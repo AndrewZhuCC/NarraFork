@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { StreamEvent } from "../kiro/event-stream-parser";
 import type { KiroChatRequest, KiroHistoryMessage, KiroToolResult } from "../kiro/types";
+import { resolveModel } from "./resolve-model";
 import { toolRegistry } from "./tool-registry";
 import { truncateOutput } from "./truncate";
 import type { AgentConfig, AgentEvent, AgentToolUse, ToolContext } from "./types";
@@ -142,7 +143,7 @@ function buildRequest(
 			currentMessage: {
 				userInputMessage: {
 					content,
-					modelId: config.model,
+					modelId: resolveModel(config.model),
 					origin: "AI_EDITOR",
 					userInputMessageContext: {
 						tools,

@@ -4,6 +4,7 @@ import type {
 	KiroHistoryUserMessage,
 	KiroToolResult,
 } from "../kiro/types";
+import { resolveModel } from "./resolve-model";
 
 interface DbMessage {
 	id: string;
@@ -92,7 +93,7 @@ export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistor
 			const userMsg: KiroHistoryUserMessage = {
 				userInputMessage: {
 					content: text,
-					modelId: model,
+					modelId: resolveModel(model),
 					...(pendingToolResults.length > 0
 						? { userInputMessageContext: { toolResults: pendingToolResults } }
 						: {}),
