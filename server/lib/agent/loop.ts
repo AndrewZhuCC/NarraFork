@@ -139,6 +139,8 @@ function buildRequest(
 		conversationState: {
 			conversationId: config.conversationId,
 			chatTriggerType: "MANUAL",
+			agentTaskType: "vibe",
+			agentContinuationId: config.conversationId,
 			history: history.length > 0 ? history : undefined,
 			currentMessage: {
 				userInputMessage: {
