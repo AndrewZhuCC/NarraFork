@@ -1,6 +1,7 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { resolveModel } from "../lib/agent/resolve-model";
 import type { KiroChatRequest, KiroModel } from "../lib/kiro-adapter";
 import {
 	isKiroAvailable,
@@ -148,7 +149,7 @@ kiroRoutes.post("/chat", async (c) => {
 		try {
 			const gen = isFullRequest
 				? kiroChatRaw(body as KiroChatRequest)
-				: kiroChat(body.text, body.model as KiroModel | undefined);
+				: kiroChat(body.text, resolveModel(body.model) as KiroModel | undefined);
 			for await (const evt of gen) {
 				await stream.writeSSE({
 					event: evt.eventType,

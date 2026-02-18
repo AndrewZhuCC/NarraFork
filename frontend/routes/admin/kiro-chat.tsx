@@ -1,16 +1,11 @@
 import { Button, Group, Paper, Select, Stack, Text, Textarea, Title } from "@mantine/core";
+import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { kiroStreamChat } from "../../lib/api";
-
-const MODELS = [
-	{ value: "claude-sonnet-4.5", label: "Claude Sonnet 4.5" },
-	{ value: "claude-opus-4.5", label: "Claude Opus 4.5" },
-	{ value: "claude-opus-4.6", label: "Claude Opus 4.6" },
-	{ value: "claude-haiku-4.5", label: "Claude Haiku 4.5" },
-];
+import { api, kiroStreamChat } from "../../lib/api";
+import { BUILTIN_MODELS } from "../../lib/constants";
 
 export const Route = createFileRoute("/admin/kiro-chat")({
 	component: KiroChatPage,
@@ -21,11 +16,19 @@ function KiroChatPage() {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
 	const [input, setInput] = useState("");
-	const [model, setModel] = useState<string>("claude-sonnet-4.5");
+	const [model, setModel] = useState<string>("claude-sonnet");
 	const [output, setOutput] = useState("");
 	const [streaming, setStreaming] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
+
+	const { data: settingsData } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+	});
+	const allModels = useMemo(() => {
+		return [...BUILTIN_MODELS, ...(settingsData?.agent?.customModels ?? [])];
+	}, [settingsData?.agent?.customModels]);
 
 	const handleSend = useCallback(async () => {
 		if (!input.trim() || streaming) return;
@@ -74,7 +77,7 @@ function KiroChatPage() {
 					/>
 					<Group>
 						<Select
-							data={MODELS}
+							data={allModels}
 							value={model}
 							onChange={(v) => v && setModel(v)}
 							label={t("kiroModel")}
