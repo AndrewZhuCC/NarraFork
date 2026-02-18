@@ -5,11 +5,11 @@ import { randomUUID } from "node:crypto";
 import { effectiveApiRegion } from "./config";
 import type { MultiTokenManager } from "./multi-token-manager";
 import {
-	KiroApiError,
-	KiroQuotaError,
 	type CallContext,
+	KiroApiError,
 	type KiroChatRequest,
 	type KiroModel,
+	KiroQuotaError,
 } from "./types";
 
 const BASE_DELAY_MS = 200;
@@ -19,9 +19,7 @@ export class KiroApiClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
 	/** Send a chat request, return raw Response for streaming. */
-	async sendChatRequest(
-		request: KiroChatRequest,
-	): Promise<Response> {
+	async sendChatRequest(request: KiroChatRequest): Promise<Response> {
 		const model = request.conversationState.currentMessage.userInputMessage.modelId;
 		const maxRetries = this.tokenManager.maxRetries;
 		let lastError: Error | null = null;

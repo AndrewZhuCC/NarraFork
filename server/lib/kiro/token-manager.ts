@@ -1,17 +1,9 @@
 // Token manager — ported from kiro.rs/src/kiro/token_manager.rs
 // Single-credential mode with auto-refresh (Social + IdC)
 
-import {
-	effectiveAuthRegion,
-	loadCredentials,
-	saveCredentials,
-} from "./config";
+import { effectiveAuthRegion, loadCredentials, saveCredentials } from "./config";
 import { generateMachineId } from "./machine-id";
-import {
-	KiroAuthError,
-	type KiroConfig,
-	type KiroCredentials,
-} from "./types";
+import { KiroAuthError, type KiroConfig, type KiroCredentials } from "./types";
 
 const IDC_AMZ_USER_AGENT =
 	"aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
@@ -27,15 +19,11 @@ export async function refreshCredentials(
 	const rt = creds.refreshToken;
 	if (!rt) throw new KiroAuthError("Missing refreshToken");
 	if (rt.length < 100 || rt.includes("...")) {
-		throw new KiroAuthError(
-			`refreshToken appears truncated (${rt.length} chars)`,
-		);
+		throw new KiroAuthError(`refreshToken appears truncated (${rt.length} chars)`);
 	}
 
 	const authMethod = detectAuthMethod(creds);
-	return authMethod === "idc"
-		? refreshIdc(creds, config)
-		: refreshSocial(creds, config);
+	return authMethod === "idc" ? refreshIdc(creds, config) : refreshSocial(creds, config);
 }
 
 function detectAuthMethod(creds: KiroCredentials): string {
@@ -46,10 +34,7 @@ function detectAuthMethod(creds: KiroCredentials): string {
 	return "social";
 }
 
-async function refreshSocial(
-	creds: KiroCredentials,
-	config: KiroConfig,
-): Promise<KiroCredentials> {
+async function refreshSocial(creds: KiroCredentials, config: KiroConfig): Promise<KiroCredentials> {
 	const rt = creds.refreshToken!;
 	const region = effectiveAuthRegion(creds, config);
 	const domain = `prod.${region}.auth.desktop.kiro.dev`;
@@ -74,9 +59,7 @@ async function refreshSocial(
 
 	if (!res.ok) {
 		const body = await res.text().catch(() => "");
-		throw new KiroAuthError(
-			`Social token refresh failed: ${res.status} ${body}`,
-		);
+		throw new KiroAuthError(`Social token refresh failed: ${res.status} ${body}`);
 	}
 
 	const data = (await res.json()) as {
@@ -97,10 +80,7 @@ async function refreshSocial(
 	};
 }
 
-async function refreshIdc(
-	creds: KiroCredentials,
-	config: KiroConfig,
-): Promise<KiroCredentials> {
+async function refreshIdc(creds: KiroCredentials, config: KiroConfig): Promise<KiroCredentials> {
 	const rt = creds.refreshToken!;
 	const clientId = creds.clientId;
 	const clientSecret = creds.clientSecret;
@@ -135,9 +115,7 @@ async function refreshIdc(
 
 	if (!res.ok) {
 		const body = await res.text().catch(() => "");
-		throw new KiroAuthError(
-			`IdC token refresh failed: ${res.status} ${body}`,
-		);
+		throw new KiroAuthError(`IdC token refresh failed: ${res.status} ${body}`);
 	}
 
 	const data = (await res.json()) as {
@@ -162,11 +140,7 @@ export class KiroTokenManager {
 	private credentialsPath: string;
 	private refreshPromise: Promise<void> | null = null;
 
-	constructor(
-		config: KiroConfig,
-		credentials: KiroCredentials,
-		credentialsPath: string,
-	) {
+	constructor(config: KiroConfig, credentials: KiroCredentials, credentialsPath: string) {
 		this.config = config;
 		this.credentials = credentials;
 		this.credentialsPath = credentialsPath;

@@ -28,10 +28,7 @@ function sha256Hex(input: string): string {
  * Generate machineId from credentials and config.
  * Priority: cred.machineId > config.machineId > SHA256("KotlinNativeAPI/" + refreshToken)
  */
-export function generateMachineId(
-	creds: KiroCredentials,
-	config: KiroConfig,
-): string | null {
+export function generateMachineId(creds: KiroCredentials, config: KiroConfig): string | null {
 	if (creds.machineId) {
 		const normalized = normalizeMachineId(creds.machineId);
 		if (normalized) return normalized;

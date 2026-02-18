@@ -2,11 +2,7 @@
 // Ported from kiro.rs/src/kiro/parser/{frame,header,crc,decoder}.rs
 // Uses Bun's built-in CRC32 (ISO-HDLC)
 
-import {
-	KiroApiError,
-	KiroParseError,
-	type ParseErrorKind,
-} from "./types";
+import { KiroApiError, KiroParseError, type ParseErrorKind } from "./types";
 
 const PRELUDE_SIZE = 12;
 const MIN_MESSAGE_SIZE = PRELUDE_SIZE + 4; // prelude + msg CRC
@@ -20,11 +16,7 @@ function crc32(data: Uint8Array): number {
 
 function readU32BE(buf: Uint8Array, offset: number): number {
 	return (
-		((buf[offset] << 24) |
-			(buf[offset + 1] << 16) |
-			(buf[offset + 2] << 8) |
-			buf[offset + 3]) >>>
-		0
+		((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]) >>> 0
 	);
 }
 
@@ -39,10 +31,7 @@ export interface FrameHeaders {
 	errorCode?: string;
 }
 
-function parseHeaders(
-	data: Uint8Array,
-	headerLength: number,
-): FrameHeaders {
+function parseHeaders(data: Uint8Array, headerLength: number): FrameHeaders {
 	const result: FrameHeaders = {};
 	let offset = 0;
 
@@ -60,11 +49,22 @@ function parseHeaders(
 		offset += 1;
 
 		switch (valueType) {
-			case 0: case 1: break;
-			case 2: offset += 1; break;
-			case 3: offset += 2; break;
-			case 4: offset += 4; break;
-			case 5: case 8: offset += 8; break;
+			case 0:
+			case 1:
+				break;
+			case 2:
+				offset += 1;
+				break;
+			case 3:
+				offset += 2;
+				break;
+			case 4:
+				offset += 4;
+				break;
+			case 5:
+			case 8:
+				offset += 8;
+				break;
 			case 6: {
 				if (offset + 2 > data.length) return result;
 				const len = readU16BE(data, offset);
@@ -84,8 +84,11 @@ function parseHeaders(
 				else if (name === ":error-code") result.errorCode = val;
 				break;
 			}
-			case 9: offset += 16; break;
-			default: return result;
+			case 9:
+				offset += 16;
+				break;
+			default:
+				return result;
 		}
 	}
 
@@ -100,10 +103,7 @@ interface ParsedFrame {
 	consumed: number;
 }
 
-type FrameResult =
-	| { ok: true; frame: ParsedFrame }
-	| { ok: false; error: KiroParseError }
-	| null; // null = need more data
+type FrameResult = { ok: true; frame: ParsedFrame } | { ok: false; error: KiroParseError } | null; // null = need more data
 
 function parseFrameTyped(buffer: Uint8Array): FrameResult {
 	if (buffer.length < PRELUDE_SIZE) return null;
@@ -113,13 +113,22 @@ function parseFrameTyped(buffer: Uint8Array): FrameResult {
 	const preludeCrc = readU32BE(buffer, 8);
 
 	if (totalLength < MIN_MESSAGE_SIZE) {
-		return { ok: false, error: new KiroParseError("message_too_small", `Message too small: ${totalLength}`) };
+		return {
+			ok: false,
+			error: new KiroParseError("message_too_small", `Message too small: ${totalLength}`),
+		};
 	}
 	if (totalLength > MAX_MESSAGE_SIZE) {
-		return { ok: false, error: new KiroParseError("message_too_large", `Message too large: ${totalLength}`) };
+		return {
+			ok: false,
+			error: new KiroParseError("message_too_large", `Message too large: ${totalLength}`),
+		};
 	}
 	if (headerLength > totalLength - MIN_MESSAGE_SIZE) {
-		return { ok: false, error: new KiroParseError("header_parse_failed", "Header length exceeds frame") };
+		return {
+			ok: false,
+			error: new KiroParseError("header_parse_failed", "Header length exceeds frame"),
+		};
 	}
 
 	if (buffer.length < totalLength) return null; // Need more data
@@ -165,7 +174,10 @@ export class EventStreamDecoder {
 	feed(data: Uint8Array): void {
 		const newSize = this.buffer.length + data.length;
 		if (newSize > this.maxBufferSize) {
-			throw new KiroParseError("buffer_overflow", `Buffer overflow: ${newSize} > ${this.maxBufferSize}`);
+			throw new KiroParseError(
+				"buffer_overflow",
+				`Buffer overflow: ${newSize} > ${this.maxBufferSize}`,
+			);
 		}
 		const newBuf = new Uint8Array(newSize);
 		newBuf.set(this.buffer);
@@ -178,7 +190,10 @@ export class EventStreamDecoder {
 	/** Try to decode the next frame. Returns frame or null. */
 	decode(): ParsedFrame | null {
 		if (this.state === "stopped") {
-			throw new KiroParseError("too_many_errors", `Decoder stopped after ${this.errorCount} errors`);
+			throw new KiroParseError(
+				"too_many_errors",
+				`Decoder stopped after ${this.errorCount} errors`,
+			);
 		}
 
 		if (this.buffer.length === 0) {
@@ -206,7 +221,10 @@ export class EventStreamDecoder {
 		this.errorCount++;
 		if (this.errorCount >= this.maxErrors) {
 			this.state = "stopped";
-			throw new KiroParseError("too_many_errors", `Too many errors (${this.errorCount}): ${result.error.message}`);
+			throw new KiroParseError(
+				"too_many_errors",
+				`Too many errors (${this.errorCount}): ${result.error.message}`,
+			);
 		}
 
 		this.tryRecover(result.error.kind);
@@ -241,11 +259,21 @@ export class EventStreamDecoder {
 		this.bytesSkipped = 0;
 	}
 
-	get currentState(): DecoderState { return this.state; }
-	get decodedCount(): number { return this.framesDecoded; }
-	get errors(): number { return this.errorCount; }
-	get skipped(): number { return this.bytesSkipped; }
-	get bufferLength(): number { return this.buffer.length; }
+	get currentState(): DecoderState {
+		return this.state;
+	}
+	get decodedCount(): number {
+		return this.framesDecoded;
+	}
+	get errors(): number {
+		return this.errorCount;
+	}
+	get skipped(): number {
+		return this.bytesSkipped;
+	}
+	get bufferLength(): number {
+		return this.buffer.length;
+	}
 
 	private tryRecover(kind: ParseErrorKind): void {
 		if (this.buffer.length === 0) return;
@@ -314,18 +342,12 @@ export async function* parseEventStream(
 
 				if (headers.messageType === "exception") {
 					const msg = td.decode(payload);
-					throw new KiroApiError(
-						headers.exceptionType ?? "UnknownException",
-						msg,
-					);
+					throw new KiroApiError(headers.exceptionType ?? "UnknownException", msg);
 				}
 
 				if (headers.messageType === "error") {
 					const msg = td.decode(payload);
-					throw new KiroApiError(
-						headers.errorCode ?? "UnknownError",
-						msg,
-					);
+					throw new KiroApiError(headers.errorCode ?? "UnknownError", msg);
 				}
 
 				if (headers.messageType === "event" && headers.eventType) {

@@ -36,8 +36,7 @@ export function loadCredentials(path: string): KiroCredentials | null {
 		if (Array.isArray(parsed)) {
 			// Sort by priority (lower = higher priority), then take first
 			const sorted = parsed.sort(
-				(a: KiroCredentials, b: KiroCredentials) =>
-					(a.priority ?? 0) - (b.priority ?? 0),
+				(a: KiroCredentials, b: KiroCredentials) => (a.priority ?? 0) - (b.priority ?? 0),
 			);
 			const cred = sorted[0] ?? null;
 			if (cred) canonicalizeAuthMethod(cred);
@@ -64,36 +63,24 @@ export function loadConfig(path: string): KiroConfig {
 			machineId: parsed.machineId ?? undefined,
 			systemVersion: parsed.systemVersion ?? CONFIG_DEFAULTS.systemVersion,
 			nodeVersion: parsed.nodeVersion ?? CONFIG_DEFAULTS.nodeVersion,
-			loadBalancingMode:
-				parsed.loadBalancingMode === "balanced" ? "balanced" : undefined,
+			loadBalancingMode: parsed.loadBalancingMode === "balanced" ? "balanced" : undefined,
 		};
 	} catch {
 		return { ...CONFIG_DEFAULTS };
 	}
 }
 
-export function saveCredentials(
-	path: string,
-	creds: KiroCredentials,
-): void {
+export function saveCredentials(path: string, creds: KiroCredentials): void {
 	writeFileSync(path, JSON.stringify(creds, null, 2));
 }
 
 /** cred.authRegion > cred.region > config.authRegion > config.region */
-export function effectiveAuthRegion(
-	creds: KiroCredentials,
-	config: KiroConfig,
-): string {
-	return (
-		creds.authRegion ?? creds.region ?? config.authRegion ?? config.region
-	);
+export function effectiveAuthRegion(creds: KiroCredentials, config: KiroConfig): string {
+	return creds.authRegion ?? creds.region ?? config.authRegion ?? config.region;
 }
 
 /** cred.apiRegion > config.apiRegion > config.region */
-export function effectiveApiRegion(
-	creds: KiroCredentials,
-	config: KiroConfig,
-): string {
+export function effectiveApiRegion(creds: KiroCredentials, config: KiroConfig): string {
 	return creds.apiRegion ?? config.apiRegion ?? config.region;
 }
 
@@ -105,9 +92,10 @@ export interface StatsEntry {
 }
 
 /** Load all credentials from file. Supports single object and array format. */
-export function loadAllCredentials(
-	path: string,
-): { credentials: KiroCredentials[]; isMultipleFormat: boolean } {
+export function loadAllCredentials(path: string): {
+	credentials: KiroCredentials[];
+	isMultipleFormat: boolean;
+} {
 	if (!existsSync(path)) return { credentials: [], isMultipleFormat: false };
 	try {
 		const raw = readFileSync(path, "utf-8").trim();
@@ -116,8 +104,7 @@ export function loadAllCredentials(
 		if (Array.isArray(parsed)) {
 			for (const c of parsed) canonicalizeAuthMethod(c);
 			const sorted = parsed.sort(
-				(a: KiroCredentials, b: KiroCredentials) =>
-					(a.priority ?? 0) - (b.priority ?? 0),
+				(a: KiroCredentials, b: KiroCredentials) => (a.priority ?? 0) - (b.priority ?? 0),
 			);
 			return { credentials: sorted, isMultipleFormat: true };
 		}
@@ -129,17 +116,12 @@ export function loadAllCredentials(
 }
 
 /** Save all credentials as array format. */
-export function saveAllCredentials(
-	path: string,
-	creds: KiroCredentials[],
-): void {
+export function saveAllCredentials(path: string, creds: KiroCredentials[]): void {
 	writeFileSync(path, JSON.stringify(creds, null, 2));
 }
 
 /** Load stats from kiro_stats.json in the same directory as credentialsPath. */
-export function loadStats(
-	credentialsPath: string,
-): Record<string, StatsEntry> {
+export function loadStats(credentialsPath: string): Record<string, StatsEntry> {
 	const statsPath = join(dirname(credentialsPath), "kiro_stats.json");
 	if (!existsSync(statsPath)) return {};
 	try {
@@ -150,10 +132,7 @@ export function loadStats(
 }
 
 /** Save stats to kiro_stats.json in the same directory as credentialsPath. */
-export function saveStats(
-	credentialsPath: string,
-	stats: Record<string, StatsEntry>,
-): void {
+export function saveStats(credentialsPath: string, stats: Record<string, StatsEntry>): void {
 	const statsPath = join(dirname(credentialsPath), "kiro_stats.json");
 	writeFileSync(statsPath, JSON.stringify(stats, null, 2));
 }
@@ -163,9 +142,7 @@ export function saveStats(
 import type { UsageCacheEntry } from "./types";
 
 /** Load usage cache from kiro_usage.json in the same directory as credentialsPath. */
-export function loadUsageCache(
-	credentialsPath: string,
-): Record<string, UsageCacheEntry> {
+export function loadUsageCache(credentialsPath: string): Record<string, UsageCacheEntry> {
 	const usagePath = join(dirname(credentialsPath), "kiro_usage.json");
 	if (!existsSync(usagePath)) return {};
 	try {

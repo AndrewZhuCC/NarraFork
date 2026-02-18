@@ -44,7 +44,6 @@ function KiroCredentialsPage() {
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
 
-
 	const { data: status, isLoading } = useQuery({
 		queryKey: ["kiro", "status"],
 		queryFn: api.kiroStatus,
@@ -121,13 +120,18 @@ function KiroCredentialsPage() {
 
 			{snapshot && (
 				<Group>
-					<Badge color="blue">{t("kiroTotal")}: {snapshot.total}</Badge>
-					<Badge color="green">{t("kiroAvailable")}: {snapshot.available}</Badge>
-					<Badge color="violet">{t("kiroCurrent")}: #{snapshot.currentId}</Badge>
+					<Badge color="blue">
+						{t("kiroTotal")}: {snapshot.total}
+					</Badge>
+					<Badge color="green">
+						{t("kiroAvailable")}: {snapshot.available}
+					</Badge>
+					<Badge color="violet">
+						{t("kiroCurrent")}: #{snapshot.currentId}
+					</Badge>
 					<Badge color="gray">{snapshot.loadBalancingMode}</Badge>
 				</Group>
 			)}
-
 
 			<Paper withBorder p="md">
 				<Stack>
@@ -140,8 +144,16 @@ function KiroCredentialsPage() {
 						autosize
 						styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
 					/>
-					{importError && <Text c="red" size="sm">{importError}</Text>}
-					{importResult && <Text c="green" size="sm">{importResult}</Text>}
+					{importError && (
+						<Text c="red" size="sm">
+							{importError}
+						</Text>
+					)}
+					{importResult && (
+						<Text c="green" size="sm">
+							{importResult}
+						</Text>
+					)}
 					<Button
 						onClick={handleImport}
 						disabled={!importJson.trim()}
@@ -152,7 +164,6 @@ function KiroCredentialsPage() {
 					</Button>
 				</Stack>
 			</Paper>
-
 
 			{entries.length > 0 && (
 				<Paper withBorder p="md">
@@ -187,38 +198,61 @@ function KiroCredentialsPage() {
 										</Table.Td>
 										<Table.Td>
 											{entry.disabled ? (
-												<Badge color="red" size="sm">{entry.disabledReason ?? "disabled"}</Badge>
+												<Badge color="red" size="sm">
+													{entry.disabledReason ?? "disabled"}
+												</Badge>
 											) : (
-												<Badge color="green" size="sm">enabled</Badge>
+												<Badge color="green" size="sm">
+													enabled
+												</Badge>
 											)}
 										</Table.Td>
 										<Table.Td>
-											<Text size="xs" c="dimmed">{entry.expiresAt ? relativeTime(entry.expiresAt) : "-"}</Text>
+											<Text size="xs" c="dimmed">
+												{entry.expiresAt ? relativeTime(entry.expiresAt) : "-"}
+											</Text>
 										</Table.Td>
 
 										<Table.Td>
 											<Text size="xs">
-												{t("kiroSuccess")}: {entry.successCount} / {t("kiroFail")}: {entry.failureCount}
+												{t("kiroSuccess")}: {entry.successCount} / {t("kiroFail")}:{" "}
+												{entry.failureCount}
 											</Text>
-											<Text size="xs" c="dimmed">{relativeTime(entry.lastUsedAt)}</Text>
+											<Text size="xs" c="dimmed">
+												{relativeTime(entry.lastUsedAt)}
+											</Text>
 										</Table.Td>
 										<Table.Td>
 											{usage ? (
 												<Stack gap={2}>
 													{usage.subscriptionTitle && (
-														<Badge size="xs" variant="light">{usage.subscriptionTitle}</Badge>
+														<Badge size="xs" variant="light">
+															{usage.subscriptionTitle}
+														</Badge>
 													)}
-													<Text size="xs">{usage.currentUsage}/{usage.usageLimit}</Text>
+													<Text size="xs">
+														{usage.currentUsage}/{usage.usageLimit}
+													</Text>
 													<Progress
 														value={usage.usagePercentage}
 														size="xs"
-														color={usage.usagePercentage > 90 ? "red" : usage.usagePercentage > 70 ? "yellow" : "blue"}
+														color={
+															usage.usagePercentage > 90
+																? "red"
+																: usage.usagePercentage > 70
+																	? "yellow"
+																	: "blue"
+														}
 														style={{ width: 80 }}
 													/>
-													<Text size="xs" c="dimmed">{relativeTime(usage.queriedAt)}</Text>
+													<Text size="xs" c="dimmed">
+														{relativeTime(usage.queriedAt)}
+													</Text>
 												</Stack>
 											) : (
-												<Text size="xs" c="dimmed">-</Text>
+												<Text size="xs" c="dimmed">
+													-
+												</Text>
 											)}
 										</Table.Td>
 										<Table.Td>

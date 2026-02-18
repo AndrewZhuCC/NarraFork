@@ -220,9 +220,7 @@ export interface KiroHistoryAssistantMessage {
 	};
 }
 
-export type KiroHistoryMessage =
-	| KiroHistoryUserMessage
-	| KiroHistoryAssistantMessage;
+export type KiroHistoryMessage = KiroHistoryUserMessage | KiroHistoryAssistantMessage;
 
 export interface KiroConversationState {
 	conversationId: string;

@@ -5,9 +5,9 @@ import { effectiveApiRegion } from "./config";
 
 import type { MultiTokenManager } from "./multi-token-manager";
 import {
+	type CallContext,
 	KiroApiError,
 	KiroQuotaError,
-	type CallContext,
 	type McpRequest,
 	type McpResponse,
 } from "./types";
@@ -18,10 +18,7 @@ const MAX_DELAY_MS = 2000;
 export class KiroMcpClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
-	async callTool(
-		name: string,
-		args: Record<string, unknown>,
-	): Promise<McpResponse> {
+	async callTool(name: string, args: Record<string, unknown>): Promise<McpResponse> {
 		const body: McpRequest = {
 			id: randomUUID(),
 			jsonrpc: "2.0",

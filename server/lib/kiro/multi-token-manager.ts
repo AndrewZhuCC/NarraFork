@@ -3,18 +3,18 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import {
+	effectiveApiRegion,
 	loadStats,
+	type StatsEntry,
 	saveAllCredentials,
 	saveStats,
-	type StatsEntry,
 } from "./config";
-import { effectiveApiRegion } from "./config";
 import { generateMachineId } from "./machine-id";
 import { refreshCredentials } from "./token-manager";
 import {
-	KiroAuthError,
 	type CallContext,
 	type CredentialEntry,
+	KiroAuthError,
 	type KiroConfig,
 	type KiroCredentials,
 	type LoadBalancingMode,
@@ -37,10 +37,7 @@ function isExpiringSoon(creds: KiroCredentials): boolean {
 	return isExpiringWithin(creds, 10) ?? false;
 }
 
-function isExpiringWithin(
-	creds: KiroCredentials,
-	minutes: number,
-): boolean | null {
+function isExpiringWithin(creds: KiroCredentials, minutes: number): boolean | null {
 	if (!creds.expiresAt) return null;
 	try {
 		const t = new Date(creds.expiresAt).getTime();
@@ -119,9 +116,7 @@ export class MultiTokenManager {
 		this.currentId =
 			this.entries.length > 0
 				? this.entries.reduce((best, e) =>
-						(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0)
-							? e
-							: best,
+						(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0) ? e : best,
 					).id
 				: 0;
 
@@ -209,15 +204,11 @@ export class MultiTokenManager {
 
 		// Priority mode: pick lowest priority number
 		return available.reduce((best, e) =>
-			(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0)
-				? e
-				: best,
+			(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0) ? e : best,
 		);
 	}
 
-	private async tryEnsureToken(
-		entry: CredentialEntry,
-	): Promise<CallContext | null> {
+	private async tryEnsureToken(entry: CredentialEntry): Promise<CallContext | null> {
 		const creds = entry.credentials;
 		const needsRefresh = isExpired(creds) || isExpiringSoon(creds);
 
@@ -236,7 +227,9 @@ export class MultiTokenManager {
 
 			// Persist refreshed credentials
 			if (this.isMultipleFormat) {
-				try { this.persistCredentials(); } catch {}
+				try {
+					this.persistCredentials();
+				} catch {}
 			}
 
 			this.currentId = entry.id;
@@ -251,10 +244,7 @@ export class MultiTokenManager {
 	}
 
 	/** Promise-based dedup: concurrent callers for the same credential share one refresh. */
-	private deduplicatedRefresh(
-		id: number,
-		creds: KiroCredentials,
-	): Promise<KiroCredentials> {
+	private deduplicatedRefresh(id: number, creds: KiroCredentials): Promise<KiroCredentials> {
 		const existing = this.refreshPromises.get(id);
 		if (existing) return existing;
 
@@ -366,7 +356,9 @@ export class MultiTokenManager {
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		entry.credentials.priority = priority;
 		if (this.isMultipleFormat) {
-			try { this.persistCredentials(); } catch {}
+			try {
+				this.persistCredentials();
+			} catch {}
 		}
 	}
 
@@ -386,7 +378,9 @@ export class MultiTokenManager {
 			this.currentId = this.entries[0].id;
 		}
 		if (this.isMultipleFormat) {
-			try { this.persistCredentials(); } catch {}
+			try {
+				this.persistCredentials();
+			} catch {}
 		}
 	}
 
@@ -398,7 +392,9 @@ export class MultiTokenManager {
 		const refreshed = await this.deduplicatedRefresh(id, entry.credentials);
 		entry.credentials = refreshed;
 		if (this.isMultipleFormat) {
-			try { this.persistCredentials(); } catch {}
+			try {
+				this.persistCredentials();
+			} catch {}
 		}
 	}
 
@@ -450,7 +446,9 @@ export class MultiTokenManager {
 
 		if (added > 0) {
 			this.isMultipleFormat = true;
-			try { this.persistCredentials(); } catch {}
+			try {
+				this.persistCredentials();
+			} catch {}
 		}
 
 		return { added, duplicates };
@@ -498,7 +496,9 @@ export class MultiTokenManager {
 			res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
 		} catch (err) {
 			console.log("[kiro:usage] fetch threw:", err);
-			throw new Error(`getUsageLimits network error: ${err instanceof Error ? err.message : String(err)}`);
+			throw new Error(
+				`getUsageLimits network error: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 
 		console.log("[kiro:usage] response status=", res.status);
@@ -560,12 +560,15 @@ export class MultiTokenManager {
 		if (subscriptionTitle && subscriptionTitle !== creds.subscriptionTitle) {
 			creds.subscriptionTitle = subscriptionTitle;
 			if (this.isMultipleFormat) {
-				try { this.persistCredentials(); } catch {}
+				try {
+					this.persistCredentials();
+				} catch {}
 			}
 		}
 
 		const remaining = Math.max(0, totalLimit - totalUsage);
-		const usagePercentage = totalLimit > 0 ? Math.round((totalUsage / totalLimit) * 10000) / 100 : 0;
+		const usagePercentage =
+			totalLimit > 0 ? Math.round((totalUsage / totalLimit) * 10000) / 100 : 0;
 
 		console.log("[kiro:usage] done, remaining=", remaining);
 		return {

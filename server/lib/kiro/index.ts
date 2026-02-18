@@ -1,7 +1,17 @@
 // Kiro plugin public API
 
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
 import { KiroApiClient } from "./api-client";
-import { loadAllCredentials, loadConfig, loadUsageCache, saveAllCredentials, saveUsageCache } from "./config";
+import {
+	loadAllCredentials,
+	loadConfig,
+	loadUsageCache,
+	saveAllCredentials,
+	saveUsageCache,
+} from "./config";
 import { parseEventStream, type StreamEvent } from "./event-stream-parser";
 import { KiroMcpClient } from "./mcp-client";
 import { MultiTokenManager } from "./multi-token-manager";
@@ -15,11 +25,6 @@ import type {
 	UsageCacheEntry,
 } from "./types";
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
-import { dirname, resolve } from "node:path";
-
 let tokenManager: MultiTokenManager | null = null;
 let apiClient: KiroApiClient | null = null;
 let mcpClient: KiroMcpClient | null = null;
@@ -31,9 +36,7 @@ let pluginConfig: KiroPluginConfig | null = null;
 export function initKiro(config: KiroPluginConfig): boolean {
 	pluginConfig = config;
 	credentialsPath = config.credentialsPath;
-	const { credentials, isMultipleFormat } = loadAllCredentials(
-		config.credentialsPath,
-	);
+	const { credentials, isMultipleFormat } = loadAllCredentials(config.credentialsPath);
 	if (!credentials.some((c) => c.refreshToken)) return false;
 
 	const kiroConfig = loadConfig(config.configPath);
@@ -76,11 +79,8 @@ export function buildChatRequest(
 }
 
 /** Stream structured events from Claude via Kiro API. Accepts full request body. */
-export async function* kiroChatRaw(
-	request: KiroChatRequest,
-): AsyncGenerator<StreamEvent> {
-	if (!apiClient)
-		throw new Error("Kiro not initialized — call initKiro() first");
+export async function* kiroChatRaw(request: KiroChatRequest): AsyncGenerator<StreamEvent> {
+	if (!apiClient) throw new Error("Kiro not initialized — call initKiro() first");
 
 	const res = await apiClient.sendChatRequest(request);
 	if (!res.body) throw new Error("No response body");
@@ -89,18 +89,12 @@ export async function* kiroChatRaw(
 }
 
 /** Convenience: stream events from a simple text prompt. */
-export async function* kiroChat(
-	text: string,
-	model?: KiroModel,
-): AsyncGenerator<StreamEvent> {
+export async function* kiroChat(text: string, model?: KiroModel): AsyncGenerator<StreamEvent> {
 	yield* kiroChatRaw(buildChatRequest(text, model ?? defaultModel));
 }
 
 /** Collect full response from Claude via Kiro API. */
-export async function kiroGenerate(
-	text: string,
-	model?: KiroModel,
-): Promise<string> {
+export async function kiroGenerate(text: string, model?: KiroModel): Promise<string> {
 	const chunks: string[] = [];
 	for await (const evt of kiroChat(text, model)) {
 		if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
@@ -116,8 +110,7 @@ export async function kiroMcpCall(
 	name: string,
 	args: Record<string, unknown>,
 ): Promise<McpResponse> {
-	if (!mcpClient)
-		throw new Error("Kiro not initialized — call initKiro() first");
+	if (!mcpClient) throw new Error("Kiro not initialized — call initKiro() first");
 	return mcpClient.callTool(name, args);
 }
 
@@ -154,9 +147,10 @@ export async function kiroManualRefresh(id: number): Promise<void> {
 	await tokenManager.manualRefresh(id);
 }
 
-export function kiroImportCredentials(
-	creds: KiroCredentials[],
-): { added: number; duplicates: number } {
+export function kiroImportCredentials(creds: KiroCredentials[]): {
+	added: number;
+	duplicates: number;
+} {
 	if (tokenManager) {
 		return tokenManager.addCredentials(creds);
 	}
@@ -221,6 +215,7 @@ export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	return loadUsageCache(credentialsPath);
 }
 
+export { EventStreamDecoder, type StreamEvent } from "./event-stream-parser";
 // Re-export types for consumers
 export type {
 	KiroChatRequest,
@@ -241,10 +236,9 @@ export type {
 	UsageCacheEntry,
 } from "./types";
 export {
-	KiroError,
-	KiroAuthError,
 	KiroApiError,
-	KiroQuotaError,
+	KiroAuthError,
+	KiroError,
 	KiroParseError,
+	KiroQuotaError,
 } from "./types";
-export { EventStreamDecoder, type StreamEvent } from "./event-stream-parser";

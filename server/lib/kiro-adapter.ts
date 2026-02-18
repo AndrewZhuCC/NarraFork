@@ -232,9 +232,10 @@ export async function kiroManualRefresh(id: number): Promise<void> {
 	await mod.kiroManualRefresh(id);
 }
 
-export function kiroImportCredentials(
-	creds: ImportCredentialInput[],
-): { added: number; duplicates: number } {
+export function kiroImportCredentials(creds: ImportCredentialInput[]): {
+	added: number;
+	duplicates: number;
+} {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	// Works even when kiro is not yet initialized (no credentials loaded)
 	return mod.kiroImportCredentials(creds);
