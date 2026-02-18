@@ -12,6 +12,7 @@ import { authRoutes } from "./routes/auth";
 import { chapterRoutes } from "./routes/chapters";
 import { favoriteRoutes } from "./routes/favorites";
 import { graphRoutes } from "./routes/graph";
+import { kiroRoutes } from "./routes/kiro";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
 import { projectRoutes } from "./routes/projects";
@@ -58,6 +59,7 @@ app.route("/api/mcp", mcpRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
+app.route("/api/kiro", kiroRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);

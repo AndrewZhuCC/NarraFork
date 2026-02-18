@@ -4,11 +4,20 @@ import { serveStatic } from "hono/bun";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { verifyToken } from "./lib/auth";
+import { initKiro, isKiroAvailable } from "./lib/kiro-adapter";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import { terminalService } from "./services/terminal-service";
 import { resolveWSData, wsHandlers } from "./websocket/ws-handler";
+
+// Catch unhandled errors to prevent silent crashes
+process.on("uncaughtException", (err) => {
+	logger.error("Uncaught exception", { error: String(err), stack: err?.stack });
+});
+process.on("unhandledRejection", (reason) => {
+	logger.error("Unhandled rejection", { error: String(reason), stack: (reason as Error)?.stack });
+});
 
 const port = Number(process.env.PORT) || settings.server.port;
 const isProd = process.env.NODE_ENV === "production";
@@ -66,6 +75,24 @@ const _server = Bun.serve({
 });
 
 logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
+
+// Initialize Kiro plugin if configured
+if (settings.kiro?.credentialsPath) {
+	try {
+		const ok = initKiro({
+			credentialsPath: settings.kiro.credentialsPath,
+			configPath:
+				settings.kiro.configPath ??
+				settings.kiro.credentialsPath.replace("credentials.json", "config.json"),
+			defaultModel: settings.kiro.defaultModel as any,
+		});
+		logger.info(`Kiro plugin: ${ok ? "initialized" : "credentials not found"}`, {
+			available: isKiroAvailable(),
+		});
+	} catch (err) {
+		logger.error("Kiro plugin initialization failed", { error: String(err) });
+	}
+}
 
 // Mark any stale terminals from a previous run as exited
 terminalService.recoverOnStartup().catch((err) => {
