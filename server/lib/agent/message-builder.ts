@@ -27,15 +27,20 @@ interface DbToolCall {
 /**
  * Convert DB narrator messages into KiroHistoryMessage[] for the Kiro API.
  *
- * Follows the kiro.rs build_history() pattern:
+ * Follows the kiro CLI chat protocol:
  * - Drop the last user message (it's sent as currentMessage)
  * - Merge consecutive user messages into one
  * - user messages always include userInputMessageContext (even if empty)
  * - assistant content uses "." as placeholder when only tool_uses exist
  * - Trailing orphan user messages get an auto-paired assistant "OK"
  * - Tool results from completed tool calls attach to the next user message
+ * - When consecutive assistant messages exist (tool-call then text-response),
+ *   a synthetic user message is inserted to carry tool results
  */
-export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistoryMessage[] {
+export function buildHistory(
+	dbMessages: DbMessage[],
+	model: string,
+): { history: KiroHistoryMessage[]; trailingToolResults: KiroToolResult[] } {
 	const modelId = resolveModel(model);
 
 	// Only top-level user/assistant messages
@@ -66,22 +71,46 @@ export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistor
 
 	for (const msg of merged) {
 		if (msg.role === "assistant") {
+			// Kiro protocol requires user→assistant alternation.
+			// When we have pending tool results (from a previous assistant's tool calls)
+			// but the next DB message is another assistant (no intervening user message),
+			// insert a synthetic user message to carry the tool results.
+			if (pendingToolResults.length > 0) {
+				history.push({
+					userInputMessage: {
+						content: ".",
+						modelId,
+						origin: "AI_EDITOR",
+						userInputMessageContext: { toolResults: pendingToolResults },
+					},
+				});
+				pendingToolResults = [];
+			}
+
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);
 			let text = textParts.join("\n") || msg.contentText || "";
 
+			// Only include tool uses that have completed results (completed/failed).
+			// Kiro rejects tool_uses without matching tool_results.
+			const completedToolUseIds = new Set(
+				msg.toolCalls
+					?.filter((tc) => tc.status === "completed" || tc.status === "failed")
+					.map((tc) => tc.toolUseId) ?? [],
+			);
+
 			const toolUses =
 				msg.toolCalls
-					?.filter((tc) => tc.toolName && tc.toolUseId)
+					?.filter((tc) => tc.toolName && tc.toolUseId && completedToolUseIds.has(tc.toolUseId))
 					.map((tc) => ({
 						toolUseId: tc.toolUseId,
 						name: tc.toolName,
 						input: (tc.inputJson as Record<string, unknown>) ?? {},
 					})) ?? [];
 
-			// kiro.rs: assistant with only tool_uses and no text uses "." as placeholder
+			// Kiro protocol: assistant with only tool_uses and no text uses "." as placeholder
 			if (!text && toolUses.length > 0) {
 				text = ".";
 			}
@@ -119,6 +148,7 @@ export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistor
 				userInputMessage: {
 					content: text,
 					modelId,
+					origin: "AI_EDITOR",
 					userInputMessageContext:
 						pendingToolResults.length > 0 ? { toolResults: pendingToolResults } : {},
 				},
@@ -128,7 +158,7 @@ export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistor
 		}
 	}
 
-	// kiro.rs: trailing orphan user message gets auto-paired assistant "OK"
+	// Kiro protocol: trailing orphan user message gets auto-paired assistant "OK"
 	if (history.length > 0) {
 		const last = history[history.length - 1];
 		if ("userInputMessage" in last) {
@@ -138,5 +168,5 @@ export function buildHistory(dbMessages: DbMessage[], model: string): KiroHistor
 		}
 	}
 
-	return history;
+	return { history, trailingToolResults: pendingToolResults };
 }

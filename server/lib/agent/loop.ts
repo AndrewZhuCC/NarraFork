@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { StreamEvent } from "../kiro/event-stream-parser";
 import type { KiroChatRequest, KiroHistoryMessage, KiroToolResult } from "../kiro/types";
 import { resolveModel } from "./resolve-model";
@@ -17,14 +16,37 @@ export async function* agentLoop(
 	config: AgentConfig,
 	userText: string,
 	history: KiroHistoryMessage[],
+	initialToolResults?: KiroToolResult[],
 ): AsyncGenerator<AgentEvent> {
 	// Dynamic import to avoid circular dependency with kiro-adapter
 	const { kiroChatRaw } = await import("../kiro-adapter");
 
 	const maxTurns = config.maxTurns ?? DEFAULT_MAX_TURNS;
 	const tools = toolRegistry.toKiroTools();
-	let pendingToolResults: KiroToolResult[] = [];
+	let pendingToolResults: KiroToolResult[] = initialToolResults ?? [];
 	let turnIndex = 0;
+
+	// Shallow-copy to avoid mutating the caller's array
+	history = [...history];
+
+	// System prompt is injected as a user+assistant history pair (kiro CLI chat protocol)
+	if (config.systemPrompt) {
+		const modelId = resolveModel(config.model);
+		history.unshift(
+			{
+				userInputMessage: {
+					content: config.systemPrompt,
+					modelId,
+					userInputMessageContext: {},
+				},
+			},
+			{
+				assistantResponseMessage: {
+					content: "I will follow these instructions.",
+				},
+			},
+		);
+	}
 
 	while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
@@ -34,7 +56,7 @@ export async function* agentLoop(
 
 		// Build the request for this turn
 		const isFirstTurn = turnIndex === 0;
-		const content = isFirstTurn ? userText : "";
+		const content = isFirstTurn ? userText : ".";
 		const request = buildRequest(config, content, history, tools, pendingToolResults);
 
 		// Call Kiro API and collect the response
@@ -42,17 +64,69 @@ export async function* agentLoop(
 		const toolUses: AgentToolUse[] = [];
 		let messageId: string | undefined;
 
+		// Accumulator for streaming tool use events (input arrives in chunks)
+		const toolUseAccum = new Map<string, { name: string; inputChunks: string[] }>();
+
 		try {
-			for await (const evt of kiroChatRaw(request)) {
+			for await (const evt of kiroChatRaw(request, config.signal)) {
 				const parsed = parseStreamEvent(evt);
 				if (parsed.text) {
 					assistantText += parsed.text;
 					yield { type: "stream_text", text: parsed.text };
 				}
 				if (parsed.toolUses) toolUses.push(...parsed.toolUses);
+
+				// Handle streaming toolUseEvent: accumulate input chunks, finalize on stop
+				if (evt.eventType === "toolUseEvent") {
+					const id = evt.data.toolUseId as string | undefined;
+					const name = evt.data.name as string | undefined;
+					if (id) {
+						if (!toolUseAccum.has(id) && name) {
+							toolUseAccum.set(id, { name, inputChunks: [] });
+						}
+						const acc = toolUseAccum.get(id);
+						if (acc) {
+							if (typeof evt.data.input === "string") {
+								acc.inputChunks.push(evt.data.input);
+							}
+							if (evt.data.stop) {
+								const raw = acc.inputChunks.join("");
+								let input: Record<string, unknown> = {};
+								if (raw) {
+									try {
+										input = JSON.parse(raw);
+									} catch {
+										input = { _raw: raw };
+									}
+								}
+								toolUses.push({ toolUseId: id, name: acc.name, input });
+								toolUseAccum.delete(id);
+							}
+						}
+					}
+				}
+
 				if (parsed.messageId) messageId = parsed.messageId;
+				if (parsed.reasoning) {
+					yield { type: "stream_reasoning", text: parsed.reasoning };
+				}
+				if (parsed.contextUsagePercentage != null) {
+					yield { type: "context_usage", percentage: parsed.contextUsagePercentage };
+				}
+				if (parsed.invalidState) {
+					yield {
+						type: "invalid_state",
+						reason: parsed.invalidState.reason,
+						message: parsed.invalidState.message,
+					};
+				}
 			}
 		} catch (err) {
+			// Abort signal → clean exit, not an error
+			if (config.signal.aborted) {
+				yield { type: "error", message: "Aborted" };
+				return;
+			}
 			const msg = err instanceof Error ? err.message : String(err);
 			yield { type: "error", message: msg };
 			return;
@@ -70,6 +144,29 @@ export async function* agentLoop(
 		if (toolUses.length === 0) {
 			yield { type: "done" };
 			return;
+		}
+
+		// Push the currentMessage into history for the next turn.
+		// This must happen AFTER the API call (not before), because
+		// buildRequest references the history array directly.
+		if (isFirstTurn) {
+			history.push({
+				userInputMessage: {
+					content: userText,
+					modelId: resolveModel(config.model),
+					origin: "AI_EDITOR",
+					userInputMessageContext: {},
+				},
+			});
+		} else if (pendingToolResults.length > 0) {
+			history.push({
+				userInputMessage: {
+					content: ".",
+					modelId: resolveModel(config.model),
+					origin: "AI_EDITOR",
+					userInputMessageContext: { toolResults: pendingToolResults },
+				},
+			});
 		}
 
 		// Execute each tool call
@@ -106,16 +203,23 @@ export async function* agentLoop(
 			};
 		}
 
-		// Append assistant message to history for next turn
+		// Append assistant message to history for next turn.
+		// Tool results stay in pendingToolResults and are sent via
+		// currentMessage.userInputMessageContext on the next iteration.
+		// (history ends with assistant; currentMessage is the next user turn)
+		const historyToolUses =
+			toolUses.length > 0
+				? toolUses.map((tu) => ({
+						toolUseId: tu.toolUseId,
+						name: tu.name,
+						input: tu.input,
+					}))
+				: undefined;
+
 		history.push({
 			assistantResponseMessage: {
-				content: assistantText,
-				messageId: messageId ?? randomUUID(),
-				toolUses: toolUses.map((tu) => ({
-					toolUseId: tu.toolUseId,
-					name: tu.name,
-					input: tu.input,
-				})),
+				content: assistantText || ".",
+				...(historyToolUses ? { toolUses: historyToolUses } : {}),
 			},
 		});
 
@@ -151,8 +255,19 @@ function buildRequest(
 						tools,
 						...(toolResults.length > 0 ? { toolResults } : {}),
 					},
-					...(config.systemPrompt ? { userIntent: config.systemPrompt } : {}),
 				},
+			},
+			envState: {
+				operatingSystem:
+					process.platform === "win32"
+						? "WINDOWS"
+						: process.platform === "darwin"
+							? "MAC"
+							: "LINUX",
+				currentWorkingDirectory: config.cwd,
+			},
+			shellState: {
+				shellName: process.env.SHELL?.split("/").pop() ?? "bash",
 			},
 		},
 	};
@@ -162,6 +277,9 @@ interface ParsedEvent {
 	text?: string;
 	toolUses?: AgentToolUse[];
 	messageId?: string;
+	reasoning?: string;
+	contextUsagePercentage?: number;
+	invalidState?: { reason: string; message: string };
 }
 
 function parseStreamEvent(evt: StreamEvent): ParsedEvent {
@@ -176,8 +294,9 @@ function parseStreamEvent(evt: StreamEvent): ParsedEvent {
 		}
 	}
 
-	// Tool use events — handle both embedded and standalone formats
-	if (evt.eventType === "toolUseEvent" || evt.eventType === "assistantResponseEvent") {
+	// Tool use events — only handle non-streaming formats (e.g. embedded in assistantResponseEvent)
+	// Streaming toolUseEvent with chunked input is handled by the accumulator in agentLoop()
+	if (evt.eventType === "assistantResponseEvent") {
 		const toolUse = evt.data.toolUse as
 			| { toolUseId: string; name: string; input: Record<string, unknown> }
 			| undefined;
@@ -202,6 +321,27 @@ function parseStreamEvent(evt: StreamEvent): ParsedEvent {
 				input: tu.input ?? {},
 			}));
 		}
+	}
+
+	if (evt.eventType === "reasoningContentEvent") {
+		const content = evt.data.content ?? evt.data.text;
+		if (content != null) {
+			result.reasoning = String(content);
+		}
+	}
+
+	if (evt.eventType === "contextUsageEvent") {
+		const pct = evt.data.contextUsagePercentage ?? evt.data.context_usage_percentage;
+		if (pct != null) {
+			result.contextUsagePercentage = Number(pct);
+		}
+	}
+
+	if (evt.eventType === "invalidStateEvent") {
+		result.invalidState = {
+			reason: String(evt.data.reason ?? "unknown"),
+			message: String(evt.data.message ?? evt.data.content ?? "Invalid state"),
+		};
 	}
 
 	return result;
