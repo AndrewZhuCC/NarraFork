@@ -1,7 +1,7 @@
 /**
  * Resolve model names to Kiro model IDs.
  *
- * Mirrors the logic from kiro.rs `map_model()`:
+ * Reverse-engineered from kiro CLI chat model resolution:
  * - Any model containing "sonnet" → "claude-sonnet-4.5"
  * - Opus 4.5/4-5 variants → "claude-opus-4.5"
  * - Other opus variants → "claude-opus-4.6"

@@ -1,4 +1,4 @@
-// Config loading — reads kiro.rs credentials.json and config.json
+// Config loading — reads kiro CLI credentials.json and config.json
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";

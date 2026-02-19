@@ -1,4 +1,4 @@
-// Multi-credential Token Manager — ported from kiro.rs/src/kiro/token_manager.rs
+// Multi-credential Token Manager — reverse-engineered from kiro CLI chat
 // Supports multiple credentials with failover, load balancing, and self-healing
 
 import { createHash, randomUUID } from "node:crypto";
@@ -535,7 +535,7 @@ export class MultiTokenManager {
 		}
 		console.log("[kiro:usage] json ok, breakdowns=", data.usageBreakdownList?.length ?? 0);
 
-		// Parse response following kiro.rs logic: primary breakdown + active bonuses + active free trial
+		// Parse response: primary breakdown + active bonuses + active free trial
 		const breakdown = data.usageBreakdownList?.[0];
 		let totalUsage = breakdown?.currentUsageWithPrecision ?? 0;
 		let totalLimit = breakdown?.usageLimitWithPrecision ?? 0;

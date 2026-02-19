@@ -1,5 +1,5 @@
 // AWS Event Stream binary parser — state machine decoder
-// Ported from kiro.rs/src/kiro/parser/{frame,header,crc,decoder}.rs
+// Reverse-engineered from kiro CLI chat binary protocol
 // Uses Bun's built-in CRC32 (ISO-HDLC)
 
 import { KiroApiError, KiroParseError, type ParseErrorKind } from "./types";

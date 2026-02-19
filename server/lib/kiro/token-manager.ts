@@ -1,4 +1,4 @@
-// Token manager — ported from kiro.rs/src/kiro/token_manager.rs
+// Token manager — reverse-engineered from kiro CLI chat
 // Single-credential mode with auto-refresh (Social + IdC)
 
 import { effectiveAuthRegion, loadCredentials, saveCredentials } from "./config";

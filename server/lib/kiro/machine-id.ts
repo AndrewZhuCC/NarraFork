@@ -1,4 +1,4 @@
-// Machine ID generation — ported from kiro.rs/src/kiro/machine_id.rs
+// Machine ID generation — reverse-engineered from kiro CLI chat
 
 import { createHash } from "node:crypto";
 import type { KiroConfig, KiroCredentials } from "./types";
