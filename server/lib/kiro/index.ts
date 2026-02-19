@@ -79,10 +79,13 @@ export function buildChatRequest(
 }
 
 /** Stream structured events from Claude via Kiro API. Accepts full request body. */
-export async function* kiroChatRaw(request: KiroChatRequest): AsyncGenerator<StreamEvent> {
+export async function* kiroChatRaw(
+	request: KiroChatRequest,
+	signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
 	if (!apiClient) throw new Error("Kiro not initialized — call initKiro() first");
 
-	const res = await apiClient.sendChatRequest(request);
+	const res = await apiClient.sendChatRequest(request, signal);
 	if (!res.body) throw new Error("No response body");
 
 	yield* parseEventStream(res.body);
@@ -112,6 +115,11 @@ export async function kiroMcpCall(
 ): Promise<McpResponse> {
 	if (!mcpClient) throw new Error("Kiro not initialized — call initKiro() first");
 	return mcpClient.callTool(name, args);
+}
+
+export async function kiroMcpListTools(): Promise<McpResponse> {
+	if (!mcpClient) throw new Error("Kiro not initialized — call initKiro() first");
+	return mcpClient.listTools();
 }
 
 // --- Management API ---

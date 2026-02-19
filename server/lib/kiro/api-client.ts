@@ -1,7 +1,8 @@
-// Kiro API client — ported from kiro.rs/src/kiro/provider.rs
+// Kiro API client — reverse-engineered from kiro CLI chat
 // Multi-credential failover mode using MultiTokenManager
 
 import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { effectiveApiRegion } from "./config";
 import type { MultiTokenManager } from "./multi-token-manager";
 import {
@@ -15,11 +16,17 @@ import {
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
 
+const DUMP_DIR = "/tmp/narrafork-kiro-dumps";
+let dumpSeq = 0;
+try {
+	mkdirSync(DUMP_DIR, { recursive: true });
+} catch {}
+
 export class KiroApiClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
 	/** Send a chat request, return raw Response for streaming. */
-	async sendChatRequest(request: KiroChatRequest): Promise<Response> {
+	async sendChatRequest(request: KiroChatRequest, signal?: AbortSignal): Promise<Response> {
 		const model = request.conversationState.currentMessage.userInputMessage.modelId;
 		const maxRetries = this.tokenManager.maxRetries;
 		let lastError: Error | null = null;
@@ -33,7 +40,11 @@ export class KiroApiClient {
 				continue;
 			}
 
-			const headers = this.buildHeaders(ctx);
+			const agentMode =
+				request.conversationState.currentMessage.userInputMessage.agentMode
+				?? request.conversationState.agentTaskType
+				?? "vibe";
+			const headers = this.buildHeaders(ctx, attempt, maxRetries, agentMode);
 			// Inject profileArn from credentials if not already set
 			const body = { ...request };
 			if (!body.profileArn && ctx.credentials.profileArn) {
@@ -43,12 +54,32 @@ export class KiroApiClient {
 			const url = `https://q.${region}.amazonaws.com`;
 
 			let res: Response;
+			const seq = String(++dumpSeq).padStart(4, "0");
+			const ts = new Date().toISOString().replace(/[:.]/g, "-");
+			const convId = request.conversationState.conversationId?.slice(0, 8) ?? "unknown";
+			const dumpPath = `${DUMP_DIR}/${seq}_${ts}_${convId}`;
 			try {
+				// Dump request
+				try {
+					writeFileSync(`${dumpPath}_req.json`, JSON.stringify(body, null, 2));
+				} catch {}
+
 				res = await fetch(url, {
 					method: "POST",
 					headers,
 					body: JSON.stringify(body),
+					signal,
 				});
+
+				// Dump response metadata
+				try {
+					const resHeaders: Record<string, string> = {};
+					res.headers.forEach((v, k) => { resHeaders[k] = v; });
+					writeFileSync(
+						`${dumpPath}_res_meta.json`,
+						JSON.stringify({ status: res.status, headers: resHeaders }, null, 2),
+					);
+				} catch {}
 			} catch (err) {
 				lastError = err instanceof Error ? err : new Error(String(err));
 				if (attempt + 1 < maxRetries) await this.delay(attempt);
@@ -61,6 +92,11 @@ export class KiroApiClient {
 			}
 
 			const resBody = await res.text().catch(() => "");
+
+			// Dump error response body
+			try {
+				writeFileSync(`${dumpPath}_res_body.txt`, resBody);
+			} catch {}
 
 			// 400: bad request, don't retry
 			if (res.status === 400) {
@@ -99,21 +135,31 @@ export class KiroApiClient {
 		throw lastError ?? new Error("Max retries exceeded");
 	}
 
-	private buildHeaders(ctx: CallContext): Record<string, string> {
+	private buildHeaders(
+		ctx: CallContext,
+		attempt: number,
+		maxRetries: number,
+		agentMode: string,
+	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
 		const region = effectiveApiRegion(ctx.credentials, config);
 		const { kiroVersion } = config;
+		const [os, osVersion] = config.systemVersion.split("#");
 
 		return {
 			"Content-Type": "application/x-amz-json-1.0",
 			"x-amz-target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
 			"x-amzn-codewhisperer-optout": "true",
-			"x-amzn-kiro-agent-mode": "vibe",
+			"x-amzn-kiro-agent-mode": agentMode,
 			"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
 			Host: `q.${region}.amazonaws.com`,
 			"amz-sdk-invocation-id": randomUUID(),
-			"amz-sdk-request": "attempt=1; max=3",
+			"amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
 			Authorization: `Bearer ${ctx.token}`,
+			"x-amzn-codewhisperer-os": os ?? "linux",
+			"x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
+			"x-amzn-codewhisperer-ide": "kiro",
+			"x-amzn-codewhisperer-ide-version": kiroVersion,
 		};
 	}
 

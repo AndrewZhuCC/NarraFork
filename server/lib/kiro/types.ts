@@ -1,4 +1,4 @@
-// Kiro plugin types — mirrors kiro.rs data models
+// Kiro plugin types — reverse-engineered from kiro CLI chat
 
 export interface KiroCredentials {
 	id?: number;
@@ -211,7 +211,6 @@ export interface KiroHistoryUserMessage {
 export interface KiroHistoryAssistantMessage {
 	assistantResponseMessage: {
 		content: string;
-		messageId?: string;
 		toolUses?: Array<{
 			toolUseId: string;
 			name: string;
@@ -221,6 +220,17 @@ export interface KiroHistoryAssistantMessage {
 }
 
 export type KiroHistoryMessage = KiroHistoryUserMessage | KiroHistoryAssistantMessage;
+
+export interface KiroEnvState {
+	operatingSystem: "LINUX" | "MAC" | "WINDOWS";
+	currentWorkingDirectory: string;
+	environmentVariables?: Array<{ key: string; value: string }>;
+	timezoneOffset?: string;
+}
+
+export interface KiroShellState {
+	shellName: string;
+}
 
 export interface KiroConversationState {
 	conversationId: string;
@@ -232,6 +242,8 @@ export interface KiroConversationState {
 	agentContinuationId?: string;
 	agentTaskType?: string;
 	workspaceId?: string;
+	envState?: KiroEnvState;
+	shellState?: KiroShellState;
 }
 
 /** Full chat request body matching the official Smithy protocol. */
@@ -245,8 +257,8 @@ export interface KiroChatRequest {
 export interface McpRequest {
 	id: string;
 	jsonrpc: "2.0";
-	method: "tools/call";
-	params: { name: string; arguments: Record<string, unknown> };
+	method: "tools/call" | "tools/list" | (string & {});
+	params: Record<string, unknown>;
 }
 
 export interface McpResponse {

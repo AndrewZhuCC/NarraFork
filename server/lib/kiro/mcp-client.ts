@@ -1,4 +1,4 @@
-// MCP Client — ported from kiro.rs/src/kiro/provider.rs call_mcp_with_retry()
+// MCP Client — reverse-engineered from kiro CLI chat
 
 import { randomUUID } from "node:crypto";
 import { effectiveApiRegion } from "./config";
@@ -28,6 +28,26 @@ export class KiroMcpClient {
 		return this.callMcpWithRetry(JSON.stringify(body));
 	}
 
+	async listTools(): Promise<McpResponse> {
+		const body: McpRequest = {
+			id: randomUUID(),
+			jsonrpc: "2.0",
+			method: "tools/list",
+			params: {},
+		};
+		return this.callMcpWithRetry(JSON.stringify(body));
+	}
+
+	async callGeneric(method: string, params: Record<string, unknown>): Promise<McpResponse> {
+		const body: McpRequest = {
+			id: randomUUID(),
+			jsonrpc: "2.0",
+			method,
+			params,
+		};
+		return this.callMcpWithRetry(JSON.stringify(body));
+	}
+
 	private async callMcpWithRetry(body: string): Promise<McpResponse> {
 		const maxRetries = this.tokenManager.maxRetries;
 		let lastError: Error | null = null;
@@ -41,15 +61,23 @@ export class KiroMcpClient {
 				continue;
 			}
 
-			const headers = this.buildHeaders(ctx);
+			const headers = this.buildHeaders(ctx, attempt, maxRetries);
 			const url = this.buildUrl(ctx);
+
+			// Inject profileArn from credentials if available
+			let effectiveBody = body;
+			if (ctx.credentials.profileArn) {
+				const parsed = JSON.parse(body);
+				parsed.profileArn = ctx.credentials.profileArn;
+				effectiveBody = JSON.stringify(parsed);
+			}
 
 			let res: Response;
 			try {
 				res = await fetch(url, {
 					method: "POST",
 					headers,
-					body,
+					body: effectiveBody,
 				});
 			} catch (err) {
 				lastError = err instanceof Error ? err : new Error(String(err));
@@ -102,19 +130,29 @@ export class KiroMcpClient {
 		return `https://q.${region}.amazonaws.com`;
 	}
 
-	private buildHeaders(ctx: CallContext): Record<string, string> {
+	private buildHeaders(
+		ctx: CallContext,
+		attempt: number,
+		maxRetries: number,
+	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
 		const region = effectiveApiRegion(ctx.credentials, config);
 		const { kiroVersion } = config;
+		const [os, osVersion] = config.systemVersion.split("#");
 
 		return {
 			"Content-Type": "application/x-amz-json-1.0",
 			"x-amz-target": "AmazonCodeWhispererStreamingService.InvokeMCP",
+			"x-amzn-codewhisperer-optout": "true",
 			"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
 			Host: `q.${region}.amazonaws.com`,
 			"amz-sdk-invocation-id": randomUUID(),
-			"amz-sdk-request": "attempt=1; max=3",
+			"amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
 			Authorization: `Bearer ${ctx.token}`,
+			"x-amzn-codewhisperer-os": os ?? "linux",
+			"x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
+			"x-amzn-codewhisperer-ide": "kiro",
+			"x-amzn-codewhisperer-ide-version": kiroVersion,
 		};
 	}
 

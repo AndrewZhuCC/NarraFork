@@ -111,11 +111,6 @@ export interface KiroUserInputMessageContext {
 	tools?: KiroTool[];
 }
 
-export interface KiroHistoryMessage {
-	userInputMessage?: Record<string, unknown>;
-	assistantResponseMessage?: Record<string, unknown>;
-}
-
 export interface KiroChatRequest {
 	conversationState: {
 		conversationId: string;
@@ -134,10 +129,12 @@ export interface KiroChatRequest {
 			};
 		};
 		chatTriggerType?: string;
-		history?: KiroHistoryMessage[];
+		history?: Record<string, unknown>[];
 		agentContinuationId?: string;
 		agentTaskType?: string;
 		workspaceId?: string;
+		envState?: Record<string, unknown>;
+		shellState?: Record<string, unknown>;
 	};
 	profileArn?: string;
 }
@@ -145,10 +142,11 @@ export interface KiroChatRequest {
 interface KiroModule {
 	initKiro(config: KiroPluginConfig): boolean;
 	isKiroAvailable(): boolean;
-	kiroChatRaw(request: KiroChatRequest): AsyncGenerator<StreamEvent>;
+	kiroChatRaw(request: KiroChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent>;
 	kiroChat(text: string, model?: KiroModel): AsyncGenerator<StreamEvent>;
 	kiroGenerate(text: string, model?: KiroModel): Promise<string>;
 	kiroMcpCall(name: string, args: Record<string, unknown>): Promise<McpResponse>;
+	kiroMcpListTools(): Promise<McpResponse>;
 	kiroSnapshot(): ManagerSnapshot | null;
 	kiroSetDisabled(id: number, disabled: boolean): void;
 	kiroSetPriority(id: number, priority: number): void;
@@ -185,9 +183,12 @@ export async function* kiroChat(text: string, model?: KiroModel): AsyncGenerator
 	yield* mod.kiroChat(text, model);
 }
 
-export async function* kiroChatRaw(request: KiroChatRequest): AsyncGenerator<StreamEvent> {
+export async function* kiroChatRaw(
+	request: KiroChatRequest,
+	signal?: AbortSignal,
+): AsyncGenerator<StreamEvent> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
-	yield* mod.kiroChatRaw(request);
+	yield* mod.kiroChatRaw(request, signal);
 }
 
 export async function kiroGenerate(text: string, model?: KiroModel): Promise<string> {
@@ -201,6 +202,11 @@ export async function kiroMcpCall(
 ): Promise<McpResponse> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	return mod.kiroMcpCall(name, args);
+}
+
+export async function kiroMcpListTools(): Promise<McpResponse> {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	return mod.kiroMcpListTools();
 }
 
 export function kiroSnapshot(): ManagerSnapshot | null {

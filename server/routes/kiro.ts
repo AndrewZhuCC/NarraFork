@@ -12,6 +12,7 @@ import {
 	kiroImportCredentials,
 	kiroManualRefresh,
 	kiroMcpCall,
+	kiroMcpListTools,
 	kiroRemoveCredential,
 	kiroResetAndEnable,
 	kiroSetDisabled,
@@ -127,12 +128,29 @@ kiroRoutes.get("/credentials/:id/usage", async (c) => {
 	}
 });
 
+kiroRoutes.get("/mcp-tools", async (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	try {
+		const result = await kiroMcpListTools();
+		return c.json(result);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		return c.json({ error: msg }, 500);
+	}
+});
+
 kiroRoutes.post("/mcp-search", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
-	const { query } = await c.req.json<{ query: string }>();
-	const result = await kiroMcpCall("search", { query });
-	return c.json(result);
+	try {
+		const { query } = await c.req.json<{ query: string }>();
+		const result = await kiroMcpCall("web_search", { query });
+		return c.json(result);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		return c.json({ error: msg }, 500);
+	}
 });
 
 kiroRoutes.post("/chat", async (c) => {
