@@ -5,7 +5,7 @@ import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { api, kiroStreamChat } from "../../lib/api";
-import { BUILTIN_MODELS } from "../../lib/constants";
+import { BUILTIN_MODELS, groupModelsByProvider, type ModelOption } from "../../lib/constants";
 
 export const Route = createFileRoute("/admin/kiro-chat")({
 	component: KiroChatPage,
@@ -27,8 +27,33 @@ function KiroChatPage() {
 		queryFn: api.getSettings,
 	});
 	const allModels = useMemo(() => {
-		return [...BUILTIN_MODELS, ...(settingsData?.agent?.customModels ?? [])];
-	}, [settingsData?.agent?.customModels]);
+		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
+		const kiroModels: ModelOption[] = settingsData?.kiroModels?.length
+			? settingsData.kiroModels
+					.map((m: any) => ({
+						value: String(m.model_id ?? m.modelId ?? ""),
+						label: String(
+							m.model_short_name ??
+								m.modelShortName ??
+								m.model_name ??
+								m.modelName ??
+								m.model_id ??
+								m.modelId ??
+								"",
+						),
+						provider: "kiro" as const,
+						rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
+					}))
+					.filter((m: ModelOption) => m.value)
+			: BUILTIN_MODELS;
+		return [...kiroModels, ...(settingsData?.agent?.customModels ?? [])].filter(
+			(m) => !hidden.includes(m.value),
+		);
+	}, [
+		settingsData?.kiroModels,
+		settingsData?.agent?.customModels,
+		settingsData?.agent?.hiddenModels,
+	]);
 
 	const handleSend = useCallback(async () => {
 		if (!input.trim() || streaming) return;
@@ -77,7 +102,7 @@ function KiroChatPage() {
 					/>
 					<Group>
 						<Select
-							data={allModels}
+							data={groupModelsByProvider(allModels)}
 							value={model}
 							onChange={(v) => v && setModel(v)}
 							label={t("kiroModel")}

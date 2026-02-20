@@ -40,7 +40,12 @@ import {
 } from "../../hooks/useNarrator";
 import { useSessionsListWS } from "../../hooks/useNarratorWS";
 import { api } from "../../lib/api";
-import { BUILTIN_MODELS, NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import {
+	BUILTIN_MODELS,
+	groupModelsByProvider,
+	type ModelOption,
+	NARRATOR_STATUS_COLORS,
+} from "../../lib/constants";
 
 export const Route = createFileRoute("/sessions/")({
 	component: SessionsPage,
@@ -84,8 +89,36 @@ function SessionsPage() {
 	});
 	const customModels = settingsData?.agent?.customModels;
 	const allModels = useMemo(() => {
-		return [...BUILTIN_MODELS, ...(customModels ?? [])];
-	}, [customModels]);
+		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
+		const kiroModels: ModelOption[] = settingsData?.kiroModels?.length
+			? settingsData.kiroModels
+					.map((m: any) => ({
+						value: String(m.model_id ?? m.modelId ?? ""),
+						label: String(
+							m.model_short_name ??
+								m.modelShortName ??
+								m.model_name ??
+								m.modelName ??
+								m.model_id ??
+								m.modelId ??
+								"",
+						),
+						provider: "kiro" as string,
+						rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
+					}))
+					.filter((m: ModelOption) => m.value)
+			: BUILTIN_MODELS.map((m) => ({
+					...m,
+					provider: "kiro" as string,
+				}));
+		const custom = (customModels ?? []).map(
+			(m: { value: string; label: string; provider?: string }) => ({
+				...m,
+				provider: m.provider ?? "openai",
+			}),
+		);
+		return [...kiroModels, ...custom].filter((m) => !hidden.includes(m.value));
+	}, [customModels, settingsData?.kiroModels, settingsData?.agent?.hiddenModels]);
 
 	const sessionIds = useMemo(() => sessions.map((s: any) => s.id), [sessions]);
 	useSessionsListWS(sessionIds, (narratorId, event) => {
@@ -412,7 +445,7 @@ function SessionsPage() {
 					<Select
 						label={t("model")}
 						description={t("modelHint")}
-						data={allModels}
+						data={groupModelsByProvider(allModels)}
 						searchable
 						value={selectedModel || null}
 						onChange={(v) => setSelectedModel(v ?? "")}
