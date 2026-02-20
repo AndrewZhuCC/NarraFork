@@ -7,3 +7,4 @@ frontend/routeTree.gen.ts
 *.db-wal
 *.db-shm
 .worktrees/
+.kiro-dumps/
