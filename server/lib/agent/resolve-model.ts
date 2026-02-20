@@ -1,11 +1,14 @@
 /**
- * Resolve model names to Kiro model IDs.
+ * Resolve user-facing model names to Kiro API model IDs.
+ * This is the single source of truth for model name → Kiro ID mapping.
  *
  * Reverse-engineered from kiro CLI chat model resolution:
  * - Any model containing "sonnet" → "claude-sonnet-4.5"
  * - Opus 4.5/4-5 variants → "claude-opus-4.5"
  * - Other opus variants → "claude-opus-4.6"
  * - Any model containing "haiku" → "claude-haiku-4.5"
+ *
+ * See also: kiro/types.ts (KiroModel type), kiro-adapter.ts (inlined mirror type)
  */
 export function resolveModel(model?: string): string {
 	if (!model) return "claude-sonnet-4.5";
