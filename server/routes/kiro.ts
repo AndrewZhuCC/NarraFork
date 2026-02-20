@@ -8,17 +8,21 @@ import {
 	kiroChat,
 	kiroChatRaw,
 	kiroGetAllUsageCache,
+	kiroGetCachedModels,
 	kiroGetUsage,
 	kiroImportCredentials,
+	kiroListModels,
 	kiroManualRefresh,
 	kiroMcpCall,
 	kiroMcpListTools,
+	kiroRefreshModelCache,
 	kiroRemoveCredential,
 	kiroResetAndEnable,
 	kiroSetDisabled,
 	kiroSetPriority,
 	kiroSnapshot,
 } from "../lib/kiro-adapter";
+import { logger } from "../lib/logger";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 export const kiroRoutes = new Hono();
@@ -124,6 +128,28 @@ kiroRoutes.get("/credentials/:id/usage", async (c) => {
 		return c.json(usage);
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
+		return c.json({ error: msg }, 500);
+	}
+});
+
+kiroRoutes.get("/models", (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	return c.json({ models: kiroGetCachedModels(), fromCache: true });
+});
+
+kiroRoutes.post("/models/refresh", async (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	try {
+		const credentialId = c.req.query("credentialId");
+		const result = await kiroListModels(credentialId ? Number(credentialId) : undefined);
+		// Also update the system-wide cache
+		await kiroRefreshModelCache();
+		return c.json({ models: result.models, credentialId: result.credentialId, fromCache: false });
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("kiro listModels refresh failed", { error: msg, stack: (err as Error)?.stack });
 		return c.json({ error: msg }, 500);
 	}
 });

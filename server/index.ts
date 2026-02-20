@@ -4,7 +4,7 @@ import { serveStatic } from "hono/bun";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import { verifyToken } from "./lib/auth";
-import { initKiro, isKiroAvailable } from "./lib/kiro-adapter";
+import { initKiro, isKiroAvailable, kiroRefreshModelCache } from "./lib/kiro-adapter";
 import { logger } from "./lib/logger";
 import { settings } from "./lib/settings";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
@@ -89,6 +89,11 @@ if (settings.kiro?.credentialsPath) {
 		logger.info(`Kiro plugin: ${ok ? "initialized" : "credentials not found"}`, {
 			available: isKiroAvailable(),
 		});
+		if (ok && isKiroAvailable()) {
+			kiroRefreshModelCache()
+				.then((models) => logger.info(`Kiro model cache: ${models.length} models loaded`))
+				.catch((err) => logger.error("Kiro model cache refresh failed", { error: String(err) }));
+		}
 	} catch (err) {
 		logger.error("Kiro plugin initialization failed", { error: String(err) });
 	}
