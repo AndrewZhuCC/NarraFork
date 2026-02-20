@@ -145,6 +145,10 @@ interface KiroModule {
 	kiroChatRaw(request: KiroChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent>;
 	kiroChat(text: string, model?: KiroModel): AsyncGenerator<StreamEvent>;
 	kiroGenerate(text: string, model?: KiroModel): Promise<string>;
+	kiroGenerateWithMeta(
+		text: string,
+		model?: KiroModel,
+	): Promise<{ text: string; contextPercent?: number }>;
 	kiroMcpCall(name: string, args: Record<string, unknown>): Promise<McpResponse>;
 	kiroMcpListTools(): Promise<McpResponse>;
 	kiroSnapshot(): ManagerSnapshot | null;
@@ -156,6 +160,9 @@ interface KiroModule {
 	kiroImportCredentials(creds: ImportCredentialInput[]): { added: number; duplicates: number };
 	kiroGetUsage(id: number): Promise<UsageCacheEntry>;
 	kiroGetAllUsageCache(): Record<string, UsageCacheEntry>;
+	kiroListModels(
+		credentialId?: number,
+	): Promise<{ models: Array<Record<string, unknown>>; credentialId: number }>;
 }
 
 let mod: KiroModule | null = null;
@@ -194,6 +201,14 @@ export async function* kiroChatRaw(
 export async function kiroGenerate(text: string, model?: KiroModel): Promise<string> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	return mod.kiroGenerate(text, model);
+}
+
+export async function kiroGenerateWithMeta(
+	text: string,
+	model?: KiroModel,
+): Promise<{ text: string; contextPercent?: number }> {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	return mod.kiroGenerateWithMeta(text, model);
 }
 
 export async function kiroMcpCall(
@@ -254,4 +269,37 @@ export async function kiroGetUsage(id: number): Promise<UsageCacheEntry> {
 
 export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	return mod?.kiroGetAllUsageCache() ?? {};
+}
+
+export async function kiroListModels(credentialId?: number): Promise<{
+	models: Array<Record<string, unknown>>;
+	credentialId: number;
+}> {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	return mod.kiroListModels(credentialId);
+}
+
+// --- Cached model list for system-wide use ---
+
+let cachedKiroModels: Array<Record<string, unknown>> = [];
+
+/** Fetch models from the API and cache them. Called once after kiro init. */
+export async function kiroRefreshModelCache(): Promise<Array<Record<string, unknown>>> {
+	if (!mod || !mod.isKiroAvailable()) return [];
+	try {
+		const result = await mod.kiroListModels();
+		cachedKiroModels = result.models.map((m) => {
+			const name = String(m.model_name ?? m.modelName ?? "");
+			return { ...m, model_short_name: name.replace(/^Claude\s+/i, "") };
+		});
+		return cachedKiroModels;
+	} catch {
+		// Keep whatever was cached before (or empty)
+		return cachedKiroModels;
+	}
+}
+
+/** Return the cached kiro model list (synchronous). */
+export function kiroGetCachedModels(): Array<Record<string, unknown>> {
+	return cachedKiroModels;
 }

@@ -2,21 +2,17 @@
 // Multi-credential failover mode using MultiTokenManager
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { effectiveApiRegion } from "./config";
 import type { MultiTokenManager } from "./multi-token-manager";
-import {
-	type CallContext,
-	KiroApiError,
-	type KiroChatRequest,
-	type KiroModel,
-	KiroQuotaError,
-} from "./types";
+import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } from "./types";
 
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
 
-const DUMP_DIR = "/tmp/narrafork-kiro-dumps";
+const DUMP_DIR = resolve(homedir(), ".narrafork", "kiro-dumps");
 let dumpSeq = 0;
 try {
 	mkdirSync(DUMP_DIR, { recursive: true });
@@ -41,16 +37,16 @@ export class KiroApiClient {
 			}
 
 			const agentMode =
-				request.conversationState.currentMessage.userInputMessage.agentMode
-				?? request.conversationState.agentTaskType
-				?? "vibe";
+				request.conversationState.currentMessage.userInputMessage.agentMode ??
+				request.conversationState.agentTaskType ??
+				"vibe";
 			const headers = this.buildHeaders(ctx, attempt, maxRetries, agentMode);
 			// Inject profileArn from credentials if not already set
 			const body = { ...request };
 			if (!body.profileArn && ctx.credentials.profileArn) {
 				body.profileArn = ctx.credentials.profileArn;
 			}
-			const region = effectiveApiRegion(ctx.credentials, this.tokenManager.currentConfig);
+			const region = effectiveApiRegion(this.tokenManager.currentConfig);
 			const url = `https://q.${region}.amazonaws.com`;
 
 			let res: Response;
@@ -74,7 +70,9 @@ export class KiroApiClient {
 				// Dump response metadata
 				try {
 					const resHeaders: Record<string, string> = {};
-					res.headers.forEach((v, k) => { resHeaders[k] = v; });
+					res.headers.forEach((v, k) => {
+						resHeaders[k] = v;
+					});
 					writeFileSync(
 						`${dumpPath}_res_meta.json`,
 						JSON.stringify({ status: res.status, headers: resHeaders }, null, 2),
@@ -142,7 +140,7 @@ export class KiroApiClient {
 		agentMode: string,
 	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
-		const region = effectiveApiRegion(ctx.credentials, config);
+		const region = effectiveApiRegion(config);
 		const { kiroVersion } = config;
 		const [os, osVersion] = config.systemVersion.split("#");
 

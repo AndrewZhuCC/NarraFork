@@ -126,7 +126,7 @@ export class KiroMcpClient {
 
 	private buildUrl(ctx: CallContext): string {
 		const config = this.tokenManager.currentConfig;
-		const region = effectiveApiRegion(ctx.credentials, config);
+		const region = effectiveApiRegion(config);
 		return `https://q.${region}.amazonaws.com`;
 	}
 
@@ -136,7 +136,7 @@ export class KiroMcpClient {
 		maxRetries: number,
 	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
-		const region = effectiveApiRegion(ctx.credentials, config);
+		const region = effectiveApiRegion(config);
 		const { kiroVersion } = config;
 		const [os, osVersion] = config.systemVersion.split("#");
 

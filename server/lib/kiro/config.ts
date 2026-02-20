@@ -79,9 +79,9 @@ export function effectiveAuthRegion(creds: KiroCredentials, config: KiroConfig):
 	return creds.authRegion ?? creds.region ?? config.authRegion ?? config.region;
 }
 
-/** cred.apiRegion > config.apiRegion > config.region */
-export function effectiveApiRegion(creds: KiroCredentials, config: KiroConfig): string {
-	return creds.apiRegion ?? config.apiRegion ?? config.region;
+/** config.apiRegion > config.region (credential region only used for token refresh) */
+export function effectiveApiRegion(config: KiroConfig): string {
+	return config.apiRegion ?? config.region;
 }
 
 // --- Multi-credential support ---

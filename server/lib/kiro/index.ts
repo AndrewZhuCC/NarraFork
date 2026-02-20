@@ -98,13 +98,27 @@ export async function* kiroChat(text: string, model?: KiroModel): AsyncGenerator
 
 /** Collect full response from Claude via Kiro API. */
 export async function kiroGenerate(text: string, model?: KiroModel): Promise<string> {
+	const result = await kiroGenerateWithMeta(text, model);
+	return result.text;
+}
+
+/** Like kiroGenerate but also returns contextUsagePercentage if available. */
+export async function kiroGenerateWithMeta(
+	text: string,
+	model?: KiroModel,
+): Promise<{ text: string; contextPercent?: number }> {
 	const chunks: string[] = [];
+	let contextPercent: number | undefined;
 	for await (const evt of kiroChat(text, model)) {
 		if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
 			chunks.push(String(evt.data.content));
 		}
+		if (evt.eventType === "contextUsageEvent") {
+			const pct = evt.data.contextUsagePercentage ?? evt.data.context_usage_percentage;
+			if (pct != null) contextPercent = Number(pct);
+		}
 	}
-	return chunks.join("");
+	return { text: chunks.join(""), contextPercent };
 }
 
 // --- MCP ---
@@ -216,6 +230,14 @@ export async function kiroGetUsage(id: number): Promise<UsageCacheEntry> {
 		console.log("[kiro:usage] cache save failed:", err);
 	}
 	return result;
+}
+
+export async function kiroListModels(credentialId?: number): Promise<{
+	models: Array<Record<string, unknown>>;
+	credentialId: number;
+}> {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	return tokenManager.listAvailableModels(credentialId);
 }
 
 export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {

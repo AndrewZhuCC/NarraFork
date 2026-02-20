@@ -2,6 +2,7 @@
 // Supports multiple credentials with failover, load balancing, and self-healing
 
 import { createHash, randomUUID } from "node:crypto";
+import { logger } from "../logger";
 import {
 	effectiveApiRegion,
 	loadStats,
@@ -457,17 +458,17 @@ export class MultiTokenManager {
 	// ==================== Usage Limits ====================
 
 	async getUsageLimits(id: number): Promise<UsageCacheEntry> {
-		console.log("[kiro:usage] start, id=", id);
+		logger.debug("[kiro:usage] start", { credentialId: id });
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 
-		console.log("[kiro:usage] tryEnsureToken...");
+		logger.debug("[kiro:usage] tryEnsureToken");
 		const ctx = await this.tryEnsureToken(entry);
 		if (!ctx) throw new KiroAuthError(`Cannot acquire valid token for credential ${id}`);
-		console.log("[kiro:usage] token ok");
+		logger.debug("[kiro:usage] token ok");
 
 		const creds = entry.credentials;
-		const region = effectiveApiRegion(creds, this.config);
+		const region = effectiveApiRegion(this.config);
 		const { kiroVersion } = this.config;
 		const host = `q.${region}.amazonaws.com`;
 		const url = `https://${host}`;
@@ -490,25 +491,25 @@ export class MultiTokenManager {
 			Authorization: `Bearer ${ctx.token}`,
 		};
 
-		console.log("[kiro:usage] fetch POST", url);
+		logger.debug("[kiro:usage] fetch POST", { url });
 		let res: Response;
 		try {
 			res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
 		} catch (err) {
-			console.log("[kiro:usage] fetch threw:", err);
+			logger.error("[kiro:usage] fetch threw", { error: String(err) });
 			throw new Error(
 				`getUsageLimits network error: ${err instanceof Error ? err.message : String(err)}`,
 			);
 		}
 
-		console.log("[kiro:usage] response status=", res.status);
+		logger.debug("[kiro:usage] response", { status: res.status });
 		if (!res.ok) {
 			const body = await res.text().catch(() => "");
-			console.log("[kiro:usage] not ok, body=", body.slice(0, 200));
+			logger.warn("[kiro:usage] not ok", { status: res.status, body: body.slice(0, 200) });
 			throw new Error(`getUsageLimits failed: ${res.status} ${body}`);
 		}
 
-		console.log("[kiro:usage] parsing json...");
+		logger.debug("[kiro:usage] parsing json");
 		let data: {
 			nextDateReset?: number;
 			subscriptionInfo?: { subscriptionTitle?: string };
@@ -533,7 +534,7 @@ export class MultiTokenManager {
 		} catch {
 			throw new Error("getUsageLimits: failed to parse response JSON");
 		}
-		console.log("[kiro:usage] json ok, breakdowns=", data.usageBreakdownList?.length ?? 0);
+		logger.debug("[kiro:usage] json ok", { breakdowns: data.usageBreakdownList?.length ?? 0 });
 
 		// Parse response: primary breakdown + active bonuses + active free trial
 		const breakdown = data.usageBreakdownList?.[0];
@@ -554,7 +555,7 @@ export class MultiTokenManager {
 		const subscriptionTitle = data.subscriptionInfo?.subscriptionTitle;
 		const nextResetAt = data.nextDateReset ?? breakdown?.nextDateReset;
 
-		console.log("[kiro:usage] usage=", totalUsage, "limit=", totalLimit, "sub=", subscriptionTitle);
+		logger.debug("[kiro:usage] parsed", { totalUsage, totalLimit, subscriptionTitle });
 
 		// Update subscriptionTitle on credential if changed
 		if (subscriptionTitle && subscriptionTitle !== creds.subscriptionTitle) {
@@ -570,7 +571,7 @@ export class MultiTokenManager {
 		const usagePercentage =
 			totalLimit > 0 ? Math.round((totalUsage / totalLimit) * 10000) / 100 : 0;
 
-		console.log("[kiro:usage] done, remaining=", remaining);
+		logger.debug("[kiro:usage] done", { remaining });
 		return {
 			id,
 			subscriptionTitle,
@@ -581,6 +582,107 @@ export class MultiTokenManager {
 			nextResetAt,
 			queriedAt: new Date().toISOString(),
 		};
+	}
+
+	// ==================== List Available Models ====================
+
+	async listAvailableModels(credentialId?: number): Promise<{
+		models: Array<Record<string, unknown>>;
+		credentialId: number;
+	}> {
+		const entry = credentialId
+			? this.entries.find((e) => e.id === credentialId)
+			: this.entries.find((e) => !e.disabled);
+		if (!entry)
+			throw new Error(
+				credentialId ? `Credential not found: ${credentialId}` : "No available credentials",
+			);
+
+		const ctx = await this.tryEnsureToken(entry);
+		if (!ctx) throw new KiroAuthError(`Cannot acquire valid token for credential ${entry.id}`);
+
+		const creds = entry.credentials;
+		const region = effectiveApiRegion(this.config);
+		const { kiroVersion } = this.config;
+		const host = `q.${region}.amazonaws.com`;
+		const url = `https://${host}`;
+
+		const reqBody: Record<string, unknown> = {
+			origin: "AI_EDITOR",
+			maxResults: 100,
+		};
+		if (creds.profileArn) reqBody.profileArn = creds.profileArn;
+
+		const allModels: Array<Record<string, unknown>> = [];
+		let nextToken: string | undefined;
+
+		logger.debug("[kiro:models] start", { credentialId: entry.id, region });
+
+		do {
+			if (nextToken) reqBody.nextToken = nextToken;
+			else delete reqBody.nextToken;
+
+			// Build query string (AWS JSON 1.0 dual encoding: query params + JSON body)
+			const params = new URLSearchParams();
+			params.set("origin", "AI_EDITOR");
+			if (reqBody.maxResults != null) params.set("maxResults", String(reqBody.maxResults));
+			if (creds.profileArn) params.set("profileArn", creds.profileArn);
+			if (nextToken) params.set("nextToken", nextToken);
+			const requestUrl = `${url}/?${params.toString()}`;
+
+			const headers: Record<string, string> = {
+				"Content-Type": "application/x-amz-json-1.0",
+				"x-amz-target": "AmazonCodeWhispererService.ListAvailableModels",
+				"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
+				Host: host,
+				"amz-sdk-invocation-id": randomUUID(),
+				"amz-sdk-request": "attempt=1; max=1",
+				Authorization: `Bearer ${ctx.token}`,
+			};
+
+			logger.debug("[kiro:models] fetch POST", { url: requestUrl });
+			let res: Response;
+			try {
+				res = await fetch(requestUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+			} catch (err) {
+				throw new Error(
+					`ListAvailableModels network error: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			logger.debug("[kiro:models] response", { status: res.status });
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				logger.warn("[kiro:models] not ok", { status: res.status, body: body.slice(0, 500) });
+				throw new Error(`ListAvailableModels failed: ${res.status} ${body}`);
+			}
+
+			let data: Record<string, unknown>;
+			try {
+				data = await res.json();
+			} catch {
+				throw new Error("ListAvailableModels: failed to parse response JSON");
+			}
+			logger.debug("[kiro:models] json ok", {
+				models: Array.isArray(data.models) ? data.models.length : typeof data.models,
+				keys: Object.keys(data).join(","),
+			});
+			if (data.models != null && !Array.isArray(data.models)) {
+				throw new Error(
+					`ListAvailableModels: unexpected response shape: ${JSON.stringify(data).slice(0, 500)}`,
+				);
+			}
+			if (!data.models) {
+				// Server returned 200 but no models field — treat as error with response dump
+				throw new Error(
+					`ListAvailableModels: response missing 'models' field: ${JSON.stringify(data).slice(0, 500)}`,
+				);
+			}
+			if (Array.isArray(data.models)) allModels.push(...data.models);
+			nextToken = (data.nextToken as string) || undefined;
+		} while (nextToken);
+
+		logger.debug("[kiro:models] done", { total: allModels.length });
+		return { models: allModels, credentialId: entry.id };
 	}
 
 	get availableCount(): number {

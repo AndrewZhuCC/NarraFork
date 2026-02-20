@@ -210,7 +210,7 @@ export interface KiroHistoryUserMessage {
 
 export interface KiroHistoryAssistantMessage {
 	assistantResponseMessage: {
-		content: string;
+		content?: string;
 		toolUses?: Array<{
 			toolUseId: string;
 			name: string;
