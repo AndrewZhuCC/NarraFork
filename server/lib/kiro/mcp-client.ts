@@ -124,7 +124,7 @@ export class KiroMcpClient {
 		throw lastError ?? new Error("MCP: max retries exceeded");
 	}
 
-	private buildUrl(ctx: CallContext): string {
+	private buildUrl(_ctx: CallContext): string {
 		const config = this.tokenManager.currentConfig;
 		const region = effectiveApiRegion(config);
 		return `https://q.${region}.amazonaws.com`;

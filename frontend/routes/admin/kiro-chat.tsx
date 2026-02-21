@@ -30,6 +30,7 @@ function KiroChatPage() {
 		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
 		const kiroModels: ModelOption[] = settingsData?.kiroModels?.length
 			? settingsData.kiroModels
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 					.map((m: any) => ({
 						value: String(m.model_id ?? m.modelId ?? ""),
 						label: String(

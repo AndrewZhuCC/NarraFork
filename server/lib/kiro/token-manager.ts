@@ -35,7 +35,7 @@ function detectAuthMethod(creds: KiroCredentials): string {
 }
 
 async function refreshSocial(creds: KiroCredentials, config: KiroConfig): Promise<KiroCredentials> {
-	const rt = creds.refreshToken!;
+	const rt = creds.refreshToken ?? "";
 	const region = effectiveAuthRegion(creds, config);
 	const domain = `prod.${region}.auth.desktop.kiro.dev`;
 	const url = `https://${domain}/refreshToken`;
@@ -81,7 +81,7 @@ async function refreshSocial(creds: KiroCredentials, config: KiroConfig): Promis
 }
 
 async function refreshIdc(creds: KiroCredentials, config: KiroConfig): Promise<KiroCredentials> {
-	const rt = creds.refreshToken!;
+	const rt = creds.refreshToken ?? "";
 	const clientId = creds.clientId;
 	const clientSecret = creds.clientSecret;
 	if (!clientId || !clientSecret) {

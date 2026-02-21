@@ -37,6 +37,7 @@ function KiroModelsPage() {
 	});
 
 	const credentialOptions =
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		status?.snapshot?.entries?.map((e: any) => ({
 			value: String(e.id),
 			label: `#${e.id} ${e.email ?? ""} ${e.disabled ? "(disabled)" : ""}`.trim(),
@@ -129,6 +130,7 @@ function KiroModelsPage() {
 							</Table.Tr>
 						</Table.Thead>
 						<Table.Tbody>
+							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 							{models.map((m: any, idx: number) => (
 								<Table.Tr key={m.model_id ?? m.modelId ?? m.value ?? idx}>
 									<Table.Td>

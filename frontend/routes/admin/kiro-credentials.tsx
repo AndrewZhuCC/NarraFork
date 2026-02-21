@@ -52,6 +52,7 @@ function KiroCredentialsPage() {
 	});
 
 	const snapshot = status?.snapshot;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const usageCache: Record<string, any> = (status as any)?.usageCache ?? {};
 
 	const disableMut = useMutation({
@@ -75,6 +76,7 @@ function KiroCredentialsPage() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
 	});
 	const importMut = useMutation({
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		mutationFn: (creds: any[]) => api.kiroImportCredentials(creds),
 		onSuccess: (data) => {
 			setImportResult(t("kiroImportSuccess", { added: data.added, duplicates: data.duplicates }));
@@ -112,6 +114,7 @@ function KiroCredentialsPage() {
 
 	if (isLoading) return <Loader />;
 
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const entries: any[] = snapshot?.entries ?? [];
 
 	return (
@@ -181,6 +184,7 @@ function KiroCredentialsPage() {
 							</Table.Tr>
 						</Table.Thead>
 						<Table.Tbody>
+							{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
 							{entries.map((entry: any) => {
 								const usage = usageCache[String(entry.id)];
 								return (

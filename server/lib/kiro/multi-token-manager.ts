@@ -183,7 +183,7 @@ export class MultiTokenManager {
 			if (excludeIds?.has(e.id)) return false;
 			if (isOpus) {
 				const title = e.credentials.subscriptionTitle;
-				if (title && title.toUpperCase().includes("FREE")) return false;
+				if (title?.toUpperCase().includes("FREE")) return false;
 			}
 			return true;
 		});

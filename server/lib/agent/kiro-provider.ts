@@ -7,6 +7,7 @@ import type {
 	KiroImage,
 	KiroToolResult,
 } from "../kiro/types";
+import { getToolMessage, type Locale } from "../prompt-i18n";
 import { getImagePath, imageToBase64 } from "../uploads";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
@@ -44,7 +45,7 @@ export class KiroProvider implements ProviderAdapter {
 	): void {
 		const modelId = resolveModel(model);
 		const h = history as KiroHistoryMessage[];
-		const ack = locale === "zh-CN" ? "我会遵循这些指示。" : "I will follow these instructions.";
+		const ack = getToolMessage("systemPromptAck", (locale ?? "en") as Locale);
 		h.unshift(
 			{
 				userInputMessage: {
@@ -114,6 +115,7 @@ export class KiroProvider implements ProviderAdapter {
 	async generate(text: string, model: string): Promise<string> {
 		const { kiroGenerate } = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		return kiroGenerate(text, modelId as any);
 	}
 
@@ -123,6 +125,7 @@ export class KiroProvider implements ProviderAdapter {
 	): Promise<{ text: string; contextPercent?: number }> {
 		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		return kiroGenerateWithMeta(text, modelId as any);
 	}
 
@@ -134,14 +137,8 @@ export class KiroProvider implements ProviderAdapter {
 	): Promise<string> {
 		const kiroAdapter = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
-		const ack =
-			locale === "zh-CN"
-				? "明白。我只会生成一个简短的标题。请发送内容。"
-				: "Understood. I will generate only a short title. Send me the content.";
-		const reminder =
-			locale === "zh-CN"
-				? "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。"
-				: "Reply with ONLY a short title (max 50 chars), nothing else.";
+		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
+		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 
 		const request: import("../kiro-adapter").KiroChatRequest = {
 			conversationState: {
@@ -211,6 +208,7 @@ function buildKiroRequest(params: ChatParams): KiroChatRequest {
 					origin: "AI_EDITOR",
 					...(kiroImages ? { images: kiroImages } : {}),
 					userInputMessageContext: {
+						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 						tools: params.tools as any[],
 						...(toolResults.length > 0 ? { toolResults } : {}),
 					},
@@ -436,7 +434,7 @@ async function buildKiroHistory(
 				if (imageBlocks.length > 0) {
 					const resolved: KiroImage[] = [];
 					for (const block of imageBlocks) {
-						const filePath = getImagePath(narratorId, block.imageId!);
+						const filePath = getImagePath(narratorId, block.imageId ?? "");
 						if (filePath) {
 							try {
 								const base64 = await imageToBase64(filePath);

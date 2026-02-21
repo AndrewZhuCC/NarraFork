@@ -209,7 +209,7 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 	saveAllCredentials(pluginConfig.credentialsPath, merged);
 	const ok = initKiro(pluginConfig);
 	if (!ok) throw new Error("Imported credentials but initKiro still failed — check refreshTokens");
-	const afterCount = tokenManager!.snapshot().total;
+	const afterCount = tokenManager?.snapshot().total ?? 0;
 	const added = afterCount - existing.length;
 	return { added: Math.max(added, 0), duplicates: creds.length - Math.max(added, 0) };
 }

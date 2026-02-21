@@ -226,6 +226,7 @@ function SettingsPage() {
 	// Use remote kiro models if available, otherwise fall back to hardcoded builtins
 	const kiroModels: ModelOption[] = settings?.kiroModels?.length
 		? settings.kiroModels
+				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				.map((m: any) => ({
 					value: String(m.model_id ?? m.modelId ?? ""),
 					label: String(

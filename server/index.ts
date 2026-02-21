@@ -84,6 +84,7 @@ if (settings.kiro?.credentialsPath) {
 			configPath:
 				settings.kiro.configPath ??
 				settings.kiro.credentialsPath.replace("credentials.json", "config.json"),
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			defaultModel: settings.kiro.defaultModel as any,
 		});
 		logger.info(`Kiro plugin: ${ok ? "initialized" : "credentials not found"}`, {
