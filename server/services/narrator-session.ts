@@ -534,14 +534,14 @@ async function createSession(
 	const narrator = await narratorService.getById(narratorId);
 
 	// Resolve branch-level session state
-	let effectiveSessionId = narrator.claudeSessionId;
+	let effectiveConversationId = narrator.apiConversationId;
 	let effectiveContextSummary = narrator.contextSummary;
 	if (narrator.activeBranchId) {
 		const branch = await db.query.conversationBranches.findFirst({
 			where: eq(conversationBranches.id, narrator.activeBranchId),
 		});
 		if (branch) {
-			effectiveSessionId = branch.claudeSessionId ?? null;
+			effectiveConversationId = branch.apiConversationId ?? null;
 			effectiveContextSummary = branch.contextSummary ?? null;
 		}
 	}
@@ -575,7 +575,7 @@ async function createSession(
 	const session: ActiveSession = {
 		abortController,
 		narratorId,
-		conversationId: effectiveSessionId ?? randomUUID(),
+		conversationId: effectiveConversationId ?? randomUUID(),
 		cwd: sessionCwd,
 		model: sessionModel,
 		provider: resolveProvider(sessionModel),
@@ -819,7 +819,7 @@ async function runAgentLoop(
 
 /**
  * Run custom compact: generate a summary from DB messages and store it.
- * Clears claudeSessionId so the next session starts fresh with the summary.
+ * Clears apiConversationId so the next session starts fresh with the summary.
  */
 export async function runCustomCompact(
 	narratorId: string,
@@ -857,7 +857,7 @@ export async function runCustomCompact(
 			.update(conversationBranches)
 			.set({
 				contextSummary: summary,
-				claudeSessionId: null,
+				apiConversationId: null,
 				updatedAt: now,
 			})
 			.where(eq(conversationBranches.id, narrator.activeBranchId));
@@ -866,7 +866,7 @@ export async function runCustomCompact(
 			.update(narrators)
 			.set({
 				contextSummary: summary,
-				claudeSessionId: null,
+				apiConversationId: null,
 				updatedAt: now,
 			})
 			.where(eq(narrators.id, narratorId));
