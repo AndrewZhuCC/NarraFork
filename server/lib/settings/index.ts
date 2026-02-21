@@ -19,6 +19,7 @@ export interface NarraForkSettings {
 		customModels: ModelOption[];
 		hiddenModels: string[];
 		extendedContext: boolean;
+		maxTurns: number;
 	};
 	chapters: {
 		maxActiveWorktrees: number;
@@ -60,6 +61,7 @@ const DEFAULTS: NarraForkSettings = {
 		customModels: [],
 		hiddenModels: [],
 		extendedContext: false,
+		maxTurns: 200,
 	},
 	chapters: {
 		maxActiveWorktrees: 10,

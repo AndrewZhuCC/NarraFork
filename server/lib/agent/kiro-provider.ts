@@ -4,8 +4,10 @@ import type {
 	KiroHistoryAssistantMessage,
 	KiroHistoryMessage,
 	KiroHistoryUserMessage,
+	KiroImage,
 	KiroToolResult,
 } from "../kiro/types";
+import { getImagePath, imageToBase64 } from "../uploads";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
 import { zodToJsonSchema } from "./tool-registry";
@@ -27,15 +29,22 @@ export class KiroProvider implements ProviderAdapter {
 		}));
 	}
 
-	buildHistory(
+	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
-	): { history: unknown[]; trailingToolResults: unknown[] } {
-		return buildKiroHistory(dbMessages, model);
+		narratorId?: string,
+	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
+		return buildKiroHistory(dbMessages, model, narratorId);
 	}
-	injectSystemPrompt(history: unknown[], systemPrompt: string, model: string): void {
+	injectSystemPrompt(
+		history: unknown[],
+		systemPrompt: string,
+		model: string,
+		locale?: string,
+	): void {
 		const modelId = resolveModel(model);
 		const h = history as KiroHistoryMessage[];
+		const ack = locale === "zh-CN" ? "我会遵循这些指示。" : "I will follow these instructions.";
 		h.unshift(
 			{
 				userInputMessage: {
@@ -46,7 +55,7 @@ export class KiroProvider implements ProviderAdapter {
 			},
 			{
 				assistantResponseMessage: {
-					content: "I will follow these instructions.",
+					content: ack,
 				},
 			},
 		);
@@ -54,7 +63,7 @@ export class KiroProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const { kiroChatRaw } = await import("../kiro-adapter");
-		const request = buildKiroRequest(params);
+		const request = buildKiroRequest(params) as import("../kiro-adapter").KiroChatRequest;
 		for await (const evt of kiroChatRaw(request, params.signal)) {
 			yield parseKiroStreamEvent(evt);
 		}
@@ -87,7 +96,7 @@ export class KiroProvider implements ProviderAdapter {
 		const h = history as KiroHistoryMessage[];
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
-				content: text || ".",
+				content: text || "",
 				...(toolUses.length > 0
 					? {
 							toolUses: toolUses.map((tu) => ({
@@ -101,6 +110,76 @@ export class KiroProvider implements ProviderAdapter {
 		};
 		h.push(assistantMsg);
 	}
+
+	async generate(text: string, model: string): Promise<string> {
+		const { kiroGenerate } = await import("../kiro-adapter");
+		const modelId = resolveModel(model);
+		return kiroGenerate(text, modelId as any);
+	}
+
+	async generateWithMeta(
+		text: string,
+		model: string,
+	): Promise<{ text: string; contextPercent?: number }> {
+		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
+		const modelId = resolveModel(model);
+		return kiroGenerateWithMeta(text, modelId as any);
+	}
+
+	async generateWithHistory(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<string> {
+		const kiroAdapter = await import("../kiro-adapter");
+		const modelId = resolveModel(model);
+		const ack =
+			locale === "zh-CN"
+				? "明白。我只会生成一个简短的标题。请发送内容。"
+				: "Understood. I will generate only a short title. Send me the content.";
+		const reminder =
+			locale === "zh-CN"
+				? "只回复一个简短的标题（最多50个字符），不要回复其他任何内容。"
+				: "Reply with ONLY a short title (max 50 chars), nothing else.";
+
+		const request: import("../kiro-adapter").KiroChatRequest = {
+			conversationState: {
+				conversationId: crypto.randomUUID(),
+				chatTriggerType: "MANUAL",
+				history: [
+					{
+						userInputMessage: {
+							content: systemInstruction,
+							modelId,
+							origin: "AI_EDITOR",
+						},
+					},
+					{
+						assistantResponseMessage: {
+							content: ack,
+						},
+					},
+				] as Record<string, unknown>[],
+				currentMessage: {
+					userInputMessage: {
+						content: `${reminder}\n\n${content}`,
+						modelId,
+						userInputMessageContext: {},
+						origin: "AI_EDITOR",
+					},
+				},
+			},
+		};
+
+		const chunks: string[] = [];
+		for await (const evt of kiroAdapter.kiroChatRaw(request)) {
+			if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
+				chunks.push(String(evt.data.content));
+			}
+		}
+		return chunks.join("");
+	}
 }
 
 // === Private helpers ===
@@ -109,6 +188,14 @@ function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	const modelId = resolveModel(params.model);
 	const history = params.history as KiroHistoryMessage[];
 	const toolResults = params.toolResults as KiroToolResult[];
+
+	// Convert generic images to KiroImage format
+	const kiroImages: import("../kiro/types").KiroImage[] | undefined = params.images?.length
+		? params.images.map((img) => ({
+				format: img.format as "jpeg" | "png" | "gif" | "webp",
+				source: { bytes: img.base64 },
+			}))
+		: undefined;
 
 	return {
 		conversationState: {
@@ -122,6 +209,7 @@ function buildKiroRequest(params: ChatParams): KiroChatRequest {
 					content: params.content,
 					modelId,
 					origin: "AI_EDITOR",
+					...(kiroImages ? { images: kiroImages } : {}),
 					userInputMessageContext: {
 						tools: params.tools as any[],
 						...(toolResults.length > 0 ? { toolResults } : {}),
@@ -235,10 +323,11 @@ function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 
 // === buildKiroHistory — moved from message-builder.ts ===
 
-function buildKiroHistory(
+async function buildKiroHistory(
 	dbMessages: DbMessage[],
 	model: string,
-): { history: KiroHistoryMessage[]; trailingToolResults: KiroToolResult[] } {
+	narratorId?: string,
+): Promise<{ history: KiroHistoryMessage[]; trailingToolResults: KiroToolResult[] }> {
 	const modelId = resolveModel(model);
 
 	// Only top-level user/assistant messages
@@ -276,7 +365,7 @@ function buildKiroHistory(
 			if (pendingToolResults.length > 0) {
 				history.push({
 					userInputMessage: {
-						content: ".",
+						content: "",
 						modelId,
 						origin: "AI_EDITOR",
 						userInputMessageContext: { toolResults: pendingToolResults },
@@ -310,7 +399,7 @@ function buildKiroHistory(
 
 			const assistantMsg: KiroHistoryAssistantMessage = {
 				assistantResponseMessage: {
-					content: text || ".",
+					content: text || "",
 					...(toolUses.length > 0 ? { toolUses } : {}),
 				},
 			};
@@ -337,11 +426,45 @@ function buildKiroHistory(
 			}
 		} else if (msg.role === "user") {
 			const text = msg.contentText || "";
+
+			// Extract images from contentJson if narratorId is available
+			let images: KiroImage[] | undefined;
+			if (narratorId && Array.isArray(msg.contentJson)) {
+				const imageBlocks = (
+					msg.contentJson as Array<{ type: string; imageId?: string; mediaType?: string }>
+				).filter((b) => b.type === "image" && b.imageId);
+				if (imageBlocks.length > 0) {
+					const resolved: KiroImage[] = [];
+					for (const block of imageBlocks) {
+						const filePath = getImagePath(narratorId, block.imageId!);
+						if (filePath) {
+							try {
+								const base64 = await imageToBase64(filePath);
+								const mimeToFormat: Record<string, string> = {
+									"image/png": "png",
+									"image/jpeg": "jpeg",
+									"image/gif": "gif",
+									"image/webp": "webp",
+								};
+								resolved.push({
+									format: (mimeToFormat[block.mediaType ?? ""] ?? "png") as KiroImage["format"],
+									source: { bytes: base64 },
+								});
+							} catch {
+								// Image file may have been deleted — skip silently
+							}
+						}
+					}
+					if (resolved.length > 0) images = resolved;
+				}
+			}
+
 			const userMsg: KiroHistoryUserMessage = {
 				userInputMessage: {
 					content: text,
 					modelId,
 					origin: "AI_EDITOR",
+					...(images ? { images } : {}),
 					userInputMessageContext:
 						pendingToolResults.length > 0 ? { toolResults: pendingToolResults } : {},
 				},
