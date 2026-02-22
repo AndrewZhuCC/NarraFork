@@ -4,13 +4,7 @@ import { readFile } from "node:fs/promises";
 import { join, normalize, resolve } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { db, sqlite } from "../db";
-import {
-	chapters,
-	conversationBranches,
-	narratorMessages,
-	narrators,
-	narratorToolCalls,
-} from "../db/schema";
+import { chapters, narratorMessages, narrators, narratorToolCalls } from "../db/schema";
 import {
 	type AgentEvent,
 	agentLoop,
@@ -27,7 +21,7 @@ import {
 	getReplyLanguageInstruction,
 	getToolMessage,
 } from "../lib/prompt-i18n";
-import { settings } from "../lib/settings";
+import { resolveProvider, settings } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { getImagePath, imageToBase64 } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
@@ -38,15 +32,6 @@ import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
 // === In-memory state ===
 
 // User-facing model names that map to Kiro provider (see resolve-model.ts for ID mapping)
-const BUILTIN_KIRO_MODELS = ["claude-haiku", "claude-sonnet", "claude-opus"];
-
-/** Resolve provider name for a given model by looking up settings.agent.customModels. */
-function resolveProvider(model: string): string {
-	if (BUILTIN_KIRO_MODELS.includes(model)) return "kiro";
-	const custom = settings.agent.customModels ?? [];
-	const found = custom.find((m: { value: string; provider?: string }) => m.value === model);
-	return found?.provider ?? "kiro";
-}
 
 interface ActiveSession {
 	abortController: AbortController;
@@ -82,6 +67,8 @@ interface PendingPermission {
 	input: Record<string, unknown>;
 	narratorId: string;
 	toolUseId: string;
+	/** For subagent permissions: broadcast to parent narrator's WS channel instead of own. */
+	broadcastTargetId: string;
 }
 
 const pendingPermissions = new Map<string, PendingPermission>();
@@ -141,7 +128,9 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 
 // WebSearch is auto-allowed because it delegates to Kiro MCP server-side
 // and does not access the local filesystem or execute arbitrary commands.
-const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch"];
+// Task is auto-allowed because it only spawns a subagent — the subagent's
+// individual tools go through their own permission checks.
+const ALWAYS_ALLOW_TOOLS = ["TodoWrite", "EnterPlanMode", "WebSearch", "Task"];
 
 const ACCEPT_EDITS_AUTO_ALLOW = [
 	"Edit",
@@ -169,6 +158,8 @@ export function resolvePermissionDecision(
 ): "allow" | "deny" | "ask" {
 	// Plan mode: deny mutating tools (except Bash which keeps its normal permission flow)
 	if (planMode && !PLAN_MODE_ALLOWED_TOOLS.has(toolName)) return "deny";
+	// Plan mode: Task is allowed but only for explore/plan subagents (general has write access)
+	if (planMode && toolName === "Task" && input.subagent_type === "general") return "deny";
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
 	if (ALWAYS_ALLOW_TOOLS.includes(toolName)) return "allow";
 	if (permMode === "bypassPermissions") return "allow";
@@ -185,7 +176,7 @@ export function resolvePermissionDecision(
 	return "ask";
 }
 
-async function handlePermission(
+export async function handlePermission(
 	narratorId: string,
 	signal: AbortSignal,
 	toolName: string,
@@ -193,7 +184,9 @@ async function handlePermission(
 	toolUseId: string,
 	cwd: string,
 	locale: Locale = "en",
+	broadcastTargetId?: string,
 ): Promise<PermissionResult> {
+	const wsTarget = broadcastTargetId ?? narratorId;
 	// Read permission mode and plan mode from DB in real-time
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -270,18 +263,22 @@ async function handlePermission(
 		.set({ status: "pending" })
 		.where(eq(narratorToolCalls.id, toolCallId));
 
-	broadcastToNarrator(narratorId, {
+	broadcastToNarrator(wsTarget, {
 		type: "permission_request",
-		narratorId,
+		narratorId: wsTarget,
 		request: { id: toolCallId, toolName, toolUseId, inputJson: input },
 	});
 	eventBus.emit({ type: "narrator:permission_request", narratorId, requestId: toolCallId });
 	await narratorService.updateStatus(narratorId, "waiting");
+	// When a subagent requests permission, also set the parent narrator to waiting
+	if (broadcastTargetId && broadcastTargetId !== narratorId) {
+		await narratorService.updateStatus(broadcastTargetId, "waiting");
+	}
 
 	if (signal.aborted) {
-		broadcastToNarrator(narratorId, {
+		broadcastToNarrator(wsTarget, {
 			type: "permission_resolved",
-			narratorId,
+			narratorId: wsTarget,
 			requestId: toolCallId,
 			toolUseId,
 		});
@@ -313,9 +310,9 @@ async function handlePermission(
 				timeoutMs: PERMISSION_TIMEOUT_MS,
 			});
 			cleanup();
-			broadcastToNarrator(narratorId, {
+			broadcastToNarrator(wsTarget, {
 				type: "permission_resolved",
-				narratorId,
+				narratorId: wsTarget,
 				requestId: toolCallId,
 				toolUseId,
 			});
@@ -328,6 +325,10 @@ async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
+			// Restore parent narrator status on timeout
+			if (broadcastTargetId && broadcastTargetId !== narratorId) {
+				await narratorService.updateStatus(broadcastTargetId, "thinking");
+			}
 			resolve({ behavior: "deny", message: "Permission request timed out" });
 		}, PERMISSION_TIMEOUT_MS);
 
@@ -339,9 +340,9 @@ async function handlePermission(
 				toolName,
 			});
 			cleanup();
-			broadcastToNarrator(narratorId, {
+			broadcastToNarrator(wsTarget, {
 				type: "permission_resolved",
-				narratorId,
+				narratorId: wsTarget,
 				requestId: toolCallId,
 				toolUseId,
 			});
@@ -354,6 +355,10 @@ async function handlePermission(
 					permissionDecidedAt: new Date().toISOString(),
 				})
 				.where(eq(narratorToolCalls.id, toolCallId));
+			// Restore parent narrator status on abort
+			if (broadcastTargetId && broadcastTargetId !== narratorId) {
+				await narratorService.updateStatus(broadcastTargetId, "thinking");
+			}
 			resolve({ behavior: "deny", message: "Session aborted" });
 		};
 
@@ -365,6 +370,7 @@ async function handlePermission(
 			input,
 			narratorId,
 			toolUseId,
+			broadcastTargetId: wsTarget,
 		});
 	});
 }
@@ -399,15 +405,19 @@ export async function resolvePermission(
 	pending.cleanup();
 
 	// Broadcast to all subscribers so other tabs can clear the permission banner
-	broadcastToNarrator(pending.narratorId, {
+	broadcastToNarrator(pending.broadcastTargetId, {
 		type: "permission_resolved",
-		narratorId: pending.narratorId,
+		narratorId: pending.broadcastTargetId,
 		requestId,
 		toolUseId: pending.toolUseId,
 	});
 
 	try {
 		await narratorService.updateStatus(pending.narratorId, "thinking");
+		// Restore parent narrator status when subagent permission is resolved
+		if (pending.broadcastTargetId !== pending.narratorId) {
+			await narratorService.updateStatus(pending.broadcastTargetId, "thinking");
+		}
 		const now = new Date().toISOString();
 		const effectiveDenyMessage = denyMessage || feedbackText?.trim() || undefined;
 		await db
@@ -568,18 +578,9 @@ async function createSession(
 
 	const narrator = await narratorService.getById(narratorId);
 
-	// Resolve branch-level session state
-	let effectiveConversationId = narrator.apiConversationId;
-	let effectiveContextSummary = narrator.contextSummary;
-	if (narrator.activeBranchId) {
-		const branch = await db.query.conversationBranches.findFirst({
-			where: eq(conversationBranches.id, narrator.activeBranchId),
-		});
-		if (branch) {
-			effectiveConversationId = branch.apiConversationId ?? null;
-			effectiveContextSummary = branch.contextSummary ?? null;
-		}
-	}
+	// Use narrator-level session state directly
+	const effectiveConversationId = narrator.apiConversationId;
+	const effectiveContextSummary = narrator.contextSummary;
 
 	// Resolve CWD
 	let sessionCwd: string;
@@ -682,18 +683,8 @@ async function runAgentLoop(
 
 			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up
 			const freshNarrator = await narratorService.getById(narratorId);
-			// Use branch-level context summary if on a branch
-			let freshContextSummary = freshNarrator.contextSummary;
-			if (freshNarrator.activeBranchId) {
-				const branch = await db.query.conversationBranches.findFirst({
-					where: eq(conversationBranches.id, freshNarrator.activeBranchId),
-				});
-				if (branch) {
-					freshContextSummary = branch.contextSummary ?? null;
-				}
-			}
 			const { prompt: freshSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
-				{ systemPrompt: freshNarrator.systemPrompt, contextSummary: freshContextSummary },
+				{ systemPrompt: freshNarrator.systemPrompt, contextSummary: freshNarrator.contextSummary },
 				session.cwd,
 				locale,
 				session._replyInUserLanguage ?? false,
@@ -912,27 +903,15 @@ export async function runCustomCompact(
 
 	const now = new Date().toISOString();
 
-	// Determine whether to store summary on branch or narrator
-	const narrator = await narratorService.getById(narratorId);
-	if (narrator.activeBranchId) {
-		await db
-			.update(conversationBranches)
-			.set({
-				contextSummary: summary,
-				apiConversationId: null,
-				updatedAt: now,
-			})
-			.where(eq(conversationBranches.id, narrator.activeBranchId));
-	} else {
-		await db
-			.update(narrators)
-			.set({
-				contextSummary: summary,
-				apiConversationId: null,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, narratorId));
-	}
+	// Store summary on narrator
+	await db
+		.update(narrators)
+		.set({
+			contextSummary: summary,
+			apiConversationId: null,
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, narratorId));
 
 	// Finalize the compacting marker into the final compacted message (with full summary)
 	const compactedMsg = await narratorService.finalizeCompactingMessage(
@@ -956,28 +935,16 @@ async function runPlanCompact(narratorId: string, planText: string): Promise<voi
 	logger.info("Starting plan compact", { narratorId, planLength: planText.length });
 
 	const now = new Date().toISOString();
-	const narrator = await narratorService.getById(narratorId);
 
-	// Store summary on branch or narrator
-	if (narrator.activeBranchId) {
-		await db
-			.update(conversationBranches)
-			.set({
-				contextSummary: planText,
-				apiConversationId: null,
-				updatedAt: now,
-			})
-			.where(eq(conversationBranches.id, narrator.activeBranchId));
-	} else {
-		await db
-			.update(narrators)
-			.set({
-				contextSummary: planText,
-				apiConversationId: null,
-				updatedAt: now,
-			})
-			.where(eq(narrators.id, narratorId));
-	}
+	// Store summary on narrator
+	await db
+		.update(narrators)
+		.set({
+			contextSummary: planText,
+			apiConversationId: null,
+			updatedAt: now,
+		})
+		.where(eq(narrators.id, narratorId));
 
 	// Insert compact message directly (no compacting intermediate state needed)
 	const compactMsg = await narratorService.persistPlanMessage(narratorId, planText);
@@ -1153,21 +1120,10 @@ async function processAgentEvent(
 			// Clear compact summary from DB after first response so it won't be
 			// re-injected if the session is recreated.
 			if (session._usedCompactSummary) {
-				const freshN = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { activeBranchId: true },
-				});
-				if (freshN?.activeBranchId) {
-					await db
-						.update(conversationBranches)
-						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
-						.where(eq(conversationBranches.id, freshN.activeBranchId));
-				} else {
-					await db
-						.update(narrators)
-						.set({ contextSummary: null, updatedAt: new Date().toISOString() })
-						.where(eq(narrators.id, narratorId));
-				}
+				await db
+					.update(narrators)
+					.set({ contextSummary: null, updatedAt: new Date().toISOString() })
+					.where(eq(narrators.id, narratorId));
 				session._usedCompactSummary = false;
 			}
 
@@ -1208,6 +1164,7 @@ async function processAgentEvent(
 				toolUseId: event.toolUseId,
 				status,
 				output: event.output,
+				durationMs: event.durationMs,
 			});
 
 			// ExitPlanMode check
