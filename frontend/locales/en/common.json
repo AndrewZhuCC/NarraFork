@@ -86,5 +86,7 @@
 	"kiroModelCaching": "Caching",
 	"kiroModelRawJson": "Raw JSON",
 	"kiroModelFromCache": "cached",
-	"kiroModelRefresh": "Refresh"
+	"kiroModelRefresh": "Refresh",
+	"wsDisconnected": "Real-time connection lost. Some updates may not appear.",
+	"wsReconnect": "Reconnect"
 }
