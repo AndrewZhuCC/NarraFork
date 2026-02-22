@@ -2,21 +2,12 @@
 // Multi-credential failover mode using MultiTokenManager
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { effectiveApiRegion } from "./config";
 import type { MultiTokenManager } from "./multi-token-manager";
 import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } from "./types";
 
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
-
-const DUMP_DIR = resolve(homedir(), ".narrafork", "kiro-dumps");
-let dumpSeq = 0;
-try {
-	mkdirSync(DUMP_DIR, { recursive: true });
-} catch {}
 
 export class KiroApiClient {
 	constructor(private tokenManager: MultiTokenManager) {}
@@ -50,34 +41,13 @@ export class KiroApiClient {
 			const url = `https://q.${region}.amazonaws.com`;
 
 			let res: Response;
-			const seq = String(++dumpSeq).padStart(4, "0");
-			const ts = new Date().toISOString().replace(/[:.]/g, "-");
-			const convId = request.conversationState.conversationId?.slice(0, 8) ?? "unknown";
-			const dumpPath = `${DUMP_DIR}/${seq}_${ts}_${convId}`;
 			try {
-				// Dump request
-				try {
-					writeFileSync(`${dumpPath}_req.json`, JSON.stringify(body, null, 2));
-				} catch {}
-
 				res = await fetch(url, {
 					method: "POST",
 					headers,
 					body: JSON.stringify(body),
 					signal,
 				});
-
-				// Dump response metadata
-				try {
-					const resHeaders: Record<string, string> = {};
-					res.headers.forEach((v, k) => {
-						resHeaders[k] = v;
-					});
-					writeFileSync(
-						`${dumpPath}_res_meta.json`,
-						JSON.stringify({ status: res.status, headers: resHeaders }, null, 2),
-					);
-				} catch {}
 			} catch (err) {
 				lastError = err instanceof Error ? err : new Error(String(err));
 				if (attempt + 1 < maxRetries) await this.delay(attempt);
@@ -90,11 +60,6 @@ export class KiroApiClient {
 			}
 
 			const resBody = await res.text().catch(() => "");
-
-			// Dump error response body
-			try {
-				writeFileSync(`${dumpPath}_res_body.txt`, resBody);
-			} catch {}
 
 			// 400: bad request, don't retry
 			if (res.status === 400) {
