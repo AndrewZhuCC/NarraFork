@@ -8,3 +8,6 @@ frontend/routeTree.gen.ts
 *.db-shm
 .worktrees/
 .kiro-dumps/
+
+analyze/
+analyze2/
