@@ -63,6 +63,10 @@ export class KiroApiClient {
 
 			// 400: bad request, don't retry
 			if (res.status === 400) {
+				// Detect context window overflow specifically
+				if (this.isContentLengthExceeded(resBody)) {
+					throw new KiroApiError("CONTEXT_LENGTH_EXCEEDED", resBody, 400);
+				}
 				throw new KiroApiError("BAD_REQUEST", resBody, 400);
 			}
 
@@ -124,6 +128,16 @@ export class KiroApiClient {
 			"x-amzn-codewhisperer-ide": "kiro",
 			"x-amzn-codewhisperer-ide-version": kiroVersion,
 		};
+	}
+
+	private isContentLengthExceeded(body: string): boolean {
+		if (body.includes("CONTENT_LENGTH_EXCEEDS_THRESHOLD")) return true;
+		try {
+			const json = JSON.parse(body);
+			if (json?.reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD") return true;
+			if (json?.error?.reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD") return true;
+		} catch {}
+		return false;
 	}
 
 	private isMonthlyRequestLimit(body: string): boolean {
