@@ -18,7 +18,6 @@ export interface NarraForkSettings {
 		summaryModel: string;
 		customModels: ModelOption[];
 		hiddenModels: string[];
-		extendedContext: boolean;
 		maxTurns: number;
 		subagentModels: {
 			explore: string;
@@ -64,7 +63,6 @@ const DEFAULTS: NarraForkSettings = {
 		summaryModel: "claude-haiku",
 		customModels: [],
 		hiddenModels: [],
-		extendedContext: false,
 		maxTurns: 200,
 		subagentModels: {
 			explore: "",

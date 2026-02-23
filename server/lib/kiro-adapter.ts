@@ -3,6 +3,10 @@
 //
 // Types are inlined here so this file compiles even when server/lib/kiro/ is absent.
 
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
+
 // --- Inlined types (mirror of kiro/types.ts public surface) ---
 
 export type KiroModel =
@@ -281,20 +285,50 @@ export async function kiroListModels(credentialId?: number): Promise<{
 
 // --- Cached model list for system-wide use ---
 
+const modelCachePath = resolve(homedir(), ".narrafork", "model-cache.json");
+
 let cachedKiroModels: Array<Record<string, unknown>> = [];
+
+/** Load model cache from disk (synchronous, called once at import / init time). */
+function loadModelCacheFromDisk(): void {
+	try {
+		if (existsSync(modelCachePath)) {
+			const raw = JSON.parse(readFileSync(modelCachePath, "utf-8"));
+			if (Array.isArray(raw)) {
+				cachedKiroModels = raw;
+			}
+		}
+	} catch {
+		// Corrupted file — ignore, will be overwritten on next refresh
+	}
+}
+
+/** Persist model cache to disk. */
+function saveModelCacheToDisk(models: Array<Record<string, unknown>>): void {
+	try {
+		mkdirSync(resolve(homedir(), ".narrafork"), { recursive: true });
+		writeFileSync(modelCachePath, JSON.stringify(models, null, 2));
+	} catch {
+		// Non-critical — cache will still work in-memory
+	}
+}
+
+// Eagerly load from disk so kiroGetCachedModels() returns data immediately
+loadModelCacheFromDisk();
 
 /** Fetch models from the API and cache them. Called once after kiro init. */
 export async function kiroRefreshModelCache(): Promise<Array<Record<string, unknown>>> {
-	if (!mod || !mod.isKiroAvailable()) return [];
+	if (!mod || !mod.isKiroAvailable()) return cachedKiroModels;
 	try {
 		const result = await mod.kiroListModels();
 		cachedKiroModels = result.models.map((m) => {
 			const name = String(m.model_name ?? m.modelName ?? "");
 			return { ...m, model_short_name: name.replace(/^Claude\s+/i, "") };
 		});
+		saveModelCacheToDisk(cachedKiroModels);
 		return cachedKiroModels;
 	} catch {
-		// Keep whatever was cached before (or empty)
+		// Keep whatever was cached before (memory or disk)
 		return cachedKiroModels;
 	}
 }
