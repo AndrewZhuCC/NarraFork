@@ -1,11 +1,10 @@
 import { Button, Group, Paper, Select, Stack, Text, Textarea, Title } from "@mantine/core";
-import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { api, kiroStreamChat } from "../../lib/api";
-import { BUILTIN_MODELS, groupModelsByProvider, type ModelOption } from "../../lib/constants";
+import { useAllModels } from "../../hooks/useModels";
+import { kiroStreamChat } from "../../lib/api";
 
 export const Route = createFileRoute("/admin/kiro-chat")({
 	component: KiroChatPage,
@@ -22,39 +21,7 @@ function KiroChatPage() {
 	const [error, setError] = useState<string | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
 
-	const { data: settingsData } = useQuery({
-		queryKey: ["settings"],
-		queryFn: api.getSettings,
-	});
-	const allModels = useMemo(() => {
-		const hidden: string[] = settingsData?.agent?.hiddenModels ?? [];
-		const kiroModels: ModelOption[] = settingsData?.kiroModels?.length
-			? settingsData.kiroModels
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-					.map((m: any) => ({
-						value: String(m.model_id ?? m.modelId ?? ""),
-						label: String(
-							m.model_short_name ??
-								m.modelShortName ??
-								m.model_name ??
-								m.modelName ??
-								m.model_id ??
-								m.modelId ??
-								"",
-						),
-						provider: "kiro" as const,
-						rateMultiplier: m.rate_multiplier ?? m.rateMultiplier,
-					}))
-					.filter((m: ModelOption) => m.value)
-			: BUILTIN_MODELS;
-		return [...kiroModels, ...(settingsData?.agent?.customModels ?? [])].filter(
-			(m) => !hidden.includes(m.value),
-		);
-	}, [
-		settingsData?.kiroModels,
-		settingsData?.agent?.customModels,
-		settingsData?.agent?.hiddenModels,
-	]);
+	const { groupedModels } = useAllModels();
 
 	const handleSend = useCallback(async () => {
 		if (!input.trim() || streaming) return;
@@ -103,7 +70,7 @@ function KiroChatPage() {
 					/>
 					<Group>
 						<Select
-							data={groupModelsByProvider(allModels)}
+							data={groupedModels}
 							value={model}
 							onChange={(v) => v && setModel(v)}
 							label={t("kiroModel")}
