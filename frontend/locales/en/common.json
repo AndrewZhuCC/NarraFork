@@ -88,5 +88,6 @@
 	"kiroModelFromCache": "cached",
 	"kiroModelRefresh": "Refresh",
 	"wsDisconnected": "Real-time connection lost. Some updates may not appear.",
-	"wsReconnect": "Reconnect"
+	"wsReconnect": "Reconnect",
+	"providers": "Providers"
 }
