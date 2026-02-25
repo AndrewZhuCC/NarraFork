@@ -244,6 +244,19 @@ function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 			result.conversationId = String(evt.data.conversationId);
 		}
 
+		// Detect output truncation via stopReason (if the API provides it)
+		const stopReason = evt.data.stopReason ?? evt.data.stop_reason;
+		if (
+			stopReason === "max_tokens" ||
+			stopReason === "max_output_tokens" ||
+			stopReason === "length"
+		) {
+			result.invalidState = {
+				reason: "max_tokens",
+				message: "Response truncated: model reached maximum token limit.",
+			};
+		}
+
 		// Non-streaming tool use (single)
 		const toolUse = evt.data.toolUse as
 			| { toolUseId: string; name: string; input: Record<string, unknown> }

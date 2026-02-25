@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { registerKiroModelChecker, registerKiroModelLister } from "./settings";
 
 // --- Inlined types (mirror of kiro/types.ts public surface) ---
 
@@ -315,6 +316,17 @@ function saveModelCacheToDisk(models: Array<Record<string, unknown>>): void {
 
 // Eagerly load from disk so kiroGetCachedModels() returns data immediately
 loadModelCacheFromDisk();
+
+// Register kiro model checker and lister
+registerKiroModelChecker((model) =>
+	cachedKiroModels.some((m) => String(m.model_id ?? m.modelId ?? "") === model),
+);
+registerKiroModelLister(() =>
+	cachedKiroModels
+		.map((m) => String(m.model_id ?? m.modelId ?? ""))
+		.filter(Boolean)
+		.map((id) => `kiro:${id}`),
+);
 
 /** Fetch models from the API and cache them. Called once after kiro init. */
 export async function kiroRefreshModelCache(): Promise<Array<Record<string, unknown>>> {

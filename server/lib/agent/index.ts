@@ -45,7 +45,7 @@ export async function buildHistory(
  */
 export async function agentGenerate(text: string, model?: string): Promise<string> {
 	const provider = getProvider(resolveProvider(model));
-	return provider.generate(text, model ?? "claude-sonnet");
+	return provider.generate(text, model ?? "kiro:claude-sonnet");
 }
 
 export async function agentGenerateWithMeta(
@@ -53,7 +53,7 @@ export async function agentGenerateWithMeta(
 	model?: string,
 ): Promise<{ text: string; contextPercent?: number }> {
 	const provider = getProvider(resolveProvider(model));
-	return provider.generateWithMeta(text, model ?? "claude-sonnet");
+	return provider.generateWithMeta(text, model ?? "kiro:claude-sonnet");
 }
 
 /**
@@ -67,5 +67,10 @@ export async function agentGenerateWithHistory(
 	locale?: string,
 ): Promise<string> {
 	const provider = getProvider(resolveProvider(model));
-	return provider.generateWithHistory(systemInstruction, content, model ?? "claude-sonnet", locale);
+	return provider.generateWithHistory(
+		systemInstruction,
+		content,
+		model ?? "kiro:claude-sonnet",
+		locale,
+	);
 }

@@ -1,6 +1,10 @@
+import { parseModelId } from "../settings";
+
 /**
  * Resolve user-facing model names to Kiro API model IDs.
  * This is the single source of truth for model name → Kiro ID mapping.
+ *
+ * Supports "provider:model" prefix format — the prefix is stripped before resolution.
  *
  * Reverse-engineered from kiro CLI chat model resolution:
  * - Any model containing "sonnet" → "claude-sonnet-4.5"
@@ -13,7 +17,11 @@
 export function resolveModel(model?: string): string {
 	if (!model) return "claude-sonnet-4.5";
 
-	const lower = model.toLowerCase();
+	// Strip provider prefix if present (e.g. "kiro:claude-sonnet" → "claude-sonnet")
+	const { model: bare } = parseModelId(model);
+	if (!bare) return "claude-sonnet-4.5";
+
+	const lower = bare.toLowerCase();
 
 	if (lower.includes("sonnet")) {
 		return "claude-sonnet-4.5";
@@ -29,5 +37,5 @@ export function resolveModel(model?: string): string {
 	}
 
 	// Already a valid Kiro model ID or unknown — pass through
-	return model;
+	return bare;
 }
