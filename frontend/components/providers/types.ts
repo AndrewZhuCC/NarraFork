@@ -25,7 +25,7 @@ export function ensurePrefix(val: string): string {
  * Classify a Kiro credential's account tier.
  *
  * Decision logic (in priority order):
- * 1. authMethod === "idc" or hasProfileArn → enterprise (IDC = AWS Identity Center)
+ * 1. authMethod === "idc" or hasProfileArn or hasStartUrl → enterprise
  * 2. subscriptionTitle contains "enterprise" / "business" → enterprise
  * 3. subscriptionTitle contains "pro" / "individual" / "paid" / "builder" / "power" → paid
  * 4. subscriptionTitle contains "free" or is absent → free
@@ -33,10 +33,13 @@ export function ensurePrefix(val: string): string {
 export function classifyKiroTier(entry: {
 	authMethod?: string;
 	hasProfileArn?: boolean;
+	hasStartUrl?: boolean;
 	subscriptionTitle?: string;
 }): KiroAccountTier {
-	// IDC auth or profileArn presence is the definitive enterprise signal
-	if (entry.authMethod === "idc" || entry.hasProfileArn) return "enterprise";
+	// IDC auth, profileArn, or startUrl (AWS SSO) is the definitive enterprise signal
+	if (entry.authMethod === "idc" || entry.hasProfileArn || entry.hasStartUrl) {
+		return "enterprise";
+	}
 
 	const title = entry.subscriptionTitle;
 	if (!title) return "free";

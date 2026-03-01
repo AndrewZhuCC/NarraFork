@@ -193,6 +193,7 @@ export function KiroSection({ settings, hiddenModels, onToggleHidden }: KiroSect
 		const tier = classifyKiroTier({
 			authMethod: entry.authMethod,
 			hasProfileArn: entry.hasProfileArn,
+			hasStartUrl: entry.hasStartUrl,
 			subscriptionTitle: usage?.subscriptionTitle ?? entry.subscriptionTitle,
 		});
 		tierGroups[tier].push(entry);
@@ -498,6 +499,7 @@ function UsageDisplay({ entry, usage }: { entry: any; usage: any }) {
 	const tier = classifyKiroTier({
 		authMethod: entry.authMethod,
 		hasProfileArn: entry.hasProfileArn,
+		hasStartUrl: entry.hasStartUrl,
 		subscriptionTitle,
 	});
 	const tierCfg = TIER_CONFIG[tier];

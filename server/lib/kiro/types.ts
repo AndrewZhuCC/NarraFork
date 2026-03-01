@@ -20,6 +20,7 @@ export interface KiroCredentials {
 	proxyUrl?: string;
 	proxyUsername?: string;
 	proxyPassword?: string;
+	startUrl?: string; // AWS SSO start URL — presence indicates enterprise (IDC)
 	/** Accumulated metering usage from streaming responses (local tracking). */
 	meterUsage?: number;
 	/** Model IDs available to this credential (fetched from ListAvailableModels API). */
@@ -117,6 +118,7 @@ export interface CredentialSnapshot {
 	email?: string;
 	displayName?: string;
 	hasProfileArn: boolean;
+	hasStartUrl: boolean;
 	expiresAt?: string;
 	authMethod?: string;
 	subscriptionTitle?: string;

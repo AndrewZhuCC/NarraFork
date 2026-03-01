@@ -12,7 +12,7 @@ import { getImagePath, imageToBase64 } from "../uploads";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
 import { zodToJsonSchema } from "./tool-registry";
-import type { AgentToolUse, ToolDefinition } from "./types";
+import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 /**
  * Kiro CLI chat protocol adapter.
@@ -20,7 +20,7 @@ import type { AgentToolUse, ToolDefinition } from "./types";
  * stream parsing, and tool result formatting.
  */
 export class KiroProvider implements ProviderAdapter {
-	formatTools(tools: ToolDefinition[]): unknown[] {
+	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map((tool) => ({
 			toolSpecification: {
 				name: tool.name,

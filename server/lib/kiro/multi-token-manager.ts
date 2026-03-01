@@ -58,7 +58,7 @@ function isExpiringWithin(creds: KiroCredentials, minutes: number): boolean | nu
  * Lower number = higher selection priority (consume free quota first).
  */
 function tierOrder(creds: KiroCredentials): number {
-	if (creds.authMethod === "idc" || creds.profileArn) return 1; // enterprise
+	if (creds.authMethod === "idc" || creds.profileArn || creds.startUrl) return 1; // enterprise
 	const title = creds.subscriptionTitle;
 	if (!title) return 0; // free (unknown defaults to free)
 	const lower = title.toLowerCase();
@@ -363,6 +363,7 @@ export class MultiTokenManager {
 				email: e.credentials.email,
 				displayName: e.credentials.displayName,
 				hasProfileArn: !!e.credentials.profileArn,
+				hasStartUrl: !!e.credentials.startUrl,
 				expiresAt: e.credentials.expiresAt,
 				authMethod: e.credentials.authMethod,
 				subscriptionTitle: e.credentials.subscriptionTitle,
