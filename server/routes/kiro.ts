@@ -1,17 +1,19 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { z } from "zod";
 import { resolveModel } from "../lib/agent/resolve-model";
 import type { KiroChatRequest, KiroModel } from "../lib/kiro-adapter";
 import {
 	isKiroAvailable,
 	kiroChat,
 	kiroChatRaw,
+	kiroFetchAllCredentialModels,
+	kiroFetchCredentialModels,
 	kiroGetAllUsageCache,
 	kiroGetCachedModels,
 	kiroGetUsage,
 	kiroImportCredentials,
-	kiroListModels,
 	kiroManualRefresh,
 	kiroMcpCall,
 	kiroMcpListTools,
@@ -19,11 +21,21 @@ import {
 	kiroRemoveCredential,
 	kiroResetAndEnable,
 	kiroSetDisabled,
+	kiroSetLoadBalancingMode,
 	kiroSetPriority,
 	kiroSnapshot,
+	kiroUpdateCredential,
 } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
 import { requireAdmin, requireAuth } from "../middleware/auth";
+
+const updateCredentialSchema = z
+	.object({
+		email: z.string().max(200).optional(),
+		displayName: z.string().max(200).optional(),
+		region: z.string().max(50).optional(),
+	})
+	.strict();
 
 export const kiroRoutes = new Hono();
 
@@ -37,12 +49,35 @@ function requireKiro(c: Context): Response | null {
 	return null;
 }
 
+/** Track in-flight auto-fetch to avoid duplicate requests from polling. */
+const autoFetchingUsage = new Set<string>();
+
 kiroRoutes.get("/status", (c) => {
-	return c.json({
+	const snapshot = kiroSnapshot();
+	const response = {
 		available: isKiroAvailable(),
-		snapshot: kiroSnapshot(),
+		snapshot,
 		usageCache: kiroGetAllUsageCache(),
-	});
+	};
+
+	// Auto-fetch usage for credentials that have never been queried
+	if (snapshot) {
+		for (const entry of snapshot.entries) {
+			if (entry.disabled) continue;
+			if (entry.meterUsage == null && !autoFetchingUsage.has(entry.id)) {
+				autoFetchingUsage.add(entry.id);
+				const timeout = setTimeout(() => autoFetchingUsage.delete(entry.id), 30_000);
+				kiroGetUsage(entry.id)
+					.catch(() => {})
+					.finally(() => {
+						clearTimeout(timeout);
+						autoFetchingUsage.delete(entry.id);
+					});
+			}
+		}
+	}
+
+	return c.json(response);
 });
 
 // Import must be registered before :id routes to avoid param matching
@@ -59,7 +94,25 @@ kiroRoutes.post("/credentials/import", async (c) => {
 	}
 	try {
 		const result = kiroImportCredentials(credentials);
-		return c.json(result);
+		// Synchronously fetch model lists for newly added credentials
+		const modelResults: Record<string, string[] | string> = {};
+		if (result.added > 0) {
+			const snap = kiroSnapshot();
+			if (snap) {
+				for (const entry of snap.entries) {
+					if (!entry.disabled && !entry.availableModels?.length) {
+						try {
+							const models = await kiroFetchCredentialModels(entry.id);
+							modelResults[entry.id] = models;
+						} catch (err) {
+							modelResults[entry.id] =
+								err instanceof Error ? err.message : "Failed to fetch models";
+						}
+					}
+				}
+			}
+		}
+		return c.json({ ...result, modelResults });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
 		return c.json({ error: msg }, 500);
@@ -69,21 +122,21 @@ kiroRoutes.post("/credentials/import", async (c) => {
 kiroRoutes.post("/credentials/:id/disable", (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
-	kiroSetDisabled(Number(c.req.param("id")), true);
+	kiroSetDisabled(c.req.param("id"), true);
 	return c.json({ ok: true });
 });
 
 kiroRoutes.post("/credentials/:id/enable", (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
-	kiroSetDisabled(Number(c.req.param("id")), false);
+	kiroSetDisabled(c.req.param("id"), false);
 	return c.json({ ok: true });
 });
 
 kiroRoutes.post("/credentials/:id/reset", (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
-	kiroResetAndEnable(Number(c.req.param("id")));
+	kiroResetAndEnable(c.req.param("id"));
 	return c.json({ ok: true });
 });
 
@@ -91,7 +144,7 @@ kiroRoutes.delete("/credentials/:id", (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
 	try {
-		kiroRemoveCredential(Number(c.req.param("id")));
+		kiroRemoveCredential(c.req.param("id"));
 		return c.json({ ok: true });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -103,7 +156,18 @@ kiroRoutes.post("/credentials/:id/priority", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
 	const { priority } = await c.req.json<{ priority: number }>();
-	kiroSetPriority(Number(c.req.param("id")), priority);
+	kiroSetPriority(c.req.param("id"), priority);
+	return c.json({ ok: true });
+});
+
+kiroRoutes.post("/load-balancing-mode", async (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	const { mode } = await c.req.json<{ mode: string }>();
+	if (mode !== "priority" && mode !== "balanced") {
+		return c.json({ error: "mode must be 'priority' or 'balanced'" }, 400);
+	}
+	kiroSetLoadBalancingMode(mode);
 	return c.json({ ok: true });
 });
 
@@ -111,7 +175,22 @@ kiroRoutes.post("/credentials/:id/refresh", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
 	try {
-		await kiroManualRefresh(Number(c.req.param("id")));
+		await kiroManualRefresh(c.req.param("id"));
+		return c.json({ ok: true });
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		return c.json({ error: msg }, 500);
+	}
+});
+
+kiroRoutes.patch("/credentials/:id", async (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	try {
+		const body = await c.req.json();
+		const parsed = updateCredentialSchema.safeParse(body);
+		if (!parsed.success) return c.json({ error: parsed.error.message }, 400);
+		kiroUpdateCredential(c.req.param("id"), parsed.data);
 		return c.json({ ok: true });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
@@ -122,7 +201,7 @@ kiroRoutes.post("/credentials/:id/refresh", async (c) => {
 kiroRoutes.get("/credentials/:id/usage", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
-	const id = Number(c.req.param("id"));
+	const id = c.req.param("id");
 	try {
 		const usage = await kiroGetUsage(id);
 		return c.json(usage);
@@ -142,14 +221,14 @@ kiroRoutes.post("/models/refresh", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
 	try {
-		const credentialId = c.req.query("credentialId");
-		const result = await kiroListModels(credentialId ? Number(credentialId) : undefined);
+		// Fetch models for all credentials (stores per-credential) and get deduplicated union
+		const allModels = await kiroFetchAllCredentialModels();
 		// Also update the system-wide cache
 		await kiroRefreshModelCache();
-		return c.json({ models: result.models, credentialId: result.credentialId, fromCache: false });
+		return c.json({ models: allModels, fromCache: false });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
-		logger.error("kiro listModels refresh failed", { error: msg, stack: (err as Error)?.stack });
+		logger.error("kiro models refresh failed", { error: msg, stack: (err as Error)?.stack });
 		return c.json({ error: msg }, 500);
 	}
 });

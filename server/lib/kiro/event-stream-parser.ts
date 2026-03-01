@@ -2,6 +2,7 @@
 // Reverse-engineered from kiro CLI chat binary protocol
 // Uses Bun's built-in CRC32 (ISO-HDLC)
 
+import { readWithTimeout } from "../stream-timeout";
 import { KiroApiError, KiroParseError, type ParseErrorKind } from "./types";
 
 const PRELUDE_SIZE = 12;
@@ -332,7 +333,7 @@ export async function* parseEventStream(
 
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await readWithTimeout(reader);
 			if (done) break;
 
 			decoder.feed(value);

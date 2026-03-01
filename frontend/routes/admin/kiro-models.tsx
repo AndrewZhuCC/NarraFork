@@ -45,13 +45,12 @@ function KiroModelsPage() {
 
 	const { data, isLoading, error } = useQuery({
 		queryKey: ["kiro", "models", selectedCredential],
-		queryFn: () => api.kiroListModels(selectedCredential ? Number(selectedCredential) : undefined),
+		queryFn: () => api.kiroListModels(selectedCredential || undefined),
 		enabled: user?.role === "admin",
 	});
 
 	const refreshMutation = useMutation({
-		mutationFn: () =>
-			api.kiroRefreshModels(selectedCredential ? Number(selectedCredential) : undefined),
+		mutationFn: () => api.kiroRefreshModels(selectedCredential || undefined),
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["kiro", "models"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });

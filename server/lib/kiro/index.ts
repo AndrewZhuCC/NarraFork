@@ -85,8 +85,11 @@ export async function* kiroChatRaw(
 ): AsyncGenerator<StreamEvent> {
 	if (!apiClient) throw new Error("Kiro not initialized — call initKiro() first");
 
-	const res = await apiClient.sendChatRequest(request, signal);
+	const { response: res, credentialId } = await apiClient.sendChatRequest(request, signal);
 	if (!res.body) throw new Error("No response body");
+
+	// Emit synthetic credential event so consumers can associate metering with the credential
+	yield { eventType: "credentialIdEvent", data: { credentialId } };
 
 	yield* parseEventStream(res.body);
 }
@@ -142,31 +145,44 @@ export function kiroSnapshot(): ManagerSnapshot | null {
 	return tokenManager?.snapshot() ?? null;
 }
 
-export function kiroSetDisabled(id: number, disabled: boolean): void {
+export function kiroSetDisabled(id: string, disabled: boolean): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.setDisabled(id, disabled);
 }
 
-export function kiroSetPriority(id: number, priority: number): void {
+export function kiroSetLoadBalancingMode(mode: "priority" | "balanced"): void {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	tokenManager.setLoadBalancingMode(mode);
+}
+
+export function kiroSetPriority(id: string, priority: number): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.setPriority(id, priority);
 }
 
-export function kiroResetAndEnable(id: number): void {
+export function kiroResetAndEnable(id: string): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.resetAndEnable(id);
 }
 
-export function kiroRemoveCredential(id: number): void {
+export function kiroRemoveCredential(id: string): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.removeCredential(id);
 }
 
 // --- Credential Management API ---
 
-export async function kiroManualRefresh(id: number): Promise<void> {
+export async function kiroManualRefresh(id: string): Promise<void> {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	await tokenManager.manualRefresh(id);
+}
+
+export function kiroUpdateCredential(
+	id: string,
+	fields: { email?: string; displayName?: string; region?: string },
+): void {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	tokenManager.updateCredential(id, fields);
 }
 
 export function kiroImportCredentials(creds: KiroCredentials[]): {
@@ -209,40 +225,54 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 	saveAllCredentials(pluginConfig.credentialsPath, merged);
 	const ok = initKiro(pluginConfig);
 	if (!ok) throw new Error("Imported credentials but initKiro still failed — check refreshTokens");
-	const afterCount = tokenManager?.snapshot().total ?? 0;
+	const afterCount = kiroSnapshot()?.total ?? 0;
 	const added = afterCount - existing.length;
 	return { added: Math.max(added, 0), duplicates: creds.length - Math.max(added, 0) };
 }
 
-export async function kiroGetUsage(id: number): Promise<UsageCacheEntry> {
-	console.log("[kiro:usage] kiroGetUsage called, id=", id);
+export async function kiroGetUsage(id: string): Promise<UsageCacheEntry> {
 	if (!tokenManager || !credentialsPath) throw new Error("Kiro not initialized");
-	console.log("[kiro:usage] calling tokenManager.getUsageLimits...");
 	const result = await tokenManager.getUsageLimits(id);
-	console.log("[kiro:usage] getUsageLimits returned, saving cache...");
+	// Sync meterUsage on the credential to the authoritative API value
+	tokenManager.setMeterUsage(id, result.currentUsage);
 	// Save to cache
 	try {
 		const cache = loadUsageCache(credentialsPath);
-		cache[String(id)] = result;
+		cache[id] = result;
 		saveUsageCache(credentialsPath, cache);
-		console.log("[kiro:usage] cache saved");
-	} catch (err) {
-		console.log("[kiro:usage] cache save failed:", err);
-	}
+	} catch {}
 	return result;
 }
 
-export async function kiroListModels(credentialId?: number): Promise<{
+export async function kiroListModels(credentialId?: string): Promise<{
 	models: Array<Record<string, unknown>>;
-	credentialId: number;
+	credentialId: string;
 }> {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	return tokenManager.listAvailableModels(credentialId);
 }
 
+/** Fetch and store the model list for a single credential. */
+export async function kiroFetchCredentialModels(credentialId: string): Promise<string[]> {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	return tokenManager.fetchAndStoreModels(credentialId);
+}
+
+/** Fetch model lists for all credentials, store per-credential, return deduplicated union. */
+export async function kiroFetchAllCredentialModels(): Promise<Array<Record<string, unknown>>> {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	return tokenManager.fetchAllCredentialModels();
+}
+
 export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	if (!credentialsPath) return {};
 	return loadUsageCache(credentialsPath);
+}
+
+/** Accumulate metering usage for a credential (debounced persistence). */
+export function kiroAddMeterUsage(credentialId: string, amount: number): void {
+	if (!tokenManager) return;
+	tokenManager.addMeterUsage(credentialId, amount);
 }
 
 export { EventStreamDecoder, type StreamEvent } from "./event-stream-parser";

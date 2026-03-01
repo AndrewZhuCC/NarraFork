@@ -2,6 +2,7 @@
 // Supports multiple credentials with failover, load balancing, and self-healing
 
 import { createHash, randomUUID } from "node:crypto";
+import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
 	effectiveApiRegion,
@@ -25,6 +26,8 @@ import {
 
 const MAX_FAILURES_PER_CREDENTIAL = 3;
 const STATS_SAVE_DEBOUNCE_MS = 30_000;
+/** Debounce interval for persisting accumulated meter usage to credentials file. */
+const METER_PERSIST_DEBOUNCE_MS = 60_000;
 
 function sha256Hex(input: string): string {
 	return createHash("sha256").update(input).digest("hex");
@@ -49,17 +52,34 @@ function isExpiringWithin(creds: KiroCredentials, minutes: number): boolean | nu
 	}
 }
 
+/**
+ * Classify a credential's account tier for selection ordering.
+ * Returns 0 = free, 1 = enterprise, 2 = paid.
+ * Lower number = higher selection priority (consume free quota first).
+ */
+function tierOrder(creds: KiroCredentials): number {
+	if (creds.authMethod === "idc" || creds.profileArn) return 1; // enterprise
+	const title = creds.subscriptionTitle;
+	if (!title) return 0; // free (unknown defaults to free)
+	const lower = title.toLowerCase();
+	if (lower.includes("enterprise") || lower.includes("business")) return 1;
+	if (lower.includes("free")) return 0;
+	return 2; // paid (pro, pro+, power, builder, etc.)
+}
+
 export class MultiTokenManager {
 	private config: KiroConfig;
 	private entries: CredentialEntry[];
-	private currentId: number;
+	private currentId: string;
 	private credentialsPath: string;
 	private isMultipleFormat: boolean;
 	private loadBalancingMode: LoadBalancingMode;
 	private lastStatsSaveAt = 0;
 	private statsDirty = false;
 	/** Per-credential refresh promise dedup */
-	private refreshPromises = new Map<number, Promise<KiroCredentials>>();
+	private refreshPromises = new Map<string, Promise<KiroCredentials>>();
+	private lastMeterPersistAt = 0;
+	private meterDirty = false;
 
 	constructor(
 		config: KiroConfig,
@@ -72,13 +92,15 @@ export class MultiTokenManager {
 		this.isMultipleFormat = isMultipleFormat;
 		this.loadBalancingMode = config.loadBalancingMode ?? "priority";
 
-		// Assign IDs to credentials that don't have one
-		let maxId = 0;
-		for (const c of credentials) {
-			if (c.id != null && c.id > maxId) maxId = c.id;
-		}
-		let nextId = maxId + 1;
 		let needsPersist = false;
+
+		// Migrate legacy numeric IDs to short strings
+		for (const c of credentials) {
+			if (c.id != null && /^\d+$/.test(String(c.id))) {
+				c.id = generateShortId();
+				needsPersist = true;
+			}
+		}
 
 		// SHA-256 dedup based on refreshToken
 		const seen = new Set<string>();
@@ -93,8 +115,8 @@ export class MultiTokenManager {
 		}
 
 		this.entries = deduped.map((cred) => {
-			if (cred.id == null) {
-				cred.id = nextId++;
+			if (!cred.id) {
+				cred.id = generateShortId();
 				needsPersist = true;
 			}
 			if (!cred.machineId) {
@@ -119,7 +141,7 @@ export class MultiTokenManager {
 				? this.entries.reduce((best, e) =>
 						(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0) ? e : best,
 					).id
-				: 0;
+				: "";
 
 		// Persist if we assigned new IDs or machineIds
 		if (needsPersist && isMultipleFormat) {
@@ -131,9 +153,10 @@ export class MultiTokenManager {
 		// Restore stats from disk
 		this.restoreStats();
 
-		// Flush stats on process exit
+		// Flush stats and meter usage on process exit
 		process.on("beforeExit", () => {
 			if (this.statsDirty) this.flushStats();
+			if (this.meterDirty) this.persistCredentials();
 		});
 	}
 
@@ -145,7 +168,7 @@ export class MultiTokenManager {
 
 	async acquireContext(model?: string | null): Promise<CallContext> {
 		const total = this.entries.length;
-		const triedIds = new Set<number>();
+		const triedIds = new Set<string>();
 
 		while (triedIds.size < total) {
 			const entry = this.selectEntry(model ?? undefined, triedIds);
@@ -175,24 +198,28 @@ export class MultiTokenManager {
 		);
 	}
 
-	private selectEntry(model?: string, excludeIds?: Set<number>): CredentialEntry | null {
-		const isOpus = model ? model.toLowerCase().includes("opus") : false;
-
+	private selectEntry(model?: string, excludeIds?: Set<string>): CredentialEntry | null {
 		const available = this.entries.filter((e) => {
 			if (e.disabled) return false;
 			if (excludeIds?.has(e.id)) return false;
-			if (isOpus) {
-				const title = e.credentials.subscriptionTitle;
-				if (title?.toUpperCase().includes("FREE")) return false;
+			// If the credential has a known model list, skip it when the requested model isn't in it
+			if (model && e.credentials.availableModels?.length) {
+				if (!e.credentials.availableModels.includes(model)) return false;
 			}
 			return true;
 		});
 
 		if (available.length === 0) return null;
 
+		// Compare two entries: tier first, then mode-specific tiebreaker.
+		// Tier order: free (0) → enterprise (1) → paid (2).
 		if (this.loadBalancingMode === "balanced") {
-			// Least-used: pick lowest successCount, break ties by priority
 			return available.reduce((best, e) => {
+				const tBest = tierOrder(best.credentials);
+				const tE = tierOrder(e.credentials);
+				if (tE < tBest) return e;
+				if (tE > tBest) return best;
+				// Same tier: least-used, then priority
 				if (e.successCount < best.successCount) return e;
 				if (
 					e.successCount === best.successCount &&
@@ -203,10 +230,14 @@ export class MultiTokenManager {
 			});
 		}
 
-		// Priority mode: pick lowest priority number
-		return available.reduce((best, e) =>
-			(e.credentials.priority ?? 0) < (best.credentials.priority ?? 0) ? e : best,
-		);
+		// Priority mode: tier first, then lowest priority number
+		return available.reduce((best, e) => {
+			const tBest = tierOrder(best.credentials);
+			const tE = tierOrder(e.credentials);
+			if (tE < tBest) return e;
+			if (tE > tBest) return best;
+			return (e.credentials.priority ?? 0) < (best.credentials.priority ?? 0) ? e : best;
+		});
 	}
 
 	private async tryEnsureToken(entry: CredentialEntry): Promise<CallContext | null> {
@@ -245,7 +276,7 @@ export class MultiTokenManager {
 	}
 
 	/** Promise-based dedup: concurrent callers for the same credential share one refresh. */
-	private deduplicatedRefresh(id: number, creds: KiroCredentials): Promise<KiroCredentials> {
+	private deduplicatedRefresh(id: string, creds: KiroCredentials): Promise<KiroCredentials> {
 		const existing = this.refreshPromises.get(id);
 		if (existing) return existing;
 
@@ -258,7 +289,7 @@ export class MultiTokenManager {
 
 	// ==================== Reporting ====================
 
-	reportSuccess(id: number): void {
+	reportSuccess(id: string): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) return;
 		entry.failureCount = 0;
@@ -267,7 +298,7 @@ export class MultiTokenManager {
 		this.saveStatsDebounced();
 	}
 
-	reportFailure(id: number): boolean {
+	reportFailure(id: string): boolean {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) return this.entries.some((e) => !e.disabled);
 
@@ -283,7 +314,7 @@ export class MultiTokenManager {
 		return this.entries.some((e) => !e.disabled);
 	}
 
-	reportQuotaExhausted(id: number): boolean {
+	reportQuotaExhausted(id: string): boolean {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) return this.entries.some((e) => !e.disabled);
 
@@ -330,8 +361,14 @@ export class MultiTokenManager {
 				successCount: e.successCount,
 				lastUsedAt: e.lastUsedAt,
 				email: e.credentials.email,
+				displayName: e.credentials.displayName,
 				hasProfileArn: !!e.credentials.profileArn,
 				expiresAt: e.credentials.expiresAt,
+				authMethod: e.credentials.authMethod,
+				subscriptionTitle: e.credentials.subscriptionTitle,
+				region: e.credentials.region,
+				meterUsage: e.credentials.meterUsage,
+				availableModels: e.credentials.availableModels,
 			})),
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
@@ -340,7 +377,11 @@ export class MultiTokenManager {
 		};
 	}
 
-	setDisabled(id: number, disabled: boolean): void {
+	setLoadBalancingMode(mode: LoadBalancingMode): void {
+		this.loadBalancingMode = mode;
+	}
+
+	setDisabled(id: string, disabled: boolean): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		entry.disabled = disabled;
@@ -352,7 +393,7 @@ export class MultiTokenManager {
 		}
 	}
 
-	setPriority(id: number, priority: number): void {
+	setPriority(id: string, priority: number): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		entry.credentials.priority = priority;
@@ -363,7 +404,7 @@ export class MultiTokenManager {
 		}
 	}
 
-	resetAndEnable(id: number): void {
+	resetAndEnable(id: string): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		entry.failureCount = 0;
@@ -371,7 +412,7 @@ export class MultiTokenManager {
 		entry.disabledReason = undefined;
 	}
 
-	removeCredential(id: number): void {
+	removeCredential(id: string): void {
 		const idx = this.entries.findIndex((e) => e.id === id);
 		if (idx === -1) throw new Error(`Credential not found: ${id}`);
 		this.entries.splice(idx, 1);
@@ -387,11 +428,29 @@ export class MultiTokenManager {
 
 	// ==================== Manual Refresh ====================
 
-	async manualRefresh(id: number): Promise<void> {
+	async manualRefresh(id: string): Promise<void> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
 		const refreshed = await this.deduplicatedRefresh(id, entry.credentials);
 		entry.credentials = refreshed;
+		if (this.isMultipleFormat) {
+			try {
+				this.persistCredentials();
+			} catch {}
+		}
+	}
+
+	// ==================== Update Credential Fields ====================
+
+	updateCredential(
+		id: string,
+		fields: { email?: string; displayName?: string; region?: string },
+	): void {
+		const entry = this.entries.find((e) => e.id === id);
+		if (!entry) throw new Error(`Credential not found: ${id}`);
+		if (fields.email !== undefined) entry.credentials.email = fields.email;
+		if (fields.displayName !== undefined) entry.credentials.displayName = fields.displayName;
+		if (fields.region !== undefined) entry.credentials.region = fields.region;
 		if (this.isMultipleFormat) {
 			try {
 				this.persistCredentials();
@@ -410,12 +469,6 @@ export class MultiTokenManager {
 			}
 		}
 
-		let maxId = 0;
-		for (const e of this.entries) {
-			if (e.id > maxId) maxId = e.id;
-		}
-		let nextId = maxId + 1;
-
 		let added = 0;
 		let duplicates = 0;
 
@@ -429,7 +482,7 @@ export class MultiTokenManager {
 				existingHashes.add(hash);
 			}
 
-			cred.id = nextId++;
+			cred.id = generateShortId();
 			if (!cred.machineId) {
 				const mid = generateMachineId(cred, this.config);
 				if (mid) cred.machineId = mid;
@@ -457,7 +510,7 @@ export class MultiTokenManager {
 
 	// ==================== Usage Limits ====================
 
-	async getUsageLimits(id: number): Promise<UsageCacheEntry> {
+	async getUsageLimits(id: string): Promise<UsageCacheEntry> {
 		logger.debug("[kiro:usage] start", { credentialId: id });
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
@@ -586,9 +639,9 @@ export class MultiTokenManager {
 
 	// ==================== List Available Models ====================
 
-	async listAvailableModels(credentialId?: number): Promise<{
+	async listAvailableModels(credentialId?: string): Promise<{
 		models: Array<Record<string, unknown>>;
-		credentialId: number;
+		credentialId: string;
 	}> {
 		const entry = credentialId
 			? this.entries.find((e) => e.id === credentialId)
@@ -685,6 +738,58 @@ export class MultiTokenManager {
 		return { models: allModels, credentialId: entry.id };
 	}
 
+	/**
+	 * Fetch the model list for a single credential and store it on the credential.
+	 * Returns the model ID list.
+	 */
+	async fetchAndStoreModels(credentialId: string): Promise<string[]> {
+		const result = await this.listAvailableModels(credentialId);
+		const modelIds = result.models
+			.map((m) => String(m.model_id ?? m.modelId ?? ""))
+			.filter(Boolean);
+		const entry = this.entries.find((e) => e.id === credentialId);
+		if (entry) {
+			entry.credentials.availableModels = modelIds;
+			this.persistCredentials();
+		}
+		return modelIds;
+	}
+
+	/**
+	 * Fetch model lists for all enabled credentials, store per-credential,
+	 * and return a deduplicated union of all models (full objects).
+	 */
+	async fetchAllCredentialModels(): Promise<Array<Record<string, unknown>>> {
+		const seen = new Set<string>();
+		const allModels: Array<Record<string, unknown>> = [];
+
+		for (const entry of this.entries) {
+			if (entry.disabled) continue;
+			try {
+				const result = await this.listAvailableModels(entry.id);
+				const modelIds: string[] = [];
+				for (const m of result.models) {
+					const id = String(m.model_id ?? m.modelId ?? "");
+					if (!id) continue;
+					modelIds.push(id);
+					if (!seen.has(id)) {
+						seen.add(id);
+						allModels.push(m);
+					}
+				}
+				entry.credentials.availableModels = modelIds;
+			} catch (err) {
+				logger.warn("[kiro:models] failed for credential", {
+					credentialId: entry.id,
+					error: String(err),
+				});
+			}
+		}
+
+		this.persistCredentials();
+		return allModels;
+	}
+
 	get availableCount(): number {
 		return this.entries.filter((e) => !e.disabled).length;
 	}
@@ -737,5 +842,36 @@ export class MultiTokenManager {
 			this.credentialsPath,
 			this.entries.map((e) => e.credentials),
 		);
+	}
+
+	// ==================== Meter Usage Accumulation ====================
+
+	/**
+	 * Accumulate metering usage for a credential.
+	 * The amount is added to `credentials.meterUsage` in memory and
+	 * periodically persisted to `credentials.json` (debounced).
+	 */
+	addMeterUsage(credentialId: string, amount: number): void {
+		if (amount <= 0) return;
+		const entry = this.entries.find((e) => e.id === credentialId);
+		if (!entry) return;
+		entry.credentials.meterUsage = (entry.credentials.meterUsage ?? 0) + amount;
+		this.meterDirty = true;
+
+		if (Date.now() - this.lastMeterPersistAt > METER_PERSIST_DEBOUNCE_MS) {
+			this.persistCredentials();
+			this.lastMeterPersistAt = Date.now();
+			this.meterDirty = false;
+		}
+	}
+
+	/** Set meterUsage to an absolute value (e.g. after querying the real API). */
+	setMeterUsage(credentialId: string, value: number): void {
+		const entry = this.entries.find((e) => e.id === credentialId);
+		if (!entry) return;
+		entry.credentials.meterUsage = value;
+		this.persistCredentials();
+		this.lastMeterPersistAt = Date.now();
+		this.meterDirty = false;
 	}
 }

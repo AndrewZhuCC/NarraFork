@@ -1,7 +1,7 @@
 // Kiro plugin types — reverse-engineered from kiro CLI chat
 
 export interface KiroCredentials {
-	id?: number;
+	id?: string;
 	accessToken?: string;
 	refreshToken?: string;
 	profileArn?: string;
@@ -15,10 +15,15 @@ export interface KiroCredentials {
 	apiRegion?: string;
 	machineId?: string;
 	email?: string;
+	displayName?: string;
 	subscriptionTitle?: string;
 	proxyUrl?: string;
 	proxyUsername?: string;
 	proxyPassword?: string;
+	/** Accumulated metering usage from streaming responses (local tracking). */
+	meterUsage?: number;
+	/** Model IDs available to this credential (fetched from ListAvailableModels API). */
+	availableModels?: string[];
 }
 
 export interface KiroConfig {
@@ -86,7 +91,7 @@ export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
 export type LoadBalancingMode = "priority" | "balanced";
 
 export interface CredentialEntry {
-	id: number;
+	id: string;
 	credentials: KiroCredentials;
 	failureCount: number;
 	disabled: boolean;
@@ -96,13 +101,13 @@ export interface CredentialEntry {
 }
 
 export interface CallContext {
-	id: number;
+	id: string;
 	credentials: KiroCredentials;
 	token: string;
 }
 
 export interface CredentialSnapshot {
-	id: number;
+	id: string;
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
@@ -110,13 +115,19 @@ export interface CredentialSnapshot {
 	successCount: number;
 	lastUsedAt?: string;
 	email?: string;
+	displayName?: string;
 	hasProfileArn: boolean;
 	expiresAt?: string;
+	authMethod?: string;
+	subscriptionTitle?: string;
+	region?: string;
+	meterUsage?: number;
+	availableModels?: string[];
 }
 
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
-	currentId: number;
+	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
@@ -125,7 +136,7 @@ export interface ManagerSnapshot {
 // --- Usage ---
 
 export interface UsageCacheEntry {
-	id: number;
+	id: string;
 	subscriptionTitle?: string;
 	currentUsage: number;
 	usageLimit: number;

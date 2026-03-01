@@ -322,6 +322,13 @@ function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 		}
 	}
 
+	if (evt.eventType === "credentialIdEvent") {
+		const id = evt.data.credentialId;
+		if (id != null) {
+			result.credentialId = String(id);
+		}
+	}
+
 	if (evt.eventType === "invalidStateEvent") {
 		result.invalidState = {
 			reason: String(evt.data.reason ?? "unknown"),

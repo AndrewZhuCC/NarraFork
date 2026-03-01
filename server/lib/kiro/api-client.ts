@@ -9,11 +9,16 @@ import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } 
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
 
+export interface ChatResponse {
+	response: Response;
+	credentialId: string;
+}
+
 export class KiroApiClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
-	/** Send a chat request, return raw Response for streaming. */
-	async sendChatRequest(request: KiroChatRequest, signal?: AbortSignal): Promise<Response> {
+	/** Send a chat request, return raw Response + credential ID for streaming. */
+	async sendChatRequest(request: KiroChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
 		const model = request.conversationState.currentMessage.userInputMessage.modelId;
 		const maxRetries = this.tokenManager.maxRetries;
 		let lastError: Error | null = null;
@@ -56,7 +61,7 @@ export class KiroApiClient {
 
 			if (res.ok) {
 				this.tokenManager.reportSuccess(ctx.id);
-				return res;
+				return { response: res, credentialId: ctx.id };
 			}
 
 			const resBody = await res.text().catch(() => "");

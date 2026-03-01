@@ -26,7 +26,7 @@ export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
 export type LoadBalancingMode = "priority" | "balanced";
 
 export interface CredentialSnapshot {
-	id: number;
+	id: string;
 	priority: number;
 	disabled: boolean;
 	disabledReason?: DisabledReason;
@@ -34,13 +34,19 @@ export interface CredentialSnapshot {
 	successCount: number;
 	lastUsedAt?: string;
 	email?: string;
+	displayName?: string;
 	hasProfileArn: boolean;
 	expiresAt?: string;
+	authMethod?: string;
+	subscriptionTitle?: string;
+	region?: string;
+	meterUsage?: number;
+	availableModels?: string[];
 }
 
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
-	currentId: number;
+	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
@@ -57,7 +63,7 @@ export interface McpResponse {
 }
 
 export interface UsageCacheEntry {
-	id: number;
+	id: string;
 	subscriptionTitle?: string;
 	currentUsage: number;
 	usageLimit: number;
@@ -157,17 +163,25 @@ interface KiroModule {
 	kiroMcpCall(name: string, args: Record<string, unknown>): Promise<McpResponse>;
 	kiroMcpListTools(): Promise<McpResponse>;
 	kiroSnapshot(): ManagerSnapshot | null;
-	kiroSetDisabled(id: number, disabled: boolean): void;
-	kiroSetPriority(id: number, priority: number): void;
-	kiroResetAndEnable(id: number): void;
-	kiroRemoveCredential(id: number): void;
-	kiroManualRefresh(id: number): Promise<void>;
+	kiroSetDisabled(id: string, disabled: boolean): void;
+	kiroSetLoadBalancingMode(mode: "priority" | "balanced"): void;
+	kiroSetPriority(id: string, priority: number): void;
+	kiroResetAndEnable(id: string): void;
+	kiroRemoveCredential(id: string): void;
+	kiroManualRefresh(id: string): Promise<void>;
+	kiroUpdateCredential(
+		id: string,
+		fields: { email?: string; displayName?: string; region?: string },
+	): void;
 	kiroImportCredentials(creds: ImportCredentialInput[]): { added: number; duplicates: number };
-	kiroGetUsage(id: number): Promise<UsageCacheEntry>;
+	kiroGetUsage(id: string): Promise<UsageCacheEntry>;
 	kiroGetAllUsageCache(): Record<string, UsageCacheEntry>;
+	kiroAddMeterUsage(credentialId: string, amount: number): void;
 	kiroListModels(
-		credentialId?: number,
-	): Promise<{ models: Array<Record<string, unknown>>; credentialId: number }>;
+		credentialId?: string,
+	): Promise<{ models: Array<Record<string, unknown>>; credentialId: string }>;
+	kiroFetchCredentialModels(credentialId: string): Promise<string[]>;
+	kiroFetchAllCredentialModels(): Promise<Array<Record<string, unknown>>>;
 }
 
 let mod: KiroModule | null = null;
@@ -233,29 +247,42 @@ export function kiroSnapshot(): ManagerSnapshot | null {
 	return mod?.kiroSnapshot() ?? null;
 }
 
-export function kiroSetDisabled(id: number, disabled: boolean): void {
+export function kiroSetDisabled(id: string, disabled: boolean): void {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	mod.kiroSetDisabled(id, disabled);
 }
 
-export function kiroSetPriority(id: number, priority: number): void {
+export function kiroSetLoadBalancingMode(mode: "priority" | "balanced"): void {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	mod.kiroSetLoadBalancingMode(mode);
+}
+
+export function kiroSetPriority(id: string, priority: number): void {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	mod.kiroSetPriority(id, priority);
 }
 
-export function kiroResetAndEnable(id: number): void {
+export function kiroResetAndEnable(id: string): void {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	mod.kiroResetAndEnable(id);
 }
 
-export function kiroRemoveCredential(id: number): void {
+export function kiroRemoveCredential(id: string): void {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	mod.kiroRemoveCredential(id);
 }
 
-export async function kiroManualRefresh(id: number): Promise<void> {
+export async function kiroManualRefresh(id: string): Promise<void> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	await mod.kiroManualRefresh(id);
+}
+
+export function kiroUpdateCredential(
+	id: string,
+	fields: { email?: string; displayName?: string; region?: string },
+): void {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	mod.kiroUpdateCredential(id, fields);
 }
 
 export function kiroImportCredentials(creds: ImportCredentialInput[]): {
@@ -267,7 +294,7 @@ export function kiroImportCredentials(creds: ImportCredentialInput[]): {
 	return mod.kiroImportCredentials(creds);
 }
 
-export async function kiroGetUsage(id: number): Promise<UsageCacheEntry> {
+export async function kiroGetUsage(id: string): Promise<UsageCacheEntry> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	return mod.kiroGetUsage(id);
 }
@@ -276,12 +303,29 @@ export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	return mod?.kiroGetAllUsageCache() ?? {};
 }
 
-export async function kiroListModels(credentialId?: number): Promise<{
+/** Accumulate metering usage for a credential (debounced persistence). */
+export function kiroAddMeterUsage(credentialId: string, amount: number): void {
+	mod?.kiroAddMeterUsage(credentialId, amount);
+}
+
+export async function kiroListModels(credentialId?: string): Promise<{
 	models: Array<Record<string, unknown>>;
-	credentialId: number;
+	credentialId: string;
 }> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	return mod.kiroListModels(credentialId);
+}
+
+/** Fetch and store the model list for a single credential. */
+export async function kiroFetchCredentialModels(credentialId: string): Promise<string[]> {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	return mod.kiroFetchCredentialModels(credentialId);
+}
+
+/** Fetch model lists for all credentials, store per-credential, return deduplicated union. */
+export async function kiroFetchAllCredentialModels(): Promise<Array<Record<string, unknown>>> {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	return mod.kiroFetchAllCredentialModels();
 }
 
 // --- Cached model list for system-wide use ---
