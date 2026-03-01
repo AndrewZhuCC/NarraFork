@@ -11,7 +11,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { initKiro, kiroChatRaw, type StreamEvent } from "../server/lib/kiro/index";
+import { initKiro, kiroChatRaw } from "../server/lib/kiro/index";
 import type { KiroChatRequest } from "../server/lib/kiro/types";
 
 // --- Init ---
@@ -112,7 +112,7 @@ async function testAtSize(chars: number) {
 
 	// Check if the HTML looks complete
 	const hasClosingHtml = assistantText.includes("</html>");
-	const hasClosingScript = assistantText.includes("</script>");
+	const _hasClosingScript = assistantText.includes("</script>");
 	const scriptTags = (assistantText.match(/<script/g) ?? []).length;
 	const closingScriptTags = (assistantText.match(/<\/script>/g) ?? []).length;
 

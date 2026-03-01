@@ -36,12 +36,6 @@ export const CONTAINER_STATUS_COLORS: Record<string, string> = {
 	removed: "gray",
 };
 
-export const BUILTIN_MODELS: ModelOption[] = [
-	{ value: "kiro:claude-haiku", label: "Haiku", provider: "kiro" },
-	{ value: "kiro:claude-sonnet", label: "Sonnet", provider: "kiro" },
-	{ value: "kiro:claude-opus", label: "Opus", provider: "kiro" },
-];
-
 export type ModelOption = {
 	value: string;
 	label: string;
@@ -80,7 +74,11 @@ export function groupModelsByProvider(
 	models: ModelOption[],
 	providerLabels: Record<string, string> = {},
 ): { group: string; items: { value: string; label: string }[] }[] {
-	const defaultLabels: Record<string, string> = { kiro: "Kiro", openai: "OpenAI" };
+	const defaultLabels: Record<string, string> = {
+		kiro: "Kiro",
+		openai: "OpenAI",
+		anthropic: "Anthropic",
+	};
 	const labels = { ...defaultLabels, ...providerLabels };
 	const groups = new Map<string, { value: string; label: string }[]>();
 	const seen = new Set<string>();

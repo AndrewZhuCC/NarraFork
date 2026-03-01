@@ -25,6 +25,10 @@ export interface KiroCredentials {
 	meterUsage?: number;
 	/** Model IDs available to this credential (fetched from ListAvailableModels API). */
 	availableModels?: string[];
+	/** Whether this credential is manually disabled (persisted across restarts). */
+	disabled?: boolean;
+	/** Reason for disabling (persisted across restarts). */
+	disabledReason?: DisabledReason;
 }
 
 export interface KiroConfig {

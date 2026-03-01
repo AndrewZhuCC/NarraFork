@@ -75,7 +75,15 @@ export function CustomModelsSection({
 							<Badge
 								size="sm"
 								variant="light"
-								color={m.provider === "kiro" ? "violet" : "teal"}
+								color={
+									m.provider === "kiro"
+										? "violet"
+										: m.provider === "codex"
+											? "indigo"
+											: m.provider === "anthropic"
+												? "pink"
+												: "teal"
+								}
 								w={70}
 							>
 								{m.provider ?? "openai"}

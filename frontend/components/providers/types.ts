@@ -11,6 +11,16 @@ export interface OpenAIProviderState {
 	codexAccountId: string;
 }
 
+export interface AnthropicProviderState {
+	id: string;
+	name: string;
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+	maxMode: boolean;
+}
+
 /** Kiro account tier — determines model availability. */
 export type KiroAccountTier = "free" | "paid" | "enterprise";
 

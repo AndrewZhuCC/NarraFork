@@ -32,7 +32,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
-import { BUILTIN_MODELS, type ModelOption, modelValue } from "../../lib/constants";
+import { type ModelOption, modelValue } from "../../lib/constants";
 import { classifyKiroTier, type KiroAccountTier, TIER_CONFIG } from "./types";
 
 function relativeTime(iso: string | undefined): string {
@@ -180,7 +180,7 @@ export function KiroSection({ settings, hiddenModels, onToggleHidden }: KiroSect
 					};
 				})
 				.filter((m: ModelOption) => m.value !== "kiro:")
-		: BUILTIN_MODELS;
+		: [];
 
 	// --- Group credentials by account tier ---
 	const tierGroups: Record<KiroAccountTier, typeof entries> = {

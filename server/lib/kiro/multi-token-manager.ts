@@ -126,11 +126,14 @@ export class MultiTokenManager {
 					needsPersist = true;
 				}
 			}
+			// Restore persisted disabled state (only for manual disables)
+			const disabled = cred.disabled === true && cred.disabledReason === "manual";
 			return {
 				id: cred.id,
 				credentials: cred,
 				failureCount: 0,
-				disabled: false,
+				disabled,
+				disabledReason: disabled ? ("manual" as const) : undefined,
 				successCount: 0,
 			};
 		});
@@ -392,6 +395,14 @@ export class MultiTokenManager {
 		} else {
 			entry.disabledReason = "manual";
 		}
+		// Sync to credentials object for persistence
+		entry.credentials.disabled = disabled;
+		entry.credentials.disabledReason = disabled ? "manual" : undefined;
+		if (this.isMultipleFormat) {
+			try {
+				this.persistCredentials();
+			} catch {}
+		}
 	}
 
 	setPriority(id: string, priority: number): void {
@@ -411,6 +422,14 @@ export class MultiTokenManager {
 		entry.failureCount = 0;
 		entry.disabled = false;
 		entry.disabledReason = undefined;
+		// Sync to credentials object for persistence
+		entry.credentials.disabled = undefined;
+		entry.credentials.disabledReason = undefined;
+		if (this.isMultipleFormat) {
+			try {
+				this.persistCredentials();
+			} catch {}
+		}
 	}
 
 	removeCredential(id: string): void {

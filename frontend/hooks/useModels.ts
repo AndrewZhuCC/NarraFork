@@ -1,13 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "../lib/api";
-import {
-	BUILTIN_MODELS,
-	groupModelsByProvider,
-	type ModelOption,
-	mergeModels,
-	modelValue,
-} from "../lib/constants";
+import { groupModelsByProvider, type ModelOption, mergeModels, modelValue } from "../lib/constants";
+
+// Hardcoded Codex models (no API to fetch them)
+const BUILTIN_CODEX_MODELS = [
+	"gpt-5.3-codex",
+	"gpt-5.2-codex",
+	"gpt-5.2",
+	"gpt-5.1-codex",
+	"gpt-5.1-codex-max",
+	"gpt-5.1-codex-mini",
+];
 
 export interface ProviderModels {
 	prefix: string;
@@ -30,6 +34,8 @@ export function useAllModels() {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
 
 		// --- Kiro models ---
+		// Only show kiro models when kiro is available (has enabled credentials).
+		// When kiroModels is null (kiro unavailable), return empty array instead of BUILTIN_MODELS.
 		const kiroModels: ModelOption[] = settingsData?.kiroModels?.length
 			? settingsData.kiroModels
 					// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -45,7 +51,7 @@ export function useAllModels() {
 						};
 					})
 					.filter((m: ModelOption) => m.value !== "kiro:")
-			: BUILTIN_MODELS;
+			: [];
 
 		// --- OpenAI-compatible models (per-provider) ---
 		const openaiModelsGrouped: Array<{
@@ -57,7 +63,7 @@ export function useAllModels() {
 		const serverProviders: Array<{ id: string; prefix?: string; name?: string }> =
 			settingsData?.openaiProviders ?? [];
 
-		const providerLabels: Record<string, string> = { kiro: "Kiro" };
+		const providerLabels: Record<string, string> = { kiro: "Kiro", codex: "Codex" };
 		const fetchedOpenaiModels: ModelOption[] = [];
 		const openaiByProvider: ProviderModels[] = [];
 
@@ -98,6 +104,37 @@ export function useAllModels() {
 			openaiByProvider.push({ prefix, name, models });
 		}
 
+		// --- Anthropic models (per-provider) ---
+		const anthropicModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<{ id: string }>;
+		}> = settingsData?.anthropicModelsGrouped ?? [];
+
+		const serverAnthropicProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.anthropicProviders ?? [];
+
+		const fetchedAnthropicModels: ModelOption[] = [];
+		const anthropicByProvider: ProviderModels[] = [];
+
+		for (const group of anthropicModelsGrouped) {
+			const cfg = serverAnthropicProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "anthropic";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const opt: ModelOption = {
+					value: `${prefix}:${m.id}`,
+					label: m.id,
+					provider: prefix,
+				};
+				models.push(opt);
+				fetchedAnthropicModels.push(opt);
+			}
+			anthropicByProvider.push({ prefix, name, models });
+		}
+
 		// --- Custom models ---
 		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
 			(m: { value: string; label: string; provider?: string }) => ({
@@ -106,8 +143,21 @@ export function useAllModels() {
 			}),
 		);
 
+		// --- Codex models (hardcoded) ---
+		const codexModels: ModelOption[] = BUILTIN_CODEX_MODELS.map((id) => ({
+			value: modelValue("codex", id),
+			label: id,
+			provider: "codex",
+		}));
+
 		// --- Merge & filter ---
-		const allModels = mergeModels(kiroModels, fetchedOpenaiModels, customModels);
+		const allModels = mergeModels(
+			kiroModels,
+			fetchedOpenaiModels,
+			fetchedAnthropicModels,
+			codexModels,
+			customModels,
+		);
 		const visibleModels = allModels.filter((m) => !hidden.has(m.value));
 		const groupedModels = groupModelsByProvider(visibleModels, providerLabels);
 
@@ -120,8 +170,12 @@ export function useAllModels() {
 			groupedModels,
 			/** Kiro models only. */
 			kiroModels,
+			/** Codex models only. */
+			codexModels,
 			/** OpenAI models grouped by provider. */
 			openaiByProvider,
+			/** Anthropic models grouped by provider. */
+			anthropicByProvider,
 			/** Custom models. */
 			customModels,
 			/** Hidden model values set. */

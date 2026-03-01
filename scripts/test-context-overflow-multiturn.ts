@@ -8,7 +8,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 import { initKiro, kiroChatRaw, type StreamEvent } from "../server/lib/kiro/index";
