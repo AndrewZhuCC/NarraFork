@@ -26,9 +26,10 @@
 
 ### 5. OpenAI Provider
 - **文件**: `server/lib/agent/openai-provider.ts`
-- **修改**: 在 Responses API 请求中添加 reasoning 配置
+- **修改**: 在 Responses API 请求中添加 reasoning 配置，仅当模型 ID 包含 "codex" 时生效
 ```typescript
-if (params.reasoningEffort) {
+// Add reasoning configuration for Codex models (model ID contains "codex")
+if (params.reasoningEffort && model.toLowerCase().includes("codex")) {
   body.reasoning = {
     effort: params.reasoningEffort,
     summary: "auto",
@@ -68,7 +69,7 @@ if (params.reasoningEffort) {
   - 添加 `reasoningEffortMutation` 变量
   - 在 Desktop selects 区域添加思考强度选择器（权限模式选择器之后）
   - 在 Mobile 区域添加思考强度选择器（使用字母缩写：A/L/M/H/X）
-  - 仅在 `narrator.model?.startsWith("codex:")` 时显示
+  - 仅在模型 ID 包含 "codex" 时显示（`narrator.model?.toLowerCase().includes("codex")`）
 
 ### 4. 国际化
 - **文件**: 
@@ -84,7 +85,7 @@ if (params.reasoningEffort) {
 
 ## 功能特性
 
-1. **条件显示**: 思考强度选择器仅在使用 Codex 模型时显示
+1. **条件显示**: 思考强度选择器仅在模型 ID 包含 "codex" 时显示（支持所有 OpenAI compatible provider）
 2. **五个级别**: 
    - Auto（默认，不设置 reasoning 参数）
    - Low（低强度思考）
@@ -106,10 +107,16 @@ if (params.reasoningEffort) {
 
 ## 使用方式
 
-1. 创建或打开一个使用 Codex 模型的叙述者会话
+1. 创建或打开一个使用包含 "codex" 的模型的叙述者会话（例如 `codex:gpt-5.3-codex`、`openai:gpt-4-codex` 等）
 2. 在顶部工具栏中找到思考强度选择器（权限模式选择器旁边）
 3. 点击选择器，从下拉菜单中选择所需的思考强度
 4. 下次发送消息时，模型将使用选定的思考强度
+
+## 支持的 Provider
+
+- **Kiro Provider**: 原生 `codex:` 前缀模型（如 `codex:gpt-5.3-codex`）
+- **OpenAI Compatible Provider**: 任何模型 ID 包含 "codex" 的模型（如 `gpt-4-codex`、`my-codex-model` 等）
+- 只要模型 ID 中包含 "codex"（不区分大小写），就会启用 reasoning 配置功能
 
 ## 技术细节
 

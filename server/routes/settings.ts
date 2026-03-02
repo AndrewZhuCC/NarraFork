@@ -1,8 +1,14 @@
 import { Hono } from "hono";
 import { z } from "zod";
+import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import { isKiroAvailable, kiroGetCachedModels } from "../lib/kiro-adapter";
-import { loadSettings, type NarraForkSettings, saveSettings } from "../lib/settings";
+import {
+	getBuiltinCodexModels,
+	loadSettings,
+	type NarraForkSettings,
+	saveSettings,
+} from "../lib/settings";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
@@ -102,6 +108,14 @@ const updateSettingsSchema = z
 			.optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
+		codex: z
+			.object({
+				proxy: z.string().optional(),
+				loadBalancingMode: z.enum(["priority", "balanced"]).optional(),
+				defaultReasoningEffort: z.enum(["low", "medium", "high", "xhigh"]).nullable().optional(),
+			})
+			.partial()
+			.optional(),
 	})
 	.strict();
 
@@ -116,6 +130,8 @@ function maskApiKey(key?: string): string {
 
 settingsRoutes.get("/", (c) => {
 	const s = loadSettings();
+	const codexManager = getCodexManager();
+	const codexSnapshot = codexManager.snapshot();
 	const result = {
 		...s,
 		auth: { ...s.auth, jwtSecret: undefined },
@@ -132,6 +148,8 @@ settingsRoutes.get("/", (c) => {
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
+		codexAvailable: codexSnapshot.available > 0,
+		codexModels: getBuiltinCodexModels(),
 	};
 	return c.json(result);
 });
@@ -143,6 +161,11 @@ settingsRoutes.patch("/", async (c) => {
 
 	const current = loadSettings();
 	const validated = parsed.data;
+
+	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
+	if (validated.codex?.defaultReasoningEffort === null) {
+		validated.codex.defaultReasoningEffort = undefined;
+	}
 
 	// Preserve real API keys for multi-provider
 	if (validated.openaiProviders) {

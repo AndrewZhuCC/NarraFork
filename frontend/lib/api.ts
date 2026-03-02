@@ -312,6 +312,8 @@ export const api = {
 		}
 		return res.json();
 	},
+	retryLastMessage: (narratorId: string) =>
+		request<{ ok: boolean }>(`/narrators/${narratorId}/retry`, { method: "POST" }),
 	triggerCompact: (narratorId: string, beforeMessageId?: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/compact`, {
 			method: "POST",
@@ -982,12 +984,65 @@ export const api = {
 				failureCount: number;
 				lastUsedAt?: string;
 				expiresAt?: number;
+				usage?: {
+					plan_type: string;
+					primary_window?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+						window_type: "5h" | "weekly" | "unknown";
+					};
+					secondary_window?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+						window_type: "5h" | "weekly" | "unknown";
+					};
+					code_review?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+					};
+					queriedAt: string;
+				};
 			}>;
 			currentId: string;
 			loadBalancingMode: "priority" | "balanced";
 			total: number;
 			available: number;
+			stickySessionCount: number;
 			globalProxy?: string;
+			defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
+			usageCache: Record<
+				string,
+				{
+					plan_type: string;
+					primary_window?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+						window_type: "5h" | "weekly" | "unknown";
+					};
+					secondary_window?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+						window_type: "5h" | "weekly" | "unknown";
+					};
+					code_review?: {
+						used_percent: number;
+						remaining_percent: number;
+						reset_at: number;
+						reset_after_seconds: number;
+					};
+					queriedAt: string;
+				}
+			>;
 		}>("/codex/status"),
 	codexBrowserAuth: () =>
 		request<{ authorizeUrl: string }>("/codex/auth/browser", {
@@ -1026,6 +1081,31 @@ export const api = {
 		}),
 	codexCredentialRefresh: (id: string) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}/refresh`, { method: "POST" }),
+	codexCredentialGetUsage: (id: string) =>
+		request<{
+			plan_type: string;
+			primary_window?: {
+				used_percent: number;
+				remaining_percent: number;
+				reset_at: number;
+				reset_after_seconds: number;
+				window_type: "5h" | "weekly" | "unknown";
+			};
+			secondary_window?: {
+				used_percent: number;
+				remaining_percent: number;
+				reset_at: number;
+				reset_after_seconds: number;
+				window_type: "5h" | "weekly" | "unknown";
+			};
+			code_review?: {
+				used_percent: number;
+				remaining_percent: number;
+				reset_at: number;
+				reset_after_seconds: number;
+			};
+			queriedAt: string;
+		}>(`/codex/credentials/${id}/usage`, { method: "POST" }),
 	codexSetLoadBalancingMode: (mode: "priority" | "balanced") =>
 		request<{ ok: boolean; mode: string }>("/codex/load-balancing-mode", {
 			method: "POST",
@@ -1036,6 +1116,18 @@ export const api = {
 			method: "POST",
 			body: JSON.stringify({ proxy }),
 		}),
+	codexGetDefaultReasoningEffort: () =>
+		request<{ reasoningEffort: "low" | "medium" | "high" | "xhigh" | null }>(
+			"/codex/default-reasoning-effort",
+		),
+	codexSetDefaultReasoningEffort: (reasoningEffort?: "low" | "medium" | "high" | "xhigh" | null) =>
+		request<{ ok: boolean; reasoningEffort: "low" | "medium" | "high" | "xhigh" | null }>(
+			"/codex/default-reasoning-effort",
+			{
+				method: "POST",
+				body: JSON.stringify({ reasoningEffort }),
+			},
+		),
 	codexImportCredentials: (
 		credentials: Array<{
 			refreshToken: string;
@@ -1043,7 +1135,10 @@ export const api = {
 			priority?: number;
 		}>,
 	) =>
-		request<{ added: number; duplicates: number }>("/codex/import", {
+		request<{
+			added: number;
+			duplicates: number;
+		}>("/codex/import", {
 			method: "POST",
 			body: JSON.stringify({ credentials }),
 		}),
