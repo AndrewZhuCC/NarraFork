@@ -122,6 +122,29 @@ export interface KiroUserInputMessageContext {
 	tools?: KiroTool[];
 }
 
+export interface KiroHistoryUserMessage {
+	userInputMessage: {
+		content: string;
+		modelId: string;
+		origin?: string;
+		images?: KiroImage[];
+		userInputMessageContext?: KiroUserInputMessageContext;
+	};
+}
+
+export interface KiroHistoryAssistantMessage {
+	assistantResponseMessage: {
+		content?: string;
+		toolUses?: Array<{
+			toolUseId: string;
+			name: string;
+			input: Record<string, unknown>;
+		}>;
+	};
+}
+
+export type KiroHistoryMessage = KiroHistoryUserMessage | KiroHistoryAssistantMessage;
+
 export interface KiroChatRequest {
 	conversationState: {
 		conversationId: string;
@@ -140,7 +163,7 @@ export interface KiroChatRequest {
 			};
 		};
 		chatTriggerType?: string;
-		history?: Record<string, unknown>[];
+		history?: KiroHistoryMessage[];
 		agentContinuationId?: string;
 		agentTaskType?: string;
 		workspaceId?: string;
@@ -185,17 +208,21 @@ interface KiroModule {
 }
 
 let mod: KiroModule | null = null;
+const isKiroPluginDisabled = process.env.NARRAFORK_DISABLE_KIRO_PLUGIN === "1";
 
-try {
-	// Path constructed at runtime so TypeScript doesn't resolve it statically.
-	// This allows compilation even when server/lib/kiro/ is absent.
-	const kiroPath = `./kiro/${"index"}`;
-	mod = await import(kiroPath);
-} catch {
-	// kiro directory absent — plugin unavailable
+if (!isKiroPluginDisabled) {
+	try {
+		// Path constructed at runtime so TypeScript doesn't resolve it statically.
+		// This allows compilation even when server/lib/kiro/ is absent.
+		const kiroPath = `./kiro/${"index"}`;
+		mod = await import(kiroPath);
+	} catch {
+		// kiro directory absent — plugin unavailable
+	}
 }
 
 export function initKiro(config: KiroPluginConfig): boolean {
+	if (isKiroPluginDisabled) return false;
 	if (!mod) return false;
 	return mod.initKiro(config);
 }

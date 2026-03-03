@@ -93,12 +93,16 @@ try {
 		}
 	}
 	console.log(`\n✅ Stream ended normally. Total events: ${eventCount}`);
-} catch (err: any) {
+} catch (err: unknown) {
 	console.log("\n🔴 === ERROR CAUGHT ===");
-	console.log("Name:", err.name);
-	console.log("Code:", err.code);
-	console.log("Message:", err.message);
-	if (err.statusCode) console.log("Status:", err.statusCode);
+	const name = err instanceof Error ? err.name : "Error";
+	const message = err instanceof Error ? err.message : String(err);
+	console.log("Name:", name);
+	console.log("Code:", (err as { code?: unknown })?.code ?? "");
+	console.log("Message:", message);
+	if ((err as { statusCode?: unknown })?.statusCode) {
+		console.log("Status:", (err as { statusCode?: unknown }).statusCode);
+	}
 	console.log("Full error:", err);
 	console.log("======================\n");
 }

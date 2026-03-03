@@ -88,20 +88,24 @@ async function sendTurn(
 				console.log(`   [${evt.eventType}] ${JSON.stringify(evt.data).slice(0, 200)}`);
 			}
 		}
-	} catch (err: any) {
+	} catch (err: unknown) {
 		console.log(`\n🔴 ERROR in ${turnLabel}:`);
-		console.log(`   Name: ${err.name}`);
-		console.log(`   Code: ${err.code}`);
+		const name = err instanceof Error ? err.name : "Error";
+		const message = err instanceof Error ? err.message : String(err);
+		console.log(`   Name: ${name}`);
+		console.log(`   Code: ${String((err as { code?: unknown })?.code ?? "")}`);
 		// Try to parse the message as JSON for readability
 		try {
-			const parsed = JSON.parse(err.message);
-			console.log(`   Type: ${parsed.__type}`);
-			console.log(`   Message: ${parsed.message}`);
-			console.log(`   Reason: ${parsed.reason}`);
+			const parsed = JSON.parse(message) as { __type?: string; message?: string; reason?: string };
+			console.log(`   Type: ${parsed.__type ?? "unknown"}`);
+			console.log(`   Message: ${parsed.message ?? message}`);
+			console.log(`   Reason: ${parsed.reason ?? "unknown"}`);
 		} catch {
-			console.log(`   Message: ${err.message}`);
+			console.log(`   Message: ${message}`);
 		}
-		if (err.statusCode) console.log(`   Status: ${err.statusCode}`);
+		if ((err as { statusCode?: unknown })?.statusCode) {
+			console.log(`   Status: ${String((err as { statusCode?: unknown }).statusCode)}`);
+		}
 	}
 
 	console.log(

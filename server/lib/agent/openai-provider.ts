@@ -108,7 +108,10 @@ const CODEX_IDENTITY: Record<string, string> = {
 
 type OAIContentPart =
 	| { type: "text"; text: string }
-	| { type: "image_url"; image_url: { url: string } };
+	| { type: "image_url"; image_url: { url: string } }
+	| { type: "input_text"; text: string }
+	| { type: "input_image"; image_url: string }
+	| { type: "output_text"; text: string };
 
 interface OAIMessage {
 	role: "system" | "user" | "assistant" | "tool";
@@ -370,8 +373,9 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (Array.isArray(msg.content)) return msg.content.length > 0;
 				return false;
 			});
+			const responsesInput = convertHistoryToResponsesApi(sanitizedInputMessages);
 
-			body = { model, input: sanitizedInputMessages, stream: true, store: false };
+			body = { model, input: responsesInput, stream: true, store: false };
 			if (instructions) {
 				body.instructions = instructions;
 			}
@@ -390,7 +394,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				model,
 				hasInstructions: !!instructions,
 				instructionsLength: instructions.length,
-				inputMessageCount: sanitizedInputMessages.length,
+				inputMessageCount: responsesInput.length,
 				toolCount: tools.length,
 				reasoningEffort: params.reasoningEffort,
 			});
@@ -971,7 +975,10 @@ function parseResponsesAPIEvent(
 	// ── Error states ──
 	if (type === "response.failed") {
 		const errMsg = chunk.response?.error?.message ?? "Response failed";
-		results.push({ invalidState: { reason: "api_error", message: errMsg } });
+		const reason =
+			String(chunk.response?.error?.code ?? chunk.response?.error?.type ?? "api_error") ||
+			"api_error";
+		results.push({ invalidState: { reason, message: errMsg } });
 		return results;
 	}
 	if (type === "response.incomplete") {

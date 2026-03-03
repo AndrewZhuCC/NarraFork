@@ -1,4 +1,3 @@
-import type { StreamEvent } from "../kiro/event-stream-parser";
 import type {
 	KiroChatRequest,
 	KiroHistoryAssistantMessage,
@@ -6,7 +5,8 @@ import type {
 	KiroHistoryUserMessage,
 	KiroImage,
 	KiroToolResult,
-} from "../kiro/types";
+	StreamEvent,
+} from "../kiro-adapter";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { getImagePath, imageToBase64 } from "../uploads";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
@@ -157,7 +157,7 @@ export class KiroProvider implements ProviderAdapter {
 							content: ack,
 						},
 					},
-				] as Record<string, unknown>[],
+				] as KiroHistoryMessage[],
 				currentMessage: {
 					userInputMessage: {
 						content: `${reminder}\n\n${content}`,
@@ -187,7 +187,7 @@ function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	const toolResults = params.toolResults as KiroToolResult[];
 
 	// Convert generic images to KiroImage format
-	const kiroImages: import("../kiro/types").KiroImage[] | undefined = params.images?.length
+	const kiroImages: KiroImage[] | undefined = params.images?.length
 		? params.images.map((img) => ({
 				format: img.format as "jpeg" | "png" | "gif" | "webp",
 				source: { bytes: img.base64 },

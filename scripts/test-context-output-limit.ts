@@ -79,9 +79,9 @@ async function testAtSize(chars: number) {
 	let assistantText = "";
 	let contextPercent: number | null = null;
 	let hasInvalidState = false;
-	let invalidStateData: any = null;
+	let invalidStateData: unknown = null;
 	let eventCount = 0;
-	let meteringData: any = null;
+	let meteringData: unknown = null;
 
 	try {
 		for await (const evt of kiroChatRaw(request)) {
@@ -100,12 +100,13 @@ async function testAtSize(chars: number) {
 				invalidStateData = evt.data;
 			}
 		}
-	} catch (err: any) {
+	} catch (err: unknown) {
+		const message = err instanceof Error ? err.message : String(err);
 		try {
-			const parsed = JSON.parse(err.message);
-			console.log(`❌ HTTP Error: ${parsed.reason} — ${parsed.message}`);
+			const parsed = JSON.parse(message) as { reason?: string; message?: string };
+			console.log(`❌ HTTP Error: ${parsed.reason ?? "unknown"} — ${parsed.message ?? message}`);
 		} catch {
-			console.log(`❌ Error: ${err.message}`);
+			console.log(`❌ Error: ${message}`);
 		}
 		return;
 	}
