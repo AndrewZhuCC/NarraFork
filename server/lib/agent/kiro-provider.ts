@@ -122,6 +122,7 @@ export class KiroProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
+		_systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
