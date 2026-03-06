@@ -41,6 +41,7 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const port = Number(process.env.PORT) || settings.server.port;
+const host = process.env.HOST || "localhost";
 const isProd = process.env.NODE_ENV === "production";
 
 // MIME type lookup for embedded static files
@@ -170,6 +171,7 @@ if (isProd) {
 
 const _server = Bun.serve({
 	port,
+	hostname: host,
 	idleTimeout: 255,
 	async fetch(req, server) {
 		const url = new URL(req.url);
@@ -191,10 +193,15 @@ const _server = Bun.serve({
 			// Look up user info for presence tracking
 			const user = await db.query.users.findFirst({
 				where: eq(users.id, payload.sub),
-				columns: { id: true, username: true, avatarColor: true },
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
 			});
 			const userInfo = user
-				? { userId: user.id, username: user.username, avatarColor: user.avatarColor }
+				? {
+						userId: user.id,
+						username: user.username,
+						avatarColor: user.avatarColor,
+						avatarImageId: user.avatarImageId,
+					}
 				: undefined;
 
 			const wsData = resolveWSData(url, userInfo);
@@ -213,7 +220,7 @@ const _server = Bun.serve({
 	websocket: wsHandlers,
 });
 
-logger.info(`NarraFork server running on http://localhost:${port}`, { isProd });
+logger.info(`NarraFork server running on http://${host}:${port}`, { isProd });
 
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
