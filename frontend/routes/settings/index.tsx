@@ -24,6 +24,7 @@ import {
 	IconBell,
 	IconEye,
 	IconHandStop,
+	IconNotebook,
 	IconPencilCheck,
 	IconPlayerPlay,
 	IconRefresh,
@@ -37,7 +38,6 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
-import { type CommandDef, CommandsEditor } from "../../components/common/CommandsEditor";
 import { LanguageSwitcher } from "../../components/LanguageSwitcher";
 import { ThemeSwitcher } from "../../components/ThemeSwitcher";
 import { TERMINAL_THEMES } from "../../components/terminal/terminal-theme";
@@ -514,6 +514,7 @@ function SettingsPage() {
 							{ value: "acceptEdits", label: tn("perm_acceptEdits") },
 							{ value: "bypassPermissions", label: tn("perm_bypassPermissions") },
 							{ value: "readOnly", label: tn("perm_readOnly") },
+							{ value: "plan", label: tn("perm_plan") },
 							{ value: "dontAsk", label: tn("perm_dontAsk") },
 						]}
 						leftSection={
@@ -525,6 +526,8 @@ function SettingsPage() {
 								<IconShieldOff size={14} />
 							) : permissionMode === "readOnly" ? (
 								<IconEye size={14} />
+							) : permissionMode === "plan" ? (
+								<IconNotebook size={14} />
 							) : permissionMode === "dontAsk" ? (
 								<IconHandStop size={14} />
 							) : (
@@ -537,6 +540,7 @@ function SettingsPage() {
 								acceptEdits: <IconPencilCheck size={14} />,
 								bypassPermissions: <IconShieldOff size={14} />,
 								readOnly: <IconEye size={14} />,
+								plan: <IconNotebook size={14} />,
 								dontAsk: <IconHandStop size={14} />,
 							};
 							return (
@@ -886,22 +890,6 @@ function SettingsPage() {
 				<Stack>
 					<Title order={4}>{t("languageSection")}</Title>
 					<LanguageSwitcher />
-				</Stack>
-			</Paper>
-
-			{/* Slash Commands */}
-			<Paper withBorder p="md">
-				<Stack>
-					<div>
-						<Title order={4}>{t("commandsSection")}</Title>
-						<Text size="xs" c="dimmed">
-							{t("commandsSectionDesc")}
-						</Text>
-					</div>
-					<CommandsEditor
-						commands={(userPrefs?.commands ?? []) as CommandDef[]}
-						onChange={(cmds) => updateUserPref.mutate({ commands: cmds })}
-					/>
 				</Stack>
 			</Paper>
 
