@@ -148,6 +148,11 @@ export interface NarraForkSettings {
 		/** Default reasoning effort for Codex models when narrator reasoningEffort is unset. */
 		defaultReasoningEffort?: "low" | "medium" | "high" | "xhigh";
 	};
+	/** Built-in routines configuration. */
+	routines: {
+		/** Globally disabled routine IDs (blacklist — all enabled by default). */
+		disabledRoutines: string[];
+	};
 	/** Multiple OpenAI-compatible API providers. */
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers. */
@@ -159,7 +164,7 @@ const DEFAULTS: NarraForkSettings = {
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
 		defaultModel: "kiro:claude-sonnet",
-		defaultPermissionMode: "default",
+		defaultPermissionMode: "acceptEdits",
 		summaryModel: "kiro:claude-haiku",
 		customModels: [],
 		hiddenModels: [],
@@ -197,6 +202,12 @@ const DEFAULTS: NarraForkSettings = {
 	auth: {
 		jwtSecret: "",
 		registrationOpen: true,
+	},
+	routines: {
+		disabledRoutines: [],
+	},
+	codex: {
+		defaultReasoningEffort: "high",
 	},
 };
 
@@ -348,6 +359,7 @@ _cache.current = settings;
 
 const BUILTIN_KIRO_MODELS = ["claude-haiku", "claude-sonnet", "claude-opus"];
 const BUILTIN_CODEX_MODELS = [
+	"gpt-5.4",
 	"gpt-5.3-codex",
 	"gpt-5.2-codex",
 	"gpt-5.2",
@@ -628,6 +640,7 @@ const BUILTIN_CONTEXT_WINDOWS: Record<string, number | ModelContextConfig> = {
 	"gpt-5.1-codex-mini": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	"gpt-5.2-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	"gpt-5.2": { contextLength: 256_000, maxCompletionTokens: 128_000 },
+	"gpt-5.4": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	"gpt-5.3-codex": { contextLength: 256_000, maxCompletionTokens: 128_000 },
 	// Common third-party models (via OpenAI-compatible APIs)
 	"deepseek-chat": 64_000,

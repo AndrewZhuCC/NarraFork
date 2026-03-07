@@ -156,6 +156,8 @@
 	"selectDrive": "Select a drive",
 	"computer": "Computer",
 	"cancel": "Cancel",
+	"version": "Version",
+	"versionWithNumber": "v{{version}}",
 	"status": {
 		"chapterActive": "Active",
 		"chapterDormant": "Dormant",
