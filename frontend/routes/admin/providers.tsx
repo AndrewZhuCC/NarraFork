@@ -356,6 +356,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
+					isDirty={isDirty}
 				/>
 
 				<AnthropicProvidersSection
@@ -366,6 +367,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
+					isDirty={isDirty}
 				/>
 
 				<CustomModelsSection
