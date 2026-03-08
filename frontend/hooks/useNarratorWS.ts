@@ -40,6 +40,7 @@ interface NarratorWSCallbacks {
 	onBufferSet?: (text: string, bufferedAt: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onPermissionModeChanged?: (permissionMode: string) => void;
+	onRelaxedPlanChanged?: (relaxedPlan: boolean) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
 	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
@@ -66,6 +67,7 @@ interface NarratorWSCallbacks {
 		filesChanged: number;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
+	onNkpQuotaBalance?: (quotaBalance: number | null) => void;
 	onNarratorError?: (error: string) => void;
 	onNarratorWarning?: (message: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
@@ -272,6 +274,9 @@ export function useNarratorWS(
 						case "permission_mode_changed":
 							callbacksRef.current.onPermissionModeChanged?.(data.permissionMode);
 							break;
+						case "relaxed_plan_changed":
+							callbacksRef.current.onRelaxedPlanChanged?.(data.relaxedPlan);
+							break;
 						case "compacting":
 							callbacksRef.current.onCompacting?.();
 							break;
@@ -331,6 +336,9 @@ export function useNarratorWS(
 							if (!data.isSubagent) {
 								callbacksRef.current.onMetering?.(data.unit, data.unitPlural, data.usage);
 							}
+							break;
+						case "nkp_quota_balance":
+							callbacksRef.current.onNkpQuotaBalance?.(data.quotaBalance ?? null);
 							break;
 						case "narrator_error":
 							callbacksRef.current.onNarratorError?.(data.error);

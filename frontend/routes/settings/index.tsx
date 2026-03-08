@@ -162,6 +162,8 @@ function SettingsPage() {
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
+	const [translateReasoning, setTranslateReasoning] = useState(false);
+	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [planTimeoutAction, setPlanTimeoutAction] = useState("deny");
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [localFontSize, setLocalFontSize] = useState<number | null>(null);
@@ -212,6 +214,8 @@ function SettingsPage() {
 		proxyEnabled: false,
 		proxyPort: 7780,
 		legacyEncoding: false,
+		translateReasoning: false,
+		defaultRelaxedPlan: false,
 		planTimeoutAction: "deny",
 		codexDefaultReasoningEffort: "high",
 	});
@@ -241,6 +245,8 @@ function SettingsPage() {
 				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
 				proxyPort: settings.containers?.proxy?.port ?? 7780,
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
+				translateReasoning: settings.agent?.translateReasoning ?? false,
+				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planTimeoutAction: settings.agent?.planTimeoutAction ?? "deny",
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 			};
@@ -267,6 +273,8 @@ function SettingsPage() {
 			setProxyEnabled(snap.proxyEnabled);
 			setProxyPort(snap.proxyPort);
 			setLegacyEncoding(snap.legacyEncoding);
+			setTranslateReasoning(snap.translateReasoning);
+			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setPlanTimeoutAction(snap.planTimeoutAction);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setInitialized(true);
@@ -299,6 +307,8 @@ function SettingsPage() {
 			proxyEnabled !== s.proxyEnabled ||
 			proxyPort !== s.proxyPort ||
 			legacyEncoding !== s.legacyEncoding ||
+			translateReasoning !== s.translateReasoning ||
+			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			planTimeoutAction !== s.planTimeoutAction ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort
 		);
@@ -326,6 +336,8 @@ function SettingsPage() {
 		proxyEnabled,
 		proxyPort,
 		legacyEncoding,
+		translateReasoning,
+		defaultRelaxedPlan,
 		planTimeoutAction,
 		codexDefaultReasoningEffort,
 	]);
@@ -360,6 +372,8 @@ function SettingsPage() {
 						plan: subagentPlanModel,
 					},
 					legacyEncoding,
+					translateReasoning,
+					defaultRelaxedPlan,
 					planTimeoutAction,
 				},
 				chapters: {
@@ -412,6 +426,8 @@ function SettingsPage() {
 						proxyEnabled,
 						proxyPort,
 						legacyEncoding,
+						translateReasoning,
+						defaultRelaxedPlan,
 						planTimeoutAction,
 						codexDefaultReasoningEffort,
 					};
@@ -611,6 +627,18 @@ function SettingsPage() {
 						description={t("legacyEncodingDesc")}
 						checked={legacyEncoding}
 						onChange={(e) => setLegacyEncoding(e.currentTarget.checked)}
+					/>
+					<Switch
+						label={t("translateReasoning")}
+						description={t("translateReasoningDesc")}
+						checked={translateReasoning}
+						onChange={(e) => setTranslateReasoning(e.currentTarget.checked)}
+					/>
+					<Switch
+						label={t("defaultRelaxedPlan")}
+						description={t("defaultRelaxedPlanDesc")}
+						checked={defaultRelaxedPlan}
+						onChange={(e) => setDefaultRelaxedPlan(e.currentTarget.checked)}
 					/>
 					<Select
 						label={t("planTimeoutAction")}

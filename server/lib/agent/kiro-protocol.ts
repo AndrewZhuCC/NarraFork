@@ -179,6 +179,12 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 		};
 	}
 
+	// NKP-specific: quota balance event sent after each request
+	if (evt.eventType === "nkpQuotaBalanceEvent") {
+		const balance = evt.data.quotaBalance;
+		result.nkpQuotaBalance = balance != null ? Number(balance) : null;
+	}
+
 	return result;
 }
 

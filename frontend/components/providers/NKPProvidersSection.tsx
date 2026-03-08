@@ -38,6 +38,7 @@ interface NKPProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	quotas?: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }>;
 }
 
 export function NKPProvidersSection({
@@ -49,6 +50,7 @@ export function NKPProvidersSection({
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	quotas,
 }: NKPProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -145,6 +147,7 @@ export function NKPProvidersSection({
 					const isExpanded = expandedProviders.has(p.id);
 					const pModels = providerModelsMap[p.id] ?? [];
 					const providerModelCount = pModels.length;
+					const quota = quotas?.[p.id];
 					return (
 						<Paper key={p.id} withBorder p="sm">
 							<Stack gap="xs">
@@ -163,6 +166,11 @@ export function NKPProvidersSection({
 												{t("nkpModelsCount", {
 													count: providerModelCount,
 												})}
+											</Badge>
+										)}
+										{quota?.quotaBalance != null && (
+											<Badge size="xs" variant="light" color="teal">
+												{t("nkpQuotaBalance", { balance: quota.quotaBalance.toFixed(2) })}
 											</Badge>
 										)}
 									</Group>

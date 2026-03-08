@@ -55,6 +55,8 @@ export interface ParsedStreamEvent {
 	invalidState?: { reason: string; message: string };
 	/** Kiro credential ID that served this request */
 	credentialId?: string;
+	/** NKP quota balance returned after each request */
+	nkpQuotaBalance?: number | null;
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

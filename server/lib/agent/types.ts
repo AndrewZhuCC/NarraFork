@@ -117,6 +117,7 @@ export type AgentEvent =
 			contextWindow?: number;
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
+	| { type: "nkp_quota_balance"; quotaBalance: number | null }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "done" };
 
@@ -141,7 +142,12 @@ export interface ReasoningProviderMetadata {
 /** A fully-streamed content block within an assistant message. */
 export type ContentBlock =
 	| { type: "text"; text: string }
-	| { type: "reasoning"; text: string; providerMetadata?: ReasoningProviderMetadata }
+	| {
+			type: "reasoning";
+			text: string;
+			translatedText?: string;
+			providerMetadata?: ReasoningProviderMetadata;
+	  }
 	| {
 			type: "tool_use";
 			toolUseId: string;
@@ -186,6 +192,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	maxTurns?: number;
 	planMode?: boolean;
+	/** When true, plan mode does NOT disable tool descriptions — tools remain fully available */
+	relaxedPlan?: boolean;
 	/** Plan file ID — set during plan mode for Write/Edit redirection and ExitPlanMode */
 	planFileId?: string;
 	/** Skill scan root — project gitPath or git root resolved from cwd */

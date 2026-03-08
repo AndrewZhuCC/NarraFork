@@ -85,6 +85,7 @@ export interface UseNarratorPanelWSReturn {
 	contextWindow: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
+	nkpQuotaBalance: number | null;
 	// Todos
 	currentTodos: TodoItem[] | null;
 	todosToolUseId: string | null;
@@ -213,6 +214,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
+	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
 
 	// --- Viewers ---
@@ -874,6 +876,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					old ? { ...old, permissionMode } : old,
 				);
 			},
+			onRelaxedPlanChanged: (relaxedPlan) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, relaxedPlan } : old,
+				);
+			},
 			onContextUsage: (percentage, promptTokens, contextWindow) => {
 				setContextPercent(percentage);
 				setPromptTokens(promptTokens ?? null);
@@ -882,6 +889,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPruneBoundary: (boundaryMessageId, prunedPct) => {
 				setPruneBoundaryMessageId(boundaryMessageId);
 				setPrunedPercent(prunedPct);
+			},
+			onNkpQuotaBalance: (balance) => {
+				setNkpQuotaBalance(balance);
 			},
 			onGitStatus: (data) => {
 				qc.setQueryData(["chapterGitStatus", data.chapterId], {
@@ -1162,6 +1172,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		contextWindow,
 		pruneBoundaryMessageId,
 		prunedPercent,
+		nkpQuotaBalance,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,

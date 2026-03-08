@@ -281,6 +281,13 @@ chapterBatchMerge.cleanupStaleSessions().catch((err) => {
 // Register project DB backup sync (event-driven dual-write)
 registerProjectDbSync();
 
+// Fetch NKP quota balances on startup
+import("./routes/nkp")
+	.then(({ fetchAllNkpQuotas }) => fetchAllNkpQuotas())
+	.catch((err) => {
+		logger.warn("NKP quota startup fetch failed", { error: String(err) });
+	});
+
 // Start container proxy if enabled
 if (settings.containers.proxy?.enabled) {
 	startContainerProxy().catch((err) => {

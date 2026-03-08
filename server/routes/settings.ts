@@ -11,7 +11,7 @@ import {
 } from "../lib/settings";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
-import { getNkpCachedModelsGrouped } from "./nkp";
+import { getAllNkpCachedQuotas, getNkpCachedModelsGrouped } from "./nkp";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
 const modelOptionSchema = z.object({
@@ -77,6 +77,8 @@ const updateSettingsSchema = z
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),
+				translateReasoning: z.boolean(),
+				defaultRelaxedPlan: z.boolean(),
 				planTimeoutAction: z.enum(["deny", "auto_approve"]),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
 			})
@@ -172,6 +174,7 @@ settingsRoutes.get("/", (c) => {
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nkpModelsGrouped: getNkpCachedModelsGrouped(),
+		nkpQuotas: getAllNkpCachedQuotas(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
 	};

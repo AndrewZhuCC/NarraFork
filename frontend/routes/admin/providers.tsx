@@ -461,6 +461,7 @@ function ProvidersPage() {
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isNkpProviderDirty}
+					quotas={settings?.nkpQuotas}
 				/>
 
 				<KiroSection

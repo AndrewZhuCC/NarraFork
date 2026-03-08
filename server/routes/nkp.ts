@@ -21,6 +21,88 @@ export type NkpModelInfo = Record<string, unknown>;
 /** Per-provider cached model lists. Key = provider id. */
 const cachedModelsByProvider = new Map<string, NkpModelInfo[]>();
 
+// === In-memory NKP quota cache (key = provider id) ===
+
+interface NkpQuotaCache {
+	quotaBalance: number | null;
+	quotaTotalGranted: number | null;
+	fetchedAt: number;
+}
+
+const cachedQuotaByProvider = new Map<string, NkpQuotaCache>();
+
+/** Fetch quota from a single NKP provider. */
+async function fetchNkpQuota(
+	config: NKPProviderConfig,
+): Promise<{ quotaBalance: number; quotaTotalGranted: number } | null> {
+	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	if (!baseUrl || !config.apiKey) return null;
+	try {
+		const response = await fetch(`${baseUrl}/v1/quota`, {
+			headers: { Authorization: `Bearer ${config.apiKey}` },
+		});
+		if (!response.ok) return null;
+		return (await response.json()) as { quotaBalance: number; quotaTotalGranted: number };
+	} catch {
+		return null;
+	}
+}
+
+/** Fetch quota for all configured NKP providers (called on startup). */
+export async function fetchAllNkpQuotas(): Promise<void> {
+	const providers = settings.nkpProviders ?? [];
+	await Promise.allSettled(
+		providers.map(async (p) => {
+			const data = await fetchNkpQuota(p);
+			if (data) {
+				cachedQuotaByProvider.set(p.id, {
+					quotaBalance: data.quotaBalance,
+					quotaTotalGranted: data.quotaTotalGranted,
+					fetchedAt: Date.now(),
+				});
+				logger.debug("NKP quota fetched on startup", {
+					provider: p.name,
+					quotaBalance: data.quotaBalance,
+				});
+			}
+		}),
+	);
+}
+
+/** Update cached quota balance for a provider identified by prefix. */
+export function updateNkpQuotaByPrefix(prefix: string, quotaBalance: number | null): void {
+	const providers = settings.nkpProviders ?? [];
+	const config = providers.find((p) => p.prefix === prefix);
+	if (!config) return;
+	const existing = cachedQuotaByProvider.get(config.id);
+	cachedQuotaByProvider.set(config.id, {
+		quotaBalance,
+		quotaTotalGranted: existing?.quotaTotalGranted ?? null,
+		fetchedAt: Date.now(),
+	});
+}
+
+/** Get cached quota for a provider by ID. */
+export function getNkpCachedQuota(providerId: string): NkpQuotaCache | undefined {
+	return cachedQuotaByProvider.get(providerId);
+}
+
+/** Get all cached quotas keyed by provider ID. */
+export function getAllNkpCachedQuotas(): Record<
+	string,
+	{ quotaBalance: number | null; quotaTotalGranted: number | null }
+> {
+	const result: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }> =
+		{};
+	for (const [id, cache] of cachedQuotaByProvider) {
+		result[id] = {
+			quotaBalance: cache.quotaBalance,
+			quotaTotalGranted: cache.quotaTotalGranted,
+		};
+	}
+	return result;
+}
+
 // Load cache on startup
 loadAllCachedModels();
 
@@ -206,4 +288,47 @@ nkpRoutes.post("/providers/:id/models/refresh", async (c) => {
 		logger.error("NKP listModels refresh failed", { error: msg, provider: config.name });
 		return c.json({ error: msg }, 500);
 	}
+});
+
+/** Proxy quota balance from NKP service (updates cache). */
+nkpRoutes.get("/providers/:id/quota", async (c) => {
+	const id = c.req.param("id");
+	const providers = settings.nkpProviders ?? [];
+	const config = providers.find((p) => p.id === id);
+	if (!config) {
+		return c.json({ error: `Provider "${id}" not found` }, 404);
+	}
+	const baseUrl = (config.baseUrl || "").replace(/\/+$/, "");
+	if (!baseUrl || !config.apiKey) {
+		return c.json({ error: "Provider not fully configured" }, 400);
+	}
+	try {
+		const response = await fetch(`${baseUrl}/v1/quota`, {
+			headers: { Authorization: `Bearer ${config.apiKey}` },
+		});
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			return c.json({ error: `NKP API error ${response.status}: ${errText}` }, 502);
+		}
+		const data = (await response.json()) as {
+			quotaBalance?: number;
+			quotaTotalGranted?: number;
+		};
+		// Update cache
+		cachedQuotaByProvider.set(id, {
+			quotaBalance: data.quotaBalance ?? null,
+			quotaTotalGranted: data.quotaTotalGranted ?? null,
+			fetchedAt: Date.now(),
+		});
+		return c.json(data);
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		logger.error("NKP quota fetch failed", { error: msg, provider: config.name });
+		return c.json({ error: msg }, 502);
+	}
+});
+
+/** Get cached quotas for all NKP providers. */
+nkpRoutes.get("/quotas", (c) => {
+	return c.json(getAllNkpCachedQuotas());
 });

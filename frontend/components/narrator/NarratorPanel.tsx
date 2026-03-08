@@ -38,6 +38,7 @@ import {
 	IconEraser,
 	IconExternalLink,
 	IconFolderPlus,
+	IconLock,
 	IconPaperclip,
 	IconShield,
 	IconSparkles,
@@ -64,6 +65,7 @@ import {
 	useUpdatePermissionMode,
 	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
+	useUpdateRelaxedPlan,
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
@@ -387,6 +389,7 @@ export function NarratorPanel({
 	const permModeMutation = useUpdatePermissionMode();
 	const reasoningEffortMutation = useUpdateReasoningEffort();
 	const fastModeMutation = useUpdateFastMode();
+	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const modelMutation = useUpdateModel();
 	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const { visibleModels: allModels, settingsData } = useAllModels();
@@ -644,6 +647,7 @@ export function NarratorPanel({
 		contextWindow,
 		pruneBoundaryMessageId,
 		prunedPercent,
+		nkpQuotaBalance,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,
@@ -1870,6 +1874,14 @@ export function NarratorPanel({
 							</Menu>
 						);
 					})()}
+					{/* NKP quota balance */}
+					{nkpQuotaBalance != null && (
+						<Tooltip label={t("nkpQuotaBalance", { balance: nkpQuotaBalance.toFixed(2) })}>
+							<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
+								${nkpQuotaBalance.toFixed(2)}
+							</Text>
+						</Tooltip>
+					)}
 					{/* Desktop selects */}
 					{!compact && (
 						<Group gap={6} wrap="nowrap" visibleFrom="sm">
@@ -1963,6 +1975,27 @@ export function NarratorPanel({
 										}
 									>
 										<IconBolt size={16} />
+									</ActionIcon>
+								</Tooltip>
+							)}
+							{/* Relaxed Plan toggle (only visible in plan mode) */}
+							{narrator.permissionMode === "plan" && (
+								<Tooltip label={t("relaxed_plan_tooltip")}>
+									<ActionIcon
+										variant="subtle"
+										color={narrator.relaxedPlan ? "teal" : "gray"}
+										size="sm"
+										onClick={() =>
+											relaxedPlanMutation.mutate({
+												id: narratorId,
+												relaxedPlan: !narrator.relaxedPlan,
+											})
+										}
+									>
+										<IconLock
+											size={16}
+											style={narrator.relaxedPlan ? { opacity: 0.5 } : undefined}
+										/>
 									</ActionIcon>
 								</Tooltip>
 							)}
@@ -2068,6 +2101,24 @@ export function NarratorPanel({
 									}
 								>
 									<IconBolt size={16} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
+						{narrator.permissionMode === "plan" && (
+							<Tooltip label={t("relaxed_plan_tooltip")}>
+								<ActionIcon
+									variant="subtle"
+									color={narrator.relaxedPlan ? "teal" : "gray"}
+									size="sm"
+									onClick={() =>
+										relaxedPlanMutation.mutate({
+											id: narratorId,
+											relaxedPlan: !narrator.relaxedPlan,
+										})
+									}
+								>
+									<IconLock size={16} style={narrator.relaxedPlan ? { opacity: 0.5 } : undefined} />
 								</ActionIcon>
 							</Tooltip>
 						)}
