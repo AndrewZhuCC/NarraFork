@@ -36,6 +36,7 @@ import {
 	IconCode,
 	IconCodeOff,
 	IconEraser,
+	IconExternalLink,
 	IconFolderPlus,
 	IconPaperclip,
 	IconShield,
@@ -877,7 +878,7 @@ export function NarratorPanel({
 		},
 		[narratorId, forkNarratorMutation.mutate, navigate],
 	);
-	// Chapter-bound: use onForkFromMessage (opens ChapterForkModal)
+	// Chapter-bound: use onForkFromMessage (direct fork with auto-generated name)
 	// Standalone: use handleStandaloneFork (direct narrator fork)
 	const forkHandler = narrator?.chapterId ? onForkFromMessage : handleStandaloneFork;
 
@@ -1312,8 +1313,10 @@ export function NarratorPanel({
 	};
 
 	const handleKeyDown = (e: React.KeyboardEvent) => {
-		// Let CommandPopover handle keys when visible
-		if (commandPopoverVisible) return;
+		// Let CommandPopover handle arrow/tab/escape keys when visible,
+		// but still allow Enter to reach our send handler (CommandPopover
+		// calls stopPropagation when it consumes Enter for selection).
+		if (commandPopoverVisible && e.key !== "Enter") return;
 		if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			handleSend();
@@ -1337,14 +1340,25 @@ export function NarratorPanel({
 				style={{ borderBottom: "1px solid var(--mantine-color-default-border)", flexShrink: 0 }}
 			>
 				<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
-					<ActionIcon
-						size="sm"
-						variant="subtle"
-						color="gray"
-						onClick={() => navigate({ to: ".." })}
-					>
-						<IconArrowLeft size={16} />
-					</ActionIcon>
+					{compact ? (
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="gray"
+							onClick={() => navigate({ to: "/narrators/$narratorId", params: { narratorId } })}
+						>
+							<IconExternalLink size={16} />
+						</ActionIcon>
+					) : (
+						<ActionIcon
+							size="sm"
+							variant="subtle"
+							color="gray"
+							onClick={() => navigate({ to: ".." })}
+						>
+							<IconArrowLeft size={16} />
+						</ActionIcon>
+					)}
 					<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
 						{editingTitle ? (
 							<TextInput
@@ -1870,7 +1884,7 @@ export function NarratorPanel({
 										style={{ pointerEvents: "auto" }}
 									/>
 								</Menu.Target>
-								<Menu.Dropdown>
+								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 									<ModelMenuItems
 										allModels={allModels}
 										currentModel={narrator.model}
@@ -1895,7 +1909,7 @@ export function NarratorPanel({
 										style={{ pointerEvents: "auto" }}
 									/>
 								</Menu.Target>
-								<Menu.Dropdown>
+								<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 									<PermModeMenuItems
 										currentMode={narrator.permissionMode ?? "default"}
 										onSelect={(m) => permModeMutation.mutate({ id: narratorId, permissionMode: m })}
@@ -1923,7 +1937,7 @@ export function NarratorPanel({
 											style={{ pointerEvents: "auto" }}
 										/>
 									</Menu.Target>
-									<Menu.Dropdown>
+									<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 										<ReasoningEffortMenuItems
 											currentEffort={narrator.reasoningEffort}
 											onSelect={(e) =>

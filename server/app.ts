@@ -21,6 +21,7 @@ import { graphRoutes } from "./routes/graph";
 import { kiroRoutes } from "./routes/kiro";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
+import { nkpRoutes } from "./routes/nkp";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
@@ -89,6 +90,7 @@ app.route("/api/kiro", kiroRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/anthropic", anthropicRoutes);
+app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/routines", routineRoutes);
 

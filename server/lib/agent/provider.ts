@@ -3,6 +3,7 @@ import { isKiroAvailable } from "../kiro-adapter";
 import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
+	getNkpProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
 	resolveProvider,
@@ -11,6 +12,7 @@ import {
 import { AnthropicProvider } from "./anthropic-provider";
 import { CodexProvider } from "./codex-provider";
 import { KiroProvider } from "./kiro-provider";
+import { NkpProvider } from "./nkp-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { AgentToolUse } from "./types";
 
@@ -178,6 +180,11 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new AnthropicProvider(anthropicConfig);
 	}
 
+	const nkpConfig = getNkpProviderConfig(provider);
+	if (nkpConfig) {
+		return new NkpProvider(nkpConfig);
+	}
+
 	const openaiConfig = getOpenaiProviderConfig(provider);
 	if (openaiConfig) {
 		return new OpenAIProvider(openaiConfig);
@@ -200,6 +207,14 @@ function getConfiguredNonKiroProviders(): string[] {
 
 	for (const p of settings.anthropicProviders ?? []) {
 		if (!p.apiKey) continue;
+		if (!seen.has(p.prefix)) {
+			seen.add(p.prefix);
+			providers.push(p.prefix);
+		}
+	}
+
+	for (const p of settings.nkpProviders ?? []) {
+		if (!p.apiKey || !p.baseUrl) continue;
 		if (!seen.has(p.prefix)) {
 			seen.add(p.prefix);
 			providers.push(p.prefix);
@@ -241,6 +256,11 @@ function defaultModelForProvider(provider: string): string | null {
 	const anthropic = getAnthropicProviderConfig(provider);
 	if (anthropic?.defaultModel) {
 		return `${provider}:${anthropic.defaultModel}`;
+	}
+
+	const nkp = getNkpProviderConfig(provider);
+	if (nkp?.defaultModel) {
+		return `${provider}:${nkp.defaultModel}`;
 	}
 
 	const custom = settings.agent.customModels ?? [];

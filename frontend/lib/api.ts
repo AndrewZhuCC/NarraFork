@@ -780,7 +780,7 @@ export const api = {
 	forkChapter: (
 		id: string,
 		data: {
-			title: string;
+			title?: string;
 			description?: string;
 			inheritMode?: string;
 			forkAtMessageUuid?: string;
@@ -1353,6 +1353,13 @@ export const api = {
 			models: Array<{ id: string; display_name?: string }>;
 			fromCache: boolean;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
+
+	// NKP models
+	nkpRefreshProviderModels: (providerId: string) =>
+		request<{
+			models: Array<{ id: string; owned_by?: string }>;
+			fromCache: boolean;
+		}>(`/nkp/providers/${providerId}/models/refresh`, { method: "POST" }),
 
 	// Health / platform
 	health: () =>

@@ -11,6 +11,7 @@ import {
 } from "../lib/settings";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
+import { getNkpCachedModelsGrouped } from "./nkp";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
 const modelOptionSchema = z.object({
@@ -39,6 +40,15 @@ const anthropicProviderSchema = z.object({
 	baseUrl: z.string(),
 	defaultModel: z.string(),
 	maxMode: z.boolean().optional(),
+});
+
+const nkpProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -110,6 +120,7 @@ const updateSettingsSchema = z
 			.optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
+		nkpProviders: z.array(nkpProviderSchema).optional(),
 		codex: z
 			.object({
 				proxy: z.string().optional(),
@@ -152,10 +163,15 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		nkpProviders: (s.nkpProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		kiroModels: isKiroAvailable() ? kiroGetCachedModels() : null,
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
+		nkpModelsGrouped: getNkpCachedModelsGrouped(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
 	};
@@ -199,11 +215,22 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real API keys for NKP providers
+	if (validated.nkpProviders) {
+		const currentProviders = current.nkpProviders ?? [];
+		for (const p of validated.nkpProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.apiKey = existing?.apiKey ?? "";
+			}
+		}
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
-		if (key === "openaiProviders" || key === "anthropicProviders") {
+		if (key === "openaiProviders" || key === "anthropicProviders" || key === "nkpProviders") {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
@@ -242,6 +269,10 @@ settingsRoutes.patch("/", async (c) => {
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		anthropicProviders: (merged.anthropicProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		nkpProviders: (merged.nkpProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),

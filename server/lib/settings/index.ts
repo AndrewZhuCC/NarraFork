@@ -66,6 +66,21 @@ export interface AnthropicProviderConfig {
 	maxMode?: boolean;
 }
 
+export interface NKPProviderConfig {
+	/** Unique short ID (8 chars). */
+	id: string;
+	/** User-defined display name, e.g. "NKP Production". */
+	name: string;
+	/** Provider prefix used in model IDs, e.g. "nkp". */
+	prefix: string;
+	/** NKP API Key for authentication. */
+	apiKey: string;
+	/** NKP service base URL, e.g. "http://127.0.0.1:7789". */
+	baseUrl: string;
+	/** Default model (bare name without prefix). */
+	defaultModel: string;
+}
+
 export interface NarraForkSettings {
 	server: { port: number };
 	paths: { defaultProjectDir: string };
@@ -157,6 +172,8 @@ export interface NarraForkSettings {
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers. */
 	anthropicProviders?: AnthropicProviderConfig[];
+	/** NKP (Native Kiro Proxy) providers — remote Kiro protocol proxies. */
+	nkpProviders?: NKPProviderConfig[];
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -378,10 +395,12 @@ let openaiModelChecker: ((model: string) => boolean) | null = null;
 let kiroModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
+let nkpModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let kiroModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
+let nkpModelLister: (() => string[]) | null = null;
 
 // Register codex model checker and lister immediately
 registerCodexModelChecker((model) => BUILTIN_CODEX_MODELS.includes(model));
@@ -419,6 +438,14 @@ export function registerCodexModelLister(lister: () => string[]): void {
 	codexModelLister = lister;
 }
 
+export function registerNkpModelChecker(checker: (model: string) => boolean): void {
+	nkpModelChecker = checker;
+}
+
+export function registerNkpModelLister(lister: () => string[]): void {
+	nkpModelLister = lister;
+}
+
 /**
  * Get all available model values (provider:id format), excluding hidden models.
  * Sources: kiro cached models, openai cached models, anthropic models, codex models, custom models.
@@ -429,10 +456,11 @@ export function getVisibleModels(): string[] {
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
+	const nkp = nkpModelLister?.() ?? [];
 	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [...kiro, ...openai, ...anthropic, ...codex, ...custom]) {
+	for (const v of [...kiro, ...openai, ...anthropic, ...codex, ...nkp, ...custom]) {
 		if (!seen.has(v) && !hidden.has(v)) {
 			seen.add(v);
 			result.push(v);
@@ -505,6 +533,21 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
+/**
+ * Get the NKP provider config by its prefix.
+ * If prefix is undefined, returns the first provider.
+ */
+export function getNkpProviderConfig(prefix?: string): NKPProviderConfig | undefined {
+	const providers = settings.nkpProviders ?? [];
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/** Get the provider prefix for a given NKP provider config. */
+export function nkpProviderPrefix(config: NKPProviderConfig): string {
+	return config.prefix;
+}
+
 function hasConfiguredOpenaiProvider(): boolean {
 	const providers = settings.openaiProviders ?? [];
 	return providers.some((p) => !!p.apiKey);
@@ -528,6 +571,16 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
+export function hasConfiguredNkpProvider(): boolean {
+	const providers = settings.nkpProviders ?? [];
+	return providers.some((p) => !!p.apiKey && !!p.baseUrl);
+}
+
+/** Get the first configured NKP provider (for MCP search fallback). */
+export function getFirstNkpProvider(): NKPProviderConfig | undefined {
+	return (settings.nkpProviders ?? []).find((p) => !!p.apiKey && !!p.baseUrl);
+}
+
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
 	if (hasConfiguredOpenaiProvider()) {
@@ -542,6 +595,11 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
+	}
+	if (hasConfiguredNkpProvider()) {
+		for (const p of settings.nkpProviders ?? []) {
+			if (p.apiKey && p.baseUrl) available.add(p.prefix || "nkp");
+		}
 	}
 	if (hasConfiguredKiroProvider()) {
 		available.add("kiro");
@@ -590,6 +648,7 @@ export function resolveProvider(model?: string): string {
 		if (openaiModelChecker?.(bare)) return "openai";
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
+		if (nkpModelChecker?.(bare)) return "nkp";
 	}
 
 	const configured = getConfiguredProviderCandidates();
@@ -694,6 +753,7 @@ export function getModelContextWindow(model: string, provider: string): number |
 		if (anthropicConfig?.defaultContextWindow) {
 			return anthropicConfig.defaultContextWindow;
 		}
+		// NKP providers don't have defaultContextWindow — fall through to built-in table
 	}
 
 	// 2. Check built-in table (exact match)

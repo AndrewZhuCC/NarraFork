@@ -7,10 +7,12 @@ import { AnthropicProvidersSection } from "../../components/providers/AnthropicP
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
 import { KiroSection } from "../../components/providers/KiroSection";
+import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
 import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
 import {
 	type AnthropicProviderState,
 	ensurePrefix,
+	type NKPProviderState,
 	type OpenAIProviderState,
 } from "../../components/providers/types";
 import { useCurrentUser } from "../../hooks/useAuth";
@@ -41,6 +43,10 @@ function ProvidersPage() {
 	const [anthropicProviders, setAnthropicProviders] = useState<AnthropicProviderState[]>([]);
 	const [anthropicInitialized, setAnthropicInitialized] = useState(false);
 
+	// NKP providers state
+	const [nkpProviders, setNkpProviders] = useState<NKPProviderState[]>([]);
+	const [nkpInitialized, setNkpInitialized] = useState(false);
+
 	// Hidden models state
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [hiddenInitialized, setHiddenInitialized] = useState(false);
@@ -59,6 +65,7 @@ function ProvidersPage() {
 	const serverSnapshot = useRef({
 		openaiProviders: [] as OpenAIProviderState[],
 		anthropicProviders: [] as AnthropicProviderState[],
+		nkpProviders: [] as NKPProviderState[],
 		hiddenModels: [] as string[],
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
 		modelContextWindows: {} as Record<string, number>,
@@ -103,6 +110,24 @@ function ProvidersPage() {
 		}
 	}, [settings, anthropicInitialized]);
 
+	// Sync NKP providers from settings
+	useEffect(() => {
+		if (settings && !nkpInitialized) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const providers = (settings.nkpProviders ?? []).map((p: any) => ({
+				id: p.id ?? "",
+				name: p.name ?? "",
+				prefix: p.prefix ?? "nkp",
+				apiKey: p.apiKey ?? "",
+				baseUrl: p.baseUrl ?? "",
+				defaultModel: p.defaultModel ?? "",
+			}));
+			setNkpProviders(providers);
+			serverSnapshot.current.nkpProviders = providers;
+			setNkpInitialized(true);
+		}
+	}, [settings, nkpInitialized]);
+
 	// Sync hidden models from settings
 	useEffect(() => {
 		if (settings && !hiddenInitialized) {
@@ -144,12 +169,14 @@ function ProvidersPage() {
 			serverSnapshot.current = {
 				openaiProviders: [...openaiProviders],
 				anthropicProviders: [...anthropicProviders],
+				nkpProviders: [...nkpProviders],
 				hiddenModels: [...hiddenModels],
 				customModels: [...customModels],
 				modelContextWindows: { ...modelContextWindows },
 			};
 			setProvidersInitialized(true);
 			setAnthropicInitialized(true);
+			setNkpInitialized(true);
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
 		},
@@ -159,6 +186,7 @@ function ProvidersPage() {
 		if (
 			!providersInitialized ||
 			!anthropicInitialized ||
+			!nkpInitialized ||
 			!hiddenInitialized ||
 			!customInitialized ||
 			!contextWindowsInitialized
@@ -168,6 +196,7 @@ function ProvidersPage() {
 		return (
 			JSON.stringify(openaiProviders) !== JSON.stringify(s.openaiProviders) ||
 			JSON.stringify(anthropicProviders) !== JSON.stringify(s.anthropicProviders) ||
+			JSON.stringify(nkpProviders) !== JSON.stringify(s.nkpProviders) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
 			JSON.stringify(modelContextWindows) !== JSON.stringify(s.modelContextWindows)
@@ -175,15 +204,47 @@ function ProvidersPage() {
 	}, [
 		providersInitialized,
 		anthropicInitialized,
+		nkpInitialized,
 		hiddenInitialized,
 		customInitialized,
 		contextWindowsInitialized,
 		openaiProviders,
 		anthropicProviders,
+		nkpProviders,
 		hiddenModels,
 		customModels,
 		modelContextWindows,
 	]);
+
+	const isOpenaiProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = openaiProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.openaiProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[openaiProviders],
+	);
+
+	const isAnthropicProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = anthropicProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.anthropicProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[anthropicProviders],
+	);
+
+	const isNkpProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = nkpProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.nkpProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[nkpProviders],
+	);
 
 	const [highlight, setHighlight] = useState(false);
 	useEffect(() => {
@@ -225,16 +286,32 @@ function ProvidersPage() {
 				}
 			}
 		}
+		for (const provider of nkpProviders) {
+			const original = serverSnapshot.current.nkpProviders.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				const oldPrefix = original.prefix;
+				const newPrefix = provider.prefix;
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${oldPrefix}:`)) {
+						const model = key.slice(oldPrefix.length + 1);
+						migratedWindows[`${newPrefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
 
 		updateMutation.mutate({
 			openaiProviders,
 			anthropicProviders,
+			nkpProviders,
 			agent: { hiddenModels, customModels, modelContextWindows: migratedWindows },
 		});
 	}, [
 		updateMutation,
 		openaiProviders,
 		anthropicProviders,
+		nkpProviders,
 		hiddenModels,
 		customModels,
 		modelContextWindows,
@@ -315,6 +392,37 @@ function ProvidersPage() {
 		}));
 	}
 
+	// Build NKP models from per-provider grouped data (Kiro-compatible format)
+	const nkpModelsGrouped: Array<{
+		providerId: string;
+		providerName: string;
+		models: Array<Record<string, unknown>>;
+	}> = settings?.nkpModelsGrouped ?? [];
+
+	const serverNkpProviders: Array<{ id: string; prefix?: string; name?: string }> =
+		settings?.nkpProviders ?? [];
+
+	const nkpPrefixMap: Record<string, string> = {};
+	for (const p of serverNkpProviders) {
+		nkpPrefixMap[p.id] = p.prefix ?? "nkp";
+	}
+
+	const nkpModelsMap: Record<string, ModelOption[]> = {};
+	for (const group of nkpModelsGrouped) {
+		const prefix = nkpPrefixMap[group.providerId] ?? "nkp";
+		const models: ModelOption[] = [];
+		for (const m of group.models) {
+			const id = String(m.model_id ?? m.modelId ?? "");
+			if (!id) continue;
+			models.push({
+				value: `${prefix}:${id}`,
+				label: String(m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id),
+				provider: prefix,
+			});
+		}
+		nkpModelsMap[group.providerId] = models;
+	}
+
 	// Provider prefix options for custom model add
 	const prefixOptions = [
 		{ value: "kiro", label: t("modelProviderKiro") },
@@ -326,6 +434,10 @@ function ProvidersPage() {
 		...serverAnthropicProviders.map((p) => ({
 			value: p.prefix ?? "anthropic",
 			label: p.name ?? p.prefix ?? "anthropic",
+		})),
+		...serverNkpProviders.map((p) => ({
+			value: p.prefix ?? "nkp",
+			label: p.name ?? p.prefix ?? "nkp",
 		})),
 	];
 	const seenPrefixes = new Set<string>();
@@ -339,6 +451,17 @@ function ProvidersPage() {
 		<>
 			<Stack>
 				<Title order={2}>{t("providersTitle")}</Title>
+
+				<NKPProvidersSection
+					providers={nkpProviders}
+					onProvidersChange={setNkpProviders}
+					providerModelsMap={nkpModelsMap}
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
+					isProviderDirty={isNkpProviderDirty}
+				/>
 
 				<KiroSection
 					settings={settings}
@@ -356,7 +479,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
-					isDirty={isDirty}
+					isProviderDirty={isOpenaiProviderDirty}
 				/>
 
 				<AnthropicProvidersSection
@@ -367,7 +490,7 @@ function ProvidersPage() {
 					onToggleHidden={toggleHidden}
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
-					isDirty={isDirty}
+					isProviderDirty={isAnthropicProviderDirty}
 				/>
 
 				<CustomModelsSection

@@ -1,6 +1,31 @@
 import { z } from "zod/v4";
-import { isKiroAvailable, kiroMcpCall } from "../../kiro-adapter";
+import { isKiroAvailable, kiroMcpCall, type McpResponse } from "../../kiro-adapter";
+import { logger } from "../../logger";
+import { getFirstNkpProvider, hasConfiguredNkpProvider } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
+
+/** Call MCP search via NKP provider. */
+async function nkpMcpSearch(query: string): Promise<McpResponse> {
+	const config = getFirstNkpProvider();
+	if (!config) throw new Error("No NKP provider configured");
+
+	const baseUrl = config.baseUrl.replace(/\/+$/, "");
+	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${config.apiKey}`,
+		},
+		body: JSON.stringify({ query }),
+	});
+
+	if (!response.ok) {
+		const errText = await response.text().catch(() => "");
+		throw new Error(`NKP MCP search error ${response.status}: ${errText}`);
+	}
+
+	return (await response.json()) as McpResponse;
+}
 
 export const webSearchTool: ToolDefinition = {
 	name: "WebSearch",
@@ -11,19 +36,40 @@ export const webSearchTool: ToolDefinition = {
 	parameters: z.object({
 		query: z.string().describe("Search query string"),
 	}),
-	isAvailable: () => isKiroAvailable(),
+	isAvailable: () => isKiroAvailable() || hasConfiguredNkpProvider(),
 	async execute(args): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
-		if (!isKiroAvailable()) {
+		const kiroUp = isKiroAvailable();
+		const nkpUp = hasConfiguredNkpProvider();
+
+		if (!kiroUp && !nkpUp) {
 			return {
-				output: "Web search is not available: Kiro plugin is not loaded",
+				output:
+					"Web search is not available: Kiro plugin is not loaded and no NKP provider configured",
 				isError: true,
 			};
 		}
 
 		try {
-			const response = await kiroMcpCall("web_search", { query });
+			// Try Kiro first; on failure, fall back to NKP if available
+			let response: McpResponse | undefined;
+			if (kiroUp) {
+				try {
+					response = await kiroMcpCall("web_search", { query });
+				} catch (kiroErr) {
+					if (nkpUp) {
+						logger.warn("Kiro web search failed, falling back to NKP", {
+							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
+						});
+						response = await nkpMcpSearch(query);
+					} else {
+						throw kiroErr;
+					}
+				}
+			} else {
+				response = await nkpMcpSearch(query);
+			}
 
 			if (response.error) {
 				return {

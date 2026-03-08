@@ -125,6 +125,43 @@ export function useAllModels() {
 			anthropicByProvider.push({ prefix, name, models });
 		}
 
+		// --- NKP models (per-provider, Kiro-compatible format) ---
+		const nkpModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<Record<string, unknown>>;
+		}> = settingsData?.nkpModelsGrouped ?? [];
+
+		const serverNkpProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.nkpProviders ?? [];
+
+		const fetchedNkpModels: ModelOption[] = [];
+		const nkpByProvider: ProviderModels[] = [];
+
+		for (const group of nkpModelsGrouped) {
+			const cfg = serverNkpProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "nkp";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const id = String(m.model_id ?? m.modelId ?? "");
+				if (!id) continue;
+				const rawRate = m.rate_multiplier ?? m.rateMultiplier;
+				const opt: ModelOption = {
+					value: `${prefix}:${id}`,
+					label: String(
+						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
+					),
+					provider: prefix,
+					rateMultiplier: typeof rawRate === "number" ? rawRate : undefined,
+				};
+				models.push(opt);
+				fetchedNkpModels.push(opt);
+			}
+			nkpByProvider.push({ prefix, name, models });
+		}
+
 		// --- Custom models ---
 		const customModels: ModelOption[] = (settingsData?.agent?.customModels ?? []).map(
 			(m: { value: string; label: string; provider?: string }) => ({
@@ -146,6 +183,7 @@ export function useAllModels() {
 
 		// --- Merge & filter ---
 		const allModels = mergeModels(
+			fetchedNkpModels,
 			kiroModels,
 			fetchedOpenaiModels,
 			fetchedAnthropicModels,
@@ -170,6 +208,8 @@ export function useAllModels() {
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */
 			anthropicByProvider,
+			/** NKP models grouped by provider. */
+			nkpByProvider,
 			/** Custom models. */
 			customModels,
 			/** Hidden model values set. */

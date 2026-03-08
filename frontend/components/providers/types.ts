@@ -21,6 +21,15 @@ export interface AnthropicProviderState {
 	maxMode: boolean;
 }
 
+export interface NKPProviderState {
+	id: string;
+	name: string;
+	prefix: string;
+	apiKey: string;
+	baseUrl: string;
+	defaultModel: string;
+}
+
 /** Kiro account tier — determines model availability. */
 export type KiroAccountTier = "free" | "paid" | "enterprise";
 
