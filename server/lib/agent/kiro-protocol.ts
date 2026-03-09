@@ -286,6 +286,44 @@ export async function buildKiroHistory(
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+
+			// Web search blocks — inject as user context before the assistant message
+			const webSearchBlocks = content.filter(
+				(b: { type: string }) => b.type === "web_search",
+			) as Array<{ type: "web_search"; query?: string; queries?: string[] }>;
+			if (webSearchBlocks.length > 0) {
+				const searchSummary = webSearchBlocks
+					.map((ws) => {
+						const q = ws.query || ws.queries?.join(", ") || "unknown";
+						return `[Web search: ${q}]`;
+					})
+					.join("\n");
+				// Flush pending tool results first if any
+				if (pendingToolResults.length > 0) {
+					history.push({
+						userInputMessage: {
+							content: searchSummary,
+							modelId,
+							origin: "AI_EDITOR",
+							userInputMessageContext: { toolResults: pendingToolResults },
+						},
+					});
+					pendingToolResults = [];
+				} else {
+					history.push({
+						userInputMessage: {
+							content: searchSummary,
+							modelId,
+							userInputMessageContext: {},
+						},
+					});
+					// Kiro requires alternation — add a synthetic assistant ack
+					history.push({
+						assistantResponseMessage: { content: "OK" },
+					});
+				}
+			}
+
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
 				.map((b: { text: string }) => b.text);

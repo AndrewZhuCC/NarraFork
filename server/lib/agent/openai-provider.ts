@@ -5,7 +5,7 @@ import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { zodToJsonSchema } from "./tool-registry";
-import type { AgentToolUse, ResolvedToolDefinition } from "./types";
+import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
 
@@ -401,6 +401,13 @@ export class OpenAIProvider implements ProviderAdapter {
 			}
 			if (tools.length > 0) body.tools = tools;
 
+			// Codex: inject native web_search tool (server-side search, not a function tool)
+			if (this.apiMode === "codex") {
+				const toolsArr = (body.tools ?? []) as unknown[];
+				toolsArr.push({ type: "web_search" });
+				body.tools = toolsArr;
+			}
+
 			// Add reasoning configuration for Codex provider requests.
 			if (params.reasoningEffort && this.apiMode === "codex") {
 				body.reasoning = {
@@ -467,7 +474,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
 		}
 
 		if (!response.body) {
@@ -628,7 +635,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
 		}
 
 		const raw = await response.text();
@@ -688,7 +695,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
 		}
 
 		const raw = await response.text();
@@ -715,7 +722,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`OpenAI API error ${response.status}: ${errText}`);
+			throw new ApiError(response.status, `OpenAI API error ${response.status}: ${errText}`);
 		}
 
 		const isStreaming = body.stream === true;
@@ -996,6 +1003,42 @@ function parseResponsesAPIEvent(
 	// ── Text streaming ──
 	if (type === "response.output_text.delta" && typeof chunk.delta === "string") {
 		results.push({ text: chunk.delta });
+		return results;
+	}
+
+	// ── Web search: output_item.added (type=web_search_call) ──
+	if (type === "response.output_item.added" && chunk.item?.type === "web_search_call") {
+		const id = chunk.item.id ?? "";
+		logger.debug("Responses API web search started", { id });
+		results.push({ webSearch: { id, status: "in_progress" } });
+		return results;
+	}
+
+	// ── Web search: lifecycle events ──
+	if (type === "response.web_search_call.in_progress") {
+		results.push({ webSearch: { id: chunk.item_id ?? "", status: "in_progress" } });
+		return results;
+	}
+	if (type === "response.web_search_call.searching") {
+		results.push({ webSearch: { id: chunk.item_id ?? "", status: "searching" } });
+		return results;
+	}
+	if (type === "response.web_search_call.completed") {
+		results.push({ webSearch: { id: chunk.item_id ?? "", status: "completed" } });
+		return results;
+	}
+
+	// ── Web search: output_item.done (type=web_search_call) — final result with query ──
+	if (type === "response.output_item.done" && chunk.item?.type === "web_search_call") {
+		const action = chunk.item.action;
+		results.push({
+			webSearch: {
+				id: chunk.item.id ?? "",
+				status: "completed",
+				query: action?.query,
+				queries: action?.queries,
+			},
+		});
 		return results;
 	}
 
@@ -1596,6 +1639,21 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 						providerMetadata: b.providerMetadata,
 					}),
 				);
+
+			// Extract web_search blocks — these are Codex native searches persisted as content blocks.
+			// Replay them as user context so the model knows it searched previously.
+			const webSearchBlocks = content.filter(
+				(b: { type: string }) => b.type === "web_search",
+			) as Array<{ type: "web_search"; id: string; query?: string; queries?: string[] }>;
+			if (webSearchBlocks.length > 0) {
+				const searchSummary = webSearchBlocks
+					.map((ws) => {
+						const q = ws.query || ws.queries?.join(", ") || "unknown";
+						return `[Web search: ${q}]`;
+					})
+					.join("\n");
+				history.push({ role: "user", content: searchSummary });
+			}
 
 			const completedToolUseIds = new Set(
 				msg.toolCalls

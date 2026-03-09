@@ -9,6 +9,7 @@ export interface NkpQuotaData {
 export function useNkpQuota(providerId: string | undefined) {
 	return useQuery<NkpQuotaData>({
 		queryKey: ["nkp", "quota", providerId],
+		// biome-ignore lint/style/noNonNullAssertion: guarded by enabled: !!providerId
 		queryFn: () => api.getNkpProviderQuota(providerId!),
 		enabled: !!providerId,
 		staleTime: 60_000,
