@@ -514,6 +514,18 @@ export function NarratorPanel({
 		[narratorId, t],
 	);
 
+	const handleRegenerate = useCallback(
+		async (messageId: string) => {
+			try {
+				await api.regenerateFromMessage(narratorId, messageId);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to regenerate";
+				notifications.show({ title: t("regenerateFailed"), message, color: "red" });
+			}
+		},
+		[narratorId, t],
+	);
+
 	// --- Input management ---
 	const [input, setInput] = useState(
 		() => sessionStorage.getItem(`narrafork_draft_${narratorId}`) ?? "",
@@ -999,6 +1011,7 @@ export function NarratorPanel({
 					showTokenUsage={showTokenUsage}
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
+					onRegenerateFromMessage={handleRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>
 			));
@@ -1023,6 +1036,7 @@ export function NarratorPanel({
 					maxMessages={maxMsg < pageLen ? maxMsg : undefined}
 					onDeleteBlock={handleDeleteBlock}
 					onCompactBeforeMessage={handleCompactBefore}
+					onRegenerateFromMessage={handleRegenerate}
 					pruneBoundaryMessageId={pruneBoundaryMessageId}
 				/>,
 			);
@@ -1042,6 +1056,7 @@ export function NarratorPanel({
 		showTokenUsage,
 		handleDeleteBlock,
 		handleCompactBefore,
+		handleRegenerate,
 		pruneBoundaryMessageId,
 	]);
 
