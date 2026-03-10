@@ -202,9 +202,7 @@ async function fetchNkpModels(config: NKPProviderConfig): Promise<NkpModelInfo[]
 	}
 
 	const response = await fetch(`${baseUrl}/v1/kiro/models`, {
-		headers: {
-			Authorization: `Bearer ${config.apiKey}`,
-		},
+		headers: { Authorization: `Bearer ${config.apiKey}` },
 	});
 
 	if (!response.ok) {

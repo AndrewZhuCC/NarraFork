@@ -88,7 +88,7 @@
 	"kiroModelRawJson": "原始 JSON",
 	"kiroModelFromCache": "缓存",
 	"kiroModelRefresh": "刷新",
-	"versionUpdate": "新版本（{{version}}）已发布。",
+	"versionUpdate": "服务端已更新至 {{version}}，请刷新页面以同步。",
 	"wsDisconnected": "实时连接已断开，部分更新可能无法显示。",
 	"wsReconnect": "重新连接",
 	"providers": "供应商",

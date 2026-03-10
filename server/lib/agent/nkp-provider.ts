@@ -5,12 +5,14 @@ import type {
 	KiroHistoryUserMessage,
 	KiroToolResult,
 } from "../kiro-adapter";
+import { prepareNkpRequest } from "../nkp-ext";
+import { buildNkpRequestToken } from "../nkp-token";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NKPProviderConfig } from "../settings";
 import { buildKiroHistory, buildKiroRequest, parseSSEStream } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
-import { zodToJsonSchema } from "./tool-registry";
+import { resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 /**
@@ -31,7 +33,7 @@ export class NkpProvider implements ProviderAdapter {
 			toolSpecification: {
 				name: tool.name,
 				description: tool.description,
-				inputSchema: { json: zodToJsonSchema(tool.parameters) },
+				inputSchema: { json: resolveToolJsonSchema(tool) },
 			},
 		}));
 	}
@@ -73,12 +75,14 @@ export class NkpProvider implements ProviderAdapter {
 		const request = buildKiroRequest(params);
 		const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
 
+		prepareNkpRequest(request);
 		const response = await fetch(`${baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${this.config.apiKey}`,
 				Accept: "text/event-stream",
+				"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
 			},
 			body: JSON.stringify(request),
 			signal: params.signal,
@@ -166,12 +170,14 @@ export class NkpProvider implements ProviderAdapter {
 		};
 
 		const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
+		prepareNkpRequest(request);
 		const response = await fetch(`${baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${this.config.apiKey}`,
 				Accept: "text/event-stream",
+				"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
 			},
 			body: JSON.stringify(request),
 		});
@@ -234,12 +240,14 @@ export class NkpProvider implements ProviderAdapter {
 		};
 
 		const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
+		prepareNkpRequest(request);
 		const response = await fetch(`${baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
 				Authorization: `Bearer ${this.config.apiKey}`,
 				Accept: "text/event-stream",
+				"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
 			},
 			body: JSON.stringify(request),
 		});

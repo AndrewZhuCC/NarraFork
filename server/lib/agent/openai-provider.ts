@@ -4,7 +4,7 @@ import type { OpenAIProviderConfig } from "../settings";
 import { parseModelId } from "../settings";
 import { readWithTimeout } from "../stream-timeout";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
-import { zodToJsonSchema } from "./tool-registry";
+import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
 
 export type OpenAIApiMode = "responses" | "completions" | "codex";
@@ -236,7 +236,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				type: "function",
 				name: tool.name,
 				description: tool.description,
-				parameters: zodToJsonSchema(tool.parameters),
+				parameters: resolveToolJsonSchema(tool),
 				strict: false, // Strict mode disabled by default (can be made configurable later)
 			}));
 		}
@@ -247,7 +247,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				function: {
 					name: tool.name,
 					description: tool.description,
-					parameters: zodToJsonSchema(tool.parameters),
+					parameters: resolveToolJsonSchema(tool),
 				},
 			}),
 		);

@@ -6,6 +6,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	narratorWhitelistDirs,
 	users,
 } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -2683,6 +2684,25 @@ export const narratorService = {
 					seq: compactSeq,
 					isCompact: 1,
 				});
+			}
+
+			// Inherit whitelist directories from parent narrator
+			const parentWhitelistDirs = await tx
+				.select()
+				.from(narratorWhitelistDirs)
+				.where(eq(narratorWhitelistDirs.narratorId, parentNarratorId));
+
+			if (parentWhitelistDirs.length > 0) {
+				await tx.insert(narratorWhitelistDirs).values(
+					parentWhitelistDirs.map((dir) => ({
+						id: generateId(),
+						narratorId: id,
+						path: dir.path,
+						accessLevel: dir.accessLevel,
+						enabled: dir.enabled,
+						createdAt: now,
+					})),
+				);
 			}
 
 			return created;

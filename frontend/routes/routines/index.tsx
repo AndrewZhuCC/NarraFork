@@ -832,7 +832,10 @@ function McpToolsTab() {
 						label={t("mcpServerName")}
 						placeholder={t("mcpServerNamePlaceholder")}
 						value={draft.name}
-						onChange={(e) => setDraft((d) => ({ ...d, name: e.currentTarget.value }))}
+						onChange={(e) => {
+							const val = e.currentTarget.value;
+							setDraft((d) => ({ ...d, name: val }));
+						}}
 					/>
 					<div>
 						<Text size="sm" fw={500} mb={4}>
@@ -861,13 +864,19 @@ function McpToolsTab() {
 								label={t("mcpCommand")}
 								placeholder={t("mcpCommandPlaceholder")}
 								value={draft.command}
-								onChange={(e) => setDraft((d) => ({ ...d, command: e.currentTarget.value }))}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, command: val }));
+								}}
 							/>
 							<Textarea
 								label={t("mcpArgs")}
 								placeholder={t("mcpArgsPlaceholder")}
 								value={draft.args}
-								onChange={(e) => setDraft((d) => ({ ...d, args: e.currentTarget.value }))}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, args: val }));
+								}}
 								autosize
 								minRows={2}
 								maxRows={6}
@@ -876,7 +885,10 @@ function McpToolsTab() {
 								label={t("mcpCwd")}
 								placeholder={t("mcpCwdPlaceholder")}
 								value={draft.cwd}
-								onChange={(e) => setDraft((d) => ({ ...d, cwd: e.currentTarget.value }))}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, cwd: val }));
+								}}
 							/>
 						</>
 					) : (
@@ -885,7 +897,10 @@ function McpToolsTab() {
 								label={t("mcpUrl")}
 								placeholder={t("mcpUrlPlaceholder")}
 								value={draft.url}
-								onChange={(e) => setDraft((d) => ({ ...d, url: e.currentTarget.value }))}
+								onChange={(e) => {
+									const val = e.currentTarget.value;
+									setDraft((d) => ({ ...d, url: val }));
+								}}
 							/>
 							{/* Headers */}
 							<div>
@@ -913,8 +928,9 @@ function McpToolsTab() {
 											placeholder={t("mcpHeaderKey")}
 											value={h.key}
 											onChange={(e) => {
+												const val = e.currentTarget.value;
 												const headers = [...draft.headers];
-												headers[i] = { ...h, key: e.currentTarget.value };
+												headers[i] = { ...h, key: val };
 												setDraft((d) => ({ ...d, headers }));
 											}}
 											size="xs"
@@ -924,8 +940,9 @@ function McpToolsTab() {
 											placeholder={t("mcpHeaderValue")}
 											value={h.value}
 											onChange={(e) => {
+												const val = e.currentTarget.value;
 												const headers = [...draft.headers];
-												headers[i] = { ...h, value: e.currentTarget.value };
+												headers[i] = { ...h, value: val };
 												setDraft((d) => ({ ...d, headers }));
 											}}
 											size="xs"
@@ -974,8 +991,9 @@ function McpToolsTab() {
 									placeholder={t("mcpEnvKey")}
 									value={e.key}
 									onChange={(ev) => {
+										const val = ev.currentTarget.value;
 										const env = [...draft.env];
-										env[i] = { ...e, key: ev.currentTarget.value };
+										env[i] = { ...e, key: val };
 										setDraft((d) => ({ ...d, env }));
 									}}
 									size="xs"
@@ -985,8 +1003,9 @@ function McpToolsTab() {
 									placeholder={t("mcpEnvValue")}
 									value={e.value}
 									onChange={(ev) => {
+										const val = ev.currentTarget.value;
 										const env = [...draft.env];
-										env[i] = { ...e, value: ev.currentTarget.value };
+										env[i] = { ...e, value: val };
 										setDraft((d) => ({ ...d, env }));
 									}}
 									size="xs"
@@ -1010,7 +1029,10 @@ function McpToolsTab() {
 					<Switch
 						label={t("mcpEnabled")}
 						checked={draft.enabled}
-						onChange={(e) => setDraft((d) => ({ ...d, enabled: e.currentTarget.checked }))}
+						onChange={(e) => {
+							const val = e.currentTarget.checked;
+							setDraft((d) => ({ ...d, enabled: val }));
+						}}
 					/>
 
 					{/* Test result */}
