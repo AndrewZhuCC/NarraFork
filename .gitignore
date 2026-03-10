@@ -15,3 +15,7 @@ analyze/
 analyze2/
 .narrafork/
 .idea/
+
+*.heapsnapshot
+script/
+scripts/

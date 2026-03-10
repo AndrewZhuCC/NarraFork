@@ -553,11 +553,12 @@ export function NarratorPanel({
 
 	// --- Command popover ---
 	const { data: commandsList } = useNarratorCommands(narratorId);
-	// Show command popover only when typing command name (no space yet)
+	// Show command popover only when typing command name (no space yet),
+	// or when typing "/load <tool>" sub-completion
 	const commandPopoverVisible =
 		input.startsWith("/") &&
 		!input.includes("\n") &&
-		!input.includes(" ") &&
+		(!input.includes(" ") || /^\/load\s\S*$/i.test(input)) &&
 		(commandsList?.length ?? 0) > 0;
 	// Matched command for param helper (after space is typed)
 	const matchedCommand = useMemo(() => {
@@ -575,6 +576,9 @@ export function NarratorPanel({
 		if (cmd.type === "skill") {
 			// Skill selected — insert a prompt that tells the AI to load this skill
 			setInput(`Please load the "${cmd.name}" skill and apply it to: `);
+		} else if (cmd.type === "tool" && !cmd.name.includes(" ")) {
+			// Parent /load entry — expand to show sub-items
+			setInput(`/${cmd.name} `);
 		} else {
 			// Always keep command format — user can continue typing or press space for params
 			setInput(`/${cmd.name}`);
@@ -883,7 +887,7 @@ export function NarratorPanel({
 				}
 			}, 16);
 		};
-		const onTouchEnd = () => clearInterruptTimerRef.current();
+		const onTouchEnd = () => handleInterruptMouseUpRef.current();
 		const onTouchCancel = () => clearInterruptTimerRef.current();
 		btn.addEventListener("touchstart", onTouchStart, { passive: false });
 		btn.addEventListener("touchend", onTouchEnd);
@@ -894,6 +898,18 @@ export function NarratorPanel({
 			btn.removeEventListener("touchcancel", onTouchCancel);
 		};
 	}, []);
+	const handleInterruptMouseUp = useCallback(() => {
+		if (!interruptFiredRef.current && interruptTimerRef.current) {
+			notifications.show({
+				message: t("interruptHoldHint"),
+				color: "yellow",
+			});
+		}
+		clearInterruptTimer();
+	}, [clearInterruptTimer, t]);
+	const handleInterruptMouseUpRef = useRef(handleInterruptMouseUp);
+	handleInterruptMouseUpRef.current = handleInterruptMouseUp;
+
 	useEffect(() => clearInterruptTimer, [clearInterruptTimer]);
 
 	// --- Hydration & message counting ---
@@ -1349,7 +1365,29 @@ export function NarratorPanel({
 		});
 		scrollToBottom(true);
 		try {
-			await api.sendNarratorMessage(narratorId, msg, images.length > 0 ? images : undefined);
+			const result = await api.sendNarratorMessage(
+				narratorId,
+				msg,
+				images.length > 0 ? images : undefined,
+			);
+			// Handle /load tool response — not a real message, just a tool load confirmation
+			if (result?.loaded) {
+				// Remove optimistic message since no real message was created
+				qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
+					if (!old?.pages?.length) return old;
+					const pages = [...old.pages];
+					const firstPage = { ...pages[0] };
+					firstPage.messages = firstPage.messages.filter((m: NarratorMsg) => m.id !== optimisticId);
+					pages[0] = firstPage;
+					return { ...old, pages };
+				});
+				const toolName = result.toolName ?? "tool";
+				notifications.show({
+					title: result.alreadyLoaded ? t("toolAlreadyLoaded") : t("toolLoaded"),
+					message: toolName,
+					color: result.alreadyLoaded ? "yellow" : "green",
+				});
+			}
 		} catch (err) {
 			qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 				if (!old?.pages?.length) return old;
@@ -1375,10 +1413,29 @@ export function NarratorPanel({
 		if (!msg) return;
 		inputHistory.push(msg);
 		if (isActive) {
-			sendBufferMessage(narratorId, msg);
-			setBufferedText(msg);
+			// Send via HTTP POST so images are uploaded via multipart/form-data
+			const images = [...attachedImages];
 			setInput("");
-			scrollToBottom(true);
+			setAttachedImages([]);
+			try {
+				const result = await api.sendNarratorMessage(
+					narratorId,
+					msg,
+					images.length > 0 ? images : undefined,
+				);
+				if (result?.buffered) {
+					setBufferedText(msg);
+					scrollToBottom(true);
+				}
+			} catch {
+				// Fallback to WebSocket text-only buffer (images not supported over WS)
+				if (images.length > 0) {
+					setAttachedImages(images);
+				}
+				sendBufferMessage(narratorId, msg);
+				setBufferedText(msg);
+				scrollToBottom(true);
+			}
 			return;
 		}
 		const images = [...attachedImages];
@@ -1603,6 +1660,11 @@ export function NarratorPanel({
 									}
 									archiveMutation.mutate(narratorId);
 									closeArchiveConfirm();
+									if (onMinimize) {
+										onMinimize();
+									} else {
+										navigate({ to: "/narrators" });
+									}
 								}}
 							>
 								{t("confirmArchive")}
@@ -2375,7 +2437,7 @@ export function NarratorPanel({
 											color="red"
 											variant="light"
 											onMouseDown={startInterruptPress}
-											onMouseUp={clearInterruptTimer}
+											onMouseUp={handleInterruptMouseUp}
 											onMouseLeave={clearInterruptTimer}
 											onContextMenu={(e) => e.preventDefault()}
 											loading={interruptMutation.isPending}
