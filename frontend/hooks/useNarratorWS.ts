@@ -99,6 +99,7 @@ interface NarratorWSCallbacks {
 	onBackgroundTaskFailed?: (taskNarratorId: string, toolUseId: string, error: string) => void;
 	onBackgroundTaskCancelled?: (taskNarratorId: string, toolUseId: string) => void;
 	onMessagesDeleted?: (deletedMessageIds: string[]) => void;
+	onMessageUpdated?: (message: TreeMessage) => void;
 	onPresenceUpdate?: (
 		viewers: Array<{
 			userId: string;
@@ -384,6 +385,11 @@ export function useNarratorWS(
 						case "messages_deleted":
 							if (data.deletedMessageIds) {
 								callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds);
+							}
+							break;
+						case "message_updated":
+							if (data.message) {
+								callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
 							}
 							break;
 						case "commits_updated":
