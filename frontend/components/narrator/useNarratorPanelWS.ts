@@ -468,6 +468,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						updatedPlan !== undefined && perm?.inputJson
 							? { inputJson: { ...perm.inputJson, plan: updatedPlan } }
 							: {};
+					if (decision === "deny") {
+						// Deny: immediately show as failed with user feedback
+						return mergeFieldsByIndex(
+							old,
+							toolUseId,
+							{
+								status: "fail",
+								permissionDenyMessage: feedbackText?.trim() || null,
+								...inputUpdate,
+							},
+							toolUseIndexRef.current,
+						);
+					}
 					return mergeFieldsByIndex(
 						old,
 						toolUseId,
@@ -957,7 +970,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-			onPermissionResolved: (_requestId, toolUseId, updatedInput) => {
+			onPermissionResolved: (_requestId, toolUseId, updatedInput, decision, feedbackText) => {
 				if (toolUseId) {
 					setPendingPermsMap((prev) => {
 						if (!prev.has(toolUseId)) return prev;
@@ -967,6 +980,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
 						if (!old?.pages?.length) return old;
+						if (decision === "deny") {
+							return mergeFieldsByIndex(
+								old,
+								toolUseId,
+								{
+									status: "fail",
+									permissionDenyMessage: feedbackText?.trim() || null,
+								},
+								toolUseIndexRef.current,
+							);
+						}
 						return mergeFieldsByIndex(
 							old,
 							toolUseId,
