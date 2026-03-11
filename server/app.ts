@@ -30,6 +30,7 @@ import { notificationRoutes } from "./routes/notifications";
 import { openaiRoutes } from "./routes/openai";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
@@ -100,6 +101,7 @@ app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/routines", routineRoutes);
+app.route("/api/reviews", reviewsRouter);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);
