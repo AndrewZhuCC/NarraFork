@@ -105,7 +105,7 @@ export interface McpServerConfig {
 }
 
 export interface NarraForkSettings {
-	server: { port: number };
+	server: { port: number; host: string };
 	paths: { defaultProjectDir: string };
 	agent: {
 		defaultModel: string;
@@ -119,12 +119,6 @@ export interface NarraForkSettings {
 			plan: string;
 		};
 		legacyEncoding: boolean;
-		/**
-		 * What to do when an ExitPlanMode permission request times out (30 min):
-		 *   - "deny"         — reject the plan and abort the agent loop (default)
-		 *   - "auto_approve" — automatically approve the plan and continue
-		 */
-		planTimeoutAction: "deny" | "auto_approve";
 		/**
 		 * Per-model context window overrides (tokens).
 		 * Key is the full model value ("provider:modelId"), value is the context window size.
@@ -145,6 +139,17 @@ export interface NarraForkSettings {
 		blacklistDirs?: Array<{
 			path: string;
 			denyLevel: "denyWrite" | "denyAll";
+			enabled?: boolean;
+		}>;
+		/** Global command whitelist — commands auto-allowed for all narrators. */
+		commandWhitelist?: Array<{
+			pattern: string;
+			enabled?: boolean;
+		}>;
+		/** Global command blacklist — commands auto-denied for all narrators. */
+		commandBlacklist?: Array<{
+			pattern: string;
+			denyPrompt?: string;
 			enabled?: boolean;
 		}>;
 	};
@@ -218,7 +223,7 @@ export interface NarraForkSettings {
 }
 
 const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778 },
+	server: { port: 7778, host: "localhost" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
 		defaultModel: "kiro:claude-sonnet",
@@ -232,7 +237,6 @@ const DEFAULTS: NarraForkSettings = {
 			plan: "",
 		},
 		legacyEncoding: false,
-		planTimeoutAction: "deny",
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,

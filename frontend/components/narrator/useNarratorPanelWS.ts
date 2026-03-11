@@ -85,8 +85,10 @@ export interface UseNarratorPanelWSReturn {
 	pendingPermission: PendingPermission | null;
 	renderPermCb: PermissionCallbacks;
 	// State
-	bufferedText: string | null;
-	setBufferedText: React.Dispatch<React.SetStateAction<string | null>>;
+	queuedMessages: Array<{ id: string; text: string; bufferedAt: string }>;
+	setQueuedMessages: React.Dispatch<
+		React.SetStateAction<Array<{ id: string; text: string; bufferedAt: string }>>
+	>;
 	isCompacting: boolean;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
@@ -238,7 +240,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [pendingPermsMap]);
 
 	// --- Misc state ---
-	const [bufferedText, setBufferedText] = useState<string | null>(null);
+	const [queuedMessages, setQueuedMessages] = useState<
+		Array<{ id: string; text: string; bufferedAt: string }>
+	>([]);
 	const [isCompacting, setIsCompacting] = useState(false);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
@@ -1034,11 +1038,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				setCurrentTodos(todos);
 				if (toolUseId) setTodosToolUseId(toolUseId);
 			},
-			onBufferSet: (text) => {
-				setBufferedText(text);
+			onBufferSet: (messages) => {
+				setQueuedMessages(messages);
+			},
+			onBufferConsumed: (_messageId, remaining) => {
+				setQueuedMessages(remaining);
 			},
 			onBufferCleared: () => {
-				setBufferedText(null);
+				setQueuedMessages([]);
 			},
 			onPermissionModeChanged: (permissionMode) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -1287,8 +1294,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			})
 			.catch(() => {});
 		api
-			.getBufferedMessage(narratorId)
-			.then((buf) => setBufferedText(buf?.text ?? null))
+			.getBufferedMessages(narratorId)
+			.then((msgs) => setQueuedMessages(msgs ?? []))
 			.catch(() => {});
 	}, [narratorId, connected]);
 
@@ -1370,8 +1377,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pendingPermsMap,
 		pendingPermission,
 		renderPermCb,
-		bufferedText,
-		setBufferedText,
+		queuedMessages,
+		setQueuedMessages,
 		isCompacting,
 		contextPercent,
 		setContextPercent,

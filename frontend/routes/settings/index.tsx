@@ -170,6 +170,7 @@ function SettingsPage() {
 
 	// Server
 	const [port, setPort] = useState<number | undefined>();
+	const [host, setHost] = useState("localhost");
 	const [projectDir, setProjectDir] = useState("");
 	// Agent
 	const [defaultModel, setDefaultModel] = useState("kiro:claude-sonnet");
@@ -181,13 +182,18 @@ function SettingsPage() {
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
-	const [planTimeoutAction, setPlanTimeoutAction] = useState("deny");
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [globalWhitelistDirs, setGlobalWhitelistDirs] = useState<
 		Array<{ path: string; accessLevel: string; enabled?: boolean }>
 	>([]);
 	const [globalBlacklistDirs, setGlobalBlacklistDirs] = useState<
 		Array<{ path: string; denyLevel: string; enabled?: boolean }>
+	>([]);
+	const [globalCommandWhitelist, setGlobalCommandWhitelist] = useState<
+		Array<{ pattern: string; enabled?: boolean }>
+	>([]);
+	const [globalCommandBlacklist, setGlobalCommandBlacklist] = useState<
+		Array<{ pattern: string; denyPrompt?: string; enabled?: boolean }>
 	>([]);
 	// Chapters
 	const [maxWorktrees, setMaxWorktrees] = useState(10);
@@ -238,7 +244,6 @@ function SettingsPage() {
 		legacyEncoding: false,
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
-		planTimeoutAction: "deny",
 		codexDefaultReasoningEffort: "high",
 		globalWhitelistDirs: [] as Array<{
 			path: string;
@@ -250,12 +255,22 @@ function SettingsPage() {
 			denyLevel: string;
 			enabled?: boolean;
 		}>,
+		globalCommandWhitelist: [] as Array<{
+			pattern: string;
+			enabled?: boolean;
+		}>,
+		globalCommandBlacklist: [] as Array<{
+			pattern: string;
+			denyPrompt?: string;
+			enabled?: boolean;
+		}>,
 	});
 
 	useEffect(() => {
 		if (settings && !initialized) {
 			const snap = {
 				port: settings.server?.port ?? 7778,
+				host: settings.server?.host ?? "localhost",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
@@ -279,13 +294,15 @@ function SettingsPage() {
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
-				planTimeoutAction: settings.agent?.planTimeoutAction ?? "deny",
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
+				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
+				globalCommandBlacklist: settings.agent?.commandBlacklist ?? [],
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
+			setHost(snap.host);
 			setProjectDir(snap.projectDir);
 			setDefaultModel(snap.defaultModel);
 			setPermissionMode(snap.permissionMode);
@@ -309,10 +326,11 @@ function SettingsPage() {
 			setLegacyEncoding(snap.legacyEncoding);
 			setTranslateReasoning(snap.translateReasoning);
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
-			setPlanTimeoutAction(snap.planTimeoutAction);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setGlobalWhitelistDirs(snap.globalWhitelistDirs);
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
+			setGlobalCommandWhitelist(snap.globalCommandWhitelist);
+			setGlobalCommandBlacklist(snap.globalCommandBlacklist);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -322,6 +340,7 @@ function SettingsPage() {
 		const s = serverSnapshot.current;
 		return (
 			port !== s.port ||
+			host !== s.host ||
 			projectDir !== s.projectDir ||
 			defaultModel !== s.defaultModel ||
 			permissionMode !== s.permissionMode ||
@@ -345,14 +364,16 @@ function SettingsPage() {
 			legacyEncoding !== s.legacyEncoding ||
 			translateReasoning !== s.translateReasoning ||
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
-			planTimeoutAction !== s.planTimeoutAction ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
-			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs)
+			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
+			JSON.stringify(globalCommandWhitelist) !== JSON.stringify(s.globalCommandWhitelist) ||
+			JSON.stringify(globalCommandBlacklist) !== JSON.stringify(s.globalCommandBlacklist)
 		);
 	}, [
 		initialized,
 		port,
+		host,
 		projectDir,
 		defaultModel,
 		permissionMode,
@@ -376,10 +397,11 @@ function SettingsPage() {
 		legacyEncoding,
 		translateReasoning,
 		defaultRelaxedPlan,
-		planTimeoutAction,
 		codexDefaultReasoningEffort,
 		globalWhitelistDirs,
 		globalBlacklistDirs,
+		globalCommandWhitelist,
+		globalCommandBlacklist,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -400,7 +422,7 @@ function SettingsPage() {
 	const handleSave = () => {
 		updateSettings.mutate(
 			{
-				server: { port },
+				server: { port, host },
 				paths: { defaultProjectDir: projectDir },
 				agent: {
 					defaultModel,
@@ -414,9 +436,10 @@ function SettingsPage() {
 					legacyEncoding,
 					translateReasoning,
 					defaultRelaxedPlan,
-					planTimeoutAction,
 					whitelistDirs: globalWhitelistDirs,
 					blacklistDirs: globalBlacklistDirs,
+					commandWhitelist: globalCommandWhitelist,
+					commandBlacklist: globalCommandBlacklist,
 				},
 				chapters: {
 					maxActiveWorktrees: maxWorktrees,
@@ -470,10 +493,11 @@ function SettingsPage() {
 						legacyEncoding,
 						translateReasoning,
 						defaultRelaxedPlan,
-						planTimeoutAction,
 						codexDefaultReasoningEffort,
 						globalWhitelistDirs,
 						globalBlacklistDirs,
+						globalCommandWhitelist,
+						globalCommandBlacklist,
 					};
 				},
 			},
@@ -561,12 +585,14 @@ function SettingsPage() {
 							setTranslateReasoning={setTranslateReasoning}
 							defaultRelaxedPlan={defaultRelaxedPlan}
 							setDefaultRelaxedPlan={setDefaultRelaxedPlan}
-							planTimeoutAction={planTimeoutAction}
-							setPlanTimeoutAction={setPlanTimeoutAction}
 							globalWhitelistDirs={globalWhitelistDirs}
 							setGlobalWhitelistDirs={setGlobalWhitelistDirs}
 							globalBlacklistDirs={globalBlacklistDirs}
 							setGlobalBlacklistDirs={setGlobalBlacklistDirs}
+							globalCommandWhitelist={globalCommandWhitelist}
+							setGlobalCommandWhitelist={setGlobalCommandWhitelist}
+							globalCommandBlacklist={globalCommandBlacklist}
+							setGlobalCommandBlacklist={setGlobalCommandBlacklist}
 							userPrefs={userPrefs}
 							updateUserPref={updateUserPref}
 						/>
@@ -646,6 +672,8 @@ function SettingsPage() {
 						<ServerSystemSection
 							port={port}
 							setPort={setPort}
+							host={host}
+							setHost={setHost}
 							projectDir={projectDir}
 							setProjectDir={setProjectDir}
 							pwaUpdating={pwaUpdating}
