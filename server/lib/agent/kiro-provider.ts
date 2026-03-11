@@ -8,7 +8,7 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import { buildKiroHistory, buildKiroRequest, parseKiroStreamEvent } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
-import { resolveToolJsonSchema } from "./tool-registry";
+import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 /**
@@ -22,7 +22,7 @@ export class KiroProvider implements ProviderAdapter {
 			toolSpecification: {
 				name: tool.name,
 				description: tool.description,
-				inputSchema: { json: resolveToolJsonSchema(tool) },
+				inputSchema: { json: ensureNonEmptySchema(resolveToolJsonSchema(tool)) },
 			},
 		}));
 	}

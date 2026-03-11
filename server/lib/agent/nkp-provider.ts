@@ -12,7 +12,7 @@ import type { NKPProviderConfig } from "../settings";
 import { buildKiroHistory, buildKiroRequest, parseSSEStream } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
-import { resolveToolJsonSchema } from "./tool-registry";
+import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
 /**
@@ -33,7 +33,7 @@ export class NkpProvider implements ProviderAdapter {
 			toolSpecification: {
 				name: tool.name,
 				description: tool.description,
-				inputSchema: { json: resolveToolJsonSchema(tool) },
+				inputSchema: { json: ensureNonEmptySchema(resolveToolJsonSchema(tool)) },
 			},
 		}));
 	}
