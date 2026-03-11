@@ -388,16 +388,18 @@ export async function buildKiroHistory(
 						const filePath = getImagePath(narratorId, block.imageId ?? "");
 						if (filePath) {
 							try {
-								const base64 = await imageToBase64(filePath);
+								const result = await imageToBase64(filePath);
 								const mimeToFormat: Record<string, string> = {
 									"image/png": "png",
 									"image/jpeg": "jpeg",
 									"image/gif": "gif",
 									"image/webp": "webp",
 								};
+								// Prefer detected real format over stored mediaType
+								const effectiveMime = result.detectedMediaType ?? block.mediaType ?? "";
 								resolved.push({
-									format: (mimeToFormat[block.mediaType ?? ""] ?? "png") as KiroImage["format"],
-									source: { bytes: base64 },
+									format: (mimeToFormat[effectiveMime] ?? "png") as KiroImage["format"],
+									source: { bytes: result.base64 },
 								});
 							} catch {
 								// Image file may have been deleted — skip silently
