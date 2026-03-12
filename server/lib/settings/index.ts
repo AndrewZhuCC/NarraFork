@@ -207,6 +207,19 @@ export interface NarraForkSettings {
 	nkpProviders?: NKPProviderConfig[];
 	/** External MCP server configurations. */
 	mcpServers?: McpServerConfig[];
+	/** Delta update configuration. */
+	update?: {
+		/** Update server URL. */
+		serverUrl: string;
+		/** Product ID for multi-product update servers. */
+		product: string;
+		/** Update channel: stable or beta. */
+		channel: "stable" | "beta";
+		/** Auto-check interval in minutes (0 to disable). */
+		checkIntervalMinutes: number;
+		/** Automatically download updates when available. */
+		autoDownload: boolean;
+	};
 }
 
 const DEFAULTS: NarraForkSettings = {
@@ -255,6 +268,13 @@ const DEFAULTS: NarraForkSettings = {
 	},
 	codex: {
 		defaultReasoningEffort: "high",
+	},
+	update: {
+		serverUrl: "",
+		product: "narrafork",
+		channel: "stable",
+		checkIntervalMinutes: 60,
+		autoDownload: false,
 	},
 };
 
