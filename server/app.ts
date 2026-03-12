@@ -35,6 +35,7 @@ import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { skillRoutes } from "./routes/skills";
 import { terminalRoutes } from "./routes/terminals";
+import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 
@@ -100,6 +101,7 @@ app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/routines", routineRoutes);
+app.route("/api/update", updateRoutes);
 
 // Graph routes are nested under projects for RESTful consistency
 app.route("/api/projects", graphRoutes);
