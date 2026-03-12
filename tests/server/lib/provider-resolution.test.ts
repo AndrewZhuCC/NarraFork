@@ -24,6 +24,7 @@ function restoreFromSnapshot(snapshot: ReturnType<typeof cloneSettingsSnapshot>)
 function resetProviders(): void {
 	settings.openaiProviders = [];
 	settings.anthropicProviders = [];
+	settings.nkpProviders = [];
 	settings.codex = undefined;
 	settings.kiro = undefined;
 	settings.agent.customModels = [];
@@ -173,30 +174,28 @@ describe("getProvider fallback behavior", () => {
 		}
 	});
 
-	test("禁用 kiro provider 时回退到 openai provider", () => {
+	test("禁用 kiro provider 时直接报错", () => {
 		addOpenaiProvider("deepseek");
 		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		const provider = getProvider("kiro");
-		expect(provider.constructor.name).toBe("OpenAIProvider");
+		expect(() => getProvider("kiro")).toThrow(/Kiro provider is disabled/);
 	});
 
 	test("禁用 kiro provider 且无其他 provider 时抛错", () => {
 		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		expect(() => getProvider("kiro")).toThrow(
-			"Kiro provider disabled and no non-Kiro provider is configured.",
+		expect(() => getProvider("kiro")).toThrow(/Kiro provider is disabled/);
+	});
+
+	test("unknown provider 直接报错而非静默回退", () => {
+		addOpenaiProvider("deepseek");
+		expect(() => getProvider("unknown-provider")).toThrow(
+			/Provider "unknown-provider" is not configured/,
 		);
 	});
 
-	test("unknown provider 回退到可用 non-kiro provider", () => {
-		addOpenaiProvider("deepseek");
-		const provider = getProvider("unknown-provider");
-		expect(provider.constructor.name).toBe("OpenAIProvider");
-	});
-
-	test("unknown provider 且无 fallback 且 kiro 被禁用时抛错", () => {
+	test("unknown provider 且 kiro 被禁用时抛错", () => {
 		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
 		expect(() => getProvider("unknown-provider")).toThrow(
-			'Provider "unknown-provider" is not configured, and no fallback provider is available.',
+			/Provider "unknown-provider" is not configured/,
 		);
 	});
 
@@ -229,13 +228,12 @@ describe("resolveProviderAndModel behavior", () => {
 		}
 	});
 
-	test("禁用 kiro provider 回退时同时回退模型", () => {
+	test("禁用 kiro provider 时直接报错而非静默回退", () => {
 		addOpenaiProvider("deepseek");
 		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		const resolved = resolveProviderAndModel("kiro:claude-sonnet");
-		expect(resolved.provider).toBe("deepseek");
-		expect(resolved.adapter.constructor.name).toBe("OpenAIProvider");
-		expect(resolved.model).toBe("deepseek:gpt-4o");
+		expect(() => resolveProviderAndModel("kiro:claude-sonnet-4.5")).toThrow(
+			/Kiro provider is disabled/,
+		);
 	});
 
 	test("provider 未变更时保留原模型", () => {

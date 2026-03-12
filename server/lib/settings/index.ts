@@ -105,7 +105,12 @@ export interface McpServerConfig {
 }
 
 export interface NarraForkSettings {
-	server: { port: number; host: string };
+	server: {
+		port: number;
+		host: string;
+		/** Browser launch behaviour on server start: "off" | "browser" | "app" */
+		openBrowser: "off" | "browser" | "app";
+	};
 	paths: { defaultProjectDir: string };
 	agent: {
 		defaultModel: string;
@@ -223,12 +228,12 @@ export interface NarraForkSettings {
 }
 
 const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778, host: "localhost" },
+	server: { port: 7778, host: "localhost", openBrowser: "app" },
 	paths: { defaultProjectDir: resolve(homedir(), "projects") },
 	agent: {
-		defaultModel: "kiro:claude-sonnet",
+		defaultModel: "kiro:claude-sonnet-4.5",
 		defaultPermissionMode: "acceptEdits",
-		summaryModel: "kiro:claude-haiku",
+		summaryModel: "kiro:claude-haiku-4.5",
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 200,
@@ -424,7 +429,16 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 export const settings: NarraForkSettings = loadSettings();
 _cache.current = settings;
 
-const BUILTIN_KIRO_MODELS = ["claude-haiku", "claude-sonnet", "claude-opus"];
+const BUILTIN_KIRO_MODELS = [
+	"claude-haiku-4.5",
+	"claude-sonnet-4.5",
+	"claude-opus-4.5",
+	"claude-opus-4.6",
+	// Legacy short names (for resolveProvider backward compat)
+	"claude-haiku",
+	"claude-sonnet",
+	"claude-opus",
+];
 const BUILTIN_CODEX_MODELS = [
 	"gpt-5.4",
 	"gpt-5.3-codex",

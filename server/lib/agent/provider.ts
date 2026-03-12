@@ -1,6 +1,4 @@
-import { getCodexManager } from "../codex-manager";
 import { isKiroAvailable } from "../kiro-adapter";
-import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
 	getNkpProviderConfig,
@@ -203,47 +201,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	return null;
 }
 
-function getConfiguredNonKiroProviders(): string[] {
-	const seen = new Set<string>();
-	const providers: string[] = [];
-
-	for (const p of settings.openaiProviders ?? []) {
-		if (!p.apiKey) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-	for (const p of settings.anthropicProviders ?? []) {
-		if (!p.apiKey) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-	for (const p of settings.nkpProviders ?? []) {
-		if (!p.apiKey || !p.baseUrl) continue;
-		if (!seen.has(p.prefix)) {
-			seen.add(p.prefix);
-			providers.push(p.prefix);
-		}
-	}
-
-	if (!seen.has("codex") && settings.codex) {
-		try {
-			if (getCodexManager().availableCount > 0) {
-				providers.push("codex");
-			}
-		} catch {
-			// Ignore codex manager errors during fallback discovery
-		}
-	}
-
-	return providers;
-}
-
 function defaultModelForProvider(provider: string): string | null {
 	if (provider === "codex") {
 		const custom = settings.agent.customModels ?? [];
@@ -255,7 +212,7 @@ function defaultModelForProvider(provider: string): string | null {
 	}
 
 	if (provider === "kiro") {
-		return "kiro:claude-sonnet";
+		return "kiro:claude-sonnet-4.5";
 	}
 
 	const openai = getOpenaiProviderConfig(provider);
@@ -310,55 +267,25 @@ function buildResolution(
 	};
 }
 
-function getFirstAvailableNonKiroResolution(
-	requestedProvider: string,
-	requestedModel: string,
-): ProviderResolution | null {
-	for (const name of getConfiguredNonKiroProviders()) {
-		const adapter = createProviderByName(name);
-		if (adapter) {
-			return buildResolution(requestedProvider, requestedModel, name, adapter);
-		}
-	}
-	return null;
-}
-
 export function resolveProviderAndModel(model?: string): ProviderResolution {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const requestedProvider = resolveProvider(requestedModel);
 
 	if (requestedProvider === "kiro") {
 		if (isKiroProviderDisabled()) {
-			const fallback = getFirstAvailableNonKiroResolution(requestedProvider, requestedModel);
-			if (fallback) {
-				logger.warn("Kiro provider disabled by environment variable, using fallback provider", {
-					requestedProvider,
-					requestedModel,
-					fallbackProvider: fallback.provider,
-					fallbackModel: fallback.model,
-					env: "NARRAFORK_DISABLE_KIRO_PROVIDER",
-				});
-				return fallback;
-			}
-			throw new Error("Kiro provider disabled and no non-Kiro provider is configured.");
+			throw new Error(
+				`Kiro provider is disabled (NARRAFORK_DISABLE_KIRO_PROVIDER=1). ` +
+					`Please choose a different model or remove the environment variable.`,
+			);
 		}
 
-		if (isKiroAvailable()) {
-			return buildResolution(requestedProvider, requestedModel, "kiro", new KiroProvider());
+		if (!isKiroAvailable()) {
+			throw new Error(
+				"Kiro provider is not available. Please check your Kiro connection and try again.",
+			);
 		}
 
-		const fallback = getFirstAvailableNonKiroResolution(requestedProvider, requestedModel);
-		if (fallback) {
-			logger.warn("Kiro provider unavailable, falling back to non-Kiro provider", {
-				requestedProvider,
-				requestedModel,
-				fallbackProvider: fallback.provider,
-				fallbackModel: fallback.model,
-			});
-			return fallback;
-		}
-
-		throw new Error("Kiro provider unavailable and no non-Kiro provider is configured.");
+		return buildResolution(requestedProvider, requestedModel, "kiro", new KiroProvider());
 	}
 
 	const explicit = createProviderByName(requestedProvider);
@@ -366,28 +293,9 @@ export function resolveProviderAndModel(model?: string): ProviderResolution {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
 	}
 
-	const fallback = getFirstAvailableNonKiroResolution(requestedProvider, requestedModel);
-	if (fallback) {
-		logger.warn("Unknown provider requested, falling back to configured provider", {
-			requestedProvider,
-			requestedModel,
-			fallbackProvider: fallback.provider,
-			fallbackModel: fallback.model,
-		});
-		return fallback;
-	}
-
-	if (!isKiroProviderDisabled() && isKiroAvailable()) {
-		logger.warn("Unknown provider requested, falling back to Kiro", {
-			requestedProvider,
-			requestedModel,
-			fallbackModel: "kiro:claude-sonnet",
-		});
-		return buildResolution(requestedProvider, requestedModel, "kiro", new KiroProvider());
-	}
-
 	throw new Error(
-		`Provider "${requestedProvider}" is not configured, and no fallback provider is available.`,
+		`Provider "${requestedProvider}" is not configured. ` +
+			`Please check your provider settings or choose a different model.`,
 	);
 }
 

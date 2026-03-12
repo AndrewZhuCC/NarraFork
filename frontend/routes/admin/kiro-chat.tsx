@@ -15,7 +15,7 @@ function KiroChatPage() {
 	const navigate = useNavigate();
 	const { t } = useTranslation("common");
 	const [input, setInput] = useState("");
-	const [model, setModel] = useState<string>("claude-sonnet");
+	const [model, setModel] = useState<string>("claude-sonnet-4.5");
 	const [output, setOutput] = useState("");
 	const [streaming, setStreaming] = useState(false);
 	const [error, setError] = useState<string | null>(null);

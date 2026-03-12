@@ -42,14 +42,14 @@ export function ModelsSection({
 				data={groupedModels}
 				searchable
 				value={defaultModel}
-				onChange={(v) => setDefaultModel(v ?? "kiro:claude-sonnet")}
+				onChange={(v) => setDefaultModel(v ?? "kiro:claude-sonnet-4.5")}
 			/>
 			<Select
 				label={t("summaryModel")}
 				data={groupedModels}
 				searchable
 				value={summaryModel}
-				onChange={(v) => setSummaryModel(v ?? "kiro:claude-haiku")}
+				onChange={(v) => setSummaryModel(v ?? "kiro:claude-haiku-4.5")}
 			/>
 			<Stack gap="xs">
 				<Text size="sm" fw={500}>

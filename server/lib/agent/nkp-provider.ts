@@ -15,6 +15,13 @@ import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
 
+/** Create an Error with an attached HTTP status code for retry detection. */
+function httpError(message: string, status: number): Error {
+	const err = new Error(message);
+	(err as Error & { status: number }).status = status;
+	return err;
+}
+
 /**
  * NKP (Native Kiro Proxy) provider adapter.
  * Communicates with a remote NKP service using the Kiro native protocol over HTTP SSE.
@@ -90,7 +97,7 @@ export class NkpProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`NKP chat error ${response.status}: ${errText}`);
+			throw httpError(`NKP chat error ${response.status}: ${errText}`, response.status);
 		}
 
 		if (!response.body) {
@@ -184,7 +191,7 @@ export class NkpProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`NKP generate error ${response.status}: ${errText}`);
+			throw httpError(`NKP generate error ${response.status}: ${errText}`, response.status);
 		}
 
 		const chunks: string[] = [];
@@ -254,7 +261,10 @@ export class NkpProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new Error(`NKP generateWithHistory error ${response.status}: ${errText}`);
+			throw httpError(
+				`NKP generateWithHistory error ${response.status}: ${errText}`,
+				response.status,
+			);
 		}
 
 		const chunks: string[] = [];

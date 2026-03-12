@@ -36,7 +36,12 @@ export type KiroAccountTier = "free" | "paid" | "enterprise";
 /** Ensure a model value has a "provider:" prefix. */
 export function ensurePrefix(val: string): string {
 	if (!val || val.includes(":")) return val;
-	if (["claude-haiku", "claude-sonnet", "claude-opus"].includes(val)) return `kiro:${val}`;
+	if (["claude-haiku-4.5", "claude-sonnet-4.5", "claude-opus-4.5", "claude-opus-4.6"].includes(val))
+		return `kiro:${val}`;
+	// Legacy short names — map to full IDs
+	if (val === "claude-haiku") return "kiro:claude-haiku-4.5";
+	if (val === "claude-sonnet") return "kiro:claude-sonnet-4.5";
+	if (val === "claude-opus") return "kiro:claude-opus-4.6";
 	return `openai:${val}`;
 }
 

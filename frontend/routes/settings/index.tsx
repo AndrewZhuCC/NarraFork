@@ -16,6 +16,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AvatarCropModal } from "../../components/AvatarCropModal";
+import { ensurePrefix } from "../../components/providers/types";
 import { AboutSection } from "../../components/settings/AboutSection";
 import { AgentSection } from "../../components/settings/AgentSection";
 import { AppearanceSection } from "../../components/settings/AppearanceSection";
@@ -34,13 +35,6 @@ import { useLocalPref } from "../../hooks/useLocalPref";
 import { useAllModels } from "../../hooks/useModels";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
-
-/** Ensure a model value has a "provider:" prefix. */
-function ensurePrefix(val: string): string {
-	if (!val || val.includes(":")) return val;
-	if (["claude-haiku", "claude-sonnet", "claude-opus"].includes(val)) return `kiro:${val}`;
-	return `openai:${val}`;
-}
 
 const ALL_SECTIONS = [
 	"profile",
@@ -165,10 +159,11 @@ function SettingsPage() {
 	const [port, setPort] = useState<number | undefined>();
 	const [host, setHost] = useState("localhost");
 	const [projectDir, setProjectDir] = useState("");
+	const [openBrowser, setOpenBrowser] = useState("app");
 	// Agent
-	const [defaultModel, setDefaultModel] = useState("kiro:claude-sonnet");
+	const [defaultModel, setDefaultModel] = useState("kiro:claude-sonnet-4.5");
 	const [permissionMode, setPermissionMode] = useState("acceptEdits");
-	const [summaryModel, setSummaryModel] = useState("kiro:claude-haiku");
+	const [summaryModel, setSummaryModel] = useState("kiro:claude-haiku-4.5");
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
@@ -209,10 +204,12 @@ function SettingsPage() {
 	// Snapshot of server values for dirty comparison
 	const serverSnapshot = useRef({
 		port: 7778 as number | undefined,
+		host: "localhost",
+		openBrowser: "app",
 		projectDir: "",
-		defaultModel: "kiro:claude-sonnet",
+		defaultModel: "kiro:claude-sonnet-4.5",
 		permissionMode: "acceptEdits",
-		summaryModel: "kiro:claude-haiku",
+		summaryModel: "kiro:claude-haiku-4.5",
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
@@ -255,10 +252,11 @@ function SettingsPage() {
 			const snap = {
 				port: settings.server?.port ?? 7778,
 				host: settings.server?.host ?? "localhost",
+				openBrowser: settings.server?.openBrowser ?? "app",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
-				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet"),
+				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
-				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? "kiro:claude-haiku"),
+				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? "kiro:claude-haiku-4.5"),
 				maxTurns: settings.agent?.maxTurns ?? 200,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
@@ -283,6 +281,7 @@ function SettingsPage() {
 			serverSnapshot.current = snap;
 			setPort(snap.port);
 			setHost(snap.host);
+			setOpenBrowser(snap.openBrowser);
 			setProjectDir(snap.projectDir);
 			setDefaultModel(snap.defaultModel);
 			setPermissionMode(snap.permissionMode);
@@ -317,6 +316,7 @@ function SettingsPage() {
 		return (
 			port !== s.port ||
 			host !== s.host ||
+			openBrowser !== s.openBrowser ||
 			projectDir !== s.projectDir ||
 			defaultModel !== s.defaultModel ||
 			permissionMode !== s.permissionMode ||
@@ -346,6 +346,7 @@ function SettingsPage() {
 		initialized,
 		port,
 		host,
+		openBrowser,
 		projectDir,
 		defaultModel,
 		permissionMode,
@@ -390,7 +391,7 @@ function SettingsPage() {
 	const handleSave = () => {
 		updateSettings.mutate(
 			{
-				server: { port, host },
+				server: { port, host, openBrowser },
 				paths: { defaultProjectDir: projectDir },
 				agent: {
 					defaultModel,
@@ -434,6 +435,8 @@ function SettingsPage() {
 				onSuccess: () => {
 					serverSnapshot.current = {
 						port,
+						host,
+						openBrowser,
 						projectDir,
 						defaultModel,
 						permissionMode,
@@ -628,6 +631,8 @@ function SettingsPage() {
 							setHost={setHost}
 							projectDir={projectDir}
 							setProjectDir={setProjectDir}
+							openBrowser={openBrowser}
+							setOpenBrowser={setOpenBrowser}
 							pwaUpdating={pwaUpdating}
 							handlePwaUpdate={handlePwaUpdate}
 						/>

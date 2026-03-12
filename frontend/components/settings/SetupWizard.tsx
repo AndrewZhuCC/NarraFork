@@ -336,7 +336,7 @@ function BasicSettingsStep() {
 
 	const [projectDir, setProjectDir] = useState(settings?.paths?.defaultProjectDir ?? "");
 	const [defaultModel, setDefaultModel] = useState(
-		settings?.agent?.defaultModel ?? "kiro:claude-sonnet",
+		settings?.agent?.defaultModel ?? "kiro:claude-sonnet-4.5",
 	);
 
 	const save = useMutation({
@@ -368,7 +368,7 @@ function BasicSettingsStep() {
 				searchable
 				value={defaultModel}
 				onChange={(v) => {
-					const val = v ?? "kiro:claude-sonnet";
+					const val = v ?? "kiro:claude-sonnet-4.5";
 					setDefaultModel(val);
 					save.mutate({
 						paths: { defaultProjectDir: projectDir },
