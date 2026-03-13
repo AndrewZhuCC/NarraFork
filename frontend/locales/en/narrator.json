@@ -156,6 +156,8 @@
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"nkpQuotaBalance": "NKP Quota: ${{balance}}",
 	"truncatedPreview": "Content truncated ({{size}}) — expand to load full data",
+	"truncatedLoading": "Loading full data ({{size}})…",
+	"truncatedError": "Failed to load full data — click to retry",
 	"toolStartedAt": "Started at {{time}}",
 	"chapterBar.git": "Git",
 	"chapterBar.containers": "Containers",
@@ -200,5 +202,8 @@
 	"webSearchPreparing": "Preparing web search…",
 	"backToGraph": "Back to graph",
 	"toolLoaded": "Tool loaded",
-	"toolAlreadyLoaded": "Tool already loaded"
+	"toolAlreadyLoaded": "Tool already loaded",
+	"shareFile.download": "Download",
+	"shareFile.directory": "directory",
+	"shareFile.compressed": "compressed"
 }

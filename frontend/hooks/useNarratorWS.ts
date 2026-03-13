@@ -45,6 +45,7 @@ interface NarratorWSCallbacks {
 		parentToolUseId?: string,
 	) => void;
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
+	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
 	onTitleUpdated?: (title: string) => void;
 	onTodosUpdated?: (
 		todos: { id?: string; content?: string; status?: string }[],
@@ -117,6 +118,7 @@ interface NarratorWSCallbacks {
 			started?: boolean;
 			input?: unknown;
 			streamStartedAt?: number;
+			streamingOutput?: string;
 		}>;
 	}) => void;
 }
@@ -236,6 +238,13 @@ export function useNarratorWS(
 						callbacksRef.current.onToolLongRunning?.(
 							data.toolUseId as string,
 							data.elapsed as number,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
+					case "tool_output":
+						callbacksRef.current.onToolOutput?.(
+							data.toolUseId as string,
+							data.output as string,
 							data.parentToolUseId as string | undefined,
 						);
 						break;
@@ -420,6 +429,7 @@ export function useNarratorWS(
 								started?: boolean;
 								input?: unknown;
 								streamStartedAt?: number;
+								streamingOutput?: string;
 							}>,
 						});
 						break;
