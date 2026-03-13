@@ -1011,7 +1011,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status) => {
 				setIsCompacting(false);
-				if (status === "idle") {
+				// Clean up streaming state for ALL terminal statuses, not just "idle".
+				// "interrupted" and "done" also mean the agent loop has stopped, so any
+				// residual streaming text / tool chunks must be flushed.
+				const isTerminal =
+					status === "idle" || status === "interrupted" || status === "done" || status === "error";
+				if (isTerminal) {
 					if (streamingRef.current) {
 						streamingRef.current = "";
 					}
@@ -1021,7 +1026,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					webSearchRef.current = null;
 					clearStreamingState();
 				}
-				if (status === "idle") {
+				if (isTerminal) {
 					// Cancel any pending RAF tool chunk flush.
 					cancelPendingToolChunks(false);
 					removeStreamingChunksMsg(qc, messagesQueryKey);
