@@ -119,10 +119,55 @@ export class KiroProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
-		_systemInstruction?: string,
+		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
-		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
+		if (systemInstruction) {
+			// Kiro API has no system prompt field — simulate via history
+			const kiroAdapter = await import("../kiro-adapter");
+			const ack = "Understood.";
+			const request: import("../kiro-adapter").KiroChatRequest = {
+				conversationState: {
+					conversationId: crypto.randomUUID(),
+					chatTriggerType: "MANUAL",
+					history: [
+						{
+							userInputMessage: {
+								content: systemInstruction,
+								modelId,
+								origin: "AI_EDITOR",
+							},
+						},
+						{
+							assistantResponseMessage: {
+								content: ack,
+							},
+						},
+					] as KiroHistoryMessage[],
+					currentMessage: {
+						userInputMessage: {
+							content: text,
+							modelId,
+							userInputMessageContext: {},
+							origin: "AI_EDITOR",
+						},
+					},
+				},
+			};
+			const chunks: string[] = [];
+			let contextPercent: number | undefined;
+			for await (const evt of kiroAdapter.kiroChatRaw(request)) {
+				if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
+					chunks.push(String(evt.data.content));
+				}
+				if (evt.eventType === "contextUsageEvent") {
+					const pct = evt.data.contextUsagePercentage ?? evt.data.context_usage_percentage;
+					if (pct != null) contextPercent = Number(pct);
+				}
+			}
+			return { text: chunks.join(""), contextPercent };
+		}
+		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		return kiroGenerateWithMeta(text, modelId as any);
 	}

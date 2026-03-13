@@ -158,13 +158,31 @@ export class NkpProvider implements ProviderAdapter {
 	async generateWithMeta(
 		text: string,
 		model: string,
-		_systemInstruction?: string,
+		systemInstruction?: string,
 	): Promise<{ text: string; contextPercent?: number }> {
 		const modelId = resolveModel(model);
 		const request: KiroChatRequest = {
 			conversationState: {
 				conversationId: crypto.randomUUID(),
 				chatTriggerType: "MANUAL",
+				...(systemInstruction
+					? {
+							history: [
+								{
+									userInputMessage: {
+										content: systemInstruction,
+										modelId,
+										origin: "AI_EDITOR",
+									},
+								},
+								{
+									assistantResponseMessage: {
+										content: "Understood.",
+									},
+								},
+							] as KiroHistoryMessage[],
+						}
+					: {}),
 				currentMessage: {
 					userInputMessage: {
 						content: text,

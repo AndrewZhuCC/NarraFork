@@ -35,6 +35,7 @@ import { routineRoutes } from "./routes/routines";
 import { rulerRoutes } from "./routes/ruler";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
+import { shareRoutes } from "./routes/shares";
 import { skillRoutes } from "./routes/skills";
 import { terminalRoutes } from "./routes/terminals";
 import { updateRoutes } from "./routes/update";
@@ -75,6 +76,9 @@ app.get("/api/auth/status", async (c) => {
 		registrationOpen: settings.auth.registrationOpen,
 	});
 });
+
+// Public: share download links (no auth — the share ID itself is the secret)
+app.route("/api/shares", shareRoutes);
 
 // All routes below require authentication
 app.use("/api/*", requireAuth);
