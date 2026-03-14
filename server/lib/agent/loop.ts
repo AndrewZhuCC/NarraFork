@@ -1,5 +1,5 @@
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
-import { getModelContextWindow, settings } from "../settings";
+import { getModelContextWindow, isAnthropicProvider, settings } from "../settings";
 import { StreamStaleError } from "../stream-timeout";
 import { resolveProviderAndModel } from "./provider";
 import { toolRegistry } from "./tool-registry";
@@ -270,7 +270,7 @@ export async function* agentLoop(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
-	let resolvedProvider = resolveProviderAndModel(config.model);
+	const resolvedProvider = resolveProviderAndModel(config.model);
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
 	let effectiveProvider = resolvedProvider.provider;
@@ -289,9 +289,9 @@ export async function* agentLoop(
 		allTools = allTools.filter(config.toolFilter);
 	}
 
-	// Codex provider uses native web_search — remove the WebSearch function tool
-	// to avoid duplicate search capabilities.
-	if (effectiveProvider === "codex") {
+	// Codex and Anthropic providers use native server-side web_search —
+	// remove the WebSearch function tool to avoid duplicate search capabilities.
+	if (effectiveProvider === "codex" || isAnthropicProvider(effectiveProvider)) {
 		allTools = allTools.filter((t) => t.name !== "WebSearch");
 	}
 
@@ -326,6 +326,10 @@ export async function* agentLoop(
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
 
+	// Track the last response ID from OpenAI Responses API for previous_response_id chaining.
+	// Only used by Codex provider with store: true. Reset on errors or provider switches.
+	let lastResponseId: string | undefined;
+
 	while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
 			yield { type: "error", message: "Aborted" };
@@ -343,6 +347,8 @@ export async function* agentLoop(
 					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 				}
 				pendingToolResults = replacement.pendingToolResults;
+				// History was rebuilt from DB — stored response no longer matches
+				lastResponseId = undefined;
 			}
 		}
 
@@ -363,6 +369,8 @@ export async function* agentLoop(
 						// Provider changed — rebuild tools and history for the new adapter
 						provider = newResolved.adapter;
 						tools = provider.formatTools(allTools);
+						// Stored response belongs to previous provider — invalidate
+						lastResponseId = undefined;
 
 						// Force history rebuild via onBeforeTurn so messages are
 						// re-serialised in the new provider's format.
@@ -447,6 +455,7 @@ export async function* agentLoop(
 				reasoningEffort: config.reasoningEffort,
 				serviceTier: config.serviceTier,
 				metadata: config.metadata,
+				previousResponseId: lastResponseId,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 
@@ -718,6 +727,7 @@ export async function* agentLoop(
 
 				if (parsed.messageId) messageId = parsed.messageId;
 				if (parsed.credentialId) credentialId = parsed.credentialId;
+				if (parsed.responseId) lastResponseId = parsed.responseId;
 				if (parsed.reasoning) {
 					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
 					const existing = reasoningBlockMap.get(itemKey);
@@ -819,10 +829,12 @@ export async function* agentLoop(
 					const reason = String(parsed.invalidState.reason ?? "api_error");
 					const message = String(parsed.invalidState.message ?? "Unknown provider error");
 					if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
+						lastResponseId = undefined;
 						yield { type: "context_length_exceeded", message };
 						return;
 					}
 					if (isRetryableInvalidStateReason(reason)) {
+						lastResponseId = undefined;
 						yield { type: "retryable_error", message };
 						return;
 					}
@@ -833,6 +845,7 @@ export async function* agentLoop(
 						// Don't return — fall through to yield assistant_message
 						// so the truncated content is persisted normally.
 					} else {
+						lastResponseId = undefined;
 						yield {
 							type: "invalid_state",
 							reason,
@@ -842,6 +855,8 @@ export async function* agentLoop(
 				}
 			}
 		} catch (err) {
+			// Stream error — invalidate stored response state
+			lastResponseId = undefined;
 			// Even on error, yield block_complete for accumulated content so it can be persisted
 			for (const entry of reasoningBlockMap.values()) {
 				if (entry.text || entry.providerMetadata) {
@@ -1088,7 +1103,12 @@ export async function* agentLoop(
 					isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
 				pendingToolResults.push(
-					provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
+					provider.formatToolResult(
+						tu.toolUseId,
+						outputForModel,
+						result.isError ?? false,
+						result.images,
+					),
 				);
 
 				if (yieldedToolResults.has(tu.toolUseId)) {
@@ -1194,7 +1214,12 @@ export async function* agentLoop(
 						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
 					pendingToolResults.push(
-						provider.formatToolResult(tu.toolUseId, outputForModel, result.isError ?? false),
+						provider.formatToolResult(
+							tu.toolUseId,
+							outputForModel,
+							result.isError ?? false,
+							result.images,
+						),
 					);
 
 					if (!yieldedToolResults.has(tu.toolUseId)) {
@@ -1298,6 +1323,8 @@ interface ToolExecResult {
 	broken?: boolean;
 	/** Optional metadata from the tool (e.g. line numbers for Edit). */
 	metadata?: Record<string, unknown>;
+	/** Base64-encoded images to include in the tool result (for multimodal providers). */
+	images?: Array<{ format: string; base64: string }>;
 }
 
 async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolExecResult> {
@@ -1453,6 +1480,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 				fatal: result.fatal,
 				durationMs: Date.now() - start,
 				metadata: result.metadata,
+				images: result.images,
 			};
 		}
 		const truncated = truncateOutput(result.output);
@@ -1462,6 +1490,7 @@ async function executeTool(tu: AgentToolUse, config: AgentConfig): Promise<ToolE
 			fatal: result.fatal,
 			durationMs: Date.now() - start,
 			metadata: result.metadata,
+			images: result.images,
 		};
 	} catch (err) {
 		return {

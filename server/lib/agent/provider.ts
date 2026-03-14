@@ -79,6 +79,8 @@ export interface ParsedStreamEvent {
 		query?: string;
 		queries?: string[];
 	};
+	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
+	responseId?: string;
 	/** Internal: set when Responses API format is detected from the gateway */
 	_responsesApi?: boolean;
 }
@@ -107,6 +109,8 @@ export interface ChatParams {
 	serviceTier?: string;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
 	metadata?: { user_id: string };
+	/** Previous response ID for Responses API chaining (Codex store mode) */
+	previousResponseId?: string;
 }
 
 // === The adapter interface ===
@@ -134,7 +138,12 @@ export interface ProviderAdapter {
 	chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent>;
 
 	/** Format a single tool result for the provider protocol */
-	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown;
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		isError: boolean,
+		images?: Array<{ format: string; base64: string }>,
+	): unknown;
 
 	/** Append a user turn to history (mutates in place) */
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void;

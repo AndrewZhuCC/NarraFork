@@ -9,7 +9,14 @@ import { prepareNkpRequest } from "../nkp-ext";
 import { buildNkpRequestToken } from "../nkp-token";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NKPProviderConfig } from "../settings";
-import { buildKiroHistory, buildKiroRequest, parseSSEStream } from "./kiro-protocol";
+import {
+	buildKiroHistory,
+	buildKiroRequest,
+	flushPendingToolImages,
+	type PendingToolImage,
+	parseSSEStream,
+	stashToolImages,
+} from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
@@ -30,6 +37,8 @@ function httpError(message: string, status: number): Error {
  */
 export class NkpProvider implements ProviderAdapter {
 	private config: NKPProviderConfig;
+	/** Images from tool results that need to be injected into history as user messages. */
+	private pendingToolImages: PendingToolImage[] = [];
 
 	constructor(config: NKPProviderConfig) {
 		this.config = config;
@@ -107,7 +116,15 @@ export class NkpProvider implements ProviderAdapter {
 		yield* parseSSEStream(response.body);
 	}
 
-	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown {
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		isError: boolean,
+		images?: Array<{ format: string; base64: string }>,
+	): unknown {
+		if (images?.length) {
+			stashToolImages(this.pendingToolImages, output, images);
+		}
 		return {
 			toolUseId,
 			content: [{ text: output }],
@@ -119,6 +136,9 @@ export class NkpProvider implements ProviderAdapter {
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
 		const modelId = resolveModel(model);
 		const h = history as KiroHistoryMessage[];
+
+		flushPendingToolImages(this.pendingToolImages, h, modelId);
+
 		const userMsg: KiroHistoryUserMessage = {
 			userInputMessage: {
 				content,

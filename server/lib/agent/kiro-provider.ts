@@ -5,7 +5,14 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { getToolMessage, type Locale } from "../prompt-i18n";
-import { buildKiroHistory, buildKiroRequest, parseKiroStreamEvent } from "./kiro-protocol";
+import {
+	buildKiroHistory,
+	buildKiroRequest,
+	flushPendingToolImages,
+	type PendingToolImage,
+	parseKiroStreamEvent,
+	stashToolImages,
+} from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
@@ -17,6 +24,8 @@ import type { AgentToolUse, ResolvedToolDefinition } from "./types";
  * stream parsing, and tool result formatting.
  */
 export class KiroProvider implements ProviderAdapter {
+	/** Images from tool results that need to be injected into history as user messages. */
+	private pendingToolImages: PendingToolImage[] = [];
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map((tool) => ({
 			toolSpecification: {
@@ -67,7 +76,15 @@ export class KiroProvider implements ProviderAdapter {
 		}
 	}
 
-	formatToolResult(toolUseId: string, output: string, isError: boolean): unknown {
+	formatToolResult(
+		toolUseId: string,
+		output: string,
+		isError: boolean,
+		images?: Array<{ format: string; base64: string }>,
+	): unknown {
+		if (images?.length) {
+			stashToolImages(this.pendingToolImages, output, images);
+		}
 		return {
 			toolUseId,
 			content: [{ text: output }],
@@ -78,6 +95,9 @@ export class KiroProvider implements ProviderAdapter {
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
 		const modelId = resolveModel(model);
 		const h = history as KiroHistoryMessage[];
+
+		flushPendingToolImages(this.pendingToolImages, h, modelId);
+
 		const userMsg: KiroHistoryUserMessage = {
 			userInputMessage: {
 				content,

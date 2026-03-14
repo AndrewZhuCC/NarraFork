@@ -425,30 +425,6 @@ function ProvidersPage() {
 		nkpModelsMap[group.providerId] = models;
 	}
 
-	// Provider prefix options for custom model add
-	const prefixOptions = [
-		{ value: "kiro", label: t("modelProviderKiro") },
-		{ value: "codex", label: "Codex" },
-		...serverProviders.map((p) => ({
-			value: p.prefix ?? "openai",
-			label: p.name ?? p.prefix ?? "openai",
-		})),
-		...serverAnthropicProviders.map((p) => ({
-			value: p.prefix ?? "anthropic",
-			label: p.name ?? p.prefix ?? "anthropic",
-		})),
-		...serverNkpProviders.map((p) => ({
-			value: p.prefix ?? "nkp",
-			label: p.name ?? p.prefix ?? "nkp",
-		})),
-	];
-	const seenPrefixes = new Set<string>();
-	const uniquePrefixOptions = prefixOptions.filter((o) => {
-		if (seenPrefixes.has(o.value)) return false;
-		seenPrefixes.add(o.value);
-		return true;
-	});
-
 	return (
 		<>
 			<Stack pb={80}>
@@ -464,15 +440,28 @@ function ProvidersPage() {
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isNkpProviderDirty}
 					quotas={settings?.nkpQuotas}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
 				/>
 
 				<KiroSection
 					settings={settings}
 					hiddenModels={hiddenModels}
 					onToggleHidden={toggleHidden}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
 				/>
 
-				<CodexSection hiddenModels={hiddenModels} onToggleHidden={toggleHidden} />
+				<CodexSection
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
+				/>
 
 				<OpenAIProvidersSection
 					providers={openaiProviders}
@@ -483,6 +472,8 @@ function ProvidersPage() {
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isOpenaiProviderDirty}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
 				/>
 
 				<AnthropicProvidersSection
@@ -494,17 +485,38 @@ function ProvidersPage() {
 					modelContextWindows={modelContextWindows}
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isAnthropicProviderDirty}
-				/>
-
-				<CustomModelsSection
 					customModels={customModels}
 					onCustomModelsChange={setCustomModels}
-					hiddenModels={hiddenModels}
-					onToggleHidden={toggleHidden}
-					prefixOptions={uniquePrefixOptions}
-					modelContextWindows={modelContextWindows}
-					onContextWindowChange={handleContextWindowChange}
 				/>
+
+				{/* Orphan custom models: models whose provider prefix doesn't match any configured provider */}
+				{(() => {
+					const knownPrefixes = new Set([
+						"kiro",
+						"codex",
+						...openaiProviders.map((p) => p.prefix || "openai"),
+						...anthropicProviders.map((p) => p.prefix || "anthropic"),
+						...nkpProviders.map((p) => p.prefix || "nkp"),
+					]);
+					const orphanModels = customModels.filter((m) => {
+						const prefix = m.value.split(":")[0];
+						return !knownPrefixes.has(prefix);
+					});
+					if (orphanModels.length === 0) return null;
+					return (
+						<CustomModelsSection
+							customModels={customModels}
+							onCustomModelsChange={setCustomModels}
+							hiddenModels={hiddenModels}
+							onToggleHidden={toggleHidden}
+							prefixOptions={[]}
+							modelContextWindows={modelContextWindows}
+							onContextWindowChange={handleContextWindowChange}
+							orphanOnly
+							orphanModels={orphanModels}
+						/>
+					);
+				})()}
 			</Stack>
 
 			<Affix position={{ bottom: 24, right: 24 }}>

@@ -437,3 +437,63 @@ export async function buildKiroHistory(
 
 	return { history, trailingToolResults: pendingToolResults };
 }
+
+// ── Shared image helpers for KiroProvider / NkpProvider ──
+
+/** Pending tool images waiting to be injected into history. */
+export interface PendingToolImage {
+	images: KiroImage[];
+	label: string;
+}
+
+/** Extract a human-readable file name from the Read tool's image output placeholder. */
+export function extractImageFileName(output: string): string | null {
+	const m = output.match(/\[Image:\s*(.+?)\s*\(/);
+	return m?.[1] ?? null;
+}
+
+/**
+ * Stash images from a tool result into the pending queue.
+ * Kiro protocol doesn't support images in tool results, so they are
+ * surfaced as separate user messages in `flushPendingToolImages`.
+ */
+export function stashToolImages(
+	pending: PendingToolImage[],
+	output: string,
+	images: Array<{ format: string; base64: string }>,
+): void {
+	const label = extractImageFileName(output) ?? "image";
+	pending.push({
+		images: images.map((img) => ({
+			format: img.format as KiroImage["format"],
+			source: { bytes: img.base64 },
+		})),
+		label,
+	});
+}
+
+/**
+ * Flush pending tool images into history as user→assistant pairs.
+ * Mutates `history` in place and empties `pending`.
+ */
+export function flushPendingToolImages(
+	pending: PendingToolImage[],
+	history: KiroHistoryMessage[],
+	modelId: string,
+): void {
+	for (const entry of pending) {
+		history.push({
+			userInputMessage: {
+				content: `${entry.label} 的内容：`,
+				modelId,
+				origin: "AI_EDITOR",
+				images: entry.images,
+				userInputMessageContext: {},
+			},
+		});
+		history.push({
+			assistantResponseMessage: { content: "OK" },
+		});
+	}
+	pending.length = 0;
+}

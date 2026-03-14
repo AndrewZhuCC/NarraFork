@@ -33,6 +33,8 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
+import type { CustomModelEntry } from "./InlineCustomModels";
+import { InlineCustomModels } from "./InlineCustomModels";
 import { classifyKiroTier, type KiroAccountTier, TIER_CONFIG } from "./types";
 
 function relativeTime(iso: string | undefined): string {
@@ -54,9 +56,21 @@ interface KiroSectionProps {
 	settings: any;
 	hiddenModels: string[];
 	onToggleHidden: (modelVal: string) => void;
+	customModels: CustomModelEntry[];
+	onCustomModelsChange: (models: CustomModelEntry[]) => void;
+	modelContextWindows: Record<string, number>;
+	onContextWindowChange: (modelVal: string, size: number | null) => void;
 }
 
-export function KiroSection({ settings, hiddenModels, onToggleHidden }: KiroSectionProps) {
+export function KiroSection({
+	settings,
+	hiddenModels,
+	onToggleHidden,
+	customModels,
+	onCustomModelsChange,
+	modelContextWindows,
+	onContextWindowChange,
+}: KiroSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const [expanded, setExpanded] = useState(true);
@@ -390,6 +404,15 @@ export function KiroSection({ settings, hiddenModels, onToggleHidden }: KiroSect
 												</Group>
 											);
 										})}
+										<InlineCustomModels
+											prefix="kiro"
+											customModels={customModels}
+											onCustomModelsChange={onCustomModelsChange}
+											hiddenModels={hiddenModels}
+											onToggleHidden={onToggleHidden}
+											modelContextWindows={modelContextWindows}
+											onContextWindowChange={onContextWindowChange}
+										/>
 									</Stack>
 								</Collapse>
 							</Stack>

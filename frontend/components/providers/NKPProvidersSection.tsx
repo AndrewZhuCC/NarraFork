@@ -27,6 +27,8 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
+import type { CustomModelEntry } from "./InlineCustomModels";
+import { InlineCustomModels } from "./InlineCustomModels";
 import type { NKPProviderState } from "./types";
 
 interface NKPProvidersSectionProps {
@@ -39,6 +41,8 @@ interface NKPProvidersSectionProps {
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
 	quotas?: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }>;
+	customModels: CustomModelEntry[];
+	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 }
 
 export function NKPProvidersSection({
@@ -51,6 +55,8 @@ export function NKPProvidersSection({
 	onContextWindowChange,
 	isProviderDirty,
 	quotas,
+	customModels,
+	onCustomModelsChange,
 }: NKPProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -276,6 +282,15 @@ export function NKPProvidersSection({
 												})}
 											</Stack>
 										)}
+										<InlineCustomModels
+											prefix={p.prefix || "nkp"}
+											customModels={customModels}
+											onCustomModelsChange={onCustomModelsChange}
+											hiddenModels={hiddenModels}
+											onToggleHidden={onToggleHidden}
+											modelContextWindows={modelContextWindows}
+											onContextWindowChange={onContextWindowChange}
+										/>
 									</Stack>
 								</Collapse>
 							</Stack>
