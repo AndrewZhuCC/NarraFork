@@ -20,41 +20,30 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	const history = params.history as KiroHistoryMessage[];
 	const toolResults = params.toolResults as KiroToolResult[];
 
-	// Convert generic images to KiroImage format
-	const kiroImages: KiroImage[] | undefined = params.images?.length
-		? params.images.map((img) => ({
+	// Collect all images for the current message:
+	// 1. User-uploaded images from params.images
+	// 2. Images extracted from tool results (Read tool image output)
+	const allImages: KiroImage[] = [];
+
+	if (params.images?.length) {
+		for (const img of params.images) {
+			allImages.push({
 				format: img.format as "jpeg" | "png" | "gif" | "webp",
 				source: { bytes: img.base64 },
-			}))
-		: undefined;
-
-	// Extract images attached to tool results (Read tool image output).
-	// Kiro protocol doesn't support images inside tool results, so we strip
-	// the _images marker and append separate user messages with the images.
-	const imageMessages: KiroHistoryUserMessage[] = [];
-	for (const tr of toolResults) {
-		const tagged = tr as KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string };
-		if (tagged._images?.length) {
-			imageMessages.push({
-				userInputMessage: {
-					content: tagged._imageLabel ?? "image",
-					modelId,
-					origin: "AI_EDITOR",
-					images: tagged._images,
-					userInputMessageContext: {},
-				},
 			});
-			// Clean up internal markers before sending to API
-			delete tagged._images;
-			delete tagged._imageLabel;
 		}
 	}
 
-	// If there are image messages, append them to history so the model sees
-	// them in the current turn: ... → user(tool_results) → user(image)
-	if (imageMessages.length > 0) {
-		for (const msg of imageMessages) {
-			history.push(msg);
+	// Extract images attached to tool results (Read tool image output).
+	// Kiro protocol doesn't support images inside tool results, so we strip
+	// the _images marker and merge them into the currentMessage images.
+	for (const tr of toolResults) {
+		const tagged = tr as KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string };
+		if (tagged._images?.length) {
+			allImages.push(...tagged._images);
+			// Clean up internal markers before sending to API
+			delete tagged._images;
+			delete tagged._imageLabel;
 		}
 	}
 
@@ -70,7 +59,7 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 					content: params.content,
 					modelId,
 					origin: "AI_EDITOR",
-					...(kiroImages ? { images: kiroImages } : {}),
+					...(allImages.length > 0 ? { images: allImages } : {}),
 					userInputMessageContext: {
 						// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 						tools: params.tools as any[],
