@@ -28,6 +28,36 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 			}))
 		: undefined;
 
+	// Extract images attached to tool results (Read tool image output).
+	// Kiro protocol doesn't support images inside tool results, so we strip
+	// the _images marker and append separate user messages with the images.
+	const imageMessages: KiroHistoryUserMessage[] = [];
+	for (const tr of toolResults) {
+		const tagged = tr as KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string };
+		if (tagged._images?.length) {
+			imageMessages.push({
+				userInputMessage: {
+					content: tagged._imageLabel ?? "image",
+					modelId,
+					origin: "AI_EDITOR",
+					images: tagged._images,
+					userInputMessageContext: {},
+				},
+			});
+			// Clean up internal markers before sending to API
+			delete tagged._images;
+			delete tagged._imageLabel;
+		}
+	}
+
+	// If there are image messages, append them to history so the model sees
+	// them in the current turn: ... → user(tool_results) → user(image)
+	if (imageMessages.length > 0) {
+		for (const msg of imageMessages) {
+			history.push(msg);
+		}
+	}
+
 	return {
 		conversationState: {
 			conversationId: params.conversationId,
@@ -440,59 +470,8 @@ export async function buildKiroHistory(
 
 // ── Shared image helpers for KiroProvider / NkpProvider ──
 
-/** Pending tool images waiting to be injected into history. */
-export interface PendingToolImage {
-	images: KiroImage[];
-	label: string;
-}
-
 /** Extract a human-readable file name from the Read tool's image output placeholder. */
 export function extractImageFileName(output: string): string | null {
 	const m = output.match(/\[Image:\s*(.+?)\s*\(/);
 	return m?.[1] ?? null;
-}
-
-/**
- * Stash images from a tool result into the pending queue.
- * Kiro protocol doesn't support images in tool results, so they are
- * surfaced as separate user messages in `flushPendingToolImages`.
- */
-export function stashToolImages(
-	pending: PendingToolImage[],
-	output: string,
-	images: Array<{ format: string; base64: string }>,
-): void {
-	const label = extractImageFileName(output) ?? "image";
-	pending.push({
-		images: images.map((img) => ({
-			format: img.format as KiroImage["format"],
-			source: { bytes: img.base64 },
-		})),
-		label,
-	});
-}
-
-/**
- * Flush pending tool images into history as user messages.
- * Mutates `history` in place and empties `pending`.
- * Must be called AFTER the tool results user message so the
- * tool_use → tool_result pairing is not broken.
- */
-export function flushPendingToolImages(
-	pending: PendingToolImage[],
-	history: KiroHistoryMessage[],
-	modelId: string,
-): void {
-	for (const entry of pending) {
-		history.push({
-			userInputMessage: {
-				content: `${entry.label} 的内容：`,
-				modelId,
-				origin: "AI_EDITOR",
-				images: entry.images,
-				userInputMessageContext: {},
-			},
-		});
-	}
-	pending.length = 0;
 }

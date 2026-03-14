@@ -3,6 +3,7 @@ import type {
 	KiroHistoryAssistantMessage,
 	KiroHistoryMessage,
 	KiroHistoryUserMessage,
+	KiroImage,
 	KiroToolResult,
 } from "../kiro-adapter";
 import { prepareNkpRequest } from "../nkp-ext";
@@ -12,10 +13,8 @@ import type { NKPProviderConfig } from "../settings";
 import {
 	buildKiroHistory,
 	buildKiroRequest,
-	flushPendingToolImages,
-	type PendingToolImage,
+	extractImageFileName,
 	parseSSEStream,
-	stashToolImages,
 } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
 import { resolveModel } from "./resolve-model";
@@ -37,8 +36,6 @@ function httpError(message: string, status: number): Error {
  */
 export class NkpProvider implements ProviderAdapter {
 	private config: NKPProviderConfig;
-	/** Images from tool results that need to be injected into history as user messages. */
-	private pendingToolImages: PendingToolImage[] = [];
 
 	constructor(config: NKPProviderConfig) {
 		this.config = config;
@@ -122,15 +119,20 @@ export class NkpProvider implements ProviderAdapter {
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
 	): unknown {
-		if (images?.length) {
-			stashToolImages(this.pendingToolImages, output, images);
-		}
-		return {
+		const result: KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string } = {
 			toolUseId,
 			content: [{ text: output }],
 			status: isError ? "error" : "success",
 			isError,
-		} satisfies KiroToolResult;
+		};
+		if (images?.length) {
+			result._images = images.map((img) => ({
+				format: img.format as KiroImage["format"],
+				source: { bytes: img.base64 },
+			}));
+			result._imageLabel = extractImageFileName(output) ?? "image";
+		}
+		return result;
 	}
 
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
@@ -147,10 +149,6 @@ export class NkpProvider implements ProviderAdapter {
 			},
 		};
 		h.push(userMsg);
-
-		// Flush pending images AFTER the tool results user message so the
-		// tool_use → tool_result pairing is preserved.
-		flushPendingToolImages(this.pendingToolImages, h, modelId);
 	}
 
 	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
