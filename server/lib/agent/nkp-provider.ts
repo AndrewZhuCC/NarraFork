@@ -39,6 +39,8 @@ export class NkpProvider implements ProviderAdapter {
 	private config: NKPProviderConfig;
 	/** Images from tool results that need to be injected into history as user messages. */
 	private pendingToolImages: PendingToolImage[] = [];
+	/** Last modelId seen in pushUserTurn, used by pushAssistantTurn to flush images. */
+	private lastModelId = "";
 
 	constructor(config: NKPProviderConfig) {
 		this.config = config;
@@ -135,9 +137,8 @@ export class NkpProvider implements ProviderAdapter {
 
 	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
 		const modelId = resolveModel(model);
+		this.lastModelId = modelId;
 		const h = history as KiroHistoryMessage[];
-
-		flushPendingToolImages(this.pendingToolImages, h, modelId);
 
 		const userMsg: KiroHistoryUserMessage = {
 			userInputMessage: {
@@ -168,6 +169,13 @@ export class NkpProvider implements ProviderAdapter {
 			},
 		};
 		h.push(assistantMsg);
+
+		// Flush pending images AFTER the assistant turn so the history stays
+		// well-formed: ... → assistant(tool_use) → user(image) → assistant("OK")
+		// The next pushUserTurn will append the new tool results after this.
+		if (this.pendingToolImages.length > 0) {
+			flushPendingToolImages(this.pendingToolImages, h, this.lastModelId);
+		}
 	}
 
 	async generate(text: string, model: string): Promise<string> {
