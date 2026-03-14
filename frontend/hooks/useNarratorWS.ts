@@ -79,7 +79,13 @@ interface NarratorWSCallbacks {
 		queries?: string[],
 	) => void;
 	onNarratorError?: (error: string) => void;
-	onNarratorWarning?: (message: string) => void;
+	onNarratorWarning?: (info: {
+		message: string;
+		retryCount?: number;
+		maxRetries?: number;
+		delayMs?: number;
+	}) => void;
+	onModelChanged?: (model: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
@@ -344,7 +350,18 @@ export function useNarratorWS(
 						callbacksRef.current.onNarratorError?.(data.error as string);
 						break;
 					case "warning":
-						callbacksRef.current.onNarratorWarning?.(data.message as string);
+						callbacksRef.current.onNarratorWarning?.({
+							message: data.message as string,
+							retryCount: data.retryCount as number | undefined,
+							maxRetries: data.maxRetries as number | undefined,
+							delayMs: data.delayMs as number | undefined,
+						});
+						break;
+					case "model_changed":
+					case "model_switched":
+						if (data.model) {
+							callbacksRef.current.onModelChanged?.(data.model as string);
+						}
 						break;
 					case "catch_up": {
 						const topLevel = (data.topLevel ?? []) as TreeMessage[];

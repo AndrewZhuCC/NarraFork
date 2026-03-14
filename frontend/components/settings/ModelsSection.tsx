@@ -82,10 +82,10 @@ export function ModelsSection({
 				description={t("codexDefaultReasoningEffortDesc")}
 				data={[
 					{ value: "auto", label: tn("reasoning_auto") },
+					{ value: "none", label: tn("reasoning_none") },
 					{ value: "low", label: tn("reasoning_low") },
 					{ value: "medium", label: tn("reasoning_medium") },
 					{ value: "high", label: tn("reasoning_high") },
-					{ value: "xhigh", label: tn("reasoning_xhigh") },
 				]}
 				value={codexDefaultReasoningEffort || "auto"}
 				onChange={(v) => setCodexDefaultReasoningEffort(v === "auto" ? "" : (v ?? ""))}

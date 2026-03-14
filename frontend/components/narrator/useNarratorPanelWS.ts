@@ -38,6 +38,14 @@ export interface ViewerInfo {
 	avatarImageId: string | null;
 }
 
+export interface RetryInfo {
+	message: string;
+	retryCount: number;
+	maxRetries: number;
+	/** Timestamp (ms) when the retry delay expires */
+	retryAt: number;
+}
+
 export interface UseNarratorPanelWSOptions {
 	narratorId: string;
 	narratorStatus?: string;
@@ -97,6 +105,8 @@ export interface UseNarratorPanelWSReturn {
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
 	nkpQuotaBalance: number | null;
+	// Retry
+	retryInfo: RetryInfo | null;
 	// Todos
 	currentTodos: TodoItem[] | null;
 	todosToolUseId: string | null;
@@ -250,6 +260,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
 	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(null);
+	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
 
 	// --- Viewers ---
@@ -1029,6 +1040,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status) => {
 				setIsCompacting(false);
+				setRetryInfo(null);
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
 				// residual streaming text / tool chunks must be flushed.
@@ -1138,13 +1150,26 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 8000,
 				});
 			},
-			onNarratorWarning: (message) => {
+			onNarratorWarning: (info) => {
+				if (info.retryCount != null && info.maxRetries != null && info.delayMs != null) {
+					setRetryInfo({
+						message: info.message,
+						retryCount: info.retryCount,
+						maxRetries: info.maxRetries,
+						retryAt: Date.now() + info.delayMs,
+					});
+				}
 				notifications.show({
 					title: t("narratorRetrying"),
-					message,
+					message: info.message,
 					color: "yellow",
 					autoClose: 10000,
 				});
+			},
+			onModelChanged: (model) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, model } : old,
+				);
 			},
 			onCatchUp: (orphanChildren, topLevel) => {
 				// Clean up any residual streaming chunks from before the disconnect
@@ -1555,6 +1580,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId,
 		prunedPercent,
 		nkpQuotaBalance,
+		retryInfo,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,
