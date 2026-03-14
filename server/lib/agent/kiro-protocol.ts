@@ -473,8 +473,10 @@ export function stashToolImages(
 }
 
 /**
- * Flush pending tool images into history as user→assistant pairs.
+ * Flush pending tool images into history as user messages.
  * Mutates `history` in place and empties `pending`.
+ * Must be called AFTER the tool results user message so the
+ * tool_use → tool_result pairing is not broken.
  */
 export function flushPendingToolImages(
 	pending: PendingToolImage[],
@@ -490,9 +492,6 @@ export function flushPendingToolImages(
 				images: entry.images,
 				userInputMessageContext: {},
 			},
-		});
-		history.push({
-			assistantResponseMessage: { content: "OK" },
 		});
 	}
 	pending.length = 0;
