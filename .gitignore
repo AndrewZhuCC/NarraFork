@@ -20,3 +20,4 @@ analyze2/
 script/
 scripts/
 .release.local.json
+mitm-dump/
