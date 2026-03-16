@@ -174,6 +174,7 @@ function SettingsPage() {
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
+	const [maxTransientRetries, setMaxTransientRetries] = useState(10);
 	const [codexDefaultReasoningEffort, setCodexDefaultReasoningEffort] = useState("high");
 	const [globalWhitelistDirs, setGlobalWhitelistDirs] = useState<
 		Array<{ path: string; accessLevel: string; enabled?: boolean }>
@@ -230,6 +231,7 @@ function SettingsPage() {
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
+		maxTransientRetries: 10,
 		codexDefaultReasoningEffort: "high",
 		globalWhitelistDirs: [] as Array<{
 			path: string;
@@ -278,6 +280,7 @@ function SettingsPage() {
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
+				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				codexDefaultReasoningEffort: settings.codex?.defaultReasoningEffort ?? "",
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
@@ -308,6 +311,7 @@ function SettingsPage() {
 			setTranslateReasoning(snap.translateReasoning);
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setSmartInterruptionCheck(snap.smartInterruptionCheck);
+			setMaxTransientRetries(snap.maxTransientRetries);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
 			setGlobalWhitelistDirs(snap.globalWhitelistDirs);
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
@@ -344,6 +348,7 @@ function SettingsPage() {
 			translateReasoning !== s.translateReasoning ||
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			smartInterruptionCheck !== s.smartInterruptionCheck ||
+			maxTransientRetries !== s.maxTransientRetries ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
@@ -375,6 +380,7 @@ function SettingsPage() {
 		translateReasoning,
 		defaultRelaxedPlan,
 		smartInterruptionCheck,
+		maxTransientRetries,
 		codexDefaultReasoningEffort,
 		globalWhitelistDirs,
 		globalBlacklistDirs,
@@ -415,6 +421,7 @@ function SettingsPage() {
 					translateReasoning,
 					defaultRelaxedPlan,
 					smartInterruptionCheck,
+					maxTransientRetries,
 					whitelistDirs: globalWhitelistDirs,
 					blacklistDirs: globalBlacklistDirs,
 					commandWhitelist: globalCommandWhitelist,
@@ -467,6 +474,7 @@ function SettingsPage() {
 						translateReasoning,
 						defaultRelaxedPlan,
 						smartInterruptionCheck,
+						maxTransientRetries,
 						codexDefaultReasoningEffort,
 						globalWhitelistDirs,
 						globalBlacklistDirs,
@@ -561,6 +569,8 @@ function SettingsPage() {
 							setDefaultRelaxedPlan={setDefaultRelaxedPlan}
 							smartInterruptionCheck={smartInterruptionCheck}
 							setSmartInterruptionCheck={setSmartInterruptionCheck}
+							maxTransientRetries={maxTransientRetries}
+							setMaxTransientRetries={setMaxTransientRetries}
 							globalWhitelistDirs={globalWhitelistDirs}
 							setGlobalWhitelistDirs={setGlobalWhitelistDirs}
 							globalBlacklistDirs={globalBlacklistDirs}

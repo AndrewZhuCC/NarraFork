@@ -52,10 +52,10 @@ import {
 import { executeAgentLoop } from "./narrator-executor";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
+	getMaxTransientRetries,
 	handleContextOverflow,
 	handleTransientError,
 	MAX_CONTEXT_OVERFLOW_RETRIES,
-	MAX_TRANSIENT_RETRIES,
 } from "./narrator-recovery";
 import { narratorService } from "./narrator-service";
 import { generateAndSetTitle, generateQuickTitle } from "./narrator-title";
@@ -2552,10 +2552,12 @@ async function runAgentLoop(
 
 				if (overflow.action === "retry_pruned") {
 					active._pruneBoundaryMessageId = overflow.boundaryMessageId;
+					transientRetries = 0;
 					continue;
 				}
 				if (overflow.action === "retry_compacted") {
 					active.conversationId = overflow.newConversationId;
+					transientRetries = 0;
 					continue;
 				}
 
@@ -2577,11 +2579,16 @@ async function runAgentLoop(
 					narratorId,
 					error: result.retryableError,
 					retryCount: transientRetries,
-					maxRetries: MAX_TRANSIENT_RETRIES,
+					maxRetries: getMaxTransientRetries(),
 					signal: active.abortController.signal,
 				});
 				if (shouldRetry) {
 					continue;
+				}
+				// If aborted during backoff sleep, don't mark as error — the
+				// interrupt handler will set the correct status.
+				if (!active.alive) {
+					break;
 				}
 				await narratorService.updateStatus(narratorId, "error", result.retryableError);
 				active.events.emit("event", {
