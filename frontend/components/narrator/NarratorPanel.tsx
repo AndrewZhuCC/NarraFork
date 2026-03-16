@@ -2563,11 +2563,16 @@ export function NarratorPanel({
 									truncate
 								>
 									{isRetrying
-										? t("retryingCountdown", {
-												count: retryInfo?.retryCount,
-												max: retryInfo?.maxRetries,
-												seconds: retryCountdown,
-											})
+										? retryCountdown > 0
+											? t("retryingCountdown", {
+													count: retryInfo?.retryCount,
+													max: retryInfo?.maxRetries,
+													seconds: retryCountdown,
+												})
+											: t("retryingNow", {
+													count: retryInfo?.retryCount,
+													max: retryInfo?.maxRetries,
+												})
 										: isCompacting
 											? t("compacting")
 											: activeTodo
