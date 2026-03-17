@@ -30,7 +30,7 @@ export const Route = createFileRoute("/admin/beta-trial")({
 
 const BETA_PROVIDER_NAME = "内测";
 const BETA_PROVIDER_PREFIX = "dome";
-const BETA_BASE_URL = "https://nkp.domexie.cn";
+const BETA_BASE_URL = "https://nkp.b.domexie.cn";
 
 function BetaTrialPage() {
 	const { t } = useTranslation("settings");
@@ -162,7 +162,7 @@ function BetaTrialPage() {
 							{t("betaTrialStep1Desc")}
 						</Text>
 						<Anchor
-							href="https://nkp.domexie.cn"
+							href="https://nkp.b.domexie.cn"
 							target="_blank"
 							rel="noopener noreferrer"
 							size="sm"
