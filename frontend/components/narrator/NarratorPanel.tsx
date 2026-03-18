@@ -2089,6 +2089,14 @@ export function NarratorPanel({
 							<ActionIcon
 								size="xs"
 								variant="subtle"
+								onClick={startEditingTitle}
+								title={t("editTitle")}
+							>
+								<IconPencil size={12} />
+							</ActionIcon>
+							<ActionIcon
+								size="xs"
+								variant="subtle"
 								onClick={handleGenerateTitle}
 								loading={generatingTitle}
 								title={t("generateTitle")}
