@@ -126,6 +126,7 @@
 	"reasoning_low": "低",
 	"reasoning_medium": "中",
 	"reasoning_high": "高",
+	"reasoning_xhigh": "超高",
 	"reasoning_none": "关闭",
 	"nkpProvidersSection": "NKP 供应商",
 	"nkpProvidersSectionDesc": "配置 NKP（Native Kiro Proxy）端点，通过远程 Kiro 协议代理访问模型",

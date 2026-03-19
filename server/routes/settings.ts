@@ -146,7 +146,10 @@ const updateSettingsSchema = z
 			.object({
 				proxy: z.string().optional(),
 				loadBalancingMode: z.enum(["priority", "balanced"]).optional(),
-				defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+				defaultReasoningEffort: z
+					.enum(["none", "low", "medium", "high", "xhigh"])
+					.nullable()
+					.optional(),
 			})
 			.partial()
 			.optional(),

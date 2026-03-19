@@ -326,10 +326,6 @@ export async function* agentLoop(
 	// Consumed once and reset to empty after use.
 	let nextTurnContent = "";
 
-	// Track the last response ID from OpenAI Responses API for previous_response_id chaining.
-	// Only used by Codex provider with store: true. Reset on errors or provider switches.
-	let lastResponseId: string | undefined;
-
 	while (turnIndex < maxTurns) {
 		if (config.signal.aborted) {
 			yield { type: "error", message: "Aborted" };
@@ -347,8 +343,6 @@ export async function* agentLoop(
 					provider.injectSystemPrompt(history, config.systemPrompt, effectiveModel, config.locale);
 				}
 				pendingToolResults = replacement.pendingToolResults;
-				// History was rebuilt from DB — stored response no longer matches
-				lastResponseId = undefined;
 			}
 		}
 
@@ -369,8 +363,6 @@ export async function* agentLoop(
 						// Provider changed — rebuild tools and history for the new adapter
 						provider = newResolved.adapter;
 						tools = provider.formatTools(allTools);
-						// Stored response belongs to previous provider — invalidate
-						lastResponseId = undefined;
 
 						// Force history rebuild via onBeforeTurn so messages are
 						// re-serialised in the new provider's format.
@@ -455,7 +447,6 @@ export async function* agentLoop(
 				reasoningEffort: config.reasoningEffort,
 				serviceTier: config.serviceTier,
 				metadata: config.metadata,
-				previousResponseId: lastResponseId,
 				...(isFirstTurn && images?.length ? { images } : {}),
 			});
 
@@ -727,7 +718,7 @@ export async function* agentLoop(
 
 				if (parsed.messageId) messageId = parsed.messageId;
 				if (parsed.credentialId) credentialId = parsed.credentialId;
-				if (parsed.responseId) lastResponseId = parsed.responseId;
+
 				if (parsed.reasoning) {
 					const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
 					const existing = reasoningBlockMap.get(itemKey);
@@ -829,12 +820,10 @@ export async function* agentLoop(
 					const reason = String(parsed.invalidState.reason ?? "api_error");
 					const message = String(parsed.invalidState.message ?? "Unknown provider error");
 					if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
-						lastResponseId = undefined;
 						yield { type: "context_length_exceeded", message };
 						return;
 					}
 					if (isRetryableInvalidStateReason(reason)) {
-						lastResponseId = undefined;
 						yield { type: "retryable_error", message };
 						return;
 					}
@@ -845,7 +834,6 @@ export async function* agentLoop(
 						// Don't return — fall through to yield assistant_message
 						// so the truncated content is persisted normally.
 					} else {
-						lastResponseId = undefined;
 						yield {
 							type: "invalid_state",
 							reason,
@@ -855,8 +843,6 @@ export async function* agentLoop(
 				}
 			}
 		} catch (err) {
-			// Stream error — invalidate stored response state
-			lastResponseId = undefined;
 			// Even on error, yield block_complete for accumulated content so it can be persisted
 			for (const entry of reasoningBlockMap.values()) {
 				if (entry.text || entry.providerMetadata) {

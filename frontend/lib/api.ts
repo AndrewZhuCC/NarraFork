@@ -1663,7 +1663,7 @@ export const api = {
 			available: number;
 			stickySessionCount: number;
 			globalProxy?: string;
-			defaultReasoningEffort?: "none" | "low" | "medium" | "high";
+			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
 			usageCache: Record<
 				string,
 				{
@@ -1770,11 +1770,13 @@ export const api = {
 			body: JSON.stringify({ proxy }),
 		}),
 	codexGetDefaultReasoningEffort: () =>
-		request<{ reasoningEffort: "none" | "low" | "medium" | "high" | null }>(
+		request<{ reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null }>(
 			"/codex/default-reasoning-effort",
 		),
-	codexSetDefaultReasoningEffort: (reasoningEffort?: "none" | "low" | "medium" | "high" | null) =>
-		request<{ ok: boolean; reasoningEffort: "none" | "low" | "medium" | "high" | null }>(
+	codexSetDefaultReasoningEffort: (
+		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | null,
+	) =>
+		request<{ ok: boolean; reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | null }>(
 			"/codex/default-reasoning-effort",
 			{
 				method: "POST",

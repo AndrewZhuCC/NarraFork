@@ -126,6 +126,7 @@
 	"reasoning_low": "Low",
 	"reasoning_medium": "Medium",
 	"reasoning_high": "High",
+	"reasoning_xhigh": "X-High",
 	"reasoning_none": "Off",
 	"nkpProvidersSection": "NKP Providers",
 	"nkpProvidersSectionDesc": "Configure NKP (Native Kiro Proxy) endpoints for remote Kiro protocol access",
