@@ -17,6 +17,7 @@ import { authRoutes } from "./routes/auth";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
 import { codexRoutes } from "./routes/codex";
+import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dependencyRoutes } from "./routes/dependencies";
 import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
@@ -99,6 +100,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/update",
 	"/api/routines",
 	"/api/skills",
+	"/api/custom-subagents",
 	"/api/kiro",
 	"/api/openai",
 	"/api/codex",
@@ -135,6 +137,7 @@ app.route("/api/codex", codexRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);
+app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);
 app.route("/api/update", updateRoutes);
