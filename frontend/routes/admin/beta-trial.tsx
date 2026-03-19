@@ -16,7 +16,7 @@ import {
 	Title,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { IconArrowLeft, IconCheck, IconGift, IconKey, IconUsers } from "@tabler/icons-react";
+import { IconArrowLeft, IconCheck, IconKey, IconServer, IconUsers } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { nanoid } from "nanoid";
@@ -28,7 +28,7 @@ export const Route = createFileRoute("/admin/beta-trial")({
 	component: BetaTrialPage,
 });
 
-const BETA_PROVIDER_NAME = "内测";
+const BETA_PROVIDER_NAME = "NarraFork 官方";
 const BETA_PROVIDER_PREFIX = "dome";
 const BETA_BASE_URL = "https://nkp.b.domexie.cn";
 
@@ -123,7 +123,7 @@ function BetaTrialPage() {
 			</Group>
 
 			<Group gap="sm">
-				<IconGift size={28} color="var(--mantine-color-yellow-5)" />
+				<IconServer size={28} color="var(--mantine-color-indigo-5)" />
 				<Title order={2}>{t("betaTrialTitle")}</Title>
 			</Group>
 
