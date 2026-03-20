@@ -4,6 +4,7 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
+import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
 import { KiroSection } from "../../components/providers/KiroSection";
@@ -475,6 +476,16 @@ function ProvidersPage() {
 					onContextWindowChange={handleContextWindowChange}
 				/>
 
+				<ClineSection
+					settings={settings}
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
+				/>
+
 				<OpenAIProvidersSection
 					providers={openaiProviders}
 					onProvidersChange={setOpenaiProviders}
@@ -508,6 +519,7 @@ function ProvidersPage() {
 					const knownPrefixes = new Set([
 						"kiro",
 						"codex",
+						"cline",
 						...openaiProviders.map((p) => p.prefix || "openai"),
 						...anthropicProviders.map((p) => p.prefix || "anthropic"),
 						...nkpProviders.map((p) => p.prefix || "nkp"),

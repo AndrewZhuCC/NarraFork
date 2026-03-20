@@ -1,13 +1,16 @@
 import { isKiroAvailable } from "../kiro-adapter";
 import {
 	getAnthropicProviderConfig,
+	getClineProviderConfig,
 	getNkpProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
+	resolveEffectiveModel,
 	resolveProvider,
 	settings,
 } from "../settings";
 import { AnthropicProvider } from "./anthropic-provider";
+import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
 import { KiroProvider } from "./kiro-provider";
 import { NkpProvider } from "./nkp-provider";
@@ -207,6 +210,11 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new OpenAIProvider(openaiConfig);
 	}
 
+	const clineConfig = getClineProviderConfig(provider);
+	if (clineConfig) {
+		return new ClineProvider(clineConfig);
+	}
+
 	return null;
 }
 
@@ -237,6 +245,11 @@ function defaultModelForProvider(provider: string): string | null {
 	const nkp = getNkpProviderConfig(provider);
 	if (nkp?.defaultModel) {
 		return `${provider}:${nkp.defaultModel}`;
+	}
+
+	const cline = getClineProviderConfig(provider);
+	if (cline?.defaultModel) {
+		return `${provider}:${cline.defaultModel}`;
 	}
 
 	const custom = settings.agent.customModels ?? [];
@@ -277,7 +290,7 @@ function buildResolution(
 }
 
 export function resolveProviderAndModel(model?: string): ProviderResolution {
-	const requestedModel = model ?? settings.agent.defaultModel;
+	const requestedModel = resolveEffectiveModel(model);
 	const requestedProvider = resolveProvider(requestedModel);
 
 	if (requestedProvider === "kiro") {

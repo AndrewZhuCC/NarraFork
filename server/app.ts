@@ -16,6 +16,7 @@ import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
+import { clineRoutes } from "./routes/cline";
 import { codexRoutes } from "./routes/codex";
 import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dependencyRoutes } from "./routes/dependencies";
@@ -104,6 +105,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/kiro",
 	"/api/openai",
 	"/api/codex",
+	"/api/cline",
 	"/api/anthropic",
 	"/api/nkp",
 ];
@@ -134,6 +136,7 @@ app.route("/api/notifications", notificationRoutes);
 app.route("/api/kiro", kiroRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/codex", codexRoutes);
+app.route("/api/cline", clineRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);

@@ -19,6 +19,7 @@ import {
 } from "../lib/validators";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped } from "./anthropic";
+import { getClineEnabledModelsGrouped } from "./cline";
 import { getAllNkpCachedQuotas, getNkpCachedModelsGrouped } from "./nkp";
 import { getOpenaiCachedModels, getOpenaiCachedModelsGrouped } from "./openai";
 
@@ -59,6 +60,16 @@ const nkpProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
+});
+
+const clineProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	baseUrl: z.string(),
+	accessToken: z.string().optional(),
+	defaultModel: z.string(),
+	defaultContextWindow: z.number().int().min(1).optional(),
 });
 
 /** Only non-sensitive, user-editable fields are allowed. auth.jwtSecret is excluded. */
@@ -142,6 +153,7 @@ const updateSettingsSchema = z
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nkpProviders: z.array(nkpProviderSchema).optional(),
+		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
 			.object({
 				proxy: z.string().optional(),
@@ -223,11 +235,16 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		clineProviders: (s.clineProviders ?? []).map((p) => ({
+			...p,
+			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
+		})),
 		kiroModels: isKiroAvailable() ? kiroGetCachedModels() : null,
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nkpModelsGrouped: getNkpCachedModelsGrouped(),
+		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		nkpQuotas: getAllNkpCachedQuotas(),
 		codexAvailable: codexSnapshot.available > 0,
 		codexModels: getBuiltinCodexModels(),
@@ -285,11 +302,27 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real access tokens for Cline providers
+	if (validated.clineProviders) {
+		const currentProviders = current.clineProviders ?? [];
+		for (const p of validated.clineProviders) {
+			if (p.accessToken?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.accessToken = existing?.accessToken ?? "";
+			}
+		}
+	}
+
 	// Deep merge: iterate top-level keys
 	const merged = { ...current } as NarraForkSettings;
 	for (const key of Object.keys(validated) as Array<keyof typeof validated>) {
 		const val = validated[key];
-		if (key === "openaiProviders" || key === "anthropicProviders" || key === "nkpProviders") {
+		if (
+			key === "openaiProviders" ||
+			key === "anthropicProviders" ||
+			key === "nkpProviders" ||
+			key === "clineProviders"
+		) {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
@@ -334,6 +367,10 @@ settingsRoutes.patch("/", async (c) => {
 		nkpProviders: (merged.nkpProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		clineProviders: (merged.clineProviders ?? []).map((p) => ({
+			...p,
+			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
 	};
 	return c.json(result);

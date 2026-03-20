@@ -94,8 +94,11 @@ import {
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api, type TreeMessage } from "../../lib/api";
-import type { ModelOption } from "../../lib/constants";
-import { NARRATOR_STATUS_COLORS } from "../../lib/constants";
+import {
+	FOLLOW_DEFAULT_MODEL,
+	type ModelOption,
+	NARRATOR_STATUS_COLORS,
+} from "../../lib/constants";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { UserAvatar } from "../UserAvatar";
@@ -157,7 +160,11 @@ function ModelMenuItems({
 		if (!groups.has(prov)) groups.set(prov, []);
 		groups.get(prov)?.push(m);
 	}
-	const provLabels: Record<string, string> = { kiro: "Kiro", openai: "OpenAI" };
+	const provLabels: Record<string, string> = {
+		kiro: "Kiro",
+		openai: "OpenAI",
+		__default__: "Default",
+	};
 	const entries = [...groups.entries()];
 	return (
 		<>
@@ -743,7 +750,7 @@ export function NarratorPanel({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const modelMutation = useUpdateModel();
 	const pruneEnabledMutation = useUpdatePruneEnabled();
-	const { visibleModels: allModels, settingsData } = useAllModels();
+	const { visibleWithDefault: allModels, defaultModelValue, settingsData } = useAllModels();
 	const { data: userPrefs } = useUserPreferences();
 	const autoLoadEnabled = userPrefs?.autoLoadOlderMessages ?? true;
 	const isMobileViewport = useMediaQuery("(max-width: 768px)") ?? false;
@@ -3035,9 +3042,14 @@ export function NarratorPanel({
 											size="xs"
 											data={allModels.map((m) => ({
 												value: m.value,
-												label: m.provider ? `${m.provider}:${m.label}` : m.label,
+												label:
+													m.value === FOLLOW_DEFAULT_MODEL
+														? t("followDefault", { model: defaultModelValue })
+														: m.provider
+															? `${m.provider}:${m.label}`
+															: m.label,
 											}))}
-											value={narrator.model ?? ""}
+											value={narrator.model ?? FOLLOW_DEFAULT_MODEL}
 											onChange={() => {}}
 											onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
 											style={{ pointerEvents: "auto" }}
@@ -3175,6 +3187,7 @@ export function NarratorPanel({
 									<ActionIcon variant="subtle" color="gray" size="sm">
 										<Text size="xs" fw={600}>
 											{(() => {
+												if (narrator.model === FOLLOW_DEFAULT_MODEL || !narrator.model) return "D";
 												const m = allModels.find((x) => x.value === narrator.model);
 												return (m?.label ?? narrator.model ?? "?")[0].toUpperCase();
 											})()}
