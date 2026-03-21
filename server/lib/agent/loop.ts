@@ -779,8 +779,8 @@ export async function* agentLoop(
 				if (parsed.nkpQuotaBalance !== undefined) {
 					yield { type: "nkp_quota_balance", quotaBalance: parsed.nkpQuotaBalance };
 				}
-				// Convert OpenAI usage to context_usage percentage
-				if (parsed.usage) {
+				// Convert OpenAI/Anthropic usage to context_usage percentage
+				if (parsed.usage && parsed.usage.promptTokens != null) {
 					const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
 					if (contextWindow) {
 						const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
