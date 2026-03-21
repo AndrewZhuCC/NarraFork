@@ -5,6 +5,7 @@ import { resolveProviderAndModel } from "../lib/agent/provider";
 import { getCodexManager } from "../lib/codex-manager";
 import { ValidationError } from "../lib/errors";
 import { isKiroAvailable, kiroGetCachedModels } from "../lib/kiro-adapter";
+import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
 	type NarraForkSettings,
@@ -263,6 +264,8 @@ settingsRoutes.patch("/", async (c) => {
 	const validated = parsed.data;
 	const oldProxyEnabled = current.containers.proxy.enabled;
 	const oldProxyPort = current.containers.proxy.port;
+	const oldHost = current.server.host;
+	const oldPort = current.server.port;
 
 	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
 	if (validated.codex?.defaultReasoningEffort === null) {
@@ -352,6 +355,15 @@ settingsRoutes.patch("/", async (c) => {
 
 	saveSettings(merged);
 
+	// Detect host/port changes and schedule a server restart
+	const newHost = merged.server.host;
+	const newPort = merged.server.port;
+	const serverAddressChanged = newHost !== oldHost || newPort !== oldPort;
+
+	if (serverAddressChanged) {
+		scheduleServerRestart(newHost, newPort);
+	}
+
 	// Mask sensitive fields before returning (same logic as GET)
 	const result = {
 		...merged,
@@ -372,6 +384,11 @@ settingsRoutes.patch("/", async (c) => {
 			...p,
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
+		// Signal to the frontend that the server is restarting at a new address
+		...(serverAddressChanged && {
+			serverRestarting: true,
+			newUrl: `http://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
+		}),
 	};
 	return c.json(result);
 });
