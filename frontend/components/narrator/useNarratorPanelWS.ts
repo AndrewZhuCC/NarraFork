@@ -61,6 +61,10 @@ export interface UseNarratorPanelWSOptions {
 	narratorTodosToolUseId?: string | null;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for ContinueTask */
 	isSubagent?: boolean;
+	/** Initial NKP quota balance from settings cache (before any streaming events arrive) */
+	initialNkpQuotaBalance?: number | null;
+	/** NKP provider ID for the current narrator model (used to sync quota back to settings cache) */
+	nkpProviderId?: string | null;
 }
 
 export interface UseNarratorPanelWSReturn {
@@ -152,6 +156,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorTodosJson,
 		narratorTodosToolUseId,
 		isSubagent,
+		initialNkpQuotaBalance,
+		nkpProviderId,
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -276,7 +282,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
 	const [pruneBoundaryMessageId, setPruneBoundaryMessageId] = useState<string | null>(null);
 	const [prunedPercent, setPrunedPercent] = useState<number | null>(null);
-	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(null);
+	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(
+		initialNkpQuotaBalance ?? null,
+	);
+	// Sync initial NKP quota when the narrator switches to a different NKP provider
+	const prevInitialNkpRef = useRef(initialNkpQuotaBalance);
+	useEffect(() => {
+		if (prevInitialNkpRef.current !== initialNkpQuotaBalance) {
+			prevInitialNkpRef.current = initialNkpQuotaBalance;
+			setNkpQuotaBalance(initialNkpQuotaBalance ?? null);
+		}
+	}, [initialNkpQuotaBalance]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [unreadCount, setUnreadCount] = useState(0);
 
@@ -1169,6 +1185,23 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onNkpQuotaBalance: (balance) => {
 				setNkpQuotaBalance(balance);
+				// Sync back to settings cache so provider info stays up-to-date
+				if (nkpProviderId && balance != null) {
+					// biome-ignore lint/suspicious/noExplicitAny: dynamic settings shape
+					qc.setQueryData(["settings"], (old: any) => {
+						if (!old?.nkpQuotas) return old;
+						return {
+							...old,
+							nkpQuotas: {
+								...old.nkpQuotas,
+								[nkpProviderId]: {
+									...old.nkpQuotas[nkpProviderId],
+									quotaBalance: balance,
+								},
+							},
+						};
+					});
+				}
 			},
 			onWebSearch: (id, status, query) => {
 				webSearchRef.current = { id, status, query };

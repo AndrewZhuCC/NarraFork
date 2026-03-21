@@ -1045,6 +1045,23 @@ export function NarratorPanel({
 	// --- WebSocket + real-time state ---
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isSubagent = (fetchedNarrator as any)?.type === "subagent";
+
+	// Resolve NKP provider info for initial quota balance
+	const nkpProviderInfo = useMemo(() => {
+		const prefix = narrator?.model?.split(":")[0];
+		if (!prefix) return null;
+		const nkpProviders: Array<{ id: string; prefix?: string }> = settingsData?.nkpProviders ?? [];
+		const cfg = nkpProviders.find((p) => p.prefix === prefix);
+		if (!cfg) return null;
+		const quotas = settingsData?.nkpQuotas as
+			| Record<string, { quotaBalance: number | null }>
+			| undefined;
+		return {
+			providerId: cfg.id,
+			quotaBalance: quotas?.[cfg.id]?.quotaBalance ?? null,
+		};
+	}, [narrator?.model, settingsData?.nkpProviders, settingsData?.nkpQuotas]);
+
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -1056,6 +1073,8 @@ export function NarratorPanel({
 		narratorTodosJson: narrator?.todosJson,
 		narratorTodosToolUseId: narrator?.todosToolUseId,
 		isSubagent,
+		initialNkpQuotaBalance: nkpProviderInfo?.quotaBalance,
+		nkpProviderId: nkpProviderInfo?.providerId,
 	});
 	const {
 		disconnected,
