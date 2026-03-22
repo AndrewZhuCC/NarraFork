@@ -133,6 +133,16 @@ function saveAllCachedModels(): void {
 	}
 }
 
+/** Remove cached models and quotas for providers that no longer exist in settings. */
+export function purgeNkpProviderCache(removedIds: string[]): void {
+	let changed = false;
+	for (const id of removedIds) {
+		if (cachedModelsByProvider.delete(id)) changed = true;
+		cachedQuotaByProvider.delete(id);
+	}
+	if (changed) saveAllCachedModels();
+}
+
 /** Get cached models for a specific provider. */
 export function getNkpCachedModelsByProvider(providerId: string): NkpModelInfo[] {
 	return cachedModelsByProvider.get(providerId) ?? [];
