@@ -65,7 +65,12 @@ interface NarratorWSCallbacks {
 	) => void;
 	onCompacting?: () => void;
 	onCompactDone?: () => void;
-	onContextUsage?: (percentage: number, promptTokens?: number, contextWindow?: number) => void;
+	onContextUsage?: (
+		percentage: number,
+		promptTokens?: number,
+		contextWindow?: number,
+		isEstimated?: boolean,
+	) => void;
 	onPruneBoundary?: (boundaryMessageId: string | null, prunedPercent: number | null) => void;
 	onGitStatus?: (data: {
 		chapterId: string;
@@ -309,6 +314,7 @@ export function useNarratorWS(
 								data.percentage as number,
 								data.promptTokens as number | undefined,
 								data.contextWindow as number | undefined,
+								data.isEstimated as boolean | undefined,
 							);
 						}
 						break;
