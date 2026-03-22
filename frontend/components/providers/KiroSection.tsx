@@ -73,7 +73,7 @@ export function KiroSection({
 }: KiroSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const [expanded, setExpanded] = useState(true);
+	const [expanded, setExpanded] = useState(false);
 	const [refreshingKiro, setRefreshingKiro] = useState(false);
 	const [credentialsExpanded, setCredentialsExpanded] = useState(false);
 	const [modelsExpanded, setModelsExpanded] = useState(true);
