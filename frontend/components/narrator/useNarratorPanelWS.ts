@@ -198,6 +198,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string;
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
+				extractedFields?: Record<string, string>;
 			}
 		>
 	>(new Map());
@@ -210,6 +211,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				inputCharsTotal: number;
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
+				extractedFields?: Record<string, string>;
 			}
 		>
 	>(new Map());
@@ -416,6 +418,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					...(chunk.contentCharsReceived != null && {
 						_streamingContentChars: chunk.contentCharsReceived,
 					}),
+					...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
 				});
 				blocks = next.blocks;
 				toolCalls = next.toolCalls;
@@ -1020,6 +1023,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				parentToolUseId?: string,
 				extractedFilePath?: string,
 				contentCharsReceived?: number,
+				extractedFields?: Record<string, string>,
 			) => {
 				// Accumulate the latest state for each toolUseId; flush once per frame
 				pendingToolChunkRef.current.set(toolUseId, {
@@ -1029,6 +1033,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					parentToolUseId,
 					extractedFilePath,
 					contentCharsReceived,
+					extractedFields,
 				});
 				if (!toolChunkRafRef.current) {
 					toolChunkRafRef.current = requestAnimationFrame(() => {
@@ -1055,6 +1060,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 										toolUseIndexRef.current,
 										chunk.extractedFilePath,
 										chunk.contentCharsReceived,
+										chunk.extractedFields,
 									) as MessagesQueryData;
 								}
 								return result;
@@ -1071,6 +1077,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								inputCharsTotal: chunk.inputCharsTotal,
 								extractedFilePath: chunk.extractedFilePath,
 								contentCharsReceived: chunk.contentCharsReceived,
+								extractedFields: chunk.extractedFields,
 							});
 							topLevelChanged = true;
 						}
@@ -1350,7 +1357,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return result;
 				});
 				if (isAtBottomRef.current) {
-					requestAnimationFrame(() => scrollToBottom(true));
+					requestAnimationFrame(() => scrollToBottom());
 				}
 			},
 			onFullReload: () => {

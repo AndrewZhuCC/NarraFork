@@ -163,6 +163,10 @@ function SettingsPage() {
 	const [host, setHost] = useState("localhost");
 	const [projectDir, setProjectDir] = useState("");
 	const [openBrowser, setOpenBrowser] = useState("app");
+	// Update server
+	const [updateServerUrl, setUpdateServerUrl] = useState("");
+	const [updateChannel, setUpdateChannel] = useState<"stable" | "beta">("stable");
+	const [updateAutoDownload, setUpdateAutoDownload] = useState(false);
 	// Agent
 	const [defaultModel, setDefaultModel] = useState("kiro:claude-sonnet-4.5");
 	const [permissionMode, setPermissionMode] = useState("acceptEdits");
@@ -252,6 +256,9 @@ function SettingsPage() {
 			denyPrompt?: string;
 			enabled?: boolean;
 		}>,
+		updateServerUrl: "",
+		updateChannel: "stable" as "stable" | "beta",
+		updateAutoDownload: false,
 	});
 
 	useEffect(() => {
@@ -286,6 +293,9 @@ function SettingsPage() {
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
 				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
 				globalCommandBlacklist: settings.agent?.commandBlacklist ?? [],
+				updateServerUrl: settings.update?.serverUrl ?? "",
+				updateChannel: settings.update?.channel ?? "stable",
+				updateAutoDownload: settings.update?.autoDownload ?? false,
 			};
 			serverSnapshot.current = snap;
 			setPort(snap.port);
@@ -317,6 +327,9 @@ function SettingsPage() {
 			setGlobalBlacklistDirs(snap.globalBlacklistDirs);
 			setGlobalCommandWhitelist(snap.globalCommandWhitelist);
 			setGlobalCommandBlacklist(snap.globalCommandBlacklist);
+			setUpdateServerUrl(settings.update?.serverUrl ?? "");
+			setUpdateChannel(settings.update?.channel ?? "stable");
+			setUpdateAutoDownload(settings.update?.autoDownload ?? false);
 			setInitialized(true);
 		}
 	}, [settings, initialized]);
@@ -353,7 +366,10 @@ function SettingsPage() {
 			JSON.stringify(globalWhitelistDirs) !== JSON.stringify(s.globalWhitelistDirs) ||
 			JSON.stringify(globalBlacklistDirs) !== JSON.stringify(s.globalBlacklistDirs) ||
 			JSON.stringify(globalCommandWhitelist) !== JSON.stringify(s.globalCommandWhitelist) ||
-			JSON.stringify(globalCommandBlacklist) !== JSON.stringify(s.globalCommandBlacklist)
+			JSON.stringify(globalCommandBlacklist) !== JSON.stringify(s.globalCommandBlacklist) ||
+			updateServerUrl !== (s.updateServerUrl ?? "") ||
+			updateChannel !== (s.updateChannel ?? "stable") ||
+			updateAutoDownload !== (s.updateAutoDownload ?? false)
 		);
 	}, [
 		initialized,
@@ -447,6 +463,11 @@ function SettingsPage() {
 					defaultReasoningEffort:
 						(codexDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") || null,
 				},
+				update: {
+					serverUrl: updateServerUrl || undefined,
+					channel: updateChannel,
+					autoDownload: updateAutoDownload,
+				},
 			},
 			{
 				onSuccess: (data) => {
@@ -480,6 +501,9 @@ function SettingsPage() {
 						globalBlacklistDirs,
 						globalCommandWhitelist,
 						globalCommandBlacklist,
+						updateServerUrl,
+						updateChannel,
+						updateAutoDownload,
 					};
 					// Server is restarting at a new address — redirect after a short delay
 					const resp = data as { serverRestarting?: boolean; newUrl?: string };
@@ -667,6 +691,12 @@ function SettingsPage() {
 							setOpenBrowser={setOpenBrowser}
 							pwaUpdating={pwaUpdating}
 							handlePwaUpdate={handlePwaUpdate}
+							updateServerUrl={updateServerUrl}
+							setUpdateServerUrl={setUpdateServerUrl}
+							updateChannel={updateChannel}
+							setUpdateChannel={setUpdateChannel}
+							updateAutoDownload={updateAutoDownload}
+							setUpdateAutoDownload={setUpdateAutoDownload}
 						/>
 					</Accordion.Panel>
 				</Accordion.Item>
