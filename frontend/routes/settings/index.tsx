@@ -163,6 +163,12 @@ function SettingsPage() {
 	const [host, setHost] = useState("localhost");
 	const [projectDir, setProjectDir] = useState("");
 	const [openBrowser, setOpenBrowser] = useState("app");
+	// TLS
+	const [tlsEnabled, setTlsEnabled] = useState(false);
+	const [tlsCertFile, setTlsCertFile] = useState("");
+	const [tlsKeyFile, setTlsKeyFile] = useState("");
+	const [tlsPassphrase, setTlsPassphrase] = useState("");
+	const [tlsCaFile, setTlsCaFile] = useState("");
 	// Update server
 	const [updateServerUrl, setUpdateServerUrl] = useState("");
 	const [updateChannel, setUpdateChannel] = useState<"stable" | "beta">("stable");
@@ -174,6 +180,7 @@ function SettingsPage() {
 	const [maxTurns, setMaxTurns] = useState(200);
 	const [subagentExploreModel, setSubagentExploreModel] = useState("");
 	const [subagentPlanModel, setSubagentPlanModel] = useState("");
+	const [subagentAllowedModels, setSubagentAllowedModels] = useState<string[]>([]);
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
@@ -215,6 +222,11 @@ function SettingsPage() {
 		port: 7778 as number | undefined,
 		host: "localhost",
 		openBrowser: "app",
+		tlsEnabled: false,
+		tlsCertFile: "",
+		tlsKeyFile: "",
+		tlsPassphrase: "",
+		tlsCaFile: "",
 		projectDir: "",
 		defaultModel: "kiro:claude-sonnet-4.5",
 		permissionMode: "acceptEdits",
@@ -222,6 +234,7 @@ function SettingsPage() {
 		maxTurns: 200,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
+		subagentAllowedModels: [] as string[],
 		maxWorktrees: 10,
 		maxContainers: 5,
 		sizeWarning: 500,
@@ -267,6 +280,11 @@ function SettingsPage() {
 				port: settings.server?.port ?? 7778,
 				host: settings.server?.host ?? "localhost",
 				openBrowser: settings.server?.openBrowser ?? "app",
+				tlsEnabled: settings.server?.tls?.enabled ?? false,
+				tlsCertFile: settings.server?.tls?.certFile ?? "",
+				tlsKeyFile: settings.server?.tls?.keyFile ?? "",
+				tlsPassphrase: "",
+				tlsCaFile: settings.server?.tls?.caFile ?? "",
 				projectDir: settings.paths?.defaultProjectDir ?? "",
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
@@ -274,6 +292,7 @@ function SettingsPage() {
 				maxTurns: settings.agent?.maxTurns ?? 200,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
+				subagentAllowedModels: settings.agent?.subagentAllowedModels ?? [],
 				maxWorktrees: settings.chapters?.maxActiveWorktrees ?? 10,
 				maxContainers: settings.chapters?.maxActiveContainers ?? 5,
 				sizeWarning: settings.chapters?.worktreeSizeWarningMb ?? 500,
@@ -301,6 +320,11 @@ function SettingsPage() {
 			setPort(snap.port);
 			setHost(snap.host);
 			setOpenBrowser(snap.openBrowser);
+			setTlsEnabled(snap.tlsEnabled);
+			setTlsCertFile(snap.tlsCertFile);
+			setTlsKeyFile(snap.tlsKeyFile);
+			setTlsPassphrase(snap.tlsPassphrase);
+			setTlsCaFile(snap.tlsCaFile);
 			setProjectDir(snap.projectDir);
 			setDefaultModel(snap.defaultModel);
 			setPermissionMode(snap.permissionMode);
@@ -308,6 +332,7 @@ function SettingsPage() {
 			setMaxTurns(snap.maxTurns);
 			setSubagentExploreModel(snap.subagentExploreModel);
 			setSubagentPlanModel(snap.subagentPlanModel);
+			setSubagentAllowedModels(snap.subagentAllowedModels);
 			setMaxWorktrees(snap.maxWorktrees);
 			setMaxContainers(snap.maxContainers);
 			setSizeWarning(snap.sizeWarning);
@@ -341,6 +366,11 @@ function SettingsPage() {
 			port !== s.port ||
 			host !== s.host ||
 			openBrowser !== s.openBrowser ||
+			tlsEnabled !== s.tlsEnabled ||
+			tlsCertFile !== s.tlsCertFile ||
+			tlsKeyFile !== s.tlsKeyFile ||
+			tlsPassphrase !== s.tlsPassphrase ||
+			tlsCaFile !== s.tlsCaFile ||
 			projectDir !== s.projectDir ||
 			defaultModel !== s.defaultModel ||
 			permissionMode !== s.permissionMode ||
@@ -348,6 +378,7 @@ function SettingsPage() {
 			maxTurns !== s.maxTurns ||
 			subagentExploreModel !== s.subagentExploreModel ||
 			subagentPlanModel !== s.subagentPlanModel ||
+			JSON.stringify(subagentAllowedModels) !== JSON.stringify(s.subagentAllowedModels) ||
 			maxWorktrees !== s.maxWorktrees ||
 			maxContainers !== s.maxContainers ||
 			sizeWarning !== s.sizeWarning ||
@@ -376,6 +407,11 @@ function SettingsPage() {
 		port,
 		host,
 		openBrowser,
+		tlsEnabled,
+		tlsCertFile,
+		tlsKeyFile,
+		tlsPassphrase,
+		tlsCaFile,
 		projectDir,
 		defaultModel,
 		permissionMode,
@@ -383,6 +419,7 @@ function SettingsPage() {
 		maxTurns,
 		subagentExploreModel,
 		subagentPlanModel,
+		subagentAllowedModels,
 		maxWorktrees,
 		maxContainers,
 		sizeWarning,
@@ -402,6 +439,9 @@ function SettingsPage() {
 		globalBlacklistDirs,
 		globalCommandWhitelist,
 		globalCommandBlacklist,
+		updateServerUrl,
+		updateChannel,
+		updateAutoDownload,
 	]);
 
 	// Trigger highlight animation when transitioning from clean to dirty
@@ -422,7 +462,18 @@ function SettingsPage() {
 	const handleSave = () => {
 		updateSettings.mutate(
 			{
-				server: { port, host, openBrowser },
+				server: {
+					port,
+					host,
+					openBrowser,
+					tls: {
+						enabled: tlsEnabled,
+						certFile: tlsCertFile,
+						keyFile: tlsKeyFile,
+						...(tlsPassphrase && { passphrase: tlsPassphrase }),
+						...(tlsCaFile && { caFile: tlsCaFile }),
+					},
+				},
 				paths: { defaultProjectDir: projectDir },
 				agent: {
 					defaultModel,
@@ -433,6 +484,7 @@ function SettingsPage() {
 						explore: subagentExploreModel,
 						plan: subagentPlanModel,
 					},
+					subagentAllowedModels,
 					legacyEncoding,
 					translateReasoning,
 					defaultRelaxedPlan,
@@ -475,6 +527,11 @@ function SettingsPage() {
 						port,
 						host,
 						openBrowser,
+						tlsEnabled,
+						tlsCertFile,
+						tlsKeyFile,
+						tlsPassphrase,
+						tlsCaFile,
 						projectDir,
 						defaultModel,
 						permissionMode,
@@ -482,6 +539,7 @@ function SettingsPage() {
 						maxTurns,
 						subagentExploreModel,
 						subagentPlanModel,
+						subagentAllowedModels,
 						maxWorktrees,
 						maxContainers,
 						sizeWarning,
@@ -575,6 +633,8 @@ function SettingsPage() {
 							setSubagentExploreModel={setSubagentExploreModel}
 							subagentPlanModel={subagentPlanModel}
 							setSubagentPlanModel={setSubagentPlanModel}
+							subagentAllowedModels={subagentAllowedModels}
+							setSubagentAllowedModels={setSubagentAllowedModels}
 							codexDefaultReasoningEffort={codexDefaultReasoningEffort}
 							setCodexDefaultReasoningEffort={setCodexDefaultReasoningEffort}
 							groupedModels={groupedModels}
@@ -691,6 +751,16 @@ function SettingsPage() {
 							setOpenBrowser={setOpenBrowser}
 							pwaUpdating={pwaUpdating}
 							handlePwaUpdate={handlePwaUpdate}
+							tlsEnabled={tlsEnabled}
+							setTlsEnabled={setTlsEnabled}
+							tlsCertFile={tlsCertFile}
+							setTlsCertFile={setTlsCertFile}
+							tlsKeyFile={tlsKeyFile}
+							setTlsKeyFile={setTlsKeyFile}
+							tlsPassphrase={tlsPassphrase}
+							setTlsPassphrase={setTlsPassphrase}
+							tlsCaFile={tlsCaFile}
+							setTlsCaFile={setTlsCaFile}
 							updateServerUrl={updateServerUrl}
 							setUpdateServerUrl={setUpdateServerUrl}
 							updateChannel={updateChannel}

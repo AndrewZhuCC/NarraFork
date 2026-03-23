@@ -148,20 +148,18 @@ export function NKPProvidersSection({
 							</Text>
 						</div>
 					</Group>
-					<Button
-						size="xs"
-						variant="light"
-						leftSection={<IconPlus size={14} />}
-						onClick={(e) => {
-							e.stopPropagation();
-							setSectionExpanded(true);
-							handleAddProvider();
-						}}
-					>
-						{t("nkpAddProvider")}
-					</Button>
 				</Group>
 				<Collapse in={sectionExpanded}>
+					<Group justify="flex-end" mb="xs">
+						<Button
+							size="xs"
+							variant="light"
+							leftSection={<IconPlus size={14} />}
+							onClick={() => handleAddProvider()}
+						>
+							{t("nkpAddProvider")}
+						</Button>
+					</Group>
 					<Stack>
 						{providers.map((p, idx) => {
 							const isExpanded = expandedProviders.has(p.id);
