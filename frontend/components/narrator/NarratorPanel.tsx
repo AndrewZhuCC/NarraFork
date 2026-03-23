@@ -1788,9 +1788,9 @@ export function NarratorPanel({
 					streamingRef={streamingRef}
 					streamingReasoningRef={streamingReasoningRef}
 					includeReasoning={reasoningInBubble}
-					advancedAnim={advancedAnim}
 					webSearchRef={webSearchRef}
 					version={streamingVersion}
+					advancedAnim={advancedAnim}
 				/>,
 			);
 			keys.push("__streaming_bubble__");
@@ -1821,13 +1821,16 @@ export function NarratorPanel({
 				const prevTargets = targets[lastToolRunIdx] ?? [];
 				const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
 					appendMessages: [reasoningMsg],
+					animateAppended: !!advancedAnim,
 				});
 				if (mergedEl) {
 					els[lastToolRunIdx] = mergedEl;
 					targets[lastToolRunIdx] = prevTargets;
 				}
 			} else {
-				const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb);
+				const toolEl = renderToolRun([reasoningMsg], narratorId, renderPermCb, {
+					animateAppended: !!advancedAnim,
+				});
 				if (toolEl) {
 					els.push(toolEl);
 					keys.push("__streaming_tool_chunks__");
@@ -1859,13 +1862,16 @@ export function NarratorPanel({
 					const prevTargets = targets[toolRunIdx] ?? [];
 					const mergedEl = renderToolRun(lastToolRunMsgs, narratorId, renderPermCb, {
 						appendMessages: [chunksToRender],
+						animateAppended: !!advancedAnim,
 					});
 					if (mergedEl) {
 						els[toolRunIdx] = mergedEl;
 						targets[toolRunIdx] = prevTargets;
 					}
 				} else {
-					const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
+					const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb, {
+						animateAppended: !!advancedAnim,
+					});
 					if (toolEl) {
 						els.push(toolEl);
 						keys.push("__streaming_tool_chunks__");
@@ -1874,7 +1880,9 @@ export function NarratorPanel({
 				}
 			} else {
 				// Has streaming text content or no preceding tool run — render standalone
-				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb);
+				const toolEl = renderToolRun([chunksToRender], narratorId, renderPermCb, {
+					animateAppended: !!advancedAnim,
+				});
 				if (toolEl) {
 					els.push(toolEl);
 					keys.push("__streaming_tool_chunks__");
@@ -2968,7 +2976,6 @@ export function NarratorPanel({
 									scrollRef={viewportCallbackRef}
 									contentRef={contentRef}
 									shift={shifting}
-									advancedAnim={advancedAnim}
 								/>
 							</LatestTodosToolUseIdCtx.Provider>
 						</MessageSelectionCtx.Provider>
