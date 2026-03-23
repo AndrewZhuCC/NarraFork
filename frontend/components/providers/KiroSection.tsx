@@ -390,10 +390,11 @@ export function KiroSection({
 												<Group
 													key={m.value}
 													gap="xs"
+													wrap="wrap"
 													style={isHidden ? { opacity: 0.5 } : undefined}
 												>
-													<TextInput value={m.value} disabled style={{ flex: 1 }} />
-													<TextInput value={m.label} disabled style={{ flex: 1 }} />
+													<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
+													<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
 													<ActionIcon
 														variant="subtle"
 														color={isHidden ? "gray" : "blue"}
