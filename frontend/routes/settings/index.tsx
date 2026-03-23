@@ -670,6 +670,8 @@ function SettingsPage() {
 							setLegacyEncoding={setLegacyEncoding}
 							translateReasoning={translateReasoning}
 							setTranslateReasoning={setTranslateReasoning}
+							expandReasoning={expandReasoning}
+							setExpandReasoning={setExpandReasoning}
 							defaultRelaxedPlan={defaultRelaxedPlan}
 							setDefaultRelaxedPlan={setDefaultRelaxedPlan}
 							smartInterruptionCheck={smartInterruptionCheck}
@@ -746,8 +748,6 @@ function SettingsPage() {
 							setWakeLock={setWakeLock}
 							advancedAnim={advancedAnim}
 							setAdvancedAnim={setAdvancedAnim}
-							expandReasoning={expandReasoning}
-							setExpandReasoning={setExpandReasoning}
 						/>
 					</Accordion.Panel>
 				</Accordion.Item>
