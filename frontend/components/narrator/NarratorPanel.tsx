@@ -51,7 +51,7 @@ import {
 	IconUpload,
 	IconX,
 } from "@tabler/icons-react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -806,6 +806,26 @@ export function NarratorPanel({
 		return m;
 	}, [narrator?.model, defaultModelValue]);
 
+	// Parse provider:model for context threshold lookup
+	const { resolvedProvider, resolvedBareModel } = useMemo(() => {
+		const idx = resolvedModel.indexOf(":");
+		if (idx > 0) {
+			return {
+				resolvedProvider: resolvedModel.slice(0, idx),
+				resolvedBareModel: resolvedModel.slice(idx + 1),
+			};
+		}
+		return { resolvedProvider: "", resolvedBareModel: resolvedModel };
+	}, [resolvedModel]);
+
+	// Fetch context thresholds for the current model (used as fallback when WS hasn't pushed yet)
+	const { data: modelThresholds } = useQuery({
+		queryKey: ["contextThresholds", resolvedBareModel, resolvedProvider],
+		queryFn: () => api.getContextThresholds(resolvedBareModel, resolvedProvider),
+		staleTime: 5 * 60 * 1000,
+		placeholderData: { pruneStart: 95, compactStart: 99 },
+	});
+
 	const codexCapableProviders = useMemo(() => {
 		const providers = new Set<string>();
 		if (settingsData?.codexAvailable) providers.add("codex");
@@ -1083,7 +1103,7 @@ export function NarratorPanel({
 
 	// Resolve NKP provider info for initial quota balance
 	const nkpProviderInfo = useMemo(() => {
-		const prefix = narrator?.model?.split(":")[0];
+		const prefix = resolvedModel?.split(":")[0];
 		if (!prefix) return null;
 		const nkpProviders: Array<{ id: string; prefix?: string }> = settingsData?.nkpProviders ?? [];
 		const cfg = nkpProviders.find((p) => p.prefix === prefix);
@@ -1095,7 +1115,7 @@ export function NarratorPanel({
 			providerId: cfg.id,
 			quotaBalance: quotas?.[cfg.id]?.quotaBalance ?? null,
 		};
-	}, [narrator?.model, settingsData?.nkpProviders, settingsData?.nkpQuotas]);
+	}, [resolvedModel, settingsData?.nkpProviders, settingsData?.nkpQuotas]);
 
 	const wsState = useNarratorPanelWS({
 		narratorId,
@@ -3427,12 +3447,10 @@ export function NarratorPanel({
 								</Avatar.Group>
 							</Tooltip>
 						)}
-						{/* Context usage indicator */}
+						{/* Context usage indicator — always visible, empty ring when no data */}
 						{(() => {
-							// Note: contextPercent is now available for both Kiro and OpenAI providers
-							// (Kiro via native contextUsageEvent, OpenAI via usage → context_window calculation)
-							if (contextPercent == null) return null;
-							const pct = Math.min(contextPercent, 100);
+							const hasData = contextPercent != null;
+							const pct = hasData ? Math.min(contextPercent, 100) : 0;
 							const r = 9;
 							const circ = 2 * Math.PI * r;
 							const offset = circ * (1 - pct / 100);
@@ -3442,6 +3460,7 @@ export function NarratorPanel({
 									: pct >= 95
 										? "var(--mantine-color-yellow-6)"
 										: "var(--mantine-color-blue-6)";
+							const label = hasData ? `Context: ${contextPercent.toFixed(1)}%` : "Context";
 							return (
 								<Menu position="top-start">
 									<Menu.Target>
@@ -3455,14 +3474,8 @@ export function NarratorPanel({
 											}}
 											className="context-ring"
 										>
-											<svg
-												width={24}
-												height={24}
-												viewBox="0 0 24 24"
-												role="img"
-												aria-label={`Context: ${contextPercent.toFixed(1)}%`}
-											>
-												<title>{`Context: ${contextPercent.toFixed(1)}%`}</title>
+											<svg width={24} height={24} viewBox="0 0 24 24" role="img" aria-label={label}>
+												<title>{label}</title>
 												<circle
 													cx={12}
 													cy={12}
@@ -3471,31 +3484,34 @@ export function NarratorPanel({
 													stroke="light-dark(var(--mantine-color-gray-3), var(--mantine-color-dark-4))"
 													strokeWidth={2.5}
 												/>
-												<circle
-													cx={12}
-													cy={12}
-													r={r}
-													fill="none"
-													stroke={color}
-													strokeWidth={2.5}
-													strokeDasharray={circ}
-													strokeDashoffset={offset}
-													strokeLinecap="round"
-													transform="rotate(-90 12 12)"
-													style={{ transition: "stroke-dashoffset 0.3s ease" }}
-												/>
+												{hasData && (
+													<circle
+														cx={12}
+														cy={12}
+														r={r}
+														fill="none"
+														stroke={color}
+														strokeWidth={2.5}
+														strokeDasharray={circ}
+														strokeDashoffset={offset}
+														strokeLinecap="round"
+														transform="rotate(-90 12 12)"
+														style={{ transition: "stroke-dashoffset 0.3s ease" }}
+													/>
+												)}
 											</svg>
 										</Box>
 									</Menu.Target>
 									<Menu.Dropdown>
-										{activePruneStart != null && activeCompactStart != null && (
-											<Menu.Label c="dimmed" fz={10}>
-												{t("activeThresholds", {
-													prune: activePruneStart,
-													compact: activeCompactStart,
-												})}
-											</Menu.Label>
-										)}
+										{(() => {
+											const prune = activePruneStart ?? modelThresholds?.pruneStart;
+											const compact = activeCompactStart ?? modelThresholds?.compactStart;
+											return (
+												<Menu.Label c="dimmed" fz={10}>
+													{t("activeThresholds", { prune, compact })}
+												</Menu.Label>
+											);
+										})()}
 										<Menu.Item
 											leftSection={<IconSettings size={14} />}
 											c="dimmed"
@@ -3513,9 +3529,11 @@ export function NarratorPanel({
 										{prunedPercent != null && (
 											<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
 										)}
-										<Menu.Label>
-											{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
-										</Menu.Label>
+										{hasData && (
+											<Menu.Label>
+												{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
+											</Menu.Label>
+										)}
 										{promptTokens != null && (
 											<Menu.Label>
 												{contextWindow != null
