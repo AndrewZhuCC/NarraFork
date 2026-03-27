@@ -25,6 +25,7 @@ import {
 	IconDeviceFloppy,
 	IconEye,
 	IconEyeOff,
+	IconPlayerPlay,
 	IconRefresh,
 	IconTrash,
 } from "@tabler/icons-react";
@@ -60,6 +61,7 @@ interface KiroSectionProps {
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onTestModel?: (model: string) => void;
 }
 
 export function KiroSection({
@@ -70,6 +72,7 @@ export function KiroSection({
 	onCustomModelsChange,
 	modelContextWindows,
 	onContextWindowChange,
+	onTestModel,
 }: KiroSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -395,6 +398,15 @@ export function KiroSection({
 												>
 													<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
 													<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
+													<Tooltip label={t("modelTestBtn")}>
+														<ActionIcon
+															variant="subtle"
+															color="teal"
+															onClick={() => onTestModel?.(m.value)}
+														>
+															<IconPlayerPlay size={16} />
+														</ActionIcon>
+													</Tooltip>
 													<ActionIcon
 														variant="subtle"
 														color={isHidden ? "gray" : "blue"}

@@ -11,6 +11,7 @@ import {
 	Text,
 	TextInput,
 	Title,
+	Tooltip,
 } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
@@ -18,6 +19,7 @@ import {
 	IconChevronRight,
 	IconEye,
 	IconEyeOff,
+	IconPlayerPlay,
 	IconPlus,
 	IconRefresh,
 	IconTrash,
@@ -43,6 +45,8 @@ interface NKPProvidersSectionProps {
 	quotas?: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
+	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
+	onTestModel?: (model: string) => void;
 }
 
 export function NKPProvidersSection({
@@ -57,6 +61,8 @@ export function NKPProvidersSection({
 	quotas,
 	customModels,
 	onCustomModelsChange,
+	getPrefixError,
+	onTestModel,
 }: NKPProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
@@ -221,6 +227,7 @@ export function NKPProvidersSection({
 													description={t("nkpProviderPrefixDesc")}
 													placeholder={t("nkpProviderPrefixPlaceholder")}
 													value={p.prefix}
+													error={getPrefixError?.(p.prefix, p.id)}
 													onChange={(e) =>
 														updateProvider(
 															p.id,
@@ -298,6 +305,15 @@ export function NKPProvidersSection({
 																		w={180}
 																		size="xs"
 																	/>
+																	<Tooltip label={t("modelTestBtn")}>
+																		<ActionIcon
+																			variant="subtle"
+																			color="teal"
+																			onClick={() => onTestModel?.(m.value)}
+																		>
+																			<IconPlayerPlay size={16} />
+																		</ActionIcon>
+																	</Tooltip>
 																	<ActionIcon
 																		variant="subtle"
 																		color={isHidden ? "gray" : "blue"}
