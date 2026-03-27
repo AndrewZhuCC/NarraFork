@@ -1,6 +1,13 @@
 const BASE = "/api";
 const TOKEN_KEY = "narrafork_token";
 
+export interface ChangelogEntry {
+	version: string;
+	date: string;
+	en: string;
+	"zh-CN": string;
+}
+
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
 }
@@ -2208,6 +2215,9 @@ export const api = {
 		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	deleteWorkspace: (id: string) =>
 		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
+
+	// Changelog
+	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),
 };
 
 /** Stream chat response from Kiro. Yields text chunks via SSE. */

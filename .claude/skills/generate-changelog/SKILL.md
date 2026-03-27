@@ -1,10 +1,16 @@
 ---
+name: "generate-changelog"
 description: 从 git 提交记录生成双语更新日志用于发布。当用户要求生成 changelog、准备发布、写更新日志时触发。
 ---
 
 # generate-changelog
 
-基于 git 提交历史生成双语（英文 + 中文）更新日志，输出为 JSON 文件供发布脚本使用。
+基于 git 提交历史生成双语（英文 + 中文）更新日志，写入 `changelogs/` 目录供发布脚本和前端 changelog 页面使用。
+
+## 确定版本号
+
+- 如果用户指定了版本号，直接使用
+- 否则，读取 `package.json` 中的 `version` 字段作为当前版本，询问用户本次发布的版本号
 
 ## 步骤
 
@@ -14,11 +20,11 @@ description: 从 git 提交记录生成双语更新日志用于发布。当用�
    ```
    如果没有标签，使用所有提交。
 
-2. 获取从上一个标签到 HEAD 的所有提交：
+2. 获取从上一个标签到 HEAD 的所有提交（包含完整 body 以获取更多上下文）：
    ```bash
-   git log <last-tag>..HEAD --oneline --no-merges
+   git log <last-tag>..HEAD --format="%B---COMMIT_SEP---" --no-merges
    ```
-   如果没有标签：`git log --oneline --no-merges -30`
+   如果没有标签：`git log --format="%B---COMMIT_SEP---" --no-merges -30`
 
 3. 按 conventional commit 前缀分类：
    - **feat** → New Features / 新功能
@@ -40,9 +46,11 @@ description: 从 git 提交记录生成双语更新日志用于发布。当用�
    - Description of fix A
    ```
 
-5. 将结果写入 `/tmp/changelog.json`：
+5. 将结果写入 `changelogs/v{version}.json`：
    ```json
    {
+     "version": "0.2.0",
+     "date": "2026-04-01",
      "en": "## New Features\n\n- Feature A\n- Feature B\n\n## Bug Fixes\n\n- Fix A",
      "zh-CN": "## 新功能\n\n- 功能 A\n- 功能 B\n\n## 修复\n\n- 修复 A"
    }
@@ -56,5 +64,8 @@ description: 从 git 提交记录生成双语更新日志用于发布。当用�
 - 每条描述控制在一行内
 - 中文描述不需要是英文的直译，应该自然流畅
 - 空分类不要输出
-- 完成后告知用户文件路径，并提示运行发布命令：
-  `bun scripts/release.ts <version> --changelog=/tmp/changelog.json`
+- `date` 字段使用当天日期，格式 `YYYY-MM-DD`
+- 完成后告知用户文件路径，并提示：
+  - 发布命令：`bun scripts/release.ts <version>`（release.ts 会自动从 `changelogs/v<version>.json` 读取）
+  - 构建时 `scripts/build-cross-platform.ts` 会自动将 `changelogs/` 下所有 JSON 嵌入二进制
+  - 前端 `/changelog` 页面可查看所有历史版本的更新日志
