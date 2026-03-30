@@ -58,6 +58,8 @@ export interface ParsedStreamEvent {
 	credentialId?: string;
 	/** NKP quota balance returned after each request */
 	nkpQuotaBalance?: number | null;
+	/** NKP queue status — sent while waiting for a concurrency slot */
+	nkpQueue?: { position: number; queueDepth: number };
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;

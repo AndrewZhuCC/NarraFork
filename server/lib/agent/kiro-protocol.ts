@@ -204,6 +204,15 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 		result.nkpQuotaBalance = balance != null ? Number(balance) : null;
 	}
 
+	// NKP-specific: queue status event sent while waiting for a concurrency slot
+	if (evt.eventType === "nkpQueueEvent") {
+		const position = evt.data.position;
+		const queueDepth = evt.data.queueDepth;
+		if (position != null) {
+			result.nkpQueue = { position: Number(position), queueDepth: Number(queueDepth ?? 0) };
+		}
+	}
+
 	return result;
 }
 

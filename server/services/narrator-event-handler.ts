@@ -879,6 +879,16 @@ export async function processEvent(
 			return null;
 		}
 
+		case "nkp_queue_status": {
+			dualBroadcast(ctx, {
+				type: "nkp_queue_status",
+				narratorId: broadcastTargetId,
+				position: event.position,
+				queueDepth: event.queueDepth,
+			});
+			return null;
+		}
+
 		case "invalid_state": {
 			logger.warn("Agent invalid state event", {
 				narratorId,

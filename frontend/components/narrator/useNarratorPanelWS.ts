@@ -101,6 +101,7 @@ export interface UseNarratorPanelWSReturn {
 	queuedMessages: BufferMessageSummary[];
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
 	isCompacting: boolean;
+	nkpQueuePosition: number | null;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
 	promptTokens: number | null;
@@ -287,6 +288,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Misc state ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [isCompacting, setIsCompacting] = useState(false);
+	const [nkpQueuePosition, setNkpQueuePosition] = useState<number | null>(null);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
 	const [contextWindow, setContextWindow] = useState<number | null>(null);
@@ -1195,6 +1197,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt) => {
 				setIsCompacting(false);
+				setNkpQueuePosition(null);
 				if (retryInfo) setRetryInfo(null);
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
@@ -1298,6 +1301,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						};
 					});
 				}
+			},
+			onNkpQueueStatus: (position, _queueDepth) => {
+				setNkpQueuePosition(position > 0 ? position : null);
 			},
 			onWebSearch: (id, status, query) => {
 				webSearchRef.current = { id, status, query };
@@ -1775,6 +1781,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		queuedMessages,
 		setQueuedMessages,
 		isCompacting,
+		nkpQueuePosition,
 		contextPercent,
 		setContextPercent,
 		promptTokens,

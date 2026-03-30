@@ -240,6 +240,12 @@ export type NarratorServerMessage =
 			quotaBalance: number | null;
 	  }
 	| {
+			type: "nkp_queue_status";
+			narratorId: string;
+			position: number;
+			queueDepth: number;
+	  }
+	| {
 			type: "streaming_snapshot";
 			narratorId: string;
 			streamingText: string;

@@ -832,6 +832,13 @@ export async function* agentLoop(
 				if (parsed.nkpQuotaBalance !== undefined) {
 					yield { type: "nkp_quota_balance", quotaBalance: parsed.nkpQuotaBalance };
 				}
+				if (parsed.nkpQueue) {
+					yield {
+						type: "nkp_queue_status",
+						position: parsed.nkpQueue.position,
+						queueDepth: parsed.nkpQueue.queueDepth,
+					};
+				}
 				// Convert OpenAI/Anthropic usage to context_usage percentage
 				if (parsed.usage && parsed.usage.promptTokens != null) {
 					receivedUsage = true;
