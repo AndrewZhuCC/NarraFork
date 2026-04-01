@@ -38,6 +38,7 @@ import { projectRoutes } from "./routes/projects";
 import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
 import { rulerRoutes } from "./routes/ruler";
+import { runtimeRoutes } from "./routes/runtime";
 import { searchRoutes } from "./routes/search";
 import { settingsRoutes } from "./routes/settings";
 import { shareRoutes } from "./routes/shares";
@@ -105,6 +106,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/settings",
 	"/api/admin",
 	"/api/storage",
+	"/api/runtime",
 	"/api/user-preferences",
 	"/api/notification",
 	"/api/update",
@@ -150,6 +152,7 @@ app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/storage", storageRoutes);
+app.route("/api/runtime", runtimeRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
 app.route("/api/reviews", reviewsRouter);
