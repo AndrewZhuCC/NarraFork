@@ -86,6 +86,7 @@ function ProvidersPage() {
 				defaultModel: p.defaultModel ?? "",
 				apiMode: p.apiMode ?? "responses",
 				codexAccountId: p.codexAccountId ?? "",
+				disabled: p.disabled ?? false,
 			}));
 			setOpenaiProviders(providers);
 			serverSnapshot.current.openaiProviders = providers;
@@ -107,6 +108,7 @@ function ProvidersPage() {
 				defaultReasoningEffort: p.defaultReasoningEffort ?? null,
 				proxy: p.proxy ?? "",
 				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
+				disabled: p.disabled ?? false,
 			}));
 			setAnthropicProviders(providers);
 			serverSnapshot.current.anthropicProviders = providers;
@@ -125,6 +127,7 @@ function ProvidersPage() {
 				apiKey: p.apiKey ?? "",
 				baseUrl: p.baseUrl ?? "",
 				defaultModel: p.defaultModel ?? "",
+				disabled: p.disabled ?? false,
 			}));
 			setNkpProviders(providers);
 			serverSnapshot.current.nkpProviders = providers;

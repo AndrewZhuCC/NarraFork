@@ -172,7 +172,7 @@ export function getNkpCachedModelsGrouped(): Array<{
 }> {
 	const providers = settings.nkpProviders ?? [];
 	return providers
-		.filter((p) => cachedModelsByProvider.has(p.id))
+		.filter((p) => !p.disabled && cachedModelsByProvider.has(p.id))
 		.map((p) => ({
 			providerId: p.id,
 			providerName: p.name,
@@ -192,6 +192,7 @@ registerNkpModelLister(() => {
 	const result: string[] = [];
 	const providers = settings.nkpProviders ?? [];
 	for (const p of providers) {
+		if (p.disabled) continue;
 		const prefix = nkpProviderPrefix(p);
 		const models = cachedModelsByProvider.get(p.id) ?? [];
 		for (const m of models) {

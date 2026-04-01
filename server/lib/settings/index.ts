@@ -15,6 +15,8 @@ export interface OpenAIProviderConfig {
 	id: string;
 	/** User-defined display name, e.g. "DeepSeek", "Groq", "OpenAI". */
 	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
 	/**
 	 * User-defined provider prefix used in model IDs, e.g. "openai", "deepseek", "groq".
 	 * Model IDs are formatted as "{prefix}:{model}", e.g. "deepseek:deepseek-chat".
@@ -47,6 +49,8 @@ export interface AnthropicProviderConfig {
 	id: string;
 	/** User-defined display name, e.g. "Anthropic", "Anthropic Proxy". */
 	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
 	/**
 	 * User-defined provider prefix used in model IDs, e.g. "anthropic".
 	 * Model IDs are formatted as "{prefix}:{model}", e.g. "anthropic:claude-sonnet-4-20250514".
@@ -82,6 +86,8 @@ export interface NKPProviderConfig {
 	id: string;
 	/** User-defined display name, e.g. "NKP Production". */
 	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
 	/** Provider prefix used in model IDs, e.g. "nkp". */
 	prefix: string;
 	/** NKP API Key for authentication. */
@@ -97,6 +103,8 @@ export interface ClineProviderConfig {
 	id: string;
 	/** User-defined display name, e.g. "Cline", "Cline Production". */
 	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
 	/** Provider prefix used in model IDs, e.g. "cline". */
 	prefix: string;
 	/** Cline API base URL, e.g. "https://openrouter.ai/api/v1". */
@@ -817,7 +825,7 @@ export function parseModelId(raw?: string): { provider?: string; model: string }
  * If prefix is undefined, returns the first provider (legacy compat).
  */
 export function getOpenaiProviderConfig(prefix?: string): OpenAIProviderConfig | undefined {
-	const providers = settings.openaiProviders ?? [];
+	const providers = (settings.openaiProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
 	return providers.find((p) => p.prefix === prefix);
 }
@@ -865,7 +873,7 @@ export function openaiProviderPrefix(config: OpenAIProviderConfig): string {
  * If prefix is undefined, returns the first provider.
  */
 export function getAnthropicProviderConfig(prefix?: string): AnthropicProviderConfig | undefined {
-	const providers = settings.anthropicProviders ?? [];
+	const providers = (settings.anthropicProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
 	return providers.find((p) => p.prefix === prefix);
 }
@@ -883,7 +891,7 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
  * If prefix is undefined, returns the first provider.
  */
 export function getNkpProviderConfig(prefix?: string): NKPProviderConfig | undefined {
-	const providers = settings.nkpProviders ?? [];
+	const providers = (settings.nkpProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
 	return providers.find((p) => p.prefix === prefix);
 }
@@ -898,7 +906,7 @@ export function nkpProviderPrefix(config: NKPProviderConfig): string {
  * If prefix is undefined, returns the first provider.
  */
 export function getClineProviderConfig(prefix?: string): ClineProviderConfig | undefined {
-	const providers = settings.clineProviders ?? [];
+	const providers = (settings.clineProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
 	return providers.find((p) => p.prefix === prefix);
 }
@@ -910,17 +918,17 @@ export function clineProviderPrefix(config: ClineProviderConfig): string {
 
 export function hasConfiguredClineProvider(): boolean {
 	const providers = settings.clineProviders ?? [];
-	return providers.some((p) => !!p.accessToken);
+	return providers.some((p) => !p.disabled && !!p.accessToken);
 }
 
 function hasConfiguredOpenaiProvider(): boolean {
 	const providers = settings.openaiProviders ?? [];
-	return providers.some((p) => !!p.apiKey);
+	return providers.some((p) => !p.disabled && !!p.apiKey);
 }
 
 function hasConfiguredAnthropicProvider(): boolean {
 	const providers = settings.anthropicProviders ?? [];
-	return providers.some((p) => !!p.apiKey);
+	return providers.some((p) => !p.disabled && !!p.apiKey);
 }
 
 function hasConfiguredKiroProvider(): boolean {
@@ -938,24 +946,24 @@ function hasConfiguredCodexProvider(): boolean {
 
 export function hasConfiguredNkpProvider(): boolean {
 	const providers = settings.nkpProviders ?? [];
-	return providers.some((p) => !!p.apiKey && !!p.baseUrl);
+	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
 }
 
 /** Get the first configured NKP provider (for MCP search fallback). */
 export function getFirstNkpProvider(): NKPProviderConfig | undefined {
-	return (settings.nkpProviders ?? []).find((p) => !!p.apiKey && !!p.baseUrl);
+	return (settings.nkpProviders ?? []).find((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
 }
 
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
 	if (hasConfiguredOpenaiProvider()) {
 		for (const p of settings.openaiProviders ?? []) {
-			if (p.apiKey) available.add(p.prefix || "openai");
+			if (!p.disabled && p.apiKey) available.add(p.prefix || "openai");
 		}
 	}
 	if (hasConfiguredAnthropicProvider()) {
 		for (const p of settings.anthropicProviders ?? []) {
-			if (p.apiKey) available.add(p.prefix || "anthropic");
+			if (!p.disabled && p.apiKey) available.add(p.prefix || "anthropic");
 		}
 	}
 	if (hasConfiguredCodexProvider()) {
@@ -963,7 +971,7 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredNkpProvider()) {
 		for (const p of settings.nkpProviders ?? []) {
-			if (p.apiKey && p.baseUrl) available.add(p.prefix || "nkp");
+			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nkp");
 		}
 	}
 	if (hasConfiguredKiroProvider()) {
@@ -971,7 +979,7 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredClineProvider()) {
 		for (const p of settings.clineProviders ?? []) {
-			if (p.accessToken) available.add(p.prefix || "cline");
+			if (!p.disabled && p.accessToken) available.add(p.prefix || "cline");
 		}
 	}
 	const result: string[] = [];
