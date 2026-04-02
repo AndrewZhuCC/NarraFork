@@ -98,6 +98,27 @@ export interface NKPProviderConfig {
 	defaultModel: string;
 }
 
+export interface NUGProviderConfig {
+	/** Unique short ID (8 chars). */
+	id: string;
+	/** User-defined display name, e.g. "NUG Production". */
+	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
+	/** Provider prefix used in model IDs, e.g. "nug". */
+	prefix: string;
+	/** NUG API Key for authentication. */
+	apiKey: string;
+	/** NUG service base URL, e.g. "http://127.0.0.1:7790". */
+	baseUrl: string;
+	/** Default model (bare name without prefix, may include channel e.g. "kiro:claude-sonnet-4.5"). */
+	defaultModel: string;
+	/** NUG account username (auto-filled after login). */
+	nugUsername?: string;
+	/** NUG account user ID (auto-filled after login). */
+	nugUserId?: string;
+}
+
 export interface ClineProviderConfig {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -318,6 +339,8 @@ export interface NarraForkSettings {
 	anthropicProviders?: AnthropicProviderConfig[];
 	/** NKP (Native Kiro Proxy) providers — remote Kiro protocol proxies. */
 	nkpProviders?: NKPProviderConfig[];
+	/** NUG (Narrafork Unified Gateway) providers — unified AI gateway. */
+	nugProviders?: NUGProviderConfig[];
 	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
 	clineProviders?: ClineProviderConfig[];
 	/** External MCP server configurations. */
@@ -699,12 +722,14 @@ let kiroModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
 let nkpModelChecker: ((model: string) => boolean) | null = null;
+let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let kiroModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
 let nkpModelLister: (() => string[]) | null = null;
+let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
 
 // Register codex model checker and lister immediately
@@ -751,6 +776,14 @@ export function registerNkpModelLister(lister: () => string[]): void {
 	nkpModelLister = lister;
 }
 
+export function registerNugModelChecker(checker: (model: string) => boolean): void {
+	nugModelChecker = checker;
+}
+
+export function registerNugModelLister(lister: () => string[]): void {
+	nugModelLister = lister;
+}
+
 export function registerClineModelChecker(checker: (model: string) => boolean): void {
 	clineModelChecker = checker;
 }
@@ -786,11 +819,21 @@ export function getVisibleModels(): string[] {
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
 	const nkp = nkpModelLister?.() ?? [];
+	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
 	const custom = (settings.agent.customModels ?? []).map((m) => m.value);
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [...kiro, ...openai, ...anthropic, ...codex, ...nkp, ...cline, ...custom]) {
+	for (const v of [
+		...kiro,
+		...openai,
+		...anthropic,
+		...codex,
+		...nkp,
+		...nug,
+		...cline,
+		...custom,
+	]) {
 		if (!seen.has(v) && !hidden.has(v)) {
 			seen.add(v);
 			result.push(v);
@@ -902,6 +945,21 @@ export function nkpProviderPrefix(config: NKPProviderConfig): string {
 }
 
 /**
+ * Get the NUG provider config by its prefix.
+ * If prefix is undefined, returns the first provider.
+ */
+export function getNugProviderConfig(prefix?: string): NUGProviderConfig | undefined {
+	const providers = (settings.nugProviders ?? []).filter((p) => !p.disabled);
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+/** Get the provider prefix for a given NUG provider config. */
+export function nugProviderPrefix(config: NUGProviderConfig): string {
+	return config.prefix;
+}
+
+/**
  * Get the Cline provider config by its prefix.
  * If prefix is undefined, returns the first provider.
  */
@@ -954,6 +1012,16 @@ export function getFirstNkpProvider(): NKPProviderConfig | undefined {
 	return (settings.nkpProviders ?? []).find((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
 }
 
+export function hasConfiguredNugProvider(): boolean {
+	const providers = settings.nugProviders ?? [];
+	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
+}
+
+/** Get the first configured NUG provider. */
+export function getFirstNugProvider(): NUGProviderConfig | undefined {
+	return (settings.nugProviders ?? []).find((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
+}
+
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
 	if (hasConfiguredOpenaiProvider()) {
@@ -972,6 +1040,11 @@ function getConfiguredProviderCandidates(): string[] {
 	if (hasConfiguredNkpProvider()) {
 		for (const p of settings.nkpProviders ?? []) {
 			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nkp");
+		}
+	}
+	if (hasConfiguredNugProvider()) {
+		for (const p of settings.nugProviders ?? []) {
+			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nug");
 		}
 	}
 	if (hasConfiguredKiroProvider()) {
@@ -1027,6 +1100,7 @@ export function resolveProvider(model?: string): string {
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
 		if (nkpModelChecker?.(bare)) return "nkp";
+		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
 	}
 

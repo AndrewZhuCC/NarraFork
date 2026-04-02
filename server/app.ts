@@ -31,6 +31,7 @@ import { narratorRoutes } from "./routes/narrators";
 import { nkpRoutes } from "./routes/nkp";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
 import { notificationRoutes } from "./routes/notifications";
+import { nugRoutes } from "./routes/nug";
 import { openaiRoutes } from "./routes/openai";
 import { overseerRoutes } from "./routes/overseers";
 import { projectDbRoutes } from "./routes/project-db";
@@ -119,6 +120,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/cline",
 	"/api/anthropic",
 	"/api/nkp",
+	"/api/nug",
 ];
 app.use("/api/*", async (c, next) => {
 	if (gitAvailable) return next();
@@ -150,6 +152,7 @@ app.route("/api/codex", codexRoutes);
 app.route("/api/cline", clineRoutes);
 app.route("/api/anthropic", anthropicRoutes);
 app.route("/api/nkp", nkpRoutes);
+app.route("/api/nug", nugRoutes);
 app.route("/api/skills", skillRoutes);
 app.route("/api/storage", storageRoutes);
 app.route("/api/runtime", runtimeRoutes);
