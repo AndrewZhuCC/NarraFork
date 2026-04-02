@@ -10,6 +10,7 @@ import { CustomModelsSection } from "../../components/providers/CustomModelsSect
 import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
+import { type NUGProviderState, NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
 import {
 	type AnthropicProviderState,
@@ -49,6 +50,10 @@ function ProvidersPage() {
 	const [nkpProviders, setNkpProviders] = useState<NKPProviderState[]>([]);
 	const [nkpInitialized, setNkpInitialized] = useState(false);
 
+	// NUG providers state
+	const [nugProviders, setNugProviders] = useState<NUGProviderState[]>([]);
+	const [nugInitialized, setNugInitialized] = useState(false);
+
 	// Hidden models state
 	const [hiddenModels, setHiddenModels] = useState<string[]>([]);
 	const [hiddenInitialized, setHiddenInitialized] = useState(false);
@@ -68,6 +73,7 @@ function ProvidersPage() {
 		openaiProviders: [] as OpenAIProviderState[],
 		anthropicProviders: [] as AnthropicProviderState[],
 		nkpProviders: [] as NKPProviderState[],
+		nugProviders: [] as NUGProviderState[],
 		hiddenModels: [] as string[],
 		customModels: [] as Array<{ value: string; label: string; provider?: string }>,
 		modelContextWindows: {} as Record<string, number>,
@@ -135,6 +141,27 @@ function ProvidersPage() {
 		}
 	}, [settings, nkpInitialized]);
 
+	// Sync NUG providers from settings
+	useEffect(() => {
+		if (settings && !nugInitialized) {
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			const providers = (settings.nugProviders ?? []).map((p: any) => ({
+				id: p.id ?? "",
+				name: p.name ?? "",
+				prefix: p.prefix ?? "nug",
+				apiKey: p.apiKey ?? "",
+				baseUrl: p.baseUrl ?? "",
+				defaultModel: p.defaultModel ?? "",
+				disabled: p.disabled ?? false,
+				nugUsername: p.nugUsername,
+				nugUserId: p.nugUserId,
+			}));
+			setNugProviders(providers);
+			serverSnapshot.current.nugProviders = providers;
+			setNugInitialized(true);
+		}
+	}, [settings, nugInitialized]);
+
 	// Sync hidden models from settings
 	useEffect(() => {
 		if (settings && !hiddenInitialized) {
@@ -177,6 +204,7 @@ function ProvidersPage() {
 				openaiProviders: [...openaiProviders],
 				anthropicProviders: [...anthropicProviders],
 				nkpProviders: [...nkpProviders],
+				nugProviders: [...nugProviders],
 				hiddenModels: [...hiddenModels],
 				customModels: [...customModels],
 				modelContextWindows: { ...modelContextWindows },
@@ -194,6 +222,7 @@ function ProvidersPage() {
 			!providersInitialized ||
 			!anthropicInitialized ||
 			!nkpInitialized ||
+			!nugInitialized ||
 			!hiddenInitialized ||
 			!customInitialized ||
 			!contextWindowsInitialized
@@ -204,6 +233,7 @@ function ProvidersPage() {
 			JSON.stringify(openaiProviders) !== JSON.stringify(s.openaiProviders) ||
 			JSON.stringify(anthropicProviders) !== JSON.stringify(s.anthropicProviders) ||
 			JSON.stringify(nkpProviders) !== JSON.stringify(s.nkpProviders) ||
+			JSON.stringify(nugProviders) !== JSON.stringify(s.nugProviders) ||
 			JSON.stringify(hiddenModels) !== JSON.stringify(s.hiddenModels) ||
 			JSON.stringify(customModels) !== JSON.stringify(s.customModels) ||
 			JSON.stringify(modelContextWindows) !== JSON.stringify(s.modelContextWindows)
@@ -212,12 +242,14 @@ function ProvidersPage() {
 		providersInitialized,
 		anthropicInitialized,
 		nkpInitialized,
+		nugInitialized,
 		hiddenInitialized,
 		customInitialized,
 		contextWindowsInitialized,
 		openaiProviders,
 		anthropicProviders,
 		nkpProviders,
+		nugProviders,
 		hiddenModels,
 		customModels,
 		modelContextWindows,
@@ -253,6 +285,16 @@ function ProvidersPage() {
 		[nkpProviders],
 	);
 
+	const isNugProviderDirty = useCallback(
+		(providerId: string) => {
+			const current = nugProviders.find((p) => p.id === providerId);
+			const saved = serverSnapshot.current.nugProviders.find((p) => p.id === providerId);
+			if (!saved) return true;
+			return JSON.stringify(current) !== JSON.stringify(saved);
+		},
+		[nugProviders],
+	);
+
 	// Prefix conflict detection — reserved prefixes and cross-provider duplicates
 	const RESERVED_PREFIXES = useMemo(() => new Set(["kiro", "codex"]), []);
 	// Extract cline provider prefixes from settings (cline state is not locally managed)
@@ -271,6 +313,7 @@ function ProvidersPage() {
 				...openaiProviders,
 				...anthropicProviders,
 				...nkpProviders,
+				...nugProviders,
 				...clineProviderPrefixes,
 			];
 			const dup = allProviders.find((p) => p.prefix === prefix && p.id !== currentProviderId);
@@ -282,6 +325,7 @@ function ProvidersPage() {
 			openaiProviders,
 			anthropicProviders,
 			nkpProviders,
+			nugProviders,
 			clineProviderPrefixes,
 			t,
 		],
@@ -342,11 +386,26 @@ function ProvidersPage() {
 				}
 			}
 		}
+		for (const provider of nugProviders) {
+			const original = serverSnapshot.current.nugProviders.find((p) => p.id === provider.id);
+			if (original && original.prefix !== provider.prefix) {
+				const oldPrefix = original.prefix;
+				const newPrefix = provider.prefix;
+				for (const key of Object.keys(migratedWindows)) {
+					if (key.startsWith(`${oldPrefix}:`)) {
+						const model = key.slice(oldPrefix.length + 1);
+						migratedWindows[`${newPrefix}:${model}`] = migratedWindows[key];
+						delete migratedWindows[key];
+					}
+				}
+			}
+		}
 
 		updateMutation.mutate({
 			openaiProviders,
 			anthropicProviders,
 			nkpProviders,
+			nugProviders,
 			agent: { hiddenModels, customModels, modelContextWindows: migratedWindows },
 		});
 	}, [
@@ -354,6 +413,7 @@ function ProvidersPage() {
 		openaiProviders,
 		anthropicProviders,
 		nkpProviders,
+		nugProviders,
 		hiddenModels,
 		customModels,
 		modelContextWindows,
@@ -477,6 +537,37 @@ function ProvidersPage() {
 		nkpModelsMap[group.providerId] = models;
 	}
 
+	// Build NUG models from per-provider grouped data
+	const nugModelsGrouped: Array<{
+		providerId: string;
+		providerName: string;
+		models: Array<Record<string, unknown>>;
+	}> = settings?.nugModelsGrouped ?? [];
+
+	const serverNugProviders: Array<{ id: string; prefix?: string; name?: string }> =
+		settings?.nugProviders ?? [];
+
+	const nugPrefixMap: Record<string, string> = {};
+	for (const p of serverNugProviders) {
+		nugPrefixMap[p.id] = p.prefix ?? "nug";
+	}
+
+	const nugModelsMap: Record<string, ModelOption[]> = {};
+	for (const group of nugModelsGrouped) {
+		const prefix = nugPrefixMap[group.providerId] ?? "nug";
+		const models: ModelOption[] = [];
+		for (const m of group.models) {
+			const id = String(m.model_id ?? m.modelId ?? m.id ?? "");
+			if (!id) continue;
+			models.push({
+				value: `${prefix}:${id}`,
+				label: String(m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? m.name ?? id),
+				provider: prefix,
+			});
+		}
+		nugModelsMap[group.providerId] = models;
+	}
+
 	return (
 		<>
 			<Stack pb={80}>
@@ -492,6 +583,21 @@ function ProvidersPage() {
 					onContextWindowChange={handleContextWindowChange}
 					isProviderDirty={isNkpProviderDirty}
 					quotas={settings?.nkpQuotas}
+					customModels={customModels}
+					onCustomModelsChange={setCustomModels}
+					getPrefixError={getPrefixError}
+					onTestModel={setTestingModel}
+				/>
+
+				<NUGProvidersSection
+					providers={nugProviders}
+					onProvidersChange={setNugProviders}
+					providerModelsMap={nugModelsMap}
+					hiddenModels={hiddenModels}
+					onToggleHidden={toggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={handleContextWindowChange}
+					isProviderDirty={isNugProviderDirty}
 					customModels={customModels}
 					onCustomModelsChange={setCustomModels}
 					getPrefixError={getPrefixError}
@@ -571,6 +677,7 @@ function ProvidersPage() {
 						...openaiProviders.map((p) => p.prefix || "openai"),
 						...anthropicProviders.map((p) => p.prefix || "anthropic"),
 						...nkpProviders.map((p) => p.prefix || "nkp"),
+						...nugProviders.map((p) => p.prefix || "nug"),
 					]);
 					const orphanModels = customModels.filter((m) => {
 						const prefix = m.value.split(":")[0];
