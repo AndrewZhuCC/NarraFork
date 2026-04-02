@@ -425,6 +425,7 @@ export function KiroSection({
 											onToggleHidden={onToggleHidden}
 											modelContextWindows={modelContextWindows}
 											onContextWindowChange={onContextWindowChange}
+											onTestModel={onTestModel}
 										/>
 									</Stack>
 								</Collapse>

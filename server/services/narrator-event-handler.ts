@@ -126,6 +126,10 @@ export interface StreamingSnapshot {
 	streamingText: string;
 	streamingReasoning: string;
 	toolChunks: Map<string, ToolChunkSnapshot>;
+	/** Cached NKP queue position (> 0 means queued). */
+	nkpQueuePosition?: number;
+	/** Cached NKP queue depth. */
+	nkpQueueDepth?: number;
 }
 
 const streamingSnapshots = hotSafe<Map<string, StreamingSnapshot>>(
@@ -880,6 +884,11 @@ export async function processEvent(
 		}
 
 		case "nkp_queue_status": {
+			// Cache queue position in the streaming snapshot so late-joining
+			// subscribers see it immediately via streaming_snapshot.
+			const qSnap = getOrCreateSnapshot(narratorId);
+			qSnap.nkpQueuePosition = event.position;
+			qSnap.nkpQueueDepth = event.queueDepth;
 			dualBroadcast(ctx, {
 				type: "nkp_queue_status",
 				narratorId: broadcastTargetId,

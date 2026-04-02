@@ -1209,14 +1209,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			},
 			onStatusChange: (status, turnStartedAt) => {
 				setIsCompacting(false);
-				setNkpQueuePosition(null);
 				if (retryInfo) setRetryInfo(null);
 				// Clean up streaming state for ALL terminal statuses, not just "idle".
 				// "interrupted" and "done" also mean the agent loop has stopped, so any
 				// residual streaming text / tool chunks must be flushed.
 				const isTerminal =
 					status === "idle" || status === "interrupted" || status === "done" || status === "error";
+				// Only clear NKP queue position on terminal statuses — clearing on
+				// "thinking" would race with the nkp_queue_status event that arrives
+				// shortly after the thinking transition.
 				if (isTerminal) {
+					setNkpQueuePosition(null);
+
 					const hadStreaming =
 						!!streamingRef.current || !!streamingReasoningRef.current || !!webSearchRef.current;
 					if (streamingRef.current) {
@@ -1232,8 +1236,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (hadStreaming) {
 						clearStreamingState();
 					}
-				}
-				if (isTerminal) {
+
 					// Cancel any pending RAF tool chunk flush and notify so the memo
 					// recomputes — otherwise stale streaming tool blocks linger on screen.
 					// Include subagent chunks since the entire session is done.
