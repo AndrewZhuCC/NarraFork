@@ -116,7 +116,7 @@ function BetaTrialPage() {
 				<Button
 					variant="subtle"
 					leftSection={<IconArrowLeft size={16} />}
-					onClick={() => navigate({ to: "/admin/providers" })}
+					onClick={() => navigate({ to: "/admin" })}
 				>
 					{t("betaTrialBack")}
 				</Button>
@@ -133,7 +133,7 @@ function BetaTrialPage() {
 
 			{existingProvider && !createMutation.isSuccess ? (
 				<Alert color="blue" title={t("betaTrialAlreadyExists")}>
-					<Button variant="light" mt="sm" onClick={() => navigate({ to: "/admin/providers" })}>
+					<Button variant="light" mt="sm" onClick={() => navigate({ to: "/admin" })}>
 						{t("betaTrialGoToProviders")}
 					</Button>
 				</Alert>
@@ -143,7 +143,7 @@ function BetaTrialPage() {
 						<Text size="sm">
 							{t("betaTrialSuccess", { count: createMutation.data?.modelCount ?? 0 })}
 						</Text>
-						<Button variant="light" onClick={() => navigate({ to: "/admin/providers" })}>
+						<Button variant="light" onClick={() => navigate({ to: "/admin" })}>
 							{t("betaTrialGoToProviders")}
 						</Button>
 					</Stack>
