@@ -34,7 +34,7 @@ import {
 	IconUser,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
@@ -54,6 +54,8 @@ export interface NUGProviderState {
 	nugUsername?: string;
 	nugUserId?: string;
 }
+
+type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
 
 interface ChannelHealth {
 	channelType: string;
@@ -100,9 +102,9 @@ interface UsageSummary {
 
 interface NUGProvidersSectionProps {
 	providers: NUGProviderState[];
-	onProvidersChange: (providers: NUGProviderState[]) => void;
+	onProvidersChange: (updater: ProvidersUpdater) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
@@ -376,7 +378,6 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 				</Group>
 			</Group>
 
-			{/* Summary cards */}
 			{summary && (
 				<SimpleGrid cols={3} mb="xs">
 					<Paper withBorder p="xs" ta="center">
@@ -400,7 +401,6 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 				</SimpleGrid>
 			)}
 
-			{/* Events table */}
 			<Table striped highlightOnHover withTableBorder withColumnBorders fz="xs">
 				<Table.Thead>
 					<Table.Tr>
@@ -417,9 +417,8 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 						const hasCache = ev.cacheCreationInputTokens > 0 || ev.cacheReadInputTokens > 0;
 						const isExpanded = expandedRow === ev.id;
 						return (
-							<>
+							<React.Fragment key={ev.id}>
 								<Table.Tr
-									key={ev.id}
 									style={{ cursor: hasCache ? "pointer" : undefined }}
 									onClick={() => hasCache && setExpandedRow(isExpanded ? null : ev.id)}
 								>
@@ -439,13 +438,13 @@ function NUGUsagePanel({ providerId }: { providerId: string }) {
 									</Table.Td>
 								</Table.Tr>
 								{isExpanded && (
-									<Table.Tr key={`${ev.id}-detail`}>
+									<Table.Tr>
 										<Table.Td colSpan={6}>
 											<CacheDetail event={ev} />
 										</Table.Td>
 									</Table.Tr>
 								)}
-							</>
+							</React.Fragment>
 						);
 					})}
 					{events.length === 0 && (
@@ -522,7 +521,7 @@ function CacheDetail({ event }: { event: UsageEvent }) {
 
 /* ── Main Section Component ────────────────────────────── */
 
-export function NUGProvidersSection({
+export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	providers,
 	onProvidersChange,
 	providerModelsMap,
@@ -545,8 +544,8 @@ export function NUGProvidersSection({
 
 	const handleAddProvider = useCallback(() => {
 		const id = Math.random().toString(36).slice(2, 10);
-		onProvidersChange([
-			...providers,
+		onProvidersChange((prev) => [
+			...prev,
 			{
 				id,
 				name: "NUG",
@@ -557,20 +556,20 @@ export function NUGProvidersSection({
 			},
 		]);
 		setExpandedProviders((prev) => new Set(prev).add(id));
-	}, [providers, onProvidersChange]);
+	}, [onProvidersChange]);
 
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.filter((p) => p.id !== id));
+			onProvidersChange((prev) => prev.filter((p) => p.id !== id));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const updateProvider = useCallback(
 		(id: string, updates: Partial<NUGProviderState>) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, ...updates } : p)));
+			onProvidersChange((prev) => prev.map((p) => (p.id === id ? { ...p, ...updates } : p)));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const toggleProviderExpanded = useCallback((id: string) => {
@@ -584,9 +583,11 @@ export function NUGProvidersSection({
 
 	const toggleProviderDisabled = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)));
+			onProvidersChange((prev) =>
+				prev.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)),
+			);
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const handleRefreshModels = useCallback(
@@ -691,9 +692,7 @@ export function NUGProvidersSection({
 												)}
 												{!p.disabled && providerModelCount > 0 && (
 													<Badge size="xs" variant="light">
-														{t("nkpModelsCount", {
-															count: providerModelCount,
-														})}
+														{t("nkpModelsCount", { count: providerModelCount })}
 													</Badge>
 												)}
 												{p.nugUsername && (
@@ -732,11 +731,7 @@ export function NUGProvidersSection({
 													label={t("nugProviderName")}
 													placeholder="NUG"
 													value={p.name}
-													onChange={(e) =>
-														updateProvider(p.id, {
-															name: e.currentTarget.value,
-														})
-													}
+													onChange={(e) => updateProvider(p.id, { name: e.currentTarget.value })}
 												/>
 												<TextInput
 													label={t("nugProviderPrefix")}
@@ -756,11 +751,7 @@ export function NUGProvidersSection({
 													label={t("nugBaseUrl")}
 													placeholder="http://localhost:7800"
 													value={p.baseUrl}
-													onChange={(e) =>
-														updateProvider(p.id, {
-															baseUrl: e.currentTarget.value,
-														})
-													}
+													onChange={(e) => updateProvider(p.id, { baseUrl: e.currentTarget.value })}
 												/>
 												<Group gap="xs" align="flex-end">
 													<PasswordInput
@@ -768,9 +759,7 @@ export function NUGProvidersSection({
 														placeholder={t("nugApiKeyPlaceholder")}
 														value={p.apiKey}
 														onChange={(e) =>
-															updateProvider(p.id, {
-																apiKey: e.currentTarget.value,
-															})
+															updateProvider(p.id, { apiKey: e.currentTarget.value })
 														}
 														style={{ flex: 1 }}
 													/>
@@ -821,16 +810,14 @@ export function NUGProvidersSection({
 													</Button>
 													{providerModelCount > 0 && (
 														<Text size="xs" c="dimmed">
-															{t("nkpModelsCount", {
-																count: providerModelCount,
-															})}
+															{t("nkpModelsCount", { count: providerModelCount })}
 														</Text>
 													)}
 												</Group>
 												{pModels.length > 0 && (
 													<Stack gap="xs" mt="xs">
 														{pModels.map((m) => {
-															const isHidden = hiddenModels.includes(m.value);
+															const isHidden = hiddenModels.has(m.value);
 															return (
 																<Group
 																	key={m.value}
@@ -841,18 +828,12 @@ export function NUGProvidersSection({
 																	<TextInput
 																		value={m.value}
 																		disabled
-																		style={{
-																			flex: 1,
-																			minWidth: 120,
-																		}}
+																		style={{ flex: 1, minWidth: 120 }}
 																	/>
 																	<TextInput
 																		value={m.label}
 																		disabled
-																		style={{
-																			flex: 1,
-																			minWidth: 120,
-																		}}
+																		style={{ flex: 1, minWidth: 120 }}
 																	/>
 																	<NumberInput
 																		placeholder={t("contextWindowPlaceholder")}
@@ -924,4 +905,4 @@ export function NUGProvidersSection({
 			)}
 		</Paper>
 	);
-}
+});

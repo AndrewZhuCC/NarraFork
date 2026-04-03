@@ -253,6 +253,8 @@ export interface NarraForkSettings {
 			denyPrompt?: string;
 			enabled?: boolean;
 		}>;
+		/** Default system prompt — used as base prompt for all narrators when their own systemPrompt is null. */
+		defaultSystemPrompt?: string;
 		/** WebFetch permission policy. */
 		webFetchPolicy?: {
 			/** When true, all URLs are auto-allowed without user approval. */
@@ -605,6 +607,9 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const prov of merged.nkpProviders ?? []) {
+		if (prov.prefix) activePrefixes.add(prov.prefix);
+	}
+	for (const prov of merged.nugProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const prov of merged.clineProviders ?? []) {

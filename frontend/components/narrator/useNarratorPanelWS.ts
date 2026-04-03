@@ -102,6 +102,7 @@ export interface UseNarratorPanelWSReturn {
 	queuedMessages: BufferMessageSummary[];
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
 	isCompacting: boolean;
+	isCheckingInterrupt: boolean;
 	nkpQueuePosition: number | null;
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
@@ -289,6 +290,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Misc state ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [isCompacting, setIsCompacting] = useState(false);
+	const [isCheckingInterrupt, setIsCheckingInterrupt] = useState(false);
 	const [nkpQueuePosition, setNkpQueuePosition] = useState<number | null>(null);
 	const [contextPercent, setContextPercent] = useState<number | null>(null);
 	const [promptTokens, setPromptTokens] = useState<number | null>(null);
@@ -1228,6 +1230,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				// residual streaming text / tool chunks must be flushed.
 				const isTerminal =
 					status === "idle" || status === "interrupted" || status === "done" || status === "error";
+				// Clear interrupt checking state on any terminal status (safety net)
+				if (isTerminal) setIsCheckingInterrupt(false);
 				// Only clear NKP queue position on terminal statuses — clearing on
 				// "thinking" would race with the nkp_queue_status event that arrives
 				// shortly after the thinking transition.
@@ -1358,6 +1362,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				removeStreamingChunksMsg(qc, messagesQueryKey);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
+			},
+			onInterruptChecking: () => {
+				setIsCheckingInterrupt(true);
+			},
+			onInterruptCheckDone: () => {
+				setIsCheckingInterrupt(false);
 			},
 			onNarratorError: (error, errorCode) => {
 				// Session error may leave synthetic streaming chunks in the cache.
@@ -1811,6 +1821,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		queuedMessages,
 		setQueuedMessages,
 		isCompacting,
+		isCheckingInterrupt,
 		nkpQueuePosition,
 		contextPercent,
 		setContextPercent,

@@ -30,7 +30,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
@@ -55,7 +55,7 @@ function fmtNum(n: number): string {
 interface KiroSectionProps {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
 	settings: any;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
@@ -64,7 +64,7 @@ interface KiroSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function KiroSection({
+export const KiroSection = React.memo(function KiroSection({
 	settings,
 	hiddenModels,
 	onToggleHidden,
@@ -388,7 +388,7 @@ export function KiroSection({
 								<Collapse in={modelsExpanded}>
 									<Stack gap="xs" mt="xs">
 										{kiroModels.map((m) => {
-											const isHidden = hiddenModels.includes(m.value);
+											const isHidden = hiddenModels.has(m.value);
 											return (
 												<Group
 													key={m.value}
@@ -436,7 +436,7 @@ export function KiroSection({
 			</Stack>
 		</Paper>
 	);
-}
+});
 
 // --- Credential list (responsive: cards on mobile, table on desktop) ---
 

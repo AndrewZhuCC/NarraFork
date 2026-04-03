@@ -28,6 +28,7 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
 import { getAllNkpCachedQuotas, getNkpCachedModelsGrouped, purgeNkpProviderCache } from "./nkp";
+import { getNugCachedModelsGrouped, purgeNugProviderCache } from "./nug";
 import {
 	getOpenaiCachedModels,
 	getOpenaiCachedModelsGrouped,
@@ -72,6 +73,17 @@ const nkpProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
+});
+
+const nugProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	nugUsername: z.string().optional(),
+	nugUserId: z.string().optional(),
 });
 
 const clineProviderSchema = z.object({
@@ -194,6 +206,7 @@ const updateSettingsSchema = z
 							.optional(),
 					})
 					.optional(),
+				defaultSystemPrompt: z.string().max(50000).optional(),
 			})
 			.partial()
 			.optional(),
@@ -236,6 +249,7 @@ const updateSettingsSchema = z
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nkpProviders: z.array(nkpProviderSchema).optional(),
+		nugProviders: z.array(nugProviderSchema).optional(),
 		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
 			.object({
@@ -339,6 +353,11 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn: purgeNkpProviderCache,
 		},
 		{
+			type: "nug",
+			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
+			fn: purgeNugProviderCache,
+		},
+		{
 			type: "cline",
 			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
 			fn: purgeClineProviderCache,
@@ -362,6 +381,7 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			prev.openaiProviders,
 			prev.anthropicProviders,
 			prev.nkpProviders,
+			prev.nugProviders,
 			prev.clineProviders,
 		]) {
 			for (const p of prov ?? []) {
@@ -408,6 +428,10 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		nugProviders: (s.nugProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		clineProviders: (s.clineProviders ?? []).map((p) => ({
 			...p,
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
@@ -417,6 +441,7 @@ settingsRoutes.get("/", (c) => {
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nkpModelsGrouped: getNkpCachedModelsGrouped(),
+		nugModelsGrouped: getNugCachedModelsGrouped(),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		nkpQuotas: getAllNkpCachedQuotas(),
 		codexAvailable: codexSnapshot.available > 0,
@@ -486,6 +511,9 @@ settingsRoutes.patch("/", async (c) => {
 		}
 		for (const p of validated.nkpProviders ?? current.nkpProviders ?? []) {
 			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NKP "${p.name || p.id}"` });
+		}
+		for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
+			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
 		}
 		for (const p of validated.clineProviders ?? current.clineProviders ?? []) {
 			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Cline "${p.name || p.id}"` });
@@ -580,6 +608,17 @@ settingsRoutes.patch("/", async (c) => {
 		}
 	}
 
+	// Preserve real API keys for NUG providers
+	if (validated.nugProviders) {
+		const currentProviders = current.nugProviders ?? [];
+		for (const p of validated.nugProviders) {
+			if (p.apiKey?.startsWith("*")) {
+				const existing = currentProviders.find((cp) => cp.id === p.id);
+				p.apiKey = existing?.apiKey ?? "";
+			}
+		}
+	}
+
 	// Preserve real access tokens for Cline providers
 	if (validated.clineProviders) {
 		const currentProviders = current.clineProviders ?? [];
@@ -599,6 +638,7 @@ settingsRoutes.patch("/", async (c) => {
 			key === "openaiProviders" ||
 			key === "anthropicProviders" ||
 			key === "nkpProviders" ||
+			key === "nugProviders" ||
 			key === "clineProviders"
 		) {
 			// Array — replace entirely, don't merge
@@ -675,6 +715,10 @@ settingsRoutes.patch("/", async (c) => {
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		nkpProviders: (merged.nkpProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
+		nugProviders: (merged.nugProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),

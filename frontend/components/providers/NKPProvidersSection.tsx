@@ -26,7 +26,7 @@ import {
 	IconTrash,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
@@ -34,11 +34,13 @@ import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import type { NKPProviderState } from "./types";
 
+type ProvidersUpdater = NKPProviderState[] | ((prev: NKPProviderState[]) => NKPProviderState[]);
+
 interface NKPProvidersSectionProps {
 	providers: NKPProviderState[];
-	onProvidersChange: (providers: NKPProviderState[]) => void;
+	onProvidersChange: (updater: ProvidersUpdater) => void;
 	providerModelsMap: Record<string, ModelOption[]>;
-	hiddenModels: string[];
+	hiddenModels: Set<string>;
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
@@ -50,7 +52,7 @@ interface NKPProvidersSectionProps {
 	onTestModel?: (model: string) => void;
 }
 
-export function NKPProvidersSection({
+export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 	providers,
 	onProvidersChange,
 	providerModelsMap,
@@ -73,8 +75,8 @@ export function NKPProvidersSection({
 
 	const handleAddProvider = useCallback(() => {
 		const id = Math.random().toString(36).slice(2, 10);
-		onProvidersChange([
-			...providers,
+		onProvidersChange((prev) => [
+			...prev,
 			{
 				id,
 				name: "NKP",
@@ -85,20 +87,20 @@ export function NKPProvidersSection({
 			},
 		]);
 		setExpandedProviders((prev) => new Set(prev).add(id));
-	}, [providers, onProvidersChange]);
+	}, [onProvidersChange]);
 
 	const handleRemoveProvider = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.filter((p) => p.id !== id));
+			onProvidersChange((prev) => prev.filter((p) => p.id !== id));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const updateProvider = useCallback(
 		(id: string, field: keyof NKPProviderState, value: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
+			onProvidersChange((prev) => prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const toggleProviderExpanded = useCallback((id: string) => {
@@ -112,9 +114,11 @@ export function NKPProvidersSection({
 
 	const toggleProviderDisabled = useCallback(
 		(id: string) => {
-			onProvidersChange(providers.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)));
+			onProvidersChange((prev) =>
+				prev.map((p) => (p.id === id ? { ...p, disabled: !p.disabled } : p)),
+			);
 		},
-		[providers, onProvidersChange],
+		[onProvidersChange],
 	);
 
 	const handleRefreshProviderModels = useCallback(
@@ -209,9 +213,7 @@ export function NKPProvidersSection({
 												)}
 												{!p.disabled && providerModelCount > 0 && (
 													<Badge size="xs" variant="light">
-														{t("nkpModelsCount", {
-															count: providerModelCount,
-														})}
+														{t("nkpModelsCount", { count: providerModelCount })}
 													</Badge>
 												)}
 												{!p.disabled && quota?.quotaBalance != null && (
@@ -292,16 +294,14 @@ export function NKPProvidersSection({
 													</Button>
 													{providerModelCount > 0 && (
 														<Text size="xs" c="dimmed">
-															{t("nkpModelsCount", {
-																count: providerModelCount,
-															})}
+															{t("nkpModelsCount", { count: providerModelCount })}
 														</Text>
 													)}
 												</Group>
 												{pModels.length > 0 && (
 													<Stack gap="xs" mt="xs">
 														{pModels.map((m) => {
-															const isHidden = hiddenModels.includes(m.value);
+															const isHidden = hiddenModels.has(m.value);
 															return (
 																<Group
 																	key={m.value}
@@ -376,4 +376,4 @@ export function NKPProvidersSection({
 			</Stack>
 		</Paper>
 	);
-}
+});
