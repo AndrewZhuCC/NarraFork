@@ -127,8 +127,11 @@ interface NarratorWSCallbacks {
 		}>,
 	) => void;
 	onStreamingSnapshot?: (snapshot: {
-		streamingText: string;
-		streamingReasoning: string;
+		streamingBlocks: Array<
+			| { type: "reasoning"; text: string }
+			| { type: "web_search"; id: string; status: string; query?: string; queries?: string[] }
+			| { type: "text"; text: string }
+		>;
 		toolChunks: Array<{
 			toolUseId: string;
 			toolName: string;
@@ -488,8 +491,17 @@ export function useNarratorWS(
 						break;
 					case "streaming_snapshot":
 						callbacksRef.current.onStreamingSnapshot?.({
-							streamingText: (data.streamingText as string) ?? "",
-							streamingReasoning: (data.streamingReasoning as string) ?? "",
+							streamingBlocks: (data.streamingBlocks ?? []) as Array<
+								| { type: "reasoning"; text: string }
+								| {
+										type: "web_search";
+										id: string;
+										status: string;
+										query?: string;
+										queries?: string[];
+								  }
+								| { type: "text"; text: string }
+							>,
 							toolChunks: (data.toolChunks ?? []) as Array<{
 								toolUseId: string;
 								toolName: string;

@@ -1359,11 +1359,9 @@ export function NarratorPanel({
 		reconnect,
 		sendBufferMessage,
 		cancelBuffer,
-		streamingRef,
-		streamingReasoningRef,
 		streamingVersion,
 		topLevelStreamingChunks,
-		webSearchRef,
+		streamingBlocksRef,
 		renderPermCb,
 		queuedMessages,
 		setQueuedMessages,
@@ -2223,11 +2221,7 @@ export function NarratorPanel({
 	// into a single message so segmentMessages can apply canonical ordering and
 	// merge tool-runs correctly.
 	const streamingReasoningCreatedAtRef = useRef<string | null>(null);
-	const hasStreamingContent =
-		!!streamingRef.current ||
-		!!streamingReasoningRef.current ||
-		!!topLevelStreamingChunks ||
-		!!webSearchRef.current;
+	const hasStreamingContent = streamingBlocksRef.current.length > 0 || !!topLevelStreamingChunks;
 	if (hasStreamingContent) {
 		if (!streamingReasoningCreatedAtRef.current) {
 			streamingReasoningCreatedAtRef.current = new Date().toISOString();
@@ -2240,12 +2234,11 @@ export function NarratorPanel({
 	// reference when the actual streaming content changes, not on every render.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: refs are read intentionally — streamingVersion forces re-evaluation
 	const streamingMsg = useMemo(() => {
-		// streamingVersion forces re-read of refs (streamingRef, webSearchRef)
+		// streamingVersion forces re-read of streamingBlocksRef
 		void streamingVersion;
 		return buildStreamingMsg({
-			streamingText: streamingRef.current || undefined,
-			streamingReasoning: streamingReasoningRef.current || undefined,
-			webSearch: webSearchRef.current,
+			streamingBlocks:
+				streamingBlocksRef.current.length > 0 ? streamingBlocksRef.current : undefined,
 			toolChunksMsg: topLevelStreamingChunks,
 			narratorId,
 		});
@@ -2859,8 +2852,7 @@ export function NarratorPanel({
 
 	// --- Send / retry message ---
 	const submitMessage = async (msg: string, images: File[] = [], textFiles: File[] = []) => {
-		streamingRef.current = "";
-		streamingReasoningRef.current = "";
+		streamingBlocksRef.current = [];
 
 		// Detect slash command for optimistic display
 		const isSlashCommand = msg.startsWith("/") && /^\/[a-zA-Z0-9_-]+(\s|$)/.test(msg);
