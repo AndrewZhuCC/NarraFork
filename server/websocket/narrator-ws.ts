@@ -856,6 +856,7 @@ export const handleNarratorWS = {
 								msg.narratorId,
 								cmdResult as LoadToolResult | LoadToolNotFound,
 								locale,
+								userId,
 							);
 							return;
 						}
