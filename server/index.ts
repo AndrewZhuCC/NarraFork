@@ -36,6 +36,7 @@ import {
 import { ensureRootlessEnv } from "./services/container-service";
 import { recoverOnStartup as recoverNarrators } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
+import { initContainerEventHandler } from "./services/container-event-handler";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { initReviewEventHandler } from "./services/review-event-handler";
 import { terminalService } from "./services/terminal-service";
@@ -626,6 +627,9 @@ registerProjectDbSync();
 
 // Register review event handler (inject feedback into source narrator on conclude)
 initReviewEventHandler();
+
+// Register container event handler (inject access info + auto-enable Browser on container start)
+initContainerEventHandler();
 
 // Fetch NKP quota balances on startup
 import("./routes/nkp")
