@@ -206,6 +206,7 @@ function SettingsPage() {
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
 	const [maxTransientRetries, setMaxTransientRetries] = useState(10);
+	const [retryBackoffCeilMs, setRetryBackoffCeilMs] = useState(20000);
 	const [customRetryRules, setCustomRetryRules] = useState<
 		Array<{
 			id: string;
@@ -287,6 +288,7 @@ function SettingsPage() {
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
+		retryBackoffCeilMs: 20000,
 		customRetryRules: [] as Array<{
 			id: string;
 			domain?: string;
@@ -364,6 +366,7 @@ function SettingsPage() {
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
+				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
 				contextThresholds: settings.agent?.contextThresholds ?? {
 					standard: { pruneStart: 95, compactStart: 99 },
@@ -412,6 +415,7 @@ function SettingsPage() {
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setSmartInterruptionCheck(snap.smartInterruptionCheck);
 			setMaxTransientRetries(snap.maxTransientRetries);
+			setRetryBackoffCeilMs(snap.retryBackoffCeilMs);
 			setCustomRetryRules(snap.customRetryRules);
 			setContextThresholds(snap.contextThresholds);
 			setCodexDefaultReasoningEffort(snap.codexDefaultReasoningEffort);
@@ -463,6 +467,7 @@ function SettingsPage() {
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			smartInterruptionCheck !== s.smartInterruptionCheck ||
 			maxTransientRetries !== s.maxTransientRetries ||
+			retryBackoffCeilMs !== s.retryBackoffCeilMs ||
 			JSON.stringify(customRetryRules) !== JSON.stringify(s.customRetryRules) ||
 			JSON.stringify(contextThresholds) !== JSON.stringify(s.contextThresholds) ||
 			codexDefaultReasoningEffort !== s.codexDefaultReasoningEffort ||
@@ -580,6 +585,7 @@ function SettingsPage() {
 					defaultRelaxedPlan,
 					smartInterruptionCheck,
 					maxTransientRetries,
+					retryBackoffCeilMs,
 					customRetryRules,
 					contextThresholds,
 					whitelistDirs: globalWhitelistDirs,
@@ -655,6 +661,7 @@ function SettingsPage() {
 						defaultRelaxedPlan,
 						smartInterruptionCheck,
 						maxTransientRetries,
+						retryBackoffCeilMs,
 						customRetryRules,
 						contextThresholds,
 						codexDefaultReasoningEffort,
@@ -771,6 +778,8 @@ function SettingsPage() {
 							setSmartInterruptionCheck={setSmartInterruptionCheck}
 							maxTransientRetries={maxTransientRetries}
 							setMaxTransientRetries={setMaxTransientRetries}
+							retryBackoffCeilMs={retryBackoffCeilMs}
+							setRetryBackoffCeilMs={setRetryBackoffCeilMs}
 							customRetryRules={customRetryRules}
 							setCustomRetryRules={setCustomRetryRules}
 							contextThresholds={contextThresholds}
