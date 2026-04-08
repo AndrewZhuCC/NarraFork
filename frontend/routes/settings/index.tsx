@@ -201,6 +201,7 @@ function SettingsPage() {
 		general: [],
 	});
 	const [legacyEncoding, setLegacyEncoding] = useState(false);
+	const [freshShellEnv, setFreshShellEnv] = useState(false);
 	const [translateReasoning, setTranslateReasoning] = useState(false);
 	const [defaultRelaxedPlan, setDefaultRelaxedPlan] = useState(false);
 	const [smartInterruptionCheck, setSmartInterruptionCheck] = useState(true);
@@ -281,6 +282,7 @@ function SettingsPage() {
 		proxyEnabled: false,
 		proxyPort: 7780,
 		legacyEncoding: false,
+		freshShellEnv: false,
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
 		smartInterruptionCheck: true,
@@ -357,6 +359,7 @@ function SettingsPage() {
 				proxyEnabled: settings.containers?.proxy?.enabled ?? false,
 				proxyPort: settings.containers?.proxy?.port ?? 7780,
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
+				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
@@ -404,6 +407,7 @@ function SettingsPage() {
 			setProxyEnabled(snap.proxyEnabled);
 			setProxyPort(snap.proxyPort);
 			setLegacyEncoding(snap.legacyEncoding);
+			setFreshShellEnv(snap.freshShellEnv);
 			setTranslateReasoning(snap.translateReasoning);
 			setDefaultRelaxedPlan(snap.defaultRelaxedPlan);
 			setSmartInterruptionCheck(snap.smartInterruptionCheck);
@@ -454,6 +458,7 @@ function SettingsPage() {
 			proxyEnabled !== s.proxyEnabled ||
 			proxyPort !== s.proxyPort ||
 			legacyEncoding !== s.legacyEncoding ||
+			freshShellEnv !== s.freshShellEnv ||
 			translateReasoning !== s.translateReasoning ||
 			defaultRelaxedPlan !== s.defaultRelaxedPlan ||
 			smartInterruptionCheck !== s.smartInterruptionCheck ||
@@ -499,6 +504,7 @@ function SettingsPage() {
 		proxyEnabled,
 		proxyPort,
 		legacyEncoding,
+		freshShellEnv,
 		translateReasoning,
 		defaultRelaxedPlan,
 		smartInterruptionCheck,
@@ -569,6 +575,7 @@ function SettingsPage() {
 					},
 					subagentAllowedModels,
 					legacyEncoding,
+					freshShellEnv,
 					translateReasoning,
 					defaultRelaxedPlan,
 					smartInterruptionCheck,
@@ -643,6 +650,7 @@ function SettingsPage() {
 						proxyEnabled,
 						proxyPort,
 						legacyEncoding,
+						freshShellEnv,
 						translateReasoning,
 						defaultRelaxedPlan,
 						smartInterruptionCheck,
@@ -751,6 +759,8 @@ function SettingsPage() {
 							setMaxTurns={setMaxTurns}
 							legacyEncoding={legacyEncoding}
 							setLegacyEncoding={setLegacyEncoding}
+							freshShellEnv={freshShellEnv}
+							setFreshShellEnv={setFreshShellEnv}
 							translateReasoning={translateReasoning}
 							setTranslateReasoning={setTranslateReasoning}
 							expandReasoning={expandReasoning}
