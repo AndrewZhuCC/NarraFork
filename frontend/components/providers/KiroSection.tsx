@@ -2,7 +2,7 @@ import {
 	ActionIcon,
 	Badge,
 	Button,
-	Collapse,
+	Divider,
 	Group,
 	NumberInput,
 	Paper,
@@ -14,38 +14,21 @@ import {
 	Text,
 	Textarea,
 	TextInput,
-	Title,
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import {
-	IconChevronDown,
-	IconChevronRight,
-	IconDeviceFloppy,
-	IconEye,
-	IconEyeOff,
-	IconPlayerPlay,
-	IconRefresh,
-	IconTrash,
-} from "@tabler/icons-react";
+import { IconDeviceFloppy, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
+import { relativeTime } from "../../lib/relative-time";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
+import { ModelList } from "./ModelList";
 import { classifyKiroTier, type KiroAccountTier, TIER_CONFIG } from "./types";
-
-function relativeTime(iso: string | undefined): string {
-	if (!iso) return "-";
-	const diff = Date.now() - new Date(iso).getTime();
-	if (diff < 60_000) return "<1m ago";
-	if (diff < 3600_000) return `${Math.floor(diff / 60_000)}m ago`;
-	if (diff < 86400_000) return `${Math.floor(diff / 3600_000)}h ago`;
-	return `${Math.floor(diff / 86400_000)}d ago`;
-}
 
 /** Format a number to exactly 2 decimal places. */
 function fmtNum(n: number): string {
@@ -76,10 +59,7 @@ export const KiroSection = React.memo(function KiroSection({
 }: KiroSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
-	const [expanded, setExpanded] = useState(false);
 	const [refreshingKiro, setRefreshingKiro] = useState(false);
-	const [credentialsExpanded, setCredentialsExpanded] = useState(false);
-	const [modelsExpanded, setModelsExpanded] = useState(true);
 
 	// --- Kiro credential state ---
 	const [importJson, setImportJson] = useState("");
@@ -218,223 +198,159 @@ export const KiroSection = React.memo(function KiroSection({
 	}
 
 	return (
-		<Paper withBorder p="md">
-			<Stack gap="md">
-				<Group
-					justify="space-between"
-					style={{ cursor: "pointer" }}
-					onClick={() => setExpanded((v) => !v)}
-				>
-					<Group gap="xs">
-						{expanded ? <IconChevronDown size={20} /> : <IconChevronRight size={20} />}
-						<Title order={4}>{t("kiroSection")}</Title>
-					</Group>
-					<Badge size="sm" color={snapshot && snapshot.available > 0 ? "green" : "gray"}>
-						{snapshot?.available ?? 0} / {snapshot?.total ?? 0}
-					</Badge>
+		<Stack gap="md">
+			<Group justify="space-between">
+				<Text fw={500} size="sm">
+					{t("kiroSection")}
+				</Text>
+				<Badge size="sm" color={snapshot && snapshot.available > 0 ? "green" : "gray"}>
+					{snapshot?.available ?? 0} / {snapshot?.total ?? 0}
+				</Badge>
+			</Group>
+
+			<Text size="xs" c="dimmed">
+				{t("kiroSectionDesc")}
+			</Text>
+
+			{/* Load balancing mode */}
+			{snapshot && (
+				<Group gap="xs" align="center">
+					<Text size="sm">{t("kiroLoadBalancing")}:</Text>
+					<SegmentedControl
+						size="xs"
+						value={snapshot.loadBalancingMode}
+						onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
+						data={[
+							{ value: "priority", label: t("kiroModePriority") },
+							{ value: "balanced", label: t("kiroModeBalanced") },
+						]}
+					/>
 				</Group>
+			)}
 
-				<Collapse in={expanded}>
-					<Stack gap="md">
-						<Text size="xs" c="dimmed">
-							{t("kiroSectionDesc")}
-						</Text>
+			{/* === Credentials Sub-section === */}
+			<Divider />
+			<Group gap="xs">
+				<Text fw={500} size="sm">
+					{t("kiroCredentialsSection")}
+				</Text>
+				{entries.length > 0 && (
+					<Badge size="xs" variant="light">
+						{entries.length}
+					</Badge>
+				)}
+			</Group>
 
-						{/* Load balancing mode */}
-						{snapshot && (
-							<Group gap="xs" align="center">
-								<Text size="sm">{t("kiroLoadBalancing")}:</Text>
-								<SegmentedControl
-									size="xs"
-									value={snapshot.loadBalancingMode}
-									onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
-									data={[
-										{ value: "priority", label: t("kiroModePriority") },
-										{ value: "balanced", label: t("kiroModeBalanced") },
-									]}
-								/>
-							</Group>
-						)}
+			{/* Import area */}
+			<Textarea
+				size="xs"
+				placeholder={t("kiroImportPlaceholder")}
+				value={importJson}
+				onChange={(e) => setImportJson(e.currentTarget.value)}
+				minRows={2}
+				autosize
+				styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
+			/>
+			{importError && (
+				<Text c="red" size="sm">
+					{importError}
+				</Text>
+			)}
+			{importResult && (
+				<Text c="green" size="sm">
+					{importResult}
+				</Text>
+			)}
+			<Button
+				onClick={handleImport}
+				disabled={!importJson.trim()}
+				loading={importMut.isPending}
+				size="xs"
+				variant="light"
+				style={{ alignSelf: "flex-start" }}
+			>
+				{t("kiroImportBtn")}
+			</Button>
 
-						{/* === Credentials Sub-section === */}
-						<Paper withBorder p="sm">
-							<Stack gap="xs">
-								<Group
-									justify="space-between"
-									style={{ cursor: "pointer" }}
-									onClick={() => setCredentialsExpanded((v) => !v)}
-								>
-									<Group gap="xs">
-										{credentialsExpanded ? (
-											<IconChevronDown size={16} />
-										) : (
-											<IconChevronRight size={16} />
-										)}
-										<Text fw={500} size="sm">
-											{t("kiroCredentialsSection")}
-										</Text>
-										{entries.length > 0 && (
-											<Badge size="xs" variant="light">
-												{entries.length}
-											</Badge>
-										)}
-									</Group>
-								</Group>
-								<Collapse in={credentialsExpanded}>
-									<Stack gap="sm" mt="xs">
-										{/* Import area */}
-										<Textarea
-											placeholder={t("kiroImportPlaceholder")}
-											value={importJson}
-											onChange={(e) => setImportJson(e.currentTarget.value)}
-											minRows={2}
-											autosize
-											styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
-										/>
-										{importError && (
-											<Text c="red" size="sm">
-												{importError}
-											</Text>
-										)}
-										{importResult && (
-											<Text c="green" size="sm">
-												{importResult}
-											</Text>
-										)}
-										<Button
-											onClick={handleImport}
-											disabled={!importJson.trim()}
-											loading={importMut.isPending}
-											size="xs"
-											variant="light"
-											style={{ alignSelf: "flex-start" }}
-										>
-											{t("kiroImportBtn")}
-										</Button>
+			{entries.length === 0 && (
+				<Text c="dimmed" size="sm">
+					{t("kiroNoCredentials")}
+				</Text>
+			)}
 
-										{entries.length === 0 && (
-											<Text c="dimmed" size="sm">
-												{t("kiroNoCredentials")}
-											</Text>
-										)}
-
-										{/* Credentials grouped by tier */}
-										{(["paid", "enterprise", "free"] as const).map((tier) => {
-											const group = tierGroups[tier];
-											if (group.length === 0) return null;
-											const cfg = TIER_CONFIG[tier];
-											return (
-												<Stack key={tier} gap="xs">
-													<Group gap="xs">
-														<Badge color={cfg.color} size="sm" variant="filled">
-															{t(cfg.i18nKey)}
-														</Badge>
-														<Text size="xs" c="dimmed">
-															{t(cfg.descKey)} · {group.length}
-														</Text>
-													</Group>
-													<CredentialList
-														entries={group}
-														snapshot={snapshot}
-														usageCache={usageCache}
-														disableMut={disableMut}
-														enableMut={enableMut}
-														resetMut={resetMut}
-														refreshMut={refreshMut}
-														usageMut={usageMut}
-														deleteMut={deleteMut}
-														updateMut={updateMut}
-														priorityMut={priorityMut}
-													/>
-												</Stack>
-											);
-										})}
-									</Stack>
-								</Collapse>
-							</Stack>
-						</Paper>
-
-						{/* === Models Sub-section === */}
-						<Paper withBorder p="sm">
-							<Stack gap="xs">
-								<Group
-									justify="space-between"
-									style={{ cursor: "pointer" }}
-									onClick={() => setModelsExpanded((v) => !v)}
-								>
-									<Group gap="xs">
-										{modelsExpanded ? (
-											<IconChevronDown size={16} />
-										) : (
-											<IconChevronRight size={16} />
-										)}
-										<Text fw={500} size="sm">
-											{t("kiroModelsCount", { count: kiroModels.length })}
-										</Text>
-									</Group>
-									<Button
-										size="xs"
-										variant="light"
-										leftSection={<IconRefresh size={14} />}
-										loading={refreshingKiro}
-										onClick={(e) => {
-											e.stopPropagation();
-											if (confirm(t("kiroRefreshModelsConfirm"))) handleRefreshKiro();
-										}}
-									>
-										{t("kiroRefreshModels")}
-									</Button>
-								</Group>
-								<Collapse in={modelsExpanded}>
-									<Stack gap="xs" mt="xs">
-										{kiroModels.map((m) => {
-											const isHidden = hiddenModels.has(m.value);
-											return (
-												<Group
-													key={m.value}
-													gap="xs"
-													wrap="wrap"
-													style={isHidden ? { opacity: 0.5 } : undefined}
-												>
-													<TextInput value={m.value} disabled style={{ flex: 1, minWidth: 120 }} />
-													<TextInput value={m.label} disabled style={{ flex: 1, minWidth: 120 }} />
-													<Tooltip label={t("modelTestBtn")}>
-														<ActionIcon
-															variant="subtle"
-															color="teal"
-															onClick={() => onTestModel?.(m.value)}
-														>
-															<IconPlayerPlay size={16} />
-														</ActionIcon>
-													</Tooltip>
-													<ActionIcon
-														variant="subtle"
-														color={isHidden ? "gray" : "blue"}
-														onClick={() => onToggleHidden(m.value)}
-													>
-														{isHidden ? <IconEyeOff size={16} /> : <IconEye size={16} />}
-													</ActionIcon>
-												</Group>
-											);
-										})}
-										<InlineCustomModels
-											prefix="kiro"
-											customModels={customModels}
-											onCustomModelsChange={onCustomModelsChange}
-											hiddenModels={hiddenModels}
-											onToggleHidden={onToggleHidden}
-											modelContextWindows={modelContextWindows}
-											onContextWindowChange={onContextWindowChange}
-											onTestModel={onTestModel}
-										/>
-									</Stack>
-								</Collapse>
-							</Stack>
-						</Paper>
+			{/* Credentials grouped by tier */}
+			{(["paid", "enterprise", "free"] as const).map((tier) => {
+				const group = tierGroups[tier];
+				if (group.length === 0) return null;
+				const cfg = TIER_CONFIG[tier];
+				return (
+					<Stack key={tier} gap="xs">
+						<Group gap="xs">
+							<Badge color={cfg.color} size="sm" variant="filled">
+								{t(cfg.i18nKey)}
+							</Badge>
+							<Text size="xs" c="dimmed">
+								{t(cfg.descKey)} · {group.length}
+							</Text>
+						</Group>
+						<CredentialList
+							entries={group}
+							snapshot={snapshot}
+							usageCache={usageCache}
+							disableMut={disableMut}
+							enableMut={enableMut}
+							resetMut={resetMut}
+							refreshMut={refreshMut}
+							usageMut={usageMut}
+							deleteMut={deleteMut}
+							updateMut={updateMut}
+							priorityMut={priorityMut}
+						/>
 					</Stack>
-				</Collapse>
-			</Stack>
-		</Paper>
+				);
+			})}
+
+			{/* === Models Sub-section === */}
+			<Divider />
+			<Group justify="space-between">
+				<Text fw={500} size="sm">
+					{t("kiroModelsCount", { count: kiroModels.length })}
+				</Text>
+				<Button
+					size="xs"
+					variant="light"
+					leftSection={<IconRefresh size={14} />}
+					loading={refreshingKiro}
+					onClick={() => {
+						if (confirm(t("kiroRefreshModelsConfirm"))) handleRefreshKiro();
+					}}
+				>
+					{t("kiroRefreshModels")}
+				</Button>
+			</Group>
+
+			{kiroModels.length > 0 && (
+				<ModelList
+					models={kiroModels}
+					hiddenModels={hiddenModels}
+					onToggleHidden={onToggleHidden}
+					modelContextWindows={modelContextWindows}
+					onContextWindowChange={onContextWindowChange}
+					onTestModel={onTestModel}
+					showContextWindow={false}
+				/>
+			)}
+			<InlineCustomModels
+				prefix="kiro"
+				customModels={customModels}
+				onCustomModelsChange={onCustomModelsChange}
+				hiddenModels={hiddenModels}
+				onToggleHidden={onToggleHidden}
+				modelContextWindows={modelContextWindows}
+				onContextWindowChange={onContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		</Stack>
 	);
 });
 
