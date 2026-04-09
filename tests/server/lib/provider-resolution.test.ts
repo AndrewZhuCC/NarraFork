@@ -25,6 +25,7 @@ function resetProviders(): void {
 	settings.openaiProviders = [];
 	settings.anthropicProviders = [];
 	settings.nkpProviders = [];
+	settings.clineProviders = [];
 	settings.codex = undefined;
 	settings.kiro = undefined;
 	settings.agent.customModels = [];
