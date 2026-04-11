@@ -35,11 +35,19 @@ export interface CommandParam {
 	defaultValue?: string;
 }
 
+export interface CommandModelOverride {
+	/** Model identifier, e.g. "kiro:claude-opus-4.6" */
+	model: string;
+	/** "temporary" = revert after this command; "permanent" = keep the new model */
+	mode: "temporary" | "permanent";
+}
+
 export interface Command {
 	name: string;
 	prompt: string;
 	description?: string;
 	params?: CommandParam[];
+	modelOverride?: CommandModelOverride;
 }
 
 interface ChapterSettings {

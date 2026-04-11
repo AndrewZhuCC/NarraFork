@@ -83,8 +83,8 @@ export interface NugChannelHealthStatus {
 }
 
 export interface NugQuota {
-	quotaBalance: number;
-	quotaTotalGranted: number;
+	balance: number;
+	totalGranted: number;
 }
 
 export interface NugUsageEvent {
@@ -127,12 +127,16 @@ export class NugProvider implements ProviderAdapter {
 		return this.config.baseUrl.replace(/\/+$/, "");
 	}
 
-	private get authHeaders(): Record<string, string> {
-		return {
+	private chatHeaders(conversationId?: string): Record<string, string> {
+		const h: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${this.config.apiKey}`,
 			Accept: "text/event-stream",
 		};
+		if (conversationId) {
+			h["X-Conversation-ID"] = conversationId;
+		}
+		return h;
 	}
 
 	// === ProviderAdapter interface ===
@@ -189,23 +193,23 @@ export class NugProvider implements ProviderAdapter {
 			return;
 		}
 
-		// For other channels, use the unified /v1/chat endpoint with the raw body.
-		// NUG handles format conversion on its side.
+		// For other channels, build a Kiro-native request body and add a top-level
+		// `model` field so NUG's gateway can route to the correct channel.
+		// NUG transparently forwards the entire body to the channel service.
 		const request = buildKiroRequest(params);
 		prepareNkpRequest(request);
 
-		// Wrap as a unified chat request with model routing hint
-		const unifiedBody = {
+		const body = {
 			model: channel ? `${channel}:${bareModel}` : bareModel,
-			kiroRequest: request,
-			conversationId: request.conversationState?.conversationId ?? params.conversationId,
-			stream: true,
+			...request,
 		};
+
+		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
 
 		const response = await fetch(`${this.baseUrl}${endpoint}`, {
 			method: "POST",
-			headers: this.authHeaders,
-			body: JSON.stringify(unifiedBody),
+			headers: this.chatHeaders(conversationId),
+			body: JSON.stringify(body),
 			signal: params.signal,
 		});
 
@@ -225,9 +229,11 @@ export class NugProvider implements ProviderAdapter {
 		const request = buildKiroRequest(params);
 		prepareNkpRequest(request);
 
+		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
+
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.authHeaders,
+			headers: this.chatHeaders(conversationId),
 			body: JSON.stringify(request),
 			signal: params.signal,
 		});
@@ -348,7 +354,7 @@ export class NugProvider implements ProviderAdapter {
 		prepareNkpRequest(request);
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.authHeaders,
+			headers: this.chatHeaders(request.conversationState.conversationId),
 			body: JSON.stringify(request),
 		});
 
@@ -412,7 +418,7 @@ export class NugProvider implements ProviderAdapter {
 		prepareNkpRequest(request);
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.authHeaders,
+			headers: this.chatHeaders(request.conversationState.conversationId),
 			body: JSON.stringify(request),
 		});
 
@@ -472,8 +478,10 @@ export class NugProvider implements ProviderAdapter {
 		return (await response.json()) as { events: NugUsageEvent[]; total: number };
 	}
 
-	async getUsageSummary(): Promise<NugUsageSummary> {
-		const response = await fetch(`${this.baseUrl}/v1/usage/summary`, {
+	async getUsageSummary(period?: string): Promise<NugUsageSummary> {
+		const url = new URL(`${this.baseUrl}/v1/usage/summary`);
+		if (period) url.searchParams.set("period", period);
+		const response = await fetch(url.toString(), {
 			headers: { Authorization: `Bearer ${this.config.apiKey}` },
 		});
 		if (!response.ok) {
@@ -483,7 +491,7 @@ export class NugProvider implements ProviderAdapter {
 		return (await response.json()) as NugUsageSummary;
 	}
 
-	async getModels(): Promise<{ object: string; data: Array<Record<string, unknown>> }> {
+	async getModels(): Promise<{ models: Array<Record<string, unknown>> }> {
 		const response = await fetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}` },
 		});
@@ -491,6 +499,6 @@ export class NugProvider implements ProviderAdapter {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG models error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as { object: string; data: Array<Record<string, unknown>> };
+		return (await response.json()) as { models: Array<Record<string, unknown>> };
 	}
 }

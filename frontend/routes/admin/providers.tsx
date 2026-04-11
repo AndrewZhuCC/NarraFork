@@ -280,7 +280,15 @@ function ProvidersPage() {
 	);
 
 	// ── Models maps (memoized) ──
-	const { allModels, providerLabels } = useAllModels();
+	const {
+		providerLabels,
+		kiroModels,
+		codexModels,
+		openaiByProvider,
+		anthropicByProvider,
+		nkpByProvider,
+		clineByProvider,
+	} = useAllModels();
 
 	const providerModelsMap = useMemo(() => {
 		const map: Record<string, ModelOption[]> = {};
@@ -418,35 +426,43 @@ function ProvidersPage() {
 	]);
 
 	// ── Build provider groups for overview ──
+	// Build from individual source arrays (NOT filtered by disabledProviders),
+	// so disabled providers still appear in the overview.
 	const providerGroups: ProviderGroup[] = useMemo(() => {
-		const groups: ProviderGroup[] = [];
-		// Group allModels by provider prefix
 		const byPrefix = new Map<string, ModelOption[]>();
-		for (const m of allModels) {
-			const prefix = m.provider ?? m.value.split(":")[0] ?? "unknown";
-			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
-			byPrefix.get(prefix)?.push(m);
-		}
 		const platformPrefixes = new Set(["kiro", "codex", "cline"]);
-		// Also include disabled multi-instance providers that have no models
-		for (const p of state.openaiProviders) {
-			if (!byPrefix.has(p.prefix)) byPrefix.set(p.prefix, []);
-		}
-		for (const p of state.anthropicProviders) {
-			if (!byPrefix.has(p.prefix)) byPrefix.set(p.prefix, []);
-		}
-		for (const p of state.nkpProviders) {
-			if (!byPrefix.has(p.prefix)) byPrefix.set(p.prefix, []);
-		}
-		for (const p of state.nugProviders) {
-			if (!byPrefix.has(p.prefix)) byPrefix.set(p.prefix, []);
-		}
-		for (const [prefix, models] of byPrefix) {
+
+		const addModel = (prefix: string, m: ModelOption) => {
+			let arr = byPrefix.get(prefix);
+			if (!arr) {
+				arr = [];
+				byPrefix.set(prefix, arr);
+			}
+			arr.push(m);
+		};
+		const ensureEmpty = (prefix: string) => {
+			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
+		};
+
+		for (const m of kiroModels) addModel("kiro", m);
+		for (const m of codexModels) addModel("codex", m);
+		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of nkpByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
+
+		// Ensure platform providers always present
+		for (const p of platformPrefixes) ensureEmpty(p);
+		// Ensure multi-instance providers always present (even disabled)
+		for (const p of state.openaiProviders) ensureEmpty(p.prefix);
+		for (const p of state.anthropicProviders) ensureEmpty(p.prefix);
+		for (const p of state.nkpProviders) ensureEmpty(p.prefix);
+		for (const p of state.nugProviders) ensureEmpty(p.prefix);
+
+		return [...byPrefix].map(([prefix, models]) => {
 			const isPlatform = platformPrefixes.has(prefix);
-			// Check disabled status
 			let disabled = state.disabledProviders.has(prefix);
 			if (!isPlatform) {
-				// Multi-instance: check the provider's own disabled field
 				const allDisabled = [
 					...state.openaiProviders.filter((p) => p.prefix === prefix),
 					...state.anthropicProviders.filter((p) => p.prefix === prefix),
@@ -457,17 +473,21 @@ function ProvidersPage() {
 					disabled = true;
 				}
 			}
-			groups.push({
+			return {
 				prefix,
 				label: providerLabels[prefix] ?? prefix,
 				models,
 				disabled,
 				isPlatform,
-			});
-		}
-		return groups;
+			};
+		});
 	}, [
-		allModels,
+		kiroModels,
+		codexModels,
+		openaiByProvider,
+		anthropicByProvider,
+		nkpByProvider,
+		clineByProvider,
 		providerLabels,
 		state.disabledProviders,
 		state.openaiProviders,
