@@ -1,16 +1,6 @@
-import {
-	ActionIcon,
-	Affix,
-	Box,
-	Button,
-	Group,
-	Loader,
-	Menu,
-	Title,
-	Transition,
-} from "@mantine/core";
+import { Affix, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { IconArrowLeft, IconPlus } from "@tabler/icons-react";
+import { IconArrowLeft } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -20,12 +10,12 @@ import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
 import { KiroSection } from "../../components/providers/KiroSection";
-import { ModelOverviewTab, type ProviderGroup } from "../../components/providers/ModelOverviewTab";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
-import { ProviderDetailPanel } from "../../components/providers/ProviderDetailPanel";
+import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
+import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -216,6 +206,7 @@ function ProvidersPage() {
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
 	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+
 	useEffect(() => {
 		if (isDirty) {
 			setHighlight(true);
@@ -426,9 +417,7 @@ function ProvidersPage() {
 	]);
 
 	// ── Build provider groups for overview ──
-	// Build from individual source arrays (NOT filtered by disabledProviders),
-	// so disabled providers still appear in the overview.
-	const providerGroups: ProviderGroup[] = useMemo(() => {
+	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
 		const platformPrefixes = new Set(["kiro", "codex", "cline"]);
 
@@ -510,99 +499,11 @@ function ProvidersPage() {
 
 	if (isLoading) return <Loader />;
 
-	return (
-		<>
-			<Box
-				pb={80}
-				style={{
-					display: "flex",
-					height: isMobile ? undefined : "calc(100vh - 80px)",
-					overflow: "hidden",
-				}}
-			>
-				{/* Left: Model Overview */}
-				<Box
-					style={{
-						flex: 1,
-						minWidth: 0,
-						overflow: "auto",
-						padding: "var(--mantine-spacing-md)",
-					}}
-				>
-					<Group mb="xs" justify="space-between">
-						<Group gap="xs">
-							<ActionIcon variant="subtle" component={Link} to="/admin">
-								<IconArrowLeft size={18} />
-							</ActionIcon>
-							<Title order={2}>{t("providersTitle")}</Title>
-						</Group>
-						<Menu position="bottom-end" withinPortal>
-							<Menu.Target>
-								<Button size="xs" variant="light" leftSection={<IconPlus size={14} />}>
-									{t("addProvider")}
-								</Button>
-							</Menu.Target>
-							<Menu.Dropdown>
-								<Menu.Item onClick={() => handleAddProvider("nkp")}>
-									{t("addProviderNkp")}
-								</Menu.Item>
-								<Menu.Item onClick={() => handleAddProvider("openai")}>
-									{t("addProviderOpenai")}
-								</Menu.Item>
-								<Menu.Item onClick={() => handleAddProvider("anthropic")}>
-									{t("addProviderAnthropic")}
-								</Menu.Item>
-								<Menu.Item onClick={() => handleAddProvider("nug")}>
-									{t("addProviderNug")}
-								</Menu.Item>
-							</Menu.Dropdown>
-						</Menu>
-					</Group>
-
-					<ModelOverviewTab
-						groups={providerGroups}
-						hiddenModels={state.hiddenModels}
-						providerOrder={state.providerOrder}
-						disabledProviders={state.disabledProviders}
-						onProviderOrderChange={dispatchers.setProviderOrder}
-						onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
-						onOpenProviderDetail={setSelectedProvider}
-						selectedProvider={selectedProvider}
-					/>
-				</Box>
-
-				{/* Right: Provider Detail Panel */}
-				{!isMobile && selectedProvider && (
-					<ProviderDetailPanel
-						selectedProvider={selectedProvider}
-						providerLabel={selectedProviderLabel}
-						onClose={() => setSelectedProvider(null)}
-					>
-						<ProviderSectionContent
-							provider={selectedProvider}
-							settings={settings}
-							state={state}
-							dispatchers={dispatchers}
-							providerModelsMap={providerModelsMap}
-							anthropicModelsMap={anthropicModelsMap}
-							nkpModelsMap={nkpModelsMap}
-							nugModelsMap={nugModelsMap}
-							isOpenaiProviderDirty={isOpenaiProviderDirty}
-							isAnthropicProviderDirty={isAnthropicProviderDirty}
-							isNkpProviderDirty={isNkpProviderDirty}
-							isNugProviderDirty={isNugProviderDirty}
-							getPrefixError={getPrefixError}
-							onTestModel={setTestingModel}
-							orphanModels={orphanModels}
-						/>
-					</ProviderDetailPanel>
-				)}
-			</Box>
-
-			{/* Mobile: Drawer for provider detail */}
-			{isMobile && selectedProvider && (
-				<ProviderDetailPanel
-					selectedProvider={selectedProvider}
+	// ── Render overview or config view ──
+	const renderContent = () => {
+		if (selectedProvider) {
+			return (
+				<ProviderConfigView
 					providerLabel={selectedProviderLabel}
 					onClose={() => setSelectedProvider(null)}
 				>
@@ -623,8 +524,44 @@ function ProvidersPage() {
 						onTestModel={setTestingModel}
 						orphanModels={orphanModels}
 					/>
-				</ProviderDetailPanel>
-			)}
+				</ProviderConfigView>
+			);
+		}
+
+		return (
+			<ProviderOverviewView
+				groups={providerGroups}
+				hiddenModels={state.hiddenModels}
+				onToggleProviderDisabled={dispatchers.toggleProviderDisabled}
+				onOpenProviderConfig={setSelectedProvider}
+				onAddProvider={handleAddProvider}
+				selectedProvider={selectedProvider}
+			/>
+		);
+	};
+
+	return (
+		<>
+			<Box
+				pb={80}
+				style={{
+					height: isMobile ? undefined : "calc(100vh - 80px)",
+					overflow: "hidden",
+				}}
+			>
+				<Stack gap="md" style={{ height: "100%", padding: "var(--mantine-spacing-md)" }}>
+					<Group gap="xs">
+						{!selectedProvider && (
+							<Box component={Link} to="/admin" style={{ display: "flex", alignItems: "center" }}>
+								<IconArrowLeft size={18} />
+							</Box>
+						)}
+						<Title order={2}>{t("providersTitle")}</Title>
+					</Group>
+
+					<Box style={{ flex: 1, overflow: "auto" }}>{renderContent()}</Box>
+				</Stack>
+			</Box>
 
 			<Affix position={{ bottom: 24, right: 24 }}>
 				<Transition transition="slide-up" mounted={isDirty}>
@@ -656,12 +593,12 @@ function ProvidersPage() {
 			</Affix>
 
 			<style>{`
-			@keyframes providersPulse {
-				0% { box-shadow: 0 0 0 0 var(--mantine-color-indigo-5); }
-				40% { box-shadow: 0 0 0 10px transparent; }
-				100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
-			}
-		`}</style>
+				@keyframes providersPulse {
+					0% { box-shadow: 0 0 0 0 var(--mantine-color-indigo-5); }
+					40% { box-shadow: 0 0 0 10px transparent; }
+					100% { box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25); }
+				}
+			`}</style>
 			<ModelTestDialog
 				opened={testingModel !== null}
 				onClose={() => setTestingModel(null)}
