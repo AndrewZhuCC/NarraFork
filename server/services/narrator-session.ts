@@ -3101,7 +3101,7 @@ async function runAgentLoop(
 			};
 
 			const resolvedReasoningEffort =
-				freshNarrator.reasoningEffort ?? resolveDefaultReasoningEffort(resolved.provider);
+				freshNarrator.reasoningEffort || resolveDefaultReasoningEffort(resolved.provider);
 
 			const resolvedServiceTier =
 				freshNarrator.fastMode && usesCodexApiMode(resolved.provider) ? "priority" : undefined;
