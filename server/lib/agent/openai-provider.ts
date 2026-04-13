@@ -1059,6 +1059,7 @@ function parseResponsesAPIEvent(
 		results.push({
 			usage: {
 				promptTokens: usage.input_tokens,
+				inputTokens: usage.input_tokens,
 				completionTokens: usage.output_tokens,
 				reasoningTokens: usage.output_tokens_details?.reasoning_tokens ?? undefined,
 				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
@@ -1447,6 +1448,7 @@ function parseSSELine(line: string, toolAccum: Map<number, ToolAccumEntry>): Par
 				{
 					usage: {
 						promptTokens,
+						inputTokens: promptTokens,
 						completionTokens: chunk.usage.completion_tokens,
 						reasoningTokens: chunk.usage.completion_tokens_details?.reasoning_tokens ?? undefined,
 						cachedInputTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? undefined,

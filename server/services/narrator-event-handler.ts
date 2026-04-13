@@ -9,6 +9,7 @@ import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { DEFAULT_CONTEXT_THRESHOLDS, LARGE_CONTEXT_BOUNDARY, settings } from "../lib/settings";
+import { buildUsageDataFromSnapshot, updateMessageUsage } from "../lib/usage-tracking";
 import { broadcastToNarrator, type NarratorServerMessage } from "../websocket/narrator-ws";
 import {
 	enrichToolUseBlocks,
@@ -30,9 +31,13 @@ import { recordOutputChunk } from "./output-stats";
  */
 export interface TokenUsageSnapshot {
 	promptTokens?: number;
+	inputTokens?: number;
 	completionTokens?: number;
 	reasoningTokens?: number;
 	cachedInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	cacheCreation5mTokens?: number;
+	cacheCreation1hTokens?: number;
 	contextWindow?: number;
 	isEstimated?: boolean;
 }
@@ -50,6 +55,10 @@ export interface EventHandlerContext {
 	locale?: string;
 	/** Provider prefix (e.g. "nkp", "kiro") for the current session */
 	providerPrefix?: string;
+	/** Resolved provider for the current turn */
+	provider?: string;
+	/** Resolved model for the current turn */
+	model?: string;
 
 	// --- Mutable state accessors ---
 	getContextUsagePct: () => number | undefined;
@@ -57,10 +66,13 @@ export interface EventHandlerContext {
 	getMeterUnit: () => string | undefined;
 	getPartialMessageId: () => string | undefined;
 	getTokenUsage: () => TokenUsageSnapshot | undefined;
+	getTurnStartedAt?: () => string | undefined;
+	getTtftMs?: () => number | undefined;
 	setPartialMessageId: (id: string | undefined) => void;
 	setContextUsagePct: (pct: number) => void;
 	setMeterData: (usage: number, unit: string) => void;
 	setTokenUsage: (usage: TokenUsageSnapshot | undefined) => void;
+	setTtftMs?: (ttftMs: number | undefined) => void;
 
 	// --- Subagent-specific ---
 	/** Parent tool_use ID that spawned this subagent */
@@ -384,6 +396,14 @@ export async function processEvent(
 
 	switch (event.type) {
 		case "stream_text": {
+			// First text token latency (TTFT)
+			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
+				const startedAt = ctx.getTurnStartedAt?.();
+				if (startedAt) {
+					const ttftMs = Math.max(0, Date.now() - new Date(startedAt).getTime());
+					ctx.setTtftMs(ttftMs);
+				}
+			}
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 
@@ -456,6 +476,13 @@ export async function processEvent(
 		}
 
 		case "tool_use_chunk": {
+			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
+				const startedAt = ctx.getTurnStartedAt?.();
+				if (startedAt) {
+					const ttftMs = Math.max(0, Date.now() - new Date(startedAt).getTime());
+					ctx.setTtftMs(ttftMs);
+				}
+			}
 			// Track tool input streaming chars (inputCharsTotal is cumulative,
 			// so compute the delta from the last seen value for this tool)
 			if (event.inputCharsTotal > 0) {
@@ -534,10 +561,25 @@ export async function processEvent(
 					contextPercent: ctx.getContextUsagePct(),
 					meterUsage: ctx.getMeterUsage(),
 					meterUnit: ctx.getMeterUnit(),
-					tokensIn: tokenUsage?.promptTokens,
+					tokensIn: tokenUsage?.inputTokens ?? tokenUsage?.promptTokens,
+					provider: ctx.provider,
+					model: ctx.model,
+					outputTokens: tokenUsage?.completionTokens,
+					cachedInputTokens: tokenUsage?.cachedInputTokens,
+					cacheCreationInputTokens: tokenUsage?.cacheCreationInputTokens,
+					cacheCreation5mTokens: tokenUsage?.cacheCreation5mTokens,
+					cacheCreation1hTokens: tokenUsage?.cacheCreation1hTokens,
+					reasoningTokens: tokenUsage?.reasoningTokens,
+					ttftMs: ctx.getTtftMs?.(),
+					durationMs: ctx.getTurnStartedAt?.()
+						? Math.max(0, Date.now() - new Date(ctx.getTurnStartedAt?.() ?? 0).getTime())
+						: undefined,
 					turnUsage: tokenUsage
 						? {
-								input_tokens: tokenUsage.promptTokens,
+								input_tokens: tokenUsage.inputTokens ?? tokenUsage.promptTokens,
+								...(tokenUsage.promptTokens != null && {
+									prompt_tokens: tokenUsage.promptTokens,
+								}),
 								...(tokenUsage.completionTokens != null && {
 									output_tokens: tokenUsage.completionTokens,
 								}),
@@ -546,6 +588,15 @@ export async function processEvent(
 								}),
 								...(tokenUsage.cachedInputTokens != null && {
 									cached_input_tokens: tokenUsage.cachedInputTokens,
+								}),
+								...(tokenUsage.cacheCreationInputTokens != null && {
+									cache_creation_input_tokens: tokenUsage.cacheCreationInputTokens,
+								}),
+								...(tokenUsage.cacheCreation5mTokens != null && {
+									cache_creation_5m_tokens: tokenUsage.cacheCreation5mTokens,
+								}),
+								...(tokenUsage.cacheCreation1hTokens != null && {
+									cache_creation_1h_tokens: tokenUsage.cacheCreation1hTokens,
 								}),
 								...(tokenUsage.contextWindow != null && {
 									context_window: tokenUsage.contextWindow,
@@ -604,7 +655,10 @@ export async function processEvent(
 			const tokenUsage = ctx.getTokenUsage();
 			const turnUsage = tokenUsage
 				? {
-						input_tokens: tokenUsage.promptTokens,
+						input_tokens: tokenUsage.inputTokens ?? tokenUsage.promptTokens,
+						...(tokenUsage.promptTokens != null && {
+							prompt_tokens: tokenUsage.promptTokens,
+						}),
 						...(tokenUsage.completionTokens != null && {
 							output_tokens: tokenUsage.completionTokens,
 						}),
@@ -613,6 +667,15 @@ export async function processEvent(
 						}),
 						...(tokenUsage.cachedInputTokens != null && {
 							cached_input_tokens: tokenUsage.cachedInputTokens,
+						}),
+						...(tokenUsage.cacheCreationInputTokens != null && {
+							cache_creation_input_tokens: tokenUsage.cacheCreationInputTokens,
+						}),
+						...(tokenUsage.cacheCreation5mTokens != null && {
+							cache_creation_5m_tokens: tokenUsage.cacheCreation5mTokens,
+						}),
+						...(tokenUsage.cacheCreation1hTokens != null && {
+							cache_creation_1h_tokens: tokenUsage.cacheCreation1hTokens,
 						}),
 						...(tokenUsage.contextWindow != null && {
 							context_window: tokenUsage.contextWindow,
@@ -629,10 +692,15 @@ export async function processEvent(
 				savedId = partialId;
 				const updates: Record<string, unknown> = {};
 				if (event.messageId) updates.messageUuid = event.messageId;
-				if (tokenUsage?.promptTokens != null) updates.tokensIn = tokenUsage.promptTokens;
+				if (event.credentialId) updates.credentialId = event.credentialId;
 				if (turnUsage) updates.turnUsageJson = turnUsage;
+
 				if (Object.keys(updates).length > 0) {
 					await db.update(narratorMessages).set(updates).where(eq(narratorMessages.id, savedId));
+				}
+				const usageData = buildUsageDataFromSnapshot(tokenUsage);
+				if (usageData && ctx.provider && ctx.model) {
+					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
 				ctx.setPartialMessageId(undefined);
 			} else {
@@ -649,6 +717,7 @@ export async function processEvent(
 					});
 				}
 
+				const usageData = buildUsageDataFromSnapshot(tokenUsage);
 				const saved = await narratorService.persistAssistantMessage(narratorId, {
 					uuid: event.messageId ?? randomUUID(),
 					session_id: ctx.conversationId,
@@ -656,9 +725,9 @@ export async function processEvent(
 					message: {
 						content,
 						usage:
-							tokenUsage?.promptTokens != null
+							tokenUsage?.inputTokens != null || tokenUsage?.promptTokens != null
 								? {
-										input_tokens: tokenUsage.promptTokens,
+										input_tokens: tokenUsage.inputTokens ?? tokenUsage.promptTokens,
 										...(tokenUsage.completionTokens != null && {
 											output_tokens: tokenUsage.completionTokens,
 										}),
@@ -668,8 +737,24 @@ export async function processEvent(
 					contextPercent: ctx.getContextUsagePct(),
 					meterUsage: ctx.getMeterUsage(),
 					meterUnit: ctx.getMeterUnit(),
+					provider: ctx.provider,
+					credentialId: event.credentialId,
+					model: ctx.model,
+					outputTokens: tokenUsage?.completionTokens,
+					cachedInputTokens: tokenUsage?.cachedInputTokens,
+					cacheCreationInputTokens: tokenUsage?.cacheCreationInputTokens,
+					cacheCreation5mTokens: tokenUsage?.cacheCreation5mTokens,
+					cacheCreation1hTokens: tokenUsage?.cacheCreation1hTokens,
+					reasoningTokens: tokenUsage?.reasoningTokens,
+					ttftMs: ctx.getTtftMs?.(),
+					durationMs: ctx.getTurnStartedAt?.()
+						? Math.max(0, Date.now() - new Date(ctx.getTurnStartedAt?.() ?? 0).getTime())
+						: undefined,
 				});
 				savedId = saved.id;
+				if (usageData && ctx.provider && ctx.model) {
+					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
+				}
 			}
 
 			// Main narrator hooks: TodoWrite, EnterPlanMode
@@ -889,6 +974,14 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
+			// First visible token latency (reasoning may arrive before text)
+			if (ctx.getTtftMs && ctx.setTtftMs && ctx.getTtftMs() == null) {
+				const startedAt = ctx.getTurnStartedAt?.();
+				if (startedAt) {
+					const ttftMs = Math.max(0, Date.now() - new Date(startedAt).getTime());
+					ctx.setTtftMs(ttftMs);
+				}
+			}
 			// Track AI reasoning output character rate
 			recordOutputChunk(event.text.length);
 
@@ -961,11 +1054,23 @@ export async function processEvent(
 
 		case "context_usage": {
 			ctx.setContextUsagePct(event.percentage);
+			const previousUsage = ctx.getTokenUsage() ?? {};
 			ctx.setTokenUsage({
+				...previousUsage,
 				...(event.promptTokens != null && { promptTokens: event.promptTokens }),
+				...(event.inputTokens != null && { inputTokens: event.inputTokens }),
 				...(event.completionTokens != null && { completionTokens: event.completionTokens }),
 				...(event.reasoningTokens != null && { reasoningTokens: event.reasoningTokens }),
 				...(event.cachedInputTokens != null && { cachedInputTokens: event.cachedInputTokens }),
+				...(event.cacheCreationInputTokens != null && {
+					cacheCreationInputTokens: event.cacheCreationInputTokens,
+				}),
+				...(event.cacheCreation5mTokens != null && {
+					cacheCreation5mTokens: event.cacheCreation5mTokens,
+				}),
+				...(event.cacheCreation1hTokens != null && {
+					cacheCreation1hTokens: event.cacheCreation1hTokens,
+				}),
 				...(event.contextWindow != null && { contextWindow: event.contextWindow }),
 				...(event.isEstimated && { isEstimated: true }),
 			});
