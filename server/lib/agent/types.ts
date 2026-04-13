@@ -192,6 +192,7 @@ export type AgentEvent =
 	| {
 			type: "api_request_end";
 			requestId: string;
+			credentialId?: string;
 			usage?: {
 				promptTokens?: number;
 				inputTokens?: number;

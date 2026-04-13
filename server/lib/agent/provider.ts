@@ -224,7 +224,7 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	}
 	if (provider === "codex") {
 		return new CodexProvider({
-			useWebSocket: settings.codex?.useWebSocket ?? false,
+			useWebSocket: settings.codex?.useWebSocket ?? true,
 		});
 	}
 
