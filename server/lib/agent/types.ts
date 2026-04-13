@@ -207,6 +207,7 @@ export type AgentEvent =
 			contextPercent?: number;
 			meterUsage?: number;
 			meterUnit?: string;
+			rawDump?: unknown;
 	  }
 	| { type: "done" };
 

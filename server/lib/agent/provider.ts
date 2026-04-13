@@ -17,6 +17,7 @@ import { KiroProvider } from "./kiro-provider";
 import { NkpProvider } from "./nkp-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
+import type { ApiRequestDumpCollector } from "./request-dump";
 import type { AgentToolUse } from "./types";
 
 function isKiroProviderDisabled(): boolean {
@@ -27,7 +28,7 @@ function isKiroProviderDisabled(): boolean {
 
 export interface DbMessage {
 	id: string;
-	role: "user" | "assistant" | "system";
+	role: "user" | "assistant" | "system" | "sys" | "disp";
 	contentJson: unknown;
 	contentText: string | null;
 	parentToolUseId: string | null;
@@ -131,6 +132,8 @@ export interface ChatParams {
 	serviceTier?: string;
 	/** Metadata to include in the request body (e.g. user_id for Anthropic) */
 	metadata?: { user_id: string };
+	/** Optional collector for persisting raw provider request/response dumps. */
+	requestDump?: ApiRequestDumpCollector;
 }
 
 // === The adapter interface ===
@@ -176,6 +179,13 @@ export interface ProviderAdapter {
 		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
+		}>,
+		webSearches?: Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
 		}>,
 	): void;
 

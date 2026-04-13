@@ -8,7 +8,6 @@ import { useTranslation } from "react-i18next";
 import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
 import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
-import { CustomModelsSection } from "../../components/providers/CustomModelsSection";
 import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
@@ -205,6 +204,7 @@ function ProvidersPage() {
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
+	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (kiro/codex/cline)
 	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
 
 	useEffect(() => {
@@ -223,9 +223,8 @@ function ProvidersPage() {
 				case "nkp":
 					dispatchers.setNkpProviders((prev) => [
 						...prev,
-						{ id, name: "NKP", prefix: "nkp", apiKey: "", baseUrl: "", defaultModel: "" },
+						{ id, name: "NKP", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
 					]);
-					setSelectedProvider("nkp");
 					break;
 				case "openai":
 					dispatchers.setOpenaiProviders((prev) => [
@@ -241,7 +240,6 @@ function ProvidersPage() {
 							codexAccountId: "",
 						},
 					]);
-					setSelectedProvider("openai");
 					break;
 				case "anthropic":
 					dispatchers.setAnthropicProviders((prev) => [
@@ -249,23 +247,23 @@ function ProvidersPage() {
 						{
 							id,
 							name: "Anthropic",
-							prefix: "anthropic",
+							prefix: "",
 							apiKey: "",
 							baseUrl: "",
 							defaultModel: "",
 							proxy: "",
 						},
 					]);
-					setSelectedProvider("anthropic");
 					break;
 				case "nug":
 					dispatchers.setNugProviders((prev) => [
 						...prev,
-						{ id, name: "NUG", prefix: "nug", apiKey: "", baseUrl: "", defaultModel: "" },
+						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
 					]);
-					setSelectedProvider("nug");
 					break;
 			}
+			// Route to new provider by its immutable ID
+			setSelectedProvider(id);
 		},
 		[dispatchers],
 	);
@@ -393,29 +391,6 @@ function ProvidersPage() {
 		return map;
 	}, [settings?.nugProviders, settings?.nugModelsGrouped]);
 
-	// ── Orphan models ──
-	const orphanModels = useMemo(() => {
-		const knownPrefixes = new Set([
-			"kiro",
-			"codex",
-			"cline",
-			...state.openaiProviders.map((p) => p.prefix || "openai"),
-			...state.anthropicProviders.map((p) => p.prefix || "anthropic"),
-			...state.nkpProviders.map((p) => p.prefix || "nkp"),
-			...state.nugProviders.map((p) => p.prefix || "nug"),
-		]);
-		return state.customModels.filter((m) => {
-			const prefix = m.value.split(":")[0];
-			return !knownPrefixes.has(prefix);
-		});
-	}, [
-		state.customModels,
-		state.openaiProviders,
-		state.anthropicProviders,
-		state.nkpProviders,
-		state.nugProviders,
-	]);
-
 	// ── Build provider groups for overview ──
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
@@ -466,19 +441,31 @@ function ProvidersPage() {
 		return [...byPrefix].map(([prefix, models]) => {
 			const isPlatform = platformPrefixes.has(prefix);
 			let disabled = state.disabledProviders.has(prefix);
+
+			// Find provider ID for multi-instance providers
+			let providerId: string | undefined;
 			if (!isPlatform) {
-				const allDisabled = [
-					...state.openaiProviders.filter((p) => p.prefix === prefix),
-					...state.anthropicProviders.filter((p) => p.prefix === prefix),
-					...state.nkpProviders.filter((p) => p.prefix === prefix),
-					...state.nugProviders.filter((p) => p.prefix === prefix),
-				];
-				if (allDisabled.length > 0 && allDisabled.every((p) => p.disabled)) {
-					disabled = true;
+				const match =
+					state.openaiProviders.find((p) => p.prefix === prefix) ??
+					state.anthropicProviders.find((p) => p.prefix === prefix) ??
+					state.nkpProviders.find((p) => p.prefix === prefix) ??
+					state.nugProviders.find((p) => p.prefix === prefix);
+				providerId = match?.id;
+				if (match) {
+					const allDisabled = [
+						...state.openaiProviders.filter((p) => p.prefix === prefix),
+						...state.anthropicProviders.filter((p) => p.prefix === prefix),
+						...state.nkpProviders.filter((p) => p.prefix === prefix),
+						...state.nugProviders.filter((p) => p.prefix === prefix),
+					];
+					if (allDisabled.length > 0 && allDisabled.every((p) => p.disabled)) {
+						disabled = true;
+					}
 				}
 			}
 			return {
 				prefix,
+				providerId,
 				label: providerLabels[prefix] ?? prefix,
 				badgeLabel: isPlatform ? undefined : getBadgeLabel(prefix),
 				models,
@@ -505,8 +492,26 @@ function ProvidersPage() {
 	// ── Provider label for detail panel ──
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
-		return providerLabels[selectedProvider] ?? selectedProvider;
-	}, [selectedProvider, providerLabels]);
+		// Platform providers: selectedProvider is the prefix
+		if (["kiro", "codex", "cline"].includes(selectedProvider)) {
+			return providerLabels[selectedProvider] ?? selectedProvider;
+		}
+		// Multi-instance providers: selectedProvider is the provider ID
+		const p =
+			state.openaiProviders.find((p) => p.id === selectedProvider) ??
+			state.anthropicProviders.find((p) => p.id === selectedProvider) ??
+			state.nkpProviders.find((p) => p.id === selectedProvider) ??
+			state.nugProviders.find((p) => p.id === selectedProvider);
+		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
+		return "";
+	}, [
+		selectedProvider,
+		state.openaiProviders,
+		state.anthropicProviders,
+		state.nkpProviders,
+		state.nugProviders,
+		providerLabels,
+	]);
 
 	// ── Redirect non-admin users ──
 	if (user && user.role !== "admin") {
@@ -525,7 +530,7 @@ function ProvidersPage() {
 					onClose={() => setSelectedProvider(null)}
 				>
 					<ProviderSectionContent
-						provider={selectedProvider}
+						providerKey={selectedProvider}
 						settings={settings}
 						state={state}
 						dispatchers={dispatchers}
@@ -539,7 +544,6 @@ function ProvidersPage() {
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
 						onTestModel={setTestingModel}
-						orphanModels={orphanModels}
 					/>
 				</ProviderConfigView>
 			);
@@ -636,10 +640,11 @@ function ProvidersPage() {
 	);
 }
 
-// ── Provider Section Content (renders the right section for a given provider) ──
+// ── Provider Section Content ──
+// providerKey is either a platform prefix (kiro/codex/cline) or a provider ID
 
 interface ProviderSectionContentProps {
-	provider: string;
+	providerKey: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
 	settings: any;
 	state: ProvidersState;
@@ -654,11 +659,10 @@ interface ProviderSectionContentProps {
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	onTestModel: (model: string) => void;
-	orphanModels: ModelOption[];
 }
 
 function ProviderSectionContent({
-	provider,
+	providerKey,
 	settings,
 	state,
 	dispatchers,
@@ -672,146 +676,130 @@ function ProviderSectionContent({
 	isNugProviderDirty,
 	getPrefixError,
 	onTestModel,
-	orphanModels,
 }: ProviderSectionContentProps) {
-	switch (provider) {
-		case "kiro":
-			return (
-				<KiroSection
-					settings={settings}
-					hiddenModels={state.hiddenModels}
-					onToggleHidden={dispatchers.toggleHidden}
-					customModels={state.customModels}
-					onCustomModelsChange={dispatchers.setCustomModels}
-					modelContextWindows={state.modelContextWindows}
-					onContextWindowChange={dispatchers.handleContextWindowChange}
-					onTestModel={onTestModel}
-				/>
-			);
-		case "codex":
-			return (
-				<CodexSection
-					hiddenModels={state.hiddenModels}
-					onToggleHidden={dispatchers.toggleHidden}
-					customModels={state.customModels}
-					onCustomModelsChange={dispatchers.setCustomModels}
-					modelContextWindows={state.modelContextWindows}
-					onContextWindowChange={dispatchers.handleContextWindowChange}
-					onTestModel={onTestModel}
-				/>
-			);
-		case "cline":
-			return (
-				<ClineSection
-					settings={settings}
-					hiddenModels={state.hiddenModels}
-					onToggleHidden={dispatchers.toggleHidden}
-					customModels={state.customModels}
-					onCustomModelsChange={dispatchers.setCustomModels}
-					modelContextWindows={state.modelContextWindows}
-					onContextWindowChange={dispatchers.handleContextWindowChange}
-					onTestModel={onTestModel}
-				/>
-			);
-		default: {
-			// Multi-instance providers: find which type this prefix belongs to
-			const openaiMatch = state.openaiProviders.find((p) => p.prefix === provider);
-			if (openaiMatch) {
-				return (
-					<OpenAIProvidersSection
-						providers={state.openaiProviders.filter((p) => p.prefix === provider)}
-						onProvidersChange={dispatchers.setOpenaiProviders}
-						providerModelsMap={providerModelsMap}
-						hiddenModels={state.hiddenModels}
-						onToggleHidden={dispatchers.toggleHidden}
-						onBatchToggleHidden={dispatchers.batchToggleHidden}
-						modelContextWindows={state.modelContextWindows}
-						onContextWindowChange={dispatchers.handleContextWindowChange}
-						isProviderDirty={isOpenaiProviderDirty}
-						customModels={state.customModels}
-						onCustomModelsChange={dispatchers.setCustomModels}
-						getPrefixError={getPrefixError}
-						onTestModel={onTestModel}
-					/>
-				);
-			}
-			const anthropicMatch = state.anthropicProviders.find((p) => p.prefix === provider);
-			if (anthropicMatch) {
-				return (
-					<AnthropicProvidersSection
-						providers={state.anthropicProviders.filter((p) => p.prefix === provider)}
-						onProvidersChange={dispatchers.setAnthropicProviders}
-						providerModelsMap={anthropicModelsMap}
-						hiddenModels={state.hiddenModels}
-						onToggleHidden={dispatchers.toggleHidden}
-						onBatchToggleHidden={dispatchers.batchToggleHidden}
-						modelContextWindows={state.modelContextWindows}
-						onContextWindowChange={dispatchers.handleContextWindowChange}
-						isProviderDirty={isAnthropicProviderDirty}
-						customModels={state.customModels}
-						onCustomModelsChange={dispatchers.setCustomModels}
-						getPrefixError={getPrefixError}
-						onTestModel={onTestModel}
-					/>
-				);
-			}
-			const nkpMatch = state.nkpProviders.find((p) => p.prefix === provider);
-			if (nkpMatch) {
-				return (
-					<NKPProvidersSection
-						providers={state.nkpProviders.filter((p) => p.prefix === provider)}
-						onProvidersChange={dispatchers.setNkpProviders}
-						providerModelsMap={nkpModelsMap}
-						hiddenModels={state.hiddenModels}
-						onToggleHidden={dispatchers.toggleHidden}
-						modelContextWindows={state.modelContextWindows}
-						onContextWindowChange={dispatchers.handleContextWindowChange}
-						isProviderDirty={isNkpProviderDirty}
-						quotas={settings?.nkpQuotas}
-						customModels={state.customModels}
-						onCustomModelsChange={dispatchers.setCustomModels}
-						getPrefixError={getPrefixError}
-						onTestModel={onTestModel}
-					/>
-				);
-			}
-			const nugMatch = state.nugProviders.find((p) => p.prefix === provider);
-			if (nugMatch) {
-				return (
-					<NUGProvidersSection
-						providers={state.nugProviders.filter((p) => p.prefix === provider)}
-						onProvidersChange={dispatchers.setNugProviders}
-						providerModelsMap={nugModelsMap}
-						hiddenModels={state.hiddenModels}
-						onToggleHidden={dispatchers.toggleHidden}
-						modelContextWindows={state.modelContextWindows}
-						onContextWindowChange={dispatchers.handleContextWindowChange}
-						isProviderDirty={isNugProviderDirty}
-						customModels={state.customModels}
-						onCustomModelsChange={dispatchers.setCustomModels}
-						getPrefixError={getPrefixError}
-						onTestModel={onTestModel}
-					/>
-				);
-			}
-			// Orphan custom models
-			if (orphanModels.length > 0) {
-				return (
-					<CustomModelsSection
-						customModels={state.customModels}
-						onCustomModelsChange={dispatchers.setCustomModels}
-						hiddenModels={state.hiddenModels}
-						onToggleHidden={dispatchers.toggleHidden}
-						prefixOptions={[]}
-						modelContextWindows={state.modelContextWindows}
-						onContextWindowChange={dispatchers.handleContextWindowChange}
-						onTestModel={onTestModel}
-						orphanOnly
-						orphanModels={orphanModels}
-					/>
-				);
-			}
-			return null;
-		}
+	// Platform providers: matched by prefix
+	if (providerKey === "kiro") {
+		return (
+			<KiroSection
+				settings={settings}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
 	}
+	if (providerKey === "codex") {
+		return (
+			<CodexSection
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	if (providerKey === "cline") {
+		return (
+			<ClineSection
+				settings={settings}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+
+	// Multi-instance providers: matched by ID (immutable, survives prefix edits)
+	const openaiMatch = state.openaiProviders.find((p) => p.id === providerKey);
+	if (openaiMatch) {
+		return (
+			<OpenAIProvidersSection
+				providers={[openaiMatch]}
+				onProvidersChange={dispatchers.setOpenaiProviders}
+				providerModelsMap={providerModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				onBatchToggleHidden={dispatchers.batchToggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isOpenaiProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	const anthropicMatch = state.anthropicProviders.find((p) => p.id === providerKey);
+	if (anthropicMatch) {
+		return (
+			<AnthropicProvidersSection
+				providers={[anthropicMatch]}
+				onProvidersChange={dispatchers.setAnthropicProviders}
+				providerModelsMap={anthropicModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				onBatchToggleHidden={dispatchers.batchToggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isAnthropicProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	const nkpMatch = state.nkpProviders.find((p) => p.id === providerKey);
+	if (nkpMatch) {
+		return (
+			<NKPProvidersSection
+				providers={[nkpMatch]}
+				onProvidersChange={dispatchers.setNkpProviders}
+				providerModelsMap={nkpModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isNkpProviderDirty}
+				quotas={settings?.nkpQuotas}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	const nugMatch = state.nugProviders.find((p) => p.id === providerKey);
+	if (nugMatch) {
+		return (
+			<NUGProvidersSection
+				providers={[nugMatch]}
+				onProvidersChange={dispatchers.setNugProviders}
+				providerModelsMap={nugModelsMap}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
+				isProviderDirty={isNugProviderDirty}
+				customModels={state.customModels}
+				onCustomModelsChange={dispatchers.setCustomModels}
+				getPrefixError={getPrefixError}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+
+	return null;
 }

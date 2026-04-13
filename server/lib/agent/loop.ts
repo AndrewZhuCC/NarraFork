@@ -11,6 +11,7 @@ import {
 import { StreamStaleError } from "../stream-timeout";
 import { estimateTokens } from "./estimate-tokens";
 import { resolveProviderAndModel } from "./provider";
+import { ApiRequestDumpCollector } from "./request-dump";
 import { toolRegistry } from "./tool-registry";
 import { SHELL_TOOL_NAME } from "./tools/bash";
 import { truncateOutput } from "./truncate";
@@ -383,6 +384,23 @@ function collectReasoningBlocks(
 	return blocks.length > 0 ? blocks : undefined;
 }
 
+function collectCompletedWebSearches(
+	map: Map<string, { query?: string; queries?: string[]; emitted: boolean; outputIndex?: number }>,
+): Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }> | undefined {
+	const blocks: Array<{ id: string; query?: string; queries?: string[]; outputIndex?: number }> =
+		[];
+	for (const [id, entry] of map.entries()) {
+		if (!entry.query && !entry.queries?.length) continue;
+		blocks.push({
+			id,
+			query: entry.query,
+			queries: entry.queries,
+			outputIndex: entry.outputIndex,
+		});
+	}
+	return blocks.length > 0 ? blocks : undefined;
+}
+
 /**
  * Core agent loop. Delegates all provider-specific logic to a ProviderAdapter.
  * Yields AgentEvent objects for the caller to consume.
@@ -583,6 +601,7 @@ export async function* agentLoop(
 		let requestContextPercent: number | undefined;
 		let requestMeterUsage: number | undefined;
 		let requestMeterUnit: string | undefined;
+		let requestDump: ApiRequestDumpCollector | undefined;
 
 		// ── Transient-error retry loop ──
 		// For stateless providers (kiro, nkp, anthropic, openai-completions, cline)
@@ -630,6 +649,14 @@ export async function* agentLoop(
 			requestMeterUsage = undefined;
 			requestMeterUnit = undefined;
 
+			// Initialize request dump collector if enabled
+			requestDump = settings.agent.requestDumpEnabled
+				? new ApiRequestDumpCollector({
+						provider: effectiveProvider,
+						model: effectiveModel,
+					})
+				: undefined;
+
 			// Emit API request start event
 			yield {
 				type: "api_request_start",
@@ -653,6 +680,7 @@ export async function* agentLoop(
 					reasoningEffort: config.reasoningEffort,
 					serviceTier: config.serviceTier,
 					metadata: config.metadata,
+					requestDump,
 					...(isFirstTurn && images?.length ? { images } : {}),
 				});
 
@@ -1266,6 +1294,7 @@ export async function* agentLoop(
 			contextPercent: requestContextPercent,
 			meterUsage: requestMeterUsage,
 			meterUnit: requestMeterUnit,
+			rawDump: requestDump?.snapshot(),
 		};
 
 		// Reset retry counter after a successful turn so the next turn's
@@ -1351,6 +1380,7 @@ export async function* agentLoop(
 					assistantText,
 					[],
 					collectReasoningBlocks(reasoningBlockMap),
+					collectCompletedWebSearches(webSearchAccum),
 				);
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
 					toolNames: orphanedNames,
@@ -1641,6 +1671,7 @@ export async function* agentLoop(
 				assistantText,
 				toolUses,
 				collectReasoningBlocks(reasoningBlockMap),
+				collectCompletedWebSearches(webSearchAccum),
 			);
 			yield { type: "turn_complete", turnIndex };
 			return;
@@ -1652,14 +1683,19 @@ export async function* agentLoop(
 		// they waste context and cause retry loops.
 		if (brokenToolUseIds.size > 0) {
 			const cleanToolUses = toolUses.filter((tu) => !brokenToolUseIds.has(tu.toolUseId));
-			pendingToolResults = pendingToolResults.filter(
-				(tr) => !brokenToolUseIds.has((tr as { toolUseId: string }).toolUseId),
-			);
+			pendingToolResults = pendingToolResults.filter((tr) => {
+				const toolUseId =
+					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).toolUseId ??
+					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).call_id ??
+					(tr as { toolUseId?: string; call_id?: string; tool_call_id?: string }).tool_call_id;
+				return !toolUseId || !brokenToolUseIds.has(toolUseId);
+			});
 			provider.pushAssistantTurn(
 				history,
 				assistantText,
 				cleanToolUses,
 				collectReasoningBlocks(reasoningBlockMap),
+				collectCompletedWebSearches(webSearchAccum),
 			);
 
 			// Inject a user-side reminder so the model knows what happened and
@@ -1677,6 +1713,7 @@ export async function* agentLoop(
 				assistantText,
 				toolUses,
 				collectReasoningBlocks(reasoningBlockMap),
+				collectCompletedWebSearches(webSearchAccum),
 			);
 		}
 

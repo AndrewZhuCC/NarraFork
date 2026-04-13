@@ -17,6 +17,7 @@ import {
 	parseSSEStream,
 } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -89,20 +90,42 @@ export class NkpProvider implements ProviderAdapter {
 		const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
 
 		prepareNkpRequest(request);
+		const headers = {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${this.config.apiKey}`,
+			Accept: "text/event-stream",
+			"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
+		};
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: `${baseUrl}/v1/kiro/chat`,
+			headers: sanitizeHeaders(headers),
+			body: request,
+		});
+
 		const response = await fetch(`${baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${this.config.apiKey}`,
-				Accept: "text/event-stream",
-				"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
-			},
+			headers,
 			body: JSON.stringify(request),
 			signal: params.signal,
+		});
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
 		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw httpError(`NKP chat error ${response.status}: ${errText}`, response.status);
 		}
 
@@ -111,6 +134,9 @@ export class NkpProvider implements ProviderAdapter {
 		}
 
 		yield* parseSSEStream(response.body);
+		if (responseTextPromise) {
+			params.requestDump?.setResponseBodyText(await responseTextPromise);
+		}
 	}
 
 	formatToolResult(

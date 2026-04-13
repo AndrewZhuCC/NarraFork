@@ -68,9 +68,16 @@ export class KiroProvider implements ProviderAdapter {
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const { kiroChatRaw } = await import("../kiro-adapter");
 		const request = buildKiroRequest(params) as import("../kiro-adapter").KiroChatRequest;
+		params.requestDump?.setRequest({
+			transport: "kiro-plugin",
+			body: request,
+		});
+		const rawEvents: import("../kiro-adapter").StreamEvent[] = [];
 		for await (const evt of kiroChatRaw(request, params.signal)) {
+			rawEvents.push(evt);
 			yield parseKiroStreamEvent(evt);
 		}
+		params.requestDump?.setResponseEvents(rawEvents);
 	}
 
 	formatToolResult(

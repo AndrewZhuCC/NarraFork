@@ -64,8 +64,8 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					visibleModels={visibleModelsList}
 					disabled={group.disabled}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
-					onOpenConfig={() => onOpenProviderConfig(group.prefix)}
-					isSelected={selectedProvider === group.prefix}
+					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
+					isSelected={selectedProvider === (group.providerId ?? group.prefix)}
 				/>
 			</Grid.Col>
 		);

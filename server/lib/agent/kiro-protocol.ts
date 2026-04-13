@@ -269,9 +269,10 @@ export async function buildKiroHistory(
 ): Promise<{ history: KiroHistoryMessage[]; trailingToolResults: KiroToolResult[] }> {
 	const modelId = resolveModel(model);
 
-	// Only top-level user/assistant messages
+	// Filter model-visible messages: user, assistant, sys (system context)
+	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
 	const topLevel = dbMessages.filter(
-		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant"),
+		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
 
 	// Drop the last user message — it's the current message being sent via currentMessage
@@ -279,16 +280,17 @@ export async function buildKiroHistory(
 		topLevel.pop();
 	}
 
-	// Merge consecutive user messages (e.g. from previous failed sessions)
+	// Normalize sys → user for Kiro-compatible replay, then merge consecutive user messages.
 	const merged: DbMessage[] = [];
 	for (const msg of topLevel) {
+		const normalizedMsg: DbMessage = msg.role === "sys" ? { ...msg, role: "user" } : { ...msg };
 		const prev = merged[merged.length - 1];
-		if (prev && prev.role === msg.role && msg.role === "user") {
+		if (prev && prev.role === normalizedMsg.role && normalizedMsg.role === "user") {
 			const prevText = prev.contentText || "";
-			const curText = msg.contentText || "";
+			const curText = normalizedMsg.contentText || "";
 			prev.contentText = prevText ? `${prevText}\n${curText}` : curText;
 		} else {
-			merged.push({ ...msg });
+			merged.push(normalizedMsg);
 		}
 	}
 

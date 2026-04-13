@@ -16,6 +16,7 @@ import {
 	parseSSEStream,
 } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -205,16 +206,37 @@ export class NugProvider implements ProviderAdapter {
 		};
 
 		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
+		const headers = this.chatHeaders(conversationId);
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: `${this.baseUrl}${endpoint}`,
+			headers: sanitizeHeaders(headers),
+			body,
+		});
 
 		const response = await fetch(`${this.baseUrl}${endpoint}`, {
 			method: "POST",
-			headers: this.chatHeaders(conversationId),
+			headers,
 			body: JSON.stringify(body),
 			signal: params.signal,
+		});
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
 		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw httpError(`NUG chat error ${response.status}: ${errText}`, response.status);
 		}
 
@@ -223,6 +245,9 @@ export class NugProvider implements ProviderAdapter {
 		}
 
 		yield* parseSSEStream(response.body);
+		if (responseTextPromise) {
+			params.requestDump?.setResponseBodyText(await responseTextPromise);
+		}
 	}
 
 	private async *chatKiro(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -230,16 +255,37 @@ export class NugProvider implements ProviderAdapter {
 		prepareNkpRequest(request);
 
 		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
+		const headers = this.chatHeaders(conversationId);
+		params.requestDump?.setRequest({
+			transport: "http",
+			url: `${this.baseUrl}/v1/kiro/chat`,
+			headers: sanitizeHeaders(headers),
+			body: request,
+		});
 
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.chatHeaders(conversationId),
+			headers,
 			body: JSON.stringify(request),
 			signal: params.signal,
+		});
+		const responseTextPromise = params.requestDump
+			? response
+					.clone()
+					.text()
+					.catch((error) => {
+						params.requestDump?.setResponseError(error);
+						return "";
+					})
+			: undefined;
+		params.requestDump?.setResponseMeta({
+			status: response.status,
+			headers: sanitizeHeaders(response.headers),
 		});
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
+			params.requestDump?.setResponseBodyText(errText);
 			throw httpError(`NUG chat error ${response.status}: ${errText}`, response.status);
 		}
 
@@ -248,6 +294,9 @@ export class NugProvider implements ProviderAdapter {
 		}
 
 		yield* parseSSEStream(response.body);
+		if (responseTextPromise) {
+			params.requestDump?.setResponseBodyText(await responseTextPromise);
+		}
 	}
 
 	formatToolResult(
