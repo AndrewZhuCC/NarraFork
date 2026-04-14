@@ -210,6 +210,7 @@ export type AgentEvent =
 			meterUnit?: string;
 			rawDump?: unknown;
 	  }
+	| { type: "silent_disconnect" }
 	| { type: "done" };
 
 export interface AgentToolUse {

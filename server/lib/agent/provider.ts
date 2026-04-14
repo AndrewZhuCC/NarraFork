@@ -108,6 +108,8 @@ export interface ParsedStreamEvent {
 	_responsesApi?: boolean;
 	/** Stop reason from message_delta (Anthropic) or finish_reason (OpenAI) */
 	stopReason?: string;
+	/** Upstream socket closed and the turn should end quietly without surfacing an error. */
+	silentDisconnect?: boolean;
 }
 
 // === Chat parameters passed to provider.chat() ===
@@ -189,6 +191,7 @@ export interface ProviderAdapter {
 			queries?: string[];
 			outputIndex?: number;
 		}>,
+		messageId?: string,
 	): void;
 
 	/** Simple text generation — no tools, no loop. Returns generated text. */

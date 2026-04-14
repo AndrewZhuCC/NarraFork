@@ -177,7 +177,22 @@ export class NkpProvider implements ProviderAdapter {
 		h.push(userMsg);
 	}
 
-	pushAssistantTurn(history: unknown[], text: string, toolUses: AgentToolUse[]): void {
+	pushAssistantTurn(
+		history: unknown[],
+		text: string,
+		toolUses: AgentToolUse[],
+		_reasoningBlocks?: Array<{
+			text: string;
+			providerMetadata?: import("./types").ReasoningProviderMetadata;
+		}>,
+		_webSearches?: Array<{
+			id: string;
+			query?: string;
+			queries?: string[];
+			outputIndex?: number;
+		}>,
+		_messageId?: string,
+	): void {
 		const h = history as KiroHistoryMessage[];
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
