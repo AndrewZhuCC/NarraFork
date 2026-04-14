@@ -405,17 +405,18 @@ export async function buildKiroHistory(
 			}
 		} else if (msg.role === "user") {
 			const text = msg.contentText || "";
+			const ownerNarratorId = msg.narratorId ?? narratorId;
 
-			// Extract images from contentJson if narratorId is available
+			// Extract images from contentJson if narrator ownership is available
 			let images: KiroImage[] | undefined;
-			if (narratorId && Array.isArray(msg.contentJson)) {
+			if (ownerNarratorId && Array.isArray(msg.contentJson)) {
 				const imageBlocks = (
 					msg.contentJson as Array<{ type: string; imageId?: string; mediaType?: string }>
 				).filter((b) => b.type === "image" && b.imageId);
 				if (imageBlocks.length > 0) {
 					const resolved: KiroImage[] = [];
 					for (const block of imageBlocks) {
-						const filePath = getImagePath(narratorId, block.imageId ?? "");
+						const filePath = getImagePath(ownerNarratorId, block.imageId ?? "");
 						if (filePath) {
 							try {
 								const result = await imageToBase64(filePath);
