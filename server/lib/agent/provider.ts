@@ -24,6 +24,16 @@ function isKiroProviderDisabled(): boolean {
 	return process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1";
 }
 
+// === Web search action types (matches OpenAI Responses API web_search_call action) ===
+
+export interface WebSearchAction {
+	type: string;
+	query?: string;
+	queries?: string[];
+	url?: string;
+	pattern?: string;
+}
+
 // === Provider-agnostic DB types (used by buildHistory) ===
 
 export interface DbMessage {
@@ -101,6 +111,8 @@ export interface ParsedStreamEvent {
 		outputIndex?: number;
 		/** True when this event is the final output_item.done payload. */
 		final?: boolean;
+		/** Full action object from the API (search/open_page/find_in_page). */
+		action?: WebSearchAction;
 	};
 	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
 	responseId?: string;
@@ -190,6 +202,7 @@ export interface ProviderAdapter {
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: WebSearchAction;
 		}>,
 		messageId?: string,
 	): void;

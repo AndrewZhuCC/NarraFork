@@ -162,6 +162,7 @@ export type SnapshotStreamingBlock =
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: import("../lib/agent/provider").WebSearchAction;
 	  }
 	| { type: "text"; text: string };
 
@@ -660,6 +661,7 @@ export async function processEvent(
 					query: block.query,
 					queries: block.queries,
 					outputIndex: block.outputIndex,
+					...(block.action ? { action: block.action } : {}),
 				});
 			}
 			return null;
