@@ -1216,11 +1216,13 @@ export function resolveEffectiveModel(model: string | null | undefined): string 
 }
 
 /**
- * Get all available model values (provider:id format), excluding hidden models.
+ * Get all available model values (provider:id format), excluding hidden models
+ * and models from disabled providers.
  * Sources: kiro cached models, openai cached models, anthropic models, codex models, custom models.
  */
 export function getVisibleModels(): string[] {
 	const hidden = new Set(settings.agent.hiddenModels ?? []);
+	const disabledPrefixes = new Set(settings.agent.disabledProviders ?? []);
 	const kiro = kiroModelLister?.() ?? [];
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
@@ -1241,10 +1243,12 @@ export function getVisibleModels(): string[] {
 		...cline,
 		...custom,
 	]) {
-		if (!seen.has(v) && !hidden.has(v)) {
-			seen.add(v);
-			result.push(v);
-		}
+		if (seen.has(v) || hidden.has(v)) continue;
+		// Check if the model's provider prefix is disabled
+		const colonIdx = v.indexOf(":");
+		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;
+		seen.add(v);
+		result.push(v);
 	}
 	return result;
 }
