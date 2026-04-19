@@ -25,6 +25,7 @@ import { favoriteRoutes } from "./routes/favorites";
 import { fsRoutes } from "./routes/fs";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
+import { hookRoutes } from "./routes/hooks";
 import { kiroRoutes } from "./routes/kiro";
 import { mcpRoutes } from "./routes/mcp";
 import { narratorRoutes } from "./routes/narrators";
@@ -115,6 +116,7 @@ const GIT_FREE_PREFIXES = [
 	"/api/routines",
 	"/api/skills",
 	"/api/custom-subagents",
+	"/api/hooks",
 	"/api/kiro",
 	"/api/openai",
 	"/api/codex",
@@ -159,6 +161,7 @@ app.route("/api/storage", storageRoutes);
 app.route("/api/runtime", runtimeRoutes);
 app.route("/api/custom-subagents", customSubagentRoutes);
 app.route("/api/routines", routineRoutes);
+app.route("/api/hooks", hookRoutes);
 app.route("/api/reviews", reviewsRouter);
 app.route("/api/overseers", overseerRoutes);
 app.route("/api/update", updateRoutes);
