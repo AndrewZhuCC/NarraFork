@@ -1303,6 +1303,30 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onSubagentSuspended: (subagentNarratorId: string, _toolUseId: string) => {
+				// Invalidate the subagent narrator query so SubagentCard picks up "suspended" status
+				qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+			},
+			onSubagentConclusionUpdated: (
+				_subagentNarratorId: string,
+				toolUseId: string,
+				output: unknown,
+				hasError: boolean,
+			) => {
+				// Update the tool call's outputJson in the messages cache
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							outputJson: output,
+							status: hasError ? "fail" : "success",
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onToolUseChunk: (
 				toolUseId: string,
 				toolName: string,
