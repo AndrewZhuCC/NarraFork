@@ -320,12 +320,7 @@ function ProviderStep({
 
 	const handleGoToProviders = () => {
 		onMinimize();
-		navigate({ to: "/admin/providers" });
-	};
-
-	const handleGoToBetaTrial = () => {
-		onMinimize();
-		navigate({ to: "/admin/beta-trial" });
+		navigate({ to: "/settings/providers" });
 	};
 
 	return (
@@ -352,9 +347,6 @@ function ProviderStep({
 			<Group>
 				<Button variant="light" onClick={handleGoToProviders}>
 					{t("wizardProviderGoToAdmin")}
-				</Button>
-				<Button variant="filled" color="indigo" onClick={handleGoToBetaTrial}>
-					{t("betaTrialButton")}
 				</Button>
 			</Group>
 		</Stack>
