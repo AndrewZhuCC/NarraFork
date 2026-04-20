@@ -28,7 +28,9 @@ function resetProviders(): void {
 	settings.clineProviders = [];
 	settings.codex = undefined;
 	settings.kiro = undefined;
-	settings.agent.customModels = [];
+	if (settings.agent) {
+		settings.agent.customModels = [];
+	}
 }
 
 function createTempCodexManagerWithCredential(): CodexManager {
