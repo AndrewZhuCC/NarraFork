@@ -72,7 +72,7 @@ description: 完整的版本发布流程：从 git 提交记录生成双语更�
 
 ## 阶段二：执行发布
 
-Changelog 生成后，告知用户并询问是否继续执行发布。
+Changelog 生成后，立即执行发布脚本，不要询问用户确认。
 
 ### 发布命令
 
@@ -113,5 +113,4 @@ bun scripts/release.ts <version>
 ## 工作流总结
 
 1. 生成 changelog → `changelogs/v{version}.json`
-2. 确认内容无误
-3. 执行 `bun scripts/release.ts <version>` 完成发布
+2. 立即执行 `bun scripts/release.ts <version>` 完成发布（不要询问确认）
