@@ -171,6 +171,8 @@ export type AgentEvent =
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
 	| { type: "nkp_quota_balance"; quotaBalance: number | null }
 	| { type: "nkp_queue_status"; position: number; queueDepth: number }
+	| { type: "queue_status"; position: number; queueDepth: number }
+	| { type: "quota_balance"; quotaBalance: string | null }
 	| { type: "invalid_state"; reason: string; message: string }
 	| { type: "output_truncated"; message: string }
 	| {

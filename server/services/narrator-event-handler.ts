@@ -1208,6 +1208,29 @@ export async function processEvent(
 			return null;
 		}
 
+		// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway).
+		case "queue_status": {
+			const qsSnap = getOrCreateSnapshot(narratorId);
+			qsSnap.nkpQueuePosition = event.position;
+			qsSnap.nkpQueueDepth = event.queueDepth;
+			dualBroadcast(ctx, {
+				type: "queue_status",
+				narratorId: broadcastTargetId,
+				position: event.position,
+				queueDepth: event.queueDepth,
+			});
+			return null;
+		}
+
+		case "quota_balance": {
+			dualBroadcast(ctx, {
+				type: "quota_balance",
+				narratorId: broadcastTargetId,
+				quotaBalance: event.quotaBalance,
+			});
+			return null;
+		}
+
 		case "invalid_state": {
 			logger.warn("Agent invalid state event", {
 				narratorId,

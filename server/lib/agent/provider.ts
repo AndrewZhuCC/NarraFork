@@ -5,6 +5,7 @@ import {
 	getNkpProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
+	parseAggModelValue,
 	parseModelId,
 	resolveEffectiveModel,
 	resolveProvider,
@@ -77,6 +78,11 @@ export interface ParsedStreamEvent {
 	nkpQuotaBalance?: number | null;
 	/** NKP queue status — sent while waiting for a concurrency slot */
 	nkpQueue?: { position: number; queueDepth: number };
+	/** Gateway-injected queue status (generic, for non-NKP providers via unified gateway) */
+	queueStatus?: { position: number; queueDepth: number };
+	/** Gateway-injected quota balance (generic, for non-NKP providers via unified gateway).
+	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
+	quotaBalance?: string | null;
 	/** Streaming tool use chunk — accumulated by the loop */
 	toolUseChunk?: {
 		toolUseId: string;
@@ -350,8 +356,13 @@ function buildResolution(
 	};
 }
 
-export function resolveProviderAndModel(model?: string): ProviderResolution {
-	const requestedModel = resolveEffectiveModel(model);
+export function resolveProviderAndModel(
+	model?: string,
+	stickyProvider?: string,
+): ProviderResolution {
+	// For aggregation models, pass stickyProvider to enable session affinity
+	const isAgg = model ? !!parseAggModelValue(model) : false;
+	const requestedModel = resolveEffectiveModel(model, isAgg ? stickyProvider : undefined);
 	const requestedProvider = resolveProvider(requestedModel);
 
 	if (requestedProvider === "kiro") {

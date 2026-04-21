@@ -2,8 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api } from "../lib/api";
 import {
+	AGG_MODEL_PREFIX,
 	FOLLOW_DEFAULT_MODEL,
 	groupModelsByProvider,
+	type ModelAggregation,
 	type ModelOption,
 	mergeModels,
 	modelValue,
@@ -281,6 +283,14 @@ export function useAllModels() {
 		const allModels = mergeModels(...enabledModelArrays);
 		const visibleModels = allModels.filter((m) => !hidden.has(m.value));
 
+		// --- Model aggregations ---
+		const aggregations: ModelAggregation[] = settingsData?.agent?.modelAggregations ?? [];
+		const aggModels: ModelOption[] = aggregations.map((agg) => ({
+			value: `${AGG_MODEL_PREFIX}${agg.id}`,
+			label: agg.name,
+			provider: "__agg__",
+		}));
+
 		// --- "Follow default" option ---
 		const defaultModelValue = settingsData?.agent?.defaultModel ?? "kiro:claude-sonnet-4.5";
 		const defaultModelOption = visibleModels.find((m) => m.value === defaultModelValue);
@@ -291,11 +301,12 @@ export function useAllModels() {
 			provider: "__default__",
 		};
 
-		// Prepend follow-default to visible models for grouped select
-		const visibleWithDefault = [followDefaultOption, ...visibleModels];
+		// Prepend follow-default and aggregations to visible models for grouped select
+		const visibleWithDefault = [followDefaultOption, ...aggModels, ...visibleModels];
 		const groupedModels = groupModelsByProvider(visibleWithDefault, {
 			...providerLabels,
 			__default__: "Default",
+			__agg__: "Aggregations",
 		});
 
 		return {
@@ -303,14 +314,16 @@ export function useAllModels() {
 			allModels,
 			/** Models after hiddenModels filter. */
 			visibleModels,
-			/** Models with "follow default" prepended, after hiddenModels filter. */
+			/** Models with "follow default" and aggregations prepended, after hiddenModels filter. */
 			visibleWithDefault,
-			/** Grouped for Mantine Select (includes "follow default"). */
+			/** Grouped for Mantine Select (includes "follow default" and aggregations). */
 			groupedModels,
 			/** The "follow default" ModelOption. */
 			followDefaultOption,
 			/** The current default model value from settings. */
 			defaultModelValue,
+			/** Model aggregations from settings. */
+			aggregations,
 			/** Kiro models only. */
 			kiroModels,
 			/** Codex models only. */

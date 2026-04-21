@@ -1660,6 +1660,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					payload: { nkpQueuePosition: position > 0 ? position : null },
 				});
 			},
+			onQuotaBalance: (_balance) => {
+				// Generic gateway quota balance — currently a no-op.
+				// UI for non-NKP provider quota display will be added later.
+			},
+			onQueueStatus: (position, _queueDepth) => {
+				// Generic gateway queue status — reuses nkpQueuePosition for the UI
+				// since the display logic is identical (show position badge).
+				dispatchStatus({
+					type: "patch",
+					payload: { nkpQueuePosition: position > 0 ? position : null },
+				});
+			},
 			onBrowserSessionCount: (count) => {
 				setBrowserSessionCount(count);
 				qc.invalidateQueries({ queryKey: ["browser-sessions", narratorId] });
