@@ -542,6 +542,7 @@ export async function processEvent(
 				}),
 				...(event.extractedFields && { extractedFields: event.extractedFields }),
 				...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
+				...(event.inputDelta && { inputDelta: event.inputDelta }),
 			});
 			return null;
 		}

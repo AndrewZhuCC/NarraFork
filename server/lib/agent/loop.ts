@@ -356,6 +356,8 @@ export async function* agentLoop(
 				name: string;
 				inputChunks: string[];
 				totalChars: number;
+				/** Accumulated input delta since last yield (flushed on each yield) */
+				pendingDelta: string;
 				startedAt: number;
 				extractedFilePath?: string;
 				extractedFields?: Record<string, string>;
@@ -591,6 +593,7 @@ export async function* agentLoop(
 										name,
 										inputChunks: [],
 										totalChars: 0,
+										pendingDelta: "",
 										startedAt: Date.now(),
 										lastYieldedAt: Date.now(),
 									});
@@ -608,6 +611,7 @@ export async function* agentLoop(
 								if (typeof input === "string") {
 									acc.inputChunks.push(input);
 									acc.totalChars += input.length;
+									acc.pendingDelta += input;
 
 									// For Write/Edit tools, try to extract file_path from first chunk
 									let filePathJustExtracted = false;
@@ -657,6 +661,10 @@ export async function* agentLoop(
 											contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 										}
 
+										// Flush accumulated delta since last yield
+										const inputDelta = acc.pendingDelta;
+										acc.pendingDelta = "";
+
 										yield {
 											type: "tool_use_chunk",
 											toolUseId: id,
@@ -671,6 +679,7 @@ export async function* agentLoop(
 											...(acc.extractedFields && {
 												extractedFields: acc.extractedFields,
 											}),
+											...(inputDelta && { inputDelta }),
 										};
 									}
 								}
@@ -681,6 +690,8 @@ export async function* agentLoop(
 										const filePathFieldSize = `"file_path":"${acc.extractedFilePath}",`.length;
 										contentChars = Math.max(0, acc.totalChars - filePathFieldSize);
 									}
+									const inputDelta = acc.pendingDelta;
+									acc.pendingDelta = "";
 									yield {
 										type: "tool_use_chunk",
 										toolUseId: id,
@@ -695,6 +706,7 @@ export async function* agentLoop(
 										...(acc.extractedFields && {
 											extractedFields: acc.extractedFields,
 										}),
+										...(inputDelta && { inputDelta }),
 									};
 
 									const raw = acc.inputChunks.join("");
