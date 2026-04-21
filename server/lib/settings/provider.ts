@@ -609,6 +609,18 @@ export const DEFAULT_CONTEXT_THRESHOLDS = {
 	large: { pruneStart: 95, compactStart: 99 },
 };
 
+/**
+ * Resolve the summary model's effective context window (tokens).
+ * kiro / nkp providers default to 200K; others use the built-in table.
+ */
+export function getSummaryModelContextWindow(): number {
+	const summaryModel = s().agent.summaryModel;
+	const parsed = parseModelId(summaryModel);
+	const prov = parsed.provider ?? "kiro";
+	if (prov === "kiro" || prov.startsWith("nkp")) return 200_000;
+	return getModelContextWindow(parsed.model, prov) ?? 128_000;
+}
+
 export function getContextThresholds(
 	model: string,
 	provider: string,

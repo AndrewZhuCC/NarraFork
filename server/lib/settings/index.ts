@@ -34,6 +34,7 @@ export {
 	getNkpProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
+	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,
 	hasConfiguredNkpProvider,
