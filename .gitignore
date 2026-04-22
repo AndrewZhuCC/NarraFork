@@ -25,3 +25,4 @@ mitm-dump/
 package-lock.json
 IMPROVEMENT-PLAN.md
 kirocli.zip
+*.log

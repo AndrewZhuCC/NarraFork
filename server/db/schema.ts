@@ -410,6 +410,8 @@ export const narratorToolCalls = sqliteTable(
 		// Provider and model info
 		provider: text("provider"), // anthropic, openai, kiro, codex, nkp
 		model: text("model"), // claude-3-5-sonnet-20241022, gpt-4o, etc.
+		// Subagent result binding: points to the subagent's assistant message that produced the result
+		resultMessageId: text("result_message_id"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
