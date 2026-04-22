@@ -150,6 +150,7 @@ const updateSettingsSchema = z
 					})
 					.partial(),
 				legacyEncoding: z.boolean(),
+				freshShellEnv: z.boolean(),
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),

@@ -115,10 +115,7 @@ export interface UseNarratorPanelWSReturn {
 	// State
 	queuedMessages: BufferMessageSummary[];
 	setQueuedMessages: React.Dispatch<React.SetStateAction<BufferMessageSummary[]>>;
-	isCompacting: boolean;
-	setIsCompacting: React.Dispatch<React.SetStateAction<boolean>>;
-	isCheckingInterrupt: boolean;
-	nkpQueuePosition: number | null;
+	substatus: string[];
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
 	promptTokens: number | null;
@@ -158,9 +155,7 @@ const MAX_LIVE_MESSAGES = 200;
 // per callback since React batches reducer dispatches into one update.
 
 interface StatusState {
-	isCompacting: boolean;
-	isCheckingInterrupt: boolean;
-	nkpQueuePosition: number | null;
+	substatus: string[];
 	contextPercent: number | null;
 	promptTokens: number | null;
 	contextWindow: number | null;
@@ -173,11 +168,24 @@ interface StatusState {
 
 type StatusAction = { type: "patch"; payload: Partial<StatusState> };
 
+function arraysEqual(a: unknown, b: unknown): boolean {
+	if (!Array.isArray(a) || !Array.isArray(b)) return false;
+	return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
 function statusReducer(state: StatusState, action: StatusAction): StatusState {
 	if (action.type === "patch") {
 		// Bail out early if nothing actually changed — avoids a re-render.
 		const keys = Object.keys(action.payload) as (keyof StatusState)[];
-		if (keys.every((k) => state[k] === action.payload[k])) return state;
+		if (
+			keys.every((k) => {
+				const sv = state[k];
+				const pv = action.payload[k];
+				if (Array.isArray(sv) || Array.isArray(pv)) return arraysEqual(sv, pv);
+				return sv === pv;
+			})
+		)
+			return state;
 		return { ...state, ...action.payload };
 	}
 	return state;
@@ -263,13 +271,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string;
 				contentCharsReceived?: number;
 				extractedFields?: Record<string, string>;
-				inputRaw?: string;
+				streamingFieldName?: string;
+				streamingFieldValue?: string;
 			}
 		>
 	>(new Map());
 	const topLevelStreamingCreatedAtRef = useRef<string | null>(null);
-	/** Accumulated raw JSON input per tool (persists across RAF frames, cleared on tool completion) */
-	const toolInputRawRef = useRef<Map<string, string>>(new Map());
+	/** Accumulated streaming field value per tool (persists across RAF frames) */
+	const toolStreamingFieldRef = useRef<Map<string, { name: string; value: string }>>(new Map());
 	const toolChunkRafRef = useRef(0);
 
 	// Cancel pending RAF handles on unmount
@@ -299,14 +308,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const cancelPendingToolChunks = useCallback((notify = true, includeSubagent = false) => {
 		if (includeSubagent) {
 			pendingToolChunkRef.current.clear();
-			toolInputRawRef.current.clear();
+			toolStreamingFieldRef.current.clear();
 		} else {
 			// Only remove top-level entries; keep subagent chunks intact.
 			// NOTE: Deleting during Map iteration is safe per ES2015 spec §23.1.3.5.
 			for (const [key, chunk] of pendingToolChunkRef.current) {
 				if (!chunk.parentToolUseId) {
 					pendingToolChunkRef.current.delete(key);
-					toolInputRawRef.current.delete(key);
+					toolStreamingFieldRef.current.delete(key);
 				}
 			}
 		}
@@ -395,9 +404,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// --- Misc state (co-updated fields merged into reducer) ---
 	const [queuedMessages, setQueuedMessages] = useState<BufferMessageSummary[]>([]);
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
-		isCompacting: false,
-		isCheckingInterrupt: false,
-		nkpQueuePosition: null,
+		substatus: [],
 		contextPercent: null,
 		promptTokens: null,
 		contextWindow: null,
@@ -408,9 +415,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		prunedPercent: null,
 	});
 	const {
-		isCompacting,
-		isCheckingInterrupt,
-		nkpQueuePosition,
+		substatus,
 		contextPercent,
 		promptTokens,
 		contextWindow,
@@ -420,18 +425,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		pruneBoundaryMessageId,
 		prunedPercent,
 	} = statusState;
-	// Expose setters that match the original useState API for external callers
-	const setIsCompacting = useCallback(
-		(v: React.SetStateAction<boolean>) => {
-			dispatchStatus({
-				type: "patch",
-				payload: {
-					isCompacting: typeof v === "function" ? v(statusState.isCompacting) : v,
-				},
-			});
-		},
-		[statusState.isCompacting],
-	);
 	const setContextPercent = useCallback(
 		(v: React.SetStateAction<number | null>) => {
 			dispatchStatus({
@@ -611,7 +604,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						_streamingContentChars: chunk.contentCharsReceived,
 					}),
 					...(chunk.extractedFields && { _streamingFields: chunk.extractedFields }),
-					...(chunk.inputRaw && { _streamingInputRaw: chunk.inputRaw }),
+					...(chunk.streamingFieldName && {
+						_streamingFieldName: chunk.streamingFieldName,
+					}),
+					...(chunk.streamingFieldValue && {
+						_streamingFieldValue: chunk.streamingFieldValue,
+					}),
 				});
 				blocks = next.blocks;
 				toolCalls = next.toolCalls;
@@ -934,21 +932,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
 				);
 				if (compactBlock) {
-					const patch: Partial<StatusState> = {
-						isCompacting: compactBlock.status === "compacting",
-					};
+					const patch: Partial<StatusState> = {};
 					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
 						patch.contextPercent = wsData.message.contextPercent as number;
 					}
-					if (compactBlock.status === "failed") {
-						patch.isCompacting = false;
+					if (Object.keys(patch).length > 0) {
+						dispatchStatus({ type: "patch", payload: patch });
 					}
-					dispatchStatus({ type: "patch", payload: patch });
 				}
-				// Note: do NOT setIsCompacting(false) for non-compact messages —
-				// that causes a race condition where subagent or other messages
-				// arriving during compact would incorrectly clear the loading state.
-				// isCompacting is cleared by the dedicated compact_done/compact_failed events.
+				// Note: compact status is now tracked via substatus — do NOT dispatch
+				// isCompacting here. The substatus_change event handles it.
 				if (wsData.message?.id && wsData.message?.createdAt) {
 					const newMsg = { ...wsData.message, children: wsData.message.children ?? [] };
 					if (wsData.message?.role === "assistant") {
@@ -1151,7 +1144,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			) => {
 				// Discard any pending RAF chunk and accumulated raw input for this tool
 				pendingToolChunkRef.current.delete(toolUseId);
-				toolInputRawRef.current.delete(toolUseId);
+				toolStreamingFieldRef.current.delete(toolUseId);
 
 				// Update the streaming chunk entry if it still exists (top-level only)
 				if (!parentToolUseId) {
@@ -1402,12 +1395,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				extractedFilePath?: string,
 				contentCharsReceived?: number,
 				extractedFields?: Record<string, string>,
-				inputDelta?: string,
+				streamingField?: { name: string; delta: string },
 			) => {
-				// Accumulate raw JSON input across frames (not cleared per RAF)
-				if (inputDelta) {
-					const prev = toolInputRawRef.current.get(toolUseId) ?? "";
-					toolInputRawRef.current.set(toolUseId, prev + inputDelta);
+				// Accumulate streaming field value across frames (not cleared per RAF)
+				if (streamingField) {
+					const prev = toolStreamingFieldRef.current.get(toolUseId);
+					if (prev && prev.name === streamingField.name) {
+						prev.value += streamingField.delta;
+					} else {
+						toolStreamingFieldRef.current.set(toolUseId, {
+							name: streamingField.name,
+							value: streamingField.delta,
+						});
+					}
 				}
 				// Accumulate the latest state for each toolUseId; flush once per frame
 				pendingToolChunkRef.current.set(toolUseId, {
@@ -1455,6 +1455,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							if (!topLevelStreamingCreatedAtRef.current) {
 								topLevelStreamingCreatedAtRef.current = new Date().toISOString();
 							}
+							const sf = toolStreamingFieldRef.current.get(chunk.toolUseId);
 							topLevelStreamingChunkRef.current.set(chunk.toolUseId, {
 								toolUseId: chunk.toolUseId,
 								toolName: chunk.toolName,
@@ -1462,7 +1463,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								extractedFilePath: chunk.extractedFilePath,
 								contentCharsReceived: chunk.contentCharsReceived,
 								extractedFields: chunk.extractedFields,
-								inputRaw: toolInputRawRef.current.get(chunk.toolUseId),
+								streamingFieldName: sf?.name,
+								streamingFieldValue: sf?.value,
 							});
 							topLevelChanged = true;
 						}
@@ -1548,21 +1550,22 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 				}
 			},
-			onStatusChange: (status, turnStartedAt) => {
+			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
-				// Clean up streaming state for ALL terminal statuses, not just "idle".
-				// "interrupted" and "done" also mean the agent loop has stopped, so any
-				// residual streaming text / tool chunks must be flushed.
-				const isTerminal =
-					status === "idle" || status === "interrupted" || status === "done" || status === "error";
+				// Clean up streaming state when the narrator is no longer actively working.
+				// "idle" and "archived" are non-working states; done/error/interrupted are
+				// now represented as idle+substatus.
+				const isNotWorking = status !== "working" && status !== "waiting";
 				// Batch all reducer state updates into a single dispatch
-				const patch: Partial<StatusState> = { isCompacting: false };
-				if (isTerminal) {
-					patch.isCheckingInterrupt = false;
-					patch.nkpQueuePosition = null;
+				const patch: Partial<StatusState> = {};
+				if (eventSubstatus !== undefined) {
+					patch.substatus = eventSubstatus;
+				} else if (isNotWorking) {
+					// Clear substatus when transitioning to idle without explicit substatus
+					patch.substatus = [];
 				}
 				dispatchStatus({ type: "patch", payload: patch });
-				if (isTerminal) {
+				if (isNotWorking) {
 					const hadStreaming = streamingBlocksRef.current.length > 0;
 					streamingBlocksRef.current = [];
 					// Only bump streamingVersion when there was actual streaming content
@@ -1579,14 +1582,27 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					removeStreamingChunksMsg(qc, messagesQueryKey);
 				}
 				// Merge turnStartedAt only when the server explicitly sends it (i.e. at turn start).
-				// Terminal-status broadcasts (idle/done/error) omit turnStartedAt on purpose so the
-				// cached value from the "thinking" broadcast is preserved — the UI uses it to display
+				// Terminal-status broadcasts (idle) omit turnStartedAt on purpose so the
+				// cached value from the "working" broadcast is preserved — the UI uses it to display
 				// the elapsed duration of the last completed turn.
 				// Note: errorMessage is NOT cleared here — it persists until user manually dismisses it.
+				const narratorPatch: Record<string, unknown> = {
+					status,
+					...(turnStartedAt !== undefined && { turnStartedAt }),
+				};
+				if (eventSubstatus !== undefined) {
+					narratorPatch.substatus = eventSubstatus;
+				}
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-					old ? { ...old, status, ...(turnStartedAt !== undefined && { turnStartedAt }) } : old,
+					old ? { ...old, ...narratorPatch } : old,
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+			},
+			onSubstatusChange: (newSubstatus) => {
+				dispatchStatus({ type: "patch", payload: { substatus: newSubstatus } });
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, substatus: newSubstatus } : old,
+				);
 			},
 			onTitleUpdated: () => {
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
@@ -1668,23 +1684,15 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-			onNkpQueueStatus: (position, _queueDepth) => {
-				dispatchStatus({
-					type: "patch",
-					payload: { nkpQueuePosition: position > 0 ? position : null },
-				});
+			onNkpQueueStatus: (_position, _queueDepth) => {
+				// Queue position now comes via substatus_change — no-op here.
 			},
 			onQuotaBalance: (_balance) => {
 				// Generic gateway quota balance — currently a no-op.
 				// UI for non-NKP provider quota display will be added later.
 			},
-			onQueueStatus: (position, _queueDepth) => {
-				// Generic gateway queue status — reuses nkpQueuePosition for the UI
-				// since the display logic is identical (show position badge).
-				dispatchStatus({
-					type: "patch",
-					payload: { nkpQueuePosition: position > 0 ? position : null },
-				});
+			onQueueStatus: (_position, _queueDepth) => {
+				// Queue position now comes via substatus_change — no-op here.
 			},
 			onBrowserSessionCount: (count) => {
 				setBrowserSessionCount(count);
@@ -1724,7 +1732,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
 			},
 			onCompacting: () => {
-				dispatchStatus({ type: "patch", payload: { isCompacting: true } });
+				// Compacting status now comes via substatus_change.
+				// Keep this callback for compact block detection in onMessage.
 			},
 			onSegmentCompactHide: (hiddenMessageIds: string[]) => {
 				// Remove hidden messages from the cache immediately so the UI
@@ -1749,7 +1758,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				dispatchStatus({
 					type: "patch",
 					payload: {
-						isCompacting: false,
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
 					},
@@ -1770,20 +1778,25 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				}
 			},
 			onInterruptChecking: () => {
-				dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: true } });
+				// isCheckingInterrupt now comes via substatus_change.
 				// Safety timeout: if the backend never sends interrupt_check_done
-				// (e.g. WS glitch, backend crash), clear the checking state after
-				// 20 s so the UI doesn't stay stuck forever.
+				// (e.g. WS glitch, backend crash), remove the checking_interrupt tag
+				// after 20 s so the UI doesn't stay stuck forever.
 				if (interruptCheckTimeoutRef.current) {
 					clearTimeout(interruptCheckTimeoutRef.current);
 				}
 				interruptCheckTimeoutRef.current = setTimeout(() => {
-					dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: false } });
+					dispatchStatus({
+						type: "patch",
+						payload: {
+							substatus: statusState.substatus.filter((s) => s !== "checking_interrupt"),
+						},
+					});
 					interruptCheckTimeoutRef.current = null;
 				}, 20_000);
 			},
 			onInterruptCheckDone: () => {
-				dispatchStatus({ type: "patch", payload: { isCheckingInterrupt: false } });
+				// isCheckingInterrupt now comes via substatus_change.
 				if (interruptCheckTimeoutRef.current) {
 					clearTimeout(interruptCheckTimeoutRef.current);
 					interruptCheckTimeoutRef.current = null;
@@ -2090,11 +2103,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		const isReconnect = connected && prevConnectedRef.current === false;
 		if (connected) prevConnectedRef.current = true;
 
-		// On reconnect, if the narrator is no longer thinking, the WS catch-up
+		// On reconnect, if the narrator is no longer working, the WS catch-up
 		// may have missed messages (e.g. user switched tabs while AI was running).
 		// Skip this for bounded around-windows, where refetching would still keep a
 		// truncated view and only add network churn.
-		if (isReconnect && narratorStatus !== "thinking" && !firstPageHasMoreAfter) {
+		if (isReconnect && narratorStatus !== "working" && !firstPageHasMoreAfter) {
 			qc.invalidateQueries({ queryKey: messagesQueryKey });
 		}
 
@@ -2154,21 +2167,25 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	}, [narratorId, narratorStatus, pendingPermsMap.size, messagesQueryKey, qc]);
 
 	// --- Mark "done" narrator as read ---
+	// With substatus refactor, "done" is now idle + substatus includes "unread".
+	const hasUnreadSubstatus = substatus.includes("unread");
 	useEffect(() => {
 		// Subagents must stay in done/error so ContinueTask can pick them up.
 		if (isSubagent) return;
-		// Preserve error sessions: do not auto-clear done->idle when an error exists.
-		if (narratorStatus === "done" && !narratorErrorMessage) {
+		// Preserve error sessions: do not auto-clear when an error exists.
+		if (narratorStatus === "idle" && hasUnreadSubstatus && !narratorErrorMessage) {
 			// Optimistically update cache so the UI reflects "idle" immediately,
 			// even if the WS event arrives late or is missed entirely.
 			qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
-				old ? { ...old, status: "idle" } : old,
+				old ? { ...old, status: "idle", substatus: [] } : old,
 			);
 			api.markNarratorRead(narratorId).catch(() => {});
 		}
-	}, [narratorId, narratorStatus, narratorErrorMessage, isSubagent, qc]);
+	}, [narratorId, narratorStatus, hasUnreadSubstatus, narratorErrorMessage, isSubagent, qc]);
 
-	// --- Derive isCompacting from persisted messages ---
+	// --- Derive compacting substatus from persisted messages ---
+	// On initial load (before WS connects), detect if the last message has an
+	// active compact block and seed the substatus accordingly.
 	useEffect(() => {
 		if (!messagesData?.pages?.length) return;
 		const firstPage = messagesData.pages[0];
@@ -2179,10 +2196,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		const compactBlock = blocks.find(
 			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
 		);
-		if (compactBlock) {
+		if (compactBlock && compactBlock.status === "compacting") {
 			dispatchStatus({
 				type: "patch",
-				payload: { isCompacting: compactBlock.status === "compacting" },
+				payload: { substatus: ["compacting"] },
 			});
 		}
 	}, [messagesData]);
@@ -2203,10 +2220,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			renderPermCb,
 			queuedMessages,
 			setQueuedMessages,
-			isCompacting,
-			setIsCompacting,
-			isCheckingInterrupt,
-			nkpQueuePosition,
+			substatus,
 			contextPercent,
 			setContextPercent,
 			promptTokens,
@@ -2245,10 +2259,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			pendingPermission,
 			renderPermCb,
 			queuedMessages,
-			isCompacting,
-			setIsCompacting,
-			isCheckingInterrupt,
-			nkpQueuePosition,
+			substatus,
 			contextPercent,
 			setContextPercent,
 			promptTokens,
