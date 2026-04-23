@@ -124,7 +124,7 @@ server/
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Kiro、Codex、NKP）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
-- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NKP 五个提供商，统一的工具注册和执行框架，内置 19 个工具（bash、read、write、edit、glob、grep、web-search、task、todo、ask-user-question、skill、plan-mode、share-file、terminal、continue-task、check-background-task、cancel-background-task 等）。支持可选工具机制（Terminal、ShareFile 通过 `enabledTools` 字段控制可见性）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NKP 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）、overseer 专用和 review 专用四组。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
@@ -142,7 +142,7 @@ server/
 - **技能系统**（`server/services/skill-service.ts`）：项目级技能库，为叙述者提供领域特定指令和知识。
 - **例程系统**（`server/services/routine-service.ts`）：内置和自定义的自动化例程。
 - **通知系统**（`server/services/notification-service.ts`）：通知管理和声音提醒。
-- **后台任务**：叙述者支持后台运行模式（`isBackground`/`backgroundStatus`/`backgroundResult` 字段），配合 check-background-task、cancel-background-task、continue-task 工具管理。
+- **后台任务**：叙述者支持后台运行模式（`isBackground`/`backgroundStatus`/`backgroundResult` 字段），配合 task（stop 参数）、continue-task 工具管理。
 - **叙述者服务拆分**：叙述者逻辑拆分为多个子服务 — narrator-service（核心 CRUD）、narrator-session（会话管理）、narrator-executor（执行器）、narrator-subagent（子代理管理）、narrator-context（上下文管理）、narrator-prompt（提示词生成）、narrator-title（标题生成）、narrator-recovery（恢复机制）、narrator-event-handler（事件处理）。
 - **项目数据库同步**（`server/services/project-db-sync.ts`）：项目数据库同步和导入功能。
 - **Worktree 监视器**（`server/services/worktree-watcher.ts`）：监视 worktree 文件变化。
