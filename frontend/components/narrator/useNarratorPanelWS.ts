@@ -594,6 +594,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						...(ext._durationMs != null && { durationMs: ext._durationMs }),
 						...(ext._metadata && { _metadata: ext._metadata }),
 						...(ext._longRunning && { _longRunning: true }),
+						...(ext._streamingOutput && { _streamingOutput: ext._streamingOutput }),
 					};
 				}
 			} else {
@@ -1490,7 +1491,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					});
 				}
 			},
-			onPermissionResolved: (_requestId, toolUseId, updatedInput, decision, feedbackText) => {
+			onPermissionResolved: (
+				_requestId,
+				toolUseId,
+				updatedInput,
+				decision,
+				feedbackText,
+				subagentNarratorId,
+			) => {
 				if (toolUseId) {
 					setPendingPermsMap((prev) => {
 						if (!prev.has(toolUseId)) return prev;
@@ -1530,6 +1538,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							toolUseIndexRef.current,
 						);
 					});
+					// Invalidate subagent narrator query so SubagentCard picks up "working" status
+					if (subagentNarratorId) {
+						qc.invalidateQueries({ queryKey: ["narrators", subagentNarratorId] });
+					}
 				}
 			},
 			onOverseerReviewing: (_requestId, toolUseId, status) => {
@@ -1717,6 +1729,25 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						query,
 						queries,
 						...(outputIndex != null ? { outputIndex } : {}),
+					});
+				}
+				flushStreamingVersion();
+			},
+			onImageGeneration: (id, status, revisedPrompt) => {
+				const blocks = streamingBlocksRef.current;
+				const existingIdx = blocks.findIndex((b) => b.type === "image_generation" && b.id === id);
+				if (existingIdx !== -1) {
+					const existing = blocks[existingIdx];
+					if (existing.type === "image_generation") {
+						existing.status = status;
+						if (revisedPrompt) existing.revisedPrompt = revisedPrompt;
+					}
+				} else {
+					blocks.splice(findStreamingInsertIndex(blocks, undefined), 0, {
+						type: "image_generation",
+						id,
+						status,
+						revisedPrompt,
 					});
 				}
 				flushStreamingVersion();
@@ -2007,6 +2038,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								_started: true,
 								_input: chunk.input,
 								_startedAt: chunk.streamStartedAt,
+								_streamingOutput: chunk.streamingOutput,
 								// biome-ignore lint/suspicious/noExplicitAny: sentinel fields on streaming chunk
 							} as any);
 							topLevelChanged = true;
