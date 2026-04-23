@@ -208,6 +208,7 @@ export async function executeTool(tu: AgentToolUse, config: AgentConfig): Promis
 		chapterId: config.chapterId,
 		planFileId: config.planFileId,
 		skillRoot: config.skillRoot,
+		parentNarratorId: config.parentNarratorId,
 		requestPermission: config.permissionHandler,
 		currentToolUseId: tu.toolUseId,
 	};
