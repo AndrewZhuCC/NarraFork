@@ -141,6 +141,7 @@ import { ChapterBar } from "./ChapterBar";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { FileModificationsDrawer } from "./FileModificationsDrawer";
 import {
 	type RenderedTreeElementMeta,
@@ -2849,7 +2850,9 @@ export function NarratorPanel({
 		isSubagent &&
 		narrator &&
 		narrator.status === "idle" &&
-		(substatus.includes("unread") || substatus.includes("error")) &&
+		(substatus.includes("unread") ||
+			substatus.includes("error") ||
+			substatus.includes("manual_override")) &&
 		!isActive;
 	const finalElements = useMemo(() => {
 		const elements = showManualLoadOlder
@@ -4266,6 +4269,7 @@ export function NarratorPanel({
 										)}
 									</ActionIcon>
 								</Tooltip>
+								<BackgroundTasksDrawer narratorId={narratorId} />
 								<Tooltip label={t("fileMod_title")}>
 									<ActionIcon
 										size="sm"

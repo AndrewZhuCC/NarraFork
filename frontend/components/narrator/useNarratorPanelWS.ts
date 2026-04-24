@@ -1962,6 +1962,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 					return result;
 				});
+				notifications.show({
+					title: t("backgroundTasks.completed"),
+					message: resultPreview?.slice(0, 100) || "",
+					color: "green",
+					autoClose: 5000,
+				});
 			},
 			onBackgroundTaskFailed: (_taskNarratorId, toolUseId, error) => {
 				scheduleCacheUpdate((old) => {
@@ -1983,6 +1989,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}
 					return result;
 				});
+				notifications.show({
+					title: t("backgroundTasks.failed"),
+					message: error?.slice(0, 100) || "",
+					color: "red",
+					autoClose: 8000,
+				});
 			},
 			onBackgroundTaskCancelled: (_taskNarratorId, toolUseId) => {
 				scheduleCacheUpdate((old) => {
@@ -1990,7 +2002,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return updateToolCallByIndex(
 						old,
 						toolUseId,
-						"fail",
+						"cancelled",
 						[{ type: "text", text: "Cancelled" }],
 						toolUseIndexRef.current,
 					);
