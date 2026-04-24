@@ -236,6 +236,8 @@ type ReasoningBlockEntry = {
 	text: string;
 	providerMetadata?: ReasoningProviderMetadata;
 	outputIndex?: number;
+	/** When true, the next reasoning delta should be preceded by a separator. */
+	_needsSeparator?: boolean;
 };
 
 /** Convert the per-itemId reasoning map to the blocks array expected by pushAssistantTurn. */
@@ -246,7 +248,9 @@ function collectReasoningBlocks(
 	const blocks: ReasoningBlockEntry[] = [];
 	for (const entry of map.values()) {
 		if (entry.text || entry.providerMetadata) {
-			blocks.push(entry);
+			// Strip internal-only _needsSeparator before passing to pushAssistantTurn
+			const { _needsSeparator: _, ...block } = entry;
+			blocks.push(block);
 		}
 	}
 	return blocks.length > 0 ? blocks : undefined;
@@ -472,6 +476,8 @@ export async function* agentLoop(
 
 		// Call provider and collect the response
 		let assistantText = "";
+		/** Provider-native content block index for the text block (for interleaved ordering). */
+		let textOutputIndex: number | undefined;
 		/**
 		 * Reasoning blocks accumulated during streaming, keyed by itemId.
 		 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
@@ -504,6 +510,8 @@ export async function* agentLoop(
 				/** How many raw chars of the active field have been yielded so far */
 				streamingFieldYielded: number;
 				lastYieldedAt: number;
+				/** Provider-native content block index for interleaved ordering. */
+				outputIndex?: number;
 			}
 		>();
 		// Accumulator for native web search calls (Codex web_search tool)
@@ -588,6 +596,7 @@ export async function* agentLoop(
 			// begins (the stream fails during the model's response, not after tool
 			// dispatch), so this is safe.
 			assistantText = "";
+			textOutputIndex = undefined;
 			reasoningBlockMap.clear();
 			toolUses.length = 0;
 			messageId = undefined;
@@ -677,6 +686,9 @@ export async function* agentLoop(
 
 					if (parsed.text) {
 						assistantText += parsed.text;
+						if (parsed.textOutputIndex != null) {
+							textOutputIndex = parsed.textOutputIndex;
+						}
 						yield { type: "stream_text", text: parsed.text };
 					}
 					if (parsed.toolUses) {
@@ -769,6 +781,7 @@ export async function* agentLoop(
 										streamingFieldYielded: 0,
 										startedAt: Date.now(),
 										lastYieldedAt: Date.now(),
+										outputIndex: parsed.toolUseChunk.outputIndex,
 									});
 									// Yield immediately so the frontend knows the tool name early
 									yield {
@@ -957,6 +970,7 @@ export async function* agentLoop(
 										name: acc.name,
 										input: parsedInput,
 										streamStartedAt: acc.startedAt,
+										outputIndex: acc.outputIndex,
 									};
 									// Skip if already added via non-streaming parsed.toolUses
 									const alreadyAdded = toolUses.some((t) => t.toolUseId === id);
@@ -979,6 +993,7 @@ export async function* agentLoop(
 											name: tu.name,
 											input: parsedInput,
 											streamStartedAt: acc.startedAt,
+											outputIndex: acc.outputIndex,
 										} satisfies ContentBlock,
 									};
 
@@ -1052,8 +1067,15 @@ export async function* agentLoop(
 					if (parsed.reasoning) {
 						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
 						const existing = reasoningBlockMap.get(itemKey);
+						// Separator prefix for merged reasoning segments
+						// (e.g. interleaved thinking blocks from Anthropic).
+						let prefix = "";
 						if (existing) {
-							existing.text += parsed.reasoning;
+							if (existing._needsSeparator && existing.text) {
+								prefix = "\n\n";
+								existing._needsSeparator = false;
+							}
+							existing.text += prefix + parsed.reasoning;
 							if (parsed.reasoningMetadata) {
 								existing.providerMetadata = parsed.reasoningMetadata;
 							}
@@ -1069,19 +1091,26 @@ export async function* agentLoop(
 						}
 						yield {
 							type: "stream_reasoning",
-							text: parsed.reasoning,
+							text: prefix + parsed.reasoning,
 							providerMetadata: parsed.reasoningMetadata,
 							outputIndex: parsed.reasoningOutputIndex,
 						};
 					} else if (parsed.reasoningMetadata) {
-						// Metadata-only event (e.g. final encrypted_content from output_item.done).
+						// Metadata-only event (e.g. final encrypted_content from output_item.done
+						// or Anthropic thinking block stop with signature).
 						// Update the stored metadata without emitting a streaming event.
+						// Mark the entry so the next reasoning delta inserts a separator.
 						const itemKey = parsed.reasoningMetadata?.openai?.itemId ?? "__default";
 						const existing = reasoningBlockMap.get(itemKey);
 						if (existing) {
 							existing.providerMetadata = parsed.reasoningMetadata;
 							if (parsed.reasoningOutputIndex != null) {
 								existing.outputIndex = parsed.reasoningOutputIndex;
+							}
+							// Mark for separator so the next reasoning delta from a
+							// new thinking block gets a visual break from the previous one.
+							if (existing.text) {
+								existing._needsSeparator = true;
 							}
 						} else {
 							// Metadata arrived before any text — create an empty-text entry
@@ -1606,6 +1635,7 @@ export async function* agentLoop(
 					collectCompletedWebSearches(webSearchAccum),
 					undefined,
 					collectCompletedImageGenerations(imageGenAccum),
+					textOutputIndex,
 				);
 				nextTurnContent = getToolMessageWithParams("brokenToolCallReminder", locale, {
 					toolNames: orphanedNames,
@@ -1899,6 +1929,7 @@ export async function* agentLoop(
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
+				textOutputIndex,
 			);
 			yield { type: "turn_complete", turnIndex };
 			return;
@@ -1925,6 +1956,7 @@ export async function* agentLoop(
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
+				textOutputIndex,
 			);
 
 			// Inject a user-side reminder so the model knows what happened and
@@ -1945,6 +1977,7 @@ export async function* agentLoop(
 				collectCompletedWebSearches(webSearchAccum),
 				messageId,
 				collectCompletedImageGenerations(imageGenAccum),
+				textOutputIndex,
 			);
 		}
 
