@@ -32,6 +32,8 @@ let defaultModel: KiroModel = "claude-sonnet-4.5";
 let credentialsPath: string | null = null;
 let pluginConfig: KiroPluginConfig | null = null;
 
+export { getProxy, registerProxyResolver } from "./proxy";
+
 /** Initialize the kiro plugin. Call once at app startup. */
 export function initKiro(config: KiroPluginConfig): boolean {
 	pluginConfig = config;

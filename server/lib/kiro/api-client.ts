@@ -4,6 +4,7 @@
 import { randomUUID } from "node:crypto";
 import { effectiveApiRegion } from "./config";
 import type { MultiTokenManager } from "./multi-token-manager";
+import { pfetch } from "./proxy";
 import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } from "./types";
 
 const BASE_DELAY_MS = 200;
@@ -47,7 +48,7 @@ export class KiroApiClient {
 
 			let res: Response;
 			try {
-				res = await fetch(url, {
+				res = await pfetch(url, {
 					method: "POST",
 					headers,
 					body: JSON.stringify(body),

@@ -363,6 +363,8 @@ export interface NarraForkSettings {
 		credentialsPath: string;
 		configPath: string;
 		defaultModel?: string;
+		/** Default HTTPS proxy for all Kiro requests. */
+		proxy?: string;
 	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.

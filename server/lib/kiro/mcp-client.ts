@@ -2,8 +2,8 @@
 
 import { randomUUID } from "node:crypto";
 import { effectiveApiRegion } from "./config";
-
 import type { MultiTokenManager } from "./multi-token-manager";
+import { pfetch } from "./proxy";
 import {
 	type CallContext,
 	KiroApiError,
@@ -74,7 +74,7 @@ export class KiroMcpClient {
 
 			let res: Response;
 			try {
-				res = await fetch(url, {
+				res = await pfetch(url, {
 					method: "POST",
 					headers,
 					body: effectiveBody,

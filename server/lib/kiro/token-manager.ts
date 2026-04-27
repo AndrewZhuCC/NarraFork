@@ -3,6 +3,7 @@
 
 import { effectiveAuthRegion, loadCredentials, saveCredentials } from "./config";
 import { generateMachineId } from "./machine-id";
+import { pfetch } from "./proxy";
 import { KiroAuthError, type KiroConfig, type KiroCredentials } from "./types";
 
 const IDC_AMZ_USER_AGENT =
@@ -44,7 +45,7 @@ async function refreshSocial(creds: KiroCredentials, config: KiroConfig): Promis
 		throw new KiroAuthError("Cannot generate machineId for Social refresh");
 	}
 
-	const res = await fetch(url, {
+	const res = await pfetch(url, {
 		method: "POST",
 		headers: {
 			Accept: "application/json, text/plain, */*",
@@ -92,7 +93,7 @@ async function refreshIdc(creds: KiroCredentials, config: KiroConfig): Promise<K
 	const host = `oidc.${region}.amazonaws.com`;
 	const url = `https://${host}/token`;
 
-	const res = await fetch(url, {
+	const res = await pfetch(url, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",

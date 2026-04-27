@@ -397,7 +397,10 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 	const debouncedSaveDir = useDebouncedCallback((path: string) => {
 		save.mutate({
 			paths: { defaultProjectDir: path },
-			agent: { defaultModel, summaryModel },
+			agent: {
+				...(defaultModel ? { defaultModel } : {}),
+				...(summaryModel ? { summaryModel } : {}),
+			},
 		});
 	}, 500);
 
@@ -428,7 +431,10 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					setDefaultModel(val);
 					save.mutate({
 						paths: { defaultProjectDir: projectDir },
-						agent: { defaultModel: val, summaryModel },
+						agent: {
+							...(val ? { defaultModel: val } : {}),
+							...(summaryModel ? { summaryModel } : {}),
+						},
 					});
 				}}
 			/>
@@ -444,7 +450,10 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 					setSummaryModel(val);
 					save.mutate({
 						paths: { defaultProjectDir: projectDir },
-						agent: { defaultModel, summaryModel: val },
+						agent: {
+							...(defaultModel ? { defaultModel } : {}),
+							...(val ? { summaryModel: val } : {}),
+						},
 					});
 				}}
 			/>

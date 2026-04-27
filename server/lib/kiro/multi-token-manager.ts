@@ -12,6 +12,7 @@ import {
 	saveStats,
 } from "./config";
 import { generateMachineId } from "./machine-id";
+import { pfetch } from "./proxy";
 import { refreshCredentials } from "./token-manager";
 import {
 	type CallContext,
@@ -567,7 +568,7 @@ export class MultiTokenManager {
 		logger.debug("[kiro:usage] fetch POST", { url });
 		let res: Response;
 		try {
-			res = await fetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
+			res = await pfetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
 		} catch (err) {
 			logger.error("[kiro:usage] fetch threw", { error: String(err) });
 			throw new Error(
@@ -716,7 +717,11 @@ export class MultiTokenManager {
 			logger.debug("[kiro:models] fetch POST", { url: requestUrl });
 			let res: Response;
 			try {
-				res = await fetch(requestUrl, { method: "POST", headers, body: JSON.stringify(reqBody) });
+				res = await pfetch(requestUrl, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(reqBody),
+				});
 			} catch (err) {
 				throw new Error(
 					`ListAvailableModels network error: ${err instanceof Error ? err.message : String(err)}`,

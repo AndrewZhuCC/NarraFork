@@ -6,7 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
-import { registerKiroModelChecker, registerKiroModelLister } from "./settings";
+import { registerKiroModelChecker, registerKiroModelLister, settings } from "./settings";
 
 // --- Inlined types (mirror of kiro/types.ts public surface) ---
 
@@ -205,6 +205,7 @@ interface KiroModule {
 	): Promise<{ models: Array<Record<string, unknown>>; credentialId: string }>;
 	kiroFetchCredentialModels(credentialId: string): Promise<string[]>;
 	kiroFetchAllCredentialModels(): Promise<Array<Record<string, unknown>>>;
+	registerProxyResolver(resolver: () => string | undefined): void;
 }
 
 let mod: KiroModule | null = null;
@@ -215,7 +216,10 @@ if (!isKiroPluginDisabled) {
 		// Path constructed at runtime so TypeScript doesn't resolve it statically.
 		// This allows compilation even when server/lib/kiro/ is absent.
 		const kiroPath = `./kiro/${"index"}`;
-		mod = await import(kiroPath);
+		const loaded: KiroModule = await import(kiroPath);
+		mod = loaded;
+		// Register proxy resolver so kiro plugin reads proxy from settings at runtime
+		loaded.registerProxyResolver(() => settings.kiro?.proxy);
 	} catch {
 		// kiro directory absent — plugin unavailable
 	}

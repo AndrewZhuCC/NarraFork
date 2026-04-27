@@ -162,7 +162,8 @@ export const miscApi = {
 		}),
 
 	// Kiro
-	kiroStatus: () => request<{ available: boolean; snapshot: ApiEntity }>("/kiro/status"),
+	kiroStatus: () =>
+		request<{ available: boolean; snapshot: ApiEntity; globalProxy?: string }>("/kiro/status"),
 	kiroDisableCredential: (id: string) =>
 		request<{ ok: boolean }>(`/kiro/credentials/${id}/disable`, { method: "POST" }),
 	kiroEnableCredential: (id: string) =>
@@ -216,6 +217,12 @@ export const miscApi = {
 			fromCache: boolean;
 		}>(`/kiro/models/refresh${credentialId ? `?credentialId=${credentialId}` : ""}`, {
 			method: "POST",
+		}),
+
+	kiroSetGlobalProxy: (proxy?: string) =>
+		request<{ ok: boolean }>("/kiro/global-proxy", {
+			method: "POST",
+			body: JSON.stringify({ proxy }),
 		}),
 
 	// OpenAI-compatible models

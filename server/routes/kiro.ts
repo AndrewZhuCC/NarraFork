@@ -27,6 +27,7 @@ import {
 	kiroUpdateCredential,
 } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
+import { saveSettings, settings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 const updateCredentialSchema = z
@@ -58,6 +59,7 @@ kiroRoutes.get("/status", (c) => {
 		available: isKiroAvailable(),
 		snapshot,
 		usageCache: kiroGetAllUsageCache(),
+		globalProxy: settings.kiro?.proxy,
 	};
 
 	// Auto-fetch usage for credentials that have never been queried
@@ -285,4 +287,43 @@ kiroRoutes.post("/chat", async (c) => {
 			await stream.writeSSE({ event: "error", data: msg });
 		}
 	});
+});
+
+/**
+ * POST /api/kiro/global-proxy
+ * Set the global proxy for all Kiro requests.
+ */
+const proxySchema = z.object({
+	proxy: z
+		.string()
+		.optional()
+		.refine(
+			(v) => {
+				if (!v) return true;
+				try {
+					const url = new URL(v);
+					return ["http:", "https:", "socks5:", "socks5h:", "socks4:"].includes(url.protocol);
+				} catch {
+					return false;
+				}
+			},
+			{
+				message: "Proxy must be a valid URL with http, https, socks5, socks5h, or socks4 protocol",
+			},
+		),
+});
+
+kiroRoutes.post("/global-proxy", async (c) => {
+	const parsed = proxySchema.safeParse(await c.req.json().catch(() => ({})));
+	if (!parsed.success) {
+		return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid proxy URL" }, 400);
+	}
+
+	if (!settings.kiro) {
+		return c.json({ error: "Kiro is not configured" }, 400);
+	}
+	settings.kiro.proxy = parsed.data.proxy || undefined;
+	saveSettings(settings);
+
+	return c.json({ ok: true });
 });
