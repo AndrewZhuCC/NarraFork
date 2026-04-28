@@ -268,7 +268,7 @@ export function matchesCustomRetryRules(
 		}
 	}
 
-	const allText = msgCandidates.join(" ");
+	const allText = msgCandidates.join(" ").toLowerCase();
 
 	for (const rule of rules) {
 		if (rule.enabled === false) continue;

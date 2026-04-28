@@ -51,6 +51,7 @@ export interface UsageHistoryRecord {
 	meterUsage: number | null;
 	meterUnit: string | null;
 	createdAt: string;
+	errorMessage?: string | null;
 	narratorTitle?: string | null;
 	chapterTitle?: string | null;
 	chapterId?: string | null;
@@ -150,6 +151,7 @@ export class UsageHistoryService {
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
 				rawDumpJson: apiRequests.rawDumpJson,
+				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
@@ -176,6 +178,7 @@ export class UsageHistoryService {
 				cacheCreation1hTokens: r.cacheCreation1hTokens ?? 0,
 				reasoningTokens: r.reasoningTokens ?? 0,
 				hasRawDump: !!r.rawDumpJson,
+				errorMessage: r.errorMessage,
 			})) as UsageHistoryRecord[],
 			total,
 		};
@@ -248,6 +251,7 @@ export class UsageHistoryService {
 				meterUsage: apiRequests.meterUsage,
 				meterUnit: apiRequests.meterUnit,
 				rawDumpJson: apiRequests.rawDumpJson,
+				errorMessage: apiRequests.errorMessage,
 				createdAt: apiRequests.createdAt,
 				narratorTitle: narrators.title,
 				chapterTitle: chapters.title,
@@ -273,6 +277,7 @@ export class UsageHistoryService {
 			reasoningTokens: record.reasoningTokens ?? 0,
 			hasRawDump: !!rawDumpJson,
 			rawDump: this.parseRawDump(rawDumpJson),
+			errorMessage: record.errorMessage,
 		};
 	}
 
