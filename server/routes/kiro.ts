@@ -319,9 +319,7 @@ kiroRoutes.post("/global-proxy", async (c) => {
 		return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid proxy URL" }, 400);
 	}
 
-	if (!settings.kiro) {
-		return c.json({ error: "Kiro is not configured" }, 400);
-	}
+	settings.kiro = settings.kiro || { credentialsPath: "", configPath: "" };
 	settings.kiro.proxy = parsed.data.proxy || undefined;
 	saveSettings(settings);
 
