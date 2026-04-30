@@ -128,6 +128,7 @@ export type NarratorServerMessage =
 			id: string;
 			status: "in_progress" | "generating" | "completed";
 			revisedPrompt?: string;
+			outputIndex?: number;
 	  }
 	| {
 			type: "tool_started";
@@ -305,7 +306,7 @@ export type NarratorServerMessage =
 						result?: string;
 						outputIndex?: number;
 				  }
-				| { type: "text"; text: string }
+				| { type: "text"; text: string; outputIndex?: number }
 			>;
 			toolChunks: Array<{
 				toolUseId: string;

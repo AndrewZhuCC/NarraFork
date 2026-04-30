@@ -180,6 +180,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 								placeholder={t("nkpApiKeyPlaceholder")}
 								value={p.apiKey}
 								size="xs"
+								autoComplete="off"
 								onChange={(e) => updateProvider(p.id, "apiKey", e.currentTarget.value)}
 							/>
 							<TextInput
