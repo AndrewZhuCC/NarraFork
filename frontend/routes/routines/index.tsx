@@ -1468,7 +1468,7 @@ interface McpServerDraft {
 	env: Array<{ key: string; value: string }>;
 	headers: Array<{ key: string; value: string }>;
 	enabled: boolean;
-	defaultBehavior: "" | "allow" | "ask" | "deny";
+	defaultBehavior: "" | "readOnly" | "readWrite" | "ask" | "deny";
 }
 
 interface McpToolPermissionDraft {
@@ -1828,7 +1828,8 @@ function McpToolsTab() {
 														}}
 														data={[
 															{ value: "", label: t("mcpBehaviorFollow") },
-															{ value: "allow", label: t("mcpBehaviorAllow") },
+															{ value: "readOnly", label: t("mcpBehaviorReadOnly") },
+															{ value: "readWrite", label: t("mcpBehaviorReadWrite") },
 															{ value: "ask", label: t("mcpBehaviorAsk") },
 															{ value: "deny", label: t("mcpBehaviorDeny") },
 														]}
@@ -2101,7 +2102,8 @@ function McpToolsTab() {
 						}
 						data={[
 							{ value: "", label: t("mcpBehaviorFollow") },
-							{ value: "allow", label: t("mcpBehaviorAllow") },
+							{ value: "readOnly", label: t("mcpBehaviorReadOnly") },
+							{ value: "readWrite", label: t("mcpBehaviorReadWrite") },
 							{ value: "ask", label: t("mcpBehaviorAsk") },
 							{ value: "deny", label: t("mcpBehaviorDeny") },
 						]}
