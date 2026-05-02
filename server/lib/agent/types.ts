@@ -256,6 +256,8 @@ export interface ReasoningProviderMetadata {
 		reasoningEncryptedContent?: string | null;
 	};
 	anthropic?: {
+		/** Provider-native content block index for this thinking block. */
+		blockIndex?: number;
 		/** Signature for thinking block verification (must be echoed back in subsequent turns) */
 		signature?: string;
 	};
@@ -271,6 +273,7 @@ export type ContentBlock =
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
 	  }
+	| { type: "redacted_thinking"; data: string; outputIndex?: number }
 	| {
 			type: "tool_use";
 			toolUseId: string;
