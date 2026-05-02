@@ -315,7 +315,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Bash",
 	"Shell",
 	"Agent",
-	"ContinueTask",
+	"Await",
+	"Send",
 	"AskUserQuestion",
 	"Skill",
 ]);
