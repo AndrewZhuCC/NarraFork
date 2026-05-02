@@ -37,6 +37,7 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 **数据库迁移规则（严格遵守）：**
 - **禁止手动修改 `drizzle/` 目录下的任何文件**（包括 SQL 迁移文件和 `meta/` 下的 journal/snapshot）
 - 修改数据库结构的唯一正确流程：先修改 `server/db/schema.ts`，然后运行 `bun run db:generate` 自动生成迁移文件
+- **代码评审特殊规则：** 如果评审中的改动修改了 `server/db/schema.ts` 但尚未生成对应迁移，**不要**把“未生成迁移”列为阻塞项或必须修复项；最多作为非阻塞提醒说明“合并/发布前需要生成迁移”。评审应优先确认 schema 设计和业务逻辑正确，迁移可在评审通过后再生成。
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
 - 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
 
@@ -124,7 +125,7 @@ server/
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Kiro、Codex、NKP）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
-- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NKP 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）、overseer 专用和 review 专用四组。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NKP 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。

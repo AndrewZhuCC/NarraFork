@@ -120,7 +120,6 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
-import { useGlobalOverseer } from "../../hooks/useOverseers";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUserPreferences } from "../../hooks/useUserPreferences";
 import {
@@ -924,14 +923,14 @@ function goalStatusColor(status: NarratorGoalStatus): string {
 function SortableGoalItem({
 	goal,
 	index,
-	onStatus,
-	onRemove,
+	onComplete,
+	onCancel,
 	t,
 }: {
 	goal: NarratorGoal;
 	index: number;
-	onStatus: (goalId: string, status: NarratorGoalStatus) => void;
-	onRemove: (goalId: string) => void;
+	onComplete: (goalId: string) => void;
+	onCancel: (goalId: string) => void;
 	t: (key: string, opts?: Record<string, unknown>) => string;
 }) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -996,40 +995,15 @@ function SortableGoalItem({
 			<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
 				{formatGoalUsage(goal)}
 			</Text>
-			{goal.status === "active" && (
-				<ActionIcon
-					size="xs"
-					variant="subtle"
-					color="yellow"
-					onClick={() => onStatus(goal.id, "paused")}
-					title={t("pauseGoal")}
-				>
-					<IconBolt size={12} />
-				</ActionIcon>
-			)}
-			{goal.status === "paused" && (
-				<ActionIcon
-					size="xs"
-					variant="subtle"
-					color="green"
-					onClick={() => onStatus(goal.id, "active")}
-					title={t("resumeGoal")}
-				>
-					<IconCheck size={12} />
-				</ActionIcon>
-			)}
-			{goal.status !== "complete" && (
-				<ActionIcon
-					size="xs"
-					variant="subtle"
-					color="green"
-					onClick={() => onStatus(goal.id, "complete")}
-					title={t("completeGoal")}
-				>
-					<IconCheck size={12} />
-				</ActionIcon>
-			)}
-			<CloseButton size="xs" onClick={() => onRemove(goal.id)} title={t("removeGoal")} />
+			<ActionIcon
+				size="xs"
+				variant="subtle"
+				color={goal.status === "active" ? "green" : "red"}
+				onClick={() => (goal.status === "active" ? onComplete(goal.id) : onCancel(goal.id))}
+				title={goal.status === "active" ? t("completeGoal") : t("removeGoal")}
+			>
+				{goal.status === "active" ? <IconCheck size={12} /> : <IconX size={12} />}
+			</ActionIcon>
 		</Group>
 	);
 }
@@ -1370,7 +1344,6 @@ export function NarratorPanel({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: tt } = useTranslation("terminal");
-	const { t: tn } = useTranslation("nav");
 	const qc = useQueryClient();
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
@@ -1403,12 +1376,7 @@ export function NarratorPanel({
 		});
 	}, [promoteMutation, narratorId, t, navigate]);
 
-	// Overseer title: if this narrator is the global overseer's narrator, show i18n title + #id
-	const { data: globalOverseer } = useGlobalOverseer();
-	const isOverseerNarrator = !!globalOverseer && globalOverseer.narratorId === narratorId;
-	const displayTitle = isOverseerNarrator
-		? `${tn("overseer")} #${narratorId}`
-		: narrator?.title || t("untitled");
+	const displayTitle = narrator?.title || t("untitled");
 	const isWorkspacePreview = workspacePreview === true;
 	// Resolve the effective model: when following default, use the actual default model value
 	const resolvedModel = useMemo(() => {
@@ -1863,7 +1831,7 @@ export function NarratorPanel({
 	renderPermCbRef.current = renderPermCb;
 	const resolvePermForRender = useCallback((tc: import("./ToolCallCard").ToolCallData) => {
 		const p = renderPermCbRef.current;
-		return resolvePendingPerm(tc, p.pendingPermission, p.pendingPermsMap, p.overseerReviewMap);
+		return resolvePendingPerm(tc, p.pendingPermission, p.pendingPermsMap);
 	}, []);
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
@@ -3858,10 +3826,10 @@ export function NarratorPanel({
 		if (goals.length <= QUEUE_COLLAPSE_THRESHOLD) setGoalsExpanded(false);
 	}, [goals.length]);
 
-	const handleGoalStatus = (goalId: string, status: NarratorGoalStatus) => {
-		updateGoalMutation.mutate({ goalId, status });
+	const handleCompleteGoal = (goalId: string) => {
+		updateGoalMutation.mutate({ goalId, status: "complete" });
 	};
-	const handleRemoveGoal = (goalId: string) => {
+	const handleCancelGoal = (goalId: string) => {
 		removeGoalMutation.mutate(goalId);
 	};
 	const handleClearGoals = () => {
@@ -3877,9 +3845,14 @@ export function NarratorPanel({
 			const newOrder = [...goals];
 			const [moved] = newOrder.splice(oldIndex, 1);
 			newOrder.splice(newIndex, 0, moved);
+			const optimisticGoals = newOrder.map((goal, index) => ({
+				...goal,
+				sortOrder: index + 1,
+			}));
+			qc.setQueryData(["narrators", narratorId, "goals"], { goals: optimisticGoals });
 			reorderGoalsMutation.mutate(newOrder.map((goal) => goal.id));
 		},
-		[goals, reorderGoalsMutation],
+		[goals, narratorId, qc, reorderGoalsMutation],
 	);
 
 	const handleCancelAllQueued = () => {
@@ -4444,7 +4417,7 @@ export function NarratorPanel({
 									</ActionIcon>
 								))}
 							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-								{editingTitle && !isOverseerNarrator && !isWorkspacePreview ? (
+								{editingTitle && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
 										value={titleValue}
@@ -4458,11 +4431,9 @@ export function NarratorPanel({
 									<Text
 										size="sm"
 										fw={500}
-										onDoubleClick={
-											isOverseerNarrator || isWorkspacePreview ? undefined : startEditingTitle
-										}
+										onDoubleClick={isWorkspacePreview ? undefined : startEditingTitle}
 										style={{
-											cursor: isOverseerNarrator || isWorkspacePreview ? "default" : "pointer",
+											cursor: isWorkspacePreview ? "default" : "pointer",
 											overflow: "hidden",
 											textOverflow: "ellipsis",
 											whiteSpace: "nowrap",
@@ -4473,7 +4444,7 @@ export function NarratorPanel({
 										{displayTitle}
 									</Text>
 								)}
-								{!isOverseerNarrator && !isWorkspacePreview && (
+								{!isWorkspacePreview && (
 									<>
 										<ActionIcon
 											size="xs"
@@ -5008,8 +4979,8 @@ export function NarratorPanel({
 													key={goal.id}
 													goal={goal}
 													index={index}
-													onStatus={handleGoalStatus}
-													onRemove={handleRemoveGoal}
+													onComplete={handleCompleteGoal}
+													onCancel={handleCancelGoal}
 													t={t}
 												/>
 											))}
@@ -5403,6 +5374,58 @@ export function NarratorPanel({
 													onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
 												/>
 											)}
+											{/* Reasoning Effort (Codex + Anthropic providers) */}
+											{supportsReasoningEffort && (
+												<Menu position="top-end">
+													<Menu.Target>
+														<NativeSelect
+															size="xs"
+															data={[
+																{ value: "", label: t("reasoning_auto") },
+																...reasoningEffortOptions.map((effort) => ({
+																	value: effort,
+																	label: t(`reasoning_${effort}`),
+																})),
+															]}
+															value={displayedReasoningEffort}
+															onChange={() => {}}
+															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
+															style={{ pointerEvents: "auto" }}
+														/>
+													</Menu.Target>
+													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+														<ReasoningEffortMenuItems
+															currentEffort={displayedReasoningEffort}
+															options={reasoningEffortOptions}
+															onSelect={(e) =>
+																reasoningEffortMutation.mutate({
+																	id: narratorId,
+																	reasoningEffort: e,
+																})
+															}
+															t={t}
+														/>
+													</Menu.Dropdown>
+												</Menu>
+											)}
+											{/* Fast Mode toggle (only for Codex-mode providers) */}
+											{supportsCodexControls && (
+												<Tooltip label={t("fast_mode_tooltip")}>
+													<ActionIcon
+														variant="subtle"
+														color={narrator.fastMode ? "yellow" : "gray"}
+														size="sm"
+														onClick={() =>
+															fastModeMutation.mutate({
+																id: narratorId,
+																fastMode: !narrator.fastMode,
+															})
+														}
+													>
+														<IconBolt size={16} />
+													</ActionIcon>
+												</Tooltip>
+											)}
 											<Tooltip
 												label={
 													narrator.isAskInPassing
@@ -5472,58 +5495,6 @@ export function NarratorPanel({
 												</Tooltip>
 											)}
 											<PathRulesPopover narratorId={narratorId} t={t} />
-											{/* Reasoning Effort (Codex + Anthropic providers) */}
-											{supportsReasoningEffort && (
-												<Menu position="top-end">
-													<Menu.Target>
-														<NativeSelect
-															size="xs"
-															data={[
-																{ value: "", label: t("reasoning_auto") },
-																...reasoningEffortOptions.map((effort) => ({
-																	value: effort,
-																	label: t(`reasoning_${effort}`),
-																})),
-															]}
-															value={displayedReasoningEffort}
-															onChange={() => {}}
-															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
-															style={{ pointerEvents: "auto" }}
-														/>
-													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-														<ReasoningEffortMenuItems
-															currentEffort={displayedReasoningEffort}
-															options={reasoningEffortOptions}
-															onSelect={(e) =>
-																reasoningEffortMutation.mutate({
-																	id: narratorId,
-																	reasoningEffort: e,
-																})
-															}
-															t={t}
-														/>
-													</Menu.Dropdown>
-												</Menu>
-											)}
-											{/* Fast Mode toggle (only for Codex-mode providers) */}
-											{supportsCodexControls && (
-												<Tooltip label={t("fast_mode_tooltip")}>
-													<ActionIcon
-														variant="subtle"
-														color={narrator.fastMode ? "yellow" : "gray"}
-														size="sm"
-														onClick={() =>
-															fastModeMutation.mutate({
-																id: narratorId,
-																fastMode: !narrator.fastMode,
-															})
-														}
-													>
-														<IconBolt size={16} />
-													</ActionIcon>
-												</Tooltip>
-											)}
 											{/* Relaxed Plan toggle (only visible in plan mode) */}
 											{narrator.permissionMode === "plan" && (
 												<Tooltip label={t("relaxed_plan_tooltip")}>
@@ -5557,11 +5528,17 @@ export function NarratorPanel({
 													}
 												>
 													<Indicator
+														inline
 														label={activeTerminalCount}
 														size={14}
 														disabled={activeTerminalCount === 0}
 														offset={2}
 														color="blue"
+														style={{
+															height: "var(--ai-size-sm)",
+															display: "flex",
+															alignItems: "center",
+														}}
 													>
 														<ActionIcon
 															variant="subtle"
@@ -5610,6 +5587,58 @@ export function NarratorPanel({
 												providerLabels={providerLabels}
 												onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
 											/>
+										)}
+										{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
+										{supportsReasoningEffort && (
+											<Menu position="bottom-end" withinPortal>
+												<Menu.Target>
+													<ActionIcon variant="subtle" color="gray" size="sm">
+														<Text size="xs" fw={600}>
+															{(() => {
+																const effortMap = {
+																	none: "O",
+																	low: "L",
+																	medium: "M",
+																	high: "H",
+																	xhigh: "X",
+																};
+																return (
+																	effortMap[displayedReasoningEffort as keyof typeof effortMap] ??
+																	"A"
+																);
+															})()}
+														</Text>
+													</ActionIcon>
+												</Menu.Target>
+												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<ReasoningEffortMenuItems
+														currentEffort={displayedReasoningEffort}
+														options={reasoningEffortOptions}
+														onSelect={(e) =>
+															reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
+														}
+														t={t}
+													/>
+												</Menu.Dropdown>
+											</Menu>
+										)}
+										{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
+										{supportsCodexControls && (
+											<Tooltip label={t("fast_mode_tooltip")}>
+												<ActionIcon
+													variant="subtle"
+													color={narrator.fastMode ? "yellow" : "gray"}
+													size="sm"
+													onClick={() =>
+														fastModeMutation.mutate({
+															id: narratorId,
+															fastMode: !narrator.fastMode,
+														})
+													}
+												>
+													<IconBolt size={16} />
+												</ActionIcon>
+											</Tooltip>
 										)}
 										<Tooltip
 											label={
@@ -5670,58 +5699,6 @@ export function NarratorPanel({
 											</Tooltip>
 										)}
 										<PathRulesPopover narratorId={narratorId} t={t} />
-										{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
-										{supportsReasoningEffort && (
-											<Menu position="bottom-end" withinPortal>
-												<Menu.Target>
-													<ActionIcon variant="subtle" color="gray" size="sm">
-														<Text size="xs" fw={600}>
-															{(() => {
-																const effortMap = {
-																	none: "O",
-																	low: "L",
-																	medium: "M",
-																	high: "H",
-																	xhigh: "X",
-																};
-																return (
-																	effortMap[displayedReasoningEffort as keyof typeof effortMap] ??
-																	"A"
-																);
-															})()}
-														</Text>
-													</ActionIcon>
-												</Menu.Target>
-												<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
-													<ReasoningEffortMenuItems
-														currentEffort={displayedReasoningEffort}
-														options={reasoningEffortOptions}
-														onSelect={(e) =>
-															reasoningEffortMutation.mutate({ id: narratorId, reasoningEffort: e })
-														}
-														t={t}
-													/>
-												</Menu.Dropdown>
-											</Menu>
-										)}
-										{/* Fast Mode toggle (only for Codex-mode providers) - Mobile */}
-										{supportsCodexControls && (
-											<Tooltip label={t("fast_mode_tooltip")}>
-												<ActionIcon
-													variant="subtle"
-													color={narrator.fastMode ? "yellow" : "gray"}
-													size="sm"
-													onClick={() =>
-														fastModeMutation.mutate({
-															id: narratorId,
-															fastMode: !narrator.fastMode,
-														})
-													}
-												>
-													<IconBolt size={16} />
-												</ActionIcon>
-											</Tooltip>
-										)}
 										{/* Relaxed Plan toggle (compact layout, only in plan mode) */}
 										{narrator.permissionMode === "plan" && (
 											<Tooltip label={t("relaxed_plan_tooltip")}>
