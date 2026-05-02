@@ -62,6 +62,7 @@ export {
 	registerOpenaiModelChecker,
 	registerOpenaiModelLister,
 	resolveAggregation,
+	resolveAllowedModelCandidate,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveProvider,
