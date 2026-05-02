@@ -103,10 +103,12 @@ export class NkpProvider implements ProviderAdapter {
 			body: request,
 		});
 
+		const bodyText = JSON.stringify(request);
+		params.onRequestStart?.();
 		const response = await fetch(`${baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(request),
+			body: bodyText,
 			signal: params.signal,
 		});
 		const responseTextPromise = params.requestDump
