@@ -33,6 +33,7 @@ export interface InstanceSettingsState {
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
 	defaultRelaxedPlan: boolean;
+	yoloSkipReadOnlyConfirmations: boolean;
 	smartInterruptionCheck: boolean;
 	maxTransientRetries: number;
 	retryBackoffCeilMs: number;
@@ -111,6 +112,7 @@ function makeDefaults(): InstanceSettingsState {
 		translateReasoning: false,
 		requestDumpEnabled: false,
 		defaultRelaxedPlan: false,
+		yoloSkipReadOnlyConfirmations: false,
 		smartInterruptionCheck: true,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20000,
@@ -187,6 +189,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
+				yoloSkipReadOnlyConfirmations: settings.agent?.yoloSkipReadOnlyConfirmations ?? false,
 				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
@@ -266,6 +269,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
+					yoloSkipReadOnlyConfirmations: state.yoloSkipReadOnlyConfirmations,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
 						undefined,
