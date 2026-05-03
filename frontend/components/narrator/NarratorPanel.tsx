@@ -3298,6 +3298,9 @@ export function NarratorPanel({
 
 	// --- Scroll state: user-input driven ---
 	const lastTouchYRef = useRef(0);
+	const userScrollIntentRef = useRef<"up" | "down" | null>(null);
+	const userScrollIntentExpiresAtRef = useRef(0);
+	const scrollbarDragRef = useRef(false);
 	const cleanupRef = useRef<(() => void) | null>(null);
 	const viewportCallbackRef = useCallback((node: HTMLDivElement | null) => {
 		cleanupRef.current?.();
@@ -3305,6 +3308,17 @@ export function NarratorPanel({
 		(viewportRef as React.MutableRefObject<HTMLDivElement | null>).current = node;
 		if (!node) return;
 
+		const markUserScrollIntent = (direction: "up" | "down") => {
+			userScrollIntentRef.current = direction;
+			userScrollIntentExpiresAtRef.current = performance.now() + 500;
+		};
+		const hasRecentUpwardUserIntent = () => {
+			if (scrollbarDragRef.current) return true;
+			if (userScrollIntentRef.current !== "up") return false;
+			if (performance.now() <= userScrollIntentExpiresAtRef.current) return true;
+			userScrollIntentRef.current = null;
+			return false;
+		};
 		const checkAtBottom = () => {
 			const atBottom = getSlidingWindowDistanceFromBottom(node) < 30;
 			if (atBottom && !isAtBottomRef.current) {
@@ -3321,7 +3335,12 @@ export function NarratorPanel({
 		};
 
 		const onWheel = (e: WheelEvent) => {
-			if (e.deltaY < 0) detachFromBottom();
+			if (e.deltaY < 0) {
+				markUserScrollIntent("up");
+				detachFromBottom();
+			} else if (e.deltaY > 0) {
+				markUserScrollIntent("down");
+			}
 		};
 		const onTouchStart = (e: TouchEvent) => {
 			if (e.touches.length > 0) lastTouchYRef.current = e.touches[0].clientY;
@@ -3331,7 +3350,31 @@ export function NarratorPanel({
 			const cur = e.touches[0].clientY;
 			const delta = lastTouchYRef.current - cur;
 			lastTouchYRef.current = cur;
-			if (delta < 0) detachFromBottom();
+			if (delta < 0) {
+				markUserScrollIntent("up");
+				detachFromBottom();
+			} else if (delta > 0) {
+				markUserScrollIntent("down");
+			}
+		};
+		const onPointerDown = (e: PointerEvent) => {
+			const verticalScrollbarWidth = node.offsetWidth - node.clientWidth;
+			if (verticalScrollbarWidth <= 0) return;
+			const rect = node.getBoundingClientRect();
+			if (e.clientX >= rect.right - verticalScrollbarWidth) {
+				scrollbarDragRef.current = true;
+			}
+		};
+		const onPointerUp = () => {
+			scrollbarDragRef.current = false;
+		};
+		const onKeyDown = (e: KeyboardEvent) => {
+			if (["ArrowUp", "PageUp", "Home"].includes(e.key) || (e.key === " " && e.shiftKey)) {
+				markUserScrollIntent("up");
+				detachFromBottom();
+			} else if (["ArrowDown", "PageDown", "End", " "].includes(e.key)) {
+				markUserScrollIntent("down");
+			}
 		};
 
 		let lastScrollTop = node.scrollTop;
@@ -3351,7 +3394,10 @@ export function NarratorPanel({
 				lastScrollTop = cur;
 				return;
 			}
-			if (!followingRef.current && cur < lastScrollTop) {
+			// A negative scrollTop delta can also be produced by virtualization clamps,
+			// scroll anchoring, or content re-measurement. Only treat it as leaving the
+			// bottom-following mode when it is tied to explicit upward user input.
+			if (!followingRef.current && cur < lastScrollTop && hasRecentUpwardUserIntent()) {
 				detachFromBottom();
 			}
 			lastScrollTop = cur;
@@ -3364,14 +3410,23 @@ export function NarratorPanel({
 		node.addEventListener("wheel", onWheel, { passive: true });
 		node.addEventListener("touchstart", onTouchStart, { passive: true });
 		node.addEventListener("touchmove", onTouchMove, { passive: true });
+		node.addEventListener("pointerdown", onPointerDown, { passive: true });
+		node.addEventListener("keydown", onKeyDown);
 		node.addEventListener("scroll", onScroll, { passive: true });
 		node.addEventListener("scrollend", onScrollEnd, { passive: true });
+		window.addEventListener("pointerup", onPointerUp);
+		window.addEventListener("pointercancel", onPointerUp);
 		cleanupRef.current = () => {
 			node.removeEventListener("wheel", onWheel);
 			node.removeEventListener("touchstart", onTouchStart);
 			node.removeEventListener("touchmove", onTouchMove);
+			node.removeEventListener("pointerdown", onPointerDown);
+			node.removeEventListener("keydown", onKeyDown);
 			node.removeEventListener("scroll", onScroll);
 			node.removeEventListener("scrollend", onScrollEnd);
+			window.removeEventListener("pointerup", onPointerUp);
+			window.removeEventListener("pointercancel", onPointerUp);
+			scrollbarDragRef.current = false;
 		};
 	}, []);
 
