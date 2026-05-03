@@ -131,9 +131,10 @@ export async function kiroGenerateWithMeta(
 export async function kiroMcpCall(
 	name: string,
 	args: Record<string, unknown>,
+	signal?: AbortSignal,
 ): Promise<McpResponse> {
 	if (!mcpClient) throw new Error("Kiro not initialized — call initKiro() first");
-	return mcpClient.callTool(name, args);
+	return mcpClient.callTool(name, args, signal);
 }
 
 export async function kiroMcpListTools(): Promise<McpResponse> {

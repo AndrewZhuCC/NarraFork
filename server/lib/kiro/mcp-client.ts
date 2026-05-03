@@ -15,44 +15,62 @@ import {
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
 
+function isAbortError(err: unknown): boolean {
+	return err instanceof Error && (err.name === "AbortError" || err.message === "Aborted");
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error("Aborted");
+}
+
 export class KiroMcpClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
-	async callTool(name: string, args: Record<string, unknown>): Promise<McpResponse> {
+	async callTool(
+		name: string,
+		args: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<McpResponse> {
 		const body: McpRequest = {
 			id: randomUUID(),
 			jsonrpc: "2.0",
 			method: "tools/call",
 			params: { name, arguments: args },
 		};
-		return this.callMcpWithRetry(JSON.stringify(body));
+		return this.callMcpWithRetry(JSON.stringify(body), signal);
 	}
 
-	async listTools(): Promise<McpResponse> {
+	async listTools(signal?: AbortSignal): Promise<McpResponse> {
 		const body: McpRequest = {
 			id: randomUUID(),
 			jsonrpc: "2.0",
 			method: "tools/list",
 			params: {},
 		};
-		return this.callMcpWithRetry(JSON.stringify(body));
+		return this.callMcpWithRetry(JSON.stringify(body), signal);
 	}
 
-	async callGeneric(method: string, params: Record<string, unknown>): Promise<McpResponse> {
+	async callGeneric(
+		method: string,
+		params: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<McpResponse> {
 		const body: McpRequest = {
 			id: randomUUID(),
 			jsonrpc: "2.0",
 			method,
 			params,
 		};
-		return this.callMcpWithRetry(JSON.stringify(body));
+		return this.callMcpWithRetry(JSON.stringify(body), signal);
 	}
 
-	private async callMcpWithRetry(body: string): Promise<McpResponse> {
+	private async callMcpWithRetry(body: string, signal?: AbortSignal): Promise<McpResponse> {
 		const maxRetries = this.tokenManager.maxRetries;
 		let lastError: Error | null = null;
 
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
+			throwIfAborted(signal);
+
 			let ctx: CallContext;
 			try {
 				ctx = await this.tokenManager.acquireContext(null);
@@ -60,6 +78,7 @@ export class KiroMcpClient {
 				lastError = err instanceof Error ? err : new Error(String(err));
 				continue;
 			}
+			throwIfAborted(signal);
 
 			const headers = this.buildHeaders(ctx, attempt, maxRetries);
 			const url = this.buildUrl(ctx);
@@ -78,10 +97,12 @@ export class KiroMcpClient {
 					method: "POST",
 					headers,
 					body: effectiveBody,
+					signal,
 				});
 			} catch (err) {
+				if (signal?.aborted || isAbortError(err)) throw new Error("Aborted");
 				lastError = err instanceof Error ? err : new Error(String(err));
-				if (attempt + 1 < maxRetries) await this.delay(attempt);
+				if (attempt + 1 < maxRetries) await this.delay(attempt, signal);
 				continue;
 			}
 
@@ -114,7 +135,7 @@ export class KiroMcpClient {
 
 			if (res.status === 408 || res.status === 429 || res.status >= 500) {
 				lastError = new KiroApiError("TRANSIENT", resBody, res.status);
-				if (attempt + 1 < maxRetries) await this.delay(attempt);
+				if (attempt + 1 < maxRetries) await this.delay(attempt, signal);
 				continue;
 			}
 
@@ -166,9 +187,22 @@ export class KiroMcpClient {
 		return false;
 	}
 
-	private delay(attempt: number): Promise<void> {
+	private delay(attempt: number, signal?: AbortSignal): Promise<void> {
 		const exp = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS);
 		const jitter = Math.random() * (exp / 4);
-		return new Promise((r) => setTimeout(r, exp + jitter));
+		const delayMs = exp + jitter;
+		if (!signal) return new Promise((resolve) => setTimeout(resolve, delayMs));
+		throwIfAborted(signal);
+		return new Promise((resolve, reject) => {
+			const onAbort = () => {
+				clearTimeout(timer);
+				reject(new Error("Aborted"));
+			};
+			const timer = setTimeout(() => {
+				signal.removeEventListener("abort", onAbort);
+				resolve();
+			}, delayMs);
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
 	}
 }

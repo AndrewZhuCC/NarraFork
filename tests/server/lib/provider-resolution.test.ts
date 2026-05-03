@@ -154,6 +154,11 @@ describe("resolveProvider fallback order", () => {
 		expect(provider).toBe("codex");
 	});
 
+	test("builtin codex spark model 解析为 codex", () => {
+		const provider = resolveProvider("gpt-5.3-codex-spark");
+		expect(provider).toBe("codex");
+	});
+
 	test("builtin kiro model 仍解析为 kiro", () => {
 		const provider = resolveProvider("claude-sonnet");
 		expect(provider).toBe("kiro");

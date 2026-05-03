@@ -341,6 +341,7 @@
 	"closePanel": "关闭面板",
 	"lastTurnDuration": "上轮耗时 {{duration}}",
 	"nkpQueuePosition": "排队中 第{{position}}位",
+	"nkpQueuePositionWithDepth": "排队中 第{{position}}位 / 共{{queueDepth}}个",
 	"fileMod_title": "文件修改",
 	"fileMod_tabSummary": "汇总",
 	"fileMod_tabApproval": "审批",

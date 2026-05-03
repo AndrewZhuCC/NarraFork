@@ -140,13 +140,13 @@ import {
 	parseAggModelValue,
 } from "../../lib/constants";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { PathInputWithBrowse } from "../common/PathInputWithBrowse";
 import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { UserAvatar } from "../UserAvatar";
 import { BackgroundTasksDrawer } from "./BackgroundTasksDrawer";
 import { BlurInOnAppearProvider } from "./BlurInOnAppear";
-import { BroadMessageList, type BroadMessageListHandle } from "./BroadMessageList";
 import { BrowserSessionBar } from "./BrowserSessionBar";
 import { collectBlurInAnimationIdsFromMessages } from "./blur-in-ids";
 import { ChapterBar } from "./ChapterBar";
@@ -195,6 +195,12 @@ import {
 	STREAMING_CHUNKS_MSG_ID,
 } from "./narrator-panel-types";
 import { ScrollbarUserMarkers } from "./ScrollbarUserMarkers";
+import {
+	getSlidingWindowDistanceFromBottom,
+	getSlidingWindowScrollBottom,
+	SlidingWindowList,
+	type SlidingWindowListHandle,
+} from "./SlidingWindowList";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import {
 	getGlobalCloseSwipe,
@@ -836,6 +842,7 @@ const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortV
 	// Includes "none" for UI display (disables reasoning). The backend counterpart
 	// (openai-provider CODEX_MODEL_REASONING_LEVELS) omits "none" because it is
 	// handled separately before the table lookup.
+	"gpt-5.3-codex-spark": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.3-codex": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.2-codex": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.1-codex-max": ["none", "low", "medium", "high", "xhigh"],
@@ -1343,6 +1350,7 @@ export function NarratorPanel({
 	);
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
+	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
 	const handlePromote = useCallback(() => {
@@ -1657,7 +1665,7 @@ export function NarratorPanel({
 				followingRef.current = false;
 				return;
 			}
-			const target = vp.scrollHeight - vp.clientHeight;
+			const target = getSlidingWindowScrollBottom(vp);
 			const gap = target - vp.scrollTop;
 			if (gap < 1.5) {
 				programmaticScrollRef.current = true;
@@ -1695,7 +1703,7 @@ export function NarratorPanel({
 			setUnreadCountRef.current?.(0);
 			if (instant) {
 				programmaticScrollRef.current = true;
-				vp.scrollTop = vp.scrollHeight;
+				vp.scrollTop = getSlidingWindowScrollBottom(vp);
 			} else {
 				startFollowing();
 			}
@@ -1912,6 +1920,9 @@ export function NarratorPanel({
 	const isCompacting = substatus.includes("compacting");
 	const isCheckingInterrupt = substatus.includes("checking_interrupt");
 	const nkpQueuePosition = substatus.find((s) => s.startsWith("queue_position:"));
+	const nkpQueueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
+	const nkpQueuePositionValue = nkpQueuePosition ? Number(nkpQueuePosition.split(":")[1]) : null;
+	const nkpQueueDepthValue = nkpQueueDepth ? Number(nkpQueueDepth.split(":")[1]) : null;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
 	// --- Turn elapsed timer ---
@@ -2341,7 +2352,7 @@ export function NarratorPanel({
 	const initialScrollDoneRef = useRef(false);
 	const [initialScrollDone, setInitialScrollDone] = useState(false);
 	const [highlightedId, setHighlightedId] = useState<string | null>(null);
-	const virtualListRef = useRef<BroadMessageListHandle>(null);
+	const virtualListRef = useRef<SlidingWindowListHandle>(null);
 
 	const clearHighlightTimers = useCallback(() => {
 		if (highlightStartTimerRef.current != null) {
@@ -2646,7 +2657,7 @@ export function NarratorPanel({
 		const metas = resolveSelectedBlockMeta(container, selectedBlockIds);
 		if (metas.length === 0) return;
 		// Confirm
-		const ok = window.confirm(t("batchDeleteConfirm", { count: metas.length }));
+		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
 		if (!ok) return;
 		// Optimistic update: remove blocks from cache
 		const prevData = qc.getQueryData(messagesQueryKey);
@@ -2693,7 +2704,7 @@ export function NarratorPanel({
 			qc.invalidateQueries({ queryKey: messagesQueryKey });
 			notifications.show({ message: t("batchDeleteFailed"), color: "red" });
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, messagesQueryKey, qc, t]);
+	}, [selectedBlockIds, exitSelection, narratorId, messagesQueryKey, qc, t, confirm]);
 
 	// --- Batch fork ---
 	const handleBatchFork = useCallback(async () => {
@@ -2729,7 +2740,8 @@ export function NarratorPanel({
 		if (!container || selectedBlockIds.size === 0) return;
 		const messageIds = resolveSelectedMessageIds(container, selectedBlockIds);
 		if (messageIds.length === 0) return;
-		if (!window.confirm(t("segmentCompactConfirm", { count: messageIds.length }))) return;
+		if (!(await confirm({ message: t("segmentCompactConfirm", { count: messageIds.length }) })))
+			return;
 		exitSelection();
 		try {
 			// Compacting state will arrive via substatus_change WS event
@@ -2743,7 +2755,7 @@ export function NarratorPanel({
 				autoClose: 5000,
 			});
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, t]);
+	}, [selectedBlockIds, exitSelection, narratorId, t, confirm]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -3209,7 +3221,7 @@ export function NarratorPanel({
 		const check = () => {
 			// Normal scroll direction: scrollTop near max = at visual bottom (newest messages).
 			// Trigger load-newer when near the bottom.
-			const distFromBottom = vp.scrollHeight - vp.scrollTop - vp.clientHeight;
+			const distFromBottom = getSlidingWindowDistanceFromBottom(vp);
 			if (distFromBottom <= 24) {
 				handleLoadNewerRef.current();
 			}
@@ -3228,7 +3240,7 @@ export function NarratorPanel({
 		if (!node) return;
 
 		const checkAtBottom = () => {
-			const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight < 30;
+			const atBottom = getSlidingWindowDistanceFromBottom(node) < 30;
 			if (atBottom && !isAtBottomRef.current) {
 				isAtBottomRef.current = true;
 				setIsAtBottom(true);
@@ -3339,9 +3351,7 @@ export function NarratorPanel({
 		let vpResizeTimer = 0;
 
 		// Use MutationObserver to detect content changes (new messages, streaming
-		// content growth, etc.) instead of ResizeObserver on contentRef. This is
-		// more reliable because broad-infinite-list manages its own DOM structure
-		// and contentRef may not be set synchronously.
+		// content growth, etc.) instead of ResizeObserver on contentRef.
 		let mutationRafId = 0;
 		const mutationObserver = new MutationObserver(() => {
 			if (!initialScrollDoneRef.current) return;
@@ -3351,14 +3361,14 @@ export function NarratorPanel({
 				if (resizingRef.current) {
 					if (isAtBottomRef.current && !highlightMessageId) {
 						programmaticScrollRef.current = true;
-						vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+						vp.scrollTop = getSlidingWindowScrollBottom(vp);
 					}
 					return;
 				}
 				if (isAtBottomRef.current && !highlightMessageId) {
 					startFollowing();
 				} else if (!isAtBottomRef.current && !highlightMessageId) {
-					if (vp.scrollHeight - vp.scrollTop - vp.clientHeight < 30) {
+					if (getSlidingWindowDistanceFromBottom(vp) < 30) {
 						isAtBottomRef.current = true;
 						setIsAtBottom(true);
 					}
@@ -3379,7 +3389,7 @@ export function NarratorPanel({
 				if (resizingRef.current) {
 					if (isAtBottomRef.current && !highlightMessageId) {
 						programmaticScrollRef.current = true;
-						vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+						vp.scrollTop = getSlidingWindowScrollBottom(vp);
 					}
 					return;
 				}
@@ -3407,7 +3417,7 @@ export function NarratorPanel({
 
 			if (isAtBottomRef.current && !highlightMessageId) {
 				programmaticScrollRef.current = true;
-				vp.scrollTop = vp.scrollHeight - vp.clientHeight;
+				vp.scrollTop = getSlidingWindowScrollBottom(vp);
 			}
 		});
 		vpObserver.observe(vp);
@@ -4694,7 +4704,7 @@ export function NarratorPanel({
 													suppress={suppressBlurIn}
 													seedIds={blurInSeedIds}
 												>
-													<BroadMessageList
+													<SlidingWindowList
 														ref={virtualListRef}
 														elements={renderedElements}
 														elementKeys={renderedKeys}
@@ -4704,7 +4714,7 @@ export function NarratorPanel({
 													/>
 												</BlurInOnAppearProvider>
 											) : (
-												<BroadMessageList
+												<SlidingWindowList
 													ref={virtualListRef}
 													elements={renderedElements}
 													elementKeys={renderedKeys}
@@ -5247,9 +5257,12 @@ export function NarratorPanel({
 									{nkpQueuePosition != null && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
-											{t("nkpQueuePosition", {
-												position: Number(nkpQueuePosition.split(":")[1]),
-											})}
+											{t(
+												nkpQueueDepthValue != null && nkpQueueDepthValue > 0
+													? "nkpQueuePositionWithDepth"
+													: "nkpQueuePosition",
+												{ position: nkpQueuePositionValue, queueDepth: nkpQueueDepthValue },
+											)}
 										</Text>
 									)}
 									{turnElapsedText && (

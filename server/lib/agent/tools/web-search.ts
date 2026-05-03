@@ -4,8 +4,17 @@ import { logger } from "../../logger";
 import { getFirstNkpProvider, hasConfiguredNkpProvider } from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
+function isAbortError(err: unknown): boolean {
+	return (
+		(err instanceof Error && (err.name === "AbortError" || err.message === "Aborted")) ||
+		(typeof DOMException !== "undefined" &&
+			err instanceof DOMException &&
+			err.name === "AbortError")
+	);
+}
+
 /** Call MCP search via NKP provider. */
-async function nkpMcpSearch(query: string): Promise<McpResponse> {
+async function nkpMcpSearch(query: string, signal?: AbortSignal): Promise<McpResponse> {
 	const config = getFirstNkpProvider();
 	if (!config) throw new Error("No NKP provider configured");
 
@@ -17,6 +26,7 @@ async function nkpMcpSearch(query: string): Promise<McpResponse> {
 			Authorization: `Bearer ${config.apiKey}`,
 		},
 		body: JSON.stringify({ query }),
+		signal,
 	});
 
 	if (!response.ok) {
@@ -80,7 +90,7 @@ export const webSearchTool: ToolDefinition = {
 		query: z.string().describe("Search query string"),
 	}),
 	isAvailable: () => isKiroAvailable() || hasConfiguredNkpProvider(),
-	async execute(args): Promise<ToolResult> {
+	async execute(args, ctx): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
 		const kiroUp = isKiroAvailable();
@@ -95,23 +105,28 @@ export const webSearchTool: ToolDefinition = {
 		}
 
 		try {
-			// Try Kiro first; on failure, fall back to NKP if available
+			if (ctx.signal.aborted) throw new Error("Aborted");
+
+			// Try Kiro first; on failure, fall back to NKP if available.
+			// Do not fall back when the failure was caused by narrator interruption;
+			// that must unwind immediately so the agent loop can clean up.
 			let response: McpResponse | undefined;
 			if (kiroUp) {
 				try {
-					response = await kiroMcpCall("web_search", { query });
+					response = await kiroMcpCall("web_search", { query }, ctx.signal);
 				} catch (kiroErr) {
+					if (ctx.signal.aborted || isAbortError(kiroErr)) throw kiroErr;
 					if (nkpUp) {
 						logger.warn("Kiro web search failed, falling back to NKP", {
 							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
 						});
-						response = await nkpMcpSearch(query);
+						response = await nkpMcpSearch(query, ctx.signal);
 					} else {
 						throw kiroErr;
 					}
 				}
 			} else {
-				response = await nkpMcpSearch(query);
+				response = await nkpMcpSearch(query, ctx.signal);
 			}
 
 			if (response.error) {
@@ -136,6 +151,12 @@ export const webSearchTool: ToolDefinition = {
 				title: query.slice(0, 80),
 			};
 		} catch (err) {
+			if (ctx.signal.aborted || isAbortError(err)) {
+				return {
+					output: "Web search aborted by user",
+					isError: true,
+				};
+			}
 			return {
 				output: `Web search failed: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,

@@ -8,6 +8,7 @@ import type {
 	StreamEvent,
 } from "../kiro-adapter";
 import { getImagePath, imageToBase64 } from "../uploads";
+import { parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent } from "./provider";
 import { resolveModel } from "./resolve-model";
 
@@ -84,6 +85,9 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 }
 
 export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
+	const gatewayEvent = parseGatewaySSEEvent(evt.eventType, evt.data);
+	if (gatewayEvent) return gatewayEvent;
+
 	const result: ParsedStreamEvent = {};
 
 	if (evt.eventType === "assistantResponseEvent") {
@@ -246,14 +250,17 @@ export async function* parseSSEStream(
 					if (!dataStr || dataStr === "[DONE]") continue;
 					try {
 						const data = JSON.parse(dataStr);
+						const embeddedEventType = data && typeof data.type === "string" ? data.type : undefined;
 						const evt: StreamEvent = {
-							eventType: currentEventType || "assistantResponseEvent",
+							eventType: currentEventType || embeddedEventType || "assistantResponseEvent",
 							data,
 						};
 						yield parseKiroStreamEvent(evt);
 					} catch {
 						// Malformed JSON — skip
 					}
+				} else if (line.trim() === "") {
+					currentEventType = "";
 				}
 			}
 		}
@@ -411,12 +418,18 @@ export async function buildKiroHistory(
 			let images: KiroImage[] | undefined;
 			if (ownerNarratorId && Array.isArray(msg.contentJson)) {
 				const imageBlocks = (
-					msg.contentJson as Array<{ type: string; imageId?: string; mediaType?: string }>
+					msg.contentJson as Array<{
+						type: string;
+						imageId?: string;
+						mediaType?: string;
+						uploadNarratorId?: string;
+					}>
 				).filter((b) => b.type === "image" && b.imageId);
 				if (imageBlocks.length > 0) {
 					const resolved: KiroImage[] = [];
 					for (const block of imageBlocks) {
-						const filePath = getImagePath(ownerNarratorId, block.imageId ?? "");
+						const uploadNarratorId = block.uploadNarratorId ?? ownerNarratorId;
+						const filePath = getImagePath(uploadNarratorId, block.imageId ?? "");
 						if (filePath) {
 							try {
 								const result = await imageToBase64(filePath);

@@ -3,8 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setUploadsDirForTests } from "../../uploads";
-import { buildKiroHistory } from "../kiro-protocol";
-import type { DbMessage } from "../provider";
+import { buildKiroHistory, parseSSEStream } from "../kiro-protocol";
+import type { DbMessage, ParsedStreamEvent } from "../provider";
 
 const SAMPLE_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
@@ -42,6 +42,15 @@ function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 		toolCalls: [],
 		...overrides,
 	};
+}
+
+function streamFromText(text: string): ReadableStream<Uint8Array> {
+	return new ReadableStream({
+		start(controller) {
+			controller.enqueue(new TextEncoder().encode(text));
+			controller.close();
+		},
+	});
 }
 
 beforeEach(() => {
@@ -88,5 +97,36 @@ describe("buildKiroHistory", () => {
 		expect(historyJson).toContain("Inspect this screenshot");
 		expect(historyJson).toContain(SAMPLE_PNG_BASE64);
 		expect(historyJson).toContain('"images"');
+	});
+});
+
+describe("parseSSEStream", () => {
+	test("parses NKP queue events from data-embedded SSE frames", async () => {
+		const events: ParsedStreamEvent[] = [];
+		const body = streamFromText(
+			'data: {"type":"nkpQueueEvent","position":2,"queueDepth":5}\n\n' +
+				'data: {"content":"hello"}\n\n',
+		);
+
+		for await (const event of parseSSEStream(body)) {
+			events.push(event);
+		}
+
+		expect(events).toEqual([{ nkpQueue: { position: 2, queueDepth: 5 } }, { text: "hello" }]);
+	});
+
+	test("parses generic gateway queue events in Kiro-compatible streams", async () => {
+		const events: ParsedStreamEvent[] = [];
+		const body = streamFromText(
+			"event: queueEvent\n" +
+				'data: {"position":3,"queueDepth":8}\n\n' +
+				'data: {"content":"ready"}\n\n',
+		);
+
+		for await (const event of parseSSEStream(body)) {
+			events.push(event);
+		}
+
+		expect(events).toEqual([{ queueStatus: { position: 3, queueDepth: 8 } }, { text: "ready" }]);
 	});
 });

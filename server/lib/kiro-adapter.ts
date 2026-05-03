@@ -183,7 +183,11 @@ interface KiroModule {
 		text: string,
 		model?: KiroModel,
 	): Promise<{ text: string; contextPercent?: number }>;
-	kiroMcpCall(name: string, args: Record<string, unknown>): Promise<McpResponse>;
+	kiroMcpCall(
+		name: string,
+		args: Record<string, unknown>,
+		signal?: AbortSignal,
+	): Promise<McpResponse>;
 	kiroMcpListTools(): Promise<McpResponse>;
 	kiroSnapshot(): ManagerSnapshot | null;
 	kiroSetDisabled(id: string, disabled: boolean): void;
@@ -264,9 +268,10 @@ export async function kiroGenerateWithMeta(
 export async function kiroMcpCall(
 	name: string,
 	args: Record<string, unknown>,
+	signal?: AbortSignal,
 ): Promise<McpResponse> {
 	if (!mod) throw new Error("Kiro plugin is not installed");
-	return mod.kiroMcpCall(name, args);
+	return mod.kiroMcpCall(name, args, signal);
 }
 
 export async function kiroMcpListTools(): Promise<McpResponse> {
@@ -405,7 +410,7 @@ registerKiroModelLister(() =>
 
 /** Fetch models from the API and cache them. Called once after kiro init. */
 export async function kiroRefreshModelCache(): Promise<Array<Record<string, unknown>>> {
-	if (!mod || !mod.isKiroAvailable()) return cachedKiroModels;
+	if (!mod?.isKiroAvailable()) return cachedKiroModels;
 	try {
 		const result = await mod.kiroListModels();
 		cachedKiroModels = result.models.map((m) => {

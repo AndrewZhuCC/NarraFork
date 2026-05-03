@@ -25,6 +25,7 @@ import { useTranslation } from "react-i18next";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
 import { relativeTime } from "../../lib/relative-time";
+import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -58,6 +59,7 @@ export const KiroSection = React.memo(function KiroSection({
 	onTestModel,
 }: KiroSectionProps) {
 	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
 	const [refreshingKiro, setRefreshingKiro] = useState(false);
 
@@ -321,8 +323,10 @@ export const KiroSection = React.memo(function KiroSection({
 					variant="light"
 					leftSection={<IconRefresh size={14} />}
 					loading={refreshingKiro}
-					onClick={() => {
-						if (confirm(t("kiroRefreshModelsConfirm"))) handleRefreshKiro();
+					onClick={async () => {
+						if (await confirm({ message: t("kiroRefreshModelsConfirm"), confirmColor: "indigo" })) {
+							handleRefreshKiro();
+						}
 					}}
 				>
 					{t("kiroRefreshModels")}
@@ -401,6 +405,7 @@ function CredentialActions({
 	"disableMut" | "enableMut" | "resetMut" | "refreshMut" | "usageMut" | "deleteMut" | "updateMut"
 >) {
 	const { t } = useTranslation("settings");
+	const confirm = useConfirmDialog();
 	return (
 		<Group gap="xs" wrap="wrap">
 			<Switch
@@ -445,8 +450,10 @@ function CredentialActions({
 				variant="subtle"
 				color="red"
 				size="sm"
-				onClick={() => {
-					if (confirm(t("kiroDeleteConfirm"))) muts.deleteMut.mutate(entry.id);
+				onClick={async () => {
+					if (await confirm({ message: t("kiroDeleteConfirm") })) {
+						muts.deleteMut.mutate(entry.id);
+					}
 				}}
 			>
 				<IconTrash size={14} />

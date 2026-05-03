@@ -341,6 +341,7 @@
 	"closePanel": "Close panel",
 	"lastTurnDuration": "last turn {{duration}}",
 	"nkpQueuePosition": "queued #{{position}}",
+	"nkpQueuePositionWithDepth": "queued #{{position}} of {{queueDepth}}",
 	"fileMod_title": "File Modifications",
 	"fileMod_tabSummary": "Summary",
 	"fileMod_tabApproval": "Approval",
