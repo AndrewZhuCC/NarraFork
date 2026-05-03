@@ -315,6 +315,8 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"TaskCreate",
 	"EnterPlanMode",
 	"ExitPlanMode",
+	"StartPipeline",
+	"EndPipeline",
 	"Bash",
 	"Shell",
 	"Agent",
