@@ -13,7 +13,8 @@ registerCoreTools();
 initTruncateCleanup();
 
 export { KiroProvider } from "./kiro-provider";
-export { agentLoop } from "./loop";
+export type { ReflectionLoopRunOptions } from "./loop";
+export { agentLoop, runReflectionLoop } from "./loop";
 export type {
 	DbMessage,
 	DbToolCall,
@@ -29,6 +30,8 @@ export type {
 	AgentEvent,
 	AgentToolUse,
 	PermissionResult,
+	ReflectionLoopConfig,
+	ReflectionLoopContext,
 	ToolContext,
 	ToolDefinition,
 	ToolResult,
