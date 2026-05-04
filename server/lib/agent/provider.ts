@@ -11,6 +11,7 @@ import {
 	resolveProvider,
 	settings,
 } from "../settings";
+import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
@@ -191,6 +192,15 @@ export interface GenerateOptions {
 	reasoningEffort?: ChatParams["reasoningEffort"];
 }
 
+export interface GenerateMetaResult {
+	text: string;
+	contextPercent?: number;
+	usage?: UsageData | null;
+	credentialId?: string;
+	meterUsage?: number;
+	meterUnit?: string;
+}
+
 // === The adapter interface ===
 
 export interface ProviderAdapter {
@@ -269,7 +279,7 @@ export interface ProviderAdapter {
 		model: string,
 		systemInstruction?: string,
 		options?: GenerateOptions,
-	): Promise<{ text: string; contextPercent?: number }>;
+	): Promise<GenerateMetaResult>;
 
 	/**
 	 * Generate text using a history-based conversation (system instruction + user content).
@@ -282,6 +292,15 @@ export interface ProviderAdapter {
 		locale?: string,
 		options?: GenerateOptions,
 	): Promise<string>;
+
+	/** Like generateWithHistory() but also returns usage and other request metadata if available. */
+	generateWithHistoryWithMeta?(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+		options?: GenerateOptions,
+	): Promise<GenerateMetaResult>;
 }
 
 // === Provider resolution ===

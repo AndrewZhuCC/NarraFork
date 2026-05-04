@@ -6,6 +6,7 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { getToolMessage, type Locale } from "../prompt-i18n";
+import type { UsageData } from "../usage-tracking";
 import {
 	buildKiroHistory,
 	buildKiroRequest,
@@ -22,6 +23,19 @@ import type { AgentToolUse, ResolvedToolDefinition } from "./types";
  * Encapsulates all Kiro-specific request building, history formatting,
  * stream parsing, and tool result formatting.
  */
+function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
+	if (!usage) return undefined;
+	return {
+		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
+		outputTokens: usage.completionTokens ?? 0,
+		cachedInputTokens: usage.cachedInputTokens ?? 0,
+		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
+		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
+		reasoningTokens: usage.reasoningTokens ?? 0,
+	};
+}
+
 export class KiroProvider implements ProviderAdapter {
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map((tool) => ({
@@ -163,56 +177,59 @@ export class KiroProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
-	): Promise<{ text: string; contextPercent?: number }> {
+	): Promise<import("./provider").GenerateMetaResult> {
 		const modelId = resolveModel(model);
-		if (systemInstruction) {
-			// Kiro API has no system prompt field — simulate via history
-			const kiroAdapter = await import("../kiro-adapter");
-			const ack = "Understood.";
-			const request: import("../kiro-adapter").KiroChatRequest = {
-				conversationState: {
-					conversationId: crypto.randomUUID(),
-					chatTriggerType: "MANUAL",
-					history: [
-						{
-							userInputMessage: {
-								content: systemInstruction,
-								modelId,
-								origin: "AI_EDITOR",
-							},
-						},
-						{
-							assistantResponseMessage: {
-								content: ack,
-							},
-						},
-					] as KiroHistoryMessage[],
-					currentMessage: {
-						userInputMessage: {
-							content: text,
-							modelId,
-							userInputMessageContext: {},
-							origin: "AI_EDITOR",
-						},
+		const kiroAdapter = await import("../kiro-adapter");
+		const request: import("../kiro-adapter").KiroChatRequest = {
+			conversationState: {
+				conversationId: crypto.randomUUID(),
+				chatTriggerType: "MANUAL",
+				...(systemInstruction
+					? {
+							history: [
+								{
+									userInputMessage: {
+										content: systemInstruction,
+										modelId,
+										origin: "AI_EDITOR",
+									},
+								},
+								{
+									assistantResponseMessage: {
+										content: "Understood.",
+									},
+								},
+							] as KiroHistoryMessage[],
+						}
+					: {}),
+				currentMessage: {
+					userInputMessage: {
+						content: text,
+						modelId,
+						userInputMessageContext: {},
+						origin: "AI_EDITOR",
 					},
 				},
-			};
-			const chunks: string[] = [];
-			let contextPercent: number | undefined;
-			for await (const evt of kiroAdapter.kiroChatRaw(request)) {
-				if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
-					chunks.push(String(evt.data.content));
-				}
-				if (evt.eventType === "contextUsageEvent") {
-					const pct = evt.data.contextUsagePercentage ?? evt.data.context_usage_percentage;
-					if (pct != null) contextPercent = Number(pct);
-				}
+			},
+		};
+		const chunks: string[] = [];
+		let contextPercent: number | undefined;
+		let usage: UsageData | undefined;
+		let credentialId: string | undefined;
+		let meterUsage: number | undefined;
+		let meterUnit: string | undefined;
+		for await (const rawEvent of kiroAdapter.kiroChatRaw(request)) {
+			const evt = parseKiroStreamEvent(rawEvent);
+			if (evt.text != null) chunks.push(evt.text);
+			if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
+			if (evt.usage) usage = toUsageData(evt.usage);
+			if (evt.credentialId) credentialId = evt.credentialId;
+			if (evt.metering) {
+				meterUsage = evt.metering.usage;
+				meterUnit = evt.metering.unit;
 			}
-			return { text: chunks.join(""), contextPercent };
 		}
-		const { kiroGenerateWithMeta } = await import("../kiro-adapter");
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		return kiroGenerateWithMeta(text, modelId as any);
+		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
 	}
 
 	async generateWithHistory(
@@ -221,6 +238,21 @@ export class KiroProvider implements ProviderAdapter {
 		model: string,
 		locale?: string,
 	): Promise<string> {
+		const result = await this.generateWithHistoryWithMeta(
+			systemInstruction,
+			content,
+			model,
+			locale,
+		);
+		return result.text;
+	}
+
+	async generateWithHistoryWithMeta(
+		systemInstruction: string,
+		content: string,
+		model: string,
+		locale?: string,
+	): Promise<import("./provider").GenerateMetaResult> {
 		const kiroAdapter = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
 		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
@@ -256,11 +288,22 @@ export class KiroProvider implements ProviderAdapter {
 		};
 
 		const chunks: string[] = [];
-		for await (const evt of kiroAdapter.kiroChatRaw(request)) {
-			if (evt.eventType === "assistantResponseEvent" && evt.data.content != null) {
-				chunks.push(String(evt.data.content));
+		let contextPercent: number | undefined;
+		let usage: UsageData | undefined;
+		let credentialId: string | undefined;
+		let meterUsage: number | undefined;
+		let meterUnit: string | undefined;
+		for await (const rawEvent of kiroAdapter.kiroChatRaw(request)) {
+			const evt = parseKiroStreamEvent(rawEvent);
+			if (evt.text != null) chunks.push(evt.text);
+			if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
+			if (evt.usage) usage = toUsageData(evt.usage);
+			if (evt.credentialId) credentialId = evt.credentialId;
+			if (evt.metering) {
+				meterUsage = evt.metering.usage;
+				meterUnit = evt.metering.unit;
 			}
 		}
-		return chunks.join("");
+		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
 	}
 }

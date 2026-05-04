@@ -84,11 +84,103 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	};
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function numberFrom(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value);
+		if (Number.isFinite(parsed)) return parsed;
+	}
+	return undefined;
+}
+
+function firstNumber(source: Record<string, unknown>, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const value = numberFrom(source[key]);
+		if (value != null) return value;
+	}
+	return undefined;
+}
+
+function parseUsagePayload(data: Record<string, unknown>): ParsedStreamEvent["usage"] | undefined {
+	const source = isRecord(data.usage) ? data.usage : data;
+	const inputTokens = firstNumber(source, [
+		"inputTokens",
+		"input_tokens",
+		"promptTokens",
+		"prompt_tokens",
+	]);
+	const completionTokens = firstNumber(source, [
+		"completionTokens",
+		"completion_tokens",
+		"outputTokens",
+		"output_tokens",
+	]);
+	const cachedInputTokens = firstNumber(source, [
+		"cachedInputTokens",
+		"cached_input_tokens",
+		"cacheReadInputTokens",
+		"cache_read_input_tokens",
+	]);
+	const cacheCreationInputTokens = firstNumber(source, [
+		"cacheCreationInputTokens",
+		"cache_creation_input_tokens",
+		"cacheWriteInputTokens",
+		"cache_write_input_tokens",
+	]);
+	const cacheCreation5mTokens = firstNumber(source, [
+		"cacheCreation5mTokens",
+		"cache_creation_5m_tokens",
+		"ephemeral5mInputTokens",
+		"ephemeral_5m_input_tokens",
+	]);
+	const cacheCreation1hTokens = firstNumber(source, [
+		"cacheCreation1hTokens",
+		"cache_creation_1h_tokens",
+		"ephemeral1hInputTokens",
+		"ephemeral_1h_input_tokens",
+	]);
+	const reasoningTokens = firstNumber(source, ["reasoningTokens", "reasoning_tokens"]);
+
+	const hasAny = [
+		inputTokens,
+		completionTokens,
+		cachedInputTokens,
+		cacheCreationInputTokens,
+		cacheCreation5mTokens,
+		cacheCreation1hTokens,
+		reasoningTokens,
+	].some((value) => value != null);
+	if (!hasAny) return undefined;
+
+	const derivedCacheCreation =
+		cacheCreationInputTokens ?? (cacheCreation5mTokens ?? 0) + (cacheCreation1hTokens ?? 0);
+	const promptTokens =
+		firstNumber(source, ["promptTokens", "prompt_tokens"]) ??
+		(inputTokens ?? 0) + (cachedInputTokens ?? 0) + derivedCacheCreation;
+
+	return {
+		promptTokens,
+		inputTokens,
+		completionTokens,
+		reasoningTokens,
+		cachedInputTokens,
+		cacheCreationInputTokens: derivedCacheCreation,
+		cacheCreation5mTokens,
+		cacheCreation1hTokens,
+	};
+}
+
 export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 	const gatewayEvent = parseGatewaySSEEvent(evt.eventType, evt.data);
 	if (gatewayEvent) return gatewayEvent;
 
 	const result: ParsedStreamEvent = {};
+	const usage = parseUsagePayload(evt.data);
+	if (usage) result.usage = usage;
 
 	if (evt.eventType === "assistantResponseEvent") {
 		if (evt.data.content != null) {
