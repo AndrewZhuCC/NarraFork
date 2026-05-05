@@ -901,16 +901,6 @@ export async function* agentLoop(
 		return [];
 	}
 
-	/** Returns the assembled output (raw + sidecars) for the model API. */
-	async function applyToolResultReminder(
-		tu: AgentToolUse,
-		result: ToolExecResult,
-	): Promise<string> {
-		const sideCars = await collectToolResultSideCars(tu, result);
-		if (sideCars.length === 0) return result.output;
-		return appendSideCarsForApi(result.output, sideCars);
-	}
-
 	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
 		if (!config.getSideCars) return [];
 		try {
@@ -1684,7 +1674,7 @@ export async function* agentLoop(
 											toolName: prevTu.name,
 											output: sr.broken
 												? getToolMessage("brokenToolCallResult", locale)
-												: await applyToolResultReminder(prevTu, sr),
+												: sr.output,
 											isError: sr.isError ?? false,
 											durationMs: sr.durationMs,
 											permissionStartedAt: sr.permissionStartedAt,
@@ -2399,9 +2389,7 @@ export async function* agentLoop(
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: sr.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: await applyToolResultReminder(tu, sr),
+					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
 					isError: sr.isError ?? false,
 					durationMs: sr.durationMs,
 					permissionStartedAt: sr.permissionStartedAt,
@@ -2474,9 +2462,7 @@ export async function* agentLoop(
 					type: "tool_result",
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
-					output: sr.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: await applyToolResultReminder(tu, sr),
+					output: sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output,
 					isError: sr.isError ?? false,
 					durationMs: sr.durationMs,
 					permissionStartedAt: sr.permissionStartedAt,
@@ -2636,15 +2622,12 @@ export async function* agentLoop(
 					const brokenInputOverride = result.broken
 						? sanitizeBrokenInput(tu.name, tu.input, locale)
 						: undefined;
-					const displayOutput = result.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: outputWithReminder;
 
 					yield {
 						type: "tool_result",
 						toolUseId: tu.toolUseId,
 						toolName: tu.name,
-						output: displayOutput,
+						output: result.broken ? getToolMessage("brokenToolCallResult", locale) : result.output,
 						isError: result.isError ?? false,
 						durationMs,
 						brokenInputOverride,
@@ -2745,15 +2728,14 @@ export async function* agentLoop(
 						const brokenInputOverride = effectiveResult.broken
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
-						const displayOutput = effectiveResult.broken
-							? getToolMessage("brokenToolCallResult", locale)
-							: outputWithReminder;
 
 						yield {
 							type: "tool_result",
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
-							output: displayOutput,
+							output: effectiveResult.broken
+								? getToolMessage("brokenToolCallResult", locale)
+								: effectiveResult.output,
 							isError: effectiveResult.isError ?? false,
 							durationMs: effectiveResult.durationMs,
 							permissionStartedAt: effectiveResult.permissionStartedAt,
