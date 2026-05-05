@@ -11,6 +11,12 @@ import { getImagePath, imageToBase64 } from "../uploads";
 import { parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent } from "./provider";
 import { resolveModel } from "./resolve-model";
+import {
+	appendSideCarsForApi,
+	outputToText,
+	sideCarsForToolResult,
+	sideCarsForUserMessage,
+} from "./sidecar";
 
 /**
  * Shared Kiro protocol helpers used by both KiroProvider and NkpProvider.
@@ -365,7 +371,11 @@ export async function buildKiroHistory(
 	dbMessages: DbMessage[],
 	model: string,
 	narratorId?: string,
-): Promise<{ history: KiroHistoryMessage[]; trailingToolResults: KiroToolResult[] }> {
+): Promise<{
+	history: KiroHistoryMessage[];
+	trailingToolResults: KiroToolResult[];
+	trailingUserText?: string;
+}> {
 	const modelId = resolveModel(model);
 
 	// Filter model-visible messages: user, assistant, sys (system context)
@@ -395,6 +405,7 @@ export async function buildKiroHistory(
 
 	const history: KiroHistoryMessage[] = [];
 	let pendingToolResults: KiroToolResult[] = [];
+	let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 	for (const msg of merged) {
 		if (msg.role === "assistant") {
@@ -405,13 +416,14 @@ export async function buildKiroHistory(
 			if (pendingToolResults.length > 0) {
 				history.push({
 					userInputMessage: {
-						content: "",
+						content: appendSideCarsForApi("", pendingUserSideCars),
 						modelId,
 						origin: "AI_EDITOR",
 						userInputMessageContext: { toolResults: pendingToolResults },
 					},
 				});
 				pendingToolResults = [];
+				pendingUserSideCars = [];
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -431,13 +443,14 @@ export async function buildKiroHistory(
 				if (pendingToolResults.length > 0) {
 					history.push({
 						userInputMessage: {
-							content: searchSummary,
+							content: appendSideCarsForApi(searchSummary, pendingUserSideCars),
 							modelId,
 							origin: "AI_EDITOR",
 							userInputMessageContext: { toolResults: pendingToolResults },
 						},
 					});
 					pendingToolResults = [];
+					pendingUserSideCars = [];
 				} else {
 					history.push({
 						userInputMessage: {
@@ -487,12 +500,10 @@ export async function buildKiroHistory(
 			if (msg.toolCalls) {
 				for (const tc of msg.toolCalls) {
 					if (tc.status === "success" || tc.status === "fail") {
-						const outputText =
-							typeof tc.outputJson === "string"
-								? tc.outputJson
-								: tc.outputJson != null
-									? JSON.stringify(tc.outputJson)
-									: "";
+						const outputText = appendSideCarsForApi(
+							outputToText(tc.outputJson),
+							sideCarsForToolResult(msg.sideCars, tc.toolUseId),
+						);
 						pendingToolResults.push({
 							toolUseId: tc.toolUseId,
 							content: [{ text: outputText }],
@@ -505,6 +516,8 @@ export async function buildKiroHistory(
 		} else if (msg.role === "user") {
 			const text = msg.contentText || "";
 			const ownerNarratorId = msg.narratorId ?? narratorId;
+
+			const userText = appendSideCarsForApi(text, pendingUserSideCars);
 
 			// Extract images from contentJson if narrator ownership is available
 			let images: KiroImage[] | undefined;
@@ -548,7 +561,7 @@ export async function buildKiroHistory(
 
 			const userMsg: KiroHistoryUserMessage = {
 				userInputMessage: {
-					content: text,
+					content: userText,
 					modelId,
 					origin: "AI_EDITOR",
 					...(images ? { images } : {}),
@@ -558,6 +571,10 @@ export async function buildKiroHistory(
 			};
 			history.push(userMsg);
 			pendingToolResults = [];
+			pendingUserSideCars = [];
+		}
+		if (msg.role === "assistant") {
+			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		}
 	}
 
@@ -571,7 +588,11 @@ export async function buildKiroHistory(
 		}
 	}
 
-	return { history, trailingToolResults: pendingToolResults };
+	return {
+		history,
+		trailingToolResults: pendingToolResults,
+		trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
+	};
 }
 
 // ── Shared image helpers for KiroProvider / NkpProvider ──

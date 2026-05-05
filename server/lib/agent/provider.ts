@@ -20,7 +20,7 @@ import { NkpProvider } from "./nkp-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
-import type { AgentToolUse } from "./types";
+import type { AgentSideCar, AgentToolUse } from "./types";
 
 function isKiroProviderDisabled(): boolean {
 	return process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1";
@@ -48,6 +48,13 @@ export interface DbMessage {
 	parentToolUseId: string | null;
 	messageUuid: string | null;
 	toolCalls?: DbToolCall[];
+	sideCars?: DbSideCar[];
+}
+
+export interface DbSideCar extends AgentSideCar {
+	messageId?: string | null;
+	toolUseId?: string | null;
+	createdAt?: string;
 }
 
 export interface DbToolCall {
@@ -56,6 +63,12 @@ export interface DbToolCall {
 	inputJson: unknown;
 	outputJson: unknown;
 	status: string;
+}
+
+export interface BuiltHistory {
+	history: unknown[];
+	trailingToolResults: unknown[];
+	trailingUserText?: string;
 }
 
 // === Stream event emitted by provider.chat() ===
@@ -208,11 +221,7 @@ export interface ProviderAdapter {
 	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 
 	/** Convert DB messages to provider history + trailing tool results */
-	buildHistory(
-		dbMessages: DbMessage[],
-		model: string,
-		narratorId?: string,
-	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }>;
+	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
 
 	/** Inject system prompt into the history array (mutates in place) */
 	injectSystemPrompt(
