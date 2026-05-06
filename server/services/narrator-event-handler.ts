@@ -184,6 +184,8 @@ export interface StreamingSnapshot {
 	nkpQueuePosition?: number;
 	/** Cached NKP queue depth. */
 	nkpQueueDepth?: number;
+	/** Cached generic gateway queue message. */
+	queueMessage?: string;
 }
 
 const streamingSnapshots = hotSafe<Map<string, StreamingSnapshot>>(
@@ -1362,13 +1364,19 @@ export async function processEvent(
 		// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway).
 		case "queue_status": {
 			const qsSnap = getOrCreateSnapshot(narratorId);
-			qsSnap.nkpQueuePosition = event.position;
-			qsSnap.nkpQueueDepth = event.queueDepth;
+			if (event.position !== undefined) {
+				qsSnap.nkpQueuePosition = event.position;
+			}
+			if (event.queueDepth !== undefined) {
+				qsSnap.nkpQueueDepth = event.queueDepth;
+			}
+			qsSnap.queueMessage = event.queueMessage;
 			dualBroadcast(ctx, {
 				type: "queue_status",
 				narratorId: broadcastTargetId,
 				position: event.position,
 				queueDepth: event.queueDepth,
+				queueMessage: event.queueMessage,
 			});
 			return null;
 		}
@@ -1514,11 +1522,22 @@ export async function processEvent(
 		}
 
 		case "model_switched": {
+			ctx.provider = event.provider;
+			ctx.providerPrefix = event.provider;
+			ctx.model = event.model;
 			dualBroadcast(ctx, {
 				type: "model_switched",
 				narratorId: broadcastTargetId,
 				model: event.model,
 				provider: event.provider,
+				reasoningEffort: event.reasoningEffort,
+			});
+			dualBroadcast(ctx, {
+				type: "model_settings_applied",
+				narratorId: broadcastTargetId,
+				model: event.model,
+				provider: event.provider,
+				reasoningEffort: event.reasoningEffort,
 			});
 			return null;
 		}
@@ -1623,6 +1642,7 @@ export async function processEvent(
 						source: sc.source,
 						content: sc.content,
 						toolUseId: sc.toolUseId,
+						orderIndex: sc.orderIndex,
 					})),
 					...(ctx.parentToolUseId && { parentToolUseId: ctx.parentToolUseId }),
 				});

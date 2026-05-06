@@ -56,6 +56,7 @@ export type {
 	PaginatedMessages,
 	PaginatedNarrators,
 	RuntimeScanResult,
+	SideCarRecord,
 	StorageCategoryResult,
 	StorageScanResult,
 	ToolCallRecord,

@@ -183,15 +183,26 @@ export class NkpProvider implements ProviderAdapter {
 		return result;
 	}
 
-	pushUserTurn(history: unknown[], content: string, model: string, toolResults: unknown[]): void {
+	pushUserTurn(
+		history: unknown[],
+		content: string,
+		model: string,
+		toolResults: unknown[],
+		images?: Array<{ format: string; base64: string }>,
+	): void {
 		const modelId = resolveModel(model);
 		const h = history as KiroHistoryMessage[];
+		const kiroImages = images?.map((img) => ({
+			format: img.format as KiroImage["format"],
+			source: { bytes: img.base64 },
+		}));
 
 		const userMsg: KiroHistoryUserMessage = {
 			userInputMessage: {
 				content,
 				modelId,
 				origin: "AI_EDITOR",
+				...(kiroImages?.length ? { images: kiroImages } : {}),
 				userInputMessageContext:
 					toolResults.length > 0 ? { toolResults: toolResults as KiroToolResult[] } : {},
 			},

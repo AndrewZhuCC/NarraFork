@@ -89,20 +89,59 @@ go run .kiro/skills/narrafork-release/release.go -token {token} -version {versio
 
 **重要**：设置 Bash timeout 为 600000（10 分钟），因为构建和上传需要较长时间。
 
-### 步骤 7：报告结果
+### 步骤 7：上传二进制到 123 网盘（仅正式版本）
+
+**仅当版本号的 patch 位为 `0`（即 x.y.0）时执行此步骤。**
+
+判断逻辑：
+- 正式版本（如 `0.4.0`、`1.0.0`、`1.2.0`）→ patch 位为 0 → 执行上传
+- 测试版本（如 `0.4.1`、`0.4.2`、`1.0.3`）→ patch 位非 0 → 跳过此步骤
+
+上传流程：
+
+1. 检查 rclone 是否已配置 `nf_update` 远端：
+   ```bash
+   rclone listremotes | grep nf_update
+   ```
+   如果未配置，提示用户先运行 `rclone config` 配置 WebDAV 远端（服务器地址：`https://webdav.123pan.cn/webdav`，账户使用团队私有配置或发布负责人提供的 123 网盘 WebDAV 账号），远端名称为 `nf_update`。
+
+2. 上传纯二进制文件到 `nf_update:{version}/` 子目录，排除 patch、metadata、blockmap、7z 等文件：
+   ```bash
+   rclone copy dist/ nf_update:{version} \
+     --filter "+ narrafork-{version}-linux-arm64" \
+     --filter "+ narrafork-{version}-linux-x64" \
+     --filter "+ narrafork-{version}-linux-x64-baseline" \
+     --filter "+ narrafork-{version}-macos-arm64" \
+     --filter "+ narrafork-{version}-macos-x64" \
+     --filter "+ narrafork-{version}-windows-x64.exe" \
+     --filter "+ narrafork-{version}-windows-x64-baseline.exe" \
+     --filter "- *" \
+     -v --progress
+   ```
+   **注意**：`--filter` 规则按顺序匹配，必须先列出要包含的文件（`+ 文件名`），最后用 `- *` 排除其余所有文件。不要混用 `--include` 和 `--exclude`，否则顺序不确定会导致错误文件被上传。
+
+3. 设置 Bash timeout 为 600000（10 分钟），上传大文件需要较长时间。
+
+4. 上传完成后，验证远端文件数量是否与本地构建的平台数量一致：
+   ```bash
+   rclone ls nf_update:{version}
+   ```
+
+### 步骤 8：报告结果
 
 发布完成后，显示：
 - 上传的文件列表
 - 新版本号
 - 更新服务器地址
 - 如果执行了 Git 操作，显示创建的 tag
+- 如果上传了 123 网盘，显示上传的文件列表和远端路径 `nf_update:{version}/`
 
 ## 版本号规则
 
-| 类型 | 格式 | 示例 | 渠道 |
-|------|------|------|------|
-| Patch/Minor/Major | x.y.z | 1.0.0 | stable |
-| Beta | x.y.z-beta.N | 1.0.0-beta.1 | beta |
+| 类型 | 格式 | 示例 | 渠道 | 上传 123 网盘 |
+|------|------|------|------|------|
+| 正式版本 | x.y.0 | 1.0.0、0.4.0 | stable | ✅ |
+| 测试版本 | x.y.z（z≠0） | 0.4.1、1.0.3 | stable | ❌ |
 
 ## 版本号计算
 

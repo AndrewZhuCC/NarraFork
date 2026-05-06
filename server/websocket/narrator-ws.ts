@@ -534,7 +534,8 @@ export const handleNarratorWS = {
 					if (!snap) continue;
 					const hasStreaming = snap.streamingBlocks.length > 0 || snap.toolChunks.size > 0;
 					const hasQueue = snap.nkpQueuePosition != null && snap.nkpQueuePosition > 0;
-					if (!hasStreaming && !hasQueue) continue;
+					const hasQueueMessage = !!snap.queueMessage;
+					if (!hasStreaming && !hasQueue && !hasQueueMessage) continue;
 					try {
 						if (hasStreaming) {
 							ws.send(
@@ -546,7 +547,17 @@ export const handleNarratorWS = {
 								}),
 							);
 						}
-						if (hasQueue) {
+						if (hasQueueMessage) {
+							ws.send(
+								JSON.stringify({
+									type: "queue_status",
+									narratorId: id,
+									position: snap.nkpQueuePosition,
+									queueDepth: snap.nkpQueueDepth,
+									queueMessage: snap.queueMessage,
+								}),
+							);
+						} else if (hasQueue) {
 							ws.send(
 								JSON.stringify({
 									type: "nkp_queue_status",

@@ -3,7 +3,7 @@ import { apiRequests, chapters, narrators } from "@server/db/schema";
 import { getCodexManager } from "@server/lib/codex-manager";
 import { kiroSnapshot } from "@server/lib/kiro-adapter";
 import { settings } from "@server/lib/settings";
-import { and, desc, eq, gte, like, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, like, lte, or, sql } from "drizzle-orm";
 
 export interface UsageHistoryFilters {
 	narratorId?: string;
@@ -14,6 +14,7 @@ export interface UsageHistoryFilters {
 	kind?: string;
 	startDate?: string;
 	endDate?: string;
+	includeSubagents?: boolean;
 }
 
 export interface UsageHistoryStats {
@@ -291,7 +292,16 @@ export class UsageHistoryService {
 		const model = filters.model?.trim();
 		const kind = filters.kind?.trim();
 
-		if (filters.narratorId) conditions.push(eq(apiRequests.narratorId, filters.narratorId));
+		if (filters.narratorId) {
+			conditions.push(
+				filters.includeSubagents
+					? or(
+							eq(apiRequests.narratorId, filters.narratorId),
+							eq(narrators.parentNarratorId, filters.narratorId),
+						)
+					: eq(apiRequests.narratorId, filters.narratorId),
+			);
+		}
 		if (filters.chapterId) conditions.push(eq(narrators.chapterId, filters.chapterId));
 		if (filters.projectId) conditions.push(eq(chapters.projectId, filters.projectId));
 		if (provider) conditions.push(eq(apiRequests.provider, provider));

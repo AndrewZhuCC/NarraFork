@@ -36,6 +36,7 @@ export interface InstanceSettingsState {
 	defaultRelaxedPlan: boolean;
 	dangerSkipReadOnlyConfirmations: boolean;
 	maxTransientRetries: number;
+	silentToolCallThreshold: number;
 	retryBackoffCeilMs: number;
 	firstTokenTimeoutMs: number;
 	customRetryRules: Array<{
@@ -116,6 +117,7 @@ function makeDefaults(): InstanceSettingsState {
 		defaultRelaxedPlan: false,
 		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
+		silentToolCallThreshold: 20,
 		retryBackoffCeilMs: 20000,
 		firstTokenTimeoutMs: 60000,
 		customRetryRules: [],
@@ -194,6 +196,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
+				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 60000,
 				customRetryRules: settings.agent?.customRetryRules ?? [],
@@ -278,6 +281,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
 						undefined,
 					maxTransientRetries: state.maxTransientRetries,
+					silentToolCallThreshold: state.silentToolCallThreshold,
 					retryBackoffCeilMs: state.retryBackoffCeilMs,
 					firstTokenTimeoutMs: state.firstTokenTimeoutMs,
 					customRetryRules: state.customRetryRules,

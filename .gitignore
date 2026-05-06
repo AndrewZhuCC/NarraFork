@@ -25,4 +25,6 @@ mitm-dump/
 package-lock.json
 IMPROVEMENT-PLAN.md
 kirocli.zip
+kiro-cli*-linux-*/
+kiro-cli*-linux-*.7z
 *.log

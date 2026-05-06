@@ -1218,6 +1218,8 @@ function SortableQueuedMessageItem({
 	onRemove,
 	cancelBufferLabel,
 	editLabel,
+	priorityLabel,
+	priorityNextRequestLabel,
 }: {
 	msg: BufferMessageSummary;
 	index: number;
@@ -1230,6 +1232,8 @@ function SortableQueuedMessageItem({
 	onRemove: (id: string) => void;
 	cancelBufferLabel: string;
 	editLabel: string;
+	priorityLabel: string;
+	priorityNextRequestLabel: string;
 }) {
 	const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
 		id: msg.id,
@@ -1239,6 +1243,7 @@ function SortableQueuedMessageItem({
 		transition,
 		opacity: isDragging ? 0.5 : 1,
 	};
+	const priorityText = index === 0 ? priorityNextRequestLabel : priorityLabel;
 
 	return (
 		<Group
@@ -1323,6 +1328,17 @@ function SortableQueuedMessageItem({
 						/>
 					) : (
 						<Box w={16} h={16} style={{ flexShrink: 0 }} />
+					)}
+					{msg.priority && (
+						<Badge
+							size="xs"
+							color="orange"
+							variant="light"
+							leftSection={<IconBolt size={10} />}
+							style={{ flexShrink: 0 }}
+						>
+							{priorityText}
+						</Badge>
 					)}
 					<Text size="xs" c="blue" truncate style={{ flex: 1 }}>
 						{msg.text}
@@ -2153,8 +2169,12 @@ export function NarratorPanel({
 	const isCompacting = substatus.includes("compacting");
 	const nkpQueuePosition = substatus.find((s) => s.startsWith("queue_position:"));
 	const nkpQueueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
+	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
 	const nkpQueuePositionValue = nkpQueuePosition ? Number(nkpQueuePosition.split(":")[1]) : null;
 	const nkpQueueDepthValue = nkpQueueDepth ? Number(nkpQueueDepth.split(":")[1]) : null;
+	const queueMessageValue = queueMessage
+		? decodeURIComponent(queueMessage.slice("queue_message:".length))
+		: null;
 	const showWorkIndicator = !!(isWorking || isWaiting || isCompacting || isRetrying);
 
 	// --- Turn elapsed timer ---
@@ -4154,14 +4174,14 @@ export function NarratorPanel({
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
 
-	/** Send with priority=true (cut in line — interrupt + insert at front of queue). */
+	/** Send with priority=true (cut in line at the next safe request boundary). */
 	const handleSendPriority = async () => {
 		const msg = input.trim();
 		if (!msg || sendingRef.current) return;
 		sendingRef.current = true;
 		try {
 			inputHistory.push(msg);
-			// Send with priority=true — backend will automatically interrupt and insert at front
+			// Send with priority=true — backend inserts at the front and waits for a safe boundary.
 			await doSendBuffered(msg, true);
 		} catch (err) {
 			// On error, restore input and attachments
@@ -5647,6 +5667,17 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
+									{queuedMessages[0].priority && (
+										<Badge
+											size="xs"
+											color="orange"
+											variant="light"
+											leftSection={<IconBolt size={10} />}
+											style={{ flexShrink: 0 }}
+										>
+											{t("queuedPriorityNextRequest")}
+										</Badge>
+									)}
 									<Text size="xs" c="dimmed" truncate style={{ flex: 1 }}>
 										{queuedMessages[0].text}
 									</Text>
@@ -5688,6 +5719,8 @@ export function NarratorPanel({
 													onRemove={handleRemoveQueued}
 													cancelBufferLabel={t("cancelBuffer")}
 													editLabel={tc("edit")}
+													priorityLabel={t("queuedPriority")}
+													priorityNextRequestLabel={t("queuedPriorityNextRequest")}
 												/>
 											))}
 										</SortableContext>
@@ -5835,15 +5868,16 @@ export function NarratorPanel({
 															? t("planning")
 															: t("thinking")}
 									</Text>
-									{nkpQueuePosition != null && (
+									{(nkpQueuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
-											{t(
-												nkpQueueDepthValue != null && nkpQueueDepthValue > 0
-													? "nkpQueuePositionWithDepth"
-													: "nkpQueuePosition",
-												{ position: nkpQueuePositionValue, queueDepth: nkpQueueDepthValue },
-											)}
+											{queueMessageValue ??
+												t(
+													nkpQueueDepthValue != null && nkpQueueDepthValue > 0
+														? "nkpQueuePositionWithDepth"
+														: "nkpQueuePosition",
+													{ position: nkpQueuePositionValue, queueDepth: nkpQueueDepthValue },
+												)}
 										</Text>
 									)}
 									{turnElapsedText && (
