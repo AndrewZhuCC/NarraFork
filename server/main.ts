@@ -9,6 +9,7 @@ import "./db"; // Ensure DB is initialized early
 import { db, markDatabaseCleanShutdown } from "./db";
 import { users } from "./db/schema";
 import { verifyToken } from "./lib/auth";
+import { getCodexManager } from "./lib/codex-manager";
 import {
 	initKiro,
 	isKiroAvailable,
@@ -768,6 +769,12 @@ async function openAsApp(url: string) {
 // Start WebSocket heartbeat (ping/pong) to detect stale connections
 startHeartbeat();
 
+try {
+	getCodexManager().startUsageRefreshScheduler();
+} catch (err) {
+	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
+}
+
 // Initialize Kiro plugin if configured
 if (settings.kiro?.credentialsPath) {
 	try {
@@ -920,6 +927,7 @@ async function performGracefulShutdown(
 	shutdownPromise = (async () => {
 		logger.info("Graceful shutdown started", { reason: options.reason });
 		stopHeartbeat();
+		getCodexManager().stopUsageRefreshScheduler();
 		stopContainerProxy();
 
 		// Terminate all WebSocket connections first — this sends TCP RST so the

@@ -4,6 +4,9 @@ import type {
 	ChangelogEntry,
 	CodexCredentialEntry,
 	CodexUsageData,
+	CodexUsageForecast,
+	CodexUsageSchedulerSnapshot,
+	CodexUsageSummary,
 	CustomSubagentData,
 	DatabaseCleanupExecutionResult,
 	DatabaseCleanupPreviewResult,
@@ -335,6 +338,9 @@ export const miscApi = {
 			useWebSocket?: boolean;
 			lastBrowserAuthError?: string;
 			usageCache: Record<string, CodexUsageData>;
+			usageSummary: CodexUsageSummary;
+			usageForecast: CodexUsageForecast;
+			usageScheduler: CodexUsageSchedulerSnapshot;
 			usageQueue?: {
 				items: Array<{
 					id: string;
