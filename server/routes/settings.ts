@@ -9,6 +9,7 @@ import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
 import { isKiroAvailable, kiroGetCachedModels } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
+import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { scheduleServerRestart } from "../lib/server-restart";
 import {
 	getBuiltinCodexModels,
@@ -136,7 +137,8 @@ const updateSettingsSchema = z
 		agent: z
 			.object({
 				defaultModel: z.string().min(1),
-				defaultPermissionMode: z.string().min(1),
+				defaultPermissionMode: legacyPermissionModeSchema,
+				defaultStartInPlanMode: z.boolean(),
 				summaryModel: z.string(),
 				customModels: z.array(modelOptionSchema),
 				hiddenModels: z.array(z.string()),
@@ -159,9 +161,8 @@ const updateSettingsSchema = z
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
-				yoloSkipReadOnlyConfirmations: z.boolean(),
+				dangerSkipReadOnlyConfirmations: z.boolean(),
 				defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
-				smartInterruptionCheck: z.boolean(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				retryBackoffCeilMs: z.number().int().min(1000).max(300000),
 				firstTokenTimeoutMs: z.number().int().min(0).max(600000),
@@ -321,6 +322,24 @@ const updateSettingsSchema = z
 	})
 	.strict();
 
+function normalizeLegacySettingsPatch(body: unknown): unknown {
+	if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+	const draft = { ...(body as Record<string, unknown>) };
+	const rawAgent = draft.agent;
+	if (rawAgent && typeof rawAgent === "object" && !Array.isArray(rawAgent)) {
+		const agent = { ...(rawAgent as Record<string, unknown>) };
+		if (agent.defaultPermissionMode === "plan") {
+			agent.defaultPermissionMode = "default";
+			agent.defaultStartInPlanMode = true;
+		}
+		if (!("dangerSkipReadOnlyConfirmations" in agent) && "yoloSkipReadOnlyConfirmations" in agent) {
+			agent.dangerSkipReadOnlyConfirmations = agent.yoloSkipReadOnlyConfirmations;
+		}
+		draft.agent = agent;
+	}
+	return draft;
+}
+
 export const settingsRoutes = new Hono();
 
 /** Mask an API key for safe display (show last 4 chars). */
@@ -444,7 +463,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 settingsRoutes.get("/", (c) => {
 	const s = settings;
 	const codexManager = getCodexManager();
-	const codexSnapshot = codexManager.snapshot();
 	const result = {
 		...s,
 		// Mask TLS passphrase
@@ -485,7 +503,7 @@ settingsRoutes.get("/", (c) => {
 		nugModelsGrouped: getNugCachedModelsGrouped(),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		nkpQuotas: getAllNkpCachedQuotas(),
-		codexAvailable: codexSnapshot.available > 0,
+		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
 		lanAddresses: getLanAddresses(),
@@ -536,7 +554,7 @@ settingsRoutes.post("/test-model", async (c) => {
 });
 
 settingsRoutes.patch("/", async (c) => {
-	const body = await c.req.json();
+	const body = normalizeLegacySettingsPatch(await c.req.json());
 	const parsed = updateSettingsSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 

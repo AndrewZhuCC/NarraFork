@@ -32,9 +32,9 @@ export interface InstanceSettingsState {
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
+	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
-	yoloSkipReadOnlyConfirmations: boolean;
-	smartInterruptionCheck: boolean;
+	dangerSkipReadOnlyConfirmations: boolean;
 	maxTransientRetries: number;
 	retryBackoffCeilMs: number;
 	firstTokenTimeoutMs: number;
@@ -112,9 +112,9 @@ function makeDefaults(): InstanceSettingsState {
 		freshShellEnv: false,
 		translateReasoning: false,
 		requestDumpEnabled: false,
+		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
-		yoloSkipReadOnlyConfirmations: false,
-		smartInterruptionCheck: true,
+		dangerSkipReadOnlyConfirmations: false,
 		maxTransientRetries: 10,
 		retryBackoffCeilMs: 20000,
 		firstTokenTimeoutMs: 60000,
@@ -177,6 +177,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
+				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? "kiro:claude-haiku-4.5"),
 				maxTurns: settings.agent?.maxTurns ?? 200,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
@@ -191,8 +192,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
-				yoloSkipReadOnlyConfirmations: settings.agent?.yoloSkipReadOnlyConfirmations ?? false,
-				smartInterruptionCheck: settings.agent?.smartInterruptionCheck ?? true,
+				dangerSkipReadOnlyConfirmations: settings.agent?.dangerSkipReadOnlyConfirmations ?? false,
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 60000,
@@ -271,12 +271,12 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
+					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
-					yoloSkipReadOnlyConfirmations: state.yoloSkipReadOnlyConfirmations,
+					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
 						undefined,
-					smartInterruptionCheck: state.smartInterruptionCheck,
 					maxTransientRetries: state.maxTransientRetries,
 					retryBackoffCeilMs: state.retryBackoffCeilMs,
 					firstTokenTimeoutMs: state.firstTokenTimeoutMs,
