@@ -27,7 +27,7 @@ import {
 	kiroUpdateCredential,
 } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
-import { saveSettings, settings } from "../lib/settings";
+import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
 const updateCredentialSchema = z
@@ -295,8 +295,7 @@ kiroRoutes.post("/chat", async (c) => {
  */
 const proxySchema = z.object({
 	proxy: z
-		.string()
-		.optional()
+		.preprocess((v) => (typeof v === "string" ? normalizeProxyUrl(v) : v), z.string().optional())
 		.refine(
 			(v) => {
 				if (!v) return true;

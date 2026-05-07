@@ -3,6 +3,7 @@ import { createContext, useContext, useEffect, useMemo, useRef, useState } from 
 import { ensurePrefix } from "../components/providers/types";
 import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
+import { normalizeProxyUrl } from "../lib/proxy";
 
 export interface InstanceSettingsState {
 	// Server
@@ -245,6 +246,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	}, [isDirty]);
 
 	const save = () => {
+		const normalizedWebFetchProxyUrl = normalizeProxyUrl(state.webFetchProxyUrl) ?? "";
+		const normalizedState = { ...state, webFetchProxyUrl: normalizedWebFetchProxyUrl };
 		updateSettings.mutate(
 			{
 				server: {
@@ -293,8 +296,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					webFetchPolicy: {
 						proxy: {
 							mode: state.webFetchProxyMode as "direct" | "system" | "custom",
-							...(state.webFetchProxyMode === "custom" && state.webFetchProxyUrl
-								? { url: state.webFetchProxyUrl }
+							...(state.webFetchProxyMode === "custom" && normalizedWebFetchProxyUrl
+								? { url: normalizedWebFetchProxyUrl }
 								: {}),
 						},
 					},
@@ -328,7 +331,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 			},
 			{
 				onSuccess: (data) => {
-					serverSnapshot.current = { ...state };
+					serverSnapshot.current = normalizedState;
+					setState(normalizedState);
 					const resp = data as { serverRestarting?: boolean; newUrl?: string };
 					if (resp.serverRestarting && resp.newUrl) {
 						setTimeout(() => {
