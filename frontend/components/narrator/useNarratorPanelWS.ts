@@ -1840,6 +1840,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 								toolUseIndexRef.current,
 							);
 						}
+						if (decision !== "allow") return old;
 						return mergeFieldsByIndex(
 							old,
 							toolUseId,
