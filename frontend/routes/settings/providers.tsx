@@ -33,6 +33,23 @@ export const Route = createFileRoute("/settings/providers")({
 	component: SettingsProvidersPage,
 });
 
+function getDirtyProviderIds<T extends { id: string }>(
+	currentProviders: T[],
+	savedProviders: T[],
+): Set<string> {
+	const savedById = new Map(savedProviders.map((provider) => [provider.id, provider]));
+	const dirtyIds = new Set<string>();
+
+	for (const currentProvider of currentProviders) {
+		const savedProvider = savedById.get(currentProvider.id);
+		if (!savedProvider || JSON.stringify(currentProvider) !== JSON.stringify(savedProvider)) {
+			dirtyIds.add(currentProvider.id);
+		}
+	}
+
+	return dirtyIds;
+}
+
 function SettingsProvidersPage() {
 	const { data: user } = useCurrentUser();
 	const { t } = useTranslation("settings");
@@ -71,7 +88,8 @@ function SettingsProvidersPage() {
 		}
 	}, [state.initialized, state]);
 
-	const isDirty = useIsDirty(state, savedSnapshot.current);
+	const savedProviderSnapshot = savedSnapshot.current;
+	const isDirty = useIsDirty(state, savedProviderSnapshot);
 
 	// ── Handle OAuth callback redirect (oauth_success / oauth_error in URL) ──
 	const oauthHandledRef = useRef(false);
@@ -103,41 +121,37 @@ function SettingsProvidersPage() {
 	}, [search.oauth_success, search.oauth_error, qc, t]);
 
 	// Per-provider dirty checkers
+	const openaiDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.openaiProviders, savedProviderSnapshot.openaiProviders),
+		[state.openaiProviders, savedProviderSnapshot],
+	);
+	const anthropicDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.anthropicProviders, savedProviderSnapshot.anthropicProviders),
+		[state.anthropicProviders, savedProviderSnapshot],
+	);
+	const nkpDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.nkpProviders, savedProviderSnapshot.nkpProviders),
+		[state.nkpProviders, savedProviderSnapshot],
+	);
+	const nugDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.nugProviders, savedProviderSnapshot.nugProviders),
+		[state.nugProviders, savedProviderSnapshot],
+	);
 	const isOpenaiProviderDirty = useCallback(
-		(providerId: string) => {
-			const current = state.openaiProviders.find((p) => p.id === providerId);
-			const saved = savedSnapshot.current.openaiProviders.find((p) => p.id === providerId);
-			if (!saved) return true;
-			return JSON.stringify(current) !== JSON.stringify(saved);
-		},
-		[state.openaiProviders],
+		(providerId: string) => openaiDirtyProviderIds.has(providerId),
+		[openaiDirtyProviderIds],
 	);
 	const isAnthropicProviderDirty = useCallback(
-		(providerId: string) => {
-			const current = state.anthropicProviders.find((p) => p.id === providerId);
-			const saved = savedSnapshot.current.anthropicProviders.find((p) => p.id === providerId);
-			if (!saved) return true;
-			return JSON.stringify(current) !== JSON.stringify(saved);
-		},
-		[state.anthropicProviders],
+		(providerId: string) => anthropicDirtyProviderIds.has(providerId),
+		[anthropicDirtyProviderIds],
 	);
 	const isNkpProviderDirty = useCallback(
-		(providerId: string) => {
-			const current = state.nkpProviders.find((p) => p.id === providerId);
-			const saved = savedSnapshot.current.nkpProviders.find((p) => p.id === providerId);
-			if (!saved) return true;
-			return JSON.stringify(current) !== JSON.stringify(saved);
-		},
-		[state.nkpProviders],
+		(providerId: string) => nkpDirtyProviderIds.has(providerId),
+		[nkpDirtyProviderIds],
 	);
 	const isNugProviderDirty = useCallback(
-		(providerId: string) => {
-			const current = state.nugProviders.find((p) => p.id === providerId);
-			const saved = savedSnapshot.current.nugProviders.find((p) => p.id === providerId);
-			if (!saved) return true;
-			return JSON.stringify(current) !== JSON.stringify(saved);
-		},
-		[state.nugProviders],
+		(providerId: string) => nugDirtyProviderIds.has(providerId),
+		[nugDirtyProviderIds],
 	);
 
 	// ── Prefix conflict detection ──
