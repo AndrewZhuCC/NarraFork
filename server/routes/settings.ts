@@ -33,7 +33,9 @@ import {
 	commandWhitelistEntrySchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
+import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { ensureContainerProxyRuntime } from "../services/container-proxy";
+import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
 import { getAllNkpCachedQuotas, getNkpCachedModelsGrouped, purgeNkpProviderCache } from "./nkp";
@@ -362,6 +364,28 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		vnet: z
+			.object({
+				enabled: z.boolean(),
+				relayToken: z.string().optional(),
+				allowAnonymousRelay: z.boolean(),
+				maxPeersPerNetwork: z.number().int().min(1).max(1024),
+				maxMessageBytes: z
+					.number()
+					.int()
+					.min(1024)
+					.max(64 * 1024 * 1024),
+				udp: z
+					.object({
+						enabled: z.boolean(),
+						host: z.string().min(1).max(255),
+						port: z.number().int().min(0).max(65535),
+					})
+					.partial()
+					.optional(),
+			})
+			.partial()
+			.optional(),
 		shares: z
 			.object({
 				defaultExpiryHours: z.number().int().min(1),
@@ -397,6 +421,14 @@ function maskApiKey(key?: string): string {
 	if (!key) return "";
 	if (key.length <= 4) return "*".repeat(key.length);
 	return `${"*".repeat(8)}${key.slice(-4)}`;
+}
+
+function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["vnet"] {
+	if (!vnet) return undefined;
+	return {
+		...vnet,
+		relayToken: vnet.relayToken ? maskApiKey(vnet.relayToken) : "",
+	};
 }
 
 /** Get RFC 1918 private IPv4 addresses from network interfaces. */
@@ -604,6 +636,7 @@ settingsRoutes.get("/", (c) => {
 			...p,
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
+		vnet: maskVNetSettings(s.vnet),
 		kiroModels: isKiroAvailable() ? kiroGetCachedModels() : null,
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
@@ -723,6 +756,7 @@ settingsRoutes.patch("/", async (c) => {
 	const oldHost = current.server.host;
 	const oldPort = current.server.port;
 	const oldTls = current.server.tls;
+	const oldVNet = current.vnet;
 
 	// Normalize nullable codex defaultReasoningEffort to undefined for settings storage.
 	if (validated.codex?.defaultReasoningEffort === null) {
@@ -734,6 +768,11 @@ settingsRoutes.patch("/", async (c) => {
 		if (!validated.server.tls.passphrase || validated.server.tls.passphrase === "********") {
 			validated.server.tls.passphrase = oldTls?.passphrase;
 		}
+	}
+
+	// Preserve real VNet relay token when the client sends a masked display value.
+	if (validated.vnet?.relayToken?.startsWith("*")) {
+		validated.vnet.relayToken = current.vnet?.relayToken;
 	}
 
 	// Validate TLS cert/key files exist when enabling TLS
@@ -854,6 +893,13 @@ settingsRoutes.patch("/", async (c) => {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
+		} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
+			const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
+			merged.vnet = {
+				...current.vnet,
+				...vnetPatch,
+				udp: vnetPatch.udp ? { ...current.vnet?.udp, ...vnetPatch.udp } : current.vnet?.udp,
+			} as NarraForkSettings["vnet"];
 		} else if (val && typeof val === "object" && !Array.isArray(val)) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = { ...(current as any)[key], ...val };
@@ -885,7 +931,15 @@ settingsRoutes.patch("/", async (c) => {
 	// which would make `current` and `merged` identical and prevent detection.
 	purgeRemovedProviderCaches(current, merged);
 
+	const vnetChanged = JSON.stringify(oldVNet ?? null) !== JSON.stringify(merged.vnet ?? null);
+
 	saveSettings(merged);
+
+	if (vnetChanged) {
+		const closedConnections = closeVNetConnections("vnet settings changed");
+		const status = await startVNetUdpRendezvous(merged.vnet);
+		logger.info("Applied VNet runtime settings", { status, closedConnections });
+	}
 
 	// Detect host/port/TLS changes and schedule a server restart
 	const newHost = merged.server.host;
@@ -901,8 +955,6 @@ settingsRoutes.patch("/", async (c) => {
 	if (needsRestart) {
 		scheduleServerRestart(newHost, newPort);
 	}
-
-	const newProtocol = newTls?.enabled ? "https" : "http";
 
 	// Mask sensitive fields before returning (same logic as GET)
 	const result = {
@@ -943,10 +995,11 @@ settingsRoutes.patch("/", async (c) => {
 			...p,
 			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
 		})),
+		vnet: maskVNetSettings(merged.vnet),
 		// Signal to the frontend that the server is restarting at a new address
 		...(needsRestart && {
 			serverRestarting: true,
-			newUrl: `${newProtocol}://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
+			newUrl: `${newTls?.enabled ? "https" : "http"}://${newHost === "0.0.0.0" ? "localhost" : newHost}:${newPort}`,
 		}),
 	};
 	return c.json(result);
