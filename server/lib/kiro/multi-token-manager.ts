@@ -494,14 +494,16 @@ export class MultiTokenManager {
 		let duplicates = 0;
 
 		for (const cred of newCreds) {
-			if (cred.refreshToken) {
-				const hash = sha256Hex(cred.refreshToken);
-				if (existingHashes.has(hash)) {
-					duplicates++;
-					continue;
-				}
-				existingHashes.add(hash);
+			if (!cred.refreshToken) {
+				duplicates++;
+				continue;
 			}
+			const hash = sha256Hex(cred.refreshToken);
+			if (existingHashes.has(hash)) {
+				duplicates++;
+				continue;
+			}
+			existingHashes.add(hash);
 
 			cred.id = generateShortId();
 			if (!cred.machineId) {

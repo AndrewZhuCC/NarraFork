@@ -26,7 +26,7 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { saveSettings, settings } from "./lib/settings";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -781,17 +781,47 @@ try {
 	logger.warn("Codex usage refresh scheduler startup failed", { error: String(err) });
 }
 
-// Initialize Kiro plugin if configured
-if (settings.kiro?.credentialsPath) {
-	try {
-		const ok = initKiro({
-			credentialsPath: settings.kiro.credentialsPath,
+function resolveStartupKiroConfig(): Parameters<typeof initKiro>[0] | null {
+	const configuredCredentialsPath = settings.kiro?.credentialsPath?.trim();
+	if (configuredCredentialsPath) {
+		return {
+			credentialsPath: configuredCredentialsPath,
 			configPath:
-				settings.kiro.configPath ??
-				settings.kiro.credentialsPath.replace("credentials.json", "config.json"),
+				settings.kiro?.configPath?.trim() ||
+				configuredCredentialsPath.replace("credentials.json", "config.json"),
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			defaultModel: settings.kiro.defaultModel as any,
-		});
+			defaultModel: settings.kiro?.defaultModel as any,
+		};
+	}
+
+	const defaultKiroDir = resolve(homedir(), ".narrafork", "kiro");
+	const defaultCredentialsPath = resolve(defaultKiroDir, "credentials.json");
+	if (!existsSync(defaultCredentialsPath)) return null;
+
+	const defaultConfigPath = resolve(defaultKiroDir, "config.json");
+	settings.kiro = {
+		...settings.kiro,
+		credentialsPath: defaultCredentialsPath,
+		configPath: settings.kiro?.configPath?.trim() || defaultConfigPath,
+	};
+	saveSettings(settings);
+	logger.info("Kiro default credentials discovered; settings updated", {
+		credentialsPath: defaultCredentialsPath,
+	});
+
+	return {
+		credentialsPath: defaultCredentialsPath,
+		configPath: settings.kiro.configPath,
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		defaultModel: settings.kiro.defaultModel as any,
+	};
+}
+
+// Initialize Kiro plugin if configured, or if built-in manager credentials exist at the default path.
+const kiroStartupConfig = resolveStartupKiroConfig();
+if (kiroStartupConfig) {
+	try {
+		const ok = initKiro(kiroStartupConfig);
 		logger.info(`Kiro plugin: ${ok ? "initialized" : "credentials not found"}`, {
 			available: isKiroAvailable(),
 		});

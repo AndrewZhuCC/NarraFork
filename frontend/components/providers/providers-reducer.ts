@@ -1,6 +1,12 @@
 import { useCallback, useMemo } from "react";
 import type { NUGProviderState } from "./NUGProvidersSection";
-import type { AnthropicProviderState, NKPProviderState, OpenAIProviderState } from "./types";
+import type {
+	AnthropicProviderState,
+	CustomApiProtocol,
+	CustomApiProviderState,
+	NKPProviderState,
+	OpenAIProviderState,
+} from "./types";
 
 // ── Types ──────────────────────────────────────────────
 
@@ -11,6 +17,7 @@ export interface CustomModelEntry {
 }
 
 export interface ProvidersState {
+	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nkpProviders: NKPProviderState[];
@@ -24,6 +31,7 @@ export interface ProvidersState {
 }
 
 export interface SavedSnapshot {
+	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
 	nkpProviders: NKPProviderState[];
@@ -40,6 +48,7 @@ type Updater<T> = T | ((prev: T) => T);
 
 export type ProvidersAction =
 	| { type: "INIT_FROM_SETTINGS"; settings: Record<string, unknown> }
+	| { type: "SET_CUSTOM_API_PROVIDERS"; providers: Updater<CustomApiProviderState[]> }
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
 	| { type: "SET_NKP_PROVIDERS"; providers: Updater<NKPProviderState[]> }
@@ -61,9 +70,149 @@ function resolveUpdater<T>(prev: T, updater: Updater<T>): T {
 	return typeof updater === "function" ? (updater as (prev: T) => T)(prev) : updater;
 }
 
+function protocolFromOpenAI(provider: OpenAIProviderState): CustomApiProtocol {
+	switch (provider.apiMode) {
+		case "codex":
+			return "codex-native";
+		case "completions":
+			return "completions-compatible";
+		case "responses":
+			return "responses-compatible";
+		default:
+			return provider.responsesApi === false ? "completions-compatible" : "responses-compatible";
+	}
+}
+
+function protocolFromAnthropic(officialApi?: boolean): CustomApiProtocol {
+	return officialApi ? "anthropic-official" : "anthropic-compatible";
+}
+
+function isAnthropicProtocol(protocol: CustomApiProtocol): boolean {
+	return protocol === "anthropic-official" || protocol === "anthropic-compatible";
+}
+
+function customApiToOpenAI(provider: CustomApiProviderState): OpenAIProviderState | null {
+	let apiMode: NonNullable<OpenAIProviderState["apiMode"]> | null = null;
+	if (provider.protocol === "codex-native") apiMode = "codex";
+	else if (provider.protocol === "responses-compatible") apiMode = "responses";
+	else if (provider.protocol === "completions-compatible") apiMode = "completions";
+	if (!apiMode) return null;
+	return {
+		id: provider.id,
+		name: provider.name,
+		prefix: provider.prefix,
+		apiKey: provider.apiKey,
+		baseUrl: provider.baseUrl,
+		defaultModel: provider.defaultModel,
+		apiMode,
+		codexAccountId: provider.codexAccountId ?? "",
+		codexWebSocket: provider.codexWebSocket ?? false,
+		disabled: provider.disabled ?? false,
+	};
+}
+
+function customApiToAnthropic(provider: CustomApiProviderState): AnthropicProviderState | null {
+	if (!isAnthropicProtocol(provider.protocol)) return null;
+	return {
+		id: provider.id,
+		name: provider.name,
+		prefix: provider.prefix,
+		apiKey: provider.apiKey,
+		baseUrl: provider.baseUrl,
+		defaultModel: provider.defaultModel,
+		defaultReasoningEffort: provider.defaultReasoningEffort ?? null,
+		proxy: provider.proxy ?? "",
+		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
+		officialApi: provider.protocol === "anthropic-official",
+		disabled: provider.disabled ?? false,
+	};
+}
+
+function deriveSplitProviders(customApiProviders: CustomApiProviderState[]): {
+	openai: OpenAIProviderState[];
+	anthropic: AnthropicProviderState[];
+} {
+	return {
+		openai: customApiProviders.flatMap((provider) => {
+			const converted = customApiToOpenAI(provider);
+			return converted ? [converted] : [];
+		}),
+		anthropic: customApiProviders.flatMap((provider) => {
+			const converted = customApiToAnthropic(provider);
+			return converted ? [converted] : [];
+		}),
+	};
+}
+
+function normalizeCustomApiProvider(
+	provider: Partial<CustomApiProviderState>,
+): CustomApiProviderState {
+	return {
+		id: provider.id ?? "",
+		name: provider.name ?? "",
+		prefix: provider.prefix ?? "openai",
+		apiKey: provider.apiKey ?? "",
+		baseUrl: provider.baseUrl ?? "",
+		defaultModel: provider.defaultModel ?? "",
+		protocol: provider.protocol ?? "responses-compatible",
+		defaultContextWindow: provider.defaultContextWindow,
+		defaultReasoningEffort: provider.defaultReasoningEffort ?? null,
+		proxy: provider.proxy ?? "",
+		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
+		codexAccountId: provider.codexAccountId ?? "",
+		codexWebSocket: provider.codexWebSocket ?? false,
+		disabled: provider.disabled ?? false,
+	};
+}
+
+function deriveCustomApiProvidersFromLegacy(
+	openaiProviders: OpenAIProviderState[],
+	anthropicProviders: AnthropicProviderState[],
+): CustomApiProviderState[] {
+	const byId = new Map<string, CustomApiProviderState>();
+	for (const provider of openaiProviders) {
+		byId.set(
+			provider.id,
+			normalizeCustomApiProvider({
+				...provider,
+				protocol: protocolFromOpenAI(provider),
+			}),
+		);
+	}
+	for (const provider of anthropicProviders) {
+		const existing = byId.get(provider.id);
+		byId.set(
+			provider.id,
+			normalizeCustomApiProvider({
+				...existing,
+				...provider,
+				protocol: protocolFromAnthropic(provider.officialApi),
+				codexAccountId: existing?.codexAccountId ?? "",
+				codexWebSocket: existing?.codexWebSocket ?? false,
+			}),
+		);
+	}
+	return [...byId.values()];
+}
+
+function withDerivedCustomApiProviders(
+	state: ProvidersState,
+	customApiProviders: CustomApiProviderState[],
+): ProvidersState {
+	const normalized = customApiProviders.map(normalizeCustomApiProvider);
+	const split = deriveSplitProviders(normalized);
+	return {
+		...state,
+		customApiProviders: normalized,
+		openaiProviders: split.openai,
+		anthropicProviders: split.anthropic,
+	};
+}
+
 // ── Initial state ──────────────────────────────────────
 
 export const initialProvidersState: ProvidersState = {
+	customApiProviders: [],
 	openaiProviders: [],
 	anthropicProviders: [],
 	nkpProviders: [],
@@ -93,7 +242,8 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				apiKey: p.apiKey ?? "",
 				baseUrl: p.baseUrl ?? "",
 				defaultModel: p.defaultModel ?? "",
-				apiMode: p.apiMode ?? "responses",
+				responsesApi: p.responsesApi,
+				apiMode: p.apiMode,
 				codexAccountId: p.codexAccountId ?? "",
 				codexWebSocket: p.codexWebSocket ?? false,
 				disabled: p.disabled ?? false,
@@ -110,8 +260,20 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				defaultReasoningEffort: p.defaultReasoningEffort ?? null,
 				proxy: p.proxy ?? "",
 				tlsRejectUnauthorized: p.tlsRejectUnauthorized ?? true,
+				officialApi: p.officialApi ?? false,
 				disabled: p.disabled ?? false,
 			}));
+
+			const rawCustomApiProviders: unknown[] = Array.isArray(s.customApiProviders)
+				? s.customApiProviders
+				: [];
+			const customApiProviders =
+				rawCustomApiProviders.length > 0
+					? rawCustomApiProviders.map((p) =>
+							normalizeCustomApiProvider(p as Partial<CustomApiProviderState>),
+						)
+					: deriveCustomApiProvidersFromLegacy(openai, anthropic);
+			const splitCustomApiProviders = deriveSplitProviders(customApiProviders);
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const nkp = (s.nkpProviders ?? []).map((p: any) => ({
@@ -177,8 +339,9 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			}
 
 			return {
-				openaiProviders: openai,
-				anthropicProviders: anthropic,
+				customApiProviders,
+				openaiProviders: splitCustomApiProviders.openai,
+				anthropicProviders: splitCustomApiProviders.anthropic,
 				nkpProviders: nkp,
 				nugProviders: nug,
 				hiddenModels: new Set(hidden),
@@ -189,6 +352,12 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				initialized: true,
 			};
 		}
+
+		case "SET_CUSTOM_API_PROVIDERS":
+			return withDerivedCustomApiProviders(
+				state,
+				resolveUpdater(state.customApiProviders, action.providers),
+			);
 
 		case "SET_OPENAI_PROVIDERS":
 			return {
@@ -282,20 +451,22 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				);
 			};
 
-			return {
-				...state,
-				disabledProviders: next,
-				openaiProviders: syncDisabled(state.openaiProviders),
-				anthropicProviders: syncDisabled(state.anthropicProviders),
-				nkpProviders: syncDisabled(state.nkpProviders),
-				nugProviders: syncDisabled(state.nugProviders),
-			};
+			return withDerivedCustomApiProviders(
+				{
+					...state,
+					disabledProviders: next,
+					nkpProviders: syncDisabled(state.nkpProviders),
+					nugProviders: syncDisabled(state.nugProviders),
+				},
+				syncDisabled(state.customApiProviders),
+			);
 		}
 
 		case "RESTORE_FROM_SNAPSHOT": {
 			const snap = action.snapshot;
 			return {
 				...state,
+				customApiProviders: snap.customApiProviders.map((p) => ({ ...p })),
 				openaiProviders: snap.openaiProviders.map((p) => ({ ...p })),
 				anthropicProviders: snap.anthropicProviders.map((p) => ({ ...p })),
 				nkpProviders: snap.nkpProviders.map((p) => ({ ...p })),
@@ -327,8 +498,7 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 	return useMemo(() => {
 		if (!state.initialized) return false;
 		// Fast path: array length comparison
-		if (state.openaiProviders.length !== savedSnapshot.openaiProviders.length) return true;
-		if (state.anthropicProviders.length !== savedSnapshot.anthropicProviders.length) return true;
+		if (state.customApiProviders.length !== savedSnapshot.customApiProviders.length) return true;
 		if (state.nkpProviders.length !== savedSnapshot.nkpProviders.length) return true;
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
 		if (state.hiddenModels.size !== savedSnapshot.hiddenModels.length) return true;
@@ -337,10 +507,8 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (state.disabledProviders.size !== savedSnapshot.disabledProviders.length) return true;
 
 		// Deep comparison via JSON.stringify only when lengths match
-		if (JSON.stringify(state.openaiProviders) !== JSON.stringify(savedSnapshot.openaiProviders))
-			return true;
 		if (
-			JSON.stringify(state.anthropicProviders) !== JSON.stringify(savedSnapshot.anthropicProviders)
+			JSON.stringify(state.customApiProviders) !== JSON.stringify(savedSnapshot.customApiProviders)
 		)
 			return true;
 		if (JSON.stringify(state.nkpProviders) !== JSON.stringify(savedSnapshot.nkpProviders))
@@ -374,6 +542,7 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 /** Create a snapshot of the current state for dirty detection. */
 export function createSnapshot(state: ProvidersState): SavedSnapshot {
 	return {
+		customApiProviders: state.customApiProviders.map((p) => ({ ...p })),
 		openaiProviders: state.openaiProviders.map((p) => ({ ...p })),
 		anthropicProviders: state.anthropicProviders.map((p) => ({ ...p })),
 		nkpProviders: state.nkpProviders.map((p) => ({ ...p })),
@@ -388,6 +557,15 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 
 /** Build dispatch wrappers that support functional updaters. */
 export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) {
+	const setCustomApiProviders = useCallback(
+		(
+			updater:
+				| CustomApiProviderState[]
+				| ((prev: CustomApiProviderState[]) => CustomApiProviderState[]),
+		) => dispatch({ type: "SET_CUSTOM_API_PROVIDERS", providers: updater }),
+		[dispatch],
+	);
+
 	const setOpenaiProviders = useCallback(
 		(updater: OpenAIProviderState[] | ((prev: OpenAIProviderState[]) => OpenAIProviderState[])) =>
 			dispatch({ type: "SET_OPENAI_PROVIDERS", providers: updater }),
@@ -454,6 +632,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 
 	return useMemo(
 		() => ({
+			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNkpProviders,
@@ -467,6 +646,7 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			mergeContextWindows,
 		}),
 		[
+			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
 			setNkpProviders,

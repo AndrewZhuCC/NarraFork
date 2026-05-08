@@ -5,14 +5,16 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { AnthropicProvidersSection } from "../../components/providers/AnthropicProvidersSection";
 import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
+import {
+	CUSTOM_API_PROTOCOL_LABEL_KEYS,
+	CustomApiProviderSection,
+} from "../../components/providers/CustomApiProviderSection";
 import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
-import { OpenAIProvidersSection } from "../../components/providers/OpenAIProvidersSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
 import {
@@ -122,13 +124,9 @@ function SettingsProvidersPage() {
 	}, [search.oauth_success, search.oauth_error, qc, t]);
 
 	// Per-provider dirty checkers
-	const openaiDirtyProviderIds = useMemo(
-		() => getDirtyProviderIds(state.openaiProviders, savedProviderSnapshot.openaiProviders),
-		[state.openaiProviders, savedProviderSnapshot],
-	);
-	const anthropicDirtyProviderIds = useMemo(
-		() => getDirtyProviderIds(state.anthropicProviders, savedProviderSnapshot.anthropicProviders),
-		[state.anthropicProviders, savedProviderSnapshot],
+	const customApiDirtyProviderIds = useMemo(
+		() => getDirtyProviderIds(state.customApiProviders, savedProviderSnapshot.customApiProviders),
+		[state.customApiProviders, savedProviderSnapshot],
 	);
 	const nkpDirtyProviderIds = useMemo(
 		() => getDirtyProviderIds(state.nkpProviders, savedProviderSnapshot.nkpProviders),
@@ -138,13 +136,9 @@ function SettingsProvidersPage() {
 		() => getDirtyProviderIds(state.nugProviders, savedProviderSnapshot.nugProviders),
 		[state.nugProviders, savedProviderSnapshot],
 	);
-	const isOpenaiProviderDirty = useCallback(
-		(providerId: string) => openaiDirtyProviderIds.has(providerId),
-		[openaiDirtyProviderIds],
-	);
-	const isAnthropicProviderDirty = useCallback(
-		(providerId: string) => anthropicDirtyProviderIds.has(providerId),
-		[anthropicDirtyProviderIds],
+	const isCustomApiProviderDirty = useCallback(
+		(providerId: string) => customApiDirtyProviderIds.has(providerId),
+		[customApiDirtyProviderIds],
 	);
 	const isNkpProviderDirty = useCallback(
 		(providerId: string) => nkpDirtyProviderIds.has(providerId),
@@ -166,8 +160,7 @@ function SettingsProvidersPage() {
 	const allPrefixToId = useMemo(() => {
 		const map = new Map<string, string>();
 		for (const p of [
-			...state.openaiProviders,
-			...state.anthropicProviders,
+			...state.customApiProviders,
 			...state.nkpProviders,
 			...state.nugProviders,
 			...clineProviderPrefixes,
@@ -175,13 +168,7 @@ function SettingsProvidersPage() {
 			if (p.prefix) map.set(p.prefix, p.id);
 		}
 		return map;
-	}, [
-		state.openaiProviders,
-		state.anthropicProviders,
-		state.nkpProviders,
-		state.nugProviders,
-		clineProviderPrefixes,
-	]);
+	}, [state.customApiProviders, state.nkpProviders, state.nugProviders, clineProviderPrefixes]);
 	const getPrefixError = useCallback(
 		(prefix: string, currentProviderId: string): string | undefined => {
 			if (!prefix) return undefined;
@@ -213,8 +200,7 @@ function SettingsProvidersPage() {
 		const migratedWindows = { ...state.modelContextWindows };
 		const snap = savedSnapshot.current;
 		for (const providers of [
-			{ cur: state.openaiProviders, saved: snap.openaiProviders },
-			{ cur: state.anthropicProviders, saved: snap.anthropicProviders },
+			{ cur: state.customApiProviders, saved: snap.customApiProviders },
 			{ cur: state.nkpProviders, saved: snap.nkpProviders },
 			{ cur: state.nugProviders, saved: snap.nugProviders },
 		]) {
@@ -233,16 +219,15 @@ function SettingsProvidersPage() {
 				}
 			}
 		}
-		const normalizedAnthropicProviders = state.anthropicProviders.map((provider) => ({
+		const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 			...provider,
 			proxy: normalizeProxyUrl(provider.proxy) ?? "",
 		}));
-		const normalizedState = { ...state, anthropicProviders: normalizedAnthropicProviders };
+		const normalizedState = { ...state, customApiProviders: normalizedCustomApiProviders };
 		pendingSnapshot.current = createSnapshot(normalizedState);
-		dispatchers.setAnthropicProviders(normalizedAnthropicProviders);
+		dispatchers.setCustomApiProviders(normalizedCustomApiProviders);
 		updateMutation.mutate({
-			openaiProviders: state.openaiProviders,
-			anthropicProviders: normalizedAnthropicProviders,
+			customApiProviders: normalizedCustomApiProviders,
 			nkpProviders: state.nkpProviders,
 			nugProviders: state.nugProviders,
 			agent: {
@@ -285,7 +270,7 @@ function SettingsProvidersPage() {
 					]);
 					break;
 				case "openai":
-					dispatchers.setOpenaiProviders((prev) => [
+					dispatchers.setCustomApiProviders((prev) => [
 						...prev,
 						{
 							id,
@@ -294,13 +279,16 @@ function SettingsProvidersPage() {
 							apiKey: "",
 							baseUrl: "",
 							defaultModel: "",
-							apiMode: "completions" as const,
+							protocol: "completions-compatible" as const,
 							codexAccountId: "",
+							codexWebSocket: false,
+							proxy: "",
+							tlsRejectUnauthorized: true,
 						},
 					]);
 					break;
 				case "anthropic":
-					dispatchers.setAnthropicProviders((prev) => [
+					dispatchers.setCustomApiProviders((prev) => [
 						...prev,
 						{
 							id,
@@ -309,7 +297,11 @@ function SettingsProvidersPage() {
 							apiKey: "",
 							baseUrl: "",
 							defaultModel: "",
+							protocol: "anthropic-compatible" as const,
+							codexAccountId: "",
+							codexWebSocket: false,
 							proxy: "",
+							tlsRejectUnauthorized: true,
 						},
 					]);
 					break;
@@ -470,9 +462,8 @@ function SettingsProvidersPage() {
 		const platformPrefixes = new Set(["kiro", "codex", "cline"]);
 
 		const getBadgeLabel = (prefix: string): string | undefined => {
-			const openaiProvider = state.openaiProviders.find((p) => p.prefix === prefix);
-			if (openaiProvider) return openaiProvider.apiMode ?? "responses";
-			if (state.anthropicProviders.some((p) => p.prefix === prefix)) return "anthropic";
+			const customApiProvider = state.customApiProviders.find((p) => p.prefix === prefix);
+			if (customApiProvider) return t(CUSTOM_API_PROTOCOL_LABEL_KEYS[customApiProvider.protocol]);
 			if (state.nkpProviders.some((p) => p.prefix === prefix)) return "nkp";
 			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
 			return undefined;
@@ -506,8 +497,7 @@ function SettingsProvidersPage() {
 		// Ensure platform providers always present
 		for (const p of platformPrefixes) ensureEmpty(p);
 		// Ensure multi-instance providers always present (even disabled)
-		for (const p of state.openaiProviders) ensureEmpty(p.prefix);
-		for (const p of state.anthropicProviders) ensureEmpty(p.prefix);
+		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
 		for (const p of state.nkpProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
@@ -519,8 +509,7 @@ function SettingsProvidersPage() {
 			let providerId: string | undefined;
 			if (!isPlatform) {
 				const match =
-					state.openaiProviders.find((p) => p.prefix === prefix) ??
-					state.anthropicProviders.find((p) => p.prefix === prefix) ??
+					state.customApiProviders.find((p) => p.prefix === prefix) ??
 					state.nkpProviders.find((p) => p.prefix === prefix) ??
 					state.nugProviders.find((p) => p.prefix === prefix);
 				providerId = match?.id;
@@ -545,10 +534,10 @@ function SettingsProvidersPage() {
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
-		state.openaiProviders,
-		state.anthropicProviders,
+		state.customApiProviders,
 		state.nkpProviders,
 		state.nugProviders,
+		t,
 	]);
 
 	// ── Provider label for detail panel ──
@@ -560,16 +549,14 @@ function SettingsProvidersPage() {
 		}
 		// Multi-instance providers: selectedProvider is the provider ID
 		const p =
-			state.openaiProviders.find((p) => p.id === selectedProvider) ??
-			state.anthropicProviders.find((p) => p.id === selectedProvider) ??
+			state.customApiProviders.find((p) => p.id === selectedProvider) ??
 			state.nkpProviders.find((p) => p.id === selectedProvider) ??
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
 		return "";
 	}, [
 		selectedProvider,
-		state.openaiProviders,
-		state.anthropicProviders,
+		state.customApiProviders,
 		state.nkpProviders,
 		state.nugProviders,
 		providerLabels,
@@ -594,8 +581,7 @@ function SettingsProvidersPage() {
 						anthropicModelsMap={anthropicModelsMap}
 						nkpModelsMap={nkpModelsMap}
 						nugModelsMap={nugModelsMap}
-						isOpenaiProviderDirty={isOpenaiProviderDirty}
-						isAnthropicProviderDirty={isAnthropicProviderDirty}
+						isCustomApiProviderDirty={isCustomApiProviderDirty}
 						isNkpProviderDirty={isNkpProviderDirty}
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
@@ -705,8 +691,7 @@ interface ProviderSectionContentProps {
 	anthropicModelsMap: Record<string, ModelOption[]>;
 	nkpModelsMap: Record<string, ModelOption[]>;
 	nugModelsMap: Record<string, ModelOption[]>;
-	isOpenaiProviderDirty: (id: string) => boolean;
-	isAnthropicProviderDirty: (id: string) => boolean;
+	isCustomApiProviderDirty: (id: string) => boolean;
 	isNkpProviderDirty: (id: string) => boolean;
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
@@ -723,8 +708,7 @@ function ProviderSectionContent({
 	anthropicModelsMap,
 	nkpModelsMap,
 	nugModelsMap,
-	isOpenaiProviderDirty,
-	isAnthropicProviderDirty,
+	isCustomApiProviderDirty,
 	isNkpProviderDirty,
 	isNugProviderDirty,
 	getPrefixError,
@@ -776,39 +760,20 @@ function ProviderSectionContent({
 	}
 
 	// Multi-instance providers: matched by ID (immutable, survives prefix edits)
-	const openaiMatch = state.openaiProviders.find((p) => p.id === providerKey);
-	if (openaiMatch) {
+	const customApiMatch = state.customApiProviders.find((p) => p.id === providerKey);
+	if (customApiMatch) {
 		return (
-			<OpenAIProvidersSection
-				providers={[openaiMatch]}
-				onProvidersChange={dispatchers.setOpenaiProviders}
-				providerModelsMap={providerModelsMap}
+			<CustomApiProviderSection
+				provider={customApiMatch}
+				onProvidersChange={dispatchers.setCustomApiProviders}
+				openAIProviderModelsMap={providerModelsMap}
+				anthropicProviderModelsMap={anthropicModelsMap}
 				hiddenModels={state.hiddenModels}
 				onToggleHidden={dispatchers.toggleHidden}
 				onBatchToggleHidden={dispatchers.batchToggleHidden}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
-				isProviderDirty={isOpenaiProviderDirty}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				getPrefixError={getPrefixError}
-				onTestModel={onTestModel}
-			/>
-		);
-	}
-	const anthropicMatch = state.anthropicProviders.find((p) => p.id === providerKey);
-	if (anthropicMatch) {
-		return (
-			<AnthropicProvidersSection
-				providers={[anthropicMatch]}
-				onProvidersChange={dispatchers.setAnthropicProviders}
-				providerModelsMap={anthropicModelsMap}
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				onBatchToggleHidden={dispatchers.batchToggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				isProviderDirty={isAnthropicProviderDirty}
+				isProviderDirty={isCustomApiProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}
