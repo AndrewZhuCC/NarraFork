@@ -1,4 +1,5 @@
 import type { PendingPermission } from "@frontend/types/narrator";
+import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { BufferMessageSummary, NarratorGoal, SideCarRecord, TreeMessage } from "../lib/api";
 import {
@@ -255,6 +256,24 @@ interface NarratorWSCallbacks {
 	onBrowserSessionCount?: (count: number) => void;
 }
 
+function getDeepestMessageId(message: TreeMessage | undefined): string | undefined {
+	if (!message?.id) return undefined;
+	let deepest = message;
+	while (deepest.children?.length) {
+		deepest = deepest.children[deepest.children.length - 1];
+	}
+	return deepest.id;
+}
+
+function getLastCatchUpMessageId(
+	topLevel: TreeMessage[],
+	orphanChildren: TreeMessage[],
+): string | undefined {
+	const lastTopLevelId = getDeepestMessageId(topLevel[topLevel.length - 1]);
+	if (lastTopLevelId) return lastTopLevelId;
+	return orphanChildren[orphanChildren.length - 1]?.id;
+}
+
 export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
@@ -262,14 +281,17 @@ export function useNarratorWS(
 ) {
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
+	const providedLastMessageIdRef = useRef(lastMessageId);
 	const lastMessageIdRef = useRef(lastMessageId);
 	useEffect(() => {
+		providedLastMessageIdRef.current = lastMessageId;
 		if (lastMessageId !== undefined) {
 			lastMessageIdRef.current = lastMessageId;
+			if (narratorId) narratorWSManager.updateLastMessageId(narratorId, lastMessageId);
 		} else {
 			lastMessageIdRef.current = undefined;
 		}
-	}, [lastMessageId]);
+	}, [lastMessageId, narratorId]);
 
 	const [connected, setConnected] = useState(narratorWSManager.connected);
 	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
@@ -303,9 +325,9 @@ export function useNarratorWS(
 							data as { message?: TreeMessage; [key: string]: unknown },
 						);
 						if ((data.message as TreeMessage | undefined)?.id) {
-							const msgId = (data.message as TreeMessage).id;
-							lastMessageIdRef.current = msgId;
-							narratorWSManager.updateLastMessageId(subscribedId, msgId);
+							const msg = data.message as TreeMessage;
+							lastMessageIdRef.current = msg.id;
+							narratorWSManager.noteMessage(subscribedId, msg);
 							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
@@ -314,9 +336,9 @@ export function useNarratorWS(
 							data as { message?: TreeMessage; [key: string]: unknown },
 						);
 						if ((data.message as TreeMessage | undefined)?.id) {
-							const msgId = (data.message as TreeMessage).id;
-							lastMessageIdRef.current = msgId;
-							narratorWSManager.updateLastMessageId(subscribedId, msgId);
+							const msg = data.message as TreeMessage;
+							lastMessageIdRef.current = msg.id;
+							narratorWSManager.noteMessage(subscribedId, msg);
 							narratorWSManager.bumpMessageVersion(subscribedId);
 						}
 						break;
@@ -433,6 +455,7 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 							data.sideCars as SideCarRecord[] | undefined,
 						);
+						narratorWSManager.bumpMessageVersion(subscribedId);
 						break;
 					case "sidecars":
 						callbacksRef.current.onSideCars?.(
@@ -653,10 +676,12 @@ export function useNarratorWS(
 						const topLevel = (data.topLevel ?? []) as TreeMessage[];
 						const orphanChildren = (data.orphanChildren ?? []) as TreeMessage[];
 						callbacksRef.current.onCatchUp?.(orphanChildren, topLevel);
-						if (topLevel.length > 0) {
-							const lastId = topLevel[topLevel.length - 1].id;
+						const cursor = data.cursor as CatchUpCursor | undefined;
+						if (cursor) narratorWSManager.updateCatchUpCursor(subscribedId, cursor);
+						const lastId = getLastCatchUpMessageId(topLevel, orphanChildren);
+						if (lastId) {
 							lastMessageIdRef.current = lastId;
-							narratorWSManager.updateLastMessageId(subscribedId, lastId);
+							if (!cursor) narratorWSManager.updateLastMessageId(subscribedId, lastId);
 						}
 						// Track messageVersion from catch_up response
 						if (typeof data.messageVersion === "number") {
@@ -664,9 +689,16 @@ export function useNarratorWS(
 						}
 						break;
 					}
-					case "full_reload":
+					case "full_reload": {
+						narratorWSManager.clearCatchUpState(subscribedId);
+						const providedLastMessageId = providedLastMessageIdRef.current;
+						lastMessageIdRef.current = providedLastMessageId;
+						if (providedLastMessageId) {
+							narratorWSManager.updateLastMessageId(subscribedId, providedLastMessageId);
+						}
 						callbacksRef.current.onFullReload?.();
 						break;
+					}
 					case "sync_ok":
 						// Server confirmed we're in sync — update tracked version
 						if (typeof data.version === "number") {
@@ -734,6 +766,7 @@ export function useNarratorWS(
 							data.output as string,
 							data.hasError as boolean,
 						);
+						narratorWSManager.bumpMessageVersion(subscribedId);
 						break;
 					case "background_task_completed":
 						callbacksRef.current.onBackgroundTaskCompleted?.(
