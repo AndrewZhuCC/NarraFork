@@ -4944,7 +4944,10 @@ export function NarratorPanel({
 				return;
 			}
 			const fallbackOffScreen = getFallbackOffScreen();
-			if (!fallbackOffScreen) return;
+			if (!fallbackOffScreen) {
+				clearOverlay();
+				return;
+			}
 			showOverlay(scrollEl, fallbackOffScreen, false, fallbackPreviewText);
 		};
 		const scheduleCheck = () => {
@@ -4971,6 +4974,7 @@ export function NarratorPanel({
 			scrollEl.removeEventListener("scroll", scheduleCheck);
 			window.removeEventListener("resize", scheduleCheck);
 			mutationObserver.disconnect();
+			clearOverlay();
 		};
 	}, [
 		activeMessageRenderWindow,
