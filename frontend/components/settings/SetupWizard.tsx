@@ -32,6 +32,8 @@ import { PathInput } from "../common/PathInput";
 import { DependencyStatus } from "./DependencyStatus";
 
 const TOTAL_STEPS = 6;
+const SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS = 60_000;
+const MODEL_SELECT_OPTION_LIMIT = 100;
 
 // Inject pulse keyframes once
 if (typeof document !== "undefined" && !document.getElementById("wizard-fab-style")) {
@@ -82,6 +84,7 @@ export function SetupWizard({
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	const providerCount =
@@ -359,6 +362,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const { groupedModels, visibleModels } = useAllModels();
 
@@ -425,6 +429,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 				placeholder={t("wizardSelectModel")}
 				data={groupedModels}
 				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={defaultModel}
 				onChange={(v) => {
 					const val = v ?? "";
@@ -444,6 +449,7 @@ function BasicSettingsStep({ onValidChange }: { onValidChange: (valid: boolean) 
 				placeholder={t("wizardSelectModel")}
 				data={groupedModels}
 				searchable
+				limit={MODEL_SELECT_OPTION_LIMIT}
 				value={summaryModel}
 				onChange={(v) => {
 					const val = v ?? "";
@@ -472,6 +478,7 @@ function NetworkStep() {
 	const { data: settings } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
+		gcTime: SETUP_WIZARD_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
 	const currentHost = settings?.server?.host ?? "localhost";

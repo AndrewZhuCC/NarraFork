@@ -397,6 +397,8 @@ export interface NarraForkSettings {
 			standard: { pruneStart: number; compactStart: number };
 			large: { pruneStart: number; compactStart: number };
 		};
+		/** Number of recent user/assistant turns kept after automatic history compact. */
+		autoCompactKeepPairs?: number;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

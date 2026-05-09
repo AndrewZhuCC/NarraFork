@@ -31,6 +31,8 @@ import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
 import { classifyKiroTier, type KiroAccountTier, TIER_CONFIG } from "./types";
 
+const KIRO_STATUS_GC_TIME_MS = 60_000;
+
 /** Format a number to exactly 2 decimal places. */
 function fmtNum(n: number): string {
 	return n.toFixed(2);
@@ -72,6 +74,7 @@ export const KiroSection = React.memo(function KiroSection({
 		queryKey: ["kiro", "status"],
 		queryFn: api.kiroStatus,
 		refetchInterval: 30_000,
+		gcTime: KIRO_STATUS_GC_TIME_MS,
 	});
 
 	const snapshot = kiroStatus?.snapshot;

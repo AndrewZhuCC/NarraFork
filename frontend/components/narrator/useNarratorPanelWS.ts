@@ -57,6 +57,8 @@ export interface RetryInfo {
 	retryAt: number;
 }
 
+const MAX_BG_RETRY_DISMISSED_IDS = 128;
+
 function isPageVisible(): boolean {
 	return typeof document === "undefined" || document.visibilityState === "visible";
 }
@@ -171,6 +173,13 @@ export interface UseNarratorPanelWSOptions {
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
 	 *  substatus survives page navigation (the WS-only path starts from []). */
 	narratorSubstatus?: string[];
+	onDraftChanged?: (draft: {
+		hasDraft: boolean;
+		text: string;
+		updatedAt: string | null;
+		updatedBy: string | null;
+		sourceId: string | null;
+	}) => void;
 }
 
 export interface UseNarratorPanelWSReturn {
@@ -232,9 +241,12 @@ export interface UseNarratorPanelWSReturn {
 
 /** Max messages to keep in cache while the user is at the bottom. */
 const MAX_LIVE_MESSAGES = 200;
+const STREAMING_TEXT_PREVIEW_MAX_CHARS = 120_000;
 const STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS = 16_000;
+const STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS = 16_000;
 const STREAMING_TOOL_OUTPUT_THROTTLE_MIN_CHARS = 12_000;
 const STREAMING_TOOL_OUTPUT_THROTTLE_MS = 250;
+const CACHE_UPDATE_FALLBACK_MS = 250;
 
 interface ToolOutputPreviewState {
 	preview: string;
@@ -243,9 +255,20 @@ interface ToolOutputPreviewState {
 	timer: ReturnType<typeof setTimeout> | null;
 }
 
+function appendStreamingTextPreview(current: string, delta: string): string {
+	const next = current + delta;
+	if (next.length <= STREAMING_TEXT_PREVIEW_MAX_CHARS) return next;
+	return next.slice(-STREAMING_TEXT_PREVIEW_MAX_CHARS);
+}
+
 function getToolOutputPreview(output: string): string {
 	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
 	return output.slice(-STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS);
+}
+
+function getStreamingFieldPreview(value: string): string {
+	if (value.length <= STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS) return value;
+	return value.slice(-STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS);
 }
 
 // --- Reducer for co-updated state ---
@@ -357,6 +380,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		initialNkpQuotaBalance,
 		nkpProviderId,
 		narratorSubstatus,
+		onDraftChanged,
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
@@ -427,6 +451,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			if (streamingRafRef.current) cancelAnimationFrame(streamingRafRef.current);
 			if (toolChunkRafRef.current) cancelAnimationFrame(toolChunkRafRef.current);
 			if (cacheUpdateRafRef.current) cancelAnimationFrame(cacheUpdateRafRef.current);
+			if (cacheUpdateTimeoutRef.current) clearTimeout(cacheUpdateTimeoutRef.current);
 			streamingBlocksRef.current = [];
 			pendingToolChunkRef.current.clear();
 			toolStreamingFieldRef.current.clear();
@@ -496,11 +521,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	) => MessagesQueryData | undefined | { pages: unknown[]; pageParams?: unknown[] };
 	const pendingCacheUpdatesRef = useRef<CacheUpdater[]>([]);
 	const cacheUpdateRafRef = useRef(0);
+	const cacheUpdateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	// Flush all pending cache updaters synchronously in a single setQueryData call.
 	const flushCacheUpdatesSync = useCallback(() => {
 		if (cacheUpdateRafRef.current) {
 			cancelAnimationFrame(cacheUpdateRafRef.current);
 			cacheUpdateRafRef.current = 0;
+		}
+		if (cacheUpdateTimeoutRef.current) {
+			clearTimeout(cacheUpdateTimeoutRef.current);
+			cacheUpdateTimeoutRef.current = null;
 		}
 		const fns = pendingCacheUpdatesRef.current;
 		if (fns.length === 0) return;
@@ -517,26 +547,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const scheduleCacheUpdate = useCallback(
 		(fn: CacheUpdater) => {
 			pendingCacheUpdatesRef.current.push(fn);
-			if (!cacheUpdateRafRef.current) {
+			if (pageVisible && !cacheUpdateRafRef.current) {
 				cacheUpdateRafRef.current = requestAnimationFrame(() => {
 					cacheUpdateRafRef.current = 0;
-					const fns = pendingCacheUpdatesRef.current;
-					if (fns.length === 0) return;
-					pendingCacheUpdatesRef.current = [];
-					qc.setQueryData(messagesQueryKey, (old: MessagesQueryData | undefined) => {
-						let result:
-							| MessagesQueryData
-							| undefined
-							| { pages: unknown[]; pageParams?: unknown[] } = old;
-						for (const updater of fns) {
-							result = updater(result as MessagesQueryData | undefined);
-						}
-						return result;
-					});
+					flushCacheUpdatesSync();
 				});
 			}
+			if (!cacheUpdateTimeoutRef.current) {
+				cacheUpdateTimeoutRef.current = setTimeout(() => {
+					cacheUpdateTimeoutRef.current = null;
+					flushCacheUpdatesSync();
+				}, CACHE_UPDATE_FALLBACK_MS);
+			}
 		},
-		[qc, messagesQueryKey],
+		[flushCacheUpdatesSync, pageVisible],
 	);
 
 	const flushToolOutputPreview = useCallback(
@@ -998,7 +1022,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	const handleBgAgentRetry = useCallback(
 		(toolUseId: string) => {
-			setBgRetryDismissedIds((prev) => new Set(prev).add(toolUseId));
+			setBgRetryDismissedIds((prev) => {
+				const next = new Set(prev);
+				next.delete(toolUseId);
+				next.add(toolUseId);
+				while (next.size > MAX_BG_RETRY_DISMISSED_IDS) {
+					const oldest = next.values().next().value;
+					if (oldest === undefined) break;
+					next.delete(oldest);
+				}
+				return next;
+			});
 			sendBufferMessageRef.current?.(narratorId, t("bgAgentRetryPrompt"));
 			interruptMutation.mutate(narratorId);
 		},
@@ -1126,15 +1160,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 							: -1;
 					if (existingIdx !== -1) {
 						const existing = blocks[existingIdx];
-						if (existing.type === "text") existing.text += ev.delta.text;
+						if (existing.type === "text") {
+							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
+						}
 					} else {
 						const lastBlock = blocks[blocks.length - 1];
 						if (lastBlock?.type === "text" && outputIndex == null) {
-							lastBlock.text += ev.delta.text;
+							lastBlock.text = appendStreamingTextPreview(lastBlock.text, ev.delta.text);
 						} else {
 							blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
 								type: "text",
-								text: ev.delta.text,
+								text: appendStreamingTextPreview("", ev.delta.text),
 								...(outputIndex != null ? { outputIndex } : {}),
 							});
 						}
@@ -1160,14 +1196,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					if (existingIdx !== -1) {
 						const existing = blocks[existingIdx];
 						if (existing.type === "reasoning") {
-							existing.text += ev.delta.text;
+							existing.text = appendStreamingTextPreview(existing.text, ev.delta.text);
 							if (reasoningId) existing.id = reasoningId;
 							if (outputIndex != null) existing.outputIndex = outputIndex;
 						}
 					} else {
 						blocks.splice(findStreamingInsertIndex(blocks, outputIndex), 0, {
 							type: "reasoning",
-							text: ev.delta.text,
+							text: appendStreamingTextPreview("", ev.delta.text),
 							...(reasoningId ? { id: reasoningId } : {}),
 							...(outputIndex != null ? { outputIndex } : {}),
 						});
@@ -1180,12 +1216,20 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				let needsStreamingVersionBump = false;
 				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
 				const compactBlock = blocks.find(
-					(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
+					(b: ContentBlock) =>
+						(b.type === "compact" && b.subtype !== "plan") || b.type === "segment_compact",
 				);
 				if (compactBlock) {
 					const patch: Partial<StatusState> = {};
 					if (compactBlock.status === "compacted" && wsData.message?.contextPercent != null) {
 						patch.contextPercent = wsData.message.contextPercent as number;
+					}
+					const tu = wsData.message?.turnUsageJson as Record<string, unknown> | null | undefined;
+					if (compactBlock.status === "compacted" && tu) {
+						const restoredPromptTokens = promptTokensFromTurnUsage(tu);
+						if (restoredPromptTokens != null) patch.promptTokens = restoredPromptTokens;
+						if (tu.context_window != null) patch.contextWindow = tu.context_window as number;
+						patch.isEstimated = !!tu.is_estimated;
 					}
 					if (Object.keys(patch).length > 0) {
 						dispatchStatus({ type: "patch", payload: patch });
@@ -1718,11 +1762,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				if (streamingField) {
 					const prev = toolStreamingFieldRef.current.get(toolUseId);
 					if (prev && prev.name === streamingField.name) {
-						prev.value += streamingField.delta;
+						prev.value = getStreamingFieldPreview(prev.value + streamingField.delta);
 					} else {
 						toolStreamingFieldRef.current.set(toolUseId, {
 							name: streamingField.name,
-							value: streamingField.delta,
+							value: getStreamingFieldPreview(streamingField.delta),
 						});
 					}
 				}
@@ -2144,9 +2188,17 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				);
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId, "custom-traits"] });
 			},
+			onDraftChanged: (draft) => {
+				onDraftChanged?.(draft);
+			},
 			onRelaxedPlanChanged: (relaxedPlan) => {
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, relaxedPlan } : old,
+				);
+			},
+			onReflectionOverridesChanged: (overrides) => {
+				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
+					old ? { ...old, ...overrides } : old,
 				);
 			},
 			onContextUsage: (percentage, pTokens, ctxWindow, isEst, pruneStart, compactStart) => {
