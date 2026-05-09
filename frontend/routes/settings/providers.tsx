@@ -16,7 +16,10 @@ import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
-import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
+import {
+	type AddProviderType,
+	ProviderOverviewView,
+} from "../../components/providers/ProviderOverviewView";
 import {
 	createSnapshot,
 	initialProvidersState,
@@ -263,7 +266,7 @@ function SettingsProvidersPage() {
 
 	// ── Add provider ──
 	const handleAddProvider = useCallback(
-		(type: "nkp" | "openai" | "anthropic" | "nug") => {
+		(type: AddProviderType) => {
 			const id = Math.random().toString(36).slice(2, 10);
 			switch (type) {
 				case "nkp":
@@ -272,53 +275,43 @@ function SettingsProvidersPage() {
 						{ id, name: "NKP", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
 					]);
 					break;
-				case "openai":
-					dispatchers.setCustomApiProviders((prev) => [
-						...prev,
-						{
-							id,
-							name: "",
-							prefix: "",
-							apiKey: "",
-							baseUrl: "",
-							defaultModel: "",
-							protocol: "completions-compatible" as const,
-							codexAccountId: "",
-							codexWebSocket: false,
-							proxy: "",
-							tlsRejectUnauthorized: true,
-						},
-					]);
-					break;
-				case "anthropic":
-					dispatchers.setCustomApiProviders((prev) => [
-						...prev,
-						{
-							id,
-							name: "Anthropic",
-							prefix: "",
-							apiKey: "",
-							baseUrl: "",
-							defaultModel: "",
-							protocol: "anthropic-compatible" as const,
-							codexAccountId: "",
-							codexWebSocket: false,
-							proxy: "",
-							tlsRejectUnauthorized: true,
-						},
-					]);
-					break;
 				case "nug":
 					dispatchers.setNugProviders((prev) => [
 						...prev,
 						{ id, name: "NUG", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
 					]);
 					break;
+				default: {
+					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nkp" | "nug">, string> = {
+						"anthropic-compatible": t("addProviderAnthropicCompatible"),
+						"anthropic-official": t("addProviderClaudeCode"),
+						"codex-native": t("addProviderCodex"),
+						"responses-compatible": t("addProviderResponses"),
+						"completions-compatible": t("addProviderCompletions"),
+					};
+					dispatchers.setCustomApiProviders((prev) => [
+						...prev,
+						{
+							id,
+							name: defaultNameByProtocol[type],
+							prefix: "",
+							apiKey: "",
+							baseUrl: "",
+							defaultModel: "",
+							protocol: type,
+							codexAccountId: "",
+							codexWebSocket: false,
+							proxy: "",
+							tlsRejectUnauthorized: true,
+						},
+					]);
+					break;
+				}
 			}
 			// Route to new provider by its immutable ID
 			setSelectedProvider(id);
 		},
-		[dispatchers],
+		[dispatchers, t],
 	);
 
 	// ── Server-side context window merge (e.g. after Cline model add) ──
@@ -556,7 +549,7 @@ function SettingsProvidersPage() {
 			state.nkpProviders.find((p) => p.id === selectedProvider) ??
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
-		return "";
+		return p?.name ?? "";
 	}, [
 		selectedProvider,
 		state.customApiProviders,
