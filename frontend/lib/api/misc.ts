@@ -13,6 +13,7 @@ import type {
 	DatabaseCleanupExecutionResult,
 	DatabaseCleanupPreviewResult,
 	DatabaseCleanupTarget,
+	DatabaseVacuumResult,
 	HookApiRecord,
 	LearningDoc,
 	LearningIndexResponse,
@@ -862,6 +863,10 @@ export const miscApi = {
 		request<DatabaseCleanupExecutionResult>("/storage/database/cleanup", {
 			method: "POST",
 			body: JSON.stringify(data),
+		}),
+	vacuumDatabase: () =>
+		request<DatabaseVacuumResult>("/storage/database/vacuum", {
+			method: "POST",
 		}),
 
 	// Runtime Resources
