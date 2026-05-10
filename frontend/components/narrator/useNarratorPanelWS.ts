@@ -318,8 +318,14 @@ function withoutQueueMessageSubstatus(substatus: string[]): string[] {
 	return substatus.filter((s) => !s.startsWith("queue_message:"));
 }
 
+function hasActiveCompactSubstatus(substatus: string[]): boolean {
+	return substatus.includes("compacting") || substatus.includes("background_compacting");
+}
+
 function withoutCompactingSubstatus(substatus: unknown): string[] {
-	return Array.isArray(substatus) ? substatus.filter((s) => s !== "compacting") : [];
+	return Array.isArray(substatus)
+		? substatus.filter((s) => s !== "compacting" && s !== "background_compacting")
+		: [];
 }
 
 function withQueueSubstatus(
@@ -2107,7 +2113,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					patch.substatus = [];
 				}
 				if (patch.substatus !== undefined) {
-					suppressMessageDerivedCompactingRef.current = !patch.substatus.includes("compacting");
+					suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(patch.substatus);
 				}
 				dispatchStatus({ type: "patch", payload: patch });
 				if (isNotWorking) {
@@ -2144,7 +2150,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 			},
 			onSubstatusChange: (newSubstatus) => {
-				suppressMessageDerivedCompactingRef.current = !newSubstatus.includes("compacting");
+				suppressMessageDerivedCompactingRef.current = !hasActiveCompactSubstatus(newSubstatus);
 				dispatchStatus({ type: "patch", payload: { substatus: newSubstatus } });
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: newSubstatus } : old,
@@ -2349,7 +2355,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					return anyChanged ? { ...old, pages } : old;
 				});
 			},
-			onCompactDone: (contextPercentAfter?: number, isSegment?: boolean) => {
+			onCompactDone: (
+				contextPercentAfter?: number,
+				isSegment?: boolean,
+				mode?: "blocking" | "background",
+			) => {
+				const isBackgroundCompact = mode === "background";
 				suppressMessageDerivedCompactingRef.current = true;
 				const nextSubstatus = withoutCompactingSubstatus(statusState.substatus);
 				dispatchStatus({
@@ -2363,8 +2374,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
 					old ? { ...old, substatus: withoutCompactingSubstatus(old.substatus) } : old,
 				);
-				cancelPendingToolChunks(true, true);
-				removeStreamingChunksMsg(qc, messagesQueryKey);
+				if (!isBackgroundCompact) {
+					cancelPendingToolChunks(true, true);
+					removeStreamingChunksMsg(qc, messagesQueryKey);
+				}
 				qc.invalidateQueries({ queryKey: ["narrators", narratorId] });
 				qc.invalidateQueries({ queryKey: messagesQueryKey });
 				if (contextPercentAfter != null) {
@@ -2858,9 +2871,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			(b: ContentBlock) => b.type === "compact" && b.subtype !== "plan",
 		);
 		if (compactBlock && compactBlock.status === "compacting") {
+			const compactSubstatus =
+				compactBlock.mode === "background" ? "background_compacting" : "compacting";
 			dispatchStatus({
 				type: "patch",
-				payload: { substatus: ["compacting"] },
+				payload: { substatus: [compactSubstatus] },
 			});
 		}
 	}, [messagesData]);
