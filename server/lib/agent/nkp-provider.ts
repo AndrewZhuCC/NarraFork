@@ -15,6 +15,7 @@ import {
 	buildKiroHistory,
 	buildKiroRequest,
 	extractImageFileName,
+	normalizeKiroChatRequest,
 	parseSSEStream,
 } from "./kiro-protocol";
 import type {
@@ -106,7 +107,7 @@ export class NkpProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
-		const request = buildKiroRequest(params);
+		const request = normalizeKiroChatRequest(buildKiroRequest(params));
 		const baseUrl = this.config.baseUrl.replace(/\/+$/, "");
 
 		prepareNkpRequest(request);

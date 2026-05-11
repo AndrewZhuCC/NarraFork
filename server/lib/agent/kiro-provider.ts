@@ -11,6 +11,7 @@ import {
 	buildKiroHistory,
 	buildKiroRequest,
 	extractImageFileName,
+	normalizeKiroChatRequest,
 	parseKiroStreamEvent,
 } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
@@ -81,7 +82,7 @@ export class KiroProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const { kiroChatRaw } = await import("../kiro-adapter");
-		const request = buildKiroRequest(params) as import("../kiro-adapter").KiroChatRequest;
+		const request = normalizeKiroChatRequest(buildKiroRequest(params));
 		params.requestDump?.setRequest({
 			transport: "kiro-plugin",
 			body: request,

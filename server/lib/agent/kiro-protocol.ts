@@ -90,6 +90,290 @@ export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	};
 }
 
+type KiroRequestMessage = KiroHistoryMessage;
+type KiroRequestMessageWithMarker = {
+	message: KiroRequestMessage;
+	isCurrent: boolean;
+};
+
+function isKiroUserMessage(message: KiroRequestMessage): message is KiroHistoryUserMessage {
+	return "userInputMessage" in message;
+}
+
+function isKiroAssistantMessage(
+	message: KiroRequestMessage,
+): message is KiroHistoryAssistantMessage {
+	return "assistantResponseMessage" in message;
+}
+
+function cloneToolResult(result: KiroToolResult): KiroToolResult {
+	return {
+		...result,
+		content: result.content.map((block) => ({ ...block })),
+	};
+}
+
+function cloneUserMessage(message: KiroHistoryUserMessage): KiroHistoryUserMessage {
+	const user = message.userInputMessage;
+	const ctx = user.userInputMessageContext;
+	return {
+		userInputMessage: {
+			...user,
+			...(user.images ? { images: user.images.map((image) => ({ ...image })) } : {}),
+			userInputMessageContext: ctx
+				? {
+						...ctx,
+						...(ctx.tools ? { tools: ctx.tools.map((tool) => ({ ...tool })) } : {}),
+						...(ctx.toolResults
+							? { toolResults: ctx.toolResults.map((result) => cloneToolResult(result)) }
+							: {}),
+					}
+				: {},
+		},
+	};
+}
+
+function cloneAssistantMessage(message: KiroHistoryAssistantMessage): KiroHistoryAssistantMessage {
+	const assistant = message.assistantResponseMessage;
+	return {
+		assistantResponseMessage: {
+			...assistant,
+			...(assistant.toolUses
+				? {
+						toolUses: assistant.toolUses.map((toolUse) => ({
+							...toolUse,
+							input: { ...toolUse.input },
+						})),
+					}
+				: {}),
+		},
+	};
+}
+
+function isEmptyAssistant(message: KiroHistoryAssistantMessage): boolean {
+	const assistant = message.assistantResponseMessage;
+	return !assistant.content?.trim() && (assistant.toolUses?.length ?? 0) === 0;
+}
+
+function hasUserPayload(message: KiroHistoryUserMessage): boolean {
+	const user = message.userInputMessage;
+	const ctx = user.userInputMessageContext;
+	return Boolean(
+		user.content.trim() ||
+			(user.images?.length ?? 0) > 0 ||
+			(ctx?.tools?.length ?? 0) > 0 ||
+			(ctx?.toolResults?.length ?? 0) > 0,
+	);
+}
+
+function createSyntheticUser(modelId: string): KiroHistoryUserMessage {
+	return {
+		userInputMessage: {
+			content: "",
+			modelId,
+			origin: "AI_EDITOR",
+			userInputMessageContext: {},
+		},
+	};
+}
+
+function createSyntheticAssistantAck(): KiroHistoryAssistantMessage {
+	return { assistantResponseMessage: { content: "OK" } };
+}
+
+function mergeUserMessages(target: KiroHistoryUserMessage, source: KiroHistoryUserMessage): void {
+	const targetUser = target.userInputMessage;
+	const sourceUser = source.userInputMessage;
+	const sourceContent = sourceUser.content ?? "";
+	if (sourceContent) {
+		targetUser.content = targetUser.content
+			? `${targetUser.content}\n${sourceContent}`
+			: sourceContent;
+	}
+	if (sourceUser.images?.length) {
+		targetUser.images = [...(targetUser.images ?? []), ...sourceUser.images];
+	}
+
+	const targetCtx = targetUser.userInputMessageContext ?? {};
+	const sourceCtx = sourceUser.userInputMessageContext ?? {};
+	const mergedToolResults = [...(targetCtx.toolResults ?? []), ...(sourceCtx.toolResults ?? [])];
+	targetUser.userInputMessageContext = {
+		...targetCtx,
+		...sourceCtx,
+		...(sourceCtx.tools ? { tools: sourceCtx.tools } : {}),
+		...(mergedToolResults.length > 0 ? { toolResults: mergedToolResults } : {}),
+	};
+}
+
+function mergeAssistantMessages(
+	target: KiroHistoryAssistantMessage,
+	source: KiroHistoryAssistantMessage,
+): void {
+	const targetAssistant = target.assistantResponseMessage;
+	const sourceAssistant = source.assistantResponseMessage;
+	const sourceContent = sourceAssistant.content ?? "";
+	if (sourceContent) {
+		targetAssistant.content = targetAssistant.content
+			? `${targetAssistant.content}\n${sourceContent}`
+			: sourceContent;
+	}
+	if (sourceAssistant.toolUses?.length) {
+		targetAssistant.toolUses = [...(targetAssistant.toolUses ?? []), ...sourceAssistant.toolUses];
+	}
+}
+
+function cleanupUserContext(message: KiroHistoryUserMessage): void {
+	const user = message.userInputMessage;
+	const ctx = user.userInputMessageContext;
+	if (!ctx) {
+		user.userInputMessageContext = {};
+		return;
+	}
+	if (ctx.toolResults?.length === 0) delete ctx.toolResults;
+	user.userInputMessageContext = ctx;
+}
+
+function compactKiroMessages(
+	messages: KiroRequestMessageWithMarker[],
+	modelId: string,
+): KiroRequestMessageWithMarker[] {
+	const compacted: KiroRequestMessageWithMarker[] = [];
+	for (const entry of messages) {
+		const msg = entry.message;
+		if (isKiroAssistantMessage(msg) && isEmptyAssistant(msg)) continue;
+		if (isKiroUserMessage(msg) && !entry.isCurrent && !hasUserPayload(msg)) continue;
+
+		const prev = compacted[compacted.length - 1];
+		if (isKiroUserMessage(msg)) {
+			cleanupUserContext(msg);
+			if (prev && isKiroUserMessage(prev.message)) {
+				if (entry.isCurrent) {
+					compacted.push({ message: createSyntheticAssistantAck(), isCurrent: false });
+					compacted.push(entry);
+				} else {
+					mergeUserMessages(prev.message, msg);
+					prev.isCurrent = prev.isCurrent || entry.isCurrent;
+				}
+				continue;
+			}
+			compacted.push(entry);
+			continue;
+		}
+
+		if (prev && isKiroAssistantMessage(prev.message)) {
+			mergeAssistantMessages(prev.message, msg);
+			continue;
+		}
+		if (!prev) {
+			compacted.push({ message: createSyntheticUser(modelId), isCurrent: false });
+		}
+		compacted.push(entry);
+	}
+	return compacted;
+}
+
+function sanitizeKiroToolPairs(
+	messages: KiroRequestMessageWithMarker[],
+): KiroRequestMessageWithMarker[] {
+	const consumedToolUseIds = new Set<string>();
+	const keep = new Array(messages.length).fill(true) as boolean[];
+
+	for (let i = 0; i < messages.length; i++) {
+		const current = messages[i].message;
+		if (!isKiroUserMessage(current)) continue;
+
+		const user = current.userInputMessage;
+		const ctx = user.userInputMessageContext ?? {};
+		const incomingResults = ctx.toolResults ?? [];
+		const prev = i > 0 ? messages[i - 1].message : undefined;
+		const prevAssistant = prev && isKiroAssistantMessage(prev) ? prev : undefined;
+		const expectedToolUses = prevAssistant?.assistantResponseMessage.toolUses ?? [];
+		const expectedIds = new Set(
+			expectedToolUses
+				.map((toolUse) => toolUse.toolUseId)
+				.filter((toolUseId) => !consumedToolUseIds.has(toolUseId)),
+		);
+		const keptResults: KiroToolResult[] = [];
+		const matchedIds = new Set<string>();
+
+		for (const result of incomingResults) {
+			if (!expectedIds.has(result.toolUseId) || matchedIds.has(result.toolUseId)) continue;
+			keptResults.push(result);
+			matchedIds.add(result.toolUseId);
+			consumedToolUseIds.add(result.toolUseId);
+		}
+
+		if (keptResults.length > 0) {
+			ctx.toolResults = keptResults;
+		} else {
+			delete ctx.toolResults;
+		}
+		user.userInputMessageContext = ctx;
+
+		if (prevAssistant && expectedToolUses.length > 0) {
+			const filteredToolUses = expectedToolUses.filter((toolUse) =>
+				matchedIds.has(toolUse.toolUseId),
+			);
+			if (filteredToolUses.length > 0) {
+				prevAssistant.assistantResponseMessage.toolUses = filteredToolUses;
+			} else {
+				delete prevAssistant.assistantResponseMessage.toolUses;
+			}
+			if (isEmptyAssistant(prevAssistant)) keep[i - 1] = false;
+		}
+
+		if (!messages[i].isCurrent && !hasUserPayload(current)) keep[i] = false;
+	}
+
+	return messages.filter((_, index) => keep[index]);
+}
+
+/**
+ * Normalize the Kiro native request immediately before it leaves Kiro/NKP providers.
+ * This is intentionally Kiro-protocol scoped: other providers keep their own history logic.
+ *
+ * The Kiro API is strict about user/assistant alternation and requires every toolResult
+ * to immediately answer the previous assistant toolUse exactly once.  Compaction,
+ * dynamic pruning, output-limit recovery, and in-memory multi-turn replay can leave
+ * stale toolResults or empty assistant placeholders in the assembled request; sanitize
+ * those final-wire-shape issues here without touching persisted messages.
+ */
+export function normalizeKiroChatRequest(request: KiroChatRequest): KiroChatRequest {
+	const cs = request.conversationState;
+	const currentMessage = cloneUserMessage(cs.currentMessage);
+	const modelId = currentMessage.userInputMessage.modelId;
+	const initialMessages: KiroRequestMessageWithMarker[] = [
+		...(cs.history ?? []).map((message) => ({
+			message: isKiroUserMessage(message)
+				? cloneUserMessage(message)
+				: cloneAssistantMessage(message),
+			isCurrent: false,
+		})),
+		{ message: currentMessage, isCurrent: true },
+	];
+
+	let normalized = compactKiroMessages(initialMessages, modelId);
+	normalized = sanitizeKiroToolPairs(normalized);
+	normalized = compactKiroMessages(normalized, modelId);
+	normalized = sanitizeKiroToolPairs(normalized);
+	normalized = compactKiroMessages(normalized, modelId);
+
+	const currentIndex = normalized.findIndex((entry) => entry.isCurrent);
+	const effectiveCurrentIndex = currentIndex >= 0 ? currentIndex : normalized.length - 1;
+	const beforeCurrent = normalized.slice(0, effectiveCurrentIndex);
+	const current = normalized[effectiveCurrentIndex]?.message;
+
+	if (!current || !isKiroUserMessage(current)) {
+		cs.history = beforeCurrent.map((entry) => entry.message);
+		cs.currentMessage = { userInputMessage: currentMessage.userInputMessage };
+		return request;
+	}
+
+	cs.history = beforeCurrent.length > 0 ? beforeCurrent.map((entry) => entry.message) : undefined;
+	cs.currentMessage = { userInputMessage: current.userInputMessage };
+	return request;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }

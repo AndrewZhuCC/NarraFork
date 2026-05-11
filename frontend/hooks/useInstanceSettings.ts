@@ -33,6 +33,7 @@ export interface InstanceSettingsState {
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
+	requestDumpErrorsOnly: boolean;
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	planReflectionAutoApprove: boolean;
@@ -118,6 +119,7 @@ function makeDefaults(): InstanceSettingsState {
 		freshShellEnv: false,
 		translateReasoning: false,
 		requestDumpEnabled: false,
+		requestDumpErrorsOnly: false,
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		planReflectionAutoApprove: false,
@@ -202,6 +204,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
+				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
 				dangerReflectionEnabled: settings.agent?.dangerReflectionEnabled ?? true,
@@ -289,6 +292,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
+					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					planReflectionAutoApprove: state.planReflectionAutoApprove,
