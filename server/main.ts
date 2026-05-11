@@ -30,6 +30,7 @@ import {
 import { saveSettings, settings } from "./lib/settings";
 import type { VNetRelayAuth } from "./lib/vnet/types";
 import { startVNetUdpRendezvous, stopVNetUdpRendezvous } from "./lib/vnet/udp-rendezvous";
+import { clearInheritableHandlesAfterServerBind } from "./lib/win-handle-guard";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
@@ -577,7 +578,7 @@ function startServer(listenPort: number) {
 				}
 			: undefined;
 
-	return Bun.serve({
+	const server = Bun.serve({
 		port: listenPort,
 		hostname: currentHost,
 		idleTimeout: 255,
@@ -642,6 +643,9 @@ function startServer(listenPort: number) {
 		},
 		websocket: wsHandlers,
 	});
+
+	clearInheritableHandlesAfterServerBind();
+	return server;
 }
 
 let actualPort = port;
