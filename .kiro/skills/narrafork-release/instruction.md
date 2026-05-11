@@ -105,7 +105,13 @@ go run .kiro/skills/narrafork-release/release.go -token {token} -version {versio
    ```
    如果未配置，提示用户先运行 `rclone config` 配置 WebDAV 远端（服务器地址：`https://webdav.123pan.cn/webdav`，账户使用团队私有配置或发布负责人提供的 123 网盘 WebDAV 账号），远端名称为 `nf_update`。
 
-2. 上传纯二进制文件到 `nf_update:{version}/` 子目录，排除 patch、metadata、blockmap、7z 等文件：
+2. 先显式创建远端版本目录（123 网盘 WebDAV 可能不会在 `rclone copy` 时自动创建父目录）：
+   ```bash
+   rclone mkdir nf_update:{version} -v
+   ```
+   即使目录已存在，也可以安全执行此步骤。
+
+3. 上传纯二进制文件到 `nf_update:{version}/` 子目录，排除 patch、metadata、blockmap、7z 等文件：
    ```bash
    rclone copy dist/ nf_update:{version} \
      --filter "+ narrafork-{version}-linux-arm64" \
@@ -120,9 +126,9 @@ go run .kiro/skills/narrafork-release/release.go -token {token} -version {versio
    ```
    **注意**：`--filter` 规则按顺序匹配，必须先列出要包含的文件（`+ 文件名`），最后用 `- *` 排除其余所有文件。不要混用 `--include` 和 `--exclude`，否则顺序不确定会导致错误文件被上传。
 
-3. 设置 Bash timeout 为 600000（10 分钟），上传大文件需要较长时间。
+4. 设置 Bash timeout 为 600000（10 分钟），上传大文件需要较长时间。
 
-4. 上传完成后，验证远端文件数量是否与本地构建的平台数量一致：
+5. 上传完成后，验证远端文件数量是否与本地构建的平台数量一致：
    ```bash
    rclone ls nf_update:{version}
    ```
