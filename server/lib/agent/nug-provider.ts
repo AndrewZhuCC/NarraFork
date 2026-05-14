@@ -7,19 +7,23 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { prepareNkpRequest } from "../nkp-ext";
+import { type ResolvedNugModelMeta, resolveNugModelMeta } from "../nug-model-cache";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NUGProviderConfig } from "../settings";
 import type { UsageData } from "../usage-tracking";
+import { AnthropicProvider } from "./anthropic-provider";
 import {
 	buildKiroHistory,
 	buildKiroRequest,
 	extractImageFileName,
 	parseSSEStream,
 } from "./kiro-protocol";
+import { OpenAIProvider } from "./openai-provider";
 import type {
 	ChatParams,
 	DbMessage,
 	GenerateMetaResult,
+	GenerateOptions,
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
@@ -67,48 +71,6 @@ export interface NugUsageSummary {
 	[key: string]: unknown;
 }
 
-/**
- * Resolve the NUG chat endpoint based on the model's channel prefix.
- *
- * Model ID formats:
- *   - "nug:kiro:claude-sonnet-4.5"       → /v1/kiro/chat (Kiro native protocol)
- *   - "nug:openai:gpt-4o"                → /v1/chat/completions (OpenAI format)
- *   - "nug:anthropic:claude-sonnet-4.5"   → /v1/anthropic/messages (Anthropic format)
- *   - "nug:claude-sonnet-4.5"             → /v1/chat (unified routing)
- *   - "nug:codex:gpt-5.3-codex"          → /v1/chat (unified routing)
- */
-function resolveNugEndpoint(model: string): {
-	endpoint: string;
-	channel?: string;
-	bareModel: string;
-} {
-	// Strip provider prefix (e.g. "nug:kiro:claude-sonnet-4.5" → "kiro:claude-sonnet-4.5")
-	let rest = model;
-	if (rest.startsWith("nug:")) rest = rest.slice(4);
-
-	// Check for channel prefix
-	const channelPrefixes = ["kiro", "openai", "anthropic", "codex"] as const;
-	for (const ch of channelPrefixes) {
-		if (rest.startsWith(`${ch}:`)) {
-			const bareModel = rest.slice(ch.length + 1);
-			switch (ch) {
-				case "kiro":
-					return { endpoint: "/v1/kiro/chat", channel: ch, bareModel };
-				case "openai":
-					return { endpoint: "/v1/chat/completions", channel: ch, bareModel };
-				case "anthropic":
-					return { endpoint: "/v1/anthropic/messages", channel: ch, bareModel };
-				default:
-					// codex and others go through unified routing
-					return { endpoint: "/v1/chat", channel: ch, bareModel };
-			}
-		}
-	}
-
-	// No channel prefix — use unified routing
-	return { endpoint: "/v1/chat", bareModel: rest };
-}
-
 // === NUG-specific API response types ===
 
 export interface NugChannelHealthStatus {
@@ -139,6 +101,8 @@ export interface NugQuota {
  */
 export class NugProvider implements ProviderAdapter {
 	private config: NUGProviderConfig;
+	private activeMeta: ResolvedNugModelMeta | null = null;
+	private activeDelegate: ProviderAdapter | null = null;
 
 	constructor(config: NUGProviderConfig) {
 		this.config = config;
@@ -160,9 +124,76 @@ export class NugProvider implements ProviderAdapter {
 		return h;
 	}
 
+	private resolveMeta(model: string): ResolvedNugModelMeta {
+		return resolveNugModelMeta(this.config.id, this.config.prefix, model);
+	}
+
+	private modelForDelegate(meta: ResolvedNugModelMeta): string {
+		return `${this.config.prefix}:${meta.routedModel}`;
+	}
+
+	prepareForModel(model: string): void {
+		const meta = this.resolveMeta(model);
+		this.activeMeta = meta;
+		this.activeDelegate = this.createDelegate(meta);
+	}
+
+	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter | null {
+		switch (meta.channelType) {
+			case "codex":
+				return new OpenAIProvider({
+					id: this.config.id,
+					name: this.config.name,
+					prefix: this.config.prefix,
+					apiKey: this.config.apiKey,
+					baseUrl: `${this.baseUrl}/v1`,
+					defaultModel: meta.routedModel,
+					apiMode: "codex",
+					codexWebSocket: false,
+				});
+			case "openai":
+				return new OpenAIProvider({
+					id: this.config.id,
+					name: this.config.name,
+					prefix: this.config.prefix,
+					apiKey: this.config.apiKey,
+					baseUrl: `${this.baseUrl}/v1`,
+					defaultModel: meta.routedModel,
+					apiMode: "completions",
+				});
+			case "anthropic":
+				return new AnthropicProvider({
+					id: this.config.id,
+					name: this.config.name,
+					prefix: this.config.prefix,
+					apiKey: this.config.apiKey,
+					baseUrl: `${this.baseUrl}/v1/anthropic`,
+					defaultModel: meta.routedModel,
+					officialApi: false,
+				});
+			default:
+				return null;
+		}
+	}
+
+	private ensureDelegateForModel(model: string): ProviderAdapter | null {
+		const meta = this.resolveMeta(model);
+		if (this.activeMeta?.routedModel === meta.routedModel) return this.activeDelegate;
+		this.activeMeta = meta;
+		this.activeDelegate = this.createDelegate(meta);
+		return this.activeDelegate;
+	}
+
 	// === ProviderAdapter interface ===
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
+		if (this.activeDelegate) {
+			const effectiveTools =
+				this.activeMeta?.channelType === "codex"
+					? tools.filter((tool) => tool.name !== "WebSearch")
+					: tools;
+			return this.activeDelegate.formatTools(effectiveTools);
+		}
 		return tools.map((tool) => ({
 			toolSpecification: {
 				name: tool.name,
@@ -177,7 +208,13 @@ export class NugProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildKiroHistory(dbMessages, model, narratorId);
+		const meta = this.resolveMeta(model);
+		this.activeMeta = meta;
+		this.activeDelegate = this.createDelegate(meta);
+		if (this.activeDelegate) {
+			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
+		}
+		return buildKiroHistory(dbMessages, meta.bareModel, narratorId);
 	}
 
 	injectSystemPrompt(
@@ -186,7 +223,17 @@ export class NugProvider implements ProviderAdapter {
 		model: string,
 		locale?: string,
 	): void {
-		const modelId = resolveModel(model);
+		const delegate = this.ensureDelegateForModel(model);
+		if (delegate && this.activeMeta) {
+			delegate.injectSystemPrompt(
+				history,
+				systemPrompt,
+				this.modelForDelegate(this.activeMeta),
+				locale,
+			);
+			return;
+		}
+		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
 		const h = history as KiroHistoryMessage[];
 		const ack = getToolMessage("systemPromptAck", (locale ?? "en") as Locale);
 		h.unshift(
@@ -206,86 +253,35 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
-		const { endpoint, channel, bareModel } = resolveNugEndpoint(params.model);
-
-		// For Kiro channel, use the Kiro native protocol (same as NkpProvider)
-		if (channel === "kiro" || endpoint === "/v1/kiro/chat") {
-			yield* this.chatKiro(params);
+		const meta = this.resolveMeta(params.model);
+		const delegate = this.createDelegate(meta);
+		this.activeMeta = meta;
+		this.activeDelegate = delegate;
+		if (delegate) {
+			yield* delegate.chat({ ...params, model: this.modelForDelegate(meta) });
 			return;
 		}
-
-		// For other channels, build a Kiro-native request body and add a top-level
-		// `model` field so NUG's gateway can route to the correct channel.
-		// NUG transparently forwards the entire body to the channel service.
-		const request = buildKiroRequest(params);
-		prepareNkpRequest(request);
-
-		const body = {
-			model: channel ? `${channel}:${bareModel}` : bareModel,
-			...request,
-		};
-
-		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
-		const headers = this.chatHeaders(conversationId);
-		params.requestDump?.setRequest({
-			transport: "http",
-			url: `${this.baseUrl}${endpoint}`,
-			headers: sanitizeHeaders(headers),
-			body,
-		});
-
-		const bodyText = JSON.stringify(body);
-		params.onRequestStart?.();
-		const response = await fetch(`${this.baseUrl}${endpoint}`, {
-			method: "POST",
-			headers,
-			body: bodyText,
-			signal: params.signal,
-		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw httpError(`NUG chat error ${response.status}: ${errText}`, response.status);
-		}
-
-		if (!response.body) {
-			throw new Error("NUG returned no response body");
-		}
-
-		yield* parseSSEStream(response.body);
-		if (responseTextPromise) {
-			params.requestDump?.setResponseBodyText(await responseTextPromise);
-		}
+		yield* this.chatKiro(params, meta);
 	}
 
-	private async *chatKiro(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
-		const request = buildKiroRequest(params);
+	private async *chatKiro(
+		params: ChatParams,
+		meta: ResolvedNugModelMeta,
+	): AsyncGenerator<ParsedStreamEvent> {
+		const request = buildKiroRequest({ ...params, model: meta.bareModel });
 		prepareNkpRequest(request);
 
+		const body = { model: meta.routedModel, ...request };
 		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
 		const headers = this.chatHeaders(conversationId);
 		params.requestDump?.setRequest({
 			transport: "http",
 			url: `${this.baseUrl}/v1/kiro/chat`,
 			headers: sanitizeHeaders(headers),
-			body: request,
+			body,
 		});
 
-		const bodyText = JSON.stringify(request);
+		const bodyText = JSON.stringify(body);
 		params.onRequestStart?.();
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
@@ -329,6 +325,9 @@ export class NugProvider implements ProviderAdapter {
 		isError: boolean,
 		images?: Array<{ format: string; base64: string }>,
 	): unknown {
+		if (this.activeDelegate) {
+			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images);
+		}
 		const result: KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string } = {
 			toolUseId,
 			content: [{ text: output }],
@@ -352,7 +351,18 @@ export class NugProvider implements ProviderAdapter {
 		toolResults: unknown[],
 		images?: Array<{ format: string; base64: string }>,
 	): void {
-		const modelId = resolveModel(model);
+		const delegate = this.ensureDelegateForModel(model);
+		if (delegate && this.activeMeta) {
+			delegate.pushUserTurn(
+				history,
+				content,
+				this.modelForDelegate(this.activeMeta),
+				toolResults,
+				images,
+			);
+			return;
+		}
+		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
 		const h = history as KiroHistoryMessage[];
 		const kiroImages = images?.map((img) => ({
 			format: img.format as KiroImage["format"],
@@ -376,18 +386,42 @@ export class NugProvider implements ProviderAdapter {
 		history: unknown[],
 		text: string,
 		toolUses: AgentToolUse[],
-		_reasoningBlocks?: Array<{
+		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
 		}>,
-		_webSearches?: Array<{
+		webSearches?: Array<{
 			id: string;
 			query?: string;
 			queries?: string[];
 			outputIndex?: number;
+			action?: import("./provider").WebSearchAction;
 		}>,
-		_messageId?: string,
+		messageId?: string,
+		imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
+		textOutputIndex?: number,
+		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
 	): void {
+		if (this.activeDelegate) {
+			this.activeDelegate.pushAssistantTurn(
+				history,
+				text,
+				toolUses,
+				reasoningBlocks,
+				webSearches,
+				messageId,
+				imageGenerations,
+				textOutputIndex,
+				redactedThinkingBlocks,
+			);
+			return;
+		}
 		const h = history as KiroHistoryMessage[];
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
@@ -415,8 +449,21 @@ export class NugProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		const modelId = resolveModel(model);
+		const meta = this.resolveMeta(model);
+		const delegate = this.createDelegate(meta);
+		this.activeMeta = meta;
+		this.activeDelegate = delegate;
+		if (delegate) {
+			return delegate.generateWithMeta(
+				text,
+				this.modelForDelegate(meta),
+				systemInstruction,
+				options,
+			);
+		}
+		const modelId = meta.bareModel;
 		const request: KiroChatRequest = {
 			conversationState: {
 				conversationId: crypto.randomUUID(),
@@ -451,10 +498,11 @@ export class NugProvider implements ProviderAdapter {
 		};
 
 		prepareNkpRequest(request);
+		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: this.chatHeaders(request.conversationState.conversationId),
-			body: JSON.stringify(request),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {
@@ -490,12 +538,14 @@ export class NugProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<string> {
 		const result = await this.generateWithHistoryWithMeta(
 			systemInstruction,
 			content,
 			model,
 			locale,
+			options,
 		);
 		return result.text;
 	}
@@ -505,8 +555,33 @@ export class NugProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		const modelId = resolveModel(model);
+		const meta = this.resolveMeta(model);
+		const delegate = this.createDelegate(meta);
+		this.activeMeta = meta;
+		this.activeDelegate = delegate;
+		if (delegate?.generateWithHistoryWithMeta) {
+			return delegate.generateWithHistoryWithMeta(
+				systemInstruction,
+				content,
+				this.modelForDelegate(meta),
+				locale,
+				options,
+			);
+		}
+		if (delegate) {
+			return {
+				text: await delegate.generateWithHistory(
+					systemInstruction,
+					content,
+					this.modelForDelegate(meta),
+					locale,
+					options,
+				),
+			};
+		}
+		const modelId = meta.bareModel;
 		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
 		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
 
@@ -540,10 +615,11 @@ export class NugProvider implements ProviderAdapter {
 		};
 
 		prepareNkpRequest(request);
+		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: this.chatHeaders(request.conversationState.conversationId),
-			body: JSON.stringify(request),
+			body: JSON.stringify(body),
 		});
 
 		if (!response.ok) {

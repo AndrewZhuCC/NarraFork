@@ -173,7 +173,7 @@ export interface KiroChatRequest {
 	profileArn?: string;
 }
 
-interface KiroModule {
+export interface KiroModule {
 	initKiro(config: KiroPluginConfig): boolean;
 	isKiroAvailable(): boolean;
 	kiroChatRaw(request: KiroChatRequest, signal?: AbortSignal): AsyncGenerator<StreamEvent>;
@@ -237,6 +237,11 @@ export function initKiro(config: KiroPluginConfig): boolean {
 
 export function isKiroAvailable(): boolean {
 	return mod?.isKiroAvailable() ?? false;
+}
+
+/** Test helper: replace the optional Kiro plugin module for runtime fixture tests. */
+export function __setKiroModuleForTests(module: Partial<KiroModule> | null): void {
+	mod = module as KiroModule | null;
 }
 
 export async function* kiroChat(text: string, model?: KiroModel): AsyncGenerator<StreamEvent> {
