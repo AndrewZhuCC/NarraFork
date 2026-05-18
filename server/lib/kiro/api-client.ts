@@ -109,12 +109,19 @@ export class KiroApiClient {
 
 			const resBody = await res.text().catch(() => "");
 
-			// Suspicious activity throttle may arrive as 400 or 429. Do not retry with
-			// the same credential; cool it down and fail over.
+			// Suspicious activity throttle may arrive as 400 or 429. Prefer failover,
+			// but keep retrying the same credential when no usable alternative remains.
 			if (isSuspiciousThrottle(resBody)) {
+				concurrencyThrottle(ctx.id);
+				touchLastRequest(ctx.id);
+				recordThrottle(ctx.id);
 				releaseHeld();
-				failedCredentialIds.add(ctx.id);
-				this.tokenManager.reportSuspiciousThrottle(ctx.id);
+				const hasFailoverCredential = this.tokenManager.hasAlternativeAvailableCredential(
+					ctx.id,
+					failedCredentialIds,
+				);
+				if (hasFailoverCredential) failedCredentialIds.add(ctx.id);
+				this.tokenManager.reportSuspiciousThrottle(ctx.id, failedCredentialIds);
 				lastError = new KiroApiError("SUSPICIOUS_THROTTLE", resBody, res.status);
 				continue;
 			}

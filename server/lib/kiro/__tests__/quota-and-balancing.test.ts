@@ -207,6 +207,80 @@ describe("Kiro credential balancing", () => {
 			globalThis.fetch = originalFetch;
 		}
 	});
+
+	test("retries suspicious throttle on the last available credential", async () => {
+		const manager = createManager([makeCredential("only", { subscriptionTitle: "Free" })]);
+		const client = new KiroApiClient(manager);
+		const originalFetch = globalThis.fetch;
+		const requestedTokens: string[] = [];
+		const suspiciousBody = JSON.stringify({
+			__type: "ThrottlingException",
+			message: "Suspicious activity detected",
+		});
+		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+			requestedTokens.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""));
+			return requestedTokens.length === 1
+				? new Response(suspiciousBody, { status: 429 })
+				: new Response("", { status: 200 });
+		}) as typeof fetch;
+
+		try {
+			const response = await client.sendChatRequest({
+				conversationState: {
+					conversationId: "conv-1",
+					currentMessage: {
+						userInputMessage: { content: "hi", modelId: "claude-sonnet-4.5" },
+					},
+				},
+			});
+			response.release();
+			expect(response.credentialId).toBe("only");
+			expect(requestedTokens).toEqual(["Bearer access-only", "Bearer access-only"]);
+			expect(manager.snapshot().entries[0].disabled).toBe(false);
+			expect(manager.snapshot().entries[0].disabledReason).toBeUndefined();
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("cools down suspicious-throttled credential when failover is available", async () => {
+		const manager = createManager([
+			makeCredential("first", { subscriptionTitle: "Free", priority: 0 }),
+			makeCredential("second", { subscriptionTitle: "Free", priority: 1 }),
+		]);
+		const client = new KiroApiClient(manager);
+		const originalFetch = globalThis.fetch;
+		const requestedTokens: string[] = [];
+		const suspiciousBody = JSON.stringify({
+			__type: "ThrottlingException",
+			message: "Suspicious activity detected",
+		});
+		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+			requestedTokens.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""));
+			return requestedTokens.length === 1
+				? new Response(suspiciousBody, { status: 429 })
+				: new Response("", { status: 200 });
+		}) as typeof fetch;
+
+		try {
+			const response = await client.sendChatRequest({
+				conversationState: {
+					conversationId: "conv-1",
+					currentMessage: {
+						userInputMessage: { content: "hi", modelId: "claude-sonnet-4.5" },
+					},
+				},
+			});
+			response.release();
+			expect(response.credentialId).toBe("second");
+			expect(requestedTokens).toEqual(["Bearer access-first", "Bearer access-second"]);
+			const snapshot = manager.snapshot();
+			expect(snapshot.entries[0].disabled).toBe(true);
+			expect(snapshot.entries[0].disabledReason).toBe("suspicious_throttle");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
 });
 
 describe("Kiro credential persistence", () => {

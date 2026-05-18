@@ -1,0 +1,162 @@
+{
+	"name": "go-backend-phase3-contract-matrix",
+	"updatedAt": "2026-05-18",
+	"scope": "Narrator plan mode, compact/retry/recovery, foreground/background subagents, MCP tool discovery versus agent injection, and review tool closure.",
+	"contracts": [
+		{
+			"group": "narrator.planMode",
+			"status": "supported-baseline",
+			"features": [
+				"/api/narrators/:id/plan stores and retrieves plan state",
+				"plan-mode enter/exit persists planMode and previous permission mode traits",
+				"EnterPlanMode and ExitPlanMode tools are available through the reflection tool scope",
+				"ExitPlanMode persists an approved compact plan marker when invoked by the agent runtime"
+			],
+			"goSources": [
+				"go_backend/internal/narrators/handlers.go",
+				"go_backend/internal/narrators/service.go",
+				"go_backend/internal/agentbasic/tool_inventory.go"
+			],
+			"tests": [
+				"go_backend/internal/narrators/route_contract_test.go",
+				"go_backend/internal/narrators/handlers_compact_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go",
+				"go_backend/internal/agentbasic/tool_inventory_test.go"
+			]
+		},
+		{
+			"group": "narrator.compact",
+			"status": "supported-with-fallback-summary",
+			"features": [
+				"blocking compact creates a compact marker message and clears provider/prune state",
+				"segment compact hides selected refs behind a compact marker and exposes summary/messages routes",
+				"context clear uses the same compact marker contract",
+				"when no caller summary is provided, Go backend builds a deterministic fallback summary instead of invoking a model"
+			],
+			"fallbacks": [
+				{
+					"mode": "fallback-summary",
+					"reason": "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs."
+				}
+			],
+			"goSources": ["go_backend/internal/narrators/handlers.go"],
+			"tests": [
+				"go_backend/internal/narrators/handlers_compact_test.go",
+				"go_backend/internal/narrators/message_pagination_test.go",
+				"go_backend/internal/narrators/agent_history_content_test.go"
+			]
+		},
+		{
+			"group": "narrator.retryRecovery",
+			"status": "supported-baseline-with-disabled-rollback",
+			"features": [
+				"retry trims assistant/tool results after the latest user message and returns deletedMessageIds",
+				"continue appends a Continue. user message",
+				"interrupt clears active status and preserves manual_override state needed for retry/recovery",
+				"subagent conclusion update can rewrite parent tool result from the child final assistant text"
+			],
+			"disabled": [
+				{
+					"feature": "narrator.rollback",
+					"code": "FEATURE_DISABLED",
+					"reason": "TS-equivalent file snapshot rollback and rerun semantics are not available in go_backend yet."
+				},
+				{
+					"feature": "narrator.editAndRegenerate",
+					"code": "FEATURE_DISABLED",
+					"reason": "Edit-and-regenerate requires rollback plus agent rerun semantics that are not available in go_backend yet."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/narrators/handlers.go",
+				"go_backend/internal/narrators/service.go"
+			],
+			"tests": [
+				"go_backend/internal/narrators/route_contract_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go",
+				"go_backend/internal/narrators/subagent_message_tree_test.go"
+			]
+		},
+		{
+			"group": "narrator.subagents",
+			"status": "supported-baseline-with-reattach-fallback",
+			"features": [
+				"Agent tool creates foreground and background subagent narrators",
+				"background subagents are tracked in background_tasks and emit P1 background events",
+				"Await supports type=agent and returns stable unsupported metadata for other task types",
+				"Send and TeamStatus support list, send, broadcast, and file_changes across accessible sibling subagents",
+				"explore and review subagents default to readOnly permission; plan subagents enter plan mode",
+				"custom subagent types are stored, with fallback prompts when custom prompt files are unavailable"
+			],
+			"fallbacks": [
+				{
+					"feature": "subagent.attachRunningParentPromise",
+					"fallback": true,
+					"reason": "Go backend can mark background/foreground state but cannot re-block an already-running parent tool promise after detach/attach."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/narrators/service.go",
+				"go_backend/internal/narrators/handlers.go",
+				"go_backend/internal/narrators/agent_event_handler.go"
+			],
+			"tests": [
+				"go_backend/internal/narrators/agent_event_integration_test.go",
+				"go_backend/internal/narrators/subagent_message_tree_test.go",
+				"go_backend/internal/narrators/background_task_events_test.go"
+			]
+		},
+		{
+			"group": "mcp.tools",
+			"status": "discovery-supported-agent-injection-disabled",
+			"features": [
+				"/api/mcp/tools lists Go compatibility tools",
+				"MCP JSON-RPC initialize and tools/list are supported",
+				"MCP JSON-RPC tools/call dispatches embedded NarraFork compatibility tools",
+				"MCP server definitions are persisted through settings.json when a settings store is present",
+				"stdio MCP server probing can discover external tools for metadata"
+			],
+			"disabled": [
+				{
+					"feature": "mcp.externalAgentInjection",
+					"code": "FEATURE_DISABLED",
+					"reason": "External mcp__server__tool entries are discoverable metadata only and are not injected into Go narrator agent provider tool lists."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/mcpcompat/handlers.go",
+				"go_backend/internal/agentbasic/tool_inventory.go",
+				"go_backend/internal/app/router.go"
+			],
+			"tests": [
+				"go_backend/internal/mcpcompat/handlers_test.go",
+				"go_backend/internal/agentbasic/tool_inventory_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "review.tools",
+			"status": "supported-baseline",
+			"features": [
+				"review tool scope includes ConcludeReview without leaking into normal tool scope",
+				"ConcludeReview validates review chapter state and persists review_conclusions in TS-compatible shape",
+				"ConcludeReview updates review_status to concluded and injects review feedback into the source narrator",
+				"review promote, dismiss, and convert-to-subagent compatibility routes expose stable closure actions",
+				"chapter merge rejects stale review conclusions when the reviewed source has moved"
+			],
+			"goSources": [
+				"go_backend/internal/narrators/service.go",
+				"go_backend/internal/agentbasic/openai.go",
+				"go_backend/internal/misccompat/handlers.go",
+				"go_backend/internal/chapters/service.go"
+			],
+			"tests": [
+				"go_backend/internal/agentbasic/openai_test.go",
+				"go_backend/internal/narrators/review_parity_test.go",
+				"go_backend/internal/misccompat/review_parity_test.go",
+				"go_backend/internal/chapters/service_merge_parity_test.go",
+				"go_backend/internal/chapters/review_parity_test.go"
+			]
+		}
+	]
+}

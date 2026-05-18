@@ -1,0 +1,3 @@
+.tmp-*/
+*.test
+narrafork-go-check

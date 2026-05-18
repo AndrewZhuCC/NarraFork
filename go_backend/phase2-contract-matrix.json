@@ -1,0 +1,111 @@
+{
+	"name": "go-backend-phase2-contract-matrix",
+	"updatedAt": "2026-05-18",
+	"scope": "Narrator WebSocket event contract, message history rebuild, tool inventory parity, and permission pause/resume/reflection readiness.",
+	"contracts": [
+		{
+			"group": "narrator.ws.p0Events",
+			"status": "supported-baseline",
+			"events": [
+				"message",
+				"user_message",
+				"stream_event",
+				"tool_started",
+				"tool_use_chunk",
+				"tool_completed",
+				"permission_request",
+				"permission_resolved",
+				"status_change",
+				"substatus_change",
+				"catch_up",
+				"sync_ok",
+				"full_reload",
+				"streaming_snapshot"
+			],
+			"goSources": [
+				"go_backend/internal/ws/hub.go",
+				"go_backend/internal/narrators/agent_event_handler.go",
+				"go_backend/internal/narrators/service.go"
+			],
+			"tests": [
+				"go_backend/internal/ws/frontend_contract_smoke_test.go",
+				"go_backend/internal/ws/hub_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go"
+			]
+		},
+		{
+			"group": "narrator.ws.p1Events",
+			"status": "partial-supported-with-phase3-followup",
+			"events": [
+				"background_task_started",
+				"background_task_completed",
+				"background_task_failed",
+				"background_task_cancelled",
+				"background_task_status_changed",
+				"background_task_output",
+				"todos_updated",
+				"goals_set",
+				"context_usage",
+				"metering",
+				"git_status",
+				"tool_inventory"
+			],
+			"knownGaps": [
+				"foreground/background subagent parent blocking and continuation semantics are finalized in Phase 3",
+				"MCP injected tools remain unsupported metadata only until Phase 3"
+			],
+			"tests": [
+				"go_backend/internal/narrators/background_task_events_test.go",
+				"go_backend/internal/agentbasic/tool_inventory_test.go",
+				"go_backend/internal/worktreewatcher/watcher_test.go"
+			]
+		},
+		{
+			"group": "narrator.messageHistory",
+			"status": "supported-baseline",
+			"features": [
+				"top-level message cursor pagination",
+				"messageVersion catch-up metadata",
+				"child/orphan subagent message catch-up",
+				"tool call attachment",
+				"agent history rebuild from content_json",
+				"compact marker summary injection"
+			],
+			"tests": [
+				"go_backend/internal/narrators/message_pagination_test.go",
+				"go_backend/internal/narrators/agent_history_content_test.go",
+				"go_backend/internal/narrators/subagent_message_tree_test.go"
+			]
+		},
+		{
+			"group": "narrator.toolInventory",
+			"status": "supported-with-mcp-disabled",
+			"categories": ["core", "optional", "review", "reflection", "mcp"],
+			"mcpExternalToolInjection": {
+				"supported": false,
+				"fallback": true,
+				"code": "FEATURE_DISABLED"
+			},
+			"tests": ["go_backend/internal/agentbasic/tool_inventory_test.go"]
+		},
+		{
+			"group": "narrator.permissions",
+			"status": "supported-baseline",
+			"modes": ["readOnly", "default", "acceptEdits", "bypassPermissions", "dontAsk"],
+			"features": [
+				"pending permission_request persistence",
+				"approve/deny permission_resolved broadcast",
+				"answers merged into updatedInput",
+				"deny prevents side effects",
+				"danger reflection cancel",
+				"plan reflection confirm",
+				"goal completion reflection confirm"
+			],
+			"tests": [
+				"go_backend/internal/narrators/permission_test.go",
+				"go_backend/internal/narrators/route_contract_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go"
+			]
+		}
+	]
+}

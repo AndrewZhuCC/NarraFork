@@ -430,13 +430,27 @@ export class MultiTokenManager {
 		return this.entries.some((e) => !e.disabled);
 	}
 
-	reportSuspiciousThrottle(id: string): boolean {
+	reportSuspiciousThrottle(id: string, excludeIds?: ReadonlySet<string>): boolean {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) return this.entries.some((e) => !e.disabled);
+
+		if (!this.hasAlternativeAvailableCredential(id, excludeIds)) {
+			logger.warn("[kiro] last available credential suspicious-throttled, retrying", {
+				credentialId: id,
+			});
+			entry.lastUsedAt = new Date().toISOString();
+			this.saveStatsDebounced();
+			return true;
+		}
+
 		logger.warn("[kiro] credential suspicious-throttled, cooling down", { credentialId: id });
 		this.disableEntry(entry, "suspicious_throttle", true);
 		this.scheduleThrottleRecovery(id, SUSPICIOUS_THROTTLE_COOLDOWN_MS);
 		return this.entries.some((e) => !e.disabled);
+	}
+
+	hasAlternativeAvailableCredential(id: string, excludeIds?: ReadonlySet<string>): boolean {
+		return this.entries.some((e) => e.id !== id && !e.disabled && !excludeIds?.has(e.id));
 	}
 
 	private disableEntry(entry: CredentialEntry, reason: DisabledReason, persist: boolean): void {

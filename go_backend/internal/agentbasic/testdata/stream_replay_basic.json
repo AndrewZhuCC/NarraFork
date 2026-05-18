@@ -1,0 +1,46 @@
+{
+	"name": "basic_reasoning_tool_text",
+	"inputMessages": [
+		{
+			"role": "user",
+			"content": "inspect file"
+		}
+	],
+	"providerTurns": [
+		[
+			{
+				"reasoning": "Need to inspect the file first."
+			},
+			{
+				"toolUseChunk": {
+					"toolUseId": "tool-read-1",
+					"name": "Read",
+					"input": "{\"file_path\":\"note.txt\"}",
+					"stop": true
+				}
+			}
+		],
+		[
+			{
+				"text": "The file says hello."
+			}
+		]
+	],
+	"toolOutputs": {
+		"tool-read-1": "hello"
+	},
+	"expectedEventTypes": [
+		"stream_reasoning",
+		"tool_use_chunk",
+		"block_complete",
+		"tool_call",
+		"block_complete",
+		"assistant_message",
+		"tool_result",
+		"turn_complete",
+		"stream_text",
+		"block_complete",
+		"assistant_message",
+		"done"
+	]
+}

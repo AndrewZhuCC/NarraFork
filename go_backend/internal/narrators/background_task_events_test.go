@@ -1,0 +1,305 @@
+package narrators
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/go-chi/chi/v5"
+
+	"narrafork-go/internal/agentbasic"
+	"narrafork-go/internal/ws"
+)
+
+func TestBackgroundTaskToolUseIDReturnsLookupErrors(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`INSERT INTO background_tasks (id, parent_narrator_id, type, status, tool_use_id, started_at, created_at, updated_at) VALUES ('task-1', 'parent-1', 'general', 'running', 'tool-bg', 'now', 'now', 'now')`); err != nil {
+		t.Fatalf("insert background task: %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE background_tasks RENAME TO background_tasks_real`,
+		`CREATE VIEW background_tasks AS SELECT id, parent_narrator_id, type, status, command, exit_code, subagent_narrator_id, subagent_type, json_extract('not-json', '$') AS tool_use_id, alias, title, output, output_bytes, output_truncated, notified, started_at, completed_at, created_at, updated_at FROM background_tasks_real`,
+	} {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("prepare broken background_tasks view: %v", err)
+		}
+	}
+	service := &Service{DB: sqlDB}
+
+	_, err := service.backgroundTaskToolUseID(context.Background(), "parent-1", "task-1")
+	if err == nil {
+		t.Fatalf("expected background task tool_use_id lookup error")
+	}
+}
+
+func TestRecordedToolCallIDReturnsLookupErrors(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, created_at) VALUES ('tc-1', 'nar-1', 'msg-1', 'tool-1', 'Bash', 'pending', 'now')`); err != nil {
+		t.Fatalf("insert tool call: %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE narrator_tool_calls RENAME TO narrator_tool_calls_real`,
+		`CREATE VIEW narrator_tool_calls AS SELECT id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, output_json, execution_started_at, completed_at, error_message, permission_decided_by, permission_decided_at, permission_deny_message, permission_decision_reason, result_message_id, json_extract('not-json', '$') AS created_at FROM narrator_tool_calls_real`,
+	} {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("prepare broken tool call view: %v", err)
+		}
+	}
+	service := &Service{DB: sqlDB}
+
+	_, err := service.recordedToolCallID(context.Background(), "nar-1", "tool-1")
+	if err == nil {
+		t.Fatalf("expected recorded tool call lookup error")
+	}
+}
+
+func TestRecordRunningToolCallReturnsDuplicateLookupErrors(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	for _, stmt := range []string{
+		`ALTER TABLE narrator_tool_calls RENAME TO narrator_tool_calls_real`,
+		`CREATE VIEW narrator_tool_calls AS SELECT id, narrator_id, message_id, json_extract('not-json', '$') AS tool_use_id, tool_name, input_json, status, execution_started_at, is_background, created_at FROM narrator_tool_calls_real`,
+		`CREATE TRIGGER narrator_tool_calls_insert INSTEAD OF INSERT ON narrator_tool_calls BEGIN INSERT INTO narrator_tool_calls_real (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, execution_started_at, is_background, created_at) VALUES (NEW.id, NEW.narrator_id, NEW.message_id, NEW.tool_use_id, NEW.tool_name, NEW.input_json, NEW.status, NEW.execution_started_at, NEW.is_background, NEW.created_at); END;`,
+	} {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("prepare broken tool call view: %v", err)
+		}
+	}
+	service := &Service{DB: sqlDB}
+
+	err := service.recordRunningToolCall(context.Background(), "nar-1", "msg-1", Narrator{}, agentbasic.AgentEvent{ToolUseID: "tool-1", ToolName: "Bash", Input: map[string]any{"command": "true"}})
+	if err == nil || !strings.Contains(err.Error(), "query running tool call") {
+		t.Fatalf("expected running tool call lookup error, got %v", err)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_tool_calls_real`).Scan(&count); err != nil {
+		t.Fatalf("count backing tool calls: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("lookup failure should not insert tool call, count=%d", count)
+	}
+}
+
+func TestSendToolReturnsInterruptStatusUpdateErrors(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+	parent, err := service.Get(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Worker", "openai:test", "", "", "worker", false)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_send_interrupt_update BEFORE UPDATE OF status ON narrators WHEN OLD.id = '` + child.ID + `' BEGIN SELECT RAISE(ABORT, 'send interrupt update blocked'); END;`); err != nil {
+		t.Fatalf("create interrupt trigger: %v", err)
+	}
+
+	_, err = service.sendTool(context.Background(), parentID, map[string]any{"id": child.ID, "message": "hello", "doInterrupt": true})
+	if err == nil || !strings.Contains(err.Error(), "interrupt send target") {
+		t.Fatalf("expected interrupt update error, got %v", err)
+	}
+	var messageCount int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND content_text = 'hello'`, child.ID).Scan(&messageCount); err != nil {
+		t.Fatalf("count child messages: %v", err)
+	}
+	if messageCount != 0 {
+		t.Fatalf("send should not enqueue message after interrupt update failure, count=%d", messageCount)
+	}
+}
+
+func TestPersistAgentErrorReturnsStatusUpdateErrorsAndBroadcastsFallback(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_agent_error_status_update BEFORE UPDATE OF status ON narrators BEGIN SELECT RAISE(ABORT, 'agent error status update blocked'); END;`); err != nil {
+		t.Fatalf("create status trigger: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	err := service.persistAgentError(context.Background(), narratorID, errors.New("model failed"), false)
+	if err == nil || !strings.Contains(err.Error(), "persist agent error status") {
+		t.Fatalf("expected status persist error, got %v", err)
+	}
+	found := false
+	for _, event := range events() {
+		payload := event.Payload
+		if payload["type"] == "error" && payload["code"] == "AGENT_ERROR_PERSIST_FAILED" && payload["stage"] == "status" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected agent error persistence fallback broadcast, got %#v", events())
+	}
+}
+
+func TestBackgroundAgentCompletionSyncsTaskRecordAndBroadcastsParentEvents(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	parent, err := service.Get(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Background worker", "openai:test", "", "", "worker", true)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if err := service.createBackgroundAgentTask(context.Background(), parentID, child.ID, "general", "Background worker", "toolu_bg", "worker"); err != nil {
+		t.Fatalf("create background task: %v", err)
+	}
+	if !hasBroadcast(events(), parentID, "background_task_started") {
+		t.Fatalf("expected background_task_started broadcast, got %#v", events())
+	}
+
+	state := &agentRunState{narratorID: child.ID, narrator: child, assistantText: "finished output"}
+	if err := service.finishAgentRunSuccess(context.Background(), state); err != nil {
+		t.Fatalf("finish background run: %v", err)
+	}
+
+	var taskStatus, taskOutput string
+	var notified int
+	if err := sqlDB.QueryRow(`SELECT status, output, notified FROM background_tasks WHERE id = ?`, child.ID).Scan(&taskStatus, &taskOutput, &notified); err != nil {
+		t.Fatalf("load background task: %v", err)
+	}
+	if taskStatus != "completed" || taskOutput != "finished output" || notified != 0 {
+		t.Fatalf("task status/output/notified = %q/%q/%d", taskStatus, taskOutput, notified)
+	}
+	var backgroundStatus, backgroundResult string
+	if err := sqlDB.QueryRow(`SELECT background_status, background_result FROM narrators WHERE id = ?`, child.ID).Scan(&backgroundStatus, &backgroundResult); err != nil {
+		t.Fatalf("load child background fields: %v", err)
+	}
+	if backgroundStatus != "completed" || backgroundResult != "finished output" {
+		t.Fatalf("child background status/result = %q/%q", backgroundStatus, backgroundResult)
+	}
+	if !hasBroadcast(events(), parentID, "background_task_completed") {
+		t.Fatalf("expected background_task_completed broadcast, got %#v", events())
+	}
+	if !hasBroadcastStatus(events(), parentID, child.ID, "completed") {
+		t.Fatalf("expected background_task_status_changed completed broadcast, got %#v", events())
+	}
+}
+
+func TestAgentToolEventsBroadcastTSCompatibleToolStartedAndCompleted(t *testing.T) {
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{Hub: hub}
+	service.broadcastAgentEvent("nar_tool", agentbasic.AgentEvent{Type: "tool_call", ToolUseID: "toolu_1", ToolName: "Task", Input: map[string]any{"prompt": "go"}})
+	service.broadcastAgentEvent("nar_tool", agentbasic.AgentEvent{Type: "tool_result", ToolUseID: "toolu_1", ToolName: "Task", Output: "started", DurationMs: 12})
+
+	if !hasBroadcast(events(), "nar_tool", "tool_started") {
+		t.Fatalf("expected tool_started broadcast, got %#v", events())
+	}
+	completed := findBroadcast(events(), "nar_tool", "tool_completed")
+	if completed == nil || completed["status"] != "success" || completed["output"] != "started" {
+		t.Fatalf("unexpected tool_completed broadcast: %#v all=%#v", completed, events())
+	}
+}
+
+func TestCancelBackgroundTaskBroadcastsCancellationAndUpdatesChild(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	parent, err := service.Get(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Cancelable", "openai:test", "", "", "", true)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'working', background_status = 'running' WHERE id = ?`, child.ID); err != nil {
+		t.Fatalf("mark child running: %v", err)
+	}
+	if err := service.createBackgroundAgentTask(context.Background(), parentID, child.ID, "general", "Cancelable", "toolu_cancel", ""); err != nil {
+		t.Fatalf("create background task: %v", err)
+	}
+
+	req := httptestRequest(http.MethodPost, "/narrators/"+parentID+"/background-tasks/"+child.ID+"/cancel")
+	w := serveNarratorHandlerWithService(service, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var taskStatus, childStatus string
+	if err := sqlDB.QueryRow(`SELECT status FROM background_tasks WHERE id = ?`, child.ID).Scan(&taskStatus); err != nil {
+		t.Fatalf("load task status: %v", err)
+	}
+	if err := sqlDB.QueryRow(`SELECT background_status FROM narrators WHERE id = ?`, child.ID).Scan(&childStatus); err != nil {
+		t.Fatalf("load child status: %v", err)
+	}
+	if taskStatus != "cancelled" || childStatus != "cancelled" {
+		t.Fatalf("task/child status = %q/%q", taskStatus, childStatus)
+	}
+	if !hasBroadcast(events(), parentID, "background_task_cancelled") {
+		t.Fatalf("expected background_task_cancelled broadcast, got %#v", events())
+	}
+	if !hasBroadcastStatus(events(), parentID, child.ID, "cancelled") {
+		t.Fatalf("expected status_changed cancelled broadcast, got %#v", events())
+	}
+}
+
+type capturedBroadcast struct {
+	NarratorID string
+	Payload    map[string]any
+}
+
+func captureNarratorBroadcasts() (*ws.Hub, func() []capturedBroadcast) {
+	hub := ws.NewHub()
+	events := []capturedBroadcast{}
+	hub.SetNarratorBroadcastHook(func(narratorID string, payload any, data []byte) {
+		decoded := map[string]any{}
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return
+		}
+		events = append(events, capturedBroadcast{NarratorID: narratorID, Payload: decoded})
+	})
+	return hub, func() []capturedBroadcast { return append([]capturedBroadcast(nil), events...) }
+}
+
+func hasBroadcast(events []capturedBroadcast, narratorID string, eventType string) bool {
+	return findBroadcast(events, narratorID, eventType) != nil
+}
+
+func hasBroadcastStatus(events []capturedBroadcast, narratorID string, taskID string, status string) bool {
+	for _, event := range events {
+		if event.NarratorID == narratorID && event.Payload["type"] == "background_task_status_changed" && event.Payload["taskId"] == taskID && event.Payload["status"] == status {
+			return true
+		}
+	}
+	return false
+}
+
+func findBroadcast(events []capturedBroadcast, narratorID string, eventType string) map[string]any {
+	for _, event := range events {
+		if event.NarratorID == narratorID && event.Payload["type"] == eventType {
+			return event.Payload
+		}
+	}
+	return nil
+}
+
+func httptestRequest(method string, path string) *http.Request {
+	return httptest.NewRequest(method, path, nil)
+}
+
+func serveNarratorHandlerWithService(service *Service, req *http.Request) *httptest.ResponseRecorder {
+	h := NewHandler(service)
+	r := chi.NewRouter()
+	r.Route("/narrators", h.RegisterRoutes)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}

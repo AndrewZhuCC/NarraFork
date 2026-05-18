@@ -146,9 +146,16 @@ export class KiroMcpClient {
 			const resBody = await res.text().catch(() => "");
 
 			if (isSuspiciousThrottle(resBody)) {
+				concurrencyThrottle(ctx.id);
+				touchLastRequest(ctx.id);
+				recordThrottle(ctx.id);
 				releaseHeld();
-				failedCredentialIds.add(ctx.id);
-				this.tokenManager.reportSuspiciousThrottle(ctx.id);
+				const hasFailoverCredential = this.tokenManager.hasAlternativeAvailableCredential(
+					ctx.id,
+					failedCredentialIds,
+				);
+				if (hasFailoverCredential) failedCredentialIds.add(ctx.id);
+				this.tokenManager.reportSuspiciousThrottle(ctx.id, failedCredentialIds);
 				lastError = new KiroApiError("SUSPICIOUS_THROTTLE", resBody, res.status);
 				continue;
 			}

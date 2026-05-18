@@ -1,0 +1,251 @@
+{
+	"name": "go-backend-phase0-contract-matrix",
+	"updatedAt": "2026-05-18",
+	"scope": "Freeze TypeScript-owned DB compatibility mode and make Go unsupported/degraded behavior discoverable before users trigger side effects.",
+	"principles": [
+		{
+			"id": "ts-owned-main-db",
+			"status": "frozen",
+			"owner": "TypeScript Drizzle migrations",
+			"goBehavior": "read-only canonical schema and migration compatibility checks; no business schema creation, ALTER, index creation, FTS rebuild, or main DB repair",
+			"evidence": [
+				"go_backend/internal/db/schema.go",
+				"go_backend/internal/db/canonical_schema.go",
+				"go_backend/internal/db/migration_compat.go"
+			]
+		},
+		{
+			"id": "disabled-before-mutation",
+			"status": "required",
+			"goBehavior": "Unsupported mutation endpoints must return a stable fallback payload before DB, git, filesystem, process, container, or network side effects."
+		},
+		{
+			"id": "frontend-capability-discovery",
+			"status": "required",
+			"goBehavior": "Known unsupported or degraded features must be exposed through /api/health.capabilities, graph capabilities, or a route-specific capability payload so the frontend can hide or disable controls."
+		}
+	],
+	"fallbackShape": {
+		"ok": false,
+		"code": "FEATURE_DISABLED",
+		"feature": "string",
+		"supported": false,
+		"fallback": true,
+		"reason": "string"
+	},
+	"apiRouteGroups": [
+		{
+			"group": "health-runtime-capabilities",
+			"tsSource": "server/app.ts",
+			"goSource": "go_backend/internal/app/router.go",
+			"frontendConsumers": ["frontend/lib/api/misc.ts", "frontend/hooks/usePlatform.ts"],
+			"phase0Status": "full",
+			"requiredCapabilityKeys": [
+				"database.mainSchemaOwner",
+				"database.goMainMigrations",
+				"database.ftsRepair",
+				"content.projectRoutines.supported",
+				"content.projectSkills.supported",
+				"chapters.split.supported",
+				"narrator.browserSessions.supported",
+				"narrator.rollbackEditRegenerate.supported",
+				"fs.reveal.supported",
+				"vnet.supported",
+				"update.manualOnly",
+				"gateway.weixinQr.supported",
+				"storage.cleanup.worktrees.supported",
+				"storage.cleanup.containers.supported",
+				"mcp.serverSettingsStorage.supported",
+				"mcp.externalToolsInjection.supported",
+				"providers.openai.quota.supported",
+				"providers.anthropic.quota.supported",
+				"benchmark.containerExecution.supported"
+			],
+			"tests": ["go_backend/internal/app/route_contract_test.go"]
+		},
+		{
+			"group": "chapters.split",
+			"method": "POST",
+			"path": "/api/chapters/{id}/split",
+			"tsSource": "server/routes/chapters.ts / TS split-at-commit domain semantics",
+			"goSource": "go_backend/internal/chapters/handlers.go",
+			"frontendConsumers": ["frontend/lib/api/chapters.ts"],
+			"phase0Status": "disabled",
+			"capabilityKey": "chapters.split",
+			"fallbackCode": "FEATURE_DISABLED",
+			"sideEffectPolicy": "reject-before-mutation",
+			"tests": ["go_backend/internal/chapters/route_contract_test.go"]
+		},
+		{
+			"group": "vnet",
+			"paths": ["/api/vnet/*", "/ws/vnet"],
+			"tsSource": "server/routes/vnet.ts and server/websocket/vnet-ws.ts",
+			"goSource": "go_backend/internal/app/router.go and go_backend/internal/ws/hub.go",
+			"phase0Status": "disabled",
+			"capabilityKey": "vnet",
+			"fallbackCode": "VNET_DISABLED",
+			"sideEffectPolicy": "reject-before-runtime-start",
+			"tests": ["go_backend/internal/ws/heartbeat_vnet_test.go"]
+		},
+		{
+			"group": "gateway.weixinQr",
+			"paths": ["/api/gateway/weixin/qr-start", "/api/gateway/weixin/qr-poll"],
+			"tsSource": "server/routes/gateway.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": ["frontend/components/settings/GatewaySection.tsx"],
+			"phase0Status": "disabled",
+			"capabilityKey": "gateway.weixinQr",
+			"fallbackCode": "WEIXIN_QR_UNSUPPORTED",
+			"sideEffectPolicy": "reject-before-runtime-start"
+		},
+		{
+			"group": "storage.cleanup",
+			"method": "POST",
+			"path": "/api/storage/cleanup",
+			"tsSource": "server/routes/storage.ts",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": ["frontend/components/settings/StorageSection.tsx"],
+			"phase0Status": "partial",
+			"supportedTargets": ["uploads", "shares"],
+			"disabledTargets": ["worktrees", "containers"],
+			"capabilityKeys": ["storage.cleanup.worktrees", "storage.cleanup.containers"],
+			"fallbackCodes": [
+				"STORAGE_CLEANUP_WORKTREES_UNSUPPORTED",
+				"STORAGE_CLEANUP_CONTAINERS_UNSUPPORTED"
+			],
+			"sideEffectPolicy": "unsupported targets reject before cleanup"
+		},
+		{
+			"group": "update.apply",
+			"method": "POST",
+			"path": "/api/update/apply",
+			"tsSource": "server/routes/update.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": [
+				"frontend/components/UpdateModal.tsx",
+				"frontend/hooks/useUpdateCheck.ts"
+			],
+			"phase0Status": "manual-only-fallback",
+			"capabilityKey": "update.manualOnly",
+			"sideEffectPolicy": "do not auto-restart from Go backend"
+		},
+		{
+			"group": "mcp.serverSettingsStorage",
+			"tsSource": "server/routes/mcp.ts",
+			"goSource": "go_backend/internal/mcpcompat/handlers.go",
+			"phase0Status": "full-in-standard-router",
+			"capabilityKey": "mcp.serverSettingsStorage",
+			"storage": "settings.json",
+			"conditionalFallback": "Handlers return FEATURE_DISABLED only when constructed without a settings store."
+		},
+		{
+			"group": "mcp.externalToolsInjection",
+			"tsSource": "server/lib/mcp/tool-bridge.ts",
+			"goSource": "go_backend/internal/agentbasic/tool_inventory.go and go_backend/internal/mcpcompat/handlers.go",
+			"phase0Status": "disabled",
+			"capabilityKey": "mcp.externalToolsInjection",
+			"fallbackCode": "FEATURE_DISABLED",
+			"sideEffectPolicy": "do not expose external MCP tools as executable provider tools until bridge is implemented"
+		},
+		{
+			"group": "project-content",
+			"paths": ["/api/routines/project/{projectId}", "/api/skills?projectId={projectId}"],
+			"tsSource": "server/routes/routines.ts and server/routes/skills.ts",
+			"goSource": "go_backend/internal/simplecontent/handlers.go",
+			"phase0Status": "full-in-standard-router",
+			"capabilityKeys": ["content.projectRoutines", "content.projectSkills"],
+			"conditionalFallback": "Handlers return FEATURE_DISABLED only when constructed without a DB service."
+		},
+		{
+			"group": "fs.reveal",
+			"method": "POST",
+			"path": "/api/fs/reveal",
+			"tsSource": "server/routes/fs.ts",
+			"goSource": "go_backend/internal/fs/handlers.go",
+			"phase0Status": "platform-dependent-fallback",
+			"capabilityKey": "fs.reveal",
+			"fallbackCode": "FS_REVEAL_UNSUPPORTED",
+			"sideEffectPolicy": "Linux rejects before spawning a file-manager process"
+		},
+		{
+			"group": "provider-runtime",
+			"paths": [
+				"/api/openai/*",
+				"/api/anthropic/*",
+				"/api/kiro/*",
+				"/api/nkp/*",
+				"/api/nug/*",
+				"/api/codex/*",
+				"/api/cline/*"
+			],
+			"tsSource": "server/routes/{openai,anthropic,kiro,nkp,nug,codex,cline}.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go and go_backend/internal/agentbasic/provider_*.go",
+			"phase0Status": "partial-by-provider",
+			"capabilityKey": "providers",
+			"knownFallbacks": ["providers.openai.quota", "providers.anthropic.quota"],
+			"sideEffectPolicy": "Unsupported provider subfeatures must be hidden or return explicit fallback; implemented auth/model/quota routes must not leak secrets."
+		},
+		{
+			"group": "benchmark.containerExecution",
+			"tsSource": "server/services/benchmark-container.ts",
+			"goSource": "go_backend/internal/systemroutes/benchmark_execution.go",
+			"phase0Status": "disabled",
+			"capabilityKey": "benchmark.containerExecution",
+			"fallbackCode": "FEATURE_DISABLED",
+			"sideEffectPolicy": "do not start Podman benchmark containers from Go backend"
+		},
+		{
+			"group": "narrator.rollback-edit-regenerate",
+			"paths": [
+				"/api/narrators/{id}/rollback/{messageId}",
+				"/api/narrators/{id}/edit-and-regenerate/{messageId}"
+			],
+			"tsSource": "server/routes/narrators.ts and snapshot/revert services",
+			"goSource": "go_backend/internal/narrators/handlers.go",
+			"phase0Status": "disabled",
+			"capabilityKey": "narrator.rollbackEditRegenerate",
+			"fallbackCode": "FEATURE_DISABLED",
+			"sideEffectPolicy": "reject before file/message regeneration side effects"
+		}
+	],
+	"wsEventGroups": [
+		{
+			"group": "narrator-ws-p0",
+			"tsSource": "server/websocket/narrator-ws-types.ts and frontend/hooks/useNarratorWS.ts",
+			"goSource": "go_backend/internal/ws/hub.go",
+			"phase0Status": "matrix-only",
+			"phase2RequiredEvents": [
+				"message",
+				"user_message",
+				"stream_event",
+				"tool_started",
+				"tool_use_chunk",
+				"tool_completed",
+				"permission_request",
+				"permission_resolved",
+				"status_change",
+				"substatus_change",
+				"catch_up",
+				"sync_ok",
+				"full_reload",
+				"streaming_snapshot"
+			],
+			"tests": ["go_backend/internal/ws/frontend_contract_smoke_test.go"]
+		},
+		{
+			"group": "terminal-ws",
+			"tsSource": "server/websocket/terminal-ws.ts and frontend/hooks/useTerminalWS.ts",
+			"goSource": "go_backend/internal/ws/hub.go",
+			"phase0Status": "partial",
+			"capabilityKey": "terminal.supported",
+			"tests": ["go_backend/internal/ws/frontend_contract_smoke_test.go"]
+		}
+	],
+	"phaseExitCriteria": [
+		"The Go health payload exposes all Phase 0 required capability keys.",
+		"Known disabled mutations return a stable fallback payload before side effects.",
+		"Frontend capability types can consume all Phase 0 keys.",
+		"Known Go-disabled controls are hidden or disabled when the corresponding capability is false.",
+		"Focused Go contract tests cover health capabilities and disabled fallback shape."
+	]
+}

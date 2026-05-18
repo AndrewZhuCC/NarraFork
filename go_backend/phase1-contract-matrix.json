@@ -1,0 +1,128 @@
+{
+	"name": "go-backend-phase1-contract-matrix",
+	"updatedAt": "2026-05-18",
+	"scope": "Database compatibility, canonical schema drift detection, FTS/Search degraded behavior, Graph/Ruler baseline, and commit sync readiness for the TypeScript-owned main DB mode.",
+	"principles": [
+		{
+			"id": "read-only-db-readiness",
+			"status": "required",
+			"goBehavior": "Go verifies TS-owned tables, columns, indexes, FKs, FTS trigram objects, and FTS triggers, but must not repair or migrate the main database."
+		},
+		{
+			"id": "machine-readable-degraded-contract",
+			"status": "required",
+			"goBehavior": "Search, Graph, and Ruler read endpoints return stable degraded/fallback metadata instead of failing the whole response when optional compatibility components are missing."
+		},
+		{
+			"id": "commit-sync-baseline",
+			"status": "required",
+			"goBehavior": "Commits created through Go git routes are recorded immediately; external commits are synced by worktree watcher; graph reads refresh head/count metadata without requiring a heavy full sync."
+		}
+	],
+	"contracts": [
+		{
+			"group": "database.canonicalSchema",
+			"tsSource": "server/db/schema.ts and drizzle migrations",
+			"goSource": "go_backend/internal/db/canonical_schema.go",
+			"phase1Status": "read-only-drift-detection",
+			"requiredObjects": [
+				"tables",
+				"columns",
+				"indexes",
+				"foreignKeys",
+				"ftsTrigramTables",
+				"ftsSyncTriggers"
+			],
+			"goMustNot": [
+				"CREATE main business tables",
+				"ALTER main business tables",
+				"CREATE main indexes",
+				"rebuild FTS",
+				"delete or repair user DB data"
+			],
+			"tests": ["go_backend/internal/db/schema_contract_test.go"]
+		},
+		{
+			"group": "database.migrationCompatibility",
+			"tsSource": "drizzle/meta and __drizzle_migrations",
+			"goSource": "go_backend/internal/db/migration_compat.go",
+			"phase1Status": "compatible-journal",
+			"goOwnedTable": "__narrafork_go_migration_journal",
+			"mainDbOwner": "typescript-drizzle",
+			"tests": ["go_backend/internal/db/migration_compat_test.go"]
+		},
+		{
+			"group": "search.ftsDegraded",
+			"path": "/api/search",
+			"goSource": "go_backend/internal/search/handlers.go",
+			"phase1Status": "fts-preferred-like-fallback",
+			"responseContract": [
+				"degraded",
+				"fallbacks",
+				"searchMetadata.mode",
+				"searchMetadata.ftsReady",
+				"searchMetadata.shortQuery",
+				"searchMetadata.requestedEntities"
+			],
+			"fallbackReasons": ["fts_unavailable", "fts_query_failed", "query_too_short_for_trigram"],
+			"tests": ["go_backend/internal/search/handlers_contract_test.go"]
+		},
+		{
+			"group": "graph.baseline",
+			"path": "/api/projects/{id}/graph",
+			"goSource": "go_backend/internal/graph/handlers.go",
+			"phase1Status": "read-with-optional-metadata-fallbacks",
+			"responseContract": [
+				"nodes",
+				"edges",
+				"explorationGroups",
+				"openedTerminals",
+				"capabilities",
+				"degraded",
+				"fallbacks"
+			],
+			"capabilities": ["split", "chapterEdges", "commitSync", "upstreamUpdates"],
+			"tests": ["go_backend/internal/graph/handlers_test.go"]
+		},
+		{
+			"group": "ruler.baseline",
+			"path": "/api/projects/{id}/ruler",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"phase1Status": "read-degraded-mutations-gated",
+			"responseContract": [
+				"commits",
+				"segments",
+				"activeChapters",
+				"mergedChapters",
+				"totalCommitCount",
+				"degraded",
+				"fallbacks",
+				"capabilities"
+			],
+			"mutationFallbacks": [
+				"ruler.fork",
+				"ruler.merge",
+				"ruler.abandon",
+				"ruler.rebase",
+				"ruler.rebaseResolve",
+				"ruler.rebaseContinue"
+			],
+			"tests": [
+				"go_backend/internal/misccompat/ruler_parity_test.go",
+				"go_backend/internal/misccompat/routes_test.go"
+			]
+		},
+		{
+			"group": "commitSync.baseline",
+			"goSource": "go_backend/internal/gitroutes/handlers.go and go_backend/internal/worktreewatcher/watcher.go",
+			"phase1Status": "manual-route-plus-background-watcher",
+			"sources": ["manual", "watcher", "graph-read-refresh"],
+			"events": ["git_status", "commits_updated", "commit_sync_error"],
+			"tests": [
+				"go_backend/internal/gitroutes/handlers_test.go",
+				"go_backend/internal/worktreewatcher/watcher_test.go",
+				"go_backend/internal/graph/handlers_test.go"
+			]
+		}
+	]
+}

@@ -1,0 +1,284 @@
+{
+	"name": "go-backend-phase4-contract-matrix",
+	"updatedAt": "2026-05-18",
+	"scope": "Terminal, Container/Podman, Provider, MCP/settings, uploads/share/fs, update/runtime/storage runtime parity or explicit capability degradation.",
+	"contracts": [
+		{
+			"group": "terminal.runtime",
+			"status": "supported-baseline-with-platform-and-replay-degradation",
+			"features": [
+				"terminal HTTP CRUD, tabs, view-state, and process inspection routes",
+				"terminal WebSocket subscribe/input/resize/kill/create/rename contract",
+				"Unix PTY runtime with optional dtach detached reattach",
+				"startup orphan recovery and capped raw scrollback replay"
+			],
+			"fallbacks": [
+				{
+					"feature": "terminal.windowsPty",
+					"supported": false,
+					"reason": "Go backend does not bundle a Windows ConPTY/bun-pty equivalent."
+				},
+				{
+					"feature": "terminal.xtermSerializedReplay",
+					"supported": false,
+					"mode": "raw-capped-buffer",
+					"reason": "Go backend replays capped raw PTY output instead of TS xterm-headless serialized buffer state."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/terminalruntime/manager.go",
+				"go_backend/internal/terminals/handlers.go",
+				"go_backend/internal/ws/hub.go",
+				"go_backend/internal/app/router.go"
+			],
+			"tests": [
+				"go_backend/internal/terminalruntime/manager_test.go",
+				"go_backend/internal/ws/hub_terminal_test.go",
+				"go_backend/internal/terminals/handlers_broadcast_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "chapters.containers",
+			"status": "manual-controls-supported-with-ts-runtime-degradations",
+			"features": [
+				"Podman status/setup/install route surface",
+				"compose-info discovery and bounded compose file reads",
+				"manual start/stop/pause/unpause/remove/logs",
+				"host port allocation and release",
+				"proxy-mode metadata when project proxy domain and pasta/passt backend are available",
+				"container status persistence and status-change broadcasts"
+			],
+			"fallbacks": [
+				{
+					"feature": "container.backgroundStart",
+					"supported": false,
+					"reason": "Go container start is synchronous within the HTTP request."
+				},
+				{
+					"feature": "container.streamingLogs",
+					"supported": false,
+					"reason": "Go container actions return bounded command output instead of streaming container:log events."
+				},
+				{
+					"feature": "container.perChapterLock",
+					"supported": false,
+					"reason": "TS containerLock semantics are not implemented."
+				},
+				{
+					"feature": "container.autoStartOnFork",
+					"supported": false,
+					"reason": "Fork inherits config and reports fallback; containers must be started manually."
+				},
+				{
+					"feature": "container.dormantWakeLifecycle",
+					"supported": false,
+					"reason": "Dormant/wake do not automatically pause/unpause containers in go_backend yet."
+				},
+				{
+					"feature": "container.deleteVolumes",
+					"supported": false,
+					"reason": "remove route does not expose TS deleteVolumes/-v semantics yet."
+				},
+				{
+					"feature": "container.reverseProxyRuntime",
+					"supported": false,
+					"reason": "Go backend records proxy metadata but does not host the TS container reverse proxy runtime."
+				},
+				{
+					"feature": "container.readyNarratorIntegration",
+					"supported": false,
+					"reason": "Container ready messages and Browser auto-enable are not implemented in go_backend."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/chapters/handlers.go",
+				"go_backend/internal/chapters/container_runtime.go",
+				"go_backend/internal/chapters/service.go"
+			],
+			"tests": [
+				"go_backend/internal/chapters/container_runtime_test.go",
+				"go_backend/internal/chapters/route_contract_test.go",
+				"go_backend/internal/systemroutes/runtime_container_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "providers.runtimeAndRoutes",
+			"status": "supported-baseline-with-manager-parity-gaps",
+			"features": [
+				"OpenAI-compatible model routes and chat/responses agent runtime",
+				"Anthropic model routes and messages agent runtime",
+				"Kiro credential/model/chat routes and Kiro-compatible SSE/plugin bridge runtime",
+				"NKP, NUG, Cline provider route and agent runtime baselines",
+				"Codex credential, status, quota overview, browser/device auth routes and responses WS/HTTP runtime"
+			],
+			"fallbacks": [
+				{ "feature": "openai.quota", "supported": false, "code": "FEATURE_DISABLED" },
+				{ "feature": "anthropic.quota", "supported": false, "code": "FEATURE_DISABLED" },
+				{
+					"feature": "codex.tsManagerParity",
+					"supported": false,
+					"mode": "partial",
+					"reason": "Go exposes Codex compatibility routes/runtime but not the full TS CodexManager scheduler/usage queue semantics."
+				},
+				{
+					"feature": "kiro.pluginAvailability",
+					"supported": "conditional",
+					"reason": "Kiro plugin bridge requires the external Bun bridge/plugin environment."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/systemroutes/handlers.go",
+				"go_backend/internal/agentbasic/provider_resolver.go",
+				"go_backend/internal/agentbasic/provider_openai_chat.go",
+				"go_backend/internal/agentbasic/provider_anthropic_messages.go",
+				"go_backend/internal/agentbasic/provider_kiro.go",
+				"go_backend/internal/agentbasic/provider_codex_ws.go"
+			],
+			"tests": [
+				"go_backend/internal/agentbasic/provider_runtime_routing_test.go",
+				"go_backend/internal/agentbasic/provider_openai_responses_test.go",
+				"go_backend/internal/agentbasic/provider_anthropic_stream_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "mcp.settingsAndTools",
+			"status": "settings-and-builtin-tools-supported-external-agent-injection-disabled",
+			"features": [
+				"MCP server definitions persisted in settings.json",
+				"MCP JSON-RPC initialize/tools/list/tools/call for embedded NarraFork tools",
+				"MCP server import/create/update/delete/test/connect/disconnect route surface",
+				"stdio MCP probe can discover external tool metadata"
+			],
+			"fallbacks": [
+				{ "feature": "mcp.transport.sse", "supported": false, "code": "FEATURE_DISABLED" },
+				{
+					"feature": "mcp.transport.streamableHttp",
+					"supported": false,
+					"code": "FEATURE_DISABLED"
+				},
+				{ "feature": "mcp.externalAgentInjection", "supported": false, "code": "FEATURE_DISABLED" },
+				{
+					"feature": "mcp.forkInheritModeToolArg",
+					"supported": false,
+					"mode": "partial-builtin-tool-parity"
+				}
+			],
+			"goSources": [
+				"go_backend/internal/mcpcompat/handlers.go",
+				"go_backend/internal/config/config.go",
+				"go_backend/internal/agentbasic/tool_inventory.go"
+			],
+			"tests": [
+				"go_backend/internal/mcpcompat/handlers_test.go",
+				"go_backend/internal/config/config_test.go",
+				"go_backend/internal/agentbasic/tool_inventory_test.go"
+			]
+		},
+		{
+			"group": "settings.store",
+			"status": "supported-with-loose-validation",
+			"features": [
+				"settings.json storage under ~/.narrafork",
+				"GET/PATCH settings routes",
+				"secret masking for auth, TLS, and provider credentials",
+				"provider model cache augmentation",
+				"context thresholds, TLS generation, retry rules, and test-model routes"
+			],
+			"fallbacks": [
+				{
+					"feature": "settings.tsZodParity",
+					"supported": false,
+					"mode": "loose-json-with-normalization"
+				}
+			],
+			"goSources": [
+				"go_backend/internal/settings/handlers.go",
+				"go_backend/internal/config/config.go"
+			],
+			"tests": [
+				"go_backend/internal/settings/handlers_test.go",
+				"go_backend/internal/config/config_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "files.uploadsSharesFs",
+			"status": "supported-baseline-with-security-and-presentation-degradations",
+			"features": [
+				"narrator image and avatar upload file serving",
+				"share creation, public download, and public preview",
+				"safe share headers and escaped HTML preview",
+				"fs browse, shortcuts, mkdir, reveal fallback, and bounded preview"
+			],
+			"fallbacks": [
+				{ "feature": "shares.tsSanitizeHTMLPreview", "supported": false, "mode": "escaped-pre" },
+				{
+					"feature": "shares.ephemeralOnly",
+					"supported": false,
+					"reason": "Go resolver can serve disk fallback share directories after in-memory records are gone."
+				},
+				{
+					"feature": "uploads.messageImageRefCleanupParity",
+					"supported": false,
+					"mode": "partial"
+				},
+				{ "feature": "fs.reveal.linux", "supported": false, "code": "FS_REVEAL_UNSUPPORTED" }
+			],
+			"goSources": [
+				"go_backend/internal/misccompat/handlers.go",
+				"go_backend/internal/fs/handlers.go"
+			],
+			"tests": [
+				"go_backend/internal/misccompat/share_security_test.go",
+				"go_backend/internal/misccompat/routes_test.go",
+				"go_backend/internal/fs/handlers_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "update.runtime.storage",
+			"status": "supported-baseline-with-manual-update-and-cleanup-degradations",
+			"features": [
+				"update check/version/directory/status/cleanup/download/apply route surface",
+				"update download SSE with HTTP(S), multiple files, SHA512, and 512 MiB cap",
+				"runtime scan/cached/cleanup for terminals, containers, browsers, and Go-specific worktree cleanup",
+				"storage scan/cached/cleanup/database preview/database cleanup and disabled VACUUM contract"
+			],
+			"fallbacks": [
+				{ "feature": "update.selfApply", "supported": false, "mode": "manual-only" },
+				{ "feature": "update.autoRestart", "supported": false, "mode": "manual-only" },
+				{ "feature": "storage.cachedScan", "supported": false, "mode": "cached:false" },
+				{
+					"feature": "storage.cleanup.worktrees",
+					"supported": false,
+					"alternative": "runtime.cleanup.worktrees"
+				},
+				{
+					"feature": "storage.cleanup.containersPrune",
+					"supported": false,
+					"alternative": "runtime.cleanup.containers"
+				},
+				{
+					"feature": "storage.vacuum",
+					"supported": false,
+					"reason": "Main-thread SQLite VACUUM is disabled in request handling."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/systemroutes/handlers.go",
+				"go_backend/internal/misccompat/handlers.go",
+				"go_backend/internal/app/router.go"
+			],
+			"tests": [
+				"go_backend/internal/systemroutes/update_contract_test.go",
+				"go_backend/internal/systemroutes/runtime_cleanup_test.go",
+				"go_backend/internal/systemroutes/runtime_container_test.go",
+				"go_backend/internal/misccompat/routes_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		}
+	]
+}
