@@ -2540,6 +2540,9 @@ export function NarratorPanel({
 		initialNkpQuotaBalance: nkpProviderInfo?.quotaBalance,
 		nkpProviderId: nkpProviderInfo?.providerId,
 		onDraftChanged: handleDraftChanged,
+		onQueuedNewNarratorCreated: (newNarratorId) => {
+			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
+		},
 	});
 	const {
 		disconnected,
@@ -2561,6 +2564,7 @@ export function NarratorPanel({
 		pruneBoundaryMessageId,
 		prunedPercent,
 		nkpQuotaBalance,
+		quotaBalance,
 		retryInfo,
 		currentTodos,
 		todosToolUseId,
@@ -5419,6 +5423,11 @@ export function NarratorPanel({
 
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
+				if (isActive) {
+					await doSendBuffered(msg);
+					return;
+				}
+
 				const initialMessage = newMatch[1]?.trim() ?? "";
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
@@ -7629,6 +7638,25 @@ export function NarratorPanel({
 										<Tooltip label={t("nkpQuotaBalance", { balance: nkpQuotaBalance.toFixed(2) })}>
 											<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
 												${nkpQuotaBalance.toFixed(2)}
+											</Text>
+										</Tooltip>
+									)}
+									{/* Generic gateway/API quota balance */}
+									{quotaBalance != null && (
+										<Tooltip label={t("quotaBalance", { balance: quotaBalance })}>
+											<Text
+												size="xs"
+												c="dimmed"
+												style={{
+													flexShrink: 0,
+													cursor: "default",
+													maxWidth: 120,
+													overflow: "hidden",
+													textOverflow: "ellipsis",
+													whiteSpace: "nowrap",
+												}}
+											>
+												{quotaBalance}
 											</Text>
 										</Tooltip>
 									)}

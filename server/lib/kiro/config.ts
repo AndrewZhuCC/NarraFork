@@ -2,7 +2,15 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { KiroConfig, KiroCredentials } from "./types";
+import type {
+	AccountTier,
+	ConcurrencyPlanConfig,
+	ConcurrencySettings,
+	KiroConfig,
+	KiroCredentials,
+	RequestIntervalSettings,
+	UsageCacheEntry,
+} from "./types";
 
 const SYSTEM_VERSIONS = ["darwin#24.6.0", "win32#10.0.22631"] as const;
 
@@ -10,18 +18,28 @@ function randomSystemVersion(): string {
 	return SYSTEM_VERSIONS[Math.floor(Math.random() * SYSTEM_VERSIONS.length)];
 }
 
+const DEFAULT_CONCURRENCY_PLAN: ConcurrencyPlanConfig = { initialMax: 3, ceiling: 8, floor: 1 };
+const DEFAULT_CONCURRENCY: ConcurrencySettings = { default: { ...DEFAULT_CONCURRENCY_PLAN } };
+const DEFAULT_REQUEST_INTERVAL: RequestIntervalSettings = { free: 0, enterprise: 0, paid: 0 };
+const DEFAULT_TIER_PRIORITY: AccountTier[] = ["free", "enterprise", "paid"];
+
 const CONFIG_DEFAULTS: KiroConfig = {
 	region: "us-east-1",
 	kiroVersion: "1.26.1",
 	systemVersion: randomSystemVersion(),
 	nodeVersion: "22.21.1",
+	loadBalancingMode: "priority",
+	ignoreTierPriority: false,
+	tierPriority: [...DEFAULT_TIER_PRIORITY],
+	concurrency: { ...DEFAULT_CONCURRENCY },
+	requestInterval: { ...DEFAULT_REQUEST_INTERVAL },
 };
 
 function canonicalizeAuthMethod(creds: KiroCredentials): void {
 	const m = creds.authMethod;
 	if (!m) return;
 	const lower = m.toLowerCase();
-	if (lower === "builder-id" || lower === "iam") {
+	if (lower === "iam") {
 		creds.authMethod = "idc";
 	}
 }
@@ -49,25 +67,84 @@ export function loadCredentials(path: string): KiroCredentials | null {
 	}
 }
 
+function parseTierPriority(value: unknown): AccountTier[] {
+	if (!Array.isArray(value)) return [...DEFAULT_TIER_PRIORITY];
+	const result = value.filter(
+		(v): v is AccountTier => v === "free" || v === "enterprise" || v === "paid",
+	);
+	return result.length > 0 ? result : [...DEFAULT_TIER_PRIORITY];
+}
+
+function parsePlanConfig(value: unknown): ConcurrencyPlanConfig | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const initialMax = Number(record.initialMax);
+	const ceiling = Number(record.ceiling);
+	const floor = Number(record.floor);
+	if (!Number.isFinite(initialMax) || !Number.isFinite(ceiling) || !Number.isFinite(floor)) {
+		return undefined;
+	}
+	return {
+		initialMax: Math.max(1, Math.floor(initialMax)),
+		ceiling: Math.max(1, Math.floor(ceiling)),
+		floor: Math.max(1, Math.floor(floor)),
+	};
+}
+
+function parseConcurrency(value: unknown): ConcurrencySettings {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return { default: { ...DEFAULT_CONCURRENCY_PLAN } };
+	}
+	const record = value as Record<string, unknown>;
+	const parsed: ConcurrencySettings = {
+		default: parsePlanConfig(record.default) ?? { ...DEFAULT_CONCURRENCY_PLAN },
+	};
+	for (const key of ["free", "pro", "pro_plus", "power"] as const) {
+		const cfg = parsePlanConfig(record[key]);
+		if (cfg) parsed[key] = cfg;
+	}
+	return parsed;
+}
+
+function parseRequestInterval(value: unknown): RequestIntervalSettings {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		return { ...DEFAULT_REQUEST_INTERVAL };
+	}
+	const record = value as Record<string, unknown>;
+	return {
+		free: Math.max(0, Number(record.free) || 0),
+		enterprise: Math.max(0, Number(record.enterprise) || 0),
+		paid: Math.max(0, Number(record.paid) || 0),
+	};
+}
+
 export function loadConfig(path: string): KiroConfig {
 	if (!existsSync(path)) return { ...CONFIG_DEFAULTS };
 	try {
 		const raw = readFileSync(path, "utf-8").trim();
 		if (!raw) return { ...CONFIG_DEFAULTS };
-		const parsed = JSON.parse(raw);
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
 		return {
-			region: parsed.region ?? CONFIG_DEFAULTS.region,
-			authRegion: parsed.authRegion ?? undefined,
-			apiRegion: parsed.apiRegion ?? undefined,
-			kiroVersion: parsed.kiroVersion ?? CONFIG_DEFAULTS.kiroVersion,
-			machineId: parsed.machineId ?? undefined,
-			systemVersion: parsed.systemVersion ?? CONFIG_DEFAULTS.systemVersion,
-			nodeVersion: parsed.nodeVersion ?? CONFIG_DEFAULTS.nodeVersion,
-			loadBalancingMode: parsed.loadBalancingMode === "balanced" ? "balanced" : undefined,
+			region: String(parsed.region ?? CONFIG_DEFAULTS.region),
+			authRegion: typeof parsed.authRegion === "string" ? parsed.authRegion : undefined,
+			apiRegion: typeof parsed.apiRegion === "string" ? parsed.apiRegion : undefined,
+			kiroVersion: String(parsed.kiroVersion ?? CONFIG_DEFAULTS.kiroVersion),
+			machineId: typeof parsed.machineId === "string" ? parsed.machineId : undefined,
+			systemVersion: String(parsed.systemVersion ?? CONFIG_DEFAULTS.systemVersion),
+			nodeVersion: String(parsed.nodeVersion ?? CONFIG_DEFAULTS.nodeVersion),
+			loadBalancingMode: parsed.loadBalancingMode === "balanced" ? "balanced" : "priority",
+			ignoreTierPriority: parsed.ignoreTierPriority === true,
+			tierPriority: parseTierPriority(parsed.tierPriority),
+			concurrency: parseConcurrency(parsed.concurrency),
+			requestInterval: parseRequestInterval(parsed.requestInterval),
 		};
 	} catch {
 		return { ...CONFIG_DEFAULTS };
 	}
+}
+
+export function saveConfig(path: string, config: KiroConfig): void {
+	writeFileSync(path, JSON.stringify(config, null, 2));
 }
 
 export function saveCredentials(path: string, creds: KiroCredentials): void {
@@ -138,8 +215,6 @@ export function saveStats(credentialsPath: string, stats: Record<string, StatsEn
 }
 
 // --- Usage cache ---
-
-import type { UsageCacheEntry } from "./types";
 
 /** Load usage cache from kiro_usage.json in the same directory as credentialsPath. */
 export function loadUsageCache(credentialsPath: string): Record<string, UsageCacheEntry> {

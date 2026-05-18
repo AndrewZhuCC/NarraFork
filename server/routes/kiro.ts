@@ -8,7 +8,6 @@ import {
 	isKiroAvailable,
 	kiroChat,
 	kiroChatRaw,
-	kiroFetchAllCredentialModels,
 	kiroFetchCredentialModels,
 	kiroGetAllUsageCache,
 	kiroGetCachedModels,
@@ -17,6 +16,7 @@ import {
 	kiroManualRefresh,
 	kiroMcpCall,
 	kiroMcpListTools,
+	kiroQueueUsageFetch,
 	kiroRefreshModelCache,
 	kiroRemoveCredential,
 	kiroResetAndEnable,
@@ -25,6 +25,7 @@ import {
 	kiroSetPriority,
 	kiroSnapshot,
 	kiroUpdateCredential,
+	kiroUsageQueueSnapshot,
 } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
@@ -59,6 +60,7 @@ kiroRoutes.get("/status", (c) => {
 		available: isKiroAvailable(),
 		snapshot,
 		usageCache: kiroGetAllUsageCache(),
+		usageQueue: kiroUsageQueueSnapshot(),
 		globalProxy: settings.kiro?.proxy,
 	};
 
@@ -69,12 +71,11 @@ kiroRoutes.get("/status", (c) => {
 			if (entry.meterUsage == null && !autoFetchingUsage.has(entry.id)) {
 				autoFetchingUsage.add(entry.id);
 				const timeout = setTimeout(() => autoFetchingUsage.delete(entry.id), 30_000);
-				kiroGetUsage(entry.id)
-					.catch(() => {})
-					.finally(() => {
-						clearTimeout(timeout);
-						autoFetchingUsage.delete(entry.id);
-					});
+				kiroQueueUsageFetch(entry.id);
+				setTimeout(() => {
+					clearTimeout(timeout);
+					autoFetchingUsage.delete(entry.id);
+				}, 1000);
 			}
 		}
 	}
@@ -223,10 +224,8 @@ kiroRoutes.post("/models/refresh", async (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
 	try {
-		// Fetch models for all credentials (stores per-credential) and get deduplicated union
-		const allModels = await kiroFetchAllCredentialModels();
-		// Also update the system-wide cache
-		await kiroRefreshModelCache();
+		// Fetch models for all credentials, store per-credential, and cache the deduplicated union.
+		const allModels = await kiroRefreshModelCache();
 		return c.json({ models: allModels, fromCache: false });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";

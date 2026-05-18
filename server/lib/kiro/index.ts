@@ -10,6 +10,7 @@ import {
 	loadConfig,
 	loadUsageCache,
 	saveAllCredentials,
+	saveConfig,
 	saveUsageCache,
 } from "./config";
 import { parseEventStream, type StreamEvent } from "./event-stream-parser";
@@ -24,6 +25,7 @@ import type {
 	McpResponse,
 	UsageCacheEntry,
 } from "./types";
+import { kiroUsageFetchQueue } from "./usage-fetch-queue";
 
 let tokenManager: MultiTokenManager | null = null;
 let apiClient: KiroApiClient | null = null;
@@ -99,13 +101,19 @@ export async function* kiroChatRaw(
 ): AsyncGenerator<StreamEvent> {
 	if (!apiClient) throw new Error("Kiro not initialized — call initKiro() first");
 
-	const { response: res, credentialId } = await apiClient.sendChatRequest(request, signal);
-	if (!res.body) throw new Error("No response body");
+	const { response: res, credentialId, release } = await apiClient.sendChatRequest(request, signal);
+	if (!res.body) {
+		release();
+		throw new Error("No response body");
+	}
 
-	// Emit synthetic credential event so consumers can associate metering with the credential
-	yield { eventType: "credentialIdEvent", data: { credentialId } };
-
-	yield* parseEventStream(res.body);
+	try {
+		// Emit synthetic credential event so consumers can associate metering with the credential
+		yield { eventType: "credentialIdEvent", data: { credentialId } };
+		yield* parseEventStream(res.body);
+	} finally {
+		release();
+	}
 }
 
 /** Convenience: stream events from a simple text prompt. */
@@ -168,6 +176,13 @@ export function kiroSetDisabled(id: string, disabled: boolean): void {
 export function kiroSetLoadBalancingMode(mode: "priority" | "balanced"): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.setLoadBalancingMode(mode);
+	if (pluginConfig) {
+		try {
+			saveConfig(pluginConfig.configPath, tokenManager.currentConfig);
+		} catch {
+			// Non-critical: runtime mode is already updated.
+		}
+	}
 }
 
 export function kiroSetPriority(id: string, priority: number): void {
@@ -292,11 +307,21 @@ export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	return loadUsageCache(credentialsPath);
 }
 
+export function kiroQueueUsageFetch(id: string): void {
+	kiroUsageFetchQueue.enqueue(id);
+}
+
+export function kiroUsageQueueSnapshot(): ReturnType<typeof kiroUsageFetchQueue.getSnapshot> {
+	return kiroUsageFetchQueue.getSnapshot();
+}
+
 /** Accumulate metering usage for a credential (debounced persistence). */
 export function kiroAddMeterUsage(credentialId: string, amount: number): void {
 	if (!tokenManager) return;
 	tokenManager.addMeterUsage(credentialId, amount);
 }
+
+kiroUsageFetchQueue.setExecutor((credentialId) => kiroGetUsage(credentialId));
 
 export { EventStreamDecoder, type StreamEvent } from "./event-stream-parser";
 // Re-export types for consumers

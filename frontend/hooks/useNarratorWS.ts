@@ -102,6 +102,7 @@ interface NarratorWSCallbacks {
 	) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
+	onQueuedNewNarratorCreated?: (messageId: string, newNarratorId: string) => void;
 	onBufferCleared?: (reason: "cancelled" | "sent" | "narrator_error") => void;
 	onBufferPreserved?: (messages: BufferMessageSummary[]) => void;
 	onGoalsSet?: (goals: NarratorGoal[]) => void;
@@ -510,6 +511,12 @@ export function useNarratorWS(
 							data.remaining as BufferMessageSummary[],
 						);
 						break;
+					case "queued_new_narrator_created":
+						callbacksRef.current.onQueuedNewNarratorCreated?.(
+							data.messageId as string,
+							data.newNarratorId as string,
+						);
+						break;
 					case "buffer_cleared":
 						callbacksRef.current.onBufferCleared?.(
 							data.reason as "cancelled" | "sent" | "narrator_error",
@@ -629,9 +636,13 @@ export function useNarratorWS(
 							data.queueDepth as number,
 						);
 						break;
-					case "quota_balance":
-						callbacksRef.current.onQuotaBalance?.((data.quotaBalance as string) ?? null);
+					case "quota_balance": {
+						const quotaBalance = data.quotaBalance;
+						callbacksRef.current.onQuotaBalance?.(
+							quotaBalance == null ? null : String(quotaBalance),
+						);
 						break;
+					}
 					case "queue_status":
 						callbacksRef.current.onQueueStatus?.(
 							data.position as number | undefined,

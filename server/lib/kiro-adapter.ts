@@ -22,7 +22,12 @@ export interface KiroPluginConfig {
 	defaultModel?: KiroModel;
 }
 
-export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
+export type DisabledReason =
+	| "manual"
+	| "too_many_failures"
+	| "quota_exhausted"
+	| "account_suspended"
+	| "suspicious_throttle";
 export type LoadBalancingMode = "priority" | "balanced";
 
 export interface CredentialSnapshot {
@@ -42,6 +47,18 @@ export interface CredentialSnapshot {
 	region?: string;
 	meterUsage?: number;
 	availableModels?: string[];
+	tier?: "free" | "enterprise" | "paid";
+}
+
+export interface KiroConcurrencySnapshot {
+	maxConcurrency: number;
+	activeConcurrency: number;
+	queueDepth: number;
+	lastThrottleTs: number;
+	consecutiveSuccess: number;
+	backoffMs: number;
+	lastRequestTs: number;
+	blockedUntil: number;
 }
 
 export interface ManagerSnapshot {
@@ -50,6 +67,9 @@ export interface ManagerSnapshot {
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
+	concurrencyStates?: Record<string, KiroConcurrencySnapshot>;
+	rpmCounts?: Record<string, number>;
+	throttleCounts?: Record<string, { recent: number; total: number }>;
 }
 
 export interface McpResponse {
@@ -71,6 +91,25 @@ export interface UsageCacheEntry {
 	usagePercentage: number;
 	nextResetAt?: number;
 	queriedAt: string;
+	overageStatus?: string;
+	overageLimit?: number;
+	overageCap?: number;
+	overageRate?: number;
+	overageCharges?: number;
+	currentOverages?: number;
+}
+
+export interface UsageQueueSnapshot {
+	items: Array<{
+		id: string;
+		credentialId: string;
+		status: "pending" | "processing" | "done" | "failed";
+		error?: string;
+		addedAt: number;
+		startedAt?: number;
+		finishedAt?: number;
+	}>;
+	isRunning: boolean;
 }
 
 export interface ImportCredentialInput {
@@ -203,6 +242,8 @@ export interface KiroModule {
 	kiroImportCredentials(creds: ImportCredentialInput[]): { added: number; duplicates: number };
 	kiroGetUsage(id: string): Promise<UsageCacheEntry>;
 	kiroGetAllUsageCache(): Record<string, UsageCacheEntry>;
+	kiroQueueUsageFetch(id: string): void;
+	kiroUsageQueueSnapshot(): UsageQueueSnapshot;
 	kiroAddMeterUsage(credentialId: string, amount: number): void;
 	kiroListModels(
 		credentialId?: string,
@@ -344,6 +385,14 @@ export function kiroGetAllUsageCache(): Record<string, UsageCacheEntry> {
 	return mod?.kiroGetAllUsageCache() ?? {};
 }
 
+export function kiroQueueUsageFetch(id: string): void {
+	mod?.kiroQueueUsageFetch?.(id);
+}
+
+export function kiroUsageQueueSnapshot(): UsageQueueSnapshot {
+	return mod?.kiroUsageQueueSnapshot?.() ?? { items: [], isRunning: false };
+}
+
 /** Accumulate metering usage for a credential (debounced persistence). */
 export function kiroAddMeterUsage(credentialId: string, amount: number): void {
 	mod?.kiroAddMeterUsage(credentialId, amount);
@@ -402,6 +451,15 @@ function saveModelCacheToDisk(models: Array<Record<string, unknown>>): void {
 // Eagerly load from disk so kiroGetCachedModels() returns data immediately
 loadModelCacheFromDisk();
 
+function normalizeKiroModelCache(
+	models: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+	return models.map((m) => {
+		const name = String(m.model_name ?? m.modelName ?? "");
+		return { ...m, model_short_name: name.replace(/^Claude\s+/i, "") };
+	});
+}
+
 // Register kiro model checker and lister
 registerKiroModelChecker((model) =>
 	cachedKiroModels.some((m) => String(m.model_id ?? m.modelId ?? "") === model),
@@ -417,11 +475,8 @@ registerKiroModelLister(() =>
 export async function kiroRefreshModelCache(): Promise<Array<Record<string, unknown>>> {
 	if (!mod?.isKiroAvailable()) return cachedKiroModels;
 	try {
-		const result = await mod.kiroListModels();
-		cachedKiroModels = result.models.map((m) => {
-			const name = String(m.model_name ?? m.modelName ?? "");
-			return { ...m, model_short_name: name.replace(/^Claude\s+/i, "") };
-		});
+		const models = await mod.kiroFetchAllCredentialModels();
+		cachedKiroModels = normalizeKiroModelCache(models);
 		saveModelCacheToDisk(cachedKiroModels);
 		return cachedKiroModels;
 	} catch {

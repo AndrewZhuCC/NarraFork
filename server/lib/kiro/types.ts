@@ -1,5 +1,30 @@
 // Kiro plugin types — reverse-engineered from kiro CLI chat
 
+export type AccountTier = "free" | "enterprise" | "paid";
+
+export interface ConcurrencyPlanConfig {
+	/** Initial adaptive concurrency window. */
+	initialMax: number;
+	/** Maximum adaptive concurrency window. */
+	ceiling: number;
+	/** Minimum adaptive concurrency window. */
+	floor: number;
+}
+
+export interface ConcurrencySettings {
+	default: ConcurrencyPlanConfig;
+	free?: ConcurrencyPlanConfig;
+	pro?: ConcurrencyPlanConfig;
+	pro_plus?: ConcurrencyPlanConfig;
+	power?: ConcurrencyPlanConfig;
+}
+
+export interface RequestIntervalSettings {
+	free: number;
+	enterprise: number;
+	paid: number;
+}
+
 export interface KiroCredentials {
 	id?: string;
 	accessToken?: string;
@@ -25,10 +50,12 @@ export interface KiroCredentials {
 	meterUsage?: number;
 	/** Model IDs available to this credential (fetched from ListAvailableModels API). */
 	availableModels?: string[];
-	/** Whether this credential is manually disabled (persisted across restarts). */
+	/** Whether this credential is disabled (manual disables persist; runtime disables may recover). */
 	disabled?: boolean;
-	/** Reason for disabling (persisted across restarts). */
+	/** Reason for disabling (persisted across restarts for durable reasons). */
 	disabledReason?: DisabledReason;
+	/** ISO timestamp when the credential was disabled. Used for cooldown recovery. */
+	disabledAt?: string;
 }
 
 export interface KiroConfig {
@@ -40,6 +67,14 @@ export interface KiroConfig {
 	systemVersion: string;
 	nodeVersion: string;
 	loadBalancingMode?: LoadBalancingMode;
+	/** When true, all tiers are balanced together instead of honoring tier order. */
+	ignoreTierPriority?: boolean;
+	/** Account tier order. Lower index is consumed first. */
+	tierPriority?: AccountTier[];
+	/** Adaptive concurrency window settings. */
+	concurrency?: ConcurrencySettings;
+	/** Minimum request interval per credential tier, in milliseconds. */
+	requestInterval?: RequestIntervalSettings;
 }
 
 export type KiroModel =
@@ -92,7 +127,12 @@ export class KiroQuotaError extends KiroError {
 
 // --- Multi-credential management ---
 
-export type DisabledReason = "manual" | "too_many_failures" | "quota_exhausted";
+export type DisabledReason =
+	| "manual"
+	| "too_many_failures"
+	| "quota_exhausted"
+	| "account_suspended"
+	| "suspicious_throttle";
 export type LoadBalancingMode = "priority" | "balanced";
 
 export interface CredentialEntry {
@@ -129,6 +169,18 @@ export interface CredentialSnapshot {
 	region?: string;
 	meterUsage?: number;
 	availableModels?: string[];
+	tier?: AccountTier;
+}
+
+export interface KiroConcurrencySnapshot {
+	maxConcurrency: number;
+	activeConcurrency: number;
+	queueDepth: number;
+	lastThrottleTs: number;
+	consecutiveSuccess: number;
+	backoffMs: number;
+	lastRequestTs: number;
+	blockedUntil: number;
 }
 
 export interface ManagerSnapshot {
@@ -137,6 +189,9 @@ export interface ManagerSnapshot {
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
 	available: number;
+	concurrencyStates?: Record<string, KiroConcurrencySnapshot>;
+	rpmCounts?: Record<string, number>;
+	throttleCounts?: Record<string, { recent: number; total: number }>;
 }
 
 // --- Usage ---
@@ -150,6 +205,12 @@ export interface UsageCacheEntry {
 	usagePercentage: number;
 	nextResetAt?: number;
 	queriedAt: string; // ISO 8601
+	overageStatus?: string;
+	overageLimit?: number;
+	overageCap?: number;
+	overageRate?: number;
+	overageCharges?: number;
+	currentOverages?: number;
 }
 
 // --- Decoder ---

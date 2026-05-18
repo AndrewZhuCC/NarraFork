@@ -2,17 +2,37 @@
 // Multi-credential failover mode using MultiTokenManager
 
 import { randomUUID } from "node:crypto";
+import {
+	acquireSlot,
+	acquireSlotPriority,
+	onSuccess as concurrencySuccess,
+	onThrottle as concurrencyThrottle,
+	getBackoffMs,
+	recordRequest,
+	recordThrottle,
+	releaseSlot,
+	touchLastRequest,
+} from "./concurrency-control";
 import { effectiveApiRegion } from "./config";
-import type { MultiTokenManager } from "./multi-token-manager";
+import { classifyKiroCredentialTier, type MultiTokenManager } from "./multi-token-manager";
 import { pfetch } from "./proxy";
+import {
+	isAccountSuspended,
+	isContextLengthExceeded,
+	isMonthlyRequestLimit,
+	isSuspiciousThrottle,
+} from "./quota-check";
 import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } from "./types";
 
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
+const MAX_THROTTLE_RETRIES = 3;
 
 export interface ChatResponse {
 	response: Response;
 	credentialId: string;
+	/** Release the held streaming slot. Must be called when response body consumption ends. */
+	release: () => void;
 }
 
 export class KiroApiClient {
@@ -22,15 +42,16 @@ export class KiroApiClient {
 	async sendChatRequest(request: KiroChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
 		const model = request.conversationState.currentMessage.userInputMessage.modelId;
 		const maxRetries = this.tokenManager.maxRetries;
+		const failedCredentialIds = new Set<string>();
 		let lastError: Error | null = null;
 
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			let ctx: CallContext;
 			try {
-				ctx = await this.tokenManager.acquireContext(model);
+				ctx = await this.tokenManager.acquireContext(model, failedCredentialIds);
 			} catch (err) {
 				lastError = err instanceof Error ? err : new Error(String(err));
-				continue;
+				break;
 			}
 
 			const agentMode =
@@ -45,39 +66,80 @@ export class KiroApiClient {
 			}
 			const region = effectiveApiRegion(this.tokenManager.currentConfig);
 			const url = `https://q.${region}.amazonaws.com`;
-
+			const tier = classifyKiroCredentialTier(ctx.credentials);
+			const slotState = { held: false };
 			let res: Response;
+
 			try {
-				res = await pfetch(url, {
-					method: "POST",
-					headers,
-					body: JSON.stringify(body),
-					signal,
-				});
+				await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
+				slotState.held = true;
+				res = await this.fetchWithThrottleRetry(
+					() =>
+						pfetch(url, {
+							method: "POST",
+							headers,
+							body: JSON.stringify(body),
+							signal,
+						}),
+					ctx,
+					slotState,
+				);
 			} catch (err) {
+				if (slotState.held) releaseSlot(ctx.id);
 				lastError = err instanceof Error ? err : new Error(String(err));
 				if (attempt + 1 < maxRetries) await this.delay(attempt);
 				continue;
 			}
 
+			const releaseHeld = () => {
+				if (!slotState.held) return;
+				releaseSlot(ctx.id);
+				slotState.held = false;
+			};
+
 			if (res.ok) {
+				concurrencySuccess(ctx.id);
 				this.tokenManager.reportSuccess(ctx.id);
-				return { response: res, credentialId: ctx.id };
+				return {
+					response: res,
+					credentialId: ctx.id,
+					release: releaseHeld,
+				};
 			}
 
 			const resBody = await res.text().catch(() => "");
 
-			// 400: bad request, don't retry
+			// Suspicious activity throttle may arrive as 400 or 429. Do not retry with
+			// the same credential; cool it down and fail over.
+			if (isSuspiciousThrottle(resBody)) {
+				releaseHeld();
+				failedCredentialIds.add(ctx.id);
+				this.tokenManager.reportSuspiciousThrottle(ctx.id);
+				lastError = new KiroApiError("SUSPICIOUS_THROTTLE", resBody, res.status);
+				continue;
+			}
+
+			// 400: bad request, don't retry unless it is quota exhaustion.
 			if (res.status === 400) {
-				// Detect context window overflow specifically
-				if (this.isContentLengthExceeded(resBody)) {
+				if (isMonthlyRequestLimit(resBody)) {
+					releaseHeld();
+					failedCredentialIds.add(ctx.id);
+					const hasAvailable = this.tokenManager.reportQuotaExhausted(ctx.id);
+					if (!hasAvailable) throw new KiroQuotaError(resBody);
+					lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
+					continue;
+				}
+				releaseHeld();
+				if (isContextLengthExceeded(resBody)) {
 					throw new KiroApiError("CONTEXT_LENGTH_EXCEEDED", resBody, 400);
 				}
 				throw new KiroApiError("BAD_REQUEST", resBody, 400);
 			}
 
 			// 402 + quota exhausted
-			if (res.status === 402 && this.isMonthlyRequestLimit(resBody)) {
+			if (res.status === 402 && isMonthlyRequestLimit(resBody)) {
+				releaseHeld();
+				failedCredentialIds.add(ctx.id);
 				const hasAvailable = this.tokenManager.reportQuotaExhausted(ctx.id);
 				if (!hasAvailable) throw new KiroQuotaError(resBody);
 				lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 402);
@@ -86,7 +148,12 @@ export class KiroApiClient {
 
 			// 401/403: credential failure, failover to next
 			if (res.status === 401 || res.status === 403) {
-				const hasAvailable = this.tokenManager.reportFailure(ctx.id);
+				releaseHeld();
+				failedCredentialIds.add(ctx.id);
+				const hasAvailable = this.tokenManager.reportFailure(
+					ctx.id,
+					isAccountSuspended(resBody) ? "account_suspended" : undefined,
+				);
 				if (!hasAvailable) {
 					throw new KiroApiError("AUTH_FAILED", resBody, res.status);
 				}
@@ -94,18 +161,53 @@ export class KiroApiClient {
 				continue;
 			}
 
-			// 429/5xx: transient, retry with backoff (don't switch credential)
-			if (res.status === 408 || res.status === 429 || res.status >= 500) {
+			// 429 after inner backoff retries are exhausted: give up for this request.
+			if (res.status === 429) {
+				releaseHeld();
+				throw new KiroApiError("THROTTLED", resBody, 429);
+			}
+
+			// 408/5xx: transient, retry with backoff
+			if (res.status === 408 || res.status >= 500) {
+				releaseHeld();
 				lastError = new KiroApiError("TRANSIENT", resBody, res.status);
 				if (attempt + 1 < maxRetries) await this.delay(attempt);
 				continue;
 			}
 
-			// Other client errors
+			releaseHeld();
 			throw new KiroApiError("API_ERROR", resBody, res.status);
 		}
 
 		throw lastError ?? new Error("Max retries exceeded");
+	}
+
+	private async fetchWithThrottleRetry(
+		fetchFn: () => Promise<Response>,
+		ctx: CallContext,
+		slotState: { held: boolean },
+	): Promise<Response> {
+		const tier = classifyKiroCredentialTier(ctx.credentials);
+		for (let i = 0; ; i++) {
+			recordRequest(ctx.id);
+			const response = await fetchFn();
+			if (response.status !== 429 || i >= MAX_THROTTLE_RETRIES) return response;
+
+			const bodyText = await response.text().catch(() => "");
+			if (isSuspiciousThrottle(bodyText)) {
+				return new Response(bodyText, { status: 429, headers: response.headers });
+			}
+
+			if (i === 0) concurrencyThrottle(ctx.id);
+			touchLastRequest(ctx.id);
+			recordThrottle(ctx.id);
+
+			releaseSlot(ctx.id);
+			slotState.held = false;
+			await new Promise((resolve) => setTimeout(resolve, getBackoffMs(ctx.id)));
+			await acquireSlotPriority(ctx.id, tier, ctx.credentials.subscriptionTitle);
+			slotState.held = true;
+		}
 	}
 
 	private buildHeaders(
@@ -134,26 +236,6 @@ export class KiroApiClient {
 			"x-amzn-codewhisperer-ide": "kiro",
 			"x-amzn-codewhisperer-ide-version": kiroVersion,
 		};
-	}
-
-	private isContentLengthExceeded(body: string): boolean {
-		if (body.includes("CONTENT_LENGTH_EXCEEDS_THRESHOLD")) return true;
-		try {
-			const json = JSON.parse(body);
-			if (json?.reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD") return true;
-			if (json?.error?.reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD") return true;
-		} catch {}
-		return false;
-	}
-
-	private isMonthlyRequestLimit(body: string): boolean {
-		if (body.includes("MONTHLY_REQUEST_COUNT")) return true;
-		try {
-			const json = JSON.parse(body);
-			if (json?.reason === "MONTHLY_REQUEST_COUNT") return true;
-			if (json?.error?.reason === "MONTHLY_REQUEST_COUNT") return true;
-		} catch {}
-		return false;
 	}
 
 	private delay(attempt: number): Promise<void> {
