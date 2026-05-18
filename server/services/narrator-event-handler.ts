@@ -17,6 +17,7 @@ import {
 	finishApiRequest,
 	startApiRequest,
 } from "../lib/api-request-tracker";
+import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
@@ -1425,7 +1426,15 @@ export async function processEvent(
 				type: "quota_balance",
 				narratorId: broadcastTargetId,
 				quotaBalance: event.quotaBalance,
+				detailedQuotaBalance: event.detailedQuotaBalance,
 			});
+			if (ctx.providerPrefix) {
+				updateCustomApiQuotaByPrefix(
+					ctx.providerPrefix,
+					event.quotaBalance,
+					event.detailedQuotaBalance,
+				);
+			}
 			return null;
 		}
 

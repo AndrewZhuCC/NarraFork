@@ -2525,6 +2525,27 @@ export function NarratorPanel({
 		};
 	}, [resolvedModel, settingsData?.nkpProviders, settingsData?.nkpQuotas]);
 
+	// Resolve custom API provider info for initial generic quota balance
+	const customApiProviderInfo = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const customApiProviders: Array<{ id: string; prefix?: string }> =
+			settingsData?.customApiProviders ?? [];
+		const cfg = customApiProviders.find((p) => p.prefix === prefix);
+		if (!cfg) return null;
+		const quotas = settingsData?.customApiQuotas as
+			| Record<string, { quotaBalance: string | null; detailedQuotaBalance?: string | null }>
+			| undefined;
+		const quota = quotas?.[cfg.id];
+		const rawDetailedQuotaBalance = quota?.detailedQuotaBalance;
+		const detailedQuotaBalance = rawDetailedQuotaBalance?.trim() ? rawDetailedQuotaBalance : null;
+		return {
+			providerId: cfg.id,
+			quotaBalance: quota?.quotaBalance ?? null,
+			detailedQuotaBalance,
+		};
+	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.customApiQuotas]);
+
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -2539,6 +2560,9 @@ export function NarratorPanel({
 		narratorSubstatus,
 		initialNkpQuotaBalance: nkpProviderInfo?.quotaBalance,
 		nkpProviderId: nkpProviderInfo?.providerId,
+		initialQuotaBalance: customApiProviderInfo?.quotaBalance,
+		initialDetailedQuotaBalance: customApiProviderInfo?.detailedQuotaBalance,
+		customApiProviderId: customApiProviderInfo?.providerId,
 		onDraftChanged: handleDraftChanged,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
@@ -2565,6 +2589,7 @@ export function NarratorPanel({
 		prunedPercent,
 		nkpQuotaBalance,
 		quotaBalance,
+		detailedQuotaBalance,
 		retryInfo,
 		currentTodos,
 		todosToolUseId,
@@ -7643,7 +7668,20 @@ export function NarratorPanel({
 									)}
 									{/* Generic gateway/API quota balance */}
 									{quotaBalance != null && (
-										<Tooltip label={t("quotaBalance", { balance: quotaBalance })}>
+										<Tooltip
+											label={detailedQuotaBalance || t("quotaBalance", { balance: quotaBalance })}
+											styles={
+												detailedQuotaBalance
+													? {
+															tooltip: {
+																whiteSpace: "pre-wrap",
+																overflowWrap: "anywhere",
+																maxWidth: 360,
+															},
+														}
+													: undefined
+											}
+										>
 											<Text
 												size="xs"
 												c="dimmed"

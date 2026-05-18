@@ -259,6 +259,12 @@ export interface UseNarratorPanelWSOptions {
 	initialNkpQuotaBalance?: number | null;
 	/** NKP provider ID for the current narrator model (used to sync quota back to settings cache) */
 	nkpProviderId?: string | null;
+	/** Initial generic gateway/API quota balance from settings cache. */
+	initialQuotaBalance?: string | null;
+	/** Initial generic gateway/API quota details from settings cache. */
+	initialDetailedQuotaBalance?: string | null;
+	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
+	customApiProviderId?: string | null;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
 	 *  substatus survives page navigation (the WS-only path starts from []). */
 	narratorSubstatus?: string[];
@@ -311,6 +317,7 @@ export interface UseNarratorPanelWSReturn {
 	prunedPercent: number | null;
 	nkpQuotaBalance: number | null;
 	quotaBalance: string | null;
+	detailedQuotaBalance: string | null;
 	// Browser sessions
 	browserSessionCount: number;
 	// Retry
@@ -488,6 +495,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		isSubagent,
 		initialNkpQuotaBalance,
 		nkpProviderId,
+		initialQuotaBalance,
+		initialDetailedQuotaBalance,
+		customApiProviderId,
 		narratorSubstatus,
 		onDraftChanged,
 		onQueuedNewNarratorCreated,
@@ -771,12 +781,16 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(
 		initialNkpQuotaBalance ?? null,
 	);
-	const [quotaBalance, setQuotaBalance] = useState<string | null>(null);
-	// Generic gateway balances are transient streaming state; clear them when switching narrators.
-	// biome-ignore lint/correctness/useExhaustiveDependencies: intentional reset on narratorId change
+	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
+	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
+		initialDetailedQuotaBalance ?? null,
+	);
+	// Sync initial generic quota when switching narrators or custom API providers.
+	// biome-ignore lint/correctness/useExhaustiveDependencies: narratorId/providerId must reset same-balance stale runtime state.
 	useEffect(() => {
-		setQuotaBalance(null);
-	}, [narratorId]);
+		setQuotaBalance(initialQuotaBalance ?? null);
+		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
+	}, [narratorId, customApiProviderId, initialQuotaBalance, initialDetailedQuotaBalance]);
 	// Sync initial NKP quota when the narrator switches to a different NKP provider
 	const prevInitialNkpRef = useRef(initialNkpQuotaBalance);
 	useEffect(() => {
@@ -2224,6 +2238,55 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					);
 				});
 			},
+			onGoalReflectionStarted: ({ requestId, toolUseId, inputJson, activeGoal, reason }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status: "pending",
+							...(inputJson ? { inputJson } : {}),
+							permissionDecisionReason: reason ?? "Goal completion reflection in progress",
+							permissionSuggestions: [
+								{ type: "goal_reflection", status: "running", requestId, reason, activeGoal },
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
+			onGoalReflectionResolved: ({ requestId, toolUseId, decision, reason, nextSteps }) => {
+				scheduleCacheUpdate((old) => {
+					if (!old?.pages?.length) return old;
+					const status = decision === "allow" ? "running" : "fail";
+					return mergeFieldsByIndex(
+						old,
+						toolUseId,
+						{
+							status,
+							...(decision === "allow" ? { startedAt: Date.now() } : {}),
+							...(decision !== "allow" ? { errorMessage: reason ?? null } : {}),
+							permissionDecisionReason: reason ?? null,
+							permissionSuggestions: [
+								{
+									type: "goal_reflection",
+									status:
+										decision === "allow"
+											? "confirmed"
+											: decision === "aborted"
+												? "aborted"
+												: "cancelled",
+									requestId,
+									reason,
+									nextSteps,
+								},
+							],
+						},
+						toolUseIndexRef.current,
+					);
+				});
+			},
 			onStatusChange: (status, turnStartedAt, eventSubstatus) => {
 				clearRetryIfActive();
 				// Clean up streaming state when the narrator is no longer actively working.
@@ -2392,8 +2455,37 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onNkpQueueStatus: (position, queueDepth) => {
 				applyQueueStatus(position, queueDepth);
 			},
-			onQuotaBalance: (balance) => {
+			onQuotaBalance: (balance, detailedBalance) => {
 				setQuotaBalance(balance);
+				setDetailedQuotaBalance(detailedBalance ?? null);
+				if (customApiProviderId) {
+					const updateSettingsQuota = (old: unknown) => {
+						if (!old || typeof old !== "object") return old;
+						const settings = old as Record<string, unknown>;
+						const customApiQuotas =
+							settings.customApiQuotas && typeof settings.customApiQuotas === "object"
+								? (settings.customApiQuotas as Record<string, unknown>)
+								: {};
+						const existing =
+							customApiQuotas[customApiProviderId] &&
+							typeof customApiQuotas[customApiProviderId] === "object"
+								? (customApiQuotas[customApiProviderId] as Record<string, unknown>)
+								: {};
+						return {
+							...settings,
+							customApiQuotas: {
+								...customApiQuotas,
+								[customApiProviderId]: {
+									...existing,
+									quotaBalance: balance,
+									detailedQuotaBalance: detailedBalance ?? null,
+								},
+							},
+						};
+					};
+					qc.setQueryData(["settings"], updateSettingsQuota);
+					qc.setQueryData(["admin", "settings"], updateSettingsQuota);
+				}
 			},
 			onQueueStatus: (position, queueDepth, queueMessage) => {
 				applyQueueStatus(position, queueDepth, queueMessage);
@@ -3043,6 +3135,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			prunedPercent,
 			nkpQuotaBalance,
 			quotaBalance,
+			detailedQuotaBalance,
 			browserSessionCount,
 			retryInfo,
 			currentTodos,
@@ -3083,6 +3176,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			prunedPercent,
 			nkpQuotaBalance,
 			quotaBalance,
+			detailedQuotaBalance,
 			browserSessionCount,
 			retryInfo,
 			currentTodos,
