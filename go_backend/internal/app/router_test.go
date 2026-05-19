@@ -66,8 +66,8 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	}
 	var body map[string]any
 	decodeRouterJSON(t, w, &body)
-	if body["version"] != "1.2.3-test" || body["commit"] != "abc123" {
-		t.Fatalf("expected version/commit from env, got %#v", body)
+	if body["version"] != "1.2.3-test" || body["commit"] != "abc123" || body["backend"] != "go" || body["buildChannel"] != "dev" {
+		t.Fatalf("expected version/commit/backend metadata, got %#v", body)
 	}
 	capabilities, _ := body["capabilities"].(map[string]any)
 	vnet, _ := capabilities["vnet"].(map[string]any)
@@ -80,7 +80,7 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	cleanup, _ := storage["cleanup"].(map[string]any)
 	cleanupUploads, _ := cleanup["uploads"].(map[string]any)
 	cleanupWorktrees, _ := cleanup["worktrees"].(map[string]any)
-	if vnet["supported"] != false || vnet["ws"] != false || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != false || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true {
+	if vnet["supported"] != true || vnet["ws"] != true || vnet["mode"] != "relay" || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != true || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true {
 		t.Fatalf("unexpected capability contract: %#v", capabilities)
 	}
 }
@@ -197,7 +197,7 @@ func TestStaticFrontendHostingAndAPIOnlyFallback(t *testing.T) {
 	})
 }
 
-func TestVNetRoutesExposeDisabledCapability(t *testing.T) {
+func TestVNetRoutesExposeRelayCapability(t *testing.T) {
 	router, authService := newRouterContractFixture(t)
 	token, err := authService.CreateToken("user-1", "admin")
 	if err != nil {
@@ -214,8 +214,8 @@ func TestVNetRoutesExposeDisabledCapability(t *testing.T) {
 	}
 	var body map[string]any
 	decodeRouterJSON(t, w, &body)
-	if body["code"] != "VNET_DISABLED" || body["supported"] != false || body["ws"] != false || body["fallback"] != true {
-		t.Fatalf("unexpected vnet disabled body: %#v", body)
+	if body["supported"] != true || body["ws"] != true || body["mode"] != "relay" || body["fallback"] != false {
+		t.Fatalf("unexpected vnet relay body: %#v", body)
 	}
 }
 

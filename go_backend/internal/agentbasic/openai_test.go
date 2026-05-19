@@ -54,8 +54,12 @@ func TestReflectionToolDefinitionsExposeSchemas(t *testing.T) {
 		t.Fatalf("GoalCompleteConfirm should expose confirm/evidence/reflection: %#v", goalConfirmProps)
 	}
 	goalReviseProps, _ := byName["GoalCompleteRevise"].Parameters["properties"].(map[string]any)
-	if goalReviseProps["confirm"] == nil || goalReviseProps["feedback"] == nil {
-		t.Fatalf("GoalCompleteRevise should expose confirm/feedback: %#v", goalReviseProps)
+	if goalReviseProps["confirm"] == nil || goalReviseProps["feedback"] == nil || goalReviseProps["nextSteps"] == nil {
+		t.Fatalf("GoalCompleteRevise should expose confirm/feedback/nextSteps: %#v", goalReviseProps)
+	}
+	goalReviseRequired, _ := byName["GoalCompleteRevise"].Parameters["required"].([]string)
+	if !stringSliceContains(goalReviseRequired, "nextSteps") {
+		t.Fatalf("GoalCompleteRevise should require nextSteps: %#v", goalReviseRequired)
 	}
 	exitConfirmProps, _ := byName["ExitPlanConfirm"].Parameters["properties"].(map[string]any)
 	if exitConfirmProps["confirm"] == nil || exitConfirmProps["reflection"] == nil {
@@ -75,6 +79,15 @@ func TestReviewToolScopeIncludesConcludeReviewAndNormalTools(t *testing.T) {
 	if toolListHasFunction(toolDefinitions("normal"), "ConcludeReview") {
 		t.Fatalf("ConcludeReview leaked into normal tool scope")
 	}
+}
+
+func stringSliceContains(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func toolListHasFunction(tools []map[string]any, name string) bool {

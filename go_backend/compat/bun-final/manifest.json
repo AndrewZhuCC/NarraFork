@@ -1,0 +1,38 @@
+{
+	"artifactVersion": 1,
+	"source": "bun-final",
+	"drizzleLastTag": "0040_talented_pandemic",
+	"artifacts": {
+		"sqliteSchemaSnapshot": {
+			"path": "db/sqlite_schema_snapshot.json",
+			"sha256Path": "db/sqlite_schema_snapshot.sha256",
+			"schemaHash": "6978b55693a2394768a2353e200a8a6347598c0702f5960"
+		},
+		"drizzleJournalSnapshot": {
+			"path": "db/drizzle_journal_snapshot.json",
+			"schemaHash": "c260ac8a49bee7c8027b77690b6faedb226179e9aa001e1fddf75cbf838874bf"
+		},
+		"canonicalSchemaContract": {
+			"path": "db/canonical_schema_contract.json",
+			"schemaHash": "bbd4ac3d4e26e7b61aed9210823885a6f8266c38a3be19abc63248d22a3d02f9"
+		},
+		"roundtripFixture": {
+			"path": "db/roundtrip_fixture.json"
+		},
+		"httpSmokeGolden": {
+			"path": "api/http_smoke_golden.json"
+		},
+		"narratorWSEventInventory": {
+			"path": "ws/narrator_ws_event_inventory.json"
+		},
+		"settingsRoundtripCases": {
+			"path": "settings/settings_roundtrip_cases.json"
+		},
+		"searchRoundtripCases": {
+			"path": "search/search_roundtrip_cases.json"
+		},
+		"ftsSchemaContract": {
+			"path": "search/fts_schema_contract.json"
+		}
+	}
+}

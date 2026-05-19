@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/mail"
+	"regexp"
 	"strings"
 	"time"
 
@@ -24,6 +26,8 @@ type contextKey string
 const userContextKey contextKey = "user"
 
 const tokenExpiry = 7 * 24 * time.Hour
+
+var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 var avatarColors = []string{
 	"#4C6EF5", "#7950F2", "#BE4BDB", "#E64980", "#FA5252", "#FD7E14",
@@ -62,59 +66,43 @@ func NewService(sqlDB *sql.DB, settings *config.Store) *Service {
 }
 
 func (s *Service) Register(ctx context.Context, username, password, language string) (AuthResult, error) {
-	username = strings.TrimSpace(username)
-	if username == "" || len(username) > 100 {
-		return AuthResult{}, httpx.BadRequest("username is required")
+	if len(username) < 3 || len(username) > 50 || !usernamePattern.MatchString(username) {
+		return AuthResult{}, httpx.ValidationError("username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores")
 	}
-	if len(password) < 6 || len(password) > 200 {
-		return AuthResult{}, httpx.BadRequest("password must be 6-200 characters")
+	if len(password) < 8 || len(password) > 128 {
+		return AuthResult{}, httpx.ValidationError("password must be 8-128 characters")
 	}
-	if language == "" {
-		language = "en"
-	}
-
-	var count int
-	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&count); err != nil {
-		return AuthResult{}, err
-	}
-	if count > 0 && !s.Settings.Core().Auth.RegistrationOpen {
-		return AuthResult{}, httpx.Error(http.StatusForbidden, "REGISTRATION_CLOSED", "Registration is closed")
-	}
-
-	var existing string
-	err := s.DB.QueryRowContext(ctx, `SELECT id FROM users WHERE username = ?`, username).Scan(&existing)
-	if err == nil {
-		return AuthResult{}, httpx.Error(http.StatusConflict, "USERNAME_TAKEN", "Username already taken")
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return AuthResult{}, err
+	if len(language) < 1 || len(language) > 10 {
+		return AuthResult{}, httpx.ValidationError("language must be 1-10 characters")
 	}
 
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
 	if err != nil {
 		return AuthResult{}, err
 	}
-	role := "user"
-	if count == 0 {
-		role = "admin"
-	}
 	now := db.NowISO()
 	userID := id.New()
 	prefID := id.New()
 	avatarColor := avatarColors[rand.Intn(len(avatarColors))]
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return AuthResult{}, err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO users (id, username, password_hash, role, avatar_color, created_at) VALUES (?, ?, ?, ?, ?, ?)`, userID, username, string(passwordHash), role, avatarColor, now); err != nil {
-		return AuthResult{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO user_preferences (id, user_id, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, prefID, userID, language, now, now); err != nil {
-		return AuthResult{}, err
-	}
-	if err := tx.Commit(); err != nil {
+	var role string
+	for attempt := 0; ; attempt++ {
+		role, err = s.registerUserTx(
+			ctx,
+			username,
+			string(passwordHash),
+			language,
+			userID,
+			prefID,
+			avatarColor,
+			now,
+		)
+		if err == nil {
+			break
+		}
+		if attempt < 2 && isSerializationFailure(err) {
+			continue
+		}
 		return AuthResult{}, err
 	}
 
@@ -126,7 +114,62 @@ func (s *Service) Register(ctx context.Context, username, password, language str
 	return AuthResult{User: user, Token: token, Language: language}, nil
 }
 
+func (s *Service) registerUserTx(
+	ctx context.Context,
+	username string,
+	passwordHash string,
+	language string,
+	userID string,
+	prefID string,
+	avatarColor string,
+	now string,
+) (string, error) {
+	tx, err := s.DB.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	// Keep bootstrap role selection in the same write statement as the user insert.
+	// The preference row below commits in the same serializable transaction.
+	insertUserQuery := `INSERT INTO users (id, username, password_hash, role, avatar_color, created_at)
+		SELECT ?, ?, ?, CASE WHEN NOT EXISTS (SELECT 1 FROM users) THEN 'admin' ELSE 'user' END, ?, ?`
+	if !s.Settings.Core().Auth.RegistrationOpen {
+		insertUserQuery += ` WHERE NOT EXISTS (SELECT 1 FROM users)`
+	}
+	insertUserQuery += ` RETURNING role`
+
+	var role string
+	if err := tx.QueryRowContext(
+		ctx,
+		insertUserQuery,
+		userID,
+		username,
+		passwordHash,
+		avatarColor,
+		now,
+	).Scan(&role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", httpx.Error(http.StatusForbidden, "REGISTRATION_CLOSED", "Registration is closed")
+		}
+		if isUsernameUniqueViolation(err) {
+			return "", httpx.Error(http.StatusConflict, "USERNAME_TAKEN", "Username already taken")
+		}
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_preferences (id, user_id, language, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`, prefID, userID, language, now, now); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return role, nil
+}
+
 func (s *Service) Login(ctx context.Context, username, password string) (AuthResult, error) {
+	if username == "" || password == "" {
+		return AuthResult{}, httpx.ValidationError("username and password are required")
+	}
 	row := s.DB.QueryRowContext(ctx, `SELECT id, username, password_hash, role, avatar_color, avatar_image_id, git_username, git_email, created_at FROM users WHERE username = ?`, username)
 	var passwordHash string
 	user, err := scanUserWithPassword(row, &passwordHash)
@@ -237,7 +280,26 @@ func (s *Service) UpdateProfile(ctx context.Context, userID string, gitUsername,
 	if gitUsername == nil && gitEmail == nil {
 		return nil
 	}
-	_, err := s.DB.ExecContext(ctx, `UPDATE users SET git_username = COALESCE(?, git_username), git_email = COALESCE(?, git_email) WHERE id = ?`, nullableString(gitUsername), nullableString(gitEmail), userID)
+	sets := make([]string, 0, 2)
+	args := make([]any, 0, 3)
+	if gitUsername != nil {
+		if len(*gitUsername) > 100 {
+			return httpx.ValidationError("gitUsername must be at most 100 characters")
+		}
+		sets = append(sets, "git_username = ?")
+		args = append(args, nullableProfileString(*gitUsername))
+	}
+	if gitEmail != nil {
+		if *gitEmail != "" {
+			if len(*gitEmail) > 254 || !isValidEmail(*gitEmail) {
+				return httpx.ValidationError("gitEmail must be a valid email address")
+			}
+		}
+		sets = append(sets, "git_email = ?")
+		args = append(args, nullableProfileString(*gitEmail))
+	}
+	args = append(args, userID)
+	_, err := s.DB.ExecContext(ctx, `UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
 	return err
 }
 
@@ -280,12 +342,35 @@ func nullStringPtr(v sql.NullString) *string {
 	return &v.String
 }
 
-func nullableString(v *string) any {
-	if v == nil {
+func nullableProfileString(v string) any {
+	if v == "" {
 		return nil
 	}
-	if *v == "" {
-		return nil
+	return v
+}
+
+func isUsernameUniqueViolation(err error) bool {
+	if err == nil {
+		return false
 	}
-	return *v
+	message := strings.ToLower(err.Error())
+	if !strings.Contains(message, "username") {
+		return false
+	}
+	return strings.Contains(message, "unique") || strings.Contains(message, "duplicate")
+}
+
+func isSerializationFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "40001") ||
+		strings.Contains(message, "serialize") ||
+		strings.Contains(message, "serialization")
+}
+
+func isValidEmail(v string) bool {
+	addr, err := mail.ParseAddress(v)
+	return err == nil && addr.Address == v
 }

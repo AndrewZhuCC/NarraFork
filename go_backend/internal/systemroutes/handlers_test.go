@@ -6,18 +6,24 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
+	"narrafork-go/internal/narrators"
 )
 
 func newSystemRoutesTestStore(t *testing.T) *config.Store {
@@ -28,6 +34,87 @@ func newSystemRoutesTestStore(t *testing.T) *config.Store {
 		t.Fatalf("load settings: %v", err)
 	}
 	return store
+}
+
+func newProviderRoutesTestRouter(t *testing.T) (*chi.Mux, string) {
+	t.Helper()
+	return newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "user")
+}
+
+func newProviderRoutesTestRouterWithStore(t *testing.T, store *config.Store, role string) (*chi.Mux, string) {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if _, err := sqlDB.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, role TEXT)`); err != nil {
+		t.Fatalf("create users table: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO users (id, role) VALUES ('user-1', ?)`, role); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	authService := auth.NewService(sqlDB, store)
+	token, err := authService.CreateToken("user-1", role)
+	if err != nil {
+		t.Fatalf("create user token: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Use(authService.Middleware)
+	h := &Handler{Settings: store}
+	h.RegisterProviders(router)
+	return router, token
+}
+
+func TestProviderSensitiveRoutesRequireAdminBoundary(t *testing.T) {
+	router, userToken := newProviderRoutesTestRouter(t)
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/kiro/status"},
+		{http.MethodGet, "/codex/status"},
+		{http.MethodPost, "/codex/import"},
+		{http.MethodPost, "/cline/auth/browser"},
+		{http.MethodPost, "/nug/providers/nug-test/login"},
+		{http.MethodPost, "/nug/providers/nug-test/api-key"},
+		{http.MethodGet, "/nug/providers/nug-test/oauth/start"},
+		{http.MethodPost, "/openai/models/refresh"},
+		{http.MethodPost, "/openai/providers/openai-test/models/refresh"},
+		{http.MethodPost, "/anthropic/models/refresh"},
+		{http.MethodPost, "/anthropic/providers/anthropic-test/models/refresh"},
+		{http.MethodPost, "/nkp/models/refresh"},
+		{http.MethodPost, "/nkp/providers/nkp-test/models/refresh"},
+		{http.MethodPost, "/nug/models/refresh"},
+		{http.MethodPost, "/nug/providers/nug-test/models/refresh"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403 admin boundary, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			decodeJSONBody(t, w, &body)
+			if body["code"] != "FORBIDDEN" || body["error"] != "Admin access required" {
+				t.Fatalf("unexpected forbidden body: %#v", body)
+			}
+		})
+	}
+}
+
+func TestCodexQuotaOverviewRemainsAvailableToAuthenticatedUsers(t *testing.T) {
+	router, userToken := newProviderRoutesTestRouter(t)
+	req := httptest.NewRequest(http.MethodGet, "/codex/quota-overview", nil)
+	req.Header.Set("Authorization", "Bearer "+userToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected quota overview 200 for authenticated user, got %d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func TestBenchmarkResultRoutesRequireAdminBoundary(t *testing.T) {
@@ -150,6 +237,121 @@ func TestGatewayWebhookMappedNarratorNeedsRuntimeFallback(t *testing.T) {
 	decodeJSONBody(t, w, &body)
 	if body["code"] != "GATEWAY_WEBHOOK_RUNTIME_UNAVAILABLE" || body["narratorId"] != "narrator-1" {
 		t.Fatalf("unexpected mapped fallback body: %#v", body)
+	}
+}
+
+func TestGatewayWebhookCreatesStandaloneNarratorForNewSender(t *testing.T) {
+	t.Setenv("GATEWAY_WEBHOOK_SECRET", "test-secret")
+	sqlDB := openGatewayTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`DELETE FROM gateway_session_mappings`); err != nil {
+		t.Fatalf("clear mappings: %v", err)
+	}
+	stub := &gatewayNarratorStub{nextID: "narrator-created"}
+	r := chi.NewRouter()
+	h := &Handler{DB: sqlDB, GatewayNarrators: stub}
+	r.Route("/api/gateway", h.RegisterGatewayPublic)
+
+	payload := `{"chat_id":"chat-new","user_id":"user-new","username":"Grace","text":"hello from webhook"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/gateway/webhook", strings.NewReader(payload))
+	req.Header.Set("X-Hub-Signature-256", "sha256="+gatewayTestSignature(payload, "test-secret"))
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 webhook success, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != true || body["fallback"] != false || body["chatId"] != "chat-new" || body["narratorId"] != "narrator-created" {
+		t.Fatalf("unexpected webhook body: %#v", body)
+	}
+	if len(stub.created) != 1 || stub.created[0].Title == nil || *stub.created[0].Title != "Webhook: Grace" {
+		t.Fatalf("expected standalone webhook narrator creation, got %#v", stub.created)
+	}
+	if len(stub.messages) != 1 || stub.messages[0].creator != "gateway:user-new" || stub.messages[0].text != "hello from webhook" {
+		t.Fatalf("expected forwarded webhook message, got %#v", stub.messages)
+	}
+	var narratorID, username string
+	if err := sqlDB.QueryRow(`SELECT narrator_id, username FROM gateway_session_mappings WHERE platform='webhook' AND chat_id='chat-new' AND user_id='user-new'`).Scan(&narratorID, &username); err != nil {
+		t.Fatalf("query inserted mapping: %v", err)
+	}
+	if narratorID != "narrator-created" || username != "Grace" {
+		t.Fatalf("unexpected inserted mapping narrator=%q username=%q", narratorID, username)
+	}
+}
+
+type gatewayNarratorStub struct {
+	nextID   string
+	created  []narrators.CreateInput
+	messages []gatewayNarratorMessage
+}
+
+type gatewayNarratorMessage struct {
+	narratorID string
+	creator    string
+	text       string
+}
+
+func (s *gatewayNarratorStub) Create(_ context.Context, input narrators.CreateInput) (narrators.Narrator, error) {
+	s.created = append(s.created, input)
+	return narrators.Narrator{ID: s.nextID}, nil
+}
+
+func (s *gatewayNarratorStub) AddUserMessage(_ context.Context, narratorID, userID, text string) (narrators.Message, error) {
+	s.messages = append(s.messages, gatewayNarratorMessage{narratorID: narratorID, creator: userID, text: text})
+	return narrators.Message{ID: "message-1", NarratorID: narratorID}, nil
+}
+
+func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/quota" || r.Header.Get("Authorization") != "Bearer nug-key" {
+			t.Fatalf("unexpected upstream request path=%s auth=%s", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"balance":"12.5","totalGranted":"50"}`))
+	}))
+	defer upstream.Close()
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	if _, err := store.Patch(map[string]any{"nugProviders": []any{map[string]any{"id": "nug-1", "name": "NUG One", "prefix": "nug", "baseUrl": upstream.URL, "apiKey": "nug-key"}}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	r := chi.NewRouter()
+	h := &Handler{Settings: store}
+	h.RegisterProviders(r)
+
+	req := httptest.NewRequest(http.MethodGet, "/nug/providers/nug-1/quota", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected quota 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var quota map[string]any
+	decodeJSONBody(t, w, &quota)
+	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) {
+		t.Fatalf("unexpected normalized quota: %#v", quota)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/nug/quotas", nil)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected quotas 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var quotas map[string]map[string]any
+	decodeJSONBody(t, w, &quotas)
+	cached := quotas["nug-1"]
+	if cached["balance"] != float64(12.5) || cached["totalGranted"] != float64(50) {
+		t.Fatalf("unexpected cached quota: %#v", quotas)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".narrafork", "nug-quotas.json")); err != nil {
+		t.Fatalf("expected nug quota cache file: %v", err)
 	}
 }
 
@@ -284,9 +486,7 @@ func TestProviderRoutesReturnCachedLongTailShapesWithoutRefresh(t *testing.T) {
 		t.Fatalf("write nkp quota cache: %v", err)
 	}
 
-	r := chi.NewRouter()
-	h := &Handler{Settings: store}
-	h.RegisterProviders(r)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
 
 	cases := []struct {
 		path string
@@ -302,6 +502,7 @@ func TestProviderRoutesReturnCachedLongTailShapesWithoutRefresh(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
 			if w.Code != http.StatusOK {
@@ -318,6 +519,270 @@ func TestProviderRoutesReturnCachedLongTailShapesWithoutRefresh(t *testing.T) {
 	}
 }
 
+func TestKiroMCPRetriesSuspiciousThrottleOnLastCredential(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeKiroTestCredentials(t, []map[string]any{{"id": "only", "accessToken": "access-only"}})
+	originalClient := kiroMCPHTTPClient
+	defer func() { kiroMCPHTTPClient = originalClient }()
+
+	requestedTokens := []string{}
+	kiroMCPHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestedTokens = append(requestedTokens, req.Header.Get("Authorization"))
+		if len(requestedTokens) == 1 {
+			return kiroTestResponse(http.StatusTooManyRequests, `{"__type":"ThrottlingException","message":"Suspicious activity detected"}`), nil
+		}
+		return kiroTestResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+
+	result, err := (&Handler{}).callKiroMCP(context.Background(), "tools/list", map[string]any{})
+	if err != nil {
+		t.Fatalf("callKiroMCP returned error: %v", err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("unexpected MCP result: %#v", result)
+	}
+	if strings.Join(requestedTokens, ",") != "Bearer access-only,Bearer access-only" {
+		t.Fatalf("expected retry with same last credential, got %#v", requestedTokens)
+	}
+	entries := readKiroTestCredentials(t)
+	if len(entries) != 1 || boolMap(entries[0], "disabled") || stringMap(entries[0], "disabledReason", "") != "" {
+		t.Fatalf("last available credential should remain enabled, got %#v", entries)
+	}
+}
+
+func TestKiroMCPDisablesSuspiciousThrottleWhenFailoverAvailable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeKiroTestCredentials(t, []map[string]any{
+		{"id": "first", "accessToken": "access-first"},
+		{"id": "second", "accessToken": "access-second"},
+	})
+	originalClient := kiroMCPHTTPClient
+	defer func() { kiroMCPHTTPClient = originalClient }()
+
+	requestedTokens := []string{}
+	kiroMCPHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		requestedTokens = append(requestedTokens, req.Header.Get("Authorization"))
+		if len(requestedTokens) == 1 {
+			return kiroTestResponse(http.StatusTooManyRequests, `{"__type":"ThrottlingException","message":"Suspicious activity detected"}`), nil
+		}
+		return kiroTestResponse(http.StatusOK, `{"ok":true}`), nil
+	})}
+
+	result, err := (&Handler{}).callKiroMCP(context.Background(), "tools/list", map[string]any{})
+	if err != nil {
+		t.Fatalf("callKiroMCP returned error: %v", err)
+	}
+	if result["ok"] != true {
+		t.Fatalf("unexpected MCP result: %#v", result)
+	}
+	if strings.Join(requestedTokens, ",") != "Bearer access-first,Bearer access-second" {
+		t.Fatalf("expected failover to second credential, got %#v", requestedTokens)
+	}
+	entries := readKiroTestCredentials(t)
+	if len(entries) != 2 || !boolMap(entries[0], "disabled") || stringMap(entries[0], "disabledReason", "") != "suspicious_throttle" || stringMap(entries[0], "disabledAt", "") == "" {
+		t.Fatalf("first credential should be suspicious-throttle cooled down, got %#v", entries)
+	}
+}
+
+func TestLoadKiroCredentialsRecoversExpiredSuspiciousThrottle(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	writeKiroTestCredentials(t, []map[string]any{{
+		"id":             "recover",
+		"accessToken":    "access-recover",
+		"disabled":       true,
+		"disabledReason": "suspicious_throttle",
+		"disabledAt":     time.Now().Add(-kiroSuspiciousThrottleCooldown - time.Minute).Format(time.RFC3339),
+	}})
+
+	entries, err := (&Handler{}).loadKiroCredentials()
+	if err != nil {
+		t.Fatalf("loadKiroCredentials returned error: %v", err)
+	}
+	if len(entries) != 1 || boolMap(entries[0], "disabled") || stringMap(entries[0], "disabledReason", "") != "" || stringMap(entries[0], "disabledAt", "") != "" {
+		t.Fatalf("expected expired suspicious throttle to recover, got %#v", entries)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func kiroTestResponse(status int, body string) *http.Response {
+	statusText := http.StatusText(status)
+	if statusText == "" {
+		statusText = "status"
+	}
+	return &http.Response{
+		StatusCode: status,
+		Status:     strconv.Itoa(status) + " " + statusText,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func writeKiroTestCredentials(t *testing.T, entries []map[string]any) {
+	t.Helper()
+	path := filepath.Join(os.Getenv("HOME"), ".narrafork", "kiro", "credentials.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir kiro credentials dir: %v", err)
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatalf("marshal kiro credentials: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write kiro credentials: %v", err)
+	}
+}
+
+func readKiroTestCredentials(t *testing.T) []map[string]any {
+	t.Helper()
+	path := filepath.Join(os.Getenv("HOME"), ".narrafork", "kiro", "credentials.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read kiro credentials: %v", err)
+	}
+	entries := []map[string]any{}
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("decode kiro credentials: %v", err)
+	}
+	return entries
+}
+
+func TestCodexImportAcceptsAccessTokenOnlyCredential(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	accessToken := testJWT(map[string]any{
+		"sub":                "user-access-only",
+		"email":              "access-only@example.com",
+		"chatgpt_account_id": "acc-access-only",
+	})
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	payload, _ := json.Marshal(map[string]any{"credentials": []any{map[string]any{
+		"refresh_token": "",
+		"access_token":  accessToken,
+	}}})
+	req := httptest.NewRequest(http.MethodPost, "/codex/import", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["added"] != float64(1) || body["skipped"] != float64(0) {
+		t.Fatalf("unexpected import result: %#v", body)
+	}
+	entries, err := loadCodexCredentials()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("load codex credentials len=%d err=%v", len(entries), err)
+	}
+	entry := entries[0]
+	if stringMap(entry, "refreshToken", "") != "" || stringMap(entry, "accessToken", "") != accessToken {
+		t.Fatalf("unexpected imported token fields: %#v", entry)
+	}
+	if stringMap(entry, "accountId", "") != "acc-access-only" || stringMap(entry, "email", "") != "access-only@example.com" {
+		t.Fatalf("expected JWT metadata extraction, got %#v", entry)
+	}
+}
+
+func TestCodexImportParsesAtMarkerAccountLine(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	payload, _ := json.Marshal(map[string]any{"credentials": []any{
+		"marker@example.com----password----at----actual-access-token",
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/codex/import", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	entries, err := loadCodexCredentials()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("load codex credentials len=%d err=%v", len(entries), err)
+	}
+	entry := entries[0]
+	if stringMap(entry, "accessToken", "") != "actual-access-token" || stringMap(entry, "email", "") != "marker@example.com" {
+		t.Fatalf("unexpected marker import entry: %#v", entry)
+	}
+	if stringMap(entry, "refreshToken", "") != "" {
+		t.Fatalf("marker access-token import should not set refresh token: %#v", entry)
+	}
+}
+
+func TestCodexImportParsesSub2ApiAccountExport(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	expiresAt := "2026-05-28T14:06:40.000Z"
+	importText, _ := json.Marshal(map[string]any{
+		"exported_at": "2026-05-18T14:06:47.807Z",
+		"accounts": []any{map[string]any{
+			"name":     "Sub2Api Plus Account",
+			"platform": "openai",
+			"type":     "oauth",
+			"priority": float64(4),
+			"credentials": map[string]any{
+				"access_token":       "access-token-from-sub2api",
+				"chatgpt_account_id": "acc-sub2api",
+				"chatgpt_user_id":    "user-sub2api",
+				"email":              "sub2api@example.com",
+				"expires_at":         expiresAt,
+			},
+		}},
+	})
+	payload, _ := json.Marshal(map[string]any{"importText": string(importText)})
+	req := httptest.NewRequest(http.MethodPost, "/codex/import", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	entries, err := loadCodexCredentials()
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("load codex credentials len=%d err=%v", len(entries), err)
+	}
+	entry := entries[0]
+	if stringMap(entry, "accessToken", "") != "access-token-from-sub2api" || stringMap(entry, "accountId", "") != "acc-sub2api" {
+		t.Fatalf("unexpected sub2api import token fields: %#v", entry)
+	}
+	if stringMap(entry, "email", "") != "sub2api@example.com" || stringMap(entry, "sub", "") != "user-sub2api" {
+		t.Fatalf("unexpected sub2api import metadata: %#v", entry)
+	}
+	if stringMap(entry, "displayName", "") != "Sub2Api Plus Account" || numericMapOr(entry, "priority", 0) != 4 {
+		t.Fatalf("unexpected sub2api display fields: %#v", entry)
+	}
+	parsedExpiresAt, err := time.Parse(time.RFC3339, expiresAt)
+	if err != nil {
+		t.Fatalf("parse expiresAt: %v", err)
+	}
+	if numericMapOr(entry, "expiresAt", 0) != float64(parsedExpiresAt.UnixMilli()) {
+		t.Fatalf("unexpected sub2api expiresAt: %#v", entry)
+	}
+}
+
 func TestClineEnabledModelsStoresContextWindowsFromCache(t *testing.T) {
 	store := newSystemRoutesTestStore(t)
 	provider := map[string]any{"id": "cline1", "name": "Cline", "prefix": "cline", "enabledModels": []any{}}
@@ -329,12 +794,11 @@ func TestClineEnabledModelsStoresContextWindowsFromCache(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dataDir, "cline-models.json"), []byte(`{"cline1":[{"id":"anthropic/claude-test","contextLength":200000}]}`), 0o600); err != nil {
 		t.Fatalf("write cline cache: %v", err)
 	}
-	r := chi.NewRouter()
-	h := &Handler{Settings: store}
-	h.RegisterProviders(r)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
 	payload := []byte(`{"models":["anthropic/claude-test"]}`)
 	req := httptest.NewRequest(http.MethodPost, "/cline/enabled-models", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 
 	r.ServeHTTP(w, req)
@@ -391,6 +855,12 @@ func gatewayTestSignature(payload, secret string) string {
 	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write([]byte(payload))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func testJWT(payload map[string]any) string {
+	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
+	body, _ := json.Marshal(payload)
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body) + ".signature"
 }
 
 func decodeJSONBody(t *testing.T, w *httptest.ResponseRecorder, dst any) {

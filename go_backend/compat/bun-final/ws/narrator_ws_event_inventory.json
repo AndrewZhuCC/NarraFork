@@ -1,0 +1,23 @@
+{
+	"artifactVersion": 1,
+	"source": "frontend/hooks/useNarratorWS.ts",
+	"priority": "p0",
+	"comparisonMode": "consumer-required-fields",
+	"events": [
+		{ "type": "message", "requiredFields": ["narratorId", "message"] },
+		{ "type": "user_message", "requiredFields": ["narratorId", "message"] },
+		{ "type": "stream_event", "requiredFields": ["narratorId", "event"] },
+		{ "type": "tool_started", "requiredFields": ["narratorId", "toolUseId", "toolName"] },
+		{ "type": "tool_use_chunk", "requiredFields": ["narratorId", "toolUseId"] },
+		{ "type": "tool_completed", "requiredFields": ["narratorId", "toolUseId", "status"] },
+		{ "type": "permission_request", "requiredFields": ["narratorId", "request"] },
+		{ "type": "permission_resolved", "requiredFields": ["narratorId", "toolUseId", "decision"] },
+		{ "type": "status_change", "requiredFields": ["narratorId", "status"] },
+		{ "type": "substatus_change", "requiredFields": ["narratorId", "substatus"] },
+		{ "type": "catch_up", "requiredFields": ["narratorId", "messages", "messageVersion"] },
+		{ "type": "sync_ok", "requiredFields": ["narratorId", "messageVersion"] },
+		{ "type": "full_reload", "requiredFields": ["narratorId", "reason"] },
+		{ "type": "streaming_snapshot", "requiredFields": ["narratorId", "snapshot"] },
+		{ "type": "presence_update", "requiredFields": ["narratorId", "viewers"] }
+	]
+}

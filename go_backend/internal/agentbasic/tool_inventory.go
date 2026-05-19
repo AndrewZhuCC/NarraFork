@@ -21,16 +21,18 @@ type ToolInventoryOptions struct {
 	Scope                    string
 	EnabledTools             []string
 	DisabledTools            []string
+	ExternalTools            []ExternalToolSpec
 	MCPExternalToolInjection bool
 }
 
 type ToolCapability struct {
-	Name      string `json:"name"`
-	Category  string `json:"category"`
-	Source    string `json:"source,omitempty"`
-	Supported bool   `json:"supported"`
-	Enabled   bool   `json:"enabled"`
-	Reason    string `json:"reason,omitempty"`
+	Name      string         `json:"name"`
+	Category  string         `json:"category"`
+	Source    string         `json:"source,omitempty"`
+	Supported bool           `json:"supported"`
+	Enabled   bool           `json:"enabled"`
+	Reason    string         `json:"reason,omitempty"`
+	Metadata  map[string]any `json:"metadata,omitempty"`
 }
 
 type ToolInventoryMetadata struct {
@@ -40,8 +42,29 @@ type ToolInventoryMetadata struct {
 }
 
 var optionalToolNames = map[string]bool{
+	"Terminal":  true,
 	"ShareFile": true,
 	"Browser":   true,
+}
+
+type unsupportedOptionalTool struct {
+	Name   string
+	Reason string
+}
+
+var unsupportedOptionalTools = []unsupportedOptionalTool{
+	{
+		Name:   "Recall",
+		Reason: "Conversation recall/search is available through regular search APIs, but the Recall agent tool is not implemented in Go narrator sessions yet.",
+	},
+	{
+		Name:   "ForkNarrator",
+		Reason: "Chapter and narrator fork APIs exist, but the ForkNarrator agent tool is not implemented in Go narrator sessions yet.",
+	},
+	{
+		Name:   "NarraForkAdmin",
+		Reason: "Admin routes exist, but the NarraForkAdmin agent tool is not implemented in Go narrator sessions yet.",
+	},
 }
 
 var reviewToolNames = map[string]bool{
@@ -156,7 +179,7 @@ func resolveToolSpecs(opts ToolInventoryOptions) []toolSpec {
 	enabled := toolNameSet(opts.EnabledTools)
 	disabled := toolNameSet(opts.DisabledTools)
 	out := []toolSpec{}
-	for _, spec := range toolSpecs() {
+	for _, spec := range append(toolSpecs(), externalToolSpecs(opts.ExternalTools)...) {
 		category := toolCategory(spec)
 		if disabled[spec.Name] {
 			continue
@@ -194,8 +217,44 @@ func toolNameSet(values []string) map[string]bool {
 	return set
 }
 
+func externalToolSpecs(tools []ExternalToolSpec) []toolSpec {
+	out := []toolSpec{}
+	for _, tool := range normalizeExternalTools(tools) {
+		description := tool.Description
+		if description == "" {
+			description = tool.Name
+		}
+		out = append(out, toolSpec{Name: tool.Name, Description: description, Parameters: tool.Parameters})
+	}
+	return out
+}
+
+func externalToolMetadata(tools []ExternalToolSpec, name string) map[string]any {
+	for _, tool := range normalizeExternalTools(tools) {
+		if tool.Name == name {
+			return cloneMetadata(tool.Metadata)
+		}
+	}
+	return nil
+}
+
+func unsupportedOptionalToolMetadata() []map[string]any {
+	items := make([]map[string]any, 0, len(unsupportedOptionalTools))
+	for _, tool := range unsupportedOptionalTools {
+		items = append(items, map[string]any{
+			"name":      tool.Name,
+			"category":  ToolCategoryOptional,
+			"supported": false,
+			"enabled":   false,
+			"reason":    tool.Reason,
+		})
+	}
+	return items
+}
+
 func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMetadata {
 	scope := normalizeToolScopeName(opts.Scope)
+	external := normalizeExternalTools(opts.ExternalTools)
 	enabled := map[string]bool{}
 	for _, spec := range resolveToolSpecs(opts) {
 		enabled[spec.Name] = true
@@ -214,49 +273,85 @@ func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMet
 			Enabled:   enabled[spec.Name],
 		})
 	}
-	capabilities = append(capabilities, ToolCapability{
-		Name:      "mcp__external_tools",
-		Category:  ToolCategoryMCP,
-		Source:    "mcp",
-		Supported: opts.MCPExternalToolInjection,
-		Enabled:   false,
-		Reason:    "external MCP tools are discoverable through /api/mcp/tools but are not injected into Go narrator agent runtime yet",
-	})
+	if scope != ToolScopeReflection {
+		for _, tool := range unsupportedOptionalTools {
+			capabilities = append(capabilities, ToolCapability{
+				Name:      tool.Name,
+				Category:  ToolCategoryOptional,
+				Source:    "static",
+				Supported: false,
+				Enabled:   false,
+				Reason:    tool.Reason,
+			})
+		}
+	}
+	for _, tool := range external {
+		capabilities = append(capabilities, ToolCapability{
+			Name:      tool.Name,
+			Category:  ToolCategoryMCP,
+			Source:    firstNonEmpty(tool.Source, "mcp"),
+			Supported: true,
+			Enabled:   enabled[tool.Name],
+			Metadata:  cloneMetadata(tool.Metadata),
+		})
+	}
+	supportedExternal := opts.MCPExternalToolInjection || len(external) > 0
+	reason := "stdio MCP external tools can be injected into Go narrator agent loops when servers are connected"
+	if len(external) == 0 {
+		reason = "no connected stdio MCP tools are currently injected"
+	}
+	if !supportedExternal {
+		reason = "external MCP tool injection is not configured for this Go narrator runtime"
+		capabilities = append(capabilities, ToolCapability{
+			Name:      "mcp__external_tools",
+			Category:  ToolCategoryMCP,
+			Source:    "mcp",
+			Supported: false,
+			Enabled:   false,
+			Reason:    reason,
+		})
+	}
 	return ToolInventoryMetadata{
 		Scope: scope,
 		Tools: capabilities,
 		Capabilities: map[string]any{
 			"externalMCPToolInjection": map[string]any{
-				"supported": opts.MCPExternalToolInjection,
-				"reason":    "Go compatibility backend does not execute external MCP tools inside narrator agent loops yet",
+				"supported": supportedExternal,
+				"reason":    reason,
+				"toolCount": len(external),
 			},
+			"unsupportedOptionalTools": unsupportedOptionalToolMetadata(),
 		},
 	}
 }
 
 func ToolMenuCapabilities() []map[string]any {
+	return ToolMenuCapabilitiesForOptions(ToolInventoryOptions{})
+}
+
+func ToolMenuCapabilitiesForOptions(opts ToolInventoryOptions) []map[string]any {
 	items := []map[string]any{}
 	seen := map[string]bool{}
-	for _, spec := range toolSpecs() {
+	for _, spec := range append(toolSpecs(), externalToolSpecs(opts.ExternalTools)...) {
 		category := toolCategory(spec)
 		if category == ToolCategoryReflection || seen[spec.Name] {
 			continue
 		}
 		seen[spec.Name] = true
-		items = append(items, map[string]any{
+		item := map[string]any{
 			"name":        spec.Name,
 			"description": spec.Description,
 			"category":    category,
 			"supported":   true,
-		})
+		}
+		if category == ToolCategoryMCP {
+			item["source"] = "mcp"
+			if metadata := externalToolMetadata(opts.ExternalTools, spec.Name); metadata != nil {
+				item["metadata"] = metadata
+			}
+		}
+		items = append(items, item)
 	}
-	items = append(items, map[string]any{
-		"name":        "mcp__external_tools",
-		"description": "External MCP tools discovered from configured MCP servers.",
-		"category":    ToolCategoryMCP,
-		"supported":   false,
-		"reason":      "Go narrator runtime does not inject or execute external MCP tools yet",
-	})
 	sort.Slice(items, func(i, j int) bool {
 		ci := strings.TrimSpace(stringValue(items[i]["category"]))
 		cj := strings.TrimSpace(stringValue(items[j]["category"]))

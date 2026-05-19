@@ -48,33 +48,28 @@
 		},
 		{
 			"group": "narrator.retryRecovery",
-			"status": "supported-baseline-with-disabled-rollback",
+			"status": "supported-baseline-with-rollback-edit",
 			"features": [
 				"retry trims assistant/tool results after the latest user message and returns deletedMessageIds",
 				"continue appends a Continue. user message",
 				"interrupt clears active status and preserves manual_override state needed for retry/recovery",
-				"subagent conclusion update can rewrite parent tool result from the child final assistant text"
+				"subagent conclusion update can rewrite parent tool result from the child final assistant text",
+				"rollback truncates narrator_message_refs and assistant blocks, invalidates affected tool calls, and optionally rebuilds file state from snapshots via revert=true",
+				"edit-and-regenerate performs copy-on-write user message edits, preserves attachment block order, optionally rolls back file state, optionally skips agent rerun, deletes following messages, and broadcasts WS updates"
 			],
-			"disabled": [
-				{
-					"feature": "narrator.rollback",
-					"code": "FEATURE_DISABLED",
-					"reason": "TS-equivalent file snapshot rollback and rerun semantics are not available in go_backend yet."
-				},
-				{
-					"feature": "narrator.editAndRegenerate",
-					"code": "FEATURE_DISABLED",
-					"reason": "Edit-and-regenerate requires rollback plus agent rerun semantics that are not available in go_backend yet."
-				}
+			"remainingParityRisks": [
+				"broader TS-vs-Go fixture comparison is still needed for compact boundaries, long tool chains, provider-specific recovery, and failure compensation"
 			],
 			"goSources": [
 				"go_backend/internal/narrators/handlers.go",
-				"go_backend/internal/narrators/service.go"
+				"go_backend/internal/narrators/service.go",
+				"go_backend/internal/narrators/rollback_edit.go"
 			],
 			"tests": [
 				"go_backend/internal/narrators/route_contract_test.go",
 				"go_backend/internal/narrators/agent_event_integration_test.go",
-				"go_backend/internal/narrators/subagent_message_tree_test.go"
+				"go_backend/internal/narrators/subagent_message_tree_test.go",
+				"go_backend/internal/narrators/rollback_edit_test.go"
 			]
 		},
 		{

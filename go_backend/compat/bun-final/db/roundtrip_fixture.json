@@ -1,0 +1,111 @@
+{
+	"rows": [
+		{
+			"table": "projects",
+			"values": {
+				"id": "proj_roundtrip",
+				"name": "Roundtrip Project",
+				"description": "Go writes should survive TS/Bun startup",
+				"status": "active",
+				"flow_mode": "classic",
+				"git_path": "/tmp/narrafork-roundtrip",
+				"created_at": "2026-01-01T00:00:00Z",
+				"updated_at": "2026-01-01T00:00:00Z"
+			}
+		},
+		{
+			"table": "chapters",
+			"values": {
+				"id": "chap_roundtrip",
+				"project_id": "proj_roundtrip",
+				"title": "Roundtrip Chapter",
+				"description": "Fixture chapter for compatibility roundtrip",
+				"status": "active",
+				"role": "branch",
+				"branch": "roundtrip",
+				"base_branch": "main",
+				"created_at": "2026-01-01T00:00:00Z",
+				"updated_at": "2026-01-01T00:00:00Z"
+			}
+		},
+		{
+			"table": "narrators",
+			"values": {
+				"id": "narr_roundtrip",
+				"chapter_id": "chap_roundtrip",
+				"title": "Roundtrip Narrator",
+				"type": "primary",
+				"subagent_type": "",
+				"status": "idle",
+				"substatus": "[]",
+				"permission_mode": "default",
+				"previous_permission_mode": "default",
+				"model": "gpt-5.5",
+				"message_count": "1",
+				"total_cost_usd": "0",
+				"plan_mode": "0",
+				"cwd": "/tmp/narrafork-roundtrip",
+				"traits": "[]",
+				"variant": "primary",
+				"enabled_tools": "[]",
+				"is_background": "0",
+				"background_status": "idle",
+				"background_result": "",
+				"is_ask_in_passing": "0",
+				"message_version": "1",
+				"created_at": "2026-01-01T00:00:00Z",
+				"updated_at": "2026-01-01T00:00:00Z"
+			}
+		},
+		{
+			"table": "narrator_goals",
+			"values": {
+				"id": "goal_roundtrip",
+				"narrator_id": "narr_roundtrip",
+				"objective": "Verify Go to TS/Bun roundtrip",
+				"status": "pending",
+				"sort_order": "1",
+				"tokens_used": "0",
+				"time_used_seconds": "0",
+				"created_at": "2026-01-01T00:00:00Z",
+				"updated_at": "2026-01-01T00:00:00Z"
+			}
+		},
+		{
+			"table": "narrator_messages",
+			"values": {
+				"id": "msg_roundtrip",
+				"narrator_id": "narr_roundtrip",
+				"role": "assistant",
+				"content_json": "[{\"type\":\"text\",\"text\":\"hello from go\"}]",
+				"content_text": "hello from go",
+				"provider": "go-test",
+				"model": "gpt-5.5",
+				"created_at": "2026-01-01T00:00:00Z"
+			}
+		},
+		{
+			"table": "narrator_message_refs",
+			"values": {
+				"id": "ref_roundtrip",
+				"narrator_id": "narr_roundtrip",
+				"message_id": "msg_roundtrip",
+				"seq": "1",
+				"is_compact": "0",
+				"pruned_percent": "0"
+			}
+		},
+		{
+			"table": "terminals",
+			"values": {
+				"id": "term_roundtrip",
+				"chapter_id": "chap_roundtrip",
+				"narrator_id": "narr_roundtrip",
+				"name": "shell",
+				"cwd": "/tmp/narrafork-roundtrip",
+				"status": "running",
+				"created_at": "2026-01-01T00:00:00Z"
+			}
+		}
+	]
+}

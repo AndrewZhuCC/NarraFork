@@ -35,6 +35,8 @@ func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
 	expectDefaultValue(t, raw, "agent.summaryModel", "kiro:claude-haiku-4.5")
 	expectDefaultValue(t, raw, "agent.maxTurns", float64(200))
 	expectDefaultValue(t, raw, "agent.requestDumpMaxSize", float64(1024*1024))
+	expectDefaultValue(t, raw, "agent.questionReflectionEnabled", false)
+	expectDefaultValue(t, raw, "agent.questionReflectionTimeoutMs", float64(300000))
 	expectDefaultValue(t, raw, "agent.dangerReflectionEnabled", true)
 	expectDefaultValue(t, raw, "agent.maxTransientRetries", float64(10))
 	expectDefaultValue(t, raw, "agent.firstTokenTimeoutMs", float64(60000))
@@ -76,6 +78,32 @@ func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
 	expectNoDefaultValue(t, raw, "clineProviders")
 	expectNoDefaultValue(t, raw, "kiro")
 	expectNoDefaultValue(t, raw, "mcpServers")
+}
+
+func TestCoreReadsOptionalDatabaseSettings(t *testing.T) {
+	store := &Store{raw: map[string]any{
+		"database": map[string]any{
+			"driver":                 "postgres",
+			"sqlitePath":             "/tmp/narrafork.db",
+			"postgresDsn":            "postgres://example/db",
+			"postgresSchema":         "narrafork_app",
+			"maxOpenConns":           float64(12),
+			"maxIdleConns":           float64(4),
+			"connMaxLifetimeSeconds": float64(60),
+			"verifyCanonical":        false,
+			"tsOwnedSchema":          false,
+		},
+	}}
+	core := store.Core()
+	if core.Database.Driver != "postgres" || core.Database.SQLitePath != "/tmp/narrafork.db" || core.Database.PostgresDSN != "postgres://example/db" || core.Database.PostgresSchema != "narrafork_app" {
+		t.Fatalf("unexpected database strings: %#v", core.Database)
+	}
+	if core.Database.MaxOpenConns != 12 || core.Database.MaxIdleConns != 4 || core.Database.ConnMaxLifetimeSeconds != 60 {
+		t.Fatalf("unexpected database pool settings: %#v", core.Database)
+	}
+	if core.Database.VerifyCanonical || core.Database.TSOwnedSchema {
+		t.Fatalf("database boolean settings not read: %#v", core.Database)
+	}
 }
 
 func TestCoreReadsOptionalTLSSettings(t *testing.T) {

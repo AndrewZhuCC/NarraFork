@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"narrafork-go/internal/compat/bunfinal"
 )
 
 func TestEnsureMigrationCompatibilityCreatesOnlyGoJournalAfterCanonicalSchemaReady(t *testing.T) {
@@ -215,6 +217,43 @@ func TestEmbeddedDrizzleJournalSnapshotMatchesRepository(t *testing.T) {
 		}
 		if embeddedDrizzleMigrationSnapshot[i] != want {
 			t.Fatalf("snapshot[%d] = %#v, want %#v", i, embeddedDrizzleMigrationSnapshot[i], want)
+		}
+	}
+}
+
+func TestBunFinalDrizzleJournalArtifactMatchesEmbeddedSnapshot(t *testing.T) {
+	data, err := bunfinal.ReadDrizzleJournalSnapshot()
+	if err != nil {
+		t.Fatalf("read bun-final Drizzle journal artifact: %v", err)
+	}
+	var artifact struct {
+		LastTag                string `json:"lastTag"`
+		ExpectedMigrationCount int    `json:"expectedMigrationCount"`
+		ExpectedJournalHash    string `json:"expectedJournalHash"`
+		Entries                []struct {
+			Idx  int    `json:"idx"`
+			Tag  string `json:"tag"`
+			When int64  `json:"when"`
+			Hash string `json:"hash"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("parse bun-final Drizzle journal artifact: %v", err)
+	}
+	if artifact.ExpectedMigrationCount != len(embeddedDrizzleMigrationSnapshot) || len(artifact.Entries) != len(embeddedDrizzleMigrationSnapshot) {
+		t.Fatalf("artifact migration count = %d/%d, want %d", artifact.ExpectedMigrationCount, len(artifact.Entries), len(embeddedDrizzleMigrationSnapshot))
+	}
+	if artifact.ExpectedJournalHash != expectedDrizzleJournalHash() {
+		t.Fatalf("artifact expectedJournalHash = %q, want %q", artifact.ExpectedJournalHash, expectedDrizzleJournalHash())
+	}
+	last := embeddedDrizzleMigrationSnapshot[len(embeddedDrizzleMigrationSnapshot)-1]
+	if artifact.LastTag != last.Tag {
+		t.Fatalf("artifact lastTag = %q, want %q", artifact.LastTag, last.Tag)
+	}
+	for i, entry := range artifact.Entries {
+		want := embeddedDrizzleMigrationSnapshot[i]
+		if entry.Idx != i || entry.Tag != want.Tag || entry.When != want.When || entry.Hash != want.Hash {
+			t.Fatalf("artifact entry[%d] = %#v, want idx=%d snapshot=%#v", i, entry, i, want)
 		}
 	}
 }

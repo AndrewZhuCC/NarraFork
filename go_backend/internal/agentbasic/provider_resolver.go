@@ -476,7 +476,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		apiKey := firstNonEmpty(stringValue(codex["apiKey"]), stringValue(codex["accessToken"]), stringValue(codex["token"]))
 		if apiKey != "" {
 			baseURL := strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), "https://chatgpt.com/backend-api/codex"), "/")
-			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"])}, true
+			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"]), LoadBalancingMode: stringValue(codex["loadBalancingMode"])}, true
 		}
 	}
 	if credential, ok := firstCodexCredentialFromDiskWithOptions(codex); ok {
@@ -484,7 +484,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		if codex != nil {
 			baseURL = strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), baseURL), "/")
 		}
-		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex)}, true
+		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex), LoadBalancingMode: stringValue(codex["loadBalancingMode"])}, true
 	}
 	return Provider{}, false
 }
@@ -590,11 +590,12 @@ func codexCredentialPoolFromDiskWithOptions(baseURL string, model string, codex 
 	}
 	entries = sortCodexCredentials(entries, codex)
 	pool := []Provider{}
+	mode := stringValue(codex["loadBalancingMode"])
 	for _, entry := range entries {
-		if boolValue(entry["disabled"]) || strings.TrimSpace(stringValue(entry["accessToken"])) == "" {
+		if boolValue(entry["disabled"]) || strings.TrimSpace(stringValue(entry["accessToken"])) == "" || codexAccessTokenOnlyExpired(entry) {
 			continue
 		}
-		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"])})
+		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"]), LoadBalancingMode: mode})
 	}
 	return pool
 }
@@ -636,6 +637,9 @@ func firstCodexCredentialFromDiskWithOptions(codex map[string]any) (map[string]a
 			continue
 		}
 		if !codexCredentialFresh(entry) {
+			if strings.TrimSpace(stringValue(entry["refreshToken"])) == "" {
+				continue
+			}
 			if refreshed, err := refreshCodexCredential(entry); err == nil && refreshed != nil {
 				entries[i] = refreshed
 				entry = refreshed
@@ -664,6 +668,9 @@ func sortCodexCredentials(entries []map[string]any, codex map[string]any) []map[
 			tierOrder = append(tierOrder, value)
 		}
 	}
+	if len(tierOrder) == 0 {
+		tierOrder = []string{"pro", "prolite", "plus", "team", "free"}
+	}
 	tierRank := func(entry map[string]any) int {
 		tier := ""
 		if usage, ok := entry["usage"].(map[string]any); ok {
@@ -687,7 +694,7 @@ func sortCodexCredentials(entries []map[string]any, codex map[string]any) []map[
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		switch mode {
-		case "tier-balanced":
+		case "tier-balanced", "tiered_sticky":
 			if tierRank(out[i]) != tierRank(out[j]) {
 				return tierRank(out[i]) < tierRank(out[j])
 			}
@@ -723,6 +730,14 @@ func firstNonEmptyAny(values ...any) any {
 func codexCredentialFresh(entry map[string]any) bool {
 	expiresAt := intValue(entry["expiresAt"], 0)
 	return expiresAt == 0 || int64(expiresAt) >= time.Now().Add(30*time.Second).UnixMilli()
+}
+
+func codexAccessTokenOnlyExpired(entry map[string]any) bool {
+	if strings.TrimSpace(stringValue(entry["accessToken"])) == "" || strings.TrimSpace(stringValue(entry["refreshToken"])) != "" {
+		return false
+	}
+	expiresAt := intValue(entry["expiresAt"], 0)
+	return expiresAt > 0 && int64(expiresAt) < time.Now().Add(30*time.Second).UnixMilli()
 }
 
 func refreshCodexCredential(entry map[string]any) (map[string]any, error) {
@@ -772,6 +787,48 @@ func refreshCodexCredential(entry map[string]any) (map[string]any, error) {
 
 func markCodexCredentialRuntimeFailure(credentialID string, err error) {
 	home, homeErr := os.UserHomeDir()
+	if homeErr != nil || home == "" || credentialID == "" || err == nil {
+		return
+	}
+	path := filepath.Join(home, ".narrafork", "codex-credentials.json")
+	entries, ok := codexCredentialEntriesFromDisk()
+	if !ok {
+		return
+	}
+	classification := classifyCodexRuntimeError(err)
+	updated := false
+	for _, entry := range entries {
+		if stringValue(entry["id"]) != credentialID {
+			continue
+		}
+		now := time.Now().Format(time.RFC3339)
+		failureCount := intValue(entry["failureCount"], 0) + 1
+		entry["failureCount"] = float64(failureCount)
+		entry["lastUsedAt"] = now
+		entry["lastRuntimeError"] = err.Error()
+		entry["lastRuntimeErrorAt"] = now
+		if classification.DisabledReason != "" {
+			entry["disabled"] = true
+			entry["disabledReason"] = classification.DisabledReason
+			if classification.QuotaResetsAt > 0 {
+				entry["quotaResetsAt"] = classification.QuotaResetsAt
+			}
+			unbindCodexSessionsByCredential(credentialID)
+		} else if failureCount >= 3 {
+			entry["disabled"] = true
+			entry["disabledReason"] = "too_many_failures"
+			unbindCodexSessionsByCredential(credentialID)
+		}
+		updated = true
+		break
+	}
+	if updated {
+		_ = writeProviderJSON(path, entries)
+	}
+}
+
+func markCodexCredentialRuntimeSuccess(credentialID string) {
+	home, homeErr := os.UserHomeDir()
 	if homeErr != nil || home == "" || credentialID == "" {
 		return
 	}
@@ -785,15 +842,11 @@ func markCodexCredentialRuntimeFailure(credentialID string, err error) {
 		if stringValue(entry["id"]) != credentialID {
 			continue
 		}
-		entry["lastRuntimeError"] = err.Error()
-		entry["lastRuntimeErrorAt"] = time.Now().Format(time.RFC3339)
-		if isCodexFailoverError(err) {
-			entry["failureCount"] = float64(intValue(entry["failureCount"], 0) + 1)
-			message := strings.ToLower(err.Error())
-			if strings.Contains(message, "quota") || strings.Contains(message, "exhausted") {
-				entry["disabledReason"] = "quota_exhausted"
-			}
-		}
+		entry["successCount"] = float64(intValue(entry["successCount"], 0) + 1)
+		entry["failureCount"] = float64(0)
+		entry["lastUsedAt"] = time.Now().Format(time.RFC3339)
+		delete(entry, "lastRuntimeError")
+		delete(entry, "lastRuntimeErrorAt")
 		updated = true
 		break
 	}

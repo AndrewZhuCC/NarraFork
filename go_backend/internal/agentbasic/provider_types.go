@@ -71,6 +71,7 @@ type ParsedStreamEvent struct {
 	NkpQueue               *QueueSnapshot
 	QueueStatus            *QueueSnapshot
 	QuotaBalance           *string
+	DetailedQuotaBalance   *string
 	Metering               *MeteringSnapshot
 	InvalidState           *InvalidState
 	WebSearch              *WebSearchEvent

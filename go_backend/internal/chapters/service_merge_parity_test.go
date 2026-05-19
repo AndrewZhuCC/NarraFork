@@ -32,7 +32,7 @@ func TestFallbackRootTargetIDReturnsQueryErrors(t *testing.T) {
 	}
 }
 
-func TestMergeAutoCommitsDirtySourceCleansWorktreeAndRecordsFallbacks(t *testing.T) {
+func TestMergeRejectsDirtySourceWithoutAutoCommit(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -42,34 +42,49 @@ func TestMergeAutoCommitsDirtySourceCleansWorktreeAndRecordsFallbacks(t *testing
 	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
 
 	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
-	result, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
-	if err != nil {
-		t.Fatalf("merge: %v", err)
+	_, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
+	if err == nil || !strings.Contains(err.Error(), "MERGE_DIRTY_SOURCE") {
+		t.Fatalf("merge error = %v, want MERGE_DIRTY_SOURCE", err)
 	}
-	if ok, _ := result["ok"].(bool); !ok {
-		t.Fatalf("merge result = %#v, want ok", result)
+	if _, err := os.Stat(sourceWT); err != nil {
+		t.Fatalf("source worktree should remain for user cleanup: %v", err)
 	}
-	if _, err := os.Stat(sourceWT); !os.IsNotExist(err) {
-		t.Fatalf("source worktree still exists or unexpected stat error: %v", err)
+	if head := strings.TrimSpace(runGitChapterTest(t, sourceWT, "rev-parse", "HEAD")); head != sourceHead {
+		t.Fatalf("source head changed by rejected merge: got %s want %s", head, sourceHead)
 	}
 	var status string
 	var worktree sql.NullString
 	if err := database.QueryRow(`SELECT status, worktree_path FROM chapters WHERE id = 'source'`).Scan(&status, &worktree); err != nil {
 		t.Fatalf("query source: %v", err)
 	}
-	if status != "merged" || worktree.Valid {
-		t.Fatalf("source status/worktree = %s/%v, want merged/null", status, worktree)
+	if status != "active" || !worktree.Valid {
+		t.Fatalf("source status/worktree = %s/%v, want active/valid", status, worktree)
 	}
 	var autoCommits, mergeCommits int
 	_ = database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'source' AND source = 'auto'`).Scan(&autoCommits)
 	_ = database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'target' AND source = 'merge'`).Scan(&mergeCommits)
-	if autoCommits == 0 || mergeCommits == 0 {
-		t.Fatalf("commit sync counts auto=%d merge=%d, want both > 0", autoCommits, mergeCommits)
+	if autoCommits != 0 || mergeCommits != 0 {
+		t.Fatalf("rejected merge should not record commits, auto=%d merge=%d", autoCommits, mergeCommits)
 	}
-	var summaries int
-	_ = database.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE content_json LIKE '%merge_summary%' AND content_json LIKE '%source%'`).Scan(&summaries)
-	if summaries == 0 {
-		t.Fatalf("expected fallback merge summary message")
+}
+
+func TestMergeRejectsDirtyTarget(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, _ := setupMergeParityRepo(t)
+	runGitChapterTest(t, sourceWT, "add", ".")
+	runGitChapterTest(t, sourceWT, "commit", "-m", "source clean")
+	sourceHead := strings.TrimSpace(runGitChapterTest(t, sourceWT, "rev-parse", "HEAD"))
+	writeChapterTestFile(t, repo, "target-dirty.txt", "dirty target\n")
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
+	_, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
+	if err == nil || !strings.Contains(err.Error(), "MERGE_DIRTY_TARGET") {
+		t.Fatalf("merge error = %v, want MERGE_DIRTY_TARGET", err)
 	}
 }
 

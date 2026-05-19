@@ -64,7 +64,7 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 		return
 	}
 	adapter.InjectSystemPrompt(&built, options.systemPrompt, resolution.Model, "")
-	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools}
+	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0}
 	if options.emitToolInventory {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "tool_inventory", Metadata: map[string]any{"inventory": ToolInventoryMetadataForOptions(inventoryOptions)}})
 	}
@@ -139,6 +139,13 @@ func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter P
 		if errors.Is(err, errTerminalEvent) {
 			return nil, false
 		}
+		if isCodexRebuildHistoryRetryError(err) {
+			if state != nil {
+				flushTurnBlocks(ctx, out, state)
+			}
+			emitAgentEvent(ctx, out, AgentEvent{Type: "retryable_error", Code: CodexRebuildHistoryRetryCode, Message: err.Error(), Metadata: codexRebuildHistoryRetryMetadata(err)})
+			return nil, false
+		}
 		if !isTransientAgentError(err) {
 			if state != nil {
 				flushTurnBlocks(ctx, out, state)
@@ -167,71 +174,111 @@ func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter P
 
 func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, resolution ProviderResolution, built *BuiltHistory, cwd string, options generateOptions, toolExecutor ToolExecutor) (*turnState, error) {
 	effectiveToolScope := encodedToolScope(options.toolScope, options.enabledTools, options.disabledTools)
-	stream, err := adapter.Chat(ctx, ChatParams{
-		Model:           resolution.Model,
-		Cwd:             cwd,
-		History:         built,
-		Tools:           adapter.FormatTools(effectiveToolScope),
-		ReasoningEffort: options.reasoningEffort,
-		SystemPrompt:    options.systemPrompt,
-		ToolScope:       effectiveToolScope,
+	turnCtx, cancelTurn := context.WithCancel(ctx)
+	defer cancelTurn()
+	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0}
+	stream, err := adapter.Chat(turnCtx, ChatParams{
+		Model:            resolution.Model,
+		Cwd:              cwd,
+		History:          built,
+		Tools:            formatToolsForAdapter(adapter, inventoryOptions),
+		ReasoningEffort:  options.reasoningEffort,
+		SystemPrompt:     options.systemPrompt,
+		ToolScope:        effectiveToolScope,
+		StickySessionKey: options.stickySessionKey,
 	})
 	if err != nil {
 		return nil, err
 	}
 	state := newTurnState()
 	chunks := map[string]*toolChunkAccum{}
-	for event := range stream {
-		if event.Err != nil {
-			return state, event.Err
-		}
-		parsed := event.Parsed
-		if parsed.CredentialID != "" {
-			state.credentialID = parsed.CredentialID
-		}
-		if parsed.TextOutputIndex != nil {
-			state.textOutputIndex = parsed.TextOutputIndex
-		}
-		if parsed.Text != "" {
-			state.assistantText += parsed.Text
-			emitAgentEvent(ctx, out, AgentEvent{Type: "stream_text", Text: parsed.Text, OutputIndex: parsed.TextOutputIndex})
-		}
-		if parsed.Reasoning != "" || parsed.ReasoningMetadata != nil {
-			key := reasoningKey(parsed)
-			entry := state.reasoning[key]
-			if entry == nil {
-				entry = &reasoningAccum{}
-				state.reasoning[key] = entry
+	var firstTokenTimer *time.Timer
+	var firstTokenC <-chan time.Time
+	if options.firstTokenTimeout > 0 {
+		firstTokenTimer = time.NewTimer(options.firstTokenTimeout)
+		firstTokenC = firstTokenTimer.C
+		defer firstTokenTimer.Stop()
+	}
+	for {
+		select {
+		case <-firstTokenC:
+			emitAgentEvent(ctx, out, AgentEvent{
+				Type:       "first_token_timeout",
+				Message:    fmt.Sprintf("Provider did not produce a response within %dms", options.firstTokenTimeout.Milliseconds()),
+				Provider:   resolution.Provider,
+				Model:      resolution.Model,
+				DurationMs: options.firstTokenTimeout.Milliseconds(),
+				Metadata:   map[string]any{"timeoutMs": options.firstTokenTimeout.Milliseconds()},
+			})
+			return state, errTerminalEvent
+		case event, ok := <-stream:
+			if !ok {
+				return state, nil
 			}
-			entry.Text += parsed.Reasoning
-			entry.ProviderMetadata = parsed.ReasoningMetadata
-			entry.OutputIndex = parsed.ReasoningOutputIndex
-			emitAgentEvent(ctx, out, AgentEvent{Type: "stream_reasoning", Text: parsed.Reasoning, OutputIndex: parsed.ReasoningOutputIndex, Metadata: parsed.ReasoningMetadata})
-		}
-		if parsed.RedactedThinking != nil {
-			state.redacted = append(state.redacted, parsed.RedactedThinking)
-		}
-		if parsed.ContextUsagePercentage != nil {
-			emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Percentage: *parsed.ContextUsagePercentage, Usage: parsed.Usage})
-		} else if parsed.Usage != nil {
-			emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Usage: parsed.Usage})
-		}
-		emitProviderLifecycleEvents(ctx, out, parsed)
-		if parsed.InvalidState != nil {
-			emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: parsed.InvalidState.Reason, Message: parsed.InvalidState.Message})
-			return nil, errTerminalEvent
-		}
-		if parsed.ToolUseChunk != nil {
-			handleToolUseChunk(ctx, out, state, chunks, parsed.ToolUseChunk, cwd, toolExecutor)
-		}
-		for _, call := range parsed.ToolUses {
-			addToolUse(ctx, out, state, call, cwd, toolExecutor)
+			if event.Err != nil {
+				return state, event.Err
+			}
+			parsed := event.Parsed
+			if firstTokenC != nil && parsedHasMeaningfulResponse(parsed) {
+				if firstTokenTimer != nil {
+					firstTokenTimer.Stop()
+				}
+				firstTokenC = nil
+			}
+			if parsed.SilentDisconnect {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "silent_disconnect", Provider: resolution.Provider, Model: resolution.Model, Message: "Provider stream ended without a final response"})
+				return state, errTerminalEvent
+			}
+			if parsed.CredentialID != "" {
+				state.credentialID = parsed.CredentialID
+			}
+			if parsed.TextOutputIndex != nil {
+				state.textOutputIndex = parsed.TextOutputIndex
+			}
+			if parsed.Text != "" {
+				state.assistantText += parsed.Text
+				emitAgentEvent(ctx, out, AgentEvent{Type: "stream_text", Text: parsed.Text, OutputIndex: parsed.TextOutputIndex})
+			}
+			if parsed.Reasoning != "" || parsed.ReasoningMetadata != nil {
+				key := reasoningKey(parsed)
+				entry := state.reasoning[key]
+				if entry == nil {
+					entry = &reasoningAccum{}
+					state.reasoning[key] = entry
+				}
+				entry.Text += parsed.Reasoning
+				entry.ProviderMetadata = parsed.ReasoningMetadata
+				entry.OutputIndex = parsed.ReasoningOutputIndex
+				emitAgentEvent(ctx, out, AgentEvent{Type: "stream_reasoning", Text: parsed.Reasoning, OutputIndex: parsed.ReasoningOutputIndex, Metadata: parsed.ReasoningMetadata})
+			}
+			if parsed.RedactedThinking != nil {
+				state.redacted = append(state.redacted, parsed.RedactedThinking)
+			}
+			if parsed.ContextUsagePercentage != nil {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Percentage: *parsed.ContextUsagePercentage, Usage: parsed.Usage})
+			} else if parsed.Usage != nil {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Usage: parsed.Usage})
+			}
+			emitProviderLifecycleEvents(ctx, out, parsed, resolution.Provider, resolution.Model)
+			if parsed.InvalidState != nil {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: parsed.InvalidState.Reason, Message: parsed.InvalidState.Message})
+				return nil, errTerminalEvent
+			}
+			if parsed.ToolUseChunk != nil {
+				handleToolUseChunk(ctx, out, state, chunks, parsed.ToolUseChunk, cwd, toolExecutor)
+			}
+			for _, call := range parsed.ToolUses {
+				addToolUse(ctx, out, state, call, cwd, toolExecutor)
+			}
 		}
 	}
-	return state, nil
 }
 
 var errTerminalEvent = errors.New("terminal agent event emitted")
+
+func parsedHasMeaningfulResponse(parsed ParsedStreamEvent) bool {
+	return parsed.Text != "" || parsed.Reasoning != "" || len(parsed.ToolUses) > 0 || parsed.ToolUseChunk != nil
+}
 
 func handleToolUseChunk(ctx context.Context, out chan<- AgentEvent, state *turnState, chunks map[string]*toolChunkAccum, chunk *ToolUseChunk, cwd string, toolExecutor ToolExecutor) {
 	idValue := strings.TrimSpace(chunk.ToolUseID)
@@ -426,6 +473,9 @@ func isParallelTool(call ToolCall) bool {
 }
 
 func shouldEagerExecuteTool(call ToolCall) bool {
+	if strings.HasPrefix(call.Function.Name, "mcp__") {
+		return false
+	}
 	switch call.Function.Name {
 	case "Bash", "Shell", "Execute", "Agent", "Write", "Edit", "Browser", "Terminal", "ShareFile", "NarraForkAdmin", "ForkNarrator", "UpdateGoal":
 		return false
@@ -473,7 +523,13 @@ func reasoningKey(parsed ParsedStreamEvent) string {
 	return "__default"
 }
 
-func emitProviderLifecycleEvents(ctx context.Context, out chan<- AgentEvent, parsed ParsedStreamEvent) {
+func emitProviderLifecycleEvents(
+	ctx context.Context,
+	out chan<- AgentEvent,
+	parsed ParsedStreamEvent,
+	provider string,
+	model string,
+) {
 	if parsed.WebSearch != nil {
 		ws := parsed.WebSearch
 		if ws.Final {
@@ -495,7 +551,7 @@ func emitProviderLifecycleEvents(ctx context.Context, out chan<- AgentEvent, par
 		emitAgentEvent(ctx, out, AgentEvent{Type: "model_switched", Provider: parsed.ModelSwitched.Provider, Model: parsed.ModelSwitched.Model, Message: parsed.ModelSwitched.Cause, Metadata: map[string]any{"reasoningEffort": parsed.ModelSwitched.ReasoningEffort}})
 	}
 	if parsed.NkpQueue != nil {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "nkp_queue", Message: parsed.NkpQueue.QueueMessage, Metadata: map[string]any{"position": parsed.NkpQueue.Position, "queueDepth": parsed.NkpQueue.QueueDepth}})
+		emitAgentEvent(ctx, out, AgentEvent{Type: "nkp_queue_status", Message: parsed.NkpQueue.QueueMessage, Metadata: map[string]any{"position": parsed.NkpQueue.Position, "queueDepth": parsed.NkpQueue.QueueDepth}})
 	}
 	if parsed.NkpQuotaBalance != nil {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "nkp_quota_balance", Metadata: map[string]any{"quotaBalance": *parsed.NkpQuotaBalance}})
@@ -507,7 +563,11 @@ func emitProviderLifecycleEvents(ctx context.Context, out chan<- AgentEvent, par
 		emitAgentEvent(ctx, out, AgentEvent{Type: "metering", Metadata: map[string]any{"unit": parsed.Metering.Unit, "unitPlural": parsed.Metering.UnitPlural, "usage": parsed.Metering.Usage}})
 	}
 	if parsed.QuotaBalance != nil {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "quota_balance", Message: *parsed.QuotaBalance})
+		detailedQuotaBalance := ""
+		if parsed.DetailedQuotaBalance != nil {
+			detailedQuotaBalance = *parsed.DetailedQuotaBalance
+		}
+		emitAgentEvent(ctx, out, AgentEvent{Type: "quota_balance", Message: *parsed.QuotaBalance, Provider: provider, Model: model, Metadata: map[string]any{"quotaBalance": *parsed.QuotaBalance, "detailedQuotaBalance": detailedQuotaBalance}})
 	}
 	if parsed.APIRequest != nil {
 		req := parsed.APIRequest

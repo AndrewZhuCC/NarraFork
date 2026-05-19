@@ -60,12 +60,18 @@ func acquireWorktreeLock(path string) func() {
 }
 
 type Commit struct {
-	SHA         string `json:"sha"`
-	Message     string `json:"message"`
-	FullMessage string `json:"fullMessage,omitempty"`
-	AuthorName  string `json:"authorName,omitempty"`
-	AuthorEmail string `json:"authorEmail,omitempty"`
-	AuthoredAt  string `json:"authoredAt"`
+	SHA               string `json:"sha"`
+	Message           string `json:"message"`
+	FullMessage       string `json:"fullMessage,omitempty"`
+	AuthorName        string `json:"authorName,omitempty"`
+	AuthorEmail       string `json:"authorEmail,omitempty"`
+	AuthoredAt        string `json:"authoredAt"`
+	Source            string `json:"source,omitempty"`
+	NarratorID        string `json:"narratorId,omitempty"`
+	NarratorMessageID string `json:"narratorMessageId,omitempty"`
+	FilesChanged      *int   `json:"filesChanged,omitempty"`
+	LinesAdded        *int   `json:"linesAdded,omitempty"`
+	LinesRemoved      *int   `json:"linesRemoved,omitempty"`
 }
 
 type CommitFile struct {
@@ -319,7 +325,15 @@ func (s *Service) PruneWorktrees(ctx context.Context, repoPath string) error {
 }
 
 func (s *Service) HeadCommit(ctx context.Context, path string) (string, error) {
-	out, err := s.run(ctx, path, "git", "rev-parse", "HEAD")
+	return s.HeadCommitRef(ctx, path, "HEAD")
+}
+
+func (s *Service) HeadCommitRef(ctx context.Context, path, ref string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	out, err := s.run(ctx, path, "git", "rev-parse", ref)
 	if err != nil {
 		return "", err
 	}
@@ -327,7 +341,15 @@ func (s *Service) HeadCommit(ctx context.Context, path string) (string, error) {
 }
 
 func (s *Service) CommitCount(ctx context.Context, path string) (int, error) {
-	out, err := s.run(ctx, path, "git", "rev-list", "--count", "HEAD")
+	return s.CommitCountRef(ctx, path, "HEAD")
+}
+
+func (s *Service) CommitCountRef(ctx context.Context, path, ref string) (int, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	out, err := s.run(ctx, path, "git", "rev-list", "--count", ref)
 	if err != nil {
 		return 0, err
 	}
@@ -355,11 +377,19 @@ func (s *Service) Status(ctx context.Context, path string) (Status, error) {
 }
 
 func (s *Service) Log(ctx context.Context, path string, limit int) ([]Commit, error) {
+	return s.LogRef(ctx, path, "", limit)
+}
+
+func (s *Service) LogRef(ctx context.Context, path, ref string, limit int) ([]Commit, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
 	format := "%H%x1f%s%x1f%an%x1f%ae%x1f%aI"
-	out, err := s.run(ctx, path, "git", "log", "--max-count", strconv.Itoa(limit), "--pretty=format:"+format)
+	args := []string{"log", "--max-count", strconv.Itoa(limit), "--pretty=format:" + format}
+	if ref = strings.TrimSpace(ref); ref != "" {
+		args = append(args, ref)
+	}
+	out, err := s.run(ctx, path, "git", args...)
 	if err != nil {
 		return nil, err
 	}

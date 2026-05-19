@@ -262,6 +262,10 @@ data: {"toolUseId":"tool_read","name":"Read","input":"{\"file_path\":\"note.txt\
 data: {"toolUseId":"tool_read","name":"Read","stop":true}
 
 `)
+		fmt.Fprint(w, `event: assistantResponseEvent
+data: {"stopReason":"end_turn"}
+
+`)
 	}))
 	defer server.Close()
 	adapter := &KiroProviderAdapter{Provider: Provider{Prefix: "kiro", Kind: "kiro", APIKey: "kiro-token", BaseURL: server.URL, Model: "claude-sonnet-4.5"}}

@@ -32,9 +32,9 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 }
 
 type registerRequest struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
-	Language string `json:"language"`
+	Username string  `json:"username"`
+	Password string  `json:"password"`
+	Language *string `json:"language"`
 }
 
 type loginRequest struct {
@@ -52,7 +52,11 @@ func (h *Handler) register(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
 	}
-	result, err := h.Service.Register(r.Context(), req.Username, req.Password, req.Language)
+	language := "en"
+	if req.Language != nil {
+		language = *req.Language
+	}
+	result, err := h.Service.Register(r.Context(), req.Username, req.Password, language)
 	if err != nil {
 		return err
 	}

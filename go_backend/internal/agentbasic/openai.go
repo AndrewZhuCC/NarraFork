@@ -53,6 +53,7 @@ type Provider struct {
 	AccountID           string
 	CredentialID        string
 	CredentialPool      []Provider
+	LoadBalancingMode   string
 	KiroCredentialsPath string
 	KiroConfigPath      string
 	PreviousResponseID  string
@@ -81,7 +82,24 @@ type FileChange struct {
 	AfterContent  *string
 }
 
+type shareDiskMetadata struct {
+	ID           string `json:"id"`
+	OriginalName string `json:"originalName"`
+	FileName     string `json:"fileName"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	ExpiresAt    string `json:"expiresAt,omitempty"`
+	CreatedBy    string `json:"createdBy,omitempty"`
+}
+
 type ToolExecutor func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error)
+
+type ExternalToolSpec struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
+	Source      string
+	Metadata    map[string]any
+}
 
 const (
 	DefaultSystemPrompt         = "You are NarraFork Go backend's coding assistant. Use available tools when needed, keep answers concise, and explain important changes."
@@ -91,7 +109,10 @@ const (
 	defaultEmptyResponseRetries = 3
 	maxToolWriteBytes           = 2 * 1024 * 1024
 	maxToolEditFileBytes        = 2 * 1024 * 1024
+	defaultToolShareExpiry      = 24 * time.Hour
 )
+
+var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type generateOptions struct {
 	toolExecutor         ToolExecutor
@@ -102,9 +123,12 @@ type generateOptions struct {
 	enabledTools         []string
 	disabledTools        []string
 	emitToolInventory    bool
+	externalTools        []ExternalToolSpec
+	firstTokenTimeout    time.Duration
 	maxChatRetries       int
 	emptyResponseRetries int
 	retryBaseDelay       time.Duration
+	stickySessionKey     string
 }
 
 type GenerateOption func(*generateOptions)
@@ -151,9 +175,27 @@ func WithRetryBaseDelay(delay time.Duration) GenerateOption {
 	}
 }
 
+func WithExternalTools(tools []ExternalToolSpec) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.externalTools = normalizeExternalTools(tools)
+	}
+}
+
+func WithFirstTokenTimeout(timeout time.Duration) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.firstTokenTimeout = timeout
+	}
+}
+
 func WithEmptyResponseRetries(maxRetries int) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.emptyResponseRetries = maxRetries
+	}
+}
+
+func WithStickySessionKey(sessionKey string) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.stickySessionKey = strings.TrimSpace(sessionKey)
 	}
 }
 
@@ -192,6 +234,10 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 	options.toolScope = normalizeToolScopeName(options.toolScope)
 	options.enabledTools = normalizedToolNames(options.enabledTools)
 	options.disabledTools = normalizedToolNames(options.disabledTools)
+	options.externalTools = normalizeExternalTools(options.externalTools)
+	if options.firstTokenTimeout < 0 {
+		options.firstTokenTimeout = 0
+	}
 	if options.maxChatRetries < 0 {
 		options.maxChatRetries = 0
 	}
@@ -202,6 +248,45 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 		options.retryBaseDelay = 0
 	}
 	return options
+}
+
+func normalizeExternalTools(tools []ExternalToolSpec) []ExternalToolSpec {
+	seen := map[string]bool{}
+	out := []ExternalToolSpec{}
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		params := tool.Parameters
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		source := strings.TrimSpace(tool.Source)
+		if source == "" {
+			source = "external"
+		}
+		out = append(out, ExternalToolSpec{
+			Name:        name,
+			Description: strings.TrimSpace(tool.Description),
+			Parameters:  params,
+			Source:      source,
+			Metadata:    cloneMetadata(tool.Metadata),
+		})
+	}
+	return out
+}
+
+func cloneMetadata(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func normalizeReasoningEffort(value string) string {
@@ -244,8 +329,12 @@ func toolDefinitions(scope ...string) []map[string]any {
 	if len(scope) > 0 && strings.TrimSpace(scope[0]) != "" {
 		toolScope = strings.TrimSpace(scope[0])
 	}
+	return openAIToolDefinitionsFromSpecs(visibleToolSpecs(toolScope))
+}
+
+func openAIToolDefinitionsFromSpecs(specs []toolSpec) []map[string]any {
 	tools := []map[string]any{}
-	for _, spec := range visibleToolSpecs(toolScope) {
+	for _, spec := range specs {
 		tools = append(tools, map[string]any{
 			"type": "function",
 			"function": map[string]any{
@@ -263,8 +352,12 @@ func anthropicToolDefinitions(scope ...string) []map[string]any {
 	if len(scope) > 0 && strings.TrimSpace(scope[0]) != "" {
 		toolScope = strings.TrimSpace(scope[0])
 	}
+	return anthropicToolDefinitionsFromSpecs(visibleToolSpecs(toolScope))
+}
+
+func anthropicToolDefinitionsFromSpecs(specs []toolSpec) []map[string]any {
 	tools := []map[string]any{}
-	for _, spec := range visibleToolSpecs(toolScope) {
+	for _, spec := range specs {
 		tools = append(tools, map[string]any{
 			"name":         spec.Name,
 			"description":  spec.Description,
@@ -272,6 +365,37 @@ func anthropicToolDefinitions(scope ...string) []map[string]any {
 		})
 	}
 	return tools
+}
+
+func kiroToolDefinitionsFromSpecs(specs []toolSpec) []map[string]any {
+	tools := []map[string]any{}
+	for _, spec := range specs {
+		toolSpec := map[string]any{"name": spec.Name, "description": spec.Description}
+		toolSpec["inputSchema"] = map[string]any{"json": ensureNonEmptySchema(spec.Parameters)}
+		tools = append(tools, map[string]any{"toolSpecification": toolSpec})
+	}
+	return tools
+}
+
+func formatToolsForAdapter(adapter ProviderAdapter, opts ToolInventoryOptions) []map[string]any {
+	opts.Scope = normalizeToolScopeName(opts.Scope)
+	opts.EnabledTools = normalizedToolNames(opts.EnabledTools)
+	opts.DisabledTools = normalizedToolNames(opts.DisabledTools)
+	opts.ExternalTools = normalizeExternalTools(opts.ExternalTools)
+	if len(opts.ExternalTools) == 0 {
+		return adapter.FormatTools(encodedToolScope(opts.Scope, opts.EnabledTools, opts.DisabledTools))
+	}
+	specs := resolveToolSpecs(opts)
+	switch typed := adapter.(type) {
+	case *AnthropicMessagesAdapter:
+		return anthropicToolDefinitionsFromSpecs(specs)
+	case *KiroProviderAdapter:
+		return kiroToolDefinitionsFromSpecs(specs)
+	case *NugProviderAdapter:
+		return formatToolsForAdapter(typed.delegate(), opts)
+	default:
+		return openAIToolDefinitionsFromSpecs(specs)
+	}
 }
 
 type toolSpec struct {
@@ -310,8 +434,9 @@ func reflectionToolSpec(name, description string) toolSpec {
 		props["reflection"] = stringProp("Optional explanation of why completion is safe")
 		required = append(required, "evidence")
 	case "GoalCompleteRevise":
-		props["feedback"] = stringProp("Actionable feedback describing what remains before completion")
-		required = append(required, "feedback")
+		props["feedback"] = stringProp("Concise feedback describing why the goal cannot be completed yet")
+		props["nextSteps"] = stringProp("Concrete next action for the main narrator before trying UpdateGoal again")
+		required = append(required, "feedback", "nextSteps")
 	case "ExitPlanConfirm":
 		props["reflection"] = stringProp("Optional explanation of why the plan is ready")
 	case "ExitPlanRevise":
@@ -441,6 +566,7 @@ func toolSpecs() []toolSpec {
 				"required": []string{"query"},
 			},
 		},
+		terminalToolSpec(),
 		{
 			Name:        "ShareFile",
 			Description: "Share files from the working directory. Directories become .tar.gz, multiple paths become .zip, and single files can be gzip-compressed.",
@@ -716,6 +842,27 @@ func toolSpecs() []toolSpec {
 	}
 }
 
+func terminalToolSpec() toolSpec {
+	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	return toolSpec{
+		Name:        "Terminal",
+		Description: "Interact with persistent interactive terminals for this narrator or chapter. Use Bash for one-off commands; use Terminal for long-running dev servers, REPLs, and incremental terminal output.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action":       stringProp("list, create, read, write, or rename"),
+				"terminal_id":  stringProp("Terminal ID or exact terminal name for read/write/rename"),
+				"input":        stringProp("Input to send for write, e.g. \\n for Enter or \\x03 for Ctrl-C"),
+				"name":         stringProp("Name for create or rename"),
+				"last_n_lines": map[string]any{"type": "number", "description": "For read: return only the last N lines instead of incremental output"},
+				"wait_for":     stringProp("For read: wait until this substring appears in new output, up to 30s"),
+				"max_length":   map[string]any{"type": "number", "description": "Maximum output characters to return"},
+			},
+			"required": []string{"action"},
+		},
+	}
+}
+
 func browserToolSpec() toolSpec {
 	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
 	properties := map[string]any{
@@ -797,7 +944,7 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 		return toolShareFile(cwd, args["path"], boolValue(args["compress"]), boolValue(args["preview"])), nil
 	case "Browser":
 		return toolBrowser(ctx, cwd, args), nil
-	case "Agent", "Await", "TeamStatus", "Send", "AskUserQuestion", "Skill", "LearningGuide", "TaskCreate", "StartPipeline", "EndPipeline", "EnterPlanMode", "ExitPlanMode", "GetGoals", "AddGoal", "UpdateGoal":
+	case "Terminal", "Agent", "Await", "TeamStatus", "Send", "AskUserQuestion", "Skill", "LearningGuide", "TaskCreate", "StartPipeline", "EndPipeline", "EnterPlanMode", "ExitPlanMode", "GetGoals", "AddGoal", "UpdateGoal":
 		return name + " requires narrator context and cannot run outside a narrator session", nil
 	default:
 		return "unknown tool: " + name, nil
@@ -1447,12 +1594,26 @@ func toolShareFile(cwd string, rawPath any, compress bool, preview bool) string 
 	if err != nil {
 		return err.Error()
 	}
+	fileName := filepath.Base(dest)
+	expiresAt := time.Now().Add(defaultToolShareExpiry)
+	if err := writeShareMetadata(shareDiskMetadata{
+		ID:           shareID,
+		OriginalName: fileName,
+		FileName:     fileName,
+		SizeBytes:    info.Size(),
+		ExpiresAt:    expiresAt.Format(time.RFC3339Nano),
+		CreatedBy:    "agent",
+	}); err != nil {
+		removeShareDisk(shareID)
+		return err.Error()
+	}
 	payload := map[string]any{
 		"id":         shareID,
 		"url":        "/api/shares/" + shareID,
-		"fileName":   filepath.Base(dest),
+		"fileName":   fileName,
 		"sizeBytes":  info.Size(),
 		"compressed": compressed,
+		"expiresAt":  expiresAt.Format(time.RFC3339),
 	}
 	if preview && !compressed && len(resolved) == 1 {
 		payload["previewUrl"] = "/api/shares/" + shareID + "/preview"
@@ -1536,6 +1697,9 @@ func createTarGzArchive(dest, root string) error {
 		if err != nil || d.IsDir() {
 			return err
 		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return errors.New("symlink paths cannot be shared")
+		}
 		return addFileToTar(tw, base, path)
 	})
 }
@@ -1590,6 +1754,9 @@ func createZipArchive(dest string, paths []string) error {
 			if err != nil || d.IsDir() {
 				return err
 			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return errors.New("symlink paths cannot be shared")
+			}
 			return addFileToZip(zw, base, path)
 		}); err != nil {
 			return err
@@ -1621,26 +1788,127 @@ func sharesRoot() string {
 	return filepath.Join(home, ".narrafork", "shares")
 }
 
+func shareMetadataPath(shareID string) string {
+	return filepath.Join(sharesRoot(), shareID+".json")
+}
+
+func writeShareMetadata(metadata shareDiskMetadata) error {
+	if !isSafeShareID(metadata.ID) {
+		return errors.New("invalid share id")
+	}
+	if !isSafeShareFileName(metadata.FileName) || !isSafeShareFileName(metadata.OriginalName) {
+		return errors.New("invalid share filename")
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	path := shareMetadataPath(metadata.ID)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func isSafeShareID(shareID string) bool {
+	trimmed := strings.TrimSpace(shareID)
+	return shareID == trimmed && safeShareIDPattern.MatchString(shareID)
+}
+
+func isSafeShareFileName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+func removeShareDisk(shareID string) {
+	if !isSafeShareID(shareID) {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(sharesRoot(), shareID))
+	_ = os.Remove(shareMetadataPath(shareID))
+	_ = os.Remove(shareMetadataPath(shareID) + ".tmp")
+}
+
 func resolveWithin(cwd, path string) (string, error) {
 	if path == "" {
 		return "", errors.New("file_path is required")
 	}
+	root, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(cwd, path)
+		path = filepath.Join(root, path)
 	}
 	resolved, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
 	}
-	root, _ := filepath.Abs(cwd)
-	rel, err := filepath.Rel(root, resolved)
+	if !pathWithinBase(root, resolved) {
+		return "", errors.New("path escapes working directory")
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return "", err
 	}
-	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+	realResolved, err := filepath.EvalSymlinks(resolved)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		realAncestor, ancestorErr := evalExistingAncestor(resolved)
+		if ancestorErr != nil {
+			return "", err
+		}
+		if !pathWithinBase(realRoot, realAncestor) {
+			return "", errors.New("path escapes working directory")
+		}
+		return resolved, nil
+	}
+	if !pathWithinBase(realRoot, realResolved) {
 		return "", errors.New("path escapes working directory")
 	}
-	return resolved, nil
+	return realResolved, nil
+}
+
+func evalExistingAncestor(path string) (string, error) {
+	current := filepath.Clean(path)
+	for {
+		info, err := os.Lstat(current)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || info.IsDir() {
+				return filepath.EvalSymlinks(current)
+			}
+			return filepath.EvalSymlinks(filepath.Dir(current))
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		current = parent
+	}
+}
+
+func pathWithinBase(baseAbs, targetAbs string) bool {
+	rel, err := filepath.Rel(baseAbs, targetAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
 }
 
 type cappedBuffer struct {

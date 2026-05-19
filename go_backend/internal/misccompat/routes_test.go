@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -66,6 +68,52 @@ func TestStorageCleanupUnsupportedTargetsDoNotFakeSuccess(t *testing.T) {
 		if body["ok"] != false || body["code"] != tc.code || body["feature"] != tc.feature || body["supported"] != false || body["fallback"] != true {
 			t.Fatalf("cleanup %s returned fake or malformed unsupported payload: %#v", tc.target, body)
 		}
+	}
+}
+
+func TestStorageCleanupUploadsPreservesMessageImageOwners(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	root := uploadsRoot()
+	for _, dir := range []string{"avatars", "active-narrator", "referenced-deleted", "stale-deleted"} {
+		path := filepath.Join(root, dir)
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatalf("create upload dir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "image.png"), []byte(dir), 0o644); err != nil {
+			t.Fatalf("write upload fixture %s: %v", dir, err)
+		}
+	}
+
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	for _, stmt := range []string{
+		`CREATE TABLE narrators (id TEXT PRIMARY KEY)`,
+		`CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, content_json TEXT NOT NULL)`,
+		`INSERT INTO narrators (id) VALUES ('active-narrator')`,
+		`INSERT INTO narrator_messages (id, narrator_id, content_json) VALUES ('msg-image', 'referenced-deleted', '[{"type":"image","imageId":"img1"}]')`,
+		`INSERT INTO narrator_messages (id, narrator_id, content_json) VALUES ('msg-text', 'stale-deleted', '[{"type":"text","text":"hello"}]')`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("prepare upload cleanup fixture: %v", err)
+		}
+	}
+
+	h := NewHandler(database)
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/cleanup", nil)
+	removed, freed := h.cleanupOrphanedUploads(req)
+	if removed != 1 || freed == 0 {
+		t.Fatalf("cleanup removed/freed = %d/%d, want one stale directory removed", removed, freed)
+	}
+	for _, dir := range []string{"avatars", "active-narrator", "referenced-deleted"} {
+		if _, err := os.Stat(filepath.Join(root, dir)); err != nil {
+			t.Fatalf("expected %s to be preserved: %v", dir, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "stale-deleted")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale-deleted to be removed, stat err=%v", err)
 	}
 }
 

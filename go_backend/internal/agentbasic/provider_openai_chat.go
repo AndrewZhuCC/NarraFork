@@ -56,10 +56,15 @@ func (a *OpenAIChatCompletionsAdapter) Chat(ctx context.Context, params ChatPara
 		apiMode := strings.ToLower(strings.TrimSpace(a.Provider.APIMode))
 		var err error
 		if strings.TrimSpace(a.Provider.Kind) == "codex" {
+			sessionKey := firstNonEmpty(params.StickySessionKey, params.ConversationID)
 			if len(a.Provider.CredentialPool) > 0 {
-				err = streamCodexWithFailover(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, ch)
+				err = streamCodexWithFailover(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, sessionKey, ch)
 			} else {
 				err = streamCodexCandidate(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, ch)
+				if err == nil && a.Provider.CredentialID != "" {
+					markCodexCredentialRuntimeSuccess(a.Provider.CredentialID)
+					bindCodexSession(sessionKey, a.Provider, a.Provider.CredentialID)
+				}
 			}
 		} else {
 			switch apiMode {
@@ -137,9 +142,11 @@ type chatResponse struct {
 }
 
 type apiErrorPayload struct {
-	Message string `json:"message"`
-	Type    string `json:"type"`
-	Code    any    `json:"code"`
+	Message  string `json:"message"`
+	Type     string `json:"type"`
+	Code     any    `json:"code"`
+	ResetsAt any    `json:"resets_at,omitempty"`
+	ResetAt  any    `json:"reset_at,omitempty"`
 }
 
 type openAIUsage struct {
@@ -244,9 +251,14 @@ func streamChatCompletions(ctx context.Context, client *http.Client, provider Pr
 		return nil
 	}
 	acc := map[int]*openAIStreamingTool{}
-	return readSSE(ctx, res.Body, 0, func(event sseEvent) error {
+	completed := false
+	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			return nil
+		}
+		if data == "[DONE]" {
+			completed = true
 			return nil
 		}
 		var chunk chatStreamChunk
@@ -314,6 +326,13 @@ func streamChatCompletions(ctx context.Context, client *http.Client, provider Pr
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !completed {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{SilentDisconnect: true}})
+	}
+	return nil
 }
 
 func emitStreamEvent(ctx context.Context, out chan<- StreamEvent, event StreamEvent) bool {
@@ -454,9 +473,10 @@ type responsesOutputItem struct {
 	Result        string `json:"result"`
 }
 
-func streamCodexWithFailover(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
+func streamCodexWithFailover(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, sessionKey string, out chan<- StreamEvent) error {
 	var lastErr error
-	for _, candidate := range provider.CredentialPool {
+	pool := codexCredentialPoolForSession(provider, sessionKey)
+	for _, candidate := range pool {
 		if candidate.Model == "" {
 			candidate.Model = provider.Model
 		}
@@ -465,9 +485,12 @@ func streamCodexWithFailover(ctx context.Context, client *http.Client, provider 
 		}
 		candidate.Kind = "codex"
 		candidate.APIMode = "codex"
-		err := streamCodexCandidate(ctx, client, candidate, messages, reasoningEffort, toolScope, out)
+		candidate.LoadBalancingMode = provider.LoadBalancingMode
+		yielded, err := streamCodexCandidateObserved(ctx, client, candidate, messages, reasoningEffort, toolScope, out)
 		if err == nil {
 			if candidate.CredentialID != "" {
+				markCodexCredentialRuntimeSuccess(candidate.CredentialID)
+				bindCodexSession(sessionKey, provider, candidate.CredentialID)
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{CredentialID: candidate.CredentialID}})
 			}
 			return nil
@@ -479,11 +502,36 @@ func streamCodexWithFailover(ctx context.Context, client *http.Client, provider 
 		if candidate.CredentialID != "" {
 			markCodexCredentialRuntimeFailure(candidate.CredentialID, err)
 		}
+		if yielded {
+			if candidate.CredentialID != "" {
+				unbindCodexSession(sessionKey)
+			}
+			return &codexRebuildHistoryRetryError{PreviousCredentialID: candidate.CredentialID, Operation: "chat", Cause: err}
+		}
 	}
 	if lastErr != nil {
 		return lastErr
 	}
 	return streamOpenAIResponses(ctx, client, provider, messages, reasoningEffort, toolScope, out)
+}
+
+func streamCodexCandidateObserved(ctx context.Context, client *http.Client, candidate Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) (bool, error) {
+	local := make(chan StreamEvent, 16)
+	done := make(chan struct{})
+	yielded := false
+	go func() {
+		defer close(done)
+		for event := range local {
+			if event.Err == nil && parsedHasMeaningfulResponse(event.Parsed) {
+				yielded = true
+			}
+			emitStreamEvent(ctx, out, event)
+		}
+	}()
+	err := streamCodexCandidate(ctx, client, candidate, messages, reasoningEffort, toolScope, local)
+	close(local)
+	<-done
+	return yielded, err
 }
 
 func isProviderUnauthorized(err error) bool {
@@ -492,14 +540,7 @@ func isProviderUnauthorized(err error) bool {
 }
 
 func isCodexFailoverError(err error) bool {
-	var httpErr *providerHTTPError
-	if errors.As(err, &httpErr) {
-		if httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden || httpErr.StatusCode == http.StatusTooManyRequests || httpErr.StatusCode >= 500 {
-			return true
-		}
-	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "quota") || strings.Contains(message, "exhausted") || strings.Contains(message, "unauthorized")
+	return classifyCodexRuntimeError(err).Failover
 }
 
 func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
@@ -558,6 +599,11 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 		if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
 			return err
 		}
+		if (strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex") && decoded.Type == "response.failed" {
+			if err := codexFailoverErrorFromResponsesEvent(decoded); err != nil {
+				return err
+			}
+		}
 		if decoded.Response.Usage != nil {
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Usage: openAIUsageSnapshot(decoded.Response.Usage), ResponseID: decoded.Response.ID, ResponsesAPI: true}})
 		}
@@ -565,14 +611,24 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 		return nil
 	}
 	toolsByItem := map[string]*openAIStreamingTool{}
-	return readSSE(ctx, res.Body, 0, func(event sseEvent) error {
+	completed := false
+	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			return nil
+		}
+		if data == "[DONE]" {
+			completed = true
 			return nil
 		}
 		var parsed responsesStreamEvent
 		if err := json.Unmarshal([]byte(data), &parsed); err != nil {
 			return fmt.Errorf("decode responses stream event: %w", err)
+		}
+		if (strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex") && parsed.Type == "response.failed" {
+			if err := codexFailoverErrorFromResponsesEvent(parsed); err != nil {
+				return err
+			}
 		}
 		if invalid := openAIInvalidStateFromResponsesEvent(parsed); invalid != nil {
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{InvalidState: invalid, ResponsesAPI: true, ResponseID: parsed.Response.ID}})
@@ -600,6 +656,7 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 				tool.Stopped = true
 			}
 		case "response.completed":
+			completed = true
 			emitResponsesCompletedOutput(ctx, out, parsed)
 			event := ParsedStreamEvent{ResponsesAPI: true, ResponseID: parsed.Response.ID}
 			if parsed.Response.Usage != nil {
@@ -609,6 +666,13 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !completed {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{SilentDisconnect: true, ResponsesAPI: true}})
+	}
+	return nil
 }
 
 func emitResponsesCompletedOutput(ctx context.Context, out chan<- StreamEvent, decoded responsesStreamEvent) {

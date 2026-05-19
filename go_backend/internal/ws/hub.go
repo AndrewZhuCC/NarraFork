@@ -16,10 +16,12 @@ import (
 	"github.com/gorilla/websocket"
 
 	"narrafork-go/internal/auth"
+	"narrafork-go/internal/config"
 	"narrafork-go/internal/db"
 	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/id"
 	"narrafork-go/internal/terminaldb"
+	"narrafork-go/internal/vnet"
 )
 
 type TerminalRuntime interface {
@@ -43,11 +45,13 @@ type Hub struct {
 	terminals              map[*client]struct{}
 	terminalRuntime        TerminalRuntime
 	terminalDB             *sql.DB
+	browserSessionDB       *sql.DB
 	mergeDB                *sql.DB
 	narratorSync           NarratorSyncProvider
 	presence               map[string]map[*client]viewerInfo
 	streamingSnapshots     map[string]*streamingSnapshot
 	activeTerminalClients  map[string]*client
+	vnetRelay              *vnet.RelayHub
 	narratorBroadcastHooks []func(narratorID string, payload any, data []byte)
 	upgrader               websocket.Upgrader
 }
@@ -103,6 +107,7 @@ func NewHub() *Hub {
 		presence:              map[string]map[*client]viewerInfo{},
 		streamingSnapshots:    map[string]*streamingSnapshot{},
 		activeTerminalClients: map[string]*client{},
+		vnetRelay:             vnet.NewRelayHub(vnet.DefaultOptions()),
 		upgrader:              websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }},
 	}
 }
@@ -126,6 +131,12 @@ func (h *Hub) SetMergeDB(sqlDB *sql.DB) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.mergeDB = sqlDB
+}
+
+func (h *Hub) SetBrowserSessionDB(sqlDB *sql.DB) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.browserSessionDB = sqlDB
 }
 
 func (h *Hub) NarratorIDsWithPresence() []string {
@@ -203,6 +214,52 @@ func (h *Hub) TerminalHandler(authService *auth.Service) http.HandlerFunc {
 	}
 }
 
+func (h *Hub) VNetHandler(authService *auth.Service, settings *config.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		options := h.ConfigureVNetFromSettings(settings)
+		if !websocket.IsWebSocketUpgrade(r) {
+			status := http.StatusOK
+			payload := h.VNetStats(settings)
+			if !options.Enabled {
+				status = http.StatusServiceUnavailable
+			}
+			httpx.WriteJSON(w, status, payload)
+			return
+		}
+		if !options.Enabled {
+			conn, err := h.upgrader.Upgrade(w, r, nil)
+			if err != nil {
+				slog.Warn("upgrade disabled vnet websocket", "error", err)
+				return
+			}
+			payload := map[string]any{"type": "error", "ok": false, "supported": true, "fallback": true, "code": "VNET_DISABLED", "feature": "vnet", "message": "VNet is disabled"}
+			data, _ := json.Marshal(payload)
+			_ = conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
+			_ = conn.WriteMessage(websocket.TextMessage, data)
+			_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseUnsupportedData, "vnet disabled"), time.Now().Add(websocketWriteTimeout))
+			_ = conn.Close()
+			return
+		}
+		authInfo, ok := resolveVNetRelayAuth(r, authService, options)
+		if !ok {
+			httpx.WriteError(w, httpx.Unauthorized("VNet relay authentication required"))
+			return
+		}
+		conn, err := h.upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			slog.Warn("upgrade vnet websocket", "error", err)
+			return
+		}
+		c := &client{conn: conn, kind: "vnet", userID: authInfo.UserID, subscribers: map[string]struct{}{}}
+		h.add(c)
+		if h.vnetRelay != nil {
+			h.vnetRelay.AttachSocket(c, authInfo)
+		}
+		go h.heartbeatLoop(c)
+		go h.readLoop(c)
+	}
+}
+
 func (h *Hub) VNetDisabledHandler() http.HandlerFunc {
 	payload := map[string]any{
 		"type":      "error",
@@ -229,6 +286,93 @@ func (h *Hub) VNetDisabledHandler() http.HandlerFunc {
 		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseUnsupportedData, "vnet disabled"), time.Now().Add(websocketWriteTimeout))
 		_ = conn.Close()
 	}
+}
+
+func (h *Hub) ConfigureVNetFromSettings(settings *config.Store) vnet.Options {
+	options := vnet.DefaultOptions()
+	options.Enabled = true
+	if settings != nil {
+		raw := settings.Raw()
+		if cfg, ok := raw["vnet"].(map[string]any); ok {
+			if enabled, ok := cfg["enabled"]; ok {
+				options.Enabled = boolValue(enabled)
+			}
+			options.AllowAnonymous = boolValue(cfg["allowAnonymousRelay"])
+			options.RelayToken = strings.TrimSpace(stringValue(cfg["relayToken"]))
+			if maxPeers := intNumber(cfg["maxPeersPerNetwork"]); maxPeers > 0 {
+				options.MaxPeersPerNetwork = maxPeers
+			}
+			if maxBytes := intNumber(cfg["maxMessageBytes"]); maxBytes > 0 {
+				options.MaxMessageBytes = maxBytes
+			}
+			if udp, ok := cfg["udp"].(map[string]any); ok {
+				options.UDP = vnet.UDPInfo{Enabled: boolValue(udp["enabled"]), Host: strings.TrimSpace(stringValue(udp["host"])), Port: intNumber(udp["port"])}
+			}
+		}
+	}
+	if h != nil && h.vnetRelay != nil {
+		h.vnetRelay.Configure(options)
+	}
+	return options
+}
+
+func (h *Hub) VNetStats(settings *config.Store) map[string]any {
+	options := h.ConfigureVNetFromSettings(settings)
+	stats := vnet.Stats{MaxPeersPerNetwork: options.MaxPeersPerNetwork, MaxMessageBytes: options.MaxMessageBytes, UDP: options.UDP}
+	if h != nil && h.vnetRelay != nil {
+		stats = h.vnetRelay.Stats()
+	}
+	payload := map[string]any{
+		"ok":                 options.Enabled,
+		"supported":          true,
+		"fallback":           !options.Enabled,
+		"mode":               "relay",
+		"ws":                 true,
+		"peerCleanup":        true,
+		"udpRendezvous":      false,
+		"networks":           stats.Networks,
+		"peers":              stats.Peers,
+		"connections":        stats.Connections,
+		"maxPeersPerNetwork": stats.MaxPeersPerNetwork,
+		"maxMessageBytes":    stats.MaxMessageBytes,
+		"relay": map[string]any{
+			"clients": stats.Connections,
+			"rooms":   stats.Networks,
+			"peers":   stats.Peers,
+			"running": options.Enabled,
+		},
+		"udp": stats.UDP,
+	}
+	if !options.Enabled {
+		payload["code"] = "VNET_DISABLED"
+		payload["feature"] = "vnet"
+		payload["reason"] = "VNet is disabled in settings"
+	}
+	return payload
+}
+
+func resolveVNetRelayAuth(r *http.Request, authService *auth.Service, options vnet.Options) (vnet.RelayAuth, bool) {
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	bearer := ""
+	if strings.HasPrefix(strings.ToLower(header), "bearer ") {
+		bearer = strings.TrimSpace(header[len("Bearer "):])
+	}
+	token := bearer
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	if token != "" && options.RelayToken != "" && token == options.RelayToken {
+		return vnet.RelayAuth{Kind: "relay-token"}, true
+	}
+	if token != "" && authService != nil {
+		if claims, err := authService.VerifyToken(token); err == nil {
+			return vnet.RelayAuth{Kind: "jwt", UserID: claims.Subject}, true
+		}
+	}
+	if options.AllowAnonymous {
+		return vnet.RelayAuth{Kind: "anonymous"}, true
+	}
+	return vnet.RelayAuth{}, false
 }
 
 func (h *Hub) BroadcastTerminal(terminalID string, payload any) {
@@ -423,6 +567,14 @@ func narratorBroadcastPayloads(narratorID string, payload any) []any {
 			compat["input"] = input
 		}
 		appendPayload(compat)
+	case "retrying":
+		appendPayload(map[string]any{
+			"type":       "warning",
+			"message":    stringValue(base["message"]),
+			"retryCount": base["attempt"],
+			"maxRetries": base["maxRetries"],
+			"delayMs":    base["delayMs"],
+		})
 	case "tool_result":
 		status := "success"
 		if boolValue(base["isError"]) {
@@ -553,15 +705,19 @@ func loadViewerInfo(ctx context.Context, sqlDB *sql.DB, userID string) viewerInf
 func (h *Hub) add(c *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if c.kind == "terminal" {
+	switch c.kind {
+	case "terminal":
 		h.terminals[c] = struct{}{}
-	} else {
+	case "narrator":
 		h.narrators[c] = struct{}{}
 	}
 }
 
 func (h *Hub) remove(c *client) {
 	broadcasts := []pendingBroadcast{}
+	if c.kind == "vnet" && h.vnetRelay != nil {
+		h.vnetRelay.DetachSocket(c)
+	}
 	h.mu.Lock()
 	delete(h.narrators, c)
 	delete(h.terminals, c)
@@ -769,6 +925,16 @@ func (h *Hub) readLoop(c *client) {
 
 func (h *Hub) handleMessage(c *client, msg map[string]any) {
 	typeValue, _ := msg["type"].(string)
+	if c.kind == "vnet" {
+		if typeValue == "ping" {
+			c.sendJSON(map[string]any{"type": "pong"})
+			return
+		}
+		if h.vnetRelay != nil {
+			h.vnetRelay.HandleClientMessage(c, msg)
+		}
+		return
+	}
 	switch typeValue {
 	case "ping":
 		c.sendJSON(map[string]any{"type": "pong"})
@@ -1126,7 +1292,12 @@ func (h *Hub) activeBrowserSessionCount(ctx context.Context, narratorID string) 
 	if narratorID == "" {
 		return 0
 	}
-	sqlDB := h.narratorDB()
+	h.mu.RLock()
+	sqlDB := h.browserSessionDB
+	if sqlDB == nil {
+		sqlDB = h.terminalDB
+	}
+	h.mu.RUnlock()
 	if sqlDB == nil {
 		return 0
 	}
@@ -1959,6 +2130,15 @@ func nullableNullFloat(value sql.NullFloat64) any {
 		return nil
 	}
 	return value.Float64
+}
+
+func (c *client) SendJSON(payload any) {
+	c.queueSendJSON(payload)
+}
+
+func (c *client) Close(code int, reason string) {
+	_ = c.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), time.Now().Add(websocketWriteTimeout))
+	_ = c.conn.Close()
 }
 
 func (c *client) sendJSON(payload any) {

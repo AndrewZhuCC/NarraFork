@@ -615,6 +615,143 @@ func TestCodexProviderFailsOverAcrossCredentialPool(t *testing.T) {
 	}
 }
 
+func TestCodexProviderUsesStickySessionAfterFailover(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), []byte(`[
+		{"id":"bad","accessToken":"bad-token","accountId":"bad-acct","priority":0},
+		{"id":"good","accessToken":"good-token","accountId":"good-acct","priority":1}
+	]`), 0o600); err != nil {
+		t.Fatalf("write codex creds: %v", err)
+	}
+	badRequests := 0
+	goodRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer bad-token":
+			badRequests++
+			http.Error(w, `{"error":{"code":"usage_limit_reached","message":"usage limit reached","resets_at":2000000000}}`, http.StatusTooManyRequests)
+			return
+		case "Bearer good-token":
+			goodRequests++
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"ok"}
+
+`)
+			fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+`)
+			return
+		default:
+			t.Fatalf("unexpected auth header: %s", r.Header.Get("Authorization"))
+		}
+	}))
+	defer server.Close()
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err := store.Patch(map[string]any{"codex": map[string]any{"baseUrl": server.URL, "loadBalancingMode": "tier-balanced"}}); err != nil {
+		t.Fatalf("patch config: %v", err)
+	}
+	resolution, err := ResolveProviderAndModel(store, "codex:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve codex pool: %v", err)
+	}
+	adapter := &OpenAIChatCompletionsAdapter{Provider: resolution.Config}
+	for i := 0; i < 2; i++ {
+		stream, err := adapter.Chat(context.Background(), ChatParams{StickySessionKey: "nar-sticky", History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+		if err != nil {
+			t.Fatalf("Chat returned error: %v", err)
+		}
+		text := ""
+		for event := range stream {
+			if event.Err != nil {
+				t.Fatalf("stream error: %v", event.Err)
+			}
+			text += event.Parsed.Text
+		}
+		if text != "ok" {
+			t.Fatalf("unexpected text on call %d: %q", i+1, text)
+		}
+	}
+	if badRequests != 1 || goodRequests < 2 || CodexStickySessionCount() < 1 {
+		t.Fatalf("sticky session did not prefer the successful credential: bad=%d good=%d sticky=%d", badRequests, goodRequests, CodexStickySessionCount())
+	}
+}
+
+func TestCodexProviderMapsUsageLimitFailureToRebuildRetryAfterYield(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), []byte(`[
+		{"id":"bad","accessToken":"bad-token","accountId":"bad-acct","priority":0},
+		{"id":"good","accessToken":"good-token","accountId":"good-acct","priority":1}
+	]`), 0o600); err != nil {
+		t.Fatalf("write codex creds: %v", err)
+	}
+	goodRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "Bearer good-token" {
+			goodRequests++
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"partial"}
+
+`)
+		fmt.Fprint(w, `data: {"type":"response.failed","response":{"error":{"code":"usage_limit_reached","message":"usage limit reached","resets_at":2000000000}}}
+
+`)
+	}))
+	defer server.Close()
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err := store.Patch(map[string]any{"codex": map[string]any{"baseUrl": server.URL, "loadBalancingMode": "tier-balanced"}}); err != nil {
+		t.Fatalf("patch config: %v", err)
+	}
+	resolution, err := ResolveProviderAndModel(store, "codex:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve codex pool: %v", err)
+	}
+	adapter := &OpenAIChatCompletionsAdapter{Provider: resolution.Config}
+	stream, err := adapter.Chat(context.Background(), ChatParams{StickySessionKey: "nar-rebuild", History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	text := ""
+	var streamErr error
+	for event := range stream {
+		if event.Err != nil {
+			streamErr = event.Err
+			continue
+		}
+		text += event.Parsed.Text
+	}
+	if text != "partial" || !isCodexRebuildHistoryRetryError(streamErr) || goodRequests != 0 {
+		t.Fatalf("expected partial output and rebuild retry without in-stream failover, text=%q err=%v goodRequests=%d", text, streamErr, goodRequests)
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "codex-credentials.json"))
+	if err != nil {
+		t.Fatalf("read codex creds: %v", err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("decode codex creds: %v", err)
+	}
+	if entries[0]["disabled"] != true || entries[0]["disabledReason"] != "quota_exhausted" || entries[0]["quotaResetsAt"] == nil {
+		t.Fatalf("expected quota failure metadata on first credential: %#v", entries[0])
+	}
+}
+
 func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -907,6 +1044,49 @@ func TestResolverRefreshesExpiredCodexAndClineCredentials(t *testing.T) {
 	}
 	if cline.Config.APIKey != "cline-refreshed" {
 		t.Fatalf("expected refreshed cline token, got %#v", cline.Config)
+	}
+}
+
+func TestResolverSkipsExpiredCodexAccessTokenOnlyCredentialWithoutRefresh(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	refreshRequests := 0
+	codexRefresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		refreshRequests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer codexRefresh.Close()
+	t.Setenv("CODEX_ISSUER_URL", codexRefresh.URL)
+	future := time.Now().Add(time.Hour).UnixMilli()
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), []byte(fmt.Sprintf(`[
+		{"id":"expired-at-only","accessToken":"expired-token","accountId":"expired","expiresAt":1,"priority":0},
+		{"id":"fresh-at-only","accessToken":"fresh-token","accountId":"fresh","expiresAt":%d,"priority":1}
+	]`, future)), 0o600); err != nil {
+		t.Fatalf("write codex creds: %v", err)
+	}
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if _, err := store.Patch(map[string]any{"codex": map[string]any{"baseUrl": "https://codex.example"}}); err != nil {
+		t.Fatalf("patch config: %v", err)
+	}
+	codex, err := ResolveProviderAndModel(store, "codex:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve codex: %v", err)
+	}
+	if codex.Config.CredentialID != "fresh-at-only" || codex.Config.APIKey != "fresh-token" {
+		t.Fatalf("expected fresh access-token-only credential, got %#v", codex.Config)
+	}
+	if refreshRequests != 0 {
+		t.Fatalf("access-token-only credentials must not refresh, got %d refresh requests", refreshRequests)
+	}
+	if len(codex.Config.CredentialPool) != 1 || codex.Config.CredentialPool[0].CredentialID != "fresh-at-only" {
+		t.Fatalf("expected expired access-token-only credential excluded from pool, got %#v", codex.Config.CredentialPool)
 	}
 }
 

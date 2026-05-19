@@ -3,6 +3,7 @@ package narrators
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -106,6 +107,71 @@ func TestPermissionDenyBroadcastsResolvedAndPreservesPendingSideEffectState(t *t
 	}
 	if len(*events) != 1 || (*events)[0].Payload["decision"] != "deny" || (*events)[0].Payload["toolUseId"] != "tool-deny" {
 		t.Fatalf("expected permission_resolved deny broadcast, got %#v", *events)
+	}
+}
+
+func TestStopDangerReflectionHandlesPersistedStateWithoutRuntime(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	suggestions := `[{"type":"danger_reflection","status":"running","requestId":"req-danger","danger":{"summary":"Risk"},"startedAt":"2026-05-18T00:00:00Z"}]`
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, permission_suggestions, created_at) VALUES ('req-danger', ?, 'tool-danger', 'Bash', '{"command":"rm -rf tmp"}', 'pending', ?, '2026-05-18T00:00:00Z')`, narratorID, suggestions); err != nil {
+		t.Fatalf("insert danger reflection tool call: %v", err)
+	}
+	hub, events := newPermissionBroadcastRecorder()
+	h := NewHandler(&Service{DB: sqlDB, Hub: hub})
+	router := chi.NewRouter()
+	h.RegisterRoutes(router)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/permissions/req-danger/stop-reflection", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected stop reflection 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var status, reason, updatedSuggestions string
+	if err := sqlDB.QueryRow(`SELECT status, COALESCE(permission_decision_reason, ''), COALESCE(permission_suggestions, '') FROM narrator_tool_calls WHERE id = 'req-danger'`).Scan(&status, &reason, &updatedSuggestions); err != nil {
+		t.Fatalf("load stopped danger reflection: %v", err)
+	}
+	if status != "fail" || reason == "" || !strings.Contains(updatedSuggestions, `"status":"aborted"`) {
+		t.Fatalf("danger reflection should be aborted, status=%s reason=%q suggestions=%s", status, reason, updatedSuggestions)
+	}
+	if len(*events) != 1 || (*events)[0].Payload["type"] != "danger_reflection_resolved" || (*events)[0].Payload["decision"] != "aborted" {
+		t.Fatalf("expected danger_reflection_resolved aborted broadcast, got %#v", *events)
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/permissions/req-danger/stop-reflection", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected idempotent stop reflection 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if len(*events) != 2 || (*events)[1].Payload["type"] != "danger_reflection_resolved" || (*events)[1].Payload["decision"] != "aborted" {
+		t.Fatalf("expected idempotent resolved broadcast, got %#v", *events)
+	}
+}
+
+func TestRecoverOnStartupAbortsStaleReflectionSuggestions(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'waiting', substatus = '["reflecting"]' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark narrator waiting: %v", err)
+	}
+	suggestions := `[{"type":"plan_reflection","status":"running","requestId":"req-plan","startedAt":"2026-05-18T00:00:00Z"}]`
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, permission_suggestions, created_at) VALUES ('req-plan', ?, 'tool-plan', 'ExitPlanMode', '{}', 'pending', ?, '2026-05-18T00:00:00Z')`, narratorID, suggestions); err != nil {
+		t.Fatalf("insert stale reflection tool call: %v", err)
+	}
+	if err := (&Service{DB: sqlDB}).RecoverOnStartup(context.Background()); err != nil {
+		t.Fatalf("recover on startup: %v", err)
+	}
+	var narratorStatus, substatus, toolStatus, updatedSuggestions string
+	if err := sqlDB.QueryRow(`SELECT status, substatus FROM narrators WHERE id = ?`, narratorID).Scan(&narratorStatus, &substatus); err != nil {
+		t.Fatalf("load recovered narrator: %v", err)
+	}
+	if err := sqlDB.QueryRow(`SELECT status, COALESCE(permission_suggestions, '') FROM narrator_tool_calls WHERE id = 'req-plan'`).Scan(&toolStatus, &updatedSuggestions); err != nil {
+		t.Fatalf("load recovered tool call: %v", err)
+	}
+	if narratorStatus != "idle" || !strings.Contains(substatus, "interrupted") || toolStatus != "fail" || !strings.Contains(updatedSuggestions, `"status":"aborted"`) {
+		t.Fatalf("unexpected recovery state narrator=%s substatus=%s tool=%s suggestions=%s", narratorStatus, substatus, toolStatus, updatedSuggestions)
 	}
 }
 
@@ -372,6 +438,31 @@ func stringSliceContains(values []string, needle string) bool {
 	return false
 }
 
+func TestBrowserSessionListReturnsFrontendMillisecondShape(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	createBrowserSessionsTestTable(t, sqlDB)
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_browser_sessions (id, narrator_id, status, url, title, ttl_seconds, expires_at, tracing_status, tracing_json, metadata_json, created_at, updated_at) VALUES ('browser-1', ?, 'active', 'https://example.test', 'Example', 60, '2999-01-01T00:00:00Z', 'active', '{"startedAt": 1700000000000}', '{"networkRequestCount":3,"networkCaptureEnabled":true}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z')`, narratorID); err != nil {
+		t.Fatalf("insert browser session: %v", err)
+	}
+	w := serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/browser-sessions")
+	if w.Code != http.StatusOK {
+		t.Fatalf("list browser sessions status=%d body=%s", w.Code, w.Body.String())
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &items); err != nil {
+		t.Fatalf("decode sessions: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("items=%#v", items)
+	}
+	item := items[0]
+	if item["ttlMs"] != float64(60000) || item["expiresAt"] == nil || item["lastActivity"] == nil || item["tracing"] == nil || item["networkRequestCount"] != float64(3) || item["networkCaptureEnabled"] != true {
+		t.Fatalf("browser session item should expose frontend ms shape, got %#v", item)
+	}
+}
+
 func TestBrowserSessionListReturnsErrorWhenExpireUpdateFails(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -384,7 +475,7 @@ func TestBrowserSessionListReturnsErrorWhenExpireUpdateFails(t *testing.T) {
 		t.Fatalf("create browser expire trigger: %v", err)
 	}
 
-	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/browser-sessions")
+	w := serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/browser-sessions")
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("expected browser session expire failure to return 500, got %d body=%s", w.Code, w.Body.String())
 	}
@@ -411,6 +502,41 @@ func createBrowserSessionsTestTable(t *testing.T, sqlDB *sql.DB) {
 	)`)
 	if err != nil {
 		t.Fatalf("create narrator_browser_sessions table: %v", err)
+	}
+}
+
+func TestBrowserSessionActionsManagePersistedFallbackRows(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	createBrowserSessionsTestTable(t, sqlDB)
+	shot := base64.StdEncoding.EncodeToString([]byte("png"))
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_browser_sessions (id, narrator_id, status, url, title, ttl_seconds, expires_at, screenshot_data_base64, screenshot_mime, tracing_status, tracing_json, metadata_json, created_at, updated_at) VALUES ('browser-1', ?, 'active', 'https://example.test', 'Example', 60, '2999-01-01T00:00:00Z', ?, 'image/png', 'active', '{"status":"active"}', '{}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z')`, narratorID, shot); err != nil {
+		t.Fatalf("insert browser row: %v", err)
+	}
+	w := serveNarratorHandlerJSONWithBrowserStorage(sqlDB, http.MethodPatch, "/narrators/"+narratorID+"/browser-sessions/browser-1/ttl", map[string]any{"ttlMs": 120000})
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ttlMs":120000`) {
+		t.Fatalf("ttl update failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = serveNarratorHandlerJSONWithBrowserStorage(sqlDB, http.MethodPatch, "/narrators/"+narratorID+"/browser-sessions/browser-1/ttl", map[string]any{"ttlMs": 5})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("invalid ttl should return 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/browser-sessions/browser-1/screenshot")
+	if w.Code != http.StatusOK || w.Body.String() != "png" || w.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("screenshot fallback failed: status=%d type=%s body=%q", w.Code, w.Header().Get("Content-Type"), w.Body.String())
+	}
+	w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/browser-sessions/browser-1/stop-tracing")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"stopped"`) {
+		t.Fatalf("stop tracing fallback failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodDelete, "/narrators/"+narratorID+"/browser-sessions/browser-1")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"closed"`) {
+		t.Fatalf("close fallback failed: status=%d body=%s", w.Code, w.Body.String())
+	}
+	var status string
+	if err := sqlDB.QueryRow(`SELECT status FROM narrator_browser_sessions WHERE id = 'browser-1'`).Scan(&status); err != nil || status != "closed" {
+		t.Fatalf("browser row status=%s err=%v", status, err)
 	}
 }
 
@@ -450,42 +576,39 @@ func TestBrowserSessionActionsExposeFeatureDisabledFallbackWithoutStorageTable(t
 	}
 }
 
-func TestRollbackAndEditExposeFeatureDisabledFallback(t *testing.T) {
+func TestRollbackAndEditRoutesAreActive(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
 
 	cases := []struct {
-		name    string
-		path    string
-		body    map[string]any
-		feature string
+		name string
+		path string
+		body map[string]any
 	}{
 		{
-			name:    "rollback",
-			path:    "/narrators/" + narratorID + "/rollback/msg-1",
-			body:    map[string]any{"blockIndex": 0},
-			feature: "narrator.rollback",
+			name: "rollback missing message",
+			path: "/narrators/" + narratorID + "/rollback/msg-1",
+			body: map[string]any{"blockIndex": 0},
 		},
 		{
-			name:    "edit and regenerate",
-			path:    "/narrators/" + narratorID + "/edit-and-regenerate/msg-1",
-			body:    map[string]any{"content": "updated", "rollback": true},
-			feature: "narrator.editAndRegenerate",
+			name: "edit missing message",
+			path: "/narrators/" + narratorID + "/edit-and-regenerate/msg-1",
+			body: map[string]any{"content": "updated", "rollback": true},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, tc.path, tc.body)
-			if w.Code != http.StatusNotImplemented {
-				t.Fatalf("expected explicit 501 fallback, got %d body=%s", w.Code, w.Body.String())
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("expected active route to validate message refs with 404, got %d body=%s", w.Code, w.Body.String())
 			}
 			var body map[string]any
 			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode fallback body: %v", err)
+				t.Fatalf("decode error body: %v", err)
 			}
-			if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != tc.feature || body["supported"] != false || body["fallback"] != true {
-				t.Fatalf("unexpected fallback payload: %#v", body)
+			if body["code"] == "FEATURE_DISABLED" || body["supported"] == false {
+				t.Fatalf("rollback/edit routes should no longer return feature-disabled fallback: %#v", body)
 			}
 		})
 	}
@@ -556,12 +679,16 @@ func TestBareNarratorListRequiresChapterOrStandalone(t *testing.T) {
 	}
 }
 
-func TestSubagentDetachAttachRoutesExposeFallbackStatus(t *testing.T) {
+func TestSubagentDetachAttachRoutesExposeParentBlockingStatus(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
 	childID := insertChildNarratorTestRow(t, sqlDB, "route_child")
-	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'working', is_background = 0, traits = '[]' WHERE id = ?`, childID); err != nil {
+	if _, err := sqlDB.Exec(`UPDATE narrators SET parent_narrator_id = ?, status = 'working', is_background = 0, traits = '[]' WHERE id = ?`, parentID, childID); err != nil {
 		t.Fatalf("seed child status: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_messages (id, narrator_id, parent_tool_use_id, role, content_json, content_text, created_at) VALUES ('route_child_msg', ?, 'agent-route', 'user', '[{"type":"text","text":"launch"}]', 'launch', '2026-01-01T00:00:00Z')`, childID); err != nil {
+		t.Fatalf("seed child parent tool use: %v", err)
 	}
 
 	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+childID+"/detach", map[string]any{})
@@ -577,14 +704,14 @@ func TestSubagentDetachAttachRoutesExposeFallbackStatus(t *testing.T) {
 	}
 
 	w = serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+childID+"/attach", map[string]any{})
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected attach 200, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected attach stale recovery 400, got %d body=%s", w.Code, w.Body.String())
 	}
 	var attached map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &attached); err != nil {
 		t.Fatalf("decode attach: %v", err)
 	}
-	if attached["attached"] != true || attached["fallback"] != true || attached["background"] != false {
-		t.Fatalf("unexpected attach payload: %#v", attached)
+	if attached["attached"] != false || attached["staleRecovered"] != true || attached["backgroundStatus"] != "failed" {
+		t.Fatalf("unexpected attach stale recovery payload: %#v", attached)
 	}
 }

@@ -172,9 +172,13 @@ func TestReflectionDecisionFromToolCall(t *testing.T) {
 	if decision.Action != "confirm" || decision.Evidence == "" || output == "" {
 		t.Fatalf("expected goal completion confirm decision, got %#v output=%q", decision, output)
 	}
-	decision, _ = reflectionDecisionFromToolCall("GoalCompleteRevise", `{"confirm":true,"feedback":"Need to run the final validation."}`)
-	if decision.Action != "revise" || decision.Feedback == "" {
-		t.Fatalf("expected goal completion revise decision, got %#v", decision)
+	decision, _ = reflectionDecisionFromToolCall("GoalCompleteRevise", `{"confirm":true,"feedback":"Need to run the final validation.","nextSteps":"Run the final validation and retry UpdateGoal if it passes."}`)
+	if decision.Action != "revise" || decision.Feedback == "" || decision.NextSteps == "" {
+		t.Fatalf("expected goal completion revise decision with next steps, got %#v", decision)
+	}
+	decision, output = reflectionDecisionFromToolCall("GoalCompleteRevise", `{"confirm":true,"feedback":"Need to run the final validation."}`)
+	if decision.Action != "" || !strings.Contains(output, "nextSteps") {
+		t.Fatalf("expected missing nextSteps to reject goal completion revise, got %#v output=%q", decision, output)
 	}
 	decision, _ = reflectionDecisionFromToolCall("ExitPlanConfirm", `{"confirm":true,"reflection":"plan is actionable"}`)
 	if decision.Action != "confirm" || decision.ToolName != "ExitPlanConfirm" {

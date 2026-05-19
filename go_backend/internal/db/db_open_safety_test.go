@@ -13,21 +13,109 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestOpenRefusesMissingDatabaseAndDoesNotCreateIt(t *testing.T) {
+func TestOpenReadOnlyModeRefusesMissingDatabaseAndDoesNotCreateIt(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
+	cfg, err := NewConfig(ConfigInput{
+		SQLitePath:          dbPath,
+		SQLiteBootstrapMode: string(SQLiteBootstrapModeReadOnly),
+	})
+	if err != nil {
+		t.Fatalf("NewConfig returned error: %v", err)
+	}
 
-	store, err := Open(context.Background())
+	store, err := OpenWithConfig(context.Background(), cfg)
 	if err == nil {
 		store.Close()
-		t.Fatal("Open should fail when the canonical TS database does not exist")
+		t.Fatal("OpenWithConfig should fail when the canonical TS database does not exist in read-only mode")
 	}
 	if !strings.Contains(err.Error(), "canonical TypeScript database does not exist") {
 		t.Fatalf("expected missing canonical DB error, got %q", err.Error())
 	}
-	if _, statErr := os.Stat(filepath.Join(home, ".narrafork", "narrafork.db")); !os.IsNotExist(statErr) {
-		t.Fatalf("Open should not create narrafork.db; stat error = %v", statErr)
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("OpenWithConfig should not create narrafork.db in read-only mode; stat error = %v", statErr)
 	}
+}
+
+func TestOpenBootstrapsMissingSQLiteDatabaseByDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
+
+	store, err := Open(context.Background())
+	if err != nil {
+		t.Fatalf("Open should bootstrap missing SQLite database by default: %v", err)
+	}
+	defer store.Close()
+	if _, statErr := os.Stat(dbPath); statErr != nil {
+		t.Fatalf("bootstrapped database should exist: %v", statErr)
+	}
+	if err := VerifyCanonicalSchema(context.Background(), store.SQL); err != nil {
+		t.Fatalf("bootstrapped database should satisfy canonical schema: %v", err)
+	}
+	if store.RuntimeSQL == nil || store.RuntimePath != runtimeSidecarPathForSQLite(dbPath) {
+		t.Fatalf("bootstrap should open Go runtime sidecar: runtimePath=%q", store.RuntimePath)
+	}
+	assertTableMissing(t, store.SQL, goMigrationJournalTable)
+	journal := readGoMigrationJournalForTest(t, store.RuntimeSQL)
+	if journal.Status != "compatible" || journal.ExpectedCount != len(embeddedDrizzleMigrationSnapshot) {
+		t.Fatalf("unexpected Go migration journal after bootstrap: %#v", journal)
+	}
+	for _, expected := range canonicalFTSObjects {
+		ok, err := ftsObjectReady(context.Background(), store.SQL, expected)
+		if err != nil {
+			t.Fatalf("inspect bootstrapped FTS table %s: %v", expected.Table, err)
+		}
+		if !ok {
+			t.Fatalf("bootstrapped FTS table %s is not ready", expected.Table)
+		}
+	}
+}
+
+func TestOpenWithConfigFailsFastWhenPostgresDriverIsUnavailable(t *testing.T) {
+	if sqlDriverRegistered((PostgresDialect{}).DriverName()) {
+		t.Skip("postgres driver is registered in this build")
+	}
+	cfg, err := NewConfig(ConfigInput{
+		Driver:      "postgres",
+		PostgresDSN: "postgres://example/db",
+	})
+	if err != nil {
+		t.Fatalf("NewConfig returned error: %v", err)
+	}
+	store, err := OpenWithConfig(context.Background(), cfg)
+	if err == nil {
+		store.Close()
+		t.Fatal("OpenWithConfig should fail clearly when pgx is not linked")
+	}
+	if !errors.Is(err, ErrPostgresDriverUnavailable) {
+		t.Fatalf("expected ErrPostgresDriverUnavailable, got %v", err)
+	}
+}
+
+func TestOpenWithConfigCanSkipCanonicalChecksForSQLite(t *testing.T) {
+	home := t.TempDir()
+	dbPath := prepareHomeDatabase(t, home)
+	sqlDB := openSQLiteFileForTest(t, dbPath)
+	mustCloseTestDB(t, sqlDB)
+
+	cfg, err := NewConfig(ConfigInput{
+		SQLitePath:      dbPath,
+		VerifyCanonical: Bool(false),
+		TSOwnedSchema:   Bool(true),
+	})
+	if err != nil {
+		t.Fatalf("NewConfig returned error: %v", err)
+	}
+	store, err := OpenWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("OpenWithConfig should skip canonical checks when disabled: %v", err)
+	}
+	defer store.Close()
+	if store.Engine != EngineSQLite || store.Dialect.Name() != EngineSQLite || store.Path != dbPath {
+		t.Fatalf("unexpected store metadata: %#v", store)
+	}
+	assertTableMissing(t, store.SQL, goMigrationJournalTable)
 }
 
 func TestOpenDoesNotWriteJournalWhenCanonicalSchemaFails(t *testing.T) {
@@ -73,7 +161,7 @@ func TestOpenDoesNotWriteJournalWhenDrizzleJournalFails(t *testing.T) {
 	assertFileDBTableMissing(t, dbPath, goMigrationJournalTable)
 }
 
-func TestOpenWithCompatibleDBOnlyAddsGoJournal(t *testing.T) {
+func TestOpenWithCompatibleDBWritesGoJournalOnlyToRuntimeSidecar(t *testing.T) {
 	home := t.TempDir()
 	dbPath := prepareHomeDatabase(t, home)
 	sqlDB := openSQLiteFileForTest(t, dbPath)
@@ -99,12 +187,12 @@ func TestOpenWithCompatibleDBOnlyAddsGoJournal(t *testing.T) {
 		}
 	}
 	sort.Strings(newObjects)
-	if strings.Join(newObjects, ",") != goMigrationJournalTable {
-		t.Fatalf("Open should only add %s, got %#v", goMigrationJournalTable, newObjects)
+	if len(newObjects) != 0 {
+		t.Fatalf("Open should not add Go-only objects to the shared DB, got %#v", newObjects)
 	}
 	assertStringSlicesEqual(t, projectColumnsBefore, tableColumnNamesForTest(t, store.SQL, "projects"))
 	assertStringSlicesEqual(t, narratorColumnsBefore, tableColumnNamesForTest(t, store.SQL, "narrators"))
-	journal := readGoMigrationJournalForTest(t, store.SQL)
+	journal := readGoMigrationJournalForTest(t, store.RuntimeSQL)
 	if journal.Status != "compatible" {
 		t.Fatalf("journal status = %q, want compatible", journal.Status)
 	}

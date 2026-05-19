@@ -27,14 +27,52 @@ import (
 	"narrafork-go/internal/ws"
 )
 
+type ExternalToolContext struct {
+	NarratorID       string
+	ParentNarratorID string
+	PermissionMode   string
+	SubagentType     string
+	Type             string
+	Variant          string
+	ToolAccess       string
+	CustomTools      []string
+}
+
+type ExternalToolProvider interface {
+	AgentToolSpecs(ctx context.Context, info ExternalToolContext) []agentbasic.ExternalToolSpec
+	ResolveToolPermission(toolName string, permissionMode string) (action string, reason string, handled bool)
+	ExecuteTool(ctx context.Context, toolName string, args map[string]any) (agentbasic.ToolRun, bool)
+}
+
 type Service struct {
-	DB       *sql.DB
-	Hub      *ws.Hub
-	Settings *config.Store
+	DB        *sql.DB
+	RuntimeDB *sql.DB
+	// BrowserSessionPersistenceEnabled keeps the Go-owned browser-session extension
+	// disabled by default so Bun-final shared schema stays untouched unless an
+	// explicit cutover enables it.
+	BrowserSessionPersistenceEnabled bool
+	Hub                              *ws.Hub
+	Settings                         *config.Store
+	ExternalTools                    ExternalToolProvider
+	TerminalRuntime                  terminalAgentRuntime
+	contextOverflowRetry             func(context.Context, string)
 
 	runMu          sync.Mutex
 	activeRuns     map[string]context.CancelFunc
 	activeRunToken map[string]string
+}
+
+type askQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+	Preview     string `json:"preview,omitempty"`
+}
+
+type askQuestionInput struct {
+	Question    string              `json:"question"`
+	Header      string              `json:"header"`
+	Options     []askQuestionOption `json:"options"`
+	MultiSelect bool                `json:"multiSelect"`
 }
 
 type Narrator struct {
@@ -82,15 +120,18 @@ type Narrator struct {
 }
 
 type ToolCallRecord struct {
-	ID         string `json:"id"`
-	NarratorID string `json:"narratorId"`
-	MessageID  string `json:"messageId"`
-	ToolUseID  string `json:"toolUseId"`
-	ToolName   string `json:"toolName"`
-	InputJSON  any    `json:"inputJson"`
-	OutputJSON any    `json:"outputJson"`
-	Status     string `json:"status"`
-	CreatedAt  string `json:"createdAt"`
+	ID                       string  `json:"id"`
+	NarratorID               string  `json:"narratorId"`
+	MessageID                string  `json:"messageId"`
+	ToolUseID                string  `json:"toolUseId"`
+	ToolName                 string  `json:"toolName"`
+	InputJSON                any     `json:"inputJson"`
+	OutputJSON               any     `json:"outputJson"`
+	Status                   string  `json:"status"`
+	ErrorMessage             *string `json:"errorMessage,omitempty"`
+	PermissionDecisionReason *string `json:"permissionDecisionReason,omitempty"`
+	PermissionSuggestions    any     `json:"permissionSuggestions,omitempty"`
+	CreatedAt                string  `json:"createdAt"`
 }
 
 type Message struct {
@@ -202,10 +243,164 @@ type ForkNarratorOptions struct {
 
 func NewService(sqlDB *sql.DB, hub *ws.Hub, settings *config.Store) *Service {
 	service := &Service{DB: sqlDB, Hub: hub, Settings: settings}
+	agentbasic.SetBrowserSessionObserver(service)
 	if hub != nil {
 		hub.SetNarratorSyncProvider(service)
 	}
 	return service
+}
+
+func (s *Service) SetRuntimeDB(sqlDB *sql.DB) {
+	if s == nil {
+		return
+	}
+	s.RuntimeDB = sqlDB
+	if s.BrowserSessionPersistenceEnabled {
+		_ = s.EnsureBrowserSessionStorage(context.Background())
+		_ = s.importLegacyBrowserSessions(context.Background())
+	}
+}
+
+func (s *Service) EnableBrowserSessionPersistence() {
+	if s == nil {
+		return
+	}
+	s.BrowserSessionPersistenceEnabled = true
+	if s.RuntimeDB != nil {
+		_ = s.EnsureBrowserSessionStorage(context.Background())
+		_ = s.importLegacyBrowserSessions(context.Background())
+	}
+}
+
+func (s *Service) DisableBrowserSessionPersistence() {
+	if s == nil {
+		return
+	}
+	s.BrowserSessionPersistenceEnabled = false
+}
+
+func (s *Service) browserDB() *sql.DB {
+	if s == nil || !s.BrowserSessionPersistenceEnabled {
+		return nil
+	}
+	if s.RuntimeDB != nil {
+		return s.RuntimeDB
+	}
+	return s.DB
+}
+
+func (s *Service) RecoverOnStartup(ctx context.Context) error {
+	now := db.NowISO()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["interrupted"]', updated_at = ? WHERE status IN ('working', 'waiting')`, now); err != nil {
+		return err
+	}
+
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, permission_suggestions FROM narrator_tool_calls WHERE status = 'pending'`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	const restartMessage = "Interrupted by server restart"
+	type stalePermission struct {
+		id          string
+		suggestions sql.NullString
+	}
+	stale := []stalePermission{}
+	for rows.Next() {
+		var row stalePermission
+		if err := rows.Scan(&row.id, &row.suggestions); err != nil {
+			return err
+		}
+		stale = append(stale, row)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, row := range stale {
+		abortedSuggestions, changed := abortActiveReflectionSuggestionsRaw(row.suggestions, restartMessage, now)
+		if changed {
+			if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, permission_decided_by = 'server_restart', permission_decided_at = ?, permission_decision_reason = ?, permission_suggestions = ? WHERE id = ?`, restartMessage, now, restartMessage, abortedSuggestions, row.id); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, permission_decided_by = 'server_restart', permission_decided_at = ? WHERE id = ?`, restartMessage, now, row.id); err != nil {
+			return err
+		}
+	}
+
+	outputJSON, _ := json.Marshal(map[string]any{"output": restartMessage})
+	if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?) WHERE status = 'running'`, restartMessage, string(outputJSON)); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?) WHERE status = 'initializing'`, restartMessage, string(outputJSON)); err != nil {
+		return err
+	}
+	return nil
+}
+
+var persistedReflectionSuggestionTypes = map[string]bool{
+	"danger_reflection": true,
+	"plan_reflection":   true,
+	"goal_reflection":   true,
+}
+
+func abortActiveReflectionSuggestionsRaw(raw sql.NullString, reason, resolvedAt string) (string, bool) {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return "", false
+	}
+	var suggestions []any
+	if err := json.Unmarshal([]byte(raw.String), &suggestions); err != nil {
+		return "", false
+	}
+	changed := false
+	for index, suggestion := range suggestions {
+		record, ok := suggestion.(map[string]any)
+		if !ok {
+			continue
+		}
+		typeValue := stringValue(record["type"])
+		if !persistedReflectionSuggestionTypes[typeValue] {
+			continue
+		}
+		status := stringValue(record["status"])
+		if status == "" {
+			status = "running"
+		}
+		if status != "running" && status != "awaiting_user" {
+			continue
+		}
+		record["status"] = "aborted"
+		record["reason"] = reason
+		record["resolvedAt"] = resolvedAt
+		suggestions[index] = record
+		changed = true
+	}
+	if !changed {
+		return "", false
+	}
+	data, err := json.Marshal(suggestions)
+	if err != nil {
+		return "", false
+	}
+	return string(data), true
+}
+
+func externalToolContextFromNarrator(n Narrator) ExternalToolContext {
+	subagentType := ptrString(n.SubagentType)
+	access := customSubagentToolAccessForType(subagentType)
+	return ExternalToolContext{
+		NarratorID:       n.ID,
+		ParentNarratorID: ptrString(n.ParentNarratorID),
+		PermissionMode:   ptrString(n.PermissionMode),
+		SubagentType:     subagentType,
+		Type:             n.Type,
+		Variant:          n.Variant,
+		ToolAccess:       access.ToolAccess,
+		CustomTools:      access.CustomTools,
+	}
 }
 
 func (s *Service) Create(ctx context.Context, input CreateInput) (Narrator, error) {
@@ -1393,10 +1588,11 @@ func (s *Service) RetryLastUserMessage(ctx context.Context, narratorID string) (
 	if len(messages) == 0 || messages[0].ContentText == nil || strings.TrimSpace(*messages[0].ContentText) == "" {
 		return Message{}, nil, httpx.BadRequest("no previous user message to retry")
 	}
-	deletedIDs, err := s.deleteRefsAfterSeq(ctx, narratorID, ref.Seq)
+	deleted, err := s.deleteMessagesAfter(ctx, narratorID, ref.MessageID, false, true)
 	if err != nil {
 		return Message{}, nil, err
 	}
+	deletedIDs := deleted.DeletedMessageIDs
 	if s.Hub != nil && len(deletedIDs) > 0 {
 		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "messages_deleted", "narratorId": narratorID, "deletedMessageIds": deletedIDs})
 	}
@@ -1810,6 +2006,34 @@ func nullableStringPtrValue(value string) *string {
 	return &trimmed
 }
 
+func (s *Service) executeBuiltInAgentTool(ctx context.Context, cwd, narratorID string, call agentbasic.ToolCall) string {
+	if strings.TrimSpace(call.Function.Name) == "Browser" {
+		ctx = agentbasic.ContextWithBrowserExecution(ctx, agentbasic.BrowserExecutionContext{NarratorID: narratorID, ToolUseID: call.ID})
+	}
+	return agentbasic.ExecuteTool(ctx, cwd, call.Function.Name, call.Function.Arguments)
+}
+
+func (s *Service) executeExternalTool(ctx context.Context, call agentbasic.ToolCall) (agentbasic.ToolRun, bool) {
+	if s.ExternalTools == nil {
+		return agentbasic.ToolRun{}, false
+	}
+	args := map[string]any{}
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		args = map[string]any{"_raw": call.Function.Arguments}
+	}
+	run, handled := s.ExternalTools.ExecuteTool(ctx, call.Function.Name, args)
+	if !handled {
+		return agentbasic.ToolRun{}, false
+	}
+	run.ID = call.ID
+	run.Name = call.Function.Name
+	run.Arguments = call.Function.Arguments
+	if strings.TrimSpace(run.Status) == "" {
+		run.Status = "completed"
+	}
+	return run, true
+}
+
 func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	narrator, err := s.Get(ctx, narratorID)
 	if err != nil {
@@ -1852,20 +2076,20 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 			pipeline.capture(&run)
 			return run, nil
 		}
-		if permission.Action == "ask" {
-			if shouldRunDangerReflection(narrator) {
-				decision, err := s.runDangerReflection(execCtx, narratorID, call)
-				if err != nil {
-					run.Status = "error"
-					run.Output = "Danger reflection failed: " + err.Error()
-					return run, nil
-				}
-				if decision.Action == "cancel" {
-					run.Status = "denied"
-					run.Output = firstNonEmptyString(decision.Feedback, "Danger reflection rejected this tool call.")
-					return run, nil
-				}
+		if shouldRunDangerReflectionBeforeExecution(s.Settings, narrator, permission, call) {
+			decision, err := s.runDangerReflection(execCtx, narratorID, call)
+			if err != nil {
+				run.Status = "error"
+				run.Output = "Danger reflection failed: " + err.Error()
+				return run, nil
 			}
+			if decision.Action == "cancel" {
+				run.Status = "denied"
+				run.Output = firstNonEmptyString(decision.Feedback, "Danger reflection rejected this tool call.")
+				return run, nil
+			}
+		}
+		if permission.Action == "ask" {
 			if draftMessageID == "" {
 				draftMessageID, err = s.createAssistantDraft(execCtx, narratorID)
 				if err != nil {
@@ -1898,10 +2122,19 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 			if err := s.setNarratorRunSubstatus(execCtx, narratorID, narrator.IsBackground, []string{"executing_tool"}); err != nil {
 				return agentbasic.ToolRun{}, err
 			}
-			fileChange := prepareToolFileChange(execCwd, call)
-			run.Output = agentbasic.ExecuteTool(execCtx, execCwd, call.Function.Name, call.Function.Arguments)
-			completeToolFileChange(fileChange)
-			run.FileChange = fileChange
+			if contextRun, handled, err := s.executeContextualAgentTool(execCtx, narratorID, narrator, call); handled || err != nil {
+				run = contextRun
+				if err != nil {
+					return agentbasic.ToolRun{}, err
+				}
+			} else if externalRun, handled := s.executeExternalTool(execCtx, call); handled {
+				run = externalRun
+			} else {
+				fileChange := prepareToolFileChange(execCwd, call)
+				run.Output = s.executeBuiltInAgentTool(execCtx, execCwd, narratorID, call)
+				completeToolFileChange(fileChange)
+				run.FileChange = fileChange
+			}
 			pipeline.capture(&run)
 			if err := s.finishRecordedToolCall(execCtx, narratorID, call.ID, draftMessageID, run, decision, "success"); err != nil {
 				return agentbasic.ToolRun{}, err
@@ -1909,10 +2142,19 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 			_ = s.setNarratorRunSubstatus(execCtx, narratorID, narrator.IsBackground, []string{"calling_model"})
 			return run, nil
 		}
-		fileChange := prepareToolFileChange(cwd, call)
-		run.Output = agentbasic.ExecuteTool(execCtx, cwd, call.Function.Name, call.Function.Arguments)
-		completeToolFileChange(fileChange)
-		run.FileChange = fileChange
+		if contextRun, handled, err := s.executeContextualAgentTool(execCtx, narratorID, narrator, call); handled || err != nil {
+			run = contextRun
+			if err != nil {
+				return agentbasic.ToolRun{}, err
+			}
+		} else if externalRun, handled := s.executeExternalTool(execCtx, call); handled {
+			run = externalRun
+		} else {
+			fileChange := prepareToolFileChange(cwd, call)
+			run.Output = s.executeBuiltInAgentTool(execCtx, cwd, narratorID, call)
+			completeToolFileChange(fileChange)
+			run.FileChange = fileChange
+		}
 		pipeline.capture(&run)
 		return run, nil
 	}
@@ -1923,6 +2165,10 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	toolScope := "normal"
 	if meta, ok := s.reviewMetaForNarrator(ctx, narrator); ok && meta.Role == "review" {
 		toolScope = "review"
+	}
+	externalTools := []agentbasic.ExternalToolSpec{}
+	if s.ExternalTools != nil {
+		externalTools = s.ExternalTools.AgentToolSpecs(ctx, externalToolContextFromNarrator(narrator))
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	runToken := s.registerActiveRun(narratorID, cancel)
@@ -1939,7 +2185,10 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 		agentbasic.WithToolScope(toolScope),
 		agentbasic.WithEnabledTools(anyStringSlice(narrator.EnabledTools)),
 		agentbasic.WithDisabledTools(disabledToolsFromTraits(narrator.Traits)),
+		agentbasic.WithExternalTools(externalTools),
+		agentbasic.WithFirstTokenTimeout(s.agentFirstTokenTimeout()),
 		agentbasic.WithToolInventoryEvent(true),
+		agentbasic.WithStickySessionKey(narratorID),
 	)
 	if err != nil {
 		if narrator.IsBackground && s.narratorRunCancelled(ctx, narratorID) {
@@ -1948,7 +2197,7 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 		s.persistAgentError(ctx, narratorID, err, narrator.IsBackground)
 		return
 	}
-	state := &agentRunState{narratorID: narratorID, narrator: narrator, draftMessageID: &draftMessageID}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator, draftMessageID: &draftMessageID, providerPrefix: providerPrefixFromModelValue(model)}
 	for event := range stream {
 		if err := s.handleAgentEvent(ctx, state, event); err != nil {
 			if isCancelledError(err) || runCtx.Err() != nil {
@@ -2118,6 +2367,17 @@ func (s *Service) agentHistoryLimit() int {
 		limit = 200
 	}
 	return limit
+}
+
+func (s *Service) agentFirstTokenTimeout() time.Duration {
+	value := s.agentIntSetting("firstTokenTimeoutMs", 60000)
+	if value <= 0 {
+		return 0
+	}
+	if value > 600000 {
+		value = 600000
+	}
+	return time.Duration(value) * time.Millisecond
 }
 
 func (s *Service) agentIntSetting(key string, fallback int) int {
@@ -2451,6 +2711,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = jsonToolOutput(payload)
 		return run, true, nil
 	case "Send":
+		args["_tool_use_id"] = call.ID
 		payload, err := s.sendTool(ctx, narratorID, args)
 		if err != nil {
 			return run, true, err
@@ -2520,11 +2781,25 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 			run.Output = "goal_id is required"
 			return run, true, nil
 		}
-		payload, err := s.updateGoal(ctx, narratorID, goalID, stringFromAny(args["status"]), stringFromAny(args["objective"]), stringFromAny(args["evidence"]), stringFromAny(args["reflection"]))
+		broadcastTargetID := narratorID
+		if narrator.ParentNarratorID != nil && strings.TrimSpace(*narrator.ParentNarratorID) != "" {
+			broadcastTargetID = strings.TrimSpace(*narrator.ParentNarratorID)
+		}
+		reflectionMeta := &goalReflectionContext{
+			ToolUseID:         call.ID,
+			ToolName:          call.Function.Name,
+			InputJSON:         args,
+			BroadcastTargetID: broadcastTargetID,
+		}
+		payload, err := s.updateGoalWithReflectionContext(ctx, narratorID, goalID, stringFromAny(args["status"]), stringFromAny(args["objective"]), stringFromAny(args["evidence"]), stringFromAny(args["reflection"]), reflectionMeta)
 		if err != nil {
 			return run, true, err
 		}
 		run.Output = jsonToolOutput(payload)
+		if strings.TrimSpace(stringFromAny(payload["error"])) != "" {
+			run.Status = "denied"
+			run.Error = strings.TrimSpace(stringFromAny(payload["error"]))
+		}
 		return run, true, nil
 	default:
 		return run, false, nil
@@ -2774,19 +3049,59 @@ func (s *Service) sendTool(ctx context.Context, callerID string, args map[string
 			targets = append(targets, child)
 		}
 	}
-	results := []map[string]any{}
-	for _, target := range targets {
-		if anyBool(args["doInterrupt"]) {
-			if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '[]', updated_at = ? WHERE id = ?`, db.NowISO(), target.ID); err != nil {
-				return nil, fmt.Errorf("interrupt send target %s: %w", target.ID, err)
-			}
-		}
-		_, err := s.AddUserMessage(ctx, target.ID, "agent", message)
+	if anyBool(args["doInterrupt"]) {
+		caller, err := s.Get(ctx, callerID)
 		if err != nil {
 			return nil, err
 		}
-		payload := subagentStatusPayload(target)
+		if caller.ParentNarratorID != nil && strings.TrimSpace(*caller.ParentNarratorID) != "" {
+			return map[string]any{"ok": false, "error": "doInterrupt is only supported from a primary narrator to its child subagents"}, nil
+		}
+	}
+	parentToolUseID := strings.TrimSpace(stringFromAny(args["_tool_use_id"]))
+	results := []map[string]any{}
+	for _, target := range targets {
+		fresh, err := s.Get(ctx, target.ID)
+		if err != nil {
+			return nil, err
+		}
+		payload := subagentStatusPayload(fresh)
+		if anyBool(args["doInterrupt"]) {
+			if fresh.ParentNarratorID == nil || strings.TrimSpace(*fresh.ParentNarratorID) != callerID {
+				payload["sent"] = false
+				payload["error"] = "doInterrupt is only supported for this narrator's direct child subagents"
+				results = append(results, payload)
+				continue
+			}
+			payload["interrupted"] = s.CancelRun(fresh.ID)
+		}
+		if fresh.Status == "working" || fresh.Status == "waiting" || (fresh.IsBackground && ptrString(fresh.BackgroundStatus) == "running") {
+			if fresh.IsBackground && ptrString(fresh.BackgroundStatus) == "running" && !s.runActive(fresh.ID) {
+				if err := s.reconcileStaleBackgroundAgent(ctx, fresh); err != nil {
+					return nil, err
+				}
+				fresh, _ = s.Get(ctx, fresh.ID)
+			}
+			if fresh.Status == "working" || fresh.Status == "waiting" || (fresh.IsBackground && ptrString(fresh.BackgroundStatus) == "running") {
+				_, err := s.BufferUserMessage(ctx, fresh.ID, "agent", message, []map[string]any{{"type": "text", "text": message}}, anyBool(args["doInterrupt"]))
+				if err != nil {
+					return nil, err
+				}
+				payload = subagentStatusPayload(fresh)
+				payload["sent"] = true
+				payload["queued"] = true
+				results = append(results, payload)
+				continue
+			}
+		}
+		_, err = s.startUserMessageRunWithParentToolUse(ctx, fresh.ID, "agent", message, []map[string]any{{"type": "text", "text": message}}, fresh, parentToolUseID)
+		if err != nil {
+			return nil, err
+		}
+		started, _ := s.Get(ctx, fresh.ID)
+		payload = subagentStatusPayload(started)
 		payload["sent"] = true
+		payload["started"] = true
 		results = append(results, payload)
 	}
 	if anyBool(args["await"]) {
@@ -2856,6 +3171,145 @@ func anyStringSlice(value any) []string {
 	default:
 		return nil
 	}
+}
+
+func disabledToolsTrait(tools []string) string {
+	payload, _ := json.Marshal(map[string]any{"version": 1, "tools": tools})
+	return "custom-disabled-tools:" + base64.RawURLEncoding.EncodeToString(payload)
+}
+
+type customSubagentToolAccess struct {
+	ToolAccess  string
+	CustomTools []string
+	Found       bool
+}
+
+var subagentKnownToolNames = []string{
+	"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
+	"ShareFile", "Browser", "Agent", "Await", "TeamStatus", "Send", "AskUserQuestion",
+	"Skill", "LearningGuide", "TaskCreate", "StartPipeline", "EndPipeline", "EnterPlanMode",
+	"ExitPlanMode", "GetGoals", "AddGoal", "UpdateGoal", "ConcludeReview",
+}
+
+func disabledToolsForSubagentType(subagentType string) []string {
+	access := customSubagentToolAccessForType(subagentType)
+	allowed := allowedToolsForSubagentType(subagentType, access)
+	disabled := []string{}
+	for _, tool := range subagentKnownToolNames {
+		if !allowed[tool] {
+			disabled = append(disabled, tool)
+		}
+	}
+	return disabled
+}
+
+func allowedToolsForSubagentType(subagentType string, access customSubagentToolAccess) map[string]bool {
+	explorePlan := []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit", "TaskCreate", "TeamStatus", "Await", "Send"}
+	general := append(append([]string{}, explorePlan...), "Skill")
+	allowed := map[string]bool{}
+	add := func(values []string) {
+		for _, value := range values {
+			value = strings.TrimSpace(value)
+			if value == "" || value == "AskUserQuestion" || value == "Agent" {
+				continue
+			}
+			allowed[value] = true
+		}
+	}
+	if access.Found {
+		switch access.ToolAccess {
+		case "general":
+			add(general)
+		case "custom":
+			add(access.CustomTools)
+		default:
+			add(explorePlan)
+		}
+		return allowed
+	}
+	switch subagentType {
+	case "general":
+		add(general)
+	case "explore", "plan", "review":
+		add(explorePlan)
+	default:
+		add(explorePlan)
+	}
+	return allowed
+}
+
+func customSubagentToolAccessForType(subagentType string) customSubagentToolAccess {
+	subagentType = strings.TrimSpace(subagentType)
+	if subagentType == "" || subagentType == "general" || subagentType == "explore" || subagentType == "plan" || subagentType == "review" {
+		return customSubagentToolAccess{}
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return customSubagentToolAccess{}
+	}
+	path := filepath.Join(home, ".narrafork", "subagents", subagentType, "SUBAGENT.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return customSubagentToolAccess{}
+	}
+	frontmatter := parseCustomSubagentFrontmatterForTools(string(data))
+	access := strings.TrimSpace(frontmatter["toolAccess"])
+	if access != "general" && access != "custom" {
+		access = "readOnly"
+	}
+	return customSubagentToolAccess{ToolAccess: access, CustomTools: splitCustomTools(frontmatter["customTools"]), Found: true}
+}
+
+func parseCustomSubagentFrontmatterForTools(raw string) map[string]string {
+	out := map[string]string{}
+	lines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) != "---" {
+		return out
+	}
+	currentArray := ""
+	items := []string{}
+	flushArray := func() {
+		if currentArray != "" {
+			out[currentArray] = strings.Join(items, "\n")
+		}
+		currentArray = ""
+		items = nil
+	}
+	for _, line := range lines[1:] {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "---" {
+			flushArray()
+			break
+		}
+		if currentArray != "" && strings.HasPrefix(trimmed, "-") {
+			items = append(items, strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "-")), `"'`))
+			continue
+		}
+		flushArray()
+		key, value, ok := strings.Cut(trimmed, ":")
+		if !ok {
+			continue
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if value == "" && key == "customTools" {
+			currentArray = key
+			items = []string{}
+			continue
+		}
+		out[key] = strings.Trim(value, `"'`)
+	}
+	return out
+}
+
+func splitCustomTools(value string) []string {
+	out := []string{}
+	for _, line := range strings.Split(value, "\n") {
+		if item := strings.TrimSpace(line); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func disabledToolsFromTraits(traits []string) []string {
@@ -2946,7 +3400,7 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 		return started, nil
 	}
 	timeout := anyInt(args["timeout"], 30000)
-	awaited, err := s.awaitTool(ctx, parentID, map[string]any{"type": "agent", "id": child.ID, "timeout": timeout})
+	awaited, err := s.awaitTool(ctx, parentID, map[string]any{"type": "agent", "id": child.ID, "timeout": timeout, "_parent_blocking": true, "_tool_use_id": toolUseID})
 	if err != nil {
 		return nil, err
 	}
@@ -2980,6 +3434,9 @@ func (s *Service) createSubagentNarrator(ctx context.Context, parent Narrator, s
 	}
 	systemPrompt := subagentSystemPrompt(subagentType, cwd)
 	traits := []string{"subagent", "subagent-type:" + subagentType}
+	if disabled := disabledToolsForSubagentType(subagentType); len(disabled) > 0 {
+		traits = append(traits, disabledToolsTrait(disabled))
+	}
 	if strings.TrimSpace(alias) != "" {
 		traits = append(traits, "agent-alias:"+strings.TrimSpace(alias))
 	}
@@ -3044,13 +3501,51 @@ func (s *Service) finishBackgroundTaskRecord(ctx context.Context, parentID, task
 	if err != nil {
 		return err
 	}
-	if rows > 0 && s.Hub != nil {
+	if rows > 0 {
 		theToolUseID, err := s.backgroundTaskToolUseID(ctx, parentID, taskID)
 		if err != nil {
-			s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "background_task_status_changed", "narratorId": parentID, "taskId": taskID, "status": status, "output": nullableStringPtrValue(storedOutput), "degraded": true, "fallback": true, "fallbacks": []any{"background_task_tool_use_id_query_failed"}, "error": err.Error()})
+			if s.Hub != nil {
+				s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "background_task_status_changed", "narratorId": parentID, "taskId": taskID, "status": status, "output": nullableStringPtrValue(storedOutput), "degraded": true, "fallback": true, "fallbacks": []any{"background_task_tool_use_id_query_failed"}, "error": err.Error()})
+			}
 			return fmt.Errorf("query background task tool use id: %w", err)
 		}
+		if err := s.injectBackgroundSubagentResult(ctx, parentID, taskID, theToolUseID, status, storedOutput); err != nil {
+			return err
+		}
 		s.broadcastBackgroundTaskStatus(parentID, taskID, status, nullableStringPtrValue(storedOutput), theToolUseID)
+	}
+	return nil
+}
+
+func (s *Service) injectBackgroundSubagentResult(ctx context.Context, parentID, taskID, toolUseID, status, output string) error {
+	if strings.TrimSpace(parentID) == "" || strings.TrimSpace(toolUseID) == "" {
+		return nil
+	}
+	dbStatus := "success"
+	if status != "completed" {
+		dbStatus = "error"
+	}
+	payload := map[string]any{
+		"output":              output,
+		"result":              output,
+		"formatted":           formatSubagentResult(taskID, output),
+		"subagentId":          taskID,
+		"backgroundStatus":    status,
+		"backgroundCompleted": status == "completed",
+		"detached":            true,
+	}
+	outputJSON, _ := json.Marshal(payload)
+	errorMessage := ""
+	if dbStatus == "error" {
+		errorMessage = output
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET output_json = ?, status = ?, completed_at = COALESCE(completed_at, ?), error_message = ? WHERE narrator_id = ? AND tool_use_id = ?`, string(outputJSON), dbStatus, db.NowISO(), nullableTrimmedString(errorMessage), parentID, toolUseID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows > 0 && s.Hub != nil {
+		s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "tool_completed", "narratorId": parentID, "toolUseId": toolUseID, "toolName": "Agent", "status": dbStatus, "output": output, "backgroundStatus": status, "subagentNarratorId": taskID})
 	}
 	return nil
 }
@@ -3135,6 +3630,7 @@ func (s *Service) awaitTool(ctx context.Context, parentID string, args map[strin
 	if target == "" {
 		return map[string]any{"status": "error", "message": "id is required"}, nil
 	}
+	parentBlocking := anyBool(args["_parent_blocking"])
 	timeoutMs := anyInt(args["timeout"], 0)
 	if timeoutMs < 0 {
 		timeoutMs = 0
@@ -3148,10 +3644,37 @@ func (s *Service) awaitTool(ctx context.Context, parentID string, args map[strin
 		if err != nil {
 			return map[string]any{"status": "not_found", "id": target}, nil
 		}
+		if parentBlocking && child.IsBackground && ptrString(child.BackgroundStatus) == "running" {
+			payload := subagentStatusPayload(child)
+			payload["status"] = "detached"
+			payload["detached"] = true
+			payload["background"] = true
+			payload["backgroundStatus"] = "running"
+			payload["result"] = formatBackgroundTaskResult(child.ID, fmt.Sprintf("Subagent detached to background. Use Await({ type: \"agent\", id: \"%s\" }) to get results, or Send({ id: \"%s\", message }) to continue.", firstNonEmptyString(childAlias(child), child.ID), firstNonEmptyString(childAlias(child), child.ID)))
+			payload["output"] = payload["result"]
+			payload["formatted"] = payload["result"]
+			return payload, nil
+		}
+		if child.IsBackground && ptrString(child.BackgroundStatus) == "running" && !s.runActive(child.ID) {
+			if err := s.reconcileStaleBackgroundAgent(ctx, child); err != nil {
+				return nil, err
+			}
+			child, _ = s.resolveChildNarrator(ctx, parentID, target)
+		}
 		payload := subagentStatusPayload(child)
 		if subagentDone(child) || timeoutMs == 0 || time.Now().After(deadline) {
+			result := ptrString(child.BackgroundResult)
+			if strings.TrimSpace(result) == "" {
+				result, _ = s.lastAssistantText(ctx, child.ID)
+			}
+			if strings.TrimSpace(result) != "" {
+				payload["result"] = result
+				payload["output"] = result
+				payload["formatted"] = formatSubagentResult(child.ID, result)
+			}
 			if !subagentDone(child) && timeoutMs > 0 {
 				payload["timedOut"] = true
+				payload["status"] = "timeout"
 			}
 			return payload, nil
 		}
@@ -3280,23 +3803,44 @@ func (s *Service) DetachSubagent(ctx context.Context, subagentID string) (map[st
 	if child.Type != "subagent" && child.Variant != "subagent" {
 		return map[string]any{"detached": false, "fallback": true, "error": "Not a subagent"}, nil
 	}
+	if child.ParentNarratorID == nil || strings.TrimSpace(*child.ParentNarratorID) == "" {
+		return map[string]any{"detached": false, "fallback": true, "error": "Subagent has no parent narrator"}, nil
+	}
 	if !s.runActive(subagentID) && child.Status != "working" {
 		return map[string]any{"detached": false, "fallback": true, "error": "Subagent is not running in foreground mode"}, nil
 	}
-	now := db.NowISO()
-	traits := addStringTrait(child.Traits, "background")
-	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET is_background = 1, background_status = COALESCE(background_status, 'running'), traits = ?, updated_at = ? WHERE id = ?`, traits, now, subagentID)
+	toolUseID, err := s.subagentParentToolUseID(ctx, subagentID)
 	if err != nil {
+		return map[string]any{"detached": false, "fallback": true, "error": "Cannot find parent tool_use"}, nil
+	}
+	parentID := strings.TrimSpace(*child.ParentNarratorID)
+	alias, traitsJSON := ensureSubagentAliasTrait(child)
+	now := db.NowISO()
+	previousTraitsJSON, _ := json.Marshal(child.Traits)
+	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET is_background = 1, background_status = 'running', traits = ?, updated_at = ? WHERE id = ?`, traitsJSON, now, subagentID)
+	if err != nil {
+		return nil, err
+	}
+	subagentType := firstNonEmptyString(ptrString(child.SubagentType), normalizeSubagentType(ptrString(child.SubagentType)))
+	if subagentType == "" {
+		subagentType = "general"
+	}
+	if err := s.createBackgroundAgentTask(ctx, parentID, child.ID, subagentType, ptrString(child.Title), toolUseID, alias); err != nil {
+		_, _ = s.DB.ExecContext(ctx, `UPDATE narrators SET is_background = ?, background_status = ?, traits = ?, updated_at = ? WHERE id = ?`, boolInt(child.IsBackground), nullableTrimmedString(ptrString(child.BackgroundStatus)), string(previousTraitsJSON), now, subagentID)
 		return nil, err
 	}
 	updated, err := s.Get(ctx, subagentID)
 	if err != nil {
 		return nil, err
 	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "subagent_detached", "narratorId": parentID, "subagentNarratorId": subagentID, "toolUseId": toolUseID})
+	}
 	payload := subagentStatusPayload(updated)
 	payload["detached"] = true
 	payload["fallback"] = false
-	payload["message"] = "Subagent marked as background. Go backend cannot unblock an already-running parent tool promise; Await/Send can inspect or continue the background narrator."
+	payload["toolUseId"] = toolUseID
+	payload["message"] = fmt.Sprintf("Subagent detached to background. Use Await({ type: \"agent\", id: \"%s\" }) to get results, or Send({ id: \"%s\", message }) to continue.", firstNonEmptyString(alias, subagentID), firstNonEmptyString(alias, subagentID))
 	return payload, nil
 }
 
@@ -3311,6 +3855,18 @@ func (s *Service) AttachSubagent(ctx context.Context, subagentID string) (map[st
 	if !child.IsBackground {
 		return map[string]any{"attached": false, "fallback": true, "error": "Subagent is not in background mode"}, nil
 	}
+	if ptrString(child.BackgroundStatus) == "running" && !s.runActive(subagentID) {
+		if err := s.reconcileStaleBackgroundAgent(ctx, child); err != nil {
+			return nil, err
+		}
+		updated, _ := s.Get(ctx, subagentID)
+		payload := subagentStatusPayload(updated)
+		payload["attached"] = false
+		payload["fallback"] = true
+		payload["staleRecovered"] = true
+		payload["message"] = "Background subagent runtime was not active; marked failed for recovery."
+		return payload, nil
+	}
 	now := db.NowISO()
 	traits := removeStringTrait(child.Traits, "background")
 	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET is_background = 0, background_status = NULL, traits = ?, updated_at = ? WHERE id = ?`, traits, now, subagentID)
@@ -3321,15 +3877,34 @@ func (s *Service) AttachSubagent(ctx context.Context, subagentID string) (map[st
 	if err != nil {
 		return nil, err
 	}
+	if s.Hub != nil && child.ParentNarratorID != nil {
+		s.Hub.BroadcastNarrator(*child.ParentNarratorID, map[string]any{"type": "subagent_attached", "narratorId": *child.ParentNarratorID, "subagentNarratorId": subagentID})
+	}
 	payload := subagentStatusPayload(updated)
 	payload["attached"] = true
-	payload["fallback"] = !s.runActive(subagentID)
-	if payload["fallback"] == true {
-		payload["message"] = "Subagent mode restored to foreground, but no active Go runner was found to attach and block on."
-	} else {
-		payload["message"] = "Subagent mode restored to foreground. Go backend does not support re-blocking the original parent tool call."
-	}
+	payload["fallback"] = false
+	payload["parentBlocking"] = true
+	payload["message"] = "Subagent attached to foreground. Await or Send(await=true) can block until this running subagent completes."
 	return payload, nil
+}
+
+func (s *Service) reconcileStaleBackgroundAgent(ctx context.Context, child Narrator) error {
+	if !child.IsBackground || ptrString(child.BackgroundStatus) != "running" || child.ParentNarratorID == nil || strings.TrimSpace(*child.ParentNarratorID) == "" || s.runActive(child.ID) {
+		return nil
+	}
+	message := "Background subagent runtime was not active after restart/recovery"
+	parentID := strings.TrimSpace(*child.ParentNarratorID)
+	now := db.NowISO()
+	if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["error"]', background_status = 'failed', background_result = ?, background_completed_at = ?, error_message = ?, updated_at = ? WHERE id = ?`, message, now, message, now, child.ID); err != nil {
+		return err
+	}
+	if err := s.finishBackgroundTaskRecord(ctx, parentID, child.ID, "failed", message); err != nil {
+		return err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(child.ID, map[string]any{"type": "status", "narratorId": child.ID, "status": "idle", "substatus": []string{"error"}, "isBackground": true, "backgroundStatus": "failed"})
+	}
+	return nil
 }
 
 func (s *Service) UpdateSubagentConclusion(ctx context.Context, subagentID string) (map[string]any, error) {
@@ -3441,6 +4016,58 @@ func childAlias(child Narrator) string {
 	return ""
 }
 
+func ensureSubagentAliasTrait(child Narrator) (string, string) {
+	alias := childAlias(child)
+	traits := append([]string(nil), child.Traits...)
+	if strings.TrimSpace(alias) == "" {
+		alias = stableSubagentAlias(child)
+		traits = append(traits, "agent-alias:"+alias)
+	}
+	if !containsString(traits, "background") {
+		traits = append(traits, "background")
+	}
+	traitsJSON, _ := json.Marshal(traits)
+	return alias, string(traitsJSON)
+}
+
+func stableSubagentAlias(child Narrator) string {
+	base := strings.ToLower(strings.TrimSpace(ptrString(child.Title)))
+	var builder strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			builder.WriteRune(r)
+		} else if r == '-' || r == '_' || r == ' ' {
+			builder.WriteByte('-')
+		}
+		if builder.Len() >= 24 {
+			break
+		}
+	}
+	alias := strings.Trim(builder.String(), "-")
+	if alias == "" {
+		alias = "agent"
+	}
+	idPart := child.ID
+	if len(idPart) > 8 {
+		idPart = idPart[:8]
+	}
+	return alias + "-" + idPart
+}
+
+func formatSubagentResult(subagentID, output string) string {
+	if strings.TrimSpace(output) == "" {
+		output = "(no output)"
+	}
+	return "<subagent_id>" + subagentID + "</subagent_id>\n\n" + output
+}
+
+func formatBackgroundTaskResult(subagentID, output string) string {
+	if strings.TrimSpace(output) == "" {
+		output = "(no output)"
+	}
+	return "<background_task_id>" + subagentID + "</background_task_id>\n\n" + output
+}
+
 func subagentStatusPayload(child Narrator) map[string]any {
 	payload := map[string]any{
 		"id":                 child.ID,
@@ -3547,6 +4174,13 @@ func ptrString(value *string) string {
 	return *value
 }
 
+func anySliceValue(value any) []any {
+	if items, ok := value.([]any); ok {
+		return items
+	}
+	return nil
+}
+
 func anyBool(value any) bool {
 	if b, ok := value.(bool); ok {
 		return b
@@ -3595,6 +4229,7 @@ func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string,
 	if err := s.recordPendingToolCall(ctx, narratorID, *draftMessageID, narrator, call); err != nil {
 		return agentbasic.ToolRun{}, err
 	}
+	s.scheduleAskUserQuestionReflection(ctx, narratorID, call.ID)
 	if err := s.setNarratorRunSubstatus(ctx, narratorID, narrator.IsBackground, []string{"awaiting_permission"}); err != nil {
 		return agentbasic.ToolRun{}, err
 	}
@@ -3626,6 +4261,66 @@ func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string,
 	return run, nil
 }
 
+const maxQuestionReflectionContextChars = 24000
+
+func (s *Service) questionReflectionEnabled() bool {
+	if s.Settings == nil {
+		return false
+	}
+	return s.Settings.Core().Agent.QuestionReflectionEnabled
+}
+
+func (s *Service) questionReflectionTimeout() time.Duration {
+	value := 300000
+	if s.Settings != nil {
+		value = s.Settings.Core().Agent.QuestionReflectionTimeoutMs
+	}
+	if value < 10000 {
+		value = 10000
+	}
+	if value > 3600000 {
+		value = 3600000
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func (s *Service) scheduleAskUserQuestionReflection(ctx context.Context, narratorID, toolUseID string) {
+	if !s.questionReflectionEnabled() || !s.askQuestionAutoReflectionAllowed(ctx, narratorID, toolUseID) {
+		return
+	}
+	timeout := s.questionReflectionTimeout()
+	go func() {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		reflectCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		_, _ = s.ReflectPendingAskUserQuestion(reflectCtx, narratorID, toolUseID, true)
+	}()
+}
+
+func (s *Service) askQuestionAutoReflectionAllowed(ctx context.Context, narratorID, toolUseID string) bool {
+	if !s.questionReflectionEnabled() {
+		return false
+	}
+	var permissionMode sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT permission_mode FROM narrators WHERE id = ?`, narratorID).Scan(&permissionMode); err != nil {
+		return false
+	}
+	if strings.TrimSpace(permissionMode.String) != "bypassPermissions" {
+		return false
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? AND tool_name = 'AskUserQuestion' AND status = 'pending' AND permission_decided_at IS NULL`, narratorID, toolUseID).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
 func (s *Service) askUserQuestionAnswers(ctx context.Context, narratorID, toolUseID string) (map[string]any, error) {
 	var inputRaw sql.NullString
 	err := s.DB.QueryRowContext(ctx, `SELECT input_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, narratorID, toolUseID).Scan(&inputRaw)
@@ -3641,6 +4336,310 @@ func (s *Service) askUserQuestionAnswers(ctx context.Context, narratorID, toolUs
 		return map[string]any{}, nil
 	}
 	return answers, nil
+}
+
+func (s *Service) askQuestionReflectionSystemPrompt(mode string) string {
+	if mode == "suggest" {
+		return "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences."
+	}
+	return "You are NarraFork's question reflection gate. An AI coding assistant asked the user one or more questions, but the session is allowed to proceed automatically. Use the conversation context and project intent to answer as a careful user would: choose the safest practical default, prefer the assistant's recommended option when it is reasonable, and avoid adding new requirements. If options are provided, pick option labels exactly; for multi-select questions, return comma-separated option labels. For free-text questions, give a concise answer. Reply with ONLY a valid JSON object mapping each question key to your answer string. No explanation, no markdown fences."
+}
+
+func parseAskQuestions(raw any) []askQuestionInput {
+	if text, ok := raw.(string); ok {
+		var decoded any
+		if err := json.Unmarshal([]byte(text), &decoded); err != nil {
+			return nil
+		}
+		raw = decoded
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil
+	}
+	questions := []askQuestionInput{}
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		question := strings.TrimSpace(stringFromAny(entry["question"]))
+		header := strings.TrimSpace(stringFromAny(entry["header"]))
+		if question == "" || header == "" {
+			continue
+		}
+		options := []askQuestionOption{}
+		for _, optRaw := range anySliceValue(entry["options"]) {
+			opt, ok := optRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			label := strings.TrimSpace(stringFromAny(opt["label"]))
+			if label == "" {
+				continue
+			}
+			options = append(options, askQuestionOption{Label: label, Description: stringFromAny(opt["description"]), Preview: stringFromAny(opt["preview"])})
+		}
+		questions = append(questions, askQuestionInput{Question: question, Header: header, Options: options, MultiSelect: anyBool(entry["multiSelect"])})
+	}
+	return questions
+}
+
+func (s *Service) buildQuestionReflectionContext(ctx context.Context, narratorID string) string {
+	history, err := s.agentHistory(ctx, narratorID, 80)
+	if err != nil {
+		return ""
+	}
+	lines := []string{}
+	total := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		msg := history[i]
+		text := strings.TrimSpace(msg.Content)
+		if text == "" {
+			continue
+		}
+		role := "System"
+		if msg.Role == "assistant" {
+			role = "Assistant"
+		} else if msg.Role == "user" {
+			role = "User"
+		}
+		line := "[" + role + "]: " + text
+		lines = append(lines, line)
+		total += len(line)
+		if total >= maxQuestionReflectionContextChars {
+			break
+		}
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	contextText := strings.Join(lines, "\n\n")
+	if len(contextText) > maxQuestionReflectionContextChars {
+		contextText = contextText[len(contextText)-maxQuestionReflectionContextChars:]
+	}
+	return contextText
+}
+
+func buildQuestionReflectionQuestionsText(questions []askQuestionInput) string {
+	parts := []string{}
+	for _, q := range questions {
+		optionText := "\n(free-text, no predefined options)"
+		if len(q.Options) > 0 {
+			opts := []string{}
+			for _, option := range q.Options {
+				opts = append(opts, option.Label+" — "+option.Description)
+			}
+			optionText = "\nOptions: " + strings.Join(opts, "; ")
+		}
+		parts = append(parts, "Key: \""+q.Question+"\"\nQuestion: "+q.Header+optionText)
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func parseQuestionReflectionJSON(raw string) map[string]any {
+	cleaned := strings.TrimSpace(strings.ReplaceAll(raw, "```json", "```"))
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	cleaned = strings.TrimSpace(cleaned)
+	out := map[string]any{}
+	_ = json.Unmarshal([]byte(cleaned), &out)
+	return out
+}
+
+func normalizeQuestionReflectionAnswer(question askQuestionInput, raw any) string {
+	labels := []string{}
+	for _, option := range question.Options {
+		labels = append(labels, option.Label)
+	}
+	fallback := "No special preference; please use your best judgment."
+	if len(labels) > 0 {
+		fallback = labels[0]
+	}
+	parts := []string{}
+	switch value := raw.(type) {
+	case []any:
+		for _, item := range value {
+			parts = append(parts, splitAnswerParts(fmt.Sprint(item))...)
+		}
+	case nil:
+		return fallback
+	default:
+		parts = append(parts, splitAnswerParts(fmt.Sprint(value))...)
+	}
+	if len(parts) == 0 {
+		return fallback
+	}
+	if len(labels) == 0 {
+		return strings.Join(parts, ", ")
+	}
+	labelSet := map[string]bool{}
+	for _, label := range labels {
+		labelSet[label] = true
+	}
+	if question.MultiSelect {
+		matched := []string{}
+		for _, part := range parts {
+			if labelSet[part] {
+				matched = append(matched, part)
+			}
+		}
+		if len(matched) > 0 {
+			return strings.Join(matched, ", ")
+		}
+		return strings.Join(parts, ", ")
+	}
+	for _, part := range parts {
+		if labelSet[part] {
+			return part
+		}
+	}
+	return parts[0]
+}
+
+func splitAnswerParts(value string) []string {
+	out := []string{}
+	for _, part := range strings.Split(value, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func (s *Service) GenerateAskUserQuestionAnswers(ctx context.Context, narratorID string, questions []askQuestionInput, mode string) (map[string]string, error) {
+	if len(questions) == 0 {
+		return map[string]string{}, nil
+	}
+	narrator, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return nil, err
+	}
+	model := ptrString(narrator.Model)
+	if model == "" && s.Settings != nil {
+		model = s.Settings.Core().Agent.DefaultModel
+	}
+	contextText := s.buildQuestionReflectionContext(ctx, narratorID)
+	questionsText := buildQuestionReflectionQuestionsText(questions)
+	userMessage := questionsText
+	if strings.TrimSpace(contextText) != "" {
+		userMessage = "<conversation>\n" + contextText + "\n</conversation>\n\n<questions>\n" + questionsText + "\n</questions>"
+	}
+	result, err := agentbasic.Generate(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: userMessage}}, "", agentbasic.WithSystemPrompt(s.askQuestionReflectionSystemPrompt(mode)), agentbasic.WithReasoningEffort("none"), agentbasic.WithMaxTurns(1), agentbasic.WithToolScope("reflection"), agentbasic.WithDisabledTools([]string{"DangerConfirm", "DangerCancel", "ExitPlanConfirm", "ExitPlanRevise", "GoalCompleteConfirm", "GoalCompleteRevise"}))
+	if err != nil {
+		return nil, err
+	}
+	parsed := parseQuestionReflectionJSON(result.Text)
+	answers := map[string]string{}
+	for _, question := range questions {
+		answers[question.Question] = normalizeQuestionReflectionAnswer(question, parsed[question.Question])
+	}
+	return answers, nil
+}
+
+func questionReflectionSuggestions(status, requestID, reason string) []map[string]any {
+	suggestion := map[string]any{"type": "question_reflection", "status": status, "requestId": requestID}
+	if status != "running" {
+		suggestion["resolvedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if strings.TrimSpace(reason) != "" {
+		suggestion["reason"] = strings.TrimSpace(reason)
+	}
+	return []map[string]any{suggestion}
+}
+
+func (s *Service) markQuestionReflectionStatus(ctx context.Context, narratorID, requestID, toolUseID, status, reason string, input any) {
+	suggestionsJSON, _ := json.Marshal(questionReflectionSuggestions(status, requestID, reason))
+	_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET permission_suggestions = ?, permission_decision_reason = COALESCE(?, permission_decision_reason) WHERE id = ?`, string(suggestionsJSON), nullableTrimmedString(reason), requestID)
+	if s.Hub == nil {
+		return
+	}
+	if status == "running" {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "question_reflection_started", "narratorId": narratorID, "requestId": requestID, "toolUseId": toolUseID, "toolName": "AskUserQuestion", "inputJson": input, "reason": strings.TrimSpace(reason)})
+		return
+	}
+	decision := "deny"
+	if status == "confirmed" {
+		decision = "allow"
+	} else if status == "awaiting_user" || status == "aborted" {
+		decision = "aborted"
+	}
+	s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "question_reflection_resolved", "narratorId": narratorID, "requestId": requestID, "toolUseId": toolUseID, "decision": decision, "reason": strings.TrimSpace(reason)})
+}
+
+func (s *Service) pendingAskQuestionInput(ctx context.Context, narratorID, toolUseID string) (string, string, map[string]any, bool, error) {
+	var requestID, inputRaw string
+	err := s.DB.QueryRowContext(ctx, `SELECT id, input_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? AND tool_name = 'AskUserQuestion' AND status = 'pending' AND permission_decided_at IS NULL ORDER BY created_at DESC LIMIT 1`, narratorID, toolUseID).Scan(&requestID, &inputRaw)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", "", nil, false, nil
+		}
+		return "", "", nil, false, err
+	}
+	input := map[string]any{}
+	if strings.TrimSpace(inputRaw) != "" {
+		_ = json.Unmarshal([]byte(inputRaw), &input)
+	}
+	return requestID, inputRaw, input, true, nil
+}
+
+func mergeAnswerStringsIntoInput(input map[string]any, answers map[string]string) map[string]any {
+	merged := map[string]any{}
+	for key, value := range input {
+		merged[key] = value
+	}
+	answerMap := map[string]any{}
+	for key, value := range answers {
+		answerMap[key] = value
+	}
+	merged["answers"] = answerMap
+	return merged
+}
+
+func (s *Service) ReflectPendingAskUserQuestion(ctx context.Context, narratorID, toolUseID string, automatic bool) (map[string]string, error) {
+	if automatic && !s.askQuestionAutoReflectionAllowed(ctx, narratorID, toolUseID) {
+		return nil, errors.New("question reflection is not enabled for this permission mode")
+	}
+	requestID, _, input, ok, err := s.pendingAskQuestionInput(ctx, narratorID, toolUseID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, sql.ErrNoRows
+	}
+	questions := parseAskQuestions(input["questions"])
+	if len(questions) == 0 {
+		return nil, errors.New("no AskUserQuestion questions found")
+	}
+	s.markQuestionReflectionStatus(ctx, narratorID, requestID, toolUseID, "running", "Question reflection is answering AskUserQuestion", input)
+	answers, err := s.GenerateAskUserQuestionAnswers(ctx, narratorID, questions, "reflection")
+	if err != nil {
+		s.markQuestionReflectionStatus(ctx, narratorID, requestID, toolUseID, "awaiting_user", err.Error(), input)
+		return nil, err
+	}
+	if automatic && !s.askQuestionAutoReflectionAllowed(ctx, narratorID, toolUseID) {
+		return answers, errors.New("question was already answered")
+	}
+	mergedInput := mergeAnswerStringsIntoInput(input, answers)
+	inputJSON, _ := json.Marshal(mergedInput)
+	now := db.NowISO()
+	result, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET input_json = ?, status = 'running', permission_decided_by = 'reflection', permission_decided_at = ?, permission_decision_reason = ?, permission_suggestions = ? WHERE id = ? AND status = 'pending' AND permission_decided_at IS NULL`, string(inputJSON), now, "Question reflection answered automatically", mustJSON(questionReflectionSuggestions("confirmed", requestID, "Question reflection answered automatically")), requestID)
+	if err != nil {
+		return nil, err
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return answers, errors.New("question was already answered")
+	}
+	s.markQuestionReflectionStatus(ctx, narratorID, requestID, toolUseID, "confirmed", "Question reflection answered automatically", mergedInput)
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "permission_resolved", "narratorId": narratorID, "requestId": requestID, "toolUseId": toolUseID, "updatedInput": mergedInput, "decision": "allow"})
+	}
+	return answers, nil
+}
+
+func mustJSON(value any) string {
+	data, _ := json.Marshal(value)
+	return string(data)
 }
 
 func formatAskUserAnswers(answers map[string]any) string {
@@ -3756,10 +4755,139 @@ type reflectionDecision struct {
 	Evidence   string
 	Reflection string
 	Feedback   string
+	NextSteps  string
 	ToolName   string
 }
 
-func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, goalID, evidence, reflection string) (reflectionDecision, error) {
+type goalReflectionContext struct {
+	RequestID         string
+	ToolUseID         string
+	ToolName          string
+	InputJSON         map[string]any
+	ActiveGoal        map[string]any
+	BroadcastTargetID string
+	StartedAt         time.Time
+}
+
+func (meta *goalReflectionContext) ensure(narratorID string) {
+	if meta == nil {
+		return
+	}
+	if meta.StartedAt.IsZero() {
+		meta.StartedAt = time.Now()
+	}
+	if strings.TrimSpace(meta.ToolName) == "" {
+		meta.ToolName = "UpdateGoal"
+	}
+	if meta.InputJSON == nil {
+		meta.InputJSON = map[string]any{}
+	}
+	if strings.TrimSpace(meta.BroadcastTargetID) == "" {
+		meta.BroadcastTargetID = narratorID
+	}
+	if strings.TrimSpace(meta.RequestID) == "" {
+		if strings.TrimSpace(meta.ToolUseID) != "" {
+			meta.RequestID = "goal_complete_" + strings.TrimSpace(meta.ToolUseID)
+		} else {
+			meta.RequestID = "goal_complete_" + id.Must(8)
+		}
+	}
+}
+
+func goalReflectionStatusReason(status, reason, nextSteps string) string {
+	if strings.TrimSpace(reason) != "" && strings.TrimSpace(nextSteps) != "" {
+		return strings.TrimSpace(reason) + "\n\nNext steps: " + strings.TrimSpace(nextSteps)
+	}
+	if strings.TrimSpace(reason) != "" {
+		return strings.TrimSpace(reason)
+	}
+	switch status {
+	case "running":
+		return "Goal completion reflection is checking the active goal"
+	case "confirmed":
+		return "Goal completion reflection confirmed the active goal"
+	case "cancelled":
+		return "Goal completion reflection requested more work"
+	case "aborted":
+		return "Goal completion reflection aborted"
+	default:
+		return "Goal completion reflection updated"
+	}
+}
+
+func goalReflectionSuggestions(meta *goalReflectionContext, status, reason, nextSteps string) []map[string]any {
+	meta.ensure("")
+	suggestion := map[string]any{
+		"type":      "goal_reflection",
+		"status":    status,
+		"requestId": meta.RequestID,
+		"startedAt": meta.StartedAt.UTC().Format(time.RFC3339Nano),
+	}
+	if meta.ActiveGoal != nil {
+		suggestion["activeGoal"] = meta.ActiveGoal
+	}
+	if status == "confirmed" || status == "cancelled" || status == "aborted" {
+		suggestion["resolvedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if strings.TrimSpace(reason) != "" {
+		suggestion["reason"] = strings.TrimSpace(reason)
+	}
+	if strings.TrimSpace(nextSteps) != "" {
+		suggestion["nextSteps"] = strings.TrimSpace(nextSteps)
+	}
+	return []map[string]any{suggestion}
+}
+
+func (s *Service) markGoalReflectionStatus(ctx context.Context, narratorID string, meta *goalReflectionContext, status, reason, nextSteps string) {
+	if meta == nil {
+		return
+	}
+	meta.ensure(narratorID)
+	message := goalReflectionStatusReason(status, reason, nextSteps)
+	suggestions := goalReflectionSuggestions(meta, status, reason, nextSteps)
+	inputJSON, _ := json.Marshal(meta.InputJSON)
+	suggestionsJSON, _ := json.Marshal(suggestions)
+	dbStatus := "fail"
+	switch status {
+	case "running":
+		dbStatus = "pending"
+	case "confirmed":
+		dbStatus = "running"
+	}
+	startedAt := any(nil)
+	if status == "running" {
+		startedAt = db.NowISO()
+	}
+	decidedAt := any(nil)
+	if status != "running" {
+		decidedAt = db.NowISO()
+	}
+	errorMessage := any(nil)
+	if status == "cancelled" || status == "aborted" {
+		errorMessage = message
+	}
+	if strings.TrimSpace(meta.ToolUseID) != "" {
+		if toolCallID, err := s.recordedToolCallID(ctx, narratorID, meta.ToolUseID); err == nil && toolCallID.Valid {
+			_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, input_json = ?, permission_started_at = COALESCE(permission_started_at, ?), permission_decision_reason = ?, permission_suggestions = ?, permission_decided_at = COALESCE(?, permission_decided_at), error_message = ? WHERE id = ?`, dbStatus, string(inputJSON), startedAt, message, string(suggestionsJSON), decidedAt, errorMessage, toolCallID.String)
+		}
+	}
+	if s.Hub == nil {
+		return
+	}
+	if status == "running" {
+		s.Hub.BroadcastNarrator(meta.BroadcastTargetID, map[string]any{"type": "goal_reflection_started", "narratorId": meta.BroadcastTargetID, "requestId": meta.RequestID, "toolUseId": meta.ToolUseID, "toolName": meta.ToolName, "inputJson": meta.InputJSON, "activeGoal": meta.ActiveGoal, "reason": message})
+		return
+	}
+	decision := "deny"
+	if status == "confirmed" {
+		decision = "allow"
+	} else if status == "aborted" {
+		decision = "aborted"
+	}
+	s.Hub.BroadcastNarrator(meta.BroadcastTargetID, map[string]any{"type": "goal_reflection_resolved", "narratorId": meta.BroadcastTargetID, "requestId": meta.RequestID, "toolUseId": meta.ToolUseID, "decision": decision, "reason": strings.TrimSpace(reason), "nextSteps": strings.TrimSpace(nextSteps)})
+}
+
+func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, goalID, evidence, reflection string, meta *goalReflectionContext) (reflectionDecision, error) {
 	goals, err := s.loadGoals(ctx, narratorID)
 	if err != nil {
 		return reflectionDecision{}, err
@@ -3767,6 +4895,10 @@ func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, g
 	goal := findGoalByID(goals, goalID)
 	if goal == nil {
 		return reflectionDecision{}, errors.New("goal not found")
+	}
+	if meta != nil {
+		meta.ActiveGoal = goal
+		s.markGoalReflectionStatus(ctx, narratorID, meta, "running", "", "")
 	}
 	prompt := fmt.Sprintf(`Review whether this goal is truly complete.
 
@@ -3779,7 +4911,7 @@ Evidence provided by the agent:
 Agent reflection:
 %s
 
-If every material requirement is satisfied and no required work remains, call GoalCompleteConfirm with confirm=true and concrete evidence. If anything is missing or uncertain, call GoalCompleteRevise with confirm=true and actionable feedback.`, stringFromAny(goal["objective"]), evidence, reflection)
+If every material requirement is satisfied and no required work remains, call GoalCompleteConfirm with confirm=true and concrete evidence. If anything is missing or uncertain, call GoalCompleteRevise with confirm=true, feedback explaining why completion is blocked, and nextSteps describing the concrete next action before trying UpdateGoal again.`, stringFromAny(goal["objective"]), evidence, reflection)
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"GoalCompleteConfirm": true, "GoalCompleteRevise": true})
 }
 
@@ -3797,8 +4929,40 @@ If the plan is concrete, actionable, and has no obvious gaps, call ExitPlanConfi
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"ExitPlanConfirm": true, "ExitPlanRevise": true})
 }
 
-func shouldRunDangerReflection(narrator Narrator) bool {
-	return strings.ToLower(strings.TrimSpace(narrator.DangerReflectionOverride)) == "on"
+func shouldRunDangerReflection(settings *config.Store, narrator Narrator) bool {
+	switch strings.ToLower(strings.TrimSpace(narrator.DangerReflectionOverride)) {
+	case "on":
+		return true
+	case "off":
+		return false
+	}
+	if settings == nil {
+		return false
+	}
+	agent, _ := settings.Raw()["agent"].(map[string]any)
+	return anyBool(agent["dangerReflectionEnabled"])
+}
+
+func shouldRunDangerReflectionBeforeExecution(settings *config.Store, narrator Narrator, permission toolPermissionDecision, call agentbasic.ToolCall) bool {
+	if !shouldRunDangerReflection(settings, narrator) {
+		return false
+	}
+	if permission.Action == "ask" {
+		return true
+	}
+	if permission.Action != "allow" {
+		return false
+	}
+	mode := normalizePermissionMode(ptrString(narrator.PermissionMode), "default")
+	if mode != "bypassPermissions" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(call.Function.Name)) {
+	case "bash", "write", "edit":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) runDangerReflection(ctx context.Context, narratorID string, call agentbasic.ToolCall) (reflectionDecision, error) {
@@ -3880,7 +5044,11 @@ func reflectionDecisionFromToolCall(name, rawArgs string) (reflectionDecision, s
 		if feedback == "" {
 			return reflectionDecision{}, "feedback is required"
 		}
-		return reflectionDecision{Action: "revise", ToolName: name, Feedback: feedback}, "Goal-completion reflection requested revision."
+		nextSteps := strings.TrimSpace(stringFromAny(args["nextSteps"]))
+		if nextSteps == "" {
+			return reflectionDecision{}, "nextSteps is required"
+		}
+		return reflectionDecision{Action: "revise", ToolName: name, Feedback: feedback, NextSteps: nextSteps}, "Goal-completion reflection requested revision."
 	case "ExitPlanConfirm":
 		return reflectionDecision{Action: "confirm", ToolName: name, Reflection: strings.TrimSpace(stringFromAny(args["reflection"]))}, "ExitPlanMode reflection confirmed."
 	case "ExitPlanRevise":
@@ -4127,6 +5295,10 @@ func (s *Service) addGoal(ctx context.Context, narratorID, objective, createdBy 
 }
 
 func (s *Service) updateGoal(ctx context.Context, narratorID, goalID, status, objective, evidence, reflection string) (map[string]any, error) {
+	return s.updateGoalWithReflectionContext(ctx, narratorID, goalID, status, objective, evidence, reflection, nil)
+}
+
+func (s *Service) updateGoalWithReflectionContext(ctx context.Context, narratorID, goalID, status, objective, evidence, reflection string, reflectionMeta *goalReflectionContext) (map[string]any, error) {
 	sets := []string{}
 	args := []any{}
 	if strings.TrimSpace(objective) != "" {
@@ -4145,13 +5317,16 @@ func (s *Service) updateGoal(ctx context.Context, narratorID, goalID, status, ob
 			if !goalCompletionEvidenceValid(completionEvidence) {
 				return map[string]any{"error": "Completing a goal requires concrete evidence of at least 20 characters."}, nil
 			}
-			decision, err := s.runGoalCompletionReflection(ctx, narratorID, goalID, completionEvidence, completionReflection)
+			decision, err := s.runGoalCompletionReflection(ctx, narratorID, goalID, completionEvidence, completionReflection, reflectionMeta)
 			if err != nil {
+				s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "aborted", err.Error(), "")
 				return map[string]any{"error": err.Error()}, nil
 			}
 			if decision.Action != "confirm" {
-				return map[string]any{"error": "Goal completion reflection requested more work.", "feedback": decision.Feedback, "reflectionDecision": decision.Action}, nil
+				s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "cancelled", decision.Feedback, decision.NextSteps)
+				return map[string]any{"error": "Goal completion reflection requested more work.", "feedback": decision.Feedback, "nextSteps": decision.NextSteps, "reflectionDecision": decision.Action}, nil
 			}
+			s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "confirmed", firstNonEmptyString(decision.Reflection, decision.Evidence), "")
 			if strings.TrimSpace(decision.Evidence) != "" {
 				completionEvidence = strings.TrimSpace(decision.Evidence)
 			}
@@ -4301,7 +5476,7 @@ func (s *Service) attachToolCalls(ctx context.Context, messages []Message) ([]Me
 }
 
 func (s *Service) loadToolCalls(ctx context.Context, messageID string) ([]ToolCallRecord, error) {
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json, status, created_at FROM narrator_tool_calls WHERE message_id = ? ORDER BY created_at ASC`, messageID)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json, status, error_message, permission_decision_reason, permission_suggestions, created_at FROM narrator_tool_calls WHERE message_id = ? ORDER BY created_at ASC`, messageID)
 	if err != nil {
 		return nil, err
 	}
@@ -4309,12 +5484,15 @@ func (s *Service) loadToolCalls(ctx context.Context, messageID string) ([]ToolCa
 	calls := []ToolCallRecord{}
 	for rows.Next() {
 		var call ToolCallRecord
-		var inputRaw, outputRaw sql.NullString
-		if err := rows.Scan(&call.ID, &call.NarratorID, &call.MessageID, &call.ToolUseID, &call.ToolName, &inputRaw, &outputRaw, &call.Status, &call.CreatedAt); err != nil {
+		var inputRaw, outputRaw, errorMessage, decisionReason, suggestionsRaw sql.NullString
+		if err := rows.Scan(&call.ID, &call.NarratorID, &call.MessageID, &call.ToolUseID, &call.ToolName, &inputRaw, &outputRaw, &call.Status, &errorMessage, &decisionReason, &suggestionsRaw, &call.CreatedAt); err != nil {
 			return nil, err
 		}
 		call.InputJSON = decodeAny(inputRaw)
 		call.OutputJSON = decodeAny(outputRaw)
+		call.ErrorMessage = nullStringPtr(errorMessage)
+		call.PermissionDecisionReason = nullStringPtr(decisionReason)
+		call.PermissionSuggestions = decodeAny(suggestionsRaw)
 		calls = append(calls, call)
 	}
 	return calls, rows.Err()
@@ -4827,13 +6005,14 @@ func toolRequiresApproval(permissionMode *string, toolName string) bool {
 		return false
 	}
 	if mode == "acceptEdits" {
-		return name == "bash"
+		return name == "bash" || name == "terminal"
 	}
-	return name == "bash" || name == "write" || name == "edit"
+	return name == "bash" || name == "write" || name == "edit" || name == "terminal"
 }
 
 func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, cwd string, call agentbasic.ToolCall) (toolPermissionDecision, error) {
-	name := strings.ToLower(strings.TrimSpace(call.Function.Name))
+	rawName := strings.TrimSpace(call.Function.Name)
+	name := strings.ToLower(rawName)
 	if name == "" {
 		return toolPermissionDecision{Action: "allow"}, nil
 	}
@@ -4843,9 +6022,32 @@ func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, 
 	if narrator.ParentNarratorID != nil && strings.TrimSpace(*narrator.ParentNarratorID) != "" && narrator.Variant != "primary" {
 		ownerID = strings.TrimSpace(*narrator.ParentNarratorID)
 	}
-	whitelistDirs, blacklistDirs, whitelistCmds, blacklistCmds, err := s.loadToolPermissionRules(ctx, ownerID)
+	whitelistDirs, blacklistDirs, whitelistCmds, blacklistCmds, err := s.loadToolPermissionRules(ctx, narrator, ownerID)
 	if err != nil {
 		return toolPermissionDecision{}, err
+	}
+	if s.ExternalTools != nil && strings.HasPrefix(rawName, "mcp__") {
+		mode := normalizePermissionMode(ptrString(narrator.PermissionMode), "default")
+		if action, reason, handled := s.ExternalTools.ResolveToolPermission(rawName, mode); handled {
+			return toolPermissionDecision{Action: firstNonEmptyString(action, "allow"), Reason: reason}, nil
+		}
+	}
+	if name == "terminal" {
+		action := strings.ToLower(strings.TrimSpace(stringFromAny(args["action"])))
+		if action == "list" || action == "read" {
+			return toolPermissionDecision{Action: "allow"}, nil
+		}
+		mode := normalizePermissionMode(ptrString(narrator.PermissionMode), "default")
+		switch mode {
+		case "bypassPermissions":
+			return toolPermissionDecision{Action: "allow"}, nil
+		case "dontAsk":
+			return toolPermissionDecision{Action: "deny", Reason: "Permission mode dontAsk denied this terminal tool call."}, nil
+		case "readOnly":
+			return toolPermissionDecision{Action: "deny", Reason: "Permission mode readOnly denies terminal mutation and input actions."}, nil
+		default:
+			return toolPermissionDecision{Action: "ask"}, nil
+		}
 	}
 	operation := toolOperation(name)
 	paths := toolPermissionPaths(cwd, name, args)
@@ -4901,24 +6103,146 @@ func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, 
 	}
 }
 
-func (s *Service) loadToolPermissionRules(ctx context.Context, narratorID string) ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule, error) {
-	whitelistDirs, err := s.loadPathRules(ctx, `SELECT path, access_level FROM narrator_whitelist_dirs WHERE narrator_id = ? AND enabled = 1`, narratorID)
+func (s *Service) loadToolPermissionRules(ctx context.Context, narrator Narrator, ownerID string) ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule, error) {
+	globalWhitelistDirs, globalBlacklistDirs, globalWhitelistCmds, globalBlacklistCmds := s.globalToolPermissionRules()
+	projectWhitelistDirs, projectBlacklistDirs, projectWhitelistCmds, projectBlacklistCmds, err := s.projectToolPermissionRules(ctx, narrator, ownerID)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	blacklistDirs, err := s.loadPathRules(ctx, `SELECT path, deny_level FROM narrator_blacklist_dirs WHERE narrator_id = ? AND enabled = 1`, narratorID)
+
+	narratorWhitelistDirs, err := s.loadPathRules(ctx, `SELECT path, access_level FROM narrator_whitelist_dirs WHERE narrator_id = ? AND enabled = 1`, ownerID)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	whitelistCmds, err := s.loadCommandRules(ctx, `SELECT pattern, '' FROM narrator_whitelist_cmds WHERE narrator_id = ? AND enabled = 1`, narratorID)
+	narratorBlacklistDirs, err := s.loadPathRules(ctx, `SELECT path, deny_level FROM narrator_blacklist_dirs WHERE narrator_id = ? AND enabled = 1`, ownerID)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	blacklistCmds, err := s.loadCommandRules(ctx, `SELECT pattern, COALESCE(deny_prompt, '') FROM narrator_blacklist_cmds WHERE narrator_id = ? AND enabled = 1`, narratorID)
+	narratorWhitelistCmds, err := s.loadCommandRules(ctx, `SELECT pattern, '' FROM narrator_whitelist_cmds WHERE narrator_id = ? AND enabled = 1`, ownerID)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	narratorBlacklistCmds, err := s.loadCommandRules(ctx, `SELECT pattern, COALESCE(deny_prompt, '') FROM narrator_blacklist_cmds WHERE narrator_id = ? AND enabled = 1`, ownerID)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	whitelistDirs := append(append(globalWhitelistDirs, projectWhitelistDirs...), narratorWhitelistDirs...)
+	blacklistDirs := append(append(globalBlacklistDirs, projectBlacklistDirs...), narratorBlacklistDirs...)
+	whitelistCmds := append(append(globalWhitelistCmds, projectWhitelistCmds...), narratorWhitelistCmds...)
+	blacklistCmds := append(append(globalBlacklistCmds, projectBlacklistCmds...), narratorBlacklistCmds...)
 	return whitelistDirs, blacklistDirs, whitelistCmds, blacklistCmds, nil
+}
+
+func (s *Service) globalToolPermissionRules() ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule) {
+	if s == nil || s.Settings == nil {
+		return nil, nil, nil, nil
+	}
+	raw := s.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	return permissionRulesFromConfigMap(agent)
+}
+
+func (s *Service) projectToolPermissionRules(ctx context.Context, narrator Narrator, ownerID string) ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule, error) {
+	chapterID := ptrString(narrator.ChapterID)
+	if strings.TrimSpace(chapterID) == "" && strings.TrimSpace(ownerID) != "" && ownerID != narrator.ID {
+		var parentChapter sql.NullString
+		err := s.DB.QueryRowContext(ctx, `SELECT chapter_id FROM narrators WHERE id = ?`, ownerID).Scan(&parentChapter)
+		if err != nil {
+			if err == sql.ErrNoRows || isSQLiteMissingTableError(err) || isSQLiteMissingColumnError(err) {
+				return nil, nil, nil, nil, nil
+			}
+			return nil, nil, nil, nil, err
+		}
+		if parentChapter.Valid {
+			chapterID = parentChapter.String
+		}
+	}
+	chapterID = strings.TrimSpace(chapterID)
+	if chapterID == "" {
+		return nil, nil, nil, nil, nil
+	}
+	var rawSettings sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(p.chapter_settings, '') FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.id = ?`, chapterID).Scan(&rawSettings)
+	if err != nil {
+		if err == sql.ErrNoRows || isSQLiteMissingTableError(err) || isSQLiteMissingColumnError(err) {
+			return nil, nil, nil, nil, nil
+		}
+		return nil, nil, nil, nil, err
+	}
+	if !rawSettings.Valid || strings.TrimSpace(rawSettings.String) == "" {
+		return nil, nil, nil, nil, nil
+	}
+	settings := map[string]any{}
+	if err := json.Unmarshal([]byte(rawSettings.String), &settings); err != nil {
+		return nil, nil, nil, nil, nil
+	}
+	whitelistDirs, blacklistDirs, whitelistCmds, blacklistCmds := permissionRulesFromConfigMap(settings)
+	return whitelistDirs, blacklistDirs, whitelistCmds, blacklistCmds, nil
+}
+
+func permissionRulesFromConfigMap(raw map[string]any) ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule) {
+	if len(raw) == 0 {
+		return nil, nil, nil, nil
+	}
+	return pathRulesFromConfig(raw["whitelistDirs"], "accessLevel"),
+		pathRulesFromConfig(raw["blacklistDirs"], "denyLevel"),
+		commandRulesFromConfig(raw["commandWhitelist"], false),
+		commandRulesFromConfig(raw["commandBlacklist"], true)
+}
+
+func pathRulesFromConfig(value any, levelKey string) []permissionPathRule {
+	rules := []permissionPathRule{}
+	for _, item := range anySliceValue(value) {
+		entry, _ := item.(map[string]any)
+		if len(entry) == 0 || !permissionRuleEnabled(entry["enabled"]) {
+			continue
+		}
+		rule := permissionPathRule{
+			Path:  strings.TrimSpace(stringFromAny(entry["path"])),
+			Level: strings.TrimSpace(stringFromAny(entry[levelKey])),
+		}
+		if rule.Path != "" && rule.Level != "" {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+func commandRulesFromConfig(value any, includeDenyPrompt bool) []permissionCommandRule {
+	rules := []permissionCommandRule{}
+	for _, item := range anySliceValue(value) {
+		entry, _ := item.(map[string]any)
+		if len(entry) == 0 || !permissionRuleEnabled(entry["enabled"]) {
+			continue
+		}
+		rule := permissionCommandRule{Pattern: strings.TrimSpace(stringFromAny(entry["pattern"]))}
+		if includeDenyPrompt {
+			rule.DenyPrompt = stringFromAny(entry["denyPrompt"])
+		}
+		if rule.Pattern != "" {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
+
+func permissionRuleEnabled(value any) bool {
+	if value == nil {
+		return true
+	}
+	if b, ok := value.(bool); ok {
+		return b
+	}
+	return false
+}
+
+func isSQLiteMissingTableError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "no such table")
+}
+
+func isSQLiteMissingColumnError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "no such column")
 }
 
 func (s *Service) loadPathRules(ctx context.Context, query, narratorID string) ([]permissionPathRule, error) {

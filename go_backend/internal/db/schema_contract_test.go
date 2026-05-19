@@ -3,9 +3,12 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+
+	"narrafork-go/internal/compat/bunfinal"
 
 	_ "modernc.org/sqlite"
 )
@@ -26,6 +29,21 @@ func TestCanonicalSchemaContractReportFreezesTSOwnedDBMode(t *testing.T) {
 	}
 	if report.CanonicalTableCount == 0 || report.CanonicalIndexCount == 0 || report.CanonicalForeignKeyCount == 0 || report.CanonicalFTSTableCount != 3 || report.CanonicalFTSTriggerCount == 0 {
 		t.Fatalf("contract report should expose canonical object counts: %#v", report)
+	}
+}
+
+func TestCanonicalSchemaContractArtifactMatchesRuntime(t *testing.T) {
+	data, err := bunfinal.ReadCanonicalSchemaContract()
+	if err != nil {
+		t.Fatalf("read bun-final canonical schema contract: %v", err)
+	}
+	var artifact CanonicalSchemaContractReport
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("parse bun-final canonical schema contract: %v", err)
+	}
+	want := CanonicalSchemaContract()
+	if artifact != want {
+		t.Fatalf("canonical schema artifact mismatch:\nartifact=%#v\nruntime=%#v", artifact, want)
 	}
 }
 

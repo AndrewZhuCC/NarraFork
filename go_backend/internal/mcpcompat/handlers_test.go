@@ -1,17 +1,58 @@
 package mcpcompat
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/config"
+	"narrafork-go/internal/narrators"
 )
+
+func TestMCPHelperProcess(t *testing.T) {
+	if os.Getenv("NF_MCP_HELPER") != "1" {
+		return
+	}
+	scanner := bufio.NewScanner(os.Stdin)
+	encoder := json.NewEncoder(os.Stdout)
+	for scanner.Scan() {
+		var req map[string]any
+		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
+			continue
+		}
+		idValue := req["id"]
+		switch stringOr(req["method"], "") {
+		case "initialize":
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": idValue, "result": map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{"tools": map[string]any{}}}})
+		case "notifications/initialized":
+			continue
+		case "tools/list":
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": idValue, "result": map[string]any{"tools": []any{
+				map[string]any{"name": "read_file", "description": "Read a file", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}, "required": []any{"path"}}},
+				map[string]any{"name": "ask_tool", "description": "Ask first", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}}},
+				map[string]any{"name": "write_file", "description": "Write a file", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{"path": map[string]any{"type": "string"}}}},
+			}}})
+		case "tools/call":
+			params, _ := req["params"].(map[string]any)
+			args, _ := params["arguments"].(map[string]any)
+			text := "called " + stringOr(params["name"], "") + " " + stringOr(args["path"], "")
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": idValue, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": text}}, "isError": false}})
+		default:
+			_ = encoder.Encode(map[string]any{"jsonrpc": "2.0", "id": idValue, "error": map[string]any{"code": -32601, "message": "method not found"}})
+		}
+	}
+	os.Exit(0)
+}
 
 func newTestHandler(t *testing.T) (*Handler, *config.Store) {
 	t.Helper()
@@ -168,7 +209,7 @@ func TestImportServersPersistsSettingsAndSkipsDuplicates(t *testing.T) {
 	}
 }
 
-func TestListToolsReportsExternalInjectionUnsupportedCapability(t *testing.T) {
+func TestListToolsReportsExternalInjectionPartialCapability(t *testing.T) {
 	handler, _ := newTestHandler(t)
 	w := serveMCP(handler, http.MethodGet, "/tools", nil)
 	if w.Code != http.StatusOK {
@@ -180,8 +221,45 @@ func TestListToolsReportsExternalInjectionUnsupportedCapability(t *testing.T) {
 		t.Fatalf("missing capabilities payload: %#v", payload)
 	}
 	external, ok := caps["externalMCPToolInjection"].(map[string]any)
-	if !ok || external["supported"] != false || !strings.Contains(stringOr(external["reason"], ""), "does not execute external MCP tools") {
-		t.Fatalf("expected explicit unsupported external MCP injection capability: %#v", caps)
+	if !ok || external["supported"] != true || !strings.Contains(stringOr(external["reason"], ""), "no connected stdio MCP tools") {
+		t.Fatalf("expected partial external MCP injection capability: %#v", caps)
+	}
+}
+
+func TestReadJSONRPCLinesRejectsOversizedLine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	responses := make(chan map[string]any, 1)
+	readErrs := make(chan error, 1)
+	go readJSONRPCLines(ctx, strings.NewReader(strings.Repeat("x", maxMCPJSONRPCLineBytes+1)+"\n"), responses, readErrs)
+	select {
+	case err := <-readErrs:
+		if err == nil || !strings.Contains(err.Error(), "exceeded") {
+			t.Fatalf("expected oversized line error, got %v", err)
+		}
+	case msg := <-responses:
+		t.Fatalf("oversized line should not produce response: %#v", msg)
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for oversized line error")
+	}
+}
+
+func TestMCPToolOutputTruncatesLargeText(t *testing.T) {
+	output, isError := mcpToolOutput(map[string]any{
+		"isError": false,
+		"content": []any{map[string]any{
+			"type": "text",
+			"text": strings.Repeat("x", maxMCPToolOutputBytes+1024),
+		}},
+	})
+	if isError {
+		t.Fatalf("unexpected isError=true")
+	}
+	if !strings.Contains(output, "[truncated: MCP tool output exceeded") {
+		t.Fatalf("expected truncation marker, got suffix %q", output[len(output)-80:])
+	}
+	if len(output) > maxMCPToolOutputBytes+200 {
+		t.Fatalf("truncated output too large: %d", len(output))
 	}
 }
 
@@ -228,6 +306,96 @@ func TestProtocolToolsListAndCallUseEmbeddedCompatibilityTools(t *testing.T) {
 	content, _ := result["content"].([]any)
 	if len(content) == 0 || !strings.Contains(stringOr(content[0].(map[string]any)["text"], ""), "Unknown tool") {
 		t.Fatalf("unexpected unknown tool response: %#v", result)
+	}
+}
+
+func specNamesContain(specs []agentbasic.ExternalToolSpec, name string) bool {
+	for _, spec := range specs {
+		if spec.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMCPBehaviorPermissionMatrixMatchesTS(t *testing.T) {
+	cases := []struct {
+		behavior string
+		mode     string
+		want     string
+	}{
+		{"readOnly", "default", "allow"},
+		{"readOnly", "readOnly", "allow"},
+		{"readOnly", "acceptEdits", "allow"},
+		{"readOnly", "dontAsk", "deny"},
+		{"readWrite", "default", "ask"},
+		{"readWrite", "readOnly", "deny"},
+		{"readWrite", "acceptEdits", "allow"},
+		{"readWrite", "bypassPermissions", "allow"},
+		{"readWrite", "dontAsk", "deny"},
+		{"ask", "default", "ask"},
+		{"ask", "acceptEdits", "ask"},
+		{"ask", "dontAsk", "deny"},
+		{"deny", "default", "deny"},
+		{"allow", "acceptEdits", "allow"},
+		{"allow", "readOnly", "deny"},
+	}
+	for _, tc := range cases {
+		if got := mapMcpBehaviorToPermissionDecision(tc.behavior, tc.mode); got != tc.want {
+			t.Fatalf("behavior=%s mode=%s got %s want %s", tc.behavior, tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestAgentMCPToolSpecsAndExecuteUseConnectedStdioServer(t *testing.T) {
+	handler, store := newTestHandler(t)
+	if err := store.SetMCPServers([]map[string]any{{
+		"id":              "srv_fs",
+		"name":            "Filesystem",
+		"transport":       "stdio",
+		"command":         os.Args[0],
+		"args":            []any{"-test.run=TestMCPHelperProcess"},
+		"env":             map[string]any{"NF_MCP_HELPER": "1"},
+		"enabled":         true,
+		"defaultBehavior": "ask",
+		"toolPermissions": []any{
+			map[string]any{"toolName": "read_file", "behavior": "readOnly"},
+			map[string]any{"toolName": "write_file", "behavior": "deny"},
+		},
+	}}); err != nil {
+		t.Fatalf("seed stdio server: %v", err)
+	}
+	w := serveMCP(handler, http.MethodPost, "/servers/srv_fs/connect", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("connect status = %d body=%s", w.Code, w.Body.String())
+	}
+	payload := decodeResponse(t, w)
+	if payload["status"] != "connected" {
+		t.Fatalf("connect payload = %#v", payload)
+	}
+	specs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{PermissionMode: "default"})
+	if !specNamesContain(specs, "mcp__filesystem__read_file") || !specNamesContain(specs, "mcp__filesystem__ask_tool") || specNamesContain(specs, "mcp__filesystem__write_file") {
+		t.Fatalf("unexpected primary agent MCP specs: %#v", specs)
+	}
+	exploreSpecs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{Type: "subagent", Variant: "subagent", SubagentType: "explore"})
+	if !specNamesContain(exploreSpecs, "mcp__filesystem__read_file") || specNamesContain(exploreSpecs, "mcp__filesystem__ask_tool") {
+		t.Fatalf("explore subagent should only see readOnly MCP tools: %#v", exploreSpecs)
+	}
+	generalSpecs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{Type: "subagent", Variant: "subagent", SubagentType: "general"})
+	if !specNamesContain(generalSpecs, "mcp__filesystem__read_file") || !specNamesContain(generalSpecs, "mcp__filesystem__ask_tool") || specNamesContain(generalSpecs, "mcp__filesystem__write_file") {
+		t.Fatalf("general subagent should see non-denied MCP tools: %#v", generalSpecs)
+	}
+	customSpecs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{Type: "subagent", Variant: "subagent", SubagentType: "audit", ToolAccess: "custom", CustomTools: []string{"mcp__filesystem__ask_tool"}})
+	if specNamesContain(customSpecs, "mcp__filesystem__read_file") || !specNamesContain(customSpecs, "mcp__filesystem__ask_tool") {
+		t.Fatalf("custom subagent should only see explicitly listed MCP tools: %#v", customSpecs)
+	}
+	action, _, handled := handler.ResolveToolPermission("mcp__filesystem__read_file", "readOnly")
+	if !handled || action != "allow" {
+		t.Fatalf("readOnly MCP permission = action=%s handled=%v", action, handled)
+	}
+	run, ok := handler.ExecuteTool(context.Background(), "mcp__filesystem__read_file", map[string]any{"path": "README.md"})
+	if !ok || run.Status != "completed" || !strings.Contains(run.Output, "called read_file README.md") {
+		t.Fatalf("unexpected MCP run: ok=%v run=%#v", ok, run)
 	}
 }
 

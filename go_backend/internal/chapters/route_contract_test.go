@@ -5,23 +5,64 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 )
 
-func TestSplitRouteDisabledBeforeMutation(t *testing.T) {
+func TestSplitRouteValidatesInputBeforeMutation(t *testing.T) {
 	h := NewHandler(&Service{})
-	w := serveChapterRouteContractRequest(h, http.MethodPost, "/chapters/source/split", `{"commitSha":"abc123","newFork":{"title":"Split"}}`)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 disabled split, got %d body=%s", w.Code, w.Body.String())
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "commitSha required",
+			body: `{"newFork":{"title":"Fork"}}`,
+			want: "commitSha is required",
+		},
+		{
+			name: "title required",
+			body: `{"commitSha":"abc123","newFork":{}}`,
+			want: "newFork.title is required",
+		},
+		{
+			name: "title max",
+			body: `{"commitSha":"abc123","newFork":{"title":"` + strings.Repeat("x", 201) + `"}}`,
+			want: "newFork.title must be at most 200 characters",
+		},
+		{
+			name: "description max",
+			body: `{"commitSha":"abc123","newFork":{"title":"Fork","description":"` + strings.Repeat("x", 2001) + `"}}`,
+			want: "newFork.description must be at most 2000 characters",
+		},
+		{
+			name: "inheritMode required",
+			body: `{"commitSha":"abc123","newFork":{"title":"Fork"}}`,
+			want: "newFork.inheritMode must be full, compressed, or fresh",
+		},
+		{
+			name: "inheritMode enum",
+			body: `{"commitSha":"abc123","newFork":{"title":"Fork","inheritMode":"summary"}}`,
+			want: "newFork.inheritMode must be full, compressed, or fresh",
+		},
 	}
-	var body map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode split body: %v", err)
-	}
-	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "chapter.split" || body["supported"] != false {
-		t.Fatalf("unexpected split disabled body: %#v", body)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveChapterRouteContractRequest(h, http.MethodPost, "/chapters/source/split", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 split validation, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode split body: %v", err)
+			}
+			if body["code"] != "BAD_REQUEST" || body["error"] != tc.want {
+				t.Fatalf("unexpected split validation body: %#v", body)
+			}
+		})
 	}
 }
 

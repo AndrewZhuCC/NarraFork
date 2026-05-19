@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -132,7 +133,7 @@ func TestG05CriticalPathE2E(t *testing.T) {
 
 	criticalPathAssertTerminalWS(t, server.URL, token, rootID, fakeTerminal)
 	criticalPathAssertFakePodman(t, client, server.URL, token)
-	criticalPathAssertUpdateSSE(t, client, server.URL, token)
+	criticalPathAssertUpdateSSE(t, client, server.URL, token, settings)
 }
 
 func openCriticalPathDB(t *testing.T) *sql.DB {
@@ -501,19 +502,44 @@ func criticalPathAssertFakePodman(t *testing.T, client *http.Client, baseURL, to
 	}
 }
 
-func criticalPathAssertUpdateSSE(t *testing.T, client *http.Client, baseURL, token string) {
+func criticalPathAssertUpdateSSE(t *testing.T, client *http.Client, baseURL, token string, settings *config.Store) {
 	t.Helper()
 	artifact := []byte("fake update artifact")
 	hash := sha512.Sum512(artifact)
-	artifactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(artifact)
+	version := "9.9.9-test"
+	filename := "narrafork-" + version + "-" + criticalPathUpdatePlatform()
+	updateServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/products/narrafork/releases/latest":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"updateAvailable": true,
+				"currentVersion":  r.URL.Query().Get("version"),
+				"version":         version,
+				"releaseDate":     "2026-05-18T00:00:00Z",
+				"releaseNotes":    map[string]string{"en": "Trusted test release"},
+				"platform":        criticalPathUpdatePlatform(),
+				"file": map[string]any{
+					"filename": filename,
+					"size":     len(artifact),
+					"sha512":   fmt.Sprintf("%x", hash[:]),
+				},
+				"zstdPatch": nil,
+			})
+		case "/api/v2/products/narrafork/releases/" + version + "/download/" + filename:
+			_, _ = w.Write(artifact)
+		default:
+			http.NotFound(w, r)
+		}
 	}))
-	defer artifactServer.Close()
+	defer updateServer.Close()
+	if _, err := settings.Patch(map[string]any{"update": map[string]any{"serverUrl": updateServer.URL, "product": "narrafork", "channel": "stable"}}); err != nil {
+		t.Fatalf("patch trusted update source: %v", err)
+	}
 	reqBody, _ := json.Marshal(map[string]any{
-		"version":    "9.9.9-test",
-		"url":        artifactServer.URL + "/artifact",
-		"totalBytes": len(artifact),
-		"sha512":     fmt.Sprintf("%x", hash[:]),
+		"releaseInfo": map[string]any{
+			"version": version,
+			"files":   []map[string]any{{"url": "https://client.invalid/must-not-be-used"}},
+		},
 	})
 	req, err := http.NewRequest(http.MethodPost, baseURL+"/api/update/download", bytes.NewReader(reqBody))
 	if err != nil {
@@ -534,5 +560,20 @@ func criticalPathAssertUpdateSSE(t *testing.T, client *http.Client, baseURL, tok
 	body := buf.String()
 	if !strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") || !strings.Contains(body, "event: progress") || !strings.Contains(body, "event: complete") {
 		t.Fatalf("update download did not return progress+complete SSE, content-type=%q body=%s", resp.Header.Get("Content-Type"), body)
+	}
+}
+
+func criticalPathUpdatePlatform() string {
+	arch := "x64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return "darwin-" + arch
+	case "windows":
+		return "win-" + arch
+	default:
+		return "linux-" + arch
 	}
 }

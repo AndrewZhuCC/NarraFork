@@ -41,6 +41,38 @@ func TestAnthropicCompatibleProviderCleansThinkingBlocksFromHistory(t *testing.T
 	}
 }
 
+func TestAnthropicEmitsSilentDisconnectWithoutMessageStop(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+
+`)
+	}))
+	defer server.Close()
+	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-test"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	seenPartial := false
+	seenSilent := false
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		if event.Parsed.Text == "partial" {
+			seenPartial = true
+		}
+		if event.Parsed.SilentDisconnect {
+			seenSilent = true
+		}
+	}
+	if !seenPartial || !seenSilent {
+		t.Fatalf("expected partial text and silent disconnect, partial=%v silent=%v", seenPartial, seenSilent)
+	}
+}
+
 func TestAnthropicMessagesStreamsTextThinkingToolAndUsage(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,6 +200,10 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
 `)
 		fmt.Fprint(w, `event: content_block_stop
 data: {"type":"content_block_stop","index":0}
+
+`)
+		fmt.Fprint(w, `event: message_stop
+data: {"type":"message_stop"}
 
 `)
 	}))

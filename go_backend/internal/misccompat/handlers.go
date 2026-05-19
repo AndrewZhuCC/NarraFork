@@ -18,14 +18,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/chapters"
+	"narrafork-go/internal/config"
 	"narrafork-go/internal/db"
 	gitx "narrafork-go/internal/git"
 	"narrafork-go/internal/httpx"
@@ -33,7 +36,84 @@ import (
 	"narrafork-go/internal/narrators"
 )
 
-var shareRecords = map[string]map[string]any{}
+type shareRecord struct {
+	ID           string
+	OriginalName string
+	StoragePath  string
+	Size         int64
+	ExpiresAt    time.Time
+	CreatedBy    string
+}
+
+type shareDiskMetadata struct {
+	ID           string `json:"id"`
+	OriginalName string `json:"originalName"`
+	FileName     string `json:"fileName"`
+	SizeBytes    int64  `json:"sizeBytes"`
+	ExpiresAt    string `json:"expiresAt,omitempty"`
+	CreatedBy    string `json:"createdBy,omitempty"`
+}
+
+type shareRecordStore struct {
+	mu      sync.RWMutex
+	records map[string]shareRecord
+}
+
+func newShareRecordStore() *shareRecordStore {
+	return &shareRecordStore{records: map[string]shareRecord{}}
+}
+
+func (s *shareRecordStore) set(record shareRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.records[record.ID] = record
+}
+
+func (s *shareRecordStore) get(shareID string, now time.Time) (shareRecord, bool) {
+	s.mu.Lock()
+	record, ok := s.records[shareID]
+	if !ok {
+		s.mu.Unlock()
+		return shareRecord{}, false
+	}
+	if !record.ExpiresAt.IsZero() && !record.ExpiresAt.After(now) {
+		delete(s.records, shareID)
+		s.mu.Unlock()
+		removeShareDisk(shareID)
+		return shareRecord{}, false
+	}
+	s.mu.Unlock()
+	return record, true
+}
+
+func (s *shareRecordStore) delete(shareID string) bool {
+	s.mu.Lock()
+	_, ok := s.records[shareID]
+	if ok {
+		delete(s.records, shareID)
+	}
+	s.mu.Unlock()
+	if ok {
+		removeShareDisk(shareID)
+	}
+	return ok
+}
+
+func (s *shareRecordStore) clearMemory() int {
+	s.mu.Lock()
+	removed := len(s.records)
+	s.records = map[string]shareRecord{}
+	s.mu.Unlock()
+	return removed
+}
+
+func (s *shareRecordStore) len() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.records)
+}
+
+var shareRecords = newShareRecordStore()
 
 const (
 	maxStorageScanEntries       = 5000
@@ -43,8 +123,11 @@ const (
 	maxCleanupEntries           = 500
 	maxCompatGitOutputBytes     = 128 * 1024
 	maxShareHTMLPreviewBytes    = 2 * 1024 * 1024
+	maxShareMetadataBytes       = 16 * 1024
 	shareHTMLPreviewContentType = "text/html; charset=utf-8"
 )
+
+var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 var sharePreviewMIMETypes = map[string]string{
 	".jpg":  "image/jpeg",
@@ -70,6 +153,7 @@ type Handler struct {
 	Git       *gitx.Service
 	Chapters  *chapters.Service
 	Narrators *narrators.Service
+	Settings  *config.Store
 }
 
 func NewHandler(sqlDB *sql.DB, services ...any) *Handler {
@@ -82,6 +166,8 @@ func NewHandler(sqlDB *sql.DB, services ...any) *Handler {
 			h.Chapters = v
 		case *narrators.Service:
 			h.Narrators = v
+		case *config.Store:
+			h.Settings = v
 		}
 	}
 	return h
@@ -355,27 +441,119 @@ func (h *Handler) serveUpload(w http.ResponseWriter, r *http.Request) error {
 }
 func serveUploadFile(w http.ResponseWriter, r *http.Request, dir, imageID string) error {
 	root := uploadsRoot()
-	base := filepath.Clean(filepath.Join(root, dir))
+	if strings.TrimSpace(dir) == "" || strings.TrimSpace(imageID) == "" {
+		return httpx.NotFound("Upload")
+	}
+	base, err := resolveExistingPathWithinBase(root, dir)
+	if err != nil {
+		return httpx.NotFound("Upload")
+	}
 	entries, err := os.ReadDir(base)
 	if err != nil {
 		return httpx.NotFound("Upload")
 	}
 	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), imageID) {
-			path := filepath.Join(base, entry.Name())
-			ctype := mime.TypeByExtension(filepath.Ext(path))
-			if ctype != "" {
-				w.Header().Set("Content-Type", ctype)
-			}
-			http.ServeFile(w, r, path)
-			return nil
+		if !strings.HasPrefix(entry.Name(), imageID) {
+			continue
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		path, err := resolveExistingPathWithinBase(base, entry.Name())
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		ctype := mime.TypeByExtension(filepath.Ext(path))
+		if ctype != "" {
+			w.Header().Set("Content-Type", ctype)
+		}
+		http.ServeFile(w, r, path)
+		return nil
 	}
 	return httpx.NotFound("Upload")
 }
 func uploadsRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".narrafork", "uploads")
+}
+
+func resolvePathWithinBase(base, candidate string) (string, error) {
+	baseAbs, err := filepath.Abs(strings.TrimSpace(base))
+	if err != nil {
+		return "", err
+	}
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return "", fmt.Errorf("path is empty")
+	}
+	resolved := candidate
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(baseAbs, resolved)
+	}
+	resolvedAbs, err := filepath.Abs(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !pathWithinBase(baseAbs, resolvedAbs) {
+		return "", fmt.Errorf("path escapes base directory")
+	}
+	return resolvedAbs, nil
+}
+
+func resolveExistingPathWithinBase(base, candidate string) (string, error) {
+	baseAbs, err := filepath.Abs(strings.TrimSpace(base))
+	if err != nil {
+		return "", err
+	}
+	lexical, err := resolvePathWithinBase(baseAbs, candidate)
+	if err != nil {
+		return "", err
+	}
+	realBase, err := filepath.EvalSymlinks(baseAbs)
+	if err != nil {
+		return "", err
+	}
+	realCandidate, err := filepath.EvalSymlinks(lexical)
+	if err != nil {
+		return "", err
+	}
+	realBaseAbs, err := filepath.Abs(realBase)
+	if err != nil {
+		return "", err
+	}
+	realCandidateAbs, err := filepath.Abs(realCandidate)
+	if err != nil {
+		return "", err
+	}
+	if !pathWithinBase(realBaseAbs, realCandidateAbs) {
+		return "", fmt.Errorf("path escapes base directory")
+	}
+	return realCandidateAbs, nil
+}
+
+func pathWithinBase(baseAbs, targetAbs string) bool {
+	rel, err := filepath.Rel(baseAbs, targetAbs)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
+}
+
+func isSensitiveSharePath(path string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return false
+	}
+	for _, subdir := range []string{".narrafork", ".ssh"} {
+		if _, err := resolvePathWithinBase(filepath.Join(home, subdir), path); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) uploadNotificationSound(w http.ResponseWriter, r *http.Request) error {
@@ -502,39 +680,111 @@ func (h *Handler) createShare(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	if body.Path == "" {
+	path := strings.TrimSpace(body.Path)
+	if path == "" {
 		return httpx.BadRequest("path is required")
 	}
-	info, err := os.Stat(body.Path)
-	if err != nil || info.IsDir() {
-		return httpx.BadRequest("path must be an existing file")
+	if body.ExpiryHours < 0 {
+		return httpx.BadRequest("expiryHours must be positive")
 	}
-	shareID := id.Must(12)
-	dir := filepath.Join(sharesRoot(), shareID)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	defaultExpiryHours, maxShareSizeBytes := h.shareLimits()
+	if body.ExpiryHours == 0 {
+		body.ExpiryHours = defaultExpiryHours
+	}
+	if body.ExpiryHours <= 0 {
+		return httpx.BadRequest("expiryHours must be positive")
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
 		return err
 	}
-	name := filepath.Base(body.Path)
-	storagePath := filepath.Join(dir, name)
-	in, err := os.Open(body.Path)
+	lexicalPath, err := resolvePathWithinBase(cwd, path)
+	if err != nil {
+		return httpx.BadRequest("path must be inside the current working directory")
+	}
+	linkInfo, err := os.Lstat(lexicalPath)
+	if err != nil || linkInfo.Mode()&os.ModeSymlink != 0 {
+		return httpx.BadRequest("path must be an existing regular file")
+	}
+	path, err = resolveExistingPathWithinBase(cwd, path)
+	if err != nil {
+		return httpx.BadRequest("path must be inside the current working directory")
+	}
+	if isSensitiveSharePath(path) {
+		return httpx.BadRequest("path is not shareable")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return httpx.BadRequest("path must be an existing regular file")
+	}
+	if info.Size() > maxShareSizeBytes {
+		return httpx.Error(http.StatusRequestEntityTooLarge, "SHARE_FILE_TOO_LARGE", "file exceeds the maximum share size")
+	}
+
+	in, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(storagePath)
+	openedInfo, err := in.Stat()
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
+	if !openedInfo.Mode().IsRegular() {
+		return httpx.BadRequest("path must be an existing regular file")
+	}
+	if openedInfo.Size() > maxShareSizeBytes {
+		return httpx.Error(http.StatusRequestEntityTooLarge, "SHARE_FILE_TOO_LARGE", "file exceeds the maximum share size")
+	}
+
+	shareID := id.Must(12)
+	root := sharesRoot()
+	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
-	_ = out.Close()
-	expires := time.Now().Add(24 * time.Hour)
-	if body.ExpiryHours > 0 {
-		expires = time.Now().Add(time.Duration(body.ExpiryHours) * time.Hour)
+	tmpDir, err := os.MkdirTemp(root, ".tmp-"+shareID+"-")
+	if err != nil {
+		return err
 	}
-	shareRecords[shareID] = map[string]any{"id": shareID, "originalName": name, "storagePath": storagePath, "size": info.Size(), "expiresAt": expires, "createdBy": userID}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
+
+	name := filepath.Base(path)
+	tmpStoragePath := filepath.Join(tmpDir, name)
+	out, err := os.OpenFile(tmpStoragePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	limited := &io.LimitedReader{R: in, N: maxShareSizeBytes + 1}
+	copied, copyErr := io.Copy(out, limited)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if copied > maxShareSizeBytes {
+		return httpx.Error(http.StatusRequestEntityTooLarge, "SHARE_FILE_TOO_LARGE", "file exceeds the maximum share size")
+	}
+
+	dir := shareDirPath(shareID)
+	if err := os.Rename(tmpDir, dir); err != nil {
+		return err
+	}
+	cleanupTmp = false
+	storagePath := filepath.Join(dir, name)
+	expires := time.Now().Add(time.Duration(body.ExpiryHours) * time.Hour)
+	record := shareRecord{ID: shareID, OriginalName: name, StoragePath: storagePath, Size: copied, ExpiresAt: expires, CreatedBy: userID}
+	if err := writeShareMetadata(record); err != nil {
+		removeShareDisk(shareID)
+		return err
+	}
+	shareRecords.set(record)
 	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"id": shareID, "url": "/api/shares/" + shareID, "previewUrl": "/api/shares/" + shareID + "/preview", "expiresAt": expires.Format(time.RFC3339)})
 	return nil
 }
@@ -614,35 +864,193 @@ func shareAttachmentDisposition(name string) string {
 }
 
 func resolveShare(shareID string) (string, string) {
-	if strings.Contains(shareID, "/") || strings.Contains(shareID, "\\") || strings.Contains(shareID, "..") {
+	if !isSafeShareID(shareID) {
 		return "", ""
 	}
-	if record := shareRecords[shareID]; record != nil {
-		if expires, ok := record["expiresAt"].(time.Time); ok && expires.Before(time.Now()) {
-			return "", ""
+	now := time.Now()
+	if record, ok := shareRecords.get(shareID, now); ok {
+		if info, err := os.Stat(record.StoragePath); err == nil && info.Mode().IsRegular() {
+			return record.StoragePath, record.OriginalName
 		}
-		path, _ := record["storagePath"].(string)
-		name, _ := record["originalName"].(string)
-		if _, err := os.Stat(path); err == nil {
-			return path, name
-		}
+		return "", ""
 	}
-	dir := filepath.Join(sharesRoot(), shareID)
-	entries, err := os.ReadDir(dir)
+	record, ok := readShareMetadata(shareID, now)
+	if !ok {
+		return "", ""
+	}
+	shareRecords.set(record)
+	return record.StoragePath, record.OriginalName
+}
+
+func isSafeShareID(shareID string) bool {
+	trimmed := strings.TrimSpace(shareID)
+	return shareID == trimmed && safeShareIDPattern.MatchString(shareID)
+}
+
+func isSafeShareFileName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return false
+	}
+	return filepath.Base(name) == name
+}
+
+func writeShareMetadata(record shareRecord) error {
+	if !isSafeShareID(record.ID) {
+		return fmt.Errorf("invalid share id")
+	}
+	fileName := filepath.Base(record.StoragePath)
+	if !isSafeShareFileName(fileName) || !isSafeShareFileName(record.OriginalName) {
+		return fmt.Errorf("invalid share filename")
+	}
+	metadata := shareDiskMetadata{
+		ID:           record.ID,
+		OriginalName: record.OriginalName,
+		FileName:     fileName,
+		SizeBytes:    record.Size,
+		CreatedBy:    record.CreatedBy,
+	}
+	if !record.ExpiresAt.IsZero() {
+		metadata.ExpiresAt = record.ExpiresAt.Format(time.RFC3339Nano)
+	}
+	data, err := json.Marshal(metadata)
 	if err != nil {
-		return "", ""
+		return err
 	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			return filepath.Join(dir, entry.Name()), entry.Name()
+	path := shareMetadataPath(record.ID)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, append(data, '\n'), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+func readShareMetadata(shareID string, now time.Time) (shareRecord, bool) {
+	if !isSafeShareID(shareID) {
+		return shareRecord{}, false
+	}
+	metadataPath := shareMetadataPath(shareID)
+	metadataInfo, err := os.Lstat(metadataPath)
+	if err != nil || !metadataInfo.Mode().IsRegular() || metadataInfo.Size() > maxShareMetadataBytes {
+		return shareRecord{}, false
+	}
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return shareRecord{}, false
+	}
+	var metadata shareDiskMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return shareRecord{}, false
+	}
+	if metadata.ID != shareID {
+		return shareRecord{}, false
+	}
+	fileName := strings.TrimSpace(metadata.FileName)
+	if fileName == "" {
+		fileName = strings.TrimSpace(metadata.OriginalName)
+	}
+	originalName := strings.TrimSpace(metadata.OriginalName)
+	if originalName == "" {
+		originalName = fileName
+	}
+	if !isSafeShareFileName(fileName) || !isSafeShareFileName(originalName) {
+		return shareRecord{}, false
+	}
+	expiresAt, ok := parseShareMetadataExpiry(metadata.ExpiresAt)
+	if !ok {
+		return shareRecord{}, false
+	}
+	if !expiresAt.IsZero() && !expiresAt.After(now) {
+		removeShareDisk(shareID)
+		return shareRecord{}, false
+	}
+	storagePath, ok := shareContentPathFromMetadata(shareID, fileName)
+	if !ok {
+		return shareRecord{}, false
+	}
+	return shareRecord{ID: shareID, OriginalName: originalName, StoragePath: storagePath, Size: metadata.SizeBytes, ExpiresAt: expiresAt, CreatedBy: metadata.CreatedBy}, true
+}
+
+func parseShareMetadataExpiry(raw string) (time.Time, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}, true
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339} {
+		parsed, err := time.Parse(layout, raw)
+		if err == nil {
+			return parsed, true
 		}
 	}
-	return "", ""
+	return time.Time{}, false
+}
+
+func shareContentPathFromMetadata(shareID, fileName string) (string, bool) {
+	dir := shareDirPath(shareID)
+	dirInfo, err := os.Lstat(dir)
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return "", false
+	}
+	fileInfo, err := os.Lstat(filepath.Join(dir, fileName))
+	if err != nil || fileInfo.Mode()&os.ModeSymlink != 0 {
+		return "", false
+	}
+	path, err := resolveExistingPathWithinBase(dir, fileName)
+	if err != nil {
+		return "", false
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	return path, true
+}
+
+func removeShareDisk(shareID string) {
+	if !isSafeShareID(shareID) {
+		return
+	}
+	_ = os.RemoveAll(shareDirPath(shareID))
+	_ = os.Remove(shareMetadataPath(shareID))
+	_ = os.Remove(shareMetadataPath(shareID) + ".tmp")
 }
 
 func sharesRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".narrafork", "shares")
+}
+
+func shareDirPath(shareID string) string {
+	return filepath.Join(sharesRoot(), shareID)
+}
+
+func shareMetadataPath(shareID string) string {
+	return filepath.Join(sharesRoot(), shareID+".json")
+}
+
+func (h *Handler) shareLimits() (int, int64) {
+	defaultExpiryHours := 24
+	maxFileSizeMb := 4096
+	if h != nil && h.Settings != nil {
+		if shares, ok := h.Settings.Raw()["shares"].(map[string]any); ok {
+			defaultExpiryHours = int(numericMapOr(shares, "defaultExpiryHours", float64(defaultExpiryHours)))
+			maxFileSizeMb = int(numericMapOr(shares, "maxFileSizeMb", float64(maxFileSizeMb)))
+		}
+	}
+	if defaultExpiryHours <= 0 {
+		defaultExpiryHours = 24
+	}
+	if maxFileSizeMb <= 0 {
+		maxFileSizeMb = 4096
+	}
+	return defaultExpiryHours, int64(maxFileSizeMb) * 1024 * 1024
 }
 
 func (h *Handler) RegisterStorage(r chi.Router) {
@@ -719,8 +1127,9 @@ func (h *Handler) cleanupStorage(w http.ResponseWriter, r *http.Request) error {
 	}
 	switch body.Target {
 	case "shares":
+		memoryRemoved := shareRecords.clearMemory()
 		removed, freed := removeChildren(sharesRoot())
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "freedBytes": freed})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "freedBytes": freed, "memoryRemoved": memoryRemoved})
 	case "uploads":
 		removed, freed := h.cleanupOrphanedUploads(r)
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "freedBytes": freed})
@@ -1291,11 +1700,12 @@ func (h *Handler) cleanupOrphanedUploads(r *http.Request) (int, int64) {
 	active := map[string]bool{"avatars": true}
 	for rows.Next() {
 		var id string
-		if err := rows.Scan(&id); err == nil {
+		if err := rows.Scan(&id); err == nil && strings.TrimSpace(id) != "" {
 			active[id] = true
 		}
 	}
 	rows.Close()
+	h.addReferencedUploadOwnerIDs(r, active)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return 0, 0
@@ -1314,6 +1724,42 @@ func (h *Handler) cleanupOrphanedUploads(r *http.Request) (int, int64) {
 		}
 	}
 	return removed, freed
+}
+
+func (h *Handler) addReferencedUploadOwnerIDs(r *http.Request, active map[string]bool) {
+	if h == nil || h.DB == nil {
+		return
+	}
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT narrator_id, content_json FROM narrator_messages WHERE narrator_id IS NOT NULL`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var narratorID string
+		var contentJSON string
+		if err := rows.Scan(&narratorID, &contentJSON); err != nil {
+			continue
+		}
+		if strings.TrimSpace(narratorID) != "" && contentJSONHasImageBlocks(contentJSON) {
+			active[narratorID] = true
+		}
+	}
+}
+
+func contentJSONHasImageBlocks(raw string) bool {
+	var blocks []map[string]any
+	if err := json.Unmarshal([]byte(raw), &blocks); err != nil {
+		return false
+	}
+	for _, block := range blocks {
+		blockType, _ := block["type"].(string)
+		imageID, _ := block["imageId"].(string)
+		if blockType == "image" && strings.TrimSpace(imageID) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func databaseTableCategory(name string) string {
@@ -1805,6 +2251,7 @@ func (h *Handler) rulerFork(w http.ResponseWriter, r *http.Request) error {
 		Title           *string  `json:"title"`
 		Description     *string  `json:"description"`
 		Role            string   `json:"role"`
+		InheritMode     string   `json:"inheritMode"`
 		ParentChapterID string   `json:"parentChapterId"`
 		AnchorCommitSHA *string  `json:"anchorCommitSha"`
 		AxisOffset      *float64 `json:"axisOffset"`
@@ -1829,8 +2276,36 @@ func (h *Handler) rulerFork(w http.ResponseWriter, r *http.Request) error {
 	} else if !ok {
 		return httpx.NotFound("Chapter")
 	}
+	if split, err := h.rulerForkShouldSplit(r.Context(), projectID, parentID, start); err != nil {
+		return err
+	} else if split {
+		title := strings.TrimSpace(stringPtrValue(body.Title))
+		if title == "" {
+			short := start
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			title = "Fork from " + short
+		}
+		result, err := h.Chapters.SplitAtCommit(r.Context(), parentID, chapters.SplitInput{
+			CommitSHA: start,
+			NewFork: chapters.SplitNewForkInput{
+				Title:       title,
+				Description: body.Description,
+				InheritMode: body.InheritMode,
+			},
+			AnchorCommitSHA: body.AnchorCommitSHA,
+			AxisOffset:      body.AxisOffset,
+			CrossOffset:     body.CrossOffset,
+		})
+		if err != nil {
+			return err
+		}
+		httpx.WriteJSON(w, http.StatusCreated, result.NewForkChapter)
+		return nil
+	}
 	chapter, err := h.Chapters.Fork(r.Context(), parentID, chapters.ForkInput{
-		Title: body.Title, Description: body.Description, Role: body.Role,
+		Title: body.Title, Description: body.Description, Role: body.Role, InheritMode: body.InheritMode,
 		StartCommitSHA: &start, AnchorCommitSHA: body.AnchorCommitSHA,
 		AxisOffset: body.AxisOffset, CrossOffset: body.CrossOffset,
 	})
@@ -1839,6 +2314,66 @@ func (h *Handler) rulerFork(w http.ResponseWriter, r *http.Request) error {
 	}
 	httpx.WriteJSON(w, http.StatusCreated, chapter)
 	return nil
+}
+
+func (h *Handler) rulerForkShouldSplit(ctx context.Context, projectID, parentID, startCommitSHA string) (bool, error) {
+	gitService := h.Git
+	if gitService == nil && h.Chapters != nil {
+		gitService = h.Chapters.Git
+	}
+	if gitService == nil {
+		return false, nil
+	}
+	database := h.DB
+	if database == nil && h.Chapters != nil {
+		database = h.Chapters.DB
+	}
+	if database == nil {
+		return false, nil
+	}
+	var worktreePath, branch, gitPath sql.NullString
+	err := database.QueryRowContext(ctx, `SELECT c.worktree_path, c.branch, p.git_path FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.id = ? AND c.project_id = ?`, parentID, projectID).Scan(&worktreePath, &branch, &gitPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, httpx.NotFound("Chapter")
+	}
+	if err != nil {
+		return false, err
+	}
+	if !gitPath.Valid || strings.TrimSpace(gitPath.String) == "" {
+		return false, nil
+	}
+	repoPath := strings.TrimSpace(gitPath.String)
+	head := ""
+	if worktreePath.Valid && strings.TrimSpace(worktreePath.String) != "" {
+		head, err = gitService.HeadCommit(ctx, strings.TrimSpace(worktreePath.String))
+	} else if branch.Valid && strings.TrimSpace(branch.String) != "" {
+		head, err = gitService.GetRefCommit(ctx, repoPath, strings.TrimSpace(branch.String))
+	} else {
+		head, err = gitService.HeadCommit(ctx, repoPath)
+	}
+	if err != nil {
+		return false, err
+	}
+	head = strings.TrimSpace(head)
+	if head == "" {
+		return false, nil
+	}
+	start, err := gitService.GetRefCommit(ctx, repoPath, strings.TrimSpace(startCommitSHA))
+	if err != nil {
+		return false, nil
+	}
+	start = strings.TrimSpace(start)
+	if start == "" || start == head {
+		return false, nil
+	}
+	return gitService.IsAncestor(ctx, repoPath, start, head), nil
+}
+
+func stringPtrValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {

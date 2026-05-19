@@ -42,9 +42,22 @@ type Core struct {
 		RegistrationOpen bool   `json:"registrationOpen"`
 	} `json:"auth"`
 	Agent struct {
-		DefaultModel          string `json:"defaultModel"`
-		DefaultPermissionMode string `json:"defaultPermissionMode"`
+		DefaultModel                string `json:"defaultModel"`
+		DefaultPermissionMode       string `json:"defaultPermissionMode"`
+		QuestionReflectionEnabled   bool   `json:"questionReflectionEnabled"`
+		QuestionReflectionTimeoutMs int    `json:"questionReflectionTimeoutMs"`
 	} `json:"agent"`
+	Database struct {
+		Driver                 string `json:"driver"`
+		SQLitePath             string `json:"sqlitePath"`
+		PostgresDSN            string `json:"postgresDsn"`
+		PostgresSchema         string `json:"postgresSchema"`
+		MaxOpenConns           int    `json:"maxOpenConns"`
+		MaxIdleConns           int    `json:"maxIdleConns"`
+		ConnMaxLifetimeSeconds int    `json:"connMaxLifetimeSeconds"`
+		VerifyCanonical        bool   `json:"verifyCanonical"`
+		TSOwnedSchema          bool   `json:"tsOwnedSchema"`
+	} `json:"database"`
 }
 
 func Load() (*Store, error) {
@@ -118,6 +131,8 @@ func defaultRaw(home string) map[string]any {
 			"translateReasoning":              false,
 			"defaultRelaxedPlan":              false,
 			"planReflectionAutoApprove":       false,
+			"questionReflectionEnabled":       false,
+			"questionReflectionTimeoutMs":     float64(300000),
 			"dangerReflectionEnabled":         true,
 			"dangerSkipReadOnlyConfirmations": false,
 			"maxTransientRetries":             float64(10),
@@ -203,6 +218,17 @@ func (s *Store) Core() Core {
 	c.Auth.RegistrationOpen = getBool(s.raw, true, "auth", "registrationOpen")
 	c.Agent.DefaultModel = stringOr(getString(s.raw, "agent", "defaultModel"), DefaultAgentModel)
 	c.Agent.DefaultPermissionMode = stringOr(getString(s.raw, "agent", "defaultPermissionMode"), "acceptEdits")
+	c.Agent.QuestionReflectionEnabled = getBool(s.raw, false, "agent", "questionReflectionEnabled")
+	c.Agent.QuestionReflectionTimeoutMs = getInt(s.raw, 300000, "agent", "questionReflectionTimeoutMs")
+	c.Database.Driver = getString(s.raw, "database", "driver")
+	c.Database.SQLitePath = getString(s.raw, "database", "sqlitePath")
+	c.Database.PostgresDSN = getString(s.raw, "database", "postgresDsn")
+	c.Database.PostgresSchema = getString(s.raw, "database", "postgresSchema")
+	c.Database.MaxOpenConns = getInt(s.raw, 0, "database", "maxOpenConns")
+	c.Database.MaxIdleConns = getInt(s.raw, 0, "database", "maxIdleConns")
+	c.Database.ConnMaxLifetimeSeconds = getInt(s.raw, 0, "database", "connMaxLifetimeSeconds")
+	c.Database.VerifyCanonical = getBool(s.raw, true, "database", "verifyCanonical")
+	c.Database.TSOwnedSchema = getBool(s.raw, true, "database", "tsOwnedSchema")
 	return c
 }
 

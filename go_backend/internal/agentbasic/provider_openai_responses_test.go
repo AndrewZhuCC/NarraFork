@@ -103,6 +103,37 @@ func TestOpenAIResponsesStreamsTextReasoningToolAndUsage(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesEmitsSilentDisconnectWithoutCompleted(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"partial"}
+
+`)
+	}))
+	defer server.Close()
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "openai", Kind: "openai", APIKey: "test-key", BaseURL: server.URL, Model: "gpt-test", APIMode: "responses"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	seenPartial := false
+	seenSilent := false
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		if event.Parsed.Text == "partial" {
+			seenPartial = true
+		}
+		if event.Parsed.SilentDisconnect && event.Parsed.ResponsesAPI {
+			seenSilent = true
+		}
+	}
+	if !seenPartial || !seenSilent {
+		t.Fatalf("expected partial responses text and silent disconnect, partial=%v silent=%v", seenPartial, seenSilent)
+	}
+}
+
 func TestOpenAIResponsesSendsPreviousResponseID(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

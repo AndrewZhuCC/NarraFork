@@ -295,9 +295,14 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 	}
 	blocks := map[int]*anthropicStreamingBlock{}
 	messageID := ""
-	return readSSE(ctx, res.Body, 0, func(event sseEvent) error {
+	completed := false
+	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			return nil
+		}
+		if data == "[DONE]" {
+			completed = true
 			return nil
 		}
 		var parsed anthropicStreamEvent
@@ -339,10 +344,18 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 			}
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: streamEvent})
 		case "message_stop":
+			completed = true
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID}})
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !completed {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, SilentDisconnect: true}})
+	}
+	return nil
 }
 
 func anthropicSystemBlocks(systemPrompt string) any {

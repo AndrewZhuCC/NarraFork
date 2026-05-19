@@ -90,12 +90,20 @@ func (h *Handler) graph(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		fallbacks = append(fallbacks, graphFallback("graph.containers", "container_presence_unavailable", err))
 	}
-	nodes := []node{}
-	for _, ch := range records {
-		head, commitCount, refreshErr := h.refreshGitMeta(r.Context(), ch.id, ch.status, ch.worktree, ch.head, ch.commitCount)
+	for i := range records {
+		head, commitCount, refreshErr := h.refreshGitMeta(r.Context(), records[i].id, records[i].status, records[i].worktree, records[i].head, records[i].commitCount)
 		if refreshErr != nil {
 			fallbacks = append(fallbacks, graphFallback("graph.gitMetadata", "git_metadata_refresh_failed", refreshErr))
 		}
+		records[i].head = head
+		records[i].commitCount = commitCount
+	}
+	upstreamUpdates, err := h.upstreamUpdates(r, projectID)
+	if err != nil {
+		fallbacks = append(fallbacks, graphFallback("graph.upstreamUpdates", "dependency_upstream_updates_unavailable", err))
+	}
+	nodes := []node{}
+	for _, ch := range records {
 		nodeType := "chapterNode"
 		if ch.role == "review" {
 			nodeType = "reviewNode"
@@ -118,10 +126,10 @@ func (h *Handler) graph(w http.ResponseWriter, r *http.Request) error {
 				"narratorMessageVersion": nullableMapInt(narratorMessageVersions, ch.id),
 				"messageVersion":         nullableMapInt(narratorMessageVersions, ch.id),
 				"hasContainers":          containerPresence[ch.id],
-				"hasUpstreamUpdates":     false,
+				"hasUpstreamUpdates":     upstreamUpdates[ch.id],
 				"isRoot":                 ch.isRoot != 0,
-				"commitCount":            commitCount,
-				"headCommitSha":          nullString(head),
+				"commitCount":            ch.commitCount,
+				"headCommitSha":          nullString(ch.head),
 				"panelExpanded":          ch.panelExpanded != 0,
 				"panelWidth":             nullFloat(ch.panelWidth),
 				"panelHeight":            nullFloat(ch.panelHeight),
@@ -169,15 +177,32 @@ func graphFallback(feature, reason string, err error) map[string]any {
 	return payload
 }
 
+func SplitCapability() map[string]any {
+	return map[string]any{
+		"supported": true,
+		"fallback":  false,
+		"mode":      "go-basic-split",
+		"routes": map[string]any{
+			"splitAtCommit": true,
+		},
+		"partials": map[string]any{
+			"compressedAISummary": map[string]any{
+				"supported": false,
+				"fallback":  true,
+				"mode":      "deterministic-summary-placeholder",
+			},
+			"containerAutostart": map[string]any{
+				"supported": true,
+				"fallback":  false,
+				"mode":      "background-start",
+			},
+		},
+	}
+}
+
 func domainCapabilities() map[string]any {
 	return map[string]any{
-		"split": map[string]any{
-			"supported": false,
-			"fallback":  true,
-			"mode":      "disabled-before-mutation",
-			"code":      "FEATURE_DISABLED",
-			"reason":    "TS-equivalent split prefix/continuation/message truncation semantics are not implemented in go_backend yet",
-		},
+		"split": SplitCapability(),
 		"chapterEdges": map[string]any{
 			"manualCreateTypes": []string{"dependency"},
 			"manualDeleteTypes": []string{"dependency"},
@@ -186,21 +211,21 @@ func domainCapabilities() map[string]any {
 		"commitSync": map[string]any{
 			"supported":                true,
 			"manualRecordingSupported": true,
-			"mode":                     "manual-route-graph-read-and-worktree-watcher",
+			"mode":                     "manual-route-lightweight-graph-read-and-worktree-watcher",
 			"backgroundSync":           true,
 			"worktreeWatcher":          true,
 			"graphReadRefresh":         true,
 			"fallback":                 false,
 			"events":                   []string{"git_status", "commits_updated", "commit_sync_error"},
-			"sources":                  []string{"manual", "watcher", "graph-read-refresh"},
-			"metadata":                 "Go records commits created through git routes, refreshes chapter metadata when graph data is read, and runs a background worktree watcher for external commit/status sync.",
+			"sources":                  []string{"manual", "watcher"},
+			"metadata":                 "Go records commits created through git routes, refreshes only lightweight chapter head/count metadata when graph data is read, and runs a background worktree watcher for external commit/status sync.",
 		},
 		"upstreamUpdates": map[string]any{
-			"supported": false,
-			"fallback":  true,
-			"mode":      "not-yet-detected",
+			"supported": true,
+			"fallback":  false,
+			"mode":      "db-backed-dependency-last-synced-commit",
 			"field":     "nodes[].data.hasUpstreamUpdates",
-			"reason":    "Graph currently preserves the TS response field but does not compute upstream dependency update detection in go_backend Phase 1.",
+			"source":    "chapter_edges.metadata.lastSyncedCommit + chapters.headCommitSha",
 		},
 	}
 }
@@ -251,7 +276,7 @@ func (h *Handler) updatePositions(w http.ResponseWriter, r *http.Request) error 
 				panelExpanded = 0
 			}
 		}
-		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height), updated_at = datetime('now') WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), pos.AxisOffset, pos.CrossOffset, panelExpanded, nullableFloatPtr(pos.PanelWidth), nullableFloatPtr(pos.PanelHeight), pos.ChapterID, projectID)
+		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height), updated_at = ? WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), pos.AxisOffset, pos.CrossOffset, panelExpanded, nullableFloatPtr(pos.PanelWidth), nullableFloatPtr(pos.PanelHeight), db.NowISO(), pos.ChapterID, projectID)
 		if err != nil {
 			return err
 		}
@@ -359,7 +384,7 @@ func (h *Handler) narratorMeta(r *http.Request, projectID string) (map[string]in
 }
 
 func (h *Handler) containerPresence(r *http.Request, projectID string) (map[string]bool, error) {
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT DISTINCT ci.chapter_id FROM container_instances ci JOIN chapters c ON c.id = ci.chapter_id WHERE c.project_id = ? AND ci.status IN ('running', 'paused')`, projectID)
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT DISTINCT ci.chapter_id FROM container_instances ci JOIN chapters c ON c.id = ci.chapter_id WHERE c.project_id = ? AND ci.status <> 'removed'`, projectID)
 	presence := map[string]bool{}
 	if err != nil {
 		return presence, err
@@ -373,6 +398,48 @@ func (h *Handler) containerPresence(r *http.Request, projectID string) (map[stri
 		presence[chapterID] = true
 	}
 	return presence, rows.Err()
+}
+
+func (h *Handler) upstreamUpdates(r *http.Request, projectID string) (map[string]bool, error) {
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT e.target_id, COALESCE(e.metadata, ''), COALESCE(s.head_commit_sha, '') FROM chapter_edges e JOIN chapters s ON s.id = e.source_id WHERE e.project_id = ? AND e.type = 'dependency'`, projectID)
+	updates := map[string]bool{}
+	if err != nil {
+		return updates, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var targetID, rawMetadata, sourceHead string
+		if err := rows.Scan(&targetID, &rawMetadata, &sourceHead); err != nil {
+			return updates, err
+		}
+		lastSynced := graphDependencyLastSyncedCommit(rawMetadata)
+		if strings.TrimSpace(sourceHead) != "" && sourceHead != lastSynced {
+			updates[targetID] = true
+		}
+	}
+	return updates, rows.Err()
+}
+
+func graphDependencyLastSyncedCommit(rawMetadata string) string {
+	if strings.TrimSpace(rawMetadata) == "" {
+		return ""
+	}
+	metadata := map[string]any{}
+	if err := json.Unmarshal([]byte(rawMetadata), &metadata); err != nil {
+		return ""
+	}
+	return graphStringValue(metadata["lastSyncedCommit"])
+}
+
+func graphStringValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case []byte:
+		return strings.TrimSpace(string(typed))
+	default:
+		return ""
+	}
 }
 
 func (h *Handler) edges(r *http.Request, projectID string) ([]edge, error) {
@@ -400,6 +467,7 @@ func (h *Handler) edges(r *http.Request, projectID string) ([]edge, error) {
 }
 
 func (h *Handler) openedTerminals(r *http.Request, projectID string) ([]map[string]any, error) {
+
 	rows, err := h.DB.QueryContext(r.Context(), `SELECT t.id, t.chapter_id, t.name, t.status, t.graph_x, t.graph_y, t.graph_width, t.graph_height FROM terminals t JOIN chapters c ON c.id = t.chapter_id WHERE c.project_id = ? AND COALESCE(t.graph_opened, 0) = 1 AND t.status = 'running' ORDER BY t.created_at ASC`, projectID)
 	if err != nil {
 		return []map[string]any{}, err

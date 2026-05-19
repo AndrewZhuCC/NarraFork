@@ -201,11 +201,11 @@
 				"/api/narrators/{id}/edit-and-regenerate/{messageId}"
 			],
 			"tsSource": "server/routes/narrators.ts and snapshot/revert services",
-			"goSource": "go_backend/internal/narrators/handlers.go",
-			"phase0Status": "disabled",
+			"goSource": "go_backend/internal/narrators/handlers.go; go_backend/internal/narrators/rollback_edit.go",
+			"phase0Status": "supported",
 			"capabilityKey": "narrator.rollbackEditRegenerate",
-			"fallbackCode": "FEATURE_DISABLED",
-			"sideEffectPolicy": "reject before file/message regeneration side effects"
+			"tests": ["go_backend/internal/narrators/rollback_edit_test.go"],
+			"sideEffectPolicy": "truncate message refs/blocks, invalidate affected tool calls, optionally rebuild file state from snapshots, preserve copy-on-write message sharing, broadcast WS updates, and optionally rerun the agent for edit-and-regenerate"
 		}
 	],
 	"wsEventGroups": [

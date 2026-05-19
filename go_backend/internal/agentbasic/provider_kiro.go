@@ -35,23 +35,7 @@ func (a *KiroProviderAdapter) ProviderName() string {
 }
 
 func (a *KiroProviderAdapter) FormatTools(toolScope string) []map[string]any {
-	chatTools := toolDefinitions(toolScope)
-	tools := make([]map[string]any, 0, len(chatTools))
-	for _, tool := range chatTools {
-		fn, _ := tool["function"].(map[string]any)
-		name := stringValue(fn["name"])
-		if name == "" {
-			continue
-		}
-		spec := map[string]any{"name": name, "description": stringValue(fn["description"])}
-		if params, ok := fn["parameters"].(map[string]any); ok {
-			spec["inputSchema"] = map[string]any{"json": ensureNonEmptySchema(params)}
-		} else {
-			spec["inputSchema"] = map[string]any{"json": map[string]any{"type": "object", "properties": map[string]any{}}}
-		}
-		tools = append(tools, map[string]any{"toolSpecification": spec})
-	}
-	return tools
+	return kiroToolDefinitionsFromSpecs(visibleToolSpecs(toolScope))
 }
 
 func (a *KiroProviderAdapter) BuildHistory(messages []Message, model string, _ string) (BuiltHistory, error) {
@@ -172,9 +156,14 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 	if !isSSEContentType(res.Header) {
 		return errors.New("kiro provider returned non-SSE response")
 	}
-	return readSSE(ctx, res.Body, 0, func(event sseEvent) error {
+	completed := false
+	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
-		if data == "" || data == "[DONE]" {
+		if data == "" {
+			return nil
+		}
+		if data == "[DONE]" {
+			completed = true
 			return nil
 		}
 		var payload map[string]any
@@ -191,9 +180,20 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 		if eventType == "" {
 			eventType = "assistantResponseEvent"
 		}
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: parseKiroEvent(eventType, payload)})
+		parsed := parseKiroEvent(eventType, payload)
+		if parsed.StopReason != "" || eventType == "message_stop" || eventType == "response.completed" || eventType == "done" || eventType == "complete" {
+			completed = true
+		}
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: parsed})
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if !completed {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{SilentDisconnect: true}})
+	}
+	return nil
 }
 
 func defaultKiroBridgeScriptPath() string {
@@ -640,8 +640,10 @@ func parseKiroEvent(eventType string, data map[string]any) ParsedStreamEvent {
 		result.QueueStatus = &QueueSnapshot{Position: position, QueueDepth: depth, QueueMessage: stringValue(data["message"])}
 	case "quotaBalanceEvent":
 		balance := firstNonEmpty(stringValue(data["quotaBalance"]), stringValue(data["balance"]), stringValue(data["message"]))
+		detailedBalance := stringValue(data["detailedQuotaBalance"])
 		if balance != "" {
 			result.QuotaBalance = &balance
+			result.DetailedQuotaBalance = &detailedBalance
 		}
 	}
 	return result

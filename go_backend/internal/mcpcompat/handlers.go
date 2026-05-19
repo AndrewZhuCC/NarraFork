@@ -33,6 +33,13 @@ type Handler struct {
 	state     map[string]mcpRuntimeState
 }
 
+const (
+	maxMCPJSONRPCLineBytes     = 1 * 1024 * 1024
+	maxMCPJSONRPCTotalBytes    = 4 * 1024 * 1024
+	maxMCPJSONRPCResponseCount = 256
+	maxMCPToolOutputBytes      = 256 * 1024
+)
+
 type mcpRuntimeState struct {
 	Status string
 	Tools  []any
@@ -451,9 +458,150 @@ func (h *Handler) listTools(w http.ResponseWriter, r *http.Request) error {
 			tools = append(tools, entry)
 		}
 	}
-	metadata := agentbasic.ToolInventoryMetadataForOptions(agentbasic.ToolInventoryOptions{Scope: agentbasic.ToolScopeNormal})
+	metadata := agentbasic.ToolInventoryMetadataForOptions(agentbasic.ToolInventoryOptions{Scope: agentbasic.ToolScopeNormal, ExternalTools: h.AgentToolSpecs(r.Context(), narrators.ExternalToolContext{}), MCPExternalToolInjection: true})
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"tools": tools, "capabilities": metadata.Capabilities})
 	return nil
+}
+
+func (h *Handler) AgentToolSpecs(ctx context.Context, info narrators.ExternalToolContext) []agentbasic.ExternalToolSpec {
+	_ = ctx
+	states := h.runtimeStatesSnapshot()
+	servers := h.settingsServers()
+	tools := []agentbasic.ExternalToolSpec{}
+	for _, server := range servers {
+		serverID := stringOr(server["id"], "")
+		if serverID == "" || !boolValue(server["enabled"], true) || stringOr(server["transport"], "stdio") != "stdio" {
+			continue
+		}
+		state, ok := states[serverID]
+		if !ok || state.Status != "connected" {
+			continue
+		}
+		for _, item := range state.Tools {
+			tool, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			originalName := strings.TrimSpace(stringOr(tool["name"], ""))
+			if originalName == "" {
+				continue
+			}
+			behavior := resolveMcpBehaviorForTool(server, originalName)
+			if !mcpToolAllowedForAgentContext(behavior, info) {
+				continue
+			}
+			name := buildAgentMCPToolName(stringOr(server["name"], serverID), originalName)
+			if info.ToolAccess == "custom" && !stringSliceContains(info.CustomTools, name) {
+				continue
+			}
+			tools = append(tools, agentbasic.ExternalToolSpec{
+				Name:        name,
+				Description: "[MCP: " + stringOr(server["name"], serverID) + "] " + firstNonEmptyString(stringOr(tool["description"], ""), originalName),
+				Parameters:  mcpInputSchema(tool["inputSchema"]),
+				Source:      "mcp",
+				Metadata: map[string]any{
+					"serverId":         serverID,
+					"serverName":       stringOr(server["name"], serverID),
+					"originalToolName": originalName,
+					"behavior":         behavior,
+					"transport":        stringOr(server["transport"], "stdio"),
+				},
+			})
+		}
+	}
+	return tools
+}
+
+func (h *Handler) ResolveToolPermission(toolName string, permissionMode string) (string, string, bool) {
+	if !strings.HasPrefix(toolName, "mcp__") {
+		return "", "", false
+	}
+	server, originalName, ok := h.resolveAgentMCPTool(toolName)
+	if !ok {
+		return "deny", "MCP tool is not connected or is not available: " + toolName, true
+	}
+	behavior := resolveMcpBehaviorForTool(server, originalName)
+	if behavior == "" {
+		return "", "", false
+	}
+	decision := mapMcpBehaviorToPermissionDecision(behavior, permissionMode)
+	reason := ""
+	if decision == "deny" {
+		reason = "MCP tool permission denied by server settings: " + behavior
+	}
+	return decision, reason, true
+}
+
+func (h *Handler) ExecuteTool(ctx context.Context, toolName string, args map[string]any) (agentbasic.ToolRun, bool) {
+	if !strings.HasPrefix(toolName, "mcp__") {
+		return agentbasic.ToolRun{}, false
+	}
+	server, originalName, ok := h.resolveAgentMCPTool(toolName)
+	run := agentbasic.ToolRun{Name: toolName, Status: "completed"}
+	if !ok {
+		run.Status = "error"
+		run.Output = "MCP tool is not connected or is not available: " + toolName
+		run.Error = run.Output
+		return run, true
+	}
+	output, isError, err := callMcpServerTool(ctx, server, originalName, args)
+	if err != nil {
+		run.Status = "error"
+		run.Output = "MCP tool error: " + err.Error()
+		run.Error = run.Output
+		return run, true
+	}
+	run.Output = output
+	if isError {
+		run.Status = "error"
+		run.Error = output
+	}
+	return run, true
+}
+
+func (h *Handler) runtimeStatesSnapshot() map[string]mcpRuntimeState {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	states := make(map[string]mcpRuntimeState, len(h.state))
+	for id, state := range h.state {
+		states[id] = state
+	}
+	return states
+}
+
+func (h *Handler) settingsServers() []map[string]any {
+	if h.Settings == nil {
+		return []map[string]any{}
+	}
+	items := h.Settings.MCPServers()
+	for _, item := range items {
+		setDefaultServerRuntimeFields(item)
+		h.applyState(item)
+	}
+	return items
+}
+
+func (h *Handler) resolveAgentMCPTool(toolName string) (map[string]any, string, bool) {
+	states := h.runtimeStatesSnapshot()
+	for _, server := range h.settingsServers() {
+		serverID := stringOr(server["id"], "")
+		state, ok := states[serverID]
+		if !ok || state.Status != "connected" || !boolValue(server["enabled"], true) || stringOr(server["transport"], "stdio") != "stdio" {
+			continue
+		}
+		serverName := stringOr(server["name"], serverID)
+		for _, item := range state.Tools {
+			tool, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			originalName := strings.TrimSpace(stringOr(tool["name"], ""))
+			if buildAgentMCPToolName(serverName, originalName) == toolName {
+				return server, originalName, true
+			}
+		}
+	}
+	return nil, "", false
 }
 
 func (h *Handler) setState(serverID string, state mcpRuntimeState) {
@@ -562,26 +710,48 @@ func writeJSONLine(stdin interface{ Write([]byte) (int, error) }, payload map[st
 }
 
 func readJSONRPCLines(ctx context.Context, stdout interface{ Read([]byte) (int, error) }, responses chan<- map[string]any, readErrs chan<- error) {
-	reader := bufio.NewReader(stdout)
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			var msg map[string]any
-			if json.Unmarshal(line, &msg) == nil {
-				select {
-				case responses <- msg:
-				case <-ctx.Done():
-					return
-				}
-			}
+	sendReadErr := func(err error) {
+		select {
+		case readErrs <- err:
+		default:
 		}
-		if err != nil {
-			select {
-			case readErrs <- err:
-			default:
-			}
+	}
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxMCPJSONRPCLineBytes)
+	totalBytes := 0
+	responseCount := 0
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		line := scanner.Bytes()
+		totalBytes += len(line)
+		if totalBytes > maxMCPJSONRPCTotalBytes {
+			sendReadErr(fmt.Errorf("MCP JSON-RPC response exceeded %d bytes", maxMCPJSONRPCTotalBytes))
 			return
 		}
+		responseCount++
+		if responseCount > maxMCPJSONRPCResponseCount {
+			sendReadErr(fmt.Errorf("MCP JSON-RPC response exceeded %d messages", maxMCPJSONRPCResponseCount))
+			return
+		}
+		var msg map[string]any
+		if json.Unmarshal(line, &msg) != nil {
+			continue
+		}
+		select {
+		case responses <- msg:
+		case <-ctx.Done():
+			return
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		sendReadErr(fmt.Errorf("MCP JSON-RPC read failed or line exceeded %d bytes: %w", maxMCPJSONRPCLineBytes, err))
 	}
 }
 
@@ -674,8 +844,9 @@ func withStderr(err error, stderr string) string {
 }
 
 type limitedStringBuilder struct {
-	builder strings.Builder
-	limit   int
+	builder   strings.Builder
+	limit     int
+	truncated bool
 }
 
 func (w *limitedStringBuilder) Write(p []byte) (int, error) {
@@ -683,14 +854,19 @@ func (w *limitedStringBuilder) Write(p []byte) (int, error) {
 	if remaining > 0 {
 		if len(p) > remaining {
 			_, _ = w.builder.Write(p[:remaining])
+			w.truncated = true
 		} else {
 			_, _ = w.builder.Write(p)
 		}
+	} else if len(p) > 0 {
+		w.truncated = true
 	}
 	return len(p), nil
 }
 
 func (w *limitedStringBuilder) String() string { return w.builder.String() }
+
+func (w *limitedStringBuilder) Truncated() bool { return w.truncated }
 
 func (h *Handler) importServers(w http.ResponseWriter, r *http.Request) error {
 	if h.Settings == nil {
@@ -1101,6 +1277,243 @@ func normalizeMcpBehavior(value any) (string, error) {
 	default:
 		return "", httpx.BadRequest("behavior must be one of readOnly, readWrite, ask, or deny")
 	}
+}
+
+func stringSliceContains(values []string, want string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func buildAgentMCPToolName(serverName, toolName string) string {
+	sanitize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		var b strings.Builder
+		for _, r := range value {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+				b.WriteRune(r)
+			} else {
+				b.WriteRune('_')
+			}
+		}
+		out := b.String()
+		if strings.Trim(out, "_") == "" {
+			return "unknown"
+		}
+		return out
+	}
+	safeTool := strings.TrimSpace(toolName)
+	if safeTool == "" {
+		safeTool = "unknown"
+	}
+	return "mcp__" + sanitize(serverName) + "__" + safeTool
+}
+
+func mcpInputSchema(value any) map[string]any {
+	if schema, ok := value.(map[string]any); ok && len(schema) > 0 {
+		out := map[string]any{}
+		for key, val := range schema {
+			out[key] = val
+		}
+		if _, ok := out["type"]; !ok {
+			out["type"] = "object"
+		}
+		if _, ok := out["properties"]; !ok {
+			out["properties"] = map[string]any{}
+		}
+		return out
+	}
+	return map[string]any{"type": "object", "properties": map[string]any{}}
+}
+
+func resolveMcpBehaviorForTool(server map[string]any, toolName string) string {
+	permissions := arrayValue(server["toolPermissions"])
+	for _, item := range permissions {
+		perm, ok := item.(map[string]any)
+		if !ok || stringOr(perm["toolName"], "") != toolName || !boolValue(perm["enabled"], true) {
+			continue
+		}
+		return normalizeMcpBehaviorString(stringOr(perm["behavior"], ""))
+	}
+	return normalizeMcpBehaviorString(stringOr(server["defaultBehavior"], ""))
+}
+
+func normalizeMcpBehaviorString(behavior string) string {
+	behavior = strings.TrimSpace(behavior)
+	if behavior == "allow" {
+		behavior = "readWrite"
+	}
+	switch behavior {
+	case "readOnly", "readWrite", "ask", "deny":
+		return behavior
+	default:
+		return ""
+	}
+}
+
+func mapMcpBehaviorToPermissionDecision(behavior string, permissionMode string) string {
+	mode := strings.TrimSpace(permissionMode)
+	if mode == "" {
+		mode = "default"
+	}
+	switch normalizeMcpBehaviorString(behavior) {
+	case "readOnly":
+		if mode == "dontAsk" {
+			return "deny"
+		}
+		return "allow"
+	case "readWrite":
+		if mode == "bypassPermissions" || mode == "acceptEdits" {
+			return "allow"
+		}
+		if mode == "readOnly" || mode == "dontAsk" {
+			return "deny"
+		}
+		return "ask"
+	case "ask":
+		if mode == "dontAsk" {
+			return "deny"
+		}
+		return "ask"
+	case "deny":
+		return "deny"
+	default:
+		return ""
+	}
+}
+
+func mcpToolAllowedForAgentContext(behavior string, info narrators.ExternalToolContext) bool {
+	behavior = normalizeMcpBehaviorString(behavior)
+	if behavior == "deny" {
+		return false
+	}
+	isSubagent := info.Type == "subagent" || info.Variant == "subagent"
+	if !isSubagent {
+		return true
+	}
+	if info.ToolAccess == "custom" {
+		// The caller checks the final mcp__ name after it is built, so keep behavior-level filtering permissive here.
+		return true
+	}
+	if info.ToolAccess == "general" || strings.TrimSpace(info.SubagentType) == "general" {
+		return true
+	}
+	return behavior == "readOnly"
+}
+
+func callMcpServerTool(parent context.Context, config map[string]any, toolName string, arguments map[string]any) (string, bool, error) {
+	if stringOr(config["transport"], "stdio") != "stdio" {
+		return "", true, fmt.Errorf("only stdio MCP transport is implemented in go_backend compatibility mode")
+	}
+	command := strings.TrimSpace(stringOr(config["command"], ""))
+	if command == "" {
+		return "", true, fmt.Errorf("stdio MCP server requires command")
+	}
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, command, stringSlice(config["args"])...)
+	if cwd := strings.TrimSpace(stringOr(config["cwd"], "")); cwd != "" {
+		cmd.Dir = cwd
+	}
+	cmd.Env = mergedEnv(config["env"])
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		return "", true, err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", true, err
+	}
+	stderr := &limitedStringBuilder{limit: 100000}
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return "", true, err
+	}
+	defer func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+	responses := make(chan map[string]any, 8)
+	readErrs := make(chan error, 1)
+	go readJSONRPCLines(ctx, stdout, responses, readErrs)
+	if err := writeJSONLine(stdin, map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{"protocolVersion": "2024-11-05", "capabilities": map[string]any{}, "clientInfo": map[string]any{"name": "narrafork-go", "version": "0.1.0"}}}); err != nil {
+		return "", true, err
+	}
+	if _, err := waitForJSONRPCID(ctx, responses, readErrs, 1); err != nil {
+		return "", true, fmt.Errorf("%s", withStderr(err, stderr.String()))
+	}
+	_ = writeJSONLine(stdin, map[string]any{"jsonrpc": "2.0", "method": "notifications/initialized", "params": map[string]any{}})
+	if err := writeJSONLine(stdin, map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": map[string]any{"name": toolName, "arguments": arguments}}); err != nil {
+		return "", true, err
+	}
+	response, err := waitForJSONRPCID(ctx, responses, readErrs, 2)
+	if err != nil {
+		return "", true, fmt.Errorf("%s", withStderr(err, stderr.String()))
+	}
+	if errObj, ok := response["error"].(map[string]any); ok {
+		return "", true, fmt.Errorf("%v", errObj["message"])
+	}
+	result, _ := response["result"].(map[string]any)
+	output, isError := mcpToolOutput(result)
+	return output, isError, nil
+}
+
+func mcpToolOutput(result map[string]any) (string, bool) {
+	builder := &limitedStringBuilder{limit: maxMCPToolOutputBytes}
+	partCount := 0
+	appendPart := func(value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		if partCount > 0 {
+			_, _ = builder.Write([]byte("\n\n"))
+		}
+		_, _ = builder.Write([]byte(value))
+		partCount++
+	}
+	for _, item := range arrayValue(result["content"]) {
+		content, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch stringOr(content["type"], "") {
+		case "text":
+			appendPart(stringOr(content["text"], ""))
+		case "image":
+			mime := stringOr(content["mimeType"], "image/png")
+			appendPart(fmt.Sprintf("[image: %s, %d bytes base64]", mime, len(stringOr(content["data"], ""))))
+		case "resource":
+			resource, _ := content["resource"].(map[string]any)
+			if text := stringOr(resource["text"], ""); text != "" {
+				appendPart(text)
+			} else {
+				appendPart("[resource: " + stringOr(resource["uri"], "unknown") + "]")
+			}
+		}
+	}
+	if partCount == 0 {
+		appendPart("(no output)")
+	}
+	output := builder.String()
+	if builder.Truncated() {
+		output += fmt.Sprintf("\n\n[truncated: MCP tool output exceeded %d bytes]", maxMCPToolOutputBytes)
+	}
+	return output, boolValue(result["isError"], false)
 }
 
 func boolValue(value any, fallback bool) bool {

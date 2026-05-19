@@ -35,13 +35,15 @@ const (
 	browserViewportHeight   = 900
 	browserUserAgent        = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-	browserDefaultSessionTTL = 10 * time.Minute
-	browserMinSessionTTL     = time.Second
-	browserMaxSessionTTL     = 24 * time.Hour
-	browserCleanupInterval   = time.Minute
-	browserMaxConsoleEntries = 200
-	browserMaxNetworkEntries = 500
-	browserMaxPostDataLength = 4_000
+	browserDefaultSessionTTL   = 10 * time.Minute
+	browserMinSessionTTL       = time.Second
+	browserMaxSessionTTL       = 24 * time.Hour
+	browserCleanupInterval     = time.Minute
+	browserMaxConsoleEntries   = 200
+	browserMaxNetworkEntries   = 500
+	browserMaxPostDataLength   = 4_000
+	browserMaxTotalSessions    = 32
+	browserMaxNarratorSessions = 8
 )
 
 var browserDefaultTraceCategories = []string{
@@ -55,10 +57,86 @@ var browserDefaultTraceCategories = []string{
 	"loading",
 }
 
+type browserExecutionContextKey struct{}
+
+// BrowserExecutionContext binds Browser tool calls to a NarraFork narrator run.
+type BrowserExecutionContext struct {
+	NarratorID string
+	ToolUseID  string
+}
+
+// ContextWithBrowserExecution stores Browser tool execution metadata in ctx.
+func ContextWithBrowserExecution(ctx context.Context, info BrowserExecutionContext) context.Context {
+	return context.WithValue(ctx, browserExecutionContextKey{}, info)
+}
+
+// BrowserExecutionFromContext returns Browser tool execution metadata from ctx.
+func BrowserExecutionFromContext(ctx context.Context) (BrowserExecutionContext, bool) {
+	info, ok := ctx.Value(browserExecutionContextKey{}).(BrowserExecutionContext)
+	return info, ok
+}
+
+type BrowserSessionSnapshot struct {
+	ID                    string
+	NarratorID            string
+	Status                string
+	URL                   string
+	Title                 string
+	Headless              bool
+	ChromePath            string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
+	LastActivity          time.Time
+	TtlMs                 int64
+	ExpiresAt             time.Time
+	NetworkCaptureEnabled bool
+	NetworkRequestCount   int
+	ConsoleMessageCount   int
+	TracingActive         bool
+	TracingStartedAt      *time.Time
+	ScreenshotMime        string
+	ScreenshotData        []byte
+	ScreenshotFilePath    string
+	TraceMetadata         map[string]any
+	Metadata              map[string]any
+	Reason                string
+}
+
+type BrowserSessionEvent struct {
+	Type     string
+	Snapshot BrowserSessionSnapshot
+}
+
+type BrowserSessionObserver interface {
+	BrowserSessionEvent(ctx context.Context, event BrowserSessionEvent)
+}
+
+var browserObserver struct {
+	sync.Mutex
+	observer BrowserSessionObserver
+}
+
+func SetBrowserSessionObserver(observer BrowserSessionObserver) {
+	browserObserver.Lock()
+	browserObserver.observer = observer
+	browserObserver.Unlock()
+}
+
+func notifyBrowserSessionEvent(ctx context.Context, eventType string, snapshot BrowserSessionSnapshot) {
+	browserObserver.Lock()
+	observer := browserObserver.observer
+	browserObserver.Unlock()
+	if observer != nil {
+		observer.BrowserSessionEvent(ctx, BrowserSessionEvent{Type: eventType, Snapshot: snapshot})
+	}
+}
+
 type browserSession struct {
 	mu sync.Mutex
 
 	ID                    string             `json:"id"`
+	NarratorID            string             `json:"narratorId,omitempty"`
+	ToolUseID             string             `json:"toolUseId,omitempty"`
 	URL                   string             `json:"url"`
 	Title                 string             `json:"title"`
 	Headless              bool               `json:"headless"`
@@ -187,9 +265,9 @@ func toolBrowser(ctx context.Context, cwd string, args map[string]any) string {
 	case "get_network":
 		return browserGetNetwork(ctx, stringValue(args["session_id"]), stringValue(args["value"]), boolValue(args["include_details"]), boolValue(args["clear"]), maxLength)
 	case "network_start":
-		return browserNetworkStart(stringValue(args["session_id"]), boolValue(args["clear"]))
+		return browserNetworkStart(ctx, stringValue(args["session_id"]), boolValue(args["clear"]))
 	case "network_stop":
-		return browserNetworkStop(stringValue(args["session_id"]))
+		return browserNetworkStop(ctx, stringValue(args["session_id"]))
 	case "evaluate":
 		return browserEvaluate(ctx, stringValue(args["session_id"]), stringValue(args["value"]), timeoutMs, maxLength)
 	case "evaluate_capture":
@@ -199,21 +277,25 @@ func toolBrowser(ctx context.Context, cwd string, args map[string]any) string {
 	case "scroll":
 		return browserScroll(ctx, stringValue(args["session_id"]), stringValue(args["selector"]), coordinate, hasCoordinate, strings.TrimSpace(stringValue(args["direction"])), intValue(args["amount"], 500), timeoutMs)
 	case "set_ttl":
-		return browserSetTTL(stringValue(args["session_id"]), intValue(args["ttl_ms"], 0))
+		return browserSetTTL(ctx, stringValue(args["session_id"]), intValue(args["ttl_ms"], 0))
 	case "list_sessions":
-		return browserListSessions()
+		return browserListSessions(ctx)
 	case "perf_start":
 		return browserPerfStart(ctx, stringValue(args["session_id"]), stringList(args["categories"]), timeoutMs)
 	case "perf_stop":
 		return browserPerfStop(ctx, cwd, stringValue(args["session_id"]), pathValue(args["file_path"]), timeoutMs)
 	case "close":
-		return browserClose(stringValue(args["session_id"]))
+		return browserClose(ctx, stringValue(args["session_id"]))
 	default:
 		return "Browser action unsupported in Go rod implementation: " + action
 	}
 }
 
 func browserLaunch(ctx context.Context, rawURL string, headless bool, ttlMs int, captureNetwork bool, timeoutMs int, maxLength int) string {
+	execInfo, _ := BrowserExecutionFromContext(ctx)
+	if err := enforceBrowserSessionLimits(execInfo.NarratorID); err != nil {
+		return err.Error()
+	}
 	if err := validateBrowserURL(rawURL); err != nil {
 		return err.Error()
 	}
@@ -268,6 +350,8 @@ func browserLaunch(ctx context.Context, rawURL string, headless bool, ttlMs int,
 	now := time.Now().UTC()
 	session := &browserSession{
 		ID:                    id.Must(8),
+		NarratorID:            strings.TrimSpace(execInfo.NarratorID),
+		ToolUseID:             strings.TrimSpace(execInfo.ToolUseID),
 		Headless:              headless,
 		ChromePath:            chromePath,
 		Browser:               browser,
@@ -296,6 +380,7 @@ func browserLaunch(ctx context.Context, rawURL string, headless bool, ttlMs int,
 	browserSessions.items[session.ID] = session
 	browserSessions.Unlock()
 	ensureBrowserCleanupTimer()
+	notifyBrowserSessionEvent(ctx, "created", session.snapshot())
 
 	text, _ := pageText(ctx, page, "", timeoutMs)
 	return jsonTool(map[string]any{
@@ -309,7 +394,7 @@ func browserLaunch(ctx context.Context, rawURL string, headless bool, ttlMs int,
 }
 
 func browserNavigate(ctx context.Context, sessionID, rawURL, direction string, timeoutMs int, maxLength int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -339,7 +424,7 @@ func browserNavigate(ctx context.Context, sessionID, rawURL, direction string, t
 }
 
 func browserDOM(ctx context.Context, sessionID, selector string, timeoutMs int, maxLength int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -368,7 +453,7 @@ func browserDOM(ctx context.Context, sessionID, selector string, timeoutMs int, 
 }
 
 func browserText(ctx context.Context, sessionID, selector string, timeoutMs int, maxLength int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -387,7 +472,7 @@ func browserClick(ctx context.Context, sessionID, selector string, coordinate br
 	if strings.TrimSpace(selector) == "" && !hasCoordinate {
 		return "selector or coordinate is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -421,7 +506,7 @@ func browserFill(ctx context.Context, sessionID, selector, value string, timeout
 	if strings.TrimSpace(selector) == "" {
 		return "selector is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -460,7 +545,7 @@ func browserSelect(ctx context.Context, sessionID, selector, value string, timeo
 	if value == "" {
 		return "value is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -488,7 +573,7 @@ func browserSelect(ctx context.Context, sessionID, selector, value string, timeo
 }
 
 func browserType(ctx context.Context, sessionID, selector, value, key string, timeoutMs int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -531,7 +616,7 @@ func browserHover(ctx context.Context, sessionID, selector string, timeoutMs int
 	if strings.TrimSpace(selector) == "" {
 		return "selector is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -552,7 +637,7 @@ func browserHover(ctx context.Context, sessionID, selector string, timeoutMs int
 }
 
 func browserScreenshot(ctx context.Context, cwd, sessionID, filePath string, fullPage bool, timeoutMs int, maxLength int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -577,6 +662,11 @@ func browserScreenshot(ctx context.Context, cwd, sessionID, filePath string, ful
 		if err := session.refreshSnapshotLocked(ctx, timeoutMs); err != nil {
 			return err.Error()
 		}
+		snapshot := session.snapshotLockedWithStatus("active", "")
+		snapshot.ScreenshotMime = "image/png"
+		snapshot.ScreenshotData = data
+		snapshot.ScreenshotFilePath = resolved
+		notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
 		return jsonTool(map[string]any{"session_id": session.ID, "mime": "image/png", "bytes": len(data), "file_path": resolved, "snapshot": session.snapshotLocked()})
 	}
 
@@ -584,6 +674,10 @@ func browserScreenshot(ctx context.Context, cwd, sessionID, filePath string, ful
 	if err := session.refreshSnapshotLocked(ctx, timeoutMs); err != nil {
 		return err.Error()
 	}
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	snapshot.ScreenshotMime = "image/png"
+	snapshot.ScreenshotData = data
+	notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
 	return jsonTool(map[string]any{
 		"session_id":      session.ID,
 		"mime":            "image/png",
@@ -602,7 +696,7 @@ func browserGetAttribute(ctx context.Context, sessionID, selector, attribute str
 	if strings.TrimSpace(attribute) == "" {
 		return "value (attribute name) is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -623,7 +717,7 @@ func browserGetAttribute(ctx context.Context, sessionID, selector, attribute str
 
 func browserGetConsole(ctx context.Context, sessionID string, clear bool, maxLength int) string {
 	_ = ctx
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -643,7 +737,7 @@ func browserGetConsole(ctx context.Context, sessionID string, clear bool, maxLen
 
 func browserGetNetwork(ctx context.Context, sessionID, filter string, includeDetails, clear bool, maxLength int) string {
 	_ = ctx
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -669,8 +763,8 @@ func browserGetNetwork(ctx context.Context, sessionID, filter string, includeDet
 	return jsonTool(map[string]any{"output": truncateString(output, maxLength), "count": len(requests), "totalCount": total, "cleared": clear, "networkCaptureEnabled": session.NetworkCaptureEnabled, "snapshot": session.snapshotLocked()})
 }
 
-func browserNetworkStart(sessionID string, clear bool) string {
-	session, err := browserRequireSession(sessionID)
+func browserNetworkStart(ctx context.Context, sessionID string, clear bool) string {
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -682,11 +776,13 @@ func browserNetworkStart(sessionID string, clear bool) string {
 	}
 	session.NetworkCaptureEnabled = true
 	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
 	return jsonTool(map[string]any{"session_id": session.ID, "networkCaptureEnabled": true, "networkRequestCount": len(session.NetworkRequests), "cleared": clear})
 }
 
-func browserNetworkStop(sessionID string) string {
-	session, err := browserRequireSession(sessionID)
+func browserNetworkStop(ctx context.Context, sessionID string) string {
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -694,6 +790,8 @@ func browserNetworkStop(sessionID string) string {
 	defer session.mu.Unlock()
 	session.NetworkCaptureEnabled = false
 	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
 	return jsonTool(map[string]any{"session_id": session.ID, "networkCaptureEnabled": false, "networkRequestCount": len(session.NetworkRequests)})
 }
 
@@ -701,7 +799,7 @@ func browserEvaluate(ctx context.Context, sessionID, expression string, timeoutM
 	if strings.TrimSpace(expression) == "" {
 		return "value is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -723,7 +821,7 @@ func browserEvaluateCapture(ctx context.Context, sessionID, expression string, c
 	if strings.TrimSpace(expression) == "" {
 		return "value is required"
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -778,7 +876,7 @@ func browserEvaluateCapture(ctx context.Context, sessionID, expression string, c
 }
 
 func browserWait(ctx context.Context, sessionID, selector, state string, timeoutMs int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -802,7 +900,7 @@ func browserScroll(ctx context.Context, sessionID, selector string, coordinate b
 	if amount <= 0 {
 		amount = 500
 	}
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -858,8 +956,8 @@ func browserScroll(ctx context.Context, sessionID, selector string, coordinate b
 	return jsonTool(map[string]any{"session_id": session.ID, "snapshot": session.snapshotLocked()})
 }
 
-func browserSetTTL(sessionID string, ttlMs int) string {
-	session, err := browserRequireSession(sessionID)
+func browserSetTTL(ctx context.Context, sessionID string, ttlMs int) string {
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -868,17 +966,21 @@ func browserSetTTL(sessionID string, ttlMs int) string {
 		return err.Error()
 	}
 	session.mu.Lock()
-	defer session.mu.Unlock()
 	session.TtlMs = int64(ttl / time.Millisecond)
 	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	ttlValue := session.TtlMs
+	expiresAt := session.LastActivity.Add(ttl)
+	session.mu.Unlock()
 	ensureBrowserCleanupTimer()
-	return jsonTool(map[string]any{"session_id": session.ID, "ttlMs": session.TtlMs, "expiresAt": session.LastActivity.Add(ttl)})
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
+	return jsonTool(map[string]any{"session_id": session.ID, "ttlMs": ttlValue, "expiresAt": expiresAt})
 }
 
 func browserPerfStart(ctx context.Context, sessionID string, categories []string, timeoutMs int) string {
 	_ = ctx
 	_ = timeoutMs
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -897,11 +999,14 @@ func browserPerfStart(ctx context.Context, sessionID string, categories []string
 		return err.Error()
 	}
 	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	snapshot.TraceMetadata = map[string]any{"status": "active", "startedAt": trace.StartedAt.UTC().Format(time.RFC3339Nano), "categories": categories}
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
 	return jsonTool(map[string]any{"session_id": session.ID, "tracingStatus": "active", "categories": categories})
 }
 
 func browserPerfStop(ctx context.Context, cwd, sessionID, filePath string, timeoutMs int) string {
-	session, err := browserRequireSession(sessionID)
+	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
@@ -931,7 +1036,8 @@ func browserPerfStop(ctx context.Context, cwd, sessionID, filePath string, timeo
 	trace.Active = false
 	session.Tracing = nil
 	session.touchLocked()
-	snapshot := session.snapshotLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	outputSnapshot := session.snapshotLocked()
 	session.mu.Unlock()
 
 	if strings.TrimSpace(filePath) == "" {
@@ -952,21 +1058,34 @@ func browserPerfStop(ctx context.Context, cwd, sessionID, filePath string, timeo
 	if err := os.WriteFile(resolved, data, 0o644); err != nil {
 		return err.Error()
 	}
-	return jsonTool(map[string]any{"session_id": session.ID, "file_path": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "snapshot": snapshot})
+	snapshot.TraceMetadata = map[string]any{"status": "stopped", "filePath": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "stoppedAt": time.Now().UTC().Format(time.RFC3339Nano)}
+	notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
+	return jsonTool(map[string]any{"session_id": session.ID, "file_path": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "snapshot": outputSnapshot})
 }
 
-func browserListSessions() string {
+func browserListSessions(ctx context.Context) string {
+	execInfo, hasExecInfo := BrowserExecutionFromContext(ctx)
 	browserSessions.Lock()
 	items := make([]*browserSession, 0, len(browserSessions.items))
+	expired := make([]*browserSession, 0)
+	now := time.Now()
 	for id, session := range browserSessions.items {
-		if session.isExpired(time.Now()) {
+		if session.isExpired(now) {
 			delete(browserSessions.items, id)
-			go session.close()
+			expired = append(expired, session)
+			continue
+		}
+		if hasExecInfo && strings.TrimSpace(execInfo.NarratorID) != "" && session.NarratorID != strings.TrimSpace(execInfo.NarratorID) {
 			continue
 		}
 		items = append(items, session)
 	}
 	browserSessions.Unlock()
+	for _, session := range expired {
+		snapshot := session.snapshotWithStatus("expired", "ttl_expired")
+		go session.close()
+		notifyBrowserSessionEvent(ctx, "expired", snapshot)
+	}
 
 	summaries := make([]browserSessionSummary, 0, len(items))
 	for _, session := range items {
@@ -995,18 +1114,12 @@ func browserListSessions() string {
 	return jsonTool(map[string]any{"sessions": summaries})
 }
 
-func browserClose(sessionID string) string {
+func browserClose(ctx context.Context, sessionID string) string {
 	if strings.TrimSpace(sessionID) == "" {
 		return "session_id is required"
 	}
-	browserSessions.Lock()
-	session, existed := browserSessions.items[sessionID]
-	delete(browserSessions.items, sessionID)
-	browserSessions.Unlock()
-	if existed {
-		session.close()
-	}
-	return jsonTool(map[string]any{"ok": existed, "closed": sessionID})
+	closed, snapshot := closeBrowserSession(ctx, "", sessionID, "closed_by_tool")
+	return jsonTool(map[string]any{"ok": closed, "closed": sessionID, "narratorId": snapshot.NarratorID})
 }
 
 func ActiveBrowserSessionIDs() []string {
@@ -1018,6 +1131,144 @@ func ActiveBrowserSessionIDs() []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+func LiveBrowserSessionSnapshots(narratorID string) []BrowserSessionSnapshot {
+	narratorID = strings.TrimSpace(narratorID)
+	browserSessions.Lock()
+	items := make([]*browserSession, 0, len(browserSessions.items))
+	for _, session := range browserSessions.items {
+		if narratorID != "" && session.NarratorID != narratorID {
+			continue
+		}
+		items = append(items, session)
+	}
+	browserSessions.Unlock()
+	snapshots := make([]BrowserSessionSnapshot, 0, len(items))
+	for _, session := range items {
+		snapshots = append(snapshots, session.snapshot())
+	}
+	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].UpdatedAt.After(snapshots[j].UpdatedAt) })
+	return snapshots
+}
+
+func CloseBrowserSession(ctx context.Context, narratorID, sessionID, reason string) bool {
+	closed, _ := closeBrowserSession(ctx, narratorID, sessionID, reason)
+	return closed
+}
+
+func SetBrowserSessionTTL(ctx context.Context, narratorID, sessionID string, ttlMs int64) (BrowserSessionSnapshot, bool, error) {
+	ttl, err := normalizeBrowserSessionTTL(time.Duration(ttlMs) * time.Millisecond)
+	if err != nil {
+		return BrowserSessionSnapshot{}, false, err
+	}
+	session, ok := liveBrowserSessionForNarrator(narratorID, sessionID)
+	if !ok {
+		return BrowserSessionSnapshot{}, false, nil
+	}
+	session.mu.Lock()
+	session.TtlMs = int64(ttl / time.Millisecond)
+	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	session.mu.Unlock()
+	ensureBrowserCleanupTimer()
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
+	return snapshot, true, nil
+}
+
+func CaptureBrowserSessionScreenshot(ctx context.Context, narratorID, sessionID string) ([]byte, BrowserSessionSnapshot, bool, error) {
+	session, ok := liveBrowserSessionForNarrator(narratorID, sessionID)
+	if !ok {
+		return nil, BrowserSessionSnapshot{}, false, nil
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	data, err := session.Page.Context(ctx).Timeout(time.Duration(browserDefaultTimeoutMs)*time.Millisecond).Screenshot(false, &proto.PageCaptureScreenshot{Format: proto.PageCaptureScreenshotFormatPng, FromSurface: true})
+	if err != nil {
+		return nil, BrowserSessionSnapshot{}, true, err
+	}
+	_ = session.refreshSnapshotLocked(ctx, browserDefaultTimeoutMs)
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	snapshot.ScreenshotMime = "image/png"
+	snapshot.ScreenshotData = data
+	notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
+	return data, snapshot, true, nil
+}
+
+func StopBrowserSessionTracing(ctx context.Context, narratorID, sessionID string) (BrowserSessionSnapshot, bool, error) {
+	session, ok := liveBrowserSessionForNarrator(narratorID, sessionID)
+	if !ok {
+		return BrowserSessionSnapshot{}, false, nil
+	}
+	session.mu.Lock()
+	trace := session.Tracing
+	if trace == nil || !trace.Active {
+		snapshot := session.snapshotLockedWithStatus("active", "")
+		session.mu.Unlock()
+		return snapshot, true, nil
+	}
+	session.mu.Unlock()
+	if err := (proto.TracingEnd{}).Call(session.Browser); err != nil {
+		return BrowserSessionSnapshot{}, true, err
+	}
+	select {
+	case <-trace.Done:
+	case <-ctx.Done():
+		return BrowserSessionSnapshot{}, true, ctx.Err()
+	case <-time.After(time.Duration(browserDefaultTimeoutMs) * time.Millisecond):
+		return BrowserSessionSnapshot{}, true, fmt.Errorf("tracing stop timed out after %dms", browserDefaultTimeoutMs)
+	}
+	session.mu.Lock()
+	trace.Active = false
+	session.Tracing = nil
+	session.touchLocked()
+	snapshot := session.snapshotLockedWithStatus("active", "")
+	snapshot.TraceMetadata = map[string]any{"status": "stopped", "stoppedAt": time.Now().UTC().Format(time.RFC3339Nano), "dataLossOccurred": trace.DataLossOccurred}
+	session.mu.Unlock()
+	notifyBrowserSessionEvent(ctx, "updated", snapshot)
+	return snapshot, true, nil
+}
+
+func liveBrowserSessionForNarrator(narratorID, sessionID string) (*browserSession, bool) {
+	narratorID = strings.TrimSpace(narratorID)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, false
+	}
+	browserSessions.Lock()
+	session, ok := browserSessions.items[sessionID]
+	browserSessions.Unlock()
+	if !ok {
+		return nil, false
+	}
+	if narratorID != "" && session.NarratorID != narratorID {
+		return nil, false
+	}
+	return session, true
+}
+
+func closeBrowserSession(ctx context.Context, narratorID, sessionID, reason string) (bool, BrowserSessionSnapshot) {
+	narratorID = strings.TrimSpace(narratorID)
+	sessionID = strings.TrimSpace(sessionID)
+	if execInfo, ok := BrowserExecutionFromContext(ctx); ok && narratorID == "" {
+		narratorID = strings.TrimSpace(execInfo.NarratorID)
+	}
+	browserSessions.Lock()
+	session, existed := browserSessions.items[sessionID]
+	if existed && narratorID != "" && session.NarratorID != narratorID {
+		session = nil
+		existed = false
+	} else if existed {
+		delete(browserSessions.items, sessionID)
+	}
+	browserSessions.Unlock()
+	if !existed || session == nil {
+		return false, BrowserSessionSnapshot{ID: sessionID, NarratorID: narratorID, Status: "not_found", Reason: "not_found"}
+	}
+	snapshot := session.snapshotWithStatus("closed", firstNonEmpty(reason, "closed"))
+	session.close()
+	notifyBrowserSessionEvent(ctx, "closed", snapshot)
+	return true, snapshot
 }
 
 func CloseAllBrowserSessions() []string {
@@ -1036,26 +1287,74 @@ func CloseAllBrowserSessions() []string {
 	browserSessions.Unlock()
 	sort.Strings(ids)
 	for _, session := range toClose {
+		snapshot := session.snapshotWithStatus("closed", "runtime_cleanup")
 		session.close()
+		notifyBrowserSessionEvent(context.Background(), "closed", snapshot)
 	}
 	return ids
 }
 
-func browserRequireSession(sessionID string) (*browserSession, error) {
+func enforceBrowserSessionLimits(narratorID string) error {
+	narratorID = strings.TrimSpace(narratorID)
+	browserSessions.Lock()
+	expired := make([]*browserSession, 0)
+	total := 0
+	for id, session := range browserSessions.items {
+		if session.isExpired(time.Now()) {
+			delete(browserSessions.items, id)
+			expired = append(expired, session)
+			continue
+		}
+		total++
+	}
+	perNarrator := 0
+	if narratorID != "" {
+		for _, session := range browserSessions.items {
+			if session.NarratorID == narratorID {
+				perNarrator++
+			}
+		}
+	}
+	browserSessions.Unlock()
+	for _, session := range expired {
+		snapshot := session.snapshotWithStatus("expired", "ttl_expired")
+		go session.close()
+		notifyBrowserSessionEvent(context.Background(), "expired", snapshot)
+	}
+	if total >= browserMaxTotalSessions {
+		return fmt.Errorf("browser session limit reached: maximum %d active sessions", browserMaxTotalSessions)
+	}
+	if narratorID != "" && perNarrator >= browserMaxNarratorSessions {
+		return fmt.Errorf("browser session limit reached for narrator: maximum %d active sessions", browserMaxNarratorSessions)
+	}
+	return nil
+}
+
+func browserRequireSession(ctx context.Context, sessionID string) (*browserSession, error) {
 	if strings.TrimSpace(sessionID) == "" {
 		return nil, errors.New("session_id is required")
 	}
+	execInfo, hasExecInfo := BrowserExecutionFromContext(ctx)
+	narratorID := strings.TrimSpace(execInfo.NarratorID)
 	browserSessions.Lock()
 	session, ok := browserSessions.items[sessionID]
+	expired := false
 	if ok && session.isExpired(time.Now()) {
 		delete(browserSessions.items, sessionID)
-		browserSessions.Unlock()
-		session.close()
-		return nil, errors.New("browser session not found or expired")
+		expired = true
 	}
 	browserSessions.Unlock()
+	if expired {
+		snapshot := session.snapshotWithStatus("expired", "ttl_expired")
+		session.close()
+		notifyBrowserSessionEvent(ctx, "expired", snapshot)
+		return nil, errors.New("browser session not found or expired")
+	}
 	if !ok {
 		return nil, errors.New("browser session not found")
+	}
+	if hasExecInfo && narratorID != "" && session.NarratorID != narratorID {
+		return nil, errors.New("browser session belongs to a different narrator")
 	}
 	return session, nil
 }
@@ -1282,6 +1581,51 @@ func (s *browserSession) touchLocked() {
 
 func (s *browserSession) snapshotLocked() map[string]any {
 	return map[string]any{"url": s.URL, "title": s.Title}
+}
+
+func (s *browserSession) snapshot() BrowserSessionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotLockedWithStatus("active", "")
+}
+
+func (s *browserSession) snapshotWithStatus(status, reason string) BrowserSessionSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshotLockedWithStatus(status, reason)
+}
+
+func (s *browserSession) snapshotLockedWithStatus(status, reason string) BrowserSessionSnapshot {
+	if status == "" {
+		status = "active"
+	}
+	traceActive := false
+	var traceStarted *time.Time
+	if s.Tracing != nil && s.Tracing.Active {
+		traceActive = true
+		started := s.Tracing.StartedAt.UTC()
+		traceStarted = &started
+	}
+	return BrowserSessionSnapshot{
+		ID:                    s.ID,
+		NarratorID:            s.NarratorID,
+		Status:                status,
+		URL:                   s.URL,
+		Title:                 s.Title,
+		Headless:              s.Headless,
+		ChromePath:            s.ChromePath,
+		CreatedAt:             s.CreatedAt,
+		UpdatedAt:             s.UpdatedAt,
+		LastActivity:          s.LastActivity,
+		TtlMs:                 s.TtlMs,
+		ExpiresAt:             s.LastActivity.Add(time.Duration(s.TtlMs) * time.Millisecond),
+		NetworkCaptureEnabled: s.NetworkCaptureEnabled,
+		NetworkRequestCount:   len(s.NetworkRequests),
+		ConsoleMessageCount:   len(s.ConsoleMessages),
+		TracingActive:         traceActive,
+		TracingStartedAt:      traceStarted,
+		Reason:                reason,
+	}
 }
 
 func (s *browserSession) isExpired(now time.Time) bool {
@@ -1769,7 +2113,9 @@ func browserCleanupTick() {
 	}
 	browserSessions.Unlock()
 	for _, session := range toClose {
+		snapshot := session.snapshotWithStatus("expired", "ttl_expired")
 		session.close()
+		notifyBrowserSessionEvent(context.Background(), "expired", snapshot)
 	}
 }
 

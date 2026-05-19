@@ -14,13 +14,24 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-
-	"github.com/creack/pty"
 )
 
 type Broadcaster func(terminalID string, payload any)
+
+type terminalProcess interface {
+	io.Reader
+	io.Writer
+	Close() error
+	Resize(cols, rows int) error
+	PID() int
+	Wait() int
+	KillTree(ctx context.Context)
+}
+
+type terminalProcessStarter func(ctx context.Context, command string, args []string, cwd string, env []string, cols, rows int) (terminalProcess, error)
+
+var startTerminalProcess terminalProcessStarter = startPlatformTerminal
 
 type Manager struct {
 	DB        *sql.DB
@@ -37,8 +48,7 @@ type Manager struct {
 
 type Session struct {
 	id          string
-	cmd         *exec.Cmd
-	file        *os.File
+	proc        terminalProcess
 	done        chan struct{}
 	mu          sync.Mutex
 	buf         bytes.Buffer
@@ -118,14 +128,14 @@ func (m *Manager) ensureExisting(ctx context.Context, terminalID string, cols, r
 	existing.mu.Lock()
 	existing.cols = cols
 	existing.rows = rows
-	file := existing.file
+	proc := existing.proc
 	useDtach := existing.useDtach
 	socketPath := existing.dtachSocket
 	orphan := existing.orphan
 	existing.mu.Unlock()
 
-	if file != nil && !orphan {
-		_ = pty.Setsize(file, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	if proc != nil && !orphan {
+		_ = proc.Resize(cols, rows)
 		return nil
 	}
 	if useDtach && socketPath != "" && m.dtachAvailableNow() && m.isDtachSocketAlive(ctx, terminalID, socketPath) {
@@ -148,10 +158,10 @@ func (m *Manager) Write(ctx context.Context, terminalID string, data string) err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.file == nil || s.orphan {
+	if s.proc == nil || s.orphan {
 		return errors.New("terminal session is not attached")
 	}
-	_, err := s.file.Write([]byte(data))
+	_, err := s.proc.Write([]byte(data))
 	return err
 }
 
@@ -169,21 +179,21 @@ func (m *Manager) Resize(ctx context.Context, terminalID string, cols, rows int)
 	s.mu.Lock()
 	s.cols = cols
 	s.rows = rows
-	file := s.file
+	proc := s.proc
 	useDtach := s.useDtach
 	pid := 0
-	if s.cmd != nil && s.cmd.Process != nil {
-		pid = s.cmd.Process.Pid
+	if proc != nil {
+		pid = proc.PID()
 	}
 	s.mu.Unlock()
-	if file == nil {
+	if proc == nil {
 		return nil
 	}
-	if err := pty.Setsize(file, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}); err != nil {
+	if err := proc.Resize(cols, rows); err != nil {
 		return err
 	}
-	if useDtach && pid > 0 && runtime.GOOS != "windows" {
-		_ = syscall.Kill(pid, syscall.SIGWINCH)
+	if useDtach && pid > 0 {
+		signalTerminalResize(pid)
 	}
 	return nil
 }
@@ -194,19 +204,19 @@ func (m *Manager) Kill(ctx context.Context, terminalID string) error {
 		s.mu.Lock()
 		useDtach := s.useDtach
 		socketPath := s.dtachSocket
-		pid := 0
-		if s.cmd != nil && s.cmd.Process != nil {
-			pid = s.cmd.Process.Pid
-		}
-		file := s.file
+		proc := s.proc
 		s.mu.Unlock()
 		if useDtach && socketPath != "" {
 			m.killDtachSession(ctx, terminalID, socketPath)
-		} else if pid > 0 {
-			m.killProcessTree(ctx, pid)
+		} else if proc != nil {
+			if pid := proc.PID(); pid > 0 {
+				m.killProcessTree(ctx, pid)
+			} else {
+				proc.KillTree(ctx)
+			}
 		}
-		if file != nil {
-			_ = file.Close()
+		if proc != nil {
+			_ = proc.Close()
 		}
 	}
 	if s == nil && m.dtachAvailableNow() {
@@ -278,15 +288,11 @@ func (m *Manager) StopAll() {
 		s.mu.Lock()
 		useDtach := s.useDtach
 		socketPath := s.dtachSocket
-		file := s.file
-		pid := 0
-		if s.cmd != nil && s.cmd.Process != nil {
-			pid = s.cmd.Process.Pid
-		}
+		proc := s.proc
 		s.mu.Unlock()
 		if useDtach {
-			if file != nil {
-				_ = file.Close()
+			if proc != nil {
+				_ = proc.Close()
 			}
 			if socketPath != "" && m.isDtachSocketAlive(context.Background(), s.id, socketPath) {
 				m.markOrphan(context.Background(), s.id)
@@ -295,11 +301,13 @@ func (m *Manager) StopAll() {
 			}
 			continue
 		}
-		if pid > 0 {
-			m.killProcessTree(context.Background(), pid)
-		}
-		if file != nil {
-			_ = file.Close()
+		if proc != nil {
+			if pid := proc.PID(); pid > 0 {
+				m.killProcessTree(context.Background(), pid)
+			} else {
+				proc.KillTree(context.Background())
+			}
+			_ = proc.Close()
 		}
 		m.markExited(context.Background(), s.id, -1)
 		m.emit(s.id, map[string]any{"type": "exit", "terminalId": s.id, "code": -1})
@@ -374,21 +382,20 @@ func (m *Manager) RecoverOnStartup(ctx context.Context) error {
 }
 
 func (m *Manager) Capabilities() map[string]any {
+	caps := platformTerminalCapabilities()
+	if caps == nil {
+		caps = map[string]any{}
+	}
 	dtachSupported := runtime.GOOS != "windows"
-	caps := map[string]any{
-		"supported":             runtime.GOOS != "windows",
-		"directPty":             runtime.GOOS != "windows",
-		"dtachSupported":        dtachSupported,
-		"dtachAvailable":        dtachSupported && m.dtachAvailableNow(),
-		"detachedReattach":      dtachSupported && m.dtachAvailableNow(),
-		"scrollbackReplay":      true,
-		"bufferStateReplay":     true,
-		"maxSnapshotBytes":      maxSnapshotBytes,
-		"multiClientResizeMode": "last-input-client",
+	if _, ok := caps["dtachSupported"]; !ok {
+		caps["dtachSupported"] = dtachSupported
 	}
-	if runtime.GOOS == "windows" {
-		caps["reason"] = "Go terminal PTY runtime is not enabled on Windows; use the TypeScript backend or a Unix-like host for interactive terminals."
-	}
+	caps["dtachAvailable"] = dtachSupported && m.dtachAvailableNow()
+	caps["detachedReattach"] = dtachSupported && m.dtachAvailableNow()
+	caps["scrollbackReplay"] = true
+	caps["bufferStateReplay"] = true
+	caps["maxSnapshotBytes"] = maxSnapshotBytes
+	caps["multiClientResizeMode"] = "last-input-client"
 	return caps
 }
 
@@ -451,7 +458,7 @@ func (m *Manager) ShellPID(terminalID string) (int, bool) {
 	s.mu.Lock()
 	useDtach := s.useDtach
 	socketPath := s.dtachSocket
-	cmd := s.cmd
+	proc := s.proc
 	s.mu.Unlock()
 	if useDtach && socketPath != "" {
 		if pid := m.dtachShellPID(context.Background(), socketPath); pid > 0 {
@@ -459,10 +466,10 @@ func (m *Manager) ShellPID(terminalID string) (int, bool) {
 		}
 		return 0, false
 	}
-	if cmd == nil || cmd.Process == nil {
+	if proc == nil || proc.PID() <= 0 {
 		return 0, false
 	}
-	return cmd.Process.Pid, true
+	return proc.PID(), true
 }
 
 func (m *Manager) get(terminalID string) *Session {
@@ -472,20 +479,9 @@ func (m *Manager) get(terminalID string) *Session {
 }
 
 func (m *Manager) startDirect(ctx context.Context, terminalID, cwd string, cols, rows int, existing *Session) error {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
-	args := []string{}
-	if runtime.GOOS == "windows" {
-		shell = "cmd.exe"
-	} else {
-		args = []string{"-l"}
-	}
-	cmd := exec.CommandContext(context.Background(), shell, args...)
-	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	command, args := defaultTerminalCommand()
+	env := append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
+	proc, err := startTerminalProcess(ctx, command, args, cwd, env, cols, rows)
 	if err != nil {
 		return err
 	}
@@ -494,8 +490,7 @@ func (m *Manager) startDirect(ctx context.Context, terminalID, cwd string, cols,
 		session = &Session{id: terminalID, done: make(chan struct{})}
 	}
 	session.mu.Lock()
-	session.cmd = cmd
-	session.file = ptmx
+	session.proc = proc
 	session.cols = cols
 	session.rows = rows
 	session.useDtach = false
@@ -503,26 +498,24 @@ func (m *Manager) startDirect(ctx context.Context, terminalID, cwd string, cols,
 	session.orphan = false
 	session.done = make(chan struct{})
 	session.mu.Unlock()
-	if err := m.storeSession(terminalID, session, ptmx, cmd, cols, rows); err != nil {
+	if err := m.storeSession(terminalID, session, proc, cols, rows); err != nil {
 		return err
 	}
 	if m.DB != nil {
 		if _, err := m.DB.ExecContext(ctx, `UPDATE terminals SET status = 'running', exit_code = NULL, dtach_socket = NULL WHERE id = ?`, terminalID); err != nil {
-			m.cleanupFailedStart(terminalID, session, ptmx, cmd)
+			m.cleanupFailedStart(terminalID, session, proc)
 			return err
 		}
 	}
 	m.emit(terminalID, map[string]any{"type": "requestResize", "terminalId": terminalID})
-	go m.readLoop(session, ptmx)
-	go m.waitLoop(session, cmd, ptmx, false)
+	go m.readLoop(session, proc)
+	go m.waitLoop(session, proc, false)
 	return nil
 }
 
 func (m *Manager) attachDtach(ctx context.Context, terminalID, socketPath string, cols, rows int, existing *Session) error {
-	cmd := exec.CommandContext(context.Background(), "sh", "-c", `stty -echoctl 2>/dev/null; exec dtach -a "$1" -z`, "_", socketPath)
-	cmd.Dir = "."
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+	env := append(os.Environ(), "TERM=xterm-256color", "COLORTERM=truecolor")
+	proc, err := startTerminalProcess(ctx, "sh", []string{"-c", `stty -echoctl 2>/dev/null; exec dtach -a "$1" -z`, "_", socketPath}, ".", env, cols, rows)
 	if err != nil {
 		return err
 	}
@@ -531,8 +524,7 @@ func (m *Manager) attachDtach(ctx context.Context, terminalID, socketPath string
 		session = &Session{id: terminalID, done: make(chan struct{})}
 	}
 	session.mu.Lock()
-	session.cmd = cmd
-	session.file = ptmx
+	session.proc = proc
 	session.cols = cols
 	session.rows = rows
 	session.useDtach = true
@@ -540,48 +532,53 @@ func (m *Manager) attachDtach(ctx context.Context, terminalID, socketPath string
 	session.orphan = false
 	session.done = make(chan struct{})
 	session.mu.Unlock()
-	if err := m.storeSession(terminalID, session, ptmx, cmd, cols, rows); err != nil {
+	if err := m.storeSession(terminalID, session, proc, cols, rows); err != nil {
 		return err
 	}
 	if m.DB != nil {
 		if _, err := m.DB.ExecContext(ctx, `UPDATE terminals SET status = 'running', exit_code = NULL, dtach_socket = ? WHERE id = ?`, socketPath, terminalID); err != nil {
-			m.cleanupFailedStart(terminalID, session, ptmx, cmd)
+			m.cleanupFailedStart(terminalID, session, proc)
 			return err
 		}
 	}
 	m.emit(terminalID, map[string]any{"type": "requestResize", "terminalId": terminalID})
-	go m.readLoop(session, ptmx)
-	go m.waitLoop(session, cmd, ptmx, true)
+	go m.readLoop(session, proc)
+	go m.waitLoop(session, proc, true)
 	return nil
 }
 
-func (m *Manager) cleanupFailedStart(terminalID string, session *Session, ptmx *os.File, cmd *exec.Cmd) {
+func (m *Manager) cleanupFailedStart(terminalID string, session *Session, proc terminalProcess) {
 	m.mu.Lock()
 	if m.sessions[terminalID] == session {
 		delete(m.sessions, terminalID)
 	}
 	m.mu.Unlock()
-	_ = ptmx.Close()
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
+	if proc != nil {
+		if pid := proc.PID(); pid > 0 {
+			m.killProcessTree(context.Background(), pid)
+		} else {
+			proc.KillTree(context.Background())
+		}
+		_ = proc.Close()
 	}
+
 }
 
-func (m *Manager) storeSession(terminalID string, session *Session, ptmx *os.File, cmd *exec.Cmd, cols, rows int) error {
+func (m *Manager) storeSession(terminalID string, session *Session, proc terminalProcess, cols, rows int) error {
 	m.mu.Lock()
 	if existing, ok := m.sessions[terminalID]; ok && existing != session {
 		m.mu.Unlock()
-		_ = ptmx.Close()
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		if proc != nil {
+			proc.KillTree(context.Background())
+			_ = proc.Close()
 		}
 		existing.mu.Lock()
 		existing.cols = cols
 		existing.rows = rows
-		file := existing.file
+		existingProc := existing.proc
 		existing.mu.Unlock()
-		if file != nil {
-			_ = pty.Setsize(file, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
+		if existingProc != nil {
+			_ = existingProc.Resize(cols, rows)
 		}
 		return nil
 	}
@@ -590,10 +587,10 @@ func (m *Manager) storeSession(terminalID string, session *Session, ptmx *os.Fil
 	return nil
 }
 
-func (m *Manager) readLoop(s *Session, file *os.File) {
+func (m *Manager) readLoop(s *Session, proc terminalProcess) {
 	buf := make([]byte, 8192)
 	for {
-		n, err := file.Read(buf)
+		n, err := proc.Read(buf)
 		if n > 0 {
 			data := string(buf[:n])
 			s.mu.Lock()
@@ -620,23 +617,14 @@ func (s *Session) appendBufferLocked(data string) {
 	}
 }
 
-func (m *Manager) waitLoop(s *Session, cmd *exec.Cmd, file *os.File, attachOnly bool) {
-	err := cmd.Wait()
-	exitCode := 0
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			exitCode = exitErr.ExitCode()
-		} else {
-			exitCode = 1
-		}
-	}
-	_ = file.Close()
+func (m *Manager) waitLoop(s *Session, proc terminalProcess, attachOnly bool) {
+	exitCode := proc.Wait()
+	_ = proc.Close()
 
 	if attachOnly {
 		s.mu.Lock()
-		if s.cmd == cmd {
-			s.cmd = nil
-			s.file = nil
+		if s.proc == proc {
+			s.proc = nil
 			s.orphan = true
 		}
 		socketPath := s.dtachSocket
@@ -930,18 +918,6 @@ func (s processSnapshot) descendants(pid int) []int {
 		queue = append(queue, s.children[child]...)
 	}
 	return out
-}
-
-func (m *Manager) killProcessTree(ctx context.Context, pid int) {
-	if pid <= 0 || runtime.GOOS == "windows" {
-		return
-	}
-	snapshot := m.processSnapshot(ctx)
-	descendants := snapshot.descendants(pid)
-	for i := len(descendants) - 1; i >= 0; i-- {
-		_ = syscall.Kill(descendants[i], syscall.SIGKILL)
-	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
 }
 
 func atoi(value string) int {

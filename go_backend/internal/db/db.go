@@ -3,66 +3,133 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
+var ErrPostgresDriverUnavailable = errors.New("postgres driver unavailable")
+
 type Store struct {
-	SQL  *sql.DB
-	Path string
+	SQL         *sql.DB
+	RuntimeSQL  *sql.DB
+	Path        string
+	RuntimePath string
+	Engine      Engine
+	Dialect     Dialect
+	Config      Config
 }
 
 func Open(ctx context.Context) (*Store, error) {
-	home, err := os.UserHomeDir()
+	cfg, err := NewConfig(ConfigInput{})
 	if err != nil {
-		return nil, fmt.Errorf("resolve home directory: %w", err)
+		return nil, err
 	}
-	dir := filepath.Join(home, ".narrafork")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("create database directory: %w", err)
-	}
-	path := filepath.Join(dir, "narrafork.db")
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("canonical TypeScript database does not exist at %s; start the TypeScript backend once to create and migrate it before using go_backend", path)
-		}
-		return nil, fmt.Errorf("stat database: %w", err)
-	}
-	sqlDB, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
-	sqlDB.SetConnMaxLifetime(0)
+	return OpenWithConfig(ctx, cfg)
+}
 
-	store := &Store{SQL: sqlDB, Path: path}
+func OpenWithConfig(ctx context.Context, cfg Config) (*Store, error) {
+	cfg, err := cfg.normalized()
+	if err != nil {
+		return nil, err
+	}
+	dialect, err := NewDialect(cfg.Engine)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Engine == EngineSQLite {
+		if err := ensureSQLiteDatabaseFile(cfg.SQLitePath, cfg.SQLiteBootstrapMode); err != nil {
+			return nil, err
+		}
+	}
+	if cfg.Engine == EnginePostgres && !sqlDriverRegistered(dialect.DriverName()) {
+		return nil, fmt.Errorf("%w: driver %q is not registered; add github.com/jackc/pgx/v5/stdlib when module downloads are available", ErrPostgresDriverUnavailable, dialect.DriverName())
+	}
+	sqlDB, err := sql.Open(dialect.DriverName(), cfg.DataSourceName())
+	if err != nil {
+		return nil, fmt.Errorf("open %s database: %w", cfg.Engine, err)
+	}
+	sqlDB.SetMaxOpenConns(cfg.MaxOpenConns)
+	sqlDB.SetMaxIdleConns(cfg.MaxIdleConns)
+	sqlDB.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+
+	store := &Store{
+		SQL:     sqlDB,
+		Path:    cfg.DisplayName(),
+		Engine:  cfg.Engine,
+		Dialect: dialect,
+		Config:  cfg,
+	}
+	if cfg.Engine == EngineSQLite {
+		runtimeDB, runtimePath, err := openSQLiteRuntimeSidecar(ctx, cfg.SQLitePath)
+		if err != nil {
+			_ = sqlDB.Close()
+			return nil, err
+		}
+		store.RuntimeSQL = runtimeDB
+		store.RuntimePath = runtimePath
+	}
 	if err := store.configure(ctx); err != nil {
-		_ = sqlDB.Close()
+		_ = store.Close()
 		return nil, err
 	}
-	// The Go compatibility backend must use the database schema created by the
-	// original TypeScript/Bun backend. This verifier is read-only and intentionally
-	// refuses to repair missing schema objects from Go.
-	if err := store.VerifyCanonicalSchema(ctx); err != nil {
-		_ = sqlDB.Close()
-		return nil, err
-	}
-	// After schema readiness passes, record Go's compatibility view in a
-	// namespaced journal table. This does not execute Drizzle SQL or mutate any
-	// TS-owned business schema object.
-	if err := store.EnsureMigrationCompatibility(ctx); err != nil {
-		_ = sqlDB.Close()
-		return nil, err
+	if cfg.Engine == EngineSQLite && cfg.TSOwnedSchema && cfg.VerifyCanonical {
+		if cfg.SQLiteBootstrapMode == SQLiteBootstrapModeBunFinalCompatible {
+			if err := store.BootstrapSQLiteBunFinalCompatible(ctx); err != nil {
+				_ = store.Close()
+				return nil, err
+			}
+		}
+		if err := store.VerifyCanonicalSchema(ctx); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
+		if err := store.EnsureMigrationCompatibility(ctx); err != nil {
+			_ = store.Close()
+			return nil, err
+		}
 	}
 	return store, nil
 }
 
+func sqlDriverRegistered(name string) bool {
+	for _, registered := range sql.Drivers() {
+		if registered == name {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureSQLiteDatabaseFile(path string, mode SQLiteBootstrapMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create database directory: %w", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			if mode == SQLiteBootstrapModeReadOnly {
+				return fmt.Errorf("canonical TypeScript database does not exist at %s; start the TypeScript backend once to create and migrate it before using go_backend", path)
+			}
+			return nil
+		}
+		return fmt.Errorf("stat database: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) configure(ctx context.Context) error {
+	if s.Engine == EnginePostgres {
+		if err := s.SQL.PingContext(ctx); err != nil {
+			return fmt.Errorf("ping postgres database: %w", err)
+		}
+		if err := SetPostgresSearchPath(ctx, s.SQL, s.Config.PostgresSchema); err != nil {
+			return fmt.Errorf("set postgres search_path: %w", err)
+		}
+		return nil
+	}
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA foreign_keys = ON",
@@ -77,10 +144,21 @@ func (s *Store) configure(ctx context.Context) error {
 }
 
 func (s *Store) Close() error {
-	if s == nil || s.SQL == nil {
+	if s == nil {
 		return nil
 	}
-	return s.SQL.Close()
+	var firstErr error
+	if s.SQL != nil {
+		if err := s.SQL.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if s.RuntimeSQL != nil && s.RuntimeSQL != s.SQL {
+		if err := s.RuntimeSQL.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func NowISO() string {

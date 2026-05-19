@@ -27,7 +27,8 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 		VALUES
 		('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', ?, NULL, 1, 'anchor1', 10, 20, 0, 'stale', 1, '2026-01-01', '2026-01-01'),
 		('c2', 'p1', 'Chapter 2', 'active', 'feature', 'branch', NULL, NULL, 0, NULL, 0, 0, 4, 'cached', 0, '2026-01-01', '2026-01-01'),
-		('c3', 'p1', 'Chapter 3', 'active', 'other', 'branch', NULL, '{"composeFile":"compose.yml"}', 0, NULL, 0, 0, 4, 'cached', 0, '2026-01-01', '2026-01-01')`, repoPath)
+		('c3', 'p1', 'Chapter 3', 'active', 'other', 'branch', NULL, '{"composeFile":"compose.yml"}', 0, NULL, 0, 0, 4, 'cached', 0, '2026-01-01', '2026-01-01'),
+		('c4', 'p1', 'Chapter 4', 'active', 'removed', 'branch', NULL, NULL, 0, NULL, 0, 0, 0, NULL, 0, '2026-01-01', '2026-01-01')`, repoPath)
 	if err != nil {
 		t.Fatalf("insert chapters: %v", err)
 	}
@@ -40,7 +41,8 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	_, err = sqlDB.Exec(`INSERT INTO container_instances (id, chapter_id, service_name, status, created_at, updated_at) VALUES
 		('ci1', 'c1', 'app', 'running', 'now', 'now'),
 		('ci2', 'c2', 'worker', 'paused', 'now', 'now'),
-		('ci3', 'c3', 'db', 'stopped', 'now', 'now')`)
+		('ci3', 'c3', 'db', 'stopped', 'now', 'now'),
+		('ci4', 'c4', 'cache', 'removed', 'now', 'now')`)
 	if err != nil {
 		t.Fatalf("insert containers: %v", err)
 	}
@@ -50,14 +52,18 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("insert terminals: %v", err)
 	}
+	_, err = sqlDB.Exec(`INSERT INTO chapter_edges (id, project_id, source_id, target_id, type, metadata, created_at) VALUES ('e1', 'p1', 'c1', 'c2', 'dependency', '{"lastSyncedCommit":"stale"}', 'now')`)
+	if err != nil {
+		t.Fatalf("insert dependency edge: %v", err)
+	}
 
 	body := serveGraphRequest(t, NewHandler(sqlDB, gitx.NewService()), http.MethodGet, "/p1/graph", "")
 	if body["degraded"] != false {
 		t.Fatalf("complete graph response should not be degraded: %#v", body)
 	}
 	nodes := body["nodes"].([]any)
-	if len(nodes) != 3 {
-		t.Fatalf("nodes len = %d, want 3; body=%#v", len(nodes), body)
+	if len(nodes) != 4 {
+		t.Fatalf("nodes len = %d, want 4; body=%#v", len(nodes), body)
 	}
 	byID := map[string]map[string]any{}
 	for _, raw := range nodes {
@@ -85,26 +91,49 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	if c2Data["hasContainers"] != true {
 		t.Fatalf("paused container instance should set hasContainers=true, got %#v", c2Data["hasContainers"])
 	}
+	if c2Data["hasUpstreamUpdates"] != true {
+		t.Fatalf("dependency edge should surface upstream updates, got %#v", c2Data["hasUpstreamUpdates"])
+	}
 	c3Data := byID["c3"]["data"].(map[string]any)
-	if c3Data["hasContainers"] != false {
-		t.Fatalf("stopped container/config-only chapter should not set hasContainers, got %#v", c3Data["hasContainers"])
+	if c3Data["hasContainers"] != true {
+		t.Fatalf("stopped container instance should still count as present, got %#v", c3Data["hasContainers"])
+	}
+	c4Data := byID["c4"]["data"].(map[string]any)
+	if c4Data["hasContainers"] != false {
+		t.Fatalf("removed container instance should not count as present, got %#v", c4Data["hasContainers"])
 	}
 	capabilities := body["capabilities"].(map[string]any)
 	split := capabilities["split"].(map[string]any)
-	if split["supported"] != false || split["code"] != "FEATURE_DISABLED" || split["mode"] != "disabled-before-mutation" {
-		t.Fatalf("split capability should expose disabled fallback, got %#v", split)
+	if split["supported"] != true || split["fallback"] != false || split["mode"] != "go-basic-split" {
+		t.Fatalf("split capability should expose supported core split, got %#v", split)
+	}
+	if split["routes"].(map[string]any)["splitAtCommit"] != true {
+		t.Fatalf("split capability should expose splitAtCommit route support, got %#v", split)
+	}
+	partials := split["partials"].(map[string]any)
+	compressed := partials["compressedAISummary"].(map[string]any)
+	if compressed["supported"] != false || compressed["fallback"] != true || compressed["mode"] != "deterministic-summary-placeholder" {
+		t.Fatalf("compressed split AI summary should be explicit fallback, got %#v", compressed)
+	}
+	containerAutostart := partials["containerAutostart"].(map[string]any)
+	if containerAutostart["supported"] != true || containerAutostart["fallback"] != false || containerAutostart["mode"] != "background-start" {
+		t.Fatalf("split container autostart capability mismatch: %#v", containerAutostart)
 	}
 	commitSync := capabilities["commitSync"].(map[string]any)
-	if commitSync["supported"] != true || commitSync["manualRecordingSupported"] != true || commitSync["worktreeWatcher"] != true || commitSync["backgroundSync"] != true || commitSync["graphReadRefresh"] != true || commitSync["fallback"] != false || commitSync["mode"] != "manual-route-graph-read-and-worktree-watcher" {
+	if commitSync["supported"] != true || commitSync["manualRecordingSupported"] != true || commitSync["worktreeWatcher"] != true || commitSync["backgroundSync"] != true || commitSync["graphReadRefresh"] != true || commitSync["fallback"] != false || commitSync["mode"] != "manual-route-lightweight-graph-read-and-worktree-watcher" {
 		t.Fatalf("commit-sync capability metadata missing: %#v", commitSync)
 	}
 	events := commitSync["events"].([]any)
 	if len(events) != 3 || events[0] != "git_status" || events[1] != "commits_updated" || events[2] != "commit_sync_error" {
 		t.Fatalf("commit-sync events should be explicit and stable, got %#v", events)
 	}
+	sources := commitSync["sources"].([]any)
+	if len(sources) != 2 || sources[0] != "manual" || sources[1] != "watcher" {
+		t.Fatalf("commit-sync sources should avoid read-path internal values, got %#v", sources)
+	}
 	upstream := capabilities["upstreamUpdates"].(map[string]any)
-	if upstream["supported"] != false || upstream["fallback"] != true || upstream["field"] != "nodes[].data.hasUpstreamUpdates" {
-		t.Fatalf("upstream update capability should explain hasUpstreamUpdates fallback, got %#v", upstream)
+	if upstream["supported"] != true || upstream["fallback"] != false || upstream["field"] != "nodes[].data.hasUpstreamUpdates" {
+		t.Fatalf("upstream update capability should be supported, got %#v", upstream)
 	}
 	edgeCaps := capabilities["chapterEdges"].(map[string]any)
 	manualCreateTypes := edgeCaps["manualCreateTypes"].([]any)
@@ -128,6 +157,49 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	}
 	if storedHead != head || storedCount != 2 {
 		t.Fatalf("DB git metadata not refreshed: head=%q count=%d", storedHead, storedCount)
+	}
+	var syncedCommits int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'c1'`).Scan(&syncedCommits); err != nil {
+		t.Fatalf("count graph synced commits: %v", err)
+	}
+	if syncedCommits != 0 {
+		t.Fatalf("graph read refresh should not write commit rows, count=%d", syncedCommits)
+	}
+}
+
+func TestGraphRouteOnlyUsesLightweightGitMetadataRefresh(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	worktree := t.TempDir()
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, worktree_path, is_root, axis_offset, cross_offset, commit_count, head_commit_sha, panel_expanded, created_at, updated_at)
+		VALUES ('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', ?, 1, 1, 2, 0, 'stale', 0, 'now', 'now')`, worktree); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	logPath := prependFakeGraphGit(t)
+
+	body := serveGraphRequest(t, NewHandler(sqlDB, gitx.NewService()), http.MethodGet, "/p1/graph", "")
+	if body["degraded"] != false {
+		t.Fatalf("lightweight graph response should not be degraded: %#v", body)
+	}
+	nodes := body["nodes"].([]any)
+	data := nodes[0].(map[string]any)["data"].(map[string]any)
+	if data["headCommitSha"] != "abc123" || data["commitCount"] != float64(12) {
+		t.Fatalf("expected fake head/count, got %#v", data)
+	}
+	commands := readGraphTestFile(t, logPath)
+	if !strings.Contains(commands, "rev-parse HEAD") || !strings.Contains(commands, "rev-list --count HEAD") {
+		t.Fatalf("graph read did not perform expected lightweight git commands:\n%s", commands)
+	}
+	for _, forbidden := range []string{"log ", "show ", "diff "} {
+		if strings.Contains(commands, forbidden) {
+			t.Fatalf("graph read should not run heavy git command %q:\n%s", forbidden, commands)
+		}
+	}
+	var syncedCommits int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'c1'`).Scan(&syncedCommits); err != nil {
+		t.Fatalf("count graph commit rows: %v", err)
+	}
+	if syncedCommits != 0 {
+		t.Fatalf("lightweight graph read should not insert chapter_commits, count=%d", syncedCommits)
 	}
 }
 
@@ -237,6 +309,7 @@ func newGraphTestDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	stmts := []string{
 		`CREATE TABLE chapters (
@@ -255,6 +328,7 @@ func newGraphTestDB(t *testing.T) *sql.DB {
 			id TEXT PRIMARY KEY, chapter_id TEXT, service_name TEXT, status TEXT, created_at TEXT, updated_at TEXT
 		)`,
 		`CREATE TABLE chapter_edges (id TEXT PRIMARY KEY, project_id TEXT, source_id TEXT, target_id TEXT, type TEXT, metadata TEXT, created_at TEXT)`,
+		`CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, chapter_id TEXT, sha TEXT, message TEXT, full_message TEXT, author_name TEXT, author_email TEXT, authored_at TEXT, source TEXT, narrator_id TEXT, narrator_message_id TEXT, files_changed INTEGER, lines_added INTEGER, lines_removed INTEGER, created_at TEXT)`,
 		`CREATE TABLE exploration_groups (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, description TEXT, base_chapter_id TEXT, status TEXT, decided_chapter_id TEXT, created_at TEXT, updated_at TEXT)`,
 		`CREATE TABLE terminals (id TEXT PRIMARY KEY, chapter_id TEXT, name TEXT, status TEXT, graph_opened INTEGER, graph_x REAL, graph_y REAL, graph_width REAL, graph_height REAL, created_at TEXT)`,
 	}
@@ -304,6 +378,35 @@ func gitOutput(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
+}
+
+func prependFakeGraphGit(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "git.log")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "` + logPath + `"
+if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then echo "abc123"; exit 0; fi
+if [ "$1" = "rev-list" ] && [ "$2" = "--count" ] && [ "$3" = "HEAD" ]; then echo "12"; exit 0; fi
+if [ "$1" = "log" ] || [ "$1" = "show" ] || [ "$1" = "diff" ]; then echo "heavy git command blocked" >&2; exit 97; fi
+echo "unexpected git command: $*" >&2
+exit 1
+`
+	path := filepath.Join(dir, "git")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func readGraphTestFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
 }
 
 func serveGraphRequest(t *testing.T, h *Handler, method, path, requestBody string) map[string]any {

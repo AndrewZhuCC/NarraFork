@@ -1,0 +1,19 @@
+{
+	"mode": "ts-owned-db-compatibility",
+	"mainSchemaOwner": "typescript-drizzle",
+	"goMainMigrations": false,
+	"goEnsureColumns": false,
+	"goFtsRepair": false,
+	"canonicalSchemaHash": "bbd4ac3d4e26e7b61aed9210823885a6f8266c38a3be19abc63248d22a3d02f9",
+	"expectedMigrationHash": "c260ac8a49bee7c8027b77690b6faedb226179e9aa001e1fddf75cbf838874bf",
+	"expectedMigrationCount": 41,
+	"expectedLastMigration": "0040_talented_pandemic",
+	"goJournalTable": "__narrafork_go_migration_journal",
+	"drizzleJournalTable": "__drizzle_migrations",
+	"readOnlyVerifier": true,
+	"canonicalTableCount": 41,
+	"canonicalIndexCount": 48,
+	"canonicalForeignKeyCount": 35,
+	"canonicalFtsTableCount": 3,
+	"canonicalFtsTriggerCount": 9
+}

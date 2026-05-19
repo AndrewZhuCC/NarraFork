@@ -106,7 +106,8 @@ func emitNugUsageSummary(ctx context.Context, out chan<- StreamEvent, provider P
 		payload = nested
 	}
 	if balance := firstNonEmpty(stringValue(payload["quotaBalance"]), stringValue(payload["remaining"]), stringValue(payload["creditsRemaining"])); balance != "" {
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{QuotaBalance: &balance}})
+		detailedBalance := stringValue(payload["detailedQuotaBalance"])
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{QuotaBalance: &balance, DetailedQuotaBalance: &detailedBalance}})
 	}
 	if usage, ok := numericAsFloat(payload["usage"]); ok {
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Metering: &MeteringSnapshot{Unit: firstNonEmpty(stringValue(payload["unit"]), "credit"), UnitPlural: firstNonEmpty(stringValue(payload["unitPlural"]), "credits"), Usage: usage}}})

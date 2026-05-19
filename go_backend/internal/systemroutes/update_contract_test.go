@@ -12,12 +12,15 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"narrafork-go/internal/config"
+	"narrafork-go/internal/restart"
 )
 
-func TestUpdateDownloadWithoutURLReturnsTerminalErrorSSE(t *testing.T) {
+func TestUpdateDownloadWithoutTrustedSourceReturnsTerminalErrorSSE(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	h := NewHandler(nil, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"releaseInfo":{"version":"1.2.3"}}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"releaseInfo":{"version":"1.2.3","files":[{"url":"https://client.invalid/artifact"}]}}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -45,32 +48,133 @@ func TestUpdateDownloadWithoutURLReturnsTerminalErrorSSE(t *testing.T) {
 	if terminal.Payload["success"] != false || terminal.Payload["phase"] != "error" {
 		t.Fatalf("expected parseable failed result payload, got %#v", terminal.Payload)
 	}
-	if terminal.Payload["version"] != "1.2.3" {
-		t.Fatalf("expected releaseInfo version to be preserved, got %#v", terminal.Payload)
-	}
-	if _, ok := terminal.Payload["error"].(string); !ok {
-		t.Fatalf("expected error string, got %#v", terminal.Payload)
+	if !strings.Contains(terminal.Payload["error"].(string), "trusted update metadata") {
+		t.Fatalf("expected trusted metadata error, got %#v", terminal.Payload)
 	}
 }
 
-func TestUpdateDownloadStreamsProgressAndCompleteSSE(t *testing.T) {
+func TestUpdateCheckUsesConfiguredTrustedSourceShape(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	artifactBytes := []byte("fake update artifact")
-	artifactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", "20")
-		_, _ = w.Write(artifactBytes)
-	}))
-	defer artifactServer.Close()
+	server := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "1.2.3",
+		Channel: "beta",
+		Product: "narrafork-go-test",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer server.Close()
+	h := newUpdateTestHandler(t, server.URL, "narrafork-go-test", "beta")
 
-	h := NewHandler(nil, nil)
-	body := `{"releaseInfo":{"version":"1.2.3","files":[{"url":"` + artifactServer.URL + `/artifact","size":20}]}}`
+	req := httptest.NewRequest(http.MethodGet, "/api/update/check?downloadUrl=https://client.invalid/evil", nil)
+	w := httptest.NewRecorder()
+	if err := h.updateCheck(w, req); err != nil {
+		t.Fatalf("updateCheck returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode check: %v", err)
+	}
+	if body["updateAvailable"] != true || body["latestVersion"] != "1.2.3" || body["currentVersion"] == "" {
+		t.Fatalf("unexpected update check body: %#v", body)
+	}
+	if body["selfUpdateAvailable"] != false || body["canAutoRestart"] != false || body["manualOnly"] != true {
+		t.Fatalf("expected update check to expose manual mode without restart handoff, got %#v", body)
+	}
+	instructions, _ := body["instructions"].(map[string]any)
+	if instructions["manual"] != true {
+		t.Fatalf("expected manual check instructions, got %#v", instructions)
+	}
+	source, _ := body["updateSource"].(map[string]any)
+	if source["product"] != "narrafork-go-test" || source["channel"] != "beta" {
+		t.Fatalf("expected configured update source metadata, got %#v", source)
+	}
+	releaseInfo, _ := body["releaseInfo"].(map[string]any)
+	if releaseInfo["version"] != "1.2.3" || releaseInfo["path"] == "" || releaseInfo["sha512"] == "" {
+		t.Fatalf("unexpected releaseInfo: %#v", releaseInfo)
+	}
+	files, _ := releaseInfo["files"].([]any)
+	if len(files) != 1 {
+		t.Fatalf("expected one release file, got %#v", releaseInfo["files"])
+	}
+	file, _ := files[0].(map[string]any)
+	if !strings.HasPrefix(file["url"].(string), server.URL+"/api/v2/products/narrafork-go-test/") {
+		t.Fatalf("release file URL should be derived from trusted server, got %#v", file)
+	}
+}
+
+func TestUpdateCheckExposesAutoCapabilityWhenRestartHandoffAvailable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	currentExe := filepath.Join(home, "narrafork-go")
+	if err := os.WriteFile(currentExe, []byte("current binary"), 0o700); err != nil {
+		t.Fatalf("write current executable: %v", err)
+	}
+	artifactBytes := []byte("fake update artifact")
+	server := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "1.2.5",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer server.Close()
+
+	origExec := updateExecutablePath
+	updateExecutablePath = func() (string, error) { return currentExe, nil }
+	t.Cleanup(func() { updateExecutablePath = origExec })
+
+	h := newUpdateTestHandler(t, server.URL, "narrafork", "stable")
+	h.Restart = restart.NewManager(restart.RuntimeAddress{Protocol: "http", Host: "127.0.0.1", Port: 7778}, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/update/check", nil)
+	w := httptest.NewRecorder()
+	if err := h.updateCheck(w, req); err != nil {
+		t.Fatalf("updateCheck returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode check: %v", err)
+	}
+	if body["updateAvailable"] != true || body["selfUpdateAvailable"] != true || body["canAutoRestart"] != true || body["manualOnly"] != false {
+		t.Fatalf("expected update check to expose auto-capable mode, got %#v", body)
+	}
+	instructions, _ := body["instructions"].(map[string]any)
+	if instructions["manual"] != false || instructions["action"] != "apply" {
+		t.Fatalf("expected automatic check instructions, got %#v", instructions)
+	}
+}
+
+func TestUpdateDownloadRefetchesTrustedMetadataAndIgnoresClientURLs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	artifactBytes := []byte("fake update artifact")
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "1.2.3",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer trusted.Close()
+	clientURLHit := false
+	clientURLServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientURLHit = true
+		_, _ = w.Write([]byte("client supplied artifact must not be used"))
+	}))
+	defer clientURLServer.Close()
+
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+	body := `{"requestedVersion":"1.2.3","url":"` + clientURLServer.URL + `/top-level","downloadUrl":"` + clientURLServer.URL + `/download","artifactUrl":"` + clientURLServer.URL + `/artifact","releaseInfo":{"version":"client-version","files":[{"url":"` + clientURLServer.URL + `/file","size":999}]}}`
 	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
 	if err := h.updateDownload(w, req); err != nil {
 		t.Fatalf("updateDownload returned error: %v", err)
+	}
+	if clientURLHit {
+		t.Fatal("download used a client-supplied artifact URL")
 	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
@@ -83,18 +187,36 @@ func TestUpdateDownloadStreamsProgressAndCompleteSSE(t *testing.T) {
 	if len(events) < 3 {
 		t.Fatalf("expected checking, downloading, and complete events, got %#v", events)
 	}
-	if events[0].Name != "progress" || events[0].Payload["phase"] != "checking" {
-		t.Fatalf("expected initial checking progress, got %#v", events[0])
-	}
-	if events[1].Name != "progress" || events[1].Payload["phase"] != "downloading" {
-		t.Fatalf("expected downloading progress, got %#v", events[1])
-	}
 	terminal := events[len(events)-1]
 	if terminal.Name != "complete" || terminal.Payload["success"] != true {
 		t.Fatalf("expected successful complete terminal event, got %#v", terminal)
 	}
 	if terminal.Payload["phase"] != "complete" || terminal.Payload["version"] != "1.2.3" {
-		t.Fatalf("expected complete payload with version, got %#v", terminal.Payload)
+		t.Fatalf("expected complete payload with trusted version, got %#v", terminal.Payload)
+	}
+	if terminal.Payload["ready"] != true || terminal.Payload["selfUpdateAvailable"] != false || terminal.Payload["canAutoRestart"] != false || terminal.Payload["manualOnly"] != true {
+		t.Fatalf("expected manual-only ready download contract, got %#v", terminal.Payload)
+	}
+	instructions, _ := terminal.Payload["instructions"].(map[string]any)
+	if instructions["manual"] != true {
+		t.Fatalf("expected manual download instructions, got %#v", instructions)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/update/status?version=1.2.3", nil)
+	statusW := httptest.NewRecorder()
+	if err := h.updateStatus(statusW, statusReq); err != nil {
+		t.Fatalf("updateStatus returned error: %v", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(statusW.Body.Bytes(), &status); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if status["ready"] != true || status["selfUpdateAvailable"] != false || status["canAutoRestart"] != false || status["manualOnly"] != true {
+		t.Fatalf("expected manual-only ready status contract, got %#v", status)
+	}
+	statusInstructions, _ := status["instructions"].(map[string]any)
+	if statusInstructions["manual"] != true {
+		t.Fatalf("expected manual status instructions, got %#v", statusInstructions)
 	}
 
 	artifactPath := filepath.Join(home, ".narrafork", "updates", "1.2.3", "artifact")
@@ -107,63 +229,46 @@ func TestUpdateDownloadStreamsProgressAndCompleteSSE(t *testing.T) {
 	}
 }
 
-func TestUpdateDownloadSupportsMultipleFilesAndSHA512(t *testing.T) {
+func TestUpdateDownloadAndStatusExposeAutoApplyWhenReady(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	files := map[string][]byte{
-		"/one.bin": []byte("first update artifact"),
-		"/two.bin": []byte("second update artifact"),
+	currentExe := filepath.Join(home, "narrafork-go")
+	if err := os.WriteFile(currentExe, []byte("current binary"), 0o700); err != nil {
+		t.Fatalf("write current executable: %v", err)
 	}
-	artifactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		payload, ok := files[r.URL.Path]
-		if !ok {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
-		_, _ = w.Write(payload)
-	}))
-	defer artifactServer.Close()
+	artifactBytes := []byte("auto apply artifact")
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "1.2.4",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer trusted.Close()
 
-	h := NewHandler(nil, nil)
-	body := `{"releaseInfo":{"version":"2.0.0","files":[` +
-		`{"url":"` + artifactServer.URL + `/one.bin","size":21,"sha512":"` + sha512Base64(files["/one.bin"]) + `"},` +
-		`{"url":"` + artifactServer.URL + `/two.bin","size":22,"sha512":"` + sha512Hex(files["/two.bin"]) + `"}` +
-		`]}}`
-	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(body))
+	origExec := updateExecutablePath
+	updateExecutablePath = func() (string, error) { return currentExe, nil }
+	t.Cleanup(func() { updateExecutablePath = origExec })
+
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+	h.Restart = restart.NewManager(restart.RuntimeAddress{Protocol: "http", Host: "127.0.0.1", Port: 7778}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"requestedVersion":"1.2.4"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-
 	if err := h.updateDownload(w, req); err != nil {
 		t.Fatalf("updateDownload returned error: %v", err)
 	}
 	events := parseUpdateSSEEvents(t, w.Body.String())
 	terminal := events[len(events)-1]
 	if terminal.Name != "complete" || terminal.Payload["success"] != true {
-		t.Fatalf("expected complete success, got %#v", terminal)
+		t.Fatalf("expected complete download, got %#v", terminal)
 	}
-	if terminal.Payload["bytesDownloaded"] != float64(43) || terminal.Payload["totalBytes"] != float64(43) || terminal.Payload["percent"] != float64(100) {
-		t.Fatalf("expected aggregate progress totals, got %#v", terminal.Payload)
-	}
-	if terminal.Payload["selfUpdateAvailable"] != false {
-		t.Fatalf("expected selfUpdateAvailable=false, got %#v", terminal.Payload)
-	}
-	instructions, _ := terminal.Payload["instructions"].(map[string]any)
-	if instructions["manual"] != true || !strings.Contains(instructions["message"].(string), "not supported") {
-		t.Fatalf("expected manual unsupported instructions, got %#v", instructions)
+	assertAutoReadyUpdateContract(t, terminal.Payload)
+	if terminal.Payload["placed"] != false {
+		t.Fatalf("download should cache but not pre-place the replacement binary, got %#v", terminal.Payload)
 	}
 
-	for name, expected := range map[string][]byte{"one.bin": files["/one.bin"], "two.bin": files["/two.bin"]} {
-		written, err := os.ReadFile(filepath.Join(home, ".narrafork", "updates", "2.0.0", name))
-		if err != nil {
-			t.Fatalf("read downloaded %s: %v", name, err)
-		}
-		if string(written) != string(expected) {
-			t.Fatalf("content mismatch for %s: %q", name, string(written))
-		}
-	}
-
-	statusReq := httptest.NewRequest(http.MethodGet, "/api/update/status?version=2.0.0", nil)
+	statusReq := httptest.NewRequest(http.MethodGet, "/api/update/status?version=1.2.4", nil)
 	statusW := httptest.NewRecorder()
 	if err := h.updateStatus(statusW, statusReq); err != nil {
 		t.Fatalf("updateStatus returned error: %v", err)
@@ -172,22 +277,55 @@ func TestUpdateDownloadSupportsMultipleFilesAndSHA512(t *testing.T) {
 	if err := json.Unmarshal(statusW.Body.Bytes(), &status); err != nil {
 		t.Fatalf("decode status: %v", err)
 	}
-	if status["ready"] != true || status["canAutoRestart"] != false || status["selfUpdateAvailable"] != false {
-		t.Fatalf("unexpected status contract: %#v", status)
+	assertAutoReadyUpdateContract(t, status)
+	if status["placed"] != false {
+		t.Fatalf("status should keep placed=false until apply prepares the replacement binary, got %#v", status)
+	}
+}
+
+func TestUpdateDownloadRejectsRequestedVersionMismatch(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	artifactBytes := []byte("new trusted artifact")
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "2.0.0",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer trusted.Close()
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"version":"1.0.0"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.updateDownload(w, req); err != nil {
+		t.Fatalf("updateDownload returned error: %v", err)
+	}
+	events := parseUpdateSSEEvents(t, w.Body.String())
+	terminal := events[len(events)-1]
+	if terminal.Name != "error" || terminal.Payload["success"] != false {
+		t.Fatalf("expected terminal version mismatch error, got %#v", terminal)
+	}
+	if terminal.Payload["requestedVersion"] != "1.0.0" || terminal.Payload["latestVersion"] != "2.0.0" {
+		t.Fatalf("expected mismatch details, got %#v", terminal.Payload)
 	}
 }
 
 func TestUpdateDownloadRejectsSHA512Mismatch(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	artifactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("tampered artifact"))
-	}))
-	defer artifactServer.Close()
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "bad-sha",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   []byte("tampered artifact"),
+		SHA512:  sha512Hex([]byte("expected artifact")),
+	})
+	defer trusted.Close()
 
-	h := NewHandler(nil, nil)
-	body := `{"releaseInfo":{"version":"bad-sha","files":[{"url":"` + artifactServer.URL + `/artifact","sha512":"` + sha512Hex([]byte("expected artifact")) + `"}]}}`
-	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(body))
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"requestedVersion":"bad-sha"}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 
@@ -281,6 +419,75 @@ func TestUpdateDirectoryCleanupAndApplyExposeUnsupportedContract(t *testing.T) {
 	if applyInstructions["manual"] != true {
 		t.Fatalf("expected manual apply instructions, got %#v", applyInstructions)
 	}
+}
+
+func assertAutoReadyUpdateContract(t *testing.T, payload map[string]any) {
+	t.Helper()
+	if payload["ready"] != true || payload["selfUpdateAvailable"] != true || payload["canAutoRestart"] != true || payload["manualOnly"] != false {
+		t.Fatalf("expected auto-ready update contract, got %#v", payload)
+	}
+	instructions, _ := payload["instructions"].(map[string]any)
+	if instructions["manual"] != false || instructions["action"] != "apply" {
+		t.Fatalf("expected automatic apply instructions, got %#v", instructions)
+	}
+	if payload["updatePath"] == "" || payload["artifactPath"] == "" {
+		t.Fatalf("expected ready payload to include update/artifact path, got %#v", payload)
+	}
+}
+
+type trustedUpdateServerOptions struct {
+	Version string
+	Channel string
+	Product string
+	Bytes   []byte
+	SHA512  string
+}
+
+func newTrustedUpdateServer(t *testing.T, opts trustedUpdateServerOptions) *httptest.Server {
+	t.Helper()
+	filename := "narrafork-" + opts.Version + "-" + updatePlatform()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/products/"+opts.Product+"/releases/latest":
+			if r.URL.Query().Get("channel") != opts.Channel {
+				t.Fatalf("unexpected channel query: %q", r.URL.RawQuery)
+			}
+			if r.URL.Query().Get("platform") != updatePlatform() {
+				t.Fatalf("unexpected platform query: %q", r.URL.RawQuery)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"updateAvailable": true,
+				"currentVersion":  r.URL.Query().Get("version"),
+				"version":         opts.Version,
+				"releaseDate":     "2026-05-18T00:00:00Z",
+				"releaseNotes":    map[string]any{"en": "Trusted release", "zh-CN": "可信发布"},
+				"platform":        updatePlatform(),
+				"file": map[string]any{
+					"filename": filename,
+					"size":     len(opts.Bytes),
+					"sha512":   opts.SHA512,
+				},
+				"zstdPatch": nil,
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v2/products/"+opts.Product+"/releases/"+opts.Version+"/download/"+filename:
+			w.Header().Set("Content-Length", strconv.Itoa(len(opts.Bytes)))
+			_, _ = w.Write(opts.Bytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func newUpdateTestHandler(t *testing.T, serverURL, product, channel string) *Handler {
+	t.Helper()
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	if _, err := settings.Patch(map[string]any{"update": map[string]any{"serverUrl": serverURL, "product": product, "channel": channel}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	return NewHandler(nil, settings)
 }
 
 func sha512Base64(payload []byte) string {

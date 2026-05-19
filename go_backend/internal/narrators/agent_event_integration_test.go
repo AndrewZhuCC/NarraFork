@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 
+	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/id"
@@ -540,6 +541,58 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 	if status != "complete" {
 		t.Fatalf("expected goal complete, got %s", status)
 	}
+	var toolStatus, suggestionsRaw, decisionReason string
+	if err := service.DB.QueryRow(`SELECT status, COALESCE(permission_suggestions, ''), COALESCE(permission_decision_reason, '') FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'goal-update-1'`, narratorID).Scan(&toolStatus, &suggestionsRaw, &decisionReason); err != nil {
+		t.Fatalf("load goal update tool call: %v", err)
+	}
+	if toolStatus != "success" || !strings.Contains(suggestionsRaw, "goal_reflection") || !strings.Contains(suggestionsRaw, "confirmed") || decisionReason == "" {
+		t.Fatalf("unexpected goal reflection tool call status=%s suggestions=%s reason=%q", toolStatus, suggestionsRaw, decisionReason)
+	}
+}
+
+func TestRunBasicAgentGoalReflectionRevisePersistsNextSteps(t *testing.T) {
+	goalID := ""
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if requestHasTool(body, "GoalCompleteRevise") {
+			if requestHasToolResult(body) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "reflection done"}}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "goal-revise-1", "type": "function", "function": map[string]any{"name": "GoalCompleteRevise", "arguments": `{"confirm":true,"feedback":"Need final verification.","nextSteps":"Run the final verification, then retry UpdateGoal if it passes."}`}}}}}}})
+			return
+		}
+		if requestHasToolResult(body) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "goal still active"}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "goal-update-revise-1", "type": "function", "function": map[string]any{"name": "UpdateGoal", "arguments": `{"goal_id":"` + goalID + `","status":"complete","evidence":"Verified event loop goal reflection completed successfully."}`}}}}}}})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	payload, err := service.addGoal(context.Background(), narratorID, "Complete P3 reflection coverage", "tester")
+	if err != nil {
+		t.Fatalf("add goal: %v", err)
+	}
+	goal, _ := payload["goal"].(map[string]any)
+	goalID = stringFromAny(goal["id"])
+	service.runBasicAgent(context.Background(), narratorID)
+	var status string
+	if err := service.DB.QueryRow(`SELECT status FROM narrator_goals WHERE id = ?`, goalID).Scan(&status); err != nil {
+		t.Fatalf("load goal: %v", err)
+	}
+	if status != "active" {
+		t.Fatalf("expected goal to remain active, got %s", status)
+	}
+	var toolStatus, suggestionsRaw, decisionReason string
+	if err := service.DB.QueryRow(`SELECT status, COALESCE(permission_suggestions, ''), COALESCE(permission_decision_reason, '') FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'goal-update-revise-1'`, narratorID).Scan(&toolStatus, &suggestionsRaw, &decisionReason); err != nil {
+		t.Fatalf("load goal update tool call: %v", err)
+	}
+	if toolStatus != "fail" || !strings.Contains(suggestionsRaw, "goal_reflection") || !strings.Contains(suggestionsRaw, "cancelled") || !strings.Contains(suggestionsRaw, "nextSteps") || !strings.Contains(decisionReason, "Next steps") {
+		t.Fatalf("unexpected goal reflection revise status=%s suggestions=%s reason=%q", toolStatus, suggestionsRaw, decisionReason)
+	}
 }
 
 func TestRunBasicAgentExitPlanReflectionWorksThroughEventLoop(t *testing.T) {
@@ -616,6 +669,44 @@ func TestRunBasicAgentDangerReflectionCanCancelDangerousTool(t *testing.T) {
 	}
 }
 
+func TestRunBasicAgentBypassPermissionsStillRunsDangerReflection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if requestHasTool(body, "DangerCancel") {
+			if requestHasToolResult(body) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger reflection done"}}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-cancel-bypass-1", "type": "function", "function": map[string]any{"name": "DangerCancel", "arguments": `{"confirm":true,"feedback":"Bypass must still reflect."}`}}}}}}})
+			return
+		}
+		if requestHasToolResult(body) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "bypass danger cancelled"}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bypass-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch bypass-should-not-run"}`}}}}}}})
+	}))
+	defer server.Close()
+	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	_, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'bypassPermissions', danger_reflection_override = 'on' WHERE id = ?`, narratorID)
+	if err != nil {
+		t.Fatalf("enable bypass danger reflection: %v", err)
+	}
+	service.runBasicAgent(context.Background(), narratorID)
+	if _, err := os.Stat(filepath.Join(cwd, "bypass-should-not-run")); err == nil {
+		t.Fatalf("danger reflection should have prevented bypass Bash execution")
+	}
+	var status, outputRaw string
+	if err := service.DB.QueryRow(`SELECT status, output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'danger-bypass-bash-1'`, narratorID).Scan(&status, &outputRaw); err != nil {
+		t.Fatalf("load bypass danger tool call: %v", err)
+	}
+	if status != "fail" || !strings.Contains(outputRaw, "Bypass must still reflect") {
+		t.Fatalf("unexpected bypass danger tool result status=%s output=%s", status, outputRaw)
+	}
+}
+
 func TestRunBasicAgentNonPermissionWritePersistsFileSnapshot(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
@@ -629,7 +720,7 @@ func TestRunBasicAgentNonPermissionWritePersistsFileSnapshot(t *testing.T) {
 	}))
 	defer server.Close()
 	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
-	_, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'trust-all' WHERE id = ?`, narratorID)
+	_, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'trust-all', danger_reflection_override = 'off' WHERE id = ?`, narratorID)
 	if err != nil {
 		t.Fatalf("set trust-all: %v", err)
 	}
@@ -702,6 +793,9 @@ func TestRunBasicAgentPermissionFlowStillWorksWithEventLoop(t *testing.T) {
 	}))
 	defer server.Close()
 	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	if _, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'off' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("disable danger reflection for permission loop test: %v", err)
+	}
 	done := make(chan struct{})
 	go func() {
 		service.runBasicAgent(context.Background(), narratorID)
@@ -863,7 +957,42 @@ func TestRunBasicAgentCancelMarksRunIdle(t *testing.T) {
 	}
 }
 
-func TestSubagentDetachAttachLifecycleFallbacks(t *testing.T) {
+func TestSendToolContinuationPersistsParentToolUse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "continued"}}}})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	parent, err := service.Get(context.Background(), narratorID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Worker", "openai:gpt-test", "", ptrString(parent.Cwd), "worker", false)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	payload, err := service.sendTool(context.Background(), narratorID, map[string]any{"id": child.ID, "message": "continue", "_tool_use_id": "send-tool-1"})
+	if err != nil {
+		t.Fatalf("send tool: %v", err)
+	}
+	if payload["ok"] != true {
+		t.Fatalf("unexpected send payload: %#v", payload)
+	}
+	var parentToolUseID string
+	if err := service.DB.QueryRow(`SELECT COALESCE(parent_tool_use_id, '') FROM narrator_messages WHERE narrator_id = ? AND role = 'user' AND content_text = 'continue' ORDER BY created_at DESC LIMIT 1`, child.ID).Scan(&parentToolUseID); err != nil {
+		t.Fatalf("load child continuation message: %v", err)
+	}
+	if parentToolUseID != "send-tool-1" {
+		t.Fatalf("child continuation parent_tool_use_id=%q", parentToolUseID)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for service.isRunActive(child.ID) && time.Now().Before(deadline) {
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+func TestSubagentDetachAttachLifecycleReconcilesStaleBackground(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "ok"}}}})
@@ -877,6 +1006,9 @@ func TestSubagentDetachAttachLifecycleFallbacks(t *testing.T) {
 	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Foreground", "openai:gpt-test", "", ptrString(parent.Cwd), "fg", false)
 	if err != nil {
 		t.Fatalf("create subagent: %v", err)
+	}
+	if _, err := service.addMessageWithBlocksWithCommandAndParentToolUse(context.Background(), child.ID, "user", "launch", []map[string]any{{"type": "text", "text": "launch"}}, nil, "", "agent-1"); err != nil {
+		t.Fatalf("seed child parent tool use: %v", err)
 	}
 	_, err = service.DB.Exec(`UPDATE narrators SET status = 'working' WHERE id = ?`, child.ID)
 	if err != nil {
@@ -901,8 +1033,8 @@ func TestSubagentDetachAttachLifecycleFallbacks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("attach subagent: %v", err)
 	}
-	if attached["attached"] != true || attached["fallback"] != true {
-		t.Fatalf("attach should be explicit fallback without active waiter: %#v", attached)
+	if attached["attached"] != false || attached["staleRecovered"] != true || attached["backgroundStatus"] != "failed" {
+		t.Fatalf("attach should reconcile stale background without active run: %#v", attached)
 	}
 }
 
@@ -1008,6 +1140,42 @@ func TestUpdateSubagentConclusionReturnsManualOverrideClearError(t *testing.T) {
 	}
 	if !strings.Contains(substatus, "manual_override") {
 		t.Fatalf("failed clear should leave manual_override for retry, got %s", substatus)
+	}
+}
+
+func TestFirstTokenTimeoutAndSilentDisconnectPersistRunStatus(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "http://127.0.0.1")
+	ctx := context.Background()
+	narrator, err := service.Get(ctx, narratorID)
+	if err != nil {
+		t.Fatalf("get narrator: %v", err)
+	}
+	timeoutState := &agentRunState{narratorID: narratorID, narrator: narrator}
+	if err := service.handleAgentEvent(ctx, timeoutState, agentbasic.AgentEvent{Type: "first_token_timeout", Message: "first token timed out"}); err != nil {
+		t.Fatalf("handle first token timeout: %v", err)
+	}
+	var status, substatus, errorMessage string
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("query timeout status: %v", err)
+	}
+	if status != "idle" || substatus != `["timeout"]` || !strings.Contains(errorMessage, "first token timed out") {
+		t.Fatalf("unexpected timeout persisted state: status=%s substatus=%s error=%s", status, substatus, errorMessage)
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	_, err = service.DB.Exec(`UPDATE narrators SET status = 'working', substatus = '["calling_model"]', error_message = 'old', updated_at = ? WHERE id = ?`, now, narratorID)
+	if err != nil {
+		t.Fatalf("reset narrator status: %v", err)
+	}
+	disconnectState := &agentRunState{narratorID: narratorID, narrator: narrator}
+	if err := service.handleAgentEvent(ctx, disconnectState, agentbasic.AgentEvent{Type: "silent_disconnect"}); err != nil {
+		t.Fatalf("handle silent disconnect: %v", err)
+	}
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("query silent disconnect status: %v", err)
+	}
+	if status != "idle" || substatus != `["silent_disconnect"]` || errorMessage != "" {
+		t.Fatalf("unexpected silent disconnect persisted state: status=%s substatus=%s error=%s", status, substatus, errorMessage)
 	}
 }
 

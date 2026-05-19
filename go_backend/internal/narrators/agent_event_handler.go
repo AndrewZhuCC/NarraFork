@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
@@ -24,9 +28,13 @@ type agentRunState struct {
 	errored        bool
 	errorMessage   string
 	streamedBytes  int
+	providerPrefix string
 }
 
 func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
+	if strings.TrimSpace(event.Provider) != "" {
+		state.providerPrefix = event.Provider
+	}
 	s.broadcastAgentEvent(state.narratorID, event)
 	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil && (event.Type == "stream_text" || event.Type == "stream_reasoning") && event.Text != "" {
 		state.streamedBytes += len([]byte(event.Text))
@@ -34,6 +42,17 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 	}
 	switch event.Type {
 	case "stream_text", "stream_reasoning", "tool_use_chunk", "context_usage", "retrying", "api_request_start", "api_request_end", "web_search", "image_generation", "output_truncated", "model_switched", "turn_complete", "tool_inventory":
+		return nil
+	case "quota_balance":
+		s.persistCustomApiQuotaBalance(
+			state.providerPrefix,
+			event.Message,
+			stringFromMetadata(event.Metadata, "detailedQuotaBalance"),
+		)
+		s.persistNugQuotaBalance(state.providerPrefix, event.Message)
+		return nil
+	case "nkp_quota_balance":
+		s.persistNKPQuotaBalance(state.providerPrefix, event.Metadata)
 		return nil
 	case "block_complete":
 		if event.Block == nil {
@@ -93,7 +112,15 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		return nil
 	case "done":
 		return s.finishAgentRunSuccess(ctx, state)
+	case "first_token_timeout":
+		state.errorMessage = firstNonEmptyString(event.Message, "Provider did not produce a response before the first-token timeout")
+		return s.finishAgentRunTimeout(ctx, state, state.errorMessage)
+	case "silent_disconnect":
+		return s.finishAgentRunSilentDisconnect(ctx, state)
 	case "error", "retryable_error", "invalid_state":
+		if isContextOverflowAgentEvent(event) {
+			return s.finishAgentRunContextOverflow(ctx, state, event)
+		}
 		state.errored = true
 		state.errorMessage = firstNonEmptyString(event.Message, event.Reason, "agent run failed")
 		if isCancelledError(errors.New(state.errorMessage)) {
@@ -192,9 +219,27 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	}
 	if event.Usage != nil {
 		payload["usage"] = event.Usage
+		payload["promptTokens"] = event.Usage.PromptTokens
+		payload["inputTokens"] = event.Usage.InputTokens
+		payload["completionTokens"] = event.Usage.CompletionTokens
+		payload["reasoningTokens"] = event.Usage.ReasoningTokens
+		payload["cachedInputTokens"] = event.Usage.CachedInputTokens
+		payload["contextWindow"] = event.Usage.ContextWindow
+		payload["isEstimated"] = event.Usage.Estimated
+		if event.Type == "context_usage" && event.Percentage == 0 && event.Usage.ContextWindow > 0 {
+			inputTokens := event.Usage.PromptTokens
+			if inputTokens == 0 {
+				inputTokens = event.Usage.InputTokens
+			}
+			payload["percentage"] = float64(inputTokens) / float64(event.Usage.ContextWindow) * 100
+		}
 	}
 	if event.Percentage != 0 {
 		payload["percentage"] = event.Percentage
+	} else if event.Type == "context_usage" {
+		if _, ok := payload["percentage"]; !ok {
+			payload["percentage"] = 0
+		}
 	}
 	if event.RequestID != "" {
 		payload["requestId"] = event.RequestID
@@ -208,7 +253,240 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	if event.Metadata != nil {
 		payload["metadata"] = event.Metadata
 	}
+	if event.Type == "web_search" {
+		payload["id"] = event.ToolUseID
+		payload["status"] = event.Message
+		if event.Metadata != nil {
+			if query, ok := event.Metadata["query"]; ok {
+				payload["query"] = query
+			}
+			if queries, ok := event.Metadata["queries"]; ok {
+				payload["queries"] = queries
+			}
+			if action, ok := event.Metadata["action"]; ok {
+				payload["action"] = action
+			}
+		}
+	}
+	if event.Type == "image_generation" {
+		payload["id"] = event.ToolUseID
+		payload["status"] = event.Message
+		if event.Metadata != nil {
+			if revisedPrompt, ok := event.Metadata["revisedPrompt"]; ok {
+				payload["revisedPrompt"] = revisedPrompt
+			}
+			if result, ok := event.Metadata["result"]; ok {
+				payload["result"] = result
+			}
+		}
+	}
+	if event.Type == "metering" && event.Metadata != nil {
+		if unit, ok := event.Metadata["unit"]; ok {
+			payload["unit"] = unit
+		}
+		if unitPlural, ok := event.Metadata["unitPlural"]; ok {
+			payload["unitPlural"] = unitPlural
+		}
+		if usage, ok := event.Metadata["usage"]; ok {
+			payload["usage"] = usage
+		}
+	}
+	if event.Type == "nkp_quota_balance" && event.Metadata != nil {
+		if quotaBalance, ok := event.Metadata["quotaBalance"]; ok {
+			payload["quotaBalance"] = quotaBalance
+		}
+	}
+	if event.Type == "nkp_queue_status" && event.Metadata != nil {
+		if position, ok := event.Metadata["position"]; ok {
+			payload["position"] = position
+		}
+		if queueDepth, ok := event.Metadata["queueDepth"]; ok {
+			payload["queueDepth"] = queueDepth
+		}
+	}
+	if event.Type == "queue_status" {
+		if event.Metadata != nil {
+			if position, ok := event.Metadata["position"]; ok {
+				payload["position"] = position
+			}
+			if queueDepth, ok := event.Metadata["queueDepth"]; ok {
+				payload["queueDepth"] = queueDepth
+			}
+		}
+		if strings.TrimSpace(event.Message) != "" {
+			payload["queueMessage"] = event.Message
+		}
+	}
+	if event.Type == "quota_balance" {
+		if strings.TrimSpace(event.Message) != "" {
+			payload["quotaBalance"] = event.Message
+		} else if event.Metadata != nil {
+			if quotaBalance, ok := event.Metadata["quotaBalance"]; ok {
+				payload["quotaBalance"] = quotaBalance
+			}
+		}
+		payload["detailedQuotaBalance"] = stringFromMetadata(event.Metadata, "detailedQuotaBalance")
+	}
 	s.Hub.BroadcastNarrator(narratorID, payload)
+}
+
+func (s *Service) persistCustomApiQuotaBalance(providerPrefix, quotaBalance, detailedQuotaBalance string) {
+	providerPrefix = strings.TrimSpace(providerPrefix)
+	quotaBalance = strings.TrimSpace(quotaBalance)
+	detailedQuotaBalance = strings.TrimSpace(detailedQuotaBalance)
+	if providerPrefix == "" || quotaBalance == "" || s.Settings == nil {
+		return
+	}
+	providerID := ""
+	for _, item := range anySliceFromMap(s.Settings.Raw()["customApiProviders"]) {
+		provider, ok := item.(map[string]any)
+		if !ok || strings.TrimSpace(stringValue(provider["prefix"])) != providerPrefix {
+			continue
+		}
+		providerID = strings.TrimSpace(stringValue(provider["id"]))
+		break
+	}
+	if providerID == "" {
+		return
+	}
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dir, ".narrafork", "custom-api-quotas.json")
+	cache := map[string]map[string]any{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &cache)
+	}
+	cache[providerID] = map[string]any{
+		"quotaBalance":         quotaBalance,
+		"detailedQuotaBalance": nullableTrimmedString(detailedQuotaBalance),
+		"fetchedAt":            time.Now().UnixMilli(),
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o600)
+}
+
+func (s *Service) persistNugQuotaBalance(providerPrefix, quotaBalance string) {
+	providerPrefix = strings.TrimSpace(providerPrefix)
+	if providerPrefix == "" || strings.TrimSpace(quotaBalance) == "" || s.Settings == nil {
+		return
+	}
+	balance, ok := quotaBalanceNumber(quotaBalance)
+	if !ok {
+		return
+	}
+	providerID := providerIDForPrefix(s.Settings.Raw(), "nugProviders", providerPrefix)
+	if providerID == "" {
+		return
+	}
+	persistQuotaCacheEntry("nug-quotas.json", providerID, map[string]any{"balance": balance})
+}
+
+func (s *Service) persistNKPQuotaBalance(providerPrefix string, metadata map[string]any) {
+	providerPrefix = strings.TrimSpace(providerPrefix)
+	if providerPrefix == "" || metadata == nil || s.Settings == nil {
+		return
+	}
+	balance, ok := quotaBalanceNumber(metadata["quotaBalance"])
+	if !ok {
+		return
+	}
+	providerID := providerIDForPrefix(s.Settings.Raw(), "nkpProviders", providerPrefix)
+	if providerID == "" {
+		return
+	}
+	persistQuotaCacheEntry("nkp-quotas.json", providerID, map[string]any{"quotaBalance": balance})
+}
+
+func providerIDForPrefix(raw map[string]any, providerField, providerPrefix string) string {
+	for _, item := range anySliceFromMap(raw[providerField]) {
+		provider, ok := item.(map[string]any)
+		if !ok || strings.TrimSpace(stringValue(provider["prefix"])) != providerPrefix {
+			continue
+		}
+		return strings.TrimSpace(stringValue(provider["id"]))
+	}
+	return ""
+}
+
+func quotaBalanceNumber(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		parsed, err := typed.Float64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func persistQuotaCacheEntry(fileName, providerID string, patch map[string]any) {
+	dir, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	path := filepath.Join(dir, ".narrafork", fileName)
+	cache := map[string]map[string]any{}
+	if data, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(data, &cache)
+	}
+	entry := cache[providerID]
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	for key, value := range patch {
+		entry[key] = value
+	}
+	entry["fetchedAt"] = time.Now().UnixMilli()
+	cache[providerID] = entry
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o600)
+}
+
+func stringFromMetadata(metadata map[string]any, key string) string {
+	if metadata == nil {
+		return ""
+	}
+	if value, ok := metadata[key]; ok {
+		return strings.TrimSpace(stringFromAny(value))
+	}
+	return ""
+}
+
+func anySliceFromMap(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+func providerPrefixFromModelValue(model string) string {
+	idx := strings.Index(model, ":")
+	if idx <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(model[:idx])
 }
 
 func contentBlockToMap(block *agentbasic.ContentBlock) map[string]any {
@@ -309,6 +587,36 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 	return s.persistFileSnapshot(ctx, state.narratorID, *state.draftMessageID, sqlNullString(toolCallID), run)
 }
 
+func (s *Service) latestRunNarrator(ctx context.Context, state *agentRunState) Narrator {
+	if latest, err := s.Get(ctx, state.narratorID); err == nil {
+		return latest
+	}
+	return state.narrator
+}
+
+func (s *Service) backgroundRunParent(ctx context.Context, state *agentRunState, latest Narrator) (string, bool) {
+	if latest.ParentNarratorID == nil || strings.TrimSpace(*latest.ParentNarratorID) == "" {
+		if state.narrator.ParentNarratorID == nil || strings.TrimSpace(*state.narrator.ParentNarratorID) == "" {
+			return "", latest.IsBackground
+		}
+		parentID := strings.TrimSpace(*state.narrator.ParentNarratorID)
+		return parentID, latest.IsBackground || s.backgroundTaskRunning(ctx, parentID, state.narratorID)
+	}
+	parentID := strings.TrimSpace(*latest.ParentNarratorID)
+	return parentID, latest.IsBackground || s.backgroundTaskRunning(ctx, parentID, state.narratorID)
+}
+
+func (s *Service) backgroundTaskRunning(ctx context.Context, parentID, taskID string) bool {
+	if s == nil || s.DB == nil || strings.TrimSpace(parentID) == "" || strings.TrimSpace(taskID) == "" {
+		return false
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM background_tasks WHERE id = ? AND parent_narrator_id = ? AND type = 'agent' AND status = 'running'`, taskID, parentID).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
+}
+
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	if state.draftMessageID != nil && strings.TrimSpace(*state.draftMessageID) != "" {
@@ -327,14 +635,16 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 			}
 		}
 	}
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	var err error
-	if state.narrator.IsBackground {
+	if treatAsBackground {
 		result := state.assistantText
 		if strings.TrimSpace(result) == "" {
 			result = "Completed"
 		}
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '[]', background_status = 'completed', background_result = ?, background_completed_at = ?, error_message = NULL, updated_at = ? WHERE id = ?`, result, db.NowISO(), db.NowISO(), state.narratorID)
-	} else if state.narrator.Type == "subagent" || state.narrator.Variant == "subagent" {
+	} else if latest.Type == "subagent" || latest.Variant == "subagent" {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["manual_override"]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID)
 	} else {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["unread"]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID)
@@ -342,30 +652,96 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 	if err != nil {
 		return err
 	}
-	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil {
+	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
 		result := state.assistantText
 		if strings.TrimSpace(result) == "" {
 			result = "Completed"
 		}
-		if err := s.finishBackgroundTaskRecord(ctx, *state.narrator.ParentNarratorID, state.narratorID, "completed", result); err != nil {
+		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "completed", result); err != nil {
 			return err
 		}
 	}
 	if s.Hub != nil {
 		substatus := []string{}
-		if !state.narrator.IsBackground && (state.narrator.Type == "subagent" || state.narrator.Variant == "subagent") {
+		if !treatAsBackground && (latest.Type == "subagent" || latest.Variant == "subagent") {
 			substatus = []string{"manual_override"}
-		} else if !state.narrator.IsBackground {
+		} else if !treatAsBackground {
 			substatus = []string{"unread"}
 		}
 		backgroundStatus := nullableTrimmedString("")
-		if state.narrator.IsBackground {
+		if treatAsBackground {
 			backgroundStatus = nullableTrimmedString("completed")
 		}
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": substatus, "isBackground": state.narrator.IsBackground, "backgroundStatus": backgroundStatus})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": substatus, "isBackground": latest.IsBackground, "backgroundStatus": backgroundStatus})
 	}
-	if !state.narrator.IsBackground && state.narrator.Type != "subagent" && state.narrator.Variant != "subagent" {
+	if !treatAsBackground && latest.Type != "subagent" && latest.Variant != "subagent" {
 		_, _ = s.consumeNextBufferedMessage(context.Background(), state.narratorID)
+	}
+	return nil
+}
+
+func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunState, message string) error {
+	state.completed = true
+	state.errored = true
+	if strings.TrimSpace(message) == "" {
+		message = "Provider did not produce a response before the first-token timeout"
+	}
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
+	if treatAsBackground {
+		_, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["timeout"]', background_status = 'failed', background_result = ?, background_completed_at = ?, error_message = ?, updated_at = ? WHERE id = ?`, message, db.NowISO(), message, db.NowISO(), state.narratorID)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(backgroundParentID) != "" {
+			if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+				return err
+			}
+		}
+	} else {
+		_, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["timeout"]', error_message = ?, updated_at = ? WHERE id = ?`, message, db.NowISO(), state.narratorID)
+		if err != nil {
+			return err
+		}
+	}
+	if s.Hub != nil {
+		payload := map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"timeout"}, "isBackground": latest.IsBackground}
+		if treatAsBackground {
+			payload["backgroundStatus"] = "failed"
+		}
+		s.Hub.BroadcastNarrator(state.narratorID, payload)
+	}
+	return nil
+}
+
+func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *agentRunState) error {
+	state.completed = true
+	state.errored = true
+	message := "Provider stream disconnected before completion"
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
+	if treatAsBackground {
+		_, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["silent_disconnect"]', background_status = 'failed', background_result = ?, background_completed_at = ?, error_message = NULL, updated_at = ? WHERE id = ?`, message, db.NowISO(), db.NowISO(), state.narratorID)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(backgroundParentID) != "" {
+			if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+				return err
+			}
+		}
+	} else {
+		_, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["silent_disconnect"]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID)
+		if err != nil {
+			return err
+		}
+	}
+	if s.Hub != nil {
+		payload := map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"silent_disconnect"}, "isBackground": latest.IsBackground}
+		if treatAsBackground {
+			payload["backgroundStatus"] = "failed"
+		}
+		s.Hub.BroadcastNarrator(state.narratorID, payload)
 	}
 	return nil
 }
@@ -374,8 +750,10 @@ func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunSt
 	state.completed = true
 	state.errored = true
 	message := "Cancelled"
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	var err error
-	if state.narrator.IsBackground {
+	if treatAsBackground {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '[]', background_status = 'cancelled', background_result = ?, background_completed_at = ?, error_message = NULL, updated_at = ? WHERE id = ?`, message, db.NowISO(), db.NowISO(), state.narratorID)
 	} else {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '[]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID)
@@ -383,13 +761,13 @@ func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunSt
 	if err != nil {
 		return err
 	}
-	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil {
-		if err := s.finishBackgroundTaskRecord(ctx, *state.narrator.ParentNarratorID, state.narratorID, "cancelled", message); err != nil {
+	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
+		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "cancelled", message); err != nil {
 			return err
 		}
 	}
 	if s.Hub != nil {
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{}, "isBackground": state.narrator.IsBackground, "backgroundStatus": nullableTrimmedString("cancelled")})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "cancelled", false: ""}[treatAsBackground])})
 	}
 	return nil
 }
@@ -401,8 +779,10 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 		message = "agent run failed"
 	}
 	_, _ = s.addMessage(ctx, state.narratorID, "disp", "AI provider call failed: "+message, nil)
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	var err error
-	if state.narrator.IsBackground {
+	if treatAsBackground {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["error"]', background_status = 'failed', background_result = ?, background_completed_at = ?, error_message = ?, updated_at = ? WHERE id = ?`, message, db.NowISO(), message, db.NowISO(), state.narratorID)
 	} else {
 		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["error"]', error_message = ?, updated_at = ? WHERE id = ?`, message, db.NowISO(), state.narratorID)
@@ -410,13 +790,13 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 	if err != nil {
 		return err
 	}
-	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil {
-		if err := s.finishBackgroundTaskRecord(ctx, *state.narrator.ParentNarratorID, state.narratorID, "failed", message); err != nil {
+	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
+		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
 			return err
 		}
 	}
 	if s.Hub != nil {
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"error"}, "isBackground": state.narrator.IsBackground, "backgroundStatus": nullableTrimmedString("failed")})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"error"}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "failed", false: ""}[treatAsBackground])})
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package systemroutes
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -110,16 +111,21 @@ func TestFinishBenchmarkRunWithStatusReturnsUpdateErrors(t *testing.T) {
 	}
 }
 
-func TestBenchmarkContainerTaskUsesExplicitFallback(t *testing.T) {
+func TestBenchmarkContainerTaskUsesPodmanRunnerAndCleansUp(t *testing.T) {
 	sqlDB := newBenchmarkTestDB(t)
+	original := benchmarkContainerRunner
+	fake := &fakeBenchmarkPodmanRunner{}
+	benchmarkContainerRunner = fake
+	t.Cleanup(func() { benchmarkContainerRunner = original })
 	h := &Handler{DB: sqlDB, Narrators: narrators.NewService(sqlDB, nil, nil)}
 	insertBenchmarkSuite(t, sqlDB, "suite-1", "swe-bench", []map[string]any{{
-		"id":       "task-1",
-		"name":     "Needs container",
-		"prompt":   "Fix repo",
-		"metadata": map[string]any{"dockerImage": "python:3.11"},
+		"id":             "task-1",
+		"name":           "Needs container",
+		"prompt":         "Fix repo",
+		"expectedOutput": "expected",
+		"metadata":       map[string]any{"dockerImage": "python:3.11"},
 	}})
-	insertBenchmarkRun(t, sqlDB, "run-1", "suite-1", map[string]any{"fake": true})
+	insertBenchmarkRun(t, sqlDB, "run-1", "suite-1", map[string]any{"fake": true, "fakeOutput": "expected"})
 
 	run, err := h.claimBenchmarkRun(context.Background(), "run-1")
 	if err != nil {
@@ -127,17 +133,40 @@ func TestBenchmarkContainerTaskUsesExplicitFallback(t *testing.T) {
 	}
 	h.executeClaimedBenchmarkRun(context.Background(), run, func() {})
 
-	var taskStatus, message string
-	if err := sqlDB.QueryRow(`SELECT status, error_message FROM benchmark_task_results WHERE run_id='run-1'`).Scan(&taskStatus, &message); err != nil {
+	var taskStatus string
+	if err := sqlDB.QueryRow(`SELECT status FROM benchmark_task_results WHERE run_id='run-1'`).Scan(&taskStatus); err != nil {
 		t.Fatalf("load task: %v", err)
 	}
-	if taskStatus != "error" || !strings.Contains(message, "container execution is not implemented") {
-		t.Fatalf("expected explicit container fallback, got status=%s message=%q", taskStatus, message)
+	if taskStatus != "passed" {
+		t.Fatalf("expected container-backed fake task to pass, got %s", taskStatus)
 	}
-	var failed int
-	_ = sqlDB.QueryRow(`SELECT failed_tasks FROM benchmark_runs WHERE id='run-1'`).Scan(&failed)
-	if failed != 1 {
-		t.Fatalf("expected failed aggregate after fallback, got %d", failed)
+	if !fake.sawCommand("run") || !fake.sawCommand("rm") {
+		t.Fatalf("expected podman run and rm commands, got %#v", fake.commands)
+	}
+}
+
+func TestBenchmarkContainerSetupFailureCleansUp(t *testing.T) {
+	original := benchmarkContainerRunner
+	fake := &failingSetupPodmanRunner{}
+	benchmarkContainerRunner = fake
+	t.Cleanup(func() { benchmarkContainerRunner = original })
+	h := &Handler{}
+	task := benchmarkTask{ID: "task-1", Name: "Task", Metadata: map[string]any{"dockerImage": "python:3.11", "repo": "owner/repo", "baseCommit": "abc123"}}
+	_, err := h.prepareBenchmarkContainer(context.Background(), benchmarkRunRecord{ID: "run-1", Config: map[string]any{}}, task, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "setup failed") {
+		t.Fatalf("expected setup failure, got %v", err)
+	}
+	if !fake.sawCommand("rm") {
+		t.Fatalf("expected failed setup to remove container, got %#v", fake.commands)
+	}
+}
+
+func TestLimitedBufferTruncatesWithoutBlocking(t *testing.T) {
+	var buf bytes.Buffer
+	lb := &limitedBuffer{Buffer: &buf, Limit: 4}
+	_, _ = lb.Write([]byte("abcdef"))
+	if got := buf.String(); !strings.Contains(got, "[truncated]") {
+		t.Fatalf("expected truncation marker, got %q", got)
 	}
 }
 
@@ -249,6 +278,41 @@ func insertBenchmarkSuite(t *testing.T, db *sql.DB, idValue, name string, tasks 
 	if _, err := db.Exec(`INSERT INTO benchmark_suites (id,name,tasks_json,created_at) VALUES (?,?,?,?)`, idValue, name, string(payload), "2026-01-01T00:00:00Z"); err != nil {
 		t.Fatalf("insert suite: %v", err)
 	}
+}
+
+type fakeBenchmarkPodmanRunner struct{ commands [][]string }
+
+func (f *fakeBenchmarkPodmanRunner) Run(ctx context.Context, args []string, stdin string, timeout time.Duration) (benchmarkCommandResult, error) {
+	f.commands = append(f.commands, append([]string{}, args...))
+	if len(args) >= 2 && args[0] == "image" && args[1] == "exists" {
+		return benchmarkCommandResult{ExitCode: 0}, nil
+	}
+	if len(args) > 0 && args[0] == "run" {
+		return benchmarkCommandResult{ExitCode: 0, Stdout: "container-1"}, nil
+	}
+	return benchmarkCommandResult{ExitCode: 0, Stdout: "ok"}, nil
+}
+
+func (f *fakeBenchmarkPodmanRunner) sawCommand(name string) bool {
+	for _, cmd := range f.commands {
+		if len(cmd) > 0 && cmd[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+type failingSetupPodmanRunner struct{ fakeBenchmarkPodmanRunner }
+
+func (f *failingSetupPodmanRunner) Run(ctx context.Context, args []string, stdin string, timeout time.Duration) (benchmarkCommandResult, error) {
+	f.commands = append(f.commands, append([]string{}, args...))
+	if len(args) > 0 && args[0] == "run" {
+		return benchmarkCommandResult{ExitCode: 0, Stdout: "container-setup-fail"}, nil
+	}
+	if len(args) > 0 && args[0] == "exec" {
+		return benchmarkCommandResult{ExitCode: 2, Stdout: strings.Repeat("x", 32), Stderr: "boom"}, nil
+	}
+	return benchmarkCommandResult{ExitCode: 0}, nil
 }
 
 func insertBenchmarkRun(t *testing.T, db *sql.DB, idValue, suiteID string, config map[string]any) {

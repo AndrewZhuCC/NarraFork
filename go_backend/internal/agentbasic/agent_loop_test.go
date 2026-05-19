@@ -88,6 +88,70 @@ func eventTypeCount(events []AgentEvent, eventType string) int {
 	return count
 }
 
+type hangingAdapter struct {
+	chatCalls int
+	done      chan struct{}
+}
+
+func (a *hangingAdapter) ProviderName() string                { return "fake" }
+func (a *hangingAdapter) FormatTools(string) []map[string]any { return nil }
+func (a *hangingAdapter) BuildHistory(messages []Message, _ string, _ string) (BuiltHistory, error) {
+	history := make([]any, 0, len(messages))
+	for _, message := range messages {
+		history = append(history, message)
+	}
+	return BuiltHistory{History: history}, nil
+}
+func (a *hangingAdapter) InjectSystemPrompt(*BuiltHistory, string, string, string) {}
+func (a *hangingAdapter) Chat(ctx context.Context, params ChatParams) (<-chan StreamEvent, error) {
+	a.chatCalls++
+	a.done = make(chan struct{})
+	ch := make(chan StreamEvent)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+		close(a.done)
+	}()
+	return ch, nil
+}
+func (a *hangingAdapter) FormatToolResult(toolUseID string, output string, isError bool) any {
+	return map[string]any{"type": "tool_result", "tool_use_id": toolUseID, "content": output, "is_error": isError}
+}
+func (a *hangingAdapter) PushUserTurn(history *BuiltHistory, content string, toolResults []any) {}
+func (a *hangingAdapter) PushAssistantTurn(history *BuiltHistory, text string, toolUses []ToolCall, rawContent any) {
+}
+
+func TestFirstTokenTimeoutEmitsTerminalEventWithoutRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adapter := &hangingAdapter{}
+	stream := runAgentLoop(ctx, ProviderResolution{Provider: "fake", Model: "model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithMaxTurns(1), WithFirstTokenTimeout(5*time.Millisecond), WithMaxChatRetries(3)))
+	events := collectEvents(stream)
+	if eventTypeCount(events, "first_token_timeout") != 1 {
+		t.Fatalf("expected first_token_timeout event, got %v", eventTypes(events))
+	}
+	if eventTypeCount(events, "retrying") != 0 || adapter.chatCalls != 1 {
+		t.Fatalf("first-token timeout should not enter transient retry loop, events=%v chatCalls=%d", eventTypes(events), adapter.chatCalls)
+	}
+	select {
+	case <-adapter.done:
+	case <-time.After(time.Second):
+		t.Fatalf("first-token timeout should cancel the provider stream context")
+	}
+}
+
+func TestSilentDisconnectEmitsTerminalEvent(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{{{Parsed: ParsedStreamEvent{SilentDisconnect: true}}}}}
+	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithMaxTurns(1), WithFirstTokenTimeout(time.Second)))
+	events := collectEvents(stream)
+	if eventTypeCount(events, "silent_disconnect") != 1 {
+		t.Fatalf("expected silent_disconnect event, got %v", eventTypes(events))
+	}
+	if eventTypeCount(events, "error") != 0 || eventTypeCount(events, "retrying") != 0 {
+		t.Fatalf("silent disconnect should be terminal without error/retry events: %v", eventTypes(events))
+	}
+}
+
 func TestRunAgentLoopStreamsTextAndDone(t *testing.T) {
 	adapter := &scriptedAdapter{turns: [][]StreamEvent{{{Parsed: ParsedStreamEvent{Text: "hello"}}}}}
 	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithRetryBaseDelay(0)))

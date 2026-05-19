@@ -1,6 +1,6 @@
 {
 	"name": "go-backend-phase4-contract-matrix",
-	"updatedAt": "2026-05-18",
+	"updatedAt": "2026-05-19",
 	"scope": "Terminal, Container/Podman, Provider, MCP/settings, uploads/share/fs, update/runtime/storage runtime parity or explicit capability degradation.",
 	"contracts": [
 		{
@@ -44,53 +44,20 @@
 			"features": [
 				"Podman status/setup/install route surface",
 				"compose-info discovery and bounded compose file reads",
-				"manual start/stop/pause/unpause/remove/logs",
+				"manual stop/pause/unpause/remove/logs",
+				"container start returns immediately and continues compose up in a background goroutine",
+				"container start streams container:log events while preserving bounded final output",
+				"per-chapter container lifecycle lock",
+				"dormant/wake container pause/unpause-or-start lifecycle",
+				"fork/split new-fork container auto-start when containerConfig is inherited",
+				"remove route accepts deleteVolumes and runs compose down -v",
 				"host port allocation and release",
 				"proxy-mode metadata when project proxy domain and pasta/passt backend are available",
+				"Go-owned HTTP/WebSocket reverse proxy runtime with settings start/stop/restart hook",
+				"container ready narrator message injection and Browser auto-enable",
 				"container status persistence and status-change broadcasts"
 			],
-			"fallbacks": [
-				{
-					"feature": "container.backgroundStart",
-					"supported": false,
-					"reason": "Go container start is synchronous within the HTTP request."
-				},
-				{
-					"feature": "container.streamingLogs",
-					"supported": false,
-					"reason": "Go container actions return bounded command output instead of streaming container:log events."
-				},
-				{
-					"feature": "container.perChapterLock",
-					"supported": false,
-					"reason": "TS containerLock semantics are not implemented."
-				},
-				{
-					"feature": "container.autoStartOnFork",
-					"supported": false,
-					"reason": "Fork inherits config and reports fallback; containers must be started manually."
-				},
-				{
-					"feature": "container.dormantWakeLifecycle",
-					"supported": false,
-					"reason": "Dormant/wake do not automatically pause/unpause containers in go_backend yet."
-				},
-				{
-					"feature": "container.deleteVolumes",
-					"supported": false,
-					"reason": "remove route does not expose TS deleteVolumes/-v semantics yet."
-				},
-				{
-					"feature": "container.reverseProxyRuntime",
-					"supported": false,
-					"reason": "Go backend records proxy metadata but does not host the TS container reverse proxy runtime."
-				},
-				{
-					"feature": "container.readyNarratorIntegration",
-					"supported": false,
-					"reason": "Container ready messages and Browser auto-enable are not implemented in go_backend."
-				}
-			],
+			"fallbacks": [],
 			"goSources": [
 				"go_backend/internal/chapters/handlers.go",
 				"go_backend/internal/chapters/container_runtime.go",
@@ -209,6 +176,7 @@
 			"status": "supported-baseline-with-security-and-presentation-degradations",
 			"features": [
 				"narrator image and avatar upload file serving",
+				"upload cleanup preserves directories still referenced by narrator image message blocks",
 				"share creation, public download, and public preview",
 				"safe share headers and escaped HTML preview",
 				"fs browse, shortcuts, mkdir, reveal fallback, and bounded preview"
@@ -219,11 +187,6 @@
 					"feature": "shares.ephemeralOnly",
 					"supported": false,
 					"reason": "Go resolver can serve disk fallback share directories after in-memory records are gone."
-				},
-				{
-					"feature": "uploads.messageImageRefCleanupParity",
-					"supported": false,
-					"mode": "partial"
 				},
 				{ "feature": "fs.reveal.linux", "supported": false, "code": "FS_REVEAL_UNSUPPORTED" }
 			],

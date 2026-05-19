@@ -2,10 +2,23 @@ package db
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
+
+	"narrafork-go/internal/compat/bunfinal"
 )
+
+func TestSavedSchemaSnapshotManifestIsValid(t *testing.T) {
+	manifest, err := bunfinal.ReadManifest()
+	if err != nil {
+		t.Fatalf("read bun-final manifest: %v", err)
+	}
+	if err := bunfinal.ValidateManifest(manifest); err != nil {
+		t.Fatalf("validate bun-final manifest: %v", err)
+	}
+	if manifest.Source != "bun-final" {
+		t.Fatalf("manifest source = %q, want bun-final", manifest.Source)
+	}
+}
 
 func TestSavedSchemaSnapshotHashMatchesFile(t *testing.T) {
 	snapshot := loadSavedSchemaSnapshot(t)
@@ -104,7 +117,7 @@ func TestSavedSnapshotDocumentsLegacyOptionalExtensionObjects(t *testing.T) {
 
 func loadSavedSchemaSnapshot(t *testing.T) SQLiteSchemaSnapshot {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("testdata", "current_ts_schema_snapshot.json"))
+	data, err := bunfinal.ReadSQLiteSchemaSnapshot()
 	if err != nil {
 		t.Fatalf("read saved schema snapshot: %v", err)
 	}
@@ -117,11 +130,11 @@ func loadSavedSchemaSnapshot(t *testing.T) SQLiteSchemaSnapshot {
 
 func readSnapshotHashFile(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(filepath.Join("testdata", "current_ts_schema_snapshot.sha256"))
+	hash, err := bunfinal.ReadSQLiteSchemaSnapshotHash()
 	if err != nil {
 		t.Fatalf("read saved schema snapshot hash: %v", err)
 	}
-	return normalizeSnapshotSQL(string(data))
+	return normalizeSnapshotSQL(hash)
 }
 
 func savedSnapshotTables(snapshot SQLiteSchemaSnapshot) map[string]map[string]struct{} {

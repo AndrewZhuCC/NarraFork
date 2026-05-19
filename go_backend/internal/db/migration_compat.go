@@ -33,16 +33,25 @@ func (s *Store) EnsureMigrationCompatibility(ctx context.Context) error {
 	if s == nil || s.SQL == nil {
 		return fmt.Errorf("%w: database is not open", ErrMigrationCompatibilityMismatch)
 	}
-	return EnsureMigrationCompatibility(ctx, s.SQL)
+	return EnsureMigrationCompatibilityWithRuntime(ctx, s.SQL, s.RuntimeSQL)
 }
 
 // EnsureMigrationCompatibility verifies that the existing TS-owned Drizzle
 // migration journal contains every migration hash embedded into this Go build.
-// It never executes Drizzle SQL and only writes the Go-owned compatibility
-// journal table after the canonical schema verifier has already passed.
+// It never executes Drizzle SQL. The legacy standalone helper writes the
+// Go-owned compatibility journal to the same database for tests and older
+// callers; Store.EnsureMigrationCompatibility writes it to the Go runtime
+// sidecar instead.
 func EnsureMigrationCompatibility(ctx context.Context, sqlDB *sql.DB) error {
+	return EnsureMigrationCompatibilityWithRuntime(ctx, sqlDB, sqlDB)
+}
+
+func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB, runtimeDB *sql.DB) error {
 	if sqlDB == nil {
 		return fmt.Errorf("%w: database is not open", ErrMigrationCompatibilityMismatch)
+	}
+	if runtimeDB == nil {
+		runtimeDB = sqlDB
 	}
 	if len(embeddedDrizzleMigrationSnapshot) == 0 {
 		return fmt.Errorf("%w: no embedded Drizzle migration snapshot", ErrMigrationCompatibilityMismatch)
@@ -77,7 +86,7 @@ func EnsureMigrationCompatibility(ctx context.Context, sqlDB *sql.DB) error {
 		return fmt.Errorf("marshal Go migration compatibility journal details: %w", err)
 	}
 
-	return writeGoMigrationJournal(ctx, sqlDB, last, string(detailsJSON))
+	return writeGoMigrationJournal(ctx, runtimeDB, last, string(detailsJSON))
 }
 
 func readAppliedDrizzleMigrationHashes(ctx context.Context, sqlDB *sql.DB) (map[string]struct{}, error) {

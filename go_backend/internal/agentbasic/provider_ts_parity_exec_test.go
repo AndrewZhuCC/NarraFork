@@ -59,6 +59,24 @@ func TestGoMatchesExecutableTSProviderFixtures(t *testing.T) {
 			RequestBody         map[string]any   `json:"requestBody"`
 			AuthorizationPrefix string           `json:"authorizationPrefix"`
 		} `json:"tsCodexProvider"`
+		TSCodexRebuildHistory struct {
+			RequestCount             int              `json:"requestCount"`
+			FirstAuthorizationPrefix string           `json:"firstAuthorizationPrefix"`
+			FirstCredentialID        string           `json:"firstCredentialId"`
+			FailedCredentialID       string           `json:"failedCredentialId"`
+			PartialText              string           `json:"partialText"`
+			Events                   []map[string]any `json:"events"`
+			Error                    struct {
+				Name                 string `json:"name"`
+				Message              string `json:"message"`
+				Code                 string `json:"code"`
+				PreviousCredentialID string `json:"previousCredentialId"`
+				Operation            string `json:"operation"`
+			} `json:"error"`
+			FailedDisabledReason string  `json:"failedDisabledReason"`
+			FailedQuotaResetsAt  float64 `json:"failedQuotaResetsAt"`
+			Available            int     `json:"available"`
+		} `json:"tsCodexRebuildHistory"`
 		TSProviderErrors struct {
 			OpenAIChat      []map[string]any `json:"openAIChat"`
 			OpenAIResponses []map[string]any `json:"openAIResponses"`
@@ -159,6 +177,22 @@ func TestGoMatchesExecutableTSProviderFixtures(t *testing.T) {
 		tsFixture.TSCodexProvider.RequestBody["parallel_tool_calls"] != true ||
 		tsFixture.TSCodexProvider.AuthorizationPrefix != "Bearer " {
 		t.Fatalf("TS Codex provider runtime fixture missing expected stream/body/header: %#v", tsFixture.TSCodexProvider)
+	}
+	failedCodexID := strings.TrimSpace(tsFixture.TSCodexRebuildHistory.FailedCredentialID)
+	if !fixtureEventsContainText(tsFixture.TSCodexRebuildHistory.Events, "partial") ||
+		failedCodexID == "" ||
+		!fixtureEventsContainCredential(tsFixture.TSCodexRebuildHistory.Events, failedCodexID) ||
+		tsFixture.TSCodexRebuildHistory.RequestCount != 1 ||
+		strings.TrimSpace(tsFixture.TSCodexRebuildHistory.FirstCredentialID) != failedCodexID ||
+		tsFixture.TSCodexRebuildHistory.FirstAuthorizationPrefix != "Bearer " ||
+		tsFixture.TSCodexRebuildHistory.PartialText != "partial" ||
+		tsFixture.TSCodexRebuildHistory.Error.Code != CodexRebuildHistoryRetryCode ||
+		strings.TrimSpace(tsFixture.TSCodexRebuildHistory.Error.Operation) != "chat" ||
+		strings.TrimSpace(tsFixture.TSCodexRebuildHistory.Error.PreviousCredentialID) != failedCodexID ||
+		tsFixture.TSCodexRebuildHistory.FailedDisabledReason != "quota_exhausted" ||
+		tsFixture.TSCodexRebuildHistory.FailedQuotaResetsAt <= 0 ||
+		tsFixture.TSCodexRebuildHistory.Available < 1 {
+		t.Fatalf("TS Codex rebuild-history fixture missing expected failover/retry state: %#v", tsFixture.TSCodexRebuildHistory)
 	}
 	if !fixtureEventsContainInvalidState(tsFixture.TSProviderErrors.OpenAIChat, "rate_limit", "ts rate limited") ||
 		!fixtureEventsContainInvalidState(tsFixture.TSProviderErrors.OpenAIResponses, "server_error", "ts failed") ||

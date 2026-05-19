@@ -1,6 +1,7 @@
 package settings
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -24,7 +25,14 @@ import (
 	"narrafork-go/internal/id"
 )
 
-type Handler struct{ Store *config.Store }
+type ContainerProxyRuntime interface {
+	EnsureContainerProxy(ctx context.Context, enabled bool, port int) error
+}
+
+type Handler struct {
+	Store        *config.Store
+	ProxyRuntime ContainerProxyRuntime
+}
 
 func NewHandler(store *config.Store) *Handler { return &Handler{Store: store} }
 
@@ -62,8 +70,21 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	oldHost, oldPort, oldTLSEnabled := serverAddressState(current)
+	oldProxyEnabled, oldProxyPort := containerProxyState(current)
+	prospective := cloneMap(current)
+	mergeSettingsPatch(prospective, patch)
+	newProxyEnabled, newProxyPort := containerProxyState(prospective)
+	proxyRuntimeChanged := oldProxyEnabled != newProxyEnabled || oldProxyPort != newProxyPort
+	if proxyRuntimeChanged && h.ProxyRuntime != nil {
+		if err := h.ProxyRuntime.EnsureContainerProxy(r.Context(), newProxyEnabled, newProxyPort); err != nil {
+			return err
+		}
+	}
 	next, err := h.Store.Patch(patch)
 	if err != nil {
+		if proxyRuntimeChanged && h.ProxyRuntime != nil {
+			_ = h.ProxyRuntime.EnsureContainerProxy(context.Background(), oldProxyEnabled, oldProxyPort)
+		}
 		return err
 	}
 	next, _ = h.applyProviderRemovalSideEffects(current, next)
@@ -86,7 +107,9 @@ func augmentProviderModelSettings(raw map[string]any) {
 	raw["nkpModelsGrouped"] = groupedSettingsModels(raw, "nkpProviders", "nkp", loadProviderModelCache("nkp"))
 	raw["nugModelsGrouped"] = groupedSettingsModels(raw, "nugProviders", "nug", loadProviderModelCache("nug"))
 	raw["clineModelsGrouped"] = clineEnabledModelsGrouped(raw, loadProviderModelCache("cline"))
-	raw["nkpQuotas"] = loadObjectCache("nkp-quotas.json")
+	raw["customApiQuotas"] = loadObjectCache("custom-api-quotas.json")
+	raw["nkpQuotas"] = loadQuotaObjectCache("nkp-quotas.json", "quotaBalance", "quotaTotalGranted")
+	raw["nugQuotas"] = loadQuotaObjectCache("nug-quotas.json", "balance", "totalGranted")
 	raw["codexAvailable"] = len(loadCodexCredentialEntries()) > 0
 	raw["codexModels"] = builtinCodexModels()
 	raw["builtinModelContextWindows"] = builtinCodexContextWindows()
@@ -211,6 +234,23 @@ func loadObjectCache(fileName string) map[string]any {
 		return map[string]any{}
 	}
 	return cache
+}
+
+func loadQuotaObjectCache(fileName string, keys ...string) map[string]any {
+	raw := loadObjectCache(fileName)
+	out := map[string]any{}
+	for providerID, value := range raw {
+		record, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		entry := map[string]any{}
+		for _, key := range keys {
+			entry[key] = record[key]
+		}
+		out[providerID] = entry
+	}
+	return out
 }
 
 func groupedSettingsModels(raw map[string]any, providerField, kind string, cache map[string][]map[string]any) []any {
@@ -429,10 +469,27 @@ func normalizeLegacySettingsPatch(patch map[string]any) map[string]any {
 			agent["dangerSkipReadOnlyConfirmations"] = value
 		}
 	}
+	if value, ok := agent["questionReflectionTimeoutMs"]; ok {
+		agent["questionReflectionTimeoutMs"] = clampNumberValue(value, 10000, 3600000, 300000)
+	}
 	return patch
 }
 
+func clampNumberValue(value any, minValue, maxValue, fallback int) float64 {
+	parsed := intSetting(value, fallback)
+	if parsed < minValue {
+		parsed = minValue
+	}
+	if parsed > maxValue {
+		parsed = maxValue
+	}
+	return float64(parsed)
+}
+
 func prepareSettingsPatch(current, patch map[string]any) error {
+	if err := validateAuthSettingsPatch(patch); err != nil {
+		return err
+	}
 	if err := preserveMaskedSecrets(current, patch); err != nil {
 		return err
 	}
@@ -441,6 +498,30 @@ func prepareSettingsPatch(current, patch map[string]any) error {
 	}
 	if err := validateTLSFiles(patch); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateAuthSettingsPatch(patch map[string]any) error {
+	rawAuth, exists := patch["auth"]
+	if !exists {
+		return nil
+	}
+	authPatch, ok := rawAuth.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("auth must be an object")
+	}
+	for key, value := range authPatch {
+		switch key {
+		case "jwtSecret":
+			return httpx.ValidationError("auth.jwtSecret cannot be updated")
+		case "registrationOpen":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("auth.registrationOpen must be boolean")
+			}
+		default:
+			return httpx.ValidationError("auth." + key + " cannot be updated")
+		}
 	}
 	return nil
 }
@@ -821,6 +902,26 @@ func serverAddressState(raw map[string]any) (string, int, bool) {
 	port := intSetting(server["port"], 7778)
 	tls, _ := server["tls"].(map[string]any)
 	return host, port, boolValue(tls["enabled"])
+}
+
+func containerProxyState(raw map[string]any) (bool, int) {
+	containers, _ := raw["containers"].(map[string]any)
+	proxy, _ := containers["proxy"].(map[string]any)
+	return boolValue(proxy["enabled"]), intSetting(proxy["port"], 7780)
+}
+
+func mergeSettingsPatch(dst, patch map[string]any) {
+	for key, value := range patch {
+		if child, ok := value.(map[string]any); ok {
+			if existing, ok := dst[key].(map[string]any); ok {
+				mergeSettingsPatch(existing, child)
+				continue
+			}
+			dst[key] = cloneMap(child)
+			continue
+		}
+		dst[key] = value
+	}
 }
 
 func serverURL(host string, port int, tlsEnabled bool) string {

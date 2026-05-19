@@ -61,6 +61,13 @@ func TestFileStateRebuildDiffRevertAndUnrevert(t *testing.T) {
 	}
 	insertNarratorToolCallForSnapshotTest(t, sqlDB, narratorID, "msg_write", "write-1", "Write", map[string]any{"file_path": "note.txt", "content": "hello\nworld\n"}, baseTime.Add(time.Second))
 	insertNarratorToolCallForSnapshotTest(t, sqlDB, narratorID, "msg_edit", "edit-1", "Edit", map[string]any{"file_path": "note.txt", "old_string": "world", "new_string": "Go"}, baseTime.Add(2*time.Second))
+	writeBlocks, _ := json.Marshal([]map[string]any{
+		{"type": "text", "text": "write"},
+		{"type": "tool_use", "id": "write-1", "name": "Write", "input": map[string]any{"file_path": "note.txt", "content": "hello\nworld\n"}},
+	})
+	if _, err := sqlDB.Exec(`UPDATE narrator_messages SET content_json = ?, content_text = 'write' WHERE id = 'msg_write'`, string(writeBlocks)); err != nil {
+		t.Fatalf("update write message blocks: %v", err)
+	}
 
 	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/file-modifications")
 	if w.Code != http.StatusOK {
@@ -125,6 +132,25 @@ func TestFileStateRebuildDiffRevertAndUnrevert(t *testing.T) {
 	affectedFile := affected[0].(map[string]any)
 	if affectedFile["currentContent"] != "hello\nGo\n" || affectedFile["revertedContent"] != "hello\nworld\n" || affectedFile["willBeDeleted"] != false {
 		t.Fatalf("delete preview should use rebuilt current/reverted states, got %#v", affectedFile)
+	}
+
+	w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/rollback-preview?messageId=msg_write&blockIndex=0")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected rollback preview 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &preview); err != nil {
+		t.Fatalf("decode rollback preview: %v body=%s", err, w.Body.String())
+	}
+	if preview["toolCallCount"] != float64(2) || preview["deletedBlockCount"] != float64(1) || preview["deletedMessageCount"] != float64(1) {
+		t.Fatalf("rollback preview should count removed tool calls/blocks/messages, got %#v", preview)
+	}
+	affected, _ = preview["affectedFiles"].([]any)
+	if len(affected) != 1 {
+		t.Fatalf("expected one rollback affected file, got %#v", preview)
+	}
+	affectedFile = affected[0].(map[string]any)
+	if affectedFile["currentContent"] != "hello\nGo\n" || affectedFile["revertedContent"] != "hello\n" || affectedFile["willBeDeleted"] != false {
+		t.Fatalf("rollback preview should expose current/reverted file-state diff, got %#v", affectedFile)
 	}
 
 	w = serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/revert", map[string]any{"messageId": "msg_edit"})
@@ -418,6 +444,28 @@ func serveNarratorHandlerRequest(sqlDB *sql.DB, method string, path string) *htt
 
 func serveNarratorHandlerJSON(sqlDB *sql.DB, method string, path string, body any) *httptest.ResponseRecorder {
 	h := NewHandler(&Service{DB: sqlDB})
+	r := chi.NewRouter()
+	r.Route("/narrators", h.RegisterRoutes)
+	data, _ := json.Marshal(body)
+	req := httptest.NewRequest(method, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func serveNarratorHandlerRequestWithBrowserStorage(sqlDB *sql.DB, method string, path string) *httptest.ResponseRecorder {
+	h := NewHandler(&Service{DB: sqlDB, BrowserSessionPersistenceEnabled: true})
+	r := chi.NewRouter()
+	r.Route("/narrators", h.RegisterRoutes)
+	req := httptest.NewRequest(method, path, nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func serveNarratorHandlerJSONWithBrowserStorage(sqlDB *sql.DB, method string, path string, body any) *httptest.ResponseRecorder {
+	h := NewHandler(&Service{DB: sqlDB, BrowserSessionPersistenceEnabled: true})
 	r := chi.NewRouter()
 	r.Route("/narrators", h.RegisterRoutes)
 	data, _ := json.Marshal(body)

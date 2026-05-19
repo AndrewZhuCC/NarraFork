@@ -39,6 +39,9 @@ type Service struct {
 	BroadcastMergeProgress func(payload any)
 	MergeDecisionTimeout   time.Duration
 	MergeDecisionInterval  time.Duration
+	// BrowserToolAutoEnableEnabled keeps the container-ready browser tool injection
+	// disabled unless an explicit cutover opts into auto-enabling it.
+	BrowserToolAutoEnableEnabled bool
 }
 
 type Chapter struct {
@@ -77,8 +80,30 @@ type Chapter struct {
 	LastAccessedAt        *string        `json:"lastAccessedAt"`
 	CreatedAt             string         `json:"createdAt"`
 	UpdatedAt             string         `json:"updatedAt"`
-	Warnings              []string       `json:"warnings,omitempty"`
-	Fallbacks             []ForkFallback `json:"fallbacks,omitempty"`
+	PanelActiveTab        *string        `json:"panelActiveTab"`
+	PanelFilters          map[string]any `json:"panelFilters"`
+	PanelRefreshNeeded    bool           `json:"panelRefreshNeeded"`
+	PanelLastRefreshAt    *time.Time     `json:"panelLastRefreshAt"`
+	PanelSearchQuery      *string        `json:"panelSearchQuery"`
+	PanelSortBy           *string        `json:"panelSortBy"`
+	PanelSortDirection    *string        `json:"panelSortDirection"`
+	PanelFilterTags       []string       `json:"panelFilterTags"`
+	Warnings              []string       `json:"warnings"`
+	Fallbacks             []ForkFallback `json:"fallbacks"`
+}
+
+func (s *Service) EnableBrowserToolAutoEnable() {
+	if s == nil {
+		return
+	}
+	s.BrowserToolAutoEnableEnabled = true
+}
+
+func (s *Service) DisableBrowserToolAutoEnable() {
+	if s == nil {
+		return
+	}
+	s.BrowserToolAutoEnableEnabled = false
 }
 
 type ForkFallback struct {
@@ -392,7 +417,7 @@ func (s *Service) Fork(ctx context.Context, sourceID string, input ForkInput) (C
 		fallback("narratorContext", "No primary parent narrator was found; created a fresh narrator for the fork.")
 	}
 	if source.ContainerConfig != nil {
-		fallback("containerStartup", "Container config was inherited, but Go backend does not auto-start fork containers yet; start them manually from the chapter container controls.")
+		s.startChapterContainersBackground(chapterID)
 	}
 	if project.StartupScript.Valid && strings.TrimSpace(project.StartupScript.String) != "" {
 		scriptWarnings := runStartupScript(ctx, worktreePath, chapterID, project.StartupScript.String)
@@ -1277,90 +1302,115 @@ func (s *Service) Delete(ctx context.Context, chapterID string) error {
 }
 
 func (s *Service) Dormant(ctx context.Context, chapterID string) error {
-	ch, err := s.Get(ctx, chapterID)
-	if err != nil {
+	return withChapterContainerLock(chapterID, func() error {
+		ch, err := s.Get(ctx, chapterID)
+		if err != nil {
+			return err
+		}
+		if ch.IsRoot {
+			return httpx.BadRequest("Cannot make root chapter dormant")
+		}
+		if ch.Status != "active" {
+			return httpx.BadRequest("Can only make active chapters dormant")
+		}
+		if ch.WorktreePath == nil || strings.TrimSpace(*ch.WorktreePath) == "" {
+			return httpx.BadRequest("Chapter has no worktree")
+		}
+		project, err := s.getProject(ctx, ch.ProjectID)
+		if err != nil {
+			return err
+		}
+		if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
+			return httpx.BadRequest("Project has no git repository configured")
+		}
+		if err := s.killAndDeleteChapterTerminals(ctx, chapterID); err != nil {
+			return err
+		}
+		if ch.ContainerConfig != nil {
+			paused, err := s.pauseChapterContainersLocked(ctx, ch)
+			if err != nil {
+				s.broadcastContainerLifecycle(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			} else if paused {
+				s.broadcastContainerLifecycle(map[string]any{"type": "container:paused", "chapterId": chapterID})
+			}
+		}
+		if _, err := s.Git.AutoCommit(ctx, *ch.WorktreePath, "auto-save before dormant"); err != nil {
+			s.Git.AbortMerge(ctx, *ch.WorktreePath)
+			_, _ = s.Git.AutoCommit(ctx, *ch.WorktreePath, "auto-save before dormant (after merge abort)")
+		}
+		if safeWorktreePath(project.GitPath.String, *ch.WorktreePath) {
+			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, *ch.WorktreePath)
+		}
+		_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'dormant', worktree_path = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), chapterID)
+		if err == nil {
+			s.broadcastContainerLifecycle(map[string]any{"type": "chapter:dormant", "chapterId": chapterID, "projectId": ch.ProjectID})
+		}
 		return err
-	}
-	if ch.IsRoot {
-		return httpx.BadRequest("Cannot make root chapter dormant")
-	}
-	if ch.Status != "active" {
-		return httpx.BadRequest("Can only make active chapters dormant")
-	}
-	if ch.WorktreePath == nil || strings.TrimSpace(*ch.WorktreePath) == "" {
-		return httpx.BadRequest("Chapter has no worktree")
-	}
-	project, err := s.getProject(ctx, ch.ProjectID)
-	if err != nil {
-		return err
-	}
-	if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
-		return httpx.BadRequest("Project has no git repository configured")
-	}
-	if err := s.killAndDeleteChapterTerminals(ctx, chapterID); err != nil {
-		return err
-	}
-	if _, err := s.Git.AutoCommit(ctx, *ch.WorktreePath, "auto-save before dormant"); err != nil {
-		s.Git.AbortMerge(ctx, *ch.WorktreePath)
-		_, _ = s.Git.AutoCommit(ctx, *ch.WorktreePath, "auto-save before dormant (after merge abort)")
-	}
-	if safeWorktreePath(project.GitPath.String, *ch.WorktreePath) {
-		_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, *ch.WorktreePath)
-	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'dormant', worktree_path = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), chapterID)
-	return err
+	})
 }
 
 func (s *Service) Wake(ctx context.Context, chapterID string) error {
-	ch, err := s.Get(ctx, chapterID)
-	if err != nil {
-		return err
-	}
-	if ch.Status != "dormant" && ch.Status != "merged" {
-		return httpx.BadRequest("Can only wake dormant or merged chapters")
-	}
-	project, err := s.getProject(ctx, ch.ProjectID)
-	if err != nil {
-		return err
-	}
-	if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
-		return httpx.BadRequest("Project has no git repository configured")
-	}
-	branchSuffix := strings.Join(strings.Split(ch.Branch, "/")[1:], "/")
-	if strings.TrimSpace(branchSuffix) == "" {
-		branchSuffix = slugify(ch.Title) + "-" + id.Must(6)
-	}
-	worktreePath := filepath.Join(project.GitPath.String, ".worktrees", branchSuffix)
-	if err := s.Git.CreateWorktree(ctx, project.GitPath.String, worktreePath, ch.Branch); err != nil {
-		return err
-	}
-	now := db.NowISO()
-	if ch.Status == "merged" {
-		tx, err := s.DB.BeginTx(ctx, nil)
+	return withChapterContainerLock(chapterID, func() error {
+		ch, err := s.Get(ctx, chapterID)
 		if err != nil {
+			return err
+		}
+		if ch.Status != "dormant" && ch.Status != "merged" {
+			return httpx.BadRequest("Can only wake dormant or merged chapters")
+		}
+		project, err := s.getProject(ctx, ch.ProjectID)
+		if err != nil {
+			return err
+		}
+		if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
+			return httpx.BadRequest("Project has no git repository configured")
+		}
+		branchSuffix := strings.Join(strings.Split(ch.Branch, "/")[1:], "/")
+		if strings.TrimSpace(branchSuffix) == "" {
+			branchSuffix = slugify(ch.Title) + "-" + id.Must(6)
+		}
+		worktreePath := filepath.Join(project.GitPath.String, ".worktrees", branchSuffix)
+		if err := s.Git.CreateWorktree(ctx, project.GitPath.String, worktreePath, ch.Branch); err != nil {
+			return err
+		}
+		now := db.NowISO()
+		if ch.Status == "merged" {
+			tx, err := s.DB.BeginTx(ctx, nil)
+			if err != nil {
+				_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
+				return err
+			}
+			defer tx.Rollback()
+			if _, err := tx.ExecContext(ctx, `UPDATE chapters SET status = 'active', worktree_path = ?, merged_into_chapter_id = NULL, merge_commit_sha = NULL, merge_strategy = NULL, pre_merge_target_sha = NULL, last_accessed_at = ?, updated_at = ? WHERE id = ?`, worktreePath, now, now, chapterID); err != nil {
+				_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM chapter_edges WHERE source_id = ? AND type = 'merge'`, chapterID); err != nil {
+				_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
+				return err
+			}
+		} else if _, err := s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'active', worktree_path = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?`, worktreePath, now, now, chapterID); err != nil {
 			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
 			return err
 		}
-		defer tx.Rollback()
-		if _, err := tx.ExecContext(ctx, `UPDATE chapters SET status = 'active', worktree_path = ?, merged_into_chapter_id = NULL, merge_commit_sha = NULL, merge_strategy = NULL, pre_merge_target_sha = NULL, last_accessed_at = ?, updated_at = ? WHERE id = ?`, worktreePath, now, now, chapterID); err != nil {
-			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
-			return err
+		if ch.ContainerConfig != nil {
+			eventType, err := s.unpauseOrStartChapterContainersLocked(ctx, chapterID)
+			if err != nil {
+				s.broadcastContainerLifecycle(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			} else if eventType != "" {
+				if eventType == "container:started" {
+					_ = s.handleContainerReadyNarratorIntegration(ctx, chapterID)
+				}
+				s.broadcastContainerLifecycle(map[string]any{"type": eventType, "chapterId": chapterID})
+			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM chapter_edges WHERE source_id = ? AND type = 'merge'`, chapterID); err != nil {
-			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
-			return err
-		}
+		s.broadcastContainerLifecycle(map[string]any{"type": "chapter:woken", "chapterId": chapterID, "projectId": ch.ProjectID})
 		return nil
-	}
-	if _, err := s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'active', worktree_path = ?, last_accessed_at = ?, updated_at = ? WHERE id = ?`, worktreePath, now, now, chapterID); err != nil {
-		_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, worktreePath)
-		return err
-	}
-	return nil
+	})
 }
 
 func (s *Service) BatchCleanup(ctx context.Context, chapterIDs []string, force, deleteBranch bool) (CleanupReport, error) {
@@ -1433,13 +1483,22 @@ func (s *Service) killAndDeleteChapterTerminals(ctx context.Context, chapterID s
 }
 
 func (s *Service) cleanupChapterResources(ctx context.Context, ch Chapter, deleteBranch bool) error {
+	return withChapterContainerLock(ch.ID, func() error {
+		return s.cleanupChapterResourcesLocked(ctx, ch, deleteBranch)
+	})
+}
+
+func (s *Service) cleanupChapterResourcesLocked(ctx context.Context, ch Chapter, deleteBranch bool) error {
 	chapterID := ch.ID
 	if err := s.killAndDeleteChapterTerminals(ctx, chapterID); err != nil {
 		return err
 	}
-	s.removeChapterContainersIfPossible(ctx, ch)
+	if err := s.removeChapterContainersLocked(ctx, ch, deleteBranch); err != nil {
+		return err
+	}
+	s.broadcastContainerLifecycle(map[string]any{"type": "container:stopped", "chapterId": chapterID})
 	project, err := s.getProject(ctx, ch.ProjectID)
-	if err == nil && project.GitPath.Valid {
+	if err == nil && project.GitPath.Valid && s.Git != nil {
 		if ch.WorktreePath != nil && safeWorktreePath(project.GitPath.String, *ch.WorktreePath) {
 			_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, *ch.WorktreePath)
 		}
@@ -1448,6 +1507,9 @@ func (s *Service) cleanupChapterResources(ctx context.Context, ch Chapter, delet
 		}
 	}
 	_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'abandoned', worktree_path = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), chapterID)
+	if err == nil {
+		s.broadcastContainerLifecycle(map[string]any{"type": "chapter:abandoned", "chapterId": chapterID, "projectId": ch.ProjectID})
+	}
 	return err
 }
 
@@ -1525,7 +1587,7 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 			return err
 		}
 		if !status.Clean {
-			return httpx.BadRequest("target worktree has uncommitted changes")
+			return mergeDirtyValidationError("target")
 		}
 		preMergeHead, err := s.Git.HeadCommit(ctx, targetWorktree)
 		if err != nil {
@@ -1624,7 +1686,7 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 		return nil, err
 	}
 	if !status.Clean {
-		return nil, httpx.BadRequest("target worktree has uncommitted changes")
+		return nil, mergeDirtyValidationError("target")
 	}
 	preMergeHead, err := s.Git.HeadCommit(ctx, *target.WorktreePath)
 	if err != nil {
@@ -2152,42 +2214,34 @@ func (s *Service) reviewRequiredBeforeMerge(ctx context.Context, projectID strin
 }
 
 func (s *Service) prepareSourceBeforeMerge(ctx context.Context, source, target Chapter, gitPath string, requireReview bool) error {
+	if err := s.ensureMergeWorktreeClean(ctx, source, "source"); err != nil {
+		return err
+	}
 	if requireReview {
 		return s.ensureSourceReadyForRequiredReview(ctx, source, gitPath)
 	}
-	_, err := s.autoCommitSourceBeforeMerge(ctx, source, target)
-	return err
+	return nil
 }
 
-func (s *Service) autoCommitSourceBeforeMerge(ctx context.Context, source, target Chapter) (string, error) {
-	if source.WorktreePath == nil || strings.TrimSpace(*source.WorktreePath) == "" {
-		return "", nil
-	}
-	worktree := strings.TrimSpace(*source.WorktreePath)
-	message := fmt.Sprintf("Auto-commit %s changes before merge into %s", firstNonEmptyString(source.Title, source.Branch), target.Branch)
-	var commitSHA string
-	err := s.Git.WithWorktreeLock(worktree, func() error {
-		currentBranch, err := s.Git.CurrentBranch(ctx, worktree)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(currentBranch) != source.Branch {
-			return httpx.BadRequest(fmt.Sprintf("Source chapter worktree is on branch %s, expected %s", currentBranch, source.Branch))
-		}
-		sha, err := s.Git.AutoCommit(ctx, worktree, message)
-		if err != nil {
-			return err
-		}
-		commitSHA = strings.TrimSpace(sha)
+func (s *Service) ensureMergeWorktreeClean(ctx context.Context, chapter Chapter, kind string) error {
+	if chapter.WorktreePath == nil || strings.TrimSpace(*chapter.WorktreePath) == "" {
 		return nil
-	})
-	if err != nil || commitSHA == "" {
-		return commitSHA, err
 	}
-	if err := s.recordChapterCommit(ctx, source.ID, commitSHA, message, "auto"); err != nil {
-		return "", err
+	status, err := s.Git.Status(ctx, strings.TrimSpace(*chapter.WorktreePath))
+	if err != nil {
+		return err
 	}
-	return commitSHA, nil
+	if !status.Clean {
+		return mergeDirtyValidationError(kind)
+	}
+	return nil
+}
+
+func mergeDirtyValidationError(kind string) error {
+	if kind == "target" {
+		return httpx.ValidationError("MERGE_DIRTY_TARGET")
+	}
+	return httpx.ValidationError("MERGE_DIRTY_SOURCE")
 }
 
 func (s *Service) ensureSourceReadyForRequiredReview(ctx context.Context, source Chapter, gitPath string) error {
@@ -2393,25 +2447,287 @@ func (s *Service) ChapterGitStatus(ctx context.Context, chapterID string) (Chapt
 }
 
 func (s *Service) Commits(ctx context.Context, chapterID string, limit int) ([]gitx.Commit, error) {
+	limit = normalizeChapterCommitLimit(limit)
+	if s.DB != nil && s.Git != nil {
+		if _, err := s.syncChapterCommits(ctx, chapterID, limit); err == nil {
+			if commits, loaded, err := s.loadChapterCommitsFromDB(ctx, chapterID, limit); err == nil && loaded {
+				return commits, nil
+			}
+		}
+	}
 	ch, err := s.Get(ctx, chapterID)
 	if err != nil {
 		return nil, err
 	}
-	if ch.WorktreePath == nil {
-		return nil, httpx.BadRequest("Chapter has no worktree path")
+	cwd, ref, err := s.chapterGitLocation(ctx, ch)
+	if err != nil {
+		return nil, err
 	}
-	return s.Git.Log(ctx, *ch.WorktreePath, limit)
+	if s.Git == nil {
+		return nil, httpx.BadRequest("Git service unavailable")
+	}
+	return s.Git.LogRef(ctx, cwd, ref, limit)
 }
 
 func (s *Service) Commit(ctx context.Context, chapterID, sha string) (gitx.Commit, error) {
+	if s.DB != nil && s.Git != nil {
+		if commit, loaded, err := s.loadChapterCommitFromDB(ctx, chapterID, sha); err == nil && loaded {
+			return commit, nil
+		}
+		if _, err := s.syncChapterCommits(ctx, chapterID, normalizeChapterCommitLimit(50)); err == nil {
+			if commit, loaded, err := s.loadChapterCommitFromDB(ctx, chapterID, sha); err == nil && loaded {
+				return commit, nil
+			}
+		}
+	}
 	ch, err := s.Get(ctx, chapterID)
 	if err != nil {
 		return gitx.Commit{}, err
 	}
-	if ch.WorktreePath == nil {
-		return gitx.Commit{}, httpx.BadRequest("Chapter has no worktree path")
+	cwd, ref, err := s.chapterGitLocation(ctx, ch)
+	if err != nil {
+		return gitx.Commit{}, err
 	}
-	return s.Git.ShowCommit(ctx, *ch.WorktreePath, sha)
+	if s.Git == nil {
+		return gitx.Commit{}, httpx.BadRequest("Git service unavailable")
+	}
+	if strings.TrimSpace(ref) == "" {
+		return s.Git.ShowCommit(ctx, cwd, sha)
+	}
+	return s.Git.ShowCommit(ctx, cwd, sha)
+}
+
+const chapterCommitSyncMaxLimit = 200
+
+func normalizeChapterCommitLimit(limit int) int {
+	if limit <= 0 || limit > chapterCommitSyncMaxLimit {
+		return 50
+	}
+	return limit
+}
+
+func (s *Service) chapterGitLocation(ctx context.Context, ch Chapter) (string, string, error) {
+	if ch.WorktreePath != nil && strings.TrimSpace(*ch.WorktreePath) != "" {
+		return *ch.WorktreePath, "", nil
+	}
+	if s.DB == nil {
+		return "", "", httpx.BadRequest("Chapter has no active worktree")
+	}
+	project, err := s.getProject(ctx, ch.ProjectID)
+	if err != nil {
+		return "", "", err
+	}
+	if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
+		return "", "", httpx.BadRequest("Chapter has no active worktree")
+	}
+	ref := firstNonEmptyString(ch.Branch, ch.BaseBranch, "HEAD")
+	return project.GitPath.String, ref, nil
+}
+
+func (s *Service) syncChapterCommits(ctx context.Context, chapterID string, limit int) (int, error) {
+	if s.DB == nil || s.Git == nil {
+		return 0, nil
+	}
+	ch, err := s.Get(ctx, chapterID)
+	if err != nil {
+		return 0, err
+	}
+	cwd, ref, err := s.chapterGitLocation(ctx, ch)
+	if err != nil {
+		return 0, err
+	}
+	commits, err := s.Git.LogRef(ctx, cwd, ref, normalizeChapterCommitLimit(limit))
+	if err != nil {
+		if isSQLiteMissingTableError(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(commits) == 0 {
+		return 0, nil
+	}
+	existing, err := s.chapterCommitSHASet(ctx, chapterID)
+	if err != nil {
+		if isSQLiteMissingTableError(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	inserted := 0
+	now := db.NowISO()
+	for _, commit := range commits {
+		if existing[commit.SHA] {
+			continue
+		}
+		fullMessage := commit.FullMessage
+		authorName := commit.AuthorName
+		authorEmail := commit.AuthorEmail
+		authoredAt := commit.AuthoredAt
+		if detail, detailErr := s.Git.ShowCommit(ctx, cwd, commit.SHA); detailErr == nil {
+			fullMessage = firstNonEmptyString(detail.FullMessage, fullMessage)
+			authorName = firstNonEmptyString(detail.AuthorName, authorName)
+			authorEmail = firstNonEmptyString(detail.AuthorEmail, authorEmail)
+			authoredAt = firstNonEmptyString(detail.AuthoredAt, authoredAt)
+		}
+		filesChanged, linesAdded, linesRemoved := 0, 0, 0
+		if statsFiles, statsAdded, statsRemoved, statsErr := s.Git.CommitDiffStats(ctx, cwd, commit.SHA); statsErr == nil {
+			filesChanged, linesAdded, linesRemoved = statsFiles, statsAdded, statsRemoved
+		}
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, narrator_id, narrator_message_id, files_changed, lines_added, lines_removed, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			id.New(), chapterID, commit.SHA, firstNonEmptyString(commit.Message, commit.SHA), nullableString(fullMessage), nullableString(authorName), nullableString(authorEmail), authoredAt, "manual", nullableString(commit.NarratorID), nullableString(commit.NarratorMessageID), filesChanged, linesAdded, linesRemoved, now); err != nil {
+			if isSQLiteMissingTableError(err) {
+				return inserted, nil
+			}
+			return inserted, err
+		}
+		existing[commit.SHA] = true
+		inserted++
+	}
+	if len(commits) > 0 {
+		head := commits[0].SHA
+		count, countErr := s.Git.CommitCountRef(ctx, cwd, ref)
+		if countErr != nil || count <= 0 {
+			count, countErr = s.chapterCommitCount(ctx, chapterID)
+			if countErr != nil {
+				if isSQLiteMissingTableError(countErr) {
+					return inserted, nil
+				}
+				return inserted, countErr
+			}
+		}
+		if _, err := s.DB.ExecContext(ctx, `UPDATE chapters SET head_commit_sha = ?, commit_count = ?, updated_at = ? WHERE id = ?`, nullableString(head), count, db.NowISO(), chapterID); err != nil {
+			if !isSQLiteMissingTableError(err) {
+				return inserted, err
+			}
+		}
+	}
+	return inserted, nil
+}
+
+func (s *Service) loadChapterCommitsFromDB(ctx context.Context, chapterID string, limit int) ([]gitx.Commit, bool, error) {
+	if s.DB == nil {
+		return nil, false, nil
+	}
+	if limit <= 0 || limit > chapterCommitSyncMaxLimit {
+		limit = 50
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT sha, message, COALESCE(full_message, ''), COALESCE(author_name, ''), COALESCE(author_email, ''), authored_at, COALESCE(source, ''), COALESCE(narrator_id, ''), COALESCE(narrator_message_id, ''), files_changed, lines_added, lines_removed FROM chapter_commits WHERE chapter_id = ? ORDER BY authored_at DESC, created_at DESC LIMIT ?`, chapterID, limit)
+	if err != nil {
+		if isSQLiteMissingTableError(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	defer rows.Close()
+	commits := []gitx.Commit{}
+	for rows.Next() {
+		var sha, message, fullMessage, authorName, authorEmail, authoredAt, source, narratorID, narratorMessageID string
+		var filesChanged, linesAdded, linesRemoved sql.NullInt64
+		if err := rows.Scan(&sha, &message, &fullMessage, &authorName, &authorEmail, &authoredAt, &source, &narratorID, &narratorMessageID, &filesChanged, &linesAdded, &linesRemoved); err != nil {
+			return nil, false, err
+		}
+		commits = append(commits, gitx.Commit{
+			SHA:               sha,
+			Message:           message,
+			FullMessage:       fullMessage,
+			AuthorName:        authorName,
+			AuthorEmail:       authorEmail,
+			AuthoredAt:        authoredAt,
+			Source:            source,
+			NarratorID:        narratorID,
+			NarratorMessageID: narratorMessageID,
+			FilesChanged:      nullableIntPtr(filesChanged),
+			LinesAdded:        nullableIntPtr(linesAdded),
+			LinesRemoved:      nullableIntPtr(linesRemoved),
+		})
+	}
+	return commits, true, rows.Err()
+}
+
+func (s *Service) loadChapterCommitFromDB(ctx context.Context, chapterID, sha string) (gitx.Commit, bool, error) {
+	if s.DB == nil {
+		return gitx.Commit{}, false, nil
+	}
+	row := s.DB.QueryRowContext(ctx, `SELECT sha, message, COALESCE(full_message, ''), COALESCE(author_name, ''), COALESCE(author_email, ''), authored_at, COALESCE(source, ''), COALESCE(narrator_id, ''), COALESCE(narrator_message_id, ''), files_changed, lines_added, lines_removed FROM chapter_commits WHERE chapter_id = ? AND sha = ? LIMIT 1`, chapterID, sha)
+	var record struct {
+		sha, message, fullMessage, authorName, authorEmail, authoredAt, source, narratorID, narratorMessageID string
+		filesChanged, linesAdded, linesRemoved                                                                sql.NullInt64
+	}
+	if err := row.Scan(&record.sha, &record.message, &record.fullMessage, &record.authorName, &record.authorEmail, &record.authoredAt, &record.source, &record.narratorID, &record.narratorMessageID, &record.filesChanged, &record.linesAdded, &record.linesRemoved); err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isSQLiteMissingTableError(err) {
+			return gitx.Commit{}, false, nil
+		}
+		return gitx.Commit{}, false, err
+	}
+	return gitx.Commit{
+		SHA:               record.sha,
+		Message:           record.message,
+		FullMessage:       record.fullMessage,
+		AuthorName:        record.authorName,
+		AuthorEmail:       record.authorEmail,
+		AuthoredAt:        record.authoredAt,
+		Source:            record.source,
+		NarratorID:        record.narratorID,
+		NarratorMessageID: record.narratorMessageID,
+		FilesChanged:      nullableIntPtr(record.filesChanged),
+		LinesAdded:        nullableIntPtr(record.linesAdded),
+		LinesRemoved:      nullableIntPtr(record.linesRemoved),
+	}, true, nil
+}
+
+func (s *Service) chapterCommitSHASet(ctx context.Context, chapterID string) (map[string]bool, error) {
+	set := map[string]bool{}
+	if s.DB == nil {
+		return set, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT sha FROM chapter_commits WHERE chapter_id = ?`, chapterID)
+	if err != nil {
+		if isSQLiteMissingTableError(err) {
+			return set, nil
+		}
+		return set, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return set, err
+		}
+		if strings.TrimSpace(sha) != "" {
+			set[sha] = true
+		}
+	}
+	return set, rows.Err()
+}
+
+func (s *Service) chapterCommitCount(ctx context.Context, chapterID string) (int, error) {
+	if s.DB == nil {
+		return 0, nil
+	}
+	var count int
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = ?`, chapterID).Scan(&count); err != nil {
+		if isSQLiteMissingTableError(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return count, nil
+}
+
+func nullableIntPtr(value sql.NullInt64) *int {
+	if !value.Valid {
+		return nil
+	}
+	v := int(value.Int64)
+	return &v
+}
+
+func isSQLiteMissingTableError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such table")
+}
+
+func isSQLiteMissingColumnError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "no such column")
 }
 
 func (s *Service) getProject(ctx context.Context, projectID string) (projectRow, error) {

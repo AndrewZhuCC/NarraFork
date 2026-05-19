@@ -1,9 +1,12 @@
 package chapters
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -72,7 +76,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Post("/{id}/containers/pause", httpx.Handler(h.containerAction("pause")))
 	r.Post("/{id}/containers/unpause", httpx.Handler(h.containerAction("unpause")))
 	r.Get("/{id}/containers/logs", httpx.Handler(h.containerLogs))
-	r.Post("/{id}/containers/remove", httpx.Handler(h.containerAction("down", "--remove-orphans")))
+	r.Post("/{id}/containers/remove", httpx.Handler(h.containerRemove))
 	r.Get("/{id}/commits", httpx.Handler(h.commits))
 	r.Get("/{id}/commits/{sha}/files/*", httpx.Handler(h.commitFileDiff))
 	r.Get("/{id}/commits/{sha}", httpx.Handler(h.commit))
@@ -95,6 +99,24 @@ type forkRequest struct {
 	AnchorCommitSHA *string  `json:"anchorCommitSha"`
 	AxisOffset      *float64 `json:"axisOffset"`
 	CrossOffset     *float64 `json:"crossOffset"`
+}
+
+const (
+	splitTitleMaxLength       = 200
+	splitDescriptionMaxLength = 2000
+)
+
+type splitRequest struct {
+	CommitSHA string `json:"commitSha"`
+	NewFork   struct {
+		Title       string  `json:"title"`
+		Description *string `json:"description"`
+		InheritMode string  `json:"inheritMode"`
+	} `json:"newFork"`
+}
+
+type containerRemoveRequest struct {
+	DeleteVolumes bool `json:"deleteVolumes"`
 }
 
 type reviewRequest struct {
@@ -341,13 +363,40 @@ func (h *Handler) batchFork(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) split(w http.ResponseWriter, r *http.Request) error {
-	// TS split-at-commit is not a simple "fork from commit": it rewrites the original chapter
-	// into prefix/continuation chapters and truncates narrator refs. Until that full domain
-	// lifecycle is implemented, reject before any git/DB side effect instead of returning a
-	// misleading successful fork.
-	payload := httpx.FeatureDisabledPayload("chapter.split", "TS split requires prefix and continuation chapter rewrites plus narrator message truncation; Go previously only forked from commit and could corrupt graph semantics")
-	payload["error"] = "Chapter split is disabled in go_backend because TS-equivalent prefix/continuation/message truncation semantics are not implemented yet"
-	httpx.WriteJSON(w, http.StatusNotImplemented, payload)
+	var req splitRequest
+	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
+		return err
+	}
+	commitSHA := strings.TrimSpace(req.CommitSHA)
+	if commitSHA == "" {
+		return httpx.BadRequest("commitSha is required")
+	}
+	title := strings.TrimSpace(req.NewFork.Title)
+	if title == "" {
+		return httpx.BadRequest("newFork.title is required")
+	}
+	if len(title) > splitTitleMaxLength {
+		return httpx.BadRequest("newFork.title must be at most 200 characters")
+	}
+	if req.NewFork.Description != nil && len(*req.NewFork.Description) > splitDescriptionMaxLength {
+		return httpx.BadRequest("newFork.description must be at most 2000 characters")
+	}
+	inheritMode := strings.TrimSpace(req.NewFork.InheritMode)
+	if inheritMode != "full" && inheritMode != "compressed" && inheritMode != "fresh" {
+		return httpx.BadRequest("newFork.inheritMode must be full, compressed, or fresh")
+	}
+	result, err := h.Service.SplitAtCommit(r.Context(), chi.URLParam(r, "id"), SplitInput{
+		CommitSHA: commitSHA,
+		NewFork: SplitNewForkInput{
+			Title:       title,
+			Description: req.NewFork.Description,
+			InheritMode: inheritMode,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusCreated, result)
 	return nil
 }
 
@@ -391,27 +440,54 @@ func (h *Handler) dependencyStatus(w http.ResponseWriter, r *http.Request) error
 	if err != nil {
 		return err
 	}
-	rows, err := h.Service.DB.QueryContext(r.Context(), `SELECT id, source_id FROM chapter_edges WHERE target_id = ? AND type = 'dependency' ORDER BY created_at ASC`, target.ID)
+	rows, err := h.Service.DB.QueryContext(r.Context(), `SELECT id, source_id, metadata FROM chapter_edges WHERE target_id = ? AND type = 'dependency' ORDER BY created_at ASC`, target.ID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	items := []map[string]any{}
+	type dependencyEdgeRow struct {
+		edgeID   string
+		sourceID string
+		metadata sql.NullString
+	}
+	edges := []dependencyEdgeRow{}
 	for rows.Next() {
-		var edgeID, sourceID string
-		if err := rows.Scan(&edgeID, &sourceID); err != nil {
+		var edge dependencyEdgeRow
+		if err := rows.Scan(&edge.edgeID, &edge.sourceID, &edge.metadata); err != nil {
+			_ = rows.Close()
 			return err
 		}
-		count := 0
-		if source, sourceErr := h.Service.Get(r.Context(), sourceID); sourceErr == nil && target.WorktreePath != nil {
-			if c, countErr := h.Service.Git.CountCommitsBetween(r.Context(), *target.WorktreePath, target.Branch, source.Branch); countErr == nil {
-				count = c
-			}
-		}
-		items = append(items, map[string]any{"edgeId": edgeID, "sourceChapterId": sourceID, "hasUpdates": count > 0, "newCommitCount": count})
+		edges = append(edges, edge)
 	}
 	if err := rows.Err(); err != nil {
+		_ = rows.Close()
 		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	items := []map[string]any{}
+	for _, edge := range edges {
+		_, _ = h.Service.syncChapterCommits(r.Context(), edge.sourceID, 50)
+		source, sourceErr := h.Service.Get(r.Context(), edge.sourceID)
+		if sourceErr != nil {
+			return sourceErr
+		}
+		edgeMetadata := dependencyEdgeMetadataMap(edge.metadata)
+		lastSyncedCommit := dependencyEdgeLastSyncedCommit(edgeMetadata)
+		sourceHeadCommitSha := stringPtrValue(source.HeadCommitSHA)
+		hasUpdates := sourceHeadCommitSha != "" && sourceHeadCommitSha != lastSyncedCommit
+		newCommitCount := 0
+		if hasUpdates {
+			newCommitCount = dependencyNewCommitCount(r.Context(), h.Service.DB, source, lastSyncedCommit)
+		}
+		items = append(items, map[string]any{
+			"edgeId":              edge.edgeID,
+			"sourceChapterId":     edge.sourceID,
+			"hasUpdates":          hasUpdates,
+			"newCommitCount":      newCommitCount,
+			"lastSyncedCommit":    nullableStringValue(lastSyncedCommit),
+			"sourceHeadCommitSha": nullableStringValue(sourceHeadCommitSha),
+		})
 	}
 	httpx.WriteJSON(w, http.StatusOK, items)
 	return nil
@@ -433,7 +509,8 @@ func (h *Handler) syncUpstream(w http.ResponseWriter, r *http.Request) error {
 		strategy = "merge"
 	}
 	var sourceID, targetID, edgeType string
-	err := h.Service.DB.QueryRowContext(r.Context(), `SELECT source_id, target_id, type FROM chapter_edges WHERE id = ?`, body.EdgeID).Scan(&sourceID, &targetID, &edgeType)
+	var rawMetadata sql.NullString
+	err := h.Service.DB.QueryRowContext(r.Context(), `SELECT source_id, target_id, type, metadata FROM chapter_edges WHERE id = ?`, body.EdgeID).Scan(&sourceID, &targetID, &edgeType, &rawMetadata)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return httpx.NotFound("ChapterEdge")
@@ -463,12 +540,104 @@ func (h *Handler) syncUpstream(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	success := dependencySyncResultSuccess(result)
+	if !success {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"success": false, "strategy": strategy, "result": result})
+		return nil
+	}
+	_, _ = h.Service.syncChapterCommits(r.Context(), source.ID, 50)
+	_, _ = h.Service.syncChapterCommits(r.Context(), target.ID, 50)
 	chapter, updateErr := h.refreshChapterGitMetadata(r.Context(), target.ID, *target.WorktreePath)
 	if updateErr != nil {
 		return updateErr
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"success": true, "strategy": strategy, "result": result, "chapter": chapter})
+	source, _ = h.Service.Get(r.Context(), sourceID)
+	lastSyncedCommit := stringPtrValue(source.HeadCommitSHA)
+	if err := h.updateDependencyEdgeMetadata(r.Context(), body.EdgeID, rawMetadata, lastSyncedCommit, strategy); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"success":  true,
+		"strategy": strategy,
+		"result":   result,
+		"chapter":  chapter,
+		"dependencySync": map[string]any{
+			"edgeId":              body.EdgeID,
+			"sourceChapterId":     sourceID,
+			"targetChapterId":     targetID,
+			"sourceHeadCommitSha": nullableStringValue(lastSyncedCommit),
+			"lastSyncedCommit":    nullableStringValue(lastSyncedCommit),
+			"strategy":            strategy,
+		},
+	})
 	return nil
+}
+
+func dependencySyncResultSuccess(result any) bool {
+	switch typed := result.(type) {
+	case gitx.MergeResult:
+		return typed.Success
+	case gitx.RebaseResult:
+		return typed.Success
+	default:
+		return true
+	}
+}
+
+func dependencyEdgeMetadataMap(raw sql.NullString) map[string]any {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return map[string]any{}
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal([]byte(raw.String), &decoded); err != nil {
+		return map[string]any{}
+	}
+	return decoded
+}
+
+func dependencyEdgeLastSyncedCommit(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	return firstStringValue(metadata, "lastSyncedCommit", "last_synced_commit")
+}
+
+func dependencyNewCommitCount(ctx context.Context, database *sql.DB, source Chapter, lastSyncedCommit string) int {
+	if database == nil {
+		return 0
+	}
+	if strings.TrimSpace(lastSyncedCommit) == "" {
+		return source.CommitCount
+	}
+	var authoredAt, createdAt string
+	err := database.QueryRowContext(ctx, `SELECT authored_at, created_at FROM chapter_commits WHERE chapter_id = ? AND sha = ? LIMIT 1`, source.ID, lastSyncedCommit).Scan(&authoredAt, &createdAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || isSQLiteMissingTableError(err) {
+			return source.CommitCount
+		}
+		return 0
+	}
+	var count int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = ? AND (authored_at > ? OR (authored_at = ? AND created_at > ?))`, source.ID, authoredAt, authoredAt, createdAt).Scan(&count); err != nil {
+		return 0
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+func (h *Handler) updateDependencyEdgeMetadata(ctx context.Context, edgeID string, raw sql.NullString, lastSyncedCommit, strategy string) error {
+	metadata := dependencyEdgeMetadataMap(raw)
+	metadata["lastSyncedCommit"] = strings.TrimSpace(lastSyncedCommit)
+	metadata["lastSyncedAt"] = db.NowISO()
+	metadata["lastSyncStrategy"] = strategy
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	_, err = h.Service.DB.ExecContext(ctx, `UPDATE chapter_edges SET metadata = ? WHERE id = ?`, string(encoded), edgeID)
+	return err
 }
 
 func (h *Handler) createReview(w http.ResponseWriter, r *http.Request) error {
@@ -643,6 +812,13 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func nullableIntValue(value *int) any {
+	if value == nil {
+		return nil
+	}
+	return *value
+}
+
 func commitPayload(commit gitx.Commit) map[string]any {
 	var authorName any
 	if commit.AuthorName != "" {
@@ -660,13 +836,20 @@ func commitPayload(commit gitx.Commit) map[string]any {
 		"authorName":        authorName,
 		"authorEmail":       authorEmail,
 		"authoredAt":        commit.AuthoredAt,
-		"source":            "manual",
-		"narratorId":        nil,
-		"narratorMessageId": nil,
-		"filesChanged":      nil,
-		"linesAdded":        nil,
-		"linesRemoved":      nil,
+		"source":            firstNonEmptyString(commit.Source, "manual"),
+		"narratorId":        nullableStringValue(commit.NarratorID),
+		"narratorMessageId": nullableStringValue(commit.NarratorMessageID),
+		"filesChanged":      nullableIntValue(commit.FilesChanged),
+		"linesAdded":        nullableIntValue(commit.LinesAdded),
+		"linesRemoved":      nullableIntValue(commit.LinesRemoved),
 	}
+}
+
+func stringPtrValue(value *string) string {
+	if value == nil {
+		return ""
+	}
+	return strings.TrimSpace(*value)
 }
 
 func nullableStringValue(value string) any {
@@ -858,7 +1041,7 @@ func (h *Handler) containers(w http.ResponseWriter, r *http.Request) error {
 	if cwd == "" {
 		return httpx.BadRequest("chapter has no worktree path")
 	}
-	stored, err := h.persistedContainerInstances(r.Context(), chapterID)
+	stored, err := h.Service.persistedContainerInstances(r.Context(), chapterID)
 	if err != nil {
 		return err
 	}
@@ -877,17 +1060,17 @@ func (h *Handler) containers(w http.ResponseWriter, r *http.Request) error {
 		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; returning persisted container state"))
 		return nil
 	}
-	proxyInfo, proxyUnsupported, proxyMessage := h.proxyInfoForChapter(r.Context(), chapter)
+	proxyInfo, proxyUnsupported, proxyMessage := h.Service.proxyInfoForChapter(r.Context(), chapter)
 	if proxyUnsupported {
 		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "PROXY_BACKEND_UNAVAILABLE", proxyMessage))
 		return nil
 	}
-	items, liveErr := h.liveComposeContainerInstances(r.Context(), chapterID, cwd, cmd, nil, cfg, proxyInfo)
+	items, liveErr := h.Service.liveComposeContainerInstances(r.Context(), chapterID, cwd, cmd, nil, cfg, proxyInfo)
 	if liveErr != nil {
 		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "CONTAINER_STATE_UNAVAILABLE", "live container state is unavailable; returning persisted container state"))
 		return nil
 	}
-	if err := h.persistContainerInstances(r.Context(), chapterID, items); err != nil {
+	if err := h.Service.persistContainerInstances(r.Context(), chapterID, items); err != nil {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, items)
@@ -972,6 +1155,12 @@ func (h *Handler) persistedContainerInstances(ctx context.Context, chapterID str
 
 func (h *Handler) persistContainerInstances(ctx context.Context, chapterID string, items []map[string]any) error {
 	now := db.NowISO()
+	portAllocationUpsert := db.InsertOnConflictUpdateSQL(
+		"port_allocations",
+		[]string{"port", "chapter_id", "service_name", "allocated_at"},
+		[]string{"port"},
+		[]string{"chapter_id", "service_name", "allocated_at"},
+	)
 	if _, err := h.Service.DB.ExecContext(ctx, `DELETE FROM port_allocations WHERE chapter_id = ?`, chapterID); err != nil {
 		return err
 	}
@@ -994,7 +1183,7 @@ func (h *Handler) persistContainerInstances(ctx context.Context, chapterID strin
 			return err
 		}
 		if hostPort != nil {
-			_, err = h.Service.DB.ExecContext(ctx, `INSERT OR REPLACE INTO port_allocations (port, chapter_id, service_name, allocated_at) VALUES (?, ?, ?, ?)`, intValue(item["hostPort"]), chapterID, serviceName, now)
+			_, err = h.Service.DB.ExecContext(ctx, portAllocationUpsert, intValue(item["hostPort"]), chapterID, serviceName, now)
 			if err != nil {
 				return err
 			}
@@ -1222,11 +1411,173 @@ func nullableInt(value int) any {
 	return value
 }
 
+func (h *Handler) containerRemove(w http.ResponseWriter, r *http.Request) error {
+	var body containerRemoveRequest
+	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+		return err
+	}
+	args := []string{"down", "--remove-orphans"}
+	if body.DeleteVolumes {
+		args = append(args, "-v")
+	}
+	return h.containerAction(args...)(w, r)
+}
+
 func (h *Handler) containerAction(args ...string) httpx.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
+		if len(args) > 0 && args[0] == "up" {
+			return h.containerStartBackground(w, r, args...)
+		}
 		chapterID := chi.URLParam(r, "id")
-		chapter, err := h.Service.Get(r.Context(), chapterID)
+		return withChapterContainerLock(chapterID, func() error {
+			chapter, err := h.Service.Get(r.Context(), chapterID)
+			if err != nil {
+				return err
+			}
+			cwd := ""
+			if chapter.WorktreePath != nil {
+				cwd = strings.TrimSpace(*chapter.WorktreePath)
+			}
+			if cwd == "" {
+				return httpx.BadRequest("chapter has no worktree path")
+			}
+			if commandVersion(r.Context(), "podman", "--version") == "" {
+				httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_NOT_FOUND", "podman is not available; container action skipped"))
+				return nil
+			}
+			cfg := containerConfigFrom(chapter.ContainerConfig)
+			composeFile := resolveComposeFilePath(cwd, cfg)
+			if composeFile == "" {
+				return httpx.BadRequest("compose file not found")
+			}
+			proxyInfo, proxyUnsupported, proxyMessage := h.Service.proxyInfoForChapter(r.Context(), chapter)
+			if proxyUnsupported {
+				return httpx.BadRequest(proxyMessage)
+			}
+			overrideFile := ""
+			if proxyInfo != nil && len(args) > 0 && args[0] == "up" {
+				var overrideErr error
+				overrideFile, overrideErr = writeProxyOverride(cwd, parseComposeServicesFromFile(composeFile))
+				if overrideErr != nil {
+					return overrideErr
+				}
+				if overrideFile != "" {
+					defer os.Remove(overrideFile)
+				}
+			}
+			cmd := composeCommandForFiles(r.Context(), composeFile, overrideFile)
+			if len(cmd) == 0 {
+				httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; container action skipped"))
+				return nil
+			}
+			action := containerBroadcastAction(args...)
+			h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "starting", true, "")
+			h.broadcastContainerCompat(map[string]any{"type": "container:starting", "chapterId": chapterID})
+
+			mappings := []map[string]any{}
+			if len(args) > 0 && args[0] == "up" {
+				if proxyInfo != nil {
+					if err := h.Service.releaseContainerPorts(r.Context(), chapterID); err != nil {
+						h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
+						h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+						return err
+					}
+				} else {
+					mappings, err = h.Service.allocateContainerPorts(r.Context(), chapterID, cfg.Ports)
+					if err != nil {
+						h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
+						h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+						return err
+					}
+				}
+			}
+			env := buildComposeEnv(chapterID, cfg, mappings, proxyInfo)
+			fullArgs := append(append([]string{}, cmd[1:]...), args...)
+			if len(args) > 0 && args[0] == "up" && len(cfg.Services) > 0 {
+				fullArgs = append(fullArgs, cfg.Services...)
+			}
+			timeout := 60 * time.Second
+			if len(args) > 0 && args[0] == "up" {
+				timeout = 10 * time.Minute
+			}
+			var out string
+			var runErr error
+			if len(args) > 0 && args[0] == "up" {
+				logPhase := "build"
+				out, runErr = runLimitedEnvTimeoutStreaming(r.Context(), cwd, env, timeout, func(line string) {
+					logPhase = h.broadcastContainerLog(chapterID, line, logPhase)
+				}, cmd[0], fullArgs...)
+			} else {
+				out, runErr = runLimitedEnvTimeout(r.Context(), cwd, env, timeout, cmd[0], fullArgs...)
+			}
+			status := "ok"
+			if runErr != nil {
+				status = runErr.Error()
+				if len(args) > 0 && args[0] == "up" && proxyInfo == nil {
+					_ = h.Service.releaseContainerPorts(r.Context(), chapterID)
+				}
+				h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, status)
+				h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": status})
+			} else {
+				if err := h.syncContainerActionState(r.Context(), chapterID, cwd, cmd, env, cfg, proxyInfo, mappings, args...); err != nil {
+					h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
+					h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+					return err
+				}
+				containerStatus := h.containerStatusForChapter(r.Context(), chapterID)
+				if containerStatus == "" {
+					containerStatus = containerSuccessStatus(action)
+				}
+				h.broadcastContainerStatusChanged(r.Context(), chapterID, action, containerStatus, true, "")
+				h.broadcastContainerCompat(containerCompatPayload(chapterID, action, true, ""))
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": runErr == nil, "status": status, "output": out, "fallback": false, "supported": true})
+			return nil
+		})
+	}
+}
+
+func (h *Handler) containerStartBackground(w http.ResponseWriter, r *http.Request, args ...string) error {
+	chapterID := chi.URLParam(r, "id")
+	chapter, err := h.Service.Get(r.Context(), chapterID)
+	if err != nil {
+		return err
+	}
+	cwd := ""
+	if chapter.WorktreePath != nil {
+		cwd = strings.TrimSpace(*chapter.WorktreePath)
+	}
+	if cwd == "" {
+		return httpx.BadRequest("chapter has no worktree path")
+	}
+	if commandVersion(r.Context(), "podman", "--version") == "" {
+		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_NOT_FOUND", "podman is not available; container action skipped"))
+		return nil
+	}
+	cfg := containerConfigFrom(chapter.ContainerConfig)
+	composeFile := resolveComposeFilePath(cwd, cfg)
+	if composeFile == "" {
+		return httpx.BadRequest("compose file not found")
+	}
+	if _, proxyUnsupported, proxyMessage := h.Service.proxyInfoForChapter(r.Context(), chapter); proxyUnsupported {
+		return httpx.BadRequest(proxyMessage)
+	}
+	if len(composeCommandForFile(r.Context(), composeFile)) == 0 {
+		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; container action skipped"))
+		return nil
+	}
+	go h.runContainerStartJob(chapterID, args...)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "starting", "fallback": false, "supported": true})
+	return nil
+}
+
+func (h *Handler) runContainerStartJob(chapterID string, args ...string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	_ = withChapterContainerLock(chapterID, func() error {
+		chapter, err := h.Service.Get(ctx, chapterID)
 		if err != nil {
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
 			return err
 		}
 		cwd := ""
@@ -1234,92 +1585,92 @@ func (h *Handler) containerAction(args ...string) httpx.HandlerFunc {
 			cwd = strings.TrimSpace(*chapter.WorktreePath)
 		}
 		if cwd == "" {
-			return httpx.BadRequest("chapter has no worktree path")
-		}
-		if commandVersion(r.Context(), "podman", "--version") == "" {
-			httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_NOT_FOUND", "podman is not available; container action skipped"))
-			return nil
+			err := httpx.BadRequest("chapter has no worktree path")
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			return err
 		}
 		cfg := containerConfigFrom(chapter.ContainerConfig)
 		composeFile := resolveComposeFilePath(cwd, cfg)
 		if composeFile == "" {
-			return httpx.BadRequest("compose file not found")
+			err := httpx.BadRequest("compose file not found")
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			return err
 		}
-		proxyInfo, proxyUnsupported, proxyMessage := h.proxyInfoForChapter(r.Context(), chapter)
+		proxyInfo, proxyUnsupported, proxyMessage := h.Service.proxyInfoForChapter(ctx, chapter)
 		if proxyUnsupported {
-			return httpx.BadRequest(proxyMessage)
+			err := httpx.BadRequest(proxyMessage)
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			return err
 		}
 		overrideFile := ""
-		if proxyInfo != nil && len(args) > 0 && args[0] == "up" {
+		if proxyInfo != nil {
 			var overrideErr error
 			overrideFile, overrideErr = writeProxyOverride(cwd, parseComposeServicesFromFile(composeFile))
 			if overrideErr != nil {
+				h.broadcastContainerStatusChanged(ctx, chapterID, "start", "error", false, overrideErr.Error())
+				h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": overrideErr.Error()})
 				return overrideErr
 			}
 			if overrideFile != "" {
 				defer os.Remove(overrideFile)
 			}
 		}
-		cmd := composeCommandForFiles(r.Context(), composeFile, overrideFile)
+		cmd := composeCommandForFiles(ctx, composeFile, overrideFile)
 		if len(cmd) == 0 {
-			httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallback("PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; container action skipped"))
-			return nil
+			err := httpx.BadRequest("podman compose is not available; container action skipped")
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			return err
 		}
 		action := containerBroadcastAction(args...)
-		h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "starting", true, "")
+		h.broadcastContainerStatusChanged(ctx, chapterID, action, "starting", true, "")
 		h.broadcastContainerCompat(map[string]any{"type": "container:starting", "chapterId": chapterID})
-
 		mappings := []map[string]any{}
-		if len(args) > 0 && args[0] == "up" {
-			if proxyInfo != nil {
-				if err := h.Service.releaseContainerPorts(r.Context(), chapterID); err != nil {
-					h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
-					h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
-					return err
-				}
-			} else {
-				mappings, err = h.Service.allocateContainerPorts(r.Context(), chapterID, cfg.Ports)
-				if err != nil {
-					h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
-					h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
-					return err
-				}
+		if proxyInfo != nil {
+			if err := h.Service.releaseContainerPorts(ctx, chapterID); err != nil {
+				h.broadcastContainerStatusChanged(ctx, chapterID, action, "error", false, err.Error())
+				h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+				return err
+			}
+		} else {
+			mappings, err = h.Service.allocateContainerPorts(ctx, chapterID, cfg.Ports)
+			if err != nil {
+				h.broadcastContainerStatusChanged(ctx, chapterID, action, "error", false, err.Error())
+				h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+				return err
 			}
 		}
 		env := buildComposeEnv(chapterID, cfg, mappings, proxyInfo)
 		fullArgs := append(append([]string{}, cmd[1:]...), args...)
-		if len(args) > 0 && args[0] == "up" && len(cfg.Services) > 0 {
+		if len(cfg.Services) > 0 {
 			fullArgs = append(fullArgs, cfg.Services...)
 		}
-		timeout := 60 * time.Second
-		if len(args) > 0 && args[0] == "up" {
-			timeout = 10 * time.Minute
-		}
-		out, runErr := runLimitedEnvTimeout(r.Context(), cwd, env, timeout, cmd[0], fullArgs...)
-		status := "ok"
+		logPhase := "build"
+		_, runErr := runLimitedEnvTimeoutStreaming(ctx, cwd, env, 10*time.Minute, func(line string) {
+			logPhase = h.broadcastContainerLog(chapterID, line, logPhase)
+		}, cmd[0], fullArgs...)
 		if runErr != nil {
-			status = runErr.Error()
-			if len(args) > 0 && args[0] == "up" && proxyInfo == nil {
-				_ = h.Service.releaseContainerPorts(r.Context(), chapterID)
+			status := runErr.Error()
+			if proxyInfo == nil {
+				_ = h.Service.releaseContainerPorts(ctx, chapterID)
 			}
-			h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, status)
+			h.broadcastContainerStatusChanged(ctx, chapterID, action, "error", false, status)
 			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": status})
-		} else {
-			if err := h.syncContainerActionState(r.Context(), chapterID, cwd, cmd, env, cfg, proxyInfo, mappings, args...); err != nil {
-				h.broadcastContainerStatusChanged(r.Context(), chapterID, action, "error", false, err.Error())
-				h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
-				return err
-			}
-			containerStatus := h.containerStatusForChapter(r.Context(), chapterID)
-			if containerStatus == "" {
-				containerStatus = containerSuccessStatus(action)
-			}
-			h.broadcastContainerStatusChanged(r.Context(), chapterID, action, containerStatus, true, "")
-			h.broadcastContainerCompat(containerCompatPayload(chapterID, action, true, ""))
+			return runErr
 		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": runErr == nil, "status": status, "output": out, "fallback": false, "supported": true})
+		if err := h.syncContainerActionState(ctx, chapterID, cwd, cmd, env, cfg, proxyInfo, mappings, args...); err != nil {
+			h.broadcastContainerStatusChanged(ctx, chapterID, action, "error", false, err.Error())
+			h.broadcastContainerCompat(map[string]any{"type": "container:error", "chapterId": chapterID, "error": err.Error()})
+			return err
+		}
+		_ = h.Service.handleContainerReadyNarratorIntegration(ctx, chapterID)
+		containerStatus := h.containerStatusForChapter(ctx, chapterID)
+		if containerStatus == "" {
+			containerStatus = containerSuccessStatus(action)
+		}
+		h.broadcastContainerStatusChanged(ctx, chapterID, action, containerStatus, true, "")
+		h.broadcastContainerCompat(containerCompatPayload(chapterID, action, true, ""))
 		return nil
-	}
+	})
 }
 
 func (h *Handler) broadcastContainerStatusChanged(ctx context.Context, chapterID, action, status string, ok bool, errorMessage string) {
@@ -1396,6 +1747,71 @@ func (h *Handler) broadcastContainerCompat(payload map[string]any) {
 	}
 }
 
+func (h *Handler) broadcastContainerLog(chapterID, line, currentPhase string) string {
+	cleaned := stripANSI(strings.TrimSpace(line))
+	if cleaned == "" {
+		return currentPhase
+	}
+	if currentPhase == "" {
+		currentPhase = "build"
+	}
+	if currentPhase == "build" && containerLogIsStartLine(cleaned) {
+		currentPhase = "start"
+		h.broadcastContainerCompat(map[string]any{"type": "container:log", "chapterId": chapterID, "line": "", "phase": "start"})
+	}
+	phase := currentPhase
+	if containerLogIsBuildLine(cleaned) {
+		phase = "build"
+	}
+	h.broadcastContainerCompat(map[string]any{"type": "container:log", "chapterId": chapterID, "line": cleaned, "phase": phase})
+	return currentPhase
+}
+
+func containerLogIsStartLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
+	}
+	for _, prefix := range []string{"Container ", "Network ", "Volume ", "Attaching to", "Gracefully stopping", "Killing "} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func containerLogIsBuildLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{"step ", "--> ", "cached", "commit", "successfully tagged ", "[internal]", "[build]", "building "} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	for _, prefix := range []string{"RUN ", "COPY ", "FROM ", "ADD "} {
+		if strings.HasPrefix(trimmed, prefix) {
+			return true
+		}
+	}
+	return strings.HasPrefix(lower, "error building at step") || strings.HasPrefix(lower, "error: failed to solve")
+}
+
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && (s[i] < '@' || s[i] > '~') {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 func containerBroadcastAction(args ...string) string {
 	if len(args) == 0 {
 		return ""
@@ -1447,7 +1863,7 @@ func (h *Handler) syncContainerActionState(ctx context.Context, chapterID, cwd s
 	}
 	switch args[0] {
 	case "up", "unpause":
-		items, err := h.liveComposeContainerInstances(ctx, chapterID, cwd, cmd, env, cfg, proxyInfo)
+		items, err := h.Service.liveComposeContainerInstances(ctx, chapterID, cwd, cmd, env, cfg, proxyInfo)
 		if err != nil && proxyInfo == nil && len(mappings) > 0 {
 			nowItems := make([]map[string]any, 0, len(mappings))
 			for _, mapping := range mappings {
@@ -1471,7 +1887,7 @@ func (h *Handler) syncContainerActionState(ctx context.Context, chapterID, cwd s
 		if args[0] == "up" && proxyInfo != nil && len(items) == 0 {
 			return httpx.BadRequest("No proxy routes resolved from running containers. Check compose service ports or image EXPOSE settings.")
 		}
-		return h.persistContainerInstances(ctx, chapterID, items)
+		return h.Service.persistContainerInstances(ctx, chapterID, items)
 	case "pause":
 		_, err := h.Service.DB.ExecContext(ctx, `UPDATE container_instances SET status = 'paused', updated_at = ? WHERE chapter_id = ?`, db.NowISO(), chapterID)
 		return err
@@ -1582,6 +1998,66 @@ func runLimited(ctx context.Context, cwd, name string, args ...string) (string, 
 
 func runLimitedEnv(ctx context.Context, cwd string, env map[string]string, name string, args ...string) (string, error) {
 	return runLimitedEnvTimeout(ctx, cwd, env, 60*time.Second, name, args...)
+}
+
+func runLimitedEnvTimeoutStreaming(ctx context.Context, cwd string, env map[string]string, timeout time.Duration, onLine func(string), name string, args ...string) (string, error) {
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, name, args...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	if len(env) > 0 {
+		merged := os.Environ()
+		for key, value := range env {
+			merged = append(merged, key+"="+value)
+		}
+		cmd.Env = merged
+	}
+	writer := newLimitedCombinedWriter(containerCommandOutputLimit)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return writer.String(), err
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return writer.String(), err
+	}
+	if err := cmd.Start(); err != nil {
+		return writer.String(), err
+	}
+	var wg sync.WaitGroup
+	var lineMu sync.Mutex
+	stream := func(reader io.Reader) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(reader)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			_, _ = writer.Write([]byte(line + "\n"))
+			if onLine != nil {
+				lineMu.Lock()
+				onLine(line)
+				lineMu.Unlock()
+			}
+		}
+	}
+	wg.Add(2)
+	go stream(stdout)
+	go stream(stderr)
+	err = cmd.Wait()
+	wg.Wait()
+	out := writer.String()
+	if cctx.Err() == context.DeadlineExceeded && err != nil {
+		if strings.TrimSpace(out) != "" {
+			out += "\n"
+		}
+		out += "[timed out]"
+	}
+	return out, err
 }
 
 func runLimitedEnvTimeout(ctx context.Context, cwd string, env map[string]string, timeout time.Duration, name string, args ...string) (string, error) {

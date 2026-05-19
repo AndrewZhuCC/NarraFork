@@ -19,6 +19,24 @@ var allowedProjectBackupSchemaFunctions = map[string]struct{}{
 	"ensureProjectBackupColumns": {},
 }
 
+var allowedGoOwnedOptionalSchemaFunctions = map[string]struct{}{
+	"EnsureBrowserSessionStorage": {},
+}
+
+var allowedPostgresSchemaContractFunctions = map[string]struct{}{
+	"PostgresBusinessSchemaDDL":   {},
+	"PostgresMigrationJournalDDL": {},
+	"postgresCreateTableDDL":      {},
+	"postgresCreateIndexDDL":      {},
+	"postgresForeignKeyDDL":       {},
+}
+
+var allowedBunCompatibleSQLiteBootstrapFiles = map[string]struct{}{
+	"drizzle_migrations_embedded.go": {},
+	"sqlite_fts.go":                  {},
+	"sqlite_migrations.go":           {},
+}
+
 const allowedGoMigrationJournalFunction = "createGoMigrationJournal"
 
 const allowedGoMigrationJournalCreateSQL = `CREATE TABLE IF NOT EXISTS __narrafork_go_migration_journal (
@@ -55,6 +73,7 @@ func TestGoBackendDoesNotMutateMainDatabaseSchema(t *testing.T) {
 func TestSchemaMutationGuardDocumentsAllowedExceptions(t *testing.T) {
 	allowedBackupFile := filepath.Clean("/repo/internal/projects/service.go")
 	allowedMigrationFile := filepath.Clean("/repo/internal/db/migration_compat.go")
+	allowedPostgresSchemaFile := filepath.Clean("/repo/internal/db/postgres_schema_contract.go")
 	testCases := []struct {
 		name      string
 		path      string
@@ -125,6 +144,33 @@ const migrationSQL = "CREATE TABLE projects (id TEXT PRIMARY KEY); --> statement
 			wantCount: 3,
 		},
 		{
+			name: "allows generated Bun-compatible Drizzle migration payload",
+			path: "/repo/internal/db/drizzle_migrations_embedded.go",
+			source: `package db
+const migrationSQL = "CREATE TABLE projects (id TEXT PRIMARY KEY); --> statement-breakpoint ALTER TABLE projects ADD COLUMN name TEXT"
+`,
+			wantCount: 0,
+		},
+		{
+			name: "allows Bun-compatible SQLite migration runner SQL",
+			path: "/repo/internal/db/sqlite_migrations.go",
+			source: `package db
+func run(db executor) {
+	_, _ = db.Exec("CREATE TABLE IF NOT EXISTS __drizzle_migrations (hash text NOT NULL, created_at numeric)")
+	_, _ = db.Exec("INSERT INTO __drizzle_migrations (hash, created_at) VALUES ('x', 1)")
+}`,
+			wantCount: 0,
+		},
+		{
+			name: "allows Bun-compatible SQLite FTS maintenance SQL",
+			path: "/repo/internal/db/sqlite_fts.go",
+			source: `package db
+const createFTS = "CREATE VIRTUAL TABLE IF NOT EXISTS chapters_fts USING fts5(title, tokenize='trigram')"
+const rebuildFTS = "INSERT INTO chapters_fts(chapters_fts) VALUES ('rebuild')"
+`,
+			wantCount: 0,
+		},
+		{
 			name: "allows test memory schema fixtures",
 			path: "/repo/internal/db/schema_guard_test.go",
 			source: `package db
@@ -176,6 +222,35 @@ func migrateMainDB(db executor) {
 }`,
 			wantCount: 1,
 		},
+		{
+			name: "allows documented go-owned optional browser session storage",
+			path: filepath.Clean("/repo/internal/narrators/browser_sessions.go"),
+			source: `package narrators
+func (s *Service) EnsureBrowserSessionStorage() {
+	_, _ = s.DB.Exec("CREATE TABLE IF NOT EXISTS narrator_browser_sessions (id TEXT PRIMARY KEY)")
+	_, _ = s.DB.Exec("ALTER TABLE narrator_browser_sessions ADD COLUMN ttl_ms INTEGER")
+	_, _ = s.DB.Exec("CREATE INDEX idx_narrator_browser_sessions_narrator_status ON narrator_browser_sessions(narrator_id, status)")
+}`,
+			wantCount: 0,
+		},
+		{
+			name: "allows documented go-owned postgres schema contract DDL",
+			path: allowedPostgresSchemaFile,
+			source: `package db
+func PostgresMigrationJournalDDL() []string {
+	return []string{"CREATE TABLE IF NOT EXISTS __narrafork_pg_schema_migrations (version BIGINT PRIMARY KEY)"}
+}`,
+			wantCount: 0,
+		},
+		{
+			name: "blocks postgres schema contract DDL outside documented function",
+			path: allowedPostgresSchemaFile,
+			source: `package db
+func CreateUnexpectedPostgresTable() string {
+	return "CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY)"
+}`,
+			wantCount: 1,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -185,6 +260,8 @@ func migrateMainDB(db executor) {
 				[]byte(tc.source),
 				allowedBackupFile,
 				allowedMigrationFile,
+				filepath.Clean("/repo/internal/narrators/browser_sessions.go"),
+				allowedPostgresSchemaFile,
 			)
 
 			if err != nil {
@@ -200,6 +277,8 @@ func migrateMainDB(db executor) {
 func findMainSchemaMutationViolations(root string) ([]schemaMutationViolation, error) {
 	allowedBackupFile := filepath.Join(root, "internal", "projects", "service.go")
 	allowedMigrationFile := filepath.Join(root, "internal", "db", "migration_compat.go")
+	allowedOptionalFile := filepath.Join(root, "internal", "narrators", "browser_sessions.go")
+	allowedPostgresSchemaFile := filepath.Join(root, "internal", "db", "postgres_schema_contract.go")
 	violations := []schemaMutationViolation{}
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
@@ -223,6 +302,8 @@ func findMainSchemaMutationViolations(root string) ([]schemaMutationViolation, e
 			data,
 			allowedBackupFile,
 			allowedMigrationFile,
+			allowedOptionalFile,
+			allowedPostgresSchemaFile,
 		)
 		if err != nil {
 			return err
@@ -238,8 +319,13 @@ func schemaMutationViolationsInSource(
 	source []byte,
 	allowedBackupFile string,
 	allowedMigrationFile string,
+	allowedOptionalFile string,
+	allowedPostgresSchemaFile string,
 ) ([]schemaMutationViolation, error) {
 	if strings.HasSuffix(path, "_test.go") {
+		return nil, nil
+	}
+	if isAllowedBunCompatibleSQLiteBootstrapFile(path) {
 		return nil, nil
 	}
 
@@ -257,6 +343,28 @@ func schemaMutationViolationsInSource(
 				continue
 			}
 			if _, allowed := allowedProjectBackupSchemaFunctions[fn.Name.Name]; allowed {
+				allowedRanges[fn.Name.Name] = append(allowedRanges[fn.Name.Name], sourceRange{start: fn.Body.Pos(), end: fn.Body.End()})
+			}
+		}
+	}
+	if samePath(path, allowedOptionalFile) {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if _, allowed := allowedGoOwnedOptionalSchemaFunctions[fn.Name.Name]; allowed {
+				allowedRanges[fn.Name.Name] = append(allowedRanges[fn.Name.Name], sourceRange{start: fn.Body.Pos(), end: fn.Body.End()})
+			}
+		}
+	}
+	if samePath(path, allowedPostgresSchemaFile) {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if _, allowed := allowedPostgresSchemaContractFunctions[fn.Name.Name]; allowed {
 				allowedRanges[fn.Name.Name] = append(allowedRanges[fn.Name.Name], sourceRange{start: fn.Body.Pos(), end: fn.Body.End()})
 			}
 		}
@@ -346,6 +454,11 @@ func appendSchemaMutationViolations(
 
 func isAllowedGoMigrationJournalSQL(value string) bool {
 	return normalizeSQLFragment(value) == normalizeSQLFragment(allowedGoMigrationJournalCreateSQL)
+}
+
+func isAllowedBunCompatibleSQLiteBootstrapFile(path string) bool {
+	_, ok := allowedBunCompatibleSQLiteBootstrapFiles[filepath.Base(filepath.Clean(path))]
+	return ok
 }
 
 func stringExpressionValue(expr ast.Expr) (string, bool) {

@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -32,11 +33,13 @@ import (
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/auth"
+	"narrafork-go/internal/buildinfo"
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/db"
 	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/id"
 	"narrafork-go/internal/narrators"
+	"narrafork-go/internal/restart"
 	"narrafork-go/internal/terminals"
 )
 
@@ -58,11 +61,30 @@ type terminalReattachRuntime interface {
 	Ensure(ctx context.Context, terminalID string) error
 }
 
+type VNetStatsProvider interface {
+	VNetStats(settings *config.Store) map[string]any
+}
+
+type GatewayRuntime interface {
+	Status(ctx context.Context) map[string]any
+	Reload(ctx context.Context, platforms []string) (map[string]any, error)
+}
+
+type GatewayNarratorRuntime interface {
+	Create(ctx context.Context, input narrators.CreateInput) (narrators.Narrator, error)
+	AddUserMessage(ctx context.Context, narratorID, userID, text string) (narrators.Message, error)
+}
+
 type Handler struct {
-	DB              *sql.DB
-	Settings        *config.Store
-	TerminalRuntime TerminalRuntime
-	Narrators       *narrators.Service
+	DB               *sql.DB
+	RuntimeDB        *sql.DB
+	Settings         *config.Store
+	TerminalRuntime  TerminalRuntime
+	Narrators        *narrators.Service
+	GatewayNarrators GatewayNarratorRuntime
+	VNet             VNetStatsProvider
+	Restart          *restart.Manager
+	Gateway          GatewayRuntime
 }
 
 type nugOAuthState struct {
@@ -575,19 +597,27 @@ func (h *Handler) vnetStatus(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 	sort.Strings(addrs)
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"ok":        false,
-		"supported": false,
-		"fallback":  true,
-		"mode":      "disabled",
-		"code":      "VNET_DISABLED",
-		"feature":   "vnet",
-		"ws":        false,
-		"reason":    "VNet relay/UDP runtime is not bundled in go_backend",
-		"relay":     map[string]any{"clients": 0, "rooms": 0, "messages": 0, "running": false},
-		"udp":       map[string]any{"enabled": false, "sessions": 0},
-		"network":   map[string]any{"hostname": hostname(), "addresses": addrs},
-	})
+	payload := map[string]any{
+		"ok":                 true,
+		"supported":          true,
+		"fallback":           false,
+		"mode":               "relay",
+		"ws":                 true,
+		"peerCleanup":        true,
+		"udpRendezvous":      false,
+		"networks":           0,
+		"peers":              0,
+		"connections":        0,
+		"maxPeersPerNetwork": 64,
+		"maxMessageBytes":    1024 * 1024,
+		"relay":              map[string]any{"clients": 0, "rooms": 0, "peers": 0, "running": true},
+		"udp":                map[string]any{"enabled": false},
+	}
+	if h.VNet != nil {
+		payload = h.VNet.VNetStats(h.Settings)
+	}
+	payload["network"] = map[string]any{"hostname": hostname(), "addresses": addrs}
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
@@ -627,10 +657,45 @@ func (h *Handler) gatewayWebhookFallback(w http.ResponseWriter, r *http.Request)
 		return err
 	}
 	if !ok {
-		payload := gatewayFallbackPayload("GATEWAY_WEBHOOK_NO_MAPPING", "No gateway session mapping exists for this webhook sender; Go backend will not create a new narrator implicitly")
-		payload["chatId"] = msg.ChatID
-		payload["userId"] = msg.UserID
-		httpx.WriteJSON(w, http.StatusAccepted, payload)
+		runtime := h.gatewayNarratorRuntime()
+		if runtime == nil {
+			payload := gatewayFallbackPayload("GATEWAY_WEBHOOK_RUNTIME_UNAVAILABLE", "Narrator runtime is not attached to the public gateway route")
+			payload["chatId"] = msg.ChatID
+			payload["userId"] = msg.UserID
+			httpx.WriteJSON(w, http.StatusAccepted, payload)
+			return nil
+		}
+		if h.DB == nil {
+			payload := gatewayFallbackPayload("GATEWAY_WEBHOOK_STORAGE_UNAVAILABLE", "Gateway session storage is not available")
+			payload["chatId"] = msg.ChatID
+			payload["userId"] = msg.UserID
+			httpx.WriteJSON(w, http.StatusAccepted, payload)
+			return nil
+		}
+		if tableOK, err := h.systemTableExists(r.Context(), "gateway_session_mappings"); err != nil || !tableOK {
+			if err != nil {
+				return err
+			}
+			payload := gatewayFallbackPayload("GATEWAY_WEBHOOK_STORAGE_UNAVAILABLE", "Gateway session storage is not available")
+			payload["chatId"] = msg.ChatID
+			payload["userId"] = msg.UserID
+			httpx.WriteJSON(w, http.StatusAccepted, payload)
+			return nil
+		}
+		title := "Webhook: " + msg.Username
+		narrator, err := runtime.Create(r.Context(), narrators.CreateInput{Title: &title, PermissionMode: h.gatewayDefaultPermissionMode(r.Context())})
+		if err != nil {
+			return err
+		}
+		mappingID, err := h.insertGatewayMappingForMessage(r.Context(), msg, narrator.ID)
+		if err != nil {
+			return err
+		}
+		creator := "gateway:" + msg.UserID
+		if _, err := runtime.AddUserMessage(r.Context(), narrator.ID, creator, msg.Text); err != nil {
+			return err
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "supported": true, "fallback": false, "platform": msg.Platform, "chatId": msg.ChatID, "narratorId": narrator.ID, "mappingId": mappingID})
 		return nil
 	}
 
@@ -642,7 +707,8 @@ func (h *Handler) gatewayWebhookFallback(w http.ResponseWriter, r *http.Request)
 		httpx.WriteJSON(w, http.StatusAccepted, payload)
 		return nil
 	}
-	if h.Narrators == nil {
+	runtime := h.gatewayNarratorRuntime()
+	if runtime == nil {
 		payload := gatewayFallbackPayload("GATEWAY_WEBHOOK_RUNTIME_UNAVAILABLE", "Narrator runtime is not attached to the public gateway route")
 		payload["chatId"] = msg.ChatID
 		payload["narratorId"] = narratorID
@@ -651,7 +717,7 @@ func (h *Handler) gatewayWebhookFallback(w http.ResponseWriter, r *http.Request)
 	}
 
 	creator := firstNonEmpty(stringMap(mapping, "app_user_id", ""), "gateway:"+msg.UserID)
-	if _, err := h.Narrators.AddUserMessage(r.Context(), narratorID, creator, msg.Text); err != nil {
+	if _, err := runtime.AddUserMessage(r.Context(), narratorID, creator, msg.Text); err != nil {
 		return err
 	}
 	if err := h.updateGatewayLastMessage(r.Context(), stringMap(mapping, "id", "")); err != nil {
@@ -666,7 +732,39 @@ func (h *Handler) updateGatewayLastMessage(ctx context.Context, mappingID string
 	return err
 }
 
+func (h *Handler) insertGatewayMappingForMessage(ctx context.Context, msg gatewayInboundMessage, narratorID string) (string, error) {
+	mappingID := id.New()
+	now := db.NowISO()
+	_, err := h.DB.ExecContext(ctx, `INSERT INTO gateway_session_mappings (id, platform, chat_id, user_id, username, narrator_id, last_message_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, mappingID, msg.Platform, msg.ChatID, msg.UserID, msg.Username, narratorID, now, now, now)
+	return mappingID, err
+}
+
+func (h *Handler) gatewayNarratorRuntime() GatewayNarratorRuntime {
+	if h.GatewayNarrators != nil {
+		return h.GatewayNarrators
+	}
+	if h.Narrators != nil {
+		return h.Narrators
+	}
+	return nil
+}
+
+func (h *Handler) gatewayDefaultPermissionMode(ctx context.Context) string {
+	if h.DB != nil {
+		if cfg, ok := h.gatewayDBConfig(ctx); ok {
+			if value := strings.TrimSpace(stringMap(cfg, "defaultPermissionMode", "")); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 func (h *Handler) gatewayStatus(w http.ResponseWriter, r *http.Request) error {
+	if h.Gateway != nil {
+		httpx.WriteJSON(w, http.StatusOK, h.Gateway.Status(r.Context()))
+		return nil
+	}
 	sessions, sessionErr := h.gatewaySessionRows(r.Context())
 	configuredUsers := 0
 	degraded := false
@@ -696,7 +794,8 @@ func (h *Handler) gatewayStatus(w http.ResponseWriter, r *http.Request) error {
 	if cfg.Enabled {
 		platforms = append(platforms, "webhook")
 	}
-	status := map[string]any{"started": false, "platforms": platforms, "sessions": len(sessions), "configuredUsers": configuredUsers, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": h.Narrators != nil, "fallback": h.Narrators == nil}}
+	narratorRuntimeAttached := h.gatewayNarratorRuntime() != nil
+	status := map[string]any{"started": false, "platforms": platforms, "sessions": len(sessions), "configuredUsers": configuredUsers, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": narratorRuntimeAttached, "fallback": !narratorRuntimeAttached}}
 	if degraded {
 		status["degraded"] = true
 		status["fallback"] = true
@@ -731,12 +830,26 @@ func (h *Handler) gatewayDeleteSession(w http.ResponseWriter, r *http.Request) e
 }
 
 func (h *Handler) gatewayReload(w http.ResponseWriter, r *http.Request) error {
+	if h.Gateway != nil {
+		var body map[string]any
+		if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+			return err
+		}
+		platforms := stringList(body["platforms"])
+		payload, err := h.Gateway.Reload(r.Context(), platforms)
+		if err != nil {
+			return err
+		}
+		httpx.WriteJSON(w, http.StatusOK, payload)
+		return nil
+	}
 	cfg := h.gatewayWebhookConfig(r.Context())
 	platforms := []string{}
 	if cfg.Enabled {
 		platforms = append(platforms, "webhook")
 	}
-	status := map[string]any{"started": false, "platforms": platforms, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": h.Narrators != nil, "fallback": h.Narrators == nil}}
+	narratorRuntimeAttached := h.gatewayNarratorRuntime() != nil
+	status := map[string]any{"started": false, "platforms": platforms, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": narratorRuntimeAttached, "fallback": !narratorRuntimeAttached}}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "reloaded": []string{}, "status": status})
 	return nil
 }
@@ -989,32 +1102,266 @@ func (h *Handler) RegisterUpdate(r chi.Router) {
 }
 
 func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) error {
-	current := currentBackendVersion()
-	manifestURL := strings.TrimSpace(os.Getenv("NARRAFORK_UPDATE_MANIFEST_URL"))
-	payload := map[string]any{"updateAvailable": false, "currentVersion": current, "releaseInfo": nil, "source": "go_backend", "selfUpdateAvailable": false, "instructions": updateManualInstructions("")}
-	if manifestURL == "" {
-		payload["reason"] = "NARRAFORK_UPDATE_MANIFEST_URL is not configured"
+	current := buildinfo.VersionValue()
+	canAuto := h.canApplySelfUpdate()
+	payload := map[string]any{
+		"updateAvailable":     false,
+		"currentVersion":      current,
+		"releaseInfo":         nil,
+		"source":              "go_backend",
+		"selfUpdateAvailable": canAuto,
+		"canAutoRestart":      canAuto,
+		"manualOnly":          !canAuto,
+		"instructions":        updateInstructions("", canAuto),
+	}
+	if source, ok := h.trustedUpdateSource(); ok {
+		payload["updateSource"] = map[string]any{"product": source.Product, "channel": source.Channel}
+	} else {
+		payload["reason"] = "settings.update.serverUrl is not configured"
 		httpx.WriteJSON(w, http.StatusOK, payload)
 		return nil
 	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	manifest, err := getJSON(ctx, manifestURL, map[string]string{})
+	release, err := h.trustedLatestUpdate(ctx)
 	if err != nil {
 		payload["error"] = err.Error()
 		httpx.WriteJSON(w, http.StatusOK, payload)
 		return nil
 	}
-	latest := firstNonEmpty(stringMap(manifest, "version", ""), stringMap(manifest, "latestVersion", ""))
-	payload["releaseInfo"] = manifest
-	payload["latestVersion"] = latest
-	payload["updateAvailable"] = latest != "" && latest != current
+	if release.LatestVersion != "" {
+		payload["latestVersion"] = release.LatestVersion
+	}
+	if release.ReleaseInfo != nil {
+		payload["releaseInfo"] = release.ReleaseInfo
+	}
+	payload["updateAvailable"] = release.Available
+	if release.Available {
+		payload["downloadSize"] = release.DownloadSize
+		payload["totalSize"] = release.TotalSize
+		if release.Strategy != "" {
+			payload["strategy"] = release.Strategy
+		}
+		if len(release.PatchChain) > 0 {
+			payload["patchChain"] = release.PatchChain
+		}
+	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
+type trustedUpdateSource struct {
+	ServerURL string
+	Product   string
+	Channel   string
+	Platform  string
+}
+
+type trustedUpdateRelease struct {
+	Available     bool
+	Current       string
+	LatestVersion string
+	ReleaseInfo   map[string]any
+	Files         []updateDownloadFile
+	ExpectedBytes int64
+	DownloadSize  int64
+	TotalSize     int64
+	Strategy      string
+	PatchChain    []map[string]any
+}
+
+func (h *Handler) trustedUpdateSource() (trustedUpdateSource, bool) {
+	update := map[string]any{}
+	if h != nil && h.Settings != nil {
+		if rawUpdate, ok := h.Settings.Raw()["update"].(map[string]any); ok {
+			update = rawUpdate
+		}
+	}
+	serverURL := strings.TrimSpace(stringMap(update, "serverUrl", ""))
+	serverURL = strings.TrimRight(serverURL, "/")
+	if serverURL == "" {
+		return trustedUpdateSource{}, false
+	}
+	parsed, err := url.Parse(serverURL)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return trustedUpdateSource{}, false
+	}
+	product := strings.TrimSpace(stringMap(update, "product", ""))
+	if product == "" {
+		product = "narrafork"
+	}
+	channel := strings.TrimSpace(stringMap(update, "channel", ""))
+	if channel == "" {
+		channel = "stable"
+	}
+	return trustedUpdateSource{ServerURL: serverURL, Product: product, Channel: channel, Platform: updatePlatform()}, true
+}
+
+func (h *Handler) trustedLatestUpdate(ctx context.Context) (trustedUpdateRelease, error) {
+	source, ok := h.trustedUpdateSource()
+	if !ok {
+		return trustedUpdateRelease{Current: buildinfo.VersionValue()}, errorsNew("settings.update.serverUrl is not configured")
+	}
+	return fetchTrustedLatestUpdate(ctx, source, buildinfo.VersionValue())
+}
+
+func fetchTrustedLatestUpdate(ctx context.Context, source trustedUpdateSource, current string) (trustedUpdateRelease, error) {
+	checkURL := trustedUpdateCheckURL(source, current)
+	data, err := getJSON(ctx, checkURL, map[string]string{})
+	if err != nil {
+		return trustedUpdateRelease{Current: current}, err
+	}
+	return trustedUpdateReleaseFromV2(source, current, data), nil
+}
+
+func trustedUpdateCheckURL(source trustedUpdateSource, current string) string {
+	endpoint := source.ServerURL + "/api/v2/products/" + url.PathEscape(source.Product) + "/releases/latest"
+	values := url.Values{}
+	values.Set("channel", source.Channel)
+	values.Set("platform", source.Platform)
+	values.Set("version", current)
+	return endpoint + "?" + values.Encode()
+}
+
+func trustedUpdateReleaseFromV2(source trustedUpdateSource, current string, data map[string]any) trustedUpdateRelease {
+	version := strings.TrimSpace(stringMap(data, "version", ""))
+	release := trustedUpdateRelease{Current: current, LatestVersion: version}
+	if !boolMap(data, "updateAvailable") || version == "" {
+		return release
+	}
+	file, _ := data["file"].(map[string]any)
+	filename := strings.TrimSpace(stringMap(file, "filename", ""))
+	if filename == "" {
+		return release
+	}
+	size := int64(numericMapOr(file, "size", 0))
+	sha := strings.TrimSpace(stringMap(file, "sha512", ""))
+	downloadURL := trustedUpdateArtifactURL(source, version, filename)
+	fileInfo := map[string]any{"url": downloadURL, "size": size, "sha512": sha}
+	releaseInfo := map[string]any{
+		"version":     version,
+		"releaseDate": stringMap(data, "releaseDate", time.Now().Format(time.RFC3339)),
+		"path":        filename,
+		"sha512":      sha,
+		"files":       []any{fileInfo},
+	}
+	if notes, ok := data["releaseNotes"]; ok {
+		releaseInfo["releaseNotes"] = notes
+	}
+	if notes, ok := data["releaseNotesPerVersion"]; ok {
+		releaseInfo["releaseNotesPerVersion"] = notes
+	}
+	v2 := map[string]any{}
+	if zstd, ok := data["zstdPatch"].(map[string]any); ok && zstd != nil {
+		if patchURL := trustedUpdateAbsoluteURL(source.ServerURL, stringMap(zstd, "url", "")); patchURL != "" {
+			v2["zstdPatchUrl"] = patchURL
+		}
+		if metaURL := trustedUpdateAbsoluteURL(source.ServerURL, stringMap(zstd, "metaUrl", "")); metaURL != "" {
+			v2["zstdPatchMetaUrl"] = metaURL
+		}
+	}
+	patchChain := trustedPatchChain(source.ServerURL, data["patchChain"])
+	if len(patchChain) > 0 {
+		v2["patchChain"] = patchChain
+	}
+	if len(v2) > 0 {
+		releaseInfo["_v2"] = v2
+	}
+	expectedBytes := size
+	downloadSize := size
+	strategy := ""
+	if zstd, ok := data["zstdPatch"].(map[string]any); ok && zstd != nil {
+		if patchSize := int64(numericMapOr(zstd, "patchSize", 0)); patchSize > 0 {
+			downloadSize = patchSize
+			strategy = "zstd"
+		}
+	} else if len(patchChain) > 0 {
+		downloadSize = 0
+		for _, step := range patchChain {
+			downloadSize += int64(numericMapOr(step, "patchSize", 0))
+		}
+		strategy = "zstd"
+	}
+	release.Available = true
+	release.ReleaseInfo = releaseInfo
+	release.Files = []updateDownloadFile{{URL: downloadURL, Name: "artifact", Size: size, SHA512: sha}}
+	release.ExpectedBytes = expectedBytes
+	release.DownloadSize = downloadSize
+	release.TotalSize = size
+	release.Strategy = strategy
+	release.PatchChain = patchChain
+	return release
+}
+
+func trustedPatchChain(serverURL string, raw any) []map[string]any {
+	items, _ := raw.([]any)
+	chain := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		step, _ := item.(map[string]any)
+		if step == nil {
+			continue
+		}
+		trusted := map[string]any{}
+		for key, value := range step {
+			trusted[key] = value
+		}
+		if patchURL := trustedUpdateAbsoluteURL(serverURL, stringMap(step, "url", "")); patchURL != "" {
+			trusted["url"] = patchURL
+		}
+		if metaURL := trustedUpdateAbsoluteURL(serverURL, stringMap(step, "metaUrl", "")); metaURL != "" {
+			trusted["metaUrl"] = metaURL
+		}
+		chain = append(chain, trusted)
+	}
+	return chain
+}
+
+func trustedUpdateArtifactURL(source trustedUpdateSource, version, filename string) string {
+	return source.ServerURL + "/api/v2/products/" + url.PathEscape(source.Product) + "/releases/" + url.PathEscape(version) + "/download/" + url.PathEscape(filename)
+}
+
+func trustedUpdateAbsoluteURL(serverURL, value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	base, err := url.Parse(strings.TrimRight(serverURL, "/"))
+	if err != nil {
+		return ""
+	}
+	parsed, err := url.Parse(value)
+	if err == nil && parsed.IsAbs() {
+		if (parsed.Scheme == "http" || parsed.Scheme == "https") && strings.EqualFold(parsed.Scheme, base.Scheme) && strings.EqualFold(parsed.Host, base.Host) {
+			return parsed.String()
+		}
+		return ""
+	}
+	ref := &url.URL{Path: value}
+	if !strings.HasPrefix(value, "/") {
+		ref.Path = "/" + value
+	}
+	return base.ResolveReference(ref).String()
+}
+
+func updatePlatform() string {
+	arch := "x64"
+	if runtime.GOARCH == "arm64" {
+		arch = "arm64"
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return "darwin-" + arch
+	case "windows":
+		return "win-" + arch
+	default:
+		return "linux-" + arch
+	}
+}
+
 func (h *Handler) updateVersion(w http.ResponseWriter, r *http.Request) error {
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"version": currentBackendVersion(), "commit": currentBackendCommit(), "platform": runtime.GOOS, "arch": runtime.GOARCH, "goVersion": runtime.Version(), "selfUpdateAvailable": false, "manualOnly": true})
+	canAuto := h.canApplySelfUpdate()
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"version": buildinfo.VersionValue(), "commit": buildinfo.CommitValue(), "backend": buildinfo.Backend, "buildChannel": buildinfo.ChannelValue(), "platform": runtime.GOOS, "arch": runtime.GOARCH, "goVersion": runtime.Version(), "selfUpdateAvailable": canAuto, "manualOnly": !canAuto, "canAutoRestart": canAuto})
 	return nil
 }
 
@@ -1023,7 +1370,8 @@ func (h *Handler) updateDirectory(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"directory": dir, "selfUpdateAvailable": false, "instructions": updateManualInstructions(dir)})
+	canAuto := h.canApplySelfUpdate()
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"directory": dir, "selfUpdateAvailable": canAuto, "canAutoRestart": canAuto, "manualOnly": !canAuto, "instructions": updateInstructions(dir, canAuto)})
 	return nil
 }
 
@@ -1057,6 +1405,13 @@ func (h *Handler) updateStatus(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	status := updateStatusPayload(version, dir)
+	canApply := h.canApplySelfUpdate()
+	ready := boolMap(status, "ready")
+	canAuto := canApply && ready
+	status["canAutoRestart"] = canAuto
+	status["selfUpdateAvailable"] = canApply
+	status["manualOnly"] = !canApply
+	status["instructions"] = updateInstructions(stringMap(status, "updatePath", ""), canAuto)
 	httpx.WriteJSON(w, http.StatusOK, status)
 	return nil
 }
@@ -1097,18 +1452,35 @@ func (h *Handler) updateDownload(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	version, files, expectedBytes := updateDownloadRequestMetadata(body, r)
+	requestedVersion := updateDownloadRequestedVersion(body)
 	send := newUpdateSSESender(w)
 
-	send("progress", updateProgressPayload("checking", 0, expectedBytes, ""))
-	if len(files) == 0 {
-		send("error", updateDownloadErrorPayload(version, "No update artifact URL was provided; go_backend does not include a bundled update source."))
+	send("progress", updateProgressPayload("checking", 0, 0, ""))
+	checkCtx, checkCancel := context.WithTimeout(r.Context(), 10*time.Second)
+	release, err := h.trustedLatestUpdate(checkCtx)
+	checkCancel()
+	if err != nil {
+		send("error", updateDownloadErrorPayload(requestedVersion, "Failed to fetch trusted update metadata: "+err.Error()))
 		return nil
 	}
+	version := release.LatestVersion
+	if !release.Available || version == "" || len(release.Files) == 0 {
+		send("error", updateDownloadErrorPayload(version, "No update available from the configured update source."))
+		return nil
+	}
+	if requestedVersion != "" && requestedVersion != version {
+		payload := updateDownloadErrorPayload(requestedVersion, "Requested update version no longer matches the latest server metadata")
+		payload["requestedVersion"] = requestedVersion
+		payload["latestVersion"] = version
+		send("error", payload)
+		return nil
+	}
+	files := release.Files
+	expectedBytes := release.ExpectedBytes
 	for _, file := range files {
 		parsed, err := url.Parse(file.URL)
 		if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-			send("error", updateDownloadErrorPayload(version, "valid http(s) update URL is required"))
+			send("error", updateDownloadErrorPayload(version, "trusted update source returned an invalid artifact URL"))
 			return nil
 		}
 	}
@@ -1248,14 +1620,16 @@ func (h *Handler) updateDownload(w http.ResponseWriter, r *http.Request) error {
 	if totalWritten != totalBytes {
 		send("progress", updateProgressPayload("downloading", totalWritten, totalBytes, ""))
 	}
-	metadata := updateDownloadMetadata{Version: version, Directory: dir, Files: downloaded, TotalBytes: totalWritten, DownloadedAt: time.Now().Format(time.RFC3339), SelfUpdateAvailable: false}
+	canAuto := h.canApplySelfUpdate()
+	metadata := updateDownloadMetadata{Version: version, Directory: dir, Files: downloaded, TotalBytes: totalWritten, DownloadedAt: time.Now().Format(time.RFC3339), SelfUpdateAvailable: canAuto}
 	if err := writeUpdateDownloadMetadata(dir, metadata); err != nil {
 		cleanupDownloadedUpdateFiles(downloadedPaths)
 		send("error", updateDownloadErrorPayload(version, err.Error()))
 		return nil
 	}
 
-	send("complete", updateDownloadCompletePayload(version, dir, downloaded, totalWritten, totalBytes))
+	completePayload := updateDownloadCompletePayload(version, dir, downloaded, totalWritten, totalBytes, canAuto)
+	send("complete", completePayload)
 	return nil
 }
 
@@ -1279,95 +1653,13 @@ func newUpdateSSESender(w http.ResponseWriter) func(string, any) {
 	}
 }
 
-func updateDownloadRequestMetadata(body map[string]any, r *http.Request) (string, []updateDownloadFile, int64) {
+func updateDownloadRequestedVersion(body map[string]any) string {
 	releaseInfo, _ := body["releaseInfo"].(map[string]any)
-	version := strings.TrimSpace(firstNonEmpty(stringMap(body, "version", ""), firstNonEmpty(stringMap(releaseInfo, "version", ""), r.URL.Query().Get("version"))))
-	rawURL := firstNonEmpty(stringMap(body, "url", ""), firstNonEmpty(stringMap(body, "downloadUrl", ""), stringMap(body, "artifactUrl", "")))
-	if rawURL == "" {
-		rawURL = firstNonEmpty(stringMap(releaseInfo, "url", ""), firstNonEmpty(stringMap(releaseInfo, "downloadUrl", ""), stringMap(releaseInfo, "artifactUrl", "")))
-	}
-	expectedBytes := int64(numericMapOr(body, "totalBytes", numericMapOr(releaseInfo, "totalBytes", 0)))
-	if rawURL != "" {
-		file := updateDownloadFile{URL: strings.TrimSpace(rawURL), Name: "artifact", Size: expectedBytes, SHA512: firstNonEmpty(stringMap(body, "sha512", ""), stringMap(releaseInfo, "sha512", ""))}
-		return version, []updateDownloadFile{file}, expectedBytes
-	}
-
-	files := updateFilesFromReleaseInfo(releaseInfo, version)
-	if expectedBytes <= 0 {
-		for _, file := range files {
-			expectedBytes += file.Size
-		}
-	}
-	return version, files, expectedBytes
-}
-
-func updateFilesFromReleaseInfo(releaseInfo map[string]any, version string) []updateDownloadFile {
-	filesRaw, _ := releaseInfo["files"].([]any)
-	files := make([]updateDownloadFile, 0, len(filesRaw))
-	usedNames := map[string]int{}
-	for index, item := range filesRaw {
-		file, _ := item.(map[string]any)
-		fileURL := strings.TrimSpace(firstNonEmpty(stringMap(file, "url", ""), firstNonEmpty(stringMap(file, "downloadUrl", ""), stringMap(file, "artifactUrl", ""))))
-		if fileURL == "" {
-			continue
-		}
-		name := uniqueUpdateFileName(updateArtifactFileName(file, fileURL, version, index, len(filesRaw)), usedNames)
-		size := int64(numericMapOr(file, "size", 0))
-		sha := stringMap(file, "sha512", "")
-		if len(filesRaw) == 1 {
-			if size <= 0 {
-				size = int64(numericMapOr(releaseInfo, "totalBytes", 0))
-			}
-			sha = firstNonEmpty(sha, stringMap(releaseInfo, "sha512", ""))
-		}
-		files = append(files, updateDownloadFile{URL: fileURL, Name: name, Size: size, SHA512: sha})
-	}
-	return files
-}
-
-func updateArtifactFileName(file map[string]any, rawURL, version string, index, total int) string {
-	if total == 1 {
-		return "artifact"
-	}
-	candidate := firstNonEmpty(stringMap(file, "path", ""), firstNonEmpty(stringMap(file, "filename", ""), stringMap(file, "name", "")))
-	if candidate == "" {
-		if parsed, err := url.Parse(rawURL); err == nil {
-			candidate = pathBase(parsed.Path)
-		}
-	}
-	if candidate == "" || candidate == "." || candidate == string(filepath.Separator) {
-		candidate = "artifact-" + strconv.Itoa(index+1)
-	}
-	candidate = filepath.Base(candidate)
-	candidate = strings.NewReplacer("/", "-", "\\", "-", "\x00", "", "<", "-", ">", "-", ":", "-", "\"", "-", "|", "-", "?", "-", "*", "-").Replace(candidate)
-	candidate = strings.TrimSpace(candidate)
-	if candidate == "" || candidate == "." || candidate == ".." {
-		candidate = "narrafork-" + strings.NewReplacer("/", "-", "\\", "-", "..", "-").Replace(firstNonEmpty(version, "update"))
-	}
-	return candidate
-}
-
-func uniqueUpdateFileName(name string, used map[string]int) string {
-	count := used[name]
-	used[name] = count + 1
-	if count == 0 {
-		return name
-	}
-	ext := filepath.Ext(name)
-	stem := strings.TrimSuffix(name, ext)
-	return stem + "-" + strconv.Itoa(count+1) + ext
-}
-
-func pathBase(p string) string {
-	p = strings.TrimRight(p, "/")
-	if p == "" {
-		return ""
-	}
-	idx := strings.LastIndex(p, "/")
-	if idx >= 0 {
-		return p[idx+1:]
-	}
-	return p
+	return strings.TrimSpace(firstNonEmpty(
+		stringMap(body, "requestedVersion", ""),
+		stringMap(releaseInfo, "version", ""),
+		stringMap(body, "version", ""),
+	))
 }
 
 func updateProgressPayload(phase string, bytesDownloaded, totalBytes int64, errorMessage string) map[string]any {
@@ -1391,11 +1683,13 @@ func updateDownloadErrorPayload(version, message string) map[string]any {
 	payload["version"] = version
 	payload["message"] = message
 	payload["selfUpdateAvailable"] = false
+	payload["canAutoRestart"] = false
+	payload["manualOnly"] = true
 	payload["instructions"] = updateManualInstructions("")
 	return payload
 }
 
-func updateDownloadCompletePayload(version, directory string, files []updateDownloadedFileInfo, bytesDownloaded, totalBytes int64) map[string]any {
+func updateDownloadCompletePayload(version, directory string, files []updateDownloadedFileInfo, bytesDownloaded, totalBytes int64, canAuto bool) map[string]any {
 	if totalBytes <= 0 {
 		totalBytes = bytesDownloaded
 	}
@@ -1414,8 +1708,10 @@ func updateDownloadCompletePayload(version, directory string, files []updateDown
 	payload["directory"] = directory
 	payload["files"] = files
 	payload["placed"] = false
-	payload["selfUpdateAvailable"] = false
-	payload["instructions"] = updateManualInstructions(updatePath)
+	payload["selfUpdateAvailable"] = canAuto
+	payload["canAutoRestart"] = canAuto
+	payload["manualOnly"] = !canAuto
+	payload["instructions"] = updateInstructions(updatePath, canAuto)
 	return payload
 }
 
@@ -1442,8 +1738,24 @@ func updateSHA512Matches(expected, actualHex, actualBase64 string) bool {
 	return strings.EqualFold(expected, actualHex) || expected == actualBase64
 }
 
+func updateInstructions(updatePath string, canAuto bool) map[string]any {
+	if canAuto {
+		return updateAutomaticInstructions(updatePath)
+	}
+	return updateManualInstructions(updatePath)
+}
+
+func updateAutomaticInstructions(updatePath string) map[string]any {
+	message := "Update artifact is verified and ready for automatic apply. Use the apply endpoint to start the replacement NarraFork process and gracefully stop this one."
+	instructions := map[string]any{"manual": false, "message": message, "action": "apply"}
+	if updatePath != "" {
+		instructions["updatePath"] = updatePath
+	}
+	return instructions
+}
+
 func updateManualInstructions(updatePath string) map[string]any {
-	message := "go_backend downloaded update artifact(s) for an operator, but in-process self-update/apply is not supported. Stop NarraFork and manually replace or run the downloaded artifact as appropriate."
+	message := "Automatic self-update/apply is not available for this prepared artifact. Stop NarraFork and manually replace or run the downloaded artifact as appropriate."
 	instructions := map[string]any{"manual": true, "message": message}
 	if updatePath != "" {
 		instructions["updatePath"] = updatePath
@@ -1524,6 +1836,7 @@ func updateStatusPayload(version, dir string) map[string]any {
 		"canAutoRestart":      false,
 		"placed":              false,
 		"selfUpdateAvailable": false,
+		"manualOnly":          true,
 		"instructions":        updateManualInstructions(updatePath),
 	}
 	if updateFile != "" {
@@ -1595,29 +1908,6 @@ func removeUpdatePathIfSafe(target string) (bool, error) {
 	return true, nil
 }
 
-func (h *Handler) updateApply(w http.ResponseWriter, r *http.Request) error {
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"success": false, "serverRestarting": false, "restarting": false, "canAutoRestart": false, "selfUpdateAvailable": false, "message": "go_backend can download artifacts for operators, but in-process self-update/apply is not supported.", "instructions": updateManualInstructions("")})
-	return nil
-}
-
-func currentBackendVersion() string {
-	for _, key := range []string{"NARRAFORK_VERSION", "APP_VERSION"} {
-		if version := strings.TrimSpace(os.Getenv(key)); version != "" {
-			return version
-		}
-	}
-	return "go-backend-dev"
-}
-
-func currentBackendCommit() string {
-	for _, key := range []string{"NARRAFORK_COMMIT", "GIT_COMMIT"} {
-		if commit := strings.TrimSpace(os.Getenv(key)); commit != "" {
-			return commit
-		}
-	}
-	return ""
-}
-
 func updateBaseDir() (string, error) {
 	dir, err := narraforkDataDir()
 	if err != nil {
@@ -1640,92 +1930,109 @@ func updateVersionDir(version string) (string, error) {
 }
 
 func (h *Handler) RegisterProviders(r chi.Router) {
-	r.Get("/kiro/status", httpx.Handler(h.kiroStatus))
-	r.Get("/kiro/models", httpx.Handler(h.kiroModels))
-	r.Post("/kiro/models/refresh", httpx.Handler(h.kiroModels))
-	r.Get("/kiro/mcp-tools", httpx.Handler(h.kiroMcpTools))
-	r.Post("/kiro/mcp-search", httpx.Handler(h.kiroMcpSearch))
-	r.Post("/kiro/chat", httpx.Handler(h.kiroChat))
-	r.Post("/kiro/global-proxy", httpx.Handler(h.kiroSetGlobalProxy))
-	r.Post("/kiro/load-balancing-mode", httpx.Handler(h.kiroSetLoadBalancingMode))
-	r.Post("/kiro/credentials/import", httpx.Handler(h.kiroImportCredentials))
-	r.Post("/kiro/credentials/{id}/disable", httpx.Handler(h.kiroCredentialDisable))
-	r.Post("/kiro/credentials/{id}/enable", httpx.Handler(h.kiroCredentialEnable))
-	r.Post("/kiro/credentials/{id}/reset", httpx.Handler(h.kiroCredentialReset))
-	r.Post("/kiro/credentials/{id}/priority", httpx.Handler(h.kiroCredentialPriority))
-	r.Post("/kiro/credentials/{id}/refresh", httpx.Handler(h.kiroCredentialRefresh))
-	r.Get("/kiro/credentials/{id}/usage", httpx.Handler(h.kiroCredentialUsage))
-	r.Patch("/kiro/credentials/{id}", httpx.Handler(h.kiroCredentialUpdate))
-	r.Delete("/kiro/credentials/{id}", httpx.Handler(h.kiroCredentialDelete))
+	r.Route("/kiro", func(kr chi.Router) {
+		kr.Use(h.adminMiddleware)
+		kr.Get("/status", httpx.Handler(h.kiroStatus))
+		kr.Get("/models", httpx.Handler(h.kiroModels))
+		kr.Post("/models/refresh", httpx.Handler(h.kiroModels))
+		kr.Get("/mcp-tools", httpx.Handler(h.kiroMcpTools))
+		kr.Post("/mcp-search", httpx.Handler(h.kiroMcpSearch))
+		kr.Post("/chat", httpx.Handler(h.kiroChat))
+		kr.Post("/global-proxy", httpx.Handler(h.kiroSetGlobalProxy))
+		kr.Post("/load-balancing-mode", httpx.Handler(h.kiroSetLoadBalancingMode))
+		kr.Post("/credentials/import", httpx.Handler(h.kiroImportCredentials))
+		kr.Post("/credentials/{id}/disable", httpx.Handler(h.kiroCredentialDisable))
+		kr.Post("/credentials/{id}/enable", httpx.Handler(h.kiroCredentialEnable))
+		kr.Post("/credentials/{id}/reset", httpx.Handler(h.kiroCredentialReset))
+		kr.Post("/credentials/{id}/priority", httpx.Handler(h.kiroCredentialPriority))
+		kr.Post("/credentials/{id}/refresh", httpx.Handler(h.kiroCredentialRefresh))
+		kr.Get("/credentials/{id}/usage", httpx.Handler(h.kiroCredentialUsage))
+		kr.Patch("/credentials/{id}", httpx.Handler(h.kiroCredentialUpdate))
+		kr.Delete("/credentials/{id}", httpx.Handler(h.kiroCredentialDelete))
+	})
 
 	r.Get("/openai/models", httpx.Handler(h.providerCachedModels("openai", false)))
-	r.Post("/openai/models/refresh", httpx.Handler(h.providerCachedModels("openai", true)))
+	r.Post("/openai/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("openai", true))))
 	r.Get("/openai/providers/{id}/models", httpx.Handler(h.providerCachedModels("openai", false)))
-	r.Post("/openai/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("openai", true)))
+	r.Post("/openai/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("openai", true))))
 	r.Get("/anthropic/models", httpx.Handler(h.providerCachedModels("anthropic", false)))
-	r.Post("/anthropic/models/refresh", httpx.Handler(h.providerCachedModels("anthropic", true)))
+	r.Post("/anthropic/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("anthropic", true))))
 	r.Get("/anthropic/providers/{id}/models", httpx.Handler(h.providerCachedModels("anthropic", false)))
-	r.Post("/anthropic/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("anthropic", true)))
+	r.Post("/anthropic/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("anthropic", true))))
 	r.Get("/nkp/models", httpx.Handler(h.providerCachedModels("nkp", false)))
-	r.Post("/nkp/models/refresh", httpx.Handler(h.providerCachedModels("nkp", true)))
+	r.Post("/nkp/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("nkp", true))))
 	r.Get("/nkp/providers/{id}/models", httpx.Handler(h.providerCachedModels("nkp", false)))
-	r.Post("/nkp/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("nkp", true)))
+	r.Post("/nkp/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("nkp", true))))
 	r.Get("/nkp/providers/{id}/quota", httpx.Handler(h.nkpQuota))
 	r.Get("/nkp/quotas", httpx.Handler(h.nkpQuotas))
 
 	r.Get("/nug/models", httpx.Handler(h.nugAllModels))
-	r.Post("/nug/models/refresh", httpx.Handler(h.nugAllModels))
+	r.Post("/nug/models/refresh", httpx.Handler(h.adminOnly(h.nugAllModels)))
 	r.Get("/nug/providers/{id}/models", httpx.Handler(h.nugModels))
-	r.Post("/nug/providers/{id}/models/refresh", httpx.Handler(h.nugModels))
-	r.Post("/nug/providers/{id}/login", httpx.Handler(h.nugLogin))
-	r.Post("/nug/providers/{id}/api-key", httpx.Handler(h.nugAPIKey))
+	r.Post("/nug/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.nugModels)))
+	r.Post("/nug/providers/{id}/login", httpx.Handler(h.adminOnly(h.nugLogin)))
+	r.Post("/nug/providers/{id}/api-key", httpx.Handler(h.adminOnly(h.nugAPIKey)))
 	r.Get("/nug/providers/{id}/quota", httpx.Handler(h.nugQuota))
+	r.Get("/nug/quotas", httpx.Handler(h.nugQuotas))
 	r.Get("/nug/providers/{id}/channels/health", httpx.Handler(h.nugChannelsHealth))
 	r.Get("/nug/providers/{id}/usage", httpx.Handler(h.nugUsage))
 	r.Get("/nug/providers/{id}/usage/summary", httpx.Handler(h.nugUsageSummary))
-	r.Get("/nug/providers/{id}/oauth/start", httpx.Handler(h.nugOAuthStart))
+	r.Get("/nug/providers/{id}/oauth/start", httpx.Handler(h.adminOnly(h.nugOAuthStart)))
 
 	r.Get("/codex/quota-overview", httpx.Handler(h.codexQuotaOverview))
-	r.Get("/codex/status", h.codexStatus)
-	r.Get("/codex/default-reasoning-effort", httpx.Handler(h.codexGetDefaultReasoningEffort))
-	r.Post("/codex/default-reasoning-effort", httpx.Handler(h.codexSetDefaultReasoningEffort))
-	r.Post("/codex/use-websocket", httpx.Handler(h.codexSetUseWebSocket))
-	r.Post("/codex/load-balancing-mode", httpx.Handler(h.codexSetLoadBalancingMode))
-	r.Post("/codex/tier-order", httpx.Handler(h.codexSetTierOrder))
-	r.Post("/codex/global-proxy", httpx.Handler(h.codexSetGlobalProxy))
-	r.Post("/codex/import", httpx.Handler(h.codexImport))
-	r.Post("/codex/usage-queue/clear", ok)
-	r.Post("/codex/auth/browser", httpx.Handler(h.codexAuthBrowser))
-	r.Post("/codex/auth/browser/wait", httpx.Handler(h.codexAuthBrowserWait))
-	r.Post("/codex/auth/browser/cancel", httpx.Handler(h.codexAuthCancel))
-	r.Post("/codex/auth/device/start", httpx.Handler(h.codexDeviceStart))
-	r.Post("/codex/auth/device/poll", httpx.Handler(h.codexDevicePoll))
-	r.Post("/codex/auth/device/cancel", httpx.Handler(h.codexDeviceCancel))
-	r.Post("/codex/credentials/{id}/disable", httpx.Handler(h.codexCredentialDisable))
-	r.Post("/codex/credentials/{id}/enable", httpx.Handler(h.codexCredentialEnable))
-	r.Post("/codex/credentials/{id}/reset", httpx.Handler(h.codexCredentialReset))
-	r.Post("/codex/credentials/{id}/refresh", httpx.Handler(h.codexCredentialRefresh))
-	r.Post("/codex/credentials/{id}/usage", httpx.Handler(h.codexCredentialUsage))
-	r.Patch("/codex/credentials/{id}", httpx.Handler(h.codexCredentialUpdate))
-	r.Delete("/codex/credentials/batch", httpx.Handler(h.codexCredentialBatchDelete))
-	r.Delete("/codex/credentials/{id}", httpx.Handler(h.codexCredentialDelete))
+	r.Route("/codex", func(cr chi.Router) {
+		cr.Use(h.adminMiddleware)
+		cr.Get("/status", h.codexStatus)
+		cr.Get("/default-reasoning-effort", httpx.Handler(h.codexGetDefaultReasoningEffort))
+		cr.Post("/default-reasoning-effort", httpx.Handler(h.codexSetDefaultReasoningEffort))
+		cr.Post("/use-websocket", httpx.Handler(h.codexSetUseWebSocket))
+		cr.Post("/load-balancing-mode", httpx.Handler(h.codexSetLoadBalancingMode))
+		cr.Post("/tier-order", httpx.Handler(h.codexSetTierOrder))
+		cr.Post("/global-proxy", httpx.Handler(h.codexSetGlobalProxy))
+		cr.Post("/import", httpx.Handler(h.codexImport))
+		cr.Post("/usage-queue/clear", httpx.Handler(h.adminOnly(func(w http.ResponseWriter, r *http.Request) error {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return nil
+		})))
+		cr.Post("/auth/browser", httpx.Handler(h.codexAuthBrowser))
+		cr.Post("/auth/browser/wait", httpx.Handler(h.codexAuthBrowserWait))
+		cr.Post("/auth/browser/cancel", httpx.Handler(h.codexAuthCancel))
+		cr.Post("/auth/device/start", httpx.Handler(h.codexDeviceStart))
+		cr.Post("/auth/device/poll", httpx.Handler(h.codexDevicePoll))
+		cr.Post("/auth/device/cancel", httpx.Handler(h.codexDeviceCancel))
+		cr.Post("/credentials/{id}/disable", httpx.Handler(h.codexCredentialDisable))
+		cr.Post("/credentials/{id}/enable", httpx.Handler(h.codexCredentialEnable))
+		cr.Post("/credentials/{id}/reset", httpx.Handler(h.codexCredentialReset))
+		cr.Post("/credentials/{id}/refresh", httpx.Handler(h.codexCredentialRefresh))
+		cr.Post("/credentials/{id}/usage", httpx.Handler(h.codexCredentialUsage))
+		cr.Patch("/credentials/{id}", httpx.Handler(h.codexCredentialUpdate))
+		cr.Delete("/credentials/batch", httpx.Handler(h.codexCredentialBatchDelete))
+		cr.Delete("/credentials/{id}", httpx.Handler(h.codexCredentialDelete))
+	})
 
-	r.Get("/cline/status", httpx.Handler(h.clineStatus))
-	r.Get("/cline/models", httpx.Handler(h.providerCachedModels("cline", false)))
-	r.Post("/cline/models/refresh", httpx.Handler(h.providerCachedModels("cline", true)))
-	r.Get("/cline/providers/{id}/models", httpx.Handler(h.providerCachedModels("cline", false)))
-	r.Post("/cline/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("cline", true)))
-	r.Get("/cline/balance", httpx.Handler(h.clineBalance))
-	r.Get("/cline/recommended-models", httpx.Handler(h.clineRecommendedModels))
-	r.Get("/cline/pool/search", httpx.Handler(h.clinePoolSearch))
-	r.Get("/cline/pool/count", httpx.Handler(h.clinePoolCount))
-	r.Post("/cline/enabled-models", httpx.Handler(h.clineSetEnabledModels))
-	r.Post("/cline/user-info/refresh", httpx.Handler(h.clineUserInfoRefresh))
-	r.Post("/cline/auth/browser", httpx.Handler(h.clineAuthBrowser))
-	r.Post("/cline/auth/cancel", httpx.Handler(h.clineAuthCancel))
-	r.Post("/cline/auth/callback", httpx.Handler(h.clineAuthCallback))
-	r.Post("/cline/auth/logout", httpx.Handler(h.clineAuthLogout))
+	r.Route("/cline", func(cr chi.Router) {
+		cr.Use(h.adminMiddleware)
+		cr.Get("/status", httpx.Handler(h.clineStatus))
+		cr.Get("/models", httpx.Handler(h.providerCachedModels("cline", false)))
+		cr.Post("/models/refresh", httpx.Handler(h.providerCachedModels("cline", true)))
+		cr.Get("/providers/{id}/models", httpx.Handler(h.providerCachedModels("cline", false)))
+		cr.Post("/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("cline", true)))
+		cr.Get("/balance", httpx.Handler(h.clineBalance))
+		cr.Get("/recommended-models", httpx.Handler(h.clineRecommendedModels))
+		cr.Get("/pool/search", httpx.Handler(h.clinePoolSearch))
+		cr.Get("/pool/count", httpx.Handler(h.clinePoolCount))
+		cr.Post("/enabled-models", httpx.Handler(h.clineSetEnabledModels))
+		cr.Post("/user-info/refresh", httpx.Handler(h.clineUserInfoRefresh))
+		cr.Post("/auth/browser", httpx.Handler(h.clineAuthBrowser))
+		cr.Post("/auth/cancel", httpx.Handler(h.clineAuthCancel))
+		cr.Post("/auth/callback", httpx.Handler(h.clineAuthCallback))
+		cr.Post("/auth/logout", httpx.Handler(h.clineAuthLogout))
+	})
 }
+
+const kiroSuspiciousThrottleCooldown = 5 * time.Minute
+
+var kiroMCPHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 func (h *Handler) kiroStatus(w http.ResponseWriter, r *http.Request) error {
 	entries, _ := h.loadKiroCredentials()
@@ -1848,17 +2155,66 @@ func (h *Handler) kiroChat(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) callKiroMCP(ctx context.Context, method string, params map[string]any) (map[string]any, error) {
-	entry, err := h.firstUsableKiroCredential()
+	entries, err := h.loadKiroCredentials()
 	if err != nil {
 		return nil, err
 	}
+	maxRetries := kiroMaxCredentialRetries(len(entries))
+	failedCredentialIDs := map[string]bool{}
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		entry, _, ok := firstUsableKiroCredentialFromEntries(entries, failedCredentialIDs)
+		if !ok {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, errorsNew("No enabled Kiro credential with access token")
+		}
+
+		result, status, bodyText, err := h.callKiroMCPWithCredential(ctx, entry, method, params)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if result != nil {
+			return result, nil
+		}
+
+		lastErr = errorsNew(status + ": " + bodyText)
+		if !isKiroSuspiciousThrottle(bodyText) {
+			return nil, lastErr
+		}
+
+		credentialID := stringMap(entry, "id", "")
+		if hasAlternativeUsableKiroCredential(entries, credentialID, failedCredentialIDs) {
+			entry["disabled"] = true
+			entry["disabledReason"] = "suspicious_throttle"
+			entry["disabledAt"] = time.Now().Format(time.RFC3339)
+			if err := h.saveKiroCredentials(entries); err != nil {
+				return nil, err
+			}
+			failedCredentialIDs[credentialID] = true
+			continue
+		}
+
+		entry["lastUsedAt"] = time.Now().Format(time.RFC3339)
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, errorsNew("No enabled Kiro credential with access token")
+}
+
+func (h *Handler) callKiroMCPWithCredential(ctx context.Context, entry map[string]any, method string, params map[string]any) (map[string]any, string, string, error) {
 	config := h.loadKiroConfig()
 	region := firstNonEmpty(stringMap(entry, "apiRegion", ""), stringMap(entry, "region", ""))
 	region = firstNonEmpty(region, stringMap(config, "region", "us-east-1"))
 	kiroVersion := firstNonEmpty(stringMap(config, "kiroVersion", ""), "1.26.1")
 	token := strings.TrimSpace(stringMap(entry, "accessToken", ""))
 	if token == "" {
-		return nil, errorsNew("No Kiro access token available")
+		return nil, "", "", errorsNew("No Kiro access token available")
 	}
 	body := map[string]any{"id": id.Must(12), "jsonrpc": "2.0", "method": method, "params": params}
 	if profileArn := stringMap(entry, "profileArn", ""); profileArn != "" {
@@ -1868,7 +2224,7 @@ func (h *Handler) callKiroMCP(ctx context.Context, method string, params map[str
 	urlValue := "https://q." + region + ".amazonaws.com"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlValue, bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 	req.Header.Set("Content-Type", "application/x-amz-json-1.0")
 	req.Header.Set("x-amz-target", "AmazonCodeWhispererStreamingService.InvokeMCP")
@@ -1880,20 +2236,20 @@ func (h *Handler) callKiroMCP(ctx context.Context, method string, params map[str
 	req.Header.Set("x-amzn-codewhisperer-os-version", runtime.GOOS)
 	req.Header.Set("x-amzn-codewhisperer-ide", "kiro")
 	req.Header.Set("x-amzn-codewhisperer-ide-version", kiroVersion)
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := kiroMCPHTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1000000))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, errorsNew(resp.Status + ": " + string(data))
+		return nil, resp.Status, string(data), nil
 	}
 	result := map[string]any{}
 	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
-	return result, nil
+	return result, resp.Status, string(data), nil
 }
 
 func (h *Handler) firstUsableKiroCredential() (map[string]any, error) {
@@ -1901,15 +2257,62 @@ func (h *Handler) firstUsableKiroCredential() (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, entry := range entries {
+	entry, _, ok := firstUsableKiroCredentialFromEntries(entries, nil)
+	if !ok {
+		return nil, errorsNew("No enabled Kiro credential with access token")
+	}
+	return entry, nil
+}
+
+func firstUsableKiroCredentialFromEntries(entries []map[string]any, excludeIDs map[string]bool) (map[string]any, int, bool) {
+	for i, entry := range entries {
+		credentialID := stringMap(entry, "id", "")
+		if excludeIDs != nil && excludeIDs[credentialID] {
+			continue
+		}
 		if boolMap(entry, "disabled") {
 			continue
 		}
 		if strings.TrimSpace(stringMap(entry, "accessToken", "")) != "" {
-			return entry, nil
+			return entry, i, true
 		}
 	}
-	return nil, errorsNew("No enabled Kiro credential with access token")
+	return nil, -1, false
+}
+
+func hasAlternativeUsableKiroCredential(entries []map[string]any, currentID string, excludeIDs map[string]bool) bool {
+	for _, entry := range entries {
+		credentialID := stringMap(entry, "id", "")
+		if credentialID == currentID {
+			continue
+		}
+		if excludeIDs != nil && excludeIDs[credentialID] {
+			continue
+		}
+		if boolMap(entry, "disabled") {
+			continue
+		}
+		if strings.TrimSpace(stringMap(entry, "accessToken", "")) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isKiroSuspiciousThrottle(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "throttlingexception") && strings.Contains(lower, "suspicious activity")
+}
+
+func kiroMaxCredentialRetries(total int) int {
+	if total <= 0 {
+		return 1
+	}
+	retries := total * 3
+	if retries > 9 {
+		return 9
+	}
+	return retries
 }
 
 func kiroFallbackMcpTools() []map[string]any {
@@ -2039,6 +2442,7 @@ func (h *Handler) kiroCredentialEnable(w http.ResponseWriter, r *http.Request) e
 	return h.updateKiroCredential(w, chi.URLParam(r, "id"), func(entry map[string]any) error {
 		entry["disabled"] = false
 		delete(entry, "disabledReason")
+		delete(entry, "disabledAt")
 		return nil
 	})
 }
@@ -2048,6 +2452,7 @@ func (h *Handler) kiroCredentialReset(w http.ResponseWriter, r *http.Request) er
 		entry["disabled"] = false
 		entry["failureCount"] = 0
 		delete(entry, "disabledReason")
+		delete(entry, "disabledAt")
 		return nil
 	})
 }
@@ -2226,6 +2631,45 @@ func nkpQuotaCachePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "nkp-quotas.json"), nil
+}
+
+func loadNugQuotaCache() (map[string]map[string]any, error) {
+	path, err := nugQuotaCachePath()
+	if err != nil {
+		return map[string]map[string]any{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]map[string]any{}, nil
+	}
+	cache := map[string]map[string]any{}
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return map[string]map[string]any{}, err
+	}
+	return cache, nil
+}
+
+func saveNugQuotaCache(cache map[string]map[string]any) error {
+	path, err := nugQuotaCachePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func nugQuotaCachePath() (string, error) {
+	dir, err := narraforkDataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "nug-quotas.json"), nil
 }
 
 func (h *Handler) providerCachedModels(kind string, refresh bool) func(http.ResponseWriter, *http.Request) error {
@@ -2746,11 +3190,33 @@ func (h *Handler) nugModels(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) nugQuota(w http.ResponseWriter, r *http.Request) error {
-	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/quota", url.Values{})
+	providerID := chi.URLParam(r, "id")
+	data, err := h.fetchNugJSON(r.Context(), providerID, "/v1/quota", url.Values{})
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, data)
+	quota := normalizeNugQuotaResponse(data)
+	cache, _ := loadNugQuotaCache()
+	cache[providerID] = map[string]any{
+		"balance":      quota["balance"],
+		"totalGranted": quota["totalGranted"],
+		"fetchedAt":    time.Now().UnixMilli(),
+	}
+	_ = saveNugQuotaCache(cache)
+	httpx.WriteJSON(w, http.StatusOK, quota)
+	return nil
+}
+
+func (h *Handler) nugQuotas(w http.ResponseWriter, r *http.Request) error {
+	cache, _ := loadNugQuotaCache()
+	out := map[string]map[string]any{}
+	for providerID, entry := range cache {
+		out[providerID] = map[string]any{
+			"balance":      entry["balance"],
+			"totalGranted": entry["totalGranted"],
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, out)
 	return nil
 }
 
@@ -2855,6 +3321,25 @@ func mapsFromAnyModels(models []any) []map[string]any {
 		}
 	}
 	return out
+}
+
+func normalizeNugQuotaResponse(data map[string]any) map[string]any {
+	quota := map[string]any{}
+	for key, value := range data {
+		quota[key] = value
+	}
+	quota["balance"] = nugFirstNumber(data, 0, "balance", "quotaBalance", "remaining", "creditsRemaining")
+	quota["totalGranted"] = nugFirstNumber(data, 0, "totalGranted", "quotaTotalGranted", "total_granted", "creditsTotal", "total")
+	return quota
+}
+
+func nugFirstNumber(data map[string]any, fallback float64, keys ...string) float64 {
+	for _, key := range keys {
+		if _, ok := data[key]; ok {
+			return numericMapOr(data, key, fallback)
+		}
+	}
+	return fallback
 }
 
 func normalizeNugModels(data map[string]any) []any {
@@ -3232,6 +3717,17 @@ func (h *Handler) adminOnly(next httpx.HandlerFunc) httpx.HandlerFunc {
 		}
 		return next(w, r)
 	}
+}
+
+func (h *Handler) adminMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := auth.UserFromContext(r.Context())
+		if claims == nil || claims.Role != "admin" {
+			httpx.WriteError(w, httpx.Forbidden("Admin access required"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) error {
@@ -3827,6 +4323,11 @@ const (
 	codexClientID       = "app_EMoamEEZ73f0CkXaXp7hrann"
 	codexIssuer         = "https://auth.openai.com"
 	clineDefaultBaseURL = "https://api.cline.bot"
+)
+
+var (
+	codexRefreshTokenPattern = regexp.MustCompile(`rt_[A-Za-z0-9._-]+`)
+	codexEmailPattern        = regexp.MustCompile(`(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}`)
 )
 
 func (h *Handler) clineRecommendedModels(w http.ResponseWriter, r *http.Request) error {
@@ -4670,7 +5171,10 @@ func (h *Handler) codexCredentialReset(w http.ResponseWriter, r *http.Request) e
 	updated, err := mutateCodexCredential(idParam, func(entry map[string]any) {
 		entry["disabled"] = false
 		delete(entry, "disabledReason")
+		delete(entry, "quotaResetsAt")
 		delete(entry, "lastError")
+		delete(entry, "lastRuntimeError")
+		delete(entry, "lastRuntimeErrorAt")
 		entry["successCount"] = float64(0)
 		entry["failureCount"] = float64(0)
 	})
@@ -4789,8 +5293,12 @@ func (h *Handler) codexCredentialUsage(w http.ResponseWriter, r *http.Request) e
 		if stringMap(entry, "id", "") != idParam {
 			continue
 		}
-		accessToken := stringMap(entry, "accessToken", "")
-		if accessToken == "" || numericMapOr(entry, "expiresAt", 0) < float64(time.Now().UnixMilli()+30000) {
+		accessToken := strings.TrimSpace(stringMap(entry, "accessToken", ""))
+		expiresAt := numericMapOr(entry, "expiresAt", 0)
+		if accessToken == "" || (expiresAt > 0 && expiresAt < float64(time.Now().UnixMilli()+30000)) {
+			if strings.TrimSpace(stringMap(entry, "refreshToken", "")) == "" {
+				return httpx.BadRequest("Access token is expired or unavailable and no refresh token is available")
+			}
 			refreshed, err := refreshCodexCredentialToken(r.Context(), entry)
 			if err != nil {
 				return httpx.BadRequest(err.Error())
@@ -4798,7 +5306,7 @@ func (h *Handler) codexCredentialUsage(w http.ResponseWriter, r *http.Request) e
 			entry = mergeCredentialMetadata(entry, refreshed)
 			entries[i] = entry
 			_ = saveCodexCredentials(entries)
-			accessToken = stringMap(entry, "accessToken", "")
+			accessToken = strings.TrimSpace(stringMap(entry, "accessToken", ""))
 		}
 		usage, err := fetchCodexUsage(r.Context(), accessToken, stringMap(entry, "accountId", ""))
 		if err != nil {
@@ -4818,6 +5326,10 @@ func (h *Handler) updateCodexCredentialFlag(w http.ResponseWriter, idParam strin
 		entry["disabled"] = disabled
 		if !disabled {
 			delete(entry, "disabledReason")
+			delete(entry, "quotaResetsAt")
+			entry["failureCount"] = float64(0)
+		} else {
+			entry["disabledReason"] = "manual"
 		}
 	})
 	if err != nil {
@@ -4983,9 +5495,293 @@ func normalizeCodexUsageWindow(window map[string]any, includeType bool) map[stri
 	return out
 }
 
+func codexImportCredentialsFromBody(items []any, texts ...string) []map[string]any {
+	credentials := []map[string]any{}
+	for _, item := range items {
+		switch value := item.(type) {
+		case map[string]any:
+			credentials = append(credentials, codexImportCredentialsFromMap(value)...)
+		case string:
+			credentials = append(credentials, codexImportCredentialsFromText(value)...)
+		}
+	}
+	for _, text := range texts {
+		credentials = append(credentials, codexImportCredentialsFromText(text)...)
+	}
+	return credentials
+}
+
+func codexImportCredentialsFromMap(value map[string]any) []map[string]any {
+	if accounts, ok := value["accounts"].([]any); ok {
+		return codexImportCredentialsFromBody(accounts)
+	}
+	if credentials, ok := value["credentials"].([]any); ok {
+		return codexImportCredentialsFromBody(credentials)
+	}
+	return []map[string]any{value}
+}
+
+func codexImportCredentialsFromText(text string) []map[string]any {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return []map[string]any{}
+	}
+	if strings.HasPrefix(text, "{") || strings.HasPrefix(text, "[") {
+		var parsed any
+		if err := json.Unmarshal([]byte(text), &parsed); err == nil {
+			switch value := parsed.(type) {
+			case map[string]any:
+				return codexImportCredentialsFromMap(value)
+			case []any:
+				return codexImportCredentialsFromBody(value)
+			case string:
+				return codexImportCredentialsFromText(value)
+			}
+		}
+	}
+
+	credentials := []map[string]any{}
+	for _, record := range strings.FieldsFunc(text, func(r rune) bool { return r == ',' || r == '\n' }) {
+		record = strings.TrimSpace(record)
+		if record == "" {
+			continue
+		}
+		email := codexEmailFromText(record)
+		for _, refreshToken := range codexRefreshTokenPattern.FindAllString(record, -1) {
+			credential := map[string]any{"refreshToken": refreshToken}
+			if email != "" {
+				credential["email"] = email
+				credential["displayName"] = email
+			}
+			credentials = append(credentials, credential)
+		}
+		parts := strings.Split(record, "----")
+		for i, part := range parts {
+			if !strings.EqualFold(strings.TrimSpace(part), "at") || i+1 >= len(parts) {
+				continue
+			}
+			accessToken := strings.TrimSpace(parts[i+1])
+			if accessToken == "" {
+				continue
+			}
+			credential := map[string]any{"accessToken": accessToken}
+			if email != "" {
+				credential["email"] = email
+				credential["displayName"] = email
+			}
+			credentials = append(credentials, credential)
+		}
+	}
+	return credentials
+}
+
+func codexEmailFromText(value string) string {
+	match := codexEmailPattern.FindString(value)
+	return strings.TrimSpace(match)
+}
+
+func codexMap(value map[string]any, key string) map[string]any {
+	if nested, ok := value[key].(map[string]any); ok {
+		return nested
+	}
+	return map[string]any{}
+}
+
+func codexCredentialFromImport(credential map[string]any, defaultPriority float64) map[string]any {
+	nestedCredentials := codexMap(credential, "credentials")
+	extra := codexMap(credential, "extra")
+	refreshToken := codexFirstString(
+		stringMap(credential, "refreshToken", ""),
+		stringMap(credential, "refresh_token", ""),
+		stringMap(nestedCredentials, "refreshToken", ""),
+		stringMap(nestedCredentials, "refresh_token", ""),
+	)
+	accessToken := codexFirstString(
+		stringMap(credential, "accessToken", ""),
+		stringMap(credential, "access_token", ""),
+		stringMap(nestedCredentials, "accessToken", ""),
+		stringMap(nestedCredentials, "access_token", ""),
+	)
+	if refreshToken == "" && accessToken == "" {
+		return nil
+	}
+	info := codexTokenInfo("", accessToken)
+	accountID := codexFirstString(
+		stringMap(credential, "accountId", ""),
+		stringMap(credential, "account_id", ""),
+		stringMap(nestedCredentials, "accountId", ""),
+		stringMap(nestedCredentials, "account_id", ""),
+		stringMap(nestedCredentials, "chatgptAccountId", ""),
+		stringMap(nestedCredentials, "chatgpt_account_id", ""),
+		stringMap(info, "accountId", ""),
+	)
+	email := codexFirstString(
+		stringMap(credential, "email", ""),
+		stringMap(nestedCredentials, "email", ""),
+		stringMap(extra, "email", ""),
+		stringMap(info, "email", ""),
+	)
+	sub := codexFirstString(
+		stringMap(credential, "sub", ""),
+		stringMap(nestedCredentials, "sub", ""),
+		stringMap(nestedCredentials, "chatgptUserId", ""),
+		stringMap(nestedCredentials, "chatgpt_user_id", ""),
+		stringMap(info, "sub", ""),
+	)
+	displayName := codexFirstString(
+		stringMap(credential, "displayName", ""),
+		stringMap(credential, "display_name", ""),
+		stringMap(credential, "name", ""),
+		stringMap(nestedCredentials, "displayName", ""),
+		stringMap(nestedCredentials, "display_name", ""),
+		email,
+		accountID,
+	)
+	entry := map[string]any{
+		"id":       id.Must(8),
+		"priority": numericMapOr(credential, "priority", numericMapOr(nestedCredentials, "priority", defaultPriority)),
+		"disabled": false,
+	}
+	if refreshToken != "" {
+		entry["refreshToken"] = refreshToken
+	}
+	if accessToken != "" {
+		entry["accessToken"] = accessToken
+	}
+	if expiresAt := codexNormalizeExpiresAt(codexFirstValue(credential["expiresAt"], credential["expires_at"], nestedCredentials["expiresAt"], nestedCredentials["expires_at"])); expiresAt > 0 {
+		entry["expiresAt"] = expiresAt
+	}
+	if accountID != "" {
+		entry["accountId"] = accountID
+	}
+	if email != "" {
+		entry["email"] = email
+	}
+	if sub != "" {
+		entry["sub"] = sub
+	}
+	if displayName != "" {
+		entry["displayName"] = displayName
+	}
+	return entry
+}
+
+func codexCredentialDedupeKeys(entry map[string]any) []string {
+	keys := []string{}
+	if refreshToken := codexFirstString(stringMap(entry, "refreshToken", ""), stringMap(entry, "refresh_token", "")); refreshToken != "" {
+		keys = append(keys, "rt:"+sha256String(refreshToken))
+	}
+	if sub := codexFirstString(stringMap(entry, "sub", "")); sub != "" {
+		keys = append(keys, "sub:"+sub)
+	}
+	accountID := codexFirstString(stringMap(entry, "accountId", ""), stringMap(entry, "account_id", ""))
+	email := codexFirstString(stringMap(entry, "email", ""))
+	if accountID != "" && email != "" {
+		keys = append(keys, "account-email:"+accountID+":"+email)
+	}
+	if accessToken := codexFirstString(stringMap(entry, "accessToken", ""), stringMap(entry, "access_token", "")); accessToken != "" {
+		keys = append(keys, "at:"+sha256String(accessToken))
+	}
+	return keys
+}
+
+func codexFirstString(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func codexFirstValue(values ...any) any {
+	for _, value := range values {
+		if text, ok := value.(string); ok {
+			if strings.TrimSpace(text) != "" {
+				return value
+			}
+			continue
+		}
+		if value != nil {
+			return value
+		}
+	}
+	return nil
+}
+
+func codexNormalizeExpiresAt(value any) float64 {
+	switch typed := value.(type) {
+	case nil:
+		return 0
+	case float64:
+		return codexNormalizeExpiresAtNumber(typed)
+	case float32:
+		return codexNormalizeExpiresAtNumber(float64(typed))
+	case int:
+		return codexNormalizeExpiresAtNumber(float64(typed))
+	case int64:
+		return codexNormalizeExpiresAtNumber(float64(typed))
+	case json.Number:
+		parsed, _ := typed.Float64()
+		return codexNormalizeExpiresAtNumber(parsed)
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0
+		}
+		if parsed, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return codexNormalizeExpiresAtNumber(parsed)
+		}
+		for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+			if parsed, err := time.Parse(layout, trimmed); err == nil {
+				return float64(parsed.UnixMilli())
+			}
+		}
+	}
+	return 0
+}
+
+func codexNormalizeExpiresAtNumber(value float64) float64 {
+	if value > 0 && value < 100000000000 {
+		return value * 1000
+	}
+	return value
+}
+
+func codexTokenInfo(idToken, accessToken string) map[string]any {
+	result := map[string]any{}
+	applyClaims := func(claims map[string]any) {
+		if len(claims) == 0 {
+			return
+		}
+		if result["email"] == nil {
+			if email := stringMap(claims, "email", ""); email != "" {
+				result["email"] = email
+			}
+		}
+		if result["sub"] == nil {
+			if sub := stringMap(claims, "sub", ""); sub != "" {
+				result["sub"] = sub
+			}
+		}
+		if result["accountId"] == nil {
+			if accountID := codexAccountID(claims); accountID != "" {
+				result["accountId"] = accountID
+			}
+		}
+	}
+	applyClaims(parseJWTClaims(idToken))
+	if result["accountId"] == nil || result["email"] == nil || result["sub"] == nil {
+		applyClaims(parseJWTClaims(accessToken))
+	}
+	return result
+}
+
 func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
-		Credentials []map[string]any `json:"credentials"`
+		Credentials []any  `json:"credentials"`
+		Text        string `json:"text"`
+		ImportText  string `json:"importText"`
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
@@ -4993,31 +5789,35 @@ func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 	entries, _ := loadCodexCredentials()
 	existing := map[string]bool{}
 	for _, entry := range entries {
-		if rt := stringMap(entry, "refreshToken", ""); rt != "" {
-			existing[sha256String(rt)] = true
+		for _, key := range codexCredentialDedupeKeys(entry) {
+			existing[key] = true
 		}
 	}
 	added, duplicates, skipped := 0, 0, 0
-	for _, cred := range body.Credentials {
-		rt := stringMap(cred, "refreshToken", "")
-		if rt == "" {
+	for _, cred := range codexImportCredentialsFromBody(body.Credentials, body.Text, body.ImportText) {
+		entry := codexCredentialFromImport(cred, float64(len(entries)))
+		if entry == nil {
 			skipped++
 			continue
 		}
-		hash := sha256String(rt)
-		if existing[hash] {
+		keys := codexCredentialDedupeKeys(entry)
+		if len(keys) == 0 {
+			skipped++
+			continue
+		}
+		duplicate := false
+		for _, key := range keys {
+			if existing[key] {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
 			duplicates++
 			continue
 		}
-		existing[hash] = true
-		entry := map[string]any{
-			"id":           id.Must(8),
-			"refreshToken": rt,
-			"priority":     numericMapOr(cred, "priority", float64(len(entries))),
-			"disabled":     false,
-		}
-		if displayName := stringMap(cred, "displayName", ""); displayName != "" {
-			entry["displayName"] = displayName
+		for _, key := range keys {
+			existing[key] = true
 		}
 		entries = append(entries, entry)
 		added++
@@ -5337,27 +6137,32 @@ func exchangeCodexAuthCode(ctx context.Context, code, redirectURI, verifier stri
 }
 
 func codexCredentialFromTokenResponse(tokens map[string]any) map[string]any {
-	idToken := stringMap(tokens, "id_token", "")
-	claims := parseJWTClaims(idToken)
+	info := codexTokenInfo(stringMap(tokens, "id_token", ""), stringMap(tokens, "access_token", ""))
 	expiresIn := numericMapOr(tokens, "expires_in", 3600)
 	entry := map[string]any{
-		"id":           id.Must(8),
-		"displayName":  firstNonEmpty(stringMap(claims, "email", ""), firstNonEmpty(stringMap(claims, "chatgpt_account_id", ""), "Codex")),
-		"refreshToken": stringMap(tokens, "refresh_token", ""),
-		"accessToken":  stringMap(tokens, "access_token", ""),
-		"expiresAt":    float64(time.Now().UnixMilli()) + expiresIn*1000,
-		"priority":     float64(0),
-		"disabled":     false,
+		"id":        id.Must(8),
+		"expiresAt": float64(time.Now().UnixMilli()) + expiresIn*1000,
+		"priority":  float64(0),
+		"disabled":  false,
 	}
-	if accountID := codexAccountID(claims); accountID != "" {
+	if refreshToken := stringMap(tokens, "refresh_token", ""); refreshToken != "" {
+		entry["refreshToken"] = refreshToken
+	}
+	if accessToken := stringMap(tokens, "access_token", ""); accessToken != "" {
+		entry["accessToken"] = accessToken
+	}
+	if accountID := stringMap(info, "accountId", ""); accountID != "" {
 		entry["accountId"] = accountID
 	}
-	if email := stringMap(claims, "email", ""); email != "" {
+	if email := stringMap(info, "email", ""); email != "" {
 		entry["email"] = email
 		entry["displayName"] = email
 	}
-	if sub := stringMap(claims, "sub", ""); sub != "" {
+	if sub := stringMap(info, "sub", ""); sub != "" {
 		entry["sub"] = sub
+	}
+	if stringMap(entry, "displayName", "") == "" {
+		entry["displayName"] = firstNonEmpty(stringMap(entry, "accountId", ""), "Codex")
 	}
 	return entry
 }
@@ -5378,22 +6183,26 @@ func codexAccountID(claims map[string]any) string {
 }
 
 func addCodexCredential(entry map[string]any) error {
-	if stringMap(entry, "refreshToken", "") == "" {
-		return errorsNew("No refresh token in Codex token response")
+	if stringMap(entry, "refreshToken", "") == "" && stringMap(entry, "accessToken", "") == "" {
+		return errorsNew("No refresh token or access token in Codex token response")
 	}
 	entries, _ := loadCodexCredentials()
-	newHash := sha256String(stringMap(entry, "refreshToken", ""))
+	newKeys := map[string]bool{}
+	for _, key := range codexCredentialDedupeKeys(entry) {
+		newKeys[key] = true
+	}
 	for i, existing := range entries {
-		if stringMap(entry, "sub", "") != "" && stringMap(existing, "sub", "") == stringMap(entry, "sub", "") {
-			entry["id"] = stringMap(existing, "id", id.Must(8))
-			entry["priority"] = numericMapOr(existing, "priority", float64(i))
-			entries[i] = entry
-			return saveCodexCredentials(entries)
+		matched := false
+		for _, key := range codexCredentialDedupeKeys(existing) {
+			if newKeys[key] {
+				matched = true
+				break
+			}
 		}
-		if sha256String(stringMap(existing, "refreshToken", "")) == newHash {
+		if matched {
 			entry["id"] = stringMap(existing, "id", id.Must(8))
 			entry["priority"] = numericMapOr(existing, "priority", float64(i))
-			entries[i] = entry
+			entries[i] = mergeCredentialMetadata(existing, entry)
 			return saveCodexCredentials(entries)
 		}
 	}
@@ -5416,18 +6225,21 @@ func (h *Handler) codexCredentialEntries() []map[string]any {
 			entry["disabled"] = false
 		}
 		out = append(out, map[string]any{
-			"id":             stringMap(entry, "id", ""),
-			"displayName":    entry["displayName"],
-			"accountId":      entry["accountId"],
-			"email":          entry["email"],
-			"priority":       numericMapOr(entry, "priority", float64(i)),
-			"disabled":       boolMap(entry, "disabled"),
-			"disabledReason": entry["disabledReason"],
-			"successCount":   0,
-			"failureCount":   0,
-			"expiresAt":      entry["expiresAt"],
-			"quotaResetsAt":  entry["quotaResetsAt"],
-			"usage":          entry["usage"],
+			"id":                 stringMap(entry, "id", ""),
+			"displayName":        entry["displayName"],
+			"accountId":          entry["accountId"],
+			"email":              entry["email"],
+			"priority":           numericMapOr(entry, "priority", float64(i)),
+			"disabled":           boolMap(entry, "disabled"),
+			"disabledReason":     entry["disabledReason"],
+			"successCount":       numericMapOr(entry, "successCount", 0),
+			"failureCount":       numericMapOr(entry, "failureCount", 0),
+			"lastUsedAt":         entry["lastUsedAt"],
+			"expiresAt":          entry["expiresAt"],
+			"quotaResetsAt":      entry["quotaResetsAt"],
+			"usage":              entry["usage"],
+			"lastRuntimeError":   entry["lastRuntimeError"],
+			"lastRuntimeErrorAt": entry["lastRuntimeErrorAt"],
 		})
 	}
 	return out
@@ -5752,7 +6564,43 @@ func (h *Handler) loadKiroCredentials() ([]map[string]any, error) {
 			entry["authMethod"] = "idc"
 		}
 	}
+	if recoverExpiredKiroSuspiciousThrottles(entries, time.Now()) {
+		_ = writeJSONFile(path, entries)
+	}
 	return entries, nil
+}
+
+func recoverExpiredKiroSuspiciousThrottles(entries []map[string]any, now time.Time) bool {
+	changed := false
+	for _, entry := range entries {
+		if !boolMap(entry, "disabled") || stringMap(entry, "disabledReason", "") != "suspicious_throttle" {
+			continue
+		}
+		disabledAt, ok := parseKiroDisabledAt(stringMap(entry, "disabledAt", ""))
+		if ok && now.Sub(disabledAt) < kiroSuspiciousThrottleCooldown {
+			continue
+		}
+		entry["disabled"] = false
+		entry["failureCount"] = 0
+		delete(entry, "disabledReason")
+		delete(entry, "disabledAt")
+		changed = true
+	}
+	return changed
+}
+
+func parseKiroDisabledAt(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 func (h *Handler) saveKiroCredentials(entries []map[string]any) error {
@@ -6182,12 +7030,13 @@ func (h *Handler) browserRuntimePayload(ctx context.Context) map[string]any {
 	memoryCount := len(ids)
 	dbTableAvailable := false
 	dbError := ""
-	if h.DB != nil {
-		if ok, err := h.systemTableExists(ctx, "narrator_browser_sessions"); err != nil {
+	browserDB := h.browserRuntimeDB()
+	if browserDB != nil {
+		if ok, err := tableExistsInDB(ctx, browserDB, "narrator_browser_sessions"); err != nil {
 			dbError = err.Error()
 		} else if ok {
 			dbTableAvailable = true
-			rows, err := h.DB.QueryContext(ctx, `SELECT id FROM narrator_browser_sessions WHERE status IN ('active', 'running', 'idle') ORDER BY id ASC LIMIT 1000`)
+			rows, err := browserDB.QueryContext(ctx, `SELECT id FROM narrator_browser_sessions WHERE status IN ('active', 'running', 'idle') ORDER BY id ASC LIMIT 1000`)
 			if err != nil {
 				dbError = err.Error()
 			} else {
@@ -6584,11 +7433,12 @@ func (h *Handler) cleanupRuntimeBrowsers(ctx context.Context, dryRun bool, resul
 			ids[id] = true
 		}
 	}
+	browserDB := h.browserRuntimeDB()
 	exists, err := h.runtimeTableExists(ctx, "narrator_browser_sessions")
 	if err != nil {
 		result.addError("browsers", "narrator_browser_sessions", err)
-	} else if exists {
-		rows, err := h.DB.QueryContext(ctx, `SELECT id FROM narrator_browser_sessions WHERE status IN ('active', 'running', 'idle') ORDER BY id ASC`)
+	} else if exists && browserDB != nil {
+		rows, err := browserDB.QueryContext(ctx, `SELECT id FROM narrator_browser_sessions WHERE status IN ('active', 'running', 'idle') ORDER BY id ASC`)
 		if err != nil {
 			result.addError("browsers", "narrator_browser_sessions", err)
 		} else {
@@ -6609,7 +7459,7 @@ func (h *Handler) cleanupRuntimeBrowsers(ctx context.Context, dryRun bool, resul
 		for _, id := range agentbasic.CloseAllBrowserSessions() {
 			ids[id] = true
 		}
-		if exists && h.DB != nil {
+		if exists && browserDB != nil {
 			sets := []string{"status = 'closed'"}
 			if ok, _ := h.runtimeColumnExists(ctx, "narrator_browser_sessions", "closed_at"); ok {
 				sets = append(sets, "closed_at = COALESCE(closed_at, ?)")
@@ -6625,7 +7475,7 @@ func (h *Handler) cleanupRuntimeBrowsers(ctx context.Context, dryRun bool, resul
 				}
 			}
 			query := `UPDATE narrator_browser_sessions SET ` + strings.Join(sets, ", ") + ` WHERE status IN ('active', 'running', 'idle')`
-			if _, err := h.DB.ExecContext(ctx, query, args...); err != nil {
+			if _, err := browserDB.ExecContext(ctx, query, args...); err != nil {
 				result.addError("browsers", "narrator_browser_sessions", err)
 			}
 		}
@@ -6742,18 +7592,44 @@ func (h *Handler) cleanupRuntimeWorktrees(ctx context.Context, dryRun bool, resu
 	}
 }
 
-func (h *Handler) runtimeTableExists(ctx context.Context, table string) (bool, error) {
-	if h.DB == nil {
+func (h *Handler) browserRuntimeDB() *sql.DB {
+	if h == nil {
+		return nil
+	}
+	if h.RuntimeDB != nil {
+		return h.RuntimeDB
+	}
+	return h.DB
+}
+
+func tableExistsInDB(ctx context.Context, sqlDB *sql.DB, table string) (bool, error) {
+	if sqlDB == nil {
 		return false, nil
 	}
-	return h.systemTableExists(ctx, table)
+	var name string
+	err := sqlDB.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (h *Handler) runtimeTableExists(ctx context.Context, table string) (bool, error) {
+	if table == "narrator_browser_sessions" {
+		return tableExistsInDB(ctx, h.browserRuntimeDB(), table)
+	}
+	return tableExistsInDB(ctx, h.DB, table)
 }
 
 func (h *Handler) runtimeColumnExists(ctx context.Context, table, column string) (bool, error) {
-	if h.DB == nil {
+	sqlDB := h.DB
+	if table == "narrator_browser_sessions" {
+		sqlDB = h.browserRuntimeDB()
+	}
+	if sqlDB == nil {
 		return false, nil
 	}
-	rows, err := h.DB.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	rows, err := sqlDB.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		return false, err
 	}
@@ -6949,9 +7825,13 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	codexAuthMu.Unlock()
 	_, usageSummary, usageForecast, usageCache := buildCodexUsageArtifacts(entries)
 	usageScheduler := map[string]any{"scheduledCredentialCount": numericMapOr(usageSummary, "scheduledAccountCount", 0), "dueCredentialCount": 0, "started": false}
-	loadBalancingMode := h.codexSettingsValue("loadBalancingMode", "tiered_sticky")
+	loadBalancingMode := h.codexSettingsValue("loadBalancingMode", "tier-balanced")
 	tierOrder, _ := h.codexSettingsValue("tierOrder", []any{}).([]any)
-	payload := map[string]any{"entries": entries, "availableEntries": available, "unavailableEntries": unavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": tierOrder, "proxy": h.codexSettingsValue("proxy", ""), "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": 0, "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
+	effectiveTierOrder := normalizeCodexTierOrder(tierOrder)
+	if len(effectiveTierOrder) == 0 {
+		effectiveTierOrder = []any{"pro", "prolite", "plus", "team", "free"}
+	}
+	payload := map[string]any{"entries": entries, "availableEntries": available, "unavailableEntries": unavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "proxy": h.codexSettingsValue("proxy", ""), "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
 	if lastBrowserAuthError != "" {
 		payload["lastBrowserAuthError"] = lastBrowserAuthError
 	}

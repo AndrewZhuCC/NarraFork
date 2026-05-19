@@ -11,10 +11,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"narrafork-go/internal/db"
 	"narrafork-go/internal/httpx"
 )
 
-type Handler struct{ DB *sql.DB }
+type Handler struct {
+	DB     *sql.DB
+	Engine db.Engine
+}
 
 type searchFallback struct {
 	Entity        string `json:"entity"`
@@ -49,7 +53,26 @@ func (d *searchDiagnostics) addFallback(fallback *searchFallback) {
 	d.Fallbacks = append(d.Fallbacks, *fallback)
 }
 
-func NewHandler(sqlDB *sql.DB) *Handler { return &Handler{DB: sqlDB} }
+func NewHandler(sqlDB *sql.DB) *Handler { return NewHandlerWithEngine(sqlDB, db.EngineSQLite) }
+
+func NewHandlerWithEngine(sqlDB *sql.DB, engine db.Engine) *Handler {
+	if engine == "" {
+		engine = db.EngineSQLite
+	}
+	return &Handler{DB: sqlDB, Engine: engine}
+}
+
+func (h *Handler) isPostgres() bool {
+	return h != nil && h.Engine == db.EnginePostgres
+}
+
+func (h *Handler) queryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if h.isPostgres() {
+		query = strings.ReplaceAll(query, " LIKE ? ESCAPE '\\'", " ILIKE ?")
+		query = (db.PostgresDialect{}).Rebind(query)
+	}
+	return h.DB.QueryContext(ctx, query, args...)
+}
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/", httpx.Handler(h.search))
@@ -92,7 +115,10 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 	ftsQuery := `"` + strings.ReplaceAll(safeQuery, `"`, `""`) + `"`
 	useFts := utf8.RuneCountInString(safeQuery) >= 3
 	diagnostics.ShortQuery = !useFts
-	if useFts {
+	if h.isPostgres() {
+		useFts = false
+		diagnostics.Mode = "postgres-like"
+	} else if useFts {
 		diagnostics.Mode = "fts5-with-like-fallback"
 	} else {
 		diagnostics.Mode = "like-short-query"
@@ -139,6 +165,13 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) searchChapters(ctx context.Context, safeQuery, like, ftsQuery string, useFts bool, limit int) ([]map[string]any, *searchFallback) {
+	if h.isPostgres() {
+		items, err := h.searchChaptersLike(ctx, safeQuery, like, limit)
+		if err != nil {
+			return []map[string]any{}, &searchFallback{Entity: "chapters", From: "postgres-like", To: "postgres-like", Reason: "postgres_like_failed", Error: err.Error()}
+		}
+		return items, nil
+	}
 	if useFts {
 		items, err := h.searchChaptersFTS(ctx, safeQuery, ftsQuery, limit)
 		if err == nil {
@@ -162,7 +195,7 @@ func (h *Handler) searchChapters(ctx context.Context, safeQuery, like, ftsQuery 
 }
 
 func (h *Handler) searchChaptersFTS(ctx context.Context, safeQuery, ftsQuery string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name, snippet(chapters_fts, 1, '', '', '...', 96), rank FROM chapters_fts JOIN chapters c ON c.rowid = chapters_fts.rowid JOIN projects p ON p.id = c.project_id WHERE chapters_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
+	rows, err := h.queryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name, snippet(chapters_fts, 1, '', '', '...', 96), rank FROM chapters_fts JOIN chapters c ON c.rowid = chapters_fts.rowid JOIN projects p ON p.id = c.project_id WHERE chapters_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +215,7 @@ func (h *Handler) searchChaptersFTS(ctx context.Context, safeQuery, ftsQuery str
 }
 
 func (h *Handler) searchChaptersLike(ctx context.Context, safeQuery, like string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.title LIKE ? ESCAPE '\' OR COALESCE(c.description, '') LIKE ? ESCAPE '\' LIMIT ?`, like, like, limit)
+	rows, err := h.queryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.title LIKE ? ESCAPE '\' OR COALESCE(c.description, '') LIKE ? ESCAPE '\' LIMIT ?`, like, like, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +248,13 @@ func chapterResult(id, title string, description sql.NullString, status, role, c
 }
 
 func (h *Handler) searchMessages(ctx context.Context, like, ftsQuery string, useFts bool, limit int) ([]map[string]any, *searchFallback) {
+	if h.isPostgres() {
+		items, err := h.searchMessagesLike(ctx, like, limit)
+		if err != nil {
+			return []map[string]any{}, &searchFallback{Entity: "messages", From: "postgres-like", To: "postgres-like", Reason: "postgres_like_failed", Error: err.Error()}
+		}
+		return items, nil
+	}
 	if useFts {
 		items, err := h.searchMessagesFTS(ctx, ftsQuery, limit)
 		if err == nil {
@@ -238,7 +278,7 @@ func (h *Handler) searchMessages(ctx context.Context, like, ftsQuery string, use
 }
 
 func (h *Handler) searchMessagesFTS(ctx context.Context, ftsQuery string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT m.id, m.narrator_id, substr(COALESCE(m.content_text, ''), 1, 240), m.role, m.created_at, n.chapter_id, n.title, n.model, c.title, p.name, snippet(narrator_messages_fts, 0, '', '', '...', 96), rank FROM narrator_messages_fts JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid JOIN narrators n ON n.id = m.narrator_id LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE narrator_messages_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
+	rows, err := h.queryContext(ctx, `SELECT m.id, m.narrator_id, substr(COALESCE(m.content_text, ''), 1, 240), m.role, m.created_at, n.chapter_id, n.title, n.model, c.title, p.name, snippet(narrator_messages_fts, 0, '', '', '...', 96), rank FROM narrator_messages_fts JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid JOIN narrators n ON n.id = m.narrator_id LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE narrator_messages_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +297,7 @@ func (h *Handler) searchMessagesFTS(ctx context.Context, ftsQuery string, limit 
 }
 
 func (h *Handler) searchMessagesLike(ctx context.Context, like string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT m.id, m.narrator_id, substr(COALESCE(m.content_text, ''), 1, 240), m.role, m.created_at, n.chapter_id, n.title, n.model, c.title, p.name FROM narrator_messages m JOIN narrators n ON n.id = m.narrator_id LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE COALESCE(m.content_text, '') LIKE ? ESCAPE '\' LIMIT ?`, like, limit)
+	rows, err := h.queryContext(ctx, `SELECT m.id, m.narrator_id, substr(COALESCE(m.content_text, ''), 1, 240), m.role, m.created_at, n.chapter_id, n.title, n.model, c.title, p.name FROM narrator_messages m JOIN narrators n ON n.id = m.narrator_id LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE COALESCE(m.content_text, '') LIKE ? ESCAPE '\' LIMIT ?`, like, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -282,6 +322,13 @@ func messageResult(id, narratorID, preview, role, createdAt string, chapterID, n
 }
 
 func (h *Handler) searchNarrators(ctx context.Context, like, ftsQuery string, useFts bool, limit int) ([]map[string]any, *searchFallback) {
+	if h.isPostgres() {
+		items, err := h.searchNarratorsLike(ctx, like, limit)
+		if err != nil {
+			return []map[string]any{}, &searchFallback{Entity: "narrators", From: "postgres-like", To: "postgres-like", Reason: "postgres_like_failed", Error: err.Error()}
+		}
+		return items, nil
+	}
 	if useFts {
 		items, err := h.searchNarratorsFTS(ctx, ftsQuery, limit)
 		if err == nil {
@@ -305,7 +352,7 @@ func (h *Handler) searchNarrators(ctx context.Context, like, ftsQuery string, us
 }
 
 func (h *Handler) searchNarratorsFTS(ctx context.Context, ftsQuery string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.last_message_at, n.created_at, n.updated_at, c.title, p.name, snippet(narrators_fts, 0, '', '', '...', 96), rank FROM narrators_fts JOIN narrators n ON n.rowid = narrators_fts.rowid LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE narrators_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
+	rows, err := h.queryContext(ctx, `SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.last_message_at, n.created_at, n.updated_at, c.title, p.name, snippet(narrators_fts, 0, '', '', '...', 96), rank FROM narrators_fts JOIN narrators n ON n.rowid = narrators_fts.rowid LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE narrators_fts MATCH ? ORDER BY rank LIMIT ?`, ftsQuery, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -324,7 +371,7 @@ func (h *Handler) searchNarratorsFTS(ctx context.Context, ftsQuery string, limit
 }
 
 func (h *Handler) searchNarratorsLike(ctx context.Context, like string, limit int) ([]map[string]any, error) {
-	rows, err := h.DB.QueryContext(ctx, `SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.last_message_at, n.created_at, n.updated_at, c.title, p.name FROM narrators n LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE COALESCE(n.title, '') LIKE ? ESCAPE '\' LIMIT ?`, like, limit)
+	rows, err := h.queryContext(ctx, `SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.last_message_at, n.created_at, n.updated_at, c.title, p.name FROM narrators n LEFT JOIN chapters c ON c.id = n.chapter_id LEFT JOIN projects p ON p.id = c.project_id WHERE COALESCE(n.title, '') LIKE ? ESCAPE '\' LIMIT ?`, like, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -354,7 +401,7 @@ func (h *Handler) searchTable(r *http.Request, query string, like string) ([]map
 	if strings.Count(query, "?") == 1 {
 		args = []any{like}
 	}
-	rows, err := h.DB.QueryContext(r.Context(), query, args...)
+	rows, err := h.queryContext(r.Context(), query, args...)
 	if err != nil {
 		return nil, err
 	}

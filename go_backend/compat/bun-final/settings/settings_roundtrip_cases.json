@@ -1,0 +1,39 @@
+{
+	"artifactVersion": 1,
+	"source": "bun-final-settings-contract-seed",
+	"cases": [
+		{
+			"id": "default-get-redacts-auth-secret",
+			"method": "GET",
+			"path": "/api/settings",
+			"disallowedResponsePaths": ["settings.auth.jwtSecret"],
+			"requiredResponsePaths": ["settings.server", "settings.auth", "settings.agent"]
+		},
+		{
+			"id": "patch-default-model",
+			"method": "PATCH",
+			"path": "/api/settings",
+			"body": { "agent": { "defaultModel": "claude-sonnet-4.5" } },
+			"requiredPersistedPaths": ["agent.defaultModel"]
+		},
+		{
+			"id": "context-thresholds-shape",
+			"method": "GET",
+			"path": "/api/settings/context-thresholds",
+			"requiredResponsePaths": ["pruneStart", "compactStart"]
+		},
+		{
+			"id": "reject-auth-jwt-secret-patch",
+			"method": "PATCH",
+			"path": "/api/settings",
+			"body": { "auth": { "jwtSecret": "must-not-be-accepted" } },
+			"expectedErrorCode": "VALIDATION_ERROR"
+		},
+		{
+			"id": "generate-tls-shape",
+			"method": "POST",
+			"path": "/api/settings/generate-tls",
+			"requiredResponsePaths": ["certPath", "keyPath", "expiresAt"]
+		}
+	]
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -70,8 +71,8 @@ func TestForkParityRestoresContextFilesRuntimeMetadata(t *testing.T) {
 	if !hasForkFallback(chapter.Fallbacks, "copyFilesPartial") {
 		t.Fatalf("expected copyFilesPartial fallback, got %#v", chapter.Fallbacks)
 	}
-	if !hasForkFallback(chapter.Fallbacks, "containerStartup") {
-		t.Fatalf("expected explicit containerStartup fallback, got %#v", chapter.Fallbacks)
+	if hasForkFallback(chapter.Fallbacks, "containerStartup") {
+		t.Fatalf("containerStartup should not be reported as fallback after auto-start support, got %#v", chapter.Fallbacks)
 	}
 
 	var childNarratorID, parentNarratorID, forkMessageID, inheritMode, cwd string
@@ -117,6 +118,41 @@ func TestForkParityRestoresContextFilesRuntimeMetadata(t *testing.T) {
 	if _, ok := metadata["fallbacks"].([]any); !ok {
 		t.Fatalf("expected persisted fallback metadata on edge: %#v", metadata)
 	}
+}
+
+func TestForkAutoStartsInheritedContainers(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake podman script uses POSIX sh")
+	}
+	ctx := context.Background()
+	sqlDB := newForkParityDB(t)
+	repo := newForkParityRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "compose.yml"), []byte("services:\n  web:\n    image: test\n"), 0o644); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	runGit(t, repo, "add", "compose.yml")
+	runGit(t, repo, "commit", "-m", "add compose")
+	baseSHA := gitOutput(t, repo, "rev-parse", "HEAD")
+	containerConfig := `{"ports":[{"containerPort":8080,"serviceName":"web"}]}`
+	if _, err := sqlDB.Exec(`INSERT INTO projects (id, name, git_path, default_branch, created_at, updated_at) VALUES ('p1', 'Project', ?, 'master', 'now', 'now')`, repo); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, worktree_path, base_branch, container_config, is_root, head_commit_sha, commit_count, axis_offset, cross_offset, last_accessed_at, created_at, updated_at) VALUES ('c_parent', 'p1', 'Parent', 'active', 'branch', 'master', ?, 'master', ?, 0, ?, 1, 10, 20, 'now', 'now', 'now')`, repo, containerConfig, baseSHA); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	prependFakePodman(t, fakePodmanScript())
+	recorder := &chapterBroadcastRecorder{}
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), BroadcastMergeProgress: recorder.BroadcastMergeProgress}
+	title := "Container Fork"
+	chapter, err := service.Fork(ctx, "c_parent", ForkInput{Title: &title, InheritMode: "full"})
+	if err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	eventually(t, func() bool { return recorder.hasGlobalEvent("container:started") }, "fork auto-start container:started")
+	eventually(t, func() bool {
+		var count int
+		return sqlDB.QueryRow(`SELECT COUNT(*) FROM container_instances WHERE chapter_id = ?`, chapter.ID).Scan(&count) == nil && count > 0
+	}, "fork auto-start persisted container instance")
 }
 
 func TestForkParityFreshInheritSkipsMessageRefs(t *testing.T) {
@@ -245,6 +281,7 @@ func newForkParityDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	sqlDB.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	stmts := []string{
 		`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, git_path TEXT, default_branch TEXT, startup_script TEXT, copy_files TEXT, chapter_settings TEXT, created_at TEXT, updated_at TEXT)`,
@@ -255,6 +292,8 @@ func newForkParityDB(t *testing.T) *sql.DB {
 		`CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER DEFAULT 0, segment_compact_id TEXT)`,
 		`CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, tool_use_id TEXT, tool_name TEXT, input_json TEXT, output_json TEXT, status TEXT, created_at TEXT)`,
 		`CREATE TABLE narrator_file_snapshots (id TEXT PRIMARY KEY, narrator_id TEXT, file_path TEXT, original_content TEXT, created_at TEXT)`,
+		`CREATE TABLE container_instances (id TEXT PRIMARY KEY, chapter_id TEXT, container_id TEXT, service_name TEXT, status TEXT, host_port INTEGER, container_port INTEGER, proxy_label TEXT, container_ip TEXT, volume_name TEXT, created_at TEXT, updated_at TEXT)`,
+		`CREATE TABLE port_allocations (port INTEGER PRIMARY KEY, chapter_id TEXT, service_name TEXT, allocated_at TEXT)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := sqlDB.Exec(stmt); err != nil {

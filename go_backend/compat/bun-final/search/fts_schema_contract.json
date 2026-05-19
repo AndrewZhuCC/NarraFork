@@ -1,0 +1,51 @@
+{
+	"artifactVersion": 1,
+	"source": "bun-final-fts-contract-seed",
+	"tokenizer": "trigram",
+	"tables": [
+		{
+			"name": "chapters_fts",
+			"contentTable": "chapters",
+			"columns": ["title", "description"],
+			"requiredSqlFragments": [
+				"USING fts5",
+				"content='chapters'",
+				"content_rowid=rowid",
+				"tokenize='trigram'"
+			]
+		},
+		{
+			"name": "narrator_messages_fts",
+			"contentTable": "narrator_messages",
+			"columns": ["content_text"],
+			"requiredSqlFragments": [
+				"USING fts5",
+				"content='narrator_messages'",
+				"content_rowid=rowid",
+				"tokenize='trigram'"
+			]
+		},
+		{
+			"name": "narrators_fts",
+			"contentTable": "narrators",
+			"columns": ["title"],
+			"requiredSqlFragments": [
+				"USING fts5",
+				"content='narrators'",
+				"content_rowid=rowid",
+				"tokenize='trigram'"
+			]
+		}
+	],
+	"triggers": [
+		{ "name": "chapters_fts_insert", "table": "chapters" },
+		{ "name": "chapters_fts_update", "table": "chapters" },
+		{ "name": "chapters_fts_delete", "table": "chapters" },
+		{ "name": "narrator_messages_fts_insert", "table": "narrator_messages" },
+		{ "name": "narrator_messages_fts_update", "table": "narrator_messages" },
+		{ "name": "narrator_messages_fts_delete", "table": "narrator_messages" },
+		{ "name": "narrators_fts_insert", "table": "narrators" },
+		{ "name": "narrators_fts_update", "table": "narrators" },
+		{ "name": "narrators_fts_delete", "table": "narrators" }
+	]
+}

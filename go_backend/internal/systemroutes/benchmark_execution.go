@@ -275,6 +275,20 @@ func (h *Handler) executeBenchmarkTask(ctx context.Context, run benchmarkRunReco
 	if err := h.prepareBenchmarkWorkspace(ctx, run, task, workDir); err != nil {
 		return h.recordBenchmarkTaskError(context.Background(), resultID, "error", err.Error(), time.Since(started).Milliseconds())
 	}
+	containerID := ""
+	if benchmarkRequiresContainer(run, task) {
+		container, err := h.prepareBenchmarkContainer(ctx, run, task, workDir)
+		if err != nil {
+			return h.recordBenchmarkTaskError(context.Background(), resultID, "error", err.Error(), time.Since(started).Milliseconds())
+		}
+		containerID = container.ID
+		if task.Metadata == nil {
+			task.Metadata = map[string]any{}
+		}
+		task.Metadata["containerId"] = container.ID
+		task.Metadata["containerSetupOutput"] = container.Output
+		defer func() { _ = cleanupBenchmarkContainer(context.Background(), containerID) }()
+	}
 
 	if h.Narrators == nil {
 		return h.recordBenchmarkTaskError(context.Background(), resultID, "error", "Benchmark narrator execution unavailable in go_backend: narrator service is not configured", time.Since(started).Milliseconds())
@@ -320,13 +334,13 @@ func (h *Handler) executeBenchmarkTask(ctx context.Context, run benchmarkRunReco
 	}
 	metrics.DurationMs = time.Since(started).Milliseconds()
 	evalResult := evaluateBenchmarkTask(task, metrics.LastAssistantText, run.Config)
+	if containerID != "" {
+		evalResult = h.evaluateBenchmarkTaskWithContainer(ctx, containerID, task, evalResult, run.Config)
+	}
 	return h.recordBenchmarkTaskSuccess(ctx, resultID, metrics, evalResult)
 }
 
 func (h *Handler) prepareBenchmarkWorkspace(ctx context.Context, run benchmarkRunRecord, task benchmarkTask, workDir string) error {
-	if benchmarkRequiresContainer(run, task) {
-		return errors.New("Benchmark container execution is not implemented in go_backend; task skipped with explicit fallback instead of starting Podman")
-	}
 	sourcePath := strings.TrimSpace(stringMap(task.Metadata, "sourcePath", ""))
 	if sourcePath == "" {
 		return nil
@@ -435,7 +449,18 @@ func (h *Handler) finishBenchmarkRunWithStatus(ctx context.Context, runID, statu
 	if err := h.refreshBenchmarkRunTotals(ctx, runID); err != nil {
 		return err
 	}
-	_, err := h.DB.ExecContext(ctx, `UPDATE benchmark_runs SET status=?, completed_at=?, total_duration_ms=CASE WHEN started_at IS NOT NULL THEN CAST((julianday(?) - julianday(started_at)) * 86400000 AS INTEGER) ELSE total_duration_ms END WHERE id=?`, status, db.NowISO(), db.NowISO(), runID)
+	completedAt := time.Now().UTC()
+	durationMs := any(nil)
+	var startedAt sql.NullString
+	if err := h.DB.QueryRowContext(ctx, `SELECT started_at FROM benchmark_runs WHERE id=?`, runID).Scan(&startedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if startedAt.Valid {
+		if parsed, err := time.Parse(time.RFC3339Nano, startedAt.String); err == nil {
+			durationMs = completedAt.Sub(parsed).Milliseconds()
+		}
+	}
+	_, err := h.DB.ExecContext(ctx, `UPDATE benchmark_runs SET status=?, completed_at=?, total_duration_ms=COALESCE(?, total_duration_ms) WHERE id=?`, status, completedAt.Format(time.RFC3339Nano), durationMs, runID)
 	return err
 }
 

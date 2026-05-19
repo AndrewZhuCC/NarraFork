@@ -14,6 +14,7 @@ import (
 
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/chapters"
+	"narrafork-go/internal/compat/bunfinal"
 	"narrafork-go/internal/config"
 	gitx "narrafork-go/internal/git"
 	"narrafork-go/internal/narrators"
@@ -22,30 +23,7 @@ import (
 )
 
 func TestFrontendContractSmokeHTTPPaths(t *testing.T) {
-	sqlDB := openFrontendContractDB(t)
-	settings := loadFrontendContractSettings(t)
-	seedFrontendProviderCaches(t)
-	seedFrontendContractSettings(t, settings)
-	authService := auth.NewService(sqlDB, settings)
-	token, err := authService.CreateToken("user-1", "admin")
-	if err != nil {
-		t.Fatalf("create token: %v", err)
-	}
-
-	hub := ws.NewHub()
-	narratorService := narrators.NewService(sqlDB, hub, settings)
-	chapterService := chapters.NewService(sqlDB, (*gitx.Service)(nil), narratorService, nil, settings)
-	projectService := projects.NewService(sqlDB, (*gitx.Service)(nil), chapterService, settings)
-	router := NewRouter(Services{
-		DB:        sqlDB,
-		Settings:  settings,
-		Auth:      authService,
-		Hub:       hub,
-		Git:       (*gitx.Service)(nil),
-		Projects:  projectService,
-		Chapters:  chapterService,
-		Narrators: narratorService,
-	})
+	router, token := newFrontendContractFixture(t)
 
 	tests := []struct {
 		name       string
@@ -344,6 +322,113 @@ func TestFrontendContractSmokeHTTPPaths(t *testing.T) {
 			tc.assert(t, map[string]any{"$array": decoded})
 		})
 	}
+}
+
+type bunFinalHTTPSmokeGolden struct {
+	Cases []bunFinalHTTPSmokeCase `json:"cases"`
+}
+
+type bunFinalHTTPSmokeCase struct {
+	ID                   string   `json:"id"`
+	Method               string   `json:"method"`
+	Path                 string   `json:"path"`
+	Auth                 string   `json:"auth"`
+	ExpectedStatus       int      `json:"expectedStatus"`
+	RequiredTopLevelKeys []string `json:"requiredTopLevelKeys"`
+}
+
+func TestBunFinalHTTPSmokeGoldenCases(t *testing.T) {
+	data, err := bunfinal.ReadHTTPSmokeGolden()
+	if err != nil {
+		t.Fatalf("read HTTP smoke golden artifact: %v", err)
+	}
+	var golden bunFinalHTTPSmokeGolden
+	if err := json.Unmarshal(data, &golden); err != nil {
+		t.Fatalf("decode HTTP smoke golden artifact: %v", err)
+	}
+	if len(golden.Cases) == 0 {
+		t.Fatal("HTTP smoke golden should contain cases")
+	}
+	router, token := newFrontendContractFixture(t)
+	for _, tc := range golden.Cases {
+		t.Run(tc.ID, func(t *testing.T) {
+			req := httptest.NewRequest(tc.Method, tc.Path, nil)
+			if tc.Auth == "required" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.ExpectedStatus {
+				t.Fatalf("%s %s expected %d, got %d: %s", tc.Method, tc.Path, tc.ExpectedStatus, w.Code, w.Body.String())
+			}
+			var body any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response %q: %v", w.Body.String(), err)
+			}
+			for _, key := range tc.RequiredTopLevelKeys {
+				if !httpSmokeGoldenHasTopLevelKey(body, key) {
+					t.Fatalf("required top-level key %q missing from %#v", key, body)
+				}
+			}
+		})
+	}
+}
+
+func httpSmokeGoldenHasTopLevelKey(body any, key string) bool {
+	if items, ok := body.([]any); ok {
+		return key == "projects" && len(items) >= 0
+	}
+	mapped, ok := body.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := mapped[key]; ok {
+		return true
+	}
+	switch key {
+	case "settings":
+		_, hasServer := mapped["server"]
+		_, hasAuth := mapped["auth"]
+		_, hasAgent := mapped["agent"]
+		return hasServer && hasAuth && hasAgent
+	case "authenticated":
+		_, hasUsers := mapped["hasUsers"]
+		_, hasRegistrationOpen := mapped["registrationOpen"]
+		return hasUsers && hasRegistrationOpen
+	case "metadata":
+		_, hasSearchMetadata := mapped["searchMetadata"]
+		return hasSearchMetadata
+	}
+	return false
+}
+
+func newFrontendContractFixture(t *testing.T) (http.Handler, string) {
+	t.Helper()
+	sqlDB := openFrontendContractDB(t)
+	settings := loadFrontendContractSettings(t)
+	seedFrontendProviderCaches(t)
+	seedFrontendContractSettings(t, settings)
+	authService := auth.NewService(sqlDB, settings)
+	token, err := authService.CreateToken("user-1", "admin")
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	hub := ws.NewHub()
+	narratorService := narrators.NewService(sqlDB, hub, settings)
+	chapterService := chapters.NewService(sqlDB, (*gitx.Service)(nil), narratorService, nil, settings)
+	projectService := projects.NewService(sqlDB, (*gitx.Service)(nil), chapterService, settings)
+	router := NewRouter(Services{
+		DB:        sqlDB,
+		Settings:  settings,
+		Auth:      authService,
+		Hub:       hub,
+		Git:       (*gitx.Service)(nil),
+		Projects:  projectService,
+		Chapters:  chapterService,
+		Narrators: narratorService,
+	})
+	return router, token
 }
 
 func openFrontendContractDB(t *testing.T) *sql.DB {

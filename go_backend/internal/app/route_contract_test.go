@@ -12,6 +12,7 @@ import (
 
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
+	"narrafork-go/internal/db"
 	gitx "narrafork-go/internal/git"
 	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/ws"
@@ -196,6 +197,11 @@ func TestH02RequiresGitMatchesTSGuardRules(t *testing.T) {
 		{http.MethodPost, "/api/chapters/batch-merge"},
 		{http.MethodGet, "/api/chapters/chapter-1/merge-check"},
 		{http.MethodPost, "/api/chapters/chapter-1/fork"},
+		{http.MethodPost, "/api/chapters/chapter-1/batch-fork"},
+		{http.MethodPost, "/api/chapters/chapter-1/split"},
+		{http.MethodPost, "/api/chapters/chapter-1/cherry-pick"},
+		{http.MethodGet, "/api/chapters/chapter-1/dependency-status"},
+		{http.MethodPost, "/api/chapters/chapter-1/sync-upstream"},
 		{http.MethodGet, "/api/chapters/chapter-1/git/status"},
 		{http.MethodGet, "/api/chapters/chapter-1/commits/abc/files"},
 	}
@@ -233,19 +239,35 @@ func TestH02GitMissingGuardReturnsTSShapeOnlyForGitRoutes(t *testing.T) {
 		t.Fatalf("create token: %v", err)
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/api/chapters/chapter-1/git/status", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected git-missing 503, got %d: %s", w.Code, w.Body.String())
-	}
-	var body map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode git guard body: %v", err)
-	}
-	if body["code"] != "GIT_NOT_INSTALLED" || body["error"] != "Git is not installed. Please install git and retry this Git-dependent action." {
-		t.Fatalf("unexpected git guard body: %#v", body)
+	for _, tc := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/api/chapters/chapter-1/git/status", ""},
+		{http.MethodPost, "/api/chapters/chapter-1/batch-fork", `{"forks":[{"title":"Fork"}]}`},
+		{http.MethodPost, "/api/chapters/chapter-1/split", `{"commitSha":"abc123","newFork":{"title":"Fork"}}`},
+		{http.MethodPost, "/api/chapters/chapter-1/cherry-pick", `{"commitShas":["abc123"]}`},
+		{http.MethodGet, "/api/chapters/chapter-1/dependency-status", ""},
+		{http.MethodPost, "/api/chapters/chapter-1/sync-upstream", `{"edgeId":"edge-1"}`},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		if tc.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("expected git-missing 503 for %s %s, got %d: %s", tc.method, tc.path, w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode git guard body: %v", err)
+		}
+		if body["code"] != "GIT_NOT_INSTALLED" || body["error"] != "Git is not installed. Please install git and retry this Git-dependent action." {
+			t.Fatalf("unexpected git guard body: %#v", body)
+		}
 	}
 
 	for _, path := range []string{"/api/settings", "/api/openai/models", "/api/search?q=anything", "/api/narrators?standalone=true"} {
@@ -257,6 +279,18 @@ func TestH02GitMissingGuardReturnsTSShapeOnlyForGitRoutes(t *testing.T) {
 			t.Fatalf("%s should not be blocked by git-missing guard: %s", path, w.Body.String())
 		}
 	}
+}
+
+func TestPostgresHealthCapabilitiesExposeGoOwnedDatabaseMode(t *testing.T) {
+	caps := runtimeCapabilities("linux", nil, db.EnginePostgres, false)
+	assertNestedCapability(t, caps, []string{"database"}, map[string]any{
+		"engine":           "postgres",
+		"mainSchemaOwner":  "go-postgres",
+		"goMainMigrations": true,
+		"goEnsureColumns":  true,
+		"mode":             "go-owned-postgres-schema",
+		"searchMode":       "postgres-like",
+	})
 }
 
 func TestPhase0GenericNotImplementedUsesFeatureDisabledFallbackShape(t *testing.T) {
@@ -296,13 +330,19 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"goEnsureColumns":  false,
 		"ftsRepair":        false,
 	})
-	assertNestedCapability(t, caps, []string{"chapters", "split"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
+	assertNestedCapability(t, caps, []string{"releasePackaging"}, map[string]any{"buildInfo": "ldflags-or-env", "frontend": "sidecar-directory-or-env", "changelog": "sidecar-directory-or-env", "singleFileEmbedded": false})
+	assertNestedCapability(t, caps, []string{"nativeExtensions"}, map[string]any{"defaultEnabled": false, "scope": "go-owned-runtime-extensions"})
+	assertNestedCapability(t, caps, []string{"nativeExtensions", "browserSessions"}, map[string]any{"defaultEnabled": false, "storage": "go-runtime-sidecar", "cutover": "explicit-enable", "rollback": "explicit-disable-or-export"})
+	assertNestedCapability(t, caps, []string{"nativeExtensions", "containerBrowserToolAutoEnable"}, map[string]any{"defaultEnabled": false, "cutover": "explicit-enable", "rollback": "explicit-disable"})
+	assertNestedCapability(t, caps, []string{"chapters", "split"}, map[string]any{"supported": true, "fallback": false, "mode": "go-basic-split"})
+	assertNestedCapability(t, caps, []string{"chapters", "split", "partials", "compressedAISummary"}, map[string]any{"supported": false, "fallback": true, "mode": "deterministic-summary-placeholder"})
+	assertNestedCapability(t, caps, []string{"chapters", "split", "partials", "containerAutostart"}, map[string]any{"supported": true, "fallback": false, "mode": "background-start"})
 	assertNestedCapability(t, caps, []string{"chapters", "containers"}, map[string]any{"supported": true})
-	assertNestedCapability(t, caps, []string{"chapters", "containers", "runtime"}, map[string]any{"syncStartRequest": true, "backgroundStart": false, "streamingLogs": false, "perChapterLock": false})
-	assertNestedCapability(t, caps, []string{"chapters", "containers", "lifecycle"}, map[string]any{"manualControls": true, "autoStartOnFork": false, "pauseOnDormant": false, "unpauseOnWake": false, "deleteVolumes": false})
-	assertNestedCapability(t, caps, []string{"chapters", "containers", "proxy"}, map[string]any{"metadataSupported": true, "reverseProxyServer": false})
-	assertNestedCapability(t, caps, []string{"chapters", "containers", "narratorIntegration"}, map[string]any{"statusChangedEvent": true, "containerReadyMessage": false, "browserToolAutoEnable": false})
-	assertNestedCapability(t, caps, []string{"vnet"}, map[string]any{"supported": false})
+	assertNestedCapability(t, caps, []string{"chapters", "containers", "runtime"}, map[string]any{"syncStartRequest": false, "backgroundStart": true, "streamingLogs": true, "perChapterLock": true})
+	assertNestedCapability(t, caps, []string{"chapters", "containers", "lifecycle"}, map[string]any{"manualControls": true, "autoStartOnFork": true, "pauseOnDormant": true, "unpauseOnWake": true, "deleteVolumes": true})
+	assertNestedCapability(t, caps, []string{"chapters", "containers", "proxy"}, map[string]any{"metadataSupported": true, "reverseProxyServer": true, "http": true, "websocket": true, "dynamicSettingsHook": true})
+	assertNestedCapability(t, caps, []string{"chapters", "containers", "narratorIntegration"}, map[string]any{"statusChangedEvent": true, "containerReadyMessage": true, "browserToolAutoEnable": false, "defaultEnabled": false, "cutover": "explicit-enable", "rollback": "explicit-disable"})
+	assertNestedCapability(t, caps, []string{"vnet"}, map[string]any{"supported": true, "ws": true, "mode": "relay", "peerCleanup": true, "udpRendezvous": false})
 	assertNestedCapability(t, caps, []string{"update"}, map[string]any{"manualOnly": true, "selfUpdateAvailable": false, "canAutoRestart": false})
 	assertNestedCapability(t, caps, []string{"update", "download"}, map[string]any{"supported": true, "sse": true, "sha512": true, "maxBytes": float64(512 * 1024 * 1024), "trustMode": "client-or-env-manifest-url"})
 	assertNestedCapability(t, caps, []string{"update", "apply"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
@@ -310,9 +350,10 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"storage", "scan"}, map[string]any{"supported": true, "sse": true, "cache": false})
 	assertNestedCapability(t, caps, []string{"storage", "cached"}, map[string]any{"supported": true, "cache": false})
 	assertNestedCapability(t, caps, []string{"storage", "database"}, map[string]any{"preview": true, "cleanup": true})
-	assertNestedCapability(t, caps, []string{"storage", "cleanup", "uploads"}, map[string]any{"supported": true, "partialParity": "does-not-preserve-message-image-only-owners"})
+	assertNestedCapability(t, caps, []string{"storage", "cleanup", "uploads"}, map[string]any{"supported": true, "preservesMessageImageRefs": true})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "worktrees"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.worktrees"})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "containers"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.containers"})
+	assertNestedCapability(t, caps, []string{"runtime"}, map[string]any{"backend": "go", "buildChannel": "dev"})
 	assertNestedCapability(t, caps, []string{"runtime", "scan"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"runtime", "cleanup", "containers"}, map[string]any{"supported": true, "mode": "stop-running-db-records"})
 	assertNestedCapability(t, caps, []string{"runtime", "cleanup", "worktrees"}, map[string]any{"supported": true, "mode": "go-extension"})
@@ -324,29 +365,30 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"mcp", "transports", "sse"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
 	assertNestedCapability(t, caps, []string{"mcp", "transports", "streamableHttp"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
 	assertNestedCapability(t, caps, []string{"mcp", "toolsList"}, map[string]any{"supported": true, "fallback": false})
-	assertNestedCapability(t, caps, []string{"mcp", "toolsCall"}, map[string]any{"supported": true, "fallback": false, "scope": "go-embedded-compatibility-tools"})
-	assertNestedCapability(t, caps, []string{"mcp", "externalToolsInjection"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
-	assertNestedCapability(t, caps, []string{"mcp", "externalAgentInjection"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
+	assertNestedCapability(t, caps, []string{"mcp", "toolsCall"}, map[string]any{"supported": true, "fallback": false, "scope": "go-embedded-compatibility-tools-and-stdio-external-tools"})
+	assertNestedCapability(t, caps, []string{"mcp", "externalToolsInjection"}, map[string]any{"supported": true, "fallback": false, "parity": "partial", "transport": "stdio", "lifecycle": "per-call"})
+	assertNestedCapability(t, caps, []string{"mcp", "externalAgentInjection"}, map[string]any{"supported": true, "fallback": false, "parity": "partial"})
 	assertNestedCapability(t, caps, []string{"settings", "validation"}, map[string]any{"tsZodParity": false, "mode": "loose-json-with-normalization"})
 	assertNestedCapability(t, caps, []string{"settings", "storage"}, map[string]any{"supported": true, "path": "~/.narrafork/settings.json"})
-	assertNestedCapability(t, caps, []string{"benchmark", "containerExecution"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
+	assertNestedCapability(t, caps, []string{"benchmark", "containerExecution"}, map[string]any{"supported": true, "fallback": false, "runtime": "podman", "resourceLimits": true, "timeout": true})
 	assertNestedCapability(t, caps, []string{"narrator", "wsEvents", "p0"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"narrator", "messageHistory"}, map[string]any{"supported": true, "catchUp": true, "childOrphans": true, "toolCalls": true, "compactMarkers": true})
 	assertNestedCapability(t, caps, []string{"narrator", "permissions"}, map[string]any{"supported": true, "approveDeny": true, "updatedInput": true, "pauseResume": "db-pending-tool-call"})
-	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "mcpExternalTools"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "mcpExternalTools"}, map[string]any{"supported": true, "parity": "partial", "transport": "stdio", "lifecycle": "per-call"})
 	assertNestedCapability(t, caps, []string{"narrator", "planMode"}, map[string]any{"supported": true, "api": true, "toolReflection": true, "previousModeRestore": true})
 	assertNestedCapability(t, caps, []string{"narrator", "compact"}, map[string]any{"supported": true, "segmentCompact": true, "contextClear": true, "fallbackSummary": true})
-	assertNestedCapability(t, caps, []string{"narrator", "retryRecovery"}, map[string]any{"supported": true, "retry": true, "continue": true, "interrupt": true, "manualOverride": true, "rollback": false, "editAndRegenerate": false, "disabledFeatureCode": "FEATURE_DISABLED"})
-	assertNestedCapability(t, caps, []string{"narrator", "subagents"}, map[string]any{"supported": true, "foreground": true, "background": true, "awaitAgent": true, "send": true, "teamStatus": true, "detachAttach": true, "reattachBlocksParent": false})
+	assertNestedCapability(t, caps, []string{"narrator", "retryRecovery"}, map[string]any{"supported": true, "retry": true, "continue": true, "interrupt": true, "manualOverride": true, "rollback": true, "editAndRegenerate": true})
+	assertNestedCapability(t, caps, []string{"narrator", "subagents"}, map[string]any{"supported": true, "foreground": true, "background": true, "awaitAgent": true, "send": true, "teamStatus": true, "detachAttach": true, "detachUnblocksParent": true, "reattachBlocksParent": true, "backgroundResultInjection": true, "staleRecovery": true})
 	assertNestedCapability(t, caps, []string{"narrator", "reviewTools"}, map[string]any{"supported": true, "concludeReview": true, "feedbackInjection": true, "promote": true, "dismiss": true, "convertToSubagent": true, "staleMergeGuard": true})
-	assertNestedCapability(t, caps, []string{"narrator", "rollbackEditRegenerate"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED"})
+	assertNestedCapability(t, caps, []string{"narrator", "browserSessions"}, map[string]any{"supported": true, "defaultEnabled": false, "fallback": false, "runtime": "go-rod", "storage": "go-owned-optional-table", "cutover": "explicit-enable", "rollback": "explicit-disable-or-export", "narratorBound": true, "lifecycleEvents": true, "artifactPersistence": true, "resourceLimits": true, "requiresChrome": true})
+	assertNestedCapability(t, caps, []string{"narrator", "rollbackEditRegenerate"}, map[string]any{"supported": true, "fallback": false, "rollback": true, "editAndRegenerate": true, "copyOnWrite": true, "messageRefTruncation": true, "fileStateRebuild": true, "toolCallInvalidation": true, "agentRerun": true, "optionalFileRevert": true, "optionalAgentRerun": true, "wsEvents": true})
 	assertNestedCapability(t, caps, []string{"content", "projectRoutines"}, map[string]any{"supported": true, "fallback": false, "storage": "main-db-project-chapter-settings"})
 	assertNestedCapability(t, caps, []string{"content", "projectSkills"}, map[string]any{"supported": true, "fallback": false, "storage": "project-git-path-scan"})
 	assertNestedCapability(t, caps, []string{"fs", "browse"}, map[string]any{"supported": true, "fallback": false})
 	assertNestedCapability(t, caps, []string{"fs", "preview"}, map[string]any{"supported": true, "maxTextBytes": float64(1 << 20), "maxBinaryBytes": float64(20 * 1024 * 1024)})
 	assertNestedCapability(t, caps, []string{"fs", "reveal"}, map[string]any{"code": "FS_REVEAL_UNSUPPORTED"})
 	assertNestedCapability(t, caps, []string{"uploads", "serveNarratorImages"}, map[string]any{"supported": true, "fallback": false})
-	assertNestedCapability(t, caps, []string{"uploads", "cleanupPreservesMessageImageRefs"}, map[string]any{"supported": false, "fallback": true, "code": "PARTIAL_PARITY"})
+	assertNestedCapability(t, caps, []string{"uploads", "cleanupPreservesMessageImageRefs"}, map[string]any{"supported": true, "fallback": false})
 	assertNestedCapability(t, caps, []string{"shares", "preview"}, map[string]any{"supported": true, "htmlMode": "escaped-pre"})
 	assertNestedCapability(t, caps, []string{"shares", "ephemeralOnly"}, map[string]any{"supported": false, "fallback": true})
 	assertNestedCapability(t, caps, []string{"terminal"}, map[string]any{"scrollbackReplayMode": "raw-capped-buffer", "bufferStateMode": "basic-defaults", "windowsPty": false, "maxSnapshotBytes": float64(1 << 20), "multiClientResizeMode": "last-input-client"})
@@ -356,6 +398,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"providers", "openai", "agentRuntime"}, map[string]any{"supported": true, "chatCompletions": true, "responsesApi": true, "toolCalling": true, "streaming": true})
 	assertNestedCapability(t, caps, []string{"providers", "kiro", "pluginBridge"}, map[string]any{"supported": true, "requiresBun": true})
 	assertNestedCapability(t, caps, []string{"providers", "kiro", "mcp"}, map[string]any{"listToolsRoute": true, "searchRoute": true, "agentInjection": false})
+	assertNestedCapability(t, caps, []string{"providers", "nug", "routes"}, map[string]any{
+		"modelsRefresh":     true,
+		"perProviderModels": true,
+		"login":             true,
+		"apiKey":            true,
+		"oauthStart":        true,
+		"oauthCallback":     true,
+		"channelsHealth":    true,
+		"usageSummary":      true,
+		"quotas":            true,
+	})
 	assertNestedCapability(t, caps, []string{"providers", "codex", "auth"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"providers", "codex", "managerParity"}, map[string]any{"tsCodexManagerEquivalent": false, "usageQueueParity": "partial", "snapshotPaginationParity": "partial"})
 }
