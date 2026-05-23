@@ -72,6 +72,7 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	capabilities, _ := body["capabilities"].(map[string]any)
 	vnet, _ := capabilities["vnet"].(map[string]any)
 	update, _ := capabilities["update"].(map[string]any)
+	updateApply, _ := update["apply"].(map[string]any)
 	terminal, _ := capabilities["terminal"].(map[string]any)
 	gateway, _ := capabilities["gateway"].(map[string]any)
 	weixinQR, _ := gateway["weixinQr"].(map[string]any)
@@ -80,8 +81,25 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	cleanup, _ := storage["cleanup"].(map[string]any)
 	cleanupUploads, _ := cleanup["uploads"].(map[string]any)
 	cleanupWorktrees, _ := cleanup["worktrees"].(map[string]any)
-	if vnet["supported"] != true || vnet["ws"] != true || vnet["mode"] != "relay" || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != true || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true {
+	cleanupContainers, _ := cleanup["containers"].(map[string]any)
+	if vnet["supported"] != true || vnet["ws"] != true || vnet["mode"] != "relay" || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != true || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true || cleanupContainers["supported"] != false || cleanupContainers["fallback"] != true {
 		t.Fatalf("unexpected capability contract: %#v", capabilities)
+	}
+	reason, _ := weixinQR["reason"].(string)
+	if reason != "Weixin QR gateway runtime is not bundled in go_backend." {
+		t.Fatalf("unexpected weixin QR reason: %#v", weixinQR)
+	}
+	if vacuumReason, _ := vacuum["reason"].(string); vacuumReason != "Main-thread SQLite VACUUM is disabled in go_backend; use an explicit maintenance window/tool outside request handling." {
+		t.Fatalf("unexpected vacuum reason: %#v", vacuum)
+	}
+	if cleanupReason, _ := cleanupWorktrees["reason"].(string); cleanupReason != "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent." {
+		t.Fatalf("unexpected cleanup worktrees reason: %#v", cleanupWorktrees)
+	}
+	if cleanupContainersReason, _ := cleanupContainers["reason"].(string); cleanupContainersReason != "Podman prune is disabled from storage cleanup in go_backend; use per-chapter container controls or an external maintenance command." {
+		t.Fatalf("unexpected cleanup containers reason: %#v", cleanupContainers)
+	}
+	if applyReason, _ := updateApply["reason"].(string); applyReason != "Automatic self-update requires a configured restart handoff manager and a regular current executable." {
+		t.Fatalf("unexpected update apply reason: %#v", updateApply)
 	}
 }
 

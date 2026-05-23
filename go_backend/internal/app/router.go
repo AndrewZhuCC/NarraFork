@@ -116,6 +116,7 @@ func NewRouter(s Services) http.Handler {
 		}
 		settingsHandler := settingshandler.NewHandler(s.Settings)
 		settingsHandler.ProxyRuntime = s.ContainerProxy
+		settingsHandler.Restart = s.Restart
 		graphHandler := graph.NewHandler(s.DB, s.Git)
 		gitHandler := gitroutes.NewHandler(s.DB, s.Git, s.Settings)
 		gitHandler.Broadcaster = s.Hub
@@ -301,21 +302,25 @@ func healthHandler(git *gitx.Service, terminalRuntime *terminalruntime.Manager, 
 	}
 }
 
+const terminalXtermSerializedReplayReason = "Go backend replays capped raw PTY output instead of TS xterm-headless serialized buffer state."
+
 func phase4TerminalCapabilities(platform string, runtimeCaps map[string]any) map[string]any {
 	terminal := map[string]any{
-		"supported":             platform != "windows",
-		"directPty":             platform != "windows",
-		"windowsPty":            false,
-		"dtachSupported":        platform != "windows",
-		"dtachAvailable":        false,
-		"detachedReattach":      platform != "windows",
-		"orphanRecovery":        platform != "windows",
-		"scrollbackReplay":      true,
-		"scrollbackReplayMode":  "raw-capped-buffer",
-		"bufferStateReplay":     true,
-		"bufferStateMode":       "basic-defaults",
-		"maxSnapshotBytes":      1 << 20,
-		"multiClientResizeMode": "last-input-client",
+		"supported":                   platform != "windows",
+		"directPty":                   platform != "windows",
+		"windowsPty":                  false,
+		"dtachSupported":              platform != "windows",
+		"dtachAvailable":              false,
+		"detachedReattach":            platform != "windows",
+		"orphanRecovery":              platform != "windows",
+		"scrollbackReplay":            true,
+		"scrollbackReplayMode":        "raw-capped-buffer",
+		"bufferStateReplay":           true,
+		"bufferStateMode":             "raw-capped-buffer",
+		"xtermSerializedReplay":       false,
+		"xtermSerializedReplayReason": terminalXtermSerializedReplayReason,
+		"maxSnapshotBytes":            1 << 20,
+		"multiClientResizeMode":       "last-input-client",
 		"ws": map[string]any{
 			"subscribe": true, "create": true, "input": true, "resize": true,
 			"kill": true, "rename": true, "scrollback": true, "bufferState": true,
@@ -328,10 +333,48 @@ func phase4TerminalCapabilities(platform string, runtimeCaps map[string]any) map
 	for key, value := range runtimeCaps {
 		terminal[key] = value
 	}
-	if platform == "windows" {
+	if platform == "windows" && terminal["supported"] == false {
 		terminal["reason"] = "Go terminal PTY runtime is not enabled on Windows; use the TypeScript backend or a Unix-like host for interactive terminals."
 	}
 	return terminal
+}
+
+const disabledNarratorSessionCleanupReason = "Go database cleanup execution for narrator sessions is disabled until the Bun-equivalent safe narrator deletion plan, shared message ref handoff, child narrator handling, running terminal guard, and upload preservation semantics are implemented. Preview remains available."
+
+const shareEscapedHTMLPreviewReason = "Go public share preview escapes HTML and renders it in a preformatted block instead of using the TypeScript sanitize-html preview pipeline."
+
+const shareEphemeralFallbackReason = "Go ShareFile uses disk metadata as an in-process bridge for public share routes; startup cleanup removes previous-run share directories and metadata."
+
+const mcpNonStdioTransportReason = "Go compatibility mode only connects stdio MCP servers."
+
+const browserSessionsDefaultOffReason = "Go browser sessions are opt-in native extensions backed by go-rod and require Chrome/Chromium; enable sessions explicitly and disable or export artifacts to roll back."
+
+const containerBackgroundStartReason = "Go container start requests return immediately and continue compose startup in the background while progress is reported through logs and status updates."
+
+const containerBrowserToolAutoEnableReason = "Go native container Browser tool auto-enable is default-off; enable browser tools explicitly after validating the native extension/container browser runtime."
+
+func storageDatabaseMaintenanceCapability() map[string]any {
+	return map[string]any{
+		"preview": true,
+		"cleanup": true,
+		"cleanupTargets": map[string]any{
+			"apiRequestDumps": map[string]any{
+				"supported": true,
+			},
+			"archivedSessions": map[string]any{
+				"supported": false,
+				"fallback":  true,
+				"code":      "FEATURE_DISABLED",
+				"reason":    disabledNarratorSessionCleanupReason,
+			},
+			"staleSessions": map[string]any{
+				"supported": false,
+				"fallback":  true,
+				"code":      "FEATURE_DISABLED",
+				"reason":    disabledNarratorSessionCleanupReason,
+			},
+		},
+	}
 }
 
 func runtimeCapabilities(platform string, terminalCapabilities map[string]any, engine db.Engine, canApplySelfUpdate bool) map[string]any {
@@ -343,12 +386,11 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 		frontend["directory"] = frontendDir
 	}
 	fsReveal := map[string]any{
-		"supported": platform == "windows" || platform == "macos",
-		"fallback":  platform == "linux",
-		"code":      "FS_REVEAL_UNSUPPORTED",
+		"supported": platform == "windows" || platform == "macos" || platform == "linux",
+		"fallback":  false,
 	}
 	if platform == "linux" {
-		fsReveal["reason"] = "Opening the system file manager is not supported on Linux by go_backend."
+		fsReveal["reason"] = "Opening the system file manager on Linux uses xdg-open in go_backend."
 	}
 	database := map[string]any{
 		"engine":           string(db.EngineSQLite),
@@ -389,11 +431,13 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"storage":        "go-runtime-sidecar",
 				"cutover":        "explicit-enable",
 				"rollback":       "explicit-disable-or-export",
+				"reason":         browserSessionsDefaultOffReason,
 			},
 			"containerBrowserToolAutoEnable": map[string]any{
 				"defaultEnabled": false,
 				"cutover":        "explicit-enable",
 				"rollback":       "explicit-disable",
+				"reason":         containerBrowserToolAutoEnableReason,
 			},
 		},
 		"fs": map[string]any{
@@ -439,7 +483,7 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				},
 				"runtime": map[string]any{
 					"podmanCompose": true, "podmanComposeFallbackCommand": true, "boundedOutput": true,
-					"syncStartRequest": false, "backgroundStart": true, "streamingLogs": true,
+					"syncStartRequest": false, "backgroundStart": true, "backgroundStartReason": containerBackgroundStartReason, "streamingLogs": true,
 					"perChapterLock": true,
 				},
 				"ports": map[string]any{
@@ -465,12 +509,13 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					"deleteVolumes":        true,
 				},
 				"narratorIntegration": map[string]any{
-					"statusChangedEvent":    true,
-					"containerReadyMessage": true,
-					"browserToolAutoEnable": false,
-					"defaultEnabled":        false,
-					"cutover":               "explicit-enable",
-					"rollback":              "explicit-disable",
+					"statusChangedEvent":          true,
+					"containerReadyMessage":       true,
+					"browserToolAutoEnable":       false,
+					"browserToolAutoEnableReason": containerBrowserToolAutoEnableReason,
+					"defaultEnabled":              false,
+					"cutover":                     "explicit-enable",
+					"rollback":                    "explicit-disable",
 				},
 			},
 		},
@@ -508,6 +553,31 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"categories":               []string{"core", "optional", "review", "reflection", "mcp"},
 				"supportedOptionalTools":   []string{"Terminal", "Browser", "ShareFile"},
 				"unsupportedOptionalTools": []string{"Recall", "ForkNarrator", "NarraForkAdmin"},
+				"webFetch": map[string]any{
+					"supported":        true,
+					"parity":           "partial",
+					"mode":             "raw-only",
+					"defaultMode":      "raw",
+					"supportedModes":   []string{"raw"},
+					"unsupportedModes": []string{"readability", "dom", "smart", "screenshot"},
+					"protocols":        []string{"http", "https", "data"},
+					"policy":           "permission-policy-and-proxy-consumed",
+					"reason":           "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
+				},
+				"browser": map[string]any{
+					"supported":             true,
+					"parity":                "partial",
+					"runtime":               "go-rod",
+					"screenshotPreviewMode": "inline-base64-or-file-artifact",
+					"sharePreview":          false,
+					"imageContentBlock":     false,
+					"fileOutput":            true,
+					"traceFormat":           "chrome-devtools-json",
+					"traceShare":            true,
+					"traceFileOutput":       true,
+					"traceShareUrl":         "/api/shares/{shareId}",
+					"reason":                "Go Browser screenshots return JSON/base64 or an explicit file_path artifact; TS additionally returns an image content block and temporary share preview metadata. Browser perf_stop writes Chrome trace JSON and creates a functional share URL when file_path is omitted.",
+				},
 				"mcpExternalTools": map[string]any{
 					"supported": true,
 					"parity":    "partial",
@@ -526,6 +596,7 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"segmentCompact":  true,
 				"contextClear":    true,
 				"fallbackSummary": true,
+				"fallbackReason":  "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs.",
 				"mode":            "deterministic-fallback-or-caller-summary",
 			},
 			"retryRecovery": map[string]any{
@@ -542,11 +613,16 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"foreground":                true,
 				"background":                true,
 				"awaitAgent":                true,
+				"awaitBash":                 false,
+				"awaitBashWaitForText":      false,
+				"awaitBashReason":           "Go Await currently supports agent/subagent background tasks only; Bash background tasks and wait_for_text are not implemented in go_backend.",
 				"send":                      true,
 				"teamStatus":                true,
 				"detachAttach":              true,
 				"detachUnblocksParent":      true,
-				"reattachBlocksParent":      true,
+				"reattachBlocksParent":      false,
+				"reattachFallback":          true,
+				"reattachReason":            "Go can detach and open subagent sessions, but cannot re-block an already-running parent tool promise after reattach.",
 				"backgroundResultInjection": true,
 				"staleRecovery":             true,
 			},
@@ -567,11 +643,18 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"storage":             "go-owned-optional-table",
 				"cutover":             "explicit-enable",
 				"rollback":            "explicit-disable-or-export",
+				"reason":              browserSessionsDefaultOffReason,
 				"narratorBound":       true,
 				"lifecycleEvents":     true,
 				"artifactPersistence": true,
 				"resourceLimits":      true,
 				"requiresChrome":      true,
+			},
+			"containerBrowserToolAutoEnable": map[string]any{
+				"defaultEnabled": false,
+				"cutover":        "explicit-enable",
+				"rollback":       "explicit-disable",
+				"reason":         containerBrowserToolAutoEnableReason,
 			},
 			"rollbackEditRegenerate": map[string]any{
 				"supported":            true,
@@ -604,7 +687,7 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"builtinTools": map[string]any{
 				"supported": true,
 				"parity":    "partial",
-				"missing":   []string{"fork.inheritMode", "generatedContextSummary"},
+				"missing":   []string{"generatedContextSummary"},
 			},
 			"externalServerManagement": map[string]any{
 				"supported":   true,
@@ -620,11 +703,13 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					"supported": false,
 					"fallback":  true,
 					"code":      "FEATURE_DISABLED",
+					"reason":    mcpNonStdioTransportReason,
 				},
 				"streamableHttp": map[string]any{
 					"supported": false,
 					"fallback":  true,
 					"code":      "FEATURE_DISABLED",
+					"reason":    mcpNonStdioTransportReason,
 				},
 			},
 			"toolsList": map[string]any{
@@ -663,6 +748,7 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"validation": map[string]any{
 				"tsZodParity": false,
 				"mode":        "loose-json-with-normalization",
+				"reason":      "Go backend normalizes settings before saving but does not apply the full TypeScript Zod schema strictly.",
 			},
 			"secretMasking":             true,
 			"providerModelAugmentation": true,
@@ -682,11 +768,12 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 		},
 		"terminal": terminal,
 		"vnet": map[string]any{
-			"supported":     true,
-			"mode":          "relay",
-			"ws":            true,
-			"peerCleanup":   true,
-			"udpRendezvous": false,
+			"supported":           true,
+			"mode":                "relay",
+			"ws":                  true,
+			"peerCleanup":         true,
+			"udpRendezvous":       false,
+			"udpRendezvousReason": "Go VNet compatibility mode relays WebSocket peer traffic and does not expose UDP rendezvous.",
 		},
 		"update": updateRuntimeCapability(canApplySelfUpdate),
 		"uploads": map[string]any{
@@ -713,11 +800,12 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"preview": map[string]any{
 				"supported": true,
 				"htmlMode":  "escaped-pre",
+				"reason":    shareEscapedHTMLPreviewReason,
 			},
 			"ephemeralOnly": map[string]any{
 				"supported": false,
 				"fallback":  true,
-				"reason":    "Go share resolver can serve disk fallback share directories after in-memory records are gone.",
+				"reason":    shareEphemeralFallbackReason,
 			},
 		},
 		"runtime": map[string]any{
@@ -760,16 +848,13 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"scan": map[string]any{
 				"supported": true,
 				"sse":       true,
-				"cache":     false,
+				"cache":     true,
 			},
 			"cached": map[string]any{
 				"supported": true,
-				"cache":     false,
+				"cache":     true,
 			},
-			"database": map[string]any{
-				"preview": true,
-				"cleanup": true,
-			},
+			"database": storageDatabaseMaintenanceCapability(),
 			"vacuum": map[string]any{
 				"supported": false,
 				"reason":    "Main-thread SQLite VACUUM is disabled in go_backend; use an explicit maintenance window/tool outside request handling.",
@@ -872,13 +957,33 @@ func providerCapabilities() map[string]any {
 			"models":    models(true),
 			"quota":     map[string]any{"supported": true, "fallback": false},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("status", "models", "credentials", "mcpTools", "chat"),
+			"routes": routes(
+				"status",
+				"models",
+				"modelsRefresh",
+				"mcpTools",
+				"mcpSearch",
+				"chat",
+				"globalProxy",
+				"loadBalancingMode",
+				"credentials",
+				"credentialsImport",
+				"credentialDisable",
+				"credentialEnable",
+				"credentialReset",
+				"credentialPriority",
+				"credentialRefresh",
+				"credentialUsage",
+				"credentialUpdate",
+				"credentialDelete",
+			),
 			"agentRuntime": agentRuntime(
 				"httpCompatible", "sse", "pluginBridge",
 			),
 			"pluginBridge": map[string]any{
 				"supported":   true,
 				"requiresBun": true,
+				"reason":      "Kiro plugin bridge is available only when the external Bun bridge/plugin environment is present.",
 			},
 			"mcp": map[string]any{
 				"listToolsRoute": true,
@@ -891,7 +996,7 @@ func providerCapabilities() map[string]any {
 			"models":    models(true),
 			"quota":     map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "OpenAI-compatible quota inspection is not available in go_backend."},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("models", "perProviderModels", "refresh"),
+			"routes":    routes("models", "modelsRefresh", "perProviderModels", "perProviderModelsRefresh", "refresh"),
 			"agentRuntime": agentRuntime(
 				"chatCompletions", "responsesApi", "toolCalling", "streaming",
 			),
@@ -901,7 +1006,7 @@ func providerCapabilities() map[string]any {
 			"models":    models(true),
 			"quota":     map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "Anthropic quota inspection is not available in go_backend."},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("models", "perProviderModels", "refresh"),
+			"routes":    routes("models", "modelsRefresh", "perProviderModels", "perProviderModelsRefresh", "refresh"),
 			"agentRuntime": agentRuntime(
 				"messagesApi", "toolCalling", "streaming",
 			),
@@ -911,7 +1016,7 @@ func providerCapabilities() map[string]any {
 			"models":    models(true),
 			"quota":     map[string]any{"supported": true, "fallback": false},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("models", "perProviderModels", "quotas", "refresh"),
+			"routes":    routes("models", "modelsRefresh", "perProviderModels", "perProviderModelsRefresh", "quota", "quotas", "refresh"),
 			"agentRuntime": agentRuntime(
 				"kiroCompatible", "requestToken", "streaming",
 			),
@@ -923,8 +1028,9 @@ func providerCapabilities() map[string]any {
 			"agentMode": map[string]any{"supported": true, "fallback": false},
 			"routes": routes(
 				"models",
-				"perProviderModels",
 				"modelsRefresh",
+				"perProviderModels",
+				"perProviderModelsRefresh",
 				"auth",
 				"login",
 				"apiKey",
@@ -945,14 +1051,42 @@ func providerCapabilities() map[string]any {
 			"models":    map[string]any{"supported": true, "refreshSupported": false},
 			"quota":     map[string]any{"supported": true, "fallback": false},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("status", "import", "browserAuth", "deviceAuth", "credentialManagement", "quotaOverview"),
+			"routes": routes(
+				"status",
+				"defaultReasoningEffort",
+				"useWebSocket",
+				"loadBalancingMode",
+				"tierOrder",
+				"globalProxy",
+				"import",
+				"usageQueueClear",
+				"browserAuth",
+				"browserAuthWait",
+				"browserAuthCancel",
+				"deviceAuth",
+				"deviceAuthStart",
+				"deviceAuthPoll",
+				"deviceAuthCancel",
+				"credentialManagement",
+				"credentialDisable",
+				"credentialEnable",
+				"credentialReset",
+				"credentialRefresh",
+				"credentialUsage",
+				"credentialUpdate",
+				"credentialBatchDelete",
+				"credentialDelete",
+				"quotaOverview",
+			),
 			"agentRuntime": agentRuntime(
 				"responsesWebSocket", "responsesHttpFallback", "credentialPoolFailover",
 			),
 			"managerParity": map[string]any{
 				"tsCodexManagerEquivalent": false,
 				"usageQueueParity":         "partial",
-				"snapshotPaginationParity": "partial",
+				"usageQueueClearSupported": true,
+				"snapshotPaginationParity": "supported",
+				"reason":                   "Go exposes Codex compatibility routes/runtime but not the full TS CodexManager scheduler/usage queue semantics.",
 			},
 		},
 		"cline": map[string]any{
@@ -960,7 +1094,24 @@ func providerCapabilities() map[string]any {
 			"models":    models(true),
 			"quota":     map[string]any{"supported": true, "fallback": false},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes":    routes("status", "models", "balance", "auth", "logout"),
+			"routes": routes(
+				"status",
+				"models",
+				"modelsRefresh",
+				"perProviderModels",
+				"perProviderModelsRefresh",
+				"balance",
+				"recommendedModels",
+				"poolSearch",
+				"poolCount",
+				"enabledModels",
+				"userInfoRefresh",
+				"auth",
+				"authBrowser",
+				"authCancel",
+				"authCallback",
+				"logout",
+			),
 			"agentRuntime": agentRuntime(
 				"openaiCompatible", "streaming",
 			),

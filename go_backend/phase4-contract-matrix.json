@@ -1,22 +1,31 @@
 {
 	"name": "go-backend-phase4-contract-matrix",
-	"updatedAt": "2026-05-19",
-	"scope": "Terminal, Container/Podman, Provider, MCP/settings, uploads/share/fs, update/runtime/storage runtime parity or explicit capability degradation.",
+	"updatedAt": "2026-05-21",
+	"scope": "Terminal, Container/Podman, Provider, MCP/settings, narrator tool schema, uploads/share/fs, update/runtime/storage runtime parity or explicit capability degradation.",
 	"contracts": [
 		{
 			"group": "terminal.runtime",
-			"status": "supported-baseline-with-platform-and-replay-degradation",
+			"status": "supported-baseline-with-replay-and-dtach-availability-degradations",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useTerminals.ts",
+				"frontend/routes/settings/terminals.tsx",
+				"frontend/routes/narrators/$narratorId.tsx"
+			],
 			"features": [
 				"terminal HTTP CRUD, tabs, view-state, and process inspection routes",
 				"terminal WebSocket subscribe/input/resize/kill/create/rename contract",
 				"Unix PTY runtime with optional dtach detached reattach",
-				"startup orphan recovery and capped raw scrollback replay"
+				"Windows ConPTY runtime without dtach detached reattach/orphan recovery",
+				"Unix startup orphan recovery and capped raw scrollback replay",
+				"terminal runtime capabilities expose dtach availability, detached reattach, raw replay mode, and xtermSerializedReplay=false for frontend gating"
 			],
 			"fallbacks": [
 				{
-					"feature": "terminal.windowsPty",
-					"supported": false,
-					"reason": "Go backend does not bundle a Windows ConPTY/bun-pty equivalent."
+					"feature": "terminal.dtachAvailable",
+					"supported": "conditional",
+					"mode": "platform-and-path-dependent",
+					"reason": "Detached terminal reattach requires dtach on Unix-like hosts; when dtach is unavailable, go_backend falls back to in-process PTY sessions."
 				},
 				{
 					"feature": "terminal.xtermSerializedReplay",
@@ -31,16 +40,212 @@
 				"go_backend/internal/ws/hub.go",
 				"go_backend/internal/app/router.go"
 			],
+			"frontendConsumerPolicy": "usePlatform preserves terminal degradation metadata; terminal creation hooks reject unsupported runtimes before calling the API; the terminal settings page surfaces dtach, detached reattach, orphan recovery, raw replay, xterm serialized replay, resize, and process-tree limitations as warnings.",
 			"tests": [
 				"go_backend/internal/terminalruntime/manager_test.go",
 				"go_backend/internal/ws/hub_terminal_test.go",
 				"go_backend/internal/terminals/handlers_broadcast_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getTerminalCapability"
+			]
+		},
+		{
+			"group": "vnet.runtime",
+			"status": "supported-relay-mode-with-udp-rendezvous-degradation",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/settings/RuntimeSection.tsx"
+			],
+			"features": [
+				"VNet WebSocket relay route surface",
+				"relay-mode peer traffic and peer cleanup",
+				"runtime capabilities expose relay mode, WebSocket support, peer cleanup, and UDP rendezvous availability for frontend gating"
+			],
+			"fallbacks": [
+				{
+					"feature": "vnet.udpRendezvous",
+					"supported": false,
+					"mode": "relay-only",
+					"reason": "Go VNet compatibility mode relays WebSocket peer traffic and does not expose UDP rendezvous."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/vnet/relay.go",
+				"go_backend/internal/ws/hub.go",
+				"go_backend/internal/app/router.go"
+			],
+			"frontendConsumerPolicy": "RuntimeSection reads VNet capability metadata and surfaces relay mode plus UDP rendezvous degradation so users do not assume direct UDP peer connectivity when go_backend is relay-only.",
+			"tests": [
+				"go_backend/internal/vnet/relay_test.go",
+				"go_backend/internal/ws/vnet_relay_test.go",
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getVNetCapability"
+			]
+		},
+		{
+			"group": "narrator.browserSessions",
+			"status": "supported-opt-in-native-extension-with-chrome-runtime-requirement",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useBrowserSessions.ts",
+				"frontend/components/narrator/BrowserSessionBar.tsx",
+				"frontend/components/narrator/NarratorDetailsPanel.tsx"
+			],
+			"features": [
+				"narrator-bound Browser session lifecycle routes and events",
+				"go-rod runtime with optional artifact persistence and resource limits",
+				"runtime capabilities expose opt-in default, storage, rollback, Chrome requirement, and frontend-visible reason"
+			],
+			"fallbacks": [
+				{
+					"feature": "narrator.browserSessions.autoEnableByDefault",
+					"supported": false,
+					"mode": "explicit-enable",
+					"reason": "Go browser sessions are opt-in native extensions backed by go-rod and require Chrome/Chromium; enable sessions explicitly and disable or export artifacts to roll back."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/narrators/browser_sessions.go",
+				"go_backend/internal/narrators/browser_sessions_sync.go",
+				"go_backend/internal/app/router.go"
+			],
+			"frontendConsumerPolicy": "BrowserSessionBar does not call browser-session routes when the capability is unsupported; NarratorDetailsPanel surfaces opt-in/default-off, go-rod runtime, Chrome requirement, storage, cutover, rollback, lifecycle, artifact, and resource-limit metadata instead of implying TypeScript-default auto availability.",
+			"tests": [
+				"go_backend/internal/narrators/browser_sessions_test.go",
+				"go_backend/internal/narrators/browser_sessions_sync_test.go",
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getNarratorBrowserSessionsCapability"
+			]
+		},
+		{
+			"group": "narrator.toolSchemaParity",
+			"status": "supported-for-core-tool-schema-with-explicit-runtime-degradations",
+			"features": [
+				"TypeScript Skill rawJsonSchema now matches the runtime Zod contract for name/skill/args and does not reject the supported name alias via additionalProperties=false",
+				"Go Skill tool definition exposes the same runtime-supported name/skill/args parameter surface without over-requiring fields that runtime treats as optional",
+				"Go Glob consumes the TS-compatible path parameter, returns path-relative newline output, raises path escape errors instead of silently searching the narrator cwd, and aligns the match cap with TS at 500 entries",
+				"Go Grep consumes TS-compatible path, type, multiline, -B/-A/-C, -n, offset, and files_with_matches default-mode parameters, with path escape checks, common file-type filtering, and multiline dotall matching within bounded safe-walker limits",
+				"Go Read provider schema exposes the TS pages/PDF extraction parameter and explicitly rejects it at runtime instead of silently ignoring it while reading as plain text",
+				"Go WebFetch, WebSearch, ShareFile, Bash, Write, Edit, Glob, and Grep provider schemas now expose TS-compatible strict-object constraints, including WebFetch TS extraction-mode fields gated by raw-only runtime diagnostics, WebSearch query minLength, ShareFile path union strictness, Bash workdir/strict_serial/background fields, and Grep output_mode enum",
+				"Go Bash supports TS-compatible workdir and strict_serial scheduling while explicitly rejecting unsupported run_in_background; Go Agent consumes/exposes the TS legacy background alias for run_in_background, uses the TS reasoning_effort enum, and Agent/Send/TeamStatus provider schemas now reject extra fields with TeamStatus action enum parity",
+				"Go Await provider schema exposes TS-compatible type enum and wait_for_text field while runtime capabilities/frontend helpers expose Go bash-task degradation, including disabled wait_for_text support",
+				"Go Browser provider schema now constrains action and direction with TS-aligned enums and additionalProperties=false instead of accepting unconstrained strings/extra properties and relying only on runtime unsupported-action errors",
+				"Go Browser provider schema hides TS-unsupported Go-only state/full_page extensions while keeping runtime compatibility for explicit legacy calls",
+				"Go Terminal provider schema now uses the TS action enum, additionalProperties=false, and hides the Go-only max_length read extension while keeping runtime compatibility for explicit calls",
+				"Go GetGoals, AddGoal, LearningGuide, TaskCreate, AskUserQuestion, and ConcludeReview provider schemas now expose TS-compatible confirm literals, enum/length constraints, strict nested objects, preview/answers/annotations/metadata fields, and mode/status/priority constraints; Go runtime rejects oversized AddGoal objectives and unsupported ConcludeReview finding properties",
+				"Go UpdateGoal provider schema now matches the TS active-goal-only completion contract, and runtime accepts status-only completion while rejecting non-active goal completion attempts",
+				"Go StartPipeline/EndPipeline provider schemas now match TS strict-object and format-enum constraints, and EndPipeline rejects unsupported format values instead of silently treating them as sections",
+				"Go EnterPlanMode/ExitPlanMode provider schemas now match TS plan-mode strictness for EnterPlanMode and structured allowedPrompts items, with runtime rejection for unsupported allowedPrompts tools/properties",
+				"Go Browser navigate/scroll now rejects unsupported direction values explicitly instead of silently ignoring navigate direction or defaulting scroll to down",
+				"Runtime capabilities, tool inventory, and frontend helpers now expose Go Browser screenshot preview parity metadata: JSON/base64 or file artifact output instead of TS image content block plus temporary share preview",
+				"Go Browser perf_stop now defaults to a share-backed Chrome trace artifact with functional /api/shares/{shareId} metadata when file_path is omitted, while preserving explicit file_path cwd output",
+				"TypeScript rawJsonSchema parity test allowlist is narrowed to the intentional WebFetch default-mode exception only"
+			],
+			"fallbacks": [
+				{
+					"feature": "tools.webFetch.rawJsonSchemaDefaultMode",
+					"supported": "intentional-exception",
+					"mode": "optional-provider-schema-default-at-runtime",
+					"reason": "WebFetch keeps mode optional in the provider raw JSON schema so callers may rely on the runtime default, while zod-to-json-schema treats the defaulted field as required. Go exposes its raw-only WebFetch degradation separately through runtime capabilities and explicit runtime rejection."
+				},
+				{
+					"feature": "tools.read.pdfPages",
+					"supported": false,
+					"mode": "explicit-runtime-error",
+					"reason": "Go Read currently supports text/directory reads only; TS PDF page extraction is rejected explicitly until a safe PDF extraction runtime is implemented."
+				},
+				{
+					"feature": "tools.await.bashTasks",
+					"supported": false,
+					"mode": "capability-and-explicit-runtime-error",
+					"reason": "Go Await currently supports agent/subagent background tasks only; TS bash background task awaiting and wait_for_text are surfaced as unsupported."
+				},
+				{
+					"feature": "tools.browser.screenshotPreview",
+					"supported": false,
+					"mode": "capability-declared-inline-base64-or-file-artifact",
+					"reason": "Go Browser screenshot output is JSON/base64 or an explicit file_path artifact, while TS Browser also returns an image content block and temporary share preview metadata."
+				}
+			],
+			"goSources": ["go_backend/internal/agentbasic/openai.go"],
+			"tsSources": [
+				"server/lib/agent/tools/skill.ts",
+				"server/lib/agent/tools/read.ts",
+				"server/lib/agent/tools/task.ts",
+				"server/lib/agent/tools/glob.ts",
+				"server/lib/agent/tools/grep.ts",
+				"server/lib/agent/tools/__tests__/tools.test.ts"
+			],
+			"tests": [
+				"go_backend/internal/agentbasic/openai_test.go::TestToolDefinitionsIncludeGateParameters",
+				"go_backend/internal/agentbasic/openai_test.go::TestBashToolSupportsWorkdirAndRejectsBackground",
+				"go_backend/internal/agentbasic/openai_test.go::TestBashStrictSerialPreventsParallelGrouping",
+				"go_backend/internal/agentbasic/openai_test.go::TestGlobToolSupportsRecursivePatternsAndPath",
+				"go_backend/internal/agentbasic/openai_test.go::TestGrepToolSupportsModesContextPathAndCaseInsensitive",
+				"go_backend/internal/agentbasic/openai_test.go::TestReadToolRejectsUnsupportedPagesParameter",
+				"go_backend/internal/agentbasic/openai_test.go::TestWebFetchToolRejectsUnsupportedModeInsteadOfIgnoring",
+				"go_backend/internal/agentbasic/openai_test.go::TestBrowserToolSchemaIncludesRodParameters",
+				"go_backend/internal/agentbasic/openai_test.go::TestBrowserToolRejectsInvalidDirectionsBeforeSessionLookup",
+				"go_backend/internal/agentbasic/openai_test.go::TestBrowserTraceArtifactDefaultsToShare",
+				"go_backend/internal/agentbasic/openai_test.go::TestBrowserTraceArtifactExplicitFilePathStaysInCwd",
+				"go_backend/internal/agentbasic/tool_inventory_test.go::TestToolInventoryExposesBrowserScreenshotParityMetadata",
+				"go_backend/internal/narrators/service_test.go::TestAddGoalRejectsOversizedObjectiveBeforeDB",
+				"go_backend/internal/narrators/service_test.go::TestNormalizeReviewFindingsRejectsExtraProperties",
+				"go_backend/internal/narrators/subagent_message_tree_test.go::TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree",
+				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
+				"frontend/hooks/usePlatform.test.ts::getNarratorSubagentsCapability await bash degradation metadata",
+				"frontend/hooks/usePlatform.test.ts::getNarratorToolInventoryCapability Browser screenshot preview parity metadata",
+				"server/lib/agent/tools/__tests__/tools.test.ts::Skill tool rawJsonSchema exposes runtime-supported name alias without over-requiring skill",
+				"server/lib/agent/tools/__tests__/tools.test.ts::rawJsonSchema parity for all tools Skill rawJsonSchema keys/required"
+			]
+		},
+		{
+			"group": "chapters.split",
+			"status": "supported-with-compressed-ai-summary-fallback",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/chapter/GitCommitsTab.tsx",
+				"frontend/components/chapter/CommitDetailModal.tsx",
+				"frontend/components/chapter/ChapterSplitModal.tsx",
+				"frontend/components/settings/ChaptersContainersSection.tsx"
+			],
+			"features": [
+				"split-at-commit route capability and commit split workflow",
+				"fresh/full context inheritance modes",
+				"compressed context inheritance mode with explicit deterministic fallback metadata"
+			],
+			"fallbacks": [
+				{
+					"feature": "chapters.split.compressedAISummary",
+					"supported": false,
+					"mode": "deterministic-summary-placeholder",
+					"reason": "Go split compressed context uses a deterministic placeholder summary instead of a TypeScript-equivalent model-generated summary."
+				}
+			],
+			"goSources": [
+				"go_backend/internal/graph/handlers.go",
+				"go_backend/internal/chapters/handlers.go",
+				"go_backend/internal/app/router.go"
+			],
+			"frontendConsumerPolicy": "Git commit actions and commit details disable split-at-commit when unsupported; ChapterSplitModal blocks unsupported submits and displays compressed-summary fallback warnings when users choose compressed inheritance; settings surfaces split capability degradation.",
+			"tests": [
+				"go_backend/internal/graph/handlers_test.go",
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getChapterSplitCapability"
 			]
 		},
 		{
 			"group": "chapters.containers",
-			"status": "manual-controls-supported-with-ts-runtime-degradations",
+			"status": "manual-controls-supported-with-browser-tool-auto-enable-default-off",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/container/ContainerPanel.tsx",
+				"frontend/components/container/ContainerConfigModal.tsx",
+				"frontend/components/container/PodmanInstallModal.tsx",
+				"frontend/components/narrator/ChapterBar.tsx",
+				"frontend/components/narrator/NarratorDetailsPanel.tsx",
+				"frontend/components/settings/ChaptersContainersSection.tsx"
+			],
 			"features": [
 				"Podman status/setup/install route surface",
 				"compose-info discovery and bounded compose file reads",
@@ -54,35 +259,85 @@
 				"host port allocation and release",
 				"proxy-mode metadata when project proxy domain and pasta/passt backend are available",
 				"Go-owned HTTP/WebSocket reverse proxy runtime with settings start/stop/restart hook",
-				"container ready narrator message injection and Browser auto-enable",
+				"container ready narrator message injection and explicit Browser tool auto-enable metadata",
 				"container status persistence and status-change broadcasts"
 			],
-			"fallbacks": [],
+			"fallbacks": [
+				{
+					"feature": "chapters.containers.syncStartRequest",
+					"supported": false,
+					"mode": "background-start-with-streaming-logs",
+					"reason": "Go container start requests return immediately and continue compose startup in the background while progress is reported through logs and status updates."
+				},
+				{
+					"feature": "chapters.containers.browserToolAutoEnable",
+					"supported": false,
+					"mode": "default-off-explicit-enable",
+					"reason": "Go native container Browser tool auto-enable is default-off; enable browser tools explicitly after validating the native extension/container browser runtime."
+				}
+			],
 			"goSources": [
 				"go_backend/internal/chapters/handlers.go",
 				"go_backend/internal/chapters/container_runtime.go",
 				"go_backend/internal/chapters/service.go"
 			],
+			"frontendConsumerPolicy": "Container UI gates list/start/stop/logs/compose-info/remove/install by per-route capabilities, displays background-start streaming-log metadata in settings, and surfaces browser tool auto-enable default-off metadata in narrator details so users do not assume TypeScript synchronous starts or automatic Browser tool enablement.",
 			"tests": [
 				"go_backend/internal/chapters/container_runtime_test.go",
 				"go_backend/internal/chapters/route_contract_test.go",
 				"go_backend/internal/systemroutes/runtime_container_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getChapterContainersCapability",
+				"frontend/hooks/usePlatform.test.ts::getNarratorContainerBrowserToolAutoEnableCapability"
 			]
 		},
 		{
 			"group": "providers.runtimeAndRoutes",
 			"status": "supported-baseline-with-manager-parity-gaps",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useModels.ts",
+				"frontend/lib/api/streams.ts",
+				"frontend/routes/settings/models.tsx",
+				"frontend/routes/settings/proxy.tsx",
+				"frontend/components/providers/AnthropicProvidersSection.tsx",
+				"frontend/components/providers/ClineSection.tsx",
+				"frontend/components/providers/CodexSection.tsx",
+				"frontend/components/providers/CustomApiProviderSection.tsx",
+				"frontend/components/providers/KiroSection.tsx",
+				"frontend/components/providers/NKPProvidersSection.tsx",
+				"frontend/components/providers/NUGProvidersSection.tsx",
+				"frontend/components/providers/OpenAIProvidersSection.tsx"
+			],
 			"features": [
 				"OpenAI-compatible model routes and chat/responses agent runtime",
 				"Anthropic model routes and messages agent runtime",
 				"Kiro credential/model/chat routes and Kiro-compatible SSE/plugin bridge runtime",
 				"NKP, NUG, Cline provider route and agent runtime baselines",
-				"Codex credential, status, quota overview, browser/device auth routes and responses WS/HTTP runtime"
+				"Codex credential, paginated status, quota overview, usage-queue clear, browser/device auth routes and responses WS/HTTP runtime",
+				"Codex responses prompt_cache_key follows the TS/CLI conversationId contract instead of credential/account identifiers, even when stickySessionKey is present for credential affinity",
+				"Codex stream events propagate credentialId to match TS CodexProvider event metadata and rebuild-history retry state",
+				"custom/openAI Codex provider resolvers honor the TS-facing codexAccountId field when building Codex runtime providers",
+				"custom/openAI Codex providers honor the TS-facing codexWebSocket switch: built-in Codex defaults to WebSocket, while custom/openAI providers use WebSocket only when explicitly enabled",
+				"provider runtime requests apply the TS default reasoning fallback chain: narrator override first, then provider/codex defaultReasoningEffort, then agent.defaultReasoningEffort",
+				"provider runtime consumes TS-supported proxy/TLS fields: Codex global proxy, Anthropic/custom-Anthropic proxy, and Anthropic tlsRejectUnauthorized=false are applied to outbound HTTP/WebSocket clients",
+				"Cline chat requests preserve workos Authorization headers while streaming TS/Go text and usage parity",
+				"executable TS provider fixtures are compared against Go provider invalidState outputs for OpenAI Chat, OpenAI Responses, and Anthropic error streams",
+				"executable TS provider fixtures are compared against Go provider normal stream outputs for OpenAI Chat, OpenAI Responses, Anthropic, Cline, Kiro, NKP, NUG, and Codex text/tool/usage/message/reasoning/context/metering/body/header events"
 			],
 			"fallbacks": [
-				{ "feature": "openai.quota", "supported": false, "code": "FEATURE_DISABLED" },
-				{ "feature": "anthropic.quota", "supported": false, "code": "FEATURE_DISABLED" },
+				{
+					"feature": "openai.quota",
+					"supported": false,
+					"code": "FEATURE_DISABLED",
+					"reason": "OpenAI-compatible quota inspection is not available in go_backend."
+				},
+				{
+					"feature": "anthropic.quota",
+					"supported": false,
+					"code": "FEATURE_DISABLED",
+					"reason": "Anthropic quota inspection is not available in go_backend."
+				},
 				{
 					"feature": "codex.tsManagerParity",
 					"supported": false,
@@ -92,7 +347,7 @@
 				{
 					"feature": "kiro.pluginAvailability",
 					"supported": "conditional",
-					"reason": "Kiro plugin bridge requires the external Bun bridge/plugin environment."
+					"reason": "Kiro plugin bridge is available only when the external Bun bridge/plugin environment is present."
 				}
 			],
 			"goSources": [
@@ -103,34 +358,54 @@
 				"go_backend/internal/agentbasic/provider_kiro.go",
 				"go_backend/internal/agentbasic/provider_codex_ws.go"
 			],
+			"frontendConsumerPolicy": "Provider settings sections gate model refresh, per-provider refresh, quota reads, proxy/status, credential management, Codex usage-queue clear, and Kiro plugin/MCP routes through provider capability metadata; useModels hides providers whose Go agent runtime is unavailable; CodexSection/OpenAIProvidersSection surface Codex manager parity warnings instead of assuming full TS CodexManager semantics; kiroStreamChat preserves structured Kiro route/SSE errors on ApiError.data.",
 			"tests": [
 				"go_backend/internal/agentbasic/provider_runtime_routing_test.go",
+				"go_backend/internal/agentbasic/provider_ts_parity_exec_test.go::TestGoMatchesExecutableTSProviderFixtures",
 				"go_backend/internal/agentbasic/provider_openai_responses_test.go",
 				"go_backend/internal/agentbasic/provider_anthropic_stream_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
+				"go_backend/internal/systemroutes/handlers_test.go::TestProviderRoutesRequireAuth",
+				"go_backend/internal/systemroutes/handlers_test.go::TestProviderRoutesReturnCachedLongTailShapesWithoutRefresh",
+				"go_backend/internal/systemroutes/handlers_test.go::TestCodexUsageQueueClearReturnsOkWhenQueueIsEmpty",
+				"go_backend/internal/systemroutes/handlers_test.go::TestCodexQuotaOverviewRemainsAvailableToAuthenticatedUsers",
+				"frontend/hooks/usePlatform.test.ts::getProviderRuntimeCapability",
+				"frontend/hooks/usePlatform.test.ts::getProviderRouteCapability",
+				"frontend/hooks/usePlatform.test.ts::getProviderModelRefreshCapability",
+				"frontend/hooks/usePlatform.test.ts::getProviderQuotaCapability",
+				"frontend/hooks/usePlatform.test.ts::getProviderAgentModeCapability",
+				"frontend/hooks/usePlatform.test.ts::getCodexManagerParityCapability",
+				"frontend/lib/api/streams.test.ts::kiroStreamChat"
 			]
 		},
 		{
 			"group": "mcp.settingsAndTools",
-			"status": "settings-and-builtin-tools-supported-external-agent-injection-disabled",
+			"status": "settings-builtin-tools-and-stdio-external-agent-injection-supported-with-http-transport-degradations",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useMcp.ts",
+				"frontend/routes/routines/index.tsx",
+				"frontend/routes/routines/tool-permissions.tsx"
+			],
 			"features": [
 				"MCP server definitions persisted in settings.json",
-				"MCP JSON-RPC initialize/tools/list/tools/call for embedded NarraFork tools",
+				"MCP JSON-RPC initialize/tools/list/tools/call for embedded NarraFork tools, including fork inheritMode argument parity",
 				"MCP server import/create/update/delete/test/connect/disconnect route surface",
-				"stdio MCP probe can discover external tool metadata"
+				"stdio MCP probe can discover external tool metadata",
+				"connected stdio MCP tools are injected into Go narrator agent loops with permission-mode and subagent tool-access filtering"
 			],
 			"fallbacks": [
-				{ "feature": "mcp.transport.sse", "supported": false, "code": "FEATURE_DISABLED" },
+				{
+					"feature": "mcp.transport.sse",
+					"supported": false,
+					"code": "FEATURE_DISABLED",
+					"reason": "Go compatibility mode only connects stdio MCP servers."
+				},
 				{
 					"feature": "mcp.transport.streamableHttp",
 					"supported": false,
-					"code": "FEATURE_DISABLED"
-				},
-				{ "feature": "mcp.externalAgentInjection", "supported": false, "code": "FEATURE_DISABLED" },
-				{
-					"feature": "mcp.forkInheritModeToolArg",
-					"supported": false,
-					"mode": "partial-builtin-tool-parity"
+					"code": "FEATURE_DISABLED",
+					"reason": "Go compatibility mode only connects stdio MCP servers."
 				}
 			],
 			"goSources": [
@@ -138,96 +413,191 @@
 				"go_backend/internal/config/config.go",
 				"go_backend/internal/agentbasic/tool_inventory.go"
 			],
+			"frontendConsumerPolicy": "McpToolsTab gates MCP server listing, CRUD, import, test, permissions, and transport selection through settings/storage, management, and transport capabilities; tool-permissions only lists external MCP tools when supported and surfaces stdio-only Go agent-injection warnings for non-stdio transports.",
 			"tests": [
 				"go_backend/internal/mcpcompat/handlers_test.go",
 				"go_backend/internal/config/config_test.go",
-				"go_backend/internal/agentbasic/tool_inventory_test.go"
+				"go_backend/internal/agentbasic/tool_inventory_test.go",
+				"frontend/hooks/usePlatform.test.ts::getMcpServerSettingsStorageCapability",
+				"frontend/hooks/usePlatform.test.ts::getMcpExternalServerManagementCapability",
+				"frontend/hooks/usePlatform.test.ts::getMcpTransportsCapability",
+				"frontend/hooks/usePlatform.test.ts::getMcpExternalAgentCapability",
+				"frontend/hooks/usePlatform.test.ts::getMcpExternalToolsCapability"
 			]
 		},
 		{
 			"group": "settings.store",
-			"status": "supported-with-loose-validation",
+			"status": "supported-with-loose-validation-and-test-model-contract-lock",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useInstanceSettings.ts",
+				"frontend/routes/settings.tsx",
+				"frontend/routes/settings/providers.tsx"
+			],
 			"features": [
 				"settings.json storage under ~/.narrafork",
 				"GET/PATCH settings routes",
-				"secret masking for auth, TLS, and provider credentials",
-				"provider model cache augmentation",
-				"context thresholds, TLS generation, retry rules, and test-model routes"
+				"server/TLS schema and file-existence validation plus secret masking/preservation for auth, TLS, VNet, and provider credentials",
+				"provider model cache augmentation plus bidirectional customApiProviders/legacy provider array synchronization and GET response normalization",
+				"provider and settings schema validation for required strings, non-null optional strings/arrays/enums/ints, nullable provider reasoning enums, custom/legacy provider prefix conflicts, proxy URL normalization, booleans, integer windows, and enabled model arrays",
+				"agent scalar/runtime schema validation for permission mode, booleans, retry and timeout bounds (including question reflection timeout), summary model non-null string, custom retry rules, default system prompt, model aggregations, custom model channel metadata, subagent model key restrictions, non-null reasoning effort enum, auto compact, context thresholds, model selection maps/arrays, tool permission policy rules, and WebFetch policy/proxy settings, with Go permission handling enforcing TS allowAll/whitelist/blacklist URL policy, frontend proxy overview consuming the current shape, Go WebFetch tool runtime consuming the current {mode,url} proxy policy plus TS-supported data: URLs, and WebFetch extraction-mode partial parity exposed through health/tool-inventory capabilities with unsupported TS modes explicitly rejected instead of silently ignored",
+				"paths, chapters, containers, editor, codex, and routines schema validation for project directories, limits, container proxy, editor type, Codex routing, and routine lists",
+				"vnet schema validation for relay token, peer/message limits, and UDP rendezvous settings",
+				"update and shares schema validation for URLs, channels, intervals, expiry, and size limits",
+				"context thresholds, TLS generation, retry rules with create-route schema/201 full-rule response parity, and test-model routes",
+				"test-model prompt length limit plus model-resolution 400 and generation-failure 502 mapping"
 			],
 			"fallbacks": [
 				{
 					"feature": "settings.tsZodParity",
 					"supported": false,
-					"mode": "loose-json-with-normalization"
+					"mode": "loose-json-with-normalization",
+					"reason": "Go backend normalizes settings before saving but does not apply the full TypeScript Zod schema strictly.",
+					"resolvedSubfeatures": [
+						"settings.testModel.promptLimitAndErrorMapping",
+						"settings.serverTLS.schemaValidation",
+						"settings.providerArrays.schemaValidation",
+						"settings.agentScalar.schemaValidation",
+						"settings.agentCustomRetryRules.schemaValidation",
+						"settings.retryRulesCreate.schemaValidation",
+						"settings.agentPromptAggregations.schemaValidation",
+						"settings.agentModelSelection.schemaValidation",
+						"settings.agentPolicyRules.schemaValidation",
+						"settings.agentWebFetchPolicy.schemaValidation",
+						"settings.pathsChaptersContainersEditor.schemaValidation",
+						"settings.codexRoutines.schemaValidation",
+						"settings.vnet.schemaValidation",
+						"settings.updateShares.schemaValidation"
+					]
 				}
 			],
 			"goSources": [
 				"go_backend/internal/settings/handlers.go",
 				"go_backend/internal/config/config.go"
 			],
+			"frontendConsumerPolicy": "SettingsLayout surfaces Go loose-validation metadata globally before users edit settings; providers/settings pages consume settings storage capability metadata and preserve existing normalized settings flows instead of assuming strict TypeScript Zod parity.",
 			"tests": [
 				"go_backend/internal/settings/handlers_test.go",
 				"go_backend/internal/config/config_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getSettingsFeatureCapability",
+				"frontend/hooks/usePlatform.test.ts::getSettingsValidationCapability",
+				"frontend/hooks/usePlatform.test.ts::getNarratorToolInventoryCapability WebFetch mode parity metadata",
+				"frontend/lib/proxy.test.ts::summarizeWebFetchProxyPolicy",
+				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
+				"go_backend/internal/agentbasic/tool_inventory_test.go::TestToolInventoryExposesWebFetchModeParityMetadata",
+				"go_backend/internal/agentbasic/openai_test.go::TestWebFetchToolUsesCustomProxyPolicy",
+				"go_backend/internal/agentbasic/openai_test.go::TestWebFetchToolSupportsDataURL",
+				"go_backend/internal/agentbasic/openai_test.go::TestWebFetchToolRejectsUnsupportedModeInsteadOfIgnoring",
+				"go_backend/internal/narrators/permission_test.go::TestWebFetchPermissionPolicyMatchesTSRules"
 			]
+		},
+		{
+			"group": "userPreferences.gatewayAndNotifications",
+			"status": "supported-with-secret-masking-and-masked-roundtrip-preservation",
+			"routes": ["GET /api/user-preferences", "PATCH /api/user-preferences"],
+			"features": [
+				"gatewayConfig persistence for frontend GatewaySection",
+				"notification webhook/secret masking on preference reads",
+				"notification webhook HTTPS validation on writes",
+				"boolean, enum, terminal font size, sound field, command schema, and gateway config schema validation on writes",
+				"gateway platform token/botToken/appToken/appSecret/secret/clientSecret masking on preference reads",
+				"masked notification and gateway secret PATCH values preserve stored originals"
+			],
+			"goSources": ["go_backend/internal/userprefs/handlers.go"],
+			"tsSources": [
+				"server/routes/user-preferences.ts",
+				"frontend/components/settings/GatewaySection.tsx",
+				"frontend/components/settings/NotificationSection.tsx"
+			],
+			"tests": ["go_backend/internal/userprefs/handlers_json_test.go"]
 		},
 		{
 			"group": "files.uploadsSharesFs",
 			"status": "supported-baseline-with-security-and-presentation-degradations",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useAvatarBlobUrl.ts",
+				"frontend/components/narrator/MessageBubble.tsx",
+				"frontend/components/narrator/pixi/NarratorPixiMessageList.tsx",
+				"frontend/components/narrator/ToolCallCard.tsx",
+				"frontend/components/settings/StorageSection.tsx"
+			],
 			"features": [
 				"narrator image and avatar upload file serving",
 				"upload cleanup preserves directories still referenced by narrator image message blocks",
-				"share creation, public download, and public preview",
+				"share creation, public download, public preview, and startup stale-share cleanup",
+				"ShareFile source-size preflight enforces the TS-equivalent 512MB limit before raw copy, gzip, tar.gz, or multi-path zip work starts",
+				"ShareFile previewUrl metadata is emitted only for TS-equivalent previewable file types: image, video, PDF, and HTML",
 				"safe share headers and escaped HTML preview",
-				"fs browse, shortcuts, mkdir, reveal fallback, and bounded preview"
+				"fs browse, shortcuts, mkdir, reveal, and bounded preview"
 			],
 			"fallbacks": [
-				{ "feature": "shares.tsSanitizeHTMLPreview", "supported": false, "mode": "escaped-pre" },
+				{
+					"feature": "shares.tsSanitizeHTMLPreview",
+					"supported": false,
+					"mode": "escaped-pre",
+					"reason": "Go public share preview escapes HTML and renders it in a preformatted block instead of using the TypeScript sanitize-html preview pipeline."
+				},
 				{
 					"feature": "shares.ephemeralOnly",
 					"supported": false,
-					"reason": "Go resolver can serve disk fallback share directories after in-memory records are gone."
-				},
-				{ "feature": "fs.reveal.linux", "supported": false, "code": "FS_REVEAL_UNSUPPORTED" }
+					"mode": "startup cleanup plus disk metadata bridge",
+					"reason": "Go ShareFile uses disk metadata as an in-process bridge for public share routes; startup cleanup removes previous-run share directories and metadata."
+				}
 			],
 			"goSources": [
 				"go_backend/internal/misccompat/handlers.go",
-				"go_backend/internal/fs/handlers.go"
+				"go_backend/internal/fs/handlers.go",
+				"go_backend/internal/agentbasic/openai.go"
 			],
+			"frontendConsumerPolicy": "Narrator image/avatar consumers skip upload fetches when serving is unsupported; ShareFile tool details surface escaped HTML preview and disk-backed non-ephemeral share warnings; storage cleanup respects upload message-reference preservation and disables unsafe cleanup targets.",
 			"tests": [
 				"go_backend/internal/misccompat/share_security_test.go",
 				"go_backend/internal/misccompat/routes_test.go",
 				"go_backend/internal/fs/handlers_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"go_backend/internal/agentbasic/openai_test.go::TestShareFileToolRejectsOversizedSourcesBeforeArchiving",
+				"go_backend/internal/agentbasic/openai_test.go::TestShareFileToolOmitsPreviewForUnsupportedFileTypes",
+				"frontend/hooks/usePlatform.test.ts::getUploadCapability",
+				"frontend/hooks/usePlatform.test.ts::getShareCapability",
+				"frontend/hooks/usePlatform.test.ts::getFileSystemCapability",
+				"frontend/hooks/usePlatform.test.ts::getStorageCleanupOperationCapabilities"
 			]
 		},
 		{
 			"group": "update.runtime.storage",
-			"status": "supported-baseline-with-manual-update-and-cleanup-degradations",
+			"status": "supported-baseline-with-conditional-auto-update-and-cleanup-degradations",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useUpdateCheck.ts",
+				"frontend/components/UpdateModal.tsx",
+				"frontend/components/settings/RuntimeSection.tsx",
+				"frontend/components/settings/StorageSection.tsx"
+			],
 			"features": [
-				"update check/version/directory/status/cleanup/download/apply route surface",
-				"update download SSE with HTTP(S), multiple files, SHA512, and 512 MiB cap",
+				"update check/version/directory/status/cleanup/download/apply route surface with conditional graceful self-apply and auto-restart handoff",
+				"update download SSE with HTTP(S), multiple files, SHA512, 512 MiB cap, and manual fallback when restart handoff is unavailable",
 				"runtime scan/cached/cleanup for terminals, containers, browsers, and Go-specific worktree cleanup",
-				"storage scan/cached/cleanup/database preview/database cleanup and disabled VACUUM contract"
+				"storage scan/cached with last-completed scan cache, cleanup/database preview/database cleanup, and disabled VACUUM contract"
 			],
 			"fallbacks": [
-				{ "feature": "update.selfApply", "supported": false, "mode": "manual-only" },
-				{ "feature": "update.autoRestart", "supported": false, "mode": "manual-only" },
-				{ "feature": "storage.cachedScan", "supported": false, "mode": "cached:false" },
 				{
 					"feature": "storage.cleanup.worktrees",
 					"supported": false,
-					"alternative": "runtime.cleanup.worktrees"
+					"alternative": "runtime.cleanup.worktrees",
+					"reason": "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent."
 				},
 				{
 					"feature": "storage.cleanup.containersPrune",
 					"supported": false,
-					"alternative": "runtime.cleanup.containers"
+					"alternative": "runtime.cleanup.containers",
+					"reason": "Podman prune is disabled from storage cleanup in go_backend; use per-chapter container controls or an external maintenance command."
 				},
 				{
 					"feature": "storage.vacuum",
 					"supported": false,
-					"reason": "Main-thread SQLite VACUUM is disabled in request handling."
+					"reason": "Main-thread SQLite VACUUM is disabled in go_backend; use an explicit maintenance window/tool outside request handling."
 				}
 			],
 			"goSources": [
@@ -235,12 +605,18 @@
 				"go_backend/internal/misccompat/handlers.go",
 				"go_backend/internal/app/router.go"
 			],
+			"frontendConsumerPolicy": "UpdateModal gates SSE download and auto-apply/restart by update capability metadata and falls back to manual instructions; RuntimeSection gates runtime cleanup targets; StorageSection reroutes worktree cleanup to runtime, keeps container prune disabled when unsafe, and surfaces disabled VACUUM/database cleanup reasons.",
 			"tests": [
 				"go_backend/internal/systemroutes/update_contract_test.go",
 				"go_backend/internal/systemroutes/runtime_cleanup_test.go",
 				"go_backend/internal/systemroutes/runtime_container_test.go",
 				"go_backend/internal/misccompat/routes_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getUpdateCapability",
+				"frontend/hooks/usePlatform.test.ts::getRuntimeMaintenanceCapability",
+				"frontend/hooks/usePlatform.test.ts::getStorageCapability",
+				"frontend/hooks/usePlatform.test.ts::getStorageCleanupOperationCapabilities",
+				"frontend/hooks/usePlatform.test.ts::getStorageDatabaseCleanupCapabilities"
 			]
 		}
 	]

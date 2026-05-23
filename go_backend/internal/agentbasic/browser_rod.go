@@ -394,6 +394,10 @@ func browserLaunch(ctx context.Context, rawURL string, headless bool, ttlMs int,
 }
 
 func browserNavigate(ctx context.Context, sessionID, rawURL, direction string, timeoutMs int, maxLength int) string {
+	direction = strings.ToLower(strings.TrimSpace(direction))
+	if direction != "" && direction != "back" && direction != "forward" {
+		return "unsupported navigate direction: " + direction
+	}
 	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
@@ -401,7 +405,6 @@ func browserNavigate(ctx context.Context, sessionID, rawURL, direction string, t
 	session.mu.Lock()
 	defer session.mu.Unlock()
 
-	direction = strings.ToLower(strings.TrimSpace(direction))
 	if direction == "back" {
 		err = session.Page.Context(ctx).Timeout(time.Duration(timeoutMs) * time.Millisecond).NavigateBack()
 	} else if direction == "forward" {
@@ -900,25 +903,22 @@ func browserScroll(ctx context.Context, sessionID, selector string, coordinate b
 	if amount <= 0 {
 		amount = 500
 	}
+	direction = strings.ToLower(strings.TrimSpace(direction))
+	var deltaX, deltaY int
+	switch direction {
+	case "", "down":
+		deltaY = amount
+	case "up":
+		deltaY = -amount
+	default:
+		return "unsupported scroll direction: " + direction
+	}
 	session, err := browserRequireSession(ctx, sessionID)
 	if err != nil {
 		return err.Error()
 	}
 	session.mu.Lock()
 	defer session.mu.Unlock()
-
-	direction = strings.ToLower(strings.TrimSpace(direction))
-	var deltaX, deltaY int
-	switch direction {
-	case "up":
-		deltaY = -amount
-	case "left":
-		deltaX = -amount
-	case "right":
-		deltaX = amount
-	default:
-		deltaY = amount
-	}
 
 	if strings.TrimSpace(selector) != "" {
 		el, err := browserElement(ctx, session.Page, selector, timeoutMs)
@@ -1040,27 +1040,79 @@ func browserPerfStop(ctx context.Context, cwd, sessionID, filePath string, timeo
 	outputSnapshot := session.snapshotLocked()
 	session.mu.Unlock()
 
-	if strings.TrimSpace(filePath) == "" {
-		filePath = fmt.Sprintf("trace-%s-%d.json", session.ID, time.Now().UnixMilli())
-	}
-	resolved, err := resolveWithin(cwd, filePath)
+	artifact, err := writeBrowserTraceArtifact(cwd, session.ID, filePath, events, durationMs, trace.DataLossOccurred)
 	if err != nil {
 		return err.Error()
 	}
-	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
-		return err.Error()
+	traceMetadata := map[string]any{"status": "stopped", "filePath": artifact["file_path"], "fileSize": artifact["fileSize"], "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "stoppedAt": time.Now().UTC().Format(time.RFC3339Nano)}
+	if shareID, ok := artifact["shareId"]; ok {
+		traceMetadata["shareId"] = shareID
+		traceMetadata["shareUrl"] = artifact["shareUrl"]
 	}
+	snapshot.TraceMetadata = traceMetadata
+	notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
+	output := map[string]any{"session_id": session.ID, "snapshot": outputSnapshot}
+	for key, value := range artifact {
+		output[key] = value
+	}
+	return jsonTool(output)
+}
+
+func writeBrowserTraceArtifact(cwd, sessionID, filePath string, events []map[string]any, durationMs int64, dataLossOccurred bool) (map[string]any, error) {
 	payload := map[string]any{"traceEvents": events}
 	data, err := json.Marshal(payload)
 	if err != nil {
-		return err.Error()
+		return nil, err
 	}
+
+	shareID := ""
+	fileName := ""
+	resolved := ""
+	if strings.TrimSpace(filePath) == "" {
+		shareID = id.Must(12)
+		fileName = fmt.Sprintf("trace-%s-%d.json", sessionID, time.Now().UnixMilli())
+		dir := filepath.Join(sharesRoot(), shareID)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		resolved = filepath.Join(dir, fileName)
+	} else {
+		resolved, err = resolveWithin(cwd, filePath)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
+			return nil, err
+		}
+		fileName = filepath.Base(resolved)
+	}
+
 	if err := os.WriteFile(resolved, data, 0o644); err != nil {
-		return err.Error()
+		if shareID != "" {
+			removeShareDisk(shareID)
+		}
+		return nil, err
 	}
-	snapshot.TraceMetadata = map[string]any{"status": "stopped", "filePath": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "stoppedAt": time.Now().UTC().Format(time.RFC3339Nano)}
-	notifyBrowserSessionEvent(ctx, "artifact_saved", snapshot)
-	return jsonTool(map[string]any{"session_id": session.ID, "file_path": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": trace.DataLossOccurred, "snapshot": outputSnapshot})
+
+	artifact := map[string]any{"file_path": resolved, "fileSize": len(data), "durationMs": durationMs, "dataLossOccurred": dataLossOccurred}
+	if shareID != "" {
+		expiresAt := time.Now().Add(defaultToolShareExpiry)
+		if err := writeShareMetadata(shareDiskMetadata{
+			ID:           shareID,
+			OriginalName: fileName,
+			FileName:     fileName,
+			SizeBytes:    int64(len(data)),
+			ExpiresAt:    expiresAt.Format(time.RFC3339Nano),
+			CreatedBy:    "browser",
+		}); err != nil {
+			removeShareDisk(shareID)
+			return nil, err
+		}
+		artifact["shareId"] = shareID
+		artifact["shareUrl"] = "/api/shares/" + shareID
+		artifact["expiresAt"] = expiresAt.Format(time.RFC3339)
+	}
+	return artifact, nil
 }
 
 func browserListSessions(ctx context.Context) string {

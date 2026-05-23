@@ -35,7 +35,7 @@
 		},
 		{
 			"group": "narrator.ws.p1Events",
-			"status": "partial-supported-with-phase3-followup",
+			"status": "supported-baseline-with-phase3-and-phase4-clarifications",
 			"events": [
 				"background_task_started",
 				"background_task_completed",
@@ -50,9 +50,9 @@
 				"git_status",
 				"tool_inventory"
 			],
-			"knownGaps": [
-				"foreground/background subagent parent blocking and continuation semantics are finalized in Phase 3",
-				"MCP injected tools remain unsupported metadata only until Phase 3"
+			"clarifications": [
+				"foreground/background subagent continuation semantics are tracked in Phase 3; the remaining Go reattach limitation is represented by narrator.subagents.reattachFallback and health capabilities",
+				"MCP injected tools are no longer metadata-only in general: connected stdio MCP tools are executable, while non-stdio transports remain explicit fallback in Phase 3/4"
 			],
 			"tests": [
 				"go_backend/internal/narrators/background_task_events_test.go",
@@ -79,14 +79,31 @@
 		},
 		{
 			"group": "narrator.toolInventory",
-			"status": "supported-with-mcp-disabled",
+			"status": "supported-with-stdio-mcp-injection-and-nonstdio-fallback",
 			"categories": ["core", "optional", "review", "reflection", "mcp"],
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/routes/routines/tool-permissions.tsx"
+			],
 			"mcpExternalToolInjection": {
-				"supported": false,
-				"fallback": true,
-				"code": "FEATURE_DISABLED"
+				"supported": true,
+				"fallback": false,
+				"parity": "partial",
+				"transport": "stdio",
+				"lifecycle": "per-call",
+				"nonStdioTransports": {
+					"supported": false,
+					"fallback": true,
+					"code": "FEATURE_DISABLED",
+					"reason": "SSE and streamable HTTP MCP transports remain metadata/configuration only; only connected stdio MCP tools are executable by Go narrator agents."
+				}
 			},
-			"tests": ["go_backend/internal/agentbasic/tool_inventory_test.go"]
+			"frontendConsumerPolicy": "tool-permissions surfaces partial stdio MCP agent-injection parity and non-stdio fallback reasons instead of implying full TS MCP parity.",
+			"tests": [
+				"go_backend/internal/agentbasic/tool_inventory_test.go",
+				"go_backend/internal/mcpcompat/handlers_test.go",
+				"frontend/hooks/usePlatform.test.ts::getMcpExternalAgentCapability"
+			]
 		},
 		{
 			"group": "narrator.permissions",

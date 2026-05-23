@@ -232,7 +232,8 @@ func (h *Hub) VNetHandler(authService *auth.Service, settings *config.Store) htt
 				slog.Warn("upgrade disabled vnet websocket", "error", err)
 				return
 			}
-			payload := map[string]any{"type": "error", "ok": false, "supported": true, "fallback": true, "code": "VNET_DISABLED", "feature": "vnet", "message": "VNet is disabled"}
+			reason := "VNet is disabled"
+			payload := map[string]any{"type": "error", "ok": false, "supported": true, "fallback": true, "code": "VNET_DISABLED", "feature": "vnet", "reason": reason, "error": reason, "message": reason}
 			data, _ := json.Marshal(payload)
 			_ = conn.SetWriteDeadline(time.Now().Add(websocketWriteTimeout))
 			_ = conn.WriteMessage(websocket.TextMessage, data)
@@ -261,6 +262,7 @@ func (h *Hub) VNetHandler(authService *auth.Service, settings *config.Store) htt
 }
 
 func (h *Hub) VNetDisabledHandler() http.HandlerFunc {
+	reason := "VNet relay/UDP WebSocket runtime is not bundled in go_backend"
 	payload := map[string]any{
 		"type":      "error",
 		"ok":        false,
@@ -268,7 +270,9 @@ func (h *Hub) VNetDisabledHandler() http.HandlerFunc {
 		"fallback":  true,
 		"code":      "VNET_DISABLED",
 		"feature":   "vnet",
-		"reason":    "VNet relay/UDP WebSocket runtime is not bundled in go_backend",
+		"reason":    reason,
+		"error":     reason,
+		"message":   reason,
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !websocket.IsWebSocketUpgrade(r) {
@@ -1149,10 +1153,13 @@ func (h *Hub) sendTerminalState(c *client, terminalID string, terminal map[strin
 	c.sendJSON(payload)
 
 	if snapshot, ok, err := h.terminalSnapshot(terminalID); err != nil {
+		reason := err.Error()
 		c.sendJSON(map[string]any{
 			"type":       "error",
 			"terminalId": terminalID,
-			"message":    err.Error(),
+			"reason":     reason,
+			"error":      reason,
+			"message":    reason,
 			"code":       "TERMINAL_SNAPSHOT_UNAVAILABLE",
 			"fallback":   true,
 			"fatal":      false,

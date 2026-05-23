@@ -102,6 +102,92 @@ func TestToolPermissionGlobalRulesFromSettings(t *testing.T) {
 	}
 }
 
+func TestWebFetchPermissionPolicyMatchesTSRules(t *testing.T) {
+	service := newPermissionTestService(t)
+	cwd := t.TempDir()
+
+	cases := []struct {
+		mode string
+		want string
+	}{
+		{mode: "default", want: "ask"},
+		{mode: "readOnly", want: "ask"},
+		{mode: "acceptEdits", want: "ask"},
+		{mode: "bypassPermissions", want: "ask"},
+		{mode: "dontAsk", want: "deny"},
+	}
+	for _, tc := range cases {
+		t.Run("default-policy/"+tc.mode, func(t *testing.T) {
+			narrator := permissionTestNarrator(cwd, tc.mode)
+			decision, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("WebFetch", `{"url":"https://example.com/page"}`))
+			if err != nil {
+				t.Fatalf("resolve WebFetch permission: %v", err)
+			}
+			if decision.Action != tc.want {
+				t.Fatalf("WebFetch decision = %s (%s), want %s", decision.Action, decision.Reason, tc.want)
+			}
+		})
+	}
+
+	t.Setenv("HOME", t.TempDir())
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	_, err = store.Patch(map[string]any{"agent": map[string]any{
+		"webFetchPolicy": map[string]any{
+			"allowAll":  true,
+			"whitelist": []map[string]any{{"pattern": "allowed.example", "enabled": true}},
+			"blacklist": []map[string]any{{"pattern": "blocked.example", "enabled": true}},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("patch WebFetch policy: %v", err)
+	}
+	service.Settings = store
+	narrator := permissionTestNarrator(cwd, "bypassPermissions")
+	blocked, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("WebFetch", `{"url":"https://blocked.example/page"}`))
+	if err != nil {
+		t.Fatalf("resolve blacklisted WebFetch: %v", err)
+	}
+	if blocked.Action != "deny" || blocked.Reason == "" {
+		t.Fatalf("blacklisted WebFetch decision = %s (%s), want deny with reason", blocked.Action, blocked.Reason)
+	}
+
+	allowed, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("WebFetch", `{"url":"https://other.example/page"}`))
+	if err != nil {
+		t.Fatalf("resolve allowAll WebFetch: %v", err)
+	}
+	if allowed.Action != "allow" {
+		t.Fatalf("allowAll WebFetch decision = %s (%s), want allow", allowed.Action, allowed.Reason)
+	}
+
+	_, err = store.Patch(map[string]any{"agent": map[string]any{
+		"webFetchPolicy": map[string]any{
+			"allowAll":  false,
+			"whitelist": []map[string]any{{"pattern": "allowed.example", "enabled": true}},
+			"blacklist": []map[string]any{{"pattern": "blocked.example", "enabled": true}},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("patch WebFetch whitelist policy: %v", err)
+	}
+	whitelisted, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("WebFetch", `{"url":"https://allowed.example/page"}`))
+	if err != nil {
+		t.Fatalf("resolve whitelisted WebFetch: %v", err)
+	}
+	if whitelisted.Action != "allow" {
+		t.Fatalf("whitelisted WebFetch decision = %s (%s), want allow", whitelisted.Action, whitelisted.Reason)
+	}
+	notWhitelisted, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("WebFetch", `{"url":"https://other.example/page"}`))
+	if err != nil {
+		t.Fatalf("resolve non-whitelisted WebFetch: %v", err)
+	}
+	if notWhitelisted.Action != "ask" {
+		t.Fatalf("non-whitelisted WebFetch decision = %s (%s), want ask", notWhitelisted.Action, notWhitelisted.Reason)
+	}
+}
+
 func TestToolPermissionProjectRulesFromChapterSettings(t *testing.T) {
 	service := newPermissionTestService(t)
 	cwd := t.TempDir()

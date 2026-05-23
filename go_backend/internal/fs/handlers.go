@@ -170,14 +170,19 @@ func (h *Handler) reveal(w http.ResponseWriter, r *http.Request) error {
 		cmdName = "open"
 	case "windows":
 		cmdName = "explorer"
+	case "linux":
+		cmdName = "xdg-open"
 	default:
+		reason := "Opening the system file manager is not supported on this platform by go_backend."
 		httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{
 			"ok":        false,
 			"code":      "FS_REVEAL_UNSUPPORTED",
 			"feature":   "fs.reveal",
 			"supported": false,
 			"fallback":  true,
-			"reason":    "Opening the system file manager is not supported on this platform by go_backend.",
+			"reason":    reason,
+			"error":     reason,
+			"message":   reason,
 		})
 		return nil
 	}
@@ -258,7 +263,16 @@ func (h *Handler) preview(w http.ResponseWriter, r *http.Request) error {
 		limit = maxBinaryPreview
 	}
 	if info.Size() > limit {
-		httpx.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": "File too large to preview"})
+		reason := "File too large to preview"
+		httpx.WriteJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"ok":       false,
+			"code":     "FS_PREVIEW_TOO_LARGE",
+			"reason":   reason,
+			"error":    reason,
+			"message":  reason,
+			"size":     info.Size(),
+			"maxBytes": limit,
+		})
 		return nil
 	}
 	if ctype == "" {

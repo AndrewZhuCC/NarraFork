@@ -154,6 +154,9 @@ type Handler struct {
 	Chapters  *chapters.Service
 	Narrators *narrators.Service
 	Settings  *config.Store
+
+	storageScanMu    sync.RWMutex
+	storageScanCache map[string]any
 }
 
 func NewHandler(sqlDB *sql.DB, services ...any) *Handler {
@@ -1022,6 +1025,37 @@ func removeShareDisk(shareID string) {
 	_ = os.Remove(shareMetadataPath(shareID) + ".tmp")
 }
 
+func CleanupStaleShares() (int, error) {
+	root := sharesRoot()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		path := filepath.Join(root, name)
+		if entry.IsDir() {
+			if err := os.RemoveAll(path); err != nil {
+				return removed, err
+			}
+			removed++
+			continue
+		}
+		if strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".json.tmp") {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return removed, err
+			}
+			removed++
+		}
+	}
+	shareRecords.clearMemory()
+	return removed, nil
+}
+
 func sharesRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".narrafork", "shares")
@@ -1055,7 +1089,7 @@ func (h *Handler) shareLimits() (int, int64) {
 
 func (h *Handler) RegisterStorage(r chi.Router) {
 	r.Get("/cached", h.storageAdminOnly(func(w http.ResponseWriter, r *http.Request) {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"cached": false})
+		httpx.WriteJSON(w, http.StatusOK, h.storageCachedResponse())
 	}))
 	r.Get("/scan", h.storageAdminOnly(h.storageScan))
 	r.Post("/cleanup", httpx.Handler(h.storageAdminOnlyFunc(h.cleanupStorage)))
@@ -1083,6 +1117,22 @@ func (h *Handler) storageAdminOnlyFunc(next httpx.HandlerFunc) httpx.HandlerFunc
 		}
 		return next(w, r)
 	}
+}
+
+func (h *Handler) setStorageScanCache(payload map[string]any) {
+	h.storageScanMu.Lock()
+	defer h.storageScanMu.Unlock()
+	h.storageScanCache = payload
+}
+
+func (h *Handler) storageCachedResponse() map[string]any {
+	h.storageScanMu.RLock()
+	cached := h.storageScanCache
+	h.storageScanMu.RUnlock()
+	if cached == nil {
+		return map[string]any{"cached": false}
+	}
+	return map[string]any{"cached": true, "data": cached}
 }
 
 func (h *Handler) storageScan(w http.ResponseWriter, r *http.Request) {
@@ -1115,7 +1165,9 @@ func (h *Handler) storageScan(w http.ResponseWriter, r *http.Request) {
 	for _, category := range categories {
 		total += int64Number(category["sizeBytes"])
 	}
-	send("complete", map[string]any{"categories": categories, "totalBytes": total, "scannedAt": time.Now().UnixMilli()})
+	complete := map[string]any{"categories": categories, "totalBytes": total, "scannedAt": time.Now().UnixMilli()}
+	h.setStorageScanCache(complete)
+	send("complete", complete)
 }
 
 func (h *Handler) cleanupStorage(w http.ResponseWriter, r *http.Request) error {
@@ -1276,10 +1328,13 @@ func (h *Handler) databaseTableSummaries(r *http.Request) ([]map[string]any, []m
 		categoryTables[category]++
 		tableSummary := map[string]any{"name": name, "category": category, "kind": "table", "rowCount": rowCount, "approxContentBytes": 0, "diskBytes": 0, "indexBytes": 0, "totalBytes": 0}
 		if countErr != nil {
+			reason := countErr.Error()
 			tableSummary["degraded"] = true
 			tableSummary["fallback"] = true
 			tableSummary["fallbacks"] = []any{"table_row_count_failed"}
-			tableSummary["error"] = countErr.Error()
+			tableSummary["reason"] = reason
+			tableSummary["error"] = reason
+			tableSummary["message"] = reason
 		}
 		tables = append(tables, tableSummary)
 	}
@@ -1342,6 +1397,10 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 	}
 	if body.OlderThanDays <= 0 {
 		body.OlderThanDays = defaultDatabaseRetentionDays(body.Target)
+	}
+	if body.Target == "archivedSessions" || body.Target == "staleSessions" {
+		httpx.WriteFeatureDisabled(w, "storage.database.cleanup."+body.Target, "Go database cleanup execution for narrator sessions is disabled until the Bun-equivalent safe narrator deletion plan, shared message ref handoff, child narrator handling, running terminal guard, and upload preservation semantics are implemented. Preview remains available.")
+		return nil
 	}
 	before, _, _ := databaseFileSizes()
 	preview := h.previewDatabaseCleanup(r, body.Target, body.OlderThanDays, 10)
@@ -1480,7 +1539,10 @@ func markDatabaseCleanupPreviewDegraded(preview map[string]any, code string, err
 	preview["fallbacks"] = []any{code}
 	preview["warningCodes"] = []any{code}
 	if err != nil {
-		preview["error"] = err.Error()
+		reason := err.Error()
+		preview["reason"] = reason
+		preview["error"] = reason
+		preview["message"] = reason
 	}
 }
 
@@ -1508,26 +1570,7 @@ func (h *Handler) databaseCleanupNarratorIDs(r *http.Request, target string, old
 }
 
 func (h *Handler) deleteNarratorSessions(r *http.Request, ids []string) error {
-	tx, err := h.DB.BeginTx(r.Context(), nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	tables := []string{"narrator_message_refs", "narrator_tool_calls", "narrator_sidecars", "api_requests", "terminal_view_state", "terminal_tabs", "terminals", "narrator_buffered_messages", "narrator_goals", "narrator_file_snapshots", "narrator_patches", "narrator_whitelist_dirs", "narrator_blacklist_dirs", "narrator_whitelist_cmds", "narrator_blacklist_cmds", "gateway_session_mappings"}
-	for _, narratorID := range ids {
-		for _, table := range tables {
-			if _, err := tx.ExecContext(r.Context(), `DELETE FROM `+table+` WHERE narrator_id = ?`, narratorID); err != nil {
-				return fmt.Errorf("delete %s for narrator %s: %w", table, narratorID, err)
-			}
-		}
-		if _, err := tx.ExecContext(r.Context(), `DELETE FROM narrator_messages WHERE narrator_id = ?`, narratorID); err != nil {
-			return fmt.Errorf("delete narrator_messages for narrator %s: %w", narratorID, err)
-		}
-		if _, err := tx.ExecContext(r.Context(), `DELETE FROM narrators WHERE id = ?`, narratorID); err != nil {
-			return fmt.Errorf("delete narrator %s: %w", narratorID, err)
-		}
-	}
-	return tx.Commit()
+	return httpx.NotImplemented("storage.database.cleanup.archivedSessions")
 }
 
 func (h *Handler) countForNarratorIDs(r *http.Request, table string, ids []string) (int, error) {
@@ -1572,10 +1615,13 @@ func (h *Handler) narratorCleanupSamples(r *http.Request, ids []string, limit in
 		var messageCount int
 		sample := map[string]any{"type": "narrator", "id": id, "descendantNarratorCount": 0}
 		if err := h.DB.QueryRowContext(r.Context(), `SELECT title, status, COALESCE(last_message_at, updated_at, created_at), message_count FROM narrators WHERE id = ?`, id).Scan(&title, &status, &last, &messageCount); err != nil {
+			reason := err.Error()
 			sample["degraded"] = true
 			sample["fallback"] = true
 			sample["fallbacks"] = []any{"narrator_cleanup_sample_query_failed"}
-			sample["error"] = err.Error()
+			sample["reason"] = reason
+			sample["error"] = reason
+			sample["message"] = reason
 		} else {
 			sample["title"] = nullSQLString(title)
 			sample["status"] = nullSQLString(status)
@@ -1922,7 +1968,7 @@ func (h *Handler) testDingtalkWebhook(w http.ResponseWriter, r *http.Request) er
 		return httpx.BadRequest("webhook is required")
 	}
 	if err := sendDingtalkWebhook(r.Context(), req.Webhook, req.Secret, "NarraFork: Test", "**Test Notification**\n\nDingTalk webhook is working."); err != nil {
-		httpx.WriteJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		writeNotificationWebhookError(w, "NOTIFICATION_DINGTALK_WEBHOOK_FAILED", err.Error())
 		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -1941,11 +1987,21 @@ func (h *Handler) testFeishuWebhook(w http.ResponseWriter, r *http.Request) erro
 		return httpx.BadRequest("webhook is required")
 	}
 	if err := sendFeishuWebhook(r.Context(), req.Webhook, req.Secret, "NarraFork Notification", "**Test Notification**\n\nFeishu webhook is working."); err != nil {
-		httpx.WriteJSON(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		writeNotificationWebhookError(w, "NOTIFICATION_FEISHU_WEBHOOK_FAILED", err.Error())
 		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
+}
+
+func writeNotificationWebhookError(w http.ResponseWriter, code, reason string) {
+	httpx.WriteJSON(w, http.StatusBadGateway, map[string]any{
+		"ok":      false,
+		"code":    code,
+		"reason":  reason,
+		"error":   reason,
+		"message": reason,
+	})
 }
 
 func sendDingtalkWebhook(ctx context.Context, webhook, secret, title, text string) error {
@@ -2753,6 +2809,8 @@ func (h *Handler) RegisterRuler(r chi.Router) {
 func rulerCapabilities(h *Handler) map[string]any {
 	chapterServiceReady := h != nil && h.Chapters != nil
 	gitServiceReady := h != nil && h.Git != nil
+	chapterMutationReason := "Ruler chapter mutation routes require the chapter service in go_backend."
+	gitMutationReason := "Ruler git mutation routes require the git service in go_backend."
 	return map[string]any{
 		"read": map[string]any{
 			"supported": true,
@@ -2760,37 +2818,29 @@ func rulerCapabilities(h *Handler) map[string]any {
 			"mode":      "git-log-plus-chapter-overlay",
 		},
 		"mutations": map[string]any{
-			"fork": map[string]any{
-				"supported": chapterServiceReady,
-				"fallback":  !chapterServiceReady,
-				"code":      fallbackCodeIfDisabled(chapterServiceReady),
-			},
-			"merge": map[string]any{
-				"supported": chapterServiceReady,
-				"fallback":  !chapterServiceReady,
-				"code":      fallbackCodeIfDisabled(chapterServiceReady),
-			},
-			"abandon": map[string]any{
-				"supported": chapterServiceReady,
-				"fallback":  !chapterServiceReady,
-				"code":      fallbackCodeIfDisabled(chapterServiceReady),
-			},
-			"rebase": map[string]any{
-				"supported": gitServiceReady,
-				"fallback":  !gitServiceReady,
-				"code":      fallbackCodeIfDisabled(gitServiceReady),
-			},
-			"rebaseResolve": map[string]any{
-				"supported": gitServiceReady,
-				"fallback":  !gitServiceReady,
-				"code":      fallbackCodeIfDisabled(gitServiceReady),
-			},
+			"fork":          rulerMutationCapability(chapterServiceReady, chapterMutationReason),
+			"merge":         rulerMutationCapability(chapterServiceReady, chapterMutationReason),
+			"abandon":       rulerMutationCapability(chapterServiceReady, chapterMutationReason),
+			"rebase":        rulerMutationCapability(gitServiceReady, gitMutationReason),
+			"rebaseResolve": rulerMutationCapability(gitServiceReady, gitMutationReason),
 		},
 		"degradedRead": map[string]any{
 			"supported": true,
 			"fallbacks": []string{"project_git_path_missing", "git_rev_list_failed", "git_log_failed"},
 		},
 	}
+}
+
+func rulerMutationCapability(supported bool, reason string) map[string]any {
+	payload := map[string]any{
+		"supported": supported,
+		"fallback":  !supported,
+		"code":      fallbackCodeIfDisabled(supported),
+	}
+	if !supported {
+		payload["reason"] = reason
+	}
+	return payload
 }
 
 func fallbackCodeIfDisabled(supported bool) any {

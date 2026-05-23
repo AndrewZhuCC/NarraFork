@@ -31,6 +31,52 @@ func TestGoalCompletionEvidenceValid(t *testing.T) {
 	}
 }
 
+func TestEndPipelineRejectsUnsupportedFormat(t *testing.T) {
+	call := agentbasic.ToolCall{ID: "end-pipeline-1", Type: "function"}
+	call.Function.Name = "EndPipeline"
+	call.Function.Arguments = `{"format":"markdown"}`
+	run, handled, err := (&Service{}).executeNarratorTool(context.Background(), "narrator-1", Narrator{}, nil, &agentPipelineState{}, call, nil)
+	if err != nil || !handled {
+		t.Fatalf("expected handled EndPipeline without service error, handled=%v err=%v", handled, err)
+	}
+	if run.Status != "error" || !strings.Contains(run.Output, "unsupported pipeline format") {
+		t.Fatalf("expected unsupported format error, got status=%s output=%q", run.Status, run.Output)
+	}
+}
+
+func TestNormalizeExitPlanAllowedPrompts(t *testing.T) {
+	normalized, reason := normalizeExitPlanAllowedPrompts([]any{map[string]any{"tool": "Bash", "prompt": "run tests"}})
+	if reason != "" || normalized == nil {
+		t.Fatalf("expected valid allowedPrompts to normalize, normalized=%#v reason=%q", normalized, reason)
+	}
+	if _, reason := normalizeExitPlanAllowedPrompts([]any{map[string]any{"tool": "Edit", "prompt": "change code"}}); !strings.Contains(reason, "must be Bash") {
+		t.Fatalf("expected unsupported tool rejection, got %q", reason)
+	}
+	if _, reason := normalizeExitPlanAllowedPrompts([]any{map[string]any{"tool": "Bash", "prompt": "run tests", "extra": true}}); !strings.Contains(reason, "unsupported property") {
+		t.Fatalf("expected extra property rejection, got %q", reason)
+	}
+}
+
+func TestAddGoalRejectsOversizedObjectiveBeforeDB(t *testing.T) {
+	call := agentbasic.ToolCall{ID: "add-goal-1", Type: "function"}
+	call.Function.Name = "AddGoal"
+	call.Function.Arguments = `{"objective":"` + strings.Repeat("a", 4001) + `"}`
+	run, handled, err := (&Service{}).executeNarratorTool(context.Background(), "narrator-1", Narrator{}, nil, &agentPipelineState{}, call, nil)
+	if err != nil || !handled {
+		t.Fatalf("expected handled AddGoal without DB, handled=%v err=%v", handled, err)
+	}
+	if !strings.Contains(run.Output, "at most 4000") {
+		t.Fatalf("expected max length rejection, got %q", run.Output)
+	}
+}
+
+func TestNormalizeReviewFindingsRejectsExtraProperties(t *testing.T) {
+	_, err := normalizeReviewFindings([]any{map[string]any{"severity": "major", "message": "Fix it", "extra": true}})
+	if err == nil || !strings.Contains(err.Error(), "unsupported property") {
+		t.Fatalf("expected extra property rejection, got %v", err)
+	}
+}
+
 func TestExitPlanTextValid(t *testing.T) {
 	if exitPlanTextValid("short plan") {
 		t.Fatalf("short plan should not satisfy exit-plan gate")

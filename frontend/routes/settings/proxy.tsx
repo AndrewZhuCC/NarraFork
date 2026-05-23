@@ -16,8 +16,9 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useProviderRouteCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
-import { normalizeProxyUrl } from "../../lib/proxy";
+import { normalizeProxyUrl, summarizeWebFetchProxyPolicy } from "../../lib/proxy";
 
 export const Route = createFileRoute("/settings/proxy")({
 	component: ProxyManagementPage,
@@ -53,12 +54,20 @@ function ProxyManagementPage() {
 function KiroProxyCard() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const kiroStatusRoute = useProviderRouteCapability("kiro", "status");
+	const kiroGlobalProxyRoute = useProviderRouteCapability("kiro", "globalProxy");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const canReadKiroStatus = kiroStatusRoute.supported;
+	const canSetKiroGlobalProxy = kiroGlobalProxyRoute.supported;
+	const kiroGlobalProxyUnsupportedReason =
+		kiroGlobalProxyRoute.reason ?? providerRouteUnsupportedReason;
 	const [proxy, setProxy] = useState("");
 	const [initialized, setInitialized] = useState(false);
 
 	const { data: kiroStatus } = useQuery({
 		queryKey: ["kiro", "status"],
 		queryFn: api.kiroStatus,
+		enabled: canReadKiroStatus,
 		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
@@ -78,10 +87,11 @@ function KiroProxyCard() {
 	});
 
 	const handleSave = useCallback(() => {
+		if (!canSetKiroGlobalProxy) return;
 		const normalized = normalizeProxyUrl(proxy);
 		setProxy(normalized ?? "");
 		saveMut.mutate(normalized);
-	}, [proxy, saveMut]);
+	}, [proxy, saveMut, canSetKiroGlobalProxy]);
 
 	return (
 		<Card withBorder padding="md">
@@ -102,8 +112,15 @@ function KiroProxyCard() {
 						value={proxy}
 						onChange={(e) => setProxy(e.target.value)}
 						style={{ flex: 1 }}
+						disabled={!canSetKiroGlobalProxy}
 					/>
-					<Button size="xs" onClick={handleSave} loading={saveMut.isPending}>
+					<Button
+						size="xs"
+						onClick={handleSave}
+						loading={saveMut.isPending}
+						disabled={!canSetKiroGlobalProxy}
+						title={!canSetKiroGlobalProxy ? kiroGlobalProxyUnsupportedReason : undefined}
+					>
 						{t("proxySave")}
 					</Button>
 				</Group>
@@ -115,12 +132,20 @@ function KiroProxyCard() {
 function CodexProxyCard() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const codexStatusRoute = useProviderRouteCapability("codex", "status");
+	const codexGlobalProxyRoute = useProviderRouteCapability("codex", "globalProxy");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const canReadCodexStatus = codexStatusRoute.supported;
+	const canSetCodexGlobalProxy = codexGlobalProxyRoute.supported;
+	const codexGlobalProxyUnsupportedReason =
+		codexGlobalProxyRoute.reason ?? providerRouteUnsupportedReason;
 	const [proxy, setProxy] = useState("");
 	const [initialized, setInitialized] = useState(false);
 
 	const { data: codexStatus } = useQuery({
 		queryKey: ["codex", "status"],
 		queryFn: () => api.codexStatus(),
+		enabled: canReadCodexStatus,
 		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
 	});
 
@@ -140,10 +165,11 @@ function CodexProxyCard() {
 	});
 
 	const handleSave = useCallback(() => {
+		if (!canSetCodexGlobalProxy) return;
 		const normalized = normalizeProxyUrl(proxy);
 		setProxy(normalized ?? "");
 		saveMut.mutate(normalized);
-	}, [proxy, saveMut]);
+	}, [proxy, saveMut, canSetCodexGlobalProxy]);
 
 	return (
 		<Card withBorder padding="md">
@@ -164,8 +190,15 @@ function CodexProxyCard() {
 						value={proxy}
 						onChange={(e) => setProxy(e.target.value)}
 						style={{ flex: 1 }}
+						disabled={!canSetCodexGlobalProxy}
 					/>
-					<Button size="xs" onClick={handleSave} loading={saveMut.isPending}>
+					<Button
+						size="xs"
+						onClick={handleSave}
+						loading={saveMut.isPending}
+						disabled={!canSetCodexGlobalProxy}
+						title={!canSetCodexGlobalProxy ? codexGlobalProxyUnsupportedReason : undefined}
+					>
 						{t("proxySave")}
 					</Button>
 				</Group>
@@ -242,23 +275,22 @@ function WebFetchProxyCard() {
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const agentSettings = (settingsData as any)?.agent;
-	const proxyMode = agentSettings?.webFetchPolicy?.proxy ?? "direct";
-	const proxyUrl = agentSettings?.webFetchPolicy?.proxyUrl;
+	const proxySummary = summarizeWebFetchProxyPolicy(agentSettings?.webFetchPolicy);
 
 	const displayValue =
-		proxyMode === "direct"
+		proxySummary.mode === "direct"
 			? t("proxyDirectConnection")
-			: proxyMode === "system"
+			: proxySummary.mode === "system"
 				? t("webFetchProxySystem")
-				: proxyUrl || t("webFetchProxyCustom");
+				: proxySummary.url || t("webFetchProxyCustom");
 
 	return (
 		<Card withBorder padding="md">
 			<Stack gap="xs">
 				<Group justify="space-between">
 					<Text fw={600}>{t("proxyWebFetchTitle")}</Text>
-					<Badge size="xs" color={proxyMode !== "direct" ? "green" : "gray"} variant="light">
-						{proxyMode !== "direct" ? t("proxyConfigured") : t("proxyNotConfigured")}
+					<Badge size="xs" color={proxySummary.configured ? "green" : "gray"} variant="light">
+						{proxySummary.configured ? t("proxyConfigured") : t("proxyNotConfigured")}
 					</Badge>
 				</Group>
 				<Text size="xs" c="dimmed">

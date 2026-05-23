@@ -393,7 +393,10 @@ func (m *Manager) Capabilities() map[string]any {
 	caps["dtachAvailable"] = dtachSupported && m.dtachAvailableNow()
 	caps["detachedReattach"] = dtachSupported && m.dtachAvailableNow()
 	caps["scrollbackReplay"] = true
+	caps["scrollbackReplayMode"] = "raw-capped-buffer"
 	caps["bufferStateReplay"] = true
+	caps["bufferStateMode"] = "raw-capped-buffer"
+	caps["xtermSerializedReplay"] = false
 	caps["maxSnapshotBytes"] = maxSnapshotBytes
 	caps["multiClientResizeMode"] = "last-input-client"
 	return caps
@@ -798,11 +801,14 @@ func (m *Manager) markOrphan(ctx context.Context, terminalID string) {
 }
 
 func (m *Manager) emitStatusPersistError(terminalID, status string, err error) {
+	reason := err.Error()
 	m.emit(terminalID, map[string]any{
 		"type":       "error",
 		"terminalId": terminalID,
 		"code":       "TERMINAL_STATUS_PERSIST_FAILED",
-		"message":    err.Error(),
+		"reason":     reason,
+		"error":      reason,
+		"message":    reason,
 		"status":     status,
 		"fallback":   true,
 		"fatal":      false,

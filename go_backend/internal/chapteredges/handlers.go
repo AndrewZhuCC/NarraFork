@@ -31,9 +31,26 @@ var manualEdgeTypes = map[string]bool{
 }
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
-	r.Get("/", httpx.Handler(h.list))
-	r.Post("/", httpx.Handler(h.create))
-	r.Delete("/{id}", httpx.Handler(h.delete))
+	r.Get("/", chapterEdgeHandler(h.list))
+	r.Post("/", chapterEdgeHandler(h.create))
+	r.Delete("/{id}", chapterEdgeHandler(h.delete))
+}
+
+func chapterEdgeHandler(fn httpx.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := fn(w, r); err != nil {
+			writeChapterEdgeError(w, err)
+		}
+	}
+}
+
+func writeChapterEdgeError(w http.ResponseWriter, err error) {
+	var appErr *httpx.AppError
+	if errors.As(err, &appErr) && appErr.Code == "VALIDATION_ERROR" {
+		httpx.WriteJSON(w, appErr.Status, map[string]any{"error": appErr.Message, "code": appErr.Code})
+		return
+	}
+	httpx.WriteError(w, err)
 }
 
 type Edge struct {

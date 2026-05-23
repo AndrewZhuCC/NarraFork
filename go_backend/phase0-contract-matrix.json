@@ -1,6 +1,6 @@
 {
 	"name": "go-backend-phase0-contract-matrix",
-	"updatedAt": "2026-05-18",
+	"updatedAt": "2026-05-20",
 	"scope": "Freeze TypeScript-owned DB compatibility mode and make Go unsupported/degraded behavior discoverable before users trigger side effects.",
 	"principles": [
 		{
@@ -25,13 +25,16 @@
 			"goBehavior": "Known unsupported or degraded features must be exposed through /api/health.capabilities, graph capabilities, or a route-specific capability payload so the frontend can hide or disable controls."
 		}
 	],
+	"fallbackShapeScope": "Route-level fallback/error payloads should expose reason/error/message; health capability metadata must at minimum expose reason when fallback or unsupported is advertised.",
 	"fallbackShape": {
 		"ok": false,
 		"code": "FEATURE_DISABLED",
 		"feature": "string",
 		"supported": false,
 		"fallback": true,
-		"reason": "string"
+		"reason": "string",
+		"error": "string",
+		"message": "string"
 	},
 	"apiRouteGroups": [
 		{
@@ -47,12 +50,20 @@
 				"content.projectRoutines.supported",
 				"content.projectSkills.supported",
 				"chapters.split.supported",
+				"chapters.containers.supported",
 				"narrator.browserSessions.supported",
 				"narrator.rollbackEditRegenerate.supported",
 				"fs.reveal.supported",
 				"vnet.supported",
+				"runtime.scan.supported",
+				"runtime.cached.supported",
+				"runtime.cleanup.containers.supported",
+				"runtime.cleanup.terminals.supported",
 				"update.manualOnly",
+				"gateway.webhook.supported",
 				"gateway.weixinQr.supported",
+				"storage.database.preview",
+				"storage.database.cleanupTargets.apiRequestDumps.supported",
 				"storage.cleanup.worktrees.supported",
 				"storage.cleanup.containers.supported",
 				"mcp.serverSettingsStorage.supported",
@@ -68,35 +79,138 @@
 			"method": "POST",
 			"path": "/api/chapters/{id}/split",
 			"tsSource": "server/routes/chapters.ts / TS split-at-commit domain semantics",
-			"goSource": "go_backend/internal/chapters/handlers.go",
-			"frontendConsumers": ["frontend/lib/api/chapters.ts"],
-			"phase0Status": "disabled",
+			"goSource": "go_backend/internal/chapters/handlers.go and go_backend/internal/graph/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/chapters.ts",
+				"frontend/components/chapter/ChapterSplitModal.tsx"
+			],
+			"phase0Status": "supported-with-compressed-ai-summary-fallback",
 			"capabilityKey": "chapters.split",
-			"fallbackCode": "FEATURE_DISABLED",
-			"sideEffectPolicy": "reject-before-mutation",
-			"tests": ["go_backend/internal/chapters/route_contract_test.go"]
+			"supportedModes": ["fresh", "full"],
+			"degradedModes": ["compressed"],
+			"knownFallbacks": ["chapters.split.compressedAISummary"],
+			"sideEffectPolicy": "split-at-commit mutations run only after route/auth/input validation; compressed inheritance exposes deterministic-summary fallback metadata",
+			"tests": [
+				"go_backend/internal/chapters/route_contract_test.go",
+				"go_backend/internal/graph/handlers_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "chapters.containers-runtime",
+			"paths": [
+				"/api/chapters/container-setup",
+				"/api/chapters/podman/status",
+				"/api/chapters/{id}/containers/*"
+			],
+			"tsSource": "server/routes/chapters.ts and container services",
+			"goSource": "go_backend/internal/chapters/handlers.go and go_backend/internal/chapters/container_runtime.go",
+			"frontendConsumers": [
+				"frontend/lib/api/chapters.ts",
+				"frontend/components/container/PodmanInstallModal.tsx"
+			],
+			"phase0Status": "supported-with-podman-runtime-fallback",
+			"capabilityKey": "chapters.containers",
+			"knownFallbacks": [
+				"chapters.containers.podmanMissing",
+				"chapters.containers.unsupportedPlatform"
+			],
+			"fallbackReasons": {
+				"chapters.containers.podmanMissing": "podman is not available; container runtime features will return explicit fallback responses",
+				"chapters.containers.unsupportedPlatform": "Container management is only supported on Linux in go_backend."
+			},
+			"sideEffectPolicy": "Podman setup/status routes are read-only; container mutations return explicit fallback before spawning Podman when runtime prerequisites are missing.",
+			"tests": ["go_backend/internal/chapters/container_runtime_test.go"]
 		},
 		{
 			"group": "vnet",
 			"paths": ["/api/vnet/*", "/ws/vnet"],
 			"tsSource": "server/routes/vnet.ts and server/websocket/vnet-ws.ts",
 			"goSource": "go_backend/internal/app/router.go and go_backend/internal/ws/hub.go",
-			"phase0Status": "disabled",
+			"phase0Status": "relay-supported-udp-rendezvous-disabled",
 			"capabilityKey": "vnet",
-			"fallbackCode": "VNET_DISABLED",
-			"sideEffectPolicy": "reject-before-runtime-start",
-			"tests": ["go_backend/internal/ws/heartbeat_vnet_test.go"]
+			"supportedMode": "relay",
+			"disabledFeatures": ["udpRendezvous"],
+			"sideEffectPolicy": "relay mode is supported with authenticated WS access, peer cleanup, message limits, and masked relay-token settings roundtrip; UDP rendezvous remains disabled",
+			"tests": [
+				"go_backend/internal/app/router_test.go",
+				"go_backend/internal/app/route_contract_test.go",
+				"go_backend/internal/ws/vnet_relay_test.go",
+				"go_backend/internal/vnet/relay_test.go",
+				"go_backend/internal/settings/handlers_test.go"
+			]
 		},
 		{
 			"group": "gateway.weixinQr",
 			"paths": ["/api/gateway/weixin/qr-start", "/api/gateway/weixin/qr-poll"],
 			"tsSource": "server/routes/gateway.ts",
 			"goSource": "go_backend/internal/systemroutes/handlers.go",
-			"frontendConsumers": ["frontend/components/settings/GatewaySection.tsx"],
+			"frontendConsumers": [
+				"frontend/lib/api/misc.ts",
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/settings/GatewaySection.tsx"
+			],
 			"phase0Status": "disabled",
 			"capabilityKey": "gateway.weixinQr",
 			"fallbackCode": "WEIXIN_QR_UNSUPPORTED",
-			"sideEffectPolicy": "reject-before-runtime-start"
+			"reason": "Weixin QR gateway runtime is not bundled in go_backend.",
+			"sideEffectPolicy": "reject-before-runtime-start",
+			"tests": [
+				"go_backend/internal/systemroutes/handlers_test.go",
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts"
+			]
+		},
+		{
+			"group": "gateway.status",
+			"paths": ["/api/gateway/status", "/api/gateway/reload"],
+			"tsSource": "server/routes/gateway.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/settings/GatewaySection.tsx"
+			],
+			"phase0Status": "webhook-compatible-with-persistent-runtime-fallback",
+			"capabilityKey": "gateway.webhook",
+			"knownFallbacks": ["gateway.persistentRuntimes", "gateway.webhook.runtimeUnavailable"],
+			"fallbackReasons": {
+				"gateway.persistentRuntimes": "Persistent gateway runtimes are not bundled in go_backend",
+				"gateway.webhook.runtimeUnavailable": "Gateway webhook narrator runtime is not attached in go_backend"
+			},
+			"sideEffectPolicy": "Gateway reload filters unsupported platforms before attempting runtime reload; status and reload fallback payloads expose reason/error/message diagnostics for UI gating.",
+			"tests": [
+				"go_backend/internal/systemroutes/handlers_test.go::TestGatewayStatusFallbackIsExplicitWithoutDegradation",
+				"go_backend/internal/systemroutes/handlers_test.go::TestGatewayReloadFallbackIsExplicit",
+				"frontend/hooks/usePlatform.test.ts"
+			]
+		},
+		{
+			"group": "ruler.flow",
+			"paths": [
+				"/api/projects/{projectId}/ruler",
+				"/api/projects/{projectId}/ruler/segment",
+				"/api/projects/{projectId}/ruler/fork",
+				"/api/projects/{projectId}/ruler/merge",
+				"/api/projects/{projectId}/ruler/abandon",
+				"/api/projects/{projectId}/ruler/rebase",
+				"/api/projects/{projectId}/ruler/rebase-resolve"
+			],
+			"tsSource": "server/routes/ruler.ts and frontend/components/ruler/*",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/hooks/useRuler.ts",
+				"frontend/components/ruler/RulerFlow.tsx",
+				"frontend/components/ruler/RulerContextMenus.tsx"
+			],
+			"phase0Status": "supported-with-explicit-mutation-capability-fallbacks",
+			"capabilityKey": "ruler.capabilities.mutations",
+			"knownFallbacks": [
+				"ruler.mutations.chapterServiceUnavailable",
+				"ruler.mutations.gitServiceUnavailable",
+				"ruler.read.gitLogDegraded"
+			],
+			"sideEffectPolicy": "Ruler read can degrade to empty or partial git-log overlays with explicit fallbacks; mutation controls advertise disabled reasons before the frontend triggers unsupported chapter/git side effects.",
+			"tests": ["go_backend/internal/misccompat/routes_test.go", "frontend/lib/api/misc.test.ts"]
 		},
 		{
 			"group": "storage.cleanup",
@@ -104,8 +218,11 @@
 			"path": "/api/storage/cleanup",
 			"tsSource": "server/routes/storage.ts",
 			"goSource": "go_backend/internal/misccompat/handlers.go",
-			"frontendConsumers": ["frontend/components/settings/StorageSection.tsx"],
-			"phase0Status": "partial",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/settings/StorageSection.tsx"
+			],
+			"phase0Status": "partial-with-explicit-capability-fallbacks",
 			"supportedTargets": ["uploads", "shares"],
 			"disabledTargets": ["worktrees", "containers"],
 			"capabilityKeys": ["storage.cleanup.worktrees", "storage.cleanup.containers"],
@@ -113,21 +230,189 @@
 				"STORAGE_CLEANUP_WORKTREES_UNSUPPORTED",
 				"STORAGE_CLEANUP_CONTAINERS_UNSUPPORTED"
 			],
-			"sideEffectPolicy": "unsupported targets reject before cleanup"
+			"fallbackReasons": {
+				"worktrees": "Go storage cleanup does not remove git worktrees; StorageSection reroutes to runtime cleanup only when runtime.cleanup.worktrees is explicitly supported.",
+				"containers": "Go storage cleanup does not run podman prune; StorageSection keeps storage cleanup disabled even when runtime container cleanup exists."
+			},
+			"frontendConsumerPolicy": "StorageSection shows structured error.message values for cleanup failures; usePlatform reroutes worktrees to runtime cleanup only with explicit runtime support and keeps container storage cleanup disabled.",
+			"sideEffectPolicy": "unsupported targets reject before cleanup and are also advertised through capabilities so the frontend avoids unsafe storage-side git/container deletion.",
+			"tests": [
+				"go_backend/internal/misccompat/routes_test.go::TestStorageCleanupUnsupportedTargetsDoNotFakeSuccess",
+				"frontend/hooks/usePlatform.test.ts::getStorageCleanupOperationCapabilities",
+				"frontend/lib/api/misc.test.ts"
+			]
+		},
+		{
+			"group": "storage.database-diagnostics",
+			"paths": [
+				"/api/storage/database",
+				"/api/storage/database/preview",
+				"/api/storage/database/cleanup",
+				"/api/storage/database/vacuum"
+			],
+			"tsSource": "server/routes/storage.ts",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/types.ts",
+				"frontend/components/settings/StorageSection.tsx"
+			],
+			"phase0Status": "supported-with-degraded-diagnostics",
+			"capabilityKeys": ["storage.database.preview", "storage.database.cleanupTargets"],
+			"knownFallbacks": [
+				"storage.database.tableRowCountFailed",
+				"storage.database.cleanupPreviewFailed",
+				"storage.database.cleanupSampleFailed",
+				"storage.database.vacuumDisabled"
+			],
+			"frontendConsumerPolicy": "StorageSection shows structured error.message values for database preview/cleanup failures instead of generic labels.",
+			"fallbackReasons": {
+				"storage.database.tableRowCountFailed": "A per-table row count query failed; the summary remains available with degraded diagnostics.",
+				"storage.database.cleanupPreviewFailed": "A cleanup preview query failed; the preview returns safe zero counts with fallback diagnostics.",
+				"storage.database.cleanupSampleFailed": "A cleanup sample query failed; the sample item carries fallback diagnostics instead of unsafe deletion metadata.",
+				"storage.database.vacuumDisabled": "Database vacuum is disabled in go_backend to avoid long blocking maintenance on the main runtime."
+			},
+			"sideEffectPolicy": "Preview and summary degrade to safe diagnostics; cleanup and vacuum avoid destructive or long-running work unless explicitly supported.",
+			"tests": ["go_backend/internal/misccompat/routes_test.go"]
+		},
+		{
+			"group": "notifications.webhook-test",
+			"method": "POST",
+			"paths": ["/api/notifications/test-dingtalk", "/api/notifications/test-feishu"],
+			"tsSource": "server/routes/notifications.ts",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/misc.ts",
+				"frontend/components/settings/NotificationSection.tsx"
+			],
+			"phase0Status": "supported-with-structured-upstream-failure-diagnostics",
+			"failureCodes": [
+				"NOTIFICATION_DINGTALK_WEBHOOK_FAILED",
+				"NOTIFICATION_FEISHU_WEBHOOK_FAILED"
+			],
+			"diagnosticFields": ["code", "reason", "error", "message"],
+			"frontendConsumerPolicy": "NotificationSection prefers message/reason/error/code for ok:false responses and ApiError.message from non-2xx structured bodies.",
+			"sideEffectPolicy": "Webhook tests send one provider request only; upstream failures return HTTP 502 with structured diagnostics and do not fake success.",
+			"tests": [
+				"go_backend/internal/misccompat/routes_test.go::TestNotificationWebhookFailuresReturnDiagnostics",
+				"frontend/lib/api/misc.test.ts"
+			]
+		},
+		{
+			"group": "projects.create.stream",
+			"method": "POST",
+			"path": "/api/projects",
+			"tsSource": "server/routes/projects.ts",
+			"goSource": "go_backend/internal/projects/handlers.go",
+			"frontendConsumers": ["frontend/hooks/useProjects.ts", "frontend/routes/projects/index.tsx"],
+			"phase0Status": "supported-with-stream-and-auth-diagnostics",
+			"fallbackCodes": ["UNAUTHORIZED"],
+			"frontendConsumerPolicy": "useCreateProjectStream surfaces ApiError.message from auth failures and SSE error events instead of generic labels.",
+			"sideEffectPolicy": "Clone mode streams progress and may require credential retries; unauthenticated access returns structured 401 JSON before the stream begins.",
+			"tests": [
+				"go_backend/internal/app/route_contract_test.go::TestProjectCreateRouteAuthBoundaryReturnsStructuredUnauthorized",
+				"frontend/lib/api/projects.test.ts"
+			]
+		},
+		{
+			"group": "uploads.media",
+			"paths": ["/api/auth/me/avatar", "/api/notification-sounds"],
+			"tsSource": "server/routes/auth.ts / server/routes/notification-sounds.ts",
+			"goSource": "go_backend/internal/auth/handlers.go and go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/auth.ts",
+				"frontend/lib/api/misc.ts",
+				"frontend/hooks/useAvatarBlobUrl.ts",
+				"frontend/lib/notification-sound.ts",
+				"frontend/components/narrator/MessageBubble.tsx",
+				"frontend/components/settings/ProfileSection.tsx",
+				"frontend/components/settings/NotificationSection.tsx"
+			],
+			"phase0Status": "supported-with-structured-upload-diagnostics",
+			"fallbackCodes": ["UNAUTHORIZED", "BAD_REQUEST"],
+			"frontendConsumerPolicy": "uploadAvatar and uploadNotificationSound surface structured upload errors and preserve them on ApiError.data; avatar blob loading, message image previews, and custom sound playback are background media fetches that clear stale auth tokens on 401 before falling back silently.",
+			"sideEffectPolicy": "Avatar upload, avatar blob loading, and message image previews clear stale auth tokens on 401; notification sound upload validates multipart payloads and custom sound playback also clears stale auth tokens on 401 before falling back silently.",
+			"tests": [
+				"go_backend/internal/app/route_contract_test.go::TestAvatarUploadRouteAuthBoundaryReturnsStructuredUnauthorized",
+				"go_backend/internal/misccompat/routes_test.go::TestNotificationSoundUploadRejectsMissingFileWithBadRequest",
+				"frontend/hooks/useAvatarBlobUrl.test.ts",
+				"frontend/lib/api/uploads.test.ts",
+				"frontend/lib/notification-sound.test.ts"
+			]
+		},
+		{
+			"group": "update.download",
+			"method": "POST",
+			"path": "/api/update/download",
+			"tsSource": "server/routes/update.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": [
+				"frontend/hooks/useUpdateCheck.ts",
+				"frontend/components/UpdateModal.tsx"
+			],
+			"phase0Status": "supported-with-structured-stream-diagnostics",
+			"fallbackCodes": ["UPDATE_DOWNLOAD_FAILED"],
+			"frontendConsumerPolicy": "useUpdateCheck preserves structured update download failures in its result/progress state while deriving UI messages from the structured payload so status-only errors never reach the UI.",
+			"sideEffectPolicy": "Download streams progress as SSE and terminal failures emit structured diagnostics before cleanup; non-OK preflight responses are parsed as JSON errors.",
+			"tests": [
+				"go_backend/internal/systemroutes/update_contract_test.go::TestUpdateDownloadWithoutTrustedSourceReturnsTerminalErrorSSE",
+				"frontend/hooks/useUpdateCheck.test.ts",
+				"frontend/lib/api/client.test.ts"
+			]
 		},
 		{
 			"group": "update.apply",
 			"method": "POST",
 			"path": "/api/update/apply",
 			"tsSource": "server/routes/update.ts",
-			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"goSource": "go_backend/internal/systemroutes/handlers.go and go_backend/internal/systemroutes/update_apply.go",
 			"frontendConsumers": [
 				"frontend/components/UpdateModal.tsx",
 				"frontend/hooks/useUpdateCheck.ts"
 			],
-			"phase0Status": "manual-only-fallback",
-			"capabilityKey": "update.manualOnly",
-			"sideEffectPolicy": "do not auto-restart from Go backend"
+			"phase0Status": "conditional-auto-apply-with-manual-fallback",
+			"capabilityKeys": ["update.manualOnly", "update.canAutoRestart", "update.apply.supported"],
+			"autoApplyRequires": [
+				"configured restart handoff manager",
+				"regular current executable",
+				"trusted downloaded artifact with SHA512"
+			],
+			"fallbackCode": "FEATURE_DISABLED",
+			"reason": "Automatic self-update requires a configured restart handoff manager and a regular current executable.",
+			"sideEffectPolicy": "without auto-apply prerequisites Go exposes manual instructions and does not restart; with prerequisites it starts a replacement process through graceful restart handoff",
+			"tests": [
+				"go_backend/internal/systemroutes/update_apply_test.go",
+				"go_backend/internal/systemroutes/update_contract_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
+			"group": "runtime.scan",
+			"paths": ["/api/runtime/scan", "/api/runtime/cached", "/api/runtime/cleanup"],
+			"tsSource": "server/routes/runtime.ts / terminal/container/browser runtime services",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/types.ts",
+				"frontend/components/settings/RuntimeSection.tsx"
+			],
+			"phase0Status": "supported-with-degraded-diagnostics",
+			"capabilityKeys": ["runtime.scan", "runtime.cached", "runtime.cleanup"],
+			"knownFallbacks": [
+				"runtime.scan.terminals.degraded",
+				"runtime.scan.containers.podmanUnavailable",
+				"runtime.cleanup.containers.dryRunOrUnsupported"
+			],
+			"fallbackReasons": {
+				"runtime.scan.terminals.degraded": "Terminal runtime state queries can degrade when the persisted terminal schema is incomplete.",
+				"runtime.scan.containers.podmanUnavailable": "podman is not available; runtime scan uses persisted/non-container state only",
+				"runtime.cleanup.containers.dryRunOrUnsupported": "Container cleanup is limited to safe stop-running-db-records semantics in go_backend."
+			},
+			"frontendConsumerPolicy": "RuntimeSection shows structured error.message values from scan and cleanup failures instead of generic labels.",
+			"sideEffectPolicy": "Runtime scan is read-only and surfaces degraded diagnostics; cleanup targets are gated by health capabilities and per-target safe semantics.",
+			"tests": [
+				"go_backend/internal/systemroutes/handlers_test.go",
+				"frontend/hooks/usePlatform.test.ts",
+				"frontend/lib/api/misc.test.ts"
+			]
 		},
 		{
 			"group": "mcp.serverSettingsStorage",
@@ -142,10 +427,17 @@
 			"group": "mcp.externalToolsInjection",
 			"tsSource": "server/lib/mcp/tool-bridge.ts",
 			"goSource": "go_backend/internal/agentbasic/tool_inventory.go and go_backend/internal/mcpcompat/handlers.go",
-			"phase0Status": "disabled",
+			"phase0Status": "stdio-partial-agent-injection-supported",
 			"capabilityKey": "mcp.externalToolsInjection",
-			"fallbackCode": "FEATURE_DISABLED",
-			"sideEffectPolicy": "do not expose external MCP tools as executable provider tools until bridge is implemented"
+			"supportedTargets": ["stdio"],
+			"disabledTargets": ["sse", "streamable-http"],
+			"fallbackCodes": ["FEATURE_DISABLED"],
+			"sideEffectPolicy": "only connected stdio MCP tools are executable provider tools; SSE and streamable HTTP MCP servers remain metadata-only until a real bridge exists",
+			"tests": [
+				"go_backend/internal/mcpcompat/handlers_test.go",
+				"go_backend/internal/agentbasic/tool_inventory_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
 		},
 		{
 			"group": "project-content",
@@ -162,10 +454,36 @@
 			"path": "/api/fs/reveal",
 			"tsSource": "server/routes/fs.ts",
 			"goSource": "go_backend/internal/fs/handlers.go",
-			"phase0Status": "platform-dependent-fallback",
+			"phase0Status": "supported-on-windows-macos-linux-with-platform-fallback",
 			"capabilityKey": "fs.reveal",
+			"supportedPlatforms": ["windows", "macos", "linux"],
+			"linuxMode": "xdg-open",
 			"fallbackCode": "FS_REVEAL_UNSUPPORTED",
-			"sideEffectPolicy": "Linux rejects before spawning a file-manager process"
+			"reason": "Opening the system file manager is not supported on this platform by go_backend.",
+			"sideEffectPolicy": "unsupported platforms reject before spawning a file-manager process; Linux uses xdg-open when available"
+		},
+		{
+			"group": "fs.preview",
+			"method": "GET",
+			"path": "/api/fs/preview",
+			"tsSource": "server/routes/fs.ts",
+			"goSource": "go_backend/internal/fs/handlers.go",
+			"frontendConsumers": [
+				"frontend/components/narrator/ToolCallCard.tsx",
+				"frontend/components/narrator/MessageBubble.tsx",
+				"frontend/components/narrator/image-clipboard.ts",
+				"frontend/components/narrator/pixi/pixi-image-textures.ts"
+			],
+			"phase0Status": "supported-with-bounded-preview-diagnostics",
+			"capabilityKey": "fs.preview",
+			"knownErrors": ["fs.preview.tooLarge"],
+			"sideEffectPolicy": "Preview is read-only and enforces text/binary size caps before streaming file content; too-large responses expose code/reason/error/message plus size/maxBytes diagnostics.",
+			"frontendConsumerPolicy": "ToolCallCard, MessageBubble, image clipboard copy, and Pixi image texture direct fetches read structured preview error bodies and preserve them on ApiError.data instead of dropping them to statusText or message-only errors.",
+			"tests": [
+				"go_backend/internal/fs/handlers_test.go::TestPreviewUsesTextSizeLimitAndInlineHeaders",
+				"frontend/lib/api/client.test.ts",
+				"frontend/components/narrator/image-clipboard.test.ts"
+			]
 		},
 		{
 			"group": "provider-runtime",
@@ -182,17 +500,192 @@
 			"goSource": "go_backend/internal/systemroutes/handlers.go and go_backend/internal/agentbasic/provider_*.go",
 			"phase0Status": "partial-by-provider",
 			"capabilityKey": "providers",
-			"knownFallbacks": ["providers.openai.quota", "providers.anthropic.quota"],
-			"sideEffectPolicy": "Unsupported provider subfeatures must be hidden or return explicit fallback; implemented auth/model/quota routes must not leak secrets."
+			"knownFallbacks": [
+				"providers.openai.quota",
+				"providers.anthropic.quota",
+				"providers.codex.managerParity",
+				"providers.kiro.pluginBridge"
+			],
+			"fallbackReasons": {
+				"providers.openai.quota": "OpenAI-compatible quota inspection is not available in go_backend.",
+				"providers.anthropic.quota": "Anthropic quota inspection is not available in go_backend.",
+				"providers.codex.managerParity": "Go exposes Codex compatibility routes/runtime but not the full TS CodexManager scheduler/usage queue semantics.",
+				"providers.kiro.pluginBridge": "Kiro plugin bridge is available only when the external Bun bridge/plugin environment is present."
+			},
+			"sideEffectPolicy": "Unsupported provider subfeatures must be hidden or return explicit fallback; implemented auth/model/quota routes must not leak secrets.",
+			"tests": [
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/lib/api/narrators.test.ts",
+				"frontend/lib/api/streams.test.ts"
+			]
 		},
 		{
 			"group": "benchmark.containerExecution",
 			"tsSource": "server/services/benchmark-container.ts",
 			"goSource": "go_backend/internal/systemroutes/benchmark_execution.go",
-			"phase0Status": "disabled",
+			"phase0Status": "supported-with-resource-limits",
 			"capabilityKey": "benchmark.containerExecution",
-			"fallbackCode": "FEATURE_DISABLED",
-			"sideEffectPolicy": "do not start Podman benchmark containers from Go backend"
+			"fallbackCode": null,
+			"sideEffectPolicy": "Go benchmark container execution is supported only through the benchmark runtime with Podman resource limits, task timeouts, bounded output, and health capability advertising.",
+			"tests": [
+				"go_backend/internal/app/route_contract_test.go",
+				"go_backend/internal/systemroutes/benchmark_execution_test.go"
+			]
+		},
+		{
+			"group": "benchmark.results",
+			"paths": [
+				"/api/benchmarks/runs/{id}/results",
+				"/api/benchmarks/runs/{id}/summary",
+				"/api/benchmarks/compare"
+			],
+			"tsSource": "server/routes/benchmarks.ts",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"phase0Status": "supported-with-admin-boundary-and-validation-diagnostics",
+			"knownErrors": [
+				"benchmark.compare.runIdsRequired",
+				"benchmark.compare.minRunsRequired",
+				"benchmark.compare.summaryFailed"
+			],
+			"sideEffectPolicy": "Benchmark result/summary/compare routes are read-only and admin-gated; compare validation failures expose ok:false plus code/reason/error/message diagnostics.",
+			"tests": [
+				"go_backend/internal/systemroutes/handlers_test.go::TestBenchmarkCompareValidationReturnsDiagnostics",
+				"go_backend/internal/systemroutes/handlers_test.go::TestBenchmarkResultRoutesRequireAdminBoundary"
+			]
+		},
+		{
+			"group": "usage-history.admin",
+			"paths": [
+				"/api/usage-history",
+				"/api/usage-history/providers",
+				"/api/usage-history/stats",
+				"/api/usage-history/timeseries",
+				"/api/usage-history/{id}"
+			],
+			"tsSource": "frontend/lib/usage-history-api.ts and frontend/routes/settings/usage.tsx",
+			"goSource": "go_backend/internal/systemroutes/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/usage-history-api.ts",
+				"frontend/components/usage-history/UsageHistoryTable.tsx",
+				"frontend/routes/settings/usage.tsx"
+			],
+			"phase0Status": "supported-with-admin-error-visibility",
+			"capabilityKey": "usageHistory.admin",
+			"sideEffectPolicy": "Usage-history routes are admin-only and read-only; structured errors from Go admin handlers are read by usageHistoryApi and preserved on ApiError.data instead of being collapsed to HTTP status text or message-only errors.",
+			"tests": [
+				"go_backend/internal/systemroutes/handlers_test.go::TestUsageHistoryStatsReturnsSummaryQueryErrors",
+				"frontend/lib/usage-history-api.test.ts"
+			]
+		},
+		{
+			"group": "storage.scan",
+			"paths": ["/api/storage/scan"],
+			"tsSource": "server/routes/storage.ts and frontend/lib/api/streams.ts",
+			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/components/settings/StorageSection.tsx",
+				"frontend/lib/api/streams.ts"
+			],
+			"phase0Status": "supported-with-sse-progress-events",
+			"capabilityKey": "storage.scan",
+			"sideEffectPolicy": "Storage scan is read-only SSE reporting; progress/category/complete events are consumed by StorageSection and any admin errors must remain structured enough for the UI to surface them.",
+			"tests": [
+				"go_backend/internal/misccompat/routes_test.go::TestStorageCachedReturnsLastCompletedScan",
+				"frontend/lib/api/streams.test.ts"
+			]
+		},
+		{
+			"group": "narrator.messages",
+			"paths": ["/api/narrators/{id}/messages"],
+			"tsSource": "frontend/lib/api/narrators.ts and frontend/components/narrator/NarratorPanel.tsx",
+			"goSource": "go_backend/internal/narrators/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/narrators.ts",
+				"frontend/components/narrator/NarratorPanel.tsx"
+			],
+			"phase0Status": "supported-with-structured-send-errors",
+			"capabilityKey": "narrator.messages",
+			"sideEffectPolicy": "Narrator message send is user-facing and can buffer or reject; structured Go error bodies are read by sendNarratorMessage and preserved on ApiError.data instead of falling back to statusText or message-only errors, and buffered storage fallback paths keep the same diagnostics contract.",
+			"tests": [
+				"go_backend/internal/narrators/handlers_buffer_test.go::TestPostMessageBuffersWorkingNarratorWithPriority",
+				"go_backend/internal/narrators/handlers_buffer_test.go::TestPostMessageBufferedStorageMissingReturnsReasonedFallback",
+				"frontend/lib/api/narrators.test.ts"
+			]
+		},
+		{
+			"group": "narrator.browser-sessions",
+			"paths": [
+				"/api/narrators/{id}/browser-sessions",
+				"/api/narrators/{id}/browser-sessions/{sessionId}/screenshot",
+				"/api/narrators/{id}/browser-sessions/{sessionId}/ttl",
+				"/api/narrators/{id}/browser-sessions/{sessionId}/stop-tracing"
+			],
+			"tsSource": "server/routes/narrators.ts and server/lib/browser/*",
+			"goSource": "go_backend/internal/narrators/handlers.go and go_backend/internal/narrators/browser_sessions.go",
+			"frontendConsumers": ["frontend/components/narrator/BrowserSessionBar.tsx"],
+			"phase0Status": "supported-with-persisted-session-fallbacks",
+			"capabilityKey": "narrator.browserSessions",
+			"sideEffectPolicy": "Go persists browser-session snapshots and screenshot blobs in DB; screenshot fetch failures use standard structured HTTP errors and BrowserSessionBar preserves them on ApiError.data instead of collapsing to HTTP status text.",
+			"tests": [
+				"go_backend/internal/narrators/route_contract_test.go::TestBrowserSessionActionsManagePersistedFallbackRows",
+				"go_backend/internal/narrators/route_contract_test.go::TestBrowserSessionActionsExposeFeatureDisabledFallbackWithoutStorageTable",
+				"go_backend/internal/narrators/browser_sessions_test.go"
+			]
+		},
+		{
+			"group": "narrator.compact",
+			"paths": [
+				"/api/narrators/{id}/compact",
+				"/api/narrators/{id}/segment-compact",
+				"/api/narrators/{id}/segment-compact/{messageId}",
+				"/api/narrators/{id}/segment-compact/{messageId}/messages"
+			],
+			"tsSource": "server/routes/narrators.ts and server/services/narrator-context.ts",
+			"goSource": "go_backend/internal/narrators/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/narrators.ts",
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/narrator/NarratorPanel.tsx"
+			],
+			"phase0Status": "supported-with-deterministic-summary-fallback",
+			"capabilityKey": "narrator.compact",
+			"knownFallbacks": ["narrator.compact.fallbackSummary"],
+			"fallbackReasons": {
+				"narrator.compact.fallbackSummary": "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs."
+			},
+			"sideEffectPolicy": "Compact and segment-compact persist marker messages and clear conversation/prune state; when caller summary is absent, responses include fallbackSummary:true plus fallbackReason so the frontend can distinguish deterministic Go fallback summaries from model-generated summaries.",
+			"tests": ["go_backend/internal/narrators/handlers_compact_test.go"]
+		},
+		{
+			"group": "narrator.subagents-runtime",
+			"paths": [
+				"/api/narrators/{id}/detach",
+				"/api/narrators/{id}/attach",
+				"/api/narrators/{id}/update-conclusion"
+			],
+			"tsSource": "server/routes/narrators.ts and server/services/narrator-subagent.ts",
+			"goSource": "go_backend/internal/narrators/handlers.go and go_backend/internal/narrators/service.go",
+			"phase0Status": "supported-with-explicit-reattach-and-manual-override-fallbacks",
+			"capabilityKey": "narrator.subagents",
+			"knownFallbacks": [
+				"narrator.subagents.reattachFallback",
+				"narrator.subagents.manualOverrideConclusionFallback",
+				"narrator.subagents.teamStatusUnsupportedAction",
+				"narrator.subagents.awaitUnsupportedType"
+			],
+			"fallbackReasons": {
+				"narrator.subagents.reattachFallback": "Go can detach and open subagent sessions, but cannot re-block an already-running parent tool promise after reattach.",
+				"narrator.subagents.manualOverrideConclusionFallback": "Go backend updated the parent tool call conclusion when present; in-memory manual override waiters are not implemented, so any manual override is cleared as a fallback rather than resuming a blocked parent promise.",
+				"narrator.subagents.teamStatusUnsupportedAction": "Go backend TeamStatus currently supports action=list, file_changes, broadcast, and send.",
+				"narrator.subagents.awaitUnsupportedType": "Go backend Await currently supports type=agent only."
+			},
+			"sideEffectPolicy": "Subagent detach/attach/update-conclusion mutate only DB state and tool-call conclusions; any TS in-memory waiter parity gap, unsupported TeamStatus action, or unsupported Await task type is surfaced with fallback:true and reason/error/message diagnostics. Agent/Send/Await/TeamStatus validation errors and file_changes target misses are non-fallback tool diagnostics but still expose code/reason/error/message for stable consumers.",
+			"tests": [
+				"go_backend/internal/narrators/background_task_events_test.go",
+				"go_backend/internal/narrators/subagent_message_tree_test.go::TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree",
+				"go_backend/internal/narrators/agent_event_integration_test.go::TestUpdateSubagentConclusionUpdatesParentToolCallWithFallback",
+				"go_backend/internal/app/route_contract_test.go"
+			]
 		},
 		{
 			"group": "narrator.rollback-edit-regenerate",
@@ -213,7 +706,8 @@
 			"group": "narrator-ws-p0",
 			"tsSource": "server/websocket/narrator-ws-types.ts and frontend/hooks/useNarratorWS.ts",
 			"goSource": "go_backend/internal/ws/hub.go",
-			"phase0Status": "matrix-only",
+			"phase0Status": "supported-baseline-with-phase2-contract-tests",
+			"capabilityKey": "narrator.wsEvents.p0",
 			"phase2RequiredEvents": [
 				"message",
 				"user_message",
@@ -230,15 +724,35 @@
 				"full_reload",
 				"streaming_snapshot"
 			],
-			"tests": ["go_backend/internal/ws/frontend_contract_smoke_test.go"]
+			"tests": [
+				"go_backend/internal/ws/frontend_contract_smoke_test.go",
+				"go_backend/internal/ws/hub_test.go",
+				"go_backend/internal/ws/hub_narrator_events_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
 		},
 		{
 			"group": "terminal-ws",
 			"tsSource": "server/websocket/terminal-ws.ts and frontend/hooks/useTerminalWS.ts",
-			"goSource": "go_backend/internal/ws/hub.go",
-			"phase0Status": "partial",
+			"goSource": "go_backend/internal/ws/hub.go and go_backend/internal/terminalruntime/manager.go",
+			"phase0Status": "supported-with-runtime-degradations",
 			"capabilityKey": "terminal.supported",
-			"tests": ["go_backend/internal/ws/frontend_contract_smoke_test.go"]
+			"supportedEvents": [
+				"subscribe",
+				"create",
+				"input",
+				"resize",
+				"kill",
+				"rename",
+				"scrollback",
+				"bufferState"
+			],
+			"knownFallbacks": ["terminal.xtermSerializedReplay", "terminal.dtachAvailable"],
+			"tests": [
+				"go_backend/internal/ws/frontend_contract_smoke_test.go",
+				"go_backend/internal/ws/hub_terminal_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
 		}
 	],
 	"phaseExitCriteria": [

@@ -1091,6 +1091,8 @@ func (h *Handler) segmentCompactRefs(ctx context.Context, narratorID string, mes
 	return refs, rows.Err()
 }
 
+const compactFallbackSummaryReason = "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs."
+
 func (h *Handler) buildSummaryFromRefs(ctx context.Context, refs []map[string]any, fallback string) (string, error) {
 	parts := []string{}
 	for _, ref := range refs {
@@ -1210,7 +1212,11 @@ func (h *Handler) segmentCompact(w http.ResponseWriter, r *http.Request) error {
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "message", "message": msg})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "segment_compact_hide", "hiddenMessageIds": ids})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "compact_done", "isSegment": true, "mode": "blocking"})
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg, "summary": summary, "messageCount": len(ids), "fallbackSummary": body.Summary == ""})
+	payload := map[string]any{"ok": true, "message": msg, "summary": summary, "messageCount": len(ids), "fallbackSummary": body.Summary == ""}
+	if body.Summary == "" {
+		payload["fallbackReason"] = compactFallbackSummaryReason
+	}
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
@@ -1543,12 +1549,15 @@ func (h *Handler) patches(w http.ResponseWriter, r *http.Request) error {
 	} else if ok {
 		return h.writeLegacyPatches(w, r, narratorID)
 	}
+	reason := "No narrator patch or snapshot storage table is available in this database"
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"patches":   []any{},
 		"snapshots": []any{},
 		"fallback":  true,
 		"supported": false,
-		"reason":    "No narrator patch or snapshot storage table is available in this database",
+		"reason":    reason,
+		"error":     reason,
+		"message":   reason,
 	})
 	return nil
 }
@@ -2340,6 +2349,9 @@ func (h *Handler) promoteNarrator(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
+	if h.Service.Hub != nil {
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "permission_mode_changed", "narratorId": narratorID, "permissionMode": "default"})
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"type": "unlocked", "narrator": updated})
 	return nil
 }
@@ -2740,7 +2752,11 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) error {
 	}
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "message", "message": msg})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "compact_done", "mode": "blocking"})
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "message": msg, "summary": summary, "fallbackSummary": body.Summary == ""})
+	payload := map[string]any{"ok": true, "message": msg, "summary": summary, "fallbackSummary": body.Summary == ""}
+	if body.Summary == "" {
+		payload["fallbackReason"] = compactFallbackSummaryReason
+	}
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
@@ -2843,11 +2859,7 @@ func (h *Handler) setPlanMode(enabled bool) httpx.HandlerFunc {
 }
 
 func (h *Handler) deleteNarrator(w http.ResponseWriter, r *http.Request) error {
-	_, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrators WHERE id = ?`, chi.URLParam(r, "id"))
-	if err != nil {
-		return err
-	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	httpx.WriteFeatureDisabled(w, "narrators.delete", "Safe narrator deletion semantics are not implemented in go_backend yet; use the Bun backend or the database cleanup preview path until recursive shared-message cleanup is available.")
 	return nil
 }
 
@@ -2948,7 +2960,8 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 		buffered, err := h.Service.BufferUserMessage(r.Context(), narratorID, userID, finalMessage, contentBlocks, payload.Priority)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "no such table") {
-				httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"ok": false, "queued": false, "fallback": true, "status": "busy", "reason": "narrator is busy and buffered message storage is unavailable"})
+				reason := "narrator is busy and buffered message storage is unavailable"
+				httpx.WriteJSON(w, http.StatusAccepted, map[string]any{"ok": false, "queued": false, "fallback": true, "status": "busy", "reason": reason, "error": reason, "message": reason})
 				return nil
 			}
 			return err
@@ -3028,9 +3041,13 @@ func (h *Handler) updateTitle(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	title := firstString(stringValue(body["title"]), stringValue(body["name"]))
-	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "title", nullableString(title))
+	narratorID := chi.URLParam(r, "id")
+	n, err := h.Service.UpdateTextField(r.Context(), narratorID, "title", nullableString(title))
 	if err != nil {
 		return err
+	}
+	if h.Service.Hub != nil {
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "title_updated", "narratorId": narratorID, "title": title})
 	}
 	httpx.WriteJSON(w, http.StatusOK, n)
 	return nil
@@ -3060,9 +3077,13 @@ func (h *Handler) updatePermissionMode(w http.ResponseWriter, r *http.Request) e
 	if !ok {
 		return httpx.BadRequest("permissionMode must be one of default, acceptEdits, bypassPermissions, readOnly, or dontAsk")
 	}
-	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "permission_mode", normalized)
+	narratorID := chi.URLParam(r, "id")
+	n, err := h.Service.UpdateTextField(r.Context(), narratorID, "permission_mode", normalized)
 	if err != nil {
 		return err
+	}
+	if h.Service.Hub != nil {
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "permission_mode_changed", "narratorId": narratorID, "permissionMode": normalized})
 	}
 	httpx.WriteJSON(w, http.StatusOK, n)
 	return nil
@@ -5107,12 +5128,17 @@ func (h *Handler) updateBool(column, jsonKey string) httpx.HandlerFunc {
 			return err
 		}
 		value := 0
-		if body[jsonKey] == true {
+		boolValue := body[jsonKey] == true
+		if boolValue {
 			value = 1
 		}
-		_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET `+column+` = ?, updated_at = ? WHERE id = ?`, value, db.NowISO(), chi.URLParam(r, "id"))
+		narratorID := chi.URLParam(r, "id")
+		_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET `+column+` = ?, updated_at = ? WHERE id = ?`, value, db.NowISO(), narratorID)
 		if err != nil {
 			return err
+		}
+		if h.Service.Hub != nil && jsonKey == "relaxedPlan" {
+			h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "relaxed_plan_changed", "narratorId": narratorID, "relaxedPlan": boolValue})
 		}
 		return h.ok(w, r)
 	}
@@ -5122,9 +5148,20 @@ func (h *Handler) updateReflectionOverrides(w http.ResponseWriter, r *http.Reque
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET plan_reflection_auto_approve_override = COALESCE(?, plan_reflection_auto_approve_override), danger_reflection_override = COALESCE(?, danger_reflection_override), updated_at = ? WHERE id = ?`, body["planReflectionAutoApproveOverride"], body["dangerReflectionOverride"], db.NowISO(), chi.URLParam(r, "id"))
+	narratorID := chi.URLParam(r, "id")
+	_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET plan_reflection_auto_approve_override = COALESCE(?, plan_reflection_auto_approve_override), danger_reflection_override = COALESCE(?, danger_reflection_override), updated_at = ? WHERE id = ?`, body["planReflectionAutoApproveOverride"], body["dangerReflectionOverride"], db.NowISO(), narratorID)
 	if err != nil {
 		return err
+	}
+	if h.Service.Hub != nil {
+		payload := map[string]any{"type": "reflection_overrides_changed", "narratorId": narratorID}
+		if _, ok := body["planReflectionAutoApproveOverride"]; ok {
+			payload["planReflectionAutoApproveOverride"] = body["planReflectionAutoApproveOverride"]
+		}
+		if _, ok := body["dangerReflectionOverride"]; ok {
+			payload["dangerReflectionOverride"] = body["dangerReflectionOverride"]
+		}
+		h.Service.Hub.BroadcastNarrator(narratorID, payload)
 	}
 	return h.ok(w, r)
 }

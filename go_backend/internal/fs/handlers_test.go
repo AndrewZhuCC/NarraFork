@@ -95,18 +95,37 @@ func TestMkdirRejectsUnsafeNamesAndCreatesSingleDirectory(t *testing.T) {
 	}
 }
 
-func TestRevealValidatesPathAndDoesNotFakeSuccessOnUnsupportedPlatform(t *testing.T) {
+func TestRevealValidatesPathAndOpensSupportedPlatforms(t *testing.T) {
 	settings := loadFSTestSettings(t)
 	missing := filepath.Join(t.TempDir(), "missing")
 	w := serveFSRaw(t, settings, http.MethodPost, "/fs/reveal", `{"path":"`+missing+`"}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing reveal path should be rejected, got %d body=%s", w.Code, w.Body.String())
 	}
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		t.Skip("supported platforms would open the platform file manager")
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" && runtime.GOOS != "linux" {
+		t.Skip("unsupported platform should be tested separately")
 	}
 	dir := t.TempDir()
 	w = serveFSRaw(t, settings, http.MethodPost, "/fs/reveal", `{"path":"`+dir+`"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("supported reveal should succeed, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode reveal body: %v", err)
+	}
+	if body["ok"] != true || body["path"] != dir {
+		t.Fatalf("unexpected reveal success body: %#v", body)
+	}
+}
+
+func TestRevealUnsupportedPlatformReturnsFeatureDisabled(t *testing.T) {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" || runtime.GOOS == "linux" {
+		t.Skip("current platform now supports reveal")
+	}
+	settings := loadFSTestSettings(t)
+	dir := t.TempDir()
+	w := serveFSRaw(t, settings, http.MethodPost, "/fs/reveal", `{"path":"`+dir+`"}`)
 	if w.Code != http.StatusNotImplemented {
 		t.Fatalf("unsupported reveal should not fake success, got %d body=%s", w.Code, w.Body.String())
 	}
@@ -116,6 +135,10 @@ func TestRevealValidatesPathAndDoesNotFakeSuccessOnUnsupportedPlatform(t *testin
 	}
 	if body["ok"] != false || body["code"] != "FS_REVEAL_UNSUPPORTED" || body["supported"] != false || body["fallback"] != true {
 		t.Fatalf("unexpected reveal unsupported body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if reason != "Opening the system file manager is not supported on this platform by go_backend." || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("unsupported reveal should expose reason/error/message, got %#v", body)
 	}
 }
 
@@ -129,6 +152,14 @@ func TestPreviewUsesTextSizeLimitAndInlineHeaders(t *testing.T) {
 	w := serveFSRaw(t, settings, http.MethodGet, "/fs/preview?path="+largeText, "")
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("large text preview should be 413, got %d body=%s", w.Code, w.Body.String())
+	}
+	var tooLarge map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &tooLarge); err != nil {
+		t.Fatalf("decode too-large preview body: %v body=%s", err, w.Body.String())
+	}
+	reason, _ := tooLarge["reason"].(string)
+	if tooLarge["ok"] != false || tooLarge["code"] != "FS_PREVIEW_TOO_LARGE" || reason == "" || tooLarge["error"] != reason || tooLarge["message"] != reason || tooLarge["size"] != float64(maxTextPreview+1) || tooLarge["maxBytes"] != float64(maxTextPreview) {
+		t.Fatalf("large preview should expose bounded diagnostics, got %#v", tooLarge)
 	}
 	smallText := filepath.Join(dir, "small.log")
 	if err := os.WriteFile(smallText, []byte("hello"), 0o644); err != nil {

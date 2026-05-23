@@ -2,8 +2,10 @@ package narrators
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +16,146 @@ import (
 
 	"github.com/go-chi/chi/v5"
 )
+
+func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	cases := []struct {
+		name      string
+		method    string
+		path      string
+		body      string
+		eventType string
+		assert    func(t *testing.T, payload map[string]any)
+	}{
+		{
+			name:      "title",
+			method:    http.MethodPatch,
+			path:      "/narrators/" + narratorID + "/title",
+			body:      `{"title":"New Title"}`,
+			eventType: "title_updated",
+			assert: func(t *testing.T, payload map[string]any) {
+				t.Helper()
+				if payload["title"] != "New Title" {
+					t.Fatalf("unexpected title event: %#v", payload)
+				}
+			},
+		},
+		{
+			name:      "permission mode",
+			method:    http.MethodPatch,
+			path:      "/narrators/" + narratorID + "/permission-mode",
+			body:      `{"permissionMode":"readOnly"}`,
+			eventType: "permission_mode_changed",
+			assert: func(t *testing.T, payload map[string]any) {
+				t.Helper()
+				if payload["permissionMode"] != "readOnly" {
+					t.Fatalf("unexpected permission mode event: %#v", payload)
+				}
+			},
+		},
+		{
+			name:      "relaxed plan",
+			method:    http.MethodPatch,
+			path:      "/narrators/" + narratorID + "/relaxed-plan",
+			body:      `{"relaxedPlan":true}`,
+			eventType: "relaxed_plan_changed",
+			assert: func(t *testing.T, payload map[string]any) {
+				t.Helper()
+				if payload["relaxedPlan"] != true {
+					t.Fatalf("unexpected relaxed plan event: %#v", payload)
+				}
+			},
+		},
+		{
+			name:      "reflection overrides",
+			method:    http.MethodPatch,
+			path:      "/narrators/" + narratorID + "/reflection-overrides",
+			body:      `{"dangerReflectionOverride":"on"}`,
+			eventType: "reflection_overrides_changed",
+			assert: func(t *testing.T, payload map[string]any) {
+				t.Helper()
+				if payload["dangerReflectionOverride"] != "on" {
+					t.Fatalf("unexpected reflection override event: %#v", payload)
+				}
+				if _, ok := payload["planReflectionAutoApproveOverride"]; ok {
+					t.Fatalf("missing reflection override keys must not be broadcast as null: %#v", payload)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := serveNarratorHandlerWithService(service, req)
+			if w.Code < 200 || w.Code >= 300 {
+				t.Fatalf("expected success, got %d body=%s", w.Code, w.Body.String())
+			}
+			payload := findBroadcast(events(), narratorID, tc.eventType)
+			if payload == nil {
+				t.Fatalf("expected %s broadcast, got %#v", tc.eventType, events())
+			}
+			if payload["narratorId"] != narratorID {
+				t.Fatalf("event should include narratorId, got %#v", payload)
+			}
+			tc.assert(t, payload)
+		})
+	}
+}
+
+func TestPersistAgentErrorBroadcastsNarratorError(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	if err := service.persistAgentError(context.Background(), narratorID, errors.New("model exploded"), false); err != nil {
+		t.Fatalf("persistAgentError returned error: %v", err)
+	}
+	payload := findBroadcast(events(), narratorID, "narrator_error")
+	if payload == nil {
+		t.Fatalf("expected narrator_error broadcast, got %#v", events())
+	}
+	if !strings.Contains(stringFromAny(payload["error"]), "model exploded") || payload["errorCode"] != "AGENT_ERROR" {
+		t.Fatalf("unexpected narrator_error payload: %#v", payload)
+	}
+}
+
+func TestDeleteNarratorReturnsExplicitFeatureDisabledFallbackAndPreservesRow(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodDelete, "/narrators/"+narratorID)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode fallback body: %v", err)
+	}
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "narrators.delete" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected delete fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if !strings.Contains(reason, "Safe narrator deletion semantics are not implemented in go_backend yet") || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("delete fallback should expose reason/error/message, got %#v", body)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrators WHERE id = ?`, narratorID).Scan(&count); err != nil {
+		t.Fatalf("count narrators: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("narrator row was deleted despite feature-disabled response")
+	}
+}
 
 func TestPatchesListsFileSnapshotsWithoutLegacyPatchTable(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
@@ -192,6 +334,10 @@ func TestPatchesFallbackWhenStorageTablesAreMissing(t *testing.T) {
 	}
 	if patches, ok := body["patches"].([]any); !ok || len(patches) != 0 {
 		t.Fatalf("expected empty patches list, got %#v", body["patches"])
+	}
+	reason, _ := body["reason"].(string)
+	if reason != "No narrator patch or snapshot storage table is available in this database" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("patch fallback should expose reason/error/message, got %#v", body)
 	}
 }
 

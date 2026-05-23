@@ -63,12 +63,13 @@ func (a *AnthropicMessagesAdapter) Chat(ctx context.Context, params ChatParams) 
 	ch := make(chan StreamEvent, 16)
 	client := a.Client
 	if client == nil {
-		client = defaultProviderHTTPClient()
+		client = providerHTTPClient(a.Provider)
 	}
 	messages := anthropicHistoryMaps(params.History)
 	go func() {
 		defer close(ch)
-		if err := streamAnthropicMessages(ctx, client, a.Provider, params.SystemPrompt, messages, params.ToolScope, params.ReasoningEffort, ch); err != nil {
+		reasoningEffort := firstNonEmpty(params.ReasoningEffort, a.Provider.DefaultReasoningEffort)
+		if err := streamAnthropicMessages(ctx, client, a.Provider, params.SystemPrompt, messages, params.ToolScope, reasoningEffort, ch); err != nil {
 			ch <- StreamEvent{Err: err}
 		}
 	}()

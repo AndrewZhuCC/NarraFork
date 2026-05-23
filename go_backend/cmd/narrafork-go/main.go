@@ -24,6 +24,7 @@ import (
 	"narrafork-go/internal/db"
 	"narrafork-go/internal/gatewayruntime"
 	gitx "narrafork-go/internal/git"
+	"narrafork-go/internal/misccompat"
 	"narrafork-go/internal/narrators"
 	"narrafork-go/internal/notifications"
 	"narrafork-go/internal/projects"
@@ -159,6 +160,11 @@ func run() error {
 	settings, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if removed, err := misccompat.CleanupStaleShares(); err != nil {
+		slog.Warn("stale share cleanup failed", "error", err)
+	} else if removed > 0 {
+		slog.Info("cleaned stale shares", "count", removed)
 	}
 	core := settings.Core()
 

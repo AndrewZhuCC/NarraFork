@@ -137,8 +137,8 @@ data: {"type":"message_stop"}
 `)
 	}))
 	defer server.Close()
-	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-test"}}
-	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{map[string]any{"role": "user", "content": "hi"}}}, ReasoningEffort: "medium", SystemPrompt: "system prompt"})
+	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-test", DefaultReasoningEffort: "medium"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{map[string]any{"role": "user", "content": "hi"}}}, SystemPrompt: "system prompt"})
 	if err != nil {
 		t.Fatalf("Chat returned error: %v", err)
 	}
@@ -184,6 +184,48 @@ data: {"type":"message_stop"}
 	}
 	if usage == nil || usage.CompletionTokens != 5 || usage.CacheCreationInputTokens != 3 || usage.CacheCreation5mTokens != 1 || usage.CacheCreation1hTokens != 2 {
 		t.Fatalf("unexpected usage: %#v", usage)
+	}
+}
+
+func TestAnthropicMessagesHonorsTLSRejectUnauthorizedFalse(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/messages" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `event: message_start
+data: {"type":"message_start","message":{"id":"msg_tls"}}
+
+`)
+		fmt.Fprint(w, `event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+`)
+		fmt.Fprint(w, `event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tls ok"}}
+
+`)
+		fmt.Fprint(w, `event: message_stop
+data: {"type":"message_stop"}
+
+`)
+	}))
+	defer server.Close()
+	tlsRejectUnauthorized := false
+	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-test", TLSRejectUnauthorized: &tlsRejectUnauthorized}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{map[string]any{"role": "user", "content": "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	text := ""
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		text += event.Parsed.Text
+	}
+	if text != "tls ok" {
+		t.Fatalf("unexpected text %q", text)
 	}
 }
 

@@ -482,7 +482,9 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 			downloadJsonFile(rawDumpDownloadFileName(fullRecord), buildRawDumpExport(fullRecord));
 		} catch (error) {
 			console.error("Failed to download raw dump", error);
-			window.alert(t("usageHistoryDownloadFailed"));
+			window.alert(
+				error instanceof Error && error.message ? error.message : t("usageHistoryDownloadFailed"),
+			);
 		} finally {
 			setDownloadingRecordId(null);
 		}

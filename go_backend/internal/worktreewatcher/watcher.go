@@ -181,12 +181,15 @@ func (s *Service) broadcastCommitsUpdated(chapterID string, narratorIDs []string
 
 func (s *Service) broadcastCommitSyncError(chapterID string, narratorIDs []string, err error) {
 	for _, narratorID := range narratorIDs {
+		reason := err.Error()
 		s.Broadcaster.BroadcastNarrator(narratorID, map[string]any{
 			"type":           "commit_sync_error",
 			"narratorId":     narratorID,
 			"chapterId":      chapterID,
 			"code":           "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
-			"message":        err.Error(),
+			"reason":         reason,
+			"error":          reason,
+			"message":        reason,
 			"backgroundSync": true,
 			"fallback":       true,
 			"fatal":          false,

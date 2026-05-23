@@ -77,7 +77,29 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	}))
 	defer server.Close()
 	service, parentID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
 	ctx := context.Background()
+	parentCwd := t.TempDir()
+	if _, err := service.DB.Exec(`UPDATE narrators SET cwd = ? WHERE id = ?`, parentCwd, parentID); err != nil {
+		t.Fatalf("set parent cwd: %v", err)
+	}
+	missingPromptPayload, err := service.executeAgentTool(ctx, parentID, map[string]any{"subagent_type": "general"})
+	if err != nil {
+		t.Fatalf("agent tool with missing prompt: %v", err)
+	}
+	missingPromptReason := assertToolDiagnosticFields(t, missingPromptPayload, "AGENT_PROMPT_REQUIRED")
+	if missingPromptPayload["ok"] != false || !strings.Contains(missingPromptReason, "prompt is required") {
+		t.Fatalf("agent prompt validation should expose diagnostics, got %#v", missingPromptPayload)
+	}
+	invalidWorkdirPayload, err := service.executeAgentTool(ctx, parentID, map[string]any{"prompt": "fg", "workdir": "../outside"})
+	if err != nil {
+		t.Fatalf("agent tool with invalid workdir: %v", err)
+	}
+	invalidWorkdirReason := assertToolDiagnosticFields(t, invalidWorkdirPayload, "AGENT_WORKDIR_INVALID")
+	if invalidWorkdirPayload["ok"] != false || !strings.Contains(invalidWorkdirReason, "workdir") {
+		t.Fatalf("agent workdir validation should expose diagnostics, got %#v", invalidWorkdirPayload)
+	}
 
 	fgAssistant, err := service.addMessageWithBlocks(ctx, parentID, "assistant", "launch fg", []map[string]any{{"type": "tool_use", "id": "fg_tool", "name": "Agent", "input": map[string]any{"prompt": "fg"}}}, nil)
 	if err != nil {
@@ -92,6 +114,7 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if fgChildID == "" || fgPayload["foreground"] != true {
 		t.Fatalf("unexpected foreground payload: %#v", fgPayload)
 	}
+	assertBroadcastSubagentStarted(t, events(), parentID, "fg_tool", fgChildID, "openai:gpt-test", false)
 	assertAllSubagentMessagesHaveParentToolUse(t, service.DB, fgChildID, "fg_tool")
 
 	sendPayload, err := service.sendTool(ctx, parentID, map[string]any{"id": fgChildID, "message": "follow-up", "await": true, "timeout": 3000})
@@ -101,6 +124,22 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if sendPayload["ok"] != true {
 		t.Fatalf("unexpected send payload: %#v", sendPayload)
 	}
+	missingMessageSend, err := service.sendTool(ctx, parentID, map[string]any{"id": fgChildID})
+	if err != nil {
+		t.Fatalf("send with missing message: %v", err)
+	}
+	missingMessageReason := assertToolDiagnosticFields(t, missingMessageSend, "SEND_MESSAGE_REQUIRED")
+	if missingMessageSend["ok"] != false || !strings.Contains(missingMessageReason, "message is required") {
+		t.Fatalf("send validation error should expose diagnostics, got %#v", missingMessageSend)
+	}
+	missingTargetSend, err := service.sendTool(ctx, parentID, map[string]any{"message": "hi"})
+	if err != nil {
+		t.Fatalf("send with missing target: %v", err)
+	}
+	missingTargetSendReason := assertToolDiagnosticFields(t, missingTargetSend, "SEND_TARGET_REQUIRED")
+	if missingTargetSend["ok"] != false || !strings.Contains(missingTargetSendReason, "target id") {
+		t.Fatalf("send target validation error should expose diagnostics, got %#v", missingTargetSend)
+	}
 	assertAllSubagentMessagesHaveParentToolUse(t, service.DB, fgChildID, "fg_tool")
 	teamPayload, err := service.teamStatusTool(ctx, parentID, map[string]any{"action": "list"})
 	if err != nil {
@@ -109,13 +148,38 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if len(teamPayload["subagents"].([]map[string]any)) != 1 {
 		t.Fatalf("expected team status to list child, got %#v", teamPayload)
 	}
+	unsupportedTeamPayload, err := service.teamStatusTool(ctx, parentID, map[string]any{"action": "unknown"})
+	if err != nil {
+		t.Fatalf("unsupported team status action: %v", err)
+	}
+	assertToolDiagnosticFields(t, unsupportedTeamPayload, "TEAM_STATUS_ACTION_UNSUPPORTED")
+	if unsupportedTeamPayload["fallback"] != true {
+		t.Fatalf("unsupported team status action should be marked fallback, got %#v", unsupportedTeamPayload)
+	}
+	missingTargetTeamPayload, err := service.teamStatusTool(ctx, parentID, map[string]any{"action": "send", "message": "hi"})
+	if err != nil {
+		t.Fatalf("team status send with missing target: %v", err)
+	}
+	missingTargetReason := assertToolDiagnosticFields(t, missingTargetTeamPayload, "TEAM_TARGET_ID_REQUIRED")
+	if missingTargetTeamPayload["ok"] != false || missingTargetTeamPayload["sent"] != 0 || missingTargetTeamPayload["action"] != "send" || !strings.Contains(missingTargetReason, "target_id") {
+		t.Fatalf("team status validation error should expose diagnostics, got %#v", missingTargetTeamPayload)
+	}
+	missingFileTargetPayload, err := service.teamStatusTool(ctx, parentID, map[string]any{"action": "file_changes", "target_id": "missing"})
+	if err != nil {
+		t.Fatalf("team status file_changes with missing target: %v", err)
+	}
+	missingFileReason := assertToolDiagnosticFields(t, missingFileTargetPayload, "TEAM_FILE_CHANGES_TARGET_NOT_FOUND")
+	changes, _ := missingFileTargetPayload["changes"].([]any)
+	if missingFileTargetPayload["supported"] != true || len(changes) != 0 || missingFileTargetPayload["action"] != "file_changes" || !strings.Contains(missingFileReason, "target subagent") {
+		t.Fatalf("team file_changes target miss should expose diagnostics, got %#v", missingFileTargetPayload)
+	}
 
 	bgAssistant, err := service.addMessageWithBlocks(ctx, parentID, "assistant", "launch bg", []map[string]any{{"type": "tool_use", "id": "bg_tool", "name": "Agent", "input": map[string]any{"prompt": "bg"}}}, nil)
 	if err != nil {
 		t.Fatalf("insert background parent assistant: %v", err)
 	}
 	insertToolCallTestRow(t, service.DB, parentID, bgAssistant.ID, "bg_tool")
-	bgPayload, err := service.executeAgentTool(ctx, parentID, map[string]any{"prompt": "background task", "subagent_type": "explore", "description": "Background H04", "alias": "bg", "run_in_background": true, "_tool_use_id": "bg_tool"})
+	bgPayload, err := service.executeAgentTool(ctx, parentID, map[string]any{"prompt": "background task", "subagent_type": "explore", "description": "Background H04", "alias": "bg", "background": true, "_tool_use_id": "bg_tool"})
 	if err != nil {
 		t.Fatalf("execute background Agent tool: %v", err)
 	}
@@ -123,6 +187,7 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if bgChildID == "" || bgPayload["background"] != true {
 		t.Fatalf("unexpected background payload: %#v", bgPayload)
 	}
+	assertBroadcastSubagentStarted(t, events(), parentID, "bg_tool", bgChildID, "openai:gpt-test", true)
 	waitForBackgroundStatus(t, service.DB, bgChildID, "completed")
 	assertAllSubagentMessagesHaveParentToolUse(t, service.DB, bgChildID, "bg_tool")
 	awaited, err := service.awaitTool(ctx, parentID, map[string]any{"type": "agent", "id": "bg", "timeout": 3000})
@@ -136,8 +201,17 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if err != nil {
 		t.Fatalf("await unsupported task type: %v", err)
 	}
-	if unsupportedAwait["status"] != "unsupported" || !strings.Contains(stringFromAny(unsupportedAwait["message"]), "type=agent only") {
-		t.Fatalf("unsupported await should return stable fallback metadata, got %#v", unsupportedAwait)
+	awaitReason := assertToolDiagnosticFields(t, unsupportedAwait, "AWAIT_TASK_TYPE_UNSUPPORTED")
+	if unsupportedAwait["status"] != "unsupported" || unsupportedAwait["fallback"] != true || !strings.Contains(awaitReason, "type=agent only") {
+		t.Fatalf("unsupported await should return stable fallback diagnostics, got %#v", unsupportedAwait)
+	}
+	missingAwaitID, err := service.awaitTool(ctx, parentID, map[string]any{"type": "agent"})
+	if err != nil {
+		t.Fatalf("await with missing id: %v", err)
+	}
+	missingAwaitReason := assertToolDiagnosticFields(t, missingAwaitID, "AWAIT_ID_REQUIRED")
+	if missingAwaitID["ok"] != false || missingAwaitID["status"] != "error" || !strings.Contains(missingAwaitReason, "id is required") {
+		t.Fatalf("await validation error should expose diagnostics, got %#v", missingAwaitID)
 	}
 
 	page, err := service.MessagesCursor(ctx, parentID, 20, "", "older")
@@ -155,6 +229,15 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if childrenByTool["fg_tool"] < 4 || childrenByTool["bg_tool"] < 2 {
 		t.Fatalf("expected complete foreground/background child trees, got %#v", childrenByTool)
 	}
+}
+
+func assertToolDiagnosticFields(t *testing.T, payload map[string]any, wantCode string) string {
+	t.Helper()
+	reason, _ := payload["reason"].(string)
+	if payload["code"] != wantCode || reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("expected diagnostic fields for %s, got %#v", wantCode, payload)
+	}
+	return reason
 }
 
 func assertAllSubagentMessagesHaveParentToolUse(t *testing.T, sqlDB *sql.DB, narratorID, want string) {
@@ -195,6 +278,20 @@ func waitForBackgroundStatus(t *testing.T, sqlDB *sql.DB, narratorID, want strin
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("narrator %s background_status did not reach %s", narratorID, want)
+}
+
+func assertBroadcastSubagentStarted(t *testing.T, events []capturedBroadcast, parentID, toolUseID, childID, model string, background bool) {
+	t.Helper()
+	for _, event := range events {
+		if event.NarratorID != parentID || event.Payload["type"] != "subagent_started" || event.Payload["toolUseId"] != toolUseID {
+			continue
+		}
+		if event.Payload["subagentNarratorId"] != childID || event.Payload["model"] != model || event.Payload["background"] != background {
+			t.Fatalf("unexpected subagent_started broadcast: %#v", event.Payload)
+		}
+		return
+	}
+	t.Fatalf("expected subagent_started broadcast for %s, got %#v", toolUseID, events)
 }
 
 func hasParentMessageBroadcast(events []capturedBroadcast, parentID, childID, parentToolUseID string) bool {

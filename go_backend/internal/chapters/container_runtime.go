@@ -1333,7 +1333,7 @@ func (s *Service) broadcastContainerLifecycle(payload map[string]any) {
 }
 
 func containerRuntimeFallback(code, message string) map[string]any {
-	return map[string]any{"ok": false, "supported": false, "fallback": true, "code": code, "error": message, "message": message}
+	return map[string]any{"ok": false, "supported": false, "fallback": true, "code": code, "reason": message, "error": message, "message": message}
 }
 
 func containerRuntimeFallbackWithItems(items []map[string]any, code, message string) map[string]any {

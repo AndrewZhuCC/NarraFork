@@ -12,10 +12,12 @@ import (
 )
 
 func streamCodexCandidate(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
-	if err := streamCodexResponsesWebSocket(ctx, provider, messages, reasoningEffort, toolScope, out); err == nil {
-		return nil
-	} else if isCodexFailoverError(err) {
-		return err
+	if provider.UseWebSocket == nil || *provider.UseWebSocket {
+		if err := streamCodexResponsesWebSocket(ctx, provider, messages, reasoningEffort, toolScope, out); err == nil {
+			return nil
+		} else if isCodexFailoverError(err) {
+			return err
+		}
 	}
 	return streamOpenAIResponses(ctx, client, provider, messages, reasoningEffort, toolScope, out)
 }
@@ -32,7 +34,7 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 	if provider.AccountID != "" {
 		headers.Set("ChatGPT-Account-Id", provider.AccountID)
 	}
-	dialer := websocket.Dialer{Proxy: http.ProxyFromEnvironment}
+	dialer := websocket.Dialer{Proxy: providerProxyFunc(provider)}
 	conn, res, err := dialer.DialContext(ctx, endpoint, headers)
 	if err != nil {
 		if res != nil && (res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden || res.StatusCode == http.StatusTooManyRequests || res.StatusCode >= 500) {
@@ -50,7 +52,7 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 		"stream":              true,
 		"store":               false,
 		"parallel_tool_calls": true,
-		"prompt_cache_key":    firstNonEmpty(provider.CredentialID, provider.AccountID, "narrafork"),
+		"prompt_cache_key":    codexPromptCacheKey(provider),
 		"instructions":        firstNonEmpty(instructions, "You are an AI coding agent working inside NarraFork."),
 	}
 	if provider.PreviousResponseID != "" {

@@ -42,7 +42,7 @@ func NotFound(resource string) *AppError {
 	return Error(http.StatusNotFound, "NOT_FOUND", resource+" not found")
 }
 func NotImplemented(feature string) *AppError {
-	return Error(http.StatusNotImplemented, "FEATURE_DISABLED", feature+" is not implemented in go_backend yet")
+	return Error(http.StatusNotImplemented, "FEATURE_DISABLED", feature)
 }
 
 func FeatureDisabledPayload(feature, reason string) map[string]any {
@@ -50,13 +50,19 @@ func FeatureDisabledPayload(feature, reason string) map[string]any {
 }
 
 func FeatureDisabledPayloadWithCode(feature, code, reason string) map[string]any {
+	message := reason
+	if message == "" {
+		message = feature + " is not implemented in go_backend yet"
+	}
 	return map[string]any{
 		"ok":        false,
 		"code":      code,
 		"feature":   feature,
 		"supported": false,
 		"fallback":  true,
-		"reason":    reason,
+		"reason":    message,
+		"error":     message,
+		"message":   message,
 	}
 }
 
@@ -78,10 +84,12 @@ func WriteError(w http.ResponseWriter, err error) {
 	var appErr *AppError
 	if errors.As(err, &appErr) {
 		if appErr.Status == http.StatusNotImplemented && appErr.Code == "FEATURE_DISABLED" {
-			WriteJSON(w, appErr.Status, FeatureDisabledPayload(appErr.Message, appErr.Message))
+			feature := appErr.Message
+			reason := feature + " is not implemented in go_backend yet"
+			WriteJSON(w, appErr.Status, FeatureDisabledPayload(feature, reason))
 			return
 		}
-		WriteJSON(w, appErr.Status, map[string]any{"error": appErr.Message, "code": appErr.Code})
+		WriteJSON(w, appErr.Status, map[string]any{"error": appErr.Message, "message": appErr.Message, "code": appErr.Code})
 		return
 	}
 	WriteJSON(w, http.StatusInternalServerError, map[string]any{"error": "Internal server error"})

@@ -80,6 +80,7 @@ func volumeSnapshotFallbackPayload(code, message string) map[string]any {
 		"supported": false,
 		"fallback":  true,
 		"code":      code,
+		"reason":    message,
 		"error":     message,
 		"message":   message,
 	}

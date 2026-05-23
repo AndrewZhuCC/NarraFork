@@ -48,7 +48,14 @@ func TestUpdateDownloadWithoutTrustedSourceReturnsTerminalErrorSSE(t *testing.T)
 	if terminal.Payload["success"] != false || terminal.Payload["phase"] != "error" {
 		t.Fatalf("expected parseable failed result payload, got %#v", terminal.Payload)
 	}
-	if !strings.Contains(terminal.Payload["error"].(string), "trusted update metadata") {
+	if terminal.Payload["code"] != "UPDATE_DOWNLOAD_FAILED" {
+		t.Fatalf("expected structured failure code, got %#v", terminal.Payload)
+	}
+	reason, _ := terminal.Payload["reason"].(string)
+	if reason == "" || terminal.Payload["error"] != reason || terminal.Payload["message"] != reason {
+		t.Fatalf("expected reason/error/message diagnostics, got %#v", terminal.Payload)
+	}
+	if !strings.Contains(reason, "trusted update metadata") {
 		t.Fatalf("expected trusted metadata error, got %#v", terminal.Payload)
 	}
 }
@@ -342,6 +349,36 @@ func TestUpdateDownloadRejectsSHA512Mismatch(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".narrafork", "updates", "bad-sha", "artifact")); !os.IsNotExist(err) {
 		t.Fatalf("expected mismatched artifact to be removed, stat err=%v", err)
+	}
+}
+
+func TestUpdateDownloadRejectsMissingSHA512(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "missing-sha",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   []byte("artifact without hash"),
+		SHA512:  "",
+	})
+	defer trusted.Close()
+
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"requestedVersion":"missing-sha"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	if err := h.updateDownload(w, req); err != nil {
+		t.Fatalf("updateDownload returned error: %v", err)
+	}
+	events := parseUpdateSSEEvents(t, w.Body.String())
+	terminal := events[len(events)-1]
+	if terminal.Name != "error" || terminal.Payload["success"] != false {
+		t.Fatalf("expected terminal missing-hash error, got %#v", terminal)
+	}
+	if !strings.Contains(terminal.Payload["error"].(string), "SHA512") {
+		t.Fatalf("expected SHA512-required error, got %#v", terminal.Payload)
 	}
 }
 

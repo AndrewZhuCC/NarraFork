@@ -177,6 +177,8 @@ func graphFallback(feature, reason string, err error) map[string]any {
 	return payload
 }
 
+const CompressedAISummaryFallbackReason = "Go split compressed context uses a deterministic placeholder summary instead of a TypeScript-equivalent model-generated summary."
+
 func SplitCapability() map[string]any {
 	return map[string]any{
 		"supported": true,
@@ -190,6 +192,7 @@ func SplitCapability() map[string]any {
 				"supported": false,
 				"fallback":  true,
 				"mode":      "deterministic-summary-placeholder",
+				"reason":    CompressedAISummaryFallbackReason,
 			},
 			"containerAutostart": map[string]any{
 				"supported": true,

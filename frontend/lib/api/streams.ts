@@ -1,4 +1,4 @@
-import { ApiError, BASE, getToken } from "./client";
+import { ApiError, BASE, getErrorMessage, getToken, readFetchError } from "./client";
 import type { StorageCategoryResult, StorageScanResult } from "./types";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
@@ -101,8 +101,8 @@ export async function* kiroStreamChat(
 		signal,
 	});
 	if (!res.ok) {
-		const err = await res.json().catch(() => ({ error: res.statusText }));
-		throw new Error(err.error ?? "Request failed");
+		const error = await readFetchError(res, "Request failed");
+		throw new ApiError(error.message, res.status, error.data);
 	}
 	if (!res.body) throw new Error("No response body");
 
@@ -112,7 +112,15 @@ export async function* kiroStreamChat(
 	const parser = createSseEventParser("chunk");
 
 	const consumeEvent = (event: ParsedSseEvent, chunks: string[]): Error | "done" | null => {
-		if (event.eventName === "error") return new Error(event.data || "Unknown error");
+		if (event.eventName === "error") {
+			try {
+				const parsed = JSON.parse(event.data) as Record<string, unknown>;
+				return new ApiError(getErrorMessage(parsed, "Unknown error"), 500, parsed);
+			} catch {
+				const message = event.data || "Unknown error";
+				return new ApiError(message, 500, { error: message });
+			}
+		}
 		if (event.eventName === "done") return "done";
 		chunks.push(event.data);
 		return null;
@@ -179,7 +187,8 @@ export async function scanStorageStream(callbacks: {
 
 	const response = await fetch(`${BASE}/storage/scan`, { headers, signal: callbacks.signal });
 	if (!response.ok) {
-		throw new ApiError("Scan failed", response.status);
+		const error = await readFetchError(response, "Scan failed");
+		throw new ApiError(error.message, response.status, error.data);
 	}
 	const reader = response.body?.getReader();
 	if (!reader) {
@@ -204,7 +213,7 @@ export async function scanStorageStream(callbacks: {
 			} else if (eventName === "complete") {
 				result = parsed as StorageScanResult;
 			} else if (eventName === "error") {
-				terminalError = new ApiError(parsed.error ?? "Scan failed", 500);
+				terminalError = new ApiError(getErrorMessage(parsed, "Scan failed"), 500, parsed);
 			}
 		} catch {
 			// Skip malformed JSON, matching the previous tolerant behavior.

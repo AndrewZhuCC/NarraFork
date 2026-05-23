@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarratorWS } from "../../hooks/useNarratorWS";
+import { useNarratorPermissionsCapability } from "../../hooks/usePlatform";
 import {
 	api,
 	type BufferMessageSummary,
@@ -501,6 +502,11 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	} = opts;
 	const { t } = useTranslation("narrator");
 	const qc = useQueryClient();
+	const narratorPermissionsCapability = useNarratorPermissionsCapability();
+	const permissionDecisionsSupported =
+		narratorPermissionsCapability.supported && narratorPermissionsCapability.approveDeny;
+	const updatedPermissionInputSupported =
+		narratorPermissionsCapability.supported && narratorPermissionsCapability.updatedInput;
 	const pageVisible = usePageVisibility();
 
 	// --- Streaming state ---
@@ -1031,6 +1037,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			compactAfter?: boolean,
 			updatedPlan?: string,
 		) => {
+			if (!permissionDecisionsSupported) return;
+			const nextUpdatedPlan = updatedPermissionInputSupported ? updatedPlan : undefined;
 			const wsSent = sendPermissionDecisionRef.current?.(
 				requestId,
 				decision,
@@ -1038,14 +1046,14 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				undefined,
 				feedbackText,
 				compactAfter,
-				updatedPlan,
+				nextUpdatedPlan,
 			);
 			// Fallback to HTTP API when WS send fails (e.g. reconnecting)
 			if (!wsSent) {
 				const payload = {
 					feedbackText,
 					compactAfter,
-					updatedPlan,
+					updatedPlan: nextUpdatedPlan,
 				};
 				if (decision === "allow") {
 					api.approvePermission(requestId, payload).catch(() => {});
@@ -1070,10 +1078,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						});
 						return anyChanged ? { ...old, pages } : old;
 					}
-					// Optimistically update inputJson when plan was edited
+					// Optimistically update inputJson when plan was edited and the backend supports it.
 					const inputUpdate =
-						updatedPlan !== undefined && perm?.inputJson
-							? { inputJson: { ...perm.inputJson, plan: updatedPlan } }
+						nextUpdatedPlan !== undefined && perm?.inputJson
+							? { inputJson: { ...perm.inputJson, plan: nextUpdatedPlan } }
 							: {};
 					if (decision === "deny") {
 						// Deny: immediately show as failed with user feedback
@@ -1097,11 +1105,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			}
 		},
-		[qc, messagesQueryKey, resolveAndRemovePerm],
+		[
+			messagesQueryKey,
+			permissionDecisionsSupported,
+			qc,
+			resolveAndRemovePerm,
+			updatedPermissionInputSupported,
+		],
 	);
 
 	const handleQuestionSubmit = useCallback(
 		(requestId: string, answers: Record<string, string>) => {
+			if (!permissionDecisionsSupported || !updatedPermissionInputSupported) return;
 			const wsSent = sendPermissionDecisionRef.current?.(requestId, "allow", undefined, answers);
 			if (!wsSent) {
 				api.approvePermission(requestId, { answers }).catch(() => {});
@@ -1122,11 +1137,18 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			}
 		},
-		[qc, messagesQueryKey, resolveAndRemovePerm],
+		[
+			messagesQueryKey,
+			permissionDecisionsSupported,
+			qc,
+			resolveAndRemovePerm,
+			updatedPermissionInputSupported,
+		],
 	);
 
 	const handleQuestionReflect = useCallback(
 		async (requestId: string) => {
+			if (!permissionDecisionsSupported || !updatedPermissionInputSupported) return;
 			try {
 				const { answers } = await api.reflectQuestion(requestId);
 				const { toolUseId, perm } = resolveAndRemovePerm(requestId);
@@ -1152,11 +1174,19 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			}
 		},
-		[qc, messagesQueryKey, resolveAndRemovePerm, t],
+		[
+			messagesQueryKey,
+			permissionDecisionsSupported,
+			qc,
+			resolveAndRemovePerm,
+			t,
+			updatedPermissionInputSupported,
+		],
 	);
 
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
+			if (!permissionDecisionsSupported) return;
 			const message = "User skipped the question";
 			const wsSent = sendPermissionDecisionRef.current?.(requestId, "deny", message);
 			if (!wsSent) {
@@ -1170,7 +1200,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 			}
 		},
-		[qc, messagesQueryKey, resolveAndRemovePerm],
+		[qc, messagesQueryKey, permissionDecisionsSupported, resolveAndRemovePerm],
 	);
 
 	// --- Stable permission callbacks ---
@@ -2635,6 +2665,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				});
 				// Also invalidate the detailed git status used by the Git panel
 				qc.invalidateQueries({ queryKey: ["gitStatus", data.chapterId] });
+			},
+			onCommitSyncError: (event) => {
+				qc.invalidateQueries({ queryKey: ["chapterGitStatus", event.chapterId] });
+				qc.invalidateQueries({ queryKey: ["gitStatus", event.chapterId] });
+				notifications.show({
+					title: t("commitSyncErrorTitle"),
+					message:
+						event.reason ??
+						event.message ??
+						event.error ??
+						event.code ??
+						t("commitSyncErrorFallback"),
+					color: "yellow",
+					autoClose: 5000,
+				});
 			},
 			onCompacting: () => {
 				// Compacting status now comes via substatus_change.

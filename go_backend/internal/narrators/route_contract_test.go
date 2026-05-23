@@ -572,6 +572,10 @@ func TestBrowserSessionActionsExposeFeatureDisabledFallbackWithoutStorageTable(t
 			if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "narrator.browserSessions" || body["supported"] != false || body["fallback"] != true {
 				t.Fatalf("unexpected browser-session fallback payload: %#v", body)
 			}
+			reason, _ := body["reason"].(string)
+			if reason == "" || body["error"] != reason || body["message"] != reason {
+				t.Fatalf("browser-session fallback should expose reason/error/message, got %#v", body)
+			}
 		})
 	}
 }

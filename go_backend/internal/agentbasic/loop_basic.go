@@ -2,9 +2,11 @@ package agentbasic
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -670,6 +672,39 @@ func isTransientAgentError(err error) bool {
 
 func defaultProviderHTTPClient() *http.Client {
 	return &http.Client{Timeout: 180 * time.Second}
+}
+
+func providerHTTPClient(provider Provider) *http.Client {
+	if strings.TrimSpace(provider.ProxyURL) == "" && !providerDisablesTLSVerification(provider) {
+		return defaultProviderHTTPClient()
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = providerProxyFunc(provider)
+	if providerDisablesTLSVerification(provider) {
+		tlsConfig := &tls.Config{InsecureSkipVerify: true}
+		if transport.TLSClientConfig != nil {
+			tlsConfig = transport.TLSClientConfig.Clone()
+			tlsConfig.InsecureSkipVerify = true
+		}
+		transport.TLSClientConfig = tlsConfig
+	}
+	return &http.Client{Timeout: 180 * time.Second, Transport: transport}
+}
+
+func providerProxyFunc(provider Provider) func(*http.Request) (*url.URL, error) {
+	proxyURL := strings.TrimSpace(provider.ProxyURL)
+	if proxyURL == "" {
+		return http.ProxyFromEnvironment
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return http.ProxyFromEnvironment
+	}
+	return http.ProxyURL(parsed)
+}
+
+func providerDisablesTLSVerification(provider Provider) bool {
+	return provider.TLSRejectUnauthorized != nil && !*provider.TLSRejectUnauthorized
 }
 
 func errProviderEmptyResponse() error {

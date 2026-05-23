@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"narrafork-go/internal/agentbasic"
+	"narrafork-go/internal/chapters"
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/narrators"
 )
@@ -263,6 +264,58 @@ func TestMCPToolOutputTruncatesLargeText(t *testing.T) {
 	}
 }
 
+func TestForkChapterToolSchemaIncludesInheritMode(t *testing.T) {
+	handler := &Handler{}
+	for _, tool := range handler.embeddedTools() {
+		if tool["name"] != "narrafork_fork_chapter" {
+			continue
+		}
+		schema, _ := tool["inputSchema"].(map[string]any)
+		properties, _ := schema["properties"].(map[string]any)
+		inheritMode, _ := properties["inheritMode"].(map[string]any)
+		enum, _ := inheritMode["enum"].([]string)
+		if strings.Join(enum, ",") != "full,compressed,fresh" {
+			t.Fatalf("fork inheritMode enum = %#v", inheritMode["enum"])
+		}
+		return
+	}
+	t.Fatalf("missing narrafork_fork_chapter tool")
+}
+
+func TestForkChapterToolRejectsInvalidInheritMode(t *testing.T) {
+	handler := &Handler{Chapters: &chapters.Service{}}
+	for _, tc := range []struct {
+		name string
+		mode any
+		want string
+	}{
+		{name: "enum", mode: "summary", want: "inheritMode must be full, compressed, or fresh"},
+		{name: "type", mode: 1, want: "inheritMode must be a string"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := handler.callEmbeddedTool(context.Background(), map[string]any{
+				"name": "narrafork_fork_chapter",
+				"arguments": map[string]any{
+					"chapterId":   "chapter-1",
+					"title":       "Fork",
+					"inheritMode": tc.mode,
+				},
+			})
+			if result["isError"] != true {
+				t.Fatalf("expected MCP error result, got %#v", result)
+			}
+			content, _ := result["content"].([]any)
+			if len(content) == 0 {
+				t.Fatalf("missing MCP error content: %#v", result)
+			}
+			block, _ := content[0].(map[string]any)
+			if !strings.Contains(stringOr(block["text"], ""), tc.want) {
+				t.Fatalf("unexpected MCP error content: %#v", result)
+			}
+		})
+	}
+}
+
 func TestProtocolToolsListAndCallUseEmbeddedCompatibilityTools(t *testing.T) {
 	handler, _ := newTestHandler(t)
 	listReq := map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": map[string]any{}}
@@ -440,6 +493,10 @@ func TestMutatingServersWithoutSettingsReturnsExplicitFallback(t *testing.T) {
 		payload := decodeResponse(t, w)
 		if payload["ok"] != false || payload["code"] != "FEATURE_DISABLED" || payload["feature"] != "mcp.serverSettingsStorage" || payload["supported"] != false || payload["fallback"] != true {
 			t.Fatalf("unexpected MCP fallback payload for %s %s: %#v", tc.method, tc.path, payload)
+		}
+		reason, _ := payload["reason"].(string)
+		if reason != "MCP server settings storage is not available in this go_backend runtime" || payload["error"] != reason || payload["message"] != reason {
+			t.Fatalf("MCP fallback payload should expose reason/error/message, got %#v", payload)
 		}
 	}
 	w := serveMCP(handler, http.MethodGet, "/servers", nil)

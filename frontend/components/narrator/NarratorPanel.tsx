@@ -139,6 +139,13 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
+import {
+	useNarratorCompactCapability,
+	useNarratorPermissionsCapability,
+	useNarratorPlanModeCapability,
+	useNarratorRetryRecoveryCapability,
+	useRuntimeCapabilities,
+} from "../../hooks/usePlatform";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
@@ -736,16 +743,29 @@ function AggProviderSwitcher({
 
 function PermModeMenuItems({
 	currentMode,
+	availableModes,
+	unavailableReason,
 	onSelect,
 	t,
 }: {
 	currentMode: string;
+	availableModes: string[];
+	unavailableReason?: string;
 	onSelect: (mode: string) => void;
 	t: (key: string) => string;
 }) {
+	const modes = PERM_MODES.filter((mode) => availableModes.includes(mode));
+	if (modes.length === 0) {
+		return (
+			<Menu.Item disabled title={unavailableReason}>
+				{t("permissionModesUnavailable")}
+			</Menu.Item>
+		);
+	}
+
 	return (
 		<>
-			{PERM_MODES.map((mode) => {
+			{modes.map((mode) => {
 				const selected = currentMode === mode;
 				return (
 					<Menu.Item
@@ -818,11 +838,15 @@ function OverrideControl({
 
 function PermissionMenuContent({
 	currentMode,
+	availablePermissionModes,
+	permissionModesUnavailableReason,
 	onSelectPermissionMode,
 	t,
 	hasPlanTrait,
 	onTogglePlanMode,
 	planModePending,
+	planModeSupported,
+	planModeUnsupportedReason,
 	showPlanReflectionAutoApproveToggle,
 	planReflectionAutoApproveOverride,
 	planReflectionAutoApproveEffective,
@@ -832,11 +856,15 @@ function PermissionMenuContent({
 	onOpenReflectionSettings,
 }: {
 	currentMode: string;
+	availablePermissionModes: string[];
+	permissionModesUnavailableReason?: string;
 	onSelectPermissionMode: (mode: string) => void;
 	t: (key: string) => string;
 	hasPlanTrait: boolean;
 	onTogglePlanMode: () => void;
 	planModePending: boolean;
+	planModeSupported: boolean;
+	planModeUnsupportedReason?: string;
 	showPlanReflectionAutoApproveToggle: boolean;
 	planReflectionAutoApproveOverride: BooleanOverride;
 	planReflectionAutoApproveEffective: boolean;
@@ -849,14 +877,25 @@ function PermissionMenuContent({
 	return (
 		<>
 			<Menu.Label>{t("permissionMode")}</Menu.Label>
-			<PermModeMenuItems currentMode={currentMode} onSelect={onSelectPermissionMode} t={t} />
+			<PermModeMenuItems
+				currentMode={currentMode}
+				availableModes={availablePermissionModes}
+				unavailableReason={permissionModesUnavailableReason}
+				onSelect={onSelectPermissionMode}
+				t={t}
+			/>
 			<Menu.Divider />
 			<Menu.Item
 				leftSection={<IconNotebook size={14} />}
 				onClick={onTogglePlanMode}
-				disabled={planModePending}
+				disabled={planModePending || !planModeSupported}
+				title={!planModeSupported ? planModeUnsupportedReason : undefined}
 			>
-				{hasPlanTrait ? t("exitPlanMode") : t("enterPlanMode")}
+				{!planModeSupported
+					? t("planModeUnavailable")
+					: hasPlanTrait
+						? t("exitPlanMode")
+						: t("enterPlanMode")}
 			</Menu.Item>
 			{hasReflectionSettings && (
 				<>
@@ -1932,6 +1971,40 @@ export function NarratorPanel({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const { t: ts } = useTranslation("settings");
+	const runtimeCapabilities = useRuntimeCapabilities();
+	const narratorPermissionsCapability = useNarratorPermissionsCapability();
+	const availablePermissionModes = narratorPermissionsCapability.supported
+		? narratorPermissionsCapability.modes
+		: [];
+	const permissionModesUnavailableReason = narratorPermissionsCapability.supported
+		? undefined
+		: (narratorPermissionsCapability.reason ?? t("permissionModesUnavailable"));
+	const permissionReflections = narratorPermissionsCapability.reflections;
+	const planReflectionSupported = permissionReflections.includes("plan");
+	const dangerReflectionSupported = permissionReflections.includes("danger");
+	const planModeCapability = useNarratorPlanModeCapability();
+	const planModeSupported = planModeCapability.supported;
+	const planModeUnsupportedReason = planModeSupported
+		? undefined
+		: (planModeCapability.reason ?? t("planModeUnavailable"));
+	const retryRecoveryCapability = useNarratorRetryRecoveryCapability();
+	const retryRecoverySupported = retryRecoveryCapability.supported;
+	const retryRecoveryAllowsRetry =
+		retryRecoverySupported && retryRecoveryCapability.retry !== false;
+	const retryRecoveryAllowsContinue =
+		retryRecoverySupported && retryRecoveryCapability.continue !== false;
+	const retryRecoveryAllowsInterrupt =
+		retryRecoverySupported && retryRecoveryCapability.interrupt !== false;
+	const compactCapability = useNarratorCompactCapability();
+	const compactSupported = compactCapability.supported;
+	const compactUsesFallbackSummary = compactCapability.fallbackSummary === true;
+	const compactFallbackSummaryReason =
+		compactCapability.fallbackReason ?? t("compactFallbackSummaryDesc");
+	const compactUnsupportedReason = compactCapability.reason ?? t("compactUnsupported");
+	const rollbackEditRegenerateCapability = runtimeCapabilities?.narrator?.rollbackEditRegenerate;
+	const rollbackEditRegenerateSupported = rollbackEditRegenerateCapability?.supported !== false;
+	const rollbackEditRegenerateUnsupportedReason =
+		rollbackEditRegenerateCapability?.reason ?? t("rollbackEditRegenerateUnsupported");
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
 	const qc = useQueryClient();
@@ -2147,12 +2220,32 @@ export function NarratorPanel({
 		blockIndex: number;
 	} | null>(null);
 
-	const handleRollback = useCallback((messageId: string, blockIndex: number) => {
-		setPendingRollback({ messageId, blockIndex });
-	}, []);
+	const handleRollback = useCallback(
+		(messageId: string, blockIndex: number) => {
+			if (!rollbackEditRegenerateSupported) {
+				notifications.show({
+					title: t("rollbackEditRegenerateUnsupportedTitle"),
+					message: rollbackEditRegenerateUnsupportedReason,
+					color: "yellow",
+				});
+				return;
+			}
+			setPendingRollback({ messageId, blockIndex });
+		},
+		[rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+	);
 
 	const confirmRollback = useCallback(async () => {
 		if (!pendingRollback) return;
+		if (!rollbackEditRegenerateSupported) {
+			notifications.show({
+				title: t("rollbackEditRegenerateUnsupportedTitle"),
+				message: rollbackEditRegenerateUnsupportedReason,
+				color: "yellow",
+			});
+			setPendingRollback(null);
+			return;
+		}
 		try {
 			await api.rollbackToBlock(narratorId, pendingRollback.messageId, pendingRollback.blockIndex);
 		} catch (err) {
@@ -2160,10 +2253,24 @@ export function NarratorPanel({
 			notifications.show({ title: t("rollbackFailed"), message, color: "red" });
 		}
 		setPendingRollback(null);
-	}, [narratorId, pendingRollback, t]);
+	}, [
+		narratorId,
+		pendingRollback,
+		rollbackEditRegenerateSupported,
+		rollbackEditRegenerateUnsupportedReason,
+		t,
+	]);
 
 	const handleEditAndRegenerate = useCallback(
 		async (messageId: string, newContent: string, rollback: boolean) => {
+			if (!rollbackEditRegenerateSupported) {
+				notifications.show({
+					title: t("rollbackEditRegenerateUnsupportedTitle"),
+					message: rollbackEditRegenerateUnsupportedReason,
+					color: "yellow",
+				});
+				return;
+			}
 			try {
 				await api.editAndRegenerate(narratorId, messageId, newContent, rollback);
 			} catch (err) {
@@ -2171,7 +2278,7 @@ export function NarratorPanel({
 				notifications.show({ title: t("editFailed"), message, color: "red" });
 			}
 		},
-		[narratorId, t],
+		[narratorId, rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
 	);
 
 	// --- Editing message state ---
@@ -2618,12 +2725,36 @@ export function NarratorPanel({
 
 	const handleCompactBefore = useCallback(
 		(messageId: string) => {
+			if (!compactSupported) {
+				notifications.show({
+					title: t("compactUnsupportedTitle"),
+					message: compactUnsupportedReason,
+					color: "yellow",
+				});
+				return;
+			}
+			if (compactUsesFallbackSummary) {
+				notifications.show({
+					title: t("compactFallbackSummaryTitle"),
+					message: compactFallbackSummaryReason,
+					color: "yellow",
+					autoClose: 5000,
+				});
+			}
 			// Compacting state will arrive via substatus_change WS event
 			api.triggerCompact(narratorId, messageId).catch((err) => {
 				handleCompactError(err);
 			});
 		},
-		[narratorId, handleCompactError],
+		[
+			narratorId,
+			handleCompactError,
+			compactSupported,
+			compactUnsupportedReason,
+			compactUsesFallbackSummary,
+			compactFallbackSummaryReason,
+			t,
+		],
 	);
 
 	// Stable resolvePerm callback for renderTreeMessages — uses a ref to avoid
@@ -2828,49 +2959,65 @@ export function NarratorPanel({
 		dangerReflectionGlobal,
 	);
 	const togglePlanMode = useCallback(() => {
-		if (!narratorId) return;
+		if (!narratorId || !planModeSupported) return;
 		if (hasPlanTrait) {
 			exitPlanModeMutation.mutate(narratorId);
 		} else {
 			enterPlanModeMutation.mutate(narratorId);
 		}
-	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId]);
+	}, [enterPlanModeMutation, exitPlanModeMutation, hasPlanTrait, narratorId, planModeSupported]);
 	const handlePlanReflectionAutoApproveOverride = useCallback(
 		(value: BooleanOverride) => {
+			if (!planReflectionSupported) return;
 			reflectionOverridesMutation.mutate({
 				id: narratorId,
 				planReflectionAutoApproveOverride: value,
 			});
 		},
-		[narratorId, reflectionOverridesMutation],
+		[narratorId, planReflectionSupported, reflectionOverridesMutation],
 	);
 	const handleDangerReflectionOverride = useCallback(
 		async (value: BooleanOverride) => {
+			if (!dangerReflectionSupported) return;
 			if (value === "off" && dangerReflectionEffective) {
 				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
 				if (!ok) return;
 			}
 			reflectionOverridesMutation.mutate({ id: narratorId, dangerReflectionOverride: value });
 		},
-		[confirm, dangerReflectionEffective, narratorId, reflectionOverridesMutation, t],
+		[
+			confirm,
+			dangerReflectionEffective,
+			dangerReflectionSupported,
+			narratorId,
+			reflectionOverridesMutation,
+			t,
+		],
 	);
 	const handlePlanReflectionAutoApproveGlobal = useCallback(
 		(enabled: boolean) => {
-			if (!settingsData) return;
+			if (!settingsData || !planReflectionSupported) return;
 			updateSettingsMutation.mutate({ agent: { planReflectionAutoApprove: enabled } });
 		},
-		[settingsData, updateSettingsMutation],
+		[planReflectionSupported, settingsData, updateSettingsMutation],
 	);
 	const handleDangerReflectionGlobal = useCallback(
 		async (enabled: boolean) => {
-			if (!settingsData) return;
+			if (!settingsData || !dangerReflectionSupported) return;
 			if (!enabled && dangerReflectionGlobal) {
 				const ok = await confirm({ message: t("dangerReflectionDisableWarning") });
 				if (!ok) return;
 			}
 			updateSettingsMutation.mutate({ agent: { dangerReflectionEnabled: enabled } });
 		},
-		[confirm, dangerReflectionGlobal, settingsData, t, updateSettingsMutation],
+		[
+			confirm,
+			dangerReflectionGlobal,
+			dangerReflectionSupported,
+			settingsData,
+			t,
+			updateSettingsMutation,
+		],
 	);
 	const handleOpenContextThresholdSettings = useCallback(() => {
 		setContextThresholdDraft(contextThresholdSettings);
@@ -3297,13 +3444,15 @@ export function NarratorPanel({
 		!!lastMessage &&
 		lastMessage.role === "user" &&
 		!String(lastMessage.id).startsWith("optimistic-") &&
-		narratorIsIdle;
+		narratorIsIdle &&
+		retryRecoveryAllowsRetry;
 
 	const canContinueNarrator =
 		!!lastMessage &&
 		lastMessage.role === "assistant" &&
 		!String(lastMessage.id).startsWith("optimistic-") &&
-		narratorIsIdle;
+		narratorIsIdle &&
+		retryRecoveryAllowsContinue;
 
 	// Find the last user message ID for edit confirmation logic
 	const lastUserMessageId = useMemo(() => {
@@ -3771,12 +3920,22 @@ export function NarratorPanel({
 
 	// --- Segment compact ---
 	const handleSegmentCompact = useCallback(async () => {
+		if (!compactSupported) {
+			notifications.show({
+				title: t("compactUnsupportedTitle"),
+				message: compactUnsupportedReason,
+				color: "yellow",
+			});
+			return;
+		}
 		const container = contentRef.current;
 		if (!container || selectedBlockIds.size === 0) return;
 		const messageIds = resolveSelectedMessageIds(container, selectedBlockIds);
 		if (messageIds.length === 0) return;
-		if (!(await confirm({ message: t("segmentCompactConfirm", { count: messageIds.length }) })))
-			return;
+		const segmentCompactConfirmMessage = compactUsesFallbackSummary
+			? `${t("segmentCompactConfirm", { count: messageIds.length })}\n\n${compactFallbackSummaryReason}`
+			: t("segmentCompactConfirm", { count: messageIds.length });
+		if (!(await confirm({ message: segmentCompactConfirmMessage }))) return;
 		exitSelection();
 		try {
 			// Compacting state will arrive via substatus_change WS event
@@ -3790,7 +3949,17 @@ export function NarratorPanel({
 				autoClose: 5000,
 			});
 		}
-	}, [selectedBlockIds, exitSelection, narratorId, t, confirm]);
+	}, [
+		selectedBlockIds,
+		exitSelection,
+		narratorId,
+		t,
+		confirm,
+		compactSupported,
+		compactUnsupportedReason,
+		compactUsesFallbackSummary,
+		compactFallbackSummaryReason,
+	]);
 
 	const selectionCtxValue = useMemo<MessageSelectionState>(
 		() => ({
@@ -3939,7 +4108,7 @@ export function NarratorPanel({
 		// Build a secondary cache key for render-affecting props outside the page
 		// message references themselves.
 		const permsKey = `${renderPermCb.pendingPermsMap.size}:${[...renderPermCb.pendingPermsMap.keys()].join(",")}`;
-		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${permsKey}`;
+		const secondaryKey = `${narratorId}|${highlightedId}|${expandedToolUseId}|${editExpandOverride}|${showTokenUsage}|${pruneBoundaryMessageId}|${lastUserMessageId}|${hasChapter}|${planModeSupported}|${retryRecoverySupported}|${compactSupported}|${rollbackEditRegenerateSupported}|${permsKey}`;
 
 		for (let ri = 0; ri < reversed.length; ri++) {
 			const { page, pageParam } = reversed[ri];
@@ -3986,10 +4155,10 @@ export function NarratorPanel({
 					showTokenUsage,
 					pruneBoundaryMessageId,
 					pruneDividerLabel,
-					handleCompactBefore,
+					compactSupported ? handleCompactBefore : undefined,
 					handleDeleteBlock,
-					handleRollback,
-					handleEditAndRegenerate,
+					rollbackEditRegenerateSupported ? handleRollback : undefined,
+					rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 					lastUserMessageId,
 					hasChapter,
 					onViewSubagentSession,
@@ -4124,8 +4293,12 @@ export function NarratorPanel({
 		getStableRenderElementKey,
 		handleDeleteBlock,
 		handleCompactBefore,
+		planModeSupported,
+		retryRecoverySupported,
+		compactSupported,
 		handleRollback,
 		handleEditAndRegenerate,
+		rollbackEditRegenerateSupported,
 		pruneBoundaryMessageId,
 		pruneDividerLabel,
 		lastUserMessageId,
@@ -6551,9 +6724,10 @@ export function NarratorPanel({
 								<Button
 									color="orange"
 									onClick={async () => {
-										if (isActive) {
+										if (isActive && retryRecoveryAllowsInterrupt) {
 											await interruptMutation.mutateAsync(narratorId);
 										}
+
 										archiveMutation.mutate(narratorId);
 										closeArchiveConfirm();
 										if (onClose) {
@@ -6764,31 +6938,33 @@ export function NarratorPanel({
 								<Text size="sm" fw={600}>
 									{t("sessionOverrides")}
 								</Text>
-								{((narrator.permissionMode ?? "default") === "acceptEdits" ||
-									(narrator.permissionMode ?? "default") === "bypassPermissions") && (
-									<OverrideControl
-										label={t("sessionPlanReflectionAutoApprove")}
-										description={t("sessionPlanReflectionAutoApproveDesc")}
-										value={planReflectionAutoApproveOverride}
-										effective={planReflectionAutoApproveEffective}
-										globalDefault={planReflectionAutoApproveGlobal}
-										disabled={reflectionOverridesMutation.isPending}
-										onChange={handlePlanReflectionAutoApproveOverride}
-										t={t}
-									/>
-								)}
-								{(narrator.permissionMode ?? "default") === "bypassPermissions" && (
-									<OverrideControl
-										label={t("sessionDangerReflection")}
-										description={t("sessionDangerReflectionDesc")}
-										value={dangerReflectionOverride}
-										effective={dangerReflectionEffective}
-										globalDefault={dangerReflectionGlobal}
-										disabled={reflectionOverridesMutation.isPending}
-										onChange={handleDangerReflectionOverride}
-										t={t}
-									/>
-								)}
+								{planReflectionSupported &&
+									((narrator.permissionMode ?? "default") === "acceptEdits" ||
+										(narrator.permissionMode ?? "default") === "bypassPermissions") && (
+										<OverrideControl
+											label={t("sessionPlanReflectionAutoApprove")}
+											description={t("sessionPlanReflectionAutoApproveDesc")}
+											value={planReflectionAutoApproveOverride}
+											effective={planReflectionAutoApproveEffective}
+											globalDefault={planReflectionAutoApproveGlobal}
+											disabled={reflectionOverridesMutation.isPending}
+											onChange={handlePlanReflectionAutoApproveOverride}
+											t={t}
+										/>
+									)}
+								{dangerReflectionSupported &&
+									(narrator.permissionMode ?? "default") === "bypassPermissions" && (
+										<OverrideControl
+											label={t("sessionDangerReflection")}
+											description={t("sessionDangerReflectionDesc")}
+											value={dangerReflectionOverride}
+											effective={dangerReflectionEffective}
+											globalDefault={dangerReflectionGlobal}
+											disabled={reflectionOverridesMutation.isPending}
+											onChange={handleDangerReflectionOverride}
+											t={t}
+										/>
+									)}
 							</Stack>
 							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
 							<Stack gap="sm">
@@ -6802,14 +6978,14 @@ export function NarratorPanel({
 									onChange={(event) =>
 										handlePlanReflectionAutoApproveGlobal(event.currentTarget.checked)
 									}
-									disabled={globalReflectionSettingsDisabled}
+									disabled={globalReflectionSettingsDisabled || !planReflectionSupported}
 								/>
 								<Switch
 									label={t("globalDangerReflection")}
 									description={t("globalDangerReflectionDesc")}
 									checked={dangerReflectionGlobal}
 									onChange={(event) => handleDangerReflectionGlobal(event.currentTarget.checked)}
-									disabled={globalReflectionSettingsDisabled}
+									disabled={globalReflectionSettingsDisabled || !dangerReflectionSupported}
 								/>
 							</Stack>
 							<Group justify="space-between">
@@ -7002,9 +7178,13 @@ export function NarratorPanel({
 														onPermissionDecision={renderPermCb.onPermissionDecision}
 														onForkFromMessage={forkHandler}
 														onAskInPassing={handleAskInPassing}
-														onCompactBeforeMessage={handleCompactBefore}
+														onCompactBeforeMessage={
+															compactSupported ? handleCompactBefore : undefined
+														}
 														onDeleteBlock={handleDeleteBlock}
-														onRollbackToBlock={handleRollback}
+														onRollbackToBlock={
+															rollbackEditRegenerateSupported ? handleRollback : undefined
+														}
 														scrollRef={viewportCallbackRef}
 														contentRef={contentRef}
 														shift={isFetchingNextPage}
@@ -7067,6 +7247,8 @@ export function NarratorPanel({
 										<Menu.Item
 											leftSection={<IconArrowsMinimize size={14} />}
 											onClick={handleSegmentCompact}
+											disabled={!compactSupported}
+											title={!compactSupported ? compactUnsupportedReason : undefined}
 										>
 											{t("segmentCompact")}
 										</Menu.Item>
@@ -7824,6 +8006,8 @@ export function NarratorPanel({
 														<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 															<PermissionMenuContent
 																currentMode={narrator.permissionMode ?? "default"}
+																availablePermissionModes={availablePermissionModes}
+																permissionModesUnavailableReason={permissionModesUnavailableReason}
 																onSelectPermissionMode={(m) =>
 																	permModeMutation.mutate({ id: narratorId, permissionMode: m })
 																}
@@ -7833,9 +8017,12 @@ export function NarratorPanel({
 																planModePending={
 																	enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
 																}
+																planModeSupported={planModeSupported}
+																planModeUnsupportedReason={planModeUnsupportedReason}
 																showPlanReflectionAutoApproveToggle={
-																	(narrator.permissionMode ?? "default") === "acceptEdits" ||
-																	(narrator.permissionMode ?? "default") === "bypassPermissions"
+																	planReflectionSupported &&
+																	((narrator.permissionMode ?? "default") === "acceptEdits" ||
+																		(narrator.permissionMode ?? "default") === "bypassPermissions")
 																}
 																planReflectionAutoApproveOverride={
 																	planReflectionAutoApproveOverride
@@ -7844,6 +8031,7 @@ export function NarratorPanel({
 																	planReflectionAutoApproveEffective
 																}
 																showDangerReflectionToggle={
+																	dangerReflectionSupported &&
 																	(narrator.permissionMode ?? "default") === "bypassPermissions"
 																}
 																dangerReflectionOverride={dangerReflectionOverride}
@@ -8034,6 +8222,8 @@ export function NarratorPanel({
 													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
 														<PermissionMenuContent
 															currentMode={narrator.permissionMode ?? "default"}
+															availablePermissionModes={availablePermissionModes}
+															permissionModesUnavailableReason={permissionModesUnavailableReason}
 															onSelectPermissionMode={(m) =>
 																permModeMutation.mutate({ id: narratorId, permissionMode: m })
 															}
@@ -8043,15 +8233,19 @@ export function NarratorPanel({
 															planModePending={
 																enterPlanModeMutation.isPending || exitPlanModeMutation.isPending
 															}
+															planModeSupported={planModeSupported}
+															planModeUnsupportedReason={planModeUnsupportedReason}
 															showPlanReflectionAutoApproveToggle={
-																(narrator.permissionMode ?? "default") === "acceptEdits" ||
-																(narrator.permissionMode ?? "default") === "bypassPermissions"
+																planReflectionSupported &&
+																((narrator.permissionMode ?? "default") === "acceptEdits" ||
+																	(narrator.permissionMode ?? "default") === "bypassPermissions")
 															}
 															planReflectionAutoApproveOverride={planReflectionAutoApproveOverride}
 															planReflectionAutoApproveEffective={
 																planReflectionAutoApproveEffective
 															}
 															showDangerReflectionToggle={
+																dangerReflectionSupported &&
 																(narrator.permissionMode ?? "default") === "bypassPermissions"
 															}
 															dangerReflectionOverride={dangerReflectionOverride}
@@ -8233,7 +8427,9 @@ export function NarratorPanel({
 								{(() => {
 									const hasInput = !!input.trim();
 									const hasAttachments = attachedImages.length > 0 || attachedTextFiles.length > 0;
-									const showInterrupt = isActive && !hasInput && !hasAttachments;
+									const showInterrupt =
+										isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
+
 									const hasCutInMessage = !!queuedMessages[0]?.priority;
 									const showRetry =
 										!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;

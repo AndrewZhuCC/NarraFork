@@ -61,8 +61,14 @@ func TestRulerDataWithoutGitPathReturnsExplicitFallback(t *testing.T) {
 	capabilities := body["capabilities"].(map[string]any)
 	mutations := capabilities["mutations"].(map[string]any)
 	fork := mutations["fork"].(map[string]any)
-	if fork["supported"] != false || fork["fallback"] != true || fork["code"] != "FEATURE_DISABLED" {
+	forkReason, _ := fork["reason"].(string)
+	if fork["supported"] != false || fork["fallback"] != true || fork["code"] != "FEATURE_DISABLED" || forkReason == "" {
 		t.Fatalf("ruler fork should expose disabled mutation fallback without chapter service, got %#v", fork)
+	}
+	rebase := mutations["rebase"].(map[string]any)
+	rebaseReason, _ := rebase["reason"].(string)
+	if rebase["supported"] != false || rebase["fallback"] != true || rebase["code"] != "FEATURE_DISABLED" || rebaseReason == "" {
+		t.Fatalf("ruler rebase should expose disabled mutation fallback without git service, got %#v", rebase)
 	}
 	degradedRead := capabilities["degradedRead"].(map[string]any)
 	fallbackReasons := degradedRead["fallbacks"].([]any)

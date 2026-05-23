@@ -114,7 +114,7 @@ func TestVNetHandlerRelayTokenJWTDisabledAndMessageLimit(t *testing.T) {
 		t.Fatalf("disabled vnet should still upgrade to report error: %v", err)
 	}
 	defer disabledConn.Close()
-	if msg := readWSMessageOfType(t, disabledConn, "error"); msg["code"] != "VNET_DISABLED" || msg["supported"] != true {
-		t.Fatalf("expected VNET_DISABLED websocket payload, got %#v", msg)
+	if msg := readWSMessageOfType(t, disabledConn, "error"); msg["code"] != "VNET_DISABLED" || msg["supported"] != true || msg["reason"] != "VNet is disabled" || msg["error"] != "VNet is disabled" || msg["message"] != "VNet is disabled" {
+		t.Fatalf("expected VNET_DISABLED websocket payload with reason/error/message, got %#v", msg)
 	}
 }

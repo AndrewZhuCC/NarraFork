@@ -103,7 +103,7 @@ func TestVolumeSnapshotCreateReturnsExplicitFallbackWithoutPodman(t *testing.T) 
 	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode fallback: %v", err)
 	}
-	if payload["fallback"] != true || payload["supported"] != false || payload["code"] != "PODMAN_NOT_FOUND" {
+	if payload["fallback"] != true || payload["supported"] != false || payload["code"] != "PODMAN_NOT_FOUND" || payload["reason"] == "" {
 		t.Fatalf("unexpected fallback payload: %#v", payload)
 	}
 	if got := countVolumeSnapshotRows(t, sqlDB, "volume_snapshots"); got != 0 {

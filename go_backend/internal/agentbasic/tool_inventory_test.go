@@ -81,6 +81,70 @@ func TestToolInventoryMarksUnimplementedOptionalToolsUnsupported(t *testing.T) {
 	}
 }
 
+func TestToolInventoryExposesWebFetchModeParityMetadata(t *testing.T) {
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	found := false
+	for _, tool := range metadata.Tools {
+		if tool.Name != "WebFetch" {
+			continue
+		}
+		found = true
+		if tool.Metadata["parity"] != "partial" || tool.Metadata["mode"] != "raw-only" || tool.Metadata["defaultMode"] != "raw" {
+			t.Fatalf("unexpected WebFetch tool metadata: %#v", tool.Metadata)
+		}
+	}
+	if !found {
+		t.Fatalf("WebFetch capability metadata missing: %#v", metadata.Tools)
+	}
+
+	menuFound := false
+	for _, item := range ToolMenuCapabilities() {
+		if stringValue(item["name"]) != "WebFetch" {
+			continue
+		}
+		menuFound = true
+		itemMetadata, _ := item["metadata"].(map[string]any)
+		if itemMetadata["parity"] != "partial" || itemMetadata["mode"] != "raw-only" {
+			t.Fatalf("unexpected WebFetch menu metadata: %#v", item)
+		}
+	}
+	if !menuFound {
+		t.Fatalf("WebFetch menu capability missing: %#v", ToolMenuCapabilities())
+	}
+}
+
+func TestToolInventoryExposesBrowserScreenshotParityMetadata(t *testing.T) {
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	found := false
+	for _, tool := range metadata.Tools {
+		if tool.Name != "Browser" {
+			continue
+		}
+		found = true
+		if tool.Metadata["parity"] != "partial" || tool.Metadata["screenshotPreviewMode"] != "inline-base64-or-file-artifact" || tool.Metadata["sharePreview"] != false || tool.Metadata["imageContentBlock"] != false || tool.Metadata["traceShare"] != true || tool.Metadata["traceShareUrl"] != "/api/shares/{shareId}" {
+			t.Fatalf("unexpected Browser tool metadata: %#v", tool.Metadata)
+		}
+	}
+	if !found {
+		t.Fatalf("Browser capability metadata missing: %#v", metadata.Tools)
+	}
+
+	menuFound := false
+	for _, item := range ToolMenuCapabilities() {
+		if stringValue(item["name"]) != "Browser" {
+			continue
+		}
+		menuFound = true
+		itemMetadata, _ := item["metadata"].(map[string]any)
+		if itemMetadata["runtime"] != "go-rod" || itemMetadata["sharePreview"] != false {
+			t.Fatalf("unexpected Browser menu metadata: %#v", item)
+		}
+	}
+	if !menuFound {
+		t.Fatalf("Browser menu capability missing: %#v", ToolMenuCapabilities())
+	}
+}
+
 func TestToolInventoryExternalMCPToolsAreInjectedAndGuarded(t *testing.T) {
 	external := []ExternalToolSpec{{
 		Name:        "mcp__filesystem__read_file",

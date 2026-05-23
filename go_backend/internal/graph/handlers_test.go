@@ -112,7 +112,7 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	}
 	partials := split["partials"].(map[string]any)
 	compressed := partials["compressedAISummary"].(map[string]any)
-	if compressed["supported"] != false || compressed["fallback"] != true || compressed["mode"] != "deterministic-summary-placeholder" {
+	if compressed["supported"] != false || compressed["fallback"] != true || compressed["mode"] != "deterministic-summary-placeholder" || compressed["reason"] != CompressedAISummaryFallbackReason {
 		t.Fatalf("compressed split AI summary should be explicit fallback, got %#v", compressed)
 	}
 	containerAutostart := partials["containerAutostart"].(map[string]any)

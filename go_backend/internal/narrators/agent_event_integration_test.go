@@ -523,7 +523,7 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "goal updated"}}}})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "goal-update-1", "type": "function", "function": map[string]any{"name": "UpdateGoal", "arguments": `{"goal_id":"` + goalID + `","status":"complete","evidence":"Verified event loop goal reflection completed successfully."}`}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "goal-update-1", "type": "function", "function": map[string]any{"name": "UpdateGoal", "arguments": `{"status":"complete"}`}}}}}}})
 	}))
 	defer server.Close()
 	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
@@ -547,6 +547,60 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 	}
 	if toolStatus != "success" || !strings.Contains(suggestionsRaw, "goal_reflection") || !strings.Contains(suggestionsRaw, "confirmed") || decisionReason == "" {
 		t.Fatalf("unexpected goal reflection tool call status=%s suggestions=%s reason=%q", toolStatus, suggestionsRaw, decisionReason)
+	}
+}
+
+func TestRunBasicAgentUpdateGoalRejectsLegacyNonActiveGoalID(t *testing.T) {
+	pendingGoalID := ""
+	reflectionRequested := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if requestHasTool(body, "GoalCompleteConfirm") || requestHasTool(body, "GoalCompleteRevise") {
+			reflectionRequested = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "unexpected reflection"}}}})
+			return
+		}
+		if requestHasToolResult(body) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "goal rejected"}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "goal-update-nonactive-1", "type": "function", "function": map[string]any{"name": "UpdateGoal", "arguments": `{"goal_id":"` + pendingGoalID + `","status":"complete"}`}}}}}}})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	activePayload, err := service.addGoal(context.Background(), narratorID, "Keep this active goal open", "tester")
+	if err != nil {
+		t.Fatalf("add active goal: %v", err)
+	}
+	pendingPayload, err := service.addGoal(context.Background(), narratorID, "Do not complete pending goal by id", "tester")
+	if err != nil {
+		t.Fatalf("add pending goal: %v", err)
+	}
+	activeGoal, _ := activePayload["goal"].(map[string]any)
+	pendingGoal, _ := pendingPayload["goal"].(map[string]any)
+	activeGoalID := stringFromAny(activeGoal["id"])
+	pendingGoalID = stringFromAny(pendingGoal["id"])
+	service.runBasicAgent(context.Background(), narratorID)
+	if reflectionRequested {
+		t.Fatalf("non-active legacy goal_id should be rejected before goal-completion reflection")
+	}
+	statuses := map[string]string{}
+	rows, err := service.DB.Query(`SELECT id, status FROM narrator_goals WHERE narrator_id = ?`, narratorID)
+	if err != nil {
+		t.Fatalf("query goals: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var idValue, status string
+		if err := rows.Scan(&idValue, &status); err != nil {
+			t.Fatalf("scan goal: %v", err)
+		}
+		statuses[idValue] = status
+	}
+	if statuses[activeGoalID] != "active" || statuses[pendingGoalID] != "pending" {
+		t.Fatalf("unexpected goal statuses after non-active UpdateGoal attempt: %#v", statuses)
 	}
 }
 
@@ -1082,6 +1136,10 @@ func TestUpdateSubagentConclusionUpdatesParentToolCallWithFallback(t *testing.T)
 	if payload["ok"] != true || payload["manualOverrideCleared"] != true || payload["fallback"] != true {
 		t.Fatalf("unexpected conclusion payload: %#v", payload)
 	}
+	reason, _ := payload["reason"].(string)
+	if reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("subagent conclusion fallback should expose reason/error/message, got %#v", payload)
+	}
 	var outputRaw string
 	if err := service.DB.QueryRow(`SELECT output_json FROM narrator_tool_calls WHERE tool_use_id = 'agent-1'`).Scan(&outputRaw); err != nil {
 		t.Fatalf("load updated tool call: %v", err)
@@ -1140,6 +1198,49 @@ func TestUpdateSubagentConclusionReturnsManualOverrideClearError(t *testing.T) {
 	}
 	if !strings.Contains(substatus, "manual_override") {
 		t.Fatalf("failed clear should leave manual_override for retry, got %s", substatus)
+	}
+}
+
+func TestProviderSpecificRetryableErrorPreservesCodeThroughWSAndFinalError(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "http://127.0.0.1")
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	ctx := context.Background()
+	narrator, err := service.Get(ctx, narratorID)
+	if err != nil {
+		t.Fatalf("get narrator: %v", err)
+	}
+	event := agentbasic.AgentEvent{
+		Type:     "retryable_error",
+		Code:     agentbasic.CodexRebuildHistoryRetryCode,
+		Message:  "codex quota failover requires history rebuild",
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Metadata: map[string]any{"previousCredentialId": "cred-old", "nextCredentialId": "cred-next"},
+	}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator}
+	if err := service.handleAgentEvent(ctx, state, event); err != nil {
+		t.Fatalf("handle provider retryable error: %v", err)
+	}
+
+	rawRetry := findBroadcast(events(), narratorID, "retryable_error")
+	if rawRetry == nil || rawRetry["code"] != agentbasic.CodexRebuildHistoryRetryCode || rawRetry["provider"] != "codex" || rawRetry["model"] != "gpt-5-codex" {
+		t.Fatalf("retryable_error should preserve provider code/model metadata, got %#v", rawRetry)
+	}
+	metadata, _ := rawRetry["metadata"].(map[string]any)
+	if metadata["previousCredentialId"] != "cred-old" || metadata["nextCredentialId"] != "cred-next" {
+		t.Fatalf("retryable_error should preserve failover metadata, got %#v", rawRetry)
+	}
+	finalError := findBroadcast(events(), narratorID, "narrator_error")
+	if finalError == nil || finalError["errorCode"] != agentbasic.CodexRebuildHistoryRetryCode || !strings.Contains(stringFromAny(finalError["error"]), "history rebuild") {
+		t.Fatalf("narrator_error should surface provider-specific error code, got %#v", finalError)
+	}
+	var status, substatus, persistedError string
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &persistedError); err != nil {
+		t.Fatalf("query persisted error status: %v", err)
+	}
+	if status != "idle" || substatus != `["error"]` || !strings.Contains(persistedError, "history rebuild") {
+		t.Fatalf("unexpected persisted provider error: status=%s substatus=%s error=%s", status, substatus, persistedError)
 	}
 }
 

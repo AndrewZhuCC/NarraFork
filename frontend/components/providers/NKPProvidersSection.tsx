@@ -15,6 +15,11 @@ import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderQuotaCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import type { CustomModelEntry } from "./InlineCustomModels";
@@ -33,6 +38,7 @@ interface NKPProvidersSectionProps {
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
 	isProviderDirty?: (providerId: string) => boolean;
+	onSaveBeforeRefresh?: () => Promise<boolean>;
 	quotas?: Record<string, { quotaBalance: number | null; quotaTotalGranted: number | null }>;
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
@@ -49,6 +55,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 	modelContextWindows,
 	onContextWindowChange,
 	isProviderDirty,
+	onSaveBeforeRefresh,
 	quotas,
 	customModels,
 	onCustomModelsChange,
@@ -57,6 +64,19 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 }: NKPProvidersSectionProps) {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
+	const nkpRuntimeCapability = useProviderRuntimeCapability("nkp");
+	const nkpRefreshCapability = useProviderModelRefreshCapability("nkp");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const nkpRefreshReason = nkpRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const nkpRoutesSupported = nkpRuntimeCapability?.routes?.supported !== false;
+	const canRefreshNkpProviderModels =
+		nkpRefreshCapability.supported &&
+		nkpRoutesSupported &&
+		nkpRuntimeCapability?.routes?.perProviderModelsRefresh !== false;
+	const nkpRefreshUnsupportedReason = nkpRefreshCapability.supported
+		? providerRouteUnsupportedReason
+		: nkpRefreshReason;
+	const nkpQuotaCapability = useProviderQuotaCapability("nkp");
 	const [refreshingProvider, setRefreshingProvider] = useState<string | null>(null);
 
 	const handleRemoveProvider = useCallback(
@@ -84,9 +104,10 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 
 	const handleRefreshProviderModels = useCallback(
 		async (providerId: string) => {
+			if (!canRefreshNkpProviderModels) return;
 			if (isProviderDirty?.(providerId)) {
-				notifications.show({ color: "yellow", title: t("refreshModelsSaveFirst"), message: "" });
-				return;
+				const saved = await onSaveBeforeRefresh?.();
+				if (!saved) return;
 			}
 			setRefreshingProvider(providerId);
 			try {
@@ -99,7 +120,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[qc, t, isProviderDirty],
+		[canRefreshNkpProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
 	);
 
 	return (
@@ -130,7 +151,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 											{t("nkpModelsCount", { count: pModels.length })}
 										</Badge>
 									)}
-									{!p.disabled && quota?.quotaBalance != null && (
+									{!p.disabled && nkpQuotaCapability.supported && quota?.quotaBalance != null && (
 										<Badge size="xs" variant="light" color="teal">
 											${quota.quotaBalance.toFixed(2)}
 										</Badge>
@@ -196,7 +217,8 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 									variant="light"
 									leftSection={<IconRefresh size={14} />}
 									loading={refreshingProvider === p.id}
-									disabled={!p.apiKey || !p.baseUrl}
+									disabled={!p.apiKey || !p.baseUrl || !canRefreshNkpProviderModels}
+									title={!canRefreshNkpProviderModels ? nkpRefreshUnsupportedReason : undefined}
 									onClick={() => handleRefreshProviderModels(p.id)}
 								>
 									{refreshingProvider === p.id

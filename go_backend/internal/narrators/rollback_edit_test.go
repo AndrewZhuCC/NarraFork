@@ -322,6 +322,105 @@ func TestEditAndRegenerateCanSkipRerunAndFileRevert(t *testing.T) {
 	}
 }
 
+func TestEditAndRegeneratePreservesCompactBoundaryAndDeletesLongToolChain(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	service := &Service{DB: sqlDB}
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	ctx := context.Background()
+
+	compactMessage, err := service.addMessageWithBlocks(ctx, narratorID, "system", "[Compact] Prior context", []map[string]any{
+		{"type": "compact", "status": "compacted", "summary": "Prior compacted context"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("insert compact marker: %v", err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE narrator_message_refs SET is_compact = 1 WHERE narrator_id = ? AND message_id = ?`, narratorID, compactMessage.ID); err != nil {
+		t.Fatalf("mark compact ref: %v", err)
+	}
+	userMsg, err := service.addMessageWithBlocks(ctx, narratorID, "user", "old question", []map[string]any{{"type": "text", "text": "old question"}}, nil)
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	firstTool, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "call first tool", []map[string]any{
+		{"type": "text", "text": "I will inspect"},
+		{"type": "tool_use", "id": "long-chain-tool-1", "name": "Read", "input": map[string]any{"file_path": "README.md"}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("insert first tool message: %v", err)
+	}
+	insertNarratorToolCallForSnapshotTest(t, sqlDB, narratorID, firstTool.ID, "long-chain-tool-1", "Read", map[string]any{"file_path": "README.md"}, time.Now().UTC())
+	firstResult, err := service.addMessageWithBlocks(ctx, narratorID, "user", "read result", []map[string]any{{"type": "tool_result", "tool_use_id": "long-chain-tool-1", "content": "read output"}}, nil)
+	if err != nil {
+		t.Fatalf("insert first tool result: %v", err)
+	}
+	secondTool, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "call second tool", []map[string]any{
+		{"type": "tool_use", "id": "long-chain-tool-2", "name": "Grep", "input": map[string]any{"pattern": "TODO", "path": "."}},
+	}, nil)
+	if err != nil {
+		t.Fatalf("insert second tool message: %v", err)
+	}
+	insertNarratorToolCallForSnapshotTest(t, sqlDB, narratorID, secondTool.ID, "long-chain-tool-2", "Grep", map[string]any{"pattern": "TODO", "path": "."}, time.Now().UTC())
+	secondResult, err := service.addMessageWithBlocks(ctx, narratorID, "user", "grep result", []map[string]any{{"type": "tool_result", "tool_use_id": "long-chain-tool-2", "content": "grep output"}}, nil)
+	if err != nil {
+		t.Fatalf("insert second tool result: %v", err)
+	}
+	finalAssistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "final answer", []map[string]any{{"type": "text", "text": "final answer"}}, nil)
+	if err != nil {
+		t.Fatalf("insert final assistant: %v", err)
+	}
+
+	result, err := service.EditAndRegenerate(ctx, narratorID, userMsg.ID, "new question", false, false)
+	if err != nil {
+		t.Fatalf("edit without rerun: %v", err)
+	}
+	wantDeleted := []string{firstTool.ID, firstResult.ID, secondTool.ID, secondResult.ID, finalAssistant.ID}
+	if len(result.DeletedMessageIDs) != len(wantDeleted) {
+		t.Fatalf("deleted message count mismatch: got %#v want %#v", result.DeletedMessageIDs, wantDeleted)
+	}
+	for i, want := range wantDeleted {
+		if result.DeletedMessageIDs[i] != want {
+			t.Fatalf("deleted message order mismatch: got %#v want %#v", result.DeletedMessageIDs, wantDeleted)
+		}
+	}
+	var refCount, compactRef int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*), COALESCE(MAX(is_compact), 0) FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?`, narratorID, compactMessage.ID).Scan(&refCount, &compactRef); err != nil {
+		t.Fatalf("load compact ref: %v", err)
+	}
+	if refCount != 1 || compactRef != 1 {
+		t.Fatalf("compact boundary should be preserved, refs=%d compact=%d", refCount, compactRef)
+	}
+	for _, deletedID := range wantDeleted {
+		var refs int
+		if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?`, narratorID, deletedID).Scan(&refs); err != nil {
+			t.Fatalf("count deleted ref %s: %v", deletedID, err)
+		}
+		if refs != 0 {
+			t.Fatalf("deleted message %s should not keep refs, got %d", deletedID, refs)
+		}
+	}
+	var staleToolCalls int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_tool_calls WHERE tool_use_id IN ('long-chain-tool-1', 'long-chain-tool-2')`).Scan(&staleToolCalls); err != nil {
+		t.Fatalf("count stale tool calls: %v", err)
+	}
+	if staleToolCalls != 0 {
+		t.Fatalf("deleted long tool chain should remove tool calls, got %d", staleToolCalls)
+	}
+	history, err := service.agentHistory(ctx, narratorID, 20)
+	if err != nil {
+		t.Fatalf("agent history: %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("expected compact summary plus edited user only, got %#v", history)
+	}
+	if history[0].Role != "user" || !strings.Contains(history[0].Content, "Prior compacted conversation summary:\nPrior compacted context") {
+		t.Fatalf("compact boundary summary mismatch: %#v", history[0])
+	}
+	if history[1].Role != "user" || history[1].Content != "new question" {
+		t.Fatalf("edited user history mismatch: %#v", history[1])
+	}
+}
+
 func TestCopyOnWriteMessageDoesNotMutateSharedMessage(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

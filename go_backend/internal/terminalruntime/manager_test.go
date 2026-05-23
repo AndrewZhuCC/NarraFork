@@ -231,22 +231,26 @@ func TestMarkStatusEmitsErrorWhenDatabaseUpdateFails(t *testing.T) {
 	if event["type"] != "error" || event["code"] != "TERMINAL_STATUS_PERSIST_FAILED" || event["status"] != "exited" || event["fallback"] != true || event["fatal"] != false {
 		t.Fatalf("unexpected status persist event: %#v", event)
 	}
+	reason, _ := event["reason"].(string)
+	if reason == "" || event["error"] != reason || event["message"] != reason {
+		t.Fatalf("status persist event should expose reason/error/message, got %#v", event)
+	}
 }
 
 func TestCapabilitiesExposePlatformAndReplayContract(t *testing.T) {
 	manager := NewManager(nil, nil)
 	manager.dtachAvailable = func() bool { return runtime.GOOS != "windows" }
 	caps := manager.Capabilities()
-	if caps["multiClientResizeMode"] != "last-input-client" || caps["scrollbackReplay"] != true || caps["bufferStateReplay"] != true {
+	if caps["multiClientResizeMode"] != "last-input-client" || caps["scrollbackReplay"] != true || caps["scrollbackReplayMode"] != "raw-capped-buffer" || caps["bufferStateReplay"] != true || caps["bufferStateMode"] != "raw-capped-buffer" || caps["xtermSerializedReplay"] != false {
 		t.Fatalf("unexpected terminal capability contract: %#v", caps)
 	}
 	if runtime.GOOS == "windows" {
-		if caps["supported"] != false || caps["directPty"] != false || caps["dtachSupported"] != false || caps["reason"] == "" {
-			t.Fatalf("expected explicit Windows unsupported capability, got %#v", caps)
+		if caps["supported"] != true || caps["directPty"] != true || caps["windowsPty"] != true || caps["runtime"] != "conpty" || caps["dtachSupported"] != false || caps["orphanRecovery"] != false {
+			t.Fatalf("expected Windows ConPTY terminal support capabilities, got %#v", caps)
 		}
 		return
 	}
-	if caps["supported"] != true || caps["directPty"] != true || caps["dtachSupported"] != true {
+	if caps["supported"] != true || caps["directPty"] != true || caps["windowsPty"] != false || caps["dtachSupported"] != true {
 		t.Fatalf("expected Unix-like terminal support capabilities, got %#v", caps)
 	}
 }

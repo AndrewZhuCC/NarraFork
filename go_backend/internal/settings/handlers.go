@@ -8,14 +8,18 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -23,6 +27,7 @@ import (
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/id"
+	"narrafork-go/internal/restart"
 )
 
 type ContainerProxyRuntime interface {
@@ -32,7 +37,13 @@ type ContainerProxyRuntime interface {
 type Handler struct {
 	Store        *config.Store
 	ProxyRuntime ContainerProxyRuntime
+	Restart      *restart.Manager
 }
+
+var settingsExecutablePath = os.Executable
+var settingsStartReplacement = startReplacementProcess
+
+const testModelPromptMaxChars = 10000
 
 func NewHandler(store *config.Store) *Handler { return &Handler{Store: store} }
 
@@ -50,6 +61,7 @@ func (h *Handler) get(w http.ResponseWriter, _ *http.Request) error {
 		return httpx.BadRequest("Settings unavailable")
 	}
 	raw := h.Store.Raw()
+	normalizeProviderCompatibilityForResponse(raw)
 	augmentProviderModelSettings(raw)
 	sanitizeSettingsForResponse(raw)
 	httpx.WriteJSON(w, http.StatusOK, raw)
@@ -90,12 +102,31 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) error {
 	next, _ = h.applyProviderRemovalSideEffects(current, next)
 	newHost, newPort, newTLSEnabled := serverAddressState(next)
 	if oldHost != newHost || oldPort != newPort || oldTLSEnabled != newTLSEnabled {
-		next["serverRestarting"] = true
-		next["newUrl"] = serverURL(newHost, newPort, newTLSEnabled)
+		restartPayload, restartErr := h.serverRestartResponse(r.Context(), newHost, newPort, newTLSEnabled)
+		if restartErr != nil {
+			return restartErr
+		}
+		for key, value := range restartPayload {
+			next[key] = value
+		}
 	}
 	sanitizeSettingsForResponse(next)
 	httpx.WriteJSON(w, http.StatusOK, next)
 	return nil
+}
+
+func normalizeProviderCompatibilityForResponse(raw map[string]any) {
+	customProviders := anySlice(raw["customApiProviders"])
+	if len(customProviders) > 0 {
+		raw["openaiProviders"] = customApiProvidersToOpenAI(customProviders)
+		raw["anthropicProviders"] = customApiProvidersToAnthropic(customProviders)
+		return
+	}
+	openaiProviders := anySlice(raw["openaiProviders"])
+	anthropicProviders := anySlice(raw["anthropicProviders"])
+	if len(openaiProviders) > 0 || len(anthropicProviders) > 0 {
+		raw["customApiProviders"] = deriveCustomApiProvidersFromLegacy(openaiProviders, anthropicProviders)
+	}
 }
 
 func augmentProviderModelSettings(raw map[string]any) {
@@ -469,35 +500,945 @@ func normalizeLegacySettingsPatch(patch map[string]any) map[string]any {
 			agent["dangerSkipReadOnlyConfirmations"] = value
 		}
 	}
-	if value, ok := agent["questionReflectionTimeoutMs"]; ok {
-		agent["questionReflectionTimeoutMs"] = clampNumberValue(value, 10000, 3600000, 300000)
-	}
 	return patch
 }
 
-func clampNumberValue(value any, minValue, maxValue, fallback int) float64 {
-	parsed := intSetting(value, fallback)
-	if parsed < minValue {
-		parsed = minValue
-	}
-	if parsed > maxValue {
-		parsed = maxValue
-	}
-	return float64(parsed)
-}
-
 func prepareSettingsPatch(current, patch map[string]any) error {
+	if err := validateSettingsPatchKeys(patch); err != nil {
+		return err
+	}
+	if err := validateServerSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validatePathsSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateAgentSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateChaptersSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateEditorSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateCodexSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateRoutinesSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateContainersSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateVNetSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateUpdateSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateSharesSettingsPatch(patch); err != nil {
+		return err
+	}
 	if err := validateAuthSettingsPatch(patch); err != nil {
+		return err
+	}
+	if err := validateProviderSettingsPatch(patch); err != nil {
 		return err
 	}
 	if err := preserveMaskedSecrets(current, patch); err != nil {
 		return err
 	}
+	syncLegacyProvidersFromCustomPatch(patch)
+	syncCustomProvidersFromLegacyPatch(current, patch)
 	if err := validateProviderPrefixes(current, patch); err != nil {
 		return err
 	}
 	if err := validateTLSFiles(patch); err != nil {
 		return err
+	}
+	return nil
+}
+
+var allowedSettingsPatchRoots = map[string]struct{}{
+	"server":             {},
+	"paths":              {},
+	"agent":              {},
+	"chapters":           {},
+	"containers":         {},
+	"editor":             {},
+	"auth":               {},
+	"customApiProviders": {},
+	"openaiProviders":    {},
+	"anthropicProviders": {},
+	"nkpProviders":       {},
+	"nugProviders":       {},
+	"clineProviders":     {},
+	"codex":              {},
+	"routines":           {},
+	"update":             {},
+	"vnet":               {},
+	"shares":             {},
+}
+
+func validateSettingsPatchKeys(patch map[string]any) error {
+	for key, value := range patch {
+		if _, ok := allowedSettingsPatchRoots[key]; !ok {
+			return httpx.ValidationError("unsupported settings field: " + key)
+		}
+		switch key {
+		case "server", "paths", "agent", "chapters", "containers", "editor", "auth", "codex", "routines", "update", "vnet", "shares":
+			if value != nil {
+				if _, ok := value.(map[string]any); !ok {
+					return httpx.ValidationError(key + " must be an object")
+				}
+			}
+		case "customApiProviders", "openaiProviders", "anthropicProviders", "nkpProviders", "nugProviders", "clineProviders":
+			if value != nil {
+				if _, ok := value.([]any); !ok {
+					return httpx.ValidationError(key + " must be an array")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func patchIntValue(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), true
+	case int:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err == nil {
+			return int(parsed), true
+		}
+	}
+	return 0, false
+}
+
+func validateServerSettingsPatch(patch map[string]any) error {
+	rawServer, exists := patch["server"]
+	if !exists {
+		return nil
+	}
+	serverPatch, ok := rawServer.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("server must be an object")
+	}
+	for key, value := range serverPatch {
+		switch key {
+		case "port":
+			port, ok := patchIntValue(value)
+			if !ok || port < 1 || port > 65535 {
+				return httpx.ValidationError("server.port must be an integer between 1 and 65535")
+			}
+		case "host":
+			if strings.TrimSpace(stringValue(value)) == "" || len(strings.TrimSpace(stringValue(value))) > 255 {
+				return httpx.ValidationError("server.host must be a non-empty string up to 255 characters")
+			}
+		case "openBrowser":
+			valueText := strings.TrimSpace(stringValue(value))
+			if valueText != "off" && valueText != "browser" && valueText != "app" {
+				return httpx.ValidationError("server.openBrowser must be one of off, browser, or app")
+			}
+		case "tls":
+			tlsPatch, ok := value.(map[string]any)
+			if !ok {
+				return httpx.ValidationError("server.tls must be an object")
+			}
+			for tlsKey, tlsValue := range tlsPatch {
+				switch tlsKey {
+				case "enabled":
+					if _, ok := tlsValue.(bool); !ok {
+						return httpx.ValidationError("server.tls.enabled must be boolean")
+					}
+				case "certFile", "keyFile", "caFile", "passphrase":
+					if _, ok := tlsValue.(string); !ok {
+						return httpx.ValidationError("server.tls." + tlsKey + " must be a string")
+					}
+				default:
+					return httpx.ValidationError("server.tls." + tlsKey + " cannot be updated")
+				}
+			}
+		default:
+			return httpx.ValidationError("server." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validatePathsSettingsPatch(patch map[string]any) error {
+	rawPaths, exists := patch["paths"]
+	if !exists {
+		return nil
+	}
+	pathsPatch, ok := rawPaths.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("paths must be an object")
+	}
+	for key, value := range pathsPatch {
+		switch key {
+		case "defaultProjectDir":
+			if strings.TrimSpace(stringValue(value)) == "" {
+				return httpx.ValidationError("paths.defaultProjectDir must be a non-empty string")
+			}
+		default:
+			return httpx.ValidationError("paths." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateAgentSettingsPatch(patch map[string]any) error {
+	rawAgent, exists := patch["agent"]
+	if !exists {
+		return nil
+	}
+	agentPatch, ok := rawAgent.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("agent must be an object")
+	}
+	for _, key := range []string{"defaultStartInPlanMode", "legacyEncoding", "freshShellEnv", "translateReasoning", "requestDumpEnabled", "requestDumpErrorsOnly", "defaultRelaxedPlan", "planReflectionAutoApprove", "questionReflectionEnabled", "dangerReflectionEnabled", "dangerSkipReadOnlyConfirmations"} {
+		if value, ok := agentPatch[key]; ok {
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("agent." + key + " must be boolean")
+			}
+		}
+	}
+	if value, ok := agentPatch["summaryModel"]; ok {
+		if _, ok := value.(string); !ok {
+			return httpx.ValidationError("agent.summaryModel must be a string")
+		}
+	}
+	for _, key := range []string{"defaultModel"} {
+		if value, ok := agentPatch[key]; ok && strings.TrimSpace(stringValue(value)) == "" {
+			return httpx.ValidationError("agent." + key + " must be a non-empty string")
+		}
+	}
+	if value, ok := agentPatch["defaultPermissionMode"]; ok && !isSettingsPermissionMode(stringValue(value)) {
+		return httpx.ValidationError("agent.defaultPermissionMode is not supported")
+	}
+	if value, ok := agentPatch["defaultReasoningEffort"]; ok {
+		effort, ok := value.(string)
+		if !ok || (effort != "none" && effort != "low" && effort != "medium" && effort != "high" && effort != "xhigh") {
+			return httpx.ValidationError("agent.defaultReasoningEffort is not supported")
+		}
+	}
+	intRanges := map[string][2]int{
+		"maxTurns":                    {1, 1000},
+		"maxTransientRetries":         {-1, 100},
+		"silentToolCallThreshold":     {-1, 1000},
+		"retryBackoffCeilMs":          {1000, 300000},
+		"firstTokenTimeoutMs":         {0, 600000},
+		"questionReflectionTimeoutMs": {10000, 3600000},
+		"autoCompactKeepPairs":        {1, 25},
+		"autoCompactPruneThreshold":   {0, 100},
+	}
+	for key, bounds := range intRanges {
+		if value, ok := agentPatch[key]; ok {
+			if err := validateSettingsIntRange(value, "agent."+key, bounds[0], bounds[1]); err != nil {
+				return err
+			}
+		}
+	}
+	if err := validateAgentCustomRetryRules(agentPatch); err != nil {
+		return err
+	}
+	if err := validateAgentPromptAndAggregations(agentPatch); err != nil {
+		return err
+	}
+	if value, ok := agentPatch["contextThresholds"]; ok {
+		thresholds, ok := value.(map[string]any)
+		if !ok {
+			return httpx.ValidationError("agent.contextThresholds must be an object")
+		}
+		if err := validateAgentContextThresholds(thresholds); err != nil {
+			return err
+		}
+	}
+	if err := validateAgentModelSelectionSettings(agentPatch); err != nil {
+		return err
+	}
+	if err := validateAgentPolicySettings(agentPatch); err != nil {
+		return err
+	}
+	return validateAgentWebFetchPolicy(agentPatch)
+}
+
+func isSettingsPermissionMode(value string) bool {
+	switch value {
+	case "default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAgentPromptAndAggregations(agentPatch map[string]any) error {
+	if value, ok := agentPatch["defaultSystemPrompt"]; ok {
+		prompt, ok := value.(string)
+		if !ok {
+			return httpx.ValidationError("agent.defaultSystemPrompt must be a string")
+		}
+		if len(prompt) > 50000 {
+			return httpx.ValidationError("agent.defaultSystemPrompt must be at most 50000 characters")
+		}
+	}
+	value, ok := agentPatch["modelAggregations"]
+	if !ok {
+		return nil
+	}
+	aggregations, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("agent.modelAggregations must be an array")
+	}
+	if len(aggregations) > 50 {
+		return httpx.ValidationError("agent.modelAggregations must contain at most 50 items")
+	}
+	for i, item := range aggregations {
+		agg, ok := item.(map[string]any)
+		path := "agent.modelAggregations[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := validateSettingsStringFieldBounds(agg, "id", path, 1, 20); err != nil {
+			return err
+		}
+		if err := validateSettingsStringFieldBounds(agg, "name", path, 1, 100); err != nil {
+			return err
+		}
+		if err := validateModelAggregationModels(agg, path); err != nil {
+			return err
+		}
+		routingMode := stringValue(agg["routingMode"])
+		if routingMode != "priority" && routingMode != "balanced" {
+			return httpx.ValidationError(path + ".routingMode must be priority or balanced")
+		}
+	}
+	return nil
+}
+
+func validateModelAggregationModels(agg map[string]any, path string) error {
+	value, ok := agg["models"]
+	if !ok {
+		return httpx.ValidationError(path + ".models is required")
+	}
+	models, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(path + ".models must be an array")
+	}
+	if len(models) < 1 || len(models) > 20 {
+		return httpx.ValidationError(path + ".models must contain between 1 and 20 items")
+	}
+	for i, item := range models {
+		model, ok := item.(string)
+		if !ok || strings.TrimSpace(model) == "" {
+			return httpx.ValidationError(path + ".models[" + strconv.Itoa(i) + "] must be a non-empty string")
+		}
+	}
+	return nil
+}
+
+func validateSettingsStringFieldBounds(item map[string]any, key string, path string, minLen int, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if len(text) < minLen {
+		return httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if len(text) > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func validateAgentCustomRetryRules(agentPatch map[string]any) error {
+	value, ok := agentPatch["customRetryRules"]
+	if !ok {
+		return nil
+	}
+	rules, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("agent.customRetryRules must be an array")
+	}
+	if len(rules) > 100 {
+		return httpx.ValidationError("agent.customRetryRules must contain at most 100 items")
+	}
+	for i, item := range rules {
+		rule, ok := item.(map[string]any)
+		path := "agent.customRetryRules[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if _, err := settingsRequiredStringField(rule, "id", path, 1); err != nil {
+			return err
+		}
+		for _, key := range []string{"domain", "keyword"} {
+			if err := settingsOptionalStringField(rule, key, path); err != nil {
+				return err
+			}
+		}
+		if value, ok := rule["statusCode"]; ok {
+			if err := validateSettingsIntRange(value, path+".statusCode", 100, 599); err != nil {
+				return err
+			}
+		}
+		if err := settingsOptionalBoolField(rule, "enabled", path); err != nil {
+			return err
+		}
+		if err := settingsOptionalStringMaxField(rule, "note", path, 200); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAgentModelSelectionSettings(agentPatch map[string]any) error {
+	if err := validateAgentCustomModels(agentPatch); err != nil {
+		return err
+	}
+	if err := settingsStringArrayField(agentPatch, "hiddenModels", "agent", -1); err != nil {
+		return err
+	}
+	if err := settingsStringArrayField(agentPatch, "providerOrder", "agent", 50); err != nil {
+		return err
+	}
+	if err := settingsStringArrayField(agentPatch, "disabledProviders", "agent", 200); err != nil {
+		return err
+	}
+	if err := validateAgentModelContextWindows(agentPatch); err != nil {
+		return err
+	}
+	if err := validateAgentSubagentModels(agentPatch); err != nil {
+		return err
+	}
+	return validateAgentSubagentAllowedModels(agentPatch)
+}
+
+func validateAgentCustomModels(agentPatch map[string]any) error {
+	value, ok := agentPatch["customModels"]
+	if !ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("agent.customModels must be an array")
+	}
+	for i, item := range items {
+		model, ok := item.(map[string]any)
+		path := "agent.customModels[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if _, err := settingsRequiredStringField(model, "value", path, 1); err != nil {
+			return err
+		}
+		if _, err := settingsRequiredStringField(model, "label", path, 1); err != nil {
+			return err
+		}
+		for _, key := range []string{"provider", "channel", "channelType"} {
+			if err := settingsOptionalStringField(model, key, path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateAgentModelContextWindows(agentPatch map[string]any) error {
+	value, ok := agentPatch["modelContextWindows"]
+	if !ok {
+		return nil
+	}
+	windows, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("agent.modelContextWindows must be an object")
+	}
+	for key, value := range windows {
+		if key == "" {
+			return httpx.ValidationError("agent.modelContextWindows keys must be non-empty")
+		}
+		if err := validateSettingsIntRange(value, "agent.modelContextWindows."+key, 1, int(^uint(0)>>1)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAgentSubagentModels(agentPatch map[string]any) error {
+	value, ok := agentPatch["subagentModels"]
+	if !ok {
+		return nil
+	}
+	models, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("agent.subagentModels must be an object")
+	}
+	for key, value := range models {
+		switch key {
+		case "explore", "plan":
+			if _, ok := value.(string); !ok {
+				return httpx.ValidationError("agent.subagentModels." + key + " must be a string")
+			}
+		default:
+			return httpx.ValidationError("agent.subagentModels." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateAgentSubagentAllowedModels(agentPatch map[string]any) error {
+	value, ok := agentPatch["subagentAllowedModels"]
+	if !ok {
+		return nil
+	}
+	allowed, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("agent.subagentAllowedModels must be an object")
+	}
+	for key := range allowed {
+		switch key {
+		case "explore", "plan", "general":
+			if err := settingsStringArrayField(allowed, key, "agent.subagentAllowedModels", -1); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("agent.subagentAllowedModels." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateAgentWebFetchPolicy(agentPatch map[string]any) error {
+	value, ok := agentPatch["webFetchPolicy"]
+	if !ok {
+		return nil
+	}
+	policy, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("agent.webFetchPolicy must be an object")
+	}
+	for key, value := range policy {
+		switch key {
+		case "allowAll":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("agent.webFetchPolicy.allowAll must be boolean")
+			}
+		case "whitelist", "blacklist":
+			if err := validateAgentWebFetchPatternList(value, "agent.webFetchPolicy."+key); err != nil {
+				return err
+			}
+		case "proxy":
+			proxy, ok := value.(map[string]any)
+			if !ok {
+				return httpx.ValidationError("agent.webFetchPolicy.proxy must be an object")
+			}
+			normalizeProxyField(proxy, "url")
+			if err := validateAgentWebFetchProxy(proxy); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("agent.webFetchPolicy." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateAgentWebFetchPatternList(value any, path string) error {
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(path + " must be an array")
+	}
+	for i, item := range items {
+		rule, ok := item.(map[string]any)
+		itemPath := path + "[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(itemPath + " must be an object")
+		}
+		if _, ok := rule["pattern"].(string); !ok {
+			return httpx.ValidationError(itemPath + ".pattern must be a string")
+		}
+		if err := settingsOptionalBoolField(rule, "enabled", itemPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAgentWebFetchProxy(proxy map[string]any) error {
+	for key, value := range proxy {
+		switch key {
+		case "mode":
+			mode := stringValue(value)
+			if mode != "direct" && mode != "system" && mode != "custom" {
+				return httpx.ValidationError("agent.webFetchPolicy.proxy.mode must be direct, system, or custom")
+			}
+		case "url":
+			proxyURL, ok := value.(string)
+			if !ok {
+				return httpx.ValidationError("agent.webFetchPolicy.proxy.url must be a string")
+			}
+			if proxyURL != "" {
+				parsed, err := url.Parse(proxyURL)
+				if err != nil || parsed.Scheme == "" || parsed.Host == "" || !validProxyScheme(parsed.Scheme) {
+					return httpx.ValidationError("agent.webFetchPolicy.proxy.url must be an http, https, socks4, socks5, or socks5h URL")
+				}
+			}
+		default:
+			return httpx.ValidationError("agent.webFetchPolicy.proxy." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateAgentPolicySettings(agentPatch map[string]any) error {
+	if err := validateAgentPathPolicyRules(agentPatch, "whitelistDirs", true); err != nil {
+		return err
+	}
+	if err := validateAgentPathPolicyRules(agentPatch, "blacklistDirs", false); err != nil {
+		return err
+	}
+	if err := validateAgentCommandPolicyRules(agentPatch, "commandWhitelist", false); err != nil {
+		return err
+	}
+	return validateAgentCommandPolicyRules(agentPatch, "commandBlacklist", true)
+}
+
+func validateAgentPathPolicyRules(agentPatch map[string]any, key string, whitelist bool) error {
+	value, ok := agentPatch[key]
+	if !ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("agent." + key + " must be an array")
+	}
+	if len(items) > 50 {
+		return httpx.ValidationError("agent." + key + " must contain at most 50 items")
+	}
+	for i, item := range items {
+		rule, ok := item.(map[string]any)
+		path := "agent." + key + "[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := settingsRequiredTrimmedString(rule, "path", path, 1, 4096); err != nil {
+			return err
+		}
+		if whitelist {
+			if err := settingsOptionalEnumField(rule, "accessLevel", path, []string{"readOnly", "readWrite", "full"}); err != nil {
+				return err
+			}
+		} else {
+			if err := settingsOptionalEnumField(rule, "denyLevel", path, []string{"denyWrite", "denyAll"}); err != nil {
+				return err
+			}
+		}
+		if err := settingsOptionalBoolField(rule, "enabled", path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateAgentCommandPolicyRules(agentPatch map[string]any, key string, includeDenyPrompt bool) error {
+	value, ok := agentPatch[key]
+	if !ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("agent." + key + " must be an array")
+	}
+	if len(items) > 50 {
+		return httpx.ValidationError("agent." + key + " must contain at most 50 items")
+	}
+	for i, item := range items {
+		rule, ok := item.(map[string]any)
+		path := "agent." + key + "[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := settingsRequiredTrimmedString(rule, "pattern", path, 1, 200); err != nil {
+			return err
+		}
+		if includeDenyPrompt {
+			if err := settingsOptionalStringMaxField(rule, "denyPrompt", path, 2000); err != nil {
+				return err
+			}
+		}
+		if err := settingsOptionalBoolField(rule, "enabled", path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func settingsRequiredTrimmedString(item map[string]any, key string, path string, minLen int, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	text = strings.TrimSpace(text)
+	if len(text) < minLen {
+		return httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if len(text) > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func settingsOptionalStringMaxField(item map[string]any, key string, path string, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if len(text) > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func validateAgentContextThresholds(thresholds map[string]any) error {
+	for tier, minValue := range map[string]int{"standard": 50, "large": 10} {
+		value, ok := thresholds[tier]
+		if !ok {
+			continue
+		}
+		cfg, ok := value.(map[string]any)
+		if !ok {
+			return httpx.ValidationError("agent.contextThresholds." + tier + " must be an object")
+		}
+		for _, key := range []string{"pruneStart", "compactStart"} {
+			if value, ok := cfg[key]; ok {
+				if err := validateSettingsIntRange(value, "agent.contextThresholds."+tier+"."+key, minValue, 100); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateChaptersSettingsPatch(patch map[string]any) error {
+	rawChapters, exists := patch["chapters"]
+	if !exists {
+		return nil
+	}
+	chaptersPatch, ok := rawChapters.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("chapters must be an object")
+	}
+	for key, value := range chaptersPatch {
+		switch key {
+		case "maxActiveWorktrees":
+			if err := validateSettingsIntRange(value, "chapters.maxActiveWorktrees", 1, int(^uint(0)>>1)); err != nil {
+				return err
+			}
+		case "maxActiveContainers", "worktreeSizeWarningMb", "dormantAfterMinutes":
+			if err := validateSettingsIntRange(value, "chapters."+key, 0, int(^uint(0)>>1)); err != nil {
+				return err
+			}
+		case "autoSaveOnDormant":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("chapters.autoSaveOnDormant must be boolean")
+			}
+		default:
+			return httpx.ValidationError("chapters." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateEditorSettingsPatch(patch map[string]any) error {
+	rawEditor, exists := patch["editor"]
+	if !exists {
+		return nil
+	}
+	editorPatch, ok := rawEditor.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("editor must be an object")
+	}
+	for key, value := range editorPatch {
+		switch key {
+		case "type":
+			editorType := stringValue(value)
+			if editorType != "vscode" && editorType != "cursor" && editorType != "windsurf" && editorType != "zed" {
+				return httpx.ValidationError("editor.type must be one of vscode, cursor, windsurf, or zed")
+			}
+		default:
+			return httpx.ValidationError("editor." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateCodexSettingsPatch(patch map[string]any) error {
+	rawCodex, exists := patch["codex"]
+	if !exists {
+		return nil
+	}
+	codexPatch, ok := rawCodex.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("codex must be an object")
+	}
+	for key, value := range codexPatch {
+		switch key {
+		case "proxy":
+			proxy, ok := value.(string)
+			if !ok {
+				return httpx.ValidationError("codex.proxy must be a string")
+			}
+			proxy = normalizeProxyURL(proxy)
+			codexPatch["proxy"] = proxy
+			if proxy != "" {
+				parsed, err := url.Parse(proxy)
+				if err != nil || parsed.Scheme == "" || parsed.Host == "" || !validProxyScheme(parsed.Scheme) {
+					return httpx.ValidationError("codex.proxy must be an http, https, socks4, socks5, or socks5h URL")
+				}
+			}
+		case "loadBalancingMode":
+			mode := stringValue(value)
+			if mode != "priority" && mode != "balanced" && mode != "tier-balanced" {
+				return httpx.ValidationError("codex.loadBalancingMode must be priority, balanced, or tier-balanced")
+			}
+		case "tierOrder":
+			items, ok := value.([]any)
+			if !ok {
+				return httpx.ValidationError("codex.tierOrder must be an array")
+			}
+			if len(items) > 6 {
+				return httpx.ValidationError("codex.tierOrder must contain at most 6 items")
+			}
+			for i, item := range items {
+				tier, ok := item.(string)
+				if !ok || !isCodexTier(tier) {
+					return httpx.ValidationError("codex.tierOrder[" + strconv.Itoa(i) + "] is not supported")
+				}
+			}
+		case "defaultReasoningEffort":
+			if value == nil {
+				continue
+			}
+			effort := stringValue(value)
+			if effort != "none" && effort != "low" && effort != "medium" && effort != "high" && effort != "xhigh" {
+				return httpx.ValidationError("codex.defaultReasoningEffort is not supported")
+			}
+		default:
+			return httpx.ValidationError("codex." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateRoutinesSettingsPatch(patch map[string]any) error {
+	rawRoutines, exists := patch["routines"]
+	if !exists {
+		return nil
+	}
+	routinesPatch, ok := rawRoutines.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("routines must be an object")
+	}
+	for key := range routinesPatch {
+		switch key {
+		case "disabledRoutines", "enabledRoutines":
+			if err := settingsOptionalStringArrayField(routinesPatch, key, "routines"); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("routines." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validProxyScheme(scheme string) bool {
+	return scheme == "http" || scheme == "https" || scheme == "socks4" || scheme == "socks5" || scheme == "socks5h"
+}
+
+func normalizeProxyURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "://") {
+		return trimmed
+	}
+	return "http://" + trimmed
+}
+
+func normalizeProxyField(item map[string]any, key string) {
+	if value, ok := item[key].(string); ok {
+		item[key] = normalizeProxyURL(value)
+	}
+}
+
+func isCodexTier(tier string) bool {
+	switch tier {
+	case "free", "plus", "team", "prolite", "pro", "other":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateContainersSettingsPatch(patch map[string]any) error {
+	rawContainers, exists := patch["containers"]
+	if !exists {
+		return nil
+	}
+	containersPatch, ok := rawContainers.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("containers must be an object")
+	}
+	for key, value := range containersPatch {
+		switch key {
+		case "portRangeStart", "portRangeEnd":
+			port, ok := patchIntValue(value)
+			if !ok || port < 1 || port > 65535 {
+				return httpx.ValidationError("containers." + key + " must be an integer between 1 and 65535")
+			}
+		case "proxy":
+			proxyPatch, ok := value.(map[string]any)
+			if !ok {
+				return httpx.ValidationError("containers.proxy must be an object")
+			}
+			for proxyKey, proxyValue := range proxyPatch {
+				switch proxyKey {
+				case "enabled":
+					if _, ok := proxyValue.(bool); !ok {
+						return httpx.ValidationError("containers.proxy.enabled must be boolean")
+					}
+				case "port":
+					port, ok := patchIntValue(proxyValue)
+					if !ok || port < 1 || port > 65535 {
+						return httpx.ValidationError("containers.proxy.port must be an integer between 1 and 65535")
+					}
+				default:
+					return httpx.ValidationError("containers.proxy." + proxyKey + " cannot be updated")
+				}
+			}
+		default:
+			return httpx.ValidationError("containers." + key + " cannot be updated")
+		}
 	}
 	return nil
 }
@@ -521,6 +1462,361 @@ func validateAuthSettingsPatch(patch map[string]any) error {
 			}
 		default:
 			return httpx.ValidationError("auth." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateUpdateSettingsPatch(patch map[string]any) error {
+	rawUpdate, exists := patch["update"]
+	if !exists {
+		return nil
+	}
+	updatePatch, ok := rawUpdate.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("update must be an object")
+	}
+	for key, value := range updatePatch {
+		switch key {
+		case "serverUrl":
+			serverURL := stringValue(value)
+			parsed, err := url.Parse(serverURL)
+			if serverURL == "" || err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				return httpx.ValidationError("update.serverUrl must be a valid URL")
+			}
+		case "product":
+			if stringValue(value) == "" {
+				return httpx.ValidationError("update.product must be a non-empty string")
+			}
+		case "channel":
+			channel := stringValue(value)
+			if channel != "stable" && channel != "beta" {
+				return httpx.ValidationError("update.channel must be stable or beta")
+			}
+		case "checkIntervalMinutes":
+			if err := validateSettingsIntRange(value, "update.checkIntervalMinutes", 0, int(^uint(0)>>1)); err != nil {
+				return err
+			}
+		case "autoDownload":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("update.autoDownload must be boolean")
+			}
+		default:
+			return httpx.ValidationError("update." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateSharesSettingsPatch(patch map[string]any) error {
+	rawShares, exists := patch["shares"]
+	if !exists {
+		return nil
+	}
+	sharesPatch, ok := rawShares.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("shares must be an object")
+	}
+	for key, value := range sharesPatch {
+		switch key {
+		case "defaultExpiryHours", "maxFileSizeMb":
+			if err := validateSettingsIntRange(value, "shares."+key, 1, int(^uint(0)>>1)); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("shares." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateVNetSettingsPatch(patch map[string]any) error {
+	rawVNet, exists := patch["vnet"]
+	if !exists {
+		return nil
+	}
+	vnetPatch, ok := rawVNet.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("vnet must be an object")
+	}
+	for key, value := range vnetPatch {
+		switch key {
+		case "enabled", "allowAnonymousRelay":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("vnet." + key + " must be boolean")
+			}
+		case "relayToken":
+			if _, ok := value.(string); !ok {
+				return httpx.ValidationError("vnet.relayToken must be a string")
+			}
+		case "maxPeersPerNetwork":
+			if err := validateSettingsIntRange(value, "vnet.maxPeersPerNetwork", 1, 1024); err != nil {
+				return err
+			}
+		case "maxMessageBytes":
+			if err := validateSettingsIntRange(value, "vnet.maxMessageBytes", 1024, 64*1024*1024); err != nil {
+				return err
+			}
+		case "udp":
+			udpPatch, ok := value.(map[string]any)
+			if !ok {
+				return httpx.ValidationError("vnet.udp must be an object")
+			}
+			if err := validateVNetUDPSettingsPatch(udpPatch); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("vnet." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateVNetUDPSettingsPatch(udpPatch map[string]any) error {
+	for key, value := range udpPatch {
+		switch key {
+		case "enabled":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("vnet.udp.enabled must be boolean")
+			}
+		case "host":
+			host := strings.TrimSpace(stringValue(value))
+			if host == "" || len(host) > 255 {
+				return httpx.ValidationError("vnet.udp.host must be a non-empty string up to 255 characters")
+			}
+		case "port":
+			if err := validateSettingsIntRange(value, "vnet.udp.port", 0, 65535); err != nil {
+				return err
+			}
+		default:
+			return httpx.ValidationError("vnet.udp." + key + " cannot be updated")
+		}
+	}
+	return nil
+}
+
+func validateSettingsIntRange(value any, path string, minValue int, maxValue int) error {
+	number, ok := value.(float64)
+	if !ok || number != float64(int(number)) || number < float64(minValue) || number > float64(maxValue) {
+		return httpx.ValidationError(path + " must be an integer between " + strconv.Itoa(minValue) + " and " + strconv.Itoa(maxValue))
+	}
+	return nil
+}
+
+type providerPatchSchema struct {
+	requiredStrings map[string]int
+	optionalStrings []string
+	optionalBools   []string
+	optionalEnums   map[string][]string
+	nullableEnums   map[string][]string
+	optionalIntsMin map[string]int
+	optionalArrays  []string
+}
+
+var providerPatchSchemas = map[string]providerPatchSchema{
+	"customApiProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0, "protocol": 1},
+		optionalStrings: []string{"proxy", "codexAccountId"},
+		optionalBools:   []string{"tlsRejectUnauthorized", "codexWebSocket", "disabled"},
+		optionalEnums:   map[string][]string{"protocol": {"anthropic-official", "anthropic-compatible", "codex-native", "responses-compatible", "completions-compatible"}},
+		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high"}},
+		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
+	},
+	"openaiProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
+		optionalStrings: []string{"codexAccountId"},
+		optionalBools:   []string{"responsesApi", "codexWebSocket", "disabled"},
+		optionalEnums:   map[string][]string{"apiMode": {"responses", "completions", "codex"}},
+		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
+	},
+	"anthropicProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
+		optionalStrings: []string{"proxy"},
+		optionalBools:   []string{"tlsRejectUnauthorized", "officialApi", "disabled"},
+		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high"}},
+	},
+	"nkpProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
+		optionalBools:   []string{"disabled"},
+	},
+	"nugProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
+		optionalStrings: []string{"nugUsername", "nugUserId", "oauthClientId", "oauthClientSecret", "oauthDeviceId", "oauthCallbackUrl"},
+		optionalBools:   []string{"disabled"},
+	},
+	"clineProviders": {
+		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "baseUrl": 0, "defaultModel": 0},
+		optionalStrings: []string{"accessToken"},
+		optionalBools:   []string{"disabled"},
+		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
+		optionalArrays:  []string{"enabledModels"},
+	},
+}
+
+func validateProviderSettingsPatch(patch map[string]any) error {
+	for field, schema := range providerPatchSchemas {
+		value, ok := patch[field]
+		if !ok {
+			continue
+		}
+		items, ok := value.([]any)
+		if !ok {
+			return httpx.ValidationError(field + " must be an array")
+		}
+		for i, item := range items {
+			provider, ok := item.(map[string]any)
+			path := field + "[" + strconv.Itoa(i) + "]"
+			if !ok {
+				return httpx.ValidationError(path + " must be an object")
+			}
+			if err := validateProviderPatchItem(provider, path, schema); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateProviderPatchItem(provider map[string]any, path string, schema providerPatchSchema) error {
+	for key, minLen := range schema.requiredStrings {
+		if _, err := settingsRequiredStringField(provider, key, path, minLen); err != nil {
+			return err
+		}
+	}
+	for _, key := range schema.optionalStrings {
+		if err := settingsOptionalStringField(provider, key, path); err != nil {
+			return err
+		}
+		if key == "proxy" {
+			normalizeProxyField(provider, key)
+		}
+	}
+	for _, key := range schema.optionalBools {
+		if err := settingsOptionalBoolField(provider, key, path); err != nil {
+			return err
+		}
+	}
+	for key, allowed := range schema.optionalEnums {
+		if err := settingsOptionalEnumField(provider, key, path, allowed); err != nil {
+			return err
+		}
+	}
+	for key, allowed := range schema.nullableEnums {
+		if err := settingsOptionalNullableEnumField(provider, key, path, allowed); err != nil {
+			return err
+		}
+	}
+	for key, minValue := range schema.optionalIntsMin {
+		if err := settingsOptionalIntMinField(provider, key, path, minValue); err != nil {
+			return err
+		}
+	}
+	for _, key := range schema.optionalArrays {
+		if err := settingsOptionalStringArrayField(provider, key, path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func settingsRequiredStringField(item map[string]any, key string, path string, minLen int) (string, error) {
+	value, ok := item[key]
+	if !ok {
+		return "", httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if len(text) < minLen {
+		return "", httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	return text, nil
+}
+
+func settingsOptionalStringField(item map[string]any, key string, path string) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	if _, ok := value.(string); !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	return nil
+}
+
+func settingsOptionalBoolField(item map[string]any, key string, path string) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	if _, ok := value.(bool); !ok {
+		return httpx.ValidationError(path + "." + key + " must be boolean")
+	}
+	return nil
+}
+
+func settingsOptionalEnumField(item map[string]any, key string, path string, allowed []string) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	return settingsEnumValue(value, key, path, allowed)
+}
+
+func settingsOptionalNullableEnumField(item map[string]any, key string, path string, allowed []string) error {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return nil
+	}
+	return settingsEnumValue(value, key, path, allowed)
+}
+
+func settingsEnumValue(value any, key string, path string, allowed []string) error {
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	for _, allowedValue := range allowed {
+		if text == allowedValue {
+			return nil
+		}
+	}
+	return httpx.ValidationError(path + "." + key + " is not supported")
+}
+
+func settingsOptionalIntMinField(item map[string]any, key string, path string, minValue int) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	number, ok := value.(float64)
+	if !ok || number != float64(int(number)) || number < float64(minValue) {
+		return httpx.ValidationError(path + "." + key + " must be an integer >= " + strconv.Itoa(minValue))
+	}
+	item[key] = int(number)
+	return nil
+}
+
+func settingsOptionalStringArrayField(item map[string]any, key string, path string) error {
+	return settingsStringArrayField(item, key, path, -1)
+}
+
+func settingsStringArrayField(item map[string]any, key string, path string, maxItems int) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be an array")
+	}
+	if maxItems >= 0 && len(items) > maxItems {
+		return httpx.ValidationError(path + "." + key + " must contain at most " + strconv.Itoa(maxItems) + " items")
+	}
+	for i, item := range items {
+		if _, ok := item.(string); !ok {
+			return httpx.ValidationError(path + "." + key + "[" + strconv.Itoa(i) + "] must be a string")
 		}
 	}
 	return nil
@@ -678,7 +1974,11 @@ func purgeStaleAgentModelRefs(agent map[string]any, stalePrefixes map[string]boo
 		changed = true
 	}
 	if subagent, ok := cleaned["subagentModels"].(map[string]any); ok {
-		for _, key := range []string{"explore", "plan", "general"} {
+		if _, ok := subagent["general"]; ok {
+			delete(subagent, "general")
+			changed = true
+		}
+		for _, key := range []string{"explore", "plan"} {
 			if isStale(stringValue(subagent[key])) {
 				subagent[key] = ""
 				changed = true
@@ -817,14 +2117,223 @@ func preserveProviderSecret(current, patch map[string]any, field, secretKey stri
 	}
 }
 
+func syncLegacyProvidersFromCustomPatch(patch map[string]any) {
+	providers, ok := patch["customApiProviders"].([]any)
+	if !ok {
+		return
+	}
+	patch["openaiProviders"] = customApiProvidersToOpenAI(providers)
+	patch["anthropicProviders"] = customApiProvidersToAnthropic(providers)
+}
+
+func syncCustomProvidersFromLegacyPatch(current, patch map[string]any) {
+	if _, hasCustomProviders := patch["customApiProviders"]; hasCustomProviders {
+		return
+	}
+	_, hasOpenAIProviders := patch["openaiProviders"]
+	_, hasAnthropicProviders := patch["anthropicProviders"]
+	if !hasOpenAIProviders && !hasAnthropicProviders {
+		return
+	}
+	openaiProviders := anySlice(current["openaiProviders"])
+	if incoming, ok := patch["openaiProviders"].([]any); ok {
+		openaiProviders = incoming
+	}
+	anthropicProviders := anySlice(current["anthropicProviders"])
+	if incoming, ok := patch["anthropicProviders"].([]any); ok {
+		anthropicProviders = incoming
+	}
+	patch["customApiProviders"] = deriveCustomApiProvidersFromLegacy(openaiProviders, anthropicProviders)
+}
+
+func deriveCustomApiProvidersFromLegacy(openaiProviders, anthropicProviders []any) []any {
+	byID := map[string]map[string]any{}
+	order := []string{}
+	for _, item := range openaiProviders {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		converted := openAIProviderToCustomApi(provider)
+		providerID := stringValue(converted["id"])
+		if _, exists := byID[providerID]; !exists {
+			order = append(order, providerID)
+		}
+		byID[providerID] = converted
+	}
+	for _, item := range anthropicProviders {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		converted := anthropicProviderToCustomApi(provider)
+		providerID := stringValue(converted["id"])
+		if existing, exists := byID[providerID]; exists {
+			merged := cloneMap(existing)
+			for key, value := range converted {
+				merged[key] = value
+			}
+			if value, ok := existing["codexAccountId"]; ok {
+				merged["codexAccountId"] = value
+			}
+			if value, ok := existing["codexWebSocket"]; ok {
+				merged["codexWebSocket"] = value
+			}
+			byID[providerID] = merged
+			continue
+		}
+		order = append(order, providerID)
+		byID[providerID] = converted
+	}
+	out := make([]any, 0, len(order))
+	for _, providerID := range order {
+		out = append(out, byID[providerID])
+	}
+	return out
+}
+
+func openAIProviderToCustomApi(provider map[string]any) map[string]any {
+	converted := map[string]any{
+		"id":           stringValue(provider["id"]),
+		"name":         stringValue(provider["name"]),
+		"prefix":       stringValue(provider["prefix"]),
+		"apiKey":       stringValue(provider["apiKey"]),
+		"baseUrl":      stringValue(provider["baseUrl"]),
+		"defaultModel": stringValue(provider["defaultModel"]),
+		"protocol":     customApiProtocolFromOpenAI(provider),
+	}
+	copyProviderFieldIfPresent(converted, provider, "disabled")
+	copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
+	copyProviderFieldIfPresent(converted, provider, "codexAccountId")
+	copyProviderFieldIfPresent(converted, provider, "codexWebSocket")
+	return converted
+}
+
+func anthropicProviderToCustomApi(provider map[string]any) map[string]any {
+	converted := map[string]any{
+		"id":           stringValue(provider["id"]),
+		"name":         stringValue(provider["name"]),
+		"prefix":       stringValue(provider["prefix"]),
+		"apiKey":       stringValue(provider["apiKey"]),
+		"baseUrl":      stringValue(provider["baseUrl"]),
+		"defaultModel": stringValue(provider["defaultModel"]),
+		"protocol":     customApiProtocolFromAnthropic(boolValue(provider["officialApi"])),
+	}
+	copyProviderFieldIfPresent(converted, provider, "disabled")
+	copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
+	copyProviderFieldIfPresent(converted, provider, "defaultReasoningEffort")
+	copyProviderFieldIfPresent(converted, provider, "proxy")
+	copyProviderFieldIfPresent(converted, provider, "tlsRejectUnauthorized")
+	return converted
+}
+
+func customApiProtocolFromOpenAI(provider map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(stringValue(provider["apiMode"]))) {
+	case "codex":
+		return "codex-native"
+	case "completions":
+		return "completions-compatible"
+	case "responses":
+		return "responses-compatible"
+	default:
+		if responsesAPI, ok := provider["responsesApi"].(bool); ok && !responsesAPI {
+			return "completions-compatible"
+		}
+		return "responses-compatible"
+	}
+}
+
+func customApiProtocolFromAnthropic(officialAPI bool) string {
+	if officialAPI {
+		return "anthropic-official"
+	}
+	return "anthropic-compatible"
+}
+
+func customApiProvidersToOpenAI(providers []any) []any {
+	out := []any{}
+	for _, item := range providers {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		apiMode := customApiProtocolToOpenAIApiMode(stringValue(provider["protocol"]))
+		if apiMode == "" {
+			continue
+		}
+		converted := map[string]any{
+			"id":           stringValue(provider["id"]),
+			"name":         stringValue(provider["name"]),
+			"prefix":       stringValue(provider["prefix"]),
+			"apiKey":       stringValue(provider["apiKey"]),
+			"baseUrl":      stringValue(provider["baseUrl"]),
+			"defaultModel": stringValue(provider["defaultModel"]),
+			"apiMode":      apiMode,
+		}
+		copyProviderFieldIfPresent(converted, provider, "disabled")
+		copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
+		copyProviderFieldIfPresent(converted, provider, "codexAccountId")
+		copyProviderFieldIfPresent(converted, provider, "codexWebSocket")
+		out = append(out, converted)
+	}
+	return out
+}
+
+func customApiProvidersToAnthropic(providers []any) []any {
+	out := []any{}
+	for _, item := range providers {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		protocol := strings.ToLower(strings.TrimSpace(stringValue(provider["protocol"])))
+		if protocol != "anthropic-official" && protocol != "anthropic-compatible" {
+			continue
+		}
+		converted := map[string]any{
+			"id":           stringValue(provider["id"]),
+			"name":         stringValue(provider["name"]),
+			"prefix":       stringValue(provider["prefix"]),
+			"apiKey":       stringValue(provider["apiKey"]),
+			"baseUrl":      stringValue(provider["baseUrl"]),
+			"defaultModel": stringValue(provider["defaultModel"]),
+			"officialApi":  protocol == "anthropic-official",
+		}
+		copyProviderFieldIfPresent(converted, provider, "disabled")
+		copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
+		copyProviderFieldIfPresent(converted, provider, "proxy")
+		copyProviderFieldIfPresent(converted, provider, "tlsRejectUnauthorized")
+		if value, ok := provider["defaultReasoningEffort"]; ok && value != nil {
+			converted["defaultReasoningEffort"] = value
+		}
+		out = append(out, converted)
+	}
+	return out
+}
+
+func customApiProtocolToOpenAIApiMode(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "codex-native":
+		return "codex"
+	case "responses-compatible":
+		return "responses"
+	case "completions-compatible":
+		return "completions"
+	default:
+		return ""
+	}
+}
+
+func copyProviderFieldIfPresent(dst, src map[string]any, key string) {
+	if value, ok := src[key]; ok {
+		dst[key] = value
+	}
+}
+
 func validateProviderPrefixes(current, patch map[string]any) error {
 	type providerRef struct{ prefix, source string }
 	refs := []providerRef{}
-	for _, field := range []string{"customApiProviders", "nkpProviders", "nugProviders", "clineProviders"} {
-		providers := anySlice(current[field])
-		if incoming, ok := patch[field].([]any); ok {
-			providers = incoming
-		}
+	appendProviderRefs := func(field string, providers []any) {
 		for _, item := range providers {
 			provider, ok := item.(map[string]any)
 			if !ok {
@@ -837,13 +2346,31 @@ func validateProviderPrefixes(current, patch map[string]any) error {
 			refs = append(refs, providerRef{prefix: prefix, source: firstString(stringValue(provider["name"]), stringValue(provider["id"]), field)})
 		}
 	}
+	if customProviders, ok := patch["customApiProviders"].([]any); ok {
+		appendProviderRefs("customApiProviders", customProviders)
+	} else {
+		for _, field := range []string{"openaiProviders", "anthropicProviders"} {
+			providers := anySlice(current[field])
+			if incoming, ok := patch[field].([]any); ok {
+				providers = incoming
+			}
+			appendProviderRefs(field, providers)
+		}
+	}
+	for _, field := range []string{"nkpProviders", "nugProviders", "clineProviders"} {
+		providers := anySlice(current[field])
+		if incoming, ok := patch[field].([]any); ok {
+			providers = incoming
+		}
+		appendProviderRefs(field, providers)
+	}
 	seen := map[string]string{}
 	for _, ref := range refs {
 		if ref.prefix == "kiro" || ref.prefix == "codex" {
-			return httpx.BadRequest("Provider prefix \"" + ref.prefix + "\" is reserved")
+			return httpx.ValidationError("Provider prefix \"" + ref.prefix + "\" is reserved")
 		}
 		if existing := seen[ref.prefix]; existing != "" {
-			return httpx.BadRequest("Duplicate provider prefix \"" + ref.prefix + "\" found in " + existing + " and " + ref.source)
+			return httpx.ValidationError("Duplicate provider prefix \"" + ref.prefix + "\" found in " + existing + " and " + ref.source)
 		}
 		seen[ref.prefix] = ref.source
 	}
@@ -859,13 +2386,13 @@ func validateTLSFiles(patch map[string]any) error {
 	certFile := stringValue(tls["certFile"])
 	keyFile := stringValue(tls["keyFile"])
 	if certFile == "" || !fileExists(certFile) {
-		return httpx.BadRequest("TLS certificate file not found: " + firstString(certFile, "(empty)"))
+		return httpx.ValidationError("TLS certificate file not found: " + firstString(certFile, "(empty)"))
 	}
 	if keyFile == "" || !fileExists(keyFile) {
-		return httpx.BadRequest("TLS private key file not found: " + firstString(keyFile, "(empty)"))
+		return httpx.ValidationError("TLS private key file not found: " + firstString(keyFile, "(empty)"))
 	}
 	if caFile := stringValue(tls["caFile"]); caFile != "" && !fileExists(caFile) {
-		return httpx.BadRequest("TLS CA certificate file not found: " + caFile)
+		return httpx.ValidationError("TLS CA certificate file not found: " + caFile)
 	}
 	return nil
 }
@@ -933,6 +2460,47 @@ func serverURL(host string, port int, tlsEnabled bool) string {
 		scheme = "https"
 	}
 	return scheme + "://" + host + ":" + strconv.Itoa(port)
+}
+
+func (h *Handler) serverRestartResponse(ctx context.Context, host string, port int, tlsEnabled bool) (map[string]any, error) {
+	newURL := serverURL(host, port, tlsEnabled)
+	if h == nil || h.Restart == nil {
+		return map[string]any{"serverRestarting": false, "manualRestartRequired": true, "newUrl": newURL}, nil
+	}
+	session, err := h.Restart.Begin()
+	if err != nil {
+		return nil, err
+	}
+	execPath, err := settingsExecutablePath()
+	if err != nil {
+		h.Restart.Cancel()
+		return nil, err
+	}
+	if strings.TrimSpace(execPath) == "" {
+		h.Restart.Cancel()
+		return nil, fmt.Errorf("resolve current executable: empty path")
+	}
+	pid, err := settingsStartReplacement(ctx, execPath, os.Args[1:], restart.EnvForSession(session))
+	if err != nil {
+		h.Restart.Cancel()
+		return nil, err
+	}
+	return map[string]any{"serverRestarting": true, "manualRestartRequired": false, "newUrl": newURL, "handoffUrl": session.URL, "replacementPid": pid}, nil
+}
+
+func startReplacementProcess(ctx context.Context, path string, args []string, extraEnv []string) (int, error) {
+	cmd := exec.CommandContext(ctx, path, args...)
+	cmd.Env = append(os.Environ(), extraEnv...)
+	cmd.Dir, _ = os.Getwd()
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+	pid := cmd.Process.Pid
+	_ = cmd.Process.Release()
+	return pid, nil
 }
 
 func contextThresholdTierForModel(raw map[string]any, r *http.Request) string {
@@ -1057,11 +2625,17 @@ func (h *Handler) testModel(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if strings.TrimSpace(body.Model) == "" || strings.TrimSpace(body.Prompt) == "" {
-		return httpx.BadRequest("model and prompt are required")
+		return httpx.ValidationError("model and prompt are required")
+	}
+	if utf8.RuneCountInString(body.Prompt) > testModelPromptMaxChars {
+		return httpx.ValidationError("prompt must be at most 10000 characters")
+	}
+	if _, err := agentbasic.ResolveProviderAndModel(h.Store, body.Model); err != nil {
+		return httpx.BadRequest(err.Error())
 	}
 	result, err := agentbasic.Generate(r.Context(), h.Store, body.Model, []agentbasic.Message{{Role: "user", Content: body.Prompt}}, "")
 	if err != nil {
-		return err
+		return httpx.Error(http.StatusBadGateway, "BAD_GATEWAY", err.Error())
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"text": result.Text})
 	return nil
@@ -1085,13 +2659,20 @@ func (h *Handler) generateTLS(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
-		"certPath":         certPath,
-		"keyPath":          keyPath,
-		"expiresAt":        expiresAt.Format(time.RFC3339),
-		"newUrl":           serverURL(host, port, true),
-		"serverRestarting": true,
-	})
+	restartPayload, restartErr := h.serverRestartResponse(r.Context(), host, port, true)
+	if restartErr != nil {
+		return restartErr
+	}
+	response := map[string]any{
+		"certPath":  certPath,
+		"keyPath":   keyPath,
+		"expiresAt": expiresAt.Format(time.RFC3339),
+	}
+	for key, value := range restartPayload {
+		response[key] = value
+	}
+	httpx.WriteJSON(w, http.StatusOK, response)
+
 	return nil
 }
 
@@ -1145,19 +2726,48 @@ func (h *Handler) addRetryRule(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if body["domain"] == nil && body["statusCode"] == nil && body["keyword"] == nil {
+	hasRetryTrigger := false
+	for _, key := range []string{"domain", "keyword"} {
+		value, exists := body[key]
+		if !exists {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok || text == "" {
+			return httpx.ValidationError("agent.customRetryRules[0]." + key + " must be a non-empty string")
+		}
+		hasRetryTrigger = true
+	}
+	if _, exists := body["statusCode"]; exists {
+		if err := validateSettingsIntRange(body["statusCode"], "agent.customRetryRules[0].statusCode", 100, 599); err != nil {
+			return err
+		}
+		hasRetryTrigger = true
+	}
+	if !hasRetryTrigger {
 		return httpx.BadRequest("At least one of domain, statusCode, or keyword is required")
 	}
-	ruleID := id.New()
-	body["id"] = ruleID
+	if h.Store == nil {
+		return httpx.NotImplemented("settings.retryRules")
+	}
+	rule := map[string]any{"id": id.New(), "enabled": true}
+	for _, key := range []string{"domain", "statusCode", "keyword", "note"} {
+		if value, ok := body[key]; ok {
+			rule[key] = value
+		}
+	}
+	if err := validateAgentCustomRetryRules(map[string]any{"customRetryRules": []any{rule}}); err != nil {
+		return err
+	}
 	raw := h.Store.Raw()
-	rules, _ := raw["retryRules"].([]any)
-	rules = append(rules, body)
-	_, err := h.Store.Patch(map[string]any{"retryRules": rules})
+	agent, _ := raw["agent"].(map[string]any)
+	rules, _ := agent["customRetryRules"].([]any)
+	rules = append(rules, rule)
+	_, err := h.Store.Patch(map[string]any{"agent": map[string]any{"customRetryRules": rules}})
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id": ruleID})
+	httpx.WriteJSON(w, http.StatusCreated, rule)
 	return nil
 }
 

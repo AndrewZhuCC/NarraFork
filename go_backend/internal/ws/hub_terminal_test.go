@@ -155,8 +155,8 @@ func TestTerminalSubscribeReportsSnapshotFallbackError(t *testing.T) {
 	if fallback["type"] != "error" || fallback["terminalId"] != "term-running" || fallback["code"] != "TERMINAL_SNAPSHOT_UNAVAILABLE" || fallback["fallback"] != true || fallback["fatal"] != false {
 		t.Fatalf("unexpected snapshot fallback payload: %#v", fallback)
 	}
-	if fallback["message"] != "snapshot failed" {
-		t.Fatalf("snapshot fallback should include error detail, got %#v", fallback)
+	if fallback["reason"] != "snapshot failed" || fallback["error"] != "snapshot failed" || fallback["message"] != "snapshot failed" {
+		t.Fatalf("snapshot fallback should include reason/error/message detail, got %#v", fallback)
 	}
 }
 

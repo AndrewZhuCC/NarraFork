@@ -238,6 +238,38 @@ func externalToolMetadata(tools []ExternalToolSpec, name string) map[string]any 
 	return nil
 }
 
+func staticToolMetadata(name string) map[string]any {
+	switch name {
+	case "WebFetch":
+		return map[string]any{
+			"parity":           "partial",
+			"mode":             "raw-only",
+			"defaultMode":      "raw",
+			"supportedModes":   []string{"raw"},
+			"unsupportedModes": []string{"readability", "dom", "smart", "screenshot"},
+			"protocols":        []string{"http", "https", "data"},
+			"policy":           "permission-policy-and-proxy-consumed",
+			"reason":           "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
+		}
+	case "Browser":
+		return map[string]any{
+			"parity":                "partial",
+			"runtime":               "go-rod",
+			"screenshotPreviewMode": "inline-base64-or-file-artifact",
+			"sharePreview":          false,
+			"imageContentBlock":     false,
+			"fileOutput":            true,
+			"traceFormat":           "chrome-devtools-json",
+			"traceShare":            true,
+			"traceFileOutput":       true,
+			"traceShareUrl":         "/api/shares/{shareId}",
+			"reason":                "Go Browser screenshots return JSON/base64 or an explicit file_path artifact; TS additionally returns an image content block and temporary share preview metadata. Browser perf_stop writes Chrome trace JSON and creates a functional share URL when file_path is omitted.",
+		}
+	default:
+		return nil
+	}
+}
+
 func unsupportedOptionalToolMetadata() []map[string]any {
 	items := make([]map[string]any, 0, len(unsupportedOptionalTools))
 	for _, tool := range unsupportedOptionalTools {
@@ -271,6 +303,7 @@ func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMet
 			Source:    "static",
 			Supported: true,
 			Enabled:   enabled[spec.Name],
+			Metadata:  staticToolMetadata(spec.Name),
 		})
 	}
 	if scope != ToolScopeReflection {
@@ -343,6 +376,9 @@ func ToolMenuCapabilitiesForOptions(opts ToolInventoryOptions) []map[string]any 
 			"description": spec.Description,
 			"category":    category,
 			"supported":   true,
+		}
+		if metadata := staticToolMetadata(spec.Name); metadata != nil {
+			item["metadata"] = metadata
 		}
 		if category == ToolCategoryMCP {
 			item["source"] = "mcp"

@@ -469,6 +469,62 @@ func TestStaleShareDiskWithoutRecordReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestCleanupStaleSharesRemovesDiskFallbackAndMemoryRecords(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetShareRecords(t)
+	dir := shareDirPath("stale-share")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create stale share dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "stale.html"), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale share: %v", err)
+	}
+	metadata := shareDiskMetadata{
+		ID:           "stale-share",
+		OriginalName: "stale.html",
+		FileName:     "stale.html",
+		SizeBytes:    5,
+		ExpiresAt:    time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+	}
+	data, err := json.Marshal(metadata)
+	if err != nil {
+		t.Fatalf("marshal metadata: %v", err)
+	}
+	if err := os.WriteFile(shareMetadataPath("stale-share"), data, 0o644); err != nil {
+		t.Fatalf("write stale metadata: %v", err)
+	}
+	if err := os.WriteFile(shareMetadataPath("stale-share")+".tmp", data, 0o644); err != nil {
+		t.Fatalf("write stale metadata tmp: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sharesRoot(), "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write unrelated file: %v", err)
+	}
+	shareRecords.set(shareRecord{ID: "memory-share", StoragePath: filepath.Join(dir, "stale.html"), OriginalName: "stale.html", ExpiresAt: time.Now().Add(time.Hour)})
+
+	removed, err := CleanupStaleShares()
+	if err != nil {
+		t.Fatalf("cleanup stale shares: %v", err)
+	}
+	if removed != 3 {
+		t.Fatalf("expected 3 stale entries removed, got %d", removed)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("expected stale share dir removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(shareMetadataPath("stale-share")); !os.IsNotExist(err) {
+		t.Fatalf("expected stale metadata removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(shareMetadataPath("stale-share") + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("expected stale temp metadata removed, stat err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sharesRoot(), "keep.txt")); err != nil {
+		t.Fatalf("expected unrelated file to remain: %v", err)
+	}
+	if shareRecords.len() != 0 {
+		t.Fatalf("stale cleanup should clear memory records")
+	}
+}
+
 func TestCleanupSharesClearsMemoryAndDisk(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	dir := shareDirPath("cleanup-share")

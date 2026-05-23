@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -58,6 +59,13 @@ func TestVNetWebSocketDisabledContract(t *testing.T) {
 	if plainW.Code != http.StatusNotImplemented {
 		t.Fatalf("expected plain /ws/vnet to return 501, got %d: %s", plainW.Code, plainW.Body.String())
 	}
+	var plainBody map[string]any
+	if err := json.Unmarshal(plainW.Body.Bytes(), &plainBody); err != nil {
+		t.Fatalf("decode plain vnet disabled body: %v", err)
+	}
+	if plainBody["reason"] != "VNet relay/UDP WebSocket runtime is not bundled in go_backend" || plainBody["error"] != plainBody["reason"] || plainBody["message"] != plainBody["reason"] {
+		t.Fatalf("plain disabled vnet payload should expose reason/error/message, got %#v", plainBody)
+	}
 
 	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(server.URL, "http"), nil)
 	if err != nil {
@@ -66,7 +74,7 @@ func TestVNetWebSocketDisabledContract(t *testing.T) {
 	defer conn.Close()
 
 	msg := readWSMessage(t, conn)
-	if msg["type"] != "error" || msg["code"] != "VNET_DISABLED" || msg["supported"] != false || msg["fallback"] != true {
+	if msg["type"] != "error" || msg["code"] != "VNET_DISABLED" || msg["supported"] != false || msg["fallback"] != true || msg["reason"] != plainBody["reason"] || msg["error"] != plainBody["reason"] || msg["message"] != plainBody["reason"] {
 		t.Fatalf("unexpected disabled vnet payload: %#v", msg)
 	}
 }

@@ -1,5 +1,6 @@
 import {
 	ActionIcon,
+	Alert,
 	Badge,
 	Button,
 	Divider,
@@ -22,6 +23,11 @@ import { IconDeviceFloppy, IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	useProviderModelRefreshCapability,
+	useProviderRouteCapability,
+	useProviderRuntimeCapability,
+} from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
 import { relativeTime } from "../../lib/relative-time";
@@ -63,6 +69,42 @@ export const KiroSection = React.memo(function KiroSection({
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
 	const qc = useQueryClient();
+	const kiroRefreshCapability = useProviderModelRefreshCapability("kiro");
+	const kiroRuntimeCapability = useProviderRuntimeCapability("kiro");
+	const kiroStatusRoute = useProviderRouteCapability("kiro", "status");
+	const kiroLoadBalancingRoute = useProviderRouteCapability("kiro", "loadBalancingMode");
+	const kiroCredentialsImportRoute = useProviderRouteCapability("kiro", "credentialsImport");
+	const kiroCredentialDisableRoute = useProviderRouteCapability("kiro", "credentialDisable");
+	const kiroCredentialEnableRoute = useProviderRouteCapability("kiro", "credentialEnable");
+	const kiroCredentialResetRoute = useProviderRouteCapability("kiro", "credentialReset");
+	const kiroCredentialPriorityRoute = useProviderRouteCapability("kiro", "credentialPriority");
+	const kiroCredentialRefreshRoute = useProviderRouteCapability("kiro", "credentialRefresh");
+	const kiroCredentialUsageRoute = useProviderRouteCapability("kiro", "credentialUsage");
+	const kiroCredentialUpdateRoute = useProviderRouteCapability("kiro", "credentialUpdate");
+	const kiroCredentialDeleteRoute = useProviderRouteCapability("kiro", "credentialDelete");
+	const kiroModelsRefreshRoute = useProviderRouteCapability("kiro", "modelsRefresh");
+	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
+	const kiroPluginBridge = kiroRuntimeCapability?.pluginBridge;
+	const showKiroPluginBridgeRequirement =
+		kiroPluginBridge?.supported !== false && kiroPluginBridge?.requiresBun === true;
+	const kiroPluginBridgeRequirementReason =
+		kiroPluginBridge?.reason ?? t("kiroPluginBridgeRequiresBunDesc");
+	const kiroRefreshReason = kiroRefreshCapability.reason ?? t("providerRefreshModelsUnsupported");
+	const canReadKiroStatus = kiroStatusRoute.supported;
+	const canSetKiroLoadBalancingMode = kiroLoadBalancingRoute.supported;
+	const canImportKiroCredentials = kiroCredentialsImportRoute.supported;
+	const canDisableKiroCredential = kiroCredentialDisableRoute.supported;
+	const canEnableKiroCredential = kiroCredentialEnableRoute.supported;
+	const canResetKiroCredential = kiroCredentialResetRoute.supported;
+	const canSetKiroCredentialPriority = kiroCredentialPriorityRoute.supported;
+	const canRefreshKiroCredential = kiroCredentialRefreshRoute.supported;
+	const canQueryKiroCredentialUsage = kiroCredentialUsageRoute.supported;
+	const canUpdateKiroCredential = kiroCredentialUpdateRoute.supported;
+	const canDeleteKiroCredential = kiroCredentialDeleteRoute.supported;
+	const canRefreshKiroModels = kiroRefreshCapability.supported && kiroModelsRefreshRoute.supported;
+	const kiroRefreshUnsupportedReason = kiroRefreshCapability.supported
+		? (kiroModelsRefreshRoute.reason ?? providerRouteUnsupportedReason)
+		: kiroRefreshReason;
 	const [refreshingKiro, setRefreshingKiro] = useState(false);
 
 	// --- Kiro credential state ---
@@ -73,6 +115,7 @@ export const KiroSection = React.memo(function KiroSection({
 	const { data: kiroStatus } = useQuery({
 		queryKey: ["kiro", "status"],
 		queryFn: api.kiroStatus,
+		enabled: canReadKiroStatus,
 		refetchInterval: 30_000,
 		gcTime: KIRO_STATUS_GC_TIME_MS,
 	});
@@ -143,6 +186,7 @@ export const KiroSection = React.memo(function KiroSection({
 	});
 
 	const handleImport = useCallback(() => {
+		if (!canImportKiroCredentials) return;
 		setImportError(null);
 		setImportResult(null);
 		try {
@@ -152,9 +196,10 @@ export const KiroSection = React.memo(function KiroSection({
 		} catch {
 			setImportError(t("kiroImportInvalidJson"));
 		}
-	}, [importJson, importMut, t]);
+	}, [importJson, importMut, t, canImportKiroCredentials]);
 
 	const handleRefreshKiro = useCallback(async () => {
+		if (!canRefreshKiroModels) return;
 		setRefreshingKiro(true);
 		try {
 			await api.kiroRefreshModels();
@@ -166,7 +211,7 @@ export const KiroSection = React.memo(function KiroSection({
 		} finally {
 			setRefreshingKiro(false);
 		}
-	}, [qc, t]);
+	}, [canRefreshKiroModels, qc, t]);
 
 	// --- Build kiro models list ---
 	const kiroModels: ModelOption[] = settings?.kiroModels?.length
@@ -217,6 +262,12 @@ export const KiroSection = React.memo(function KiroSection({
 				{t("kiroSectionDesc")}
 			</Text>
 
+			{showKiroPluginBridgeRequirement && (
+				<Alert color="blue" variant="light" title={t("kiroPluginBridgeRequiresBunTitle")}>
+					{kiroPluginBridgeRequirementReason}
+				</Alert>
+			)}
+
 			{/* Load balancing mode */}
 			{snapshot && (
 				<Group gap="xs" align="center">
@@ -224,7 +275,10 @@ export const KiroSection = React.memo(function KiroSection({
 					<SegmentedControl
 						size="xs"
 						value={snapshot.loadBalancingMode}
-						onChange={(v) => lbModeMut.mutate(v as "priority" | "balanced")}
+						disabled={!canSetKiroLoadBalancingMode}
+						onChange={(v) =>
+							canSetKiroLoadBalancingMode && lbModeMut.mutate(v as "priority" | "balanced")
+						}
 						data={[
 							{ value: "priority", label: t("kiroModePriority") },
 							{ value: "balanced", label: t("kiroModeBalanced") },
@@ -268,11 +322,12 @@ export const KiroSection = React.memo(function KiroSection({
 			)}
 			<Button
 				onClick={handleImport}
-				disabled={!importJson.trim()}
+				disabled={!importJson.trim() || !canImportKiroCredentials}
 				loading={importMut.isPending}
 				size="xs"
 				variant="light"
 				style={{ alignSelf: "flex-start" }}
+				title={!canImportKiroCredentials ? providerRouteUnsupportedReason : undefined}
 			>
 				{t("kiroImportBtn")}
 			</Button>
@@ -310,6 +365,15 @@ export const KiroSection = React.memo(function KiroSection({
 							deleteMut={deleteMut}
 							updateMut={updateMut}
 							priorityMut={priorityMut}
+							canDisableKiroCredential={canDisableKiroCredential}
+							canEnableKiroCredential={canEnableKiroCredential}
+							canResetKiroCredential={canResetKiroCredential}
+							canSetKiroCredentialPriority={canSetKiroCredentialPriority}
+							canRefreshKiroCredential={canRefreshKiroCredential}
+							canQueryKiroCredentialUsage={canQueryKiroCredentialUsage}
+							canUpdateKiroCredential={canUpdateKiroCredential}
+							canDeleteKiroCredential={canDeleteKiroCredential}
+							credentialRouteUnsupportedReason={providerRouteUnsupportedReason}
 						/>
 					</Stack>
 				);
@@ -326,6 +390,8 @@ export const KiroSection = React.memo(function KiroSection({
 					variant="light"
 					leftSection={<IconRefresh size={14} />}
 					loading={refreshingKiro}
+					disabled={!canRefreshKiroModels}
+					title={!canRefreshKiroModels ? kiroRefreshUnsupportedReason : undefined}
 					onClick={async () => {
 						if (await confirm({ message: t("kiroRefreshModelsConfirm"), confirmColor: "indigo" })) {
 							handleRefreshKiro();
@@ -386,6 +452,15 @@ interface CredentialListProps {
 	updateMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types
 	priorityMut: any;
+	canDisableKiroCredential: boolean;
+	canEnableKiroCredential: boolean;
+	canResetKiroCredential: boolean;
+	canSetKiroCredentialPriority: boolean;
+	canRefreshKiroCredential: boolean;
+	canQueryKiroCredentialUsage: boolean;
+	canUpdateKiroCredential: boolean;
+	canDeleteKiroCredential: boolean;
+	credentialRouteUnsupportedReason: string;
 }
 
 function CredentialList(props: CredentialListProps) {
@@ -405,25 +480,47 @@ function CredentialActions({
 	onEdit?: () => void;
 } & Pick<
 	CredentialListProps,
-	"disableMut" | "enableMut" | "resetMut" | "refreshMut" | "usageMut" | "deleteMut" | "updateMut"
+	| "disableMut"
+	| "enableMut"
+	| "resetMut"
+	| "refreshMut"
+	| "usageMut"
+	| "deleteMut"
+	| "updateMut"
+	| "canDisableKiroCredential"
+	| "canEnableKiroCredential"
+	| "canResetKiroCredential"
+	| "canRefreshKiroCredential"
+	| "canQueryKiroCredentialUsage"
+	| "canUpdateKiroCredential"
+	| "canDeleteKiroCredential"
+	| "credentialRouteUnsupportedReason"
 >) {
 	const { t } = useTranslation("settings");
 	const confirm = useConfirmDialog();
+	const canToggleEnabled = entry.disabled
+		? muts.canEnableKiroCredential
+		: muts.canDisableKiroCredential;
 	return (
 		<Group gap="xs" wrap="wrap">
 			<Switch
 				size="xs"
 				checked={!entry.disabled}
-				onChange={() =>
-					entry.disabled ? muts.enableMut.mutate(entry.id) : muts.disableMut.mutate(entry.id)
-				}
+				disabled={!canToggleEnabled}
+				title={!canToggleEnabled ? muts.credentialRouteUnsupportedReason : undefined}
+				onChange={() => {
+					if (!canToggleEnabled) return;
+					entry.disabled ? muts.enableMut.mutate(entry.id) : muts.disableMut.mutate(entry.id);
+				}}
 			/>
 			<Tooltip label={t("kiroRefreshToken")}>
 				<ActionIcon
 					variant="subtle"
 					size="sm"
-					onClick={() => muts.refreshMut.mutate(entry.id)}
+					onClick={() => muts.canRefreshKiroCredential && muts.refreshMut.mutate(entry.id)}
 					loading={muts.refreshMut.isPending}
+					disabled={!muts.canRefreshKiroCredential}
+					title={!muts.canRefreshKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
 				>
 					<IconRefresh size={14} />
 				</ActionIcon>
@@ -431,13 +528,23 @@ function CredentialActions({
 			<Button
 				variant="subtle"
 				size="compact-xs"
-				onClick={() => muts.usageMut.mutate(entry.id)}
+				onClick={() => muts.canQueryKiroCredentialUsage && muts.usageMut.mutate(entry.id)}
 				loading={muts.usageMut.isPending}
+				disabled={!muts.canQueryKiroCredentialUsage}
+				title={
+					!muts.canQueryKiroCredentialUsage ? muts.credentialRouteUnsupportedReason : undefined
+				}
 			>
 				{t("kiroQueryUsage")}
 			</Button>
 			{onEdit && !editing && (
-				<Button variant="subtle" size="compact-xs" onClick={onEdit}>
+				<Button
+					variant="subtle"
+					size="compact-xs"
+					onClick={() => muts.canUpdateKiroCredential && onEdit()}
+					disabled={!muts.canUpdateKiroCredential}
+					title={!muts.canUpdateKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
+				>
 					{t("kiroEdit")}
 				</Button>
 			)}
@@ -445,7 +552,9 @@ function CredentialActions({
 				variant="subtle"
 				size="compact-xs"
 				color="orange"
-				onClick={() => muts.resetMut.mutate(entry.id)}
+				onClick={() => muts.canResetKiroCredential && muts.resetMut.mutate(entry.id)}
+				disabled={!muts.canResetKiroCredential}
+				title={!muts.canResetKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
 			>
 				{t("kiroReset")}
 			</Button>
@@ -454,10 +563,13 @@ function CredentialActions({
 				color="red"
 				size="sm"
 				onClick={async () => {
+					if (!muts.canDeleteKiroCredential) return;
 					if (await confirm({ message: t("kiroDeleteConfirm") })) {
 						muts.deleteMut.mutate(entry.id);
 					}
 				}}
+				disabled={!muts.canDeleteKiroCredential}
+				title={!muts.canDeleteKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
 			>
 				<IconTrash size={14} />
 			</ActionIcon>
@@ -558,6 +670,15 @@ function CredentialCard({
 	| "deleteMut"
 	| "updateMut"
 	| "priorityMut"
+	| "canDisableKiroCredential"
+	| "canEnableKiroCredential"
+	| "canResetKiroCredential"
+	| "canSetKiroCredentialPriority"
+	| "canRefreshKiroCredential"
+	| "canQueryKiroCredentialUsage"
+	| "canUpdateKiroCredential"
+	| "canDeleteKiroCredential"
+	| "credentialRouteUnsupportedReason"
 >) {
 	const { t } = useTranslation("settings");
 	const [editing, setEditing] = useState(false);
@@ -568,11 +689,12 @@ function CredentialCard({
 	const isCurrent = entry.id === snapshot?.currentId;
 
 	const handleSave = () => {
+		if (!muts.canUpdateKiroCredential) return;
 		muts.updateMut.mutate({
 			id: entry.id,
 			fields: { email: editEmail, displayName: editDisplayName, region: editRegion },
 		});
-		if (editPriority !== (entry.priority ?? 0)) {
+		if (editPriority !== (entry.priority ?? 0) && muts.canSetKiroCredentialPriority) {
 			muts.priorityMut.mutate({ id: entry.id, priority: editPriority });
 		}
 		setEditing(false);
@@ -787,6 +909,15 @@ function CredentialTableRow({
 	| "deleteMut"
 	| "updateMut"
 	| "priorityMut"
+	| "canDisableKiroCredential"
+	| "canEnableKiroCredential"
+	| "canResetKiroCredential"
+	| "canSetKiroCredentialPriority"
+	| "canRefreshKiroCredential"
+	| "canQueryKiroCredentialUsage"
+	| "canUpdateKiroCredential"
+	| "canDeleteKiroCredential"
+	| "credentialRouteUnsupportedReason"
 >) {
 	const { t } = useTranslation("settings");
 	const [editing, setEditing] = useState(false);
@@ -796,11 +927,12 @@ function CredentialTableRow({
 	const [editPriority, setEditPriority] = useState<number>(entry.priority ?? 0);
 
 	const handleSave = () => {
+		if (!muts.canUpdateKiroCredential) return;
 		muts.updateMut.mutate({
 			id: entry.id,
 			fields: { email: editEmail, displayName: editDisplayName, region: editRegion },
 		});
-		if (editPriority !== (entry.priority ?? 0)) {
+		if (editPriority !== (entry.priority ?? 0) && muts.canSetKiroCredentialPriority) {
 			muts.priorityMut.mutate({ id: entry.id, priority: editPriority });
 		}
 		setEditing(false);
@@ -852,6 +984,10 @@ function CredentialTableRow({
 							size="compact-xs"
 							onClick={handleSave}
 							leftSection={<IconDeviceFloppy size={12} />}
+							disabled={!muts.canUpdateKiroCredential}
+							title={
+								!muts.canUpdateKiroCredential ? muts.credentialRouteUnsupportedReason : undefined
+							}
 						>
 							{t("kiroEditSave")}
 						</Button>

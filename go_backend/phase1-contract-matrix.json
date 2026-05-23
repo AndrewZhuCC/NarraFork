@@ -1,6 +1,6 @@
 {
 	"name": "go-backend-phase1-contract-matrix",
-	"updatedAt": "2026-05-18",
+	"updatedAt": "2026-05-21",
 	"scope": "Database compatibility, canonical schema drift detection, FTS/Search degraded behavior, Graph/Ruler baseline, and commit sync readiness for the TypeScript-owned main DB mode.",
 	"principles": [
 		{
@@ -54,7 +54,14 @@
 		{
 			"group": "search.ftsDegraded",
 			"path": "/api/search",
+			"tsSource": "frontend/lib/api/misc.ts and frontend/routes/search.tsx",
 			"goSource": "go_backend/internal/search/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/misc.ts",
+				"frontend/hooks/useSearch.ts",
+				"frontend/routes/search.tsx",
+				"frontend/lib/search-utils.tsx"
+			],
 			"phase1Status": "fts-preferred-like-fallback",
 			"responseContract": [
 				"degraded",
@@ -65,12 +72,23 @@
 				"searchMetadata.requestedEntities"
 			],
 			"fallbackReasons": ["fts_unavailable", "fts_query_failed", "query_too_short_for_trigram"],
-			"tests": ["go_backend/internal/search/handlers_contract_test.go"]
+			"frontendConsumerPolicy": "SearchResponse preserves degraded/fallbacks/searchMetadata, and the search page surfaces fallback diagnostics instead of treating degraded LIKE fallback as an ordinary result list.",
+			"tests": [
+				"go_backend/internal/search/handlers_contract_test.go",
+				"frontend/lib/api/misc.test.ts::preserves search degraded metadata",
+				"frontend/lib/search-utils.test.ts"
+			]
 		},
 		{
 			"group": "graph.baseline",
 			"path": "/api/projects/{id}/graph",
+			"tsSource": "frontend/lib/api/projects.ts, frontend/hooks/useNarraFlow.ts, and frontend/components/graph/NarraFlow.tsx",
 			"goSource": "go_backend/internal/graph/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/projects.ts",
+				"frontend/hooks/useNarraFlow.ts",
+				"frontend/components/graph/NarraFlow.tsx"
+			],
 			"phase1Status": "read-with-optional-metadata-fallbacks",
 			"responseContract": [
 				"nodes",
@@ -82,12 +100,37 @@
 				"fallbacks"
 			],
 			"capabilities": ["split", "chapterEdges", "commitSync", "upstreamUpdates"],
-			"tests": ["go_backend/internal/graph/handlers_test.go"]
+			"frontendConsumerPolicy": "useNarraFlow summarizes graph degraded/fallback metadata and NarraFlow displays runtime degraded alerts instead of silently treating fallback graph reads as healthy.",
+			"tests": ["go_backend/internal/graph/handlers_test.go", "frontend/hooks/useNarraFlow.test.ts"]
+		},
+		{
+			"group": "chapterEdges.mutations",
+			"path": "/api/chapter-edges",
+			"tsSource": "server/routes/chapter-edges.ts and frontend/lib/api/chapter-edges.ts",
+			"goSource": "go_backend/internal/chapteredges/handlers.go",
+			"phase1Status": "supported-ts-validation-error-shape",
+			"features": [
+				"dependency edge create/delete",
+				"manual mutation gating for non-dependency edge types",
+				"dependency metadata allow-listing",
+				"redundant chapter parent/merge fields sync"
+			],
+			"errorContract": [
+				"validation failures return { error, code }",
+				"validation failures omit the non-TS message alias",
+				"non-validation errors keep shared httpx diagnostics"
+			],
+			"tests": ["go_backend/internal/chapteredges/handlers_test.go"]
 		},
 		{
 			"group": "ruler.baseline",
 			"path": "/api/projects/{id}/ruler",
+			"tsSource": "frontend/hooks/useRuler.ts and frontend/components/ruler/RulerFlow.tsx",
 			"goSource": "go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/hooks/useRuler.ts",
+				"frontend/components/ruler/RulerFlow.tsx"
+			],
 			"phase1Status": "read-degraded-mutations-gated",
 			"responseContract": [
 				"commits",
@@ -107,21 +150,32 @@
 				"ruler.rebaseResolve",
 				"ruler.rebaseContinue"
 			],
+			"frontendConsumerPolicy": "useRuler preserves degraded/fallback/capability metadata across paginated reads, and RulerFlow surfaces degraded-mode/fallback reasons while gating unsupported mutations.",
 			"tests": [
 				"go_backend/internal/misccompat/ruler_parity_test.go",
-				"go_backend/internal/misccompat/routes_test.go"
+				"go_backend/internal/misccompat/routes_test.go",
+				"frontend/hooks/useRuler.test.ts"
 			]
 		},
 		{
 			"group": "commitSync.baseline",
 			"goSource": "go_backend/internal/gitroutes/handlers.go and go_backend/internal/worktreewatcher/watcher.go",
+			"frontendConsumers": [
+				"frontend/hooks/useNarratorWS.ts",
+				"frontend/components/narrator/useNarratorPanelWS.ts",
+				"frontend/hooks/useNarraFlow.ts",
+				"frontend/components/graph/NarraFlow.tsx"
+			],
 			"phase1Status": "manual-route-plus-background-watcher",
 			"sources": ["manual", "watcher", "graph-read-refresh"],
 			"events": ["git_status", "commits_updated", "commit_sync_error"],
+			"frontendConsumerPolicy": "useNarratorWS dispatches commits_updated and commit_sync_error; NarratorPanel invalidates git status caches and surfaces commit-sync degradation notifications, while graphReadRefresh capability is summarized by useNarraFlow.",
 			"tests": [
 				"go_backend/internal/gitroutes/handlers_test.go",
 				"go_backend/internal/worktreewatcher/watcher_test.go",
-				"go_backend/internal/graph/handlers_test.go"
+				"go_backend/internal/graph/handlers_test.go",
+				"frontend/hooks/useNarratorWS.test.ts",
+				"frontend/hooks/useNarraFlow.test.ts"
 			]
 		}
 	]

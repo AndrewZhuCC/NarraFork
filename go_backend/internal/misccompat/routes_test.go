@@ -1,9 +1,12 @@
 package misccompat
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +16,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	_ "modernc.org/sqlite"
+
+	"narrafork-go/internal/httpx"
 )
 
 func TestPublicShareRegistrationExposesOnlyDownloadAndPreview(t *testing.T) {
@@ -68,6 +73,141 @@ func TestStorageCleanupUnsupportedTargetsDoNotFakeSuccess(t *testing.T) {
 		if body["ok"] != false || body["code"] != tc.code || body["feature"] != tc.feature || body["supported"] != false || body["fallback"] != true {
 			t.Fatalf("cleanup %s returned fake or malformed unsupported payload: %#v", tc.target, body)
 		}
+		reason, _ := body["reason"].(string)
+		if reason == "" || body["error"] != reason || body["message"] != reason {
+			t.Fatalf("cleanup %s fallback should expose reason/error/message, got %#v", tc.target, body)
+		}
+	}
+}
+
+func TestStorageCachedReturnsLastCompletedScan(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("mkdir narrafork root: %v", err)
+	}
+
+	database, err := sql.Open("sqlite", filepath.Join(root, "narrafork.db"))
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, git_path TEXT, updated_at TEXT)`); err != nil {
+		t.Fatalf("create projects: %v", err)
+	}
+
+	repo := filepath.Join(home, "repo")
+	for path, contents := range map[string][]byte{
+		filepath.Join(root, "uploads", "nar-1", "upload.txt"):       []byte("upload"),
+		filepath.Join(root, "shares", "share-1", "preview.txt"):     []byte("share"),
+		filepath.Join(repo, ".worktrees", "branch", "worktree.txt"): []byte("worktree"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+		}
+		if err := os.WriteFile(path, contents, 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	if _, err := database.Exec(`INSERT INTO projects (id, name, git_path, updated_at) VALUES ('p1', 'Project', ?, '2026-01-01T00:00:00Z')`, repo); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+
+	h := NewHandler(database)
+	if cached := h.storageCachedResponse(); cached["cached"] != false {
+		t.Fatalf("initial cached response = %#v, want cached=false", cached)
+	}
+
+	w := httptest.NewRecorder()
+	h.storageScan(w, httptest.NewRequest(http.MethodGet, "/api/storage/scan", nil))
+	if !strings.Contains(w.Body.String(), "event:complete") {
+		t.Fatalf("scan did not emit complete event: %s", w.Body.String())
+	}
+
+	cached := h.storageCachedResponse()
+	if cached["cached"] != true {
+		t.Fatalf("cached response after scan = %#v, want cached=true", cached)
+	}
+	data, ok := cached["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("cached data missing or wrong type: %#v", cached)
+	}
+	categories, ok := data["categories"].([]map[string]any)
+	if !ok || len(categories) != 5 {
+		t.Fatalf("cached categories = %#v, want 5 storage categories", data["categories"])
+	}
+	seen := map[string]bool{}
+	for _, category := range categories {
+		key, _ := category["key"].(string)
+		seen[key] = true
+	}
+	for _, key := range []string{"database", "uploads", "shares", "worktrees", "containers"} {
+		if !seen[key] {
+			t.Fatalf("cached categories missing %s: %#v", key, categories)
+		}
+	}
+	if int64Number(data["totalBytes"]) <= 0 || int64Number(data["scannedAt"]) <= 0 {
+		t.Fatalf("cached scan should include positive totalBytes and scannedAt: %#v", data)
+	}
+}
+
+func TestDatabaseCleanupSessionTargetsReturnExplicitFeatureDisabledFallback(t *testing.T) {
+	h := NewHandler(nil)
+	for _, target := range []string{"archivedSessions", "staleSessions"} {
+		t.Run(target, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"`+target+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			if err := h.databaseCleanup(w, req); err != nil {
+				t.Fatalf("database cleanup %s returned error: %v", target, err)
+			}
+			if w.Code != http.StatusNotImplemented {
+				t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode fallback body: %v", err)
+			}
+			if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "storage.database.cleanup."+target || body["supported"] != false || body["fallback"] != true {
+				t.Fatalf("unexpected session cleanup fallback body: %#v", body)
+			}
+			reason, _ := body["reason"].(string)
+			if !strings.Contains(reason, "safe narrator deletion plan") || body["error"] != reason || body["message"] != reason {
+				t.Fatalf("session cleanup fallback should expose reason/error/message, got %#v", body)
+			}
+		})
+	}
+}
+
+func TestDatabaseVacuumRouteAlwaysReturnsDisabledConflict(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+
+	h := NewHandler(database)
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/vacuum", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.databaseVacuum(w, req); err != nil {
+		t.Fatalf("database vacuum returned error: %v", err)
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 disabled conflict, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode vacuum body: %v", err)
+	}
+	errorMessage, _ := body["error"].(string)
+	if !strings.Contains(errorMessage, "VACUUM is disabled") {
+		t.Fatalf("unexpected vacuum error: %#v", body)
+	}
+	if body["vacuumRan"] != false || body["checkpointRan"] != false || body["optimized"] != false {
+		t.Fatalf("vacuum route must not run request-path maintenance: %#v", body)
 	}
 }
 
@@ -163,6 +303,10 @@ func TestDatabaseTableSummariesMarkRowCountErrorsDegraded(t *testing.T) {
 	if len(fallbacks) != 1 || fallbacks[0] != "table_row_count_failed" {
 		t.Fatalf("expected row count fallback, got %#v", tables[0])
 	}
+	reason, _ := tables[0]["reason"].(string)
+	if reason == "" || tables[0]["error"] != reason || tables[0]["message"] != reason {
+		t.Fatalf("degraded table summary should expose reason/error/message, got %#v", tables[0])
+	}
 }
 
 func TestSourceChapterCwdReturnsQueryErrors(t *testing.T) {
@@ -202,6 +346,10 @@ func TestNarratorCleanupSamplesMarkQueryErrorsDegraded(t *testing.T) {
 	if sample["degraded"] != true || sample["fallback"] != true {
 		t.Fatalf("expected degraded sample, got %#v", sample)
 	}
+	reason, _ := sample["reason"].(string)
+	if reason == "" || sample["error"] != reason || sample["message"] != reason {
+		t.Fatalf("degraded narrator cleanup sample should expose reason/error/message, got %#v", sample)
+	}
 }
 
 func TestDatabaseCleanupPreviewMarksApiDumpStatsErrorsDegraded(t *testing.T) {
@@ -231,9 +379,13 @@ func TestDatabaseCleanupPreviewMarksApiDumpStatsErrorsDegraded(t *testing.T) {
 	if !found || preview["count"] != int64(0) {
 		t.Fatalf("unexpected degraded preview metadata: %#v", preview)
 	}
+	reason, _ := preview["reason"].(string)
+	if reason == "" || preview["error"] != reason || preview["message"] != reason {
+		t.Fatalf("degraded cleanup preview should expose reason/error/message, got %#v", preview)
+	}
 }
 
-func TestDeleteNarratorSessionsRollsBackWhenRelatedDeleteFails(t *testing.T) {
+func TestDeleteNarratorSessionsIsFeatureDisabled(t *testing.T) {
 	database := openCleanupDeleteTestDB(t)
 	if _, err := database.Exec(`INSERT INTO narrators (id) VALUES ('nar-1')`); err != nil {
 		t.Fatalf("insert narrator: %v", err)
@@ -241,21 +393,23 @@ func TestDeleteNarratorSessionsRollsBackWhenRelatedDeleteFails(t *testing.T) {
 	if _, err := database.Exec(`INSERT INTO terminal_tabs (id, narrator_id) VALUES ('tab-1', 'nar-1')`); err != nil {
 		t.Fatalf("insert terminal tab: %v", err)
 	}
-	if _, err := database.Exec(`CREATE TRIGGER fail_terminal_tab_cleanup BEFORE DELETE ON terminal_tabs BEGIN SELECT RAISE(ABORT, 'terminal tab cleanup blocked'); END;`); err != nil {
-		t.Fatalf("create cleanup trigger: %v", err)
-	}
 	h := NewHandler(database)
 	req := httptest.NewRequest(http.MethodPost, "/api/storage/cleanup", nil)
 
-	if err := h.deleteNarratorSessions(req, []string{"nar-1"}); err == nil {
-		t.Fatalf("expected cleanup delete failure")
+	err := h.deleteNarratorSessions(req, []string{"nar-1"})
+	var appErr *httpx.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("expected app error, got %T %v", err, err)
+	}
+	if appErr.Code != "NOT_IMPLEMENTED" && appErr.Code != "FEATURE_DISABLED" {
+		t.Fatalf("expected feature-disabled delete guard, got %#v", appErr)
 	}
 	var narratorCount int
 	if err := database.QueryRow(`SELECT COUNT(*) FROM narrators WHERE id = 'nar-1'`).Scan(&narratorCount); err != nil {
 		t.Fatalf("count narrators: %v", err)
 	}
 	if narratorCount != 1 {
-		t.Fatalf("cleanup failure should roll back narrator delete, count=%d", narratorCount)
+		t.Fatalf("feature-disabled delete guard should preserve narrator, count=%d", narratorCount)
 	}
 }
 
@@ -287,6 +441,10 @@ func TestRulerMutationsMissingServicesExposeFeatureDisabledFallback(t *testing.T
 		}
 		if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != tc.feature || body["supported"] != false || body["fallback"] != true {
 			t.Fatalf("unexpected fallback for %s: %#v", tc.path, body)
+		}
+		reason, _ := body["reason"].(string)
+		if reason == "" || body["error"] != reason || body["message"] != reason {
+			t.Fatalf("ruler fallback for %s should expose reason/error/message, got %#v", tc.path, body)
 		}
 	}
 }
@@ -327,5 +485,95 @@ func TestNotificationSoundRegistrationIncludesAuthenticatedMethods(t *testing.T)
 		if !router.Match(rctx, tc.method, tc.path) {
 			t.Fatalf("expected %s %s to be registered", tc.method, tc.path)
 		}
+	}
+}
+
+func TestNotificationSoundUploadRejectsMissingFileWithBadRequest(t *testing.T) {
+	router := chi.NewRouter()
+	h := NewHandler(nil)
+	router.Route("/api/notification-sounds", h.RegisterNotificationSounds)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("note", "hello"); err != nil {
+		t.Fatalf("write field: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/notification-sounds/", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing file, got %d: %s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, w.Body.String())
+	}
+	if payload["code"] != "BAD_REQUEST" || payload["message"] != "missing file in form data" || payload["error"] != "missing file in form data" {
+		t.Fatalf("unexpected notification sound diagnostics: %#v", payload)
+	}
+}
+
+func TestNotificationWebhookFailuresReturnDiagnostics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "denied", http.StatusTeapot)
+	}))
+	defer upstream.Close()
+
+	router := chi.NewRouter()
+	h := NewHandler(nil)
+	router.Route("/api/notifications", h.RegisterNotifications)
+
+	for _, tc := range []struct {
+		name         string
+		path         string
+		provider     string
+		expectedCode string
+	}{
+		{
+			name:         "dingtalk",
+			path:         "/api/notifications/test-dingtalk",
+			provider:     "DingTalk",
+			expectedCode: "NOTIFICATION_DINGTALK_WEBHOOK_FAILED",
+		},
+		{
+			name:         "feishu",
+			path:         "/api/notifications/test-feishu",
+			provider:     "Feishu",
+			expectedCode: "NOTIFICATION_FEISHU_WEBHOOK_FAILED",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			webhookJSON, err := json.Marshal(upstream.URL)
+			if err != nil {
+				t.Fatalf("marshal webhook: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"webhook":`+string(webhookJSON)+`}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if body["ok"] != false || body["code"] != tc.expectedCode {
+				t.Fatalf("unexpected diagnostic envelope: %#v", body)
+			}
+			reason, _ := body["reason"].(string)
+			if !strings.Contains(reason, tc.provider+" webhook failed: 418") || !strings.Contains(reason, "denied") {
+				t.Fatalf("unexpected reason: %#v", body)
+			}
+			if body["error"] != reason || body["message"] != reason {
+				t.Fatalf("notification error should expose reason/error/message, got %#v", body)
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,20 +45,25 @@ type ToolCall struct {
 }
 
 type Provider struct {
-	Prefix              string
-	Kind                string
-	APIKey              string
-	BaseURL             string
-	Model               string
-	OfficialAPI         bool
-	APIMode             string
-	AccountID           string
-	CredentialID        string
-	CredentialPool      []Provider
-	LoadBalancingMode   string
-	KiroCredentialsPath string
-	KiroConfigPath      string
-	PreviousResponseID  string
+	Prefix                 string
+	Kind                   string
+	APIKey                 string
+	BaseURL                string
+	Model                  string
+	OfficialAPI            bool
+	APIMode                string
+	AccountID              string
+	CredentialID           string
+	PromptCacheKey         string
+	CredentialPool         []Provider
+	LoadBalancingMode      string
+	KiroCredentialsPath    string
+	KiroConfigPath         string
+	PreviousResponseID     string
+	UseWebSocket           *bool
+	DefaultReasoningEffort string
+	ProxyURL               string
+	TLSRejectUnauthorized  *bool
 }
 
 type Result struct {
@@ -109,6 +116,7 @@ const (
 	defaultEmptyResponseRetries = 3
 	maxToolWriteBytes           = 2 * 1024 * 1024
 	maxToolEditFileBytes        = 2 * 1024 * 1024
+	maxToolShareSourceBytes     = 512 * 1024 * 1024
 	defaultToolShareExpiry      = 24 * time.Hour
 )
 
@@ -468,11 +476,15 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"command":     stringProp("Command to execute"),
-					"description": stringProp("Short description of what the command does"),
-					"timeout":     map[string]any{"type": "number", "description": "Timeout in milliseconds, capped at 600000"},
+					"command":           stringProp("Command to execute"),
+					"description":       stringProp("Short description of what the command does"),
+					"timeout":           map[string]any{"type": "number", "description": "Timeout in milliseconds, capped at 600000"},
+					"workdir":           stringProp("Optional working directory under the narrator cwd"),
+					"run_in_background": map[string]any{"type": "boolean", "description": "Run in background; Go runtime currently rejects this explicitly"},
+					"strict_serial":     map[string]any{"type": "boolean", "description": "Execute strictly serially instead of parallelizing with other eager tools"},
 				},
-				"required": []string{"command"},
+				"required":             []string{"command"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -484,8 +496,10 @@ func toolSpecs() []toolSpec {
 					"file_path": stringProp("Relative or absolute path"),
 					"offset":    map[string]any{"type": "number", "description": "1-based line number to start reading from"},
 					"limit":     map[string]any{"type": "number", "description": "Number of lines to read; -1 reads to EOF"},
+					"pages":     stringProp("PDF page range such as 1-5; Go runtime currently rejects PDF page extraction explicitly"),
 				},
-				"required": []string{"file_path"},
+				"required":             []string{"file_path"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -497,7 +511,8 @@ func toolSpecs() []toolSpec {
 					"file_path": stringProp("Relative or absolute path"),
 					"content":   stringProp("File content"),
 				},
-				"required": []string{"file_path", "content"},
+				"required":             []string{"file_path", "content"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -511,7 +526,8 @@ func toolSpecs() []toolSpec {
 					"new_string":  stringProp("Replacement text"),
 					"replace_all": map[string]any{"type": "boolean", "description": "Replace all occurrences instead of requiring a unique match"},
 				},
-				"required": []string{"file_path", "old_string", "new_string"},
+				"required":             []string{"file_path", "old_string", "new_string"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -521,8 +537,10 @@ func toolSpecs() []toolSpec {
 				"type": "object",
 				"properties": map[string]any{
 					"pattern": stringProp("Pattern such as *.go or internal"),
+					"path":    stringProp("Optional directory under the working directory to search from"),
 				},
-				"required": []string{"pattern"},
+				"required":             []string{"pattern"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -532,25 +550,38 @@ func toolSpecs() []toolSpec {
 				"type": "object",
 				"properties": map[string]any{
 					"pattern":     stringProp("Regex pattern"),
+					"path":        stringProp("Optional file or directory under the working directory to search in"),
 					"glob":        stringProp("Optional glob filter, such as **/*.go"),
-					"output_mode": stringProp("content, files_with_matches, or count"),
-					"context":     map[string]any{"type": "number", "description": "Lines before and after each match"},
+					"output_mode": map[string]any{"type": "string", "enum": []string{"content", "files_with_matches", "count"}, "description": "content, files_with_matches, or count; defaults to files_with_matches"},
+					"context":     map[string]any{"type": "number", "description": "Lines before and after each match in content mode"},
+					"-B":          map[string]any{"type": "number", "description": "Lines before each match in content mode"},
+					"-A":          map[string]any{"type": "number", "description": "Lines after each match in content mode"},
+					"-C":          map[string]any{"type": "number", "description": "Alias for context in content mode"},
+					"-n":          map[string]any{"type": "boolean", "description": "Show line numbers in content mode; defaults to true"},
 					"head_limit":  map[string]any{"type": "number", "description": "Maximum output entries"},
+					"offset":      map[string]any{"type": "number", "description": "Skip this many output entries before applying head_limit"},
 					"-i":          map[string]any{"type": "boolean", "description": "Case-insensitive search"},
+					"type":        stringProp("File type to search, such as go, js, ts, py, rust, java, json, or md"),
+					"multiline":   map[string]any{"type": "boolean", "description": "Enable multiline dotall matching"},
 				},
-				"required": []string{"pattern"},
+				"required":             []string{"pattern"},
+				"additionalProperties": false,
 			},
 		},
 		{
 			Name:        "WebFetch",
-			Description: "Fetch an HTTP/HTTPS URL and return truncated response text.",
+			Description: "Fetch an HTTP, HTTPS, or data URL and return truncated response text.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"url":        stringProp("HTTP or HTTPS URL to fetch"),
+					"url":        stringProp("HTTP, HTTPS, or data URL to fetch"),
+					"mode":       map[string]any{"type": "string", "enum": []string{"readability", "screenshot", "dom", "smart"}, "description": "TS extraction mode; Go runtime rejects these modes and defaults to raw fetch when omitted"},
+					"selector":   stringProp("CSS selector for dom mode; unsupported in Go raw-only runtime"),
 					"max_length": map[string]any{"type": "number", "description": "Maximum response bytes to return"},
+					"purpose":    stringProp("Purpose for smart mode; unsupported in Go raw-only runtime"),
 				},
-				"required": []string{"url"},
+				"required":             []string{"url"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -559,11 +590,12 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"query":           stringProp("Search query"),
+					"query":           map[string]any{"type": "string", "minLength": 2, "description": "Search query"},
 					"allowed_domains": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Only include results from these domains"},
 					"blocked_domains": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Exclude results from these domains"},
 				},
-				"required": []string{"query"},
+				"required":             []string{"query"},
+				"additionalProperties": false,
 			},
 		},
 		terminalToolSpec(),
@@ -577,7 +609,8 @@ func toolSpecs() []toolSpec {
 					"compress": map[string]any{"type": "boolean", "description": "Gzip-compress a single file"},
 					"preview":  map[string]any{"type": "boolean", "description": "Include preview URL for raw single files"},
 				},
-				"required": []string{"path"},
+				"required":             []string{"path"},
+				"additionalProperties": false,
 			},
 		},
 		browserToolSpec(),
@@ -591,13 +624,15 @@ func toolSpecs() []toolSpec {
 					"subagent_type":     stringProp("explore, plan, general, review, or a custom subagent type name"),
 					"prompt":            stringProp("Task prompt for the subagent"),
 					"model":             stringProp("Optional model override"),
-					"reasoning_effort":  stringProp("Optional reasoning effort"),
+					"reasoning_effort":  map[string]any{"type": "string", "enum": []string{"none", "low", "medium", "high", "xhigh"}, "description": "Optional reasoning effort"},
 					"workdir":           stringProp("Optional working directory under the parent cwd"),
 					"alias":             stringProp("Optional alias for later Await calls"),
 					"stop":              stringProp("Subagent id or alias to stop"),
 					"timeout":           map[string]any{"type": "number", "description": "Foreground wait timeout in milliseconds, capped at 30000"},
 					"run_in_background": map[string]any{"type": "boolean", "description": "Run as a background subagent"},
+					"background":        map[string]any{"type": "boolean", "description": "Legacy alias for run_in_background"},
 				},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -606,11 +641,13 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"type":    stringProp("agent or bash; Go backend currently supports agent"),
-					"id":      stringProp("Subagent id or alias"),
-					"timeout": map[string]any{"type": "number", "description": "Milliseconds to wait, capped at 30000"},
+					"type":          map[string]any{"type": "string", "enum": []string{"agent", "bash"}, "description": "What to await: agent or bash"},
+					"id":            stringProp("Subagent id or alias"),
+					"timeout":       map[string]any{"type": "number", "description": "Milliseconds to wait, capped at 30000"},
+					"wait_for_text": stringProp("For type=bash only: return early once matching output appears; Go runtime currently exposes this as unsupported via capabilities"),
 				},
-				"required": []string{"type", "id"},
+				"required":             []string{"type", "id"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -619,10 +656,12 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"action":    stringProp("list, file_changes, broadcast, or send"),
+					"action":    map[string]any{"type": "string", "enum": []string{"list", "file_changes", "broadcast", "send"}, "description": "list, file_changes, broadcast, or send"},
 					"target_id": stringProp("Target subagent id/alias/title/prefix for file_changes or send"),
 					"message":   stringProp("Message text for broadcast or send"),
 				},
+				"required":             []string{"action"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -640,7 +679,8 @@ func toolSpecs() []toolSpec {
 					"await":       map[string]any{"type": "boolean", "description": "Wait for target responses"},
 					"timeout":     map[string]any{"type": "number", "description": "Milliseconds to wait when await=true"},
 				},
-				"required": []string{"message"},
+				"required":             []string{"message"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -658,7 +698,7 @@ func toolSpecs() []toolSpec {
 							"properties": map[string]any{
 								"question":    stringProp("The complete question to ask the user"),
 								"header":      stringProp("Very short label for the question"),
-								"multiSelect": map[string]any{"type": "boolean", "description": "Allow selecting multiple options"},
+								"multiSelect": map[string]any{"type": "boolean", "default": false, "description": "Allow selecting multiple options"},
 								"options": map[string]any{
 									"type":     "array",
 									"minItems": 2,
@@ -670,16 +710,31 @@ func toolSpecs() []toolSpec {
 											"description": stringProp("Option description"),
 											"preview":     stringProp("Optional markdown preview"),
 										},
-										"required": []string{"label", "description"},
+										"required":             []string{"label", "description"},
+										"additionalProperties": false,
 									},
 								},
 							},
-							"required": []string{"question", "header", "options", "multiSelect"},
+							"required":             []string{"question", "header", "options", "multiSelect"},
+							"additionalProperties": false,
 						},
 					},
-					"metadata": map[string]any{"type": "object", "description": "Optional metadata"},
+					"answers": map[string]any{
+						"type":                 "object",
+						"description":          "User answers collected by the permission component",
+						"propertyNames":        map[string]any{"type": "string"},
+						"additionalProperties": map[string]any{"type": "string"},
+					},
+					"annotations": map[string]any{
+						"type":                 "object",
+						"description":          "Optional per-question annotations from the user",
+						"propertyNames":        map[string]any{"type": "string"},
+						"additionalProperties": map[string]any{"type": "object", "properties": map[string]any{"preview": stringProp("Selected option preview"), "notes": stringProp("Free-text notes")}, "additionalProperties": false},
+					},
+					"metadata": map[string]any{"type": "object", "properties": map[string]any{"source": stringProp("Optional source identifier")}, "additionalProperties": false, "description": "Optional metadata"},
 				},
-				"required": []string{"questions"},
+				"required":             []string{"questions"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -700,7 +755,7 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"mode":  stringProp("list, search, or get"),
+					"mode":  map[string]any{"type": "string", "enum": []string{"list", "search", "get"}, "default": "search", "description": "list, search, or get"},
 					"query": stringProp("Search query when mode is search"),
 					"id":    stringProp("Learning document id when mode is get"),
 					"lang":  stringProp("Preferred language, such as en or zh-CN"),
@@ -720,8 +775,8 @@ func toolSpecs() []toolSpec {
 							"properties": map[string]any{
 								"id":       stringProp("Short unique todo identifier"),
 								"content":  stringProp("Todo description"),
-								"status":   stringProp("pending, in_progress, or completed"),
-								"priority": stringProp("high, medium, or low"),
+								"status":   map[string]any{"type": "string", "enum": []string{"pending", "in_progress", "completed"}, "description": "pending, in_progress, or completed"},
+								"priority": map[string]any{"type": "string", "enum": []string{"high", "medium", "low"}, "default": "medium", "description": "high, medium, or low"},
 							},
 							"required": []string{"id", "content", "status"},
 						},
@@ -749,11 +804,13 @@ func toolSpecs() []toolSpec {
 								"line":     map[string]any{"type": "number", "description": "Optional line number"},
 								"message":  stringProp("Description of the finding"),
 							},
-							"required": []string{"severity", "message"},
+							"required":             []string{"severity", "message"},
+							"additionalProperties": false,
 						},
 					},
 				},
-				"required": []string{"verdict", "findings"},
+				"required":             []string{"verdict", "findings"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -765,6 +822,7 @@ func toolSpecs() []toolSpec {
 					"label":           stringProp("Optional pipeline label"),
 					"maxPreviewChars": map[string]any{"type": "number", "description": "Preview characters per captured output, max 100"},
 				},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -775,17 +833,19 @@ func toolSpecs() []toolSpec {
 				"properties": map[string]any{
 					"rule":     stringProp("Optional rule such as: from p1 p2 | grep PATTERN | head -n 20"),
 					"aliases":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Default aliases when rule omits from"},
-					"format":   stringProp("sections or plain"),
+					"format":   map[string]any{"type": "string", "enum": []string{"sections", "plain"}, "description": "Output format. Default sections."},
 					"maxChars": map[string]any{"type": "number", "description": "Maximum output chars, max 50000"},
 				},
+				"additionalProperties": false,
 			},
 		},
 		{
 			Name:        "EnterPlanMode",
 			Description: "Enter NarraFork plan mode for the current narrator. The backend stores the previous permission mode, switches to read-only planning, and creates a designated .narrafork/plan-{id}.md file target for plan drafts.",
 			Parameters: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type":                 "object",
+				"properties":           map[string]any{},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -794,17 +854,34 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"plan":           stringProp("Complete implementation plan; optional if the designated plan file contains the plan"),
-					"allowedPrompts": map[string]any{"type": "array", "description": "Optional command categories the implementation may require"},
+					"plan": stringProp("Complete implementation plan; optional if the designated plan file contains the plan"),
+					"allowedPrompts": map[string]any{
+						"type":        "array",
+						"description": "Optional command categories the implementation may require",
+						"items": map[string]any{
+							"type": "object",
+							"properties": map[string]any{
+								"tool":   map[string]any{"type": "string", "enum": []string{"Bash"}, "description": "The tool this prompt applies to"},
+								"prompt": stringProp("Semantic description of the action"),
+							},
+							"required":             []string{"tool", "prompt"},
+							"additionalProperties": false,
+						},
+					},
 				},
+				"additionalProperties": map[string]any{},
 			},
 		},
 		{
 			Name:        "GetGoals",
 			Description: "Get the current narrator goal list.",
 			Parameters: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type": "object",
+				"properties": map[string]any{
+					"confirm": map[string]any{"type": "boolean", "const": true, "default": true, "description": "Dummy parameter; always pass true"},
+				},
+				"required":             []string{"confirm"},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -813,24 +890,22 @@ func toolSpecs() []toolSpec {
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"objective": stringProp("Concrete objective to add"),
+					"objective": map[string]any{"type": "string", "minLength": 1, "maxLength": 4000, "description": "Concrete objective to add"},
 				},
-				"required": []string{"objective"},
+				"required":             []string{"objective"},
+				"additionalProperties": false,
 			},
 		},
 		{
 			Name:        "UpdateGoal",
-			Description: "Update a goal status or objective in the current narrator goal list.",
+			Description: "Update the current active goal. This tool can only mark the active goal complete after NarraFork has run a separate goal-completion reflection gate that verifies the user-provided objective is actually achieved and no required work remains.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"goal_id":    stringProp("Goal ID to update"),
-					"status":     stringProp("New status, such as pending, active, paused, or complete"),
-					"objective":  stringProp("Optional updated objective"),
-					"evidence":   stringProp("Concrete evidence required when marking a goal complete"),
-					"reflection": stringProp("Optional explanation for goal completion"),
+					"status": map[string]any{"type": "string", "const": "complete", "description": "Set to complete only when the active goal is achieved."},
 				},
-				"required": []string{"goal_id"},
+				"required":             []string{"status"},
+				"additionalProperties": false,
 			},
 		},
 		reflectionToolSpec("DangerConfirm", "Confirm the currently paused dangerous operation after reflection."),
@@ -844,42 +919,42 @@ func toolSpecs() []toolSpec {
 
 func terminalToolSpec() toolSpec {
 	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	terminalActions := []string{"read", "write", "list", "create", "rename"}
 	return toolSpec{
 		Name:        "Terminal",
 		Description: "Interact with persistent interactive terminals for this narrator or chapter. Use Bash for one-off commands; use Terminal for long-running dev servers, REPLs, and incremental terminal output.",
 		Parameters: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"action":       stringProp("list, create, read, write, or rename"),
+				"action":       map[string]any{"type": "string", "enum": terminalActions, "description": "Terminal action to perform: " + strings.Join(terminalActions, ", ")},
 				"terminal_id":  stringProp("Terminal ID or exact terminal name for read/write/rename"),
 				"input":        stringProp("Input to send for write, e.g. \\n for Enter or \\x03 for Ctrl-C"),
 				"name":         stringProp("Name for create or rename"),
 				"last_n_lines": map[string]any{"type": "number", "description": "For read: return only the last N lines instead of incremental output"},
 				"wait_for":     stringProp("For read: wait until this substring appears in new output, up to 30s"),
-				"max_length":   map[string]any{"type": "number", "description": "Maximum output characters to return"},
 			},
-			"required": []string{"action"},
+			"required":             []string{"action"},
+			"additionalProperties": false,
 		},
 	}
 }
 
 func browserToolSpec() toolSpec {
 	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	browserActions := []string{"launch", "click", "fill", "select", "type", "hover", "screenshot", "get_text", "get_attribute", "get_console", "get_network", "network_start", "network_stop", "evaluate", "evaluate_capture", "wait", "navigate", "scroll", "dom", "close", "set_ttl", "list_sessions", "perf_start", "perf_stop"}
 	properties := map[string]any{
-		"action":          stringProp("launch, navigate, dom, get_text, click, fill, select, type, hover, wait, scroll, get_attribute, get_console, get_network, network_start, network_stop, evaluate, evaluate_capture, screenshot, set_ttl, list_sessions, perf_start, perf_stop, or close"),
+		"action":          map[string]any{"type": "string", "enum": browserActions, "description": "Browser action to perform: " + strings.Join(browserActions, ", ")},
 		"url":             stringProp("HTTP, HTTPS, or data URL for launch/navigate"),
 		"session_id":      stringProp("Browser session ID"),
 		"selector":        stringProp("CSS selector for element actions"),
 		"value":           stringProp("Value for fill/select/type/evaluate/get_attribute/filter actions"),
 		"key":             stringProp("Keyboard key for type, for example Enter or Escape"),
-		"state":           stringProp("Wait state: attached, visible, or hidden"),
-		"direction":       stringProp("Navigation or scroll direction: back, forward, up, down, left, right"),
+		"direction":       map[string]any{"type": "string", "enum": []string{"back", "forward", "up", "down"}, "description": "Navigation or scroll direction: back/forward for navigate; up/down for scroll"},
 		"amount":          map[string]any{"type": "number", "description": "Scroll amount in pixels"},
 		"timeout":         map[string]any{"type": "number", "description": "Action timeout in milliseconds"},
 		"ttl_ms":          map[string]any{"type": "number", "description": "Session inactivity TTL in milliseconds"},
 		"max_length":      map[string]any{"type": "number", "description": "Maximum output length"},
 		"file_path":       stringProp("Path under the working directory for screenshot or trace output"),
-		"full_page":       map[string]any{"type": "boolean", "description": "Capture the full page screenshot"},
 		"headless":        map[string]any{"type": "boolean", "description": "Run browser headless; defaults to true"},
 		"clear":           map[string]any{"type": "boolean", "description": "Clear console/network captures before or after reading"},
 		"include_details": map[string]any{"type": "boolean", "description": "Include network request/response details in get_network output"},
@@ -892,11 +967,38 @@ func browserToolSpec() toolSpec {
 		Name:        "Browser",
 		Description: "Interactive Chrome/Chromium browser session powered by rod. Supports launch, navigate, dom, get_text, click, fill, select, type, hover, wait, scroll, get_attribute, get_console, get_network, network_start, network_stop, evaluate, evaluate_capture, screenshot, set_ttl, list_sessions, perf_start, perf_stop, and close.",
 		Parameters: map[string]any{
-			"type":       "object",
-			"properties": properties,
-			"required":   []string{"action"},
+			"type":                 "object",
+			"properties":           properties,
+			"required":             []string{"action"},
+			"additionalProperties": false,
 		},
 	}
+}
+
+type ToolRuntimeSettings struct {
+	WebFetchProxy WebFetchProxyPolicy
+}
+
+type WebFetchProxyPolicy struct {
+	Mode string
+	URL  string
+}
+
+type toolRuntimeSettingsContextKey struct{}
+
+func ContextWithToolRuntimeSettings(ctx context.Context, settings ToolRuntimeSettings) context.Context {
+	return context.WithValue(ctx, toolRuntimeSettingsContextKey{}, settings)
+}
+
+func ToolRuntimeSettingsFromRawSettings(raw map[string]any) ToolRuntimeSettings {
+	agent, _ := raw["agent"].(map[string]any)
+	policy, _ := agent["webFetchPolicy"].(map[string]any)
+	proxy, _ := policy["proxy"].(map[string]any)
+	mode := stringValue(proxy["mode"])
+	if mode == "" {
+		mode = "system"
+	}
+	return ToolRuntimeSettings{WebFetchProxy: WebFetchProxyPolicy{Mode: mode, URL: stringValue(proxy["url"])}}
 }
 
 func ExecuteTool(ctx context.Context, cwd, name, rawArgs string) string {
@@ -918,25 +1020,65 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 	}
 	switch name {
 	case "Bash":
-		return toolBash(ctx, cwd, stringValue(args["command"]), intValue(args["timeout"], 30000)), nil
+		if boolValue(args["run_in_background"]) {
+			return "Bash run_in_background is not supported in the Go backend yet; run the command in foreground or use Terminal for long-running interactive processes.", nil
+		}
+		bashCwd := cwd
+		if workdir := strings.TrimSpace(stringValue(args["workdir"])); workdir != "" {
+			resolved, err := resolveOptionalPathWithin(cwd, workdir)
+			if err != nil {
+				return err.Error(), nil
+			}
+			info, err := os.Stat(resolved)
+			if err != nil {
+				return err.Error(), nil
+			}
+			if !info.IsDir() {
+				return "workdir must be a directory", nil
+			}
+			bashCwd = resolved
+		}
+		return toolBash(ctx, bashCwd, stringValue(args["command"]), intValue(args["timeout"], 30000)), nil
 	case "Read":
+		if strings.TrimSpace(stringValue(args["pages"])) != "" {
+			return "Read pages/PDF extraction is not supported in the Go backend yet; omit pages and read text files only.", nil
+		}
 		return toolRead(cwd, stringValue(args["file_path"]), intValue(args["offset"], 1), intValue(args["limit"], 0)), nil
 	case "Write":
 		return toolWrite(cwd, pathValue(args["file_path"]), stringValue(args["content"])), nil
 	case "Edit":
 		return toolEdit(cwd, pathValue(args["file_path"]), stringValue(args["old_string"]), stringValue(args["new_string"]), boolValue(args["replace_all"])), nil
 	case "Glob":
-		return toolGlob(cwd, stringValue(args["pattern"])), nil
+		return toolGlob(cwd, stringValue(args["pattern"]), stringValue(args["path"])), nil
 	case "Grep":
+		showLineNumbers := true
+		if _, ok := args["-n"]; ok {
+			showLineNumbers = boolValue(args["-n"])
+		}
 		return toolGrep(cwd, grepOptions{
-			Pattern:     stringValue(args["pattern"]),
-			Glob:        stringValue(args["glob"]),
-			OutputMode:  stringValue(args["output_mode"]),
-			Context:     intValue(args["context"], 0),
-			HeadLimit:   intValue(args["head_limit"], 200),
-			Insensitive: boolValue(args["-i"]) || boolValue(args["i"]) || boolValue(args["case_insensitive"]),
+			Pattern:         stringValue(args["pattern"]),
+			Path:            stringValue(args["path"]),
+			Glob:            stringValue(args["glob"]),
+			OutputMode:      stringValue(args["output_mode"]),
+			Context:         intValue(args["context"], -1),
+			Before:          intValue(args["-B"], -1),
+			After:           intValue(args["-A"], -1),
+			ContextAlias:    intValue(args["-C"], -1),
+			ShowLineNumbers: showLineNumbers,
+			HeadLimit:       intValue(args["head_limit"], 200),
+			Offset:          intValue(args["offset"], 0),
+			Insensitive:     boolValue(args["-i"]),
+			Type:            stringValue(args["type"]),
+			Multiline:       boolValue(args["multiline"]),
 		}), nil
 	case "WebFetch":
+		mode := strings.TrimSpace(stringValue(args["mode"]))
+		if mode != "" && !strings.EqualFold(mode, "raw") {
+			return fmt.Sprintf("unsupported WebFetch mode %q in Go backend; supported mode: raw. TS extraction modes readability, dom, smart, and screenshot are not implemented yet.", mode), nil
+		}
+		if strings.TrimSpace(stringValue(args["selector"])) != "" || strings.TrimSpace(stringValue(args["purpose"])) != "" {
+			return "WebFetch selector and purpose parameters require TS extraction modes and are not supported in the Go backend yet.", nil
+		}
 		return toolWebFetch(ctx, stringValue(args["url"]), intValue(args["max_length"], 20000)), nil
 	case "WebSearch":
 		return toolWebSearch(ctx, stringValue(args["query"]), stringList(args["allowed_domains"]), stringList(args["blocked_domains"])), nil
@@ -1194,28 +1336,45 @@ func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
 	return "edited " + resolved
 }
 
-func toolGlob(cwd, pattern string) string {
+func toolGlob(cwd, pattern, searchPath string) string {
 	pattern = filepath.ToSlash(strings.TrimSpace(pattern))
 	if pattern == "" {
 		pattern = "*"
 	}
+	root, err := resolveOptionalPathWithin(cwd, searchPath)
+	if err != nil {
+		return err.Error()
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return err.Error()
+	}
+	if !info.IsDir() {
+		return "path must be a directory"
+	}
 	matches := []string{}
-	_ = filepath.WalkDir(cwd, func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		rel, _ := filepath.Rel(cwd, path)
+		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
 		if globMatch(pattern, rel) {
 			matches = append(matches, rel)
-			if len(matches) >= 200 {
+			if len(matches) >= 500 {
 				return filepath.SkipAll
 			}
 		}
 		return nil
 	})
-	data, _ := json.MarshalIndent(matches, "", "  ")
-	return string(data)
+	if len(matches) == 0 {
+		return "No matches found"
+	}
+	out := strings.Join(matches, "\n")
+	if len(matches) >= 500 {
+		out += "\n(limited to 500)"
+	}
+	return out
 }
 
 func globMatch(pattern, rel string) bool {
@@ -1248,12 +1407,65 @@ func globDoubleStarMatch(pattern, rel string) bool {
 }
 
 type grepOptions struct {
-	Pattern     string
-	Glob        string
-	OutputMode  string
-	Context     int
-	HeadLimit   int
-	Insensitive bool
+	Pattern         string
+	Path            string
+	Glob            string
+	OutputMode      string
+	Context         int
+	Before          int
+	After           int
+	ContextAlias    int
+	ShowLineNumbers bool
+	HeadLimit       int
+	Offset          int
+	Insensitive     bool
+	Type            string
+	Multiline       bool
+}
+
+var grepTypeExtensions = map[string][]string{
+	"c":      {".c", ".h"},
+	"cpp":    {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"},
+	"css":    {".css"},
+	"go":     {".go"},
+	"html":   {".html", ".htm"},
+	"java":   {".java"},
+	"js":     {".js", ".jsx", ".mjs", ".cjs"},
+	"json":   {".json"},
+	"md":     {".md", ".markdown"},
+	"php":    {".php"},
+	"py":     {".py", ".pyw"},
+	"python": {".py", ".pyw"},
+	"rb":     {".rb"},
+	"rs":     {".rs"},
+	"rust":   {".rs"},
+	"sh":     {".sh", ".bash", ".zsh"},
+	"sql":    {".sql"},
+	"swift":  {".swift"},
+	"toml":   {".toml"},
+	"ts":     {".ts", ".tsx"},
+	"tsx":    {".tsx"},
+	"txt":    {".txt"},
+	"xml":    {".xml"},
+	"yaml":   {".yaml", ".yml"},
+	"yml":    {".yaml", ".yml"},
+}
+
+func grepTypeMatches(typeName, path string) bool {
+	if typeName == "" {
+		return true
+	}
+	extensions, ok := grepTypeExtensions[typeName]
+	if !ok {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(path))
+	for _, candidate := range extensions {
+		if ext == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 func toolGrep(cwd string, opts grepOptions) string {
@@ -1261,34 +1473,62 @@ func toolGrep(cwd string, opts grepOptions) string {
 	if strings.TrimSpace(pattern) == "" {
 		return "pattern is required"
 	}
+	flags := ""
 	if opts.Insensitive {
-		pattern = "(?i)" + pattern
+		flags += "i"
+	}
+	if opts.Multiline {
+		flags += "s"
+	}
+	if flags != "" {
+		pattern = "(?" + flags + ")" + pattern
 	}
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return err.Error()
 	}
+	typeName := strings.ToLower(strings.TrimSpace(opts.Type))
+	if typeName != "" {
+		if _, ok := grepTypeExtensions[typeName]; !ok {
+			return "unsupported Grep type: " + typeName
+		}
+	}
+	root, err := resolveOptionalPathWithin(cwd, opts.Path)
+	if err != nil {
+		return err.Error()
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return err.Error()
+	}
+	walkRoot := root
+	relRoot := root
+	if !info.IsDir() {
+		relRoot = filepath.Dir(root)
+	}
 	mode := strings.TrimSpace(opts.OutputMode)
 	if mode == "" {
-		mode = "content"
+		mode = "files_with_matches"
 	}
 	if opts.HeadLimit <= 0 || opts.HeadLimit > 1000 {
 		opts.HeadLimit = 200
 	}
-	if opts.Context < 0 {
-		opts.Context = 0
+	if opts.Offset < 0 {
+		opts.Offset = 0
 	}
-	if opts.Context > 20 {
-		opts.Context = 20
-	}
+	before, after := grepContextBounds(opts)
+	collectLimit := opts.HeadLimit + opts.Offset
 	outputs := []string{}
-	_ = filepath.WalkDir(cwd, func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
-		rel, _ := filepath.Rel(cwd, path)
+		rel, _ := filepath.Rel(relRoot, path)
 		rel = filepath.ToSlash(rel)
 		if opts.Glob != "" && !globMatch(filepath.ToSlash(opts.Glob), rel) {
+			return nil
+		}
+		if !grepTypeMatches(typeName, path) {
 			return nil
 		}
 		info, err := d.Info()
@@ -1299,12 +1539,21 @@ func toolGrep(cwd string, opts grepOptions) string {
 		if err != nil || bytes.IndexByte(data, 0) >= 0 {
 			return nil
 		}
-		fileLines := strings.Split(string(data), "\n")
+		text := string(data)
+		fileLines := strings.Split(text, "\n")
 		matchLines := []int{}
-		for idx, line := range fileLines {
-			if re.MatchString(line) {
-				matchLines = append(matchLines, idx)
+		matchCount := 0
+		if opts.Multiline {
+			matchRanges := re.FindAllStringIndex(text, -1)
+			matchCount = len(matchRanges)
+			matchLines = grepMultilineMatchLines(text, matchRanges)
+		} else {
+			for idx, line := range fileLines {
+				if re.MatchString(line) {
+					matchLines = append(matchLines, idx)
+				}
 			}
+			matchCount = len(matchLines)
 		}
 		if len(matchLines) == 0 {
 			return nil
@@ -1313,15 +1562,15 @@ func toolGrep(cwd string, opts grepOptions) string {
 		case "files_with_matches":
 			outputs = append(outputs, rel)
 		case "count":
-			outputs = append(outputs, fmt.Sprintf("%s:%d", rel, len(matchLines)))
+			outputs = append(outputs, fmt.Sprintf("%s:%d", rel, matchCount))
 		default:
 			seen := map[int]bool{}
 			for _, idx := range matchLines {
-				start := idx - opts.Context
+				start := idx - before
 				if start < 0 {
 					start = 0
 				}
-				end := idx + opts.Context
+				end := idx + after
 				if end >= len(fileLines) {
 					end = len(fileLines) - 1
 				}
@@ -1330,19 +1579,99 @@ func toolGrep(cwd string, opts grepOptions) string {
 						continue
 					}
 					seen[lineNo] = true
-					outputs = append(outputs, fmt.Sprintf("%s:%d:%s", rel, lineNo+1, fileLines[lineNo]))
+					if opts.ShowLineNumbers {
+						outputs = append(outputs, fmt.Sprintf("%s:%d:%s", rel, lineNo+1, fileLines[lineNo]))
+					} else {
+						outputs = append(outputs, fmt.Sprintf("%s:%s", rel, fileLines[lineNo]))
+					}
 				}
 			}
 		}
-		if len(outputs) >= opts.HeadLimit {
+		if len(outputs) >= collectLimit {
 			return filepath.SkipAll
 		}
 		return nil
 	})
+	if opts.Offset > 0 {
+		if opts.Offset >= len(outputs) {
+			return "No matches found"
+		}
+		outputs = outputs[opts.Offset:]
+	}
 	if len(outputs) > opts.HeadLimit {
 		outputs = outputs[:opts.HeadLimit]
 	}
+	if len(outputs) == 0 {
+		return "No matches found"
+	}
 	return strings.Join(outputs, "\n")
+}
+
+func grepMultilineMatchLines(text string, ranges [][]int) []int {
+	if len(ranges) == 0 {
+		return nil
+	}
+	seen := map[int]bool{}
+	lines := []int{}
+	for _, matchRange := range ranges {
+		if len(matchRange) != 2 {
+			continue
+		}
+		start, end := matchRange[0], matchRange[1]
+		if start < 0 {
+			start = 0
+		}
+		if end < start {
+			end = start
+		}
+		if end > len(text) {
+			end = len(text)
+		}
+		startLine := strings.Count(text[:start], "\n")
+		endLine := startLine
+		if end > start {
+			endLine = strings.Count(text[:end], "\n")
+		}
+		for line := startLine; line <= endLine; line++ {
+			if seen[line] {
+				continue
+			}
+			seen[line] = true
+			lines = append(lines, line)
+		}
+	}
+	sort.Ints(lines)
+	return lines
+}
+
+func grepContextBounds(opts grepOptions) (int, int) {
+	contextLines := opts.Context
+	if opts.ContextAlias >= 0 {
+		contextLines = opts.ContextAlias
+	}
+	if contextLines < 0 {
+		contextLines = 0
+	}
+	if contextLines > 20 {
+		contextLines = 20
+	}
+	before, after := contextLines, contextLines
+	if opts.Before >= 0 || opts.After >= 0 {
+		before, after = 0, 0
+		if opts.Before >= 0 {
+			before = opts.Before
+		}
+		if opts.After >= 0 {
+			after = opts.After
+		}
+	}
+	if before > 20 {
+		before = 20
+	}
+	if after > 20 {
+		after = 20
+	}
+	return before, after
 }
 
 func toolWebSearch(ctx context.Context, query string, allowedDomains, blockedDomains []string) string {
@@ -1498,14 +1827,17 @@ func toolWebFetch(ctx context.Context, rawURL string, maxLength int) string {
 	if err != nil {
 		return "invalid URL"
 	}
+	if maxLength <= 0 || maxLength > 200000 {
+		maxLength = 20000
+	}
+	if parsed.Scheme == "data" {
+		return toolWebFetchDataURL(rawURL, maxLength)
+	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "only http and https URLs are supported"
+		return "only http, https, and data URLs are supported"
 	}
 	if parsed.Host == "" {
 		return "invalid URL"
-	}
-	if maxLength <= 0 || maxLength > 200000 {
-		maxLength = 20000
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -1514,7 +1846,7 @@ func toolWebFetch(ctx context.Context, rawURL string, maxLength int) string {
 		return err.Error()
 	}
 	req.Header.Set("User-Agent", "NarraFork-Go-Agent/1.0")
-	res, err := (&http.Client{Timeout: 20 * time.Second}).Do(req)
+	res, err := webFetchHTTPClient(ctx).Do(req)
 	if err != nil {
 		return err.Error()
 	}
@@ -1541,6 +1873,106 @@ func toolWebFetch(ctx context.Context, rawURL string, maxLength int) string {
 	return strings.Join(parts, "\n")
 }
 
+func toolWebFetchDataURL(rawURL string, maxLength int) string {
+	payload := strings.TrimPrefix(rawURL, "data:")
+	header, dataPart, ok := strings.Cut(payload, ",")
+	if !ok {
+		return "invalid data URL"
+	}
+	contentType, base64Encoded := parseDataURLHeader(header)
+	var data []byte
+	if base64Encoded {
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(dataPart))
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(dataPart))
+			if err != nil {
+				return "invalid data URL: " + err.Error()
+			}
+		}
+		data = decoded
+	} else {
+		decoded, err := url.PathUnescape(dataPart)
+		if err != nil {
+			return "invalid data URL: " + err.Error()
+		}
+		data = []byte(decoded)
+	}
+	truncated := len(data) > maxLength
+	if truncated {
+		data = data[:maxLength]
+	}
+	parts := []string{
+		"URL: data:[inline]",
+		"Status: 200 OK",
+		"Content-Type: " + contentType,
+		"",
+		string(data),
+	}
+	if truncated {
+		parts = append(parts, "\n[truncated]")
+	}
+	return strings.Join(parts, "\n")
+}
+
+func parseDataURLHeader(header string) (string, bool) {
+	if header == "" {
+		return "text/plain;charset=US-ASCII", false
+	}
+	parts := strings.Split(header, ";")
+	contentType := strings.TrimSpace(parts[0])
+	params := []string{}
+	base64Encoded := false
+	for _, part := range parts[1:] {
+		part = strings.TrimSpace(part)
+		if strings.EqualFold(part, "base64") {
+			base64Encoded = true
+			continue
+		}
+		if part != "" {
+			params = append(params, part)
+		}
+	}
+	if contentType == "" {
+		if len(params) > 0 {
+			contentType = "text/plain"
+		} else {
+			contentType = "text/plain;charset=US-ASCII"
+		}
+	}
+	if len(params) > 0 {
+		contentType += ";" + strings.Join(params, ";")
+	}
+	return contentType, base64Encoded
+}
+
+func webFetchHTTPClient(ctx context.Context) *http.Client {
+	settings, _ := ctx.Value(toolRuntimeSettingsContextKey{}).(ToolRuntimeSettings)
+	mode := strings.ToLower(strings.TrimSpace(settings.WebFetchProxy.Mode))
+	if mode == "" {
+		mode = "system"
+	}
+	var proxy func(*http.Request) (*url.URL, error)
+	switch mode {
+	case "direct":
+		proxy = nil
+	case "custom":
+		proxyURL := strings.TrimSpace(settings.WebFetchProxy.URL)
+		if proxyURL != "" {
+			if parsed, err := url.Parse(proxyURL); err == nil && parsed.Scheme != "" && parsed.Host != "" {
+				proxy = http.ProxyURL(parsed)
+			}
+		}
+	default:
+		proxy = http.ProxyFromEnvironment
+	}
+	if mode == "system" || mode == "" {
+		return &http.Client{Timeout: 20 * time.Second}
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = proxy
+	return &http.Client{Timeout: 20 * time.Second, Transport: transport}
+}
+
 func toolShareFile(cwd string, rawPath any, compress bool, preview bool) string {
 	inputPaths := inputPathList(rawPath)
 	if len(inputPaths) == 0 {
@@ -1553,6 +1985,9 @@ func toolShareFile(cwd string, rawPath any, compress bool, preview bool) string 
 			return err.Error()
 		}
 		resolved = append(resolved, path)
+	}
+	if _, err := shareSourceSize(resolved); err != nil {
+		return err.Error()
 	}
 	shareID := id.Must(12)
 	dir := filepath.Join(sharesRoot(), shareID)
@@ -1616,10 +2051,29 @@ func toolShareFile(cwd string, rawPath any, compress bool, preview bool) string 
 		"expiresAt":  expiresAt.Format(time.RFC3339),
 	}
 	if preview && !compressed && len(resolved) == 1 {
-		payload["previewUrl"] = "/api/shares/" + shareID + "/preview"
+		if previewType := sharePreviewType(fileName); previewType != "" {
+			payload["preview"] = true
+			payload["previewType"] = previewType
+			payload["previewUrl"] = "/api/shares/" + shareID + "/preview"
+		}
 	}
 	data, _ := json.MarshalIndent(payload, "", "  ")
 	return string(data)
+}
+
+func sharePreviewType(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico":
+		return "image"
+	case ".mp4", ".webm", ".mov", ".ogg":
+		return "video"
+	case ".pdf":
+		return "pdf"
+	case ".html", ".htm":
+		return "html"
+	default:
+		return ""
+	}
 }
 
 func inputPathList(raw any) []string {
@@ -1639,12 +2093,52 @@ func inputPathList(raw any) []string {
 	return paths
 }
 
+func shareSourceSize(paths []string) (int64, error) {
+	var total int64
+	for _, root := range paths {
+		info, err := os.Stat(root)
+		if err != nil {
+			return 0, err
+		}
+		if !info.IsDir() {
+			total += info.Size()
+			if total > maxToolShareSourceBytes {
+				return total, errors.New("source size exceeds 512MB ShareFile limit")
+			}
+			continue
+		}
+		if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Type()&os.ModeSymlink != 0 {
+				return errors.New("symlink paths cannot be shared")
+			}
+			if d.IsDir() {
+				return nil
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			total += info.Size()
+			if total > maxToolShareSourceBytes {
+				return errors.New("source size exceeds 512MB ShareFile limit")
+			}
+			return nil
+		}); err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
 func copyFile(dest, src string) error {
 	info, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
-	if info.Size() > 512*1024*1024 {
+	if info.Size() > maxToolShareSourceBytes {
 		return errors.New("file exceeds 512MB ShareFile limit")
 	}
 	in, err := os.Open(src)
@@ -1838,6 +2332,20 @@ func removeShareDisk(shareID string) {
 	_ = os.RemoveAll(filepath.Join(sharesRoot(), shareID))
 	_ = os.Remove(shareMetadataPath(shareID))
 	_ = os.Remove(shareMetadataPath(shareID) + ".tmp")
+}
+
+func resolveOptionalPathWithin(cwd, path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		root, err := filepath.Abs(cwd)
+		if err != nil {
+			return "", err
+		}
+		if realRoot, err := filepath.EvalSymlinks(root); err == nil {
+			return realRoot, nil
+		}
+		return root, nil
+	}
+	return resolveWithin(cwd, strings.TrimSpace(path))
 }
 
 func resolveWithin(cwd, path string) (string, error) {

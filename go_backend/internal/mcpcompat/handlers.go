@@ -123,7 +123,11 @@ func (h *Handler) embeddedTools() []map[string]any {
 		{
 			"name":        "narrafork_fork_chapter",
 			"description": "Fork an existing chapter into a new branch",
-			"inputSchema": objectSchema(map[string]any{"chapterId": stringSchema("Source chapter ID to fork from"), "title": stringSchema("Title for the new chapter")}, []string{"chapterId", "title"}),
+			"inputSchema": objectSchema(map[string]any{
+				"chapterId":   stringSchema("Source chapter ID to fork from"),
+				"title":       stringSchema("Title for the new chapter"),
+				"inheritMode": enumSchema([]string{"full", "compressed", "fresh"}, "Context inheritance mode; defaults to full"),
+			}, []string{"chapterId", "title"}),
 		},
 		{
 			"name":        "narrafork_merge_chapter",
@@ -186,7 +190,18 @@ func (h *Handler) callEmbeddedTool(ctx context.Context, params map[string]any) m
 		if chapterID == "" || title == "" {
 			return mcpErrorResult("chapterId and title are required")
 		}
-		chapter, err := h.Chapters.Fork(ctx, chapterID, chapters.ForkInput{Title: &title})
+		inheritMode := ""
+		if rawMode, ok := arguments["inheritMode"]; ok {
+			mode, ok := rawMode.(string)
+			if !ok {
+				return mcpErrorResult("inheritMode must be a string")
+			}
+			inheritMode = strings.TrimSpace(mode)
+			if inheritMode != "" && inheritMode != "full" && inheritMode != "compressed" && inheritMode != "fresh" {
+				return mcpErrorResult("inheritMode must be full, compressed, or fresh")
+			}
+		}
+		chapter, err := h.Chapters.Fork(ctx, chapterID, chapters.ForkInput{Title: &title, InheritMode: inheritMode})
 		if err != nil {
 			return mcpErrorResult(err.Error())
 		}

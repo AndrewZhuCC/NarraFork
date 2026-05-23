@@ -47,7 +47,7 @@ func resolveProvider(settings *config.Store, model string) (Provider, error) {
 func resolveProviderFromRaw(raw map[string]any, model string) (Provider, error) {
 	provider, err := resolveProviderExact(raw, model)
 	if err == nil {
-		return provider, nil
+		return applyProviderRuntimeDefaults(raw, provider), nil
 	}
 	prefix, _ := splitModel(model)
 	if !isGoRuntimeUnsupportedProvider(prefix) {
@@ -56,10 +56,37 @@ func resolveProviderFromRaw(raw map[string]any, model string) (Provider, error) 
 	for _, candidate := range fallbackProviderCandidates(raw) {
 		provider, fallbackErr := resolveProviderExact(raw, candidate)
 		if fallbackErr == nil {
-			return provider, nil
+			return applyProviderRuntimeDefaults(raw, provider), nil
 		}
 	}
 	return Provider{}, fmt.Errorf("provider %q is not supported by go_backend runtime yet and no OpenAI/Anthropic-compatible fallback is configured: %w", prefix, err)
+}
+
+func applyProviderRuntimeDefaults(raw map[string]any, provider Provider) Provider {
+	if strings.TrimSpace(provider.DefaultReasoningEffort) == "" && (provider.Kind == "codex" || strings.EqualFold(provider.APIMode, "codex")) {
+		provider.DefaultReasoningEffort = settingsNestedString(raw, "codex", "defaultReasoningEffort")
+	}
+	if strings.TrimSpace(provider.DefaultReasoningEffort) == "" {
+		provider.DefaultReasoningEffort = settingsNestedString(raw, "agent", "defaultReasoningEffort")
+	}
+	provider.DefaultReasoningEffort = normalizeReasoningEffort(provider.DefaultReasoningEffort)
+	return provider
+}
+
+func settingsNestedString(raw map[string]any, section string, key string) string {
+	if raw == nil {
+		return ""
+	}
+	sectionMap, _ := raw[section].(map[string]any)
+	return stringValue(sectionMap[key])
+}
+
+func optionalBoolValue(values map[string]any, key string) *bool {
+	if _, ok := values[key]; !ok {
+		return nil
+	}
+	value := boolValue(values[key])
+	return &value
 }
 
 func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
@@ -97,7 +124,7 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com/v1"
 		}
-		return Provider{Prefix: pfx, Kind: "anthropic", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, OfficialAPI: boolValue(provider["officialApi"])}, nil
+		return Provider{Prefix: pfx, Kind: "anthropic", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, OfficialAPI: boolValue(provider["officialApi"]), DefaultReasoningEffort: stringValue(provider["defaultReasoningEffort"]), ProxyURL: stringValue(provider["proxy"]), TLSRejectUnauthorized: optionalBoolValue(provider, "tlsRejectUnauthorized")}, nil
 	}
 	for _, item := range readArray(raw["customApiProviders"]) {
 		provider, ok := item.(map[string]any)
@@ -126,7 +153,7 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 		if baseURL == "" {
 			baseURL = "https://api.anthropic.com/v1"
 		}
-		return Provider{Prefix: pfx, Kind: "anthropic", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, OfficialAPI: strings.Contains(protocol, "official")}, nil
+		return Provider{Prefix: pfx, Kind: "anthropic", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, OfficialAPI: strings.Contains(protocol, "official"), DefaultReasoningEffort: stringValue(provider["defaultReasoningEffort"]), ProxyURL: stringValue(provider["proxy"]), TLSRejectUnauthorized: optionalBoolValue(provider, "tlsRejectUnauthorized")}, nil
 	}
 	for _, spec := range []struct{ Key, DefaultPrefix, Kind string }{{"nkpProviders", "nkp", "nkp"}, {"nugProviders", "nug", "nug"}, {"clineProviders", "cline", "cline"}} {
 		for _, item := range readArray(raw[spec.Key]) {
@@ -207,6 +234,9 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 			if boolValue(provider["responsesApi"]) && apiMode == "" {
 				apiMode = "responses"
 			}
+			if apiMode == "codex" {
+				kind = "codex"
+			}
 			if bareModel == "" {
 				bareModel = stringValue(provider["defaultModel"])
 			}
@@ -218,7 +248,14 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 			if baseURL == "" {
 				baseURL = "https://api.openai.com/v1"
 			}
-			return Provider{Prefix: pfx, Kind: kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode, AccountID: stringValue(provider["accountId"])}, nil
+			accountID := ""
+			var useWebSocket *bool
+			if kind == "codex" {
+				accountID = firstNonEmpty(stringValue(provider["codexAccountId"]), stringValue(provider["accountId"]))
+				value := boolValue(provider["codexWebSocket"])
+				useWebSocket = &value
+			}
+			return Provider{Prefix: pfx, Kind: kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode, AccountID: accountID, UseWebSocket: useWebSocket}, nil
 		}
 	}
 	if prefix == "anthropic" {
@@ -453,6 +490,8 @@ func nugModelMeta(provider map[string]any, model string) (string, string) {
 }
 
 func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool) {
+	codex, _ := raw["codex"].(map[string]any)
+	codexProxy := stringValue(codex["proxy"])
 	for _, item := range readArray(raw["codexProviders"]) {
 		provider, ok := item.(map[string]any)
 		if !ok || boolValue(provider["disabled"]) {
@@ -466,9 +505,8 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 			continue
 		}
 		baseURL := strings.TrimRight(firstNonEmpty(stringValue(provider["baseUrl"]), "https://chatgpt.com/backend-api/codex"), "/")
-		return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(provider["accountId"])}, true
+		return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(provider["accountId"]), ProxyURL: codexProxy}, true
 	}
-	codex, _ := raw["codex"].(map[string]any)
 	if bareModel == "" {
 		bareModel = firstNonEmpty(stringValue(codex["defaultModel"]), "gpt-5.3-codex")
 	}
@@ -476,7 +514,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		apiKey := firstNonEmpty(stringValue(codex["apiKey"]), stringValue(codex["accessToken"]), stringValue(codex["token"]))
 		if apiKey != "" {
 			baseURL := strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), "https://chatgpt.com/backend-api/codex"), "/")
-			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"]), LoadBalancingMode: stringValue(codex["loadBalancingMode"])}, true
+			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"]), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy}, true
 		}
 	}
 	if credential, ok := firstCodexCredentialFromDiskWithOptions(codex); ok {
@@ -484,7 +522,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		if codex != nil {
 			baseURL = strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), baseURL), "/")
 		}
-		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex), LoadBalancingMode: stringValue(codex["loadBalancingMode"])}, true
+		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy}, true
 	}
 	return Provider{}, false
 }
@@ -583,6 +621,17 @@ func codexCredentialPoolFromDisk(baseURL string, model string) []Provider {
 	return codexCredentialPoolFromDiskWithOptions(baseURL, model, nil)
 }
 
+func codexUseWebSocketOption(codex map[string]any) *bool {
+	if codex == nil {
+		return nil
+	}
+	if _, ok := codex["useWebSocket"]; !ok {
+		return nil
+	}
+	value := boolValue(codex["useWebSocket"])
+	return &value
+}
+
 func codexCredentialPoolFromDiskWithOptions(baseURL string, model string, codex map[string]any) []Provider {
 	entries, ok := codexCredentialEntriesFromDisk()
 	if !ok {
@@ -591,11 +640,12 @@ func codexCredentialPoolFromDiskWithOptions(baseURL string, model string, codex 
 	entries = sortCodexCredentials(entries, codex)
 	pool := []Provider{}
 	mode := stringValue(codex["loadBalancingMode"])
+	codexProxy := stringValue(codex["proxy"])
 	for _, entry := range entries {
 		if boolValue(entry["disabled"]) || strings.TrimSpace(stringValue(entry["accessToken"])) == "" || codexAccessTokenOnlyExpired(entry) {
 			continue
 		}
-		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"]), LoadBalancingMode: mode})
+		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"]), LoadBalancingMode: mode, UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy})
 	}
 	return pool
 }

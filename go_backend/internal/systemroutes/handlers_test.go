@@ -66,6 +66,32 @@ func newProviderRoutesTestRouterWithStore(t *testing.T, store *config.Store, rol
 	return router, token
 }
 
+func newProviderRoutesTestRouterWithoutSettings(t *testing.T, role string) (*chi.Mux, string) {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	if _, err := sqlDB.Exec(`CREATE TABLE users (id TEXT PRIMARY KEY, role TEXT)`); err != nil {
+		t.Fatalf("create users table: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO users (id, role) VALUES ('user-1', ?)`, role); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	store := newSystemRoutesTestStore(t)
+	authService := auth.NewService(sqlDB, store)
+	token, err := authService.CreateToken("user-1", role)
+	if err != nil {
+		t.Fatalf("create user token: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Use(authService.Middleware)
+	h := &Handler{}
+	h.RegisterProviders(router)
+	return router, token
+}
+
 func TestProviderSensitiveRoutesRequireAdminBoundary(t *testing.T) {
 	router, userToken := newProviderRoutesTestRouter(t)
 	cases := []struct {
@@ -106,6 +132,276 @@ func TestProviderSensitiveRoutesRequireAdminBoundary(t *testing.T) {
 	}
 }
 
+func TestKiroChatReturnsExplicitFeatureDisabledFallback(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/kiro/chat", strings.NewReader(`{"messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("kiro chat fallback must not be reported as a successful SSE stream")
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "kiro.chat" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected Kiro chat fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if !strings.Contains(reason, "Kiro chat streaming is not implemented in go_backend") || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("Kiro chat fallback should expose reason/error/message, got %#v", body)
+	}
+}
+
+func TestKiroMcpToolsFallbackExposesReason(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodGet, "/kiro/mcp-tools", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 fallback tools, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	reason, _ := body["reason"].(string)
+	if body["fallback"] != true || reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("Kiro MCP tools fallback should expose reason/error/message, got %#v", body)
+	}
+	if result, _ := body["result"].(map[string]any); len(result) == 0 {
+		t.Fatalf("Kiro MCP tools fallback should keep result tools payload, got %#v", body)
+	}
+}
+
+func TestKiroMcpSearchFallbackExposesReason(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/kiro/mcp-search", strings.NewReader(`{"query":"narrafork"}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 fallback search, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	reason, _ := body["reason"].(string)
+	errorPayload, _ := body["error"].(map[string]any)
+	if body["fallback"] != true || !strings.Contains(reason, "Kiro MCP search unavailable in go_backend") || body["message"] != reason || errorPayload["message"] != reason {
+		t.Fatalf("Kiro MCP search fallback should expose reason/message and JSON-RPC error, got %#v", body)
+	}
+}
+
+func TestNugLoginPersistsReturnedAPIKey(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/login":
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected login method: %s", r.Method)
+			}
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode login body: %v", err)
+			}
+			if body["username"] != "alice" || body["password"] != "secret" {
+				t.Fatalf("unexpected login body: %#v", body)
+			}
+			http.SetCookie(w, &http.Cookie{Name: "nug_session", Value: "session-token"})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"user": map[string]any{"id": "nug-user-1", "username": "alice"},
+			})
+		case "/api/api-keys":
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected api key method: %s", r.Method)
+			}
+			if got := r.Header.Get("Cookie"); !strings.Contains(got, "nug_session=session-token") {
+				t.Fatalf("missing session cookie: %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"apiKey": "nug-api-key"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"nugProviders": []any{map[string]any{
+			"id":      "nug-test",
+			"name":    "NUG Test",
+			"prefix":  "nug",
+			"baseUrl": upstream.URL,
+		}},
+	}); err != nil {
+		t.Fatalf("seed nug provider: %v", err)
+	}
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	payload, _ := json.Marshal(map[string]any{"username": "alice", "password": "secret"})
+	req := httptest.NewRequest(http.MethodPost, "/nug/providers/nug-test/login", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected login 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	decodeJSONBody(t, w, &response)
+	if response["apiKey"] != "nug-api-key" {
+		t.Fatalf("unexpected login response: %#v", response)
+	}
+
+	raw := store.Raw()
+	providers, _ := raw["nugProviders"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("expected one provider, got %#v", providers)
+	}
+	provider, _ := providers[0].(map[string]any)
+	if provider["apiKey"] != "nug-api-key" {
+		t.Fatalf("expected saved api key, got %#v", provider)
+	}
+	if provider["nugUsername"] != "alice" || provider["nugUserId"] != "nug-user-1" {
+		t.Fatalf("expected saved user metadata, got %#v", provider)
+	}
+}
+
+func TestCodexUsageQueueClearReturnsOkWhenQueueIsEmpty(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/codex/usage-queue/clear", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 ok, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != true {
+		t.Fatalf("unexpected Codex usage queue clear body: %#v", body)
+	}
+}
+
+func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir, err := narraforkDataDir()
+	if err != nil {
+		t.Fatalf("data dir: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	credentials := make([]map[string]any, 0, 28)
+	for i := 0; i < 25; i++ {
+		id := "available-" + strconv.Itoa(i)
+		credentials = append(credentials, map[string]any{
+			"id":          id,
+			"displayName": "Available " + strconv.Itoa(i),
+			"usage":       map[string]any{"plan_type": "pro", "remaining_percent": 80 - i},
+		})
+	}
+	for i := 0; i < 3; i++ {
+		credentials = append(credentials, map[string]any{
+			"id":          "unavailable-" + strconv.Itoa(i),
+			"displayName": "Unavailable " + strconv.Itoa(i),
+			"disabled":    true,
+			"usage":       map[string]any{"plan_type": "free", "remaining_percent": i},
+		})
+	}
+	data, _ := json.Marshal(credentials)
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), data, 0o600); err != nil {
+		t.Fatalf("write codex credentials: %v", err)
+	}
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	req := httptest.NewRequest(http.MethodGet, "/codex/status?availablePage=2&unavailablePage=1&pageSize=20", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 ok, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["availableTotal"] != float64(25) || body["unavailableTotal"] != float64(3) {
+		t.Fatalf("unexpected totals: available=%#v unavailable=%#v", body["availableTotal"], body["unavailableTotal"])
+	}
+	availableEntries, _ := body["availableEntries"].([]any)
+	unavailableEntries, _ := body["unavailableEntries"].([]any)
+	entries, _ := body["entries"].([]any)
+	if len(availableEntries) != 5 || len(unavailableEntries) != 3 || len(entries) != 8 {
+		t.Fatalf("unexpected page lengths: available=%d unavailable=%d entries=%d", len(availableEntries), len(unavailableEntries), len(entries))
+	}
+	firstAvailable, _ := availableEntries[0].(map[string]any)
+	if firstAvailable["id"] != "available-20" {
+		t.Fatalf("expected page 2 to start with available-20, got %#v", firstAvailable["id"])
+	}
+	usageCache, _ := body["usageCache"].(map[string]any)
+	if _, ok := usageCache["available-0"]; ok {
+		t.Fatalf("usageCache should only include paged entries, got %#v", usageCache)
+	}
+	if _, ok := usageCache["available-20"]; !ok {
+		t.Fatalf("usageCache should include current page entries, got %#v", usageCache)
+	}
+}
+
+func TestKiroSettingsMutationWithoutSettingsStoreReturnsFeatureDisabled(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithoutSettings(t, "admin")
+	req := httptest.NewRequest(http.MethodPost, "/kiro/global-proxy", strings.NewReader(`{"proxy":"https://proxy.example.test"}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "providers.kiro.settingsStore" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected Kiro settings fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("Kiro settings fallback should expose reason/error/message, got %#v", body)
+	}
+}
+
+func TestCodexSettingsMutationWithoutSettingsStoreReturnsFeatureDisabled(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithoutSettings(t, "admin")
+	req := httptest.NewRequest(http.MethodPost, "/codex/default-reasoning-effort", strings.NewReader(`{"reasoningEffort":"medium"}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "providers.codex.settingsStore" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected Codex settings fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("Codex settings fallback should expose reason/error/message, got %#v", body)
+	}
+}
+
 func TestCodexQuotaOverviewRemainsAvailableToAuthenticatedUsers(t *testing.T) {
 	router, userToken := newProviderRoutesTestRouter(t)
 	req := httptest.NewRequest(http.MethodGet, "/codex/quota-overview", nil)
@@ -114,6 +410,204 @@ func TestCodexQuotaOverviewRemainsAvailableToAuthenticatedUsers(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected quota overview 200 for authenticated user, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func newAdminRoutesTestRouter(t *testing.T, seedUsers []struct{ id, username, role string }, tokenUserID string) (*chi.Mux, string, *sql.DB) {
+	t.Helper()
+	return newAdminRoutesTestRouterWithTokenRole(t, seedUsers, tokenUserID, "")
+}
+
+func newAdminRoutesTestRouterWithTokenRole(t *testing.T, seedUsers []struct{ id, username, role string }, tokenUserID, tokenRole string) (*chi.Mux, string, *sql.DB) {
+	t.Helper()
+	store := newSystemRoutesTestStore(t)
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	_, err = sqlDB.Exec(`CREATE TABLE users (
+		id TEXT PRIMARY KEY,
+		username TEXT UNIQUE,
+		password_hash TEXT,
+		role TEXT,
+		avatar_color TEXT,
+		avatar_image_id TEXT,
+		created_at TEXT
+	)`)
+	if err != nil {
+		t.Fatalf("create users table: %v", err)
+	}
+	for _, user := range seedUsers {
+		if _, err := sqlDB.Exec(`INSERT INTO users (id, username, password_hash, role, created_at) VALUES (?, ?, 'hash', ?, 'now')`, user.id, user.username, user.role); err != nil {
+			t.Fatalf("insert user %s: %v", user.id, err)
+		}
+	}
+	authService := auth.NewService(sqlDB, store)
+	role := tokenRole
+	if role == "" {
+		role = "admin"
+		for _, user := range seedUsers {
+			if user.id == tokenUserID {
+				role = user.role
+			}
+		}
+	}
+	token, err := authService.CreateToken(tokenUserID, role)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Use(authService.Middleware)
+	h := &Handler{DB: sqlDB, Settings: store}
+	router.Route("/admin", h.RegisterAdmin)
+	return router, token, sqlDB
+}
+
+func TestAdminUpdateUserPreventsSelfDemote(t *testing.T) {
+	router, token, sqlDB := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"admin-2", "ops", "admin"}}, "admin-1")
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/admin-1", strings.NewReader(`{"role":"user"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 self demote, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["code"] != "SELF_DEMOTE" || body["error"] != "Cannot demote yourself" {
+		t.Fatalf("unexpected self demote body: %#v", body)
+	}
+	var role string
+	if err := sqlDB.QueryRow(`SELECT role FROM users WHERE id='admin-1'`).Scan(&role); err != nil || role != "admin" {
+		t.Fatalf("self demote should not update role, role=%q err=%v", role, err)
+	}
+}
+
+func TestAdminUpdateUserProtectsLastAdminDemotion(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouterWithTokenRole(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"user-1", "member", "user"}}, "user-1", "admin")
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/admin-1", strings.NewReader(`{"role":"user"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 last-admin demote, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["code"] != "LAST_ADMIN" {
+		t.Fatalf("unexpected last-admin demote body: %#v", body)
+	}
+}
+
+func TestAdminDeleteUserProtectsLastAdmin(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouterWithTokenRole(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"user-1", "member", "user"}}, "user-1", "admin")
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/admin/users/admin-1", nil)
+	deleteReq.Header.Set("Authorization", "Bearer "+token)
+	deleteW := httptest.NewRecorder()
+	router.ServeHTTP(deleteW, deleteReq)
+	if deleteW.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 last-admin delete, got %d body=%s", deleteW.Code, deleteW.Body.String())
+	}
+	var deleteBody map[string]any
+	decodeJSONBody(t, deleteW, &deleteBody)
+	if deleteBody["code"] != "LAST_ADMIN" {
+		t.Fatalf("unexpected last-admin delete body: %#v", deleteBody)
+	}
+}
+
+func TestAdminUpdateUserValidatesDuplicateAndMissingUsers(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"user-1", "member", "user"}}, "admin-1")
+
+	dupReq := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1", strings.NewReader(`{"username":"root"}`))
+	dupReq.Header.Set("Authorization", "Bearer "+token)
+	dupReq.Header.Set("Content-Type", "application/json")
+	dupW := httptest.NewRecorder()
+	router.ServeHTTP(dupW, dupReq)
+	if dupW.Code != http.StatusConflict {
+		t.Fatalf("expected 409 duplicate username, got %d body=%s", dupW.Code, dupW.Body.String())
+	}
+	var dupBody map[string]any
+	decodeJSONBody(t, dupW, &dupBody)
+	if dupBody["code"] != "USERNAME_TAKEN" {
+		t.Fatalf("unexpected duplicate username body: %#v", dupBody)
+	}
+
+	missingReq := httptest.NewRequest(http.MethodPatch, "/admin/users/missing", strings.NewReader(`{"username":"nobody"}`))
+	missingReq.Header.Set("Authorization", "Bearer "+token)
+	missingReq.Header.Set("Content-Type", "application/json")
+	missingW := httptest.NewRecorder()
+	router.ServeHTTP(missingW, missingReq)
+	if missingW.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 missing update target, got %d body=%s", missingW.Code, missingW.Body.String())
+	}
+}
+
+func TestAdminUpdateUserReturnsUpdatedShape(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"user-1", "member", "user"}}, "admin-1")
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/user-1", strings.NewReader(`{"username":"member2","role":"admin","password":"new-secret"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 update, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["id"] != "user-1" || body["username"] != "member2" || body["role"] != "admin" {
+		t.Fatalf("unexpected updated user body: %#v", body)
+	}
+}
+
+func TestAdminDeleteUserReturnsNotFoundForMissingTarget(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"admin-2", "ops", "admin"}}, "admin-1")
+	req := httptest.NewRequest(http.MethodDelete, "/admin/users/missing", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 missing delete target, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestBenchmarkCompareValidationReturnsDiagnostics(t *testing.T) {
+	router, token, sqlDB := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}}, "admin-1")
+	router.Route("/api/benchmarks", (&Handler{DB: sqlDB}).RegisterBenchmarks)
+	cases := []struct {
+		path string
+		code string
+	}{
+		{"/api/benchmarks/compare", "BENCHMARK_COMPARE_RUN_IDS_REQUIRED"},
+		{"/api/benchmarks/compare?runIds=run-1", "BENCHMARK_COMPARE_MIN_RUNS_REQUIRED"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.code, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 validation body, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			decodeJSONBody(t, w, &body)
+			reason, _ := body["reason"].(string)
+			if body["ok"] != false || body["code"] != tc.code || reason == "" || body["error"] != reason || body["message"] != reason {
+				t.Fatalf("benchmark compare validation should expose diagnostics, got %#v", body)
+			}
+		})
 	}
 }
 
@@ -168,6 +662,7 @@ func TestGatewayPublicWebhookFallbackIsRegistered(t *testing.T) {
 	if body["code"] != "GATEWAY_WEBHOOK_NOT_CONFIGURED" {
 		t.Fatalf("unexpected code: %#v", body)
 	}
+	assertGatewayFallbackReason(t, body, "Webhook adapter is not configured in go_backend")
 }
 
 func TestGatewayWebhookRejectsInvalidSignature(t *testing.T) {
@@ -190,6 +685,7 @@ func TestGatewayWebhookRejectsInvalidSignature(t *testing.T) {
 	if body["code"] != "GATEWAY_WEBHOOK_INVALID_SIGNATURE" || body["supported"] != false {
 		t.Fatalf("unexpected invalid signature body: %#v", body)
 	}
+	assertGatewayFallbackReason(t, body, "Invalid webhook signature")
 }
 
 func TestGatewayWebhookValidatesPayloadBeforeFallback(t *testing.T) {
@@ -213,6 +709,7 @@ func TestGatewayWebhookValidatesPayloadBeforeFallback(t *testing.T) {
 	if body["code"] != "GATEWAY_WEBHOOK_MISSING_TEXT" {
 		t.Fatalf("unexpected validation body: %#v", body)
 	}
+	assertGatewayFallbackReason(t, body, "Missing required webhook field: text")
 }
 
 func TestGatewayWebhookMappedNarratorNeedsRuntimeFallback(t *testing.T) {
@@ -237,6 +734,14 @@ func TestGatewayWebhookMappedNarratorNeedsRuntimeFallback(t *testing.T) {
 	decodeJSONBody(t, w, &body)
 	if body["code"] != "GATEWAY_WEBHOOK_RUNTIME_UNAVAILABLE" || body["narratorId"] != "narrator-1" {
 		t.Fatalf("unexpected mapped fallback body: %#v", body)
+	}
+	assertGatewayFallbackReason(t, body, "Narrator runtime is not attached to the public gateway route")
+}
+
+func assertGatewayFallbackReason(t *testing.T, body map[string]any, expected string) {
+	t.Helper()
+	if body["reason"] != expected || body["error"] != expected || body["message"] != expected {
+		t.Fatalf("gateway fallback should expose reason/error/message=%q, got %#v", expected, body)
 	}
 }
 
@@ -381,6 +886,28 @@ func TestScanRuntimeMarksTerminalCountErrorsDegraded(t *testing.T) {
 	if len(fallbacks) == 0 || fallbacks[0] != "terminal_running_count_failed" {
 		t.Fatalf("expected terminal count fallback, got %#v", terminals)
 	}
+	reason, _ := terminals["reason"].(string)
+	if reason == "" || terminals["error"] != reason || terminals["message"] != reason {
+		t.Fatalf("degraded terminal runtime payload should expose reason/error/message, got %#v", terminals)
+	}
+}
+
+func TestScanRuntimeContainerFallbackExposesReason(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/runtime/scan", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.scanRuntime(w, req); err != nil {
+		t.Fatalf("scan runtime: %v", err)
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	containers, _ := body["containers"].(map[string]any)
+	reason, _ := containers["reason"].(string)
+	if containers["fallback"] != true || containers["supported"] != false || reason == "" || containers["error"] != reason || containers["message"] != reason {
+		t.Fatalf("container runtime fallback should expose reason/error/message, got %#v", containers)
+	}
 }
 
 func TestUsageHistoryStatsReturnsSummaryQueryErrors(t *testing.T) {
@@ -431,6 +958,58 @@ func TestGatewayStatusMarksConfiguredUserCountErrorsDegraded(t *testing.T) {
 	if !found {
 		t.Fatalf("expected configured users fallback, got %#v", body)
 	}
+	reason, _ := body["reason"].(string)
+	if reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("gateway status fallback should expose reason/error/message, got %#v", body)
+	}
+	webhook, _ := body["webhook"].(map[string]any)
+	webhookReason, _ := webhook["reason"].(string)
+	if webhook["fallback"] != true || webhookReason == "" || webhook["error"] != webhookReason || webhook["message"] != webhookReason {
+		t.Fatalf("gateway webhook status fallback should expose reason/error/message, got %#v", webhook)
+	}
+}
+
+func TestGatewayStatusFallbackIsExplicitWithoutDegradation(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodGet, "/api/gateway/status", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.gatewayStatus(w, req); err != nil {
+		t.Fatalf("gateway status: %v", err)
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("expected explicit gateway status fallback, got %#v", body)
+	}
+	assertGatewayFallbackReason(t, body, gatewayRuntimeFallbackReason)
+	webhook, _ := body["webhook"].(map[string]any)
+	if webhook["supported"] != false || webhook["fallback"] != true {
+		t.Fatalf("expected explicit webhook status fallback, got %#v", webhook)
+	}
+	assertGatewayFallbackReason(t, webhook, gatewayWebhookFallbackReason)
+}
+
+func TestGatewayReloadFallbackIsExplicit(t *testing.T) {
+	h := &Handler{}
+	req := httptest.NewRequest(http.MethodPost, "/api/gateway/reload", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.gatewayReload(w, req); err != nil {
+		t.Fatalf("gateway reload: %v", err)
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	status, _ := body["status"].(map[string]any)
+	if body["ok"] != true || status["supported"] != false || status["fallback"] != true {
+		t.Fatalf("expected explicit gateway reload fallback, got %#v", body)
+	}
+	assertGatewayFallbackReason(t, status, gatewayRuntimeFallbackReason)
+	webhook, _ := status["webhook"].(map[string]any)
+	if webhook["supported"] != false || webhook["fallback"] != true {
+		t.Fatalf("expected explicit webhook reload fallback, got %#v", webhook)
+	}
+	assertGatewayFallbackReason(t, webhook, gatewayWebhookFallbackReason)
 }
 
 func TestUpdateGatewayLastMessageReturnsUpdateErrors(t *testing.T) {
@@ -461,7 +1040,7 @@ func TestGatewayWeixinQRFallbackIsExplicit(t *testing.T) {
 	}
 	var body map[string]any
 	decodeJSONBody(t, w, &body)
-	if body["supported"] != false || body["fallback"] != true || body["code"] != "WEIXIN_QR_UNSUPPORTED" {
+	if body["supported"] != false || body["fallback"] != true || body["code"] != "WEIXIN_QR_UNSUPPORTED" || body["reason"] != gatewayWeixinQRUnsupportedReason || body["error"] != gatewayWeixinQRUnsupportedReason || body["message"] != gatewayWeixinQRUnsupportedReason {
 		t.Fatalf("unexpected QR fallback body: %#v", body)
 	}
 }

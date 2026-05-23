@@ -796,6 +796,31 @@ func TestPodmanStatusMissingOnLinuxRemainsInstallable(t *testing.T) {
 	if body["installed"] != false || body["supported"] != true || body["fallback"] != true || body["platform"] != "linux" {
 		t.Fatalf("missing podman should be installable on Linux, got %#v", body)
 	}
+	reason, _ := body["reason"].(string)
+	if reason != "Podman is not installed or not available on PATH." || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("missing podman status should expose reason/error/message, got %#v", body)
+	}
+}
+
+func TestContainerSetupPodmanMissingExposesReasonedFallback(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	handler := NewHandler(&Service{})
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/chapters/container-setup", nil)
+	if err := handler.containerSetup(recorder, req); err != nil {
+		t.Fatalf("containerSetup: %v", err)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	reason, _ := body["reason"].(string)
+	if body["supported"] != false || body["fallback"] != true || reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("container setup fallback should expose reason/error/message, got %#v", body)
+	}
 }
 
 func TestPodmanInstallDoesNotReportSuccessWhenCommandDoesNotInstall(t *testing.T) {
@@ -848,7 +873,7 @@ func TestContainerActionReturnsExplicitFallbackWhenPodmanMissing(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
-	if body["fallback"] != true || body["code"] != "PODMAN_NOT_FOUND" || body["supported"] != false {
+	if body["fallback"] != true || body["code"] != "PODMAN_NOT_FOUND" || body["supported"] != false || body["reason"] == "" {
 		t.Fatalf("fallback body = %#v", body)
 	}
 }

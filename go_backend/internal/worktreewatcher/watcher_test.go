@@ -120,6 +120,10 @@ func TestPollOnceBroadcastsCommitSyncErrorWhenMetadataUpdateFails(t *testing.T) 
 	if event.payload["code"] != "WORKTREE_WATCHER_COMMIT_SYNC_FAILED" || event.payload["backgroundSync"] != true || event.payload["fallback"] != true || event.payload["fatal"] != false {
 		t.Fatalf("unexpected commit sync error payload: %#v", event.payload)
 	}
+	reason, _ := event.payload["reason"].(string)
+	if reason == "" || event.payload["error"] != reason || event.payload["message"] != reason {
+		t.Fatalf("commit sync error should expose reason/error/message, got %#v", event.payload)
+	}
 }
 
 type watcherBroadcastEvent struct {

@@ -929,9 +929,12 @@ func (h *Handler) containerSetup(w http.ResponseWriter, r *http.Request) error {
 		"allReady":        podman != "" && len(compose.command) > 0 && rootlessOK,
 	}
 	if podman == "" {
+		reason := "podman is not available; container runtime features will return explicit fallback responses"
 		payload["fallback"] = true
 		payload["supported"] = false
-		payload["message"] = "podman is not available; container runtime features will return explicit fallback responses"
+		payload["reason"] = reason
+		payload["error"] = reason
+		payload["message"] = reason
 	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
@@ -946,9 +949,15 @@ func (h *Handler) podmanStatus(w http.ResponseWriter, r *http.Request) error {
 	installed := version != ""
 	payload := map[string]any{"installed": installed, "version": version, "platform": podmanStatusPlatform(), "supported": platformSupported, "fallback": !installed}
 	if !platformSupported {
-		payload["reason"] = "Container management is only supported on Linux in go_backend."
+		reason := "Container management is only supported on Linux in go_backend."
+		payload["reason"] = reason
+		payload["error"] = reason
+		payload["message"] = reason
 	} else if !installed {
-		payload["reason"] = "Podman is not installed or not available on PATH."
+		reason := "Podman is not installed or not available on PATH."
+		payload["reason"] = reason
+		payload["error"] = reason
+		payload["message"] = reason
 	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil

@@ -1,6 +1,6 @@
 {
 	"name": "go-backend-phase3-contract-matrix",
-	"updatedAt": "2026-05-18",
+	"updatedAt": "2026-05-21",
 	"scope": "Narrator plan mode, compact/retry/recovery, foreground/background subagents, MCP tool discovery versus agent injection, and review tool closure.",
 	"contracts": [
 		{
@@ -27,6 +27,11 @@
 		{
 			"group": "narrator.compact",
 			"status": "supported-with-fallback-summary",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/components/narrator/NarratorPanel.tsx",
+				"frontend/components/narrator/MessageBubble.tsx"
+			],
 			"features": [
 				"blocking compact creates a compact marker message and clears provider/prune state",
 				"segment compact hides selected refs behind a compact marker and exposes summary/messages routes",
@@ -40,10 +45,12 @@
 				}
 			],
 			"goSources": ["go_backend/internal/narrators/handlers.go"],
+			"frontendConsumerPolicy": "NarratorPanel consumes compact capability through useNarratorCompactCapability, blocks unsupported compact requests before calling the API, and warns when Go compact uses caller-provided or deterministic fallback summaries instead of TypeScript model-generated summaries; MessageBubble exposes segment compact summary UI on compact markers.",
 			"tests": [
 				"go_backend/internal/narrators/handlers_compact_test.go",
 				"go_backend/internal/narrators/message_pagination_test.go",
-				"go_backend/internal/narrators/agent_history_content_test.go"
+				"go_backend/internal/narrators/agent_history_content_test.go",
+				"frontend/hooks/usePlatform.test.ts::getNarratorCompactCapability"
 			]
 		},
 		{
@@ -55,26 +62,41 @@
 				"interrupt clears active status and preserves manual_override state needed for retry/recovery",
 				"subagent conclusion update can rewrite parent tool result from the child final assistant text",
 				"rollback truncates narrator_message_refs and assistant blocks, invalidates affected tool calls, and optionally rebuilds file state from snapshots via revert=true",
-				"edit-and-regenerate performs copy-on-write user message edits, preserves attachment block order, optionally rolls back file state, optionally skips agent rerun, deletes following messages, and broadcasts WS updates"
+				"edit-and-regenerate performs copy-on-write user message edits, preserves attachment block order, optionally rolls back file state, optionally skips agent rerun, deletes following messages, and broadcasts WS updates",
+				"provider-specific retryable error codes and failover metadata are preserved on raw WS events and final narrator_error payloads",
+				"agent error persistence failures emit diagnostic fallback events and stop before unsafe follow-up mutations when error-message persistence fails",
+				"background agent run completion failures emit diagnostic fallback events when the parent background task record cannot be finalized"
 			],
 			"remainingParityRisks": [
-				"broader TS-vs-Go fixture comparison is still needed for compact boundaries, long tool chains, provider-specific recovery, and failure compensation"
+				"broader TS-vs-Go fixture comparison is still needed for remaining provider/runtime streams beyond the OpenAI Chat, OpenAI Responses, Anthropic, Kiro, NKP, NUG, Codex, and Cline provider executable fixtures; compact-boundary long-tool-chain edit/regenerate behavior, provider-specific retryable error diagnostics, failure compensation paths, provider invalidState fixture parity, Codex rebuild-history failover parity, and core provider stream/body/header fixture parity are now covered by focused Go contract tests"
 			],
 			"goSources": [
 				"go_backend/internal/narrators/handlers.go",
 				"go_backend/internal/narrators/service.go",
+				"go_backend/internal/narrators/agent_event_handler.go",
 				"go_backend/internal/narrators/rollback_edit.go"
 			],
 			"tests": [
 				"go_backend/internal/narrators/route_contract_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go::TestProviderSpecificRetryableErrorPreservesCodeThroughWSAndFinalError",
 				"go_backend/internal/narrators/agent_event_integration_test.go",
+				"go_backend/internal/narrators/background_task_events_test.go::TestPersistAgentErrorReturnsMessageInsertErrorsAndBroadcastsFallback",
+				"go_backend/internal/narrators/background_task_events_test.go::TestPersistAgentErrorReturnsStatusUpdateErrorsAndBroadcastsFallback",
+				"go_backend/internal/narrators/background_task_events_test.go::TestBackgroundAgentCompletionBroadcastsFallbackWhenTaskRecordUpdateFails",
 				"go_backend/internal/narrators/subagent_message_tree_test.go",
-				"go_backend/internal/narrators/rollback_edit_test.go"
+				"go_backend/internal/narrators/rollback_edit_test.go::TestEditAndRegeneratePreservesCompactBoundaryAndDeletesLongToolChain"
 			]
 		},
 		{
 			"group": "narrator.subagents",
 			"status": "supported-baseline-with-reattach-fallback",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/hooks/useNarratorWS.ts",
+				"frontend/components/narrator/SubagentCard.tsx",
+				"frontend/components/narrator/BackgroundTasksDrawer.tsx",
+				"frontend/components/narrator/NarratorPanel.tsx"
+			],
 			"features": [
 				"Agent tool creates foreground and background subagent narrators",
 				"background subagents are tracked in background_tasks and emit P1 background events",
@@ -95,27 +117,36 @@
 				"go_backend/internal/narrators/handlers.go",
 				"go_backend/internal/narrators/agent_event_handler.go"
 			],
+			"frontendConsumerPolicy": "SubagentCard and BackgroundTasksDrawer gate foreground/background, detach/open-session, cancel, and stale-recovery actions through subagent capability metadata; BackgroundTasksDrawer surfaces reattach fallback warnings so users do not assume a detached parent tool promise can be re-blocked after attach.",
 			"tests": [
 				"go_backend/internal/narrators/agent_event_integration_test.go",
 				"go_backend/internal/narrators/subagent_message_tree_test.go",
-				"go_backend/internal/narrators/background_task_events_test.go"
+				"go_backend/internal/narrators/background_task_events_test.go",
+				"frontend/hooks/usePlatform.test.ts::getNarratorSubagentsCapability"
 			]
 		},
 		{
 			"group": "mcp.tools",
-			"status": "discovery-supported-agent-injection-disabled",
+			"status": "stdio-partial-agent-injection-supported",
+			"frontendConsumers": [
+				"frontend/hooks/usePlatform.ts",
+				"frontend/routes/routines/tool-permissions.tsx"
+			],
 			"features": [
 				"/api/mcp/tools lists Go compatibility tools",
 				"MCP JSON-RPC initialize and tools/list are supported",
 				"MCP JSON-RPC tools/call dispatches embedded NarraFork compatibility tools",
 				"MCP server definitions are persisted through settings.json when a settings store is present",
-				"stdio MCP server probing can discover external tools for metadata"
+				"stdio MCP server probing can discover external tools for metadata",
+				"connected stdio MCP tools are injected into Go narrator provider tool lists with per-call stdio JSON-RPC execution",
+				"frontend tool permissions surface partial MCP agent-injection parity warnings"
 			],
-			"disabled": [
+			"fallbacks": [
 				{
-					"feature": "mcp.externalAgentInjection",
+					"feature": "mcp.externalAgentInjection.nonStdioTransports",
+					"supported": false,
 					"code": "FEATURE_DISABLED",
-					"reason": "External mcp__server__tool entries are discoverable metadata only and are not injected into Go narrator agent provider tool lists."
+					"reason": "SSE and streamable HTTP MCP transports remain metadata/configuration only; only connected stdio MCP tools are executable by Go narrator agents."
 				}
 			],
 			"goSources": [
@@ -123,10 +154,12 @@
 				"go_backend/internal/agentbasic/tool_inventory.go",
 				"go_backend/internal/app/router.go"
 			],
+			"frontendConsumerPolicy": "tool-permissions surfaces partial stdio MCP agent-injection parity and non-stdio fallback reasons before users assume all external MCP transports are executable by Go agents.",
 			"tests": [
 				"go_backend/internal/mcpcompat/handlers_test.go",
 				"go_backend/internal/agentbasic/tool_inventory_test.go",
-				"go_backend/internal/app/route_contract_test.go"
+				"go_backend/internal/app/route_contract_test.go",
+				"frontend/hooks/usePlatform.test.ts::getMcpExternalAgentCapability"
 			]
 		},
 		{

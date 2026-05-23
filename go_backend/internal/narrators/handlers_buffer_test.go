@@ -57,6 +57,34 @@ func TestPostMessageBuffersWorkingNarratorWithPriority(t *testing.T) {
 	}
 }
 
+func TestPostMessageBufferedStorageMissingReturnsReasonedFallback(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'working' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark working: %v", err)
+	}
+	if _, err := sqlDB.Exec(`DROP TABLE narrator_buffered_messages`); err != nil {
+		t.Fatalf("drop buffered messages: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"message":"cut in line"}`)
+	req := httptest.NewRequest(http.MethodPost, "/narrators/"+narratorID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := serveNarratorHandlerHTTPRequest(sqlDB, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 fallback, got %d body=%s", w.Code, w.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	reason, _ := payload["reason"].(string)
+	if payload["ok"] != false || payload["queued"] != false || payload["fallback"] != true || reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("buffered storage fallback should expose reason/error/message, got %#v", payload)
+	}
+}
+
 func TestDeletedMessageCountAfterSeqReturnsQueryErrors(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

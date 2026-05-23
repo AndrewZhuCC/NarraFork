@@ -10,6 +10,11 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
+import {
+	getProviderAgentModeCapability,
+	type ProviderCapabilityKey,
+	useRuntimeCapabilities,
+} from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 
@@ -17,6 +22,7 @@ export interface ProviderModels {
 	prefix: string;
 	name: string;
 	models: ModelOption[];
+	agentProviderType?: ProviderCapabilityKey;
 }
 
 /**
@@ -30,11 +36,14 @@ export function useAllModels() {
 		queryFn: api.getSettings,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
+	const runtimeCapabilities = useRuntimeCapabilities();
 
 	return useMemo(() => {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
 		const providerOrder: string[] = settingsData?.agent?.providerOrder ?? [];
 		const disabledProviders = new Set<string>(settingsData?.agent?.disabledProviders ?? []);
+		const providerAgentModeSupported = (provider: ProviderCapabilityKey) =>
+			getProviderAgentModeCapability(runtimeCapabilities, provider).supported;
 
 		// --- Kiro models ---
 		// Only show kiro models when kiro is available (has enabled credentials).
@@ -85,7 +94,7 @@ export function useAllModels() {
 				models.push(opt);
 				fetchedOpenaiModels.push(opt);
 			}
-			openaiByProvider.push({ prefix, name, models });
+			openaiByProvider.push({ prefix, name, models, agentProviderType: "openai" });
 		}
 
 		// Fallback: legacy flat openaiModels (no grouped data)
@@ -104,7 +113,7 @@ export function useAllModels() {
 				models.push(opt);
 				fetchedOpenaiModels.push(opt);
 			}
-			openaiByProvider.push({ prefix, name, models });
+			openaiByProvider.push({ prefix, name, models, agentProviderType: "openai" });
 		}
 
 		// --- Anthropic models (per-provider) ---
@@ -135,7 +144,7 @@ export function useAllModels() {
 				models.push(opt);
 				fetchedAnthropicModels.push(opt);
 			}
-			anthropicByProvider.push({ prefix, name, models });
+			anthropicByProvider.push({ prefix, name, models, agentProviderType: "anthropic" });
 		}
 
 		// --- NKP models (per-provider, Kiro-compatible format) ---
@@ -172,7 +181,7 @@ export function useAllModels() {
 				models.push(opt);
 				fetchedNkpModels.push(opt);
 			}
-			nkpByProvider.push({ prefix, name, models });
+			nkpByProvider.push({ prefix, name, models, agentProviderType: "nkp" });
 		}
 
 		// --- Cline models (per-provider, OpenRouter-based) ---
@@ -203,7 +212,7 @@ export function useAllModels() {
 				models.push(opt);
 				fetchedClineModels.push(opt);
 			}
-			clineByProvider.push({ prefix, name, models });
+			clineByProvider.push({ prefix, name, models, agentProviderType: "cline" });
 		}
 
 		// --- NUG models (per-provider, channel metadata aware) ---
@@ -239,7 +248,7 @@ export function useAllModels() {
 					bareModel,
 				});
 			}
-			nugByProvider.push({ prefix, name, models });
+			nugByProvider.push({ prefix, name, models, agentProviderType: "nug" });
 		}
 
 		// --- Custom models ---
@@ -264,20 +273,41 @@ export function useAllModels() {
 
 		// --- Merge & filter ---
 		// Build per-provider model arrays, then sort by providerOrder
-		const providerModelArrays: { prefix: string; models: ModelOption[] }[] = [];
-		const addGroup = (prefix: string, models: ModelOption[]) => {
+		const providerModelArrays: ProviderModels[] = [];
+		const addGroup = (
+			prefix: string,
+			models: ModelOption[],
+			agentProviderType?: ProviderCapabilityKey,
+		) => {
 			if (models.length === 0) return;
-			providerModelArrays.push({ prefix, models });
+			providerModelArrays.push({
+				prefix,
+				name: providerLabels[prefix] ?? prefix,
+				models,
+				agentProviderType,
+			});
 		};
 
-		for (const group of nkpByProvider) addGroup(group.prefix, group.models);
-		if (kiroModels.length > 0) addGroup("kiro", kiroModels);
-		for (const group of openaiByProvider) addGroup(group.prefix, group.models);
-		for (const group of anthropicByProvider) addGroup(group.prefix, group.models);
-		for (const group of clineByProvider) addGroup(group.prefix, group.models);
-		for (const group of nugByProvider) addGroup(group.prefix, group.models);
-		if (codexModels.length > 0) addGroup("codex", codexModels);
+		for (const group of nkpByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		if (kiroModels.length > 0) addGroup("kiro", kiroModels, "kiro");
+		for (const group of openaiByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		for (const group of anthropicByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		for (const group of clineByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		for (const group of nugByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
 		if (customModels.length > 0) addGroup("__custom__", customModels);
+
+		const agentModeUnsupportedProviders = new Set<ProviderCapabilityKey>();
+		for (const group of providerModelArrays) {
+			if (group.agentProviderType && !providerAgentModeSupported(group.agentProviderType)) {
+				agentModeUnsupportedProviders.add(group.agentProviderType);
+			}
+		}
 
 		// Sort by providerOrder (providers not in the list go to the end)
 		if (providerOrder.length > 0) {
@@ -289,9 +319,13 @@ export function useAllModels() {
 			});
 		}
 
-		// Filter out disabled providers and merge
+		// Filter out user-disabled providers and providers that are not available for agent mode.
 		const enabledModelArrays = providerModelArrays
-			.filter((g) => !disabledProviders.has(g.prefix))
+			.filter(
+				(g) =>
+					!disabledProviders.has(g.prefix) &&
+					(!g.agentProviderType || providerAgentModeSupported(g.agentProviderType)),
+			)
 			.map((g) => g.models);
 		const allModels = mergeModels(...enabledModelArrays);
 		const visibleModels = allModels.filter((m) => !hidden.has(m.value));
@@ -361,8 +395,10 @@ export function useAllModels() {
 			settingsData,
 			/** Per-provider model groups BEFORE disabled filtering (for overview). */
 			allProviderModels: providerModelArrays,
+			/** Provider capability keys that are configured but unavailable for agent mode. */
+			agentModeUnsupportedProviders,
 			/** Set of disabled provider prefixes (for overview). */
 			disabledProviders,
 		};
-	}, [settingsData]);
+	}, [settingsData, runtimeCapabilities]);
 }

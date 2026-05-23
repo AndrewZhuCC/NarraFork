@@ -2007,6 +2007,9 @@ func nullableStringPtrValue(value string) *string {
 }
 
 func (s *Service) executeBuiltInAgentTool(ctx context.Context, cwd, narratorID string, call agentbasic.ToolCall) string {
+	if s.Settings != nil {
+		ctx = agentbasic.ContextWithToolRuntimeSettings(ctx, agentbasic.ToolRuntimeSettingsFromRawSettings(s.Settings.Raw()))
+	}
 	if strings.TrimSpace(call.Function.Name) == "Browser" {
 		ctx = agentbasic.ContextWithBrowserExecution(ctx, agentbasic.BrowserExecutionContext{NarratorID: narratorID, ToolUseID: call.ID})
 	}
@@ -2056,7 +2059,7 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	pipeline := &agentPipelineState{}
 	executor := func(execCtx context.Context, execCwd string, call agentbasic.ToolCall) (agentbasic.ToolRun, error) {
 		run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
-		if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, &draftMessageID, pipeline, call); handled || err != nil {
+		if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, &draftMessageID, pipeline, call, history); handled || err != nil {
 			pipeline.capture(&specialRun)
 			return specialRun, err
 		}
@@ -2249,15 +2252,28 @@ func (s *Service) persistAgentError(ctx context.Context, narratorID string, err 
 	s.broadcastMessage(ctx, narratorID, msg)
 	if s.Hub != nil {
 		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "status", "narratorId": narratorID, "status": "idle", "substatus": []string{"error"}, "isBackground": isBackground, "backgroundStatus": nullableTrimmedString("failed")})
+		s.broadcastNarratorError(narratorID, message, "AGENT_ERROR")
 	}
 	return nil
+}
+
+func (s *Service) broadcastNarratorError(narratorID, message, errorCode string) {
+	if s.Hub == nil {
+		return
+	}
+	payload := map[string]any{"type": "narrator_error", "narratorId": narratorID, "error": message}
+	if strings.TrimSpace(errorCode) != "" {
+		payload["errorCode"] = errorCode
+	}
+	s.Hub.BroadcastNarrator(narratorID, payload)
 }
 
 func (s *Service) broadcastAgentErrorPersistenceFailure(narratorID, stage string, err error) {
 	if s.Hub == nil {
 		return
 	}
-	s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "error", "narratorId": narratorID, "code": "AGENT_ERROR_PERSIST_FAILED", "stage": stage, "message": err.Error(), "fallback": true, "fatal": false})
+	reason := err.Error()
+	s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "error", "narratorId": narratorID, "code": "AGENT_ERROR_PERSIST_FAILED", "stage": stage, "reason": reason, "error": reason, "message": reason, "fallback": true, "fatal": false})
 }
 
 func (s *Service) agentSystemPrompt(ctx context.Context, narrator Narrator) string {
@@ -2666,7 +2682,7 @@ func (s *Service) reviewMetaForChapter(ctx context.Context, chapterID string) (r
 	return meta, true
 }
 
-func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, narrator Narrator, draftMessageID *string, pipeline *agentPipelineState, call agentbasic.ToolCall) (agentbasic.ToolRun, bool, error) {
+func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, narrator Narrator, draftMessageID *string, pipeline *agentPipelineState, call agentbasic.ToolCall, history []agentbasic.Message) (agentbasic.ToolRun, bool, error) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
 	var args map[string]any
 	if strings.TrimSpace(call.Function.Arguments) != "" {
@@ -2683,7 +2699,13 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = pipeline.start(stringFromAny(args["label"]), anyInt(args["maxPreviewChars"], 100))
 		return run, true, nil
 	case "EndPipeline":
-		run.Output = pipeline.end(stringFromAny(args["rule"]), anyStringSlice(args["aliases"]), stringFromAny(args["format"]), anyInt(args["maxChars"], 12000))
+		format := strings.TrimSpace(stringFromAny(args["format"]))
+		if format != "" && !strings.EqualFold(format, "sections") && !strings.EqualFold(format, "plain") {
+			run.Status = "error"
+			run.Output = "unsupported pipeline format: " + format
+			return run, true, nil
+		}
+		run.Output = pipeline.end(stringFromAny(args["rule"]), anyStringSlice(args["aliases"]), format, anyInt(args["maxChars"], 12000))
 		return run, true, nil
 	case "AskUserQuestion":
 		askRun, err := s.executeAskUserQuestion(ctx, narratorID, narrator, draftMessageID, call)
@@ -2769,6 +2791,10 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 			run.Output = "objective is required"
 			return run, true, nil
 		}
+		if len([]rune(objective)) > 4000 {
+			run.Output = "objective must be at most 4000 characters"
+			return run, true, nil
+		}
 		payload, err := s.addGoal(ctx, narratorID, objective, "agent")
 		if err != nil {
 			return run, true, err
@@ -2776,9 +2802,30 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = jsonToolOutput(payload)
 		return run, true, nil
 	case "UpdateGoal":
-		goalID := firstNonEmptyString(stringFromAny(args["goal_id"]), stringFromAny(args["goalId"]), stringFromAny(args["id"]))
-		if goalID == "" {
-			run.Output = "goal_id is required"
+		status := normalizeGoalStatus(stringFromAny(args["status"]))
+		if status != "complete" {
+			run.Status = "denied"
+			run.Output = "UpdateGoal only supports status=complete for the current active goal."
+			run.Error = run.Output
+			return run, true, nil
+		}
+		goals, err := s.loadGoals(ctx, narratorID)
+		if err != nil {
+			return run, true, err
+		}
+		activeGoal := activeGoalFromList(goals)
+		if activeGoal == nil {
+			run.Status = "denied"
+			run.Output = "No active goal exists to complete."
+			run.Error = run.Output
+			return run, true, nil
+		}
+		goalID := stringFromAny(activeGoal["id"])
+		legacyGoalID := firstNonEmptyString(stringFromAny(args["goal_id"]), stringFromAny(args["goalId"]), stringFromAny(args["id"]))
+		if legacyGoalID != "" && legacyGoalID != goalID {
+			run.Status = "denied"
+			run.Output = "UpdateGoal can only complete the current active goal."
+			run.Error = run.Output
 			return run, true, nil
 		}
 		broadcastTargetID := narratorID
@@ -2791,7 +2838,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 			InputJSON:         args,
 			BroadcastTargetID: broadcastTargetID,
 		}
-		payload, err := s.updateGoalWithReflectionContext(ctx, narratorID, goalID, stringFromAny(args["status"]), stringFromAny(args["objective"]), stringFromAny(args["evidence"]), stringFromAny(args["reflection"]), reflectionMeta)
+		payload, err := s.completeActiveGoalWithReflectionContext(ctx, narratorID, goalID, stringFromAny(args["evidence"]), stringFromAny(args["reflection"]), history, reflectionMeta)
 		if err != nil {
 			return run, true, err
 		}
@@ -2984,6 +3031,11 @@ func normalizeReviewFindings(raw any) ([]map[string]any, error) {
 		if !ok {
 			return nil, fmt.Errorf("each finding must be an object")
 		}
+		for key := range m {
+			if key != "severity" && key != "file" && key != "line" && key != "message" {
+				return nil, fmt.Errorf("finding contains unsupported property %q", key)
+			}
+		}
 		severity := strings.TrimSpace(stringFromAny(m["severity"]))
 		if severity != "critical" && severity != "major" && severity != "minor" && severity != "suggestion" {
 			return nil, fmt.Errorf("finding severity must be critical, major, minor, or suggestion")
@@ -3018,10 +3070,22 @@ func numericFindingLine(raw any) (int, bool) {
 	}
 }
 
+func addToolDiagnosticFields(payload map[string]any, code, reason string) map[string]any {
+	payload["code"] = code
+	payload["reason"] = reason
+	payload["error"] = reason
+	payload["message"] = reason
+	return payload
+}
+
+func toolValidationErrorPayload(code, reason string) map[string]any {
+	return addToolDiagnosticFields(map[string]any{"ok": false}, code, reason)
+}
+
 func (s *Service) sendTool(ctx context.Context, callerID string, args map[string]any) (map[string]any, error) {
 	message := strings.TrimSpace(stringFromAny(args["message"]))
 	if message == "" {
-		return map[string]any{"error": "message is required"}, nil
+		return toolValidationErrorPayload("SEND_MESSAGE_REQUIRED", "message is required"), nil
 	}
 	tokens := []string{}
 	tokens = appendIfNonEmpty(tokens, stringFromAny(args["id"]))
@@ -3029,7 +3093,10 @@ func (s *Service) sendTool(ctx context.Context, callerID string, args map[string
 	tokens = appendIfNonEmpty(tokens, stringFromAny(args["name"]))
 	tokens = append(tokens, anyStringSlice(args["names"])...)
 	if len(tokens) == 0 {
-		return map[string]any{"error": "at least one target id, alias, or name is required"}, nil
+		return toolValidationErrorPayload(
+			"SEND_TARGET_REQUIRED",
+			"at least one target id, alias, or name is required",
+		), nil
 	}
 	children, err := s.accessibleSubagents(ctx, callerID)
 	if err != nil {
@@ -3055,7 +3122,10 @@ func (s *Service) sendTool(ctx context.Context, callerID string, args map[string
 			return nil, err
 		}
 		if caller.ParentNarratorID != nil && strings.TrimSpace(*caller.ParentNarratorID) != "" {
-			return map[string]any{"ok": false, "error": "doInterrupt is only supported from a primary narrator to its child subagents"}, nil
+			return toolValidationErrorPayload(
+				"SEND_INTERRUPT_UNSUPPORTED_FROM_SUBAGENT",
+				"doInterrupt is only supported from a primary narrator to its child subagents",
+			), nil
 		}
 	}
 	parentToolUseID := strings.TrimSpace(stringFromAny(args["_tool_use_id"]))
@@ -3069,7 +3139,11 @@ func (s *Service) sendTool(ctx context.Context, callerID string, args map[string
 		if anyBool(args["doInterrupt"]) {
 			if fresh.ParentNarratorID == nil || strings.TrimSpace(*fresh.ParentNarratorID) != callerID {
 				payload["sent"] = false
-				payload["error"] = "doInterrupt is only supported for this narrator's direct child subagents"
+				addToolDiagnosticFields(
+					payload,
+					"SEND_INTERRUPT_TARGET_NOT_DIRECT_CHILD",
+					"doInterrupt is only supported for this narrator's direct child subagents",
+				)
 				results = append(results, payload)
 				continue
 			}
@@ -3350,7 +3424,10 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 
 	prompt := strings.TrimSpace(stringFromAny(args["prompt"]))
 	if prompt == "" {
-		return map[string]any{"error": "prompt is required when launching a subagent"}, nil
+		return toolValidationErrorPayload(
+			"AGENT_PROMPT_REQUIRED",
+			"prompt is required when launching a subagent",
+		), nil
 	}
 	parent, err := s.Get(ctx, parentID)
 	if err != nil {
@@ -3361,7 +3438,7 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 	reasoningEffort := firstNonEmptyString(stringFromAny(args["reasoning_effort"]), ptrString(parent.ReasoningEffort))
 	cwd, cwdErr := resolveSubagentCwd(ptrString(parent.Cwd), stringFromAny(args["workdir"]))
 	if cwdErr != nil {
-		return map[string]any{"error": cwdErr.Error()}, nil
+		return toolValidationErrorPayload("AGENT_WORKDIR_INVALID", cwdErr.Error()), nil
 	}
 	alias := strings.TrimSpace(stringFromAny(args["alias"]))
 	description := strings.TrimSpace(stringFromAny(args["description"]))
@@ -3369,7 +3446,7 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 	if title == "" {
 		title = subagentType + " subagent"
 	}
-	runInBackground := anyBool(args["run_in_background"])
+	runInBackground := anyBool(args["run_in_background"]) || anyBool(args["background"])
 	child, err := s.createSubagentNarrator(ctx, parent, subagentType, title, model, reasoningEffort, cwd, alias, runInBackground)
 	if err != nil {
 		return nil, err
@@ -3386,6 +3463,18 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 			_ = s.finishBackgroundTaskRecord(ctx, parent.ID, child.ID, "failed", "failed to start background subagent: "+err.Error())
 		}
 		return nil, err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(parent.ID, map[string]any{
+			"type":               "subagent_started",
+			"narratorId":         parent.ID,
+			"subagentNarratorId": child.ID,
+			"toolUseId":          toolUseID,
+			"subagentType":       subagentType,
+			"model":              model,
+			"background":         runInBackground,
+			"alias":              alias,
+		})
 	}
 	started := map[string]any{
 		"subagentId":       child.ID,
@@ -3505,7 +3594,8 @@ func (s *Service) finishBackgroundTaskRecord(ctx context.Context, parentID, task
 		theToolUseID, err := s.backgroundTaskToolUseID(ctx, parentID, taskID)
 		if err != nil {
 			if s.Hub != nil {
-				s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "background_task_status_changed", "narratorId": parentID, "taskId": taskID, "status": status, "output": nullableStringPtrValue(storedOutput), "degraded": true, "fallback": true, "fallbacks": []any{"background_task_tool_use_id_query_failed"}, "error": err.Error()})
+				reason := err.Error()
+				s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "background_task_status_changed", "narratorId": parentID, "taskId": taskID, "status": status, "output": nullableStringPtrValue(storedOutput), "degraded": true, "fallback": true, "fallbacks": []any{"background_task_tool_use_id_query_failed"}, "reason": reason, "error": reason, "message": reason})
 			}
 			return fmt.Errorf("query background task tool use id: %w", err)
 		}
@@ -3624,11 +3714,22 @@ func (s *Service) awaitTool(ctx context.Context, parentID string, args map[strin
 		kind = "agent"
 	}
 	if kind != "agent" {
-		return map[string]any{"status": "unsupported", "message": "Go backend Await currently supports type=agent only."}, nil
+		reason := "Go backend Await currently supports type=agent only."
+		return map[string]any{
+			"status":    "unsupported",
+			"supported": false,
+			"fallback":  true,
+			"code":      "AWAIT_TASK_TYPE_UNSUPPORTED",
+			"reason":    reason,
+			"error":     reason,
+			"message":   reason,
+		}, nil
 	}
 	target := strings.TrimSpace(stringFromAny(args["id"]))
 	if target == "" {
-		return map[string]any{"status": "error", "message": "id is required"}, nil
+		payload := toolValidationErrorPayload("AWAIT_ID_REQUIRED", "id is required")
+		payload["status"] = "error"
+		return payload, nil
 	}
 	parentBlocking := anyBool(args["_parent_blocking"])
 	timeoutMs := anyInt(args["timeout"], 0)
@@ -3705,7 +3806,16 @@ func (s *Service) teamStatusTool(ctx context.Context, narratorID string, args ma
 		return s.teamMessage(ctx, members, narratorID, stringFromAny(args["target_id"]), stringFromAny(args["message"]), false)
 	}
 	if action != "list" {
-		return map[string]any{"action": action, "supported": false, "message": "Go backend TeamStatus currently supports action=list, file_changes, broadcast, and send."}, nil
+		reason := "Go backend TeamStatus currently supports action=list, file_changes, broadcast, and send."
+		return map[string]any{
+			"action":    action,
+			"supported": false,
+			"fallback":  true,
+			"code":      "TEAM_STATUS_ACTION_UNSUPPORTED",
+			"reason":    reason,
+			"error":     reason,
+			"message":   reason,
+		}, nil
 	}
 	items := make([]map[string]any, 0, len(members))
 	for _, child := range members {
@@ -3717,7 +3827,10 @@ func (s *Service) teamStatusTool(ctx context.Context, narratorID string, args ma
 func (s *Service) teamMessage(ctx context.Context, members []Narrator, callerID, targetID, message string, broadcast bool) (map[string]any, error) {
 	message = strings.TrimSpace(message)
 	if message == "" {
-		return map[string]any{"action": map[bool]string{true: "broadcast", false: "send"}[broadcast], "sent": 0, "error": "message is required"}, nil
+		payload := toolValidationErrorPayload("TEAM_MESSAGE_REQUIRED", "message is required")
+		payload["action"] = map[bool]string{true: "broadcast", false: "send"}[broadcast]
+		payload["sent"] = 0
+		return payload, nil
 	}
 	targets := []Narrator{}
 	if broadcast {
@@ -3728,12 +3841,18 @@ func (s *Service) teamMessage(ctx context.Context, members []Narrator, callerID,
 		}
 	} else {
 		if strings.TrimSpace(targetID) == "" {
-			return map[string]any{"action": "send", "sent": 0, "error": "target_id is required"}, nil
+			payload := toolValidationErrorPayload("TEAM_TARGET_ID_REQUIRED", "target_id is required")
+			payload["action"] = "send"
+			payload["sent"] = 0
+			return payload, nil
 		}
 		if target, ok := matchSubagent(members, targetID); ok {
 			targets = append(targets, target)
 		} else {
-			return map[string]any{"action": "send", "sent": 0, "error": "target subagent not found"}, nil
+			payload := toolValidationErrorPayload("TEAM_TARGET_NOT_FOUND", "target subagent not found")
+			payload["action"] = "send"
+			payload["sent"] = 0
+			return payload, nil
 		}
 	}
 	items := []map[string]any{}
@@ -3757,7 +3876,12 @@ func (s *Service) teamFileChanges(ctx context.Context, members []Narrator, targe
 		if target, ok := matchSubagent(members, targetID); ok {
 			selected = []Narrator{target}
 		} else {
-			return map[string]any{"action": "file_changes", "supported": true, "changes": []any{}, "message": "target subagent not found"}, nil
+			payload := addToolDiagnosticFields(
+				map[string]any{"action": "file_changes", "supported": true, "changes": []any{}},
+				"TEAM_FILE_CHANGES_TARGET_NOT_FOUND",
+				"target subagent not found",
+			)
+			return payload, nil
 		}
 	}
 	ids := make([]string, 0, len(selected))
@@ -3795,23 +3919,31 @@ func (s *Service) teamFileChanges(ctx context.Context, members []Narrator, targe
 	return map[string]any{"action": "file_changes", "supported": true, "changes": changes}, nil
 }
 
+func subagentFallbackPayload(payload map[string]any, reason string) map[string]any {
+	payload["fallback"] = true
+	payload["reason"] = reason
+	payload["error"] = reason
+	payload["message"] = reason
+	return payload
+}
+
 func (s *Service) DetachSubagent(ctx context.Context, subagentID string) (map[string]any, error) {
 	child, err := s.Get(ctx, subagentID)
 	if err != nil {
 		return nil, err
 	}
 	if child.Type != "subagent" && child.Variant != "subagent" {
-		return map[string]any{"detached": false, "fallback": true, "error": "Not a subagent"}, nil
+		return subagentFallbackPayload(map[string]any{"detached": false}, "Not a subagent"), nil
 	}
 	if child.ParentNarratorID == nil || strings.TrimSpace(*child.ParentNarratorID) == "" {
-		return map[string]any{"detached": false, "fallback": true, "error": "Subagent has no parent narrator"}, nil
+		return subagentFallbackPayload(map[string]any{"detached": false}, "Subagent has no parent narrator"), nil
 	}
 	if !s.runActive(subagentID) && child.Status != "working" {
-		return map[string]any{"detached": false, "fallback": true, "error": "Subagent is not running in foreground mode"}, nil
+		return subagentFallbackPayload(map[string]any{"detached": false}, "Subagent is not running in foreground mode"), nil
 	}
 	toolUseID, err := s.subagentParentToolUseID(ctx, subagentID)
 	if err != nil {
-		return map[string]any{"detached": false, "fallback": true, "error": "Cannot find parent tool_use"}, nil
+		return subagentFallbackPayload(map[string]any{"detached": false}, "Cannot find parent tool_use"), nil
 	}
 	parentID := strings.TrimSpace(*child.ParentNarratorID)
 	alias, traitsJSON := ensureSubagentAliasTrait(child)
@@ -3850,10 +3982,10 @@ func (s *Service) AttachSubagent(ctx context.Context, subagentID string) (map[st
 		return nil, err
 	}
 	if child.Type != "subagent" && child.Variant != "subagent" {
-		return map[string]any{"attached": false, "fallback": true, "error": "Not a subagent"}, nil
+		return subagentFallbackPayload(map[string]any{"attached": false}, "Not a subagent"), nil
 	}
 	if !child.IsBackground {
-		return map[string]any{"attached": false, "fallback": true, "error": "Subagent is not in background mode"}, nil
+		return subagentFallbackPayload(map[string]any{"attached": false}, "Subagent is not in background mode"), nil
 	}
 	if ptrString(child.BackgroundStatus) == "running" && !s.runActive(subagentID) {
 		if err := s.reconcileStaleBackgroundAgent(ctx, child); err != nil {
@@ -3861,10 +3993,13 @@ func (s *Service) AttachSubagent(ctx context.Context, subagentID string) (map[st
 		}
 		updated, _ := s.Get(ctx, subagentID)
 		payload := subagentStatusPayload(updated)
+		reason := "Background subagent runtime was not active; marked failed for recovery."
 		payload["attached"] = false
 		payload["fallback"] = true
 		payload["staleRecovered"] = true
-		payload["message"] = "Background subagent runtime was not active; marked failed for recovery."
+		payload["reason"] = reason
+		payload["error"] = reason
+		payload["message"] = reason
 		return payload, nil
 	}
 	now := db.NowISO()
@@ -3913,14 +4048,14 @@ func (s *Service) UpdateSubagentConclusion(ctx context.Context, subagentID strin
 		return nil, err
 	}
 	if child.Type != "subagent" && child.Variant != "subagent" {
-		return map[string]any{"ok": false, "fallback": true, "error": "Not a subagent"}, nil
+		return subagentFallbackPayload(map[string]any{"ok": false}, "Not a subagent"), nil
 	}
 	if child.ParentNarratorID == nil || strings.TrimSpace(*child.ParentNarratorID) == "" {
-		return map[string]any{"ok": false, "fallback": true, "error": "No parent narrator"}, nil
+		return subagentFallbackPayload(map[string]any{"ok": false}, "No parent narrator"), nil
 	}
 	toolUseID, err := s.subagentParentToolUseID(ctx, subagentID)
 	if err != nil {
-		return map[string]any{"ok": false, "fallback": true, "error": "Cannot find parent tool_use"}, nil
+		return subagentFallbackPayload(map[string]any{"ok": false}, "Cannot find parent tool_use"), nil
 	}
 	finalText, err := s.lastAssistantText(ctx, subagentID)
 	if err != nil {
@@ -3949,7 +4084,21 @@ func (s *Service) UpdateSubagentConclusion(ctx context.Context, subagentID strin
 			return nil, fmt.Errorf("clear subagent manual override: %w", err)
 		}
 	}
-	return map[string]any{"ok": rows > 0, "toolUseId": toolUseID, "fallback": rows == 0 || manualOverride, "manualOverrideResolved": false, "manualOverrideCleared": manualOverride, "message": "Go backend updated the parent tool call conclusion when present; in-memory manual override waiters are not implemented, so any manual override is cleared as a fallback rather than resuming a blocked parent promise."}, nil
+	fallback := rows == 0 || manualOverride
+	message := "Go backend updated the parent tool call conclusion when present; in-memory manual override waiters are not implemented, so any manual override is cleared as a fallback rather than resuming a blocked parent promise."
+	payload := map[string]any{
+		"ok":                     rows > 0,
+		"toolUseId":              toolUseID,
+		"fallback":               fallback,
+		"manualOverrideResolved": false,
+		"manualOverrideCleared":  manualOverride,
+		"message":                message,
+	}
+	if fallback {
+		payload["reason"] = message
+		payload["error"] = message
+	}
+	return payload, nil
 }
 
 func (s *Service) subagentParentToolUseID(ctx context.Context, subagentID string) (string, error) {
@@ -4887,7 +5036,7 @@ func (s *Service) markGoalReflectionStatus(ctx context.Context, narratorID strin
 	s.Hub.BroadcastNarrator(meta.BroadcastTargetID, map[string]any{"type": "goal_reflection_resolved", "narratorId": meta.BroadcastTargetID, "requestId": meta.RequestID, "toolUseId": meta.ToolUseID, "decision": decision, "reason": strings.TrimSpace(reason), "nextSteps": strings.TrimSpace(nextSteps)})
 }
 
-func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, goalID, evidence, reflection string, meta *goalReflectionContext) (reflectionDecision, error) {
+func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, goalID, evidence, reflection string, history []agentbasic.Message, meta *goalReflectionContext) (reflectionDecision, error) {
 	goals, err := s.loadGoals(ctx, narratorID)
 	if err != nil {
 		return reflectionDecision{}, err
@@ -4900,19 +5049,80 @@ func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, g
 		meta.ActiveGoal = goal
 		s.markGoalReflectionStatus(ctx, narratorID, meta, "running", "", "")
 	}
-	prompt := fmt.Sprintf(`Review whether this goal is truly complete.
+	inputJSON := "{}"
+	if meta != nil && meta.InputJSON != nil {
+		if raw, err := json.MarshalIndent(meta.InputJSON, "", "  "); err == nil {
+			inputJSON = string(raw)
+		}
+	}
+	prompt := fmt.Sprintf(`Goal-completion reflection: the narrator is attempting to mark a user-set goal complete.
 
-Goal:
+Original UpdateGoal input:
 %s
 
-Evidence provided by the agent:
+Active goal:
 %s
 
-Agent reflection:
+Recent conversation and tool-result context:
 %s
 
-If every material requirement is satisfied and no required work remains, call GoalCompleteConfirm with confirm=true and concrete evidence. If anything is missing or uncertain, call GoalCompleteRevise with confirm=true, feedback explaining why completion is blocked, and nextSteps describing the concrete next action before trying UpdateGoal again.`, stringFromAny(goal["objective"]), evidence, reflection)
+Agent-provided completion evidence, if any:
+%s
+
+Agent reflection, if any:
+%s
+
+Your job is to prevent premature or lazy completion. Audit the active goal against the conversation, tool-result context, and any explicit evidence above.
+
+Confirm ONLY if every material requirement in the active goal is satisfied by concrete evidence, the result has been verified enough for the task's risk level, and no required work remains. Progress, intent, partial implementation, or a vague final statement is not enough.
+
+Reject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved. When rejecting, include both why completion is blocked and concrete next steps the main narrator should take before trying UpdateGoal again.
+
+You have exactly one response, and you MUST call exactly one tool:
+- GoalCompleteConfirm if the active goal is actually achieved. Include objective-specific evidence.
+- GoalCompleteRevise if more work or verification is needed. Provide feedback and nextSteps. nextSteps must be actionable: name the next verification, implementation, question, or blocker-handling action.
+If you do not call either tool in this one response, the goal completion will be rejected.
+Do not call UpdateGoal from this reflection loop.`, inputJSON, stringFromAny(goal["objective"]), formatGoalReflectionHistory(history, 16000), evidence, reflection)
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"GoalCompleteConfirm": true, "GoalCompleteRevise": true})
+}
+
+func formatGoalReflectionHistory(history []agentbasic.Message, maxChars int) string {
+	lines := []string{}
+	for _, msg := range history {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			role = "message"
+		}
+		text := strings.TrimSpace(msg.Content)
+		if text == "" && len(msg.ToolCalls) > 0 {
+			parts := []string{}
+			for _, call := range msg.ToolCalls {
+				name := strings.TrimSpace(call.Function.Name)
+				if name == "" {
+					name = "tool"
+				}
+				args := truncateString(strings.TrimSpace(call.Function.Arguments), 600)
+				if args != "" {
+					parts = append(parts, fmt.Sprintf("%s(%s)", name, args))
+				} else {
+					parts = append(parts, name)
+				}
+			}
+			text = strings.Join(parts, "; ")
+		}
+		if text == "" {
+			continue
+		}
+		lines = append(lines, strings.ToUpper(role)+": "+text)
+	}
+	if len(lines) == 0 {
+		return "(no prior conversation context available)"
+	}
+	text := strings.Join(lines, "\n\n")
+	if maxChars > 0 && len(text) > maxChars {
+		text = "(truncated to recent context)\n" + text[len(text)-maxChars:]
+	}
+	return text
 }
 
 func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, plan string, allowedPrompts any) (reflectionDecision, error) {
@@ -5070,6 +5280,38 @@ func reflectionDecisionFromToolCall(name, rawArgs string) (reflectionDecision, s
 	}
 }
 
+func normalizeExitPlanAllowedPrompts(raw any) (any, string) {
+	if raw == nil {
+		return nil, ""
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, "allowedPrompts must be an array of {tool, prompt} objects."
+	}
+	normalized := []map[string]any{}
+	for idx, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Sprintf("allowedPrompts[%d] must be an object.", idx)
+		}
+		for key := range entry {
+			if key != "tool" && key != "prompt" {
+				return nil, fmt.Sprintf("allowedPrompts[%d] contains unsupported property %q.", idx, key)
+			}
+		}
+		tool := strings.TrimSpace(stringFromAny(entry["tool"]))
+		prompt := strings.TrimSpace(stringFromAny(entry["prompt"]))
+		if tool != "Bash" {
+			return nil, fmt.Sprintf("allowedPrompts[%d].tool must be Bash.", idx)
+		}
+		if prompt == "" {
+			return nil, fmt.Sprintf("allowedPrompts[%d].prompt is required.", idx)
+		}
+		normalized = append(normalized, map[string]any{"tool": tool, "prompt": prompt})
+	}
+	return normalized, ""
+}
+
 func (s *Service) exitPlanModeTool(ctx context.Context, narratorID string, args map[string]any) (map[string]any, error) {
 	narrator, err := s.Get(ctx, narratorID)
 	if err != nil {
@@ -5089,7 +5331,11 @@ func (s *Service) exitPlanModeTool(ctx context.Context, narratorID string, args 
 		}
 		return map[string]any{"ok": false, "planMode": true, "error": "ExitPlanMode requires a complete plan of at least 40 characters before leaving plan mode. Provide a non-empty plan parameter or write it to " + planFile + "."}, nil
 	}
-	decision, err := s.runExitPlanReflection(ctx, narratorID, plan, args["allowedPrompts"])
+	allowedPrompts, allowedPromptsError := normalizeExitPlanAllowedPrompts(args["allowedPrompts"])
+	if allowedPromptsError != "" {
+		return map[string]any{"ok": false, "planMode": true, "error": allowedPromptsError}, nil
+	}
+	decision, err := s.runExitPlanReflection(ctx, narratorID, plan, allowedPrompts)
 	if err != nil {
 		return map[string]any{"ok": false, "planMode": true, "error": err.Error()}, nil
 	}
@@ -5102,7 +5348,7 @@ func (s *Service) exitPlanModeTool(ctx context.Context, narratorID string, args 
 	}
 	payload["plan"] = plan
 	payload["planSource"] = planSource
-	payload["allowedPrompts"] = args["allowedPrompts"]
+	payload["allowedPrompts"] = allowedPrompts
 	payload["reflectionDecision"] = decision.Action
 	if decision.Reflection != "" {
 		payload["reflection"] = decision.Reflection
@@ -5298,6 +5544,38 @@ func (s *Service) updateGoal(ctx context.Context, narratorID, goalID, status, ob
 	return s.updateGoalWithReflectionContext(ctx, narratorID, goalID, status, objective, evidence, reflection, nil)
 }
 
+func (s *Service) completeActiveGoalWithReflectionContext(ctx context.Context, narratorID, goalID, evidence, reflection string, history []agentbasic.Message, reflectionMeta *goalReflectionContext) (map[string]any, error) {
+	completionEvidence := strings.TrimSpace(evidence)
+	completionReflection := strings.TrimSpace(reflection)
+	decision, err := s.runGoalCompletionReflection(ctx, narratorID, goalID, completionEvidence, completionReflection, history, reflectionMeta)
+	if err != nil {
+		s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "aborted", err.Error(), "")
+		return map[string]any{"error": err.Error()}, nil
+	}
+	if decision.Action != "confirm" {
+		s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "cancelled", decision.Feedback, decision.NextSteps)
+		return map[string]any{"error": "Goal completion reflection requested more work.", "feedback": decision.Feedback, "nextSteps": decision.NextSteps, "reflectionDecision": decision.Action}, nil
+	}
+	s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "confirmed", firstNonEmptyString(decision.Reflection, decision.Evidence), "")
+	if strings.TrimSpace(decision.Evidence) != "" {
+		completionEvidence = strings.TrimSpace(decision.Evidence)
+	}
+	if strings.TrimSpace(decision.Reflection) != "" {
+		completionReflection = strings.TrimSpace(decision.Reflection)
+	}
+	payload, err := s.completeActiveGoalBasic(ctx, narratorID)
+	if err != nil {
+		return nil, err
+	}
+	if completionEvidence != "" {
+		payload["completionEvidence"] = completionEvidence
+		if completionReflection != "" {
+			payload["reflection"] = completionReflection
+		}
+	}
+	return payload, nil
+}
+
 func (s *Service) updateGoalWithReflectionContext(ctx context.Context, narratorID, goalID, status, objective, evidence, reflection string, reflectionMeta *goalReflectionContext) (map[string]any, error) {
 	sets := []string{}
 	args := []any{}
@@ -5317,7 +5595,7 @@ func (s *Service) updateGoalWithReflectionContext(ctx context.Context, narratorI
 			if !goalCompletionEvidenceValid(completionEvidence) {
 				return map[string]any{"error": "Completing a goal requires concrete evidence of at least 20 characters."}, nil
 			}
-			decision, err := s.runGoalCompletionReflection(ctx, narratorID, goalID, completionEvidence, completionReflection, reflectionMeta)
+			decision, err := s.runGoalCompletionReflection(ctx, narratorID, goalID, completionEvidence, completionReflection, nil, reflectionMeta)
 			if err != nil {
 				s.markGoalReflectionStatus(ctx, narratorID, reflectionMeta, "aborted", err.Error(), "")
 				return map[string]any{"error": err.Error()}, nil
@@ -5390,18 +5668,21 @@ func (s *Service) resumeGoal(ctx context.Context, narratorID string) (map[string
 	return map[string]any{"goal": nil, "goals": goals}, nil
 }
 
+func activeGoalFromList(goals []map[string]any) map[string]any {
+	for _, goal := range goals {
+		if goal["status"] == "active" {
+			return goal
+		}
+	}
+	return nil
+}
+
 func (s *Service) completeActiveGoalBasic(ctx context.Context, narratorID string) (map[string]any, error) {
 	goals, err := s.loadGoals(ctx, narratorID)
 	if err != nil {
 		return nil, err
 	}
-	var active map[string]any
-	for _, goal := range goals {
-		if goal["status"] == "active" {
-			active = goal
-			break
-		}
-	}
+	active := activeGoalFromList(goals)
 	if active == nil {
 		return map[string]any{"completed": nil, "active": nil, "goals": goals}, nil
 	}
@@ -5759,7 +6040,8 @@ func (s *Service) finishRecordedToolCall(ctx context.Context, narratorID, toolUs
 	}
 	toolCallID, queryErr := s.recordedToolCallID(ctx, narratorID, toolUseID)
 	if queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
-		payload := map[string]any{"type": "permission_resolved", "narratorId": narratorID, "requestId": nil, "toolUseId": toolUseID, "decision": map[bool]string{true: "deny", false: "allow"}[status != "success"], "degraded": true, "fallback": true, "fallbacks": []any{"permission_resolved_request_id_query_failed"}, "error": queryErr.Error()}
+		reason := queryErr.Error()
+		payload := map[string]any{"type": "permission_resolved", "narratorId": narratorID, "requestId": nil, "toolUseId": toolUseID, "decision": map[bool]string{true: "deny", false: "allow"}[status != "success"], "degraded": true, "fallback": true, "fallbacks": []any{"permission_resolved_request_id_query_failed"}, "reason": reason, "error": reason, "message": reason}
 		if s.Hub != nil {
 			s.Hub.BroadcastNarrator(narratorID, payload)
 		}
@@ -5998,6 +6280,12 @@ type permissionCommandRule struct {
 	DenyPrompt string
 }
 
+type webFetchPermissionPolicy struct {
+	AllowAll  bool
+	Whitelist []string
+	Blacklist []string
+}
+
 func toolRequiresApproval(permissionMode *string, toolName string) bool {
 	mode := normalizePermissionMode(ptrString(permissionMode), "default")
 	name := strings.ToLower(strings.TrimSpace(toolName))
@@ -6048,6 +6336,9 @@ func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, 
 		default:
 			return toolPermissionDecision{Action: "ask"}, nil
 		}
+	}
+	if name == "webfetch" {
+		return s.resolveWebFetchPermission(narrator, args), nil
 	}
 	operation := toolOperation(name)
 	paths := toolPermissionPaths(cwd, name, args)
@@ -6141,6 +6432,67 @@ func (s *Service) globalToolPermissionRules() ([]permissionPathRule, []permissio
 	raw := s.Settings.Raw()
 	agent, _ := raw["agent"].(map[string]any)
 	return permissionRulesFromConfigMap(agent)
+}
+
+func (s *Service) resolveWebFetchPermission(narrator Narrator, args map[string]any) toolPermissionDecision {
+	policy := s.globalWebFetchPermissionPolicy()
+	url := strings.ToLower(strings.TrimSpace(stringFromAny(args["url"])))
+	if pattern := matchingWebFetchURLPattern(url, policy.Blacklist); pattern != "" {
+		return toolPermissionDecision{Action: "deny", Reason: fmt.Sprintf("WebFetch URL blocked by blacklist pattern: %q", pattern)}
+	}
+	if policy.AllowAll {
+		return toolPermissionDecision{Action: "allow"}
+	}
+	if pattern := matchingWebFetchURLPattern(url, policy.Whitelist); pattern != "" {
+		return toolPermissionDecision{Action: "allow", Reason: fmt.Sprintf("WebFetch URL matched whitelist pattern: %q", pattern)}
+	}
+	mode := normalizePermissionMode(ptrString(narrator.PermissionMode), "default")
+	if mode == "dontAsk" {
+		return toolPermissionDecision{Action: "deny", Reason: "Permission mode dontAsk denied this WebFetch tool call."}
+	}
+	return toolPermissionDecision{Action: "ask"}
+}
+
+func (s *Service) globalWebFetchPermissionPolicy() webFetchPermissionPolicy {
+	if s == nil || s.Settings == nil {
+		return webFetchPermissionPolicy{}
+	}
+	raw := s.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	policy, _ := agent["webFetchPolicy"].(map[string]any)
+	return webFetchPermissionPolicy{
+		AllowAll:  anyBool(policy["allowAll"]),
+		Whitelist: webFetchURLPatternsFromConfig(policy["whitelist"]),
+		Blacklist: webFetchURLPatternsFromConfig(policy["blacklist"]),
+	}
+}
+
+func webFetchURLPatternsFromConfig(value any) []string {
+	patterns := []string{}
+	for _, item := range anySliceValue(value) {
+		entry, _ := item.(map[string]any)
+		if len(entry) == 0 || !permissionRuleEnabled(entry["enabled"]) {
+			continue
+		}
+		pattern := strings.TrimSpace(stringFromAny(entry["pattern"]))
+		if pattern != "" {
+			patterns = append(patterns, pattern)
+		}
+	}
+	return patterns
+}
+
+func matchingWebFetchURLPattern(rawURL string, patterns []string) string {
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		if strings.Contains(rawURL, strings.ToLower(pattern)) {
+			return pattern
+		}
+	}
+	return ""
 }
 
 func (s *Service) projectToolPermissionRules(ctx context.Context, narrator Narrator, ownerID string) ([]permissionPathRule, []permissionPathRule, []permissionCommandRule, []permissionCommandRule, error) {

@@ -118,6 +118,46 @@ func TestUpdateApplyRejectsEscapedArtifactPath(t *testing.T) {
 	}
 }
 
+func TestUpdateApplyRejectsMissingSHA512(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	currentExe := filepath.Join(home, "narrafork-go")
+	if err := os.WriteFile(currentExe, []byte("old"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	versionDir := filepath.Join(home, ".narrafork", "updates", "missing-sha")
+	if err := os.MkdirAll(versionDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	artifact := filepath.Join(versionDir, "artifact")
+	if err := os.WriteFile(artifact, []byte("unsigned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteUpdateMetadata(t, versionDir, updateDownloadMetadata{Version: "missing-sha", Directory: versionDir, Files: []updateDownloadedFileInfo{{Name: "artifact", Path: artifact, Size: int64(len("unsigned")), SHA512: ""}}})
+	origExec := updateExecutablePath
+	updateExecutablePath = func() (string, error) { return currentExe, nil }
+	t.Cleanup(func() { updateExecutablePath = origExec })
+	h := NewHandler(nil, nil)
+	h.Restart = restart.NewManager(restart.RuntimeAddress{Protocol: "http", Host: "127.0.0.1", Port: 7778}, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/update/apply", strings.NewReader(`{"version":"missing-sha"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.updateApply(w, req); err != nil {
+		t.Fatalf("updateApply: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["success"] != false || !strings.Contains(body["error"].(string), "SHA512") {
+		t.Fatalf("expected missing SHA512 rejection, got %#v", body)
+	}
+	if body["selfUpdateAvailable"] != true || body["manualOnly"] != false {
+		t.Fatalf("expected auto-capable failure contract, got %#v", body)
+	}
+}
+
 func mustWriteUpdateMetadata(t *testing.T, dir string, metadata updateDownloadMetadata) {
 	t.Helper()
 	if err := writeUpdateDownloadMetadata(dir, metadata); err != nil {

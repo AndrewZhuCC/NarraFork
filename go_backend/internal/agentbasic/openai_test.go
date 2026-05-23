@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -130,16 +131,161 @@ func TestToolDefinitionsIncludeGateParameters(t *testing.T) {
 		byName[spec.Name] = spec
 	}
 	updateProps, _ := byName["UpdateGoal"].Parameters["properties"].(map[string]any)
-	if updateProps["evidence"] == nil || updateProps["reflection"] == nil {
-		t.Fatalf("UpdateGoal should expose evidence/reflection parameters: %#v", updateProps)
+	updateStatus, _ := updateProps["status"].(map[string]any)
+	updateRequired, _ := byName["UpdateGoal"].Parameters["required"].([]string)
+	if updateStatus["const"] != "complete" || updateProps["evidence"] != nil || updateProps["goal_id"] != nil || !slices.Contains(updateRequired, "status") || byName["UpdateGoal"].Parameters["additionalProperties"] != false {
+		t.Fatalf("UpdateGoal should expose TS-compatible active-goal completion schema: %#v", byName["UpdateGoal"].Parameters)
+	}
+	addGoalProps, _ := byName["AddGoal"].Parameters["properties"].(map[string]any)
+	addGoalObjective, _ := addGoalProps["objective"].(map[string]any)
+	if addGoalObjective["minLength"] != 1 || addGoalObjective["maxLength"] != 4000 || byName["AddGoal"].Parameters["additionalProperties"] != false {
+		t.Fatalf("AddGoal should expose TS-compatible objective length and strict schema: %#v", byName["AddGoal"].Parameters)
+	}
+	concludeProps, _ := byName["ConcludeReview"].Parameters["properties"].(map[string]any)
+	concludeFindings, _ := concludeProps["findings"].(map[string]any)
+	concludeFindingItems, _ := concludeFindings["items"].(map[string]any)
+	if byName["ConcludeReview"].Parameters["additionalProperties"] != false || concludeFindingItems["additionalProperties"] != false {
+		t.Fatalf("ConcludeReview should expose TS-compatible strict schema: %#v", byName["ConcludeReview"].Parameters)
+	}
+	if byName["EnterPlanMode"].Parameters["additionalProperties"] != false {
+		t.Fatalf("EnterPlanMode should reject extra provider-schema fields: %#v", byName["EnterPlanMode"].Parameters)
 	}
 	exitProps, _ := byName["ExitPlanMode"].Parameters["properties"].(map[string]any)
-	if exitProps["plan"] == nil || exitProps["allowedPrompts"] == nil {
-		t.Fatalf("ExitPlanMode should expose plan/allowedPrompts parameters: %#v", exitProps)
+	exitAllowedPrompts, _ := exitProps["allowedPrompts"].(map[string]any)
+	exitAllowedPromptItems, _ := exitAllowedPrompts["items"].(map[string]any)
+	exitAllowedPromptProps, _ := exitAllowedPromptItems["properties"].(map[string]any)
+	exitAllowedPromptTool, _ := exitAllowedPromptProps["tool"].(map[string]any)
+	exitAllowedPromptToolEnum, _ := exitAllowedPromptTool["enum"].([]string)
+	if exitProps["plan"] == nil || exitProps["allowedPrompts"] == nil || !slices.Contains(exitAllowedPromptToolEnum, "Bash") || exitAllowedPromptItems["additionalProperties"] != false {
+		t.Fatalf("ExitPlanMode should expose TS-compatible plan/allowedPrompts schema: %#v", byName["ExitPlanMode"].Parameters)
 	}
 	agentProps, _ := byName["Agent"].Parameters["properties"].(map[string]any)
-	if agentProps["timeout"] == nil {
-		t.Fatalf("Agent should expose foreground timeout parameter: %#v", agentProps)
+	agentReasoning, _ := agentProps["reasoning_effort"].(map[string]any)
+	agentReasoningEnum, _ := agentReasoning["enum"].([]string)
+	if agentProps["timeout"] == nil || agentProps["background"] == nil || !slices.Contains(agentReasoningEnum, "xhigh") || byName["Agent"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Agent should expose foreground timeout, legacy background, reasoning enum, and strict schema: %#v", byName["Agent"].Parameters)
+	}
+	teamStatusProps, _ := byName["TeamStatus"].Parameters["properties"].(map[string]any)
+	teamStatusAction, _ := teamStatusProps["action"].(map[string]any)
+	teamStatusActionEnum, _ := teamStatusAction["enum"].([]string)
+	if !slices.Contains(teamStatusActionEnum, "file_changes") || !slices.Contains(teamStatusActionEnum, "broadcast") || byName["TeamStatus"].Parameters["additionalProperties"] != false {
+		t.Fatalf("TeamStatus should expose TS-compatible action enum and strict schema: %#v", byName["TeamStatus"].Parameters)
+	}
+	if byName["Send"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Send should expose TS-compatible strict schema: %#v", byName["Send"].Parameters)
+	}
+	awaitProps, _ := byName["Await"].Parameters["properties"].(map[string]any)
+	awaitType, _ := awaitProps["type"].(map[string]any)
+	awaitTypeEnum, _ := awaitType["enum"].([]string)
+	if !slices.Contains(awaitTypeEnum, "agent") || !slices.Contains(awaitTypeEnum, "bash") || awaitProps["wait_for_text"] == nil || byName["Await"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Await should expose TS-compatible type enum and wait_for_text schema while runtime gates bash support: %#v", byName["Await"].Parameters)
+	}
+	skillProps, _ := byName["Skill"].Parameters["properties"].(map[string]any)
+	if skillProps["name"] == nil || skillProps["skill"] == nil || skillProps["args"] == nil {
+		t.Fatalf("Skill should expose runtime-supported name/skill/args parameters: %#v", skillProps)
+	}
+	if required, ok := byName["Skill"].Parameters["required"]; ok {
+		t.Fatalf("Skill schema should not require fields that runtime treats as optional: %#v", required)
+	}
+	askProps, _ := byName["AskUserQuestion"].Parameters["properties"].(map[string]any)
+	askQuestions, _ := askProps["questions"].(map[string]any)
+	askQuestionItems, _ := askQuestions["items"].(map[string]any)
+	askQuestionProps, _ := askQuestionItems["properties"].(map[string]any)
+	askOptions, _ := askQuestionProps["options"].(map[string]any)
+	askOptionItems, _ := askOptions["items"].(map[string]any)
+	askOptionProps, _ := askOptionItems["properties"].(map[string]any)
+	if askProps["answers"] == nil || askProps["annotations"] == nil || askProps["metadata"] == nil || askOptionProps["preview"] == nil || byName["AskUserQuestion"].Parameters["additionalProperties"] != false || askQuestionItems["additionalProperties"] != false || askOptionItems["additionalProperties"] != false {
+		t.Fatalf("AskUserQuestion should expose TS raw schema fields and strict nested objects: %#v", byName["AskUserQuestion"].Parameters)
+	}
+	bashProps, _ := byName["Bash"].Parameters["properties"].(map[string]any)
+	for _, key := range []string{"workdir", "run_in_background", "strict_serial"} {
+		if bashProps[key] == nil {
+			t.Fatalf("Bash should expose TS-compatible %s parameter: %#v", key, bashProps)
+		}
+	}
+	if byName["Bash"].Parameters["additionalProperties"] != false || byName["Write"].Parameters["additionalProperties"] != false || byName["Edit"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Bash/Write/Edit should expose TS-compatible strict schemas: bash=%#v write=%#v edit=%#v", byName["Bash"].Parameters, byName["Write"].Parameters, byName["Edit"].Parameters)
+	}
+	globProps, _ := byName["Glob"].Parameters["properties"].(map[string]any)
+	if globProps["path"] == nil || byName["Glob"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Glob should expose TS-compatible path parameter and strict schema: %#v", byName["Glob"].Parameters)
+	}
+	readProps, _ := byName["Read"].Parameters["properties"].(map[string]any)
+	if readProps["pages"] == nil || byName["Read"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Read should expose TS-compatible pages field and strict schema while runtime rejects unsupported PDF extraction: %#v", byName["Read"].Parameters)
+	}
+	webFetchProps, _ := byName["WebFetch"].Parameters["properties"].(map[string]any)
+	webFetchMode, _ := webFetchProps["mode"].(map[string]any)
+	webFetchModeEnum, _ := webFetchMode["enum"].([]string)
+	if !slices.Contains(webFetchModeEnum, "readability") || !slices.Contains(webFetchModeEnum, "screenshot") || webFetchProps["selector"] == nil || webFetchProps["purpose"] == nil || byName["WebFetch"].Parameters["additionalProperties"] != false {
+		t.Fatalf("WebFetch should expose TS-compatible mode/selector/purpose schema while runtime gates raw-only support: %#v", byName["WebFetch"].Parameters)
+	}
+	webSearchProps, _ := byName["WebSearch"].Parameters["properties"].(map[string]any)
+	webSearchQuery, _ := webSearchProps["query"].(map[string]any)
+	if webSearchQuery["minLength"] != 2 || byName["WebSearch"].Parameters["additionalProperties"] != false {
+		t.Fatalf("WebSearch should expose TS-compatible query minLength and strict schema: %#v", byName["WebSearch"].Parameters)
+	}
+	if byName["ShareFile"].Parameters["additionalProperties"] != false {
+		t.Fatalf("ShareFile should expose TS-compatible strict schema: %#v", byName["ShareFile"].Parameters)
+	}
+	grepProps, _ := byName["Grep"].Parameters["properties"].(map[string]any)
+	for _, key := range []string{"path", "-B", "-A", "-C", "-n", "offset", "type", "multiline"} {
+		if grepProps[key] == nil {
+			t.Fatalf("Grep should expose TS-compatible %s parameter: %#v", key, grepProps)
+		}
+	}
+	grepOutputMode, _ := grepProps["output_mode"].(map[string]any)
+	grepOutputModeEnum, _ := grepOutputMode["enum"].([]string)
+	if !slices.Contains(grepOutputModeEnum, "content") || !slices.Contains(grepOutputModeEnum, "files_with_matches") || !slices.Contains(grepOutputModeEnum, "count") || byName["Grep"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Grep should expose TS-compatible output_mode enum and strict schema: %#v", byName["Grep"].Parameters)
+	}
+	terminalProps, _ := byName["Terminal"].Parameters["properties"].(map[string]any)
+	terminalAction, _ := terminalProps["action"].(map[string]any)
+	terminalActionEnum, _ := terminalAction["enum"].([]string)
+	for _, action := range []string{"read", "write", "list", "create", "rename"} {
+		if !slices.Contains(terminalActionEnum, action) {
+			t.Fatalf("Terminal action enum should expose %s: %#v", action, terminalAction)
+		}
+	}
+	if terminalProps["max_length"] != nil || byName["Terminal"].Parameters["additionalProperties"] != false {
+		t.Fatalf("Terminal schema should match TS parameters without max_length extras: %#v", byName["Terminal"].Parameters)
+	}
+	getGoalsProps, _ := byName["GetGoals"].Parameters["properties"].(map[string]any)
+	confirmProp, _ := getGoalsProps["confirm"].(map[string]any)
+	if confirmProp["const"] != true || byName["GetGoals"].Parameters["additionalProperties"] != false {
+		t.Fatalf("GetGoals should expose TS-compatible confirm literal: %#v", byName["GetGoals"].Parameters)
+	}
+	learningProps, _ := byName["LearningGuide"].Parameters["properties"].(map[string]any)
+	modeProp, _ := learningProps["mode"].(map[string]any)
+	modeEnum, _ := modeProp["enum"].([]string)
+	for _, mode := range []string{"list", "search", "get"} {
+		if !slices.Contains(modeEnum, mode) {
+			t.Fatalf("LearningGuide mode enum should expose %s: %#v", mode, modeProp)
+		}
+	}
+	taskProps, _ := byName["TaskCreate"].Parameters["properties"].(map[string]any)
+	todosProp, _ := taskProps["todos"].(map[string]any)
+	todoItems, _ := todosProp["items"].(map[string]any)
+	todoItemProps, _ := todoItems["properties"].(map[string]any)
+	statusProp, _ := todoItemProps["status"].(map[string]any)
+	priorityProp, _ := todoItemProps["priority"].(map[string]any)
+	statusEnum, _ := statusProp["enum"].([]string)
+	priorityEnum, _ := priorityProp["enum"].([]string)
+	for _, status := range []string{"pending", "in_progress", "completed"} {
+		if !slices.Contains(statusEnum, status) {
+			t.Fatalf("TaskCreate status enum should expose %s: %#v", status, statusProp)
+		}
+	}
+	for _, priority := range []string{"high", "medium", "low"} {
+		if !slices.Contains(priorityEnum, priority) {
+			t.Fatalf("TaskCreate priority enum should expose %s: %#v", priority, priorityProp)
+		}
+	}
+	endPipelineProps, _ := byName["EndPipeline"].Parameters["properties"].(map[string]any)
+	endPipelineFormat, _ := endPipelineProps["format"].(map[string]any)
+	endPipelineFormatEnum, _ := endPipelineFormat["enum"].([]string)
+	if byName["StartPipeline"].Parameters["additionalProperties"] != false || byName["EndPipeline"].Parameters["additionalProperties"] != false || !slices.Contains(endPipelineFormatEnum, "sections") || !slices.Contains(endPipelineFormatEnum, "plain") {
+		t.Fatalf("Pipeline schemas should expose TS-compatible strict objects and format enum: start=%#v end=%#v", byName["StartPipeline"].Parameters, byName["EndPipeline"].Parameters)
 	}
 }
 
@@ -599,32 +745,52 @@ func TestChatCompletionsSendsSupportedReasoningEffort(t *testing.T) {
 	}
 }
 
-func TestGrepToolSupportsModesContextAndCaseInsensitive(t *testing.T) {
+func TestGrepToolSupportsModesContextPathAndCaseInsensitive(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cwd, "src"), 0o755); err != nil {
 		t.Fatalf("mkdir fixture: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cwd, "src", "a.go"), []byte("one\nTwo\nthree\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cwd, "src", "a.go"), []byte("one\nTwo\nthree\ntype Widget struct {\n\tField string\n}\n"), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cwd, "src", "b.txt"), []byte("two\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cwd, "src", "b.txt"), []byte("two\ntype Widget struct {\n\tField string\n}\n"), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-	out := ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","glob":"**/*.go","-i":true,"context":1}`)
+	out := ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","glob":"**/*.go","-i":true,"output_mode":"content","context":1}`)
 	if !strings.Contains(out, "src/a.go:1:one") || !strings.Contains(out, "src/a.go:2:Two") || strings.Contains(out, "b.txt") {
 		t.Fatalf("unexpected grep context output: %s", out)
 	}
-	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","-i":true,"output_mode":"files_with_matches"}`)
-	if !strings.Contains(out, "src/a.go") || !strings.Contains(out, "src/b.txt") {
-		t.Fatalf("unexpected files_with_matches output: %s", out)
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","-i":true}`)
+	if !strings.Contains(out, "src/a.go") || !strings.Contains(out, "src/b.txt") || strings.Contains(out, ":1:") {
+		t.Fatalf("default mode should be files_with_matches, got: %s", out)
 	}
-	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","-i":true,"output_mode":"count","head_limit":1}`)
-	if strings.Count(strings.TrimSpace(out), "\n") != 0 {
-		t.Fatalf("expected head_limit to keep one count entry, got: %s", out)
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","path":"src","glob":"*.go","-i":true,"output_mode":"content","-B":1,"-A":0,"-n":false}`)
+	if !strings.Contains(out, "a.go:one") || !strings.Contains(out, "a.go:Two") || strings.Contains(out, "src/a.go") || strings.Contains(out, ":1:") {
+		t.Fatalf("unexpected grep path/context output: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","-i":true,"output_mode":"count","head_limit":1,"offset":1}`)
+	if strings.Count(strings.TrimSpace(out), "\n") != 0 || !strings.Contains(out, "src/b.txt:1") {
+		t.Fatalf("expected offset/head_limit to keep second count entry, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","path":"../outside"}`)
+	if !strings.Contains(out, "path escapes working directory") {
+		t.Fatalf("expected path escape rejection, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","type":"go","-i":true}`)
+	if !strings.Contains(out, "src/a.go") || strings.Contains(out, "src/b.txt") {
+		t.Fatalf("expected type=go to keep only Go files, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"type Widget.*Field","type":"go","multiline":true,"output_mode":"content"}`)
+	if !strings.Contains(out, "src/a.go:4:type Widget struct") || !strings.Contains(out, "src/a.go:5:\tField string") || strings.Contains(out, "src/b.txt") {
+		t.Fatalf("expected multiline type-filtered content match, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Grep", `{"pattern":"two","type":"unknown"}`)
+	if !strings.Contains(out, "unsupported Grep type") {
+		t.Fatalf("expected unsupported type rejection, got: %s", out)
 	}
 }
 
-func TestGlobToolSupportsRecursivePatterns(t *testing.T) {
+func TestGlobToolSupportsRecursivePatternsAndPath(t *testing.T) {
 	cwd := t.TempDir()
 	for _, file := range []string{"main.go", "internal/app/server.go", "internal/app/server.ts", "README.md"} {
 		full := filepath.Join(cwd, filepath.FromSlash(file))
@@ -642,6 +808,14 @@ func TestGlobToolSupportsRecursivePatterns(t *testing.T) {
 	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.md"}`)
 	if !strings.Contains(out, "README.md") || strings.Contains(out, "server.go") {
 		t.Fatalf("unexpected basename glob output: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.go","path":"internal/app"}`)
+	if out != "server.go" {
+		t.Fatalf("expected path-relative glob output, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.go","path":"../outside"}`)
+	if !strings.Contains(out, "path escapes working directory") {
+		t.Fatalf("expected path escape rejection, got: %s", out)
 	}
 }
 
@@ -757,6 +931,17 @@ func TestReadToolSupportsOffsetAndLimit(t *testing.T) {
 	}
 }
 
+func TestReadToolRejectsUnsupportedPagesParameter(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "sample.txt"), []byte("line1\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "Read", `{"file_path":"sample.txt","pages":"1-2"}`)
+	if !strings.Contains(out, "pages/PDF extraction is not supported") {
+		t.Fatalf("expected explicit unsupported pages error, got: %s", out)
+	}
+}
+
 func TestBashToolRejectsEmptyCommand(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "Bash", `{"command":"   "}`)
 	if !strings.Contains(out, "command is required") {
@@ -768,6 +953,32 @@ func TestBashToolHonorsTimeout(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "Bash", `{"command":"sleep 2","timeout":1000}`)
 	if !strings.Contains(out, "[timeout]") {
 		t.Fatalf("expected timeout marker, got: %s", out)
+	}
+}
+
+func TestBashToolSupportsWorkdirAndRejectsBackground(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cwd, "subdir"), 0o755); err != nil {
+		t.Fatalf("mkdir fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "Bash", `{"command":"pwd","workdir":"subdir"}`)
+	if !strings.Contains(filepath.ToSlash(out), "/subdir") {
+		t.Fatalf("expected pwd output under subdir, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), cwd, "Bash", `{"command":"pwd","run_in_background":true}`)
+	if !strings.Contains(out, "run_in_background is not supported") {
+		t.Fatalf("expected background rejection, got: %s", out)
+	}
+}
+
+func TestBashStrictSerialPreventsParallelGrouping(t *testing.T) {
+	parallel := newFunctionToolCall("bash-parallel", "Bash", `{"command":"pwd"}`)
+	serial := newFunctionToolCall("bash-serial", "Bash", `{"command":"pwd","strict_serial":true}`)
+	if isStrictSerialTool(parallel) {
+		t.Fatalf("plain Bash should remain parallel-capable")
+	}
+	if !isStrictSerialTool(serial) {
+		t.Fatalf("strict_serial Bash should block eager parallel execution")
 	}
 }
 
@@ -784,10 +995,112 @@ func TestBrowserToolSchemaIncludesRodParameters(t *testing.T) {
 		t.Fatalf("expected Browser tool spec")
 	}
 	props, _ := browser.Parameters["properties"].(map[string]any)
-	for _, key := range []string{"selector", "value", "key", "state", "direction", "amount", "timeout", "ttl_ms", "max_length", "file_path", "full_page", "headless", "clear", "include_details", "capture_network", "wait_after_ms", "categories", "coordinate"} {
+	for _, key := range []string{"selector", "value", "key", "direction", "amount", "timeout", "ttl_ms", "max_length", "file_path", "headless", "clear", "include_details", "capture_network", "wait_after_ms", "categories", "coordinate"} {
 		if props[key] == nil {
 			t.Fatalf("Browser tool should expose %s: %#v", key, props)
 		}
+	}
+	for _, key := range []string{"state", "full_page"} {
+		if props[key] != nil {
+			t.Fatalf("Browser tool should not expose TS-unsupported %s: %#v", key, props)
+		}
+	}
+	if browser.Parameters["additionalProperties"] != false {
+		t.Fatalf("Browser tool schema should reject additional properties: %#v", browser.Parameters)
+	}
+	actionProp, _ := props["action"].(map[string]any)
+	actionEnum, _ := actionProp["enum"].([]string)
+	for _, action := range []string{"launch", "screenshot", "get_network", "perf_start", "perf_stop"} {
+		if !slices.Contains(actionEnum, action) {
+			t.Fatalf("Browser action enum should include %s: %#v", action, actionProp)
+		}
+	}
+	directionProp, _ := props["direction"].(map[string]any)
+	directionEnum, _ := directionProp["enum"].([]string)
+	for _, direction := range []string{"back", "forward", "up", "down"} {
+		if !slices.Contains(directionEnum, direction) {
+			t.Fatalf("Browser direction enum should include %s: %#v", direction, directionProp)
+		}
+	}
+	for _, direction := range []string{"left", "right"} {
+		if slices.Contains(directionEnum, direction) {
+			t.Fatalf("Browser direction enum should not expose TS-unsupported %s: %#v", direction, directionProp)
+		}
+	}
+}
+
+func TestBrowserToolRejectsInvalidDirectionsBeforeSessionLookup(t *testing.T) {
+	out := ExecuteTool(context.Background(), t.TempDir(), "Browser", `{"action":"navigate","session_id":"missing","direction":"sideways","url":"https://example.com"}`)
+	if !strings.Contains(out, "unsupported navigate direction: sideways") {
+		t.Fatalf("expected unsupported navigate direction before session lookup, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), t.TempDir(), "Browser", `{"action":"scroll","session_id":"missing","direction":"sideways"}`)
+	if !strings.Contains(out, "unsupported scroll direction: sideways") {
+		t.Fatalf("expected unsupported scroll direction before session lookup, got: %s", out)
+	}
+	out = ExecuteTool(context.Background(), t.TempDir(), "Browser", `{"action":"scroll","session_id":"missing","direction":"left"}`)
+	if !strings.Contains(out, "unsupported scroll direction: left") {
+		t.Fatalf("expected TS-unsupported left direction to be rejected, got: %s", out)
+	}
+}
+
+func TestBrowserTraceArtifactDefaultsToShare(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cwd := t.TempDir()
+
+	artifact, err := writeBrowserTraceArtifact(cwd, "sess-trace", "", []map[string]any{{"name": "trace-event"}}, 1234, false)
+	if err != nil {
+		t.Fatalf("write trace artifact: %v", err)
+	}
+	shareID := stringValue(artifact["shareId"])
+	if shareID == "" || artifact["shareUrl"] != "/api/shares/"+shareID || artifact["expiresAt"] == nil {
+		t.Fatalf("expected share metadata in artifact: %#v", artifact)
+	}
+	filePath := stringValue(artifact["file_path"])
+	if !strings.HasPrefix(filePath, filepath.Join(home, ".narrafork", "shares", shareID)+string(os.PathSeparator)) {
+		t.Fatalf("expected trace under share root, got %s", filePath)
+	}
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read trace artifact: %v", err)
+	}
+	if !strings.Contains(string(data), "trace-event") {
+		t.Fatalf("trace artifact missing event: %s", data)
+	}
+	metadataRaw, err := os.ReadFile(shareMetadataPath(shareID))
+	if err != nil {
+		t.Fatalf("read share metadata: %v", err)
+	}
+	var metadata shareDiskMetadata
+	if err := json.Unmarshal(metadataRaw, &metadata); err != nil {
+		t.Fatalf("decode share metadata: %v", err)
+	}
+	if metadata.ID != shareID || metadata.CreatedBy != "browser" || metadata.SizeBytes != int64(len(data)) {
+		t.Fatalf("unexpected share metadata: %#v", metadata)
+	}
+}
+
+func TestBrowserTraceArtifactExplicitFilePathStaysInCwd(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+
+	artifact, err := writeBrowserTraceArtifact(cwd, "sess-trace", "traces/out.json", []map[string]any{{"name": "trace-event"}}, 55, true)
+	if err != nil {
+		t.Fatalf("write trace artifact: %v", err)
+	}
+	if artifact["shareId"] != nil || artifact["shareUrl"] != nil {
+		t.Fatalf("explicit file_path should not create share metadata: %#v", artifact)
+	}
+	filePath := stringValue(artifact["file_path"])
+	if filePath != filepath.Join(cwd, "traces", "out.json") {
+		t.Fatalf("unexpected explicit trace path: %s", filePath)
+	}
+	if artifact["dataLossOccurred"] != true || artifact["durationMs"] != int64(55) {
+		t.Fatalf("unexpected trace artifact metadata: %#v", artifact)
+	}
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("expected explicit trace file: %v", err)
 	}
 }
 
@@ -984,6 +1297,32 @@ func TestShareFileToolCopiesFileUnderSharesRoot(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "artifact.html"), []byte("hello share"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	out := ExecuteTool(context.Background(), cwd, "ShareFile", `{"path":"artifact.html","preview":true}`)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("expected JSON output, got %q: %v", out, err)
+	}
+	shareID, _ := payload["id"].(string)
+	if shareID == "" || payload["url"] != "/api/shares/"+shareID || payload["previewUrl"] != "/api/shares/"+shareID+"/preview" || payload["preview"] != true || payload["previewType"] != "html" {
+		t.Fatalf("unexpected share payload: %#v", payload)
+	}
+	sharedPath := filepath.Join(home, ".narrafork", "shares", shareID, "artifact.html")
+	data, err := os.ReadFile(sharedPath)
+	if err != nil {
+		t.Fatalf("read shared file: %v", err)
+	}
+	if string(data) != "hello share" {
+		t.Fatalf("unexpected shared content: %q", string(data))
+	}
+}
+
+func TestShareFileToolOmitsPreviewForUnsupportedFileTypes(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, "artifact.txt"), []byte("hello share"), 0o644); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
@@ -993,17 +1332,8 @@ func TestShareFileToolCopiesFileUnderSharesRoot(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
 		t.Fatalf("expected JSON output, got %q: %v", out, err)
 	}
-	shareID, _ := payload["id"].(string)
-	if shareID == "" || payload["url"] != "/api/shares/"+shareID || payload["previewUrl"] != "/api/shares/"+shareID+"/preview" {
-		t.Fatalf("unexpected share payload: %#v", payload)
-	}
-	sharedPath := filepath.Join(home, ".narrafork", "shares", shareID, "artifact.txt")
-	data, err := os.ReadFile(sharedPath)
-	if err != nil {
-		t.Fatalf("read shared file: %v", err)
-	}
-	if string(data) != "hello share" {
-		t.Fatalf("unexpected shared content: %q", string(data))
+	if payload["previewUrl"] != nil || payload["preview"] != nil || payload["previewType"] != nil {
+		t.Fatalf("unsupported file type should not expose preview metadata: %#v", payload)
 	}
 }
 
@@ -1060,22 +1390,67 @@ func TestShareFileToolPackagesMultiplePathsAsZip(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &payload); err != nil {
 		t.Fatalf("expected JSON output, got %q: %v", out, err)
 	}
-	if payload["compressed"] != true || payload["fileName"] != "shared-files.zip" {
-		t.Fatalf("unexpected zip payload: %#v", payload)
+	if payload["compressed"] != true || !strings.HasSuffix(payload["fileName"].(string), ".zip") {
+		t.Fatalf("expected zip payload, got %#v", payload)
 	}
-	shareID, _ := payload["id"].(string)
-	zr, err := zip.OpenReader(filepath.Join(home, ".narrafork", "shares", shareID, "shared-files.zip"))
-	if err != nil {
-		t.Fatalf("open zip: %v", err)
-	}
-	defer zr.Close()
-	names := map[string]bool{}
-	for _, file := range zr.File {
-		names[file.Name] = true
-	}
+	shareID := payload["id"].(string)
+	zipPath := filepath.Join(home, ".narrafork", "shares", shareID, payload["fileName"].(string))
+	names := zipEntryNames(t, zipPath)
 	if !names["a.txt"] || !names["dir/b.txt"] {
 		t.Fatalf("zip missing expected files: %#v", names)
 	}
+}
+
+func TestShareFileToolRejectsOversizedSourcesBeforeArchiving(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	cwd := t.TempDir()
+	bigPath := filepath.Join(cwd, "big.bin")
+	if err := os.WriteFile(bigPath, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	if err := os.Truncate(bigPath, maxToolShareSourceBytes+1); err != nil {
+		t.Fatalf("truncate fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "small.txt"), []byte("small"), 0o644); err != nil {
+		t.Fatalf("write small fixture: %v", err)
+	}
+	for name, input := range map[string]string{
+		"gzip": `{"path":"big.bin","compress":true}`,
+		"zip":  `{"path":["big.bin","small.txt"]}`,
+	} {
+		out := ExecuteTool(context.Background(), cwd, "ShareFile", input)
+		if !strings.Contains(out, "source size exceeds 512MB ShareFile limit") {
+			t.Fatalf("%s expected source-size rejection, got: %s", name, out)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(cwd, "big-dir"), 0o755); err != nil {
+		t.Fatalf("mkdir fixture: %v", err)
+	}
+	bigDirFile := filepath.Join(cwd, "big-dir", "nested.bin")
+	if err := os.WriteFile(bigDirFile, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write dir fixture: %v", err)
+	}
+	if err := os.Truncate(bigDirFile, maxToolShareSourceBytes+1); err != nil {
+		t.Fatalf("truncate dir fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "ShareFile", `{"path":"big-dir"}`)
+	if !strings.Contains(out, "source size exceeds 512MB ShareFile limit") {
+		t.Fatalf("directory expected source-size rejection, got: %s", out)
+	}
+}
+
+func zipEntryNames(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	reader, err := zip.OpenReader(path)
+	if err != nil {
+		t.Fatalf("open zip %s: %v", path, err)
+	}
+	defer reader.Close()
+	names := map[string]bool{}
+	for _, file := range reader.File {
+		names[file.Name] = true
+	}
+	return names
 }
 
 func TestShareFileToolRejectsEscapingPath(t *testing.T) {
@@ -1104,8 +1479,72 @@ func TestWebFetchToolFetchesAndTruncatesHTTP(t *testing.T) {
 
 func TestWebFetchToolRejectsNonHTTPURL(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"file:///etc/passwd"}`)
-	if !strings.Contains(out, "only http and https") {
+	if !strings.Contains(out, "only http, https, and data") {
 		t.Fatalf("expected non-HTTP rejection, got: %s", out)
+	}
+}
+
+func TestWebFetchToolSupportsDataURL(t *testing.T) {
+	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;base64,aGVsbG8gd29ybGQ=","max_length":20}`)
+	if !strings.Contains(out, "Status: 200 OK") || !strings.Contains(out, "Content-Type: text/plain") || !strings.Contains(out, "hello world") {
+		t.Fatalf("expected decoded data URL output, got: %s", out)
+	}
+
+	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;charset=utf-8,hello%20inline","max_length":5}`)
+	if !strings.Contains(out, "Content-Type: text/plain;charset=utf-8") || !strings.Contains(out, "hello") || !strings.Contains(out, "[truncated]") {
+		t.Fatalf("expected plain data URL output with truncation, got: %s", out)
+	}
+}
+
+func TestWebFetchToolRejectsUnsupportedModeInsteadOfIgnoring(t *testing.T) {
+	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","mode":"readability"}`)
+	if !strings.Contains(out, "unsupported WebFetch mode") || !strings.Contains(out, "readability") {
+		t.Fatalf("expected unsupported mode error, got: %s", out)
+	}
+
+	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","selector":"main"}`)
+	if !strings.Contains(out, "selector and purpose parameters") {
+		t.Fatalf("expected unsupported selector error, got: %s", out)
+	}
+
+	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","mode":"raw"}`)
+	if !strings.Contains(out, "hello") {
+		t.Fatalf("expected raw mode to fetch content, got: %s", out)
+	}
+}
+
+func TestWebFetchToolUsesCustomProxyPolicy(t *testing.T) {
+	proxyHit := false
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit = true
+		if r.URL.Scheme != "http" || r.URL.Host != "webfetch-target.example" || r.URL.Path != "/page" {
+			t.Fatalf("unexpected proxied WebFetch URL: scheme=%q host=%q path=%q requestURI=%q", r.URL.Scheme, r.URL.Host, r.URL.Path, r.RequestURI)
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("proxied webfetch body"))
+	}))
+	defer proxy.Close()
+	ctx := ContextWithToolRuntimeSettings(context.Background(), ToolRuntimeSettings{WebFetchProxy: WebFetchProxyPolicy{Mode: "custom", URL: proxy.URL}})
+	out := ExecuteTool(ctx, t.TempDir(), "WebFetch", `{"url":"http://webfetch-target.example/page","max_length":200}`)
+	if !proxyHit || !strings.Contains(out, "proxied webfetch body") {
+		t.Fatalf("expected WebFetch to use configured proxy, proxyHit=%v output=%s", proxyHit, out)
+	}
+}
+
+func TestToolRuntimeSettingsFromRawSettingsReadsWebFetchProxy(t *testing.T) {
+	settings := ToolRuntimeSettingsFromRawSettings(map[string]any{
+		"agent": map[string]any{
+			"webFetchPolicy": map[string]any{
+				"proxy": map[string]any{"mode": "custom", "url": "http://proxy.example.test:8080"},
+			},
+		},
+	})
+	if settings.WebFetchProxy.Mode != "custom" || settings.WebFetchProxy.URL != "http://proxy.example.test:8080" {
+		t.Fatalf("unexpected WebFetch proxy settings: %#v", settings)
+	}
+	defaultSettings := ToolRuntimeSettingsFromRawSettings(nil)
+	if defaultSettings.WebFetchProxy.Mode != "system" || defaultSettings.WebFetchProxy.URL != "" {
+		t.Fatalf("unexpected default WebFetch proxy settings: %#v", defaultSettings)
 	}
 }
 

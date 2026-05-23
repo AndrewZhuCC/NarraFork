@@ -38,6 +38,35 @@ func TestBackgroundTaskToolUseIDReturnsLookupErrors(t *testing.T) {
 	}
 }
 
+func TestSubagentFallbackResultsExposeReason(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+	ctx := context.Background()
+
+	cases := []struct {
+		name string
+		call func() (map[string]any, error)
+	}{
+		{name: "detach", call: func() (map[string]any, error) { return service.DetachSubagent(ctx, narratorID) }},
+		{name: "attach", call: func() (map[string]any, error) { return service.AttachSubagent(ctx, narratorID) }},
+		{name: "conclusion", call: func() (map[string]any, error) { return service.UpdateSubagentConclusion(ctx, narratorID) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := tc.call()
+			if err != nil {
+				t.Fatalf("call %s: %v", tc.name, err)
+			}
+			reason, _ := payload["reason"].(string)
+			if payload["fallback"] != true || reason != "Not a subagent" || payload["error"] != reason || payload["message"] != reason {
+				t.Fatalf("subagent fallback should expose reason/error/message, got %#v", payload)
+			}
+		})
+	}
+}
+
 func TestRecordedToolCallIDReturnsLookupErrors(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -105,8 +134,9 @@ func TestSendToolRejectsInterruptFromSubagentCaller(t *testing.T) {
 	if err != nil {
 		t.Fatalf("send tool returned error: %v", err)
 	}
-	if payload["ok"] != false || !strings.Contains(stringFromAny(payload["error"]), "doInterrupt") {
-		t.Fatalf("expected doInterrupt guard payload, got %#v", payload)
+	reason := assertToolDiagnosticFields(t, payload, "SEND_INTERRUPT_UNSUPPORTED_FROM_SUBAGENT")
+	if payload["ok"] != false || !strings.Contains(reason, "doInterrupt") {
+		t.Fatalf("expected doInterrupt guard diagnostics, got %#v", payload)
 	}
 	var messageCount int
 	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND content_text = 'hello'`, child.ID).Scan(&messageCount); err != nil {
@@ -114,6 +144,68 @@ func TestSendToolRejectsInterruptFromSubagentCaller(t *testing.T) {
 	}
 	if messageCount != 0 {
 		t.Fatalf("send should not enqueue message after interrupt guard, count=%d", messageCount)
+	}
+}
+
+func TestFinishRecordedToolCallLookupFallbackEventExposesReason(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, created_at) VALUES ('tc-1', 'nar-1', 'msg-1', 'tool-1', 'Bash', 'pending', 'now')`); err != nil {
+		t.Fatalf("insert tool call: %v", err)
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE narrator_tool_calls RENAME TO narrator_tool_calls_real`,
+		`CREATE VIEW narrator_tool_calls AS SELECT id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, output_json, execution_started_at, completed_at, error_message, permission_decided_by, permission_decided_at, permission_deny_message, permission_decision_reason, result_message_id, CASE WHEN status IN ('success', 'fail', 'error') THEN json_extract('not-json', '$') ELSE created_at END AS created_at FROM narrator_tool_calls_real`,
+		`CREATE TRIGGER narrator_tool_calls_update INSTEAD OF UPDATE ON narrator_tool_calls BEGIN UPDATE narrator_tool_calls_real SET status = NEW.status, output_json = NEW.output_json, execution_started_at = NEW.execution_started_at, completed_at = NEW.completed_at, error_message = NEW.error_message, permission_decided_by = NEW.permission_decided_by, permission_decided_at = NEW.permission_decided_at, permission_deny_message = NEW.permission_deny_message, permission_decision_reason = NEW.permission_decision_reason, result_message_id = NEW.result_message_id WHERE narrator_id = OLD.narrator_id AND tool_use_id = OLD.tool_use_id; END;`,
+	} {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("prepare broken tool call view: %v", err)
+		}
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	err := service.finishRecordedToolCall(context.Background(), "nar-1", "tool-1", "msg-result", agentbasic.ToolRun{Output: "done"}, permissionDecision{}, "success")
+	if err == nil || !strings.Contains(err.Error(), "query recorded tool call") {
+		t.Fatalf("expected recorded tool call query error, got %v", err)
+	}
+	payload := findBroadcast(events(), "nar-1", "permission_resolved")
+	if payload == nil {
+		t.Fatalf("expected degraded permission_resolved broadcast, got %#v", events())
+	}
+	reason, _ := payload["reason"].(string)
+	if payload["fallback"] != true || payload["degraded"] != true || reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("permission_resolved fallback should expose reason/error/message, got %#v", payload)
+	}
+}
+
+func TestPersistAgentErrorReturnsMessageInsertErrorsAndBroadcastsFallback(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	prepareBrokenNarratorMessageRefsSeq(t, sqlDB, narratorID)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	err := service.persistAgentError(context.Background(), narratorID, errors.New("model failed"), false)
+	if err == nil || !strings.Contains(err.Error(), "persist agent error message") {
+		t.Fatalf("expected message persist error, got %v", err)
+	}
+	payload := findBroadcast(events(), narratorID, "error")
+	if payload == nil || payload["code"] != "AGENT_ERROR_PERSIST_FAILED" || payload["stage"] != "message" || payload["fallback"] != true || payload["fatal"] != false {
+		t.Fatalf("expected message-stage persistence fallback broadcast, got %#v", events())
+	}
+	reason, _ := payload["reason"].(string)
+	if reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("agent error message persistence fallback should expose reason/error/message, got %#v", payload)
+	}
+	assertNoMessageRefSeqFallbackInsert(t, sqlDB, narratorID, "AI provider call failed: model failed")
+	var status, substatus, errorMessage string
+	if err := sqlDB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("load narrator after message persist failure: %v", err)
+	}
+	if status != "idle" || substatus != "[]" || errorMessage != "" {
+		t.Fatalf("message persist failure should not continue to status update, status=%s substatus=%s error=%s", status, substatus, errorMessage)
 	}
 }
 
@@ -135,6 +227,10 @@ func TestPersistAgentErrorReturnsStatusUpdateErrorsAndBroadcastsFallback(t *test
 	for _, event := range events() {
 		payload := event.Payload
 		if payload["type"] == "error" && payload["code"] == "AGENT_ERROR_PERSIST_FAILED" && payload["stage"] == "status" {
+			reason, _ := payload["reason"].(string)
+			if reason == "" || payload["error"] != reason || payload["message"] != reason {
+				t.Fatalf("agent error persistence fallback should expose reason/error/message, got %#v", payload)
+			}
 			found = true
 			break
 		}
@@ -302,6 +398,56 @@ func TestBackgroundAgentCompletionSyncsTaskRecordAndBroadcastsParentEvents(t *te
 	}
 	if !hasBroadcastStatus(events(), parentID, child.ID, "completed") {
 		t.Fatalf("expected background_task_status_changed completed broadcast, got %#v", events())
+	}
+}
+
+func TestBackgroundAgentCompletionBroadcastsFallbackWhenTaskRecordUpdateFails(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	parent, err := service.Get(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Background worker", "openai:test", "", "", "worker", true)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+	insertParentAgentToolCallForTest(t, service, parentID, "toolu_bg_fail")
+	if err := service.createBackgroundAgentTask(context.Background(), parentID, child.ID, "general", "Background worker", "toolu_bg_fail", "worker"); err != nil {
+		t.Fatalf("create background task: %v", err)
+	}
+	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_background_task_finish BEFORE UPDATE OF status ON background_tasks BEGIN SELECT RAISE(ABORT, 'background task finish blocked'); END;`); err != nil {
+		t.Fatalf("create background task failure trigger: %v", err)
+	}
+
+	state := &agentRunState{narratorID: child.ID, narrator: child, assistantText: "finished output"}
+	err = service.finishAgentRunSuccess(context.Background(), state)
+	if err == nil || !strings.Contains(err.Error(), "background task finish blocked") {
+		t.Fatalf("expected background task finish error, got %v", err)
+	}
+	payload := findBroadcast(events(), child.ID, "error")
+	if payload == nil || payload["code"] != "AGENT_ERROR_PERSIST_FAILED" || payload["stage"] != "background_task" || payload["fallback"] != true || payload["fatal"] != false {
+		t.Fatalf("expected background-task persistence fallback broadcast, got %#v", events())
+	}
+	reason, _ := payload["reason"].(string)
+	if reason == "" || payload["error"] != reason || payload["message"] != reason {
+		t.Fatalf("background-task persistence fallback should expose reason/error/message, got %#v", payload)
+	}
+	var taskStatus, backgroundStatus, backgroundResult string
+	if err := sqlDB.QueryRow(`SELECT status FROM background_tasks WHERE id = ?`, child.ID).Scan(&taskStatus); err != nil {
+		t.Fatalf("load task status: %v", err)
+	}
+	if err := sqlDB.QueryRow(`SELECT background_status, background_result FROM narrators WHERE id = ?`, child.ID).Scan(&backgroundStatus, &backgroundResult); err != nil {
+		t.Fatalf("load child background fields: %v", err)
+	}
+	if taskStatus != "running" || backgroundStatus != "completed" || backgroundResult != "finished output" {
+		t.Fatalf("unexpected partial background state task=%s child=%s result=%q", taskStatus, backgroundStatus, backgroundResult)
+	}
+	if hasBroadcast(events(), parentID, "background_task_completed") || hasBroadcastStatus(events(), parentID, child.ID, "completed") {
+		t.Fatalf("failed task-record update should not broadcast completed parent events, got %#v", events())
 	}
 }
 

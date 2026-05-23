@@ -399,10 +399,20 @@ func (h *Handler) getBenchmarkRunSummary(w http.ResponseWriter, r *http.Request)
 	return nil
 }
 
+func writeBenchmarkError(w http.ResponseWriter, status int, code, reason string) {
+	httpx.WriteJSON(w, status, map[string]any{
+		"ok":      false,
+		"code":    code,
+		"reason":  reason,
+		"error":   reason,
+		"message": reason,
+	})
+}
+
 func (h *Handler) compareBenchmarkRuns(w http.ResponseWriter, r *http.Request) error {
 	raw := strings.TrimSpace(r.URL.Query().Get("runIds"))
 	if raw == "" {
-		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "runIds query parameter required"})
+		writeBenchmarkError(w, http.StatusBadRequest, "BENCHMARK_COMPARE_RUN_IDS_REQUIRED", "runIds query parameter required")
 		return nil
 	}
 	runIDs := []string{}
@@ -412,14 +422,14 @@ func (h *Handler) compareBenchmarkRuns(w http.ResponseWriter, r *http.Request) e
 		}
 	}
 	if len(runIDs) < 2 {
-		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "At least 2 run IDs required"})
+		writeBenchmarkError(w, http.StatusBadRequest, "BENCHMARK_COMPARE_MIN_RUNS_REQUIRED", "At least 2 run IDs required")
 		return nil
 	}
 	summaries := []map[string]any{}
 	for _, runID := range runIDs {
 		summary, err := h.benchmarkRunSummary(r.Context(), runID)
 		if err != nil {
-			httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			writeBenchmarkError(w, http.StatusBadRequest, "BENCHMARK_RUN_SUMMARY_FAILED", err.Error())
 			return nil
 		}
 		summaries = append(summaries, summary)
@@ -760,6 +770,19 @@ func (h *Handler) gatewayDefaultPermissionMode(ctx context.Context) string {
 	return ""
 }
 
+const gatewayRuntimeFallbackReason = "Persistent gateway runtimes are not bundled in go_backend"
+const gatewayWebhookFallbackReason = "Gateway webhook narrator runtime is not attached in go_backend"
+
+func gatewayWebhookStatusPayload(configured bool, supported bool) map[string]any {
+	payload := map[string]any{"configured": configured, "supported": supported, "fallback": !supported}
+	if !supported {
+		payload["reason"] = gatewayWebhookFallbackReason
+		payload["error"] = gatewayWebhookFallbackReason
+		payload["message"] = gatewayWebhookFallbackReason
+	}
+	return payload
+}
+
 func (h *Handler) gatewayStatus(w http.ResponseWriter, r *http.Request) error {
 	if h.Gateway != nil {
 		httpx.WriteJSON(w, http.StatusOK, h.Gateway.Status(r.Context()))
@@ -795,7 +818,23 @@ func (h *Handler) gatewayStatus(w http.ResponseWriter, r *http.Request) error {
 		platforms = append(platforms, "webhook")
 	}
 	narratorRuntimeAttached := h.gatewayNarratorRuntime() != nil
-	status := map[string]any{"started": false, "platforms": platforms, "sessions": len(sessions), "configuredUsers": configuredUsers, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": narratorRuntimeAttached, "fallback": !narratorRuntimeAttached}}
+	webhookPayload := gatewayWebhookStatusPayload(
+		cfg.Enabled && cfg.Secret != "",
+		narratorRuntimeAttached,
+	)
+	status := map[string]any{
+		"started":         false,
+		"platforms":       platforms,
+		"sessions":        len(sessions),
+		"configuredUsers": configuredUsers,
+		"mode":            "fallback",
+		"supported":       false,
+		"fallback":        true,
+		"reason":          gatewayRuntimeFallbackReason,
+		"error":           gatewayRuntimeFallbackReason,
+		"message":         gatewayRuntimeFallbackReason,
+		"webhook":         webhookPayload,
+	}
 	if degraded {
 		status["degraded"] = true
 		status["fallback"] = true
@@ -849,18 +888,33 @@ func (h *Handler) gatewayReload(w http.ResponseWriter, r *http.Request) error {
 		platforms = append(platforms, "webhook")
 	}
 	narratorRuntimeAttached := h.gatewayNarratorRuntime() != nil
-	status := map[string]any{"started": false, "platforms": platforms, "mode": "fallback", "supported": false, "reason": "Persistent gateway runtimes are not bundled in go_backend", "webhook": map[string]any{"configured": cfg.Enabled && cfg.Secret != "", "supported": narratorRuntimeAttached, "fallback": !narratorRuntimeAttached}}
+	status := map[string]any{
+		"started":   false,
+		"platforms": platforms,
+		"mode":      "fallback",
+		"supported": false,
+		"fallback":  true,
+		"reason":    gatewayRuntimeFallbackReason,
+		"error":     gatewayRuntimeFallbackReason,
+		"message":   gatewayRuntimeFallbackReason,
+		"webhook": gatewayWebhookStatusPayload(
+			cfg.Enabled && cfg.Secret != "",
+			narratorRuntimeAttached,
+		),
+	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "reloaded": []string{}, "status": status})
 	return nil
 }
 
+const gatewayWeixinQRUnsupportedReason = "Weixin QR gateway runtime is not bundled in go_backend."
+
 func (h *Handler) gatewayWeixinQRStart(w http.ResponseWriter, r *http.Request) error {
-	httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "status": "unavailable", "supported": false, "fallback": true, "code": "WEIXIN_QR_UNSUPPORTED", "qrcodeUrl": "", "qrcodeToken": "", "message": "Weixin QR gateway runtime is not bundled in go_backend"})
+	httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "status": "unavailable", "supported": false, "fallback": true, "code": "WEIXIN_QR_UNSUPPORTED", "qrcodeUrl": "", "qrcodeToken": "", "reason": gatewayWeixinQRUnsupportedReason, "error": gatewayWeixinQRUnsupportedReason, "message": gatewayWeixinQRUnsupportedReason})
 	return nil
 }
 
 func (h *Handler) gatewayWeixinQRPoll(w http.ResponseWriter, r *http.Request) error {
-	httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "status": "unavailable", "supported": false, "fallback": true, "code": "WEIXIN_QR_UNSUPPORTED", "message": "No active QR session: Weixin QR gateway runtime is not bundled in go_backend"})
+	httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{"ok": false, "status": "unavailable", "supported": false, "fallback": true, "code": "WEIXIN_QR_UNSUPPORTED", "reason": gatewayWeixinQRUnsupportedReason, "error": gatewayWeixinQRUnsupportedReason, "message": "No active QR session: " + gatewayWeixinQRUnsupportedReason})
 	return nil
 }
 
@@ -870,6 +924,7 @@ func gatewayFallbackPayload(code, message string) map[string]any {
 		"supported": false,
 		"fallback":  true,
 		"code":      code,
+		"reason":    message,
 		"error":     message,
 		"message":   message,
 		"platform":  "webhook",
@@ -1680,7 +1735,10 @@ func updateProgressPayload(phase string, bytesDownloaded, totalBytes int64, erro
 func updateDownloadErrorPayload(version, message string) map[string]any {
 	payload := updateProgressPayload("error", 0, 0, message)
 	payload["success"] = false
+	payload["code"] = "UPDATE_DOWNLOAD_FAILED"
 	payload["version"] = version
+	payload["reason"] = message
+	payload["error"] = message
 	payload["message"] = message
 	payload["selfUpdateAvailable"] = false
 	payload["canAutoRestart"] = false
@@ -1732,7 +1790,7 @@ func updateDownloadPercent(bytesDownloaded, totalBytes int64) int {
 func updateSHA512Matches(expected, actualHex, actualBase64 string) bool {
 	expected = strings.TrimSpace(expected)
 	if expected == "" {
-		return true
+		return false
 	}
 	expected = strings.TrimPrefix(expected, "sha512-")
 	return strings.EqualFold(expected, actualHex) || expected == actualBase64
@@ -2108,7 +2166,8 @@ func (h *Handler) kiroMcpTools(w http.ResponseWriter, r *http.Request) error {
 		httpx.WriteJSON(w, http.StatusOK, result)
 		return nil
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id": "go-backend-kiro-tools", "jsonrpc": "2.0", "tools": kiroFallbackMcpTools(), "result": map[string]any{"tools": kiroFallbackMcpTools()}, "fallback": true})
+	reason := "Kiro MCP tools bridge is unavailable in go_backend; returning the built-in fallback tool list."
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id": "go-backend-kiro-tools", "jsonrpc": "2.0", "tools": kiroFallbackMcpTools(), "result": map[string]any{"tools": kiroFallbackMcpTools()}, "fallback": true, "reason": reason, "error": reason, "message": reason})
 	return nil
 }
 
@@ -2128,11 +2187,14 @@ func (h *Handler) kiroMcpSearch(w http.ResponseWriter, r *http.Request) error {
 		httpx.WriteJSON(w, http.StatusOK, result)
 		return nil
 	} else {
+		reason := "Kiro MCP search unavailable in go_backend: " + err.Error()
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{
 			"id":       "go-backend-kiro-search",
 			"jsonrpc":  "2.0",
-			"error":    map[string]any{"code": -32000, "message": "Kiro MCP search unavailable in go_backend: " + err.Error()},
+			"error":    map[string]any{"code": -32000, "message": reason},
 			"fallback": true,
+			"reason":   reason,
+			"message":  reason,
 		})
 		return nil
 	}
@@ -2143,14 +2205,7 @@ func (h *Handler) kiroChat(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("event: done\ndata: \n\n"))
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	httpx.WriteFeatureDisabled(w, "kiro.chat", "Kiro chat streaming is not implemented in go_backend; use the narrator/provider agent routes or the TypeScript backend for Kiro chat streaming.")
 	return nil
 }
 
@@ -3418,7 +3473,8 @@ func numericQuery(r *http.Request, key string, fallback float64) float64 {
 }
 
 func (h *Handler) nugLogin(w http.ResponseWriter, r *http.Request) error {
-	provider, baseURL, err := h.nugProvider(chi.URLParam(r, "id"))
+	providerID := chi.URLParam(r, "id")
+	provider, baseURL, err := h.nugProvider(providerID)
 	if err != nil {
 		return err
 	}
@@ -3461,8 +3517,29 @@ func (h *Handler) nugLogin(w http.ResponseWriter, r *http.Request) error {
 		httpx.WriteJSON(w, status, map[string]any{"error": err.Error()})
 		return nil
 	}
+	apiKey := firstNonEmpty(stringMap(apiKeyData, "apiKey", ""), stringMap(apiKeyData, "api_key", ""))
+	userData, _ := loginData["user"].(map[string]any)
+	loginUsername := firstNonEmpty(
+		stringMap(userData, "username", ""),
+		stringMap(userData, "name", ""),
+		username,
+	)
+	userID := firstNonEmpty(
+		stringMap(userData, "id", ""),
+		stringMap(userData, "userId", ""),
+		stringMap(userData, "user_id", ""),
+	)
+	if apiKey != "" {
+		if err := h.updateNugProviderCredentials(providerID, map[string]any{
+			"apiKey":      apiKey,
+			"nugUsername": loginUsername,
+			"nugUserId":   userID,
+		}); err != nil {
+			return err
+		}
+	}
 	_ = provider
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"apiKey": apiKeyData["apiKey"], "user": loginData["user"]})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"apiKey": apiKey, "user": loginData["user"]})
 	return nil
 }
 
@@ -3593,6 +3670,15 @@ func (h *Handler) NugOAuthCallback(w http.ResponseWriter, r *http.Request) error
 }
 
 func (h *Handler) updateNugProviderAfterOAuth(providerID string, tokenData map[string]any) error {
+	return h.updateNugProviderCredentials(providerID, map[string]any{
+		"apiKey":        stringMap(tokenData, "api_key", ""),
+		"oauthDeviceId": stringMap(tokenData, "device_id", ""),
+		"nugUsername":   stringMap(tokenData, "username", ""),
+		"nugUserId":     stringMap(tokenData, "user_id", ""),
+	})
+}
+
+func (h *Handler) updateNugProviderCredentials(providerID string, updates map[string]any) error {
 	if h.Settings == nil {
 		return errorsNew("Settings unavailable")
 	}
@@ -3604,17 +3690,10 @@ func (h *Handler) updateNugProviderAfterOAuth(providerID string, tokenData map[s
 		if !ok || stringMap(provider, "id", "") != providerID {
 			continue
 		}
-		if apiKey := stringMap(tokenData, "api_key", ""); apiKey != "" {
-			provider["apiKey"] = apiKey
-		}
-		if deviceID := stringMap(tokenData, "device_id", ""); deviceID != "" {
-			provider["oauthDeviceId"] = deviceID
-		}
-		if username := stringMap(tokenData, "username", ""); username != "" {
-			provider["nugUsername"] = username
-		}
-		if userID := stringMap(tokenData, "user_id", ""); userID != "" {
-			provider["nugUserId"] = userID
+		for key, value := range updates {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				provider[key] = value
+			}
 		}
 		updated = true
 		break
@@ -3666,7 +3745,7 @@ func (h *Handler) nugProvider(providerID string) (map[string]any, string, error)
 		}
 		return provider, baseURL, nil
 	}
-	return nil, "", httpx.NotFound("Provider")
+	return nil, "", httpx.Error(http.StatusNotFound, "NOT_FOUND", "Provider \""+providerID+"\" not found")
 }
 
 func (h *Handler) createNugAPIKey(ctx context.Context, client *http.Client, baseURL, sessionToken, name string) (map[string]any, int, error) {
@@ -3749,22 +3828,98 @@ func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) error {
 	return rows.Err()
 }
 
+var adminUsernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+func (h *Handler) adminUserCount(ctx context.Context) (int, error) {
+	var count int
+	if err := h.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE role = 'admin'`).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (h *Handler) adminUserResponse(ctx context.Context, userID string) (map[string]any, error) {
+	var idValue, username, role string
+	if err := h.DB.QueryRowContext(ctx, `SELECT id, username, role FROM users WHERE id = ?`, userID).Scan(&idValue, &username, &role); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, httpx.NotFound("User")
+		}
+		return nil, err
+	}
+	return map[string]any{"id": idValue, "username": username, "role": role}, nil
+}
+
 func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) error {
 	var body map[string]any
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	if _, hasUsername := body["username"]; !hasUsername {
+		if _, hasPassword := body["password"]; !hasPassword {
+			if _, hasRole := body["role"]; !hasRole {
+				return httpx.BadRequest("At least one field is required")
+			}
+		}
+	}
+
+	ctx := r.Context()
+	targetID := chi.URLParam(r, "id")
+	var targetRole string
+	if err := h.DB.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, targetID).Scan(&targetRole); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return httpx.NotFound("User")
+		}
+		return err
+	}
+
 	sets := []string{}
 	args := []any{}
-	if username, ok := body["username"].(string); ok && strings.TrimSpace(username) != "" {
+	if rawUsername, ok := body["username"]; ok {
+		username, ok := rawUsername.(string)
+		if !ok {
+			return httpx.ValidationError("username must be a string")
+		}
+		username = strings.TrimSpace(username)
+		if !adminUsernamePattern.MatchString(username) || len(username) < 3 || len(username) > 50 {
+			return httpx.ValidationError("username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores")
+		}
+		var existingID string
+		err := h.DB.QueryRowContext(ctx, `SELECT id FROM users WHERE username = ? AND id != ? LIMIT 1`, username, targetID).Scan(&existingID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if existingID != "" {
+			return httpx.Error(http.StatusConflict, "USERNAME_TAKEN", "Username already taken")
+		}
 		sets = append(sets, "username = ?")
-		args = append(args, strings.TrimSpace(username))
+		args = append(args, username)
 	}
-	if role, ok := body["role"].(string); ok && (role == "admin" || role == "user") {
+	if rawRole, ok := body["role"]; ok {
+		role, ok := rawRole.(string)
+		if !ok || (role != "admin" && role != "user") {
+			return httpx.ValidationError("role must be admin or user")
+		}
+		claims := auth.UserFromContext(ctx)
+		if claims != nil && claims.Subject == targetID && role != "admin" {
+			return httpx.Error(http.StatusBadRequest, "SELF_DEMOTE", "Cannot demote yourself")
+		}
+		if targetRole == "admin" && role == "user" {
+			adminCount, err := h.adminUserCount(ctx)
+			if err != nil {
+				return err
+			}
+			if adminCount <= 1 {
+				return httpx.Error(http.StatusBadRequest, "LAST_ADMIN", "Cannot demote the last administrator")
+			}
+		}
 		sets = append(sets, "role = ?")
 		args = append(args, role)
 	}
-	if password, ok := body["password"].(string); ok && password != "" {
+	if rawPassword, ok := body["password"]; ok {
+		password, ok := rawPassword.(string)
+		if !ok || len(password) < 8 || len(password) > 128 {
+			return httpx.ValidationError("password must be 8-128 characters")
+		}
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
 		if err != nil {
 			return err
@@ -3775,22 +3930,51 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) error {
 	if len(sets) == 0 {
 		return httpx.BadRequest("At least one field is required")
 	}
-	args = append(args, chi.URLParam(r, "id"))
-	if _, err := h.DB.ExecContext(r.Context(), `UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+	args = append(args, targetID)
+	res, err := h.DB.ExecContext(ctx, `UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		return httpx.NotFound("User")
+	}
+	user, err := h.adminUserResponse(ctx, targetID)
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, user)
 	return nil
 }
 
 func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) error {
-	claims := auth.UserFromContext(r.Context())
-	if claims != nil && claims.Subject == chi.URLParam(r, "id") {
-		return httpx.BadRequest("Cannot delete your own account")
+	ctx := r.Context()
+	targetID := chi.URLParam(r, "id")
+	claims := auth.UserFromContext(ctx)
+	if claims != nil && claims.Subject == targetID {
+		return httpx.Error(http.StatusBadRequest, "SELF_DELETE", "Cannot delete your own account")
 	}
-	_, err := h.DB.ExecContext(r.Context(), `DELETE FROM users WHERE id = ?`, chi.URLParam(r, "id"))
+	var targetRole string
+	if err := h.DB.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, targetID).Scan(&targetRole); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return httpx.NotFound("User")
+		}
+		return err
+	}
+	if targetRole == "admin" {
+		adminCount, err := h.adminUserCount(ctx)
+		if err != nil {
+			return err
+		}
+		if adminCount <= 1 {
+			return httpx.Error(http.StatusBadRequest, "LAST_ADMIN", "Cannot delete the last administrator")
+		}
+	}
+	res, err := h.DB.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, targetID)
 	if err != nil {
 		return err
+	}
+	if affected, err := res.RowsAffected(); err == nil && affected == 0 {
+		return httpx.NotFound("User")
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -3976,6 +4160,7 @@ func writeTerminalAdminUnsupported(w http.ResponseWriter, feature, message strin
 		"feature":   feature,
 		"supported": false,
 		"fallback":  true,
+		"reason":    message,
 		"error":     message,
 		"message":   message,
 	})
@@ -5116,7 +5301,7 @@ func (h *Handler) codexSetGlobalProxy(w http.ResponseWriter, r *http.Request) er
 
 func (h *Handler) patchCodexSetting(key string, value any) error {
 	if h.Settings == nil {
-		return nil
+		return httpx.NotImplemented("providers.codex.settingsStore")
 	}
 	_, err := h.Settings.Patch(map[string]any{"codex": map[string]any{key: value}})
 	return err
@@ -6703,7 +6888,7 @@ func (h *Handler) loadKiroUsageCache() map[string]any {
 
 func (h *Handler) patchKiroSetting(key string, value any) error {
 	if h.Settings == nil {
-		return nil
+		return httpx.NotImplemented("providers.kiro.settingsStore")
 	}
 	_, err := h.Settings.Patch(map[string]any{"kiro": map[string]any{key: value}})
 	return err
@@ -6995,18 +7180,30 @@ func (h *Handler) scanRuntime(w http.ResponseWriter, r *http.Request) error {
 	}
 	terminalPayload := map[string]any{"running": running, "exited": exited, "orphanSockets": orphanSockets, "supported": terminalSupported, "degraded": terminalDegraded}
 	if terminalDegraded {
+		reason := terminalError
+		if reason == "" {
+			reason = "terminal runtime state query failed"
+		}
 		terminalPayload["fallback"] = true
 		terminalPayload["fallbacks"] = terminalFallbacks
-		terminalPayload["error"] = terminalError
+		terminalPayload["reason"] = reason
+		terminalPayload["error"] = reason
+		terminalPayload["message"] = reason
 	}
 	if !terminalSupported {
+		reason := "terminal runtime state table is not available"
 		terminalPayload["fallback"] = true
-		terminalPayload["message"] = "terminal runtime state table is not available"
+		terminalPayload["reason"] = reason
+		terminalPayload["error"] = reason
+		terminalPayload["message"] = reason
 	}
 	containersRunning, containersStopped, podmanAvailable := podmanCounts(r.Context())
 	containerPayload := map[string]any{"running": containersRunning, "stopped": containersStopped, "podmanAvailable": podmanAvailable, "supported": podmanAvailable, "fallback": !podmanAvailable}
 	if !podmanAvailable {
-		containerPayload["message"] = "podman is not available; runtime scan uses persisted/non-container state only"
+		reason := "podman is not available; runtime scan uses persisted/non-container state only"
+		containerPayload["reason"] = reason
+		containerPayload["error"] = reason
+		containerPayload["message"] = reason
 	}
 	browserPayload := h.browserRuntimePayload(r.Context())
 	result := map[string]any{
@@ -7817,13 +8014,23 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		available = append(available, entry)
 	}
+	availablePage := intQuery(r, "availablePage", 0)
+	unavailablePage := intQuery(r, "unavailablePage", 0)
+	pageSize := intQuery(r, "pageSize", 0)
+	pagedAvailable := paginateCodexStatusEntries(available, availablePage, pageSize)
+	pagedUnavailable := paginateCodexStatusEntries(unavailable, unavailablePage, pageSize)
+	pagedEntries := make([]map[string]any, 0, len(pagedAvailable)+len(pagedUnavailable))
+	pagedEntries = append(pagedEntries, pagedAvailable...)
+	pagedEntries = append(pagedEntries, pagedUnavailable...)
+
 	codexAuthMu.Lock()
 	lastBrowserAuthError := ""
 	if codexBrowser != nil && codexBrowser.Err != "" {
 		lastBrowserAuthError = codexBrowser.Err
 	}
 	codexAuthMu.Unlock()
-	_, usageSummary, usageForecast, usageCache := buildCodexUsageArtifacts(entries)
+	_, usageSummary, usageForecast, _ := buildCodexUsageArtifacts(entries)
+	usageCache := codexUsageCacheForEntries(pagedEntries)
 	usageScheduler := map[string]any{"scheduledCredentialCount": numericMapOr(usageSummary, "scheduledAccountCount", 0), "dueCredentialCount": 0, "started": false}
 	loadBalancingMode := h.codexSettingsValue("loadBalancingMode", "tier-balanced")
 	tierOrder, _ := h.codexSettingsValue("tierOrder", []any{}).([]any)
@@ -7831,11 +8038,40 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	if len(effectiveTierOrder) == 0 {
 		effectiveTierOrder = []any{"pro", "prolite", "plus", "team", "free"}
 	}
-	payload := map[string]any{"entries": entries, "availableEntries": available, "unavailableEntries": unavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "proxy": h.codexSettingsValue("proxy", ""), "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
+	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "proxy": h.codexSettingsValue("proxy", ""), "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
 	if lastBrowserAuthError != "" {
 		payload["lastBrowserAuthError"] = lastBrowserAuthError
 	}
 	httpx.WriteJSON(w, http.StatusOK, payload)
+}
+
+func paginateCodexStatusEntries(entries []map[string]any, page int, pageSize int) []map[string]any {
+	if pageSize <= 0 || page < 1 {
+		return entries
+	}
+	start := (page - 1) * pageSize
+	if start >= len(entries) {
+		return []map[string]any{}
+	}
+	end := start + pageSize
+	if end > len(entries) {
+		end = len(entries)
+	}
+	return entries[start:end]
+}
+
+func codexUsageCacheForEntries(entries []map[string]any) map[string]any {
+	cache := map[string]any{}
+	for _, entry := range entries {
+		usage, ok := entry["usage"].(map[string]any)
+		if !ok || usage == nil {
+			continue
+		}
+		if entryID := stringMap(entry, "id", ""); entryID != "" {
+			cache[entryID] = usage
+		}
+	}
+	return cache
 }
 
 func modelList(w http.ResponseWriter, r *http.Request) {

@@ -3,8 +3,10 @@ package userprefs
 import (
 	"database/sql"
 	"encoding/json"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -69,6 +71,7 @@ var prefFieldMap = map[string]string{
 	"commands":                "commands",
 	"sendMode":                "send_mode",
 	"setupWizardCompleted":    "setup_wizard_completed",
+	"gatewayConfig":           "gateway_config",
 }
 
 func (h *Handler) get(w http.ResponseWriter, r *http.Request) error {
@@ -97,6 +100,12 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) error {
 	}
 	var body map[string]any
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+		return err
+	}
+	if err := validatePreferencePatch(body); err != nil {
+		return err
+	}
+	if err := h.preserveMaskedSecrets(r, userID, body); err != nil {
 		return err
 	}
 	sets := []string{}
@@ -304,6 +313,15 @@ func (h *Handler) ensure(r *http.Request, userID string) error {
 }
 
 func (h *Handler) load(r *http.Request, userID string) (map[string]any, error) {
+	out, err := h.loadRaw(r, userID)
+	if err != nil {
+		return nil, err
+	}
+	redactPreferenceSecrets(out)
+	return out, nil
+}
+
+func (h *Handler) loadRaw(r *http.Request, userID string) (map[string]any, error) {
 	if err := h.ensure(r, userID); err != nil {
 		return nil, err
 	}
@@ -338,6 +356,620 @@ func (h *Handler) load(r *http.Request, userID string) (map[string]any, error) {
 	out["graphViewports"] = decodeObject(out["graphViewports"])
 	out["gatewayConfig"] = decodeObject(out["gatewayConfig"])
 	return out, nil
+}
+
+var preferenceSecretFields = []string{
+	"notifyDingtalkWebhook",
+	"notifyDingtalkSecret",
+	"notifyFeishuWebhook",
+	"notifyFeishuSecret",
+}
+
+var preferenceWebhookFields = map[string]bool{
+	"notifyDingtalkWebhook": true,
+	"notifyFeishuWebhook":   true,
+}
+
+var commandNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+var gatewayPlatformSecretFields = []string{"token", "botToken", "appToken", "appSecret", "secret", "clientSecret"}
+
+func validatePreferencePatch(patch map[string]any) error {
+	for key, value := range patch {
+		column, ok := prefFieldMap[key]
+		if ok && boolFields[column] {
+			if _, valid := value.(bool); !valid {
+				return httpx.ValidationError(key + " must be a boolean")
+			}
+		}
+	}
+	if err := validateEnumPreference(patch, "language", []string{"en", "zh-CN"}); err != nil {
+		return err
+	}
+	if err := validateEnumPreference(patch, "sendMode", []string{"enter", "ctrl+enter"}); err != nil {
+		return err
+	}
+	if err := validateEnumPreference(patch, "notifySoundType", []string{"builtin", "custom"}); err != nil {
+		return err
+	}
+	if err := validateStringPreference(patch, "terminalTheme", 1, 50, false); err != nil {
+		return err
+	}
+	if err := validateStringPreference(patch, "notifySoundBuiltin", 0, 50, false); err != nil {
+		return err
+	}
+	if err := validateStringPreference(patch, "notifySoundFileId", 0, 50, true); err != nil {
+		return err
+	}
+	if err := validateTerminalFontSize(patch); err != nil {
+		return err
+	}
+	if err := validateCommandsPreference(patch); err != nil {
+		return err
+	}
+	if err := validateGatewayConfigPreference(patch); err != nil {
+		return err
+	}
+	for _, field := range preferenceSecretFields {
+		value, ok := patch[field]
+		if !ok {
+			continue
+		}
+		text := stringValue(value)
+		if len(text) > 500 {
+			return httpx.ValidationError(field + " must be at most 500 characters")
+		}
+		if preferenceWebhookFields[field] && text != "" && !strings.HasPrefix(text, "*") && !strings.HasPrefix(text, "https://") {
+			return httpx.ValidationError(field + " must start with https://")
+		}
+	}
+	return nil
+}
+
+func validateEnumPreference(patch map[string]any, key string, allowed []string) error {
+	value, ok := patch[key]
+	if !ok {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(key + " must be a string")
+	}
+	for _, item := range allowed {
+		if text == item {
+			return nil
+		}
+	}
+	return httpx.ValidationError(key + " is not supported")
+}
+
+func validateStringPreference(patch map[string]any, key string, minLen int, maxLen int, nullable bool) error {
+	value, ok := patch[key]
+	if !ok {
+		return nil
+	}
+	if value == nil && nullable {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(key + " must be a string")
+	}
+	if len(text) < minLen {
+		return httpx.ValidationError(key + " must not be empty")
+	}
+	if len(text) > maxLen {
+		return httpx.ValidationError(key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func validateTerminalFontSize(patch map[string]any) error {
+	value, ok := patch["terminalFontSize"]
+	if !ok {
+		return nil
+	}
+	number, ok := value.(float64)
+	if !ok || number != math.Trunc(number) {
+		return httpx.ValidationError("terminalFontSize must be an integer")
+	}
+	if number < 8 || number > 32 {
+		return httpx.ValidationError("terminalFontSize must be between 8 and 32")
+	}
+	patch["terminalFontSize"] = int(number)
+	return nil
+}
+
+func validateCommandsPreference(patch map[string]any) error {
+	value, ok := patch["commands"]
+	if !ok {
+		return nil
+	}
+	commands, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("commands must be an array")
+	}
+	if len(commands) > 100 {
+		return httpx.ValidationError("commands must contain at most 100 items")
+	}
+	for i, item := range commands {
+		command, ok := item.(map[string]any)
+		if !ok {
+			return httpx.ValidationError("commands[" + strconv.Itoa(i) + "] must be an object")
+		}
+		if err := validateCommandDefinition(command, "commands["+strconv.Itoa(i)+"]"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCommandDefinition(command map[string]any, path string) error {
+	name, err := requiredStringField(command, "name", path, 1, 50)
+	if err != nil {
+		return err
+	}
+	if !commandNameRe.MatchString(name) {
+		return httpx.ValidationError(path + ".name must contain only letters, numbers, underscores, or dashes")
+	}
+	if _, err := requiredStringField(command, "prompt", path, 1, 400000); err != nil {
+		return err
+	}
+	if err := optionalStringField(command, "description", path, 0, 500); err != nil {
+		return err
+	}
+	if err := optionalBoolField(command, "runBashFirst", path); err != nil {
+		return err
+	}
+	if err := optionalStringField(command, "bashCommand", path, 0, 400000); err != nil {
+		return err
+	}
+	if err := validateCommandParams(command, path); err != nil {
+		return err
+	}
+	return validateCommandModelOverride(command, path)
+}
+
+func validateCommandParams(command map[string]any, path string) error {
+	value, ok := command["params"]
+	if !ok {
+		return nil
+	}
+	params, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(path + ".params must be an array")
+	}
+	if len(params) > 20 {
+		return httpx.ValidationError(path + ".params must contain at most 20 items")
+	}
+	for i, item := range params {
+		param, ok := item.(map[string]any)
+		paramPath := path + ".params[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(paramPath + " must be an object")
+		}
+		if _, err := requiredStringField(param, "name", paramPath, 1, 50); err != nil {
+			return err
+		}
+		if err := optionalStringField(param, "description", paramPath, 0, 500); err != nil {
+			return err
+		}
+		if err := optionalBoolField(param, "required", paramPath); err != nil {
+			return err
+		}
+		if err := optionalStringField(param, "defaultValue", paramPath, 0, 1000); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateCommandModelOverride(command map[string]any, path string) error {
+	value, ok := command["modelOverride"]
+	if !ok {
+		return nil
+	}
+	override, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError(path + ".modelOverride must be an object")
+	}
+	if _, err := requiredStringField(override, "model", path+".modelOverride", 1, 100); err != nil {
+		return err
+	}
+	mode, err := requiredStringField(override, "mode", path+".modelOverride", 1, 20)
+	if err != nil {
+		return err
+	}
+	if mode != "temporary" && mode != "permanent" {
+		return httpx.ValidationError(path + ".modelOverride.mode is not supported")
+	}
+	return nil
+}
+
+func requiredStringField(item map[string]any, key string, path string, minLen int, maxLen int) (string, error) {
+	value, ok := item[key]
+	if !ok {
+		return "", httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if len(text) < minLen {
+		return "", httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if len(text) > maxLen {
+		return "", httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return text, nil
+}
+
+func optionalStringField(item map[string]any, key string, path string, minLen int, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if len(text) < minLen {
+		return httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if len(text) > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func optionalBoolField(item map[string]any, key string, path string) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	if _, ok := value.(bool); !ok {
+		return httpx.ValidationError(path + "." + key + " must be a boolean")
+	}
+	return nil
+}
+
+func optionalIntRangeField(item map[string]any, key string, path string, minValue int, maxValue int) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	number, ok := value.(float64)
+	if !ok || number != math.Trunc(number) {
+		return httpx.ValidationError(path + "." + key + " must be an integer")
+	}
+	if number < float64(minValue) || number > float64(maxValue) {
+		return httpx.ValidationError(path + "." + key + " must be between " + strconv.Itoa(minValue) + " and " + strconv.Itoa(maxValue))
+	}
+	item[key] = int(number)
+	return nil
+}
+
+func optionalEnumField(item map[string]any, key string, path string, allowed []string) error {
+	value, ok := item[key]
+	if !ok {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	for _, allowedValue := range allowed {
+		if text == allowedValue {
+			return nil
+		}
+	}
+	return httpx.ValidationError(path + "." + key + " is not supported")
+}
+
+func validateGatewayConfigPreference(patch map[string]any) error {
+	value, ok := patch["gatewayConfig"]
+	if !ok {
+		return nil
+	}
+	gateway, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("gatewayConfig must be an object")
+	}
+	path := "gatewayConfig"
+	if err := optionalBoolField(gateway, "enabled", path); err != nil {
+		return err
+	}
+	if err := optionalStringField(gateway, "defaultProjectId", path, 0, 50); err != nil {
+		return err
+	}
+	if err := optionalStringField(gateway, "defaultChapterId", path, 0, 50); err != nil {
+		return err
+	}
+	if err := validateGatewayPermissionMode(gateway); err != nil {
+		return err
+	}
+	if err := optionalIntRangeField(gateway, "sessionIdleMinutes", path, 0, 43200); err != nil {
+		return err
+	}
+	if err := optionalIntRangeField(gateway, "rateLimitPerMinute", path, 0, 1000); err != nil {
+		return err
+	}
+	if err := optionalBoolField(gateway, "streaming", path); err != nil {
+		return err
+	}
+	platformsValue, ok := gateway["platforms"]
+	if !ok {
+		return nil
+	}
+	platforms, ok := platformsValue.([]any)
+	if !ok {
+		return httpx.ValidationError("gatewayConfig.platforms must be an array")
+	}
+	if len(platforms) > 10 {
+		return httpx.ValidationError("gatewayConfig.platforms must contain at most 10 items")
+	}
+	for i, item := range platforms {
+		platform, ok := item.(map[string]any)
+		platformPath := "gatewayConfig.platforms[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(platformPath + " must be an object")
+		}
+		if err := validateGatewayPlatformConfig(platform, platformPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGatewayPermissionMode(gateway map[string]any) error {
+	value, ok := gateway["defaultPermissionMode"]
+	if !ok {
+		return nil
+	}
+	mode, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError("gatewayConfig.defaultPermissionMode must be a string")
+	}
+	switch mode {
+	case "allowByDefault":
+		gateway["defaultPermissionMode"] = "acceptEdits"
+		return nil
+	case "denyByDefault":
+		gateway["defaultPermissionMode"] = "dontAsk"
+		return nil
+	case "plan":
+		gateway["defaultPermissionMode"] = "default"
+		return nil
+	case "default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk":
+		return nil
+	default:
+		return httpx.ValidationError("gatewayConfig.defaultPermissionMode is not supported")
+	}
+}
+
+func validateGatewayPlatformConfig(platform map[string]any, path string) error {
+	platformName, err := requiredStringField(platform, "platform", path, 1, 50)
+	if err != nil {
+		return err
+	}
+	allowedPlatforms := []string{"telegram", "discord", "slack", "feishu", "webhook", "weixin", "qqbot"}
+	allowed := false
+	for _, item := range allowedPlatforms {
+		if platformName == item {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		return httpx.ValidationError(path + ".platform is not supported")
+	}
+	if err := optionalBoolField(platform, "enabled", path); err != nil {
+		return err
+	}
+	if _, ok := platform["enabled"]; !ok {
+		return httpx.ValidationError(path + ".enabled is required")
+	}
+	for _, field := range []string{"token", "botToken", "appToken", "appSecret", "secret", "clientSecret"} {
+		if err := optionalStringField(platform, field, path, 0, 500); err != nil {
+			return err
+		}
+	}
+	for _, field := range []string{"appId", "accountId"} {
+		if err := optionalStringField(platform, field, path, 0, 200); err != nil {
+			return err
+		}
+	}
+	if err := optionalStringField(platform, "baseUrl", path, 0, 500); err != nil {
+		return err
+	}
+	if err := optionalEnumField(platform, "dmPolicy", path, []string{"open", "allowlist", "disabled"}); err != nil {
+		return err
+	}
+	if err := optionalEnumField(platform, "groupPolicy", path, []string{"open", "allowlist", "disabled"}); err != nil {
+		return err
+	}
+	if err := optionalBoolField(platform, "markdownSupport", path); err != nil {
+		return err
+	}
+	if err := optionalBoolField(platform, "sandbox", path); err != nil {
+		return err
+	}
+	if err := validateGatewayStringArray(platform, "allowedGroups", path); err != nil {
+		return err
+	}
+	if err := validateGatewayStringArray(platform, "allowedUsers", path); err != nil {
+		return err
+	}
+	return validateGatewaySTT(platform, path)
+}
+
+func validateGatewayStringArray(platform map[string]any, key string, path string) error {
+	value, ok := platform[key]
+	if !ok {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be an array")
+	}
+	if len(items) > 50 {
+		return httpx.ValidationError(path + "." + key + " must contain at most 50 items")
+	}
+	for i, item := range items {
+		text, ok := item.(string)
+		itemPath := path + "." + key + "[" + strconv.Itoa(i) + "]"
+		if !ok {
+			return httpx.ValidationError(itemPath + " must be a string")
+		}
+		if len(text) > 100 {
+			return httpx.ValidationError(itemPath + " must be at most 100 characters")
+		}
+	}
+	return nil
+}
+
+func validateGatewaySTT(platform map[string]any, path string) error {
+	value, ok := platform["stt"]
+	if !ok {
+		return nil
+	}
+	stt, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError(path + ".stt must be an object")
+	}
+	sttPath := path + ".stt"
+	if _, err := requiredStringField(stt, "apiKey", sttPath, 0, 500); err != nil {
+		return err
+	}
+	if err := optionalStringField(stt, "baseUrl", sttPath, 0, 500); err != nil {
+		return err
+	}
+	return optionalStringField(stt, "model", sttPath, 0, 100)
+}
+
+func (h *Handler) preserveMaskedSecrets(r *http.Request, userID string, patch map[string]any) error {
+	if !patchContainsMaskedSecret(patch) {
+		return nil
+	}
+	current, err := h.loadRaw(r, userID)
+	if err != nil {
+		return err
+	}
+	for _, field := range preferenceSecretFields {
+		if value, ok := patch[field]; ok && isMaskedSecret(value) {
+			patch[field] = stringValue(current[field])
+		}
+	}
+	incomingGateway, ok := patch["gatewayConfig"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	currentGateway, _ := current["gatewayConfig"].(map[string]any)
+	preserveGatewayPlatformSecrets(currentGateway, incomingGateway)
+	return nil
+}
+
+func patchContainsMaskedSecret(patch map[string]any) bool {
+	for _, field := range preferenceSecretFields {
+		if value, ok := patch[field]; ok && isMaskedSecret(value) {
+			return true
+		}
+	}
+	gateway, ok := patch["gatewayConfig"].(map[string]any)
+	return ok && gatewayConfigHasMaskedSecrets(gateway)
+}
+
+func redactPreferenceSecrets(pref map[string]any) {
+	for _, field := range preferenceSecretFields {
+		if _, ok := pref[field]; ok {
+			pref[field] = maskSecret(stringValue(pref[field]))
+		}
+	}
+	gateway, ok := pref["gatewayConfig"].(map[string]any)
+	if ok {
+		maskGatewayPlatformSecrets(gateway)
+	}
+}
+
+func gatewayConfigHasMaskedSecrets(gateway map[string]any) bool {
+	for _, platform := range gatewayPlatformMaps(gateway) {
+		for _, field := range gatewayPlatformSecretFields {
+			if isMaskedSecret(platform[field]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func maskGatewayPlatformSecrets(gateway map[string]any) {
+	platforms := gatewayPlatformMaps(gateway)
+	if platforms == nil {
+		return
+	}
+	for _, platform := range platforms {
+		for _, field := range gatewayPlatformSecretFields {
+			platform[field] = maskSecret(stringValue(platform[field]))
+		}
+	}
+}
+
+func preserveGatewayPlatformSecrets(current, incoming map[string]any) {
+	incomingPlatforms := gatewayPlatformMaps(incoming)
+	if len(incomingPlatforms) == 0 {
+		return
+	}
+	currentByPlatform := map[string]map[string]any{}
+	for _, platform := range gatewayPlatformMaps(current) {
+		if key := stringValue(platform["platform"]); key != "" {
+			currentByPlatform[key] = platform
+		}
+	}
+	for _, platform := range incomingPlatforms {
+		original := currentByPlatform[stringValue(platform["platform"])]
+		for _, field := range gatewayPlatformSecretFields {
+			if isMaskedSecret(platform[field]) {
+				platform[field] = stringValue(original[field])
+			}
+		}
+	}
+}
+
+func gatewayPlatformMaps(gateway map[string]any) []map[string]any {
+	if gateway == nil {
+		return nil
+	}
+	items, ok := gateway["platforms"].([]any)
+	if !ok {
+		return nil
+	}
+	platforms := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		platform, ok := item.(map[string]any)
+		if ok {
+			platforms = append(platforms, platform)
+		}
+	}
+	return platforms
+}
+
+func isMaskedSecret(value any) bool {
+	return strings.HasPrefix(stringValue(value), "*")
+}
+
+func maskSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	if len(value) <= 4 {
+		return strings.Repeat("*", len(value))
+	}
+	return "********" + value[len(value)-4:]
+}
+
+func stringValue(value any) string {
+	s, _ := value.(string)
+	return s
 }
 
 func (h *Handler) recentTabs(r *http.Request, userID string) ([]map[string]any, error) {

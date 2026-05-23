@@ -48,37 +48,40 @@ func (a *OpenAIChatCompletionsAdapter) Chat(ctx context.Context, params ChatPara
 	ch := make(chan StreamEvent, 16)
 	client := a.Client
 	if client == nil {
-		client = defaultProviderHTTPClient()
+		client = providerHTTPClient(a.Provider)
 	}
 	messages := openAIHistoryMessages(params.History)
 	go func() {
 		defer close(ch)
 		apiMode := strings.ToLower(strings.TrimSpace(a.Provider.APIMode))
+		reasoningEffort := firstNonEmpty(params.ReasoningEffort, a.Provider.DefaultReasoningEffort)
 		var err error
 		if strings.TrimSpace(a.Provider.Kind) == "codex" {
 			sessionKey := firstNonEmpty(params.StickySessionKey, params.ConversationID)
-			if len(a.Provider.CredentialPool) > 0 {
-				err = streamCodexWithFailover(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, sessionKey, ch)
+			provider := a.Provider
+			provider.PromptCacheKey = firstNonEmpty(params.ConversationID, provider.PromptCacheKey)
+			if len(provider.CredentialPool) > 0 {
+				err = streamCodexWithFailover(ctx, client, provider, messages, reasoningEffort, params.ToolScope, sessionKey, ch)
 			} else {
-				err = streamCodexCandidate(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, ch)
-				if err == nil && a.Provider.CredentialID != "" {
-					markCodexCredentialRuntimeSuccess(a.Provider.CredentialID)
-					bindCodexSession(sessionKey, a.Provider, a.Provider.CredentialID)
+				_, err = streamCodexCandidateObserved(ctx, client, provider, messages, reasoningEffort, params.ToolScope, ch)
+				if err == nil && provider.CredentialID != "" {
+					markCodexCredentialRuntimeSuccess(provider.CredentialID)
+					bindCodexSession(sessionKey, provider, provider.CredentialID)
 				}
 			}
 		} else {
 			switch apiMode {
 			case "responses", "codex":
-				err = streamOpenAIResponses(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, ch)
+				err = streamOpenAIResponses(ctx, client, a.Provider, messages, reasoningEffort, params.ToolScope, ch)
 			default:
-				err = streamChatCompletions(ctx, client, a.Provider, messages, params.ReasoningEffort, params.ToolScope, ch)
+				err = streamChatCompletions(ctx, client, a.Provider, messages, reasoningEffort, params.ToolScope, ch)
 			}
 		}
 		if err != nil && strings.TrimSpace(a.Provider.Kind) == "cline" && isProviderUnauthorized(err) {
 			if refreshed, ok := refreshClineCredentialFromDisk(); ok {
 				retryProvider := a.Provider
 				retryProvider.APIKey = stringValue(refreshed["accessToken"])
-				err = streamChatCompletions(ctx, client, retryProvider, messages, params.ReasoningEffort, params.ToolScope, ch)
+				err = streamChatCompletions(ctx, client, retryProvider, messages, reasoningEffort, params.ToolScope, ch)
 			}
 		}
 		if err != nil {
@@ -486,12 +489,15 @@ func streamCodexWithFailover(ctx context.Context, client *http.Client, provider 
 		candidate.Kind = "codex"
 		candidate.APIMode = "codex"
 		candidate.LoadBalancingMode = provider.LoadBalancingMode
+		if candidate.UseWebSocket == nil {
+			candidate.UseWebSocket = provider.UseWebSocket
+		}
+		candidate.PromptCacheKey = firstNonEmpty(provider.PromptCacheKey, candidate.PromptCacheKey)
 		yielded, err := streamCodexCandidateObserved(ctx, client, candidate, messages, reasoningEffort, toolScope, out)
 		if err == nil {
 			if candidate.CredentialID != "" {
 				markCodexCredentialRuntimeSuccess(candidate.CredentialID)
 				bindCodexSession(sessionKey, provider, candidate.CredentialID)
-				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{CredentialID: candidate.CredentialID}})
 			}
 			return nil
 		}
@@ -512,6 +518,7 @@ func streamCodexWithFailover(ctx context.Context, client *http.Client, provider 
 	if lastErr != nil {
 		return lastErr
 	}
+	provider.PromptCacheKey = firstNonEmpty(provider.PromptCacheKey, sessionKey)
 	return streamOpenAIResponses(ctx, client, provider, messages, reasoningEffort, toolScope, out)
 }
 
@@ -522,8 +529,13 @@ func streamCodexCandidateObserved(ctx context.Context, client *http.Client, cand
 	go func() {
 		defer close(done)
 		for event := range local {
-			if event.Err == nil && parsedHasMeaningfulResponse(event.Parsed) {
-				yielded = true
+			if event.Err == nil {
+				if candidate.CredentialID != "" && event.Parsed.CredentialID == "" {
+					event.Parsed.CredentialID = candidate.CredentialID
+				}
+				if parsedHasMeaningfulResponse(event.Parsed) {
+					yielded = true
+				}
 			}
 			emitStreamEvent(ctx, out, event)
 		}
@@ -541,6 +553,10 @@ func isProviderUnauthorized(err error) bool {
 
 func isCodexFailoverError(err error) bool {
 	return classifyCodexRuntimeError(err).Failover
+}
+
+func codexPromptCacheKey(provider Provider) string {
+	return firstNonEmpty(provider.PromptCacheKey, provider.CredentialID, provider.AccountID, "narrafork")
 }
 
 func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
@@ -566,7 +582,7 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 	}
 	if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
 		body["parallel_tool_calls"] = true
-		body["prompt_cache_key"] = firstNonEmpty(provider.CredentialID, provider.AccountID, "narrafork")
+		body["prompt_cache_key"] = codexPromptCacheKey(provider)
 	}
 	if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
 		body["reasoning"] = map[string]any{"effort": effort}

@@ -331,6 +331,10 @@ func assertTerminalUnsupported(t *testing.T, recorder *httptest.ResponseRecorder
 	if body["ok"] != false || body["code"] != "TERMINAL_RUNTIME_UNSUPPORTED" || body["feature"] != feature || body["supported"] != false || body["fallback"] != true {
 		t.Fatalf("unexpected unsupported body: %#v", body)
 	}
+	reason, _ := body["reason"].(string)
+	if reason == "" || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("terminal unsupported fallback should expose reason/error/message, got %#v", body)
+	}
 }
 
 func newRuntimeCleanupTestDB(t *testing.T) *sql.DB {

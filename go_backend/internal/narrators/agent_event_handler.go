@@ -27,6 +27,7 @@ type agentRunState struct {
 	completed      bool
 	errored        bool
 	errorMessage   string
+	errorCode      string
 	streamedBytes  int
 	providerPrefix string
 }
@@ -122,6 +123,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			return s.finishAgentRunContextOverflow(ctx, state, event)
 		}
 		state.errored = true
+		state.errorCode = strings.TrimSpace(event.Code)
 		state.errorMessage = firstNonEmptyString(event.Message, event.Reason, "agent run failed")
 		if isCancelledError(errors.New(state.errorMessage)) {
 			return s.finishAgentRunCancelled(ctx, state)
@@ -201,6 +203,9 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	}
 	if event.Message != "" {
 		payload["message"] = event.Message
+	}
+	if event.Code != "" {
+		payload["code"] = event.Code
 	}
 	if event.Reason != "" {
 		payload["reason"] = event.Reason
@@ -658,6 +663,7 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 			result = "Completed"
 		}
 		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "completed", result); err != nil {
+			s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
 			return err
 		}
 	}
@@ -695,6 +701,7 @@ func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunStat
 		}
 		if strings.TrimSpace(backgroundParentID) != "" {
 			if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+				s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
 				return err
 			}
 		}
@@ -727,6 +734,7 @@ func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *age
 		}
 		if strings.TrimSpace(backgroundParentID) != "" {
 			if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+				s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
 				return err
 			}
 		}
@@ -763,6 +771,7 @@ func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunSt
 	}
 	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
 		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "cancelled", message); err != nil {
+			s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
 			return err
 		}
 	}
@@ -792,11 +801,14 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 	}
 	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
 		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+			s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
 			return err
 		}
 	}
 	if s.Hub != nil {
+		errorCode := firstNonEmptyString(state.errorCode, "AGENT_ERROR")
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"error"}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "failed", false: ""}[treatAsBackground])})
+		s.broadcastNarratorError(state.narratorID, message, errorCode)
 	}
 	return nil
 }

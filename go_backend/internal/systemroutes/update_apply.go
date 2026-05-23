@@ -167,7 +167,7 @@ func verifyUpdateArtifact(dir string, file updateDownloadedFileInfo) error {
 		return fmt.Errorf("Update artifact size mismatch: expected %d bytes, got %d", file.Size, info.Size())
 	}
 	if strings.TrimSpace(file.SHA512) == "" {
-		return nil
+		return errors.New("SHA512 is required for prepared update artifact")
 	}
 	actualHex, actualBase64, err := sha512ForFile(cleanPath)
 	if err != nil {

@@ -541,6 +541,45 @@ func TestCodexProviderFallsBackToSSEWhenWebSocketUnavailable(t *testing.T) {
 	}
 }
 
+func TestCodexProviderSkipsWebSocketWhenDisabled(t *testing.T) {
+	postRequests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/responses" {
+			t.Fatalf("unexpected codex path: %s", r.URL.Path)
+		}
+		if strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket") {
+			t.Fatalf("websocket should not be attempted when disabled")
+		}
+		if r.Method == http.MethodPost {
+			postRequests++
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"codex http only"}
+
+`)
+		fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_http_only"}}
+
+`)
+	}))
+	defer server.Close()
+	useWebSocket := false
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "codex", Kind: "codex", APIKey: "codex-token", BaseURL: server.URL, Model: "gpt-5.3-codex", APIMode: "codex", UseWebSocket: &useWebSocket}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	text := ""
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		text += event.Parsed.Text
+	}
+	if text != "codex http only" || postRequests != 1 {
+		t.Fatalf("unexpected codex http-only result text=%q postRequests=%d", text, postRequests)
+	}
+}
+
 func TestCodexProviderFailsOverAcrossCredentialPool(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -758,8 +797,8 @@ func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 		if r.URL.Path != "/responses" {
 			t.Fatalf("unexpected codex path: %s", r.URL.Path)
 		}
-		if r.Header.Get("originator") != "narrafork" || r.Header.Get("ChatGPT-Account-Id") != "acct_1" {
-			t.Fatalf("unexpected codex headers originator=%q account=%q", r.Header.Get("originator"), r.Header.Get("ChatGPT-Account-Id"))
+		if r.Header.Get("Authorization") != "Bearer codex-token" || r.Header.Get("originator") != "narrafork" || r.Header.Get("ChatGPT-Account-Id") != "acct_1" {
+			t.Fatalf("unexpected codex headers authorization=%q originator=%q account=%q", r.Header.Get("Authorization"), r.Header.Get("originator"), r.Header.Get("ChatGPT-Account-Id"))
 		}
 		_ = json.NewDecoder(r.Body).Decode(&requestBody)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -771,8 +810,8 @@ func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 `)
 	}))
 	defer server.Close()
-	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "codex", Kind: "codex", APIKey: "codex-token", BaseURL: server.URL, Model: "gpt-5.3-codex", APIMode: "codex", AccountID: "acct_1"}}
-	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "codex", Kind: "codex", APIKey: "codex-token", BaseURL: server.URL, Model: "gpt-5.3-codex", APIMode: "codex", AccountID: "acct_1", DefaultReasoningEffort: "medium"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{ConversationID: "conv_codex_headers", History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
 	if err != nil {
 		t.Fatalf("Chat returned error: %v", err)
 	}
@@ -786,8 +825,12 @@ func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 	if text != "codex ok" {
 		t.Fatalf("unexpected codex text %q", text)
 	}
-	if requestBody["store"] != false || requestBody["parallel_tool_calls"] != true || requestBody["prompt_cache_key"] == nil || requestBody["instructions"] == nil {
+	if requestBody["store"] != false || requestBody["parallel_tool_calls"] != true || requestBody["prompt_cache_key"] != "conv_codex_headers" || requestBody["instructions"] == nil {
 		t.Fatalf("unexpected codex responses body: %#v", requestBody)
+	}
+	reasoning, _ := requestBody["reasoning"].(map[string]any)
+	if reasoning["effort"] != "medium" {
+		t.Fatalf("expected default reasoning effort to be applied, body=%#v", requestBody)
 	}
 	tools, _ := requestBody["tools"].([]any)
 	seenWeb := false
@@ -803,6 +846,66 @@ func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 	}
 	if !seenWeb || !seenImage {
 		t.Fatalf("expected codex native tools in body: %#v", tools)
+	}
+}
+
+func TestCodexResponsesUsesConfiguredHTTPProxy(t *testing.T) {
+	proxyHit := false
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit = true
+		if r.URL.Scheme != "http" || r.URL.Host != "codex-upstream.example" || r.URL.Path != "/v1/responses" {
+			t.Fatalf("unexpected proxied codex request URL: scheme=%q host=%q path=%q requestURI=%q", r.URL.Scheme, r.URL.Host, r.URL.Path, r.RequestURI)
+		}
+		if r.Header.Get("Authorization") != "Bearer codex-token" {
+			t.Fatalf("unexpected proxied auth header: %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"proxied codex"}
+
+`)
+		fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_proxy"}}
+
+`)
+	}))
+	defer proxy.Close()
+	useWebSocket := false
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "codex", Kind: "codex", APIKey: "codex-token", BaseURL: "http://codex-upstream.example/v1", Model: "gpt-5.3-codex", APIMode: "codex", UseWebSocket: &useWebSocket, ProxyURL: proxy.URL}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{ConversationID: "conv_proxy", History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	text := ""
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		text += event.Parsed.Text
+	}
+	if !proxyHit || text != "proxied codex" {
+		t.Fatalf("expected codex request through proxy, proxyHit=%v text=%q", proxyHit, text)
+	}
+}
+
+func TestCodexWebSocketUsesConfiguredHTTPProxy(t *testing.T) {
+	proxyHit := make(chan string, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHit <- r.URL.String()
+		http.Error(w, "proxy observed websocket", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	err := streamCodexResponsesWebSocket(ctx, Provider{Prefix: "codex", Kind: "codex", APIKey: "codex-token", BaseURL: "http://codex-ws.example/backend-api/codex", Model: "gpt-5.3-codex", APIMode: "codex", ProxyURL: proxy.URL}, nil, "", "", make(chan StreamEvent, 1))
+	if err == nil {
+		t.Fatalf("expected websocket proxy test to fail after proxy response")
+	}
+	select {
+	case target := <-proxyHit:
+		if !strings.Contains(target, "codex-ws.example") {
+			t.Fatalf("unexpected proxied websocket target %q", target)
+		}
+	case <-ctx.Done():
+		t.Fatalf("codex websocket did not reach configured proxy: %v", err)
 	}
 }
 
@@ -934,26 +1037,82 @@ func TestNugProviderDelegatesByChannelMode(t *testing.T) {
 	}
 }
 
+func TestResolverTreatsLegacyOpenAIProviderCodexModeAsCodex(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"openaiProviders": []any{
+			map[string]any{"prefix": "legacycx", "apiMode": "codex", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_legacy", "codexWebSocket": true},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "legacycx:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve legacy openai codex provider: %v", err)
+	}
+	if resolution.Config.Kind != "codex" || resolution.Config.APIMode != "codex" || resolution.Config.AccountID != "acct_legacy" || resolution.Config.UseWebSocket == nil || !*resolution.Config.UseWebSocket {
+		t.Fatalf("unexpected legacy openai codex provider: %#v", resolution.Config)
+	}
+}
+
+func TestResolverAppliesDefaultReasoningEffortFallbacks(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{"defaultReasoningEffort": "low"},
+		"codex": map[string]any{"defaultReasoningEffort": "medium"},
+		"openaiProviders": []any{
+			map[string]any{"prefix": "open", "apiKey": "open-key", "baseUrl": "https://open.example", "defaultModel": "gpt-5-test", "apiMode": "responses"},
+			map[string]any{"prefix": "cx", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "apiMode": "codex", "codexWebSocket": false},
+		},
+		"anthropicProviders": []any{
+			map[string]any{"prefix": "anth", "apiKey": "anth-key", "baseUrl": "https://anth.example/v1", "defaultModel": "claude-test", "defaultReasoningEffort": "high"},
+			map[string]any{"prefix": "anthfallback", "apiKey": "anth-key-2", "baseUrl": "https://anth2.example/v1", "defaultModel": "claude-test"},
+		},
+	})
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"open:gpt-5-test", "low"},
+		{"cx:gpt-5.3-codex", "medium"},
+		{"anth:claude-test", "high"},
+		{"anthfallback:claude-test", "low"},
+	}
+	for _, tc := range cases {
+		resolution, err := ResolveProviderAndModel(store, tc.model)
+		if err != nil {
+			t.Fatalf("resolve %s: %v", tc.model, err)
+		}
+		if resolution.Config.DefaultReasoningEffort != tc.want {
+			t.Fatalf("expected %s default reasoning %q, got %#v", tc.model, tc.want, resolution.Config)
+		}
+	}
+}
+
 func TestResolverSupportsCustomAnthropicAndCodexProtocols(t *testing.T) {
 	store := testConfigStore(t, map[string]any{
 		"customApiProviders": []any{
-			map[string]any{"prefix": "anth", "protocol": "anthropic-official", "apiKey": "anth-key", "baseUrl": "https://anth.example/v1", "defaultModel": "claude-test"},
-			map[string]any{"prefix": "cx", "protocol": "codex-native", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "accountId": "acct_2"},
+			map[string]any{"prefix": "anth", "protocol": "anthropic-official", "apiKey": "anth-key", "baseUrl": "https://anth.example/v1", "defaultModel": "claude-test", "proxy": "http://anth-proxy.example:8080", "tlsRejectUnauthorized": false},
+			map[string]any{"prefix": "cx", "protocol": "codex-native", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_2", "codexWebSocket": false},
+			map[string]any{"prefix": "cxws", "protocol": "codex-native", "apiKey": "codex-key-ws", "baseUrl": "https://codex-ws.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_ws", "codexWebSocket": true},
 		},
 	})
 	anth, err := ResolveProviderAndModel(store, "anth:claude-test")
 	if err != nil {
 		t.Fatalf("resolve custom anthropic: %v", err)
 	}
-	if anth.Config.Kind != "anthropic" || !anth.Config.OfficialAPI {
+	if anth.Config.Kind != "anthropic" || !anth.Config.OfficialAPI || anth.Config.ProxyURL != "http://anth-proxy.example:8080" || anth.Config.TLSRejectUnauthorized == nil || *anth.Config.TLSRejectUnauthorized {
 		t.Fatalf("unexpected anthropic custom provider: %#v", anth.Config)
 	}
 	codex, err := ResolveProviderAndModel(store, "cx:gpt-5.3-codex")
 	if err != nil {
 		t.Fatalf("resolve custom codex: %v", err)
 	}
-	if codex.Config.Kind != "codex" || codex.Config.APIMode != "codex" || codex.Config.AccountID != "acct_2" {
+	if codex.Config.Kind != "codex" || codex.Config.APIMode != "codex" || codex.Config.AccountID != "acct_2" || codex.Config.UseWebSocket == nil || *codex.Config.UseWebSocket {
 		t.Fatalf("unexpected codex custom provider: %#v", codex.Config)
+	}
+	codexWS, err := ResolveProviderAndModel(store, "cxws:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve custom codex websocket: %v", err)
+	}
+	if codexWS.Config.Kind != "codex" || codexWS.Config.APIMode != "codex" || codexWS.Config.AccountID != "acct_ws" || codexWS.Config.UseWebSocket == nil || !*codexWS.Config.UseWebSocket {
+		t.Fatalf("unexpected codex websocket custom provider: %#v", codexWS.Config)
 	}
 }
 
@@ -975,18 +1134,18 @@ func TestResolverOrdersCodexCredentialsByTierBalancedMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if _, err := store.Patch(map[string]any{"codex": map[string]any{"baseUrl": "https://codex.example", "loadBalancingMode": "tier-balanced", "tierOrder": []any{"pro", "plus"}}}); err != nil {
+	if _, err := store.Patch(map[string]any{"codex": map[string]any{"baseUrl": "https://codex.example", "proxy": "http://codex-proxy.example:8080", "loadBalancingMode": "tier-balanced", "tierOrder": []any{"pro", "plus"}}}); err != nil {
 		t.Fatalf("patch config: %v", err)
 	}
 	resolution, err := ResolveProviderAndModel(store, "codex:gpt-5.3-codex")
 	if err != nil {
 		t.Fatalf("resolve tier-balanced codex: %v", err)
 	}
-	if resolution.Config.CredentialID != "pro-free" || resolution.Config.APIKey != "pro-token" {
-		t.Fatalf("expected pro-free credential first, got %#v", resolution.Config)
+	if resolution.Config.CredentialID != "pro-free" || resolution.Config.APIKey != "pro-token" || resolution.Config.ProxyURL != "http://codex-proxy.example:8080" {
+		t.Fatalf("expected pro-free credential first with proxy, got %#v", resolution.Config)
 	}
-	if len(resolution.Config.CredentialPool) != 3 || resolution.Config.CredentialPool[0].CredentialID != "pro-free" || resolution.Config.CredentialPool[1].CredentialID != "pro-busy" || resolution.Config.CredentialPool[2].CredentialID != "plus-busy" {
-		t.Fatalf("unexpected tier-balanced pool order: %#v", resolution.Config.CredentialPool)
+	if len(resolution.Config.CredentialPool) != 3 || resolution.Config.CredentialPool[0].CredentialID != "pro-free" || resolution.Config.CredentialPool[1].CredentialID != "pro-busy" || resolution.Config.CredentialPool[2].CredentialID != "plus-busy" || resolution.Config.CredentialPool[0].ProxyURL != "http://codex-proxy.example:8080" {
+		t.Fatalf("unexpected tier-balanced pool order/proxy: %#v", resolution.Config.CredentialPool)
 	}
 }
 
