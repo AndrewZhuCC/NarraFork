@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -31,6 +32,142 @@ func newTestStore(t *testing.T) *config.Store {
 		t.Fatalf("load settings: %v", err)
 	}
 	return store
+}
+
+func TestGetSettingsIncludesTSOptionalProviderArraysWithoutPersistingDefaults(t *testing.T) {
+	store := newTestStore(t)
+	for _, field := range []string{"nkpProviders", "nugProviders", "clineProviders"} {
+		if _, ok := store.Raw()[field]; ok {
+			t.Fatalf("test fixture should not persist optional default %s", field)
+		}
+	}
+	h := &Handler{Store: store}
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	w := httptest.NewRecorder()
+	if err := h.get(w, req); err != nil {
+		t.Fatalf("get settings returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode settings response: %v", err)
+	}
+	for _, field := range []string{"nkpProviders", "nugProviders", "clineProviders"} {
+		items, ok := body[field].([]any)
+		if !ok || len(items) != 0 {
+			t.Fatalf("expected %s empty array in response, got %#v", field, body[field])
+		}
+		if _, persisted := store.Raw()[field]; persisted {
+			t.Fatalf("%s should be response-only and not persisted into settings defaults", field)
+		}
+	}
+}
+
+func TestGetSettingsIncludesCustomApiQuotaCacheShape(t *testing.T) {
+	store := newTestStore(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve test home: %v", err)
+	}
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "custom-api-quotas.json"), []byte(`{"provider":{"quotaBalance":"$42.50","detailedQuotaBalance":"42.50 credits\nreset soon","fetchedAt":1700000000000}}`), 0o600); err != nil {
+		t.Fatalf("write custom api quota cache: %v", err)
+	}
+
+	h := &Handler{Store: store}
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	w := httptest.NewRecorder()
+	if err := h.get(w, req); err != nil {
+		t.Fatalf("get settings returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode settings response: %v", err)
+	}
+	quotas, ok := body["customApiQuotas"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected customApiQuotas object, got %#v", body["customApiQuotas"])
+	}
+	quota, ok := quotas["provider"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected provider quota entry, got %#v", quotas)
+	}
+	if quota["quotaBalance"] != "$42.50" || quota["detailedQuotaBalance"] != "42.50 credits\nreset soon" || quota["fetchedAt"] != float64(1700000000000) || len(quota) != 3 {
+		t.Fatalf("unexpected custom API quota shape: %#v", quota)
+	}
+}
+
+func TestGetSettingsMatchesTSKiroAndNugQuotaResponseShape(t *testing.T) {
+	store := newTestStore(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve test home: %v", err)
+	}
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "nug-quotas.json"), []byte(`{"provider":{"balance":12,"totalGranted":34}}`), 0o600); err != nil {
+		t.Fatalf("write nug quota cache: %v", err)
+	}
+	customQuotaFixture := `{"openai-secret-fixture":{"quotaBalance":"$42.50","detailedQuotaBalance":"42.50 credits\nreset soon","fetchedAt":1700000000000}}`
+	if err := os.WriteFile(filepath.Join(dataDir, "custom-api-quotas.json"), []byte(customQuotaFixture), 0o600); err != nil {
+		t.Fatalf("write custom API quota cache: %v", err)
+	}
+	h := &Handler{Store: store}
+	req := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	w := httptest.NewRecorder()
+	if err := h.get(w, req); err != nil {
+		t.Fatalf("get settings returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode settings response: %v", err)
+	}
+	if body["kiroModels"] != nil {
+		t.Fatalf("fresh Go settings should mirror TS unavailable Kiro null, got %#v", body["kiroModels"])
+	}
+	if _, ok := body["nugQuotas"]; ok {
+		t.Fatalf("TS settings response does not expose top-level nugQuotas, got %#v", body["nugQuotas"])
+	}
+	customApiQuotas, ok := body["customApiQuotas"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected customApiQuotas object, got %#v", body["customApiQuotas"])
+	}
+	customApiQuota, ok := customApiQuotas["openai-secret-fixture"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected custom API quota fixture, got %#v", customApiQuotas)
+	}
+	if customApiQuota["quotaBalance"] != "$42.50" || customApiQuota["detailedQuotaBalance"] != "42.50 credits\nreset soon" || customApiQuota["fetchedAt"] != float64(1700000000000) || len(customApiQuota) != 3 {
+		t.Fatalf("unexpected custom API quota shape: %#v", customApiQuota)
+	}
+
+	kiroDir := filepath.Join(dataDir, "kiro")
+	if err := os.MkdirAll(kiroDir, 0o700); err != nil {
+		t.Fatalf("mkdir kiro dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kiroDir, "credentials.json"), []byte(`[{"availableModels":["kiro-model-a"]}]`), 0o600); err != nil {
+		t.Fatalf("write kiro credentials: %v", err)
+	}
+	w = httptest.NewRecorder()
+	if err := h.get(w, req); err != nil {
+		t.Fatalf("get settings with kiro credentials returned error: %v", err)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode settings response with kiro credentials: %v", err)
+	}
+	models, ok := body["kiroModels"].([]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("expected Kiro credentials to produce model array, got %#v", body["kiroModels"])
+	}
 }
 
 type bunFinalSettingsRoundtripArtifact struct {
@@ -1148,6 +1285,69 @@ func TestGetSettingsRedactsVNetRelayTokenAndPreservesMaskedPatch(t *testing.T) {
 	}
 }
 
+func TestGetSettingsRedactsProviderSecretsAndPreservesMaskedPatch(t *testing.T) {
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+	initialPatch := []byte(`{
+		"openaiProviders":[{"id":"openai-1","name":"OpenAI","prefix":"openai","apiKey":"sk-openai-secret","baseUrl":"https://openai.example.test","defaultModel":"gpt-test"}],
+		"nugProviders":[{"id":"nug-1","name":"NUG","prefix":"nug","apiKey":"sk-nug-secret","oauthClientSecret":"nug-oauth-secret","baseUrl":"https://nug.example.test","defaultModel":"nug-test"}],
+		"clineProviders":[{"id":"cline-1","name":"Cline","prefix":"cline","accessToken":"cline-access-secret","baseUrl":"https://cline.example.test","defaultModel":"cline-test"}]
+	}`)
+	initialReq := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(initialPatch))
+	initialReq.Header.Set("Content-Type", "application/json")
+	initialW := httptest.NewRecorder()
+	if err := h.patch(initialW, initialReq); err != nil {
+		t.Fatalf("initial provider patch returned error: %v", err)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/api/settings", nil)
+	getW := httptest.NewRecorder()
+	if err := h.get(getW, getReq); err != nil {
+		t.Fatalf("get settings returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(getW.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	openai := anySlice(body["openaiProviders"])[0].(map[string]any)
+	nug := anySlice(body["nugProviders"])[0].(map[string]any)
+	cline := anySlice(body["clineProviders"])[0].(map[string]any)
+	if stringValue(openai["apiKey"]) == "sk-openai-secret" || !strings.HasPrefix(stringValue(openai["apiKey"]), "********") {
+		t.Fatalf("openai apiKey leaked in response: %#v", openai["apiKey"])
+	}
+	if stringValue(nug["apiKey"]) == "sk-nug-secret" || stringValue(nug["oauthClientSecret"]) == "nug-oauth-secret" {
+		t.Fatalf("nug secrets leaked in response: %#v", nug)
+	}
+	if stringValue(cline["accessToken"]) == "cline-access-secret" || !strings.HasPrefix(stringValue(cline["accessToken"]), "********") {
+		t.Fatalf("cline accessToken leaked in response: %#v", cline["accessToken"])
+	}
+
+	maskedPatch := []byte(`{
+		"openaiProviders":[{"id":"openai-1","name":"OpenAI","prefix":"openai","apiKey":"********cret","baseUrl":"https://openai.example.test","defaultModel":"gpt-test"}],
+		"nugProviders":[{"id":"nug-1","name":"NUG","prefix":"nug","apiKey":"********cret","oauthClientSecret":"********cret","baseUrl":"https://nug.example.test","defaultModel":"nug-test"}],
+		"clineProviders":[{"id":"cline-1","name":"Cline","prefix":"cline","accessToken":"********cret","baseUrl":"https://cline.example.test","defaultModel":"cline-test"}]
+	}`)
+	maskedReq := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(maskedPatch))
+	maskedReq.Header.Set("Content-Type", "application/json")
+	maskedW := httptest.NewRecorder()
+	if err := h.patch(maskedW, maskedReq); err != nil {
+		t.Fatalf("masked provider patch returned error: %v", err)
+	}
+	stored := store.Raw()
+	storedOpenAI := anySlice(stored["openaiProviders"])[0].(map[string]any)
+	storedNUG := anySlice(stored["nugProviders"])[0].(map[string]any)
+	storedCline := anySlice(stored["clineProviders"])[0].(map[string]any)
+	if stringValue(storedOpenAI["apiKey"]) != "sk-openai-secret" {
+		t.Fatalf("masked openai patch should preserve original apiKey, got %#v", storedOpenAI["apiKey"])
+	}
+	if stringValue(storedNUG["apiKey"]) != "sk-nug-secret" || stringValue(storedNUG["oauthClientSecret"]) != "nug-oauth-secret" {
+		t.Fatalf("masked nug patch should preserve original secrets, got %#v", storedNUG)
+	}
+	if stringValue(storedCline["accessToken"]) != "cline-access-secret" {
+		t.Fatalf("masked cline patch should preserve original accessToken, got %#v", storedCline["accessToken"])
+	}
+}
+
 type fakeContainerProxyRuntime struct {
 	calls []struct {
 		enabled bool
@@ -1247,8 +1447,16 @@ func TestGenerateTLSCreatesCertificateAndEnablesSettings(t *testing.T) {
 	}
 	certPath, _ := body["certPath"].(string)
 	keyPath, _ := body["keyPath"].(string)
+	newURL, _ := body["newUrl"].(string)
+	expiresAt, _ := body["expiresAt"].(string)
 	if certPath == "" || keyPath == "" || body["serverRestarting"] != true || body["manualRestartRequired"] != false {
 		t.Fatalf("unexpected TLS response: %#v", body)
+	}
+	if !strings.HasPrefix(newURL, "https://") || !strings.Contains(newURL, ":7778") {
+		t.Fatalf("expected TLS newUrl for frontend redirect, got %#v", newURL)
+	}
+	if _, err := time.Parse(time.RFC3339, expiresAt); err != nil {
+		t.Fatalf("expected RFC3339 expiresAt, got %#v: %v", expiresAt, err)
 	}
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {

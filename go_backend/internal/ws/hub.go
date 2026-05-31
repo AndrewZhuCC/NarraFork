@@ -474,10 +474,43 @@ func (h *Hub) BroadcastMergeProgress(payload any) {
 	if err != nil {
 		return
 	}
+	projectID := ""
+	if body, ok := payload.(map[string]any); ok {
+		projectID = strings.TrimSpace(stringValue(body["projectId"]))
+	}
 	h.mu.RLock()
 	clients := make([]*client, 0, len(h.narrators))
 	for c := range h.narrators {
 		clients = append(clients, c)
+	}
+	sqlDB := h.mergeDB
+	h.mu.RUnlock()
+	for _, c := range clients {
+		if projectID != "" && sqlDB != nil {
+			allowed, err := h.clientCanAccessMergeProject(context.Background(), sqlDB, c, projectID, true)
+			if err != nil || !allowed {
+				continue
+			}
+		}
+		c.queueSend(data)
+	}
+}
+
+func (h *Hub) BroadcastUser(userID string, payload any) {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	h.mu.RLock()
+	clients := make([]*client, 0)
+	for c := range h.narrators {
+		if c.userID == userID {
+			clients = append(clients, c)
+		}
 	}
 	h.mu.RUnlock()
 	for _, c := range clients {
@@ -567,9 +600,7 @@ func narratorBroadcastPayloads(narratorID string, payload any) []any {
 			"toolUseId": base["toolUseId"],
 			"toolName":  base["toolName"],
 		}
-		if input, ok := base["input"]; ok {
-			compat["input"] = input
-		}
+		copyOptionalFields(compat, base, "input", "streamStartedAt", "parentToolUseId")
 		appendPayload(compat)
 	case "retrying":
 		appendPayload(map[string]any{
@@ -591,12 +622,18 @@ func narratorBroadcastPayloads(narratorID string, payload any) []any {
 			"status":    status,
 			"output":    base["output"],
 		}
-		if durationMs, ok := base["durationMs"]; ok {
-			compat["durationMs"] = durationMs
-		}
+		copyOptionalFields(compat, base, "durationMs", "updatedInput", "metadata", "sideCars", "parentToolUseId")
 		appendPayload(compat)
 	}
 	return items
+}
+
+func copyOptionalFields(dst, src map[string]any, fields ...string) {
+	for _, field := range fields {
+		if value, ok := src[field]; ok {
+			dst[field] = value
+		}
+	}
 }
 
 func withNarratorID(narratorID string, payload map[string]any) map[string]any {
@@ -1734,6 +1771,22 @@ func (h *Hub) handleMergeDecision(c *client, msg map[string]any) {
 		c.sendJSON(map[string]any{"type": "error", "message": "decision must be continue or cancel"})
 		return
 	}
+	projectID, hasProjectMetadata, err := mergeSessionProjectID(context.Background(), sqlDB, mergeSessionID)
+	if err != nil {
+		c.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+		return
+	}
+	if hasProjectMetadata {
+		allowed, err := h.clientCanAccessMergeProject(context.Background(), sqlDB, c, projectID, false)
+		if err != nil {
+			c.sendJSON(map[string]any{"type": "error", "message": err.Error()})
+			return
+		}
+		if !allowed {
+			c.sendJSON(map[string]any{"type": "error", "message": "Merge session is not available for this project"})
+			return
+		}
+	}
 	result, err := sqlDB.ExecContext(context.Background(), `UPDATE merge_sessions SET status = ?, updated_at = ? WHERE id = ?`, status, db.NowISO(), mergeSessionID)
 	if err != nil {
 		c.sendJSON(map[string]any{"type": "error", "message": err.Error()})
@@ -1744,6 +1797,93 @@ func (h *Hub) handleMergeDecision(c *client, msg map[string]any) {
 		return
 	}
 	c.sendJSON(map[string]any{"type": "merge_decision_resolved", "mergeSessionId": mergeSessionID, "decision": decision, "status": status})
+}
+
+func mergeSessionProjectID(ctx context.Context, sqlDB *sql.DB, mergeSessionID string) (string, bool, error) {
+	if sqlDB == nil {
+		return "", false, nil
+	}
+	chaptersExist, err := wsTableExists(ctx, sqlDB, "chapters")
+	if err != nil || !chaptersExist {
+		return "", false, err
+	}
+	var projectID sql.NullString
+	err = sqlDB.QueryRowContext(ctx, `SELECT ch.project_id FROM merge_sessions ms LEFT JOIN chapters ch ON ch.id = ms.target_chapter_id WHERE ms.id = ?`, mergeSessionID).Scan(&projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", true, fmt.Errorf("Merge session not found")
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if !projectID.Valid || strings.TrimSpace(projectID.String) == "" {
+		return "", false, nil
+	}
+	return strings.TrimSpace(projectID.String), true, nil
+}
+
+func (h *Hub) clientCanAccessMergeProject(ctx context.Context, sqlDB *sql.DB, c *client, projectID string, allowEmptySubscription bool) (bool, error) {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" || sqlDB == nil {
+		return true, nil
+	}
+	narratorsExist, err := wsTableExists(ctx, sqlDB, "narrators")
+	if err != nil || !narratorsExist {
+		return true, err
+	}
+	chaptersExist, err := wsTableExists(ctx, sqlDB, "chapters")
+	if err != nil || !chaptersExist {
+		return true, err
+	}
+	subscriberIDs := h.clientSubscriberIDs(c)
+	if len(subscriberIDs) == 0 {
+		return allowEmptySubscription, nil
+	}
+	placeholders, args := wsSQLPlaceholders(subscriberIDs)
+	args = append(args, projectID)
+	var count int
+	err = sqlDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM narrators n JOIN chapters ch ON ch.id = n.chapter_id WHERE n.id IN (`+placeholders+`) AND ch.project_id = ?`, args...).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (h *Hub) clientSubscriberIDs(c *client) []string {
+	if c == nil {
+		return nil
+	}
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	ids := make([]string, 0, len(c.subscribers))
+	for id := range c.subscribers {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
+func wsTableExists(ctx context.Context, sqlDB *sql.DB, table string) (bool, error) {
+	var name string
+	err := sqlDB.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return name == table, nil
+}
+
+func wsSQLPlaceholders(values []string) (string, []any) {
+	placeholders := make([]string, 0, len(values))
+	args := make([]any, 0, len(values))
+	for _, value := range values {
+		placeholders = append(placeholders, "?")
+		args = append(args, value)
+	}
+	return strings.Join(placeholders, ","), args
 }
 
 func permissionDecisionDBStatus(decision string) string {

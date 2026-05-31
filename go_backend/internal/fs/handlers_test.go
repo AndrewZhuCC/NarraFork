@@ -52,6 +52,28 @@ func TestBrowseReturnsFrontendContractFields(t *testing.T) {
 	if _, ok := body["drives"].([]any); !ok {
 		t.Fatalf("drives should be an array, got %#v", body["drives"])
 	}
+	if entryNames(body)["note.txt"] {
+		t.Fatalf("browse entries should contain directories only, got %#v", body["entries"])
+	}
+}
+
+func TestBrowseWindowsNoPathReturnsDriveRootContract(t *testing.T) {
+	settings := loadFSTestSettings(t)
+	oldGOOS := runtimeGOOS
+	runtimeGOOS = "windows"
+	t.Cleanup(func() { runtimeGOOS = oldGOOS })
+
+	body := serveFSJSON(t, settings, http.MethodGet, "/fs/browse", "")
+	if body["path"] != nil || body["parent"] != nil || body["sep"] != string(os.PathSeparator) {
+		t.Fatalf("unexpected Windows drive-root metadata: %#v", body)
+	}
+	entries, ok := body["entries"].([]any)
+	if !ok || len(entries) != 0 {
+		t.Fatalf("Windows drive root should return an empty entries array, got %#v", body["entries"])
+	}
+	if _, ok := body["drives"].([]any); !ok {
+		t.Fatalf("Windows drive root should include drives array, got %#v", body["drives"])
+	}
 }
 
 func TestBrowseHonorsShowHidden(t *testing.T) {
@@ -86,6 +108,10 @@ func TestMkdirRejectsUnsafeNamesAndCreatesSingleDirectory(t *testing.T) {
 			t.Fatalf("mkdir %q should be rejected, got %d body=%s", name, w.Code, w.Body.String())
 		}
 	}
+	pathOnly := serveFSRaw(t, settings, http.MethodPost, "/fs/mkdir", `{"path":"`+filepath.Join(parent, "path-only")+`"}`)
+	if pathOnly.Code != http.StatusBadRequest {
+		t.Fatalf("mkdir path-only body should match TS rejection, got %d body=%s", pathOnly.Code, pathOnly.Body.String())
+	}
 	w := serveFSRaw(t, settings, http.MethodPost, "/fs/mkdir", `{"parent":"`+parent+`","name":"child"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("mkdir valid got %d body=%s", w.Code, w.Body.String())
@@ -102,8 +128,8 @@ func TestRevealValidatesPathAndOpensSupportedPlatforms(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("missing reveal path should be rejected, got %d body=%s", w.Code, w.Body.String())
 	}
-	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" && runtime.GOOS != "linux" {
-		t.Skip("unsupported platform should be tested separately")
+	if runtime.GOOS != "darwin" && runtime.GOOS != "windows" {
+		t.Skip("supported reveal platform should be tested separately")
 	}
 	dir := t.TempDir()
 	w = serveFSRaw(t, settings, http.MethodPost, "/fs/reveal", `{"path":"`+dir+`"}`)
@@ -119,26 +145,22 @@ func TestRevealValidatesPathAndOpensSupportedPlatforms(t *testing.T) {
 	}
 }
 
-func TestRevealUnsupportedPlatformReturnsFeatureDisabled(t *testing.T) {
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" || runtime.GOOS == "linux" {
-		t.Skip("current platform now supports reveal")
-	}
+func TestRevealUnsupportedPlatformMatchesTSValidation(t *testing.T) {
 	settings := loadFSTestSettings(t)
+	oldGOOS := runtimeGOOS
+	runtimeGOOS = "linux"
+	t.Cleanup(func() { runtimeGOOS = oldGOOS })
 	dir := t.TempDir()
 	w := serveFSRaw(t, settings, http.MethodPost, "/fs/reveal", `{"path":"`+dir+`"}`)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("unsupported reveal should not fake success, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported reveal should match TS 400, got %d body=%s", w.Code, w.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode reveal body: %v", err)
 	}
-	if body["ok"] != false || body["code"] != "FS_REVEAL_UNSUPPORTED" || body["supported"] != false || body["fallback"] != true {
+	if body["code"] != "VALIDATION_ERROR" || body["error"] != "Opening file manager is not supported on this platform" {
 		t.Fatalf("unexpected reveal unsupported body: %#v", body)
-	}
-	reason, _ := body["reason"].(string)
-	if reason != "Opening the system file manager is not supported on this platform by go_backend." || body["error"] != reason || body["message"] != reason {
-		t.Fatalf("unsupported reveal should expose reason/error/message, got %#v", body)
 	}
 }
 

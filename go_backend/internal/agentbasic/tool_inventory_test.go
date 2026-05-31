@@ -17,7 +17,7 @@ func TestToolInventoryGoldenCategoriesAndScopes(t *testing.T) {
 			t.Fatalf("normal inventory missing core tool %s", name)
 		}
 	}
-	for _, name := range []string{"Terminal", "Browser", "ShareFile", "ConcludeReview", "DangerConfirm", "ExitPlanConfirm", "GoalCompleteConfirm"} {
+	for _, name := range []string{"Terminal", "Browser", "ShareFile", "Recall", "ConcludeReview", "DangerConfirm", "ExitPlanConfirm", "GoalCompleteConfirm"} {
 		if normal[name] {
 			t.Fatalf("normal inventory should not include %s by default", name)
 		}
@@ -62,22 +62,125 @@ func TestToolInventoryMarksUnimplementedOptionalToolsUnsupported(t *testing.T) {
 			unsupported[tool.Name] = tool.Reason != "" && !tool.Enabled
 		}
 	}
-	for _, name := range []string{"Recall", "ForkNarrator", "NarraForkAdmin"} {
+	for _, name := range []string{"ForkNarrator", "NarraForkAdmin"} {
 		if !unsupported[name] {
 			t.Fatalf("missing unsupported optional tool metadata for %s: %#v", name, metadata.Tools)
 		}
+	}
+	if unsupported["Recall"] {
+		t.Fatalf("Recall should be supported by the Go optional inventory: %#v", metadata.Tools)
 	}
 	menuNames := map[string]bool{}
 	for _, item := range ToolMenuCapabilities() {
 		menuNames[stringValue(item["name"])] = true
 	}
-	if !menuNames["Terminal"] {
-		t.Fatalf("implemented Terminal optional tool missing from loadable menu: %#v", ToolMenuCapabilities())
+	for _, name := range []string{"Terminal", "Recall"} {
+		if !menuNames[name] {
+			t.Fatalf("implemented optional tool %s missing from loadable menu: %#v", name, ToolMenuCapabilities())
+		}
 	}
-	for _, name := range []string{"Recall", "ForkNarrator", "NarraForkAdmin"} {
+	for _, name := range []string{"ForkNarrator", "NarraForkAdmin"} {
 		if menuNames[name] {
 			t.Fatalf("unsupported optional tool leaked into loadable menu: %#v", ToolMenuCapabilities())
 		}
+	}
+}
+
+func TestRecallOptionalToolSchemaAndMetadata(t *testing.T) {
+	names := toolDefinitionNames(toolDefinitions(encodedToolScope("normal", []string{"Recall"}, nil)))
+	if !names["Recall"] {
+		t.Fatalf("Recall should be exposed when enabled: %#v", names)
+	}
+	var recall *toolSpec
+	for _, spec := range toolSpecs() {
+		if spec.Name == "Recall" {
+			recall = &spec
+			break
+		}
+	}
+	if recall == nil {
+		t.Fatalf("Recall toolSpec missing")
+	}
+	props, _ := recall.Parameters["properties"].(map[string]any)
+	action, _ := props["action"].(map[string]any)
+	query, _ := props["query"].(map[string]any)
+	if fmt.Sprint(action["enum"]) != "[search read_conversation read_tool_call]" || query["oneOf"] == nil || props["time_range"] == nil || props["tool_call_id"] == nil {
+		t.Fatalf("Recall schema should match safe TS subset, got %#v", recall.Parameters)
+	}
+
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	found := false
+	for _, tool := range metadata.Tools {
+		if tool.Name != "Recall" {
+			continue
+		}
+		found = true
+		if !tool.Supported || tool.Category != ToolCategoryOptional || tool.Metadata["readOnly"] != true || tool.Metadata["scope"] != "self" || tool.Metadata["searchMode"] != "bounded-like" || tool.Metadata["crossNarrator"] != false {
+			t.Fatalf("unexpected Recall metadata: %#v", tool)
+		}
+	}
+	if !found {
+		t.Fatalf("Recall metadata missing: %#v", metadata.Tools)
+	}
+
+	out := ExecuteTool(context.Background(), t.TempDir(), "Recall", `{"action":"search","query":"x"}`)
+	if !strings.Contains(out, "requires narrator context") || !strings.Contains(out, "no database was accessed") {
+		t.Fatalf("non-narrator Recall should fail before DB access, got %q", out)
+	}
+}
+
+func TestToolInventoryExposesBashBackgroundAndAwaitMetadata(t *testing.T) {
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	var bashMetadata map[string]any
+	var awaitMetadata map[string]any
+	for _, tool := range metadata.Tools {
+		switch tool.Name {
+		case "Bash":
+			bashMetadata = tool.Metadata
+		case "Await":
+			awaitMetadata = tool.Metadata
+		}
+	}
+	if bashMetadata["bashBackground"] != true || bashMetadata["runInBackground"] != true || bashMetadata["narratorContextOnly"] != true {
+		t.Fatalf("unexpected Bash background metadata: %#v", bashMetadata)
+	}
+	if !strings.Contains(stringValue(bashMetadata["nonNarratorBackgroundNote"]), "requires narrator context") {
+		t.Fatalf("Bash metadata should document non-narrator ExecuteTool limitation: %#v", bashMetadata)
+	}
+	if awaitMetadata["awaitBash"] != true || awaitMetadata["awaitBashWaitForText"] != true || awaitMetadata["narratorContextOnly"] != true {
+		t.Fatalf("unexpected Await metadata: %#v", awaitMetadata)
+	}
+	supportedTypes, ok := awaitMetadata["supportedTypes"].([]string)
+	if !ok || len(supportedTypes) != 2 || supportedTypes[0] != "agent" || supportedTypes[1] != "bash" {
+		t.Fatalf("Await metadata should expose agent/bash supportedTypes: %#v", awaitMetadata)
+	}
+
+	menu := ToolMenuCapabilities()
+	seen := map[string]map[string]any{}
+	for _, item := range menu {
+		if name := stringValue(item["name"]); name == "Bash" || name == "Await" {
+			seen[name], _ = item["metadata"].(map[string]any)
+		}
+	}
+	if seen["Bash"]["bashBackground"] != true || seen["Await"]["awaitBashWaitForText"] != true {
+		t.Fatalf("tool menu should expose Bash/Await metadata, got %#v", seen)
+	}
+}
+
+func TestToolInventoryExposesReadPdfPagesFallbackMetadata(t *testing.T) {
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	found := false
+	for _, tool := range metadata.Tools {
+		if tool.Name != "Read" {
+			continue
+		}
+		found = true
+		if tool.Metadata["parity"] != "partial" || tool.Metadata["textFiles"] != true || tool.Metadata["directories"] != true || tool.Metadata["pdfPages"] != false || tool.Metadata["pagesSchemaOnly"] != true {
+			t.Fatalf("unexpected Read fallback metadata: %#v", tool.Metadata)
+		}
+	}
+	if !found {
+		t.Fatalf("Read capability metadata missing: %#v", metadata.Tools)
 	}
 }
 

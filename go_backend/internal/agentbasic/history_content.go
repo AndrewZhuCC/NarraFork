@@ -69,6 +69,126 @@ func jsonStringValue(value any) string {
 	return string(data)
 }
 
+func webSearchContextFromBlocks(blocks []map[string]any) string {
+	parts := []string{}
+	for _, block := range blocks {
+		if stringValue(block["type"]) != "web_search" {
+			continue
+		}
+		parts = append(parts, webSearchSummary(block))
+	}
+	return strings.Join(parts, "\n")
+}
+
+func webSearchSummary(block map[string]any) string {
+	if action, ok := block["action"].(map[string]any); ok {
+		switch stringValue(action["type"]) {
+		case "open_page":
+			if url := stringValue(action["url"]); url != "" {
+				return "[Web search: opened " + url + "]"
+			}
+		case "find_in_page":
+			parts := []string{}
+			if pattern := stringValue(action["pattern"]); pattern != "" {
+				parts = append(parts, "'"+pattern+"'")
+			}
+			if url := stringValue(action["url"]); url != "" {
+				parts = append(parts, url)
+			}
+			if len(parts) > 0 {
+				return "[Web search: find " + strings.Join(parts, " in ") + "]"
+			}
+		}
+		if query := stringValue(action["query"]); query != "" {
+			return "[Web search: " + query + "]"
+		}
+		if queries := stringSliceValue(action["queries"]); len(queries) > 0 {
+			return "[Web search: " + strings.Join(queries, ", ") + "]"
+		}
+	}
+	if query := stringValue(block["query"]); query != "" {
+		return "[Web search: " + query + "]"
+	}
+	if queries := stringSliceValue(block["queries"]); len(queries) > 0 {
+		return "[Web search: " + strings.Join(queries, ", ") + "]"
+	}
+	return "[Web search: unknown]"
+}
+
+func webSearchActionFromBlock(block map[string]any) (map[string]any, bool) {
+	if action, ok := block["action"].(map[string]any); ok && len(action) > 0 {
+		return action, true
+	}
+	query := stringValue(block["query"])
+	queries := stringSliceValue(block["queries"])
+	if query == "" && len(queries) == 0 {
+		return nil, false
+	}
+	action := map[string]any{"type": "search"}
+	if query != "" {
+		action["query"] = query
+	}
+	if len(queries) > 0 {
+		action["queries"] = queries
+	}
+	return action, true
+}
+
+func stringSliceValue(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		items := []string{}
+		for _, item := range typed {
+			if text := stringValue(item); text != "" {
+				items = append(items, text)
+			}
+		}
+		return items
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil
+		}
+		return []string{typed}
+	default:
+		return nil
+	}
+}
+
+func imageBlockData(block map[string]any) (string, string, bool) {
+	mediaType := firstNonEmpty(stringValue(block["mediaType"]), stringValue(block["media_type"]))
+	data := firstNonEmpty(stringValue(block["base64"]), stringValue(block["data"]))
+	if source, ok := block["source"].(map[string]any); ok {
+		mediaType = firstNonEmpty(mediaType, stringValue(source["media_type"]), stringValue(source["mediaType"]))
+		data = firstNonEmpty(data, stringValue(source["data"]), stringValue(source["base64"]))
+	}
+	if strings.HasPrefix(data, "data:") {
+		if idx := strings.Index(data, ";base64,"); idx > len("data:") {
+			mediaType = firstNonEmpty(mediaType, data[len("data:"):idx])
+			data = data[idx+len(";base64,"):]
+		}
+	}
+	format := stringValue(block["format"])
+	if mediaType == "" && format != "" {
+		mediaType = "image/" + strings.TrimPrefix(format, "image/")
+	}
+	mediaType = strings.TrimSpace(mediaType)
+	data = strings.TrimSpace(data)
+	if mediaType == "" || data == "" {
+		return "", "", false
+	}
+	return mediaType, data, true
+}
+
+func imageBlockDataURL(block map[string]any) (string, bool) {
+	mediaType, data, ok := imageBlockData(block)
+	if !ok {
+		return "", false
+	}
+	return "data:" + mediaType + ";base64," + data, true
+}
+
 func contentBlockToolResults(blocks []map[string]any) []Message {
 	messages := []Message{}
 	for _, block := range blocks {
@@ -131,6 +251,18 @@ func anthropicContentFromBlocks(blocks []map[string]any, fallbackText string, fa
 		case "text":
 			if text := stringValue(block["text"]); text != "" {
 				parts = append(parts, map[string]any{"type": "text", "text": text})
+			}
+		case "image":
+			mediaType, data, ok := imageBlockData(block)
+			if ok {
+				parts = append(parts, map[string]any{
+					"type": "image",
+					"source": map[string]any{
+						"type":       "base64",
+						"media_type": mediaType,
+						"data":       data,
+					},
+				})
 			}
 		case "tool_use":
 			id := stringValue(block["id"])

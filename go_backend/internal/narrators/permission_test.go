@@ -26,10 +26,11 @@ func TestToolPermissionModesMatchTSValues(t *testing.T) {
 		{mode: "default", tool: "Write", args: `{"file_path":"note.txt","content":"x"}`, want: "ask"},
 		{mode: "acceptEdits", tool: "Write", args: `{"file_path":"note.txt","content":"x"}`, want: "allow"},
 		{mode: "acceptEdits", tool: "Edit", args: `{"file_path":"note.txt","old_string":"x","new_string":"y"}`, want: "allow"},
-		{mode: "acceptEdits", tool: "Bash", args: `{"command":"touch note.txt"}`, want: "ask"},
+		{mode: "acceptEdits", tool: "Bash", args: `{"command":"touch note.txt"}`, want: "allow"},
+		{mode: "acceptEdits", tool: "Bash", args: `{"command":"rm note.txt"}`, want: "ask"},
 		{mode: "bypassPermissions", tool: "Bash", args: `{"command":"touch note.txt"}`, want: "allow"},
 		{mode: "readOnly", tool: "Write", args: `{"file_path":"note.txt","content":"x"}`, want: "deny"},
-		{mode: "readOnly", tool: "Bash", args: `{"command":"pwd"}`, want: "deny"},
+		{mode: "readOnly", tool: "Bash", args: `{"command":"pwd"}`, want: "allow"},
 		{mode: "dontAsk", tool: "Write", args: `{"file_path":"note.txt","content":"x"}`, want: "deny"},
 	}
 
@@ -113,7 +114,7 @@ func TestWebFetchPermissionPolicyMatchesTSRules(t *testing.T) {
 		{mode: "default", want: "ask"},
 		{mode: "readOnly", want: "ask"},
 		{mode: "acceptEdits", want: "ask"},
-		{mode: "bypassPermissions", want: "ask"},
+		{mode: "bypassPermissions", want: "allow"},
 		{mode: "dontAsk", want: "deny"},
 	}
 	for _, tc := range cases {
@@ -183,8 +184,8 @@ func TestWebFetchPermissionPolicyMatchesTSRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolve non-whitelisted WebFetch: %v", err)
 	}
-	if notWhitelisted.Action != "ask" {
-		t.Fatalf("non-whitelisted WebFetch decision = %s (%s), want ask", notWhitelisted.Action, notWhitelisted.Reason)
+	if notWhitelisted.Action != "allow" {
+		t.Fatalf("non-whitelisted WebFetch decision = %s (%s), want allow in bypassPermissions", notWhitelisted.Action, notWhitelisted.Reason)
 	}
 }
 
@@ -293,6 +294,80 @@ func TestToolPermissionNarratorCommandRules(t *testing.T) {
 	}
 	if blocked.Action != "deny" || blocked.Reason != "do not remove files" {
 		t.Fatalf("blacklisted command decision = %s (%s), want deny with prompt", blocked.Action, blocked.Reason)
+	}
+}
+
+func TestToolPermissionBashCommandPathsUseDirectoryBlacklist(t *testing.T) {
+	service := newPermissionTestService(t)
+	cwd := t.TempDir()
+	blockedDir := filepath.Join(cwd, "blocked")
+	narrator := permissionTestNarrator(cwd, "readOnly")
+
+	if _, err := service.DB.Exec(`INSERT INTO narrator_whitelist_cmds (id, narrator_id, pattern, enabled, created_at) VALUES ('cw-cat', ?, 'cat blocked/*', 1, 'now')`, narrator.ID); err != nil {
+		t.Fatalf("insert command whitelist: %v", err)
+	}
+	if _, err := service.DB.Exec(`INSERT INTO narrator_blacklist_dirs (id, narrator_id, path, deny_level, enabled, created_at) VALUES ('bl-deny-all', ?, ?, 'denyAll', 1, 'now')`, narrator.ID, blockedDir); err != nil {
+		t.Fatalf("insert denyAll blacklist dir: %v", err)
+	}
+	blocked, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("Bash", `{"command":"cat blocked/secret.txt"}`))
+	if err != nil {
+		t.Fatalf("resolve blacklisted Bash path: %v", err)
+	}
+	if blocked.Action != "deny" {
+		t.Fatalf("Bash command path under denyAll blacklist should deny, got %#v", blocked)
+	}
+
+	if _, err := service.DB.Exec(`DELETE FROM narrator_blacklist_dirs`); err != nil {
+		t.Fatalf("clear blacklist dirs: %v", err)
+	}
+	if _, err := service.DB.Exec(`INSERT INTO narrator_blacklist_dirs (id, narrator_id, path, deny_level, enabled, created_at) VALUES ('bl-deny-write', ?, ?, 'denyWrite', 1, 'now')`, narrator.ID, blockedDir); err != nil {
+		t.Fatalf("insert denyWrite blacklist dir: %v", err)
+	}
+	allowedRead, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("Bash", `{"command":"cat blocked/secret.txt"}`))
+	if err != nil {
+		t.Fatalf("resolve read Bash path under denyWrite blacklist: %v", err)
+	}
+	if allowedRead.Action != "allow" {
+		t.Fatalf("read-only Bash command path under denyWrite blacklist should allow when command is whitelisted, got %#v", allowedRead)
+	}
+}
+
+func TestToolPermissionCommandWhitelistModeMatrixMatchesTS(t *testing.T) {
+	service := newPermissionTestService(t)
+	cwd := t.TempDir()
+
+	cases := []struct {
+		name    string
+		mode    string
+		pattern string
+		command string
+		want    string
+	}{
+		{name: "default asks", mode: "default", pattern: "pwd", command: "pwd", want: "ask"},
+		{name: "acceptEdits allows", mode: "acceptEdits", pattern: "pwd", command: "pwd", want: "allow"},
+		{name: "readOnly allows read command", mode: "readOnly", pattern: "pwd", command: "pwd", want: "allow"},
+		{name: "readOnly denies write command", mode: "readOnly", pattern: "rm *", command: "rm scratch.txt", want: "deny"},
+		{name: "dontAsk denies", mode: "dontAsk", pattern: "pwd", command: "pwd", want: "deny"},
+		{name: "bypass allows", mode: "bypassPermissions", pattern: "pwd", command: "pwd", want: "allow"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := service.DB.Exec(`DELETE FROM narrator_whitelist_cmds`); err != nil {
+				t.Fatalf("clear command whitelist: %v", err)
+			}
+			narrator := permissionTestNarrator(cwd, tc.mode)
+			if _, err := service.DB.Exec(`INSERT INTO narrator_whitelist_cmds (id, narrator_id, pattern, enabled, created_at) VALUES (?, ?, ?, 1, 'now')`, "cw-"+tc.name, narrator.ID, tc.pattern); err != nil {
+				t.Fatalf("insert command whitelist: %v", err)
+			}
+			decision, err := service.resolveToolPermission(context.Background(), narrator, cwd, permissionToolCall("Bash", `{"command":"`+tc.command+`"}`))
+			if err != nil {
+				t.Fatalf("resolve whitelisted command: %v", err)
+			}
+			if decision.Action != tc.want {
+				t.Fatalf("whitelisted command decision = %s (%s), want %s", decision.Action, decision.Reason, tc.want)
+			}
+		})
 	}
 }
 

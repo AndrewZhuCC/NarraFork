@@ -177,22 +177,25 @@ func graphFallback(feature, reason string, err error) map[string]any {
 	return payload
 }
 
-const CompressedAISummaryFallbackReason = "Go split compressed context uses a deterministic placeholder summary instead of a TypeScript-equivalent model-generated summary."
+const CompressedAISummaryFallbackReason = "Go split compressed context copies bounded message refs and records a deterministic context note instead of generating a TypeScript-equivalent model summary."
 
 func SplitCapability() map[string]any {
 	return map[string]any{
 		"supported": true,
 		"fallback":  false,
-		"mode":      "go-basic-split",
+		"mode":      "split-at-commit",
 		"routes": map[string]any{
 			"splitAtCommit": true,
 		},
 		"partials": map[string]any{
 			"compressedAISummary": map[string]any{
-				"supported": false,
-				"fallback":  true,
-				"mode":      "deterministic-summary-placeholder",
-				"reason":    CompressedAISummaryFallbackReason,
+				"supported":             false,
+				"fallback":              true,
+				"mode":                  "bounded-ref-copy-with-deterministic-context-note",
+				"deterministic":         true,
+				"copiesMessageRefs":     true,
+				"generatesModelSummary": false,
+				"reason":                CompressedAISummaryFallbackReason,
 			},
 			"containerAutostart": map[string]any{
 				"supported": true,
@@ -239,11 +242,13 @@ func (h *Handler) updatePositions(w http.ResponseWriter, r *http.Request) error 
 		Positions []struct {
 			ChapterID       string   `json:"chapterId"`
 			AnchorCommitSHA *string  `json:"anchorCommitSha"`
-			AxisOffset      float64  `json:"axisOffset"`
-			CrossOffset     float64  `json:"crossOffset"`
+			AxisOffset      *float64 `json:"axisOffset"`
+			CrossOffset     *float64 `json:"crossOffset"`
 			PanelExpanded   *bool    `json:"panelExpanded"`
 			PanelWidth      *float64 `json:"panelWidth"`
 			PanelHeight     *float64 `json:"panelHeight"`
+			Width           *float64 `json:"width"`
+			Height          *float64 `json:"height"`
 		} `json:"positions"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
@@ -257,7 +262,13 @@ func (h *Handler) updatePositions(w http.ResponseWriter, r *http.Request) error 
 		if strings.TrimSpace(pos.ChapterID) == "" {
 			return httpx.BadRequest("chapterId is required")
 		}
-		if pos.CrossOffset < 0 {
+		if pos.AxisOffset == nil {
+			return httpx.BadRequest("axisOffset is required")
+		}
+		if pos.CrossOffset == nil {
+			return httpx.BadRequest("crossOffset is required")
+		}
+		if *pos.CrossOffset < 0 {
 			return httpx.BadRequest("crossOffset must be non-negative")
 		}
 		chapterIDs = append(chapterIDs, pos.ChapterID)
@@ -279,7 +290,15 @@ func (h *Handler) updatePositions(w http.ResponseWriter, r *http.Request) error 
 				panelExpanded = 0
 			}
 		}
-		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height), updated_at = ? WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), pos.AxisOffset, pos.CrossOffset, panelExpanded, nullableFloatPtr(pos.PanelWidth), nullableFloatPtr(pos.PanelHeight), db.NowISO(), pos.ChapterID, projectID)
+		panelWidth := pos.PanelWidth
+		if panelWidth == nil {
+			panelWidth = pos.Width
+		}
+		panelHeight := pos.PanelHeight
+		if panelHeight == nil {
+			panelHeight = pos.Height
+		}
+		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height), updated_at = ? WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), *pos.AxisOffset, *pos.CrossOffset, panelExpanded, nullableFloatPtr(panelWidth), nullableFloatPtr(panelHeight), db.NowISO(), pos.ChapterID, projectID)
 		if err != nil {
 			return err
 		}

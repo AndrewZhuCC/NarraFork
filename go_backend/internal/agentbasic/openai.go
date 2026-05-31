@@ -123,21 +123,37 @@ const (
 var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type generateOptions struct {
-	toolExecutor         ToolExecutor
-	systemPrompt         string
-	maxTurns             int
-	reasoningEffort      string
-	toolScope            string
-	enabledTools         []string
-	disabledTools        []string
-	emitToolInventory    bool
-	externalTools        []ExternalToolSpec
-	firstTokenTimeout    time.Duration
-	maxChatRetries       int
-	emptyResponseRetries int
-	retryBaseDelay       time.Duration
-	stickySessionKey     string
+	toolExecutor                      ToolExecutor
+	systemPrompt                      string
+	maxTurns                          int
+	reasoningEffort                   string
+	toolScope                         string
+	enabledTools                      []string
+	disabledTools                     []string
+	emitToolInventory                 bool
+	externalTools                     []ExternalToolSpec
+	firstTokenTimeout                 time.Duration
+	maxChatRetries                    int
+	emptyResponseRetries              int
+	retryBaseDelay                    time.Duration
+	stickySessionKey                  string
+	sideCarCollector                  SideCarCollector
+	sideCarInitialCompletedToolCount  int
+	onSideCarCompletedToolCount       func(int)
+	silentToolCallThreshold           int
+	silentToolCallThresholdConfigured bool
+	silentToolCallCount               int
 }
+
+type SideCarRequest struct {
+	Phase              string
+	ToolName           string
+	ToolUseID          string
+	ToolInput          map[string]any
+	CompletedToolCount int
+}
+
+type SideCarCollector func(ctx context.Context, request SideCarRequest) []AgentSideCar
 
 type GenerateOption func(*generateOptions)
 
@@ -207,6 +223,21 @@ func WithStickySessionKey(sessionKey string) GenerateOption {
 	}
 }
 
+func WithSideCarCollector(initialCompletedToolCount int, collector SideCarCollector, onCompletedToolCount func(int)) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.sideCarInitialCompletedToolCount = initialCompletedToolCount
+		opts.sideCarCollector = collector
+		opts.onSideCarCompletedToolCount = onCompletedToolCount
+	}
+}
+
+func WithSilentToolCallThreshold(threshold int) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.silentToolCallThreshold = threshold
+		opts.silentToolCallThresholdConfigured = true
+	}
+}
+
 func Generate(ctx context.Context, settings *config.Store, model string, history []Message, cwd string, opts ...GenerateOption) (Result, error) {
 	stream, err := RunAgentLoop(ctx, settings, model, history, cwd, opts...)
 	if err != nil {
@@ -217,12 +248,13 @@ func Generate(ctx context.Context, settings *config.Store, model string, history
 
 func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 	options := generateOptions{
-		systemPrompt:         DefaultSystemPrompt,
-		maxTurns:             defaultMaxTurns,
-		toolScope:            "normal",
-		maxChatRetries:       defaultMaxChatRetries,
-		emptyResponseRetries: defaultEmptyResponseRetries,
-		retryBaseDelay:       200 * time.Millisecond,
+		systemPrompt:            DefaultSystemPrompt,
+		maxTurns:                defaultMaxTurns,
+		toolScope:               "normal",
+		maxChatRetries:          defaultMaxChatRetries,
+		emptyResponseRetries:    defaultEmptyResponseRetries,
+		retryBaseDelay:          200 * time.Millisecond,
+		silentToolCallThreshold: 20,
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -231,6 +263,9 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 	}
 	if strings.TrimSpace(options.systemPrompt) == "" {
 		options.systemPrompt = DefaultSystemPrompt
+	}
+	if options.silentToolCallThreshold < -1 {
+		options.silentToolCallThreshold = -1
 	}
 	if options.maxTurns <= 0 {
 		options.maxTurns = defaultMaxTurns
@@ -480,7 +515,7 @@ func toolSpecs() []toolSpec {
 					"description":       stringProp("Short description of what the command does"),
 					"timeout":           map[string]any{"type": "number", "description": "Timeout in milliseconds, capped at 600000"},
 					"workdir":           stringProp("Optional working directory under the narrator cwd"),
-					"run_in_background": map[string]any{"type": "boolean", "description": "Run in background; Go runtime currently rejects this explicitly"},
+					"run_in_background": map[string]any{"type": "boolean", "description": "Run in background and return a task ID when executed through a narrator session"},
 					"strict_serial":     map[string]any{"type": "boolean", "description": "Execute strictly serially instead of parallelizing with other eager tools"},
 				},
 				"required":             []string{"command"},
@@ -598,6 +633,7 @@ func toolSpecs() []toolSpec {
 				"additionalProperties": false,
 			},
 		},
+		recallToolSpec(),
 		terminalToolSpec(),
 		{
 			Name:        "ShareFile",
@@ -637,14 +673,14 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "Await",
-			Description: "Wait for or inspect a background subagent result.",
+			Description: "Wait for or inspect a background agent or bash result.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"type":          map[string]any{"type": "string", "enum": []string{"agent", "bash"}, "description": "What to await: agent or bash"},
 					"id":            stringProp("Subagent id or alias"),
 					"timeout":       map[string]any{"type": "number", "description": "Milliseconds to wait, capped at 30000"},
-					"wait_for_text": stringProp("For type=bash only: return early once matching output appears; Go runtime currently exposes this as unsupported via capabilities"),
+					"wait_for_text": stringProp("For type=bash only: return early once matching output appears"),
 				},
 				"required":             []string{"type", "id"},
 				"additionalProperties": false,
@@ -917,6 +953,37 @@ func toolSpecs() []toolSpec {
 	}
 }
 
+func recallToolSpec() toolSpec {
+	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+	return toolSpec{
+		Name:        "Recall",
+		Description: "Search and browse the current narrator conversation. Go supports a self-scoped, read-only subset: search, read_conversation, and read_tool_call.",
+		Parameters: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type":        "string",
+					"enum":        []string{"search", "read_conversation", "read_tool_call"},
+					"description": "Action to perform: search, read_conversation, or read_tool_call",
+				},
+				"query": map[string]any{
+					"description": "Search query string or an array of query strings for action=search",
+					"oneOf":       []map[string]any{{"type": "string"}, {"type": "array", "items": map[string]any{"type": "string"}}},
+				},
+				"narrator_id":  stringProp("Optional narrator ID; when provided it must match the current narrator"),
+				"message_id":   stringProp("Optional message ID to center read_conversation around"),
+				"tool_call_id": stringProp("Tool use ID for action=read_tool_call"),
+				"limit":        map[string]any{"type": "number", "description": "Bounded result count; search/read default 20, max 50"},
+				"from":         stringProp("Optional absolute start time for search"),
+				"to":           stringProp("Optional absolute end time for search"),
+				"time_range":   stringProp("Optional relative search window such as 24h, 7d, 2w, 1mo, or 1y"),
+			},
+			"required":             []string{"action"},
+			"additionalProperties": false,
+		},
+	}
+}
+
 func terminalToolSpec() toolSpec {
 	stringProp := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
 	terminalActions := []string{"read", "write", "list", "create", "rename"}
@@ -1021,7 +1088,7 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 	switch name {
 	case "Bash":
 		if boolValue(args["run_in_background"]) {
-			return "Bash run_in_background is not supported in the Go backend yet; run the command in foreground or use Terminal for long-running interactive processes.", nil
+			return "Bash run_in_background requires narrator context; non-narrator ExecuteTool only supports foreground Bash commands.", nil
 		}
 		bashCwd := cwd
 		if workdir := strings.TrimSpace(stringValue(args["workdir"])); workdir != "" {
@@ -1086,6 +1153,8 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 		return toolShareFile(cwd, args["path"], boolValue(args["compress"]), boolValue(args["preview"])), nil
 	case "Browser":
 		return toolBrowser(ctx, cwd, args), nil
+	case "Recall":
+		return "Recall requires narrator context and cannot run outside a narrator session; no database was accessed.", nil
 	case "Terminal", "Agent", "Await", "TeamStatus", "Send", "AskUserQuestion", "Skill", "LearningGuide", "TaskCreate", "StartPipeline", "EndPipeline", "EnterPlanMode", "ExitPlanMode", "GetGoals", "AddGoal", "UpdateGoal":
 		return name + " requires narrator context and cannot run outside a narrator session", nil
 	default:

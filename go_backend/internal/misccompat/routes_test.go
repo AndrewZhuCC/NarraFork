@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"narrafork-go/internal/httpx"
+	"narrafork-go/internal/narrators"
 )
 
 func TestPublicShareRegistrationExposesOnlyDownloadAndPreview(t *testing.T) {
@@ -92,6 +94,7 @@ func TestStorageCachedReturnsLastCompletedScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
+	database.SetMaxOpenConns(1)
 	defer database.Close()
 	if _, err := database.Exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, git_path TEXT, updated_at TEXT)`); err != nil {
 		t.Fatalf("create projects: %v", err)
@@ -152,32 +155,53 @@ func TestStorageCachedReturnsLastCompletedScan(t *testing.T) {
 	}
 }
 
-func TestDatabaseCleanupSessionTargetsReturnExplicitFeatureDisabledFallback(t *testing.T) {
+func TestDatabaseCleanupStaleSessionsReturnsArchivedOnlyFeatureDisabledFallback(t *testing.T) {
 	h := NewHandler(nil)
-	for _, target := range []string{"archivedSessions", "staleSessions"} {
-		t.Run(target, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"`+target+`"}`))
-			req.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"staleSessions"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
 
-			if err := h.databaseCleanup(w, req); err != nil {
-				t.Fatalf("database cleanup %s returned error: %v", target, err)
-			}
-			if w.Code != http.StatusNotImplemented {
-				t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
-			}
-			var body map[string]any
-			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-				t.Fatalf("decode fallback body: %v", err)
-			}
-			if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "storage.database.cleanup."+target || body["supported"] != false || body["fallback"] != true {
-				t.Fatalf("unexpected session cleanup fallback body: %#v", body)
-			}
-			reason, _ := body["reason"].(string)
-			if !strings.Contains(reason, "safe narrator deletion plan") || body["error"] != reason || body["message"] != reason {
-				t.Fatalf("session cleanup fallback should expose reason/error/message, got %#v", body)
-			}
-		})
+	if err := h.databaseCleanup(w, req); err != nil {
+		t.Fatalf("database cleanup staleSessions returned error: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode fallback body: %v", err)
+	}
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "storage.database.cleanup.staleSessions" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected stale cleanup fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if !strings.Contains(reason, "archived-only deletion policy") || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("stale cleanup fallback should expose archived-only reason/error/message, got %#v", body)
+	}
+}
+
+func TestDatabaseCleanupArchivedSessionsMissingNarratorServiceReturnsFeatureDisabled(t *testing.T) {
+	h := NewHandler(nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"archivedSessions"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	if err := h.databaseCleanup(w, req); err != nil {
+		t.Fatalf("database cleanup archivedSessions returned error: %v", err)
+	}
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode fallback body: %v", err)
+	}
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "storage.database.cleanup.archivedSessions" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected archived cleanup fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if !strings.Contains(reason, "safe narrator delete path") || !strings.Contains(reason, "h.Narrators") || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("archived cleanup fallback should expose missing narrator service reason, got %#v", body)
 	}
 }
 
@@ -385,6 +409,42 @@ func TestDatabaseCleanupPreviewMarksApiDumpStatsErrorsDegraded(t *testing.T) {
 	}
 }
 
+func TestDatabaseCleanupArchivedSessionsDeletesThroughNarratorService(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	database := openDatabaseCleanupNarratorTestDB(t)
+	insertDatabaseCleanupNarrator(t, database, "nar-root", "", "archived", "2026-01-01T00:00:00Z")
+	insertDatabaseCleanupNarrator(t, database, "nar-child", "nar-root", "archived", "2026-01-02T00:00:00Z")
+	insertDatabaseCleanupNarrator(t, database, "nar-active", "", "idle", "2026-01-03T00:00:00Z")
+	if _, err := database.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES ('msg-child', 'nar-child', 'user', '[{"type":"text","text":"child"}]', '', '2026-01-02T00:00:00Z')`); err != nil {
+		t.Fatalf("insert child message: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('ref-child', 'nar-child', 'msg-child', 1)`); err != nil {
+		t.Fatalf("insert child message ref: %v", err)
+	}
+	h := NewHandler(database, &narrators.Service{DB: database})
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"archivedSessions"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	if err := h.databaseCleanup(w, req); err != nil {
+		t.Fatalf("database cleanup archivedSessions returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected cleanup 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode cleanup body: %v", err)
+	}
+	if body["ok"] != true || body["changed"] != true || body["vacuumRan"] != false || body["target"] != "archivedSessions" {
+		t.Fatalf("unexpected archived cleanup body: %#v", body)
+	}
+	assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM narrators WHERE id IN ('nar-root', 'nar-child')`, 0)
+	assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM narrators WHERE id = 'nar-active'`, 1)
+	assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM narrator_messages WHERE id = 'msg-child'`, 0)
+	assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM narrator_message_refs WHERE message_id = 'msg-child'`, 0)
+}
+
 func TestDeleteNarratorSessionsIsFeatureDisabled(t *testing.T) {
 	database := openCleanupDeleteTestDB(t)
 	if _, err := database.Exec(`INSERT INTO narrators (id) VALUES ('nar-1')`); err != nil {
@@ -446,6 +506,109 @@ func TestRulerMutationsMissingServicesExposeFeatureDisabledFallback(t *testing.T
 		if reason == "" || body["error"] != reason || body["message"] != reason {
 			t.Fatalf("ruler fallback for %s should expose reason/error/message, got %#v", tc.path, body)
 		}
+	}
+}
+
+func openDatabaseCleanupNarratorTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	database.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = database.Close() })
+	for _, stmt := range []string{
+		`CREATE TABLE narrators (
+			id TEXT PRIMARY KEY,
+			chapter_id TEXT,
+			api_conversation_id TEXT,
+			fork_message_id TEXT,
+			type TEXT,
+			subagent_type TEXT,
+			title TEXT,
+			inherit_mode TEXT,
+			parent_narrator_id TEXT,
+			context_summary TEXT,
+			model TEXT,
+			system_prompt TEXT,
+			permission_mode TEXT,
+			previous_permission_mode TEXT,
+			plan_file_id TEXT,
+			reasoning_effort TEXT,
+			fast_mode INTEGER DEFAULT 0,
+			relaxed_plan INTEGER DEFAULT 0,
+			plan_reflection_auto_approve_override TEXT DEFAULT 'inherit',
+			danger_reflection_override TEXT DEFAULT 'inherit',
+			message_count INTEGER DEFAULT 0,
+			total_cost_usd REAL DEFAULT 0,
+			last_message_at TEXT,
+			status TEXT DEFAULT 'idle',
+			substatus TEXT DEFAULT '[]',
+			plan_mode INTEGER DEFAULT 0,
+			cwd TEXT,
+			prune_boundary_message_id TEXT,
+			pruned_percent INTEGER,
+			prune_enabled INTEGER DEFAULT 1,
+			enabled_tools TEXT,
+			error_message TEXT,
+			todos_json TEXT,
+			todos_tool_use_id TEXT,
+			variant TEXT DEFAULT 'primary',
+			traits TEXT DEFAULT '[]',
+			is_background INTEGER DEFAULT 0,
+			background_status TEXT,
+			background_result TEXT,
+			background_completed_at TEXT,
+			is_ask_in_passing INTEGER DEFAULT 0,
+			message_version INTEGER DEFAULT 0,
+			created_at TEXT,
+			updated_at TEXT
+		)`,
+		`CREATE TABLE narrator_messages (
+			id TEXT PRIMARY KEY,
+			narrator_id TEXT,
+			parent_tool_use_id TEXT,
+			role TEXT,
+			content_json TEXT,
+			content_text TEXT,
+			created_at TEXT
+		)`,
+		`CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER)`,
+		`CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT)`,
+		`CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, raw_dump_json TEXT, created_at TEXT)`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("create cleanup narrator schema: %v", err)
+		}
+	}
+	return database
+}
+
+func insertDatabaseCleanupNarrator(t *testing.T, database *sql.DB, narratorID, parentID, status, updatedAt string) {
+	t.Helper()
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
+	_, err := database.Exec(`INSERT INTO narrators (
+		id, parent_narrator_id, type, title, inherit_mode, model, permission_mode, status, substatus,
+		plan_mode, cwd, variant, traits, is_background, is_ask_in_passing, message_version,
+		message_count, total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, ?, 'primary', ?, 'fresh', 'openai:test', 'default', ?, '[]', 0, '', 'primary', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, narratorID, parent, narratorID, status, updatedAt, updatedAt)
+	if err != nil {
+		t.Fatalf("insert cleanup narrator %s: %v", narratorID, err)
+	}
+}
+
+func assertCleanupRowCount(t *testing.T, database *sql.DB, query string, want int) {
+	t.Helper()
+	var got int
+	if err := database.QueryRow(query).Scan(&got); err != nil {
+		t.Fatalf("count query %q: %v", query, err)
+	}
+	if got != want {
+		t.Fatalf("count query %q = %d, want %d", query, got, want)
 	}
 }
 
@@ -514,8 +677,165 @@ func TestNotificationSoundUploadRejectsMissingFileWithBadRequest(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
 		t.Fatalf("decode response: %v body=%s", err, w.Body.String())
 	}
-	if payload["code"] != "BAD_REQUEST" || payload["message"] != "missing file in form data" || payload["error"] != "missing file in form data" {
+	if payload["code"] != "VALIDATION_ERROR" || payload["message"] != "Missing file in form data" || payload["error"] != "Missing file in form data" {
 		t.Fatalf("unexpected notification sound diagnostics: %#v", payload)
+	}
+}
+
+func TestNotificationSoundUploadMatchesTSMimeSizeAndStatus(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	router := chi.NewRouter()
+	h := NewHandler(nil)
+	router.Route("/api/notification-sounds", h.RegisterNotificationSounds)
+
+	badMime := performNotificationSoundUpload(t, router, "tone.mp3", "application/octet-stream", []byte("ID3"))
+	if badMime.Code != http.StatusBadRequest {
+		t.Fatalf("unsupported MIME with mp3 extension should be rejected, got %d: %s", badMime.Code, badMime.Body.String())
+	}
+
+	tooLarge := performNotificationSoundUpload(t, router, "tone.mp3", "audio/mpeg", bytes.Repeat([]byte("x"), 1024*1024+1))
+	if tooLarge.Code != http.StatusBadRequest {
+		t.Fatalf("oversized sound should be rejected, got %d: %s", tooLarge.Code, tooLarge.Body.String())
+	}
+
+	ok := performNotificationSoundUpload(t, router, "tone.mp3", "audio/mpeg", []byte("ID3"))
+	if ok.Code != http.StatusOK {
+		t.Fatalf("valid sound upload should match TS 200, got %d: %s", ok.Code, ok.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(ok.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode upload body: %v", err)
+	}
+	if body["id"] == "" || body["filename"] == "" || body["mediaType"] != "audio/mpeg" {
+		t.Fatalf("unexpected upload response: %#v", body)
+	}
+}
+
+func TestNotificationSoundsAreUserScopedAndValidateIDs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	userADir := filepath.Join(home, ".narrafork", "notification-sounds", "user-a")
+	if err := os.MkdirAll(userADir, 0o755); err != nil {
+		t.Fatalf("mkdir user sound dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(userADir, "sound1234.mp3"), []byte("ID3"), 0o644); err != nil {
+		t.Fatalf("write user sound: %v", err)
+	}
+	if path, err := findSoundFile("sound1234", "user-a"); err != nil || path == "" {
+		t.Fatalf("expected own sound to be found, path=%q err=%v", path, err)
+	}
+	if path, err := findSoundFile("sound1234", "user-b"); err != nil || path != "" {
+		t.Fatalf("sound lookup must not cross user dirs, path=%q err=%v", path, err)
+	}
+	if _, err := findSoundFile("..", "user-a"); err == nil {
+		t.Fatalf("invalid sound id should be rejected")
+	}
+}
+
+func performNotificationSoundUpload(t *testing.T, router http.Handler, filename, mediaType string, content []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", `form-data; name="file"; filename="`+filename+`"`)
+	header.Set("Content-Type", mediaType)
+	part, err := writer.CreatePart(header)
+	if err != nil {
+		t.Fatalf("create multipart part: %v", err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("write multipart file: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/notification-sounds/", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func TestHookPositiveCRUDAndUpdateValidationMatchTS(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	_, err = database.Exec(`CREATE TABLE hooks (
+		id TEXT PRIMARY KEY,
+		project_id TEXT,
+		event TEXT NOT NULL,
+		matcher TEXT NOT NULL DEFAULT '',
+		type TEXT NOT NULL,
+		command TEXT,
+		url TEXT,
+		headers TEXT,
+		prompt TEXT,
+		model TEXT,
+		timeout INTEGER NOT NULL DEFAULT 30,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		sort_order INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		t.Fatalf("create hooks table: %v", err)
+	}
+
+	router := chi.NewRouter()
+	h := NewHandler(database)
+	router.Route("/hooks", h.RegisterHooks)
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	created := request(http.MethodPost, "/hooks", `{"event":"PreToolUse","matcher":"Read","type":"command","command":"true","timeout":5,"enabled":true,"sortOrder":2}`)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", created.Code, created.Body.String())
+	}
+	var createBody map[string]any
+	if err := json.Unmarshal(created.Body.Bytes(), &createBody); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	hookID, _ := createBody["id"].(string)
+	if hookID == "" || createBody["matcher"] != "Read" || createBody["type"] != "command" || createBody["headers"] != nil {
+		t.Fatalf("unexpected create body: %#v", createBody)
+	}
+
+	updated := request(http.MethodPut, "/hooks/"+hookID, `{"matcher":"","type":"http","url":"https://example.com/hook","headers":{"X-Test":"yes"},"timeout":10,"enabled":false}`)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", updated.Code, updated.Body.String())
+	}
+	var updateBody map[string]any
+	if err := json.Unmarshal(updated.Body.Bytes(), &updateBody); err != nil {
+		t.Fatalf("decode update: %v", err)
+	}
+	headers, _ := updateBody["headers"].(map[string]any)
+	if updateBody["matcher"] != "" || updateBody["type"] != "http" || updateBody["url"] != "https://example.com/hook" || updateBody["enabled"] != false || headers["X-Test"] != "yes" {
+		t.Fatalf("unexpected update body: %#v", updateBody)
+	}
+
+	clearActiveURL := request(http.MethodPut, "/hooks/"+hookID, `{"url":null}`)
+	if clearActiveURL.Code != http.StatusBadRequest {
+		t.Fatalf("clear active url status = %d body=%s", clearActiveURL.Code, clearActiveURL.Body.String())
+	}
+	missingInvalid := request(http.MethodPut, "/hooks/missing", `{"type":"bad"}`)
+	if missingInvalid.Code != http.StatusNotFound {
+		t.Fatalf("missing update should 404 before body validation, got %d body=%s", missingInvalid.Code, missingInvalid.Body.String())
+	}
+
+	deleted := request(http.MethodDelete, "/hooks/"+hookID, `{}`)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", deleted.Code, deleted.Body.String())
+	}
+	afterDelete := request(http.MethodGet, "/hooks/"+hookID, "")
+	if afterDelete.Code != http.StatusNotFound {
+		t.Fatalf("detail after delete status = %d body=%s", afterDelete.Code, afterDelete.Body.String())
 	}
 }
 

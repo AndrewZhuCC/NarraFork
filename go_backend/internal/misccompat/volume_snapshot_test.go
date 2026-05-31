@@ -87,6 +87,35 @@ func TestVolumeSnapshotCreateApplyDeleteUsesPodmanArchive(t *testing.T) {
 	}
 }
 
+func TestVolumeSnapshotCreatePrefersFrontendChapterID(t *testing.T) {
+	sqlDB := newVolumeSnapshotTestDB(t)
+	h := NewHandler(sqlDB)
+	router := volumeSnapshotTestRouter(h)
+	withVolumeSnapshotTestEnv(t, t.TempDir(), 1<<20, true)
+
+	createBody := bytes.NewBufferString(`{
+		"chapterId":"c1",
+		"sourceChapterId":"other",
+		"serviceName":"db",
+		"containerPath":"/data",
+		"name":"Seed data"
+	}`)
+	createReq := httptest.NewRequest(http.MethodPost, "/api/projects/p1/volume-snapshots", createBody)
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, body %s", createRec.Code, createRec.Body.String())
+	}
+
+	var created map[string]any
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if got := created["sourceChapterId"]; got != "c1" {
+		t.Fatalf("sourceChapterId = %#v, want c1", got)
+	}
+}
+
 func TestVolumeSnapshotCreateReturnsExplicitFallbackWithoutPodman(t *testing.T) {
 	sqlDB := newVolumeSnapshotTestDB(t)
 	h := NewHandler(sqlDB)
@@ -96,7 +125,7 @@ func TestVolumeSnapshotCreateReturnsExplicitFallbackWithoutPodman(t *testing.T) 
 	req := httptest.NewRequest(http.MethodPost, "/api/projects/p1/volume-snapshots", bytes.NewBufferString(`{"chapterId":"c1","serviceName":"db","containerPath":"/data","name":"Seed data"}`))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusNotImplemented {
 		t.Fatalf("fallback status = %d, body %s", rec.Code, rec.Body.String())
 	}
 	var payload map[string]any
@@ -105,6 +134,53 @@ func TestVolumeSnapshotCreateReturnsExplicitFallbackWithoutPodman(t *testing.T) 
 	}
 	if payload["fallback"] != true || payload["supported"] != false || payload["code"] != "PODMAN_NOT_FOUND" || payload["reason"] == "" {
 		t.Fatalf("unexpected fallback payload: %#v", payload)
+	}
+	if got := countVolumeSnapshotRows(t, sqlDB, "volume_snapshots"); got != 0 {
+		t.Fatalf("snapshot rows = %d, want 0", got)
+	}
+}
+
+func TestVolumeSnapshotUpdateClearsNullableDescription(t *testing.T) {
+	sqlDB := newVolumeSnapshotTestDB(t)
+	h := NewHandler(sqlDB)
+	router := volumeSnapshotTestRouter(h)
+	if _, err := sqlDB.Exec(`INSERT INTO volume_snapshots (id, project_id, name, description, source_chapter_id, service_name, container_path, size_bytes, created_at, updated_at) VALUES ('snap-update', 'p1', 'Before', 'clear me', 'c1', 'db', '/data', 1, 'now', 'now')`); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/volume-snapshots/snap-update", bytes.NewBufferString(`{"description":null}`))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["description"] != nil {
+		t.Fatalf("description should be null after update, got %#v", body)
+	}
+}
+
+func TestVolumeSnapshotValidatesBeforeUnsupportedRuntimeFallback(t *testing.T) {
+	sqlDB := newVolumeSnapshotTestDB(t)
+	h := NewHandler(sqlDB)
+	router := volumeSnapshotTestRouter(h)
+	withVolumeSnapshotTestEnv(t, t.TempDir(), 1<<20, false)
+
+	invalidCreate := httptest.NewRequest(http.MethodPost, "/api/projects/p1/volume-snapshots", bytes.NewBufferString(`{"serviceName":"db","containerPath":"/data","name":"Missing chapter"}`))
+	invalidRec := httptest.NewRecorder()
+	router.ServeHTTP(invalidRec, invalidCreate)
+	if invalidRec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid create should be validated before fallback, got %d body=%s", invalidRec.Code, invalidRec.Body.String())
+	}
+
+	missingApply := httptest.NewRequest(http.MethodPost, "/api/volume-snapshots/missing/apply", bytes.NewBufferString(`{"targetChapterId":"c2"}`))
+	missingRec := httptest.NewRecorder()
+	router.ServeHTTP(missingRec, missingApply)
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("missing apply should return 404 before fallback, got %d body=%s", missingRec.Code, missingRec.Body.String())
 	}
 	if got := countVolumeSnapshotRows(t, sqlDB, "volume_snapshots"); got != 0 {
 		t.Fatalf("snapshot rows = %d, want 0", got)

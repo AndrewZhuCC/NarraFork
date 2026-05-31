@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -67,6 +69,39 @@ func TestEnsureMigrationCompatibilityCreatesOnlyGoJournalAfterCanonicalSchemaRea
 	}
 	if len(details.ExtraHashes) != 0 {
 		t.Fatalf("expected no extra hashes, got %#v", details.ExtraHashes)
+	}
+}
+
+func TestEnsureMigrationCompatibilityAcceptsCurrentRepositoryBaselineJournal(t *testing.T) {
+	sqlDB := openCanonicalSchemaTestDB(t)
+	defer sqlDB.Close()
+	createCanonicalSchemaTables(t, sqlDB)
+	createDrizzleMigrationsTable(t, sqlDB, currentRepositoryDrizzleBaselineSnapshot, nil)
+
+	if err := EnsureMigrationCompatibility(context.Background(), sqlDB); err != nil {
+		t.Fatalf("EnsureMigrationCompatibility returned error for current repository baseline journal: %v", err)
+	}
+	journal := readGoMigrationJournalForTest(t, sqlDB)
+	baseline := currentRepositoryDrizzleBaselineSnapshot[0]
+	if journal.ExpectedCount != 1 || journal.ExpectedLastTag != baseline.Tag || journal.ExpectedJournalHash != drizzleJournalHash(currentRepositoryDrizzleBaselineSnapshot) {
+		t.Fatalf("unexpected baseline Go journal: %#v", journal)
+	}
+	var details migrationCompatibilityDetails
+	if err := json.Unmarshal([]byte(journal.DetailsJSON), &details); err != nil {
+		t.Fatalf("unmarshal details_json: %v", err)
+	}
+	if details.ExpectedJournalName != "current-repository-baseline" || details.ObservedCount != 1 || len(details.ExtraHashes) != 0 {
+		t.Fatalf("unexpected baseline details: %#v", details)
+	}
+}
+
+func TestCurrentRepositoryBaselineSnapshotMatchesRepository(t *testing.T) {
+	entries, err := readRepositoryDrizzleJournalEntries(t)
+	if err != nil {
+		t.Fatalf("read repository Drizzle journal: %v", err)
+	}
+	if !reflect.DeepEqual(currentRepositoryDrizzleBaselineSnapshot, entries) {
+		t.Fatalf("current repository baseline snapshot = %#v, want %#v", currentRepositoryDrizzleBaselineSnapshot, entries)
 	}
 }
 
@@ -184,12 +219,24 @@ func TestCanonicalSchemaHashIsStableAndDoesNotDependOnJournalTable(t *testing.T)
 	}
 }
 
-func TestEmbeddedDrizzleJournalSnapshotMatchesRepository(t *testing.T) {
+func TestEmbeddedDrizzleJournalSnapshotMatchesBunFinalArtifact(t *testing.T) {
+	data, err := bunfinal.ReadDrizzleJournalSnapshot()
+	if err != nil {
+		t.Fatalf("read bun-final Drizzle journal artifact: %v", err)
+	}
+	entries := parseBunFinalDrizzleJournalArtifactEntries(t, data)
+	if !reflect.DeepEqual(embeddedDrizzleMigrationSnapshot, entries) {
+		t.Fatalf("embedded Drizzle snapshot = %#v, want bun-final artifact entries %#v", embeddedDrizzleMigrationSnapshot, entries)
+	}
+}
+
+func readRepositoryDrizzleJournalEntries(t *testing.T) ([]drizzleMigrationSnapshotEntry, error) {
+	t.Helper()
 	root := repositoryRootWithDrizzle(t)
 	journalPath := filepath.Join(root, "drizzle", "meta", "_journal.json")
 	journalBytes, err := os.ReadFile(journalPath)
 	if err != nil {
-		t.Fatalf("read %s: %v", journalPath, err)
+		return nil, fmt.Errorf("read %s: %w", journalPath, err)
 	}
 	var journal struct {
 		Entries []struct {
@@ -198,27 +245,38 @@ func TestEmbeddedDrizzleJournalSnapshotMatchesRepository(t *testing.T) {
 		} `json:"entries"`
 	}
 	if err := json.Unmarshal(journalBytes, &journal); err != nil {
-		t.Fatalf("parse Drizzle journal: %v", err)
+		return nil, fmt.Errorf("parse Drizzle journal: %w", err)
 	}
-	if len(journal.Entries) != len(embeddedDrizzleMigrationSnapshot) {
-		t.Fatalf("snapshot has %d entries, repository journal has %d", len(embeddedDrizzleMigrationSnapshot), len(journal.Entries))
-	}
-	for i, entry := range journal.Entries {
+	entries := make([]drizzleMigrationSnapshotEntry, 0, len(journal.Entries))
+	for _, entry := range journal.Entries {
 		sqlPath := filepath.Join(root, "drizzle", entry.Tag+".sql")
 		sqlBytes, err := os.ReadFile(sqlPath)
 		if err != nil {
-			t.Fatalf("read %s: %v", sqlPath, err)
+			return nil, fmt.Errorf("read %s: %w", sqlPath, err)
 		}
 		sum := sha256.Sum256(sqlBytes)
-		want := drizzleMigrationSnapshotEntry{
-			Tag:  entry.Tag,
-			When: entry.When,
-			Hash: hex.EncodeToString(sum[:]),
-		}
-		if embeddedDrizzleMigrationSnapshot[i] != want {
-			t.Fatalf("snapshot[%d] = %#v, want %#v", i, embeddedDrizzleMigrationSnapshot[i], want)
-		}
+		entries = append(entries, drizzleMigrationSnapshotEntry{Tag: entry.Tag, When: entry.When, Hash: hex.EncodeToString(sum[:])})
 	}
+	return entries, nil
+}
+
+func parseBunFinalDrizzleJournalArtifactEntries(t *testing.T, data []byte) []drizzleMigrationSnapshotEntry {
+	t.Helper()
+	var artifact struct {
+		Entries []struct {
+			Tag  string `json:"tag"`
+			When int64  `json:"when"`
+			Hash string `json:"hash"`
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		t.Fatalf("parse bun-final Drizzle journal artifact: %v", err)
+	}
+	entries := make([]drizzleMigrationSnapshotEntry, 0, len(artifact.Entries))
+	for _, entry := range artifact.Entries {
+		entries = append(entries, drizzleMigrationSnapshotEntry{Tag: entry.Tag, When: entry.When, Hash: entry.Hash})
+	}
+	return entries
 }
 
 func TestBunFinalDrizzleJournalArtifactMatchesEmbeddedSnapshot(t *testing.T) {

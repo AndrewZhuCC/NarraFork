@@ -113,6 +113,33 @@ func TestMergeRejectsStaleApprovedReview(t *testing.T) {
 	}
 }
 
+func TestRequiredReviewRejectsMissingAndNonApprovedConclusions(t *testing.T) {
+	cases := []struct {
+		name     string
+		verdict  string
+		wantText string
+	}{
+		{name: "missing review", wantText: "No review found"},
+		{name: "request changes", verdict: "request_changes", wantText: "Latest review verdict: request_changes"},
+		{name: "comment only", verdict: "comment_only", wantText: "Latest review verdict: comment_only"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			database := openMergeParityDB(t)
+			if tc.verdict != "" {
+				if _, err := database.Exec(`INSERT INTO review_conclusions (id, review_chapter_id, source_chapter_id, verdict, findings_json, created_at) VALUES ('rc1', 'review', 'source', ?, '[]', 'now')`, tc.verdict); err != nil {
+					t.Fatalf("insert review conclusion: %v", err)
+				}
+			}
+			svc := &Service{DB: database}
+			err := svc.ensureSourceReadyForRequiredReview(context.Background(), Chapter{ID: "source", Branch: "chapter/source"}, "/repo")
+			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("required review error = %v, want %q", err, tc.wantText)
+			}
+		})
+	}
+}
+
 func setupMergeParityRepo(t *testing.T) (repo string, sourceWT string, sourceHead string) {
 	t.Helper()
 	repo = t.TempDir()
@@ -168,6 +195,30 @@ func TestDeleteChapterReturnsNarratorArchiveErrorWithoutDeletingChapter(t *testi
 	}
 	if narratorChapterID != "delete-me" {
 		t.Fatalf("failed archive should keep narrator chapter reference, got %q", narratorChapterID)
+	}
+}
+
+func TestDeleteChapterRemovesRecentTabs(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, base_branch, is_root, commit_count, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('delete-me', 'project', 'Delete Me', 'active', 'branch', 'chapter/delete-me', 'main', 0, 0, 0, 0, 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO user_preferences (id, user_id, recent_tabs, updated_at) VALUES ('pref1', 'u1', '[{"type":"chapter","id":"delete-me","title":"Delete Me"},{"type":"narrator","id":"n1","chapterId":"delete-me"},{"type":"project","id":"project","title":"Project"}]', 'now')`); err != nil {
+		t.Fatalf("insert user preferences: %v", err)
+	}
+
+	if err := (&Service{DB: database}).Delete(context.Background(), "delete-me"); err != nil {
+		t.Fatalf("delete chapter: %v", err)
+	}
+	var tabs string
+	if err := database.QueryRow(`SELECT recent_tabs FROM user_preferences WHERE user_id = 'u1'`).Scan(&tabs); err != nil {
+		t.Fatalf("load recent tabs: %v", err)
+	}
+	if strings.Contains(tabs, "delete-me") || !strings.Contains(tabs, `"type":"project"`) {
+		t.Fatalf("recent_tabs should remove chapter references and keep unrelated tabs, got %s", tabs)
 	}
 }
 
@@ -353,6 +404,7 @@ func openMergeParityDB(t *testing.T) *sql.DB {
 		`CREATE TABLE terminals (id TEXT PRIMARY KEY, chapter_id TEXT)`,
 		`CREATE TABLE terminal_tabs (id TEXT PRIMARY KEY, chapter_id TEXT)`,
 		`CREATE TABLE terminal_view_state (id TEXT PRIMARY KEY, chapter_id TEXT)`,
+		`CREATE TABLE user_preferences (id TEXT PRIMARY KEY, user_id TEXT, recent_tabs TEXT, updated_at TEXT)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := database.Exec(stmt); err != nil {

@@ -167,6 +167,9 @@ func TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata(t *testing.T) {
 	}
 	insertToolCallTestRow(t, sqlDB, narratorID, assistant.ID, "route_tool")
 	childID := insertChildMessageTestRow(t, sqlDB, childNarratorID, "route_tool", 1, "route child")
+	if _, err := sqlDB.Exec(`UPDATE narrator_messages SET sdk_message_uuid = ? WHERE id = ?`, "sdk-msg-route", childID); err != nil {
+		t.Fatalf("set child sdk uuid: %v", err)
+	}
 
 	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/messages?after="+assistant.ID)
 	if w.Code != http.StatusOK {
@@ -182,6 +185,10 @@ func TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata(t *testing.T) {
 	orphans, _ := body["orphanChildren"].([]any)
 	if len(orphans) != 1 || orphans[0].(map[string]any)["id"] != childID {
 		t.Fatalf("expected route orphan child %s, got %#v", childID, body["orphanChildren"])
+	}
+	child, _ := orphans[0].(map[string]any)
+	if child["messageUuid"] != "sdk-msg-route" || child["sdkMessageUuid"] != "sdk-msg-route" {
+		t.Fatalf("expected TS-compatible messageUuid alias, got %#v", child)
 	}
 	if _, ok := body["cursor"].(map[string]any); !ok {
 		t.Fatalf("expected cursor metadata, got %#v", body["cursor"])

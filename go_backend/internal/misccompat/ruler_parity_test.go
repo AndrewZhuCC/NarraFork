@@ -123,8 +123,8 @@ func TestRulerProjectChaptersResolvesNarratorFromNarratorsTable(t *testing.T) {
 	if got := stringMap(first, "narratorId", ""); got != "n-primary" {
 		t.Fatalf("narratorId = %q, want n-primary", got)
 	}
-	if got := stringMap(first, "narratorStatus", ""); got != "working" {
-		t.Fatalf("narratorStatus = %q, want working", got)
+	if got := stringMap(first, "narratorStatus", ""); got != "unread" {
+		t.Fatalf("narratorStatus = %q, want unread", got)
 	}
 
 	second := items[1]
@@ -139,13 +139,40 @@ func TestRulerProjectChaptersResolvesNarratorFromNarratorsTable(t *testing.T) {
 	}
 }
 
+func TestRulerPositionsValidateRequiredFieldsAndPersistPanelSize(t *testing.T) {
+	sqlDB := newRulerParityTestDB(t)
+	h := NewHandler(sqlDB)
+
+	invalid := serveRulerParityRaw(t, h, http.MethodPatch, "/p1/ruler/positions", `{"positions":[{"chapterId":"c1","anchorCommitSha":"commit-alpha","crossOffset":20}]}`)
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "axisOffset is required") {
+		t.Fatalf("missing axisOffset should return 400, got %d body=%s", invalid.Code, invalid.Body.String())
+	}
+	invalid = serveRulerParityRaw(t, h, http.MethodPatch, "/p1/ruler/positions", `{"positions":[{"chapterId":"c1","anchorCommitSha":"commit-alpha","axisOffset":10,"crossOffset":-1}]}`)
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "crossOffset") {
+		t.Fatalf("negative crossOffset should return 400, got %d body=%s", invalid.Code, invalid.Body.String())
+	}
+	invalid = serveRulerParityRaw(t, h, http.MethodPatch, "/p1/ruler/positions", `{"positions":[{"chapterId":"c1","anchorCommitSha":"commit-alpha","axisOffset":10,"crossOffset":20,"width":0}]}`)
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "width") {
+		t.Fatalf("non-positive width should return 400, got %d body=%s", invalid.Code, invalid.Body.String())
+	}
+
+	valid := serveRulerParityRaw(t, h, http.MethodPatch, "/p1/ruler/positions", `{"positions":[{"chapterId":"c1","anchorCommitSha":"commit-alpha","axisOffset":11,"crossOffset":22,"width":333,"height":222}]}`)
+	if valid.Code != http.StatusOK {
+		t.Fatalf("valid ruler positions should return 200, got %d body=%s", valid.Code, valid.Body.String())
+	}
+	var anchor string
+	var axis, cross, width, height float64
+	if err := sqlDB.QueryRow(`SELECT anchor_commit_sha, axis_offset, cross_offset, panel_width, panel_height FROM chapters WHERE id = 'c1'`).Scan(&anchor, &axis, &cross, &width, &height); err != nil {
+		t.Fatalf("load updated ruler position: %v", err)
+	}
+	if anchor != "commit-alpha" || axis != 11 || cross != 22 || width != 333 || height != 222 {
+		t.Fatalf("unexpected ruler position persistence: anchor=%q axis=%v cross=%v width=%v height=%v", anchor, axis, cross, width, height)
+	}
+}
+
 func serveRulerParityJSON(t *testing.T, h *Handler, path string) map[string]any {
 	t.Helper()
-	router := chi.NewRouter()
-	h.RegisterRuler(router)
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, path, nil)
-	router.ServeHTTP(w, req)
+	w := serveRulerParityRaw(t, h, http.MethodGet, path, "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("ruler request status = %d body=%s", w.Code, w.Body.String())
 	}
@@ -154,6 +181,19 @@ func serveRulerParityJSON(t *testing.T, h *Handler, path string) map[string]any 
 		t.Fatalf("decode ruler body: %v", err)
 	}
 	return body
+}
+
+func serveRulerParityRaw(t *testing.T, h *Handler, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	router := chi.NewRouter()
+	h.RegisterRuler(router)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	router.ServeHTTP(w, req)
+	return w
 }
 
 func newRulerParityTestDB(t *testing.T) *sql.DB {
@@ -190,7 +230,8 @@ func newRulerParityTestDB(t *testing.T) *sql.DB {
 			review_source_chapter_id TEXT,
 			review_status TEXT,
 			is_root INTEGER,
-			created_at TEXT
+			created_at TEXT,
+			updated_at TEXT
 		)`,
 		`CREATE TABLE narrators (
 			id TEXT PRIMARY KEY,
@@ -198,20 +239,21 @@ func newRulerParityTestDB(t *testing.T) *sql.DB {
 			variant TEXT,
 			type TEXT,
 			status TEXT,
+			substatus TEXT,
 			created_at TEXT
 		)`,
 		`INSERT INTO projects (id, git_path, default_branch)
 			VALUES ('p1', NULL, 'main'), ('p2', NULL, 'main')`,
-		`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, created_at)
+		`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, created_at, updated_at)
 			VALUES
-			('root', 'p1', 'Root', 'active', 'main', 'trunk', 1, '2026-01-01T00:00:00Z'),
-			('c1', 'p1', 'Branch', 'active', 'feature', 'branch', 0, '2026-01-02T00:00:00Z'),
-			('c2', 'p1', 'No Narrator', 'active', 'feature-2', 'branch', 0, '2026-01-03T00:00:00Z'),
-			('other', 'p2', 'Other Project', 'active', 'other', 'branch', 0, '2026-01-04T00:00:00Z')`,
-		`INSERT INTO narrators (id, chapter_id, variant, type, status, created_at)
+			('root', 'p1', 'Root', 'active', 'main', 'trunk', 1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'),
+			('c1', 'p1', 'Branch', 'active', 'feature', 'branch', 0, '2026-01-02T00:00:00Z', '2026-01-02T00:00:00Z'),
+			('c2', 'p1', 'No Narrator', 'active', 'feature-2', 'branch', 0, '2026-01-03T00:00:00Z', '2026-01-03T00:00:00Z'),
+			('other', 'p2', 'Other Project', 'active', 'other', 'branch', 0, '2026-01-04T00:00:00Z', '2026-01-04T00:00:00Z')`,
+		`INSERT INTO narrators (id, chapter_id, variant, type, status, substatus, created_at)
 			VALUES
-			('n-sub', 'c1', 'subagent:review', 'subagent', 'idle', '2026-01-01T00:00:00Z'),
-			('n-primary', 'c1', 'primary', 'primary', 'working', '2026-01-02T00:00:00Z')`,
+			('n-sub', 'c1', 'subagent:review', 'subagent', 'idle', '[]', '2026-01-01T00:00:00Z'),
+			('n-primary', 'c1', 'primary', 'primary', 'idle', '["unread"]', '2026-01-02T00:00:00Z')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := sqlDB.Exec(stmt); err != nil {

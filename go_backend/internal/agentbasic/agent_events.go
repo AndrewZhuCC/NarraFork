@@ -27,9 +27,20 @@ type AgentEvent struct {
 	Provider     string         `json:"provider,omitempty"`
 	Model        string         `json:"model,omitempty"`
 	Metadata     map[string]any `json:"metadata,omitempty"`
+	SideCars     []AgentSideCar `json:"sideCars,omitempty"`
 	ToolUses     []ToolCall     `json:"toolUses,omitempty"`
 	ToolRun      *ToolRun       `json:"-"`
 	Streaming    *ToolUseChunk  `json:"streaming,omitempty"`
+}
+
+// AgentSideCar carries auxiliary model-visible context that is persisted separately
+// from message text and assembled into user/tool-result turns at provider-boundary time.
+type AgentSideCar struct {
+	Target     string `json:"target"`
+	Source     string `json:"source"`
+	Content    string `json:"content"`
+	ToolUseID  string `json:"toolUseId,omitempty"`
+	OrderIndex int    `json:"orderIndex,omitempty"`
 }
 
 type ContentBlock struct {

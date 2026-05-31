@@ -49,7 +49,7 @@ func TestSearchReportsDegradedFallbackWhenFTSTablesAreMissing(t *testing.T) {
 	}
 }
 
-func TestSearchReportsShortQueryFallbackWithoutDegradedFlag(t *testing.T) {
+func TestSearchReportsShortQueryLikeModeWithoutFallbacks(t *testing.T) {
 	sqlDB := openSearchTestDB(t)
 	defer sqlDB.Close()
 	createSearchBaseTables(t, sqlDB)
@@ -58,15 +58,16 @@ func TestSearchReportsShortQueryFallbackWithoutDegradedFlag(t *testing.T) {
 	response := runSearchRequest(t, sqlDB, "/api/search?q=Al&entities=chapters")
 
 	if degraded, ok := response["degraded"].(bool); !ok || degraded {
-		t.Fatalf("expected degraded=false for normal short-query LIKE fallback, got %#v", response["degraded"])
+		t.Fatalf("expected degraded=false for normal short-query LIKE mode, got %#v", response["degraded"])
 	}
 	fallbacks := response["fallbacks"].([]any)
-	if len(fallbacks) != 1 {
-		t.Fatalf("expected one fallback entry, got %d: %#v", len(fallbacks), fallbacks)
+	if len(fallbacks) != 0 {
+		t.Fatalf("short-query LIKE mode should not emit fallback diagnostics, got %#v", fallbacks)
 	}
-	fallback := fallbacks[0].(map[string]any)
-	if fallback["reason"] != "query_too_short_for_trigram" {
-		t.Fatalf("expected short-query fallback reason, got %#v", fallback)
+	metadata := response["searchMetadata"].(map[string]any)
+	metadataFallbacks := metadata["fallbacks"].([]any)
+	if metadata["shortQuery"] != true || metadata["mode"] != "like-short-query" || len(metadataFallbacks) != 0 {
+		t.Fatalf("short query should expose mode without fallback noise, got %#v", metadata)
 	}
 	results := response["results"].([]any)
 	if len(results) != 1 {

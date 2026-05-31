@@ -675,6 +675,18 @@ func (s *Service) GetStatus(ctx context.Context, path string) (string, error) {
 	return s.run(ctx, path, "git", "status", "--porcelain=v1")
 }
 
+func (s *Service) ShowFileAtRef(ctx context.Context, path, ref, filePath string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		ref = "HEAD"
+	}
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" || filepath.IsAbs(filePath) || strings.HasPrefix(filepath.Clean(filePath), "..") {
+		return "", fmt.Errorf("invalid git file path")
+	}
+	return s.run(ctx, path, "git", "show", ref+":"+filepath.ToSlash(filePath))
+}
+
 func (s *Service) StatusSummary(ctx context.Context, path string) (StatusSummary, error) {
 	out, err := s.GetStatus(ctx, path)
 	if err != nil {
@@ -749,9 +761,43 @@ func (s *Service) DiscardAll(ctx context.Context, path string) error {
 }
 
 func (s *Service) DiscardFiles(ctx context.Context, path string, files []string) error {
-	args := append([]string{"restore", "--"}, files...)
-	_, err := s.run(ctx, path, "git", args...)
-	return err
+	if len(files) == 0 {
+		return nil
+	}
+	args := append([]string{"status", "--porcelain", "--"}, files...)
+	out, err := s.run(ctx, path, "git", args...)
+	if err != nil {
+		return err
+	}
+	tracked := []string{}
+	untracked := []string{}
+	for _, line := range strings.Split(out, "\n") {
+		if len(line) < 4 {
+			continue
+		}
+		filePath := strings.TrimSpace(line[3:])
+		if filePath == "" {
+			continue
+		}
+		if line[0] == '?' && line[1] == '?' {
+			untracked = append(untracked, filePath)
+		} else {
+			tracked = append(tracked, filePath)
+		}
+	}
+	if len(tracked) > 0 {
+		restoreArgs := append([]string{"checkout", "HEAD", "--"}, tracked...)
+		if _, err := s.run(ctx, path, "git", restoreArgs...); err != nil {
+			return err
+		}
+	}
+	if len(untracked) > 0 {
+		cleanArgs := append([]string{"clean", "-f", "--"}, untracked...)
+		if _, err := s.run(ctx, path, "git", cleanArgs...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) FileDiff(ctx context.Context, path, file string, staged bool) (map[string]any, error) {

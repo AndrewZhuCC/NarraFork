@@ -676,13 +676,13 @@ func (h *Handler) getProjectSkill(w http.ResponseWriter, r *http.Request) error 
 }
 
 func (h *Handler) createGlobalSkill(w http.ResponseWriter, r *http.Request) error {
-	return h.writeSkill(w, r, "")
+	return h.writeSkill(w, r, "", http.StatusCreated)
 }
 func (h *Handler) updateGlobalSkill(w http.ResponseWriter, r *http.Request) error {
-	return h.writeSkill(w, r, chi.URLParam(r, "name"))
+	return h.writeSkill(w, r, chi.URLParam(r, "name"), http.StatusOK)
 }
 
-func (h *Handler) writeSkill(w http.ResponseWriter, r *http.Request, currentName string) error {
+func (h *Handler) writeSkill(w http.ResponseWriter, r *http.Request, currentName string, status int) error {
 	var body struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
@@ -691,40 +691,60 @@ func (h *Handler) writeSkill(w http.ResponseWriter, r *http.Request, currentName
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	name := safeName(body.Name)
+	displayName := strings.TrimSpace(body.Name)
+	if displayName == "" && currentName != "" {
+		displayName = strings.TrimSpace(currentName)
+	}
 	description := strings.TrimSpace(body.Description)
-	if name == "" {
+	if displayName == "" {
 		return httpx.BadRequest("name is required")
 	}
 	if description == "" {
 		return httpx.BadRequest("description is required")
 	}
-	if currentName != "" && currentName != name {
-		if existing, err := findSkill(loadGlobalSkills(), currentName); err == nil {
-			_ = os.RemoveAll(filepath.Dir(stringValue(existing["location"])))
-		} else {
-			_ = os.RemoveAll(filepath.Join(skillsRoot(), safeName(currentName)))
+	var targetPath string
+	if currentName == "" {
+		dirName := sanitizeGlobalSkillDirName(displayName)
+		if dirName == "" {
+			return httpx.BadRequest("Invalid skill name")
+		}
+		dir := filepath.Join(skillsRoot(), dirName)
+		if _, err := os.Stat(dir); err == nil {
+			return httpx.BadRequest("Skill directory already exists: " + dirName)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		targetPath = filepath.Join(dir, "SKILL.md")
+	} else {
+		existing, err := findSkill(loadGlobalSkills(), currentName)
+		if err != nil {
+			return httpx.NotFound("Global skill")
+		}
+		targetPath = stringValue(existing["location"])
+		if strings.TrimSpace(targetPath) == "" {
+			return httpx.NotFound("Global skill")
 		}
 	}
-	dir := filepath.Join(skillsRoot(), name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	content := buildSkillMarkdown(displayName, description, body.Content)
+	if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
 		return err
 	}
-	content := buildSkillMarkdown(name, description, body.Content)
-	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(content), 0o644); err != nil {
-		return err
-	}
-	item, _ := findSkill(loadGlobalSkills(), name)
-	httpx.WriteJSON(w, http.StatusOK, item)
+	item, _ := findSkill(loadGlobalSkills(), displayName)
+	httpx.WriteJSON(w, status, item)
 	return nil
 }
 
 func (h *Handler) deleteGlobalSkill(w http.ResponseWriter, r *http.Request) error {
 	name := chi.URLParam(r, "name")
-	if existing, err := findSkill(loadGlobalSkills(), name); err == nil {
-		_ = os.RemoveAll(filepath.Dir(stringValue(existing["location"])))
-	} else {
-		_ = os.RemoveAll(filepath.Join(skillsRoot(), safeName(name)))
+	existing, err := findSkill(loadGlobalSkills(), name)
+	if err != nil {
+		return httpx.NotFound("Global skill")
+	}
+	if err := os.RemoveAll(filepath.Dir(stringValue(existing["location"]))); err != nil {
+		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -732,10 +752,13 @@ func (h *Handler) deleteGlobalSkill(w http.ResponseWriter, r *http.Request) erro
 func (h *Handler) toggleGlobalSkill(w http.ResponseWriter, r *http.Request) error {
 	name := chi.URLParam(r, "name")
 	var body struct {
-		Enabled bool `json:"enabled"`
+		Enabled *bool `json:"enabled"`
 	}
-	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
+	}
+	if body.Enabled == nil {
+		return httpx.BadRequest("enabled (boolean) is required")
 	}
 	item, err := findSkill(loadGlobalSkills(), name)
 	if err != nil {
@@ -745,10 +768,10 @@ func (h *Handler) toggleGlobalSkill(w http.ResponseWriter, r *http.Request) erro
 	dir := filepath.Dir(location)
 	enabledPath := filepath.Join(dir, "SKILL.md")
 	disabledPath := filepath.Join(dir, "SKILL.md.disabled")
-	if body.Enabled && boolValue(item["disabled"]) {
+	if *body.Enabled && boolValue(item["disabled"]) {
 		_ = os.Rename(disabledPath, enabledPath)
 		_ = os.Remove(filepath.Join(dir, ".disabled"))
-	} else if !body.Enabled && !boolValue(item["disabled"]) {
+	} else if !*body.Enabled && !boolValue(item["disabled"]) {
 		_ = os.Rename(enabledPath, disabledPath)
 	}
 	updated, _ := findSkill(loadGlobalSkills(), name)
@@ -1105,6 +1128,27 @@ func fileExists(path string) bool {
 func skillsRoot() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".narrafork", "skills")
+}
+func sanitizeGlobalSkillDirName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	var builder strings.Builder
+	lastDash := false
+	for _, r := range name {
+		valid := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || (r >= '\u4e00' && r <= '\u9fff')
+		if valid {
+			if r == '-' && lastDash {
+				continue
+			}
+			builder.WriteRune(r)
+			lastDash = r == '-'
+			continue
+		}
+		if !lastDash {
+			builder.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(builder.String(), "-")
 }
 func safeName(name string) string {
 	name = strings.TrimSpace(name)

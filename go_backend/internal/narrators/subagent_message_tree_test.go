@@ -197,13 +197,12 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 	if awaited["backgroundStatus"] != "completed" || awaited["alias"] != "bg" {
 		t.Fatalf("unexpected await payload: %#v", awaited)
 	}
-	unsupportedAwait, err := service.awaitTool(ctx, parentID, map[string]any{"type": "bash", "id": "cmd-1"})
+	missingBashAwait, err := service.awaitTool(ctx, parentID, map[string]any{"type": "bash", "id": "cmd-1"})
 	if err != nil {
-		t.Fatalf("await unsupported task type: %v", err)
+		t.Fatalf("await missing bash task: %v", err)
 	}
-	awaitReason := assertToolDiagnosticFields(t, unsupportedAwait, "AWAIT_TASK_TYPE_UNSUPPORTED")
-	if unsupportedAwait["status"] != "unsupported" || unsupportedAwait["fallback"] != true || !strings.Contains(awaitReason, "type=agent only") {
-		t.Fatalf("unsupported await should return stable fallback diagnostics, got %#v", unsupportedAwait)
+	if missingBashAwait["status"] != "not_found" || missingBashAwait["id"] != "cmd-1" {
+		t.Fatalf("missing bash await should return stable not_found diagnostics, got %#v", missingBashAwait)
 	}
 	missingAwaitID, err := service.awaitTool(ctx, parentID, map[string]any{"type": "agent"})
 	if err != nil {

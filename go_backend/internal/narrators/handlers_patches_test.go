@@ -17,6 +17,105 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
+func TestMergePermissionInputUpdatesStoresExitPlanDiff(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	originalPlan := "Inspect the service\nKeep old approval wording\nRun focused tests"
+	inputJSON, _ := json.Marshal(map[string]any{"plan": originalPlan})
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-exit-plan', ?, 'exit-plan-diff-1', 'ExitPlanMode', ?, 'pending', ?)`, narratorID, string(inputJSON), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert pending ExitPlanMode: %v", err)
+	}
+	h := &Handler{Service: &Service{DB: sqlDB}}
+	updatedPlan := "Inspect the service\nUse updated approval wording\nRun focused tests"
+	updated, err := h.mergePermissionInputUpdates(context.Background(), "req-exit-plan", nil, updatedPlan, true)
+	if err != nil {
+		t.Fatalf("merge permission input updates: %v", err)
+	}
+	updatedMap, _ := updated.(map[string]any)
+	if updatedMap["plan"] != updatedPlan || updatedMap["planSource"] != "updatedPlan" || updatedMap["compactAfter"] != true {
+		t.Fatalf("unexpected updated input: %#v", updatedMap)
+	}
+	diff := stringFromAny(updatedMap["planDiff"])
+	if !strings.Contains(diff, "- Keep old approval wording") || !strings.Contains(diff, "+ Use updated approval wording") {
+		t.Fatalf("expected plan diff in updated input, got %q", diff)
+	}
+	var storedRaw string
+	if err := sqlDB.QueryRow(`SELECT input_json FROM narrator_tool_calls WHERE id = 'req-exit-plan'`).Scan(&storedRaw); err != nil {
+		t.Fatalf("load stored input: %v", err)
+	}
+	stored := map[string]any{}
+	if err := json.Unmarshal([]byte(storedRaw), &stored); err != nil {
+		t.Fatalf("decode stored input: %v", err)
+	}
+	if stringFromAny(stored["planDiff"]) != diff {
+		t.Fatalf("expected stored plan diff %q, got %#v", diff, stored)
+	}
+}
+
+func TestPermissionApproveRouteMergesExitPlanUpdatedPlanAndCompactAfter(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	originalPlan := "Review the route\nKeep old plan details\nRun tests"
+	inputJSON, _ := json.Marshal(map[string]any{"plan": originalPlan})
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-exit-plan-route', ?, 'exit-plan-route-1', 'ExitPlanMode', ?, 'pending', ?)`, narratorID, string(inputJSON), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert pending ExitPlanMode: %v", err)
+	}
+	updatedPlan := "Review the route\nUse updated plan details\nRun tests"
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/permissions/req-exit-plan-route/approve", map[string]any{"updatedPlan": updatedPlan, "compactAfter": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected approval 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var status, inputRaw string
+	if err := sqlDB.QueryRow(`SELECT status, input_json FROM narrator_tool_calls WHERE id = 'req-exit-plan-route'`).Scan(&status, &inputRaw); err != nil {
+		t.Fatalf("load approved permission: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("expected approved permission to become running, got %q", status)
+	}
+	input := map[string]any{}
+	if err := json.Unmarshal([]byte(inputRaw), &input); err != nil {
+		t.Fatalf("decode stored input: %v", err)
+	}
+	if input["plan"] != updatedPlan || input["planSource"] != "updatedPlan" || input["compactAfter"] != true {
+		t.Fatalf("unexpected route-updated input: %#v", input)
+	}
+	diff := stringFromAny(input["planDiff"])
+	if !strings.Contains(diff, "- Keep old plan details") || !strings.Contains(diff, "+ Use updated plan details") {
+		t.Fatalf("expected route to store plan diff, got %q", diff)
+	}
+}
+
+func TestPermissionDenyRouteDoesNotMergeExitPlanUpdatedPlan(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	originalPlan := "Review the route\nKeep original denied plan\nRun tests"
+	inputJSON, _ := json.Marshal(map[string]any{"plan": originalPlan})
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-exit-plan-deny', ?, 'exit-plan-deny-1', 'ExitPlanMode', ?, 'pending', ?)`, narratorID, string(inputJSON), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert pending ExitPlanMode: %v", err)
+	}
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/permissions/req-exit-plan-deny/deny", map[string]any{"updatedPlan": "Denied updated plan", "compactAfter": true})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected deny 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var status, inputRaw string
+	if err := sqlDB.QueryRow(`SELECT status, input_json FROM narrator_tool_calls WHERE id = 'req-exit-plan-deny'`).Scan(&status, &inputRaw); err != nil {
+		t.Fatalf("load denied permission: %v", err)
+	}
+	if status != "fail" {
+		t.Fatalf("expected denied permission to fail, got %q", status)
+	}
+	input := map[string]any{}
+	if err := json.Unmarshal([]byte(inputRaw), &input); err != nil {
+		t.Fatalf("decode denied input: %v", err)
+	}
+	if input["plan"] != originalPlan || input["planDiff"] != nil || input["compactAfter"] != nil {
+		t.Fatalf("deny route should not merge ExitPlanMode updated input, got %#v", input)
+	}
+}
+
 func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -128,32 +227,114 @@ func TestPersistAgentErrorBroadcastsNarratorError(t *testing.T) {
 	}
 }
 
-func TestDeleteNarratorReturnsExplicitFeatureDisabledFallbackAndPreservesRow(t *testing.T) {
+func TestUsageStatsReturnsTSShapeIncludesSubagentsAndHandlesMissingAPIRequests(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	childID := "nar_usage_child"
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (
+		id, type, title, inherit_mode, parent_narrator_id, model, permission_mode, status, substatus, plan_mode,
+		cwd, variant, traits, is_background, is_ask_in_passing, message_version, message_count,
+		total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, 'subagent', 'Usage child', 'fresh', ?, 'openai:test', 'default', 'idle', '[]', 0, '', 'subagent', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, childID, narratorID, now, now); err != nil {
+		t.Fatalf("insert child narrator: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO api_requests (id, narrator_id, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens, duration_ms, ttft_ms, cost_usd, created_at) VALUES
+		('api-parent', ?, 10, 4, 2, 3, 30, 60, 1, 100, 11, 0.5, ?),
+		('api-child', ?, 7, 2, 1, 5, 50, 100, 2, 200, 22, 0.25, ?)`, narratorID, now, childID, now); err != nil {
+		t.Fatalf("insert api requests: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, created_at) VALUES
+		('tc-parent', ?, 'missing-parent-message', 'tool-parent', 'Read', 'success', ?),
+		('tc-child', ?, 'missing-child-message', 'tool-child', 'Read', 'success', ?)`, narratorID, now, childID, now); err != nil {
+		t.Fatalf("insert tool calls: %v", err)
+	}
+
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/usage-stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected usage stats 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode usage stats: %v body=%s", err, w.Body.String())
+	}
+	if intNumber(body["totalRequests"]) != 2 || intNumber(body["totalInputTokens"]) != 17 || intNumber(body["totalOutputTokens"]) != 6 || intNumber(body["totalCacheCreationTokens"]) != 8 || intNumber(body["totalCacheReadTokens"]) != 3 || intNumber(body["totalTokens"]) != 34 || intNumber(body["totalReasoningTokens"]) != 3 || intNumber(body["toolCallCount"]) != 2 {
+		t.Fatalf("unexpected TS-shaped usage stats with subagents: %#v", body)
+	}
+	if body["totalCost"] != 0.75 || body["totalCostUsd"] != 0.75 || intNumber(body["requestCount"]) != 2 || intNumber(body["inputTokens"]) != 17 {
+		t.Fatalf("unexpected cost/legacy aliases: %#v", body)
+	}
+
+	w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/usage-stats?includeSubagents=false")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected usage stats without subagents 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body = map[string]any{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode usage stats without subagents: %v", err)
+	}
+	if intNumber(body["totalRequests"]) != 1 || intNumber(body["totalInputTokens"]) != 10 || intNumber(body["totalTokens"]) != 19 || intNumber(body["toolCallCount"]) != 1 {
+		t.Fatalf("unexpected usage stats without subagents: %#v", body)
+	}
+
+	if _, err := sqlDB.Exec(`DROP TABLE api_requests`); err != nil {
+		t.Fatalf("drop api_requests: %v", err)
+	}
+	w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/usage-stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected missing api_requests to fail open, got %d body=%s", w.Code, w.Body.String())
+	}
+	body = map[string]any{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode missing api_requests stats: %v", err)
+	}
+	if intNumber(body["totalRequests"]) != 0 || intNumber(body["totalInputTokens"]) != 0 || intNumber(body["toolCallCount"]) != 2 {
+		t.Fatalf("missing api_requests should return zero usage with tool-call count, got %#v", body)
+	}
+
+	if _, err := sqlDB.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create minimal api_requests: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO api_requests (id, narrator_id, created_at) VALUES ('api-minimal', ?, ?)`, narratorID, now); err != nil {
+		t.Fatalf("insert minimal api request: %v", err)
+	}
+	w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/usage-stats")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected minimal api_requests to fail open, got %d body=%s", w.Code, w.Body.String())
+	}
+	body = map[string]any{}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode minimal api_requests stats: %v", err)
+	}
+	if intNumber(body["totalRequests"]) != 1 || intNumber(body["totalInputTokens"]) != 0 || intNumber(body["totalTokens"]) != 0 || intNumber(body["toolCallCount"]) != 2 {
+		t.Fatalf("minimal api_requests should count requests without usage columns, got %#v", body)
+	}
+}
+
+func TestDeleteNarratorRejectsNonArchivedAndPreservesRow(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
 
 	w := serveNarratorHandlerRequest(sqlDB, http.MethodDelete, "/narrators/"+narratorID)
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-archived narrator, got %d body=%s", w.Code, w.Body.String())
 	}
 	var body map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode fallback body: %v", err)
+		t.Fatalf("decode error body: %v", err)
 	}
-	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "narrators.delete" || body["supported"] != false || body["fallback"] != true {
-		t.Fatalf("unexpected delete fallback body: %#v", body)
-	}
-	reason, _ := body["reason"].(string)
-	if !strings.Contains(reason, "Safe narrator deletion semantics are not implemented in go_backend yet") || body["error"] != reason || body["message"] != reason {
-		t.Fatalf("delete fallback should expose reason/error/message, got %#v", body)
+	if body["code"] != "BAD_REQUEST" || !strings.Contains(body["message"].(string), "only archived") {
+		t.Fatalf("unexpected delete rejection body: %#v", body)
 	}
 	var count int
 	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrators WHERE id = ?`, narratorID).Scan(&count); err != nil {
 		t.Fatalf("count narrators: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("narrator row was deleted despite feature-disabled response")
+		t.Fatalf("non-archived narrator row was deleted")
 	}
 }
 
@@ -431,6 +612,108 @@ func TestPostMessageGoalSlashAddListResumeComplete(t *testing.T) {
 	w = serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/goal"})
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "goals") {
 		t.Fatalf("expected goal list, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGoalRESTMutationsBroadcastGoalsSetAndSoftCancel(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	postGoal := func(objective string) map[string]any {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"objective": objective})
+		req := httptest.NewRequest(http.MethodPost, "/narrators/"+narratorID+"/goals", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := serveNarratorHandlerWithService(service, req)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("post goal %q got %d body=%s", objective, w.Code, w.Body.String())
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+			t.Fatalf("decode goal response: %v", err)
+		}
+		return payload
+	}
+
+	first := postGoal("first frontend-visible goal")
+	firstGoal := first["goal"].(map[string]any)
+	firstID := firstGoal["id"].(string)
+	if firstGoal["status"] != "active" {
+		t.Fatalf("first REST goal should become active, got %#v", firstGoal)
+	}
+	second := postGoal("second frontend-visible goal")
+	secondGoal := second["goal"].(map[string]any)
+	secondID := secondGoal["id"].(string)
+	if secondGoal["status"] != "pending" {
+		t.Fatalf("second REST goal should remain pending while first active, got %#v", secondGoal)
+	}
+
+	patchBody, _ := json.Marshal(map[string]any{"status": "active"})
+	patchReq := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/goals/"+secondID, bytes.NewReader(patchBody))
+	patchReq.Header.Set("Content-Type", "application/json")
+	patch := serveNarratorHandlerWithService(service, patchReq)
+	if patch.Code != http.StatusOK {
+		t.Fatalf("patch active got %d body=%s", patch.Code, patch.Body.String())
+	}
+	statuses := map[string]string{}
+	rows, err := sqlDB.Query(`SELECT id, status FROM narrator_goals WHERE narrator_id = ?`, narratorID)
+	if err != nil {
+		t.Fatalf("query goal statuses: %v", err)
+	}
+	for rows.Next() {
+		var idValue, status string
+		if err := rows.Scan(&idValue, &status); err != nil {
+			t.Fatalf("scan goal status: %v", err)
+		}
+		statuses[idValue] = status
+	}
+	_ = rows.Close()
+	if statuses[firstID] != "pending" || statuses[secondID] != "active" {
+		t.Fatalf("activating second goal should demote previous active, statuses=%#v", statuses)
+	}
+
+	removeReq := httptest.NewRequest(http.MethodDelete, "/narrators/"+narratorID+"/goals/"+secondID, nil)
+	remove := serveNarratorHandlerWithService(service, removeReq)
+	if remove.Code != http.StatusOK {
+		t.Fatalf("remove active got %d body=%s", remove.Code, remove.Body.String())
+	}
+	var secondStatus, firstStatus string
+	if err := sqlDB.QueryRow(`SELECT status FROM narrator_goals WHERE id = ?`, secondID).Scan(&secondStatus); err != nil {
+		t.Fatalf("load removed goal: %v", err)
+	}
+	if err := sqlDB.QueryRow(`SELECT status FROM narrator_goals WHERE id = ?`, firstID).Scan(&firstStatus); err != nil {
+		t.Fatalf("load reactivated goal: %v", err)
+	}
+	statuses[secondID] = secondStatus
+	statuses[firstID] = firstStatus
+	if statuses[secondID] != "cancelled" || statuses[firstID] != "active" {
+		t.Fatalf("remove should soft-cancel active goal and activate next pending, statuses=%#v", statuses)
+	}
+
+	clearReq := httptest.NewRequest(http.MethodDelete, "/narrators/"+narratorID+"/goals", nil)
+	cleared := serveNarratorHandlerWithService(service, clearReq)
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear goals got %d body=%s", cleared.Code, cleared.Body.String())
+	}
+	var openCount int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_goals WHERE narrator_id = ? AND status IN ('pending', 'active', 'paused')`, narratorID).Scan(&openCount); err != nil {
+		t.Fatalf("count open goals: %v", err)
+	}
+	if openCount != 0 {
+		t.Fatalf("clear goals should cancel all open goals, open=%d", openCount)
+	}
+	broadcasts := events()
+	goalsSetCount := 0
+	for _, event := range broadcasts {
+		if event.NarratorID == narratorID && event.Payload["type"] == "goals_set" {
+			goalsSetCount++
+		}
+	}
+	if goalsSetCount < 5 {
+		t.Fatalf("expected goals_set broadcast for every REST mutation, got %d events=%#v", goalsSetCount, broadcasts)
 	}
 }
 

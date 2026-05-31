@@ -85,11 +85,13 @@ func tableColumnSet(ctx context.Context, sqlDB *sql.DB, table string) (map[strin
 }
 
 func (s *Service) BrowserSessionEvent(ctx context.Context, event agentbasic.BrowserSessionEvent) {
-	if s == nil || s.browserDB() == nil || strings.TrimSpace(event.Snapshot.NarratorID) == "" {
+	if s == nil || strings.TrimSpace(event.Snapshot.NarratorID) == "" {
 		return
 	}
-	if err := s.persistBrowserSessionEvent(ctx, event); err != nil {
-		return
+	if s.browserDB() != nil {
+		if err := s.persistBrowserSessionEvent(ctx, event); err != nil {
+			return
+		}
 	}
 	s.broadcastBrowserSessionCount(ctx, event.Snapshot.NarratorID)
 	if s.Hub != nil {
@@ -215,7 +217,7 @@ func (s *Service) persistBrowserSessionEvent(ctx context.Context, event agentbas
 }
 
 func (s *Service) broadcastBrowserSessionCount(ctx context.Context, narratorID string) {
-	if s == nil || s.Hub == nil || s.browserDB() == nil || strings.TrimSpace(narratorID) == "" {
+	if s == nil || s.Hub == nil || strings.TrimSpace(narratorID) == "" {
 		return
 	}
 	count, err := s.activeBrowserSessionCount(ctx, narratorID)

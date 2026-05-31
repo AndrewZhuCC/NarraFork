@@ -31,6 +31,7 @@ type toolExecOutcome struct {
 	Run        ToolRun
 	IsError    bool
 	DurationMs int64
+	SideCars   []AgentSideCar
 }
 
 func RunAgentLoop(ctx context.Context, settings *config.Store, model string, history []Message, cwd string, opts ...GenerateOption) (<-chan AgentEvent, error) {
@@ -87,31 +88,39 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 			return
 		}
 		adapter.PushAssistantTurn(&built, state.assistantText, state.toolUses, nil)
-		toolResults, ok := executeTurnTools(ctx, out, adapter, cwd, toolExecutor, state)
+		toolResults, ok := executeTurnTools(ctx, out, adapter, cwd, toolExecutor, state, options)
 		if !ok {
 			return
 		}
-		adapter.PushUserTurn(&built, "", toolResults)
+		options.sideCarInitialCompletedToolCount = state.completedToolCount
+		options.silentToolCallCount = state.silentToolCallCount
+		afterToolsSideCars := collectAfterToolsSideCars(ctx, options)
+		if len(afterToolsSideCars) > 0 {
+			emitAgentEvent(ctx, out, AgentEvent{Type: "sidecars", SideCars: afterToolsSideCars})
+		}
+		adapter.PushUserTurn(&built, appendAgentSideCarsForProvider("", afterToolsSideCars), toolResults)
 		emitAgentEvent(ctx, out, AgentEvent{Type: "turn_complete", TurnIndex: turn})
 	}
 	emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "tool loop reached maximum rounds without final answer"})
 }
 
 type turnState struct {
-	assistantText    string
-	textOutputIndex  *int
-	toolUses         []ToolCall
-	seenToolUses     map[string]bool
-	emittedToolCalls map[string]bool
-	reasoning        map[string]*reasoningAccum
-	redacted         []*RedactedThinking
-	credentialID     string
-	earlyExec        map[string]<-chan toolExecOutcome
-	eagerBlocked     bool
+	assistantText       string
+	textOutputIndex     *int
+	toolUses            []ToolCall
+	seenToolUses        map[string]bool
+	emittedToolCalls    map[string]bool
+	reasoning           map[string]*reasoningAccum
+	redacted            []*RedactedThinking
+	credentialID        string
+	earlyExec           map[string]<-chan toolExecOutcome
+	eagerBlocked        bool
+	completedToolCount  int
+	silentToolCallCount int
 }
 
-func newTurnState() *turnState {
-	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}}
+func newTurnState(initialCompletedToolCount, silentToolCallCount int) *turnState {
+	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}, completedToolCount: initialCompletedToolCount, silentToolCallCount: silentToolCallCount}
 }
 
 func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, resolution ProviderResolution, built *BuiltHistory, cwd string, options generateOptions, toolExecutor ToolExecutor) (*turnState, bool) {
@@ -179,6 +188,19 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 	turnCtx, cancelTurn := context.WithCancel(ctx)
 	defer cancelTurn()
 	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0}
+	requestID := id.New()
+	requestStartedAt := time.Now()
+	requestCredentialID := strings.TrimSpace(resolution.Config.CredentialID)
+	emitAgentEvent(ctx, out, AgentEvent{Type: "api_request_start", RequestID: requestID, Provider: resolution.Provider, Model: resolution.Model, CredentialID: requestCredentialID})
+	var lastUsage *UsageSnapshot
+	apiRequestFinished := false
+	finishAPIRequest := func(message string) {
+		if apiRequestFinished {
+			return
+		}
+		apiRequestFinished = true
+		emitAgentEvent(ctx, out, AgentEvent{Type: "api_request_end", RequestID: requestID, Provider: resolution.Provider, Model: resolution.Model, CredentialID: requestCredentialID, Usage: lastUsage, Message: strings.TrimSpace(message), DurationMs: time.Since(requestStartedAt).Milliseconds()})
+	}
 	stream, err := adapter.Chat(turnCtx, ChatParams{
 		Model:            resolution.Model,
 		Cwd:              cwd,
@@ -190,9 +212,11 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 		StickySessionKey: options.stickySessionKey,
 	})
 	if err != nil {
+		finishAPIRequest(err.Error())
 		return nil, err
 	}
-	state := newTurnState()
+	defer finishAPIRequest("")
+	state := newTurnState(options.sideCarInitialCompletedToolCount, options.silentToolCallCount)
 	chunks := map[string]*toolChunkAccum{}
 	var firstTokenTimer *time.Timer
 	var firstTokenC <-chan time.Time
@@ -204,9 +228,11 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 	for {
 		select {
 		case <-firstTokenC:
+			message := fmt.Sprintf("Provider did not produce a response within %dms", options.firstTokenTimeout.Milliseconds())
+			finishAPIRequest(message)
 			emitAgentEvent(ctx, out, AgentEvent{
 				Type:       "first_token_timeout",
-				Message:    fmt.Sprintf("Provider did not produce a response within %dms", options.firstTokenTimeout.Milliseconds()),
+				Message:    message,
 				Provider:   resolution.Provider,
 				Model:      resolution.Model,
 				DurationMs: options.firstTokenTimeout.Milliseconds(),
@@ -218,9 +244,13 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 				return state, nil
 			}
 			if event.Err != nil {
+				finishAPIRequest(event.Err.Error())
 				return state, event.Err
 			}
 			parsed := event.Parsed
+			if parsed.Usage != nil {
+				lastUsage = parsed.Usage
+			}
 			if firstTokenC != nil && parsedHasMeaningfulResponse(parsed) {
 				if firstTokenTimer != nil {
 					firstTokenTimer.Stop()
@@ -228,7 +258,9 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 				firstTokenC = nil
 			}
 			if parsed.SilentDisconnect {
-				emitAgentEvent(ctx, out, AgentEvent{Type: "silent_disconnect", Provider: resolution.Provider, Model: resolution.Model, Message: "Provider stream ended without a final response"})
+				message := "Provider stream ended without a final response"
+				finishAPIRequest(message)
+				emitAgentEvent(ctx, out, AgentEvent{Type: "silent_disconnect", Provider: resolution.Provider, Model: resolution.Model, Message: message})
 				return state, errTerminalEvent
 			}
 			if parsed.CredentialID != "" {
@@ -239,6 +271,9 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			}
 			if parsed.Text != "" {
 				state.assistantText += parsed.Text
+				if strings.TrimSpace(parsed.Text) != "" {
+					state.silentToolCallCount = 0
+				}
 				emitAgentEvent(ctx, out, AgentEvent{Type: "stream_text", Text: parsed.Text, OutputIndex: parsed.TextOutputIndex})
 			}
 			if parsed.Reasoning != "" || parsed.ReasoningMetadata != nil {
@@ -263,6 +298,7 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			}
 			emitProviderLifecycleEvents(ctx, out, parsed, resolution.Provider, resolution.Model)
 			if parsed.InvalidState != nil {
+				finishAPIRequest(firstNonEmpty(parsed.InvalidState.Message, parsed.InvalidState.Reason))
 				emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: parsed.InvalidState.Reason, Message: parsed.InvalidState.Message})
 				return nil, errTerminalEvent
 			}
@@ -342,7 +378,7 @@ func emitToolCallIfMissing(ctx context.Context, out chan<- AgentEvent, call Tool
 	emitAgentEvent(ctx, out, AgentEvent{Type: "tool_call", ToolUseID: call.ID, ToolName: call.Function.Name, Input: toolCallInput(call)})
 }
 
-func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, cwd string, toolExecutor ToolExecutor, state *turnState) ([]any, bool) {
+func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, cwd string, toolExecutor ToolExecutor, state *turnState, options generateOptions) ([]any, bool) {
 	toolResults := []any{}
 	for _, group := range toolExecutionGroups(state.toolUses) {
 		outcomes := make([]toolExecOutcome, len(group))
@@ -390,11 +426,110 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 			emitToolCallIfMissing(ctx, out, call, state.emittedToolCalls)
 			outcome := outcomes[idx]
 			run := outcome.Run
-			emitAgentEvent(ctx, out, AgentEvent{Type: "tool_result", ToolUseID: run.ID, ToolName: run.Name, Output: run.Output, IsError: outcome.IsError, DurationMs: outcome.DurationMs, ToolRun: &run})
-			toolResults = append(toolResults, adapter.FormatToolResult(call.ID, run.Output, outcome.IsError))
+			sideCars := collectToolResultSideCars(ctx, options, state, call, outcome)
+			outputForModel := appendAgentSideCarsForProvider(run.Output, sideCars)
+			emitAgentEvent(ctx, out, AgentEvent{Type: "tool_result", ToolUseID: run.ID, ToolName: run.Name, Output: run.Output, IsError: outcome.IsError, DurationMs: outcome.DurationMs, ToolRun: &run, SideCars: sideCars})
+			toolResults = append(toolResults, adapter.FormatToolResult(call.ID, outputForModel, outcome.IsError))
 		}
 	}
 	return toolResults, true
+}
+
+func collectAfterToolsSideCars(ctx context.Context, options generateOptions) []AgentSideCar {
+	if options.sideCarCollector == nil {
+		return nil
+	}
+	collected := options.sideCarCollector(ctx, SideCarRequest{Phase: "after_tools"})
+	sideCars := []AgentSideCar{}
+	for _, sideCar := range collected {
+		if sideCar.Target == "user_message" {
+			sideCars = append(sideCars, sideCar)
+		}
+	}
+	return normalizeAgentSideCars(sideCars, "", false)
+}
+
+func collectToolResultSideCars(ctx context.Context, options generateOptions, state *turnState, call ToolCall, outcome toolExecOutcome) []AgentSideCar {
+	sideCars := append([]AgentSideCar(nil), outcome.SideCars...)
+	if !outcome.IsError && options.silentToolCallThreshold >= 0 {
+		state.silentToolCallCount++
+		if state.silentToolCallCount >= options.silentToolCallThreshold {
+			sideCars = append(sideCars, AgentSideCar{Target: "tool_result", Source: "silent_progress", Content: silentProgressReminder(state.silentToolCallCount), ToolUseID: call.ID, OrderIndex: 10})
+			state.silentToolCallCount = 0
+		}
+	}
+	if options.sideCarCollector == nil || call.Function.Name == "TaskCreate" {
+		return normalizeAgentSideCars(sideCars, call.ID, true)
+	}
+	state.completedToolCount++
+	if options.onSideCarCompletedToolCount != nil {
+		options.onSideCarCompletedToolCount(state.completedToolCount)
+	}
+	collected := options.sideCarCollector(ctx, SideCarRequest{Phase: "tool_result", ToolName: call.Function.Name, ToolUseID: call.ID, ToolInput: toolCallInput(call), CompletedToolCount: state.completedToolCount})
+	for _, sideCar := range collected {
+		if sideCar.Target == "tool_result" {
+			sideCars = append(sideCars, sideCar)
+		}
+	}
+	return normalizeAgentSideCars(sideCars, call.ID, true)
+}
+
+func silentProgressReminder(count int) string {
+	return fmt.Sprintf("<progress_update_request>\nYou have completed %d tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.\n</progress_update_request>", count)
+}
+
+func normalizeAgentSideCars(sideCars []AgentSideCar, fallbackToolUseID string, forceToolUseID bool) []AgentSideCar {
+	items := []AgentSideCar{}
+	for idx, sideCar := range sideCars {
+		if strings.TrimSpace(sideCar.Target) == "" || strings.TrimSpace(sideCar.Content) == "" {
+			continue
+		}
+		sideCar.Target = strings.TrimSpace(sideCar.Target)
+		sideCar.Source = strings.TrimSpace(sideCar.Source)
+		if sideCar.Source == "" {
+			sideCar.Source = "sidecar"
+		}
+		if forceToolUseID && strings.TrimSpace(fallbackToolUseID) != "" {
+			sideCar.ToolUseID = strings.TrimSpace(fallbackToolUseID)
+		} else {
+			sideCar.ToolUseID = strings.TrimSpace(sideCar.ToolUseID)
+		}
+		if sideCar.OrderIndex == 0 {
+			sideCar.OrderIndex = idx
+		}
+		items = append(items, sideCar)
+	}
+	return items
+}
+
+func appendAgentSideCarsForProvider(baseText string, sideCars []AgentSideCar) string {
+	if len(sideCars) == 0 {
+		return baseText
+	}
+	parts := []string{}
+	for _, sideCar := range sideCars {
+		if strings.TrimSpace(sideCar.Content) == "" {
+			continue
+		}
+		source := strings.TrimSpace(sideCar.Source)
+		if source == "" {
+			source = "sidecar"
+		}
+		parts = append(parts, fmt.Sprintf("<side_car source=\"%s\">\n%s\n</side_car>", escapeSideCarAttribute(source), sideCar.Content))
+	}
+	if len(parts) == 0 {
+		return baseText
+	}
+	sideCarText := strings.Join(parts, "\n\n")
+	if strings.TrimSpace(baseText) == "" {
+		return sideCarText
+	}
+	return baseText + "\n\n" + sideCarText
+}
+
+func escapeSideCarAttribute(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "\"", "&quot;", "<", "&lt;")
+	return replacer.Replace(value)
 }
 
 func guardToolExecutor(executor ToolExecutor, opts ToolInventoryOptions) ToolExecutor {

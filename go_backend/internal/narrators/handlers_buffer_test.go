@@ -5,8 +5,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +57,194 @@ func TestPostMessageBuffersWorkingNarratorWithPriority(t *testing.T) {
 	}
 	if messageCount != 0 {
 		t.Fatalf("working POST should not persist a user message immediately, got %d", messageCount)
+	}
+}
+
+func TestPostMessageBuffersExpandedSlashCommandWithRawCommandText(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	ensureSlashCommandTables(t, sqlDB)
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'working' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark working: %v", err)
+	}
+	commands := `[{"name":"review","prompt":"Review {{input}}"}]`
+	if _, err := sqlDB.Exec(`INSERT INTO user_preferences (user_id, commands) VALUES ('system', ?)`, commands); err != nil {
+		t.Fatalf("insert user commands: %v", err)
+	}
+
+	body := bytes.NewBufferString(`{"message":"/review queued file"}`)
+	req := httptest.NewRequest(http.MethodPost, "/narrators/"+narratorID+"/messages", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := serveNarratorHandlerHTTPRequest(sqlDB, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", w.Code, w.Body.String())
+	}
+	var text, commandText string
+	if err := sqlDB.QueryRow(`SELECT text, COALESCE(command_text, '') FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID).Scan(&text, &commandText); err != nil {
+		t.Fatalf("load buffered command row: %v", err)
+	}
+	if text != "Review queued file" || commandText != "/review queued file" {
+		t.Fatalf("unexpected buffered slash command text=%q commandText=%q", text, commandText)
+	}
+}
+
+func TestReorderBufferRequiresExactIDsAndUsesZeroBasedSeqs(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_buffered_messages (id, narrator_id, text, images_json, command_text, created_by, creator_json, text_file_paths_json, priority, seq, buffered_at) VALUES (?, ?, ?, NULL, NULL, ?, NULL, NULL, 0, 0, ?), (?, ?, ?, NULL, NULL, ?, NULL, NULL, 0, 1, ?)`, "buf-a", narratorID, "first", "user-1", now, "buf-b", narratorID, "second", "user-1", now); err != nil {
+		t.Fatalf("insert buffered rows: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	badReq := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/buffer/reorder", bytes.NewBufferString(`{"orderedIds":["buf-b"]}`))
+	badReq.Header.Set("Content-Type", "application/json")
+	bad := serveNarratorHandlerWithService(service, badReq)
+	if bad.Code != http.StatusBadRequest {
+		t.Fatalf("expected partial reorder to fail with 400, got %d body=%s", bad.Code, bad.Body.String())
+	}
+
+	goodReq := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/buffer/reorder", bytes.NewBufferString(`{"orderedIds":["buf-b","buf-a"]}`))
+	goodReq.Header.Set("Content-Type", "application/json")
+	good := serveNarratorHandlerWithService(service, goodReq)
+	if good.Code != http.StatusOK {
+		t.Fatalf("expected reorder 200, got %d body=%s", good.Code, good.Body.String())
+	}
+	seqs := map[string]int{}
+	rows, err := sqlDB.Query(`SELECT id, seq FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID)
+	if err != nil {
+		t.Fatalf("query reordered seqs: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var idValue string
+		var seq int
+		if err := rows.Scan(&idValue, &seq); err != nil {
+			t.Fatalf("scan reordered seqs: %v", err)
+		}
+		seqs[idValue] = seq
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate reordered seqs: %v", err)
+	}
+	if seqs["buf-b"] != 0 || seqs["buf-a"] != 1 {
+		t.Fatalf("expected zero-based reordered seqs, got %#v", seqs)
+	}
+	event := waitForBroadcast(t, events, narratorID, "buffer_set")
+	messages, ok := event["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("expected reordered buffer_set messages, got %#v", event)
+	}
+	first, firstOK := messages[0].(map[string]any)
+	second, secondOK := messages[1].(map[string]any)
+	if !firstOK || !secondOK || first["id"] != "buf-b" || second["id"] != "buf-a" {
+		t.Fatalf("expected reordered buffer_set broadcast, got %#v", event)
+	}
+}
+
+func TestPostMessageBuffersMultipartTextFileWithoutDuplicatingAttachmentHint(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	ensureSlashCommandTables(t, sqlDB)
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write git marker: %v", err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'working', cwd = ? WHERE id = ?`, cwd, narratorID); err != nil {
+		t.Fatalf("mark working: %v", err)
+	}
+	commands := `[{"name":"review","prompt":"Review {{input}}"}]`
+	if _, err := sqlDB.Exec(`INSERT INTO user_preferences (user_id, commands) VALUES ('system', ?)`, commands); err != nil {
+		t.Fatalf("insert user commands: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("message", "/review queued file"); err != nil {
+		t.Fatalf("write message field: %v", err)
+	}
+	part, err := writer.CreateFormFile("textFiles", "notes.md")
+	if err != nil {
+		t.Fatalf("create text file part: %v", err)
+	}
+	if _, err := part.Write([]byte("queued attachment body")); err != nil {
+		t.Fatalf("write text file part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/narrators/"+narratorID+"/messages", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := serveNarratorHandlerHTTPRequest(sqlDB, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var bufferID, text, commandText, pathsRaw string
+	if err := sqlDB.QueryRow(`SELECT id, text, COALESCE(command_text, ''), COALESCE(text_file_paths_json, '') FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID).Scan(&bufferID, &text, &commandText, &pathsRaw); err != nil {
+		t.Fatalf("load buffered row: %v", err)
+	}
+	if text != "Review queued file" || commandText != "/review queued file" {
+		t.Fatalf("unexpected buffered row text=%q command=%q", text, commandText)
+	}
+	if strings.Contains(text, "<attached_files>") {
+		t.Fatalf("buffer text should store raw expanded prompt without attachment hint: %q", text)
+	}
+	var refs []map[string]any
+	if err := json.Unmarshal([]byte(pathsRaw), &refs); err != nil {
+		t.Fatalf("decode buffered text file refs: %v raw=%s", err, pathsRaw)
+	}
+	if len(refs) != 1 {
+		t.Fatalf("expected one text file ref, got %#v", refs)
+	}
+	persistedPath, _ := refs[0]["path"].(string)
+	if persistedPath == "" {
+		persistedPath, _ = refs[0]["persistedPath"].(string)
+	}
+	if persistedPath == "" || !strings.Contains(persistedPath, filepath.Join(".narrafork", "buffered-files", bufferID)) {
+		t.Fatalf("expected buffered sidecar path under HOME, got %#v", refs[0])
+	}
+	if data, err := os.ReadFile(persistedPath); err != nil || string(data) != "queued attachment body" {
+		t.Fatalf("unexpected persisted buffer file data=%q err=%v", string(data), err)
+	}
+	originalWorktreePath := stringFromAny(refs[0]["filePath"])
+	if originalWorktreePath == "" || !strings.Contains(originalWorktreePath, filepath.Join(cwd, ".narrafork", "attached", "notes.md")) {
+		t.Fatalf("expected original worktree path metadata, got %#v", refs[0])
+	}
+	if _, err := os.Stat(originalWorktreePath); !os.IsNotExist(err) {
+		t.Fatalf("busy buffer should not leave uploaded text file in worktree before consumption, stat err=%v", err)
+	}
+
+	service := &Service{DB: sqlDB}
+	buffered, ok, err := service.nextBufferedMessage(context.Background(), narratorID)
+	if err != nil || !ok {
+		t.Fatalf("load next buffered message ok=%v err=%v", ok, err)
+	}
+	effective := buffered.EffectiveText()
+	if strings.Count(effective, "<attached_files>") != 1 || !strings.Contains(effective, filepath.Join(cwd, ".narrafork", "attached", "notes")) {
+		t.Fatalf("effective text should contain one worktree attachment hint, got %q", effective)
+	}
+	blocks := buffered.ContentBlocks()
+	textFileBlocks := 0
+	for _, block := range blocks {
+		if block["type"] == "text_file" {
+			textFileBlocks++
+			if got := stringFromAny(block["filePath"]); got == "" || !strings.Contains(got, filepath.Join(cwd, ".narrafork", "attached", "notes")) {
+				t.Fatalf("unexpected materialized text_file block: %#v", block)
+			}
+		}
+	}
+	if textFileBlocks != 1 {
+		t.Fatalf("expected one materialized text_file block, got %d blocks=%#v", textFileBlocks, blocks)
+	}
+	materializedPath := filepath.Join(cwd, ".narrafork", "attached", "notes.md")
+	if data, err := os.ReadFile(materializedPath); err != nil || string(data) != "queued attachment body" {
+		t.Fatalf("unexpected materialized worktree file data=%q err=%v", string(data), err)
 	}
 }
 

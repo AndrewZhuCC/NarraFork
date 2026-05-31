@@ -59,6 +59,50 @@ func TestMergeTreeReportsParityFields(t *testing.T) {
 	}
 }
 
+func TestDiscardFilesRemovesSelectedTrackedAndUntrackedOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initDiscardTestRepo(t)
+	writeGitTestFile(t, repo, "tracked.txt", "changed\n")
+	writeGitTestFile(t, repo, "untracked.txt", "temporary\n")
+	writeGitTestFile(t, repo, "keep-untracked.txt", "keep\n")
+
+	svc := &Service{Timeout: 5 * time.Second}
+	if err := svc.DiscardFiles(context.Background(), repo, []string{"tracked.txt", "untracked.txt"}); err != nil {
+		t.Fatalf("discard selected files: %v", err)
+	}
+
+	assertGitTestFileContent(t, repo, "tracked.txt", "base\n")
+	assertGitTestFileMissing(t, repo, "untracked.txt")
+	assertGitTestFileContent(t, repo, "keep-untracked.txt", "keep\n")
+	status := runGitTest(t, repo, "status", "--porcelain")
+	if status != "?? keep-untracked.txt\n" {
+		t.Fatalf("unexpected status after selected discard: %q", status)
+	}
+}
+
+func TestDiscardAllRemovesTrackedChangesAndUntrackedDirectories(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initDiscardTestRepo(t)
+	writeGitTestFile(t, repo, "tracked.txt", "changed\n")
+	writeGitTestFile(t, repo, "scratch/nested.txt", "temporary\n")
+
+	svc := &Service{Timeout: 5 * time.Second}
+	if err := svc.DiscardAll(context.Background(), repo); err != nil {
+		t.Fatalf("discard all: %v", err)
+	}
+
+	assertGitTestFileContent(t, repo, "tracked.txt", "base\n")
+	assertGitTestFileMissing(t, repo, "scratch")
+	status := runGitTest(t, repo, "status", "--porcelain")
+	if status != "" {
+		t.Fatalf("expected clean worktree after discard all, got %q", status)
+	}
+}
+
 func runGitTest(t *testing.T, cwd string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -70,6 +114,19 @@ func runGitTest(t *testing.T, cwd string, args ...string) string {
 	return string(out)
 }
 
+func initDiscardTestRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runGitTest(t, repo, "init")
+	runGitTest(t, repo, "checkout", "-b", "main")
+	runGitTest(t, repo, "config", "user.name", "Test User")
+	runGitTest(t, repo, "config", "user.email", "test@example.com")
+	writeGitTestFile(t, repo, "tracked.txt", "base\n")
+	runGitTest(t, repo, "add", ".")
+	runGitTest(t, repo, "commit", "-m", "base")
+	return repo
+}
+
 func writeGitTestFile(t *testing.T, repo, name, content string) {
 	t.Helper()
 	path := filepath.Join(repo, name)
@@ -78,5 +135,27 @@ func writeGitTestFile(t *testing.T, repo, name, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", name, err)
+	}
+}
+
+func assertGitTestFileContent(t *testing.T, repo, name, want string) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(repo, name))
+	if err != nil {
+		t.Fatalf("read %s: %v", name, err)
+	}
+	if string(content) != want {
+		t.Fatalf("%s content = %q, want %q", name, string(content), want)
+	}
+}
+
+func assertGitTestFileMissing(t *testing.T, repo, name string) {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(repo, name))
+	if err == nil {
+		t.Fatalf("expected %s to be removed", name)
+	}
+	if !os.IsNotExist(err) {
+		t.Fatalf("stat %s: %v", name, err)
 	}
 }

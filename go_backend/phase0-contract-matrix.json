@@ -257,11 +257,16 @@
 				"frontend/components/settings/StorageSection.tsx"
 			],
 			"phase0Status": "supported-with-degraded-diagnostics",
-			"capabilityKeys": ["storage.database.preview", "storage.database.cleanupTargets"],
+			"capabilityKeys": [
+				"storage.database.preview",
+				"storage.database.cleanupTargets",
+				"storage.database.cleanupTargets.archivedSessions.usesNarratorDelete"
+			],
 			"knownFallbacks": [
 				"storage.database.tableRowCountFailed",
 				"storage.database.cleanupPreviewFailed",
 				"storage.database.cleanupSampleFailed",
+				"storage.database.cleanupTargets.staleSessionsArchivedOnly",
 				"storage.database.vacuumDisabled"
 			],
 			"frontendConsumerPolicy": "StorageSection shows structured error.message values for database preview/cleanup failures instead of generic labels.",
@@ -269,9 +274,10 @@
 				"storage.database.tableRowCountFailed": "A per-table row count query failed; the summary remains available with degraded diagnostics.",
 				"storage.database.cleanupPreviewFailed": "A cleanup preview query failed; the preview returns safe zero counts with fallback diagnostics.",
 				"storage.database.cleanupSampleFailed": "A cleanup sample query failed; the sample item carries fallback diagnostics instead of unsafe deletion metadata.",
+				"storage.database.cleanupTargets.staleSessionsArchivedOnly": "staleSessions execution remains disabled by the archived-only deletion policy; explicitly archive narrators before running archivedSessions cleanup.",
 				"storage.database.vacuumDisabled": "Database vacuum is disabled in go_backend to avoid long blocking maintenance on the main runtime."
 			},
-			"sideEffectPolicy": "Preview and summary degrade to safe diagnostics; cleanup and vacuum avoid destructive or long-running work unless explicitly supported.",
+			"sideEffectPolicy": "Preview and summary degrade to safe diagnostics; archivedSessions cleanup deletes only through the safe narrator RemoveNarrator path, staleSessions requires explicit archive first, and vacuum avoids request-path maintenance.",
 			"tests": ["go_backend/internal/misccompat/routes_test.go"]
 		},
 		{
@@ -633,6 +639,30 @@
 			]
 		},
 		{
+			"group": "narrator.delete",
+			"method": "DELETE",
+			"path": "/api/narrators/{id}",
+			"tsSource": "server/routes/narrators.ts and server/services/narrator-service.ts",
+			"goSource": "go_backend/internal/narrators/handlers.go and go_backend/internal/narrators/remove.go",
+			"frontendConsumers": ["frontend/routes/narrators/archived.tsx", "frontend/lib/api/narrators.ts"],
+			"phase0Status": "supported-for-archived-narrators-with-recursive-shared-message-cleanup",
+			"capabilityKey": "narrator.delete",
+			"features": [
+				"archived-only route guard",
+				"recursive child/subagent deletion",
+				"shared narrator_message_refs owner handoff",
+				"image uploadNarratorId preservation for surviving shared messages",
+				"orphan message/tool-call/patch/sidecar cleanup",
+				"terminal/background/gateway/browser-session row cleanup with optional-table guards"
+			],
+			"sideEffectPolicy": "Delete rejects non-archived narrators before mutation; archived deletes run inside a DB transaction, hand off shared messages before removing refs, delete uploads only after commit, and preserve upload directories when surviving shared image messages still depend on them.",
+			"tests": [
+				"go_backend/internal/narrators/remove_test.go",
+				"go_backend/internal/narrators/handlers_patches_test.go",
+				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks"
+			]
+		},
+		{
 			"group": "narrator.compact",
 			"paths": [
 				"/api/narrators/{id}/compact",
@@ -677,7 +707,7 @@
 				"narrator.subagents.reattachFallback": "Go can detach and open subagent sessions, but cannot re-block an already-running parent tool promise after reattach.",
 				"narrator.subagents.manualOverrideConclusionFallback": "Go backend updated the parent tool call conclusion when present; in-memory manual override waiters are not implemented, so any manual override is cleared as a fallback rather than resuming a blocked parent promise.",
 				"narrator.subagents.teamStatusUnsupportedAction": "Go backend TeamStatus currently supports action=list, file_changes, broadcast, and send.",
-				"narrator.subagents.awaitUnsupportedType": "Go backend Await currently supports type=agent only."
+				"narrator.subagents.awaitUnsupportedType": "Go backend Await currently supports type=agent or type=bash; other task types are surfaced as unsupported."
 			},
 			"sideEffectPolicy": "Subagent detach/attach/update-conclusion mutate only DB state and tool-call conclusions; any TS in-memory waiter parity gap, unsupported TeamStatus action, or unsupported Await task type is surfaced with fallback:true and reason/error/message diagnostics. Agent/Send/Await/TeamStatus validation errors and file_changes target misses are non-fallback tool diagnostics but still expose code/reason/error/message for stable consumers.",
 			"tests": [

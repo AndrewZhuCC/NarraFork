@@ -127,8 +127,8 @@
 				"Go Grep consumes TS-compatible path, type, multiline, -B/-A/-C, -n, offset, and files_with_matches default-mode parameters, with path escape checks, common file-type filtering, and multiline dotall matching within bounded safe-walker limits",
 				"Go Read provider schema exposes the TS pages/PDF extraction parameter and explicitly rejects it at runtime instead of silently ignoring it while reading as plain text",
 				"Go WebFetch, WebSearch, ShareFile, Bash, Write, Edit, Glob, and Grep provider schemas now expose TS-compatible strict-object constraints, including WebFetch TS extraction-mode fields gated by raw-only runtime diagnostics, WebSearch query minLength, ShareFile path union strictness, Bash workdir/strict_serial/background fields, and Grep output_mode enum",
-				"Go Bash supports TS-compatible workdir and strict_serial scheduling while explicitly rejecting unsupported run_in_background; Go Agent consumes/exposes the TS legacy background alias for run_in_background, uses the TS reasoning_effort enum, and Agent/Send/TeamStatus provider schemas now reject extra fields with TeamStatus action enum parity",
-				"Go Await provider schema exposes TS-compatible type enum and wait_for_text field while runtime capabilities/frontend helpers expose Go bash-task degradation, including disabled wait_for_text support",
+				"Go Bash supports TS-compatible workdir and strict_serial scheduling; run_in_background is supported in narrator context and explicitly rejected only in non-narrator ExecuteTool contexts",
+				"Go Await provider schema exposes TS-compatible type enum and wait_for_text field; narrator context supports type=agent and type=bash, including wait_for_text for background Bash tasks",
 				"Go Browser provider schema now constrains action and direction with TS-aligned enums and additionalProperties=false instead of accepting unconstrained strings/extra properties and relying only on runtime unsupported-action errors",
 				"Go Browser provider schema hides TS-unsupported Go-only state/full_page extensions while keeping runtime compatibility for explicit legacy calls",
 				"Go Terminal provider schema now uses the TS action enum, additionalProperties=false, and hides the Go-only max_length read extension while keeping runtime compatibility for explicit calls",
@@ -153,12 +153,6 @@
 					"supported": false,
 					"mode": "explicit-runtime-error",
 					"reason": "Go Read currently supports text/directory reads only; TS PDF page extraction is rejected explicitly until a safe PDF extraction runtime is implemented."
-				},
-				{
-					"feature": "tools.await.bashTasks",
-					"supported": false,
-					"mode": "capability-and-explicit-runtime-error",
-					"reason": "Go Await currently supports agent/subagent background tasks only; TS bash background task awaiting and wait_for_text are surfaced as unsupported."
 				},
 				{
 					"feature": "tools.browser.screenshotPreview",
@@ -218,8 +212,11 @@
 				{
 					"feature": "chapters.split.compressedAISummary",
 					"supported": false,
-					"mode": "deterministic-summary-placeholder",
-					"reason": "Go split compressed context uses a deterministic placeholder summary instead of a TypeScript-equivalent model-generated summary."
+					"mode": "bounded-ref-copy-with-deterministic-context-note",
+					"deterministic": true,
+					"copiesMessageRefs": true,
+					"generatesModelSummary": false,
+					"reason": "Go split compressed context copies bounded message refs and records a deterministic context note instead of generating a TypeScript-equivalent model summary."
 				}
 			],
 			"goSources": [
@@ -579,7 +576,7 @@
 				"update check/version/directory/status/cleanup/download/apply route surface with conditional graceful self-apply and auto-restart handoff",
 				"update download SSE with HTTP(S), multiple files, SHA512, 512 MiB cap, and manual fallback when restart handoff is unavailable",
 				"runtime scan/cached/cleanup for terminals, containers, browsers, and Go-specific worktree cleanup",
-				"storage scan/cached with last-completed scan cache, cleanup/database preview/database cleanup, and disabled VACUUM contract"
+				"storage scan/cached with last-completed scan cache, cleanup/database preview/database cleanup, archivedSessions safe narrator deletion, staleSessions archived-only policy, and disabled VACUUM contract"
 			],
 			"fallbacks": [
 				{
@@ -595,6 +592,12 @@
 					"reason": "Podman prune is disabled from storage cleanup in go_backend; use per-chapter container controls or an external maintenance command."
 				},
 				{
+					"feature": "storage.database.cleanupTargets.staleSessions",
+					"supported": false,
+					"mode": "archived-only-deletion-policy",
+					"reason": "staleSessions cleanup must not delete active metadata implicitly; explicitly archive narrators first, then run archivedSessions cleanup through safe narrator delete."
+				},
+				{
 					"feature": "storage.vacuum",
 					"supported": false,
 					"reason": "Main-thread SQLite VACUUM is disabled in go_backend; use an explicit maintenance window/tool outside request handling."
@@ -605,7 +608,7 @@
 				"go_backend/internal/misccompat/handlers.go",
 				"go_backend/internal/app/router.go"
 			],
-			"frontendConsumerPolicy": "UpdateModal gates SSE download and auto-apply/restart by update capability metadata and falls back to manual instructions; RuntimeSection gates runtime cleanup targets; StorageSection reroutes worktree cleanup to runtime, keeps container prune disabled when unsafe, and surfaces disabled VACUUM/database cleanup reasons.",
+			"frontendConsumerPolicy": "UpdateModal gates SSE download and auto-apply/restart by update capability metadata and falls back to manual instructions; RuntimeSection gates runtime cleanup targets; StorageSection reroutes worktree cleanup to runtime, keeps container prune disabled when unsafe, treats archivedSessions as supported safe narrator deletion, and surfaces staleSessions archived-only plus disabled VACUUM reasons.",
 			"tests": [
 				"go_backend/internal/systemroutes/update_contract_test.go",
 				"go_backend/internal/systemroutes/runtime_cleanup_test.go",

@@ -46,7 +46,42 @@ var terminalANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]
 
 func (s *Service) executeContextualAgentTool(ctx context.Context, narratorID string, narrator Narrator, call agentbasic.ToolCall) (agentbasic.ToolRun, bool, error) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
-	if strings.TrimSpace(call.Function.Name) != "Terminal" {
+	toolName := strings.TrimSpace(call.Function.Name)
+	if toolName == "ExitPlanMode" {
+		args := map[string]any{}
+		if strings.TrimSpace(call.Function.Arguments) != "" {
+			if err := jsonUnmarshalObject(call.Function.Arguments, &args); err != nil {
+				run.Status = "error"
+				run.Output = "invalid tool arguments: " + err.Error()
+				return run, true, nil
+			}
+		}
+		payload, err := s.completeExitPlanModeTool(ctx, narratorID, args)
+		if err != nil {
+			return run, true, err
+		}
+		run.Output = jsonToolOutput(payload)
+		return run, true, nil
+	}
+	if toolName == "Bash" {
+		args := map[string]any{}
+		if strings.TrimSpace(call.Function.Arguments) != "" {
+			if err := jsonUnmarshalObject(call.Function.Arguments, &args); err != nil {
+				run.Status = "error"
+				run.Output = "invalid tool arguments: " + err.Error()
+				return run, true, nil
+			}
+		}
+		if anyBool(args["run_in_background"]) {
+			output, err := s.executeBackgroundBashTool(ctx, narratorID, narrator, call, args)
+			if err != nil {
+				return run, true, err
+			}
+			run.Output = output
+			return run, true, nil
+		}
+	}
+	if toolName != "Terminal" {
 		return run, false, nil
 	}
 	args := map[string]any{}

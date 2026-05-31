@@ -17,19 +17,49 @@ import (
 	"narrafork-go/internal/id"
 )
 
+type apiRequestRunState struct {
+	Provider     string
+	Model        string
+	CredentialID string
+	StartedAt    time.Time
+}
+
 type agentRunState struct {
-	narratorID     string
-	narrator       Narrator
-	draftMessageID *string
-	blocks         []map[string]any
-	assistantText  string
-	lastMessage    *Message
-	completed      bool
-	errored        bool
-	errorMessage   string
-	errorCode      string
-	streamedBytes  int
-	providerPrefix string
+	narratorID             string
+	narrator               Narrator
+	draftMessageID         *string
+	blocks                 []map[string]any
+	assistantText          string
+	lastMessage            *Message
+	completed              bool
+	errored                bool
+	errorMessage           string
+	errorCode              string
+	hadToolUses            bool
+	skipGoalContinuation   bool
+	goalTurnStartedAt      time.Time
+	goalTokenUsageBaseline *agentbasic.UsageSnapshot
+	lastTokenUsage         *agentbasic.UsageSnapshot
+	pendingApiRequestIDs   []string
+	apiRequests            map[string]apiRequestRunState
+	streamedBytes          int
+	providerPrefix         string
+	planApprovedMode       string
+	planApprovedPrompt     string
+	planApprovedBy         string
+	sideCarToolCount       int
+}
+
+func (state *agentRunState) resetAssistantDraft() {
+	if state == nil {
+		return
+	}
+	if state.draftMessageID != nil {
+		*state.draftMessageID = ""
+	}
+	state.blocks = nil
+	state.assistantText = ""
+	state.hadToolUses = false
 }
 
 func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
@@ -42,7 +72,21 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		s.broadcastBackgroundTaskOutput(*state.narrator.ParentNarratorID, state.narratorID, state.streamedBytes)
 	}
 	switch event.Type {
-	case "stream_text", "stream_reasoning", "tool_use_chunk", "context_usage", "retrying", "api_request_start", "api_request_end", "web_search", "image_generation", "output_truncated", "model_switched", "turn_complete", "tool_inventory":
+	case "stream_text", "stream_reasoning", "tool_use_chunk", "retrying", "web_search", "image_generation", "output_truncated", "model_switched", "tool_inventory":
+		return nil
+	case "turn_complete":
+		state.resetAssistantDraft()
+		return nil
+	case "sidecars":
+		return s.persistStandaloneSideCars(ctx, state, event.SideCars)
+	case "api_request_start":
+		rememberAPIRequestStart(state, event)
+		return nil
+	case "api_request_end":
+		_ = s.persistAPIRequestEvent(ctx, state, event)
+		return nil
+	case "context_usage":
+		state.lastTokenUsage = mergeUsageSnapshot(state.lastTokenUsage, event.Usage)
 		return nil
 	case "quota_balance":
 		s.persistCustomApiQuotaBalance(
@@ -64,6 +108,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		}
 		block := contentBlockToMap(event.Block)
 		if blockID, _ := block["id"].(string); block["type"] == "tool_use" && blockID != "" {
+			state.hadToolUses = true
 			upsertToolUseBlock(state, block)
 		} else {
 			state.blocks = append(state.blocks, block)
@@ -73,6 +118,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		}
 		return s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks)
 	case "tool_call":
+		state.hadToolUses = true
 		if err := s.ensureAssistantDraft(ctx, state); err != nil {
 			return err
 		}
@@ -100,6 +146,8 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		if err := s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks); err != nil {
 			return err
 		}
+		_ = s.updateAssistantMessageUsage(ctx, state, *state.draftMessageID, event)
+		_ = s.linkPendingAPIRequestsToMessage(ctx, state, *state.draftMessageID)
 		msg, err := s.messageByID(ctx, state.narratorID, *state.draftMessageID)
 		if err != nil {
 			return err
@@ -131,6 +179,388 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		return s.finishAgentRunError(ctx, state, state.errorMessage)
 	default:
 		return nil
+	}
+}
+
+func rememberAPIRequestStart(state *agentRunState, event agentbasic.AgentEvent) {
+	if state == nil {
+		return
+	}
+	requestID := strings.TrimSpace(event.RequestID)
+	if requestID == "" {
+		requestID = id.New()
+	}
+	if state.apiRequests == nil {
+		state.apiRequests = map[string]apiRequestRunState{}
+	}
+	state.apiRequests[requestID] = apiRequestRunState{
+		Provider:     firstNonEmptyString(strings.TrimSpace(event.Provider), state.providerPrefix),
+		Model:        firstNonEmptyString(strings.TrimSpace(event.Model), ptrString(state.narrator.Model)),
+		CredentialID: strings.TrimSpace(event.CredentialID),
+		StartedAt:    time.Now(),
+	}
+}
+
+func (s *Service) persistAPIRequestEvent(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
+	if s == nil || s.DB == nil || state == nil {
+		return nil
+	}
+	columns, err := db.TableColumnSet(ctx, s.DB, "api_requests")
+	if err != nil || len(columns) == 0 {
+		return err
+	}
+	requestID := strings.TrimSpace(event.RequestID)
+	if requestID == "" {
+		requestID = id.New()
+	}
+	request := state.apiRequests[requestID]
+	if request.StartedAt.IsZero() {
+		request.StartedAt = time.Now()
+	}
+	provider := firstNonEmptyString(strings.TrimSpace(event.Provider), request.Provider, state.providerPrefix)
+	model := firstNonEmptyString(strings.TrimSpace(event.Model), request.Model, ptrString(state.narrator.Model))
+	credentialID := firstNonEmptyString(strings.TrimSpace(event.CredentialID), request.CredentialID)
+	durationMs := event.DurationMs
+	if durationMs == 0 && !request.StartedAt.IsZero() {
+		durationMs = time.Since(request.StartedAt).Milliseconds()
+	}
+	usage := event.Usage
+	messageID := ""
+	if state.draftMessageID != nil {
+		messageID = strings.TrimSpace(*state.draftMessageID)
+	}
+	values := map[string]any{
+		"id":                          requestID,
+		"narrator_id":                 state.narratorID,
+		"message_id":                  nullableTrimmedString(messageID),
+		"kind":                        "narrator",
+		"provider":                    nullableTrimmedString(provider),
+		"credential_id":               nullableTrimmedString(credentialID),
+		"model":                       nullableTrimmedString(model),
+		"input_tokens":                usageInputTokens(usage),
+		"output_tokens":               usageCompletionTokens(usage),
+		"cached_input_tokens":         usageCachedInputTokens(usage),
+		"cache_creation_input_tokens": usageCacheCreationInputTokens(usage),
+		"cache_creation_5m_tokens":    usageCacheCreation5mTokens(usage),
+		"cache_creation_1h_tokens":    usageCacheCreation1hTokens(usage),
+		"reasoning_tokens":            usageReasoningTokens(usage),
+		"ttft_ms":                     nullablePositiveInt64(int64FromMetadata(event.Metadata, "ttftMs")),
+		"duration_ms":                 nullablePositiveInt64(durationMs),
+		"cost_usd":                    nullableCostForUsage(usage, provider, model),
+		"context_percent":             nullablePositiveFloat(event.Percentage),
+		"meter_usage":                 nullablePositiveFloat(floatFromMetadata(event.Metadata, "meterUsage")),
+		"meter_unit":                  nullableTrimmedString(stringFromMetadata(event.Metadata, "meterUnit")),
+		"error_message":               nullableTrimmedString(event.Message),
+		"raw_dump_json":               s.apiRequestRawDumpJSON(event),
+		"created_at":                  db.NowISO(),
+	}
+	insertColumns := []string{}
+	placeholders := []string{}
+	args := []any{}
+	for _, column := range []string{"id", "narrator_id", "message_id", "kind", "provider", "credential_id", "model", "input_tokens", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "reasoning_tokens", "ttft_ms", "duration_ms", "cost_usd", "context_percent", "meter_usage", "meter_unit", "error_message", "raw_dump_json", "created_at"} {
+		if !columns[column] {
+			continue
+		}
+		insertColumns = append(insertColumns, column)
+		placeholders = append(placeholders, "?")
+		args = append(args, values[column])
+	}
+	if len(insertColumns) == 0 {
+		return nil
+	}
+	updateColumns := []string{}
+	for _, column := range insertColumns {
+		if column != "id" {
+			updateColumns = append(updateColumns, column)
+		}
+	}
+	query := db.InsertOnConflictUpdateSQL("api_requests", insertColumns, []string{"id"}, updateColumns)
+	if _, err := s.DB.ExecContext(ctx, query, args...); err != nil {
+		return err
+	}
+	if messageID == "" {
+		state.pendingApiRequestIDs = append(state.pendingApiRequestIDs, requestID)
+	}
+	delete(state.apiRequests, requestID)
+	return nil
+}
+
+func (s *Service) apiRequestRawDumpJSON(event agentbasic.AgentEvent) any {
+	if s == nil || s.Settings == nil || !s.agentSettingBool("requestDumpEnabled", false) {
+		return nil
+	}
+	rawDump, ok := event.Metadata["rawDump"]
+	if !ok {
+		rawDump, ok = event.Metadata["raw_dump"]
+	}
+	if !ok || rawDump == nil {
+		return nil
+	}
+	if s.agentSettingBool("requestDumpErrorsOnly", false) && strings.TrimSpace(event.Message) == "" {
+		return nil
+	}
+	data, err := json.Marshal(rawDump)
+	if err != nil {
+		data, _ = json.Marshal(map[string]any{"invalidJson": true, "rawText": fmt.Sprint(rawDump)})
+	}
+	maxSize := s.agentSettingInt("requestDumpMaxSize", 1024*1024)
+	if maxSize >= 0 && len(data) > maxSize {
+		preview := string(data[:maxSize])
+		data, _ = json.Marshal(map[string]any{"truncated": true, "originalBytes": len(data), "preview": preview})
+	}
+	return string(data)
+}
+
+func (s *Service) agentSettingBool(key string, fallback bool) bool {
+	if s == nil || s.Settings == nil {
+		return fallback
+	}
+	raw := s.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	value, ok := agent[key]
+	if !ok {
+		return fallback
+	}
+	if boolValue, ok := value.(bool); ok {
+		return boolValue
+	}
+	return fallback
+}
+
+func (s *Service) agentSettingInt(key string, fallback int) int {
+	if s == nil || s.Settings == nil {
+		return fallback
+	}
+	raw := s.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	switch value := agent[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return fallback
+}
+
+func (s *Service) updateAssistantMessageUsage(ctx context.Context, state *agentRunState, messageID string, event agentbasic.AgentEvent) error {
+	if s == nil || s.DB == nil || state == nil || strings.TrimSpace(messageID) == "" {
+		return nil
+	}
+	columns, err := db.TableColumnSet(ctx, s.DB, "narrator_messages")
+	if err != nil || len(columns) == 0 {
+		return err
+	}
+	usage := state.lastTokenUsage
+	provider := firstNonEmptyString(state.providerPrefix, event.Provider)
+	model := firstNonEmptyString(ptrString(state.narrator.Model), event.Model)
+	credentialID := strings.TrimSpace(event.CredentialID)
+	values := map[string]any{
+		"provider":                    nullableTrimmedString(provider),
+		"credential_id":               nullableTrimmedString(credentialID),
+		"model":                       nullableTrimmedString(model),
+		"tokens_in":                   usageInputTokens(usage),
+		"output_tokens":               usageCompletionTokens(usage),
+		"cached_input_tokens":         usageCachedInputTokens(usage),
+		"cache_creation_input_tokens": usageCacheCreationInputTokens(usage),
+		"cache_creation_5m_tokens":    usageCacheCreation5mTokens(usage),
+		"cache_creation_1h_tokens":    usageCacheCreation1hTokens(usage),
+		"reasoning_tokens":            usageReasoningTokens(usage),
+		"cost_usd":                    nullableCostForUsage(usage, provider, model),
+		"duration_ms":                 nullablePositiveInt64(time.Since(state.goalTurnStartedAt).Milliseconds()),
+		"turn_usage_json":             usageTurnJSON(usage),
+	}
+	sets := []string{}
+	args := []any{}
+	for _, column := range []string{"provider", "credential_id", "model", "tokens_in", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "reasoning_tokens", "cost_usd", "duration_ms", "turn_usage_json"} {
+		if !columns[column] {
+			continue
+		}
+		if values[column] == nil && column != "cost_usd" && column != "credential_id" {
+			continue
+		}
+		sets = append(sets, column+" = ?")
+		args = append(args, values[column])
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	args = append(args, messageID)
+	_, err = s.DB.ExecContext(ctx, `UPDATE narrator_messages SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+	return err
+}
+
+func (s *Service) linkPendingAPIRequestsToMessage(ctx context.Context, state *agentRunState, messageID string) error {
+	if s == nil || s.DB == nil || state == nil || strings.TrimSpace(messageID) == "" || len(state.pendingApiRequestIDs) == 0 {
+		return nil
+	}
+	columns, err := db.TableColumnSet(ctx, s.DB, "api_requests")
+	if err != nil || !columns["message_id"] || !columns["id"] {
+		return err
+	}
+	for _, requestID := range state.pendingApiRequestIDs {
+		if strings.TrimSpace(requestID) == "" {
+			continue
+		}
+		if _, err := s.DB.ExecContext(ctx, `UPDATE api_requests SET message_id = ? WHERE id = ?`, messageID, requestID); err != nil {
+			return err
+		}
+	}
+	state.pendingApiRequestIDs = nil
+	return nil
+}
+
+func usageInputTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	if usage.InputTokens != 0 {
+		return usage.InputTokens
+	}
+	return usage.PromptTokens
+}
+
+func usageCompletionTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.CompletionTokens
+}
+
+func usageCachedInputTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.CachedInputTokens
+}
+
+func usageCacheCreationInputTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.CacheCreationInputTokens
+}
+
+func usageCacheCreation5mTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.CacheCreation5mTokens
+}
+
+func usageCacheCreation1hTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.CacheCreation1hTokens
+}
+
+func usageReasoningTokens(usage *agentbasic.UsageSnapshot) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.ReasoningTokens
+}
+
+func usageTurnJSON(usage *agentbasic.UsageSnapshot) any {
+	if usage == nil {
+		return nil
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"inputTokens":                usageInputTokens(usage),
+		"outputTokens":               usageCompletionTokens(usage),
+		"cachedInputTokens":          usageCachedInputTokens(usage),
+		"cacheCreationInputTokens":   usageCacheCreationInputTokens(usage),
+		"cacheCreation5mInputTokens": usageCacheCreation5mTokens(usage),
+		"cacheCreation1hInputTokens": usageCacheCreation1hTokens(usage),
+		"reasoningTokens":            usageReasoningTokens(usage),
+	})
+	return string(payload)
+}
+
+func nullablePositiveInt64(value int64) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func nullablePositiveFloat(value float64) any {
+	if value <= 0 {
+		return nil
+	}
+	return value
+}
+
+func nullableCostForUsage(usage *agentbasic.UsageSnapshot, provider, model string) any {
+	cost, ok := costForUsage(usage, provider, model)
+	if !ok {
+		return nil
+	}
+	return cost
+}
+
+func costForUsage(usage *agentbasic.UsageSnapshot, _ string, model string) (float64, bool) {
+	if usage == nil {
+		return 0, false
+	}
+	lowerModel := strings.ToLower(model)
+	var inputRate, outputRate, cacheReadRate, cacheWriteRate float64
+	switch {
+	case strings.Contains(lowerModel, "claude-3-5-sonnet"):
+		inputRate, outputRate, cacheReadRate, cacheWriteRate = 3.0, 15.0, 0.3, 3.75
+	case strings.Contains(lowerModel, "gpt-4o"):
+		inputRate, outputRate, cacheReadRate, cacheWriteRate = 2.5, 10.0, 1.25, 0
+	default:
+		return 0, false
+	}
+	inputCost := float64(usageInputTokens(usage)) / 1_000_000 * inputRate
+	outputCost := float64(usageCompletionTokens(usage)) / 1_000_000 * outputRate
+	cacheReadCost := float64(usageCachedInputTokens(usage)) / 1_000_000 * cacheReadRate
+	cacheCreationCost := float64(usageCacheCreationInputTokens(usage)) / 1_000_000 * cacheWriteRate
+	return inputCost + outputCost + cacheReadCost + cacheCreationCost, true
+}
+
+func int64FromMetadata(metadata map[string]any, key string) int64 {
+	if metadata == nil {
+		return 0
+	}
+	switch v := metadata[key].(type) {
+	case int:
+		return int64(v)
+	case int64:
+		return v
+	case float64:
+		return int64(v)
+	case json.Number:
+		parsed, _ := v.Int64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func floatFromMetadata(metadata map[string]any, key string) float64 {
+	if metadata == nil {
+		return 0
+	}
+	switch v := metadata[key].(type) {
+	case int:
+		return float64(v)
+	case int64:
+		return float64(v)
+	case float64:
+		return v
+	case json.Number:
+		parsed, _ := v.Float64()
+		return parsed
+	default:
+		return 0
 	}
 }
 
@@ -229,6 +659,9 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 		payload["completionTokens"] = event.Usage.CompletionTokens
 		payload["reasoningTokens"] = event.Usage.ReasoningTokens
 		payload["cachedInputTokens"] = event.Usage.CachedInputTokens
+		payload["cacheCreationInputTokens"] = event.Usage.CacheCreationInputTokens
+		payload["cacheCreation5mTokens"] = event.Usage.CacheCreation5mTokens
+		payload["cacheCreation1hTokens"] = event.Usage.CacheCreation1hTokens
 		payload["contextWindow"] = event.Usage.ContextWindow
 		payload["isEstimated"] = event.Usage.Estimated
 		if event.Type == "context_usage" && event.Percentage == 0 && event.Usage.ContextWindow > 0 {
@@ -257,6 +690,9 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	}
 	if event.Metadata != nil {
 		payload["metadata"] = event.Metadata
+	}
+	if len(event.SideCars) > 0 {
+		payload["sideCars"] = agentSideCarsPayload(event.SideCars)
 	}
 	if event.Type == "web_search" {
 		payload["id"] = event.ToolUseID
@@ -376,6 +812,25 @@ func (s *Service) persistCustomApiQuotaBalance(providerPrefix, quotaBalance, det
 		return
 	}
 	_ = os.WriteFile(path, data, 0o600)
+}
+
+func agentSideCarsPayload(sideCars []agentbasic.AgentSideCar) []map[string]any {
+	items := make([]map[string]any, 0, len(sideCars))
+	for _, sideCar := range sideCars {
+		item := map[string]any{
+			"target":  sideCar.Target,
+			"source":  sideCar.Source,
+			"content": sideCar.Content,
+		}
+		if strings.TrimSpace(sideCar.ToolUseID) != "" {
+			item["toolUseId"] = strings.TrimSpace(sideCar.ToolUseID)
+		}
+		if sideCar.OrderIndex != 0 {
+			item["orderIndex"] = sideCar.OrderIndex
+		}
+		items = append(items, item)
+	}
+	return items
 }
 
 func (s *Service) persistNugQuotaBalance(providerPrefix, quotaBalance string) {
@@ -567,12 +1022,13 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 	}
 	run := *event.ToolRun
 	if run.Recorded {
-		return nil
+		return s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars)
 	}
 	status := toolRunDBStatus(run.Status, event.IsError || strings.TrimSpace(run.Error) != "")
 	outputJSON, _ := json.Marshal(map[string]any{"output": run.Output})
+	inputJSON := toolRunArgumentsInputJSON(run.Arguments)
 	now := db.NowISO()
-	res, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, output_json = ?, execution_started_at = COALESCE(execution_started_at, ?), completed_at = ?, error_message = ?, result_message_id = ? WHERE narrator_id = ? AND tool_use_id = ?`, status, string(outputJSON), now, now, nullableTrimmedString(run.Error), *state.draftMessageID, state.narratorID, run.ID)
+	res, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, input_json = COALESCE(?, input_json), output_json = ?, execution_started_at = COALESCE(execution_started_at, ?), completed_at = ?, error_message = ?, result_message_id = ? WHERE narrator_id = ? AND tool_use_id = ?`, status, inputJSON, string(outputJSON), now, now, nullableTrimmedString(run.Error), *state.draftMessageID, state.narratorID, run.ID)
 	if err != nil {
 		return err
 	}
@@ -581,7 +1037,7 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 		if err := s.persistToolRun(ctx, state.narratorID, *state.draftMessageID, run); err != nil {
 			return err
 		}
-		return nil
+		return s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars)
 	}
 	var toolCallID sql.NullString
 	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, state.narratorID, run.ID).Scan(&toolCallID); err != nil {
@@ -589,7 +1045,25 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 			return fmt.Errorf("query finished tool call: %w", err)
 		}
 	}
+	if err := s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars); err != nil {
+		return err
+	}
 	return s.persistFileSnapshot(ctx, state.narratorID, *state.draftMessageID, sqlNullString(toolCallID), run)
+}
+
+func toolRunArgumentsInputJSON(raw string) any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	var input any
+	if err := json.Unmarshal([]byte(raw), &input); err != nil {
+		return nil
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return nil
+	}
+	return string(encoded)
 }
 
 func (s *Service) latestRunNarrator(ctx context.Context, state *agentRunState) Narrator {
@@ -631,6 +1105,9 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 			state.lastMessage = &msg
 		}
 	}
+	// TS treats goal usage accounting as best-effort; never fail a completed run
+	// because active-goal counters could not be persisted.
+	_ = s.accountGoalUsageForTurn(ctx, state)
 	if state.narrator.ChapterID != nil {
 		if isReview, reset, message := s.checkAndResetReviewGitState(ctx, *state.narrator.ChapterID); isReview {
 			if reset && strings.TrimSpace(message) != "" {

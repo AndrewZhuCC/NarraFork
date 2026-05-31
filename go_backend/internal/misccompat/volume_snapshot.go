@@ -87,7 +87,7 @@ func volumeSnapshotFallbackPayload(code, message string) map[string]any {
 }
 
 func writeVolumeSnapshotFallback(w http.ResponseWriter, code, message string) {
-	httpx.WriteJSON(w, http.StatusOK, volumeSnapshotFallbackPayload(code, message))
+	httpx.WriteJSON(w, http.StatusNotImplemented, volumeSnapshotFallbackPayload(code, message))
 }
 
 func defaultVolumeSnapshotRoot() (string, error) {

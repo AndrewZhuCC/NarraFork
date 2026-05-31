@@ -22,6 +22,8 @@ const (
 	maxTextPreview      = 1024 * 1024
 )
 
+var runtimeGOOS = runtime.GOOS
+
 type Handler struct{ Settings *config.Store }
 
 func NewHandler(settings *config.Store) *Handler { return &Handler{Settings: settings} }
@@ -45,6 +47,17 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) error {
 	path := r.URL.Query().Get("path")
 	showHidden := r.URL.Query().Get("showHidden") == "1"
 	if path == "" {
+		drives := driveObjects()
+		if runtimeGOOS == "windows" {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"path":    nil,
+				"parent":  nil,
+				"sep":     string(os.PathSeparator),
+				"drives":  drives,
+				"entries": []entry{},
+			})
+			return nil
+		}
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
 			path = home
 		} else {
@@ -64,14 +77,13 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) error {
 		if len(result) >= maxDirectoryEntries {
 			break
 		}
+		if !item.IsDir() {
+			continue
+		}
 		if !showHidden && strings.HasPrefix(item.Name(), ".") {
 			continue
 		}
-		typ := "file"
-		if item.IsDir() {
-			typ = "directory"
-		}
-		result = append(result, entry{Name: item.Name(), Path: filepath.Join(resolved, item.Name()), Type: typ, IsDir: item.IsDir()})
+		result = append(result, entry{Name: item.Name(), Path: filepath.Join(resolved, item.Name()), Type: "directory", IsDir: true})
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].IsDir != result[j].IsDir {
@@ -98,7 +110,7 @@ func parentDir(path string) any {
 }
 
 func driveObjects() []map[string]string {
-	if runtime.GOOS != "windows" {
+	if runtimeGOOS != "windows" {
 		return []map[string]string{}
 	}
 	drives := []map[string]string{}
@@ -126,7 +138,7 @@ func (h *Handler) shortcuts(w http.ResponseWriter, _ *http.Request) error {
 			candidates = append(candidates, map[string]any{"key": item.key, "path": filepath.Join(home, item.rel)})
 		}
 	}
-	if runtime.GOOS != "windows" {
+	if runtimeGOOS != "windows" {
 		candidates = append(candidates, map[string]any{"key": "root", "path": string(os.PathSeparator)})
 	}
 	if h.Settings != nil {
@@ -165,26 +177,13 @@ func (h *Handler) reveal(w http.ResponseWriter, r *http.Request) error {
 	}
 	cmdName := ""
 	args := []string{resolved}
-	switch runtime.GOOS {
+	switch runtimeGOOS {
 	case "darwin":
 		cmdName = "open"
 	case "windows":
 		cmdName = "explorer"
-	case "linux":
-		cmdName = "xdg-open"
 	default:
-		reason := "Opening the system file manager is not supported on this platform by go_backend."
-		httpx.WriteJSON(w, http.StatusNotImplemented, map[string]any{
-			"ok":        false,
-			"code":      "FS_REVEAL_UNSUPPORTED",
-			"feature":   "fs.reveal",
-			"supported": false,
-			"fallback":  true,
-			"reason":    reason,
-			"error":     reason,
-			"message":   reason,
-		})
-		return nil
+		return httpx.ValidationError("Opening file manager is not supported on this platform")
 	}
 	cmd := exec.Command(cmdName, args...)
 	cmd.Stdout = nil
@@ -199,7 +198,6 @@ func (h *Handler) reveal(w http.ResponseWriter, r *http.Request) error {
 
 func (h *Handler) mkdir(w http.ResponseWriter, r *http.Request) error {
 	var req struct {
-		Path   string `json:"path"`
 		Parent string `json:"parent"`
 		Name   string `json:"name"`
 	}
@@ -209,17 +207,7 @@ func (h *Handler) mkdir(w http.ResponseWriter, r *http.Request) error {
 	parent := strings.TrimSpace(req.Parent)
 	name := strings.TrimSpace(req.Name)
 	if parent == "" || name == "" {
-		// Legacy compatibility for callers that still send { path }, but keep the same
-		// basename validation to avoid path traversal through a full target path.
-		if strings.TrimSpace(req.Path) == "" {
-			return httpx.ValidationError("parent and name are required")
-		}
-		resolved, err := expand(req.Path)
-		if err != nil {
-			return err
-		}
-		parent = filepath.Dir(resolved)
-		name = filepath.Base(resolved)
+		return httpx.ValidationError("parent and name are required")
 	}
 	if err := validateFolderName(name); err != nil {
 		return err

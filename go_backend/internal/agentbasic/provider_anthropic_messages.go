@@ -41,6 +41,11 @@ func (a *AnthropicMessagesAdapter) BuildHistory(messages []Message, _ string, _ 
 			continue
 		}
 		if len(message.ContentBlocks) > 0 || len(message.ToolCalls) > 0 {
+			if message.Role == "assistant" {
+				if searchContext := webSearchContextFromBlocks(message.ContentBlocks); searchContext != "" {
+					history = append(history, map[string]any{"role": "user", "content": searchContext})
+				}
+			}
 			parts := anthropicContentFromBlocks(message.ContentBlocks, message.Content, message.ToolCalls)
 			if len(parts) == 0 {
 				continue
@@ -89,7 +94,11 @@ func (a *AnthropicMessagesAdapter) PushUserTurn(history *BuiltHistory, content s
 		return
 	}
 	if len(toolResults) > 0 {
-		history.History = append(history.History, map[string]any{"role": "user", "content": toolResults})
+		blocks := append([]any(nil), toolResults...)
+		if strings.TrimSpace(content) != "" {
+			blocks = append(blocks, map[string]any{"type": "text", "text": content})
+		}
+		history.History = append(history.History, map[string]any{"role": "user", "content": blocks})
 		return
 	}
 	if strings.TrimSpace(content) != "" {

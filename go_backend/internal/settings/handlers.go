@@ -61,6 +61,7 @@ func (h *Handler) get(w http.ResponseWriter, _ *http.Request) error {
 		return httpx.BadRequest("Settings unavailable")
 	}
 	raw := h.Store.Raw()
+	ensureOptionalProviderArraysForResponse(raw)
 	normalizeProviderCompatibilityForResponse(raw)
 	augmentProviderModelSettings(raw)
 	sanitizeSettingsForResponse(raw)
@@ -110,9 +111,19 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) error {
 			next[key] = value
 		}
 	}
+	ensureOptionalProviderArraysForResponse(next)
+	normalizeProviderCompatibilityForResponse(next)
 	sanitizeSettingsForResponse(next)
 	httpx.WriteJSON(w, http.StatusOK, next)
 	return nil
+}
+
+func ensureOptionalProviderArraysForResponse(raw map[string]any) {
+	for _, field := range []string{"nkpProviders", "nugProviders", "clineProviders"} {
+		if _, ok := raw[field].([]any); !ok {
+			raw[field] = []any{}
+		}
+	}
 }
 
 func normalizeProviderCompatibilityForResponse(raw map[string]any) {
@@ -130,7 +141,12 @@ func normalizeProviderCompatibilityForResponse(raw map[string]any) {
 }
 
 func augmentProviderModelSettings(raw map[string]any) {
-	raw["kiroModels"] = loadKiroModelsForSettings(raw)
+	kiroModels := loadKiroModelsForSettings(raw)
+	if len(kiroModels) == 0 {
+		raw["kiroModels"] = nil
+	} else {
+		raw["kiroModels"] = kiroModels
+	}
 	openaiCache := loadProviderModelCache("openai")
 	raw["openaiModels"] = aggregateSettingsModels(raw, "openaiProviders", "openai", openaiCache)
 	raw["openaiModelsGrouped"] = groupedSettingsModels(raw, "openaiProviders", "openai", openaiCache)
@@ -140,7 +156,7 @@ func augmentProviderModelSettings(raw map[string]any) {
 	raw["clineModelsGrouped"] = clineEnabledModelsGrouped(raw, loadProviderModelCache("cline"))
 	raw["customApiQuotas"] = loadObjectCache("custom-api-quotas.json")
 	raw["nkpQuotas"] = loadQuotaObjectCache("nkp-quotas.json", "quotaBalance", "quotaTotalGranted")
-	raw["nugQuotas"] = loadQuotaObjectCache("nug-quotas.json", "balance", "totalGranted")
+	delete(raw, "nugQuotas")
 	raw["codexAvailable"] = len(loadCodexCredentialEntries()) > 0
 	raw["codexModels"] = builtinCodexModels()
 	raw["builtinModelContextWindows"] = builtinCodexContextWindows()
@@ -2750,7 +2766,7 @@ func (h *Handler) addRetryRule(w http.ResponseWriter, r *http.Request) error {
 	if h.Store == nil {
 		return httpx.NotImplemented("settings.retryRules")
 	}
-	rule := map[string]any{"id": id.New(), "enabled": true}
+	rule := map[string]any{"id": id.Short(), "enabled": true}
 	for _, key := range []string{"domain", "statusCode", "keyword", "note"} {
 		if value, ok := body[key]; ok {
 			rule[key] = value

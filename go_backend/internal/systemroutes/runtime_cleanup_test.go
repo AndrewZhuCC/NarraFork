@@ -239,6 +239,25 @@ func TestRuntimeCleanupDefaultExecutesFrontendContract(t *testing.T) {
 	}
 }
 
+func TestRuntimeCleanupEncodesEmptyErrorsArray(t *testing.T) {
+	sqlDB := newRuntimeCleanupTestDB(t)
+	h := &Handler{DB: sqlDB, TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/cleanup", strings.NewReader(`{"target":"terminals","execute":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.cleanupRuntime(w, req); err != nil {
+		t.Fatalf("cleanupRuntime: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode cleanup: %v", err)
+	}
+	errorsList, ok := body["errors"].([]any)
+	if !ok || len(errorsList) != 0 {
+		t.Fatalf("runtime cleanup should encode empty errors as [], got %#v", body["errors"])
+	}
+}
+
 func TestRuntimeCleanupExecuteTerminalsContainersAndBrowsers(t *testing.T) {
 	sqlDB := newRuntimeCleanupTestDB(t)
 	mustExec(t, sqlDB, `INSERT INTO terminals (id, status, exit_code) VALUES ('running-term', 'running', NULL), ('exited-term', 'exited', 0), ('orphan-term', 'orphan', NULL);`)

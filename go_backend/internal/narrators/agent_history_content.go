@@ -1,8 +1,13 @@
 package narrators
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"narrafork-go/internal/agentbasic"
@@ -17,12 +22,19 @@ func agentMessagesFromStoredMessage(msg Message) []agentbasic.Message {
 		assistant := agentbasic.Message{Role: "assistant", Content: text, ContentBlocks: blocks, ToolCalls: toolCallsForAgent(msg, blocks)}
 		messages := []agentbasic.Message{assistant}
 		messages = append(messages, toolResultMessagesFromToolCalls(msg.ToolCalls)...)
+		if sideCarText := appendSideCarsForAgent("", sideCarsForUserMessage(msg.SideCars)); sideCarText != "" {
+			messages = append(messages, agentbasic.Message{Role: "user", Content: sideCarText})
+		}
 		return messages
 	case "user":
 		messages := toolResultMessagesFromBlocks(blocks)
-		userBlocks := nonToolResultBlocks(blocks)
-		if strings.TrimSpace(text) != "" || len(userBlocks) > 0 {
-			messages = append(messages, agentbasic.Message{Role: "user", Content: text, ContentBlocks: userBlocks})
+		userBlocks := agentUserBlocksForProvider(nonToolResultBlocks(blocks), text)
+		userSideCars := sideCarsForUserMessage(msg.SideCars)
+		if sideCarText := formatSideCarsForAgent(userSideCars); sideCarText != "" {
+			userBlocks = append(userBlocks, map[string]any{"type": "text", "text": sideCarText})
+		}
+		if strings.TrimSpace(text) != "" || len(userBlocks) > 0 || len(userSideCars) > 0 {
+			messages = append(messages, agentbasic.Message{Role: "user", Content: appendSideCarsForAgent(text, userSideCars), ContentBlocks: userBlocks})
 		}
 		return messages
 	case "sys":
@@ -35,18 +47,98 @@ func agentMessagesFromStoredMessage(msg Message) []agentbasic.Message {
 	}
 }
 
-func messageContentBlocks(content any) []map[string]any {
-	items, ok := content.([]any)
-	if !ok {
-		return nil
+func enrichAgentHistoryImageBlocks(msg Message, defaultNarratorID string) Message {
+	blocks := messageContentBlocks(msg.ContentJSON)
+	if len(blocks) == 0 {
+		return msg
 	}
-	blocks := make([]map[string]any, 0, len(items))
-	for _, item := range items {
-		if block, ok := item.(map[string]any); ok {
-			blocks = append(blocks, block)
+	changed := false
+	for _, block := range blocks {
+		if historyStringFromAny(block["type"]) != "image" {
+			continue
+		}
+		if historyStringFromAny(block["base64"]) != "" || historyStringFromAny(block["data"]) != "" {
+			continue
+		}
+		if enrichAgentHistoryImageBlock(block, defaultNarratorID) {
+			changed = true
 		}
 	}
-	return blocks
+	if changed {
+		msg.ContentJSON = blocks
+	}
+	return msg
+}
+
+func enrichAgentHistoryImageBlock(block map[string]any, defaultNarratorID string) bool {
+	imageID := historyStringFromAny(block["imageId"])
+	if imageID == "" {
+		return false
+	}
+	owner := historyFirstNonEmptyString(historyStringFromAny(block["uploadNarratorId"]), defaultNarratorID)
+	path, ok := agentHistoryImagePath(owner, imageID)
+	if !ok {
+		return false
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || info.Size() <= 0 || info.Size() > maxMessageImageBytes {
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	mediaType := historyStringFromAny(block["mediaType"])
+	if mediaType == "" {
+		mediaType = http.DetectContentType(data)
+	}
+	if !strings.HasPrefix(strings.ToLower(mediaType), "image/") {
+		return false
+	}
+	block["base64"] = base64.StdEncoding.EncodeToString(data)
+	block["mediaType"] = mediaType
+	if historyStringFromAny(block["format"]) == "" {
+		block["format"] = strings.TrimPrefix(strings.ToLower(mediaType), "image/")
+	}
+	if historyStringFromAny(block["uploadNarratorId"]) == "" && owner != "" {
+		block["uploadNarratorId"] = owner
+	}
+	return true
+}
+
+func agentHistoryImagePath(owner, imageID string) (string, bool) {
+	if !safePathSegment(owner) || !safePathSegment(imageID) {
+		return "", false
+	}
+	dir := filepath.Join(narratorUploadsRoot(), owner)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), imageID) {
+			continue
+		}
+		return filepath.Join(dir, entry.Name()), true
+	}
+	return "", false
+}
+
+func messageContentBlocks(content any) []map[string]any {
+	switch items := content.(type) {
+	case []map[string]any:
+		return items
+	case []any:
+		blocks := make([]map[string]any, 0, len(items))
+		for _, item := range items {
+			if block, ok := item.(map[string]any); ok {
+				blocks = append(blocks, block)
+			}
+		}
+		return blocks
+	default:
+		return nil
+	}
 }
 
 func messageTextForAgent(msg Message, blocks []map[string]any) string {
@@ -65,13 +157,20 @@ func messageTextForAgent(msg Message, blocks []map[string]any) string {
 			}
 		}
 	}
+	text := ""
 	if len(parts) > 0 {
-		return strings.Join(parts, "\n")
+		text = strings.Join(parts, "\n")
 	}
 	if msg.ContentText != nil {
-		return *msg.ContentText
+		contentText := *msg.ContentText
+		if msg.Role == "user" && hasTextFileBlock(blocks) && strings.Contains(contentText, "<attached_files>") {
+			return contentText
+		}
+		if text == "" {
+			return contentText
+		}
 	}
-	return ""
+	return text
 }
 
 func toolCallsForAgent(msg Message, blocks []map[string]any) []agentbasic.ToolCall {
@@ -99,6 +198,43 @@ func toolCallsForAgent(msg Message, blocks []map[string]any) []agentbasic.ToolCa
 	return calls
 }
 
+func agentUserBlocksForProvider(blocks []map[string]any, effectiveText string) []map[string]any {
+	if !strings.Contains(effectiveText, "<attached_files>") {
+		return blocks
+	}
+	out := make([]map[string]any, 0, len(blocks)+1)
+	replacedText := false
+	for _, block := range blocks {
+		if historyStringFromAny(block["type"]) != "text" {
+			out = append(out, block)
+			continue
+		}
+		if replacedText {
+			continue
+		}
+		updated := map[string]any{}
+		for key, value := range block {
+			updated[key] = value
+		}
+		updated["text"] = effectiveText
+		out = append(out, updated)
+		replacedText = true
+	}
+	if !replacedText {
+		out = append(out, map[string]any{"type": "text", "text": effectiveText})
+	}
+	return out
+}
+
+func hasTextFileBlock(blocks []map[string]any) bool {
+	for _, block := range blocks {
+		if historyStringFromAny(block["type"]) == "text_file" {
+			return true
+		}
+	}
+	return false
+}
+
 func nonToolResultBlocks(blocks []map[string]any) []map[string]any {
 	filtered := make([]map[string]any, 0, len(blocks))
 	for _, block := range blocks {
@@ -115,7 +251,8 @@ func toolResultMessagesFromToolCalls(records []ToolCallRecord) []agentbasic.Mess
 		if !completedToolStatus(record.Status) || strings.TrimSpace(record.ToolUseID) == "" {
 			continue
 		}
-		messages = append(messages, agentbasic.Message{Role: "tool", ToolCallID: record.ToolUseID, Content: outputTextForAgent(record.OutputJSON)})
+		content := appendSideCarsForAgent(outputTextForAgent(record.OutputJSON), sideCarsForToolResult(record.SideCars, record.ToolUseID))
+		messages = append(messages, agentbasic.Message{Role: "tool", ToolCallID: record.ToolUseID, Content: content})
 	}
 	return messages
 }
@@ -133,6 +270,73 @@ func toolResultMessagesFromBlocks(blocks []map[string]any) []agentbasic.Message 
 		messages = append(messages, agentbasic.Message{Role: "tool", ToolCallID: toolUseID, Content: outputTextForAgent(firstNonNil(block["content"], block["text"]))})
 	}
 	return messages
+}
+
+func sideCarsForToolResult(sideCars []SideCarRecord, toolUseID string) []SideCarRecord {
+	filtered := make([]SideCarRecord, 0, len(sideCars))
+	for _, sideCar := range sideCars {
+		if sideCar.Target != "tool_result" {
+			continue
+		}
+		if sideCar.ToolUseID != nil && strings.TrimSpace(*sideCar.ToolUseID) != "" && strings.TrimSpace(*sideCar.ToolUseID) != toolUseID {
+			continue
+		}
+		filtered = append(filtered, sideCar)
+	}
+	sortSideCars(filtered)
+	return filtered
+}
+
+func sideCarsForUserMessage(sideCars []SideCarRecord) []SideCarRecord {
+	filtered := make([]SideCarRecord, 0, len(sideCars))
+	for _, sideCar := range sideCars {
+		if sideCar.Target == "user_message" {
+			filtered = append(filtered, sideCar)
+		}
+	}
+	sortSideCars(filtered)
+	return filtered
+}
+
+func appendSideCarsForAgent(baseText string, sideCars []SideCarRecord) string {
+	sideCarText := formatSideCarsForAgent(sideCars)
+	if sideCarText == "" {
+		return baseText
+	}
+	if strings.TrimSpace(baseText) == "" {
+		return sideCarText
+	}
+	return baseText + "\n\n" + sideCarText
+}
+
+func formatSideCarsForAgent(sideCars []SideCarRecord) string {
+	formatted := []string{}
+	sortSideCars(sideCars)
+	for _, sideCar := range sideCars {
+		if strings.TrimSpace(sideCar.Content) == "" {
+			continue
+		}
+		source := sideCar.Source
+		if strings.TrimSpace(source) == "" {
+			source = "sidecar"
+		}
+		formatted = append(formatted, fmt.Sprintf("<side_car source=\"%s\">\n%s\n</side_car>", escapeSideCarAttr(source), sideCar.Content))
+	}
+	return strings.Join(formatted, "\n\n")
+}
+
+func sortSideCars(sideCars []SideCarRecord) {
+	sort.SliceStable(sideCars, func(i, j int) bool {
+		if sideCars[i].OrderIndex != sideCars[j].OrderIndex {
+			return sideCars[i].OrderIndex < sideCars[j].OrderIndex
+		}
+		return sideCars[i].CreatedAt < sideCars[j].CreatedAt
+	})
+}
+
+func escapeSideCarAttr(value string) string {
+	replacer := strings.NewReplacer("&", "&amp;", "\"", "&quot;", "<", "&lt;")
+	return replacer.Replace(value)
 }
 
 func completedToolStatus(status string) bool {

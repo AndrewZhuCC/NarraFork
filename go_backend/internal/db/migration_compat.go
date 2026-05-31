@@ -26,7 +26,17 @@ type migrationCompatibilityDetails struct {
 	ExpectedCount       int      `json:"expectedCount"`
 	ExpectedLastTag     string   `json:"expectedLastTag"`
 	ExpectedLastWhen    int64    `json:"expectedLastWhen"`
+	ExpectedJournalName string   `json:"expectedJournalName,omitempty"`
 	ExtraHashes         []string `json:"extraHashes,omitempty"`
+}
+
+type expectedDrizzleJournal struct {
+	Name    string
+	Entries []drizzleMigrationSnapshotEntry
+}
+
+var currentRepositoryDrizzleBaselineSnapshot = []drizzleMigrationSnapshotEntry{
+	{Tag: "0000_simple_kingpin", When: 1779518783820, Hash: "3def51bef24ef8498a922f48b687a178bc56886a4f90776bfbd195d152e88218"},
 }
 
 func (s *Store) EnsureMigrationCompatibility(ctx context.Context) error {
@@ -61,7 +71,7 @@ func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB,
 	if err != nil {
 		return err
 	}
-	missing := missingExpectedDrizzleMigrations(appliedHashes)
+	expectedJournal, missing := matchExpectedDrizzleJournal(appliedHashes)
 	if len(missing) > 0 {
 		return fmt.Errorf(
 			"%w: missing expected Drizzle migrations: %s. Start the TypeScript backend once to run migrations before using go_backend",
@@ -70,15 +80,16 @@ func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB,
 		)
 	}
 
-	extraHashes := extraAppliedDrizzleHashes(appliedHashes)
-	last := embeddedDrizzleMigrationSnapshot[len(embeddedDrizzleMigrationSnapshot)-1]
+	extraHashes := extraAppliedDrizzleHashes(appliedHashes, expectedJournal.Entries)
+	last := expectedJournal.Entries[len(expectedJournal.Entries)-1]
 	details := migrationCompatibilityDetails{
 		DrizzleJournalTable: "__drizzle_migrations",
 		GoJournalTable:      goMigrationJournalTable,
 		ObservedCount:       len(appliedHashes),
-		ExpectedCount:       len(embeddedDrizzleMigrationSnapshot),
+		ExpectedCount:       len(expectedJournal.Entries),
 		ExpectedLastTag:     last.Tag,
 		ExpectedLastWhen:    last.When,
+		ExpectedJournalName: expectedJournal.Name,
 		ExtraHashes:         extraHashes,
 	}
 	detailsJSON, err := json.Marshal(details)
@@ -86,7 +97,7 @@ func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB,
 		return fmt.Errorf("marshal Go migration compatibility journal details: %w", err)
 	}
 
-	return writeGoMigrationJournal(ctx, runtimeDB, last, string(detailsJSON))
+	return writeGoMigrationJournal(ctx, runtimeDB, expectedJournal, string(detailsJSON))
 }
 
 func readAppliedDrizzleMigrationHashes(ctx context.Context, sqlDB *sql.DB) (map[string]struct{}, error) {
@@ -127,9 +138,34 @@ func readAppliedDrizzleMigrationHashes(ctx context.Context, sqlDB *sql.DB) (map[
 	return hashes, nil
 }
 
-func missingExpectedDrizzleMigrations(appliedHashes map[string]struct{}) []string {
+func expectedDrizzleJournals() []expectedDrizzleJournal {
+	journals := []expectedDrizzleJournal{{Name: "bun-final-history", Entries: embeddedDrizzleMigrationSnapshot}}
+	if len(currentRepositoryDrizzleBaselineSnapshot) > 0 {
+		journals = append(journals, expectedDrizzleJournal{Name: "current-repository-baseline", Entries: currentRepositoryDrizzleBaselineSnapshot})
+	}
+	return journals
+}
+
+func matchExpectedDrizzleJournal(appliedHashes map[string]struct{}) (expectedDrizzleJournal, []string) {
+	journals := expectedDrizzleJournals()
+	best := journals[0]
+	bestMissing := missingExpectedDrizzleMigrations(appliedHashes, best.Entries)
+	for _, journal := range journals {
+		missing := missingExpectedDrizzleMigrations(appliedHashes, journal.Entries)
+		if len(missing) == 0 {
+			return journal, nil
+		}
+		if len(missing) < len(bestMissing) {
+			best = journal
+			bestMissing = missing
+		}
+	}
+	return best, bestMissing
+}
+
+func missingExpectedDrizzleMigrations(appliedHashes map[string]struct{}, expectedEntries []drizzleMigrationSnapshotEntry) []string {
 	missing := []string{}
-	for _, expected := range embeddedDrizzleMigrationSnapshot {
+	for _, expected := range expectedEntries {
 		if _, ok := appliedHashes[expected.Hash]; !ok {
 			missing = append(missing, expected.Tag+"("+expected.Hash+")")
 		}
@@ -137,9 +173,9 @@ func missingExpectedDrizzleMigrations(appliedHashes map[string]struct{}) []strin
 	return missing
 }
 
-func extraAppliedDrizzleHashes(appliedHashes map[string]struct{}) []string {
+func extraAppliedDrizzleHashes(appliedHashes map[string]struct{}, expectedEntries []drizzleMigrationSnapshotEntry) []string {
 	expected := map[string]struct{}{}
-	for _, entry := range embeddedDrizzleMigrationSnapshot {
+	for _, entry := range expectedEntries {
 		expected[entry.Hash] = struct{}{}
 	}
 	extra := []string{}
@@ -174,7 +210,7 @@ func createGoMigrationJournal(ctx context.Context, tx *sql.Tx) error {
 func writeGoMigrationJournal(
 	ctx context.Context,
 	sqlDB *sql.DB,
-	last drizzleMigrationSnapshotEntry,
+	expectedJournal expectedDrizzleJournal,
 	detailsJSON string,
 ) error {
 	tx, err := sqlDB.BeginTx(ctx, nil)
@@ -186,6 +222,7 @@ func writeGoMigrationJournal(
 	if err := createGoMigrationJournal(ctx, tx); err != nil {
 		return err
 	}
+	last := expectedJournal.Entries[len(expectedJournal.Entries)-1]
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO __narrafork_go_migration_journal (
 			id,
@@ -211,10 +248,10 @@ func writeGoMigrationJournal(
 			verified_at = excluded.verified_at
 	`,
 		goMigrationJournalContractVersion,
-		len(embeddedDrizzleMigrationSnapshot),
+		len(expectedJournal.Entries),
 		last.Tag,
 		last.When,
-		expectedDrizzleJournalHash(),
+		drizzleJournalHash(expectedJournal.Entries),
 		canonicalSchemaContractHash(),
 		"compatible",
 		detailsJSON,
@@ -226,7 +263,11 @@ func writeGoMigrationJournal(
 }
 
 func expectedDrizzleJournalHash() string {
-	encoded, err := json.Marshal(embeddedDrizzleMigrationSnapshot)
+	return drizzleJournalHash(embeddedDrizzleMigrationSnapshot)
+}
+
+func drizzleJournalHash(entries []drizzleMigrationSnapshotEntry) string {
+	encoded, err := json.Marshal(entries)
 	if err != nil {
 		panic(err)
 	}

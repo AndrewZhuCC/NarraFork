@@ -42,12 +42,10 @@ func (d *searchDiagnostics) addFallback(fallback *searchFallback) {
 	if fallback == nil {
 		return
 	}
-	if fallback.Reason != "query_too_short_for_trigram" {
-		ready := false
-		d.Degraded = true
-		d.FTSReady = &ready
-	}
-	if d.Mode == "fts5-with-like-fallback" && fallback.Reason != "query_too_short_for_trigram" {
+	ready := false
+	d.Degraded = true
+	d.FTSReady = &ready
+	if d.Mode == "fts5-with-like-fallback" {
 		d.Mode = "degraded-like-fallback"
 	}
 	d.Fallbacks = append(d.Fallbacks, *fallback)
@@ -82,12 +80,7 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	diagnostics := searchDiagnostics{Fallbacks: []searchFallback{}, Mode: "empty", RequestedEntities: []string{}}
 	if q == "" {
-		writeSearchJSON(w, map[string]any{
-			"results":   []any{},
-			"projects":  []any{},
-			"chapters":  []any{},
-			"narrators": []any{},
-		}, diagnostics)
+		writeSearchJSON(w, emptySearchPayload(), diagnostics)
 		return nil
 	}
 	limit := 50
@@ -101,14 +94,13 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 	}
 	entitySet := parseEntities(r.URL.Query().Get("entities"))
 	diagnostics.RequestedEntities = requestedEntityList(entitySet)
+	if len(entitySet) == 0 {
+		writeSearchJSON(w, emptySearchPayload(), diagnostics)
+		return nil
+	}
 	safeQuery := sanitizeQuery(q)
 	if safeQuery == "" {
-		writeSearchJSON(w, map[string]any{
-			"results":   []any{},
-			"projects":  []any{},
-			"chapters":  []any{},
-			"narrators": []any{},
-		}, diagnostics)
+		writeSearchJSON(w, emptySearchPayload(), diagnostics)
 		return nil
 	}
 	like := "%" + escapeLike(safeQuery) + "%"
@@ -186,12 +178,10 @@ func (h *Handler) searchChapters(ctx context.Context, safeQuery, like, ftsQuery 
 		return items, fallback
 	}
 	items, err := h.searchChaptersLike(ctx, safeQuery, like, limit)
-	fallback := &searchFallback{Entity: "chapters", From: "fts5", To: "like", Reason: "query_too_short_for_trigram"}
 	if err != nil {
-		fallback.FallbackError = err.Error()
-		return []map[string]any{}, fallback
+		return []map[string]any{}, &searchFallback{Entity: "chapters", From: "like", To: "like", Reason: "like_query_failed", Error: err.Error()}
 	}
-	return items, fallback
+	return items, nil
 }
 
 func (h *Handler) searchChaptersFTS(ctx context.Context, safeQuery, ftsQuery string, limit int) ([]map[string]any, error) {
@@ -215,7 +205,7 @@ func (h *Handler) searchChaptersFTS(ctx context.Context, safeQuery, ftsQuery str
 }
 
 func (h *Handler) searchChaptersLike(ctx context.Context, safeQuery, like string, limit int) ([]map[string]any, error) {
-	rows, err := h.queryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.title LIKE ? ESCAPE '\' OR COALESCE(c.description, '') LIKE ? ESCAPE '\' LIMIT ?`, like, like, limit)
+	rows, err := h.queryContext(ctx, `SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at, p.name, substr(COALESCE(c.description, c.title, ''), 1, 240) FROM chapters c JOIN projects p ON p.id = c.project_id WHERE c.title LIKE ? ESCAPE '\' OR COALESCE(c.description, '') LIKE ? ESCAPE '\' LIMIT ?`, like, like, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -224,11 +214,11 @@ func (h *Handler) searchChaptersLike(ctx context.Context, safeQuery, like string
 	needle := strings.ToLower(safeQuery)
 	for rows.Next() {
 		var id, title, status, role, createdAt, updatedAt, projectName string
-		var description sql.NullString
-		if err := rows.Scan(&id, &title, &description, &status, &role, &createdAt, &updatedAt, &projectName); err != nil {
+		var description, snippet sql.NullString
+		if err := rows.Scan(&id, &title, &description, &status, &role, &createdAt, &updatedAt, &projectName, &snippet); err != nil {
 			return nil, err
 		}
-		items = append(items, chapterResult(id, title, description, status, role, createdAt, updatedAt, projectName, needle, "", 520))
+		items = append(items, chapterResult(id, title, description, status, role, createdAt, updatedAt, projectName, needle, sqlString(snippet), 520))
 	}
 	return items, rows.Err()
 }
@@ -269,12 +259,10 @@ func (h *Handler) searchMessages(ctx context.Context, like, ftsQuery string, use
 		return items, fallback
 	}
 	items, err := h.searchMessagesLike(ctx, like, limit)
-	fallback := &searchFallback{Entity: "messages", From: "fts5", To: "like", Reason: "query_too_short_for_trigram"}
 	if err != nil {
-		fallback.FallbackError = err.Error()
-		return []map[string]any{}, fallback
+		return []map[string]any{}, &searchFallback{Entity: "messages", From: "like", To: "like", Reason: "like_query_failed", Error: err.Error()}
 	}
-	return items, fallback
+	return items, nil
 }
 
 func (h *Handler) searchMessagesFTS(ctx context.Context, ftsQuery string, limit int) ([]map[string]any, error) {
@@ -343,12 +331,10 @@ func (h *Handler) searchNarrators(ctx context.Context, like, ftsQuery string, us
 		return items, fallback
 	}
 	items, err := h.searchNarratorsLike(ctx, like, limit)
-	fallback := &searchFallback{Entity: "narrators", From: "fts5", To: "like", Reason: "query_too_short_for_trigram"}
 	if err != nil {
-		fallback.FallbackError = err.Error()
-		return []map[string]any{}, fallback
+		return []map[string]any{}, &searchFallback{Entity: "narrators", From: "like", To: "like", Reason: "like_query_failed", Error: err.Error()}
 	}
-	return items, fallback
+	return items, nil
 }
 
 func (h *Handler) searchNarratorsFTS(ctx context.Context, ftsQuery string, limit int) ([]map[string]any, error) {
@@ -440,6 +426,15 @@ func parseEntities(raw string) map[string]bool {
 		}
 	}
 	return out
+}
+
+func emptySearchPayload() map[string]any {
+	return map[string]any{
+		"results":   []any{},
+		"projects":  []any{},
+		"chapters":  []any{},
+		"narrators": []any{},
+	}
 }
 
 func writeSearchJSON(w http.ResponseWriter, payload map[string]any, diagnostics searchDiagnostics) {

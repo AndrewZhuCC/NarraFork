@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -1162,6 +1163,7 @@ func (h *Handler) updateCheck(w http.ResponseWriter, r *http.Request) error {
 	payload := map[string]any{
 		"updateAvailable":     false,
 		"currentVersion":      current,
+		"latestVersion":       current,
 		"releaseInfo":         nil,
 		"source":              "go_backend",
 		"selfUpdateAvailable": canAuto,
@@ -1285,6 +1287,9 @@ func trustedUpdateReleaseFromV2(source trustedUpdateSource, current string, data
 	if !boolMap(data, "updateAvailable") || version == "" {
 		return release
 	}
+	if !updateCurrentVersionAllowsDownload(current) {
+		return release
+	}
 	file, _ := data["file"].(map[string]any)
 	filename := strings.TrimSpace(stringMap(file, "filename", ""))
 	if filename == "" {
@@ -1399,6 +1404,32 @@ func trustedUpdateAbsoluteURL(serverURL, value string) string {
 	return base.ResolveReference(ref).String()
 }
 
+func updateCurrentVersionAllowsDownload(current string) bool {
+	current = strings.TrimSpace(strings.TrimPrefix(current, "v"))
+	if current == "" || strings.EqualFold(current, "go-backend-dev") || strings.EqualFold(current, "dev") {
+		return false
+	}
+	base := current
+	if idx := strings.IndexAny(base, "-+"); idx >= 0 {
+		base = base[:idx]
+	}
+	parts := strings.Split(base, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func updatePlatform() string {
 	arch := "x64"
 	if runtime.GOARCH == "arm64" {
@@ -1508,28 +1539,23 @@ func (h *Handler) updateDownload(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	requestedVersion := updateDownloadRequestedVersion(body)
-	send := newUpdateSSESender(w)
-
-	send("progress", updateProgressPayload("checking", 0, 0, ""))
 	checkCtx, checkCancel := context.WithTimeout(r.Context(), 10*time.Second)
 	release, err := h.trustedLatestUpdate(checkCtx)
 	checkCancel()
 	if err != nil {
-		send("error", updateDownloadErrorPayload(requestedVersion, "Failed to fetch trusted update metadata: "+err.Error()))
+		httpx.WriteJSON(w, http.StatusNotFound, map[string]any{"error": "No update available"})
 		return nil
 	}
 	version := release.LatestVersion
 	if !release.Available || version == "" || len(release.Files) == 0 {
-		send("error", updateDownloadErrorPayload(version, "No update available from the configured update source."))
+		httpx.WriteJSON(w, http.StatusNotFound, map[string]any{"error": "No update available"})
 		return nil
 	}
 	if requestedVersion != "" && requestedVersion != version {
-		payload := updateDownloadErrorPayload(requestedVersion, "Requested update version no longer matches the latest server metadata")
-		payload["requestedVersion"] = requestedVersion
-		payload["latestVersion"] = version
-		send("error", payload)
+		httpx.WriteJSON(w, http.StatusConflict, map[string]any{"error": "Requested update version no longer matches the latest server metadata", "requestedVersion": requestedVersion, "latestVersion": version})
 		return nil
 	}
+	send := newUpdateSSESender(w)
 	files := release.Files
 	expectedBytes := release.ExpectedBytes
 	for _, file := range files {
@@ -1988,6 +2014,7 @@ func updateVersionDir(version string) (string, error) {
 }
 
 func (h *Handler) RegisterProviders(r chi.Router) {
+	_ = h.ensureDefaultClineProvider("")
 	r.Route("/kiro", func(kr chi.Router) {
 		kr.Use(h.adminMiddleware)
 		kr.Get("/status", httpx.Handler(h.kiroStatus))
@@ -2010,32 +2037,32 @@ func (h *Handler) RegisterProviders(r chi.Router) {
 	})
 
 	r.Get("/openai/models", httpx.Handler(h.providerCachedModels("openai", false)))
-	r.Post("/openai/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("openai", true))))
+	r.Post("/openai/models/refresh", httpx.Handler(h.providerCachedModels("openai", true)))
 	r.Get("/openai/providers/{id}/models", httpx.Handler(h.providerCachedModels("openai", false)))
-	r.Post("/openai/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("openai", true))))
+	r.Post("/openai/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("openai", true)))
 	r.Get("/anthropic/models", httpx.Handler(h.providerCachedModels("anthropic", false)))
-	r.Post("/anthropic/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("anthropic", true))))
+	r.Post("/anthropic/models/refresh", httpx.Handler(h.providerCachedModels("anthropic", true)))
 	r.Get("/anthropic/providers/{id}/models", httpx.Handler(h.providerCachedModels("anthropic", false)))
-	r.Post("/anthropic/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("anthropic", true))))
+	r.Post("/anthropic/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("anthropic", true)))
 	r.Get("/nkp/models", httpx.Handler(h.providerCachedModels("nkp", false)))
-	r.Post("/nkp/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("nkp", true))))
+	r.Post("/nkp/models/refresh", httpx.Handler(h.providerCachedModels("nkp", true)))
 	r.Get("/nkp/providers/{id}/models", httpx.Handler(h.providerCachedModels("nkp", false)))
-	r.Post("/nkp/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.providerCachedModels("nkp", true))))
+	r.Post("/nkp/providers/{id}/models/refresh", httpx.Handler(h.providerCachedModels("nkp", true)))
 	r.Get("/nkp/providers/{id}/quota", httpx.Handler(h.nkpQuota))
 	r.Get("/nkp/quotas", httpx.Handler(h.nkpQuotas))
 
 	r.Get("/nug/models", httpx.Handler(h.nugAllModels))
-	r.Post("/nug/models/refresh", httpx.Handler(h.adminOnly(h.nugAllModels)))
+	r.Post("/nug/models/refresh", httpx.Handler(h.nugAllModels))
 	r.Get("/nug/providers/{id}/models", httpx.Handler(h.nugModels))
-	r.Post("/nug/providers/{id}/models/refresh", httpx.Handler(h.adminOnly(h.nugModels)))
-	r.Post("/nug/providers/{id}/login", httpx.Handler(h.adminOnly(h.nugLogin)))
-	r.Post("/nug/providers/{id}/api-key", httpx.Handler(h.adminOnly(h.nugAPIKey)))
+	r.Post("/nug/providers/{id}/models/refresh", httpx.Handler(h.nugModels))
+	r.Post("/nug/providers/{id}/login", httpx.Handler(h.nugLogin))
+	r.Post("/nug/providers/{id}/api-key", httpx.Handler(h.nugAPIKey))
 	r.Get("/nug/providers/{id}/quota", httpx.Handler(h.nugQuota))
 	r.Get("/nug/quotas", httpx.Handler(h.nugQuotas))
 	r.Get("/nug/providers/{id}/channels/health", httpx.Handler(h.nugChannelsHealth))
 	r.Get("/nug/providers/{id}/usage", httpx.Handler(h.nugUsage))
 	r.Get("/nug/providers/{id}/usage/summary", httpx.Handler(h.nugUsageSummary))
-	r.Get("/nug/providers/{id}/oauth/start", httpx.Handler(h.adminOnly(h.nugOAuthStart)))
+	r.Get("/nug/providers/{id}/oauth/start", httpx.Handler(h.nugOAuthStart))
 
 	r.Get("/codex/quota-overview", httpx.Handler(h.codexQuotaOverview))
 	r.Route("/codex", func(cr chi.Router) {
@@ -2130,6 +2157,11 @@ func (h *Handler) kiroStatus(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) kiroModels(w http.ResponseWriter, r *http.Request) error {
+	if r.Method == http.MethodPost {
+		reason := "Kiro model refresh requires the TypeScript Kiro plugin bridge; go_backend can only read cached per-credential model metadata."
+		httpx.WriteFeatureDisabled(w, "providers.kiro.modelsRefresh", reason)
+		return nil
+	}
 	entries, err := h.loadKiroCredentials()
 	if err != nil {
 		return err
@@ -2163,7 +2195,7 @@ func (h *Handler) kiroModels(w http.ResponseWriter, r *http.Request) error {
 
 func (h *Handler) kiroMcpTools(w http.ResponseWriter, r *http.Request) error {
 	if result, err := h.callKiroMCP(r.Context(), "tools/list", map[string]any{}); err == nil {
-		httpx.WriteJSON(w, http.StatusOK, result)
+		httpx.WriteJSON(w, http.StatusOK, normalizeKiroMCPToolsResponse(result))
 		return nil
 	}
 	reason := "Kiro MCP tools bridge is unavailable in go_backend; returning the built-in fallback tool list."
@@ -2227,7 +2259,7 @@ func (h *Handler) callKiroMCP(ctx context.Context, method string, params map[str
 			return nil, errorsNew("No enabled Kiro credential with access token")
 		}
 
-		result, status, bodyText, err := h.callKiroMCPWithCredential(ctx, entry, method, params)
+		result, status, bodyText, err := h.callKiroMCPWithCredential(ctx, entry, method, params, attempt, maxRetries)
 		if err != nil {
 			lastErr = err
 			continue
@@ -2262,11 +2294,39 @@ func (h *Handler) callKiroMCP(ctx context.Context, method string, params map[str
 	return nil, errorsNew("No enabled Kiro credential with access token")
 }
 
-func (h *Handler) callKiroMCPWithCredential(ctx context.Context, entry map[string]any, method string, params map[string]any) (map[string]any, string, string, error) {
+func normalizeKiroMCPToolsResponse(result map[string]any) map[string]any {
+	if result == nil {
+		return result
+	}
+	if _, exists := result["tools"]; exists {
+		return result
+	}
+	resultPayload, _ := result["result"].(map[string]any)
+	if tools, ok := resultPayload["tools"].([]any); ok {
+		result["tools"] = tools
+	}
+	return result
+}
+
+func splitKiroSystemVersion(systemVersion string) (string, string) {
+	parts := strings.SplitN(systemVersion, "#", 2)
+	osName := strings.TrimSpace(parts[0])
+	if osName == "" {
+		osName = runtime.GOOS
+	}
+	osVersion := "unknown"
+	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+		osVersion = strings.TrimSpace(parts[1])
+	}
+	return osName, osVersion
+}
+
+func (h *Handler) callKiroMCPWithCredential(ctx context.Context, entry map[string]any, method string, params map[string]any, attempt int, maxRetries int) (map[string]any, string, string, error) {
 	config := h.loadKiroConfig()
-	region := firstNonEmpty(stringMap(entry, "apiRegion", ""), stringMap(entry, "region", ""))
-	region = firstNonEmpty(region, stringMap(config, "region", "us-east-1"))
+	region := firstNonEmpty(stringMap(config, "apiRegion", ""), stringMap(config, "region", "us-east-1"), "us-east-1")
 	kiroVersion := firstNonEmpty(stringMap(config, "kiroVersion", ""), "1.26.1")
+	systemVersion := firstNonEmpty(stringMap(config, "systemVersion", ""), runtime.GOOS+"#unknown")
+	osName, osVersion := splitKiroSystemVersion(systemVersion)
 	token := strings.TrimSpace(stringMap(entry, "accessToken", ""))
 	if token == "" {
 		return nil, "", "", errorsNew("No Kiro access token available")
@@ -2286,9 +2346,11 @@ func (h *Handler) callKiroMCPWithCredential(ctx context.Context, entry map[strin
 	req.Header.Set("x-amzn-codewhisperer-optout", "true")
 	req.Header.Set("User-Agent", "AmazonQ-For-CLI/Version/"+kiroVersion)
 	req.Header.Set("Host", "q."+region+".amazonaws.com")
+	req.Header.Set("amz-sdk-invocation-id", id.Must(32))
+	req.Header.Set("amz-sdk-request", fmt.Sprintf("attempt=%d; max=%d", attempt+1, maxRetries))
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("x-amzn-codewhisperer-os", runtime.GOOS)
-	req.Header.Set("x-amzn-codewhisperer-os-version", runtime.GOOS)
+	req.Header.Set("x-amzn-codewhisperer-os", osName)
+	req.Header.Set("x-amzn-codewhisperer-os-version", osVersion)
 	req.Header.Set("x-amzn-codewhisperer-ide", "kiro")
 	req.Header.Set("x-amzn-codewhisperer-ide-version", kiroVersion)
 	resp, err := kiroMCPHTTPClient.Do(req)
@@ -2729,11 +2791,6 @@ func nugQuotaCachePath() (string, error) {
 
 func (h *Handler) providerCachedModels(kind string, refresh bool) func(http.ResponseWriter, *http.Request) error {
 	return func(w http.ResponseWriter, r *http.Request) error {
-		if kind == "cline" {
-			if err := h.ensureDefaultClineProvider(""); err != nil {
-				return err
-			}
-		}
 		providerID := chi.URLParam(r, "id")
 		cache, _ := loadProviderModelCache(kind)
 		if refresh {
@@ -2748,11 +2805,7 @@ func (h *Handler) providerCachedModels(kind string, refresh bool) func(http.Resp
 				}
 				cache[providerID] = models
 				_ = saveProviderModelCache(kind, cache)
-				response := map[string]any{"models": models, "fromCache": false}
-				for key, value := range extra {
-					response[key] = value
-				}
-				httpx.WriteJSON(w, http.StatusOK, response)
+				httpx.WriteJSON(w, http.StatusOK, providerModelRefreshResponse(kind, models, extra))
 				return nil
 			}
 
@@ -2783,12 +2836,27 @@ func (h *Handler) providerCachedModels(kind string, refresh bool) func(http.Resp
 		}
 
 		if providerID != "" {
-			httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": cache[providerID], "fromCache": true})
+			models := cache[providerID]
+			if models == nil {
+				models = []map[string]any{}
+			}
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": true})
 			return nil
 		}
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": aggregateProviderModels(kind, h.providerConfigs(kind), cache), "fromCache": true})
 		return nil
 	}
+}
+
+func providerModelRefreshResponse(kind string, models []map[string]any, extra map[string]any) map[string]any {
+	if kind == "cline" {
+		return map[string]any{"count": len(models), "fromCache": false}
+	}
+	response := map[string]any{"models": models, "fromCache": false}
+	for key, value := range extra {
+		response[key] = value
+	}
+	return response
 }
 
 func (h *Handler) providerConfigs(kind string) []map[string]any {
@@ -2813,7 +2881,7 @@ func (h *Handler) providerConfig(kind, providerID string) (map[string]any, error
 			return provider, nil
 		}
 	}
-	return nil, httpx.NotFound("Provider")
+	return nil, httpx.Error(http.StatusNotFound, "NOT_FOUND", "Provider \""+providerID+"\" not found")
 }
 
 func (h *Handler) fetchProviderModels(ctx context.Context, kind string, provider map[string]any) ([]map[string]any, map[string]any, error) {
@@ -2902,7 +2970,7 @@ func fetchAnthropicModels(ctx context.Context, provider map[string]any) ([]map[s
 }
 
 func fetchClineModels(ctx context.Context) ([]map[string]any, error) {
-	data, err := getJSON(ctx, "https://openrouter.ai/api/v1/models", clineOpenRouterHeaders())
+	data, err := getJSON(ctx, clineOpenRouterModelsURL(), clineOpenRouterHeaders())
 	if err != nil {
 		return nil, err
 	}
@@ -2930,7 +2998,31 @@ func fetchClineModels(ctx context.Context) ([]map[string]any, error) {
 		}
 		models = append(models, item)
 	}
-	return uniqueModelMaps(models, "id"), nil
+	sort.Slice(models, func(i, j int) bool {
+		return stringMap(models[i], "id", "") < stringMap(models[j], "id", "")
+	})
+	return models, nil
+}
+
+func clineOpenRouterModelsURL() string {
+	if value := strings.TrimSpace(os.Getenv("NARRAFORK_CLINE_OPENROUTER_MODELS_URL")); value != "" {
+		return value
+	}
+	return "https://openrouter.ai/api/v1/models"
+}
+
+func clineRecommendedModelsURL() string {
+	if value := strings.TrimSpace(os.Getenv("NARRAFORK_CLINE_RECOMMENDED_MODELS_URL")); value != "" {
+		return value
+	}
+	return "https://api.cline.bot/api/v1/ai/cline/recommended-models"
+}
+
+func clineAPIBaseURL() string {
+	if value := strings.TrimSpace(os.Getenv("NARRAFORK_CLINE_API_BASE_URL")); value != "" {
+		return strings.TrimRight(value, "/")
+	}
+	return strings.TrimRight(clineDefaultBaseURL, "/")
 }
 
 func clineOpenRouterHeaders() map[string]string {
@@ -3199,46 +3291,67 @@ func (h *Handler) nugAllModels(w http.ResponseWriter, r *http.Request) error {
 	if h.Settings == nil {
 		return httpx.BadRequest("Settings unavailable")
 	}
-	providers, _ := h.Settings.Raw()["nugProviders"].([]any)
+	providers := h.providerConfigs("nug")
 	cache, _ := loadProviderModelCache("nug")
-	seen := map[string]bool{}
-	models := []any{}
-	for _, item := range providers {
-		provider, ok := item.(map[string]any)
-		if !ok {
+	if r.Method == http.MethodGet {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": aggregateProviderModels("nug", providers, cache), "fromCache": true})
+		return nil
+	}
+
+	results := []map[string]any{}
+	for _, provider := range providers {
+		providerID := stringMap(provider, "id", "")
+		providerName := stringMap(provider, "name", "")
+		result := map[string]any{"providerId": providerID, "name": providerName, "count": 0}
+		if strings.TrimSpace(stringMap(provider, "apiKey", "")) == "" {
+			result["error"] = fmt.Sprintf("NUG API key not configured for provider %q", providerName)
+			results = append(results, result)
 			continue
 		}
-		providerID := stringMap(provider, "id", "")
 		data, err := h.fetchNugJSON(r.Context(), providerID, "/v1/models", url.Values{})
 		if err != nil {
+			result["error"] = err.Error()
+			results = append(results, result)
 			continue
 		}
-		providerModels := normalizeNugModels(data)
-		cache[providerID] = mapsFromAnyModels(providerModels)
-		for _, model := range providerModels {
-			m, _ := model.(map[string]any)
-			modelID := stringMap(m, "id", "")
-			if modelID == "" || seen[modelID] {
-				continue
-			}
-			seen[modelID] = true
-			models = append(models, model)
-		}
+		models := normalizeNugModelMaps(data)
+		cache[providerID] = models
+		result["count"] = len(models)
+		results = append(results, result)
 	}
 	_ = saveProviderModelCache("nug", cache)
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": false})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results, "models": aggregateProviderModels("nug", providers, cache), "fromCache": false})
 	return nil
 }
 
 func (h *Handler) nugModels(w http.ResponseWriter, r *http.Request) error {
 	providerID := chi.URLParam(r, "id")
+	cache, _ := loadProviderModelCache("nug")
+	if r.Method == http.MethodGet {
+		models := uniqueModelMaps(cache[providerID], "id")
+		if models == nil {
+			models = []map[string]any{}
+		}
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": true})
+		return nil
+	}
+
+	provider, _, err := h.nugProvider(providerID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(stringMap(provider, "apiKey", "")) == "" {
+		httpx.WriteJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": fmt.Sprintf("NUG API key not configured for provider %q", stringMap(provider, "name", "")),
+		})
+		return nil
+	}
 	data, err := h.fetchNugJSON(r.Context(), providerID, "/v1/models", url.Values{})
 	if err != nil {
 		return err
 	}
-	models := normalizeNugModels(data)
-	cache, _ := loadProviderModelCache("nug")
-	cache[providerID] = mapsFromAnyModels(models)
+	models := normalizeNugModelMaps(data)
+	cache[providerID] = models
 	_ = saveProviderModelCache("nug", cache)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": false})
 	return nil
@@ -3398,48 +3511,80 @@ func nugFirstNumber(data map[string]any, fallback float64, keys ...string) float
 }
 
 func normalizeNugModels(data map[string]any) []any {
-	if models, ok := data["models"].([]any); ok {
-		out := make([]any, 0, len(models))
-		for _, item := range models {
-			switch m := item.(type) {
-			case map[string]any:
-				if stringMap(m, "id", "") == "" {
-					continue
-				}
-				out = append(out, m)
-			case string:
-				out = append(out, map[string]any{"id": m, "name": m})
-			}
-		}
-		return out
+	models := normalizeNugModelMaps(data)
+	out := make([]any, 0, len(models))
+	for _, model := range models {
+		out = append(out, model)
 	}
-	return []any{}
+	return out
+}
+
+func normalizeNugModelMaps(data map[string]any) []map[string]any {
+	rawModels, _ := data["models"].([]any)
+	if rawModels == nil {
+		rawModels, _ = data["data"].([]any)
+	}
+	out := make([]map[string]any, 0, len(rawModels))
+	seen := map[string]bool{}
+	for _, item := range rawModels {
+		var model map[string]any
+		switch m := item.(type) {
+		case map[string]any:
+			model = m
+		case string:
+			model = map[string]any{"id": m, "name": m}
+		default:
+			continue
+		}
+		modelID := strings.TrimSpace(stringMap(model, "id", ""))
+		if modelID == "" || seen[modelID] {
+			continue
+		}
+		seen[modelID] = true
+		model["id"] = modelID
+		out = append(out, model)
+	}
+	sort.Slice(out, func(i, j int) bool { return stringMap(out[i], "id", "") < stringMap(out[j], "id", "") })
+	return out
 }
 
 func normalizeNugUsageResponse(data map[string]any) map[string]any {
 	rawEvents, _ := data["events"].([]any)
+	if rawEvents == nil {
+		rawEvents, _ = data["data"].([]any)
+	}
 	events := make([]any, 0, len(rawEvents))
-	for _, item := range rawEvents {
+	for index, item := range rawEvents {
 		record, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
+		id := nugString(record, "id")
+		if id == "" {
+			id = "usage-" + strconv.Itoa(index)
+		}
 		events = append(events, map[string]any{
-			"id":                       nugString(record, "id"),
-			"channelType":              nugString(record, "channelType", "channel_type"),
-			"model":                    nugString(record, "model"),
-			"inputTokens":              nugNumber(record, "inputTokens", "input_tokens"),
-			"outputTokens":             nugNumber(record, "outputTokens", "output_tokens"),
-			"cacheCreationInputTokens": nugNumber(record, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteTokens", "cache_write_tokens"),
-			"cacheReadInputTokens":     nugNumber(record, "cacheReadInputTokens", "cache_read_input_tokens", "cacheReadTokens", "cache_read_tokens"),
+			"id":                       id,
+			"channelType":              firstNonEmpty(nugString(record, "channelType", "channel_type", "channel"), "unknown"),
+			"model":                    nugString(record, "model", "model_id", "modelId"),
+			"inputTokens":              nugNumber(record, "inputTokens", "input_tokens", "tokensIn", "tokens_in"),
+			"outputTokens":             nugNumber(record, "outputTokens", "output_tokens", "completionTokens"),
+			"cacheCreationInputTokens": nugNumber(record, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheCreationTokens", "cache_creation_tokens", "cacheWriteInputTokens", "cache_write_input_tokens", "cacheWriteTokens", "cache_write_tokens"),
+			"cacheReadInputTokens":     nugNumber(record, "cacheReadInputTokens", "cache_read_input_tokens", "cachedInputTokens", "cached_input_tokens", "cacheReadTokens", "cache_read_tokens"),
 			"quotaCost":                nugNumber(record, "quotaCost", "quota_cost"),
 			"meterUsage":               nugNumber(record, "meterUsage", "meter_usage"),
 			"status":                   firstNonEmpty(nugString(record, "status"), "unknown"),
 			"durationMs":               nugNumber(record, "durationMs", "duration_ms"),
-			"createdAt":                nugString(record, "createdAt", "created_at"),
+			"createdAt":                nugString(record, "createdAt", "created_at", "timestamp"),
 		})
 	}
-	return map[string]any{"events": events, "total": nugNumber(data, "total")}
+	total := float64(len(events))
+	if _, ok := data["total"]; ok {
+		total = nugNumber(data, "total")
+	} else if _, ok := data["count"]; ok {
+		total = nugNumber(data, "count")
+	}
+	return map[string]any{"events": events, "total": total}
 }
 
 func nugString(record map[string]any, keys ...string) string {
@@ -3474,7 +3619,7 @@ func numericQuery(r *http.Request, key string, fallback float64) float64 {
 
 func (h *Handler) nugLogin(w http.ResponseWriter, r *http.Request) error {
 	providerID := chi.URLParam(r, "id")
-	provider, baseURL, err := h.nugProvider(providerID)
+	_, baseURL, err := h.nugProvider(providerID)
 	if err != nil {
 		return err
 	}
@@ -3518,27 +3663,6 @@ func (h *Handler) nugLogin(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	apiKey := firstNonEmpty(stringMap(apiKeyData, "apiKey", ""), stringMap(apiKeyData, "api_key", ""))
-	userData, _ := loginData["user"].(map[string]any)
-	loginUsername := firstNonEmpty(
-		stringMap(userData, "username", ""),
-		stringMap(userData, "name", ""),
-		username,
-	)
-	userID := firstNonEmpty(
-		stringMap(userData, "id", ""),
-		stringMap(userData, "userId", ""),
-		stringMap(userData, "user_id", ""),
-	)
-	if apiKey != "" {
-		if err := h.updateNugProviderCredentials(providerID, map[string]any{
-			"apiKey":      apiKey,
-			"nugUsername": loginUsername,
-			"nugUserId":   userID,
-		}); err != nil {
-			return err
-		}
-	}
-	_ = provider
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"apiKey": apiKey, "user": loginData["user"]})
 	return nil
 }
@@ -4172,14 +4296,27 @@ func (h *Handler) usageHistoryList(w http.ResponseWriter, r *http.Request) error
 	if pageSize <= 0 || pageSize > 100 {
 		pageSize = 50
 	}
+	schema, err := h.usageHistorySchema(r.Context())
+	if err != nil {
+		return err
+	}
+	if !schema.hasAPIRequests {
+		httpx.WriteJSON(w, http.StatusOK, usageHistoryEmptyList(page, pageSize))
+		return nil
+	}
+	where, args, impossible := usageFiltersForSchema(r.URL.Query(), schema, "", "")
+	if impossible {
+		httpx.WriteJSON(w, http.StatusOK, usageHistoryEmptyList(page, pageSize))
+		return nil
+	}
 	offset := (page - 1) * pageSize
-	where, args := usageFilters(r)
 	var total int
-	if err := h.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM api_requests `+where, args...).Scan(&total); err != nil {
+	if err := h.DB.QueryRowContext(r.Context(), `SELECT COUNT(*) FROM api_requests ar`+usageHistoryJoins(schema)+where, args...).Scan(&total); err != nil {
 		return err
 	}
 	args = append(args, pageSize, offset)
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,narrator_id,message_id,kind,provider,model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_tokens,ttft_ms,duration_ms,cost_usd,context_percent,meter_usage,meter_unit,error_message,CASE WHEN raw_dump_json IS NOT NULL AND raw_dump_json != '' THEN 1 ELSE 0 END AS has_raw_dump,COALESCE(LENGTH(raw_dump_json),0) AS raw_dump_bytes,created_at FROM api_requests `+where+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
+	query := `SELECT ` + usageHistoryListSelect(schema) + ` FROM api_requests ar` + usageHistoryJoins(schema) + where + ` ORDER BY ` + usageHistoryOrderExpr(schema) + ` LIMIT ? OFFSET ?`
+	rows, err := h.DB.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		return err
 	}
@@ -4193,6 +4330,14 @@ func (h *Handler) usageHistoryList(w http.ResponseWriter, r *http.Request) error
 }
 
 func (h *Handler) usageHistoryProviders(w http.ResponseWriter, r *http.Request) error {
+	schema, err := h.usageHistorySchema(r.Context())
+	if err != nil {
+		return err
+	}
+	if !schema.hasAPIRequests || !schema.apiColumn("provider") {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"providers": []string{}})
+		return nil
+	}
 	rows, err := h.DB.QueryContext(r.Context(), `SELECT DISTINCT provider FROM api_requests WHERE provider IS NOT NULL AND provider != '' ORDER BY provider`)
 	if err != nil {
 		return err
@@ -4206,7 +4351,7 @@ func (h *Handler) usageHistoryProviders(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"providers": providers})
-	return nil
+	return rows.Err()
 }
 
 func (h *Handler) usageHistoryStats(w http.ResponseWriter, r *http.Request) error {
@@ -4216,17 +4361,26 @@ func (h *Handler) usageHistoryStats(w http.ResponseWriter, r *http.Request) erro
 	if startDate.After(endDate) {
 		startDate = endDate
 	}
-	where, args := usageFiltersWithDateRange(r, startDate.Format(time.RFC3339), endDate.Format(time.RFC3339))
-	var total, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning int
-	var cost, avgDuration, avgTtft sql.NullFloat64
-	if err := h.DB.QueryRowContext(r.Context(), `SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_creation_input_tokens),0), COALESCE(SUM(cached_input_tokens),0), COALESCE(SUM(cache_creation_5m_tokens),0), COALESCE(SUM(cache_creation_1h_tokens),0), COALESCE(SUM(reasoning_tokens),0), SUM(cost_usd), AVG(duration_ms), AVG(ttft_ms) FROM api_requests `+where, args...).Scan(&total, &input, &output, &cacheCreate, &cacheRead, &cache5m, &cache1h, &reasoning, &cost, &avgDuration, &avgTtft); err != nil {
+	schema, err := h.usageHistorySchema(r.Context())
+	if err != nil {
 		return err
 	}
-	totalCost := float64(0)
-	if cost.Valid {
-		totalCost = cost.Float64
+	if !schema.hasAPIRequests {
+		httpx.WriteJSON(w, http.StatusOK, usageHistoryStatsPayload(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, bounded, startDate, endDate))
+		return nil
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"totalRequests": total, "totalInputTokens": input, "totalOutputTokens": output, "totalCacheCreationTokens": cacheCreate, "totalCacheReadTokens": cacheRead, "totalCacheCreation5mTokens": cache5m, "totalCacheCreation1hTokens": cache1h, "totalReasoningTokens": reasoning, "totalTokens": input + output + cacheCreate + cacheRead, "totalCost": totalCost, "totalCostUsd": totalCost, "averageDurationMs": nullFloatOrZero(avgDuration), "averageTtftMs": nullFloatOrZero(avgTtft), "bounded": bounded, "effectiveStartDate": startDate.Format(time.RFC3339), "effectiveEndDate": endDate.Format(time.RFC3339)})
+	where, args, impossible := usageFiltersForSchema(r.URL.Query(), schema, startDate.Format(time.RFC3339), endDate.Format(time.RFC3339))
+	if impossible {
+		httpx.WriteJSON(w, http.StatusOK, usageHistoryStatsPayload(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, bounded, startDate, endDate))
+		return nil
+	}
+	query := `SELECT COUNT(*), ` + usageSumExpr(schema, "input_tokens") + `, ` + usageSumExpr(schema, "output_tokens") + `, ` + usageSumExpr(schema, "cache_creation_input_tokens") + `, ` + usageSumExpr(schema, "cached_input_tokens") + `, ` + usageSumExpr(schema, "cache_creation_5m_tokens") + `, ` + usageSumExpr(schema, "cache_creation_1h_tokens") + `, ` + usageSumExpr(schema, "reasoning_tokens") + `, ` + usageSumExpr(schema, "cost_usd") + `, ` + usageAvgExpr(schema, "duration_ms") + `, ` + usageAvgExpr(schema, "ttft_ms") + ` FROM api_requests ar` + usageHistoryJoins(schema) + where
+	var total, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning int
+	var cost, avgDuration, avgTtft float64
+	if err := h.DB.QueryRowContext(r.Context(), query, args...).Scan(&total, &input, &output, &cacheCreate, &cacheRead, &cache5m, &cache1h, &reasoning, &cost, &avgDuration, &avgTtft); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, usageHistoryStatsPayload(total, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning, cost, avgDuration, avgTtft, bounded, startDate, endDate))
 	return nil
 }
 
@@ -4252,24 +4406,35 @@ func (h *Handler) usageHistoryTimeseries(w http.ResponseWriter, r *http.Request)
 		effectiveStart = startBucket
 		truncated = true
 	}
-	where, args := usageFiltersWithDateRange(r, effectiveStart.Format(time.RFC3339), requestedEnd.Format(time.RFC3339))
-	bucketExpr := usageBucketExpression(granularity)
-	query := `SELECT ` + bucketExpr + ` AS bucket, COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(cache_creation_input_tokens),0), COALESCE(SUM(cached_input_tokens),0), COALESCE(SUM(cache_creation_5m_tokens),0), COALESCE(SUM(cache_creation_1h_tokens),0), COALESCE(SUM(reasoning_tokens),0), COALESCE(SUM(cost_usd),0), COALESCE(AVG(duration_ms),0), COALESCE(AVG(ttft_ms),0), COALESCE(SUM(CASE WHEN error_message IS NOT NULL AND TRIM(error_message) != '' THEN 1 ELSE 0 END),0), COALESCE(SUM(meter_usage),0), CASE WHEN COUNT(DISTINCT meter_unit) = 1 THEN MAX(meter_unit) WHEN COUNT(DISTINCT meter_unit) > 1 THEN 'mixed' ELSE NULL END FROM api_requests ` + where + ` GROUP BY bucket ORDER BY bucket`
-	rows, err := h.DB.QueryContext(r.Context(), query, args...)
+	schema, err := h.usageHistorySchema(r.Context())
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
 	byBucket := map[string]map[string]any{}
-	for rows.Next() {
-		var bucket string
-		var requestCount, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning, errorCount int
-		var cost, avgDuration, avgTtft, meterUsage float64
-		var meterUnit sql.NullString
-		if err := rows.Scan(&bucket, &requestCount, &input, &output, &cacheCreate, &cacheRead, &cache5m, &cache1h, &reasoning, &cost, &avgDuration, &avgTtft, &errorCount, &meterUsage, &meterUnit); err != nil {
-			return err
+	if schema.hasAPIRequests && schema.apiColumn("created_at") {
+		where, args, impossible := usageFiltersForSchema(r.URL.Query(), schema, effectiveStart.Format(time.RFC3339), requestedEnd.Format(time.RFC3339))
+		if !impossible {
+			bucketExpr := usageBucketExpression(granularity)
+			query := `SELECT ` + bucketExpr + ` AS bucket, COUNT(*), ` + usageSumExpr(schema, "input_tokens") + `, ` + usageSumExpr(schema, "output_tokens") + `, ` + usageSumExpr(schema, "cache_creation_input_tokens") + `, ` + usageSumExpr(schema, "cached_input_tokens") + `, ` + usageSumExpr(schema, "cache_creation_5m_tokens") + `, ` + usageSumExpr(schema, "cache_creation_1h_tokens") + `, ` + usageSumExpr(schema, "reasoning_tokens") + `, ` + usageSumExpr(schema, "cost_usd") + `, ` + usageAvgExpr(schema, "duration_ms") + `, ` + usageAvgExpr(schema, "ttft_ms") + `, ` + usageErrorCountExpr(schema) + `, ` + usageSumExpr(schema, "meter_usage") + `, ` + usageMeterUnitExpr(schema) + ` FROM api_requests ar` + usageHistoryJoins(schema) + where + ` GROUP BY bucket ORDER BY bucket`
+			rows, err := h.DB.QueryContext(r.Context(), query, args...)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var bucket string
+				var requestCount, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning, errorCount int
+				var cost, avgDuration, avgTtft, meterUsage float64
+				var meterUnit sql.NullString
+				if err := rows.Scan(&bucket, &requestCount, &input, &output, &cacheCreate, &cacheRead, &cache5m, &cache1h, &reasoning, &cost, &avgDuration, &avgTtft, &errorCount, &meterUsage, &meterUnit); err != nil {
+					return err
+				}
+				byBucket[bucket] = usagePoint(bucket, requestCount, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning, cost, avgDuration, avgTtft, errorCount, meterUsage, nullableString(meterUnit))
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
 		}
-		byBucket[bucket] = usagePoint(bucket, requestCount, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning, cost, avgDuration, avgTtft, errorCount, meterUsage, nullableString(meterUnit))
 	}
 	points := []map[string]any{}
 	for cursor := startBucket; !cursor.After(endBucket) && len(points) < config.maxBuckets; cursor = addUsageBuckets(cursor, 1, granularity) {
@@ -4281,11 +4446,19 @@ func (h *Handler) usageHistoryTimeseries(w http.ResponseWriter, r *http.Request)
 		points = append(points, point)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"granularity": granularity, "points": points, "bucketCount": len(points), "maxBuckets": config.maxBuckets, "truncated": truncated, "requestedStartDate": requestedStart.Format(time.RFC3339), "requestedEndDate": requestedEnd.Format(time.RFC3339), "effectiveStartDate": effectiveStart.Format(time.RFC3339), "effectiveEndDate": requestedEnd.Format(time.RFC3339), "generatedAt": time.Now().UTC().Format(time.RFC3339)})
-	return rows.Err()
+	return nil
 }
 
 func (h *Handler) usageHistoryGet(w http.ResponseWriter, r *http.Request) error {
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,narrator_id,message_id,kind,provider,model,input_tokens,output_tokens,cached_input_tokens,cache_creation_input_tokens,reasoning_tokens,ttft_ms,duration_ms,cost_usd,context_percent,meter_usage,meter_unit,error_message,raw_dump_json,created_at FROM api_requests WHERE id = ?`, chi.URLParam(r, "id"))
+	schema, err := h.usageHistorySchema(r.Context())
+	if err != nil {
+		return err
+	}
+	if !schema.hasAPIRequests || !schema.apiColumn("id") {
+		return httpx.NotFound("Usage record")
+	}
+	query := `SELECT ` + usageHistoryDetailSelect(schema) + ` FROM api_requests ar` + usageHistoryJoins(schema) + ` WHERE ar.id = ?`
+	rows, err := h.DB.QueryContext(r.Context(), query, chi.URLParam(r, "id"))
 	if err != nil {
 		return err
 	}
@@ -4299,6 +4472,292 @@ func (h *Handler) usageHistoryGet(w http.ResponseWriter, r *http.Request) error 
 	}
 	httpx.WriteJSON(w, http.StatusOK, records[0])
 	return nil
+}
+
+type usageHistorySchemaInfo struct {
+	apiRequestsColumns map[string]bool
+	narratorColumns    map[string]bool
+	chapterColumns     map[string]bool
+	hasAPIRequests     bool
+}
+
+func (h *Handler) usageHistorySchema(ctx context.Context) (usageHistorySchemaInfo, error) {
+	var schema usageHistorySchemaInfo
+	if h == nil || h.DB == nil {
+		return schema, nil
+	}
+	apiColumns, err := db.TableColumnSet(ctx, h.DB, "api_requests")
+	if err != nil {
+		return schema, err
+	}
+	schema.apiRequestsColumns = apiColumns
+	schema.hasAPIRequests = len(apiColumns) > 0
+	if narratorColumns, err := db.TableColumnSet(ctx, h.DB, "narrators"); err != nil {
+		return schema, err
+	} else {
+		schema.narratorColumns = narratorColumns
+	}
+	if chapterColumns, err := db.TableColumnSet(ctx, h.DB, "chapters"); err != nil {
+		return schema, err
+	} else {
+		schema.chapterColumns = chapterColumns
+	}
+	return schema, nil
+}
+
+func (s usageHistorySchemaInfo) apiColumn(column string) bool {
+	return s.apiRequestsColumns[column]
+}
+
+func (s usageHistorySchemaInfo) canJoinNarrators() bool {
+	return s.apiColumn("narrator_id") && s.narratorColumns["id"]
+}
+
+func (s usageHistorySchemaInfo) canJoinChapters() bool {
+	return s.canJoinNarrators() && s.narratorColumns["chapter_id"] && s.chapterColumns["id"]
+}
+
+func usageHistoryJoins(schema usageHistorySchemaInfo) string {
+	joins := ""
+	if schema.canJoinNarrators() {
+		joins += " LEFT JOIN narrators n ON n.id = ar.narrator_id"
+	}
+	if schema.canJoinChapters() {
+		joins += " LEFT JOIN chapters c ON c.id = n.chapter_id"
+	}
+	return joins
+}
+
+func usageHistoryEmptyList(page, pageSize int) map[string]any {
+	return map[string]any{"records": []map[string]any{}, "total": 0, "page": page, "pageSize": pageSize, "totalPages": 0}
+}
+
+func usageHistoryStatsPayload(total, input, output, cacheCreate, cacheRead, cache5m, cache1h, reasoning int, cost, avgDuration, avgTtft float64, bounded bool, startDate, endDate time.Time) map[string]any {
+	return map[string]any{"totalRequests": total, "totalInputTokens": input, "totalOutputTokens": output, "totalCacheCreationTokens": cacheCreate, "totalCacheReadTokens": cacheRead, "totalCacheCreation5mTokens": cache5m, "totalCacheCreation1hTokens": cache1h, "totalReasoningTokens": reasoning, "totalTokens": input + output + cacheCreate + cacheRead, "totalCost": cost, "totalCostUsd": cost, "averageDurationMs": avgDuration, "averageTtftMs": avgTtft, "bounded": bounded, "effectiveStartDate": startDate.Format(time.RFC3339), "effectiveEndDate": endDate.Format(time.RFC3339)}
+}
+
+func usageHistoryListSelect(schema usageHistorySchemaInfo) string {
+	return strings.Join([]string{
+		usageSelectString(schema, "id"),
+		usageSelectString(schema, "narrator_id"),
+		usageSelectString(schema, "message_id"),
+		usageSelectString(schema, "kind"),
+		usageSelectString(schema, "provider"),
+		usageSelectString(schema, "credential_id"),
+		usageSelectString(schema, "model"),
+		usageSelectInt(schema, "input_tokens"),
+		usageSelectInt(schema, "output_tokens"),
+		usageSelectInt(schema, "cached_input_tokens"),
+		usageSelectInt(schema, "cache_creation_input_tokens"),
+		usageSelectInt(schema, "cache_creation_5m_tokens"),
+		usageSelectInt(schema, "cache_creation_1h_tokens"),
+		usageSelectInt(schema, "reasoning_tokens"),
+		usageSelectNullable(schema, "ttft_ms"),
+		usageSelectNullable(schema, "duration_ms"),
+		usageSelectNullable(schema, "cost_usd"),
+		usageSelectNullable(schema, "context_percent"),
+		usageSelectNullable(schema, "meter_usage"),
+		usageSelectString(schema, "meter_unit"),
+		usageSelectString(schema, "error_message"),
+		usageHasRawDumpExpr(schema),
+		usageRawDumpBytesExpr(schema),
+		usageSelectString(schema, "created_at"),
+		usageNarratorTitleExpr(schema),
+		usageChapterTitleExpr(schema),
+		usageChapterIDExpr(schema),
+		usageProjectIDExpr(schema),
+	}, ",")
+}
+
+func usageHistoryDetailSelect(schema usageHistorySchemaInfo) string {
+	return strings.Join([]string{
+		usageSelectString(schema, "id"),
+		usageSelectString(schema, "narrator_id"),
+		usageSelectString(schema, "message_id"),
+		usageSelectString(schema, "kind"),
+		usageSelectString(schema, "provider"),
+		usageSelectString(schema, "credential_id"),
+		usageSelectString(schema, "model"),
+		usageSelectInt(schema, "input_tokens"),
+		usageSelectInt(schema, "output_tokens"),
+		usageSelectInt(schema, "cached_input_tokens"),
+		usageSelectInt(schema, "cache_creation_input_tokens"),
+		usageSelectInt(schema, "cache_creation_5m_tokens"),
+		usageSelectInt(schema, "cache_creation_1h_tokens"),
+		usageSelectInt(schema, "reasoning_tokens"),
+		usageSelectNullable(schema, "ttft_ms"),
+		usageSelectNullable(schema, "duration_ms"),
+		usageSelectNullable(schema, "cost_usd"),
+		usageSelectNullable(schema, "context_percent"),
+		usageSelectNullable(schema, "meter_usage"),
+		usageSelectString(schema, "meter_unit"),
+		usageSelectString(schema, "error_message"),
+		usageSelectString(schema, "raw_dump_json"),
+		usageSelectString(schema, "created_at"),
+		usageNarratorTitleExpr(schema),
+		usageChapterTitleExpr(schema),
+		usageChapterIDExpr(schema),
+		usageProjectIDExpr(schema),
+	}, ",")
+}
+
+func usageSelectString(schema usageHistorySchemaInfo, column string) string {
+	if schema.apiColumn(column) {
+		return "ar." + column
+	}
+	return "NULL"
+}
+
+func usageSelectInt(schema usageHistorySchemaInfo, column string) string {
+	if schema.apiColumn(column) {
+		return "COALESCE(ar." + column + ",0)"
+	}
+	return "0"
+}
+
+func usageSelectNullable(schema usageHistorySchemaInfo, column string) string {
+	if schema.apiColumn(column) {
+		return "ar." + column
+	}
+	return "NULL"
+}
+
+func usageHasRawDumpExpr(schema usageHistorySchemaInfo) string {
+	if schema.apiColumn("raw_dump_json") {
+		return "CASE WHEN ar.raw_dump_json IS NOT NULL AND ar.raw_dump_json != '' THEN 1 ELSE 0 END"
+	}
+	return "0"
+}
+
+func usageRawDumpBytesExpr(schema usageHistorySchemaInfo) string {
+	if schema.apiColumn("raw_dump_json") {
+		return "COALESCE(LENGTH(ar.raw_dump_json),0)"
+	}
+	return "0"
+}
+
+func usageNarratorTitleExpr(schema usageHistorySchemaInfo) string {
+	if schema.canJoinNarrators() && schema.narratorColumns["title"] {
+		return "n.title"
+	}
+	return "NULL"
+}
+
+func usageChapterTitleExpr(schema usageHistorySchemaInfo) string {
+	if schema.canJoinChapters() && schema.chapterColumns["title"] {
+		return "c.title"
+	}
+	return "NULL"
+}
+
+func usageChapterIDExpr(schema usageHistorySchemaInfo) string {
+	if schema.canJoinNarrators() && schema.narratorColumns["chapter_id"] {
+		return "n.chapter_id"
+	}
+	return "NULL"
+}
+
+func usageProjectIDExpr(schema usageHistorySchemaInfo) string {
+	if schema.canJoinChapters() && schema.chapterColumns["project_id"] {
+		return "c.project_id"
+	}
+	return "NULL"
+}
+
+func usageHistoryOrderExpr(schema usageHistorySchemaInfo) string {
+	if schema.apiColumn("created_at") {
+		if schema.apiColumn("id") {
+			return "ar.created_at DESC, ar.id DESC"
+		}
+		return "ar.created_at DESC"
+	}
+	if schema.apiColumn("id") {
+		return "ar.id DESC"
+	}
+	return "1"
+}
+
+func usageSumExpr(schema usageHistorySchemaInfo, column string) string {
+	if schema.apiColumn(column) {
+		return "COALESCE(SUM(ar." + column + "),0)"
+	}
+	return "0"
+}
+
+func usageAvgExpr(schema usageHistorySchemaInfo, column string) string {
+	if schema.apiColumn(column) {
+		return "COALESCE(AVG(ar." + column + "),0)"
+	}
+	return "0"
+}
+
+func usageErrorCountExpr(schema usageHistorySchemaInfo) string {
+	if schema.apiColumn("error_message") {
+		return "COALESCE(SUM(CASE WHEN ar.error_message IS NOT NULL AND TRIM(ar.error_message) != '' THEN 1 ELSE 0 END),0)"
+	}
+	return "0"
+}
+
+func usageMeterUnitExpr(schema usageHistorySchemaInfo) string {
+	if schema.apiColumn("meter_unit") {
+		return "CASE WHEN COUNT(DISTINCT ar.meter_unit) = 1 THEN MAX(ar.meter_unit) WHEN COUNT(DISTINCT ar.meter_unit) > 1 THEN 'mixed' ELSE NULL END"
+	}
+	return "NULL"
+}
+
+func usageFiltersForSchema(values url.Values, schema usageHistorySchemaInfo, startDateOverride, endDateOverride string) (string, []any, bool) {
+	clauses := []string{}
+	args := []any{}
+	for _, filter := range []struct{ key, column string }{{"narratorId", "narrator_id"}, {"provider", "provider"}, {"kind", "kind"}} {
+		if value := strings.TrimSpace(values.Get(filter.key)); value != "" {
+			if !schema.apiColumn(filter.column) {
+				return "", nil, true
+			}
+			clauses = append(clauses, "ar."+filter.column+" = ?")
+			args = append(args, value)
+		}
+	}
+	if value := strings.TrimSpace(values.Get("model")); value != "" {
+		if !schema.apiColumn("model") {
+			return "", nil, true
+		}
+		clauses = append(clauses, "ar.model LIKE ?")
+		args = append(args, "%"+value+"%")
+	}
+	if value := strings.TrimSpace(values.Get("chapterId")); value != "" {
+		if !schema.canJoinNarrators() || !schema.narratorColumns["chapter_id"] {
+			return "", nil, true
+		}
+		clauses = append(clauses, "n.chapter_id = ?")
+		args = append(args, value)
+	}
+	if value := strings.TrimSpace(values.Get("projectId")); value != "" {
+		if !schema.canJoinChapters() || !schema.chapterColumns["project_id"] {
+			return "", nil, true
+		}
+		clauses = append(clauses, "c.project_id = ?")
+		args = append(args, value)
+	}
+	startDate := firstNonEmpty(startDateOverride, strings.TrimSpace(values.Get("startDate")))
+	endDate := firstNonEmpty(endDateOverride, strings.TrimSpace(values.Get("endDate")))
+	if startDate != "" {
+		if !schema.apiColumn("created_at") {
+			return "", nil, true
+		}
+		clauses = append(clauses, "ar.created_at >= ?")
+		args = append(args, startDate)
+	}
+	if endDate != "" {
+		if !schema.apiColumn("created_at") {
+			return "", nil, true
+		}
+		clauses = append(clauses, "ar.created_at <= ?")
+		args = append(args, endDate)
+	}
+	if len(clauses) == 0 {
+		return "", args, false
+	}
+	return " WHERE " + strings.Join(clauses, " AND "), args, false
 }
 
 func usageFilters(r *http.Request) (string, []any) {
@@ -4411,11 +4870,11 @@ func countUsageBuckets(start, end time.Time, granularity string) int {
 func usageBucketExpression(granularity string) string {
 	switch granularity {
 	case "hour":
-		return `substr(created_at, 1, 13) || ':00:00.000Z'`
+		return `substr(ar.created_at, 1, 13) || ':00:00.000Z'`
 	case "month":
-		return `substr(created_at, 1, 7) || '-01T00:00:00.000Z'`
+		return `substr(ar.created_at, 1, 7) || '-01T00:00:00.000Z'`
 	default:
-		return `substr(created_at, 1, 10) || 'T00:00:00.000Z'`
+		return `substr(ar.created_at, 1, 10) || 'T00:00:00.000Z'`
 	}
 }
 
@@ -4437,15 +4896,16 @@ func nullFloatOrZero(value sql.NullFloat64) float64 {
 func usageListRows(rows *sql.Rows) ([]map[string]any, error) {
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, narratorID, messageID, kind, provider, model, meterUnit, errMsg, created sql.NullString
-		var input, output, cached, cacheCreate, reasoning int
+		var id, narratorID, messageID, kind, provider, credentialID, model, meterUnit, errMsg, created sql.NullString
+		var narratorTitle, chapterTitle, chapterID, projectID sql.NullString
+		var input, output, cached, cacheCreate, cache5m, cache1h, reasoning int
 		var hasRawDump, rawDumpBytes int
 		var ttft, duration sql.NullInt64
 		var cost, contextPercent, meter sql.NullFloat64
-		if err := rows.Scan(&id, &narratorID, &messageID, &kind, &provider, &model, &input, &output, &cached, &cacheCreate, &reasoning, &ttft, &duration, &cost, &contextPercent, &meter, &meterUnit, &errMsg, &hasRawDump, &rawDumpBytes, &created); err != nil {
+		if err := rows.Scan(&id, &narratorID, &messageID, &kind, &provider, &credentialID, &model, &input, &output, &cached, &cacheCreate, &cache5m, &cache1h, &reasoning, &ttft, &duration, &cost, &contextPercent, &meter, &meterUnit, &errMsg, &hasRawDump, &rawDumpBytes, &created, &narratorTitle, &chapterTitle, &chapterID, &projectID); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id.String, "narratorId": nullableString(narratorID), "messageId": nullableString(messageID), "kind": stringDefault(kind, "narrator"), "provider": nullableString(provider), "model": nullableString(model), "inputTokens": input, "outputTokens": output, "cachedInputTokens": cached, "cacheCreationInputTokens": cacheCreate, "reasoningTokens": reasoning, "ttftMs": nullableInt(ttft), "durationMs": nullableInt(duration), "costUsd": nullableFloat(cost), "contextPercent": nullableFloat(contextPercent), "meterUsage": nullableFloat(meter), "meterUnit": nullableString(meterUnit), "errorMessage": nullableString(errMsg), "hasRawDump": hasRawDump != 0, "rawDumpBytes": rawDumpBytes, "rawDumpJson": nil, "createdAt": created.String})
+		out = append(out, usageRecordMap(id, narratorID, messageID, kind, provider, credentialID, model, input, output, cached, cacheCreate, cache5m, cache1h, reasoning, ttft, duration, cost, contextPercent, meter, meterUnit, errMsg, sql.NullString{}, created, narratorTitle, chapterTitle, chapterID, projectID, hasRawDump != 0, rawDumpBytes))
 	}
 	return out, rows.Err()
 }
@@ -4453,16 +4913,38 @@ func usageListRows(rows *sql.Rows) ([]map[string]any, error) {
 func usageRows(rows *sql.Rows) ([]map[string]any, error) {
 	out := []map[string]any{}
 	for rows.Next() {
-		var id, narratorID, messageID, kind, provider, model, meterUnit, errMsg, raw, created sql.NullString
-		var input, output, cached, cacheCreate, reasoning int
+		var id, narratorID, messageID, kind, provider, credentialID, model, meterUnit, errMsg, raw, created sql.NullString
+		var narratorTitle, chapterTitle, chapterID, projectID sql.NullString
+		var input, output, cached, cacheCreate, cache5m, cache1h, reasoning int
 		var ttft, duration sql.NullInt64
 		var cost, contextPercent, meter sql.NullFloat64
-		if err := rows.Scan(&id, &narratorID, &messageID, &kind, &provider, &model, &input, &output, &cached, &cacheCreate, &reasoning, &ttft, &duration, &cost, &contextPercent, &meter, &meterUnit, &errMsg, &raw, &created); err != nil {
+		if err := rows.Scan(&id, &narratorID, &messageID, &kind, &provider, &credentialID, &model, &input, &output, &cached, &cacheCreate, &cache5m, &cache1h, &reasoning, &ttft, &duration, &cost, &contextPercent, &meter, &meterUnit, &errMsg, &raw, &created, &narratorTitle, &chapterTitle, &chapterID, &projectID); err != nil {
 			return nil, err
 		}
-		out = append(out, map[string]any{"id": id.String, "narratorId": nullableString(narratorID), "messageId": nullableString(messageID), "kind": stringDefault(kind, "narrator"), "provider": nullableString(provider), "model": nullableString(model), "inputTokens": input, "outputTokens": output, "cachedInputTokens": cached, "cacheCreationInputTokens": cacheCreate, "reasoningTokens": reasoning, "ttftMs": nullableInt(ttft), "durationMs": nullableInt(duration), "costUsd": nullableFloat(cost), "contextPercent": nullableFloat(contextPercent), "meterUsage": nullableFloat(meter), "meterUnit": nullableString(meterUnit), "errorMessage": nullableString(errMsg), "hasRawDump": raw.Valid && raw.String != "", "createdAt": created.String})
+		out = append(out, usageRecordMap(id, narratorID, messageID, kind, provider, credentialID, model, input, output, cached, cacheCreate, cache5m, cache1h, reasoning, ttft, duration, cost, contextPercent, meter, meterUnit, errMsg, raw, created, narratorTitle, chapterTitle, chapterID, projectID, raw.Valid && raw.String != "", len(raw.String)))
 	}
 	return out, rows.Err()
+}
+
+func usageRecordMap(id, narratorID, messageID, kind, provider, credentialID, model sql.NullString, input, output, cached, cacheCreate, cache5m, cache1h, reasoning int, ttft, duration sql.NullInt64, cost, contextPercent, meter sql.NullFloat64, meterUnit, errMsg, raw, created, narratorTitle, chapterTitle, chapterID, projectID sql.NullString, hasRawDump bool, rawDumpBytes int) map[string]any {
+	record := map[string]any{"id": id.String, "narratorId": nullableString(narratorID), "messageId": nullableString(messageID), "kind": stringDefault(kind, "narrator"), "provider": nullableString(provider), "credentialId": nullableString(credentialID), "credentialName": nullableString(credentialID), "model": nullableString(model), "inputTokens": input, "outputTokens": output, "cachedInputTokens": cached, "cacheCreationInputTokens": cacheCreate, "cacheCreation5mTokens": cache5m, "cacheCreation1hTokens": cache1h, "reasoningTokens": reasoning, "ttftMs": nullableInt(ttft), "durationMs": nullableInt(duration), "costUsd": nullableFloat(cost), "contextPercent": nullableFloat(contextPercent), "meterUsage": nullableFloat(meter), "meterUnit": nullableString(meterUnit), "errorMessage": nullableString(errMsg), "hasRawDump": hasRawDump, "rawDumpBytes": rawDumpBytes, "createdAt": created.String, "narratorTitle": nullableString(narratorTitle), "chapterTitle": nullableString(chapterTitle), "chapterId": nullableString(chapterID), "projectId": nullableString(projectID)}
+	if hasRawDump {
+		record["rawDump"] = parseUsageRawDump(raw)
+	} else {
+		record["rawDump"] = nil
+	}
+	return record
+}
+
+func parseUsageRawDump(raw sql.NullString) any {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
+	}
+	var parsed any
+	if err := json.Unmarshal([]byte(raw.String), &parsed); err != nil {
+		return map[string]any{"invalidJson": true, "rawText": raw.String}
+	}
+	return parsed
 }
 func intQuery(r *http.Request, key string, fallback int) int {
 	v, err := strconv.Atoi(r.URL.Query().Get(key))
@@ -4518,7 +5000,7 @@ var (
 func (h *Handler) clineRecommendedModels(w http.ResponseWriter, r *http.Request) error {
 	refresh := r.URL.Query().Get("refresh") == "1" || strings.EqualFold(r.URL.Query().Get("refresh"), "true")
 	if refresh {
-		data, err := getJSON(r.Context(), "https://api.cline.bot/api/v1/ai/cline/recommended-models", map[string]string{})
+		data, err := getJSON(r.Context(), clineRecommendedModelsURL(), map[string]string{})
 		if err == nil {
 			normalized := normalizeClineRecommendedModels(data)
 			if len(normalized["recommended"].([]any)) > 0 || len(normalized["free"].([]any)) > 0 {
@@ -4537,9 +5019,6 @@ func (h *Handler) clineRecommendedModels(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) clinePoolSearch(w http.ResponseWriter, r *http.Request) error {
-	if err := h.ensureDefaultClineProvider(""); err != nil {
-		return err
-	}
 	limit := int(numericQuery(r, "limit", 50))
 	if limit < 1 {
 		limit = 50
@@ -4574,9 +5053,6 @@ func (h *Handler) clinePoolSearch(w http.ResponseWriter, r *http.Request) error 
 }
 
 func (h *Handler) clinePoolCount(w http.ResponseWriter, r *http.Request) error {
-	if err := h.ensureDefaultClineProvider(""); err != nil {
-		return err
-	}
 	cache, _ := loadProviderModelCache("cline")
 	models := aggregateProviderModels("cline", h.providerConfigs("cline"), cache)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"count": len(models)})
@@ -4680,28 +5156,40 @@ func (h *Handler) clineSetEnabledModels(w http.ResponseWriter, r *http.Request) 
 	if body.Models == nil {
 		return httpx.BadRequest("models must be an array")
 	}
-	if err := h.ensureDefaultClineProvider(""); err != nil {
+	count, modelContextWindows, err := h.updateClineEnabledModels(body.Models)
+	if err != nil {
 		return err
 	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "count": count, "modelContextWindows": modelContextWindows})
+	return nil
+}
+
+func (h *Handler) updateClineEnabledModels(models []string) (int, map[string]any, error) {
+	if err := h.ensureDefaultClineProvider(""); err != nil {
+		return 0, nil, err
+	}
 	if h.Settings == nil {
-		return httpx.BadRequest("Settings unavailable")
+		return 0, nil, httpx.BadRequest("Settings unavailable")
 	}
 	raw := h.Settings.Raw()
 	providers, _ := raw["clineProviders"].([]any)
 	if len(providers) == 0 {
-		return httpx.BadRequest("No Cline provider available")
+		return 0, nil, httpx.BadRequest("No Cline provider available")
 	}
-	models := make([]any, 0, len(body.Models))
-	for _, model := range body.Models {
-		if strings.TrimSpace(model) != "" {
-			models = append(models, model)
+	modelValues := make([]any, 0, len(models))
+	modelIDs := make([]string, 0, len(models))
+	for _, model := range models {
+		modelID := strings.TrimSpace(model)
+		if modelID != "" {
+			modelValues = append(modelValues, modelID)
+			modelIDs = append(modelIDs, modelID)
 		}
 	}
 	patch := map[string]any{"clineProviders": providers}
 	if provider, ok := providers[0].(map[string]any); ok {
-		provider["enabledModels"] = models
-		if provider["defaultModel"] == nil && len(models) > 0 {
-			provider["defaultModel"] = models[0]
+		provider["enabledModels"] = modelValues
+		if provider["defaultModel"] == nil && len(modelValues) > 0 {
+			provider["defaultModel"] = modelValues[0]
 		}
 		if agent, ok := raw["agent"].(map[string]any); ok {
 			windows, _ := agent["modelContextWindows"].(map[string]any)
@@ -4711,9 +5199,8 @@ func (h *Handler) clineSetEnabledModels(w http.ResponseWriter, r *http.Request) 
 			cache, _ := loadProviderModelCache("cline")
 			prefix := firstNonEmpty(stringMap(provider, "prefix", ""), "cline")
 			changedWindows := false
-			for _, modelValue := range models {
-				modelID, _ := modelValue.(string)
-				if modelID == "" || windows[prefix+":"+modelID] != nil {
+			for _, modelID := range modelIDs {
+				if windows[prefix+":"+modelID] != nil {
 					continue
 				}
 				for _, cached := range cache[stringMap(provider, "id", "")] {
@@ -4734,7 +5221,7 @@ func (h *Handler) clineSetEnabledModels(w http.ResponseWriter, r *http.Request) 
 	}
 	patched, err := h.Settings.Patch(patch)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	modelContextWindows := map[string]any{}
 	if agent, ok := patched["agent"].(map[string]any); ok {
@@ -4742,8 +5229,57 @@ func (h *Handler) clineSetEnabledModels(w http.ResponseWriter, r *http.Request) 
 			modelContextWindows = windows
 		}
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(models), "modelContextWindows": modelContextWindows})
-	return nil
+	return len(modelValues), modelContextWindows, nil
+}
+
+func (h *Handler) autoAddClineFreeModels() error {
+	if err := h.ensureDefaultClineProvider(""); err != nil {
+		return err
+	}
+	if h.Settings == nil {
+		return nil
+	}
+	recommended, err := loadClineRecommendedCache()
+	if err != nil || recommended == nil {
+		recommended = clineRecommendedFallback()
+	}
+	freeModels, _ := recommended["free"].([]any)
+	if len(freeModels) == 0 {
+		return nil
+	}
+	raw := h.Settings.Raw()
+	providers, _ := raw["clineProviders"].([]any)
+	if len(providers) == 0 {
+		return nil
+	}
+	provider, ok := providers[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+	enabled := stringList(provider["enabledModels"])
+	existing := make(map[string]bool, len(enabled))
+	for _, modelID := range enabled {
+		existing[modelID] = true
+	}
+	changed := false
+	for _, item := range freeModels {
+		model, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		modelID := stringMap(model, "id", "")
+		if modelID == "" || existing[modelID] {
+			continue
+		}
+		enabled = append(enabled, modelID)
+		existing[modelID] = true
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	_, _, err = h.updateClineEnabledModels(enabled)
+	return err
 }
 
 func (h *Handler) clineUserInfoRefresh(w http.ResponseWriter, r *http.Request) error {
@@ -4774,7 +5310,7 @@ func (h *Handler) clineBalance(w http.ResponseWriter, r *http.Request) error {
 	if userID == "" {
 		return httpx.Error(http.StatusUnprocessableEntity, "CLINE_AUTH_REQUIRED", "Not authenticated or balance unavailable")
 	}
-	baseURL := strings.TrimRight(clineDefaultBaseURL, "/")
+	baseURL := clineAPIBaseURL()
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, baseURL+"/api/v1/users/"+url.PathEscape(userID)+"/balance", nil)
 	if err != nil {
 		return err
@@ -4819,7 +5355,7 @@ func (h *Handler) validClineCredentials(ctx context.Context) (map[string]any, er
 
 func refreshClineAccessToken(ctx context.Context, creds map[string]any) (map[string]any, error) {
 	payload, _ := json.Marshal(map[string]any{"refreshToken": stringMap(creds, "refreshToken", ""), "grantType": "refresh_token"})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(clineDefaultBaseURL, "/")+"/api/v1/auth/refresh", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, clineAPIBaseURL()+"/api/v1/auth/refresh", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -4880,7 +5416,7 @@ func (h *Handler) refreshClineUserInfo(ctx context.Context) (map[string]any, err
 	if err != nil || creds == nil {
 		return creds, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(clineDefaultBaseURL, "/")+"/api/v1/users/me", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clineAPIBaseURL()+"/api/v1/users/me", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -4921,7 +5457,6 @@ func clineAuthStatusPayload(creds map[string]any) map[string]any {
 }
 
 func (h *Handler) clineStatus(w http.ResponseWriter, r *http.Request) error {
-	_ = h.ensureDefaultClineProvider("")
 	creds, _ := loadClineCredentials()
 	authenticated := stringMap(creds, "accessToken", "") != ""
 	providers := []any{}
@@ -4949,10 +5484,12 @@ func (h *Handler) clineStatus(w http.ResponseWriter, r *http.Request) error {
 	clineAuthMu.Lock()
 	pending := clineBrowser != nil && clineBrowser.Pending && time.Now().Before(clineBrowser.ExpiresAt)
 	clineAuthMu.Unlock()
+	cache, _ := loadProviderModelCache("cline")
+	totalModels := len(aggregateProviderModels("cline", h.providerConfigs("cline"), cache))
 	payload := map[string]any{
 		"authenticated": authenticated,
 		"providers":     providers,
-		"totalModels":   len(enabledModels),
+		"totalModels":   totalModels,
 		"enabledModels": enabledModels,
 		"pendingAuth":   pending,
 	}
@@ -4983,6 +5520,10 @@ func (h *Handler) clineAuthCallback(w http.ResponseWriter, r *http.Request) erro
 		return httpx.BadRequest(err.Error())
 	}
 	if err := h.ensureDefaultClineProvider(stringMap(creds, "accessToken", "")); err != nil {
+		return err
+	}
+	_, _ = h.refreshClineUserInfo(r.Context())
+	if err := h.autoAddClineFreeModels(); err != nil {
 		return err
 	}
 	h.stopClineBrowserAuth()
@@ -5022,7 +5563,7 @@ func (h *Handler) clineAuthBrowser(w http.ResponseWriter, r *http.Request) error
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	baseURL := strings.TrimRight(firstNonEmpty(body.APIBaseURL, clineDefaultBaseURL), "/")
+	baseURL := strings.TrimRight(firstNonEmpty(body.APIBaseURL, clineAPIBaseURL()), "/")
 	callbackURL := "http://localhost:19876/auth/callback"
 	authEndpoint, err := url.Parse(baseURL + "/api/v1/auth/authorize")
 	if err != nil {
@@ -5077,6 +5618,12 @@ func (h *Handler) startClineCallbackServer() error {
 		creds, err := importClineCallbackURL(fullURL)
 		if err == nil {
 			err = h.ensureDefaultClineProvider(stringMap(creds, "accessToken", ""))
+		}
+		if err == nil {
+			_, _ = h.refreshClineUserInfo(r.Context())
+		}
+		if err == nil {
+			err = h.autoAddClineFreeModels()
 		}
 		clineAuthMu.Lock()
 		if clineBrowser != nil {
@@ -5237,9 +5784,13 @@ func (h *Handler) codexSetUseWebSocket(w http.ResponseWriter, r *http.Request) e
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	useWebSocket, ok := body["useWebSocket"].(bool)
-	if !ok {
-		return httpx.BadRequest("useWebSocket must be boolean")
+	useWebSocket := true
+	if raw, exists := body["useWebSocket"]; exists {
+		value, ok := raw.(bool)
+		if !ok {
+			return httpx.BadRequest("useWebSocket must be boolean")
+		}
+		useWebSocket = value
 	}
 	if err := h.patchCodexSetting("useWebSocket", useWebSocket); err != nil {
 		return err
@@ -5254,8 +5805,8 @@ func (h *Handler) codexSetLoadBalancingMode(w http.ResponseWriter, r *http.Reque
 		return err
 	}
 	mode := stringMap(body, "mode", "")
-	if mode != "priority" && mode != "balanced" && mode != "tier-balanced" && mode != "tiered_sticky" {
-		return httpx.BadRequest("Invalid mode. Must be 'priority', 'balanced', 'tier-balanced', or 'tiered_sticky'")
+	if mode != "priority" && mode != "balanced" && mode != "tier-balanced" {
+		return httpx.BadRequest("Invalid mode. Must be 'priority', 'balanced', or 'tier-balanced'")
 	}
 	if err := h.patchCodexSetting("loadBalancingMode", mode); err != nil {
 		return err
@@ -5272,6 +5823,16 @@ func (h *Handler) codexSetTierOrder(w http.ResponseWriter, r *http.Request) erro
 	tierOrder, ok := body["tierOrder"].([]any)
 	if !ok {
 		return httpx.BadRequest("tierOrder must be an array")
+	}
+	if len(tierOrder) > 6 {
+		return httpx.BadRequest("tierOrder must contain at most 6 items")
+	}
+	allowed := map[string]bool{"free": true, "plus": true, "team": true, "prolite": true, "pro": true, "other": true}
+	for _, item := range tierOrder {
+		value, ok := item.(string)
+		if !ok || !allowed[value] {
+			return httpx.BadRequest("Invalid tierOrder")
+		}
 	}
 	normalized := normalizeCodexTierOrder(tierOrder)
 	if err := h.patchCodexSetting("tierOrder", normalized); err != nil {
@@ -5340,6 +5901,26 @@ func normalizeCodexTierOrder(values []any) []any {
 		seen[value] = true
 		out = append(out, value)
 	}
+	if len(out) == 0 {
+		return []any{"pro", "prolite", "plus", "team", "free"}
+	}
+	return out
+}
+
+func codexEffectiveTierOrder(tierOrder []any) []any {
+	out := append([]any{}, normalizeCodexTierOrder(tierOrder)...)
+	seen := map[string]bool{}
+	for _, value := range out {
+		if tier, ok := value.(string); ok {
+			seen[tier] = true
+		}
+	}
+	for _, tier := range []string{"pro", "prolite", "plus", "team", "free", "other"} {
+		if !seen[tier] {
+			out = append(out, tier)
+			seen[tier] = true
+		}
+	}
 	return out
 }
 
@@ -5367,15 +5948,16 @@ func (h *Handler) codexCredentialReset(w http.ResponseWriter, r *http.Request) e
 		return err
 	}
 	if !updated {
-		return httpx.NotFound("Codex credential")
+		writeCodexCredentialNotFound(w, http.StatusNotFound, idParam)
+		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
 }
 
 func (h *Handler) codexCredentialUpdate(w http.ResponseWriter, r *http.Request) error {
-	var body map[string]any
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	body, err := decodeCodexCredentialUpdateBody(r)
+	if err != nil {
 		return err
 	}
 	idParam := chi.URLParam(r, "id")
@@ -5391,7 +5973,8 @@ func (h *Handler) codexCredentialUpdate(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 	if !updated {
-		return httpx.NotFound("Codex credential")
+		writeCodexCredentialNotFound(w, http.StatusNotFound, idParam)
+		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -5404,7 +5987,8 @@ func (h *Handler) codexCredentialDelete(w http.ResponseWriter, r *http.Request) 
 		return err
 	}
 	if len(removed) == 0 {
-		return httpx.NotFound("Codex credential")
+		writeCodexCredentialNotFound(w, http.StatusNotFound, idParam)
+		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -5465,7 +6049,8 @@ func (h *Handler) codexCredentialRefresh(w http.ResponseWriter, r *http.Request)
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return nil
 	}
-	return httpx.NotFound("Codex credential")
+	writeCodexCredentialNotFound(w, http.StatusBadRequest, idParam)
+	return nil
 }
 
 func (h *Handler) codexCredentialUsage(w http.ResponseWriter, r *http.Request) error {
@@ -5503,7 +6088,26 @@ func (h *Handler) codexCredentialUsage(w http.ResponseWriter, r *http.Request) e
 		httpx.WriteJSON(w, http.StatusOK, usage)
 		return nil
 	}
-	return httpx.NotFound("Codex credential")
+	writeCodexCredentialNotFound(w, http.StatusBadRequest, idParam)
+	return nil
+}
+
+func writeCodexCredentialNotFound(w http.ResponseWriter, status int, idParam string) {
+	httpx.WriteJSON(w, status, map[string]any{"error": fmt.Sprintf("Credential not found: %s", idParam)})
+}
+
+func decodeCodexCredentialUpdateBody(r *http.Request) (map[string]any, error) {
+	var body map[string]any
+	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+		var appErr *httpx.AppError
+		if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest || !strings.HasPrefix(appErr.Message, "invalid JSON:") {
+			return nil, err
+		}
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	return body, nil
 }
 
 func (h *Handler) updateCodexCredentialFlag(w http.ResponseWriter, idParam string, disabled bool) error {
@@ -5521,7 +6125,8 @@ func (h *Handler) updateCodexCredentialFlag(w http.ResponseWriter, idParam strin
 		return err
 	}
 	if !updated {
-		return httpx.NotFound("Codex credential")
+		writeCodexCredentialNotFound(w, http.StatusNotFound, idParam)
+		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -5978,8 +6583,13 @@ func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 			existing[key] = true
 		}
 	}
-	added, duplicates, skipped := 0, 0, 0
-	for _, cred := range codexImportCredentialsFromBody(body.Credentials, body.Text, body.ImportText) {
+	importCredentials := codexImportCredentialsFromBody(body.Credentials, body.Text, body.ImportText)
+	if len(importCredentials) == 0 {
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "No credentials provided"})
+		return nil
+	}
+	added, duplicates, skipped, validCandidates := 0, 0, 0, 0
+	for _, cred := range importCredentials {
 		entry := codexCredentialFromImport(cred, float64(len(entries)))
 		if entry == nil {
 			skipped++
@@ -5990,6 +6600,7 @@ func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 			skipped++
 			continue
 		}
+		validCandidates++
 		duplicate := false
 		for _, key := range keys {
 			if existing[key] {
@@ -6006,6 +6617,10 @@ func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 		}
 		entries = append(entries, entry)
 		added++
+	}
+	if validCandidates == 0 {
+		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "No valid credentials: each credential must have a non-empty refreshToken or accessToken"})
+		return nil
 	}
 	if added > 0 {
 		if err := saveCodexCredentials(entries); err != nil {
@@ -6992,7 +7607,56 @@ func loadCodexCredentials() ([]map[string]any, error) {
 	if err := json.Unmarshal(data, &entries); err != nil {
 		return []map[string]any{}, err
 	}
-	return entries, nil
+	return normalizeCodexCredentialEntries(entries), nil
+}
+
+func normalizeCodexCredentialEntries(entries []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		refreshToken := codexFirstString(stringMap(entry, "refreshToken", ""), stringMap(entry, "refresh_token", ""))
+		accessToken := codexFirstString(stringMap(entry, "accessToken", ""), stringMap(entry, "access_token", ""))
+		if refreshToken == "" && accessToken == "" {
+			continue
+		}
+		if refreshToken != "" {
+			entry["refreshToken"] = refreshToken
+		}
+		if accessToken != "" {
+			entry["accessToken"] = accessToken
+		}
+		if stringMap(entry, "id", "") == "" {
+			entry["id"] = id.Must(8)
+		}
+		if _, ok := entry["priority"]; !ok {
+			entry["priority"] = float64(len(out))
+		}
+		if _, ok := entry["disabled"]; !ok {
+			entry["disabled"] = false
+		}
+		keys := codexCredentialDedupeKeys(entry)
+		if len(keys) == 0 {
+			continue
+		}
+		duplicate := false
+		for _, key := range keys {
+			if seen[key] {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		for _, key := range keys {
+			seen[key] = true
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 func saveCodexCredentials(entries []map[string]any) error {
@@ -7336,6 +8000,7 @@ func newRuntimeCleanupResult(target string, dryRun bool) *runtimeCleanupResult {
 		DryRun:        dryRun,
 		Removed:       map[string][]string{},
 		RemovedCounts: map[string]int{},
+		Errors:        []runtimeCleanupError{},
 		Truncated:     map[string]bool{},
 		Supported:     map[string]bool{},
 		Fallback:      map[string]bool{},
@@ -8032,13 +8697,15 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	_, usageSummary, usageForecast, _ := buildCodexUsageArtifacts(entries)
 	usageCache := codexUsageCacheForEntries(pagedEntries)
 	usageScheduler := map[string]any{"scheduledCredentialCount": numericMapOr(usageSummary, "scheduledAccountCount", 0), "dueCredentialCount": 0, "started": false}
-	loadBalancingMode := h.codexSettingsValue("loadBalancingMode", "tier-balanced")
-	tierOrder, _ := h.codexSettingsValue("tierOrder", []any{}).([]any)
-	effectiveTierOrder := normalizeCodexTierOrder(tierOrder)
-	if len(effectiveTierOrder) == 0 {
-		effectiveTierOrder = []any{"pro", "prolite", "plus", "team", "free"}
+	loadBalancingMode := stringMap(map[string]any{"value": h.codexSettingsValue("loadBalancingMode", "tier-balanced")}, "value", "tier-balanced")
+	if loadBalancingMode != "priority" && loadBalancingMode != "balanced" && loadBalancingMode != "tier-balanced" {
+		loadBalancingMode = "tier-balanced"
 	}
-	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "proxy": h.codexSettingsValue("proxy", ""), "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
+	rawTierOrder, _ := h.codexSettingsValue("tierOrder", []any{}).([]any)
+	tierOrder := normalizeCodexTierOrder(rawTierOrder)
+	effectiveTierOrder := codexEffectiveTierOrder(tierOrder)
+	globalProxy := h.codexSettingsValue("proxy", "")
+	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "globalProxy": globalProxy, "proxy": globalProxy, "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
 	if lastBrowserAuthError != "" {
 		payload["lastBrowserAuthError"] = lastBrowserAuthError
 	}

@@ -165,7 +165,7 @@ func TestFinishRecordedToolCallLookupFallbackEventExposesReason(t *testing.T) {
 	hub, events := captureNarratorBroadcasts()
 	service := &Service{DB: sqlDB, Hub: hub}
 
-	err := service.finishRecordedToolCall(context.Background(), "nar-1", "tool-1", "msg-result", agentbasic.ToolRun{Output: "done"}, permissionDecision{}, "success")
+	err := service.finishRecordedToolCall(context.Background(), "nar-1", "tool-1", "msg-result", agentbasic.ToolRun{ID: "tool-1", Name: "Bash", Output: "done", Status: "completed"}, permissionDecision{}, "success")
 	if err == nil || !strings.Contains(err.Error(), "query recorded tool call") {
 		t.Fatalf("expected recorded tool call query error, got %v", err)
 	}
@@ -176,6 +176,51 @@ func TestFinishRecordedToolCallLookupFallbackEventExposesReason(t *testing.T) {
 	reason, _ := payload["reason"].(string)
 	if payload["fallback"] != true || payload["degraded"] != true || reason == "" || payload["error"] != reason || payload["message"] != reason {
 		t.Fatalf("permission_resolved fallback should expose reason/error/message, got %#v", payload)
+	}
+	completed := findBroadcast(events(), "nar-1", "tool_completed")
+	if completed == nil || completed["status"] != "success" || completed["output"] != "done" || completed["fallback"] != true {
+		t.Fatalf("fallback should still broadcast final tool_completed status, got %#v", events())
+	}
+}
+
+func TestFinishRecordedToolCallBroadcastsToolCompletedStatus(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, status, created_at) VALUES ('tc-1', 'nar-1', 'msg-1', 'tool-1', 'Bash', 'pending', 'now')`); err != nil {
+		t.Fatalf("insert tool call: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	err := service.finishRecordedToolCall(context.Background(), "nar-1", "tool-1", "msg-result", agentbasic.ToolRun{ID: "tool-1", Name: "Bash", Output: "done", Status: "completed"}, permissionDecision{Status: "approved"}, "success")
+	if err != nil {
+		t.Fatalf("finish recorded tool call: %v", err)
+	}
+	completed := findBroadcast(events(), "nar-1", "tool_completed")
+	if completed == nil || completed["toolUseId"] != "tool-1" || completed["toolName"] != "Bash" || completed["status"] != "success" || completed["output"] != "done" {
+		t.Fatalf("expected final tool_completed broadcast, got %#v", events())
+	}
+}
+
+func TestMessageByIDIncludesToolCallStatusForLiveBroadcast(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+	msg, err := service.addMessageWithBlocks(context.Background(), narratorID, "assistant", "", []map[string]any{{"type": "tool_use", "id": "tool-1", "name": "Bash", "input": map[string]any{"command": "true"}}}, nil)
+	if err != nil {
+		t.Fatalf("insert assistant message: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, output_json, status, created_at) VALUES ('tc-1', ?, ?, 'tool-1', 'Bash', '{"command":"true"}', '{"output":"done"}', 'success', 'now')`, narratorID, msg.ID); err != nil {
+		t.Fatalf("insert tool call: %v", err)
+	}
+
+	loaded, err := service.messageByID(context.Background(), narratorID, msg.ID)
+	if err != nil {
+		t.Fatalf("load message: %v", err)
+	}
+	if len(loaded.ToolCalls) != 1 || loaded.ToolCalls[0].ToolUseID != "tool-1" || loaded.ToolCalls[0].Status != "success" {
+		t.Fatalf("messageByID should include current tool call status, got %#v", loaded.ToolCalls)
 	}
 }
 

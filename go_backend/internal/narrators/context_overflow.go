@@ -44,6 +44,7 @@ func isContextOverflowAgentEvent(event agentbasic.AgentEvent) bool {
 func (s *Service) finishAgentRunContextOverflow(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
 	state.completed = true
 	state.errored = false
+	state.skipGoalContinuation = true
 	if s.Hub != nil {
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "context_length_exceeded", "narratorId": state.narratorID, "reason": event.Reason, "message": event.Message})
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "compacting", "narratorId": state.narratorID, "mode": "blocking"})

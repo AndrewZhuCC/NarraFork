@@ -135,6 +135,63 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	}
 }
 
+func TestBroadcastUserSendsOnlyToMatchingNarratorConnections(t *testing.T) {
+	h := NewHub()
+	serverConnCh := make(chan *websocket.Conn, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := h.upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		serverConnCh <- conn
+	}))
+	defer server.Close()
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	attach := func(userID string) *websocket.Conn {
+		wsClient, _, err := websocket.DefaultDialer.Dial(url, nil)
+		if err != nil {
+			t.Fatalf("dial websocket: %v", err)
+		}
+		var serverConn *websocket.Conn
+		select {
+		case serverConn = <-serverConnCh:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for server websocket")
+		}
+		c := &client{
+			conn:        serverConn,
+			kind:        "narrator",
+			userID:      userID,
+			viewer:      viewerInfo{UserID: userID, Username: userID},
+			subscribers: map[string]struct{}{},
+		}
+		h.add(c)
+		t.Cleanup(func() {
+			h.remove(c)
+			_ = wsClient.Close()
+		})
+		return wsClient
+	}
+	userOne := attach("user-1")
+	userTwo := attach("user-2")
+
+	h.BroadcastUser("user-1", map[string]any{
+		"type":     "user:recent_tabs_snapshot",
+		"tabs":     []any{},
+		"revision": int64(42),
+	})
+
+	msg := readWSMessage(t, userOne)
+	if msg["type"] != "user:recent_tabs_snapshot" || msg["revision"] != float64(42) {
+		t.Fatalf("unexpected user broadcast payload: %#v", msg)
+	}
+	_ = userTwo.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, _, err := userTwo.ReadMessage(); err == nil {
+		t.Fatal("broadcast for user-1 should not be delivered to user-2")
+	}
+}
+
 func TestFrontendUseTerminalWSContractSubscribeInputResizeAndFanout(t *testing.T) {
 	sqlDB := newTerminalTestDB(t)
 	insertTerminal(t, sqlDB, "term-frontend", "running", nil)

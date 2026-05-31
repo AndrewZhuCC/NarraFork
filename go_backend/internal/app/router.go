@@ -123,7 +123,7 @@ func NewRouter(s Services) http.Handler {
 		fsHandler := fs.NewHandler(s.Settings)
 		searchHandler := search.NewHandlerWithEngine(s.DB, s.DBEngine)
 		terminalHandler := terminals.NewHandler(s.DB, s.TerminalRuntime, s.Hub)
-		userPrefsHandler := userprefs.NewHandler(s.DB)
+		userPrefsHandler := userprefs.NewHandler(s.DB, s.Hub)
 		chapterEdgeHandler := chapteredges.NewHandler(s.DB)
 		explorationHandler := explorations.NewHandler(s.DB, s.Chapters)
 		favoriteHandler := favorites.NewHandler(s.DB)
@@ -163,7 +163,10 @@ func NewRouter(s Services) http.Handler {
 		api.Route("/api/routines", simpleHandler.RegisterRoutines)
 		api.Route("/api/skills", simpleHandler.RegisterSkills)
 		api.Route("/api/workspaces", miscHandler.RegisterWorkspaces)
-		api.Route("/api/hooks", miscHandler.RegisterHooks)
+		api.Route("/api/hooks", func(r chi.Router) {
+			r.Use(adminContextOnly)
+			miscHandler.RegisterHooks(r)
+		})
 		api.Route("/api/custom-subagents", miscHandler.RegisterCustomSubagents)
 		api.Route("/api/uploads", miscHandler.RegisterUploads)
 		api.Route("/api/storage", miscHandler.RegisterStorage)
@@ -204,6 +207,17 @@ func NewRouter(s Services) http.Handler {
 	})
 
 	return r
+}
+
+func adminContextOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := auth.UserFromContext(r.Context())
+		if claims == nil || claims.Role != "admin" {
+			httpx.WriteError(w, httpx.Forbidden("Admin access required"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func gitRequiredGuard(git *gitx.Service) func(http.Handler) http.Handler {
@@ -339,7 +353,7 @@ func phase4TerminalCapabilities(platform string, runtimeCaps map[string]any) map
 	return terminal
 }
 
-const disabledNarratorSessionCleanupReason = "Go database cleanup execution for narrator sessions is disabled until the Bun-equivalent safe narrator deletion plan, shared message ref handoff, child narrator handling, running terminal guard, and upload preservation semantics are implemented. Preview remains available."
+const disabledStaleNarratorSessionCleanupReason = "staleSessions cleanup is disabled by the archived-only deletion policy: explicitly archive narrators first, then run archivedSessions cleanup. Preview remains available."
 
 const shareEscapedHTMLPreviewReason = "Go public share preview escapes HTML and renders it in a preformatted block instead of using the TypeScript sanitize-html preview pipeline."
 
@@ -362,16 +376,17 @@ func storageDatabaseMaintenanceCapability() map[string]any {
 				"supported": true,
 			},
 			"archivedSessions": map[string]any{
-				"supported": false,
-				"fallback":  true,
-				"code":      "FEATURE_DISABLED",
-				"reason":    disabledNarratorSessionCleanupReason,
+				"supported":          true,
+				"fallback":           false,
+				"archivedOnly":       true,
+				"usesNarratorDelete": true,
+				"vacuumRan":          false,
 			},
 			"staleSessions": map[string]any{
 				"supported": false,
 				"fallback":  true,
 				"code":      "FEATURE_DISABLED",
-				"reason":    disabledNarratorSessionCleanupReason,
+				"reason":    disabledStaleNarratorSessionCleanupReason,
 			},
 		},
 	}
@@ -385,12 +400,14 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 		frontend["mode"] = "static"
 		frontend["directory"] = frontendDir
 	}
+	fsRevealSupported := platform == "windows" || platform == "macos"
 	fsReveal := map[string]any{
-		"supported": platform == "windows" || platform == "macos" || platform == "linux",
-		"fallback":  false,
+		"supported": fsRevealSupported,
+		"fallback":  !fsRevealSupported,
 	}
-	if platform == "linux" {
-		fsReveal["reason"] = "Opening the system file manager on Linux uses xdg-open in go_backend."
+	if !fsRevealSupported {
+		fsReveal["code"] = "FEATURE_DISABLED"
+		fsReveal["reason"] = "Opening file manager is not supported on this platform"
 	}
 	database := map[string]any{
 		"engine":           string(db.EngineSQLite),
@@ -474,6 +491,18 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 		},
 		"chapters": map[string]any{
 			"split": graph.SplitCapability(),
+			"batchMerge": map[string]any{
+				"supported":              true,
+				"fallback":               false,
+				"mode":                   "async-merge-session",
+				"routes":                 map[string]any{"start": true, "session": true},
+				"response":               map[string]any{"mergeSessionId": true, "targetChapterId": true, "createdTarget": true, "status": true},
+				"events":                 []string{"merge:started", "merge:step_ok", "merge:conflict", "merge:ai_resolving", "merge:completed", "merge:cancelled", "merge:error"},
+				"decisionWs":             true,
+				"staleSessionCleanup":    true,
+				"createdTargetRollback":  true,
+				"frontendCompletionMode": "progress-event-or-session-poll",
+			},
 			"containers": map[string]any{
 				"supported": true,
 				"routes": map[string]any{
@@ -540,6 +569,14 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"compactMarkers":    true,
 				"structuredContent": true,
 			},
+			"delete": map[string]any{
+				"supported":            true,
+				"fallback":             false,
+				"archivedOnly":         true,
+				"recursive":            true,
+				"sharedMessageHandoff": true,
+				"uploadPreservation":   true,
+			},
 			"permissions": map[string]any{
 				"supported":    true,
 				"modes":        []string{"readOnly", "default", "acceptEdits", "bypassPermissions", "dontAsk"},
@@ -551,8 +588,29 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"toolInventory": map[string]any{
 				"supported":                true,
 				"categories":               []string{"core", "optional", "review", "reflection", "mcp"},
-				"supportedOptionalTools":   []string{"Terminal", "Browser", "ShareFile"},
-				"unsupportedOptionalTools": []string{"Recall", "ForkNarrator", "NarraForkAdmin"},
+				"supportedOptionalTools":   []string{"Terminal", "Browser", "ShareFile", "Recall"},
+				"unsupportedOptionalTools": []string{"ForkNarrator", "NarraForkAdmin"},
+				"recall": map[string]any{
+					"supported":              true,
+					"readOnly":               true,
+					"scope":                  "self",
+					"crossNarrator":          false,
+					"searchMode":             "bounded-like",
+					"maxSearchLimit":         50,
+					"maxReadLimit":           50,
+					"maxBatchQueries":        10,
+					"maxToolCallOutputChars": 4000,
+				},
+				"read": map[string]any{
+					"supported":       true,
+					"parity":          "partial",
+					"textFiles":       true,
+					"directories":     true,
+					"offsetLimit":     true,
+					"pdfPages":        false,
+					"pagesSchemaOnly": true,
+					"imageContent":    false,
+				},
 				"webFetch": map[string]any{
 					"supported":        true,
 					"parity":           "partial",
@@ -560,9 +618,12 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					"defaultMode":      "raw",
 					"supportedModes":   []string{"raw"},
 					"unsupportedModes": []string{"readability", "dom", "smart", "screenshot"},
-					"protocols":        []string{"http", "https", "data"},
-					"policy":           "permission-policy-and-proxy-consumed",
-					"reason":           "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
+					"protocols":             []string{"http", "https", "data"},
+					"policy":                "permission-policy-and-proxy-consumed",
+					"rawRequiresChrome":     false,
+					"screenshotRequiresChrome": true,
+					"smartRequiresProvider": true,
+					"reason":                "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
 				},
 				"browser": map[string]any{
 					"supported":             true,
@@ -593,11 +654,22 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			},
 			"compact": map[string]any{
 				"supported":       true,
+				"markers":         true,
 				"segmentCompact":  true,
 				"contextClear":    true,
 				"fallbackSummary": true,
 				"fallbackReason":  "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs.",
 				"mode":            "deterministic-fallback-or-caller-summary",
+				"summaryGeneration": map[string]any{
+					"supported": false,
+					"kind":      "model",
+					"reason":    "Go backend does not generate model summaries without an external provider.",
+				},
+				"summaryFallback": map[string]any{
+					"supported":     true,
+					"mode":          "caller-summary-or-deterministic-ref-preview",
+					"deterministic": true,
+				},
 			},
 			"retryRecovery": map[string]any{
 				"supported":         true,
@@ -613,9 +685,11 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"foreground":                true,
 				"background":                true,
 				"awaitAgent":                true,
-				"awaitBash":                 false,
-				"awaitBashWaitForText":      false,
-				"awaitBashReason":           "Go Await currently supports agent/subagent background tasks only; Bash background tasks and wait_for_text are not implemented in go_backend.",
+				"awaitBash":                 true,
+				"awaitBashWaitForText":      true,
+				"supportedTypes":            []string{"agent", "bash"},
+				"narratorContextOnly":       true,
+				"awaitBashReason":           "Await type=bash and wait_for_text are supported in narrator context; non-narrator ExecuteTool does not support Bash run_in_background.",
 				"send":                      true,
 				"teamStatus":                true,
 				"detachAttach":              true,
@@ -916,7 +990,7 @@ func updateRuntimeCapability(canApplySelfUpdate bool) map[string]any {
 			"sse":       true,
 			"sha512":    true,
 			"maxBytes":  512 * 1024 * 1024,
-			"trustMode": "client-or-env-manifest-url",
+			"trustMode": "server-configured-trusted-source",
 		},
 		"apply": apply,
 	}
@@ -932,6 +1006,12 @@ func providerCapabilities() map[string]any {
 			payload[name] = true
 		}
 		return payload
+	}
+	mergeRouteCapabilities := func(base map[string]any, extra map[string]any) map[string]any {
+		for key, value := range extra {
+			base[key] = value
+		}
+		return base
 	}
 	agentRuntime := func(features ...string) map[string]any {
 		payload := map[string]any{"supported": true}
@@ -953,17 +1033,19 @@ func providerCapabilities() map[string]any {
 	}
 	return map[string]any{
 		"kiro": map[string]any{
-			"auth":      auth(true, "Credential import and credential management routes are implemented in go_backend compatibility mode."),
-			"models":    models(true),
+			"auth": auth(true, "Credential import and credential management routes are implemented in go_backend compatibility mode."),
+			"models": map[string]any{
+				"supported":        true,
+				"refreshSupported": false,
+				"reason":           "Kiro model refresh requires the TypeScript Kiro plugin bridge; go_backend reads cached per-credential model metadata only.",
+			},
 			"quota":     map[string]any{"supported": true, "fallback": false},
 			"agentMode": map[string]any{"supported": true, "fallback": false},
-			"routes": routes(
+			"routes": mergeRouteCapabilities(routes(
 				"status",
 				"models",
-				"modelsRefresh",
 				"mcpTools",
 				"mcpSearch",
-				"chat",
 				"globalProxy",
 				"loadBalancingMode",
 				"credentials",
@@ -976,7 +1058,13 @@ func providerCapabilities() map[string]any {
 				"credentialUsage",
 				"credentialUpdate",
 				"credentialDelete",
-			),
+			), map[string]any{
+				"modelsRefresh": false,
+				"chat":          false,
+				"chatCode":      "FEATURE_DISABLED",
+				"chatReason":    "Kiro chat streaming is not implemented in go_backend; use the narrator/provider agent routes or the TypeScript backend for Kiro chat streaming.",
+				"reason":        "Some Kiro routes are disabled in go_backend compatibility mode; model refresh and chat streaming require TypeScript Kiro runtimes.",
+			}),
 			"agentRuntime": agentRuntime(
 				"httpCompatible", "sse", "pluginBridge",
 			),

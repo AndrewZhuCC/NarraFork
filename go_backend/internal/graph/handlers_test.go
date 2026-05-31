@@ -104,7 +104,7 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	}
 	capabilities := body["capabilities"].(map[string]any)
 	split := capabilities["split"].(map[string]any)
-	if split["supported"] != true || split["fallback"] != false || split["mode"] != "go-basic-split" {
+	if split["supported"] != true || split["fallback"] != false || split["mode"] != "split-at-commit" {
 		t.Fatalf("split capability should expose supported core split, got %#v", split)
 	}
 	if split["routes"].(map[string]any)["splitAtCommit"] != true {
@@ -112,7 +112,7 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	}
 	partials := split["partials"].(map[string]any)
 	compressed := partials["compressedAISummary"].(map[string]any)
-	if compressed["supported"] != false || compressed["fallback"] != true || compressed["mode"] != "deterministic-summary-placeholder" || compressed["reason"] != CompressedAISummaryFallbackReason {
+	if compressed["supported"] != false || compressed["fallback"] != true || compressed["mode"] != "bounded-ref-copy-with-deterministic-context-note" || compressed["reason"] != CompressedAISummaryFallbackReason || compressed["deterministic"] != true || compressed["copiesMessageRefs"] != true || compressed["generatesModelSummary"] != false {
 		t.Fatalf("compressed split AI summary should be explicit fallback, got %#v", compressed)
 	}
 	containerAutostart := partials["containerAutostart"].(map[string]any)
@@ -300,6 +300,77 @@ func TestUpdatePositionsRejectsChaptersOutsideProject(t *testing.T) {
 	}
 	if axis != 1 || cross != 2 {
 		t.Fatalf("valid chapter should not be partially updated after validation failure, got axis=%v cross=%v", axis, cross)
+	}
+}
+
+func TestUpdatePositionsRejectsMissingOffsetsBeforeMutation(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, axis_offset, cross_offset, commit_count, panel_expanded, created_at, updated_at)
+		VALUES ('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', 1, 1, 2, 0, 0, 'now', 'now')`)
+	if err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+
+	body := serveGraphRaw(t, NewHandler(sqlDB), http.MethodPatch, "/p1/graph/positions", `{"positions":[{"chapterId":"c1","crossOffset":20}]}`)
+	if body.Code != http.StatusBadRequest || !strings.Contains(body.Body.String(), "axisOffset is required") {
+		t.Fatalf("PATCH should reject missing axisOffset, got status %d body %s", body.Code, body.Body.String())
+	}
+	body = serveGraphRaw(t, NewHandler(sqlDB), http.MethodPatch, "/p1/graph/positions", `{"positions":[{"chapterId":"c1","axisOffset":10,"crossOffset":-1}]}`)
+	if body.Code != http.StatusBadRequest || !strings.Contains(body.Body.String(), "crossOffset") {
+		t.Fatalf("PATCH should reject negative crossOffset, got status %d body %s", body.Code, body.Body.String())
+	}
+
+	var axis, cross float64
+	if err := sqlDB.QueryRow(`SELECT axis_offset, cross_offset FROM chapters WHERE id = 'c1'`).Scan(&axis, &cross); err != nil {
+		t.Fatalf("load c1 position: %v", err)
+	}
+	if axis != 1 || cross != 2 {
+		t.Fatalf("invalid positions should not mutate chapter, got axis=%v cross=%v", axis, cross)
+	}
+}
+
+func TestUpdatePositionsAcceptsRulerWidthHeightAliases(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, axis_offset, cross_offset, commit_count, panel_expanded, panel_width, panel_height, created_at, updated_at)
+		VALUES ('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', 1, 1, 2, 0, 0, 50, 60, 'now', 'now')`)
+	if err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+
+	body := serveGraphRaw(t, NewHandler(sqlDB), http.MethodPatch, "/p1/graph/positions", `{"positions":[{"chapterId":"c1","anchorCommitSha":"abc123","axisOffset":10,"crossOffset":20,"width":123,"height":456}]}`)
+	if body.Code != http.StatusOK {
+		t.Fatalf("PATCH should accept width/height aliases, got status %d body %s", body.Code, body.Body.String())
+	}
+
+	var anchor string
+	var axis, cross, width, height float64
+	if err := sqlDB.QueryRow(`SELECT anchor_commit_sha, axis_offset, cross_offset, panel_width, panel_height FROM chapters WHERE id = 'c1'`).Scan(&anchor, &axis, &cross, &width, &height); err != nil {
+		t.Fatalf("load updated position: %v", err)
+	}
+	if anchor != "abc123" || axis != 10 || cross != 20 || width != 123 || height != 456 {
+		t.Fatalf("position aliases not applied: anchor=%q axis=%v cross=%v width=%v height=%v", anchor, axis, cross, width, height)
+	}
+}
+
+func TestUpdatePositionsPanelWidthHeightTakePrecedenceOverAliases(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, axis_offset, cross_offset, commit_count, panel_expanded, panel_width, panel_height, created_at, updated_at)
+		VALUES ('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', 1, 1, 2, 0, 0, 50, 60, 'now', 'now')`)
+	if err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+
+	body := serveGraphRaw(t, NewHandler(sqlDB), http.MethodPatch, "/p1/graph/positions", `{"positions":[{"chapterId":"c1","axisOffset":10,"crossOffset":20,"panelWidth":321,"panelHeight":654,"width":123,"height":456}]}`)
+	if body.Code != http.StatusOK {
+		t.Fatalf("PATCH should accept explicit panel dimensions, got status %d body %s", body.Code, body.Body.String())
+	}
+
+	var width, height float64
+	if err := sqlDB.QueryRow(`SELECT panel_width, panel_height FROM chapters WHERE id = 'c1'`).Scan(&width, &height); err != nil {
+		t.Fatalf("load updated panel dimensions: %v", err)
+	}
+	if width != 321 || height != 654 {
+		t.Fatalf("panel dimensions should take precedence over aliases, got width=%v height=%v", width, height)
 	}
 }
 

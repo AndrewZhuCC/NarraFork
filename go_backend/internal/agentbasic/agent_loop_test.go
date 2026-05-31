@@ -4,17 +4,19 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
 
 type scriptedAdapter struct {
-	turns          [][]StreamEvent
-	chatErrors     []error
-	chatCalls      int
-	pushedUsers    int
-	pushedAssist   int
-	lastToolResult []any
+	turns           [][]StreamEvent
+	chatErrors      []error
+	chatCalls       int
+	pushedUsers     int
+	pushedAssist    int
+	lastToolResult  []any
+	lastUserContent string
 }
 
 func (a *scriptedAdapter) ProviderName() string                { return "fake" }
@@ -54,8 +56,9 @@ func (a *scriptedAdapter) FormatToolResult(toolUseID string, output string, isEr
 }
 func (a *scriptedAdapter) PushUserTurn(history *BuiltHistory, content string, toolResults []any) {
 	a.pushedUsers++
+	a.lastUserContent = content
 	a.lastToolResult = append([]any(nil), toolResults...)
-	history.History = append(history.History, map[string]any{"role": "user", "content": toolResults})
+	history.History = append(history.History, map[string]any{"role": "user", "content": toolResults, "text": content})
 }
 func (a *scriptedAdapter) PushAssistantTurn(history *BuiltHistory, text string, toolUses []ToolCall, rawContent any) {
 	a.pushedAssist++
@@ -156,12 +159,12 @@ func TestRunAgentLoopStreamsTextAndDone(t *testing.T) {
 	adapter := &scriptedAdapter{turns: [][]StreamEvent{{{Parsed: ParsedStreamEvent{Text: "hello"}}}}}
 	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithRetryBaseDelay(0)))
 	events := collectEvents(stream)
-	want := []string{"stream_text", "block_complete", "assistant_message", "done"}
+	want := []string{"api_request_start", "stream_text", "api_request_end", "block_complete", "assistant_message", "done"}
 	if got := eventTypes(events); !reflect.DeepEqual(got, want) {
 		t.Fatalf("event types = %#v, want %#v", got, want)
 	}
-	if events[1].Block == nil || events[1].Block.Type != "text" || events[1].Block.Text != "hello" {
-		t.Fatalf("unexpected text block: %#v", events[1].Block)
+	if events[3].Block == nil || events[3].Block.Type != "text" || events[3].Block.Text != "hello" {
+		t.Fatalf("unexpected text block: %#v", events[3].Block)
 	}
 }
 
@@ -192,6 +195,137 @@ func TestRunAgentLoopExecutesToolAndEmitsTurnComplete(t *testing.T) {
 	}
 	if events[len(events)-1].Type != "done" {
 		t.Fatalf("expected final done event, got %#v", events[len(events)-1])
+	}
+}
+
+func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
+	calls := []ToolCall{
+		newFunctionToolCall("tool-1", "Read", `{"file_path":"a"}`),
+		newFunctionToolCall("tool-2", "Read", `{"file_path":"b"}`),
+		newFunctionToolCall("tool-3", "Read", `{"file_path":"c"}`),
+		newFunctionToolCall("tool-4", "Read", `{"file_path":"d"}`),
+	}
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: calls}}},
+		{{Parsed: ParsedStreamEvent{Text: "final"}}},
+	}}
+	seenCount := 0
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tools"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "output " + call.ID, Status: "completed"}, nil
+			}),
+			WithSideCarCollector(0, func(ctx context.Context, request SideCarRequest) []AgentSideCar {
+				if request.Phase != "tool_result" {
+					return nil
+				}
+				seenCount = request.CompletedToolCount
+				if request.CompletedToolCount != 4 {
+					return nil
+				}
+				return []AgentSideCar{{Target: "tool_result", Source: "todo_reminder", Content: "todo detail", ToolUseID: request.ToolUseID}}
+			}, nil),
+		),
+	)
+	events := collectEvents(stream)
+	if seenCount != 4 {
+		t.Fatalf("expected sidecar collector at 4 completed tools, got %d", seenCount)
+	}
+	var sideCarEvent *AgentEvent
+	for i := range events {
+		if events[i].Type == "tool_result" && events[i].ToolUseID == "tool-4" {
+			sideCarEvent = &events[i]
+			break
+		}
+	}
+	if sideCarEvent == nil || len(sideCarEvent.SideCars) != 1 || sideCarEvent.SideCars[0].Source != "todo_reminder" {
+		t.Fatalf("expected tool_result sidecar event for fourth tool, events=%#v", events)
+	}
+	if len(adapter.lastToolResult) != 4 {
+		t.Fatalf("expected four pushed tool results, got %#v", adapter.lastToolResult)
+	}
+	fourth, _ := adapter.lastToolResult[3].(map[string]any)
+	content, _ := fourth["content"].(string)
+	if !strings.Contains(content, "output tool-4\n\n<side_car") || !strings.Contains(content, `source="todo_reminder"`) || !strings.Contains(content, "todo detail") {
+		t.Fatalf("expected fourth model tool result to include sidecar text, got %#v", fourth)
+	}
+}
+
+func TestRunAgentLoopInjectsSilentProgressSideCar(t *testing.T) {
+	calls := []ToolCall{
+		newFunctionToolCall("silent-1", "Read", `{"file_path":"a"}`),
+		newFunctionToolCall("silent-2", "Read", `{"file_path":"b"}`),
+	}
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: calls}}},
+		{{Parsed: ParsedStreamEvent{Text: "visible"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tools"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithSilentToolCallThreshold(2),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "output " + call.ID, Status: "completed"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	var sideCarEvent *AgentEvent
+	for i := range events {
+		if events[i].Type == "tool_result" && events[i].ToolUseID == "silent-2" {
+			sideCarEvent = &events[i]
+			break
+		}
+	}
+	if sideCarEvent == nil || len(sideCarEvent.SideCars) != 1 || sideCarEvent.SideCars[0].Source != "silent_progress" {
+		t.Fatalf("expected silent_progress sidecar on second tool result, events=%#v", events)
+	}
+	second, _ := adapter.lastToolResult[1].(map[string]any)
+	content, _ := second["content"].(string)
+	if !strings.Contains(content, `<side_car source="silent_progress">`) || !strings.Contains(content, "You have completed 2 tool call") {
+		t.Fatalf("expected model tool result to include silent progress sidecar, got %#v", second)
+	}
+}
+
+func TestRunAgentLoopCollectsAfterToolsUserSideCars(t *testing.T) {
+	call := newFunctionToolCall("tool-after", "Read", `{"file_path":"a"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "final"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tool"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "ok", Status: "completed"}, nil
+			}),
+			WithSideCarCollector(0, func(ctx context.Context, request SideCarRequest) []AgentSideCar {
+				if request.Phase != "after_tools" {
+					return nil
+				}
+				return []AgentSideCar{{Target: "user_message", Source: "team_message", Content: "team ping"}}
+			}, nil),
+		),
+	)
+	events := collectEvents(stream)
+	if eventTypeCount(events, "sidecars") != 1 {
+		t.Fatalf("expected sidecars event, got %v", eventTypes(events))
+	}
+	if !strings.Contains(adapter.lastUserContent, `<side_car source="team_message">`) || !strings.Contains(adapter.lastUserContent, "team ping") {
+		t.Fatalf("expected after-tools sidecar text in next user turn, got %q", adapter.lastUserContent)
 	}
 }
 

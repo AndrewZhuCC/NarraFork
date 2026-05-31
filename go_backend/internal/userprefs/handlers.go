@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -18,9 +19,22 @@ import (
 	"narrafork-go/internal/jsondb"
 )
 
-type Handler struct{ DB *sql.DB }
+type UserBroadcaster interface {
+	BroadcastUser(userID string, payload any)
+}
 
-func NewHandler(sqlDB *sql.DB) *Handler { return &Handler{DB: sqlDB} }
+type Handler struct {
+	DB          *sql.DB
+	Broadcaster UserBroadcaster
+}
+
+func NewHandler(sqlDB *sql.DB, broadcasters ...UserBroadcaster) *Handler {
+	var broadcaster UserBroadcaster
+	if len(broadcasters) > 0 {
+		broadcaster = broadcasters[0]
+	}
+	return &Handler{DB: sqlDB, Broadcaster: broadcaster}
+}
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/", httpx.Handler(h.get))
@@ -139,8 +153,12 @@ func (h *Handler) upsertRecentTab(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	var tab map[string]any
-	if err := httpx.DecodeLooseJSON(r, &tab); err != nil {
+	var rawTab map[string]any
+	if err := httpx.DecodeLooseJSON(r, &rawTab); err != nil {
+		return err
+	}
+	tab, updateOnly, err := validateUpsertRecentTab(rawTab)
+	if err != nil {
 		return err
 	}
 	tabs, err := h.recentTabs(r, userID)
@@ -149,19 +167,17 @@ func (h *Handler) upsertRecentTab(w http.ResponseWriter, r *http.Request) error 
 	}
 	key := tabKey(tab)
 	idx := indexByKey(tabs, key)
-	updateOnly, _ := tab["updateOnly"].(bool)
-	delete(tab, "updateOnly")
 	if idx >= 0 {
 		tabs = append(tabs[:idx], tabs[idx+1:]...)
 	} else if updateOnly {
-		httpx.WriteJSON(w, http.StatusOK, tabs)
+		h.writeRecentTabs(w, http.StatusOK, userID, tabs)
 		return nil
 	}
 	tabs = append([]map[string]any{tab}, tabs...)
 	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, tabs)
+	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -184,7 +200,7 @@ func (h *Handler) removeRecentTab(w http.ResponseWriter, r *http.Request) error 
 	if err := h.saveRecentTabs(r, userID, filtered); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, filtered)
+	h.writeRecentTabs(w, http.StatusOK, userID, filtered)
 	return nil
 }
 
@@ -218,7 +234,7 @@ func (h *Handler) moveRecentTab(w http.ResponseWriter, r *http.Request) error {
 	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, tabs)
+	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -244,7 +260,7 @@ func (h *Handler) pinRecentTab(w http.ResponseWriter, r *http.Request) error {
 	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, tabs)
+	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -269,7 +285,7 @@ func (h *Handler) clearRecentTabs(w http.ResponseWriter, r *http.Request) error 
 	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, tabs)
+	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -292,7 +308,7 @@ func (h *Handler) saveGraphViewport(w http.ResponseWriter, r *http.Request) erro
 	if err != nil {
 		return err
 	}
-	viewports, _ := pref["graphViewports"].(map[string]any)
+	viewports := decodeObject(pref["graphViewports"])
 	if viewports == nil {
 		viewports = map[string]any{}
 	}
@@ -353,7 +369,6 @@ func (h *Handler) loadRaw(r *http.Request, userID string) (map[string]any, error
 	}
 	out["recentTabs"] = decodeArray(out["recentTabs"])
 	out["commands"] = decodeArray(out["commands"])
-	out["graphViewports"] = decodeObject(out["graphViewports"])
 	out["gatewayConfig"] = decodeObject(out["gatewayConfig"])
 	return out, nil
 }
@@ -373,6 +388,78 @@ var preferenceWebhookFields = map[string]bool{
 var commandNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 var gatewayPlatformSecretFields = []string{"token", "botToken", "appToken", "appSecret", "secret", "clientSecret"}
+
+func validateUpsertRecentTab(tab map[string]any) (map[string]any, bool, error) {
+	clean := map[string]any{}
+	tabType, err := requiredStringField(tab, "type", "recentTab", 1, 50)
+	if err != nil {
+		return nil, false, err
+	}
+	switch tabType {
+	case "chapter", "narrator", "project", "workspace", "subagent":
+		clean["type"] = tabType
+	default:
+		return nil, false, httpx.ValidationError("recentTab.type is not supported")
+	}
+	idValue, err := requiredStringField(tab, "id", "recentTab", 1, 50)
+	if err != nil {
+		return nil, false, err
+	}
+	clean["id"] = idValue
+	if err := optionalStringField(tab, "narratorId", "recentTab", 1, 50); err != nil {
+		return nil, false, err
+	}
+	if value, ok := tab["narratorId"]; ok {
+		clean["narratorId"] = value
+	}
+	if err := optionalStringField(tab, "parentNarratorId", "recentTab", 1, 50); err != nil {
+		return nil, false, err
+	}
+	if value, ok := tab["parentNarratorId"]; ok {
+		clean["parentNarratorId"] = value
+	}
+	if value, ok := tab["workspaceId"]; ok {
+		if value != nil {
+			if err := optionalStringField(tab, "workspaceId", "recentTab", 1, 50); err != nil {
+				return nil, false, err
+			}
+		}
+		clean["workspaceId"] = value
+	}
+	title, err := requiredStringField(tab, "title", "recentTab", 0, 200)
+	if err != nil {
+		return nil, false, err
+	}
+	clean["title"] = title
+	if err := optionalStringField(tab, "subtitle", "recentTab", 0, 200); err != nil {
+		return nil, false, err
+	}
+	if value, ok := tab["subtitle"]; ok {
+		clean["subtitle"] = value
+	}
+	if err := optionalStringField(tab, "status", "recentTab", 0, 50); err != nil {
+		return nil, false, err
+	}
+	if value, ok := tab["status"]; ok {
+		clean["status"] = value
+	}
+	lastVisitedAt, ok := tab["lastVisitedAt"].(float64)
+	if !ok {
+		return nil, false, httpx.ValidationError("recentTab.lastVisitedAt must be a number")
+	}
+	clean["lastVisitedAt"] = lastVisitedAt
+	if err := optionalBoolField(tab, "pinned", "recentTab"); err != nil {
+		return nil, false, err
+	}
+	if value, ok := tab["pinned"]; ok {
+		clean["pinned"] = value
+	}
+	if err := optionalBoolField(tab, "updateOnly", "recentTab"); err != nil {
+		return nil, false, err
+	}
+	updateOnly, _ := tab["updateOnly"].(bool)
+	return clean, updateOnly, nil
+}
 
 func validatePreferencePatch(patch map[string]any) error {
 	for key, value := range patch {
@@ -994,6 +1081,22 @@ func (h *Handler) saveRecentTabs(r *http.Request, userID string, tabs []map[stri
 	data, _ := json.Marshal(tabs)
 	_, err := h.DB.ExecContext(r.Context(), `UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, string(data), db.NowISO(), userID)
 	return err
+}
+
+func (h *Handler) writeRecentTabs(w http.ResponseWriter, status int, userID string, tabs []map[string]any) {
+	h.broadcastRecentTabsSnapshot(userID, tabs)
+	httpx.WriteJSON(w, status, tabs)
+}
+
+func (h *Handler) broadcastRecentTabsSnapshot(userID string, tabs []map[string]any) {
+	if h == nil || h.Broadcaster == nil || strings.TrimSpace(userID) == "" {
+		return
+	}
+	h.Broadcaster.BroadcastUser(userID, map[string]any{
+		"type":     "user:recent_tabs_snapshot",
+		"tabs":     tabs,
+		"revision": time.Now().UnixMilli(),
+	})
 }
 
 func currentUserID(r *http.Request) (string, error) {

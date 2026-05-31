@@ -35,6 +35,54 @@ func TestBrowserSessionPersistenceIsDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestBrowserSessionObserverBroadcastsWithoutPersistence(t *testing.T) {
+	mainDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open main sqlite: %v", err)
+	}
+	mainDB.SetMaxOpenConns(1)
+	if err := createNarratorTestSchema(mainDB); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _ = mainDB.Close() })
+
+	hub := ws.NewHub()
+	broadcasts := []map[string]any{}
+	hub.SetNarratorBroadcastHook(func(narratorID string, payload any, data []byte) {
+		if narratorID != "nar_browser" {
+			return
+		}
+		if mapped, ok := payload.(map[string]any); ok {
+			broadcasts = append(broadcasts, mapped)
+		}
+	})
+	service := NewService(mainDB, hub, nil)
+	service.BrowserSessionEvent(context.Background(), agentbasic.BrowserSessionEvent{
+		Type: "created",
+		Snapshot: agentbasic.BrowserSessionSnapshot{
+			ID:           "browser-1",
+			NarratorID:   "nar_browser",
+			Status:       "active",
+			URL:          "https://example.test",
+			Title:        "Example",
+			CreatedAt:    time.Now().UTC(),
+			UpdatedAt:    time.Now().UTC(),
+			LastActivity: time.Now().UTC(),
+			TtlMs:        60000,
+		},
+	})
+
+	if ok, err := tableExistsOn(context.Background(), mainDB, "narrator_browser_sessions"); err != nil || ok {
+		t.Fatalf("default-off browser observer should not create shared table: ok=%v err=%v", ok, err)
+	}
+	if len(broadcasts) < 2 {
+		t.Fatalf("expected count and lifecycle broadcasts without persistence, got %#v", broadcasts)
+	}
+	if broadcasts[0]["type"] != "browser_session_count" || broadcasts[1]["type"] != "browser_session_created" {
+		t.Fatalf("unexpected broadcasts without persistence: %#v", broadcasts)
+	}
+}
+
 func newBrowserSessionTestService(t *testing.T) (*Service, *sql.DB, *sql.DB) {
 	t.Helper()
 	mainDB, err := sql.Open("sqlite", ":memory:")

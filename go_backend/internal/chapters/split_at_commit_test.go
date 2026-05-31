@@ -164,6 +164,85 @@ func TestSplitAtCommitWarnsAndUsesEmptyContextWhenNoCommitMessageAssociation(t *
 	}
 }
 
+func TestSplitAtCommitCompressedInheritReportsSafeSummaryFallback(t *testing.T) {
+	ctx := context.Background()
+	repo, baseSHA, splitSHA, headSHA := newSplitRepo(t)
+	sqlDB := newForkParityDB(t)
+	insertSplitFixture(t, sqlDB, repo, baseSHA, splitSHA, headSHA)
+	service := &Service{DB: sqlDB, Git: gitx.NewService()}
+
+	result, err := service.SplitAtCommit(ctx, "source", SplitInput{
+		CommitSHA: splitSHA,
+		NewFork:   SplitNewForkInput{Title: "Compressed route", InheritMode: "compressed"},
+	})
+	if err != nil {
+		t.Fatalf("SplitAtCommit: %v", err)
+	}
+
+	fallback, ok := fallbackByFeature(result.Fallbacks, "compressedContext")
+	if !ok {
+		t.Fatalf("expected compressedContext fallback, got %#v", result.Fallbacks)
+	}
+	if !fallback.Fallback || fallback.Supported || !strings.Contains(fallback.Message, "AI context summary") {
+		t.Fatalf("compressed fallback must be explicit and unsupported, got %#v", fallback)
+	}
+	if !containsWarning(result.Warnings, "does not generate an AI context summary") {
+		t.Fatalf("expected compressed summary warning, got %#v", result.Warnings)
+	}
+	if !containsFallback(result.NewForkChapter.Fallbacks, "compressedContext") {
+		t.Fatalf("new fork chapter response lost compressed fallback: %#v", result.NewForkChapter.Fallbacks)
+	}
+	if !containsWarning(result.PrefixChapter.Warnings, "does not generate an AI context summary") {
+		t.Fatalf("prefix chapter response lost compressed warning: %#v", result.PrefixChapter.Warnings)
+	}
+
+	prefixNarrator := primaryNarratorID(t, sqlDB, result.PrefixChapter.ID)
+	newForkNarrator := primaryNarratorID(t, sqlDB, result.NewForkChapter.ID)
+	if got := refMessageIDs(t, sqlDB, prefixNarrator); strings.Join(got, ",") != "m_before,m_equal" {
+		t.Fatalf("compressed prefix refs = %#v, want cutoff refs", got)
+	}
+	if got := refMessageIDs(t, sqlDB, newForkNarrator); strings.Join(got, ",") != "m_before,m_equal" {
+		t.Fatalf("compressed new fork refs = %#v, want bounded prefix refs", got)
+	}
+
+	var inheritMode string
+	var parentNarratorID, forkMessageID, contextSummary sql.NullString
+	var messageCount int
+	row := sqlDB.QueryRow(
+		`SELECT inherit_mode, parent_narrator_id, fork_message_id, context_summary, message_count FROM narrators WHERE id = ?`,
+		newForkNarrator,
+	)
+	if err := row.Scan(&inheritMode, &parentNarratorID, &forkMessageID, &contextSummary, &messageCount); err != nil {
+		t.Fatalf("query compressed new fork narrator: %v", err)
+	}
+	if inheritMode != "compressed" {
+		t.Fatalf("new fork inherit_mode = %s, want compressed", inheritMode)
+	}
+	if !parentNarratorID.Valid || parentNarratorID.String != prefixNarrator {
+		t.Fatalf("new fork parent narrator = %#v, want prefix narrator %s", parentNarratorID, prefixNarrator)
+	}
+	if !forkMessageID.Valid || forkMessageID.String != "m_equal" {
+		t.Fatalf("new fork fork_message_id = %#v, want split cutoff message", forkMessageID)
+	}
+	if messageCount != 2 {
+		t.Fatalf("compressed new fork message_count = %d, want 2", messageCount)
+	}
+	hasSummaryCount := contextSummary.Valid && strings.Contains(contextSummary.String, "copied 2 prefix message reference(s)")
+	hasSummaryReason := contextSummary.Valid && strings.Contains(contextSummary.String, "instead of generating an AI context summary")
+	if !hasSummaryCount || !hasSummaryReason {
+		t.Fatalf("compressed fallback summary missing quality markers: %#v", contextSummary)
+	}
+
+	forkPoint := chapterForkPoint(t, sqlDB, result.NewForkChapter.ID)
+	if !metadataContainsFallback(forkPoint, "compressedContext") {
+		t.Fatalf("new fork fork_point lost compressed fallback metadata: %s", forkPoint)
+	}
+	edgeMetadata := forkEdgeMetadata(t, sqlDB, result.PrefixChapter.ID, result.NewForkChapter.ID)
+	if !metadataContainsFallback(edgeMetadata, "compressedContext") {
+		t.Fatalf("new fork edge lost compressed fallback metadata: %s", edgeMetadata)
+	}
+}
+
 func TestSplitAtCommitAutoStartsNewForkContainers(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake podman script uses POSIX sh")
@@ -270,6 +349,35 @@ func TestSplitRouteReturnsFullSplitResult(t *testing.T) {
 	}
 	if result.PrefixChapter.ID == "" || result.ContinuationChapter.ID != "source" || result.NewForkChapter.ID == "" {
 		t.Fatalf("route did not return full split result: %#v", result)
+	}
+	if result.CommitSHA != splitSHA {
+		t.Fatalf("route commitSha = %s, want %s", result.CommitSHA, splitSHA)
+	}
+	prefix := result.PrefixChapter
+	prefixStartsAtSplit := prefix.StartCommitSHA != nil && *prefix.StartCommitSHA == splitSHA
+	prefixHeadsAtSplit := prefix.HeadCommitSHA != nil && *prefix.HeadCommitSHA == splitSHA
+	if prefix.Status != "frozen" || !prefixStartsAtSplit || !prefixHeadsAtSplit {
+		t.Fatalf("route prefix chapter does not describe the historical prefix: %#v", prefix)
+	}
+	continuation := result.ContinuationChapter
+	continuationParent := continuation.ParentChapterID != nil && *continuation.ParentChapterID == prefix.ID
+	continuationStartsAtSplit := continuation.StartCommitSHA != nil && *continuation.StartCommitSHA == splitSHA
+	continuationKeepsHead := continuation.HeadCommitSHA != nil && *continuation.HeadCommitSHA == headSHA
+	if !continuationParent || !continuationStartsAtSplit || !continuationKeepsHead {
+		t.Fatalf("route continuation chapter does not describe the post-split continuation: %#v", continuation)
+	}
+	newFork := result.NewForkChapter
+	newForkParent := newFork.ParentChapterID != nil && *newFork.ParentChapterID == prefix.ID
+	newForkStartsAtSplit := newFork.StartCommitSHA != nil && *newFork.StartCommitSHA == splitSHA
+	newForkHeadsAtSplit := newFork.HeadCommitSHA != nil && *newFork.HeadCommitSHA == splitSHA
+	if !newForkParent || !newForkStartsAtSplit || !newForkHeadsAtSplit {
+		t.Fatalf("route new fork chapter does not start from the split commit: %#v", newFork)
+	}
+	if result.NewForkChapter.WorktreePath == nil || !pathExists(*result.NewForkChapter.WorktreePath) {
+		t.Fatalf("route new fork worktree missing: %#v", result.NewForkChapter.WorktreePath)
+	}
+	if len(result.Warnings) != 0 || len(result.Fallbacks) != 0 {
+		t.Fatalf("fresh route split should be warning-free, warnings=%#v fallbacks=%#v", result.Warnings, result.Fallbacks)
 	}
 	if got := refMessageIDs(t, sqlDB, primaryNarratorID(t, sqlDB, result.NewForkChapter.ID)); len(got) != 0 {
 		t.Fatalf("fresh route split should not copy new fork refs, got %#v", got)
@@ -422,8 +530,66 @@ func containsWarning(warnings []string, needle string) bool {
 }
 
 func containsFallback(fallbacks []ForkFallback, feature string) bool {
+	_, ok := fallbackByFeature(fallbacks, feature)
+	return ok
+}
+
+func fallbackByFeature(fallbacks []ForkFallback, feature string) (ForkFallback, bool) {
 	for _, fallback := range fallbacks {
 		if fallback.Feature == feature && fallback.Fallback {
+			return fallback, true
+		}
+	}
+	return ForkFallback{}, false
+}
+
+func chapterForkPoint(t *testing.T, sqlDB *sql.DB, chapterID string) string {
+	t.Helper()
+	var forkPoint sql.NullString
+	row := sqlDB.QueryRow(`SELECT fork_point FROM chapters WHERE id = ?`, chapterID)
+	if err := row.Scan(&forkPoint); err != nil {
+		t.Fatalf("fork_point for %s: %v", chapterID, err)
+	}
+	if !forkPoint.Valid {
+		return ""
+	}
+	return forkPoint.String
+}
+
+func forkEdgeMetadata(t *testing.T, sqlDB *sql.DB, sourceID, targetID string) string {
+	t.Helper()
+	var metadata sql.NullString
+	row := sqlDB.QueryRow(
+		`SELECT metadata FROM chapter_edges WHERE source_id = ? AND target_id = ? AND type = 'fork' LIMIT 1`,
+		sourceID,
+		targetID,
+	)
+	if err := row.Scan(&metadata); err != nil {
+		t.Fatalf("fork edge metadata %s->%s: %v", sourceID, targetID, err)
+	}
+	if !metadata.Valid {
+		return ""
+	}
+	return metadata.String
+}
+
+func metadataContainsFallback(raw string, feature string) bool {
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return false
+	}
+	fallbacks, ok := decoded["fallbacks"].([]any)
+	if !ok {
+		return false
+	}
+	for _, fallback := range fallbacks {
+		entry, ok := fallback.(map[string]any)
+		if !ok {
+			continue
+		}
+		featureValue, _ := entry["feature"].(string)
+		fallbackValue, _ := entry["fallback"].(bool)
+		if featureValue == feature && fallbackValue {
 			return true
 		}
 	}

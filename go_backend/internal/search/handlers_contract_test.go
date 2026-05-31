@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -82,6 +83,10 @@ func TestSearchShortQueriesUseLikeWithoutDegradedMetadata(t *testing.T) {
 	if metadata["degraded"] != false || metadata["ftsReady"] != nil || metadata["shortQuery"] != true || metadata["mode"] != "like-short-query" {
 		t.Fatalf("short LIKE search should not report degraded FTS or claim FTS readiness, got %#v", metadata)
 	}
+	fallbacks, _ := metadata["fallbacks"].([]any)
+	if len(fallbacks) != 0 {
+		t.Fatalf("short LIKE search should not emit fallback diagnostics, got %#v", fallbacks)
+	}
 }
 
 func TestSearchUsesFTSWhenTablesAreReady(t *testing.T) {
@@ -117,6 +122,100 @@ func TestSearchUsesFTSWhenTablesAreReady(t *testing.T) {
 	if len(results) != 3 {
 		t.Fatalf("expected FTS results for all entities, got %#v", body["results"])
 	}
+	for _, raw := range results {
+		result, _ := raw.(map[string]any)
+		if score, ok := result["matchScore"].(float64); !ok || score <= 0 {
+			t.Fatalf("FTS result should expose positive TS-style rank score, got %#v", result)
+		}
+		if snippet, ok := result["snippet"].(string); !ok || snippet == "" {
+			t.Fatalf("FTS result should expose a non-empty TS-style snippet, got %#v", result)
+		}
+	}
+}
+
+func TestSearchFTSSupportsCJKTrigramSubstrings(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	createSearchContractFTS(t, sqlDB)
+	insertSearchContractFixtures(t, sqlDB)
+	insertSearchContractCJKFixtures(t, sqlDB)
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=%E5%8F%99%E4%BA%8B%E5%88%86%E5%8F%89&entities=chapters,messages,narrators", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	metadata, _ := body["searchMetadata"].(map[string]any)
+	if metadata["degraded"] != false || metadata["ftsReady"] != true || metadata["shortQuery"] != false {
+		t.Fatalf("expected ready non-degraded CJK FTS metadata, got %#v", metadata)
+	}
+	results, _ := body["results"].([]any)
+	seen := map[string]bool{}
+	for _, raw := range results {
+		result, _ := raw.(map[string]any)
+		resultType := result["type"].(string)
+		seen[resultType] = true
+		if snippet, ok := result["snippet"].(string); !ok || snippet == "" {
+			t.Fatalf("CJK trigram result should expose a non-empty snippet, got %#v", result)
+		}
+		switch resultType {
+		case "chapter", "narrator":
+			title, _ := result["title"].(string)
+			if !strings.Contains(title, "叙事分叉") {
+				t.Fatalf("CJK trigram result should match title text, got %#v", result)
+			}
+		case "message":
+			snippet, _ := result["snippet"].(string)
+			if !strings.Contains(snippet, "叙事分叉") {
+				t.Fatalf("CJK trigram message should expose matching snippet, got %#v", result)
+			}
+		}
+	}
+	for _, entityType := range []string{"chapter", "message", "narrator"} {
+		if !seen[entityType] {
+			t.Fatalf("expected CJK FTS results to include %s, got %#v", entityType, results)
+		}
+	}
+}
+
+func TestSearchLikeChapterSnippetMatchesTypeScriptFallback(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	insertSearchContractFixtures(t, sqlDB)
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c_desc', 'p1', 'Plain Title', 'Needle description body', 'active', 'branch', '2026-05-14T00:00:00Z', '2026-05-15T00:00:00Z')`); err != nil {
+		t.Fatalf("insert description-only chapter: %v", err)
+	}
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=Needle&entities=chapters", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	results, _ := body["results"].([]any)
+	if len(results) != 1 {
+		t.Fatalf("expected one LIKE fallback chapter result, got %#v", results)
+	}
+	result := results[0].(map[string]any)
+	if result["id"] != "c_desc" || result["matchField"] != "description" || result["snippet"] != "Needle description body" {
+		t.Fatalf("LIKE fallback chapter snippet should match TS substr(description,title) contract, got %#v", result)
+	}
 }
 
 func TestSearchSanitizesSpecialCharactersWithoutFailing(t *testing.T) {
@@ -142,6 +241,38 @@ func TestSearchSanitizesSpecialCharactersWithoutFailing(t *testing.T) {
 	metadata, _ := body["searchMetadata"].(map[string]any)
 	if metadata["mode"] == "" {
 		t.Fatalf("expected machine-readable search mode, got %#v", metadata)
+	}
+}
+
+func TestSearchIgnoresInvalidEntitiesAndReturnsEmptyResultSet(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	insertSearchContractFixtures(t, sqlDB)
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=Alpha&entities=projects,unknown", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	results := body["results"].([]any)
+	projects := body["projects"].([]any)
+	if len(results) != 0 || len(projects) != 0 {
+		t.Fatalf("invalid entities should match TS empty-result behavior, got %#v", body)
+	}
+	metadata := body["searchMetadata"].(map[string]any)
+	requested := metadata["requestedEntities"].([]any)
+	if len(requested) != 0 || metadata["degraded"] != false {
+		t.Fatalf("invalid entities should not create requested entities or degraded metadata, got %#v", metadata)
 	}
 }
 
@@ -193,6 +324,21 @@ func insertSearchContractFixtures(t *testing.T, sqlDB *sql.DB) {
 		`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c1', 'p1', 'Alpha Chapter', 'demo chapter', 'active', 'branch', '2026-05-14T00:00:00Z', '2026-05-14T00:00:00Z')`,
 		`INSERT INTO narrators (id, chapter_id, title, status, model, last_message_at, created_at, updated_at) VALUES ('n1', 'c1', 'Alpha Narrator', 'idle', 'openai:gpt-4o-mini', '2026-05-14T00:00:00Z', '2026-05-14T00:00:00Z', '2026-05-14T00:00:00Z')`,
 		`INSERT INTO narrator_messages (id, narrator_id, content_text, role, created_at) VALUES ('m1', 'n1', 'Alpha message body', 'user', '2026-05-14T00:00:00Z')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("exec %s: %v", stmt, err)
+		}
+	}
+}
+
+func insertSearchContractCJKFixtures(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	stmts := []string{
+		`INSERT INTO projects (id, name, description) VALUES ('p_cjk', '中文项目', 'demo')`,
+		`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c_cjk', 'p_cjk', '叙事分叉章节', '中文检索正文', 'active', 'branch', '2026-05-14T00:00:00Z', '2026-05-16T00:00:00Z')`,
+		`INSERT INTO narrators (id, chapter_id, title, status, model, last_message_at, created_at, updated_at) VALUES ('n_cjk', 'c_cjk', '叙事分叉叙述者', 'idle', 'openai:gpt-4o-mini', '2026-05-16T00:00:00Z', '2026-05-14T00:00:00Z', '2026-05-16T00:00:00Z')`,
+		`INSERT INTO narrator_messages (id, narrator_id, content_text, role, created_at) VALUES ('m_cjk', 'n_cjk', '这是一条叙事分叉消息', 'assistant', '2026-05-16T00:00:00Z')`,
 	}
 	for _, stmt := range stmts {
 		if _, err := sqlDB.Exec(stmt); err != nil {

@@ -205,6 +205,21 @@ func (s *Service) SetMergeProgressBroadcaster(broadcast func(payload any)) {
 	s.BroadcastMergeProgress = broadcast
 }
 
+func (s *Service) CleanupStaleMergeSessions(ctx context.Context) (int64, error) {
+	if s == nil || s.DB == nil {
+		return 0, nil
+	}
+	result, err := s.DB.ExecContext(ctx, `UPDATE merge_sessions SET status = 'error', error = 'Server restarted during merge', updated_at = ? WHERE status IN ('running', 'ai_resolving', 'waiting_decision')`, db.NowISO())
+	if err != nil {
+		return 0, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, nil
+	}
+	return rows, nil
+}
+
 func (s *Service) CreateRootChapter(ctx context.Context, input RootInput) (Chapter, error) {
 	now := db.NowISO()
 	chapterID := id.New()
@@ -990,15 +1005,16 @@ func (s *Service) BatchMerge(ctx context.Context, input BatchMergeInput) (BatchM
 	s.broadcastMergeProgress(map[string]any{
 		"type":             "merge:started",
 		"mergeSessionId":   mergeSessionID,
+		"projectId":        base.ProjectID,
 		"targetChapterId":  targetID,
 		"sourceChapterIds": sourceIDs,
 	})
-	go s.processBatchMergeQueue(mergeSessionID, targetID, sourceIDs, strategy, createdTarget, input.Locale, input.UserID)
+	go s.processBatchMergeQueue(mergeSessionID, base.ProjectID, targetID, sourceIDs, strategy, createdTarget, input.Locale, input.UserID)
 
 	return BatchMergeResult{MergeSessionID: mergeSessionID, TargetChapterID: targetID, CreatedTarget: createdTarget, Status: "running"}, nil
 }
 
-func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, sourceIDs []string, strategy string, createdTarget bool, locale, userID string) {
+func (s *Service) processBatchMergeQueue(mergeSessionID, projectID, targetID string, sourceIDs []string, strategy string, createdTarget bool, locale, userID string) {
 	ctx := context.Background()
 	total := len(sourceIDs)
 	mergedCount := 0
@@ -1011,13 +1027,13 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 			"current_source_chapter_id": sourceID,
 			"error":                     nil,
 		}); err != nil {
-			s.failBatchMerge(ctx, mergeSessionID, targetID, currentSourceID, err.Error(), createdTarget)
+			s.failBatchMerge(ctx, mergeSessionID, projectID, targetID, currentSourceID, err.Error(), createdTarget)
 			return
 		}
 
 		result, err := s.Merge(ctx, sourceID, targetID, strategy, "", userID)
 		if err != nil {
-			s.failBatchMerge(ctx, mergeSessionID, targetID, currentSourceID, err.Error(), createdTarget)
+			s.failBatchMerge(ctx, mergeSessionID, projectID, targetID, currentSourceID, err.Error(), createdTarget)
 			return
 		}
 		if ok, _ := result["ok"].(bool); ok {
@@ -1029,6 +1045,7 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 			s.broadcastMergeProgress(map[string]any{
 				"type":            "merge:step_ok",
 				"mergeSessionId":  mergeSessionID,
+				"projectId":       projectID,
 				"sourceChapterId": sourceID,
 				"index":           i,
 				"total":           total,
@@ -1045,12 +1062,13 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 			"status":         "waiting_decision",
 			"conflict_files": conflictFiles,
 		}); err != nil {
-			s.failBatchMerge(ctx, mergeSessionID, targetID, currentSourceID, err.Error(), createdTarget)
+			s.failBatchMerge(ctx, mergeSessionID, projectID, targetID, currentSourceID, err.Error(), createdTarget)
 			return
 		}
 		s.broadcastMergeProgress(map[string]any{
 			"type":            "merge:conflict",
 			"mergeSessionId":  mergeSessionID,
+			"projectId":       projectID,
 			"sourceChapterId": sourceID,
 			"index":           i,
 			"total":           total,
@@ -1063,22 +1081,22 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 			if decision == "timeout" {
 				reason = "Decision timeout"
 			}
-			s.broadcastMergeProgress(map[string]any{"type": "merge:cancelled", "mergeSessionId": mergeSessionID, "reason": reason})
+			s.broadcastMergeProgress(map[string]any{"type": "merge:cancelled", "mergeSessionId": mergeSessionID, "projectId": projectID, "reason": reason})
 			s.rollbackBatchMerge(ctx, mergeSessionID, targetID, reason, createdTarget)
 			return
 		}
 
 		_ = s.updateMergeSession(ctx, mergeSessionID, map[string]any{"status": "ai_resolving"})
-		s.broadcastMergeProgress(map[string]any{"type": "merge:ai_resolving", "mergeSessionId": mergeSessionID, "sourceChapterId": sourceID})
+		s.broadcastMergeProgress(map[string]any{"type": "merge:ai_resolving", "mergeSessionId": mergeSessionID, "projectId": projectID, "sourceChapterId": sourceID})
 		aiResult, err := s.AIResolve(ctx, sourceID, targetID, strategy, "", userID, locale)
 		if err != nil {
-			s.failBatchMerge(ctx, mergeSessionID, targetID, currentSourceID, err.Error(), createdTarget)
+			s.failBatchMerge(ctx, mergeSessionID, projectID, targetID, currentSourceID, err.Error(), createdTarget)
 			return
 		}
 		if resolved, _ := aiResult["resolved"].(bool); !resolved {
 			reason := stringValueOr(aiResult["error"], "AI resolution failed")
-			s.broadcastMergeProgress(map[string]any{"type": "merge:error", "mergeSessionId": mergeSessionID, "sourceChapterId": sourceID, "error": reason})
-			s.broadcastMergeProgress(map[string]any{"type": "merge:cancelled", "mergeSessionId": mergeSessionID, "reason": reason})
+			s.broadcastMergeProgress(map[string]any{"type": "merge:error", "mergeSessionId": mergeSessionID, "projectId": projectID, "sourceChapterId": sourceID, "error": reason})
+			s.broadcastMergeProgress(map[string]any{"type": "merge:cancelled", "mergeSessionId": mergeSessionID, "projectId": projectID, "reason": reason})
 			s.rollbackBatchMerge(ctx, mergeSessionID, targetID, reason, createdTarget)
 			return
 		}
@@ -1091,6 +1109,7 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 		s.broadcastMergeProgress(map[string]any{
 			"type":            "merge:step_ok",
 			"mergeSessionId":  mergeSessionID,
+			"projectId":       projectID,
 			"sourceChapterId": sourceID,
 			"index":           i,
 			"total":           total,
@@ -1106,10 +1125,10 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, targetID string, source
 		"conflict_files":            nil,
 		"error":                     nil,
 	}); err != nil {
-		s.failBatchMerge(ctx, mergeSessionID, targetID, currentSourceID, err.Error(), createdTarget)
+		s.failBatchMerge(ctx, mergeSessionID, projectID, targetID, currentSourceID, err.Error(), createdTarget)
 		return
 	}
-	s.broadcastMergeProgress(map[string]any{"type": "merge:completed", "mergeSessionId": mergeSessionID, "targetChapterId": targetID, "mergedCount": mergedCount})
+	s.broadcastMergeProgress(map[string]any{"type": "merge:completed", "mergeSessionId": mergeSessionID, "projectId": projectID, "targetChapterId": targetID, "mergedCount": mergedCount})
 }
 
 func (s *Service) updateMergeSession(ctx context.Context, mergeSessionID string, fields map[string]any) error {
@@ -1172,9 +1191,9 @@ func (s *Service) waitForMergeDecision(ctx context.Context, mergeSessionID strin
 	}
 }
 
-func (s *Service) failBatchMerge(ctx context.Context, mergeSessionID, targetID, sourceID, reason string, createdTarget bool) {
+func (s *Service) failBatchMerge(ctx context.Context, mergeSessionID, projectID, targetID, sourceID, reason string, createdTarget bool) {
 	slog.Error("Batch merge failed", "mergeSessionId", mergeSessionID, "sourceChapterId", sourceID, "error", reason)
-	s.broadcastMergeProgress(map[string]any{"type": "merge:error", "mergeSessionId": mergeSessionID, "sourceChapterId": sourceID, "error": reason})
+	s.broadcastMergeProgress(map[string]any{"type": "merge:error", "mergeSessionId": mergeSessionID, "projectId": projectID, "sourceChapterId": sourceID, "error": reason})
 	s.rollbackBatchMerge(ctx, mergeSessionID, targetID, reason, createdTarget)
 }
 
@@ -1241,6 +1260,20 @@ func (s *Service) Get(ctx context.Context, chapterID string) (Chapter, error) {
 }
 
 func (s *Service) Update(ctx context.Context, chapterID string, fields map[string]any) (Chapter, error) {
+	existing, err := s.Get(ctx, chapterID)
+	if err != nil {
+		return Chapter{}, err
+	}
+	if _, ok := fields["status"]; ok && existing.IsRoot {
+		return Chapter{}, httpx.ValidationError("Cannot change root chapter status")
+	}
+	if _, ok := fields["role"]; ok && existing.IsRoot {
+		return Chapter{}, httpx.ValidationError("Cannot change root chapter role")
+	}
+	if role, ok := fields["role"]; ok && strings.TrimSpace(fmt.Sprint(role)) == "trunk" && !existing.IsRoot {
+		return Chapter{}, httpx.ValidationError("Trunk role is reserved for the root chapter")
+	}
+
 	allowed := map[string]string{"title": "title", "description": "description", "status": "status", "role": "role", "color": "color", "groupLabel": "group_label", "mergedIntoChapterId": "merged_into_chapter_id", "mergeCommitSha": "merge_commit_sha", "mergeStrategy": "merge_strategy"}
 	sets := []string{}
 	args := []any{}
@@ -1258,11 +1291,11 @@ func (s *Service) Update(ctx context.Context, chapterID string, fields map[strin
 		args = append(args, val)
 	}
 	if len(sets) == 0 {
-		return s.Get(ctx, chapterID)
+		return existing, nil
 	}
 	sets = append(sets, "updated_at = ?")
 	args = append(args, db.NowISO(), chapterID)
-	_, err := s.DB.ExecContext(ctx, `UPDATE chapters SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
+	_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
 	if err != nil {
 		return Chapter{}, err
 	}
@@ -1286,7 +1319,7 @@ func (s *Service) Delete(ctx context.Context, chapterID string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `UPDATE narrators SET chapter_id = NULL, status = 'archived', updated_at = ? WHERE chapter_id = ?`, now, chapterID); err != nil {
+	if err := archiveChapterNarrators(ctx, tx, chapterID, now); err != nil {
 		return fmt.Errorf("archive chapter narrators: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE chapters SET parent_chapter_id = NULL WHERE parent_chapter_id = ?`, chapterID); err != nil {
@@ -1295,10 +1328,81 @@ func (s *Service) Delete(ctx context.Context, chapterID string) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE chapters SET merged_into_chapter_id = NULL WHERE merged_into_chapter_id = ?`, chapterID); err != nil {
 		return fmt.Errorf("clear chapter merge references: %w", err)
 	}
+	if err := cleanupChapterRecentTabs(ctx, tx, chapterID); err != nil {
+		return fmt.Errorf("cleanup chapter recent tabs: %w", err)
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM chapters WHERE id = ?`, chapterID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func archiveChapterNarrators(ctx context.Context, tx *sql.Tx, chapterID, now string) error {
+	columns, err := db.TableColumnSet(ctx, tx, "narrators")
+	if err != nil || len(columns) == 0 {
+		return err
+	}
+	if !columns["chapter_id"] {
+		return nil
+	}
+	sets := []string{"chapter_id = NULL"}
+	args := []any{}
+	if columns["status"] {
+		sets = append(sets, "status = 'archived'")
+	}
+	if columns["updated_at"] {
+		sets = append(sets, "updated_at = ?")
+		args = append(args, now)
+	}
+	args = append(args, chapterID)
+	_, err = tx.ExecContext(ctx, `UPDATE narrators SET `+strings.Join(sets, ", ")+` WHERE chapter_id = ?`, args...)
+	return err
+}
+
+func cleanupChapterRecentTabs(ctx context.Context, tx *sql.Tx, chapterID string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id, recent_tabs FROM user_preferences`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	type update struct{ userID, tabs string }
+	updates := []update{}
+	for rows.Next() {
+		var userID, rawTabs string
+		if err := rows.Scan(&userID, &rawTabs); err != nil {
+			return err
+		}
+		var tabs []map[string]any
+		if json.Unmarshal([]byte(rawTabs), &tabs) != nil {
+			continue
+		}
+		filtered := make([]map[string]any, 0, len(tabs))
+		changed := false
+		for _, tab := range tabs {
+			if chapterRecentTabReferences(tab, chapterID) {
+				changed = true
+				continue
+			}
+			filtered = append(filtered, tab)
+		}
+		if changed {
+			data, _ := json.Marshal(filtered)
+			updates = append(updates, update{userID: userID, tabs: string(data)})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, item := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, item.tabs, db.NowISO(), item.userID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chapterRecentTabReferences(tab map[string]any, chapterID string) bool {
+	return (tab["type"] == "chapter" && tab["id"] == chapterID) || tab["chapterId"] == chapterID
 }
 
 func (s *Service) Dormant(ctx context.Context, chapterID string) error {

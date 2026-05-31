@@ -119,6 +119,51 @@ func TestListServersReadsSettingsWithoutDatabase(t *testing.T) {
 	}
 }
 
+func TestCreateEnabledStdioServerConnectsAndListsExternalTools(t *testing.T) {
+	handler, store := newTestHandler(t)
+	createBody := map[string]any{
+		"name":      "Live Tools",
+		"transport": "stdio",
+		"command":   os.Args[0],
+		"args":      []any{"-test.run=TestMCPHelperProcess"},
+		"env":       map[string]any{"NF_MCP_HELPER": "1"},
+		"enabled":   true,
+	}
+	w := serveMCP(handler, http.MethodPost, "/servers", createBody)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /servers status = %d, body=%s", w.Code, w.Body.String())
+	}
+	created := decodeResponse(t, w)
+	serverID, _ := created["id"].(string)
+	if len(serverID) != 8 {
+		t.Fatalf("created id = %q, want 8-char settings ID", serverID)
+	}
+	if created["status"] != "connected" {
+		t.Fatalf("enabled stdio create should probe and connect server, got %#v", created)
+	}
+	tools, _ := created["tools"].([]any)
+	if len(tools) != 3 {
+		t.Fatalf("enabled stdio create should discover helper tools, got %#v", created)
+	}
+	if len(store.MCPServers()) != 1 {
+		t.Fatalf("settings mcpServers length = %d, want 1", len(store.MCPServers()))
+	}
+
+	w = serveMCP(handler, http.MethodGet, "/tools", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /tools status = %d, body=%s", w.Code, w.Body.String())
+	}
+	payload := decodeResponse(t, w)
+	listedTools, _ := payload["tools"].([]any)
+	if len(listedTools) == 0 {
+		t.Fatalf("GET /tools should expose connected helper tools, got %#v", payload)
+	}
+	firstTool, _ := listedTools[0].(map[string]any)
+	if firstTool["source"] != "external" || firstTool["serverName"] != "Live Tools" || firstTool["serverId"] != serverID {
+		t.Fatalf("MCP tool list should expose TS-compatible source/server metadata, got %#v", firstTool)
+	}
+}
+
 func TestCreateUpdateDeleteServerPersistsSettings(t *testing.T) {
 	handler, store := newTestHandler(t)
 
@@ -127,6 +172,7 @@ func TestCreateUpdateDeleteServerPersistsSettings(t *testing.T) {
 		"transport":       "stdio",
 		"command":         "bunx",
 		"args":            []string{"@example/mcp"},
+		"enabled":         false,
 		"defaultBehavior": "allow",
 		"toolPermissions": []any{map[string]any{"toolName": "read_file", "behavior": "ask"}},
 	}
@@ -171,6 +217,53 @@ func TestCreateUpdateDeleteServerPersistsSettings(t *testing.T) {
 	}
 	if len(store.MCPServers()) != 0 {
 		t.Fatalf("settings mcpServers length = %d, want 0", len(store.MCPServers()))
+	}
+}
+
+func TestMCPServerValidationMatchesTSSchema(t *testing.T) {
+	handler, _ := newTestHandler(t)
+	cases := []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{name: "empty-name", path: "/servers", body: map[string]any{"name": "", "enabled": false}},
+		{name: "invalid-enabled", path: "/servers", body: map[string]any{"name": "bad", "enabled": "yes"}},
+		{name: "invalid-args", path: "/servers", body: map[string]any{"name": "bad", "args": []any{1}, "enabled": false}},
+		{name: "invalid-env", path: "/servers", body: map[string]any{"name": "bad", "env": map[string]any{"A": 1}, "enabled": false}},
+		{name: "invalid-url", path: "/servers", body: map[string]any{"name": "bad", "transport": "streamable-http", "url": "not-a-url", "enabled": false}},
+		{name: "invalid-tool-permissions", path: "/servers", body: map[string]any{"name": "bad", "toolPermissions": "not-an-array", "enabled": false}},
+		{name: "invalid-tool-permission-entry", path: "/servers", body: map[string]any{"name": "bad", "toolPermissions": []any{map[string]any{"toolName": "", "behavior": "ask"}}, "enabled": false}},
+		{name: "invalid-test-enabled", path: "/servers/test", body: map[string]any{"name": "bad", "enabled": "yes"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveMCP(handler, http.MethodPost, tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	w := serveMCP(handler, http.MethodPost, "/servers", map[string]any{
+		"name":            "compat",
+		"transport":       "stdio",
+		"command":         "node",
+		"args":            []any{"server.js"},
+		"enabled":         false,
+		"defaultBehavior": "allow",
+		"toolPermissions": []any{map[string]any{"toolName": "read_file", "behavior": "allow", "enabled": true}},
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected valid create to return 201, got %d body=%s", w.Code, w.Body.String())
+	}
+	payload := decodeResponse(t, w)
+	if payload["defaultBehavior"] != "readWrite" {
+		t.Fatalf("defaultBehavior should normalize allow to readWrite: %#v", payload)
+	}
+	perms, _ := payload["toolPermissions"].([]any)
+	if len(perms) != 1 || perms[0].(map[string]any)["behavior"] != "readWrite" {
+		t.Fatalf("toolPermissions should normalize allow to readWrite: %#v", payload)
 	}
 }
 
@@ -449,6 +542,41 @@ func TestAgentMCPToolSpecsAndExecuteUseConnectedStdioServer(t *testing.T) {
 	run, ok := handler.ExecuteTool(context.Background(), "mcp__filesystem__read_file", map[string]any{"path": "README.md"})
 	if !ok || run.Status != "completed" || !strings.Contains(run.Output, "called read_file README.md") {
 		t.Fatalf("unexpected MCP run: ok=%v run=%#v", ok, run)
+	}
+}
+
+func TestManualConnectDisabledStdioServerStillInjectsLikeTS(t *testing.T) {
+	handler, store := newTestHandler(t)
+	if err := store.SetMCPServers([]map[string]any{{
+		"id":        "srv_disabled",
+		"name":      "Disabled Tools",
+		"transport": "stdio",
+		"command":   os.Args[0],
+		"args":      []any{"-test.run=TestMCPHelperProcess"},
+		"env":       map[string]any{"NF_MCP_HELPER": "1"},
+		"enabled":   false,
+	}}); err != nil {
+		t.Fatalf("seed disabled stdio server: %v", err)
+	}
+	w := serveMCP(handler, http.MethodPost, "/servers/srv_disabled/connect", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("connect status = %d body=%s", w.Code, w.Body.String())
+	}
+	payload := decodeResponse(t, w)
+	if payload["status"] != "connected" || payload["enabled"] != false {
+		t.Fatalf("manual connect should connect even disabled servers like TS, got %#v", payload)
+	}
+	specs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{})
+	if !specNamesContain(specs, "mcp__disabled_tools__read_file") {
+		t.Fatalf("manual-connected disabled stdio server should inject tools like TS, got %#v", specs)
+	}
+	w = serveMCP(handler, http.MethodPatch, "/servers/srv_disabled", map[string]any{"enabled": false})
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable patch status = %d body=%s", w.Code, w.Body.String())
+	}
+	specs = handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{})
+	if specNamesContain(specs, "mcp__disabled_tools__read_file") {
+		t.Fatalf("explicit disable update should clear runtime state, got %#v", specs)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -200,6 +201,7 @@ func TestAdminOnlyRuntimeAndDependencyRoutesRejectMemberTokens(t *testing.T) {
 		{http.MethodPost, "/api/storage/database/preview", `{"target":"apiRequestDumps"}`},
 		{http.MethodPost, "/api/storage/database/cleanup", `{"target":"apiRequestDumps"}`},
 		{http.MethodPost, "/api/storage/database/vacuum", `{}`},
+		{http.MethodGet, "/api/hooks", ""},
 		{http.MethodGet, "/api/benchmarks/runs/run-1/results", ""},
 		{http.MethodGet, "/api/benchmarks/runs/run-1/summary", ""},
 		{http.MethodGet, "/api/benchmarks/compare?runIds=run-1,run-2", ""},
@@ -220,6 +222,74 @@ func TestAdminOnlyRuntimeAndDependencyRoutesRejectMemberTokens(t *testing.T) {
 			}
 			if body["code"] != "FORBIDDEN" || body["error"] != "Admin access required" {
 				t.Fatalf("unexpected forbidden body: %#v", body)
+			}
+		})
+	}
+}
+
+func TestHooksAndWorkspacesMatchTSBoundaryAndMissingStates(t *testing.T) {
+	router, authService, sqlDB := newRouterContractFixtureWithDB(t)
+	mustExecRouterContractSQL(t, sqlDB, `CREATE TABLE hooks (
+		id TEXT PRIMARY KEY,
+		project_id TEXT,
+		event TEXT NOT NULL,
+		matcher TEXT NOT NULL DEFAULT '',
+		type TEXT NOT NULL,
+		command TEXT,
+		url TEXT,
+		headers TEXT,
+		prompt TEXT,
+		model TEXT,
+		timeout INTEGER NOT NULL DEFAULT 30,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		sort_order INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL,
+		updated_at TEXT NOT NULL
+	)`)
+	mustExecRouterContractSQL(t, sqlDB, `CREATE TABLE workspaces (
+		id TEXT PRIMARY KEY,
+		user_id TEXT NOT NULL,
+		title TEXT NOT NULL,
+		tree TEXT NOT NULL,
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	)`)
+	adminToken, err := authService.CreateToken("user-1", "admin")
+	if err != nil {
+		t.Fatalf("create admin token: %v", err)
+	}
+	userToken, err := authService.CreateToken("user-1", "user")
+	if err != nil {
+		t.Fatalf("create user token: %v", err)
+	}
+	cases := []struct {
+		method string
+		path   string
+		body   string
+		token  string
+		status int
+	}{
+		{http.MethodGet, "/api/hooks", "", adminToken, http.StatusOK},
+		{http.MethodGet, "/api/hooks", "", userToken, http.StatusForbidden},
+		{http.MethodGet, "/api/hooks/missing", "", adminToken, http.StatusNotFound},
+		{http.MethodPost, "/api/hooks", `{}`, adminToken, http.StatusBadRequest},
+		{http.MethodDelete, "/api/hooks/missing", `{}`, adminToken, http.StatusNotFound},
+		{http.MethodGet, "/api/workspaces/missing", "", adminToken, http.StatusNotFound},
+		{http.MethodPost, "/api/workspaces", `{"tree":"x"}`, adminToken, http.StatusBadRequest},
+		{http.MethodPatch, "/api/workspaces/missing", `{"title":"Missing"}`, adminToken, http.StatusNotFound},
+		{http.MethodDelete, "/api/workspaces/missing", `{}`, adminToken, http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+tc.token)
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("expected %d, got %d: %s", tc.status, w.Code, w.Body.String())
 			}
 		})
 	}
@@ -408,9 +478,14 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"nativeExtensions"}, map[string]any{"defaultEnabled": false, "scope": "go-owned-runtime-extensions"})
 	assertNestedCapability(t, caps, []string{"nativeExtensions", "browserSessions"}, map[string]any{"defaultEnabled": false, "storage": "go-runtime-sidecar", "cutover": "explicit-enable", "rollback": "explicit-disable-or-export", "reason": browserSessionsDefaultOffReason})
 	assertNestedCapability(t, caps, []string{"nativeExtensions", "containerBrowserToolAutoEnable"}, map[string]any{"defaultEnabled": false, "cutover": "explicit-enable", "rollback": "explicit-disable", "reason": containerBrowserToolAutoEnableReason})
-	assertNestedCapability(t, caps, []string{"chapters", "split"}, map[string]any{"supported": true, "fallback": false, "mode": "go-basic-split"})
-	assertNestedCapability(t, caps, []string{"chapters", "split", "partials", "compressedAISummary"}, map[string]any{"supported": false, "fallback": true, "mode": "deterministic-summary-placeholder", "reason": graph.CompressedAISummaryFallbackReason})
+	assertNestedCapability(t, caps, []string{"chapters", "split"}, map[string]any{"supported": true, "fallback": false, "mode": "split-at-commit"})
+	assertNestedCapability(t, caps, []string{"chapters", "split", "routes"}, map[string]any{"splitAtCommit": true})
+	assertNestedCapability(t, caps, []string{"chapters", "split", "partials", "compressedAISummary"}, map[string]any{"supported": false, "fallback": true, "mode": "bounded-ref-copy-with-deterministic-context-note", "deterministic": true, "copiesMessageRefs": true, "generatesModelSummary": false, "reason": graph.CompressedAISummaryFallbackReason})
+
 	assertNestedCapability(t, caps, []string{"chapters", "split", "partials", "containerAutostart"}, map[string]any{"supported": true, "fallback": false, "mode": "background-start"})
+	assertNestedCapability(t, caps, []string{"chapters", "batchMerge"}, map[string]any{"supported": true, "fallback": false, "mode": "async-merge-session", "decisionWs": true, "staleSessionCleanup": true, "createdTargetRollback": true, "frontendCompletionMode": "progress-event-or-session-poll"})
+	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "routes"}, map[string]any{"start": true, "session": true})
+	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "response"}, map[string]any{"mergeSessionId": true, "targetChapterId": true, "createdTarget": true, "status": true})
 	assertNestedCapability(t, caps, []string{"chapters", "containers"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"chapters", "containers", "runtime"}, map[string]any{"syncStartRequest": false, "backgroundStart": true, "backgroundStartReason": containerBackgroundStartReason, "streamingLogs": true, "perChapterLock": true})
 	assertNestedCapability(t, caps, []string{"chapters", "containers", "lifecycle"}, map[string]any{"manualControls": true, "autoStartOnFork": true, "pauseOnDormant": true, "unpauseOnWake": true, "deleteVolumes": true})
@@ -418,8 +493,9 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"chapters", "containers", "narratorIntegration"}, map[string]any{"statusChangedEvent": true, "containerReadyMessage": true, "browserToolAutoEnable": false, "browserToolAutoEnableReason": containerBrowserToolAutoEnableReason, "defaultEnabled": false, "cutover": "explicit-enable", "rollback": "explicit-disable"})
 	assertNestedCapability(t, caps, []string{"vnet"}, map[string]any{"supported": true, "ws": true, "mode": "relay", "peerCleanup": true, "udpRendezvous": false, "udpRendezvousReason": "Go VNet compatibility mode relays WebSocket peer traffic and does not expose UDP rendezvous."})
 	assertNestedCapability(t, caps, []string{"update"}, map[string]any{"manualOnly": true, "selfUpdateAvailable": false, "canAutoRestart": false})
-	assertNestedCapability(t, caps, []string{"update", "download"}, map[string]any{"supported": true, "sse": true, "sha512": true, "maxBytes": float64(512 * 1024 * 1024), "trustMode": "client-or-env-manifest-url"})
+	assertNestedCapability(t, caps, []string{"update", "download"}, map[string]any{"supported": true, "sse": true, "sha512": true, "maxBytes": float64(512 * 1024 * 1024), "trustMode": "server-configured-trusted-source"})
 	assertNestedCapability(t, caps, []string{"update", "apply"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "Automatic self-update requires a configured restart handoff manager and a regular current executable."})
+	assertNestedCapability(t, caps, []string{"gateway", "webhook"}, map[string]any{"supported": true, "fallback": false, "mode": "http-hmac-autocreate-standalone-narrator"})
 	assertNestedCapability(t, caps, []string{"gateway", "weixinQr"}, map[string]any{"supported": false, "fallback": true, "code": "WEIXIN_QR_UNSUPPORTED", "reason": "Weixin QR gateway runtime is not bundled in go_backend."})
 	gateway, ok := caps["gateway"].(map[string]any)
 	if !ok {
@@ -439,8 +515,8 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"storage", "cached"}, map[string]any{"supported": true, "cache": true})
 	assertNestedCapability(t, caps, []string{"storage", "database"}, map[string]any{"preview": true, "cleanup": true})
 	assertNestedCapability(t, caps, []string{"storage", "database", "cleanupTargets", "apiRequestDumps"}, map[string]any{"supported": true})
-	assertNestedCapability(t, caps, []string{"storage", "database", "cleanupTargets", "archivedSessions"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": disabledNarratorSessionCleanupReason})
-	assertNestedCapability(t, caps, []string{"storage", "database", "cleanupTargets", "staleSessions"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": disabledNarratorSessionCleanupReason})
+	assertNestedCapability(t, caps, []string{"storage", "database", "cleanupTargets", "archivedSessions"}, map[string]any{"supported": true, "fallback": false, "archivedOnly": true, "usesNarratorDelete": true, "vacuumRan": false})
+	assertNestedCapability(t, caps, []string{"storage", "database", "cleanupTargets", "staleSessions"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": disabledStaleNarratorSessionCleanupReason})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "uploads"}, map[string]any{"supported": true, "preservesMessageImageRefs": true})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "worktrees"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.worktrees", "reason": "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent."})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "containers"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.containers", "reason": "Podman prune is disabled from storage cleanup in go_backend; use per-chapter container controls or an external maintenance command."})
@@ -459,18 +535,27 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"mcp", "toolsCall"}, map[string]any{"supported": true, "fallback": false, "scope": "go-embedded-compatibility-tools-and-stdio-external-tools"})
 	assertNestedCapability(t, caps, []string{"mcp", "externalToolsInjection"}, map[string]any{"supported": true, "fallback": false, "parity": "partial", "transport": "stdio", "lifecycle": "per-call"})
 	assertNestedCapability(t, caps, []string{"mcp", "externalAgentInjection"}, map[string]any{"supported": true, "fallback": false, "parity": "partial"})
+	assertNestedCapability(t, caps, []string{"settings"}, map[string]any{"secretMasking": true, "providerModelAugmentation": true, "tlsGeneration": true, "retryRules": true})
 	assertNestedCapability(t, caps, []string{"settings", "validation"}, map[string]any{"tsZodParity": false, "mode": "loose-json-with-normalization", "reason": "Go backend normalizes settings before saving but does not apply the full TypeScript Zod schema strictly."})
 	assertNestedCapability(t, caps, []string{"settings", "storage"}, map[string]any{"supported": true, "path": "~/.narrafork/settings.json"})
+	assertNestedCapability(t, caps, []string{"settings", "patch"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"providers", "codex", "managerParity"}, map[string]any{"tsCodexManagerEquivalent": false, "usageQueueParity": "partial", "usageQueueClearSupported": true, "snapshotPaginationParity": "supported", "reason": "Go exposes Codex compatibility routes/runtime but not the full TS CodexManager scheduler/usage queue semantics."})
 	assertNestedCapability(t, caps, []string{"benchmark", "containerExecution"}, map[string]any{"supported": true, "fallback": false, "runtime": "podman", "resourceLimits": true, "timeout": true})
 	assertNestedCapability(t, caps, []string{"narrator", "wsEvents", "p0"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"narrator", "messageHistory"}, map[string]any{"supported": true, "catchUp": true, "childOrphans": true, "toolCalls": true, "compactMarkers": true})
+	assertNestedCapability(t, caps, []string{"narrator", "delete"}, map[string]any{"supported": true, "fallback": false, "archivedOnly": true, "recursive": true, "sharedMessageHandoff": true, "uploadPreservation": true})
 	assertNestedCapability(t, caps, []string{"narrator", "permissions"}, map[string]any{"supported": true, "approveDeny": true, "updatedInput": true, "pauseResume": "db-pending-tool-call"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "toolInventory"}, "supportedOptionalTools", []string{"Terminal", "Browser", "ShareFile", "Recall"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "toolInventory"}, "unsupportedOptionalTools", []string{"ForkNarrator", "NarraForkAdmin"})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "mcpExternalTools"}, map[string]any{"supported": true, "parity": "partial", "transport": "stdio", "lifecycle": "per-call"})
-	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "webFetch"}, map[string]any{"supported": true, "parity": "partial", "mode": "raw-only", "defaultMode": "raw", "policy": "permission-policy-and-proxy-consumed"})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "recall"}, map[string]any{"supported": true, "readOnly": true, "scope": "self", "crossNarrator": false, "searchMode": "bounded-like", "maxSearchLimit": float64(50), "maxReadLimit": float64(50), "maxBatchQueries": float64(10), "maxToolCallOutputChars": float64(4000)})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "read"}, map[string]any{"supported": true, "parity": "partial", "textFiles": true, "directories": true, "offsetLimit": true, "pdfPages": false, "pagesSchemaOnly": true, "imageContent": false})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "webFetch"}, map[string]any{"supported": true, "parity": "partial", "mode": "raw-only", "defaultMode": "raw", "policy": "permission-policy-and-proxy-consumed", "rawRequiresChrome": false, "screenshotRequiresChrome": true, "smartRequiresProvider": true})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "browser"}, map[string]any{"supported": true, "parity": "partial", "runtime": "go-rod", "screenshotPreviewMode": "inline-base64-or-file-artifact", "sharePreview": false, "imageContentBlock": false, "fileOutput": true, "traceFormat": "chrome-devtools-json", "traceShare": true, "traceFileOutput": true, "traceShareUrl": "/api/shares/{shareId}"})
 	assertNestedCapability(t, caps, []string{"narrator", "planMode"}, map[string]any{"supported": true, "api": true, "toolReflection": true, "previousModeRestore": true})
-	assertNestedCapability(t, caps, []string{"narrator", "compact"}, map[string]any{"supported": true, "segmentCompact": true, "contextClear": true, "fallbackSummary": true, "fallbackReason": "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs."})
+	assertNestedCapability(t, caps, []string{"narrator", "compact"}, map[string]any{"supported": true, "markers": true, "segmentCompact": true, "contextClear": true, "fallbackSummary": true, "fallbackReason": "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs."})
+	assertNestedCapability(t, caps, []string{"narrator", "compact", "summaryGeneration"}, map[string]any{"supported": false, "kind": "model", "reason": "Go backend does not generate model summaries without an external provider."})
+	assertNestedCapability(t, caps, []string{"narrator", "compact", "summaryFallback"}, map[string]any{"supported": true, "mode": "caller-summary-or-deterministic-ref-preview", "deterministic": true})
 	assertNestedCapability(t, caps, []string{"narrator", "retryRecovery"}, map[string]any{"supported": true, "retry": true, "continue": true, "interrupt": true, "manualOverride": true, "rollback": true, "editAndRegenerate": true})
 	assertNestedCapability(t, caps, []string{"narrator", "subagents"}, map[string]any{"supported": true, "foreground": true, "background": true, "awaitAgent": true, "send": true, "teamStatus": true, "detachAttach": true, "detachUnblocksParent": true, "reattachBlocksParent": false, "reattachFallback": true, "reattachReason": "Go can detach and open subagent sessions, but cannot re-block an already-running parent tool promise after reattach.", "backgroundResultInjection": true, "staleRecovery": true})
 	assertNestedCapability(t, caps, []string{"narrator", "reviewTools"}, map[string]any{"supported": true, "concludeReview": true, "feedbackInjection": true, "promote": true, "dismiss": true, "convertToSubagent": true, "staleMergeGuard": true})
@@ -481,24 +566,36 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"content", "projectSkills"}, map[string]any{"supported": true, "fallback": false, "storage": "project-git-path-scan"})
 	assertNestedCapability(t, caps, []string{"fs", "browse"}, map[string]any{"supported": true, "fallback": false})
 	assertNestedCapability(t, caps, []string{"fs", "preview"}, map[string]any{"supported": true, "maxTextBytes": float64(1 << 20), "maxBinaryBytes": float64(20 * 1024 * 1024)})
-	assertNestedCapability(t, caps, []string{"fs", "reveal"}, map[string]any{"supported": true, "fallback": false})
+	fsRevealExpected := map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "Opening file manager is not supported on this platform"}
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		fsRevealExpected = map[string]any{"supported": true, "fallback": false}
+	}
+	assertNestedCapability(t, caps, []string{"fs", "reveal"}, fsRevealExpected)
 	assertNestedCapability(t, caps, []string{"uploads", "serveNarratorImages"}, map[string]any{"supported": true, "fallback": false})
+	assertNestedCapability(t, caps, []string{"uploads", "serveAvatars"}, map[string]any{"supported": true, "fallback": false})
 	assertNestedCapability(t, caps, []string{"uploads", "cleanupPreservesMessageImageRefs"}, map[string]any{"supported": true, "fallback": false})
+	assertNestedCapability(t, caps, []string{"shares", "create"}, map[string]any{"supported": true})
+	assertNestedCapability(t, caps, []string{"shares", "publicDownload"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"shares", "preview"}, map[string]any{"supported": true, "htmlMode": "escaped-pre", "reason": shareEscapedHTMLPreviewReason})
 	assertNestedCapability(t, caps, []string{"shares", "ephemeralOnly"}, map[string]any{"supported": false, "fallback": true, "reason": shareEphemeralFallbackReason})
-	assertNestedCapability(t, caps, []string{"terminal"}, map[string]any{"scrollbackReplayMode": "raw-capped-buffer", "bufferStateMode": "raw-capped-buffer", "xtermSerializedReplay": false, "xtermSerializedReplayReason": terminalXtermSerializedReplayReason, "windowsPty": false, "maxSnapshotBytes": float64(1 << 20), "multiClientResizeMode": "last-input-client"})
+	assertNestedCapability(t, caps, []string{"terminal"}, map[string]any{"supported": true, "scrollbackReplayMode": "raw-capped-buffer", "bufferStateMode": "raw-capped-buffer", "xtermSerializedReplay": false, "xtermSerializedReplayReason": terminalXtermSerializedReplayReason, "windowsPty": false, "maxSnapshotBytes": float64(1 << 20), "multiClientResizeMode": "last-input-client"})
 	assertNestedCapability(t, caps, []string{"terminal", "ws"}, map[string]any{"subscribe": true, "input": true, "resize": true, "kill": true, "rename": true, "scrollback": true, "bufferState": true})
 	assertNestedCapability(t, caps, []string{"terminal", "processTree"}, map[string]any{"supported": true, "platform": "unix-ps"})
-	assertNestedCapability(t, caps, []string{"narrator", "subagents"}, map[string]any{"awaitAgent": true, "awaitBash": false, "awaitBashWaitForText": false, "awaitBashReason": "Go Await currently supports agent/subagent background tasks only; Bash background tasks and wait_for_text are not implemented in go_backend."})
+	assertNestedCapability(t, caps, []string{"narrator", "subagents"}, map[string]any{"awaitAgent": true, "awaitBash": true, "awaitBashWaitForText": true, "narratorContextOnly": true, "awaitBashReason": "Await type=bash and wait_for_text are supported in narrator context; non-narrator ExecuteTool does not support Bash run_in_background."})
+	assertStringSliceCapability(t, caps, []string{"narrator", "subagents"}, "supportedTypes", []string{"agent", "bash"})
 	assertNestedCapability(t, caps, []string{"providers", "openai", "quota"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "OpenAI-compatible quota inspection is not available in go_backend."})
 	assertNestedCapability(t, caps, []string{"providers", "anthropic", "quota"}, map[string]any{"supported": false, "fallback": true, "code": "FEATURE_DISABLED", "reason": "Anthropic quota inspection is not available in go_backend."})
 	assertNestedCapability(t, caps, []string{"providers", "openai", "agentRuntime"}, map[string]any{"supported": true, "chatCompletions": true, "responsesApi": true, "toolCalling": true, "streaming": true})
 	assertNestedCapability(t, caps, []string{"providers", "openai", "routes"}, map[string]any{"modelsRefresh": true, "perProviderModels": true, "perProviderModelsRefresh": true})
 	assertNestedCapability(t, caps, []string{"providers", "anthropic", "routes"}, map[string]any{"modelsRefresh": true, "perProviderModels": true, "perProviderModelsRefresh": true})
+	assertNestedCapability(t, caps, []string{"providers", "kiro", "models"}, map[string]any{"supported": true, "refreshSupported": false, "reason": "Kiro model refresh requires the TypeScript Kiro plugin bridge; go_backend reads cached per-credential model metadata only."})
 	assertNestedCapability(t, caps, []string{"providers", "kiro", "pluginBridge"}, map[string]any{"supported": true, "requiresBun": true, "reason": "Kiro plugin bridge is available only when the external Bun bridge/plugin environment is present."})
 	assertNestedCapability(t, caps, []string{"providers", "kiro", "mcp"}, map[string]any{"listToolsRoute": true, "searchRoute": true, "agentInjection": false})
 	assertNestedCapability(t, caps, []string{"providers", "kiro", "routes"}, map[string]any{
-		"modelsRefresh":     true,
+		"modelsRefresh":     false,
+		"chat":              false,
+		"chatCode":          "FEATURE_DISABLED",
+		"chatReason":        "Kiro chat streaming is not implemented in go_backend; use the narrator/provider agent routes or the TypeScript backend for Kiro chat streaming.",
 		"mcpSearch":         true,
 		"globalProxy":       true,
 		"loadBalancingMode": true,
@@ -540,6 +637,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"authCallback":             true,
 	})
 	assertNestedCapability(t, caps, []string{"providers", "codex", "auth"}, map[string]any{"supported": true})
+	assertNestedCapability(t, caps, []string{"providers", "codex", "models"}, map[string]any{"supported": true, "refreshSupported": false})
 	assertNestedCapability(t, caps, []string{"providers", "codex", "routes"}, map[string]any{
 		"defaultReasoningEffort": true,
 		"useWebSocket":           true,
@@ -603,6 +701,27 @@ func assertNestedCapability(t *testing.T, root map[string]any, path []string, ex
 	}
 }
 
+func assertStringSliceCapability(t *testing.T, root map[string]any, path []string, key string, want []string) {
+	t.Helper()
+	current := root
+	for _, part := range path {
+		next, ok := current[part].(map[string]any)
+		if !ok {
+			t.Fatalf("expected capability path %v to contain object at %q, got %#v", path, part, current[part])
+		}
+		current = next
+	}
+	got, ok := current[key].([]any)
+	if !ok || len(got) != len(want) {
+		t.Fatalf("expected capability %v.%s=%#v, got %#v", path, key, want, current[key])
+	}
+	for i, value := range want {
+		if got[i] != value {
+			t.Fatalf("expected capability %v.%s[%d]=%q, got %#v", path, key, i, value, got[i])
+		}
+	}
+}
+
 func openRouterContractDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")
@@ -658,6 +777,12 @@ func TestHealthReportsAutoRestartWhenRestartManagerConfigured(t *testing.T) {
 
 func newRouterContractFixture(t *testing.T) (http.Handler, *auth.Service) {
 	t.Helper()
+	router, authService, _ := newRouterContractFixtureWithDB(t)
+	return router, authService
+}
+
+func newRouterContractFixtureWithDB(t *testing.T) (http.Handler, *auth.Service, *sql.DB) {
+	t.Helper()
 	sqlDB := openRouterContractDB(t)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	settings := loadRouterContractSettings(t)
@@ -669,7 +794,14 @@ func newRouterContractFixture(t *testing.T) (http.Handler, *auth.Service) {
 		Git:      gitx.NewService(),
 		Hub:      ws.NewHub(),
 	})
-	return router, authService
+	return router, authService, sqlDB
+}
+
+func mustExecRouterContractSQL(t *testing.T, sqlDB *sql.DB, statement string) {
+	t.Helper()
+	if _, err := sqlDB.Exec(statement); err != nil {
+		t.Fatalf("exec fixture SQL: %v", err)
+	}
 }
 
 func loadRouterContractSettings(t *testing.T) *config.Store {

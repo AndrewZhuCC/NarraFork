@@ -23,7 +23,6 @@ var validEdgeTypes = map[string]bool{
 	"merge":       true,
 	"dependency":  true,
 	"cherry_pick": true,
-	"review":      true,
 }
 
 var manualEdgeTypes = map[string]bool{

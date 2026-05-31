@@ -30,10 +30,10 @@ func TestOptionalToolMenuOnlyIncludesGoSupportedTools(t *testing.T) {
 	for _, item := range items {
 		seen[stringValue(item["toolName"])] = true
 	}
-	if !seen["Terminal"] || !seen["Browser"] || !seen["ShareFile"] {
+	if !seen["Terminal"] || !seen["Browser"] || !seen["ShareFile"] || !seen["Recall"] {
 		t.Fatalf("supported optional tools missing from menu: %#v", items)
 	}
-	for _, name := range []string{"Recall", "ForkNarrator", "NarraForkAdmin"} {
+	for _, name := range []string{"ForkNarrator", "NarraForkAdmin"} {
 		if seen[name] {
 			t.Fatalf("unsupported optional tool %s leaked into /load menu: %#v", name, items)
 		}

@@ -142,6 +142,75 @@ func TestProjectSkillsWithoutDatabaseExposeExplicitFallback(t *testing.T) {
 	}
 }
 
+func TestGlobalSkillCRUDMatchesTSStatusAndSideEffects(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	handler := NewHandler()
+
+	create := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global", map[string]any{"name": "Contract Skill", "description": "Helps parity", "content": "Initial content."})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", create.Code, create.Body.String())
+	}
+	var created map[string]any
+	if err := json.Unmarshal(create.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode create: %v", err)
+	}
+	if created["name"] != "Contract Skill" || created["content"] != "Initial content." {
+		t.Fatalf("unexpected create body: %#v", created)
+	}
+
+	duplicate := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global", map[string]any{"name": "Contract Skill", "description": "Duplicate", "content": "Duplicate"})
+	if duplicate.Code != http.StatusBadRequest {
+		t.Fatalf("duplicate create status = %d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	missingToggleBody := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", map[string]any{})
+	if missingToggleBody.Code != http.StatusBadRequest {
+		t.Fatalf("missing enabled toggle status = %d body=%s", missingToggleBody.Code, missingToggleBody.Body.String())
+	}
+
+	disable := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", map[string]any{"enabled": false})
+	if disable.Code != http.StatusOK {
+		t.Fatalf("disable status = %d body=%s", disable.Code, disable.Body.String())
+	}
+	var disabled map[string]any
+	if err := json.Unmarshal(disable.Body.Bytes(), &disabled); err != nil {
+		t.Fatalf("decode disable: %v", err)
+	}
+	if disabled["disabled"] != true {
+		t.Fatalf("expected disabled skill, got %#v", disabled)
+	}
+
+	missingUpdate := serveSimpleSkillsRequest(handler, http.MethodPut, "/skills/global/missing", map[string]any{"name": "Missing", "description": "Missing", "content": "Missing"})
+	if missingUpdate.Code != http.StatusNotFound {
+		t.Fatalf("missing update status = %d body=%s", missingUpdate.Code, missingUpdate.Body.String())
+	}
+	missingDelete := serveSimpleSkillsRequest(handler, http.MethodDelete, "/skills/global/missing", map[string]any{})
+	if missingDelete.Code != http.StatusNotFound {
+		t.Fatalf("missing delete status = %d body=%s", missingDelete.Code, missingDelete.Body.String())
+	}
+
+	update := serveSimpleSkillsRequest(handler, http.MethodPut, "/skills/global/Contract%20Skill", map[string]any{"name": "Contract Skill Updated", "description": "Updated", "content": "Updated content."})
+	if update.Code != http.StatusOK {
+		t.Fatalf("update status = %d body=%s", update.Code, update.Body.String())
+	}
+	oldDetail := serveSimpleSkillsRequest(handler, http.MethodGet, "/skills/global/Contract%20Skill", nil)
+	if oldDetail.Code != http.StatusNotFound {
+		t.Fatalf("old detail after rename status = %d body=%s", oldDetail.Code, oldDetail.Body.String())
+	}
+	newDetail := serveSimpleSkillsRequest(handler, http.MethodGet, "/skills/global/Contract%20Skill%20Updated", nil)
+	if newDetail.Code != http.StatusOK {
+		t.Fatalf("new detail after rename status = %d body=%s", newDetail.Code, newDetail.Body.String())
+	}
+
+	deleted := serveSimpleSkillsRequest(handler, http.MethodDelete, "/skills/global/Contract%20Skill%20Updated", map[string]any{})
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", deleted.Code, deleted.Body.String())
+	}
+	afterDelete := serveSimpleSkillsRequest(handler, http.MethodGet, "/skills/global/Contract%20Skill%20Updated", nil)
+	if afterDelete.Code != http.StatusNotFound {
+		t.Fatalf("detail after delete status = %d body=%s", afterDelete.Code, afterDelete.Body.String())
+	}
+}
+
 func assertSimpleContentFallback(t *testing.T, w *httptest.ResponseRecorder, feature string) {
 	t.Helper()
 	if w.Code != http.StatusNotImplemented {

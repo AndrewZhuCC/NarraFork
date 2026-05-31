@@ -3,10 +3,13 @@ package agentbasic
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -95,12 +98,15 @@ func (a *OpenAIChatCompletionsAdapter) FormatToolResult(toolUseID string, output
 	return Message{Role: "tool", ToolCallID: toolUseID, Content: output}
 }
 
-func (a *OpenAIChatCompletionsAdapter) PushUserTurn(history *BuiltHistory, _ string, toolResults []any) {
+func (a *OpenAIChatCompletionsAdapter) PushUserTurn(history *BuiltHistory, content string, toolResults []any) {
 	if history == nil {
 		return
 	}
 	for _, result := range toolResults {
 		history.History = append(history.History, result)
+	}
+	if strings.TrimSpace(content) != "" {
+		history.History = append(history.History, Message{Role: "user", Content: content})
 	}
 }
 
@@ -207,7 +213,7 @@ type openAIStreamingTool struct {
 func streamChatCompletions(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
 	body := map[string]any{
 		"model":       provider.Model,
-		"messages":    messages,
+		"messages":    openAIChatCompletionMessages(messages),
 		"temperature": 0.2,
 		"tools":       toolDefinitions(toolScope),
 		"stream":      true,
@@ -706,6 +712,35 @@ func emitResponsesCompletedOutput(ctx context.Context, out chan<- StreamEvent, d
 	}
 }
 
+func openAIChatCompletionMessages(messages []Message) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, message := range messages {
+		if message.Role == "assistant" {
+			if searchContext := webSearchContextFromBlocks(message.ContentBlocks); searchContext != "" {
+				out = append(out, map[string]any{"role": "user", "content": searchContext})
+			}
+		}
+		item := map[string]any{"role": message.Role}
+		if message.ToolCallID != "" {
+			item["tool_call_id"] = message.ToolCallID
+		}
+		if len(message.ToolCalls) > 0 {
+			item["tool_calls"] = message.ToolCalls
+		}
+		if message.Role == "user" && len(message.ContentBlocks) > 0 {
+			if parts := openAIUserContentParts(message, "chat"); len(parts) > 0 {
+				item["content"] = parts
+			} else {
+				item["content"] = message.Content
+			}
+		} else {
+			item["content"] = message.Content
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 func openAIResponsesInput(messages []Message) []any {
 	input, _ := openAIResponsesInputAndInstructions(messages)
 	return input
@@ -738,6 +773,10 @@ func openAIResponsesInputAndInstructions(messages []Message) ([]any, string) {
 				for _, toolResult := range contentBlockToolResults(message.ContentBlocks) {
 					input = append(input, map[string]any{"type": "function_call_output", "call_id": toolResult.ToolCallID, "output": toolResult.Content})
 				}
+				if parts := openAIUserContentParts(message, "responses"); len(parts) > 0 {
+					input = append(input, map[string]any{"role": message.Role, "content": parts})
+					continue
+				}
 			}
 			if strings.TrimSpace(message.Content) != "" {
 				input = append(input, map[string]any{"role": message.Role, "content": message.Content})
@@ -745,6 +784,38 @@ func openAIResponsesInputAndInstructions(messages []Message) ([]any, string) {
 		}
 	}
 	return input, strings.Join(instructions, "\n\n")
+}
+
+func openAIUserContentParts(message Message, mode string) []map[string]any {
+	parts := []map[string]any{}
+	seenText := false
+	textType := "text"
+	imageType := "image_url"
+	if mode == "responses" {
+		textType = "input_text"
+		imageType = "input_image"
+	}
+	for _, block := range message.ContentBlocks {
+		switch stringValue(block["type"]) {
+		case "text":
+			if text := stringValue(block["text"]); strings.TrimSpace(text) != "" {
+				parts = append(parts, map[string]any{"type": textType, "text": text})
+				seenText = true
+			}
+		case "image":
+			if url, ok := imageBlockDataURL(block); ok {
+				if mode == "responses" {
+					parts = append(parts, map[string]any{"type": imageType, "image_url": url})
+				} else {
+					parts = append(parts, map[string]any{"type": imageType, "image_url": map[string]any{"url": url}})
+				}
+			}
+		}
+	}
+	if !seenText && strings.TrimSpace(message.Content) != "" {
+		parts = append([]map[string]any{{"type": textType, "text": message.Content}}, parts...)
+	}
+	return parts
 }
 
 func openAIResponsesAssistantItems(message Message) []any {
@@ -783,6 +854,28 @@ func openAIResponsesAssistantItems(message Message) []any {
 				// replay native reasoning; fold it into visible assistant text.
 				textParts = append(textParts, text)
 			}
+		case "web_search":
+			flushText()
+			if action, ok := webSearchActionFromBlock(block); ok {
+				items = append(items, map[string]any{"type": "web_search_call", "status": "completed", "action": action})
+			}
+		case "image_generation":
+			flushText()
+			result := openAIImageGenerationReplayResult(block)
+			if result == "" {
+				continue
+			}
+			if savedPath := stringValue(block["savedPath"]); savedPath != "" {
+				items = append(items, map[string]any{"role": "developer", "content": imageGenerationSavedPathInstruction(savedPath)})
+			}
+			item := map[string]any{"type": "image_generation_call", "status": "completed", "result": result}
+			if id := stringValue(block["id"]); id != "" {
+				item["id"] = id
+			}
+			if revisedPrompt := stringValue(block["revisedPrompt"]); revisedPrompt != "" {
+				item["revised_prompt"] = revisedPrompt
+			}
+			items = append(items, item)
 		case "tool_use":
 			flushText()
 			id := stringValue(block["id"])
@@ -801,6 +894,44 @@ func openAIResponsesAssistantItems(message Message) []any {
 		items = append(items, map[string]any{"type": "function_call", "call_id": call.ID, "name": call.Function.Name, "arguments": firstNonEmpty(call.Function.Arguments, "{}")})
 	}
 	return items
+}
+
+const maxImageGenerationReplayBytes = 20 * 1024 * 1024
+
+func openAIImageGenerationReplayResult(block map[string]any) string {
+	result := strings.TrimSpace(stringValue(block["result"]))
+	if result != "" {
+		return stripDataURLPrefix(result)
+	}
+	savedPath := strings.TrimSpace(stringValue(block["savedPath"]))
+	if savedPath == "" {
+		return ""
+	}
+	info, err := os.Stat(savedPath)
+	if err != nil || info.IsDir() || info.Size() <= 0 || info.Size() > maxImageGenerationReplayBytes {
+		return ""
+	}
+	data, err := os.ReadFile(savedPath)
+	if err != nil || len(data) == 0 || len(data) > maxImageGenerationReplayBytes {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func stripDataURLPrefix(value string) string {
+	if strings.HasPrefix(value, "data:") {
+		if idx := strings.Index(value, ";base64,"); idx >= 0 {
+			return strings.TrimSpace(value[idx+len(";base64,"):])
+		}
+	}
+	return value
+}
+
+func imageGenerationSavedPathInstruction(savedPath string) string {
+	dir := filepath.Dir(savedPath)
+	return "Generated images are saved to " + dir + " by default.\n" +
+		"The most recent generated image is saved as " + savedPath + ".\n" +
+		"If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it."
 }
 
 func appendCodexNativeTools(tools []map[string]any, model string) []map[string]any {

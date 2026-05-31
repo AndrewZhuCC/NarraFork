@@ -127,6 +127,10 @@ const (
 	shareHTMLPreviewContentType = "text/html; charset=utf-8"
 )
 
+const databaseCleanupArchivedSessionsMissingNarratorReason = "archivedSessions cleanup requires narrator service support so it can call the safe narrator delete path; this go_backend runtime does not provide h.Narrators."
+
+const databaseCleanupStaleSessionsDisabledReason = "staleSessions cleanup is disabled by the archived-only deletion policy: explicitly archive narrators first, then run archivedSessions cleanup. Preview remains available."
+
 var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 var sharePreviewMIMETypes = map[string]string{
@@ -186,7 +190,7 @@ func (h *Handler) RegisterWorkspaces(r chi.Router) {
 
 func (h *Handler) RegisterHooks(r chi.Router) {
 	r.Get("/", httpx.Handler(h.listHooks))
-	r.Get("/all", httpx.Handler(h.listHooks))
+	r.Get("/all", httpx.Handler(h.listAllHooks))
 	r.Post("/", httpx.Handler(h.createHook))
 	r.Get("/{id}", httpx.Handler(h.getHook))
 	r.Put("/{id}", httpx.Handler(h.updateHook))
@@ -221,12 +225,16 @@ func (h *Handler) RegisterShareCreate(r chi.Router) {
 	r.Post("/", httpx.Handler(h.createShare))
 }
 
+const workspaceSelectColumns = `id, user_id, title, tree, ` +
+	`strftime('%Y-%m-%dT%H:%M:%fZ', created_at / 1000.0, 'unixepoch') AS created_at, ` +
+	`strftime('%Y-%m-%dT%H:%M:%fZ', updated_at / 1000.0, 'unixepoch') AS updated_at`
+
 func (h *Handler) listWorkspaces(w http.ResponseWriter, r *http.Request) error {
 	userID, err := currentUserID(r)
 	if err != nil {
 		return err
 	}
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT id, user_id, title, tree, created_at, updated_at FROM workspaces WHERE user_id = ? ORDER BY updated_at DESC`, userID)
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT `+workspaceSelectColumns+` FROM workspaces WHERE user_id = ? ORDER BY updated_at DESC`, userID)
 	if err != nil {
 		return err
 	}
@@ -244,18 +252,12 @@ func (h *Handler) createWorkspace(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	var body struct {
-		Title string `json:"title"`
-		Tree  string `json:"tree"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	body, err := decodeWorkspaceBody(r, true)
+	if err != nil {
 		return err
 	}
-	if body.Tree == "" {
-		return httpx.BadRequest("tree is required")
-	}
 	if body.Title == "" {
-		body.Title = "Workspace"
+		body.Title = defaultWorkspaceTitle()
 	}
 	wsID := id.New()
 	now := time.Now().UnixMilli()
@@ -277,26 +279,32 @@ func (h *Handler) updateWorkspace(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	var body map[string]any
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	body, err := decodeWorkspaceBody(r, false)
+	if err != nil {
 		return err
+	}
+	workspaceID := chi.URLParam(r, "id")
+	exists, err := h.workspaceExists(r.Context(), workspaceID, userID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return httpx.NotFound("Workspace")
 	}
 	sets := []string{}
 	args := []any{}
-	if v, ok := body["title"].(string); ok {
+	if body.HasTitle {
 		sets = append(sets, "title = ?")
-		args = append(args, v)
+		args = append(args, body.Title)
 	}
-	if v, ok := body["tree"].(string); ok {
+	if body.HasTree {
 		sets = append(sets, "tree = ?")
-		args = append(args, v)
+		args = append(args, body.Tree)
 	}
-	if len(sets) > 0 {
-		sets = append(sets, "updated_at = ?")
-		args = append(args, time.Now().UnixMilli(), chi.URLParam(r, "id"), userID)
-		if _, err := h.DB.ExecContext(r.Context(), `UPDATE workspaces SET `+strings.Join(sets, ",")+` WHERE id = ? AND user_id = ?`, args...); err != nil {
-			return err
-		}
+	sets = append(sets, "updated_at = ?")
+	args = append(args, time.Now().UnixMilli(), workspaceID, userID)
+	if _, err := h.DB.ExecContext(r.Context(), `UPDATE workspaces SET `+strings.Join(sets, ",")+` WHERE id = ? AND user_id = ?`, args...); err != nil {
+		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
@@ -306,7 +314,15 @@ func (h *Handler) deleteWorkspace(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	_, err = h.DB.ExecContext(r.Context(), `DELETE FROM workspaces WHERE id = ? AND user_id = ?`, chi.URLParam(r, "id"), userID)
+	workspaceID := chi.URLParam(r, "id")
+	exists, err := h.workspaceExists(r.Context(), workspaceID, userID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return httpx.NotFound("Workspace")
+	}
+	_, err = h.DB.ExecContext(r.Context(), `DELETE FROM workspaces WHERE id = ? AND user_id = ?`, workspaceID, userID)
 	if err != nil {
 		return err
 	}
@@ -314,7 +330,7 @@ func (h *Handler) deleteWorkspace(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 func (h *Handler) getWorkspaceByID(w http.ResponseWriter, r *http.Request, wsID, userID string, status int) error {
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,user_id,title,tree,created_at,updated_at FROM workspaces WHERE id = ? AND user_id = ?`, wsID, userID)
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT `+workspaceSelectColumns+` FROM workspaces WHERE id = ? AND user_id = ?`, wsID, userID)
 	if err != nil {
 		return err
 	}
@@ -330,8 +346,89 @@ func (h *Handler) getWorkspaceByID(w http.ResponseWriter, r *http.Request, wsID,
 	return nil
 }
 
+func (h *Handler) workspaceExists(ctx context.Context, workspaceID, userID string) (bool, error) {
+	var count int
+	if err := h.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM workspaces WHERE id = ? AND user_id = ?`, workspaceID, userID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+type workspaceBody struct {
+	Title    string
+	Tree     string
+	HasTitle bool
+	HasTree  bool
+}
+
+func decodeWorkspaceBody(r *http.Request, requireTree bool) (workspaceBody, error) {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
+		return workspaceBody{}, err
+	}
+	body := workspaceBody{}
+	if value, exists := raw["title"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return workspaceBody{}, httpx.BadRequest("title must be a string")
+		}
+		if len(text) > 200 {
+			return workspaceBody{}, httpx.BadRequest("title is too long")
+		}
+		body.Title = text
+		body.HasTitle = true
+	}
+	if value, exists := raw["tree"]; exists {
+		text, ok := value.(string)
+		if !ok {
+			return workspaceBody{}, httpx.BadRequest("tree must be a string")
+		}
+		if len(text) < 2 {
+			return workspaceBody{}, httpx.BadRequest("tree must be at least 2 characters")
+		}
+		if len(text) > 50000 {
+			return workspaceBody{}, httpx.BadRequest("tree is too long")
+		}
+		body.Tree = text
+		body.HasTree = true
+	}
+	if requireTree && !body.HasTree {
+		return workspaceBody{}, httpx.BadRequest("tree is required")
+	}
+	return body, nil
+}
+
+func defaultWorkspaceTitle() string {
+	suffix := strconv.FormatInt(time.Now().UnixMilli(), 36)
+	if len(suffix) > 4 {
+		suffix = suffix[len(suffix)-4:]
+	}
+	return "Workspace " + suffix
+}
+
 func (h *Handler) listHooks(w http.ResponseWriter, r *http.Request) error {
-	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at FROM hooks WHERE (? = '' OR project_id = ?) ORDER BY sort_order ASC, created_at DESC`, r.URL.Query().Get("projectId"), r.URL.Query().Get("projectId"))
+	projectID := r.URL.Query().Get("projectId")
+	query := `SELECT id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at FROM hooks WHERE project_id IS NULL ORDER BY sort_order ASC, created_at DESC`
+	args := []any{}
+	if projectID != "" {
+		query = `SELECT id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at FROM hooks WHERE project_id = ? ORDER BY sort_order ASC, created_at DESC`
+		args = append(args, projectID)
+	}
+	rows, err := h.DB.QueryContext(r.Context(), query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	items, err := rowsToMaps(rows)
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, items)
+	return nil
+}
+
+func (h *Handler) listAllHooks(w http.ResponseWriter, r *http.Request) error {
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at FROM hooks ORDER BY sort_order ASC, created_at DESC`)
 	if err != nil {
 		return err
 	}
@@ -344,14 +441,14 @@ func (h *Handler) listHooks(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 func (h *Handler) createHook(w http.ResponseWriter, r *http.Request) error {
-	var body map[string]any
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	body, err := decodeCreateHookBody(r)
+	if err != nil {
 		return err
 	}
 	hookID := id.New()
 	now := db.NowISO()
-	headers, _ := json.Marshal(body["headers"])
-	_, err := h.DB.ExecContext(r.Context(), `INSERT INTO hooks (id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, hookID, nullableString(body["projectId"]), stringOr(body["event"], "PreToolUse"), stringOr(body["matcher"], ""), stringOr(body["type"], "command"), nullableString(body["command"]), nullableString(body["url"]), string(headers), nullableString(body["prompt"]), nullableString(body["model"]), intOr(body["timeout"], 30), boolInt(body["enabled"], true), intOr(body["sortOrder"], 0), now, now)
+	headers, _ := json.Marshal(body.Headers)
+	_, err = h.DB.ExecContext(r.Context(), `INSERT INTO hooks (id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, hookID, nullableString(body.ProjectID), body.Event, body.Matcher, body.Type, nullableString(body.Command), nullableString(body.URL), string(headers), nil, nil, body.Timeout, boolInt(body.Enabled, true), body.SortOrder, now, now)
 	if err != nil {
 		return err
 	}
@@ -361,24 +458,376 @@ func (h *Handler) getHook(w http.ResponseWriter, r *http.Request) error {
 	return h.getHookByID(w, r, chi.URLParam(r, "id"), http.StatusOK)
 }
 func (h *Handler) updateHook(w http.ResponseWriter, r *http.Request) error {
-	var body map[string]any
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
-		return err
-	}
-	_, err := h.DB.ExecContext(r.Context(), `UPDATE hooks SET event=COALESCE(?,event), matcher=COALESCE(?,matcher), type=COALESCE(?,type), command=COALESCE(?,command), url=COALESCE(?,url), timeout=COALESCE(?,timeout), enabled=COALESCE(?,enabled), sort_order=COALESCE(?,sort_order), updated_at=? WHERE id=?`, nullableString(body["event"]), nullableString(body["matcher"]), nullableString(body["type"]), nullableString(body["command"]), nullableString(body["url"]), nullableNumber(body["timeout"]), nullableBoolInt(body["enabled"]), nullableNumber(body["sortOrder"]), db.NowISO(), chi.URLParam(r, "id"))
+	hookID := chi.URLParam(r, "id")
+	existingType, err := h.hookType(r.Context(), hookID)
 	if err != nil {
 		return err
 	}
-	return h.getHookByID(w, r, chi.URLParam(r, "id"), http.StatusOK)
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
+		return err
+	}
+	patch, err := decodeUpdateHookBody(raw, existingType)
+	if err != nil {
+		return err
+	}
+	sets := []string{}
+	args := []any{}
+	if patch.EventSet {
+		sets = append(sets, "event=?")
+		args = append(args, patch.Event)
+	}
+	if patch.MatcherSet {
+		sets = append(sets, "matcher=?")
+		args = append(args, patch.Matcher)
+	}
+	if patch.TypeSet {
+		sets = append(sets, "type=?")
+		args = append(args, patch.Type)
+	}
+	if patch.CommandSet {
+		sets = append(sets, "command=?")
+		args = append(args, patch.Command)
+	}
+	if patch.URLSet {
+		sets = append(sets, "url=?")
+		args = append(args, patch.URL)
+	}
+	if patch.HeadersSet {
+		sets = append(sets, "headers=?")
+		args = append(args, patch.Headers)
+	}
+	if patch.TimeoutSet {
+		sets = append(sets, "timeout=?")
+		args = append(args, patch.Timeout)
+	}
+	if patch.EnabledSet {
+		sets = append(sets, "enabled=?")
+		args = append(args, boolInt(patch.Enabled, true))
+	}
+	if patch.SortOrderSet {
+		sets = append(sets, "sort_order=?")
+		args = append(args, patch.SortOrder)
+	}
+	sets = append(sets, "updated_at=?")
+	args = append(args, db.NowISO(), hookID)
+	_, err = h.DB.ExecContext(r.Context(), "UPDATE hooks SET "+strings.Join(sets, ", ")+" WHERE id=?", args...)
+	if err != nil {
+		return err
+	}
+	return h.getHookByID(w, r, hookID, http.StatusOK)
 }
 func (h *Handler) deleteHook(w http.ResponseWriter, r *http.Request) error {
-	_, err := h.DB.ExecContext(r.Context(), `DELETE FROM hooks WHERE id=?`, chi.URLParam(r, "id"))
+	hookID := chi.URLParam(r, "id")
+	exists, err := h.hookExists(r.Context(), hookID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return httpx.NotFound("Hook")
+	}
+	_, err = h.DB.ExecContext(r.Context(), `DELETE FROM hooks WHERE id=?`, hookID)
 	if err != nil {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
 }
+func (h *Handler) hookExists(ctx context.Context, hookID string) (bool, error) {
+	var count int
+	if err := h.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM hooks WHERE id=?`, hookID).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (h *Handler) hookType(ctx context.Context, hookID string) (string, error) {
+	var hookType string
+	if err := h.DB.QueryRowContext(ctx, `SELECT type FROM hooks WHERE id=?`, hookID).Scan(&hookType); err != nil {
+		if err == sql.ErrNoRows {
+			return "", httpx.NotFound("Hook")
+		}
+		return "", err
+	}
+	return hookType, nil
+}
+
+type hookCreateBody struct {
+	ProjectID string
+	Event     string
+	Matcher   string
+	Type      string
+	Command   string
+	URL       string
+	Headers   map[string]string
+	Timeout   int
+	Enabled   bool
+	SortOrder int
+}
+
+type hookUpdatePatch struct {
+	EventSet     bool
+	Event        string
+	MatcherSet   bool
+	Matcher      string
+	TypeSet      bool
+	Type         string
+	CommandSet   bool
+	Command      any
+	URLSet       bool
+	URL          any
+	HeadersSet   bool
+	Headers      any
+	TimeoutSet   bool
+	Timeout      int
+	EnabledSet   bool
+	Enabled      bool
+	SortOrderSet bool
+	SortOrder    int
+}
+
+func decodeCreateHookBody(r *http.Request) (hookCreateBody, error) {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
+		return hookCreateBody{}, err
+	}
+	body := hookCreateBody{Matcher: "", Headers: nil, Timeout: 30, Enabled: true, SortOrder: 0}
+	if value, exists := raw["projectId"]; exists {
+		text, ok := value.(string)
+		if !ok || text == "" || len(text) > 100 {
+			return hookCreateBody{}, httpx.BadRequest("projectId must be a non-empty string")
+		}
+		body.ProjectID = text
+	}
+	event, ok := raw["event"].(string)
+	if !ok || (event != "PreToolUse" && event != "PostToolUse") {
+		return hookCreateBody{}, httpx.BadRequest("event must be PreToolUse or PostToolUse")
+	}
+	body.Event = event
+	if value, exists := raw["matcher"]; exists {
+		text, ok := value.(string)
+		if !ok || len(text) > 200 {
+			return hookCreateBody{}, httpx.BadRequest("matcher must be a string up to 200 characters")
+		}
+		body.Matcher = text
+	}
+	hookType, ok := raw["type"].(string)
+	if !ok || (hookType != "command" && hookType != "http") {
+		return hookCreateBody{}, httpx.BadRequest("type must be command or http")
+	}
+	body.Type = hookType
+	if value, exists := raw["command"]; exists {
+		text, ok := value.(string)
+		if !ok || len(text) > 10000 {
+			return hookCreateBody{}, httpx.BadRequest("command must be a string up to 10000 characters")
+		}
+		body.Command = text
+	}
+	if value, exists := raw["url"]; exists {
+		text, ok := value.(string)
+		if !ok || len(text) > 2000 {
+			return hookCreateBody{}, httpx.BadRequest("url must be a string up to 2000 characters")
+		}
+		if !isValidHookURL(text) {
+			return hookCreateBody{}, httpx.BadRequest("url must be a valid URL")
+		}
+		body.URL = text
+	}
+	if hookType == "command" && body.Command == "" {
+		return hookCreateBody{}, httpx.BadRequest("Missing required field for hook type")
+	}
+	if hookType == "http" && body.URL == "" {
+		return hookCreateBody{}, httpx.BadRequest("Missing required field for hook type")
+	}
+	if value, exists := raw["headers"]; exists {
+		headers, err := stringMapField(value, "headers", 2000)
+		if err != nil {
+			return hookCreateBody{}, err
+		}
+		body.Headers = headers
+	}
+	if value, exists := raw["timeout"]; exists {
+		timeout, err := intField(value, "timeout")
+		if err != nil {
+			return hookCreateBody{}, err
+		}
+		if timeout < 1 || timeout > 600 {
+			return hookCreateBody{}, httpx.BadRequest("timeout must be between 1 and 600")
+		}
+		body.Timeout = timeout
+	}
+	if value, exists := raw["enabled"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return hookCreateBody{}, httpx.BadRequest("enabled must be a boolean")
+		}
+		body.Enabled = enabled
+	}
+	if value, exists := raw["sortOrder"]; exists {
+		sortOrder, err := intField(value, "sortOrder")
+		if err != nil {
+			return hookCreateBody{}, err
+		}
+		body.SortOrder = sortOrder
+	}
+	return body, nil
+}
+
+func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePatch, error) {
+	patch := hookUpdatePatch{}
+	if value, exists := raw["event"]; exists {
+		text, ok := value.(string)
+		if !ok || (text != "PreToolUse" && text != "PostToolUse") {
+			return patch, httpx.BadRequest("event must be PreToolUse or PostToolUse")
+		}
+		patch.EventSet = true
+		patch.Event = text
+	}
+	if value, exists := raw["matcher"]; exists {
+		text, ok := value.(string)
+		if !ok || len(text) > 200 {
+			return patch, httpx.BadRequest("matcher must be a string up to 200 characters")
+		}
+		patch.MatcherSet = true
+		patch.Matcher = text
+	}
+	if value, exists := raw["type"]; exists {
+		text, ok := value.(string)
+		if !ok || (text != "command" && text != "http") {
+			return patch, httpx.BadRequest("type must be command or http")
+		}
+		patch.TypeSet = true
+		patch.Type = text
+	}
+	if value, exists := raw["command"]; exists {
+		patch.CommandSet = true
+		if value == nil {
+			patch.Command = nil
+		} else {
+			text, ok := value.(string)
+			if !ok || len(text) > 10000 {
+				return patch, httpx.BadRequest("command must be a string up to 10000 characters")
+			}
+			patch.Command = text
+		}
+	}
+	if value, exists := raw["url"]; exists {
+		patch.URLSet = true
+		if value == nil {
+			patch.URL = nil
+		} else {
+			text, ok := value.(string)
+			if !ok || len(text) > 2000 {
+				return patch, httpx.BadRequest("url must be a string up to 2000 characters")
+			}
+			if !isValidHookURL(text) {
+				return patch, httpx.BadRequest("url must be a valid URL")
+			}
+			patch.URL = text
+		}
+	}
+	if value, exists := raw["headers"]; exists {
+		patch.HeadersSet = true
+		if value == nil {
+			patch.Headers = nil
+		} else {
+			headers, err := stringMapField(value, "headers", 2000)
+			if err != nil {
+				return patch, err
+			}
+			encoded, err := json.Marshal(headers)
+			if err != nil {
+				return patch, err
+			}
+			patch.Headers = string(encoded)
+		}
+	}
+	if value, exists := raw["timeout"]; exists {
+		timeout, err := intField(value, "timeout")
+		if err != nil {
+			return patch, err
+		}
+		if timeout < 1 || timeout > 600 {
+			return patch, httpx.BadRequest("timeout must be between 1 and 600")
+		}
+		patch.TimeoutSet = true
+		patch.Timeout = timeout
+	}
+	if value, exists := raw["enabled"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return patch, httpx.BadRequest("enabled must be a boolean")
+		}
+		patch.EnabledSet = true
+		patch.Enabled = enabled
+	}
+	if value, exists := raw["sortOrder"]; exists {
+		sortOrder, err := intField(value, "sortOrder")
+		if err != nil {
+			return patch, err
+		}
+		patch.SortOrderSet = true
+		patch.SortOrder = sortOrder
+	}
+	if patch.TypeSet {
+		if patch.Type == "command" && (!patch.CommandSet || patch.Command == nil) {
+			return patch, httpx.BadRequest("When changing hook type, the corresponding field (command/url) must be provided")
+		}
+		if patch.Type == "http" && (!patch.URLSet || patch.URL == nil) {
+			return patch, httpx.BadRequest("When changing hook type, the corresponding field (command/url) must be provided")
+		}
+	}
+	effectiveType := existingType
+	if patch.TypeSet {
+		effectiveType = patch.Type
+	}
+	if effectiveType == "command" && patch.CommandSet && patch.Command == nil {
+		return patch, httpx.BadRequest("Cannot clear command without changing hook type — the hook would have no command to execute")
+	}
+	if effectiveType == "http" && patch.URLSet && patch.URL == nil {
+		return patch, httpx.BadRequest("Cannot clear url without changing hook type — the hook would have no URL to call")
+	}
+	return patch, nil
+}
+
+func isValidHookURL(text string) bool {
+	parsed, err := url.Parse(text)
+	return err == nil && parsed.Scheme != "" && parsed.Host != ""
+}
+
+func stringMapField(value any, field string, maxValueLength int) (map[string]string, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, httpx.BadRequest(field + " must be an object")
+	}
+	out := map[string]string{}
+	for key, raw := range object {
+		text, ok := raw.(string)
+		if !ok {
+			return nil, httpx.BadRequest(field + "." + key + " must be a string")
+		}
+		if len(text) > maxValueLength {
+			return nil, httpx.BadRequest(field + "." + key + " is too long")
+		}
+		out[key] = text
+	}
+	return out, nil
+}
+
+func intField(value any, field string) (int, error) {
+	switch n := value.(type) {
+	case float64:
+		if n != float64(int(n)) {
+			return 0, httpx.BadRequest(field + " must be an integer")
+		}
+		return int(n), nil
+	case int:
+		return n, nil
+	default:
+		return 0, httpx.BadRequest(field + " must be an integer")
+	}
+}
+
 func (h *Handler) getHookByID(w http.ResponseWriter, r *http.Request, hookID string, status int) error {
 	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,project_id,event,matcher,type,command,url,headers,prompt,model,timeout,enabled,sort_order,created_at,updated_at FROM hooks WHERE id=?`, hookID)
 	if err != nil {
@@ -567,13 +1016,16 @@ func (h *Handler) uploadNotificationSound(w http.ResponseWriter, r *http.Request
 	}
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		return httpx.BadRequest("missing file in form data")
+		return httpx.ValidationError("Missing file in form data")
 	}
 	defer file.Close()
 	mediaType := header.Header.Get("Content-Type")
-	ext := soundExt(mediaType, filepath.Ext(header.Filename))
+	ext := soundExt(mediaType)
 	if ext == "" {
-		return httpx.BadRequest("unsupported audio type")
+		return httpx.ValidationError("Unsupported MIME type: " + mediaType + ". Allowed: audio/mpeg, audio/wav, audio/x-wav, audio/ogg, audio/webm")
+	}
+	if header.Size > 1*1024*1024 {
+		return httpx.ValidationError("File size exceeds 1MB limit")
 	}
 	soundID := id.Must(8)
 	dir := filepath.Join(notificationSoundsRoot(), userID)
@@ -589,12 +1041,16 @@ func (h *Handler) uploadNotificationSound(w http.ResponseWriter, r *http.Request
 	if _, err := io.Copy(out, file); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"id": soundID, "filename": soundID + ext, "mediaType": mediaType})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"id": soundID, "filename": soundID + ext, "mediaType": mediaType})
 	return nil
 }
 
 func (h *Handler) serveNotificationSound(w http.ResponseWriter, r *http.Request) error {
-	path := findSoundFile(chi.URLParam(r, "id"), "")
+	userID := optionalUserID(r)
+	path, err := findSoundFile(chi.URLParam(r, "id"), userID)
+	if err != nil {
+		return err
+	}
 	if path == "" {
 		return httpx.NotFound("Notification sound")
 	}
@@ -608,7 +1064,10 @@ func (h *Handler) serveNotificationSound(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) deleteNotificationSound(w http.ResponseWriter, r *http.Request) error {
 	userID := optionalUserID(r)
-	path := findSoundFile(chi.URLParam(r, "id"), userID)
+	path, err := findSoundFile(chi.URLParam(r, "id"), userID)
+	if err != nil {
+		return err
+	}
 	if path == "" {
 		return httpx.NotFound("Notification sound")
 	}
@@ -624,7 +1083,7 @@ func notificationSoundsRoot() string {
 	return filepath.Join(home, ".narrafork", "notification-sounds")
 }
 
-func soundExt(mediaType, fallback string) string {
+func soundExt(mediaType string) string {
 	switch mediaType {
 	case "audio/mpeg":
 		return ".mp3"
@@ -635,40 +1094,27 @@ func soundExt(mediaType, fallback string) string {
 	case "audio/webm":
 		return ".webm"
 	}
-	fallback = strings.ToLower(fallback)
-	if fallback == ".mp3" || fallback == ".wav" || fallback == ".ogg" || fallback == ".webm" {
-		return fallback
-	}
 	return ""
 }
 
-func findSoundFile(soundID, userID string) string {
+func findSoundFile(soundID, userID string) (string, error) {
 	if strings.Contains(soundID, "/") || strings.Contains(soundID, "\\") || strings.Contains(soundID, "..") {
-		return ""
+		return "", httpx.ValidationError("Invalid sound ID")
 	}
-	root := notificationSoundsRoot()
-	searchDirs := []string{}
-	if userID != "" {
-		searchDirs = append(searchDirs, filepath.Join(root, userID))
-	} else if entries, err := os.ReadDir(root); err == nil {
-		for _, entry := range entries {
-			if entry.IsDir() {
-				searchDirs = append(searchDirs, filepath.Join(root, entry.Name()))
-			}
+	dir := filepath.Join(notificationSoundsRoot(), userID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), soundID) {
+			return filepath.Join(dir, entry.Name()), nil
 		}
 	}
-	for _, dir := range searchDirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue
-		}
-		for _, entry := range entries {
-			if strings.HasPrefix(entry.Name(), soundID) {
-				return filepath.Join(dir, entry.Name())
-			}
-		}
-	}
-	return ""
+	return "", nil
 }
 
 func (h *Handler) createShare(w http.ResponseWriter, r *http.Request) error {
@@ -1313,15 +1759,21 @@ func (h *Handler) databaseTableSummaries(r *http.Request) ([]map[string]any, []m
 	if err != nil {
 		return []map[string]any{}, []map[string]any{}
 	}
-	defer rows.Close()
-	tables := []map[string]any{}
-	categoryRows := map[string]int64{}
-	categoryTables := map[string]int{}
+	tableNames := []string{}
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			continue
 		}
+		tableNames = append(tableNames, name)
+	}
+	if err := rows.Close(); err != nil {
+		return []map[string]any{}, []map[string]any{}
+	}
+	tables := []map[string]any{}
+	categoryRows := map[string]int64{}
+	categoryTables := map[string]int{}
+	for _, name := range tableNames {
 		rowCount, countErr := h.tableRowCount(r, name)
 		category := databaseTableCategory(name)
 		categoryRows[category] += rowCount
@@ -1398,8 +1850,12 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 	if body.OlderThanDays <= 0 {
 		body.OlderThanDays = defaultDatabaseRetentionDays(body.Target)
 	}
-	if body.Target == "archivedSessions" || body.Target == "staleSessions" {
-		httpx.WriteFeatureDisabled(w, "storage.database.cleanup."+body.Target, "Go database cleanup execution for narrator sessions is disabled until the Bun-equivalent safe narrator deletion plan, shared message ref handoff, child narrator handling, running terminal guard, and upload preservation semantics are implemented. Preview remains available.")
+	if body.Target == "staleSessions" {
+		httpx.WriteFeatureDisabled(w, "storage.database.cleanup."+body.Target, databaseCleanupStaleSessionsDisabledReason)
+		return nil
+	}
+	if body.Target == "archivedSessions" && h.Narrators == nil {
+		httpx.WriteFeatureDisabled(w, "storage.database.cleanup."+body.Target, databaseCleanupArchivedSessionsMissingNarratorReason)
 		return nil
 	}
 	before, _, _ := databaseFileSizes()
@@ -1416,7 +1872,7 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 			return err
 		}
 		changed = rowsAffected(res) > 0
-	case "archivedSessions", "staleSessions":
+	case "archivedSessions":
 		ids, err := h.databaseCleanupNarratorIDs(r, body.Target, body.OlderThanDays)
 		if err != nil {
 			return err
@@ -1570,7 +2026,19 @@ func (h *Handler) databaseCleanupNarratorIDs(r *http.Request, target string, old
 }
 
 func (h *Handler) deleteNarratorSessions(r *http.Request, ids []string) error {
-	return httpx.NotImplemented("storage.database.cleanup.archivedSessions")
+	if h.Narrators == nil {
+		return httpx.NotImplemented("storage.database.cleanup.archivedSessions")
+	}
+	for _, narratorID := range ids {
+		if err := h.Narrators.RemoveNarrator(r.Context(), narratorID); err != nil {
+			var appErr *httpx.AppError
+			if errors.As(err, &appErr) && appErr.Code == "NOT_FOUND" {
+				continue
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (h *Handler) countForNarratorIDs(r *http.Request, table string, ids []string) (int, error) {
@@ -3116,9 +3584,9 @@ func (h *Handler) rulerPositions(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Positions []struct {
 			ChapterID       string   `json:"chapterId"`
-			AnchorCommitSHA string   `json:"anchorCommitSha"`
-			AxisOffset      float64  `json:"axisOffset"`
-			CrossOffset     float64  `json:"crossOffset"`
+			AnchorCommitSHA *string  `json:"anchorCommitSha"`
+			AxisOffset      *float64 `json:"axisOffset"`
+			CrossOffset     *float64 `json:"crossOffset"`
 			Width           *float64 `json:"width"`
 			Height          *float64 `json:"height"`
 		} `json:"positions"`
@@ -3129,10 +3597,30 @@ func (h *Handler) rulerPositions(w http.ResponseWriter, r *http.Request) error {
 	projectID := chi.URLParam(r, "projectId")
 	for _, pos := range body.Positions {
 		if strings.TrimSpace(pos.ChapterID) == "" {
-			continue
+			return httpx.BadRequest("chapterId is required")
 		}
+		if pos.AnchorCommitSHA == nil || strings.TrimSpace(*pos.AnchorCommitSHA) == "" {
+			return httpx.BadRequest("anchorCommitSha is required")
+		}
+		if pos.AxisOffset == nil {
+			return httpx.BadRequest("axisOffset is required")
+		}
+		if pos.CrossOffset == nil {
+			return httpx.BadRequest("crossOffset is required")
+		}
+		if *pos.CrossOffset < 0 {
+			return httpx.BadRequest("crossOffset must be non-negative")
+		}
+		if pos.Width != nil && *pos.Width <= 0 {
+			return httpx.BadRequest("width must be positive")
+		}
+		if pos.Height != nil && *pos.Height <= 0 {
+			return httpx.BadRequest("height must be positive")
+		}
+	}
+	for _, pos := range body.Positions {
 		sets := []string{"anchor_commit_sha = ?", "axis_offset = ?", "cross_offset = ?", "updated_at = ?"}
-		args := []any{nullableString(pos.AnchorCommitSHA), pos.AxisOffset, pos.CrossOffset, db.NowISO()}
+		args := []any{nullableString(*pos.AnchorCommitSHA), *pos.AxisOffset, *pos.CrossOffset, db.NowISO()}
 		if pos.Width != nil {
 			sets = append(sets, "panel_width = ?")
 			args = append(args, *pos.Width)
@@ -3149,6 +3637,52 @@ func (h *Handler) rulerPositions(w http.ResponseWriter, r *http.Request) error {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"success": true})
 	return nil
+}
+
+func resolveRulerNarratorDisplayStatus(status, substatusRaw string) string {
+	status = strings.TrimSpace(status)
+	if status == "" {
+		return ""
+	}
+	substatus := parseRulerSubstatus(substatusRaw)
+	if stringSetHas(substatus, "reflecting") {
+		return "reflecting"
+	}
+	if status == "working" || status == "waiting" {
+		return status
+	}
+	if status != "idle" {
+		return status
+	}
+	for _, candidate := range []string{"error", "suspended", "manual_override", "interrupted", "unread"} {
+		if stringSetHas(substatus, candidate) {
+			return candidate
+		}
+	}
+	return status
+}
+
+func parseRulerSubstatus(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" {
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw), &values); err == nil {
+		return values
+	}
+	return strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '[' || r == ']' || r == '"' || r == '\''
+	})
+}
+
+func stringSetHas(values []string, target string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) rulerProjectChapters(ctx context.Context, projectID string) ([]map[string]any, error) {
@@ -3183,6 +3717,13 @@ func (h *Handler) rulerProjectChapters(ctx context.Context, projectID string) ([
 				ORDER BY CASE WHEN n.variant = 'primary' OR n.type = 'primary' THEN 0 ELSE 1 END, n.created_at ASC
 				LIMIT 1
 			) AS narrator_status,
+			(
+				SELECT n.substatus
+				FROM narrators n
+				WHERE n.chapter_id = c.id
+				ORDER BY CASE WHEN n.variant = 'primary' OR n.type = 'primary' THEN 0 ELSE 1 END, n.created_at ASC
+				LIMIT 1
+			) AS narrator_substatus,
 			c.review_source_chapter_id,
 			c.review_status
 		FROM chapters c
@@ -3192,7 +3733,18 @@ func (h *Handler) rulerProjectChapters(ctx context.Context, projectID string) ([
 		return nil, err
 	}
 	defer rows.Close()
-	return rowsToMaps(rows)
+	items, err := rowsToMaps(rows)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		item["narratorStatus"] = resolveRulerNarratorDisplayStatus(
+			stringMap(item, "narratorStatus", ""),
+			stringMap(item, "narratorSubstatus", ""),
+		)
+		delete(item, "narratorSubstatus")
+	}
+	return items, nil
 }
 
 func (h *Handler) chapterBelongsToRulerSegment(ch map[string]any, fromSha string, byID map[string]map[string]any) bool {
@@ -3336,6 +3888,42 @@ func (h *Handler) createVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	chapterID := strings.TrimSpace(stringOr(body["chapterId"], ""))
+	if chapterID == "" {
+		chapterID = strings.TrimSpace(stringOr(body["sourceChapterId"], ""))
+	}
+	if chapterID == "" {
+		return httpx.BadRequest("chapterId is required")
+	}
+	serviceName := strings.TrimSpace(stringOr(body["serviceName"], ""))
+	if serviceName == "" {
+		return httpx.BadRequest("serviceName is required")
+	}
+	if len(serviceName) > 200 {
+		return httpx.BadRequest("serviceName is too long")
+	}
+	containerPath, err := validateContainerSnapshotPath(stringOr(body["containerPath"], ""))
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(stringOr(body["name"], ""))
+	if name == "" {
+		return httpx.BadRequest("name is required")
+	}
+	if len(name) > 200 {
+		return httpx.BadRequest("name is too long")
+	}
+	var description any
+	if _, ok := body["description"]; ok {
+		var err error
+		description, err = validateVolumeSnapshotDescription(body["description"], false)
+		if err != nil {
+			return err
+		}
+	}
+	if err := h.ensureChapterInProject(r.Context(), chapterID, chi.URLParam(r, "projectId")); err != nil {
+		return err
+	}
 	if !podmanSnapshotAvailable() {
 		writeVolumeSnapshotFallback(w, "PODMAN_NOT_FOUND", "podman is not available; volume snapshot creation requires Podman")
 		return nil
@@ -3344,11 +3932,7 @@ func (h *Handler) createVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 	if claims != nil {
 		createdBy = claims.Subject
 	}
-	chapterID := strings.TrimSpace(stringOr(body["chapterId"], ""))
-	if chapterID == "" {
-		chapterID = strings.TrimSpace(stringOr(body["sourceChapterId"], ""))
-	}
-	snapshotID, err := h.createVolumeSnapshotArchive(r.Context(), chi.URLParam(r, "projectId"), chapterID, strings.TrimSpace(stringOr(body["serviceName"], "")), stringOr(body["containerPath"], ""), strings.TrimSpace(stringOr(body["name"], "")), nullableString(body["description"]), createdBy)
+	snapshotID, err := h.createVolumeSnapshotArchive(r.Context(), chi.URLParam(r, "projectId"), chapterID, serviceName, containerPath, name, description, createdBy)
 	if err != nil {
 		return err
 	}
@@ -3362,7 +3946,33 @@ func (h *Handler) updateVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	_, err := h.DB.ExecContext(r.Context(), `UPDATE volume_snapshots SET name=COALESCE(?,name), description=COALESCE(?,description), updated_at=? WHERE id=?`, nullableString(body["name"]), nullableString(body["description"]), db.NowISO(), chi.URLParam(r, "id"))
+	sets := []string{"updated_at=?"}
+	args := []any{db.NowISO()}
+	if rawName, ok := body["name"]; ok {
+		name, ok := rawName.(string)
+		if !ok {
+			return httpx.BadRequest("name must be a string")
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return httpx.BadRequest("name is required")
+		}
+		if len(name) > 200 {
+			return httpx.BadRequest("name is too long")
+		}
+		sets = append(sets, "name=?")
+		args = append(args, name)
+	}
+	if _, ok := body["description"]; ok {
+		description, err := validateVolumeSnapshotDescription(body["description"], true)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, "description=?")
+		args = append(args, description)
+	}
+	args = append(args, chi.URLParam(r, "id"))
+	_, err := h.DB.ExecContext(r.Context(), `UPDATE volume_snapshots SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
 	if err != nil {
 		return err
 	}
@@ -3399,8 +4009,12 @@ func (h *Handler) applyVolumeSnapshot(w http.ResponseWriter, r *http.Request) er
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if strings.TrimSpace(body.TargetChapterID) == "" {
+	body.TargetChapterID = strings.TrimSpace(body.TargetChapterID)
+	if body.TargetChapterID == "" {
 		return httpx.BadRequest("targetChapterId is required")
+	}
+	if _, err := h.getVolumeSnapshotRecord(r.Context(), chi.URLParam(r, "id")); err != nil {
+		return err
 	}
 	if !podmanSnapshotAvailable() {
 		writeVolumeSnapshotFallback(w, "PODMAN_NOT_FOUND", "podman is not available; volume snapshot apply requires Podman")
@@ -3416,6 +4030,23 @@ func (h *Handler) applyVolumeSnapshot(w http.ResponseWriter, r *http.Request) er
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"success": true})
 	return nil
 }
+func validateVolumeSnapshotDescription(value any, nullable bool) (any, error) {
+	if value == nil {
+		if nullable {
+			return nil, nil
+		}
+		return nil, httpx.BadRequest("description must be a string")
+	}
+	description, ok := value.(string)
+	if !ok {
+		return nil, httpx.BadRequest("description must be a string")
+	}
+	if len(description) > 2000 {
+		return nil, httpx.BadRequest("description is too long")
+	}
+	return description, nil
+}
+
 func (h *Handler) listSnapshotApplications(w http.ResponseWriter, r *http.Request) error {
 	rows, err := h.DB.QueryContext(r.Context(), `SELECT id,snapshot_id,chapter_id,applied_at,applied_by FROM volume_snapshot_applications WHERE snapshot_id=? ORDER BY applied_at DESC`, chi.URLParam(r, "id"))
 	if err != nil {
@@ -3488,12 +4119,33 @@ func normalize(v any, col string) any {
 	if col == "enabled" {
 		return v == int64(1)
 	}
+	if col == "headers" {
+		switch x := v.(type) {
+		case nil:
+			return nil
+		case []byte:
+			return decodeJSONMapOrNil(string(x))
+		case string:
+			return decodeJSONMapOrNil(x)
+		}
+	}
 	switch x := v.(type) {
 	case []byte:
 		return string(x)
 	default:
 		return x
 	}
+}
+
+func decodeJSONMapOrNil(raw string) any {
+	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "null" {
+		return nil
+	}
+	var object map[string]string
+	if err := json.Unmarshal([]byte(raw), &object); err == nil {
+		return object
+	}
+	return raw
 }
 func snakeToCamel(s string) string {
 	parts := strings.Split(s, "_")

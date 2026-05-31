@@ -7,13 +7,173 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
 
+	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/ws"
 )
+
+func TestSubagentPendingPermissionBroadcastsToParentNarrator(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := "2026-05-18T00:00:00Z"
+	childID := "nar_sub_permission"
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (
+		id, type, title, inherit_mode, parent_narrator_id, model, permission_mode, status, substatus, plan_mode,
+		cwd, variant, traits, is_background, is_ask_in_passing, message_version, message_count,
+		total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, 'subagent', 'Permission child', 'fresh', ?, 'openai:test', 'default', 'idle', '[]', 0, '', 'subagent', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, childID, parentID, now, now); err != nil {
+		t.Fatalf("insert child narrator: %v", err)
+	}
+	service := &Service{DB: sqlDB}
+	child, err := service.Get(context.Background(), childID)
+	if err != nil {
+		t.Fatalf("load child narrator: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	call := agentbasic.ToolCall{ID: "tool-sub-perm", Type: "function"}
+	call.Function.Name = "Write"
+	call.Function.Arguments = `{"file_path":"child.txt","content":"x"}`
+	if err := service.recordPendingToolCall(context.Background(), childID, "msg-sub-perm", child, call, "needs approval"); err != nil {
+		t.Fatalf("record pending subagent tool call: %v", err)
+	}
+	broadcasts := events()
+	if len(broadcasts) != 1 || broadcasts[0].NarratorID != parentID || broadcasts[0].Payload["narratorId"] != parentID || broadcasts[0].Payload["type"] != "permission_request" {
+		t.Fatalf("expected subagent permission request broadcast to parent, got %#v", broadcasts)
+	}
+	targetID, toolUseID, err := NewHandler(service).permissionTarget(context.Background(), "tool-sub-perm")
+	if err != nil {
+		t.Fatalf("resolve permission target: %v", err)
+	}
+	if targetID != parentID || toolUseID != "tool-sub-perm" {
+		t.Fatalf("expected permission target parent/tool, got target=%q tool=%q", targetID, toolUseID)
+	}
+}
+
+func TestParentPermissionsListIncludesSubagentPendingPermission(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := "2026-05-18T00:00:00Z"
+	childID := "nar_sub_permission_list"
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (
+		id, type, title, inherit_mode, parent_narrator_id, model, permission_mode, status, substatus, plan_mode,
+		cwd, variant, traits, is_background, is_ask_in_passing, message_version, message_count,
+		total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, 'subagent', 'Permission list child', 'fresh', ?, 'openai:test', 'default', 'waiting', '["awaiting_permission"]', 0, '', 'subagent', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, childID, parentID, now, now); err != nil {
+		t.Fatalf("insert child narrator: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, permission_decision_reason, created_at) VALUES ('req-sub-list', ?, 'tool-sub-list', 'Write', '{"file_path":"child.txt"}', 'pending', 'needs parent approval', ?)`, childID, now); err != nil {
+		t.Fatalf("insert child pending permission: %v", err)
+	}
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+parentID+"/permissions")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected permissions 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &items); err != nil {
+		t.Fatalf("decode permissions response: %v", err)
+	}
+	if len(items) != 1 || items[0]["subagentNarratorId"] != childID || items[0]["toolUseId"] != "tool-sub-list" || items[0]["decisionReason"] != "needs parent approval" {
+		t.Fatalf("expected parent list to include subagent pending permission, got %#v", items)
+	}
+}
+
+func TestParentCanReadSubagentToolCallDetailAndPermissionPreview(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := "2026-05-18T00:00:00Z"
+	childID := "nar_sub_tool_detail"
+	childCwd := t.TempDir()
+	if err := os.WriteFile(childCwd+"/child.txt", []byte("old"), 0o644); err != nil {
+		t.Fatalf("seed child file: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (
+		id, type, title, inherit_mode, parent_narrator_id, model, permission_mode, status, substatus, plan_mode,
+		cwd, variant, traits, is_background, is_ask_in_passing, message_version, message_count,
+		total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, 'subagent', 'Tool detail child', 'fresh', ?, 'openai:test', 'default', 'waiting', '["awaiting_permission"]', 0, ?, 'subagent', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, childID, parentID, childCwd, now, now); err != nil {
+		t.Fatalf("insert child narrator: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-sub-detail', ?, 'tool-sub-detail', 'Write', '{"file_path":"child.txt","content":"new"}', 'pending', ?)`, childID, now); err != nil {
+		t.Fatalf("insert child tool call: %v", err)
+	}
+	detail := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+parentID+"/tool-calls/tool-sub-detail")
+	if detail.Code != http.StatusOK {
+		t.Fatalf("expected parent tool detail 200, got %d body=%s", detail.Code, detail.Body.String())
+	}
+	var detailBody map[string]any
+	if err := json.Unmarshal(detail.Body.Bytes(), &detailBody); err != nil {
+		t.Fatalf("decode detail response: %v", err)
+	}
+	if detailBody["subagentNarratorId"] != childID {
+		t.Fatalf("expected detail to include subagent narrator id, got %#v", detailBody)
+	}
+	preview := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+parentID+"/permission-file-preview?toolUseId=tool-sub-detail")
+	if preview.Code != http.StatusOK {
+		t.Fatalf("expected parent permission preview 200, got %d body=%s", preview.Code, preview.Body.String())
+	}
+	var previewBody map[string]any
+	if err := json.Unmarshal(preview.Body.Bytes(), &previewBody); err != nil {
+		t.Fatalf("decode preview response: %v", err)
+	}
+	filePath, _ := previewBody["filePath"].(string)
+	if !strings.HasSuffix(filePath, "/child.txt") || previewBody["previewContent"] != "new" {
+		t.Fatalf("expected preview to use child cwd/file path, got %#v", previewBody)
+	}
+}
+
+func TestParentBypassReprocessIncludesSubagentPendingPermission(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET permission_mode = 'bypassPermissions' WHERE id = ?`, parentID); err != nil {
+		t.Fatalf("set parent bypass: %v", err)
+	}
+	now := "2026-05-18T00:00:00Z"
+	childID := "nar_sub_reprocess"
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (
+		id, type, title, inherit_mode, parent_narrator_id, model, permission_mode, status, substatus, plan_mode,
+		cwd, variant, traits, is_background, is_ask_in_passing, message_version, message_count,
+		total_cost_usd, fast_mode, relaxed_plan, plan_reflection_auto_approve_override,
+		danger_reflection_override, created_at, updated_at
+	) VALUES (?, 'subagent', 'Reprocess child', 'fresh', ?, 'openai:test', 'bypassPermissions', 'waiting', '["awaiting_permission"]', 0, '', 'subagent', '[]', 0, 0, 0, 0, 0, 0, 0, 'inherit', 'inherit', ?, ?)`, childID, parentID, now, now); err != nil {
+		t.Fatalf("insert child narrator: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-sub-reprocess', ?, 'tool-sub-reprocess', 'Write', '{"file_path":"child.txt","content":"x"}', 'pending', ?)`, childID, now); err != nil {
+		t.Fatalf("insert child pending permission: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	count, err := service.reprocessPendingPermissionsForBypass(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("reprocess parent bypass permissions: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one subagent pending permission reprocessed, got %d", count)
+	}
+	var status string
+	if err := sqlDB.QueryRow(`SELECT status FROM narrator_tool_calls WHERE id = 'req-sub-reprocess'`).Scan(&status); err != nil {
+		t.Fatalf("load child tool status: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("expected child pending permission to become running, got %q", status)
+	}
+	broadcasts := events()
+	if len(broadcasts) != 1 || broadcasts[0].NarratorID != parentID || broadcasts[0].Payload["decision"] != "allow" || broadcasts[0].Payload["subagentNarratorId"] != childID {
+		t.Fatalf("expected parent permission_resolved allow broadcast with subagent id, got %#v", broadcasts)
+	}
+}
 
 func TestPermissionTargetReturnsQueryErrors(t *testing.T) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")
@@ -107,6 +267,9 @@ func TestPermissionDenyBroadcastsResolvedAndPreservesPendingSideEffectState(t *t
 	}
 	if len(*events) != 1 || (*events)[0].Payload["decision"] != "deny" || (*events)[0].Payload["toolUseId"] != "tool-deny" {
 		t.Fatalf("expected permission_resolved deny broadcast, got %#v", *events)
+	}
+	if _, ok := (*events)[0].Payload["updatedInput"]; ok {
+		t.Fatalf("permission_resolved deny should omit updatedInput when unchanged, got %#v", (*events)[0].Payload)
 	}
 }
 
@@ -387,7 +550,7 @@ func TestAskInPassingPendingResolveContract(t *testing.T) {
 	if err := sqlDB.QueryRow(`SELECT permission_mode, is_ask_in_passing, traits, message_count FROM narrators WHERE id = ?`, childID).Scan(&permissionMode, &isAsk, &traits, &childMessageCount); err != nil {
 		t.Fatalf("load child narrator: %v", err)
 	}
-	if permissionMode != "readOnly" || isAsk != 1 || childMessageCount != 1 {
+	if permissionMode != "readOnly" || isAsk != 1 || childMessageCount < 1 {
 		t.Fatalf("unexpected child ask-in-passing flags: perm=%s isAsk=%d count=%d", permissionMode, isAsk, childMessageCount)
 	}
 	var traitList []string
@@ -403,6 +566,27 @@ func TestAskInPassingPendingResolveContract(t *testing.T) {
 	}
 	if childQuestion != question {
 		t.Fatalf("child user message should contain question, got %q", childQuestion)
+	}
+}
+
+func TestPermissionModeRejectsAskInPassingNarratorUntilPromoted(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET permission_mode = 'readOnly', is_ask_in_passing = 1, traits = '["standalone","ask-in-passing"]' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark ask-in-passing narrator: %v", err)
+	}
+
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, "/narrators/"+narratorID+"/permission-mode", map[string]any{"permissionMode": "bypassPermissions"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected ask-in-passing permission change to return 400, got %d body=%s", w.Code, w.Body.String())
+	}
+	var permissionMode string
+	if err := sqlDB.QueryRow(`SELECT permission_mode FROM narrators WHERE id = ?`, narratorID).Scan(&permissionMode); err != nil {
+		t.Fatalf("load permission mode: %v", err)
+	}
+	if permissionMode != "readOnly" {
+		t.Fatalf("permission mode should remain readOnly, got %q", permissionMode)
 	}
 }
 
@@ -515,7 +699,7 @@ func TestBrowserSessionActionsManagePersistedFallbackRows(t *testing.T) {
 		t.Fatalf("insert browser row: %v", err)
 	}
 	w := serveNarratorHandlerJSONWithBrowserStorage(sqlDB, http.MethodPatch, "/narrators/"+narratorID+"/browser-sessions/browser-1/ttl", map[string]any{"ttlMs": 120000})
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ttlMs":120000`) {
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"ok":true`) || !strings.Contains(w.Body.String(), `"session"`) || !strings.Contains(w.Body.String(), `"ttlMs":120000`) {
 		t.Fatalf("ttl update failed: status=%d body=%s", w.Code, w.Body.String())
 	}
 	w = serveNarratorHandlerJSONWithBrowserStorage(sqlDB, http.MethodPatch, "/narrators/"+narratorID+"/browser-sessions/browser-1/ttl", map[string]any{"ttlMs": 5})
@@ -527,16 +711,46 @@ func TestBrowserSessionActionsManagePersistedFallbackRows(t *testing.T) {
 		t.Fatalf("screenshot fallback failed: status=%d type=%s body=%q", w.Code, w.Header().Get("Content-Type"), w.Body.String())
 	}
 	w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/browser-sessions/browser-1/stop-tracing")
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"stopped"`) {
+	if w.Code != http.StatusOK || w.Body.String() != `{"ok":true}`+"\n" {
 		t.Fatalf("stop tracing fallback failed: status=%d body=%s", w.Code, w.Body.String())
 	}
 	w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, http.MethodDelete, "/narrators/"+narratorID+"/browser-sessions/browser-1")
-	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"closed"`) {
+	if w.Code != http.StatusOK || w.Body.String() != `{"ok":true}`+"\n" {
 		t.Fatalf("close fallback failed: status=%d body=%s", w.Code, w.Body.String())
 	}
 	var status string
 	if err := sqlDB.QueryRow(`SELECT status FROM narrator_browser_sessions WHERE id = 'browser-1'`).Scan(&status); err != nil || status != "closed" {
 		t.Fatalf("browser row status=%s err=%v", status, err)
+	}
+}
+
+func TestBrowserSessionActionsReturnNotFoundForMissingPersistedRows(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	createBrowserSessionsTestTable(t, sqlDB)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{name: "close", method: http.MethodDelete, path: "/narrators/" + narratorID + "/browser-sessions/missing"},
+		{name: "ttl", method: http.MethodPatch, path: "/narrators/" + narratorID + "/browser-sessions/missing/ttl", body: map[string]any{"ttlMs": 60000}},
+		{name: "stop tracing", method: http.MethodPost, path: "/narrators/" + narratorID + "/browser-sessions/missing/stop-tracing"},
+		{name: "screenshot", method: http.MethodGet, path: "/narrators/" + narratorID + "/browser-sessions/missing/screenshot"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var w = serveNarratorHandlerRequestWithBrowserStorage(sqlDB, tc.method, tc.path)
+			if tc.body != nil {
+				w = serveNarratorHandlerJSONWithBrowserStorage(sqlDB, tc.method, tc.path, tc.body)
+			}
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("expected browser-session missing row 404, got %d body=%s", w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

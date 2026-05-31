@@ -1212,7 +1212,22 @@ func (h *Handler) segmentCompact(w http.ResponseWriter, r *http.Request) error {
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "message", "message": msg})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "segment_compact_hide", "hiddenMessageIds": ids})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "compact_done", "isSegment": true, "mode": "blocking"})
-	payload := map[string]any{"ok": true, "message": msg, "summary": summary, "messageCount": len(ids), "fallbackSummary": body.Summary == ""}
+	summarySource := "caller"
+	summaryQuality := "caller"
+	if body.Summary == "" {
+		summarySource = "deterministic_fallback"
+		summaryQuality = "deterministic_preview"
+	}
+	payload := map[string]any{
+		"ok":                    true,
+		"message":               msg,
+		"summary":               summary,
+		"messageCount":          len(ids),
+		"fallbackSummary":       body.Summary == "",
+		"summarySource":         summarySource,
+		"summaryQuality":        summaryQuality,
+		"modelSummaryGenerated": false,
+	}
 	if body.Summary == "" {
 		payload["fallbackReason"] = compactFallbackSummaryReason
 	}
@@ -1244,19 +1259,29 @@ func (h *Handler) closeBrowserSession(w http.ResponseWriter, r *http.Request) er
 	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
+	liveClosed := agentbasic.CloseBrowserSession(r.Context(), narratorID, sessionID, "closed_by_api")
 	browserDB := h.Service.browserDB()
-	if ok, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions"); err != nil || !ok {
+	hasStorage, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions")
+	if err != nil {
+		return err
+	}
+	if !hasStorage {
+		if liveClosed {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+			return nil
+		}
 		writeBrowserSessionsDisabled(w)
 		return nil
 	}
-	liveClosed := agentbasic.CloseBrowserSession(r.Context(), narratorID, sessionID, "closed_by_api")
 	result, err := browserDB.ExecContext(r.Context(), `UPDATE narrator_browser_sessions SET status = 'closed', closed_at = COALESCE(closed_at, ?), updated_at = ? WHERE narrator_id = ? AND id = ?`, db.NowISO(), db.NowISO(), narratorID, sessionID)
 	if err != nil {
 		return err
 	}
 	rows, _ := result.RowsAffected()
-	ok := rows > 0 || liveClosed
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": ok, "status": map[bool]string{true: "closed", false: "not_found"}[ok], "liveClosed": liveClosed})
+	if rows == 0 && !liveClosed {
+		return httpx.NotFound("Browser session")
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
 }
 
@@ -1266,37 +1291,23 @@ func (h *Handler) setBrowserSessionTtl(w http.ResponseWriter, r *http.Request) e
 	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
-	browserDB := h.Service.browserDB()
-	if ok, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions"); err != nil || !ok {
-		writeBrowserSessionsDisabled(w)
-		return nil
-	}
 	var body map[string]any
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	ttlMs := int64(0)
-	if v, ok := body["ttlMs"].(float64); ok {
-		ttlMs = int64(v)
-	} else if v, ok := body["ttlSeconds"].(float64); ok {
-		ttlMs = int64(v) * 1000
-	} else if v, ok := body["ttl"].(float64); ok {
-		ttlMs = int64(v) * 1000
+	ttlNumber, ok := body["ttlMs"].(float64)
+	if !ok || float64(int64(ttlNumber)) != ttlNumber {
+		return httpx.ValidationError("ttlMs must be an integer number of milliseconds")
 	}
+	ttlMs := int64(ttlNumber)
 	if ttlMs < int64(time.Second/time.Millisecond) || ttlMs > int64(24*time.Hour/time.Millisecond) {
 		return httpx.ValidationError("ttlMs must be between 1000 and 86400000")
 	}
-	var expiresAt any
-	var expiresAtMs any
-	var ttlValue any
-	var ttlMsValue any
-	if ttlMs > 0 {
-		expiresAtTime := time.Now().UTC().Add(time.Duration(ttlMs) * time.Millisecond)
-		expiresAt = expiresAtTime.Format(time.RFC3339Nano)
-		expiresAtMs = expiresAtTime.UnixMilli()
-		ttlValue = ttlMs / 1000
-		ttlMsValue = ttlMs
-	}
+	expiresAtTime := time.Now().UTC().Add(time.Duration(ttlMs) * time.Millisecond)
+	expiresAt := any(expiresAtTime.Format(time.RFC3339Nano))
+	expiresAtMs := any(expiresAtTime.UnixMilli())
+	ttlValue := any(ttlMs / 1000)
+	ttlMsValue := any(ttlMs)
 	liveSnapshot, liveUpdated, liveErr := agentbasic.SetBrowserSessionTTL(r.Context(), narratorID, sessionID, ttlMs)
 	if liveErr != nil {
 		return liveErr
@@ -1306,6 +1317,19 @@ func (h *Handler) setBrowserSessionTtl(w http.ResponseWriter, r *http.Request) e
 		expiresAtMs = liveSnapshot.ExpiresAt.UnixMilli()
 		ttlValue = liveSnapshot.TtlMs / 1000
 		ttlMsValue = liveSnapshot.TtlMs
+	}
+	browserDB := h.Service.browserDB()
+	hasStorage, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions")
+	if err != nil {
+		return err
+	}
+	if !hasStorage {
+		if liveUpdated {
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "session": browserSessionItemFromSnapshot(liveSnapshot)})
+			return nil
+		}
+		writeBrowserSessionsDisabled(w)
+		return nil
 	}
 	columns, _ := tableColumnSet(r.Context(), browserDB, "narrator_browser_sessions")
 	sets := []string{"ttl_seconds = ?", "expires_at = ?", "updated_at = ?"}
@@ -1324,8 +1348,17 @@ func (h *Handler) setBrowserSessionTtl(w http.ResponseWriter, r *http.Request) e
 		return err
 	}
 	rows, _ := result.RowsAffected()
-	ok := rows > 0 || liveUpdated
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": ok, "ttlSeconds": ttlValue, "ttlMs": ttlMsValue, "expiresAt": expiresAtMs, "expiresAtIso": expiresAt, "liveUpdated": liveUpdated})
+	if rows == 0 && !liveUpdated {
+		return httpx.NotFound("Browser session")
+	}
+	session := browserSessionItemFromSnapshot(liveSnapshot)
+	if !liveUpdated {
+		session, err = h.loadBrowserSessionItem(r.Context(), narratorID, sessionID)
+		if err != nil {
+			return err
+		}
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "session": session})
 	return nil
 }
 
@@ -1335,21 +1368,25 @@ func (h *Handler) stopBrowserTracing(w http.ResponseWriter, r *http.Request) err
 	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
-	browserDB := h.Service.browserDB()
-	if ok, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions"); err != nil || !ok {
-		writeBrowserSessionsDisabled(w)
-		return nil
-	}
 	liveSnapshot, liveHandled, liveErr := agentbasic.StopBrowserSessionTracing(r.Context(), narratorID, sessionID)
 	if liveErr != nil {
 		return liveErr
 	}
 	if liveHandled && liveSnapshot.TraceMetadata != nil {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "trace": liveSnapshot.TraceMetadata, "liveUpdated": true})
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return nil
+	}
+	browserDB := h.Service.browserDB()
+	hasStorage, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions")
+	if err != nil {
+		return err
+	}
+	if !hasStorage {
+		writeBrowserSessionsDisabled(w)
 		return nil
 	}
 	var raw sql.NullString
-	err := browserDB.QueryRowContext(r.Context(), `SELECT tracing_json FROM narrator_browser_sessions WHERE narrator_id = ? AND id = ?`, narratorID, sessionID).Scan(&raw)
+	err = browserDB.QueryRowContext(r.Context(), `SELECT tracing_json FROM narrator_browser_sessions WHERE narrator_id = ? AND id = ?`, narratorID, sessionID).Scan(&raw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return httpx.NotFound("Browser session")
@@ -1367,7 +1404,7 @@ func (h *Handler) stopBrowserTracing(w http.ResponseWriter, r *http.Request) err
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "trace": trace})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
 }
 
@@ -1377,21 +1414,26 @@ func (h *Handler) browserSessionScreenshot(w http.ResponseWriter, r *http.Reques
 	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
-	browserDB := h.Service.browserDB()
-	if ok, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions"); err != nil || !ok {
-		writeBrowserSessionsDisabled(w)
-		return nil
-	}
 	if data, _, liveHandled, liveErr := agentbasic.CaptureBrowserSessionScreenshot(r.Context(), narratorID, sessionID); liveErr != nil {
 		return liveErr
 	} else if liveHandled && len(data) > 0 {
 		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(data)
 		return nil
 	}
+	browserDB := h.Service.browserDB()
+	hasStorage, err := tableExistsOn(r.Context(), browserDB, "narrator_browser_sessions")
+	if err != nil {
+		return err
+	}
+	if !hasStorage {
+		writeBrowserSessionsDisabled(w)
+		return nil
+	}
 	var mime, dataRaw sql.NullString
-	err := browserDB.QueryRowContext(r.Context(), `SELECT screenshot_mime, screenshot_data_base64 FROM narrator_browser_sessions WHERE narrator_id = ? AND id = ? AND status != 'closed'`, narratorID, sessionID).Scan(&mime, &dataRaw)
+	err = browserDB.QueryRowContext(r.Context(), `SELECT screenshot_mime, screenshot_data_base64 FROM narrator_browser_sessions WHERE narrator_id = ? AND id = ? AND status != 'closed'`, narratorID, sessionID).Scan(&mime, &dataRaw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return httpx.NotFound("Browser session screenshot")
@@ -1410,6 +1452,7 @@ func (h *Handler) browserSessionScreenshot(w http.ResponseWriter, r *http.Reques
 		contentType = mime.String
 	}
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(image)
 	return nil
@@ -1985,17 +2028,16 @@ func (h *Handler) deletedMessageCountAfterSeq(ctx context.Context, narratorID st
 
 func (h *Handler) permissionFilePreview(w http.ResponseWriter, r *http.Request) error {
 	narratorID := chi.URLParam(r, "id")
-	narrator, err := h.Service.Get(r.Context(), narratorID)
-	if err != nil {
+	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
 	toolUseID := strings.TrimSpace(r.URL.Query().Get("toolUseId"))
 	if toolUseID == "" {
 		return httpx.BadRequest("toolUseId is required")
 	}
-	var toolName string
+	var ownerNarratorID, toolName string
 	var inputRaw sql.NullString
-	err = h.Service.DB.QueryRowContext(r.Context(), `SELECT tool_name, input_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, narratorID, toolUseID).Scan(&toolName, &inputRaw)
+	err := h.Service.DB.QueryRowContext(r.Context(), `SELECT tc.narrator_id, tc.tool_name, tc.input_json FROM narrator_tool_calls tc LEFT JOIN narrators n ON n.id = tc.narrator_id WHERE (tc.narrator_id = ? OR n.parent_narrator_id = ?) AND tc.tool_use_id = ? ORDER BY tc.created_at DESC LIMIT 1`, narratorID, narratorID, toolUseID).Scan(&ownerNarratorID, &toolName, &inputRaw)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return httpx.NotFound("Tool call")
@@ -2006,12 +2048,16 @@ func (h *Handler) permissionFilePreview(w http.ResponseWriter, r *http.Request) 
 	if decoded, ok := decodeAny(inputRaw).(map[string]any); ok {
 		input = decoded
 	}
+	ownerNarrator, err := h.Service.Get(r.Context(), ownerNarratorID)
+	if err != nil {
+		return err
+	}
 	filePath := permissionPreviewFilePath(input)
-	cwd := narratorWorkingDir(r.Context(), h.Service.DB, narrator)
+	cwd := narratorWorkingDir(r.Context(), h.Service.DB, ownerNarrator)
 	if filePath != "" && !filepath.IsAbs(filePath) {
 		filePath = resolveToolFilePath(cwd, filePath)
 	}
-	current, err := rebuildFileState(r.Context(), h.Service.DB, narratorID, filePath, cwd, nil)
+	current, err := rebuildFileState(r.Context(), h.Service.DB, ownerNarratorID, filePath, cwd, nil)
 	if err != nil {
 		return err
 	}
@@ -2588,16 +2634,22 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 			decider = claims.Subject
 		}
 		var body struct {
-			Reason  string         `json:"reason"`
-			Message string         `json:"message"`
-			Answers map[string]any `json:"answers"`
+			Reason       string         `json:"reason"`
+			Message      string         `json:"message"`
+			Answers      map[string]any `json:"answers"`
+			UpdatedPlan  string         `json:"updatedPlan"`
+			CompactAfter bool           `json:"compactAfter"`
 		}
 		if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 			return err
 		}
-		updatedInput, err := h.mergePermissionAnswers(r.Context(), requestID, body.Answers)
-		if err != nil {
-			return err
+		var updatedInput any
+		var err error
+		if status == "approved" {
+			updatedInput, err = h.mergePermissionInputUpdates(r.Context(), requestID, body.Answers, body.UpdatedPlan, body.CompactAfter)
+			if err != nil {
+				return err
+			}
 		}
 		dbStatus := permissionDecisionDBStatus(status)
 		_, err = h.Service.DB.ExecContext(r.Context(), `UPDATE narrator_tool_calls SET status = ?, permission_decided_by = ?, permission_decided_at = ?, permission_decision_reason = ?, permission_deny_message = ? WHERE id = ? OR tool_use_id = ?`, dbStatus, decider, db.NowISO(), nullableString(body.Reason), nullableString(body.Message), requestID, requestID)
@@ -2605,12 +2657,19 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 			return err
 		}
 		if h.Service.Hub != nil {
-			narratorID, toolUseID, err := h.permissionTarget(r.Context(), requestID)
+			narratorID, ownerNarratorID, toolUseID, err := h.permissionTargetDetails(r.Context(), requestID)
 			if err != nil {
 				return err
 			}
 			if narratorID != "" {
-				h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "permission_resolved", "narratorId": narratorID, "requestId": requestID, "toolUseId": toolUseID, "updatedInput": updatedInput, "decision": map[bool]string{true: "allow", false: "deny"}[status == "approved"]})
+				payload := map[string]any{"type": "permission_resolved", "narratorId": narratorID, "requestId": requestID, "toolUseId": toolUseID, "decision": map[bool]string{true: "allow", false: "deny"}[status == "approved"]}
+				if ownerNarratorID != "" && ownerNarratorID != narratorID {
+					payload["subagentNarratorId"] = ownerNarratorID
+				}
+				if updatedInput != nil {
+					payload["updatedInput"] = updatedInput
+				}
+				h.Service.Hub.BroadcastNarrator(narratorID, payload)
 			}
 		}
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
@@ -2618,12 +2677,13 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 	}
 }
 
-func (h *Handler) mergePermissionAnswers(ctx context.Context, requestID string, answers map[string]any) (any, error) {
-	if len(answers) == 0 {
+func (h *Handler) mergePermissionInputUpdates(ctx context.Context, requestID string, answers map[string]any, updatedPlan string, compactAfter bool) (any, error) {
+	updatedPlan = strings.TrimSpace(updatedPlan)
+	if len(answers) == 0 && updatedPlan == "" && !compactAfter {
 		return nil, nil
 	}
-	var inputRaw sql.NullString
-	err := h.Service.DB.QueryRowContext(ctx, `SELECT input_json FROM narrator_tool_calls WHERE id = ? OR tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, requestID, requestID).Scan(&inputRaw)
+	var inputRaw, toolName sql.NullString
+	err := h.Service.DB.QueryRowContext(ctx, `SELECT input_json, tool_name FROM narrator_tool_calls WHERE id = ? OR tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, requestID, requestID).Scan(&inputRaw, &toolName)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
@@ -2636,7 +2696,24 @@ func (h *Handler) mergePermissionAnswers(ctx context.Context, requestID string, 
 			input = map[string]any{"raw": inputRaw.String}
 		}
 	}
-	input["answers"] = answers
+	if len(answers) > 0 {
+		input["answers"] = answers
+	}
+	if strings.EqualFold(sqlNullString(toolName), "ExitPlanMode") {
+		if updatedPlan != "" {
+			originalPlan := strings.TrimSpace(stringFromAny(input["plan"]))
+			input["plan"] = updatedPlan
+			input["planSource"] = "updatedPlan"
+			if originalPlan != "" && originalPlan != updatedPlan {
+				if diff := computePlanLineDiff(originalPlan, updatedPlan); diff != "" {
+					input["planDiff"] = diff
+				}
+			}
+		}
+		if compactAfter {
+			input["compactAfter"] = true
+		}
+	}
 	data, _ := json.Marshal(input)
 	_, err = h.Service.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET input_json = ? WHERE id = ? OR tool_use_id = ?`, string(data), requestID, requestID)
 	if err != nil {
@@ -2645,16 +2722,120 @@ func (h *Handler) mergePermissionAnswers(ctx context.Context, requestID string, 
 	return input, nil
 }
 
+func computePlanLineDiff(oldText, newText string) string {
+	oldLines := strings.Split(oldText, "\n")
+	newLines := strings.Split(newText, "\n")
+	if len(oldLines) == 1 && oldLines[0] == "" {
+		oldLines = []string{}
+	}
+	if len(newLines) == 1 && newLines[0] == "" {
+		newLines = []string{}
+	}
+	m, n := len(oldLines), len(newLines)
+	dp := make([][]int, m+1)
+	for i := range dp {
+		dp[i] = make([]int, n+1)
+	}
+	for i := m - 1; i >= 0; i-- {
+		for j := n - 1; j >= 0; j-- {
+			if oldLines[i] == newLines[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+	type diffLine struct {
+		kind string
+		text string
+	}
+	diffLines := []diffLine{}
+	for i, j := 0, 0; i < m || j < n; {
+		if i < m && j < n && oldLines[i] == newLines[j] {
+			diffLines = append(diffLines, diffLine{kind: "keep", text: oldLines[i]})
+			i++
+			j++
+		} else if j < n && (i >= m || dp[i][j+1] >= dp[i+1][j]) {
+			diffLines = append(diffLines, diffLine{kind: "add", text: newLines[j]})
+			j++
+		} else {
+			diffLines = append(diffLines, diffLine{kind: "del", text: oldLines[i]})
+			i++
+		}
+	}
+	changed := []int{}
+	for i, line := range diffLines {
+		if line.kind != "keep" {
+			changed = append(changed, i)
+		}
+	}
+	if len(changed) == 0 {
+		return ""
+	}
+	const contextLines = 2
+	hunks := []string{}
+	hunkStart := planDiffMaxInt(0, changed[0]-contextLines)
+	hunkEnd := planDiffMinInt(len(diffLines)-1, changed[0]+contextLines)
+	emit := func(start, end int) string {
+		lines := []string{}
+		for i := start; i <= end; i++ {
+			line := diffLines[i]
+			switch line.kind {
+			case "add":
+				lines = append(lines, "+ "+line.text)
+			case "del":
+				lines = append(lines, "- "+line.text)
+			default:
+				lines = append(lines, "  "+line.text)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	for _, idx := range changed[1:] {
+		nextStart := planDiffMaxInt(0, idx-contextLines)
+		nextEnd := planDiffMinInt(len(diffLines)-1, idx+contextLines)
+		if nextStart <= hunkEnd+1 {
+			hunkEnd = nextEnd
+			continue
+		}
+		hunks = append(hunks, emit(hunkStart, hunkEnd))
+		hunkStart, hunkEnd = nextStart, nextEnd
+	}
+	hunks = append(hunks, emit(hunkStart, hunkEnd))
+	return strings.Join(hunks, "\n...\n")
+}
+
+func planDiffMaxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func planDiffMinInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func (h *Handler) permissionTarget(ctx context.Context, requestID string) (string, string, error) {
-	var narratorID, toolUseID sql.NullString
-	err := h.Service.DB.QueryRowContext(ctx, `SELECT narrator_id, tool_use_id FROM narrator_tool_calls WHERE id = ? OR tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, requestID, requestID).Scan(&narratorID, &toolUseID)
+	targetID, _, toolUseID, err := h.permissionTargetDetails(ctx, requestID)
+	return targetID, toolUseID, err
+}
+
+func (h *Handler) permissionTargetDetails(ctx context.Context, requestID string) (string, string, string, error) {
+	var targetID, ownerID, toolUseID sql.NullString
+	err := h.Service.DB.QueryRowContext(ctx, `SELECT COALESCE(NULLIF(n.parent_narrator_id, ''), tc.narrator_id), tc.narrator_id, tc.tool_use_id FROM narrator_tool_calls tc LEFT JOIN narrators n ON n.id = tc.narrator_id WHERE tc.id = ? OR tc.tool_use_id = ? ORDER BY tc.created_at DESC LIMIT 1`, requestID, requestID).Scan(&targetID, &ownerID, &toolUseID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return "", "", nil
+			return "", "", "", nil
 		}
-		return "", "", fmt.Errorf("query permission target: %w", err)
+		return "", "", "", fmt.Errorf("query permission target: %w", err)
 	}
-	return sqlNullString(narratorID), sqlNullString(toolUseID), nil
+	return sqlNullString(targetID), sqlNullString(ownerID), sqlNullString(toolUseID), nil
 }
 
 func (h *Handler) interrupt(w http.ResponseWriter, r *http.Request) error {
@@ -2752,7 +2933,21 @@ func (h *Handler) compact(w http.ResponseWriter, r *http.Request) error {
 	}
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "message", "message": msg})
 	h.broadcastCompactEvent(narratorID, map[string]any{"type": "compact_done", "mode": "blocking"})
-	payload := map[string]any{"ok": true, "message": msg, "summary": summary, "fallbackSummary": body.Summary == ""}
+	summarySource := "caller"
+	summaryQuality := "caller"
+	if body.Summary == "" {
+		summarySource = "deterministic_fallback"
+		summaryQuality = "deterministic_preview"
+	}
+	payload := map[string]any{
+		"ok":                    true,
+		"message":               msg,
+		"summary":               summary,
+		"fallbackSummary":       body.Summary == "",
+		"summarySource":         summarySource,
+		"summaryQuality":        summaryQuality,
+		"modelSummaryGenerated": false,
+	}
 	if body.Summary == "" {
 		payload["fallbackReason"] = compactFallbackSummaryReason
 	}
@@ -2859,7 +3054,11 @@ func (h *Handler) setPlanMode(enabled bool) httpx.HandlerFunc {
 }
 
 func (h *Handler) deleteNarrator(w http.ResponseWriter, r *http.Request) error {
-	httpx.WriteFeatureDisabled(w, "narrators.delete", "Safe narrator deletion semantics are not implemented in go_backend yet; use the Bun backend or the database cleanup preview path until recursive shared-message cleanup is available.")
+	narratorID := chi.URLParam(r, "id")
+	if err := h.Service.RemoveNarrator(r.Context(), narratorID); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "id": narratorID})
 	return nil
 }
 
@@ -2894,7 +3093,11 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 	}
 	finalMessage := payload.ContentText
 	commandText := ""
-	cmd, err := h.resolveSlashCommand(r.Context(), payload.ContentText, narratorID, userID)
+	slashInput := payload.RawText
+	if strings.TrimSpace(slashInput) == "" {
+		slashInput = payload.ContentText
+	}
+	cmd, err := h.resolveSlashCommand(r.Context(), slashInput, narratorID, userID)
 	if err != nil {
 		return err
 	}
@@ -2904,13 +3107,15 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		if !found {
+			cleanupUploadedTextFileBlocks(payload.ContentBlocks)
 			httpx.WriteJSON(w, http.StatusOK, map[string]any{"skillName": cmd.LoadSkill, "loaded": false})
 			return nil
 		}
-		finalMessage = skillPrompt
+		finalMessage = skillPrompt + payload.AttachmentHint
 		commandText = cmd.RawCommand
 	}
 	if cmd.Resolved && cmd.BashCommand != "" && cmd.ExpandedPrompt == "" {
+		defer cleanupUploadedTextFileBlocks(payload.ContentBlocks)
 		result, err := h.Service.HandleBashCommand(r.Context(), narratorID, cmd.BashCommand, cmd.RawCommand, userID)
 		if err != nil {
 			return err
@@ -2919,6 +3124,7 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	if cmd.Resolved && cmd.GoalCommand {
+		defer cleanupUploadedTextFileBlocks(payload.ContentBlocks)
 		result, err := h.handleGoalSlashCommand(r.Context(), narratorID, cmd, userID)
 		if err != nil {
 			return err
@@ -2927,7 +3133,7 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	if cmd.Resolved && cmd.ExpandedPrompt != "" {
-		finalMessage = cmd.ExpandedPrompt
+		finalMessage = cmd.ExpandedPrompt + payload.AttachmentHint
 		commandText = cmd.RawCommand
 		if cmd.BashCommand != "" {
 			if narrator.Status == "working" || narrator.Status == "waiting" {
@@ -2954,10 +3160,12 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 	}
 	contentBlocks := payload.ContentBlocks
 	if finalMessage != payload.ContentText {
-		contentBlocks = replaceTextBlock(contentBlocks, finalMessage)
+		contentBlocks = replaceTextBlock(contentBlocks, strings.TrimSuffix(finalMessage, payload.AttachmentHint))
 	}
 	if narratorAcceptsBufferedMessages(narrator.Status) || h.Service.isRunActive(narratorID) {
-		buffered, err := h.Service.BufferUserMessage(r.Context(), narratorID, userID, finalMessage, contentBlocks, payload.Priority)
+		bufferText := strings.TrimSuffix(finalMessage, payload.AttachmentHint)
+		buffered, err := h.Service.BufferUserMessage(r.Context(), narratorID, userID, bufferText, contentBlocks, payload.Priority, commandText)
+		cleanupUploadedTextFileBlocks(contentBlocks)
 		if err != nil {
 			if strings.Contains(strings.ToLower(err.Error()), "no such table") {
 				reason := "narrator is busy and buffered message storage is unavailable"
@@ -3078,9 +3286,21 @@ func (h *Handler) updatePermissionMode(w http.ResponseWriter, r *http.Request) e
 		return httpx.BadRequest("permissionMode must be one of default, acceptEdits, bypassPermissions, readOnly, or dontAsk")
 	}
 	narratorID := chi.URLParam(r, "id")
+	narrator, err := h.Service.Get(r.Context(), narratorID)
+	if err != nil {
+		return err
+	}
+	if narrator.IsAskInPassing || containsString(narrator.Traits, "ask-in-passing") {
+		return httpx.ValidationError("Cannot change permission mode of an ask-in-passing narrator. Use promote to unlock.")
+	}
 	n, err := h.Service.UpdateTextField(r.Context(), narratorID, "permission_mode", normalized)
 	if err != nil {
 		return err
+	}
+	if normalized == "bypassPermissions" {
+		if _, err := h.Service.reprocessPendingPermissionsForBypass(r.Context(), narratorID); err != nil {
+			return err
+		}
 	}
 	if h.Service.Hub != nil {
 		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "permission_mode_changed", "narratorId": narratorID, "permissionMode": normalized})
@@ -3159,26 +3379,31 @@ func (h *Handler) cancelBackgroundTask(w http.ResponseWriter, r *http.Request) e
 		return err
 	}
 	now := db.NowISO()
-	res, err := h.Service.DB.ExecContext(r.Context(), `UPDATE background_tasks SET status = 'cancelled', completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE parent_narrator_id = ? AND id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'timeout')`, now, now, narratorID, taskID)
+	res, err := h.Service.DB.ExecContext(r.Context(), `UPDATE background_tasks SET status = 'cancelled', output = COALESCE(output, 'Cancelled'), output_bytes = CASE WHEN output IS NULL THEN 9 ELSE output_bytes END, completed_at = COALESCE(completed_at, ?), updated_at = ? WHERE parent_narrator_id = ? AND id = ? AND status NOT IN ('completed', 'failed', 'cancelled', 'timeout')`, now, now, narratorID, taskID)
 	if err != nil {
 		return err
 	}
 	rows, _ := res.RowsAffected()
 	if rows > 0 {
+		var taskType string
 		var subagentID, toolUseID, output sql.NullString
-		if err := h.Service.DB.QueryRowContext(r.Context(), `SELECT subagent_narrator_id, tool_use_id, output FROM background_tasks WHERE parent_narrator_id = ? AND id = ?`, narratorID, taskID).Scan(&subagentID, &toolUseID, &output); err != nil {
+		if err := h.Service.DB.QueryRowContext(r.Context(), `SELECT COALESCE(type, ''), subagent_narrator_id, tool_use_id, output FROM background_tasks WHERE parent_narrator_id = ? AND id = ?`, narratorID, taskID).Scan(&taskType, &subagentID, &toolUseID, &output); err != nil {
 			return err
 		}
 		cancelID := taskID
 		if subagentID.Valid && strings.TrimSpace(subagentID.String) != "" {
 			cancelID = subagentID.String
 		}
-		h.Service.CancelRun(cancelID)
+		if strings.TrimSpace(taskType) == "bash" {
+			h.Service.cancelBackgroundBashTask(taskID)
+		} else {
+			h.Service.CancelRun(cancelID)
+			if injectErr := h.Service.injectBackgroundSubagentResult(r.Context(), narratorID, taskID, sqlNullString(toolUseID), "cancelled", firstNonEmptyString(sqlNullString(output), "Cancelled")); injectErr != nil {
+				return injectErr
+			}
+		}
 		if _, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET status = CASE WHEN status = 'working' THEN 'idle' ELSE status END, substatus = CASE WHEN status = 'working' THEN '["interrupted"]' ELSE substatus END, background_status = 'cancelled', background_completed_at = COALESCE(background_completed_at, ?), updated_at = ? WHERE parent_narrator_id = ? AND is_background = 1 AND id = ?`, now, now, narratorID, cancelID); err != nil {
 			return err
-		}
-		if injectErr := h.Service.injectBackgroundSubagentResult(r.Context(), narratorID, taskID, sqlNullString(toolUseID), "cancelled", firstNonEmptyString(sqlNullString(output), "Cancelled")); injectErr != nil {
-			return injectErr
 		}
 		if h.Service.Hub != nil {
 			h.Service.broadcastBackgroundTaskStatus(narratorID, taskID, "cancelled", nullStringPtr(output), sqlNullString(toolUseID))
@@ -3423,7 +3648,8 @@ func (h *Handler) usageStats(w http.ResponseWriter, r *http.Request) error {
 	if _, err := h.Service.Get(r.Context(), narratorID); err != nil {
 		return err
 	}
-	stats, err := h.loadUsageStats(r.Context(), narratorID)
+	includeSubagents := r.URL.Query().Get("includeSubagents") != "false"
+	stats, err := h.loadUsageStats(r.Context(), narratorID, includeSubagents)
 	if err != nil {
 		return err
 	}
@@ -3755,36 +3981,51 @@ func firstNonEmptyParagraph(value string) string {
 }
 
 func (h *Handler) toolCallDetail(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	var ownerNarratorID string
 	var inputRaw, outputRaw sql.NullString
-	row := h.Service.DB.QueryRowContext(r.Context(), `SELECT input_json, output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ?`, chi.URLParam(r, "id"), chi.URLParam(r, "toolUseId"))
-	if err := row.Scan(&inputRaw, &outputRaw); err != nil {
+	row := h.Service.DB.QueryRowContext(r.Context(), `SELECT tc.narrator_id, tc.input_json, tc.output_json FROM narrator_tool_calls tc LEFT JOIN narrators n ON n.id = tc.narrator_id WHERE (tc.narrator_id = ? OR n.parent_narrator_id = ?) AND tc.tool_use_id = ? ORDER BY tc.created_at DESC LIMIT 1`, narratorID, narratorID, chi.URLParam(r, "toolUseId"))
+	if err := row.Scan(&ownerNarratorID, &inputRaw, &outputRaw); err != nil {
 		if err == sql.ErrNoRows {
 			return httpx.NotFound("Tool call")
 		}
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"inputJson": decodeNullableJSON(inputRaw), "outputJson": decodeNullableJSON(outputRaw)})
+	toolUseID := chi.URLParam(r, "toolUseId")
+	payload := map[string]any{"inputJson": decodeNullableJSON(inputRaw), "outputJson": decodeNullableJSON(outputRaw)}
+	if sideCars, err := h.Service.loadSideCarsForToolUse(r.Context(), toolUseID); err == nil && len(sideCars) > 0 {
+		payload["sideCars"] = sideCars
+	}
+	if ownerNarratorID != narratorID {
+		payload["subagentNarratorId"] = ownerNarratorID
+	}
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
 func (h *Handler) permissions(w http.ResponseWriter, r *http.Request) error {
-	rows, err := h.Service.DB.QueryContext(r.Context(), `SELECT id, tool_name, tool_use_id, input_json, permission_decision_reason, permission_suggestions FROM narrator_tool_calls WHERE narrator_id = ? AND status = 'pending' ORDER BY created_at ASC`, chi.URLParam(r, "id"))
+	narratorID := chi.URLParam(r, "id")
+	rows, err := h.Service.DB.QueryContext(r.Context(), `SELECT tc.id, tc.narrator_id, tc.tool_name, tc.tool_use_id, tc.input_json, tc.permission_decision_reason, tc.permission_suggestions FROM narrator_tool_calls tc LEFT JOIN narrators n ON n.id = tc.narrator_id WHERE (tc.narrator_id = ? OR n.parent_narrator_id = ?) AND tc.status = 'pending' ORDER BY tc.created_at ASC`, narratorID, narratorID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	items := []map[string]any{}
 	for rows.Next() {
-		var idValue, toolName, toolUseID string
+		var idValue, ownerNarratorID, toolName, toolUseID string
 		var inputRaw, decisionReason, suggestionsRaw sql.NullString
-		if err := rows.Scan(&idValue, &toolName, &toolUseID, &inputRaw, &decisionReason, &suggestionsRaw); err != nil {
+		if err := rows.Scan(&idValue, &ownerNarratorID, &toolName, &toolUseID, &inputRaw, &decisionReason, &suggestionsRaw); err != nil {
 			return err
 		}
 		suggestions := decodeNullableJSON(suggestionsRaw)
 		if shouldHidePendingPermission(suggestions) {
 			continue
 		}
-		items = append(items, map[string]any{"id": idValue, "toolName": toolName, "toolUseId": toolUseID, "inputJson": decodeNullableJSON(inputRaw), "decisionReason": nullString(decisionReason), "suggestions": suggestions})
+		item := map[string]any{"id": idValue, "toolName": toolName, "toolUseId": toolUseID, "inputJson": decodeNullableJSON(inputRaw), "decisionReason": nullString(decisionReason), "suggestions": suggestions}
+		if ownerNarratorID != narratorID {
+			item["subagentNarratorId"] = ownerNarratorID
+		}
+		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -3831,7 +4072,7 @@ func reflectionStatus(suggestions any) string {
 }
 
 func (h *Handler) getGoals(w http.ResponseWriter, r *http.Request) error {
-	goals, err := h.loadGoals(r, chi.URLParam(r, "id"))
+	goals, err := h.Service.loadGoals(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		return err
 	}
@@ -3847,29 +4088,15 @@ func (h *Handler) addGoal(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	if strings.TrimSpace(body.Objective) == "" {
-		return httpx.BadRequest("objective is required")
-	}
-	narratorID := chi.URLParam(r, "id")
-	var sortOrder int
-	if err := h.Service.DB.QueryRowContext(r.Context(), `SELECT COALESCE(MAX(sort_order), -1) + 1 FROM narrator_goals WHERE narrator_id = ?`, narratorID).Scan(&sortOrder); err != nil {
-		return fmt.Errorf("query next goal sort order: %w", err)
-	}
-	goalID := id.New()
-	now := db.NowISO()
-	createdBy := any(nil)
+	createdBy := ""
 	if claims != nil {
 		createdBy = claims.Subject
 	}
-	_, err := h.Service.DB.ExecContext(r.Context(), `INSERT INTO narrator_goals (id, narrator_id, objective, status, sort_order, created_by, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`, goalID, narratorID, body.Objective, sortOrder, createdBy, now, now)
+	payload, err := h.Service.addGoal(r.Context(), chi.URLParam(r, "id"), body.Objective, createdBy)
 	if err != nil {
 		return err
 	}
-	goals, err := h.loadGoals(r, narratorID)
-	if err != nil {
-		return err
-	}
-	httpx.WriteJSON(w, http.StatusCreated, map[string]any{"goal": findByID(goals, goalID), "goals": goals})
+	httpx.WriteJSON(w, http.StatusCreated, payload)
 	return nil
 }
 
@@ -3878,59 +4105,34 @@ func (h *Handler) updateGoal(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	sets := []string{}
-	args := []any{}
-	if objective, ok := body["objective"].(string); ok && objective != "" {
-		sets = append(sets, "objective = ?")
-		args = append(args, objective)
+	var objective *string
+	if value, ok := body["objective"].(string); ok {
+		objective = &value
 	}
-	if status, ok := body["status"].(string); ok && status != "" {
-		status = normalizeGoalStatus(status)
-		if status == "" {
-			return httpx.BadRequest("status must be pending, active, paused, complete, or cancelled")
-		}
-		sets = append(sets, "status = ?")
-		args = append(args, status)
-		if status == "complete" {
-			sets = append(sets, "completed_at = ?")
-			args = append(args, db.NowISO())
-		}
-	}
-	if len(sets) > 0 {
-		sets = append(sets, "updated_at = ?")
-		args = append(args, db.NowISO(), chi.URLParam(r, "goalId"))
-		if _, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrator_goals SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
-			return err
-		}
-	}
-	goals, err := h.loadGoals(r, chi.URLParam(r, "id"))
+	status, _ := body["status"].(string)
+	payload, err := h.Service.updateGoalDirect(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "goalId"), objective, status)
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"goal": findByID(goals, chi.URLParam(r, "goalId")), "goals": goals})
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
 func (h *Handler) removeGoal(w http.ResponseWriter, r *http.Request) error {
-	_, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrator_goals WHERE id = ? AND narrator_id = ?`, chi.URLParam(r, "goalId"), chi.URLParam(r, "id"))
+	payload, err := h.Service.removeGoal(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "goalId"))
 	if err != nil {
 		return err
 	}
-	goals, err := h.loadGoals(r, chi.URLParam(r, "id"))
-	if err != nil {
-		return err
-	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"removed": true, "goals": goals})
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
 func (h *Handler) clearGoals(w http.ResponseWriter, r *http.Request) error {
-	res, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrator_goals WHERE narrator_id = ?`, chi.URLParam(r, "id"))
+	payload, err := h.Service.clearOpenGoals(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
 		return err
 	}
-	count, _ := res.RowsAffected()
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"cleared": count, "goals": []any{}})
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
@@ -3941,24 +4143,11 @@ func (h *Handler) reorderGoals(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	tx, err := h.Service.DB.BeginTx(r.Context(), nil)
+	payload, err := h.Service.reorderGoals(r.Context(), chi.URLParam(r, "id"), body.OrderedIDs)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	for i, goalID := range body.OrderedIDs {
-		if _, err := tx.ExecContext(r.Context(), `UPDATE narrator_goals SET sort_order = ?, updated_at = ? WHERE id = ? AND narrator_id = ?`, i, db.NowISO(), goalID, chi.URLParam(r, "id")); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	goals, err := h.loadGoals(r, chi.URLParam(r, "id"))
-	if err != nil {
-		return err
-	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "goals": goals})
+	httpx.WriteJSON(w, http.StatusOK, payload)
 	return nil
 }
 
@@ -4043,30 +4232,56 @@ func (h *Handler) updateBuffer(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	h.Service.broadcastBufferSet(r.Context(), narratorID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "message": findByID(items, messageID), "buffer": items})
 	return nil
 }
 func (h *Handler) removeBuffer(w http.ResponseWriter, r *http.Request) error {
 	narratorID := chi.URLParam(r, "id")
-	result, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrator_buffered_messages WHERE id = ? AND narrator_id = ?`, chi.URLParam(r, "messageId"), narratorID)
+	messageID := chi.URLParam(r, "messageId")
+	result, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrator_buffered_messages WHERE id = ? AND narrator_id = ?`, messageID, narratorID)
 	if err != nil {
 		return err
 	}
 	removed, _ := result.RowsAffected()
+	if removed > 0 {
+		cleanupBufferedTextFiles(messageID)
+	}
 	items, err := h.loadBuffer(r, narratorID)
 	if err != nil {
 		return err
 	}
+	h.Service.broadcastBufferSet(r.Context(), narratorID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": removed > 0, "removed": removed > 0, "buffer": items})
 	return nil
 }
 func (h *Handler) clearBuffer(w http.ResponseWriter, r *http.Request) error {
 	narratorID := chi.URLParam(r, "id")
+	rows, err := h.Service.DB.QueryContext(r.Context(), `SELECT id FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID)
+	if err != nil {
+		return err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var idValue string
+		if err := rows.Scan(&idValue); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		ids = append(ids, idValue)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	result, err := h.Service.DB.ExecContext(r.Context(), `DELETE FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID)
 	if err != nil {
 		return err
 	}
+	for _, idValue := range ids {
+		cleanupBufferedTextFiles(idValue)
+	}
 	cleared, _ := result.RowsAffected()
+	h.Service.broadcastBufferSet(r.Context(), narratorID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": cleared, "buffer": []any{}})
 	return nil
 }
@@ -4083,13 +4298,20 @@ func (h *Handler) reorderBuffer(w http.ResponseWriter, r *http.Request) error {
 	if len(ids) == 0 {
 		ids = body.MessageIDs
 	}
+	currentIDs, err := h.bufferIDs(r.Context(), narratorID)
+	if err != nil {
+		return err
+	}
+	if !sameBufferIDSet(currentIDs, ids) {
+		return httpx.BadRequest("Invalid reorder: ids do not match the current queue")
+	}
 	tx, err := h.Service.DB.BeginTx(r.Context(), nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for i, idValue := range ids {
-		if _, err := tx.ExecContext(r.Context(), `UPDATE narrator_buffered_messages SET seq = ? WHERE id = ? AND narrator_id = ?`, i+1, idValue, narratorID); err != nil {
+		if _, err := tx.ExecContext(r.Context(), `UPDATE narrator_buffered_messages SET seq = ? WHERE id = ? AND narrator_id = ?`, i, idValue, narratorID); err != nil {
 			return err
 		}
 	}
@@ -4100,8 +4322,43 @@ func (h *Handler) reorderBuffer(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	h.Service.broadcastBufferSet(r.Context(), narratorID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "buffer": items})
 	return nil
+}
+
+func (h *Handler) bufferIDs(ctx context.Context, narratorID string) ([]string, error) {
+	rows, err := h.Service.DB.QueryContext(ctx, `SELECT id FROM narrator_buffered_messages WHERE narrator_id = ? ORDER BY seq ASC, buffered_at ASC`, narratorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var idValue string
+		if err := rows.Scan(&idValue); err != nil {
+			return nil, err
+		}
+		ids = append(ids, idValue)
+	}
+	return ids, rows.Err()
+}
+
+func sameBufferIDSet(currentIDs, requestedIDs []string) bool {
+	if len(currentIDs) == 0 || len(currentIDs) != len(requestedIDs) {
+		return false
+	}
+	remaining := map[string]int{}
+	for _, idValue := range currentIDs {
+		remaining[idValue]++
+	}
+	for _, idValue := range requestedIDs {
+		if remaining[idValue] == 0 {
+			return false
+		}
+		remaining[idValue]--
+	}
+	return true
 }
 
 func (h *Handler) loadBuffer(r *http.Request, narratorID string) ([]map[string]any, error) {
@@ -4173,7 +4430,13 @@ func (h *Handler) backgroundTaskOutputPayload(ctx context.Context, narratorID, t
 	var taskOutput, completedAt sql.NullString
 	err := h.Service.DB.QueryRowContext(ctx, `SELECT status, output, completed_at FROM background_tasks WHERE parent_narrator_id = ? AND id = ?`, narratorID, taskID).Scan(&status, &taskOutput, &completedAt)
 	if err == nil {
-		return map[string]any{"status": status, "output": nullString(taskOutput), "result": nullString(taskOutput), "errorMessage": nil, "completedAt": nullString(completedAt)}, true, nil
+		output := nullString(taskOutput)
+		if status == "running" {
+			if liveOutput, ok := h.Service.liveBackgroundBashOutput(taskID); ok {
+				output = liveOutput
+			}
+		}
+		return map[string]any{"status": status, "output": output, "result": output, "errorMessage": nil, "completedAt": nullString(completedAt)}, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, err
@@ -4239,6 +4502,19 @@ func tableExistsOn(ctx context.Context, sqlDB *sql.DB, table string) (bool, erro
 		return false, err
 	}
 	return name == table, nil
+}
+
+func (h *Handler) loadBrowserSessionItem(ctx context.Context, narratorID, sessionID string) (map[string]any, error) {
+	items, err := h.loadBrowserSessions(ctx, narratorID)
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range items {
+		if idValue, _ := item["id"].(string); idValue == sessionID {
+			return item, nil
+		}
+	}
+	return nil, httpx.NotFound("Browser session")
 }
 
 func (h *Handler) loadBrowserSessions(ctx context.Context, narratorID string) ([]map[string]any, error) {
@@ -4520,27 +4796,149 @@ func (h *Handler) buildCurrentPlan(ctx context.Context, narratorID string) (stri
 	return "Current plan context:\n" + strings.Join(parts, "\n"), nil
 }
 
-func (h *Handler) loadUsageStats(ctx context.Context, narratorID string) (map[string]any, error) {
-	stats := map[string]any{"totalCostUsd": 0.0, "inputTokens": int64(0), "outputTokens": int64(0), "cacheCreationTokens": int64(0), "cacheReadTokens": int64(0), "reasoningTokens": int64(0), "requestCount": int64(0), "toolCallCount": int64(0)}
-	var inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, reasoningTokens, requestCount sql.NullInt64
-	var totalCost sql.NullFloat64
-	err := h.Service.DB.QueryRowContext(ctx, `SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cache_creation_input_tokens + cache_creation_5m_tokens + cache_creation_1h_tokens), 0), COALESCE(SUM(cached_input_tokens), 0), COALESCE(SUM(reasoning_tokens), 0), COALESCE(SUM(cost_usd), 0), COUNT(*) FROM api_requests WHERE narrator_id = ?`, narratorID).Scan(&inputTokens, &outputTokens, &cacheCreationTokens, &cacheReadTokens, &reasoningTokens, &totalCost, &requestCount)
+func (h *Handler) loadUsageStats(ctx context.Context, narratorID string, includeSubagents bool) (map[string]any, error) {
+	stats := zeroUsageStatsMap()
+	if h == nil || h.Service == nil || h.Service.DB == nil {
+		return stats, nil
+	}
+	apiColumns, err := db.TableColumnSet(ctx, h.Service.DB, "api_requests")
 	if err != nil {
 		return nil, err
 	}
-	var toolCallCount sql.NullInt64
-	if err := h.Service.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM narrator_tool_calls WHERE narrator_id = ?`, narratorID).Scan(&toolCallCount); err != nil {
+	if len(apiColumns) > 0 && apiColumns["narrator_id"] {
+		where := "ar.narrator_id = ?"
+		args := []any{narratorID}
+		join := ""
+		if includeSubagents {
+			if narratorColumns, err := db.TableColumnSet(ctx, h.Service.DB, "narrators"); err != nil {
+				return nil, err
+			} else if narratorColumns["id"] && narratorColumns["parent_narrator_id"] {
+				join = " LEFT JOIN narrators n ON n.id = ar.narrator_id"
+				where = "(ar.narrator_id = ? OR n.parent_narrator_id = ?)"
+				args = append(args, narratorID)
+			}
+		}
+		query := fmt.Sprintf(
+			`SELECT COUNT(*), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s FROM api_requests ar%s WHERE %s`,
+			usageSumExpr(apiColumns, "input_tokens"),
+			usageSumExpr(apiColumns, "output_tokens"),
+			usageSumExpr(apiColumns, "cache_creation_input_tokens"),
+			usageSumExpr(apiColumns, "cached_input_tokens"),
+			usageSumExpr(apiColumns, "cache_creation_5m_tokens"),
+			usageSumExpr(apiColumns, "cache_creation_1h_tokens"),
+			usageSumExpr(apiColumns, "reasoning_tokens"),
+			usageSumFloatExpr(apiColumns, "cost_usd"),
+			usageAvgFloatExpr(apiColumns, "duration_ms"),
+			usageAvgFloatExpr(apiColumns, "ttft_ms"),
+			join,
+			where,
+		)
+		var totalRequests, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, cache5mTokens, cache1hTokens, reasoningTokens int64
+		var totalCost, averageDuration, averageTtft float64
+		if err := h.Service.DB.QueryRowContext(ctx, query, args...).Scan(&totalRequests, &inputTokens, &outputTokens, &cacheCreationTokens, &cacheReadTokens, &cache5mTokens, &cache1hTokens, &reasoningTokens, &totalCost, &averageDuration, &averageTtft); err != nil {
+			return nil, err
+		}
+		applyUsageStats(stats, totalRequests, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, cache5mTokens, cache1hTokens, reasoningTokens, totalCost, averageDuration, averageTtft)
+	}
+	toolCallCount, err := h.loadUsageToolCallCount(ctx, narratorID, includeSubagents)
+	if err != nil {
 		return nil, err
 	}
-	stats["inputTokens"] = inputTokens.Int64
-	stats["outputTokens"] = outputTokens.Int64
-	stats["cacheCreationTokens"] = cacheCreationTokens.Int64
-	stats["cacheReadTokens"] = cacheReadTokens.Int64
-	stats["reasoningTokens"] = reasoningTokens.Int64
-	stats["totalCostUsd"] = totalCost.Float64
-	stats["requestCount"] = requestCount.Int64
-	stats["toolCallCount"] = toolCallCount.Int64
+	stats["toolCallCount"] = toolCallCount
 	return stats, nil
+}
+
+func zeroUsageStatsMap() map[string]any {
+	return map[string]any{
+		"totalRequests":              int64(0),
+		"totalInputTokens":           int64(0),
+		"totalOutputTokens":          int64(0),
+		"totalCacheCreationTokens":   int64(0),
+		"totalCacheReadTokens":       int64(0),
+		"totalCacheCreation5mTokens": int64(0),
+		"totalCacheCreation1hTokens": int64(0),
+		"totalReasoningTokens":       int64(0),
+		"totalTokens":                int64(0),
+		"totalCost":                  0.0,
+		"averageDurationMs":          0.0,
+		"averageTtftMs":              0.0,
+		"totalCostUsd":               0.0,
+		"inputTokens":                int64(0),
+		"outputTokens":               int64(0),
+		"cacheCreationTokens":        int64(0),
+		"cacheReadTokens":            int64(0),
+		"reasoningTokens":            int64(0),
+		"requestCount":               int64(0),
+		"toolCallCount":              int64(0),
+	}
+}
+
+func usageSumExpr(columns map[string]bool, column string) string {
+	if !columns[column] {
+		return "0"
+	}
+	return "COALESCE(SUM(ar." + column + "), 0)"
+}
+
+func usageSumFloatExpr(columns map[string]bool, column string) string {
+	if !columns[column] {
+		return "0"
+	}
+	return "COALESCE(SUM(ar." + column + "), 0)"
+}
+
+func usageAvgFloatExpr(columns map[string]bool, column string) string {
+	if !columns[column] {
+		return "0"
+	}
+	return "COALESCE(AVG(ar." + column + "), 0)"
+}
+
+func applyUsageStats(stats map[string]any, totalRequests, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, cache5mTokens, cache1hTokens, reasoningTokens int64, totalCost, averageDuration, averageTtft float64) {
+	totalTokens := inputTokens + outputTokens + cacheCreationTokens + cacheReadTokens
+	stats["totalRequests"] = totalRequests
+	stats["totalInputTokens"] = inputTokens
+	stats["totalOutputTokens"] = outputTokens
+	stats["totalCacheCreationTokens"] = cacheCreationTokens
+	stats["totalCacheReadTokens"] = cacheReadTokens
+	stats["totalCacheCreation5mTokens"] = cache5mTokens
+	stats["totalCacheCreation1hTokens"] = cache1hTokens
+	stats["totalReasoningTokens"] = reasoningTokens
+	stats["totalTokens"] = totalTokens
+	stats["totalCost"] = totalCost
+	stats["averageDurationMs"] = averageDuration
+	stats["averageTtftMs"] = averageTtft
+	stats["totalCostUsd"] = totalCost
+	stats["inputTokens"] = inputTokens
+	stats["outputTokens"] = outputTokens
+	stats["cacheCreationTokens"] = cacheCreationTokens
+	stats["cacheReadTokens"] = cacheReadTokens
+	stats["reasoningTokens"] = reasoningTokens
+	stats["requestCount"] = totalRequests
+}
+
+func (h *Handler) loadUsageToolCallCount(ctx context.Context, narratorID string, includeSubagents bool) (int64, error) {
+	columns, err := db.TableColumnSet(ctx, h.Service.DB, "narrator_tool_calls")
+	if err != nil || len(columns) == 0 || !columns["narrator_id"] {
+		return 0, err
+	}
+	where := "tc.narrator_id = ?"
+	args := []any{narratorID}
+	join := ""
+	if includeSubagents {
+		if narratorColumns, err := db.TableColumnSet(ctx, h.Service.DB, "narrators"); err != nil {
+			return 0, err
+		} else if narratorColumns["id"] && narratorColumns["parent_narrator_id"] {
+			join = " LEFT JOIN narrators n ON n.id = tc.narrator_id"
+			where = "(tc.narrator_id = ? OR n.parent_narrator_id = ?)"
+			args = append(args, narratorID)
+		}
+	}
+	var count int64
+	if err := h.Service.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM narrator_tool_calls tc`+join+` WHERE `+where, args...).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (h *Handler) listRules(table string) httpx.HandlerFunc {
@@ -5258,9 +5656,11 @@ const maxMessageImageBytes = 20 * 1024 * 1024
 const maxMessageTextFileBytes = 100 * 1024 * 1024
 
 type parsedMessagePayload struct {
-	ContentText   string
-	ContentBlocks []map[string]any
-	Priority      bool
+	ContentText    string
+	RawText        string
+	AttachmentHint string
+	ContentBlocks  []map[string]any
+	Priority       bool
 }
 
 type savedTextFile struct {
@@ -5276,7 +5676,7 @@ func (h *Handler) parseMessagePayload(r *http.Request, narratorID string) (parse
 		if err != nil {
 			return parsedMessagePayload{}, err
 		}
-		return parsedMessagePayload{ContentText: message, ContentBlocks: []map[string]any{{"type": "text", "text": message}}, Priority: priority}, nil
+		return parsedMessagePayload{ContentText: message, RawText: message, ContentBlocks: []map[string]any{{"type": "text", "text": message}}, Priority: priority}, nil
 	}
 	if err := r.ParseMultipartForm(140 << 20); err != nil {
 		return parsedMessagePayload{}, httpx.BadRequest("invalid multipart form")
@@ -5325,8 +5725,8 @@ func (h *Handler) parseMessagePayload(r *http.Request, narratorID string) (parse
 	if strings.TrimSpace(effectiveText) == "" && len(imageHeaders) > 0 {
 		effectiveText = "[user sent image(s)]"
 	}
-	effectiveText += attachedFilesHint(savedTextFiles)
-	return parsedMessagePayload{ContentText: effectiveText, ContentBlocks: blocks, Priority: r.FormValue("priority") == "true"}, nil
+	attachmentHint := attachedFilesHint(savedTextFiles)
+	return parsedMessagePayload{ContentText: effectiveText + attachmentHint, RawText: message, AttachmentHint: attachmentHint, ContentBlocks: blocks, Priority: r.FormValue("priority") == "true"}, nil
 }
 
 func saveMultipartImage(narratorID string, header *multipart.FileHeader) (map[string]any, error) {
@@ -5365,6 +5765,25 @@ func saveMultipartImage(narratorID string, header *multipart.FileHeader) (map[st
 		return nil, err
 	}
 	return map[string]any{"type": "image", "imageId": imageID, "filename": filename, "mediaType": mediaType}, nil
+}
+
+func cleanupUploadedTextFileBlocks(blocks []map[string]any) {
+	for _, block := range blocks {
+		if block["type"] != "text_file" {
+			continue
+		}
+		filePath := strings.TrimSpace(stringFromAny(block["filePath"]))
+		if filePath == "" || !isNarraForkAttachedPath(filePath) {
+			continue
+		}
+		_ = os.Remove(filePath)
+	}
+}
+
+func isNarraForkAttachedPath(path string) bool {
+	path = filepath.Clean(path)
+	dir := filepath.Dir(path)
+	return filepath.Base(dir) == "attached" && filepath.Base(filepath.Dir(dir)) == ".narrafork"
 }
 
 func saveMultipartTextFile(cwd string, header *multipart.FileHeader) (savedTextFile, error) {

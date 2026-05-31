@@ -45,6 +45,7 @@ var optionalToolNames = map[string]bool{
 	"Terminal":  true,
 	"ShareFile": true,
 	"Browser":   true,
+	"Recall":    true,
 }
 
 type unsupportedOptionalTool struct {
@@ -53,10 +54,6 @@ type unsupportedOptionalTool struct {
 }
 
 var unsupportedOptionalTools = []unsupportedOptionalTool{
-	{
-		Name:   "Recall",
-		Reason: "Conversation recall/search is available through regular search APIs, but the Recall agent tool is not implemented in Go narrator sessions yet.",
-	},
 	{
 		Name:   "ForkNarrator",
 		Reason: "Chapter and narrator fork APIs exist, but the ForkNarrator agent tool is not implemented in Go narrator sessions yet.",
@@ -240,6 +237,35 @@ func externalToolMetadata(tools []ExternalToolSpec, name string) map[string]any 
 
 func staticToolMetadata(name string) map[string]any {
 	switch name {
+	case "Read":
+		return map[string]any{
+			"parity":          "partial",
+			"textFiles":       true,
+			"directories":     true,
+			"offsetLimit":     true,
+			"pdfPages":        false,
+			"pagesSchemaOnly": true,
+			"imageContent":    false,
+			"reason":          "Go Read supports bounded text file and directory reads; TS PDF page extraction is schema-compatible but rejected at runtime until a safe PDF extraction runtime is implemented.",
+		}
+	case "Bash":
+		return map[string]any{
+			"runInBackground":           true,
+			"bashBackground":            true,
+			"narratorContextOnly":       true,
+			"nonNarratorExecuteTool":    "foreground-only",
+			"nonNarratorBackgroundNote": "Bash run_in_background requires narrator context; non-narrator ExecuteTool only supports foreground Bash commands.",
+		}
+	case "Await":
+		return map[string]any{
+			"supportedTypes":            []string{"agent", "bash"},
+			"awaitAgent":                true,
+			"awaitBash":                 true,
+			"awaitBashWaitForText":      true,
+			"narratorContextOnly":       true,
+			"nonNarratorExecuteTool":    false,
+			"nonNarratorBackgroundNote": "Await is handled by narrator context for agent and bash background tasks.",
+		}
 	case "WebFetch":
 		return map[string]any{
 			"parity":           "partial",
@@ -250,6 +276,20 @@ func staticToolMetadata(name string) map[string]any {
 			"protocols":        []string{"http", "https", "data"},
 			"policy":           "permission-policy-and-proxy-consumed",
 			"reason":           "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
+		}
+	case "Recall":
+		return map[string]any{
+			"supported":              true,
+			"readOnly":               true,
+			"scope":                  "self",
+			"crossNarrator":          false,
+			"searchMode":             "bounded-like",
+			"maxSearchLimit":         50,
+			"maxReadLimit":           50,
+			"maxBatchQueries":        10,
+			"maxToolCallOutputChars": 4000,
+			"nonNarratorExecuteTool": false,
+			"reason":                 "Go Recall implements a safe self-scoped/read-only subset for the current narrator only, using bounded LIKE search without FTS.",
 		}
 	case "Browser":
 		return map[string]any{

@@ -330,7 +330,7 @@ func (h *Handler) createServer(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	server, err := normalizeServerConfig(body, id.Short())
+	server, err := normalizeServerConfig(body, id.Short(), true)
 	if err != nil {
 		return err
 	}
@@ -339,8 +339,7 @@ func (h *Handler) createServer(w http.ResponseWriter, r *http.Request) error {
 	if err := h.Settings.SetMCPServers(servers); err != nil {
 		return err
 	}
-	setDefaultServerRuntimeFields(server)
-	h.applyState(server)
+	h.refreshServerRuntime(r.Context(), server)
 	httpx.WriteJSON(w, http.StatusCreated, server)
 	return nil
 }
@@ -372,8 +371,7 @@ func (h *Handler) updateServer(w http.ResponseWriter, r *http.Request) error {
 	if err := h.Settings.SetMCPServers(servers); err != nil {
 		return err
 	}
-	setDefaultServerRuntimeFields(updated)
-	h.applyState(updated)
+	h.refreshServerRuntime(r.Context(), updated)
 	httpx.WriteJSON(w, http.StatusOK, updated)
 	return nil
 }
@@ -405,16 +403,7 @@ func (h *Handler) connectServer(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	result := probeMcpServer(r.Context(), server)
-	server["status"] = "error"
-	server["tools"] = []any{}
-	server["error"] = result.Error
-	if result.OK {
-		server["status"] = "connected"
-		server["tools"] = result.Tools
-		delete(server, "error")
-	}
-	h.setState(stringOr(server["id"], ""), mcpRuntimeState{Status: stringOr(server["status"], "error"), Tools: result.Tools, Error: result.Error})
+	h.probeAndApplyServerRuntime(r.Context(), server)
 	httpx.WriteJSON(w, http.StatusOK, server)
 	return nil
 }
@@ -432,7 +421,13 @@ func (h *Handler) testConnection(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	result := probeMcpServer(r.Context(), body)
+	server, err := normalizeServerConfig(body, "test", true)
+	if err != nil {
+		return err
+	}
+	server["id"] = "test"
+	server["enabled"] = true
+	result := probeMcpServer(r.Context(), server)
 	payload := map[string]any{"ok": result.OK, "tools": result.Tools}
 	if !result.OK {
 		payload["error"] = result.Error
@@ -469,7 +464,7 @@ func (h *Handler) listTools(w http.ResponseWriter, r *http.Request) error {
 			}
 			entry["serverId"] = server["id"]
 			entry["serverName"] = server["name"]
-			entry["source"] = stringOr(server["name"], "")
+			entry["source"] = "external"
 			tools = append(tools, entry)
 		}
 	}
@@ -485,7 +480,7 @@ func (h *Handler) AgentToolSpecs(ctx context.Context, info narrators.ExternalToo
 	tools := []agentbasic.ExternalToolSpec{}
 	for _, server := range servers {
 		serverID := stringOr(server["id"], "")
-		if serverID == "" || !boolValue(server["enabled"], true) || stringOr(server["transport"], "stdio") != "stdio" {
+		if serverID == "" || stringOr(server["transport"], "stdio") != "stdio" {
 			continue
 		}
 		state, ok := states[serverID]
@@ -601,7 +596,7 @@ func (h *Handler) resolveAgentMCPTool(toolName string) (map[string]any, string, 
 	for _, server := range h.settingsServers() {
 		serverID := stringOr(server["id"], "")
 		state, ok := states[serverID]
-		if !ok || state.Status != "connected" || !boolValue(server["enabled"], true) || stringOr(server["transport"], "stdio") != "stdio" {
+		if !ok || state.Status != "connected" || stringOr(server["transport"], "stdio") != "stdio" {
 			continue
 		}
 		serverName := stringOr(server["name"], serverID)
@@ -646,6 +641,41 @@ func (h *Handler) applyState(server map[string]any) {
 	} else {
 		delete(server, "error")
 	}
+}
+
+func (h *Handler) refreshServerRuntime(ctx context.Context, server map[string]any) {
+	setDefaultServerRuntimeFields(server)
+	serverID := stringOr(server["id"], "")
+	if serverID == "" {
+		return
+	}
+	if !boolValue(server["enabled"], true) {
+		h.clearState(serverID)
+		server["status"] = "disconnected"
+		server["tools"] = []any{}
+		delete(server, "error")
+		return
+	}
+	h.probeAndApplyServerRuntime(ctx, server)
+}
+
+func (h *Handler) probeAndApplyServerRuntime(ctx context.Context, server map[string]any) {
+	result := probeMcpServer(ctx, server)
+	server["status"] = "error"
+	server["tools"] = []any{}
+	server["error"] = result.Error
+	if result.OK {
+		server["status"] = "connected"
+		server["tools"] = result.Tools
+		delete(server, "error")
+	}
+	h.setState(stringOr(server["id"], ""), mcpRuntimeState{Status: stringOr(server["status"], "error"), Tools: result.Tools, Error: result.Error})
+}
+
+func (h *Handler) clearState(serverID string) {
+	h.mu.Lock()
+	delete(h.state, serverID)
+	h.mu.Unlock()
 }
 
 type mcpProbeResult struct {
@@ -920,6 +950,7 @@ func (h *Handler) importServers(w http.ResponseWriter, r *http.Request) error {
 	}
 	added := 0
 	skipped := 0
+	addedServers := []map[string]any{}
 	for name, cfg := range serverMap {
 		name = strings.TrimSpace(name)
 		if name == "" || cfg == nil {
@@ -932,17 +963,21 @@ func (h *Handler) importServers(w http.ResponseWriter, r *http.Request) error {
 		}
 		body := map[string]any{"id": id.Short(), "name": name, "transport": detectTransport(cfg), "enabled": enabledBool(cfg)}
 		copyOptionalServerFields(body, cfg)
-		server, err := normalizeServerConfig(body, stringOr(body["id"], id.Short()))
+		server, err := normalizeServerConfig(body, stringOr(body["id"], id.Short()), false)
 		if err != nil {
 			return err
 		}
 		servers = append(servers, server)
+		addedServers = append(addedServers, server)
 		existingNames[lowerName] = struct{}{}
 		added++
 	}
 	if added > 0 {
 		if err := h.Settings.SetMCPServers(servers); err != nil {
 			return err
+		}
+		for _, server := range addedServers {
+			h.refreshServerRuntime(r.Context(), server)
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"added": added, "skipped": skipped})
@@ -1127,38 +1162,105 @@ func setDefaultServerRuntimeFields(server map[string]any) {
 	}
 }
 
-func normalizeServerConfig(input map[string]any, fallbackID string) (map[string]any, error) {
-	serverID := strings.TrimSpace(stringOr(input["id"], fallbackID))
+func normalizeServerConfig(input map[string]any, fallbackID string, strict bool) (map[string]any, error) {
+	serverID := strings.TrimSpace(fallbackID)
+	if !strict {
+		serverID = strings.TrimSpace(stringOr(input["id"], fallbackID))
+	}
 	if serverID == "" {
 		serverID = id.Short()
 	}
-	name := strings.TrimSpace(stringOr(input["name"], "Untitled"))
-	if name == "" {
-		name = "Untitled"
+
+	name := "Untitled"
+	if value, exists := input["name"]; exists {
+		parsed, err := validateOptionalString(value, "name", 200, true)
+		if err != nil {
+			if strict {
+				return nil, err
+			}
+		} else {
+			name = parsed
+		}
 	}
-	transport := stringOr(input["transport"], "stdio")
+
+	transport := "stdio"
+	if value, exists := input["transport"]; exists {
+		parsed, err := validateOptionalString(value, "transport", 32, true)
+		if err != nil {
+			if strict {
+				return nil, err
+			}
+		} else {
+			transport = parsed
+		}
+	}
 	if transport != "stdio" && transport != "streamable-http" && transport != "sse" {
 		return nil, httpx.BadRequest("transport must be one of stdio, streamable-http, or sse")
 	}
-	server := map[string]any{"id": serverID, "name": name, "transport": transport, "enabled": boolValue(input["enabled"], true)}
-	copyOptionalServerFields(server, input)
-	if value, ok := input["defaultBehavior"]; ok && value != nil {
-		behavior, err := normalizeMcpBehavior(value)
-		if err != nil {
-			return nil, err
+
+	enabled := true
+	if value, exists := input["enabled"]; exists {
+		parsed, ok := value.(bool)
+		if !ok {
+			if strict {
+				return nil, httpx.BadRequest("enabled must be a boolean")
+			}
+		} else {
+			enabled = parsed
 		}
-		server["defaultBehavior"] = behavior
 	}
-	if value, ok := input["toolPermissions"]; ok && value != nil {
-		permissions, err := normalizeToolPermissions(value)
-		if err != nil {
+
+	server := map[string]any{"id": serverID, "name": name, "transport": transport, "enabled": enabled}
+	if strict {
+		if err := copyOptionalServerFieldsStrict(server, input); err != nil {
 			return nil, err
 		}
-		if len(permissions) > 0 {
-			server["toolPermissions"] = permissions
+	} else {
+		copyOptionalServerFields(server, input)
+	}
+	if value, ok := input["defaultBehavior"]; ok {
+		if value == nil {
+			if strict {
+				return nil, httpx.BadRequest("defaultBehavior must be one of readOnly, readWrite, ask, or deny")
+			}
+		} else {
+			behavior, err := normalizeMcpBehavior(value)
+			if err != nil {
+				return nil, err
+			}
+			server["defaultBehavior"] = behavior
+		}
+	}
+	if value, ok := input["toolPermissions"]; ok {
+		if value == nil {
+			if strict {
+				return nil, httpx.BadRequest("toolPermissions must be an array")
+			}
+		} else {
+			permissions, err := normalizeToolPermissionsStrict(value)
+			if err != nil {
+				return nil, err
+			}
+			if len(permissions) > 0 {
+				server["toolPermissions"] = permissions
+			}
 		}
 	}
 	return server, nil
+}
+
+func validateOptionalString(value any, key string, maxLength int, minOne bool) (string, error) {
+	text, ok := value.(string)
+	if !ok {
+		return "", httpx.BadRequest(key + " must be a string")
+	}
+	if minOne && len(text) < 1 {
+		return "", httpx.BadRequest(key + " is required")
+	}
+	if len(text) > maxLength {
+		return "", httpx.BadRequest(key + " is too long")
+	}
+	return text, nil
 }
 
 func copyOptionalServerFields(dst map[string]any, src map[string]any) {
@@ -1178,6 +1280,99 @@ func copyOptionalServerFields(dst map[string]any, src map[string]any) {
 	}
 }
 
+func copyOptionalServerFieldsStrict(dst map[string]any, src map[string]any) error {
+	for _, spec := range []struct {
+		key string
+		max int
+	}{
+		{key: "command", max: 500},
+		{key: "cwd", max: 500},
+		{key: "url", max: 2000},
+	} {
+		value, exists := src[spec.key]
+		if !exists {
+			continue
+		}
+		text, err := validateOptionalString(value, spec.key, spec.max, false)
+		if err != nil {
+			return err
+		}
+		if spec.key == "url" {
+			parsed, err := url.Parse(text)
+			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+				return httpx.BadRequest("url must be a valid URL")
+			}
+		}
+		dst[spec.key] = text
+	}
+	if value, exists := src["args"]; exists {
+		args, err := stringArrayValueStrict(value, "args", 50, 500)
+		if err != nil {
+			return err
+		}
+		dst["args"] = args
+	}
+	if value, exists := src["env"]; exists {
+		env, err := stringObjectValueStrict(value, "env", 200, 2000)
+		if err != nil {
+			return err
+		}
+		dst["env"] = env
+	}
+	if value, exists := src["headers"]; exists {
+		headers, err := stringObjectValueStrict(value, "headers", 200, 2000)
+		if err != nil {
+			return err
+		}
+		dst["headers"] = headers
+	}
+	return nil
+}
+
+func stringArrayValueStrict(value any, key string, maxItems int, maxItemLength int) ([]any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, httpx.BadRequest(key + " must be an array")
+	}
+	if len(items) > maxItems {
+		return nil, httpx.BadRequest(key + " has too many items")
+	}
+	out := []any{}
+	for idx, item := range items {
+		text, ok := item.(string)
+		if !ok {
+			return nil, httpx.BadRequest(fmt.Sprintf("%s[%d] must be a string", key, idx))
+		}
+		if len(text) > maxItemLength {
+			return nil, httpx.BadRequest(fmt.Sprintf("%s[%d] is too long", key, idx))
+		}
+		out = append(out, text)
+	}
+	return out, nil
+}
+
+func stringObjectValueStrict(value any, key string, maxKeyLength int, maxValueLength int) (map[string]any, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return nil, httpx.BadRequest(key + " must be an object")
+	}
+	out := map[string]any{}
+	for name, raw := range object {
+		if len(name) > maxKeyLength {
+			return nil, httpx.BadRequest(key + " key is too long")
+		}
+		text, ok := raw.(string)
+		if !ok {
+			return nil, httpx.BadRequest(key + "." + name + " must be a string")
+		}
+		if len(text) > maxValueLength {
+			return nil, httpx.BadRequest(key + "." + name + " is too long")
+		}
+		out[name] = text
+	}
+	return out, nil
+}
+
 func applyServerPatch(server map[string]any, patch map[string]any) (map[string]any, error) {
 	updated := map[string]any{}
 	for key, value := range server {
@@ -1193,24 +1388,37 @@ func applyServerPatch(server map[string]any, patch map[string]any) (map[string]a
 			continue
 		}
 		if value == nil {
-			delete(updated, key)
-			continue
+			if key == "defaultBehavior" {
+				delete(updated, key)
+				continue
+			}
+			return nil, httpx.BadRequest(key + " cannot be null")
 		}
 		updated[key] = value
 	}
-	if toolPatch, ok := patch["toolPermissionPatch"].(map[string]any); ok {
+	if value, ok := patch["toolPermissionPatch"]; ok {
+		toolPatch, ok := value.(map[string]any)
+		if !ok {
+			return nil, httpx.BadRequest("toolPermissionPatch must be an object")
+		}
 		if err := applyToolPermissionPatch(updated, toolPatch); err != nil {
 			return nil, err
 		}
 	}
 	updated["id"] = serverID
-	return normalizeServerConfig(updated, serverID)
+	return normalizeServerConfig(updated, serverID, true)
 }
 
 func applyToolPermissionPatch(server map[string]any, patch map[string]any) error {
-	toolName := strings.TrimSpace(stringOr(patch["toolName"], ""))
+	toolName, ok := patch["toolName"].(string)
+	if !ok {
+		return httpx.BadRequest("toolName must be a string")
+	}
 	if toolName == "" {
 		return httpx.BadRequest("toolName is required")
+	}
+	if len(toolName) > 200 {
+		return httpx.BadRequest("toolName is too long")
 	}
 	current, err := normalizeToolPermissions(server["toolPermissions"])
 	if err != nil {
@@ -1235,7 +1443,11 @@ func applyToolPermissionPatch(server map[string]any, patch map[string]any) error
 			return err
 		}
 		rule := map[string]any{"toolName": toolName, "behavior": behavior}
-		if enabled, ok := patch["enabled"].(bool); ok {
+		if value, exists := patch["enabled"]; exists {
+			enabled, ok := value.(bool)
+			if !ok {
+				return httpx.BadRequest("enabled must be a boolean")
+			}
 			rule["enabled"] = enabled
 		}
 		if idx >= 0 {
@@ -1243,9 +1455,15 @@ func applyToolPermissionPatch(server map[string]any, patch map[string]any) error
 		} else {
 			current = append(current, rule)
 		}
-	} else if enabled, ok := patch["enabled"].(bool); ok && idx >= 0 {
-		if rule, ok := current[idx].(map[string]any); ok {
-			rule["enabled"] = enabled
+	} else if value, exists := patch["enabled"]; exists {
+		enabled, ok := value.(bool)
+		if !ok {
+			return httpx.BadRequest("enabled must be a boolean")
+		}
+		if idx >= 0 {
+			if rule, ok := current[idx].(map[string]any); ok {
+				rule["enabled"] = enabled
+			}
 		}
 	}
 	if len(current) > 0 {
@@ -1257,23 +1475,44 @@ func applyToolPermissionPatch(server map[string]any, patch map[string]any) error
 }
 
 func normalizeToolPermissions(value any) ([]any, error) {
-	items := arrayValue(value)
+	return normalizeToolPermissionItems(arrayValue(value))
+}
+
+func normalizeToolPermissionsStrict(value any) ([]any, error) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, httpx.BadRequest("toolPermissions must be an array")
+	}
+	return normalizeToolPermissionItems(items)
+}
+
+func normalizeToolPermissionItems(items []any) ([]any, error) {
 	permissions := []any{}
 	for _, item := range items {
 		raw, ok := item.(map[string]any)
 		if !ok {
 			return nil, httpx.BadRequest("toolPermissions must contain objects")
 		}
-		toolName := strings.TrimSpace(stringOr(raw["toolName"], ""))
+		toolName, ok := raw["toolName"].(string)
+		if !ok {
+			return nil, httpx.BadRequest("toolPermissions.toolName must be a string")
+		}
 		if toolName == "" {
 			return nil, httpx.BadRequest("toolPermissions.toolName is required")
+		}
+		if len(toolName) > 200 {
+			return nil, httpx.BadRequest("toolPermissions.toolName is too long")
 		}
 		behavior, err := normalizeMcpBehavior(raw["behavior"])
 		if err != nil {
 			return nil, err
 		}
 		entry := map[string]any{"toolName": toolName, "behavior": behavior}
-		if enabled, ok := raw["enabled"].(bool); ok {
+		if value, exists := raw["enabled"]; exists {
+			enabled, ok := value.(bool)
+			if !ok {
+				return nil, httpx.BadRequest("toolPermissions.enabled must be a boolean")
+			}
 			entry["enabled"] = enabled
 		}
 		permissions = append(permissions, entry)

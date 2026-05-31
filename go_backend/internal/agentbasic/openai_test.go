@@ -367,8 +367,100 @@ func TestResolveProviderAndModelReturnsAnthropicAdapter(t *testing.T) {
 	}
 }
 
-func TestResolveProviderFallsBackFromUnsupportedKiroToConfiguredOpenAI(t *testing.T) {
+func TestResolveProviderAndModelFollowsDefaultModelSentinel(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{"defaultModel": "openai:gpt-test"},
+		"openaiProviders": []any{
+			map[string]any{
+				"prefix":       "openai",
+				"apiKey":       "test-key",
+				"baseUrl":      "https://example.invalid/v1",
+				"defaultModel": "gpt-provider-default",
+			},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "__default__")
+	if err != nil {
+		t.Fatalf("ResolveProviderAndModel returned error: %v", err)
+	}
+	if resolution.Provider != "openai" || resolution.Model != "gpt-test" {
+		t.Fatalf("unexpected default sentinel resolution: %#v", resolution)
+	}
+}
+
+func TestResolveProviderAndModelFollowsPrefixedDefaultModelSentinel(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{"defaultModel": "anthropic:claude-test"},
+		"anthropicProviders": []any{
+			map[string]any{
+				"prefix":       "anthropic",
+				"apiKey":       "test-key",
+				"baseUrl":      "https://example.invalid/v1",
+				"defaultModel": "claude-provider-default",
+			},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "openai:__default__")
+	if err != nil {
+		t.Fatalf("ResolveProviderAndModel returned error: %v", err)
+	}
+	if resolution.Provider != "anthropic" || resolution.Model != "claude-test" {
+		t.Fatalf("unexpected prefixed default sentinel resolution: %#v", resolution)
+	}
+}
+
+func TestResolveProviderAndModelResolvesDefaultAggregation(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{
+			"defaultModel": "__agg__:primary",
+			"modelAggregations": []any{
+				map[string]any{
+					"id":          "primary",
+					"name":        "Primary",
+					"models":      []any{"openai:gpt-test"},
+					"routingMode": "priority",
+				},
+			},
+		},
+		"openaiProviders": []any{
+			map[string]any{
+				"prefix":       "openai",
+				"apiKey":       "test-key",
+				"baseUrl":      "https://example.invalid/v1",
+				"defaultModel": "gpt-provider-default",
+			},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "__default__")
+	if err != nil {
+		t.Fatalf("ResolveProviderAndModel returned error: %v", err)
+	}
+	if resolution.Provider != "openai" || resolution.Model != "gpt-test" {
+		t.Fatalf("unexpected default aggregation resolution: %#v", resolution)
+	}
+}
+
+func TestResolveProviderRejectsUnsupportedKiroFallbackUnlessExplicitlyAllowed(t *testing.T) {
 	raw := map[string]any{
+		"openaiProviders": []any{
+			map[string]any{
+				"id":           "openai-test",
+				"prefix":       "openai",
+				"apiKey":       "test-key",
+				"baseUrl":      "https://example.invalid/v1",
+				"defaultModel": "gpt-test",
+			},
+		},
+	}
+	_, err := resolveProviderFromRaw(raw, "kiro:claude-sonnet-4.5")
+	if err == nil || !strings.Contains(err.Error(), "automatic fallback is disabled") {
+		t.Fatalf("expected explicit fallback opt-in error, got: %v", err)
+	}
+}
+
+func TestResolveProviderFallsBackFromUnsupportedKiroToConfiguredOpenAIWhenOptedIn(t *testing.T) {
+	raw := map[string]any{
+		"agent": map[string]any{"allowGoProviderFallback": true},
 		"openaiProviders": []any{
 			map[string]any{
 				"id":           "openai-test",
@@ -388,17 +480,36 @@ func TestResolveProviderFallsBackFromUnsupportedKiroToConfiguredOpenAI(t *testin
 	}
 }
 
-func TestResolveProviderFallsBackFromUnsupportedKiroToOpenAIEnv(t *testing.T) {
+func TestResolveProviderFallsBackFromUnsupportedKiroToOpenAIEnvWhenOptedIn(t *testing.T) {
 	t.Setenv("OPENAI_API_KEY", "env-key")
 	t.Setenv("OPENAI_BASE_URL", "https://env.example.invalid/v1")
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("ANTHROPIC_BASE_URL", "")
-	provider, err := resolveProviderFromRaw(map[string]any{}, "kiro:claude-sonnet-4.5")
+	provider, err := resolveProviderFromRaw(map[string]any{"agent": map[string]any{"allowGoProviderFallback": true}}, "kiro:claude-sonnet-4.5")
 	if err != nil {
 		t.Fatalf("resolveProviderFromRaw returned error: %v", err)
 	}
 	if provider.Prefix != "openai" || provider.Kind != "openai" || provider.Model != "gpt-4o-mini" || provider.APIKey != "env-key" {
 		t.Fatalf("unexpected env fallback provider: %#v", provider)
+	}
+}
+
+func TestResolveProviderRejectsUnsupportedCodexFallbackUnlessExplicitlyAllowed(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	raw := map[string]any{
+		"openaiProviders": []any{
+			map[string]any{
+				"id":           "openai-test",
+				"prefix":       "openai",
+				"apiKey":       "test-key",
+				"baseUrl":      "https://example.invalid/v1",
+				"defaultModel": "gpt-test",
+			},
+		},
+	}
+	_, err := resolveProviderFromRaw(raw, "codex:gpt-5.3-codex")
+	if err == nil || !strings.Contains(err.Error(), "automatic fallback is disabled") {
+		t.Fatalf("expected explicit fallback opt-in error, got: %v", err)
 	}
 }
 
@@ -408,7 +519,7 @@ func TestResolveProviderReportsUnsupportedKiroWhenNoFallbackExists(t *testing.T)
 	t.Setenv("ANTHROPIC_API_KEY", "")
 	t.Setenv("ANTHROPIC_BASE_URL", "")
 	_, err := resolveProviderFromRaw(map[string]any{}, "kiro:claude-sonnet-4.5")
-	if err == nil || !strings.Contains(err.Error(), "not supported by go_backend runtime") {
+	if err == nil || !strings.Contains(err.Error(), "automatic fallback is disabled") {
 		t.Fatalf("expected unsupported Kiro fallback error, got: %v", err)
 	}
 }
@@ -626,7 +737,7 @@ func TestRunAgentLoopOpenAIAdapterEmitsEventSequence(t *testing.T) {
 		t.Fatalf("RunAgentLoop returned error: %v", err)
 	}
 	events := collectEvents(stream)
-	want := []string{"stream_text", "block_complete", "assistant_message", "done"}
+	want := []string{"api_request_start", "stream_text", "api_request_end", "block_complete", "assistant_message", "done"}
 	if got := eventTypes(events); !reflect.DeepEqual(got, want) {
 		t.Fatalf("event types = %#v, want %#v", got, want)
 	}
@@ -651,7 +762,7 @@ func TestRunAgentLoopAnthropicAdapterEmitsEventSequence(t *testing.T) {
 		t.Fatalf("RunAgentLoop returned error: %v", err)
 	}
 	events := collectEvents(stream)
-	want := []string{"stream_text", "block_complete", "assistant_message", "done"}
+	want := []string{"api_request_start", "stream_text", "api_request_end", "block_complete", "assistant_message", "done"}
 	if got := eventTypes(events); !reflect.DeepEqual(got, want) {
 		t.Fatalf("event types = %#v, want %#v", got, want)
 	}
@@ -966,8 +1077,8 @@ func TestBashToolSupportsWorkdirAndRejectsBackground(t *testing.T) {
 		t.Fatalf("expected pwd output under subdir, got: %s", out)
 	}
 	out = ExecuteTool(context.Background(), cwd, "Bash", `{"command":"pwd","run_in_background":true}`)
-	if !strings.Contains(out, "run_in_background is not supported") {
-		t.Fatalf("expected background rejection, got: %s", out)
+	if !strings.Contains(out, "run_in_background requires narrator context") {
+		t.Fatalf("expected narrator context background rejection, got: %s", out)
 	}
 }
 

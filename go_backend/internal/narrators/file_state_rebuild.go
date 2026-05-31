@@ -21,6 +21,7 @@ type orderedFileToolCall struct {
 	ResolvedFilePath string
 	Seq              int
 	CreatedAt        string
+	Output           map[string]any
 }
 
 type rebuiltFileState struct {
@@ -29,10 +30,10 @@ type rebuiltFileState struct {
 }
 
 func queryOrderedFileToolCalls(ctx context.Context, sqlDB *sql.DB, narratorID string, cwd string, maxSeq *int) ([]orderedFileToolCall, error) {
-	query := `SELECT tc.tool_use_id, tc.tool_name, COALESCE(tc.input_json, ''), tc.message_id, refs.seq, tc.created_at
+	query := `SELECT tc.tool_use_id, tc.tool_name, COALESCE(tc.input_json, ''), COALESCE(tc.output_json, ''), tc.message_id, refs.seq, tc.created_at
 FROM narrator_tool_calls tc
 INNER JOIN narrator_message_refs refs ON refs.narrator_id = ? AND refs.message_id = tc.message_id
-WHERE tc.narrator_id = ? AND tc.status = 'success' AND LOWER(tc.tool_name) IN ('write', 'edit')`
+WHERE tc.narrator_id = ? AND tc.status = 'success' AND LOWER(tc.tool_name) IN ('write', 'edit', 'bash')`
 	args := []any{narratorID, narratorID}
 	if maxSeq != nil {
 		query += ` AND refs.seq <= ?`
@@ -49,15 +50,32 @@ WHERE tc.narrator_id = ? AND tc.status = 'success' AND LOWER(tc.tool_name) IN ('
 	calls := []orderedFileToolCall{}
 	for rows.Next() {
 		var call orderedFileToolCall
-		var inputRaw string
-		if err := rows.Scan(&call.ToolUseID, &call.ToolName, &inputRaw, &call.MessageID, &call.Seq, &call.CreatedAt); err != nil {
+		var inputRaw, outputRaw string
+		if err := rows.Scan(&call.ToolUseID, &call.ToolName, &inputRaw, &outputRaw, &call.MessageID, &call.Seq, &call.CreatedAt); err != nil {
 			return nil, err
 		}
 		call.Input = map[string]any{}
 		if strings.TrimSpace(inputRaw) != "" {
 			_ = json.Unmarshal([]byte(inputRaw), &call.Input)
 		}
+		call.Output = map[string]any{}
+		if strings.TrimSpace(outputRaw) != "" {
+			_ = json.Unmarshal([]byte(outputRaw), &call.Output)
+		}
 		call.RawFilePath = toolCallInputFilePath(call.Input)
+		if strings.EqualFold(call.ToolName, "Bash") && call.RawFilePath == "" {
+			entries := toolCallOutputSnapshotEntries(call.Output)
+			for _, entry := range entries {
+				bashCall := call
+				bashCall.Input = map[string]any{"__bash_snapshot_content": entry.Content, "__bash_snapshot_exists": entry.Exists}
+				bashCall.RawFilePath = entry.FilePath
+				bashCall.ResolvedFilePath = resolveSnapshotFilePath(cwd, bashCall.RawFilePath)
+				if bashCall.RawFilePath != "" {
+					calls = append(calls, bashCall)
+				}
+			}
+			continue
+		}
 		call.ResolvedFilePath = resolveSnapshotFilePath(cwd, call.RawFilePath)
 		if call.RawFilePath == "" {
 			continue
@@ -209,6 +227,8 @@ func getAffectedFilePaths(calls []orderedFileToolCall) []string {
 func applyFileToolCall(current *string, call orderedFileToolCall) *string {
 	name := strings.ToLower(strings.TrimSpace(call.ToolName))
 	switch name {
+	case "bash":
+		return applyBashFileSnapshotToolCall(current, call)
 	case "write":
 		content, ok := call.Input["content"].(string)
 		if !ok {
@@ -242,6 +262,16 @@ func applyFileToolCall(current *string, call orderedFileToolCall) *string {
 	}
 }
 
+func applyBashFileSnapshotToolCall(current *string, call orderedFileToolCall) *string {
+	if exists, ok := call.Input["__bash_snapshot_exists"].(bool); ok && !exists {
+		return nil
+	}
+	if content, ok := call.Input["__bash_snapshot_content"].(string); ok {
+		return stringPtr(content)
+	}
+	return current
+}
+
 func toolCallInputFilePath(input map[string]any) string {
 	for _, key := range []string{"file_path", "filePath", "path"} {
 		if value, ok := input[key].(string); ok && strings.TrimSpace(value) != "" {
@@ -249,6 +279,33 @@ func toolCallInputFilePath(input map[string]any) string {
 		}
 	}
 	return ""
+}
+
+type bashSnapshotOutputEntry struct {
+	FilePath string
+	Content  string
+	Exists   bool
+}
+
+func toolCallOutputSnapshotEntries(output map[string]any) []bashSnapshotOutputEntry {
+	items, ok := output["bashSnapshots"].([]any)
+	if !ok {
+		return nil
+	}
+	entries := []bashSnapshotOutputEntry{}
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		filePath := strings.TrimSpace(stringFromAny(entry["filePath"]))
+		content, _ := entry["content"].(string)
+		exists := boolFromAny(entry["exists"])
+		if filePath != "" {
+			entries = append(entries, bashSnapshotOutputEntry{FilePath: filePath, Content: content, Exists: exists})
+		}
+	}
+	return entries
 }
 
 func canonicalToolCallFilePath(call orderedFileToolCall, snapshots map[string]*string) string {

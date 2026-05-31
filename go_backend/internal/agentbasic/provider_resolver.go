@@ -19,6 +19,9 @@ import (
 
 const maxProviderJSONFileBytes = 512 * 1024
 
+const followDefaultModelSentinel = "__default__"
+const aggregationModelPrefix = "__agg__:"
+
 func ResolveProviderAndModel(settings *config.Store, model string) (ProviderResolution, error) {
 	requestedProvider, requestedModel := splitModel(model)
 	provider, err := resolveProvider(settings, model)
@@ -44,14 +47,111 @@ func resolveProvider(settings *config.Store, model string) (Provider, error) {
 	return resolveProviderFromRaw(raw, model)
 }
 
+func resolveEffectiveModelFromRaw(raw map[string]any, model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" || isFollowDefaultModelValue(model) {
+		return resolveConfiguredDefaultModelFromRaw(raw)
+	}
+	if aggID, pinnedModel, ok := parseAggregationModelValue(model); ok {
+		if pinnedModel != "" {
+			if sanitized := sanitizeResolvedModelCandidate(pinnedModel); sanitized != "" {
+				return sanitized
+			}
+			return resolveConfiguredDefaultModelFromRaw(raw)
+		}
+		if resolved := sanitizeResolvedModelCandidate(resolveAggregationFromRaw(raw, aggID)); resolved != "" {
+			return resolved
+		}
+		return resolveConfiguredDefaultModelFromRaw(raw)
+	}
+	return model
+}
+
+func resolveConfiguredDefaultModelFromRaw(raw map[string]any) string {
+	agent, _ := raw["agent"].(map[string]any)
+	configured := strings.TrimSpace(stringValue(agent["defaultModel"]))
+	if configured == "" || isFollowDefaultModelValue(configured) {
+		return config.DefaultAgentModel
+	}
+	if aggID, pinnedModel, ok := parseAggregationModelValue(configured); ok {
+		if pinnedModel != "" {
+			if sanitized := sanitizeResolvedModelCandidate(pinnedModel); sanitized != "" {
+				return sanitized
+			}
+			return config.DefaultAgentModel
+		}
+		if resolved := sanitizeResolvedModelCandidate(resolveAggregationFromRaw(raw, aggID)); resolved != "" {
+			return resolved
+		}
+		return config.DefaultAgentModel
+	}
+	return configured
+}
+
+func isFollowDefaultModelValue(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == followDefaultModelSentinel {
+		return true
+	}
+	prefix, bare := splitModel(model)
+	return prefix != "" && strings.TrimSpace(bare) == followDefaultModelSentinel
+}
+
+func sanitizeResolvedModelCandidate(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return ""
+	}
+	if isFollowDefaultModelValue(model) {
+		return config.DefaultAgentModel
+	}
+	return model
+}
+
+func parseAggregationModelValue(model string) (string, string, bool) {
+	model = strings.TrimSpace(model)
+	if !strings.HasPrefix(model, aggregationModelPrefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(model, aggregationModelPrefix)
+	if idx := strings.Index(rest, ":"); idx >= 0 {
+		return rest[:idx], strings.TrimSpace(rest[idx+1:]), true
+	}
+	return rest, "", true
+}
+
+func resolveAggregationFromRaw(raw map[string]any, aggID string) string {
+	aggID = strings.TrimSpace(aggID)
+	if aggID == "" {
+		return ""
+	}
+	agent, _ := raw["agent"].(map[string]any)
+	for _, item := range readArray(agent["modelAggregations"]) {
+		agg, ok := item.(map[string]any)
+		if !ok || strings.TrimSpace(stringValue(agg["id"])) != aggID {
+			continue
+		}
+		for _, model := range readArray(agg["models"]) {
+			if candidate := strings.TrimSpace(stringValue(model)); candidate != "" {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
 func resolveProviderFromRaw(raw map[string]any, model string) (Provider, error) {
-	provider, err := resolveProviderExact(raw, model)
+	effectiveModel := resolveEffectiveModelFromRaw(raw, model)
+	provider, err := resolveProviderExact(raw, effectiveModel)
 	if err == nil {
 		return applyProviderRuntimeDefaults(raw, provider), nil
 	}
-	prefix, _ := splitModel(model)
+	prefix, _ := splitModel(effectiveModel)
 	if !isGoRuntimeUnsupportedProvider(prefix) {
 		return Provider{}, err
+	}
+	if !providerFallbackAllowed(raw) {
+		return Provider{}, fmt.Errorf("provider %q is not configured or supported by go_backend runtime; automatic fallback is disabled to avoid running a different provider/model: %w", prefix, err)
 	}
 	for _, candidate := range fallbackProviderCandidates(raw) {
 		provider, fallbackErr := resolveProviderExact(raw, candidate)
@@ -983,6 +1083,11 @@ func isGoRuntimeUnsupportedProvider(prefix string) bool {
 	default:
 		return false
 	}
+}
+
+func providerFallbackAllowed(raw map[string]any) bool {
+	agent, _ := raw["agent"].(map[string]any)
+	return boolValue(agent["allowGoProviderFallback"])
 }
 
 func fallbackProviderCandidates(raw map[string]any) []string {

@@ -22,6 +22,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"narrafork-go/internal/auth"
+	"narrafork-go/internal/buildinfo"
 	"narrafork-go/internal/chapters"
 	"narrafork-go/internal/config"
 	gitx "narrafork-go/internal/git"
@@ -504,6 +505,9 @@ func criticalPathAssertFakePodman(t *testing.T, client *http.Client, baseURL, to
 
 func criticalPathAssertUpdateSSE(t *testing.T, client *http.Client, baseURL, token string, settings *config.Store) {
 	t.Helper()
+	oldVersion := buildinfo.Version
+	buildinfo.Version = "1.0.0"
+	t.Cleanup(func() { buildinfo.Version = oldVersion })
 	artifact := []byte("fake update artifact")
 	hash := sha512.Sum512(artifact)
 	version := "9.9.9-test"

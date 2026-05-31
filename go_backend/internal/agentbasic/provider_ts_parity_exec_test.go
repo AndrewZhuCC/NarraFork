@@ -18,8 +18,14 @@ func TestGoMatchesExecutableTSProviderFixtures(t *testing.T) {
 	if _, err := exec.LookPath("bun"); err != nil {
 		t.Skip("bun is required for executable TS provider fixture parity")
 	}
-	cmd := exec.Command("bun", "../../scripts/provider-fixtures.ts")
-	cmd.Env = append(os.Environ(), "NARRAFORK_ALLOW_MULTIPLE=1")
+	goBackendRoot, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatalf("resolve go backend root: %v", err)
+	}
+	repoRoot := filepath.Dir(goBackendRoot)
+	cmd := exec.Command("bun", "go_backend/scripts/provider-fixtures.ts")
+	cmd.Dir = repoRoot
+	cmd.Env = append(os.Environ(), "NARRAFORK_ALLOW_MULTIPLE=1", "HOME="+t.TempDir())
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("run TS provider fixture: %v output=%s", err, string(output))

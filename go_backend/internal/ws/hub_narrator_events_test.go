@@ -127,17 +127,38 @@ func TestNarratorBroadcastPayloadsAddsStreamAndToolCompatibility(t *testing.T) {
 		t.Fatalf("unexpected stream_event payload: %#v", stream)
 	}
 
+	startedPayloads := narratorBroadcastPayloads("nar-1", map[string]any{
+		"type":            "tool_call",
+		"narratorId":      "nar-1",
+		"toolUseId":       "tool-1",
+		"toolName":        "Read",
+		"input":           map[string]any{"file_path": "README.md"},
+		"streamStartedAt": int64(1770000000000),
+		"parentToolUseId": "agent-1",
+	})
+	started := payloadByType(t, startedPayloads, "tool_started")
+	if started["streamStartedAt"] != int64(1770000000000) || started["parentToolUseId"] != "agent-1" {
+		t.Fatalf("tool_started compatibility payload should preserve TS optional fields: %#v", started)
+	}
+
 	toolPayloads := narratorBroadcastPayloads("nar-1", map[string]any{
-		"type":       "tool_result",
-		"narratorId": "nar-1",
-		"toolUseId":  "tool-1",
-		"toolName":   "Read",
-		"output":     "file contents",
-		"durationMs": int64(42),
+		"type":            "tool_result",
+		"narratorId":      "nar-1",
+		"toolUseId":       "tool-1",
+		"toolName":        "Read",
+		"output":          "file contents",
+		"durationMs":      int64(42),
+		"metadata":        map[string]any{"truncated": true},
+		"sideCars":        []any{map[string]any{"target": "tool_result", "content": "detail"}},
+		"updatedInput":    map[string]any{"file_path": "README.md"},
+		"parentToolUseId": "agent-1",
 	})
 	completed := payloadByType(t, toolPayloads, "tool_completed")
 	if completed["toolUseId"] != "tool-1" || completed["toolName"] != "Read" || completed["status"] != "success" || completed["output"] != "file contents" || completed["durationMs"] != int64(42) {
 		t.Fatalf("unexpected tool_completed payload: %#v", completed)
+	}
+	if completed["metadata"] == nil || completed["sideCars"] == nil || completed["updatedInput"] == nil || completed["parentToolUseId"] != "agent-1" {
+		t.Fatalf("tool_completed compatibility payload should preserve TS optional fields: %#v", completed)
 	}
 }
 

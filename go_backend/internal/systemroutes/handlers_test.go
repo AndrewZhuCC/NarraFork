@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -102,17 +103,6 @@ func TestProviderSensitiveRoutesRequireAdminBoundary(t *testing.T) {
 		{http.MethodGet, "/codex/status"},
 		{http.MethodPost, "/codex/import"},
 		{http.MethodPost, "/cline/auth/browser"},
-		{http.MethodPost, "/nug/providers/nug-test/login"},
-		{http.MethodPost, "/nug/providers/nug-test/api-key"},
-		{http.MethodGet, "/nug/providers/nug-test/oauth/start"},
-		{http.MethodPost, "/openai/models/refresh"},
-		{http.MethodPost, "/openai/providers/openai-test/models/refresh"},
-		{http.MethodPost, "/anthropic/models/refresh"},
-		{http.MethodPost, "/anthropic/providers/anthropic-test/models/refresh"},
-		{http.MethodPost, "/nkp/models/refresh"},
-		{http.MethodPost, "/nkp/providers/nkp-test/models/refresh"},
-		{http.MethodPost, "/nug/models/refresh"},
-		{http.MethodPost, "/nug/providers/nug-test/models/refresh"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
@@ -127,6 +117,41 @@ func TestProviderSensitiveRoutesRequireAdminBoundary(t *testing.T) {
 			decodeJSONBody(t, w, &body)
 			if body["code"] != "FORBIDDEN" || body["error"] != "Admin access required" {
 				t.Fatalf("unexpected forbidden body: %#v", body)
+			}
+		})
+	}
+}
+
+func TestProviderModelAndNugRoutesRemainAuthenticatedUserCompatible(t *testing.T) {
+	router, userToken := newProviderRoutesTestRouter(t)
+	cases := []struct {
+		method     string
+		path       string
+		wantStatus int
+	}{
+		{http.MethodPost, "/openai/models/refresh", http.StatusOK},
+		{http.MethodPost, "/openai/providers/openai-test/models/refresh", http.StatusNotFound},
+		{http.MethodPost, "/anthropic/models/refresh", http.StatusOK},
+		{http.MethodPost, "/anthropic/providers/anthropic-test/models/refresh", http.StatusNotFound},
+		{http.MethodPost, "/nkp/models/refresh", http.StatusOK},
+		{http.MethodPost, "/nkp/providers/nkp-test/models/refresh", http.StatusNotFound},
+		{http.MethodPost, "/nug/models/refresh", http.StatusOK},
+		{http.MethodPost, "/nug/providers/nug-test/models/refresh", http.StatusNotFound},
+		{http.MethodPost, "/nug/providers/nug-test/login", http.StatusNotFound},
+		{http.MethodPost, "/nug/providers/nug-test/api-key", http.StatusNotFound},
+		{http.MethodGet, "/nug/providers/nug-test/oauth/start", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("expected %d for authenticated user, got %d body=%s", tc.wantStatus, w.Code, w.Body.String())
+			}
+			if w.Code == http.StatusForbidden {
+				t.Fatalf("route should match TS authenticated-user boundary, got forbidden body=%s", w.Body.String())
 			}
 		})
 	}
@@ -188,9 +213,8 @@ func TestKiroMcpSearchFallbackExposesReason(t *testing.T) {
 	w := httptest.NewRecorder()
 
 	router.ServeHTTP(w, req)
-
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 fallback search, got %d body=%s", w.Code, w.Body.String())
+		t.Fatalf("expected fallback 200 for Kiro MCP search, got %d body=%s", w.Code, w.Body.String())
 	}
 	var body map[string]any
 	decodeJSONBody(t, w, &body)
@@ -201,7 +225,114 @@ func TestKiroMcpSearchFallbackExposesReason(t *testing.T) {
 	}
 }
 
-func TestNugLoginPersistsReturnedAPIKey(t *testing.T) {
+func TestKiroMcpPopulatedBridgeMatchesFrontendShapeAndTSHeaders(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	writeKiroTestCredentials(t, []map[string]any{{
+		"id":          "kiro-live",
+		"accessToken": "access-live",
+		"region":      "credential-region",
+		"profileArn":  "arn:aws:codewhisperer:profile/test",
+	}})
+	writeKiroTestConfig(t, map[string]any{
+		"region":        "config-region",
+		"apiRegion":     "api-region",
+		"kiroVersion":   "9.9.9",
+		"systemVersion": "darwin#14.4",
+	})
+
+	originalClient := kiroMCPHTTPClient
+	defer func() { kiroMCPHTTPClient = originalClient }()
+	type capturedRequest struct {
+		URL        string
+		Auth       string
+		UserAgent  string
+		Attempt    string
+		Invocation string
+		OS         string
+		OSVersion  string
+		Body       map[string]any
+	}
+	captured := []capturedRequest{}
+	kiroMCPHTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body map[string]any
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Fatalf("decode Kiro MCP request body: %v", err)
+		}
+		captured = append(captured, capturedRequest{
+			URL:        req.URL.String(),
+			Auth:       req.Header.Get("Authorization"),
+			UserAgent:  req.Header.Get("User-Agent"),
+			Attempt:    req.Header.Get("amz-sdk-request"),
+			Invocation: req.Header.Get("amz-sdk-invocation-id"),
+			OS:         req.Header.Get("x-amzn-codewhisperer-os"),
+			OSVersion:  req.Header.Get("x-amzn-codewhisperer-os-version"),
+			Body:       body,
+		})
+		if body["method"] == "tools/list" {
+			return kiroTestResponse(http.StatusOK, `{"jsonrpc":"2.0","id":"tools-id","result":{"tools":[{"name":"web_search","description":"Search web","inputSchema":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}]}}`), nil
+		}
+		return kiroTestResponse(http.StatusOK, `{"jsonrpc":"2.0","id":"search-id","result":{"content":[{"type":"text","text":"search result"}],"isError":false}}`), nil
+	})}
+
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	req := httptest.NewRequest(http.MethodGet, "/kiro/mcp-tools", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mcp-tools status = %d body=%s", w.Code, w.Body.String())
+	}
+	var toolsBody map[string]any
+	decodeJSONBody(t, w, &toolsBody)
+	tools, _ := toolsBody["tools"].([]any)
+	if len(tools) != 1 || tools[0].(map[string]any)["name"] != "web_search" {
+		t.Fatalf("populated mcp-tools should mirror result.tools at top level for frontend, got %#v", toolsBody)
+	}
+	resultPayload, _ := toolsBody["result"].(map[string]any)
+	resultTools, _ := resultPayload["tools"].([]any)
+	if len(resultTools) != 1 {
+		t.Fatalf("populated mcp-tools should preserve JSON-RPC result.tools, got %#v", toolsBody)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/kiro/mcp-search", strings.NewReader(`{"query":"contract parity"}`))
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mcp-search status = %d body=%s", w.Code, w.Body.String())
+	}
+	var searchBody map[string]any
+	decodeJSONBody(t, w, &searchBody)
+	searchResult, _ := searchBody["result"].(map[string]any)
+	content, _ := searchResult["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "search result" {
+		t.Fatalf("populated mcp-search should return raw JSON-RPC tool-call result, got %#v", searchBody)
+	}
+
+	if len(captured) != 2 {
+		t.Fatalf("expected two Kiro MCP upstream requests, got %#v", captured)
+	}
+	for idx, req := range captured {
+		if req.URL != "https://q.api-region.amazonaws.com" || req.Auth != "Bearer access-live" || req.UserAgent != "AmazonQ-For-CLI/Version/9.9.9" || req.OS != "darwin" || req.OSVersion != "14.4" || req.Attempt != "attempt=1; max=3" || req.Invocation == "" {
+			t.Fatalf("request %d did not match TS Kiro MCP headers/region: %#v", idx, req)
+		}
+		if req.Body["profileArn"] != "arn:aws:codewhisperer:profile/test" {
+			t.Fatalf("request %d should include profileArn from credential, got %#v", idx, req.Body)
+		}
+	}
+	if captured[0].Body["method"] != "tools/list" {
+		t.Fatalf("first request method = %#v", captured[0].Body)
+	}
+	params, _ := captured[1].Body["params"].(map[string]any)
+	arguments, _ := params["arguments"].(map[string]any)
+	if captured[1].Body["method"] != "tools/call" || params["name"] != "web_search" || arguments["query"] != "contract parity" {
+		t.Fatalf("search request should call web_search with query, got %#v", captured[1].Body)
+	}
+}
+
+func TestNugLoginReturnsAPIKeyWithoutMutatingSettings(t *testing.T) {
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/api/auth/login":
@@ -266,11 +397,151 @@ func TestNugLoginPersistsReturnedAPIKey(t *testing.T) {
 		t.Fatalf("expected one provider, got %#v", providers)
 	}
 	provider, _ := providers[0].(map[string]any)
-	if provider["apiKey"] != "nug-api-key" {
-		t.Fatalf("expected saved api key, got %#v", provider)
+	if provider["apiKey"] != nil || provider["nugUsername"] != nil || provider["nugUserId"] != nil {
+		t.Fatalf("login route should not persist credentials; frontend saves explicitly, got %#v", provider)
 	}
-	if provider["nugUsername"] != "alice" || provider["nugUserId"] != "nug-user-1" {
-		t.Fatalf("expected saved user metadata, got %#v", provider)
+}
+
+func TestNugAuthMissingFieldsMatchTSValidation(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("missing-field validation should not call upstream: %s", r.URL.Path)
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"nugProviders": []any{map[string]any{
+			"id":      "nug-login-fixture",
+			"name":    "NUG Login Fixture",
+			"baseUrl": upstream.URL,
+			"apiKey":  "",
+		}},
+	}); err != nil {
+		t.Fatalf("seed nug provider: %v", err)
+	}
+	router, userToken := newProviderRoutesTestRouterWithStore(t, store, "user")
+
+	cases := []struct {
+		name       string
+		path       string
+		body       string
+		error      string
+		statusCode int
+	}{
+		{name: "login missing credentials", path: "/nug/providers/nug-login-fixture/login", body: `{}`, error: "Missing username or password", statusCode: http.StatusBadRequest},
+		{name: "api key missing session", path: "/nug/providers/nug-login-fixture/api-key", body: `{}`, error: "Missing sessionToken", statusCode: http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.statusCode {
+				t.Fatalf("expected %d, got %d body=%s", tc.statusCode, w.Code, w.Body.String())
+			}
+			var response map[string]any
+			decodeJSONBody(t, w, &response)
+			if response["error"] != tc.error {
+				t.Fatalf("unexpected validation body: %#v", response)
+			}
+		})
+	}
+}
+
+func TestNugOAuthCallbackPersistsCredentialsAndRedirects(t *testing.T) {
+	nugOAuthMu.Lock()
+	nugOAuthStates = map[string]nugOAuthState{}
+	nugOAuthMu.Unlock()
+	t.Cleanup(func() {
+		nugOAuthMu.Lock()
+		nugOAuthStates = map[string]nugOAuthState{}
+		nugOAuthMu.Unlock()
+	})
+
+	var tokenRequest map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/oauth/token":
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected token method: %s", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&tokenRequest); err != nil {
+				t.Fatalf("decode token body: %v", err)
+			}
+			if tokenRequest["code"] != "oauth-code" || tokenRequest["client_id"] != "client-id" || tokenRequest["client_secret"] != "client-secret" {
+				t.Fatalf("unexpected token request: %#v", tokenRequest)
+			}
+			if tokenRequest["redirect_uri"] != "https://narrafork.example/api/nug/oauth/callback" {
+				t.Fatalf("callback redirect_uri should match oauth/start value, got %#v", tokenRequest)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"api_key":   "nug-oauth-api-key",
+				"device_id": "nug-oauth-device",
+				"username":  "oauth-alice",
+				"user_id":   "nug-oauth-user-1",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"nugProviders": []any{map[string]any{
+			"id":                "nug-oauth",
+			"name":              "NUG OAuth",
+			"prefix":            "nugoauth",
+			"apiKey":            "",
+			"baseUrl":           upstream.URL,
+			"oauthClientId":     "client-id",
+			"oauthClientSecret": "client-secret",
+		}},
+	}); err != nil {
+		t.Fatalf("seed nug provider: %v", err)
+	}
+
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	startReq := httptest.NewRequest(http.MethodGet, "/nug/providers/nug-oauth/oauth/start", nil)
+	startReq.Header.Set("Authorization", "Bearer "+adminToken)
+	startReq.Header.Set("X-Forwarded-Host", "narrafork.example")
+	startReq.Header.Set("X-Forwarded-Proto", "https")
+	startW := httptest.NewRecorder()
+	router.ServeHTTP(startW, startReq)
+	if startW.Code != http.StatusOK {
+		t.Fatalf("expected oauth start 200, got %d body=%s", startW.Code, startW.Body.String())
+	}
+	var startBody map[string]any
+	decodeJSONBody(t, startW, &startBody)
+	state, _ := startBody["state"].(string)
+	if state == "" {
+		t.Fatalf("missing oauth state: %#v", startBody)
+	}
+	authorizeURL, _ := url.Parse(startBody["authorizeUrl"].(string))
+	if authorizeURL.Path != "/oauth/authorize" || authorizeURL.Query().Get("client_id") != "client-id" || authorizeURL.Query().Get("state") != state || authorizeURL.Query().Get("redirect_uri") != "https://narrafork.example/api/nug/oauth/callback" {
+		t.Fatalf("unexpected authorize URL: %#v", startBody)
+	}
+
+	callbackReq := httptest.NewRequest(http.MethodGet, "/api/nug/oauth/callback?code=oauth-code&state="+url.QueryEscape(state), nil)
+	callbackW := httptest.NewRecorder()
+	callbackHandler := &Handler{Settings: store}
+	if err := callbackHandler.NugOAuthCallback(callbackW, callbackReq); err != nil {
+		t.Fatalf("oauth callback: %v", err)
+	}
+	if callbackW.Code != http.StatusFound {
+		t.Fatalf("expected callback redirect, got %d body=%s", callbackW.Code, callbackW.Body.String())
+	}
+	if got := callbackW.Header().Get("Location"); got != "/settings/providers?oauth_success=nug-oauth" {
+		t.Fatalf("unexpected callback Location: %q", got)
+	}
+
+	raw := store.Raw()
+	providers, _ := raw["nugProviders"].([]any)
+	provider, _ := providers[0].(map[string]any)
+	if provider["apiKey"] != "nug-oauth-api-key" || provider["oauthDeviceId"] != "nug-oauth-device" || provider["nugUsername"] != "oauth-alice" || provider["nugUserId"] != "nug-oauth-user-1" {
+		t.Fatalf("expected persisted oauth credentials, got %#v", provider)
 	}
 }
 
@@ -294,6 +565,15 @@ func TestCodexUsageQueueClearReturnsOkWhenQueueIsEmpty(t *testing.T) {
 
 func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{"codex": map[string]any{
+		"proxy":                  "http://proxy.example.test:8080",
+		"loadBalancingMode":      "balanced",
+		"defaultReasoningEffort": "high",
+		"useWebSocket":           false,
+		"tierOrder":              []any{"team", "pro", "invalid", "team"},
+	}}); err != nil {
+		t.Fatalf("patch codex settings: %v", err)
+	}
 	dataDir, err := narraforkDataDir()
 	if err != nil {
 		t.Fatalf("data dir: %v", err)
@@ -307,6 +587,10 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 		credentials = append(credentials, map[string]any{
 			"id":          id,
 			"displayName": "Available " + strconv.Itoa(i),
+			"accessToken": "available-access-" + strconv.Itoa(i),
+			"accountId":   "available-account-" + strconv.Itoa(i),
+			"email":       "available-" + strconv.Itoa(i) + "@example.com",
+			"sub":         "available-sub-" + strconv.Itoa(i),
 			"usage":       map[string]any{"plan_type": "pro", "remaining_percent": 80 - i},
 		})
 	}
@@ -314,6 +598,10 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 		credentials = append(credentials, map[string]any{
 			"id":          "unavailable-" + strconv.Itoa(i),
 			"displayName": "Unavailable " + strconv.Itoa(i),
+			"accessToken": "unavailable-access-" + strconv.Itoa(i),
+			"accountId":   "unavailable-account-" + strconv.Itoa(i),
+			"email":       "unavailable-" + strconv.Itoa(i) + "@example.com",
+			"sub":         "unavailable-sub-" + strconv.Itoa(i),
 			"disabled":    true,
 			"usage":       map[string]any{"plan_type": "free", "remaining_percent": i},
 		})
@@ -334,8 +622,22 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 	}
 	var body map[string]any
 	decodeJSONBody(t, w, &body)
-	if body["availableTotal"] != float64(25) || body["unavailableTotal"] != float64(3) {
-		t.Fatalf("unexpected totals: available=%#v unavailable=%#v", body["availableTotal"], body["unavailableTotal"])
+	if body["availableTotal"] != float64(25) || body["unavailableTotal"] != float64(3) || body["total"] != float64(28) || body["available"] != float64(25) {
+		t.Fatalf("unexpected totals: available=%#v unavailable=%#v total=%#v", body["availableTotal"], body["unavailableTotal"], body["total"])
+	}
+	if body["globalProxy"] != "http://proxy.example.test:8080" || body["proxy"] != body["globalProxy"] {
+		t.Fatalf("status should expose frontend globalProxy alias and legacy proxy: %#v", body)
+	}
+	if body["loadBalancingMode"] != "balanced" || body["defaultReasoningEffort"] != "high" || body["useWebSocket"] != false {
+		t.Fatalf("status should expose codex settings fields: %#v", body)
+	}
+	tierOrder, _ := body["tierOrder"].([]any)
+	if strings.Join(anyStrings(tierOrder), ",") != "team,pro" {
+		t.Fatalf("unexpected sanitized tier order: %#v", tierOrder)
+	}
+	effectiveTierOrder, _ := body["effectiveTierOrder"].([]any)
+	if strings.Join(anyStrings(effectiveTierOrder), ",") != "team,pro,prolite,plus,free,other" {
+		t.Fatalf("unexpected effective tier order: %#v", effectiveTierOrder)
 	}
 	availableEntries, _ := body["availableEntries"].([]any)
 	unavailableEntries, _ := body["unavailableEntries"].([]any)
@@ -353,6 +655,67 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 	}
 	if _, ok := usageCache["available-20"]; !ok {
 		t.Fatalf("usageCache should include current page entries, got %#v", usageCache)
+	}
+}
+
+func TestCodexStatusFiltersInvalidAndDuplicatePersistedCredentials(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir, err := narraforkDataDir()
+	if err != nil {
+		t.Fatalf("data dir: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	credentials := []map[string]any{
+		{
+			"id":           "codex-contract",
+			"displayName":  "Codex Contract Fixture",
+			"accessToken":  "codex-access-fixture",
+			"refreshToken": "codex-refresh-fixture",
+			"accountId":    "codex-account-fixture",
+			"email":        "codex-contract@example.com",
+			"sub":          "codex-sub-fixture",
+		},
+		{
+			"id":          "codex-invalid-no-token",
+			"displayName": "Codex Invalid No Token",
+		},
+		{
+			"id":           "codex-duplicate-refresh",
+			"displayName":  "Codex Duplicate Refresh",
+			"accessToken":  "codex-duplicate-access",
+			"refreshToken": "codex-refresh-fixture",
+			"accountId":    "codex-duplicate-account",
+			"email":        "codex-duplicate@example.com",
+			"sub":          "codex-duplicate-sub",
+		},
+	}
+	data, _ := json.Marshal(credentials)
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), data, 0o600); err != nil {
+		t.Fatalf("write codex credentials: %v", err)
+	}
+
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	req := httptest.NewRequest(http.MethodGet, "/codex/status", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 ok, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["total"] != float64(1) || body["availableTotal"] != float64(1) || body["currentId"] != "codex-contract" {
+		t.Fatalf("unexpected filtered codex status: %#v", body)
+	}
+	entries, _ := body["entries"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("expected one normalized credential, got %#v", entries)
+	}
+	entry, _ := entries[0].(map[string]any)
+	if entry["id"] != "codex-contract" || entry["disabled"] != false || entry["priority"] != float64(0) {
+		t.Fatalf("unexpected normalized credential: %#v", entry)
 	}
 }
 
@@ -399,6 +762,52 @@ func TestCodexSettingsMutationWithoutSettingsStoreReturnsFeatureDisabled(t *test
 	reason, _ := body["reason"].(string)
 	if reason == "" || body["error"] != reason || body["message"] != reason {
 		t.Fatalf("Codex settings fallback should expose reason/error/message, got %#v", body)
+	}
+}
+
+func TestCodexSettingsMutationsMatchTSValidation(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	post := func(path, payload string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(payload))
+		req.Header.Set("Authorization", "Bearer "+adminToken)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		var body map[string]any
+		decodeJSONBody(t, w, &body)
+		return w.Code, body
+	}
+
+	status, body := post("/codex/use-websocket", `{}`)
+	if status != http.StatusOK || body["ok"] != true || body["useWebSocket"] != true {
+		t.Fatalf("missing useWebSocket should default true like TS, status=%d body=%#v", status, body)
+	}
+
+	for _, tc := range []struct {
+		path    string
+		payload string
+	}{
+		{"/codex/use-websocket", `{"useWebSocket":"yes"}`},
+		{"/codex/load-balancing-mode", `{"mode":"tiered_sticky"}`},
+		{"/codex/tier-order", `{"tierOrder":["team","invalid"]}`},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			status, body := post(tc.path, tc.payload)
+			if status != http.StatusBadRequest {
+				t.Fatalf("expected TS-style 400, got %d body=%#v", status, body)
+			}
+		})
+	}
+
+	status, body = post("/codex/tier-order", `{"tierOrder":["team","pro","team"]}`)
+	if status != http.StatusOK || body["ok"] != true {
+		t.Fatalf("valid tierOrder should succeed, status=%d body=%#v", status, body)
+	}
+	tierOrder, _ := body["tierOrder"].([]any)
+	if strings.Join(anyStrings(tierOrder), ",") != "team,pro" {
+		t.Fatalf("valid tierOrder should be normalized after TS validation, got %#v", tierOrder)
 	}
 }
 
@@ -809,6 +1218,479 @@ func (s *gatewayNarratorStub) AddUserMessage(_ context.Context, narratorID, user
 	return narrators.Message{ID: "message-1", NarratorID: narratorID}, nil
 }
 
+func TestClineProviderEndpointsExposeFrontendContractShape(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"clineProviders": []any{map[string]any{
+			"id":            "cline1",
+			"name":          "Cline",
+			"prefix":        "cline",
+			"accessToken":   "provider-token",
+			"enabledModels": []any{"anthropic/claude-sonnet"},
+		}},
+	}); err != nil {
+		t.Fatalf("patch Cline provider settings: %v", err)
+	}
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-models.json"), []byte(`{"cline1":[{"id":"openai/gpt-test","name":"GPT Test","contextLength":128000,"pricing":{"prompt":"0.1","completion":"0.2"}},{"id":"anthropic/claude-sonnet","name":"Claude Sonnet Coding","contextLength":200000}]}`), 0o600); err != nil {
+		t.Fatalf("write cline model cache: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	get := func(path string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s expected 200, got %d body=%s", path, w.Code, w.Body.String())
+		}
+		var body map[string]any
+		decodeJSONBody(t, w, &body)
+		return body
+	}
+
+	status := get("/cline/status")
+	if status["authenticated"] != false || status["pendingAuth"] != false || status["totalModels"] != float64(2) {
+		t.Fatalf("status should report auth flags and cached model-pool count: %#v", status)
+	}
+	providers, ok := status["providers"].([]any)
+	if !ok || len(providers) != 1 {
+		t.Fatalf("status should include provider array: %#v", status)
+	}
+	provider, _ := providers[0].(map[string]any)
+	if provider["id"] != "cline1" || provider["prefix"] != "cline" || provider["hasToken"] != true {
+		t.Fatalf("unexpected provider status shape: %#v", provider)
+	}
+
+	count := get("/cline/pool/count")
+	if count["count"] != float64(2) {
+		t.Fatalf("pool count should use cached model pool: %#v", count)
+	}
+	search := get("/cline/pool/search?q=claude%20coding&limit=1")
+	models, ok := search["models"].([]any)
+	if !ok || len(models) != 1 || search["total"] != float64(1) {
+		t.Fatalf("pool search should return limited models and total matches: %#v", search)
+	}
+	first, _ := models[0].(map[string]any)
+	if first["id"] != "anthropic/claude-sonnet" || first["contextLength"] != float64(200000) {
+		t.Fatalf("pool search should preserve frontend model fields: %#v", first)
+	}
+
+	missing := get("/cline/providers/missing/models")
+	missingModels, ok := missing["models"].([]any)
+	if !ok || len(missingModels) != 0 || missing["fromCache"] != true {
+		t.Fatalf("missing provider cache should return empty models array/fromCache: %#v", missing)
+	}
+
+	recommended := get("/cline/recommended-models")
+	if rec, ok := recommended["recommended"].([]any); !ok || len(rec) == 0 {
+		t.Fatalf("recommended models should include recommended array: %#v", recommended)
+	}
+	if free, ok := recommended["free"].([]any); !ok || len(free) == 0 {
+		t.Fatalf("recommended models should include free array: %#v", recommended)
+	}
+}
+
+func TestClineRecommendedModelsPrefersCachedFrontendShape(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir cline cache dir: %v", err)
+	}
+	cache := map[string]any{
+		"recommended": []any{map[string]any{
+			"id":          "cached/recommended-model",
+			"name":        "Cached Recommended Model",
+			"description": "cached recommended description",
+			"tags":        []any{"CACHED"},
+		}},
+		"free": []any{map[string]any{
+			"id":   "cached/free-model",
+			"name": "Cached Free Model",
+			"tags": []any{"FREE"},
+		}},
+	}
+	cacheBytes, err := json.Marshal(cache)
+	if err != nil {
+		t.Fatalf("marshal cline recommended cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-recommended-models.json"), cacheBytes, 0o600); err != nil {
+		t.Fatalf("write cline recommended cache: %v", err)
+	}
+
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	req := httptest.NewRequest(http.MethodGet, "/cline/recommended-models", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected recommended models 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	recommended, _ := body["recommended"].([]any)
+	free, _ := body["free"].([]any)
+	if len(recommended) != 1 || len(free) != 1 {
+		t.Fatalf("recommended models should expose TS frontend arrays from cache, got %#v", body)
+	}
+	recommendedModel, _ := recommended[0].(map[string]any)
+	freeModel, _ := free[0].(map[string]any)
+	if recommendedModel["id"] != "cached/recommended-model" || recommendedModel["description"] != "cached recommended description" || freeModel["id"] != "cached/free-model" {
+		t.Fatalf("recommended models cache shape drifted: %#v", body)
+	}
+	if tags, ok := recommendedModel["tags"].([]any); !ok || len(tags) != 1 || tags[0] != "CACHED" {
+		t.Fatalf("recommended model tags should remain a frontend array, got %#v", recommendedModel)
+	}
+}
+
+func TestClineReadEndpointsDoNotMutateDefaultProvider(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	providers, _ := store.Raw()["clineProviders"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("provider route registration should create the TS-style default Cline provider, got %#v", providers)
+	}
+	initialProvider, _ := providers[0].(map[string]any)
+	initialProviderID := stringMap(initialProvider, "id", "")
+	readPaths := []string{
+		"/cline/status",
+		"/cline/models",
+		"/cline/pool/search?q=claude&limit=5",
+		"/cline/pool/count",
+	}
+	for _, path := range readPaths {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected read-only Cline endpoint 200, got %d body=%s", w.Code, w.Body.String())
+			}
+			providers, _ := store.Raw()["clineProviders"].([]any)
+			provider, _ := providers[0].(map[string]any)
+			if len(providers) != 1 || stringMap(provider, "id", "") != initialProviderID {
+				t.Fatalf("%s should not create or replace Cline providers, got %#v", path, providers)
+			}
+		})
+	}
+}
+
+func TestProviderMissingResponseIncludesProviderID(t *testing.T) {
+	r, token := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodGet, "/nkp/providers/missing/quota", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("missing provider should return 404, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["error"] != `Provider "missing" not found` {
+		t.Fatalf("missing provider response should include provider id, got %#v", body)
+	}
+}
+
+func TestClineUnauthenticatedUserInfoAndBalanceMatchTSStatus(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	refreshReq := httptest.NewRequest(http.MethodPost, "/cline/user-info/refresh", nil)
+	refreshReq.Header.Set("Authorization", "Bearer "+token)
+	refreshW := httptest.NewRecorder()
+	r.ServeHTTP(refreshW, refreshReq)
+	if refreshW.Code != http.StatusOK {
+		t.Fatalf("unauthenticated user-info refresh should return 200, got %d body=%s", refreshW.Code, refreshW.Body.String())
+	}
+	var refreshBody map[string]any
+	decodeJSONBody(t, refreshW, &refreshBody)
+	if refreshBody["authenticated"] != false {
+		t.Fatalf("expected unauthenticated status body, got %#v", refreshBody)
+	}
+
+	balanceReq := httptest.NewRequest(http.MethodGet, "/cline/balance", nil)
+	balanceReq.Header.Set("Authorization", "Bearer "+token)
+	balanceW := httptest.NewRecorder()
+	r.ServeHTTP(balanceW, balanceReq)
+	if balanceW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("unauthenticated balance should return TS-safe 422, got %d body=%s", balanceW.Code, balanceW.Body.String())
+	}
+	var balanceBody map[string]any
+	decodeJSONBody(t, balanceW, &balanceBody)
+	if balanceBody["error"] != "Not authenticated or balance unavailable" {
+		t.Fatalf("expected TS balance auth error, got %#v", balanceBody)
+	}
+}
+
+func TestClineRecommendedModelsRefreshFetchesAndPersistsCache(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cline/api/v1/ai/cline/recommended-models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recommended":[{"id":"cline/recommended-fixture","name":"Cline Recommended Fixture","description":"Fixture recommended model","tags":["BEST"]}],"free":[{"id":"cline/free-fixture","name":"Cline Free Fixture","tags":["FREE"]},{"id":"cline/free-live-fixture","name":"Cline Free Live Fixture","description":"Fixture live free model","tags":["FREE","LIVE"]}]}`))
+	}))
+	defer upstream.Close()
+	t.Setenv("NARRAFORK_CLINE_RECOMMENDED_MODELS_URL", upstream.URL+"/cline/api/v1/ai/cline/recommended-models")
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	refreshReq := httptest.NewRequest(http.MethodGet, "/cline/recommended-models?refresh=1", nil)
+	refreshReq.Header.Set("Authorization", "Bearer "+token)
+	refreshW := httptest.NewRecorder()
+	r.ServeHTTP(refreshW, refreshReq)
+	if refreshW.Code != http.StatusOK {
+		t.Fatalf("expected recommended refresh 200, got %d body=%s", refreshW.Code, refreshW.Body.String())
+	}
+	var refreshBody map[string]any
+	decodeJSONBody(t, refreshW, &refreshBody)
+	assertClineRecommendedFixtureBody(t, refreshBody)
+
+	cachedReq := httptest.NewRequest(http.MethodGet, "/cline/recommended-models", nil)
+	cachedReq.Header.Set("Authorization", "Bearer "+token)
+	cachedW := httptest.NewRecorder()
+	r.ServeHTTP(cachedW, cachedReq)
+	if cachedW.Code != http.StatusOK {
+		t.Fatalf("expected recommended cache 200, got %d body=%s", cachedW.Code, cachedW.Body.String())
+	}
+	var cachedBody map[string]any
+	decodeJSONBody(t, cachedW, &cachedBody)
+	assertClineRecommendedFixtureBody(t, cachedBody)
+}
+
+func assertClineRecommendedFixtureBody(t *testing.T, body map[string]any) {
+	t.Helper()
+	recommended, _ := body["recommended"].([]any)
+	free, _ := body["free"].([]any)
+	if len(recommended) != 1 || len(free) != 2 {
+		t.Fatalf("expected fixture recommended/free arrays, got %#v", body)
+	}
+	recommendedModel, _ := recommended[0].(map[string]any)
+	freeOne, _ := free[0].(map[string]any)
+	freeTwo, _ := free[1].(map[string]any)
+	if recommendedModel["id"] != "cline/recommended-fixture" || recommendedModel["description"] != "Fixture recommended model" {
+		t.Fatalf("recommended fixture model drifted: %#v", recommendedModel)
+	}
+	if freeOne["id"] != "cline/free-fixture" || freeTwo["id"] != "cline/free-live-fixture" || freeTwo["description"] != "Fixture live free model" {
+		t.Fatalf("free fixture models drifted: %#v", body)
+	}
+	if tags, ok := recommendedModel["tags"].([]any); !ok || len(tags) != 1 || tags[0] != "BEST" {
+		t.Fatalf("recommended fixture tags drifted: %#v", recommendedModel)
+	}
+}
+
+func TestClineProviderRefreshResponseMatchesTSCountShape(t *testing.T) {
+	body := providerModelRefreshResponse("cline", []map[string]any{{"id": "a"}, {"id": "b"}}, map[string]any{"ignored": true})
+	if body["count"] != 2 || body["fromCache"] != false {
+		t.Fatalf("Cline provider refresh should return TS count/fromCache shape, got %#v", body)
+	}
+	if _, ok := body["models"]; ok {
+		t.Fatalf("Cline provider refresh should not expose models in TS-compatible provider-specific response, got %#v", body)
+	}
+}
+
+func TestClineProviderRefreshFetchesOpenRouterShapeAndCachesModels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/openrouter/api/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("X-CLIENT-TYPE") != "extension" || r.Header.Get("HTTP-Referer") != "https://cline.bot" {
+			http.Error(w, "missing Cline OpenRouter headers", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"cline/refresh-b","name":"Cline Refresh B","context_length":200000,"pricing":{"prompt":"0.000002","completion":"0.000004"}},{"id":"cline/refresh-a","name":"Cline Refresh A","context_length":100000,"pricing":{"prompt":"0.000001","completion":"0.000003"}},{"id":"cline/refresh-a","name":"Duplicate"}]}`))
+	}))
+	defer upstream.Close()
+	t.Setenv("NARRAFORK_CLINE_OPENROUTER_MODELS_URL", upstream.URL+"/openrouter/api/v1/models")
+	store := newSystemRoutesTestStore(t)
+	provider := map[string]any{"id": "cline1", "name": "Cline", "prefix": "clinecache", "enabledModels": []any{}}
+	if _, err := store.Patch(map[string]any{"clineProviders": []any{provider}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	refreshReq := httptest.NewRequest(http.MethodPost, "/cline/providers/cline1/models/refresh", nil)
+	refreshReq.Header.Set("Authorization", "Bearer "+token)
+	refreshW := httptest.NewRecorder()
+	r.ServeHTTP(refreshW, refreshReq)
+	if refreshW.Code != http.StatusOK {
+		t.Fatalf("expected refresh 200, got %d body=%s", refreshW.Code, refreshW.Body.String())
+	}
+	var refreshBody map[string]any
+	decodeJSONBody(t, refreshW, &refreshBody)
+	if refreshBody["count"] != float64(3) || refreshBody["fromCache"] != false {
+		t.Fatalf("unexpected refresh body: %#v", refreshBody)
+	}
+	if _, ok := refreshBody["models"]; ok {
+		t.Fatalf("provider-specific Cline refresh should not return models: %#v", refreshBody)
+	}
+
+	modelsReq := httptest.NewRequest(http.MethodGet, "/cline/providers/cline1/models", nil)
+	modelsReq.Header.Set("Authorization", "Bearer "+token)
+	modelsW := httptest.NewRecorder()
+	r.ServeHTTP(modelsW, modelsReq)
+	if modelsW.Code != http.StatusOK {
+		t.Fatalf("expected cached models 200, got %d body=%s", modelsW.Code, modelsW.Body.String())
+	}
+	var modelsBody map[string]any
+	decodeJSONBody(t, modelsW, &modelsBody)
+	if modelsBody["fromCache"] != true {
+		t.Fatalf("expected cached response, got %#v", modelsBody)
+	}
+	models, _ := modelsBody["models"].([]any)
+	if len(models) != 3 {
+		t.Fatalf("expected provider-specific cached models to preserve TS duplicates, got %#v", modelsBody)
+	}
+	first, _ := models[0].(map[string]any)
+	second, _ := models[1].(map[string]any)
+	third, _ := models[2].(map[string]any)
+	if first["id"] != "cline/refresh-a" || second["id"] != "cline/refresh-a" || third["id"] != "cline/refresh-b" {
+		t.Fatalf("expected sorted Cline refresh models with provider-specific duplicates preserved, got %#v", models)
+	}
+	if first["contextLength"] != float64(100000) || first["promptPrice"] != "0.000001" || first["completionPrice"] != "0.000003" {
+		t.Fatalf("expected normalized Cline model metadata, got %#v", first)
+	}
+
+	allReq := httptest.NewRequest(http.MethodGet, "/cline/models", nil)
+	allReq.Header.Set("Authorization", "Bearer "+token)
+	allW := httptest.NewRecorder()
+	r.ServeHTTP(allW, allReq)
+	if allW.Code != http.StatusOK {
+		t.Fatalf("expected aggregate Cline models 200, got %d body=%s", allW.Code, allW.Body.String())
+	}
+	var allBody map[string]any
+	decodeJSONBody(t, allW, &allBody)
+	allModels, _ := allBody["models"].([]any)
+	if len(allModels) != 2 {
+		t.Fatalf("expected aggregate Cline models to dedupe by id, got %#v", allBody)
+	}
+}
+
+func TestProviderModelRefreshReturnsFrontendContractShape(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/openai/v1/models", "/openai/api/v1/models", "/openai/models":
+			if r.Header.Get("Authorization") != "Bearer openai-key" {
+				t.Fatalf("unexpected OpenAI auth header: %s", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-b"},{"id":"gpt-a"}]}`))
+		case "/anthropic/v1/models", "/anthropic/models":
+			if r.Header.Get("x-api-key") != "anthropic-key" || r.Header.Get("anthropic-version") == "" {
+				t.Fatalf("unexpected Anthropic headers api=%s version=%s", r.Header.Get("x-api-key"), r.Header.Get("anthropic-version"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"claude-b","display_name":"Claude B"},{"id":"claude-a"}]}`))
+		case "/nkp/v1/kiro/models":
+			if r.Header.Get("Authorization") != "Bearer nkp-key" {
+				t.Fatalf("unexpected NKP auth header: %s", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"nkp-b","model_name":"Claude NKP B"},{"model_id":"nkp-a","model_short_name":"NKP A"}]}`))
+		case "/nkp/v1/quota":
+			if r.Header.Get("Authorization") != "Bearer nkp-key" {
+				t.Fatalf("unexpected NKP quota auth header: %s", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"quotaBalance":12.34,"quotaTotalGranted":56.78}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"openaiProviders":    []any{map[string]any{"id": "oa", "name": "OpenAI", "prefix": "openai", "baseUrl": upstream.URL + "/openai/v1", "apiKey": "openai-key"}},
+		"anthropicProviders": []any{map[string]any{"id": "anth", "name": "Anthropic", "prefix": "anthropic", "baseUrl": upstream.URL + "/anthropic", "apiKey": "anthropic-key"}},
+		"nkpProviders":       []any{map[string]any{"id": "nkp", "name": "NKP", "prefix": "nkp", "baseUrl": upstream.URL + "/nkp", "apiKey": "nkp-key"}},
+	}); err != nil {
+		t.Fatalf("patch provider settings: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	cases := []struct {
+		path        string
+		idKey       string
+		wantFirstID string
+		wantExtra   string
+	}{
+		{path: "/openai/providers/oa/models/refresh", idKey: "id", wantFirstID: "gpt-a"},
+		{path: "/anthropic/providers/anth/models/refresh", idKey: "id", wantFirstID: "claude-a", wantExtra: "resolvedBaseUrl"},
+		{path: "/nkp/providers/nkp/models/refresh", idKey: "model_id", wantFirstID: "nkp-a"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			decodeJSONBody(t, w, &body)
+			models, ok := body["models"].([]any)
+			if !ok || len(models) != 2 || body["fromCache"] != false {
+				t.Fatalf("refresh response should expose frontend models/fromCache shape: %#v", body)
+			}
+			first, _ := models[0].(map[string]any)
+			if first[tc.idKey] != tc.wantFirstID {
+				t.Fatalf("unexpected first model for %s: %#v", tc.path, models)
+			}
+			if tc.wantExtra != "" && body[tc.wantExtra] == nil {
+				t.Fatalf("expected extra field %s in response: %#v", tc.wantExtra, body)
+			}
+		})
+	}
+
+	quotaReq := httptest.NewRequest(http.MethodGet, "/nkp/providers/nkp/quota", nil)
+	quotaReq.Header.Set("Authorization", "Bearer "+token)
+	quotaW := httptest.NewRecorder()
+	r.ServeHTTP(quotaW, quotaReq)
+	if quotaW.Code != http.StatusOK {
+		t.Fatalf("expected NKP quota 200, got %d body=%s", quotaW.Code, quotaW.Body.String())
+	}
+	var quotaBody map[string]any
+	decodeJSONBody(t, quotaW, &quotaBody)
+	if quotaBody["quotaBalance"] != float64(12.34) || quotaBody["quotaTotalGranted"] != float64(56.78) {
+		t.Fatalf("unexpected NKP quota response: %#v", quotaBody)
+	}
+
+	quotasReq := httptest.NewRequest(http.MethodGet, "/nkp/quotas", nil)
+	quotasReq.Header.Set("Authorization", "Bearer "+token)
+	quotasW := httptest.NewRecorder()
+	r.ServeHTTP(quotasW, quotasReq)
+	if quotasW.Code != http.StatusOK {
+		t.Fatalf("expected NKP quotas 200, got %d body=%s", quotasW.Code, quotasW.Body.String())
+	}
+	var quotasBody map[string]map[string]any
+	decodeJSONBody(t, quotasW, &quotasBody)
+	cachedQuota := quotasBody["nkp"]
+	if cachedQuota["quotaBalance"] != float64(12.34) || cachedQuota["quotaTotalGranted"] != float64(56.78) || len(cachedQuota) != 2 {
+		t.Fatalf("unexpected NKP cached quota: %#v", quotasBody)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/openai/models/refresh", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected all-provider refresh 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if _, ok := body["results"].([]any); !ok || body["fromCache"] != false {
+		t.Fatalf("all-provider refresh should expose results/models/fromCache shape: %#v", body)
+	}
+	if models, ok := body["models"].([]any); !ok || len(models) == 0 {
+		t.Fatalf("all-provider refresh should include aggregate models: %#v", body)
+	}
+}
+
 func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -852,11 +1734,265 @@ func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
 	var quotas map[string]map[string]any
 	decodeJSONBody(t, w, &quotas)
 	cached := quotas["nug-1"]
-	if cached["balance"] != float64(12.5) || cached["totalGranted"] != float64(50) {
+	if cached["balance"] != float64(12.5) || cached["totalGranted"] != float64(50) || len(cached) != 2 {
 		t.Fatalf("unexpected cached quota: %#v", quotas)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".narrafork", "nug-quotas.json")); err != nil {
 		t.Fatalf("expected nug quota cache file: %v", err)
+	}
+}
+
+func TestProviderGlobalRefreshReportsMissingKeyResults(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/openai/v1/models":
+			if r.Header.Get("Authorization") != "Bearer openai-key" {
+				t.Fatalf("unexpected OpenAI auth header: %s", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"gpt-b"},{"id":"gpt-a"},{"id":"gpt-a"}]}`))
+		case "/anthropic/v1/models":
+			if r.Header.Get("x-api-key") != "anthropic-key" || r.Header.Get("anthropic-version") == "" {
+				t.Fatalf("unexpected Anthropic headers: key=%s version=%s", r.Header.Get("x-api-key"), r.Header.Get("anthropic-version"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"claude-b"},{"id":"claude-a"},{"id":"claude-a"}]}`))
+		case "/nkp/v1/kiro/models":
+			if r.Header.Get("Authorization") != "Bearer nkp-key" {
+				t.Fatalf("unexpected NKP auth header: %s", r.Header.Get("Authorization"))
+			}
+			_, _ = w.Write([]byte(`{"data":[{"id":"nkp-b","model_name":"Claude B"},{"model_id":"nkp-a","model_name":"Claude A"},{"id":"nkp-a","model_name":"Claude A"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"openaiProviders": []any{
+			map[string]any{"id": "openai-ok", "name": "OpenAI OK", "baseUrl": upstream.URL + "/openai/v1", "apiKey": "openai-key"},
+			map[string]any{"id": "openai-no-key", "name": "OpenAI No Key", "baseUrl": upstream.URL + "/openai/v1", "apiKey": ""},
+		},
+		"anthropicProviders": []any{
+			map[string]any{"id": "anthropic-ok", "name": "Anthropic OK", "baseUrl": upstream.URL + "/anthropic", "apiKey": "anthropic-key"},
+			map[string]any{"id": "anthropic-no-key", "name": "Anthropic No Key", "baseUrl": upstream.URL + "/anthropic", "apiKey": ""},
+		},
+		"nkpProviders": []any{
+			map[string]any{"id": "nkp-ok", "name": "NKP OK", "baseUrl": upstream.URL + "/nkp", "apiKey": "nkp-key"},
+			map[string]any{"id": "nkp-no-key", "name": "NKP No Key", "baseUrl": upstream.URL + "/nkp", "apiKey": ""},
+		},
+	}); err != nil {
+		t.Fatalf("seed provider settings: %v", err)
+	}
+	router, userToken := newProviderRoutesTestRouterWithStore(t, store, "user")
+
+	cases := []struct {
+		path          string
+		okProviderID  string
+		badProviderID string
+		expectedError string
+		modelKey      string
+		expectedIDs   string
+	}{
+		{path: "/openai/models/refresh", okProviderID: "openai-ok", badProviderID: "openai-no-key", expectedError: `OpenAI API key not configured for provider "OpenAI No Key"`, modelKey: "id", expectedIDs: "gpt-a,gpt-b"},
+		{path: "/anthropic/models/refresh", okProviderID: "anthropic-ok", badProviderID: "anthropic-no-key", expectedError: `Anthropic API key not configured for provider "Anthropic No Key"`, modelKey: "id", expectedIDs: "claude-a,claude-b"},
+		{path: "/nkp/models/refresh", okProviderID: "nkp-ok", badProviderID: "nkp-no-key", expectedError: `NKP API key not configured for provider "NKP No Key"`, modelKey: "model_id", expectedIDs: "nkp-a,nkp-b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+			}
+			var payload map[string]any
+			decodeJSONBody(t, w, &payload)
+			if payload["fromCache"] != false {
+				t.Fatalf("expected fromCache false: %#v", payload)
+			}
+			results, _ := payload["results"].([]any)
+			if len(results) != 2 {
+				t.Fatalf("expected two provider results: %#v", payload)
+			}
+			var okResult, badResult map[string]any
+			for _, item := range results {
+				result, _ := item.(map[string]any)
+				switch result["providerId"] {
+				case tc.okProviderID:
+					okResult = result
+				case tc.badProviderID:
+					badResult = result
+				}
+			}
+			if okResult == nil || okResult["count"] != float64(2) {
+				t.Fatalf("unexpected success provider result: %#v", results)
+			}
+			if badResult == nil || badResult["count"] != float64(0) || badResult["error"] != tc.expectedError {
+				t.Fatalf("unexpected no-key provider result: %#v", results)
+			}
+			models, _ := payload["models"].([]any)
+			ids := make([]string, 0, len(models))
+			for _, item := range models {
+				model, _ := item.(map[string]any)
+				ids = append(ids, stringMap(model, tc.modelKey, ""))
+			}
+			if strings.Join(ids, ",") != tc.expectedIDs {
+				t.Fatalf("unexpected aggregate models: %#v", models)
+			}
+		})
+	}
+
+	providerSpecificNoKey := []struct {
+		path          string
+		expectedError string
+	}{
+		{path: "/openai/providers/openai-no-key/models/refresh", expectedError: `OpenAI API key not configured for provider "OpenAI No Key"`},
+		{path: "/anthropic/providers/anthropic-no-key/models/refresh", expectedError: `Anthropic API key not configured for provider "Anthropic No Key"`},
+		{path: "/nkp/providers/nkp-no-key/models/refresh", expectedError: `NKP API key not configured for provider "NKP No Key"`},
+	}
+	for _, tc := range providerSpecificNoKey {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, nil)
+			req.Header.Set("Authorization", "Bearer "+userToken)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusInternalServerError {
+				t.Fatalf("expected 500, got %d body=%s", w.Code, w.Body.String())
+			}
+			var payload map[string]any
+			decodeJSONBody(t, w, &payload)
+			if payload["error"] != tc.expectedError {
+				t.Fatalf("unexpected provider-specific no-key error: %#v", payload)
+			}
+		})
+	}
+}
+
+func TestNugProviderEndpointsExposeFrontendContractShape(t *testing.T) {
+	upstreamHits := map[string]int{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer nug-key" {
+			t.Fatalf("unexpected NUG auth header for %s: %s", r.URL.Path, r.Header.Get("Authorization"))
+		}
+		upstreamHits[r.URL.Path]++
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/models":
+			_, _ = w.Write([]byte(`{"models":[{"id":"z-model","owned_by":"nug"},{"id":"a-model","owned_by":"nug"},{"id":"z-model","owned_by":"dupe"}]}`))
+		case "/v1/quota":
+			_, _ = w.Write([]byte(`{"quotaBalance":"12.5","quotaTotalGranted":"50","username":"nug-user","role":"admin"}`))
+		case "/v1/channels/health":
+			_, _ = w.Write([]byte(`{"channels":[{"channelType":"kiro","totalCredentials":2,"availableCredentials":1,"disabledCredentials":1,"availabilityRate":0.5,"currentConcurrency":1,"maxConcurrency":4,"queueDepth":0}]}`))
+		case "/v1/usage":
+			if r.URL.Query().Get("limit") != "50" || r.URL.Query().Get("offset") != "0" {
+				t.Fatalf("unexpected usage query: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"data":[{"channel":"kiro","model_id":"claude","tokensIn":"11","completionTokens":5,"cacheCreationTokens":"2","cachedInputTokens":"3","quota_cost":"0.4","meter_usage":"0.5","status":"ok","duration_ms":"99","timestamp":"2026-05-26T00:00:00Z"}],"count":"1"}`))
+		case "/v1/usage/summary":
+			if r.URL.Query().Get("period") != "month" {
+				t.Fatalf("unexpected summary period: %s", r.URL.RawQuery)
+			}
+			_, _ = w.Write([]byte(`{"request_count":"3","total_meter_usage":"4.5","total_quota_cost":"6.7","total_input_tokens":"8","total_output_tokens":"9","total_cache_write_tokens":"10","total_cache_read_tokens":"11"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	store := newSystemRoutesTestStore(t)
+	if _, err := store.Patch(map[string]any{
+		"nugProviders": []any{
+			map[string]any{"id": "nug-1", "name": "NUG One", "prefix": "nug", "baseUrl": upstream.URL, "apiKey": "nug-key"},
+			map[string]any{"id": "nug-no-key", "name": "NUG No Key", "prefix": "nugmissing", "baseUrl": upstream.URL, "apiKey": ""},
+		},
+	}); err != nil {
+		t.Fatalf("patch NUG settings: %v", err)
+	}
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.WriteFile(filepath.Join(dataDir, "nug-models-providers.json"), []byte(`{"nug-1":[{"id":"cached-model","owned_by":"cache"}]}`), 0o600); err != nil {
+		t.Fatalf("write nug model cache: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	doJSONWithStatus := func(method, path string, body io.Reader, expectedStatus int) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(method, path, body)
+		req.Header.Set("Authorization", "Bearer "+token)
+		if body != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		if w.Code != expectedStatus {
+			t.Fatalf("%s %s expected %d, got %d body=%s", method, path, expectedStatus, w.Code, w.Body.String())
+		}
+		var payload map[string]any
+		decodeJSONBody(t, w, &payload)
+		return payload
+	}
+	doJSON := func(method, path string, body io.Reader) map[string]any {
+		t.Helper()
+		return doJSONWithStatus(method, path, body, http.StatusOK)
+	}
+
+	cached := doJSON(http.MethodGet, "/nug/providers/nug-1/models", nil)
+	models, ok := cached["models"].([]any)
+	if !ok || len(models) != 1 || cached["fromCache"] != true || upstreamHits["/v1/models"] != 0 {
+		t.Fatalf("cached provider models should be array/fromCache without upstream hit: body=%#v hits=%#v", cached, upstreamHits)
+	}
+	noKeyRefresh := doJSONWithStatus(http.MethodPost, "/nug/providers/nug-no-key/models/refresh", nil, http.StatusInternalServerError)
+	if noKeyRefresh["error"] != `NUG API key not configured for provider "NUG No Key"` || upstreamHits["/v1/models"] != 0 {
+		t.Fatalf("provider no-key refresh should fail before upstream with TS-compatible error: body=%#v hits=%#v", noKeyRefresh, upstreamHits)
+	}
+
+	aggregate := doJSON(http.MethodPost, "/nug/models/refresh", nil)
+	results, ok := aggregate["results"].([]any)
+	if !ok || len(results) != 2 || aggregate["fromCache"] != false {
+		t.Fatalf("aggregate refresh should expose results/models/fromCache: %#v", aggregate)
+	}
+	var noKeyResult map[string]any
+	for _, item := range results {
+		result, _ := item.(map[string]any)
+		if result["providerId"] == "nug-no-key" {
+			noKeyResult = result
+		}
+	}
+	if noKeyResult == nil || noKeyResult["count"] != float64(0) || noKeyResult["error"] != `NUG API key not configured for provider "NUG No Key"` {
+		t.Fatalf("aggregate refresh should expose TS-compatible missing-key result: %#v", results)
+	}
+	models, ok = aggregate["models"].([]any)
+	if !ok || len(models) != 2 {
+		t.Fatalf("aggregate refresh should expose unique refreshed models: %#v", aggregate)
+	}
+	first, _ := models[0].(map[string]any)
+	if first["id"] != "a-model" {
+		t.Fatalf("NUG refreshed models should be sorted by id: %#v", models)
+	}
+
+	quota := doJSON(http.MethodGet, "/nug/providers/nug-1/quota", nil)
+	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) || quota["username"] != "nug-user" {
+		t.Fatalf("quota should normalize numeric aliases and preserve extra fields: %#v", quota)
+	}
+	channels := doJSON(http.MethodGet, "/nug/providers/nug-1/channels/health", nil)
+	if list, ok := channels["channels"].([]any); !ok || len(list) != 1 {
+		t.Fatalf("channels health should expose channels array: %#v", channels)
+	}
+
+	usage := doJSON(http.MethodGet, "/nug/providers/nug-1/usage?range=30days", nil)
+	events, ok := usage["events"].([]any)
+	if !ok || len(events) != 1 || usage["total"] != float64(1) {
+		t.Fatalf("usage should normalize data/count fallback into events/total: %#v", usage)
+	}
+	event, _ := events[0].(map[string]any)
+	if event["id"] != "usage-0" || event["channelType"] != "kiro" || event["model"] != "claude" || event["inputTokens"] != float64(11) || event["cacheReadInputTokens"] != float64(3) {
+		t.Fatalf("usage event should expose frontend camelCase fields: %#v", event)
+	}
+
+	summary := doJSON(http.MethodGet, "/nug/providers/nug-1/usage/summary?range=30days", nil)
+	if summary["requestCount"] != float64(3) || summary["totalQuotaCost"] != float64(6.7) || summary["totalCacheReadTokens"] != float64(11) {
+		t.Fatalf("summary should expose numeric camelCase totals: %#v", summary)
 	}
 }
 
@@ -910,22 +2046,142 @@ func TestScanRuntimeContainerFallbackExposesReason(t *testing.T) {
 	}
 }
 
-func TestUsageHistoryStatsReturnsSummaryQueryErrors(t *testing.T) {
+func TestUsageHistoryStatsFailOpenOnMissingUsageColumns(t *testing.T) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
 	defer sqlDB.Close()
-	if _, err := sqlDB.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, created_at TEXT)`); err != nil {
+	if _, err := sqlDB.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, provider TEXT, created_at TEXT)`); err != nil {
 		t.Fatalf("create api_requests: %v", err)
 	}
+	if _, err := sqlDB.Exec(`INSERT INTO api_requests (id, provider, created_at) VALUES ('req-min', 'openai', ?)`, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("insert minimal api request: %v", err)
+	}
 	h := &Handler{DB: sqlDB}
-	req := httptest.NewRequest(http.MethodGet, "/api/usage/history/stats", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/usage-history/stats", nil)
 	w := httptest.NewRecorder()
 
-	err = h.usageHistoryStats(w, req)
-	if err == nil || !strings.Contains(err.Error(), "input_tokens") {
-		t.Fatalf("expected usage summary query error, got %v", err)
+	if err := h.usageHistoryStats(w, req); err != nil {
+		t.Fatalf("usage stats should fail open on missing usage columns: %v", err)
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["totalRequests"] != float64(1) || body["totalInputTokens"] != float64(0) || body["totalTokens"] != float64(0) || body["totalCost"] != float64(0) {
+		t.Fatalf("unexpected minimal usage stats payload: %#v", body)
+	}
+
+	w = httptest.NewRecorder()
+	if err := h.usageHistoryTimeseries(w, req); err != nil {
+		t.Fatalf("usage timeseries should fail open on missing usage columns: %v", err)
+	}
+	body = map[string]any{}
+	decodeJSONBody(t, w, &body)
+	points, _ := body["points"].([]any)
+	if len(points) == 0 {
+		t.Fatalf("timeseries should return zero-filled points, got %#v", body)
+	}
+
+	w = httptest.NewRecorder()
+	if err := h.usageHistoryProviders(w, req); err != nil {
+		t.Fatalf("providers should use available provider column: %v", err)
+	}
+	body = map[string]any{}
+	decodeJSONBody(t, w, &body)
+	providers, _ := body["providers"].([]any)
+	if len(providers) != 1 || providers[0] != "openai" {
+		t.Fatalf("unexpected providers payload: %#v", body)
+	}
+}
+
+func TestUsageHistoryListAndDetailExposeFrontendFields(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+	stmts := []string{
+		`CREATE TABLE narrators (id TEXT PRIMARY KEY, title TEXT, chapter_id TEXT)`,
+		`CREATE TABLE chapters (id TEXT PRIMARY KEY, title TEXT, project_id TEXT)`,
+		`CREATE TABLE api_requests (
+			id TEXT PRIMARY KEY,
+			narrator_id TEXT,
+			message_id TEXT,
+			kind TEXT,
+			provider TEXT,
+			credential_id TEXT,
+			model TEXT,
+			input_tokens INTEGER,
+			output_tokens INTEGER,
+			cached_input_tokens INTEGER,
+			cache_creation_input_tokens INTEGER,
+			cache_creation_5m_tokens INTEGER,
+			cache_creation_1h_tokens INTEGER,
+			reasoning_tokens INTEGER,
+			ttft_ms INTEGER,
+			duration_ms INTEGER,
+			cost_usd REAL,
+			context_percent REAL,
+			meter_usage REAL,
+			meter_unit TEXT,
+			error_message TEXT,
+			raw_dump_json TEXT,
+			created_at TEXT
+		)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("create usage history schema: %v", err)
+		}
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, title, project_id) VALUES ('chap-1', 'Chapter One', 'proj-1')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (id, title, chapter_id) VALUES ('nar-1', 'Narrator One', 'chap-1')`); err != nil {
+		t.Fatalf("insert narrator: %v", err)
+	}
+	rawDump := `{"request":{"url":"https://example.test"},"response":{"status":500,"error":"boom"}}`
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	if _, err := sqlDB.Exec(`INSERT INTO api_requests (id, narrator_id, message_id, kind, provider, credential_id, model, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens, ttft_ms, duration_ms, cost_usd, context_percent, meter_usage, meter_unit, error_message, raw_dump_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "req-1", "nar-1", "msg-1", "narrator", "openai", "cred-1", "gpt-test", 11, 7, 3, 5, 50, 100, 2, 123, 456, 0.0123, 42.5, 9.5, "credits", "failed", rawDump, createdAt); err != nil {
+		t.Fatalf("insert api request: %v", err)
+	}
+	h := &Handler{DB: sqlDB}
+	listReq := httptest.NewRequest(http.MethodGet, "/api/usage-history?page=1&pageSize=10", nil)
+	listW := httptest.NewRecorder()
+	if err := h.usageHistoryList(listW, listReq); err != nil {
+		t.Fatalf("usage history list: %v", err)
+	}
+	var listBody map[string]any
+	decodeJSONBody(t, listW, &listBody)
+	records, _ := listBody["records"].([]any)
+	if len(records) != 1 {
+		t.Fatalf("expected one record, got %#v", listBody)
+	}
+	record, _ := records[0].(map[string]any)
+	if record["credentialId"] != "cred-1" || record["credentialName"] != "cred-1" || record["narratorTitle"] != "Narrator One" || record["chapterTitle"] != "Chapter One" || record["chapterId"] != "chap-1" || record["projectId"] != "proj-1" {
+		t.Fatalf("list record should expose frontend identity fields: %#v", record)
+	}
+	if record["cacheCreation5mTokens"] != float64(50) || record["cacheCreation1hTokens"] != float64(100) || record["hasRawDump"] != true {
+		t.Fatalf("list record should expose cache/raw fields: %#v", record)
+	}
+	if _, ok := record["rawDump"].(map[string]any); ok {
+		t.Fatalf("list record should not include full raw dump payload: %#v", record)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/usage-history/req-1", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "req-1")
+	detailReq = detailReq.WithContext(context.WithValue(detailReq.Context(), chi.RouteCtxKey, rctx))
+	detailW := httptest.NewRecorder()
+	if err := h.usageHistoryGet(detailW, detailReq); err != nil {
+		t.Fatalf("usage history detail: %v", err)
+	}
+	var detail map[string]any
+	decodeJSONBody(t, detailW, &detail)
+	raw, _ := detail["rawDump"].(map[string]any)
+	request, _ := raw["request"].(map[string]any)
+	if request["url"] != "https://example.test" || detail["cacheCreation5mTokens"] != float64(50) || detail["cacheCreation1hTokens"] != float64(100) {
+		t.Fatalf("detail should parse raw dump and expose cache tiers: %#v", detail)
 	}
 }
 
@@ -1098,6 +2354,99 @@ func TestProviderRoutesReturnCachedLongTailShapesWithoutRefresh(t *testing.T) {
 	}
 }
 
+func TestKiroProviderEndpointsExposeFrontendContractShape(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	writeKiroTestCredentials(t, []map[string]any{
+		{
+			"id":                "cred-a",
+			"priority":          2,
+			"accessToken":       "access-a",
+			"email":             "a@example.com",
+			"displayName":       "Account A",
+			"subscriptionTitle": "Pro",
+			"region":            "us-west-2",
+			"profileArn":        "arn:test",
+			"meterUsage":        42,
+			"availableModels":   []any{"claude-z", "claude-a"},
+		},
+		{"id": "cred-b", "disabled": true, "availableModels": []any{"claude-a", "claude-b"}},
+	})
+	usagePath := filepath.Join(os.Getenv("HOME"), ".narrafork", "kiro", "kiro_usage.json")
+	if err := os.WriteFile(usagePath, []byte(`{"cred-a":{"id":"cred-a","currentUsage":7,"usageLimit":100,"remaining":93,"usagePercentage":7,"queriedAt":"2026-05-26T00:00:00Z"}}`), 0o600); err != nil {
+		t.Fatalf("write Kiro usage cache: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	req := httptest.NewRequest(http.MethodGet, "/kiro/status", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var status map[string]any
+	decodeJSONBody(t, w, &status)
+	if status["available"] != true || status["globalProxy"] == nil {
+		t.Fatalf("status should expose available and globalProxy fields: %#v", status)
+	}
+	snapshot, _ := status["snapshot"].(map[string]any)
+	if snapshot["currentId"] != "cred-a" || snapshot["total"] != float64(2) || snapshot["available"] != float64(1) || snapshot["loadBalancingMode"] != "priority" {
+		t.Fatalf("unexpected snapshot summary: %#v", snapshot)
+	}
+	entries, ok := snapshot["entries"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("snapshot should expose entries array: %#v", snapshot)
+	}
+	entry, _ := entries[0].(map[string]any)
+	if entry["id"] != "cred-a" || entry["hasProfileArn"] != true || entry["meterUsage"] != float64(42) {
+		t.Fatalf("credential snapshot should expose frontend fields: %#v", entry)
+	}
+	usageCache, _ := status["usageCache"].(map[string]any)
+	if cached, _ := usageCache["cred-a"].(map[string]any); cached["currentUsage"] != float64(7) {
+		t.Fatalf("status should expose usage cache: %#v", usageCache)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/kiro/models?credentialId=cred-a", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected models 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var modelsBody map[string]any
+	decodeJSONBody(t, w, &modelsBody)
+	models, ok := modelsBody["models"].([]any)
+	if !ok || len(models) != 2 || modelsBody["fromCache"] != true || modelsBody["credentialId"] != "cred-a" {
+		t.Fatalf("models should expose cached credential model array: %#v", modelsBody)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/kiro/credentials/cred-a/usage", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected usage 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var usage map[string]any
+	decodeJSONBody(t, w, &usage)
+	if usage["id"] != "cred-a" || usage["currentUsage"] != float64(7) || usage["remaining"] != float64(93) {
+		t.Fatalf("usage should return cached usage entry: %#v", usage)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/kiro/models/refresh", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected Kiro model refresh disabled 501, got %d body=%s", w.Code, w.Body.String())
+	}
+	var disabled map[string]any
+	decodeJSONBody(t, w, &disabled)
+	if disabled["feature"] != "providers.kiro.modelsRefresh" || disabled["supported"] != false || disabled["fallback"] != true {
+		t.Fatalf("refresh should expose explicit feature-disabled payload: %#v", disabled)
+	}
+}
+
 func TestKiroMCPRetriesSuspiciousThrottleOnLastCredential(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	writeKiroTestCredentials(t, []map[string]any{{"id": "only", "accessToken": "access-only"}})
@@ -1216,6 +2565,21 @@ func writeKiroTestCredentials(t *testing.T, entries []map[string]any) {
 	}
 }
 
+func writeKiroTestConfig(t *testing.T, config map[string]any) {
+	t.Helper()
+	path := filepath.Join(os.Getenv("HOME"), ".narrafork", "kiro", "config.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir kiro config dir: %v", err)
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatalf("marshal kiro config: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write kiro config: %v", err)
+	}
+}
+
 func readKiroTestCredentials(t *testing.T) []map[string]any {
 	t.Helper()
 	path := filepath.Join(os.Getenv("HOME"), ".narrafork", "kiro", "credentials.json")
@@ -1228,6 +2592,173 @@ func readKiroTestCredentials(t *testing.T) []map[string]any {
 		t.Fatalf("decode kiro credentials: %v", err)
 	}
 	return entries
+}
+
+func TestCodexCredentialMissingResponsesMatchTS(t *testing.T) {
+	r, token := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	cases := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		statusCode int
+	}{
+		{name: "disable", method: http.MethodPost, path: "/codex/credentials/missing/disable", statusCode: http.StatusNotFound},
+		{name: "enable", method: http.MethodPost, path: "/codex/credentials/missing/enable", statusCode: http.StatusNotFound},
+		{name: "reset", method: http.MethodPost, path: "/codex/credentials/missing/reset", statusCode: http.StatusNotFound},
+		{name: "update", method: http.MethodPatch, path: "/codex/credentials/missing", body: `{"displayName":"Missing"}`, statusCode: http.StatusNotFound},
+		{name: "delete", method: http.MethodDelete, path: "/codex/credentials/missing", statusCode: http.StatusNotFound},
+		{name: "refresh", method: http.MethodPost, path: "/codex/credentials/missing/refresh", statusCode: http.StatusBadRequest},
+		{name: "usage", method: http.MethodPost, path: "/codex/credentials/missing/usage", statusCode: http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req := httptest.NewRequest(tc.method, tc.path, body)
+			req.Header.Set("Authorization", "Bearer "+token)
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.statusCode {
+				t.Fatalf("expected %d, got %d body=%s", tc.statusCode, w.Code, w.Body.String())
+			}
+			var response map[string]any
+			decodeJSONBody(t, w, &response)
+			if response["error"] != "Credential not found: missing" {
+				t.Fatalf("unexpected missing credential body: %#v", response)
+			}
+		})
+	}
+
+	batchReq := httptest.NewRequest(http.MethodDelete, "/codex/credentials/batch", strings.NewReader(`{"ids":["missing"]}`))
+	batchReq.Header.Set("Authorization", "Bearer "+token)
+	batchReq.Header.Set("Content-Type", "application/json")
+	batchW := httptest.NewRecorder()
+	r.ServeHTTP(batchW, batchReq)
+	if batchW.Code != http.StatusOK {
+		t.Fatalf("expected batch delete 200, got %d body=%s", batchW.Code, batchW.Body.String())
+	}
+	var batchBody map[string]any
+	decodeJSONBody(t, batchW, &batchBody)
+	removed, _ := batchBody["removed"].([]any)
+	notFound, _ := batchBody["notFound"].([]any)
+	if len(removed) != 0 || len(notFound) != 1 || notFound[0] != "missing" {
+		t.Fatalf("unexpected batch delete body: %#v", batchBody)
+	}
+}
+
+func TestCodexCredentialUpdateEmptyAndInvalidBodyMatchesTS(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir, err := narraforkDataDir()
+	if err != nil {
+		t.Fatalf("data dir: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	seed := []map[string]any{{
+		"id":           "codex-contract",
+		"displayName":  "Codex Contract Fixture",
+		"accessToken":  "codex-access-fixture",
+		"refreshToken": "codex-refresh-fixture",
+		"accountId":    "codex-account-fixture",
+		"email":        "codex-contract@example.com",
+		"sub":          "codex-sub-fixture",
+		"priority":     float64(0),
+	}}
+	data, _ := json.Marshal(seed)
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), data, 0o600); err != nil {
+		t.Fatalf("write codex credentials: %v", err)
+	}
+
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	cases := []struct {
+		name       string
+		path       string
+		body       string
+		statusCode int
+		error      string
+	}{
+		{name: "empty existing", path: "/codex/credentials/codex-contract", statusCode: http.StatusOK},
+		{name: "invalid existing", path: "/codex/credentials/codex-contract", body: `{`, statusCode: http.StatusOK},
+		{name: "invalid missing", path: "/codex/credentials/missing", body: `{`, statusCode: http.StatusNotFound, error: "Credential not found: missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req := httptest.NewRequest(http.MethodPatch, tc.path, body)
+			req.Header.Set("Authorization", "Bearer "+token)
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.statusCode {
+				t.Fatalf("expected %d, got %d body=%s", tc.statusCode, w.Code, w.Body.String())
+			}
+			var response map[string]any
+			decodeJSONBody(t, w, &response)
+			if tc.error != "" {
+				if response["error"] != tc.error {
+					t.Fatalf("unexpected error body: %#v", response)
+				}
+			} else if response["ok"] != true {
+				t.Fatalf("expected ok response, got %#v", response)
+			}
+		})
+	}
+}
+
+func TestCodexImportValidationMatchesTS(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	cases := []struct {
+		name          string
+		body          map[string]any
+		expectedError string
+	}{
+		{
+			name:          "missing credentials",
+			body:          map[string]any{},
+			expectedError: "No credentials provided",
+		},
+		{
+			name: "credentials without token",
+			body: map[string]any{"credentials": []any{map[string]any{
+				"email": "codex-no-token@example.com",
+			}}},
+			expectedError: "No valid credentials: each credential must have a non-empty refreshToken or accessToken",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload, err := json.Marshal(tc.body)
+			if err != nil {
+				t.Fatalf("marshal payload: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/codex/import", bytes.NewReader(payload))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", w.Code, w.Body.String())
+			}
+			var body map[string]any
+			decodeJSONBody(t, w, &body)
+			if body["error"] != tc.expectedError {
+				t.Fatalf("unexpected import error: %#v", body)
+			}
+		})
+	}
 }
 
 func TestCodexImportAcceptsAccessTokenOnlyCredential(t *testing.T) {
@@ -1391,6 +2922,388 @@ func TestClineEnabledModelsStoresContextWindowsFromCache(t *testing.T) {
 	}
 }
 
+func TestClineBrowserAuthFlowPersistsCredentialsAndAutoAddsFreeModels(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	provider := map[string]any{
+		"id":            "cline1",
+		"name":          "Cline",
+		"prefix":        "clinecache",
+		"enabledModels": []any{},
+	}
+	if _, err := store.Patch(map[string]any{"clineProviders": []any{provider}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-models.json"), []byte(`{"cline1":[{"id":"cline/free-fixture","contextLength":123456}]}`), 0o600); err != nil {
+		t.Fatalf("write cline cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-recommended-models.json"), []byte(`{"recommended":[],"free":[{"id":"cline/free-fixture","name":"Cline Free Fixture","tags":["FREE"]}]}`), 0o600); err != nil {
+		t.Fatalf("write cline recommended cache: %v", err)
+	}
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/auth/authorize" {
+			http.NotFound(w, r)
+			return
+		}
+		callbackURL := r.URL.Query().Get("callback_url")
+		if r.URL.Query().Get("client_type") != "extension" || callbackURL != "http://localhost:19876/auth/callback" || r.URL.Query().Get("redirect_uri") != callbackURL {
+			http.Error(w, "unexpected authorize query: "+r.URL.RawQuery, http.StatusBadRequest)
+			return
+		}
+		redirectURL := "http://" + r.Host + "/oauth/authorize?callback_url=" + url.QueryEscape(callbackURL) + "&state=browser-fixture"
+		_ = json.NewEncoder(w).Encode(map[string]any{"redirect_url": redirectURL})
+	}))
+	defer fixture.Close()
+	defer (&Handler{Settings: store}).stopClineBrowserAuth()
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	payload, err := json.Marshal(map[string]any{"apiBaseUrl": fixture.URL})
+	if err != nil {
+		t.Fatalf("marshal auth browser payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cline/auth/browser", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected browser auth 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var startBody map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &startBody); err != nil {
+		t.Fatalf("decode start body: %v", err)
+	}
+	authorizeURL, ok := startBody["authorizeUrl"].(string)
+	if !ok || authorizeURL == "" {
+		t.Fatalf("missing authorizeUrl: %#v", startBody)
+	}
+	parsedAuthorizeURL, err := url.Parse(authorizeURL)
+	if err != nil {
+		t.Fatalf("parse authorizeUrl: %v", err)
+	}
+	callbackBase := parsedAuthorizeURL.Query().Get("callback_url")
+	if callbackBase != "http://localhost:19876/auth/callback" {
+		t.Fatalf("authorize URL should preserve callback_url, got %s", authorizeURL)
+	}
+	callbackData, err := json.Marshal(map[string]any{
+		"accessToken":  "cline-browser-access-token",
+		"refreshToken": "cline-browser-refresh-token",
+		"email":        "browser@example.com",
+		"name":         "Browser User",
+		"expiresAt":    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("marshal callback data: %v", err)
+	}
+	callbackResp, err := http.Get(callbackBase + "?code=" + url.QueryEscape(base64.StdEncoding.EncodeToString(callbackData)))
+	if err != nil {
+		t.Fatalf("call local callback server: %v", err)
+	}
+	defer callbackResp.Body.Close()
+	callbackBody, _ := io.ReadAll(callbackResp.Body)
+	if callbackResp.StatusCode != http.StatusOK || !strings.Contains(string(callbackBody), "Authorization successful") {
+		t.Fatalf("unexpected callback response: status=%d body=%s", callbackResp.StatusCode, string(callbackBody))
+	}
+
+	providers, _ := store.Raw()["clineProviders"].([]any)
+	storedProvider, _ := providers[0].(map[string]any)
+	if storedProvider["accessToken"] != "cline-browser-access-token" {
+		t.Fatalf("provider access token not stored: %#v", storedProvider)
+	}
+	enabled := stringList(storedProvider["enabledModels"])
+	if len(enabled) != 1 || enabled[0] != "cline/free-fixture" {
+		t.Fatalf("free model should be auto-enabled after browser callback: %#v", storedProvider)
+	}
+	agent, _ := store.Raw()["agent"].(map[string]any)
+	windows, _ := agent["modelContextWindows"].(map[string]any)
+	if windows["clinecache:cline/free-fixture"] != float64(123456) {
+		t.Fatalf("browser callback should populate context window from Cline cache: %#v", windows)
+	}
+}
+
+func TestClineAuthCallbackPersistsCredentialsAndAutoAddsFreeModels(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	provider := map[string]any{
+		"id":            "cline1",
+		"name":          "Cline",
+		"prefix":        "clinecache",
+		"enabledModels": []any{},
+	}
+	if _, err := store.Patch(map[string]any{"clineProviders": []any{provider}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-models.json"), []byte(`{"cline1":[{"id":"cline/free-fixture","contextLength":123456}]}`), 0o600); err != nil {
+		t.Fatalf("write cline cache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-recommended-models.json"), []byte(`{"recommended":[],"free":[{"id":"cline/free-fixture","name":"Cline Free Fixture","tags":["FREE"]}]}`), 0o600); err != nil {
+		t.Fatalf("write cline recommended cache: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	callbackData, err := json.Marshal(map[string]any{
+		"accessToken":  "cline-access-token",
+		"refreshToken": "cline-refresh-token",
+		"email":        "alice@example.com",
+		"name":         "Alice Cline",
+		"expiresAt":    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("marshal callback data: %v", err)
+	}
+	callbackURL := "http://localhost:19876/auth/callback?code=" + url.QueryEscape(base64.StdEncoding.EncodeToString(callbackData))
+	payload, err := json.Marshal(map[string]any{"callbackUrl": callbackURL})
+	if err != nil {
+		t.Fatalf("marshal callback payload: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/cline/auth/callback", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["ok"] != true || body["email"] != "alice@example.com" || body["displayName"] != "Alice Cline" {
+		t.Fatalf("unexpected callback response: %#v", body)
+	}
+
+	providers, _ := store.Raw()["clineProviders"].([]any)
+	storedProvider, _ := providers[0].(map[string]any)
+	if storedProvider["accessToken"] != "cline-access-token" {
+		t.Fatalf("provider access token not stored: %#v", storedProvider)
+	}
+	enabled := stringList(storedProvider["enabledModels"])
+	if len(enabled) != 1 || enabled[0] != "cline/free-fixture" {
+		t.Fatalf("free model should be auto-enabled after callback: %#v", storedProvider)
+	}
+	agent, _ := store.Raw()["agent"].(map[string]any)
+	windows, _ := agent["modelContextWindows"].(map[string]any)
+	if windows["clinecache:cline/free-fixture"] != float64(123456) {
+		t.Fatalf("callback should populate context window from Cline cache: %#v", windows)
+	}
+	credsRaw, err := os.ReadFile(filepath.Join(dataDir, "cline-credentials.json"))
+	if err != nil {
+		t.Fatalf("read credentials: %v", err)
+	}
+	var creds map[string]any
+	if err := json.Unmarshal(credsRaw, &creds); err != nil {
+		t.Fatalf("decode credentials: %v", err)
+	}
+	if creds["accessToken"] != "cline-access-token" || creds["refreshToken"] != "cline-refresh-token" {
+		t.Fatalf("callback credentials not persisted: %#v", creds)
+	}
+}
+
+func TestClineInvalidRefreshClearsCredentialsAndKeepsBalance422(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cline/api/v1/auth/refresh" {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad refresh body", http.StatusBadRequest)
+			return
+		}
+		if body["refreshToken"] != "cline-invalid-refresh-token" || body["grantType"] != "refresh_token" {
+			http.Error(w, "bad refresh payload", http.StatusBadRequest)
+			return
+		}
+		http.Error(w, "invalid refresh token", http.StatusUnauthorized)
+	}))
+	defer upstream.Close()
+	t.Setenv("NARRAFORK_CLINE_API_BASE_URL", upstream.URL+"/cline")
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	credentialsPath := filepath.Join(dataDir, "cline-credentials.json")
+	creds := map[string]any{
+		"accessToken":  "cline-expired-access-token",
+		"refreshToken": "cline-invalid-refresh-token",
+		"expiresAt":    float64(time.Now().Add(-time.Hour).Unix()),
+		"email":        "cline-expired@example.com",
+		"displayName":  "Cline Expired User",
+		"userId":       "cline-refresh-user-fixture",
+		"startedAt":    float64(time.Now().UnixMilli()),
+	}
+	credsRaw, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("marshal expired credentials: %v", err)
+	}
+	if err := os.WriteFile(credentialsPath, credsRaw, 0o600); err != nil {
+		t.Fatalf("write expired credentials: %v", err)
+	}
+
+	balanceReq := httptest.NewRequest(http.MethodGet, "/cline/balance", nil)
+	balanceReq.Header.Set("Authorization", "Bearer "+token)
+	balanceW := httptest.NewRecorder()
+	r.ServeHTTP(balanceW, balanceReq)
+	if balanceW.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected balance 422, got %d body=%s", balanceW.Code, balanceW.Body.String())
+	}
+	var balanceBody map[string]any
+	decodeJSONBody(t, balanceW, &balanceBody)
+	if balanceBody["error"] != "Not authenticated or balance unavailable" {
+		t.Fatalf("unexpected balance body after invalid refresh: %#v", balanceBody)
+	}
+	if _, err := os.Stat(credentialsPath); !os.IsNotExist(err) {
+		t.Fatalf("invalid refresh should remove credentials, stat err=%v", err)
+	}
+}
+
+func TestClineExpiredCredentialsRefreshBeforeBalance(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cline/api/v1/auth/refresh":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "bad refresh body", http.StatusBadRequest)
+				return
+			}
+			if body["refreshToken"] != "cline-expired-refresh-token" || body["grantType"] != "refresh_token" {
+				http.Error(w, "bad refresh token", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"accessToken":"cline-refreshed-access-token","refreshToken":"cline-refreshed-refresh-token","expiresAt":"2099-01-01T00:00:00Z","userInfo":{"email":"cline-refreshed@example.com","name":"Cline Refreshed User"}}}`))
+		case "/cline/api/v1/users/cline-refresh-user-fixture/balance":
+			if r.Header.Get("Authorization") != "Bearer workos:cline-refreshed-access-token" {
+				http.Error(w, "bad refreshed auth", http.StatusUnauthorized)
+				return
+			}
+			_, _ = w.Write([]byte(`{"success":true,"data":{"balance":654321,"userId":"cline-refresh-user-fixture"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	t.Setenv("NARRAFORK_CLINE_API_BASE_URL", upstream.URL+"/cline")
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	creds := map[string]any{
+		"accessToken":  "cline-expired-access-token",
+		"refreshToken": "cline-expired-refresh-token",
+		"expiresAt":    float64(time.Now().Add(-time.Hour).Unix()),
+		"email":        "cline-expired@example.com",
+		"displayName":  "Cline Expired User",
+		"userId":       "cline-refresh-user-fixture",
+		"startedAt":    float64(time.Now().UnixMilli()),
+	}
+	credsRaw, err := json.Marshal(creds)
+	if err != nil {
+		t.Fatalf("marshal expired credentials: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-credentials.json"), credsRaw, 0o600); err != nil {
+		t.Fatalf("write expired credentials: %v", err)
+	}
+
+	balanceReq := httptest.NewRequest(http.MethodGet, "/cline/balance", nil)
+	balanceReq.Header.Set("Authorization", "Bearer "+token)
+	balanceW := httptest.NewRecorder()
+	r.ServeHTTP(balanceW, balanceReq)
+	if balanceW.Code != http.StatusOK {
+		t.Fatalf("expected balance 200, got %d body=%s", balanceW.Code, balanceW.Body.String())
+	}
+	var balanceBody map[string]any
+	decodeJSONBody(t, balanceW, &balanceBody)
+	if balanceBody["balance"] != float64(654321) || balanceBody["userId"] != "cline-refresh-user-fixture" {
+		t.Fatalf("unexpected balance body after refresh: %#v", balanceBody)
+	}
+	storedRaw, err := os.ReadFile(filepath.Join(dataDir, "cline-credentials.json"))
+	if err != nil {
+		t.Fatalf("read refreshed credentials: %v", err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(storedRaw, &stored); err != nil {
+		t.Fatalf("decode refreshed credentials: %v", err)
+	}
+	if stored["accessToken"] != "cline-refreshed-access-token" || stored["refreshToken"] != "cline-refreshed-refresh-token" {
+		t.Fatalf("refresh did not persist new tokens: %#v", stored)
+	}
+	if stored["email"] != "cline-refreshed@example.com" || stored["displayName"] != "Cline Refreshed User" || stored["userId"] != "cline-refresh-user-fixture" {
+		t.Fatalf("refresh did not preserve account metadata: %#v", stored)
+	}
+}
+
+func TestClineUserInfoRefreshAndBalanceUseAccountFixture(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer workos:cline-access-token") {
+			http.Error(w, "bad cline auth", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/cline/api/v1/users/me":
+			_, _ = w.Write([]byte(`{"data":{"id":"cline-user-fixture","email":"cline-updated@example.com","displayName":"Cline Updated User","name":"Cline Updated Fallback"}}`))
+		case "/cline/api/v1/users/cline-user-fixture/balance":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"balance":123456,"userId":"cline-user-fixture"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	t.Setenv("NARRAFORK_CLINE_API_BASE_URL", upstream.URL+"/cline")
+	store := newSystemRoutesTestStore(t)
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.WriteFile(filepath.Join(dataDir, "cline-recommended-models.json"), []byte(`{"recommended":[],"free":[]}`), 0o600); err != nil {
+		t.Fatalf("write cline recommended cache: %v", err)
+	}
+	callbackData, err := json.Marshal(map[string]any{
+		"accessToken":  "cline-access-token",
+		"refreshToken": "cline-refresh-token",
+		"email":        "alice@example.com",
+		"name":         "Alice Cline",
+		"expiresAt":    time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("marshal callback data: %v", err)
+	}
+	callbackURL := "http://localhost:19876/auth/callback?code=" + url.QueryEscape(base64.StdEncoding.EncodeToString(callbackData))
+	payload, err := json.Marshal(map[string]any{"callbackUrl": callbackURL})
+	if err != nil {
+		t.Fatalf("marshal callback payload: %v", err)
+	}
+	callbackReq := httptest.NewRequest(http.MethodPost, "/cline/auth/callback", bytes.NewReader(payload))
+	callbackReq.Header.Set("Content-Type", "application/json")
+	callbackReq.Header.Set("Authorization", "Bearer "+token)
+	callbackW := httptest.NewRecorder()
+	r.ServeHTTP(callbackW, callbackReq)
+	if callbackW.Code != http.StatusOK {
+		t.Fatalf("expected callback 200, got %d body=%s", callbackW.Code, callbackW.Body.String())
+	}
+
+	refreshReq := httptest.NewRequest(http.MethodPost, "/cline/user-info/refresh", nil)
+	refreshReq.Header.Set("Authorization", "Bearer "+token)
+	refreshW := httptest.NewRecorder()
+	r.ServeHTTP(refreshW, refreshReq)
+	if refreshW.Code != http.StatusOK {
+		t.Fatalf("expected user-info refresh 200, got %d body=%s", refreshW.Code, refreshW.Body.String())
+	}
+	var refreshBody map[string]any
+	decodeJSONBody(t, refreshW, &refreshBody)
+	if refreshBody["authenticated"] != true || refreshBody["email"] != "cline-updated@example.com" || refreshBody["displayName"] != "Cline Updated User" || refreshBody["userId"] != "cline-user-fixture" {
+		t.Fatalf("unexpected user-info refresh body: %#v", refreshBody)
+	}
+
+	balanceReq := httptest.NewRequest(http.MethodGet, "/cline/balance", nil)
+	balanceReq.Header.Set("Authorization", "Bearer "+token)
+	balanceW := httptest.NewRecorder()
+	r.ServeHTTP(balanceW, balanceReq)
+	if balanceW.Code != http.StatusOK {
+		t.Fatalf("expected balance 200, got %d body=%s", balanceW.Code, balanceW.Body.String())
+	}
+	var balanceBody map[string]any
+	decodeJSONBody(t, balanceW, &balanceBody)
+	if balanceBody["balance"] != float64(123456) || balanceBody["userId"] != "cline-user-fixture" {
+		t.Fatalf("unexpected balance body: %#v", balanceBody)
+	}
+}
+
 func openGatewayTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")
@@ -1440,6 +3353,16 @@ func testJWT(payload map[string]any) string {
 	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
 	body, _ := json.Marshal(payload)
 	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body) + ".signature"
+}
+
+func anyStrings(values []any) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if s, ok := value.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func decodeJSONBody(t *testing.T, w *httptest.ResponseRecorder, dst any) {

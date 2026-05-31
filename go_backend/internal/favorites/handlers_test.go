@@ -15,6 +15,54 @@ import (
 	"narrafork-go/internal/config"
 )
 
+func TestFavoriteValidationAndMissingStatesMatchTS(t *testing.T) {
+	sqlDB := openFavoritesParityTestDB(t)
+	settings := loadFavoritesTestSettings(t)
+	authService := auth.NewService(sqlDB, settings)
+	result, err := authService.Register(context.Background(), "member", "password123", "en")
+	if err != nil {
+		t.Fatalf("register user: %v", err)
+	}
+
+	router := chi.NewRouter()
+	router.Group(func(r chi.Router) {
+		r.Use(authService.Middleware)
+		NewHandler(sqlDB).RegisterRoutes(r)
+	})
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{"list empty", http.MethodGet, "/", "", http.StatusOK},
+		{"create valid", http.MethodPost, "/", `{"path":"/contract/favorite-one","label":"Favorite One"}`, http.StatusCreated},
+		{"create duplicate", http.MethodPost, "/", `{"path":"/contract/favorite-one","label":"Duplicate"}`, http.StatusBadRequest},
+		{"create missing path", http.MethodPost, "/", `{}`, http.StatusBadRequest},
+		{"create null label", http.MethodPost, "/", `{"path":"/contract/null-label","label":null}`, http.StatusBadRequest},
+		{"update missing", http.MethodPatch, "/missing", `{"path":"/contract/missing"}`, http.StatusNotFound},
+		{"delete missing", http.MethodDelete, "/missing", `{}`, http.StatusNotFound},
+		{"reorder missing ids", http.MethodPut, "/reorder", `{}`, http.StatusBadRequest},
+		{"reorder empty ids", http.MethodPut, "/reorder", `{"ids":[]}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+			req.Header.Set("Authorization", "Bearer "+result.Token)
+			if tc.body != "" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("expected %d, got %d body=%s", tc.status, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestCreateFavoriteDoesNotInsertWhenLookupFails(t *testing.T) {
 	sqlDB := openFavoritesTestDB(t)
 	settings := loadFavoritesTestSettings(t)
@@ -46,6 +94,26 @@ func TestCreateFavoriteDoesNotInsertWhenLookupFails(t *testing.T) {
 	if count != 0 {
 		t.Fatalf("favorite should not be inserted when lookup fails, count=%d", count)
 	}
+}
+
+func openFavoritesParityTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	stmts := []string{
+		`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, password_hash TEXT, role TEXT, avatar_color TEXT, avatar_image_id TEXT, git_username TEXT, git_email TEXT, created_at TEXT)`,
+		`CREATE TABLE user_preferences (id TEXT PRIMARY KEY, user_id TEXT, language TEXT, created_at TEXT, updated_at TEXT)`,
+		`CREATE TABLE user_favorite_directories (id TEXT PRIMARY KEY, user_id TEXT, path TEXT, label TEXT, sort_order INTEGER, created_at TEXT)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("exec schema: %v\n%s", err, stmt)
+		}
+	}
+	return sqlDB
 }
 
 func openFavoritesTestDB(t *testing.T) *sql.DB {

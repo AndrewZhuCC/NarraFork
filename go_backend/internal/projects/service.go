@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"narrafork-go/internal/chapters"
 	"narrafork-go/internal/config"
@@ -175,17 +177,23 @@ func (s *Service) Get(ctx context.Context, projectID string) (Project, error) {
 }
 
 func (s *Service) Update(ctx context.Context, projectID string, fields map[string]any) (Project, error) {
+	if err := validateProjectUpdateFields(fields); err != nil {
+		return Project{}, err
+	}
 	allowed := map[string]string{
 		"name": "name", "description": "description", "status": "status", "defaultBranch": "default_branch",
 		"startupScript": "startup_script", "copyFiles": "copy_files", "proxyDomain": "proxy_domain",
-		"flowMode": "flow_mode",
 	}
 	sets := []string{}
 	args := []any{}
 	for key, val := range fields {
 		if key == "chapterSettings" {
+			merged, err := s.mergedChapterSettings(ctx, projectID, val)
+			if err != nil {
+				return Project{}, err
+			}
 			sets = append(sets, "chapter_settings = ?")
-			args = append(args, mustJSON(val))
+			args = append(args, mustJSON(merged))
 			continue
 		}
 		col, ok := allowed[key]
@@ -205,6 +213,100 @@ func (s *Service) Update(ctx context.Context, projectID string, fields map[strin
 		return Project{}, err
 	}
 	return s.Get(ctx, projectID)
+}
+
+func (s *Service) mergedChapterSettings(ctx context.Context, projectID string, incoming any) (map[string]any, error) {
+	var raw sql.NullString
+	err := s.DB.QueryRowContext(ctx, `SELECT chapter_settings FROM projects WHERE id = ?`, projectID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, httpx.NotFound("Project")
+	}
+	if err != nil {
+		return nil, err
+	}
+	merged := map[string]any{}
+	if current, ok := jsondb.DecodeNull(raw).(map[string]any); ok {
+		for key, value := range current {
+			merged[key] = value
+		}
+	}
+	next, err := validateProjectChapterSettings(incoming)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range next {
+		merged[key] = value
+	}
+	return merged, nil
+}
+
+var gitBranchNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._\-/]+$`)
+
+func validateProjectUpdateFields(fields map[string]any) error {
+	if value, ok := fields["name"]; ok {
+		name, valid := value.(string)
+		if !valid || strings.TrimSpace(name) == "" || utf8.RuneCountInString(name) > 200 {
+			return httpx.ValidationError("name must be a non-empty string up to 200 characters")
+		}
+	}
+	if value, ok := fields["description"]; ok && value != nil {
+		description, valid := value.(string)
+		if !valid || utf8.RuneCountInString(description) > 2000 {
+			return httpx.ValidationError("description must be a string up to 2000 characters")
+		}
+	}
+	if value, ok := fields["status"]; ok {
+		status, valid := value.(string)
+		if !valid || (status != "active" && status != "archived") {
+			return httpx.ValidationError("status must be active or archived")
+		}
+	}
+	if value, ok := fields["defaultBranch"]; ok && value != nil {
+		branch, valid := value.(string)
+		if !valid || !gitBranchNamePattern.MatchString(branch) {
+			return httpx.ValidationError("Invalid branch name")
+		}
+	}
+	for _, key := range []string{"startupScript", "copyFiles"} {
+		if value, ok := fields[key]; ok && value != nil {
+			text, valid := value.(string)
+			if !valid || utf8.RuneCountInString(text) > 5000 {
+				return httpx.ValidationError(key + " must be a string up to 5000 characters")
+			}
+		}
+	}
+	if value, ok := fields["proxyDomain"]; ok && value != nil {
+		domain, valid := value.(string)
+		if !valid || utf8.RuneCountInString(domain) > 200 {
+			return httpx.ValidationError("proxyDomain must be a string up to 200 characters")
+		}
+	}
+	return nil
+}
+
+func validateProjectChapterSettings(value any) (map[string]any, error) {
+	settings, ok := jsondb.DecodeValue(value).(map[string]any)
+	if !ok {
+		return nil, httpx.ValidationError("chapterSettings must be an object")
+	}
+	allowed := map[string]bool{
+		"autoCreateNarrator":        true,
+		"commands":                  true,
+		"routines":                  true,
+		"whitelistDirs":             true,
+		"blacklistDirs":             true,
+		"commandWhitelist":          true,
+		"commandBlacklist":          true,
+		"requireReviewBeforeMerge": true,
+	}
+	filtered := map[string]any{}
+	for key, item := range settings {
+		if !allowed[key] {
+			continue
+		}
+		filtered[key] = item
+	}
+	return filtered, nil
 }
 
 func (s *Service) Delete(ctx context.Context, projectID string) (DeleteResult, error) {

@@ -13,11 +13,12 @@ import (
 	"strings"
 	"testing"
 
+	"narrafork-go/internal/buildinfo"
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/restart"
 )
 
-func TestUpdateDownloadWithoutTrustedSourceReturnsTerminalErrorSSE(t *testing.T) {
+func TestUpdateDownloadWithoutTrustedSourceReturnsTSStyleNoUpdateJSON(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	h := NewHandler(nil, nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"releaseInfo":{"version":"1.2.3","files":[{"url":"https://client.invalid/artifact"}]}}`))
@@ -27,36 +28,131 @@ func TestUpdateDownloadWithoutTrustedSourceReturnsTerminalErrorSSE(t *testing.T)
 	if err := h.updateDownload(w, req); err != nil {
 		t.Fatalf("updateDownload returned error: %v", err)
 	}
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
-		t.Fatalf("expected SSE response, got content-type %q", w.Header().Get("Content-Type"))
+	if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("no-update response must not be reported as an SSE stream")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode no-update body: %v", err)
+	}
+	if body["error"] != "No update available" {
+		t.Fatalf("expected TS-style no update body, got %#v", body)
+	}
+}
+
+func TestUpdateCheckErrorStillIncludesLatestVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	setUpdateTestBuildVersion(t, "go-backend-dev")
+	unavailable := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	serverURL := unavailable.URL
+	unavailable.Close()
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	if _, err := settings.Patch(map[string]any{"update": map[string]any{"serverUrl": serverURL, "product": "narrafork", "channel": "stable"}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	h := NewHandler(nil, settings)
+	req := httptest.NewRequest(http.MethodGet, "/api/update/check", nil)
+	w := httptest.NewRecorder()
+	if err := h.updateCheck(w, req); err != nil {
+		t.Fatalf("updateCheck returned error: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode check: %v", err)
+	}
+	if body["updateAvailable"] != false || body["latestVersion"] != buildinfo.VersionValue() || body["error"] == "" {
+		t.Fatalf("failed update check should preserve latestVersion/current fallback and expose error, got %#v", body)
+	}
+}
+
+func TestUpdateCheckDevBuildDoesNotAdvertiseDownloadableUpdate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("NARRAFORK_VERSION", "")
+	t.Setenv("APP_VERSION", "")
+	setUpdateTestBuildVersion(t, "go-backend-dev")
+	artifactBytes := []byte("fake update artifact")
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version: "9.9.9",
+		Channel: "stable",
+		Product: "narrafork",
+		Bytes:   artifactBytes,
+		SHA512:  sha512Base64(artifactBytes),
+	})
+	defer trusted.Close()
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	if _, err := settings.Patch(map[string]any{"update": map[string]any{"serverUrl": trusted.URL, "product": "narrafork", "channel": "stable"}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	h := NewHandler(nil, settings)
+
+	checkReq := httptest.NewRequest(http.MethodGet, "/api/update/check", nil)
+	checkW := httptest.NewRecorder()
+	if err := h.updateCheck(checkW, checkReq); err != nil {
+		t.Fatalf("updateCheck returned error: %v", err)
+	}
+	var checkBody map[string]any
+	if err := json.Unmarshal(checkW.Body.Bytes(), &checkBody); err != nil {
+		t.Fatalf("decode check: %v", err)
+	}
+	if checkBody["updateAvailable"] != false || checkBody["latestVersion"] != "9.9.9" {
+		t.Fatalf("dev build should expose latestVersion without downloadable release, got %#v", checkBody)
+	}
+	if checkBody["releaseInfo"] != nil || checkBody["downloadSize"] != nil || checkBody["totalSize"] != nil {
+		t.Fatalf("dev build should not expose releaseInfo/download sizes, got %#v", checkBody)
 	}
 
-	events := parseUpdateSSEEvents(t, w.Body.String())
-	if len(events) != 2 {
-		t.Fatalf("expected checking + terminal error events, got %#v", events)
+	downloadReq := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{}`))
+	downloadReq.Header.Set("Content-Type", "application/json")
+	downloadW := httptest.NewRecorder()
+	if err := h.updateDownload(downloadW, downloadReq); err != nil {
+		t.Fatalf("updateDownload returned error: %v", err)
 	}
-	if events[0].Name != "progress" || events[0].Payload["phase"] != "checking" {
-		t.Fatalf("expected checking progress event, got %#v", events[0])
+	if downloadW.Code != http.StatusNotFound || strings.Contains(downloadW.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("dev build download should be TS-style JSON 404, status=%d content-type=%q body=%s", downloadW.Code, downloadW.Header().Get("Content-Type"), downloadW.Body.String())
 	}
-	terminal := events[len(events)-1]
-	if terminal.Name != "error" {
-		t.Fatalf("expected terminal error event, got %#v", terminal)
+	var downloadBody map[string]any
+	if err := json.Unmarshal(downloadW.Body.Bytes(), &downloadBody); err != nil {
+		t.Fatalf("decode download body: %v", err)
 	}
-	if terminal.Payload["success"] != false || terminal.Payload["phase"] != "error" {
-		t.Fatalf("expected parseable failed result payload, got %#v", terminal.Payload)
+	if downloadBody["error"] != "No update available" {
+		t.Fatalf("expected TS-style no update body, got %#v", downloadBody)
 	}
-	if terminal.Payload["code"] != "UPDATE_DOWNLOAD_FAILED" {
-		t.Fatalf("expected structured failure code, got %#v", terminal.Payload)
+}
+
+func TestUpdateDownloadTrustedNoUpdateReturnsTSStyleNoUpdateJSON(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	trusted := newTrustedUpdateServer(t, trustedUpdateServerOptions{
+		Version:  "1.2.3",
+		Channel:  "stable",
+		Product:  "narrafork",
+		NoUpdate: true,
+	})
+	defer trusted.Close()
+	h := newUpdateTestHandler(t, trusted.URL, "narrafork", "stable")
+	req := httptest.NewRequest(http.MethodPost, "/api/update/download", strings.NewReader(`{"releaseInfo":{"version":"1.2.3"}}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.updateDownload(w, req); err != nil {
+		t.Fatalf("updateDownload returned error: %v", err)
 	}
-	reason, _ := terminal.Payload["reason"].(string)
-	if reason == "" || terminal.Payload["error"] != reason || terminal.Payload["message"] != reason {
-		t.Fatalf("expected reason/error/message diagnostics, got %#v", terminal.Payload)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(reason, "trusted update metadata") {
-		t.Fatalf("expected trusted metadata error, got %#v", terminal.Payload)
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode no-update body: %v", err)
+	}
+	if body["error"] != "No update available" || strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("expected JSON no-update response, content-type=%q body=%#v", w.Header().Get("Content-Type"), body)
 	}
 }
 
@@ -191,8 +287,8 @@ func TestUpdateDownloadRefetchesTrustedMetadataAndIgnoresClientURLs(t *testing.T
 	}
 
 	events := parseUpdateSSEEvents(t, w.Body.String())
-	if len(events) < 3 {
-		t.Fatalf("expected checking, downloading, and complete events, got %#v", events)
+	if len(events) < 2 {
+		t.Fatalf("expected downloading progress and complete events, got %#v", events)
 	}
 	terminal := events[len(events)-1]
 	if terminal.Name != "complete" || terminal.Payload["success"] != true {
@@ -309,13 +405,18 @@ func TestUpdateDownloadRejectsRequestedVersionMismatch(t *testing.T) {
 	if err := h.updateDownload(w, req); err != nil {
 		t.Fatalf("updateDownload returned error: %v", err)
 	}
-	events := parseUpdateSSEEvents(t, w.Body.String())
-	terminal := events[len(events)-1]
-	if terminal.Name != "error" || terminal.Payload["success"] != false {
-		t.Fatalf("expected terminal version mismatch error, got %#v", terminal)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
 	}
-	if terminal.Payload["requestedVersion"] != "1.0.0" || terminal.Payload["latestVersion"] != "2.0.0" {
-		t.Fatalf("expected mismatch details, got %#v", terminal.Payload)
+	if strings.Contains(w.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("version mismatch response must not be reported as an SSE stream")
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode mismatch body: %v", err)
+	}
+	if body["error"] != "Requested update version no longer matches the latest server metadata" || body["requestedVersion"] != "1.0.0" || body["latestVersion"] != "2.0.0" {
+		t.Fatalf("expected mismatch details, got %#v", body)
 	}
 }
 
@@ -473,11 +574,12 @@ func assertAutoReadyUpdateContract(t *testing.T, payload map[string]any) {
 }
 
 type trustedUpdateServerOptions struct {
-	Version string
-	Channel string
-	Product string
-	Bytes   []byte
-	SHA512  string
+	Version  string
+	Channel  string
+	Product  string
+	Bytes    []byte
+	SHA512   string
+	NoUpdate bool
 }
 
 func newTrustedUpdateServer(t *testing.T, opts trustedUpdateServerOptions) *httptest.Server {
@@ -491,6 +593,14 @@ func newTrustedUpdateServer(t *testing.T, opts trustedUpdateServerOptions) *http
 			}
 			if r.URL.Query().Get("platform") != updatePlatform() {
 				t.Fatalf("unexpected platform query: %q", r.URL.RawQuery)
+			}
+			if opts.NoUpdate {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"updateAvailable": false,
+					"currentVersion":  r.URL.Query().Get("version"),
+					"version":         opts.Version,
+				})
+				return
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"updateAvailable": true,
@@ -515,8 +625,16 @@ func newTrustedUpdateServer(t *testing.T, opts trustedUpdateServerOptions) *http
 	}))
 }
 
+func setUpdateTestBuildVersion(t *testing.T, version string) {
+	t.Helper()
+	oldVersion := buildinfo.Version
+	buildinfo.Version = version
+	t.Cleanup(func() { buildinfo.Version = oldVersion })
+}
+
 func newUpdateTestHandler(t *testing.T, serverURL, product, channel string) *Handler {
 	t.Helper()
+	setUpdateTestBuildVersion(t, "1.0.0")
 	settings, err := config.Load()
 	if err != nil {
 		t.Fatalf("load settings: %v", err)

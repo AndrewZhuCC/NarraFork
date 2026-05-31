@@ -37,8 +37,8 @@ func TestUserPreferencesLoadDecodesJSONFields(t *testing.T) {
 	if _, ok := prefs["commands"].([]any); !ok {
 		t.Fatalf("commands = %#v, want array", prefs["commands"])
 	}
-	if _, ok := prefs["graphViewports"].(map[string]any); !ok {
-		t.Fatalf("graphViewports = %#v, want object", prefs["graphViewports"])
+	if prefs["graphViewports"] != `{"p1":{"x":1,"y":2}}` {
+		t.Fatalf("graphViewports = %#v, want raw JSON string", prefs["graphViewports"])
 	}
 	if _, ok := prefs["gatewayConfig"].(map[string]any); !ok {
 		t.Fatalf("gatewayConfig = %#v, want object", prefs["gatewayConfig"])
@@ -249,6 +249,139 @@ func TestPatchUserPreferencesRejectsInvalidTypedFields(t *testing.T) {
 		if response["code"] != "VALIDATION_ERROR" {
 			t.Fatalf("expected VALIDATION_ERROR for %s, got %#v", payload, response["code"])
 		}
+	}
+}
+
+type capturedUserBroadcast struct {
+	UserID  string
+	Payload map[string]any
+}
+
+type captureUserBroadcaster struct {
+	Calls []capturedUserBroadcast
+}
+
+func (b *captureUserBroadcaster) BroadcastUser(userID string, payload any) {
+	payloadMap, _ := payload.(map[string]any)
+	b.Calls = append(b.Calls, capturedUserBroadcast{UserID: userID, Payload: payloadMap})
+}
+
+func TestRecentTabUpsertValidatesTSShapeAndStripsUnknownFields(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := newUserPrefsTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO users (id, username, role, created_at) VALUES ('u1', 'alice', 'admin', 'now')`)
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	authService := auth.NewService(sqlDB, settings)
+	token, err := authService.CreateToken("u1", "admin")
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	wrapped := authService.Middleware(httpx.Handler((&Handler{DB: sqlDB}).upsertRecentTab))
+
+	badReq := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader([]byte(`{"type":"project","id":"p1","title":"Project"}`)))
+	badReq.Header.Set("Authorization", "Bearer "+token)
+	badReq.Header.Set("Content-Type", "application/json")
+	badResp := httptest.NewRecorder()
+	wrapped.ServeHTTP(badResp, badReq)
+	if badResp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing lastVisitedAt, got %d body=%s", badResp.Code, badResp.Body.String())
+	}
+
+	payload := []byte(`{"type":"project","id":"p1","title":"Project","lastVisitedAt":1700000000000,"pinned":true,"updateOnly":false,"unknown":"drop"}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	wrapped.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid tab, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	var tabs []map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &tabs); err != nil {
+		t.Fatalf("decode tabs: %v", err)
+	}
+	if len(tabs) != 1 {
+		t.Fatalf("expected one recent tab, got %#v", tabs)
+	}
+	if _, ok := tabs[0]["unknown"]; ok {
+		t.Fatalf("unknown field should be stripped, got %#v", tabs[0])
+	}
+	if _, ok := tabs[0]["updateOnly"]; ok {
+		t.Fatalf("updateOnly should not be persisted, got %#v", tabs[0])
+	}
+	if tabs[0]["type"] != "project" || tabs[0]["id"] != "p1" || tabs[0]["title"] != "Project" {
+		t.Fatalf("unexpected tab payload %#v", tabs[0])
+	}
+}
+
+func TestRecentTabMutationsBroadcastUserScopedSnapshot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := newUserPrefsTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO users (id, username, role, created_at) VALUES ('u1', 'alice', 'admin', 'now')`)
+	if err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	authService := auth.NewService(sqlDB, settings)
+	token, err := authService.CreateToken("u1", "admin")
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	broadcaster := &captureUserBroadcaster{}
+	wrapped := authService.Middleware(httpx.Handler((&Handler{DB: sqlDB, Broadcaster: broadcaster}).upsertRecentTab))
+
+	payload := []byte(`{"type":"project","id":"p1","title":"Project","lastVisitedAt":1700000000000}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	wrapped.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	if len(broadcaster.Calls) != 1 {
+		t.Fatalf("expected one broadcast, got %#v", broadcaster.Calls)
+	}
+	assertRecentTabsSnapshotBroadcast(t, broadcaster.Calls[0], "u1", 1)
+
+	updateOnlyPayload := []byte(`{"type":"project","id":"p2","title":"Other","lastVisitedAt":1700000000001,"updateOnly":true}`)
+	updateOnlyReq := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader(updateOnlyPayload))
+	updateOnlyReq.Header.Set("Authorization", "Bearer "+token)
+	updateOnlyReq.Header.Set("Content-Type", "application/json")
+	updateOnlyResp := httptest.NewRecorder()
+	wrapped.ServeHTTP(updateOnlyResp, updateOnlyReq)
+	if updateOnlyResp.Code != http.StatusOK {
+		t.Fatalf("expected 200 for updateOnly missing tab, got %d body=%s", updateOnlyResp.Code, updateOnlyResp.Body.String())
+	}
+	if len(broadcaster.Calls) != 2 {
+		t.Fatalf("expected updateOnly path to broadcast unchanged snapshot, got %#v", broadcaster.Calls)
+	}
+	assertRecentTabsSnapshotBroadcast(t, broadcaster.Calls[1], "u1", 1)
+}
+
+func assertRecentTabsSnapshotBroadcast(t *testing.T, call capturedUserBroadcast, userID string, wantTabs int) {
+	t.Helper()
+	if call.UserID != userID {
+		t.Fatalf("broadcast userID = %q, want %q", call.UserID, userID)
+	}
+	if call.Payload["type"] != "user:recent_tabs_snapshot" {
+		t.Fatalf("unexpected broadcast type: %#v", call.Payload)
+	}
+	tabs, ok := call.Payload["tabs"].([]map[string]any)
+	if !ok || len(tabs) != wantTabs {
+		t.Fatalf("broadcast tabs = %#v, want %d tabs", call.Payload["tabs"], wantTabs)
+	}
+	if _, ok := call.Payload["revision"].(int64); !ok {
+		t.Fatalf("broadcast revision should be int64, got %#v", call.Payload["revision"])
 	}
 }
 

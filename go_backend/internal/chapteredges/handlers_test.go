@@ -37,6 +37,11 @@ func TestCreateChapterEdgeValidationErrorsUseTSShape(t *testing.T) {
 			body:      `{"sourceId":"chapter-a","targetId":"chapter-b","type":"sidequest"}`,
 			wantError: "Invalid type: sidequest",
 		},
+		{
+			name:      "review type not accepted by public create schema",
+			body:      `{"sourceId":"chapter-a","targetId":"chapter-b","type":"review"}`,
+			wantError: "Invalid type: review",
+		},
 	}
 
 	for _, tc := range cases {
@@ -120,7 +125,7 @@ func TestChapterEdgeManualOperationsOnlyAllowDependency(t *testing.T) {
 	defer sqlDB.Close()
 	router := chapterEdgeTestRouter(sqlDB)
 
-	for _, edgeType := range []string{"fork", "merge", "review", "cherry_pick"} {
+	for _, edgeType := range []string{"fork", "merge", "cherry_pick"} {
 		w := performChapterEdgeRequest(router, http.MethodPost, "/", `{"sourceId":"chapter-a","targetId":"chapter-b","type":"`+edgeType+`"}`)
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("expected manual %s create to be rejected, got %d: %s", edgeType, w.Code, w.Body.String())
@@ -167,13 +172,17 @@ func TestListChapterEdgesRejectsInvalidType(t *testing.T) {
 	defer sqlDB.Close()
 	router := chapterEdgeTestRouter(sqlDB)
 
-	w := performChapterEdgeRequest(router, http.MethodGet, "/?projectId=project-1&type=sidequest", "")
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
-	}
-	decoded := decodeJSONBody(t, w)
-	if decoded["code"] != "VALIDATION_ERROR" || decoded["error"] != "Invalid type: sidequest" {
-		t.Fatalf("unexpected invalid list type error: %#v", decoded)
+	for _, edgeType := range []string{"sidequest", "review"} {
+		t.Run(edgeType, func(t *testing.T) {
+			w := performChapterEdgeRequest(router, http.MethodGet, "/?projectId=project-1&type="+edgeType, "")
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+			}
+			decoded := decodeJSONBody(t, w)
+			if decoded["code"] != "VALIDATION_ERROR" || decoded["error"] != "Invalid type: "+edgeType {
+				t.Fatalf("unexpected invalid list type error: %#v", decoded)
+			}
+		})
 	}
 }
 
