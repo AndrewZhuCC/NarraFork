@@ -3101,6 +3101,24 @@ func (h *Handler) postMessage(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	if cmd.Resolved && (cmd.LoadTool != "" || cmd.LoadToolNotFound != "") {
+		defer cleanupUploadedTextFileBlocks(payload.ContentBlocks)
+		result, err := h.Service.HandleLoadToolCommand(r.Context(), narratorID, cmd, userID)
+		if err != nil {
+			return err
+		}
+		httpx.WriteJSON(w, http.StatusOK, result)
+		return nil
+	}
+	if cmd.Resolved && (cmd.UnloadTool != "" || cmd.UnloadToolNotFound != "") {
+		defer cleanupUploadedTextFileBlocks(payload.ContentBlocks)
+		result, err := h.Service.HandleUnloadToolCommand(r.Context(), narratorID, cmd, userID)
+		if err != nil {
+			return err
+		}
+		httpx.WriteJSON(w, http.StatusOK, result)
+		return nil
+	}
 	if cmd.Resolved && cmd.LoadSkill != "" {
 		skillPrompt, found, err := h.Service.skillCommandPrompt(r.Context(), narratorID, cmd.LoadSkill, cmd.SkillInput)
 		if err != nil {
@@ -3757,16 +3775,20 @@ func mergeCommandLists(userCommands, projectCommands []map[string]any) []map[str
 }
 
 type slashCommandResult struct {
-	Resolved       bool
-	RawCommand     string
-	ExpandedPrompt string
-	BashCommand    string
-	LoadSkill      string
-	SkillInput     string
-	GoalCommand    bool
-	GoalAction     string
-	GoalObjective  string
-	ModelOverride  map[string]any
+	Resolved           bool
+	RawCommand         string
+	ExpandedPrompt     string
+	BashCommand        string
+	LoadTool           string
+	LoadToolNotFound   string
+	UnloadTool         string
+	UnloadToolNotFound string
+	LoadSkill          string
+	SkillInput         string
+	GoalCommand        bool
+	GoalAction         string
+	GoalObjective      string
+	ModelOverride      map[string]any
 }
 
 func parseSlashCommandInput(prompt string) (string, string, bool) {
@@ -3798,6 +3820,24 @@ func (h *Handler) resolveSlashCommand(ctx context.Context, prompt, narratorID, u
 	}
 	lower := strings.ToLower(name)
 	switch lower {
+	case "load":
+		toolID := strings.ToLower(strings.TrimSpace(input))
+		if toolID == "" {
+			return slashCommandResult{}, nil
+		}
+		if tool, ok := resolveOptionalToolByID(toolID); ok {
+			return slashCommandResult{Resolved: true, LoadTool: tool.ToolName, RawCommand: prompt}, nil
+		}
+		return slashCommandResult{Resolved: true, LoadToolNotFound: toolID, RawCommand: prompt}, nil
+	case "unload":
+		toolID := strings.ToLower(strings.TrimSpace(input))
+		if toolID == "" {
+			return slashCommandResult{}, nil
+		}
+		if tool, ok := resolveOptionalToolByID(toolID); ok {
+			return slashCommandResult{Resolved: true, UnloadTool: tool.ToolName, RawCommand: prompt}, nil
+		}
+		return slashCommandResult{Resolved: true, UnloadToolNotFound: toolID, RawCommand: prompt}, nil
 	case "skill", "load-skill":
 		parts := strings.Fields(input)
 		if len(parts) == 0 {
@@ -3946,26 +3986,80 @@ func loadGlobalSkillSummaries() []map[string]any {
 	return items
 }
 
-func optionalToolMenuItems() []map[string]any {
-	supportedOptional := map[string]bool{}
+type optionalToolDefinition struct {
+	ID            string
+	ToolName      string
+	DescriptionEn string
+	DescriptionZh string
+}
+
+func optionalToolDefinitions() []optionalToolDefinition {
+	return []optionalToolDefinition{
+		{ID: "terminal", ToolName: "Terminal", DescriptionEn: "Interactive terminal — read buffer, send input, list terminals", DescriptionZh: "交互式终端 — 读取缓冲区、发送输入、列出终端"},
+		{ID: "share_file", ToolName: "ShareFile", DescriptionEn: "Share files/directories — generate temporary download links", DescriptionZh: "分享文件/目录 — 生成临时下载链接"},
+		{ID: "recall", ToolName: "Recall", DescriptionEn: "Search and browse all narrator conversations", DescriptionZh: "搜索和浏览所有叙述者对话"},
+		{ID: "browser", ToolName: "Browser", DescriptionEn: "Interactive browser — navigate, click, fill forms, take screenshots", DescriptionZh: "交互式浏览器 — 导航、点击、填写表单、截图"},
+		{ID: "fork_narrator", ToolName: "ForkNarrator", DescriptionEn: "Fork the current narrator session into a new chapter", DescriptionZh: "将当前叙述者会话分叉到新章节"},
+		{ID: "narrafork_admin", ToolName: "NarraForkAdmin", DescriptionEn: "Admin settings management — get and modify all NarraFork settings", DescriptionZh: "管理员设置管理 — 获取和修改所有 NarraFork 设置"},
+	}
+}
+
+func supportedOptionalToolNames() map[string]bool {
+	supported := map[string]bool{}
 	for _, tool := range agentbasic.ToolMenuCapabilities() {
 		if stringValue(tool["category"]) != agentbasic.ToolCategoryOptional || tool["supported"] != true {
 			continue
 		}
-		supportedOptional[stringValue(tool["name"])] = true
-	}
-	items := []map[string]any{}
-	for _, item := range []map[string]any{
-		{"id": "terminal", "toolName": "Terminal", "descriptionEn": "Interactive terminal — read buffer, send input, list terminals", "descriptionZh": "交互式终端 — 读取缓冲区、发送输入、列出终端"},
-		{"id": "share_file", "toolName": "ShareFile", "descriptionEn": "Share files/directories — generate temporary download links", "descriptionZh": "分享文件/目录 — 生成临时下载链接"},
-		{"id": "recall", "toolName": "Recall", "descriptionEn": "Search and browse all narrator conversations", "descriptionZh": "搜索和浏览所有叙述者对话"},
-		{"id": "browser", "toolName": "Browser", "descriptionEn": "Interactive browser — navigate, click, fill forms, take screenshots", "descriptionZh": "交互式浏览器 — 导航、点击、填写表单、截图"},
-		{"id": "fork_narrator", "toolName": "ForkNarrator", "descriptionEn": "Fork the current narrator session into a new chapter", "descriptionZh": "将当前叙述者会话分叉到新章节"},
-		{"id": "narrafork_admin", "toolName": "NarraForkAdmin", "descriptionEn": "Admin settings management — get and modify all NarraFork settings", "descriptionZh": "管理员设置管理 — 获取和修改所有 NarraFork 设置"},
-	} {
-		if supportedOptional[stringValue(item["toolName"])] {
-			items = append(items, item)
+		name := strings.TrimSpace(stringValue(tool["name"]))
+		if name != "" {
+			supported[name] = true
 		}
+	}
+	return supported
+}
+
+func availableOptionalToolIDs() []string {
+	supported := supportedOptionalToolNames()
+	ids := []string{}
+	for _, tool := range optionalToolDefinitions() {
+		if supported[tool.ToolName] {
+			ids = append(ids, tool.ID)
+		}
+	}
+	return ids
+}
+
+func resolveOptionalToolByID(toolID string) (optionalToolDefinition, bool) {
+	toolID = strings.ToLower(strings.TrimSpace(toolID))
+	if toolID == "" {
+		return optionalToolDefinition{}, false
+	}
+	supported := supportedOptionalToolNames()
+	for _, tool := range optionalToolDefinitions() {
+		if strings.ToLower(tool.ID) == toolID && supported[tool.ToolName] {
+			return tool, true
+		}
+	}
+	return optionalToolDefinition{}, false
+}
+
+func optionalToolDefinitionByName(toolName string) (optionalToolDefinition, bool) {
+	for _, tool := range optionalToolDefinitions() {
+		if tool.ToolName == toolName {
+			return tool, true
+		}
+	}
+	return optionalToolDefinition{}, false
+}
+
+func optionalToolMenuItems() []map[string]any {
+	supported := supportedOptionalToolNames()
+	items := []map[string]any{}
+	for _, tool := range optionalToolDefinitions() {
+		if !supported[tool.ToolName] {
+			continue
+		}
+		items = append(items, map[string]any{"id": tool.ID, "toolName": tool.ToolName, "descriptionEn": tool.DescriptionEn, "descriptionZh": tool.DescriptionZh})
 	}
 	return items
 }

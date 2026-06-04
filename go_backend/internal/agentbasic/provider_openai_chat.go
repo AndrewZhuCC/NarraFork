@@ -310,6 +310,10 @@ func streamChatCompletions(ctx context.Context, client *http.Client, provider Pr
 					}
 					inputTotal := len(tool.Arguments)
 					emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: idValue, Name: tool.Name, Input: delta.Function.Arguments, OutputIndex: &tool.Index, InputCharsTotal: inputTotal}}})
+					if !tool.Stopped && isParsableJSON(tool.Arguments) {
+						emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: idValue, Name: tool.Name, Stop: true, OutputIndex: &tool.Index, InputCharsTotal: inputTotal}}})
+						tool.Stopped = true
+					}
 				}
 			}
 			if choice.FinishReason != "" {
@@ -671,6 +675,10 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 			tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 			tool.Arguments += parsed.Delta
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: tool.ID, Name: tool.Name, Input: parsed.Delta, OutputIndex: parsed.OutputIndex, InputCharsTotal: len(tool.Arguments)}}})
+			if !tool.Stopped && isParsableJSON(tool.Arguments) {
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: tool.ID, Name: tool.Name, Stop: true, OutputIndex: parsed.OutputIndex, InputCharsTotal: len(tool.Arguments)}}})
+				tool.Stopped = true
+			}
 		case "response.function_call_arguments.done":
 			tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 			if !tool.Stopped {
@@ -989,7 +997,11 @@ func handleResponsesOutputItemAdded(ctx context.Context, out chan<- StreamEvent,
 		if outputIndex != nil {
 			tools[fmt.Sprintf("idx:%d", *outputIndex)] = tool
 		}
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: idValue, Name: item.Name, OutputIndex: outputIndex}, ResponsesAPI: true}})
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: idValue, Name: item.Name, OutputIndex: outputIndex, InputCharsTotal: len(tool.Arguments)}, ResponsesAPI: true}})
+		if tool.Arguments != "" && isParsableJSON(tool.Arguments) {
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: idValue, Name: item.Name, Stop: true, OutputIndex: outputIndex, InputCharsTotal: len(tool.Arguments)}, ResponsesAPI: true}})
+			tool.Stopped = true
+		}
 	case "web_search_call":
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{ID: item.ID, Status: item.Status, Query: item.Query, OutputIndex: outputIndex, Final: true}, ResponsesAPI: true}})
 	case "image_generation_call":

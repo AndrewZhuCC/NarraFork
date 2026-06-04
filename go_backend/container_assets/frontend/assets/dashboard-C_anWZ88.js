@@ -1,0 +1,1 @@
+var e=`欢迎使用 NarraFork`,t=`AI 驱动的协作编程平台。`,n=`查看项目`,r=`活跃项目`,i=`项目总数`,a=`独立会话`,o=`最近项目`,s={welcome:e,subtitle:t,viewProjects:n,activeProjects:r,totalProjects:i,standaloneSessions:a,recentProjects:o};export{r as activeProjects,s as default,o as recentProjects,a as standaloneSessions,t as subtitle,i as totalProjects,n as viewProjects,e as welcome};

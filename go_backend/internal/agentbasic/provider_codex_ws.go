@@ -111,6 +111,10 @@ func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, tools
 		tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 		tool.Arguments += parsed.Delta
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: tool.ID, Name: tool.Name, Input: parsed.Delta, OutputIndex: parsed.OutputIndex, InputCharsTotal: len(tool.Arguments)}}})
+		if !tool.Stopped && isParsableJSON(tool.Arguments) {
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: tool.ID, Name: tool.Name, Stop: true, OutputIndex: parsed.OutputIndex, InputCharsTotal: len(tool.Arguments)}}})
+			tool.Stopped = true
+		}
 	case "response.function_call_arguments.done":
 		tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 		if !tool.Stopped {

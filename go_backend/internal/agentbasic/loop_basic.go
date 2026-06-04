@@ -21,17 +21,24 @@ type reasoningAccum struct {
 }
 
 type toolChunkAccum struct {
-	ID          string
-	Name        string
-	Input       string
-	OutputIndex *int
+	ID                    string
+	Name                  string
+	Input                 string
+	OutputIndex           *int
+	StartedAt             int64
+	ExtractedFilePath     string
+	ExtractedFields       map[string]string
+	StreamingMetadata     map[string]any
+	ActiveStreamingField  string
+	StreamingFieldYielded int
 }
 
 type toolExecOutcome struct {
-	Run        ToolRun
-	IsError    bool
-	DurationMs int64
-	SideCars   []AgentSideCar
+	Run           ToolRun
+	IsError       bool
+	DurationMs    int64
+	SideCars      []AgentSideCar
+	SideCarsReady bool
 }
 
 func RunAgentLoop(ctx context.Context, settings *config.Store, model string, history []Message, cwd string, opts ...GenerateOption) (<-chan AgentEvent, error) {
@@ -81,6 +88,10 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 		if !ok {
 			return
 		}
+		if !drainSettledToolResults(ctx, out, state, options) {
+			emitAgentEvent(context.Background(), out, AgentEvent{Type: "error", Message: "Aborted"})
+			return
+		}
 		flushTurnBlocks(ctx, out, state)
 		emitAgentEvent(ctx, out, AgentEvent{Type: "assistant_message", Text: state.assistantText, ToolUses: append([]ToolCall(nil), state.toolUses...), CredentialID: state.credentialID})
 		if len(state.toolUses) == 0 {
@@ -114,13 +125,15 @@ type turnState struct {
 	redacted            []*RedactedThinking
 	credentialID        string
 	earlyExec           map[string]<-chan toolExecOutcome
+	completedOutcomes   map[string]toolExecOutcome
+	yieldedToolResults  map[string]bool
 	eagerBlocked        bool
 	completedToolCount  int
 	silentToolCallCount int
 }
 
 func newTurnState(initialCompletedToolCount, silentToolCallCount int) *turnState {
-	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}, completedToolCount: initialCompletedToolCount, silentToolCallCount: silentToolCallCount}
+	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}, completedOutcomes: map[string]toolExecOutcome{}, yieldedToolResults: map[string]bool{}, completedToolCount: initialCompletedToolCount, silentToolCallCount: silentToolCallCount}
 }
 
 func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, resolution ProviderResolution, built *BuiltHistory, cwd string, options generateOptions, toolExecutor ToolExecutor) (*turnState, bool) {
@@ -308,6 +321,10 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			for _, call := range parsed.ToolUses {
 				addToolUse(ctx, out, state, call, cwd, toolExecutor)
 			}
+			if !drainSettledToolResults(ctx, out, state, options) {
+				emitAgentEvent(context.Background(), out, AgentEvent{Type: "error", Message: "Aborted"})
+				return state, errTerminalEvent
+			}
 		}
 	}
 }
@@ -325,7 +342,7 @@ func handleToolUseChunk(ctx context.Context, out chan<- AgentEvent, state *turnS
 	}
 	acc := chunks[idValue]
 	if acc == nil {
-		acc = &toolChunkAccum{ID: idValue}
+		acc = &toolChunkAccum{ID: idValue, StartedAt: time.Now().UnixMilli()}
 		chunks[idValue] = acc
 	}
 	if strings.TrimSpace(chunk.Name) != "" {
@@ -335,13 +352,16 @@ func handleToolUseChunk(ctx context.Context, out chan<- AgentEvent, state *turnS
 		acc.OutputIndex = chunk.OutputIndex
 	}
 	acc.Input += chunk.Input
-	emitAgentEvent(ctx, out, AgentEvent{Type: "tool_use_chunk", ToolUseID: idValue, ToolName: acc.Name, OutputIndex: acc.OutputIndex, Streaming: chunk})
+	enriched := enrichStreamingToolChunk(acc, chunk, cwd)
+	emitAgentEvent(ctx, out, AgentEvent{Type: "tool_use_chunk", ToolUseID: idValue, ToolName: acc.Name, OutputIndex: acc.OutputIndex, Streaming: enriched, StreamStartedAt: acc.StartedAt})
 	if chunk.Stop {
 		name := acc.Name
 		if name == "" {
 			name = chunk.Name
 		}
 		call := newFunctionToolCall(idValue, name, acc.Input)
+		call.StreamStartedAt = acc.StartedAt
+		call.OutputIndex = acc.OutputIndex
 		addToolUse(ctx, out, state, call, cwd, toolExecutor)
 		delete(chunks, idValue)
 	}
@@ -366,7 +386,7 @@ func addToolUse(ctx context.Context, out chan<- AgentEvent, state *turnState, ca
 		return
 	}
 	if !state.eagerBlocked && shouldEagerExecuteTool(call) {
-		state.earlyExec[call.ID] = startToolExecution(ctx, cwd, toolExecutor, call)
+		state.earlyExec[call.ID] = startToolExecution(ctx, out, cwd, toolExecutor, call)
 	}
 }
 
@@ -375,7 +395,7 @@ func emitToolCallIfMissing(ctx context.Context, out chan<- AgentEvent, call Tool
 		return
 	}
 	emitted[call.ID] = true
-	emitAgentEvent(ctx, out, AgentEvent{Type: "tool_call", ToolUseID: call.ID, ToolName: call.Function.Name, Input: toolCallInput(call)})
+	emitAgentEvent(ctx, out, AgentEvent{Type: "tool_call", ToolUseID: call.ID, ToolName: call.Function.Name, Input: toolCallInput(call), StreamStartedAt: call.StreamStartedAt})
 }
 
 func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter ProviderAdapter, cwd string, toolExecutor ToolExecutor, state *turnState, options generateOptions) ([]any, bool) {
@@ -384,7 +404,7 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 		outcomes := make([]toolExecOutcome, len(group))
 		if len(group) == 1 {
 			call := group[0]
-			outcome, ok := awaitOrRunTool(ctx, cwd, toolExecutor, state, call)
+			outcome, ok := awaitOrRunTool(ctx, out, cwd, toolExecutor, state, call)
 			if !ok {
 				emitAgentEvent(context.Background(), out, AgentEvent{Type: "error", Message: "Aborted"})
 				return nil, false
@@ -396,12 +416,17 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 				Outcome toolExecOutcome
 			}, len(group))
 			for idx, call := range group {
+				if completed, ok := state.completedOutcomes[call.ID]; ok {
+					outcomes[idx] = completed
+					continue
+				}
 				if early, ok := state.earlyExec[call.ID]; ok {
 					go func(index int, early <-chan toolExecOutcome) {
+						result := <-early
 						resultCh <- struct {
 							Index   int
 							Outcome toolExecOutcome
-						}{Index: index, Outcome: <-early}
+						}{Index: index, Outcome: result}
 					}(idx, early)
 					continue
 				}
@@ -409,26 +434,28 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 					resultCh <- struct {
 						Index   int
 						Outcome toolExecOutcome
-					}{Index: index, Outcome: executeToolCall(ctx, cwd, toolExecutor, toolCall)}
+					}{Index: index, Outcome: executeToolCall(ctx, out, cwd, toolExecutor, toolCall)}
 				}(idx, call)
 			}
-			for range group {
+			for remaining := countMissingOutcomes(outcomes); remaining > 0; remaining-- {
 				select {
 				case <-ctx.Done():
 					emitAgentEvent(context.Background(), out, AgentEvent{Type: "error", Message: "Aborted"})
 					return nil, false
 				case result := <-resultCh:
 					outcomes[result.Index] = result.Outcome
+					state.completedOutcomes[group[result.Index].ID] = result.Outcome
 				}
 			}
 		}
 		for idx, call := range group {
 			emitToolCallIfMissing(ctx, out, call, state.emittedToolCalls)
-			outcome := outcomes[idx]
+			outcome := ensureOutcomeSideCars(ctx, options, state, call, outcomes[idx])
 			run := outcome.Run
-			sideCars := collectToolResultSideCars(ctx, options, state, call, outcome)
-			outputForModel := appendAgentSideCarsForProvider(run.Output, sideCars)
-			emitAgentEvent(ctx, out, AgentEvent{Type: "tool_result", ToolUseID: run.ID, ToolName: run.Name, Output: run.Output, IsError: outcome.IsError, DurationMs: outcome.DurationMs, ToolRun: &run, SideCars: sideCars})
+			outputForModel := appendAgentSideCarsForProvider(run.Output, outcome.SideCars)
+			if !state.yieldedToolResults[call.ID] {
+				emitToolResultEvent(ctx, out, state, call, outcome)
+			}
 			toolResults = append(toolResults, adapter.FormatToolResult(call.ID, outputForModel, outcome.IsError))
 		}
 	}
@@ -546,30 +573,127 @@ func guardToolExecutor(executor ToolExecutor, opts ToolInventoryOptions) ToolExe
 	}
 }
 
-func awaitOrRunTool(ctx context.Context, cwd string, toolExecutor ToolExecutor, state *turnState, call ToolCall) (toolExecOutcome, bool) {
+func countMissingOutcomes(outcomes []toolExecOutcome) int {
+	count := 0
+	for _, outcome := range outcomes {
+		if strings.TrimSpace(outcome.Run.ID) == "" {
+			count++
+		}
+	}
+	return count
+}
+
+func drainSettledToolResults(ctx context.Context, out chan<- AgentEvent, state *turnState, options generateOptions) bool {
+	if state == nil || len(state.earlyExec) == 0 {
+		return true
+	}
+	for _, call := range state.toolUses {
+		if state.yieldedToolResults[call.ID] {
+			continue
+		}
+		outcome, ok := state.completedOutcomes[call.ID]
+		if !ok {
+			early := state.earlyExec[call.ID]
+			if early == nil {
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return false
+			case outcome = <-early:
+				state.completedOutcomes[call.ID] = outcome
+				delete(state.earlyExec, call.ID)
+			default:
+				continue
+			}
+		}
+		outcome = ensureOutcomeSideCars(ctx, options, state, call, outcome)
+		if !emitToolResultEvent(ctx, out, state, call, outcome) {
+			return false
+		}
+	}
+	return true
+}
+
+func ensureOutcomeSideCars(ctx context.Context, options generateOptions, state *turnState, call ToolCall, outcome toolExecOutcome) toolExecOutcome {
+	if outcome.SideCarsReady {
+		state.completedOutcomes[call.ID] = outcome
+		return outcome
+	}
+	outcome.SideCars = collectToolResultSideCars(ctx, options, state, call, outcome)
+	outcome.SideCarsReady = true
+	state.completedOutcomes[call.ID] = outcome
+	return outcome
+}
+
+func emitToolResultEvent(ctx context.Context, out chan<- AgentEvent, state *turnState, call ToolCall, outcome toolExecOutcome) bool {
+	if state.yieldedToolResults[call.ID] {
+		return true
+	}
+	state.yieldedToolResults[call.ID] = true
+	run := outcome.Run
+	return emitAgentEvent(ctx, out, AgentEvent{Type: "tool_result", ToolUseID: run.ID, ToolName: run.Name, Output: run.Output, IsError: outcome.IsError, DurationMs: outcome.DurationMs, ToolRun: &run, SideCars: outcome.SideCars})
+}
+
+func awaitOrRunTool(ctx context.Context, out chan<- AgentEvent, cwd string, toolExecutor ToolExecutor, state *turnState, call ToolCall) (toolExecOutcome, bool) {
+	if completed, ok := state.completedOutcomes[call.ID]; ok {
+		return completed, true
+	}
 	if early, ok := state.earlyExec[call.ID]; ok {
 		select {
 		case <-ctx.Done():
 			return toolExecOutcome{}, false
 		case outcome := <-early:
+			state.completedOutcomes[call.ID] = outcome
+			delete(state.earlyExec, call.ID)
 			return outcome, true
 		}
 	}
-	return executeToolCall(ctx, cwd, toolExecutor, call), true
+	outcome := executeToolCall(ctx, out, cwd, toolExecutor, call)
+	state.completedOutcomes[call.ID] = outcome
+	return outcome, true
 }
 
-func startToolExecution(ctx context.Context, cwd string, toolExecutor ToolExecutor, call ToolCall) <-chan toolExecOutcome {
+func startToolExecution(ctx context.Context, out chan<- AgentEvent, cwd string, toolExecutor ToolExecutor, call ToolCall) <-chan toolExecOutcome {
 	ch := make(chan toolExecOutcome, 1)
 	go func() {
-		ch <- executeToolCall(ctx, cwd, toolExecutor, call)
+		ch <- executeToolCall(ctx, out, cwd, toolExecutor, call)
 		close(ch)
 	}()
 	return ch
 }
 
-func executeToolCall(ctx context.Context, cwd string, toolExecutor ToolExecutor, call ToolCall) toolExecOutcome {
+var toolProgressInterval = 5 * time.Second
+
+func executeToolCall(ctx context.Context, out chan<- AgentEvent, cwd string, toolExecutor ToolExecutor, call ToolCall) toolExecOutcome {
 	started := time.Now()
-	run, err := toolExecutor(ctx, cwd, call)
+	execCtx := ContextWithToolRuntimeEvents(ctx, NewToolRuntimeEventSink(call.ID, func(event AgentEvent) {
+		emitAgentEvent(ctx, out, event)
+	}))
+	done := make(chan struct{})
+	if toolProgressInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(toolProgressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ctx.Done():
+					return
+				case tick := <-ticker.C:
+					elapsed := int64(tick.Sub(started).Seconds())
+					if elapsed <= 0 {
+						elapsed = 1
+					}
+					emitAgentEvent(ctx, out, AgentEvent{Type: "tool_progress", ToolUseID: call.ID, Elapsed: elapsed})
+				}
+			}
+		}()
+	}
+	run, err := toolExecutor(execCtx, cwd, call)
+	close(done)
+	FlushToolRuntimeEvents(execCtx)
 	if err != nil {
 		run = ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Output: "Tool error: " + err.Error(), Status: "error", Error: err.Error()}
 	}
@@ -650,7 +774,7 @@ func flushTurnBlocks(ctx context.Context, out chan<- AgentEvent, state *turnStat
 }
 
 func toolUseBlock(call ToolCall) *ContentBlock {
-	return &ContentBlock{Type: "tool_use", ToolUseID: call.ID, ToolName: call.Function.Name, Input: toolCallInput(call)}
+	return &ContentBlock{Type: "tool_use", ToolUseID: call.ID, ToolName: call.Function.Name, Input: toolCallInput(call), OutputIndex: call.OutputIndex, StreamStartedAt: call.StreamStartedAt}
 }
 
 func reasoningKey(parsed ParsedStreamEvent) string {

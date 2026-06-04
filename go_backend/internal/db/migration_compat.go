@@ -35,8 +35,12 @@ type expectedDrizzleJournal struct {
 	Entries []drizzleMigrationSnapshotEntry
 }
 
-var currentRepositoryDrizzleBaselineSnapshot = []drizzleMigrationSnapshotEntry{
-	{Tag: "0000_simple_kingpin", When: 1779518783820, Hash: "3def51bef24ef8498a922f48b687a178bc56886a4f90776bfbd195d152e88218"},
+// currentRepositoryDrizzleBaselineSnapshot returns the Drizzle journal shape that
+// the checked-out repository currently expects. It intentionally mirrors the
+// embedded Bun-compatible migration snapshot unless the repository intentionally
+// moves to a distinct squashed baseline again.
+func currentRepositoryDrizzleBaselineSnapshot() []drizzleMigrationSnapshotEntry {
+	return append([]drizzleMigrationSnapshotEntry(nil), embeddedDrizzleMigrationSnapshot...)
 }
 
 func (s *Store) EnsureMigrationCompatibility(ctx context.Context) error {
@@ -140,8 +144,9 @@ func readAppliedDrizzleMigrationHashes(ctx context.Context, sqlDB *sql.DB) (map[
 
 func expectedDrizzleJournals() []expectedDrizzleJournal {
 	journals := []expectedDrizzleJournal{{Name: "bun-final-history", Entries: embeddedDrizzleMigrationSnapshot}}
-	if len(currentRepositoryDrizzleBaselineSnapshot) > 0 {
-		journals = append(journals, expectedDrizzleJournal{Name: "current-repository-baseline", Entries: currentRepositoryDrizzleBaselineSnapshot})
+	currentRepositorySnapshot := currentRepositoryDrizzleBaselineSnapshot()
+	if len(currentRepositorySnapshot) > 0 && drizzleJournalHash(currentRepositorySnapshot) != drizzleJournalHash(embeddedDrizzleMigrationSnapshot) {
+		journals = append(journals, expectedDrizzleJournal{Name: "current-repository-baseline", Entries: currentRepositorySnapshot})
 	}
 	return journals
 }

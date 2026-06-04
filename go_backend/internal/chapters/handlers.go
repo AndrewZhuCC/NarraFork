@@ -1037,6 +1037,13 @@ func (h *Handler) composeInfo(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func writeContainerListFallback(w http.ResponseWriter, items []map[string]any, code, message string) {
+	w.Header().Set("X-Narrafork-Fallback", "true")
+	w.Header().Set("X-Narrafork-Fallback-Code", code)
+	w.Header().Set("X-Narrafork-Fallback-Reason", message)
+	httpx.WriteJSON(w, http.StatusOK, items)
+}
+
 func (h *Handler) containers(w http.ResponseWriter, r *http.Request) error {
 	chapterID := chi.URLParam(r, "id")
 	chapter, err := h.Service.Get(r.Context(), chapterID)
@@ -1055,28 +1062,28 @@ func (h *Handler) containers(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if commandVersion(r.Context(), "podman", "--version") == "" {
-		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "PODMAN_NOT_FOUND", "podman is not available; returning persisted container state"))
+		writeContainerListFallback(w, stored, "PODMAN_NOT_FOUND", "podman is not available; returning persisted container state")
 		return nil
 	}
 	cfg := containerConfigFrom(chapter.ContainerConfig)
 	composeFile := resolveComposeFilePath(cwd, cfg)
 	if composeFile == "" {
-		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "COMPOSE_FILE_NOT_FOUND", "compose file not found; returning persisted container state"))
+		writeContainerListFallback(w, stored, "COMPOSE_FILE_NOT_FOUND", "compose file not found; returning persisted container state")
 		return nil
 	}
 	cmd := composeCommandForFile(r.Context(), composeFile)
 	if len(cmd) == 0 {
-		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; returning persisted container state"))
+		writeContainerListFallback(w, stored, "PODMAN_COMPOSE_NOT_FOUND", "podman compose is not available; returning persisted container state")
 		return nil
 	}
 	proxyInfo, proxyUnsupported, proxyMessage := h.Service.proxyInfoForChapter(r.Context(), chapter)
 	if proxyUnsupported {
-		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "PROXY_BACKEND_UNAVAILABLE", proxyMessage))
+		writeContainerListFallback(w, stored, "PROXY_BACKEND_UNAVAILABLE", proxyMessage)
 		return nil
 	}
 	items, liveErr := h.Service.liveComposeContainerInstances(r.Context(), chapterID, cwd, cmd, nil, cfg, proxyInfo)
 	if liveErr != nil {
-		httpx.WriteJSON(w, http.StatusOK, containerRuntimeFallbackWithItems(stored, "CONTAINER_STATE_UNAVAILABLE", "live container state is unavailable; returning persisted container state"))
+		writeContainerListFallback(w, stored, "CONTAINER_STATE_UNAVAILABLE", "live container state is unavailable; returning persisted container state")
 		return nil
 	}
 	if err := h.Service.persistContainerInstances(r.Context(), chapterID, items); err != nil {

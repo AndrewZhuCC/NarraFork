@@ -928,6 +928,7 @@ function ProviderSectionContent({
 				onToggleHidden={dispatchers.toggleHidden}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
+				onMergeContextWindows={onServerContextWindowsMerge}
 				isProviderDirty={isNugProviderDirty}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}

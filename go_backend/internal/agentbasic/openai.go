@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"narrafork-go/internal/config"
@@ -42,6 +43,8 @@ type ToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	StreamStartedAt int64 `json:"-"`
+	OutputIndex     *int  `json:"-"`
 }
 
 type Provider struct {
@@ -1162,6 +1165,9 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 	}
 }
 
+var bashLongRunningThreshold = 60 * time.Second
+var bashLongRunningCheckInterval = time.Second
+
 func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	if strings.TrimSpace(command) == "" {
 		return "command is required"
@@ -1179,10 +1185,33 @@ func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	defer cancel()
 	cmd := exec.CommandContext(toolCtx, "bash", "-lc", command)
 	cmd.Dir = cwd
-	buf := &cappedBuffer{limit: 64 * 1024}
+	buf := &cappedBuffer{limit: 64 * 1024, onWrite: func(output string) { EmitToolRuntimeOutput(ctx, output) }}
 	cmd.Stdout = buf
 	cmd.Stderr = buf
+	started := time.Now()
+	longRunningDone := make(chan struct{})
+	if bashLongRunningThreshold > 0 && bashLongRunningCheckInterval > 0 {
+		go func() {
+			ticker := time.NewTicker(bashLongRunningCheckInterval)
+			defer ticker.Stop()
+			fired := false
+			for {
+				select {
+				case <-longRunningDone:
+					return
+				case <-toolCtx.Done():
+					return
+				case now := <-ticker.C:
+					if !fired && now.Sub(started) >= bashLongRunningThreshold {
+						fired = true
+						EmitToolRuntimeLongRunning(ctx, now.Sub(started))
+					}
+				}
+			}
+		}()
+	}
 	err := cmd.Run()
+	close(longRunningDone)
 	result := buf.String()
 	if buf.Truncated() {
 		result += "\n[truncated]"
@@ -1193,6 +1222,7 @@ func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 		}
 		result += "\n[exit error] " + err.Error()
 	}
+	EmitToolRuntimeOutput(ctx, result)
 	return result
 }
 
@@ -2492,31 +2522,60 @@ type cappedBuffer struct {
 	limit     int
 	buf       bytes.Buffer
 	truncated bool
+	onWrite   func(string)
+	mu        sync.Mutex
 }
 
 func (b *cappedBuffer) Write(p []byte) (int, error) {
+	var current string
+	b.mu.Lock()
 	if b.limit <= 0 {
 		b.truncated = true
+		current = b.buf.String()
+		b.mu.Unlock()
+		if b.onWrite != nil {
+			b.onWrite(current)
+		}
 		return len(p), nil
 	}
 	remaining := b.limit - b.buf.Len()
 	if remaining <= 0 {
 		b.truncated = true
+		current = b.buf.String()
+		b.mu.Unlock()
+		if b.onWrite != nil {
+			b.onWrite(current)
+		}
 		return len(p), nil
 	}
 	if len(p) > remaining {
 		_, _ = b.buf.Write(p[:remaining])
 		b.truncated = true
+		current = b.buf.String()
+		b.mu.Unlock()
+		if b.onWrite != nil {
+			b.onWrite(current)
+		}
 		return len(p), nil
 	}
-	return b.buf.Write(p)
+	_, err := b.buf.Write(p)
+	current = b.buf.String()
+	b.mu.Unlock()
+	if b.onWrite != nil {
+		b.onWrite(current)
+	}
+	return len(p), err
 }
 
 func (b *cappedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.buf.String()
 }
 
 func (b *cappedBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.truncated
 }
 

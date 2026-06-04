@@ -74,6 +74,60 @@ func TestNarratorBufferClientMessagesBroadcastBufferState(t *testing.T) {
 	}
 }
 
+func TestNarratorBufferLoadToolSlashUpdatesEnabledTools(t *testing.T) {
+	sqlDB := openNarratorWSDB(t)
+	ensureWSOptionalToolSchema(t, sqlDB)
+	insertWSOptionalToolNarrator(t, sqlDB, "nar_load", "[]")
+	hub := ws.NewHub()
+	hub.SetTerminalDB(sqlDB)
+
+	conn, cleanup := dialNarratorHub(t, hub)
+	defer cleanup()
+	subscribeNarrator(t, conn, "nar_load")
+	waitForNarratorSubscription(t, hub, conn, "nar_load")
+
+	if err := conn.WriteJSON(map[string]any{"type": "buffer_message", "narratorId": "nar_load", "text": "/load terminal"}); err != nil {
+		t.Fatalf("write load buffer_message: %v", err)
+	}
+	msg := readWSMessage(t, conn)
+	if msg["type"] != "message" {
+		t.Fatalf("expected display message, got %#v", msg)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "user_message" {
+		t.Fatalf("expected tool_loaded user_message, got %#v", msg)
+	}
+	assertWSNarratorEnabledTools(t, sqlDB, "nar_load", `["Terminal"]`)
+	assertWSBufferCount(t, sqlDB, "nar_load", 0)
+}
+
+func TestNarratorBufferUnloadToolSlashUpdatesEnabledTools(t *testing.T) {
+	sqlDB := openNarratorWSDB(t)
+	ensureWSOptionalToolSchema(t, sqlDB)
+	insertWSOptionalToolNarrator(t, sqlDB, "nar_unload", `["Terminal","Browser"]`)
+	hub := ws.NewHub()
+	hub.SetTerminalDB(sqlDB)
+
+	conn, cleanup := dialNarratorHub(t, hub)
+	defer cleanup()
+	subscribeNarrator(t, conn, "nar_unload")
+	waitForNarratorSubscription(t, hub, conn, "nar_unload")
+
+	if err := conn.WriteJSON(map[string]any{"type": "buffer_message", "narratorId": "nar_unload", "text": "/unload terminal"}); err != nil {
+		t.Fatalf("write unload buffer_message: %v", err)
+	}
+	msg := readWSMessage(t, conn)
+	if msg["type"] != "message" {
+		t.Fatalf("expected display message, got %#v", msg)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "user_message" {
+		t.Fatalf("expected tool_unloaded user_message, got %#v", msg)
+	}
+	assertWSNarratorEnabledTools(t, sqlDB, "nar_unload", `["Browser"]`)
+	assertWSBufferCount(t, sqlDB, "nar_unload", 0)
+}
+
 func TestChapterTerminalExitBroadcastsCountToChapterNarrators(t *testing.T) {
 	sqlDB := openNarratorWSDB(t)
 	_, err := sqlDB.Exec(`
@@ -259,6 +313,67 @@ CREATE TABLE narrator_tool_calls (
 		t.Fatalf("create tables: %v", err)
 	}
 	return sqlDB
+}
+
+func ensureWSOptionalToolSchema(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	_, err := sqlDB.Exec(`
+CREATE TABLE narrators (
+	id TEXT PRIMARY KEY,
+	enabled_tools TEXT,
+	traits TEXT DEFAULT '[]',
+	message_count INTEGER DEFAULT 0,
+	message_version INTEGER DEFAULT 0,
+	last_message_at TEXT,
+	updated_at TEXT
+);
+CREATE TABLE narrator_messages (
+	id TEXT PRIMARY KEY,
+	narrator_id TEXT,
+	role TEXT,
+	content_json TEXT,
+	content_text TEXT,
+	created_at TEXT
+);
+CREATE TABLE narrator_message_refs (
+	id TEXT PRIMARY KEY,
+	narrator_id TEXT,
+	message_id TEXT,
+	seq INTEGER,
+	is_compact INTEGER DEFAULT 0
+);`)
+	if err != nil {
+		t.Fatalf("create optional tool ws schema: %v", err)
+	}
+}
+
+func insertWSOptionalToolNarrator(t *testing.T, sqlDB *sql.DB, narratorID, enabledTools string) {
+	t.Helper()
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (id, enabled_tools, traits, message_count, message_version, updated_at) VALUES (?, ?, '[]', 0, 0, 'now')`, narratorID, enabledTools); err != nil {
+		t.Fatalf("insert optional tool narrator: %v", err)
+	}
+}
+
+func assertWSNarratorEnabledTools(t *testing.T, sqlDB *sql.DB, narratorID, want string) {
+	t.Helper()
+	var got string
+	if err := sqlDB.QueryRow(`SELECT enabled_tools FROM narrators WHERE id = ?`, narratorID).Scan(&got); err != nil {
+		t.Fatalf("query enabled tools: %v", err)
+	}
+	if got != want {
+		t.Fatalf("enabled_tools = %q, want %q", got, want)
+	}
+}
+
+func assertWSBufferCount(t *testing.T, sqlDB *sql.DB, narratorID string, want int) {
+	t.Helper()
+	var got int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID).Scan(&got); err != nil {
+		t.Fatalf("query buffer count: %v", err)
+	}
+	if got != want {
+		t.Fatalf("buffer count = %d, want %d", got, want)
+	}
 }
 
 func wsMessageItems(t *testing.T, msg map[string]any, key string) []map[string]any {

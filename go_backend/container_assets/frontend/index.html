@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<!--
+			INTENTIONAL: maximum-scale=1.0, user-scalable=no
+			NarraFork is a developer-facing PWA / desktop tool, NOT a public-facing website.
+			Pinch-to-zoom conflicts with the ruler canvas (which has its own zoom/pan),
+			causes layout glitches in the terminal emulator, and breaks drag interactions.
+			CSS touch-action:manipulation only prevents double-tap zoom — it does NOT
+			prevent pinch-to-zoom, which is the actual problem here.
+			This is a deliberate, permanent decision. Do NOT remove or "fix" this.
+		-->
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+		<meta name="theme-color" content="#1a1b1e" media="(prefers-color-scheme: dark)" />
+		<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+		<meta name="apple-mobile-web-app-capable" content="yes" />
+		<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+		<meta name="mobile-web-app-capable" content="yes" />
+		<meta name="description" content="AI-powered collaborative programming with narrative forking" />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="apple-touch-icon" href="/apple-touch-icon-180x180.png" />
+		<title>NarraFork</title>
+		<script>
+			var d = localStorage.getItem("mantine-color-scheme-value");
+			var m;
+			var o = localStorage.getItem("narrafork_oled") === "true";
+			var tc;
+			try {
+				if (d === "light" || d === "dark") {
+					m = d;
+				} else {
+					m = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+				}
+				document.documentElement.setAttribute("data-mantine-color-scheme", m);
+				tc = m === "dark" ? (o ? "#000000" : "#1a1b1e") : "#ffffff";
+				document.querySelectorAll('meta[name="theme-color"]').forEach((el) => {
+					el.setAttribute("content", tc);
+				});
+			} catch (_e) {}
+		</script>
+		<script type="module" crossorigin src="/assets/index-NEuFTu6V.js"></script>
+		<link rel="modulepreload" crossorigin href="/assets/defineProperty-Cj_dj6Mi.js">
+		<link rel="modulepreload" crossorigin href="/assets/rolldown-runtime-BYbx6iT9.js">
+		<link rel="modulepreload" crossorigin href="/assets/preload-helper-B5tYg1W2.js">
+		<link rel="modulepreload" crossorigin href="/assets/jsx-runtime-B6ABtYIT.js">
+		<link rel="modulepreload" crossorigin href="/assets/DirectionProvider-ByY3_EfP.js">
+		<link rel="modulepreload" crossorigin href="/assets/search-utils-C2droYaK.js">
+		<link rel="modulepreload" crossorigin href="/assets/narrator-list-utils-CnkPIr4f.js">
+		<link rel="modulepreload" crossorigin href="/assets/client-CZQmMb5L.js">
+		<link rel="modulepreload" crossorigin href="/assets/api-033Bd-VI.js">
+		<link rel="modulepreload" crossorigin href="/assets/classPrivateMethodInitSpec-B-VbLFPT.js">
+		<link rel="modulepreload" crossorigin href="/assets/QueryClientProvider-BUAeXWlf.js">
+		<link rel="modulepreload" crossorigin href="/assets/useQuery-BNWR0zOW.js">
+		<link rel="modulepreload" crossorigin href="/assets/usePlatform-DbrSBPQy.js">
+		<link rel="modulepreload" crossorigin href="/assets/shim-B7j0D9PT.js">
+		<link rel="modulepreload" crossorigin href="/assets/useTranslation-BLm0uO1N.js">
+		<link rel="modulepreload" crossorigin href="/assets/i18n-C5H1m5Qe.js">
+		<link rel="modulepreload" crossorigin href="/assets/polymorphic-factory-CZrU2aLo.js">
+		<link rel="modulepreload" crossorigin href="/assets/UnstyledButton-BN3KpKR_.js">
+		<link rel="modulepreload" crossorigin href="/assets/notifications.store-DoCmciv5.js">
+		<link rel="modulepreload" crossorigin href="/assets/useMutation-DtZgBwTj.js">
+		<link rel="modulepreload" crossorigin href="/assets/useRecentTabs-CH3FCC2H.js">
+		<link rel="modulepreload" crossorigin href="/assets/useUserPreferences-Bfup07L_.js">
+		<link rel="modulepreload" crossorigin href="/assets/ws-status-Cj7_uSug.js">
+		<link rel="modulepreload" crossorigin href="/assets/react-dom-Do5vwpI9.js">
+		<link rel="modulepreload" crossorigin href="/assets/floating-ui.react-DPp2yLCO.js">
+		<link rel="modulepreload" crossorigin href="/assets/get-style-object-CdJU1eJ3.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-media-query-bGEkKAqB.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-reduced-motion-CZy_HtLR.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-merged-ref-DU4JdP8d.js">
+		<link rel="modulepreload" crossorigin href="/assets/Collapse-ByxzlExR.js">
+		<link rel="modulepreload" crossorigin href="/assets/create-safe-context-Vng9nTCt.js">
+		<link rel="modulepreload" crossorigin href="/assets/create-scoped-keydown-handler-D1SSZmnl.js">
+		<link rel="modulepreload" crossorigin href="/assets/get-safe-id-BvZiO8jQ.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-uncontrolled-By-AxRZL.js">
+		<link rel="modulepreload" crossorigin href="/assets/Accordion-CE9ZBmLe.js">
+		<link rel="modulepreload" crossorigin href="/assets/Loader-D7sHUN_8.js">
+		<link rel="modulepreload" crossorigin href="/assets/Transition-DdOkS6jQ.js">
+		<link rel="modulepreload" crossorigin href="/assets/Button-B31DQSPE.js">
+		<link rel="modulepreload" crossorigin href="/assets/CloseButton-DzFSURYn.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-floating-auto-update-Bxy4xZ5o.js">
+		<link rel="modulepreload" crossorigin href="/assets/Group-BLm3FcgS.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-resolved-styles-api-Bkb6cgwg.js">
+		<link rel="modulepreload" crossorigin href="/assets/create-optional-context-WI6PrSBV.js">
+		<link rel="modulepreload" crossorigin href="/assets/Input-CT07wRT4.js">
+		<link rel="modulepreload" crossorigin href="/assets/InputBase-Dcto0Slk.js">
+		<link rel="modulepreload" crossorigin href="/assets/OptionalPortal-DHM8D95X.js">
+		<link rel="modulepreload" crossorigin href="/assets/is-element-C2e9W7mA.js">
+		<link rel="modulepreload" crossorigin href="/assets/FocusTrap-DwUg4taq.js">
+		<link rel="modulepreload" crossorigin href="/assets/Paper-BMS2Mqe2.js">
+		<link rel="modulepreload" crossorigin href="/assets/ScrollArea-DDuijA-f.js">
+		<link rel="modulepreload" crossorigin href="/assets/Modal-5dmmJGdo.js">
+		<link rel="modulepreload" crossorigin href="/assets/Stack-CKKKPJ5L.js">
+		<link rel="modulepreload" crossorigin href="/assets/Text-C5W7zxnY.js">
+		<link rel="modulepreload" crossorigin href="/assets/noop-DSZ-O0-w.js">
+		<link rel="modulepreload" crossorigin href="/assets/use-mantine-color-scheme-CJMEpy3d.js">
+		<link rel="modulepreload" crossorigin href="/assets/createReactComponent-CJTJT963.js">
+		<link rel="modulepreload" crossorigin href="/assets/useRouter-DPsf5C3U.js">
+		<link rel="modulepreload" crossorigin href="/assets/utils-BuaRSqUi.js">
+		<link rel="modulepreload" crossorigin href="/assets/invariant-C4RTLwN9.js">
+		<link rel="modulepreload" crossorigin href="/assets/useStore-CgQgRZXk.js">
+		<link rel="modulepreload" crossorigin href="/assets/link-DsjWU4yx.js">
+		<link rel="modulepreload" crossorigin href="/assets/matchContext-DJ4IE5t4.js">
+		<link rel="modulepreload" crossorigin href="/assets/useSearch-DgsSuLYP.js">
+		<link rel="modulepreload" crossorigin href="/assets/useNavigate-C1Gk_jX5.js">
+		<link rel="modulepreload" crossorigin href="/assets/redirect-DMIRDiX0.js">
+		<link rel="modulepreload" crossorigin href="/assets/lazyRouteComponent-fGTg031x.js">
+		<link rel="stylesheet" crossorigin href="/assets/index-DnBI_3AY.css">
+	<link rel="manifest" href="/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
+	<body>
+		<div id="root"></div>
+	</body>
+</html>

@@ -1,0 +1,1 @@
+var e=`探索组`,t=`创建探索组`,n=`选定方案`,r=`放弃探索`,i={active:`进行中`,decided:`已决策`,abandoned:`已放弃`},a={title:e,create:t,decide:n,abandon:r,status:i};export{r as abandon,t as create,n as decide,a as default,i as status,e as title};

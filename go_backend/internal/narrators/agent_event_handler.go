@@ -123,6 +123,9 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			return err
 		}
 		block := map[string]any{"type": "tool_use", "id": event.ToolUseID, "name": event.ToolName, "input": event.Input}
+		if event.StreamStartedAt != 0 {
+			block["streamStartedAt"] = event.StreamStartedAt
+		}
 		upsertToolUseBlock(state, block)
 		if err := s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks); err != nil {
 			return err
@@ -610,6 +613,30 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	if event.DurationMs != 0 {
 		payload["durationMs"] = event.DurationMs
 	}
+	if event.Elapsed != 0 {
+		payload["elapsed"] = event.Elapsed
+	}
+	if event.StreamStartedAt != 0 {
+		payload["streamStartedAt"] = event.StreamStartedAt
+	}
+	if event.PermissionStartedAt != 0 {
+		payload["permissionStartedAt"] = event.PermissionStartedAt
+	}
+	if event.ExecutionStartedAt != 0 {
+		payload["executionStartedAt"] = event.ExecutionStartedAt
+	}
+	if event.CompletedAt != 0 {
+		payload["completedAt"] = event.CompletedAt
+	}
+	if event.UpdatedInput != nil {
+		payload["updatedInput"] = event.UpdatedInput
+	}
+	if event.BrokenInputOverride != nil {
+		payload["brokenInputOverride"] = event.BrokenInputOverride
+	}
+	if strings.TrimSpace(event.ParentToolUseID) != "" {
+		payload["parentToolUseId"] = strings.TrimSpace(event.ParentToolUseID)
+	}
 	if event.Streaming != nil {
 		payload["inputCharsTotal"] = event.Streaming.InputCharsTotal
 		if event.Streaming.ContentCharsReceived != 0 {
@@ -955,7 +982,14 @@ func contentBlockToMap(block *agentbasic.ContentBlock) map[string]any {
 	}
 	switch block.Type {
 	case "tool_use":
-		return map[string]any{"type": "tool_use", "id": block.ToolUseID, "name": block.ToolName, "input": block.Input}
+		m := map[string]any{"type": "tool_use", "id": block.ToolUseID, "name": block.ToolName, "input": block.Input}
+		if block.StreamStartedAt != 0 {
+			m["streamStartedAt"] = block.StreamStartedAt
+		}
+		if block.OutputIndex != nil {
+			m["outputIndex"] = *block.OutputIndex
+		}
+		return m
 	case "tool_result":
 		return map[string]any{"type": "tool_result", "tool_use_id": block.ToolUseID, "content": block.Output, "is_error": block.IsError}
 	case "reasoning":
@@ -1012,7 +1046,16 @@ func (s *Service) recordRunningToolCall(ctx context.Context, narratorID, message
 		isBackground = 1
 	}
 	now := db.NowISO()
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, execution_started_at, is_background, created_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)`, id.New(), narratorID, messageID, event.ToolUseID, event.ToolName, string(inputJSON), now, isBackground, now)
+	streamStartedAt := any(nil)
+	if event.StreamStartedAt != 0 {
+		streamStartedAt = time.UnixMilli(event.StreamStartedAt).UTC().Format(time.RFC3339Nano)
+	}
+	columns, colErr := db.TableColumnSet(ctx, s.DB, "narrator_tool_calls")
+	if colErr == nil && columns["stream_started_at"] {
+		_, err := s.DB.ExecContext(ctx, `INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, stream_started_at, execution_started_at, is_background, created_at) SELECT ?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ?)`, id.New(), narratorID, messageID, event.ToolUseID, event.ToolName, string(inputJSON), streamStartedAt, now, isBackground, now, narratorID, event.ToolUseID)
+		return err
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, input_json, status, execution_started_at, is_background, created_at) SELECT ?, ?, ?, ?, ?, ?, 'running', ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ?)`, id.New(), narratorID, messageID, event.ToolUseID, event.ToolName, string(inputJSON), now, isBackground, now, narratorID, event.ToolUseID)
 	return err
 }
 
@@ -1028,7 +1071,14 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 	outputJSON, _ := json.Marshal(map[string]any{"output": run.Output})
 	inputJSON := toolRunArgumentsInputJSON(run.Arguments)
 	now := db.NowISO()
-	res, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, input_json = COALESCE(?, input_json), output_json = ?, execution_started_at = COALESCE(execution_started_at, ?), completed_at = ?, error_message = ?, result_message_id = ? WHERE narrator_id = ? AND tool_use_id = ?`, status, inputJSON, string(outputJSON), now, now, nullableTrimmedString(run.Error), *state.draftMessageID, state.narratorID, run.ID)
+	sets := []string{"status = ?", "input_json = COALESCE(?, input_json)", "output_json = ?", "execution_started_at = COALESCE(execution_started_at, ?)", "completed_at = ?", "error_message = ?", "result_message_id = ?"}
+	args := []any{status, inputJSON, string(outputJSON), now, now, nullableTrimmedString(run.Error), *state.draftMessageID}
+	if columns, colErr := db.TableColumnSet(ctx, s.DB, "narrator_tool_calls"); colErr == nil && columns["duration_ms"] && event.DurationMs > 0 {
+		sets = append(sets, "duration_ms = ?")
+		args = append(args, event.DurationMs)
+	}
+	args = append(args, state.narratorID, run.ID)
+	res, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET `+strings.Join(sets, ", ")+` WHERE narrator_id = ? AND tool_use_id = ?`, args...)
 	if err != nil {
 		return err
 	}
@@ -1039,6 +1089,7 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 		}
 		return s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars)
 	}
+	_ = s.ensureGoalReflectionMetadata(ctx, state.narratorID, run)
 	var toolCallID sql.NullString
 	if err := s.DB.QueryRowContext(ctx, `SELECT id FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, state.narratorID, run.ID).Scan(&toolCallID); err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -1049,6 +1100,42 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 		return err
 	}
 	return s.persistFileSnapshot(ctx, state.narratorID, *state.draftMessageID, sqlNullString(toolCallID), run)
+}
+
+func (s *Service) ensureGoalReflectionMetadata(ctx context.Context, narratorID string, run agentbasic.ToolRun) error {
+	if !strings.EqualFold(strings.TrimSpace(run.Name), "UpdateGoal") || strings.TrimSpace(run.ID) == "" {
+		return nil
+	}
+	var suggestions, reason sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT permission_suggestions, permission_decision_reason FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, narratorID, run.ID).Scan(&suggestions, &reason); err != nil {
+		return nil
+	}
+	if strings.TrimSpace(suggestions.String) != "" && strings.TrimSpace(reason.String) != "" {
+		return nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(run.Output), &payload); err != nil {
+		return nil
+	}
+	input := map[string]any{}
+	_ = json.Unmarshal([]byte(run.Arguments), &input)
+	status := "confirmed"
+	if strings.TrimSpace(stringFromAny(payload["error"])) != "" || strings.TrimSpace(run.Error) != "" {
+		status = "cancelled"
+	}
+	nextSteps := strings.TrimSpace(stringFromAny(payload["nextSteps"]))
+	reasonText := firstNonEmptyString(
+		strings.TrimSpace(stringFromAny(payload["reflection"])),
+		strings.TrimSpace(stringFromAny(payload["completionEvidence"])),
+		strings.TrimSpace(stringFromAny(payload["feedback"])),
+		strings.TrimSpace(stringFromAny(payload["error"])),
+		strings.TrimSpace(run.Error),
+	)
+	message := goalReflectionStatusReason(status, reasonText, nextSteps)
+	meta := &goalReflectionContext{ToolUseID: run.ID, ToolName: run.Name, InputJSON: input}
+	suggestionsJSON, _ := json.Marshal(goalReflectionSuggestions(meta, status, reasonText, nextSteps))
+	_, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET permission_decision_reason = CASE WHEN permission_decision_reason IS NULL OR TRIM(permission_decision_reason) = '' THEN ? ELSE permission_decision_reason END, permission_suggestions = CASE WHEN permission_suggestions IS NULL OR TRIM(permission_suggestions) = '' THEN ? ELSE permission_suggestions END WHERE narrator_id = ? AND tool_use_id = ?`, message, string(suggestionsJSON), narratorID, run.ID)
+	return err
 }
 
 func toolRunArgumentsInputJSON(raw string) any {

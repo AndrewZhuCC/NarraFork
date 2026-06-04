@@ -418,6 +418,10 @@ func handleAnthropicBlockDelta(ctx context.Context, out chan<- StreamEvent, bloc
 		}
 		block.Arguments += delta.PartialJSON
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ToolUseChunk: &ToolUseChunk{ToolUseID: block.ID, Name: block.Name, Input: delta.PartialJSON, OutputIndex: &block.Index, InputCharsTotal: len(block.Arguments)}}})
+		if !block.Stopped && isParsableJSON(block.Arguments) {
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ToolUseChunk: &ToolUseChunk{ToolUseID: block.ID, Name: block.Name, Stop: true, OutputIndex: &block.Index, InputCharsTotal: len(block.Arguments)}}})
+			block.Stopped = true
+		}
 	}
 }
 

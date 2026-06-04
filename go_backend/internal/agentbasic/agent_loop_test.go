@@ -65,6 +65,53 @@ func (a *scriptedAdapter) PushAssistantTurn(history *BuiltHistory, text string, 
 	history.History = append(history.History, map[string]any{"role": "assistant", "content": text, "toolUses": toolUses})
 }
 
+type waitAfterToolAdapter struct {
+	done           <-chan struct{}
+	lastToolResult []any
+}
+
+func (a *waitAfterToolAdapter) ProviderName() string                { return "fake" }
+func (a *waitAfterToolAdapter) FormatTools(string) []map[string]any { return nil }
+func (a *waitAfterToolAdapter) BuildHistory(messages []Message, _ string, _ string) (BuiltHistory, error) {
+	history := make([]any, 0, len(messages))
+	for _, message := range messages {
+		history = append(history, message)
+	}
+	return BuiltHistory{History: history}, nil
+}
+func (a *waitAfterToolAdapter) InjectSystemPrompt(*BuiltHistory, string, string, string) {}
+func (a *waitAfterToolAdapter) Chat(ctx context.Context, params ChatParams) (<-chan StreamEvent, error) {
+	ch := make(chan StreamEvent)
+	go func() {
+		defer close(ch)
+		select {
+		case <-ctx.Done():
+			return
+		case ch <- StreamEvent{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: "read-early", Name: "Read", Input: `{"file_path":"a.txt"}`, Stop: true}}}:
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-a.done:
+		}
+		select {
+		case <-ctx.Done():
+		case ch <- StreamEvent{Parsed: ParsedStreamEvent{Text: "still streaming"}}:
+		}
+	}()
+	return ch, nil
+}
+func (a *waitAfterToolAdapter) FormatToolResult(toolUseID string, output string, isError bool) any {
+	return map[string]any{"type": "tool_result", "tool_use_id": toolUseID, "content": output, "is_error": isError}
+}
+func (a *waitAfterToolAdapter) PushUserTurn(history *BuiltHistory, content string, toolResults []any) {
+	a.lastToolResult = append([]any(nil), toolResults...)
+	history.History = append(history.History, map[string]any{"role": "user", "content": toolResults, "text": content})
+}
+func (a *waitAfterToolAdapter) PushAssistantTurn(history *BuiltHistory, text string, toolUses []ToolCall, rawContent any) {
+	history.History = append(history.History, map[string]any{"role": "assistant", "content": text, "toolUses": toolUses})
+}
+
 func collectEvents(stream <-chan AgentEvent) []AgentEvent {
 	events := []AgentEvent{}
 	for event := range stream {
@@ -491,5 +538,109 @@ func TestRunAgentLoopEmptyResponseRetriesThenInvalidState(t *testing.T) {
 	events := collectEvents(stream)
 	if eventTypeCount(events, "retrying") != 1 || events[len(events)-1].Type != "invalid_state" {
 		t.Fatalf("expected retrying then invalid_state, got %#v", eventTypes(events))
+	}
+}
+
+func TestRunAgentLoopStreamingToolChunksExtractFields(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{
+			{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: "write-1", Name: "Write", Input: `{"file_path":"notes.txt","content":"hel`}}},
+			{Parsed: ParsedStreamEvent{ToolUseChunk: &ToolUseChunk{ToolUseID: "write-1", Input: `lo"}`, Stop: true}}},
+		},
+		{{Parsed: ParsedStreamEvent{Text: "done"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "write"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "ok", Status: "completed"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	var sawPath, sawField bool
+	for _, event := range events {
+		if event.Type != "tool_use_chunk" || event.Streaming == nil {
+			continue
+		}
+		if event.Streaming.ExtractedFilePath == "notes.txt" && event.Streaming.ExtractedFields["file_path"] == "notes.txt" {
+			sawPath = true
+		}
+		if event.Streaming.StreamingFieldName == "content" && strings.Contains(event.Streaming.StreamingFieldDelta, "hel") {
+			sawField = true
+		}
+	}
+	if !sawPath || !sawField {
+		t.Fatalf("expected extracted path and streaming content field, events=%#v", events)
+	}
+}
+
+func TestRunAgentLoopDrainsEarlyToolResultBeforeAssistantMessage(t *testing.T) {
+	executed := make(chan struct{})
+	adapter := &waitAfterToolAdapter{done: executed}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "read"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithMaxTurns(1),
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				close(executed)
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "early output", Status: "completed"}, nil
+			}),
+		),
+	)
+
+	events := collectEvents(stream)
+	resultIndex, assistantIndex := -1, -1
+	for i, event := range events {
+		if event.Type == "tool_result" && event.ToolUseID == "read-early" && resultIndex == -1 {
+			resultIndex = i
+		}
+		if event.Type == "assistant_message" && assistantIndex == -1 {
+			assistantIndex = i
+		}
+	}
+	if resultIndex == -1 || assistantIndex == -1 || resultIndex > assistantIndex {
+		t.Fatalf("expected early tool_result before assistant_message, got %v", eventTypes(events))
+	}
+	if eventTypeCount(events, "tool_result") != 1 {
+		t.Fatalf("expected exactly one tool_result, got %v", eventTypes(events))
+	}
+}
+
+func TestRunAgentLoopEmitsToolRuntimeProgressOutputAndLongRunning(t *testing.T) {
+	oldProgress := toolProgressInterval
+	toolProgressInterval = time.Millisecond
+	defer func() { toolProgressInterval = oldProgress }()
+	call := newFunctionToolCall("runtime-1", "Read", `{"file_path":"a.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "done"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "runtime"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				EmitToolRuntimeOutput(ctx, "partial output")
+				EmitToolRuntimeLongRunning(ctx, 61*time.Second)
+				time.Sleep(30 * time.Millisecond)
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "final output", Status: "completed"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	if eventTypeCount(events, "tool_output") == 0 || eventTypeCount(events, "tool_long_running") == 0 || eventTypeCount(events, "tool_progress") == 0 {
+		t.Fatalf("expected runtime output/long-running/progress events, got %v", eventTypes(events))
 	}
 }

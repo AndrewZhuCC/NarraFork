@@ -1,0 +1,1 @@
+import{t as e}from"./rolldown-runtime-BYbx6iT9.js";import{t}from"./csharp-BCtAEpKf.js";import{t as n}from"./t4-templating-BYj82C9A.js";var r=e(((e,r)=>{var i=n(),a=t();r.exports=o,o.displayName=`t4Cs`,o.aliases=[];function o(e){e.register(i),e.register(a),e.languages.t4=e.languages[`t4-cs`]=e.languages[`t4-templating`].createT4(`csharp`)}}));export{r as t};

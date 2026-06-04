@@ -776,6 +776,163 @@ func TestPostMessageLoadSkillSlashInjectsSkillContent(t *testing.T) {
 	}
 }
 
+func TestPostMessageLoadToolSlashPersistsEnabledTool(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/load terminal"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected load tool 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body := decodeNarratorHandlerBody(t, w)
+	if body["toolName"] != "Terminal" || body["loaded"] != true || body["alreadyLoaded"] != false {
+		t.Fatalf("unexpected load tool response: %#v", body)
+	}
+
+	var enabledTools string
+	if err := sqlDB.QueryRow(`SELECT enabled_tools FROM narrators WHERE id = ?`, narratorID).Scan(&enabledTools); err != nil {
+		t.Fatalf("load enabled tools: %v", err)
+	}
+	if enabledTools != `["Terminal"]` {
+		t.Fatalf("enabled_tools = %q, want Terminal", enabledTools)
+	}
+	var status string
+	if err := sqlDB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status); err != nil {
+		t.Fatalf("load narrator status: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("/load should not start a model run, status=%q", status)
+	}
+
+	var displayText, toolContent string
+	if err := sqlDB.QueryRow(`SELECT content_text FROM narrator_messages WHERE narrator_id = ? AND role = 'disp' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&displayText); err != nil {
+		t.Fatalf("load display message: %v", err)
+	}
+	if !strings.Contains(displayText, "Tool loaded: Terminal") {
+		t.Fatalf("unexpected display message: %q", displayText)
+	}
+	if err := sqlDB.QueryRow(`SELECT content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&toolContent); err != nil {
+		t.Fatalf("load tool_loaded message: %v", err)
+	}
+	if !strings.Contains(toolContent, `"type":"tool_loaded"`) || !strings.Contains(toolContent, `"toolName":"Terminal"`) {
+		t.Fatalf("tool_loaded message missing: %s", toolContent)
+	}
+}
+
+func TestPostMessageLoadToolSlashAlreadyLoadedDoesNotDuplicateToolMessage(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	first := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/load terminal"})
+	if first.Code != http.StatusOK {
+		t.Fatalf("expected first load 200, got %d body=%s", first.Code, first.Body.String())
+	}
+	second := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/load terminal"})
+	if second.Code != http.StatusOK {
+		t.Fatalf("expected second load 200, got %d body=%s", second.Code, second.Body.String())
+	}
+	body := decodeNarratorHandlerBody(t, second)
+	if body["toolName"] != "Terminal" || body["loaded"] != true || body["alreadyLoaded"] != true {
+		t.Fatalf("unexpected already-loaded response: %#v", body)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND role = 'user' AND content_json LIKE '%tool_loaded%'`, narratorID).Scan(&count); err != nil {
+		t.Fatalf("count tool_loaded messages: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("already-loaded command should not duplicate model-visible message, count=%d", count)
+	}
+}
+
+func TestPostMessageUnloadToolSlashPersistsRemoval(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	if _, err := sqlDB.Exec(`UPDATE narrators SET enabled_tools = '["Terminal","Browser"]' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("seed enabled tools: %v", err)
+	}
+
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/unload terminal"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected unload tool 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body := decodeNarratorHandlerBody(t, w)
+	if body["toolName"] != "Terminal" || body["unloaded"] != true || body["notLoaded"] != false {
+		t.Fatalf("unexpected unload tool response: %#v", body)
+	}
+	var enabledTools string
+	if err := sqlDB.QueryRow(`SELECT enabled_tools FROM narrators WHERE id = ?`, narratorID).Scan(&enabledTools); err != nil {
+		t.Fatalf("load enabled tools: %v", err)
+	}
+	if enabledTools != `["Browser"]` {
+		t.Fatalf("enabled_tools = %q, want Browser only", enabledTools)
+	}
+	var toolContent string
+	if err := sqlDB.QueryRow(`SELECT content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&toolContent); err != nil {
+		t.Fatalf("load tool_unloaded message: %v", err)
+	}
+	if !strings.Contains(toolContent, `"type":"tool_unloaded"`) || !strings.Contains(toolContent, `"toolName":"Terminal"`) {
+		t.Fatalf("tool_unloaded message missing: %s", toolContent)
+	}
+}
+
+func TestPostMessageLoadToolSlashUnknownToolIsHandledLocally(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/load nope"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected unknown load 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body := decodeNarratorHandlerBody(t, w)
+	if body["toolName"] != "nope" || body["loaded"] != false || body["alreadyLoaded"] != false {
+		t.Fatalf("unexpected unknown-tool response: %#v", body)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND role = 'user'`, narratorID).Scan(&count); err != nil {
+		t.Fatalf("count user messages: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("unknown /load should not send a model-visible user message, count=%d", count)
+	}
+	var displayText string
+	if err := sqlDB.QueryRow(`SELECT content_text FROM narrator_messages WHERE narrator_id = ? AND role = 'disp' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&displayText); err != nil {
+		t.Fatalf("load display message: %v", err)
+	}
+	if !strings.Contains(displayText, "Unknown tool: nope") || !strings.Contains(displayText, "terminal") {
+		t.Fatalf("unexpected unknown-tool display message: %q", displayText)
+	}
+}
+
+func TestPostMessageLoadToolSlashRespectsDisabledToolTrait(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	traits, _ := json.Marshal([]string{disabledToolsTrait([]string{"Terminal"})})
+	if _, err := sqlDB.Exec(`UPDATE narrators SET traits = ? WHERE id = ?`, string(traits), narratorID); err != nil {
+		t.Fatalf("seed traits: %v", err)
+	}
+
+	w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/messages", map[string]any{"message": "/load terminal"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected disabled load 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	body := decodeNarratorHandlerBody(t, w)
+	if body["toolName"] != "Terminal" || body["loaded"] != false || body["alreadyLoaded"] != false {
+		t.Fatalf("unexpected disabled-tool response: %#v", body)
+	}
+	var enabledTools sql.NullString
+	if err := sqlDB.QueryRow(`SELECT enabled_tools FROM narrators WHERE id = ?`, narratorID).Scan(&enabledTools); err != nil {
+		t.Fatalf("load enabled tools: %v", err)
+	}
+	if enabledTools.Valid && strings.TrimSpace(enabledTools.String) != "" {
+		t.Fatalf("disabled tool should not be persisted, enabled_tools=%q", enabledTools.String)
+	}
+}
+
 func TestPostMessageCustomCommandPreBashAndModelOverride(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

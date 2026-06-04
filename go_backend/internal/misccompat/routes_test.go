@@ -575,6 +575,7 @@ func openDatabaseCleanupNarratorTestDB(t *testing.T) *sql.DB {
 		)`,
 		`CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER)`,
 		`CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT)`,
+		`CREATE TABLE background_tasks (id TEXT PRIMARY KEY, parent_narrator_id TEXT, subagent_narrator_id TEXT, status TEXT)`,
 		`CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, raw_dump_json TEXT, created_at TEXT)`,
 	} {
 		if _, err := database.Exec(stmt); err != nil {

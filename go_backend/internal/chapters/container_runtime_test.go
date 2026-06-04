@@ -853,6 +853,36 @@ func TestPodmanInstallDoesNotReportSuccessWhenCommandDoesNotInstall(t *testing.T
 	}
 }
 
+func TestContainerListReturnsArrayWhenPodmanMissing(t *testing.T) {
+	database := openContainerRuntimeDB(t)
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "compose.yml"), []byte("services:\n  web:\n    image: test\n"), 0o644); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	insertContainerRuntimeProjectAndChapter(t, database, worktree, `{}`, "")
+	if _, err := database.Exec(`INSERT INTO container_instances (id, chapter_id, service_name, status, container_port, created_at, updated_at) VALUES ('container-1', 'c1', 'web', 'running', 8080, 'now', 'now')`); err != nil {
+		t.Fatalf("insert persisted container: %v", err)
+	}
+	t.Setenv("PATH", t.TempDir())
+
+	handler := NewHandler(&Service{DB: database})
+	recorder := httptest.NewRecorder()
+	newChapterRouter(handler).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/c1/containers", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("X-Narrafork-Fallback-Code") != "PODMAN_NOT_FOUND" {
+		t.Fatalf("fallback header = %q", recorder.Header().Get("X-Narrafork-Fallback-Code"))
+	}
+	var body []map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode array body: %v; body=%s", err, recorder.Body.String())
+	}
+	if len(body) != 1 || body[0]["serviceName"] != "web" || body[0]["status"] != "running" {
+		t.Fatalf("container list body = %#v", body)
+	}
+}
+
 func TestContainerActionReturnsExplicitFallbackWhenPodmanMissing(t *testing.T) {
 	database := openContainerRuntimeDB(t)
 	worktree := t.TempDir()

@@ -1,0 +1,1 @@
+import{t as e}from"./rolldown-runtime-BYbx6iT9.js";var t=e(((e,t)=>{function n(e){return{name:`VBScript in HTML`,subLanguage:`xml`,contains:[{begin:`<%`,end:`%>`,subLanguage:`vbscript`}]}}t.exports=n}));export{t};

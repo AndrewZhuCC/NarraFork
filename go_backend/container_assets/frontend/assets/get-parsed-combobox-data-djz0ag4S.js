@@ -1,0 +1,1 @@
+function e(t){return typeof t==`string`?{value:t,label:t}:`value`in t&&!(`label`in t)?{value:t.value,label:t.value,disabled:t.disabled}:typeof t==`number`?{value:t.toString(),label:t.toString()}:`group`in t?{group:t.group,items:t.items.map(t=>e(t))}:t}function t(t){return t?t.map(t=>e(t)):[]}export{t};

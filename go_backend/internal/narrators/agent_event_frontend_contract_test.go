@@ -46,6 +46,42 @@ func TestAgentEventBroadcastsFrontendUseNarratorWSFields(t *testing.T) {
 		MaxRetries: 5,
 		DelayMs:    750,
 	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:            "tool_call",
+		ToolUseID:       "tool-1",
+		ToolName:        "Bash",
+		Input:           map[string]any{"command": "go test ./..."},
+		StreamStartedAt: int64(1770000000000),
+		ParentToolUseID: "agent-1",
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:      "tool_use_chunk",
+		ToolUseID: "tool-1",
+		ToolName:  "Bash",
+		Streaming: &agentbasic.ToolUseChunk{
+			ToolUseID:            "tool-1",
+			Name:                 "Bash",
+			InputCharsTotal:      24,
+			ExtractedFilePath:    "main.go",
+			ContentCharsReceived: 12,
+			ExtractedFields:      map[string]string{"command": "go test ./..."},
+			StreamingFieldName:   "command",
+			StreamingFieldDelta:  "go test",
+		},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{Type: "tool_output", ToolUseID: "tool-1", Output: "live"})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{Type: "tool_progress", ToolUseID: "tool-1", Elapsed: 5})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{Type: "tool_long_running", ToolUseID: "tool-1", Elapsed: 60000})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:         "tool_result",
+		ToolUseID:    "tool-1",
+		ToolName:     "Bash",
+		Output:       "ok",
+		DurationMs:   42,
+		UpdatedInput: map[string]any{"command": "go test ./internal/agentbasic"},
+		Metadata:     map[string]any{"truncated": false},
+		SideCars:     []agentbasic.AgentSideCar{{Target: "tool_result", Source: "test", Content: "detail"}},
+	})
 
 	contextUsage := requireFrameType(t, frames, "context_usage")
 	if intNumber(contextUsage["promptTokens"]) != 50 || intNumber(contextUsage["contextWindow"]) != 100 || contextUsage["isEstimated"] != true || intNumber(contextUsage["percentage"]) != 50 {
@@ -66,6 +102,31 @@ func TestAgentEventBroadcastsFrontendUseNarratorWSFields(t *testing.T) {
 	warning := requireFrameType(t, frames, "warning")
 	if warning["message"] != "provider busy" || intNumber(warning["retryCount"]) != 2 || intNumber(warning["maxRetries"]) != 5 || intNumber(warning["delayMs"]) != 750 {
 		t.Fatalf("retrying should fan out useNarratorWS warning frame: %#v", warning)
+	}
+	started := requireFrameType(t, frames, "tool_started")
+	if started["toolUseId"] != "tool-1" || intNumber(started["streamStartedAt"]) != 1770000000000 || started["input"] == nil || started["parentToolUseId"] != "agent-1" {
+		t.Fatalf("tool_started should expose streamStartedAt/input/parentToolUseId: %#v", started)
+	}
+	chunk := requireFrameType(t, frames, "tool_use_chunk")
+	streamingField, _ := chunk["streamingField"].(map[string]any)
+	if intNumber(chunk["inputCharsTotal"]) != 24 || chunk["extractedFields"] == nil || streamingField["name"] != "command" || streamingField["delta"] != "go test" {
+		t.Fatalf("tool_use_chunk should expose streaming field extraction: %#v", chunk)
+	}
+	output := requireFrameType(t, frames, "tool_output")
+	if output["output"] != "live" {
+		t.Fatalf("tool_output should expose live output: %#v", output)
+	}
+	progress := requireFrameType(t, frames, "tool_progress")
+	if intNumber(progress["elapsed"]) != 5 {
+		t.Fatalf("tool_progress should expose elapsed: %#v", progress)
+	}
+	longRunning := requireFrameType(t, frames, "tool_long_running")
+	if intNumber(longRunning["elapsed"]) != 60000 {
+		t.Fatalf("tool_long_running should expose elapsed: %#v", longRunning)
+	}
+	completed := requireFrameType(t, frames, "tool_completed")
+	if completed["toolUseId"] != "tool-1" || completed["output"] != "ok" || intNumber(completed["durationMs"]) != 42 || completed["updatedInput"] == nil || completed["metadata"] == nil || completed["sideCars"] == nil {
+		t.Fatalf("tool_completed should preserve TS optional fields: %#v", completed)
 	}
 }
 

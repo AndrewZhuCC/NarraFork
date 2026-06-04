@@ -1,0 +1,1 @@
+import{a as e}from"./rolldown-runtime-BYbx6iT9.js";import{n as t}from"./jsx-runtime-B6ABtYIT.js";var n=e(t(),1);function r(e){return Array.isArray(e)||e===null?!1:typeof e==`object`?e.type!==n.Fragment:!1}export{r as t};

@@ -76,21 +76,26 @@ func TestEnsureMigrationCompatibilityAcceptsCurrentRepositoryBaselineJournal(t *
 	sqlDB := openCanonicalSchemaTestDB(t)
 	defer sqlDB.Close()
 	createCanonicalSchemaTables(t, sqlDB)
-	createDrizzleMigrationsTable(t, sqlDB, currentRepositoryDrizzleBaselineSnapshot, nil)
+	currentRepositorySnapshot := currentRepositoryDrizzleBaselineSnapshot()
+	createDrizzleMigrationsTable(t, sqlDB, currentRepositorySnapshot, nil)
 
 	if err := EnsureMigrationCompatibility(context.Background(), sqlDB); err != nil {
 		t.Fatalf("EnsureMigrationCompatibility returned error for current repository baseline journal: %v", err)
 	}
 	journal := readGoMigrationJournalForTest(t, sqlDB)
-	baseline := currentRepositoryDrizzleBaselineSnapshot[0]
-	if journal.ExpectedCount != 1 || journal.ExpectedLastTag != baseline.Tag || journal.ExpectedJournalHash != drizzleJournalHash(currentRepositoryDrizzleBaselineSnapshot) {
+	last := currentRepositorySnapshot[len(currentRepositorySnapshot)-1]
+	if journal.ExpectedCount != len(currentRepositorySnapshot) || journal.ExpectedLastTag != last.Tag || journal.ExpectedJournalHash != drizzleJournalHash(currentRepositorySnapshot) {
 		t.Fatalf("unexpected baseline Go journal: %#v", journal)
 	}
 	var details migrationCompatibilityDetails
 	if err := json.Unmarshal([]byte(journal.DetailsJSON), &details); err != nil {
 		t.Fatalf("unmarshal details_json: %v", err)
 	}
-	if details.ExpectedJournalName != "current-repository-baseline" || details.ObservedCount != 1 || len(details.ExtraHashes) != 0 {
+	wantJournalName := "current-repository-baseline"
+	if drizzleJournalHash(currentRepositorySnapshot) == drizzleJournalHash(embeddedDrizzleMigrationSnapshot) {
+		wantJournalName = "bun-final-history"
+	}
+	if details.ExpectedJournalName != wantJournalName || details.ObservedCount != len(currentRepositorySnapshot) || len(details.ExtraHashes) != 0 {
 		t.Fatalf("unexpected baseline details: %#v", details)
 	}
 }
@@ -100,8 +105,9 @@ func TestCurrentRepositoryBaselineSnapshotMatchesRepository(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read repository Drizzle journal: %v", err)
 	}
-	if !reflect.DeepEqual(currentRepositoryDrizzleBaselineSnapshot, entries) {
-		t.Fatalf("current repository baseline snapshot = %#v, want %#v", currentRepositoryDrizzleBaselineSnapshot, entries)
+	currentRepositorySnapshot := currentRepositoryDrizzleBaselineSnapshot()
+	if !reflect.DeepEqual(currentRepositorySnapshot, entries) {
+		t.Fatalf("current repository baseline snapshot = %#v, want %#v", currentRepositorySnapshot, entries)
 	}
 }
 

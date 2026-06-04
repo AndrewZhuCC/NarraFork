@@ -1,13 +1,17 @@
 package userprefs
 
 import (
+	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +27,10 @@ type UserBroadcaster interface {
 	BroadcastUser(userID string, payload any)
 }
 
+type recentTabsPresenceProvider interface {
+	NarratorPresenceBatch(narratorIDs []string) map[string][]map[string]any
+}
+
 type Handler struct {
 	DB          *sql.DB
 	Broadcaster UserBroadcaster
@@ -35,6 +43,18 @@ func NewHandler(sqlDB *sql.DB, broadcasters ...UserBroadcaster) *Handler {
 	}
 	return &Handler{DB: sqlDB, Broadcaster: broadcaster}
 }
+
+const maxRecentTabs = 20
+
+var containerStatusPriority = map[string]int{
+	"removed": 0,
+	"stopped": 1,
+	"created": 2,
+	"paused":  3,
+	"running": 4,
+}
+
+var recentTabsLocks sync.Map
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/", httpx.Handler(h.get))
@@ -161,23 +181,56 @@ func (h *Handler) upsertRecentTab(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	tabs, err := h.recentTabs(r, userID)
+	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
+		idx := indexByKey(tabs, tabKey(tab))
+		if idx < 0 && updateOnly && stringValue(tab["type"]) == "narrator" {
+			narratorID := stringValue(tab["id"])
+			idx = indexByRepresentedNarrator(tabs, narratorID)
+		}
+		if idx >= 0 {
+			if updateOnly {
+				patch := map[string]any{}
+				for key, value := range tab {
+					if key == "type" || key == "id" {
+						continue
+					}
+					if text, ok := value.(string); ok && text == "" {
+						continue
+					}
+					patch[key] = value
+				}
+				mergeMapInPlace(tabs[idx], patch)
+			} else {
+				mergeMapInPlace(tabs[idx], tab)
+				tabs = promoteTopLevelTabRespectingPins(tabs, idx)
+			}
+		} else if updateOnly {
+			return tabs, nil
+		} else if wsID := stringValue(tab["workspaceId"]); wsID != "" {
+			headerIdx := indexByKey(tabs, "workspace:"+wsID)
+			if headerIdx >= 0 {
+				insertIdx := headerIdx + 1
+				for insertIdx < len(tabs) && stringValue(tabs[insertIdx]["workspaceId"]) == wsID {
+					insertIdx++
+				}
+				tabs = insertTabs(tabs, insertIdx, []map[string]any{tab})
+			} else {
+				delete(tab, "workspaceId")
+				tabs = insertTopLevelTabRespectingPins(tabs, tab)
+			}
+		} else {
+			tabs = insertTopLevelTabRespectingPins(tabs, tab)
+		}
+		if len(tabs) > maxRecentTabs {
+			tabs = tabs[:maxRecentTabs]
+		}
+		tabs = regroupWorkspaces(tabs)
+		return tabs, nil
+	})
 	if err != nil {
 		return err
 	}
-	key := tabKey(tab)
-	idx := indexByKey(tabs, key)
-	if idx >= 0 {
-		tabs = append(tabs[:idx], tabs[idx+1:]...)
-	} else if updateOnly {
-		h.writeRecentTabs(w, http.StatusOK, userID, tabs)
-		return nil
-	}
-	tabs = append([]map[string]any{tab}, tabs...)
-	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
-		return err
-	}
-	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
+	h.writeRecentTabs(r, w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -186,21 +239,35 @@ func (h *Handler) removeRecentTab(w http.ResponseWriter, r *http.Request) error 
 	if err != nil {
 		return err
 	}
-	tabs, err := h.recentTabs(r, userID)
+	tabType := chi.URLParam(r, "type")
+	tabID := chi.URLParam(r, "id")
+	if err := validateRemoveRecentTab(tabType, tabID); err != nil {
+		return err
+	}
+	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
+		if tabType == "workspace" {
+			for _, tab := range tabs {
+				if stringValue(tab["workspaceId"]) == tabID {
+					delete(tab, "workspaceId")
+				}
+			}
+			if err := h.deleteWorkspaceRecord(r.Context(), tabID); err != nil {
+				return nil, err
+			}
+		}
+		key := tabType + ":" + tabID
+		filtered := make([]map[string]any, 0, len(tabs))
+		for _, tab := range tabs {
+			if tabKey(tab) != key {
+				filtered = append(filtered, tab)
+			}
+		}
+		return filtered, nil
+	})
 	if err != nil {
 		return err
 	}
-	key := chi.URLParam(r, "type") + ":" + chi.URLParam(r, "id")
-	filtered := tabs[:0]
-	for _, tab := range tabs {
-		if tabKey(tab) != key {
-			filtered = append(filtered, tab)
-		}
-	}
-	if err := h.saveRecentTabs(r, userID, filtered); err != nil {
-		return err
-	}
-	h.writeRecentTabs(w, http.StatusOK, userID, filtered)
+	h.writeRecentTabs(r, w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -217,24 +284,51 @@ func (h *Handler) moveRecentTab(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	tabs, err := h.recentTabs(r, userID)
+	if err := validateMoveRecentTab(body.Key, body.ToIndex, body.Position); err != nil {
+		return err
+	}
+	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
+		idx := indexByKey(tabs, body.Key)
+		if idx < 0 {
+			return tabs, nil
+		}
+		movedGroup, remaining := extractMovableGroup(tabs, idx)
+		tabs = remaining
+		switch body.Position {
+		case "top":
+			tabs = insertTabs(tabs, 0, movedGroup)
+		case "above_idle":
+			if wsID := stringValue(movedGroup[0]["workspaceId"]); wsID != "" && len(movedGroup) == 1 {
+				putBackAt := clampInt(idx, 0, len(tabs))
+				tabs = insertTabs(tabs, putBackAt, movedGroup)
+				if headerIdx := indexByKey(tabs, "workspace:"+wsID); headerIdx >= 0 {
+					movedGroup, tabs = extractMovableGroup(tabs, headerIdx)
+				} else {
+					movedGroup, tabs = nil, tabs
+				}
+			}
+			if len(movedGroup) == 0 {
+				return tabs, nil
+			}
+			statusMap := h.narratorStatusMap(r.Context(), tabNarratorIDs(tabs))
+			firstIdleIdx := firstIdleTopLevelIndex(tabs, statusMap)
+			if firstIdleIdx < 0 {
+				tabs = append(tabs, movedGroup...)
+			} else {
+				tabs = insertTabs(tabs, firstIdleIdx, movedGroup)
+			}
+		default:
+			if body.ToIndex != nil {
+				tabs = insertTabs(tabs, clampInt(*body.ToIndex, 0, len(tabs)), movedGroup)
+			}
+		}
+		tabs = regroupWorkspaces(tabs)
+		return tabs, nil
+	})
 	if err != nil {
 		return err
 	}
-	idx := indexByKey(tabs, body.Key)
-	if idx >= 0 {
-		tab := tabs[idx]
-		tabs = append(tabs[:idx], tabs[idx+1:]...)
-		target := 0
-		if body.ToIndex != nil && *body.ToIndex >= 0 && *body.ToIndex <= len(tabs) {
-			target = *body.ToIndex
-		}
-		tabs = append(tabs[:target], append([]map[string]any{tab}, tabs[target:]...)...)
-	}
-	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
-		return err
-	}
-	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
+	h.writeRecentTabs(r, w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -250,17 +344,33 @@ func (h *Handler) pinRecentTab(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
-	tabs, err := h.recentTabs(r, userID)
+	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 100 {
+		return httpx.ValidationError("key is required")
+	}
+	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
+		idx := indexByKey(tabs, body.Key)
+		if idx < 0 {
+			return tabs, nil
+		}
+		if body.Pinned {
+			tabs[idx]["pinned"] = true
+		} else {
+			delete(tabs[idx], "pinned")
+		}
+		tab := tabs[idx]
+		tabs = append(tabs[:idx], tabs[idx+1:]...)
+		insertIdx := 0
+		for insertIdx < len(tabs) && boolValue(tabs[insertIdx]["pinned"]) {
+			insertIdx++
+		}
+		tabs = insertTabs(tabs, insertIdx, []map[string]any{tab})
+		tabs = regroupWorkspaces(tabs)
+		return tabs, nil
+	})
 	if err != nil {
 		return err
 	}
-	if idx := indexByKey(tabs, body.Key); idx >= 0 {
-		tabs[idx]["pinned"] = body.Pinned
-	}
-	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
-		return err
-	}
-	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
+	h.writeRecentTabs(r, w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -270,22 +380,98 @@ func (h *Handler) clearRecentTabs(w http.ResponseWriter, r *http.Request) error 
 		return err
 	}
 	var body struct {
+		Scope      string `json:"scope"`
 		KeepTabKey string `json:"keepTabKey"`
 	}
-	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	tabs := []map[string]any{}
-	if body.KeepTabKey != "" {
-		old, _ := h.recentTabs(r, userID)
-		if idx := indexByKey(old, body.KeepTabKey); idx >= 0 {
-			tabs = append(tabs, old[idx])
+	if body.Scope != "all" && body.Scope != "projects" && body.Scope != "inactive_narrators" {
+		return httpx.ValidationError("scope is not supported")
+	}
+	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
+		isKept := func(tab map[string]any) bool {
+			return body.KeepTabKey != "" && tabKey(tab) == body.KeepTabKey
 		}
-	}
-	if err := h.saveRecentTabs(r, userID, tabs); err != nil {
+		if body.Scope == "all" {
+			if body.KeepTabKey == "" {
+				return []map[string]any{}, nil
+			}
+			kept := []map[string]any{}
+			for _, tab := range tabs {
+				if isKept(tab) {
+					kept = append(kept, tab)
+				}
+			}
+			return kept, nil
+		}
+		if body.Scope == "projects" {
+			filtered := make([]map[string]any, 0, len(tabs))
+			for _, tab := range tabs {
+				if stringValue(tab["type"]) != "project" || isKept(tab) {
+					filtered = append(filtered, tab)
+				}
+			}
+			return filtered, nil
+		}
+
+		statusMap := h.narratorInfoMap(r.Context(), tabNarratorIDs(tabs))
+		childrenByWorkspace := map[string][]map[string]any{}
+		workspaceIDs := map[string]struct{}{}
+		for _, tab := range tabs {
+			if stringValue(tab["type"]) == "workspace" {
+				workspaceIDs[stringValue(tab["id"])] = struct{}{}
+			}
+			if wsID := stringValue(tab["workspaceId"]); wsID != "" {
+				childrenByWorkspace[wsID] = append(childrenByWorkspace[wsID], tab)
+			}
+		}
+		activeWorkspaces := map[string]struct{}{}
+		for wsID := range workspaceIDs {
+			for _, child := range childrenByWorkspace[wsID] {
+				if narratorInfoActive(statusMap[getTabNarratorID(child)]) {
+					activeWorkspaces[wsID] = struct{}{}
+					break
+				}
+			}
+		}
+		for wsID := range workspaceIDs {
+			if _, active := activeWorkspaces[wsID]; active || body.KeepTabKey == "workspace:"+wsID {
+				continue
+			}
+			if err := h.deleteWorkspaceRecord(r.Context(), wsID); err != nil {
+				return nil, err
+			}
+		}
+		filtered := make([]map[string]any, 0, len(tabs))
+		for _, tab := range tabs {
+			if isKept(tab) || stringValue(tab["type"]) == "project" {
+				filtered = append(filtered, tab)
+				continue
+			}
+			if stringValue(tab["type"]) == "workspace" {
+				if _, ok := activeWorkspaces[stringValue(tab["id"])]; ok {
+					filtered = append(filtered, tab)
+				}
+				continue
+			}
+			if wsID := stringValue(tab["workspaceId"]); wsID != "" {
+				if _, ok := activeWorkspaces[wsID]; ok {
+					filtered = append(filtered, tab)
+				}
+				continue
+			}
+			if narratorInfoActive(statusMap[getTabNarratorID(tab)]) {
+				filtered = append(filtered, tab)
+			}
+		}
+		filtered = regroupWorkspaces(filtered)
+		return filtered, nil
+	})
+	if err != nil {
 		return err
 	}
-	h.writeRecentTabs(w, http.StatusOK, userID, tabs)
+	h.writeRecentTabs(r, w, http.StatusOK, userID, tabs)
 	return nil
 }
 
@@ -332,6 +518,9 @@ func (h *Handler) load(r *http.Request, userID string) (map[string]any, error) {
 	out, err := h.loadRaw(r, userID)
 	if err != nil {
 		return nil, err
+	}
+	if tabs := recentTabsFromAny(out["recentTabs"]); len(tabs) > 0 {
+		out["recentTabs"] = tabsToAny(h.enrichTabs(r.Context(), cloneTabs(tabs)))
 	}
 	redactPreferenceSecrets(out)
 	return out, nil
@@ -1060,18 +1249,33 @@ func stringValue(value any) string {
 }
 
 func (h *Handler) recentTabs(r *http.Request, userID string) ([]map[string]any, error) {
-	pref, err := h.load(r, userID)
+	pref, err := h.loadRaw(r, userID)
 	if err != nil {
 		return nil, err
 	}
-	items, _ := pref["recentTabs"].([]any)
-	result := []map[string]any{}
-	for _, item := range items {
-		if m, ok := item.(map[string]any); ok {
-			result = append(result, m)
-		}
+	return recentTabsFromAny(pref["recentTabs"]), nil
+}
+
+func (h *Handler) mutateRecentTabs(r *http.Request, userID string, mutate func([]map[string]any) ([]map[string]any, error)) ([]map[string]any, error) {
+	lock := userRecentTabsLock(userID)
+	lock.Lock()
+	defer lock.Unlock()
+	tabs, err := h.recentTabs(r, userID)
+	if err != nil {
+		return nil, err
 	}
-	return result, nil
+	migrateTabTypes(tabs)
+	updated, err := mutate(tabs)
+	if err != nil {
+		return nil, err
+	}
+	if updated == nil {
+		updated = []map[string]any{}
+	}
+	if err := h.saveRecentTabs(r, userID, updated); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 func (h *Handler) saveRecentTabs(r *http.Request, userID string, tabs []map[string]any) error {
@@ -1083,9 +1287,10 @@ func (h *Handler) saveRecentTabs(r *http.Request, userID string, tabs []map[stri
 	return err
 }
 
-func (h *Handler) writeRecentTabs(w http.ResponseWriter, status int, userID string, tabs []map[string]any) {
-	h.broadcastRecentTabsSnapshot(userID, tabs)
-	httpx.WriteJSON(w, status, tabs)
+func (h *Handler) writeRecentTabs(r *http.Request, w http.ResponseWriter, status int, userID string, tabs []map[string]any) {
+	enriched := h.enrichTabs(r.Context(), cloneTabs(tabs))
+	h.broadcastRecentTabsSnapshot(userID, enriched)
+	httpx.WriteJSON(w, status, enriched)
 }
 
 func (h *Handler) broadcastRecentTabsSnapshot(userID string, tabs []map[string]any) {
@@ -1097,6 +1302,646 @@ func (h *Handler) broadcastRecentTabsSnapshot(userID string, tabs []map[string]a
 		"tabs":     tabs,
 		"revision": time.Now().UnixMilli(),
 	})
+}
+
+func userRecentTabsLock(userID string) *sync.Mutex {
+	key := strings.TrimSpace(userID)
+	if key == "" {
+		key = "__anonymous__"
+	}
+	lock, _ := recentTabsLocks.LoadOrStore(key, &sync.Mutex{})
+	return lock.(*sync.Mutex)
+}
+
+func recentTabsFromAny(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		if tabs, ok := value.([]map[string]any); ok {
+			return cloneTabs(tabs)
+		}
+		return []map[string]any{}
+	}
+	result := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if tab, ok := item.(map[string]any); ok {
+			result = append(result, cloneMap(tab))
+		}
+	}
+	return result
+}
+
+func cloneTabs(tabs []map[string]any) []map[string]any {
+	out := make([]map[string]any, 0, len(tabs))
+	for _, tab := range tabs {
+		out = append(out, cloneMap(tab))
+	}
+	return out
+}
+
+func tabsToAny(tabs []map[string]any) []any {
+	out := make([]any, 0, len(tabs))
+	for _, tab := range tabs {
+		out = append(out, tab)
+	}
+	return out
+}
+
+func cloneMap(item map[string]any) map[string]any {
+	out := make(map[string]any, len(item))
+	for key, value := range item {
+		out[key] = value
+	}
+	return out
+}
+
+func mergeMapInPlace(dst map[string]any, src map[string]any) {
+	for key, value := range src {
+		dst[key] = value
+	}
+}
+
+func migrateTabTypes(tabs []map[string]any) {
+	for _, tab := range tabs {
+		if stringValue(tab["type"]) == "session" {
+			tab["type"] = "narrator"
+		}
+	}
+}
+
+func getTabNarratorID(tab map[string]any) string {
+	switch stringValue(tab["type"]) {
+	case "narrator", "subagent":
+		return stringValue(tab["id"])
+	case "chapter":
+		return stringValue(tab["narratorId"])
+	default:
+		return ""
+	}
+}
+
+func indexByRepresentedNarrator(tabs []map[string]any, narratorID string) int {
+	for i, tab := range tabs {
+		if getTabNarratorID(tab) == narratorID {
+			return i
+		}
+	}
+	return -1
+}
+
+func tabNarratorIDs(tabs []map[string]any) []string {
+	ids := make([]string, 0, len(tabs))
+	seen := map[string]struct{}{}
+	for _, tab := range tabs {
+		id := getTabNarratorID(tab)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func regroupWorkspaces(tabs []map[string]any) []map[string]any {
+	childrenByWorkspace := map[string][]map[string]any{}
+	for _, tab := range tabs {
+		if wsID := stringValue(tab["workspaceId"]); wsID != "" {
+			childrenByWorkspace[wsID] = append(childrenByWorkspace[wsID], tab)
+		}
+	}
+	if len(childrenByWorkspace) == 0 {
+		return tabs
+	}
+	topLevel := make([]map[string]any, 0, len(tabs))
+	for _, tab := range tabs {
+		if stringValue(tab["workspaceId"]) == "" {
+			topLevel = append(topLevel, tab)
+		}
+	}
+	result := make([]map[string]any, 0, len(tabs))
+	headerIDs := map[string]struct{}{}
+	for _, tab := range topLevel {
+		result = append(result, tab)
+		if stringValue(tab["type"]) != "workspace" {
+			continue
+		}
+		wsID := stringValue(tab["id"])
+		headerIDs[wsID] = struct{}{}
+		result = append(result, childrenByWorkspace[wsID]...)
+	}
+	orphanIDs := make([]string, 0)
+	for wsID := range childrenByWorkspace {
+		if _, ok := headerIDs[wsID]; !ok {
+			orphanIDs = append(orphanIDs, wsID)
+		}
+	}
+	sort.Strings(orphanIDs)
+	for _, wsID := range orphanIDs {
+		for _, child := range childrenByWorkspace[wsID] {
+			delete(child, "workspaceId")
+			result = append(result, child)
+		}
+	}
+	return result
+}
+
+func getPinnedSectionEndIndex(tabs []map[string]any) int {
+	idx := 0
+	for idx < len(tabs) {
+		tab := tabs[idx]
+		if stringValue(tab["workspaceId"]) != "" {
+			idx++
+			continue
+		}
+		if !boolValue(tab["pinned"]) {
+			break
+		}
+		idx++
+		if stringValue(tab["type"]) == "workspace" {
+			wsID := stringValue(tab["id"])
+			for idx < len(tabs) && stringValue(tabs[idx]["workspaceId"]) == wsID {
+				idx++
+			}
+		}
+	}
+	return idx
+}
+
+func promoteTopLevelTabRespectingPins(tabs []map[string]any, idx int) []map[string]any {
+	if idx < 0 || idx >= len(tabs) {
+		return tabs
+	}
+	tab := tabs[idx]
+	if stringValue(tab["workspaceId"]) != "" || boolValue(tab["pinned"]) {
+		return tabs
+	}
+	moved, remaining := extractMovableGroup(tabs, idx)
+	return insertTabs(remaining, getPinnedSectionEndIndex(remaining), moved)
+}
+
+func insertTopLevelTabRespectingPins(tabs []map[string]any, tab map[string]any) []map[string]any {
+	return insertTabs(tabs, getPinnedSectionEndIndex(tabs), []map[string]any{tab})
+}
+
+func extractMovableGroup(tabs []map[string]any, idx int) ([]map[string]any, []map[string]any) {
+	if idx < 0 || idx >= len(tabs) {
+		return nil, tabs
+	}
+	end := idx + 1
+	if stringValue(tabs[idx]["type"]) == "workspace" {
+		wsID := stringValue(tabs[idx]["id"])
+		for end < len(tabs) && stringValue(tabs[end]["workspaceId"]) == wsID {
+			end++
+		}
+	}
+	moved := append([]map[string]any{}, tabs[idx:end]...)
+	remaining := make([]map[string]any, 0, len(tabs)-len(moved))
+	remaining = append(remaining, tabs[:idx]...)
+	remaining = append(remaining, tabs[end:]...)
+	return moved, remaining
+}
+
+func insertTabs(tabs []map[string]any, index int, items []map[string]any) []map[string]any {
+	if len(items) == 0 {
+		return tabs
+	}
+	index = clampInt(index, 0, len(tabs))
+	out := make([]map[string]any, 0, len(tabs)+len(items))
+	out = append(out, tabs[:index]...)
+	out = append(out, items...)
+	out = append(out, tabs[index:]...)
+	return out
+}
+
+func firstIdleTopLevelIndex(tabs []map[string]any, statusMap map[string]string) int {
+	for i, tab := range tabs {
+		if boolValue(tab["pinned"]) || stringValue(tab["workspaceId"]) != "" {
+			continue
+		}
+		if stringValue(tab["type"]) == "workspace" {
+			wsID := stringValue(tab["id"])
+			children := []map[string]any{}
+			for j := i + 1; j < len(tabs) && stringValue(tabs[j]["workspaceId"]) == wsID; j++ {
+				children = append(children, tabs[j])
+			}
+			if len(children) == 0 {
+				continue
+			}
+			allIdle := true
+			for _, child := range children {
+				status := statusMap[getTabNarratorID(child)]
+				if status != "idle" {
+					allIdle = false
+					break
+				}
+			}
+			if allIdle {
+				return i
+			}
+			continue
+		}
+		if statusMap[getTabNarratorID(tab)] == "idle" {
+			return i
+		}
+	}
+	return -1
+}
+
+func clampInt(value int, minValue int, maxValue int) int {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func validateRemoveRecentTab(tabType string, tabID string) error {
+	switch tabType {
+	case "chapter", "narrator", "session", "project", "workspace", "subagent":
+	default:
+		return httpx.ValidationError("recentTab.type is not supported")
+	}
+	if strings.TrimSpace(tabID) == "" || len(tabID) > 50 {
+		return httpx.ValidationError("recentTab.id is required")
+	}
+	return nil
+}
+
+func validateMoveRecentTab(key string, toIndex *int, position string) error {
+	if strings.TrimSpace(key) == "" || len(key) > 100 {
+		return httpx.ValidationError("key is required")
+	}
+	if toIndex == nil && position == "" {
+		return httpx.ValidationError("toIndex or position required")
+	}
+	if toIndex != nil && (*toIndex < 0 || *toIndex > maxRecentTabs) {
+		return httpx.ValidationError("toIndex must be between 0 and 20")
+	}
+	if position != "" && position != "top" && position != "above_idle" {
+		return httpx.ValidationError("position is not supported")
+	}
+	return nil
+}
+
+type recentTabNarratorInfo struct {
+	Status        string
+	Substatus     []string
+	Traits        []string
+	HasDraft      bool
+	HasActiveGoal bool
+}
+
+func (h *Handler) enrichTabs(ctx context.Context, tabs []map[string]any) []map[string]any {
+	if len(tabs) == 0 || h == nil || h.DB == nil {
+		return tabs
+	}
+	migrateTabTypes(tabs)
+	narratorIDs := tabNarratorIDs(tabs)
+	if len(narratorIDs) > 0 {
+		infoMap := h.narratorInfoMap(ctx, narratorIDs)
+		for _, tab := range tabs {
+			narratorID := getTabNarratorID(tab)
+			info, ok := infoMap[narratorID]
+			if !ok {
+				delete(tab, "substatus")
+				delete(tab, "hasDraft")
+				delete(tab, "hasActiveGoal")
+				continue
+			}
+			if info.Status != "" {
+				tab["status"] = info.Status
+			}
+			tab["substatus"] = info.Substatus
+			if info.HasDraft {
+				tab["hasDraft"] = true
+			} else {
+				delete(tab, "hasDraft")
+			}
+			if info.HasActiveGoal {
+				tab["hasActiveGoal"] = true
+			} else {
+				delete(tab, "hasActiveGoal")
+			}
+		}
+		for narratorID, count := range h.activeTerminalCounts(ctx, narratorIDs) {
+			for _, tab := range tabs {
+				if getTabNarratorID(tab) == narratorID {
+					tab["activeTerminalCount"] = count
+				}
+			}
+		}
+		if provider, ok := h.Broadcaster.(recentTabsPresenceProvider); ok {
+			presence := provider.NarratorPresenceBatch(narratorIDs)
+			for _, tab := range tabs {
+				if viewers := presence[getTabNarratorID(tab)]; len(viewers) > 0 {
+					tab["viewers"] = viewers
+				}
+			}
+		}
+	}
+	chapterIDs := recentTabChapterIDs(tabs)
+	if len(chapterIDs) > 0 {
+		statuses := h.containerStatusMap(ctx, chapterIDs)
+		for _, tab := range tabs {
+			if stringValue(tab["type"]) != "chapter" {
+				continue
+			}
+			if status := statuses[stringValue(tab["id"])]; status != "" {
+				tab["containerStatus"] = status
+			}
+		}
+	}
+	return tabs
+}
+
+func (h *Handler) narratorStatusMap(ctx context.Context, narratorIDs []string) map[string]string {
+	info := h.narratorInfoMap(ctx, narratorIDs)
+	out := make(map[string]string, len(info))
+	for id, item := range info {
+		out[id] = item.Status
+	}
+	return out
+}
+
+func (h *Handler) narratorInfoMap(ctx context.Context, narratorIDs []string) map[string]recentTabNarratorInfo {
+	ids := uniqueStrings(narratorIDs)
+	out := map[string]recentTabNarratorInfo{}
+	if len(ids) == 0 || h == nil || h.DB == nil {
+		return out
+	}
+	cols := h.tableColumns(ctx, "narrators")
+	if !cols["id"] {
+		return out
+	}
+	statusExpr := "''"
+	if cols["status"] {
+		statusExpr = "status"
+	}
+	substatusExpr := "'[]'"
+	if cols["substatus"] {
+		substatusExpr = "substatus"
+	}
+	traitsExpr := "'[]'"
+	if cols["traits"] {
+		traitsExpr = "traits"
+	}
+	args := stringsToAny(ids)
+	rows, err := h.DB.QueryContext(ctx, `SELECT id, `+statusExpr+`, `+substatusExpr+`, `+traitsExpr+` FROM narrators WHERE id IN (`+sqlPlaceholders(len(ids))+`)`, args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var idValue string
+		var statusValue, substatusValue, traitsValue sql.NullString
+		if err := rows.Scan(&idValue, &statusValue, &substatusValue, &traitsValue); err != nil {
+			continue
+		}
+		traits := decodeStringArray(traitsValue.String)
+		out[idValue] = recentTabNarratorInfo{
+			Status:    statusValue.String,
+			Substatus: decodeStringArray(substatusValue.String),
+			Traits:    traits,
+			HasDraft:  hasDraftTrait(traits),
+		}
+	}
+	goalCols := h.tableColumns(ctx, "narrator_goals")
+	if goalCols["narrator_id"] && goalCols["status"] {
+		goalRows, err := h.DB.QueryContext(ctx, `SELECT narrator_id FROM narrator_goals WHERE status = 'active' AND narrator_id IN (`+sqlPlaceholders(len(ids))+`) GROUP BY narrator_id`, args...)
+		if err == nil {
+			defer goalRows.Close()
+			for goalRows.Next() {
+				var narratorID string
+				if err := goalRows.Scan(&narratorID); err == nil {
+					info := out[narratorID]
+					info.HasActiveGoal = true
+					out[narratorID] = info
+				}
+			}
+		}
+	}
+	return out
+}
+
+func narratorInfoActive(info recentTabNarratorInfo) bool {
+	if info.Status == "working" || info.Status == "waiting" {
+		return true
+	}
+	if info.Status != "idle" {
+		return false
+	}
+	for _, tag := range info.Substatus {
+		if tag == "unread" || tag == "error" {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) activeTerminalCounts(ctx context.Context, narratorIDs []string) map[string]int {
+	ids := uniqueStrings(narratorIDs)
+	out := map[string]int{}
+	if len(ids) == 0 || h == nil || h.DB == nil {
+		return out
+	}
+	cols := h.tableColumns(ctx, "terminals")
+	if !cols["narrator_id"] || !cols["status"] {
+		return out
+	}
+	rows, err := h.DB.QueryContext(ctx, `SELECT narrator_id, COUNT(*) FROM terminals WHERE status = 'running' AND narrator_id IN (`+sqlPlaceholders(len(ids))+`) GROUP BY narrator_id`, stringsToAny(ids)...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var narratorID string
+		var count int
+		if err := rows.Scan(&narratorID, &count); err == nil {
+			out[narratorID] = count
+		}
+	}
+	return out
+}
+
+func recentTabChapterIDs(tabs []map[string]any) []string {
+	ids := []string{}
+	seen := map[string]struct{}{}
+	for _, tab := range tabs {
+		if stringValue(tab["type"]) != "chapter" {
+			continue
+		}
+		idValue := stringValue(tab["id"])
+		if idValue == "" {
+			continue
+		}
+		if _, ok := seen[idValue]; ok {
+			continue
+		}
+		seen[idValue] = struct{}{}
+		ids = append(ids, idValue)
+	}
+	return ids
+}
+
+func (h *Handler) containerStatusMap(ctx context.Context, chapterIDs []string) map[string]string {
+	ids := uniqueStrings(chapterIDs)
+	out := map[string]string{}
+	if len(ids) == 0 || h == nil || h.DB == nil {
+		return out
+	}
+	cols := h.tableColumns(ctx, "container_instances")
+	if !cols["chapter_id"] || !cols["status"] {
+		return out
+	}
+	rows, err := h.DB.QueryContext(ctx, `SELECT chapter_id, status FROM container_instances WHERE chapter_id IN (`+sqlPlaceholders(len(ids))+`)`, stringsToAny(ids)...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var chapterID, status string
+		if err := rows.Scan(&chapterID, &status); err != nil {
+			continue
+		}
+		if out[chapterID] == "" || containerStatusPriority[status] > containerStatusPriority[out[chapterID]] {
+			out[chapterID] = status
+		}
+	}
+	return out
+}
+
+func (h *Handler) deleteWorkspaceRecord(ctx context.Context, workspaceID string) error {
+	if strings.TrimSpace(workspaceID) == "" || h == nil || h.DB == nil {
+		return nil
+	}
+	cols := h.tableColumns(ctx, "workspaces")
+	if !cols["id"] {
+		return nil
+	}
+	_, err := h.DB.ExecContext(ctx, `DELETE FROM workspaces WHERE id = ?`, workspaceID)
+	return err
+}
+
+func (h *Handler) tableColumns(ctx context.Context, table string) map[string]bool {
+	cols := map[string]bool{}
+	if h == nil || h.DB == nil || strings.TrimSpace(table) == "" {
+		return cols
+	}
+	rows, err := h.DB.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return cols
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, dataType string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &pk); err == nil {
+			cols[name] = true
+		}
+	}
+	return cols
+}
+
+func sqlPlaceholders(count int) string {
+	if count <= 0 {
+		return ""
+	}
+	return strings.TrimRight(strings.Repeat("?,", count), ",")
+}
+
+func stringsToAny(items []string) []any {
+	args := make([]any, 0, len(items))
+	for _, item := range items {
+		args = append(args, item)
+	}
+	return args
+}
+
+func uniqueStrings(items []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func decodeStringArray(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string{}, typed...)
+	case []any:
+		out := []string{}
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return []string{}
+		}
+		var out []string
+		if err := json.Unmarshal([]byte(typed), &out); err == nil {
+			return out
+		}
+	}
+	return []string{}
+}
+
+func hasDraftTrait(traits []string) bool {
+	for _, trait := range traits {
+		if !strings.HasPrefix(trait, "draft:") {
+			continue
+		}
+		encoded := strings.TrimPrefix(trait, "draft:")
+		data, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(data, &payload); err != nil {
+			continue
+		}
+		if strings.TrimSpace(stringValue(payload["text"])) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func boolValue(value any) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case int:
+		return typed != 0
+	case int64:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case string:
+		return typed == "true" || typed == "1"
+	default:
+		return false
+	}
 }
 
 func currentUserID(r *http.Request) (string, error) {

@@ -2320,6 +2320,208 @@ func (s *Service) skillCommandPrompt(ctx context.Context, narratorID, skillName,
 	return "<command-name>" + strings.TrimSpace(skillName) + "</command-name>\n" + content, true, nil
 }
 
+func (s *Service) HandleLoadToolCommand(ctx context.Context, narratorID string, cmd slashCommandResult, userID string) (map[string]any, error) {
+	locale := s.userLocale(ctx, userID)
+	if cmd.LoadToolNotFound != "" {
+		toolID := cmd.LoadToolNotFound
+		message := fmt.Sprintf("⚠️ Unknown tool: %s. Available: %s", toolID, strings.Join(availableOptionalToolIDs(), ", "))
+		if locale == "zh-CN" {
+			message = fmt.Sprintf("⚠️ 未知工具：%s。可用：%s", toolID, strings.Join(availableOptionalToolIDs(), ", "))
+		}
+		if _, err := s.persistDisplayMessage(ctx, narratorID, message); err != nil {
+			return nil, err
+		}
+		return map[string]any{"toolName": toolID, "loaded": false, "alreadyLoaded": false}, nil
+	}
+
+	toolName := strings.TrimSpace(cmd.LoadTool)
+	narrator, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return nil, err
+	}
+	if toolNameBoolSet(disabledToolsFromTraits(narrator.Traits))[toolName] {
+		message := fmt.Sprintf("⛔ Tool disabled by this narrator's custom trait: %s", toolName)
+		if locale == "zh-CN" {
+			message = fmt.Sprintf("⛔ 工具已被此叙述者的自定义 trait 禁用：%s", toolName)
+		}
+		if _, err := s.persistDisplayMessage(ctx, narratorID, message); err != nil {
+			return nil, err
+		}
+		return map[string]any{"toolName": toolName, "loaded": false, "alreadyLoaded": false}, nil
+	}
+
+	result, err := s.loadOptionalTool(ctx, narratorID, toolName, anyStringSlice(narrator.EnabledTools))
+	if err != nil {
+		return nil, err
+	}
+	if result == "unknown_tool" {
+		if _, err := s.persistDisplayMessage(ctx, narratorID, "⚠️ Unknown tool: "+toolName); err != nil {
+			return nil, err
+		}
+		return map[string]any{"toolName": toolName, "loaded": false, "alreadyLoaded": false}, nil
+	}
+	alreadyLoaded := result == "already_loaded"
+	message := fmt.Sprintf("🔧 Tool loaded: %s", toolName)
+	if alreadyLoaded {
+		message = fmt.Sprintf("🔧 Tool already loaded: %s", toolName)
+	}
+	if _, err := s.persistDisplayMessage(ctx, narratorID, message); err != nil {
+		return nil, err
+	}
+	if !alreadyLoaded {
+		description := toolName
+		if tool, ok := optionalToolDefinitionByName(toolName); ok {
+			description = tool.DescriptionEn
+			if locale == "zh-CN" {
+				description = tool.DescriptionZh
+			}
+		}
+		text := fmt.Sprintf("[The optional tool %q has just been loaded into this session. %s. You can now use this tool when appropriate.]", toolName, description)
+		if locale == "zh-CN" {
+			text = fmt.Sprintf("[可选工具 %q 刚刚被加载到本次会话中。%s。你现在可以在合适的时候使用这个工具。]", toolName, description)
+		}
+		if _, err := s.persistToolAvailabilityMessage(ctx, narratorID, "tool_loaded", toolName, text); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{"toolName": toolName, "loaded": true, "alreadyLoaded": alreadyLoaded}, nil
+}
+
+func (s *Service) HandleUnloadToolCommand(ctx context.Context, narratorID string, cmd slashCommandResult, userID string) (map[string]any, error) {
+	locale := s.userLocale(ctx, userID)
+	if cmd.UnloadToolNotFound != "" {
+		toolID := cmd.UnloadToolNotFound
+		message := fmt.Sprintf("⚠️ Unknown tool: %s. Available: %s", toolID, strings.Join(availableOptionalToolIDs(), ", "))
+		if locale == "zh-CN" {
+			message = fmt.Sprintf("⚠️ 未知工具：%s。可用：%s", toolID, strings.Join(availableOptionalToolIDs(), ", "))
+		}
+		if _, err := s.persistDisplayMessage(ctx, narratorID, message); err != nil {
+			return nil, err
+		}
+		return map[string]any{"toolName": toolID, "unloaded": false, "notLoaded": false}, nil
+	}
+
+	toolName := strings.TrimSpace(cmd.UnloadTool)
+	result, err := s.unloadOptionalTool(ctx, narratorID, toolName)
+	if err != nil {
+		return nil, err
+	}
+	unknownTool := result == "unknown_tool"
+	notLoaded := result == "not_loaded"
+	message := fmt.Sprintf("🔧 Tool unloaded: %s", toolName)
+	if unknownTool {
+		message = fmt.Sprintf("⚠️ Unknown tool: %s", toolName)
+	} else if notLoaded {
+		message = fmt.Sprintf("🔧 Tool not loaded: %s", toolName)
+	}
+	if _, err := s.persistDisplayMessage(ctx, narratorID, message); err != nil {
+		return nil, err
+	}
+	if !unknownTool && !notLoaded {
+		text := fmt.Sprintf("[The optional tool %q has just been unloaded from this session. Do not use this tool unless it is loaded again.]", toolName)
+		if locale == "zh-CN" {
+			text = fmt.Sprintf("[可选工具 %q 刚刚从本次会话中卸载。除非它再次被加载，否则不要使用这个工具。]", toolName)
+		}
+		if _, err := s.persistToolAvailabilityMessage(ctx, narratorID, "tool_unloaded", toolName, text); err != nil {
+			return nil, err
+		}
+	}
+	return map[string]any{"toolName": toolName, "unloaded": !unknownTool && !notLoaded, "notLoaded": notLoaded}, nil
+}
+
+func (s *Service) loadOptionalTool(ctx context.Context, narratorID, toolName string, current []string) (string, error) {
+	if !supportedOptionalToolNames()[toolName] {
+		return "unknown_tool", nil
+	}
+	for _, existing := range current {
+		if existing == toolName {
+			return "already_loaded", nil
+		}
+	}
+	next := append(append([]string{}, current...), toolName)
+	payload, _ := json.Marshal(next)
+	_, err := s.DB.ExecContext(ctx, `UPDATE narrators SET enabled_tools = ?, updated_at = ? WHERE id = ?`, string(payload), db.NowISO(), narratorID)
+	if err != nil {
+		return "", err
+	}
+	return "loaded", nil
+}
+
+func (s *Service) unloadOptionalTool(ctx context.Context, narratorID, toolName string) (string, error) {
+	if !supportedOptionalToolNames()[toolName] {
+		return "unknown_tool", nil
+	}
+	narrator, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return "", err
+	}
+	current := anyStringSlice(narrator.EnabledTools)
+	next := []string{}
+	removed := false
+	for _, existing := range current {
+		if existing == toolName {
+			removed = true
+			continue
+		}
+		next = append(next, existing)
+	}
+	if !removed {
+		return "not_loaded", nil
+	}
+	payload, _ := json.Marshal(next)
+	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET enabled_tools = ?, updated_at = ? WHERE id = ?`, string(payload), db.NowISO(), narratorID)
+	if err != nil {
+		return "", err
+	}
+	return "unloaded", nil
+}
+
+func (s *Service) persistDisplayMessage(ctx context.Context, narratorID, text string) (Message, error) {
+	msg, err := s.addMessageWithBlocks(ctx, narratorID, "disp", "[Info] "+text, []map[string]any{{"type": "info", "message": text}}, nil)
+	if err != nil {
+		return Message{}, err
+	}
+	s.broadcastMessage(ctx, narratorID, msg)
+	return msg, nil
+}
+
+func (s *Service) persistToolAvailabilityMessage(ctx context.Context, narratorID, blockType, toolName, text string) (Message, error) {
+	msg, err := s.addMessageWithBlocks(ctx, narratorID, "user", text, []map[string]any{{"type": blockType, "toolName": toolName, "text": text}}, nil)
+	if err != nil {
+		return Message{}, err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "user_message", "narratorId": narratorID, "message": msg})
+	}
+	return msg, nil
+}
+
+func (s *Service) userLocale(ctx context.Context, userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" {
+		return "en"
+	}
+	var locale sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT language FROM user_preferences WHERE user_id = ?`, userID).Scan(&locale); err != nil {
+		return "en"
+	}
+	if strings.TrimSpace(locale.String) == "zh-CN" {
+		return "zh-CN"
+	}
+	return "en"
+}
+
+func toolNameBoolSet(values []string) map[string]bool {
+	set := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			set[value] = true
+		}
+	}
+	return set
+}
+
 func (s *Service) HandleBashCommand(ctx context.Context, narratorID, command, rawCommand, userID string) (map[string]any, error) {
 	narrator, err := s.Get(ctx, narratorID)
 	if err != nil {
@@ -6543,9 +6745,7 @@ func (s *Service) markGoalReflectionStatus(ctx context.Context, narratorID strin
 		errorMessage = message
 	}
 	if strings.TrimSpace(meta.ToolUseID) != "" {
-		if toolCallID, err := s.recordedToolCallID(ctx, narratorID, meta.ToolUseID); err == nil && toolCallID.Valid {
-			_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, input_json = ?, permission_started_at = COALESCE(permission_started_at, ?), permission_decision_reason = ?, permission_suggestions = ?, permission_decided_at = COALESCE(?, permission_decided_at), error_message = ? WHERE id = ?`, dbStatus, string(inputJSON), startedAt, message, string(suggestionsJSON), decidedAt, errorMessage, toolCallID.String)
-		}
+		_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = ?, input_json = ?, permission_started_at = COALESCE(permission_started_at, ?), permission_decision_reason = ?, permission_suggestions = ?, permission_decided_at = COALESCE(?, permission_decided_at), error_message = ? WHERE narrator_id = ? AND tool_use_id = ?`, dbStatus, string(inputJSON), startedAt, message, string(suggestionsJSON), decidedAt, errorMessage, narratorID, meta.ToolUseID)
 	}
 	if s.Hub == nil {
 		return

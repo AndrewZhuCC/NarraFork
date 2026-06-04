@@ -111,6 +111,7 @@ interface NUGProvidersSectionProps {
 	onToggleHidden: (modelVal: string) => void;
 	modelContextWindows: Record<string, number>;
 	onContextWindowChange: (modelVal: string, size: number | null) => void;
+	onMergeContextWindows?: (windows: Record<string, number>) => void;
 	isProviderDirty?: (providerId: string) => boolean;
 	onSaveBeforeRefresh?: () => Promise<boolean>;
 	onSaveBeforeNugAction?: () => Promise<boolean>;
@@ -284,7 +285,7 @@ function NUGAccountInfo({
 	if (!nugUsername && !quota) return null;
 
 	return (
-		<Paper withBorder p="xs" bg="var(--mantine-color-dark-7)">
+		<Paper withBorder p="xs">
 			<Group justify="space-between">
 				<Group gap="xs">
 					<IconUser size={16} />
@@ -613,6 +614,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 	onToggleHidden,
 	modelContextWindows,
 	onContextWindowChange,
+	onMergeContextWindows,
 	isProviderDirty,
 	onSaveBeforeRefresh,
 	onSaveBeforeNugAction,
@@ -676,7 +678,8 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 			}
 			setRefreshingProvider(providerId);
 			try {
-				await api.nugRefreshProviderModels(providerId);
+				const result = await api.nugRefreshProviderModels(providerId);
+				if (result.modelContextWindows) onMergeContextWindows?.(result.modelContextWindows);
 				qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 				qc.invalidateQueries({ queryKey: ["settings"] });
 			} catch {
@@ -689,7 +692,14 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 				setRefreshingProvider(null);
 			}
 		},
-		[canRefreshNugProviderModels, qc, t, isProviderDirty, onSaveBeforeRefresh],
+		[
+			canRefreshNugProviderModels,
+			qc,
+			t,
+			isProviderDirty,
+			onSaveBeforeRefresh,
+			onMergeContextWindows,
+		],
 	);
 
 	const handleLoginSuccess = useCallback(

@@ -3245,8 +3245,26 @@ func loadProviderModelCache(kind string) (map[string][]map[string]any, error) {
 		return map[string][]map[string]any{}, nil
 	}
 	raw := map[string][]map[string]any{}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := json.Unmarshal(data, &raw); err == nil {
+		return raw, nil
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
 		return map[string][]map[string]any{}, err
+	}
+	providers := decoded
+	if nested, ok := decoded["providers"].(map[string]any); ok {
+		providers = nested
+	}
+	for providerID, value := range providers {
+		switch typed := value.(type) {
+		case []any:
+			raw[providerID] = mapsFromAnyModels(typed)
+		case map[string]any:
+			if models, ok := typed["models"].([]any); ok {
+				raw[providerID] = mapsFromAnyModels(models)
+			}
+		}
 	}
 	return raw, nil
 }
@@ -3260,6 +3278,59 @@ func saveProviderModelCache(kind string, value map[string][]map[string]any) erro
 		return err
 	}
 	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func loadProviderModelHashCache(kind string) map[string]string {
+	path, err := providerModelCachePath(kind)
+	if err != nil {
+		return map[string]string{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]string{}
+	}
+	decoded := map[string]any{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return map[string]string{}
+	}
+	providers, _ := decoded["providers"].(map[string]any)
+	if providers == nil {
+		return map[string]string{}
+	}
+	out := map[string]string{}
+	for providerID, value := range providers {
+		entry, ok := value.(map[string]any)
+		if !ok {
+			continue
+		}
+		if hash := firstNonEmpty(stringMap(entry, "modelHash", ""), stringMap(entry, "hash", "")); strings.TrimSpace(hash) != "" {
+			out[providerID] = strings.TrimSpace(hash)
+		}
+	}
+	return out
+}
+
+func saveNugProviderModelCache(value map[string][]map[string]any, hashes map[string]string) error {
+	path, err := providerModelCachePath("nug")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	providers := map[string]any{}
+	for providerID, models := range value {
+		entry := map[string]any{"models": models}
+		if hash := strings.TrimSpace(hashes[providerID]); hash != "" {
+			entry["modelHash"] = hash
+		}
+		providers[providerID] = entry
+	}
+	data, err := json.Marshal(map[string]any{"version": 1, "providers": providers})
 	if err != nil {
 		return err
 	}
@@ -3293,6 +3364,7 @@ func (h *Handler) nugAllModels(w http.ResponseWriter, r *http.Request) error {
 	}
 	providers := h.providerConfigs("nug")
 	cache, _ := loadProviderModelCache("nug")
+	hashes := loadProviderModelHashCache("nug")
 	if r.Method == http.MethodGet {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": aggregateProviderModels("nug", providers, cache), "fromCache": true})
 		return nil
@@ -3314,25 +3386,42 @@ func (h *Handler) nugAllModels(w http.ResponseWriter, r *http.Request) error {
 			results = append(results, result)
 			continue
 		}
+		modelHash := strings.TrimSpace(firstNonEmpty(stringMap(data, "modelHash", ""), stringMap(data, "hash", "")))
+		if modelHash != "" {
+			result["modelHash"] = modelHash
+			hashes[providerID] = modelHash
+		} else {
+			delete(hashes, providerID)
+		}
 		models := normalizeNugModelMaps(data)
 		cache[providerID] = models
+		if _, err := h.mergeNugModelContextWindows(provider, models); err != nil {
+			result["error"] = err.Error()
+			results = append(results, result)
+			continue
+		}
 		result["count"] = len(models)
 		results = append(results, result)
 	}
-	_ = saveProviderModelCache("nug", cache)
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results, "models": aggregateProviderModels("nug", providers, cache), "fromCache": false})
+	_ = saveNugProviderModelCache(cache, hashes)
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"results": results, "models": aggregateProviderModels("nug", providers, cache), "fromCache": false, "modelContextWindows": h.currentModelContextWindows()})
 	return nil
 }
 
 func (h *Handler) nugModels(w http.ResponseWriter, r *http.Request) error {
 	providerID := chi.URLParam(r, "id")
 	cache, _ := loadProviderModelCache("nug")
+	hashes := loadProviderModelHashCache("nug")
 	if r.Method == http.MethodGet {
 		models := uniqueModelMaps(cache[providerID], "id")
 		if models == nil {
 			models = []map[string]any{}
 		}
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": true})
+		response := map[string]any{"models": models, "fromCache": true}
+		if hash := strings.TrimSpace(hashes[providerID]); hash != "" {
+			response["modelHash"] = hash
+		}
+		httpx.WriteJSON(w, http.StatusOK, response)
 		return nil
 	}
 
@@ -3350,10 +3439,24 @@ func (h *Handler) nugModels(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	modelHash := strings.TrimSpace(firstNonEmpty(stringMap(data, "modelHash", ""), stringMap(data, "hash", "")))
 	models := normalizeNugModelMaps(data)
 	cache[providerID] = models
-	_ = saveProviderModelCache("nug", cache)
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"models": models, "fromCache": false})
+	if modelHash != "" {
+		hashes[providerID] = modelHash
+	} else {
+		delete(hashes, providerID)
+	}
+	_ = saveNugProviderModelCache(cache, hashes)
+	modelContextWindows, err := h.mergeNugModelContextWindows(provider, models)
+	if err != nil {
+		return err
+	}
+	response := map[string]any{"models": models, "fromCache": false, "modelContextWindows": modelContextWindows}
+	if modelHash != "" {
+		response["modelHash"] = modelHash
+	}
+	httpx.WriteJSON(w, http.StatusOK, response)
 	return nil
 }
 
@@ -3478,6 +3581,14 @@ func (h *Handler) fetchNugJSON(ctx context.Context, providerID, endpoint string,
 	if err := json.Unmarshal(body, &data); err != nil {
 		return nil, err
 	}
+	if headerHash := strings.TrimSpace(resp.Header.Get("X-NUG-Model-Hash")); headerHash != "" {
+		if strings.TrimSpace(stringMap(data, "modelHash", "")) == "" {
+			data["modelHash"] = headerHash
+		}
+		if strings.TrimSpace(stringMap(data, "hash", "")) == "" {
+			data["hash"] = headerHash
+		}
+	}
 	return data, nil
 }
 
@@ -3519,6 +3630,75 @@ func normalizeNugModels(data map[string]any) []any {
 	return out
 }
 
+func nugModelContextLength(model map[string]any) (any, bool) {
+	for _, key := range []string{"contextLength", "contextWindow", "context_length", "context_window"} {
+		if _, ok := model[key]; !ok {
+			continue
+		}
+		value := numericMapOr(model, key, 0)
+		if value > 0 {
+			return int64(value), true
+		}
+	}
+	return nil, false
+}
+
+func (h *Handler) currentModelContextWindows() map[string]any {
+	if h.Settings == nil {
+		return map[string]any{}
+	}
+	raw := h.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	windows, _ := agent["modelContextWindows"].(map[string]any)
+	if windows == nil {
+		return map[string]any{}
+	}
+	return windows
+}
+
+func (h *Handler) mergeNugModelContextWindows(provider map[string]any, models []map[string]any) (map[string]any, error) {
+	if h.Settings == nil {
+		return map[string]any{}, nil
+	}
+	raw := h.Settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	if agent == nil {
+		agent = map[string]any{}
+	}
+	windows, _ := agent["modelContextWindows"].(map[string]any)
+	if windows == nil {
+		windows = map[string]any{}
+	}
+	prefix := firstNonEmpty(stringMap(provider, "prefix", ""), "nug")
+	changed := false
+	for _, model := range models {
+		modelID := strings.TrimSpace(stringMap(model, "id", ""))
+		if modelID == "" {
+			continue
+		}
+		contextLength, ok := nugModelContextLength(model)
+		if !ok || windows[prefix+":"+modelID] != nil {
+			continue
+		}
+		windows[prefix+":"+modelID] = contextLength
+		changed = true
+	}
+	if !changed {
+		return windows, nil
+	}
+	agent["modelContextWindows"] = windows
+	patched, err := h.Settings.Patch(map[string]any{"agent": agent})
+	if err != nil {
+		return nil, err
+	}
+	if patchedAgent, ok := patched["agent"].(map[string]any); ok {
+		if patchedWindows, ok := patchedAgent["modelContextWindows"].(map[string]any); ok {
+			return patchedWindows, nil
+		}
+	}
+	return windows, nil
+}
+
 func normalizeNugModelMaps(data map[string]any) []map[string]any {
 	rawModels, _ := data["models"].([]any)
 	if rawModels == nil {
@@ -3542,6 +3722,9 @@ func normalizeNugModelMaps(data map[string]any) []map[string]any {
 		}
 		seen[modelID] = true
 		model["id"] = modelID
+		if contextLength, ok := nugModelContextLength(model); ok {
+			model["contextLength"] = contextLength
+		}
 		out = append(out, model)
 	}
 	sort.Slice(out, func(i, j int) bool { return stringMap(out[i], "id", "") < stringMap(out[j], "id", "") })

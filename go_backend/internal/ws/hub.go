@@ -3,6 +3,7 @@ package ws
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/db"
@@ -1374,6 +1376,12 @@ func (h *Hub) handleBufferMessage(c *client, msg map[string]any) {
 		c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text is required"})
 		return
 	}
+	if action, toolID, ok := parseWSOptionalToolSlashCommand(text); ok {
+		if err := h.handleWSOptionalToolSlashCommand(ctx, sqlDB, c, narratorID, action, toolID); err != nil {
+			c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": err.Error()})
+		}
+		return
+	}
 	seq := 0
 	if err := sqlDB.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), -1) + 1 FROM narrator_buffered_messages WHERE narrator_id = ?`, narratorID).Scan(&seq); err != nil {
 		c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "query next buffered message sequence: " + err.Error()})
@@ -1387,6 +1395,292 @@ func (h *Hub) handleBufferMessage(c *client, msg map[string]any) {
 		return
 	}
 	h.broadcastBufferSetOrError(c, sqlDB, narratorID)
+}
+
+type wsOptionalToolDefinition struct {
+	ID            string
+	ToolName      string
+	DescriptionEn string
+	DescriptionZh string
+}
+
+func wsOptionalToolDefinitions() []wsOptionalToolDefinition {
+	return []wsOptionalToolDefinition{
+		{ID: "terminal", ToolName: "Terminal", DescriptionEn: "Interactive terminal — read buffer, send input, list terminals", DescriptionZh: "交互式终端 — 读取缓冲区、发送输入、列出终端"},
+		{ID: "share_file", ToolName: "ShareFile", DescriptionEn: "Share files/directories — generate temporary download links", DescriptionZh: "分享文件/目录 — 生成临时下载链接"},
+		{ID: "recall", ToolName: "Recall", DescriptionEn: "Search and browse all narrator conversations", DescriptionZh: "搜索和浏览所有叙述者对话"},
+		{ID: "browser", ToolName: "Browser", DescriptionEn: "Interactive browser — navigate, click, fill forms, take screenshots", DescriptionZh: "交互式浏览器 — 导航、点击、填写表单、截图"},
+		{ID: "fork_narrator", ToolName: "ForkNarrator", DescriptionEn: "Fork the current narrator session into a new chapter", DescriptionZh: "将当前叙述者会话分叉到新章节"},
+		{ID: "narrafork_admin", ToolName: "NarraForkAdmin", DescriptionEn: "Admin settings management — get and modify all NarraFork settings", DescriptionZh: "管理员设置管理 — 获取和修改所有 NarraFork 设置"},
+	}
+}
+
+func parseWSOptionalToolSlashCommand(text string) (string, string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "/") {
+		return "", "", false
+	}
+	body := strings.TrimPrefix(trimmed, "/")
+	name, input, _ := strings.Cut(body, " ")
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name != "load" && name != "unload" {
+		return "", "", false
+	}
+	toolID := strings.ToLower(strings.TrimSpace(input))
+	if toolID == "" {
+		return "", "", false
+	}
+	return name, toolID, true
+}
+
+func wsSupportedOptionalToolNames() map[string]bool {
+	supported := map[string]bool{}
+	for _, tool := range agentbasic.ToolMenuCapabilities() {
+		if stringValue(tool["category"]) != agentbasic.ToolCategoryOptional || tool["supported"] != true {
+			continue
+		}
+		if name := strings.TrimSpace(stringValue(tool["name"])); name != "" {
+			supported[name] = true
+		}
+	}
+	return supported
+}
+
+func wsAvailableOptionalToolIDs() []string {
+	supported := wsSupportedOptionalToolNames()
+	ids := []string{}
+	for _, tool := range wsOptionalToolDefinitions() {
+		if supported[tool.ToolName] {
+			ids = append(ids, tool.ID)
+		}
+	}
+	return ids
+}
+
+func wsResolveOptionalToolByID(toolID string) (wsOptionalToolDefinition, bool) {
+	toolID = strings.ToLower(strings.TrimSpace(toolID))
+	supported := wsSupportedOptionalToolNames()
+	for _, tool := range wsOptionalToolDefinitions() {
+		if strings.ToLower(tool.ID) == toolID && supported[tool.ToolName] {
+			return tool, true
+		}
+	}
+	return wsOptionalToolDefinition{}, false
+}
+
+func (h *Hub) handleWSOptionalToolSlashCommand(ctx context.Context, sqlDB *sql.DB, c *client, narratorID, action, toolID string) error {
+	locale := wsUserLocale(ctx, sqlDB, c.userID)
+	tool, ok := wsResolveOptionalToolByID(toolID)
+	if !ok {
+		message := fmt.Sprintf("⚠️ Unknown tool: %s. Available: %s", toolID, strings.Join(wsAvailableOptionalToolIDs(), ", "))
+		if locale == "zh-CN" {
+			message = fmt.Sprintf("⚠️ 未知工具：%s。可用：%s", toolID, strings.Join(wsAvailableOptionalToolIDs(), ", "))
+		}
+		return h.persistWSDisplayMessage(ctx, sqlDB, narratorID, message)
+	}
+	if action == "unload" {
+		return h.handleWSUnloadTool(ctx, sqlDB, narratorID, tool, locale)
+	}
+	return h.handleWSLoadTool(ctx, sqlDB, narratorID, tool, locale)
+}
+
+func (h *Hub) handleWSLoadTool(ctx context.Context, sqlDB *sql.DB, narratorID string, tool wsOptionalToolDefinition, locale string) error {
+	current, traits, err := wsLoadNarratorToolState(ctx, sqlDB, narratorID)
+	if err != nil {
+		return err
+	}
+	if wsDisabledToolSetFromTraits(traits)[tool.ToolName] {
+		message := fmt.Sprintf("⛔ Tool disabled by this narrator's custom trait: %s", tool.ToolName)
+		if locale == "zh-CN" {
+			message = fmt.Sprintf("⛔ 工具已被此叙述者的自定义 trait 禁用：%s", tool.ToolName)
+		}
+		return h.persistWSDisplayMessage(ctx, sqlDB, narratorID, message)
+	}
+	if wsStringSliceContains(current, tool.ToolName) {
+		return h.persistWSDisplayMessage(ctx, sqlDB, narratorID, fmt.Sprintf("🔧 Tool already loaded: %s", tool.ToolName))
+	}
+	next := append(append([]string{}, current...), tool.ToolName)
+	payload, _ := json.Marshal(next)
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE narrators SET enabled_tools = ?, updated_at = ? WHERE id = ?`, string(payload), db.NowISO(), narratorID); err != nil {
+		return err
+	}
+	if err := h.persistWSDisplayMessage(ctx, sqlDB, narratorID, fmt.Sprintf("🔧 Tool loaded: %s", tool.ToolName)); err != nil {
+		return err
+	}
+	description := tool.DescriptionEn
+	if locale == "zh-CN" {
+		description = tool.DescriptionZh
+	}
+	text := fmt.Sprintf("[The optional tool %q has just been loaded into this session. %s. You can now use this tool when appropriate.]", tool.ToolName, description)
+	if locale == "zh-CN" {
+		text = fmt.Sprintf("[可选工具 %q 刚刚被加载到本次会话中。%s。你现在可以在合适的时候使用这个工具。]", tool.ToolName, description)
+	}
+	return h.persistWSToolAvailabilityMessage(ctx, sqlDB, narratorID, "tool_loaded", tool.ToolName, text)
+}
+
+func (h *Hub) handleWSUnloadTool(ctx context.Context, sqlDB *sql.DB, narratorID string, tool wsOptionalToolDefinition, locale string) error {
+	current, _, err := wsLoadNarratorToolState(ctx, sqlDB, narratorID)
+	if err != nil {
+		return err
+	}
+	if !wsStringSliceContains(current, tool.ToolName) {
+		return h.persistWSDisplayMessage(ctx, sqlDB, narratorID, fmt.Sprintf("🔧 Tool not loaded: %s", tool.ToolName))
+	}
+	next := []string{}
+	for _, existing := range current {
+		if existing != tool.ToolName {
+			next = append(next, existing)
+		}
+	}
+	payload, _ := json.Marshal(next)
+	if _, err := sqlDB.ExecContext(ctx, `UPDATE narrators SET enabled_tools = ?, updated_at = ? WHERE id = ?`, string(payload), db.NowISO(), narratorID); err != nil {
+		return err
+	}
+	if err := h.persistWSDisplayMessage(ctx, sqlDB, narratorID, fmt.Sprintf("🔧 Tool unloaded: %s", tool.ToolName)); err != nil {
+		return err
+	}
+	text := fmt.Sprintf("[The optional tool %q has just been unloaded from this session. Do not use this tool unless it is loaded again.]", tool.ToolName)
+	if locale == "zh-CN" {
+		text = fmt.Sprintf("[可选工具 %q 刚刚从本次会话中卸载。除非它再次被加载，否则不要使用这个工具。]", tool.ToolName)
+	}
+	return h.persistWSToolAvailabilityMessage(ctx, sqlDB, narratorID, "tool_unloaded", tool.ToolName, text)
+}
+
+func wsLoadNarratorToolState(ctx context.Context, sqlDB *sql.DB, narratorID string) ([]string, []string, error) {
+	var enabledRaw, traitsRaw sql.NullString
+	err := sqlDB.QueryRowContext(ctx, `SELECT enabled_tools, traits FROM narrators WHERE id = ?`, narratorID).Scan(&enabledRaw, &traitsRaw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wsStringSliceFromJSON(enabledRaw), wsStringSliceFromJSON(traitsRaw), nil
+}
+
+func wsStringSliceFromJSON(raw sql.NullString) []string {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal([]byte(raw.String), &values); err == nil {
+		return wsCleanStringSlice(values)
+	}
+	var anyValues []any
+	if err := json.Unmarshal([]byte(raw.String), &anyValues); err != nil {
+		return nil
+	}
+	out := []string{}
+	for _, value := range anyValues {
+		if text := strings.TrimSpace(stringValue(value)); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func wsCleanStringSlice(values []string) []string {
+	out := []string{}
+	for _, value := range values {
+		if text := strings.TrimSpace(value); text != "" {
+			out = append(out, text)
+		}
+	}
+	return out
+}
+
+func wsStringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
+func wsDisabledToolSetFromTraits(traits []string) map[string]bool {
+	set := map[string]bool{}
+	const prefix = "custom-disabled-tools:"
+	for _, trait := range traits {
+		if !strings.HasPrefix(trait, prefix) {
+			continue
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(trait, prefix))
+		if err != nil {
+			continue
+		}
+		var decoded struct {
+			Version int      `json:"version"`
+			Tools   []string `json:"tools"`
+		}
+		if err := json.Unmarshal(payload, &decoded); err != nil || decoded.Version != 1 {
+			continue
+		}
+		for _, tool := range decoded.Tools {
+			if name := strings.TrimSpace(tool); name != "" {
+				set[name] = true
+			}
+		}
+	}
+	return set
+}
+
+func wsUserLocale(ctx context.Context, sqlDB *sql.DB, userID string) string {
+	if strings.TrimSpace(userID) == "" {
+		return "en"
+	}
+	var locale sql.NullString
+	if err := sqlDB.QueryRowContext(ctx, `SELECT language FROM user_preferences WHERE user_id = ?`, userID).Scan(&locale); err != nil {
+		return "en"
+	}
+	if strings.TrimSpace(locale.String) == "zh-CN" {
+		return "zh-CN"
+	}
+	return "en"
+}
+
+func (h *Hub) persistWSDisplayMessage(ctx context.Context, sqlDB *sql.DB, narratorID, text string) error {
+	msg, err := insertWSNarratorMessage(ctx, sqlDB, narratorID, "disp", "[Info] "+text, []map[string]any{{"type": "info", "message": text}})
+	if err != nil {
+		return err
+	}
+	h.BroadcastNarrator(narratorID, map[string]any{"type": "message", "narratorId": narratorID, "message": msg})
+	return nil
+}
+
+func (h *Hub) persistWSToolAvailabilityMessage(ctx context.Context, sqlDB *sql.DB, narratorID, blockType, toolName, text string) error {
+	msg, err := insertWSNarratorMessage(ctx, sqlDB, narratorID, "user", text, []map[string]any{{"type": blockType, "toolName": toolName, "text": text}})
+	if err != nil {
+		return err
+	}
+	h.BroadcastNarrator(narratorID, map[string]any{"type": "user_message", "narratorId": narratorID, "message": msg})
+	return nil
+}
+
+func insertWSNarratorMessage(ctx context.Context, sqlDB *sql.DB, narratorID, role, contentText string, content any) (map[string]any, error) {
+	msgID := id.New()
+	refID := id.New()
+	now := db.NowISO()
+	contentJSON, _ := json.Marshal(content)
+	tx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES (?, ?, ?, ?, ?, ?)`, msgID, narratorID, role, string(contentJSON), contentText, now); err != nil {
+		return nil, err
+	}
+	seq := 1
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) + 1 FROM narrator_message_refs WHERE narrator_id = ?`, narratorID).Scan(&seq); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES (?, ?, ?, ?, 0)`, refID, narratorID, msgID, seq); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE narrators SET message_count = COALESCE(message_count, 0) + 1, message_version = message_version + 1, last_message_at = ?, updated_at = ? WHERE id = ?`, now, now, narratorID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return map[string]any{"id": msgID, "narratorId": narratorID, "role": role, "contentJson": content, "contentText": contentText, "createdAt": now, "seq": seq, "children": []any{}}, nil
 }
 
 func (h *Hub) handleCancelBuffer(c *client, msg map[string]any) {

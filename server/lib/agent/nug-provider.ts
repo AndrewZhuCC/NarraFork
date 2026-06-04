@@ -7,7 +7,12 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { prepareNkpRequest } from "../nkp-ext";
-import { type ResolvedNugModelMeta, resolveNugModelMeta } from "../nug-model-cache";
+import {
+	getNugCachedModelHash,
+	type ResolvedNugModelMeta,
+	resolveNugModelMeta,
+} from "../nug-model-cache";
+import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NUGProviderConfig } from "../settings";
 import type { UsageData } from "../usage-tracking";
@@ -89,6 +94,9 @@ export interface NugQuota {
 	totalGranted: number;
 }
 
+const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
+const NUG_UNKNOWN_MODEL_HASH = "none";
+
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
  *
@@ -112,11 +120,20 @@ export class NugProvider implements ProviderAdapter {
 		return this.config.baseUrl.replace(/\/+$/, "");
 	}
 
+	private modelHashHeaderValue(): string {
+		return getNugCachedModelHash(this.config.id) ?? NUG_UNKNOWN_MODEL_HASH;
+	}
+
+	private modelHashHeaders(): Record<string, string> {
+		return { [NUG_MODEL_HASH_HEADER]: this.modelHashHeaderValue() };
+	}
+
 	private chatHeaders(conversationId?: string): Record<string, string> {
 		const h: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${this.config.apiKey}`,
 			Accept: "text/event-stream",
+			...this.modelHashHeaders(),
 		};
 		if (conversationId) {
 			h["X-Conversation-ID"] = conversationId;
@@ -139,6 +156,7 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	private createDelegate(meta: ResolvedNugModelMeta): ProviderAdapter | null {
+		const extraHeaders = this.modelHashHeaders();
 		switch (meta.channelType) {
 			case "codex":
 				return new OpenAIProvider({
@@ -150,6 +168,7 @@ export class NugProvider implements ProviderAdapter {
 					defaultModel: meta.routedModel,
 					apiMode: "codex",
 					codexWebSocket: false,
+					extraHeaders,
 				});
 			case "openai":
 				return new OpenAIProvider({
@@ -160,6 +179,7 @@ export class NugProvider implements ProviderAdapter {
 					baseUrl: `${this.baseUrl}/v1`,
 					defaultModel: meta.routedModel,
 					apiMode: "completions",
+					extraHeaders,
 				});
 			case "anthropic":
 				return new AnthropicProvider({
@@ -170,6 +190,7 @@ export class NugProvider implements ProviderAdapter {
 					baseUrl: `${this.baseUrl}/v1/anthropic`,
 					defaultModel: meta.routedModel,
 					officialApi: false,
+					extraHeaders,
 				});
 			default:
 				return null;
@@ -182,6 +203,22 @@ export class NugProvider implements ProviderAdapter {
 		this.activeMeta = meta;
 		this.activeDelegate = this.createDelegate(meta);
 		return this.activeDelegate;
+	}
+
+	private consumeModelCatalogEvent(event: ParsedStreamEvent): boolean {
+		const catalog = event.nugModelCatalog;
+		if (!catalog) return false;
+		applyNugModelCatalogUpdate(this.config, catalog.models, catalog.modelHash);
+		return true;
+	}
+
+	private async *filterModelCatalogEvents(
+		stream: AsyncIterable<ParsedStreamEvent>,
+	): AsyncGenerator<ParsedStreamEvent> {
+		for await (const event of stream) {
+			if (this.consumeModelCatalogEvent(event)) continue;
+			yield event;
+		}
 	}
 
 	// === ProviderAdapter interface ===
@@ -258,10 +295,10 @@ export class NugProvider implements ProviderAdapter {
 		this.activeMeta = meta;
 		this.activeDelegate = delegate;
 		if (delegate) {
-			yield* delegate.chat({ ...params, model: this.modelForDelegate(meta) });
+			yield* this.filterModelCatalogEvents(delegate.chat({ ...params, model: this.modelForDelegate(meta) }));
 			return;
 		}
-		yield* this.chatKiro(params, meta);
+		yield* this.filterModelCatalogEvents(this.chatKiro(params, meta));
 	}
 
 	private async *chatKiro(
@@ -519,6 +556,7 @@ export class NugProvider implements ProviderAdapter {
 
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
+				if (this.consumeModelCatalogEvent(evt)) continue;
 				if (evt.text != null) chunks.push(evt.text);
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
@@ -638,6 +676,7 @@ export class NugProvider implements ProviderAdapter {
 		let meterUnit: string | undefined;
 		if (response.body) {
 			for await (const evt of parseSSEStream(response.body)) {
+				if (this.consumeModelCatalogEvent(evt)) continue;
 				if (evt.text != null) chunks.push(evt.text);
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
@@ -656,7 +695,7 @@ export class NugProvider implements ProviderAdapter {
 
 	async getChannelsHealth(): Promise<{ channels: NugChannelHealthStatus[] }> {
 		const response = await fetch(`${this.baseUrl}/v1/channels/health`, {
-			headers: { Authorization: `Bearer ${this.config.apiKey}` },
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -667,7 +706,7 @@ export class NugProvider implements ProviderAdapter {
 
 	async getQuota(): Promise<NugQuota> {
 		const response = await fetch(`${this.baseUrl}/v1/quota`, {
-			headers: { Authorization: `Bearer ${this.config.apiKey}` },
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -681,7 +720,7 @@ export class NugProvider implements ProviderAdapter {
 		url.searchParams.set("limit", String(limit));
 		url.searchParams.set("offset", String(offset));
 		const response = await fetch(url.toString(), {
-			headers: { Authorization: `Bearer ${this.config.apiKey}` },
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -694,7 +733,7 @@ export class NugProvider implements ProviderAdapter {
 		const url = new URL(`${this.baseUrl}/v1/usage/summary`);
 		if (period) url.searchParams.set("period", period);
 		const response = await fetch(url.toString(), {
-			headers: { Authorization: `Bearer ${this.config.apiKey}` },
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
@@ -703,14 +742,30 @@ export class NugProvider implements ProviderAdapter {
 		return (await response.json()) as NugUsageSummary;
 	}
 
-	async getModels(): Promise<{ models: Array<Record<string, unknown>> }> {
+	async getModels(): Promise<{
+		models: Array<Record<string, unknown>>;
+		modelHash?: string;
+		hash?: string;
+	}> {
 		const response = await fetch(`${this.baseUrl}/v1/models`, {
-			headers: { Authorization: `Bearer ${this.config.apiKey}` },
+			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			throw httpError(`NUG models error ${response.status}: ${errText}`, response.status);
 		}
-		return (await response.json()) as { models: Array<Record<string, unknown>> };
+		const data = (await response.json()) as {
+			models?: Array<Record<string, unknown>>;
+			modelHash?: string;
+			hash?: string;
+		};
+		const headerHash = response.headers.get("X-NUG-Model-Hash")?.trim();
+		if (!data.modelHash && headerHash) {
+			data.modelHash = headerHash;
+		}
+		if (!data.hash && data.modelHash) {
+			data.hash = data.modelHash;
+		}
+		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash };
 	}
 }
