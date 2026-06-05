@@ -2059,6 +2059,10 @@ func (h *Handler) RegisterProviders(r chi.Router) {
 	r.Post("/nug/providers/{id}/api-key", httpx.Handler(h.nugAPIKey))
 	r.Get("/nug/providers/{id}/quota", httpx.Handler(h.nugQuota))
 	r.Get("/nug/quotas", httpx.Handler(h.nugQuotas))
+	r.Get("/nug/providers/{id}/billing/config", httpx.Handler(h.nugBillingConfig))
+	r.Post("/nug/providers/{id}/billing/orders", httpx.Handler(h.nugBillingCreateOrder))
+	r.Get("/nug/providers/{id}/billing/orders/{orderId}", httpx.Handler(h.nugBillingGetOrder))
+	r.Post("/nug/providers/{id}/billing/orders/{orderId}/repay", httpx.Handler(h.nugBillingRepayOrder))
 	r.Get("/nug/providers/{id}/channels/health", httpx.Handler(h.nugChannelsHealth))
 	r.Get("/nug/providers/{id}/usage", httpx.Handler(h.nugUsage))
 	r.Get("/nug/providers/{id}/usage/summary", httpx.Handler(h.nugUsageSummary))
@@ -3491,6 +3495,48 @@ func (h *Handler) nugQuotas(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+func (h *Handler) nugBillingConfig(w http.ResponseWriter, r *http.Request) error {
+	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/billing/config", url.Values{})
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, data)
+	return nil
+}
+
+func (h *Handler) nugBillingCreateOrder(w http.ResponseWriter, r *http.Request) error {
+	var payload map[string]any
+	if err := httpx.DecodeLooseJSON(r, &payload); err != nil {
+		return err
+	}
+	data, err := h.fetchNugJSONWithBody(r.Context(), chi.URLParam(r, "id"), http.MethodPost, "/v1/billing/orders", url.Values{}, payload)
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusCreated, data)
+	return nil
+}
+
+func (h *Handler) nugBillingGetOrder(w http.ResponseWriter, r *http.Request) error {
+	endpoint := "/v1/billing/orders/" + url.PathEscape(chi.URLParam(r, "orderId"))
+	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), endpoint, url.Values{})
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, data)
+	return nil
+}
+
+func (h *Handler) nugBillingRepayOrder(w http.ResponseWriter, r *http.Request) error {
+	endpoint := "/v1/billing/orders/" + url.PathEscape(chi.URLParam(r, "orderId")) + "/repay"
+	data, err := h.fetchNugJSONWithBody(r.Context(), chi.URLParam(r, "id"), http.MethodPost, endpoint, url.Values{}, map[string]any{})
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, data)
+	return nil
+}
+
 func (h *Handler) nugChannelsHealth(w http.ResponseWriter, r *http.Request) error {
 	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/channels/health", url.Values{})
 	if err != nil {
@@ -3547,6 +3593,10 @@ func (h *Handler) nugUsageSummary(w http.ResponseWriter, r *http.Request) error 
 }
 
 func (h *Handler) fetchNugJSON(ctx context.Context, providerID, endpoint string, query url.Values) (map[string]any, error) {
+	return h.fetchNugJSONWithBody(ctx, providerID, http.MethodGet, endpoint, query, nil)
+}
+
+func (h *Handler) fetchNugJSONWithBody(ctx context.Context, providerID, method, endpoint string, query url.Values, payload any) (map[string]any, error) {
 	provider, baseURL, err := h.nugProvider(providerID)
 	if err != nil {
 		return nil, err
@@ -3559,12 +3609,23 @@ func (h *Handler) fetchNugJSON(ctx context.Context, providerID, endpoint string,
 	if len(query) > 0 {
 		target += "?" + query.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	var reqBody io.Reader
+	if payload != nil {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+		reqBody = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 	if err != nil {
 		return nil, httpx.Error(http.StatusBadGateway, "BAD_GATEWAY", err.Error())

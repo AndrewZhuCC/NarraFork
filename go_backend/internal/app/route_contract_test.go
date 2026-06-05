@@ -622,6 +622,10 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"channelsHealth":           true,
 		"usageSummary":             true,
 		"quotas":                   true,
+		"billingConfig":            true,
+		"billingCreateOrder":       true,
+		"billingGetOrder":          true,
+		"billingRepayOrder":        true,
 	})
 	assertNestedCapability(t, caps, []string{"providers", "cline", "routes"}, map[string]any{
 		"modelsRefresh":            true,

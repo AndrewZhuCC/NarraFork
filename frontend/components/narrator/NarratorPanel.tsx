@@ -209,6 +209,7 @@ import { useNarratorMessageRendererMode } from "./message-renderer-mode";
 import { buildStreamingMsg, segmentMessages } from "./message-segments";
 import { evictOldestPages, findMsgByToolUseIdInTree } from "./message-tree-utils";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
+import { NugRechargeDialog } from "./NugRechargeDialog";
 import { resolvePendingPerm, revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type {
 	ContentBlock,
@@ -241,7 +242,27 @@ import {
 	setGlobalToggleBlock,
 } from "./swipeState";
 import { FileModDrawerCtx, LatestTodosToolUseIdCtx, PermEnterHintCtx } from "./ToolCallCard";
-import { useNarratorPanelWS } from "./useNarratorPanelWS";
+import { type PaymentRequiredInfo, useNarratorPanelWS } from "./useNarratorPanelWS";
+
+function parsePersistedPaymentRequired(value: unknown): Partial<PaymentRequiredInfo> | null {
+	if (typeof value !== "string" || !value.trim()) return null;
+	try {
+		const parsed = JSON.parse(value) as Record<string, unknown>;
+		if (parsed.type !== "payment_required") return null;
+		const resumeAction = parsed.resumeAction === "continue" ? "continue" : "retry";
+		const balance = typeof parsed.balance === "number" ? parsed.balance : undefined;
+		const required = typeof parsed.required === "number" ? parsed.required : undefined;
+		return {
+			providerId: typeof parsed.providerId === "string" ? parsed.providerId : undefined,
+			providerPrefix: typeof parsed.providerPrefix === "string" ? parsed.providerPrefix : undefined,
+			balance,
+			required,
+			resumeAction,
+		};
+	} catch {
+		return null;
+	}
+}
 
 /* ── Shared menu-item renderers (desktop NativeSelect + mobile ActionIcon share these) ── */
 
@@ -2603,7 +2624,7 @@ export function NarratorPanel({
 	// Parse persisted substatus from narrator data to seed the WS hook's reducer
 	const narratorSubstatus = useMemo(() => {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		const raw = (fetchedNarrator as any)?.substatus;
+		const raw = (narrator as any)?.substatus;
 		if (!raw) return [];
 		if (Array.isArray(raw)) return raw as string[];
 		try {
@@ -2613,7 +2634,7 @@ export function NarratorPanel({
 			return [];
 		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	}, [(fetchedNarrator as any)?.substatus]);
+	}, [(narrator as any)?.substatus]);
 
 	// Resolve NKP provider info for initial quota balance
 	const nkpProviderInfo = useMemo(() => {
@@ -2652,6 +2673,26 @@ export function NarratorPanel({
 		};
 	}, [resolvedModel, settingsData?.customApiProviders, settingsData?.customApiQuotas]);
 
+	const nugProviderInfo = useMemo(() => {
+		const prefix = resolvedModel?.split(":")[0];
+		if (!prefix) return null;
+		const nugProviders: Array<{ id: string; name?: string; prefix?: string }> =
+			settingsData?.nugProviders ?? [];
+		const cfg = nugProviders.find((p) => p.prefix === prefix || p.id === prefix);
+		if (!cfg) return null;
+		const quotas = settingsData?.nugQuotas as
+			| Record<string, { balance: number | null; totalGranted?: number | null }>
+			| undefined;
+		const quota = quotas?.[cfg.id];
+		return {
+			providerId: cfg.id,
+			providerPrefix: cfg.prefix,
+			name: cfg.name ?? cfg.prefix ?? cfg.id,
+			quotaBalance: quota?.balance == null ? null : String(quota.balance),
+			totalGranted: quota?.totalGranted ?? null,
+		};
+	}, [resolvedModel, settingsData?.nugProviders, settingsData?.nugQuotas]);
+
 	const wsState = useNarratorPanelWS({
 		narratorId,
 		narratorStatus: narrator?.status,
@@ -2666,9 +2707,10 @@ export function NarratorPanel({
 		narratorSubstatus,
 		initialNkpQuotaBalance: nkpProviderInfo?.quotaBalance,
 		nkpProviderId: nkpProviderInfo?.providerId,
-		initialQuotaBalance: customApiProviderInfo?.quotaBalance,
+		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
 		initialDetailedQuotaBalance: customApiProviderInfo?.detailedQuotaBalance,
 		customApiProviderId: customApiProviderInfo?.providerId,
+		quotaProviderKey: customApiProviderInfo?.providerId ?? nugProviderInfo?.providerId,
 		onDraftChanged: handleDraftChanged,
 		onQueuedNewNarratorCreated: (newNarratorId) => {
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarratorId } });
@@ -2697,6 +2739,8 @@ export function NarratorPanel({
 		quotaBalance,
 		detailedQuotaBalance,
 		retryInfo,
+		paymentRequired,
+		setPaymentRequired,
 		currentTodos,
 		todosToolUseId,
 		expandedToolUseId,
@@ -2708,6 +2752,28 @@ export function NarratorPanel({
 		viewers,
 	} = wsState;
 	setUnreadCountRef.current = setUnreadCount;
+
+	useEffect(() => {
+		if (paymentRequired) return;
+		if (!narratorSubstatus.includes("payment_required")) return;
+		const persisted = parsePersistedPaymentRequired(narrator?.errorMessage);
+		const providerId = persisted?.providerId ?? nugProviderInfo?.providerId;
+		if (!providerId) return;
+		setPaymentRequired({
+			providerId,
+			providerPrefix: persisted?.providerPrefix ?? nugProviderInfo?.providerPrefix,
+			balance: persisted?.balance,
+			required: persisted?.required,
+			resumeAction: persisted?.resumeAction ?? "retry",
+		});
+	}, [
+		narrator?.errorMessage,
+		narratorSubstatus,
+		nugProviderInfo?.providerId,
+		nugProviderInfo?.providerPrefix,
+		paymentRequired,
+		setPaymentRequired,
+	]);
 
 	const handleCompactError = useCallback(
 		(err: unknown) => {
@@ -2768,6 +2834,8 @@ export function NarratorPanel({
 
 	const [archiveConfirmOpened, { open: openArchiveConfirm, close: closeArchiveConfirm }] =
 		useDisclosure(false);
+	const [nugRechargeOpened, { open: openNugRecharge, close: closeNugRecharge }] =
+		useDisclosure(false);
 	const [internalDetailsOpened, { toggle: toggleInternalDetails, close: closeInternalDetails }] =
 		useDisclosure(false);
 	const detailsOpened = onToggleDetailsPanel ? (detailsPanelOpen ?? false) : internalDetailsOpened;
@@ -2781,6 +2849,9 @@ export function NarratorPanel({
 		}
 		closeInternalDetails();
 	}, [closeInternalDetails, onToggleDetailsPanel]);
+	useEffect(() => {
+		if (paymentRequired) openNugRecharge();
+	}, [openNugRecharge, paymentRequired]);
 	const [
 		reflectionSettingsOpened,
 		{ open: openReflectionSettings, close: closeReflectionSettings },
@@ -6390,6 +6461,15 @@ export function NarratorPanel({
 					onDragOver={handleDragOver}
 					onDrop={handleDrop}
 				>
+					<NugRechargeDialog
+						opened={nugRechargeOpened}
+						narratorId={narratorId}
+						providerId={paymentRequired?.providerId ?? nugProviderInfo?.providerId ?? null}
+						providerName={nugProviderInfo?.name ?? paymentRequired?.providerPrefix ?? null}
+						paymentRequired={paymentRequired}
+						onClose={closeNugRecharge}
+						onPaymentRequiredChange={setPaymentRequired}
+					/>
 					{/* Drop overlay */}
 					{isDragging && (
 						<Box
@@ -7877,6 +7957,11 @@ export function NarratorPanel({
 												{quotaBalance}
 											</Text>
 										</Tooltip>
+									)}
+									{nugProviderInfo?.providerId && (
+										<Button size="compact-xs" variant="subtle" onClick={openNugRecharge}>
+											{t("recharge.open")}
+										</Button>
 									)}
 									{/* Desktop selects */}
 									{!compact && (

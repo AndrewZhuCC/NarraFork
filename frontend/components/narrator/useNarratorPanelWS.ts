@@ -58,6 +58,14 @@ export interface RetryInfo {
 	retryAt: number;
 }
 
+export interface PaymentRequiredInfo {
+	providerId?: string;
+	providerPrefix?: string;
+	balance?: number;
+	required?: number;
+	resumeAction: "retry" | "continue";
+}
+
 function isPageVisible(): boolean {
 	return typeof document === "undefined" || document.visibilityState === "visible";
 }
@@ -263,6 +271,8 @@ export interface UseNarratorPanelWSOptions {
 	initialDetailedQuotaBalance?: string | null;
 	/** Custom API provider ID for the current narrator model (used to sync quota back to settings cache). */
 	customApiProviderId?: string | null;
+	/** Generic provider key for resetting runtime quota/payment state when provider changes. */
+	quotaProviderKey?: string | null;
 	/** Persisted substatus from narrator data — used to seed the reducer on mount so that
 	 *  substatus survives page navigation (the WS-only path starts from []). */
 	narratorSubstatus?: string[];
@@ -320,6 +330,8 @@ export interface UseNarratorPanelWSReturn {
 	browserSessionCount: number;
 	// Retry
 	retryInfo: RetryInfo | null;
+	paymentRequired: PaymentRequiredInfo | null;
+	setPaymentRequired: React.Dispatch<React.SetStateAction<PaymentRequiredInfo | null>>;
 	// Todos
 	currentTodos: TodoItem[] | null;
 	todosToolUseId: string | null;
@@ -496,6 +508,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
 		customApiProviderId,
+		quotaProviderKey,
 		narratorSubstatus,
 		onDraftChanged,
 		onQueuedNewNarratorCreated,
@@ -792,7 +805,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	useEffect(() => {
 		setQuotaBalance(initialQuotaBalance ?? null);
 		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
-	}, [narratorId, customApiProviderId, initialQuotaBalance, initialDetailedQuotaBalance]);
+		setPaymentRequired(null);
+	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
 	// Sync initial NKP quota when the narrator switches to a different NKP provider
 	const prevInitialNkpRef = useRef(initialNkpQuotaBalance);
 	useEffect(() => {
@@ -802,6 +816,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		}
 	}, [initialNkpQuotaBalance]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
+	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
 	const retryInfoRef = useRef<RetryInfo | null>(null);
 	const clearRetryIfActive = useCallback(() => {
 		if (retryInfoRef.current) {
@@ -2599,6 +2614,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					qc.setQueryData(["admin", "settings"], updateSettingsQuota);
 				}
 			},
+			onPaymentRequired: (info) => {
+				setPaymentRequired(info);
+			},
 			onQueueStatus: (position, queueDepth, queueMessage) => {
 				applyQueueStatus(position, queueDepth, queueMessage);
 			},
@@ -3264,6 +3282,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			detailedQuotaBalance,
 			browserSessionCount,
 			retryInfo,
+			paymentRequired,
+			setPaymentRequired,
 			currentTodos,
 			todosToolUseId,
 			expandedToolUseId,
@@ -3275,8 +3295,8 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			viewers,
 		}),
 		// Note: streamingBlocksRef (useRef) and useState setters (setQueuedMessages,
-		// setExpandedToolUseId, setEditExpandOverride, setUnreadCount) are stable
-		// references and intentionally omitted from the dependency array.
+		// setExpandedToolUseId, setEditExpandOverride, setUnreadCount, setPaymentRequired)
+		// are stable references and intentionally omitted from the dependency array.
 		[
 			connected,
 			disconnected,
@@ -3305,6 +3325,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			detailedQuotaBalance,
 			browserSessionCount,
 			retryInfo,
+			paymentRequired,
 			currentTodos,
 			todosToolUseId,
 			expandedToolUseId,
