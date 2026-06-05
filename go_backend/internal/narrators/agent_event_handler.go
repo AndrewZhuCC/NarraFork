@@ -94,7 +94,11 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			event.Message,
 			stringFromMetadata(event.Metadata, "detailedQuotaBalance"),
 		)
-		s.persistNugQuotaBalance(state.providerPrefix, event.Message)
+		s.persistNugQuotaBalance(
+			state.providerPrefix,
+			event.Message,
+			stringFromMetadata(event.Metadata, "detailedQuotaBalance"),
+		)
 		return nil
 	case "nkp_quota_balance":
 		s.persistNKPQuotaBalance(state.providerPrefix, event.Metadata)
@@ -860,8 +864,9 @@ func agentSideCarsPayload(sideCars []agentbasic.AgentSideCar) []map[string]any {
 	return items
 }
 
-func (s *Service) persistNugQuotaBalance(providerPrefix, quotaBalance string) {
+func (s *Service) persistNugQuotaBalance(providerPrefix, quotaBalance, detailedQuotaBalance string) {
 	providerPrefix = strings.TrimSpace(providerPrefix)
+	detailedQuotaBalance = strings.TrimSpace(detailedQuotaBalance)
 	if providerPrefix == "" || strings.TrimSpace(quotaBalance) == "" || s.Settings == nil {
 		return
 	}
@@ -873,7 +878,11 @@ func (s *Service) persistNugQuotaBalance(providerPrefix, quotaBalance string) {
 	if providerID == "" {
 		return
 	}
-	persistQuotaCacheEntry("nug-quotas.json", providerID, map[string]any{"balance": balance})
+	patch := map[string]any{"balance": balance}
+	if detailedQuotaBalance != "" {
+		patch["detailedQuotaBalance"] = detailedQuotaBalance
+	}
+	persistQuotaCacheEntry("nug-quotas.json", providerID, patch)
 }
 
 func (s *Service) persistNKPQuotaBalance(providerPrefix string, metadata map[string]any) {

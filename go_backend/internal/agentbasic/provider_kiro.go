@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -32,6 +33,47 @@ func (a *KiroProviderAdapter) ProviderName() string {
 		return a.Provider.Prefix
 	}
 	return "kiro"
+}
+
+func formatExtraDetails(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case float64, int, bool:
+		return fmt.Sprint(typed)
+	case map[string]any:
+		lines := []string{}
+		keys := make([]string, 0, len(typed))
+		for key, entryValue := range typed {
+			if entryValue != nil {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			entryValue := typed[key]
+			switch v := entryValue.(type) {
+			case string:
+				lines = append(lines, key+": "+v)
+			case float64, int, bool:
+				lines = append(lines, key+": "+fmt.Sprint(v))
+			default:
+				encoded, err := json.Marshal(v)
+				if err == nil {
+					lines = append(lines, key+": "+string(encoded))
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
 }
 
 func (a *KiroProviderAdapter) FormatTools(toolScope string) []map[string]any {
@@ -640,7 +682,7 @@ func parseKiroEvent(eventType string, data map[string]any) ParsedStreamEvent {
 		result.QueueStatus = &QueueSnapshot{Position: position, QueueDepth: depth, QueueMessage: stringValue(data["message"])}
 	case "quotaBalanceEvent":
 		balance := firstNonEmpty(stringValue(data["quotaBalance"]), stringValue(data["balance"]), stringValue(data["message"]))
-		detailedBalance := stringValue(data["detailedQuotaBalance"])
+		detailedBalance := firstNonEmpty(stringValue(data["detailedQuotaBalance"]), formatExtraDetails(data["extra"]))
 		if balance != "" {
 			result.QuotaBalance = &balance
 			result.DetailedQuotaBalance = &detailedBalance

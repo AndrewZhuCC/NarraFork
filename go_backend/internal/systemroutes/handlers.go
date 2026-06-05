@@ -3472,11 +3472,18 @@ func (h *Handler) nugQuota(w http.ResponseWriter, r *http.Request) error {
 	}
 	quota := normalizeNugQuotaResponse(data)
 	cache, _ := loadNugQuotaCache()
-	cache[providerID] = map[string]any{
+	entry := map[string]any{
 		"balance":      quota["balance"],
 		"totalGranted": quota["totalGranted"],
 		"fetchedAt":    time.Now().UnixMilli(),
 	}
+	if detailedQuotaBalance := stringMap(quota, "detailedQuotaBalance", ""); detailedQuotaBalance != "" {
+		entry["detailedQuotaBalance"] = detailedQuotaBalance
+	}
+	if extra, ok := quota["extra"]; ok {
+		entry["extra"] = extra
+	}
+	cache[providerID] = entry
 	_ = saveNugQuotaCache(cache)
 	httpx.WriteJSON(w, http.StatusOK, quota)
 	return nil
@@ -3486,21 +3493,48 @@ func (h *Handler) nugQuotas(w http.ResponseWriter, r *http.Request) error {
 	cache, _ := loadNugQuotaCache()
 	out := map[string]map[string]any{}
 	for providerID, entry := range cache {
-		out[providerID] = map[string]any{
-			"balance":      entry["balance"],
-			"totalGranted": entry["totalGranted"],
+		detailedQuotaBalance := strings.TrimSpace(stringMap(entry, "detailedQuotaBalance", ""))
+		item := map[string]any{
+			"balance":              entry["balance"],
+			"totalGranted":         entry["totalGranted"],
+			"detailedQuotaBalance": nil,
 		}
+		if detailedQuotaBalance != "" {
+			item["detailedQuotaBalance"] = detailedQuotaBalance
+		}
+		if extra, ok := entry["extra"]; ok {
+			item["extra"] = extra
+		}
+		out[providerID] = item
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 	return nil
 }
 
 func (h *Handler) nugBillingConfig(w http.ResponseWriter, r *http.Request) error {
-	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/billing/config", url.Values{})
+	providerID := chi.URLParam(r, "id")
+	data, err := h.fetchNugJSON(r.Context(), providerID, "/v1/billing/config", url.Values{})
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, data)
+	quota := normalizeNugQuotaResponse(data)
+	cache, _ := loadNugQuotaCache()
+	entry := cache[providerID]
+	if entry == nil {
+		entry = map[string]any{}
+	}
+	entry["balance"] = quota["balance"]
+	entry["totalGranted"] = quota["totalGranted"]
+	entry["fetchedAt"] = time.Now().UnixMilli()
+	if detailedQuotaBalance := stringMap(quota, "detailedQuotaBalance", ""); detailedQuotaBalance != "" {
+		entry["detailedQuotaBalance"] = detailedQuotaBalance
+	}
+	if extra, ok := quota["extra"]; ok {
+		entry["extra"] = extra
+	}
+	cache[providerID] = entry
+	_ = saveNugQuotaCache(cache)
+	httpx.WriteJSON(w, http.StatusOK, quota)
 	return nil
 }
 
@@ -3561,7 +3595,11 @@ func (h *Handler) nugUsage(w http.ResponseWriter, r *http.Request) error {
 	if offset < 0 {
 		offset = 0
 	}
-	query := url.Values{"limit": []string{strconv.Itoa(limit)}, "offset": []string{strconv.Itoa(offset)}}
+	query := url.Values{
+		"limit":  []string{strconv.Itoa(limit)},
+		"offset": []string{strconv.Itoa(offset)},
+		"period": []string{nugUsagePeriod(r.URL.Query().Get("range"))},
+	}
 	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/usage", query)
 	if err != nil {
 		return err
@@ -3571,11 +3609,7 @@ func (h *Handler) nugUsage(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) nugUsageSummary(w http.ResponseWriter, r *http.Request) error {
-	rangeValue := r.URL.Query().Get("range")
-	period := map[string]string{"today": "today", "7days": "7days", "30days": "month", "month": "month", "all": "all"}[rangeValue]
-	if period == "" {
-		period = "month"
-	}
+	period := nugUsagePeriod(r.URL.Query().Get("range"))
 	data, err := h.fetchNugJSON(r.Context(), chi.URLParam(r, "id"), "/v1/usage/summary", url.Values{"period": []string{period}})
 	if err != nil {
 		return err
@@ -3670,7 +3704,55 @@ func normalizeNugQuotaResponse(data map[string]any) map[string]any {
 	}
 	quota["balance"] = nugFirstNumber(data, 0, "balance", "quotaBalance", "remaining", "creditsRemaining")
 	quota["totalGranted"] = nugFirstNumber(data, 0, "totalGranted", "quotaTotalGranted", "total_granted", "creditsTotal", "total")
+	if detailedQuotaBalance := nugQuotaDetails(data); detailedQuotaBalance != "" {
+		quota["detailedQuotaBalance"] = detailedQuotaBalance
+	}
 	return quota
+}
+
+func nugQuotaDetails(data map[string]any) string {
+	return firstNonEmpty(stringMap(data, "detailedQuotaBalance", ""), formatNugExtraDetails(data["extra"]))
+}
+
+func formatNugExtraDetails(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	case float64, int, bool:
+		return fmt.Sprint(typed)
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key, entryValue := range typed {
+			if entryValue != nil {
+				keys = append(keys, key)
+			}
+		}
+		sort.Strings(keys)
+		lines := make([]string, 0, len(keys))
+		for _, key := range keys {
+			entryValue := typed[key]
+			switch v := entryValue.(type) {
+			case string:
+				lines = append(lines, key+": "+v)
+			case float64, int, bool:
+				lines = append(lines, key+": "+fmt.Sprint(v))
+			default:
+				encoded, err := json.Marshal(v)
+				if err == nil {
+					lines = append(lines, key+": "+string(encoded))
+				}
+			}
+		}
+		return strings.Join(lines, "\n")
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return ""
+		}
+		return string(encoded)
+	}
 }
 
 func nugFirstNumber(data map[string]any, fallback float64, keys ...string) float64 {
@@ -3792,6 +3874,36 @@ func normalizeNugModelMaps(data map[string]any) []map[string]any {
 	return out
 }
 
+func nugUsagePeriod(rangeValue string) string {
+	period := map[string]string{
+		"today":  "today",
+		"7days":  "7days",
+		"30days": "month",
+		"month":  "month",
+		"all":    "all",
+	}[rangeValue]
+	if period == "" {
+		period = "month"
+	}
+	return period
+}
+
+var nugUsageResponseStandardKeys = map[string]struct{}{
+	"id": {}, "requestId": {}, "request_id": {},
+	"channelType": {}, "channel_type": {}, "channel": {}, "provider": {}, "providerType": {},
+	"model": {}, "model_id": {}, "modelId": {}, "modelName": {},
+	"inputTokens": {}, "input_tokens": {}, "promptTokens": {}, "prompt_tokens": {}, "tokensIn": {}, "tokens_in": {},
+	"outputTokens": {}, "output_tokens": {}, "completionTokens": {}, "completion_tokens": {},
+	"cacheCreationInputTokens": {}, "cache_creation_input_tokens": {}, "cacheCreationTokens": {}, "cache_creation_tokens": {}, "cacheWriteInputTokens": {}, "cache_write_input_tokens": {}, "cacheWriteTokens": {}, "cache_write_tokens": {},
+	"cacheReadInputTokens": {}, "cache_read_input_tokens": {}, "cachedInputTokens": {}, "cached_input_tokens": {}, "cacheReadTokens": {}, "cache_read_tokens": {},
+	"reasoningTokens": {}, "reasoning_tokens": {},
+	"quotaCost": {}, "quota_cost": {}, "cost": {}, "quota": {},
+	"meterUsage": {}, "meter_usage": {}, "meter": {}, "usageAmount": {},
+	"status": {}, "state": {}, "durationMs": {}, "duration_ms": {}, "latencyMs": {}, "latency_ms": {},
+	"createdAt": {}, "created_at": {}, "timestamp": {}, "time": {},
+	"extra": {}, "metadata": {}, "usage": {}, "usageData": {},
+}
+
 func normalizeNugUsageResponse(data map[string]any) map[string]any {
 	rawEvents, _ := data["events"].([]any)
 	if rawEvents == nil {
@@ -3803,24 +3915,29 @@ func normalizeNugUsageResponse(data map[string]any) map[string]any {
 		if !ok {
 			continue
 		}
-		id := nugString(record, "id")
+		sources := nugUsageSources(record)
+		id := nugStringFrom(sources, "id", "requestId", "request_id")
 		if id == "" {
 			id = "usage-" + strconv.Itoa(index)
 		}
-		events = append(events, map[string]any{
-			"id":                       id,
-			"channelType":              firstNonEmpty(nugString(record, "channelType", "channel_type", "channel"), "unknown"),
-			"model":                    nugString(record, "model", "model_id", "modelId"),
-			"inputTokens":              nugNumber(record, "inputTokens", "input_tokens", "tokensIn", "tokens_in"),
-			"outputTokens":             nugNumber(record, "outputTokens", "output_tokens", "completionTokens"),
-			"cacheCreationInputTokens": nugNumber(record, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheCreationTokens", "cache_creation_tokens", "cacheWriteInputTokens", "cache_write_input_tokens", "cacheWriteTokens", "cache_write_tokens"),
-			"cacheReadInputTokens":     nugNumber(record, "cacheReadInputTokens", "cache_read_input_tokens", "cachedInputTokens", "cached_input_tokens", "cacheReadTokens", "cache_read_tokens"),
-			"quotaCost":                nugNumber(record, "quotaCost", "quota_cost"),
-			"meterUsage":               nugNumber(record, "meterUsage", "meter_usage"),
-			"status":                   firstNonEmpty(nugString(record, "status"), "unknown"),
-			"durationMs":               nugNumber(record, "durationMs", "duration_ms"),
-			"createdAt":                nugString(record, "createdAt", "created_at", "timestamp"),
-		})
+		event := map[string]any{}
+		event["id"] = id
+		event["channelType"] = firstNonEmpty(nugStringFrom(sources, "channelType", "channel_type", "channel", "provider", "providerType"), "unknown")
+		event["model"] = nugStringFrom(sources, "model", "model_id", "modelId", "modelName")
+		event["inputTokens"] = nugNumberFrom(sources, "inputTokens", "input_tokens", "promptTokens", "prompt_tokens", "tokensIn", "tokens_in")
+		event["outputTokens"] = nugNumberFrom(sources, "outputTokens", "output_tokens", "completionTokens", "completion_tokens")
+		event["cacheCreationInputTokens"] = nugNumberFrom(sources, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheCreationTokens", "cache_creation_tokens", "cacheWriteInputTokens", "cache_write_input_tokens", "cacheWriteTokens", "cache_write_tokens")
+		event["cacheReadInputTokens"] = nugNumberFrom(sources, "cacheReadInputTokens", "cache_read_input_tokens", "cachedInputTokens", "cached_input_tokens", "cacheReadTokens", "cache_read_tokens")
+		event["reasoningTokens"] = nugNumberFrom(sources, "reasoningTokens", "reasoning_tokens")
+		event["quotaCost"] = nugNumberFrom(sources, "quotaCost", "quota_cost", "cost", "quota")
+		event["meterUsage"] = nugNumberFrom(sources, "meterUsage", "meter_usage", "meter", "usageAmount")
+		event["status"] = firstNonEmpty(nugStringFrom(sources, "status", "state"), "unknown")
+		event["durationMs"] = nugNumberFrom(sources, "durationMs", "duration_ms", "latencyMs", "latency_ms")
+		event["createdAt"] = nugStringFrom(sources, "createdAt", "created_at", "timestamp", "time")
+		if extra := safeNugUsageExtra(record); len(extra) > 0 {
+			event["extra"] = extra
+		}
+		events = append(events, event)
 	}
 	total := float64(len(events))
 	if _, ok := data["total"]; ok {
@@ -3829,6 +3946,161 @@ func normalizeNugUsageResponse(data map[string]any) map[string]any {
 		total = nugNumber(data, "count")
 	}
 	return map[string]any{"events": events, "total": total}
+}
+
+func safeNugUsageExtra(record map[string]any) map[string]any {
+	out := map[string]any{}
+	addSource := func(source map[string]any, prefix string) {
+		if source == nil || len(out) >= 12 {
+			return
+		}
+		for key, value := range source {
+			if len(out) >= 12 || value == nil || isNugUsageStandardKey(key) || isSensitiveNugUsageKey(key) {
+				continue
+			}
+			label := key
+			if prefix != "" {
+				label = prefix + "." + key
+			}
+			if len(label) > 80 {
+				label = label[:80]
+			}
+			if _, exists := out[label]; exists {
+				continue
+			}
+			if sanitized, ok := sanitizeNugUsageExtraValue(value); ok {
+				out[label] = sanitized
+			}
+		}
+	}
+	extra := nugOptionalRecord(record["extra"])
+	metadata := nugOptionalRecord(record["metadata"])
+	usage := nugOptionalRecord(record["usage"])
+	addSource(record, "")
+	addSource(extra, "")
+	if extra != nil {
+		addSource(nugOptionalRecord(extra["usage"]), "usage")
+		addSource(nugOptionalRecord(extra["metadata"]), "metadata")
+	}
+	addSource(metadata, "metadata")
+	if metadata != nil {
+		addSource(nugOptionalRecord(metadata["usage"]), "metadata.usage")
+	}
+	addSource(usage, "usage")
+	addSource(nugOptionalRecord(record["usageData"]), "usageData")
+	return out
+}
+
+func isNugUsageStandardKey(key string) bool {
+	_, ok := nugUsageResponseStandardKeys[key]
+	return ok
+}
+
+func isSensitiveNugUsageKey(key string) bool {
+	normalized := strings.ToLower(strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			return r
+		}
+		return -1
+	}, key))
+	for _, needle := range []string{"apikey", "authorization", "token", "secret", "password", "credential", "cookie", "session", "raw", "dump", "body", "headers", "prompt", "completion", "content"} {
+		if strings.Contains(normalized, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeNugUsageExtraValue(value any) (any, bool) {
+	switch typed := value.(type) {
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return nil, false
+		}
+		if len(text) > 300 {
+			text = text[:300] + "…"
+		}
+		return text, true
+	case float64, float32, int, int64, bool, json.Number:
+		return typed, true
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil || len(encoded) == 0 || string(encoded) == "null" {
+			return nil, false
+		}
+		text := string(encoded)
+		if len(text) > 300 {
+			text = text[:300] + "…"
+		}
+		return text, true
+	}
+}
+
+func nugOptionalRecord(value any) map[string]any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if !strings.HasPrefix(trimmed, "{") {
+			return nil
+		}
+		parsed := map[string]any{}
+		if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+			return nil
+		}
+		return parsed
+	default:
+		return nil
+	}
+}
+
+func nugUsageSources(record map[string]any) []map[string]any {
+	sources := []map[string]any{record}
+	appendRecord := func(value any) map[string]any {
+		parsed := nugOptionalRecord(value)
+		if parsed != nil {
+			sources = append(sources, parsed)
+		}
+		return parsed
+	}
+	extra := appendRecord(record["extra"])
+	metadata := appendRecord(record["metadata"])
+	usage := appendRecord(record["usage"])
+	appendRecord(record["usageData"])
+	if extra != nil {
+		appendRecord(extra["usage"])
+		appendRecord(extra["metadata"])
+	}
+	if metadata != nil {
+		appendRecord(metadata["usage"])
+		appendRecord(metadata["extra"])
+	}
+	if usage != nil {
+		appendRecord(usage["extra"])
+	}
+	return sources
+}
+
+func nugStringFrom(records []map[string]any, keys ...string) string {
+	for _, record := range records {
+		if value := nugString(record, keys...); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func nugNumberFrom(records []map[string]any, keys ...string) float64 {
+	for _, record := range records {
+		for _, key := range keys {
+			if _, ok := record[key]; ok {
+				return numericMapOr(record, key, 0)
+			}
+		}
+	}
+	return 0
 }
 
 func nugString(record map[string]any, keys ...string) string {
@@ -4107,13 +4379,25 @@ func (h *Handler) nugProvider(providerID string) (map[string]any, string, error)
 		if !ok || stringMap(provider, "id", "") != providerID {
 			continue
 		}
-		baseURL := strings.TrimRight(stringMap(provider, "baseUrl", ""), "/")
+		baseURL := normalizeNugBaseURL(stringMap(provider, "baseUrl", ""))
 		if baseURL == "" {
 			return nil, "", httpx.BadRequest("Provider base URL not configured")
 		}
 		return provider, baseURL, nil
 	}
 	return nil, "", httpx.Error(http.StatusNotFound, "NOT_FOUND", "Provider \""+providerID+"\" not found")
+}
+
+func normalizeNugBaseURL(baseURL string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	for {
+		trimmed := strings.TrimSuffix(strings.TrimSuffix(baseURL, "/api/v1"), "/v1")
+		trimmed = strings.TrimSuffix(trimmed, "/api")
+		if trimmed == baseURL {
+			return baseURL
+		}
+		baseURL = trimmed
+	}
 }
 
 func (h *Handler) createNugAPIKey(ctx context.Context, client *http.Client, baseURL, sessionToken, name string) (map[string]any, int, error) {

@@ -106,7 +106,7 @@ func emitNugUsageSummary(ctx context.Context, out chan<- StreamEvent, provider P
 		payload = nested
 	}
 	if balance := firstNonEmpty(stringValue(payload["quotaBalance"]), stringValue(payload["remaining"]), stringValue(payload["creditsRemaining"])); balance != "" {
-		detailedBalance := stringValue(payload["detailedQuotaBalance"])
+		detailedBalance := firstNonEmpty(stringValue(payload["detailedQuotaBalance"]), formatExtraDetails(payload["extra"]))
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{QuotaBalance: &balance, DetailedQuotaBalance: &detailedBalance}})
 	}
 	if usage, ok := numericAsFloat(payload["usage"]); ok {
@@ -136,9 +136,8 @@ func numericAsFloat(value any) (float64, bool) {
 }
 
 func nugV1BaseURL(baseURL string) string {
-	baseURL = strings.TrimRight(baseURL, "/")
-	if strings.HasSuffix(baseURL, "/v1") {
-		return baseURL
-	}
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	baseURL = strings.TrimSuffix(strings.TrimSuffix(baseURL, "/api/v1"), "/v1")
+	baseURL = strings.TrimSuffix(baseURL, "/api")
 	return baseURL + "/v1"
 }

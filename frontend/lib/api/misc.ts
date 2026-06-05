@@ -544,9 +544,26 @@ export const miscApi = {
 			body: JSON.stringify(body),
 		}),
 	nugGetQuota: (providerId: string) =>
-		request<{ balance: number; totalGranted: number; username?: string; role?: string }>(
-			`/nug/providers/${providerId}/quota`,
-		),
+		request<{
+			balance: number;
+			totalGranted: number;
+			detailedQuotaBalance?: string | null;
+			extra?: unknown;
+			username?: string;
+			role?: string;
+		}>(`/nug/providers/${providerId}/quota`),
+	nugGetQuotas: () =>
+		request<
+			Record<
+				string,
+				{
+					balance: number | null;
+					totalGranted: number | null;
+					detailedQuotaBalance?: string | null;
+					extra?: unknown;
+				}
+			>
+		>("/nug/quotas"),
 	nugGetBillingConfig: (providerId: string) =>
 		request<{
 			enabled: boolean;
@@ -558,6 +575,8 @@ export const miscApi = {
 			orderMaxAmount: number;
 			balance: number;
 			totalGranted: number;
+			detailedQuotaBalance?: string | null;
+			extra?: unknown;
 			pollIntervalMs?: number;
 		}>(`/nug/providers/${providerId}/billing/config`),
 	nugCreateBillingOrder: (
@@ -634,13 +653,18 @@ export const miscApi = {
 				outputTokens: number;
 				cacheCreationInputTokens: number;
 				cacheReadInputTokens: number;
+				reasoningTokens?: number;
 				quotaCost: number;
 				meterUsage: number;
 				status: string;
 				durationMs: number;
 				createdAt: string;
+				extra?: Record<string, unknown> | string | null;
+				metadata?: Record<string, unknown> | string | null;
+				[key: string]: unknown;
 			}>;
-		}>(`/nug/providers/${providerId}/usage?range=${range}`),
+			total?: number;
+		}>(`/nug/providers/${providerId}/usage?range=${encodeURIComponent(range)}`),
 	nugGetUsageSummary: (providerId: string, range: string) =>
 		request<{
 			requestCount: number;

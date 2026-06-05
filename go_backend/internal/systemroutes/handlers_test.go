@@ -1699,7 +1699,7 @@ func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
 			t.Fatalf("unexpected upstream request path=%s auth=%s", r.URL.Path, r.Header.Get("Authorization"))
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"balance":"12.5","totalGranted":"50"}`))
+		_, _ = w.Write([]byte(`{"balance":"12.5","totalGranted":"50","extra":{"plan":"trial","reset":"soon"}}`))
 	}))
 	defer upstream.Close()
 	store, err := config.Load()
@@ -1721,7 +1721,7 @@ func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
 	}
 	var quota map[string]any
 	decodeJSONBody(t, w, &quota)
-	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) {
+	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) || !strings.Contains(stringMap(quota, "detailedQuotaBalance", ""), "plan: trial") {
 		t.Fatalf("unexpected normalized quota: %#v", quota)
 	}
 
@@ -1734,7 +1734,7 @@ func TestNugQuotaEndpointCachesProviderQuota(t *testing.T) {
 	var quotas map[string]map[string]any
 	decodeJSONBody(t, w, &quotas)
 	cached := quotas["nug-1"]
-	if cached["balance"] != float64(12.5) || cached["totalGranted"] != float64(50) || len(cached) != 2 {
+	if cached["balance"] != float64(12.5) || cached["totalGranted"] != float64(50) || !strings.Contains(stringMap(cached, "detailedQuotaBalance", ""), "reset: soon") || cached["extra"] == nil {
 		t.Fatalf("unexpected cached quota: %#v", quotas)
 	}
 	if _, err := os.Stat(filepath.Join(home, ".narrafork", "nug-quotas.json")); err != nil {
@@ -1886,10 +1886,10 @@ func TestNugProviderEndpointsExposeFrontendContractShape(t *testing.T) {
 		case "/v1/channels/health":
 			_, _ = w.Write([]byte(`{"channels":[{"channelType":"kiro","totalCredentials":2,"availableCredentials":1,"disabledCredentials":1,"availabilityRate":0.5,"currentConcurrency":1,"maxConcurrency":4,"queueDepth":0}]}`))
 		case "/v1/usage":
-			if r.URL.Query().Get("limit") != "50" || r.URL.Query().Get("offset") != "0" {
+			if r.URL.Query().Get("limit") != "50" || r.URL.Query().Get("offset") != "0" || r.URL.Query().Get("period") != "month" {
 				t.Fatalf("unexpected usage query: %s", r.URL.RawQuery)
 			}
-			_, _ = w.Write([]byte(`{"data":[{"channel":"kiro","model_id":"claude","tokensIn":"11","completionTokens":5,"cacheCreationTokens":"2","cachedInputTokens":"3","quota_cost":"0.4","meter_usage":"0.5","status":"ok","duration_ms":"99","timestamp":"2026-05-26T00:00:00Z"}],"count":"1"}`))
+			_, _ = w.Write([]byte(`{"data":[{"channel":"kiro","model_id":"claude","tokensIn":"11","completionTokens":5,"cacheCreationTokens":"2","cachedInputTokens":"3","quota_cost":"0.4","meter_usage":"0.5","status":"ok","duration_ms":"99","timestamp":"2026-05-26T00:00:00Z","raw_dump_json":"SECRET","api_key":"SECRET","extra":{"plan":"trial","token":"secret","safe_count":7}}],"count":"1"}`))
 		case "/v1/usage/summary":
 			if r.URL.Query().Get("period") != "month" {
 				t.Fatalf("unexpected summary period: %s", r.URL.RawQuery)
@@ -1904,8 +1904,8 @@ func TestNugProviderEndpointsExposeFrontendContractShape(t *testing.T) {
 	store := newSystemRoutesTestStore(t)
 	if _, err := store.Patch(map[string]any{
 		"nugProviders": []any{
-			map[string]any{"id": "nug-1", "name": "NUG One", "prefix": "nug", "baseUrl": upstream.URL, "apiKey": "nug-key"},
-			map[string]any{"id": "nug-no-key", "name": "NUG No Key", "prefix": "nugmissing", "baseUrl": upstream.URL, "apiKey": ""},
+			map[string]any{"id": "nug-1", "name": "NUG One", "prefix": "nug", "baseUrl": upstream.URL + "/api/v1", "apiKey": "nug-key"},
+			map[string]any{"id": "nug-no-key", "name": "NUG No Key", "prefix": "nugmissing", "baseUrl": upstream.URL + "/api/v1", "apiKey": ""},
 		},
 	}); err != nil {
 		t.Fatalf("patch NUG settings: %v", err)
@@ -1988,6 +1988,13 @@ func TestNugProviderEndpointsExposeFrontendContractShape(t *testing.T) {
 	event, _ := events[0].(map[string]any)
 	if event["id"] != "usage-0" || event["channelType"] != "kiro" || event["model"] != "claude" || event["inputTokens"] != float64(11) || event["cacheReadInputTokens"] != float64(3) {
 		t.Fatalf("usage event should expose frontend camelCase fields: %#v", event)
+	}
+	if event["raw_dump_json"] != nil || event["api_key"] != nil {
+		t.Fatalf("usage event should not expose raw or sensitive upstream fields: %#v", event)
+	}
+	extra, _ := event["extra"].(map[string]any)
+	if extra["plan"] != "trial" || extra["safe_count"] != float64(7) || extra["token"] != nil {
+		t.Fatalf("usage event should expose only sanitized extra details: %#v", event)
 	}
 
 	summary := doJSON(http.MethodGet, "/nug/providers/nug-1/usage/summary?range=30days", nil)
