@@ -96,6 +96,8 @@ const customApiProviderSchema = z.object({
 	tlsRejectUnauthorized: z.boolean().optional(),
 	codexAccountId: z.string().optional(),
 	codexWebSocket: z.boolean().optional(),
+	codexWebSearch: z.boolean().optional(),
+	codexImageGeneration: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -110,6 +112,8 @@ const openaiProviderSchema = z.object({
 	apiMode: z.enum(["responses", "completions", "codex"]).optional(),
 	codexAccountId: z.string().optional(),
 	codexWebSocket: z.boolean().optional(),
+	codexWebSearch: z.boolean().optional(),
+	codexImageGeneration: z.boolean().optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
 	disabled: z.boolean().optional(),
 });
@@ -359,6 +363,8 @@ const updateSettingsSchema = z
 					.enum(["none", "low", "medium", "high", "xhigh"])
 					.nullable()
 					.optional(),
+				useWebSearch: z.boolean().optional(),
+				useImageGeneration: z.boolean().optional(),
 			})
 			.partial()
 			.optional(),

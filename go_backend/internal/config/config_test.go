@@ -62,6 +62,8 @@ func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
 	expectDefaultValue(t, raw, "codex.loadBalancingMode", "tier-balanced")
 	expectDefaultValue(t, raw, "codex.defaultReasoningEffort", "medium")
 	expectDefaultValue(t, raw, "codex.useWebSocket", true)
+	expectDefaultValue(t, raw, "codex.useWebSearch", true)
+	expectDefaultValue(t, raw, "codex.useImageGeneration", true)
 	expectDefaultValue(t, raw, "update.serverUrl", "https://narrafork-update.b.domexie.cn")
 	expectDefaultValue(t, raw, "update.product", "narrafork")
 	expectDefaultValue(t, raw, "update.channel", "stable")

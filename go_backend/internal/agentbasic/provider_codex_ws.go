@@ -45,10 +45,15 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 	defer conn.Close()
 	input, instructions := openAIResponsesInputAndInstructions(messages)
 	body := map[string]any{
-		"type":                "response.create",
-		"model":               provider.Model,
-		"input":               input,
-		"tools":               appendCodexNativeTools(openAIResponsesTools(toolScope), provider.Model),
+		"type":  "response.create",
+		"model": provider.Model,
+		"input": input,
+		"tools": appendCodexNativeTools(
+			openAIResponsesTools(toolScope),
+			provider.Model,
+			optionalBoolDefault(provider.UseWebSearch, true),
+			optionalBoolDefault(provider.UseImageGeneration, true),
+		),
 		"stream":              true,
 		"store":               false,
 		"parallel_tool_calls": true,

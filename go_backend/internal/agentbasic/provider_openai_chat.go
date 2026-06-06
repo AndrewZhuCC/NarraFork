@@ -502,6 +502,12 @@ func streamCodexWithFailover(ctx context.Context, client *http.Client, provider 
 		if candidate.UseWebSocket == nil {
 			candidate.UseWebSocket = provider.UseWebSocket
 		}
+		if candidate.UseWebSearch == nil {
+			candidate.UseWebSearch = provider.UseWebSearch
+		}
+		if candidate.UseImageGeneration == nil {
+			candidate.UseImageGeneration = provider.UseImageGeneration
+		}
 		candidate.PromptCacheKey = firstNonEmpty(provider.PromptCacheKey, candidate.PromptCacheKey)
 		yielded, err := streamCodexCandidateObserved(ctx, client, candidate, messages, reasoningEffort, toolScope, out)
 		if err == nil {
@@ -573,7 +579,12 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 	input, instructions := openAIResponsesInputAndInstructions(messages)
 	tools := openAIResponsesTools(toolScope)
 	if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
-		tools = appendCodexNativeTools(tools, provider.Model)
+		tools = appendCodexNativeTools(
+			tools,
+			provider.Model,
+			optionalBoolDefault(provider.UseWebSearch, true),
+			optionalBoolDefault(provider.UseImageGeneration, true),
+		)
 	}
 	body := map[string]any{
 		"model":  provider.Model,
@@ -942,14 +953,39 @@ func imageGenerationSavedPathInstruction(savedPath string) string {
 		"If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it."
 }
 
-func appendCodexNativeTools(tools []map[string]any, model string) []map[string]any {
-	if !hasResponseTool(tools, "web_search") {
-		tools = append(tools, map[string]any{"type": "web_search"})
+func appendCodexNativeTools(tools []map[string]any, model string, useWebSearch bool, useImageGeneration bool) []map[string]any {
+	if useWebSearch {
+		if !hasResponseTool(tools, "web_search") {
+			tools = append(tools, map[string]any{"type": "web_search"})
+		}
+	} else {
+		tools = removeResponseTool(tools, "web_search")
+	}
+	if !useImageGeneration {
+		return removeResponseTool(tools, "image_generation")
 	}
 	if strings.Contains(strings.ToLower(model), "gpt") && !hasResponseTool(tools, "image_generation") {
 		tools = append(tools, map[string]any{"type": "image_generation", "output_format": "png"})
 	}
 	return tools
+}
+
+func optionalBoolDefault(value *bool, fallback bool) bool {
+	if value == nil {
+		return fallback
+	}
+	return *value
+}
+
+func removeResponseTool(tools []map[string]any, name string) []map[string]any {
+	out := tools[:0]
+	for _, tool := range tools {
+		if stringValue(tool["type"]) == name || stringValue(tool["name"]) == name {
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out
 }
 
 func hasResponseTool(tools []map[string]any, name string) bool {

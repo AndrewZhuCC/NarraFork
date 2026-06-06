@@ -189,6 +189,14 @@ func optionalBoolValue(values map[string]any, key string) *bool {
 	return &value
 }
 
+func boolValueDefault(values map[string]any, key string, fallback bool) *bool {
+	value := fallback
+	if _, ok := values[key]; ok {
+		value = boolValue(values[key])
+	}
+	return &value
+}
+
 func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 	prefix, bareModel := splitModel(model)
 	if prefix == "kiro" {
@@ -350,12 +358,15 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 			}
 			accountID := ""
 			var useWebSocket *bool
+			var useWebSearch *bool
+			var useImageGeneration *bool
 			if kind == "codex" {
 				accountID = firstNonEmpty(stringValue(provider["codexAccountId"]), stringValue(provider["accountId"]))
-				value := boolValue(provider["codexWebSocket"])
-				useWebSocket = &value
+				useWebSocket = boolValueDefault(provider, "codexWebSocket", false)
+				useWebSearch = optionalBoolValue(provider, "codexWebSearch")
+				useImageGeneration = optionalBoolValue(provider, "codexImageGeneration")
 			}
-			return Provider{Prefix: pfx, Kind: kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode, AccountID: accountID, UseWebSocket: useWebSocket}, nil
+			return Provider{Prefix: pfx, Kind: kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode, AccountID: accountID, UseWebSocket: useWebSocket, UseWebSearch: useWebSearch, UseImageGeneration: useImageGeneration}, nil
 		}
 	}
 	if prefix == "anthropic" {
@@ -614,7 +625,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		apiKey := firstNonEmpty(stringValue(codex["apiKey"]), stringValue(codex["accessToken"]), stringValue(codex["token"]))
 		if apiKey != "" {
 			baseURL := strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), "https://chatgpt.com/backend-api/codex"), "/")
-			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"]), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy}, true
+			return Provider{Prefix: "codex", Kind: "codex", APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(codex["accountId"]), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), UseWebSearch: codexUseWebSearchOption(codex), UseImageGeneration: codexUseImageGenerationOption(codex), ProxyURL: codexProxy}, true
 		}
 	}
 	if credential, ok := firstCodexCredentialFromDiskWithOptions(codex); ok {
@@ -622,7 +633,7 @@ func resolveCodexProvider(raw map[string]any, bareModel string) (Provider, bool)
 		if codex != nil {
 			baseURL = strings.TrimRight(firstNonEmpty(stringValue(codex["baseUrl"]), baseURL), "/")
 		}
-		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy}, true
+		return Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(credential["accessToken"]), BaseURL: baseURL, Model: bareModel, APIMode: "codex", AccountID: stringValue(credential["accountId"]), CredentialID: stringValue(credential["id"]), CredentialPool: codexCredentialPoolFromDiskWithOptions(baseURL, bareModel, codex), LoadBalancingMode: stringValue(codex["loadBalancingMode"]), UseWebSocket: codexUseWebSocketOption(codex), UseWebSearch: codexUseWebSearchOption(codex), UseImageGeneration: codexUseImageGenerationOption(codex), ProxyURL: codexProxy}, true
 	}
 	return Provider{}, false
 }
@@ -722,13 +733,25 @@ func codexCredentialPoolFromDisk(baseURL string, model string) []Provider {
 }
 
 func codexUseWebSocketOption(codex map[string]any) *bool {
+	return codexBoolOption(codex, "useWebSocket")
+}
+
+func codexUseWebSearchOption(codex map[string]any) *bool {
+	return codexBoolOption(codex, "useWebSearch")
+}
+
+func codexUseImageGenerationOption(codex map[string]any) *bool {
+	return codexBoolOption(codex, "useImageGeneration")
+}
+
+func codexBoolOption(codex map[string]any, key string) *bool {
 	if codex == nil {
 		return nil
 	}
-	if _, ok := codex["useWebSocket"]; !ok {
+	if _, ok := codex[key]; !ok {
 		return nil
 	}
-	value := boolValue(codex["useWebSocket"])
+	value := boolValue(codex[key])
 	return &value
 }
 
@@ -745,7 +768,7 @@ func codexCredentialPoolFromDiskWithOptions(baseURL string, model string, codex 
 		if boolValue(entry["disabled"]) || strings.TrimSpace(stringValue(entry["accessToken"])) == "" || codexAccessTokenOnlyExpired(entry) {
 			continue
 		}
-		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"]), LoadBalancingMode: mode, UseWebSocket: codexUseWebSocketOption(codex), ProxyURL: codexProxy})
+		pool = append(pool, Provider{Prefix: "codex", Kind: "codex", APIKey: stringValue(entry["accessToken"]), BaseURL: baseURL, Model: model, APIMode: "codex", AccountID: stringValue(entry["accountId"]), CredentialID: stringValue(entry["id"]), LoadBalancingMode: mode, UseWebSocket: codexUseWebSocketOption(codex), UseWebSearch: codexUseWebSearchOption(codex), UseImageGeneration: codexUseImageGenerationOption(codex), ProxyURL: codexProxy})
 	}
 	return pool
 }

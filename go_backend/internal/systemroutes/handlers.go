@@ -2075,6 +2075,8 @@ func (h *Handler) RegisterProviders(r chi.Router) {
 		cr.Get("/default-reasoning-effort", httpx.Handler(h.codexGetDefaultReasoningEffort))
 		cr.Post("/default-reasoning-effort", httpx.Handler(h.codexSetDefaultReasoningEffort))
 		cr.Post("/use-websocket", httpx.Handler(h.codexSetUseWebSocket))
+		cr.Post("/use-web-search", httpx.Handler(h.codexSetUseWebSearch))
+		cr.Post("/use-image-generation", httpx.Handler(h.codexSetUseImageGeneration))
 		cr.Post("/load-balancing-mode", httpx.Handler(h.codexSetLoadBalancingMode))
 		cr.Post("/tier-order", httpx.Handler(h.codexSetTierOrder))
 		cr.Post("/global-proxy", httpx.Handler(h.codexSetGlobalProxy))
@@ -6307,22 +6309,34 @@ func (h *Handler) codexSetDefaultReasoningEffort(w http.ResponseWriter, r *http.
 }
 
 func (h *Handler) codexSetUseWebSocket(w http.ResponseWriter, r *http.Request) error {
+	return h.codexSetBoolSetting(w, r, "useWebSocket")
+}
+
+func (h *Handler) codexSetUseWebSearch(w http.ResponseWriter, r *http.Request) error {
+	return h.codexSetBoolSetting(w, r, "useWebSearch")
+}
+
+func (h *Handler) codexSetUseImageGeneration(w http.ResponseWriter, r *http.Request) error {
+	return h.codexSetBoolSetting(w, r, "useImageGeneration")
+}
+
+func (h *Handler) codexSetBoolSetting(w http.ResponseWriter, r *http.Request, key string) error {
 	var body map[string]any
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	useWebSocket := true
-	if raw, exists := body["useWebSocket"]; exists {
-		value, ok := raw.(bool)
+	value := true
+	if raw, exists := body[key]; exists {
+		parsed, ok := raw.(bool)
 		if !ok {
-			return httpx.BadRequest("useWebSocket must be boolean")
+			return httpx.BadRequest(key + " must be boolean")
 		}
-		useWebSocket = value
+		value = parsed
 	}
-	if err := h.patchCodexSetting("useWebSocket", useWebSocket); err != nil {
+	if err := h.patchCodexSetting(key, value); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "useWebSocket": useWebSocket})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, key: value})
 	return nil
 }
 
@@ -9232,7 +9246,7 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	tierOrder := normalizeCodexTierOrder(rawTierOrder)
 	effectiveTierOrder := codexEffectiveTierOrder(tierOrder)
 	globalProxy := h.codexSettingsValue("proxy", "")
-	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "globalProxy": globalProxy, "proxy": globalProxy, "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
+	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "globalProxy": globalProxy, "proxy": globalProxy, "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "useWebSearch": h.codexSettingsValue("useWebSearch", true), "useImageGeneration": h.codexSettingsValue("useImageGeneration", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
 	if lastBrowserAuthError != "" {
 		payload["lastBrowserAuthError"] = lastBrowserAuthError
 	}

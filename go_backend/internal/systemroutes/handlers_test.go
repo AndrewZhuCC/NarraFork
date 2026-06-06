@@ -570,6 +570,8 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 		"loadBalancingMode":      "balanced",
 		"defaultReasoningEffort": "high",
 		"useWebSocket":           false,
+		"useWebSearch":           false,
+		"useImageGeneration":     false,
 		"tierOrder":              []any{"team", "pro", "invalid", "team"},
 	}}); err != nil {
 		t.Fatalf("patch codex settings: %v", err)
@@ -628,7 +630,7 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 	if body["globalProxy"] != "http://proxy.example.test:8080" || body["proxy"] != body["globalProxy"] {
 		t.Fatalf("status should expose frontend globalProxy alias and legacy proxy: %#v", body)
 	}
-	if body["loadBalancingMode"] != "balanced" || body["defaultReasoningEffort"] != "high" || body["useWebSocket"] != false {
+	if body["loadBalancingMode"] != "balanced" || body["defaultReasoningEffort"] != "high" || body["useWebSocket"] != false || body["useWebSearch"] != false || body["useImageGeneration"] != false {
 		t.Fatalf("status should expose codex settings fields: %#v", body)
 	}
 	tierOrder, _ := body["tierOrder"].([]any)
@@ -784,12 +786,22 @@ func TestCodexSettingsMutationsMatchTSValidation(t *testing.T) {
 	if status != http.StatusOK || body["ok"] != true || body["useWebSocket"] != true {
 		t.Fatalf("missing useWebSocket should default true like TS, status=%d body=%#v", status, body)
 	}
+	status, body = post("/codex/use-web-search", `{}`)
+	if status != http.StatusOK || body["ok"] != true || body["useWebSearch"] != true {
+		t.Fatalf("missing useWebSearch should default true like TS, status=%d body=%#v", status, body)
+	}
+	status, body = post("/codex/use-image-generation", `{}`)
+	if status != http.StatusOK || body["ok"] != true || body["useImageGeneration"] != true {
+		t.Fatalf("missing useImageGeneration should default true like TS, status=%d body=%#v", status, body)
+	}
 
 	for _, tc := range []struct {
 		path    string
 		payload string
 	}{
 		{"/codex/use-websocket", `{"useWebSocket":"yes"}`},
+		{"/codex/use-web-search", `{"useWebSearch":"yes"}`},
+		{"/codex/use-image-generation", `{"useImageGeneration":"yes"}`},
 		{"/codex/load-balancing-mode", `{"mode":"tiered_sticky"}`},
 		{"/codex/tier-order", `{"tierOrder":["team","invalid"]}`},
 	} {

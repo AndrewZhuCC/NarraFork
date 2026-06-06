@@ -1041,6 +1041,7 @@ func TestResolverTreatsLegacyOpenAIProviderCodexModeAsCodex(t *testing.T) {
 	store := testConfigStore(t, map[string]any{
 		"openaiProviders": []any{
 			map[string]any{"prefix": "legacycx", "apiMode": "codex", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_legacy", "codexWebSocket": true},
+			map[string]any{"prefix": "legacycxdefault", "apiMode": "codex", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_default"},
 		},
 	})
 	resolution, err := ResolveProviderAndModel(store, "legacycx:gpt-5.3-codex")
@@ -1049,6 +1050,13 @@ func TestResolverTreatsLegacyOpenAIProviderCodexModeAsCodex(t *testing.T) {
 	}
 	if resolution.Config.Kind != "codex" || resolution.Config.APIMode != "codex" || resolution.Config.AccountID != "acct_legacy" || resolution.Config.UseWebSocket == nil || !*resolution.Config.UseWebSocket {
 		t.Fatalf("unexpected legacy openai codex provider: %#v", resolution.Config)
+	}
+	defaultResolution, err := ResolveProviderAndModel(store, "legacycxdefault:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve default legacy openai codex provider: %v", err)
+	}
+	if defaultResolution.Config.UseWebSocket == nil || *defaultResolution.Config.UseWebSocket {
+		t.Fatalf("expected legacy OpenAI codex provider to default WebSocket off, got %#v", defaultResolution.Config)
 	}
 }
 
@@ -1090,6 +1098,7 @@ func TestResolverSupportsCustomAnthropicAndCodexProtocols(t *testing.T) {
 		"customApiProviders": []any{
 			map[string]any{"prefix": "anth", "protocol": "anthropic-official", "apiKey": "anth-key", "baseUrl": "https://anth.example/v1", "defaultModel": "claude-test", "proxy": "http://anth-proxy.example:8080", "tlsRejectUnauthorized": false},
 			map[string]any{"prefix": "cx", "protocol": "codex-native", "apiKey": "codex-key", "baseUrl": "https://codex.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_2", "codexWebSocket": false},
+			map[string]any{"prefix": "cxdefault", "protocol": "codex-native", "apiKey": "codex-key-default", "baseUrl": "https://codex-default.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_default"},
 			map[string]any{"prefix": "cxws", "protocol": "codex-native", "apiKey": "codex-key-ws", "baseUrl": "https://codex-ws.example", "defaultModel": "gpt-5.3-codex", "codexAccountId": "acct_ws", "codexWebSocket": true},
 		},
 	})
@@ -1106,6 +1115,13 @@ func TestResolverSupportsCustomAnthropicAndCodexProtocols(t *testing.T) {
 	}
 	if codex.Config.Kind != "codex" || codex.Config.APIMode != "codex" || codex.Config.AccountID != "acct_2" || codex.Config.UseWebSocket == nil || *codex.Config.UseWebSocket {
 		t.Fatalf("unexpected codex custom provider: %#v", codex.Config)
+	}
+	codexDefault, err := ResolveProviderAndModel(store, "cxdefault:gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolve custom codex default websocket: %v", err)
+	}
+	if codexDefault.Config.UseWebSocket == nil || *codexDefault.Config.UseWebSocket {
+		t.Fatalf("expected custom codex provider to default WebSocket off, got %#v", codexDefault.Config)
 	}
 	codexWS, err := ResolveProviderAndModel(store, "cxws:gpt-5.3-codex")
 	if err != nil {

@@ -24,7 +24,7 @@ func TestTSParityFixtureOpenAIResponsesRequestShape(t *testing.T) {
 }
 
 func TestTSParityFixtureCodexNativeTools(t *testing.T) {
-	tools := appendCodexNativeTools([]map[string]any{{"type": "function", "name": "Read"}}, "gpt-5.3-codex")
+	tools := appendCodexNativeTools([]map[string]any{{"type": "function", "name": "Read"}}, "gpt-5.3-codex", true, true)
 	if !hasResponseTool(tools, "web_search") || !hasResponseTool(tools, "image_generation") {
 		t.Fatalf("expected Codex native tools fixture, got %#v", tools)
 	}

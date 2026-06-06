@@ -100,7 +100,7 @@ func TestGoMatchesExecutableTSProviderFixtures(t *testing.T) {
 		t.Fatalf("decode TS fixture: %v output=%s", err, string(output))
 	}
 
-	goTools := appendCodexNativeTools([]map[string]any{{"type": "function", "name": "Read"}}, "gpt-5.3-codex")
+	goTools := appendCodexNativeTools([]map[string]any{{"type": "function", "name": "Read"}}, "gpt-5.3-codex", true, true)
 	goToolTypes := make([]string, 0, len(goTools))
 	for _, tool := range goTools {
 		goToolTypes = append(goToolTypes, stringValue(tool["type"]))

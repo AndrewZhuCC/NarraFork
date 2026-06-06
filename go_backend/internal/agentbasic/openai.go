@@ -64,6 +64,8 @@ type Provider struct {
 	KiroConfigPath         string
 	PreviousResponseID     string
 	UseWebSocket           *bool
+	UseWebSearch           *bool
+	UseImageGeneration     *bool
 	DefaultReasoningEffort string
 	ProxyURL               string
 	TLSRejectUnauthorized  *bool

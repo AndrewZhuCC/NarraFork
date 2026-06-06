@@ -884,6 +884,10 @@ func TestPatchRejectsInvalidProviderArrays(t *testing.T) {
 			field:   "protocol",
 		},
 		{
+			payload: `{"customApiProviders":[{"id":"c1","name":"Custom","prefix":"custom","apiKey":"sk","baseUrl":"https://api.example.test","defaultModel":"model"}]}`,
+			field:   "protocol is required",
+		},
+		{
 			payload: `{"customApiProviders":[{"id":"c1","name":"Custom","prefix":"custom","apiKey":"sk","baseUrl":"https://api.example.test","defaultModel":"model","protocol":"responses-compatible","proxy":null}]}`,
 			field:   "proxy",
 		},

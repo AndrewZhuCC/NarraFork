@@ -175,6 +175,8 @@ func defaultRaw(home string) map[string]any {
 			"tierOrder":              []any{"pro", "prolite", "plus", "team", "free"},
 			"defaultReasoningEffort": "medium",
 			"useWebSocket":           true,
+			"useWebSearch":           true,
+			"useImageGeneration":     true,
 		},
 		"update": map[string]any{
 			"serverUrl":            "https://narrafork-update.b.domexie.cn",

@@ -1382,6 +1382,10 @@ func validateCodexSettingsPatch(patch map[string]any) error {
 			if effort != "none" && effort != "low" && effort != "medium" && effort != "high" && effort != "xhigh" {
 				return httpx.ValidationError("codex.defaultReasoningEffort is not supported")
 			}
+		case "useWebSearch", "useImageGeneration":
+			if _, ok := value.(bool); !ok {
+				return httpx.ValidationError("codex." + key + " must be a boolean")
+			}
 		default:
 			return httpx.ValidationError("codex." + key + " cannot be updated")
 		}
@@ -1658,7 +1662,8 @@ var providerPatchSchemas = map[string]providerPatchSchema{
 	"customApiProviders": {
 		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0, "protocol": 1},
 		optionalStrings: []string{"proxy", "codexAccountId"},
-		optionalBools:   []string{"tlsRejectUnauthorized", "codexWebSocket", "disabled"},
+		optionalBools:   []string{"tlsRejectUnauthorized", "codexWebSocket", "codexWebSearch", "codexImageGeneration", "disabled"},
+
 		optionalEnums:   map[string][]string{"protocol": {"anthropic-official", "anthropic-compatible", "codex-native", "responses-compatible", "completions-compatible"}},
 		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high"}},
 		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
@@ -1666,7 +1671,7 @@ var providerPatchSchemas = map[string]providerPatchSchema{
 	"openaiProviders": {
 		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
 		optionalStrings: []string{"codexAccountId"},
-		optionalBools:   []string{"responsesApi", "codexWebSocket", "disabled"},
+		optionalBools:   []string{"responsesApi", "codexWebSocket", "codexWebSearch", "codexImageGeneration", "disabled"},
 		optionalEnums:   map[string][]string{"apiMode": {"responses", "completions", "codex"}},
 		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
 	},
@@ -2220,6 +2225,12 @@ func deriveCustomApiProvidersFromLegacy(openaiProviders, anthropicProviders []an
 			if value, ok := existing["codexWebSocket"]; ok {
 				merged["codexWebSocket"] = value
 			}
+			if value, ok := existing["codexWebSearch"]; ok {
+				merged["codexWebSearch"] = value
+			}
+			if value, ok := existing["codexImageGeneration"]; ok {
+				merged["codexImageGeneration"] = value
+			}
 			byID[providerID] = merged
 			continue
 		}
@@ -2247,6 +2258,8 @@ func openAIProviderToCustomApi(provider map[string]any) map[string]any {
 	copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
 	copyProviderFieldIfPresent(converted, provider, "codexAccountId")
 	copyProviderFieldIfPresent(converted, provider, "codexWebSocket")
+	copyProviderFieldIfPresent(converted, provider, "codexWebSearch")
+	copyProviderFieldIfPresent(converted, provider, "codexImageGeneration")
 	return converted
 }
 
@@ -2315,6 +2328,8 @@ func customApiProvidersToOpenAI(providers []any) []any {
 		copyProviderFieldIfPresent(converted, provider, "defaultContextWindow")
 		copyProviderFieldIfPresent(converted, provider, "codexAccountId")
 		copyProviderFieldIfPresent(converted, provider, "codexWebSocket")
+		copyProviderFieldIfPresent(converted, provider, "codexWebSearch")
+		copyProviderFieldIfPresent(converted, provider, "codexImageGeneration")
 		out = append(out, converted)
 	}
 	return out

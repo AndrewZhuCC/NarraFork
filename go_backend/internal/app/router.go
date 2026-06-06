@@ -1210,6 +1210,8 @@ func providerCapabilities() map[string]any {
 				"status",
 				"defaultReasoningEffort",
 				"useWebSocket",
+				"useWebSearch",
+				"useImageGeneration",
 				"loadBalancingMode",
 				"tierOrder",
 				"globalProxy",

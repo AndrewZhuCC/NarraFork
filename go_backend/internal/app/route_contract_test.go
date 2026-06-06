@@ -656,6 +656,8 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"providers", "codex", "routes"}, map[string]any{
 		"defaultReasoningEffort": true,
 		"useWebSocket":           true,
+		"useWebSearch":           true,
+		"useImageGeneration":     true,
 		"loadBalancingMode":      true,
 		"tierOrder":              true,
 		"globalProxy":            true,
