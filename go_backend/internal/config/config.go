@@ -138,6 +138,7 @@ func defaultRaw(home string) map[string]any {
 			"planReflectionAutoApprove":       false,
 			"questionReflectionEnabled":       false,
 			"questionReflectionTimeoutMs":     float64(300000),
+			"dangerReflectionLevel":           "standard",
 			"dangerReflectionEnabled":         true,
 			"dangerSkipReadOnlyConfirmations": false,
 			"maxTransientRetries":             float64(10),
@@ -241,6 +242,9 @@ func (s *Store) Patch(patch map[string]any) (map[string]any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	deepMerge(s.raw, patch)
+	if agentPatch, ok := patch["agent"].(map[string]any); ok {
+		normalizeDangerReflectionPatchSettings(ensureMap(s.raw, "agent"), agentPatch)
+	}
 	if getString(s.raw, "auth", "jwtSecret") == "" {
 		ensureMap(s.raw, "auth")["jwtSecret"] = id.Must(48)
 	}
@@ -330,6 +334,9 @@ func migrateLegacySettings(raw, legacyRaw map[string]any) bool {
 			changed = true
 		}
 		delete(agent, "yoloSkipReadOnlyConfirmations")
+		changed = true
+	}
+	if normalizeDangerReflectionSettings(agent, legacyAgent) {
 		changed = true
 	}
 	if _, exists := agent["smartInterruptionCheck"]; exists {
@@ -523,6 +530,64 @@ func anySlice(value any) []any {
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+func dangerReflectionBool(value any, fallback bool) bool {
+	if b, ok := value.(bool); ok {
+		return b
+	}
+	return fallback
+}
+
+func normalizeDangerReflectionLevel(value any, legacyEnabled bool) string {
+	switch strings.ToLower(strings.TrimSpace(stringValue(value))) {
+	case "off", "light", "standard", "strict":
+		return strings.ToLower(strings.TrimSpace(stringValue(value)))
+	default:
+		if legacyEnabled {
+			return "standard"
+		}
+		return "off"
+	}
+}
+
+func normalizeDangerReflectionSettings(agent, legacyAgent map[string]any) bool {
+	legacyEnabled := dangerReflectionBool(legacyAgent["dangerReflectionEnabled"], true)
+	_, hadLevel := legacyAgent["dangerReflectionLevel"]
+	level := "standard"
+	if hadLevel {
+		level = normalizeDangerReflectionLevel(legacyAgent["dangerReflectionLevel"], legacyEnabled)
+	} else if !legacyEnabled {
+		level = "off"
+	}
+	return setDangerReflectionLevel(agent, level)
+}
+
+func normalizeDangerReflectionPatchSettings(agent, patch map[string]any) bool {
+	if rawLevel, hasLevel := patch["dangerReflectionLevel"]; hasLevel {
+		return setDangerReflectionLevel(agent, normalizeDangerReflectionLevel(rawLevel, dangerReflectionBool(agent["dangerReflectionEnabled"], true)))
+	}
+	if enabled, ok := patch["dangerReflectionEnabled"].(bool); ok {
+		if enabled {
+			return setDangerReflectionLevel(agent, "standard")
+		}
+		return setDangerReflectionLevel(agent, "off")
+	}
+	return false
+}
+
+func setDangerReflectionLevel(agent map[string]any, level string) bool {
+	changed := false
+	if agent["dangerReflectionLevel"] != level {
+		agent["dangerReflectionLevel"] = level
+		changed = true
+	}
+	enabled := level != "off"
+	if agent["dangerReflectionEnabled"] != enabled {
+		agent["dangerReflectionEnabled"] = enabled
+		changed = true
+	}
+	return changed
 }
 
 func firstString(values ...string) string {

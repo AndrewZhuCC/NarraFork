@@ -31,13 +31,17 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	head := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
 	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\nuncommitted change\n")
 	writeFileReview(t, filepath.Join(repo, "untracked.txt"), "untracked review context\n")
+	writeFileReview(t, filepath.Join(repo, "untracked-dir", "nested.txt"), "nested untracked review context\n")
+	if err := os.Remove(filepath.Join(repo, "committed.txt")); err != nil {
+		t.Fatalf("remove committed dirty file: %v", err)
+	}
 
 	sqlDB := openReviewChapterDB(t)
 	defer sqlDB.Close()
 	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
 
-	service := &Service{DB: sqlDB, Git: gitx.NewService()}
-	review, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en"})
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	review, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en", UserID: "reviewer"})
 	if err != nil {
 		t.Fatalf("CreateReview: %v", err)
 	}
@@ -50,6 +54,38 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	}
 	if data := readFileReview(t, filepath.Join(worktree, "untracked.txt")); !strings.Contains(data, "untracked review context") {
 		t.Fatalf("untracked file not copied, got %q", data)
+	}
+	if data := readFileReview(t, filepath.Join(worktree, "untracked-dir", "nested.txt")); !strings.Contains(data, "nested untracked review context") {
+		t.Fatalf("nested untracked dir file not copied, got %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(worktree, "committed.txt")); !os.IsNotExist(err) {
+		t.Fatalf("dirty deleted file should be removed from review worktree, err=%v", err)
+	}
+
+	var narratorID, systemPrompt, narratorStatus, narratorCWD string
+	var messageCount int
+	if err := sqlDB.QueryRow(`SELECT id, system_prompt, status, cwd, message_count FROM narrators WHERE chapter_id = ?`, review.ID).Scan(&narratorID, &systemPrompt, &narratorStatus, &narratorCWD, &messageCount); err != nil {
+		t.Fatalf("load review narrator: %v", err)
+	}
+	if narratorCWD != worktree {
+		t.Fatalf("review narrator cwd = %q, want %q", narratorCWD, worktree)
+	}
+	if narratorStatus != "idle" || narratorStatus == "working" || narratorStatus == "running" {
+		t.Fatalf("review narrator should be seeded only, got status %q", narratorStatus)
+	}
+	if messageCount != 1 {
+		t.Fatalf("review narrator message_count = %d, want 1", messageCount)
+	}
+	if !strings.Contains(systemPrompt, "ConcludeReview") || !strings.Contains(systemPrompt, "Code Changes to Review") || !strings.Contains(systemPrompt, "uncommitted change") {
+		t.Fatalf("review narrator system prompt missing review context:\n%s", systemPrompt)
+	}
+	var role, contentText, createdBy string
+	var seq int
+	if err := sqlDB.QueryRow(`SELECT m.role, m.content_text, m.created_by, r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? ORDER BY r.seq ASC LIMIT 1`, narratorID).Scan(&role, &contentText, &createdBy, &seq); err != nil {
+		t.Fatalf("load seeded review message: %v", err)
+	}
+	if role != "user" || contentText != reviewStartMessage("en") || createdBy != "reviewer" || seq != 1 {
+		t.Fatalf("unexpected seeded review message role=%q text=%q createdBy=%q seq=%d", role, contentText, createdBy, seq)
 	}
 
 	if committed, err := service.Git.DiffBetweenRefs(ctx, repo, base, head); err != nil || !strings.Contains(committed, "committed change") {

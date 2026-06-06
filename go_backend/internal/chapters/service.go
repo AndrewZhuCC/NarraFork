@@ -1088,7 +1088,7 @@ func (s *Service) initializeReviewNarrator(ctx context.Context, narratorID, gitP
 		return fmt.Errorf("initialize review narrator system prompt: %w", err)
 	}
 	if input.UserID != "" {
-		if _, err := s.Narrators.AddUserMessage(ctx, narratorID, input.UserID, reviewStartMessage(input.Locale)); err != nil {
+		if _, err := s.Narrators.SeedUserMessage(ctx, narratorID, input.UserID, reviewStartMessage(input.Locale)); err != nil {
 			return fmt.Errorf("initialize review narrator start message: %w", err)
 		}
 	}
@@ -1885,8 +1885,19 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 		if head == "" {
 			head, _ = s.Git.HeadCommit(ctx, targetWorktree)
 		}
+		successResponse := map[string]any{"ok": true, "success": true, "sourceChapterId": source.ID, "targetChapterId": target.ID, "mergeCommitSha": head, "commitSha": head, "isFastForward": result.IsFastForward, "output": result.Output}
 		if err := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID); err != nil {
+			if warning, ok := recordMergedPostCommitWarning(err); ok {
+				successResponse["warning"] = warning
+				response = successResponse
+				return nil
+			}
 			if retryErr := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID); retryErr != nil {
+				if warning, ok := recordMergedPostCommitWarning(retryErr); ok {
+					successResponse["warning"] = warning
+					response = successResponse
+					return nil
+				}
 				if resetErr := s.Git.Reset(ctx, targetWorktree, preMergeHead, "hard"); resetErr != nil {
 					response = map[string]any{"ok": true, "success": true, "sourceChapterId": source.ID, "targetChapterId": target.ID, "mergeCommitSha": head, "output": result.Output, "warning": fmt.Sprintf("CRITICAL: Git merge succeeded but database update failed, and git rollback also failed. Manual intervention required. DB error: %v", retryErr)}
 					return nil
@@ -1895,7 +1906,7 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 				return nil
 			}
 		}
-		response = map[string]any{"ok": true, "success": true, "sourceChapterId": source.ID, "targetChapterId": target.ID, "mergeCommitSha": head, "commitSha": head, "isFastForward": result.IsFastForward, "output": result.Output}
+		response = successResponse
 		return nil
 	})
 	if lockErr != nil {
@@ -1964,10 +1975,13 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 			s.Git.AbortMerge(ctx, *target.WorktreePath)
 			return nil, err
 		}
+		successPayload := map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}}
 		if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); err != nil {
-			return nil, err
+			if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload); rollbackResult != nil {
+				return rollbackResult, nil
+			}
 		}
-		return map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}}, nil
+		return successPayload, nil
 	}
 
 	narratorID, model, err := s.primaryNarratorModel(ctx, target.ID)
@@ -2007,10 +2021,79 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 		s.Git.AbortMerge(ctx, *target.WorktreePath)
 		return nil, err
 	}
+	successPayload := map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}, "narratorId": narratorID, "assistantMessage": result.Text}
 	if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); err != nil {
-		return nil, err
+		if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload); rollbackResult != nil {
+			return rollbackResult, nil
+		}
 	}
-	return map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}, "narratorId": narratorID, "assistantMessage": result.Text}, nil
+	return successPayload, nil
+}
+
+func (s *Service) handleAIResolveRecordMergedFailure(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID, targetWorktree string, initialErr error, successPayload map[string]any) map[string]any {
+	if warning, ok := recordMergedPostCommitWarning(initialErr); ok {
+		successPayload["warning"] = warning
+		return successPayload
+	}
+	if retryErr := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); retryErr != nil {
+		if warning, ok := recordMergedPostCommitWarning(retryErr); ok {
+			successPayload["warning"] = warning
+			return successPayload
+		}
+		if resetErr := s.Git.Reset(ctx, targetWorktree, preMergeHead, "hard"); resetErr != nil {
+			return map[string]any{
+				"resolved":        false,
+				"success":         false,
+				"sourceChapterId": source.ID,
+				"targetChapterId": target.ID,
+				"mergeResult": map[string]any{
+					"success":   false,
+					"commitSha": commitSHA,
+				},
+				"warning": fmt.Sprintf("CRITICAL: Git merge succeeded but database update failed, and git rollback also failed. Manual intervention required. DB error: %v; rollback error: %v", retryErr, resetErr),
+			}
+		}
+		return map[string]any{
+			"resolved":        false,
+			"success":         false,
+			"sourceChapterId": source.ID,
+			"targetChapterId": target.ID,
+			"mergeResult": map[string]any{
+				"success":   false,
+				"commitSha": commitSHA,
+			},
+			"warning": fmt.Sprintf("AI resolve merge rolled back: database update failed after git merge. Please retry. (%v)", retryErr),
+		}
+	}
+	return nil
+}
+
+type recordMergedPostCommitError struct {
+	step string
+	err  error
+}
+
+func (e *recordMergedPostCommitError) Error() string {
+	return fmt.Sprintf("%s: %v", e.step, e.err)
+}
+
+func (e *recordMergedPostCommitError) Unwrap() error {
+	return e.err
+}
+
+func recordMergedPostCommit(step string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &recordMergedPostCommitError{step: step, err: err}
+}
+
+func recordMergedPostCommitWarning(err error) (string, bool) {
+	var postCommitErr *recordMergedPostCommitError
+	if !errors.As(err, &postCommitErr) {
+		return "", false
+	}
+	return fmt.Sprintf("Merge database state was recorded, but post-merge follow-up failed (%s). Git was not rolled back; retry cleanup or inspect merge summary state. Error: %v", postCommitErr.step, postCommitErr.err), true
 }
 
 func (s *Service) recordMerged(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID string) error {
@@ -2019,7 +2102,7 @@ func (s *Service) recordMerged(ctx context.Context, source, target Chapter, stra
 	if target.WorktreePath != nil && *target.WorktreePath != "" {
 		count, _ = s.Git.CommitCount(ctx, *target.WorktreePath)
 	}
-	metadata := jsonObjectString(map[string]any{"mergeCommitSha": nullableString(commitSHA), "strategy": strategy})
+	metadata := jsonObjectString(map[string]any{"mergeCommitSha": nullableString(commitSHA), "strategy": strategy, "status": "completed"})
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -2043,15 +2126,15 @@ func (s *Service) recordMerged(ctx context.Context, source, target Chapter, stra
 			sourceName = "cherry_pick"
 		}
 		if err := s.recordChapterCommit(ctx, target.ID, commitSHA, firstNonEmptyString(message, fmt.Sprintf("Merge %s (%s)", source.Branch, strategy)), sourceName); err != nil {
-			return err
+			return recordMergedPostCommit("record chapter commit", err)
 		}
 	}
 	cleanupErr := s.cleanupMergedSourceWorktree(ctx, source)
 	summaryErr := s.injectMergeSummaryFallback(ctx, source, target, strategy, commitSHA, message, userID)
 	if cleanupErr != nil {
-		return cleanupErr
+		return recordMergedPostCommit("cleanup merged source worktree", cleanupErr)
 	}
-	return summaryErr
+	return recordMergedPostCommit("inject merge summary fallback", summaryErr)
 }
 
 func (s *Service) cleanupMergedSourceWorktree(ctx context.Context, source Chapter) error {
@@ -2200,10 +2283,15 @@ func (s *Service) markExistingMergeSummariesHistorical(ctx context.Context, sour
 	if err != nil {
 		return fmt.Errorf("query existing merge summaries: %w", err)
 	}
-	defer rows.Close()
+	type historicalUpdate struct {
+		messageID   string
+		contentJSON string
+	}
+	updates := []historicalUpdate{}
 	for rows.Next() {
 		var messageID, raw string
 		if err := rows.Scan(&messageID, &raw); err != nil {
+			rows.Close()
 			return fmt.Errorf("scan existing merge summary: %w", err)
 		}
 		var blocks []map[string]any
@@ -2222,14 +2310,21 @@ func (s *Service) markExistingMergeSummariesHistorical(ctx context.Context, sour
 		}
 		data, err := json.Marshal(blocks)
 		if err != nil {
+			rows.Close()
 			return err
 		}
-		if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_messages SET content_json = ? WHERE id = ?`, string(data), messageID); err != nil {
-			return fmt.Errorf("mark merge summary historical: %w", err)
-		}
+		updates = append(updates, historicalUpdate{messageID: messageID, contentJSON: string(data)})
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close existing merge summaries: %w", err)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate existing merge summaries: %w", err)
+	}
+	for _, update := range updates {
+		if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_messages SET content_json = ? WHERE id = ?`, update.contentJSON, update.messageID); err != nil {
+			return fmt.Errorf("mark merge summary historical: %w", err)
+		}
 	}
 	return nil
 }

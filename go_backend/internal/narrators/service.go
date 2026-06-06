@@ -513,7 +513,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Narrator, erro
 	fastMode := boolPtrValue(input.FastMode, false)
 	relaxedPlan := boolPtrValue(input.RelaxedPlan, false)
 	planReflectionOverride := normalizeBooleanOverride(input.PlanReflectionAutoApproveOverride)
-	dangerReflectionOverride := normalizeBooleanOverride(input.DangerReflectionOverride)
+	dangerReflectionOverride := normalizeDangerReflectionOverride(input.DangerReflectionOverride)
 	traits := []string{}
 	if input.ChapterID == nil {
 		traits = append(traits, "standalone")
@@ -1748,6 +1748,11 @@ func (s *Service) AddUserMessage(ctx context.Context, narratorID, userID, text s
 	return s.AddUserMessageWithContent(ctx, narratorID, userID, text, content)
 }
 
+func (s *Service) SeedUserMessage(ctx context.Context, narratorID, userID, text string) (Message, error) {
+	content := []map[string]any{{"type": "text", "text": text}}
+	return s.persistUserMessageWithContent(ctx, narratorID, userID, text, content)
+}
+
 func (s *Service) AddUserMessageWithContent(ctx context.Context, narratorID, userID, contentText string, contentBlocks any) (Message, error) {
 	return s.AddUserMessageWithContentAndCommand(ctx, narratorID, userID, contentText, contentBlocks, "")
 }
@@ -2789,7 +2794,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			pipeline.capture(&run)
 			return run, nil
 		}
-		if shouldRunDangerReflectionBeforeExecution(s.Settings, narrator, permission, call) {
+		if shouldRunDangerReflectionBeforeExecution(s.Settings, narrator, permission, execCwd, call) {
 			decision, err := s.runDangerReflection(execCtx, narratorID, call)
 			if err != nil {
 				run.Status = "error"
@@ -2960,6 +2965,35 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		cancel()
 		s.unregisterActiveRun(narratorID, runToken)
 	}()
+	baseSideCarCollector := s.agentSideCarCollector(narratorID)
+	priorityBufferedAfterToolsConsumed := false
+	priorityBufferedSoftStopArmed := false
+	priorityBufferedSoftStopped := false
+	sideCarCollector := func(collectorCtx context.Context, request agentbasic.SideCarRequest) []agentbasic.AgentSideCar {
+		sideCars := baseSideCarCollector(collectorCtx, request)
+		if request.Phase == "after_tools" {
+			for _, sideCar := range sideCars {
+				if sideCar.Target == "user_message" && sideCar.Source == "buffered_user" && strings.TrimSpace(sideCar.Content) != "" {
+					priorityBufferedAfterToolsConsumed = true
+					break
+				}
+			}
+		}
+		return sideCars
+	}
+	shouldStopAfterPriorityBuffer := func() bool {
+		if !priorityBufferedAfterToolsConsumed {
+			return false
+		}
+		// Let the immediate post-tool provider request observe the buffered sidecar, then
+		// stop before a third request if that response triggers another tool turn.
+		if !priorityBufferedSoftStopArmed {
+			priorityBufferedSoftStopArmed = true
+			return false
+		}
+		priorityBufferedSoftStopped = true
+		return true
+	}
 
 	stream, err := agentbasic.RunAgentLoop(runCtx, s.Settings, model, history, cwd,
 		agentbasic.WithToolExecutor(executor),
@@ -2973,7 +3007,8 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		agentbasic.WithFirstTokenTimeout(s.agentFirstTokenTimeout()),
 		agentbasic.WithToolInventoryEvent(true),
 		agentbasic.WithStickySessionKey(narratorID),
-		agentbasic.WithSideCarCollector(state.sideCarToolCount, s.agentSideCarCollector(narratorID), func(count int) { state.sideCarToolCount = count }),
+		agentbasic.WithSideCarCollector(state.sideCarToolCount, sideCarCollector, func(count int) { state.sideCarToolCount = count }),
+		agentbasic.WithShouldStop(shouldStopAfterPriorityBuffer),
 	)
 	if err != nil {
 		if narrator.IsBackground && s.narratorRunCancelled(ctx, narratorID) {
@@ -3011,6 +3046,12 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	}
 	if narrator.IsBackground && s.narratorRunCancelled(ctx, narratorID) {
 		return
+	}
+	if priorityBufferedSoftStopped && !state.completed {
+		if err := s.finishAgentRunSuccess(ctx, state); err != nil {
+			s.persistAgentError(ctx, narratorID, err, narrator.IsBackground)
+			return
+		}
 	}
 	if !state.completed {
 		_ = s.finishAgentRunError(ctx, state, "agent loop ended without completion")
@@ -6866,22 +6907,121 @@ If the plan is concrete, actionable, and has no obvious gaps, call ExitPlanConfi
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"ExitPlanConfirm": true, "ExitPlanRevise": true})
 }
 
-func shouldRunDangerReflection(settings *config.Store, narrator Narrator) bool {
-	switch strings.ToLower(strings.TrimSpace(narrator.DangerReflectionOverride)) {
-	case "on":
-		return true
+type dangerReflectionLevel string
+
+type dangerSeverity string
+
+const (
+	dangerReflectionOff      dangerReflectionLevel = "off"
+	dangerReflectionLight    dangerReflectionLevel = "light"
+	dangerReflectionStandard dangerReflectionLevel = "standard"
+	dangerReflectionStrict   dangerReflectionLevel = "strict"
+
+	dangerSeverityLow      dangerSeverity = "low"
+	dangerSeverityMedium   dangerSeverity = "medium"
+	dangerSeverityHigh     dangerSeverity = "high"
+	dangerSeverityCritical dangerSeverity = "critical"
+)
+
+type dangerReflectionInfo struct {
+	Severity dangerSeverity
+	Summary  string
+}
+
+func normalizeDangerReflectionLevel(value any, legacyEnabled bool) dangerReflectionLevel {
+	switch strings.ToLower(strings.TrimSpace(stringFromAny(value))) {
 	case "off":
-		return false
+		return dangerReflectionOff
+	case "light":
+		return dangerReflectionLight
+	case "standard":
+		return dangerReflectionStandard
+	case "strict":
+		return dangerReflectionStrict
+	default:
+		if legacyEnabled {
+			return dangerReflectionStandard
+		}
+		return dangerReflectionOff
 	}
+}
+
+func globalDangerReflectionLevel(settings *config.Store) dangerReflectionLevel {
+	if settings == nil {
+		return dangerReflectionOff
+	}
+	agent, _ := settings.Raw()["agent"].(map[string]any)
+	return normalizeDangerReflectionLevel(agent["dangerReflectionLevel"], anyBool(agent["dangerReflectionEnabled"]))
+}
+
+func dangerSkipReadOnlyConfirmations(settings *config.Store) bool {
 	if settings == nil {
 		return false
 	}
 	agent, _ := settings.Raw()["agent"].(map[string]any)
-	return anyBool(agent["dangerReflectionEnabled"])
+	return anyBool(agent["dangerSkipReadOnlyConfirmations"])
 }
 
-func shouldRunDangerReflectionBeforeExecution(settings *config.Store, narrator Narrator, permission toolPermissionDecision, call agentbasic.ToolCall) bool {
-	if !shouldRunDangerReflection(settings, narrator) {
+func effectiveDangerReflectionLevel(settings *config.Store, narrator Narrator) dangerReflectionLevel {
+	globalLevel := globalDangerReflectionLevel(settings)
+	switch normalizeDangerReflectionOverride(narrator.DangerReflectionOverride) {
+	case "on":
+		if globalLevel == dangerReflectionOff {
+			return dangerReflectionStandard
+		}
+		return globalLevel
+	case "off":
+		return dangerReflectionOff
+	case "light":
+		return dangerReflectionLight
+	case "standard":
+		return dangerReflectionStandard
+	case "strict":
+		return dangerReflectionStrict
+	default:
+		return globalLevel
+	}
+}
+
+func shouldRunDangerReflection(settings *config.Store, narrator Narrator) bool {
+	return effectiveDangerReflectionLevel(settings, narrator) != dangerReflectionOff
+}
+
+func dangerSeverityRank(severity dangerSeverity) int {
+	switch severity {
+	case dangerSeverityLow:
+		return 1
+	case dangerSeverityMedium:
+		return 2
+	case dangerSeverityHigh:
+		return 3
+	case dangerSeverityCritical:
+		return 4
+	default:
+		return 2
+	}
+}
+
+func dangerReflectionThreshold(level dangerReflectionLevel) int {
+	switch level {
+	case dangerReflectionLight:
+		return dangerSeverityRank(dangerSeverityHigh)
+	case dangerReflectionStandard:
+		return dangerSeverityRank(dangerSeverityMedium)
+	case dangerReflectionStrict:
+		return dangerSeverityRank(dangerSeverityLow)
+	default:
+		return 1 << 30
+	}
+}
+
+func shouldTriggerDangerReflection(info dangerReflectionInfo, level dangerReflectionLevel) bool {
+	return dangerSeverityRank(info.Severity) >= dangerReflectionThreshold(level)
+}
+
+func shouldRunDangerReflectionBeforeExecution(settings *config.Store, narrator Narrator, permission toolPermissionDecision, cwd string, call agentbasic.ToolCall) bool {
+	level := effectiveDangerReflectionLevel(settings, narrator)
+	if level == dangerReflectionOff {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(call.Function.Name)) {
@@ -6898,12 +7038,240 @@ func shouldRunDangerReflectionBeforeExecution(settings *config.Store, narrator N
 	if mode != "bypassPermissions" {
 		return false
 	}
-	switch strings.ToLower(strings.TrimSpace(call.Function.Name)) {
-	case "bash", "write", "edit":
+	info, ok := classifyDangerReflectionToolCall(
+		cwd,
+		call,
+		dangerSkipReadOnlyConfirmations(settings),
+	)
+	return ok && shouldTriggerDangerReflection(info, level)
+}
+
+func classifyDangerReflectionToolCall(cwd string, call agentbasic.ToolCall, skipReadOnlyConfirmations bool) (dangerReflectionInfo, bool) {
+	name := strings.ToLower(strings.TrimSpace(call.Function.Name))
+	args := map[string]any{}
+	_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+	switch name {
+	case "bash":
+		return classifyBashDanger(cwd, args, skipReadOnlyConfirmations)
+	case "write", "notebookedit":
+		paths := toolPermissionPaths(cwd, name, args)
+		if hasExternalToolPath(cwd, paths) {
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: name + " targets paths outside the current working directory."}, true
+		}
+	case "agent":
+		subagentType := strings.ToLower(strings.TrimSpace(stringFromAny(args["subagent_type"])))
+		if subagentType == "explore" || subagentType == "plan" {
+			return dangerReflectionInfo{}, false
+		}
+		workdir := strings.TrimSpace(stringFromAny(args["workdir"]))
+		if workdir == "" {
+			return dangerReflectionInfo{}, false
+		}
+		base := resolvePermissionPath(cwd, ".")
+		resolved := resolvePermissionPath(cwd, workdir)
+		if !pathInsideOrEqual(base, resolved) || resolved != base {
+			return dangerReflectionInfo{Severity: dangerSeverityMedium, Summary: "Write-capable subagent requests a custom working directory."}, true
+		}
+	}
+	return dangerReflectionInfo{}, false
+}
+
+func classifyBashDanger(cwd string, args map[string]any, skipReadOnlyConfirmations bool) (dangerReflectionInfo, bool) {
+	command := strings.TrimSpace(stringFromAny(args["command"]))
+	if command == "" {
+		return dangerReflectionInfo{}, false
+	}
+	if info, ok := classifyGitDanger(command); ok {
+		return info, true
+	}
+	if hasDestructiveShellPattern(command) {
+		return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command deletes files or executes a broad find action."}, true
+	}
+	if hasDangerousShellExecutionPattern(command) {
+		return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command contains dangerous execution patterns."}, true
+	}
+	if !bashCommandAllowedBySimplePolicy(command) {
+		return dangerReflectionInfo{Severity: dangerSeverityMedium, Summary: "Shell command includes commands outside the safety allowlist."}, true
+	}
+	paths := toolPermissionPaths(cwd, "bash", args)
+	if hasExternalToolPath(cwd, paths) {
+		if shellCommandAppearsWrite(command) {
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command writes outside the current working directory."}, true
+		}
+		if skipReadOnlyConfirmations {
+			return dangerReflectionInfo{}, false
+		}
+		return dangerReflectionInfo{Severity: dangerSeverityLow, Summary: "Shell command reads paths outside the current working directory."}, true
+	}
+	return dangerReflectionInfo{}, false
+}
+
+func hasDestructiveShellPattern(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) == 0 {
+			continue
+		}
+		name := strings.TrimSpace(tokens[0])
+		switch name {
+		case "rm", "rmdir", "shred":
+			return true
+		case "find":
+			for _, token := range tokens[1:] {
+				if token == "-delete" || token == "-exec" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func hasDangerousShellExecutionPattern(command string) bool {
+	lower := strings.ToLower(command)
+	patterns := []string{
+		"| bash", "| sh", "| zsh", "curl ", "wget ", "bash -c", "sh -c",
+		"python -c", "python3 -c", "node -e", "perl -e", "ruby -e",
+	}
+	if strings.Contains(lower, "curl ") || strings.Contains(lower, "wget ") {
+		if strings.Contains(lower, "| bash") || strings.Contains(lower, "| sh") || strings.Contains(lower, "| zsh") {
+			return true
+		}
+	}
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) == 0 {
+			continue
+		}
+		for _, token := range tokens {
+			if strings.Contains(token, "`") || strings.Contains(token, "$(") {
+				return true
+			}
+		}
+	}
+	for _, pattern := range patterns[5:] {
+		if strings.Contains(lower, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyGitDanger(command string) (dangerReflectionInfo, bool) {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) == 0 || strings.TrimSpace(tokens[0]) != "git" {
+			continue
+		}
+		sub, args := gitSubcommand(tokens)
+		summary := "Git " + sub + " may change repository state."
+		switch sub {
+		case "reset":
+			if len(args) > 0 || hasAnyArg(args, "--hard", "--merge", "--keep") {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git reset may rewrite the current worktree/index state."}, true
+			}
+		case "clean":
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git clean removes untracked files from the worktree."}, true
+		case "checkout":
+			if checkoutRestoresPath(args) {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git checkout may discard local path changes."}, true
+			}
+		case "restore":
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git restore may discard local file changes."}, true
+		case "push":
+			if hasAnyArg(args, "--force", "-f", "--force-with-lease", "--delete", "-d") || hasArgPrefix(args, "--force-with-lease=") {
+				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git push may rewrite or delete remote history."}, true
+			}
+		case "branch":
+			if hasAnyArg(args, "-d", "-D", "--delete") {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git branch deletion removes a local branch reference."}, true
+			}
+		case "worktree":
+			if hasAnyArg(args, "remove") {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git worktree remove deletes a worktree checkout."}, true
+			}
+		case "filter-branch", "filter-repo", "rebase":
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: summary}, true
+		case "rm":
+			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git rm deletes tracked files from the worktree and index."}, true
+		case "reflog":
+			if hasAnyArg(args, "expire") {
+				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git reflog expire can destroy recovery points."}, true
+			}
+		case "stash":
+			if len(args) > 0 && args[0] == "drop" {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git stash drop permanently removes a stash entry."}, true
+			}
+			if len(args) > 0 && args[0] == "clear" {
+				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git stash clear removes all stash entries."}, true
+			}
+		case "gc":
+			if hasArgPrefix(args, "--prune") {
+				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git gc --prune can permanently remove unreachable objects."}, true
+			}
+		}
+	}
+	return dangerReflectionInfo{}, false
+}
+
+func gitSubcommand(tokens []string) (string, []string) {
+	idx := 1
+	for idx < len(tokens) {
+		token := strings.TrimSpace(tokens[idx])
+		if (token == "-C" || token == "-c" || token == "--git-dir" || token == "--work-tree" || token == "--namespace") && idx+1 < len(tokens) {
+			idx += 2
+			continue
+		}
+		if strings.HasPrefix(token, "--git-dir=") || strings.HasPrefix(token, "--work-tree=") {
+			idx++
+			continue
+		}
+		if strings.HasPrefix(token, "-") {
+			idx++
+			continue
+		}
+		return token, tokens[idx+1:]
+	}
+	return "", nil
+}
+
+func hasAnyArg(args []string, values ...string) bool {
+	allowed := map[string]bool{}
+	for _, value := range values {
+		allowed[value] = true
+	}
+	for _, arg := range args {
+		if allowed[arg] {
+			return true
+		}
+	}
+	return false
+}
+
+func hasArgPrefix(args []string, prefixes ...string) bool {
+	for _, arg := range args {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(arg, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func checkoutRestoresPath(args []string) bool {
+	if hasAnyArg(args, "--", ".") || hasArgPrefix(args, "--pathspec-from-file") {
 		return true
-	default:
+	}
+	if hasAnyArg(args, "-b", "-B", "--orphan") {
 		return false
 	}
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "-") {
+			continue
+		}
+		if arg == "." || arg == ".." || strings.HasPrefix(arg, "./") || strings.HasPrefix(arg, "../") || strings.Contains(arg, "/") || strings.Contains(arg, "\\") || filepath.Ext(arg) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) runDangerReflection(ctx context.Context, narratorID string, call agentbasic.ToolCall) (reflectionDecision, error) {
@@ -11223,7 +11591,7 @@ func hasExternalToolPath(cwd string, paths []string) bool {
 
 func toolOperation(name string) string {
 	switch name {
-	case "write", "edit", "bash":
+	case "write", "edit", "notebookedit", "bash":
 		return "write"
 	default:
 		return "read"
@@ -11232,7 +11600,7 @@ func toolOperation(name string) string {
 
 func toolPermissionPaths(cwd, name string, args map[string]any) []string {
 	switch name {
-	case "read", "write", "edit":
+	case "read", "write", "edit", "notebookedit":
 		if path := strings.TrimSpace(stringFromAny(args["file_path"])); path != "" {
 			return []string{path}
 		}
@@ -11639,6 +12007,15 @@ func boolPtrValue(value *bool, fallback bool) bool {
 func normalizeBooleanOverride(value string) string {
 	switch strings.TrimSpace(value) {
 	case "on", "off":
+		return strings.TrimSpace(value)
+	default:
+		return "inherit"
+	}
+}
+
+func normalizeDangerReflectionOverride(value string) string {
+	switch strings.TrimSpace(value) {
+	case "on", "off", "light", "standard", "strict":
 		return strings.TrimSpace(value)
 	default:
 		return "inherit"

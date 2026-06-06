@@ -103,6 +103,10 @@ type shareDiskMetadata struct {
 
 type ToolExecutor func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error)
 
+type BeforeTurnHook func(turnIndex int) error
+
+type ShouldStopHook func() bool
+
 type ExternalToolSpec struct {
 	Name        string
 	Description string
@@ -125,6 +129,13 @@ const (
 
 var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
+type customRetryRule struct {
+	Domain     string
+	StatusCode int
+	Keyword    string
+	Disabled   bool
+}
+
 type generateOptions struct {
 	toolExecutor                      ToolExecutor
 	systemPrompt                      string
@@ -139,6 +150,7 @@ type generateOptions struct {
 	maxChatRetries                    int
 	emptyResponseRetries              int
 	retryBaseDelay                    time.Duration
+	customRetryRules                  []customRetryRule
 	stickySessionKey                  string
 	sideCarCollector                  SideCarCollector
 	sideCarInitialCompletedToolCount  int
@@ -146,6 +158,8 @@ type generateOptions struct {
 	silentToolCallThreshold           int
 	silentToolCallThresholdConfigured bool
 	silentToolCallCount               int
+	beforeTurnHook                    BeforeTurnHook
+	shouldStopHook                    ShouldStopHook
 }
 
 type SideCarRequest struct {
@@ -202,6 +216,12 @@ func WithRetryBaseDelay(delay time.Duration) GenerateOption {
 	}
 }
 
+func withCustomRetryRules(rules []customRetryRule) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.customRetryRules = normalizeCustomRetryRules(rules)
+	}
+}
+
 func WithExternalTools(tools []ExternalToolSpec) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.externalTools = normalizeExternalTools(tools)
@@ -238,6 +258,18 @@ func WithSilentToolCallThreshold(threshold int) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.silentToolCallThreshold = threshold
 		opts.silentToolCallThresholdConfigured = true
+	}
+}
+
+func WithBeforeTurnHook(hook BeforeTurnHook) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.beforeTurnHook = hook
+	}
+}
+
+func WithShouldStop(hook ShouldStopHook) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.shouldStopHook = hook
 	}
 }
 

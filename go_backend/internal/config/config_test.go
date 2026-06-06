@@ -42,6 +42,7 @@ func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
 	expectDefaultValue(t, raw, "agent.requestDumpMaxSize", float64(1024*1024))
 	expectDefaultValue(t, raw, "agent.questionReflectionEnabled", false)
 	expectDefaultValue(t, raw, "agent.questionReflectionTimeoutMs", float64(300000))
+	expectDefaultValue(t, raw, "agent.dangerReflectionLevel", "standard")
 	expectDefaultValue(t, raw, "agent.dangerReflectionEnabled", true)
 	expectDefaultValue(t, raw, "agent.maxTransientRetries", float64(10))
 	expectDefaultValue(t, raw, "agent.firstTokenTimeoutMs", float64(60000))
@@ -191,6 +192,27 @@ func TestLoadMigratesLegacySettingsAndPersistsResult(t *testing.T) {
 	assertMigratedLegacySettings(t, persisted)
 }
 
+func TestLoadMigratesLegacyDangerReflectionEnabledFalse(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"agent":{"dangerReflectionEnabled":false}}`), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	agent, _ := store.Raw()["agent"].(map[string]any)
+	if agent["dangerReflectionLevel"] != "off" || agent["dangerReflectionEnabled"] != false {
+		t.Fatalf("legacy disabled danger reflection not migrated to off: %#v", agent)
+	}
+}
+
 func TestLoadAddsMissingOpenAIProviderPrefix(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -222,6 +244,9 @@ func assertMigratedLegacySettings(t *testing.T, raw map[string]any) {
 	agent, _ := raw["agent"].(map[string]any)
 	if agent["legacyEncoding"] != true || agent["dangerSkipReadOnlyConfirmations"] != true {
 		t.Fatalf("agent legacy booleans not migrated: %#v", agent)
+	}
+	if agent["dangerReflectionLevel"] != "standard" || agent["dangerReflectionEnabled"] != true {
+		t.Fatalf("danger reflection settings not normalized: %#v", agent)
 	}
 	if _, exists := agent["yoloSkipReadOnlyConfirmations"]; exists {
 		t.Fatalf("legacy yolo setting should be removed: %#v", agent)

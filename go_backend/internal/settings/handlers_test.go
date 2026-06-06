@@ -496,6 +496,7 @@ func TestPatchRejectsInvalidAgentScalarSettings(t *testing.T) {
 		{payload: `{"agent":{"summaryModel":1}}`, field: "agent.summaryModel"},
 		{payload: `{"agent":{"summaryModel":null}}`, field: "agent.summaryModel"},
 		{payload: `{"agent":{"defaultPermissionMode":"unknown"}}`, field: "agent.defaultPermissionMode"},
+		{payload: `{"agent":{"dangerReflectionLevel":"extreme"}}`, field: "agent.dangerReflectionLevel"},
 		{payload: `{"agent":{"defaultStartInPlanMode":"yes"}}`, field: "agent.defaultStartInPlanMode"},
 		{payload: `{"agent":{"defaultReasoningEffort":"extreme"}}`, field: "agent.defaultReasoningEffort"},
 		{payload: `{"agent":{"defaultReasoningEffort":null}}`, field: "agent.defaultReasoningEffort"},
@@ -523,6 +524,40 @@ func TestPatchRejectsInvalidAgentScalarSettings(t *testing.T) {
 		if appErr.Code != "VALIDATION_ERROR" || !strings.Contains(appErr.Message, tc.field) {
 			t.Fatalf("unexpected validation error for %s: %#v", tc.payload, appErr)
 		}
+	}
+}
+
+func TestPatchNormalizesDangerReflectionLevelCompatibility(t *testing.T) {
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(`{"agent":{"dangerReflectionLevel":"off"}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch dangerReflectionLevel off: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode patch response: %v", err)
+	}
+	agent, _ := body["agent"].(map[string]any)
+	if agent["dangerReflectionLevel"] != "off" || agent["dangerReflectionEnabled"] != false {
+		t.Fatalf("level off did not sync enabled false: %#v", agent)
+	}
+
+	req = httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(`{"agent":{"dangerReflectionEnabled":true}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w = httptest.NewRecorder()
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch legacy dangerReflectionEnabled true: %v", err)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode second patch response: %v", err)
+	}
+	agent, _ = body["agent"].(map[string]any)
+	if agent["dangerReflectionLevel"] != "standard" || agent["dangerReflectionEnabled"] != true {
+		t.Fatalf("legacy enabled true did not sync standard level: %#v", agent)
 	}
 }
 

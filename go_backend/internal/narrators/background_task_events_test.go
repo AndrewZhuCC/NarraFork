@@ -579,6 +579,201 @@ func TestCancelBackgroundTaskBroadcastsCancellationAndUpdatesChild(t *testing.T)
 	}
 }
 
+// This locks the current Go subagent foreground mirror broadcast baseline used by
+// the frontend. It is not a claim of complete TypeScript parity.
+func TestJ08SubagentForegroundDualBroadcastTranscriptGolden(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	ctx := context.Background()
+
+	parent, err := service.Get(ctx, parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(ctx, parent, "general", "J08 foreground", "openai:test", "", "", "fg", false)
+	if err != nil {
+		t.Fatalf("create foreground child: %v", err)
+	}
+	if _, err := service.addMessageWithBlocksWithCommandAndParentToolUse(ctx, child.ID, "user", "do foreground work", []map[string]any{{"type": "text", "text": "do foreground work"}}, nil, "", "toolu_j08_fg"); err != nil {
+		t.Fatalf("seed child parent tool use: %v", err)
+	}
+
+	textIndex := 0
+	state := &agentRunState{narratorID: child.ID, narrator: child}
+	for _, event := range []agentbasic.AgentEvent{
+		{Type: "stream_text", Text: "foreground ", OutputIndex: &textIndex},
+		{Type: "block_complete", Block: &agentbasic.ContentBlock{Type: "text", Text: "foreground done", OutputIndex: &textIndex}},
+		{Type: "assistant_message", Text: "foreground done"},
+	} {
+		if err := service.handleAgentEvent(ctx, state, event); err != nil {
+			t.Fatalf("handle child event %s: %v", event.Type, err)
+		}
+	}
+
+	childStream := requireJ08Broadcast(t, events(), child.ID, func(payload map[string]any) bool {
+		return payload["type"] == "stream_text"
+	})
+	if childStream["narratorId"] != child.ID || childStream["text"] != "foreground " || intNumber(childStream["outputIndex"]) != 0 {
+		t.Fatalf("child stream_text should stay scoped to child narrator, got %#v", childStream)
+	}
+	if childStream["childNarratorId"] != nil || childStream["parentToolUseId"] != nil {
+		t.Fatalf("child stream_text should not be top-level parent mirror, got %#v", childStream)
+	}
+
+	childMessage := requireJ08Broadcast(t, events(), child.ID, func(payload map[string]any) bool {
+		return payload["type"] == "message"
+	})
+	childMessageBody, _ := childMessage["message"].(map[string]any)
+	if childMessage["narratorId"] != child.ID || childMessage["childNarratorId"] != nil || childMessageBody["narratorId"] != child.ID || childMessageBody["parentToolUseId"] != "toolu_j08_fg" {
+		t.Fatalf("child message broadcast shape drifted: payload=%#v message=%#v", childMessage, childMessageBody)
+	}
+
+	parentMirror := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "message" && payload["childNarratorId"] == child.ID
+	})
+	parentMessageBody, _ := parentMirror["message"].(map[string]any)
+	if parentMirror["narratorId"] != parentID || parentMirror["parentToolUseId"] != "toolu_j08_fg" || parentMessageBody["narratorId"] != child.ID || parentMessageBody["parentToolUseId"] != "toolu_j08_fg" {
+		t.Fatalf("parent child-message mirror shape drifted: payload=%#v message=%#v", parentMirror, parentMessageBody)
+	}
+}
+
+// This locks the current Go background subagent broadcast frame baseline used by
+// the frontend. It is not a claim of complete TypeScript parity.
+func TestJ08BackgroundSubagentBroadcastFramesCurrentGoContractGolden(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	ctx := context.Background()
+
+	parent, err := service.Get(ctx, parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	child, err := service.createSubagentNarrator(ctx, parent, "general", "J08 background", "openai:test", "", "", "bg", true)
+	if err != nil {
+		t.Fatalf("create background child: %v", err)
+	}
+	insertParentAgentToolCallForTest(t, service, parentID, "toolu_j08_bg")
+	if err := service.createBackgroundAgentTask(ctx, parentID, child.ID, "general", "J08 background", "toolu_j08_bg", "bg"); err != nil {
+		t.Fatalf("create background task: %v", err)
+	}
+
+	started := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_started" && payload["taskId"] == child.ID
+	})
+	if started["narratorId"] != parentID || started["taskNarratorId"] != child.ID || started["toolUseId"] != "toolu_j08_bg" || started["subagentType"] != "general" {
+		t.Fatalf("background_task_started frame shape drifted: %#v", started)
+	}
+	running := requireJ08BackgroundStatusFrame(t, events(), parentID, child.ID, "running")
+	if running["narratorId"] != parentID || running["output"] != nil {
+		t.Fatalf("background_task_status_changed running shape drifted: %#v", running)
+	}
+
+	state := &agentRunState{narratorID: child.ID, narrator: child}
+	if err := service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "stream_text", Text: "delta"}); err != nil {
+		t.Fatalf("handle background stream: %v", err)
+	}
+	childStream := requireJ08Broadcast(t, events(), child.ID, func(payload map[string]any) bool {
+		return payload["type"] == "stream_text" && payload["text"] == "delta"
+	})
+	if childStream["narratorId"] != child.ID {
+		t.Fatalf("background child stream_text should keep child narratorId, got %#v", childStream)
+	}
+	output := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_output" && payload["taskId"] == child.ID
+	})
+	if output["narratorId"] != parentID || intNumber(output["outputBytes"]) != len([]byte("delta")) {
+		t.Fatalf("background_task_output frame shape drifted: %#v", output)
+	}
+
+	if err := service.finishBackgroundTaskRecord(ctx, parentID, child.ID, "completed", "final answer"); err != nil {
+		t.Fatalf("finish completed background task: %v", err)
+	}
+	completed := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_completed" && payload["taskNarratorId"] == child.ID
+	})
+	if completed["narratorId"] != parentID || completed["toolUseId"] != "toolu_j08_bg" || completed["resultPreview"] != "final answer" {
+		t.Fatalf("background_task_completed frame shape drifted: %#v", completed)
+	}
+	completedStatus := requireJ08BackgroundStatusFrame(t, events(), parentID, child.ID, "completed")
+	if completedStatus["output"] != "final answer" {
+		t.Fatalf("background_task_status_changed completed output drifted: %#v", completedStatus)
+	}
+	completedTool := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "tool_completed" && payload["toolUseId"] == "toolu_j08_bg"
+	})
+	if completedTool["subagentNarratorId"] != child.ID || completedTool["backgroundStatus"] != "completed" || completedTool["status"] != "success" || completedTool["output"] != "final answer" {
+		t.Fatalf("background subagent tool_completed shape drifted: %#v", completedTool)
+	}
+
+	failedChild, err := service.createSubagentNarrator(ctx, parent, "general", "J08 failed", "openai:test", "", "", "fail", true)
+	if err != nil {
+		t.Fatalf("create failed child: %v", err)
+	}
+	insertParentAgentToolCallForTest(t, service, parentID, "toolu_j08_fail")
+	if err := service.createBackgroundAgentTask(ctx, parentID, failedChild.ID, "general", "J08 failed", "toolu_j08_fail", "fail"); err != nil {
+		t.Fatalf("create failed task: %v", err)
+	}
+	if err := service.finishBackgroundTaskRecord(ctx, parentID, failedChild.ID, "failed", "boom"); err != nil {
+		t.Fatalf("finish failed background task: %v", err)
+	}
+	failed := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_failed" && payload["taskNarratorId"] == failedChild.ID
+	})
+	if failed["narratorId"] != parentID || failed["toolUseId"] != "toolu_j08_fail" || failed["error"] != "boom" {
+		t.Fatalf("background_task_failed frame shape drifted: %#v", failed)
+	}
+	failedStatus := requireJ08BackgroundStatusFrame(t, events(), parentID, failedChild.ID, "failed")
+	if failedStatus["output"] != "boom" {
+		t.Fatalf("background_task_status_changed failed output drifted: %#v", failedStatus)
+	}
+
+	cancelChild, err := service.createSubagentNarrator(ctx, parent, "general", "J08 cancelled", "openai:test", "", "", "cancel", true)
+	if err != nil {
+		t.Fatalf("create cancelled child: %v", err)
+	}
+	insertParentAgentToolCallForTest(t, service, parentID, "toolu_j08_cancel")
+	if err := service.createBackgroundAgentTask(ctx, parentID, cancelChild.ID, "general", "J08 cancelled", "toolu_j08_cancel", "cancel"); err != nil {
+		t.Fatalf("create cancelled task: %v", err)
+	}
+	if err := service.finishBackgroundTaskRecord(ctx, parentID, cancelChild.ID, "cancelled", "Cancelled"); err != nil {
+		t.Fatalf("finish cancelled background task: %v", err)
+	}
+	cancelled := requireJ08Broadcast(t, events(), parentID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_cancelled" && payload["taskNarratorId"] == cancelChild.ID
+	})
+	if cancelled["narratorId"] != parentID || cancelled["toolUseId"] != "toolu_j08_cancel" {
+		t.Fatalf("background_task_cancelled frame shape drifted: %#v", cancelled)
+	}
+	cancelledStatus := requireJ08BackgroundStatusFrame(t, events(), parentID, cancelChild.ID, "cancelled")
+	if cancelledStatus["output"] != "Cancelled" {
+		t.Fatalf("background_task_status_changed cancelled output drifted: %#v", cancelledStatus)
+	}
+}
+
+func requireJ08BackgroundStatusFrame(t *testing.T, events []capturedBroadcast, narratorID, taskID, status string) map[string]any {
+	t.Helper()
+	return requireJ08Broadcast(t, events, narratorID, func(payload map[string]any) bool {
+		return payload["type"] == "background_task_status_changed" && payload["taskId"] == taskID && payload["status"] == status
+	})
+}
+
+func requireJ08Broadcast(t *testing.T, events []capturedBroadcast, narratorID string, match func(map[string]any) bool) map[string]any {
+	t.Helper()
+	for _, event := range events {
+		if event.NarratorID == narratorID && match(event.Payload) {
+			return event.Payload
+		}
+	}
+	t.Fatalf("missing J08 broadcast for narrator %s in %#v", narratorID, events)
+	return nil
+}
+
 type capturedBroadcast struct {
 	NarratorID string
 	Payload    map[string]any

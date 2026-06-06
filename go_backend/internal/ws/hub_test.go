@@ -47,9 +47,10 @@ func TestNarratorSubscribeSendsStreamingSnapshotAndCatchUp(t *testing.T) {
 		},
 	}
 	hub.SetNarratorSyncProvider(provider)
-	hub.BroadcastNarrator("nar_1", map[string]any{"type": "stream_text", "narratorId": "nar_1", "text": "hel"})
-	hub.BroadcastNarrator("nar_1", map[string]any{"type": "stream_text", "narratorId": "nar_1", "text": "lo"})
-	hub.BroadcastNarrator("nar_1", map[string]any{"type": "tool_call", "narratorId": "nar_1", "toolUseId": "tool_1", "toolName": "Read", "input": map[string]any{"file_path": "a.txt"}})
+	hub.BroadcastNarrator("nar_1", map[string]any{"type": "stream_text", "narratorId": "nar_1", "text": "hel", "outputIndex": 0})
+	hub.BroadcastNarrator("nar_1", map[string]any{"type": "stream_text", "narratorId": "nar_1", "text": "lo", "outputIndex": 0})
+	hub.BroadcastNarrator("nar_1", map[string]any{"type": "tool_call", "narratorId": "nar_1", "toolUseId": "tool_1", "toolName": "Read", "input": map[string]any{"file_path": "a.txt"}, "streamStartedAt": int64(1770000000000)})
+	hub.BroadcastNarrator("nar_1", map[string]any{"type": "tool_use_chunk", "narratorId": "nar_1", "toolUseId": "tool_1", "toolName": "Read", "inputCharsTotal": 42, "streamingField": map[string]any{"name": "file_path", "delta": "a.txt"}})
 
 	conn, cleanup := dialNarratorHub(t, hub)
 	defer cleanup()
@@ -62,12 +63,16 @@ func TestNarratorSubscribeSendsStreamingSnapshotAndCatchUp(t *testing.T) {
 		t.Fatalf("expected streaming_snapshot, got %#v", snapshot)
 	}
 	blocks, _ := snapshot["streamingBlocks"].([]any)
-	if len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "hello" {
+	if len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "hello" || wsTestIntNumber(blocks[0].(map[string]any)["outputIndex"]) != 0 {
 		t.Fatalf("expected aggregated streaming text, got %#v", snapshot["streamingBlocks"])
 	}
 	chunks, _ := snapshot["toolChunks"].([]any)
-	if len(chunks) != 1 || chunks[0].(map[string]any)["toolUseId"] != "tool_1" || chunks[0].(map[string]any)["started"] != true {
+	if len(chunks) != 1 {
 		t.Fatalf("expected active tool chunk, got %#v", snapshot["toolChunks"])
+	}
+	chunk := chunks[0].(map[string]any)
+	if chunk["toolUseId"] != "tool_1" || chunk["started"] != true || wsTestIntNumber(chunk["inputCharsTotal"]) != 42 || wsTestIntNumber(chunk["streamStartedAt"]) != 1770000000000 {
+		t.Fatalf("expected active tool chunk with started/inputCharsTotal, got %#v", chunk)
 	}
 
 	catchUp := readWSMessage(t, conn)
@@ -77,6 +82,10 @@ func TestNarratorSubscribeSendsStreamingSnapshotAndCatchUp(t *testing.T) {
 	topLevel, _ := catchUp["topLevel"].([]any)
 	if len(topLevel) != 1 || topLevel[0].(map[string]any)["id"] != "msg_2" {
 		t.Fatalf("expected catch-up top-level message, got %#v", catchUp["topLevel"])
+	}
+	orphanChildren, _ := catchUp["orphanChildren"].([]any)
+	if len(orphanChildren) != 0 {
+		t.Fatalf("expected empty catch-up orphanChildren, got %#v", catchUp["orphanChildren"])
 	}
 
 	hub.BroadcastNarrator("nar_1", map[string]any{"type": "message", "narratorId": "nar_1", "message": map[string]any{"id": "msg_3"}})
@@ -162,6 +171,19 @@ func readWSMessage(t *testing.T, conn *websocket.Conn) map[string]any {
 		t.Fatalf("read websocket message: %v", err)
 	}
 	return msg
+}
+
+func wsTestIntNumber(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
+	}
 }
 
 func waitForNarratorSubscription(t *testing.T, _ *ws.Hub, _ *websocket.Conn, _ string) {

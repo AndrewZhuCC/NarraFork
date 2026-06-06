@@ -245,6 +245,99 @@ func TestRunAgentLoopExecutesToolAndEmitsTurnComplete(t *testing.T) {
 	}
 }
 
+func TestBeforeTurnHookRunsForEachProviderTurn(t *testing.T) {
+	call := newFunctionToolCall("hook-tool", "Read", `{"file_path":"a.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "final"}}},
+	}}
+	turns := []int{}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tool"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithBeforeTurnHook(func(turnIndex int) error {
+				turns = append(turns, turnIndex)
+				return nil
+			}),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{Output: "tool output"}, nil
+			}),
+		),
+	)
+	_ = collectEvents(stream)
+	if !reflect.DeepEqual(turns, []int{0, 1}) {
+		t.Fatalf("before-turn hook indexes = %#v, want %#v", turns, []int{0, 1})
+	}
+	if adapter.chatCalls != 2 {
+		t.Fatalf("expected two provider requests, got %d", adapter.chatCalls)
+	}
+}
+
+func TestBeforeTurnHookErrorEmitsErrorWithoutProviderRequest(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{{{Parsed: ParsedStreamEvent{Text: "unused"}}}}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "hi"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithBeforeTurnHook(func(turnIndex int) error {
+				return errors.New("before-turn failed")
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	if adapter.chatCalls != 0 {
+		t.Fatalf("provider should not be called after hook error, got %d calls", adapter.chatCalls)
+	}
+	if len(events) != 1 || events[0].Type != "error" || events[0].Message != "before-turn failed" {
+		t.Fatalf("expected only hook error event, got %#v", events)
+	}
+}
+
+func TestShouldStopHookStopsAfterToolsWithoutDoneOrError(t *testing.T) {
+	call := newFunctionToolCall("stop-tool", "Read", `{"file_path":"a.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "should not request"}}},
+	}}
+	shouldStopCalls := 0
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tool"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithShouldStop(func() bool {
+				shouldStopCalls++
+				return true
+			}),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{Output: "tool output"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	if adapter.chatCalls != 1 {
+		t.Fatalf("expected one provider request before stop, got %d", adapter.chatCalls)
+	}
+	if shouldStopCalls != 1 {
+		t.Fatalf("expected one should-stop hook call, got %d", shouldStopCalls)
+	}
+	if eventTypeCount(events, "tool_result") != 1 || eventTypeCount(events, "turn_complete") != 1 {
+		t.Fatalf("expected tool_result and turn_complete before stop, got %#v", eventTypes(events))
+	}
+	if eventTypeCount(events, "done") != 0 || eventTypeCount(events, "error") != 0 {
+		t.Fatalf("should-stop should not emit done/error, got %#v", eventTypes(events))
+	}
+}
+
 func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
 	calls := []ToolCall{
 		newFunctionToolCall("tool-1", "Read", `{"file_path":"a"}`),
@@ -518,6 +611,92 @@ func TestRunAgentLoopRetriesTransientErrors(t *testing.T) {
 	}
 	if adapter.chatCalls != 2 {
 		t.Fatalf("expected two chat calls, got %d", adapter.chatCalls)
+	}
+}
+
+func TestRunAgentLoopRetriesCustomKeywordErrors(t *testing.T) {
+	adapter := &scriptedAdapter{
+		chatErrors: []error{errors.New("provider returned status 418: upstream says shard warming")},
+		turns:      [][]StreamEvent{nil, {{Parsed: ParsedStreamEvent{Text: "recovered"}}}},
+	}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "retry"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithMaxChatRetries(2),
+			withCustomRetryRules([]customRetryRule{{Keyword: "shard warming"}}),
+		),
+	)
+	events := collectEvents(stream)
+	if eventTypeCount(events, "retrying") != 1 || events[len(events)-1].Type != "done" {
+		t.Fatalf("expected custom keyword retry then done, got %#v", eventTypes(events))
+	}
+	if adapter.chatCalls != 2 {
+		t.Fatalf("expected two chat calls, got %d", adapter.chatCalls)
+	}
+}
+
+func TestRunAgentLoopRetriesCustomKeywordInvalidState(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{InvalidState: &InvalidState{Reason: "upstream_busy", Message: "vendor queue draining"}}}},
+		{{Parsed: ParsedStreamEvent{Text: "recovered"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "retry"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithMaxChatRetries(2),
+			withCustomRetryRules([]customRetryRule{{Keyword: "queue draining"}}),
+		),
+	)
+	events := collectEvents(stream)
+	if eventTypeCount(events, "retrying") != 1 || events[len(events)-1].Type != "done" {
+		t.Fatalf("expected custom invalid_state retry then done, got %#v", eventTypes(events))
+	}
+	if adapter.chatCalls != 2 {
+		t.Fatalf("expected two chat calls, got %d", adapter.chatCalls)
+	}
+}
+
+func TestRunAgentLoopDoesNotRetryDisabledCustomKeywordRule(t *testing.T) {
+	adapter := &scriptedAdapter{
+		chatErrors: []error{errors.New("provider returned status 418: shard warming")},
+	}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "retry"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithMaxChatRetries(2),
+			withCustomRetryRules([]customRetryRule{{Keyword: "shard warming", Disabled: true}}),
+		),
+	)
+	events := collectEvents(stream)
+	if eventTypeCount(events, "retrying") != 0 || events[len(events)-1].Type != "error" {
+		t.Fatalf("expected disabled custom rule to leave error terminal, got %#v", eventTypes(events))
+	}
+}
+
+func TestCustomRetryRulesFromSettingsParsesKeywordOnlyRule(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{
+			"customRetryRules": []any{
+				map[string]any{"id": "r1", "keyword": "Vendor Busy"},
+				map[string]any{"id": "r2", "keyword": "Disabled", "enabled": false},
+			},
+		},
+	})
+	rules := customRetryRulesFromSettings(store)
+	if len(rules) != 1 || rules[0].Keyword != "vendor busy" || rules[0].Disabled {
+		t.Fatalf("unexpected parsed custom retry rules: %#v", rules)
 	}
 }
 

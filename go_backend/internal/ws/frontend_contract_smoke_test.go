@@ -42,7 +42,7 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	// useNarratorWS passes fullSubscribe=true from panel views and expects an
 	// immediate streaming_snapshot when the server has in-flight output cached.
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "stream_text", "text": "cached", "outputIndex": 0})
-	h.BroadcastNarrator("narrator-1", map[string]any{"type": "tool_call", "toolUseId": "tool-cached", "toolName": "Read", "input": map[string]any{"file_path": "README.md"}})
+	h.BroadcastNarrator("narrator-1", map[string]any{"type": "tool_call", "toolUseId": "tool-cached", "toolName": "Read", "input": map[string]any{"file_path": "README.md"}, "streamStartedAt": int64(1770000000000)})
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "tool_use_chunk", "toolUseId": "tool-cached", "toolName": "Read", "inputCharsTotal": 42, "streamingField": map[string]any{"name": "file_path", "delta": "README.md"}})
 
 	h.handleMessage(c, map[string]any{"type": "subscribe", "narratorIds": []any{"narrator-1"}, "lastMessageId": "msg-0"})
@@ -51,15 +51,20 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	if snapshot["type"] != "streaming_snapshot" || snapshot["narratorId"] != "narrator-1" {
 		t.Fatalf("unexpected initial streaming_snapshot: %#v", snapshot)
 	}
-	if _, ok := snapshot["streamingBlocks"].([]any); !ok {
-		t.Fatalf("streaming_snapshot must include streamingBlocks array: %#v", snapshot)
+	streamingBlocks, ok := snapshot["streamingBlocks"].([]any)
+	if !ok || len(streamingBlocks) != 1 {
+		t.Fatalf("streaming_snapshot must include one streamingBlocks entry: %#v", snapshot)
+	}
+	block := streamingBlocks[0].(map[string]any)
+	if block["type"] != "text" || block["text"] != "cached" || intNumber(block["outputIndex"]) != 0 {
+		t.Fatalf("streaming_snapshot should preserve in-flight stream_text: %#v", block)
 	}
 	toolChunks, ok := snapshot["toolChunks"].([]any)
 	if !ok || len(toolChunks) != 1 {
 		t.Fatalf("streaming_snapshot must include toolChunks array: %#v", snapshot)
 	}
 	chunk := toolChunks[0].(map[string]any)
-	if chunk["toolUseId"] != "tool-cached" || intNumber(chunk["inputCharsTotal"]) != 42 || chunk["started"] != true {
+	if chunk["toolUseId"] != "tool-cached" || intNumber(chunk["inputCharsTotal"]) != 42 || chunk["started"] != true || intNumber(chunk["streamStartedAt"]) != 1770000000000 {
 		t.Fatalf("streaming_snapshot should preserve tool_use_chunk state: %#v", chunk)
 	}
 
@@ -67,10 +72,12 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	if catchUp["type"] != "catch_up" || catchUp["narratorId"] != "narrator-1" || intNumber(catchUp["messageVersion"]) != 3 {
 		t.Fatalf("unexpected catch_up payload: %#v", catchUp)
 	}
-	if _, ok := catchUp["topLevel"].([]any); !ok {
+	topLevel, ok := catchUp["topLevel"].([]any)
+	if !ok || len(topLevel) != 1 || topLevel[0].(map[string]any)["id"] != "msg-1" {
 		t.Fatalf("catch_up must include topLevel array: %#v", catchUp)
 	}
-	if _, ok := catchUp["orphanChildren"].([]any); !ok {
+	orphanChildren, ok := catchUp["orphanChildren"].([]any)
+	if !ok || len(orphanChildren) != 0 {
 		t.Fatalf("catch_up must include orphanChildren array: %#v", catchUp)
 	}
 	if !h.isSubscribed(c, "narrator-1") {
@@ -95,6 +102,12 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	}
 	if statusChange["narratorId"] != "narrator-1" || statusChange["status"] != "working" {
 		t.Fatalf("unexpected status_change frame: %#v", statusChange)
+	}
+	if substatusChange["narratorId"] != "narrator-1" {
+		t.Fatalf("unexpected substatus_change narrator id: %#v", substatusChange)
+	}
+	if substatus, ok := substatusChange["substatus"].([]any); !ok || len(substatus) != 1 || substatus[0] != "calling_model" {
+		t.Fatalf("unexpected substatus_change frame: %#v", substatusChange)
 	}
 
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "stream_text", "text": "delta", "outputIndex": 0})

@@ -1215,17 +1215,20 @@ func TestRunBasicAgentBypassPermissionsStillRunsDangerReflection(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "bypass danger cancelled"}}}})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bypass-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch bypass-should-not-run"}`}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bypass-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"rm bypass-should-not-run"}`}}}}}}})
 	}))
 	defer server.Close()
 	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	if err := os.WriteFile(filepath.Join(cwd, "bypass-should-not-run"), []byte("keep"), 0o600); err != nil {
+		t.Fatalf("seed bypass danger file: %v", err)
+	}
 	_, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'bypassPermissions', danger_reflection_override = 'on' WHERE id = ?`, narratorID)
 	if err != nil {
 		t.Fatalf("enable bypass danger reflection: %v", err)
 	}
 	service.runBasicAgent(context.Background(), narratorID)
-	if _, err := os.Stat(filepath.Join(cwd, "bypass-should-not-run")); err == nil {
-		t.Fatalf("danger reflection should have prevented bypass Bash execution")
+	if _, err := os.Stat(filepath.Join(cwd, "bypass-should-not-run")); err != nil {
+		t.Fatalf("danger reflection should have prevented bypass Bash execution: %v", err)
 	}
 	var status, outputRaw string
 	if err := service.DB.QueryRow(`SELECT status, output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'danger-bypass-bash-1'`, narratorID).Scan(&status, &outputRaw); err != nil {
@@ -1518,6 +1521,83 @@ func TestRunBasicAgentInjectsPriorityBufferedMessageAsAfterToolsSideCar(t *testi
 	}
 	if sideCarRows != 1 {
 		t.Fatalf("expected persisted buffered sidecar, got %d", sideCarRows)
+	}
+}
+
+func TestRunBasicAgentPriorityBufferedAfterToolsSideCarStopsBeforeThirdRequest(t *testing.T) {
+	var mu sync.Mutex
+	requestBodies := []string{}
+	postBufferedRequestIndex := -1
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		raw, _ := json.Marshal(body)
+		bodyText := string(raw)
+		mu.Lock()
+		requestIndex := len(requestBodies)
+		requestBodies = append(requestBodies, bodyText)
+		if requestHasToolResult(body) && postBufferedRequestIndex < 0 && strings.Contains(bodyText, "queued fallback follow-up") && strings.Contains(bodyText, "buffered_user") {
+			postBufferedRequestIndex = requestIndex
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		switch requestIndex {
+		case 0:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "fallback-read-1", "type": "function", "function": map[string]any{"name": "Read", "arguments": `{"file_path":"buffer.txt"}`}}}}}}})
+		case 1:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "fallback-read-2", "type": "function", "function": map[string]any{"name": "Read", "arguments": `{"file_path":"second.txt"}`}}}}}}})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "finished after fallback continuation"}}}})
+		}
+	}))
+	defer server.Close()
+	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	if _, err := service.DB.Exec(`CREATE TABLE narrator_sidecars (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, tool_use_id TEXT, target TEXT, source TEXT, content TEXT, order_index INTEGER, created_at TEXT)`); err != nil {
+		t.Fatalf("create narrator_sidecars: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "buffer.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatalf("write buffer fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "second.txt"), []byte("second content"), 0o644); err != nil {
+		t.Fatalf("write second fixture: %v", err)
+	}
+	if _, err := service.BufferUserMessage(context.Background(), narratorID, "tester", "queued fallback follow-up", []map[string]any{{"type": "text", "text": "queued fallback follow-up"}}, true); err != nil {
+		t.Fatalf("seed buffer: %v", err)
+	}
+
+	service.runBasicAgent(context.Background(), narratorID)
+
+	mu.Lock()
+	requests := append([]string(nil), requestBodies...)
+	postIndex := postBufferedRequestIndex
+	mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("expected soft-stop after the post-tool request and before a third provider request, got %d requests: %#v", len(requests), requests)
+	}
+	if postIndex != 1 {
+		t.Fatalf("expected second request to carry buffered_user after-tools sidecar, index=%d bodies=%#v", postIndex, requests)
+	}
+	var sideCarRows int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_sidecars WHERE narrator_id = ? AND target = 'user_message' AND source = 'buffered_user' AND content LIKE '%queued fallback follow-up%'`, narratorID).Scan(&sideCarRows); err != nil {
+		t.Fatalf("count persisted buffered sidecars: %v", err)
+	}
+	if sideCarRows != 1 {
+		t.Fatalf("expected persisted buffered sidecar evidence, got %d", sideCarRows)
+	}
+	var toolResultRows int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_tool_calls WHERE narrator_id = ? AND status = 'success' AND result_message_id IS NOT NULL`, narratorID).Scan(&toolResultRows); err != nil {
+		t.Fatalf("count completed tool results: %v", err)
+	}
+	if toolResultRows != 2 {
+		t.Fatalf("expected soft-stop to preserve tool results before final idle, got %d completed tool results", toolResultRows)
+	}
+	var status string
+	if err := service.DB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status); err != nil {
+		t.Fatalf("load narrator status: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("expected final run status idle, got %q", status)
 	}
 }
 

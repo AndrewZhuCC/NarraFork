@@ -636,8 +636,10 @@ func validateCreateRequest(req createRequest) error {
 	if req.PlanReflectionAutoApproveOverride != "" && !validBooleanOverride(req.PlanReflectionAutoApproveOverride) {
 		return httpx.BadRequest("planReflectionAutoApproveOverride must be inherit, on, or off")
 	}
-	if req.DangerReflectionOverride != "" && !validBooleanOverride(req.DangerReflectionOverride) {
-		return httpx.BadRequest("dangerReflectionOverride must be inherit, on, or off")
+	if req.DangerReflectionOverride != "" && !validDangerReflectionOverride(req.DangerReflectionOverride) {
+		return httpx.BadRequest(
+			"dangerReflectionOverride must be inherit, on, off, light, standard, or strict",
+		)
 	}
 	return nil
 }
@@ -654,6 +656,15 @@ func validReasoningEffort(value string) bool {
 func validBooleanOverride(value string) bool {
 	switch value {
 	case "inherit", "on", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func validDangerReflectionOverride(value string) bool {
+	switch value {
+	case "inherit", "on", "off", "light", "standard", "strict":
 		return true
 	default:
 		return false
@@ -5640,18 +5651,41 @@ func (h *Handler) updateReflectionOverrides(w http.ResponseWriter, r *http.Reque
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	planValue, hasPlan := body["planReflectionAutoApproveOverride"]
+	dangerValue, hasDanger := body["dangerReflectionOverride"]
+	if !hasPlan && !hasDanger {
+		return httpx.BadRequest("At least one reflection override must be provided")
+	}
+	var planOverride any
+	if hasPlan {
+		planText := stringFromAny(planValue)
+		if !validBooleanOverride(planText) {
+			return httpx.BadRequest("planReflectionAutoApproveOverride must be inherit, on, or off")
+		}
+		planOverride = normalizeBooleanOverride(planText)
+	}
+	var dangerOverride any
+	if hasDanger {
+		dangerText := stringFromAny(dangerValue)
+		if !validDangerReflectionOverride(dangerText) {
+			return httpx.BadRequest(
+				"dangerReflectionOverride must be inherit, on, off, light, standard, or strict",
+			)
+		}
+		dangerOverride = normalizeDangerReflectionOverride(dangerText)
+	}
 	narratorID := chi.URLParam(r, "id")
-	_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET plan_reflection_auto_approve_override = COALESCE(?, plan_reflection_auto_approve_override), danger_reflection_override = COALESCE(?, danger_reflection_override), updated_at = ? WHERE id = ?`, body["planReflectionAutoApproveOverride"], body["dangerReflectionOverride"], db.NowISO(), narratorID)
+	_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET plan_reflection_auto_approve_override = COALESCE(?, plan_reflection_auto_approve_override), danger_reflection_override = COALESCE(?, danger_reflection_override), updated_at = ? WHERE id = ?`, planOverride, dangerOverride, db.NowISO(), narratorID)
 	if err != nil {
 		return err
 	}
 	if h.Service.Hub != nil {
 		payload := map[string]any{"type": "reflection_overrides_changed", "narratorId": narratorID}
-		if _, ok := body["planReflectionAutoApproveOverride"]; ok {
-			payload["planReflectionAutoApproveOverride"] = body["planReflectionAutoApproveOverride"]
+		if hasPlan {
+			payload["planReflectionAutoApproveOverride"] = planOverride
 		}
-		if _, ok := body["dangerReflectionOverride"]; ok {
-			payload["dangerReflectionOverride"] = body["dangerReflectionOverride"]
+		if hasDanger {
+			payload["dangerReflectionOverride"] = dangerOverride
 		}
 		h.Service.Hub.BroadcastNarrator(narratorID, payload)
 	}

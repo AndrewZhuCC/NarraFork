@@ -26,6 +26,8 @@ export type {
 	AgentConfig,
 	AgentEvent,
 	AgentToolUse,
+	DangerInfo,
+	DangerSeverity,
 	PermissionResult,
 	ReasoningEffort,
 	ReflectionLoopConfig,

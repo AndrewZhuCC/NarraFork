@@ -502,6 +502,15 @@ func boolValue(value any) bool {
 	return false
 }
 
+func isDangerReflectionLevel(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "off", "light", "standard", "strict":
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeLegacySettingsPatch(patch map[string]any) map[string]any {
 	agent, ok := patch["agent"].(map[string]any)
 	if !ok {
@@ -514,6 +523,19 @@ func normalizeLegacySettingsPatch(patch map[string]any) map[string]any {
 	if _, hasDanger := agent["dangerSkipReadOnlyConfirmations"]; !hasDanger {
 		if value, hasLegacy := agent["yoloSkipReadOnlyConfirmations"]; hasLegacy {
 			agent["dangerSkipReadOnlyConfirmations"] = value
+		}
+	}
+	if rawLevel, hasLevel := agent["dangerReflectionLevel"]; hasLevel {
+		level := strings.ToLower(strings.TrimSpace(stringValue(rawLevel)))
+		if isDangerReflectionLevel(level) {
+			agent["dangerReflectionLevel"] = level
+			agent["dangerReflectionEnabled"] = level != "off"
+		}
+	} else if enabled, ok := agent["dangerReflectionEnabled"].(bool); ok {
+		if enabled {
+			agent["dangerReflectionLevel"] = "standard"
+		} else {
+			agent["dangerReflectionLevel"] = "off"
 		}
 	}
 	return patch
@@ -723,6 +745,9 @@ func validateAgentSettingsPatch(patch map[string]any) error {
 				return httpx.ValidationError("agent." + key + " must be boolean")
 			}
 		}
+	}
+	if value, ok := agentPatch["dangerReflectionLevel"]; ok && !isDangerReflectionLevel(stringValue(value)) {
+		return httpx.ValidationError("agent.dangerReflectionLevel must be off, light, standard, or strict")
 	}
 	if value, ok := agentPatch["summaryModel"]; ok {
 		if _, ok := value.(string); !ok {

@@ -7,7 +7,7 @@ import (
 	"narrafork-go/internal/ws"
 )
 
-func TestAgentEventBroadcastsFrontendUseNarratorWSFields(t *testing.T) {
+func TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields(t *testing.T) {
 	hub := ws.NewHub()
 	frames := []map[string]any{}
 	hub.SetNarratorBroadcastHook(func(_ string, payload any, _ []byte) {
@@ -36,8 +36,37 @@ func TestAgentEventBroadcastsFrontendUseNarratorWSFields(t *testing.T) {
 		Metadata:    map[string]any{"revisedPrompt": "draw a graph", "result": "image-data"},
 	})
 	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
-		Type:     "metering",
-		Metadata: map[string]any{"unit": "request", "unitPlural": "requests", "usage": float64(3)},
+		Type: "metering",
+		Metadata: map[string]any{
+			"unit":       "request",
+			"unitPlural": "requests",
+			"usage":      float64(3),
+			"limit":      float64(10),
+		},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:     "quota_balance",
+		Message:  "12 credits",
+		Provider: "kiro",
+		Model:    "claude-sonnet-4.5",
+		Metadata: map[string]any{
+			"quotaBalance":         "12 credits",
+			"detailedQuotaBalance": "12 of 20 credits",
+		},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:     "nkp_quota_balance",
+		Metadata: map[string]any{"quotaBalance": "8"},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:     "nkp_queue_status",
+		Message:  "waiting",
+		Metadata: map[string]any{"position": float64(2), "queueDepth": float64(5)},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:     "queue_status",
+		Message:  "Waiting for capacity",
+		Metadata: map[string]any{"position": float64(3), "queueDepth": float64(8)},
 	})
 	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
 		Type:       "retrying",
@@ -96,8 +125,25 @@ func TestAgentEventBroadcastsFrontendUseNarratorWSFields(t *testing.T) {
 		t.Fatalf("image_generation should expose useNarratorWS fields: %#v", imageGeneration)
 	}
 	metering := requireFrameType(t, frames, "metering")
-	if metering["unit"] != "request" || metering["unitPlural"] != "requests" || intNumber(metering["usage"]) != 3 {
-		t.Fatalf("metering should expose useNarratorWS fields: %#v", metering)
+	meteringMetadata, _ := metering["metadata"].(map[string]any)
+	if metering["unit"] != "request" || metering["unitPlural"] != "requests" || intNumber(metering["usage"]) != 3 || intNumber(meteringMetadata["limit"]) != 10 {
+		t.Fatalf("metering should expose useNarratorWS fields and preserve metadata: %#v", metering)
+	}
+	quota := requireFrameType(t, frames, "quota_balance")
+	if quota["quotaBalance"] != "12 credits" || quota["detailedQuotaBalance"] != "12 of 20 credits" || quota["provider"] != "kiro" || quota["model"] != "claude-sonnet-4.5" {
+		t.Fatalf("quota_balance should expose current frontend fields: %#v", quota)
+	}
+	nkpQuota := requireFrameType(t, frames, "nkp_quota_balance")
+	if nkpQuota["quotaBalance"] != "8" {
+		t.Fatalf("nkp_quota_balance should expose quotaBalance: %#v", nkpQuota)
+	}
+	nkpQueue := requireFrameType(t, frames, "nkp_queue_status")
+	if intNumber(nkpQueue["position"]) != 2 || intNumber(nkpQueue["queueDepth"]) != 5 {
+		t.Fatalf("nkp_queue_status should expose queue position/depth: %#v", nkpQueue)
+	}
+	queue := requireFrameType(t, frames, "queue_status")
+	if intNumber(queue["position"]) != 3 || intNumber(queue["queueDepth"]) != 8 || queue["queueMessage"] != "Waiting for capacity" {
+		t.Fatalf("queue_status should expose queue position/depth/message: %#v", queue)
 	}
 	warning := requireFrameType(t, frames, "warning")
 	if warning["message"] != "provider busy" || intNumber(warning["retryCount"]) != 2 || intNumber(warning["maxRetries"]) != 5 || intNumber(warning["delayMs"]) != 750 {

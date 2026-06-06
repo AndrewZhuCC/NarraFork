@@ -50,6 +50,10 @@ func RunAgentLoop(ctx context.Context, settings *config.Store, model string, his
 		return nil, errors.New("no messages to send")
 	}
 	options := normalizeGenerateOptions(opts...)
+	if rules := customRetryRulesFromSettings(settings); len(rules) > 0 {
+		options.customRetryRules = append(options.customRetryRules, rules...)
+		options.customRetryRules = normalizeCustomRetryRules(options.customRetryRules)
+	}
 	return runAgentLoop(ctx, resolution, history, cwd, options), nil
 }
 
@@ -84,6 +88,12 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 	}
 	toolExecutor = guardToolExecutor(toolExecutor, inventoryOptions)
 	for turn := 0; turn < options.maxTurns; turn++ {
+		if options.beforeTurnHook != nil {
+			if err := options.beforeTurnHook(turn); err != nil {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+				return
+			}
+		}
 		state, ok := runAgentTurnWithRetry(ctx, out, adapter, resolution, &built, cwd, options, toolExecutor)
 		if !ok {
 			return
@@ -111,6 +121,9 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 		}
 		adapter.PushUserTurn(&built, appendAgentSideCarsForProvider("", afterToolsSideCars), toolResults)
 		emitAgentEvent(ctx, out, AgentEvent{Type: "turn_complete", TurnIndex: turn})
+		if options.shouldStopHook != nil && options.shouldStopHook() {
+			return
+		}
 	}
 	emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "tool loop reached maximum rounds without final answer"})
 }
@@ -170,9 +183,20 @@ func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter P
 			emitAgentEvent(ctx, out, AgentEvent{Type: "retryable_error", Code: CodexRebuildHistoryRetryCode, Message: err.Error(), Metadata: codexRebuildHistoryRetryMetadata(err)})
 			return nil, false
 		}
-		if !isTransientAgentError(err) {
+		var retryInvalidStateErr *providerInvalidStateError
+		if errors.As(err, &retryInvalidStateErr) && state != nil && len(state.earlyExec) > 0 {
+			flushTurnBlocks(ctx, out, state)
+			emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: retryInvalidStateErr.Reason, Message: retryInvalidStateErr.Message})
+			return nil, false
+		}
+		if !isTransientAgentError(err, options.customRetryRules) {
 			if state != nil {
 				flushTurnBlocks(ctx, out, state)
+			}
+			var invalidStateErr *providerInvalidStateError
+			if errors.As(err, &invalidStateErr) {
+				emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: invalidStateErr.Reason, Message: invalidStateErr.Message})
+				return nil, false
 			}
 			emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
 			return nil, false
@@ -312,8 +336,10 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			emitProviderLifecycleEvents(ctx, out, parsed, resolution.Provider, resolution.Model)
 			if parsed.InvalidState != nil {
 				finishAPIRequest(firstNonEmpty(parsed.InvalidState.Message, parsed.InvalidState.Reason))
-				emitAgentEvent(ctx, out, AgentEvent{Type: "invalid_state", Reason: parsed.InvalidState.Reason, Message: parsed.InvalidState.Message})
-				return nil, errTerminalEvent
+				return state, &providerInvalidStateError{
+					Reason:  parsed.InvalidState.Reason,
+					Message: parsed.InvalidState.Message,
+				}
 			}
 			if parsed.ToolUseChunk != nil {
 				handleToolUseChunk(ctx, out, state, chunks, parsed.ToolUseChunk, cwd, toolExecutor)
@@ -915,11 +941,17 @@ func retryDelay(base time.Duration, attempt int) time.Duration {
 	return base * time.Duration(1<<(attempt-1))
 }
 
-func isTransientAgentError(err error) bool {
+func isTransientAgentError(err error, customRules []customRetryRule) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	message := strings.ToLower(err.Error())
+	message := retryRuleMatchText(err)
+	if matchesNonRetryableAgentPattern(message) {
+		return false
+	}
+	if matchesCustomRetryRules(err, customRules) {
+		return true
+	}
 	transientMarkers := []string{"429", "500", "502", "503", "504", "rate limit", "timeout", "temporary", "temporarily", "connection reset", "connection refused", "eof", "server overloaded", "try again"}
 	for _, marker := range transientMarkers {
 		if strings.Contains(message, marker) {
@@ -927,6 +959,174 @@ func isTransientAgentError(err error) bool {
 		}
 	}
 	return false
+}
+
+func matchesNonRetryableAgentPattern(message string) bool {
+	nonRetryableMarkers := []string{
+		"usage_limit_reached",
+		"usage limit has been reached",
+		"insufficient_quota",
+		"quota exceeded",
+		"exceeded your current quota",
+		"check your plan and billing",
+		"billing details",
+		"payment required",
+		"insufficient balance",
+		"out of balance",
+		"credit balance",
+		`"plan_type":"free"`,
+	}
+	for _, marker := range nonRetryableMarkers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesCustomRetryRules(err error, rules []customRetryRule) bool {
+	rules = normalizeCustomRetryRules(rules)
+	if len(rules) == 0 {
+		return false
+	}
+	allText := retryRuleMatchText(err)
+	statusCodes := retryRuleStatusCodes(err)
+	for _, rule := range rules {
+		matched := true
+		hasCondition := false
+		if rule.Domain != "" {
+			hasCondition = true
+			if !strings.Contains(allText, rule.Domain) {
+				matched = false
+			}
+		}
+		if matched && rule.StatusCode > 0 {
+			hasCondition = true
+			if !statusCodes[rule.StatusCode] {
+				matched = false
+			}
+		}
+		if matched && rule.Keyword != "" {
+			hasCondition = true
+			if !strings.Contains(allText, rule.Keyword) {
+				matched = false
+			}
+		}
+		if hasCondition && matched {
+			return true
+		}
+	}
+	return false
+}
+
+func retryRuleMatchText(err error) string {
+	if err == nil {
+		return ""
+	}
+	parts := []string{err.Error()}
+	var httpErr *providerHTTPError
+	if errors.As(err, &httpErr) {
+		parts = append(parts, httpErr.Provider, httpErr.Body)
+	}
+	var invalidErr *providerInvalidStateError
+	if errors.As(err, &invalidErr) {
+		parts = append(parts, invalidErr.Reason, invalidErr.Message)
+	}
+	return strings.ToLower(strings.Join(parts, " "))
+}
+
+func retryRuleStatusCodes(err error) map[int]bool {
+	codes := map[int]bool{}
+	var httpErr *providerHTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode >= 100 && httpErr.StatusCode <= 599 {
+		codes[httpErr.StatusCode] = true
+	}
+	for _, code := range parseHTTPStatusCodes(retryRuleMatchText(err)) {
+		codes[code] = true
+	}
+	return codes
+}
+
+func parseHTTPStatusCodes(text string) []int {
+	codes := []int{}
+	for i := 0; i+2 < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' || text[i+1] < '0' || text[i+1] > '9' || text[i+2] < '0' || text[i+2] > '9' {
+			continue
+		}
+		beforeIsDigit := i > 0 && text[i-1] >= '0' && text[i-1] <= '9'
+		afterIsDigit := i+3 < len(text) && text[i+3] >= '0' && text[i+3] <= '9'
+		if beforeIsDigit || afterIsDigit {
+			continue
+		}
+		code := int(text[i]-'0')*100 + int(text[i+1]-'0')*10 + int(text[i+2]-'0')
+		if code >= 100 && code <= 599 {
+			codes = append(codes, code)
+		}
+	}
+	return codes
+}
+
+func customRetryRulesFromSettings(settings *config.Store) []customRetryRule {
+	if settings == nil {
+		return nil
+	}
+	raw := settings.Raw()
+	agent, _ := raw["agent"].(map[string]any)
+	items, _ := agent["customRetryRules"].([]any)
+	if len(items) == 0 {
+		return nil
+	}
+	rules := make([]customRetryRule, 0, len(items))
+	for _, item := range items {
+		ruleMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		rule := customRetryRule{
+			Domain:     stringValue(ruleMap["domain"]),
+			StatusCode: intValue(ruleMap["statusCode"], 0),
+			Keyword:    stringValue(ruleMap["keyword"]),
+		}
+		if enabled, ok := ruleMap["enabled"].(bool); ok && !enabled {
+			rule.Disabled = true
+		}
+		rules = append(rules, rule)
+	}
+	return normalizeCustomRetryRules(rules)
+}
+
+func normalizeCustomRetryRules(rules []customRetryRule) []customRetryRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	normalized := make([]customRetryRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.Disabled {
+			continue
+		}
+		rule.Domain = strings.ToLower(strings.TrimSpace(rule.Domain))
+		rule.Keyword = strings.ToLower(strings.TrimSpace(rule.Keyword))
+		if rule.StatusCode < 100 || rule.StatusCode > 599 {
+			rule.StatusCode = 0
+		}
+		if rule.Domain == "" && rule.Keyword == "" && rule.StatusCode == 0 {
+			continue
+		}
+		normalized = append(normalized, rule)
+	}
+	return normalized
+}
+
+type providerInvalidStateError struct {
+	Reason  string
+	Message string
+}
+
+func (e *providerInvalidStateError) Error() string {
+	if strings.TrimSpace(e.Reason) != "" && strings.TrimSpace(e.Message) != "" {
+		return e.Reason + ": " + e.Message
+	}
+	return firstNonEmpty(e.Message, e.Reason, "provider invalid state")
 }
 
 func defaultProviderHTTPClient() *http.Client {

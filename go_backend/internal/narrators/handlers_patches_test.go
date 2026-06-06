@@ -174,12 +174,19 @@ func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
 			name:      "reflection overrides",
 			method:    http.MethodPatch,
 			path:      "/narrators/" + narratorID + "/reflection-overrides",
-			body:      `{"dangerReflectionOverride":"on"}`,
+			body:      `{"dangerReflectionOverride":"strict"}`,
 			eventType: "reflection_overrides_changed",
 			assert: func(t *testing.T, payload map[string]any) {
 				t.Helper()
-				if payload["dangerReflectionOverride"] != "on" {
+				if payload["dangerReflectionOverride"] != "strict" {
 					t.Fatalf("unexpected reflection override event: %#v", payload)
+				}
+				var persisted string
+				if err := sqlDB.QueryRow(`SELECT danger_reflection_override FROM narrators WHERE id = ?`, narratorID).Scan(&persisted); err != nil {
+					t.Fatalf("query persisted danger reflection override: %v", err)
+				}
+				if persisted != "strict" {
+					t.Fatalf("persisted danger reflection override = %q, want strict", persisted)
 				}
 				if _, ok := payload["planReflectionAutoApproveOverride"]; ok {
 					t.Fatalf("missing reflection override keys must not be broadcast as null: %#v", payload)

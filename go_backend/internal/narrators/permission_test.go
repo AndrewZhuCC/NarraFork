@@ -394,6 +394,104 @@ func TestDangerReflectionUsesGlobalSettingAndNarratorOverride(t *testing.T) {
 	}
 }
 
+func TestDangerReflectionLevelsControlBypassAutoAllowRiskThresholds(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	store, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	cwd := t.TempDir()
+	narrator := permissionTestNarrator(cwd, "bypassPermissions")
+	permission := toolPermissionDecision{Action: "allow"}
+
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerReflectionLevel": "light"}}); err != nil {
+		t.Fatalf("set light level: %v", err)
+	}
+	if shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"python3 manage.py migrate"}`)) {
+		t.Fatalf("light level should not pause medium-risk non-simple bash")
+	}
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"rm scratch.txt"}`)) {
+		t.Fatalf("light level should pause high-risk deletion")
+	}
+	narrator.DangerReflectionOverride = "strict"
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"ls /tmp"}`)) {
+		t.Fatalf("strict narrator override should pause low-risk external reads even when global level is light")
+	}
+	narrator.DangerReflectionOverride = ""
+
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerReflectionLevel": "standard"}}); err != nil {
+		t.Fatalf("set standard level: %v", err)
+	}
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"python3 manage.py migrate"}`)) {
+		t.Fatalf("standard level should pause medium-risk non-simple bash")
+	}
+	if shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"ls /tmp"}`)) {
+		t.Fatalf("standard level should not pause low-risk external read")
+	}
+
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerReflectionLevel": "strict"}}); err != nil {
+		t.Fatalf("set strict level: %v", err)
+	}
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"ls /tmp"}`)) {
+		t.Fatalf("strict level should pause low-risk external read")
+	}
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerSkipReadOnlyConfirmations": true}}); err != nil {
+		t.Fatalf("enable read-only skip: %v", err)
+	}
+	if shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"ls /tmp"}`)) {
+		t.Fatalf("read-only skip should suppress strict low-risk external read pauses")
+	}
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"rm scratch.txt"}`)) {
+		t.Fatalf("read-only skip must not suppress high-risk deletion")
+	}
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerSkipReadOnlyConfirmations": false}}); err != nil {
+		t.Fatalf("disable read-only skip: %v", err)
+	}
+
+	if _, err := store.Patch(map[string]any{"agent": map[string]any{"dangerReflectionLevel": "off"}}); err != nil {
+		t.Fatalf("set off level: %v", err)
+	}
+	if shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"git push --force origin main"}`)) {
+		t.Fatalf("off level should not pause even critical bypass auto-allow operations")
+	}
+	narrator.DangerReflectionOverride = "on"
+	if !shouldRunDangerReflectionBeforeExecution(store, narrator, permission, cwd, permissionToolCall("Bash", `{"command":"python3 manage.py migrate"}`)) {
+		t.Fatalf("override on should enable standard danger reflection when global level is off")
+	}
+}
+
+func TestDangerReflectionClassifiesRepresentativeToolCalls(t *testing.T) {
+	cwd := t.TempDir()
+	cases := []struct {
+		name     string
+		tool     string
+		args     string
+		severity dangerSeverity
+		want     bool
+	}{
+		{name: "safe bash", tool: "Bash", args: `{"command":"pwd"}`, want: false},
+		{name: "external read", tool: "Bash", args: `{"command":"ls /tmp"}`, severity: dangerSeverityLow, want: true},
+		{name: "non simple bash", tool: "Bash", args: `{"command":"python3 manage.py migrate"}`, severity: dangerSeverityMedium, want: true},
+		{name: "rm", tool: "Bash", args: `{"command":"rm scratch.txt"}`, severity: dangerSeverityHigh, want: true},
+		{name: "force push", tool: "Bash", args: `{"command":"git push --force origin main"}`, severity: dangerSeverityCritical, want: true},
+		{name: "external write", tool: "Write", args: `{"file_path":"/tmp/out.txt","content":"x"}`, severity: dangerSeverityHigh, want: true},
+		{name: "edit recoverable", tool: "Edit", args: `{"file_path":"/tmp/out.txt","old_string":"x","new_string":"y"}`, want: false},
+		{name: "write subagent custom workdir", tool: "Agent", args: `{"subagent_type":"general","workdir":"../other"}`, severity: dangerSeverityMedium, want: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, ok := classifyDangerReflectionToolCall(cwd, permissionToolCall(tc.tool, tc.args), false)
+
+			if ok != tc.want {
+				t.Fatalf("classified = %v, want %v; info=%#v", ok, tc.want, info)
+			}
+			if tc.want && info.Severity != tc.severity {
+				t.Fatalf("severity = %s, want %s; info=%#v", info.Severity, tc.severity, info)
+			}
+		})
+	}
+}
+
 func TestPermissionModeNormalizationUsesTSValues(t *testing.T) {
 	cases := map[string]string{
 		"default":            "default",

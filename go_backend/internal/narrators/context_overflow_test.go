@@ -12,7 +12,8 @@ import (
 func TestContextOverflowInvalidStateCompactsAndSchedulesRetry(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	service := &Service{DB: sqlDB}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
 	ctx := context.Background()
 	for i, content := range []string{"one", "two", "three", "four", "five", "six", "seven"} {
 		role := "user"
@@ -41,6 +42,16 @@ func TestContextOverflowInvalidStateCompactsAndSchedulesRetry(t *testing.T) {
 	}
 	if !retried {
 		t.Fatalf("expected overflow retry to be scheduled")
+	}
+	if !hasBroadcast(events(), narratorID, "invalid_state") || !hasBroadcast(events(), narratorID, "context_length_exceeded") || !hasBroadcast(events(), narratorID, "compacting") || !hasBroadcast(events(), narratorID, "message") || !hasBroadcast(events(), narratorID, "compact_done") {
+		t.Fatalf("expected stable overflow broadcasts, got %#v", events())
+	}
+	statusBroadcast := findBroadcast(events(), narratorID, "status")
+	if statusBroadcast == nil || statusBroadcast["status"] != "working" || statusBroadcast["isBackground"] != false {
+		t.Fatalf("expected working status broadcast after overflow compact, got %#v all=%#v", statusBroadcast, events())
+	}
+	if hasBroadcast(events(), narratorID, "narrator_error") {
+		t.Fatalf("overflow retry path should not broadcast narrator_error, got %#v", events())
 	}
 	var status, substatus string
 	var errorMessage sql.NullString
@@ -74,6 +85,56 @@ func TestContextOverflowInvalidStateCompactsAndSchedulesRetry(t *testing.T) {
 	}
 	if !strings.Contains(joined, "four") || !strings.Contains(joined, "seven") {
 		t.Fatalf("rebuilt history should keep recent messages after compact, got %#v", history)
+	}
+}
+
+func TestInvalidStateNonOverflowFinishesErrorWithoutContextCompact(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	ctx := context.Background()
+	narrator, err := service.Get(ctx, narratorID)
+	if err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator}
+	event := agentbasic.AgentEvent{Type: "invalid_state", Code: "max_tokens", Reason: "output limit", Message: "The model stopped because max_tokens was reached."}
+	if err := service.handleAgentEvent(ctx, state, event); err != nil {
+		t.Fatalf("handle non-overflow invalid_state: %v", err)
+	}
+	if !state.completed || !state.errored || state.errorCode != "max_tokens" {
+		t.Fatalf("state should finish via error path, completed=%v errored=%v code=%q", state.completed, state.errored, state.errorCode)
+	}
+	var status, substatus string
+	var errorMessage sql.NullString
+	var contextSummary sql.NullString
+	if err := sqlDB.QueryRow(`SELECT status, substatus, error_message, context_summary FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage, &contextSummary); err != nil {
+		t.Fatalf("load narrator status: %v", err)
+	}
+	if status != "idle" || substatus != `["error"]` || !errorMessage.Valid || !strings.Contains(errorMessage.String, "max_tokens") || contextSummary.Valid {
+		t.Fatalf("unexpected non-overflow invalid_state persistence status=%s substatus=%s error=%#v summary=%#v", status, substatus, errorMessage, contextSummary)
+	}
+	var compactCount int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM narrator_message_refs WHERE narrator_id = ? AND is_compact = 1`, narratorID).Scan(&compactCount); err != nil {
+		t.Fatalf("count compact refs: %v", err)
+	}
+	if compactCount != 0 {
+		t.Fatalf("non-overflow invalid_state should not compact, compact refs = %d", compactCount)
+	}
+	if !hasBroadcast(events(), narratorID, "invalid_state") || !hasBroadcast(events(), narratorID, "status") || !hasBroadcast(events(), narratorID, "narrator_error") {
+		t.Fatalf("expected invalid_state error-path broadcasts, got %#v", events())
+	}
+	if hasBroadcast(events(), narratorID, "context_length_exceeded") || hasBroadcast(events(), narratorID, "compacting") || hasBroadcast(events(), narratorID, "compact_done") {
+		t.Fatalf("non-overflow invalid_state should not use overflow broadcasts, got %#v", events())
+	}
+	statusBroadcast := findBroadcast(events(), narratorID, "status")
+	if statusBroadcast["status"] != "idle" {
+		t.Fatalf("expected idle status broadcast, got %#v", statusBroadcast)
+	}
+	errorBroadcast := findBroadcast(events(), narratorID, "narrator_error")
+	if errorBroadcast["errorCode"] != "max_tokens" || !strings.Contains(string(errorBroadcast["error"].(string)), "max_tokens") {
+		t.Fatalf("expected narrator_error with invalid_state code/message, got %#v", errorBroadcast)
 	}
 }
 

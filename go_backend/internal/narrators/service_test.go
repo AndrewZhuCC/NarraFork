@@ -86,6 +86,29 @@ func TestExitPlanTextValid(t *testing.T) {
 	}
 }
 
+func TestCreateStoresDangerReflectionLevelOverride(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+	if err := createNarratorTestSchema(sqlDB); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	service := &Service{DB: sqlDB}
+	narrator, err := service.Create(context.Background(), CreateInput{Model: "test-model", DangerReflectionOverride: "strict"})
+	if err != nil {
+		t.Fatalf("create narrator: %v", err)
+	}
+	loaded, err := service.Get(context.Background(), narrator.ID)
+	if err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	if loaded.DangerReflectionOverride != "strict" {
+		t.Fatalf("dangerReflectionOverride = %q, want strict", loaded.DangerReflectionOverride)
+	}
+}
+
 func TestPlanModeStoresPlanStateAndRestoresPermission(t *testing.T) {
 	sqlDB, err := sql.Open("sqlite", ":memory:")
 	if err != nil {

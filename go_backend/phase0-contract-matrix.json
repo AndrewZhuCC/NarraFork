@@ -139,6 +139,45 @@
 			"tests": ["go_backend/internal/chapters/container_runtime_test.go"]
 		},
 		{
+			"group": "chapters.review-merge-ai-resolve",
+			"paths": [
+				"/api/chapters/{id}/review",
+				"/api/chapters/{id}/merge",
+				"/api/chapters/{id}/ai-resolve",
+				"/api/reviews/*"
+			],
+			"tsSource": "server/routes/chapters.ts, server/routes/reviews.ts, server/services/chapter-merge.ts, and server/services/review-service.ts",
+			"goSource": "go_backend/internal/chapters/service.go, go_backend/internal/chapters/handlers.go, and go_backend/internal/misccompat/handlers.go",
+			"frontendConsumers": [
+				"frontend/lib/api/chapters.ts",
+				"frontend/components/chapter/*",
+				"frontend/routes/projects/$projectId.tsx"
+			],
+			"phase0Status": "supported-with-explicit-review-and-ai-resolve-degradations",
+			"capabilityKeys": ["review.startMode", "review.autoStartSession", "merge.aiResolveMode"],
+			"knownFallbacks": [
+				"review.seedMessageOnly",
+				"review.autoStartSessionDisabled",
+				"merge.aiResolveOneShotBasic",
+				"merge.aiResolveCherryPickFallback"
+			],
+			"fallbackReasons": {
+				"review.seedMessageOnly": "Go review creation seeds the review start message and leaves the narrator idle instead of auto-starting a full session.",
+				"review.autoStartSessionDisabled": "Full TS review auto-start through the narrator loop is not implemented in go_backend.",
+				"merge.aiResolveOneShotBasic": "Go AIResolve uses a bounded one-shot provider/tool loop rather than the full TS narrator conflict-resolution session.",
+				"merge.aiResolveCherryPickFallback": "Go delegates cherry-pick success to Merge but returns an explicit unresolved fallback for cherry-pick conflicts instead of continuing a multi-commit AI conflict loop."
+			},
+			"sideEffectPolicy": "Review creation rolls back partial DB/Git artifacts on narrator initialization failure; review dismiss/convert/promote side effects are locked by route fixtures. Merge and AIResolve retry recordMerged once after post-commit DB failure, reset Git to the pre-merge HEAD on retry failure, and expose stable warning/error payloads instead of claiming success. Cherry-pick AIResolve conflict fallback does not start provider/narrator side effects and leaves Git clean.",
+			"tests": [
+				"go_backend/internal/chapters/review_parity_test.go",
+				"go_backend/internal/misccompat/review_parity_test.go",
+				"go_backend/internal/chapters/service_merge_parity_test.go",
+				"go_backend/internal/chapters/service_airesolve_rollback_test.go",
+				"go_backend/internal/chapters/service_airesolve_cherrypick_test.go",
+				"go_backend/internal/app/route_contract_test.go"
+			]
+		},
+		{
 			"group": "vnet",
 			"paths": ["/api/vnet/*", "/ws/vnet"],
 			"tsSource": "server/routes/vnet.ts and server/websocket/vnet-ws.ts",
@@ -627,12 +666,13 @@
 				"frontend/lib/api/narrators.ts",
 				"frontend/components/narrator/NarratorPanel.tsx"
 			],
-			"phase0Status": "supported-with-structured-send-errors",
+			"phase0Status": "supported-with-structured-send-errors-and-priority-buffer-soft-stop",
 			"capabilityKey": "narrator.messages",
-			"sideEffectPolicy": "Narrator message send is user-facing and can buffer or reject; structured Go error bodies are read by sendNarratorMessage and preserved on ApiError.data instead of falling back to statusText or message-only errors, and buffered storage fallback paths keep the same diagnostics contract.",
+			"sideEffectPolicy": "Narrator message send is user-facing and can buffer or reject; structured Go error bodies are read by sendNarratorMessage and preserved on ApiError.data instead of falling back to statusText or message-only errors, buffered storage fallback paths keep the same diagnostics contract, and priority buffered messages consumed as after-tools sidecars arm a Go shouldStop hook so tool results/turn_complete are preserved while avoiding an extra provider request.",
 			"tests": [
 				"go_backend/internal/narrators/handlers_buffer_test.go::TestPostMessageBuffersWorkingNarratorWithPriority",
 				"go_backend/internal/narrators/handlers_buffer_test.go::TestPostMessageBufferedStorageMissingReturnsReasonedFallback",
+				"go_backend/internal/narrators/agent_event_integration_test.go::TestRunBasicAgentPriorityBufferedAfterToolsSideCarStopsBeforeThirdRequest",
 				"frontend/lib/api/narrators.test.ts"
 			]
 		},
