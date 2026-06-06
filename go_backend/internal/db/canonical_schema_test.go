@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -144,6 +145,138 @@ func TestVerifyCanonicalSchemaReportsMissingFTSTrigger(t *testing.T) {
 	}
 }
 
+func TestVerifyCanonicalSchemaLeavesFTSDriftReadOnly(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		mutate    func(t *testing.T, sqlDB *sql.DB)
+		assertion func(t *testing.T, sqlDB *sql.DB)
+	}{
+		{
+			name: "missing fts table",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				dropChapterFTSObjectsForTest(t, sqlDB)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				assertSchemaObjectMissingForTest(t, sqlDB, "table", "chapters_fts")
+			},
+		},
+		{
+			name: "non-trigram fts table",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				dropChapterFTSObjectsForTest(t, sqlDB)
+				mustExecCanonical(t, sqlDB, `CREATE VIRTUAL TABLE chapters_fts USING fts5(title, description, content='chapters', content_rowid=rowid)`)
+				createChapterFTSTriggers(t, sqlDB)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				sqlText := schemaSQLForTest(t, ctx, sqlDB, "table", "chapters_fts")
+				if strings.Contains(normalizeSQLForCompare(sqlText), "trigram") {
+					t.Fatalf("VerifyCanonicalSchema should not recreate chapters_fts as trigram, SQL = %q", sqlText)
+				}
+			},
+		},
+		{
+			name: "missing fts trigger",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				mustExecCanonical(t, sqlDB, `DROP TRIGGER chapters_fts_insert`)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				assertSchemaObjectMissingForTest(t, sqlDB, "trigger", "chapters_fts_insert")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sqlDB := openCanonicalSchemaTestDB(t)
+			defer sqlDB.Close()
+			createCanonicalSchemaTables(t, sqlDB)
+			setApplicationIDForTest(t, sqlDB, SQLiteCleanShutdownMarker)
+			tt.mutate(t, sqlDB)
+			beforeObjects := schemaObjectSet(t, sqlDB)
+
+			err := VerifyCanonicalSchema(ctx, sqlDB)
+			if !errors.Is(err, ErrCanonicalSchemaMismatch) {
+				t.Fatalf("expected ErrCanonicalSchemaMismatch, got %v", err)
+			}
+			assertSchemaObjectSetUnchanged(t, beforeObjects, schemaObjectSet(t, sqlDB))
+			tt.assertion(t, sqlDB)
+			assertApplicationIDForTest(t, sqlDB, SQLiteCleanShutdownMarker)
+		})
+	}
+}
+
+func TestCanonicalDefaultOpenLeavesFTSDriftReadOnly(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name      string
+		mutate    func(t *testing.T, sqlDB *sql.DB)
+		assertion func(t *testing.T, sqlDB *sql.DB)
+	}{
+		{
+			name: "missing fts table",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				dropChapterFTSObjectsForTest(t, sqlDB)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				assertSchemaObjectMissingForTest(t, sqlDB, "table", "chapters_fts")
+			},
+		},
+		{
+			name: "non-trigram fts table",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				dropChapterFTSObjectsForTest(t, sqlDB)
+				mustExecCanonical(t, sqlDB, `CREATE VIRTUAL TABLE chapters_fts USING fts5(title, description, content='chapters', content_rowid=rowid)`)
+				createChapterFTSTriggers(t, sqlDB)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				sqlText := schemaSQLForTest(t, ctx, sqlDB, "table", "chapters_fts")
+				if strings.Contains(normalizeSQLForCompare(sqlText), "trigram") {
+					t.Fatalf("Open should not recreate chapters_fts as trigram, SQL = %q", sqlText)
+				}
+			},
+		},
+		{
+			name: "missing fts trigger",
+			mutate: func(t *testing.T, sqlDB *sql.DB) {
+				mustExecCanonical(t, sqlDB, `DROP TRIGGER chapters_fts_insert`)
+			},
+			assertion: func(t *testing.T, sqlDB *sql.DB) {
+				assertSchemaObjectMissingForTest(t, sqlDB, "trigger", "chapters_fts_insert")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			dbPath := prepareHomeDatabase(t, home)
+			sqlDB := openSQLiteFileForTest(t, dbPath)
+			createCanonicalSchemaTables(t, sqlDB)
+			setApplicationIDForTest(t, sqlDB, SQLiteCleanShutdownMarker)
+			tt.mutate(t, sqlDB)
+			beforeObjects := schemaObjectSet(t, sqlDB)
+			mustCloseTestDB(t, sqlDB)
+			t.Setenv("HOME", home)
+
+			store, err := Open(ctx)
+			if err == nil {
+				store.Close()
+				t.Fatal("Open should report canonical FTS drift instead of repairing it")
+			}
+			if !errors.Is(err, ErrCanonicalSchemaMismatch) {
+				t.Fatalf("expected ErrCanonicalSchemaMismatch, got %v", err)
+			}
+
+			verifyDB := openSQLiteFileForTest(t, dbPath)
+			defer verifyDB.Close()
+			assertSchemaObjectSetUnchanged(t, beforeObjects, schemaObjectSet(t, verifyDB))
+			tt.assertion(t, verifyDB)
+			assertApplicationIDForTest(t, verifyDB, SQLiteCleanShutdownMarker)
+		})
+	}
+}
+
 func TestVerifyCanonicalSchemaDoesNotRequireGoOnlyOptionalTables(t *testing.T) {
 	goOnlyOptionalTables := []string{
 		"custom_subagents",
@@ -171,6 +304,72 @@ func TestVerifyCanonicalSchemaDoesNotRequireGoOnlyOptionalTables(t *testing.T) {
 		if exists {
 			t.Fatalf("test fixture unexpectedly created Go-only optional table %q", table)
 		}
+	}
+}
+
+func dropChapterFTSObjectsForTest(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	for _, trigger := range []string{"chapters_fts_insert", "chapters_fts_update", "chapters_fts_delete"} {
+		mustExecCanonical(t, sqlDB, `DROP TRIGGER IF EXISTS `+quoteIdentifier(trigger))
+	}
+	mustExecCanonical(t, sqlDB, `DROP TABLE IF EXISTS chapters_fts`)
+}
+
+func schemaSQLForTest(t *testing.T, ctx context.Context, sqlDB *sql.DB, objectType string, name string) string {
+	t.Helper()
+	sqlText, exists, err := schemaSQL(ctx, sqlDB, objectType, name)
+	if err != nil {
+		t.Fatalf("inspect %s %s: %v", objectType, name, err)
+	}
+	if !exists {
+		t.Fatalf("expected %s %s to exist", objectType, name)
+	}
+	return sqlText
+}
+
+func assertSchemaObjectMissingForTest(t *testing.T, sqlDB *sql.DB, objectType string, name string) {
+	t.Helper()
+	_, exists, err := schemaSQL(context.Background(), sqlDB, objectType, name)
+	if err != nil {
+		t.Fatalf("inspect %s %s: %v", objectType, name, err)
+	}
+	if exists {
+		t.Fatalf("Verify/Open should not create missing %s %s", objectType, name)
+	}
+}
+
+func assertSchemaObjectSetUnchanged(t *testing.T, before map[string]struct{}, after map[string]struct{}) {
+	t.Helper()
+	if len(after) != len(before) {
+		t.Fatalf("schema object count changed: before=%#v after=%#v", before, after)
+	}
+	for name := range before {
+		if _, ok := after[name]; !ok {
+			t.Fatalf("schema object %s was removed: before=%#v after=%#v", name, before, after)
+		}
+	}
+	for name := range after {
+		if _, ok := before[name]; !ok {
+			t.Fatalf("schema object %s was added: before=%#v after=%#v", name, before, after)
+		}
+	}
+}
+
+func setApplicationIDForTest(t *testing.T, sqlDB *sql.DB, appID int) {
+	t.Helper()
+	if _, err := sqlDB.Exec(`PRAGMA application_id = ` + strconv.Itoa(appID)); err != nil {
+		t.Fatalf("set application_id: %v", err)
+	}
+}
+
+func assertApplicationIDForTest(t *testing.T, sqlDB *sql.DB, want int) {
+	t.Helper()
+	var got int
+	if err := sqlDB.QueryRow(`PRAGMA application_id`).Scan(&got); err != nil {
+		t.Fatalf("read application_id: %v", err)
+	}
+	if got != want {
+		t.Fatalf("application_id = %#x, want %#x", got, want)
 	}
 }
 

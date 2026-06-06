@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -18,8 +19,14 @@ func TestCanonicalSchemaContractReportFreezesTSOwnedDBMode(t *testing.T) {
 	if report.Mode != "ts-owned-db-compatibility" || report.MainSchemaOwner != "typescript-drizzle" {
 		t.Fatalf("unexpected DB ownership contract: %#v", report)
 	}
+	if report.StrategyStage != "transition" || !report.TransitionalStrategy || report.TargetMode != "pure-go-db-management" {
+		t.Fatalf("SQLite contract must identify TS-owned mode as transitional: %#v", report)
+	}
+	if report.TargetMainSchemaOwner != "go" || report.CurrentRepairOwner != "typescript-drizzle-and-ts-fts-setup" || len(report.FutureGoResponsibilities) == 0 {
+		t.Fatalf("contract should expose current TS repair ownership and future Go DB responsibilities: %#v", report)
+	}
 	if report.GoMainMigrations || report.GoEnsureColumns || report.GoFTSRepair || !report.ReadOnlyVerifier {
-		t.Fatalf("Go must remain read-only for the main TS-owned DB: %#v", report)
+		t.Fatalf("Go must remain read-only for the main TS-owned DB during the transition: %#v", report)
 	}
 	if report.CanonicalSchemaHash == "" || report.ExpectedMigrationHash == "" || report.ExpectedMigrationCount == 0 || report.ExpectedLastMigration == "" {
 		t.Fatalf("contract report should expose stable schema/migration hashes: %#v", report)
@@ -42,7 +49,7 @@ func TestCanonicalSchemaContractArtifactMatchesRuntime(t *testing.T) {
 		t.Fatalf("parse bun-final canonical schema contract: %v", err)
 	}
 	want := CanonicalSchemaContract()
-	if artifact != want {
+	if !reflect.DeepEqual(artifact, want) {
 		t.Fatalf("canonical schema artifact mismatch:\nartifact=%#v\nruntime=%#v", artifact, want)
 	}
 }

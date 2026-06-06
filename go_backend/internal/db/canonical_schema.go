@@ -9,10 +9,12 @@ import (
 	"strings"
 )
 
-// canonicalMainSchema is a read-only compatibility contract with the
-// TypeScript/Drizzle-created main database. It intentionally contains only
+// canonicalMainSchema is a transitional, read-only compatibility contract with
+// the TypeScript/Drizzle-created main database. It intentionally contains only
 // object requirements and must never be used to create or migrate the main DB
-// from Go.
+// from Go while SQLite remains TS-owned. The long-term target is pure Go DB
+// management, including main schema migrations, startup backfills/repair, and
+// FTS/search lifecycle ownership.
 var canonicalMainSchema = map[string][]string{
 	"projects":                     {"id", "name", "description", "status", "flow_mode", "git_path", "remote_url", "default_branch", "startup_script", "copy_files", "chapter_settings", "proxy_domain", "created_at", "updated_at"},
 	"exploration_groups":           {"id", "project_id", "title", "description", "base_chapter_id", "status", "decided_chapter_id", "created_at", "updated_at"},
@@ -199,23 +201,29 @@ var canonicalFTSTriggers = []canonicalTriggerRequirement{
 var ErrCanonicalSchemaMismatch = errors.New("canonical TS database schema mismatch")
 
 type CanonicalSchemaContractReport struct {
-	Mode                     string `json:"mode"`
-	MainSchemaOwner          string `json:"mainSchemaOwner"`
-	GoMainMigrations         bool   `json:"goMainMigrations"`
-	GoEnsureColumns          bool   `json:"goEnsureColumns"`
-	GoFTSRepair              bool   `json:"goFtsRepair"`
-	CanonicalSchemaHash      string `json:"canonicalSchemaHash"`
-	ExpectedMigrationHash    string `json:"expectedMigrationHash"`
-	ExpectedMigrationCount   int    `json:"expectedMigrationCount"`
-	ExpectedLastMigration    string `json:"expectedLastMigration"`
-	GoJournalTable           string `json:"goJournalTable"`
-	DrizzleJournalTable      string `json:"drizzleJournalTable"`
-	ReadOnlyVerifier         bool   `json:"readOnlyVerifier"`
-	CanonicalTableCount      int    `json:"canonicalTableCount"`
-	CanonicalIndexCount      int    `json:"canonicalIndexCount"`
-	CanonicalForeignKeyCount int    `json:"canonicalForeignKeyCount"`
-	CanonicalFTSTableCount   int    `json:"canonicalFtsTableCount"`
-	CanonicalFTSTriggerCount int    `json:"canonicalFtsTriggerCount"`
+	Mode                     string   `json:"mode"`
+	StrategyStage            string   `json:"strategyStage"`
+	TransitionalStrategy     bool     `json:"transitionalStrategy"`
+	TargetMode               string   `json:"targetMode"`
+	MainSchemaOwner          string   `json:"mainSchemaOwner"`
+	TargetMainSchemaOwner    string   `json:"targetMainSchemaOwner"`
+	CurrentRepairOwner       string   `json:"currentRepairOwner"`
+	FutureGoResponsibilities []string `json:"futureGoResponsibilities"`
+	GoMainMigrations         bool     `json:"goMainMigrations"`
+	GoEnsureColumns          bool     `json:"goEnsureColumns"`
+	GoFTSRepair              bool     `json:"goFtsRepair"`
+	CanonicalSchemaHash      string   `json:"canonicalSchemaHash"`
+	ExpectedMigrationHash    string   `json:"expectedMigrationHash"`
+	ExpectedMigrationCount   int      `json:"expectedMigrationCount"`
+	ExpectedLastMigration    string   `json:"expectedLastMigration"`
+	GoJournalTable           string   `json:"goJournalTable"`
+	DrizzleJournalTable      string   `json:"drizzleJournalTable"`
+	ReadOnlyVerifier         bool     `json:"readOnlyVerifier"`
+	CanonicalTableCount      int      `json:"canonicalTableCount"`
+	CanonicalIndexCount      int      `json:"canonicalIndexCount"`
+	CanonicalForeignKeyCount int      `json:"canonicalForeignKeyCount"`
+	CanonicalFTSTableCount   int      `json:"canonicalFtsTableCount"`
+	CanonicalFTSTriggerCount int      `json:"canonicalFtsTriggerCount"`
 }
 
 func CanonicalSchemaContract() CanonicalSchemaContractReport {
@@ -225,7 +233,13 @@ func CanonicalSchemaContract() CanonicalSchemaContractReport {
 	}
 	return CanonicalSchemaContractReport{
 		Mode:                     "ts-owned-db-compatibility",
+		StrategyStage:            "transition",
+		TransitionalStrategy:     true,
+		TargetMode:               "pure-go-db-management",
 		MainSchemaOwner:          "typescript-drizzle",
+		TargetMainSchemaOwner:    "go",
+		CurrentRepairOwner:       "typescript-drizzle-and-ts-fts-setup",
+		FutureGoResponsibilities: []string{"main schema migrations", "startup backfills and repair", "FTS/search lifecycle", "schema drift fixtures and release gates"},
 		GoMainMigrations:         false,
 		GoEnsureColumns:          false,
 		GoFTSRepair:              false,

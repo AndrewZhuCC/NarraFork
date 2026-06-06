@@ -1,12 +1,23 @@
 {
 	"name": "go-backend-phase1-contract-matrix",
-	"updatedAt": "2026-05-21",
-	"scope": "Database compatibility, canonical schema drift detection, FTS/Search degraded behavior, Graph/Ruler baseline, and commit sync readiness for the TypeScript-owned main DB mode.",
+	"updatedAt": "2026-06-06",
+	"scope": "Database compatibility, canonical schema drift detection, FTS/Search degraded behavior, Graph/Ruler baseline, and commit sync readiness for the transitional TypeScript-owned SQLite main DB mode, with pure Go DB management documented as the target state.",
 	"principles": [
 		{
 			"id": "read-only-db-readiness",
 			"status": "required",
-			"goBehavior": "Go verifies TS-owned tables, columns, indexes, FKs, FTS trigram objects, and FTS triggers, but must not repair or migrate the main database."
+			"strategyStage": "transition",
+			"transitionalStrategy": true,
+			"targetMode": "pure-go-db-management",
+			"targetMainSchemaOwner": "go",
+			"currentRepairOwner": "typescript-drizzle-and-ts-fts-setup",
+			"futureGoResponsibilities": [
+				"main schema migrations",
+				"startup backfills and repair",
+				"FTS/search lifecycle",
+				"schema drift fixtures and release gates"
+			],
+			"goBehavior": "During the transition, Go verifies TS-owned SQLite tables, columns, indexes, FKs, FTS trigram objects, and FTS triggers, but must not repair or migrate the main database. Future replacement mode is pure Go DB management."
 		},
 		{
 			"id": "machine-readable-degraded-contract",
@@ -24,7 +35,11 @@
 			"group": "database.canonicalSchema",
 			"tsSource": "server/db/schema.ts and drizzle migrations",
 			"goSource": "go_backend/internal/db/canonical_schema.go",
-			"phase1Status": "read-only-drift-detection",
+			"phase1Status": "transitional-read-only-drift-detection",
+			"strategyStage": "transition",
+			"targetMode": "pure-go-db-management",
+			"targetMainSchemaOwner": "go",
+			"currentRepairOwner": "typescript-drizzle-and-ts-fts-setup",
 			"requiredObjects": [
 				"tables",
 				"columns",

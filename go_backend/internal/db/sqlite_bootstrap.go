@@ -12,6 +12,9 @@ type SQLiteBootstrapResult struct {
 	FTSRebuilt    bool
 }
 
+// BootstrapSQLiteBunFinalCompatible is an explicit legacy/test bootstrap helper
+// for Bun-final-compatible fixtures and future Go-owned databases. It is
+// intentionally not part of the read-only TS-owned transitional startup path.
 func (s *Store) BootstrapSQLiteBunFinalCompatible(ctx context.Context) error {
 	if s == nil || s.SQL == nil {
 		return fmt.Errorf("bootstrap SQLite Bun-final-compatible database: database is not open")

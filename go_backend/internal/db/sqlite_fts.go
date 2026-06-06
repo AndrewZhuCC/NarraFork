@@ -128,6 +128,12 @@ var sqliteFTSTriggerSpecs = []sqliteFTSTriggerSpec{
 	},
 }
 
+// EnsureSQLiteFTS is an explicit legacy/future-Go-owned repair helper.
+//
+// The TS-owned SQLite main database default startup path must not call this:
+// canonical verification is read-only and reports FTS drift as
+// ErrCanonicalSchemaMismatch instead of creating, dropping, recreating, or
+// rebuilding FTS objects.
 func EnsureSQLiteFTS(ctx context.Context, sqlDB *sql.DB, opts EnsureSQLiteFTSOptions) (EnsureSQLiteFTSResult, error) {
 	if sqlDB == nil {
 		return EnsureSQLiteFTSResult{}, errors.New("ensure sqlite fts: database is nil")

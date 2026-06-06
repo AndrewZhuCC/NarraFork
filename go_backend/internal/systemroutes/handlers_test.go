@@ -545,7 +545,7 @@ func TestNugOAuthCallbackPersistsCredentialsAndRedirects(t *testing.T) {
 	}
 }
 
-func TestCodexUsageQueueClearReturnsOkWhenQueueIsEmpty(t *testing.T) {
+func TestCodexUsageQueueClearReturnsFeatureDisabledWithoutQueueRuntime(t *testing.T) {
 	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
 	req := httptest.NewRequest(http.MethodPost, "/codex/usage-queue/clear", nil)
 	req.Header.Set("Authorization", "Bearer "+adminToken)
@@ -553,12 +553,12 @@ func TestCodexUsageQueueClearReturnsOkWhenQueueIsEmpty(t *testing.T) {
 
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 ok, got %d body=%s", w.Code, w.Body.String())
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
 	}
 	var body map[string]any
 	decodeJSONBody(t, w, &body)
-	if body["ok"] != true {
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "providers.codex.usageQueueClear" || body["supported"] != false || body["fallback"] != true {
 		t.Fatalf("unexpected Codex usage queue clear body: %#v", body)
 	}
 }

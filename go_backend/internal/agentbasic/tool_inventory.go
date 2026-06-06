@@ -229,35 +229,54 @@ func externalToolSpecs(tools []ExternalToolSpec) []toolSpec {
 func externalToolMetadata(tools []ExternalToolSpec, name string) map[string]any {
 	for _, tool := range normalizeExternalTools(tools) {
 		if tool.Name == name {
-			return cloneMetadata(tool.Metadata)
+			return metadataWithCapabilityContract(cloneMetadata(tool.Metadata))
 		}
 	}
 	return nil
 }
 
+func metadataWithCapabilityContract(metadata map[string]any) map[string]any {
+	out := map[string]any{
+		"schemaCompatible":  true,
+		"runtimeCompatible": "full",
+		"knownDegraded":     []string{},
+		"fallbackBehavior":  "none",
+		"frontendRendering": "tool_output_text",
+	}
+	for key, value := range metadata {
+		out[key] = value
+	}
+	return out
+}
+
 func staticToolMetadata(name string) map[string]any {
 	switch name {
 	case "Read":
-		return map[string]any{
-			"parity":          "partial",
-			"textFiles":       true,
-			"directories":     true,
-			"offsetLimit":     true,
-			"pdfPages":        false,
-			"pagesSchemaOnly": true,
-			"imageContent":    false,
-			"reason":          "Go Read supports bounded text file and directory reads; TS PDF page extraction is schema-compatible but rejected at runtime until a safe PDF extraction runtime is implemented.",
-		}
+		return metadataWithCapabilityContract(map[string]any{
+			"parity":            "partial",
+			"schemaCompatible":  true,
+			"runtimeCompatible": "partial",
+			"knownDegraded":     []string{"pdfPages", "imageContent"},
+			"fallbackBehavior":  "explicit_error",
+			"frontendRendering": "text_or_directory_listing",
+			"textFiles":         true,
+			"directories":       true,
+			"offsetLimit":       true,
+			"pdfPages":          false,
+			"pagesSchemaOnly":   true,
+			"imageContent":      false,
+			"reason":            "Go Read supports bounded text file and directory reads; TS PDF page extraction is schema-compatible but rejected at runtime until a safe PDF extraction runtime is implemented.",
+		})
 	case "Bash":
-		return map[string]any{
+		return metadataWithCapabilityContract(map[string]any{
 			"runInBackground":           true,
 			"bashBackground":            true,
 			"narratorContextOnly":       true,
 			"nonNarratorExecuteTool":    "foreground-only",
 			"nonNarratorBackgroundNote": "Bash run_in_background requires narrator context; non-narrator ExecuteTool only supports foreground Bash commands.",
-		}
+		})
 	case "Await":
-		return map[string]any{
+		return metadataWithCapabilityContract(map[string]any{
 			"supportedTypes":            []string{"agent", "bash"},
 			"awaitAgent":                true,
 			"awaitBash":                 true,
@@ -265,20 +284,25 @@ func staticToolMetadata(name string) map[string]any {
 			"narratorContextOnly":       true,
 			"nonNarratorExecuteTool":    false,
 			"nonNarratorBackgroundNote": "Await is handled by narrator context for agent and bash background tasks.",
-		}
+		})
 	case "WebFetch":
-		return map[string]any{
-			"parity":           "partial",
-			"mode":             "raw-only",
-			"defaultMode":      "raw",
-			"supportedModes":   []string{"raw"},
-			"unsupportedModes": []string{"readability", "dom", "smart", "screenshot"},
-			"protocols":        []string{"http", "https", "data"},
-			"policy":           "permission-policy-and-proxy-consumed",
-			"reason":           "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
-		}
+		return metadataWithCapabilityContract(map[string]any{
+			"parity":            "partial",
+			"schemaCompatible":  true,
+			"runtimeCompatible": "partial",
+			"knownDegraded":     []string{"readability", "dom", "smart", "screenshot"},
+			"fallbackBehavior":  "explicit_error/raw_text",
+			"frontendRendering": "raw_text",
+			"mode":              "raw-only",
+			"defaultMode":       "raw",
+			"supportedModes":    []string{"raw"},
+			"unsupportedModes":  []string{"readability", "dom", "smart", "screenshot"},
+			"protocols":         []string{"http", "https", "data"},
+			"policy":            "permission-policy-and-proxy-consumed",
+			"reason":            "Go WebFetch performs raw HTTP/HTTPS/data fetches only; TS extraction modes are rejected explicitly instead of being silently ignored.",
+		})
 	case "Recall":
-		return map[string]any{
+		return metadataWithCapabilityContract(map[string]any{
 			"supported":              true,
 			"readOnly":               true,
 			"scope":                  "self",
@@ -290,10 +314,15 @@ func staticToolMetadata(name string) map[string]any {
 			"maxToolCallOutputChars": 4000,
 			"nonNarratorExecuteTool": false,
 			"reason":                 "Go Recall implements a safe self-scoped/read-only subset for the current narrator only, using bounded LIKE search without FTS.",
-		}
+		})
 	case "Browser":
-		return map[string]any{
+		return metadataWithCapabilityContract(map[string]any{
 			"parity":                "partial",
+			"schemaCompatible":      true,
+			"runtimeCompatible":     "partial",
+			"knownDegraded":         []string{"imageContentBlock", "sharePreview"},
+			"fallbackBehavior":      "file_or_base64_artifact",
+			"frontendRendering":     "file_or_base64_artifact",
 			"runtime":               "go-rod",
 			"screenshotPreviewMode": "inline-base64-or-file-artifact",
 			"sharePreview":          false,
@@ -304,9 +333,19 @@ func staticToolMetadata(name string) map[string]any {
 			"traceFileOutput":       true,
 			"traceShareUrl":         "/api/shares/{shareId}",
 			"reason":                "Go Browser screenshots return JSON/base64 or an explicit file_path artifact; TS additionally returns an image content block and temporary share preview metadata. Browser perf_stop writes Chrome trace JSON and creates a functional share URL when file_path is omitted.",
-		}
+		})
 	default:
-		return nil
+		return metadataWithCapabilityContract(nil)
+	}
+}
+
+func unsupportedOptionalToolCapabilityMetadata() map[string]any {
+	return map[string]any{
+		"schemaCompatible":  false,
+		"runtimeCompatible": "unsupported",
+		"knownDegraded":     []string{"optional_unsupported"},
+		"fallbackBehavior":  "hidden_or_explicit_error",
+		"frontendRendering": "hidden",
 	}
 }
 
@@ -319,6 +358,7 @@ func unsupportedOptionalToolMetadata() []map[string]any {
 			"supported": false,
 			"enabled":   false,
 			"reason":    tool.Reason,
+			"metadata":  unsupportedOptionalToolCapabilityMetadata(),
 		})
 	}
 	return items
@@ -355,6 +395,7 @@ func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMet
 				Supported: false,
 				Enabled:   false,
 				Reason:    tool.Reason,
+				Metadata:  unsupportedOptionalToolCapabilityMetadata(),
 			})
 		}
 	}
@@ -365,7 +406,7 @@ func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMet
 			Source:    firstNonEmpty(tool.Source, "mcp"),
 			Supported: true,
 			Enabled:   enabled[tool.Name],
-			Metadata:  cloneMetadata(tool.Metadata),
+			Metadata:  metadataWithCapabilityContract(cloneMetadata(tool.Metadata)),
 		})
 	}
 	supportedExternal := opts.MCPExternalToolInjection || len(external) > 0
@@ -382,6 +423,12 @@ func ToolInventoryMetadataForOptions(opts ToolInventoryOptions) ToolInventoryMet
 			Supported: false,
 			Enabled:   false,
 			Reason:    reason,
+			Metadata: metadataWithCapabilityContract(map[string]any{
+				"schemaCompatible":  false,
+				"runtimeCompatible": "unsupported",
+				"knownDegraded":     []string{"mcp_external_tools_unavailable"},
+				"fallbackBehavior":  "explicit_error",
+			}),
 		})
 	}
 	return ToolInventoryMetadata{

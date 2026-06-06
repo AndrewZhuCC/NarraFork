@@ -71,7 +71,7 @@ func defaultConfig(home string) Config {
 	return Config{
 		Engine:              EngineSQLite,
 		SQLitePath:          filepath.Join(home, ".narrafork", defaultSQLiteFileName),
-		SQLiteBootstrapMode: SQLiteBootstrapModeBunFinalCompatible,
+		SQLiteBootstrapMode: SQLiteBootstrapModeReadOnly,
 		MaxOpenConns:        1,
 		MaxIdleConns:        1,
 		VerifyCanonical:     true,
@@ -172,7 +172,7 @@ func (c Config) normalized() (Config, error) {
 			c.MaxIdleConns = 1
 		}
 		if c.SQLiteBootstrapMode == "" {
-			c.SQLiteBootstrapMode = SQLiteBootstrapModeBunFinalCompatible
+			c.SQLiteBootstrapMode = SQLiteBootstrapModeReadOnly
 		}
 		switch c.SQLiteBootstrapMode {
 		case SQLiteBootstrapModeBunFinalCompatible, SQLiteBootstrapModeReadOnly:

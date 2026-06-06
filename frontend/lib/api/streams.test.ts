@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { ApiError } from "./client";
-import { kiroStreamChat, scanStorageStream } from "./streams";
+import {
+	assertKiroChatRouteSupported,
+	guardedKiroStreamChat,
+	kiroStreamChat,
+	scanStorageStream,
+} from "./streams";
 
 describe("kiroStreamChat", () => {
 	const g = globalThis as typeof globalThis & {
@@ -53,6 +58,43 @@ describe("kiroStreamChat", () => {
 			expect((err as ApiError).status).toBe(503);
 			expect((err as Error).message).toBe("Kiro chat is unavailable");
 			expect((err as ApiError).data?.code).toBe("KIRO_CHAT_UNAVAILABLE");
+		}
+	});
+
+	test("blocks Kiro chat before fetch when route capability is disabled", async () => {
+		let fetched = false;
+		Object.defineProperty(g, "fetch", {
+			value: async () => {
+				fetched = true;
+				return new Response("");
+			},
+			configurable: true,
+		});
+
+		const capabilities = {
+			providers: {
+				kiro: {
+					routes: {
+						supported: true,
+						chat: false,
+						chatReason: "Kiro chat streaming is disabled in Go",
+					},
+				},
+			},
+		};
+
+		expect(() => assertKiroChatRouteSupported(capabilities)).toThrow(
+			"Kiro chat streaming is disabled in Go",
+		);
+		const generator = guardedKiroStreamChat(capabilities, "hello", "model-1");
+		try {
+			await generator.next();
+			throw new Error("expected guarded Kiro chat to fail");
+		} catch (err) {
+			expect(err).toBeInstanceOf(ApiError);
+			expect((err as ApiError).status).toBe(501);
+			expect((err as ApiError).data?.feature).toBe("providers.kiro.routes.chat");
+			expect(fetched).toBe(false);
 		}
 	});
 

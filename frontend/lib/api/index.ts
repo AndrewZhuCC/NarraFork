@@ -31,7 +31,13 @@ export {
 	readFetchErrorMessage,
 	setToken,
 } from "./client";
-export { kiroStreamChat, scanStorageStream } from "./streams";
+export {
+	assertKiroChatRouteSupported,
+	getKiroChatRouteCapability,
+	guardedKiroStreamChat,
+	kiroStreamChat,
+	scanStorageStream,
+} from "./streams";
 export type {
 	ApiEntity,
 	BaseContentBlock,

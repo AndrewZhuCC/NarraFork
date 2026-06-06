@@ -2080,8 +2080,7 @@ func (h *Handler) RegisterProviders(r chi.Router) {
 		cr.Post("/global-proxy", httpx.Handler(h.codexSetGlobalProxy))
 		cr.Post("/import", httpx.Handler(h.codexImport))
 		cr.Post("/usage-queue/clear", httpx.Handler(h.adminOnly(func(w http.ResponseWriter, r *http.Request) error {
-			httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
-			return nil
+			return httpx.NotImplemented("providers.codex.usageQueueClear")
 		})))
 		cr.Post("/auth/browser", httpx.Handler(h.codexAuthBrowser))
 		cr.Post("/auth/browser/wait", httpx.Handler(h.codexAuthBrowserWait))

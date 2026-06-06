@@ -867,16 +867,25 @@ func (s *Service) CreateReview(ctx context.Context, sourceID string, input Revie
 	short := id.Must(6)
 	branchName := fmt.Sprintf("review/%s-%s", slug, short)
 	worktreePath := filepath.Join(gitPath, ".worktrees", slug+"-"+short)
+	cleanup := reviewCreateCleanup{s: s, gitPath: gitPath, branchName: branchName, worktreePath: worktreePath}
+	fail := func(err error) (Chapter, error) {
+		if cleanupErr := cleanup.rollback(ctx); cleanupErr != nil {
+			return Chapter{}, fmt.Errorf("%w; rollback failed: %v", err, cleanupErr)
+		}
+		return Chapter{}, err
+	}
 	if err := s.Git.CreateBranch(ctx, gitPath, branchName, sourceHead); err != nil {
 		return Chapter{}, err
 	}
+	cleanup.branchCreated = true
 	if err := s.Git.CreateWorktree(ctx, gitPath, worktreePath, branchName); err != nil {
-		_ = s.Git.DeleteBranch(ctx, gitPath, branchName)
-		return Chapter{}, err
+		return fail(err)
 	}
+	cleanup.worktreeCreated = true
 	_ = s.copyReviewDirtyFiles(ctx, sourceWorktree, worktreePath)
 	now := db.NowISO()
 	chapterID := id.New()
+	cleanup.chapterID = chapterID
 	anchor := sourceHead
 	if input.AnchorCommitSHA != nil && strings.TrimSpace(*input.AnchorCommitSHA) != "" {
 		anchor = strings.TrimSpace(*input.AnchorCommitSHA)
@@ -897,30 +906,179 @@ func (s *Service) CreateReview(ctx context.Context, sourceID string, input Revie
 		jsonObjectString(map[string]any{"commitSha": sourceHead}), nullableString(sourceHead), nullableString(sourceHead), nullableString(anchor),
 		axis, cross, sourceID, now, now, now)
 	if err != nil {
-		_ = s.Git.RemoveWorktree(ctx, gitPath, worktreePath)
-		_ = s.Git.DeleteBranch(ctx, gitPath, branchName)
-		return Chapter{}, err
+		return fail(err)
 	}
 	if _, err := s.DB.ExecContext(ctx, `INSERT INTO chapter_edges (id, project_id, source_id, target_id, type, metadata, created_at) VALUES (?, ?, ?, ?, 'review', ?, ?)`, id.New(), source.ProjectID, sourceID, chapterID, jsonObjectString(map[string]any{"commitSha": sourceHead}), now); err != nil {
-		_, _ = s.DB.ExecContext(ctx, `DELETE FROM chapters WHERE id = ?`, chapterID)
-		_ = s.Git.RemoveWorktree(ctx, gitPath, worktreePath)
-		_ = s.Git.DeleteBranch(ctx, gitPath, branchName)
-		return Chapter{}, err
+		return fail(err)
 	}
 	if s.Narrators != nil {
-		core := s.Settings.Core()
-		narrator, err := s.Narrators.Create(ctx, narrators.CreateInput{ChapterID: &chapterID, Title: &title, Model: core.Agent.DefaultModel, PermissionMode: core.Agent.DefaultPermissionMode, Cwd: &worktreePath})
+		model, permission := s.reviewDefaultNarratorSettings()
+		narrator, err := s.Narrators.Create(ctx, narrators.CreateInput{ChapterID: &chapterID, Title: &title, Model: model, PermissionMode: permission, Cwd: &worktreePath})
 		if err != nil {
-			_, _ = s.DB.ExecContext(ctx, `DELETE FROM chapters WHERE id = ?`, chapterID)
-			_ = s.Git.RemoveWorktree(ctx, gitPath, worktreePath)
-			_ = s.Git.DeleteBranch(ctx, gitPath, branchName)
-			return Chapter{}, err
+			return fail(err)
 		}
+		cleanup.narratorID = narrator.ID
 		if err := s.initializeReviewNarrator(ctx, narrator.ID, gitPath, source, sourceHead, input); err != nil {
-			return Chapter{}, err
+			return fail(err)
 		}
 	}
 	return s.Get(ctx, chapterID)
+}
+
+type reviewCreateCleanup struct {
+	s            *Service
+	gitPath      string
+	branchName   string
+	worktreePath string
+	chapterID    string
+	narratorID   string
+
+	branchCreated   bool
+	worktreeCreated bool
+}
+
+func (c *reviewCreateCleanup) rollback(ctx context.Context) error {
+	if c == nil || c.s == nil {
+		return nil
+	}
+	errs := []error{}
+	if c.chapterID != "" || c.narratorID != "" {
+		if err := c.rollbackDB(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("database cleanup: %w", err))
+		}
+	}
+	if c.gitPath != "" && c.worktreePath != "" {
+		if _, statErr := os.Stat(c.worktreePath); statErr == nil {
+			if c.worktreeCreated && c.s.Git != nil {
+				if err := c.s.Git.RemoveWorktree(ctx, c.gitPath, c.worktreePath); err != nil {
+					if removeErr := os.RemoveAll(c.worktreePath); removeErr != nil {
+						errs = append(errs, fmt.Errorf("remove worktree %s: %w; remove partial path: %v", c.worktreePath, err, removeErr))
+					}
+				}
+			} else if removeErr := os.RemoveAll(c.worktreePath); removeErr != nil {
+				errs = append(errs, fmt.Errorf("remove partial worktree path %s: %w", c.worktreePath, removeErr))
+			}
+		} else if !os.IsNotExist(statErr) {
+			errs = append(errs, fmt.Errorf("stat worktree %s: %w", c.worktreePath, statErr))
+		}
+	}
+	if c.branchCreated && c.s.Git != nil && c.gitPath != "" && c.branchName != "" {
+		if c.s.Git.BranchExists(ctx, c.gitPath, c.branchName) {
+			if err := c.s.Git.DeleteBranch(ctx, c.gitPath, c.branchName); err != nil {
+				errs = append(errs, fmt.Errorf("delete branch %s: %w", c.branchName, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (c *reviewCreateCleanup) rollbackDB(ctx context.Context) error {
+	if c.s.DB == nil {
+		return nil
+	}
+	tx, err := c.s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	narratorIDs, err := c.rollbackNarratorIDs(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, narratorID := range narratorIDs {
+		for _, table := range []string{"narrator_tool_calls", "narrator_sidecars", "narrator_goals"} {
+			if err := reviewRollbackDeleteWhere(ctx, tx, table, "narrator_id", narratorID); err != nil {
+				return err
+			}
+		}
+		if err := reviewRollbackDeleteWhere(ctx, tx, "narrator_message_refs", "narrator_id", narratorID); err != nil {
+			return err
+		}
+		if err := reviewRollbackDeleteWhere(ctx, tx, "narrator_messages", "narrator_id", narratorID); err != nil {
+			return err
+		}
+		if err := reviewRollbackDeleteWhere(ctx, tx, "narrators", "id", narratorID); err != nil {
+			return err
+		}
+	}
+	if c.chapterID != "" {
+		if err := reviewRollbackDeleteChapterEdges(ctx, tx, c.chapterID); err != nil {
+			return err
+		}
+		if err := reviewRollbackDeleteWhere(ctx, tx, "chapters", "id", c.chapterID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (c *reviewCreateCleanup) rollbackNarratorIDs(ctx context.Context, tx *sql.Tx) ([]string, error) {
+	columns, err := db.TableColumnSet(ctx, tx, "narrators")
+	if err != nil || len(columns) == 0 {
+		return nil, err
+	}
+	clauses := []string{}
+	args := []any{}
+	if c.narratorID != "" && columns["id"] {
+		clauses = append(clauses, "id = ?")
+		args = append(args, c.narratorID)
+	}
+	if c.chapterID != "" && columns["chapter_id"] {
+		clauses = append(clauses, "chapter_id = ?")
+		args = append(args, c.chapterID)
+	}
+	if len(clauses) == 0 {
+		return nil, nil
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM narrators WHERE `+strings.Join(clauses, " OR "), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	seen := map[string]bool{}
+	for rows.Next() {
+		var idValue string
+		if err := rows.Scan(&idValue); err != nil {
+			return nil, err
+		}
+		if !seen[idValue] {
+			seen[idValue] = true
+			ids = append(ids, idValue)
+		}
+	}
+	return ids, rows.Err()
+}
+
+func reviewRollbackDeleteWhere(ctx context.Context, tx *sql.Tx, table, column, value string) error {
+	columns, err := db.TableColumnSet(ctx, tx, table)
+	if err != nil || len(columns) == 0 || !columns[column] {
+		return err
+	}
+	dialect := db.SQLiteDialect{}
+	_, err = tx.ExecContext(ctx, `DELETE FROM `+dialect.QuoteIdent(table)+` WHERE `+dialect.QuoteIdent(column)+` = ?`, value)
+	return err
+}
+
+func reviewRollbackDeleteChapterEdges(ctx context.Context, tx *sql.Tx, chapterID string) error {
+	columns, err := db.TableColumnSet(ctx, tx, "chapter_edges")
+	if err != nil || len(columns) == 0 {
+		return err
+	}
+	if !columns["source_id"] || !columns["target_id"] {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM chapter_edges WHERE source_id = ? OR target_id = ?`, chapterID, chapterID)
+	return err
+}
+
+func (s *Service) reviewDefaultNarratorSettings() (string, string) {
+	if s != nil && s.Settings != nil {
+		core := s.Settings.Core()
+		return firstNonEmptyString(core.Agent.DefaultModel, config.DefaultAgentModel), firstNonEmptyString(core.Agent.DefaultPermissionMode, "default")
+	}
+	return config.DefaultAgentModel, "default"
 }
 
 func (s *Service) initializeReviewNarrator(ctx context.Context, narratorID, gitPath string, source Chapter, sourceHead string, input ReviewInput) error {

@@ -84,7 +84,72 @@ async function enforceSseResidualLimit(
 	throw createSseResidualError();
 }
 
-/** Stream chat response from Kiro. Yields text chunks via SSE. */
+interface KiroChatCapabilityInput {
+	providers?: {
+		kiro?: {
+			routes?: {
+				supported?: boolean;
+				chat?: boolean;
+				chatReason?: unknown;
+				reason?: unknown;
+			};
+		};
+	};
+}
+
+export function getKiroChatRouteCapability(capabilities?: KiroChatCapabilityInput): {
+	supported: boolean;
+	reason?: string;
+} {
+	if (!capabilities) return { supported: true };
+	const routes = capabilities.providers?.kiro?.routes;
+	const supported = routes?.supported !== false && routes?.chat === true;
+	const routeReason = routes?.chatReason;
+	return {
+		supported,
+		reason: supported
+			? undefined
+			: typeof routeReason === "string"
+				? routeReason
+				: typeof routes?.reason === "string"
+					? routes.reason
+					: undefined,
+	};
+}
+
+export function assertKiroChatRouteSupported(capabilities?: KiroChatCapabilityInput): void {
+	const capability = getKiroChatRouteCapability(capabilities);
+	if (capability.supported) return;
+	const reason = capability.reason ?? "Kiro chat route is disabled by backend capabilities";
+	throw new ApiError(reason, 501, {
+		ok: false,
+		code: "FEATURE_DISABLED",
+		feature: "providers.kiro.routes.chat",
+		supported: false,
+		fallback: true,
+		reason,
+		error: reason,
+		message: reason,
+	});
+}
+
+export async function* guardedKiroStreamChat(
+	capabilities: KiroChatCapabilityInput | undefined,
+	text: string,
+	model?: string,
+	signal?: AbortSignal,
+): AsyncGenerator<string> {
+	assertKiroChatRouteSupported(capabilities);
+	yield* kiroStreamChat(text, model, signal);
+}
+
+/**
+ * Stream chat response from Kiro. Yields text chunks via SSE.
+ *
+ * UI callers must gate this low-level fetcher with providers.kiro.routes.chat
+ * (for example useProviderRouteCapability("kiro", "chat")) or call
+ * guardedKiroStreamChat/assertKiroChatRouteSupported before starting the fetch.
+ */
 export async function* kiroStreamChat(
 	text: string,
 	model?: string,

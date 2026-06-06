@@ -151,9 +151,16 @@ func prepareRoundtripFixtureDatabase(t *testing.T) (string, roundtripFixture) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
-	store, err := Open(context.Background())
+	cfg, err := NewConfig(ConfigInput{
+		SQLitePath:          dbPath,
+		SQLiteBootstrapMode: string(SQLiteBootstrapModeBunFinalCompatible),
+	})
 	if err != nil {
-		t.Fatalf("bootstrap roundtrip fixture database: %v", err)
+		t.Fatalf("create legacy bootstrap config for roundtrip fixture: %v", err)
+	}
+	store, err := OpenWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("bootstrap roundtrip fixture database in explicit legacy mode: %v", err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatalf("close bootstrapped roundtrip fixture database: %v", err)

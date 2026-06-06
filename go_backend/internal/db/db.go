@@ -104,14 +104,14 @@ func sqlDriverRegistered(name string) bool {
 }
 
 func ensureSQLiteDatabaseFile(path string, mode SQLiteBootstrapMode) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create database directory: %w", err)
-	}
 	if _, err := os.Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			if mode == SQLiteBootstrapModeReadOnly {
 				return fmt.Errorf("canonical TypeScript database does not exist at %s; start the TypeScript backend once to create and migrate it before using go_backend", path)
+			}
+			dir := filepath.Dir(path)
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("create database directory: %w", err)
 			}
 			return nil
 		}

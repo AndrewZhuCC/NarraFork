@@ -1,13 +1,24 @@
 {
 	"name": "go-backend-phase0-contract-matrix",
-	"updatedAt": "2026-05-20",
-	"scope": "Freeze TypeScript-owned DB compatibility mode and make Go unsupported/degraded behavior discoverable before users trigger side effects.",
+	"updatedAt": "2026-06-06",
+	"scope": "Freeze the transitional TypeScript-owned SQLite DB compatibility mode, document the future pure-Go DB target, and make Go unsupported/degraded behavior discoverable before users trigger side effects.",
 	"principles": [
 		{
 			"id": "ts-owned-main-db",
-			"status": "frozen",
+			"status": "transitional",
+			"strategyStage": "transition",
+			"transitionalStrategy": true,
 			"owner": "TypeScript Drizzle migrations",
-			"goBehavior": "read-only canonical schema and migration compatibility checks; no business schema creation, ALTER, index creation, FTS rebuild, or main DB repair",
+			"targetMode": "pure-go-db-management",
+			"targetMainSchemaOwner": "go",
+			"currentRepairOwner": "typescript-drizzle-and-ts-fts-setup",
+			"futureGoResponsibilities": [
+				"main schema migrations",
+				"startup backfills and repair",
+				"FTS/search lifecycle",
+				"schema drift fixtures and release gates"
+			],
+			"goBehavior": "read-only canonical schema and migration compatibility checks while SQLite remains in the transition stage; no business schema creation, ALTER, index creation, FTS rebuild, or main DB repair in this mode",
 			"evidence": [
 				"go_backend/internal/db/schema.go",
 				"go_backend/internal/db/canonical_schema.go",
@@ -45,6 +56,11 @@
 			"phase0Status": "full",
 			"requiredCapabilityKeys": [
 				"database.mainSchemaOwner",
+				"database.targetMainSchemaOwner",
+				"database.strategyStage",
+				"database.transitionalStrategy",
+				"database.targetMode",
+				"database.currentRepairOwner",
 				"database.goMainMigrations",
 				"database.ftsRepair",
 				"content.projectRoutines.supported",
@@ -510,15 +526,17 @@
 				"providers.openai.quota",
 				"providers.anthropic.quota",
 				"providers.codex.managerParity",
+				"providers.codex.usageQueueClear",
 				"providers.kiro.pluginBridge"
 			],
 			"fallbackReasons": {
 				"providers.openai.quota": "OpenAI-compatible quota inspection is not available in go_backend.",
 				"providers.anthropic.quota": "Anthropic quota inspection is not available in go_backend.",
 				"providers.codex.managerParity": "Go exposes Codex compatibility routes/runtime but not the full TS CodexManager scheduler/usage queue semantics.",
+				"providers.codex.usageQueueClear": "Go compatibility mode returns FEATURE_DISABLED instead of a false-success clear for the TypeScript CodexManager usage queue.",
 				"providers.kiro.pluginBridge": "Kiro plugin bridge is available only when the external Bun bridge/plugin environment is present."
 			},
-			"sideEffectPolicy": "Unsupported provider subfeatures must be hidden or return explicit fallback; implemented auth/model/quota routes must not leak secrets.",
+			"sideEffectPolicy": "Unsupported provider subfeatures must be hidden or return explicit fallback; implemented auth/model/quota routes must not leak secrets; unsupported mutation routes must not return false success.",
 			"tests": [
 				"go_backend/internal/app/route_contract_test.go",
 				"frontend/lib/api/narrators.test.ts",
@@ -644,7 +662,10 @@
 			"path": "/api/narrators/{id}",
 			"tsSource": "server/routes/narrators.ts and server/services/narrator-service.ts",
 			"goSource": "go_backend/internal/narrators/handlers.go and go_backend/internal/narrators/remove.go",
-			"frontendConsumers": ["frontend/routes/narrators/archived.tsx", "frontend/lib/api/narrators.ts"],
+			"frontendConsumers": [
+				"frontend/routes/narrators/archived.tsx",
+				"frontend/lib/api/narrators.ts"
+			],
 			"phase0Status": "supported-for-archived-narrators-with-recursive-shared-message-cleanup",
 			"capabilityKey": "narrator.delete",
 			"features": [

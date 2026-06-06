@@ -248,6 +248,56 @@ func TestToolInventoryExposesBrowserScreenshotParityMetadata(t *testing.T) {
 	}
 }
 
+func TestToolInventoryCapabilityMatrixContractFields(t *testing.T) {
+	metadata := ToolInventoryMetadataForOptions(ToolInventoryOptions{Scope: ToolScopeNormal})
+	for _, tool := range metadata.Tools {
+		if tool.Metadata == nil {
+			t.Fatalf("tool capability %s missing capability contract metadata: %#v", tool.Name, tool)
+		}
+		assertContractFields(t, tool.Metadata)
+	}
+
+	readMetadata := metadataForTool(t, metadata, "Read")
+	assertContractFields(t, readMetadata)
+	if readMetadata["schemaCompatible"] != true || readMetadata["runtimeCompatible"] != "partial" || readMetadata["fallbackBehavior"] != "explicit_error" || readMetadata["frontendRendering"] != "text_or_directory_listing" {
+		t.Fatalf("unexpected Read capability contract: %#v", readMetadata)
+	}
+	if readMetadata["pdfPages"] != false || readMetadata["imageContent"] != false || readMetadata["pagesSchemaOnly"] != true || !stringSliceHas(readMetadata["knownDegraded"], "pdfPages") || !stringSliceHas(readMetadata["knownDegraded"], "imageContent") {
+		t.Fatalf("Read degraded modes should document unsupported pdf/image handling: %#v", readMetadata)
+	}
+
+	webFetchMetadata := metadataForTool(t, metadata, "WebFetch")
+	assertContractFields(t, webFetchMetadata)
+	if webFetchMetadata["schemaCompatible"] != true || webFetchMetadata["runtimeCompatible"] != "partial" || webFetchMetadata["mode"] != "raw-only" || webFetchMetadata["fallbackBehavior"] != "explicit_error/raw_text" || webFetchMetadata["frontendRendering"] != "raw_text" {
+		t.Fatalf("unexpected WebFetch capability contract: %#v", webFetchMetadata)
+	}
+	for _, mode := range []string{"readability", "dom", "smart", "screenshot"} {
+		if !stringSliceHas(webFetchMetadata["knownDegraded"], mode) || !stringSliceHas(webFetchMetadata["unsupportedModes"], mode) {
+			t.Fatalf("WebFetch should mark %s as unsupported/degraded: %#v", mode, webFetchMetadata)
+		}
+	}
+
+	browserMetadata := metadataForTool(t, metadata, "Browser")
+	assertContractFields(t, browserMetadata)
+	if browserMetadata["schemaCompatible"] != true || browserMetadata["runtimeCompatible"] != "partial" || browserMetadata["runtime"] != "go-rod" || browserMetadata["screenshotPreviewMode"] != "inline-base64-or-file-artifact" || browserMetadata["frontendRendering"] != "file_or_base64_artifact" {
+		t.Fatalf("unexpected Browser capability contract: %#v", browserMetadata)
+	}
+	if browserMetadata["imageContentBlock"] != false || browserMetadata["sharePreview"] != false || !stringSliceHas(browserMetadata["knownDegraded"], "imageContentBlock") || !stringSliceHas(browserMetadata["knownDegraded"], "sharePreview") {
+		t.Fatalf("Browser degraded preview modes should be stable: %#v", browserMetadata)
+	}
+
+	for _, name := range []string{"ForkNarrator", "NarraForkAdmin"} {
+		tool := toolCapabilityByName(t, metadata, name)
+		if tool.Supported || tool.Enabled || tool.Category != ToolCategoryOptional {
+			t.Fatalf("unsupported optional tool should remain hidden/disabled: %#v", tool)
+		}
+		assertContractFields(t, tool.Metadata)
+		if tool.Metadata["schemaCompatible"] != false || tool.Metadata["runtimeCompatible"] != "unsupported" || tool.Metadata["fallbackBehavior"] != "hidden_or_explicit_error" || tool.Metadata["frontendRendering"] != "hidden" {
+			t.Fatalf("unexpected unsupported optional capability contract for %s: %#v", name, tool.Metadata)
+		}
+	}
+}
+
 func TestToolInventoryExternalMCPToolsAreInjectedAndGuarded(t *testing.T) {
 	external := []ExternalToolSpec{{
 		Name:        "mcp__filesystem__read_file",
@@ -382,6 +432,53 @@ func TestRunAgentLoopEmitsInventoryAndFiltersProviderTools(t *testing.T) {
 	if !providerToolListHas(tools, "Browser") || providerToolListHas(tools, "Read") || providerToolListHas(tools, "ConcludeReview") {
 		t.Fatalf("provider tools were not filtered by enabled/disabled inventory: %#v", tools)
 	}
+}
+
+func toolCapabilityByName(t *testing.T, metadata ToolInventoryMetadata, name string) ToolCapability {
+	t.Helper()
+	for _, tool := range metadata.Tools {
+		if tool.Name == name {
+			return tool
+		}
+	}
+	t.Fatalf("tool capability %s missing: %#v", name, metadata.Tools)
+	return ToolCapability{}
+}
+
+func metadataForTool(t *testing.T, metadata ToolInventoryMetadata, name string) map[string]any {
+	t.Helper()
+	tool := toolCapabilityByName(t, metadata, name)
+	if tool.Metadata == nil {
+		t.Fatalf("tool capability %s has no metadata: %#v", name, tool)
+	}
+	return tool.Metadata
+}
+
+func assertContractFields(t *testing.T, metadata map[string]any) {
+	t.Helper()
+	for _, key := range []string{"schemaCompatible", "runtimeCompatible", "knownDegraded", "fallbackBehavior", "frontendRendering"} {
+		if _, ok := metadata[key]; !ok {
+			t.Fatalf("capability metadata missing %s: %#v", key, metadata)
+		}
+	}
+}
+
+func stringSliceHas(value any, want string) bool {
+	switch items := value.(type) {
+	case []string:
+		for _, item := range items {
+			if item == want {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range items {
+			if stringValue(item) == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func toolDefinitionNames(tools []map[string]any) map[string]bool {

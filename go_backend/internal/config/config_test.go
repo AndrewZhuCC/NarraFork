@@ -1,6 +1,11 @@
 package config
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestDefaultAgentModelMatchesTypeScriptDefault(t *testing.T) {
 	if DefaultAgentModel != "kiro:claude-sonnet-4.5" {
@@ -121,6 +126,157 @@ func TestCoreReadsOptionalTLSSettings(t *testing.T) {
 	core := store.Core()
 	if !core.Server.TLS.Enabled || core.Server.TLS.CertFile != "/tmp/cert.pem" || core.Server.TLS.KeyFile != "/tmp/key.pem" || core.Server.TLS.CAFile != "/tmp/ca.pem" || core.Server.TLS.Passphrase != "secret" {
 		t.Fatalf("unexpected TLS settings: %#v", core.Server.TLS)
+	}
+}
+
+func TestLoadMigratesLegacySettingsAndPersistsResult(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	legacy := []byte(`{
+		"editor":{"legacyEncoding":true,"theme":"dark"},
+		"agent":{
+			"yoloSkipReadOnlyConfirmations":true,
+			"smartInterruptionCheck":true,
+			"defaultPermissionMode":"plan",
+			"subagentAllowedModels":["kiro:model-a","openai:model-b"],
+			"webFetchPolicy":{"proxy":{"mode":"custom","url":"web-proxy.example.test:8081"}},
+			"unknownAgentField":"kept"
+		},
+		"openai":{
+			"key":"sk-legacy",
+			"baseURL":"https://legacy.example.test/v1",
+			"modelPrefix":"legacy-model-prefix",
+			"defaultModel":"gpt-legacy",
+			"unknownOpenAI":"kept"
+		},
+		"customApiProviders":[{
+			"id":"custom-1",
+			"name":"Custom One",
+			"apiKey":"sk-custom",
+			"baseUrl":"https://custom.example.test/v1",
+			"defaultModel":"model",
+			"protocol":"responses-compatible",
+			"proxyUrl":"provider-proxy.example.test:8082",
+			"proxyURL":"provider-proxy.example.test:8083"
+		}],
+		"mcpServers":[{"defaultBehavior":"allow","toolPermissions":[{"toolName":"write","behavior":"allow"}],"unknownMcp":"kept"}],
+		"codex":{"defaultReasoningEffort":null,"proxy":"codex-proxy.example.test:8084"},
+		"kiro":{"proxy":"kiro-proxy.example.test:8085"},
+		"unknownRoot":{"still":true}
+	}`)
+	if err := os.WriteFile(settingsPath, legacy, 0o600); err != nil {
+		t.Fatalf("write legacy settings: %v", err)
+	}
+
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	raw := store.Raw()
+	assertMigratedLegacySettings(t, raw)
+
+	var persisted map[string]any
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read persisted settings: %v", err)
+	}
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		t.Fatalf("decode persisted settings: %v", err)
+	}
+	assertMigratedLegacySettings(t, persisted)
+}
+
+func TestLoadAddsMissingOpenAIProviderPrefix(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	if err := os.WriteFile(settingsPath, []byte(`{"openaiProviders":[{"id":"o1","name":"OpenAI","apiKey":"sk","baseUrl":"https://api.example.test","defaultModel":"gpt"}]}`), 0o600); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	providers, _ := store.Raw()["openaiProviders"].([]any)
+	provider, _ := providers[0].(map[string]any)
+	if provider["prefix"] != "openai" {
+		t.Fatalf("openai provider prefix = %#v, want openai", provider["prefix"])
+	}
+}
+
+func assertMigratedLegacySettings(t *testing.T, raw map[string]any) {
+	t.Helper()
+	editor, _ := raw["editor"].(map[string]any)
+	if _, exists := editor["legacyEncoding"]; exists || editor["theme"] != "dark" {
+		t.Fatalf("editor legacyEncoding not migrated or unknown field lost: %#v", editor)
+	}
+	agent, _ := raw["agent"].(map[string]any)
+	if agent["legacyEncoding"] != true || agent["dangerSkipReadOnlyConfirmations"] != true {
+		t.Fatalf("agent legacy booleans not migrated: %#v", agent)
+	}
+	if _, exists := agent["yoloSkipReadOnlyConfirmations"]; exists {
+		t.Fatalf("legacy yolo setting should be removed: %#v", agent)
+	}
+	if _, exists := agent["smartInterruptionCheck"]; exists {
+		t.Fatalf("smartInterruptionCheck should be removed: %#v", agent)
+	}
+	if agent["defaultPermissionMode"] != "default" || agent["defaultStartInPlanMode"] != true {
+		t.Fatalf("plan permission mode not migrated: %#v", agent)
+	}
+	if agent["unknownAgentField"] != "kept" {
+		t.Fatalf("unknown agent field lost: %#v", agent)
+	}
+	allowed, _ := agent["subagentAllowedModels"].(map[string]any)
+	for _, role := range []string{"explore", "plan", "general"} {
+		models, _ := allowed[role].([]any)
+		if len(models) != 2 || models[0] != "kiro:model-a" || models[1] != "openai:model-b" {
+			t.Fatalf("subagentAllowedModels[%s] not migrated: %#v", role, allowed)
+		}
+	}
+	webFetchProxy, _ := nestedDefault(raw, []string{"agent", "webFetchPolicy", "proxy", "url"})
+	if webFetchProxy != "http://web-proxy.example.test:8081" {
+		t.Fatalf("web fetch proxy URL not normalized: %#v", webFetchProxy)
+	}
+	if _, exists := raw["openai"]; exists {
+		t.Fatalf("legacy openai root should be removed: %#v", raw["openai"])
+	}
+	openaiProviders, _ := raw["openaiProviders"].([]any)
+	openai, _ := openaiProviders[0].(map[string]any)
+	if openai["apiKey"] != "sk-legacy" || openai["key"] != "sk-legacy" || openai["baseUrl"] != "https://legacy.example.test/v1" || openai["baseURL"] != "https://legacy.example.test/v1" || openai["prefix"] != "openai" || openai["modelPrefix"] != "legacy-model-prefix" || openai["unknownOpenAI"] != "kept" {
+		t.Fatalf("legacy openai provider fields not preserved: %#v", openai)
+	}
+	customProviders, _ := raw["customApiProviders"].([]any)
+	custom, _ := customProviders[0].(map[string]any)
+	if custom["prefix"] != "custom" || custom["proxyUrl"] != "http://provider-proxy.example.test:8082" || custom["proxyURL"] != "http://provider-proxy.example.test:8083" {
+		t.Fatalf("custom provider prefix/proxy not normalized: %#v", custom)
+	}
+	mcpServers, _ := raw["mcpServers"].([]any)
+	mcp, _ := mcpServers[0].(map[string]any)
+	permissions, _ := mcp["toolPermissions"].([]any)
+	permission, _ := permissions[0].(map[string]any)
+	if mcp["defaultBehavior"] != "readWrite" || permission["behavior"] != "readWrite" || mcp["unknownMcp"] != "kept" {
+		t.Fatalf("MCP behavior migration failed: %#v", mcp)
+	}
+	codex, _ := raw["codex"].(map[string]any)
+	if codex["defaultReasoningEffort"] != "medium" || codex["proxy"] != "http://codex-proxy.example.test:8084" {
+		t.Fatalf("codex settings not normalized: %#v", codex)
+	}
+	kiro, _ := raw["kiro"].(map[string]any)
+	if kiro["proxy"] != "http://kiro-proxy.example.test:8085" {
+		t.Fatalf("kiro proxy not normalized: %#v", kiro)
+	}
+	unknownRoot, _ := raw["unknownRoot"].(map[string]any)
+	if unknownRoot["still"] != true {
+		t.Fatalf("unknown root lost: %#v", raw["unknownRoot"])
 	}
 }
 

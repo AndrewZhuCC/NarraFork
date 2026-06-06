@@ -68,6 +68,60 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	}
 }
 
+func TestCreateReviewRollsBackWhenInitializeNarratorFails(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	runGitReview(t, repo, "init", "-b", "main")
+	runGitReview(t, repo, "config", "user.email", "test@example.com")
+	runGitReview(t, repo, "config", "user.name", "Test User")
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "initial")
+	base := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\nfeature\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "feature")
+	head := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+
+	sqlDB := openReviewChapterDB(t)
+	defer sqlDB.Close()
+	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
+	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_review_prompt_update BEFORE UPDATE OF system_prompt ON narrators BEGIN SELECT RAISE(ABORT, 'review prompt update blocked'); END;`); err != nil {
+		t.Fatalf("create prompt trigger: %v", err)
+	}
+
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	_, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en"})
+	if err == nil || !strings.Contains(err.Error(), "initialize review narrator system prompt") {
+		t.Fatalf("expected initialize error, got %v", err)
+	}
+
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM chapters WHERE role = 'review' OR review_source_chapter_id = 'source'`); count != 0 {
+		t.Fatalf("review chapter should be rolled back, count=%d", count)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM chapter_edges WHERE type = 'review' OR source_id = 'source'`); count != 0 {
+		t.Fatalf("review edge should be rolled back, count=%d", count)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrators`); count != 0 {
+		t.Fatalf("review narrator should be rolled back, count=%d", count)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_messages`); count != 0 {
+		t.Fatalf("review messages should be rolled back, count=%d", count)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_message_refs`); count != 0 {
+		t.Fatalf("review message refs should be rolled back, count=%d", count)
+	}
+	if branches := strings.TrimSpace(runGitReview(t, repo, "branch", "--list", "review/*")); branches != "" {
+		t.Fatalf("review branch should be deleted, got %q", branches)
+	}
+	worktreesDir := filepath.Join(repo, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		t.Fatalf("review worktree should be removed, entries=%d", len(entries))
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read worktrees dir: %v", err)
+	}
+}
+
 func TestInitializeReviewNarratorReturnsPromptUpdateError(t *testing.T) {
 	sqlDB := openReviewNarratorInitDB(t)
 	defer sqlDB.Close()
@@ -116,6 +170,71 @@ func openReviewChapterDB(t *testing.T) *sql.DB {
 			anchor_commit_sha TEXT, axis_offset REAL DEFAULT 0, cross_offset REAL DEFAULT 0, panel_expanded INTEGER DEFAULT 0,
 			panel_width REAL, panel_height REAL, review_source_chapter_id TEXT, review_status TEXT,
 			last_accessed_at TEXT, created_at TEXT, updated_at TEXT
+		)`,
+		`CREATE TABLE narrators (
+			id TEXT PRIMARY KEY,
+			chapter_id TEXT,
+			api_conversation_id TEXT,
+			fork_message_id TEXT,
+			type TEXT,
+			subagent_type TEXT,
+			title TEXT,
+			inherit_mode TEXT,
+			parent_narrator_id TEXT,
+			context_summary TEXT,
+			model TEXT,
+			system_prompt TEXT,
+			permission_mode TEXT,
+			previous_permission_mode TEXT,
+			plan_file_id TEXT,
+			reasoning_effort TEXT,
+			fast_mode INTEGER DEFAULT 0,
+			relaxed_plan INTEGER DEFAULT 0,
+			plan_reflection_auto_approve_override TEXT DEFAULT 'inherit',
+			danger_reflection_override TEXT DEFAULT 'inherit',
+			message_count INTEGER DEFAULT 0,
+			total_cost_usd REAL DEFAULT 0,
+			last_message_at TEXT,
+			status TEXT DEFAULT 'idle',
+			substatus TEXT DEFAULT '[]',
+			plan_mode INTEGER DEFAULT 0,
+			cwd TEXT,
+			prune_boundary_message_id TEXT,
+			pruned_percent INTEGER,
+			prune_enabled INTEGER DEFAULT 1,
+			enabled_tools TEXT,
+			error_message TEXT,
+			todos_json TEXT,
+			todos_tool_use_id TEXT,
+			variant TEXT DEFAULT 'primary',
+			traits TEXT DEFAULT '[]',
+			is_background INTEGER DEFAULT 0,
+			background_status TEXT,
+			background_result TEXT,
+			background_completed_at TEXT,
+			is_ask_in_passing INTEGER DEFAULT 0,
+			message_version INTEGER DEFAULT 0,
+			created_at TEXT,
+			updated_at TEXT
+		)`,
+		`CREATE TABLE narrator_messages (
+			id TEXT PRIMARY KEY,
+			narrator_id TEXT,
+			parent_tool_use_id TEXT,
+			role TEXT,
+			content_json TEXT,
+			content_text TEXT,
+			command_text TEXT,
+			created_by TEXT,
+			created_at TEXT
+		)`,
+		`CREATE TABLE narrator_message_refs (
+			id TEXT PRIMARY KEY,
+			narrator_id TEXT,
+			message_id TEXT,
+			seq INTEGER,
+			is_compact INTEGER DEFAULT 0,
+			segment_compact_id TEXT
 		)`,
 	}
 	for _, stmt := range stmts {
@@ -266,4 +385,13 @@ func readFileReview(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func countRowsReview(t *testing.T, sqlDB *sql.DB, query string) int {
+	t.Helper()
+	var count int
+	if err := sqlDB.QueryRow(query).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v\n%s", err, query)
+	}
+	return count
 }

@@ -15,7 +15,8 @@ import (
 
 func TestOpenReadOnlyModeRefusesMissingDatabaseAndDoesNotCreateIt(t *testing.T) {
 	home := t.TempDir()
-	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
+	narraforkDir := filepath.Join(home, ".narrafork")
+	dbPath := filepath.Join(narraforkDir, "narrafork.db")
 	cfg, err := NewConfig(ConfigInput{
 		SQLitePath:          dbPath,
 		SQLiteBootstrapMode: string(SQLiteBootstrapModeReadOnly),
@@ -35,16 +36,47 @@ func TestOpenReadOnlyModeRefusesMissingDatabaseAndDoesNotCreateIt(t *testing.T) 
 	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
 		t.Fatalf("OpenWithConfig should not create narrafork.db in read-only mode; stat error = %v", statErr)
 	}
+	if _, statErr := os.Stat(narraforkDir); !os.IsNotExist(statErr) {
+		t.Fatalf("OpenWithConfig should not create .narrafork in read-only mode; stat error = %v", statErr)
+	}
 }
 
-func TestOpenBootstrapsMissingSQLiteDatabaseByDefault(t *testing.T) {
+func TestOpenRefusesMissingSQLiteDatabaseByDefault(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
+	narraforkDir := filepath.Join(home, ".narrafork")
+	dbPath := filepath.Join(narraforkDir, "narrafork.db")
 
 	store, err := Open(context.Background())
+	if err == nil {
+		store.Close()
+		t.Fatal("Open should fail when the default canonical TS database does not exist")
+	}
+	if !strings.Contains(err.Error(), "canonical TypeScript database does not exist") {
+		t.Fatalf("expected missing canonical DB error, got %q", err.Error())
+	}
+	if _, statErr := os.Stat(dbPath); !os.IsNotExist(statErr) {
+		t.Fatalf("Open should not create narrafork.db by default; stat error = %v", statErr)
+	}
+	if _, statErr := os.Stat(narraforkDir); !os.IsNotExist(statErr) {
+		t.Fatalf("Open should not create .narrafork by default; stat error = %v", statErr)
+	}
+}
+
+func TestOpenWithExplicitLegacyModeBootstrapsMissingSQLiteDatabase(t *testing.T) {
+	home := t.TempDir()
+	dbPath := filepath.Join(home, ".narrafork", "narrafork.db")
+	cfg, err := NewConfig(ConfigInput{
+		SQLitePath:          dbPath,
+		SQLiteBootstrapMode: string(SQLiteBootstrapModeBunFinalCompatible),
+	})
 	if err != nil {
-		t.Fatalf("Open should bootstrap missing SQLite database by default: %v", err)
+		t.Fatalf("NewConfig returned error: %v", err)
+	}
+
+	store, err := OpenWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("OpenWithConfig should bootstrap missing SQLite database in explicit legacy mode: %v", err)
 	}
 	defer store.Close()
 	if _, statErr := os.Stat(dbPath); statErr != nil {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"narrafork-go/internal/id"
@@ -82,8 +83,12 @@ func Load() (*Store, error) {
 		return nil, fmt.Errorf("read settings.json: %w", err)
 	}
 
+	legacyRaw := cloneMap(raw)
 	defaults := defaultRaw(home)
 	changed := mergeMissing(raw, defaults)
+	if migrateLegacySettings(raw, legacyRaw) {
+		changed = true
+	}
 	if getString(raw, "auth", "jwtSecret") == "" {
 		ensureMap(raw, "auth")["jwtSecret"] = id.Must(48)
 		changed = true
@@ -301,6 +306,232 @@ func mergeMissing(dst, src map[string]any) bool {
 		}
 	}
 	return changed
+}
+
+func migrateLegacySettings(raw, legacyRaw map[string]any) bool {
+	changed := false
+	agent := ensureMap(raw, "agent")
+	legacyAgent, _ := legacyRaw["agent"].(map[string]any)
+	if editor, ok := raw["editor"].(map[string]any); ok {
+		if legacyEncoding, exists := editor["legacyEncoding"]; exists {
+			if legacyEnabled, ok := legacyEncoding.(bool); ok && legacyEnabled {
+				if agent["legacyEncoding"] != true {
+					agent["legacyEncoding"] = true
+					changed = true
+				}
+			}
+			delete(editor, "legacyEncoding")
+			changed = true
+		}
+	}
+	if legacyYOLO, exists := agent["yoloSkipReadOnlyConfirmations"]; exists {
+		if _, hasDanger := legacyAgent["dangerSkipReadOnlyConfirmations"]; !hasDanger {
+			agent["dangerSkipReadOnlyConfirmations"] = legacyYOLO
+			changed = true
+		}
+		delete(agent, "yoloSkipReadOnlyConfirmations")
+		changed = true
+	}
+	if _, exists := agent["smartInterruptionCheck"]; exists {
+		delete(agent, "smartInterruptionCheck")
+		changed = true
+	}
+	if stringValue(agent["defaultPermissionMode"]) == "plan" {
+		agent["defaultPermissionMode"] = "default"
+		agent["defaultStartInPlanMode"] = true
+		changed = true
+	}
+	if pool, ok := agent["subagentAllowedModels"].([]any); ok {
+		agent["subagentAllowedModels"] = map[string]any{
+			"explore": cloneAny(pool),
+			"plan":    cloneAny(pool),
+			"general": cloneAny(pool),
+		}
+		changed = true
+	}
+	changed = migrateLegacyOpenAISettings(raw) || changed
+	changed = normalizeProviderPrefixes(raw) || changed
+	changed = migrateLegacyMCPBehaviors(raw) || changed
+	changed = normalizeCodexReasoningEffort(raw) || changed
+	changed = normalizeSettingsProxyURLs(raw) || changed
+	return changed
+}
+
+func migrateLegacyOpenAISettings(raw map[string]any) bool {
+	legacy, ok := raw["openai"].(map[string]any)
+	if !ok {
+		if _, exists := raw["openai"]; exists {
+			delete(raw, "openai")
+			return true
+		}
+		return false
+	}
+	changed := false
+	if len(anySlice(raw["openaiProviders"])) == 0 && len(legacy) > 0 {
+		provider := cloneMap(legacy)
+		provider["id"] = firstString(stringValue(provider["id"]), id.Short())
+		provider["name"] = firstString(stringValue(provider["name"]), "OpenAI")
+		provider["prefix"] = firstString(stringValue(provider["prefix"]), "openai")
+		provider["apiKey"] = firstString(
+			stringValue(provider["apiKey"]),
+			stringValue(provider["key"]),
+			stringValue(provider["api_key"]),
+		)
+		provider["baseUrl"] = firstString(
+			stringValue(provider["baseUrl"]),
+			stringValue(provider["baseURL"]),
+			stringValue(provider["base_url"]),
+		)
+		provider["defaultModel"] = firstString(
+			stringValue(provider["defaultModel"]),
+			stringValue(provider["model"]),
+			stringValue(provider["modelName"]),
+		)
+		raw["openaiProviders"] = []any{provider}
+		changed = true
+	}
+	delete(raw, "openai")
+	changed = true
+	return changed
+}
+
+func normalizeProviderPrefixes(raw map[string]any) bool {
+	changed := false
+	for field, fallbackPrefix := range map[string]string{
+		"openaiProviders":    "openai",
+		"customApiProviders": "custom",
+	} {
+		providers, ok := raw[field].([]any)
+		if !ok {
+			continue
+		}
+		for i, item := range providers {
+			provider, ok := item.(map[string]any)
+			if !ok || strings.TrimSpace(stringValue(provider["prefix"])) != "" {
+				continue
+			}
+			prefix := fallbackPrefix
+			if field == "customApiProviders" && i > 0 {
+				prefix = fmt.Sprintf("%s%d", fallbackPrefix, i+1)
+			}
+			provider["prefix"] = prefix
+			changed = true
+		}
+	}
+	return changed
+}
+
+func migrateLegacyMCPBehaviors(raw map[string]any) bool {
+	servers, ok := raw["mcpServers"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for _, item := range servers {
+		server, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if server["defaultBehavior"] == "allow" {
+			server["defaultBehavior"] = "readWrite"
+			changed = true
+		}
+		permissions, ok := server["toolPermissions"].([]any)
+		if !ok {
+			continue
+		}
+		for _, permissionItem := range permissions {
+			permission, ok := permissionItem.(map[string]any)
+			if ok && permission["behavior"] == "allow" {
+				permission["behavior"] = "readWrite"
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+func normalizeCodexReasoningEffort(raw map[string]any) bool {
+	codex, ok := raw["codex"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if value, exists := codex["defaultReasoningEffort"]; exists && value == nil {
+		codex["defaultReasoningEffort"] = "medium"
+		return true
+	}
+	return false
+}
+
+func normalizeSettingsProxyURLs(raw map[string]any) bool {
+	changed := false
+	for _, section := range []string{"codex", "kiro"} {
+		if settings, ok := raw[section].(map[string]any); ok {
+			changed = normalizeProxyField(settings, "proxy") || changed
+		}
+	}
+	if agent, ok := raw["agent"].(map[string]any); ok {
+		if policy, ok := agent["webFetchPolicy"].(map[string]any); ok {
+			if proxy, ok := policy["proxy"].(map[string]any); ok {
+				changed = normalizeProxyField(proxy, "url") || changed
+			}
+		}
+	}
+	for _, field := range []string{"customApiProviders", "openaiProviders", "anthropicProviders", "nkpProviders", "nugProviders", "clineProviders"} {
+		for _, item := range anySlice(raw[field]) {
+			provider, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			for _, proxyKey := range []string{"proxy", "proxyUrl", "proxyURL"} {
+				changed = normalizeProxyField(provider, proxyKey) || changed
+			}
+		}
+	}
+	return changed
+}
+
+func normalizeProxyField(target map[string]any, key string) bool {
+	value, ok := target[key].(string)
+	if !ok {
+		return false
+	}
+	normalized := normalizeProxyURL(value)
+	if normalized == value {
+		return false
+	}
+	target[key] = normalized
+	return true
+}
+
+func normalizeProxyURL(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "://") {
+		return trimmed
+	}
+	return "http://" + trimmed
+}
+
+func anySlice(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
+}
+
+func firstString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func deepMerge(dst, src map[string]any) {

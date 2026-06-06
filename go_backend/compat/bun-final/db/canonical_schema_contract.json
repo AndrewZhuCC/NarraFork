@@ -1,6 +1,17 @@
 {
 	"mode": "ts-owned-db-compatibility",
+	"strategyStage": "transition",
+	"transitionalStrategy": true,
+	"targetMode": "pure-go-db-management",
 	"mainSchemaOwner": "typescript-drizzle",
+	"targetMainSchemaOwner": "go",
+	"currentRepairOwner": "typescript-drizzle-and-ts-fts-setup",
+	"futureGoResponsibilities": [
+		"main schema migrations",
+		"startup backfills and repair",
+		"FTS/search lifecycle",
+		"schema drift fixtures and release gates"
+	],
 	"goMainMigrations": false,
 	"goEnsureColumns": false,
 	"goFtsRepair": false,

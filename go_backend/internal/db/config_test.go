@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func TestNewConfigDefaultsToSQLiteTSOwnedDatabase(t *testing.T) {
+func TestNewConfigDefaultsToReadOnlySQLiteTSOwnedDatabase(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 
@@ -18,8 +18,8 @@ func TestNewConfigDefaultsToSQLiteTSOwnedDatabase(t *testing.T) {
 	if cfg.Engine != EngineSQLite || cfg.SQLitePath != wantPath {
 		t.Fatalf("unexpected sqlite default config: %#v want path %q", cfg, wantPath)
 	}
-	if !cfg.VerifyCanonical || !cfg.TSOwnedSchema || cfg.SQLiteBootstrapMode != SQLiteBootstrapModeBunFinalCompatible {
-		t.Fatalf("sqlite default should bootstrap and verify Bun-final-compatible TS-owned schema: %#v", cfg)
+	if !cfg.VerifyCanonical || !cfg.TSOwnedSchema || cfg.SQLiteBootstrapMode != SQLiteBootstrapModeReadOnly {
+		t.Fatalf("sqlite default should verify read-only TS-owned schema: %#v", cfg)
 	}
 	if cfg.MaxOpenConns != 1 || cfg.MaxIdleConns != 1 || cfg.ConnMaxLifetime != 0 {
 		t.Fatalf("unexpected sqlite pool defaults: %#v", cfg)

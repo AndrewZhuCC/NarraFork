@@ -63,7 +63,7 @@ import {
 	useMcpExternalServerManagementCapability,
 	useMcpServerSettingsStorageCapability,
 	useMcpTransportsCapability,
-	useProviderRuntimeCapability,
+	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
 
 import { useProjects } from "../../hooks/useProjects";
@@ -84,6 +84,7 @@ import {
 } from "../../hooks/useSkills";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
+import { filterUnsupportedMcpImportTransports } from "../../lib/mcp-import";
 
 export const Route = createFileRoute("/routines/")({
 	component: RoutinesPage,
@@ -1618,7 +1619,7 @@ function McpToolsTab() {
 	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
 	const mcpExternalServerManagementCapability = useMcpExternalServerManagementCapability();
 	const mcpTransportCapability = useMcpTransportsCapability();
-	const kiroCapability = useProviderRuntimeCapability("kiro");
+	const kiroMcpToolsRoute = useProviderRouteCapability("kiro", "mcpTools");
 	const showMcpServerSettingsStorageWarning =
 		mcpServerSettingsStorageCapability.supported === false;
 	const mcpServerManagementSupported = mcpExternalServerManagementCapability.supported;
@@ -1631,7 +1632,7 @@ function McpToolsTab() {
 		mcpServerManagementSupported && mcpExternalServerManagementCapability.permissions !== false;
 	const mcpServerImportSupported =
 		mcpServerManagementSupported && mcpExternalServerManagementCapability.import !== false;
-	const kiroMcpToolsListSupported = kiroCapability?.mcp?.listToolsRoute !== false;
+	const kiroMcpToolsListSupported = kiroMcpToolsRoute.supported;
 	const mcpServerImportUnsupportedReason = mcpServerImportSupported
 		? undefined
 		: mcpServerManagementFallbackReason;
@@ -1693,9 +1694,29 @@ function McpToolsTab() {
 			setImportError(t("mcpImportInvalidJson"));
 			return;
 		}
-		importMutation.mutate(parsed, {
+		const filtered = filterUnsupportedMcpImportTransports(parsed);
+		if (filtered.skippedUnsupportedTransport > 0) {
+			console.warn("Skipped MCP servers with unsupported transport during import", {
+				count: filtered.skippedUnsupportedTransport,
+			});
+		}
+		const formatImportResult = (added: number, skipped: number) => {
+			const totalSkipped = skipped + filtered.skippedUnsupportedTransport;
+			const base = t("mcpImportSuccess", { added, skipped: totalSkipped });
+			if (filtered.skippedUnsupportedTransport === 0) return base;
+			return `${base} ${t("mcpImportSkippedUnsupportedTransport", {
+				count: filtered.skippedUnsupportedTransport,
+			})}`;
+		};
+		if (filtered.allRecognizedServersSkipped) {
+			setImportResult(formatImportResult(0, 0));
+			setImportError(null);
+			setImportJson("");
+			return;
+		}
+		importMutation.mutate(filtered.json, {
 			onSuccess: (data) => {
-				setImportResult(t("mcpImportSuccess", { added: data.added, skipped: data.skipped }));
+				setImportResult(formatImportResult(data.added, data.skipped));
 				setImportError(null);
 				setImportJson("");
 			},
