@@ -35,6 +35,18 @@ func TestDeleteNarratorRemovesArchivedRow(t *testing.T) {
 	}
 }
 
+func TestDeleteNarratorRejectsNonArchivedBeforeMutation(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodDelete, "/narrators/"+narratorID)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected delete 400 for non-archived narrator, got %d body=%s", w.Code, w.Body.String())
+	}
+	assertRowCount(t, sqlDB, `SELECT COUNT(*) FROM narrators WHERE id = 'nar_test'`, 1)
+}
+
 func TestRemoveNarratorDeletesArchivedChildTree(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

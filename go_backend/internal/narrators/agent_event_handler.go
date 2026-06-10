@@ -40,6 +40,9 @@ type agentRunState struct {
 	goalTurnStartedAt      time.Time
 	goalTokenUsageBaseline *agentbasic.UsageSnapshot
 	lastTokenUsage         *agentbasic.UsageSnapshot
+	lastContextPercent     *float64
+	lastMeterUsage         *float64
+	lastMeterUnit          string
 	pendingApiRequestIDs   []string
 	apiRequests            map[string]apiRequestRunState
 	streamedBytes          int
@@ -87,6 +90,15 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		return nil
 	case "context_usage":
 		state.lastTokenUsage = mergeUsageSnapshot(state.lastTokenUsage, event.Usage)
+		if pct := contextPercentFromEvent(event); pct > 0 {
+			state.lastContextPercent = &pct
+		}
+		return nil
+	case "metering":
+		if usage := floatFromMetadata(event.Metadata, "usage"); usage > 0 {
+			state.lastMeterUsage = &usage
+			state.lastMeterUnit = strings.TrimSpace(stringFromMetadata(event.Metadata, "unit"))
+		}
 		return nil
 	case "quota_balance":
 		s.persistCustomApiQuotaBalance(
@@ -232,6 +244,18 @@ func (s *Service) persistAPIRequestEvent(ctx context.Context, state *agentRunSta
 		durationMs = time.Since(request.StartedAt).Milliseconds()
 	}
 	usage := event.Usage
+	contextPercent := contextPercentFromEvent(event)
+	if contextPercent <= 0 {
+		contextPercent = floatFromMetadata(event.Metadata, "contextPercent")
+	}
+	meterUsage := firstPositiveFloat(
+		floatFromMetadata(event.Metadata, "meterUsage"),
+		floatFromMetadata(event.Metadata, "meter_usage"),
+	)
+	meterUnit := firstNonEmptyString(
+		stringFromMetadata(event.Metadata, "meterUnit"),
+		stringFromMetadata(event.Metadata, "meter_unit"),
+	)
 	messageID := ""
 	if state.draftMessageID != nil {
 		messageID = strings.TrimSpace(*state.draftMessageID)
@@ -254,9 +278,9 @@ func (s *Service) persistAPIRequestEvent(ctx context.Context, state *agentRunSta
 		"ttft_ms":                     nullablePositiveInt64(int64FromMetadata(event.Metadata, "ttftMs")),
 		"duration_ms":                 nullablePositiveInt64(durationMs),
 		"cost_usd":                    nullableCostForUsage(usage, provider, model),
-		"context_percent":             nullablePositiveFloat(event.Percentage),
-		"meter_usage":                 nullablePositiveFloat(floatFromMetadata(event.Metadata, "meterUsage")),
-		"meter_unit":                  nullableTrimmedString(stringFromMetadata(event.Metadata, "meterUnit")),
+		"context_percent":             nullablePositiveFloat(contextPercent),
+		"meter_usage":                 nullablePositiveFloat(meterUsage),
+		"meter_unit":                  nullableTrimmedString(meterUnit),
 		"error_message":               nullableTrimmedString(event.Message),
 		"raw_dump_json":               s.apiRequestRawDumpJSON(event),
 		"created_at":                  db.NowISO(),
@@ -380,11 +404,14 @@ func (s *Service) updateAssistantMessageUsage(ctx context.Context, state *agentR
 		"reasoning_tokens":            usageReasoningTokens(usage),
 		"cost_usd":                    nullableCostForUsage(usage, provider, model),
 		"duration_ms":                 nullablePositiveInt64(time.Since(state.goalTurnStartedAt).Milliseconds()),
+		"context_percent":             nullableFloatPtr(state.lastContextPercent),
+		"meter_usage":                 nullableFloatPtr(state.lastMeterUsage),
+		"meter_unit":                  nullableTrimmedString(state.lastMeterUnit),
 		"turn_usage_json":             usageTurnJSON(usage),
 	}
 	sets := []string{}
 	args := []any{}
-	for _, column := range []string{"provider", "credential_id", "model", "tokens_in", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "reasoning_tokens", "cost_usd", "duration_ms", "turn_usage_json"} {
+	for _, column := range []string{"provider", "credential_id", "model", "tokens_in", "output_tokens", "cached_input_tokens", "cache_creation_input_tokens", "cache_creation_5m_tokens", "cache_creation_1h_tokens", "reasoning_tokens", "cost_usd", "duration_ms", "context_percent", "meter_usage", "meter_unit", "turn_usage_json"} {
 		if !columns[column] {
 			continue
 		}
@@ -500,6 +527,50 @@ func nullablePositiveInt64(value int64) any {
 func nullablePositiveFloat(value float64) any {
 	if value <= 0 {
 		return nil
+	}
+	return value
+}
+
+func nullableFloatPtr(value *float64) any {
+	if value == nil || *value <= 0 {
+		return nil
+	}
+	return *value
+}
+
+func firstPositiveFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func contextPercentFromEvent(event agentbasic.AgentEvent) float64 {
+	if event.Percentage > 0 {
+		return clampPercent(event.Percentage)
+	}
+	return contextPercentForUsage(event.Usage)
+}
+
+func contextPercentForUsage(usage *agentbasic.UsageSnapshot) float64 {
+	if usage == nil || usage.ContextWindow <= 0 {
+		return 0
+	}
+	inputTokens := usage.PromptTokens
+	if inputTokens == 0 {
+		inputTokens = usage.InputTokens
+	}
+	if inputTokens <= 0 {
+		return 0
+	}
+	return clampPercent(float64(inputTokens) / float64(usage.ContextWindow) * 100)
+}
+
+func clampPercent(value float64) float64 {
+	if value > 100 {
+		return 100
 	}
 	return value
 }
@@ -695,12 +766,10 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 		payload["cacheCreation1hTokens"] = event.Usage.CacheCreation1hTokens
 		payload["contextWindow"] = event.Usage.ContextWindow
 		payload["isEstimated"] = event.Usage.Estimated
-		if event.Type == "context_usage" && event.Percentage == 0 && event.Usage.ContextWindow > 0 {
-			inputTokens := event.Usage.PromptTokens
-			if inputTokens == 0 {
-				inputTokens = event.Usage.InputTokens
+		if event.Type == "context_usage" && event.Percentage == 0 {
+			if pct := contextPercentForUsage(event.Usage); pct > 0 {
+				payload["percentage"] = pct
 			}
-			payload["percentage"] = float64(inputTokens) / float64(event.Usage.ContextWindow) * 100
 		}
 	}
 	if event.Percentage != 0 {
@@ -1169,6 +1238,24 @@ func (s *Service) latestRunNarrator(ctx context.Context, state *agentRunState) N
 	return state.narrator
 }
 
+func (s *Service) finishAgentRunReviewReset(ctx context.Context, state *agentRunState, message string) error {
+	msg, err := s.addMessage(ctx, state.narratorID, "user", message, nil)
+	if err != nil {
+		return err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "user_message", "narratorId": state.narratorID, "message": msg})
+	}
+	if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'working', substatus = '["calling_model"]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID); err != nil {
+		return err
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.narrator.IsBackground})
+	}
+	s.scheduleNarratorRetry(state.narratorID)
+	return nil
+}
+
 func (s *Service) backgroundRunParent(ctx context.Context, state *agentRunState, latest Narrator) (string, bool) {
 	if latest.ParentNarratorID == nil || strings.TrimSpace(*latest.ParentNarratorID) == "" {
 		if state.narrator.ParentNarratorID == nil || strings.TrimSpace(*state.narrator.ParentNarratorID) == "" {
@@ -1207,10 +1294,9 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 	if state.narrator.ChapterID != nil {
 		if isReview, reset, message := s.checkAndResetReviewGitState(ctx, *state.narrator.ChapterID); isReview {
 			if reset && strings.TrimSpace(message) != "" {
-				_, _ = s.addMessage(ctx, state.narratorID, "user", message, nil)
-			} else if !reset {
-				_ = s.concludeReviewChapter(ctx, *state.narrator.ChapterID)
+				return s.finishAgentRunReviewReset(ctx, state, message)
 			}
+			_ = s.concludeReviewChapter(ctx, *state.narrator.ChapterID)
 		}
 	}
 	latest := s.latestRunNarrator(ctx, state)

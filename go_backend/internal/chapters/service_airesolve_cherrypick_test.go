@@ -69,6 +69,7 @@ func TestAIResolveCherryPickConflictReturnsFallbackWithoutNarratorSideEffectsAnd
 	if errText, _ := result["error"].(string); !strings.Contains(errText, "Go basic AI resolver cannot continue") {
 		t.Fatalf("fallback error = %q, want Go basic AI resolver cannot continue", errText)
 	}
+	assertAIResolveCompatibilityContract(t, result, "cherry-pick-conflict-fallback", "merge.aiResolveCherryPickFallback")
 	mergeResult, ok := result["mergeResult"].(map[string]any)
 	if !ok {
 		t.Fatalf("mergeResult missing or wrong type: %#v", result)

@@ -14,7 +14,7 @@
 		},
 		"canonicalSchemaContract": {
 			"path": "db/canonical_schema_contract.json",
-			"schemaHash": "bbd4ac3d4e26e7b61aed9210823885a6f8266c38a3be19abc63248d22a3d02f9"
+			"schemaHash": "f3e7b5804163136f42ae0f0f3499fd8c6fcba520e34dec7b8d24c721c52dbbe7"
 		},
 		"roundtripFixture": {
 			"path": "db/roundtrip_fixture.json"

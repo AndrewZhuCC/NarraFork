@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { KiroMcpClient } from "../../../kiro/mcp-client";
 import type { ToolContext, ToolDefinition } from "../../types";
+import { askUserQuestionTool } from "../ask-user-question";
 import { bashTool } from "../bash";
 import {
 	BlockAnchorReplacer,
@@ -1125,7 +1126,6 @@ describe("Agent tool rawJsonSchema", () => {
 // All tools with rawJsonSchema — parity with Zod schema
 // ============================================================
 
-import { askUserQuestionTool } from "../ask-user-question";
 import { awaitTool } from "../await";
 import { endPipelineTool, startPipelineTool } from "../pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "../plan-mode";

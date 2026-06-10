@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,6 +103,164 @@ func TestDiscardAllRemovesTrackedChangesAndUntrackedDirectories(t *testing.T) {
 	if status != "" {
 		t.Fatalf("expected clean worktree after discard all, got %q", status)
 	}
+}
+
+func TestGitReadPrependsNoOptionalLocks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-script fake git helper is unix-only")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.txt")
+	fakeGit := filepath.Join(dir, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$GIT_ARGS_LOG\"\n"), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GIT_ARGS_LOG", logPath)
+
+	svc := &Service{Timeout: 5 * time.Second}
+	if _, err := svc.gitRead(context.Background(), "", "status", "--porcelain=v1"); err != nil {
+		t.Fatalf("gitRead: %v", err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake git args: %v", err)
+	}
+	if got, want := string(data), "--no-optional-locks\nstatus\n--porcelain=v1\n"; got != want {
+		t.Fatalf("fake git args = %q, want %q", got, want)
+	}
+}
+
+func TestStatusSummaryIncludesLineStatsForStagedUnstagedAndUntracked(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGitTest(t, repo, "init")
+	runGitTest(t, repo, "checkout", "-b", "main")
+	runGitTest(t, repo, "config", "user.name", "Test User")
+	runGitTest(t, repo, "config", "user.email", "test@example.com")
+	writeGitTestFile(t, repo, "tracked.txt", "base\nremove\n")
+	runGitTest(t, repo, "add", ".")
+	runGitTest(t, repo, "commit", "-m", "base")
+
+	writeGitTestFile(t, repo, "tracked.txt", "base\nstaged\n")
+	runGitTest(t, repo, "add", "tracked.txt")
+	writeGitTestFile(t, repo, "tracked.txt", "base\nstaged\nunstaged\n")
+	writeGitTestFile(t, repo, "new.txt", "one\ntwo")
+
+	svc := &Service{Timeout: 5 * time.Second}
+	summary, err := svc.StatusSummary(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("status summary: %v", err)
+	}
+	if summary.LinesAdded != 4 || summary.LinesRemoved != 1 {
+		t.Fatalf("summary lines = +%d -%d, want +4 -1", summary.LinesAdded, summary.LinesRemoved)
+	}
+	if summary.Staged != 1 || summary.Unstaged != 1 || summary.Untracked != 1 {
+		t.Fatalf("summary counts staged=%d unstaged=%d untracked=%d, want 1/1/1", summary.Staged, summary.Unstaged, summary.Untracked)
+	}
+	tracked := statusFileByPath(summary.Files, "tracked.txt")
+	if tracked == nil {
+		t.Fatalf("tracked file missing from status summary: %#v", summary.Files)
+	}
+	if tracked.LinesAdded != 2 || tracked.LinesRemoved != 1 || tracked.StagedLinesAdded != 1 || tracked.StagedLinesRemoved != 1 || tracked.UnstagedLinesAdded != 1 || tracked.UnstagedLinesRemoved != 0 {
+		t.Fatalf("tracked stats = %#v, want staged +1/-1 and unstaged +1/-0", *tracked)
+	}
+	untracked := statusFileByPath(summary.Files, "new.txt")
+	if untracked == nil {
+		t.Fatalf("untracked file missing from status summary: %#v", summary.Files)
+	}
+	if untracked.LinesAdded != 2 || untracked.LinesRemoved != 0 || untracked.UnstagedLinesAdded != 2 || untracked.UnstagedLinesRemoved != 0 {
+		t.Fatalf("untracked stats = %#v, want +2/-0", *untracked)
+	}
+}
+
+func TestFileDiffShowsUntrackedFileAsNewFile(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initDiscardTestRepo(t)
+	writeGitTestFile(t, repo, "new-file.txt", "hello\nworld\n")
+
+	svc := &Service{Timeout: 5 * time.Second}
+	result, err := svc.FileDiff(context.Background(), repo, "new-file.txt", false)
+	if err != nil {
+		t.Fatalf("file diff: %v", err)
+	}
+	diff, _ := result["diff"].(string)
+	if result["truncated"] != false || !strings.Contains(diff, "+hello") || !strings.Contains(diff, "+world") {
+		t.Fatalf("unexpected untracked diff result: %#v", result)
+	}
+}
+
+func TestLogIncludesTSCompatibleFields(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initDiscardTestRepo(t)
+
+	svc := &Service{Timeout: 5 * time.Second}
+	commits, err := svc.Log(context.Background(), repo, 1)
+	if err != nil {
+		t.Fatalf("log: %v", err)
+	}
+	if len(commits) != 1 {
+		t.Fatalf("expected one commit, got %#v", commits)
+	}
+	commit := commits[0]
+	if commit.SHA == "" || commit.ShortSHA == "" || commit.Message != "base" || commit.Author != "Test User" || commit.Date == "" {
+		t.Fatalf("log entry missing TS-compatible fields: %#v", commit)
+	}
+}
+
+func TestGitWriteMethodsUsePerWorktreeLock(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := initDiscardTestRepo(t)
+	writeGitTestFile(t, repo, "queued.txt", "queued\n")
+
+	unlock := acquireWorktreeLock(repo)
+	done := make(chan error, 1)
+	svc := &Service{Timeout: 5 * time.Second}
+	go func() {
+		done <- svc.StageAll(context.Background(), repo)
+	}()
+
+	select {
+	case err := <-done:
+		unlock()
+		if err != nil {
+			t.Fatalf("stage all returned before lock release with error: %v", err)
+		}
+		t.Fatalf("stage all returned before per-worktree lock was released")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	unlock()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stage all after lock release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("stage all did not finish after per-worktree lock release")
+	}
+
+	status := runGitTest(t, repo, "status", "--porcelain")
+	if status != "A  queued.txt\n" {
+		t.Fatalf("unexpected status after locked stage all: %q", status)
+	}
+}
+
+func statusFileByPath(files []StatusFile, path string) *StatusFile {
+	for i := range files {
+		if files[i].Path == path {
+			return &files[i]
+		}
+	}
+	return nil
 }
 
 func runGitTest(t *testing.T, cwd string, args ...string) string {

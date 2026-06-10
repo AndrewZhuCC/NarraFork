@@ -68,8 +68,11 @@ type NarratorSyncProvider interface {
 }
 
 type streamingSnapshot struct {
-	StreamingBlocks []map[string]any
-	ToolChunks      map[string]map[string]any
+	StreamingBlocks  []map[string]any
+	ToolChunks       map[string]map[string]any
+	NKPQueuePosition *int
+	NKPQueueDepth    *int
+	QueueMessage     string
 }
 
 type client struct {
@@ -472,6 +475,10 @@ func (h *Hub) broadcastTerminalCountForNarrator(ctx context.Context, narratorID 
 }
 
 func (h *Hub) BroadcastMergeProgress(payload any) {
+	h.BroadcastProjectEvent(payload)
+}
+
+func (h *Hub) BroadcastProjectEvent(payload any) {
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return
@@ -2238,7 +2245,7 @@ func mapValue(value any) map[string]any {
 func (h *Hub) sendStreamingSnapshot(c *client, narratorID string) {
 	h.mu.RLock()
 	snap := h.streamingSnapshots[narratorID]
-	if snap == nil || (len(snap.StreamingBlocks) == 0 && len(snap.ToolChunks) == 0) {
+	if snap == nil {
 		h.mu.RUnlock()
 		return
 	}
@@ -2247,8 +2254,44 @@ func (h *Hub) sendStreamingSnapshot(c *client, narratorID string) {
 	for _, chunk := range snap.ToolChunks {
 		chunks = append(chunks, cloneMap(chunk))
 	}
+	var queuePosition *int
+	if snap.NKPQueuePosition != nil {
+		position := *snap.NKPQueuePosition
+		queuePosition = &position
+	}
+	var queueDepth *int
+	if snap.NKPQueueDepth != nil {
+		depth := *snap.NKPQueueDepth
+		queueDepth = &depth
+	}
+	queueMessage := snap.QueueMessage
 	h.mu.RUnlock()
-	c.sendJSON(map[string]any{"type": "streaming_snapshot", "narratorId": narratorID, "streamingBlocks": blocks, "toolChunks": chunks})
+
+	hasStreaming := len(blocks) > 0 || len(chunks) > 0
+	hasQueue := queuePosition != nil && *queuePosition > 0
+	hasQueueMessage := queueMessage != ""
+	if !hasStreaming && !hasQueue && !hasQueueMessage {
+		return
+	}
+	if hasStreaming {
+		c.sendJSON(map[string]any{"type": "streaming_snapshot", "narratorId": narratorID, "streamingBlocks": blocks, "toolChunks": chunks})
+	}
+	if hasQueueMessage {
+		payload := map[string]any{"type": "queue_status", "narratorId": narratorID, "queueMessage": queueMessage}
+		if queuePosition != nil {
+			payload["position"] = *queuePosition
+		}
+		if queueDepth != nil {
+			payload["queueDepth"] = *queueDepth
+		}
+		c.sendJSON(payload)
+	} else if hasQueue {
+		depth := 0
+		if queueDepth != nil {
+			depth = *queueDepth
+		}
+		c.sendJSON(map[string]any{"type": "nkp_queue_status", "narratorId": narratorID, "position": *queuePosition, "queueDepth": depth})
+	}
 }
 
 func (h *Hub) recordStreamingSnapshotLocked(narratorID string, payload map[string]any) {
@@ -2358,6 +2401,23 @@ func (h *Hub) recordStreamingSnapshotLocked(narratorID string, payload map[strin
 		if snap := h.streamingSnapshots[narratorID]; snap != nil && toolUseID != "" {
 			delete(snap.ToolChunks, toolUseID)
 		}
+	case "nkp_queue_status":
+		snap := h.getOrCreateStreamingSnapshotLocked(narratorID)
+		if position, ok := optionalInt(payload["position"]); ok {
+			snap.NKPQueuePosition = intPtr(position)
+		}
+		if queueDepth, ok := optionalInt(payload["queueDepth"]); ok {
+			snap.NKPQueueDepth = intPtr(queueDepth)
+		}
+	case "queue_status":
+		snap := h.getOrCreateStreamingSnapshotLocked(narratorID)
+		if position, ok := optionalInt(payload["position"]); ok {
+			snap.NKPQueuePosition = intPtr(position)
+		}
+		if queueDepth, ok := optionalInt(payload["queueDepth"]); ok {
+			snap.NKPQueueDepth = intPtr(queueDepth)
+		}
+		snap.QueueMessage = stringValue(payload["queueMessage"])
 	case "block_complete":
 		block := mapValue(payload["block"])
 		if snap := h.streamingSnapshots[narratorID]; snap != nil && block != nil {
@@ -2711,6 +2771,10 @@ func stringFromAny(v any) string {
 		return s
 	}
 	return ""
+}
+
+func intPtr(value int) *int {
+	return &value
 }
 
 func optionalInt(v any) (int, bool) {

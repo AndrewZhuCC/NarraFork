@@ -5,11 +5,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -78,6 +80,37 @@ func TestCommitRouteReturnsErrorWhenMetadataUpdateFails(t *testing.T) {
 	}
 }
 
+func TestResetRouteRefreshesChapterHeadMetadata(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	baseSHA := runGitRoutesGit(t, repo, "rev-parse", "HEAD")
+	writeGitRoutesFile(t, repo, "file.txt", "second\n")
+	runGitRoutesGit(t, repo, "commit", "-am", "second change")
+	secondSHA := runGitRoutesGit(t, repo, "rev-parse", "HEAD")
+	if secondSHA == baseSHA {
+		t.Fatalf("test setup did not create a second commit")
+	}
+	insertGitRoutesChapter(t, database, "c1", repo)
+	if _, err := database.Exec(`UPDATE chapters SET commit_count = 2 WHERE id = 'c1'`); err != nil {
+		t.Fatalf("seed commit count: %v", err)
+	}
+
+	body := serveGitRoutesRequest(t, NewHandler(database, gitx.NewService()), http.MethodPost, "/c1/git/reset", `{"target":"`+baseSHA+`","mode":"hard"}`)
+	if body["hasChanges"] != false {
+		t.Fatalf("reset response should include clean status summary: %#v", body)
+	}
+
+	var head sql.NullString
+	var count int
+	if err := database.QueryRow(`SELECT head_commit_sha, commit_count FROM chapters WHERE id = 'c1'`).Scan(&head, &count); err != nil {
+		t.Fatalf("select chapter metadata: %v", err)
+	}
+	if !head.Valid || head.String != baseSHA || count != 1 {
+		t.Fatalf("expected reset to refresh chapter metadata to %s/1, got head=%#v count=%d", baseSHA, head, count)
+	}
+}
+
 func TestStatusDiffAndLogRoutesReturnFrontendShapes(t *testing.T) {
 	requireGit(t)
 	database := newGitRoutesTestDB(t)
@@ -97,10 +130,19 @@ func TestStatusDiffAndLogRoutesReturnFrontendShapes(t *testing.T) {
 	if diff["diff"] == "" || diff["truncated"] != false {
 		t.Fatalf("diff response missing diff/truncated contract: %#v", diff)
 	}
+	writeGitRoutesFile(t, repo, "new-file.txt", "new\n")
+	untrackedDiff := serveGitRoutesRequest(t, NewHandler(database, gitx.NewService()), http.MethodGet, "/c1/git/diff?file=new-file.txt", "")
+	if text, _ := untrackedDiff["diff"].(string); !strings.Contains(text, "+new") || untrackedDiff["truncated"] != false {
+		t.Fatalf("untracked diff should match TS new-file shape: %#v", untrackedDiff)
+	}
 
 	log := serveGitRoutesArrayRequest(t, NewHandler(database, gitx.NewService()), http.MethodGet, "/c1/git/log?limit=5")
-	if len(log) == 0 || log[0].(map[string]any)["sha"] == "" {
+	if len(log) == 0 {
 		t.Fatalf("log response should be a commit array: %#v", log)
+	}
+	entry := log[0].(map[string]any)
+	if entry["sha"] == "" || entry["shortSha"] == "" || entry["author"] == "" || entry["date"] == "" {
+		t.Fatalf("log response missing TS-compatible fields: %#v", entry)
 	}
 }
 
@@ -232,22 +274,36 @@ func TestAICommitMessageFallbackAndGeneratorPath(t *testing.T) {
 
 	oldGenerate := generateCommitMessage
 	t.Cleanup(func() { generateCommitMessage = oldGenerate })
-	generateCommitMessage = func(_ context.Context, _ *config.Store, model, _, prompt, cwd string) (string, error) {
-		called = true
-		if model == "" || prompt == "" || cwd != repo {
-			t.Fatalf("unexpected generator args model=%q promptEmpty=%v cwd=%q", model, prompt == "", cwd)
-		}
-		return "\"fix: update file\"\nextra", nil
-	}
 
 	t.Setenv("HOME", t.TempDir())
 	settings, err := config.Load()
 	if err != nil {
 		t.Fatalf("load settings: %v", err)
 	}
+	if _, err := settings.Patch(map[string]any{"agent": map[string]any{"defaultModel": "openai:default-model", "summaryModel": "openai:summary-model"}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	generateCommitMessage = func(_ context.Context, gotSettings *config.Store, model, _, prompt, cwd string) (string, error) {
+		called = true
+		if gotSettings != settings || model != "openai:summary-model" || prompt == "" || cwd != repo {
+			t.Fatalf("unexpected generator args settings=%p model=%q promptEmpty=%v cwd=%q", gotSettings, model, prompt == "", cwd)
+		}
+		return "\"fix: update file\"\nextra", nil
+	}
+
 	realBody := serveGitRoutesRequest(t, NewHandler(database, gitx.NewService(), settings), http.MethodPost, "/c1/git/ai-commit-message", `{}`)
 	if !called || realBody["message"] != "fix: update file" {
 		t.Fatalf("real provider body=%#v called=%v", realBody, called)
+	}
+
+	called = false
+	generateCommitMessage = func(context.Context, *config.Store, string, string, string, string) (string, error) {
+		called = true
+		return "", errors.New("provider unavailable")
+	}
+	w := serveGitRoutesRecorder(t, NewHandler(database, gitx.NewService(), settings), http.MethodPost, "/c1/git/ai-commit-message", `{}`)
+	if !called || w.Code != http.StatusInternalServerError {
+		t.Fatalf("provider error should propagate with 500, called=%v status=%d body=%s", called, w.Code, w.Body.String())
 	}
 }
 

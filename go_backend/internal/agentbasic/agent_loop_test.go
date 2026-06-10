@@ -2,7 +2,10 @@ package agentbasic
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +16,11 @@ type scriptedAdapter struct {
 	turns           [][]StreamEvent
 	chatErrors      []error
 	chatCalls       int
+	chatParams      []ChatParams
+	buildInputs     [][]Message
+	buildModels     []string
+	injectPrompts   []string
+	injectModels    []string
 	pushedUsers     int
 	pushedAssist    int
 	lastToolResult  []any
@@ -21,17 +29,23 @@ type scriptedAdapter struct {
 
 func (a *scriptedAdapter) ProviderName() string                { return "fake" }
 func (a *scriptedAdapter) FormatTools(string) []map[string]any { return nil }
-func (a *scriptedAdapter) BuildHistory(messages []Message, _ string, _ string) (BuiltHistory, error) {
+func (a *scriptedAdapter) BuildHistory(messages []Message, model string, _ string) (BuiltHistory, error) {
+	a.buildInputs = append(a.buildInputs, append([]Message(nil), messages...))
+	a.buildModels = append(a.buildModels, model)
 	history := make([]any, 0, len(messages))
 	for _, message := range messages {
 		history = append(history, message)
 	}
 	return BuiltHistory{History: history}, nil
 }
-func (a *scriptedAdapter) InjectSystemPrompt(*BuiltHistory, string, string, string) {}
+func (a *scriptedAdapter) InjectSystemPrompt(_ *BuiltHistory, systemPrompt string, model string, _ string) {
+	a.injectPrompts = append(a.injectPrompts, systemPrompt)
+	a.injectModels = append(a.injectModels, model)
+}
 func (a *scriptedAdapter) Chat(ctx context.Context, params ChatParams) (<-chan StreamEvent, error) {
 	call := a.chatCalls
 	a.chatCalls++
+	a.chatParams = append(a.chatParams, cloneChatParams(params))
 	if call < len(a.chatErrors) && a.chatErrors[call] != nil {
 		return nil, a.chatErrors[call]
 	}
@@ -51,6 +65,20 @@ func (a *scriptedAdapter) Chat(ctx context.Context, params ChatParams) (<-chan S
 	}()
 	return ch, nil
 }
+
+func cloneChatParams(params ChatParams) ChatParams {
+	cloned := params
+	if params.History != nil {
+		history := *params.History
+		history.History = append([]any(nil), params.History.History...)
+		history.TrailingToolResults = append([]any(nil), params.History.TrailingToolResults...)
+		cloned.History = &history
+	}
+	cloned.Tools = append([]map[string]any(nil), params.Tools...)
+	cloned.ToolResults = append([]any(nil), params.ToolResults...)
+	return cloned
+}
+
 func (a *scriptedAdapter) FormatToolResult(toolUseID string, output string, isError bool) any {
 	return map[string]any{"type": "tool_result", "tool_use_id": toolUseID, "content": output, "is_error": isError}
 }
@@ -300,6 +328,165 @@ func TestBeforeTurnHookErrorEmitsErrorWithoutProviderRequest(t *testing.T) {
 	}
 }
 
+func TestBeforeTurnReplacementHookRebuildsHistoryAndSystemPrompt(t *testing.T) {
+	call := newFunctionToolCall("replace-tool", "Read", `{"file_path":"a.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "final"}}},
+	}}
+	replacementPrompt := "replacement system"
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "original"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithBeforeTurnReplacementHook(func(turnIndex int) (*BeforeTurnReplacement, error) {
+				if turnIndex != 1 {
+					return nil, nil
+				}
+				return &BeforeTurnReplacement{
+					Messages:     []Message{{Role: "user", Content: "replacement"}},
+					SystemPrompt: &replacementPrompt,
+				}, nil
+			}),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{Output: "tool output"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	if events[len(events)-1].Type != "done" || adapter.chatCalls != 2 {
+		t.Fatalf("expected two turns and done, calls=%d events=%#v", adapter.chatCalls, eventTypes(events))
+	}
+	if len(adapter.buildInputs) < 2 || len(adapter.buildInputs[1]) != 1 || adapter.buildInputs[1][0].Content != "replacement" {
+		t.Fatalf("replacement hook did not rebuild from replacement messages: %#v", adapter.buildInputs)
+	}
+	if len(adapter.injectPrompts) < 2 || adapter.injectPrompts[1] != replacementPrompt {
+		t.Fatalf("replacement system prompt was not injected: %#v", adapter.injectPrompts)
+	}
+	secondHistory := adapter.chatParams[1].History
+	if secondHistory == nil || len(secondHistory.History) != 1 {
+		t.Fatalf("second request should use rebuilt history, got %#v", secondHistory)
+	}
+	message, ok := secondHistory.History[0].(Message)
+	if !ok || message.Content != "replacement" || adapter.chatParams[1].SystemPrompt != replacementPrompt {
+		t.Fatalf("second request did not use replacement history/system prompt: params=%#v", adapter.chatParams[1])
+	}
+}
+
+func TestBeforeTurnReplacementHookErrorEmitsError(t *testing.T) {
+	call := newFunctionToolCall("replace-error-tool", "Read", `{"file_path":"a.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{call}}}},
+		{{Parsed: ParsedStreamEvent{Text: "unused"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "use tool"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithBeforeTurnReplacementHook(func(turnIndex int) (*BeforeTurnReplacement, error) {
+				if turnIndex == 1 {
+					return nil, errors.New("replacement failed")
+				}
+				return nil, nil
+			}),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				return ToolRun{Output: "tool output"}, nil
+			}),
+		),
+	)
+	events := collectEvents(stream)
+	if adapter.chatCalls != 1 {
+		t.Fatalf("provider should not be called after replacement error, got %d calls", adapter.chatCalls)
+	}
+	if events[len(events)-1].Type != "error" || events[len(events)-1].Message != "replacement failed" {
+		t.Fatalf("expected replacement error event, got %#v", events)
+	}
+}
+
+func TestRuntimeSettingsOverrideSwitchesModelAndReasoningBeforeNextTurn(t *testing.T) {
+	requestBodies := []map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requestBodies = append(requestBodies, body)
+		w.Header().Set("Content-Type", "application/json")
+		if len(requestBodies) == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "runtime-tool", "type": "function", "function": map[string]any{"name": "Read", "arguments": `{"file_path":"a.txt"}`}}}}}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "final"}}},
+		})
+	}))
+	defer server.Close()
+	store := testConfigStore(t, map[string]any{
+		"openaiProviders": []any{map[string]any{
+			"prefix":       "openai",
+			"apiKey":       "test-key",
+			"baseUrl":      server.URL,
+			"defaultModel": "gpt-5-mini",
+		}},
+	})
+	reasoning := "xhigh"
+	stream, err := RunAgentLoop(
+		context.Background(),
+		store,
+		"openai:gpt-5-mini",
+		[]Message{{Role: "user", Content: "use tool"}},
+		t.TempDir(),
+		WithMaxTurns(2),
+		WithRetryBaseDelay(0),
+		WithRuntimeSettingsOverrideHook(func(turnIndex int) (*RuntimeSettingsOverride, error) {
+			if turnIndex != 1 {
+				return nil, nil
+			}
+			return &RuntimeSettingsOverride{Model: "openai:gpt-5-test-2", ReasoningEffort: &reasoning}, nil
+		}),
+		WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+			return ToolRun{Output: "tool output"}, nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("RunAgentLoop returned error: %v", err)
+	}
+	events := collectEvents(stream)
+	if len(requestBodies) != 2 {
+		t.Fatalf("expected two provider requests, got %d events=%#v", len(requestBodies), eventTypes(events))
+	}
+	if requestBodies[0]["model"] != "gpt-5-mini" || requestBodies[1]["model"] != "gpt-5-test-2" {
+		t.Fatalf("unexpected request models: %#v", requestBodies)
+	}
+	if requestBodies[1]["reasoning_effort"] != "high" {
+		t.Fatalf("expected second request reasoning effort to be high, got %#v", requestBodies[1]["reasoning_effort"])
+	}
+	var switched *AgentEvent
+	for i := range events {
+		if events[i].Type == "model_switched" {
+			switched = &events[i]
+			break
+		}
+	}
+	if switched == nil || switched.ModelSwitched == nil || switched.ModelSwitched.Model != "gpt-5-test-2" || switched.ModelSwitched.Provider != "openai" || switched.ModelSwitched.ReasoningEffort != "xhigh" || switched.ModelSwitched.Cause != "turn" {
+		t.Fatalf("expected model_switched event for runtime override, got %#v", events)
+	}
+	if events[len(events)-1].Type != "done" {
+		t.Fatalf("expected done, got %#v", eventTypes(events))
+	}
+}
+
 func TestShouldStopHookStopsAfterToolsWithoutDoneOrError(t *testing.T) {
 	call := newFunctionToolCall("stop-tool", "Read", `{"file_path":"a.txt"}`)
 	adapter := &scriptedAdapter{turns: [][]StreamEvent{
@@ -543,7 +730,9 @@ func TestRunAgentLoopFlushesPartialTextBeforeError(t *testing.T) {
 func TestRunAgentLoopMapsProviderLifecycleEvents(t *testing.T) {
 	percentage := 42.0
 	adapter := &scriptedAdapter{turns: [][]StreamEvent{{
-		{Parsed: ParsedStreamEvent{ContextUsagePercentage: &percentage, Usage: &UsageSnapshot{PromptTokens: 10}}},
+		{Parsed: ParsedStreamEvent{CredentialID: "cred-live"}},
+		{Parsed: ParsedStreamEvent{ContextUsagePercentage: &percentage, Usage: &UsageSnapshot{PromptTokens: 10, ContextWindow: 100}}},
+		{Parsed: ParsedStreamEvent{Metering: &MeteringSnapshot{Unit: "request", UnitPlural: "requests", Usage: 3}}},
 		{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{ID: "ws-1", Status: "completed", Query: "query", Final: true}}},
 		{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: "img-1", Status: "completed", RevisedPrompt: "prompt", Result: "base64", Final: true}}},
 		{Parsed: ParsedStreamEvent{OutputTruncated: "truncated"}},
@@ -554,10 +743,25 @@ func TestRunAgentLoopMapsProviderLifecycleEvents(t *testing.T) {
 	}}}
 	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter}, []Message{{Role: "user", Content: "lifecycle"}}, t.TempDir(), normalizeGenerateOptions(WithRetryBaseDelay(0)))
 	events := collectEvents(stream)
-	for _, want := range []string{"context_usage", "web_search", "image_generation", "output_truncated", "model_switched", "api_request_start", "api_request_end"} {
+	for _, want := range []string{"context_usage", "metering", "web_search", "image_generation", "output_truncated", "model_switched", "api_request_start", "api_request_end"} {
 		if eventTypeCount(events, want) == 0 {
 			t.Fatalf("expected %s event, got %#v", want, eventTypes(events))
 		}
+	}
+	var requestEnd *AgentEvent
+	for i := range events {
+		if events[i].Type == "api_request_end" && events[i].RequestID != "req-1" {
+			requestEnd = &events[i]
+		}
+	}
+	if requestEnd == nil {
+		t.Fatalf("expected loop-owned api_request_end, got %#v", events)
+	}
+	if requestEnd.CredentialID != "cred-live" || requestEnd.Percentage != percentage || requestEnd.Usage == nil || requestEnd.Usage.PromptTokens != 10 {
+		t.Fatalf("api_request_end should carry credential/context/usage telemetry, got %#v", requestEnd)
+	}
+	if requestEnd.Metadata["meterUsage"] != float64(3) || requestEnd.Metadata["meterUnit"] != "request" {
+		t.Fatalf("api_request_end should carry metering telemetry, got %#v", requestEnd.Metadata)
 	}
 }
 

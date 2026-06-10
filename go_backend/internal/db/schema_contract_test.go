@@ -34,7 +34,7 @@ func TestCanonicalSchemaContractReportFreezesTSOwnedDBMode(t *testing.T) {
 	if report.GoJournalTable != goMigrationJournalTable || report.DrizzleJournalTable != "__drizzle_migrations" {
 		t.Fatalf("unexpected migration journal contract: %#v", report)
 	}
-	if report.CanonicalTableCount == 0 || report.CanonicalIndexCount == 0 || report.CanonicalForeignKeyCount == 0 || report.CanonicalFTSTableCount != 3 || report.CanonicalFTSTriggerCount == 0 {
+	if report.CanonicalTableCount == 0 || report.CanonicalIndexCount == 0 || report.CanonicalColumnMetadataCount == 0 || report.CanonicalForeignKeyCount == 0 || report.CanonicalFTSTableCount != 3 || report.CanonicalFTSTriggerCount == 0 {
 		t.Fatalf("contract report should expose canonical object counts: %#v", report)
 	}
 }

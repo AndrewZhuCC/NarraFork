@@ -45,6 +45,14 @@ var generateCommitMessage = func(ctx context.Context, settings *config.Store, mo
 	return result.Text, nil
 }
 
+func summaryCommitModel(settings *config.Store) string {
+	if settings == nil {
+		return ""
+	}
+	core := settings.Core()
+	return strings.TrimSpace(core.Agent.SummaryModel)
+}
+
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/{chapterId}/git/status", httpx.Handler(h.status))
 	r.Post("/{chapterId}/git/stage", httpx.Handler(h.stage))
@@ -278,6 +286,7 @@ func (h *Handler) reset(w http.ResponseWriter, r *http.Request) error {
 	if err := h.Git.Reset(r.Context(), worktree, body.Target, body.Mode); err != nil {
 		return err
 	}
+	_ = h.syncChapterHeadMetadata(r.Context(), chi.URLParam(r, "chapterId"), worktree)
 	h.broadcastGitStatus(r.Context(), chi.URLParam(r, "chapterId"), worktree, "reset")
 	return h.status(w, r)
 }
@@ -297,10 +306,7 @@ func (h *Handler) aiCommitMessage(w http.ResponseWriter, r *http.Request) error 
 	}
 
 	message := "chore: update files"
-	model := ""
-	if h.Settings != nil {
-		model = strings.TrimSpace(h.Settings.Core().Agent.DefaultModel)
-	}
+	model := summaryCommitModel(h.Settings)
 	if model != "" {
 		systemPrompt := `You are a git commit message generator. Given a git diff, generate a concise commit message following the Conventional Commits format.
 Rules:
@@ -313,10 +319,11 @@ Rules:
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		generated, genErr := generateCommitMessage(ctx, h.Settings, model, systemPrompt, "<diff>\n"+diff+"\n</diff>", worktree)
-		if genErr == nil {
-			if cleaned := sanitizeCommitMessage(generated); cleaned != "" && len(cleaned) <= 200 {
-				message = cleaned
-			}
+		if genErr != nil {
+			return genErr
+		}
+		if cleaned := sanitizeCommitMessage(generated); cleaned != "" && len(cleaned) <= 200 {
+			message = cleaned
 		}
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"message": message})
@@ -445,6 +452,23 @@ func (h *Handler) recordCommit(ctx context.Context, chapterID, worktree, sha, fa
 		}
 	}
 	_, err := h.DB.ExecContext(ctx, `UPDATE chapters SET head_commit_sha = ?, commit_count = ?, updated_at = ? WHERE id = ?`, nullableString(sha), count, now, chapterID)
+	return err
+}
+
+func (h *Handler) syncChapterHeadMetadata(ctx context.Context, chapterID, worktree string) error {
+	chapterID = strings.TrimSpace(chapterID)
+	if h.DB == nil || h.Git == nil || chapterID == "" {
+		return nil
+	}
+	head, err := h.Git.HeadCommit(ctx, worktree)
+	if err != nil {
+		return err
+	}
+	count, err := h.Git.CommitCount(ctx, worktree)
+	if err != nil {
+		return err
+	}
+	_, err = h.DB.ExecContext(ctx, `UPDATE chapters SET head_commit_sha = ?, commit_count = ?, updated_at = ? WHERE id = ?`, nullableString(head), count, db.NowISO(), chapterID)
 	return err
 }
 

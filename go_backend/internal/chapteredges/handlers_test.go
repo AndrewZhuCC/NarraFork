@@ -120,6 +120,52 @@ func TestCreateChapterEdgeRejectsDuplicates(t *testing.T) {
 	}
 }
 
+func TestDependencyEdgeCreateDeleteBroadcastsTSCompatibleLifecycleEvents(t *testing.T) {
+	sqlDB := openChapterEdgeTestDB(t)
+	defer sqlDB.Close()
+	events := []map[string]any{}
+	syncedProjects := []string{}
+	handler := NewHandler(sqlDB)
+	handler.BroadcastDependencyEvent = func(payload any) {
+		event, ok := payload.(map[string]any)
+		if !ok {
+			t.Fatalf("dependency event payload should be an object, got %#v", payload)
+		}
+		events = append(events, event)
+	}
+	handler.SyncProjectDBAfterDependencyChange = func(projectID string) {
+		syncedProjects = append(syncedProjects, projectID)
+	}
+	router := chapterEdgeTestRouterWithHandler(handler)
+
+	create := performChapterEdgeRequest(router, http.MethodPost, "/", `{"sourceId":"chapter-a","targetId":"chapter-b","type":"dependency"}`)
+	if create.Code != http.StatusCreated {
+		t.Fatalf("expected dependency edge create to succeed, got %d: %s", create.Code, create.Body.String())
+	}
+	edgeID := stringBodyValue(t, create, "id")
+	assertDependencyLifecycleEvent(t, events, 0, map[string]any{
+		"type":      "dependency:created",
+		"edgeId":    edgeID,
+		"projectId": "project-1",
+		"sourceId":  "chapter-a",
+		"targetId":  "chapter-b",
+	})
+	assertSyncedProject(t, syncedProjects, 0, "project-1")
+
+	deleteResp := performChapterEdgeRequest(router, http.MethodDelete, "/"+edgeID, "")
+	if deleteResp.Code != http.StatusOK {
+		t.Fatalf("expected dependency edge delete to succeed, got %d: %s", deleteResp.Code, deleteResp.Body.String())
+	}
+	assertDependencyLifecycleEvent(t, events, 1, map[string]any{
+		"type":      "dependency:removed",
+		"edgeId":    edgeID,
+		"projectId": "project-1",
+		"sourceId":  "chapter-a",
+		"targetId":  "chapter-b",
+	})
+	assertSyncedProject(t, syncedProjects, 1, "project-1")
+}
+
 func TestChapterEdgeManualOperationsOnlyAllowDependency(t *testing.T) {
 	sqlDB := openChapterEdgeTestDB(t)
 	defer sqlDB.Close()
@@ -222,8 +268,12 @@ func openChapterEdgeTestDB(t *testing.T) *sql.DB {
 }
 
 func chapterEdgeTestRouter(sqlDB *sql.DB) http.Handler {
+	return chapterEdgeTestRouterWithHandler(NewHandler(sqlDB))
+}
+
+func chapterEdgeTestRouterWithHandler(handler *Handler) http.Handler {
 	router := chi.NewRouter()
-	NewHandler(sqlDB).RegisterRoutes(router)
+	handler.RegisterRoutes(router)
 	return router
 }
 
@@ -254,6 +304,32 @@ func stringBodyValue(t *testing.T, w *httptest.ResponseRecorder, key string) str
 		t.Fatalf("response missing string %q: %#v", key, body)
 	}
 	return value
+}
+
+func assertDependencyLifecycleEvent(t *testing.T, events []map[string]any, index int, want map[string]any) {
+	t.Helper()
+	if len(events) <= index {
+		t.Fatalf("expected dependency lifecycle event %d, got %#v", index, events)
+	}
+	got := events[index]
+	for key, wantValue := range want {
+		if got[key] != wantValue {
+			t.Fatalf("event %d %s = %#v, want %#v; event=%#v", index, key, got[key], wantValue, got)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("event %d should only contain TS-compatible fields plus projectId, got %#v", index, got)
+	}
+}
+
+func assertSyncedProject(t *testing.T, projects []string, index int, want string) {
+	t.Helper()
+	if len(projects) <= index {
+		t.Fatalf("expected project DB sync %d for %q, got %#v", index, want, projects)
+	}
+	if projects[index] != want {
+		t.Fatalf("project DB sync %d = %q, want %q; all=%#v", index, projects[index], want, projects)
+	}
 }
 
 func assertNullStringValue(t *testing.T, sqlDB *sql.DB, query, want string) {

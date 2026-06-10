@@ -125,6 +125,34 @@ type reviewRequest struct {
 	AnchorCommitSHA *string  `json:"anchorCommitSha"`
 	AxisOffset      *float64 `json:"axisOffset"`
 	CrossOffset     *float64 `json:"crossOffset"`
+	AutoStart       *bool    `json:"autoStart"`
+}
+
+const reviewAutoStartDisabledFallbackCode = "REVIEW_AUTO_START_DISABLED"
+
+func reviewCreateResponse(chapter Chapter, autoStartRequested bool) map[string]any {
+	data, _ := json.Marshal(chapter)
+	payload := map[string]any{}
+	_ = json.Unmarshal(data, &payload)
+	payload["reviewRuntime"] = map[string]any{
+		"autoStartRequested": autoStartRequested,
+		"autoStartSession":   false,
+		"startMode":          "seed-message-only",
+	}
+	if autoStartRequested {
+		payload["fallbackCode"] = reviewAutoStartDisabledFallbackCode
+		payload["fallbacks"] = []map[string]any{
+			{
+				"code":             reviewAutoStartDisabledFallbackCode,
+				"feature":          "review.autoStartSession",
+				"requested":        true,
+				"autoStartSession": false,
+				"startMode":        "seed-message-only",
+				"reason":           "Go review creation seeds the review prompt/messages but does not auto-start a full TypeScript-equivalent narrator session.",
+			},
+		}
+	}
+	return payload
 }
 
 type batchMergeRequest struct {
@@ -661,7 +689,8 @@ func (h *Handler) createReview(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusCreated, chapter)
+	autoStartRequested := req.AutoStart != nil && *req.AutoStart
+	httpx.WriteJSON(w, http.StatusCreated, reviewCreateResponse(chapter, autoStartRequested))
 	return nil
 }
 

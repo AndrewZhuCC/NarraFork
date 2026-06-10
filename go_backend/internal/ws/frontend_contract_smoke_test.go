@@ -44,6 +44,7 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "stream_text", "text": "cached", "outputIndex": 0})
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "tool_call", "toolUseId": "tool-cached", "toolName": "Read", "input": map[string]any{"file_path": "README.md"}, "streamStartedAt": int64(1770000000000)})
 	h.BroadcastNarrator("narrator-1", map[string]any{"type": "tool_use_chunk", "toolUseId": "tool-cached", "toolName": "Read", "inputCharsTotal": 42, "streamingField": map[string]any{"name": "file_path", "delta": "README.md"}})
+	h.BroadcastNarrator("narrator-1", map[string]any{"type": "queue_status", "position": 2, "queueDepth": 5, "queueMessage": "queued behind gateway"})
 
 	h.handleMessage(c, map[string]any{"type": "subscribe", "narratorIds": []any{"narrator-1"}, "lastMessageId": "msg-0"})
 
@@ -66,6 +67,11 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	chunk := toolChunks[0].(map[string]any)
 	if chunk["toolUseId"] != "tool-cached" || intNumber(chunk["inputCharsTotal"]) != 42 || chunk["started"] != true || intNumber(chunk["streamStartedAt"]) != 1770000000000 {
 		t.Fatalf("streaming_snapshot should preserve tool_use_chunk state: %#v", chunk)
+	}
+
+	queueStatus := readWSMessage(t, wsClient)
+	if queueStatus["type"] != "queue_status" || queueStatus["narratorId"] != "narrator-1" || intNumber(queueStatus["position"]) != 2 || intNumber(queueStatus["queueDepth"]) != 5 || queueStatus["queueMessage"] != "queued behind gateway" {
+		t.Fatalf("unexpected queue_status replay payload: %#v", queueStatus)
 	}
 
 	catchUp := readWSMessage(t, wsClient)
@@ -145,6 +151,19 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	toolCompleted := readWSMessage(t, wsClient)
 	if legacyTool["type"] != "tool_result" || toolCompleted["type"] != "tool_completed" || toolCompleted["toolUseId"] != "tool-1" {
 		t.Fatalf("unexpected tool compatibility frames: %#v %#v", legacyTool, toolCompleted)
+	}
+}
+
+func TestFrontendUseNarratorWSContractSubscribeReplaysNKPQueueStatus(t *testing.T) {
+	h, c, wsClient := newNarratorHubClient(t)
+	defer wsClient.Close()
+
+	h.BroadcastNarrator("narrator-queue", map[string]any{"type": "nkp_queue_status", "position": 3, "queueDepth": 9})
+	h.handleMessage(c, map[string]any{"type": "subscribe", "narratorIds": []any{"narrator-queue"}})
+
+	replay := readWSMessage(t, wsClient)
+	if replay["type"] != "nkp_queue_status" || replay["narratorId"] != "narrator-queue" || intNumber(replay["position"]) != 3 || intNumber(replay["queueDepth"]) != 9 {
+		t.Fatalf("unexpected nkp_queue_status replay payload: %#v", replay)
 	}
 }
 

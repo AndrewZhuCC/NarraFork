@@ -82,7 +82,8 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	cleanupUploads, _ := cleanup["uploads"].(map[string]any)
 	cleanupWorktrees, _ := cleanup["worktrees"].(map[string]any)
 	cleanupContainers, _ := cleanup["containers"].(map[string]any)
-	if vnet["supported"] != true || vnet["ws"] != true || vnet["mode"] != "relay" || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != true || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true || cleanupContainers["supported"] != false || cleanupContainers["fallback"] != true {
+	gatewayRuntime, _ := gateway["runtimeContract"].(map[string]any)
+	if vnet["supported"] != true || vnet["ws"] != true || vnet["mode"] != "relay" || update["manualOnly"] != true || terminal["multiClientResizeMode"] != "last-input-client" || gateway["persistentRuntimes"] != false || gateway["persistentRuntimeRoutes"] != true || gatewayRuntime["statusRouteFallbackPayload"] != true || weixinQR["supported"] != false || weixinQR["code"] != "WEIXIN_QR_UNSUPPORTED" || vacuum["supported"] != false || cleanupUploads["supported"] != true || cleanupWorktrees["supported"] != false || cleanupWorktrees["fallback"] != true || cleanupContainers["supported"] != false || cleanupContainers["fallback"] != true {
 		t.Fatalf("unexpected capability contract: %#v", capabilities)
 	}
 	reason, _ := weixinQR["reason"].(string)
@@ -95,7 +96,13 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	if cleanupReason, _ := cleanupWorktrees["reason"].(string); cleanupReason != "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent." {
 		t.Fatalf("unexpected cleanup worktrees reason: %#v", cleanupWorktrees)
 	}
-	if cleanupContainersReason, _ := cleanupContainers["reason"].(string); cleanupContainersReason != "Podman prune is disabled from storage cleanup in go_backend; use per-chapter container controls or an external maintenance command." {
+	if cleanupWorktrees["runtimeRerouteAvailable"] != true || cleanupWorktrees["runtimeRerouteTarget"] != "runtime.cleanup.worktrees" {
+		t.Fatalf("unexpected cleanup worktrees reroute contract: %#v", cleanupWorktrees)
+	}
+	if cleanupContainers["runtimeRerouteAvailable"] != false || cleanupContainers["runtimeRerouteTarget"] != "runtime.cleanup.containers" {
+		t.Fatalf("unexpected cleanup containers reroute contract: %#v", cleanupContainers)
+	}
+	if cleanupContainersReason, _ := cleanupContainers["reason"].(string); cleanupContainersReason != "Podman prune is disabled from storage cleanup in go_backend; keep storage cleanup disabled and use per-chapter container controls or explicit runtime cleanup instead of automatic storage-side reroute." {
 		t.Fatalf("unexpected cleanup containers reason: %#v", cleanupContainers)
 	}
 	if applyReason, _ := updateApply["reason"].(string); applyReason != "Automatic self-update requires a configured restart handoff manager and a regular current executable." {

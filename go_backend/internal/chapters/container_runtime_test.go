@@ -419,6 +419,250 @@ func TestWakeUnpausesContainersAndBroadcasts(t *testing.T) {
 	}
 }
 
+func TestDormantWakeRealGitWorktreeRemoveRecreatePreservesBranchFiles(t *testing.T) {
+	database := openContainerRuntimeDB(t)
+	createChapterCommitTableForCreateLifecycle(t, database)
+	repo := newForkParityRepo(t)
+	branch := "chapter/realistic-dormant-wake"
+	worktree := filepath.Join(repo, ".worktrees", "realistic-dormant-wake")
+	runGit(t, repo, "branch", branch)
+	runGit(t, repo, "worktree", "add", worktree, branch)
+	if err := os.MkdirAll(filepath.Join(worktree, "pkg", "feature"), 0o755); err != nil {
+		t.Fatalf("mkdir realistic worktree content: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "pkg", "feature", "story.txt"), []byte("chapter content\n"), 0o644); err != nil {
+		t.Fatalf("write realistic worktree content: %v", err)
+	}
+	runGit(t, worktree, "add", ".")
+	runGit(t, worktree, "commit", "-m", "add realistic dormant wake content")
+	branchHead := strings.TrimSpace(runGitChapterTest(t, worktree, "rev-parse", "HEAD"))
+	commitCount := gitCommitCountForTest(t, worktree)
+	if _, err := database.Exec(`INSERT INTO projects (id, name, git_path, default_branch, created_at, updated_at) VALUES ('p1', 'Project', ?, 'master', 'now', 'now')`, repo); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, worktree_path, base_branch, head_commit_sha, commit_count, is_root, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('c1', 'p1', 'Realistic Dormant Wake', 'active', 'branch', ?, ?, 'master', ?, ?, 0, 0, 0, 0, 0, 'now', 'now')`, branch, worktree, branchHead, commitCount); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	service := &Service{DB: database, Git: gitx.NewService()}
+
+	if err := service.Dormant(context.Background(), "c1"); err != nil {
+		t.Fatalf("Dormant: %v", err)
+	}
+	if _, err := os.Stat(worktree); !os.IsNotExist(err) {
+		t.Fatalf("dormant should remove worktree %s, stat err=%v", worktree, err)
+	}
+	if head := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", branch)); head != branchHead {
+		t.Fatalf("branch head after dormant = %s, want %s", head, branchHead)
+	}
+	var dormantStatus string
+	var dormantWorktree sql.NullString
+	if err := database.QueryRow(`SELECT status, worktree_path FROM chapters WHERE id = 'c1'`).Scan(&dormantStatus, &dormantWorktree); err != nil {
+		t.Fatalf("query dormant chapter: %v", err)
+	}
+	if dormantStatus != "dormant" || dormantWorktree.Valid {
+		t.Fatalf("chapter after dormant = %s/%#v, want dormant/null", dormantStatus, dormantWorktree)
+	}
+
+	if err := service.Wake(context.Background(), "c1"); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(worktree, "pkg", "feature", "story.txt")); err != nil {
+		t.Fatalf("wake should recreate tracked nested file: %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(worktree, "pkg", "feature", "story.txt")); err != nil || string(content) != "chapter content\n" {
+		t.Fatalf("recreated nested file content = %q err=%v", string(content), err)
+	}
+	if head := strings.TrimSpace(runGitChapterTest(t, worktree, "rev-parse", "HEAD")); head != branchHead {
+		t.Fatalf("worktree head after wake = %s, want %s", head, branchHead)
+	}
+	if status := strings.TrimSpace(runGitChapterTest(t, worktree, "status", "--porcelain")); status != "" {
+		t.Fatalf("wake recreated worktree should be clean, status=%q", status)
+	}
+	var activeStatus string
+	var activeWorktree string
+	var syncedHead sql.NullString
+	var syncedCount int
+	if err := database.QueryRow(`SELECT status, worktree_path, head_commit_sha, commit_count FROM chapters WHERE id = 'c1'`).Scan(&activeStatus, &activeWorktree, &syncedHead, &syncedCount); err != nil {
+		t.Fatalf("query woken chapter: %v", err)
+	}
+	if activeStatus != "active" || activeWorktree != worktree || !syncedHead.Valid || syncedHead.String != branchHead || syncedCount != commitCount {
+		t.Fatalf("chapter after wake = status:%s worktree:%s head:%#v count:%d", activeStatus, activeWorktree, syncedHead, syncedCount)
+	}
+	var commitRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'c1'`).Scan(&commitRows); err != nil {
+		t.Fatalf("count wake-synced commits: %v", err)
+	}
+	if commitRows != commitCount {
+		t.Fatalf("wake-synced commits = %d, want %d", commitRows, commitCount)
+	}
+}
+
+func TestWakeSyncsCommitsAfterWokenBroadcast(t *testing.T) {
+	database := openContainerRuntimeDB(t)
+	createChapterCommitTableForCreateLifecycle(t, database)
+	repo, worktree := newContainerLifecycleWorktree(t, false)
+	insertContainerLifecycleChapter(t, database, repo, "", "dormant", `{}`)
+	recorder := &chapterBroadcastRecorder{}
+	service := &Service{
+		DB:                     database,
+		Git:                    gitx.NewService(),
+		BroadcastMergeProgress: recorder.BroadcastMergeProgress,
+	}
+
+	if err := service.Wake(context.Background(), "c1"); err != nil {
+		t.Fatalf("Wake: %v", err)
+	}
+	if !recorder.hasGlobalEvent("chapter:woken") {
+		t.Fatalf("missing woken lifecycle event before/with commit sync: %#v", recorder.globalEvents)
+	}
+	expectedHead := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "chapter/test"))
+	var message, source string
+	if err := database.QueryRow(`SELECT message, source FROM chapter_commits WHERE chapter_id = 'c1' AND sha = ?`, expectedHead).Scan(&message, &source); err != nil {
+		t.Fatalf("query wake-synced head commit: %v", err)
+	}
+	if message != "add compose" || source != "manual" {
+		t.Fatalf("wake-synced commit fields = message:%q source:%q", message, source)
+	}
+	var head sql.NullString
+	var count int
+	if err := database.QueryRow(`SELECT head_commit_sha, commit_count FROM chapters WHERE id = 'c1'`).Scan(&head, &count); err != nil {
+		t.Fatalf("query wake-synced chapter metadata: %v", err)
+	}
+	expectedCount := gitCommitCountForTest(t, worktree)
+	if !head.Valid || head.String != expectedHead || count != expectedCount {
+		t.Fatalf("wake-synced chapter metadata = head:%#v count:%d, want %s/%d", head, count, expectedHead, expectedCount)
+	}
+}
+
+func TestWakeCommitSyncFailureIsNonFatalAfterWokenBroadcast(t *testing.T) {
+	database := openContainerRuntimeDB(t)
+	createChapterCommitTableForCreateLifecycle(t, database)
+	if _, err := database.Exec(`CREATE TRIGGER fail_wake_commit_sync BEFORE INSERT ON chapter_commits BEGIN SELECT RAISE(ABORT, 'wake commit sync blocked'); END;`); err != nil {
+		t.Fatalf("create sync failure trigger: %v", err)
+	}
+	repo, worktree := newContainerLifecycleWorktree(t, false)
+	insertContainerLifecycleChapter(t, database, repo, "", "dormant", `{}`)
+	recorder := &chapterBroadcastRecorder{}
+	service := &Service{
+		DB:                     database,
+		Git:                    gitx.NewService(),
+		BroadcastMergeProgress: recorder.BroadcastMergeProgress,
+	}
+
+	if err := service.Wake(context.Background(), "c1"); err != nil {
+		t.Fatalf("Wake should survive commit sync failure: %v", err)
+	}
+	if !recorder.hasGlobalEvent("chapter:woken") {
+		t.Fatalf("missing woken lifecycle event after sync failure: %#v", recorder.globalEvents)
+	}
+	if _, err := os.Stat(worktree); err != nil {
+		t.Fatalf("wake should still recreate worktree after sync failure: %v", err)
+	}
+	var status string
+	var worktreePath sql.NullString
+	if err := database.QueryRow(`SELECT status, worktree_path FROM chapters WHERE id = 'c1'`).Scan(&status, &worktreePath); err != nil {
+		t.Fatalf("query chapter after sync failure: %v", err)
+	}
+	if status != "active" || !worktreePath.Valid || worktreePath.String != worktree {
+		t.Fatalf("chapter after sync failure = %s/%#v, want active/%s", status, worktreePath, worktree)
+	}
+	var rows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'c1'`).Scan(&rows); err != nil {
+		t.Fatalf("count synced commits after failure: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("commit rows after sync failure = %d, want 0", rows)
+	}
+}
+
+func TestDormantRoutePausesContainersAndReturnsUpdatedChapter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake podman script uses POSIX sh")
+	}
+	database := openContainerRuntimeDB(t)
+	repo, worktree := newContainerLifecycleWorktree(t, true)
+	insertContainerLifecycleChapter(t, database, repo, worktree, "active", `{"ports":[{"containerPort":8080,"serviceName":"web"}]}`)
+	if _, err := database.Exec(`INSERT INTO container_instances (id, chapter_id, service_name, status, host_port, container_port, created_at, updated_at) VALUES ('container-1', 'c1', 'web', 'running', 18080, 8080, 'now', 'now')`); err != nil {
+		t.Fatalf("seed container instance: %v", err)
+	}
+	logPath := prependRecordingPodman(t)
+	recorder := &chapterBroadcastRecorder{}
+	service := &Service{DB: database, Git: gitx.NewService(), BroadcastMergeProgress: recorder.BroadcastMergeProgress}
+	handler := NewHandler(service, recorder)
+
+	recorderHTTP := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/c1/dormant", nil)
+	newChapterRouter(handler).ServeHTTP(recorderHTTP, req)
+	if recorderHTTP.Code != http.StatusOK {
+		t.Fatalf("dormant route status = %d body=%s", recorderHTTP.Code, recorderHTTP.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorderHTTP.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode dormant response: %v", err)
+	}
+	if body["status"] != "dormant" || body["worktreePath"] != nil {
+		t.Fatalf("dormant route body = %#v, want dormant/null worktree", body)
+	}
+	var containerStatus string
+	if err := database.QueryRow(`SELECT status FROM container_instances WHERE id = 'container-1'`).Scan(&containerStatus); err != nil {
+		t.Fatalf("query route container status: %v", err)
+	}
+	if containerStatus != "paused" {
+		t.Fatalf("route container status = %s, want paused", containerStatus)
+	}
+	commands := readTextFile(t, logPath)
+	if !strings.Contains(commands, " pause") {
+		t.Fatalf("dormant route podman commands did not include pause:\n%s", commands)
+	}
+	if !recorder.hasGlobalEvent("container:paused") || !recorder.hasGlobalEvent("chapter:dormant") {
+		t.Fatalf("dormant route missing lifecycle events: %#v", recorder.globalEvents)
+	}
+}
+
+func TestWakeRouteUnpausesContainersAndReturnsUpdatedChapter(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake podman script uses POSIX sh")
+	}
+	database := openContainerRuntimeDB(t)
+	repo, worktree := newContainerLifecycleWorktree(t, false)
+	insertContainerLifecycleChapter(t, database, repo, "", "dormant", `{"ports":[{"containerPort":8080,"serviceName":"web"}]}`)
+	if _, err := database.Exec(`INSERT INTO container_instances (id, chapter_id, service_name, status, container_port, created_at, updated_at) VALUES ('container-1', 'c1', 'web', 'paused', 8080, 'now', 'now')`); err != nil {
+		t.Fatalf("seed paused container: %v", err)
+	}
+	logPath := prependRecordingPodman(t)
+	recorder := &chapterBroadcastRecorder{}
+	service := &Service{DB: database, Git: gitx.NewService(), BroadcastMergeProgress: recorder.BroadcastMergeProgress}
+	handler := NewHandler(service, recorder)
+
+	recorderHTTP := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/c1/wake", nil)
+	newChapterRouter(handler).ServeHTTP(recorderHTTP, req)
+	if recorderHTTP.Code != http.StatusOK {
+		t.Fatalf("wake route status = %d body=%s", recorderHTTP.Code, recorderHTTP.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorderHTTP.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode wake response: %v", err)
+	}
+	if body["status"] != "active" || body["worktreePath"] != worktree {
+		t.Fatalf("wake route body = %#v, want active/%s", body, worktree)
+	}
+	commands := readTextFile(t, logPath)
+	if !strings.Contains(commands, " unpause") || strings.Contains(commands, " up -d") {
+		t.Fatalf("wake route unpause success should not fresh-start containers:\n%s", commands)
+	}
+	var containerStatus string
+	if err := database.QueryRow(`SELECT status FROM container_instances WHERE id = 'container-1'`).Scan(&containerStatus); err != nil {
+		t.Fatalf("query route unpaused container: %v", err)
+	}
+	if containerStatus != "running" {
+		t.Fatalf("route container status after wake = %s, want running", containerStatus)
+	}
+	if !recorder.hasGlobalEvent("container:resumed") || !recorder.hasGlobalEvent("chapter:woken") {
+		t.Fatalf("wake route missing lifecycle events: %#v", recorder.globalEvents)
+	}
+}
+
 func TestWakeUnpauseFailureFallsBackToFreshStart(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake podman script uses POSIX sh")
@@ -880,6 +1124,61 @@ func TestContainerListReturnsArrayWhenPodmanMissing(t *testing.T) {
 	}
 	if len(body) != 1 || body[0]["serviceName"] != "web" || body[0]["status"] != "running" {
 		t.Fatalf("container list body = %#v", body)
+	}
+}
+
+func TestContainerMutationFallbacksDoNotMutateOrBroadcastWhenPodmanMissing(t *testing.T) {
+	database := openContainerRuntimeDB(t)
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, "compose.yml"), []byte("services:\n  web:\n    image: test\n"), 0o644); err != nil {
+		t.Fatalf("write compose: %v", err)
+	}
+	insertContainerRuntimeProjectAndChapter(t, database, worktree, `{"ports":[{"containerPort":8080,"serviceName":"web"}]}`, "")
+	if _, err := database.Exec(`INSERT INTO container_instances (id, chapter_id, service_name, status, host_port, container_port, created_at, updated_at) VALUES ('container-1', 'c1', 'web', 'running', 18080, 8080, 'now', 'now')`); err != nil {
+		t.Fatalf("insert persisted container: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO port_allocations (port, chapter_id, service_name, allocated_at) VALUES (18080, 'c1', 'web', 'now')`); err != nil {
+		t.Fatalf("insert port allocation: %v", err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	recorder := &chapterBroadcastRecorder{}
+	router := newChapterRouter(NewHandler(&Service{DB: database}, recorder))
+
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/c1/containers/start"},
+		{method: http.MethodPost, path: "/c1/containers/stop"},
+		{method: http.MethodPost, path: "/c1/containers/remove"},
+		{method: http.MethodGet, path: "/c1/containers/logs"},
+	}
+	for _, tc := range cases {
+		recorderHTTP := httptest.NewRecorder()
+		router.ServeHTTP(recorderHTTP, httptest.NewRequest(tc.method, tc.path, nil))
+		if recorderHTTP.Code != http.StatusOK {
+			t.Fatalf("%s %s status = %d, body = %s", tc.method, tc.path, recorderHTTP.Code, recorderHTTP.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(recorderHTTP.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode %s %s body: %v", tc.method, tc.path, err)
+		}
+		if body["fallback"] != true || body["code"] != "PODMAN_NOT_FOUND" || body["supported"] != false || body["reason"] == "" {
+			t.Fatalf("%s %s fallback body = %#v", tc.method, tc.path, body)
+		}
+	}
+
+	var status string
+	if err := database.QueryRow(`SELECT status FROM container_instances WHERE id = 'container-1'`).Scan(&status); err != nil {
+		t.Fatalf("query persisted container status: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("missing-Podman fallbacks should not mutate container status, got %s", status)
+	}
+	assertContainerRuntimeCount(t, database, `SELECT COUNT(*) FROM container_instances WHERE chapter_id = 'c1'`, 1)
+	assertContainerRuntimeCount(t, database, `SELECT COUNT(*) FROM port_allocations WHERE chapter_id = 'c1'`, 1)
+	if events := recorder.snapshotGlobalEvents(); len(events) != 0 {
+		t.Fatalf("missing-Podman fallbacks should not broadcast lifecycle success/error events: %#v", events)
 	}
 }
 

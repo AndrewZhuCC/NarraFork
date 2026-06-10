@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -741,9 +741,212 @@ rl.on("line", (line) => {
 	);
 }
 
+const gitPanelFixtureChapterId = "c_search_fixture";
+const gitPanelFixtureBaseTag = "git-panel-base";
+
+function gitPanelFixtureRepoPath(home: string): string {
+	return join(home, "git-panel-fixture-repo");
+}
+
+function projectCreateFixtureRepoPath(home: string): string {
+	return join(home, "project-create-fixture-repo");
+}
+
+function chapterCreateFixtureRepoPath(home: string): string {
+	return join(home, "chapter-create-fixture-repo");
+}
+
+function chapterDormantWakeFixtureRepoPath(home: string): string {
+	return join(home, "chapter-dormant-wake-fixture-repo");
+}
+
+function chapterDormantWakeFixtureWorktreePath(home: string): string {
+	return join(chapterDormantWakeFixtureRepoPath(home), ".worktrees", "dormant-wake-fixture");
+}
+
+function projectDeleteFixtureRepoPath(home: string): string {
+	return join(home, "project-delete-fixture-repo");
+}
+
+function projectRealCleanupWarningRepoPath(home: string): string {
+	return join(home, "project-real-cleanup-warning-repo");
+}
+
+function projectRealCleanupWarningWorktreePath(home: string): string {
+	return join(projectRealCleanupWarningRepoPath(home), ".worktrees", "stale-non-worktree");
+}
+
+function projectDeleteFixtureWorktreePath(home: string): string {
+	return join(projectDeleteFixtureRepoPath(home), ".worktrees", "delete-branch");
+}
+
+type GitFixtureResult = { success: boolean; stdout: string; stderr: string; exitCode: number };
+
+function runGitPanelFixture(
+	repoPath: string,
+	args: string[],
+	options: { allowFailure?: boolean } = {},
+): GitFixtureResult {
+	const result = Bun.spawnSync(["git", ...args], {
+		cwd: repoPath,
+		env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const stdout = Buffer.from(result.stdout).toString("utf-8").trim();
+	const stderr = Buffer.from(result.stderr).toString("utf-8").trim();
+	const exitCode = result.exitCode ?? 0;
+	const success = exitCode === 0;
+	if (!success && !options.allowFailure) {
+		throw new Error(
+			`git fixture command failed: git ${args.join(" ")} (exit ${exitCode})\nstdout=${stdout}\nstderr=${stderr}`,
+		);
+	}
+	return { success, stdout, stderr, exitCode };
+}
+
+function gitPanelHeadCommit(repoPath: string): string {
+	return runGitPanelFixture(repoPath, ["rev-parse", "HEAD"]).stdout;
+}
+
+function ensureProjectCreateFixtureRepo(home: string): string {
+	const repoPath = projectCreateFixtureRepoPath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "project create base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed project create fixture"]);
+	writeFileSync(join(repoPath, "second.txt"), "project create second\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "second.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: add project create second commit"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	return repoPath;
+}
+
+function ensureChapterCreateFixtureRepo(home: string): string {
+	const repoPath = chapterCreateFixtureRepoPath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "chapter create base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed chapter create fixture"]);
+	writeFileSync(join(repoPath, "second.txt"), "chapter create second\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "second.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: add chapter create second commit"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	return repoPath;
+}
+
+function ensureChapterDormantWakeFixtureRepo(home: string): string {
+	const repoPath = chapterDormantWakeFixtureRepoPath(home);
+	const worktreePath = chapterDormantWakeFixtureWorktreePath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "dormant wake base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed dormant wake fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	runGitPanelFixture(repoPath, ["branch", "dormant-wake-fixture"]);
+	runGitPanelFixture(repoPath, ["worktree", "add", worktreePath, "dormant-wake-fixture"]);
+	writeFileSync(join(worktreePath, "wake.txt"), "wake branch content\n", "utf-8");
+	runGitPanelFixture(worktreePath, ["add", "wake.txt"]);
+	runGitPanelFixture(worktreePath, ["commit", "-m", "chore: add dormant wake branch commit"]);
+	return repoPath;
+}
+
+function ensureProjectRealCleanupWarningRepo(home: string): string {
+	const repoPath = projectRealCleanupWarningRepoPath(home);
+	const worktreePath = projectRealCleanupWarningWorktreePath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "project real cleanup warning base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed real cleanup warning fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	mkdirSync(worktreePath, { recursive: true });
+	return repoPath;
+}
+
+function ensureProjectDeleteFixtureRepo(home: string): string {
+	const repoPath = projectDeleteFixtureRepoPath(home);
+	const worktreePath = projectDeleteFixtureWorktreePath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "project delete base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed project delete fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	runGitPanelFixture(repoPath, ["branch", "delete-fixture"]);
+	mkdirSync(join(repoPath, ".worktrees"), { recursive: true });
+	runGitPanelFixture(repoPath, ["worktree", "add", worktreePath, "delete-fixture"]);
+	return repoPath;
+}
+
+function ensureGitPanelFixtureRepo(home: string): string {
+	const repoPath = gitPanelFixtureRepoPath(home);
+	mkdirSync(repoPath, { recursive: true });
+	if (!existsSync(join(repoPath, ".git"))) {
+		runGitPanelFixture(repoPath, ["init"]);
+	}
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	const hasHead = runGitPanelFixture(repoPath, ["rev-parse", "--verify", "HEAD"], {
+		allowFailure: true,
+	}).success;
+	if (!hasHead) {
+		writeFileSync(join(repoPath, "tracked.txt"), "base\n", "utf-8");
+		runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+		runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed git panel fixture"]);
+		runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	}
+	const hasBaseTag = runGitPanelFixture(
+		repoPath,
+		["rev-parse", "--verify", gitPanelFixtureBaseTag],
+		{ allowFailure: true },
+	).success;
+	if (!hasBaseTag) {
+		runGitPanelFixture(repoPath, ["tag", "-f", gitPanelFixtureBaseTag, "HEAD"]);
+	}
+	resetGitPanelFixture(home, { dirty: false });
+	return repoPath;
+}
+
+function resetGitPanelFixture(home: string, options: { dirty: boolean }): string {
+	const repoPath = gitPanelFixtureRepoPath(home);
+	if (!existsSync(join(repoPath, ".git"))) {
+		throw new Error(`git panel fixture repo is missing at ${repoPath}`);
+	}
+	runGitPanelFixture(repoPath, ["checkout", "-f", "-B", "main", gitPanelFixtureBaseTag]);
+	runGitPanelFixture(repoPath, ["reset", "--hard", gitPanelFixtureBaseTag]);
+	runGitPanelFixture(repoPath, ["clean", "-fd"]);
+	rmSync(join(repoPath, "notes.txt"), { force: true });
+	if (options.dirty) {
+		writeFileSync(join(repoPath, "tracked.txt"), "base\nchanged\n", "utf-8");
+		writeFileSync(join(repoPath, "notes.txt"), "new note\n", "utf-8");
+	}
+	return repoPath;
+}
+
 function seedSearchFixture(home: string): void {
 	writeMcpHelperFixture(home);
 	const projectRepo = join(home, "search-fixture-repo");
+	const gitPanelRepo = ensureGitPanelFixtureRepo(home);
+	const gitPanelHead = gitPanelHeadCommit(gitPanelRepo);
 	const fsFixtureDir = join(home, "fs-contract");
 	mkdirSync(join(fsFixtureDir, "visible"), { recursive: true });
 	mkdirSync(join(fsFixtureDir, ".hidden"), { recursive: true });
@@ -774,6 +977,9 @@ function seedSearchFixture(home: string): void {
 	try {
 		db.exec("PRAGMA busy_timeout = 5000");
 		const now = "2026-05-27T00:00:00.000Z";
+		const largeRecent = "2026-05-29T00:00:00.000Z";
+		const largeMiddle = "2026-05-28T12:00:00.000Z";
+		const largeOlder = "2026-05-26T00:00:00.000Z";
 		db.run(
 			`INSERT OR IGNORE INTO projects (id, name, description, status, flow_mode, git_path, default_branch, created_at, updated_at)
 			 VALUES (?, ?, ?, 'active', 'classic', ?, 'main', ?, ?)`,
@@ -819,6 +1025,46 @@ function seedSearchFixture(home: string): void {
 		db.run(
 			`UPDATE chapters SET start_commit_sha = ?, anchor_commit_sha = ?, axis_offset = ?, cross_offset = ? WHERE id = ?`,
 			["commit-alpha", "commit-alpha", 40, 60, "c_graph_target"],
+		);
+		for (const [chapterId, title, branch] of [
+			["c_dep_lifecycle_source", "Dependency Lifecycle Source", "dep-life-source"],
+			["c_dep_lifecycle_target", "Dependency Lifecycle Target", "dep-life-target"],
+		]) {
+			db.run(
+				`INSERT OR IGNORE INTO chapters (id, project_id, title, description, status, role, branch, base_branch, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, 'active', 'branch', ?, 'main', ?, ?)`,
+				[
+					chapterId,
+					"p_search_fixture",
+					title,
+					"Dependency lifecycle E2E contract fixture",
+					branch,
+					now,
+					now,
+				],
+			);
+		}
+		db.run(
+			`INSERT OR IGNORE INTO chapters (id, project_id, title, description, status, role, branch, base_branch, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'branch', ?, 'main', ?, ?)`,
+			[
+				"c_delete_fixture",
+				"p_search_fixture",
+				"Delete Fixture Chapter",
+				"Chapter delete TS-Go diff fixture",
+				"delete-fixture",
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR IGNORE INTO narrators (id, chapter_id, type, title, inherit_mode, model, permission_mode, fast_mode, relaxed_plan, plan_reflection_auto_approve_override, danger_reflection_override, message_count, status, substatus, plan_mode, prune_enabled, variant, traits, created_at, updated_at)
+			 VALUES (?, ?, 'primary', ?, 'fresh', 'claude-sonnet-4.5', 'default', 0, 0, 'inherit', 'inherit', 0, 'idle', '[]', 0, 1, 'primary', '[]', ?, ?)`,
+			["n_delete_fixture", "c_delete_fixture", "Delete Fixture Narrator", now, now],
+		);
+		db.run(
+			`UPDATE chapters SET worktree_path = ?, head_commit_sha = ?, commit_count = ? WHERE id = ?`,
+			[gitPanelRepo, gitPanelHead, 1, gitPanelFixtureChapterId],
 		);
 		db.run(
 			`INSERT OR IGNORE INTO exploration_groups (id, project_id, title, description, base_chapter_id, status, created_at, updated_at)
@@ -885,6 +1131,468 @@ function seedSearchFixture(home: string): void {
 				now,
 			],
 		);
+		for (const [id, title, description, branch, createdAt, updatedAt] of [
+			[
+				"c_search_large_title",
+				"auroraanchor Chapter North",
+				"auroraanchor ranking fixture chapter with matching title for expanded search parity",
+				"search-large-title",
+				largeMiddle,
+				largeRecent,
+			],
+			[
+				"c_search_large_description",
+				"Expanded Search South",
+				"auroraanchor chapter description collision for realistic relevance parity",
+				"search-large-description",
+				largeOlder,
+				largeMiddle,
+			],
+			[
+				"c_search_tie_recent",
+				"chrononeedle Tie Chapter",
+				"chrononeedle identical timestamp ordering body",
+				"search-tie-recent",
+				largeMiddle,
+				largeRecent,
+			],
+			[
+				"c_search_tie_older",
+				"chrononeedle Tie Chapter",
+				"chrononeedle identical timestamp ordering body",
+				"search-tie-older",
+				largeMiddle,
+				largeOlder,
+			],
+		] as const) {
+			db.run(
+				`INSERT OR IGNORE INTO chapters (id, project_id, title, description, status, role, branch, base_branch, created_at, updated_at)
+				 VALUES (?, 'p_search_fixture', ?, ?, 'active', 'branch', ?, 'main', ?, ?)`,
+				[id, title, description, branch, createdAt, updatedAt],
+			);
+		}
+		for (const [id, chapterId, title, createdAt, updatedAt, lastMessageAt] of [
+			[
+				"n_search_large_primary",
+				"c_search_large_title",
+				"auroraanchor Primary Narrator",
+				largeMiddle,
+				largeRecent,
+				largeRecent,
+			],
+			[
+				"n_search_large_secondary",
+				"c_search_large_description",
+				"auroraanchor Secondary Narrator",
+				largeOlder,
+				largeMiddle,
+				largeMiddle,
+			],
+		] as const) {
+			db.run(
+				`INSERT OR IGNORE INTO narrators (id, chapter_id, type, title, inherit_mode, model, permission_mode, fast_mode, relaxed_plan, plan_reflection_auto_approve_override, danger_reflection_override, message_count, status, substatus, plan_mode, prune_enabled, variant, traits, created_at, updated_at, last_message_at)
+				 VALUES (?, ?, 'primary', ?, 'fresh', 'claude-sonnet-4.5', 'default', 0, 0, 'inherit', 'inherit', 1, 'idle', '[]', 0, 1, 'primary', '[]', ?, ?, ?)`,
+				[id, chapterId, title, createdAt, updatedAt, lastMessageAt],
+			);
+		}
+		for (const [id, narratorId, text, createdAt] of [
+			[
+				"m_search_large_primary",
+				"n_search_large_primary",
+				"auroraanchor message collision with project chapter narrator context",
+				largeRecent,
+			],
+			[
+				"m_search_large_secondary",
+				"n_search_large_secondary",
+				"auroraanchor message collision with older timestamp context",
+				largeMiddle,
+			],
+		] as const) {
+			db.run(
+				`INSERT OR IGNORE INTO narrator_messages (id, narrator_id, role, content_json, content_text, model, created_at)
+				 VALUES (?, ?, 'assistant', ?, ?, 'claude-sonnet-4.5', ?)`,
+				[id, narratorId, JSON.stringify([{ type: "text", text }]), text, createdAt],
+			);
+		}
+	} finally {
+		db.close();
+	}
+}
+
+function resetProjectCreateFixture(home: string): void {
+	ensureProjectCreateFixtureRepo(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		db.run(
+			`DELETE FROM chapter_commits WHERE chapter_id IN (SELECT id FROM chapters WHERE project_id IN (SELECT id FROM projects WHERE name = 'Project Create Fixture'))`,
+		);
+		db.run(
+			`DELETE FROM narrators WHERE chapter_id IN (SELECT id FROM chapters WHERE project_id IN (SELECT id FROM projects WHERE name = 'Project Create Fixture'))`,
+		);
+		db.run(
+			`DELETE FROM chapters WHERE project_id IN (SELECT id FROM projects WHERE name = 'Project Create Fixture')`,
+		);
+		db.run(`DELETE FROM projects WHERE name = 'Project Create Fixture'`);
+	} finally {
+		db.close();
+	}
+}
+
+function resetChapterCreateFixture(home: string): void {
+	const repoPath = ensureChapterCreateFixtureRepo(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		db.run(
+			`DELETE FROM chapter_commits WHERE chapter_id IN (SELECT id FROM chapters WHERE project_id = 'p_chapter_create_fixture')`,
+		);
+		db.run(
+			`DELETE FROM narrators WHERE chapter_id IN (SELECT id FROM chapters WHERE project_id = 'p_chapter_create_fixture')`,
+		);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_chapter_create_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_chapter_create_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, chapter_settings, created_at, updated_at)
+			 VALUES ('p_chapter_create_fixture', 'Chapter Create Fixture Project', 'Chapter create TS-Go DB/Git/FS diff fixture', 'active', 'classic', ?, 'main', ?, ?, ?)`,
+			[repoPath, JSON.stringify({ autoCreateNarrator: true }), now, now],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function chapterCreateFixtureState(home: string): JsonSample {
+	const repoPath = chapterCreateFixtureRepoPath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapter = db
+			.query(
+				`SELECT id, branch, worktree_path, base_branch, status, role, COALESCE(is_root, 0) AS is_root, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE project_id = 'p_chapter_create_fixture' AND title = 'Chapter Create Fixture' ORDER BY created_at DESC LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			branch?: string;
+			worktree_path?: string;
+			base_branch?: string;
+			status?: string;
+			role?: string;
+			is_root?: number;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const chapterID = chapter?.id ?? "__missing__";
+		const branch = chapter?.branch ?? "";
+		const worktreePath = chapter?.worktree_path ?? "";
+		const branchList = branch
+			? runGitPanelFixture(repoPath, ["branch", "--list", branch], { allowFailure: true }).stdout
+			: "";
+		const narrator = db
+			.query(
+				`SELECT cwd FROM narrators WHERE chapter_id = '${chapterID}' AND variant = 'primary' LIMIT 1`,
+			)
+			.get() as { cwd?: string | null } | null;
+		const repoHead = existsSync(join(repoPath, ".git")) ? gitPanelHeadCommit(repoPath) : "";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_chapter_create_fixture'"),
+			chapterRows: countRows(
+				db,
+				"chapters",
+				"project_id = 'p_chapter_create_fixture' AND title = 'Chapter Create Fixture'",
+			),
+			narratorRows: countRows(db, "narrators", `chapter_id = '${chapterID}'`),
+			commitRows: countRows(db, "chapter_commits", `chapter_id = '${chapterID}'`),
+			manualCommitRows: countRows(
+				db,
+				"chapter_commits",
+				`chapter_id = '${chapterID}' AND source = 'manual'`,
+			),
+			repoExists: existsSync(join(repoPath, ".git")),
+			branchExists: branchList.includes(branch) && branch !== "",
+			branchHasExpectedPrefix: branch.startsWith("chapter/chapter-create-fixture-"),
+			worktreeExists: worktreePath !== "" && existsSync(worktreePath),
+			worktreePathInRepo: worktreePath.startsWith(join(repoPath, ".worktrees")),
+			worktreeHasTrackedFiles:
+				worktreePath !== "" &&
+				existsSync(join(worktreePath, "tracked.txt")) &&
+				existsSync(join(worktreePath, "second.txt")),
+			baseBranch: chapter?.base_branch ?? "",
+			status: chapter?.status ?? "",
+			role: chapter?.role ?? "",
+			isRoot: Number(chapter?.is_root ?? 0),
+			headMatchesRepo: (chapter?.head_commit_sha ?? "") === repoHead,
+			commitCount: Number(chapter?.commit_count ?? 0),
+			narratorCwdNull: narrator !== null && narrator.cwd === null,
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function resetChapterDormantWakeFixture(home: string): void {
+	const repoPath = ensureChapterDormantWakeFixtureRepo(home);
+	const worktreePath = chapterDormantWakeFixtureWorktreePath(home);
+	const head = runGitPanelFixture(worktreePath, ["rev-parse", "HEAD"]).stdout;
+	const commitCount = Number(
+		runGitPanelFixture(worktreePath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		db.run(`DELETE FROM chapter_commits WHERE chapter_id = 'c_dormant_wake_fixture'`);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_dormant_wake_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_dormant_wake_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, created_at, updated_at)
+			 VALUES ('p_dormant_wake_fixture', 'Chapter Dormant Wake Fixture Project', 'Chapter dormant/wake TS-Go DB/FS diff fixture', 'active', 'classic', ?, 'main', ?, ?)`,
+			[repoPath, now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_dormant_wake_fixture', 'p_dormant_wake_fixture', 'Dormant Wake Fixture', 'Chapter dormant/wake TS-Go DB/FS diff fixture', 'active', 'branch', 'dormant-wake-fixture', ?, 'main', 0, ?, ?, ?, ?, ?)`,
+			[worktreePath, head, head, commitCount, now, now],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function chapterDormantWakeFixtureState(home: string): JsonSample {
+	const repoPath = chapterDormantWakeFixtureRepoPath(home);
+	const knownWorktreePath = chapterDormantWakeFixtureWorktreePath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapter = db
+			.query(
+				`SELECT id, status, branch, worktree_path, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_dormant_wake_fixture' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const branch = chapter?.branch ?? "";
+		const branchHead = branch
+			? runGitPanelFixture(repoPath, ["rev-parse", branch], { allowFailure: true }).stdout
+			: "";
+		const worktreePath = chapter?.worktree_path ?? "";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_dormant_wake_fixture'"),
+			chapterRows: countRows(db, "chapters", "id = 'c_dormant_wake_fixture'"),
+			commitRows: countRows(db, "chapter_commits", "chapter_id = 'c_dormant_wake_fixture'"),
+			manualCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_dormant_wake_fixture' AND source = 'manual'",
+			),
+			status: chapter?.status ?? "",
+			branchExists:
+				branch !== "" &&
+				runGitPanelFixture(repoPath, ["branch", "--list", branch], {
+					allowFailure: true,
+				}).stdout.includes(branch),
+			worktreePathNull: chapter !== null && !chapter.worktree_path,
+			worktreeExists: worktreePath !== "" && existsSync(worktreePath),
+			knownWorktreeExists: existsSync(knownWorktreePath),
+			worktreePathInRepo: worktreePath.startsWith(join(repoPath, ".worktrees")),
+			headMatchesBranch: branchHead !== "" && (chapter?.head_commit_sha ?? "") === branchHead,
+			commitCount: Number(chapter?.commit_count ?? 0),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function dormantWakeResponseSample(sample: JsonSample, _home: string): JsonSample {
+	const body = recordBody(sample.body);
+	return jsonSampleFromBody(
+		{
+			ok: sample.status === 200 && (body.ok === true || typeof body.id === "string"),
+		},
+		sample.status,
+	);
+}
+
+async function createChapterCreateFixture(
+	baseUrl: string,
+	token: string,
+	home: string,
+): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters", token, {
+		method: "POST",
+		body: {
+			projectId: "p_chapter_create_fixture",
+			title: "Chapter Create Fixture",
+			description: "Chapter create TS-Go DB/Git/FS diff fixture",
+		},
+	});
+	const body = recordBody(sample.body);
+	const branch = typeof body.branch === "string" ? body.branch : "";
+	const worktreePath = typeof body.worktreePath === "string" ? body.worktreePath : "";
+	return jsonSampleFromBody(
+		{
+			idIsString: typeof body.id === "string",
+			projectId: body.projectId,
+			title: body.title,
+			status: body.status,
+			role: body.role,
+			branchHasExpectedPrefix: branch.startsWith("chapter/chapter-create-fixture-"),
+			worktreePathInFixtureRepo: worktreePath.startsWith(
+				join(chapterCreateFixtureRepoPath(home), ".worktrees"),
+			),
+		},
+		sample.status,
+	);
+}
+
+function seedProjectRealCleanupWarningFixture(home: string): void {
+	const repoPath = ensureProjectRealCleanupWarningRepo(home);
+	const worktreePath = projectRealCleanupWarningWorktreePath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT OR REPLACE INTO projects (id, name, description, status, flow_mode, git_path, default_branch, created_at, updated_at)
+			 VALUES (?, ?, ?, 'active', 'classic', ?, 'main', ?, ?)`,
+			[
+				"p_real_cleanup_fixture",
+				"Project Real Cleanup Warning Fixture",
+				"Project delete real git cleanup warning fixture",
+				repoPath,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR REPLACE INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'trunk', 'main', ?, 'main', 1, ?, ?)`,
+			[
+				"c_real_cleanup_root_fixture",
+				"p_real_cleanup_fixture",
+				"Project Real Cleanup Root",
+				"Root chapter for real cleanup fixture",
+				repoPath,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR REPLACE INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'branch', 'stale-cleanup-fixture', ?, 'main', 0, ?, ?)`,
+			[
+				"c_real_cleanup_branch_fixture",
+				"p_real_cleanup_fixture",
+				"Project Real Cleanup Branch",
+				"Branch with a stale non-worktree path for real git cleanup warning parity",
+				worktreePath,
+				now,
+				now,
+			],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function seedProjectDeleteFixture(home: string): void {
+	const repoPath = ensureProjectDeleteFixtureRepo(home);
+	const worktreePath = projectDeleteFixtureWorktreePath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT OR REPLACE INTO projects (id, name, description, status, flow_mode, git_path, default_branch, created_at, updated_at)
+			 VALUES (?, ?, ?, 'active', 'classic', ?, 'main', ?, ?)`,
+			[
+				"p_delete_fixture",
+				"Project Delete Fixture",
+				"Project delete TS-Go DB/FS diff fixture",
+				repoPath,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR REPLACE INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'trunk', 'main', ?, 'main', 1, ?, ?)`,
+			[
+				"c_project_delete_root_fixture",
+				"p_delete_fixture",
+				"Project Delete Root",
+				"Root chapter for project delete fixture",
+				repoPath,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR REPLACE INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'branch', 'delete-fixture', ?, 'main', 0, ?, ?)`,
+			[
+				"c_project_delete_branch_fixture",
+				"p_delete_fixture",
+				"Project Delete Branch",
+				"Branch/worktree chapter for project delete fixture",
+				worktreePath,
+				now,
+				now,
+			],
+		);
+		const admin = db.query("SELECT id FROM users WHERE username = 'admin' LIMIT 1").get() as {
+			id?: string;
+		} | null;
+		if (admin?.id) {
+			db.run(
+				`INSERT OR REPLACE INTO user_preferences (id, user_id, recent_tabs, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+				[
+					"pref_project_delete_fixture",
+					admin.id,
+					JSON.stringify([
+						{ type: "project", id: "p_delete_fixture", title: "Project Delete Fixture" },
+						{
+							type: "chapter",
+							id: "c_project_delete_branch_fixture",
+							title: "Project Delete Branch",
+						},
+					]),
+					now,
+					now,
+				],
+			);
+		}
+	} finally {
+		db.close();
+	}
+}
+
+function seedChapterDeleteFixture(home: string): void {
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT OR IGNORE INTO chapters (id, project_id, title, description, status, role, branch, base_branch, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, 'active', 'branch', ?, 'main', ?, ?)`,
+			[
+				"c_delete_fixture",
+				"p_search_fixture",
+				"Delete Fixture Chapter",
+				"Chapter delete TS-Go diff fixture",
+				"delete-fixture",
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT OR IGNORE INTO narrators (id, chapter_id, type, title, inherit_mode, model, permission_mode, fast_mode, relaxed_plan, plan_reflection_auto_approve_override, danger_reflection_override, message_count, status, substatus, plan_mode, prune_enabled, variant, traits, created_at, updated_at)
+			 VALUES (?, ?, 'primary', ?, 'fresh', 'claude-sonnet-4.5', 'default', 0, 0, 'inherit', 'inherit', 0, 'idle', '[]', 0, 1, 'primary', '[]', ?, ?)`,
+			["n_delete_fixture", "c_delete_fixture", "Delete Fixture Narrator", now, now],
+		);
 	} finally {
 		db.close();
 	}
@@ -894,6 +1602,95 @@ function bodyKind(body: unknown): string {
 	if (Array.isArray(body)) return "array";
 	if (body && typeof body === "object") return "object";
 	return typeof body;
+}
+
+function countRows(db: Database, table: string, where: string): number {
+	const row = db.query(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get() as
+		| { count?: number }
+		| undefined;
+	return Number(row?.count ?? 0);
+}
+
+function projectCreateFixtureState(home: string): JsonSample {
+	const repoPath = projectCreateFixtureRepoPath(home);
+	const backupPath = join(repoPath, ".narrafork", "project.db");
+	const gitignorePath = join(repoPath, ".gitignore");
+	const gitignore = existsSync(gitignorePath) ? readFileSync(gitignorePath, "utf-8") : "";
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const project = db
+			.query(
+				`SELECT id, git_path, default_branch FROM projects WHERE name = 'Project Create Fixture' ORDER BY created_at DESC LIMIT 1`,
+			)
+			.get() as { id?: string; git_path?: string; default_branch?: string } | null;
+		const projectID = project?.id ?? "__missing__";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "name = 'Project Create Fixture'"),
+			rootChapterRows: countRows(
+				db,
+				"chapters",
+				`project_id = '${projectID}' AND is_root = 1 AND role = 'trunk'`,
+			),
+			rootCommitRows: countRows(
+				db,
+				"chapter_commits",
+				`chapter_id IN (SELECT id FROM chapters WHERE project_id = '${projectID}' AND is_root = 1)`,
+			),
+			manualRootCommitRows: countRows(
+				db,
+				"chapter_commits",
+				`chapter_id IN (SELECT id FROM chapters WHERE project_id = '${projectID}' AND is_root = 1) AND source = 'manual'`,
+			),
+			backupDbExists: existsSync(backupPath),
+			gitignoreHasNarrafork: gitignore.includes(".narrafork/"),
+			gitignoreHasWorktrees: gitignore.includes(".worktrees/"),
+			repoExists: existsSync(join(repoPath, ".git")),
+			gitPathMatchesFixture: project?.git_path === repoPath,
+			defaultBranch: project?.default_branch ?? "",
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function projectRealCleanupWarningFixtureState(home: string): JsonSample {
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_real_cleanup_fixture'"),
+			chapterRows: countRows(
+				db,
+				"chapters",
+				"id IN ('c_real_cleanup_root_fixture','c_real_cleanup_branch_fixture')",
+			),
+			rootRepoExists: existsSync(projectRealCleanupWarningRepoPath(home)),
+			staleWorktreeExists: existsSync(projectRealCleanupWarningWorktreePath(home)),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function projectDeleteFixtureState(home: string): JsonSample {
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const prefs = db
+			.query(`SELECT recent_tabs FROM user_preferences WHERE id = 'pref_project_delete_fixture'`)
+			.get() as { recent_tabs?: string } | null;
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_delete_fixture'"),
+			chapterRows: countRows(
+				db,
+				"chapters",
+				"id IN ('c_project_delete_root_fixture','c_project_delete_branch_fixture')",
+			),
+			recentTabsContainDeletedProject: (prefs?.recent_tabs ?? "").includes("p_delete_fixture"),
+			rootRepoExists: existsSync(projectDeleteFixtureRepoPath(home)),
+			branchWorktreeExists: existsSync(projectDeleteFixtureWorktreePath(home)),
+		});
+	} finally {
+		db.close();
+	}
 }
 
 function seededSettingsProviders(
@@ -987,6 +1784,16 @@ function seededSettingsProviders(
 				defaultModel: "nug-oauth-test",
 			},
 		],
+	};
+}
+
+function jsonSampleFromBody(body: unknown, status = 200): JsonSample {
+	return {
+		status,
+		contentType: "application/json",
+		keys: body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body).sort() : [],
+		kind: bodyKind(body),
+		body,
 	};
 }
 
@@ -1299,6 +2106,74 @@ async function collect(
 	const fsFixtureDir = join(home, "fs-contract");
 	const fsMissingDir = join(home, "missing-fs-contract");
 	const fsMkdirName = `created-${port}`;
+	const gitPanelBase = `/api/chapters/${gitPanelFixtureChapterId}/git`;
+	resetGitPanelFixture(home, { dirty: false });
+	const gitAICommitMessageEmpty = await sampleJSON(
+		baseUrl,
+		`${gitPanelBase}/ai-commit-message`,
+		token,
+		{ method: "POST", body: {} },
+	);
+	resetGitPanelFixture(home, { dirty: true });
+	const gitStatusDirty = await sampleJSON(baseUrl, `${gitPanelBase}/status`, token);
+	const gitDiffTracked = await sampleJSON(
+		baseUrl,
+		`${gitPanelBase}/diff?file=${encodeURIComponent("tracked.txt")}`,
+		token,
+	);
+	const gitDiffUntracked = await sampleJSON(
+		baseUrl,
+		`${gitPanelBase}/diff?file=${encodeURIComponent("notes.txt")}`,
+		token,
+	);
+	const gitLog = await sampleJSON(baseUrl, `${gitPanelBase}/log?limit=5`, token);
+	const gitStageAll = await sampleJSON(baseUrl, `${gitPanelBase}/stage`, token, {
+		method: "POST",
+		body: { all: true },
+	});
+	const gitUnstageAll = await sampleJSON(baseUrl, `${gitPanelBase}/unstage`, token, {
+		method: "POST",
+		body: { all: true },
+	});
+	resetGitPanelFixture(home, { dirty: true });
+	const gitDiscardTracked = await sampleJSON(baseUrl, `${gitPanelBase}/discard`, token, {
+		method: "POST",
+		body: { files: ["tracked.txt"] },
+	});
+	resetGitPanelFixture(home, { dirty: true });
+	const gitResetHard = await sampleJSON(baseUrl, `${gitPanelBase}/reset`, token, {
+		method: "POST",
+		body: { target: gitPanelFixtureBaseTag, mode: "hard" },
+	});
+	resetGitPanelFixture(home, { dirty: true });
+	const gitStashListEmpty = await sampleJSON(baseUrl, `${gitPanelBase}/stash/list`, token);
+	const gitStashPush = await sampleJSON(baseUrl, `${gitPanelBase}/stash`, token, {
+		method: "POST",
+		body: { action: "push", message: "contract stash" },
+	});
+	const gitStashListAfterPush = await sampleJSON(baseUrl, `${gitPanelBase}/stash/list`, token);
+	const gitStashDrop = await sampleJSON(baseUrl, `${gitPanelBase}/stash`, token, {
+		method: "POST",
+		body: { action: "drop", index: 0 },
+	});
+	resetGitPanelFixture(home, { dirty: true });
+	await sampleJSON(baseUrl, `${gitPanelBase}/stash`, token, {
+		method: "POST",
+		body: { action: "push", message: "contract stash pop" },
+	});
+	const gitStashPop = await sampleJSON(baseUrl, `${gitPanelBase}/stash`, token, {
+		method: "POST",
+		body: { action: "pop" },
+	});
+	resetGitPanelFixture(home, { dirty: true });
+	const gitStageAllBeforeCommit = await sampleJSON(baseUrl, `${gitPanelBase}/stage`, token, {
+		method: "POST",
+		body: { all: true },
+	});
+	const gitCommit = await sampleJSON(baseUrl, `${gitPanelBase}/commit`, token, {
+		method: "POST",
+		body: { message: "test: contract git panel" },
+	});
 	const notificationSoundUploadValid = await sampleMultipart(
 		baseUrl,
 		"/api/notification-sounds",
@@ -1761,6 +2636,45 @@ async function collect(
 		token,
 	);
 	const clineModelsAfterProviderRefresh = await sampleJSON(baseUrl, "/api/cline/models", token);
+	const dependencyEdgeCreateLifecycle = await sampleJSON(baseUrl, "/api/chapter-edges", token, {
+		method: "POST",
+		body: {
+			sourceId: "c_dep_lifecycle_source",
+			targetId: "c_dep_lifecycle_target",
+			type: "dependency",
+			metadata: { description: "Contract lifecycle dependency" },
+		},
+	});
+	const dependencyEdgeCreatedId =
+		typeof recordBody(dependencyEdgeCreateLifecycle.body).id === "string"
+			? (recordBody(dependencyEdgeCreateLifecycle.body).id as string)
+			: "missing-dependency-edge-id";
+	const chapterEdgesAfterLifecycleCreate = await sampleJSON(
+		baseUrl,
+		"/api/chapter-edges?projectId=p_search_fixture&type=dependency",
+		token,
+	);
+	const projectGraphAfterDependencyCreate = await sampleJSON(
+		baseUrl,
+		"/api/projects/p_search_fixture/graph",
+		token,
+	);
+	const dependencyEdgeDeleteLifecycle = await sampleJSON(
+		baseUrl,
+		`/api/chapter-edges/${dependencyEdgeCreatedId}`,
+		token,
+		{ method: "DELETE" },
+	);
+	const chapterEdgesAfterLifecycleDelete = await sampleJSON(
+		baseUrl,
+		"/api/chapter-edges?projectId=p_search_fixture&type=dependency",
+		token,
+	);
+	const projectGraphAfterDependencyDelete = await sampleJSON(
+		baseUrl,
+		"/api/projects/p_search_fixture/graph",
+		token,
+	);
 	return {
 		json: {
 			health: await sampleJSON(baseUrl, "/api/health"),
@@ -1773,6 +2687,22 @@ async function collect(
 			projects: await sampleJSON(baseUrl, "/api/projects", token),
 			settings: await sampleJSON(baseUrl, "/api/settings", token),
 			userSettings: await sampleJSON(baseUrl, "/api/settings", userToken),
+			gitAICommitMessageEmpty,
+			gitStatusDirty,
+			gitDiffTracked,
+			gitDiffUntracked,
+			gitLog,
+			gitStageAll,
+			gitUnstageAll,
+			gitDiscardTracked,
+			gitResetHard,
+			gitStashListEmpty,
+			gitStashPush,
+			gitStashListAfterPush,
+			gitStashDrop,
+			gitStashPop,
+			gitStageAllBeforeCommit,
+			gitCommit,
 			settingsMaskedProviderPatch: await sampleJSON(baseUrl, "/api/settings", token, {
 				method: "PATCH",
 				body: seededSettingsProviders(
@@ -2083,6 +3013,74 @@ async function collect(
 				token,
 			),
 			projectGraph: await sampleJSON(baseUrl, "/api/projects/p_search_fixture/graph", token),
+			chapterCreateFixtureStateBefore: chapterCreateFixtureState(home),
+			chapterCreateFixture: await createChapterCreateFixture(baseUrl, token, home),
+			chapterCreateFixtureStateAfter: chapterCreateFixtureState(home),
+			projectGraphAfterChapterCreate: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_chapter_create_fixture/graph",
+				token,
+			),
+			chapterDormantWakeFixtureStateBefore: chapterDormantWakeFixtureState(home),
+			chapterDormantWakeDormant: dormantWakeResponseSample(
+				await sampleJSON(baseUrl, "/api/chapters/c_dormant_wake_fixture/dormant", token, {
+					method: "POST",
+				}),
+				home,
+			),
+			chapterDormantWakeFixtureStateAfterDormant: chapterDormantWakeFixtureState(home),
+			chapterDormantWakeWake: dormantWakeResponseSample(
+				await sampleJSON(baseUrl, "/api/chapters/c_dormant_wake_fixture/wake", token, {
+					method: "POST",
+				}),
+				home,
+			),
+			chapterDormantWakeFixtureStateAfterWake: chapterDormantWakeFixtureState(home),
+			projectCreateFixtureStateBefore: projectCreateFixtureState(home),
+			projectCreateFixture: await sampleJSON(baseUrl, "/api/projects", token, {
+				method: "POST",
+				body: {
+					name: "Project Create Fixture",
+					description: "Project create TS-Go DB/Git/FS diff fixture",
+					repoMode: "existing",
+					gitPath: projectCreateFixtureRepoPath(home),
+					flowMode: "classic",
+				},
+			}),
+			projectCreateFixtureStateAfter: projectCreateFixtureState(home),
+			projectsAfterProjectCreate: await sampleJSON(baseUrl, "/api/projects", token),
+			projectRealCleanupWarningStateBefore: projectRealCleanupWarningFixtureState(home),
+			projectRealCleanupWarning: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_real_cleanup_fixture",
+				token,
+				{ method: "DELETE" },
+			),
+			projectRealCleanupWarningStateAfter: projectRealCleanupWarningFixtureState(home),
+			projectDeleteFixtureStateBefore: projectDeleteFixtureState(home),
+			projectDeleteFixture: await sampleJSON(baseUrl, "/api/projects/p_delete_fixture", token, {
+				method: "DELETE",
+			}),
+			projectDeleteFixtureGetAfter: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_delete_fixture",
+				token,
+			),
+			projectsAfterProjectDelete: await sampleJSON(baseUrl, "/api/projects", token),
+			projectDeleteFixtureStateAfter: projectDeleteFixtureState(home),
+			chapterDeleteFixture: await sampleJSON(baseUrl, "/api/chapters/c_delete_fixture", token, {
+				method: "DELETE",
+			}),
+			chapterDeleteFixtureGetAfter: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_delete_fixture",
+				token,
+			),
+			projectGraphAfterChapterDelete: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture/graph",
+				token,
+			),
 			chapterEdgesMissingScope: await sampleJSON(baseUrl, "/api/chapter-edges", token),
 			chapterEdgesInvalidTypeReview: await sampleJSON(
 				baseUrl,
@@ -2104,6 +3102,12 @@ async function collect(
 				"/api/chapter-edges?chapterId=c_search_fixture",
 				token,
 			),
+			dependencyEdgeCreateLifecycle,
+			chapterEdgesAfterLifecycleCreate,
+			projectGraphAfterDependencyCreate,
+			dependencyEdgeDeleteLifecycle,
+			chapterEdgesAfterLifecycleDelete,
+			projectGraphAfterDependencyDelete,
 			chapterEdgeDeleteMissing: await sampleJSON(baseUrl, "/api/chapter-edges/missing", token, {
 				method: "DELETE",
 				body: {},
@@ -2119,6 +3123,16 @@ async function collect(
 				token,
 			),
 			searchShortChapter: await sampleJSON(baseUrl, "/api/search?q=Al&entities=chapters", token),
+			searchLargeTopK: await sampleJSON(
+				baseUrl,
+				"/api/search?q=auroraanchor&entities=chapters,messages,narrators&limit=6",
+				token,
+			),
+			searchLargeTieBreak: await sampleJSON(
+				baseUrl,
+				"/api/search?q=chrononeedle&entities=chapters&limit=2",
+				token,
+			),
 			routines: await sampleJSON(baseUrl, "/api/routines", token),
 			projectRoutinesInitial,
 			projectRoutineInvalidAction,
@@ -3027,18 +4041,27 @@ type SearchFieldExpectation = {
 	includes?: string;
 };
 
+function searchResultRecords(sample: BackendSample, name: string): Record<string, unknown>[] {
+	const body = recordBody(sample.json[name]?.body);
+	const results = Array.isArray(body.results) ? body.results : [];
+	return results.filter((raw): raw is Record<string, unknown> => {
+		return Boolean(raw && typeof raw === "object" && !Array.isArray(raw));
+	});
+}
+
+function searchResultKeys(sample: BackendSample, name: string): string[] {
+	return searchResultRecords(sample, name).map((result) => `${result.type}:${result.id}`);
+}
+
 function findSearchResult(
 	sample: BackendSample,
 	name: string,
 	type: string,
 	id: string,
 ): Record<string, unknown> | undefined {
-	const body = recordBody(sample.json[name]?.body);
-	const results = Array.isArray(body.results) ? body.results : [];
-	return results.find((raw): raw is Record<string, unknown> => {
-		if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
-		return raw.type === type && raw.id === id;
-	});
+	return searchResultRecords(sample, name).find(
+		(result) => result.type === type && result.id === id,
+	);
 }
 
 function expectSearchResultContract(
@@ -3076,7 +4099,91 @@ function expectSearchResultContract(
 	}
 }
 
+function expectSearchLargeFixtureContracts(
+	label: string,
+	sample: BackendSample,
+	diffs: string[],
+): void {
+	expectJSONStatus(label, sample, "searchLargeTopK", 200, diffs);
+	expectJSONStatus(label, sample, "searchLargeTieBreak", 200, diffs);
+	const largeKeys = searchResultKeys(sample, "searchLargeTopK");
+	const requiredKeys = [
+		"chapter:c_search_large_title",
+		"chapter:c_search_large_description",
+		"narrator:n_search_large_primary",
+		"narrator:n_search_large_secondary",
+		"message:m_search_large_primary",
+		"message:m_search_large_secondary",
+	];
+	for (const key of requiredKeys) {
+		if (!largeKeys.includes(key)) {
+			diffs.push(`semantic.${label}.json.searchLargeTopK.missingSearchResult ${key}`);
+		}
+	}
+	if (largeKeys.length !== requiredKeys.length) {
+		diffs.push(
+			`semantic.${label}.json.searchLargeTopK.results length expected ${requiredKeys.length} got ${largeKeys.length}`,
+		);
+	}
+	const typeCounts = new Map<string, number>();
+	for (const result of searchResultRecords(sample, "searchLargeTopK")) {
+		const resultType = typeof result.type === "string" ? result.type : "unknown";
+		typeCounts.set(resultType, (typeCounts.get(resultType) ?? 0) + 1);
+		if (typeof result.matchScore !== "number" || result.matchScore <= 0) {
+			diffs.push(
+				`semantic.${label}.json.searchLargeTopK.${resultType}:${result.id}.matchScore expected positive number got ${JSON.stringify(result.matchScore)}`,
+			);
+		}
+		if (
+			typeof result.snippet !== "string" ||
+			!result.snippet.toLowerCase().includes("auroraanchor")
+		) {
+			diffs.push(
+				`semantic.${label}.json.searchLargeTopK.${resultType}:${result.id}.snippet expected auroraanchor got ${JSON.stringify(result.snippet)}`,
+			);
+		}
+	}
+	for (const resultType of ["chapter", "message", "narrator"]) {
+		if (typeCounts.get(resultType) !== 2) {
+			diffs.push(
+				`semantic.${label}.json.searchLargeTopK.${resultType} count expected 2 got ${typeCounts.get(resultType) ?? 0}`,
+			);
+		}
+	}
+	expectSearchResultContract(
+		label,
+		sample,
+		"searchLargeTopK",
+		"chapter",
+		"c_search_large_description",
+		[
+			{ key: "snippet", type: "string", includes: "auroraanchor" },
+			{ key: "matchField", equals: "description" },
+		],
+		diffs,
+	);
+	const tieKeys = searchResultKeys(sample, "searchLargeTieBreak");
+	const expectedTieKeys = ["chapter:c_search_tie_recent", "chapter:c_search_tie_older"];
+	for (const [index, expected] of expectedTieKeys.entries()) {
+		if (tieKeys[index] !== expected) {
+			diffs.push(
+				`semantic.${label}.json.searchLargeTieBreak.order[${index}] expected ${expected} got ${tieKeys[index] ?? "<missing>"}`,
+			);
+		}
+	}
+	const metadata = recordBody(sample.json.searchLargeTopK?.body).searchMetadata;
+	if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+		const body = recordBody(metadata);
+		if (body.degraded !== false || body.ftsReady !== true || body.shortQuery !== false) {
+			diffs.push(
+				`semantic.${label}.json.searchLargeTopK.searchMetadata expected ready non-degraded FTS got ${JSON.stringify(body)}`,
+			);
+		}
+	}
+}
+
 function expectSearchFixtureContracts(label: string, sample: BackendSample, diffs: string[]): void {
+	expectSearchLargeFixtureContracts(label, sample, diffs);
 	expectSearchResultContract(
 		label,
 		sample,
@@ -3141,8 +4248,102 @@ function expectSearchFixtureContracts(label: string, sample: BackendSample, diff
 	);
 }
 
+function expectGitStatusSummaryContract(
+	label: string,
+	sample: BackendSample,
+	name: string,
+	diffs: string[],
+): void {
+	expectJSONStatus(label, sample, name, 200, diffs);
+	const body = recordBody(sample.json[name]?.body);
+	for (const [key, expectedType] of Object.entries({
+		hasChanges: "boolean",
+		staged: "number",
+		unstaged: "number",
+		untracked: "number",
+		totalFiles: "number",
+		headSha: "string",
+		branch: "string",
+		linesAdded: "number",
+		linesRemoved: "number",
+	})) {
+		if (typeof body[key] !== expectedType) {
+			diffs.push(
+				`semantic.${label}.json.${name}.${key} expected ${expectedType} got ${JSON.stringify(body[key])}`,
+			);
+		}
+	}
+	if (!Array.isArray(body.files)) {
+		diffs.push(`semantic.${label}.json.${name}.files expected array`);
+	}
+}
+
+function expectGitPanelFixtureContracts(
+	label: string,
+	sample: BackendSample,
+	diffs: string[],
+): void {
+	expectJSONStatus(label, sample, "gitAICommitMessageEmpty", 200, diffs);
+	expectJSONValue(label, sample, "gitAICommitMessageEmpty", "message", "", diffs);
+	for (const name of [
+		"gitStatusDirty",
+		"gitStageAll",
+		"gitUnstageAll",
+		"gitDiscardTracked",
+		"gitResetHard",
+		"gitStageAllBeforeCommit",
+	]) {
+		expectGitStatusSummaryContract(label, sample, name, diffs);
+	}
+	const dirtyStatus = recordBody(sample.json.gitStatusDirty?.body);
+	if (dirtyStatus.hasChanges !== true || Number(dirtyStatus.totalFiles) < 2) {
+		diffs.push(
+			`semantic.${label}.json.gitStatusDirty expected dirty fixture with at least 2 changed files got ${JSON.stringify(dirtyStatus)}`,
+		);
+	}
+	expectArrayObject(label, sample, "gitStatusDirty", "files", "path", "tracked.txt", diffs);
+	expectArrayObject(label, sample, "gitStatusDirty", "files", "path", "notes.txt", diffs);
+	for (const name of ["gitDiffTracked", "gitDiffUntracked"]) {
+		expectJSONStatus(label, sample, name, 200, diffs);
+		expectJSONValue(label, sample, name, "truncated", false, diffs);
+		if (typeof recordBody(sample.json[name]?.body).diff !== "string") {
+			diffs.push(`semantic.${label}.json.${name}.diff expected string`);
+		}
+	}
+	expectJSONStatus(label, sample, "gitLog", 200, diffs);
+	if (sampleJSONArray(sample, "gitLog").length === 0) {
+		diffs.push(`semantic.${label}.json.gitLog expected at least one commit`);
+	}
+	for (const name of ["gitStashListEmpty", "gitStashListAfterPush"]) {
+		expectJSONStatus(label, sample, name, 200, diffs);
+		if (!Array.isArray(sample.json[name]?.body)) {
+			diffs.push(`semantic.${label}.json.${name} expected array`);
+		}
+	}
+	if (sampleJSONArray(sample, "gitStashListAfterPush").length === 0) {
+		diffs.push(`semantic.${label}.json.gitStashListAfterPush expected one stashed item`);
+	}
+	for (const name of ["gitStashPush", "gitStashDrop", "gitStashPop"]) {
+		expectJSONStatus(label, sample, name, 200, diffs);
+		expectJSONValue(label, sample, name, "hasConflicts", false, diffs);
+		const status = recordBody(recordBody(sample.json[name]?.body).status);
+		if (typeof status.hasChanges !== "boolean" || !Array.isArray(status.files)) {
+			diffs.push(`semantic.${label}.json.${name}.status expected Git status summary`);
+		}
+	}
+	expectJSONStatus(label, sample, "gitCommit", 200, diffs);
+	if (typeof recordBody(sample.json.gitCommit?.body).commitSha !== "string") {
+		diffs.push(`semantic.${label}.json.gitCommit.commitSha expected string`);
+	}
+	const commitStatus = recordBody(recordBody(sample.json.gitCommit?.body).status);
+	if (commitStatus.hasChanges !== false || !Array.isArray(commitStatus.files)) {
+		diffs.push(`semantic.${label}.json.gitCommit.status expected clean Git status summary`);
+	}
+}
+
 function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string[]): void {
 	expectSettingsSecretContracts(label, sample, diffs);
+	expectGitPanelFixtureContracts(label, sample, diffs);
 	expectJSONValue(label, sample, "settingsContextThresholds", "pruneStart", 95, diffs);
 	expectJSONValue(label, sample, "settingsContextThresholds", "compactStart", 99, diffs);
 	expectJSONStatus(label, sample, "settingsTestModelMissing", 400, diffs);
@@ -3410,15 +4611,428 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 		"eg_graph_fixture",
 		diffs,
 	);
+	expectJSONStatus(label, sample, "chapterCreateFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateBefore", "chapterRows", 0, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateBefore", "repoExists", true, diffs);
+	expectJSONStatus(label, sample, "chapterCreateFixture", 201, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixture", "idIsString", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterCreateFixture",
+		"projectId",
+		"p_chapter_create_fixture",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterCreateFixture", "title", "Chapter Create Fixture", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixture", "status", "active", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixture", "role", "branch", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixture", "branchHasExpectedPrefix", true, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixture", "worktreePathInFixtureRepo", true, diffs);
+	expectJSONStatus(label, sample, "chapterCreateFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "chapterRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "narratorRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "commitRows", 2, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "manualCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "branchExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterCreateFixtureStateAfter",
+		"branchHasExpectedPrefix",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "worktreeExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterCreateFixtureStateAfter",
+		"worktreePathInRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterCreateFixtureStateAfter",
+		"worktreeHasTrackedFiles",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "baseBranch", "main", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "status", "active", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "role", "branch", diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "isRoot", 0, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "headMatchesRepo", true, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "commitCount", 2, diffs);
+	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "narratorCwdNull", true, diffs);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterCreate", 200, diffs);
+	const createdGraphNode = sampleJSONArray(sample, "projectGraphAfterChapterCreate", "nodes").find(
+		(node) => recordBody(recordBody(node).data).title === "Chapter Create Fixture",
+	);
+	if (!createdGraphNode) {
+		diffs.push(`semantic.${label}.json.projectGraphAfterChapterCreate.createdNodeMissing`);
+	} else if (recordBody(recordBody(createdGraphNode).data).role !== "branch") {
+		diffs.push(`semantic.${label}.json.projectGraphAfterChapterCreate.createdNodeUnexpectedRole`);
+	}
+	expectJSONStatus(label, sample, "chapterDormantWakeFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "chapterRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "status", "active", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateBefore",
+		"worktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "commitRows", 0, diffs);
+	expectJSONStatus(label, sample, "chapterDormantWakeDormant", 200, diffs);
+	expectJSONValue(label, sample, "chapterDormantWakeDormant", "ok", true, diffs);
+	expectJSONStatus(label, sample, "chapterDormantWakeFixtureStateAfterDormant", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterDormant",
+		"status",
+		"dormant",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterDormant",
+		"worktreePathNull",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterDormant",
+		"knownWorktreeExists",
+		false,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterDormantWakeWake", 200, diffs);
+	expectJSONValue(label, sample, "chapterDormantWakeWake", "ok", true, diffs);
+	expectJSONStatus(label, sample, "chapterDormantWakeFixtureStateAfterWake", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterWake",
+		"status",
+		"active",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterWake",
+		"worktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterWake",
+		"headMatchesBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterWake",
+		"commitCount",
+		2,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateAfterWake", "commitRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterDormantWakeFixtureStateAfterWake",
+		"manualCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectCreateFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "projectRows", 0, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "rootChapterRows", 0, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "repoExists", true, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "backupDbExists", false, diffs);
+	expectJSONStatus(label, sample, "projectCreateFixture", 201, diffs);
+	expectJSONStatus(label, sample, "projectCreateFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "rootChapterRows", 1, diffs);
+	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "rootCommitRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectCreateFixtureStateAfter",
+		"manualRootCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "backupDbExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectCreateFixtureStateAfter",
+		"gitignoreHasNarrafork",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"projectCreateFixtureStateAfter",
+		"gitignoreHasWorktrees",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"projectCreateFixtureStateAfter",
+		"gitPathMatchesFixture",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "defaultBranch", "main", diffs);
+	expectJSONStatus(label, sample, "projectsAfterProjectCreate", 200, diffs);
+	if (
+		!sampleJSONArray(sample, "projectsAfterProjectCreate", undefined).some(
+			(project) => recordBody(project).name === "Project Create Fixture",
+		)
+	) {
+		diffs.push(`semantic.${label}.json.projectsAfterProjectCreate.createdProjectMissing`);
+	}
+	expectJSONStatus(label, sample, "projectRealCleanupWarningStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "projectRealCleanupWarningStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "projectRealCleanupWarningStateBefore", "chapterRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectRealCleanupWarningStateBefore",
+		"rootRepoExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"projectRealCleanupWarningStateBefore",
+		"staleWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectRealCleanupWarning", 200, diffs);
+	expectJSONValue(label, sample, "projectRealCleanupWarning", "ok", true, diffs);
+	if (label === "go") {
+		const cleanupError = expectArrayObject(
+			label,
+			sample,
+			"projectRealCleanupWarning",
+			"cleanupErrors",
+			"scope",
+			"worktree",
+			diffs,
+		);
+		if (cleanupError && cleanupError.id !== "c_real_cleanup_branch_fixture") {
+			diffs.push(
+				`semantic.${label}.json.projectRealCleanupWarning.cleanupErrors.worktree.id expected c_real_cleanup_branch_fixture got ${JSON.stringify(cleanupError.id)}`,
+			);
+		}
+	}
+	expectJSONStatus(label, sample, "projectRealCleanupWarningStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "projectRealCleanupWarningStateAfter", "projectRows", 0, diffs);
+	expectJSONValue(label, sample, "projectRealCleanupWarningStateAfter", "chapterRows", 0, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectRealCleanupWarningStateAfter",
+		"rootRepoExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"projectRealCleanupWarningStateAfter",
+		"staleWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectDeleteFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateBefore", "chapterRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectDeleteFixtureStateBefore",
+		"recentTabsContainDeletedProject",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateBefore", "rootRepoExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectDeleteFixtureStateBefore",
+		"branchWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectDeleteFixture", 200, diffs);
+	expectJSONValue(label, sample, "projectDeleteFixture", "ok", true, diffs);
+	expectJSONStatus(label, sample, "projectDeleteFixtureGetAfter", 404, diffs);
+	expectJSONStatus(label, sample, "projectsAfterProjectDelete", 200, diffs);
+	if (
+		sampleJSONArray(sample, "projectsAfterProjectDelete", undefined).some(
+			(project) => recordBody(project).id === "p_delete_fixture",
+		)
+	) {
+		diffs.push(`semantic.${label}.json.projectsAfterProjectDelete.deletedProjectStillPresent`);
+	}
+	expectJSONStatus(label, sample, "projectDeleteFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateAfter", "projectRows", 0, diffs);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateAfter", "chapterRows", 0, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectDeleteFixtureStateAfter",
+		"recentTabsContainDeletedProject",
+		false,
+		diffs,
+	);
+	expectJSONValue(label, sample, "projectDeleteFixtureStateAfter", "rootRepoExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"projectDeleteFixtureStateAfter",
+		"branchWorktreeExists",
+		false,
+		diffs,
+	);
+	expectArrayObject(label, sample, "projectGraph", "nodes", "id", "c_delete_fixture", diffs);
+	expectJSONStatus(label, sample, "chapterDeleteFixture", 200, diffs);
+	expectJSONValue(label, sample, "chapterDeleteFixture", "ok", true, diffs);
+	expectJSONStatus(label, sample, "chapterDeleteFixtureGetAfter", 404, diffs);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterDelete", 200, diffs);
+	for (const key of ["nodes", "edges", "explorationGroups", "openedTerminals"]) {
+		expectJSONArray(label, sample, "projectGraphAfterChapterDelete", key, diffs);
+	}
+	if (
+		sampleJSONArray(sample, "projectGraphAfterChapterDelete", "nodes").some(
+			(node) => recordBody(node).id === "c_delete_fixture",
+		)
+	) {
+		diffs.push(`semantic.${label}.json.projectGraphAfterChapterDelete.deletedNodeStillPresent`);
+	}
 	for (const name of ["chapterEdgesProject", "chapterEdgesDependency", "chapterEdgesByChapter"]) {
 		expectJSONStatus(label, sample, name, 200, diffs);
 		expectArrayObject(label, sample, name, undefined, "id", "e_graph_dependency", diffs);
+	}
+	expectJSONStatus(label, sample, "dependencyEdgeCreateLifecycle", 201, diffs);
+	const lifecycleEdge = recordBody(sample.json.dependencyEdgeCreateLifecycle?.body);
+	const lifecycleEdgeId = lifecycleEdge.id;
+	if (typeof lifecycleEdgeId !== "string" || lifecycleEdgeId.length !== 21) {
+		diffs.push(
+			`semantic.${label}.json.dependencyEdgeCreateLifecycle.id expected 21-char string got ${JSON.stringify(lifecycleEdgeId)}`,
+		);
+	}
+	for (const [key, expected] of Object.entries({
+		projectId: "p_search_fixture",
+		sourceId: "c_dep_lifecycle_source",
+		targetId: "c_dep_lifecycle_target",
+		type: "dependency",
+	})) {
+		if (lifecycleEdge[key] !== expected) {
+			diffs.push(
+				`semantic.${label}.json.dependencyEdgeCreateLifecycle.${key} expected ${JSON.stringify(expected)} got ${JSON.stringify(lifecycleEdge[key])}`,
+			);
+		}
+	}
+	const lifecycleMetadata = recordBody(lifecycleEdge.metadata);
+	if (
+		lifecycleMetadata.description !== "Contract lifecycle dependency" ||
+		lifecycleMetadata.lastSyncedCommit !== null
+	) {
+		diffs.push(
+			`semantic.${label}.json.dependencyEdgeCreateLifecycle.metadata unexpected ${JSON.stringify(lifecycleMetadata)}`,
+		);
+	}
+	expectJSONStatus(label, sample, "chapterEdgesAfterLifecycleCreate", 200, diffs);
+	if (typeof lifecycleEdgeId === "string") {
+		expectArrayObject(
+			label,
+			sample,
+			"chapterEdgesAfterLifecycleCreate",
+			undefined,
+			"id",
+			lifecycleEdgeId,
+			diffs,
+		);
+	}
+	expectJSONStatus(label, sample, "projectGraphAfterDependencyCreate", 200, diffs);
+	if (typeof lifecycleEdgeId === "string") {
+		const graphLifecycleEdge = expectArrayObject(
+			label,
+			sample,
+			"projectGraphAfterDependencyCreate",
+			"edges",
+			"id",
+			lifecycleEdgeId,
+			diffs,
+		);
+		if (graphLifecycleEdge) {
+			for (const [key, expected] of Object.entries({
+				source: "c_dep_lifecycle_source",
+				target: "c_dep_lifecycle_target",
+				type: "dependency",
+			})) {
+				if (graphLifecycleEdge[key] !== expected) {
+					diffs.push(
+						`semantic.${label}.json.projectGraphAfterDependencyCreate.${key} expected ${JSON.stringify(expected)} got ${JSON.stringify(graphLifecycleEdge[key])}`,
+					);
+				}
+			}
+		}
+	}
+	expectJSONStatus(label, sample, "dependencyEdgeDeleteLifecycle", 200, diffs);
+	expectJSONValue(label, sample, "dependencyEdgeDeleteLifecycle", "ok", true, diffs);
+	expectJSONStatus(label, sample, "chapterEdgesAfterLifecycleDelete", 200, diffs);
+	if (
+		typeof lifecycleEdgeId === "string" &&
+		sampleJSONArray(sample, "chapterEdgesAfterLifecycleDelete").some(
+			(edge) => recordBody(edge).id === lifecycleEdgeId,
+		)
+	) {
+		diffs.push(`semantic.${label}.json.chapterEdgesAfterLifecycleDelete.deletedEdgeStillPresent`);
+	}
+	expectJSONStatus(label, sample, "projectGraphAfterDependencyDelete", 200, diffs);
+	if (
+		typeof lifecycleEdgeId === "string" &&
+		sampleJSONArray(sample, "projectGraphAfterDependencyDelete", "edges").some(
+			(edge) => recordBody(edge).id === lifecycleEdgeId,
+		)
+	) {
+		diffs.push(`semantic.${label}.json.projectGraphAfterDependencyDelete.deletedEdgeStillPresent`);
 	}
 	expectJSONStatus(label, sample, "chapterEdgesMissingScope", 400, diffs);
 	expectJSONStatus(label, sample, "chapterEdgesInvalidTypeReview", 400, diffs);
 	expectJSONStatus(label, sample, "chapterEdgeDeleteMissing", 404, diffs);
 	expectSearchTypes(label, sample, "searchCJK", ["chapter", "message", "narrator"], diffs);
 	expectSearchTypes(label, sample, "searchShortChapter", ["chapter"], diffs);
+	expectSearchTypes(label, sample, "searchLargeTopK", ["chapter", "message", "narrator"], diffs);
+	expectSearchTypes(label, sample, "searchLargeTieBreak", ["chapter"], diffs);
 	expectSearchFixtureContracts(label, sample, diffs);
 	expectJSONStatus(label, sample, "routines", 200, diffs);
 	expectJSONArray(label, sample, "routines", "routines", diffs);
@@ -4624,10 +6238,11 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	if (
 		cachedNugQuota.balance !== 12.5 ||
 		cachedNugQuota.totalGranted !== 50 ||
-		cachedNugQuotaKeys !== "balance,totalGranted"
+		cachedNugQuota.detailedQuotaBalance !== null ||
+		cachedNugQuotaKeys !== "balance,detailedQuotaBalance,totalGranted"
 	) {
 		diffs.push(
-			`semantic.${label}.json.userNugQuotas.nug-secret-fixture expected cached balance/totalGranted-only payload got ${JSON.stringify(cachedNugQuota)}`,
+			`semantic.${label}.json.userNugQuotas.nug-secret-fixture expected cached balance/totalGranted/null-detail payload got ${JSON.stringify(cachedNugQuota)}`,
 		);
 	}
 	expectJSONStatus(label, sample, "userNugChannelsHealth", 200, diffs);
@@ -4808,17 +6423,44 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 		expectJSONArray(label, sample, "runtimeCleanupTerminals", "errors", diffs);
 		const explicitGoHealthCapabilities: Array<[string[], unknown]> = [
 			[["chapters", "split", "supported"], true],
-			[["chapters", "containers", "routes", "setup"], true],
-			[["chapters", "containers", "routes", "podmanStatus"], true],
-			[["chapters", "containers", "routes", "podmanInstall"], true],
-			[["chapters", "containers", "routes", "composeInfo"], true],
-			[["chapters", "containers", "routes", "list"], true],
-			[["chapters", "containers", "routes", "start"], true],
-			[["chapters", "containers", "routes", "stop"], true],
-			[["chapters", "containers", "routes", "pause"], true],
-			[["chapters", "containers", "routes", "unpause"], true],
-			[["chapters", "containers", "routes", "logs"], true],
-			[["chapters", "containers", "routes", "remove"], true],
+			[["chapters", "containers", "routeContract", "setup"], "GET /api/chapters/container-setup"],
+			[
+				["chapters", "containers", "routeContract", "podmanStatus"],
+				"GET /api/chapters/podman/status",
+			],
+			[
+				["chapters", "containers", "routeContract", "podmanInstall"],
+				"POST /api/chapters/podman/install",
+			],
+			[
+				["chapters", "containers", "routeContract", "composeInfo"],
+				"GET /api/chapters/{id}/compose-info",
+			],
+			[["chapters", "containers", "routeContract", "list"], "GET /api/chapters/{id}/containers"],
+			[
+				["chapters", "containers", "routeContract", "start"],
+				"POST /api/chapters/{id}/containers/start",
+			],
+			[
+				["chapters", "containers", "routeContract", "stop"],
+				"POST /api/chapters/{id}/containers/stop",
+			],
+			[
+				["chapters", "containers", "routeContract", "pause"],
+				"POST /api/chapters/{id}/containers/pause",
+			],
+			[
+				["chapters", "containers", "routeContract", "unpause"],
+				"POST /api/chapters/{id}/containers/unpause",
+			],
+			[
+				["chapters", "containers", "routeContract", "logs"],
+				"GET /api/chapters/{id}/containers/logs",
+			],
+			[
+				["chapters", "containers", "routeContract", "remove"],
+				"POST /api/chapters/{id}/containers/remove",
+			],
 			[["terminal", "supported"], true],
 			[["vnet", "supported"], true],
 			[["vnet", "ws"], true],
@@ -4842,7 +6484,7 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 			[["shares", "preview", "supported"], true],
 			[["storage", "database", "preview"], true],
 			[["benchmark", "containerExecution", "supported"], true],
-			[["narrator", "toolInventory", "supported"], true],
+			[["narrator", "toolInventory", "capabilityContract"], true],
 			[["content", "projectRoutines", "supported"], true],
 			[["content", "projectSkills", "supported"], true],
 		];
@@ -4886,7 +6528,7 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 			sample,
 			"health",
 			["capabilities", "chapters", "split", "partials", "compressedAISummary", "mode"],
-			"deterministic-summary-placeholder",
+			"bounded-ref-copy-with-deterministic-context-note",
 			diffs,
 		);
 		expectJSONPathValue(
@@ -4894,7 +6536,7 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 			sample,
 			"health",
 			["capabilities", "chapters", "split", "partials", "compressedAISummary", "reason"],
-			"Go split compressed context uses a deterministic placeholder summary instead of a TypeScript-equivalent model-generated summary.",
+			"Go split compressed context copies bounded message refs and records a deterministic context note instead of generating a TypeScript-equivalent model summary.",
 			diffs,
 		);
 		expectJSONPathValue(
@@ -5030,6 +6672,19 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	}
 }
 
+function expectSearchOrderDiffClean(
+	ts: BackendSample,
+	go: BackendSample,
+	name: string,
+	diffs: string[],
+): void {
+	const tsKeys = searchResultKeys(ts, name);
+	const goKeys = searchResultKeys(go, name);
+	if (tsKeys.join(",") !== goKeys.join(",")) {
+		diffs.push(`json.${name}.resultOrder TS=${tsKeys.join(",")} Go=${goKeys.join(",")}`);
+	}
+}
+
 function summarize(sample: BackendSample): unknown {
 	return {
 		json: Object.fromEntries(
@@ -5064,6 +6719,8 @@ function diffSamples(ts: BackendSample, go: BackendSample): string[] {
 	const diffs: string[] = [];
 	appendSemanticDiffs("TS", ts, diffs);
 	appendSemanticDiffs("Go", go, diffs);
+	expectSearchOrderDiffClean(ts, go, "searchLargeTopK", diffs);
+	expectSearchOrderDiffClean(ts, go, "searchLargeTieBreak", diffs);
 	for (const key of Object.keys(ts.json)) {
 		const a = ts.json[key];
 		const b = go.json[key];
@@ -5162,6 +6819,11 @@ async function main() {
 			nugBaseUrl,
 		);
 		seedSearchFixture(home);
+		resetProjectCreateFixture(home);
+		resetChapterCreateFixture(home);
+		resetChapterDormantWakeFixture(home);
+		seedProjectRealCleanupWarningFixture(home);
+		seedProjectDeleteFixture(home);
 		const ts = await collect(
 			tsUrl,
 			token,
@@ -5176,6 +6838,12 @@ async function main() {
 		await stopProcess(tsProc);
 		tsProc = undefined;
 		seedClineModelCacheFixture(home);
+		seedChapterDeleteFixture(home);
+		resetProjectCreateFixture(home);
+		resetChapterCreateFixture(home);
+		resetChapterDormantWakeFixture(home);
+		seedProjectRealCleanupWarningFixture(home);
+		seedProjectDeleteFixture(home);
 
 		const goBinary = await buildGoBinary(home);
 		goProc = spawnGo(home, goPort, goBinary, providerFixture.url);

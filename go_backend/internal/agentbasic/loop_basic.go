@@ -54,19 +54,23 @@ func RunAgentLoop(ctx context.Context, settings *config.Store, model string, his
 		options.customRetryRules = append(options.customRetryRules, rules...)
 		options.customRetryRules = normalizeCustomRetryRules(options.customRetryRules)
 	}
-	return runAgentLoop(ctx, resolution, history, cwd, options), nil
+	return runAgentLoopWithSettings(ctx, settings, resolution, history, cwd, options), nil
 }
 
 func runAgentLoop(ctx context.Context, resolution ProviderResolution, history []Message, cwd string, options generateOptions) <-chan AgentEvent {
+	return runAgentLoopWithSettings(ctx, nil, resolution, history, cwd, options)
+}
+
+func runAgentLoopWithSettings(ctx context.Context, settings *config.Store, resolution ProviderResolution, history []Message, cwd string, options generateOptions) <-chan AgentEvent {
 	out := make(chan AgentEvent, 32)
 	go func() {
 		defer close(out)
-		runAgentLoopSync(ctx, out, resolution, history, cwd, options)
+		runAgentLoopSync(ctx, out, settings, resolution, history, cwd, options)
 	}()
 	return out
 }
 
-func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution ProviderResolution, history []Message, cwd string, options generateOptions) {
+func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, settings *config.Store, resolution ProviderResolution, history []Message, cwd string, options generateOptions) {
 	adapter := resolution.Adapter
 	if adapter == nil {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "provider adapter is not configured"})
@@ -91,6 +95,14 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 		if options.beforeTurnHook != nil {
 			if err := options.beforeTurnHook(turn); err != nil {
 				emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+				return
+			}
+		}
+		if turn > 0 {
+			if !applyRuntimeSettingsOverride(ctx, out, settings, turn, &resolution, &adapter, &options) {
+				return
+			}
+			if !applyBeforeTurnReplacement(ctx, out, turn, adapter, resolution, &built, &options) {
 				return
 			}
 		}
@@ -126,6 +138,78 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, resolution Pro
 		}
 	}
 	emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "tool loop reached maximum rounds without final answer"})
+}
+
+func applyRuntimeSettingsOverride(ctx context.Context, out chan<- AgentEvent, settings *config.Store, turn int, resolution *ProviderResolution, adapter *ProviderAdapter, options *generateOptions) bool {
+	if options.runtimeSettingsOverrideHook == nil {
+		return true
+	}
+	override, err := options.runtimeSettingsOverrideHook(turn)
+	if err != nil {
+		emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+		return false
+	}
+	if override == nil {
+		return true
+	}
+	modelChanged := false
+	reasoningChanged := false
+	if requestedModel := strings.TrimSpace(override.Model); requestedModel != "" {
+		if prefix, _ := splitModel(requestedModel); prefix == "" && resolution.Provider != "" && !strings.HasPrefix(requestedModel, "__") {
+			requestedModel = resolution.Provider + ":" + requestedModel
+		}
+		nextResolution, err := ResolveProviderAndModel(settings, requestedModel)
+		if err != nil {
+			emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+			return false
+		}
+		if nextResolution.Adapter == nil {
+			emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "provider adapter is not configured"})
+			return false
+		}
+		if nextResolution.Model != resolution.Model || nextResolution.Provider != resolution.Provider {
+			modelChanged = true
+		}
+		*resolution = nextResolution
+		*adapter = nextResolution.Adapter
+	}
+	if override.ReasoningEffort != nil {
+		nextReasoning := normalizeReasoningEffort(*override.ReasoningEffort)
+		if nextReasoning != options.reasoningEffort {
+			reasoningChanged = true
+			options.reasoningEffort = nextReasoning
+		}
+	}
+	if modelChanged || reasoningChanged {
+		switched := &ModelSwitchedEvent{Model: resolution.Model, Provider: resolution.Provider, ReasoningEffort: options.reasoningEffort, Cause: "turn"}
+		emitAgentEvent(ctx, out, AgentEvent{Type: "model_switched", Provider: switched.Provider, Model: switched.Model, Message: switched.Cause, Metadata: map[string]any{"reasoningEffort": switched.ReasoningEffort}, ModelSwitched: switched})
+	}
+	return true
+}
+
+func applyBeforeTurnReplacement(ctx context.Context, out chan<- AgentEvent, turn int, adapter ProviderAdapter, resolution ProviderResolution, built *BuiltHistory, options *generateOptions) bool {
+	if options.beforeTurnReplacementHook == nil {
+		return true
+	}
+	replacement, err := options.beforeTurnReplacementHook(turn)
+	if err != nil {
+		emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+		return false
+	}
+	if replacement == nil {
+		return true
+	}
+	rebuilt, err := adapter.BuildHistory(replacement.Messages, resolution.Model, "")
+	if err != nil {
+		emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: err.Error()})
+		return false
+	}
+	if replacement.SystemPrompt != nil {
+		options.systemPrompt = strings.TrimSpace(*replacement.SystemPrompt)
+	}
+	adapter.InjectSystemPrompt(&rebuilt, options.systemPrompt, resolution.Model, "")
+	*built = rebuilt
+	return true
 }
 
 type turnState struct {
@@ -230,13 +314,26 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 	requestCredentialID := strings.TrimSpace(resolution.Config.CredentialID)
 	emitAgentEvent(ctx, out, AgentEvent{Type: "api_request_start", RequestID: requestID, Provider: resolution.Provider, Model: resolution.Model, CredentialID: requestCredentialID})
 	var lastUsage *UsageSnapshot
+	requestContextPercent := 0.0
+	requestMeterUsage := 0.0
+	requestMeterUnit := ""
 	apiRequestFinished := false
 	finishAPIRequest := func(message string) {
 		if apiRequestFinished {
 			return
 		}
 		apiRequestFinished = true
-		emitAgentEvent(ctx, out, AgentEvent{Type: "api_request_end", RequestID: requestID, Provider: resolution.Provider, Model: resolution.Model, CredentialID: requestCredentialID, Usage: lastUsage, Message: strings.TrimSpace(message), DurationMs: time.Since(requestStartedAt).Milliseconds()})
+		metadata := map[string]any{}
+		if requestMeterUsage > 0 {
+			metadata["meterUsage"] = requestMeterUsage
+			if strings.TrimSpace(requestMeterUnit) != "" {
+				metadata["meterUnit"] = requestMeterUnit
+			}
+		}
+		if len(metadata) == 0 {
+			metadata = nil
+		}
+		emitAgentEvent(ctx, out, AgentEvent{Type: "api_request_end", RequestID: requestID, Provider: resolution.Provider, Model: resolution.Model, CredentialID: requestCredentialID, Usage: lastUsage, Message: strings.TrimSpace(message), DurationMs: time.Since(requestStartedAt).Milliseconds(), Percentage: requestContextPercent, Metadata: metadata})
 	}
 	stream, err := adapter.Chat(turnCtx, ChatParams{
 		Model:            resolution.Model,
@@ -301,7 +398,8 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 				return state, errTerminalEvent
 			}
 			if parsed.CredentialID != "" {
-				state.credentialID = parsed.CredentialID
+				requestCredentialID = strings.TrimSpace(parsed.CredentialID)
+				state.credentialID = requestCredentialID
 			}
 			if parsed.TextOutputIndex != nil {
 				state.textOutputIndex = parsed.TextOutputIndex
@@ -329,11 +427,19 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 				state.redacted = append(state.redacted, parsed.RedactedThinking)
 			}
 			if parsed.ContextUsagePercentage != nil {
+				requestContextPercent = *parsed.ContextUsagePercentage
 				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Percentage: *parsed.ContextUsagePercentage, Usage: parsed.Usage})
 			} else if parsed.Usage != nil {
+				if pct := usageContextPercent(parsed.Usage); pct > 0 {
+					requestContextPercent = pct
+				}
 				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Usage: parsed.Usage})
 			}
-			emitProviderLifecycleEvents(ctx, out, parsed, resolution.Provider, resolution.Model)
+			if parsed.Metering != nil {
+				requestMeterUsage = parsed.Metering.Usage
+				requestMeterUnit = parsed.Metering.Unit
+			}
+			emitProviderLifecycleEvents(ctx, out, parsed, resolution.Provider, resolution.Model, requestCredentialID)
 			if parsed.InvalidState != nil {
 				finishAPIRequest(firstNonEmpty(parsed.InvalidState.Message, parsed.InvalidState.Reason))
 				return state, &providerInvalidStateError{
@@ -358,7 +464,25 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 var errTerminalEvent = errors.New("terminal agent event emitted")
 
 func parsedHasMeaningfulResponse(parsed ParsedStreamEvent) bool {
-	return parsed.Text != "" || parsed.Reasoning != "" || len(parsed.ToolUses) > 0 || parsed.ToolUseChunk != nil
+	return parsed.Text != "" || parsed.Reasoning != "" || len(parsed.ToolUses) > 0 || parsed.ToolUseChunk != nil || parsed.WebSearch != nil || parsed.ImageGeneration != nil || parsed.InvalidState != nil || parsed.OutputTruncated != "" || parsed.APIRequest != nil || parsed.Metering != nil || parsed.QuotaBalance != nil || parsed.NkpQuotaBalance != nil || parsed.QueueStatus != nil || parsed.NkpQueue != nil
+}
+
+func usageContextPercent(usage *UsageSnapshot) float64 {
+	if usage == nil || usage.ContextWindow <= 0 {
+		return 0
+	}
+	inputTokens := usage.PromptTokens
+	if inputTokens == 0 {
+		inputTokens = usage.InputTokens
+	}
+	if inputTokens <= 0 {
+		return 0
+	}
+	pct := float64(inputTokens) / float64(usage.ContextWindow) * 100
+	if pct > 100 {
+		return 100
+	}
+	return pct
 }
 
 func handleToolUseChunk(ctx context.Context, out chan<- AgentEvent, state *turnState, chunks map[string]*toolChunkAccum, chunk *ToolUseChunk, cwd string, toolExecutor ToolExecutor) {
@@ -816,6 +940,7 @@ func emitProviderLifecycleEvents(
 	parsed ParsedStreamEvent,
 	provider string,
 	model string,
+	credentialID string,
 ) {
 	if parsed.WebSearch != nil {
 		ws := parsed.WebSearch
@@ -835,7 +960,7 @@ func emitProviderLifecycleEvents(
 		emitAgentEvent(ctx, out, AgentEvent{Type: "output_truncated", Message: parsed.OutputTruncated})
 	}
 	if parsed.ModelSwitched != nil {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "model_switched", Provider: parsed.ModelSwitched.Provider, Model: parsed.ModelSwitched.Model, Message: parsed.ModelSwitched.Cause, Metadata: map[string]any{"reasoningEffort": parsed.ModelSwitched.ReasoningEffort}})
+		emitAgentEvent(ctx, out, AgentEvent{Type: "model_switched", Provider: parsed.ModelSwitched.Provider, Model: parsed.ModelSwitched.Model, Message: parsed.ModelSwitched.Cause, Metadata: map[string]any{"reasoningEffort": parsed.ModelSwitched.ReasoningEffort}, ModelSwitched: parsed.ModelSwitched})
 	}
 	if parsed.NkpQueue != nil {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "nkp_queue_status", Message: parsed.NkpQueue.QueueMessage, Metadata: map[string]any{"position": parsed.NkpQueue.Position, "queueDepth": parsed.NkpQueue.QueueDepth}})
@@ -847,7 +972,7 @@ func emitProviderLifecycleEvents(
 		emitAgentEvent(ctx, out, AgentEvent{Type: "queue_status", Message: parsed.QueueStatus.QueueMessage, Metadata: map[string]any{"position": parsed.QueueStatus.Position, "queueDepth": parsed.QueueStatus.QueueDepth}})
 	}
 	if parsed.Metering != nil {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "metering", Metadata: map[string]any{"unit": parsed.Metering.Unit, "unitPlural": parsed.Metering.UnitPlural, "usage": parsed.Metering.Usage}})
+		emitAgentEvent(ctx, out, AgentEvent{Type: "metering", CredentialID: credentialID, Metadata: map[string]any{"unit": parsed.Metering.Unit, "unitPlural": parsed.Metering.UnitPlural, "usage": parsed.Metering.Usage}})
 	}
 	if parsed.QuotaBalance != nil {
 		detailedQuotaBalance := ""

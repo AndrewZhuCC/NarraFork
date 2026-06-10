@@ -245,13 +245,16 @@ func run() error {
 	defer gatewayRuntime.Stop()
 	chapterService := chapters.NewService(dbStore.SQL, gitService, narratorService, terminalRuntime, settings)
 	chapterService.SetMergeProgressBroadcaster(hub.BroadcastMergeProgress)
+	chapterService.SetChapterLifecycleBroadcasters(hub.BroadcastMergeProgress, hub.BroadcastUser)
 	if cleaned, err := chapterService.CleanupStaleMergeSessions(ctx); err != nil {
 		slog.Warn("merge session cleanup failed", "error", err)
 	} else if cleaned > 0 {
 		slog.Info("cleaned up stale merge sessions", "count", cleaned)
 	}
 	projectService := projects.NewService(dbStore.SQL, gitService, chapterService, settings)
+	projectService.SetUserBroadcaster(hub.BroadcastUser)
 	containerProxy := containerproxy.New(dbStore.SQL, settings)
+	projectService.SetProxyCacheRefresher(containerProxy.EnsureCurrent)
 	if err := containerProxy.EnsureCurrent(ctx); err != nil {
 		slog.Warn("container proxy startup failed", "error", err)
 	}

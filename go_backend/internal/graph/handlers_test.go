@@ -167,6 +167,74 @@ func TestGraphRouteRefreshesGitAndReturnsLiveMetadata(t *testing.T) {
 	}
 }
 
+func TestGraphRouteSurfacesReviewAndMergeLifecycleSideEffects(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, worktree_path, is_root, anchor_commit_sha, axis_offset, cross_offset, commit_count, head_commit_sha, panel_expanded, review_source_chapter_id, review_status, created_at, updated_at)
+		VALUES
+		('source', 'p1', 'Source', 'merged', 'feature/source', 'branch', NULL, 0, 'source-anchor', 10, 20, 3, 'source-head', 0, NULL, NULL, 'now', 'now'),
+		('target', 'p1', 'Target', 'active', 'main', 'trunk', NULL, 1, 'target-anchor', 0, 0, 9, 'target-head', 1, NULL, NULL, 'now', 'now'),
+		('review', 'p1', 'Review: Source', 'active', 'review/source', 'review', NULL, 0, 'review-anchor', 30, 40, 0, 'review-head', 0, 'source', 'reviewing', 'now', 'now')`)
+	if err != nil {
+		t.Fatalf("insert review/merge chapters: %v", err)
+	}
+	_, err = sqlDB.Exec(`INSERT INTO narrators (id, chapter_id, status, substatus, message_version, created_at) VALUES
+		('n-review', 'review', 'idle', '[]', 1, 'now'),
+		('n-target', 'target', 'idle', '[]', 5, 'now')`)
+	if err != nil {
+		t.Fatalf("insert narrators: %v", err)
+	}
+	_, err = sqlDB.Exec(`INSERT INTO chapter_edges (id, project_id, source_id, target_id, type, metadata, created_at) VALUES
+		('edge-review', 'p1', 'source', 'review', 'review', '{"commitSha":"source-head"}', 'now'),
+		('edge-merge', 'p1', 'source', 'target', 'merge', '{"commitSha":"merge-sha","strategy":"merge","preMergeTargetSha":"pre-target","status":"completed"}', 'now')`)
+	if err != nil {
+		t.Fatalf("insert lifecycle edges: %v", err)
+	}
+
+	body := serveGraphRequest(t, NewHandler(sqlDB), http.MethodGet, "/p1/graph", "")
+	if body["degraded"] != false {
+		t.Fatalf("review/merge lifecycle graph should not be degraded: %#v", body)
+	}
+	nodesByID := graphNodesByID(t, body)
+	reviewNode := nodesByID["review"]
+	if reviewNode["type"] != "reviewNode" {
+		t.Fatalf("review chapter should render as reviewNode, got %#v", reviewNode)
+	}
+	reviewData := reviewNode["data"].(map[string]any)
+	if reviewData["role"] != "review" || reviewData["reviewSourceChapterId"] != "source" || reviewData["reviewStatus"] != "reviewing" {
+		t.Fatalf("review node missing source/status fields: %#v", reviewData)
+	}
+	if reviewData["narratorId"] != "n-review" || reviewData["narratorMessageVersion"] != float64(1) {
+		t.Fatalf("review narrator metadata missing from graph node: %#v", reviewData)
+	}
+
+	sourceData := nodesByID["source"]["data"].(map[string]any)
+	if sourceData["status"] != "merged" || sourceData["headCommitSha"] != "source-head" || sourceData["commitCount"] != float64(3) {
+		t.Fatalf("merged source graph node should preserve merge-side fields, got %#v", sourceData)
+	}
+	targetData := nodesByID["target"]["data"].(map[string]any)
+	if targetData["role"] != "trunk" || targetData["headCommitSha"] != "target-head" || targetData["commitCount"] != float64(9) || targetData["narratorMessageVersion"] != float64(5) {
+		t.Fatalf("target graph node missing merge target metadata: %#v", targetData)
+	}
+
+	edgesByID := graphEdgesByID(t, body)
+	reviewEdge := edgesByID["edge-review"]
+	if reviewEdge["source"] != "source" || reviewEdge["target"] != "review" || reviewEdge["type"] != "review" {
+		t.Fatalf("review edge mismatch: %#v", reviewEdge)
+	}
+	reviewMeta := reviewEdge["metadata"].(map[string]any)
+	if reviewMeta["commitSha"] != "source-head" {
+		t.Fatalf("review edge metadata should expose source commit, got %#v", reviewMeta)
+	}
+	mergeEdge := edgesByID["edge-merge"]
+	if mergeEdge["source"] != "source" || mergeEdge["target"] != "target" || mergeEdge["type"] != "merge" {
+		t.Fatalf("merge edge mismatch: %#v", mergeEdge)
+	}
+	mergeMeta := mergeEdge["metadata"].(map[string]any)
+	if mergeMeta["commitSha"] != "merge-sha" || mergeMeta["strategy"] != "merge" || mergeMeta["preMergeTargetSha"] != "pre-target" || mergeMeta["status"] != "completed" {
+		t.Fatalf("merge edge metadata should expose merge lifecycle fields, got %#v", mergeMeta)
+	}
+}
+
 func TestGraphRouteOnlyUsesLightweightGitMetadataRefresh(t *testing.T) {
 	sqlDB := newGraphTestDB(t)
 	worktree := t.TempDir()
@@ -478,6 +546,48 @@ func readGraphTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func graphNodesByID(t *testing.T, body map[string]any) map[string]map[string]any {
+	t.Helper()
+	nodes, ok := body["nodes"].([]any)
+	if !ok {
+		t.Fatalf("graph response nodes should be array: %#v", body["nodes"])
+	}
+	byID := map[string]map[string]any{}
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("graph node should be object: %#v", raw)
+		}
+		id, ok := node["id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("graph node missing id: %#v", node)
+		}
+		byID[id] = node
+	}
+	return byID
+}
+
+func graphEdgesByID(t *testing.T, body map[string]any) map[string]map[string]any {
+	t.Helper()
+	edges, ok := body["edges"].([]any)
+	if !ok {
+		t.Fatalf("graph response edges should be array: %#v", body["edges"])
+	}
+	byID := map[string]map[string]any{}
+	for _, raw := range edges {
+		edge, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("graph edge should be object: %#v", raw)
+		}
+		id, ok := edge["id"].(string)
+		if !ok || id == "" {
+			t.Fatalf("graph edge missing id: %#v", edge)
+		}
+		byID[id] = edge
+	}
+	return byID
 }
 
 func serveGraphRequest(t *testing.T, h *Handler, method, path, requestBody string) map[string]any {

@@ -107,6 +107,20 @@ type ToolExecutor func(ctx context.Context, cwd string, call ToolCall) (ToolRun,
 
 type BeforeTurnHook func(turnIndex int) error
 
+type BeforeTurnReplacement struct {
+	Messages     []Message
+	SystemPrompt *string
+}
+
+type BeforeTurnReplacementHook func(turnIndex int) (*BeforeTurnReplacement, error)
+
+type RuntimeSettingsOverride struct {
+	Model           string
+	ReasoningEffort *string
+}
+
+type RuntimeSettingsOverrideHook func(turnIndex int) (*RuntimeSettingsOverride, error)
+
 type ShouldStopHook func() bool
 
 type ExternalToolSpec struct {
@@ -161,6 +175,8 @@ type generateOptions struct {
 	silentToolCallThresholdConfigured bool
 	silentToolCallCount               int
 	beforeTurnHook                    BeforeTurnHook
+	beforeTurnReplacementHook         BeforeTurnReplacementHook
+	runtimeSettingsOverrideHook       RuntimeSettingsOverrideHook
 	shouldStopHook                    ShouldStopHook
 }
 
@@ -266,6 +282,18 @@ func WithSilentToolCallThreshold(threshold int) GenerateOption {
 func WithBeforeTurnHook(hook BeforeTurnHook) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.beforeTurnHook = hook
+	}
+}
+
+func WithBeforeTurnReplacementHook(hook BeforeTurnReplacementHook) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.beforeTurnReplacementHook = hook
+	}
+}
+
+func WithRuntimeSettingsOverrideHook(hook RuntimeSettingsOverrideHook) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.runtimeSettingsOverrideHook = hook
 	}
 }
 

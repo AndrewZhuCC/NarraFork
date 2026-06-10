@@ -91,6 +91,36 @@ func TestCanonicalSchemaContractCoveredBySavedSnapshot(t *testing.T) {
 	}
 }
 
+func TestSavedSchemaSnapshotFreezesCanonicalColumnMetadata(t *testing.T) {
+	snapshot := loadSavedSchemaSnapshot(t)
+	columns := savedSnapshotColumnMetadata(snapshot)
+	for _, expected := range canonicalColumnMetadata {
+		actual, ok := columns[expected.Table+"."+expected.Column]
+		if !ok {
+			t.Fatalf("saved snapshot is missing canonical metadata column %s.%s", expected.Table, expected.Column)
+		}
+		columnName := expected.Table + "." + expected.Column
+		if expected.Type != "" && actual.Type != expected.Type {
+			t.Fatalf("saved snapshot column %s type = %q, want %q", columnName, actual.Type, expected.Type)
+		}
+		if expected.NotNull != nil && actual.NotNull != *expected.NotNull {
+			t.Fatalf("saved snapshot column %s notNull = %t, want %t", columnName, actual.NotNull, *expected.NotNull)
+		}
+		if expected.DefaultValue != nil {
+			actualDefault := "<none>"
+			if actual.DefaultValue != nil {
+				actualDefault = *actual.DefaultValue
+			}
+			if actualDefault != *expected.DefaultValue {
+				t.Fatalf("saved snapshot column %s default = %q, want %q", columnName, actualDefault, *expected.DefaultValue)
+			}
+		}
+		if expected.PrimaryKey != nil && actual.PK != *expected.PrimaryKey {
+			t.Fatalf("saved snapshot column %s pk = %d, want %d", columnName, actual.PK, *expected.PrimaryKey)
+		}
+	}
+}
+
 func TestSavedSnapshotDoesNotContainGoMigrationJournal(t *testing.T) {
 	snapshot := loadSavedSchemaSnapshot(t)
 	objects := savedSnapshotObjects(snapshot)
@@ -147,6 +177,16 @@ func savedSnapshotTables(snapshot SQLiteSchemaSnapshot) map[string]map[string]st
 		tables[table.Name] = columns
 	}
 	return tables
+}
+
+func savedSnapshotColumnMetadata(snapshot SQLiteSchemaSnapshot) map[string]SQLiteColumnSnapshot {
+	columns := map[string]SQLiteColumnSnapshot{}
+	for _, table := range snapshot.Tables {
+		for _, column := range table.Columns {
+			columns[table.Name+"."+column.Name] = column
+		}
+	}
+	return columns
 }
 
 func savedSnapshotIndexes(snapshot SQLiteSchemaSnapshot) map[string]SQLiteIndexSnapshot {

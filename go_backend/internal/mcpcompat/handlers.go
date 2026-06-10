@@ -961,7 +961,12 @@ func (h *Handler) importServers(w http.ResponseWriter, r *http.Request) error {
 			skipped++
 			continue
 		}
-		body := map[string]any{"id": id.Short(), "name": name, "transport": detectTransport(cfg), "enabled": enabledBool(cfg)}
+		transport := detectTransport(cfg)
+		if transport != "stdio" {
+			skipped++
+			continue
+		}
+		body := map[string]any{"id": id.Short(), "name": name, "transport": transport, "enabled": enabledBool(cfg)}
 		copyOptionalServerFields(body, cfg)
 		server, err := normalizeServerConfig(body, stringOr(body["id"], id.Short()), false)
 		if err != nil {

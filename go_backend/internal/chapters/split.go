@@ -564,7 +564,10 @@ func (s *Service) clonePrimaryNarratorsForSplitTx(ctx context.Context, tx *sql.T
 	contextSummary := any(nil)
 	newForkSystemPrompt := prefixSystemPrompt
 	if input.InheritMode == "compressed" {
-		summary := fmt.Sprintf("Go backend compressed split fallback: copied %d prefix message reference(s) instead of generating an AI context summary.", len(newForkRefs))
+		summary, err := splitCompressedFallbackSummaryTx(ctx, tx, newForkRefs)
+		if err != nil {
+			return err
+		}
 		contextSummary = summary
 		if prompt, ok := newForkSystemPrompt.(string); ok && strings.TrimSpace(prompt) != "" {
 			newForkSystemPrompt = prompt + "\n\n## Previous Context Summary\n\n" + summary
@@ -582,6 +585,57 @@ func (s *Service) clonePrimaryNarratorsForSplitTx(ctx context.Context, tx *sql.T
 		return err
 	}
 	return insertSplitRefsTx(ctx, tx, newForkNarratorID, newForkRefs)
+}
+
+const maxSplitCompressedFallbackExcerpts = 6
+const maxSplitCompressedFallbackExcerptRunes = 240
+
+func splitCompressedFallbackSummaryTx(ctx context.Context, tx *sql.Tx, refs []splitMessageRef) (string, error) {
+	base := fmt.Sprintf("Go backend compressed split fallback: copied %d prefix message reference(s) instead of generating an AI context summary.", len(refs))
+	if len(refs) == 0 {
+		return base, nil
+	}
+	start := 0
+	if len(refs) > maxSplitCompressedFallbackExcerpts {
+		start = len(refs) - maxSplitCompressedFallbackExcerpts
+	}
+	lines := []string{base, "", "Deterministic prefix transcript excerpts:"}
+	if start > 0 {
+		lines = append(lines, fmt.Sprintf("- ... %d earlier prefix message reference(s) omitted", start))
+	}
+	for _, ref := range refs[start:] {
+		role, text, err := splitMessageExcerptTx(ctx, tx, ref.MessageID)
+		if err != nil {
+			return "", err
+		}
+		lines = append(lines, fmt.Sprintf("- #%d %s: %s", ref.Seq, role, text))
+	}
+	return strings.Join(lines, "\n"), nil
+}
+
+func splitMessageExcerptTx(ctx context.Context, tx *sql.Tx, messageID string) (string, string, error) {
+	var role sql.NullString
+	var text sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT role, content_text FROM narrator_messages WHERE id = ?`, messageID).Scan(&role, &text); err != nil {
+		return "", "", err
+	}
+	roleText := strings.TrimSpace(sqlNullString(role))
+	if roleText == "" {
+		roleText = "message"
+	}
+	excerpt := strings.TrimSpace(sqlNullString(text))
+	if excerpt == "" {
+		excerpt = "[non-text content]"
+	}
+	return roleText, truncateSplitSummaryExcerpt(excerpt), nil
+}
+
+func truncateSplitSummaryExcerpt(text string) string {
+	runes := []rune(strings.Join(strings.Fields(text), " "))
+	if len(runes) <= maxSplitCompressedFallbackExcerptRunes {
+		return string(runes)
+	}
+	return strings.TrimSpace(string(runes[:maxSplitCompressedFallbackExcerptRunes])) + "…"
 }
 
 func splitPrimaryNarratorSeedTx(ctx context.Context, tx *sql.Tx, chapterID string) (splitNarratorSeed, bool, error) {

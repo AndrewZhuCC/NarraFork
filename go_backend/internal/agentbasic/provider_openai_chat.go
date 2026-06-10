@@ -475,15 +475,16 @@ type responsesStreamEvent struct {
 }
 
 type responsesOutputItem struct {
-	Type          string `json:"type"`
-	ID            string `json:"id"`
-	CallID        string `json:"call_id"`
-	Name          string `json:"name"`
-	Arguments     string `json:"arguments"`
-	Status        string `json:"status"`
-	Query         string `json:"query"`
-	RevisedPrompt string `json:"revised_prompt"`
-	Result        string `json:"result"`
+	Type          string         `json:"type"`
+	ID            string         `json:"id"`
+	CallID        string         `json:"call_id"`
+	Name          string         `json:"name"`
+	Arguments     string         `json:"arguments"`
+	Status        string         `json:"status"`
+	Query         string         `json:"query"`
+	Action        map[string]any `json:"action"`
+	RevisedPrompt string         `json:"revised_prompt"`
+	Result        string         `json:"result"`
 }
 
 func streamCodexWithFailover(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, sessionKey string, out chan<- StreamEvent) error {
@@ -682,6 +683,20 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 			if parsed.Item != nil {
 				handleResponsesOutputItemAdded(ctx, out, toolsByItem, parsed.Item, parsed.OutputIndex)
 			}
+		case "response.output_item.done":
+			if parsed.Item != nil {
+				handleResponsesOutputItemDone(ctx, out, parsed.Item, parsed.OutputIndex)
+			}
+		case "response.web_search_call.in_progress":
+			emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "in_progress", parsed.OutputIndex)
+		case "response.web_search_call.searching":
+			emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "searching", parsed.OutputIndex)
+		case "response.web_search_call.completed":
+			emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
+		case "response.image_generation_call.generating", "response.image_generation_call.partial_image":
+			emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "generating", parsed.OutputIndex)
+		case "response.image_generation_call.completed":
+			emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
 		case "response.function_call_arguments.delta":
 			tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 			tool.Arguments += parsed.Delta
@@ -1039,10 +1054,44 @@ func handleResponsesOutputItemAdded(ctx context.Context, out chan<- StreamEvent,
 			tool.Stopped = true
 		}
 	case "web_search_call":
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{ID: item.ID, Status: item.Status, Query: item.Query, OutputIndex: outputIndex, Final: true}, ResponsesAPI: true}})
+		emitResponsesWebSearchStatus(ctx, out, item.ID, "in_progress", outputIndex)
 	case "image_generation_call":
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: item.ID, Status: item.Status, RevisedPrompt: item.RevisedPrompt, Result: item.Result, OutputIndex: outputIndex, Final: true}, ResponsesAPI: true}})
+		emitResponsesImageGenerationStatus(ctx, out, item.ID, "in_progress", outputIndex)
 	}
+}
+
+func handleResponsesOutputItemDone(ctx context.Context, out chan<- StreamEvent, item *responsesOutputItem, outputIndex *int) {
+	switch item.Type {
+	case "web_search_call":
+		query, queries := responsesWebSearchQueryAndQueries(item)
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{ID: item.ID, Status: "completed", Query: query, Queries: queries, OutputIndex: outputIndex, Final: true, Action: item.Action}, ResponsesAPI: true}})
+	case "image_generation_call":
+		status := firstNonEmpty(item.Status, "completed")
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: item.ID, Status: status, RevisedPrompt: item.RevisedPrompt, Result: item.Result, OutputIndex: outputIndex, Final: true}, ResponsesAPI: true}})
+	}
+}
+
+func emitResponsesWebSearchStatus(ctx context.Context, out chan<- StreamEvent, idValue, status string, outputIndex *int) {
+	emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{ID: idValue, Status: status, OutputIndex: outputIndex}, ResponsesAPI: true}})
+}
+
+func emitResponsesImageGenerationStatus(ctx context.Context, out chan<- StreamEvent, idValue, status string, outputIndex *int) {
+	emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: idValue, Status: status, OutputIndex: outputIndex}, ResponsesAPI: true}})
+}
+
+func responsesWebSearchQueryAndQueries(item *responsesOutputItem) (string, []string) {
+	if item == nil {
+		return "", nil
+	}
+	query := item.Query
+	queries := []string{}
+	if item.Action != nil {
+		if query == "" {
+			query = stringValue(item.Action["query"])
+		}
+		queries = stringList(item.Action["queries"])
+	}
+	return query, queries
 }
 
 func responsesToolForEvent(tools map[string]*openAIStreamingTool, itemID string, outputIndex *int) *openAIStreamingTool {

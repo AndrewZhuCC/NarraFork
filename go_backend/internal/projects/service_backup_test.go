@@ -125,6 +125,57 @@ func TestProjectBackupSyncAndImportFullScope(t *testing.T) {
 	assertColumnValue(t, target, "port_allocations", "port", 18080, "service_name", "web")
 }
 
+func TestProjectBackupSyncPreservesReviewAndMergeLifecycleFields(t *testing.T) {
+	ctx := context.Background()
+	gitPath := t.TempDir()
+	source := openProjectBackupTestDB(t)
+	defer source.Close()
+	insertProjectBackupTestRow(t, source, "projects", map[string]any{
+		"id": "p1", "name": "Project", "status": "active", "flow_mode": "classic",
+		"git_path": gitPath, "default_branch": "main", "chapter_settings": `{"commands":[]}`,
+	})
+	insertProjectBackupTestRow(t, source, "chapters", map[string]any{
+		"id": "source", "project_id": "p1", "title": "Source", "status": "merged", "role": "branch",
+		"branch": "feature/source", "base_branch": "main", "merged_into_chapter_id": "target",
+		"merge_commit_sha": "merge-sha", "merge_strategy": "merge", "pre_merge_target_sha": "pre-target",
+		"head_commit_sha": "source-head", "commit_count": 3,
+	})
+	insertProjectBackupTestRow(t, source, "chapters", map[string]any{
+		"id": "target", "project_id": "p1", "title": "Target", "status": "active", "role": "trunk",
+		"branch": "main", "base_branch": "main", "head_commit_sha": "target-head", "commit_count": 9,
+	})
+	insertProjectBackupTestRow(t, source, "chapters", map[string]any{
+		"id": "review", "project_id": "p1", "title": "Review: Source", "status": "active", "role": "review",
+		"branch": "review/source", "base_branch": "main", "review_source_chapter_id": "source",
+		"review_status": "reviewing", "head_commit_sha": "review-head",
+	})
+	insertProjectBackupTestRow(t, source, "chapter_edges", map[string]any{
+		"id": "edge-review", "project_id": "p1", "source_id": "source", "target_id": "review",
+		"type": "review", "metadata": `{"commitSha":"source-head"}`,
+	})
+	insertProjectBackupTestRow(t, source, "chapter_edges", map[string]any{
+		"id": "edge-merge", "project_id": "p1", "source_id": "source", "target_id": "target",
+		"type": "merge", "metadata": `{"commitSha":"merge-sha","strategy":"merge","preMergeTargetSha":"pre-target","status":"completed"}`,
+	})
+
+	if _, err := (&Service{DB: source}).SyncBackup(ctx, "p1"); err != nil {
+		t.Fatalf("SyncBackup lifecycle fields: %v", err)
+	}
+	backup, err := sql.Open("sqlite", projectDBPath(gitPath))
+	if err != nil {
+		t.Fatalf("open backup db: %v", err)
+	}
+	defer backup.Close()
+	assertLifecycleBackupFields(t, backup)
+
+	target := openProjectBackupTestDB(t)
+	defer target.Close()
+	if _, err := (&Service{DB: target}).ImportBackup(ctx, gitPath); err != nil {
+		t.Fatalf("ImportBackup lifecycle fields: %v", err)
+	}
+	assertLifecycleBackupFields(t, target)
+}
+
 func openProjectBackupTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	db, err := sql.Open("sqlite", ":memory:")
@@ -216,6 +267,22 @@ func defaultProjectBackupTestValue(table string, column projectBackupColumn) any
 		return "[]"
 	}
 	return "test-" + name
+}
+
+func assertLifecycleBackupFields(t *testing.T, db *sql.DB) {
+	t.Helper()
+	assertColumnValue(t, db, "chapters", "id", "source", "status", "merged")
+	assertColumnValue(t, db, "chapters", "id", "source", "merged_into_chapter_id", "target")
+	assertColumnValue(t, db, "chapters", "id", "source", "merge_commit_sha", "merge-sha")
+	assertColumnValue(t, db, "chapters", "id", "source", "merge_strategy", "merge")
+	assertColumnValue(t, db, "chapters", "id", "source", "pre_merge_target_sha", "pre-target")
+	assertColumnValue(t, db, "chapters", "id", "review", "role", "review")
+	assertColumnValue(t, db, "chapters", "id", "review", "review_source_chapter_id", "source")
+	assertColumnValue(t, db, "chapters", "id", "review", "review_status", "reviewing")
+	assertColumnValue(t, db, "chapter_edges", "id", "edge-review", "type", "review")
+	assertColumnValue(t, db, "chapter_edges", "id", "edge-review", "metadata", `{"commitSha":"source-head"}`)
+	assertColumnValue(t, db, "chapter_edges", "id", "edge-merge", "type", "merge")
+	assertColumnValue(t, db, "chapter_edges", "id", "edge-merge", "metadata", `{"commitSha":"merge-sha","strategy":"merge","preMergeTargetSha":"pre-target","status":"completed"}`)
 }
 
 func assertColumnValue(t *testing.T, db *sql.DB, table, keyColumn string, keyValue any, column string, want any) {

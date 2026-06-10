@@ -355,6 +355,7 @@ export const miscApi = {
 			unavailableEntries: CodexCredentialEntry[];
 			availableTotal: number;
 			unavailableTotal: number;
+			unhealthyTotal: number;
 			currentId: string;
 			loadBalancingMode: CodexLoadBalancingMode;
 			tierOrder: CodexPlanTier[];
@@ -421,6 +422,11 @@ export const miscApi = {
 			method: "DELETE",
 			body: JSON.stringify({ ids }),
 		}),
+	codexCredentialDeleteUnhealthy: () =>
+		request<{ removed: string[]; reasons: Array<"too_many_failures" | "banned"> }>(
+			"/codex/credentials/unhealthy",
+			{ method: "DELETE" },
+		),
 	codexCredentialUpdate: (id: string, data: { displayName?: string; priority?: number }) =>
 		request<{ ok: boolean }>(`/codex/credentials/${id}`, {
 			method: "PATCH",

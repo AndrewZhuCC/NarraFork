@@ -90,6 +90,50 @@ func TestPollOnceSyncsExternalCommitMetadata(t *testing.T) {
 	}
 }
 
+func TestPollOnceSyncsExternalCommitsWithBoundedRecentLog(t *testing.T) {
+	requireGit(t)
+	database := newWatcherTestDB(t)
+	repo := newWatcherRepo(t)
+	insertWatcherChapter(t, database, "c1", repo)
+	insertWatcherNarrator(t, database, "nar-1", "c1")
+	recorder := &watcherBroadcastRecorder{}
+	watcher := New(database, gitx.NewService(), recorder)
+
+	if err := watcher.PollOnce(context.Background()); err != nil {
+		t.Fatalf("initial poll: %v", err)
+	}
+	for i := 0; i < commitSyncLimit+5; i++ {
+		writeWatcherFile(t, repo, filepath.Join("external", "file-"+string(rune('a'+i))+".txt"), "change\n")
+		runWatcherGit(t, repo, "add", ".")
+		runWatcherGit(t, repo, "commit", "-m", "feat: external bounded "+string(rune('a'+i)))
+	}
+	newHead := runWatcherGit(t, repo, "rev-parse", "HEAD")
+
+	if err := watcher.PollOnce(context.Background()); err != nil {
+		t.Fatalf("second poll: %v", err)
+	}
+
+	var storedHead sql.NullString
+	var commitCount int
+	if err := database.QueryRow(`SELECT head_commit_sha, commit_count FROM chapters WHERE id = 'c1'`).Scan(&storedHead, &commitCount); err != nil {
+		t.Fatalf("select chapter metadata: %v", err)
+	}
+	if !storedHead.Valid || storedHead.String != newHead || commitCount != commitSyncLimit+6 {
+		t.Fatalf("expected synced live head/count, got head=%#v count=%d", storedHead, commitCount)
+	}
+	var syncedRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'c1' AND source = 'watcher'`).Scan(&syncedRows); err != nil {
+		t.Fatalf("count synced commits: %v", err)
+	}
+	if syncedRows != commitSyncLimit {
+		t.Fatalf("watcher should cap recent commit inserts to %d, got %d", commitSyncLimit, syncedRows)
+	}
+	event, ok := recorder.event("nar-1", "commits_updated")
+	if !ok || event.payload["newCount"] != commitSyncLimit {
+		t.Fatalf("expected bounded commits_updated broadcast, got ok=%v event=%#v all=%#v", ok, event, recorder.events)
+	}
+}
+
 func TestPollOnceBroadcastsCommitSyncErrorWhenMetadataUpdateFails(t *testing.T) {
 	requireGit(t)
 	database := newWatcherTestDB(t)

@@ -23,6 +23,9 @@ func TestDefaultAgentModelMatchesTypeScriptDefault(t *testing.T) {
 	if got := store.Core().Agent.DefaultModel; got != DefaultAgentModel {
 		t.Fatalf("Core fallback defaultModel = %q, want %q", got, DefaultAgentModel)
 	}
+	if got := store.Core().Agent.SummaryModel; got != defaultSummaryModel {
+		t.Fatalf("Core fallback summaryModel = %q, want %q", got, defaultSummaryModel)
+	}
 }
 
 func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
@@ -237,6 +240,95 @@ func TestLoadAddsMissingOpenAIProviderPrefix(t *testing.T) {
 	}
 }
 
+func TestLoadSyncsLegacyProviderArraysIntoCustomAPIProviders(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	legacy := []byte(`{
+		"openaiProviders":[{"id":"o1","name":"Open","prefix":"legacy-open","apiKey":"sk-open","baseUrl":"https://open.example.test","defaultModel":"gpt-test","responsesApi":false,"codexAccountId":"acct_1","codexWebSocket":true}],
+		"anthropicProviders":[{"id":"a1","name":"Anth","prefix":"legacy-anth","apiKey":"sk-anth","baseUrl":"https://anth.example.test","defaultModel":"claude-test","officialApi":true,"defaultReasoningEffort":"high","proxy":"anth-proxy.example.test:8080","tlsRejectUnauthorized":false}]
+	}`)
+	if err := os.WriteFile(settingsPath, legacy, 0o600); err != nil {
+		t.Fatalf("write legacy settings: %v", err)
+	}
+
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	raw := store.Raw()
+	customProviders, _ := raw["customApiProviders"].([]any)
+	if len(customProviders) != 2 {
+		t.Fatalf("expected two custom providers derived from legacy arrays, got %#v", customProviders)
+	}
+	openaiCustom, _ := customProviders[0].(map[string]any)
+	if openaiCustom["id"] != "o1" || openaiCustom["protocol"] != "completions-compatible" || openaiCustom["codexAccountId"] != "acct_1" || openaiCustom["codexWebSocket"] != true || openaiCustom["codexWebSearch"] != true || openaiCustom["codexImageGeneration"] != true {
+		t.Fatalf("unexpected OpenAI-derived custom provider: %#v", openaiCustom)
+	}
+	anthropicCustom, _ := customProviders[1].(map[string]any)
+	if anthropicCustom["id"] != "a1" || anthropicCustom["protocol"] != "anthropic-official" || anthropicCustom["defaultReasoningEffort"] != "high" || anthropicCustom["proxy"] != "http://anth-proxy.example.test:8080" || anthropicCustom["tlsRejectUnauthorized"] != false {
+		t.Fatalf("unexpected Anthropic-derived custom provider: %#v", anthropicCustom)
+	}
+	openaiProviders, _ := raw["openaiProviders"].([]any)
+	openai, _ := openaiProviders[0].(map[string]any)
+	if openai["id"] != "o1" || openai["apiMode"] != "completions" || openai["codexAccountId"] != "acct_1" || openai["codexWebSocket"] != true {
+		t.Fatalf("legacy OpenAI array not synced from normalized custom provider: %#v", openai)
+	}
+}
+
+func TestLoadPurgesStaleAgentModelReferences(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	legacy := []byte(`{
+		"customApiProviders":[{"id":"keep","name":"Keep","prefix":"keepp","apiKey":"sk-keep","baseUrl":"https://keep.example.test","defaultModel":"keep-model","protocol":"responses-compatible"}],
+		"agent":{
+			"summaryModel":"oldp:model-a",
+			"subagentModels":{"explore":"oldp:model-b","plan":"keepp:model-c"},
+			"hiddenModels":["oldp:model-a","keepp:model-c","kiro:claude-sonnet-4.5"],
+			"modelContextWindows":{"oldp:model-a":128000,"keepp:model-c":200000},
+			"customModels":[{"value":"oldp:model-a","label":"Old"},{"value":"codex:gpt-5.3-codex","label":"Codex"}]
+		}
+	}`)
+	if err := os.WriteFile(settingsPath, legacy, 0o600); err != nil {
+		t.Fatalf("write legacy settings: %v", err)
+	}
+
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	agent, _ := store.Raw()["agent"].(map[string]any)
+	if agent["summaryModel"] != "" {
+		t.Fatalf("stale summary model not purged: %#v", agent["summaryModel"])
+	}
+	subagent, _ := agent["subagentModels"].(map[string]any)
+	if subagent["explore"] != "" || subagent["plan"] != "keepp:model-c" {
+		t.Fatalf("stale subagent model refs not purged selectively: %#v", subagent)
+	}
+	hidden, _ := agent["hiddenModels"].([]any)
+	if len(hidden) != 2 || hidden[0] != "keepp:model-c" || hidden[1] != "kiro:claude-sonnet-4.5" {
+		t.Fatalf("stale hidden models not purged: %#v", hidden)
+	}
+	windows, _ := agent["modelContextWindows"].(map[string]any)
+	if _, exists := windows["oldp:model-a"]; exists || windows["keepp:model-c"] != float64(200000) {
+		t.Fatalf("stale model context windows not purged: %#v", windows)
+	}
+	customModels, _ := agent["customModels"].([]any)
+	customModel, _ := customModels[0].(map[string]any)
+	if len(customModels) != 1 || customModel["value"] != "codex:gpt-5.3-codex" {
+		t.Fatalf("stale custom models not purged: %#v", customModels)
+	}
+}
+
 func assertMigratedLegacySettings(t *testing.T, raw map[string]any) {
 	t.Helper()
 	editor, _ := raw["editor"].(map[string]any)
@@ -276,15 +368,18 @@ func assertMigratedLegacySettings(t *testing.T, raw map[string]any) {
 	if _, exists := raw["openai"]; exists {
 		t.Fatalf("legacy openai root should be removed: %#v", raw["openai"])
 	}
-	openaiProviders, _ := raw["openaiProviders"].([]any)
-	openai, _ := openaiProviders[0].(map[string]any)
-	if openai["apiKey"] != "sk-legacy" || openai["key"] != "sk-legacy" || openai["baseUrl"] != "https://legacy.example.test/v1" || openai["baseURL"] != "https://legacy.example.test/v1" || openai["prefix"] != "openai" || openai["modelPrefix"] != "legacy-model-prefix" || openai["unknownOpenAI"] != "kept" {
-		t.Fatalf("legacy openai provider fields not preserved: %#v", openai)
-	}
 	customProviders, _ := raw["customApiProviders"].([]any)
 	custom, _ := customProviders[0].(map[string]any)
-	if custom["prefix"] != "custom" || custom["proxyUrl"] != "http://provider-proxy.example.test:8082" || custom["proxyURL"] != "http://provider-proxy.example.test:8083" {
+	if custom["id"] != "custom-1" || custom["prefix"] != "custom" || custom["protocol"] != "responses-compatible" || custom["proxyUrl"] != "http://provider-proxy.example.test:8082" || custom["proxyURL"] != "http://provider-proxy.example.test:8083" {
 		t.Fatalf("custom provider prefix/proxy not normalized: %#v", custom)
+	}
+	if custom["codexAccountId"] != "" || custom["codexWebSocket"] != false || custom["codexWebSearch"] != true || custom["codexImageGeneration"] != true || custom["tlsRejectUnauthorized"] != true || custom["proxy"] != "" {
+		t.Fatalf("custom provider TS defaults not materialized: %#v", custom)
+	}
+	openaiProviders, _ := raw["openaiProviders"].([]any)
+	openai, _ := openaiProviders[0].(map[string]any)
+	if openai["id"] != "custom-1" || openai["apiKey"] != "sk-custom" || openai["baseUrl"] != "https://custom.example.test/v1" || openai["prefix"] != "custom" || openai["apiMode"] != "responses" {
+		t.Fatalf("legacy OpenAI-compatible array not derived from custom provider: %#v", openai)
 	}
 	mcpServers, _ := raw["mcpServers"].([]any)
 	mcp, _ := mcpServers[0].(map[string]any)

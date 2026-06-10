@@ -229,8 +229,10 @@ func TestSplitAtCommitCompressedInheritReportsSafeSummaryFallback(t *testing.T) 
 	}
 	hasSummaryCount := contextSummary.Valid && strings.Contains(contextSummary.String, "copied 2 prefix message reference(s)")
 	hasSummaryReason := contextSummary.Valid && strings.Contains(contextSummary.String, "instead of generating an AI context summary")
-	if !hasSummaryCount || !hasSummaryReason {
-		t.Fatalf("compressed fallback summary missing quality markers: %#v", contextSummary)
+	hasSummaryExcerpts := contextSummary.Valid && strings.Contains(contextSummary.String, "#1 assistant: before split") && strings.Contains(contextSummary.String, "#2 assistant: at split")
+	hasUnsafeFuture := contextSummary.Valid && strings.Contains(contextSummary.String, "after split")
+	if !hasSummaryCount || !hasSummaryReason || !hasSummaryExcerpts || hasUnsafeFuture {
+		t.Fatalf("compressed fallback summary missing bounded transcript quality markers: %#v", contextSummary)
 	}
 
 	forkPoint := chapterForkPoint(t, sqlDB, result.NewForkChapter.ID)

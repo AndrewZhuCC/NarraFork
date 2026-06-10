@@ -270,6 +270,34 @@ func TestSessionBufferIsCapped(t *testing.T) {
 	}
 }
 
+func TestSnapshotUsesRawCappedReplayWithoutXtermSerializedState(t *testing.T) {
+	sqlDB := newTerminalRuntimeTestDB(t)
+	insertTerminalRuntimeRow(t, sqlDB, "raw-replay", "running", "")
+	manager := NewManager(sqlDB, nil)
+	session := &Session{id: "raw-replay", cols: 132, rows: 43}
+	session.appendBufferLocked("prefix-" + strings.Repeat("x", maxSnapshotBytes+64) + "-suffix")
+	manager.mu.Lock()
+	manager.sessions["raw-replay"] = session
+	manager.mu.Unlock()
+
+	snapshot, err := manager.Snapshot(context.Background(), "raw-replay")
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snapshot["type"] != "snapshot" || snapshot["status"] != "running" || int(snapshot["cols"].(int)) != 132 || int(snapshot["rows"].(int)) != 43 {
+		t.Fatalf("unexpected snapshot metadata: %#v", snapshot)
+	}
+	data, _ := snapshot["data"].(string)
+	if len(data) != maxSnapshotBytes || !strings.HasSuffix(data, "-suffix") || strings.Contains(data, "prefix-") {
+		t.Fatalf("snapshot should expose only the newest capped raw replay, len=%d suffix=%t hasPrefix=%t", len(data), strings.HasSuffix(data, "-suffix"), strings.Contains(data, "prefix-"))
+	}
+	for _, key := range []string{"serialized", "serializedState", "xtermSerialized", "xtermState", "buffer"} {
+		if _, ok := snapshot[key]; ok {
+			t.Fatalf("snapshot should not advertise TS xterm serialized replay key %q: %#v", key, snapshot)
+		}
+	}
+}
+
 func newTerminalRuntimeTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", "file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared")

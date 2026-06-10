@@ -181,6 +181,10 @@ func TestAIResolveOneShotBasicSuccessPayloadAndSideEffects(t *testing.T) {
 	if msg, _ := result["assistantMessage"].(string); !strings.Contains(msg, "one-shot basic") {
 		t.Fatalf("assistantMessage = %q, want provider text", msg)
 	}
+	if persisted, _ := result["transcriptPersisted"].(bool); !persisted || result["transcriptMode"] != "one-shot-basic-fallback" {
+		t.Fatalf("AIResolve transcript fallback metadata missing: %#v", result)
+	}
+	assertAIResolveCompatibilityContract(t, result, "one-shot-basic-fallback", "")
 	if *calls != 3 {
 		t.Fatalf("provider calls = %d, want 3 one-shot-basic loop calls", *calls)
 	}
@@ -194,6 +198,64 @@ func TestAIResolveOneShotBasicSuccessPayloadAndSideEffects(t *testing.T) {
 	}
 	assertMergeSideEffects(t, database, repo, "merge", commitSHA, preMergeHead)
 	assertMergeSummaryLatest(t, database, "source", commitSHA, true)
+	assertAIResolveTranscriptFallback(t, database, commitSHA)
+}
+
+func TestAIResolveOneShotBasicTranscriptFailureReturnsWarningWithoutRollback(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead, preMergeHead := setupMergeConflictRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	if _, err := database.Exec(`CREATE TRIGGER fail_ai_resolve_transcript BEFORE INSERT ON narrator_messages WHEN NEW.content_json LIKE '%ai_resolve_request%' BEGIN SELECT RAISE(ABORT, 'ai resolve transcript blocked'); END;`); err != nil {
+		t.Fatalf("create transcript trigger: %v", err)
+	}
+	provider, calls := newScriptedOpenAIProvider(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			writeOpenAIToolCallSSE(t, w, "call_write", "Write", `{"file_path":"shared.txt","content":"resolved by ai\n"}`)
+		},
+		func(w http.ResponseWriter, _ *http.Request) {
+			writeOpenAIToolCallSSE(t, w, "call_add", "Bash", `{"command":"git add shared.txt","description":"Mark resolved conflict"}`)
+		},
+		func(w http.ResponseWriter, _ *http.Request) {
+			writeOpenAITextSSE(t, w, "Resolved conflicts but transcript storage failed.")
+		},
+	)
+	settings := newMergeParityAISettings(t, provider.URL)
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}, Settings: settings}
+
+	result, err := svc.AIResolve(ctx, "source", "target", "merge", "AI resolved merge", "user-1", "en")
+	if err != nil {
+		t.Fatalf("AIResolve transcript warning path should not error: %v", err)
+	}
+	if resolved, _ := result["resolved"].(bool); !resolved {
+		t.Fatalf("AIResolve should stay resolved despite transcript failure: %#v", result)
+	}
+	if persisted, _ := result["transcriptPersisted"].(bool); persisted {
+		t.Fatalf("transcriptPersisted should be false when trigger blocks transcript: %#v", result)
+	}
+	if warning, _ := result["transcriptWarning"].(string); !strings.Contains(warning, "ai resolve transcript blocked") {
+		t.Fatalf("missing transcript warning: %#v", result)
+	}
+	if *calls != 3 {
+		t.Fatalf("provider calls = %d, want 3 one-shot-basic loop calls", *calls)
+	}
+	mergeResult, _ := result["mergeResult"].(map[string]any)
+	commitSHA, _ := mergeResult["commitSha"].(string)
+	if head := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD")); head != commitSHA || head == preMergeHead {
+		t.Fatalf("target HEAD = %s, want new merge commit %s and not pre-merge %s", head, commitSHA, preMergeHead)
+	}
+	assertMergeSideEffects(t, database, repo, "merge", commitSHA, preMergeHead)
+	assertMergeSummaryLatest(t, database, "source", commitSHA, true)
+	var transcriptCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE content_json GLOB '*"type":"ai_resolve_request"*' OR content_json GLOB '*"type":"ai_resolve_result"*'`).Scan(&transcriptCount); err != nil {
+		t.Fatalf("count AI resolve transcript messages: %v", err)
+	}
+	if transcriptCount != 0 {
+		t.Fatalf("failed transcript transaction should leave no AI resolve messages, count=%d", transcriptCount)
+	}
 }
 
 func TestAIResolveOneShotBasicProviderFailureAbortsMergeWithoutPartialState(t *testing.T) {
@@ -223,9 +285,67 @@ func TestAIResolveOneShotBasicProviderFailureAbortsMergeWithoutPartialState(t *t
 	if _, ok := result["assistantMessage"]; ok {
 		t.Fatalf("provider failure should not return assistantMessage: %#v", result)
 	}
+	assertAIResolveCompatibilityContract(t, result, "one-shot-basic-fallback", "merge.aiResolveOneShotBasic")
 	if *calls != 1 {
 		t.Fatalf("provider calls = %d, want 1", *calls)
 	}
+	assertMergeAbortedWithoutPartialState(t, database, repo, preMergeHead)
+}
+
+func assertAIResolveCompatibilityContract(t *testing.T, result map[string]any, mode, fallbackFeature string) {
+	t.Helper()
+	if got, _ := result["mode"].(string); got != mode {
+		t.Fatalf("AIResolve mode = %q, want %q in %#v", got, mode, result)
+	}
+	if uses, ok := result["usesNarratorSession"].(bool); !ok || uses {
+		t.Fatalf("AIResolve should expose usesNarratorSession=false, got %#v", result)
+	}
+	if requires, ok := result["requiresFullNarrator"].(bool); !ok || requires {
+		t.Fatalf("AIResolve should expose requiresFullNarrator=false, got %#v", result)
+	}
+	if fallbackFeature == "" {
+		if _, ok := result["fallbacks"]; ok {
+			t.Fatalf("successful AIResolve contract should not include fallbacks: %#v", result)
+		}
+		return
+	}
+	if got, _ := result["fallbackCode"].(string); got != fallbackFeature {
+		t.Fatalf("AIResolve fallbackCode = %q, want %q in %#v", got, fallbackFeature, result)
+	}
+	fallbacks, ok := result["fallbacks"].([]ForkFallback)
+	if !ok || len(fallbacks) != 1 {
+		t.Fatalf("AIResolve fallbacks = %#v, want one ForkFallback", result["fallbacks"])
+	}
+	fallback := fallbacks[0]
+	if fallback.Feature != fallbackFeature || !fallback.Fallback || fallback.Supported || strings.TrimSpace(fallback.Message) == "" {
+		t.Fatalf("AIResolve fallback entry mismatch: %#v", fallback)
+	}
+}
+
+func TestAIResolveMissingPrimaryNarratorReturnsExplicitFallbackContract(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead, preMergeHead := setupMergeConflictRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	if _, err := database.Exec(`DELETE FROM narrators WHERE chapter_id = 'target'`); err != nil {
+		t.Fatalf("delete target narrator: %v", err)
+	}
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
+
+	result, err := svc.AIResolve(ctx, "source", "target", "merge", "AI resolved merge", "user-1", "en")
+	if err != nil {
+		t.Fatalf("AIResolve missing-narrator fallback should not error: %v", err)
+	}
+	if resolved, _ := result["resolved"].(bool); resolved {
+		t.Fatalf("missing narrator should not resolve: %#v", result)
+	}
+	if errText, _ := result["error"].(string); errText != "Target chapter has no primary narrator" {
+		t.Fatalf("missing narrator error = %q, result=%#v", errText, result)
+	}
+	assertAIResolveCompatibilityContract(t, result, "one-shot-basic-fallback", "merge.aiResolveMissingNarrator")
 	assertMergeAbortedWithoutPartialState(t, database, repo, preMergeHead)
 }
 
@@ -421,7 +541,51 @@ func TestDeleteChapterReturnsNarratorArchiveErrorWithoutDeletingChapter(t *testi
 	}
 }
 
-func TestDeleteChapterRemovesRecentTabs(t *testing.T) {
+func TestDeleteChapterInterruptsNarratorsBeforeArchiving(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, base_branch, is_root, commit_count, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('delete-me', 'project', 'Delete Me', 'active', 'branch', 'chapter/delete-me', 'main', 0, 0, 0, 0, 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO narrators (id, chapter_id, variant, model, created_at, updated_at) VALUES ('narrator-delete', 'delete-me', 'primary', 'test-model', 'now', 'now')`); err != nil {
+		t.Fatalf("insert narrator: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TABLE interrupt_log (narrator_id TEXT PRIMARY KEY)`); err != nil {
+		t.Fatalf("create interrupt log: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER fail_archive_without_interrupt BEFORE UPDATE ON narrators WHEN OLD.chapter_id = 'delete-me' AND (SELECT COUNT(*) FROM interrupt_log WHERE narrator_id = OLD.id) = 0 BEGIN SELECT RAISE(ABORT, 'interrupt missing'); END;`); err != nil {
+		t.Fatalf("create archive trigger: %v", err)
+	}
+	interrupted := []string{}
+	service := &Service{
+		DB: database,
+		CancelNarratorRun: func(narratorID string) bool {
+			interrupted = append(interrupted, narratorID)
+			if _, err := database.Exec(`INSERT INTO interrupt_log (narrator_id) VALUES (?)`, narratorID); err != nil {
+				t.Fatalf("record interrupt: %v", err)
+			}
+			return true
+		},
+	}
+
+	if err := service.Delete(context.Background(), "delete-me"); err != nil {
+		t.Fatalf("delete chapter: %v", err)
+	}
+	if len(interrupted) != 1 || interrupted[0] != "narrator-delete" {
+		t.Fatalf("expected narrator interrupt before archive, got %#v", interrupted)
+	}
+	var narratorChapterID sql.NullString
+	if err := database.QueryRow(`SELECT chapter_id FROM narrators WHERE id = 'narrator-delete'`).Scan(&narratorChapterID); err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	if narratorChapterID.Valid {
+		t.Fatalf("expected detached narrator after archive, chapter=%v", narratorChapterID)
+	}
+}
+
+func TestDeleteChapterRemovesRecentTabsAndBroadcastsSnapshots(t *testing.T) {
 	database := openMergeParityDB(t)
 	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
 		t.Fatalf("insert project: %v", err)
@@ -433,7 +597,36 @@ func TestDeleteChapterRemovesRecentTabs(t *testing.T) {
 		t.Fatalf("insert user preferences: %v", err)
 	}
 
-	if err := (&Service{DB: database}).Delete(context.Background(), "delete-me"); err != nil {
+	var chapterBroadcasts []map[string]any
+	var userBroadcasts []struct {
+		userID  string
+		payload map[string]any
+	}
+	recordChapterBroadcast := func(payload any) {
+		item, ok := payload.(map[string]any)
+		if !ok {
+			t.Fatalf("chapter broadcast payload should be map, got %#v", payload)
+		}
+		if item["type"] == "chapter:abandoned" {
+			chapterBroadcasts = append(chapterBroadcasts, item)
+		}
+	}
+	service := &Service{
+		DB:                        database,
+		BroadcastMergeProgress:    recordChapterBroadcast,
+		BroadcastChapterLifecycle: recordChapterBroadcast,
+		BroadcastUser: func(userID string, payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("user broadcast payload should be map, got %#v", payload)
+			}
+			userBroadcasts = append(userBroadcasts, struct {
+				userID  string
+				payload map[string]any
+			}{userID: userID, payload: item})
+		},
+	}
+	if err := service.Delete(context.Background(), "delete-me"); err != nil {
 		t.Fatalf("delete chapter: %v", err)
 	}
 	var tabs string
@@ -442,6 +635,113 @@ func TestDeleteChapterRemovesRecentTabs(t *testing.T) {
 	}
 	if strings.Contains(tabs, "delete-me") || !strings.Contains(tabs, `"type":"project"`) {
 		t.Fatalf("recent_tabs should remove chapter references and keep unrelated tabs, got %s", tabs)
+	}
+	if len(chapterBroadcasts) != 1 || chapterBroadcasts[0]["type"] != "chapter:abandoned" || chapterBroadcasts[0]["chapterId"] != "delete-me" || chapterBroadcasts[0]["projectId"] != "project" {
+		t.Fatalf("expected chapter:abandoned broadcast, got %#v", chapterBroadcasts)
+	}
+	if len(userBroadcasts) != 1 || userBroadcasts[0].userID != "u1" || userBroadcasts[0].payload["type"] != "user:recent_tabs_snapshot" {
+		t.Fatalf("expected recent-tabs user broadcast, got %#v", userBroadcasts)
+	}
+	items, ok := userBroadcasts[0].payload["tabs"].([]map[string]any)
+	if !ok || len(items) != 1 || items[0]["type"] != "project" || items[0]["id"] != "project" {
+		t.Fatalf("expected broadcast snapshot to keep only project tab, got %#v", userBroadcasts[0].payload["tabs"])
+	}
+}
+
+func TestDeleteChapterArchivesNarratorsBeforeResourceCleanup(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, base_branch, is_root, commit_count, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('delete-me', 'project', 'Delete Me', 'active', 'branch', 'chapter/delete-me', 'main', 0, 0, 0, 0, 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO narrators (id, chapter_id, variant, model, created_at, updated_at) VALUES ('narrator-delete', 'delete-me', 'primary', 'test-model', 'now', 'now')`); err != nil {
+		t.Fatalf("insert narrator: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO terminal_tabs (id, chapter_id) VALUES ('tab-delete', 'delete-me')`); err != nil {
+		t.Fatalf("insert terminal tab: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER fail_terminal_cleanup_before_archive BEFORE DELETE ON terminal_tabs WHEN OLD.chapter_id = 'delete-me' AND EXISTS (SELECT 1 FROM narrators WHERE id = 'narrator-delete' AND chapter_id = 'delete-me') BEGIN SELECT RAISE(ABORT, 'archive missing before terminal cleanup'); END;`); err != nil {
+		t.Fatalf("create terminal cleanup trigger: %v", err)
+	}
+	service := &Service{DB: database}
+
+	if err := service.Delete(context.Background(), "delete-me"); err != nil {
+		t.Fatalf("delete chapter: %v", err)
+	}
+	var narratorChapterID sql.NullString
+	if err := database.QueryRow(`SELECT chapter_id FROM narrators WHERE id = 'narrator-delete'`).Scan(&narratorChapterID); err != nil {
+		t.Fatalf("load narrator chapter: %v", err)
+	}
+	if narratorChapterID.Valid {
+		t.Fatalf("expected narrator archived before resource cleanup, chapter=%q", narratorChapterID.String)
+	}
+}
+
+func TestDeleteChapterDeletesTargetMergeSessions(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, base_branch, is_root, commit_count, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('delete-me', 'project', 'Delete Me', 'active', 'branch', 'chapter/delete-me', 'main', 0, 0, 0, 0, 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO merge_sessions (id, target_chapter_id, source_chapter_ids, strategy, status, current_index, merged_count, created_at, updated_at) VALUES ('merge-delete', 'delete-me', '[]', 'merge', 'running', 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert merge session: %v", err)
+	}
+	service := &Service{DB: database}
+
+	if err := service.Delete(context.Background(), "delete-me"); err != nil {
+		t.Fatalf("delete chapter: %v", err)
+	}
+	var sessionCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM merge_sessions WHERE target_chapter_id = 'delete-me'`).Scan(&sessionCount); err != nil {
+		t.Fatalf("count merge sessions: %v", err)
+	}
+	if sessionCount != 0 {
+		t.Fatalf("expected target merge sessions deleted, count=%d", sessionCount)
+	}
+}
+
+func TestDeleteChapterRecentTabsCleanupFailureIsNonFatal(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO projects (id, name) VALUES ('project', 'Project')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, base_branch, is_root, commit_count, pinned, axis_offset, cross_offset, panel_expanded, created_at, updated_at) VALUES ('delete-me', 'project', 'Delete Me', 'active', 'branch', 'chapter/delete-me', 'main', 0, 0, 0, 0, 0, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO user_preferences (id, user_id, recent_tabs, updated_at) VALUES ('pref1', 'u1', '[{"type":"chapter","id":"delete-me","title":"Delete Me"}]', 'now')`); err != nil {
+		t.Fatalf("insert user preferences: %v", err)
+	}
+	if _, err := database.Exec(`CREATE TRIGGER fail_recent_tab_cleanup BEFORE UPDATE ON user_preferences WHEN OLD.user_id = 'u1' BEGIN SELECT RAISE(ABORT, 'recent tabs blocked'); END;`); err != nil {
+		t.Fatalf("create recent-tabs trigger: %v", err)
+	}
+	var chapterBroadcasts []map[string]any
+	service := &Service{
+		DB: database,
+		BroadcastChapterLifecycle: func(payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("chapter broadcast payload should be map, got %#v", payload)
+			}
+			chapterBroadcasts = append(chapterBroadcasts, item)
+		},
+	}
+
+	if err := service.Delete(context.Background(), "delete-me"); err != nil {
+		t.Fatalf("delete chapter should ignore recent-tabs cleanup failure: %v", err)
+	}
+	var chapterCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapters WHERE id = 'delete-me'`).Scan(&chapterCount); err != nil {
+		t.Fatalf("count chapter: %v", err)
+	}
+	if chapterCount != 0 {
+		t.Fatalf("expected chapter deleted despite recent-tabs cleanup failure, count=%d", chapterCount)
+	}
+	if len(chapterBroadcasts) != 1 || chapterBroadcasts[0]["type"] != "chapter:abandoned" {
+		t.Fatalf("expected chapter abandoned broadcast despite recent-tabs cleanup failure, got %#v", chapterBroadcasts)
 	}
 }
 
@@ -833,6 +1133,50 @@ func assertMergeAbortedWithoutPartialState(t *testing.T, database *sql.DB, repo,
 	}
 }
 
+func assertAIResolveTranscriptFallback(t *testing.T, database *sql.DB, commitSHA string) {
+	t.Helper()
+	rows, err := database.Query(`SELECT m.role, m.content_json, r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = 'narrator-target' AND (m.content_json GLOB '*"type":"ai_resolve_request"*' OR m.content_json GLOB '*"type":"ai_resolve_result"*') ORDER BY r.seq ASC`)
+	if err != nil {
+		t.Fatalf("query AI resolve transcript: %v", err)
+	}
+	defer rows.Close()
+	type transcriptMessage struct {
+		role string
+		raw  string
+		seq  int
+	}
+	messages := []transcriptMessage{}
+	for rows.Next() {
+		var msg transcriptMessage
+		if err := rows.Scan(&msg.role, &msg.raw, &msg.seq); err != nil {
+			t.Fatalf("scan AI resolve transcript: %v", err)
+		}
+		messages = append(messages, msg)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate AI resolve transcript: %v", err)
+	}
+	if len(messages) != 2 {
+		t.Fatalf("AI resolve transcript messages = %d, want 2: %#v", len(messages), messages)
+	}
+	if messages[0].role != "user" || messages[1].role != "assistant" || messages[0].seq >= messages[1].seq {
+		t.Fatalf("AI resolve transcript role/sequence mismatch: %#v", messages)
+	}
+	if !strings.Contains(messages[0].raw, "ai_resolve_request") || !strings.Contains(messages[0].raw, "one-shot-basic-fallback") || !strings.Contains(messages[0].raw, "chapter/source") {
+		t.Fatalf("AI resolve request transcript missing metadata: %s", messages[0].raw)
+	}
+	if !strings.Contains(messages[1].raw, "ai_resolve_result") || !strings.Contains(messages[1].raw, commitSHA) || !strings.Contains(messages[1].raw, "one-shot basic") {
+		t.Fatalf("AI resolve result transcript missing metadata: %s", messages[1].raw)
+	}
+	var messageCount, messageVersion int
+	if err := database.QueryRow(`SELECT message_count, message_version FROM narrators WHERE id = 'narrator-target'`).Scan(&messageCount, &messageVersion); err != nil {
+		t.Fatalf("query narrator counters after AI resolve transcript: %v", err)
+	}
+	if messageCount != 3 || messageVersion != 2 {
+		t.Fatalf("narrator counters after AI resolve transcript = count %d version %d, want count 3 version 2", messageCount, messageVersion)
+	}
+}
+
 func assertMergeSummaryLatest(t *testing.T, database *sql.DB, sourceID, commitSHA string, wantLatest bool) map[string]any {
 	t.Helper()
 	var messageID string
@@ -903,6 +1247,7 @@ func openMergeParityDB(t *testing.T) *sql.DB {
 		`CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, role TEXT, content_json TEXT, content_text TEXT, created_by TEXT, created_at TEXT)`,
 		`CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER)`,
 		`CREATE TABLE review_conclusions (id TEXT PRIMARY KEY, review_chapter_id TEXT, source_chapter_id TEXT, verdict TEXT, findings_json TEXT, created_at TEXT)`,
+		`CREATE TABLE merge_sessions (id TEXT PRIMARY KEY, target_chapter_id TEXT, source_chapter_ids TEXT, strategy TEXT, status TEXT, current_index INTEGER, merged_count INTEGER, created_at TEXT, updated_at TEXT)`,
 		`CREATE TABLE terminals (id TEXT PRIMARY KEY, chapter_id TEXT)`,
 		`CREATE TABLE terminal_tabs (id TEXT PRIMARY KEY, chapter_id TEXT)`,
 		`CREATE TABLE terminal_view_state (id TEXT PRIMARY KEY, chapter_id TEXT)`,

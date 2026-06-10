@@ -59,6 +59,7 @@ type Service struct {
 	BrowserSessionPersistenceEnabled bool
 	Hub                              *ws.Hub
 	Settings                         *config.Store
+	BroadcastProjectEvent            func(payload any)
 	ExternalTools                    ExternalToolProvider
 	TerminalRuntime                  terminalAgentRuntime
 	contextOverflowRetry             func(context.Context, string)
@@ -298,6 +299,7 @@ type messageRef struct {
 
 type reviewChapterMeta struct {
 	ID              string
+	ProjectID       string
 	Role            string
 	ReviewStatus    sql.NullString
 	SourceChapterID sql.NullString
@@ -344,6 +346,7 @@ func NewService(sqlDB *sql.DB, hub *ws.Hub, settings *config.Store) *Service {
 	agentbasic.SetBrowserSessionObserver(service)
 	if hub != nil {
 		hub.SetNarratorSyncProvider(service)
+		service.BroadcastProjectEvent = hub.BroadcastMergeProgress
 	}
 	return service
 }
@@ -1750,7 +1753,16 @@ func (s *Service) AddUserMessage(ctx context.Context, narratorID, userID, text s
 
 func (s *Service) SeedUserMessage(ctx context.Context, narratorID, userID, text string) (Message, error) {
 	content := []map[string]any{{"type": "text", "text": text}}
-	return s.persistUserMessageWithContent(ctx, narratorID, userID, text, content)
+	var createdBy *string
+	if value := strings.TrimSpace(userID); value != "" {
+		createdBy = &value
+	}
+	msg, err := s.addMessageWithBlocks(ctx, narratorID, "user", text, content, createdBy)
+	if err != nil {
+		return Message{}, err
+	}
+	s.broadcastMessage(ctx, narratorID, msg)
+	return msg, nil
 }
 
 func (s *Service) AddUserMessageWithContent(ctx context.Context, narratorID, userID, contentText string, contentBlocks any) (Message, error) {
@@ -2666,6 +2678,36 @@ func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun,
 
 const maxGoalContinuationNoToolTurns = 3
 
+func narratorModelFollowsDefault(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" || model == "__default__" {
+		return true
+	}
+	if idx := strings.Index(model, ":"); idx >= 0 {
+		return strings.TrimSpace(model[idx+1:]) == "__default__"
+	}
+	return false
+}
+
+func runtimeModelOverrideValue(model string) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "__default__"
+	}
+	return model
+}
+
+func currentResolvedDefaultModel(settings *config.Store, model string) (string, string) {
+	if !narratorModelFollowsDefault(model) {
+		return "", ""
+	}
+	resolution, err := agentbasic.ResolveProviderAndModel(settings, runtimeModelOverrideValue(model))
+	if err != nil {
+		return "", ""
+	}
+	return resolution.Provider, resolution.Model
+}
+
 func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	noToolContinuationCount := 0
 	previousWasGoalContinuation := false
@@ -2733,6 +2775,17 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	if narrator.Model != nil {
 		model = *narrator.Model
 	}
+	currentModel := strings.TrimSpace(model)
+	currentEffectiveProvider, currentEffectiveModel := currentResolvedDefaultModel(s.Settings, currentModel)
+	currentReasoningEffort := ""
+	if narrator.ReasoningEffort != nil {
+		currentReasoningEffort = strings.TrimSpace(*narrator.ReasoningEffort)
+	}
+	currentSystemPrompt := s.agentSystemPrompt(ctx, narrator)
+	currentNarrator := narrator
+	latestNarrator := narrator
+	latestNarratorTurn := -1
+	replacementNeeded := false
 	cwd := ""
 	if narrator.Cwd != nil {
 		cwd = *narrator.Cwd
@@ -2947,10 +3000,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		s.broadcastGitStatusAfterTool(execCtx, narratorID, narrator, call.Function.Name, call.ID)
 		return run, nil
 	}
-	reasoningEffort := ""
-	if narrator.ReasoningEffort != nil {
-		reasoningEffort = *narrator.ReasoningEffort
-	}
+	reasoningEffort := currentReasoningEffort
 	toolScope := "normal"
 	if meta, ok := s.reviewMetaForNarrator(ctx, narrator); ok && meta.Role == "review" {
 		toolScope = "review"
@@ -2994,10 +3044,85 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		priorityBufferedSoftStopped = true
 		return true
 	}
+	runtimeSettingsOverrideHook := func(turnIndex int) (*agentbasic.RuntimeSettingsOverride, error) {
+		refreshed, err := s.Get(runCtx, narratorID)
+		if err != nil {
+			return nil, err
+		}
+		latestNarrator = refreshed
+		latestNarratorTurn = turnIndex
+		override := &agentbasic.RuntimeSettingsOverride{}
+		changed := false
+		nextModel := strings.TrimSpace(ptrString(refreshed.Model))
+		modelChanged := nextModel != currentModel
+		if modelChanged {
+			override.Model = runtimeModelOverrideValue(nextModel)
+			currentModel = nextModel
+			changed = true
+		}
+		if narratorModelFollowsDefault(nextModel) {
+			resolution, err := agentbasic.ResolveProviderAndModel(s.Settings, runtimeModelOverrideValue(nextModel))
+			if err != nil {
+				return nil, err
+			}
+			if !modelChanged && (resolution.Provider != currentEffectiveProvider || resolution.Model != currentEffectiveModel) {
+				override.Model = runtimeModelOverrideValue(nextModel)
+				changed = true
+			}
+			currentEffectiveProvider = resolution.Provider
+			currentEffectiveModel = resolution.Model
+		}
+		if nextReasoning := strings.TrimSpace(ptrString(refreshed.ReasoningEffort)); nextReasoning != currentReasoningEffort {
+			override.ReasoningEffort = &nextReasoning
+			currentReasoningEffort = nextReasoning
+			changed = true
+		}
+		if changed {
+			replacementNeeded = true
+			currentNarrator.Model = refreshed.Model
+			currentNarrator.ReasoningEffort = refreshed.ReasoningEffort
+			state.narrator.Model = refreshed.Model
+			state.narrator.ReasoningEffort = refreshed.ReasoningEffort
+			return override, nil
+		}
+		return nil, nil
+	}
+	beforeTurnReplacementHook := func(turnIndex int) (*agentbasic.BeforeTurnReplacement, error) {
+		refreshed := latestNarrator
+		if latestNarratorTurn != turnIndex {
+			var err error
+			refreshed, err = s.Get(runCtx, narratorID)
+			if err != nil {
+				return nil, err
+			}
+			latestNarrator = refreshed
+			latestNarratorTurn = turnIndex
+		}
+		nextSystemPrompt := s.agentSystemPrompt(runCtx, refreshed)
+		if !replacementNeeded && nextSystemPrompt == currentSystemPrompt {
+			currentNarrator.SystemPrompt = refreshed.SystemPrompt
+			currentNarrator.Cwd = refreshed.Cwd
+			currentNarrator.ContextSummary = refreshed.ContextSummary
+			currentNarrator.PlanMode = refreshed.PlanMode
+			currentNarrator.PlanFileID = refreshed.PlanFileID
+			state.narrator = currentNarrator
+			return nil, nil
+		}
+		rebuiltHistory, err := s.agentHistory(runCtx, narratorID, s.agentHistoryLimit())
+		if err != nil {
+			return nil, err
+		}
+		history = rebuiltHistory
+		currentSystemPrompt = nextSystemPrompt
+		currentNarrator = refreshed
+		state.narrator = refreshed
+		replacementNeeded = false
+		return &agentbasic.BeforeTurnReplacement{Messages: rebuiltHistory, SystemPrompt: &nextSystemPrompt}, nil
+	}
 
 	stream, err := agentbasic.RunAgentLoop(runCtx, s.Settings, model, history, cwd,
 		agentbasic.WithToolExecutor(executor),
-		agentbasic.WithSystemPrompt(s.agentSystemPrompt(ctx, narrator)),
+		agentbasic.WithSystemPrompt(currentSystemPrompt),
 		agentbasic.WithMaxTurns(s.agentMaxTurns()),
 		agentbasic.WithReasoningEffort(reasoningEffort),
 		agentbasic.WithToolScope(toolScope),
@@ -3008,6 +3133,8 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		agentbasic.WithToolInventoryEvent(true),
 		agentbasic.WithStickySessionKey(narratorID),
 		agentbasic.WithSideCarCollector(state.sideCarToolCount, sideCarCollector, func(count int) { state.sideCarToolCount = count }),
+		agentbasic.WithRuntimeSettingsOverrideHook(runtimeSettingsOverrideHook),
+		agentbasic.WithBeforeTurnReplacementHook(beforeTurnReplacementHook),
 		agentbasic.WithShouldStop(shouldStopAfterPriorityBuffer),
 	)
 	if err != nil {
@@ -3305,7 +3432,11 @@ func (s *Service) agentHistory(ctx context.Context, narratorID string, limit int
 		if msg.Role == "disp" {
 			continue
 		}
-		history = append(history, agentMessagesFromStoredMessage(enrichAgentHistoryImageBlocks(msg, narratorID))...)
+		imageOwnerNarratorID := strings.TrimSpace(msg.NarratorID)
+		if imageOwnerNarratorID == "" {
+			imageOwnerNarratorID = narratorID
+		}
+		history = append(history, agentMessagesFromStoredMessage(enrichAgentHistoryImageBlocks(msg, imageOwnerNarratorID))...)
 	}
 	return history, nil
 }
@@ -3517,7 +3648,7 @@ func (s *Service) reviewMetaForNarrator(ctx context.Context, narrator Narrator) 
 
 func (s *Service) reviewMetaForChapter(ctx context.Context, chapterID string) (reviewChapterMeta, bool) {
 	var meta reviewChapterMeta
-	err := s.DB.QueryRowContext(ctx, `SELECT id, role, review_status, review_source_chapter_id, worktree_path, start_commit_sha, head_commit_sha FROM chapters WHERE id = ?`, chapterID).Scan(&meta.ID, &meta.Role, &meta.ReviewStatus, &meta.SourceChapterID, &meta.WorktreePath, &meta.StartCommitSHA, &meta.HeadCommitSHA)
+	err := s.DB.QueryRowContext(ctx, `SELECT id, project_id, role, review_status, review_source_chapter_id, worktree_path, start_commit_sha, head_commit_sha FROM chapters WHERE id = ?`, chapterID).Scan(&meta.ID, &meta.ProjectID, &meta.Role, &meta.ReviewStatus, &meta.SourceChapterID, &meta.WorktreePath, &meta.StartCommitSHA, &meta.HeadCommitSHA)
 	if err != nil || meta.Role != "review" {
 		return meta, false
 	}
@@ -4130,7 +4261,21 @@ func (s *Service) concludeReviewChapter(ctx context.Context, reviewChapterID str
 	if _, err := s.DB.ExecContext(ctx, `UPDATE chapters SET review_status = 'concluded', updated_at = ? WHERE id = ?`, now, reviewChapterID); err != nil {
 		return err
 	}
-	return s.injectReviewFeedback(ctx, reviewChapterID, meta.SourceChapterID.String)
+	sourceChapterID := meta.SourceChapterID.String
+	s.broadcastReviewConcluded(reviewChapterID, sourceChapterID, meta.ProjectID)
+	return s.injectReviewFeedback(ctx, reviewChapterID, sourceChapterID)
+}
+
+func (s *Service) broadcastReviewConcluded(reviewChapterID, sourceChapterID, projectID string) {
+	if s == nil || s.BroadcastProjectEvent == nil {
+		return
+	}
+	s.BroadcastProjectEvent(map[string]any{
+		"type":            "review:concluded",
+		"reviewChapterId": reviewChapterID,
+		"sourceChapterId": sourceChapterID,
+		"projectId":       projectID,
+	})
 }
 
 func (s *Service) injectReviewFeedback(ctx context.Context, reviewChapterID, sourceChapterID string) error {

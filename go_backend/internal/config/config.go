@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 
@@ -45,6 +46,7 @@ type Core struct {
 	Agent struct {
 		DefaultModel                string `json:"defaultModel"`
 		DefaultPermissionMode       string `json:"defaultPermissionMode"`
+		SummaryModel                string `json:"summaryModel"`
 		QuestionReflectionEnabled   bool   `json:"questionReflectionEnabled"`
 		QuestionReflectionTimeoutMs int    `json:"questionReflectionTimeoutMs"`
 	} `json:"agent"`
@@ -226,6 +228,7 @@ func (s *Store) Core() Core {
 	c.Auth.RegistrationOpen = getBool(s.raw, true, "auth", "registrationOpen")
 	c.Agent.DefaultModel = stringOr(getString(s.raw, "agent", "defaultModel"), DefaultAgentModel)
 	c.Agent.DefaultPermissionMode = stringOr(getString(s.raw, "agent", "defaultPermissionMode"), "acceptEdits")
+	c.Agent.SummaryModel = stringOr(getString(s.raw, "agent", "summaryModel"), defaultSummaryModel)
 	c.Agent.QuestionReflectionEnabled = getBool(s.raw, false, "agent", "questionReflectionEnabled")
 	c.Agent.QuestionReflectionTimeoutMs = getInt(s.raw, 300000, "agent", "questionReflectionTimeoutMs")
 	c.Database.Driver = getString(s.raw, "database", "driver")
@@ -360,6 +363,8 @@ func migrateLegacySettings(raw, legacyRaw map[string]any) bool {
 	}
 	changed = migrateLegacyOpenAISettings(raw) || changed
 	changed = normalizeProviderPrefixes(raw) || changed
+	changed = normalizeCustomAPIProviderSettings(raw, legacyRaw) || changed
+	changed = purgeStaleAgentModelReferences(raw) || changed
 	changed = migrateLegacyMCPBehaviors(raw) || changed
 	changed = normalizeCodexReasoningEffort(raw) || changed
 	changed = normalizeSettingsProxyURLs(raw) || changed
@@ -402,6 +407,326 @@ func migrateLegacyOpenAISettings(raw map[string]any) bool {
 	delete(raw, "openai")
 	changed = true
 	return changed
+}
+
+func normalizeCustomAPIProviderSettings(raw, legacyRaw map[string]any) bool {
+	beforeCustom := cloneAny(raw["customApiProviders"])
+	beforeOpenAI := cloneAny(raw["openaiProviders"])
+	beforeAnthropic := cloneAny(raw["anthropicProviders"])
+
+	customProviders, customWasArrayInLegacy := legacyRaw["customApiProviders"].([]any)
+	if customWasArrayInLegacy {
+		customProviders = anySlice(raw["customApiProviders"])
+	} else {
+		customProviders = deriveCustomAPIProvidersFromLegacy(
+			anySlice(raw["openaiProviders"]),
+			anySlice(raw["anthropicProviders"]),
+		)
+	}
+
+	normalizedCustom := make([]any, 0, len(customProviders))
+	for _, item := range customProviders {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		normalizedCustom = append(normalizedCustom, normalizeCustomAPIProvider(provider))
+	}
+	raw["customApiProviders"] = normalizedCustom
+	raw["openaiProviders"] = customAPIProvidersToOpenAI(normalizedCustom)
+	raw["anthropicProviders"] = customAPIProvidersToAnthropic(normalizedCustom)
+
+	return !reflect.DeepEqual(beforeCustom, raw["customApiProviders"]) ||
+		!reflect.DeepEqual(beforeOpenAI, raw["openaiProviders"]) ||
+		!reflect.DeepEqual(beforeAnthropic, raw["anthropicProviders"])
+}
+
+func deriveCustomAPIProvidersFromLegacy(openaiProviders, anthropicProviders []any) []any {
+	byID := map[string]map[string]any{}
+	order := []string{}
+	for _, item := range openaiProviders {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		converted := openAIProviderToCustomAPI(provider)
+		providerID := stringValue(converted["id"])
+		if _, exists := byID[providerID]; !exists {
+			order = append(order, providerID)
+		}
+		byID[providerID] = converted
+	}
+	for _, item := range anthropicProviders {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		converted := anthropicProviderToCustomAPI(provider)
+		providerID := stringValue(converted["id"])
+		if existing, exists := byID[providerID]; exists {
+			merged := cloneMap(existing)
+			for key, value := range converted {
+				merged[key] = value
+			}
+			for _, key := range []string{"codexAccountId", "codexWebSocket", "codexWebSearch", "codexImageGeneration"} {
+				if value, ok := existing[key]; ok {
+					merged[key] = value
+				}
+			}
+			byID[providerID] = merged
+			continue
+		}
+		order = append(order, providerID)
+		byID[providerID] = converted
+	}
+	out := make([]any, 0, len(order))
+	for _, providerID := range order {
+		out = append(out, byID[providerID])
+	}
+	return out
+}
+
+func normalizeCustomAPIProvider(provider map[string]any) map[string]any {
+	out := cloneMap(provider)
+	if strings.TrimSpace(stringValue(out["protocol"])) == "" {
+		out["protocol"] = "responses-compatible"
+	}
+	if value, exists := out["defaultReasoningEffort"]; exists && value == nil {
+		delete(out, "defaultReasoningEffort")
+	}
+	setDefaultIfMissing(out, "codexAccountId", "")
+	setDefaultIfMissing(out, "codexWebSocket", false)
+	setDefaultIfMissing(out, "codexWebSearch", true)
+	setDefaultIfMissing(out, "codexImageGeneration", true)
+	setDefaultIfMissing(out, "tlsRejectUnauthorized", true)
+	setDefaultIfMissing(out, "proxy", "")
+	return out
+}
+
+func openAIProviderToCustomAPI(provider map[string]any) map[string]any {
+	converted := map[string]any{
+		"id":           stringValue(provider["id"]),
+		"name":         stringValue(provider["name"]),
+		"prefix":       stringValue(provider["prefix"]),
+		"apiKey":       stringValue(provider["apiKey"]),
+		"baseUrl":      stringValue(provider["baseUrl"]),
+		"defaultModel": stringValue(provider["defaultModel"]),
+		"protocol":     customAPIProtocolFromOpenAI(provider),
+	}
+	copyFieldIfPresent(converted, provider, "disabled")
+	copyFieldIfPresent(converted, provider, "defaultContextWindow")
+	copyFieldIfPresent(converted, provider, "codexAccountId")
+	copyFieldIfPresent(converted, provider, "codexWebSocket")
+	copyFieldIfPresent(converted, provider, "codexWebSearch")
+	copyFieldIfPresent(converted, provider, "codexImageGeneration")
+	return normalizeCustomAPIProvider(converted)
+}
+
+func anthropicProviderToCustomAPI(provider map[string]any) map[string]any {
+	converted := map[string]any{
+		"id":           stringValue(provider["id"]),
+		"name":         stringValue(provider["name"]),
+		"prefix":       stringValue(provider["prefix"]),
+		"apiKey":       stringValue(provider["apiKey"]),
+		"baseUrl":      stringValue(provider["baseUrl"]),
+		"defaultModel": stringValue(provider["defaultModel"]),
+		"protocol":     customAPIProtocolFromAnthropic(boolValue(provider["officialApi"])),
+	}
+	copyFieldIfPresent(converted, provider, "disabled")
+	copyFieldIfPresent(converted, provider, "defaultContextWindow")
+	copyFieldIfPresent(converted, provider, "defaultReasoningEffort")
+	copyFieldIfPresent(converted, provider, "proxy")
+	copyFieldIfPresent(converted, provider, "tlsRejectUnauthorized")
+	return normalizeCustomAPIProvider(converted)
+}
+
+func customAPIProvidersToOpenAI(providers []any) []any {
+	out := []any{}
+	for _, item := range providers {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		apiMode := customAPIProtocolToOpenAIApiMode(stringValue(provider["protocol"]))
+		if apiMode == "" {
+			continue
+		}
+		converted := map[string]any{
+			"id":           stringValue(provider["id"]),
+			"name":         stringValue(provider["name"]),
+			"prefix":       stringValue(provider["prefix"]),
+			"apiKey":       stringValue(provider["apiKey"]),
+			"baseUrl":      stringValue(provider["baseUrl"]),
+			"defaultModel": stringValue(provider["defaultModel"]),
+			"apiMode":      apiMode,
+		}
+		copyFieldIfPresent(converted, provider, "disabled")
+		copyFieldIfPresent(converted, provider, "defaultContextWindow")
+		copyFieldIfPresent(converted, provider, "codexAccountId")
+		copyFieldIfPresent(converted, provider, "codexWebSocket")
+		copyFieldIfPresent(converted, provider, "codexWebSearch")
+		copyFieldIfPresent(converted, provider, "codexImageGeneration")
+		out = append(out, converted)
+	}
+	return out
+}
+
+func customAPIProvidersToAnthropic(providers []any) []any {
+	out := []any{}
+	for _, item := range providers {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		protocol := strings.ToLower(strings.TrimSpace(stringValue(provider["protocol"])))
+		if protocol != "anthropic-official" && protocol != "anthropic-compatible" {
+			continue
+		}
+		converted := map[string]any{
+			"id":           stringValue(provider["id"]),
+			"name":         stringValue(provider["name"]),
+			"prefix":       stringValue(provider["prefix"]),
+			"apiKey":       stringValue(provider["apiKey"]),
+			"baseUrl":      stringValue(provider["baseUrl"]),
+			"defaultModel": stringValue(provider["defaultModel"]),
+			"officialApi":  protocol == "anthropic-official",
+		}
+		copyFieldIfPresent(converted, provider, "disabled")
+		copyFieldIfPresent(converted, provider, "defaultContextWindow")
+		copyFieldIfPresent(converted, provider, "proxy")
+		copyFieldIfPresent(converted, provider, "tlsRejectUnauthorized")
+		if value, ok := provider["defaultReasoningEffort"]; ok && value != nil {
+			converted["defaultReasoningEffort"] = value
+		}
+		out = append(out, converted)
+	}
+	return out
+}
+
+func customAPIProtocolFromOpenAI(provider map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(stringValue(provider["apiMode"]))) {
+	case "codex":
+		return "codex-native"
+	case "completions":
+		return "completions-compatible"
+	case "responses":
+		return "responses-compatible"
+	default:
+		if responsesAPI, ok := provider["responsesApi"].(bool); ok && !responsesAPI {
+			return "completions-compatible"
+		}
+		return "responses-compatible"
+	}
+}
+
+func customAPIProtocolFromAnthropic(officialAPI bool) string {
+	if officialAPI {
+		return "anthropic-official"
+	}
+	return "anthropic-compatible"
+}
+
+func customAPIProtocolToOpenAIApiMode(protocol string) string {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "codex-native":
+		return "codex"
+	case "responses-compatible":
+		return "responses"
+	case "completions-compatible":
+		return "completions"
+	default:
+		return ""
+	}
+}
+
+func copyFieldIfPresent(dst, src map[string]any, key string) {
+	if value, ok := src[key]; ok {
+		dst[key] = value
+	}
+}
+
+func setDefaultIfMissing(target map[string]any, key string, value any) {
+	if current, ok := target[key]; !ok || current == nil {
+		target[key] = value
+	}
+}
+
+func purgeStaleAgentModelReferences(raw map[string]any) bool {
+	agent, ok := raw["agent"].(map[string]any)
+	if !ok {
+		return false
+	}
+	activePrefixes := activeModelProviderPrefixes(raw)
+	isStale := func(value string) bool {
+		prefix, _, ok := strings.Cut(value, ":")
+		return ok && prefix != "" && !activePrefixes[prefix]
+	}
+
+	changed := false
+	if isStale(stringValue(agent["summaryModel"])) {
+		agent["summaryModel"] = ""
+		changed = true
+	}
+	if subagent, ok := agent["subagentModels"].(map[string]any); ok {
+		for _, key := range []string{"explore", "plan"} {
+			if isStale(stringValue(subagent[key])) {
+				subagent[key] = ""
+				changed = true
+			}
+		}
+	}
+	if hidden, ok := agent["hiddenModels"].([]any); ok {
+		kept := make([]any, 0, len(hidden))
+		for _, item := range hidden {
+			if isStale(stringValue(item)) {
+				changed = true
+				continue
+			}
+			kept = append(kept, item)
+		}
+		agent["hiddenModels"] = kept
+	}
+	if windows, ok := agent["modelContextWindows"].(map[string]any); ok {
+		kept := map[string]any{}
+		for key, value := range windows {
+			if isStale(key) {
+				changed = true
+				continue
+			}
+			kept[key] = value
+		}
+		agent["modelContextWindows"] = kept
+	}
+	if custom, ok := agent["customModels"].([]any); ok {
+		kept := make([]any, 0, len(custom))
+		for _, item := range custom {
+			model, ok := item.(map[string]any)
+			if ok && isStale(stringValue(model["value"])) {
+				changed = true
+				continue
+			}
+			kept = append(kept, item)
+		}
+		agent["customModels"] = kept
+	}
+	return changed
+}
+
+func activeModelProviderPrefixes(raw map[string]any) map[string]bool {
+	active := map[string]bool{"kiro": true, "codex": true}
+	for _, field := range []string{"openaiProviders", "anthropicProviders", "nkpProviders", "nugProviders", "clineProviders"} {
+		for _, item := range anySlice(raw[field]) {
+			provider, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			prefix := strings.TrimSpace(stringValue(provider["prefix"]))
+			if prefix != "" {
+				active[prefix] = true
+			}
+		}
+	}
+	return active
 }
 
 func normalizeProviderPrefixes(raw map[string]any) bool {
@@ -532,6 +857,11 @@ func anySlice(value any) []any {
 func stringValue(value any) string {
 	text, _ := value.(string)
 	return text
+}
+
+func boolValue(value any) bool {
+	b, _ := value.(bool)
+	return b
 }
 
 func dangerReflectionBool(value any, fallback bool) bool {

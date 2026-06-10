@@ -4,9 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"narrafork-go/internal/chapters"
+	gitx "narrafork-go/internal/git"
 
 	_ "modernc.org/sqlite"
 )
@@ -25,7 +30,24 @@ func TestDeleteCleansProjectScopedRows(t *testing.T) {
 	ctx := context.Background()
 	sqlDB := newProjectDeleteTestDB(t)
 	killer := &fakeTerminalKiller{}
-	service := &Service{DB: sqlDB, Chapters: &chapters.Service{DB: sqlDB, TerminalRuntime: killer}}
+	userBroadcasts := []struct {
+		userID  string
+		payload map[string]any
+	}{}
+	service := &Service{
+		DB:       sqlDB,
+		Chapters: &chapters.Service{DB: sqlDB, TerminalRuntime: killer},
+		BroadcastUser: func(userID string, payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("user broadcast payload should be map, got %#v", payload)
+			}
+			userBroadcasts = append(userBroadcasts, struct {
+				userID  string
+				payload map[string]any
+			}{userID: userID, payload: item})
+		},
+	}
 
 	result, err := service.Delete(ctx, "p1")
 	if err != nil {
@@ -77,6 +99,66 @@ func TestDeleteCleansProjectScopedRows(t *testing.T) {
 	if tabs != `[{"id":"p2","title":"Other","type":"project"}]` {
 		t.Fatalf("recent_tabs = %s", tabs)
 	}
+	if len(userBroadcasts) != 1 || userBroadcasts[0].userID != "u1" || userBroadcasts[0].payload["type"] != "user:recent_tabs_snapshot" {
+		t.Fatalf("expected recent-tabs snapshot broadcast, got %#v", userBroadcasts)
+	}
+	items, ok := userBroadcasts[0].payload["tabs"].([]map[string]any)
+	if !ok || len(items) != 1 || items[0]["id"] != "p2" {
+		t.Fatalf("unexpected broadcast tabs: %#v", userBroadcasts[0].payload["tabs"])
+	}
+}
+
+func TestDeleteRefreshesProxyCacheAfterCommittedDelete(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := newProjectDeleteTestDB(t)
+	mustExec(t, sqlDB, `UPDATE projects SET proxy_domain = 'dev.example.test' WHERE id = 'p1'`)
+	calls := 0
+	service := &Service{
+		DB:       sqlDB,
+		Chapters: &chapters.Service{DB: sqlDB},
+		ProxyCacheRefresher: func(ctx context.Context) error {
+			calls++
+			if got := countWhere(t, sqlDB, "projects", "id = 'p1'"); got != 0 {
+				t.Fatalf("proxy cache refresh ran before committed delete, project count = %d", got)
+			}
+			return ctx.Err()
+		},
+	}
+
+	result, err := service.Delete(ctx, "p1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(result.CleanupErrors) != 0 {
+		t.Fatalf("cleanup errors = %#v", result.CleanupErrors)
+	}
+	if calls != 1 {
+		t.Fatalf("proxy refresh calls = %d", calls)
+	}
+}
+
+func TestDeleteReportsProxyCacheRefreshFailureAfterDeletingRows(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := newProjectDeleteTestDB(t)
+	mustExec(t, sqlDB, `UPDATE projects SET proxy_domain = 'dev.example.test' WHERE id = 'p1'`)
+	service := &Service{
+		DB:       sqlDB,
+		Chapters: &chapters.Service{DB: sqlDB},
+		ProxyCacheRefresher: func(context.Context) error {
+			return errors.New("proxy refresh failed")
+		},
+	}
+
+	result, err := service.Delete(ctx, "p1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(result.CleanupErrors) != 1 || result.CleanupErrors[0].Scope != "proxy-cache" || result.CleanupErrors[0].Error != "proxy refresh failed" {
+		t.Fatalf("cleanup errors = %#v", result.CleanupErrors)
+	}
+	if got := countWhere(t, sqlDB, "projects", "id = 'p1'"); got != 0 {
+		t.Fatalf("project p1 count = %d", got)
+	}
 }
 
 func TestDeleteReturnsExternalCleanupErrorsAndStillDeletesRows(t *testing.T) {
@@ -100,6 +182,114 @@ func TestDeleteReturnsExternalCleanupErrorsAndStillDeletesRows(t *testing.T) {
 	}
 	if got := countWhere(t, sqlDB, "terminals", "id IN ('term_c1','term_n_child')"); got != 0 {
 		t.Fatalf("project terminals remain: %d", got)
+	}
+}
+
+func TestDeleteReportsRealGitWorktreeWarningAndStillDeletesRows(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git executable unavailable: %v", err)
+	}
+
+	ctx := context.Background()
+	sqlDB := newProjectDeleteTestDB(t)
+	repoPath := t.TempDir()
+	runProjectDeleteGit(t, repoPath, "init")
+	worktreePath := filepath.Join(repoPath, ".worktrees", "stale-non-worktree")
+	if err := os.MkdirAll(worktreePath, 0o755); err != nil {
+		t.Fatalf("mkdir stale worktree: %v", err)
+	}
+	mustExec(t, sqlDB, `UPDATE projects SET git_path = '`+repoPath+`' WHERE id = 'p1'`)
+	mustExec(t, sqlDB, `UPDATE chapters SET worktree_path = '`+worktreePath+`' WHERE id = 'c1'`)
+	service := &Service{
+		DB:       sqlDB,
+		Git:      &gitx.Service{Timeout: 5 * time.Second},
+		Chapters: &chapters.Service{DB: sqlDB},
+	}
+
+	result, err := service.Delete(ctx, "p1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if !result.OK || result.ProjectID != "p1" {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(result.CleanupErrors) != 1 || result.CleanupErrors[0].Scope != "worktree" || result.CleanupErrors[0].ID != "c1" {
+		t.Fatalf("cleanup errors = %#v", result.CleanupErrors)
+	}
+	if got := countWhere(t, sqlDB, "projects", "id = 'p1'"); got != 0 {
+		t.Fatalf("project p1 count = %d", got)
+	}
+	if _, err := os.Stat(worktreePath); err != nil {
+		t.Fatalf("stale worktree fixture should remain after failed real git cleanup: %v", err)
+	}
+}
+
+func TestDeleteReportsContainerAndWorktreeWarningsAndStillDeletesRows(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := newProjectDeleteTestDB(t)
+	repoPath := t.TempDir()
+	worktreePath := filepath.Join(repoPath, ".worktrees", "c1")
+	mustExec(t, sqlDB, `UPDATE projects SET git_path = '`+repoPath+`' WHERE id = 'p1'`)
+	mustExec(t, sqlDB, `UPDATE chapters SET worktree_path = '`+worktreePath+`' WHERE id = 'c1'`)
+	mustExec(t, sqlDB, `UPDATE container_instances SET container_id = 'ctr-c1' WHERE id = 'ci1'`)
+
+	removedContainers := []string{}
+	removedWorktrees := []string{}
+	prunedRepos := []string{}
+	service := &Service{
+		DB:       sqlDB,
+		Chapters: &chapters.Service{DB: sqlDB},
+		ContainerRemover: func(_ context.Context, containerIDs []string) error {
+			removedContainers = append(removedContainers, containerIDs...)
+			return errors.New("container cleanup failed")
+		},
+		WorktreeRemover: func(_ context.Context, repoPath, worktreePath string) error {
+			removedWorktrees = append(removedWorktrees, repoPath+"|"+worktreePath)
+			return errors.New("worktree cleanup failed")
+		},
+		WorktreePruner: func(_ context.Context, repoPath string) error {
+			prunedRepos = append(prunedRepos, repoPath)
+			return errors.New("worktree prune failed")
+		},
+	}
+
+	result, err := service.Delete(ctx, "p1")
+	if err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(removedContainers) != 1 || removedContainers[0] != "ctr-c1" {
+		t.Fatalf("removed containers = %#v", removedContainers)
+	}
+	if len(removedWorktrees) != 1 || removedWorktrees[0] != repoPath+"|"+worktreePath {
+		t.Fatalf("removed worktrees = %#v", removedWorktrees)
+	}
+	if len(prunedRepos) != 1 || prunedRepos[0] != repoPath {
+		t.Fatalf("pruned repos = %#v", prunedRepos)
+	}
+	if len(result.CleanupErrors) != 3 {
+		t.Fatalf("cleanup errors = %#v", result.CleanupErrors)
+	}
+	if got := []string{result.CleanupErrors[0].Scope, result.CleanupErrors[1].Scope, result.CleanupErrors[2].Scope}; got[0] != "containers" || got[1] != "worktree" || got[2] != "worktree-prune" {
+		t.Fatalf("cleanup error scopes = %#v, errors = %#v", got, result.CleanupErrors)
+	}
+	if result.CleanupErrors[0].ID != "ctr-c1" || result.CleanupErrors[1].ID != "c1" || result.CleanupErrors[2].ID != "p1" {
+		t.Fatalf("cleanup error IDs = %#v", result.CleanupErrors)
+	}
+	if got := countWhere(t, sqlDB, "projects", "id = 'p1'"); got != 0 {
+		t.Fatalf("project p1 count = %d", got)
+	}
+	if got := countWhere(t, sqlDB, "container_instances", "id = 'ci1'"); got != 0 {
+		t.Fatalf("project container rows remain: %d", got)
+	}
+}
+
+func runProjectDeleteGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
 	}
 }
 

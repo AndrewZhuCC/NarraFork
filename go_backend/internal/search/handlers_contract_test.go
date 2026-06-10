@@ -133,6 +133,47 @@ func TestSearchUsesFTSWhenTablesAreReady(t *testing.T) {
 	}
 }
 
+func TestSearchLargeMissingFTSFallsBackWithout5xx(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	insertSearchContractLargeFixtures(t, sqlDB)
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=auroraanchor&entities=chapters,messages,narrators&limit=6", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	assertLargeDegradedFallbackResponse(t, w, map[string]string{
+		"chapters":  "fts_unavailable",
+		"messages":  "fts_unavailable",
+		"narrators": "fts_unavailable",
+	})
+}
+
+func TestSearchLargeCorruptFTSFallsBackWithout5xx(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	createSearchContractIncompatibleFTS(t, sqlDB)
+	insertSearchContractLargeFixtures(t, sqlDB)
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=auroraanchor&entities=chapters,messages,narrators&limit=6", nil)
+	w := httptest.NewRecorder()
+
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	assertLargeDegradedFallbackResponse(t, w, map[string]string{
+		"chapters":  "fts_unavailable",
+		"messages":  "fts_unavailable",
+		"narrators": "fts_unavailable",
+	})
+}
+
 func TestSearchFTSSupportsCJKTrigramSubstrings(t *testing.T) {
 	sqlDB := openSearchContractDB(t)
 	defer sqlDB.Close()
@@ -317,6 +358,20 @@ func createSearchContractFTS(t *testing.T, sqlDB *sql.DB) {
 	}
 }
 
+func createSearchContractIncompatibleFTS(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	stmts := []string{
+		`CREATE TABLE chapters_fts (title TEXT, description TEXT)`,
+		`CREATE TABLE narrators_fts (title TEXT)`,
+		`CREATE TABLE narrator_messages_fts (content_text TEXT)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("exec %s: %v", stmt, err)
+		}
+	}
+}
+
 func insertSearchContractFixtures(t *testing.T, sqlDB *sql.DB) {
 	t.Helper()
 	stmts := []string{
@@ -328,6 +383,73 @@ func insertSearchContractFixtures(t *testing.T, sqlDB *sql.DB) {
 	for _, stmt := range stmts {
 		if _, err := sqlDB.Exec(stmt); err != nil {
 			t.Fatalf("exec %s: %v", stmt, err)
+		}
+	}
+}
+
+func insertSearchContractLargeFixtures(t *testing.T, sqlDB *sql.DB) {
+	t.Helper()
+	stmts := []string{
+		`INSERT INTO projects (id, name, description) VALUES ('p_large', 'Large Search Project', 'auroraanchor fixture')`,
+		`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c_large_title', 'p_large', 'auroraanchor Chapter North', 'auroraanchor ranking fixture chapter', 'active', 'branch', '2026-05-28T12:00:00Z', '2026-05-29T00:00:00Z')`,
+		`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c_large_description', 'p_large', 'Expanded Search South', 'auroraanchor chapter description collision', 'active', 'branch', '2026-05-26T00:00:00Z', '2026-05-28T12:00:00Z')`,
+		`INSERT INTO narrators (id, chapter_id, title, status, model, last_message_at, created_at, updated_at) VALUES ('n_large_primary', 'c_large_title', 'auroraanchor Primary Narrator', 'idle', 'openai:gpt-4o-mini', '2026-05-29T00:00:00Z', '2026-05-28T12:00:00Z', '2026-05-29T00:00:00Z')`,
+		`INSERT INTO narrators (id, chapter_id, title, status, model, last_message_at, created_at, updated_at) VALUES ('n_large_secondary', 'c_large_description', 'auroraanchor Secondary Narrator', 'idle', 'openai:gpt-4o-mini', '2026-05-28T12:00:00Z', '2026-05-26T00:00:00Z', '2026-05-28T12:00:00Z')`,
+		`INSERT INTO narrator_messages (id, narrator_id, content_text, role, created_at) VALUES ('m_large_primary', 'n_large_primary', 'auroraanchor message collision with project context', 'assistant', '2026-05-29T00:00:00Z')`,
+		`INSERT INTO narrator_messages (id, narrator_id, content_text, role, created_at) VALUES ('m_large_secondary', 'n_large_secondary', 'auroraanchor message collision with older context', 'assistant', '2026-05-28T12:00:00Z')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			t.Fatalf("exec %s: %v", stmt, err)
+		}
+	}
+}
+
+func assertLargeDegradedFallbackResponse(t *testing.T, w *httptest.ResponseRecorder, expectedReasons map[string]string) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 degraded fallback instead of 5xx, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	if body["degraded"] != true {
+		t.Fatalf("expected degraded=true, got %#v", body)
+	}
+	results, _ := body["results"].([]any)
+	if len(results) != 6 {
+		t.Fatalf("expected six large LIKE fallback results, got %d: %#v", len(results), results)
+	}
+	metadata, _ := body["searchMetadata"].(map[string]any)
+	if metadata["degraded"] != true || metadata["ftsReady"] != false || metadata["mode"] != "degraded-like-fallback" || metadata["shortQuery"] != false {
+		t.Fatalf("expected degraded FTS->LIKE metadata, got %#v", metadata)
+	}
+	fallbacks, _ := metadata["fallbacks"].([]any)
+	if len(fallbacks) != len(expectedReasons) {
+		t.Fatalf("expected %d fallback records, got %#v", len(expectedReasons), fallbacks)
+	}
+	seen := map[string]bool{}
+	for _, item := range fallbacks {
+		fallback, _ := item.(map[string]any)
+		entity, _ := fallback["entity"].(string)
+		seen[entity] = true
+		if fallback["from"] != "fts5" || fallback["to"] != "like" {
+			t.Fatalf("expected fts5->like fallback, got %#v", fallback)
+		}
+		if fallback["reason"] != expectedReasons[entity] {
+			t.Fatalf("expected %s reason for %s, got %#v", expectedReasons[entity], entity, fallback)
+		}
+		if _, ok := fallback["error"].(string); !ok {
+			t.Fatalf("expected original FTS error string, got %#v", fallback)
+		}
+		if _, ok := fallback["fallbackError"]; ok {
+			t.Fatalf("LIKE fallback should not report fallbackError, got %#v", fallback)
+		}
+	}
+	for entity := range expectedReasons {
+		if !seen[entity] {
+			t.Fatalf("missing fallback metadata for %s: %#v", entity, fallbacks)
 		}
 	}
 }

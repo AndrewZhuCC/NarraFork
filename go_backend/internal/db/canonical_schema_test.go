@@ -50,6 +50,21 @@ func TestVerifyCanonicalSchemaReportsMissingTableAndColumn(t *testing.T) {
 	}
 }
 
+func TestVerifyCanonicalSchemaReportsColumnMetadataDrift(t *testing.T) {
+	sqlDB := openCanonicalSchemaTestDB(t)
+	defer sqlDB.Close()
+	mustExecCanonical(t, sqlDB, `CREATE TABLE projects (id INTEGER PRIMARY KEY, name TEXT, flow_mode INTEGER NOT NULL DEFAULT 'ruler')`)
+
+	failures, err := verifyCanonicalColumnMetadata(context.Background(), sqlDB)
+	if err != nil {
+		t.Fatalf("verify column metadata: %v", err)
+	}
+	assertCanonicalFailureContains(t, failures, "column projects.id type = INTEGER, want TEXT")
+	assertCanonicalFailureContains(t, failures, "column projects.name notNull = false, want true")
+	assertCanonicalFailureContains(t, failures, "column projects.flow_mode type = INTEGER, want TEXT")
+	assertCanonicalFailureContains(t, failures, "column projects.flow_mode default = 'ruler', want 'classic'")
+}
+
 func TestVerifyCanonicalSchemaReportsMissingIndex(t *testing.T) {
 	sqlDB := openCanonicalSchemaTestDB(t)
 	defer sqlDB.Close()
@@ -400,13 +415,25 @@ func createCanonicalSchemaTablesWithOptions(t *testing.T, sqlDB *sql.DB, include
 			fkByTableColumn[fk.Table+"."+fk.Column] = fk
 		}
 	}
+	metadataByTableColumn := canonicalColumnMetadataByTableColumnForTest()
 	for _, table := range sortedCanonicalBaseTables() {
 		columns := canonicalMainSchema[table]
 		defs := make([]string, 0, len(columns))
 		for i, column := range columns {
-			definition := quoteIdentifier(column) + " TEXT"
+			metadata, hasMetadata := metadataByTableColumn[table+"."+column]
+			columnType := "TEXT"
+			if hasMetadata && metadata.Type != "" {
+				columnType = metadata.Type
+			}
+			definition := quoteIdentifier(column) + " " + columnType
+			if hasMetadata && metadata.NotNull != nil && *metadata.NotNull {
+				definition += " NOT NULL"
+			}
 			if i == 0 {
 				definition += " PRIMARY KEY"
+			}
+			if hasMetadata && metadata.DefaultValue != nil {
+				definition += " DEFAULT " + *metadata.DefaultValue
 			}
 			if fk, ok := fkByTableColumn[table+"."+column]; ok {
 				definition += " REFERENCES " + quoteIdentifier(fk.ReferencedTable) + "(" + quoteIdentifier(fk.ReferencedColumn) + ")"
@@ -421,6 +448,14 @@ func createCanonicalSchemaTablesWithOptions(t *testing.T, sqlDB *sql.DB, include
 	createCanonicalFTSTables(t, sqlDB)
 	createCanonicalIndexes(t, sqlDB)
 	createCanonicalFTSTriggers(t, sqlDB)
+}
+
+func canonicalColumnMetadataByTableColumnForTest() map[string]canonicalColumnMetadataRequirement {
+	metadataByColumn := map[string]canonicalColumnMetadataRequirement{}
+	for _, metadata := range canonicalColumnMetadata {
+		metadataByColumn[metadata.Table+"."+metadata.Column] = metadata
+	}
+	return metadataByColumn
 }
 
 func sortedCanonicalBaseTables() []string {

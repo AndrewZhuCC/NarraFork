@@ -183,6 +183,28 @@ func TestKiroChatReturnsExplicitFeatureDisabledFallback(t *testing.T) {
 	}
 }
 
+func TestKiroModelsRefreshReturnsExplicitFeatureDisabledFallback(t *testing.T) {
+	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	req := httptest.NewRequest(http.MethodPost, "/kiro/models/refresh", nil)
+	req.Header.Set("Authorization", "Bearer "+adminToken)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("expected 501 feature disabled, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["ok"] != false || body["code"] != "FEATURE_DISABLED" || body["feature"] != "providers.kiro.modelsRefresh" || body["supported"] != false || body["fallback"] != true {
+		t.Fatalf("unexpected Kiro models refresh fallback body: %#v", body)
+	}
+	reason, _ := body["reason"].(string)
+	if !strings.Contains(reason, "Kiro model refresh requires the TypeScript Kiro plugin bridge") || body["error"] != reason || body["message"] != reason {
+		t.Fatalf("Kiro models refresh fallback should expose reason/error/message, got %#v", body)
+	}
+}
+
 func TestKiroMcpToolsFallbackExposesReason(t *testing.T) {
 	router, adminToken := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
 	req := httptest.NewRequest(http.MethodGet, "/kiro/mcp-tools", nil)
@@ -1984,8 +2006,8 @@ func TestNugProviderEndpointsExposeFrontendContractShape(t *testing.T) {
 	}
 
 	quota := doJSON(http.MethodGet, "/nug/providers/nug-1/quota", nil)
-	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) || quota["username"] != "nug-user" {
-		t.Fatalf("quota should normalize numeric aliases and preserve extra fields: %#v", quota)
+	if quota["balance"] != float64(12.5) || quota["totalGranted"] != float64(50) || quota["username"] != "nug-user" || quota["detailedQuotaBalance"] != nil {
+		t.Fatalf("quota should normalize numeric aliases and preserve TS null detail field: %#v", quota)
 	}
 	channels := doJSON(http.MethodGet, "/nug/providers/nug-1/channels/health", nil)
 	if list, ok := channels["channels"].([]any); !ok || len(list) != 1 {
@@ -2668,6 +2690,70 @@ func TestCodexCredentialMissingResponsesMatchTS(t *testing.T) {
 	notFound, _ := batchBody["notFound"].([]any)
 	if len(removed) != 0 || len(notFound) != 1 || notFound[0] != "missing" {
 		t.Fatalf("unexpected batch delete body: %#v", batchBody)
+	}
+}
+
+func TestCodexCredentialDeleteUnhealthyRemovesAcrossPages(t *testing.T) {
+	r, token := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	dataDir, err := narraforkDataDir()
+	if err != nil {
+		t.Fatalf("data dir: %v", err)
+	}
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	seed := []map[string]any{
+		{"id": "ok", "accessToken": "at-ok", "priority": float64(0), "disabled": false},
+		{"id": "manual", "accessToken": "at-manual", "priority": float64(1), "disabled": true, "disabledReason": "manual"},
+		{"id": "quota", "accessToken": "at-quota", "priority": float64(2), "disabled": true, "disabledReason": "quota_exhausted"},
+		{"id": "failed", "accessToken": "at-failed", "priority": float64(3), "disabled": true, "disabledReason": "too_many_failures"},
+		{"id": "banned", "accessToken": "at-banned", "priority": float64(4), "disabled": true, "disabledReason": "banned"},
+	}
+	data, _ := json.Marshal(seed)
+	if err := os.WriteFile(filepath.Join(dataDir, "codex-credentials.json"), data, 0o600); err != nil {
+		t.Fatalf("write codex credentials: %v", err)
+	}
+
+	statusReq := httptest.NewRequest(http.MethodGet, "/codex/status?unavailablePage=1&pageSize=1", nil)
+	statusReq.Header.Set("Authorization", "Bearer "+token)
+	statusW := httptest.NewRecorder()
+	r.ServeHTTP(statusW, statusReq)
+	if statusW.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", statusW.Code, statusW.Body.String())
+	}
+	var statusBody map[string]any
+	decodeJSONBody(t, statusW, &statusBody)
+	if numericMapOr(statusBody, "unhealthyTotal", 0) != 2 {
+		t.Fatalf("expected unhealthyTotal=2, got %#v", statusBody)
+	}
+	if entries, _ := statusBody["unavailableEntries"].([]any); len(entries) != 1 {
+		t.Fatalf("expected paged unavailable entries, got %#v", statusBody["unavailableEntries"])
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/codex/credentials/unhealthy", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected delete unhealthy 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	removed, _ := body["removed"].([]any)
+	if len(removed) != 2 || removed[0] != "failed" || removed[1] != "banned" {
+		t.Fatalf("unexpected delete unhealthy body: %#v", body)
+	}
+
+	updated, err := loadCodexCredentials()
+	if err != nil {
+		t.Fatalf("load updated credentials: %v", err)
+	}
+	ids := []string{}
+	for _, entry := range updated {
+		ids = append(ids, stringMap(entry, "id", ""))
+	}
+	if strings.Join(ids, ",") != "ok,manual,quota" {
+		t.Fatalf("unexpected remaining credentials: %#v", ids)
 	}
 }
 

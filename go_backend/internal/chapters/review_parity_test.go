@@ -3,6 +3,9 @@ package chapters
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,15 +41,46 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 
 	sqlDB := openReviewChapterDB(t)
 	defer sqlDB.Close()
+	createChapterCommitTableForCreateLifecycle(t, sqlDB)
 	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
 
-	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	reviewEvents := []map[string]any{}
+	service := &Service{
+		DB:        sqlDB,
+		Git:       gitx.NewService(),
+		Narrators: &narrators.Service{DB: sqlDB},
+		BroadcastChapterLifecycle: func(payload any) {
+			if event, ok := payload.(map[string]any); ok {
+				reviewEvents = append(reviewEvents, event)
+			}
+		},
+	}
 	review, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en", UserID: "reviewer"})
 	if err != nil {
 		t.Fatalf("CreateReview: %v", err)
 	}
 	if review.WorktreePath == nil || strings.TrimSpace(*review.WorktreePath) == "" {
 		t.Fatalf("review worktree missing: %#v", review)
+	}
+	if review.HeadCommitSHA == nil || *review.HeadCommitSHA != head || review.CommitCount != 2 {
+		t.Fatalf("review head/count = %#v/%d, want %s/2", review.HeadCommitSHA, review.CommitCount, head)
+	}
+	if !hasReviewLifecycleEvent(reviewEvents, "review:created", review.ID, "source", "p1") {
+		t.Fatalf("missing review:created lifecycle event: %#v", reviewEvents)
+	}
+	var commitRows, manualCommitRows int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*), COUNT(CASE WHEN source = 'manual' THEN 1 END) FROM chapter_commits WHERE chapter_id = ?`, review.ID).Scan(&commitRows, &manualCommitRows); err != nil {
+		t.Fatalf("query review commit history: %v", err)
+	}
+	if commitRows != 2 || manualCommitRows != 2 {
+		t.Fatalf("review commit rows = %d manual=%d, want 2/2", commitRows, manualCommitRows)
+	}
+	var reviewHeadMessage string
+	if err := sqlDB.QueryRow(`SELECT message FROM chapter_commits WHERE chapter_id = ? AND sha = ?`, review.ID, head).Scan(&reviewHeadMessage); err != nil {
+		t.Fatalf("query review head commit message: %v", err)
+	}
+	if reviewHeadMessage != "feature" {
+		t.Fatalf("review head commit message = %q, want feature", reviewHeadMessage)
 	}
 	worktree := *review.WorktreePath
 	if data := readFileReview(t, filepath.Join(worktree, "tracked.txt")); !strings.Contains(data, "uncommitted change") {
@@ -101,6 +135,84 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	prompt := buildReviewSystemPrompt(diffContext, "en")
 	if !strings.Contains(prompt, "ConcludeReview") || !strings.Contains(prompt, "Code Changes to Review") {
 		t.Fatalf("review prompt missing TS-compatible instructions:\n%s", prompt)
+	}
+}
+
+func hasReviewLifecycleEvent(events []map[string]any, eventType, reviewChapterID, sourceChapterID, projectID string) bool {
+	for _, event := range events {
+		if event["type"] == eventType && event["reviewChapterId"] == reviewChapterID && event["sourceChapterId"] == sourceChapterID && event["projectId"] == projectID {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	runGitReview(t, repo, "init", "-b", "main")
+	runGitReview(t, repo, "config", "user.email", "test@example.com")
+	runGitReview(t, repo, "config", "user.name", "Test User")
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "initial")
+	base := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\nfeature\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "feature")
+	head := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+
+	sqlDB := openReviewChapterDB(t)
+	defer sqlDB.Close()
+	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/source/review", strings.NewReader(`{"locale":"en","autoStart":true}`))
+	newChapterRouter(NewHandler(service)).ServeHTTP(recorder, req.WithContext(ctx))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("review status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode review response: %v", err)
+	}
+	runtimePayload, ok := body["reviewRuntime"].(map[string]any)
+	if !ok {
+		t.Fatalf("reviewRuntime missing from review response: %#v", body)
+	}
+	if runtimePayload["autoStartRequested"] != true || runtimePayload["autoStartSession"] != false || runtimePayload["startMode"] != "seed-message-only" {
+		t.Fatalf("unexpected reviewRuntime fallback payload: %#v", runtimePayload)
+	}
+	if body["fallbackCode"] != reviewAutoStartDisabledFallbackCode {
+		t.Fatalf("fallbackCode = %#v", body["fallbackCode"])
+	}
+	fallbacks, ok := body["fallbacks"].([]any)
+	if !ok || len(fallbacks) != 1 {
+		t.Fatalf("fallbacks = %#v", body["fallbacks"])
+	}
+	fallback, ok := fallbacks[0].(map[string]any)
+	if !ok || fallback["code"] != reviewAutoStartDisabledFallbackCode || fallback["feature"] != "review.autoStartSession" || fallback["requested"] != true {
+		t.Fatalf("unexpected fallback entry: %#v", fallbacks[0])
+	}
+
+	var narratorID, status, substatus, cwd string
+	var messageCount int
+	if err := sqlDB.QueryRow(`SELECT id, status, substatus, cwd, message_count FROM narrators WHERE chapter_id IN (SELECT id FROM chapters WHERE role = 'review')`).Scan(&narratorID, &status, &substatus, &cwd, &messageCount); err != nil {
+		t.Fatalf("load review narrator: %v", err)
+	}
+	if status != "idle" || substatus != "[]" || messageCount != 1 || strings.TrimSpace(cwd) == "" {
+		t.Fatalf("review narrator should stay seed-only/idle after autoStart request, status=%q substatus=%q messages=%d cwd=%q", status, substatus, messageCount, cwd)
+	}
+	var role, contentText string
+	var createdBy sql.NullString
+	if err := sqlDB.QueryRow(`SELECT role, content_text, created_by FROM narrator_messages WHERE narrator_id = ?`, narratorID).Scan(&role, &contentText, &createdBy); err != nil {
+		t.Fatalf("load seeded review message: %v", err)
+	}
+	if role != "user" || contentText != reviewStartMessage("en") || createdBy.Valid {
+		t.Fatalf("seeded review message = role %q text %q createdBy %#v", role, contentText, createdBy)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_messages WHERE role = 'assistant'`); count != 0 {
+		t.Fatalf("review autoStart fallback should not create assistant/session messages, count=%d", count)
 	}
 }
 

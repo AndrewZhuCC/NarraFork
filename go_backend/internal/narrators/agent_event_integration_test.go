@@ -317,6 +317,46 @@ func requestToolResultContains(body map[string]any, toolUseID, text string) bool
 	return false
 }
 
+type runtimeUpdateToolProvider struct {
+	execute func(context.Context) error
+}
+
+func (p runtimeUpdateToolProvider) AgentToolSpecs(ctx context.Context, info ExternalToolContext) []agentbasic.ExternalToolSpec {
+	_ = ctx
+	_ = info
+	return []agentbasic.ExternalToolSpec{{
+		Name:        "mcp__runtime_update",
+		Description: "Update narrator runtime settings for tests.",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"properties":           map[string]any{},
+			"additionalProperties": false,
+		},
+		Source: "test",
+	}}
+}
+
+func (p runtimeUpdateToolProvider) ResolveToolPermission(toolName string, permissionMode string) (string, string, bool) {
+	_ = permissionMode
+	if toolName == "mcp__runtime_update" {
+		return "allow", "", true
+	}
+	return "", "", false
+}
+
+func (p runtimeUpdateToolProvider) ExecuteTool(ctx context.Context, toolName string, args map[string]any) (agentbasic.ToolRun, bool) {
+	_ = args
+	if toolName != "mcp__runtime_update" {
+		return agentbasic.ToolRun{}, false
+	}
+	if p.execute != nil {
+		if err := p.execute(ctx); err != nil {
+			return agentbasic.ToolRun{Status: "error", Output: err.Error(), Error: err.Error()}, true
+		}
+	}
+	return agentbasic.ToolRun{Status: "completed", Output: "runtime settings updated"}, true
+}
+
 func latestAssistantBlocks(t *testing.T, service *Service, narratorID string) []map[string]any {
 	t.Helper()
 	var raw string
@@ -440,6 +480,241 @@ func TestRunBasicAgentPersistsStreamingAssistantBlocks(t *testing.T) {
 	}
 }
 
+func TestRunBasicAgentAppliesRuntimeModelReasoningAndSystemPromptBeforeNextRequest(t *testing.T) {
+	var mu sync.Mutex
+	requests := []map[string]any{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode provider request: %v", err)
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		count := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if count == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "runtime-update-1", "type": "function", "function": map[string]any{"name": "mcp__runtime_update", "arguments": `{}`}}}}}},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "runtime applied"}}},
+		})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-5-test-1", server.URL)
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	service.ExternalTools = runtimeUpdateToolProvider{execute: func(ctx context.Context) error {
+		_, err := service.DB.ExecContext(ctx, `UPDATE narrators SET model = ?, reasoning_effort = ?, system_prompt = ?, updated_at = ? WHERE id = ?`, "openai:gpt-5-test-2", "high", "runtime replacement prompt", time.Now().UTC().Format(time.RFC3339Nano), narratorID)
+		return err
+	}}
+	service.runBasicAgent(context.Background(), narratorID)
+
+	mu.Lock()
+	captured := append([]map[string]any(nil), requests...)
+	mu.Unlock()
+	if len(captured) != 2 {
+		t.Fatalf("expected two provider requests, got %d: %#v", len(captured), captured)
+	}
+	if captured[0]["model"] != "gpt-5-test-1" {
+		t.Fatalf("first request should use initial model, got %#v", captured[0]["model"])
+	}
+	if captured[1]["model"] != "gpt-5-test-2" {
+		t.Fatalf("second request should use updated model, got %#v", captured[1]["model"])
+	}
+	if captured[1]["reasoning_effort"] != "high" {
+		t.Fatalf("second request should use updated reasoning effort, got %#v", captured[1]["reasoning_effort"])
+	}
+	messages, ok := captured[1]["messages"].([]any)
+	if !ok || len(messages) == 0 {
+		t.Fatalf("second request missing messages: %#v", captured[1]["messages"])
+	}
+	firstMessage, _ := messages[0].(map[string]any)
+	if firstMessage["role"] != "system" || !strings.Contains(stringFromAny(firstMessage["content"]), "runtime replacement prompt") {
+		t.Fatalf("second request should include updated system prompt, got %#v", firstMessage)
+	}
+	if !hasBroadcast(events(), narratorID, "model_switched") {
+		t.Fatalf("expected model_switched broadcast, got %#v", events())
+	}
+	var status string
+	if err := service.DB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status); err != nil {
+		t.Fatalf("load narrator status: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("narrator should finish idle, got %s", status)
+	}
+	var messageCount, toolCount int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ?`, narratorID).Scan(&messageCount); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'runtime-update-1'`, narratorID).Scan(&toolCount); err != nil {
+		t.Fatalf("count tool calls: %v", err)
+	}
+	if messageCount == 0 || toolCount != 1 {
+		t.Fatalf("expected persisted messages and one runtime tool row, messages=%d tools=%d", messageCount, toolCount)
+	}
+}
+
+func TestRunBasicAgentCanSwitchProviderPrefixBeforeFollowUpRequest(t *testing.T) {
+	var initialMu sync.Mutex
+	initialRequests := []map[string]any{}
+	initialServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode initial provider request: %v", err)
+		}
+		initialMu.Lock()
+		initialRequests = append(initialRequests, body)
+		initialMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "provider-switch-1", "type": "function", "function": map[string]any{"name": "mcp__runtime_update", "arguments": `{}`}}}}}},
+		})
+	}))
+	defer initialServer.Close()
+
+	var switchedMu sync.Mutex
+	switchedRequests := []map[string]any{}
+	switchedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode switched provider request: %v", err)
+		}
+		switchedMu.Lock()
+		switchedRequests = append(switchedRequests, body)
+		switchedMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "provider switched"}}},
+		})
+	}))
+	defer switchedServer.Close()
+
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-initial", initialServer.URL)
+	_, err := service.Settings.Patch(map[string]any{
+		"openaiProviders": []any{
+			map[string]any{"prefix": "openai", "apiKey": "initial-key", "baseUrl": initialServer.URL, "defaultModel": "gpt-initial"},
+			map[string]any{"prefix": "alt", "apiKey": "switched-key", "baseUrl": switchedServer.URL, "defaultModel": "gpt-5-switched"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("patch provider settings: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	service.ExternalTools = runtimeUpdateToolProvider{execute: func(ctx context.Context) error {
+		_, err := service.DB.ExecContext(ctx, `UPDATE narrators SET model = ?, reasoning_effort = ?, updated_at = ? WHERE id = ?`, "alt:gpt-5-switched", "medium", time.Now().UTC().Format(time.RFC3339Nano), narratorID)
+		return err
+	}}
+
+	service.runBasicAgent(context.Background(), narratorID)
+
+	initialMu.Lock()
+	capturedInitial := append([]map[string]any(nil), initialRequests...)
+	initialMu.Unlock()
+	switchedMu.Lock()
+	capturedSwitched := append([]map[string]any(nil), switchedRequests...)
+	switchedMu.Unlock()
+	if len(capturedInitial) != 1 {
+		t.Fatalf("expected one initial-provider request, got %d", len(capturedInitial))
+	}
+	if len(capturedSwitched) != 1 {
+		t.Fatalf("expected one switched-provider request, got %d", len(capturedSwitched))
+	}
+	if capturedInitial[0]["model"] != "gpt-initial" {
+		t.Fatalf("initial request should use initial model, got %#v", capturedInitial[0]["model"])
+	}
+	if capturedSwitched[0]["model"] != "gpt-5-switched" || capturedSwitched[0]["reasoning_effort"] != "medium" {
+		t.Fatalf("switched request should use updated provider/model/reasoning, got %#v", capturedSwitched[0])
+	}
+	if !hasBroadcast(events(), narratorID, "model_switched") {
+		t.Fatalf("expected model_switched broadcast after provider prefix switch, got %#v", events())
+	}
+}
+
+func TestRunBasicAgentReResolvesDefaultModelBeforeFollowUpRequest(t *testing.T) {
+	var initialMu sync.Mutex
+	initialRequests := []map[string]any{}
+	initialServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode initial default-provider request: %v", err)
+		}
+		initialMu.Lock()
+		initialRequests = append(initialRequests, body)
+		initialMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "default-switch-1", "type": "function", "function": map[string]any{"name": "mcp__runtime_update", "arguments": `{}`}}}}}},
+		})
+	}))
+	defer initialServer.Close()
+
+	var switchedMu sync.Mutex
+	switchedRequests := []map[string]any{}
+	switchedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode switched default-provider request: %v", err)
+		}
+		switchedMu.Lock()
+		switchedRequests = append(switchedRequests, body)
+		switchedMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "default model switched"}}},
+		})
+	}))
+	defer switchedServer.Close()
+
+	service, narratorID, _ := newTestNarratorService(t, "__default__", initialServer.URL)
+	_, err := service.Settings.Patch(map[string]any{
+		"agent": map[string]any{"defaultModel": "openai:gpt-5-default-1"},
+		"openaiProviders": []any{
+			map[string]any{"prefix": "openai", "apiKey": "initial-key", "baseUrl": initialServer.URL, "defaultModel": "gpt-5-default-1"},
+			map[string]any{"prefix": "alt", "apiKey": "switched-key", "baseUrl": switchedServer.URL, "defaultModel": "gpt-5-default-2"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("patch initial default-model settings: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	service.ExternalTools = runtimeUpdateToolProvider{execute: func(ctx context.Context) error {
+		_, err := service.Settings.Patch(map[string]any{
+			"agent": map[string]any{"defaultModel": "alt:gpt-5-default-2"},
+		})
+		return err
+	}}
+
+	service.runBasicAgent(context.Background(), narratorID)
+
+	initialMu.Lock()
+	capturedInitial := append([]map[string]any(nil), initialRequests...)
+	initialMu.Unlock()
+	switchedMu.Lock()
+	capturedSwitched := append([]map[string]any(nil), switchedRequests...)
+	switchedMu.Unlock()
+	if len(capturedInitial) != 1 {
+		t.Fatalf("expected one initial default-model request, got %d", len(capturedInitial))
+	}
+	if len(capturedSwitched) != 1 {
+		t.Fatalf("expected one switched default-model request, got %d", len(capturedSwitched))
+	}
+	if capturedInitial[0]["model"] != "gpt-5-default-1" {
+		t.Fatalf("initial request should resolve initial default model, got %#v", capturedInitial[0]["model"])
+	}
+	if capturedSwitched[0]["model"] != "gpt-5-default-2" {
+		t.Fatalf("switched request should re-resolve updated default model, got %#v", capturedSwitched[0]["model"])
+	}
+	if !hasBroadcast(events(), narratorID, "model_switched") {
+		t.Fatalf("expected model_switched broadcast after default-model settings update, got %#v", events())
+	}
+}
+
 func TestPostMessageStartsAgentLoopAndReturnsIdle(t *testing.T) {
 	var mu sync.Mutex
 	requests := 0
@@ -476,6 +751,100 @@ func TestPostMessageStartsAgentLoopAndReturnsIdle(t *testing.T) {
 	defer mu.Unlock()
 	if requests == 0 {
 		t.Fatalf("POST /messages did not invoke the agent provider")
+	}
+}
+
+func TestRunBasicAgentFinalStatusFailurePreservesTranscriptAndPersistsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "answer before final status failure"}}},
+		})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	if _, err := service.DB.Exec(`CREATE TRIGGER fail_final_success_idle BEFORE UPDATE OF status ON narrators WHEN NEW.status = 'idle' AND NEW.substatus = '["unread"]' BEGIN SELECT RAISE(ABORT, 'final success status blocked'); END;`); err != nil {
+		t.Fatalf("create final status trigger: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+
+	service.runBasicAgent(context.Background(), narratorID)
+
+	blocks := latestAssistantBlocks(t, service, narratorID)
+	if len(blocks) != 1 || blocks[0]["type"] != "text" || blocks[0]["text"] != "answer before final status failure" {
+		t.Fatalf("assistant transcript should survive finalization failure, got %#v", blocks)
+	}
+	var status, substatus, errorMessage string
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("load narrator after finalization failure: %v", err)
+	}
+	if status != "idle" || substatus != `["error"]` || !strings.Contains(errorMessage, "final success status blocked") {
+		t.Fatalf("narrator should finish with persisted error, status=%s substatus=%s error=%q", status, substatus, errorMessage)
+	}
+	var errorDisplayCount int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND role = 'disp' AND content_text LIKE '%final success status blocked%'`, narratorID).Scan(&errorDisplayCount); err != nil {
+		t.Fatalf("count finalization error display messages: %v", err)
+	}
+	if errorDisplayCount != 1 {
+		t.Fatalf("expected one persisted finalization error display message, got %d", errorDisplayCount)
+	}
+	if payload := findBroadcast(events(), narratorID, "narrator_error"); payload == nil || !strings.Contains(stringFromAny(payload["error"]), "final success status blocked") || payload["errorCode"] != "AGENT_ERROR" {
+		t.Fatalf("expected narrator_error broadcast for finalization failure, got %#v events=%#v", payload, events())
+	}
+}
+
+func TestRunBasicAgentToolResultFailurePreservesToolUseTranscriptAndPersistsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if requestHasToolResult(body) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "unexpected completion"}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "read-before-db-failure", "type": "function", "function": map[string]any{"name": "Read", "arguments": `{"file_path":"note.txt"}`}}}}}},
+		})
+	}))
+	defer server.Close()
+	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	if err := os.WriteFile(filepath.Join(cwd, "note.txt"), []byte("survives failure"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+	for _, stmt := range []string{
+		`CREATE TRIGGER fail_tool_result_success_update BEFORE UPDATE OF status ON narrator_tool_calls WHEN NEW.status = 'success' BEGIN SELECT RAISE(ABORT, 'tool result update blocked'); END;`,
+		`CREATE TRIGGER fail_tool_result_success_insert BEFORE INSERT ON narrator_tool_calls WHEN NEW.status = 'success' BEGIN SELECT RAISE(ABORT, 'tool result update blocked'); END;`,
+	} {
+		if _, err := service.DB.Exec(stmt); err != nil {
+			t.Fatalf("create tool result trigger: %v", err)
+		}
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+
+	service.runBasicAgent(context.Background(), narratorID)
+
+	blocks := latestAssistantBlocks(t, service, narratorID)
+	if len(blocks) != 1 || blocks[0]["type"] != "tool_use" || blocks[0]["id"] != "read-before-db-failure" || blocks[0]["name"] != "Read" {
+		t.Fatalf("assistant tool_use transcript should survive tool result DB failure, got %#v", blocks)
+	}
+	var status, substatus, errorMessage string
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("load narrator after tool result failure: %v", err)
+	}
+	if status != "idle" || substatus != `["error"]` || !strings.Contains(errorMessage, "tool result update blocked") {
+		t.Fatalf("narrator should finish with persisted error, status=%s substatus=%s error=%q", status, substatus, errorMessage)
+	}
+	var errorDisplayCount int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND role = 'disp' AND content_text LIKE '%tool result update blocked%'`, narratorID).Scan(&errorDisplayCount); err != nil {
+		t.Fatalf("count tool result error display messages: %v", err)
+	}
+	if errorDisplayCount != 1 {
+		t.Fatalf("expected one persisted tool result error display message, got %d", errorDisplayCount)
+	}
+	if payload := findBroadcast(events(), narratorID, "narrator_error"); payload == nil || !strings.Contains(stringFromAny(payload["error"]), "tool result update blocked") || payload["errorCode"] != "AGENT_ERROR" {
+		t.Fatalf("expected narrator_error broadcast for tool result failure, got %#v events=%#v", payload, events())
 	}
 }
 
@@ -779,6 +1148,49 @@ func TestRunBasicAgentAccountsActiveGoalUsageAndBroadcastsGoalsSet(t *testing.T)
 	}
 	if !seenUpdatedGoals {
 		t.Fatalf("expected goals_set with accounted token/time usage, events=%#v", events())
+	}
+}
+
+func TestAgentEventsPersistContextAndMeteringToAPIRequestAndAssistantMessage(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "kiro:claude-test", "http://example.invalid")
+	ctx := context.Background()
+	narrator, err := service.Get(ctx, narratorID)
+	if err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator}
+	usage := &agentbasic.UsageSnapshot{InputTokens: 120, CompletionTokens: 8, ContextWindow: 240}
+	meterMetadata := map[string]any{"unit": "credit", "unitPlural": "credits", "usage": float64(2.5)}
+	apiMetadata := map[string]any{"meterUsage": float64(2.5), "meterUnit": "credit"}
+
+	for _, event := range []agentbasic.AgentEvent{
+		{Type: "api_request_start", RequestID: "req-meter", Provider: "kiro", Model: "claude-test", CredentialID: "cred-a"},
+		{Type: "context_usage", Percentage: 37.5, Usage: usage},
+		{Type: "metering", CredentialID: "cred-a", Metadata: meterMetadata},
+		{Type: "api_request_end", RequestID: "req-meter", Provider: "kiro", Model: "claude-test", CredentialID: "cred-a", Usage: usage, Percentage: 37.5, Metadata: apiMetadata},
+		{Type: "assistant_message", Text: "metered answer"},
+	} {
+		if err := service.handleAgentEvent(ctx, state, event); err != nil {
+			t.Fatalf("handle %s: %v", event.Type, err)
+		}
+	}
+
+	var apiMessageID, apiCredentialID, apiMeterUnit string
+	var apiContextPercent, apiMeterUsage sql.NullFloat64
+	if err := service.DB.QueryRow(`SELECT message_id, credential_id, context_percent, meter_usage, meter_unit FROM api_requests WHERE id = 'req-meter'`).Scan(&apiMessageID, &apiCredentialID, &apiContextPercent, &apiMeterUsage, &apiMeterUnit); err != nil {
+		t.Fatalf("load metered api request: %v", err)
+	}
+	if apiMessageID == "" || apiCredentialID != "cred-a" || !apiContextPercent.Valid || apiContextPercent.Float64 != 37.5 || !apiMeterUsage.Valid || apiMeterUsage.Float64 != 2.5 || apiMeterUnit != "credit" {
+		t.Fatalf("api request should persist credential/context/metering telemetry, message=%q credential=%q context=%#v meter=%#v unit=%q", apiMessageID, apiCredentialID, apiContextPercent, apiMeterUsage, apiMeterUnit)
+	}
+
+	var msgContextPercent, msgMeterUsage sql.NullFloat64
+	var msgMeterUnit sql.NullString
+	if err := service.DB.QueryRow(`SELECT context_percent, meter_usage, meter_unit FROM narrator_messages WHERE id = ?`, apiMessageID).Scan(&msgContextPercent, &msgMeterUsage, &msgMeterUnit); err != nil {
+		t.Fatalf("load metered assistant message: %v", err)
+	}
+	if !msgContextPercent.Valid || msgContextPercent.Float64 != 37.5 || !msgMeterUsage.Valid || msgMeterUsage.Float64 != 2.5 || !msgMeterUnit.Valid || msgMeterUnit.String != "credit" {
+		t.Fatalf("assistant message should persist context/metering telemetry, context=%#v meter=%#v unit=%#v", msgContextPercent, msgMeterUsage, msgMeterUnit)
 	}
 }
 

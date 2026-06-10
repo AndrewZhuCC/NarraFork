@@ -14,7 +14,11 @@ import (
 	"narrafork-go/internal/id"
 )
 
-type Handler struct{ DB *sql.DB }
+type Handler struct {
+	DB                                 *sql.DB
+	BroadcastDependencyEvent           func(payload any)
+	SyncProjectDBAfterDependencyChange func(projectID string)
+}
 
 func NewHandler(sqlDB *sql.DB) *Handler { return &Handler{DB: sqlDB} }
 
@@ -175,6 +179,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	h.broadcastDependencyLifecycleEvent("dependency:created", edge)
+	h.syncProjectDBAfterDependencyChange(edge)
 	httpx.WriteJSON(w, http.StatusCreated, edge)
 	return nil
 }
@@ -202,8 +208,30 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	h.broadcastDependencyLifecycleEvent("dependency:removed", edge)
+	h.syncProjectDBAfterDependencyChange(edge)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
 	return nil
+}
+
+func (h *Handler) broadcastDependencyLifecycleEvent(eventType string, edge Edge) {
+	if h.BroadcastDependencyEvent == nil || edge.Type != "dependency" {
+		return
+	}
+	h.BroadcastDependencyEvent(map[string]any{
+		"type":      eventType,
+		"edgeId":    edge.ID,
+		"projectId": edge.ProjectID,
+		"sourceId":  edge.SourceID,
+		"targetId":  edge.TargetID,
+	})
+}
+
+func (h *Handler) syncProjectDBAfterDependencyChange(edge Edge) {
+	if h.SyncProjectDBAfterDependencyChange == nil || edge.Type != "dependency" || edge.ProjectID == "" {
+		return
+	}
+	h.SyncProjectDBAfterDependencyChange(edge.ProjectID)
 }
 
 func (h *Handler) get(r *http.Request, edgeID string) (Edge, error) {

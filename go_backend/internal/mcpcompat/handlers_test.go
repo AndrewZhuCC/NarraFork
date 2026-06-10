@@ -279,27 +279,28 @@ func TestImportServersPersistsSettingsAndSkipsDuplicates(t *testing.T) {
 	}
 
 	body := map[string]any{"json": map[string]any{"mcpServers": map[string]any{
-		"dupe": map[string]any{"command": "ignored"},
-		"web":  map[string]any{"url": "https://example.com/mcp", "headers": map[string]any{"Authorization": "Bearer token", "Nil": nil}},
+		"dupe":  map[string]any{"command": "ignored"},
+		"local": map[string]any{"command": "node", "args": []any{"server.js"}, "env": map[string]any{"A": "1", "Nil": nil}},
+		"web":   map[string]any{"url": "https://example.com/mcp", "headers": map[string]any{"Authorization": "Bearer token", "Nil": nil}},
 	}}}
 	w := serveMCP(handler, http.MethodPost, "/servers/import", body)
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST /servers/import status = %d, body=%s", w.Code, w.Body.String())
 	}
 	payload := decodeResponse(t, w)
-	if payload["added"] != float64(1) || payload["skipped"] != float64(1) {
-		t.Fatalf("import payload = %#v, want added=1 skipped=1", payload)
+	if payload["added"] != float64(1) || payload["skipped"] != float64(2) {
+		t.Fatalf("import payload = %#v, want added=1 skipped=2", payload)
 	}
 	servers := store.MCPServers()
 	if len(servers) != 2 {
 		t.Fatalf("settings mcpServers length = %d, want 2", len(servers))
 	}
-	if servers[1]["transport"] != "streamable-http" {
-		t.Fatalf("imported transport = %#v, want streamable-http", servers[1]["transport"])
+	if servers[1]["name"] != "local" || servers[1]["transport"] != "stdio" {
+		t.Fatalf("only stdio import should be persisted, got %#v", servers[1])
 	}
-	headers := servers[1]["headers"].(map[string]any)
-	if _, ok := headers["Nil"]; ok {
-		t.Fatalf("nil header should be filtered: %#v", headers)
+	env := servers[1]["env"].(map[string]any)
+	if _, ok := env["Nil"]; ok {
+		t.Fatalf("nil env should be filtered: %#v", env)
 	}
 }
 
@@ -580,18 +581,44 @@ func TestManualConnectDisabledStdioServerStillInjectsLikeTS(t *testing.T) {
 	}
 }
 
-func TestNonStdioTransportConnectionReportsCompatibilityDegradation(t *testing.T) {
+func TestNonStdioTransportCreateTestAndConnectReportCompatibilityDegradation(t *testing.T) {
 	handler, store := newTestHandler(t)
-	if err := store.SetMCPServers([]map[string]any{{
-		"id":        "srv-http",
+	create := serveMCP(handler, http.MethodPost, "/servers", map[string]any{
 		"name":      "http-tools",
 		"transport": "streamable-http",
 		"url":       "https://example.com/mcp",
 		"enabled":   true,
-	}}); err != nil {
-		t.Fatalf("seed non-stdio server: %v", err)
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create non-stdio status = %d body=%s", create.Code, create.Body.String())
 	}
-	w := serveMCP(handler, http.MethodPost, "/servers/srv-http/connect", nil)
+	created := decodeResponse(t, create)
+	if created["status"] != "error" || !strings.Contains(stringOr(created["error"], ""), "only stdio MCP transport") {
+		t.Fatalf("enabled non-stdio create should persist metadata but expose degradation, got %#v", created)
+	}
+	if specs := handler.AgentToolSpecs(context.Background(), narrators.ExternalToolContext{}); len(specs) != 0 {
+		t.Fatalf("non-stdio metadata must not inject agent tools, got %#v", specs)
+	}
+
+	test := serveMCP(handler, http.MethodPost, "/servers/test", map[string]any{
+		"name":      "sse-tools",
+		"transport": "sse",
+		"url":       "https://example.com/sse",
+		"enabled":   true,
+	})
+	if test.Code != http.StatusOK {
+		t.Fatalf("test non-stdio status = %d body=%s", test.Code, test.Body.String())
+	}
+	tested := decodeResponse(t, test)
+	if tested["ok"] != false || !strings.Contains(stringOr(tested["error"], ""), "only stdio MCP transport") {
+		t.Fatalf("non-stdio test should return explicit degradation without saving, got %#v", tested)
+	}
+	if len(store.MCPServers()) != 1 {
+		t.Fatalf("test connection must not persist non-stdio server, settings=%#v", store.MCPServers())
+	}
+
+	serverID, _ := created["id"].(string)
+	w := serveMCP(handler, http.MethodPost, "/servers/"+serverID+"/connect", nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("connect non-stdio status = %d body=%s", w.Code, w.Body.String())
 	}

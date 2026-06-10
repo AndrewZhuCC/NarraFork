@@ -24,11 +24,26 @@ import (
 	"narrafork-go/internal/jsondb"
 )
 
+type CloneStreamerFunc func(
+	ctx context.Context,
+	cloneURL, gitPath, branch string,
+	credentials *gitx.CloneCredentials,
+	progress func(string),
+) error
+
 type Service struct {
-	DB       *sql.DB
-	Git      *gitx.Service
-	Chapters *chapters.Service
-	Settings *config.Store
+	DB                           *sql.DB
+	Git                          *gitx.Service
+	Chapters                     *chapters.Service
+	Settings                     *config.Store
+	BroadcastUser                func(userID string, payload any)
+	ProxyCacheRefresher          func(ctx context.Context) error
+	CloneStreamer                CloneStreamerFunc
+	CloneFailureDirectoryRemover func(path string) error
+	GitignoreCommitter           func(ctx context.Context, gitPath string) error
+	ContainerRemover             func(ctx context.Context, containerIDs []string) error
+	WorktreeRemover              func(ctx context.Context, repoPath, worktreePath string) error
+	WorktreePruner               func(ctx context.Context, repoPath string) error
 }
 
 type DeleteCleanupError struct {
@@ -83,6 +98,90 @@ func NewService(sqlDB *sql.DB, git *gitx.Service, chapterService *chapters.Servi
 	return &Service{DB: sqlDB, Git: git, Chapters: chapterService, Settings: settings}
 }
 
+func (s *Service) SetUserBroadcaster(broadcast func(userID string, payload any)) {
+	s.BroadcastUser = broadcast
+}
+
+func (s *Service) SetProxyCacheRefresher(refresh func(ctx context.Context) error) {
+	s.ProxyCacheRefresher = refresh
+}
+
+func (s *Service) cloneStreamingWithCredentials(ctx context.Context, cloneURL, gitPath, branch string, credentials *gitx.CloneCredentials, progress func(string)) error {
+	if s.CloneStreamer != nil {
+		return s.CloneStreamer(ctx, cloneURL, gitPath, branch, credentials, progress)
+	}
+	if s.Git == nil {
+		return errors.New("git service unavailable")
+	}
+	return s.Git.CloneStreamingWithCredentials(ctx, cloneURL, gitPath, branch, credentials, progress)
+}
+
+func (s *Service) removeCloneFailureDirectory(path string) error {
+	if s.CloneFailureDirectoryRemover != nil {
+		return s.CloneFailureDirectoryRemover(path)
+	}
+	return os.RemoveAll(path)
+}
+
+func (s *Service) currentBranch(ctx context.Context, gitPath string) (string, error) {
+	if s.Git == nil {
+		return "", errors.New("git service unavailable")
+	}
+	return s.Git.CurrentBranch(ctx, gitPath)
+}
+
+func (s *Service) initializeProjectBackup(ctx context.Context, projectID, gitPath string) error {
+	var syncErr error
+	if _, err := s.SyncBackup(ctx, projectID); err != nil {
+		syncErr = err
+	}
+	if err := s.commitGitignoreIfDirty(ctx, gitPath); err != nil {
+		if syncErr != nil {
+			return fmt.Errorf("sync project backup: %w; update .gitignore: %v", syncErr, err)
+		}
+		return err
+	}
+	return syncErr
+}
+
+func (s *Service) commitGitignoreIfDirty(ctx context.Context, gitPath string) error {
+	if err := ensureGitignoreEntries(gitPath); err != nil {
+		return err
+	}
+	if s.GitignoreCommitter != nil {
+		return s.GitignoreCommitter(ctx, gitPath)
+	}
+	if s.Git == nil {
+		return errors.New("git service unavailable")
+	}
+	return s.Git.CommitGitignoreIfDirty(ctx, gitPath)
+}
+
+func ensureGitignoreEntries(gitPath string) error {
+	entries := []string{".narrafork/", ".worktrees/"}
+	gitignorePath := filepath.Join(gitPath, ".gitignore")
+	content := ""
+	if existing, err := os.ReadFile(gitignorePath); err == nil {
+		content = string(existing)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	missing := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.Contains(content, entry) {
+			missing = append(missing, entry)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	prefix := strings.TrimRight(content, "\r\n")
+	if prefix != "" {
+		prefix += "\n"
+	}
+	return os.WriteFile(gitignorePath, []byte(prefix+strings.Join(missing, "\n")+"\n"), 0o644)
+}
+
 func (s *Service) List(ctx context.Context, status string) ([]Project, error) {
 	query := `SELECT ` + projectSelectColumns + ` FROM projects`
 	args := []any{}
@@ -131,7 +230,10 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Project, error
 		if strings.TrimSpace(input.CloneUsername) != "" || input.ClonePassword != "" {
 			credentials = &gitx.CloneCredentials{Username: input.CloneUsername, Password: input.ClonePassword}
 		}
-		if err := s.Git.CloneStreamingWithCredentials(ctx, input.CloneURL, gitPath, input.CloneBranch, credentials, input.Progress); err != nil {
+		if err := s.cloneStreamingWithCredentials(ctx, input.CloneURL, gitPath, input.CloneBranch, credentials, input.Progress); err != nil {
+			if isGitCredentialError(err) {
+				_ = s.removeCloneFailureDirectory(gitPath)
+			}
 			return Project{}, err
 		}
 		remoteURL = gitx.RemoteURLWithoutCredentials(input.CloneURL)
@@ -146,7 +248,7 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Project, error
 	} else {
 		return Project{}, httpx.BadRequest("repoMode must be existing, init, or clone")
 	}
-	defaultBranch, err := s.Git.CurrentBranch(ctx, gitPath)
+	defaultBranch, err := s.currentBranch(ctx, gitPath)
 	if err != nil || defaultBranch == "" {
 		defaultBranch = "main"
 	}
@@ -160,9 +262,15 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Project, error
 	if err != nil {
 		return Project{}, err
 	}
-	core := s.Settings.Core()
 	if s.Chapters != nil {
+		core := config.Core{}
+		if s.Settings != nil {
+			core = s.Settings.Core()
+		}
 		_, _ = s.Chapters.CreateRootChapter(ctx, chapters.RootInput{ProjectID: projectID, Title: input.Name, GitPath: gitPath, DefaultBranch: defaultBranch, AutoNarrator: true, NarratorModel: core.Agent.DefaultModel, PermissionMode: core.Agent.DefaultPermissionMode})
+	}
+	if err := s.initializeProjectBackup(ctx, projectID, gitPath); err != nil {
+		log.Printf("projects: failed to initialize project backup DB for %s: %v", projectID, err)
 	}
 	return s.Get(ctx, projectID)
 }
@@ -290,13 +398,13 @@ func validateProjectChapterSettings(value any) (map[string]any, error) {
 		return nil, httpx.ValidationError("chapterSettings must be an object")
 	}
 	allowed := map[string]bool{
-		"autoCreateNarrator":        true,
-		"commands":                  true,
-		"routines":                  true,
-		"whitelistDirs":             true,
-		"blacklistDirs":             true,
-		"commandWhitelist":          true,
-		"commandBlacklist":          true,
+		"autoCreateNarrator":       true,
+		"commands":                 true,
+		"routines":                 true,
+		"whitelistDirs":            true,
+		"blacklistDirs":            true,
+		"commandWhitelist":         true,
+		"commandBlacklist":         true,
 		"requireReviewBeforeMerge": true,
 	}
 	filtered := map[string]any{}
@@ -344,11 +452,11 @@ func (s *Service) Delete(ctx context.Context, projectID string) (DeleteResult, e
 		}
 	}
 	if len(containerIDs) > 0 {
-		if err := removeProjectContainers(ctx, containerIDs); err != nil {
+		if err := s.removeContainers(ctx, containerIDs); err != nil {
 			result.addCleanupError("containers", strings.Join(containerIDs, ","), err)
 		}
 	}
-	if project.GitPath != nil && *project.GitPath != "" && s.Git != nil {
+	if project.GitPath != nil && *project.GitPath != "" && s.canCleanWorktrees() {
 		for _, ch := range chaptersForDelete {
 			if ch.IsRoot || !ch.WorktreePath.Valid || ch.WorktreePath.String == "" {
 				continue
@@ -357,17 +465,24 @@ func (s *Service) Delete(ctx context.Context, projectID string) (DeleteResult, e
 				result.addCleanupError("worktree", ch.ID, fmt.Errorf("unsafe worktree path: %s", ch.WorktreePath.String))
 				continue
 			}
-			if err := s.Git.RemoveWorktree(ctx, *project.GitPath, ch.WorktreePath.String); err != nil {
+			if err := s.removeWorktree(ctx, *project.GitPath, ch.WorktreePath.String); err != nil {
 				result.addCleanupError("worktree", ch.ID, err)
 			}
 		}
-		if err := s.Git.PruneWorktrees(ctx, *project.GitPath); err != nil {
+		if err := s.pruneWorktrees(ctx, *project.GitPath); err != nil {
 			result.addCleanupError("worktree-prune", projectID, err)
 		}
 	}
 
-	if err := s.deleteProjectRows(ctx, projectID, chapterIDs, narratorIDs); err != nil {
+	recentTabUpdates, err := s.deleteProjectRows(ctx, projectID, chapterIDs, narratorIDs)
+	if err != nil {
 		return result, err
+	}
+	s.broadcastRecentTabsSnapshots(recentTabUpdates)
+	if project.ProxyDomain != nil && strings.TrimSpace(*project.ProxyDomain) != "" && s.ProxyCacheRefresher != nil {
+		if err := s.ProxyCacheRefresher(ctx); err != nil {
+			result.addCleanupError("proxy-cache", projectID, err)
+		}
 	}
 	for _, cleanupErr := range result.CleanupErrors {
 		log.Printf("project delete cleanup warning: project=%s scope=%s id=%s error=%s", projectID, cleanupErr.Scope, cleanupErr.ID, cleanupErr.Error)
@@ -391,6 +506,37 @@ func (s *Service) terminalKiller() terminalKiller {
 		return nil
 	}
 	return s.Chapters.TerminalRuntime
+}
+
+func (s *Service) removeContainers(ctx context.Context, containerIDs []string) error {
+	if s.ContainerRemover != nil {
+		return s.ContainerRemover(ctx, containerIDs)
+	}
+	return removeProjectContainers(ctx, containerIDs)
+}
+
+func (s *Service) canCleanWorktrees() bool {
+	return s.Git != nil || s.WorktreeRemover != nil || s.WorktreePruner != nil
+}
+
+func (s *Service) removeWorktree(ctx context.Context, repoPath, worktreePath string) error {
+	if s.WorktreeRemover != nil {
+		return s.WorktreeRemover(ctx, repoPath, worktreePath)
+	}
+	if s.Git == nil {
+		return nil
+	}
+	return s.Git.RemoveWorktree(ctx, repoPath, worktreePath)
+}
+
+func (s *Service) pruneWorktrees(ctx context.Context, repoPath string) error {
+	if s.WorktreePruner != nil {
+		return s.WorktreePruner(ctx, repoPath)
+	}
+	if s.Git == nil {
+		return nil
+	}
+	return s.Git.PruneWorktrees(ctx, repoPath)
 }
 
 func (s *Service) projectDeleteChapters(ctx context.Context, projectID string) ([]projectDeleteChapter, error) {
@@ -461,10 +607,10 @@ func (s *Service) projectContainerIDs(ctx context.Context, chapterIDs []string) 
 	return scanStrings(rows)
 }
 
-func (s *Service) deleteProjectRows(ctx context.Context, projectID string, chapterIDs, narratorIDs []string) error {
+func (s *Service) deleteProjectRows(ctx context.Context, projectID string, chapterIDs, narratorIDs []string) ([]recentTabsCleanupUpdate, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	committed := false
 	defer func() {
@@ -473,48 +619,48 @@ func (s *Service) deleteProjectRows(ctx context.Context, projectID string, chapt
 		}
 	}()
 
-	deletedWorkspaceIDs, err := cleanupProjectJSONReferences(ctx, tx, projectID, chapterIDs, narratorIDs)
+	deletedWorkspaceIDs, recentTabUpdates, err := cleanupProjectJSONReferences(ctx, tx, projectID, chapterIDs, narratorIDs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(narratorIDs) > 0 {
 		if err := s.deleteNarratorRows(ctx, tx, narratorIDs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if len(chapterIDs) > 0 {
 		if err := s.deleteChapterRows(ctx, tx, projectID, chapterIDs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if len(deletedWorkspaceIDs) > 0 {
 		if err := deleteByIDs(ctx, tx, "workspaces", "id", deletedWorkspaceIDs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM exploration_groups WHERE project_id = ?`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM hooks WHERE project_id = ?`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM gateway_session_mappings WHERE project_id = ?`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM volume_snapshot_applications WHERE snapshot_id IN (SELECT id FROM volume_snapshots WHERE project_id = ?)`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM volume_snapshots WHERE project_id = ?`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, projectID); err != nil {
-		return err
+		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return nil, err
 	}
 	committed = true
-	return nil
+	return recentTabUpdates, nil
 }
 
 func (s *Service) deleteNarratorRows(ctx context.Context, tx *sql.Tx, narratorIDs []string) error {
@@ -596,15 +742,16 @@ func deleteMergeSessionsBySources(ctx context.Context, tx *sql.Tx, chapterIDs []
 	return err
 }
 
-func cleanupProjectJSONReferences(ctx context.Context, tx *sql.Tx, projectID string, chapterIDs, narratorIDs []string) ([]string, error) {
+func cleanupProjectJSONReferences(ctx context.Context, tx *sql.Tx, projectID string, chapterIDs, narratorIDs []string) ([]string, []recentTabsCleanupUpdate, error) {
 	deletedWorkspaceIDs, err := referencedWorkspaceIDs(ctx, tx, projectID, chapterIDs, narratorIDs)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := cleanupRecentTabs(ctx, tx, projectID, chapterIDs, narratorIDs, deletedWorkspaceIDs); err != nil {
-		return nil, err
+	recentTabUpdates, err := cleanupRecentTabs(ctx, tx, projectID, chapterIDs, narratorIDs, deletedWorkspaceIDs)
+	if err != nil {
+		return nil, nil, err
 	}
-	return deletedWorkspaceIDs, nil
+	return deletedWorkspaceIDs, recentTabUpdates, nil
 }
 
 func referencedWorkspaceIDs(ctx context.Context, tx *sql.Tx, projectID string, chapterIDs, narratorIDs []string) ([]string, error) {
@@ -628,22 +775,27 @@ func referencedWorkspaceIDs(ctx context.Context, tx *sql.Tx, projectID string, c
 	return deleted, rows.Err()
 }
 
-func cleanupRecentTabs(ctx context.Context, tx *sql.Tx, projectID string, chapterIDs, narratorIDs, workspaceIDs []string) error {
+type recentTabsCleanupUpdate struct {
+	userID string
+	tabs   string
+	items  []map[string]any
+}
+
+func cleanupRecentTabs(ctx context.Context, tx *sql.Tx, projectID string, chapterIDs, narratorIDs, workspaceIDs []string) ([]recentTabsCleanupUpdate, error) {
 	projectIDs := stringSet([]string{projectID})
 	chapterSet := stringSet(chapterIDs)
 	narratorSet := stringSet(narratorIDs)
 	workspaceSet := stringSet(workspaceIDs)
 	rows, err := tx.QueryContext(ctx, `SELECT user_id, recent_tabs FROM user_preferences`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
-	type update struct{ userID, tabs string }
-	updates := []update{}
+	updates := []recentTabsCleanupUpdate{}
 	for rows.Next() {
 		var userID, rawTabs string
 		if err := rows.Scan(&userID, &rawTabs); err != nil {
-			return err
+			return nil, err
 		}
 		var tabs []map[string]any
 		if json.Unmarshal([]byte(rawTabs), &tabs) != nil {
@@ -660,18 +812,32 @@ func cleanupRecentTabs(ctx context.Context, tx *sql.Tx, projectID string, chapte
 		}
 		if changed {
 			data, _ := json.Marshal(filtered)
-			updates = append(updates, update{userID: userID, tabs: string(data)})
+			updates = append(updates, recentTabsCleanupUpdate{userID: userID, tabs: string(data), items: filtered})
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, item := range updates {
 		if _, err := tx.ExecContext(ctx, `UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, item.tabs, db.NowISO(), item.userID); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return updates, nil
+}
+
+func (s *Service) broadcastRecentTabsSnapshots(updates []recentTabsCleanupUpdate) {
+	if s.BroadcastUser == nil {
+		return
+	}
+	revision := time.Now().UnixMilli()
+	for _, update := range updates {
+		s.BroadcastUser(update.userID, map[string]any{
+			"type":     "user:recent_tabs_snapshot",
+			"tabs":     update.items,
+			"revision": revision,
+		})
+	}
 }
 
 func recentTabReferences(tab map[string]any, projectIDs, chapterIDs, narratorIDs, workspaceIDs map[string]bool) bool {

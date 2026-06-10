@@ -49,8 +49,33 @@ func TestPublicShareRegistrationExposesOnlyDownloadAndPreview(t *testing.T) {
 	}
 }
 
-func TestStorageCleanupUnsupportedTargetsDoNotFakeSuccess(t *testing.T) {
-	h := NewHandler(nil)
+func TestStorageCleanupUnsupportedTargetsDoNotFakeSuccessOrMutate(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	worktreeFile := filepath.Join(home, "repo", ".worktrees", "branch", "worktree.txt")
+	if err := os.MkdirAll(filepath.Dir(worktreeFile), 0o755); err != nil {
+		t.Fatalf("create worktree fixture: %v", err)
+	}
+	if err := os.WriteFile(worktreeFile, []byte("preserve"), 0o644); err != nil {
+		t.Fatalf("write worktree fixture: %v", err)
+	}
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	for _, stmt := range []string{
+		`CREATE TABLE container_instances (id TEXT PRIMARY KEY, chapter_id TEXT, status TEXT)`,
+		`CREATE TABLE port_allocations (port INTEGER PRIMARY KEY, chapter_id TEXT, service_name TEXT)`,
+		`INSERT INTO container_instances (id, chapter_id, status) VALUES ('ci-1', 'chapter-1', 'running')`,
+		`INSERT INTO port_allocations (port, chapter_id, service_name) VALUES (10001, 'chapter-1', 'web')`,
+	} {
+		if _, err := database.Exec(stmt); err != nil {
+			t.Fatalf("prepare cleanup fixture: %v", err)
+		}
+	}
+
+	h := NewHandler(database)
 	for _, tc := range []struct {
 		target  string
 		code    string
@@ -79,6 +104,11 @@ func TestStorageCleanupUnsupportedTargetsDoNotFakeSuccess(t *testing.T) {
 		if reason == "" || body["error"] != reason || body["message"] != reason {
 			t.Fatalf("cleanup %s fallback should expose reason/error/message, got %#v", tc.target, body)
 		}
+		if _, err := os.Stat(worktreeFile); err != nil {
+			t.Fatalf("cleanup %s should not remove storage worktree fixture: %v", tc.target, err)
+		}
+		assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM container_instances`, 1)
+		assertCleanupRowCount(t, database, `SELECT COUNT(*) FROM port_allocations`, 1)
 	}
 }
 

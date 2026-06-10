@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"narrafork-go/internal/agentbasic"
@@ -31,14 +32,22 @@ type TerminalKiller interface {
 }
 
 type Service struct {
-	DB                     *sql.DB
-	Git                    *gitx.Service
-	Narrators              *narrators.Service
-	TerminalRuntime        TerminalKiller
-	Settings               *config.Store
-	BroadcastMergeProgress func(payload any)
-	MergeDecisionTimeout   time.Duration
-	MergeDecisionInterval  time.Duration
+	DB                        *sql.DB
+	Git                       *gitx.Service
+	Narrators                 *narrators.Service
+	TerminalRuntime           TerminalKiller
+	Settings                  *config.Store
+	BroadcastMergeProgress    func(payload any)
+	BroadcastChapterLifecycle func(payload any)
+	BroadcastUser             func(userID string, payload any)
+	CancelNarratorRun         func(narratorID string) bool
+	MergeDecisionTimeout      time.Duration
+	MergeDecisionInterval     time.Duration
+	RootCommitMetadataReader  func(ctx context.Context, gitPath string) (head string, count int)
+	RootCommitLogReader       func(ctx context.Context, gitPath, branch string, limit int) ([]gitx.Commit, error)
+	AutoDormantDelay          time.Duration
+	autoDormantMu             sync.Mutex
+	autoDormantTimers         map[string]*time.Timer
 	// BrowserToolAutoEnableEnabled keeps the container-ready browser tool injection
 	// disabled unless an explicit cutover opts into auto-enabling it.
 	BrowserToolAutoEnableEnabled bool
@@ -205,6 +214,11 @@ func (s *Service) SetMergeProgressBroadcaster(broadcast func(payload any)) {
 	s.BroadcastMergeProgress = broadcast
 }
 
+func (s *Service) SetChapterLifecycleBroadcasters(chapterBroadcast func(payload any), userBroadcast func(userID string, payload any)) {
+	s.BroadcastChapterLifecycle = chapterBroadcast
+	s.BroadcastUser = userBroadcast
+}
+
 func (s *Service) CleanupStaleMergeSessions(ctx context.Context) (int64, error) {
 	if s == nil || s.DB == nil {
 		return 0, nil
@@ -223,8 +237,7 @@ func (s *Service) CleanupStaleMergeSessions(ctx context.Context) (int64, error) 
 func (s *Service) CreateRootChapter(ctx context.Context, input RootInput) (Chapter, error) {
 	now := db.NowISO()
 	chapterID := id.New()
-	head, _ := s.Git.HeadCommit(ctx, input.GitPath)
-	count, _ := s.Git.CommitCount(ctx, input.GitPath)
+	head, count := s.rootChapterInitialCommitMetadata(ctx, input.GitPath)
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO chapters (id, project_id, title, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, commit_count, last_accessed_at, created_at, updated_at)
 		VALUES (?, ?, ?, 'active', 'trunk', ?, ?, ?, 1, ?, ?, ?, ?, ?)`, chapterID, input.ProjectID, input.Title, input.DefaultBranch, input.GitPath, input.DefaultBranch, nullableString(head), count, now, now, now)
 	if err != nil {
@@ -233,7 +246,93 @@ func (s *Service) CreateRootChapter(ctx context.Context, input RootInput) (Chapt
 	if input.AutoNarrator && s.Narrators != nil {
 		_, _ = s.Narrators.Create(ctx, narrators.CreateInput{ChapterID: &chapterID, Title: &input.Title, Model: input.NarratorModel, PermissionMode: input.PermissionMode, Cwd: &input.GitPath})
 	}
+	if s.BroadcastChapterLifecycle != nil {
+		s.BroadcastChapterLifecycle(map[string]any{
+			"type":      "chapter:created",
+			"chapterId": chapterID,
+			"projectId": input.ProjectID,
+		})
+	}
+	if _, err := s.syncRootChapterCommits(ctx, chapterID, input.GitPath, input.DefaultBranch); err != nil {
+		slog.Warn("Failed to sync commits for root chapter (non-fatal)", "chapterId", chapterID, "error", err)
+	}
 	return s.Get(ctx, chapterID)
+}
+
+func (s *Service) rootChapterInitialCommitMetadata(ctx context.Context, gitPath string) (string, int) {
+	if s.RootCommitMetadataReader != nil {
+		return s.RootCommitMetadataReader(ctx, gitPath)
+	}
+	if s.Git == nil {
+		return "", 0
+	}
+	head, _ := s.Git.HeadCommit(ctx, gitPath)
+	count, _ := s.Git.CommitCount(ctx, gitPath)
+	return head, count
+}
+
+const (
+	rootChapterCommitSyncLimit   = 200
+	chapterCreateCommitSyncLimit = 500
+)
+
+func (s *Service) rootCommitLog(ctx context.Context, gitPath, branch string, limit int) ([]gitx.Commit, error) {
+	if s.RootCommitLogReader != nil {
+		return s.RootCommitLogReader(ctx, gitPath, branch, limit)
+	}
+	if s.Git == nil {
+		return nil, nil
+	}
+	return s.Git.LogRef(ctx, gitPath, branch, limit)
+}
+
+func (s *Service) syncRootChapterCommits(ctx context.Context, chapterID, gitPath, branch string) (int, error) {
+	commits, err := s.rootCommitLog(ctx, gitPath, branch, rootChapterCommitSyncLimit)
+	if err != nil || len(commits) == 0 {
+		return 0, err
+	}
+	existingRows, err := s.DB.QueryContext(ctx, `SELECT sha FROM chapter_commits WHERE chapter_id = ?`, chapterID)
+	if err != nil {
+		return 0, err
+	}
+	defer existingRows.Close()
+	existing := map[string]bool{}
+	for existingRows.Next() {
+		var sha string
+		if err := existingRows.Scan(&sha); err != nil {
+			return 0, err
+		}
+		existing[sha] = true
+	}
+	if err := existingRows.Err(); err != nil {
+		return 0, err
+	}
+
+	now := db.NowISO()
+	inserted := 0
+	for _, commit := range commits {
+		sha := strings.TrimSpace(commit.SHA)
+		if sha == "" || existing[sha] {
+			continue
+		}
+		message := firstNonEmptyString(commit.Message, sha)
+		authoredAt := firstNonEmptyString(commit.AuthoredAt, commit.Date, now)
+		if _, err := s.DB.ExecContext(ctx, `INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?)`, id.New(), chapterID, sha, message, nullableString(commit.FullMessage), nullableString(commit.AuthorName), nullableString(commit.AuthorEmail), authoredAt, now); err != nil {
+			return inserted, err
+		}
+		existing[sha] = true
+		inserted++
+	}
+
+	totalCount := 0
+	if err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = ?`, chapterID).Scan(&totalCount); err != nil {
+		return inserted, err
+	}
+	headSHA := strings.TrimSpace(commits[0].SHA)
+	if _, err := s.DB.ExecContext(ctx, `UPDATE chapters SET head_commit_sha = ?, commit_count = ?, updated_at = ? WHERE id = ?`, nullableString(headSHA), totalCount, now, chapterID); err != nil {
+		return inserted, err
+	}
+	return inserted, nil
 }
 
 func (s *Service) Create(ctx context.Context, input CreateInput) (Chapter, error) {
@@ -280,16 +379,27 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Chapter, error
 	head, _ := s.Git.HeadCommit(ctx, worktreePath)
 	count, _ := s.Git.CommitCount(ctx, worktreePath)
 	chapterID := id.New()
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, head_commit_sha, commit_count, last_accessed_at, created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'active', 'branch', ?, ?, ?, ?, ?, ?, ?, ?)`, chapterID, input.ProjectID, input.Title, nullablePtr(input.Description), branchName, worktreePath, baseBranch, nullableString(head), count, now, now, now)
+	_, err = s.DB.ExecContext(ctx, `INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, commit_count, last_accessed_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'active', 'branch', ?, ?, ?, 0, ?, ?, ?, ?, ?)`, chapterID, input.ProjectID, input.Title, nullablePtr(input.Description), branchName, worktreePath, baseBranch, nullableString(head), count, now, now, now)
 	if err != nil {
 		_ = s.Git.RemoveWorktree(ctx, gitPath, worktreePath)
 		_ = s.Git.DeleteBranch(ctx, gitPath, branchName)
 		return Chapter{}, err
 	}
-	if s.Narrators != nil {
-		core := s.Settings.Core()
-		_, _ = s.Narrators.Create(ctx, narrators.CreateInput{ChapterID: &chapterID, Title: &input.Title, Model: core.Agent.DefaultModel, PermissionMode: core.Agent.DefaultPermissionMode, Cwd: &worktreePath})
+	if s.Narrators != nil && projectAutoCreateNarrator(project.ChapterSettings) {
+		model, permission := s.defaultNarratorSettings()
+		_, _ = s.Narrators.Create(ctx, narrators.CreateInput{ChapterID: &chapterID, Title: &input.Title, Model: model, PermissionMode: permission})
+	}
+	if s.BroadcastChapterLifecycle != nil {
+		s.BroadcastChapterLifecycle(map[string]any{
+			"type":      "chapter:created",
+			"chapterId": chapterID,
+			"projectId": input.ProjectID,
+		})
+	}
+	s.scheduleAutoDormant(input.ProjectID)
+	if _, err := s.syncChapterCommits(ctx, chapterID, chapterCreateCommitSyncLimit); err != nil {
+		slog.Warn("chapters: failed to sync commits for new chapter", "chapterId", chapterID, "error", err)
 	}
 	return s.Get(ctx, chapterID)
 }
@@ -922,7 +1032,27 @@ func (s *Service) CreateReview(ctx context.Context, sourceID string, input Revie
 			return fail(err)
 		}
 	}
-	return s.Get(ctx, chapterID)
+	if _, err := s.syncChapterCommits(ctx, chapterID, chapterCreateCommitSyncLimit); err != nil {
+		slog.Warn("chapters: failed to sync commits for review chapter", "chapterId", chapterID, "error", err)
+	}
+	review, err := s.Get(ctx, chapterID)
+	if err != nil {
+		return Chapter{}, err
+	}
+	s.broadcastReviewCreated(review.ID, sourceID, review.ProjectID)
+	return review, nil
+}
+
+func (s *Service) broadcastReviewCreated(reviewChapterID, sourceChapterID, projectID string) {
+	if s == nil || s.BroadcastChapterLifecycle == nil {
+		return
+	}
+	s.BroadcastChapterLifecycle(map[string]any{
+		"type":            "review:created",
+		"reviewChapterId": reviewChapterID,
+		"sourceChapterId": sourceChapterID,
+		"projectId":       projectID,
+	})
 }
 
 type reviewCreateCleanup struct {
@@ -1073,12 +1203,142 @@ func reviewRollbackDeleteChapterEdges(ctx context.Context, tx *sql.Tx, chapterID
 	return err
 }
 
-func (s *Service) reviewDefaultNarratorSettings() (string, string) {
+func (s *Service) defaultNarratorSettings() (string, string) {
 	if s != nil && s.Settings != nil {
 		core := s.Settings.Core()
 		return firstNonEmptyString(core.Agent.DefaultModel, config.DefaultAgentModel), firstNonEmptyString(core.Agent.DefaultPermissionMode, "default")
 	}
 	return config.DefaultAgentModel, "default"
+}
+
+func (s *Service) reviewDefaultNarratorSettings() (string, string) {
+	return s.defaultNarratorSettings()
+}
+
+func projectAutoCreateNarrator(raw sql.NullString) bool {
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return true
+	}
+	settings := map[string]any{}
+	if err := json.Unmarshal([]byte(raw.String), &settings); err != nil {
+		return true
+	}
+	value, ok := settings["autoCreateNarrator"]
+	if !ok {
+		return true
+	}
+	enabled, ok := value.(bool)
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
+const defaultAutoDormantDelay = 30 * time.Second
+
+func (s *Service) scheduleAutoDormant(projectID string) {
+	if s == nil || s.Settings == nil || strings.TrimSpace(projectID) == "" {
+		return
+	}
+	s.autoDormantMu.Lock()
+	defer s.autoDormantMu.Unlock()
+	if s.autoDormantTimers == nil {
+		s.autoDormantTimers = map[string]*time.Timer{}
+	}
+	if existing := s.autoDormantTimers[projectID]; existing != nil {
+		existing.Stop()
+	}
+	if s.maxActiveWorktrees() <= 0 {
+		delete(s.autoDormantTimers, projectID)
+		return
+	}
+	delay := s.AutoDormantDelay
+	if delay <= 0 {
+		delay = defaultAutoDormantDelay
+	}
+	s.autoDormantTimers[projectID] = time.AfterFunc(delay, func() {
+		s.autoDormantMu.Lock()
+		delete(s.autoDormantTimers, projectID)
+		s.autoDormantMu.Unlock()
+		if _, err := s.DormantInactiveChapters(context.Background(), projectID); err != nil {
+			slog.Warn("chapters: scheduled auto-dormant failed", "projectId", projectID, "error", err)
+		}
+	})
+}
+
+func (s *Service) ClearAutoDormantTimers() {
+	if s == nil {
+		return
+	}
+	s.autoDormantMu.Lock()
+	defer s.autoDormantMu.Unlock()
+	for _, timer := range s.autoDormantTimers {
+		timer.Stop()
+	}
+	s.autoDormantTimers = map[string]*time.Timer{}
+}
+
+func (s *Service) DormantInactiveChapters(ctx context.Context, projectID string) ([]string, error) {
+	if s == nil || s.DB == nil || strings.TrimSpace(projectID) == "" {
+		return nil, nil
+	}
+	maxActive := s.maxActiveWorktrees()
+	if maxActive <= 0 {
+		return nil, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT id FROM chapters WHERE project_id = ? AND status = 'active' AND worktree_path IS NOT NULL AND COALESCE(is_root, 0) = 0 ORDER BY last_accessed_at ASC`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	activeIDs := []string{}
+	for rows.Next() {
+		var chapterID string
+		if err := rows.Scan(&chapterID); err != nil {
+			return nil, err
+		}
+		activeIDs = append(activeIDs, chapterID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(activeIDs) <= maxActive {
+		return []string{}, nil
+	}
+	dormanted := []string{}
+	for _, chapterID := range activeIDs[:len(activeIDs)-maxActive] {
+		if err := s.Dormant(ctx, chapterID); err != nil {
+			slog.Warn("chapters: failed to auto-dormant chapter", "chapterId", chapterID, "error", err)
+			continue
+		}
+		dormanted = append(dormanted, chapterID)
+	}
+	return dormanted, nil
+}
+
+func (s *Service) maxActiveWorktrees() int {
+	if s == nil || s.Settings == nil {
+		return 10
+	}
+	raw := s.Settings.Raw()
+	chaptersRaw, _ := raw["chapters"].(map[string]any)
+	return settingsInt(chaptersRaw["maxActiveWorktrees"], 10)
+}
+
+func settingsInt(value any, fallback int) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		if n, err := typed.Int64(); err == nil {
+			return int(n)
+		}
+	}
+	return fallback
 }
 
 func (s *Service) initializeReviewNarrator(ctx context.Context, narratorID, gitPath string, source Chapter, sourceHead string, input ReviewInput) error {
@@ -1087,10 +1347,8 @@ func (s *Service) initializeReviewNarrator(ctx context.Context, narratorID, gitP
 	if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET system_prompt = ?, updated_at = ? WHERE id = ?`, prompt, db.NowISO(), narratorID); err != nil {
 		return fmt.Errorf("initialize review narrator system prompt: %w", err)
 	}
-	if input.UserID != "" {
-		if _, err := s.Narrators.SeedUserMessage(ctx, narratorID, input.UserID, reviewStartMessage(input.Locale)); err != nil {
-			return fmt.Errorf("initialize review narrator start message: %w", err)
-		}
+	if _, err := s.Narrators.SeedUserMessage(ctx, narratorID, input.UserID, reviewStartMessage(input.Locale)); err != nil {
+		return fmt.Errorf("initialize review narrator start message: %w", err)
 	}
 	return nil
 }
@@ -1468,10 +1726,30 @@ func (s *Service) Delete(ctx context.Context, chapterID string) error {
 	if ch.IsRoot {
 		return httpx.BadRequest("Cannot delete root chapter")
 	}
-	if err := s.cleanupChapterResources(ctx, ch, true); err != nil {
+	narratorIDs, err := chapterNarratorIDs(ctx, s.DB, chapterID)
+	if err != nil {
+		return fmt.Errorf("load chapter narrators: %w", err)
+	}
+	s.interruptChapterNarrators(narratorIDs)
+	if err := s.archiveChapterNarratorsForDelete(ctx, chapterID, db.NowISO()); err != nil {
 		return err
 	}
-	now := db.NowISO()
+	if err := s.cleanupChapterResourcesForDelete(ctx, ch, true); err != nil {
+		return err
+	}
+	if err := s.deleteChapterRowAndReferences(ctx, chapterID); err != nil {
+		return err
+	}
+	recentTabUpdates, err := s.cleanupChapterRecentTabsBestEffort(ctx, chapterID)
+	if err != nil {
+		slog.Warn("Failed to clean up recent tabs after chapter delete", "chapterId", chapterID, "error", err)
+		recentTabUpdates = nil
+	}
+	s.broadcastChapterDeleted(ch.ProjectID, chapterID, recentTabUpdates)
+	return nil
+}
+
+func (s *Service) archiveChapterNarratorsForDelete(ctx context.Context, chapterID, now string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1480,19 +1758,82 @@ func (s *Service) Delete(ctx context.Context, chapterID string) error {
 	if err := archiveChapterNarrators(ctx, tx, chapterID, now); err != nil {
 		return fmt.Errorf("archive chapter narrators: %w", err)
 	}
+	return tx.Commit()
+}
+
+func (s *Service) deleteChapterRowAndReferences(ctx context.Context, chapterID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `UPDATE chapters SET parent_chapter_id = NULL WHERE parent_chapter_id = ?`, chapterID); err != nil {
 		return fmt.Errorf("clear child chapter parent references: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE chapters SET merged_into_chapter_id = NULL WHERE merged_into_chapter_id = ?`, chapterID); err != nil {
 		return fmt.Errorf("clear chapter merge references: %w", err)
 	}
-	if err := cleanupChapterRecentTabs(ctx, tx, chapterID); err != nil {
-		return fmt.Errorf("cleanup chapter recent tabs: %w", err)
+	if err := deleteChapterTargetMergeSessions(ctx, tx, chapterID); err != nil {
+		return fmt.Errorf("delete chapter merge sessions: %w", err)
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM chapters WHERE id = ?`, chapterID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Service) cleanupChapterRecentTabsBestEffort(ctx context.Context, chapterID string) ([]recentTabsCleanupUpdate, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	updates, err := cleanupChapterRecentTabs(ctx, tx, chapterID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updates, nil
+}
+
+func chapterNarratorIDs(ctx context.Context, sqlDB *sql.DB, chapterID string) ([]string, error) {
+	columns, err := db.TableColumnSet(ctx, sqlDB, "narrators")
+	if err != nil || len(columns) == 0 {
+		return nil, err
+	}
+	if !columns["id"] || !columns["chapter_id"] {
+		return nil, nil
+	}
+	rows, err := sqlDB.QueryContext(ctx, `SELECT id FROM narrators WHERE chapter_id = ?`, chapterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(id) != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
+}
+
+func (s *Service) interruptChapterNarrators(narratorIDs []string) {
+	for _, narratorID := range narratorIDs {
+		if s.CancelNarratorRun != nil {
+			s.CancelNarratorRun(narratorID)
+			continue
+		}
+		if s.Narrators != nil {
+			s.Narrators.CancelRun(narratorID)
+		}
+	}
 }
 
 func archiveChapterNarrators(ctx context.Context, tx *sql.Tx, chapterID, now string) error {
@@ -1517,18 +1858,35 @@ func archiveChapterNarrators(ctx context.Context, tx *sql.Tx, chapterID, now str
 	return err
 }
 
-func cleanupChapterRecentTabs(ctx context.Context, tx *sql.Tx, chapterID string) error {
-	rows, err := tx.QueryContext(ctx, `SELECT user_id, recent_tabs FROM user_preferences`)
-	if err != nil {
+func deleteChapterTargetMergeSessions(ctx context.Context, tx *sql.Tx, chapterID string) error {
+	columns, err := db.TableColumnSet(ctx, tx, "merge_sessions")
+	if err != nil || len(columns) == 0 {
 		return err
 	}
+	if !columns["target_chapter_id"] {
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM merge_sessions WHERE target_chapter_id = ?`, chapterID)
+	return err
+}
+
+type recentTabsCleanupUpdate struct {
+	userID string
+	tabs   string
+	items  []map[string]any
+}
+
+func cleanupChapterRecentTabs(ctx context.Context, tx *sql.Tx, chapterID string) ([]recentTabsCleanupUpdate, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT user_id, recent_tabs FROM user_preferences`)
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
-	type update struct{ userID, tabs string }
-	updates := []update{}
+	updates := []recentTabsCleanupUpdate{}
 	for rows.Next() {
 		var userID, rawTabs string
 		if err := rows.Scan(&userID, &rawTabs); err != nil {
-			return err
+			return nil, err
 		}
 		var tabs []map[string]any
 		if json.Unmarshal([]byte(rawTabs), &tabs) != nil {
@@ -1545,22 +1903,44 @@ func cleanupChapterRecentTabs(ctx context.Context, tx *sql.Tx, chapterID string)
 		}
 		if changed {
 			data, _ := json.Marshal(filtered)
-			updates = append(updates, update{userID: userID, tabs: string(data)})
+			updates = append(updates, recentTabsCleanupUpdate{userID: userID, tabs: string(data), items: filtered})
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	for _, item := range updates {
 		if _, err := tx.ExecContext(ctx, `UPDATE user_preferences SET recent_tabs = ?, updated_at = ? WHERE user_id = ?`, item.tabs, db.NowISO(), item.userID); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return updates, nil
 }
 
 func chapterRecentTabReferences(tab map[string]any, chapterID string) bool {
 	return (tab["type"] == "chapter" && tab["id"] == chapterID) || tab["chapterId"] == chapterID
+}
+
+func (s *Service) broadcastChapterDeleted(projectID, chapterID string, updates []recentTabsCleanupUpdate) {
+	revision := time.Now().UnixMilli()
+	if s.BroadcastChapterLifecycle != nil {
+		s.BroadcastChapterLifecycle(map[string]any{
+			"type":      "chapter:abandoned",
+			"chapterId": chapterID,
+			"projectId": projectID,
+			"revision":  revision,
+		})
+	}
+	if s.BroadcastUser == nil {
+		return
+	}
+	for _, update := range updates {
+		s.BroadcastUser(update.userID, map[string]any{
+			"type":     "user:recent_tabs_snapshot",
+			"tabs":     update.items,
+			"revision": revision,
+		})
+	}
 }
 
 func (s *Service) Dormant(ctx context.Context, chapterID string) error {
@@ -1671,6 +2051,9 @@ func (s *Service) Wake(ctx context.Context, chapterID string) error {
 			}
 		}
 		s.broadcastContainerLifecycle(map[string]any{"type": "chapter:woken", "chapterId": chapterID, "projectId": ch.ProjectID})
+		if _, err := s.syncChapterCommits(ctx, chapterID, chapterCreateCommitSyncLimit); err != nil {
+			slog.Warn("chapters: failed to sync commits after wake", "chapterId", chapterID, "error", err)
+		}
 		return nil
 	})
 }
@@ -1746,11 +2129,34 @@ func (s *Service) killAndDeleteChapterTerminals(ctx context.Context, chapterID s
 
 func (s *Service) cleanupChapterResources(ctx context.Context, ch Chapter, deleteBranch bool) error {
 	return withChapterContainerLock(ch.ID, func() error {
-		return s.cleanupChapterResourcesLocked(ctx, ch, deleteBranch)
+		return s.cleanupChapterResourcesLocked(ctx, ch, deleteBranch, false)
 	})
 }
 
-func (s *Service) cleanupChapterResourcesLocked(ctx context.Context, ch Chapter, deleteBranch bool) error {
+func (s *Service) cleanupChapterResourcesForDelete(ctx context.Context, ch Chapter, deleteBranch bool) error {
+	return withChapterContainerLock(ch.ID, func() error {
+		chapterID := ch.ID
+		if err := s.killAndDeleteChapterTerminals(ctx, chapterID); err != nil {
+			return err
+		}
+		if err := s.removeChapterContainersLocked(ctx, ch, deleteBranch); err != nil {
+			return err
+		}
+		s.broadcastContainerLifecycle(map[string]any{"type": "container:stopped", "chapterId": chapterID})
+		project, err := s.getProject(ctx, ch.ProjectID)
+		if err == nil && project.GitPath.Valid && s.Git != nil {
+			if ch.WorktreePath != nil && safeWorktreePath(project.GitPath.String, *ch.WorktreePath) {
+				_ = s.Git.RemoveWorktree(ctx, project.GitPath.String, *ch.WorktreePath)
+			}
+			if deleteBranch && ch.Branch != "" {
+				_ = s.Git.DeleteBranch(ctx, project.GitPath.String, ch.Branch)
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Service) cleanupChapterResourcesLocked(ctx context.Context, ch Chapter, deleteBranch bool, suppressChapterAbandonedBroadcast bool) error {
 	chapterID := ch.ID
 	if err := s.killAndDeleteChapterTerminals(ctx, chapterID); err != nil {
 		return err
@@ -1769,7 +2175,7 @@ func (s *Service) cleanupChapterResourcesLocked(ctx context.Context, ch Chapter,
 		}
 	}
 	_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET status = 'abandoned', worktree_path = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), chapterID)
-	if err == nil {
+	if err == nil && !suppressChapterAbandonedBroadcast {
 		s.broadcastContainerLifecycle(map[string]any{"type": "chapter:abandoned", "chapterId": chapterID, "projectId": ch.ProjectID})
 	}
 	return err
@@ -1898,7 +2304,7 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 					response = successResponse
 					return nil
 				}
-				if resetErr := s.Git.Reset(ctx, targetWorktree, preMergeHead, "hard"); resetErr != nil {
+				if resetErr := s.Git.ResetAlreadyLocked(ctx, targetWorktree, preMergeHead, "hard"); resetErr != nil {
 					response = map[string]any{"ok": true, "success": true, "sourceChapterId": source.ID, "targetChapterId": target.ID, "mergeCommitSha": head, "output": result.Output, "warning": fmt.Sprintf("CRITICAL: Git merge succeeded but database update failed, and git rollback also failed. Manual intervention required. DB error: %v", retryErr)}
 					return nil
 				}
@@ -1926,9 +2332,10 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 			return nil, err
 		}
 		if ok, _ := result["ok"].(bool); ok {
-			return map[string]any{"resolved": true, "mergeResult": result}, nil
+			return withAIResolveCompatibilityContract(map[string]any{"resolved": true, "mergeResult": result}, "cherry-pick-merge", "", ""), nil
 		}
-		return map[string]any{"resolved": false, "error": "Go basic AI resolver cannot continue a multi-commit cherry-pick conflict yet", "mergeResult": result}, nil
+		message := "Go basic AI resolver cannot continue a multi-commit cherry-pick conflict yet"
+		return withAIResolveCompatibilityContract(map[string]any{"resolved": false, "error": message, "mergeResult": result}, "cherry-pick-conflict-fallback", "merge.aiResolveCherryPickFallback", message), nil
 	}
 	source, target, err := s.mergePair(ctx, sourceID, targetID)
 	if err != nil {
@@ -1991,7 +2398,8 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 	}
 	if narratorID == "" {
 		s.Git.AbortMerge(ctx, *target.WorktreePath)
-		return map[string]any{"resolved": false, "error": "Target chapter has no primary narrator", "remainingFiles": mergeResult.ConflictFiles}, nil
+		message := "Target chapter has no primary narrator"
+		return withAIResolveCompatibilityContract(map[string]any{"resolved": false, "error": message, "remainingFiles": mergeResult.ConflictFiles}, "one-shot-basic-fallback", "merge.aiResolveMissingNarrator", message), nil
 	}
 	if model == "" && s.Settings != nil {
 		model = s.Settings.Core().Agent.DefaultModel
@@ -2001,7 +2409,7 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 	result, err := agentbasic.Generate(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: prompt}}, *target.WorktreePath)
 	if err != nil {
 		s.Git.AbortMerge(ctx, *target.WorktreePath)
-		return map[string]any{"resolved": false, "error": err.Error(), "remainingFiles": mergeResult.ConflictFiles}, nil
+		return withAIResolveCompatibilityContract(map[string]any{"resolved": false, "error": err.Error(), "remainingFiles": mergeResult.ConflictFiles}, "one-shot-basic-fallback", "merge.aiResolveOneShotBasic", "Go AIResolve uses a bounded one-shot provider/tool loop and could not complete conflict resolution."), nil
 	}
 	remaining, err := s.Git.ConflictFiles(ctx, *target.WorktreePath)
 	if err != nil {
@@ -2014,20 +2422,49 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 		for _, file := range remaining {
 			files = append(files, file.File)
 		}
-		return map[string]any{"resolved": false, "error": "Narrator could not resolve all conflicts", "remainingFiles": files}, nil
+		message := "Narrator could not resolve all conflicts"
+		return withAIResolveCompatibilityContract(map[string]any{"resolved": false, "error": message, "remainingFiles": files}, "one-shot-basic-fallback", "merge.aiResolveOneShotBasic", message), nil
 	}
 	commitSHA, err := s.Git.AutoCommit(ctx, *target.WorktreePath, message)
 	if err != nil {
 		s.Git.AbortMerge(ctx, *target.WorktreePath)
 		return nil, err
 	}
-	successPayload := map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}, "narratorId": narratorID, "assistantMessage": result.Text}
+	successPayload := withAIResolveCompatibilityContract(map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}, "narratorId": narratorID, "assistantMessage": result.Text}, "one-shot-basic-fallback", "", "")
 	if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); err != nil {
 		if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload); rollbackResult != nil {
 			return rollbackResult, nil
 		}
 	}
+	if err := s.injectAIResolveTranscriptFallback(ctx, narratorID, source, target, strategy, commitSHA, userID, prompt, result.Text); err != nil {
+		successPayload["transcriptPersisted"] = false
+		successPayload["transcriptWarning"] = fmt.Sprintf("AI resolve transcript fallback could not be persisted: %v", err)
+	} else {
+		successPayload["transcriptPersisted"] = true
+		successPayload["transcriptMode"] = "one-shot-basic-fallback"
+	}
 	return successPayload, nil
+}
+
+func withAIResolveCompatibilityContract(payload map[string]any, mode, fallbackFeature, fallbackMessage string) map[string]any {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	if strings.TrimSpace(mode) != "" {
+		payload["mode"] = mode
+	}
+	payload["usesNarratorSession"] = false
+	payload["requiresFullNarrator"] = false
+	if strings.TrimSpace(fallbackFeature) != "" {
+		payload["fallbackCode"] = fallbackFeature
+		payload["fallbacks"] = []ForkFallback{{
+			Feature:   fallbackFeature,
+			Fallback:  true,
+			Supported: false,
+			Message:   fallbackMessage,
+		}}
+	}
+	return payload
 }
 
 func (s *Service) handleAIResolveRecordMergedFailure(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID, targetWorktree string, initialErr error, successPayload map[string]any) map[string]any {
@@ -2211,6 +2648,90 @@ func (s *Service) recordChapterCommit(ctx context.Context, chapterID, sha, fallb
 	}
 	_, err := s.DB.ExecContext(ctx, `INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, id.New(), chapterID, sha, firstNonEmptyString(message, sha), nullableString(fullMessage), nullableString(authorName), nullableString(authorEmail), authoredAt, firstNonEmptyString(source, "manual"), db.NowISO())
 	return err
+}
+
+const aiResolveTranscriptTextLimit = 12000
+
+func (s *Service) injectAIResolveTranscriptFallback(ctx context.Context, narratorID string, source, target Chapter, strategy, commitSHA, userID, prompt, assistantText string) error {
+	if strings.TrimSpace(narratorID) == "" {
+		return nil
+	}
+	now := db.NowISO()
+	boundedPrompt := boundedAIResolveTranscriptText(prompt)
+	boundedAssistant := boundedAIResolveTranscriptText(assistantText)
+	userBlocks := []map[string]any{
+		{"type": "text", "text": boundedPrompt},
+		{
+			"type":            "ai_resolve_request",
+			"mode":            "one-shot-basic-fallback",
+			"sourceChapterId": source.ID,
+			"sourceBranch":    source.Branch,
+			"targetChapterId": target.ID,
+			"targetBranch":    target.Branch,
+			"strategy":        strategy,
+		},
+	}
+	assistantBlocks := []map[string]any{
+		{"type": "text", "text": boundedAssistant},
+		{
+			"type":            "ai_resolve_result",
+			"mode":            "one-shot-basic-fallback",
+			"sourceChapterId": source.ID,
+			"sourceBranch":    source.Branch,
+			"targetChapterId": target.ID,
+			"targetBranch":    target.Branch,
+			"strategy":        strategy,
+			"commitSha":       nullableString(commitSHA),
+			"resolved":        true,
+		},
+	}
+	userJSON, err := json.Marshal(userBlocks)
+	if err != nil {
+		return err
+	}
+	assistantJSON, err := json.Marshal(assistantBlocks)
+	if err != nil {
+		return err
+	}
+	userMessageID := id.New()
+	assistantMessageID := id.New()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var seq sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM narrator_message_refs WHERE narrator_id = ?`, narratorID).Scan(&seq); err != nil {
+		return fmt.Errorf("query AI resolve transcript sequence: %w", err)
+	}
+	nextSeq := int64(1)
+	if seq.Valid {
+		nextSeq = seq.Int64 + 1
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_by, created_at) VALUES (?, ?, 'user', ?, ?, ?, ?)`, userMessageID, narratorID, string(userJSON), boundedPrompt, nullableString(userID), now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES (?, ?, ?, ?, 0)`, id.New(), narratorID, userMessageID, nextSeq); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES (?, ?, 'assistant', ?, ?, ?)`, assistantMessageID, narratorID, string(assistantJSON), boundedAssistant, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES (?, ?, ?, ?, 0)`, id.New(), narratorID, assistantMessageID, nextSeq+1); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE narrators SET message_count = (SELECT COUNT(*) FROM narrator_message_refs WHERE narrator_id = ?), message_version = message_version + 1, last_message_at = ?, updated_at = ? WHERE id = ?`, narratorID, now, now, narratorID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func boundedAIResolveTranscriptText(text string) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= aiResolveTranscriptTextLimit {
+		return text
+	}
+	return text[:aiResolveTranscriptTextLimit] + "\n... [truncated by Go AIResolve transcript fallback]"
 }
 
 func (s *Service) injectMergeSummaryFallback(ctx context.Context, source, target Chapter, strategy, commitSHA, message, userID string) error {
@@ -2854,7 +3375,7 @@ func (s *Service) Commit(ctx context.Context, chapterID, sha string) (gitx.Commi
 	return s.Git.ShowCommit(ctx, cwd, sha)
 }
 
-const chapterCommitSyncMaxLimit = 200
+const chapterCommitSyncMaxLimit = 500
 
 func normalizeChapterCommitLimit(limit int) int {
 	if limit <= 0 || limit > chapterCommitSyncMaxLimit {

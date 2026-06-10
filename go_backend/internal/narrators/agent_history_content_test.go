@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -243,21 +244,94 @@ func TestAgentHistoryEmbedsUploadedImageBlocksForProviderReplay(t *testing.T) {
 	}
 }
 
+func TestAgentHistoryReplaysSharedTSCreatedLongTranscriptWithOriginalUploadOwner(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+	if err := createNarratorTestSchema(sqlDB); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	service := &Service{DB: sqlDB}
+	ownerID := "ts_owner_history"
+	forkID := "go_fork_history"
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (id, type, inherit_mode, model, status, created_at, updated_at) VALUES (?, 'primary', 'full', 'openai:gpt-test', 'idle', ?, ?), (?, 'primary', 'full', 'openai:gpt-test', 'idle', ?, ?)`, ownerID, nowForHistoryTest(0), nowForHistoryTest(0), forkID, nowForHistoryTest(0), nowForHistoryTest(0)); err != nil {
+		t.Fatalf("insert narrators: %v", err)
+	}
+	uploadDir := filepath.Join(home, ".narrafork", "uploads", ownerID)
+	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
+		t.Fatalf("create owner upload dir: %v", err)
+	}
+	pngBytes := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	if err := os.WriteFile(filepath.Join(uploadDir, "img-shared.png"), pngBytes, 0o644); err != nil {
+		t.Fatalf("write owner image: %v", err)
+	}
+	insertSharedHistoryMessage(t, sqlDB, ownerID, forkID, 10, "ts-compact", "system", []map[string]any{{"type": "compact", "status": "compacted", "summary": "TS compact summary"}}, "[Compact] TS compact summary", true)
+	for seq := 11; seq <= 100; seq++ {
+		messageID := "ts-msg-" + strconv.Itoa(seq)
+		text := "ts message " + strconv.Itoa(seq)
+		blocks := []map[string]any{{"type": "text", "text": text}}
+		if seq == 95 {
+			text = "describe shared image"
+			blocks = []map[string]any{
+				{"type": "image", "imageId": "img-shared", "filename": "shared.png", "mediaType": "image/png"},
+				{"type": "text", "text": text},
+			}
+		}
+		insertSharedHistoryMessage(t, sqlDB, ownerID, forkID, seq, messageID, "user", blocks, text, false)
+	}
+
+	history, err := service.agentHistory(context.Background(), forkID, 20)
+	if err != nil {
+		t.Fatalf("agentHistory returned error: %v", err)
+	}
+	if len(history) != 21 {
+		t.Fatalf("expected compact summary plus last 20 long-session messages, got %d: %#v", len(history), history)
+	}
+	if history[0].Role != "user" || history[0].Content != "Prior compacted conversation summary:\nTS compact summary" {
+		t.Fatalf("compact summary mismatch: %#v", history[0])
+	}
+	if history[1].Content != "ts message 81" || history[len(history)-1].Content != "ts message 100" {
+		t.Fatalf("long transcript limit/reversal mismatch: first=%#v last=%#v", history[1], history[len(history)-1])
+	}
+	var sharedImage map[string]any
+	for _, msg := range history {
+		if msg.Content != "describe shared image" || len(msg.ContentBlocks) == 0 {
+			continue
+		}
+		sharedImage = msg.ContentBlocks[0]
+	}
+	if sharedImage == nil {
+		t.Fatalf("shared TS-created image message missing from replay: %#v", history)
+	}
+	if sharedImage["base64"] != "iVBORw0KGgo=" || sharedImage["uploadNarratorId"] != ownerID || sharedImage["mediaType"] != "image/png" {
+		t.Fatalf("shared TS-created image should resolve through original owner uploads, got %#v", sharedImage)
+	}
+}
+
 func insertHistoryMessage(t *testing.T, sqlDB *sql.DB, narratorID string, seq int, messageID string, role string, blocks []map[string]any, contentText string, compact bool) {
+	t.Helper()
+	insertSharedHistoryMessage(t, sqlDB, narratorID, narratorID, seq, messageID, role, blocks, contentText, compact)
+}
+
+func insertSharedHistoryMessage(t *testing.T, sqlDB *sql.DB, ownerNarratorID string, refNarratorID string, seq int, messageID string, role string, blocks []map[string]any, contentText string, compact bool) {
 	t.Helper()
 	data, err := json.Marshal(blocks)
 	if err != nil {
 		t.Fatalf("marshal blocks: %v", err)
 	}
 	createdAt := nowForHistoryTest(seq)
-	if _, err := sqlDB.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES (?, ?, ?, ?, ?, ?)`, messageID, narratorID, role, string(data), contentText, createdAt); err != nil {
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES (?, ?, ?, ?, ?, ?)`, messageID, ownerNarratorID, role, string(data), contentText, createdAt); err != nil {
 		t.Fatalf("insert message %s: %v", messageID, err)
 	}
 	isCompact := 0
 	if compact {
 		isCompact = 1
 	}
-	if _, err := sqlDB.Exec(`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES (?, ?, ?, ?, ?)`, "ref_"+messageID, narratorID, messageID, seq, isCompact); err != nil {
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES (?, ?, ?, ?, ?)`, "ref_"+messageID+"_"+refNarratorID, refNarratorID, messageID, seq, isCompact); err != nil {
 		t.Fatalf("insert ref %s: %v", messageID, err)
 	}
 }

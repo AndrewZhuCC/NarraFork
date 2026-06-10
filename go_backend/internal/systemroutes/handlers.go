@@ -2096,6 +2096,7 @@ func (h *Handler) RegisterProviders(r chi.Router) {
 		cr.Post("/credentials/{id}/refresh", httpx.Handler(h.codexCredentialRefresh))
 		cr.Post("/credentials/{id}/usage", httpx.Handler(h.codexCredentialUsage))
 		cr.Patch("/credentials/{id}", httpx.Handler(h.codexCredentialUpdate))
+		cr.Delete("/credentials/unhealthy", httpx.Handler(h.codexCredentialDeleteUnhealthy))
 		cr.Delete("/credentials/batch", httpx.Handler(h.codexCredentialBatchDelete))
 		cr.Delete("/credentials/{id}", httpx.Handler(h.codexCredentialDelete))
 	})
@@ -3705,6 +3706,7 @@ func normalizeNugQuotaResponse(data map[string]any) map[string]any {
 	}
 	quota["balance"] = nugFirstNumber(data, 0, "balance", "quotaBalance", "remaining", "creditsRemaining")
 	quota["totalGranted"] = nugFirstNumber(data, 0, "totalGranted", "quotaTotalGranted", "total_granted", "creditsTotal", "total")
+	quota["detailedQuotaBalance"] = nil
 	if detailedQuotaBalance := nugQuotaDetails(data); detailedQuotaBalance != "" {
 		quota["detailedQuotaBalance"] = detailedQuotaBalance
 	}
@@ -6535,6 +6537,15 @@ func (h *Handler) codexCredentialDelete(w http.ResponseWriter, r *http.Request) 
 	return nil
 }
 
+func (h *Handler) codexCredentialDeleteUnhealthy(w http.ResponseWriter, r *http.Request) error {
+	removed, err := removeCodexUnhealthyCredentials()
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"removed": removed, "reasons": []string{"too_many_failures", "banned"}})
+	return nil
+}
+
 func (h *Handler) codexCredentialBatchDelete(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		IDs []string `json:"ids"`
@@ -6685,6 +6696,32 @@ func mutateCodexCredential(idParam string, mutate func(map[string]any)) (bool, e
 		}
 	}
 	return false, nil
+}
+
+func isCodexUnhealthyCredential(entry map[string]any) bool {
+	if !boolMap(entry, "disabled") {
+		return false
+	}
+	switch stringMap(entry, "disabledReason", "") {
+	case "too_many_failures", "banned":
+		return true
+	default:
+		return false
+	}
+}
+
+func removeCodexUnhealthyCredentials() ([]string, error) {
+	entries, err := loadCodexCredentials()
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{}
+	for _, entry := range entries {
+		if isCodexUnhealthyCredential(entry) {
+			ids = append(ids, stringMap(entry, "id", ""))
+		}
+	}
+	return removeCodexCredentials(ids)
 }
 
 func removeCodexCredentials(ids []string) ([]string, error) {
@@ -9209,8 +9246,12 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	entries := h.codexCredentialEntries()
 	available := []map[string]any{}
 	unavailable := []map[string]any{}
+	unhealthyTotal := 0
 	currentID := ""
 	for _, entry := range entries {
+		if isCodexUnhealthyCredential(entry) {
+			unhealthyTotal++
+		}
 		if boolMap(entry, "disabled") {
 			unavailable = append(unavailable, entry)
 			continue
@@ -9246,7 +9287,7 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 	tierOrder := normalizeCodexTierOrder(rawTierOrder)
 	effectiveTierOrder := codexEffectiveTierOrder(tierOrder)
 	globalProxy := h.codexSettingsValue("proxy", "")
-	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "globalProxy": globalProxy, "proxy": globalProxy, "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "useWebSearch": h.codexSettingsValue("useWebSearch", true), "useImageGeneration": h.codexSettingsValue("useImageGeneration", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
+	payload := map[string]any{"entries": pagedEntries, "availableEntries": pagedAvailable, "unavailableEntries": pagedUnavailable, "availableTotal": len(available), "unavailableTotal": len(unavailable), "unhealthyTotal": unhealthyTotal, "currentId": currentID, "loadBalancingMode": loadBalancingMode, "tierOrder": tierOrder, "effectiveTierOrder": effectiveTierOrder, "globalProxy": globalProxy, "proxy": globalProxy, "defaultReasoningEffort": h.codexSettingsValue("defaultReasoningEffort", nil), "useWebSocket": h.codexSettingsValue("useWebSocket", true), "useWebSearch": h.codexSettingsValue("useWebSearch", true), "useImageGeneration": h.codexSettingsValue("useImageGeneration", true), "total": len(entries), "available": len(available), "stickySessionCount": agentbasic.CodexStickySessionCount(), "usageCache": usageCache, "usageSummary": usageSummary, "usageForecast": usageForecast, "usageScheduler": usageScheduler, "usageQueue": map[string]any{"items": []any{}, "isRunning": false}}
 	if lastBrowserAuthError != "" {
 		payload["lastBrowserAuthError"] = lastBrowserAuthError
 	}

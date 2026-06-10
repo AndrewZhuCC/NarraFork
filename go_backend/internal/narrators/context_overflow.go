@@ -72,6 +72,10 @@ func (s *Service) finishAgentRunContextOverflow(ctx context.Context, state *agen
 }
 
 func (s *Service) scheduleContextOverflowRetry(narratorID string) {
+	s.scheduleNarratorRetry(narratorID)
+}
+
+func (s *Service) scheduleNarratorRetry(narratorID string) {
 	if s.contextOverflowRetry != nil {
 		s.contextOverflowRetry(context.Background(), narratorID)
 		return

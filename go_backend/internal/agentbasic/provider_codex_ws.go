@@ -112,6 +112,20 @@ func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, tools
 		if parsed.Item != nil {
 			handleResponsesOutputItemAdded(ctx, out, toolsByItem, parsed.Item, parsed.OutputIndex)
 		}
+	case "response.output_item.done":
+		if parsed.Item != nil {
+			handleResponsesOutputItemDone(ctx, out, parsed.Item, parsed.OutputIndex)
+		}
+	case "response.web_search_call.in_progress":
+		emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "in_progress", parsed.OutputIndex)
+	case "response.web_search_call.searching":
+		emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "searching", parsed.OutputIndex)
+	case "response.web_search_call.completed":
+		emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
+	case "response.image_generation_call.generating", "response.image_generation_call.partial_image":
+		emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "generating", parsed.OutputIndex)
+	case "response.image_generation_call.completed":
+		emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
 	case "response.function_call_arguments.delta":
 		tool := responsesToolForEvent(toolsByItem, parsed.ItemID, parsed.OutputIndex)
 		tool.Arguments += parsed.Delta

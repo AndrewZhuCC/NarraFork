@@ -20,14 +20,15 @@ const (
 var ErrMigrationCompatibilityMismatch = errors.New("TS migration compatibility mismatch")
 
 type migrationCompatibilityDetails struct {
-	DrizzleJournalTable string   `json:"drizzleJournalTable"`
-	GoJournalTable      string   `json:"goJournalTable"`
-	ObservedCount       int      `json:"observedCount"`
-	ExpectedCount       int      `json:"expectedCount"`
-	ExpectedLastTag     string   `json:"expectedLastTag"`
-	ExpectedLastWhen    int64    `json:"expectedLastWhen"`
-	ExpectedJournalName string   `json:"expectedJournalName,omitempty"`
-	ExtraHashes         []string `json:"extraHashes,omitempty"`
+	DrizzleJournalTable         string   `json:"drizzleJournalTable"`
+	GoJournalTable              string   `json:"goJournalTable"`
+	ObservedCount               int      `json:"observedCount"`
+	ExpectedCount               int      `json:"expectedCount"`
+	ExpectedLastTag             string   `json:"expectedLastTag"`
+	ExpectedLastWhen            int64    `json:"expectedLastWhen"`
+	ExpectedJournalName         string   `json:"expectedJournalName,omitempty"`
+	StrictCurrentRepositoryMode bool     `json:"strictCurrentRepositoryMode"`
+	ExtraHashes                 []string `json:"extraHashes,omitempty"`
 }
 
 type expectedDrizzleJournal struct {
@@ -61,6 +62,14 @@ func EnsureMigrationCompatibility(ctx context.Context, sqlDB *sql.DB) error {
 }
 
 func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB, runtimeDB *sql.DB) error {
+	return ensureMigrationCompatibility(ctx, sqlDB, runtimeDB, false)
+}
+
+func EnsureMigrationCompatibilityStrict(ctx context.Context, sqlDB *sql.DB, runtimeDB *sql.DB) error {
+	return ensureMigrationCompatibility(ctx, sqlDB, runtimeDB, true)
+}
+
+func ensureMigrationCompatibility(ctx context.Context, sqlDB *sql.DB, runtimeDB *sql.DB, strictCurrentRepository bool) error {
 	if sqlDB == nil {
 		return fmt.Errorf("%w: database is not open", ErrMigrationCompatibilityMismatch)
 	}
@@ -85,16 +94,24 @@ func EnsureMigrationCompatibilityWithRuntime(ctx context.Context, sqlDB *sql.DB,
 	}
 
 	extraHashes := extraAppliedDrizzleHashes(appliedHashes, expectedJournal.Entries)
+	if strictCurrentRepository && len(extraHashes) > 0 {
+		return fmt.Errorf(
+			"%w: unexpected Drizzle migrations in strict current-repository mode: %s. Refresh the embedded Go migration snapshot or run compatibility mode intentionally",
+			ErrMigrationCompatibilityMismatch,
+			strings.Join(extraHashes, ", "),
+		)
+	}
 	last := expectedJournal.Entries[len(expectedJournal.Entries)-1]
 	details := migrationCompatibilityDetails{
-		DrizzleJournalTable: "__drizzle_migrations",
-		GoJournalTable:      goMigrationJournalTable,
-		ObservedCount:       len(appliedHashes),
-		ExpectedCount:       len(expectedJournal.Entries),
-		ExpectedLastTag:     last.Tag,
-		ExpectedLastWhen:    last.When,
-		ExpectedJournalName: expectedJournal.Name,
-		ExtraHashes:         extraHashes,
+		DrizzleJournalTable:         "__drizzle_migrations",
+		GoJournalTable:              goMigrationJournalTable,
+		ObservedCount:               len(appliedHashes),
+		ExpectedCount:               len(expectedJournal.Entries),
+		ExpectedLastTag:             last.Tag,
+		ExpectedLastWhen:            last.When,
+		ExpectedJournalName:         expectedJournal.Name,
+		StrictCurrentRepositoryMode: strictCurrentRepository,
+		ExtraHashes:                 extraHashes,
 	}
 	detailsJSON, err := json.Marshal(details)
 	if err != nil {

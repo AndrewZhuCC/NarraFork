@@ -188,6 +188,23 @@ func TestEnsureMigrationCompatibilityIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureMigrationCompatibilityStrictRejectsExtraUnknownHashesWithoutWritingGoJournal(t *testing.T) {
+	sqlDB := openCanonicalSchemaTestDB(t)
+	defer sqlDB.Close()
+	createCanonicalSchemaTables(t, sqlDB)
+	extraHashes := []string{"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}
+	createDrizzleMigrationsTable(t, sqlDB, embeddedDrizzleMigrationSnapshot, extraHashes)
+
+	err := EnsureMigrationCompatibilityStrict(context.Background(), sqlDB, sqlDB)
+	if !errors.Is(err, ErrMigrationCompatibilityMismatch) {
+		t.Fatalf("expected ErrMigrationCompatibilityMismatch, got %v", err)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "strict current-repository mode") || !strings.Contains(msg, extraHashes[0]) {
+		t.Fatalf("expected strict extra-hash error, got %q", msg)
+	}
+	assertTableMissing(t, sqlDB, goMigrationJournalTable)
+}
+
 func TestEnsureMigrationCompatibilityRecordsExtraUnknownHashesWithoutBlocking(t *testing.T) {
 	sqlDB := openCanonicalSchemaTestDB(t)
 	defer sqlDB.Close()

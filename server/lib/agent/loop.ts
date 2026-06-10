@@ -3760,5 +3760,5 @@ export async function* agentLoop(
 		turnIndex++;
 	}
 
-	yield { type: "error", message: `Max turns (${maxTurns}) exceeded` };
+	yield { type: "max_turns_exceeded", maxTurns };
 }

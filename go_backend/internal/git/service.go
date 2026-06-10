@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,8 +19,11 @@ import (
 )
 
 const (
-	maxOutputBytes       = 1024 * 1024
-	maxConflictScanBytes = 512 * 1024
+	maxOutputBytes                 = 1024 * 1024
+	maxConflictScanBytes           = 512 * 1024
+	maxUntrackedLineCountFileBytes = 1_000_000
+	maxUntrackedLineCountFiles     = 200
+	binaryDetectBytes              = 4100
 )
 
 type Service struct {
@@ -61,10 +65,13 @@ func acquireWorktreeLock(path string) func() {
 
 type Commit struct {
 	SHA               string `json:"sha"`
+	ShortSHA          string `json:"shortSha,omitempty"`
 	Message           string `json:"message"`
 	FullMessage       string `json:"fullMessage,omitempty"`
+	Author            string `json:"author,omitempty"`
 	AuthorName        string `json:"authorName,omitempty"`
 	AuthorEmail       string `json:"authorEmail,omitempty"`
+	Date              string `json:"date,omitempty"`
 	AuthoredAt        string `json:"authoredAt"`
 	Source            string `json:"source,omitempty"`
 	NarratorID        string `json:"narratorId,omitempty"`
@@ -384,7 +391,7 @@ func (s *Service) LogRef(ctx context.Context, path, ref string, limit int) ([]Co
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
-	format := "%H%x1f%s%x1f%an%x1f%ae%x1f%aI"
+	format := "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI"
 	args := []string{"log", "--max-count", strconv.Itoa(limit), "--pretty=format:" + format}
 	if ref = strings.TrimSpace(ref); ref != "" {
 		args = append(args, ref)
@@ -397,10 +404,10 @@ func (s *Service) LogRef(ctx context.Context, path, ref string, limit int) ([]Co
 	commits := make([]Commit, 0, len(lines))
 	for _, line := range lines {
 		parts := strings.Split(line, "\x1f")
-		if len(parts) < 5 {
+		if len(parts) < 6 {
 			continue
 		}
-		commits = append(commits, Commit{SHA: parts[0], Message: parts[1], AuthorName: parts[2], AuthorEmail: parts[3], AuthoredAt: parts[4]})
+		commits = append(commits, Commit{SHA: parts[0], ShortSHA: parts[1], Message: parts[2], Author: parts[3], AuthorName: parts[3], AuthorEmail: parts[4], Date: parts[5], AuthoredAt: parts[5]})
 	}
 	return commits, nil
 }
@@ -563,6 +570,23 @@ func (s *Service) AutoCommit(ctx context.Context, path, message string) (string,
 	return s.HeadCommit(ctx, path)
 }
 
+func (s *Service) CommitGitignoreIfDirty(ctx context.Context, path string) error {
+	return s.WithWorktreeLock(path, func() error {
+		out, err := s.run(ctx, path, "git", "status", "--porcelain", ".gitignore")
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(out) == "" {
+			return nil
+		}
+		if _, err := s.run(ctx, path, "git", "add", ".gitignore"); err != nil {
+			return err
+		}
+		_, err = s.run(ctx, path, "git", "commit", "-m", "Update .gitignore for NarraFork")
+		return err
+	})
+}
+
 func (s *Service) IsAncestor(ctx context.Context, repoPath, ancestor, descendant string) bool {
 	_, err := s.run(ctx, repoPath, "git", "merge-base", "--is-ancestor", ancestor, descendant)
 	return err == nil
@@ -672,7 +696,7 @@ func (s *Service) conflictFileNames(ctx context.Context, path string) ([]string,
 }
 
 func (s *Service) GetStatus(ctx context.Context, path string) (string, error) {
-	return s.run(ctx, path, "git", "status", "--porcelain=v1")
+	return s.gitRead(ctx, path, "status", "--porcelain=v1")
 }
 
 func (s *Service) ShowFileAtRef(ctx context.Context, path, ref, filePath string) (string, error) {
@@ -688,24 +712,50 @@ func (s *Service) ShowFileAtRef(ctx context.Context, path, ref, filePath string)
 }
 
 func (s *Service) StatusSummary(ctx context.Context, path string) (StatusSummary, error) {
-	out, err := s.GetStatus(ctx, path)
+	out, err := s.gitRead(ctx, path, "status", "--porcelain=v1", "-z")
 	if err != nil {
 		return StatusSummary{}, err
 	}
-	branch, _ := s.CurrentBranch(ctx, path)
-	head, _ := s.HeadCommit(ctx, path)
-	lines := splitLines(out)
-	summary := StatusSummary{HasChanges: len(lines) > 0, Files: []StatusFile{}, TotalFiles: len(lines), HeadSHA: head, Branch: branch}
-	for _, line := range lines {
-		if len(line) < 3 {
-			continue
+	branch, _ := s.gitRead(ctx, path, "rev-parse", "--abbrev-ref", "HEAD")
+	head, _ := s.gitRead(ctx, path, "rev-parse", "HEAD")
+	stagedStats := map[string]lineStats{}
+	if stagedOut, err := s.gitRead(ctx, path, "diff", "--cached", "--numstat", "-z"); err == nil {
+		stagedStats = buildLineStatsMap(stagedOut)
+	}
+	unstagedStats := map[string]lineStats{}
+	if unstagedOut, err := s.gitRead(ctx, path, "diff", "--numstat", "-z"); err == nil {
+		unstagedStats = buildLineStatsMap(unstagedOut)
+	}
+	if untrackedOut, err := s.gitRead(ctx, path, "ls-files", "--others", "--exclude-standard", "-z"); err == nil {
+		for filePath, stats := range untrackedLineStatsMap(path, parseNulSeparatedPaths(untrackedOut)) {
+			unstagedStats[filePath] = stats
 		}
-		status := line[:2]
-		filePath := strings.TrimSpace(line[3:])
+	}
+
+	entries := parsePorcelainStatusZ(out)
+	summary := StatusSummary{
+		HasChanges: len(entries) > 0,
+		Files:      []StatusFile{},
+		TotalFiles: len(entries),
+		HeadSHA:    strings.TrimSpace(head),
+		Branch:     strings.TrimSpace(branch),
+	}
+	for _, entry := range entries {
+		staged := stagedStats[entry.Path]
+		unstaged := unstagedStats[entry.Path]
 		if len(summary.Files) < 200 {
-			summary.Files = append(summary.Files, StatusFile{Status: status, Path: filePath})
+			summary.Files = append(summary.Files, StatusFile{
+				Status:               entry.Status,
+				Path:                 entry.Path,
+				LinesAdded:           staged.Added + unstaged.Added,
+				LinesRemoved:         staged.Removed + unstaged.Removed,
+				StagedLinesAdded:     staged.Added,
+				StagedLinesRemoved:   staged.Removed,
+				UnstagedLinesAdded:   unstaged.Added,
+				UnstagedLinesRemoved: unstaged.Removed,
+			})
 		}
-		x, y := status[0], status[1]
+		x, y := entry.Status[0], entry.Status[1]
 		if y == '?' {
 			summary.Untracked++
 			continue
@@ -717,96 +767,128 @@ func (s *Service) StatusSummary(ctx context.Context, path string) (StatusSummary
 			summary.Unstaged++
 		}
 	}
+	for _, stats := range stagedStats {
+		summary.LinesAdded += stats.Added
+		summary.LinesRemoved += stats.Removed
+	}
+	for _, stats := range unstagedStats {
+		summary.LinesAdded += stats.Added
+		summary.LinesRemoved += stats.Removed
+	}
 	return summary, nil
 }
 
 func (s *Service) StageAll(ctx context.Context, path string) error {
-	_, err := s.run(ctx, path, "git", "add", "-A")
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		_, err := s.run(ctx, path, "git", "add", "-A")
+		return err
+	})
 }
 
 func (s *Service) StageFiles(ctx context.Context, path string, files []string) error {
-	args := append([]string{"add", "--"}, files...)
-	_, err := s.run(ctx, path, "git", args...)
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		args := append([]string{"add", "--"}, files...)
+		_, err := s.run(ctx, path, "git", args...)
+		return err
+	})
 }
 
 func (s *Service) UnstageAll(ctx context.Context, path string) error {
-	_, err := s.run(ctx, path, "git", "reset")
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		_, err := s.run(ctx, path, "git", "reset")
+		return err
+	})
 }
 
 func (s *Service) UnstageFiles(ctx context.Context, path string, files []string) error {
-	args := append([]string{"restore", "--staged", "--"}, files...)
-	_, err := s.run(ctx, path, "git", args...)
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		args := append([]string{"restore", "--staged", "--"}, files...)
+		_, err := s.run(ctx, path, "git", args...)
+		return err
+	})
 }
 
 func (s *Service) Commit(ctx context.Context, path, message string) (string, error) {
 	if strings.TrimSpace(message) == "" {
 		return "", fmt.Errorf("commit message is required")
 	}
-	if _, err := s.run(ctx, path, "git", "commit", "-m", message); err != nil {
-		return "", err
-	}
-	return s.HeadCommit(ctx, path)
+	sha := ""
+	err := s.WithWorktreeLock(path, func() error {
+		if _, err := s.run(ctx, path, "git", "commit", "-m", message); err != nil {
+			return err
+		}
+		head, err := s.HeadCommit(ctx, path)
+		if err != nil {
+			return err
+		}
+		sha = head
+		return nil
+	})
+	return sha, err
 }
 
 func (s *Service) DiscardAll(ctx context.Context, path string) error {
-	if _, err := s.run(ctx, path, "git", "checkout", "HEAD", "--", "."); err != nil {
+	return s.WithWorktreeLock(path, func() error {
+		if _, err := s.run(ctx, path, "git", "checkout", "HEAD", "--", "."); err != nil {
+			return err
+		}
+		_, err := s.run(ctx, path, "git", "clean", "-fd")
 		return err
-	}
-	_, err := s.run(ctx, path, "git", "clean", "-fd")
-	return err
+	})
 }
 
 func (s *Service) DiscardFiles(ctx context.Context, path string, files []string) error {
 	if len(files) == 0 {
 		return nil
 	}
-	args := append([]string{"status", "--porcelain", "--"}, files...)
-	out, err := s.run(ctx, path, "git", args...)
-	if err != nil {
-		return err
-	}
-	tracked := []string{}
-	untracked := []string{}
-	for _, line := range strings.Split(out, "\n") {
-		if len(line) < 4 {
-			continue
-		}
-		filePath := strings.TrimSpace(line[3:])
-		if filePath == "" {
-			continue
-		}
-		if line[0] == '?' && line[1] == '?' {
-			untracked = append(untracked, filePath)
-		} else {
-			tracked = append(tracked, filePath)
-		}
-	}
-	if len(tracked) > 0 {
-		restoreArgs := append([]string{"checkout", "HEAD", "--"}, tracked...)
-		if _, err := s.run(ctx, path, "git", restoreArgs...); err != nil {
+	return s.WithWorktreeLock(path, func() error {
+		args := append([]string{"status", "--porcelain", "--"}, files...)
+		out, err := s.gitRead(ctx, path, args...)
+		if err != nil {
 			return err
 		}
-	}
-	if len(untracked) > 0 {
-		cleanArgs := append([]string{"clean", "-f", "--"}, untracked...)
-		if _, err := s.run(ctx, path, "git", cleanArgs...); err != nil {
-			return err
+		tracked := []string{}
+		untracked := []string{}
+		for _, line := range strings.Split(out, "\n") {
+			if len(line) < 4 {
+				continue
+			}
+			filePath := strings.TrimSpace(line[3:])
+			if filePath == "" {
+				continue
+			}
+			if line[0] == '?' && line[1] == '?' {
+				untracked = append(untracked, filePath)
+			} else {
+				tracked = append(tracked, filePath)
+			}
 		}
-	}
-	return nil
+		if len(tracked) > 0 {
+			restoreArgs := append([]string{"checkout", "HEAD", "--"}, tracked...)
+			if _, err := s.run(ctx, path, "git", restoreArgs...); err != nil {
+				return err
+			}
+		}
+		if len(untracked) > 0 {
+			cleanArgs := append([]string{"clean", "-f", "--"}, untracked...)
+			if _, err := s.run(ctx, path, "git", cleanArgs...); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Service) FileDiff(ctx context.Context, path, file string, staged bool) (map[string]any, error) {
+	statusOut, statusErr := s.gitRead(ctx, path, "status", "--porcelain", "--", file)
 	args := []string{"diff", "--", file}
-	if staged {
+	if statusErr == nil && strings.HasPrefix(strings.TrimSpace(statusOut), "??") {
+		args = []string{"diff", "--no-index", gitDevNull(), file}
+	} else if staged {
 		args = []string{"diff", "--cached", "--", file}
 	}
-	out, err := s.run(ctx, path, "git", args...)
-	if err != nil {
+	out, err := s.gitRead(ctx, path, args...)
+	if err != nil && out == "" {
 		return nil, err
 	}
 	truncated := false
@@ -815,6 +897,13 @@ func (s *Service) FileDiff(ctx context.Context, path, file string, staged bool) 
 		truncated = true
 	}
 	return map[string]any{"diff": out, "truncated": truncated}, nil
+}
+
+func gitDevNull() string {
+	if runtime.GOOS == "windows" {
+		return "NUL"
+	}
+	return "/dev/null"
 }
 
 func (s *Service) CommitFileDiff(ctx context.Context, path, sha, file string) (map[string]any, error) {
@@ -972,12 +1061,14 @@ func (s *Service) StashList(ctx context.Context, path string) ([]map[string]any,
 }
 
 func (s *Service) Stash(ctx context.Context, path, message string) error {
-	args := []string{"stash", "push", "--include-untracked"}
-	if message != "" {
-		args = append(args, "-m", message)
-	}
-	_, err := s.run(ctx, path, "git", args...)
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		args := []string{"stash", "push", "--include-untracked"}
+		if message != "" {
+			args = append(args, "-m", message)
+		}
+		_, err := s.run(ctx, path, "git", args...)
+		return err
+	})
 }
 
 type StashResult struct {
@@ -986,11 +1077,23 @@ type StashResult struct {
 }
 
 func (s *Service) StashPop(ctx context.Context, path string) (StashResult, error) {
-	return s.stashApplyLike(ctx, path, "pop")
+	result := StashResult{}
+	err := s.WithWorktreeLock(path, func() error {
+		var err error
+		result, err = s.stashApplyLike(ctx, path, "pop")
+		return err
+	})
+	return result, err
 }
 
 func (s *Service) StashApply(ctx context.Context, path string, index int) (StashResult, error) {
-	return s.stashApplyLike(ctx, path, "apply", fmt.Sprintf("stash@{%d}", index))
+	result := StashResult{}
+	err := s.WithWorktreeLock(path, func() error {
+		var err error
+		result, err = s.stashApplyLike(ctx, path, "apply", fmt.Sprintf("stash@{%d}", index))
+		return err
+	})
+	return result, err
 }
 
 func (s *Service) stashApplyLike(ctx context.Context, path string, args ...string) (StashResult, error) {
@@ -1007,11 +1110,19 @@ func (s *Service) stashApplyLike(ctx context.Context, path string, args ...strin
 }
 
 func (s *Service) StashDrop(ctx context.Context, path string, index int) error {
-	_, err := s.run(ctx, path, "git", "stash", "drop", fmt.Sprintf("stash@{%d}", index))
-	return err
+	return s.WithWorktreeLock(path, func() error {
+		_, err := s.run(ctx, path, "git", "stash", "drop", fmt.Sprintf("stash@{%d}", index))
+		return err
+	})
 }
 
 func (s *Service) Reset(ctx context.Context, path, target, mode string) error {
+	return s.WithWorktreeLock(path, func() error {
+		return s.ResetAlreadyLocked(ctx, path, target, mode)
+	})
+}
+
+func (s *Service) ResetAlreadyLocked(ctx context.Context, path, target, mode string) error {
 	if mode != "hard" {
 		mode = "soft"
 	}
@@ -1101,6 +1212,11 @@ func (s *Service) DiffBetweenRefs(ctx context.Context, repoPath, baseRef, headRe
 	return out, nil
 }
 
+func (s *Service) gitRead(parent context.Context, cwd string, args ...string) (string, error) {
+	readArgs := append([]string{"--no-optional-locks"}, args...)
+	return s.run(parent, cwd, "git", readArgs...)
+}
+
 func (s *Service) run(parent context.Context, cwd, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(parent, s.Timeout)
 	defer cancel()
@@ -1155,6 +1271,147 @@ func parseGitStatInt(value string) int {
 		return 0
 	}
 	return n
+}
+
+type lineStats struct {
+	Added   int
+	Removed int
+}
+
+type porcelainStatusEntry struct {
+	Status string
+	Path   string
+}
+
+func parsePorcelainStatusZ(output string) []porcelainStatusEntry {
+	entries := []porcelainStatusEntry{}
+	offset := 0
+	for offset < len(output) {
+		end := strings.IndexByte(output[offset:], 0)
+		if end < 0 {
+			break
+		}
+		entry := output[offset : offset+end]
+		offset += end + 1
+		if entry == "" || len(entry) < 3 {
+			continue
+		}
+		status := entry[:2]
+		pathValue := entry[3:]
+		if strings.ContainsAny(status, "RC") {
+			oldPathEnd := strings.IndexByte(output[offset:], 0)
+			if oldPathEnd < 0 {
+				break
+			}
+			offset += oldPathEnd + 1
+		}
+		entries = append(entries, porcelainStatusEntry{Status: status, Path: pathValue})
+	}
+	return entries
+}
+
+func parseNulSeparatedPaths(output string) []string {
+	parts := strings.Split(output, "\x00")
+	paths := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			paths = append(paths, part)
+		}
+	}
+	return paths
+}
+
+func buildLineStatsMap(output string) map[string]lineStats {
+	stats := map[string]lineStats{}
+	offset := 0
+	for offset < len(output) {
+		end := strings.IndexByte(output[offset:], 0)
+		if end < 0 {
+			break
+		}
+		record := output[offset : offset+end]
+		offset += end + 1
+		if record == "" {
+			continue
+		}
+		firstTab := strings.IndexByte(record, '\t')
+		secondTab := -1
+		if firstTab >= 0 {
+			if idx := strings.IndexByte(record[firstTab+1:], '\t'); idx >= 0 {
+				secondTab = firstTab + 1 + idx
+			}
+		}
+		if firstTab < 0 || secondTab < 0 {
+			continue
+		}
+		pathValue := record[secondTab+1:]
+		if pathValue == "" {
+			oldPathEnd := strings.IndexByte(output[offset:], 0)
+			if oldPathEnd < 0 {
+				break
+			}
+			offset += oldPathEnd + 1
+			newPathEnd := strings.IndexByte(output[offset:], 0)
+			if newPathEnd < 0 {
+				break
+			}
+			pathValue = output[offset : offset+newPathEnd]
+			offset += newPathEnd + 1
+		}
+		if pathValue == "" {
+			continue
+		}
+		stats[pathValue] = lineStats{
+			Added:   parseGitStatInt(record[:firstTab]),
+			Removed: parseGitStatInt(record[firstTab+1 : secondTab]),
+		}
+	}
+	return stats
+}
+
+func untrackedLineStatsMap(worktreePath string, files []string) map[string]lineStats {
+	stats := map[string]lineStats{}
+	if len(files) > maxUntrackedLineCountFiles {
+		files = files[:maxUntrackedLineCountFiles]
+	}
+	for _, filePath := range files {
+		clean := filepath.Clean(filePath)
+		if clean == "." || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			stats[filePath] = lineStats{}
+			continue
+		}
+		fullPath := filepath.Join(worktreePath, clean)
+		info, err := os.Stat(fullPath)
+		if err != nil || info.IsDir() || info.Size() > maxUntrackedLineCountFileBytes {
+			stats[filePath] = lineStats{}
+			continue
+		}
+		data, err := os.ReadFile(fullPath)
+		if err != nil || isBinaryContent(data) {
+			stats[filePath] = lineStats{}
+			continue
+		}
+		stats[filePath] = lineStats{Added: countTextLines(data)}
+	}
+	return stats
+}
+
+func isBinaryContent(data []byte) bool {
+	if len(data) > binaryDetectBytes {
+		data = data[:binaryDetectBytes]
+	}
+	return bytes.IndexByte(data, 0) >= 0
+}
+
+func countTextLines(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	lines := bytes.Count(data, []byte("\n"))
+	if data[len(data)-1] != '\n' {
+		lines++
+	}
+	return lines
 }
 
 func commitStatusFromCode(code string) string {

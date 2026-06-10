@@ -73,6 +73,15 @@ type canonicalForeignKeyRequirement struct {
 	ReferencedColumn string
 }
 
+type canonicalColumnMetadataRequirement struct {
+	Table        string  `json:"table"`
+	Column       string  `json:"column"`
+	Type         string  `json:"type"`
+	NotNull      *bool   `json:"notNull,omitempty"`
+	DefaultValue *string `json:"defaultValue,omitempty"`
+	PrimaryKey   *int    `json:"primaryKey,omitempty"`
+}
+
 type canonicalFTSRequirement struct {
 	Table     string
 	Columns   []string
@@ -139,6 +148,26 @@ var canonicalMainIndexes = []canonicalIndexRequirement{
 	{Table: "background_tasks", Name: "idx_bg_tasks_subagent", Columns: []string{"subagent_narrator_id"}},
 }
 
+// canonicalColumnMetadata checks representative high-risk TS/Drizzle column
+// metadata that affects compatibility-sensitive writes and frontend reads. It is
+// a readiness core, not yet an exhaustive dump of every TS column.
+var canonicalColumnMetadata = []canonicalColumnMetadataRequirement{
+	{Table: "projects", Column: "id", Type: "TEXT", NotNull: canonicalBool(true), PrimaryKey: canonicalInt(1)},
+	{Table: "projects", Column: "name", Type: "TEXT", NotNull: canonicalBool(true)},
+	{Table: "projects", Column: "flow_mode", Type: "TEXT", NotNull: canonicalBool(true), DefaultValue: canonicalString("'classic'")},
+	{Table: "chapters", Column: "id", Type: "TEXT", NotNull: canonicalBool(true), PrimaryKey: canonicalInt(1)},
+	{Table: "chapters", Column: "status", Type: "TEXT", NotNull: canonicalBool(true), DefaultValue: canonicalString("'active'")},
+	{Table: "chapters", Column: "is_root", Type: "INTEGER", NotNull: canonicalBool(false), DefaultValue: canonicalString("0")},
+	{Table: "chapters", Column: "panel_width", Type: "REAL", NotNull: canonicalBool(false)},
+	{Table: "chapter_edges", Column: "type", Type: "TEXT", NotNull: canonicalBool(true)},
+	{Table: "chapter_commits", Column: "source", Type: "TEXT", NotNull: canonicalBool(true), DefaultValue: canonicalString("'manual'")},
+	{Table: "narrator_message_refs", Column: "seq", Type: "INTEGER", NotNull: canonicalBool(true)},
+	{Table: "narrator_message_refs", Column: "is_compact", Type: "INTEGER", NotNull: canonicalBool(true), DefaultValue: canonicalString("0")},
+	{Table: "narrator_tool_calls", Column: "status", Type: "TEXT", NotNull: canonicalBool(true), DefaultValue: canonicalString("'initializing'")},
+	{Table: "narrator_tool_calls", Column: "is_background", Type: "INTEGER", NotNull: canonicalBool(true), DefaultValue: canonicalString("false")},
+	{Table: "api_requests", Column: "cost_usd", Type: "REAL", NotNull: canonicalBool(false)},
+}
+
 // canonicalForeignKeys checks high-value relational links that protect graph,
 // narrator tree, permissions, terminal, usage, and background-task data. It is a
 // representative readiness core, not yet an exhaustive dump of every TS FK.
@@ -186,6 +215,18 @@ var canonicalFTSObjects = []canonicalFTSRequirement{
 	{Table: "narrators_fts", Columns: []string{"title"}, Fragments: []string{"using fts5", "content='narrators'", "content_rowid=rowid", "tokenize='trigram'"}},
 }
 
+func canonicalBool(value bool) *bool {
+	return &value
+}
+
+func canonicalInt(value int) *int {
+	return &value
+}
+
+func canonicalString(value string) *string {
+	return &value
+}
+
 var canonicalFTSTriggers = []canonicalTriggerRequirement{
 	{Name: "chapters_fts_insert", Table: "chapters", Fragments: []string{"after insert on chapters", "insert into chapters_fts(rowid, title, description)", "new.rowid"}},
 	{Name: "chapters_fts_update", Table: "chapters", Fragments: []string{"after update on chapters", "insert into chapters_fts(chapters_fts, rowid, title, description)", "'delete'", "insert into chapters_fts(rowid, title, description)"}},
@@ -201,29 +242,30 @@ var canonicalFTSTriggers = []canonicalTriggerRequirement{
 var ErrCanonicalSchemaMismatch = errors.New("canonical TS database schema mismatch")
 
 type CanonicalSchemaContractReport struct {
-	Mode                     string   `json:"mode"`
-	StrategyStage            string   `json:"strategyStage"`
-	TransitionalStrategy     bool     `json:"transitionalStrategy"`
-	TargetMode               string   `json:"targetMode"`
-	MainSchemaOwner          string   `json:"mainSchemaOwner"`
-	TargetMainSchemaOwner    string   `json:"targetMainSchemaOwner"`
-	CurrentRepairOwner       string   `json:"currentRepairOwner"`
-	FutureGoResponsibilities []string `json:"futureGoResponsibilities"`
-	GoMainMigrations         bool     `json:"goMainMigrations"`
-	GoEnsureColumns          bool     `json:"goEnsureColumns"`
-	GoFTSRepair              bool     `json:"goFtsRepair"`
-	CanonicalSchemaHash      string   `json:"canonicalSchemaHash"`
-	ExpectedMigrationHash    string   `json:"expectedMigrationHash"`
-	ExpectedMigrationCount   int      `json:"expectedMigrationCount"`
-	ExpectedLastMigration    string   `json:"expectedLastMigration"`
-	GoJournalTable           string   `json:"goJournalTable"`
-	DrizzleJournalTable      string   `json:"drizzleJournalTable"`
-	ReadOnlyVerifier         bool     `json:"readOnlyVerifier"`
-	CanonicalTableCount      int      `json:"canonicalTableCount"`
-	CanonicalIndexCount      int      `json:"canonicalIndexCount"`
-	CanonicalForeignKeyCount int      `json:"canonicalForeignKeyCount"`
-	CanonicalFTSTableCount   int      `json:"canonicalFtsTableCount"`
-	CanonicalFTSTriggerCount int      `json:"canonicalFtsTriggerCount"`
+	Mode                         string   `json:"mode"`
+	StrategyStage                string   `json:"strategyStage"`
+	TransitionalStrategy         bool     `json:"transitionalStrategy"`
+	TargetMode                   string   `json:"targetMode"`
+	MainSchemaOwner              string   `json:"mainSchemaOwner"`
+	TargetMainSchemaOwner        string   `json:"targetMainSchemaOwner"`
+	CurrentRepairOwner           string   `json:"currentRepairOwner"`
+	FutureGoResponsibilities     []string `json:"futureGoResponsibilities"`
+	GoMainMigrations             bool     `json:"goMainMigrations"`
+	GoEnsureColumns              bool     `json:"goEnsureColumns"`
+	GoFTSRepair                  bool     `json:"goFtsRepair"`
+	CanonicalSchemaHash          string   `json:"canonicalSchemaHash"`
+	ExpectedMigrationHash        string   `json:"expectedMigrationHash"`
+	ExpectedMigrationCount       int      `json:"expectedMigrationCount"`
+	ExpectedLastMigration        string   `json:"expectedLastMigration"`
+	GoJournalTable               string   `json:"goJournalTable"`
+	DrizzleJournalTable          string   `json:"drizzleJournalTable"`
+	ReadOnlyVerifier             bool     `json:"readOnlyVerifier"`
+	CanonicalTableCount          int      `json:"canonicalTableCount"`
+	CanonicalIndexCount          int      `json:"canonicalIndexCount"`
+	CanonicalColumnMetadataCount int      `json:"canonicalColumnMetadataCount"`
+	CanonicalForeignKeyCount     int      `json:"canonicalForeignKeyCount"`
+	CanonicalFTSTableCount       int      `json:"canonicalFtsTableCount"`
+	CanonicalFTSTriggerCount     int      `json:"canonicalFtsTriggerCount"`
 }
 
 func CanonicalSchemaContract() CanonicalSchemaContractReport {
@@ -232,29 +274,30 @@ func CanonicalSchemaContract() CanonicalSchemaContractReport {
 		lastMigration = embeddedDrizzleMigrationSnapshot[len(embeddedDrizzleMigrationSnapshot)-1].Tag
 	}
 	return CanonicalSchemaContractReport{
-		Mode:                     "ts-owned-db-compatibility",
-		StrategyStage:            "transition",
-		TransitionalStrategy:     true,
-		TargetMode:               "pure-go-db-management",
-		MainSchemaOwner:          "typescript-drizzle",
-		TargetMainSchemaOwner:    "go",
-		CurrentRepairOwner:       "typescript-drizzle-and-ts-fts-setup",
-		FutureGoResponsibilities: []string{"main schema migrations", "startup backfills and repair", "FTS/search lifecycle", "schema drift fixtures and release gates"},
-		GoMainMigrations:         false,
-		GoEnsureColumns:          false,
-		GoFTSRepair:              false,
-		CanonicalSchemaHash:      canonicalSchemaContractHash(),
-		ExpectedMigrationHash:    expectedDrizzleJournalHash(),
-		ExpectedMigrationCount:   len(embeddedDrizzleMigrationSnapshot),
-		ExpectedLastMigration:    lastMigration,
-		GoJournalTable:           goMigrationJournalTable,
-		DrizzleJournalTable:      "__drizzle_migrations",
-		ReadOnlyVerifier:         true,
-		CanonicalTableCount:      len(canonicalMainSchema),
-		CanonicalIndexCount:      len(canonicalMainIndexes),
-		CanonicalForeignKeyCount: len(canonicalForeignKeys),
-		CanonicalFTSTableCount:   len(canonicalFTSObjects),
-		CanonicalFTSTriggerCount: len(canonicalFTSTriggers),
+		Mode:                         "ts-owned-db-compatibility",
+		StrategyStage:                "transition",
+		TransitionalStrategy:         true,
+		TargetMode:                   "pure-go-db-management",
+		MainSchemaOwner:              "typescript-drizzle",
+		TargetMainSchemaOwner:        "go",
+		CurrentRepairOwner:           "typescript-drizzle-and-ts-fts-setup",
+		FutureGoResponsibilities:     []string{"main schema migrations", "startup backfills and repair", "FTS/search lifecycle", "schema drift fixtures and release gates"},
+		GoMainMigrations:             false,
+		GoEnsureColumns:              false,
+		GoFTSRepair:                  false,
+		CanonicalSchemaHash:          canonicalSchemaContractHash(),
+		ExpectedMigrationHash:        expectedDrizzleJournalHash(),
+		ExpectedMigrationCount:       len(embeddedDrizzleMigrationSnapshot),
+		ExpectedLastMigration:        lastMigration,
+		GoJournalTable:               goMigrationJournalTable,
+		DrizzleJournalTable:          "__drizzle_migrations",
+		ReadOnlyVerifier:             true,
+		CanonicalTableCount:          len(canonicalMainSchema),
+		CanonicalIndexCount:          len(canonicalMainIndexes),
+		CanonicalColumnMetadataCount: len(canonicalColumnMetadata),
+		CanonicalForeignKeyCount:     len(canonicalForeignKeys),
+		CanonicalFTSTableCount:       len(canonicalFTSObjects),
+		CanonicalFTSTriggerCount:     len(canonicalFTSTriggers),
 	}
 }
 
@@ -323,6 +366,12 @@ func VerifyCanonicalSchema(ctx context.Context, sqlDB *sql.DB) error {
 
 func verifyCanonicalReadinessObjects(ctx context.Context, sqlDB *sql.DB) ([]string, error) {
 	failures := []string{}
+	metadataFailures, err := verifyCanonicalColumnMetadata(ctx, sqlDB)
+	if err != nil {
+		return nil, err
+	}
+	failures = append(failures, metadataFailures...)
+
 	for _, expected := range canonicalMainIndexes {
 		actual, err := indexDetails(ctx, sqlDB, expected.Table, expected.Name)
 		if err != nil {
@@ -370,6 +419,76 @@ func verifyCanonicalReadinessObjects(ctx context.Context, sqlDB *sql.DB) ([]stri
 		}
 	}
 	return failures, nil
+}
+
+func verifyCanonicalColumnMetadata(ctx context.Context, sqlDB *sql.DB) ([]string, error) {
+	failures := []string{}
+	cache := map[string]map[string]SQLiteColumnSnapshot{}
+	for _, expected := range canonicalColumnMetadata {
+		columns, ok := cache[expected.Table]
+		if !ok {
+			var err error
+			columns, err = tableColumnMetadata(ctx, sqlDB, expected.Table)
+			if err != nil {
+				return nil, err
+			}
+			cache[expected.Table] = columns
+		}
+		actual, ok := columns[expected.Column]
+		if !ok {
+			failures = append(failures, "missing column metadata "+expected.Table+"."+expected.Column)
+			continue
+		}
+		columnName := expected.Table + "." + expected.Column
+		if expected.Type != "" && !strings.EqualFold(strings.TrimSpace(actual.Type), expected.Type) {
+			failures = append(failures, fmt.Sprintf("column %s type = %s, want %s", columnName, actual.Type, expected.Type))
+		}
+		if expected.NotNull != nil && actual.NotNull != *expected.NotNull {
+			failures = append(failures, fmt.Sprintf("column %s notNull = %t, want %t", columnName, actual.NotNull, *expected.NotNull))
+		}
+		if expected.DefaultValue != nil {
+			actualDefault := "<none>"
+			if actual.DefaultValue != nil {
+				actualDefault = strings.TrimSpace(*actual.DefaultValue)
+			}
+			wantDefault := strings.TrimSpace(*expected.DefaultValue)
+			if actualDefault != wantDefault {
+				failures = append(failures, fmt.Sprintf("column %s default = %s, want %s", columnName, actualDefault, wantDefault))
+			}
+		}
+		if expected.PrimaryKey != nil && actual.PK != *expected.PrimaryKey {
+			failures = append(failures, fmt.Sprintf("column %s pk = %d, want %d", columnName, actual.PK, *expected.PrimaryKey))
+		}
+	}
+	return failures, nil
+}
+
+func tableColumnMetadata(ctx context.Context, sqlDB *sql.DB, table string) (map[string]SQLiteColumnSnapshot, error) {
+	rows, err := sqlDB.QueryContext(ctx, `PRAGMA table_info(`+quoteIdentifier(table)+`)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	columns := map[string]SQLiteColumnSnapshot{}
+	for rows.Next() {
+		var column SQLiteColumnSnapshot
+		var notNull int
+		var defaultValue sql.NullString
+		if err := rows.Scan(&column.CID, &column.Name, &column.Type, &notNull, &defaultValue, &column.PK); err != nil {
+			return nil, err
+		}
+		column.NotNull = notNull != 0
+		if defaultValue.Valid {
+			value := defaultValue.String
+			column.DefaultValue = &value
+		}
+		columns[column.Name] = column
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
 }
 
 type indexInfo struct {
