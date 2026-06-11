@@ -3,6 +3,7 @@ package search
 import (
 	"context"
 	"database/sql"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -142,16 +143,12 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 		diagnostics.FTSReady = &ready
 	}
 	sort.SliceStable(results, func(i, j int) bool {
-		leftScore := numeric(results[i]["matchScore"])
-		rightScore := numeric(results[j]["matchScore"])
-		if leftScore != rightScore {
-			return leftScore > rightScore
-		}
-		return stringValue(results[i]["updatedAt"], results[i]["createdAt"], results[i]["lastMessageAt"]) > stringValue(results[j]["updatedAt"], results[j]["createdAt"], results[j]["lastMessageAt"])
+		return searchResultLess(results[i], results[j])
 	})
 	if len(results) > limit {
 		results = results[:limit]
 	}
+	stripSearchInternalFields(results)
 	writeSearchJSON(w, map[string]any{"results": results, "projects": projects, "chapters": chapters, "narrators": narrators}, diagnostics)
 	return nil
 }
@@ -199,7 +196,7 @@ func (h *Handler) searchChaptersFTS(ctx context.Context, safeQuery, ftsQuery str
 		if err := rows.Scan(&id, &title, &description, &status, &role, &createdAt, &updatedAt, &projectName, &snippet, &rank); err != nil {
 			return nil, err
 		}
-		items = append(items, chapterResult(id, title, description, status, role, createdAt, updatedAt, projectName, needle, sqlString(snippet), scoreFromRank(rank, 760)))
+		items = append(items, attachSearchRank(chapterResult(id, title, description, status, role, createdAt, updatedAt, projectName, needle, sqlString(snippet), scoreFromRank(rank, 760)), rank))
 	}
 	return items, rows.Err()
 }
@@ -279,7 +276,7 @@ func (h *Handler) searchMessagesFTS(ctx context.Context, ftsQuery string, limit 
 		if err := rows.Scan(&id, &narratorID, &preview, &role, &createdAt, &chapterID, &narratorTitle, &model, &chapterTitle, &projectName, &snippet, &rank); err != nil {
 			return nil, err
 		}
-		items = append(items, messageResult(id, narratorID, preview, role, createdAt, chapterID, narratorTitle, model, chapterTitle, projectName, sqlString(snippet), scoreFromRank(rank, 700)))
+		items = append(items, attachSearchRank(messageResult(id, narratorID, preview, role, createdAt, chapterID, narratorTitle, model, chapterTitle, projectName, sqlString(snippet), scoreFromRank(rank, 700)), rank))
 	}
 	return items, rows.Err()
 }
@@ -351,7 +348,7 @@ func (h *Handler) searchNarratorsFTS(ctx context.Context, ftsQuery string, limit
 		if err := rows.Scan(&id, &title, &chapterID, &status, &model, &lastMessageAt, &createdAt, &updatedAt, &chapterTitle, &projectName, &snippet, &rank); err != nil {
 			return nil, err
 		}
-		items = append(items, narratorResult(id, title, chapterID, status, model, lastMessageAt, createdAt, updatedAt, chapterTitle, projectName, sqlString(snippet), scoreFromRank(rank, 820)))
+		items = append(items, attachSearchRank(narratorResult(id, title, chapterID, status, model, lastMessageAt, createdAt, updatedAt, chapterTitle, projectName, sqlString(snippet), scoreFromRank(rank, 820)), rank))
 	}
 	return items, rows.Err()
 }
@@ -475,11 +472,42 @@ func classifyFTSError(err error) string {
 	return "fts_query_failed"
 }
 
+const searchInternalRankKey = "_rank"
+
+func attachSearchRank(result map[string]any, rank sql.NullFloat64) map[string]any {
+	if rank.Valid {
+		result[searchInternalRankKey] = rank.Float64
+	}
+	return result
+}
+
+func stripSearchInternalFields(results []map[string]any) {
+	for _, result := range results {
+		delete(result, searchInternalRankKey)
+	}
+}
+
+func searchResultLess(left, right map[string]any) bool {
+	leftScore := numeric(left["matchScore"])
+	rightScore := numeric(right["matchScore"])
+	if leftScore != rightScore {
+		return leftScore > rightScore
+	}
+	if stringValue(left["type"]) == stringValue(right["type"]) {
+		leftRank, leftHasRank := rawRank(left[searchInternalRankKey])
+		rightRank, rightHasRank := rawRank(right[searchInternalRankKey])
+		if leftHasRank && rightHasRank && leftRank != rightRank {
+			return leftRank < rightRank
+		}
+	}
+	return stringValue(left["updatedAt"], left["createdAt"], left["lastMessageAt"]) > stringValue(right["updatedAt"], right["createdAt"], right["lastMessageAt"])
+}
+
 func scoreFromRank(rank sql.NullFloat64, fallback int) int {
 	if !rank.Valid {
 		return fallback
 	}
-	score := 1000 - int(rank.Float64*1000)
+	score := int(math.Round(1000 - rank.Float64*1000))
 	if score < 0 {
 		return 0
 	}
@@ -496,6 +524,18 @@ func numeric(value any) int {
 		return int(v)
 	}
 	return 0
+}
+
+func rawRank(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	}
+	return 0, false
 }
 
 func stringValue(values ...any) string {

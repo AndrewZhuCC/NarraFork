@@ -552,6 +552,65 @@ func TestCleanupSharesClearsMemoryAndDisk(t *testing.T) {
 	assertSharesRootEmpty(t)
 }
 
+// Wave 278: storage cleanup of the shares target must make the public download
+// and preview routes return 404 afterwards, guaranteeing share privacy once an
+// operator clears shares. Before cleanup both public routes serve 200; after
+// cleanup both return 404 and the on-disk share content is gone.
+func TestStorageCleanupSharesMakesPublicRouteReturnNotFound(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	resetShareRecords(t)
+	dir := shareDirPath("public-cleanup-share")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create share dir: %v", err)
+	}
+	path := filepath.Join(dir, "preview.html")
+	if err := os.WriteFile(path, []byte("<b>hi</b>"), 0o644); err != nil {
+		t.Fatalf("write public cleanup share: %v", err)
+	}
+	shareRecords.set(shareRecord{
+		ID:           "public-cleanup-share",
+		StoragePath:  path,
+		OriginalName: "preview.html",
+		Size:         9,
+		ExpiresAt:    time.Now().Add(time.Hour),
+		CreatedBy:    "test-user",
+	})
+
+	for _, probe := range []string{
+		"/api/shares/public-cleanup-share",
+		"/api/shares/public-cleanup-share/preview",
+	} {
+		w := servePublicShareRequest(t, http.MethodGet, probe)
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected live share %s to serve 200, got %d body=%s", probe, w.Code, w.Body.String())
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/cleanup", strings.NewReader(`{"target":"shares"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := NewHandler(nil).cleanupStorage(w, req); err != nil {
+		t.Fatalf("cleanup shares: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected cleanup 200, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	for _, probe := range []string{
+		"/api/shares/public-cleanup-share",
+		"/api/shares/public-cleanup-share/preview",
+	} {
+		after := servePublicShareRequest(t, http.MethodGet, probe)
+		if after.Code != http.StatusNotFound {
+			t.Fatalf("expected share %s to return 404 after cleanup, got %d body=%s", probe, after.Code, after.Body.String())
+		}
+	}
+	if shareRecords.len() != 0 {
+		t.Fatalf("cleanup should clear share records")
+	}
+	assertSharesRootEmpty(t)
+}
+
 func TestShareRecordStoreConcurrentAccessDoesNotPanic(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	store := newShareRecordStore()

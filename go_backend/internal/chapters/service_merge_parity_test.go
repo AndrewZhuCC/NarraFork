@@ -14,8 +14,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
+
 	"narrafork-go/internal/config"
 	gitx "narrafork-go/internal/git"
+	graphx "narrafork-go/internal/graph"
 
 	_ "modernc.org/sqlite"
 )
@@ -37,7 +40,62 @@ func TestFallbackRootTargetIDReturnsQueryErrors(t *testing.T) {
 	}
 }
 
-func TestMergeRejectsDirtySourceWithoutAutoCommit(t *testing.T) {
+func TestMergeAutoCommitsDirtySourceWithoutRequiredReview(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupMergeParityRepo(t)
+	preMergeHead := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD"))
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
+	result, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
+	if err != nil {
+		t.Fatalf("Merge should auto-commit dirty source when review is not required: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if ok, _ := result["ok"].(bool); !ok || commitSHA == "" || commitSHA == preMergeHead {
+		t.Fatalf("unexpected merge result: %#v", result)
+	}
+	var autoCommitSHA, autoCommitMessage string
+	if err := database.QueryRow(`SELECT sha, message FROM chapter_commits WHERE chapter_id = 'source' AND source = 'auto'`).Scan(&autoCommitSHA, &autoCommitMessage); err != nil {
+		t.Fatalf("query source auto commit row: %v", err)
+	}
+	if autoCommitSHA == sourceHead || strings.TrimSpace(autoCommitMessage) == "" || !strings.Contains(autoCommitMessage, "Auto-commit Source changes before merge into main") {
+		t.Fatalf("auto commit row = sha:%s message:%q, sourceHead=%s", autoCommitSHA, autoCommitMessage, sourceHead)
+	}
+	assertMergeSideEffects(t, database, repo, "merge", commitSHA, preMergeHead)
+}
+
+func TestRulerMergeLifecycleDBGitGraphProof(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupMergeParityRepo(t)
+	preMergeHead := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD"))
+	if err := os.Remove(filepath.Join(sourceWT, "dirty.txt")); err != nil {
+		t.Fatalf("clean source worktree fixture: %v", err)
+	}
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Ruler merge lifecycle proof", "user-1")
+	if err != nil {
+		t.Fatalf("Ruler delegated merge should succeed: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if ok, _ := result["ok"].(bool); !ok || commitSHA == "" || commitSHA == preMergeHead {
+		t.Fatalf("unexpected merge result: %#v", result)
+	}
+	assertMergeSideEffects(t, database, repo, "merge", commitSHA, preMergeHead)
+	assertMergeGraphSurface(t, database, commitSHA, preMergeHead)
+}
+
+func TestMergeAutoCommitWaitsForSourceWorktreeLock(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -45,31 +103,64 @@ func TestMergeRejectsDirtySourceWithoutAutoCommit(t *testing.T) {
 	repo, sourceWT, sourceHead := setupMergeParityRepo(t)
 	database := openMergeParityDB(t)
 	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	gitService := &gitx.Service{Timeout: 10 * time.Second}
+	svc := &Service{DB: database, Git: gitService}
+	type mergeOutcome struct {
+		result map[string]any
+		err    error
+	}
+	done := make(chan mergeOutcome, 1)
+
+	if err := gitService.WithWorktreeLock(sourceWT, func() error {
+		go func() {
+			result, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
+			done <- mergeOutcome{result: result, err: err}
+		}()
+		select {
+		case outcome := <-done:
+			t.Fatalf("merge returned before source worktree lock release: result=%#v err=%v", outcome.result, outcome.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("hold source worktree lock: %v", err)
+	}
+
+	select {
+	case outcome := <-done:
+		if outcome.err != nil {
+			t.Fatalf("merge after source lock release: %v", outcome.err)
+		}
+		if ok, _ := outcome.result["ok"].(bool); !ok {
+			t.Fatalf("merge result after source lock release = %#v", outcome.result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("merge did not finish after source worktree lock release")
+	}
+}
+
+func TestMergeRequiredReviewRejectsDirtySourceWithoutAutoCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, true)
 
 	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
 	_, err := svc.Merge(ctx, "source", "target", "merge", "", "user-1")
-	if err == nil || !strings.Contains(err.Error(), "MERGE_DIRTY_SOURCE") {
-		t.Fatalf("merge error = %v, want MERGE_DIRTY_SOURCE", err)
+	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") {
+		t.Fatalf("merge error = %v, want uncommitted changes rejection", err)
 	}
 	if _, err := os.Stat(sourceWT); err != nil {
-		t.Fatalf("source worktree should remain for user cleanup: %v", err)
-	}
-	if head := strings.TrimSpace(runGitChapterTest(t, sourceWT, "rev-parse", "HEAD")); head != sourceHead {
-		t.Fatalf("source head changed by rejected merge: got %s want %s", head, sourceHead)
-	}
-	var status string
-	var worktree sql.NullString
-	if err := database.QueryRow(`SELECT status, worktree_path FROM chapters WHERE id = 'source'`).Scan(&status, &worktree); err != nil {
-		t.Fatalf("query source: %v", err)
-	}
-	if status != "active" || !worktree.Valid {
-		t.Fatalf("source status/worktree = %s/%v, want active/valid", status, worktree)
+		t.Fatalf("required-review rejected source worktree should remain: %v", err)
 	}
 	var autoCommits, mergeCommits int
 	_ = database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'source' AND source = 'auto'`).Scan(&autoCommits)
 	_ = database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'target' AND source = 'merge'`).Scan(&mergeCommits)
 	if autoCommits != 0 || mergeCommits != 0 {
-		t.Fatalf("rejected merge should not record commits, auto=%d merge=%d", autoCommits, mergeCommits)
+		t.Fatalf("required-review dirty rejection should not record commits, auto=%d merge=%d", autoCommits, mergeCommits)
 	}
 }
 
@@ -372,8 +463,34 @@ func TestMergeSummaryFallbackSuccessMarksHistoricalAndUpdatesNarratorRefs(t *tes
 	if _, err := database.Exec(`UPDATE narrators SET message_count = 1 WHERE id = 'narrator-target'`); err != nil {
 		t.Fatalf("seed narrator count: %v", err)
 	}
+	if _, err := database.Exec(`INSERT INTO users (id, username, password_hash, role, avatar_color, avatar_image_id, created_at) VALUES ('user-1', 'alice', 'hash', 'user', '#123456', 'avatar-1', 'now')`); err != nil {
+		t.Fatalf("insert merging user: %v", err)
+	}
+	var narratorBroadcasts []struct {
+		narratorID string
+		payload    map[string]any
+	}
+	var generatedInput mergeSummaryGenerationInput
+	svc := &Service{
+		DB:  database,
+		Git: &gitx.Service{Timeout: 10 * time.Second},
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			generatedInput = input
+			return "Model generated merge summary.", nil
+		},
+		BroadcastNarrator: func(narratorID string, payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("narrator broadcast payload should be map, got %#v", payload)
+			}
+			narratorBroadcasts = append(narratorBroadcasts, struct {
+				narratorID string
+				payload    map[string]any
+			}{narratorID: narratorID, payload: item})
+		},
+	}
 
-	result, err := (&Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}).Merge(ctx, "source", "target", "merge", "Documented merge summary", "user-1")
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Documented merge summary", "user-1")
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
@@ -390,6 +507,46 @@ func TestMergeSummaryFallbackSuccessMarksHistoricalAndUpdatesNarratorRefs(t *tes
 	if round := intFromJSONNumber(newBlock["mergeRound"]); round != 2 {
 		t.Fatalf("mergeRound = %d, want 2 in %#v", round, newBlock)
 	}
+	if newBlock["mergedBy"] != "alice" {
+		t.Fatalf("mergedBy = %#v, want username alice in %#v", newBlock["mergedBy"], newBlock)
+	}
+	if newBlock["summary"] != "Model generated merge summary." || newBlock["summarySource"] != "model" {
+		t.Fatalf("summary model output not persisted, got %#v", newBlock)
+	}
+	if generatedInput.NarratorID != "narrator-target" || generatedInput.MergedBy != "alice" || generatedInput.Source.ID != "source" || generatedInput.Target.ID != "target" || generatedInput.Locale != "en" {
+		t.Fatalf("unexpected model generation input: %#v", generatedInput)
+	}
+	summaryInput, ok := newBlock["summaryInput"].(map[string]any)
+	if !ok || summaryInput["preCollected"] != true {
+		t.Fatalf("summaryInput should be pre-collected metadata, got %#v in %#v", newBlock["summaryInput"], newBlock)
+	}
+	commits, ok := summaryInput["commits"].([]any)
+	if !ok || !containsAnyString(commits, "source committed") {
+		t.Fatalf("summaryInput commits = %#v, want source committed", summaryInput["commits"])
+	}
+	if !containsString(generatedInput.Context.Commits, "source committed") {
+		t.Fatalf("model generation commits = %#v, want source committed", generatedInput.Context.Commits)
+	}
+	diffStat, _ := summaryInput["diffStat"].(string)
+	if !strings.Contains(diffStat, "source.txt") {
+		t.Fatalf("summaryInput diffStat = %q, want source.txt", diffStat)
+	}
+	if !strings.Contains(generatedInput.Context.DiffStat, "source.txt") {
+		t.Fatalf("model generation diffStat = %q, want source.txt", generatedInput.Context.DiffStat)
+	}
+	var contentText, createdBy string
+	if err := database.QueryRow(`SELECT content_text, created_by FROM narrator_messages WHERE content_json LIKE ?`, "%"+commitSHA+"%").Scan(&contentText, &createdBy); err != nil {
+		t.Fatalf("query new merge summary message: %v", err)
+	}
+	if !strings.Contains(contentText, `"chapter/source" → "main" by alice (merge)`) {
+		t.Fatalf("content_text = %q, want merged-by username header", contentText)
+	}
+	if !strings.Contains(contentText, "Model generated merge summary.") {
+		t.Fatalf("content_text = %q, want model-generated summary", contentText)
+	}
+	if createdBy != "user-1" {
+		t.Fatalf("created_by = %q, want stable user id user-1", createdBy)
+	}
 	var messageCount, messageVersion int
 	if err := database.QueryRow(`SELECT message_count, message_version FROM narrators WHERE id = 'narrator-target'`).Scan(&messageCount, &messageVersion); err != nil {
 		t.Fatalf("query narrator counters: %v", err)
@@ -404,9 +561,384 @@ func TestMergeSummaryFallbackSuccessMarksHistoricalAndUpdatesNarratorRefs(t *tes
 	if maxSeq != 2 {
 		t.Fatalf("max ref seq = %d, want 2", maxSeq)
 	}
+	if len(narratorBroadcasts) != 1 {
+		t.Fatalf("expected one narrator message broadcast, got %#v", narratorBroadcasts)
+	}
+	broadcast := narratorBroadcasts[0]
+	if broadcast.narratorID != "narrator-target" || broadcast.payload["type"] != "message" || broadcast.payload["narratorId"] != "narrator-target" {
+		t.Fatalf("unexpected narrator broadcast envelope: %#v", narratorBroadcasts)
+	}
+	broadcastMessage, ok := broadcast.payload["message"].(map[string]any)
+	if !ok {
+		t.Fatalf("broadcast message should be map, got %#v", broadcast.payload["message"])
+	}
+	if broadcastMessage["role"] != "user" || broadcastMessage["createdBy"] != "user-1" || broadcastMessage["narratorId"] != "narrator-target" {
+		t.Fatalf("unexpected broadcast message identity fields: %#v", broadcastMessage)
+	}
+	if intFromJSONNumber(broadcastMessage["seq"]) != 2 {
+		t.Fatalf("broadcast seq = %#v, want 2 in %#v", broadcastMessage["seq"], broadcastMessage)
+	}
+	broadcastText, _ := broadcastMessage["contentText"].(string)
+	if !strings.Contains(broadcastText, contentText) {
+		t.Fatalf("broadcast contentText = %q, want persisted summary %q", broadcastText, contentText)
+	}
+	creator, ok := broadcastMessage["creator"].(map[string]any)
+	if !ok {
+		t.Fatalf("broadcast creator should be populated with avatar info, got %#v", broadcastMessage["creator"])
+	}
+	if creator["id"] != "user-1" || creator["username"] != "alice" || creator["avatarColor"] != "#123456" || creator["avatarImageId"] != "avatar-1" {
+		t.Fatalf("unexpected broadcast creator payload: %#v", creator)
+	}
+	contentBlocks, ok := broadcastMessage["contentJson"].([]map[string]any)
+	if !ok || len(contentBlocks) != 2 || contentBlocks[1]["mergedBy"] != "alice" {
+		t.Fatalf("unexpected broadcast contentJson: %#v", broadcastMessage["contentJson"])
+	}
 }
 
-func TestMergeRecordMergedSyncsSourceTargetEdgeAndCommitRows(t *testing.T) {
+func TestMergeSummaryPromptBuilderMatchesTypeScriptLocaleContract(t *testing.T) {
+	description := "Implements parity proof"
+	input := mergeSummaryGenerationInput{
+		Source: Chapter{
+			Branch:      "chapter/source",
+			Title:       "Source title",
+			Description: &description,
+		},
+		Target:    Chapter{Branch: "main"},
+		Strategy:  "merge",
+		CommitSHA: "abc123",
+		MergedBy:  "alice",
+		Locale:    "en",
+		Context: mergeSummaryContext{
+			Commits:  []string{"first commit", "second commit"},
+			DiffStat: " source.go | 2 ++",
+		},
+	}
+	expectedEnglishUserText := "Branch: chapter/source\n" +
+		"Merged into: main\n" +
+		"Strategy: merge\n" +
+		"Merge commit: abc123\n" +
+		"Merged by: alice\n" +
+		"Chapter title: Source title\n" +
+		"Description: Implements parity proof\n" +
+		"\n" +
+		"Commits (2):\n" +
+		"1. first commit\n" +
+		"2. second commit\n" +
+		"\n" +
+		"Diff summary:\n" +
+		" source.go | 2 ++"
+	if got := buildMergeSummaryUserTextGo(input); got != expectedEnglishUserText {
+		t.Fatalf("english merge summary user text mismatch:\n%s", got)
+	}
+	expectedEnglishPrompt := `You are a merge summary generator. Given the commit history of a branch that was just merged, produce a concise summary describing what the branch accomplished. This summary will be injected into the parent branch's narrator context so it can be aware of the merged work.
+
+Focus on:
+- What features, fixes, or changes were implemented
+- Key files and modules affected
+- Any notable technical decisions
+
+Keep it under 300 words. Be factual and specific. Output ONLY the summary text. Always respond in English.`
+	if got := mergeSummarySystemPromptGo("en"); got != expectedEnglishPrompt {
+		t.Fatalf("english merge summary system prompt mismatch:\n%s", got)
+	}
+
+	input.Locale = "zh-CN"
+	expectedChineseUserText := "分支: chapter/source\n" +
+		"合并到: main\n" +
+		"策略: merge\n" +
+		"合并提交: abc123\n" +
+		"合并者: alice\n" +
+		"章节标题: Source title\n" +
+		"描述: Implements parity proof\n" +
+		"\n" +
+		"提交记录 (2):\n" +
+		"1. first commit\n" +
+		"2. second commit\n" +
+		"\n" +
+		"变更统计:\n" +
+		" source.go | 2 ++"
+	if got := buildMergeSummaryUserTextGo(input); got != expectedChineseUserText {
+		t.Fatalf("chinese merge summary user text mismatch:\n%s", got)
+	}
+	expectedChinesePrompt := `你是一个合并摘要生成器。根据刚刚合并的分支的提交历史，生成一个简洁的摘要，描述该分支完成了什么工作。此摘要将注入到父分支的叙述者上下文中，使其感知到已合并的工作内容。
+
+重点关注：
+- 实现了哪些功能、修复或变更
+- 涉及的关键文件和模块
+- 任何值得注意的技术决策
+
+控制在 300 字以内。保持客观和具体。只输出摘要文本。始终使用简体中文回复。`
+	if got := mergeSummarySystemPromptGo("zh-CN"); got != expectedChinesePrompt {
+		t.Fatalf("chinese merge summary system prompt mismatch:\n%s", got)
+	}
+}
+
+func TestMergeSummaryUsesUserLanguageForPromptAndHeader(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	if _, err := database.Exec(`INSERT INTO users (id, username, password_hash, role, created_at) VALUES ('user-1', 'alice', 'hash', 'user', 'now')`); err != nil {
+		t.Fatalf("insert merging user: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO user_preferences (id, user_id, language, updated_at) VALUES ('pref-user-1', 'user-1', 'zh-CN', 'now')`); err != nil {
+		t.Fatalf("insert user language: %v", err)
+	}
+	var generatedInput mergeSummaryGenerationInput
+	var generatedUserText, generatedSystemPrompt string
+	svc := &Service{
+		DB:  database,
+		Git: &gitx.Service{Timeout: 10 * time.Second},
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			generatedInput = input
+			generatedUserText = buildMergeSummaryUserTextGo(input)
+			generatedSystemPrompt = mergeSummarySystemPromptGo(input.Locale)
+			return "模型生成的合并摘要。", nil
+		},
+	}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Fallback", "user-1")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if commitSHA == "" {
+		t.Fatalf("expected merge commit sha, result=%#v", result)
+	}
+	if generatedInput.Locale != "zh-CN" {
+		t.Fatalf("generated locale = %q, want zh-CN in %#v", generatedInput.Locale, generatedInput)
+	}
+	for _, want := range []string{"分支: chapter/source", "合并到: main", "提交记录 (2):", "变更统计:"} {
+		if !strings.Contains(generatedUserText, want) {
+			t.Fatalf("generated user text missing %q:\n%s", want, generatedUserText)
+		}
+	}
+	if !strings.Contains(generatedSystemPrompt, "始终使用简体中文回复") || strings.Contains(generatedSystemPrompt, "Always respond in English") {
+		t.Fatalf("generated system prompt should be zh-CN TS prompt, got:\n%s", generatedSystemPrompt)
+	}
+	var contentText string
+	if err := database.QueryRow(`SELECT content_text FROM narrator_messages WHERE content_json LIKE ?`, "%"+commitSHA+"%").Scan(&contentText); err != nil {
+		t.Fatalf("query merge summary content text: %v", err)
+	}
+	if !strings.Contains(contentText, `[分支已合并] "chapter/source" → "main" by alice (merge)`) {
+		t.Fatalf("content_text = %q, want localized TS header", contentText)
+	}
+}
+
+func TestMergeSummaryModelGenerationRecordsAPIRequest(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	settings := newMergeParityAISettings(t, "http://127.0.0.1")
+	if _, err := settings.Patch(map[string]any{"agent": map[string]any{"summaryModel": "openai:gpt-test"}}); err != nil {
+		t.Fatalf("patch summary model: %v", err)
+	}
+	svc := &Service{
+		DB:       database,
+		Git:      &gitx.Service{Timeout: 10 * time.Second},
+		Settings: settings,
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			return "Tracked merge summary.", nil
+		},
+	}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Tracked summary", "user-1")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if ok, _ := result["ok"].(bool); !ok {
+		t.Fatalf("unexpected merge result: %#v", result)
+	}
+	var count int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM api_requests`).Scan(&count); err != nil {
+		t.Fatalf("count api requests: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("api request count = %d, want 1", count)
+	}
+	var narratorID, kind, provider, model string
+	var durationMS int
+	var errorMessage sql.NullString
+	if err := database.QueryRow(`SELECT narrator_id, kind, provider, model, duration_ms, error_message FROM api_requests LIMIT 1`).Scan(&narratorID, &kind, &provider, &model, &durationMS, &errorMessage); err != nil {
+		t.Fatalf("load api request: %v", err)
+	}
+	if narratorID != "narrator-target" || kind != "merge_summary" || provider != "openai" || model != "gpt-test" {
+		t.Fatalf("unexpected tracked api request identity: narrator=%q kind=%q provider=%q model=%q", narratorID, kind, provider, model)
+	}
+	if durationMS < 0 || errorMessage.Valid {
+		t.Fatalf("unexpected tracked api request duration/error: duration=%d error=%v", durationMS, errorMessage)
+	}
+}
+
+func TestMergeSummaryTransientErrorsRetryAndTrackAttempts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	settings := newMergeParityAISettings(t, "http://127.0.0.1")
+	if _, err := settings.Patch(map[string]any{"agent": map[string]any{"summaryModel": "openai:gpt-test"}}); err != nil {
+		t.Fatalf("patch summary model: %v", err)
+	}
+	attempts := 0
+	var summaryEvents []map[string]any
+	svc := &Service{
+		DB:                    database,
+		Git:                   &gitx.Service{Timeout: 10 * time.Second},
+		Settings:              settings,
+		SummaryRetryBaseDelay: -1,
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			attempts++
+			if attempts < 3 {
+				return "", fmt.Errorf("rate limit 429")
+			}
+			return "Retried model summary.", nil
+		},
+		BroadcastMergeProgress: func(payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("summary model broadcast payload should be map, got %#v", payload)
+			}
+			summaryEvents = append(summaryEvents, item)
+		},
+	}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Retry summary", "user-1")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if commitSHA == "" {
+		t.Fatalf("expected merge commit sha, result=%#v", result)
+	}
+	if attempts != 3 {
+		t.Fatalf("summary generator attempts = %d, want 3", attempts)
+	}
+	newBlock := assertMergeSummaryLatest(t, database, "source", commitSHA, true)
+	if newBlock["summary"] != "Retried model summary." || newBlock["summarySource"] != "model" {
+		t.Fatalf("summary retry output not persisted as model output: %#v", newBlock)
+	}
+	if len(summaryEvents) != 0 {
+		t.Fatalf("transient retry success should not broadcast summary_model_error/unavailable, got %#v", summaryEvents)
+	}
+	var total, errors int
+	if err := database.QueryRow(`SELECT COUNT(*), SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END) FROM api_requests WHERE kind = 'merge_summary'`).Scan(&total, &errors); err != nil {
+		t.Fatalf("count api requests: %v", err)
+	}
+	if total != 3 || errors != 2 {
+		t.Fatalf("api request attempts/errors = %d/%d, want 3/2", total, errors)
+	}
+}
+
+func TestMergeSummaryProviderUnavailableBroadcastsWithoutErrorBroadcast(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	settings := newMergeParityAISettings(t, "http://127.0.0.1")
+	if _, err := settings.Patch(map[string]any{"agent": map[string]any{"summaryModel": "openai:gpt-test"}}); err != nil {
+		t.Fatalf("patch summary model: %v", err)
+	}
+	attempts := 0
+	var summaryEvents []map[string]any
+	svc := &Service{
+		DB:       database,
+		Git:      &gitx.Service{Timeout: 10 * time.Second},
+		Settings: settings,
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			attempts++
+			return "", fmt.Errorf("summary provider not configured")
+		},
+		BroadcastMergeProgress: func(payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("summary model broadcast payload should be map, got %#v", payload)
+			}
+			summaryEvents = append(summaryEvents, item)
+		},
+	}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Unavailable fallback", "user-1")
+	if err != nil {
+		t.Fatalf("Merge should survive summary provider unavailable: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if commitSHA == "" {
+		t.Fatalf("expected merge commit sha, result=%#v", result)
+	}
+	if attempts != 1 {
+		t.Fatalf("provider-unavailable should not retry, attempts=%d", attempts)
+	}
+	newBlock := assertMergeSummaryLatest(t, database, "source", commitSHA, true)
+	if newBlock["summary"] != "Unavailable fallback" || newBlock["summarySource"] != "deterministic_fallback" {
+		t.Fatalf("provider-unavailable fallback not persisted: %#v", newBlock)
+	}
+	if len(summaryEvents) != 1 || summaryEvents[0]["type"] != "summary_model_unavailable" || summaryEvents[0]["error"] != "summary provider not configured" {
+		t.Fatalf("expected one summary_model_unavailable broadcast, got %#v", summaryEvents)
+	}
+	var total, errors int
+	if err := database.QueryRow(`SELECT COUNT(*), SUM(CASE WHEN error_message IS NOT NULL THEN 1 ELSE 0 END) FROM api_requests WHERE kind = 'merge_summary'`).Scan(&total, &errors); err != nil {
+		t.Fatalf("count api requests: %v", err)
+	}
+	if total != 1 || errors != 1 {
+		t.Fatalf("api request attempts/errors = %d/%d, want 1/1", total, errors)
+	}
+}
+
+func TestMergeSummaryModelErrorFallsBackAndBroadcasts(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	var summaryEvents []map[string]any
+	svc := &Service{
+		DB:  database,
+		Git: &gitx.Service{Timeout: 10 * time.Second},
+		MergeSummaryGenerator: func(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+			return "", fmt.Errorf("summary provider failed")
+		},
+		BroadcastMergeProgress: func(payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("summary model broadcast payload should be map, got %#v", payload)
+			}
+			summaryEvents = append(summaryEvents, item)
+		},
+	}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Fallback merge summary", "user-1")
+	if err != nil {
+		t.Fatalf("Merge should survive summary model errors: %v", err)
+	}
+	commitSHA, _ := result["mergeCommitSha"].(string)
+	if commitSHA == "" {
+		t.Fatalf("expected merge commit sha, result=%#v", result)
+	}
+	newBlock := assertMergeSummaryLatest(t, database, "source", commitSHA, true)
+	if newBlock["summary"] != "Fallback merge summary" || newBlock["summarySource"] != "deterministic_fallback" {
+		t.Fatalf("summary fallback not persisted after model error: %#v", newBlock)
+	}
+	if len(summaryEvents) != 1 || summaryEvents[0]["type"] != "summary_model_error" || summaryEvents[0]["error"] != "summary provider failed" {
+		t.Fatalf("expected one summary_model_error broadcast, got %#v", summaryEvents)
+	}
+}
+
+func TestMergeRecordMergedSyncsSourceTargetEdgeCommitRowsAndEvent(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
@@ -415,7 +947,18 @@ func TestMergeRecordMergedSyncsSourceTargetEdgeAndCommitRows(t *testing.T) {
 	preMergeHead := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD"))
 	database := openMergeParityDB(t)
 	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
-	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}}
+	var broadcasts []map[string]any
+	svc := &Service{
+		DB:  database,
+		Git: &gitx.Service{Timeout: 10 * time.Second},
+		BroadcastChapterLifecycle: func(payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("chapter broadcast payload should be map, got %#v", payload)
+			}
+			broadcasts = append(broadcasts, item)
+		},
+	}
 
 	result, err := svc.Merge(ctx, "source", "target", "merge", "Record merged fixture", "user-1")
 	if err != nil {
@@ -426,6 +969,57 @@ func TestMergeRecordMergedSyncsSourceTargetEdgeAndCommitRows(t *testing.T) {
 		t.Fatalf("unexpected merge result: %#v", result)
 	}
 	assertMergeSideEffects(t, database, repo, "merge", commitSHA, preMergeHead)
+	if len(broadcasts) != 1 || broadcasts[0]["type"] != "chapter:merged" || broadcasts[0]["sourceId"] != "source" || broadcasts[0]["targetId"] != "target" || broadcasts[0]["projectId"] != "project" || broadcasts[0]["userId"] != "user-1" {
+		t.Fatalf("expected chapter:merged broadcast, got %#v", broadcasts)
+	}
+}
+
+func TestMergeCleansSourceWorktreeAndTerminalState(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	if _, err := database.Exec(`INSERT INTO terminals (id, chapter_id) VALUES ('term-source', 'source')`); err != nil {
+		t.Fatalf("insert source terminal: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO terminal_tabs (id, chapter_id) VALUES ('tab-source', 'source')`); err != nil {
+		t.Fatalf("insert source terminal tab: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO terminal_view_state (id, chapter_id) VALUES ('view-source', 'source')`); err != nil {
+		t.Fatalf("insert source terminal view state: %v", err)
+	}
+	terminalRuntime := &mergeRecordingTerminalKiller{}
+	svc := &Service{DB: database, Git: &gitx.Service{Timeout: 10 * time.Second}, TerminalRuntime: terminalRuntime}
+
+	result, err := svc.Merge(ctx, "source", "target", "merge", "Cleanup source worktree fixture", "user-1")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if ok, _ := result["ok"].(bool); !ok {
+		t.Fatalf("unexpected merge result: %#v", result)
+	}
+	if _, err := os.Stat(sourceWT); !os.IsNotExist(err) {
+		t.Fatalf("source worktree should be removed after merge, stat err=%v", err)
+	}
+	if len(terminalRuntime.killed) != 1 || terminalRuntime.killed[0] != "term-source" {
+		t.Fatalf("terminal kills = %#v, want term-source", terminalRuntime.killed)
+	}
+	for label, query := range map[string]string{
+		"terminals":           `SELECT COUNT(*) FROM terminals WHERE chapter_id = 'source'`,
+		"terminal tabs":       `SELECT COUNT(*) FROM terminal_tabs WHERE chapter_id = 'source'`,
+		"terminal view state": `SELECT COUNT(*) FROM terminal_view_state WHERE chapter_id = 'source'`,
+	} {
+		var count int
+		if err := database.QueryRow(query).Scan(&count); err != nil {
+			t.Fatalf("count %s: %v", label, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s after merge cleanup = %d, want 0", label, count)
+		}
+	}
 }
 
 func TestMergeDatabaseUpdateFailureRollsBackGitAndLeavesDBUnchanged(t *testing.T) {
@@ -745,6 +1339,179 @@ func TestDeleteChapterRecentTabsCleanupFailureIsNonFatal(t *testing.T) {
 	}
 }
 
+func TestUnmergeBroadcastsWakeAndReloadsAffectedNarrators(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ctx := context.Background()
+	repo, sourceWT, sourceHead := setupCleanMergeParityRepo(t)
+	preMergeHead := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD"))
+	database := openMergeParityDB(t)
+	insertMergeParityRows(t, database, repo, sourceWT, sourceHead, false)
+	var lifecycleEvents []map[string]any
+	recordLifecycle := func(payload any) {
+		item, ok := payload.(map[string]any)
+		if !ok {
+			t.Fatalf("lifecycle payload should be map, got %#v", payload)
+		}
+		lifecycleEvents = append(lifecycleEvents, item)
+	}
+	var narratorEvents []map[string]any
+	svc := &Service{
+		DB:                        database,
+		Git:                       &gitx.Service{Timeout: 10 * time.Second},
+		BroadcastMergeProgress:    recordLifecycle,
+		BroadcastChapterLifecycle: recordLifecycle,
+		BroadcastNarrator: func(narratorID string, payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("narrator payload should be map, got %#v", payload)
+			}
+			item["_narratorID"] = narratorID
+			narratorEvents = append(narratorEvents, item)
+		},
+	}
+
+	mergeResult, err := svc.Merge(ctx, "source", "target", "merge", "Summary to remove", "user-1")
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	commitSHA, _ := mergeResult["mergeCommitSha"].(string)
+	if commitSHA == "" {
+		t.Fatalf("expected merge commit sha, result=%#v", mergeResult)
+	}
+	lifecycleEvents = nil
+	narratorEvents = nil
+	unmergeResult, err := svc.Unmerge(ctx, "source")
+	if err != nil {
+		t.Fatalf("Unmerge: %v", err)
+	}
+	if ok, _ := unmergeResult["ok"].(bool); !ok {
+		t.Fatalf("unexpected unmerge result: %#v", unmergeResult)
+	}
+	if !containsEvent(lifecycleEvents, "chapter:woken", "chapterId", "source") {
+		t.Fatalf("expected chapter:woken event after unmerge, got %#v", lifecycleEvents)
+	}
+	if !containsEvent(narratorEvents, "full_reload", "_narratorID", "narrator-target") {
+		t.Fatalf("expected narrator full_reload after unmerge summary cleanup, got %#v", narratorEvents)
+	}
+	var targetHead sql.NullString
+	var targetCount int
+	if err := database.QueryRow(`SELECT head_commit_sha, commit_count FROM chapters WHERE id = 'target'`).Scan(&targetHead, &targetCount); err != nil {
+		t.Fatalf("query target commit metadata after unmerge: %v", err)
+	}
+	expectedTargetCount := gitCommitCountForTest(t, repo)
+	if !targetHead.Valid || targetHead.String != preMergeHead || targetCount != expectedTargetCount {
+		t.Fatalf("target commit metadata after unmerge = head:%v count:%d, want head:%s count:%d", targetHead, targetCount, preMergeHead, expectedTargetCount)
+	}
+	var targetPreMergeRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'target' AND sha = ?`, preMergeHead).Scan(&targetPreMergeRows); err != nil {
+		t.Fatalf("count target synced pre-merge commit row: %v", err)
+	}
+	if targetPreMergeRows == 0 {
+		t.Fatalf("expected target commit sync to retain pre-merge head row %s", preMergeHead)
+	}
+	var sourceWorktree, sourceHeadCache sql.NullString
+	var sourceCount int
+	if err := database.QueryRow(`SELECT worktree_path, head_commit_sha, commit_count FROM chapters WHERE id = 'source'`).Scan(&sourceWorktree, &sourceHeadCache, &sourceCount); err != nil {
+		t.Fatalf("query source commit metadata after unmerge: %v", err)
+	}
+	if !sourceWorktree.Valid || strings.TrimSpace(sourceWorktree.String) == "" {
+		t.Fatalf("expected source worktree restored after unmerge, got %v", sourceWorktree)
+	}
+	expectedSourceWorktree := filepath.Join(repo, ".worktrees", "source")
+	if filepath.Clean(sourceWorktree.String) != filepath.Clean(expectedSourceWorktree) {
+		t.Fatalf("source worktree path after unmerge = %s, want TS branch-suffix path %s", sourceWorktree.String, expectedSourceWorktree)
+	}
+	if _, err := os.Stat(sourceWorktree.String); err != nil {
+		t.Fatalf("expected restored source worktree at %s: %v", sourceWorktree.String, err)
+	}
+	expectedSourceCount := gitCommitCountForTest(t, sourceWorktree.String)
+	if !sourceHeadCache.Valid || sourceHeadCache.String != sourceHead || sourceCount != expectedSourceCount {
+		t.Fatalf("source commit metadata after unmerge = head:%v count:%d, want head:%s count:%d", sourceHeadCache, sourceCount, sourceHead, expectedSourceCount)
+	}
+	var sourceHeadRows int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'source' AND sha = ?`, sourceHead).Scan(&sourceHeadRows); err != nil {
+		t.Fatalf("count source synced head commit row: %v", err)
+	}
+	if sourceHeadRows == 0 {
+		t.Fatalf("expected source commit sync to record restored head row %s", sourceHead)
+	}
+	var summaryCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE content_json LIKE ? AND content_json LIKE ?`, "%merge_summary%", "%"+commitSHA+"%").Scan(&summaryCount); err != nil {
+		t.Fatalf("count removed merge summary: %v", err)
+	}
+	if summaryCount != 0 {
+		t.Fatalf("expected merge summary for %s removed after unmerge, count=%d", commitSHA, summaryCount)
+	}
+}
+
+func TestCleanupMergeSummaryDeletesCurrentAndRestoresPreviousLatest(t *testing.T) {
+	database := openMergeParityDB(t)
+	if _, err := database.Exec(`INSERT INTO narrators (id, chapter_id, variant, model, message_count, message_version, created_at, updated_at) VALUES ('narrator-target', 'target', 'primary', 'test-model', 2, 0, 'now', 'now')`); err != nil {
+		t.Fatalf("insert narrator: %v", err)
+	}
+	oldBlocks := []map[string]any{
+		{"type": "text", "text": "old summary"},
+		{"type": "merge_summary", "sourceChapterId": "source", "commitSha": "old-sha", "isLatest": false},
+	}
+	oldJSON, _ := json.Marshal(oldBlocks)
+	currentBlocks := []map[string]any{
+		{"type": "text", "text": "current summary"},
+		{"type": "merge_summary", "sourceChapterId": "source", "commitSha": "abc123", "isLatest": true},
+	}
+	currentJSON, _ := json.Marshal(currentBlocks)
+	if _, err := database.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES ('summary-old', 'narrator-target', 'user', ?, 'old summary', 'old-time')`, string(oldJSON)); err != nil {
+		t.Fatalf("insert old summary: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES ('summary-current', 'narrator-target', 'user', ?, 'current summary', 'new-time')`, string(currentJSON)); err != nil {
+		t.Fatalf("insert current summary: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq, is_compact) VALUES ('ref-old', 'narrator-target', 'summary-old', 1, 0), ('ref-current', 'narrator-target', 'summary-current', 2, 0)`); err != nil {
+		t.Fatalf("insert summary refs: %v", err)
+	}
+	var reloads []map[string]any
+	service := &Service{
+		DB: database,
+		BroadcastNarrator: func(narratorID string, payload any) {
+			item, ok := payload.(map[string]any)
+			if !ok {
+				t.Fatalf("full_reload payload should be map, got %#v", payload)
+			}
+			item["_narratorID"] = narratorID
+			reloads = append(reloads, item)
+		},
+	}
+
+	if err := service.cleanupMergeSummaryForMerge(context.Background(), "source", "abc123"); err != nil {
+		t.Fatalf("cleanup merge summary: %v", err)
+	}
+	var currentMessages, currentRefs int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE id = 'summary-current'`).Scan(&currentMessages); err != nil {
+		t.Fatalf("count current messages: %v", err)
+	}
+	if err := database.QueryRow(`SELECT COUNT(*) FROM narrator_message_refs WHERE id = 'ref-current'`).Scan(&currentRefs); err != nil {
+		t.Fatalf("count current refs: %v", err)
+	}
+	if currentMessages != 0 || currentRefs != 0 {
+		t.Fatalf("expected current summary and ref deleted, messages=%d refs=%d", currentMessages, currentRefs)
+	}
+	oldBlock := mergeSummaryBlockByMessage(t, database, "summary-old")
+	if oldBlock["isLatest"] != true {
+		t.Fatalf("expected previous merge summary restored as latest, got %#v", oldBlock)
+	}
+	var messageCount, messageVersion int
+	if err := database.QueryRow(`SELECT message_count, message_version FROM narrators WHERE id = 'narrator-target'`).Scan(&messageCount, &messageVersion); err != nil {
+		t.Fatalf("query narrator counters: %v", err)
+	}
+	if messageCount != 1 || messageVersion != 1 {
+		t.Fatalf("unexpected narrator counters after cleanup: count=%d version=%d", messageCount, messageVersion)
+	}
+	if len(reloads) != 1 || reloads[0]["type"] != "full_reload" || reloads[0]["narratorId"] != "narrator-target" || reloads[0]["_narratorID"] != "narrator-target" {
+		t.Fatalf("expected narrator full_reload after summary cleanup, got %#v", reloads)
+	}
+}
+
 func TestCleanupMergeSummaryReturnsNarratorCountUpdateErrors(t *testing.T) {
 	database := openMergeParityDB(t)
 	if _, err := database.Exec(`INSERT INTO narrators (id, chapter_id, variant, model, message_count, created_at, updated_at) VALUES ('narrator-target', 'target', 'primary', 'test-model', 1, 'now', 'now')`); err != nil {
@@ -793,7 +1560,7 @@ func TestInjectMergeSummaryFallbackReturnsHistoricalUpdateErrors(t *testing.T) {
 	}
 	service := &Service{DB: database}
 
-	err := service.injectMergeSummaryFallback(context.Background(), Chapter{ID: "source", Branch: "feature"}, Chapter{ID: "target", Branch: "main"}, "merge", "abc123", "merged", "user-1")
+	err := service.injectMergeSummaryFallback(context.Background(), Chapter{ID: "source", Branch: "feature"}, Chapter{ID: "target", Branch: "main"}, "merge", "abc123", "merged", "user-1", mergeSummaryContext{})
 	if err == nil || !strings.Contains(err.Error(), "mark merge summary historical") {
 		t.Fatalf("expected historical update error, got %v", err)
 	}
@@ -831,7 +1598,7 @@ func TestInjectMergeSummaryFallbackReturnsSequenceQueryErrors(t *testing.T) {
 	}
 	service := &Service{DB: database}
 
-	err := service.injectMergeSummaryFallback(context.Background(), Chapter{ID: "source", Branch: "feature"}, Chapter{ID: "target", Branch: "main"}, "merge", "abc123", "merged", "user-1")
+	err := service.injectMergeSummaryFallback(context.Background(), Chapter{ID: "source", Branch: "feature"}, Chapter{ID: "target", Branch: "main"}, "merge", "abc123", "merged", "user-1", mergeSummaryContext{})
 	if err == nil || !strings.Contains(err.Error(), "query merge summary sequence") {
 		t.Fatalf("expected merge summary sequence error, got %v", err)
 	}
@@ -1101,6 +1868,51 @@ func assertMergeSideEffects(t *testing.T, database *sql.DB, repo, strategy, comm
 	}
 }
 
+func assertMergeGraphSurface(t *testing.T, database *sql.DB, commitSHA, preMergeHead string) {
+	t.Helper()
+	router := chi.NewRouter()
+	graphx.NewHandler(database).RegisterRoutes(router)
+	req := httptest.NewRequest(http.MethodGet, "/project/graph", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("graph status = %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode graph response: %v", err)
+	}
+	if body["degraded"] != false {
+		t.Fatalf("merge lifecycle graph should not be degraded: %#v", body["fallbacks"])
+	}
+	nodes := map[string]map[string]any{}
+	for _, raw := range body["nodes"].([]any) {
+		node := raw.(map[string]any)
+		nodes[node["id"].(string)] = node
+	}
+	sourceData := nodes["source"]["data"].(map[string]any)
+	if sourceData["status"] != "merged" || sourceData["worktreePath"] != nil {
+		t.Fatalf("source graph node should show merged/null-worktree state: %#v", sourceData)
+	}
+	targetData := nodes["target"]["data"].(map[string]any)
+	if targetData["role"] != "trunk" || targetData["headCommitSha"] != commitSHA {
+		t.Fatalf("target graph node should expose merge head: %#v", targetData)
+	}
+	edges := map[string]map[string]any{}
+	for _, raw := range body["edges"].([]any) {
+		edge := raw.(map[string]any)
+		edges[edge["source"].(string)+"->"+edge["target"].(string)+":"+edge["type"].(string)] = edge
+	}
+	mergeEdge := edges["source->target:merge"]
+	if mergeEdge == nil {
+		t.Fatalf("merge edge missing from graph: %#v", body["edges"])
+	}
+	metadata := mergeEdge["metadata"].(map[string]any)
+	if metadata["mergeCommitSha"] != commitSHA || metadata["strategy"] != "merge" || metadata["status"] != "completed" {
+		t.Fatalf("merge edge metadata mismatch: %#v", metadata)
+	}
+}
+
 func assertMergeAbortedWithoutPartialState(t *testing.T, database *sql.DB, repo, preMergeHead string) {
 	t.Helper()
 	if head := strings.TrimSpace(runGitChapterTest(t, repo, "rev-parse", "HEAD")); head != preMergeHead {
@@ -1212,12 +2024,41 @@ func mergeSummaryBlockByMessage(t *testing.T, database *sql.DB, messageID string
 	return nil
 }
 
+func containsAnyString(values []any, expected string) bool {
+	for _, value := range values {
+		if text, ok := value.(string); ok && text == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsString(values []string, expected string) bool {
+	for _, value := range values {
+		if value == expected {
+			return true
+		}
+	}
+	return false
+}
+
+func containsEvent(events []map[string]any, eventType, field, value string) bool {
+	for _, event := range events {
+		if event["type"] == eventType && event[field] == value {
+			return true
+		}
+	}
+	return false
+}
+
 func intFromJSONNumber(value any) int {
 	switch typed := value.(type) {
 	case float64:
 		return int(typed)
 	case int:
 		return typed
+	case int64:
+		return int(typed)
 	default:
 		return 0
 	}
@@ -1240,18 +2081,22 @@ func openMergeParityDB(t *testing.T) *sql.DB {
 	}
 	stmts := []string{
 		`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT, git_path TEXT, default_branch TEXT, startup_script TEXT, copy_files TEXT, chapter_settings TEXT)`,
+		`CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, password_hash TEXT, role TEXT, avatar_color TEXT, avatar_image_id TEXT, created_at TEXT)`,
 		`CREATE TABLE chapters (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, description TEXT, status TEXT, role TEXT, branch TEXT, worktree_path TEXT, base_branch TEXT, parent_chapter_id TEXT, fork_point TEXT, merged_into_chapter_id TEXT, merge_commit_sha TEXT, merge_strategy TEXT, pre_merge_target_sha TEXT, container_config TEXT, exploration_group_id TEXT, is_root INTEGER, head_commit_sha TEXT, start_commit_sha TEXT, commit_count INTEGER, color TEXT, group_label TEXT, pinned INTEGER, anchor_commit_sha TEXT, axis_offset REAL, cross_offset REAL, panel_expanded INTEGER, panel_width REAL, panel_height REAL, review_source_chapter_id TEXT, review_status TEXT, last_accessed_at TEXT, created_at TEXT, updated_at TEXT)`,
 		`CREATE TABLE chapter_edges (id TEXT PRIMARY KEY, project_id TEXT, source_id TEXT, target_id TEXT, type TEXT, metadata TEXT, created_at TEXT)`,
 		`CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, chapter_id TEXT, sha TEXT, message TEXT, full_message TEXT, author_name TEXT, author_email TEXT, authored_at TEXT, source TEXT, narrator_id TEXT, narrator_message_id TEXT, files_changed INTEGER, lines_added INTEGER, lines_removed INTEGER, created_at TEXT)`,
-		`CREATE TABLE narrators (id TEXT PRIMARY KEY, chapter_id TEXT, variant TEXT, model TEXT, message_count INTEGER DEFAULT 0, message_version INTEGER DEFAULT 0, last_message_at TEXT, updated_at TEXT, created_at TEXT)`,
+		`CREATE TABLE narrators (id TEXT PRIMARY KEY, chapter_id TEXT, variant TEXT, model TEXT, status TEXT, substatus TEXT, message_count INTEGER DEFAULT 0, message_version INTEGER DEFAULT 0, last_message_at TEXT, updated_at TEXT, created_at TEXT)`,
 		`CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, role TEXT, content_json TEXT, content_text TEXT, created_by TEXT, created_at TEXT)`,
 		`CREATE TABLE narrator_message_refs (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, seq INTEGER, is_compact INTEGER)`,
+		`CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, message_id TEXT, kind TEXT DEFAULT 'narrator' NOT NULL, provider TEXT, credential_id TEXT, model TEXT, input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0, cached_input_tokens INTEGER DEFAULT 0, cache_creation_input_tokens INTEGER DEFAULT 0, cache_creation_5m_tokens INTEGER DEFAULT 0, cache_creation_1h_tokens INTEGER DEFAULT 0, reasoning_tokens INTEGER DEFAULT 0, ttft_ms INTEGER, duration_ms INTEGER, cost_usd REAL, context_percent REAL, meter_usage REAL, meter_unit TEXT, error_message TEXT, raw_dump_json TEXT, created_at TEXT NOT NULL)`,
 		`CREATE TABLE review_conclusions (id TEXT PRIMARY KEY, review_chapter_id TEXT, source_chapter_id TEXT, verdict TEXT, findings_json TEXT, created_at TEXT)`,
 		`CREATE TABLE merge_sessions (id TEXT PRIMARY KEY, target_chapter_id TEXT, source_chapter_ids TEXT, strategy TEXT, status TEXT, current_index INTEGER, merged_count INTEGER, created_at TEXT, updated_at TEXT)`,
-		`CREATE TABLE terminals (id TEXT PRIMARY KEY, chapter_id TEXT)`,
+		`CREATE TABLE terminals (id TEXT PRIMARY KEY, chapter_id TEXT, name TEXT, status TEXT, graph_opened INTEGER, graph_x REAL, graph_y REAL, graph_width REAL, graph_height REAL, created_at TEXT)`,
+		`CREATE TABLE container_instances (id TEXT PRIMARY KEY, chapter_id TEXT, container_id TEXT, service_name TEXT, status TEXT, host_port INTEGER, container_port INTEGER, proxy_label TEXT, container_ip TEXT, volume_name TEXT, created_at TEXT, updated_at TEXT)`,
+		`CREATE TABLE exploration_groups (id TEXT PRIMARY KEY, project_id TEXT, title TEXT, description TEXT, base_chapter_id TEXT, status TEXT, decided_chapter_id TEXT, created_at TEXT, updated_at TEXT)`,
 		`CREATE TABLE terminal_tabs (id TEXT PRIMARY KEY, chapter_id TEXT)`,
 		`CREATE TABLE terminal_view_state (id TEXT PRIMARY KEY, chapter_id TEXT)`,
-		`CREATE TABLE user_preferences (id TEXT PRIMARY KEY, user_id TEXT, recent_tabs TEXT, updated_at TEXT)`,
+		`CREATE TABLE user_preferences (id TEXT PRIMARY KEY, user_id TEXT, language TEXT, recent_tabs TEXT, updated_at TEXT)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := database.Exec(stmt); err != nil {
@@ -1282,6 +2127,15 @@ func insertMergeParityRows(t *testing.T, database *sql.DB, repo, sourceWT, sourc
 	if _, err := database.Exec(`INSERT INTO narrators (id, chapter_id, variant, model, created_at, updated_at) VALUES ('narrator-target', 'target', 'primary', 'test-model', 'now', 'now')`); err != nil {
 		t.Fatalf("insert narrator: %v", err)
 	}
+}
+
+type mergeRecordingTerminalKiller struct {
+	killed []string
+}
+
+func (r *mergeRecordingTerminalKiller) Kill(_ context.Context, terminalID string) error {
+	r.killed = append(r.killed, terminalID)
+	return nil
 }
 
 func runGitChapterTest(t *testing.T, cwd string, args ...string) string {

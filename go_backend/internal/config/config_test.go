@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -278,6 +279,128 @@ func TestLoadSyncsLegacyProviderArraysIntoCustomAPIProviders(t *testing.T) {
 	if openai["id"] != "o1" || openai["apiMode"] != "completions" || openai["codexAccountId"] != "acct_1" || openai["codexWebSocket"] != true {
 		t.Fatalf("legacy OpenAI array not synced from normalized custom provider: %#v", openai)
 	}
+}
+
+func TestLoadMigratesLegacyCodexOAuthIntoCredentialPool(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	settingsDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(settingsDir, 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	settingsPath := filepath.Join(settingsDir, "settings.json")
+	jwtAccessToken := unsignedTestJWT(map[string]any{
+		"email": "codex-jwt@example.com",
+		"sub":   "codex-jwt-sub",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "codex-jwt-account",
+		},
+	})
+	jwtAccessTokenJSON, err := json.Marshal(jwtAccessToken)
+	if err != nil {
+		t.Fatalf("encode jwt access token: %v", err)
+	}
+	legacy := []byte(`{
+		"openaiProviders":[
+			{
+				"id":"o1","name":"Open","prefix":"legacy-open","apiKey":"sk-open",
+				"baseUrl":"https://open.example.test","defaultModel":"gpt-test",
+				"codexOAuth":{"refreshToken":"refresh-1","accessToken":"access-1","expiresAt":1700000000000,"accountId":"account-1"},
+				"codexProxy":"http://legacy-proxy.example.test"
+			},
+			{
+				"id":"o2","name":"Open Duplicate","prefix":"legacy-open-2","apiKey":"sk-open-2",
+				"baseUrl":"https://open2.example.test","defaultModel":"gpt-test-2",
+				"codexOAuth":{"refreshToken":"refresh-1","accessToken":"access-duplicate","accountId":"account-duplicate"},
+				"codexProxy":"http://legacy-proxy-duplicate.example.test"
+			},
+			{
+				"id":"o3","name":"Open JWT","prefix":"legacy-open-3","apiKey":"sk-open-3",
+				"baseUrl":"https://open3.example.test","defaultModel":"gpt-test-3",
+				"codexOAuth":{"accessToken":` + string(jwtAccessTokenJSON) + `,"expiresAt":1700000000}
+			}
+		]
+	}`)
+	if err := os.WriteFile(settingsPath, legacy, 0o600); err != nil {
+		t.Fatalf("write legacy settings: %v", err)
+	}
+
+	store, err := Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	raw := store.Raw()
+	openaiProviders, _ := raw["openaiProviders"].([]any)
+	if len(openaiProviders) != 3 {
+		t.Fatalf("expected three OpenAI providers after migration, got %#v", openaiProviders)
+	}
+	for _, item := range openaiProviders {
+		provider, _ := item.(map[string]any)
+		if _, exists := provider["codexOAuth"]; exists {
+			t.Fatalf("legacy codexOAuth should be removed from provider: %#v", provider)
+		}
+		if _, exists := provider["codexProxy"]; exists {
+			t.Fatalf("legacy codexProxy should be removed from provider: %#v", provider)
+		}
+	}
+	customProviders, _ := raw["customApiProviders"].([]any)
+	for _, item := range customProviders {
+		provider, _ := item.(map[string]any)
+		if _, exists := provider["codexOAuth"]; exists {
+			t.Fatalf("legacy codexOAuth should not be copied into custom providers: %#v", provider)
+		}
+	}
+	credentialsPath := filepath.Join(settingsDir, "codex-credentials.json")
+	credentialsData, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatalf("read codex credentials: %v", err)
+	}
+	var credentials []map[string]any
+	if err := json.Unmarshal(credentialsData, &credentials); err != nil {
+		t.Fatalf("decode codex credentials: %v", err)
+	}
+	if len(credentials) != 2 {
+		t.Fatalf("expected duplicate legacy credentials to import once plus JWT credential, got %#v", credentials)
+	}
+	credential := credentials[0]
+	priority, priorityOK := numericValue(credential["priority"])
+	if credential["refreshToken"] != "refresh-1" || credential["accessToken"] != "access-1" || credential["accountId"] != "account-1" || credential["displayName"] != "account-1" || credential["disabled"] != false || !priorityOK || priority != 0 {
+		t.Fatalf("unexpected migrated codex credential: %#v", credential)
+	}
+	if _, ok := credential["id"].(string); !ok {
+		t.Fatalf("migrated codex credential missing id: %#v", credential)
+	}
+	jwtCredential := credentials[1]
+	jwtPriority, jwtPriorityOK := numericValue(jwtCredential["priority"])
+	jwtExpiresAt, jwtExpiresAtOK := numericValue(jwtCredential["expiresAt"])
+	if jwtCredential["accessToken"] != jwtAccessToken || jwtCredential["accountId"] != "codex-jwt-account" || jwtCredential["email"] != "codex-jwt@example.com" || jwtCredential["sub"] != "codex-jwt-sub" || jwtCredential["displayName"] != "codex-jwt@example.com" || !jwtPriorityOK || jwtPriority != 1 || !jwtExpiresAtOK || jwtExpiresAt != 1700000000000 {
+		t.Fatalf("unexpected migrated JWT codex credential: %#v", jwtCredential)
+	}
+
+	var persisted map[string]any
+	persistedData, err := os.ReadFile(settingsPath)
+	if err != nil {
+		t.Fatalf("read persisted settings: %v", err)
+	}
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatalf("decode persisted settings: %v", err)
+	}
+	persistedOpenAIProviders, _ := persisted["openaiProviders"].([]any)
+	for _, item := range persistedOpenAIProviders {
+		provider, _ := item.(map[string]any)
+		if _, exists := provider["codexOAuth"]; exists {
+			t.Fatalf("persisted provider kept legacy codexOAuth: %#v", provider)
+		}
+		if _, exists := provider["codexProxy"]; exists {
+			t.Fatalf("persisted provider kept legacy codexProxy: %#v", provider)
+		}
+	}
+}
+
+func unsignedTestJWT(claims map[string]any) string {
+	header, _ := json.Marshal(map[string]any{"alg": "none", "typ": "JWT"})
+	payload, _ := json.Marshal(claims)
+	return base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
 }
 
 func TestLoadPurgesStaleAgentModelReferences(t *testing.T) {

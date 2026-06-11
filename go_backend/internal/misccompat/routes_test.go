@@ -185,6 +185,83 @@ func TestStorageCachedReturnsLastCompletedScan(t *testing.T) {
 	}
 }
 
+func TestStorageCleanupInvalidatesCompletedScanCache(t *testing.T) {
+	for _, target := range []string{"shares", "uploads"} {
+		t.Run(target, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			database, err := sql.Open("sqlite", ":memory:")
+			if err != nil {
+				t.Fatalf("open sqlite: %v", err)
+			}
+			defer database.Close()
+			if _, err := database.Exec(`CREATE TABLE narrators (id TEXT PRIMARY KEY); CREATE TABLE narrator_messages (narrator_id TEXT, content_json TEXT)`); err != nil {
+				t.Fatalf("create upload cleanup tables: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(uploadsRoot(), "stale-upload"), 0o755); err != nil {
+				t.Fatalf("create upload fixture: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(sharesRoot(), "stale-share"), 0o755); err != nil {
+				t.Fatalf("create share fixture: %v", err)
+			}
+
+			h := NewHandler(database)
+			h.setStorageScanCache(map[string]any{"categories": []any{}, "totalBytes": int64(1), "scannedAt": int64(123)})
+			if cached := h.storageCachedResponse(); cached["cached"] != true {
+				t.Fatalf("seeded cached response = %#v, want cached=true", cached)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/storage/cleanup", strings.NewReader(`{"target":"`+target+`"}`))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			if err := h.cleanupStorage(w, req); err != nil {
+				t.Fatalf("cleanup %s: %v", target, err)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("cleanup %s status = %d body=%s", target, w.Code, w.Body.String())
+			}
+			if cached := h.storageCachedResponse(); cached["cached"] != false {
+				t.Fatalf("cached response after cleanup = %#v, want cached=false", cached)
+			}
+		})
+	}
+}
+
+func TestDatabaseCleanupInvalidatesStorageScanCache(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO api_requests (id, raw_dump_json, created_at) VALUES ('req-old', '{"dump":true}', '2020-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert api request: %v", err)
+	}
+
+	h := NewHandler(database)
+	h.setStorageScanCache(map[string]any{"categories": []any{}, "totalBytes": int64(1), "scannedAt": int64(123)})
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"apiRequestDumps","olderThanDays":30}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.databaseCleanup(w, req); err != nil {
+		t.Fatalf("database cleanup apiRequestDumps: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("database cleanup status = %d body=%s", w.Code, w.Body.String())
+	}
+	if cached := h.storageCachedResponse(); cached["cached"] != false {
+		t.Fatalf("cached response after database cleanup = %#v, want cached=false", cached)
+	}
+	var rawDump sql.NullString
+	if err := database.QueryRow(`SELECT raw_dump_json FROM api_requests WHERE id = 'req-old'`).Scan(&rawDump); err != nil {
+		t.Fatalf("load cleaned request: %v", err)
+	}
+	if rawDump.Valid {
+		t.Fatalf("raw_dump_json should be cleared, got %q", rawDump.String)
+	}
+}
+
 func TestDatabaseCleanupStaleSessionsReturnsArchivedOnlyFeatureDisabledFallback(t *testing.T) {
 	h := NewHandler(nil)
 	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"staleSessions"}`))

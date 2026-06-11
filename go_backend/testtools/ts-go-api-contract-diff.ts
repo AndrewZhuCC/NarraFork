@@ -51,6 +51,7 @@ function envFor(
 		HOME: home,
 		NARRAFORK_ALLOW_MULTIPLE: "1",
 		NARRAFORK_DISABLE_OPEN_BROWSER: "1",
+		NARRAFORK_CONTRACT_SUPPRESS_RESTART: "1",
 		HOST: "127.0.0.1",
 		PORT: String(port),
 		APP_VERSION: contractAppVersion,
@@ -574,6 +575,28 @@ function seedClineModelCacheFixture(home: string): void {
 	);
 }
 
+function readSettingsJSON(home: string): Record<string, unknown> {
+	const settingsPath = join(home, ".narrafork", "settings.json");
+	if (!existsSync(settingsPath)) return {};
+	try {
+		const parsed = JSON.parse(readFileSync(settingsPath, "utf-8"));
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+function resetPrestartProviderFixturesPreservingAuth(home: string): void {
+	const previous = readSettingsJSON(home);
+	const previousAuth = recordBody(previous.auth);
+	seedPrestartProviderFixtures(home);
+	const jwtSecret = previousAuth.jwtSecret;
+	if (typeof jwtSecret !== "string" || jwtSecret === "") return;
+	const next = readSettingsJSON(home);
+	next.auth = { ...recordBody(next.auth), jwtSecret };
+	writeFileSync(join(home, ".narrafork", "settings.json"), JSON.stringify(next, null, 2), "utf-8");
+}
+
 function seedPrestartProviderFixtures(home: string): void {
 	const dataDir = join(home, ".narrafork");
 	mkdirSync(dataDir, { recursive: true });
@@ -760,6 +783,55 @@ function chapterDormantWakeFixtureRepoPath(home: string): string {
 	return join(home, "chapter-dormant-wake-fixture-repo");
 }
 
+function chapterReviewLifecycleFixtureRepoPath(home: string): string {
+	return join(home, "chapter-review-lifecycle-fixture-repo");
+}
+
+const chapterMergeFixtureSourceBranch = "chapter/merge-source";
+const rulerMergeFixtureSourceBranch = "chapter/ruler-merge-source";
+const chapterBatchMergeFixtureSources = [
+	{
+		id: "c_batch_merge_fixture_source_one",
+		branch: "chapter/batch-merge-source-one",
+		worktreeName: "batch-merge-source-one",
+		fileName: "batch-one.txt",
+		content: "batch merge source one\n",
+		message: "feat: add batch merge source one",
+	},
+	{
+		id: "c_batch_merge_fixture_source_two",
+		branch: "chapter/batch-merge-source-two",
+		worktreeName: "batch-merge-source-two",
+		fileName: "batch-two.txt",
+		content: "batch merge source two\n",
+		message: "feat: add batch merge source two",
+	},
+];
+
+function chapterMergeFixtureRepoPath(home: string): string {
+	return join(home, "chapter-merge-fixture-repo");
+}
+
+function chapterMergeFixtureSourceWorktreePath(home: string): string {
+	return join(chapterMergeFixtureRepoPath(home), ".worktrees", "merge-source");
+}
+
+function rulerMergeFixtureRepoPath(home: string): string {
+	return join(home, "ruler-merge-fixture-repo");
+}
+
+function rulerMergeFixtureSourceWorktreePath(home: string): string {
+	return join(rulerMergeFixtureRepoPath(home), ".worktrees", "ruler-merge-source");
+}
+
+function chapterBatchMergeFixtureRepoPath(home: string): string {
+	return join(home, "chapter-batch-merge-fixture-repo");
+}
+
+function chapterBatchMergeFixtureSourceWorktreePath(home: string, worktreeName: string): string {
+	return join(chapterBatchMergeFixtureRepoPath(home), ".worktrees", worktreeName);
+}
+
 function chapterDormantWakeFixtureWorktreePath(home: string): string {
 	return join(chapterDormantWakeFixtureRepoPath(home), ".worktrees", "dormant-wake-fixture");
 }
@@ -863,6 +935,108 @@ function ensureChapterDormantWakeFixtureRepo(home: string): string {
 	return repoPath;
 }
 
+function ensureChapterReviewLifecycleFixtureRepo(home: string): string {
+	const repoPath = chapterReviewLifecycleFixtureRepoPath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, "tracked.txt"), "review lifecycle base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "tracked.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed review lifecycle fixture"]);
+	writeFileSync(join(repoPath, "second.txt"), "review lifecycle second\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", "second.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "feat: add review lifecycle change"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	writeFileSync(
+		join(repoPath, "tracked.txt"),
+		"review lifecycle base\ndirty review edit\n",
+		"utf-8",
+	);
+	writeFileSync(join(repoPath, "untracked-review.txt"), "review lifecycle untracked\n", "utf-8");
+	return repoPath;
+}
+
+function ensureChapterMergeFixtureRepo(home: string): string {
+	const repoPath = chapterMergeFixtureRepoPath(home);
+	const sourceWorktreePath = chapterMergeFixtureSourceWorktreePath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, ".gitignore"), ".worktrees/\n", "utf-8");
+	writeFileSync(join(repoPath, "base.txt"), "merge fixture base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", ".gitignore", "base.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed merge fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	runGitPanelFixture(repoPath, ["branch", chapterMergeFixtureSourceBranch]);
+	runGitPanelFixture(repoPath, [
+		"worktree",
+		"add",
+		sourceWorktreePath,
+		chapterMergeFixtureSourceBranch,
+	]);
+	writeFileSync(join(sourceWorktreePath, "feature.txt"), "merge fixture feature\n", "utf-8");
+	runGitPanelFixture(sourceWorktreePath, ["add", "feature.txt"]);
+	runGitPanelFixture(sourceWorktreePath, ["commit", "-m", "feat: add merge fixture change"]);
+	return repoPath;
+}
+
+function ensureRulerMergeFixtureRepo(home: string): string {
+	const repoPath = rulerMergeFixtureRepoPath(home);
+	const sourceWorktreePath = rulerMergeFixtureSourceWorktreePath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, ".gitignore"), ".worktrees/\n", "utf-8");
+	writeFileSync(join(repoPath, "base.txt"), "ruler merge fixture base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", ".gitignore", "base.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed ruler merge fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	runGitPanelFixture(repoPath, ["branch", rulerMergeFixtureSourceBranch]);
+	runGitPanelFixture(repoPath, [
+		"worktree",
+		"add",
+		sourceWorktreePath,
+		rulerMergeFixtureSourceBranch,
+	]);
+	writeFileSync(
+		join(sourceWorktreePath, "ruler-feature.txt"),
+		"ruler merge fixture feature\n",
+		"utf-8",
+	);
+	runGitPanelFixture(sourceWorktreePath, ["add", "ruler-feature.txt"]);
+	runGitPanelFixture(sourceWorktreePath, ["commit", "-m", "feat: add ruler merge fixture change"]);
+	return repoPath;
+}
+
+function ensureChapterBatchMergeFixtureRepo(home: string): string {
+	const repoPath = chapterBatchMergeFixtureRepoPath(home);
+	rmSync(repoPath, { recursive: true, force: true });
+	mkdirSync(repoPath, { recursive: true });
+	runGitPanelFixture(repoPath, ["init"]);
+	runGitPanelFixture(repoPath, ["config", "user.email", "contract@example.test"]);
+	runGitPanelFixture(repoPath, ["config", "user.name", "Contract Fixture"]);
+	writeFileSync(join(repoPath, ".gitignore"), ".worktrees/\n", "utf-8");
+	writeFileSync(join(repoPath, "base.txt"), "batch merge fixture base\n", "utf-8");
+	runGitPanelFixture(repoPath, ["add", ".gitignore", "base.txt"]);
+	runGitPanelFixture(repoPath, ["commit", "-m", "chore: seed batch merge fixture"]);
+	runGitPanelFixture(repoPath, ["branch", "-M", "main"]);
+	for (const source of chapterBatchMergeFixtureSources) {
+		const worktreePath = chapterBatchMergeFixtureSourceWorktreePath(home, source.worktreeName);
+		runGitPanelFixture(repoPath, ["branch", source.branch]);
+		runGitPanelFixture(repoPath, ["worktree", "add", worktreePath, source.branch]);
+		writeFileSync(join(worktreePath, source.fileName), source.content, "utf-8");
+		runGitPanelFixture(worktreePath, ["add", source.fileName]);
+		runGitPanelFixture(worktreePath, ["commit", "-m", source.message]);
+	}
+	return repoPath;
+}
+
 function ensureProjectRealCleanupWarningRepo(home: string): string {
 	const repoPath = projectRealCleanupWarningRepoPath(home);
 	const worktreePath = projectRealCleanupWarningWorktreePath(home);
@@ -942,15 +1116,7 @@ function resetGitPanelFixture(home: string, options: { dirty: boolean }): string
 	return repoPath;
 }
 
-function seedSearchFixture(home: string): void {
-	writeMcpHelperFixture(home);
-	const projectRepo = join(home, "search-fixture-repo");
-	const gitPanelRepo = ensureGitPanelFixtureRepo(home);
-	const gitPanelHead = gitPanelHeadCommit(gitPanelRepo);
-	const fsFixtureDir = join(home, "fs-contract");
-	mkdirSync(join(fsFixtureDir, "visible"), { recursive: true });
-	mkdirSync(join(fsFixtureDir, ".hidden"), { recursive: true });
-	writeFileSync(join(fsFixtureDir, "note.txt"), "fs contract text fixture\n", "utf-8");
+function seedUploadServeFixture(home: string): void {
 	mkdirSync(join(home, ".narrafork", "uploads", "n_upload_fixture"), { recursive: true });
 	writeFileSync(join(home, ".narrafork", "uploads", "n_upload_fixture", "img1234.png"), "PNGDATA");
 	mkdirSync(join(home, ".narrafork", "uploads", "avatars", "u_upload_fixture"), {
@@ -960,6 +1126,18 @@ function seedSearchFixture(home: string): void {
 		join(home, ".narrafork", "uploads", "avatars", "u_upload_fixture", "avatar1234.png"),
 		"AVATARPNG",
 	);
+}
+
+function seedSearchFixture(home: string): void {
+	writeMcpHelperFixture(home);
+	const projectRepo = join(home, "search-fixture-repo");
+	const gitPanelRepo = ensureGitPanelFixtureRepo(home);
+	const gitPanelHead = gitPanelHeadCommit(gitPanelRepo);
+	const fsFixtureDir = join(home, "fs-contract");
+	mkdirSync(join(fsFixtureDir, "visible"), { recursive: true });
+	mkdirSync(join(fsFixtureDir, ".hidden"), { recursive: true });
+	writeFileSync(join(fsFixtureDir, "note.txt"), "fs contract text fixture\n", "utf-8");
+	seedUploadServeFixture(home);
 	writeSkillFixture(
 		join(home, ".narrafork", "skills", "global-contract"),
 		"global-contract",
@@ -1418,6 +1596,1025 @@ function dormantWakeResponseSample(sample: JsonSample, _home: string): JsonSampl
 	);
 }
 
+function resetChapterReviewLifecycleFixture(home: string): void {
+	const repoPath = ensureChapterReviewLifecycleFixtureRepo(home);
+	const head = gitPanelHeadCommit(repoPath);
+	const base = runGitPanelFixture(repoPath, ["rev-list", "--max-parents=0", "HEAD"]).stdout;
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapterSubquery = `SELECT id FROM chapters WHERE project_id = 'p_review_lifecycle_fixture'`;
+		const narratorSubquery = `SELECT id FROM narrators WHERE chapter_id IN (${chapterSubquery})`;
+		db.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_sidecars WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_messages WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM review_conclusions WHERE review_chapter_id IN (${chapterSubquery})`);
+		db.run(
+			`DELETE FROM chapter_edges WHERE source_id IN (${chapterSubquery}) OR target_id IN (${chapterSubquery})`,
+		);
+		db.run(`DELETE FROM chapter_commits WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM narrators WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_review_lifecycle_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_review_lifecycle_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, chapter_settings, created_at, updated_at)
+			 VALUES ('p_review_lifecycle_fixture', 'Review Lifecycle Fixture Project', 'Review lifecycle TS-Go DB/Git/message diff fixture', 'active', 'classic', ?, 'main', ?, ?, ?)`,
+			[repoPath, JSON.stringify({ autoCreateNarrator: true }), now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_review_lifecycle_source', 'p_review_lifecycle_fixture', 'Review Lifecycle Source', 'Source chapter for review lifecycle fixture', 'active', 'branch', 'main', ?, 'main', 0, ?, ?, 2, ?, ?)`,
+			[repoPath, head, base, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_review_lifecycle_source_base', 'c_review_lifecycle_source', ?, 'chore: seed review lifecycle fixture', 'chore: seed review lifecycle fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[base, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_review_lifecycle_source_head', 'c_review_lifecycle_source', ?, 'feat: add review lifecycle change', 'feat: add review lifecycle change', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[head, now, now],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function resetChapterMergeFixture(home: string): void {
+	const repoPath = ensureChapterMergeFixtureRepo(home);
+	const sourceWorktreePath = chapterMergeFixtureSourceWorktreePath(home);
+	const targetHead = gitPanelHeadCommit(repoPath);
+	const sourceHead = gitPanelHeadCommit(sourceWorktreePath);
+	const targetCommitCount = Number(
+		runGitPanelFixture(repoPath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const sourceCommitCount = Number(
+		runGitPanelFixture(sourceWorktreePath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapterSubquery = `SELECT id FROM chapters WHERE project_id = 'p_merge_fixture'`;
+		const narratorSubquery = `SELECT id FROM narrators WHERE chapter_id IN (${chapterSubquery})`;
+		db.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_sidecars WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_messages WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(
+			`DELETE FROM chapter_edges WHERE source_id IN (${chapterSubquery}) OR target_id IN (${chapterSubquery})`,
+		);
+		db.run(`DELETE FROM chapter_commits WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM narrators WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_merge_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_merge_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, chapter_settings, created_at, updated_at)
+			 VALUES ('p_merge_fixture', 'Chapter Merge Fixture Project', 'Chapter merge TS-Go DB/Git/FS diff fixture', 'active', 'classic', ?, 'main', ?, ?, ?)`,
+			[repoPath, JSON.stringify({ autoCreateNarrator: false }), now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_merge_fixture_target', 'p_merge_fixture', 'Merge Fixture Target', 'Target chapter for merge diff fixture', 'active', 'trunk', 'main', ?, 'main', 1, ?, ?, ?, ?, ?)`,
+			[repoPath, targetHead, targetHead, targetCommitCount, now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, parent_chapter_id, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_merge_fixture_source', 'p_merge_fixture', 'Merge Fixture Source', 'Source chapter for merge diff fixture', 'active', 'branch', ?, ?, 'main', 'c_merge_fixture_target', 0, ?, ?, ?, ?, ?)`,
+			[
+				chapterMergeFixtureSourceBranch,
+				sourceWorktreePath,
+				sourceHead,
+				targetHead,
+				sourceCommitCount,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_merge_fixture_target_base', 'c_merge_fixture_target', ?, 'chore: seed merge fixture', 'chore: seed merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[targetHead, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_merge_fixture_source_base', 'c_merge_fixture_source', ?, 'chore: seed merge fixture', 'chore: seed merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[targetHead, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_merge_fixture_source_head', 'c_merge_fixture_source', ?, 'feat: add merge fixture change', 'feat: add merge fixture change', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[sourceHead, now, now],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function resetRulerMergeFixture(home: string): void {
+	const repoPath = ensureRulerMergeFixtureRepo(home);
+	const sourceWorktreePath = rulerMergeFixtureSourceWorktreePath(home);
+	const targetHead = gitPanelHeadCommit(repoPath);
+	const sourceHead = gitPanelHeadCommit(sourceWorktreePath);
+	const targetCommitCount = Number(
+		runGitPanelFixture(repoPath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const sourceCommitCount = Number(
+		runGitPanelFixture(sourceWorktreePath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapterSubquery = `SELECT id FROM chapters WHERE project_id = 'p_ruler_merge_fixture'`;
+		const narratorSubquery = `SELECT id FROM narrators WHERE chapter_id IN (${chapterSubquery})`;
+		db.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_sidecars WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_messages WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(
+			`DELETE FROM chapter_edges WHERE source_id IN (${chapterSubquery}) OR target_id IN (${chapterSubquery})`,
+		);
+		db.run(`DELETE FROM chapter_commits WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM narrators WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_ruler_merge_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_ruler_merge_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, chapter_settings, created_at, updated_at)
+			 VALUES ('p_ruler_merge_fixture', 'Ruler Merge Fixture Project', 'Ruler merge TS-Go DB/Git/graph diff fixture', 'active', 'ruler', ?, 'main', ?, ?, ?)`,
+			[repoPath, JSON.stringify({ autoCreateNarrator: false }), now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_ruler_merge_fixture_target', 'p_ruler_merge_fixture', 'Ruler Merge Fixture Target', 'Target chapter for ruler merge diff fixture', 'active', 'trunk', 'main', ?, 'main', 1, ?, ?, ?, ?, ?)`,
+			[repoPath, targetHead, targetHead, targetCommitCount, now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, parent_chapter_id, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_ruler_merge_fixture_source', 'p_ruler_merge_fixture', 'Ruler Merge Fixture Source', 'Source chapter for ruler merge diff fixture', 'active', 'branch', ?, ?, 'main', 'c_ruler_merge_fixture_target', 0, ?, ?, ?, ?, ?)`,
+			[
+				rulerMergeFixtureSourceBranch,
+				sourceWorktreePath,
+				sourceHead,
+				targetHead,
+				sourceCommitCount,
+				now,
+				now,
+			],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_ruler_merge_fixture_target_base', 'c_ruler_merge_fixture_target', ?, 'chore: seed ruler merge fixture', 'chore: seed ruler merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[targetHead, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_ruler_merge_fixture_source_base', 'c_ruler_merge_fixture_source', ?, 'chore: seed ruler merge fixture', 'chore: seed ruler merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[targetHead, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_ruler_merge_fixture_source_head', 'c_ruler_merge_fixture_source', ?, 'feat: add ruler merge fixture change', 'feat: add ruler merge fixture change', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[sourceHead, now, now],
+		);
+	} finally {
+		db.close();
+	}
+}
+
+function resetChapterBatchMergeFixture(home: string): void {
+	const repoPath = ensureChapterBatchMergeFixtureRepo(home);
+	const targetHead = gitPanelHeadCommit(repoPath);
+	const targetCommitCount = Number(
+		runGitPanelFixture(repoPath, ["rev-list", "--count", "HEAD"]).stdout,
+	);
+	const sourceHeads = chapterBatchMergeFixtureSources.map((source) => {
+		const worktreePath = chapterBatchMergeFixtureSourceWorktreePath(home, source.worktreeName);
+		return {
+			...source,
+			worktreePath,
+			head: gitPanelHeadCommit(worktreePath),
+			commitCount: Number(runGitPanelFixture(worktreePath, ["rev-list", "--count", "HEAD"]).stdout),
+		};
+	});
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const chapterSubquery = `SELECT id FROM chapters WHERE project_id = 'p_batch_merge_fixture'`;
+		const narratorSubquery = `SELECT id FROM narrators WHERE chapter_id IN (${chapterSubquery})`;
+		db.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_sidecars WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(`DELETE FROM narrator_messages WHERE narrator_id IN (${narratorSubquery})`);
+		db.run(
+			`DELETE FROM chapter_edges WHERE source_id IN (${chapterSubquery}) OR target_id IN (${chapterSubquery})`,
+		);
+		db.run(`DELETE FROM chapter_commits WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM merge_sessions WHERE target_chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM narrators WHERE chapter_id IN (${chapterSubquery})`);
+		db.run(`DELETE FROM chapters WHERE project_id = 'p_batch_merge_fixture'`);
+		db.run(`DELETE FROM projects WHERE id = 'p_batch_merge_fixture'`);
+		const now = "2026-05-27T00:00:00.000Z";
+		db.run(
+			`INSERT INTO projects (id, name, description, status, flow_mode, git_path, default_branch, chapter_settings, created_at, updated_at)
+			 VALUES ('p_batch_merge_fixture', 'Chapter Batch Merge Fixture Project', 'Chapter batch merge TS-Go E2E diff fixture', 'active', 'classic', ?, 'main', ?, ?, ?)`,
+			[repoPath, JSON.stringify({ autoCreateNarrator: false }), now, now],
+		);
+		db.run(
+			`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+			 VALUES ('c_batch_merge_fixture_target', 'p_batch_merge_fixture', 'Batch Merge Fixture Target', 'Target chapter for batch merge diff fixture', 'active', 'trunk', 'main', ?, 'main', 1, ?, ?, ?, ?, ?)`,
+			[repoPath, targetHead, targetHead, targetCommitCount, now, now],
+		);
+		db.run(
+			`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+			 VALUES ('cc_batch_merge_fixture_target_base', 'c_batch_merge_fixture_target', ?, 'chore: seed batch merge fixture', 'chore: seed batch merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+			[targetHead, now, now],
+		);
+		for (const source of sourceHeads) {
+			db.run(
+				`INSERT INTO chapters (id, project_id, title, description, status, role, branch, worktree_path, base_branch, parent_chapter_id, is_root, head_commit_sha, start_commit_sha, commit_count, created_at, updated_at)
+				 VALUES (?, 'p_batch_merge_fixture', ?, 'Source chapter for batch merge diff fixture', 'active', 'branch', ?, ?, 'main', 'c_batch_merge_fixture_target', 0, ?, ?, ?, ?, ?)`,
+				[
+					source.id,
+					source.id.endsWith("one")
+						? "Batch Merge Fixture Source One"
+						: "Batch Merge Fixture Source Two",
+					source.branch,
+					source.worktreePath,
+					source.head,
+					targetHead,
+					source.commitCount,
+					now,
+					now,
+				],
+			);
+			db.run(
+				`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+				 VALUES (?, ?, ?, 'chore: seed batch merge fixture', 'chore: seed batch merge fixture', 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+				[`cc_${source.id}_base`, source.id, targetHead, now, now],
+			);
+			db.run(
+				`INSERT INTO chapter_commits (id, chapter_id, sha, message, full_message, author_name, author_email, authored_at, source, created_at)
+				 VALUES (?, ?, ?, ?, ?, 'Contract Fixture', 'contract@example.test', ?, 'manual', ?)`,
+				[`cc_${source.id}_head`, source.id, source.head, source.message, source.message, now, now],
+			);
+		}
+	} finally {
+		db.close();
+	}
+}
+
+function chapterMergeFixtureState(home: string): JsonSample {
+	const repoPath = chapterMergeFixtureRepoPath(home);
+	const knownSourceWorktreePath = chapterMergeFixtureSourceWorktreePath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const target = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_merge_fixture_target' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const source = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, merged_into_chapter_id, merge_commit_sha, merge_strategy, pre_merge_target_sha, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_merge_fixture_source' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			merged_into_chapter_id?: string | null;
+			merge_commit_sha?: string | null;
+			merge_strategy?: string | null;
+			pre_merge_target_sha?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const targetHead = existsSync(join(repoPath, ".git")) ? gitPanelHeadCommit(repoPath) : "";
+		const sourceBranchHead = runGitPanelFixture(
+			repoPath,
+			["rev-parse", chapterMergeFixtureSourceBranch],
+			{
+				allowFailure: true,
+			},
+		).stdout;
+		const mergeEdge = db
+			.query(
+				`SELECT metadata FROM chapter_edges WHERE source_id = 'c_merge_fixture_source' AND target_id = 'c_merge_fixture_target' AND type = 'merge' LIMIT 1`,
+			)
+			.get() as { metadata?: string | null } | null;
+		const mergeMetadata = parseJSONRecord(mergeEdge?.metadata ?? "{}");
+		const storedSourceWorktreePath = source?.worktree_path ?? "";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_merge_fixture'"),
+			targetRows: countRows(db, "chapters", "id = 'c_merge_fixture_target'"),
+			sourceRows: countRows(db, "chapters", "id = 'c_merge_fixture_source'"),
+			mergeEdgeRows: countRows(
+				db,
+				"chapter_edges",
+				"source_id = 'c_merge_fixture_source' AND target_id = 'c_merge_fixture_target' AND type = 'merge'",
+			),
+			targetCommitRows: countRows(db, "chapter_commits", "chapter_id = 'c_merge_fixture_target'"),
+			targetMergeCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_merge_fixture_target' AND source = 'merge'",
+			),
+			sourceCommitRows: countRows(db, "chapter_commits", "chapter_id = 'c_merge_fixture_source'"),
+			targetStatus: target?.status ?? "",
+			targetRole: target?.role ?? "",
+			targetWorktreeExists:
+				(target?.worktree_path ?? "") !== "" && existsSync(target?.worktree_path ?? ""),
+			targetWorktreePathInRepo: (target?.worktree_path ?? "").startsWith(repoPath),
+			targetHeadMatchesRepo: targetHead !== "" && (target?.head_commit_sha ?? "") === targetHead,
+			targetCommitCount: Number(target?.commit_count ?? 0),
+			targetHasMergedFile: existsSync(join(repoPath, "feature.txt")),
+			sourceStatus: source?.status ?? "",
+			sourceRole: source?.role ?? "",
+			sourceBranchExists: sourceBranchHead !== "",
+			sourceHeadMatchesBranch:
+				sourceBranchHead !== "" && (source?.head_commit_sha ?? "") === sourceBranchHead,
+			sourceWorktreePathNull: source !== null && !source.worktree_path,
+			sourceWorktreeExists: storedSourceWorktreePath !== "" && existsSync(storedSourceWorktreePath),
+			sourceKnownWorktreeExists: existsSync(knownSourceWorktreePath),
+			sourceMergedIntoTarget: source?.merged_into_chapter_id === "c_merge_fixture_target",
+			sourceMergeStrategy: source?.merge_strategy ?? "",
+			sourceMergeCommitMatchesTarget:
+				(source?.merge_commit_sha ?? "") === (target?.head_commit_sha ?? ""),
+			preMergeTargetShaPresent: (source?.pre_merge_target_sha ?? "") !== "",
+			mergeMetadataStatus: typeof mergeMetadata.status === "string" ? mergeMetadata.status : "",
+			mergeMetadataStrategy:
+				typeof mergeMetadata.strategy === "string" ? mergeMetadata.strategy : "",
+			mergeMetadataCommitMatchesTarget:
+				typeof mergeMetadata.mergeCommitSha === "string" &&
+				mergeMetadata.mergeCommitSha === (target?.head_commit_sha ?? ""),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function rulerMergeFixtureState(home: string): JsonSample {
+	const repoPath = rulerMergeFixtureRepoPath(home);
+	const knownSourceWorktreePath = rulerMergeFixtureSourceWorktreePath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const target = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_ruler_merge_fixture_target' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const source = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, merged_into_chapter_id, merge_commit_sha, merge_strategy, pre_merge_target_sha, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_ruler_merge_fixture_source' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			merged_into_chapter_id?: string | null;
+			merge_commit_sha?: string | null;
+			merge_strategy?: string | null;
+			pre_merge_target_sha?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const targetHead = existsSync(join(repoPath, ".git")) ? gitPanelHeadCommit(repoPath) : "";
+		const sourceBranchHead = runGitPanelFixture(
+			repoPath,
+			["rev-parse", rulerMergeFixtureSourceBranch],
+			{ allowFailure: true },
+		).stdout;
+		const mergeEdge = db
+			.query(
+				`SELECT metadata FROM chapter_edges WHERE source_id = 'c_ruler_merge_fixture_source' AND target_id = 'c_ruler_merge_fixture_target' AND type = 'merge' LIMIT 1`,
+			)
+			.get() as { metadata?: string | null } | null;
+		const mergeMetadata = parseJSONRecord(mergeEdge?.metadata ?? "{}");
+		const storedSourceWorktreePath = source?.worktree_path ?? "";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_ruler_merge_fixture'"),
+			targetRows: countRows(db, "chapters", "id = 'c_ruler_merge_fixture_target'"),
+			sourceRows: countRows(db, "chapters", "id = 'c_ruler_merge_fixture_source'"),
+			mergeEdgeRows: countRows(
+				db,
+				"chapter_edges",
+				"source_id = 'c_ruler_merge_fixture_source' AND target_id = 'c_ruler_merge_fixture_target' AND type = 'merge'",
+			),
+			targetCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_ruler_merge_fixture_target'",
+			),
+			targetMergeCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_ruler_merge_fixture_target' AND source = 'merge'",
+			),
+			sourceCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_ruler_merge_fixture_source'",
+			),
+			targetStatus: target?.status ?? "",
+			targetRole: target?.role ?? "",
+			targetWorktreeExists:
+				(target?.worktree_path ?? "") !== "" && existsSync(target?.worktree_path ?? ""),
+			targetHeadMatchesRepo: targetHead !== "" && (target?.head_commit_sha ?? "") === targetHead,
+			targetCommitCount: Number(target?.commit_count ?? 0),
+			targetHasMergedFile: existsSync(join(repoPath, "ruler-feature.txt")),
+			sourceStatus: source?.status ?? "",
+			sourceRole: source?.role ?? "",
+			sourceBranchExists: sourceBranchHead !== "",
+			sourceHeadMatchesBranch:
+				sourceBranchHead !== "" && (source?.head_commit_sha ?? "") === sourceBranchHead,
+			sourceWorktreePathNull: source !== null && !source.worktree_path,
+			sourceWorktreeExists: storedSourceWorktreePath !== "" && existsSync(storedSourceWorktreePath),
+			sourceKnownWorktreeExists: existsSync(knownSourceWorktreePath),
+			sourceMergedIntoTarget: source?.merged_into_chapter_id === "c_ruler_merge_fixture_target",
+			sourceMergeStrategy: source?.merge_strategy ?? "",
+			sourceMergeCommitMatchesTarget:
+				(source?.merge_commit_sha ?? "") === (target?.head_commit_sha ?? ""),
+			preMergeTargetShaPresent: (source?.pre_merge_target_sha ?? "") !== "",
+			mergeMetadataStatus: typeof mergeMetadata.status === "string" ? mergeMetadata.status : "",
+			mergeMetadataStrategy:
+				typeof mergeMetadata.strategy === "string" ? mergeMetadata.strategy : "",
+			mergeMetadataCommitMatchesTarget:
+				typeof mergeMetadata.mergeCommitSha === "string" &&
+				mergeMetadata.mergeCommitSha === (target?.head_commit_sha ?? ""),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function chapterBatchMergeFixtureState(home: string): JsonSample {
+	const repoPath = chapterBatchMergeFixtureRepoPath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const target = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE id = 'c_batch_merge_fixture_target' LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const sources = db
+			.query(
+				`SELECT id, status, role, branch, worktree_path, merged_into_chapter_id, merge_commit_sha, merge_strategy, pre_merge_target_sha, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE project_id = 'p_batch_merge_fixture' AND role = 'branch' ORDER BY id`,
+			)
+			.all() as Array<{
+			id?: string;
+			status?: string;
+			role?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			merged_into_chapter_id?: string | null;
+			merge_commit_sha?: string | null;
+			merge_strategy?: string | null;
+			pre_merge_target_sha?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		}>;
+		const targetHead = existsSync(join(repoPath, ".git")) ? gitPanelHeadCommit(repoPath) : "";
+		const sourceBranchHeads = new Map(
+			chapterBatchMergeFixtureSources.map((source) => [
+				source.id,
+				runGitPanelFixture(repoPath, ["rev-parse", source.branch], { allowFailure: true }).stdout,
+			]),
+		);
+		const knownWorktreeExists = chapterBatchMergeFixtureSources.every((source) =>
+			existsSync(chapterBatchMergeFixtureSourceWorktreePath(home, source.worktreeName)),
+		);
+		const storedSourceWorktreesExist = sources.some(
+			(source) => (source.worktree_path ?? "") !== "" && existsSync(source.worktree_path ?? ""),
+		);
+		const allSourcesMerged =
+			sources.length === chapterBatchMergeFixtureSources.length &&
+			sources.every((source) => source.status === "merged");
+		const allSourcesActive =
+			sources.length === chapterBatchMergeFixtureSources.length &&
+			sources.every((source) => source.status === "active");
+		const allSourceBranchesExist = chapterBatchMergeFixtureSources.every(
+			(source) => (sourceBranchHeads.get(source.id) ?? "") !== "",
+		);
+		const allSourceHeadsMatchBranch = sources.every(
+			(source) => (sourceBranchHeads.get(source.id ?? "") ?? "") === (source.head_commit_sha ?? ""),
+		);
+		const allSourceWorktreePathsNull = sources.every((source) => !source.worktree_path);
+		const allSourcesMergedIntoTarget = sources.every(
+			(source) => source.merged_into_chapter_id === "c_batch_merge_fixture_target",
+		);
+		const allSourcesMergeStrategy = sources.every((source) => source.merge_strategy === "merge");
+		const allSourcePreMergeShaPresent = sources.every(
+			(source) => (source.pre_merge_target_sha ?? "") !== "",
+		);
+		const allSourceMergeCommitPresent = sources.every(
+			(source) => (source.merge_commit_sha ?? "") !== "",
+		);
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_batch_merge_fixture'"),
+			targetRows: countRows(db, "chapters", "id = 'c_batch_merge_fixture_target'"),
+			sourceRows: sources.length,
+			mergeSessionRows: countRows(
+				db,
+				"merge_sessions",
+				"target_chapter_id = 'c_batch_merge_fixture_target'",
+			),
+			completedMergeSessionRows: countRows(
+				db,
+				"merge_sessions",
+				"target_chapter_id = 'c_batch_merge_fixture_target' AND status = 'completed'",
+			),
+			errorMergeSessionRows: countRows(
+				db,
+				"merge_sessions",
+				"target_chapter_id = 'c_batch_merge_fixture_target' AND status = 'error'",
+			),
+			mergeEdgeRows: countRows(
+				db,
+				"chapter_edges",
+				"target_id = 'c_batch_merge_fixture_target' AND type = 'merge'",
+			),
+			targetCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_batch_merge_fixture_target'",
+			),
+			targetMergeCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_batch_merge_fixture_target' AND source = 'merge'",
+			),
+			sourceCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id IN ('c_batch_merge_fixture_source_one', 'c_batch_merge_fixture_source_two')",
+			),
+			targetStatus: target?.status ?? "",
+			targetRole: target?.role ?? "",
+			targetWorktreeExists:
+				(target?.worktree_path ?? "") !== "" && existsSync(target?.worktree_path ?? ""),
+			targetHeadMatchesRepo: targetHead !== "" && (target?.head_commit_sha ?? "") === targetHead,
+			targetCommitCount: Number(target?.commit_count ?? 0),
+			targetHasSourceOneFile: existsSync(join(repoPath, "batch-one.txt")),
+			targetHasSourceTwoFile: existsSync(join(repoPath, "batch-two.txt")),
+			allSourcesActive,
+			allSourcesMerged,
+			allSourceBranchesExist,
+			allSourceHeadsMatchBranch,
+			allSourceWorktreePathsNull,
+			storedSourceWorktreesExist,
+			knownSourceWorktreesExist: knownWorktreeExists,
+			allSourcesMergedIntoTarget,
+			allSourcesMergeStrategy,
+			allSourcePreMergeShaPresent,
+			allSourceMergeCommitPresent,
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function chapterBatchMergeCreatedTargetRollbackState(
+	home: string,
+	createdTargetChapterId: string,
+): JsonSample {
+	const repoPath = chapterBatchMergeFixtureRepoPath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const targetID = String(createdTargetChapterId || "missing-created-target-id");
+		const targetIDSQL = targetID.replaceAll("'", "''");
+		const sources = db
+			.query(
+				`SELECT id, status, branch, worktree_path, COALESCE(head_commit_sha, '') AS head_commit_sha
+				 FROM chapters WHERE project_id = 'p_batch_merge_fixture' AND role = 'branch' ORDER BY id`,
+			)
+			.all() as Array<{
+			id?: string;
+			status?: string;
+			branch?: string;
+			worktree_path?: string | null;
+			head_commit_sha?: string;
+		}>;
+		const sourceBranchHeads = new Map(
+			chapterBatchMergeFixtureSources.map((source) => [
+				source.id,
+				runGitPanelFixture(repoPath, ["rev-parse", source.branch], { allowFailure: true }).stdout,
+			]),
+		);
+		return jsonSampleFromBody({
+			baseTargetRows: countRows(db, "chapters", "id = 'c_batch_merge_fixture_target'"),
+			createdTargetRows: countRows(db, "chapters", `id = '${targetIDSQL}'`),
+			createdTargetCommitRows: countRows(db, "chapter_commits", `chapter_id = '${targetIDSQL}'`),
+			createdTargetMergeSessionRows: countRows(
+				db,
+				"merge_sessions",
+				`target_chapter_id = '${targetIDSQL}'`,
+			),
+			createdTargetErrorMergeSessionRows: countRows(
+				db,
+				"merge_sessions",
+				`target_chapter_id = '${targetIDSQL}' AND status = 'error'`,
+			),
+			createdTargetMergeEdgeRows: countRows(
+				db,
+				"chapter_edges",
+				`(source_id = '${targetIDSQL}' OR target_id = '${targetIDSQL}') AND type = 'merge'`,
+			),
+			sourceRows: sources.length,
+			allSourcesActive: sources.every((source) => source.status === "active"),
+			storedSourceWorktreesExist: sources.every(
+				(source) => (source.worktree_path ?? "") !== "" && existsSync(source.worktree_path ?? ""),
+			),
+			allSourceHeadsMatchBranch: sources.every(
+				(source) =>
+					(sourceBranchHeads.get(source.id ?? "") ?? "") === (source.head_commit_sha ?? ""),
+			),
+			baseTargetHasSourceOneFile: existsSync(join(repoPath, "batch-one.txt")),
+			baseTargetHasSourceTwoFile: existsSync(join(repoPath, "batch-two.txt")),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function batchMergeStartResponseSample(sample: JsonSample): JsonSample {
+	const body = recordBody(sample.body);
+	return jsonSampleFromBody(
+		{
+			mergeSessionId: typeof body.mergeSessionId === "string" ? body.mergeSessionId : "",
+			hasMergeSessionId: typeof body.mergeSessionId === "string" && body.mergeSessionId.length > 0,
+			targetChapterId: body.targetChapterId,
+			createdTarget: body.createdTarget === true,
+			status: typeof body.status === "string" ? body.status : "",
+			statusRunningOrAbsent: body.status == null || body.status === "running",
+		},
+		sample.status,
+	);
+}
+
+function batchMergeCreatedTargetStartResponseSample(sample: JsonSample): JsonSample {
+	const body = recordBody(sample.body);
+	return jsonSampleFromBody(
+		{
+			mergeSessionId: typeof body.mergeSessionId === "string" ? body.mergeSessionId : "",
+			hasMergeSessionId: typeof body.mergeSessionId === "string" && body.mergeSessionId.length > 0,
+			targetChapterId: typeof body.targetChapterId === "string" ? body.targetChapterId : "",
+			hasTargetChapterId:
+				typeof body.targetChapterId === "string" && body.targetChapterId.length > 0,
+			createdTargetTrueOrAbsent: body.createdTarget == null || body.createdTarget === true,
+			statusRunningOrAbsent: body.status == null || body.status === "running",
+		},
+		sample.status,
+	);
+}
+
+function batchMergeSessionResponseSample(sample: JsonSample): JsonSample {
+	const body = recordBody(sample.body);
+	return jsonSampleFromBody(
+		{
+			idIsString: typeof body.id === "string" && body.id.length > 0,
+			targetChapterId: body.targetChapterId,
+			status: body.status,
+			strategy: body.strategy,
+			currentIndex: Number(body.currentIndex ?? -1),
+			mergedCount: Number(body.mergedCount ?? -1),
+			currentSourceCleared: body.currentSourceChapterId == null,
+			conflictFilesCleared: body.conflictFiles == null,
+			errorCleared: body.error == null,
+			errorPresent: typeof body.error === "string" && body.error.length > 0,
+		},
+		sample.status,
+	);
+}
+
+async function createChapterBatchMergeFixture(baseUrl: string, token: string): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/batch-merge", token, {
+		method: "POST",
+		body: {
+			baseChapterId: "c_batch_merge_fixture_target",
+			targetChapterId: "c_batch_merge_fixture_target",
+			sourceChapterIds: chapterBatchMergeFixtureSources.map((source) => source.id),
+			title: "Batch Merge Fixture",
+			strategy: "merge",
+		},
+	});
+	return batchMergeStartResponseSample(sample);
+}
+
+async function createChapterBatchMergeMissingSourceRollbackFixture(
+	baseUrl: string,
+	token: string,
+): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/batch-merge", token, {
+		method: "POST",
+		body: {
+			baseChapterId: "c_batch_merge_fixture_target",
+			targetChapterId: "c_batch_merge_fixture_target",
+			sourceChapterIds: ["c_batch_merge_missing_source"],
+			title: "Batch Merge Missing Source Rollback Fixture",
+			strategy: "merge",
+		},
+	});
+	return batchMergeStartResponseSample(sample);
+}
+
+async function createChapterBatchMergeCreatedTargetMissingSourceRollbackFixture(
+	baseUrl: string,
+	token: string,
+): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/batch-merge", token, {
+		method: "POST",
+		body: {
+			baseChapterId: "c_batch_merge_fixture_target",
+			sourceChapterIds: ["c_batch_merge_missing_source"],
+			title: "Batch Merge Created Target Rollback Fixture",
+			strategy: "merge",
+		},
+	});
+	return batchMergeCreatedTargetStartResponseSample(sample);
+}
+
+async function createChapterBatchMergePartialSuccessMissingSourceFallbackFixture(
+	baseUrl: string,
+	token: string,
+): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/batch-merge", token, {
+		method: "POST",
+		body: {
+			baseChapterId: "c_batch_merge_fixture_target",
+			targetChapterId: "c_batch_merge_fixture_target",
+			sourceChapterIds: ["c_batch_merge_fixture_source_one", "c_batch_merge_missing_source"],
+			title: "Batch Merge Partial Success Fallback Fixture",
+			strategy: "merge",
+		},
+	});
+	return batchMergeStartResponseSample(sample);
+}
+
+async function waitForChapterBatchMergeFixtureSession(
+	baseUrl: string,
+	token: string,
+	mergeSessionId: string,
+): Promise<JsonSample> {
+	let lastSample = await sampleJSON(
+		baseUrl,
+		`/api/chapters/merge-sessions/${encodeURIComponent(mergeSessionId)}`,
+		token,
+	);
+	for (let attempt = 0; attempt < 60; attempt++) {
+		const body = recordBody(lastSample.body);
+		if (body.status === "completed" || body.status === "error" || body.status === "cancelled") {
+			return batchMergeSessionResponseSample(lastSample);
+		}
+		await Bun.sleep(100);
+		lastSample = await sampleJSON(
+			baseUrl,
+			`/api/chapters/merge-sessions/${encodeURIComponent(mergeSessionId)}`,
+			token,
+		);
+	}
+	return batchMergeSessionResponseSample(lastSample);
+}
+
+function mergeFixtureResponseSample(
+	sample: JsonSample,
+	sourceChapterId = "c_merge_fixture_source",
+	targetChapterId = "c_merge_fixture_target",
+): JsonSample {
+	const body = recordBody(sample.body);
+	const success = sample.status === 200 && (body.ok === true || body.success === true);
+	const commitSha =
+		typeof body.mergeCommitSha === "string"
+			? body.mergeCommitSha
+			: typeof body.commitSha === "string"
+				? body.commitSha
+				: "";
+	return jsonSampleFromBody(
+		{
+			ok: success,
+			sourceChapterId: success ? sourceChapterId : body.sourceChapterId,
+			targetChapterId: success ? targetChapterId : body.targetChapterId,
+			hasMergeCommitSha: commitSha.length > 0,
+			isFastForward: body.isFastForward === true,
+		},
+		sample.status,
+	);
+}
+
+async function createChapterMergeFixture(baseUrl: string, token: string): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/c_merge_fixture_source/merge", token, {
+		method: "POST",
+		body: {
+			targetChapterId: "c_merge_fixture_target",
+			strategy: "merge",
+			message: "Merge merge-source into main fixture",
+		},
+	});
+	return mergeFixtureResponseSample(sample);
+}
+
+async function createRulerMergeFixture(baseUrl: string, token: string): Promise<JsonSample> {
+	const sample = await sampleJSON(
+		baseUrl,
+		"/api/projects/p_ruler_merge_fixture/ruler/merge",
+		token,
+		{
+			method: "POST",
+			body: {
+				sourceChapterId: "c_ruler_merge_fixture_source",
+				strategy: "merge",
+				message: "Ruler merge source into trunk fixture",
+			},
+		},
+	);
+	return mergeFixtureResponseSample(
+		sample,
+		"c_ruler_merge_fixture_source",
+		"c_ruler_merge_fixture_target",
+	);
+}
+
+async function createChapterUnmergeFixture(baseUrl: string, token: string): Promise<JsonSample> {
+	const sample = await sampleJSON(baseUrl, "/api/chapters/c_merge_fixture_source/unmerge", token, {
+		method: "POST",
+	});
+	return jsonSampleFromBody(
+		{ ok: sample.status === 200 && recordBody(sample.body).ok === true },
+		sample.status,
+	);
+}
+
+function chapterReviewLifecycleFixtureState(home: string): JsonSample {
+	const repoPath = chapterReviewLifecycleFixtureRepoPath(home);
+	const db = new Database(join(home, ".narrafork", "narrafork.db"));
+	try {
+		const review = db
+			.query(
+				`SELECT id, branch, worktree_path, base_branch, status, role, parent_chapter_id, review_source_chapter_id, review_status, COALESCE(head_commit_sha, '') AS head_commit_sha, COALESCE(commit_count, 0) AS commit_count
+				 FROM chapters WHERE project_id = 'p_review_lifecycle_fixture' AND role = 'review' ORDER BY created_at DESC LIMIT 1`,
+			)
+			.get() as {
+			id?: string;
+			branch?: string;
+			worktree_path?: string;
+			base_branch?: string;
+			status?: string;
+			role?: string;
+			parent_chapter_id?: string | null;
+			review_source_chapter_id?: string | null;
+			review_status?: string | null;
+			head_commit_sha?: string;
+			commit_count?: number;
+		} | null;
+		const chapterID = review?.id ?? "__missing__";
+		const branch = review?.branch ?? "";
+		const worktreePath = review?.worktree_path ?? "";
+		const branchList = branch
+			? runGitPanelFixture(repoPath, ["branch", "--list", branch], { allowFailure: true }).stdout
+			: "";
+		const repoHead = existsSync(join(repoPath, ".git")) ? gitPanelHeadCommit(repoPath) : "";
+		const narrator = db
+			.query(
+				`SELECT id, cwd, status, COALESCE(message_count, 0) AS message_count, COALESCE(system_prompt, '') AS system_prompt
+				 FROM narrators WHERE chapter_id = ? AND variant = 'primary' LIMIT 1`,
+			)
+			.get(chapterID) as {
+			id?: string;
+			cwd?: string | null;
+			status?: string;
+			message_count?: number;
+			system_prompt?: string;
+		} | null;
+		const narratorID = narrator?.id ?? "__missing__";
+		const startMessage = db
+			.query(
+				`SELECT COALESCE(content_text, '') AS content_text
+				 FROM narrator_messages WHERE narrator_id = ? AND role = 'user' ORDER BY created_at ASC LIMIT 1`,
+			)
+			.get(narratorID) as { content_text?: string } | null;
+		const systemPrompt = narrator?.system_prompt ?? "";
+		return jsonSampleFromBody({
+			projectRows: countRows(db, "projects", "id = 'p_review_lifecycle_fixture'"),
+			sourceRows: countRows(db, "chapters", "id = 'c_review_lifecycle_source'"),
+			reviewRows: countRows(
+				db,
+				"chapters",
+				"project_id = 'p_review_lifecycle_fixture' AND role = 'review'",
+			),
+			reviewEdgeRows: countRows(
+				db,
+				"chapter_edges",
+				`source_id = 'c_review_lifecycle_source' AND target_id = '${chapterID}' AND type = 'review'`,
+			),
+			narratorRows: countRows(db, "narrators", `chapter_id = '${chapterID}'`),
+			messageRows: countRows(db, "narrator_messages", `narrator_id = '${narratorID}'`),
+			messageRefRows: countRows(db, "narrator_message_refs", `narrator_id = '${narratorID}'`),
+			reviewCommitRows: countRows(db, "chapter_commits", `chapter_id = '${chapterID}'`),
+			sourceCommitRows: countRows(
+				db,
+				"chapter_commits",
+				"chapter_id = 'c_review_lifecycle_source'",
+			),
+			repoExists: existsSync(join(repoPath, ".git")),
+			branchExists: branchList.includes(branch) && branch !== "",
+			branchHasExpectedPrefix: branch.startsWith("review/review-lifecycle-fixture-"),
+			worktreeExists: worktreePath !== "" && existsSync(worktreePath),
+			worktreePathInRepo: worktreePath.startsWith(join(repoPath, ".worktrees")),
+			worktreeHasCommittedFiles:
+				worktreePath !== "" &&
+				existsSync(join(worktreePath, "tracked.txt")) &&
+				existsSync(join(worktreePath, "second.txt")),
+			worktreeHasDirtyFixtureFiles:
+				worktreePath !== "" &&
+				existsSync(join(worktreePath, "tracked.txt")) &&
+				existsSync(join(worktreePath, "untracked-review.txt")),
+			baseBranch: review?.base_branch ?? "",
+			status: review?.status ?? "",
+			role: review?.role ?? "",
+			reviewStatus: review?.review_status ?? "",
+			parentMatchesSource: review?.parent_chapter_id === "c_review_lifecycle_source",
+			reviewSourceMatchesSource: review?.review_source_chapter_id === "c_review_lifecycle_source",
+			headMatchesRepo: (review?.head_commit_sha ?? "") === repoHead,
+			commitCount: Number(review?.commit_count ?? 0),
+			narratorCwdInWorktree: narrator !== null && narrator.cwd === worktreePath,
+			narratorStatusKnown: narrator?.status === "idle" || narrator?.status === "working",
+			narratorMessageCount: Number(narrator?.message_count ?? 0),
+			systemPromptHasReviewDiff: systemPrompt.includes("Code Changes to Review"),
+			systemPromptHasDirtyDiff: systemPrompt.includes("dirty review edit"),
+			startMessagePresent: (startMessage?.content_text ?? "").toLowerCase().includes("review"),
+		});
+	} finally {
+		db.close();
+	}
+}
+
+function reviewLifecycleResponseSample(sample: JsonSample): JsonSample {
+	const body = recordBody(sample.body);
+	return jsonSampleFromBody(
+		{
+			ok: sample.status === 201 && typeof body.id === "string" && body.role === "review",
+			role: typeof body.role === "string" ? body.role : "",
+			status: typeof body.status === "string" ? body.status : "",
+			hasFallbackEnvelope:
+				typeof body.reviewRuntime === "object" || typeof body.fallbackCode === "string",
+		},
+		sample.status,
+	);
+}
+
+async function createChapterReviewLifecycleFixture(
+	baseUrl: string,
+	token: string,
+	_home: string,
+): Promise<JsonSample> {
+	const sample = await sampleJSON(
+		baseUrl,
+		"/api/chapters/c_review_lifecycle_source/review",
+		token,
+		{
+			method: "POST",
+			body: {
+				title: "Review Lifecycle Fixture",
+				locale: "en",
+				autoStart: false,
+			},
+		},
+	);
+	return reviewLifecycleResponseSample(sample);
+}
+
 async function createChapterCreateFixture(
 	baseUrl: string,
 	token: string,
@@ -1787,6 +2984,132 @@ function seededSettingsProviders(
 	};
 }
 
+function settingsProviderArrayBreadthPatch(): Record<string, unknown> {
+	return {
+		customApiProviders: [
+			{
+				id: "settings-array-open",
+				name: "Settings Array Open",
+				prefix: "settingsarrayopen",
+				apiKey: "sk-settings-array-open",
+				baseUrl: "https://settings-array-open.example.test",
+				defaultModel: "gpt-settings-array",
+				protocol: "responses-compatible",
+				defaultContextWindow: 32000,
+				codexAccountId: "acct-settings-array",
+				codexWebSocket: true,
+				codexWebSearch: false,
+				codexImageGeneration: false,
+				disabled: true,
+				__unknownProvider: "drop-me",
+			},
+			{
+				id: "settings-array-anthropic",
+				name: "Settings Array Anthropic",
+				prefix: "settingsarrayanthropic",
+				apiKey: "sk-settings-array-anthropic",
+				baseUrl: "https://settings-array-anthropic.example.test",
+				defaultModel: "claude-settings-array",
+				protocol: "anthropic-official",
+				defaultReasoningEffort: "high",
+				proxy: "http://settings-array-proxy.example.test",
+				tlsRejectUnauthorized: false,
+			},
+		],
+		nkpProviders: [
+			{
+				id: "settings-array-nkp",
+				name: "Settings Array NKP",
+				prefix: "settingsarraynkp",
+				apiKey: "settings-array-nkp-key",
+				baseUrl: "https://settings-array-nkp.example.test",
+				defaultModel: "nkp-settings-array",
+				disabled: true,
+				__unknownProvider: "drop-me",
+			},
+		],
+		nugProviders: [
+			{
+				id: "settings-array-nug",
+				name: "Settings Array NUG",
+				prefix: "settingsarraynug",
+				apiKey: "settings-array-nug-key",
+				baseUrl: "https://settings-array-nug.example.test",
+				defaultModel: "nug-settings-array",
+				nugUsername: "settings-user",
+				nugUserId: "settings-user-id",
+				oauthClientId: "settings-oauth-client",
+				oauthClientSecret: "settings-oauth-secret",
+				oauthDeviceId: "settings-device-id",
+				oauthCallbackUrl: "https://settings-array-callback.example.test",
+				disabled: true,
+				__unknownProvider: "drop-me",
+			},
+		],
+		clineProviders: [
+			{
+				id: "settings-array-cline",
+				name: "Settings Array Cline",
+				prefix: "settingsarraycline",
+				baseUrl: "https://settings-array-cline.example.test",
+				accessToken: "settings-array-cline-token",
+				defaultModel: "cline-settings-array",
+				defaultContextWindow: 64000,
+				enabledModels: ["cline/free", "cline/pro"],
+				disabled: true,
+				__unknownProvider: "drop-me",
+			},
+		],
+	};
+}
+
+function settingsPositiveTLSPatch(home: string): Record<string, unknown> {
+	const tlsDir = join(home, ".narrafork", "contract-tls");
+	mkdirSync(tlsDir, { recursive: true });
+	const certFile = join(tlsDir, "contract-cert.pem");
+	const keyFile = join(tlsDir, "contract-key.pem");
+	const caFile = join(tlsDir, "contract-ca.pem");
+	writeFileSync(certFile, "contract certificate placeholder\n", "utf-8");
+	writeFileSync(keyFile, "contract key placeholder\n", "utf-8");
+	writeFileSync(caFile, "contract ca placeholder\n", "utf-8");
+	return {
+		server: {
+			tls: {
+				enabled: true,
+				certFile,
+				keyFile,
+				caFile,
+				passphrase: "contract-passphrase",
+			},
+		},
+	};
+}
+
+function settingsProviderPrefixConflictPatch(): Record<string, unknown> {
+	return {
+		customApiProviders: [
+			{
+				id: "settings-prefix-custom",
+				name: "Settings Prefix Custom",
+				prefix: "settingsprefixdup",
+				apiKey: "sk-settings-prefix",
+				baseUrl: "https://settings-prefix.example.test",
+				defaultModel: "settings-prefix-model",
+				protocol: "responses-compatible",
+			},
+		],
+		clineProviders: [
+			{
+				id: "settings-prefix-cline",
+				name: "Settings Prefix Cline",
+				prefix: "settingsprefixdup",
+				baseUrl: "https://settings-prefix-cline.example.test",
+				defaultModel: "settings-prefix-cline-model",
+			},
+		],
+	};
+}
+
 function jsonSampleFromBody(body: unknown, status = 200): JsonSample {
 	return {
 		status,
@@ -1883,6 +3206,38 @@ function buildClineCallbackUrl(
 async function sampleAbsoluteURL(url: string): Promise<JsonSample> {
 	const res = await fetch(url);
 	return jsonSampleFromResponse(res);
+}
+
+// Wave 277: prove the storage scan -> cleanup -> cached cache-invalidation side
+// effect is identical across TypeScript and Go. After a completed scan both
+// backends must report `cached:true`; after a supported storage/database cleanup
+// both backends must drop the cached scan result back to `cached:false`.
+async function sampleStorageCacheInvalidationFlow(
+	baseUrl: string,
+	token: string,
+): Promise<Record<string, JsonSample>> {
+	await sampleSSE(baseUrl, "/api/storage/scan", token, { method: "GET" });
+	const storageCacheAfterScan = await sampleJSON(baseUrl, "/api/storage/cached", token);
+	await sampleJSON(baseUrl, "/api/storage/cleanup", token, {
+		method: "POST",
+		body: { target: "uploads" },
+	});
+	const storageCacheAfterUploadCleanup = await sampleJSON(baseUrl, "/api/storage/cached", token);
+
+	await sampleSSE(baseUrl, "/api/storage/scan", token, { method: "GET" });
+	const storageCacheAfterRescan = await sampleJSON(baseUrl, "/api/storage/cached", token);
+	await sampleJSON(baseUrl, "/api/storage/database/cleanup", token, {
+		method: "POST",
+		body: { target: "apiRequestDumps", olderThanDays: 30 },
+	});
+	const storageCacheAfterDatabaseCleanup = await sampleJSON(baseUrl, "/api/storage/cached", token);
+
+	return {
+		storageCacheAfterScan,
+		storageCacheAfterUploadCleanup,
+		storageCacheAfterRescan,
+		storageCacheAfterDatabaseCleanup,
+	};
 }
 
 async function waitClineBrowserAuthSideEffects(
@@ -2675,6 +4030,64 @@ async function collect(
 		"/api/projects/p_search_fixture/graph",
 		token,
 	);
+	const chapterBatchMergeMissingSourceRollbackStateBefore = chapterBatchMergeFixtureState(home);
+	const chapterBatchMergeMissingSourceRollback =
+		await createChapterBatchMergeMissingSourceRollbackFixture(baseUrl, token);
+	const chapterBatchMergeMissingSourceRollbackSession =
+		await waitForChapterBatchMergeFixtureSession(
+			baseUrl,
+			token,
+			String(recordBody(chapterBatchMergeMissingSourceRollback.body).mergeSessionId ?? ""),
+		);
+	const chapterBatchMergeMissingSourceRollbackStateAfter = chapterBatchMergeFixtureState(home);
+	resetChapterBatchMergeFixture(home);
+	const chapterBatchMergeCreatedTargetMissingSourceRollback =
+		await createChapterBatchMergeCreatedTargetMissingSourceRollbackFixture(baseUrl, token);
+	const chapterBatchMergeCreatedTargetMissingSourceRollbackSession =
+		await waitForChapterBatchMergeFixtureSession(
+			baseUrl,
+			token,
+			String(
+				recordBody(chapterBatchMergeCreatedTargetMissingSourceRollback.body).mergeSessionId ?? "",
+			),
+		);
+	const chapterBatchMergeCreatedTargetMissingSourceRollbackState =
+		chapterBatchMergeCreatedTargetRollbackState(
+			home,
+			String(
+				recordBody(chapterBatchMergeCreatedTargetMissingSourceRollback.body).targetChapterId ?? "",
+			),
+		);
+	resetChapterBatchMergeFixture(home);
+	const chapterBatchMergePartialSuccessMissingSourceFallback =
+		await createChapterBatchMergePartialSuccessMissingSourceFallbackFixture(baseUrl, token);
+	const chapterBatchMergePartialSuccessMissingSourceFallbackSession =
+		await waitForChapterBatchMergeFixtureSession(
+			baseUrl,
+			token,
+			String(
+				recordBody(chapterBatchMergePartialSuccessMissingSourceFallback.body).mergeSessionId ?? "",
+			),
+		);
+	const chapterBatchMergePartialSuccessMissingSourceFallbackState =
+		chapterBatchMergeFixtureState(home);
+	resetChapterBatchMergeFixture(home);
+	const chapterBatchMergeFixtureStateBefore = chapterBatchMergeFixtureState(home);
+	const chapterBatchMergeFixture = await createChapterBatchMergeFixture(baseUrl, token);
+	const chapterBatchMergeFixtureSession = await waitForChapterBatchMergeFixtureSession(
+		baseUrl,
+		token,
+		String(recordBody(chapterBatchMergeFixture.body).mergeSessionId ?? ""),
+	);
+	const chapterBatchMergeFixtureStateAfter = chapterBatchMergeFixtureState(home);
+	const rulerMergeFixtureStateBefore = rulerMergeFixtureState(home);
+	const rulerMergeFixture = await createRulerMergeFixture(baseUrl, token);
+	const rulerMergeFixtureStateAfter = rulerMergeFixtureState(home);
+	const projectGraphAfterRulerMergeFixture = await sampleJSON(
+		baseUrl,
+		"/api/projects/p_ruler_merge_fixture/graph",
+		token,
+	);
 	return {
 		json: {
 			health: await sampleJSON(baseUrl, "/api/health"),
@@ -2712,6 +4125,16 @@ async function collect(
 					nkpBaseUrl,
 					nugBaseUrl,
 				),
+			}),
+			settingsNestedUnknownPatch: await sampleJSON(baseUrl, "/api/settings", token, {
+				method: "PATCH",
+				body: {
+					server: { __unknownServer: true },
+					agent: {
+						__unknownAgent: "drop-me",
+						subagentModels: { general: "drop-me", __unknownSubagent: "drop-me" },
+					},
+				},
 			}),
 			settingsContextThresholds: await sampleJSON(
 				baseUrl,
@@ -3019,6 +4442,56 @@ async function collect(
 			projectGraphAfterChapterCreate: await sampleJSON(
 				baseUrl,
 				"/api/projects/p_chapter_create_fixture/graph",
+				token,
+			),
+			chapterReviewLifecycleFixtureStateBefore: chapterReviewLifecycleFixtureState(home),
+			chapterReviewLifecycleFixture: await createChapterReviewLifecycleFixture(
+				baseUrl,
+				token,
+				home,
+			),
+			chapterReviewLifecycleFixtureStateAfter: chapterReviewLifecycleFixtureState(home),
+			projectGraphAfterChapterReviewLifecycle: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_review_lifecycle_fixture/graph",
+				token,
+			),
+			chapterBatchMergeMissingSourceRollbackStateBefore,
+			chapterBatchMergeMissingSourceRollback,
+			chapterBatchMergeMissingSourceRollbackSession,
+			chapterBatchMergeMissingSourceRollbackStateAfter,
+			chapterBatchMergeCreatedTargetMissingSourceRollback,
+			chapterBatchMergeCreatedTargetMissingSourceRollbackSession,
+			chapterBatchMergeCreatedTargetMissingSourceRollbackState,
+			chapterBatchMergePartialSuccessMissingSourceFallback,
+			chapterBatchMergePartialSuccessMissingSourceFallbackSession,
+			chapterBatchMergePartialSuccessMissingSourceFallbackState,
+			chapterBatchMergeFixtureStateBefore,
+			chapterBatchMergeFixture,
+			chapterBatchMergeFixtureSession,
+			chapterBatchMergeFixtureStateAfter,
+			projectGraphAfterChapterBatchMergeFixture: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_batch_merge_fixture/graph",
+				token,
+			),
+			rulerMergeFixtureStateBefore,
+			rulerMergeFixture,
+			rulerMergeFixtureStateAfter,
+			projectGraphAfterRulerMergeFixture,
+			chapterMergeFixtureStateBefore: chapterMergeFixtureState(home),
+			chapterMergeFixture: await createChapterMergeFixture(baseUrl, token),
+			chapterMergeFixtureStateAfter: chapterMergeFixtureState(home),
+			projectGraphAfterChapterMergeFixture: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_merge_fixture/graph",
+				token,
+			),
+			chapterUnmergeFixture: await createChapterUnmergeFixture(baseUrl, token),
+			chapterUnmergeFixtureStateAfter: chapterMergeFixtureState(home),
+			projectGraphAfterChapterUnmergeFixture: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_merge_fixture/graph",
 				token,
 			),
 			chapterDormantWakeFixtureStateBefore: chapterDormantWakeFixtureState(home),
@@ -3575,6 +5048,23 @@ async function collect(
 				"/api/nug/providers/missing/channels/health",
 				token,
 			),
+			settingsProviderArrayBreadthPatch: await sampleJSON(baseUrl, "/api/settings", token, {
+				method: "PATCH",
+				body: settingsProviderArrayBreadthPatch(),
+			}),
+			settingsProviderPrefixConflict: await sampleJSON(baseUrl, "/api/settings", token, {
+				method: "PATCH",
+				body: settingsProviderPrefixConflictPatch(),
+			}),
+			settingsPositiveTLSPatch: await sampleJSON(baseUrl, "/api/settings", token, {
+				method: "PATCH",
+				body: settingsPositiveTLSPatch(home),
+			}),
+			settingsAfterPositiveTLSPatch: await sampleJSON(baseUrl, "/api/settings", token),
+			settingsGenerateTLS: await sampleJSON(baseUrl, "/api/settings/generate-tls", token, {
+				method: "POST",
+			}),
+			settingsAfterGenerateTLS: await sampleJSON(baseUrl, "/api/settings", token),
 			runtimeCached: await sampleJSON(baseUrl, "/api/runtime/cached", token),
 			runtimeScan: await sampleJSON(baseUrl, "/api/runtime/scan", token),
 			runtimeCleanupTerminals: await sampleJSON(baseUrl, "/api/runtime/cleanup", token, {
@@ -3592,6 +5082,19 @@ async function collect(
 				method: "POST",
 				body: {},
 			}),
+			storageCleanupUploads: await sampleJSON(baseUrl, "/api/storage/cleanup", token, {
+				method: "POST",
+				body: { target: "uploads" },
+			}),
+			storageCleanupShares: await sampleJSON(baseUrl, "/api/storage/cleanup", token, {
+				method: "POST",
+				body: { target: "shares" },
+			}),
+			storageCleanupInvalidTarget: await sampleJSON(baseUrl, "/api/storage/cleanup", token, {
+				method: "POST",
+				body: { target: "not-a-storage-target" },
+			}),
+			...(await sampleStorageCacheInvalidationFlow(baseUrl, token)),
 			userStorageCached: await sampleJSON(baseUrl, "/api/storage/cached", userToken),
 			userStorageCleanup: await sampleJSON(baseUrl, "/api/storage/cleanup", userToken, {
 				method: "POST",
@@ -3679,6 +5182,14 @@ function recordBody(value: unknown): Record<string, unknown> {
 	return value && typeof value === "object" && !Array.isArray(value)
 		? (value as Record<string, unknown>)
 		: {};
+}
+
+function parseJSONRecord(value: string): Record<string, unknown> {
+	try {
+		return recordBody(JSON.parse(value));
+	} catch {
+		return {};
+	}
 }
 
 function expectJSONStatus(
@@ -3937,7 +5448,12 @@ function expectSettingsSecretContracts(
 	sample: BackendSample,
 	diffs: string[],
 ): void {
-	for (const name of ["settings", "userSettings", "settingsMaskedProviderPatch"]) {
+	for (const name of [
+		"settings",
+		"userSettings",
+		"settingsMaskedProviderPatch",
+		"settingsNestedUnknownPatch",
+	]) {
 		expectJSONStatus(label, sample, name, 200, diffs);
 		expectSettingsAuthSecretHidden(label, sample, name, diffs);
 		if (name !== "settingsMaskedProviderPatch") {
@@ -4004,6 +5520,331 @@ function expectSettingsSecretContracts(
 			"nug-oauth-client-secret",
 			diffs,
 		);
+	}
+	expectSettingsNestedUnknownFieldsStripped(label, sample, diffs);
+	expectSettingsProviderArrayAndPrefixBreadth(label, sample, diffs);
+	expectSettingsPositiveTLSPatch(label, sample, diffs);
+}
+
+function expectProviderField(
+	label: string,
+	sample: BackendSample,
+	name: string,
+	field: string,
+	id: string,
+	key: string,
+	expected: unknown,
+	diffs: string[],
+): void {
+	const provider = findSettingsProvider(sample, name, field, id);
+	if (!provider) {
+		diffs.push(`semantic.${label}.json.${name}.${field}.missingProvider ${id}`);
+		return;
+	}
+	if (provider[key] !== expected) {
+		diffs.push(
+			`semantic.${label}.json.${name}.${field}.${id}.${key} expected ${JSON.stringify(expected)} got ${JSON.stringify(provider[key])}`,
+		);
+	}
+}
+
+function expectProviderUnknownStripped(
+	label: string,
+	sample: BackendSample,
+	name: string,
+	field: string,
+	id: string,
+	diffs: string[],
+): void {
+	const provider = findSettingsProvider(sample, name, field, id);
+	if (!provider) {
+		diffs.push(`semantic.${label}.json.${name}.${field}.missingProvider ${id}`);
+		return;
+	}
+	if (provider.__unknownProvider !== undefined) {
+		diffs.push(
+			`semantic.${label}.json.${name}.${field}.${id} retained stripped provider field ${JSON.stringify(provider.__unknownProvider)}`,
+		);
+	}
+}
+
+function expectSettingsTLSPayload(
+	label: string,
+	sample: BackendSample,
+	name: string,
+	diffs: string[],
+): void {
+	const body = recordBody(sample.json[name]?.body);
+	const server = recordBody(body.server);
+	const tls = recordBody(server.tls);
+	if (tls.enabled !== true) {
+		diffs.push(`semantic.${label}.json.${name}.server.tls.enabled expected true`);
+	}
+	for (const [key, suffix] of [
+		["certFile", "contract-cert.pem"],
+		["keyFile", "contract-key.pem"],
+		["caFile", "contract-ca.pem"],
+	] as const) {
+		const value = tls[key];
+		if (typeof value !== "string" || !value.endsWith(suffix)) {
+			diffs.push(
+				`semantic.${label}.json.${name}.server.tls.${key} expected suffix ${suffix} got ${JSON.stringify(value)}`,
+			);
+		}
+	}
+	if (tls.passphrase !== "********") {
+		diffs.push(
+			`semantic.${label}.json.${name}.server.tls.passphrase expected masked got ${JSON.stringify(tls.passphrase)}`,
+		);
+	}
+}
+
+function expectSettingsPositiveTLSPatch(
+	label: string,
+	sample: BackendSample,
+	diffs: string[],
+): void {
+	expectJSONStatus(label, sample, "settingsPositiveTLSPatch", 200, diffs);
+	expectJSONStatus(label, sample, "settingsAfterPositiveTLSPatch", 200, diffs);
+	expectJSONStatus(label, sample, "settingsGenerateTLS", 200, diffs);
+	expectJSONStatus(label, sample, "settingsAfterGenerateTLS", 200, diffs);
+	expectSettingsAuthSecretHidden(label, sample, "settingsPositiveTLSPatch", diffs);
+	const patchBody = recordBody(sample.json.settingsPositiveTLSPatch?.body);
+	if (patchBody.serverRestarting !== true) {
+		diffs.push(
+			`semantic.${label}.json.settingsPositiveTLSPatch.serverRestarting expected true got ${JSON.stringify(patchBody.serverRestarting)}`,
+		);
+	}
+	if (typeof patchBody.newUrl !== "string" || !patchBody.newUrl.startsWith("https://")) {
+		diffs.push(
+			`semantic.${label}.json.settingsPositiveTLSPatch.newUrl expected https got ${JSON.stringify(patchBody.newUrl)}`,
+		);
+	}
+	expectSettingsTLSPayload(label, sample, "settingsPositiveTLSPatch", diffs);
+	expectSettingsTLSPayload(label, sample, "settingsAfterPositiveTLSPatch", diffs);
+	expectSettingsGenerateTLS(label, sample, diffs);
+}
+
+function expectSettingsGenerateTLS(label: string, sample: BackendSample, diffs: string[]): void {
+	const body = recordBody(sample.json.settingsGenerateTLS?.body);
+	if (body.serverRestarting !== true) {
+		diffs.push(
+			`semantic.${label}.json.settingsGenerateTLS.serverRestarting expected true got ${JSON.stringify(body.serverRestarting)}`,
+		);
+	}
+	if (typeof body.newUrl !== "string" || !body.newUrl.startsWith("https://")) {
+		diffs.push(
+			`semantic.${label}.json.settingsGenerateTLS.newUrl expected https got ${JSON.stringify(body.newUrl)}`,
+		);
+	}
+	for (const [key, suffix] of [
+		["certPath", "cert.pem"],
+		["keyPath", "key.pem"],
+	] as const) {
+		const value = body[key];
+		if (typeof value !== "string" || !value.endsWith(suffix)) {
+			diffs.push(
+				`semantic.${label}.json.settingsGenerateTLS.${key} expected suffix ${suffix} got ${JSON.stringify(value)}`,
+			);
+		}
+	}
+	if (typeof body.expiresAt !== "string" || body.expiresAt === "") {
+		diffs.push(
+			`semantic.${label}.json.settingsGenerateTLS.expiresAt expected non-empty string got ${JSON.stringify(body.expiresAt)}`,
+		);
+	}
+	const after = recordBody(sample.json.settingsAfterGenerateTLS?.body);
+	const tls = recordBody(recordBody(after.server).tls);
+	if (tls.enabled !== true) {
+		diffs.push(`semantic.${label}.json.settingsAfterGenerateTLS.server.tls.enabled expected true`);
+	}
+	if (typeof tls.certFile !== "string" || !tls.certFile.endsWith("cert.pem")) {
+		diffs.push(
+			`semantic.${label}.json.settingsAfterGenerateTLS.server.tls.certFile unexpected ${JSON.stringify(tls.certFile)}`,
+		);
+	}
+	if (typeof tls.keyFile !== "string" || !tls.keyFile.endsWith("key.pem")) {
+		diffs.push(
+			`semantic.${label}.json.settingsAfterGenerateTLS.server.tls.keyFile unexpected ${JSON.stringify(tls.keyFile)}`,
+		);
+	}
+}
+
+function expectSettingsProviderArrayAndPrefixBreadth(
+	label: string,
+	sample: BackendSample,
+	diffs: string[],
+): void {
+	const name = "settingsProviderArrayBreadthPatch";
+	expectJSONStatus(label, sample, name, 200, diffs);
+	expectSettingsAuthSecretHidden(label, sample, name, diffs);
+	for (const [field, id] of [
+		["customApiProviders", "settings-array-open"],
+		["customApiProviders", "settings-array-anthropic"],
+		["openaiProviders", "settings-array-open"],
+		["anthropicProviders", "settings-array-anthropic"],
+		["nkpProviders", "settings-array-nkp"],
+		["nugProviders", "settings-array-nug"],
+		["clineProviders", "settings-array-cline"],
+	] as const) {
+		expectProviderUnknownStripped(label, sample, name, field, id, diffs);
+	}
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"customApiProviders",
+		"settings-array-open",
+		"protocol",
+		"responses-compatible",
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"customApiProviders",
+		"settings-array-open",
+		"disabled",
+		true,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"openaiProviders",
+		"settings-array-open",
+		"apiMode",
+		"responses",
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"openaiProviders",
+		"settings-array-open",
+		"defaultContextWindow",
+		32000,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"openaiProviders",
+		"settings-array-open",
+		"codexWebSocket",
+		true,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"openaiProviders",
+		"settings-array-open",
+		"codexWebSearch",
+		false,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"anthropicProviders",
+		"settings-array-anthropic",
+		"officialApi",
+		true,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"anthropicProviders",
+		"settings-array-anthropic",
+		"defaultReasoningEffort",
+		"high",
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"anthropicProviders",
+		"settings-array-anthropic",
+		"tlsRejectUnauthorized",
+		false,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"nkpProviders",
+		"settings-array-nkp",
+		"disabled",
+		true,
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"nugProviders",
+		"settings-array-nug",
+		"oauthClientSecret",
+		"********cret",
+		diffs,
+	);
+	expectProviderField(
+		label,
+		sample,
+		name,
+		"clineProviders",
+		"settings-array-cline",
+		"defaultContextWindow",
+		64000,
+		diffs,
+	);
+	const clineProvider = findSettingsProvider(
+		sample,
+		name,
+		"clineProviders",
+		"settings-array-cline",
+	);
+	if (!clineProvider || !Array.isArray(clineProvider.enabledModels)) {
+		diffs.push(
+			`semantic.${label}.json.${name}.clineProviders.settings-array-cline.enabledModels expected array`,
+		);
+	} else if (clineProvider.enabledModels.join(",") !== "cline/free,cline/pro") {
+		diffs.push(
+			`semantic.${label}.json.${name}.clineProviders.settings-array-cline.enabledModels unexpected ${JSON.stringify(clineProvider.enabledModels)}`,
+		);
+	}
+	expectJSONStatus(label, sample, "settingsProviderPrefixConflict", 400, diffs);
+}
+
+function expectSettingsNestedUnknownFieldsStripped(
+	label: string,
+	sample: BackendSample,
+	diffs: string[],
+): void {
+	expectJSONStatus(label, sample, "settingsNestedUnknownPatch", 200, diffs);
+	for (const path of [
+		["server", "__unknownServer"],
+		["agent", "__unknownAgent"],
+		["agent", "subagentModels", "general"],
+		["agent", "subagentModels", "__unknownSubagent"],
+	]) {
+		const value = valueAtPath(sample.json.settingsNestedUnknownPatch?.body, path);
+		if (value !== undefined) {
+			diffs.push(
+				`semantic.${label}.json.settingsNestedUnknownPatch.${path.join(".")} expected stripped got ${JSON.stringify(value)}`,
+			);
+		}
 	}
 }
 
@@ -4678,6 +6519,1789 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	} else if (recordBody(recordBody(createdGraphNode).data).role !== "branch") {
 		diffs.push(`semantic.${label}.json.projectGraphAfterChapterCreate.createdNodeUnexpectedRole`);
 	}
+	expectJSONStatus(label, sample, "chapterReviewLifecycleFixtureStateBefore", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateBefore",
+		"projectRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateBefore",
+		"sourceRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateBefore",
+		"reviewRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateBefore",
+		"sourceCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateBefore",
+		"repoExists",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterReviewLifecycleFixture", 201, diffs);
+	expectJSONValue(label, sample, "chapterReviewLifecycleFixture", "ok", true, diffs);
+	expectJSONValue(label, sample, "chapterReviewLifecycleFixture", "role", "review", diffs);
+	expectJSONValue(label, sample, "chapterReviewLifecycleFixture", "status", "active", diffs);
+	expectJSONStatus(label, sample, "chapterReviewLifecycleFixtureStateAfter", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"projectRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterReviewLifecycleFixtureStateAfter", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterReviewLifecycleFixtureStateAfter", "reviewRows", 1, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"reviewEdgeRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"narratorRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"reviewCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"sourceCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"branchExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"branchHasExpectedPrefix",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"worktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"worktreePathInRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"worktreeHasCommittedFiles",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"worktreeHasDirtyFixtureFiles",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"baseBranch",
+		"main",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"status",
+		"active",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"role",
+		"review",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"reviewStatus",
+		"reviewing",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"parentMatchesSource",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"reviewSourceMatchesSource",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"headMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"commitCount",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"narratorCwdInWorktree",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"narratorStatusKnown",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"systemPromptHasReviewDiff",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterReviewLifecycleFixtureStateAfter",
+		"startMessagePresent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterReviewLifecycle", 200, diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterReviewLifecycle", "nodes", diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterReviewLifecycle", "edges", diffs);
+	expectJSONStatus(label, sample, "chapterBatchMergeMissingSourceRollbackStateBefore", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateBefore",
+		"projectRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateBefore",
+		"targetRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateBefore",
+		"sourceRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateBefore",
+		"mergeSessionRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateBefore",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterBatchMergeMissingSourceRollback", 201, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollback",
+		"hasMergeSessionId",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollback",
+		"targetChapterId",
+		"c_batch_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollback",
+		"createdTarget",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollback",
+		"statusRunningOrAbsent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterBatchMergeMissingSourceRollbackSession", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"status",
+		"error",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"currentIndex",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"mergedCount",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"currentSourceCleared",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"conflictFilesCleared",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackSession",
+		"errorPresent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterBatchMergeMissingSourceRollbackStateAfter", 200, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"sourceRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"mergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"errorMergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"mergeEdgeRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetMergeCommitRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetStatus",
+		"active",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetHasSourceOneFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"targetHasSourceTwoFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"allSourcesActive",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"allSourceBranchesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"storedSourceWorktreesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeMissingSourceRollbackStateAfter",
+		"knownSourceWorktreesExist",
+		true,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollback",
+		201,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollback",
+		"hasMergeSessionId",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollback",
+		"hasTargetChapterId",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollback",
+		"createdTargetTrueOrAbsent",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollback",
+		"statusRunningOrAbsent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackSession",
+		404,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		200,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"baseTargetRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"createdTargetRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"createdTargetCommitRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"createdTargetMergeSessionRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"createdTargetErrorMergeSessionRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"createdTargetMergeEdgeRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"sourceRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"allSourcesActive",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"storedSourceWorktreesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"allSourceHeadsMatchBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"baseTargetHasSourceOneFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeCreatedTargetMissingSourceRollbackState",
+		"baseTargetHasSourceTwoFile",
+		false,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallback",
+		201,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallback",
+		"hasMergeSessionId",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallback",
+		"targetChapterId",
+		"c_batch_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallback",
+		"createdTarget",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallback",
+		"statusRunningOrAbsent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		200,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"status",
+		"error",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"currentIndex",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"mergedCount",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"currentSourceCleared",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"conflictFilesCleared",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackSession",
+		"errorPresent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		200,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"sourceRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"mergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"errorMergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"mergeEdgeRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetHasSourceOneFile",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"targetHasSourceTwoFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourcesActive",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourcesMerged",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourceBranchesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourceHeadsMatchBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourceWorktreePathsNull",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"storedSourceWorktreesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"knownSourceWorktreesExist",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourcesMergedIntoTarget",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourcesMergeStrategy",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourcePreMergeShaPresent",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergePartialSuccessMissingSourceFallbackState",
+		"allSourceMergeCommitPresent",
+		false,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterBatchMergeFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateBefore", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateBefore", "sourceRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"mergeSessionRows",
+		0,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateBefore", "mergeEdgeRows", 0, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetCommitRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"sourceCommitRows",
+		4,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetStatus",
+		"active",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetRole",
+		"trunk",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetHasSourceOneFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"targetHasSourceTwoFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"allSourcesActive",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"allSourcesMerged",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"allSourceBranchesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"allSourceHeadsMatchBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateBefore",
+		"knownSourceWorktreesExist",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterBatchMergeFixture", 201, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixture", "hasMergeSessionId", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixture",
+		"targetChapterId",
+		"c_batch_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterBatchMergeFixture", "createdTarget", false, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixture", "statusRunningOrAbsent", true, diffs);
+	expectJSONStatus(label, sample, "chapterBatchMergeFixtureSession", 200, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "idIsString", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureSession",
+		"targetChapterId",
+		"c_batch_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "status", "completed", diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "strategy", "merge", diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "currentIndex", 2, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "mergedCount", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureSession",
+		"currentSourceCleared",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureSession",
+		"conflictFilesCleared",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureSession", "errorCleared", true, diffs);
+	expectJSONStatus(label, sample, "chapterBatchMergeFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateAfter", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateAfter", "sourceRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"mergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"completedMergeSessionRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterBatchMergeFixtureStateAfter", "mergeEdgeRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetMergeCommitRows",
+		2,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"sourceCommitRows",
+		4,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetStatus",
+		"active",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetRole",
+		"trunk",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetHasSourceOneFile",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"targetHasSourceTwoFile",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourcesMerged",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourceBranchesExist",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourceHeadsMatchBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourceWorktreePathsNull",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"storedSourceWorktreesExist",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"knownSourceWorktreesExist",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourcesMergedIntoTarget",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourcesMergeStrategy",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourcePreMergeShaPresent",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterBatchMergeFixtureStateAfter",
+		"allSourceMergeCommitPresent",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterBatchMergeFixture", 200, diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterBatchMergeFixture", "nodes", diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterBatchMergeFixture", "edges", diffs);
+	expectJSONStatus(label, sample, "rulerMergeFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "mergeEdgeRows", 0, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "targetCommitRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "sourceCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "targetStatus", "active", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "targetRole", "trunk", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "targetCommitCount", 1, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"targetHasMergedFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "sourceStatus", "active", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "sourceRole", "branch", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateBefore", "sourceBranchExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"sourceHeadMatchesBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"sourceWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"sourceKnownWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateBefore",
+		"sourceMergedIntoTarget",
+		false,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "rulerMergeFixture", 200, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixture", "ok", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixture",
+		"sourceChapterId",
+		"c_ruler_merge_fixture_source",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixture",
+		"targetChapterId",
+		"c_ruler_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(label, sample, "rulerMergeFixture", "hasMergeCommitSha", true, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixture", "isFastForward", true, diffs);
+	expectJSONStatus(label, sample, "rulerMergeFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "mergeEdgeRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetMergeCommitRows", 1, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "sourceCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetStatus", "active", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetRole", "trunk", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetCommitCount", 2, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "targetHasMergedFile", true, diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "sourceStatus", "merged", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "sourceRole", "branch", diffs);
+	expectJSONValue(label, sample, "rulerMergeFixtureStateAfter", "sourceBranchExists", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceHeadMatchesBranch",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceWorktreePathNull",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceWorktreeExists",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceKnownWorktreeExists",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceMergedIntoTarget",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceMergeStrategy",
+		"merge",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"sourceMergeCommitMatchesTarget",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"preMergeTargetShaPresent",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"mergeMetadataStatus",
+		"completed",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"mergeMetadataStrategy",
+		"merge",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"rulerMergeFixtureStateAfter",
+		"mergeMetadataCommitMatchesTarget",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectGraphAfterRulerMergeFixture", 200, diffs);
+	expectJSONArray(label, sample, "projectGraphAfterRulerMergeFixture", "nodes", diffs);
+	expectJSONArray(label, sample, "projectGraphAfterRulerMergeFixture", "edges", diffs);
+	expectJSONStatus(label, sample, "chapterMergeFixtureStateBefore", 200, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "mergeEdgeRows", 0, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "targetCommitRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "sourceCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "targetStatus", "active", diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "targetRole", "trunk", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "targetCommitCount", 1, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"targetHasMergedFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "sourceStatus", "active", diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateBefore", "sourceRole", "branch", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"sourceBranchExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"sourceHeadMatchesBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"sourceWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"sourceKnownWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateBefore",
+		"sourceMergedIntoTarget",
+		false,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "chapterMergeFixture", 200, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixture", "ok", true, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixture",
+		"sourceChapterId",
+		"c_merge_fixture_source",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixture",
+		"targetChapterId",
+		"c_merge_fixture_target",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixture", "hasMergeCommitSha", true, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixture", "isFastForward", true, diffs);
+	expectJSONStatus(label, sample, "chapterMergeFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "mergeEdgeRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "targetCommitRows", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"targetMergeCommitRows",
+		1,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "sourceCommitRows", 2, diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "targetStatus", "active", diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "targetRole", "trunk", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"targetHeadMatchesRepo",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "targetCommitCount", 2, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"targetHasMergedFile",
+		true,
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "sourceStatus", "merged", diffs);
+	expectJSONValue(label, sample, "chapterMergeFixtureStateAfter", "sourceRole", "branch", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceBranchExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceHeadMatchesBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceWorktreePathNull",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceWorktreeExists",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceKnownWorktreeExists",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceMergedIntoTarget",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceMergeStrategy",
+		"merge",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"sourceMergeCommitMatchesTarget",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"preMergeTargetShaPresent",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"mergeMetadataStatus",
+		"completed",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"mergeMetadataStrategy",
+		"merge",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterMergeFixtureStateAfter",
+		"mergeMetadataCommitMatchesTarget",
+		true,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterMergeFixture", 200, diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterMergeFixture", "nodes", diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterMergeFixture", "edges", diffs);
+	expectJSONStatus(label, sample, "chapterUnmergeFixture", 200, diffs);
+	expectJSONValue(label, sample, "chapterUnmergeFixture", "ok", true, diffs);
+	expectJSONStatus(label, sample, "chapterUnmergeFixtureStateAfter", 200, diffs);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "projectRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "targetRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "sourceRows", 1, diffs);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "mergeEdgeRows", 0, diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"targetStatus",
+		"active",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "targetRole", "trunk", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"targetWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"targetHasMergedFile",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceStatus",
+		"active",
+		diffs,
+	);
+	expectJSONValue(label, sample, "chapterUnmergeFixtureStateAfter", "sourceRole", "branch", diffs);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceBranchExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceHeadMatchesBranch",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceWorktreePathNull",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceKnownWorktreeExists",
+		true,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceMergedIntoTarget",
+		false,
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"sourceMergeStrategy",
+		"",
+		diffs,
+	);
+	expectJSONValue(
+		label,
+		sample,
+		"chapterUnmergeFixtureStateAfter",
+		"preMergeTargetShaPresent",
+		false,
+		diffs,
+	);
+	expectJSONStatus(label, sample, "projectGraphAfterChapterUnmergeFixture", 200, diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterUnmergeFixture", "nodes", diffs);
+	expectJSONArray(label, sample, "projectGraphAfterChapterUnmergeFixture", "edges", diffs);
 	expectJSONStatus(label, sample, "chapterDormantWakeFixtureStateBefore", 200, diffs);
 	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "projectRows", 1, diffs);
 	expectJSONValue(label, sample, "chapterDormantWakeFixtureStateBefore", "chapterRows", 1, diffs);
@@ -6591,6 +10215,16 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	expectJSONValue(label, sample, "storageCached", "cached", false, diffs);
 	expectJSONStatus(label, sample, "storageVacuum", 409, diffs);
 	expectJSONValue(label, sample, "storageVacuum", "vacuumRan", false, diffs);
+	for (const name of ["storageCleanupUploads", "storageCleanupShares"]) {
+		expectJSONStatus(label, sample, name, 200, diffs);
+		expectJSONValue(label, sample, name, "ok", true, diffs);
+	}
+	expectJSONStatus(label, sample, "storageCleanupInvalidTarget", 400, diffs);
+	// Wave 277: scan populates the cache, supported upload/database cleanup invalidates it.
+	expectJSONValue(label, sample, "storageCacheAfterScan", "cached", true, diffs);
+	expectJSONValue(label, sample, "storageCacheAfterUploadCleanup", "cached", false, diffs);
+	expectJSONValue(label, sample, "storageCacheAfterRescan", "cached", true, diffs);
+	expectJSONValue(label, sample, "storageCacheAfterDatabaseCleanup", "cached", false, diffs);
 	for (const name of ["userStorageCached", "userStorageCleanup", "userStorageVacuum"]) {
 		expectJSONStatus(label, sample, name, 403, diffs);
 	}
@@ -6821,6 +10455,10 @@ async function main() {
 		seedSearchFixture(home);
 		resetProjectCreateFixture(home);
 		resetChapterCreateFixture(home);
+		resetChapterReviewLifecycleFixture(home);
+		resetChapterBatchMergeFixture(home);
+		resetChapterMergeFixture(home);
+		resetRulerMergeFixture(home);
 		resetChapterDormantWakeFixture(home);
 		seedProjectRealCleanupWarningFixture(home);
 		seedProjectDeleteFixture(home);
@@ -6837,13 +10475,18 @@ async function main() {
 		);
 		await stopProcess(tsProc);
 		tsProc = undefined;
-		seedClineModelCacheFixture(home);
+		resetPrestartProviderFixturesPreservingAuth(home);
 		seedChapterDeleteFixture(home);
 		resetProjectCreateFixture(home);
 		resetChapterCreateFixture(home);
+		resetChapterReviewLifecycleFixture(home);
+		resetChapterBatchMergeFixture(home);
+		resetChapterMergeFixture(home);
+		resetRulerMergeFixture(home);
 		resetChapterDormantWakeFixture(home);
 		seedProjectRealCleanupWarningFixture(home);
 		seedProjectDeleteFixture(home);
+		seedUploadServeFixture(home);
 
 		const goBinary = await buildGoBinary(home);
 		goProc = spawnGo(home, goPort, goBinary, providerFixture.url);
@@ -6856,6 +10499,14 @@ async function main() {
 				`${err instanceof Error ? err.message : String(err)}\nGo stdout:\n${logs.stdout}\nGo stderr:\n${logs.stderr}`,
 			);
 		}
+		await seedSettingsSecrets(
+			goUrl,
+			token,
+			openAIBaseUrl,
+			anthropicBaseUrl,
+			nkpBaseUrl,
+			nugBaseUrl,
+		);
 		const go = await collect(
 			goUrl,
 			token,

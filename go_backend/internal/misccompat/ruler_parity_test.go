@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	_ "modernc.org/sqlite"
+	gitx "narrafork-go/internal/git"
 )
 
 func TestRunCompatGitLimitsOutput(t *testing.T) {
@@ -170,6 +172,195 @@ func TestRulerPositionsValidateRequiredFieldsAndPersistPanelSize(t *testing.T) {
 	}
 }
 
+func TestRulerMergedBranchDeletionUsesProjectGitPathAndSourceBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	sqlDB := newRulerParityTestDB(t)
+	repo := newRulerBranchDeletionRepo(t)
+	if _, err := sqlDB.Exec(`UPDATE projects SET git_path = ? WHERE id = 'p1'`, repo); err != nil {
+		t.Fatalf("set project git path: %v", err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE chapters SET branch = 'ruler-merged-source' WHERE id = 'c1'`); err != nil {
+		t.Fatalf("set source branch: %v", err)
+	}
+
+	h := NewHandler(sqlDB, gitx.NewService())
+	h.deleteRulerMergedBranch(context.Background(), "p1", "c1")
+
+	branches := runRulerParityGit(t, repo, "branch", "--list", "ruler-merged-source")
+	if strings.TrimSpace(branches) != "" {
+		t.Fatalf("ruler source branch should be deleted, got branches: %q", branches)
+	}
+	mainBranch := strings.TrimSpace(runRulerParityGit(t, repo, "branch", "--list", "main"))
+	if !strings.Contains(mainBranch, "main") {
+		t.Fatalf("main branch should remain after source deletion, got %q", mainBranch)
+	}
+}
+
+func TestRulerMergeRootDirtyCheckRejectsDirtyTrunkWorktree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skipf("git not available: %v", err)
+	}
+	sqlDB := newRulerParityTestDB(t)
+	repo := newRulerBranchDeletionRepo(t)
+	if _, err := sqlDB.Exec(`UPDATE projects SET git_path = ? WHERE id = 'p1'`, repo); err != nil {
+		t.Fatalf("set project git path: %v", err)
+	}
+	if _, err := sqlDB.Exec(`UPDATE chapters SET worktree_path = ? WHERE id = 'root'`, repo); err != nil {
+		t.Fatalf("set root worktree path: %v", err)
+	}
+
+	h := NewHandler(sqlDB, gitx.NewService())
+	if err := h.ensureRootWorktreeClean(context.Background(), "p1", "MERGE_DIRTY_TRUNK"); err != nil {
+		t.Fatalf("clean root worktree should pass dirty check: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty trunk\n"), 0o644); err != nil {
+		t.Fatalf("write dirty file: %v", err)
+	}
+	err := h.ensureRootWorktreeClean(context.Background(), "p1", "MERGE_DIRTY_TRUNK")
+	if err == nil || !strings.Contains(err.Error(), "MERGE_DIRTY_TRUNK") {
+		t.Fatalf("dirty root worktree should return MERGE_DIRTY_TRUNK, got %v", err)
+	}
+}
+
+func TestRulerMergeAIResolveResponsesExposeFallbackContract(t *testing.T) {
+	mergeResult := map[string]any{"conflictFiles": []any{"app.ts"}}
+	aiResult := map[string]any{
+		"resolved":             false,
+		"error":                "provider unavailable",
+		"remainingFiles":       []any{"app.ts"},
+		"mode":                 "one-shot-basic-fallback",
+		"fallbackCode":         "merge.aiResolveOneShotBasic",
+		"fallbacks":            []any{map[string]any{"feature": "merge.aiResolveOneShotBasic"}},
+		"usesNarratorSession":  false,
+		"requiresFullNarrator": false,
+	}
+
+	conflictResponse := rulerAIResolveConflictResponse(mergeResult, aiResult)
+	if conflictResponse["success"] != false || conflictResponse["aiAttempted"] != true {
+		t.Fatalf("unexpected conflict response base fields: %#v", conflictResponse)
+	}
+	for _, key := range []string{"mode", "fallbackCode", "fallbacks", "usesNarratorSession", "requiresFullNarrator"} {
+		if _, ok := conflictResponse[key]; !ok {
+			t.Fatalf("conflict response should preserve AIResolve fallback contract key %q: %#v", key, conflictResponse)
+		}
+	}
+	if conflictResponse["tempChapterAIConflictResolution"] != false || conflictResponse["tempChapterAIFallbackContract"] != true || conflictResponse["tempChapterAIConflictResolutionMode"] != "unsupported-one-shot-fallback" || conflictResponse["tempChapterAIFallbackCode"] != "merge.aiResolveOneShotBasic" || conflictResponse["tempChapterAIRequiresNarrator"] != false || conflictResponse["tempChapterPreserved"] != false {
+		t.Fatalf("Go Ruler AI fallback must explicitly expose temp-chapter fallback fields: %#v", conflictResponse)
+	}
+
+	successAIResult := map[string]any{
+		"resolved":             true,
+		"mergeResult":          map[string]any{"commitSha": "abc123"},
+		"mode":                 "one-shot-basic-fallback",
+		"usesNarratorSession":  false,
+		"requiresFullNarrator": false,
+		"transcriptPersisted":  true,
+		"transcriptMode":       "one-shot-basic-fallback",
+	}
+	successResponse := rulerAIResolveSuccessResponse(mergeResult, successAIResult)
+	if successResponse["success"] != true || successResponse["aiResolved"] != true || successResponse["commitSha"] != "abc123" {
+		t.Fatalf("unexpected success response base fields: %#v", successResponse)
+	}
+	for _, key := range []string{"mode", "usesNarratorSession", "requiresFullNarrator", "transcriptPersisted", "transcriptMode"} {
+		if _, ok := successResponse[key]; !ok {
+			t.Fatalf("success response should preserve AIResolve fallback contract key %q: %#v", key, successResponse)
+		}
+	}
+	if successResponse["tempChapterAIConflictResolution"] != false || successResponse["tempChapterAIFallbackContract"] != true || successResponse["tempChapterAIConflictResolutionMode"] != "unsupported-one-shot-fallback" || successResponse["tempChapterAIFallbackCode"] != "merge.aiResolveOneShotBasic" || successResponse["tempChapterAIRequiresNarrator"] != false || successResponse["tempChapterPreserved"] != false {
+		t.Fatalf("Go Ruler AI success fallback must explicitly expose temp-chapter fallback fields: %#v", successResponse)
+	}
+}
+
+func TestRulerRebaseConflictPromptMatchesTypeScriptLocaleContract(t *testing.T) {
+	conflictFiles := []gitx.ConflictFile{
+		{File: "src/app.ts", ConflictLines: 2},
+		{File: "README.md", ConflictLines: 1},
+	}
+
+	expectedEnglish := `A git rebase onto "main" has produced conflicts in the following files:
+
+  - src/app.ts (2 conflict(s))
+  - README.md (1 conflict(s))
+
+Please resolve all rebase conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Edit the file to produce the correct result, removing all conflict markers
+3. Make sure the resolved code compiles and makes sense
+
+After resolving ALL conflicts in the current step, run:
+  git add -A && git -c core.editor=true rebase --continue
+
+If rebase --continue produces new conflicts (from a subsequent commit), repeat the process: resolve the new conflicts, then run git add -A && git -c core.editor=true rebase --continue again. Keep going until the rebase is fully complete.
+
+Do NOT run git rebase --abort.`
+	if got := rebaseConflictPrompt("main", conflictFiles, "en"); got != expectedEnglish {
+		t.Fatalf("english rebase conflict prompt mismatch:\n%s", got)
+	}
+
+	expectedChinese := `在变基到 "main" 时，以下文件产生了冲突：
+
+  - src/app.ts (2 conflict(s))
+  - README.md (1 conflict(s))
+
+请解决这些文件中的所有变基冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 编辑文件以生成正确的结果，移除所有冲突标记
+3. 确保解决后的代码可以编译且逻辑正确
+
+解决完当前步骤的所有冲突后，运行：
+  git add -A && git -c core.editor=true rebase --continue
+
+如果 rebase --continue 产生了新的冲突（来自后续的 commit），请重复此过程：解决新冲突，然后再次运行 git add -A && git -c core.editor=true rebase --continue。持续进行直到变基完全完成。
+
+不要运行 git rebase --abort。`
+	if got := rebaseConflictPrompt("main", conflictFiles, "zh-CN"); got != expectedChinese {
+		t.Fatalf("chinese rebase conflict prompt mismatch:\n%s", got)
+	}
+
+	sqlDB := newRulerParityTestDB(t)
+	if got := NewHandler(sqlDB).userLanguage(context.Background(), "missing-user"); got != "en" {
+		t.Fatalf("missing user preferences should fall back to en, got %q", got)
+	}
+	if _, err := sqlDB.Exec(`CREATE TABLE user_preferences (id TEXT PRIMARY KEY, user_id TEXT, language TEXT)`); err != nil {
+		t.Fatalf("create user preferences: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO user_preferences (id, user_id, language) VALUES ('pref-1', 'user-1', 'zh-CN')`); err != nil {
+		t.Fatalf("insert user language: %v", err)
+	}
+	if got := NewHandler(sqlDB).userLanguage(context.Background(), "user-1"); got != "zh-CN" {
+		t.Fatalf("user language = %q, want zh-CN", got)
+	}
+}
+
+func newRulerBranchDeletionRepo(t *testing.T) string {
+	t.Helper()
+	repo := t.TempDir()
+	runRulerParityGit(t, repo, "init")
+	runRulerParityGit(t, repo, "config", "user.email", "ruler@example.test")
+	runRulerParityGit(t, repo, "config", "user.name", "Ruler Test")
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("ruler base\n"), 0o644); err != nil {
+		t.Fatalf("write base file: %v", err)
+	}
+	runRulerParityGit(t, repo, "add", "base.txt")
+	runRulerParityGit(t, repo, "commit", "-m", "seed ruler branch deletion")
+	runRulerParityGit(t, repo, "branch", "-M", "main")
+	runRulerParityGit(t, repo, "branch", "ruler-merged-source")
+	return repo
+}
+
+func runRulerParityGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return strings.TrimSpace(string(output))
+}
+
 func serveRulerParityJSON(t *testing.T, h *Handler, path string) map[string]any {
 	t.Helper()
 	w := serveRulerParityRaw(t, h, http.MethodGet, path, "")
@@ -216,6 +407,7 @@ func newRulerParityTestDB(t *testing.T) *sql.DB {
 			title TEXT,
 			status TEXT,
 			branch TEXT,
+			worktree_path TEXT,
 			role TEXT,
 			parent_chapter_id TEXT,
 			start_commit_sha TEXT,

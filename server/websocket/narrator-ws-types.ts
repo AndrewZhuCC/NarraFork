@@ -296,6 +296,11 @@ export type NarratorServerMessage =
 			id: string;
 			status: "in_progress" | "generating" | "completed";
 			revisedPrompt?: string;
+			partialImageIndex?: number;
+			partialSavedPath?: string;
+			savedPath?: string;
+			width?: number;
+			height?: number;
 			outputIndex?: number;
 			parentToolUseId?: string;
 	  }
@@ -477,6 +482,11 @@ export type NarratorServerMessage =
 						status: string;
 						revisedPrompt?: string;
 						result?: string;
+						partialImageIndex?: number;
+						partialSavedPath?: string;
+						savedPath?: string;
+						width?: number;
+						height?: number;
 						outputIndex?: number;
 				  }
 				| { type: "text"; text: string; outputIndex?: number }

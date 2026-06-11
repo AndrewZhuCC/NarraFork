@@ -65,6 +65,59 @@ func TestGetSettingsIncludesTSOptionalProviderArraysWithoutPersistingDefaults(t 
 	}
 }
 
+func TestPatchSettingsIncludesAugmentedResponseShape(t *testing.T) {
+	store := newTestStore(t)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve test home: %v", err)
+	}
+	dataDir := filepath.Join(home, ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "custom-api-quotas.json"), []byte(`{"provider":{"quotaBalance":"$42.50","detailedQuotaBalance":"42.50 credits","fetchedAt":1700000000000}}`), 0o600); err != nil {
+		t.Fatalf("write custom api quota cache: %v", err)
+	}
+
+	h := &Handler{Store: store}
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(`{"agent":{"summaryModel":"kiro:claude-haiku-4.5"}}`)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch settings returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode settings response: %v", err)
+	}
+	for _, key := range []string{
+		"anthropicModelsGrouped",
+		"builtinModelContextWindows",
+		"clineModelsGrouped",
+		"codexAvailable",
+		"codexModels",
+		"customApiQuotas",
+		"kiroModels",
+		"lanAddresses",
+		"nkpModelsGrouped",
+		"nkpQuotas",
+		"nugModelsGrouped",
+		"openaiModels",
+		"openaiModelsGrouped",
+		"summaryModelAvailable",
+	} {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("PATCH response missing TS-compatible augmented key %s in %#v", key, body)
+		}
+	}
+	if _, persisted := store.Raw()["customApiQuotas"]; persisted {
+		t.Fatalf("augmented response keys should not be persisted into settings")
+	}
+}
+
 func TestGetSettingsIncludesCustomApiQuotaCacheShape(t *testing.T) {
 	store := newTestStore(t)
 	home, err := os.UserHomeDir()
@@ -637,7 +690,6 @@ func TestPatchRejectsInvalidAgentModelSelectionSettings(t *testing.T) {
 		{payload: `{"agent":{"disabledProviders":"openai"}}`, field: "agent.disabledProviders"},
 		{payload: `{"agent":{"modelContextWindows":{"openai:gpt":0}}}`, field: "agent.modelContextWindows.openai:gpt"},
 		{payload: `{"agent":{"subagentModels":{"explore":1}}}`, field: "agent.subagentModels.explore"},
-		{payload: `{"agent":{"subagentModels":{"general":"openai:gpt"}}}`, field: "agent.subagentModels.general"},
 		{payload: `{"agent":{"subagentAllowedModels":{"general":[1]}}}`, field: "agent.subagentAllowedModels.general[0]"},
 	}
 	for _, tc := range cases {
@@ -862,6 +914,65 @@ func TestPatchRejectsUnknownTopLevelSettingsFields(t *testing.T) {
 	}
 }
 
+func TestPatchStripsNestedUnknownSettingsFieldsLikeTypeScript(t *testing.T) {
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+	payload := []byte(`{
+		"server":{"__unknownServer":true},
+		"agent":{
+			"__unknownAgent":"drop-me",
+			"subagentModels":{"explore":"fixture-explore","general":"drop-me","__unknownSubagent":"drop-me"},
+			"webFetchPolicy":{"allowAll":true,"__unknownPolicy":"drop-me"}
+		},
+		"customApiProviders":[{
+			"id":"custom-strip","name":"Custom Strip","prefix":"strip","apiKey":"sk-strip",
+			"baseUrl":"https://strip.example.test","defaultModel":"strip-model",
+			"protocol":"responses-compatible","__unknownProvider":"drop-me"
+		}]
+	}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch settings returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, doc := range []struct {
+		name string
+		root map[string]any
+	}{
+		{name: "response", root: body},
+		{name: "persisted", root: store.Raw()},
+	} {
+		for _, path := range []string{
+			"server.__unknownServer",
+			"agent.__unknownAgent",
+			"agent.subagentModels.__unknownSubagent",
+			"agent.subagentModels.general",
+			"agent.webFetchPolicy.__unknownPolicy",
+		} {
+			if value, ok := bunFinalSettingsLookupPath(doc.root, path); ok {
+				t.Fatalf("%s retained TS-stripped nested unknown path %s=%#v in %#v", doc.name, path, value, doc.root)
+			}
+		}
+		providers := anySlice(doc.root["customApiProviders"])
+		if len(providers) != 1 {
+			t.Fatalf("%s customApiProviders length = %d, want 1", doc.name, len(providers))
+		}
+		provider, _ := providers[0].(map[string]any)
+		if value, ok := provider["__unknownProvider"]; ok {
+			t.Fatalf("%s retained TS-stripped provider unknown field: %#v in %#v", doc.name, value, provider)
+		}
+	}
+}
+
 func TestPatchRejectsInvalidProviderArrays(t *testing.T) {
 	cases := []struct {
 		payload string
@@ -994,6 +1105,130 @@ func TestPatchRejectsProviderPrefixConflicts(t *testing.T) {
 		}
 		if appErr.Code != "VALIDATION_ERROR" || !strings.Contains(appErr.Message, tc.field) {
 			t.Fatalf("unexpected validation error for %s: %#v", tc.payload, appErr)
+		}
+	}
+}
+
+func TestPatchProviderArraysAndPrefixBreadthLikeTypeScript(t *testing.T) {
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+	payload := []byte(`{
+		"customApiProviders":[
+			{
+				"id":"wave269-open","name":"Wave269 Open","prefix":"wave269open",
+				"apiKey":"sk-open","baseUrl":"https://open.wave269.test","defaultModel":"gpt-wave269",
+				"protocol":"responses-compatible","defaultContextWindow":32000,
+				"codexAccountId":"acct-wave269","codexWebSocket":true,
+				"codexWebSearch":false,"codexImageGeneration":false,"disabled":true,
+				"__unknownProvider":"drop-me"
+			},
+			{
+				"id":"wave269-anth","name":"Wave269 Anth","prefix":"wave269anth",
+				"apiKey":"sk-anth","baseUrl":"https://anth.wave269.test","defaultModel":"claude-wave269",
+				"protocol":"anthropic-official","defaultReasoningEffort":"high",
+				"proxy":"http://proxy.wave269.test","tlsRejectUnauthorized":false
+			}
+		],
+		"nkpProviders":[{
+			"id":"wave269-nkp","name":"Wave269 NKP","prefix":"wave269nkp",
+			"apiKey":"nkp-key","baseUrl":"https://nkp.wave269.test","defaultModel":"nkp-wave269",
+			"disabled":true,"__unknownProvider":"drop-me"
+		}],
+		"nugProviders":[{
+			"id":"wave269-nug","name":"Wave269 NUG","prefix":"wave269nug",
+			"apiKey":"nug-key","baseUrl":"https://nug.wave269.test","defaultModel":"nug-wave269",
+			"nugUsername":"wave-user","nugUserId":"wave-user-id","oauthClientId":"oauth-id",
+			"oauthClientSecret":"oauth-secret","oauthDeviceId":"device-id","oauthCallbackUrl":"https://callback.wave269.test",
+			"disabled":true,"__unknownProvider":"drop-me"
+		}],
+		"clineProviders":[{
+			"id":"wave269-cline","name":"Wave269 Cline","prefix":"wave269cline",
+			"baseUrl":"https://cline.wave269.test","accessToken":"cline-token","defaultModel":"cline-wave269",
+			"defaultContextWindow":64000,"enabledModels":["cline/free","cline/pro"],
+			"disabled":true,"__unknownProvider":"drop-me"
+		}]
+	}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch provider array breadth returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	raw := store.Raw()
+	customProviders := anySlice(raw["customApiProviders"])
+	if len(customProviders) != 2 {
+		t.Fatalf("expected two custom providers, got %#v", customProviders)
+	}
+	customOpen, _ := customProviders[0].(map[string]any)
+	if customOpen["__unknownProvider"] != nil || customOpen["protocol"] != "responses-compatible" || customOpen["disabled"] != true {
+		t.Fatalf("unexpected custom OpenAI provider shape: %#v", customOpen)
+	}
+	openaiProviders := anySlice(raw["openaiProviders"])
+	if len(openaiProviders) != 1 {
+		t.Fatalf("expected one derived OpenAI provider, got %#v", openaiProviders)
+	}
+	openai, _ := openaiProviders[0].(map[string]any)
+	if openai["id"] != "wave269-open" || openai["apiMode"] != "responses" || openai["disabled"] != true || openai["codexWebSearch"] != false || intSetting(openai["defaultContextWindow"], 0) != 32000 {
+		t.Fatalf("unexpected derived OpenAI provider: %#v", openai)
+	}
+	anthropicProviders := anySlice(raw["anthropicProviders"])
+	if len(anthropicProviders) != 1 {
+		t.Fatalf("expected one derived Anthropic provider, got %#v", anthropicProviders)
+	}
+	anthropic, _ := anthropicProviders[0].(map[string]any)
+	if anthropic["id"] != "wave269-anth" || anthropic["officialApi"] != true || anthropic["defaultReasoningEffort"] != "high" || anthropic["tlsRejectUnauthorized"] != false {
+		t.Fatalf("unexpected derived Anthropic provider: %#v", anthropic)
+	}
+	for _, tc := range []struct {
+		field string
+		id    string
+	}{
+		{field: "nkpProviders", id: "wave269-nkp"},
+		{field: "nugProviders", id: "wave269-nug"},
+		{field: "clineProviders", id: "wave269-cline"},
+	} {
+		items := anySlice(raw[tc.field])
+		if len(items) != 1 {
+			t.Fatalf("expected one %s item, got %#v", tc.field, items)
+		}
+		provider, _ := items[0].(map[string]any)
+		if provider["id"] != tc.id || provider["__unknownProvider"] != nil || provider["disabled"] != true {
+			t.Fatalf("unexpected %s provider shape: %#v", tc.field, provider)
+		}
+	}
+
+	conflictCases := []struct {
+		payload string
+		field   string
+	}{
+		{
+			payload: `{"nkpProviders":[{"id":"n1","name":"NKP","prefix":"codex","apiKey":"sk","baseUrl":"https://api.nkp.test","defaultModel":"model"}]}`,
+			field:   `Provider prefix "codex" is reserved`,
+		},
+		{
+			payload: `{"nugProviders":[{"id":"n1","name":"NUG","prefix":"dup269","apiKey":"sk","baseUrl":"https://api.nug.test","defaultModel":"model"}],"clineProviders":[{"id":"c1","name":"Cline","prefix":"dup269","baseUrl":"https://api.cline.test","defaultModel":"model"}]}`,
+			field:   `Duplicate provider prefix "dup269"`,
+		},
+		{
+			payload: `{"customApiProviders":[{"id":"c1","name":"Custom","prefix":"dup-custom-269","apiKey":"sk","baseUrl":"https://api.example.test","defaultModel":"model","protocol":"responses-compatible"}],"clineProviders":[{"id":"cl1","name":"Cline","prefix":"dup-custom-269","baseUrl":"https://api.cline.test","defaultModel":"model"}]}`,
+			field:   `Duplicate provider prefix "dup-custom-269"`,
+		},
+	}
+	for _, tc := range conflictCases {
+		req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(tc.payload)))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		err := h.patch(w, req)
+		var appErr *httpx.AppError
+		if !errors.As(err, &appErr) {
+			t.Fatalf("expected app error for %s, got %T %v", tc.payload, err, err)
+		}
+		if appErr.Code != "VALIDATION_ERROR" || !strings.Contains(appErr.Message, tc.field) {
+			t.Fatalf("unexpected provider prefix validation error for %s: %#v", tc.payload, appErr)
 		}
 	}
 }

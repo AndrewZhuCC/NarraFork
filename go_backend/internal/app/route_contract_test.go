@@ -832,7 +832,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"search", "metadataContract"}, map[string]any{"requestedEntitiesSorted": true, "shortQueryNotDegraded": true})
 	assertStringSliceCapability(t, caps, []string{"search", "fallbackContract"}, "fields", []string{"entity", "from", "to", "reason", "error", "fallbackError"})
 	assertNestedCapability(t, caps, []string{"search", "fallbackContract"}, map[string]any{"ftsUnavailableReason": "fts_unavailable", "fromFTS5ToLike": true, "reasonErrorMessage": true, "topLevelFallbackMirror": true})
-	assertNestedCapability(t, caps, []string{"search", "rankingContract"}, map[string]any{"ftsRankToPositiveScore": true, "stableSortByScoreThenTimestamp": true, "limitCapsResults": true})
+	assertNestedCapability(t, caps, []string{"search", "rankingContract"}, map[string]any{"ftsRankToPositiveScore": true, "rawFTSRankTieBreakWithinType": true, "stableSortByScoreThenTimestamp": false, "stableSortByScoreRankThenTimestamp": true, "limitCapsResults": true})
 	assertNestedCapability(t, caps, []string{"search", "smokeContract"}, map[string]any{
 		"tsGoContractHarness":               "go_backend/testtools/ts-go-api-contract-diff.ts",
 		"baselineFixtureCoverage":           "minimal-ts-created-cjk-short-query-large-relevance",
@@ -923,6 +923,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"invalid-entity-empty-result",
 		"explicit-like-fallback-metadata",
 		"large-ts-created-auroraanchor-multi-entity-top-k-order",
+		"large-ts-created-auroraanchor-same-type-raw-rank-tie-breaker",
 		"chrononeedle-timestamp-tie-breaker",
 		"large-missing-fts-no-5xx-degraded-fallback",
 		"large-corrupt-fts-no-5xx-degraded-fallback",
@@ -1250,6 +1251,9 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"ci-release-gate-wiring",
 	})
 	assertStringSliceCapability(t, caps, []string{"contractHarness"}, "sampledSurfaceGroups", []string{"health/auth/projects/settings/search/update-check", "protected-route-auth-boundaries", "provider-settings-and-local-fixture-flows", "storage-runtime-benchmark-admin-boundaries", "update-ui-json-and-download-sse", "routines-skills-hooks-mcp-ui", "user-preferences-and-favorites"})
+	assertNestedCapability(t, caps, []string{"storage", "cleanup", "responseContract"}, map[string]any{"uploadShareCleanupTSGoSmoke": true, "invalidTargetTSGoSmoke": true, "emptyDirectoryResponseIsStable": true, "successInvalidatesStorageCache": true})
+	assertNestedCapability(t, caps, []string{"storage", "replacementContract"}, map[string]any{"uploadShareCleanupTSGoSmoke": true, "cleanupInvalidTargetTSGoSmoke": true, "supportedCleanupCacheInvalidation": true, "databaseCleanupCacheInvalidation": true, "fullTSStorageCleanupParity": false, "replacementSafe": false})
+	assertStringSliceCapability(t, caps, []string{"storage", "replacementContract"}, "sampledProofs", []string{"storage-scan-sse-order-contract", "regular-user-admin-boundary-probes", "storage-worktree-container-unsupported-fallback-fixture", "storage-database-vacuum-disabled-fixture", "upload-share-cleanup-route-contract", "ts-go-storage-upload-share-cleanup-smoke", "ts-go-storage-cleanup-invalid-target-smoke", "storage-cleanup-cache-invalidation-smoke", "storage-database-cleanup-cache-invalidation-smoke", "ts-go-storage-cache-invalidation-flow-smoke"})
 	assertStringSliceCapability(t, caps, []string{"contractHarness"}, "unsampledCriticalGroups", []string{"full-route-inventory", "browser-frontend-e2e", "live-external-provider-credentials", "real-podman-runtime-side-effects", "large-db-search-relevance", "long-running-narrator-provider-sessions"})
 	assertStringSliceCapability(t, caps, []string{"contractHarness"}, "safetyAssertions", []string{"status-code-content-type-required-fields", "auth-admin-boundaries", "fallback-success-not-parity", "no-raw-secret-exposure", "manual-or-disabled-runtime-actions-remain-gated"})
 	assertNestedCapability(t, caps, []string{"releasePackaging"}, map[string]any{"mode": "go-beta-opt-in", "buildInfo": "ldflags-or-env", "frontend": "sidecar-directory-or-env", "changelog": "sidecar-directory-or-env", "singleFileEmbedded": false, "fullReplacementReady": false})
@@ -1639,17 +1643,27 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "routes"}, map[string]any{"start": true, "session": true})
 	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "response"}, map[string]any{"mergeSessionId": true, "targetChapterId": true, "createdTarget": true, "status": true})
 	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract"}, map[string]any{
-		"boundaryTracked":             true,
-		"routeFocusedSmoke":           true,
-		"tsGoEndToEndSmoke":           false,
-		"reconnectDecisionSmoke":      false,
-		"conflictContinueCancelSmoke": false,
-		"aiResolutionFailureSmoke":    false,
-		"dbGitRollbackTSGoSmoke":      false,
-		"projectDBSyncSmoke":          false,
-		"frontendProgressUISmoke":     false,
-		"browserNoCrashSmoke":         false,
-		"replacementSafe":             false,
+		"boundaryTracked":                              true,
+		"routeFocusedSmoke":                            true,
+		"tsGoEndToEndSmoke":                            true,
+		"reconnectDecisionSmoke":                       true,
+		"conflictContinueCancelSmoke":                  true,
+		"aiResolutionFailureSmoke":                     true,
+		"sessionCompletedNullCleanupProof":             true,
+		"missingSourceRollbackTSGoSmoke":               true,
+		"createdTargetMissingSourceRollbackTSGoSmoke":  true,
+		"partialSuccessExistingTargetFailureTSGoSmoke": true,
+		"dbGitRollbackTSGoSmoke":                       false,
+		"existingTargetFailurePreservesTargetProof":    true,
+		"projectDBSyncSmoke":                           true,
+		"frontendProgressUISmoke":                      true,
+		"browserNoCrashSmoke":                          true,
+		"replacementSafe":                              false,
+	})
+	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "rollbackPolicy"}, map[string]any{
+		"createdTarget":                "delete-created-target-on-failure",
+		"existingTarget":               "preserve-existing-target-on-failure",
+		"existingTargetPartialSuccess": "preserve-merged-changes-on-later-failure",
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract"}, "sampledProofs", []string{
 		"async-session-response-fields",
@@ -1657,34 +1671,51 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"decision-ws-supported",
 		"created-target-rollback",
 		"stale-session-cleanup",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract"}, "requiredProofs", []string{
-		"ts-go-reconnect-session-poll",
+		"session-poll-waiting-decision-state",
+		"existing-target-preserve-clean-preflight-policy",
+		"batch-merge-project-db-sync-hook",
+		"frontend-batch-merge-completed-refresh",
+		"frontend-batch-merge-modal-no-crash",
+		"ts-go-batch-merge-e2e-db-git-fs-diff",
+		"batch-merge-completed-session-null-cleanup",
+		"ts-go-batch-merge-missing-source-existing-target-rollback",
+		"ts-go-batch-merge-missing-source-created-target-rollback",
+		"ts-go-batch-merge-partial-success-existing-target-fallback",
 		"conflict-continue-cancel-decisions",
 		"ai-resolution-failure-path",
+	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract"}, "requiredProofs", []string{
 		"db-git-rollback-diff-clean",
-		"project-db-sync-after-batch-merge",
-		"frontend-progress-browser-no-crash",
 	})
 	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "replacementContract"}, map[string]any{
-		"boundaryTracked":             true,
-		"runtimeRow":                  "CHAPTER-BATCH-MERGE-E2E-01",
-		"routeFocusedSmoke":           true,
-		"asyncSessionResponseProof":   true,
-		"mergeEventNameProof":         true,
-		"decisionWSSupportedProof":    true,
-		"createdTargetRollbackProof":  true,
-		"staleSessionCleanupProof":    true,
-		"tsGoEndToEndSmoke":           false,
-		"reconnectDecisionSmoke":      false,
-		"conflictContinueCancelSmoke": false,
-		"aiResolutionFailureSmoke":    false,
-		"dbGitRollbackTSGoSmoke":      false,
-		"projectDBSyncSmoke":          false,
-		"frontendProgressUISmoke":     false,
-		"browserNoCrashSmoke":         false,
-		"fullTSBatchMergeE2EParity":   false,
-		"replacementSafe":             false,
+		"boundaryTracked":                              true,
+		"runtimeRow":                                   "CHAPTER-BATCH-MERGE-E2E-01",
+		"routeFocusedSmoke":                            true,
+		"asyncSessionResponseProof":                    true,
+		"mergeEventNameProof":                          true,
+		"decisionWSSupportedProof":                     true,
+		"createdTargetRollbackProof":                   true,
+		"staleSessionCleanupProof":                     true,
+		"tsGoEndToEndSmoke":                            true,
+		"reconnectDecisionSmoke":                       true,
+		"conflictContinueCancelSmoke":                  true,
+		"aiResolutionFailureSmoke":                     true,
+		"sessionCompletedNullCleanupProof":             true,
+		"missingSourceRollbackTSGoSmoke":               true,
+		"createdTargetMissingSourceRollbackTSGoSmoke":  true,
+		"partialSuccessExistingTargetFailureTSGoSmoke": true,
+		"dbGitRollbackTSGoSmoke":                       false,
+		"existingTargetFailurePreservesTargetProof":    true,
+		"projectDBSyncSmoke":                           true,
+		"frontendProgressUISmoke":                      true,
+		"browserNoCrashSmoke":                          true,
+		"fullTSBatchMergeE2EParity":                    false,
+		"replacementSafe":                              false,
+	})
+	assertNestedCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "replacementContract", "rollbackPolicy"}, map[string]any{
+		"createdTarget":                "delete-created-target-on-failure",
+		"existingTarget":               "preserve-existing-target-on-failure",
+		"existingTargetPartialSuccess": "preserve-merged-changes-on-later-failure",
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "replacementContract"}, "sampledProofs", []string{
 		"async-session-response-fields",
@@ -1692,14 +1723,21 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"decision-ws-supported",
 		"created-target-rollback",
 		"stale-session-cleanup",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "replacementContract"}, "requiredProofs", []string{
-		"ts-go-reconnect-session-poll",
+		"session-poll-waiting-decision-state",
+		"existing-target-preserve-clean-preflight-policy",
+		"batch-merge-project-db-sync-hook",
+		"frontend-batch-merge-completed-refresh",
+		"frontend-batch-merge-modal-no-crash",
+		"ts-go-batch-merge-e2e-db-git-fs-diff",
+		"batch-merge-completed-session-null-cleanup",
+		"ts-go-batch-merge-missing-source-existing-target-rollback",
+		"ts-go-batch-merge-missing-source-created-target-rollback",
+		"ts-go-batch-merge-partial-success-existing-target-fallback",
 		"conflict-continue-cancel-decisions",
 		"ai-resolution-failure-path",
+	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "batchMerge", "e2eContract", "replacementContract"}, "requiredProofs", []string{
 		"db-git-rollback-diff-clean",
-		"project-db-sync-after-batch-merge",
-		"frontend-progress-browser-no-crash",
 		"full-ts-batch-merge-e2e-parity",
 	})
 	assertNestedCapability(t, caps, []string{"chapters", "replacementContract"}, map[string]any{
@@ -1716,38 +1754,48 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"splitRouteAdditivePartial":        true,
 		"dependencyEventBusParity":         true,
 		"projectChapterSettingsParity":     true,
-		"deleteLiveNarratorInterruptSmoke": false,
+		"deleteLiveNarratorInterruptSmoke": true,
 		"dormantWakeRealRuntimeSmoke":      false,
-		"reviewAutoStartSessionParity":     false,
-		"mergeFullDataIntegrityParity":     false,
-		"unmergeLifecycleParity":           false,
+		"reviewAutoStartSessionParity":     true,
+		"mergeFullDataIntegrityParity":     true,
+		"unmergeLifecycleParity":           true,
 		"batchMergeEndToEndSmoke":          false,
-		"frontendGraphRefreshSmoke":        false,
-		"tsGoDBGitFSDiffSmoke":             false,
+		"frontendGraphRefreshSmoke":        true,
+		"tsGoDBGitFSDiffSmoke":             true,
 		"replacementSafe":                  false,
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "replacementContract"}, "sampledProofs", []string{
 		"dependency-edge-validation-and-sync-metadata",
 		"basic-branch-worktree-chapter-narrator-create",
+		"chapter-create-auto-dormant-ts-go-diff-smoke",
 		"chapter-delete-db-cleanup-and-recent-tabs-json",
+		"chapter-delete-live-narrator-recent-tabs-event-frontend-smoke",
 		"dormant-wake-fake-podman-route-service-proof",
 		"review-create-rollback-seed-message-actions",
 		"review-commit-history-copy-parity",
-		"merge-dirty-source-reject-lock-rollback-focused-proof",
+		"review-auto-start-session-start-failure-rollback",
+		"merge-source-dirty-auto-commit-before-merge",
+		"merge-required-review-dirty-source-rejects-auto-commit",
+		"merge-source-target-worktree-lock-proof",
+		"merge-target-lock-rollback-focused-proof",
+		"merge-source-worktree-terminal-cleanup-after-merge",
+		"merge-target-commit-sync-after-merge",
+		"frontend-merge-graph-refresh-no-crash",
+		"merge-chapter-merged-event-broadcast",
+		"merge-summary-full-injection",
+		"full-ts-merge-data-integrity-parity",
 		"unmerge-core-reset-revert-edge-cleanup",
+		"unmerge-commit-sync-summary-cleanup-events-frontend-diff",
+		"full-ts-unmerge-lifecycle-parity",
 		"batch-merge-async-session-route-proof",
 		"dependency-event-bus-and-project-db-sync-parity",
 		"chapter-create-settings-rollback-event-commit-sync-parity",
+		"chapter-aggregate-frontend-graph-refresh-no-crash",
+		"chapter-aggregate-ts-go-db-git-fs-diff-suite",
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "replacementContract"}, "requiredProofs", []string{
-		"chapter-create-auto-dormant-ts-go-diff-smoke",
-		"chapter-delete-live-narrator-recent-tabs-event-frontend-smoke",
 		"dormant-wake-real-podman-realistic-repo-commit-sync-smoke",
-		"review-auto-start-commit-history-events-reset-frontend-smoke",
-		"merge-source-dirty-auto-commit-lock-cleanup-summary-event-diff",
-		"unmerge-commit-sync-summary-cleanup-events-frontend-diff",
-		"batch-merge-reconnect-conflict-ai-rollback-projectdb-frontend-smoke",
-		"ts-go-domain-lifecycle-db-git-fs-diff-suite",
+		"batch-merge-db-git-rollback-and-full-e2e-parity",
 	})
 	assertNestedCapability(t, caps, []string{"chapters", "containers"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"chapters", "containers", "routeContract"}, map[string]any{
@@ -2152,36 +2200,54 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"historicalCommitForkSplit":             true,
 		"lifecycleMutationParity":               "partial",
 		"tempChapterAIConflictResolution":       false,
+		"tempChapterAIFallbackContract":         true,
+		"tempChapterAIConflictResolutionMode":   "unsupported-one-shot-fallback",
+		"tempChapterAIFallbackCode":             "merge.aiResolveOneShotBasic",
+		"tempChapterAIRequiresNarrator":         false,
+		"tempChapterPreserved":                  false,
+		"tempChapterAIConflictResolutionReason": "TypeScript forks a temporary chapter and preserves it on unresolved AI conflicts; Go currently uses a one-shot fallback on the target worktree and exposes route/capability metadata instead of claiming temp-chapter parity.",
 		"fullTSMergeRebaseParity":               false,
-		"trunkMergeDirtyCheckParity":            false,
-		"rulerBranchDeletionParity":             false,
-		"rebaseConflictNarratorParity":          false,
-		"frontendLifecycleSmoke":                false,
-		"tsGoEndpointDiffSmoke":                 false,
+		"trunkMergeDirtyCheckParity":            true,
+		"rulerBranchDeletionParity":             true,
+		"rebaseConflictNarratorParity":          true,
+		"aiResolveFallbackContract":             true,
+		"mutationLifecycleFocusedProof":         true,
+		"mutationLifecycleTSGoDiffSmoke":        true,
+		"frontendLifecycleSmoke":                true,
+		"tsGoEndpointDiffSmoke":                 true,
 		"replacementSafe":                       false,
 		"frontendSmoke":                         "read-segment-position-sampled",
 		"unsupportedMutationFallbackCode":       "FEATURE_DISABLED",
 		"unsupportedMutationFallbackBeforeWork": true,
 	})
 	assertNestedCapability(t, caps, []string{"ruler", "replacementContract"}, map[string]any{
-		"boundaryTracked":                 true,
-		"runtimeRow":                      "RULER-LIFECYCLE-01",
-		"readRouteProof":                  true,
-		"segmentRouteProof":               true,
-		"positionMutationProof":           true,
-		"narratorStatusFoldingProof":      true,
-		"mutationFallbackProof":           true,
-		"gitLogDegradedFallbackProof":     true,
-		"historicalCommitForkSplitProof":  true,
-		"trunkMergeDirtyCheckParity":      false,
-		"rulerBranchDeletionParity":       false,
-		"rebaseConflictNarratorParity":    false,
-		"tempChapterAIConflictResolution": false,
-		"fullTSMergeRebaseParity":         false,
-		"frontendLifecycleSmoke":          false,
-		"tsGoEndpointDiffSmoke":           false,
-		"fullTSRulerLifecycleParity":      false,
-		"replacementSafe":                 false,
+		"boundaryTracked":                       true,
+		"runtimeRow":                            "RULER-LIFECYCLE-01",
+		"readRouteProof":                        true,
+		"segmentRouteProof":                     true,
+		"positionMutationProof":                 true,
+		"narratorStatusFoldingProof":            true,
+		"mutationFallbackProof":                 true,
+		"gitLogDegradedFallbackProof":           true,
+		"historicalCommitForkSplitProof":        true,
+		"trunkMergeDirtyCheckParity":            true,
+		"rulerBranchDeletionParity":             true,
+		"rebaseConflictNarratorParity":          true,
+		"aiResolveFallbackContract":             true,
+		"mutationLifecycleFocusedProof":         true,
+		"mutationLifecycleTSGoDiffSmoke":        true,
+		"tempChapterAIConflictResolution":       false,
+		"tempChapterAIFallbackContract":         true,
+		"tempChapterAIConflictResolutionMode":   "unsupported-one-shot-fallback",
+		"tempChapterAIFallbackCode":             "merge.aiResolveOneShotBasic",
+		"tempChapterAIRequiresNarrator":         false,
+		"tempChapterPreserved":                  false,
+		"tempChapterAIConflictResolutionReason": "TypeScript forks a temporary chapter and preserves it on unresolved AI conflicts; Go currently uses a one-shot fallback on the target worktree and exposes route/capability metadata instead of claiming temp-chapter parity.",
+		"fullTSMergeRebaseParity":               false,
+		"frontendLifecycleSmoke":                true,
+		"tsGoEndpointDiffSmoke":                 true,
+		"fullTSRulerLifecycleParity":            false,
+		"replacementSafe":                       false,
 	})
 	assertStringSliceCapability(t, caps, []string{"ruler", "replacementContract"}, "sampledProofs", []string{
 		"read-route",
@@ -2190,14 +2256,19 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"narrator-status-folding",
 		"git-log-degraded-fallback",
 		"historical-commit-fork-split",
+		"frontend-ruler-lifecycle-no-crash",
+		"ts-go-ruler-read-segment-position-graph-diff",
+		"ruler-merged-branch-deletion",
+		"ruler-trunk-dirty-merge-guard",
+		"ruler-rebase-conflict-narrator-prompt",
+		"ruler-airesolve-fallback-payload-contract",
+		"ruler-mutation-lifecycle-db-git-graph-focused-proof",
+		"ruler-temp-chapter-ai-fallback-contract",
+		"ts-go-ruler-merge-lifecycle-db-git-graph-diff",
 	})
 	assertStringSliceCapability(t, caps, []string{"ruler", "replacementContract"}, "requiredProofs", []string{
-		"trunk-merge-dirty-check-parity",
-		"ruler-specific-branch-delete-after-merge",
-		"rebase-conflict-resolution-through-narrator",
 		"temp-chapter-ai-conflict-resolution",
-		"frontend-ruler-lifecycle-no-crash",
-		"ts-go-ruler-lifecycle-e2e-db-git-graph-diff",
+		"full-ts-ruler-lifecycle-parity",
 	})
 	assertStringSliceCapability(t, caps, []string{"ruler"}, "sampledProofs", []string{
 		"read-route",
@@ -2206,14 +2277,19 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"narrator-status-folding",
 		"git-log-degraded-fallback",
 		"historical-commit-fork-split",
+		"frontend-ruler-lifecycle-no-crash",
+		"ts-go-ruler-read-segment-position-graph-diff",
+		"ruler-merged-branch-deletion",
+		"ruler-trunk-dirty-merge-guard",
+		"ruler-rebase-conflict-narrator-prompt",
+		"ruler-airesolve-fallback-payload-contract",
+		"ruler-mutation-lifecycle-db-git-graph-focused-proof",
+		"ruler-temp-chapter-ai-fallback-contract",
+		"ts-go-ruler-merge-lifecycle-db-git-graph-diff",
 	})
 	assertStringSliceCapability(t, caps, []string{"ruler"}, "requiredProofs", []string{
-		"trunk-merge-dirty-check-parity",
-		"ruler-specific-branch-delete-after-merge",
-		"rebase-conflict-resolution-through-narrator",
 		"temp-chapter-ai-conflict-resolution",
-		"frontend-ruler-lifecycle-no-crash",
-		"ts-go-ruler-lifecycle-e2e-db-git-graph-diff",
+		"full-ts-ruler-lifecycle-parity",
 	})
 
 	assertNestedCapability(t, caps, []string{"volumeSnapshots"}, map[string]any{
@@ -2755,7 +2831,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertStringSliceCapability(t, caps, []string{"storage", "database", "previewContract"}, "sampleTypes", []string{"narrator", "apiRequest"})
 	assertStringSliceCapability(t, caps, []string{"storage", "database", "previewContract"}, "degradedFields", []string{"degraded", "fallback", "fallbacks", "warningCodes", "reason", "error", "message"})
 	assertStringSliceCapability(t, caps, []string{"storage", "database", "previewContract"}, "fallbackCodes", []string{"api_request_dump_stats_failed", "cleanup_narrator_id_query_failed", "cleanup_message_count_failed", "cleanup_tool_call_count_failed", "cleanup_api_request_count_failed", "cleanup_oldest_activity_failed"})
-	assertNestedCapability(t, caps, []string{"storage", "database", "executionContract"}, map[string]any{"apiRequestDumpsMutation": "clear-raw_dump_json-only", "apiRequestRowsDeleted": false, "archivedSessionsMutation": "safe-narrator-delete-service", "staleSessionsMutation": "disabled-archived-only-policy", "storageCacheInvalidationParity": false, "vacuumRan": false})
+	assertNestedCapability(t, caps, []string{"storage", "database", "executionContract"}, map[string]any{"apiRequestDumpsMutation": "clear-raw_dump_json-only", "apiRequestRowsDeleted": false, "archivedSessionsMutation": "safe-narrator-delete-service", "staleSessionsMutation": "disabled-archived-only-policy", "cleanupInvalidatesStorageCache": true, "storageCacheInvalidationParity": "supported-cleanup-subset", "fullStorageCacheInvalidationParity": false, "vacuumRan": false})
 	assertStringSliceCapability(t, caps, []string{"storage", "database", "executionContract"}, "responseFields", []string{"ok", "target", "olderThanDays", "approxBytes", "oldestAt", "counts", "blockedCount", "warningCodes", "samples", "blocked", "count", "beforeBytes", "afterBytes", "freedBytes", "vacuumRan", "changed"})
 	assertNestedCapability(t, caps, []string{"storage", "database", "fallbackContract"}, map[string]any{"featureDisabledStatus": float64(http.StatusNotImplemented), "staleSessionsFeature": "storage.database.cleanup.staleSessions", "archivedSessionsMissingNarratorFeature": "storage.database.cleanup.archivedSessions", "previewDegradesInsteadOfThrowing": true, "invalidTargetStatus": float64(http.StatusBadRequest)})
 	assertStringSliceCapability(t, caps, []string{"storage", "database", "fallbackContract"}, "featureDisabledFields", []string{"ok", "code", "feature", "supported", "fallback", "reason", "error", "message"})
@@ -2774,31 +2850,38 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "requestContract"}, map[string]any{"targetRequired": true, "tsZodParity": "target-enum-only", "goLooseJSON": true, "invalidTargetStatus": float64(http.StatusBadRequest), "invalidTargetMessage": "Invalid target"})
 	assertStringSliceCapability(t, caps, []string{"storage", "cleanup", "responseContract"}, "uploadsFields", []string{"ok", "removed", "freedBytes"})
 	assertStringSliceCapability(t, caps, []string{"storage", "cleanup", "responseContract"}, "sharesFields", []string{"ok", "removed", "freedBytes", "memoryRemoved"})
+	assertNestedCapability(t, caps, []string{"storage", "cleanup", "responseContract"}, map[string]any{"uploadShareCleanupTSGoSmoke": true, "invalidTargetTSGoSmoke": true, "emptyDirectoryResponseIsStable": true, "successInvalidatesStorageCache": true})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "fallbackContract"}, map[string]any{"unsupportedStatus": float64(http.StatusNotImplemented), "worktreesCode": "STORAGE_CLEANUP_WORKTREES_UNSUPPORTED", "containersCode": "STORAGE_CLEANUP_CONTAINERS_UNSUPPORTED", "rejectBeforeWork": true})
 	assertStringSliceCapability(t, caps, []string{"storage", "cleanup", "fallbackContract"}, "unsupportedFields", []string{"ok", "code", "feature", "supported", "fallback", "reason", "error", "message"})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "uploads"}, map[string]any{"supported": true, "preservesMessageImageRefs": true})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "worktrees"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.worktrees", "runtimeRerouteAvailable": true, "runtimeRerouteTarget": "runtime.cleanup.worktrees"})
 	assertNestedCapability(t, caps, []string{"storage", "cleanup", "containers"}, map[string]any{"supported": false, "fallback": true, "alternative": "runtime.cleanup.containers", "runtimeRerouteAvailable": false, "runtimeRerouteTarget": "runtime.cleanup.containers"})
 	assertNestedCapability(t, caps, []string{"storage", "replacementContract"}, map[string]any{
-		"boundaryTracked":                   true,
-		"runtimeRow":                        "STORAGE-MAINTENANCE-01",
-		"scanSSEContractProof":              true,
-		"databaseMaintenanceProof":          true,
-		"storageCleanupFallbackProof":       true,
-		"uploadShareCleanupProof":           true,
-		"adminBoundaryProof":                true,
-		"unsupportedWorktreeFallbackProof":  true,
-		"unsupportedContainerFallbackProof": true,
-		"fullTSStorageScanParity":           false,
-		"fullTSStorageCleanupParity":        false,
-		"fullTSDatabaseMaintenanceParity":   false,
-		"storageCacheInvalidationParity":    false,
-		"worktreeStorageCleanupSupported":   false,
-		"containerStorageCleanupSupported":  false,
-		"staleSessionsCleanupSupported":     false,
-		"requestPathVacuumSupported":        false,
-		"backgroundCompactionJob":           false,
-		"replacementSafe":                   false,
+		"boundaryTracked":                            true,
+		"runtimeRow":                                 "STORAGE-MAINTENANCE-01",
+		"scanSSEContractProof":                       true,
+		"databaseMaintenanceProof":                   true,
+		"storageCleanupFallbackProof":                true,
+		"uploadShareCleanupProof":                    true,
+		"uploadShareCleanupTSGoSmoke":                true,
+		"cleanupInvalidTargetTSGoSmoke":              true,
+		"supportedCleanupCacheInvalidation":          true,
+		"databaseCleanupCacheInvalidation":           true,
+		"supportedCleanupCacheInvalidationTSGoSmoke": true,
+		"adminBoundaryProof":                         true,
+		"unsupportedWorktreeFallbackProof":           true,
+		"unsupportedContainerFallbackProof":          true,
+		"fullTSStorageScanParity":                    false,
+		"fullTSStorageCleanupParity":                 false,
+		"fullTSDatabaseMaintenanceParity":            false,
+		"storageCacheInvalidationParity":             "supported-cleanup-subset",
+		"fullStorageCacheInvalidationParity":         false,
+		"worktreeStorageCleanupSupported":            false,
+		"containerStorageCleanupSupported":           false,
+		"staleSessionsCleanupSupported":              false,
+		"requestPathVacuumSupported":                 false,
+		"backgroundCompactionJob":                    false,
+		"replacementSafe":                            false,
 	})
 	assertStringSliceCapability(t, caps, []string{"storage", "replacementContract"}, "sampledProofs", []string{
 		"storage-scan-sse-order-contract",
@@ -2806,12 +2889,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"storage-worktree-container-unsupported-fallback-fixture",
 		"storage-database-vacuum-disabled-fixture",
 		"upload-share-cleanup-route-contract",
+		"ts-go-storage-upload-share-cleanup-smoke",
+		"ts-go-storage-cleanup-invalid-target-smoke",
+		"storage-cleanup-cache-invalidation-smoke",
+		"storage-database-cleanup-cache-invalidation-smoke",
+		"ts-go-storage-cache-invalidation-flow-smoke",
 	})
 	assertStringSliceCapability(t, caps, []string{"storage", "replacementContract"}, "requiredProofs", []string{
 		"broader-storage-service-runtime-smoke",
 		"worktree-container-storage-cleanup-product-decision",
 		"stale-sessions-cleanup-product-decision",
-		"storage-cache-invalidation-parity-smoke",
+		"full-storage-cache-invalidation-parity-smoke",
 		"background-vacuum-compaction-job-or-decision",
 		"full-ts-zod-storage-maintenance-parity",
 	})
@@ -2827,21 +2915,22 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"concludeReviewTool":             true,
 		"dismissPromoteConvertActions":   true,
 		"staleMergeGuard":                true,
-		"autoStartSession":               false,
-		"startMode":                      "seed-message-only",
-		"autoStartFallbackPayload":       true,
-		"autoStartFallbackCode":          "REVIEW_AUTO_START_DISABLED",
+		"autoStartSession":               true,
+		"startMode":                      "auto-start-background-session",
+		"autoStartFallbackPayload":       false,
+		"autoStartOptOut":                true,
+		"autoStartOptOutStartMode":       "seed-message-only",
 		"commitHistoryCopyParity":        true,
 		"reviewCreatedEventParity":       true,
 		"reviewConcludedEventParity":     true,
 		"reviewWorktreeResetParity":      true,
-		"fullNarratorInitRollbackParity": false,
+		"fullNarratorInitRollbackParity": true,
 		"frontendReviewSmoke":            true,
-		"tsGoEndpointDiffSmoke":          false,
+		"tsGoEndpointDiffSmoke":          true,
 		"replacementSafe":                false,
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "routes", []string{"POST /api/chapters/{id}/review", "GET /api/reviews/*", "POST /api/reviews/*"})
-	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "autoStartFallbackPayloadShape", []string{"reviewRuntime", "fallbackCode", "fallbacks[]"})
+	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "autoStartRuntimePayloadShape", []string{"reviewRuntime"})
 	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "sampledProofs", []string{
 		"create-rollback",
 		"dirty-file-copy",
@@ -2851,15 +2940,14 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"review-created-concluded-event-broadcasts",
 		"review-worktree-reset-on-agent-mutation",
 		"frontend-review-graph-panel-no-crash",
+		"ts-go-review-lifecycle-e2e-db-git-message-diff",
+		"full-narrator-init-rollback-breadth",
+		"auto-start-narrator-session-and-start-failure-rollback",
 		"conclude-review-tool",
 		"dismiss-promote-convert-actions",
 		"stale-merge-guard",
 	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "requiredProofs", []string{
-		"auto-start-narrator-session-and-start-failure-rollback",
-		"full-narrator-init-rollback-breadth",
-		"ts-go-review-lifecycle-e2e-db-git-message-diff",
-	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "review"}, "requiredProofs", []string{})
 	assertNestedCapability(t, caps, []string{"chapters", "review", "replacementContract"}, map[string]any{
 		"boundaryTracked":                 true,
 		"runtimeRow":                      "CHAPTER-REVIEW-LIFECYCLE-01",
@@ -2869,15 +2957,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"seedReviewStartMessageProof":     true,
 		"reviewActionsProof":              true,
 		"staleMergeGuardProof":            true,
-		"autoStartFallbackPayloadProof":   true,
-		"autoStartSession":                false,
+		"autoStartSessionProof":           true,
+		"startFailureRollbackProof":       true,
+		"autoStartFallbackPayloadProof":   false,
+		"autoStartSession":                true,
 		"commitHistoryCopyParity":         true,
 		"reviewCreatedEventParity":        true,
 		"reviewConcludedEventParity":      true,
 		"reviewWorktreeResetParity":       true,
-		"fullNarratorInitRollbackParity":  false,
+		"fullNarratorInitRollbackParity":  true,
 		"frontendReviewSmoke":             true,
-		"tsGoReviewLifecycleE2EDiffSmoke": false,
+		"tsGoReviewLifecycleE2EDiffSmoke": true,
 		"fullTSReviewLifecycleParity":     false,
 		"replacementSafe":                 false,
 	})
@@ -2890,154 +2980,193 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"review-created-concluded-event-broadcasts",
 		"review-worktree-reset-on-agent-mutation",
 		"frontend-review-graph-panel-no-crash",
+		"ts-go-review-lifecycle-e2e-db-git-message-diff",
+		"full-narrator-init-rollback-breadth",
+		"auto-start-narrator-session-and-start-failure-rollback",
 		"conclude-review-tool",
 		"dismiss-promote-convert-actions",
 		"stale-merge-guard",
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "review", "replacementContract"}, "requiredProofs", []string{
-		"auto-start-narrator-session-and-start-failure-rollback",
-		"full-narrator-init-rollback-breadth",
-		"ts-go-review-lifecycle-e2e-db-git-message-diff",
 		"full-ts-review-lifecycle-parity",
 	})
 	assertNestedCapability(t, caps, []string{"chapters", "merge"}, map[string]any{"supported": true, "aiResolveMode": "one-shot-basic", "aiResolveUsesNarratorSession": false, "aiResolveRequiresFullNarrator": false, "aiResolveFallbackPayload": true, "aiResolveCherryPickContinuation": false, "aiResolveMultiCommitContinuation": false, "aiResolveContinuationFallbackCode": "AI_RESOLVE_CHERRY_PICK_CONFLICT_UNSUPPORTED"})
 	assertNestedCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract"}, map[string]any{
 		"boundaryTracked":                       true,
-		"dirtySourceRejectsInsteadOfAutoCommit": true,
-		"sourceDirtyAutoCommitParity":           false,
+		"dirtySourceRejectsInsteadOfAutoCommit": false,
+		"sourceDirtyAutoCommitParity":           true,
 		"requiredReviewValidationProof":         true,
 		"requiredReviewStaleValidationProof":    true,
 		"targetWorktreeLockProof":               true,
-		"sourceWorktreeLockProof":               false,
-		"sourceWorktreeCleanupAfterMerge":       false,
+		"sourceWorktreeLockProof":               true,
+		"sourceWorktreeCleanupAfterMerge":       true,
 		"recordMergedProof":                     true,
 		"postCommitDBFailureRollbackProof":      true,
 		"aiResolveRecordMergedRetryProof":       true,
 		"mergeSummaryFocusedProof":              true,
-		"mergeSummaryFullInjectionParity":       false,
-		"commitSyncParity":                      false,
-		"eventBroadcastParity":                  false,
-		"frontendMergeSmoke":                    false,
-		"replacementSafe":                       false,
+		"mergeSummaryUserIdentityProof":         true,
+		"mergeSummaryBroadcastProof":            true,
+		"mergeSummaryPreCollectedInputProof":    true,
+		"mergeSummaryModelGenerationHookProof":  true,
+		"mergeSummaryModelErrorBroadcastProof":  true,
+		"mergeSummaryAPIRequestTrackingProof":   true,
+		"mergeSummaryRetryWrapperProof":         true,
+		"mergeSummaryUnavailableBroadcastProof": true,
+		"mergeSummaryPromptLocaleParity":        true,
+		"mergeSummaryModelGenerationParity":     true,
+		"mergeSummaryFullInjectionParity":       true,
+		"commitSyncParity":                      true,
+		"eventBroadcastParity":                  true,
+		"frontendMergeSmoke":                    true,
+		"tsGoMergeE2EDBGitFSDiffSmoke":          true,
+		"replacementSafe":                       true,
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract"}, "sampledProofs", []string{
-		"dirty-source-reject-instead-of-auto-commit",
+		"source-dirty-auto-commit-before-merge",
+		"required-review-dirty-source-rejects-auto-commit",
 		"required-review-validation",
 		"required-review-stale-validation",
 		"target-worktree-lock",
+		"source-worktree-lock-during-auto-commit",
 		"record-merged-rows",
+		"source-worktree-terminal-cleanup-after-merge",
+		"target-merge-commit-sync-after-merge",
+		"frontend-merge-graph-refresh-no-crash",
 		"post-commit-db-failure-git-rollback",
 		"ai-resolve-record-merged-retry-rollback",
 		"merge-summary-focused-success",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract"}, "requiredProofs", []string{
-		"source-dirty-auto-commit",
-		"source-and-target-worktree-locking",
-		"source-worktree-cleanup-after-merge",
-		"commit-sync-after-merge",
-		"event-broadcast-parity",
+		"merge-summary-username-identity",
+		"merge-summary-message-broadcast",
+		"merge-summary-pre-collected-input",
+		"merge-summary-model-generation-hook",
+		"merge-summary-model-error-broadcast",
+		"merge-summary-api-request-tracking",
+		"merge-summary-transient-retry-wrapper",
+		"merge-summary-provider-unavailable-broadcast",
+		"merge-summary-ts-prompt-locale",
 		"merge-summary-full-injection",
-		"ts-go-merge-e2e-db-git-fs-diff",
-	})
-	assertNestedCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, map[string]any{
-		"boundaryTracked":                       true,
-		"runtimeRow":                            "CHAPTER-MERGE-DATA-INTEGRITY-01",
-		"dirtySourceRejectsInsteadOfAutoCommit": true,
-		"requiredReviewValidationProof":         true,
-		"requiredReviewStaleValidationProof":    true,
-		"targetWorktreeLockProof":               true,
-		"recordMergedProof":                     true,
-		"postCommitDBFailureRollbackProof":      true,
-		"aiResolveRecordMergedRetryProof":       true,
-		"mergeSummaryFocusedProof":              true,
-		"sourceDirtyAutoCommitParity":           false,
-		"sourceWorktreeLockProof":               false,
-		"sourceWorktreeCleanupAfterMerge":       false,
-		"commitSyncParity":                      false,
-		"eventBroadcastParity":                  false,
-		"mergeSummaryFullInjectionParity":       false,
-		"frontendMergeSmoke":                    false,
-		"tsGoMergeE2EDBGitFSDiffSmoke":          false,
-		"fullTSMergeDataIntegrityParity":        false,
-		"replacementSafe":                       false,
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, "sampledProofs", []string{
-		"dirty-source-reject-instead-of-auto-commit",
-		"required-review-validation",
-		"required-review-stale-validation",
-		"target-worktree-lock",
-		"record-merged-rows",
-		"post-commit-db-failure-git-rollback",
-		"ai-resolve-record-merged-retry-rollback",
-		"merge-summary-focused-success",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, "requiredProofs", []string{
-		"source-dirty-auto-commit",
-		"source-and-target-worktree-locking",
-		"source-worktree-cleanup-after-merge",
-		"commit-sync-after-merge",
-		"event-broadcast-parity",
-		"merge-summary-full-injection",
+		"chapter-merged-event-broadcast",
 		"ts-go-merge-e2e-db-git-fs-diff",
 		"full-ts-merge-data-integrity-parity",
 	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract"}, "requiredProofs", []string{})
+	assertNestedCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, map[string]any{
+		"boundaryTracked":                       true,
+		"runtimeRow":                            "CHAPTER-MERGE-DATA-INTEGRITY-01",
+		"dirtySourceRejectsInsteadOfAutoCommit": false,
+		"requiredReviewValidationProof":         true,
+		"requiredReviewStaleValidationProof":    true,
+		"targetWorktreeLockProof":               true,
+		"recordMergedProof":                     true,
+		"postCommitDBFailureRollbackProof":      true,
+		"aiResolveRecordMergedRetryProof":       true,
+		"mergeSummaryFocusedProof":              true,
+		"mergeSummaryUserIdentityProof":         true,
+		"mergeSummaryBroadcastProof":            true,
+		"mergeSummaryPreCollectedInputProof":    true,
+		"mergeSummaryModelGenerationHookProof":  true,
+		"mergeSummaryModelErrorBroadcastProof":  true,
+		"mergeSummaryAPIRequestTrackingProof":   true,
+		"mergeSummaryRetryWrapperProof":         true,
+		"mergeSummaryUnavailableBroadcastProof": true,
+		"mergeSummaryPromptLocaleParity":        true,
+		"sourceDirtyAutoCommitParity":           true,
+		"sourceWorktreeLockProof":               true,
+		"sourceWorktreeCleanupAfterMerge":       true,
+		"commitSyncParity":                      true,
+		"eventBroadcastParity":                  true,
+		"mergeSummaryModelGenerationParity":     true,
+		"mergeSummaryFullInjectionParity":       true,
+		"frontendMergeSmoke":                    true,
+		"tsGoMergeE2EDBGitFSDiffSmoke":          true,
+		"fullTSMergeDataIntegrityParity":        true,
+		"replacementSafe":                       true,
+	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, "sampledProofs", []string{
+		"source-dirty-auto-commit-before-merge",
+		"required-review-dirty-source-rejects-auto-commit",
+		"required-review-validation",
+		"required-review-stale-validation",
+		"target-worktree-lock",
+		"source-worktree-lock-during-auto-commit",
+		"record-merged-rows",
+		"source-worktree-terminal-cleanup-after-merge",
+		"target-merge-commit-sync-after-merge",
+		"frontend-merge-graph-refresh-no-crash",
+		"post-commit-db-failure-git-rollback",
+		"ai-resolve-record-merged-retry-rollback",
+		"merge-summary-focused-success",
+		"merge-summary-username-identity",
+		"merge-summary-message-broadcast",
+		"merge-summary-pre-collected-input",
+		"merge-summary-model-generation-hook",
+		"merge-summary-model-error-broadcast",
+		"merge-summary-api-request-tracking",
+		"merge-summary-transient-retry-wrapper",
+		"merge-summary-provider-unavailable-broadcast",
+		"merge-summary-ts-prompt-locale",
+		"merge-summary-full-injection",
+		"chapter-merged-event-broadcast",
+		"ts-go-merge-e2e-db-git-fs-diff",
+		"full-ts-merge-data-integrity-parity",
+	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract", "replacementContract"}, "requiredProofs", []string{})
 	assertNestedCapability(t, caps, []string{"chapters", "unmerge"}, map[string]any{
 		"supported":                          true,
 		"route":                              "POST /api/chapters/{id}/unmerge",
 		"coreResetRevertPath":                true,
 		"mergeEdgeCleanupProof":              true,
 		"sourceTargetStatusRestoreProof":     true,
-		"commitSyncParity":                   false,
-		"mergeSummaryCleanupParity":          false,
-		"eventBroadcastParity":               false,
-		"branchWorktreePathDerivationParity": false,
-		"reloadWakeEventParity":              false,
-		"frontendGraphRefreshSmoke":          false,
-		"replacementSafe":                    false,
+		"commitSyncParity":                   true,
+		"mergeSummaryCleanupParity":          true,
+		"eventBroadcastParity":               true,
+		"branchWorktreePathDerivationParity": true,
+		"reloadWakeEventParity":              true,
+		"frontendGraphRefreshSmoke":          true,
+		"replacementSafe":                    true,
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge"}, "sampledProofs", []string{
 		"core-reset-revert-path",
 		"merge-edge-cleanup",
 		"source-target-status-restore",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge"}, "requiredProofs", []string{
 		"target-source-commit-sync",
-		"merge-summary-cleanup",
-		"reload-wake-event-broadcasts",
 		"branch-worktree-path-derivation",
+		"merge-summary-cleanup-on-unmerge",
+		"reload-wake-event-broadcasts",
 		"frontend-graph-refresh-no-crash",
 		"ts-go-unmerge-e2e-db-git-fs-diff",
+		"full-ts-unmerge-lifecycle-parity",
 	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge"}, "requiredProofs", []string{})
 	assertNestedCapability(t, caps, []string{"chapters", "unmerge", "replacementContract"}, map[string]any{
 		"boundaryTracked":                    true,
 		"runtimeRow":                         "CHAPTER-UNMERGE-LIFECYCLE-01",
 		"coreResetRevertProof":               true,
 		"mergeEdgeCleanupProof":              true,
 		"sourceTargetStatusRestoreProof":     true,
-		"commitSyncParity":                   false,
-		"mergeSummaryCleanupParity":          false,
-		"eventBroadcastParity":               false,
-		"branchWorktreePathDerivationParity": false,
-		"reloadWakeEventParity":              false,
-		"frontendGraphRefreshSmoke":          false,
-		"tsGoUnmergeE2EDBGitFSDiffSmoke":     false,
-		"fullTSUnmergeLifecycleParity":       false,
-		"replacementSafe":                    false,
+		"commitSyncParity":                   true,
+		"mergeSummaryCleanupParity":          true,
+		"eventBroadcastParity":               true,
+		"branchWorktreePathDerivationParity": true,
+		"reloadWakeEventParity":              true,
+		"frontendGraphRefreshSmoke":          true,
+		"tsGoUnmergeE2EDBGitFSDiffSmoke":     true,
+		"fullTSUnmergeLifecycleParity":       true,
+		"replacementSafe":                    true,
 	})
 	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge", "replacementContract"}, "sampledProofs", []string{
 		"core-reset-revert-path",
 		"merge-edge-cleanup",
 		"source-target-status-restore",
-	})
-	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge", "replacementContract"}, "requiredProofs", []string{
 		"target-source-commit-sync",
-		"merge-summary-cleanup",
-		"reload-wake-event-broadcasts",
 		"branch-worktree-path-derivation",
+		"merge-summary-cleanup-on-unmerge",
+		"reload-wake-event-broadcasts",
 		"frontend-graph-refresh-no-crash",
 		"ts-go-unmerge-e2e-db-git-fs-diff",
 		"full-ts-unmerge-lifecycle-parity",
 	})
+	assertStringSliceCapability(t, caps, []string{"chapters", "unmerge", "replacementContract"}, "requiredProofs", []string{})
 	assertNestedCapability(t, caps, []string{"runtime", "routeContract"}, map[string]any{"adminOnly": true, "scan": "GET /api/runtime/scan", "cached": "GET /api/runtime/cached", "cleanup": "POST /api/runtime/cleanup", "staticRoutes": true, "authBoundary": "requireAdmin"})
 	assertStringSliceCapability(t, caps, []string{"runtime", "routeContract"}, "tsCleanupTargets", []string{"terminals", "containers", "browsers"})
 	assertStringSliceCapability(t, caps, []string{"runtime", "routeContract"}, "goExtensionTargets", []string{"worktrees"})
@@ -3195,8 +3324,8 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"live-external-mcp-server-e2e",
 		"live-kiro-mcp-e2e-or-product-decision",
 	})
-	assertNestedCapability(t, caps, []string{"settings"}, map[string]any{"secretMasking": true, "providerModelAugmentation": true, "tlsGeneration": true, "retryRules": true})
-	assertNestedCapability(t, caps, []string{"settings", "validation"}, map[string]any{"tsZodParity": false, "mode": "loose-json-with-normalization", "loadMigrationParity": "partial", "patchValidationParity": "partial", "unsafeSaveGuard": true, "legacyCodexOAuthCredentialPoolMigration": false, "fullZodUpdateSchemaParity": false, "reason": "Go backend now runs a bounded TypeScript-legacy settings migration pass before saving, including custom API provider array sync and stale model reference purge, but still does not apply the full TypeScript Zod schema or the legacy Codex OAuth credential-pool migration."})
+	assertNestedCapability(t, caps, []string{"settings"}, map[string]any{"secretMasking": true, "providerModelAugmentation": true, "patchResponseAugmentation": true, "tlsGeneration": true, "retryRules": true})
+	assertNestedCapability(t, caps, []string{"settings", "validation"}, map[string]any{"tsZodParity": false, "mode": "loose-json-with-normalization", "loadMigrationParity": "partial", "patchValidationParity": "partial", "unsafeSaveGuard": true, "legacyCodexOAuthCredentialPoolMigration": true, "positiveTLSTSGoSmoke": true, "fullZodUpdateSchemaParity": false, "reason": "Go backend now runs a bounded TypeScript-legacy settings migration pass before saving, including custom API provider array sync, stale model reference purge, and legacy Codex OAuth credential-pool migration, but still does not apply the full TypeScript Zod schema."})
 	assertNestedCapability(t, caps, []string{"settings", "validation", "patchContract"}, map[string]any{
 		"supported":                          true,
 		"mode":                               "allowlisted-root-deep-merge-with-selected-validators",
@@ -3209,17 +3338,21 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"preservesMaskedTLSPassphrase":       true,
 		"preservesMaskedVNetRelayToken":      true,
 		"sanitizesSecretsInResponse":         true,
+		"augmentsResponseLikeGet":            true,
 		"providerCompatibilitySync":          true,
 		"dangerReflectionLegacySync":         true,
 		"proxyURLNormalization":              true,
 		"providerPrefixConflictGuard":        true,
 		"tlsFileExistenceValidation":         true,
+		"positiveTLSTSGoSmoke":               true,
+		"positiveTLSRestartSuppression":      "NARRAFORK_CONTRACT_SUPPRESS_RESTART",
 		"containerProxySideEffectRollback":   true,
 		"proxyRuntimeMayRunBeforeStoreWrite": true,
-		"nestedUnknownFieldParity":           "unverified",
+		"nestedUnknownFieldParity":           "sampled-strip",
+		"nestedUnknownFieldParitySmoke":      true,
 		"fullZodUpdateSchemaParity":          false,
 	})
-	assertStringSliceCapability(t, caps, []string{"settings", "validation", "patchContract"}, "sampledValidationGroups", []string{"server", "paths", "agent-scalars", "agent-prompts-and-aggregations", "agent-retry-rules", "agent-model-selection", "agent-policy", "agent-web-fetch-policy", "chapters", "containers", "editor", "codex", "routines", "update", "vnet", "shares", "provider-arrays", "provider-prefix-conflicts", "secret-masking"})
+	assertStringSliceCapability(t, caps, []string{"settings", "validation", "patchContract"}, "sampledValidationGroups", []string{"server", "paths", "agent-scalars", "agent-prompts-and-aggregations", "agent-retry-rules", "agent-model-selection", "agent-policy", "agent-web-fetch-policy", "chapters", "containers", "editor", "codex", "routines", "update", "vnet", "shares", "provider-arrays", "provider-prefix-conflicts", "nested-unknown-strip", "secret-masking"})
 	assertStringSliceCapability(t, caps, []string{"settings", "validation", "patchContract"}, "rootAllowlist", []string{"server", "paths", "agent", "chapters", "containers", "editor", "auth", "customApiProviders", "openaiProviders", "anthropicProviders", "nkpProviders", "nugProviders", "clineProviders", "codex", "routines", "update", "vnet", "shares"})
 	assertNestedCapability(t, caps, []string{"settings", "validation", "zodGapContract"}, map[string]any{
 		"boundaryTracked":                   true,
@@ -3227,34 +3360,34 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"goMode":                            "root-allowlist-with-selected-validators",
 		"tsZodParity":                       false,
 		"fullZodUpdateSchemaParity":         false,
-		"nestedUnknownFieldParity":          "unverified",
-		"nestedUnknownFieldSmoke":           false,
+		"nestedUnknownFieldParity":          "sampled-strip",
+		"nestedUnknownFieldSmoke":           true,
 		"fullNestedSchemaValidation":        false,
-		"providerPrefixBroadSmoke":          false,
-		"providerArrayElementShapeSmoke":    false,
-		"positiveTLSTSGoSmoke":              false,
-		"legacyCodexCredentialPoolOwner":    "typescript",
-		"legacyCodexCredentialPoolMigrated": false,
-		"acceptance":                        "compare PATCH /api/settings against the full TypeScript Zod update schema, including nested unknown-field behavior, provider-array element shapes, provider-prefix conflict breadth, positive TLS save/generation cases, and legacy Codex OAuth credential-pool migration",
+		"providerPrefixBroadSmoke":          true,
+		"providerArrayElementShapeSmoke":    true,
+		"positiveTLSTSGoSmoke":              true,
+		"positiveTLSRestartSuppression":     "NARRAFORK_CONTRACT_SUPPRESS_RESTART",
+		"legacyCodexCredentialPoolOwner":    "go-compatible-migration",
+		"legacyCodexCredentialPoolMigrated": true,
+		"acceptance":                        "compare PATCH /api/settings against the full TypeScript Zod update schema; sampled nested unknown-field behavior, provider-array/prefix breadth, positive TLS save/generation, and legacy Codex OAuth credential-pool migration are covered",
 	})
-	assertStringSliceCapability(t, caps, []string{"settings", "validation", "zodGapContract"}, "unclaimedValidationFamilies", []string{
-		"nested-unknown-field-behavior",
-		"provider-array-element-shapes",
-		"provider-prefix-cross-array-breadth",
-		"positive-tls-ts-go-smoke",
-		"legacy-codex-oauth-credential-pool-migration",
-	})
+	assertStringSliceCapability(t, caps, []string{"settings", "validation", "zodGapContract"}, "unclaimedValidationFamilies", []string{})
 	assertStringSliceCapability(t, caps, []string{"settings", "validation", "zodGapContract"}, "sampledValidationFamilies", []string{
 		"root-allowlist",
+		"nested-unknown-strip",
 		"auth-jwt-rejection",
 		"masked-provider-secrets",
+		"provider-array-element-shapes",
+		"provider-prefix-cross-array-breadth",
 		"provider-prefix-conflicts",
+		"positive-tls-save-and-generate-ts-go-smoke",
+		"legacy-codex-oauth-credential-pool-migration",
 		"tls-file-existence",
 		"container-proxy-rollback",
 	})
-	assertNestedCapability(t, caps, []string{"settings", "validation", "missingMigrationDetails", "legacyCodexOAuthCredentialPool"}, map[string]any{"supported": false, "owner": "typescript", "fallback": "Use the TypeScript settings migration/import path before relying on Go for legacy Codex OAuth credential-pool settings."})
-	assertStringSliceCapability(t, caps, []string{"settings", "validation"}, "knownMissingMigrations", []string{"legacyCodexOAuthCredentialPool"})
-	assertStringSliceCapability(t, caps, []string{"settings", "validation"}, "migratedLegacyFields", []string{"editor.legacyEncoding", "agent.yoloSkipReadOnlyConfirmations", "agent.smartInterruptionCheck", "agent.defaultPermissionMode=plan", "legacy openai root", "provider prefixes", "agent.subagentAllowedModels[]", "customApiProviders protocol/defaults", "openai/anthropic provider array sync", "stale agent model references", "mcp.behavior=allow", "codex.defaultReasoningEffort=null", "proxy urls"})
+	assertNestedCapability(t, caps, []string{"settings", "validation"}, map[string]any{"legacyCodexOAuthCredentialPoolMigration": true})
+	assertStringSliceCapability(t, caps, []string{"settings", "validation"}, "knownMissingMigrations", []string{})
+	assertStringSliceCapability(t, caps, []string{"settings", "validation"}, "migratedLegacyFields", []string{"editor.legacyEncoding", "agent.yoloSkipReadOnlyConfirmations", "agent.smartInterruptionCheck", "agent.defaultPermissionMode=plan", "legacy openai root", "provider prefixes", "agent.subagentAllowedModels[]", "customApiProviders protocol/defaults", "openai/anthropic provider array sync", "stale agent model references", "mcp.behavior=allow", "codex.defaultReasoningEffort=null", "legacy Codex OAuth credential pool", "proxy urls"})
 	assertNestedCapability(t, caps, []string{"settings", "storage"}, map[string]any{"supported": true, "path": "~/.narrafork/settings.json"})
 	assertNestedCapability(t, caps, []string{"settings", "patch"}, map[string]any{"supported": true})
 	assertNestedCapability(t, caps, []string{"settings", "replacementContract"}, map[string]any{
@@ -3263,15 +3396,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"settingsPatchRootAllowlistProof":          true,
 		"maskedSecretsPreservationProof":           true,
 		"providerCompatibilitySyncProof":           true,
+		"patchResponseAugmentationProof":           true,
+		"nestedUnknownFieldParitySmoke":            true,
 		"userPreferencesRouteProof":                true,
 		"recentTabsSnapshotProof":                  true,
 		"favoritesValidationReorderProof":          true,
 		"fullZodUpdateSchemaParity":                false,
-		"nestedUnknownFieldParitySmoke":            false,
-		"providerArrayElementShapeSmoke":           false,
-		"providerPrefixBroadSmoke":                 false,
-		"positiveTLSTSGoSmoke":                     false,
-		"legacyCodexOAuthCredentialPoolMigration":  false,
+		"providerArrayElementShapeSmoke":           true,
+		"providerPrefixBroadSmoke":                 true,
+		"positiveTLSTSGoSmoke":                     true,
+		"positiveTLSTSGoRestartSuppressed":         true,
+		"legacyCodexOAuthCredentialPoolMigration":  true,
 		"recentTabsFavoritesBrowserReconnectSmoke": false,
 		"replacementSafe":                          false,
 	})
@@ -3279,16 +3414,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"settings-root-allowlist-and-selected-validators",
 		"masked-provider-tls-vnet-secret-preservation",
 		"provider-compatibility-sync",
+		"settings-patch-response-augmentation",
+		"settings-nested-unknown-strip",
+		"settings-provider-array-shape-and-prefix-breadth",
+		"settings-positive-tls-save-and-generate-ts-go-smoke",
+		"legacy-codex-oauth-credential-pool-migration",
 		"user-preferences-response-and-patch-contract",
 		"recent-tabs-snapshot-event-contract",
 		"favorites-validation-and-reorder-contract",
 	})
 	assertStringSliceCapability(t, caps, []string{"settings", "replacementContract"}, "requiredProofs", []string{
 		"full-typescript-zod-update-schema-diff",
-		"nested-unknown-field-ts-go-smoke",
-		"provider-array-element-shape-and-prefix-breadth-smoke",
-		"positive-tls-generation-and-save-ts-go-smoke",
-		"legacy-codex-oauth-credential-pool-migration-decision",
 		"recent-tabs-favorites-browser-reconnect-and-reorder-smoke",
 	})
 	assertNestedCapability(t, caps, []string{"userPreferences"}, map[string]any{"supported": true})
@@ -3861,7 +3997,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"ts-go-subagent-runtime-diff-smoke",
 		"full-ts-subagent-runtime-parity",
 	})
-	assertNestedCapability(t, caps, []string{"narrator", "reviewTools"}, map[string]any{"supported": true, "concludeReview": true, "feedbackInjection": true, "promote": true, "dismiss": true, "convertToSubagent": true, "staleMergeGuard": true, "createRollback": true, "autoStartSession": false, "startMode": "seed-message-only", "autoStartFallbackPayload": true, "autoStartFallbackCode": "REVIEW_AUTO_START_DISABLED"})
+	assertNestedCapability(t, caps, []string{"narrator", "reviewTools"}, map[string]any{"supported": true, "concludeReview": true, "feedbackInjection": true, "promote": true, "dismiss": true, "convertToSubagent": true, "staleMergeGuard": true, "createRollback": true, "autoStartSession": true, "startMode": "auto-start-background-session", "autoStartFallbackPayload": false, "autoStartOptOut": true, "autoStartOptOutStartMode": "seed-message-only"})
 	assertNestedCapability(t, caps, []string{"narrator", "browserSessions"}, map[string]any{"supported": true, "defaultEnabled": false, "fallback": false, "runtime": "go-rod", "storage": "go-owned-optional-table", "tableName": "narrator_browser_sessions", "cutover": "explicit-enable", "rollback": "explicit-disable-or-export", "reason": browserSessionsDefaultOffReason, "narratorBound": true, "lifecycleEvents": true, "artifactPersistence": true, "resourceLimits": true, "requiresChrome": true, "fullTSBrowserSessionParity": false})
 	assertNestedCapability(t, caps, []string{"narrator", "browserSessions", "routes"}, map[string]any{"list": true, "close": true, "ttl": true, "stopTracing": true, "screenshot": true})
 	assertNestedCapability(t, caps, []string{"narrator", "browserSessions", "listContract"}, map[string]any{"directArray": true, "liveFallbackWhenNoTable": true, "numericMsFields": true, "networkMetadata": true, "tracingMetadata": true})
@@ -4474,34 +4610,35 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"reason":                     shareEphemeralFallbackReason,
 	})
 	assertNestedCapability(t, caps, []string{"shares", "lifecycleSmokeContract"}, map[string]any{
-		"boundaryTracked":              true,
-		"runtimeRow":                   "RUNTIME-SHARE-01",
-		"acceptedDesign":               "go-disk-metadata-bridge-ephemeral-on-restart",
-		"focusedCleanupFixture":        true,
-		"expiredSharePrivacyFixture":   true,
-		"unknownDiskShareFixture":      true,
-		"metadataTraversalFixture":     true,
-		"browserRestartPrivacySmoke":   false,
-		"toolCreatedShareBrowserSmoke": false,
-		"tsGoRestartDiffSmoke":         false,
-		"htmlPreviewProductAccepted":   false,
-		"fullTSTimerParity":            false,
-		"fullTSProcessMemoryParity":    false,
-		"fullTSShareLifecycleParity":   false,
-		"replacementSafe":              false,
+		"boundaryTracked":                true,
+		"runtimeRow":                     "RUNTIME-SHARE-01",
+		"acceptedDesign":                 "go-disk-metadata-bridge-ephemeral-on-restart",
+		"focusedCleanupFixture":          true,
+		"expiredSharePrivacyFixture":     true,
+		"unknownDiskShareFixture":        true,
+		"metadataTraversalFixture":       true,
+		"browserRestartPrivacySmoke":     false,
+		"toolCreatedShareBrowserSmoke":   false,
+		"tsGoRestartDiffSmoke":           false,
+		"htmlPreviewProductAccepted":     false,
+		"storageCleanupPublicRouteSmoke": true,
+		"fullTSTimerParity":              false,
+		"fullTSProcessMemoryParity":      false,
+		"fullTSShareLifecycleParity":     false,
+		"replacementSafe":                false,
 	})
 	assertStringSliceCapability(t, caps, []string{"shares", "lifecycleSmokeContract"}, "sampledProofs", []string{
 		"focused-cleanup-fixture",
 		"expired-share-deletes-content",
 		"unknown-disk-share-rejected",
 		"metadata-path-traversal-rejected",
+		"storage-cleanup-share-public-route-404",
 	})
 	assertStringSliceCapability(t, caps, []string{"shares", "lifecycleSmokeContract"}, "requiredProofs", []string{
 		"browser-download-preview-before-after-restart-smoke",
 		"tool-created-share-consumer-smoke",
 		"ts-go-restart-expiry-privacy-diff-smoke",
 		"html-preview-sanitize-vs-escaped-product-acceptance",
-		"storage-cleanup-share-public-route-smoke",
 	})
 	assertNestedCapability(t, caps, []string{"shares", "lifecycleSmokeContract", "replacementContract"}, map[string]any{
 		"boundaryTracked":                true,
@@ -4516,7 +4653,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"toolCreatedShareBrowserSmoke":   false,
 		"tsGoRestartDiffSmoke":           false,
 		"htmlPreviewProductAccepted":     false,
-		"storageCleanupPublicRouteSmoke": false,
+		"storageCleanupPublicRouteSmoke": true,
 		"fullTSTimerParity":              false,
 		"fullTSProcessMemoryParity":      false,
 		"fullTSShareLifecycleParity":     false,
@@ -4527,13 +4664,13 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"expired-share-deletes-content",
 		"unknown-disk-share-rejected",
 		"metadata-path-traversal-rejected",
+		"storage-cleanup-share-public-route-404",
 	})
 	assertStringSliceCapability(t, caps, []string{"shares", "lifecycleSmokeContract", "replacementContract"}, "requiredProofs", []string{
 		"browser-download-preview-before-after-restart-smoke",
 		"tool-created-share-consumer-smoke",
 		"ts-go-restart-expiry-privacy-diff-smoke",
 		"html-preview-sanitize-vs-escaped-product-acceptance",
-		"storage-cleanup-share-public-route-smoke",
 		"full-ts-share-lifecycle-parity",
 	})
 	assertNestedCapability(t, caps, []string{"shares", "replacementContract"}, map[string]any{
@@ -4554,7 +4691,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"tsGoRestartDiffSmoke":              false,
 		"htmlPreviewSanitizeParity":         false,
 		"htmlPreviewProductAccepted":        false,
-		"storageCleanupPublicRouteSmoke":    false,
+		"storageCleanupPublicRouteSmoke":    true,
 		"fullTSShareLifecycleParity":        false,
 		"replacementSafe":                   false,
 	})
@@ -4565,13 +4702,13 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"expired-share-deletes-content",
 		"unknown-disk-share-rejected",
 		"metadata-path-traversal-rejected",
+		"storage-cleanup-share-public-route-404",
 	})
 	assertStringSliceCapability(t, caps, []string{"shares", "replacementContract"}, "requiredProofs", []string{
 		"browser-download-preview-before-after-restart-smoke",
 		"tool-created-share-consumer-smoke",
 		"ts-go-restart-expiry-privacy-diff-smoke",
 		"html-preview-sanitize-vs-escaped-product-acceptance",
-		"storage-cleanup-share-public-route-smoke",
 		"ts-share-tool-process-memory-lifecycle-diff",
 	})
 	assertNestedCapability(t, caps, []string{"shares", "ephemeralOnly"}, map[string]any{"supported": false, "fallback": true, "reason": shareEphemeralFallbackReason})

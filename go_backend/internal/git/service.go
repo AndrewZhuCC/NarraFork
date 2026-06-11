@@ -412,6 +412,55 @@ func (s *Service) LogRef(ctx context.Context, path, ref string, limit int) ([]Co
 	return commits, nil
 }
 
+func (s *Service) CommitSubjectsRange(ctx context.Context, path, baseBranch, branch string, limit int) ([]string, error) {
+	baseBranch = strings.TrimSpace(baseBranch)
+	branch = strings.TrimSpace(branch)
+	if baseBranch == "" || branch == "" {
+		return nil, fmt.Errorf("baseBranch and branch are required")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	out, err := s.run(ctx, path, "git", "log", "--format=%s", "--max-count="+strconv.Itoa(limit), baseBranch+".."+branch, "--")
+	if err != nil {
+		return nil, err
+	}
+	lines := splitLines(strings.TrimSpace(out))
+	messages := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			messages = append(messages, trimmed)
+		}
+	}
+	return messages, nil
+}
+
+func (s *Service) DiffStatRange(ctx context.Context, path, baseBranch, branch string, maxFileLines int) (string, error) {
+	baseBranch = strings.TrimSpace(baseBranch)
+	branch = strings.TrimSpace(branch)
+	if baseBranch == "" || branch == "" {
+		return "", fmt.Errorf("baseBranch and branch are required")
+	}
+	out, err := s.run(ctx, path, "git", "diff", "--stat", baseBranch+"..."+branch)
+	if err != nil {
+		return "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return "", nil
+	}
+	if maxFileLines <= 0 {
+		maxFileLines = 30
+	}
+	lines := splitLines(out)
+	if len(lines) <= maxFileLines+1 {
+		return out, nil
+	}
+	limited := append([]string{}, lines[:maxFileLines]...)
+	limited = append(limited, "...", lines[len(lines)-1])
+	return strings.Join(limited, "\n"), nil
+}
+
 func (s *Service) ShowCommit(ctx context.Context, path, sha string) (Commit, error) {
 	format := "%H%x1f%s%x1f%B%x1f%an%x1f%ae%x1f%aI"
 	out, err := s.run(ctx, path, "git", "show", "--quiet", "--pretty=format:"+format, sha)

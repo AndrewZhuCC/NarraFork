@@ -133,6 +133,45 @@ func TestSearchUsesFTSWhenTablesAreReady(t *testing.T) {
 	}
 }
 
+func TestSearchResultOrderingUsesRawFTSRankWithinRoundedScoreTies(t *testing.T) {
+	recentButLowerRelevance := map[string]any{
+		"type":                "message",
+		"matchScore":          1000,
+		"createdAt":           "2026-05-29T00:00:00Z",
+		searchInternalRankKey: -0.0000009709,
+	}
+	olderButHigherRelevance := map[string]any{
+		"type":                "message",
+		"matchScore":          1000,
+		"createdAt":           "2026-05-28T12:00:00Z",
+		searchInternalRankKey: -0.0000010308,
+	}
+	if !searchResultLess(olderButHigherRelevance, recentButLowerRelevance) {
+		t.Fatalf("expected raw FTS rank to break same-type rounded score ties before timestamps")
+	}
+}
+
+func TestSearchScoreFromRankMatchesTypeScriptRounding(t *testing.T) {
+	t.Run("rounds fractional rank instead of truncating", func(t *testing.T) {
+		got := scoreFromRank(sql.NullFloat64{Float64: -0.0015, Valid: true}, 700)
+		if got != 1002 {
+			t.Fatalf("expected TS Math.round-style score 1002, got %d", got)
+		}
+	})
+	t.Run("clamps negative scores", func(t *testing.T) {
+		got := scoreFromRank(sql.NullFloat64{Float64: 2, Valid: true}, 700)
+		if got != 0 {
+			t.Fatalf("expected negative scores to clamp to 0, got %d", got)
+		}
+	})
+	t.Run("uses fallback for null ranks", func(t *testing.T) {
+		got := scoreFromRank(sql.NullFloat64{}, 700)
+		if got != 700 {
+			t.Fatalf("expected fallback for null rank, got %d", got)
+		}
+	})
+}
+
 func TestSearchLargeMissingFTSFallsBackWithout5xx(t *testing.T) {
 	sqlDB := openSearchContractDB(t)
 	defer sqlDB.Close()

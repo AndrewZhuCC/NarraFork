@@ -128,29 +128,19 @@ type reviewRequest struct {
 	AutoStart       *bool    `json:"autoStart"`
 }
 
-const reviewAutoStartDisabledFallbackCode = "REVIEW_AUTO_START_DISABLED"
-
 func reviewCreateResponse(chapter Chapter, autoStartRequested bool) map[string]any {
 	data, _ := json.Marshal(chapter)
 	payload := map[string]any{}
 	_ = json.Unmarshal(data, &payload)
+	autoStartSession := autoStartRequested
+	startMode := "auto-start-background-session"
+	if !autoStartSession {
+		startMode = "seed-message-only"
+	}
 	payload["reviewRuntime"] = map[string]any{
 		"autoStartRequested": autoStartRequested,
-		"autoStartSession":   false,
-		"startMode":          "seed-message-only",
-	}
-	if autoStartRequested {
-		payload["fallbackCode"] = reviewAutoStartDisabledFallbackCode
-		payload["fallbacks"] = []map[string]any{
-			{
-				"code":             reviewAutoStartDisabledFallbackCode,
-				"feature":          "review.autoStartSession",
-				"requested":        true,
-				"autoStartSession": false,
-				"startMode":        "seed-message-only",
-				"reason":           "Go review creation seeds the review prompt/messages but does not auto-start a full TypeScript-equivalent narrator session.",
-			},
-		}
+		"autoStartSession":   autoStartSession,
+		"startMode":          startMode,
 	}
 	return payload
 }
@@ -218,9 +208,11 @@ func (h *Handler) mergeSession(w http.ResponseWriter, r *http.Request) error {
 	if sourceChapterIDsJSON.Valid && strings.TrimSpace(sourceChapterIDsJSON.String) != "" {
 		_ = json.Unmarshal([]byte(sourceChapterIDsJSON.String), &sourceChapterIDs)
 	}
-	conflictFiles := []string{}
+	var conflictFiles any
 	if conflictFilesJSON.Valid && strings.TrimSpace(conflictFilesJSON.String) != "" {
-		_ = json.Unmarshal([]byte(conflictFilesJSON.String), &conflictFiles)
+		var parsedConflictFiles []string
+		_ = json.Unmarshal([]byte(conflictFilesJSON.String), &parsedConflictFiles)
+		conflictFiles = parsedConflictFiles
 	}
 	steps := make([]map[string]any, 0, len(sourceChapterIDs))
 	for i, sourceID := range sourceChapterIDs {
@@ -684,12 +676,13 @@ func (h *Handler) createReview(w http.ResponseWriter, r *http.Request) error {
 		AnchorCommitSHA: req.AnchorCommitSHA,
 		AxisOffset:      req.AxisOffset,
 		CrossOffset:     req.CrossOffset,
+		AutoStart:       req.AutoStart,
 		UserID:          userID,
 	})
 	if err != nil {
 		return err
 	}
-	autoStartRequested := req.AutoStart != nil && *req.AutoStart
+	autoStartRequested := reviewAutoStartEnabled(req.AutoStart)
 	httpx.WriteJSON(w, http.StatusCreated, reviewCreateResponse(chapter, autoStartRequested))
 	return nil
 }

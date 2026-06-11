@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	gitx "narrafork-go/internal/git"
 	"narrafork-go/internal/narrators"
@@ -44,6 +45,7 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	createChapterCommitTableForCreateLifecycle(t, sqlDB)
 	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
 
+	autoStart := false
 	reviewEvents := []map[string]any{}
 	service := &Service{
 		DB:        sqlDB,
@@ -55,7 +57,7 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 			}
 		},
 	}
-	review, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en", UserID: "reviewer"})
+	review, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en", AutoStart: &autoStart, UserID: "reviewer"})
 	if err != nil {
 		t.Fatalf("CreateReview: %v", err)
 	}
@@ -147,7 +149,83 @@ func hasReviewLifecycleEvent(events []map[string]any, eventType, reviewChapterID
 	return false
 }
 
-func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
+func TestCreateReviewRouteAutoStartsNarratorSession(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	runGitReview(t, repo, "init", "-b", "main")
+	runGitReview(t, repo, "config", "user.email", "test@example.com")
+	runGitReview(t, repo, "config", "user.name", "Test User")
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "initial")
+	base := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\nfeature\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "feature")
+	head := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+
+	sqlDB := openReviewChapterDB(t)
+	defer sqlDB.Close()
+	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
+	started := make(chan string, 1)
+	service := &Service{
+		DB:  sqlDB,
+		Git: gitx.NewService(),
+		Narrators: &narrators.Service{DB: sqlDB, AgentRunner: func(_ context.Context, narratorID string) {
+			started <- narratorID
+		}},
+	}
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/source/review", strings.NewReader(`{"locale":"en","autoStart":true}`))
+	newChapterRouter(NewHandler(service)).ServeHTTP(recorder, req.WithContext(ctx))
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("review status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode review response: %v", err)
+	}
+	runtimePayload, ok := body["reviewRuntime"].(map[string]any)
+	if !ok {
+		t.Fatalf("reviewRuntime missing from review response: %#v", body)
+	}
+	if runtimePayload["autoStartRequested"] != true || runtimePayload["autoStartSession"] != true || runtimePayload["startMode"] != "auto-start-background-session" {
+		t.Fatalf("unexpected reviewRuntime auto-start payload: %#v", runtimePayload)
+	}
+	if _, ok := body["fallbackCode"]; ok {
+		t.Fatalf("auto-started review should not return fallbackCode: %#v", body)
+	}
+
+	var narratorID, status, substatus, cwd string
+	var messageCount int
+	if err := sqlDB.QueryRow(`SELECT id, status, substatus, cwd, message_count FROM narrators WHERE chapter_id IN (SELECT id FROM chapters WHERE role = 'review')`).Scan(&narratorID, &status, &substatus, &cwd, &messageCount); err != nil {
+		t.Fatalf("load review narrator: %v", err)
+	}
+	if status != "working" || !strings.Contains(substatus, "calling_model") || messageCount != 1 || strings.TrimSpace(cwd) == "" {
+		t.Fatalf("review narrator should auto-start working/calling_model, status=%q substatus=%q messages=%d cwd=%q", status, substatus, messageCount, cwd)
+	}
+	select {
+	case got := <-started:
+		if got != narratorID {
+			t.Fatalf("auto-start runner narrator = %q, want %q", got, narratorID)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("review narrator auto-start runner was not invoked")
+	}
+	var role, contentText string
+	var createdBy sql.NullString
+	if err := sqlDB.QueryRow(`SELECT role, content_text, created_by FROM narrator_messages WHERE narrator_id = ?`, narratorID).Scan(&role, &contentText, &createdBy); err != nil {
+		t.Fatalf("load review start message: %v", err)
+	}
+	if role != "user" || contentText != reviewStartMessage("en") || createdBy.Valid {
+		t.Fatalf("auto-start review message = role %q text %q createdBy %#v", role, contentText, createdBy)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_messages WHERE role = 'assistant'`); count != 0 {
+		t.Fatalf("review auto-start proof should not require assistant output in route fixture, count=%d", count)
+	}
+}
+
+func TestCreateReviewRouteCanExplicitlySeedWithoutAutoStart(t *testing.T) {
 	ctx := context.Background()
 	repo := t.TempDir()
 	runGitReview(t, repo, "init", "-b", "main")
@@ -167,7 +245,7 @@ func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
 	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
 	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
 	recorder := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/source/review", strings.NewReader(`{"locale":"en","autoStart":true}`))
+	req := httptest.NewRequest(http.MethodPost, "/source/review", strings.NewReader(`{"locale":"en","autoStart":false}`))
 	newChapterRouter(NewHandler(service)).ServeHTTP(recorder, req.WithContext(ctx))
 	if recorder.Code != http.StatusCreated {
 		t.Fatalf("review status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -180,19 +258,8 @@ func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
 	if !ok {
 		t.Fatalf("reviewRuntime missing from review response: %#v", body)
 	}
-	if runtimePayload["autoStartRequested"] != true || runtimePayload["autoStartSession"] != false || runtimePayload["startMode"] != "seed-message-only" {
-		t.Fatalf("unexpected reviewRuntime fallback payload: %#v", runtimePayload)
-	}
-	if body["fallbackCode"] != reviewAutoStartDisabledFallbackCode {
-		t.Fatalf("fallbackCode = %#v", body["fallbackCode"])
-	}
-	fallbacks, ok := body["fallbacks"].([]any)
-	if !ok || len(fallbacks) != 1 {
-		t.Fatalf("fallbacks = %#v", body["fallbacks"])
-	}
-	fallback, ok := fallbacks[0].(map[string]any)
-	if !ok || fallback["code"] != reviewAutoStartDisabledFallbackCode || fallback["feature"] != "review.autoStartSession" || fallback["requested"] != true {
-		t.Fatalf("unexpected fallback entry: %#v", fallbacks[0])
+	if runtimePayload["autoStartRequested"] != false || runtimePayload["autoStartSession"] != false || runtimePayload["startMode"] != "seed-message-only" {
+		t.Fatalf("unexpected reviewRuntime seed-only payload: %#v", runtimePayload)
 	}
 
 	var narratorID, status, substatus, cwd string
@@ -201,7 +268,7 @@ func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
 		t.Fatalf("load review narrator: %v", err)
 	}
 	if status != "idle" || substatus != "[]" || messageCount != 1 || strings.TrimSpace(cwd) == "" {
-		t.Fatalf("review narrator should stay seed-only/idle after autoStart request, status=%q substatus=%q messages=%d cwd=%q", status, substatus, messageCount, cwd)
+		t.Fatalf("review narrator should stay seed-only/idle after explicit opt-out, status=%q substatus=%q messages=%d cwd=%q", status, substatus, messageCount, cwd)
 	}
 	var role, contentText string
 	var createdBy sql.NullString
@@ -210,9 +277,6 @@ func TestCreateReviewRouteIgnoresAutoStartAndSeedsIdleNarrator(t *testing.T) {
 	}
 	if role != "user" || contentText != reviewStartMessage("en") || createdBy.Valid {
 		t.Fatalf("seeded review message = role %q text %q createdBy %#v", role, contentText, createdBy)
-	}
-	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_messages WHERE role = 'assistant'`); count != 0 {
-		t.Fatalf("review autoStart fallback should not create assistant/session messages, count=%d", count)
 	}
 }
 
@@ -234,6 +298,13 @@ func TestCreateReviewRollsBackWhenInitializeNarratorFails(t *testing.T) {
 	sqlDB := openReviewChapterDB(t)
 	defer sqlDB.Close()
 	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
+	if _, err := sqlDB.Exec(`CREATE TRIGGER seed_review_rollback_child_rows AFTER INSERT ON narrators BEGIN
+		INSERT INTO narrator_tool_calls (id, narrator_id) VALUES ('review-tool-call', NEW.id);
+		INSERT INTO narrator_sidecars (id, narrator_id) VALUES ('review-sidecar', NEW.id);
+		INSERT INTO narrator_goals (id, narrator_id) VALUES ('review-goal', NEW.id);
+	END;`); err != nil {
+		t.Fatalf("create rollback child-row trigger: %v", err)
+	}
 	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_review_prompt_update BEFORE UPDATE OF system_prompt ON narrators BEGIN SELECT RAISE(ABORT, 'review prompt update blocked'); END;`); err != nil {
 		t.Fatalf("create prompt trigger: %v", err)
 	}
@@ -259,12 +330,74 @@ func TestCreateReviewRollsBackWhenInitializeNarratorFails(t *testing.T) {
 	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM narrator_message_refs`); count != 0 {
 		t.Fatalf("review message refs should be rolled back, count=%d", count)
 	}
+	for _, table := range []string{"narrator_tool_calls", "narrator_sidecars", "narrator_goals"} {
+		if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM `+table); count != 0 {
+			t.Fatalf("%s should be rolled back, count=%d", table, count)
+		}
+	}
 	if branches := strings.TrimSpace(runGitReview(t, repo, "branch", "--list", "review/*")); branches != "" {
 		t.Fatalf("review branch should be deleted, got %q", branches)
 	}
 	worktreesDir := filepath.Join(repo, ".worktrees")
 	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
 		t.Fatalf("review worktree should be removed, entries=%d", len(entries))
+	} else if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read worktrees dir: %v", err)
+	}
+}
+
+func TestCreateReviewRollsBackWhenAutoStartFails(t *testing.T) {
+	ctx := context.Background()
+	repo := t.TempDir()
+	runGitReview(t, repo, "init", "-b", "main")
+	runGitReview(t, repo, "config", "user.email", "test@example.com")
+	runGitReview(t, repo, "config", "user.name", "Test User")
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "initial")
+	base := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+	writeFileReview(t, filepath.Join(repo, "tracked.txt"), "base\nfeature\n")
+	runGitReview(t, repo, "add", "tracked.txt")
+	runGitReview(t, repo, "commit", "-m", "feature")
+	head := strings.TrimSpace(runGitReview(t, repo, "rev-parse", "HEAD"))
+
+	sqlDB := openReviewChapterDB(t)
+	defer sqlDB.Close()
+	insertReviewProjectAndSource(t, sqlDB, repo, base, head)
+	if _, err := sqlDB.Exec(`CREATE TRIGGER seed_review_start_failure_child_rows AFTER INSERT ON narrators BEGIN
+		INSERT INTO narrator_tool_calls (id, narrator_id) VALUES ('review-tool-call', NEW.id);
+		INSERT INTO narrator_sidecars (id, narrator_id) VALUES ('review-sidecar', NEW.id);
+		INSERT INTO narrator_goals (id, narrator_id) VALUES ('review-goal', NEW.id);
+	END;`); err != nil {
+		t.Fatalf("create start-failure child-row trigger: %v", err)
+	}
+	if _, err := sqlDB.Exec(`CREATE TRIGGER fail_review_auto_start BEFORE UPDATE OF status ON narrators WHEN NEW.status = 'working' BEGIN SELECT RAISE(ABORT, 'review auto-start blocked'); END;`); err != nil {
+		t.Fatalf("create auto-start trigger: %v", err)
+	}
+
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	_, err := service.CreateReview(ctx, "source", ReviewInput{Locale: "en", UserID: "reviewer"})
+	if err == nil || !strings.Contains(err.Error(), "initialize review narrator auto-start message") {
+		t.Fatalf("expected auto-start error, got %v", err)
+	}
+
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM chapters WHERE role = 'review' OR review_source_chapter_id = 'source'`); count != 0 {
+		t.Fatalf("review chapter should be rolled back after auto-start failure, count=%d", count)
+	}
+	if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM chapter_edges WHERE type = 'review' OR source_id = 'source'`); count != 0 {
+		t.Fatalf("review edge should be rolled back after auto-start failure, count=%d", count)
+	}
+	for _, table := range []string{"narrators", "narrator_messages", "narrator_message_refs", "narrator_tool_calls", "narrator_sidecars", "narrator_goals"} {
+		if count := countRowsReview(t, sqlDB, `SELECT COUNT(*) FROM `+table); count != 0 {
+			t.Fatalf("%s should be rolled back after auto-start failure, count=%d", table, count)
+		}
+	}
+	if branches := strings.TrimSpace(runGitReview(t, repo, "branch", "--list", "review/*")); branches != "" {
+		t.Fatalf("review branch should be deleted after auto-start failure, got %q", branches)
+	}
+	worktreesDir := filepath.Join(repo, ".worktrees")
+	if entries, err := os.ReadDir(worktreesDir); err == nil && len(entries) > 0 {
+		t.Fatalf("review worktree should be removed after auto-start failure, entries=%d", len(entries))
 	} else if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read worktrees dir: %v", err)
 	}
@@ -293,8 +426,9 @@ func TestInitializeReviewNarratorReturnsStartMessageError(t *testing.T) {
 	}
 	worktree := t.TempDir()
 	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+	autoStart := false
 
-	err := service.initializeReviewNarrator(context.Background(), "review-narrator", worktree, Chapter{WorktreePath: &worktree}, "", ReviewInput{Locale: "en", UserID: "reviewer"})
+	err := service.initializeReviewNarrator(context.Background(), "review-narrator", worktree, Chapter{WorktreePath: &worktree}, "", ReviewInput{Locale: "en", AutoStart: &autoStart, UserID: "reviewer"})
 	if err == nil || !strings.Contains(err.Error(), "initialize review narrator start message") {
 		t.Fatalf("expected start message error, got %v", err)
 	}
@@ -384,6 +518,9 @@ func openReviewChapterDB(t *testing.T) *sql.DB {
 			is_compact INTEGER DEFAULT 0,
 			segment_compact_id TEXT
 		)`,
+		`CREATE TABLE narrator_tool_calls (id TEXT PRIMARY KEY, narrator_id TEXT)`,
+		`CREATE TABLE narrator_sidecars (id TEXT PRIMARY KEY, narrator_id TEXT)`,
+		`CREATE TABLE narrator_goals (id TEXT PRIMARY KEY, narrator_id TEXT)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := sqlDB.Exec(stmt); err != nil {

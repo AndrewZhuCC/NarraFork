@@ -937,6 +937,11 @@ import { cleanupStaleShares } from "./lib/shares";
 
 cleanupStaleShares();
 
+// Periodically remove old per-directory skill summary caches.
+import { startSkillCacheCleanupTimer } from "./services/skill-service";
+
+startSkillCacheCleanupTimer();
+
 // Start IM Gateway (Telegram, Discord, Slack, Feishu, Webhook)
 import { gateway } from "./gateway/gateway";
 

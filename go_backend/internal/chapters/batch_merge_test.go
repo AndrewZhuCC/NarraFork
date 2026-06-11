@@ -24,10 +24,13 @@ func TestBatchMergeRunsInBackgroundAndPersistsProgress(t *testing.T) {
 	insertBatchMergeProjectAndChapters(t, sqlDB, repo, targetWorktree)
 
 	events := make(chan map[string]any, 8)
+	syncedProjects := make(chan string, 1)
 	service := &Service{DB: sqlDB, Git: gitx.NewService(), BroadcastMergeProgress: func(payload any) {
 		if event, ok := payload.(map[string]any); ok {
 			events <- event
 		}
+	}, SyncProjectDBAfterBatchMerge: func(projectID string) {
+		syncedProjects <- projectID
 	}}
 
 	result, err := service.BatchMerge(ctx, BatchMergeInput{
@@ -46,6 +49,14 @@ func TestBatchMergeRunsInBackgroundAndPersistsProgress(t *testing.T) {
 	session := waitForMergeSessionStatus(t, sqlDB, result.MergeSessionID, "completed", 3*time.Second)
 	if session.currentIndex != 2 || session.mergedCount != 2 || session.error.Valid {
 		t.Fatalf("session progress = %#v, want currentIndex=2 mergedCount=2 no error", session)
+	}
+	select {
+	case projectID := <-syncedProjects:
+		if projectID != "project" {
+			t.Fatalf("project DB sync project = %q, want project", projectID)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for project DB sync hook")
 	}
 
 	seen := drainMergeEventTypes(events)
@@ -87,6 +98,9 @@ func TestBatchMergeRouteReturnsAsyncSessionContractAndSessionEndpoint(t *testing
 	if session["id"] != mergeSessionID || session["targetChapterId"] != "target" || session["status"] != "completed" || session["mergedCount"] != float64(2) || session["currentIndex"] != float64(2) {
 		t.Fatalf("unexpected merge session response: %#v", session)
 	}
+	if session["currentSourceChapterId"] != nil || session["conflictFiles"] != nil || session["error"] != nil {
+		t.Fatalf("completed merge session should clear current source/conflicts/error, got %#v", session)
+	}
 	steps, ok := session["steps"].([]any)
 	if !ok || len(steps) != 2 {
 		t.Fatalf("unexpected merge session steps: %#v", session["steps"])
@@ -96,6 +110,50 @@ func TestBatchMergeRouteReturnsAsyncSessionContractAndSessionEndpoint(t *testing
 		if !ok || step["status"] != "completed" || step["sourceChapterId"] == "" {
 			t.Fatalf("unexpected merge session step: %#v", rawStep)
 		}
+	}
+}
+
+func TestBatchMergeSessionEndpointPollsWaitingDecisionState(t *testing.T) {
+	sqlDB := newBatchMergeTestDB(t)
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err := sqlDB.Exec(`INSERT INTO merge_sessions (
+		id, target_chapter_id, source_chapter_ids, strategy, status, current_index, merged_count,
+		current_source_chapter_id, conflict_files, locale, created_at, updated_at
+	) VALUES (
+		'waiting_session', 'target', '["source1","source2"]', 'merge', 'waiting_decision', 0, 0,
+		'source1', '["shared.txt"]', 'en', ?, ?
+	)`, now, now)
+	if err != nil {
+		t.Fatalf("insert waiting merge session: %v", err)
+	}
+
+	handler := NewHandler(&Service{DB: sqlDB, Git: gitx.NewService()})
+	w := serveChapterRouteContractRequest(handler, http.MethodGet, "/chapters/merge-sessions/waiting_session", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("merge session status = %d body=%s", w.Code, w.Body.String())
+	}
+	var session map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &session); err != nil {
+		t.Fatalf("decode merge session response: %v", err)
+	}
+	if session["id"] != "waiting_session" || session["status"] != "waiting_decision" || session["currentSourceChapterId"] != "source1" || session["locale"] != "en" {
+		t.Fatalf("unexpected waiting session response: %#v", session)
+	}
+	conflictFiles, ok := session["conflictFiles"].([]any)
+	if !ok || len(conflictFiles) != 1 || conflictFiles[0] != "shared.txt" {
+		t.Fatalf("conflictFiles = %#v, want shared.txt", session["conflictFiles"])
+	}
+	steps, ok := session["steps"].([]any)
+	if !ok || len(steps) != 2 {
+		t.Fatalf("steps = %#v, want 2 entries", session["steps"])
+	}
+	firstStep, ok := steps[0].(map[string]any)
+	if !ok || firstStep["status"] != "waiting_decision" || firstStep["sourceChapterId"] != "source1" {
+		t.Fatalf("first step = %#v, want waiting source1", steps[0])
+	}
+	secondStep, ok := steps[1].(map[string]any)
+	if !ok || secondStep["status"] != "pending" || secondStep["sourceChapterId"] != "source2" {
+		t.Fatalf("second step = %#v, want pending source2", steps[1])
 	}
 }
 
@@ -213,6 +271,22 @@ func TestBatchMergeConflictDecisionCancelRollsBackWithUserReason(t *testing.T) {
 		t.Fatalf("conflict_files = %q, want shared.txt", session.conflictFiles.String)
 	}
 
+	var targetStatus string
+	var preservedWorktree sql.NullString
+	if err := sqlDB.QueryRow(`SELECT status, worktree_path FROM chapters WHERE id = 'target'`).Scan(&targetStatus, &preservedWorktree); err != nil {
+		t.Fatalf("query target chapter after cancel: %v", err)
+	}
+	if targetStatus != "active" || !preservedWorktree.Valid || preservedWorktree.String != targetWorktree {
+		t.Fatalf("target chapter after cancel = status %q worktree %#v, want preserved active target", targetStatus, preservedWorktree)
+	}
+	status, err := service.Git.Status(ctx, targetWorktree)
+	if err != nil {
+		t.Fatalf("git status target after cancel: %v", err)
+	}
+	if !status.Clean || strings.TrimSpace(status.Raw) != "" {
+		t.Fatalf("target worktree status = clean %v raw %q, want clean preserved target", status.Clean, status.Raw)
+	}
+
 	seen := drainMergeEventTypes(events)
 	for _, want := range []string{"merge:conflict", "merge:cancelled"} {
 		if !seen[want] {
@@ -263,6 +337,60 @@ func TestBatchMergeConflictDecisionTimeoutFallsBackToError(t *testing.T) {
 
 	seen := drainMergeEventTypes(events)
 	for _, want := range []string{"merge:conflict", "merge:cancelled"} {
+		if !seen[want] {
+			t.Fatalf("missing WS progress event %q in %#v", want, seen)
+		}
+	}
+}
+
+func TestBatchMergeConflictContinueAIResolutionFailureRollsBack(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := newBatchMergeTestDB(t)
+	repo, targetWorktree := setupBatchMergeRepo(t, true)
+	insertBatchMergeProjectAndChapters(t, sqlDB, repo, targetWorktree)
+
+	events := make(chan map[string]any, 12)
+	service := &Service{
+		DB:                    sqlDB,
+		Git:                   gitx.NewService(),
+		MergeDecisionTimeout:  time.Second,
+		MergeDecisionInterval: 10 * time.Millisecond,
+		BroadcastMergeProgress: func(payload any) {
+			if event, ok := payload.(map[string]any); ok {
+				events <- event
+				if event["type"] == "merge:conflict" {
+					mergeSessionID, _ := event["mergeSessionId"].(string)
+					if mergeSessionID != "" {
+						_, _ = sqlDB.Exec(`UPDATE merge_sessions SET status = 'running' WHERE id = ?`, mergeSessionID)
+					}
+				}
+			}
+		},
+	}
+
+	result, err := service.BatchMerge(ctx, BatchMergeInput{
+		BaseChapterID:    "target",
+		TargetChapterID:  "target",
+		SourceChapterIDs: []string{"source1"},
+		Strategy:         "merge",
+	})
+	if err != nil {
+		t.Fatalf("BatchMerge: %v", err)
+	}
+
+	session := waitForMergeSessionStatus(t, sqlDB, result.MergeSessionID, "error", 3*time.Second)
+	if session.currentIndex != 0 || session.mergedCount != 0 {
+		t.Fatalf("session progress = %#v, want stopped at first item", session)
+	}
+	if !session.error.Valid || !strings.Contains(session.error.String, "Target chapter has no primary narrator") {
+		t.Fatalf("session error = %#v, want missing narrator AI-resolution failure", session.error)
+	}
+	if !strings.Contains(session.conflictFiles.String, "shared.txt") {
+		t.Fatalf("conflict_files = %q, want shared.txt", session.conflictFiles.String)
+	}
+
+	seen := drainMergeEventTypes(events)
+	for _, want := range []string{"merge:conflict", "merge:ai_resolving", "merge:error", "merge:cancelled"} {
 		if !seen[want] {
 			t.Fatalf("missing WS progress event %q in %#v", want, seen)
 		}
@@ -339,6 +467,9 @@ CREATE TABLE merge_sessions (
 	strategy TEXT NOT NULL DEFAULT 'merge', status TEXT NOT NULL, current_index INTEGER NOT NULL DEFAULT 0,
 	merged_count INTEGER NOT NULL DEFAULT 0, current_source_chapter_id TEXT, conflict_files TEXT,
 	error TEXT, locale TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE narrators (
+	id TEXT PRIMARY KEY, chapter_id TEXT, variant TEXT, model TEXT, created_at TEXT
 );
 `)
 	if err != nil {

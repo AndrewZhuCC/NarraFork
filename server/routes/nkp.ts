@@ -148,11 +148,17 @@ export function getNkpCachedModelsByProvider(providerId: string): NkpModelInfo[]
 	return cachedModelsByProvider.get(providerId) ?? [];
 }
 
-/** Get all cached models across all providers. */
+function activeNkpProviderIds(): Set<string> {
+	return new Set((settings.nkpProviders ?? []).filter((p) => !p.disabled).map((p) => p.id));
+}
+
+/** Get all cached models across active providers. */
 export function getNkpCachedModels(): NkpModelInfo[] {
+	const providerIds = activeNkpProviderIds();
 	const seen = new Set<string>();
 	const result: NkpModelInfo[] = [];
-	for (const models of cachedModelsByProvider.values()) {
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		for (const m of models) {
 			const id = String(m.model_id ?? m.modelId ?? "");
 			if (id && !seen.has(id)) {
@@ -182,7 +188,9 @@ export function getNkpCachedModelsGrouped(): Array<{
 
 // Register model checker and lister
 registerNkpModelChecker((model) => {
-	for (const models of cachedModelsByProvider.values()) {
+	const providerIds = activeNkpProviderIds();
+	for (const [providerId, models] of cachedModelsByProvider) {
+		if (!providerIds.has(providerId)) continue;
 		if (models.some((m) => String(m.model_id ?? m.modelId ?? "") === model)) return true;
 	}
 	return false;

@@ -80,6 +80,7 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	vacuum, _ := storage["vacuum"].(map[string]any)
 	cleanup, _ := storage["cleanup"].(map[string]any)
 	cleanupUploads, _ := cleanup["uploads"].(map[string]any)
+	cleanupResponse, _ := cleanup["responseContract"].(map[string]any)
 	cleanupWorktrees, _ := cleanup["worktrees"].(map[string]any)
 	cleanupContainers, _ := cleanup["containers"].(map[string]any)
 	gatewayRuntime, _ := gateway["runtimeContract"].(map[string]any)
@@ -95,6 +96,9 @@ func TestHealthExposesVersionCommitAndRuntimeCapabilities(t *testing.T) {
 	}
 	if cleanupReason, _ := cleanupWorktrees["reason"].(string); cleanupReason != "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent." {
 		t.Fatalf("unexpected cleanup worktrees reason: %#v", cleanupWorktrees)
+	}
+	if cleanupResponse["uploadShareCleanupTSGoSmoke"] != true || cleanupResponse["invalidTargetTSGoSmoke"] != true || cleanupResponse["emptyDirectoryResponseIsStable"] != true || cleanupResponse["successInvalidatesStorageCache"] != true {
+		t.Fatalf("unexpected cleanup response contract: %#v", cleanupResponse)
 	}
 	if cleanupWorktrees["runtimeRerouteAvailable"] != true || cleanupWorktrees["runtimeRerouteTarget"] != "runtime.cleanup.worktrees" {
 		t.Fatalf("unexpected cleanup worktrees reroute contract: %#v", cleanupWorktrees)

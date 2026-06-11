@@ -1571,6 +1571,12 @@ func (h *Handler) setStorageScanCache(payload map[string]any) {
 	h.storageScanCache = payload
 }
 
+func (h *Handler) clearStorageScanCache() {
+	h.storageScanMu.Lock()
+	defer h.storageScanMu.Unlock()
+	h.storageScanCache = nil
+}
+
 func (h *Handler) storageCachedResponse() map[string]any {
 	h.storageScanMu.RLock()
 	cached := h.storageScanCache
@@ -1627,9 +1633,11 @@ func (h *Handler) cleanupStorage(w http.ResponseWriter, r *http.Request) error {
 	case "shares":
 		memoryRemoved := shareRecords.clearMemory()
 		removed, freed := removeChildren(sharesRoot())
+		h.clearStorageScanCache()
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "freedBytes": freed, "memoryRemoved": memoryRemoved})
 	case "uploads":
 		removed, freed := h.cleanupOrphanedUploads(r)
+		h.clearStorageScanCache()
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "removed": removed, "freedBytes": freed})
 	case "worktrees":
 		storageCleanupUnsupported(w, "storage.cleanup.worktrees", "STORAGE_CLEANUP_WORKTREES_UNSUPPORTED", "Storage cleanup does not remove git worktrees in go_backend; use chapter/runtime cleanup so git state and chapter metadata stay consistent.")
@@ -1891,6 +1899,7 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 	preview["freedBytes"] = maxInt64(0, before-after)
 	preview["vacuumRan"] = false
 	preview["changed"] = changed
+	h.clearStorageScanCache()
 	httpx.WriteJSON(w, http.StatusOK, preview)
 	return nil
 }
@@ -2923,6 +2932,9 @@ func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
 	} else if !ok {
 		return httpx.NotFound("Chapter")
 	}
+	if err := h.ensureRootWorktreeClean(r.Context(), projectID, "MERGE_DIRTY_TRUNK"); err != nil {
+		return err
+	}
 	if err := h.ensureSourceWorktreeClean(r.Context(), sourceID); err != nil {
 		return err
 	}
@@ -2930,42 +2942,100 @@ func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	result, err := h.Chapters.Merge(r.Context(), sourceID, targetID, body.Strategy, body.Message, optionalUserID(r))
+	userID := optionalUserID(r)
+	result, err := h.Chapters.Merge(r.Context(), sourceID, targetID, body.Strategy, body.Message, userID)
 	if err != nil {
 		return err
 	}
 	if ok, _ := result["ok"].(bool); !ok {
-		aiResult, err := h.Chapters.AIResolve(r.Context(), sourceID, targetID, body.Strategy, body.Message, optionalUserID(r), "")
+		locale := h.userLanguage(r.Context(), userID)
+		aiResult, err := h.Chapters.AIResolve(r.Context(), sourceID, targetID, body.Strategy, body.Message, userID, locale)
 		if err != nil {
 			return err
 		}
 		if resolved, _ := aiResult["resolved"].(bool); resolved {
-			response := map[string]any{}
-			if mergeResult, ok := aiResult["mergeResult"].(map[string]any); ok {
-				for key, value := range mergeResult {
-					response[key] = value
-				}
-			}
-			response["success"] = true
-			response["aiResolved"] = true
-			response["resolvedConflictFiles"] = result["conflictFiles"]
+			response := rulerAIResolveSuccessResponse(result, aiResult)
 			h.deleteRulerMergedBranch(r.Context(), projectID, sourceID)
 			httpx.WriteJSON(w, http.StatusOK, response)
 			return nil
 		}
-		httpx.WriteJSON(w, http.StatusConflict, map[string]any{
-			"success":        false,
-			"conflictFiles":  result["conflictFiles"],
-			"aiAttempted":    true,
-			"aiError":        aiResult["error"],
-			"remainingFiles": aiResult["remainingFiles"],
-		})
+		httpx.WriteJSON(w, http.StatusConflict, rulerAIResolveConflictResponse(result, aiResult))
 		return nil
 	}
 	result["success"] = true
 	h.deleteRulerMergedBranch(r.Context(), projectID, sourceID)
 	httpx.WriteJSON(w, http.StatusOK, result)
 	return nil
+}
+
+func rulerAIResolveSuccessResponse(mergeResult map[string]any, aiResult map[string]any) map[string]any {
+	response := map[string]any{}
+	if nested, ok := aiResult["mergeResult"].(map[string]any); ok {
+		for key, value := range nested {
+			response[key] = value
+		}
+	}
+	response["success"] = true
+	response["aiResolved"] = true
+	response["resolvedConflictFiles"] = mergeResult["conflictFiles"]
+	copyRulerAIResolveContractFields(response, aiResult)
+	return response
+}
+
+func rulerAIResolveConflictResponse(mergeResult map[string]any, aiResult map[string]any) map[string]any {
+	response := map[string]any{
+		"success":        false,
+		"conflictFiles":  mergeResult["conflictFiles"],
+		"aiAttempted":    true,
+		"aiError":        aiResult["error"],
+		"remainingFiles": aiResult["remainingFiles"],
+	}
+	copyRulerAIResolveContractFields(response, aiResult)
+	return response
+}
+
+func copyRulerAIResolveContractFields(response map[string]any, aiResult map[string]any) {
+	for _, key := range []string{
+		"mode",
+		"fallbackCode",
+		"fallbacks",
+		"usesNarratorSession",
+		"requiresFullNarrator",
+		"tempChapterId",
+		"transcriptPersisted",
+		"transcriptMode",
+		"transcriptWarning",
+	} {
+		if value, ok := aiResult[key]; ok {
+			response[key] = value
+		}
+	}
+	if _, ok := response["tempChapterAIConflictResolution"]; !ok {
+		response["tempChapterAIConflictResolution"] = false
+	}
+	if _, ok := response["tempChapterAIFallbackContract"]; !ok {
+		response["tempChapterAIFallbackContract"] = true
+	}
+	if _, ok := response["tempChapterAIConflictResolutionMode"]; !ok {
+		response["tempChapterAIConflictResolutionMode"] = "unsupported-one-shot-fallback"
+	}
+	if _, ok := response["tempChapterAIFallbackCode"]; !ok {
+		if fallbackCode, _ := response["fallbackCode"].(string); strings.TrimSpace(fallbackCode) != "" {
+			response["tempChapterAIFallbackCode"] = fallbackCode
+		} else {
+			response["tempChapterAIFallbackCode"] = "merge.aiResolveOneShotBasic"
+		}
+	}
+	if _, ok := response["tempChapterAIRequiresNarrator"]; !ok {
+		if requires, ok := response["requiresFullNarrator"].(bool); ok {
+			response["tempChapterAIRequiresNarrator"] = requires
+		} else {
+			response["tempChapterAIRequiresNarrator"] = false
+		}
+	}
+	if _, ok := response["tempChapterPreserved"]; !ok {
+		response["tempChapterPreserved"] = false
+	}
 }
 
 func (h *Handler) rulerRebase(w http.ResponseWriter, r *http.Request) error {
@@ -3098,7 +3168,8 @@ func (h *Handler) rulerRebaseResolve(w http.ResponseWriter, r *http.Request) err
 		if err != nil {
 			return err
 		}
-		_, err = h.Narrators.AddUserMessage(r.Context(), narratorID, userID, rebaseConflictPrompt(trunkBranch, conflictFiles))
+		locale := h.userLanguage(r.Context(), userID)
+		_, err = h.Narrators.AddUserMessage(r.Context(), narratorID, userID, rebaseConflictPrompt(trunkBranch, conflictFiles, locale))
 		if err != nil {
 			return err
 		}
@@ -3182,6 +3253,24 @@ func (h *Handler) ensureSourceWorktreeClean(ctx context.Context, sourceID string
 	return nil
 }
 
+func (h *Handler) ensureRootWorktreeClean(ctx context.Context, projectID, code string) error {
+	if h.Git == nil {
+		return nil
+	}
+	rootID, err := h.rootChapterID(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	var worktree sql.NullString
+	if err := h.DB.QueryRowContext(ctx, `SELECT worktree_path FROM chapters WHERE id = ?`, rootID).Scan(&worktree); err != nil {
+		return err
+	}
+	if !worktree.Valid || worktree.String == "" {
+		return nil
+	}
+	return h.ensureWorktreeClean(ctx, worktree.String, code)
+}
+
 func (h *Handler) ensureWorktreeClean(ctx context.Context, worktreePath, code string) error {
 	if h.Git == nil || strings.TrimSpace(worktreePath) == "" {
 		return nil
@@ -3216,20 +3305,70 @@ func (h *Handler) primaryNarratorIDOrCreate(ctx context.Context, chapterID strin
 	return narrator.ID, nil
 }
 
-func rebaseConflictPrompt(ontoBranch string, conflictFiles []gitx.ConflictFile) string {
-	var builder strings.Builder
-	builder.WriteString("Please resolve the current git rebase conflicts while rebasing this chapter onto ")
-	builder.WriteString(ontoBranch)
-	builder.WriteString(".\n\nConflict files:\n")
-	if len(conflictFiles) == 0 {
-		builder.WriteString("  - No conflicted files are currently reported by git, but the rebase is still awaiting resolution.\n")
-	} else {
-		for _, file := range conflictFiles {
-			builder.WriteString(fmt.Sprintf("  - %s (%d conflict marker(s))\n", file.File, file.ConflictLines))
-		}
+func rebaseConflictPrompt(ontoBranch string, conflictFiles []gitx.ConflictFile, locale string) string {
+	fileList := rebaseConflictFileList(conflictFiles)
+	if locale == "zh-CN" {
+		return strings.ReplaceAll(strings.ReplaceAll(`在变基到 "{ontoBranch}" 时，以下文件产生了冲突：
+
+{fileList}
+
+请解决这些文件中的所有变基冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 编辑文件以生成正确的结果，移除所有冲突标记
+3. 确保解决后的代码可以编译且逻辑正确
+
+解决完当前步骤的所有冲突后，运行：
+  git add -A && git -c core.editor=true rebase --continue
+
+如果 rebase --continue 产生了新的冲突（来自后续的 commit），请重复此过程：解决新冲突，然后再次运行 git add -A && git -c core.editor=true rebase --continue。持续进行直到变基完全完成。
+
+不要运行 git rebase --abort。`, "{ontoBranch}", ontoBranch), "{fileList}", fileList)
 	}
-	builder.WriteString("\nAfter resolving the files, stage the resolved changes and continue the rebase with `git rebase --continue`. If continuing is unsafe, explain the blocker clearly.")
-	return builder.String()
+	return strings.ReplaceAll(strings.ReplaceAll(`A git rebase onto "{ontoBranch}" has produced conflicts in the following files:
+
+{fileList}
+
+Please resolve all rebase conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Edit the file to produce the correct result, removing all conflict markers
+3. Make sure the resolved code compiles and makes sense
+
+After resolving ALL conflicts in the current step, run:
+  git add -A && git -c core.editor=true rebase --continue
+
+If rebase --continue produces new conflicts (from a subsequent commit), repeat the process: resolve the new conflicts, then run git add -A && git -c core.editor=true rebase --continue again. Keep going until the rebase is fully complete.
+
+Do NOT run git rebase --abort.`, "{ontoBranch}", ontoBranch), "{fileList}", fileList)
+}
+
+func rebaseConflictFileList(conflictFiles []gitx.ConflictFile) string {
+	if len(conflictFiles) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(conflictFiles))
+	for _, file := range conflictFiles {
+		lines = append(lines, fmt.Sprintf("  - %s (%d conflict(s))", file.File, file.ConflictLines))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (h *Handler) userLanguage(ctx context.Context, userID string) string {
+	if h == nil || h.DB == nil || strings.TrimSpace(userID) == "" {
+		return "en"
+	}
+	var language sql.NullString
+	if err := h.DB.QueryRowContext(ctx, `SELECT language FROM user_preferences WHERE user_id = ? LIMIT 1`, userID).Scan(&language); err != nil {
+		return "en"
+	}
+	if !language.Valid {
+		return "en"
+	}
+	switch strings.TrimSpace(language.String) {
+	case "zh-CN":
+		return "zh-CN"
+	default:
+		return "en"
+	}
 }
 
 func (h *Handler) projectGitPathAndDefaultBranch(ctx context.Context, projectID string) (string, string, error) {

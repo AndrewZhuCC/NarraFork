@@ -246,6 +246,7 @@ func run() error {
 	chapterService := chapters.NewService(dbStore.SQL, gitService, narratorService, terminalRuntime, settings)
 	chapterService.SetMergeProgressBroadcaster(hub.BroadcastMergeProgress)
 	chapterService.SetChapterLifecycleBroadcasters(hub.BroadcastMergeProgress, hub.BroadcastUser)
+	chapterService.SetNarratorBroadcaster(hub.BroadcastNarrator)
 	if cleaned, err := chapterService.CleanupStaleMergeSessions(ctx); err != nil {
 		slog.Warn("merge session cleanup failed", "error", err)
 	} else if cleaned > 0 {

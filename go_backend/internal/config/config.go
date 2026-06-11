@@ -1,14 +1,20 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"narrafork-go/internal/id"
 )
@@ -362,6 +368,7 @@ func migrateLegacySettings(raw, legacyRaw map[string]any) bool {
 		changed = true
 	}
 	changed = migrateLegacyOpenAISettings(raw) || changed
+	changed = migrateLegacyCodexOAuthCredentialPool(raw) || changed
 	changed = normalizeProviderPrefixes(raw) || changed
 	changed = normalizeCustomAPIProviderSettings(raw, legacyRaw) || changed
 	changed = purgeStaleAgentModelReferences(raw) || changed
@@ -407,6 +414,266 @@ func migrateLegacyOpenAISettings(raw map[string]any) bool {
 	delete(raw, "openai")
 	changed = true
 	return changed
+}
+
+func migrateLegacyCodexOAuthCredentialPool(raw map[string]any) bool {
+	providers, ok := raw["openaiProviders"].([]any)
+	if !ok || len(providers) == 0 {
+		return false
+	}
+	legacyCredentials := []map[string]any{}
+	changed := false
+	for _, item := range providers {
+		provider, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		oauth, hasOAuth := provider["codexOAuth"].(map[string]any)
+		if !hasOAuth {
+			continue
+		}
+		if credential := codexCredentialFromLegacyOAuth(oauth); credential != nil {
+			legacyCredentials = append(legacyCredentials, credential)
+		}
+		delete(provider, "codexOAuth")
+		delete(provider, "codexProxy")
+		changed = true
+	}
+	if len(legacyCredentials) > 0 {
+		writeLegacyCodexCredentials(legacyCredentials)
+	}
+	return changed
+}
+
+func codexCredentialFromLegacyOAuth(oauth map[string]any) map[string]any {
+	refreshToken := strings.TrimSpace(stringValue(oauth["refreshToken"]))
+	accessToken := strings.TrimSpace(stringValue(oauth["accessToken"]))
+	if refreshToken == "" && accessToken == "" {
+		return nil
+	}
+	tokenInfo := codexTokenInfoFromAccessToken(accessToken)
+	accountID := firstNonEmptyString(stringValue(oauth["accountId"]), tokenInfo.accountID)
+	credential := map[string]any{
+		"id":       id.Short(),
+		"priority": float64(0),
+		"disabled": false,
+	}
+	if refreshToken != "" {
+		credential["refreshToken"] = refreshToken
+	}
+	if accessToken != "" {
+		credential["accessToken"] = accessToken
+	}
+	if expiresAt, ok := normalizedExpiresAtValue(oauth["expiresAt"]); ok {
+		credential["expiresAt"] = expiresAt
+	}
+	if accountID != "" {
+		credential["accountId"] = accountID
+	}
+	if tokenInfo.email != "" {
+		credential["email"] = tokenInfo.email
+	}
+	if tokenInfo.sub != "" {
+		credential["sub"] = tokenInfo.sub
+	}
+	if displayName := firstNonEmptyString(tokenInfo.email, accountID); displayName != "" {
+		credential["displayName"] = displayName
+	}
+	return credential
+}
+
+func writeLegacyCodexCredentials(credentials []map[string]any) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return
+	}
+	dir := filepath.Join(home, ".narrafork")
+	path := filepath.Join(dir, "codex-credentials.json")
+	existing := []map[string]any{}
+	if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+		_ = json.Unmarshal(data, &existing)
+	}
+	seen := map[string]struct{}{}
+	for _, entry := range existing {
+		for _, key := range codexCredentialDedupeKeys(entry) {
+			seen[key] = struct{}{}
+		}
+	}
+	added := false
+	for _, credential := range credentials {
+		keys := codexCredentialDedupeKeys(credential)
+		if len(keys) == 0 || hasAnySeenKey(seen, keys) {
+			continue
+		}
+		credential["priority"] = float64(len(existing))
+		existing = append(existing, credential)
+		added = true
+		for _, key := range keys {
+			seen[key] = struct{}{}
+		}
+	}
+	if !added {
+		return
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(existing, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, data, 0o600)
+}
+
+func codexCredentialDedupeKeys(credential map[string]any) []string {
+	keys := []string{}
+	refreshToken := strings.TrimSpace(stringValue(credential["refreshToken"]))
+	accessToken := strings.TrimSpace(stringValue(credential["accessToken"]))
+	if refreshToken != "" {
+		keys = append(keys, "rt:"+sha256Hex(refreshToken))
+	}
+	tokenInfo := codexTokenInfoFromAccessToken(accessToken)
+	sub := firstNonEmptyString(stringValue(credential["sub"]), tokenInfo.sub)
+	accountID := firstNonEmptyString(stringValue(credential["accountId"]), tokenInfo.accountID)
+	email := firstNonEmptyString(stringValue(credential["email"]), tokenInfo.email)
+	if sub != "" {
+		keys = append(keys, "sub:"+sub)
+	}
+	if accountID != "" && email != "" {
+		keys = append(keys, "account-email:"+accountID+":"+email)
+	}
+	if accessToken != "" {
+		keys = append(keys, "at:"+sha256Hex(accessToken))
+	}
+	return keys
+}
+
+func hasAnySeenKey(seen map[string]struct{}, keys []string) bool {
+	for _, key := range keys {
+		if _, ok := seen[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func sha256Hex(value string) string {
+	sum := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(sum[:])
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+type codexTokenInfo struct {
+	accountID string
+	email     string
+	sub       string
+}
+
+func codexTokenInfoFromAccessToken(accessToken string) codexTokenInfo {
+	claims := parseJWTClaims(accessToken)
+	if len(claims) == 0 {
+		return codexTokenInfo{}
+	}
+	return codexTokenInfo{
+		accountID: firstNonEmptyString(
+			stringValue(claims["chatgpt_account_id"]),
+			codexNestedAuthAccountID(claims),
+			codexFirstOrganizationID(claims),
+		),
+		email: strings.TrimSpace(stringValue(claims["email"])),
+		sub:   strings.TrimSpace(stringValue(claims["sub"])),
+	}
+}
+
+func parseJWTClaims(token string) map[string]any {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || strings.TrimSpace(parts[1]) == "" {
+		return nil
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return nil
+		}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func codexNestedAuthAccountID(claims map[string]any) string {
+	auth, _ := claims["https://api.openai.com/auth"].(map[string]any)
+	return strings.TrimSpace(stringValue(auth["chatgpt_account_id"]))
+}
+
+func codexFirstOrganizationID(claims map[string]any) string {
+	organizations, _ := claims["organizations"].([]any)
+	if len(organizations) == 0 {
+		return ""
+	}
+	organization, _ := organizations[0].(map[string]any)
+	return strings.TrimSpace(stringValue(organization["id"]))
+}
+
+func normalizedExpiresAtValue(value any) (float64, bool) {
+	number, ok := numericValue(value)
+	if !ok {
+		return 0, false
+	}
+	if number > 0 && number < 100_000_000_000 {
+		return number * 1000, true
+	}
+	return number, true
+}
+
+func numericValue(value any) (float64, bool) {
+	var number float64
+	switch v := value.(type) {
+	case float64:
+		number = v
+	case int:
+		number = float64(v)
+	case int64:
+		number = float64(v)
+	case json.Number:
+		parsed, err := v.Float64()
+		if err != nil {
+			return 0, false
+		}
+		number = parsed
+	case string:
+		trimmed := strings.TrimSpace(v)
+		if trimmed == "" {
+			return 0, false
+		}
+		parsed, err := strconv.ParseFloat(trimmed, 64)
+		if err == nil {
+			number = parsed
+			break
+		}
+		parsedTime, err := time.Parse(time.RFC3339Nano, trimmed)
+		if err != nil {
+			return 0, false
+		}
+		number = float64(parsedTime.UnixMilli())
+	default:
+		return 0, false
+	}
+	if math.IsNaN(number) || math.IsInf(number, 0) {
+		return 0, false
+	}
+	return number, true
 }
 
 func normalizeCustomAPIProviderSettings(raw, legacyRaw map[string]any) bool {

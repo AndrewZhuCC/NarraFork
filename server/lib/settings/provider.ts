@@ -187,6 +187,26 @@ export function getAggregation(aggId: string): ModelAggregation | undefined {
 	return (s().agent.modelAggregations ?? []).find((a) => a.id === aggId);
 }
 
+function getDisabledProviderPrefixes(): Set<string> {
+	const disabled = new Set(s().agent.disabledProviders ?? []);
+	for (const provider of [
+		...(s().customApiProviders ?? []),
+		...(s().openaiProviders ?? []),
+		...(s().anthropicProviders ?? []),
+		...(s().nkpProviders ?? []),
+		...(s().nugProviders ?? []),
+		...(s().clineProviders ?? []),
+	]) {
+		if (provider.disabled && provider.prefix) disabled.add(provider.prefix);
+	}
+	return disabled;
+}
+
+function isModelProviderDisabled(modelValue: string): boolean {
+	const { provider } = parseModelId(modelValue);
+	return !!provider && getDisabledProviderPrefixes().has(provider);
+}
+
 /** Round-robin counter for balanced aggregation routing. */
 const aggRoundRobin = new Map<string, number>();
 
@@ -200,9 +220,12 @@ export function resolveAggregation(aggId: string, stickyProvider?: string): stri
 	const agg = getAggregation(aggId);
 	if (!agg || agg.models.length === 0) return null;
 
-	// If sticky provider matches a member, prefer it
+	const candidates = agg.models.filter((model) => !isModelProviderDisabled(model));
+	if (candidates.length === 0) return null;
+
+	// If sticky provider matches an enabled member, prefer it
 	if (stickyProvider) {
-		const stickyMatch = agg.models.find((m) => {
+		const stickyMatch = candidates.find((m) => {
 			const parsed = parseModelId(m);
 			return parsed.provider === stickyProvider;
 		});
@@ -211,13 +234,13 @@ export function resolveAggregation(aggId: string, stickyProvider?: string): stri
 
 	if (agg.routingMode === "balanced") {
 		const idx = aggRoundRobin.get(aggId) ?? 0;
-		const model = agg.models[idx % agg.models.length];
+		const model = candidates[idx % candidates.length];
 		aggRoundRobin.set(aggId, idx + 1);
 		return model;
 	}
 
-	// Priority mode: return first member
-	return agg.models[0];
+	// Priority mode: return first enabled member
+	return candidates[0];
 }
 
 /**
@@ -373,7 +396,7 @@ export function resolveEffectiveModel(
  */
 export function getVisibleModels(): string[] {
 	const hidden = new Set(s().agent.hiddenModels ?? []);
-	const disabledPrefixes = new Set(s().agent.disabledProviders ?? []);
+	const disabledPrefixes = getDisabledProviderPrefixes();
 	const kiro = kiroModelLister?.() ?? [];
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
@@ -381,7 +404,10 @@ export function getVisibleModels(): string[] {
 	const nkp = nkpModelLister?.() ?? [];
 	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
-	const custom = (s().agent.customModels ?? []).map((m) => m.value);
+	const custom = (s().agent.customModels ?? []).map((m) => {
+		const value = m.value ?? "";
+		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
+	});
 	const seen = new Set<string>();
 	const result: string[] = [];
 	for (const v of [

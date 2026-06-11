@@ -62,6 +62,7 @@ type Service struct {
 	BroadcastProjectEvent            func(payload any)
 	ExternalTools                    ExternalToolProvider
 	TerminalRuntime                  terminalAgentRuntime
+	AgentRunner                      func(context.Context, string)
 	contextOverflowRetry             func(context.Context, string)
 
 	runMu          sync.Mutex
@@ -1789,7 +1790,11 @@ func (s *Service) startUserMessageRunWithParentToolUse(ctx context.Context, narr
 	if len(commandText) > 0 {
 		cmd = commandText[0]
 	}
-	msg, err := s.addMessageWithBlocksWithCommandAndParentToolUse(ctx, narratorID, "user", contentText, contentBlocks, &userID, cmd, parentToolUseID)
+	var createdBy *string
+	if value := strings.TrimSpace(userID); value != "" {
+		createdBy = &value
+	}
+	msg, err := s.addMessageWithBlocksWithCommandAndParentToolUse(ctx, narratorID, "user", contentText, contentBlocks, createdBy, cmd, parentToolUseID)
 	if err != nil {
 		return Message{}, err
 	}
@@ -1814,7 +1819,11 @@ func (s *Service) startNarratorRun(ctx context.Context, narratorID string, narra
 	if err := s.markRunStarted(ctx, narratorID, narrator); err != nil {
 		return err
 	}
-	go s.runBasicAgent(context.Background(), narratorID)
+	runner := s.runBasicAgent
+	if s.AgentRunner != nil {
+		runner = s.AgentRunner
+	}
+	go runner(context.Background(), narratorID)
 	return nil
 }
 

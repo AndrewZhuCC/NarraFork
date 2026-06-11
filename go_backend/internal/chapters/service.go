@@ -32,26 +32,52 @@ type TerminalKiller interface {
 }
 
 type Service struct {
-	DB                        *sql.DB
-	Git                       *gitx.Service
-	Narrators                 *narrators.Service
-	TerminalRuntime           TerminalKiller
-	Settings                  *config.Store
-	BroadcastMergeProgress    func(payload any)
-	BroadcastChapterLifecycle func(payload any)
-	BroadcastUser             func(userID string, payload any)
-	CancelNarratorRun         func(narratorID string) bool
-	MergeDecisionTimeout      time.Duration
-	MergeDecisionInterval     time.Duration
-	RootCommitMetadataReader  func(ctx context.Context, gitPath string) (head string, count int)
-	RootCommitLogReader       func(ctx context.Context, gitPath, branch string, limit int) ([]gitx.Commit, error)
-	AutoDormantDelay          time.Duration
-	autoDormantMu             sync.Mutex
-	autoDormantTimers         map[string]*time.Timer
-	// BrowserToolAutoEnableEnabled keeps the container-ready browser tool injection
-	// disabled unless an explicit cutover opts into auto-enabling it.
+	DB                           *sql.DB
+	Git                          *gitx.Service
+	Narrators                    *narrators.Service
+	TerminalRuntime              TerminalKiller
+	Settings                     *config.Store
+	BroadcastMergeProgress       func(payload any)
+	BroadcastChapterLifecycle    func(payload any)
+	BroadcastUser                func(userID string, payload any)
+	BroadcastNarrator            func(narratorID string, payload any)
+	SyncProjectDBAfterBatchMerge func(projectID string)
+	CancelNarratorRun            func(narratorID string) bool
+	MergeDecisionTimeout         time.Duration
+	MergeDecisionInterval        time.Duration
+	RootCommitMetadataReader     func(ctx context.Context, gitPath string) (head string, count int)
+	RootCommitLogReader          func(ctx context.Context, gitPath, branch string, limit int) ([]gitx.Commit, error)
+	MergeSummaryGenerator        mergeSummaryGenerator
+	SummaryRetryBaseDelay        time.Duration
+	SummaryRetryMaxDelay         time.Duration
+	AutoDormantDelay             time.Duration
+	summaryModelErrorMu          sync.Mutex
+	summaryModelErrorLast        time.Time
+	summaryModelUnavailableLast  time.Time
+	autoDormantMu                sync.Mutex
+	autoDormantTimers            map[string]*time.Timer
 	BrowserToolAutoEnableEnabled bool
 }
+
+type mergeSummaryContext struct {
+	Commits   []string
+	DiffStat  string
+	Collected bool
+}
+
+type mergeSummaryGenerationInput struct {
+	Source       Chapter
+	Target       Chapter
+	Strategy     string
+	CommitSHA    string
+	MergeMessage string
+	MergedBy     string
+	NarratorID   string
+	Locale       string
+	Context      mergeSummaryContext
+}
+
+type mergeSummaryGenerator func(ctx context.Context, input mergeSummaryGenerationInput) (string, error)
 
 type Chapter struct {
 	ID                    string         `json:"id"`
@@ -148,6 +174,7 @@ type ReviewInput struct {
 	AnchorCommitSHA *string
 	AxisOffset      *float64
 	CrossOffset     *float64
+	AutoStart       *bool
 	UserID          string
 }
 
@@ -217,6 +244,10 @@ func (s *Service) SetMergeProgressBroadcaster(broadcast func(payload any)) {
 func (s *Service) SetChapterLifecycleBroadcasters(chapterBroadcast func(payload any), userBroadcast func(userID string, payload any)) {
 	s.BroadcastChapterLifecycle = chapterBroadcast
 	s.BroadcastUser = userBroadcast
+}
+
+func (s *Service) SetNarratorBroadcaster(broadcast func(narratorID string, payload any)) {
+	s.BroadcastNarrator = broadcast
 }
 
 func (s *Service) CleanupStaleMergeSessions(ctx context.Context) (int64, error) {
@@ -1347,10 +1378,21 @@ func (s *Service) initializeReviewNarrator(ctx context.Context, narratorID, gitP
 	if _, err := s.DB.ExecContext(ctx, `UPDATE narrators SET system_prompt = ?, updated_at = ? WHERE id = ?`, prompt, db.NowISO(), narratorID); err != nil {
 		return fmt.Errorf("initialize review narrator system prompt: %w", err)
 	}
-	if _, err := s.Narrators.SeedUserMessage(ctx, narratorID, input.UserID, reviewStartMessage(input.Locale)); err != nil {
+	startMessage := reviewStartMessage(input.Locale)
+	if reviewAutoStartEnabled(input.AutoStart) {
+		if _, err := s.Narrators.AddUserMessage(ctx, narratorID, input.UserID, startMessage); err != nil {
+			return fmt.Errorf("initialize review narrator auto-start message: %w", err)
+		}
+		return nil
+	}
+	if _, err := s.Narrators.SeedUserMessage(ctx, narratorID, input.UserID, startMessage); err != nil {
 		return fmt.Errorf("initialize review narrator start message: %w", err)
 	}
 	return nil
+}
+
+func reviewAutoStartEnabled(autoStart *bool) bool {
+	return autoStart == nil || *autoStart
 }
 
 func (s *Service) BatchMerge(ctx context.Context, input BatchMergeInput) (BatchMergeResult, error) {
@@ -1545,6 +1587,14 @@ func (s *Service) processBatchMergeQueue(mergeSessionID, projectID, targetID str
 		return
 	}
 	s.broadcastMergeProgress(map[string]any{"type": "merge:completed", "mergeSessionId": mergeSessionID, "projectId": projectID, "targetChapterId": targetID, "mergedCount": mergedCount})
+	s.syncProjectDBAfterBatchMerge(projectID)
+}
+
+func (s *Service) syncProjectDBAfterBatchMerge(projectID string) {
+	if s == nil || s.SyncProjectDBAfterBatchMerge == nil || strings.TrimSpace(projectID) == "" {
+		return
+	}
+	s.SyncProjectDBAfterBatchMerge(projectID)
 }
 
 func (s *Service) updateMergeSession(ctx context.Context, mergeSessionID string, fields map[string]any) error {
@@ -1626,6 +1676,61 @@ func (s *Service) broadcastMergeProgress(payload map[string]any) {
 	if s.BroadcastMergeProgress != nil {
 		s.BroadcastMergeProgress(payload)
 	}
+}
+
+func firstNonEmptyAny(values ...any) any {
+	for _, value := range values {
+		switch typed := value.(type) {
+		case nil:
+			continue
+		case string:
+			if strings.TrimSpace(typed) != "" {
+				return typed
+			}
+		default:
+			return value
+		}
+	}
+	return nil
+}
+
+func stringSliceFromAny(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if trimmed := strings.TrimSpace(item); trimmed != "" {
+				out = append(out, trimmed)
+			}
+		}
+		return out
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				if trimmed := strings.TrimSpace(text); trimmed != "" {
+					out = append(out, trimmed)
+				}
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func stringValueOr(value any, fallback string) string {
+	if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+		return text
+	}
+	return fallback
+}
+
+func mergeCommitFromAIResult(result map[string]any) any {
+	if result == nil {
+		return nil
+	}
+	return firstNonEmptyAny(result["mergeCommitSha"], result["commitSha"])
 }
 
 func dedupeNonEmpty(values []string) []string {
@@ -2243,6 +2348,7 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 	if err := s.prepareSourceBeforeMerge(ctx, source, target, project.GitPath.String, requireReview); err != nil {
 		return nil, err
 	}
+	mergeContext := s.collectMergeSummaryContext(ctx, project.GitPath.String, source)
 	if strings.TrimSpace(message) == "" {
 		message = fmt.Sprintf("Merge %s into %s", source.Branch, target.Branch)
 	}
@@ -2292,13 +2398,13 @@ func (s *Service) Merge(ctx context.Context, sourceID, targetID, strategy, messa
 			head, _ = s.Git.HeadCommit(ctx, targetWorktree)
 		}
 		successResponse := map[string]any{"ok": true, "success": true, "sourceChapterId": source.ID, "targetChapterId": target.ID, "mergeCommitSha": head, "commitSha": head, "isFastForward": result.IsFastForward, "output": result.Output}
-		if err := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID); err != nil {
+		if err := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID, mergeContext); err != nil {
 			if warning, ok := recordMergedPostCommitWarning(err); ok {
 				successResponse["warning"] = warning
 				response = successResponse
 				return nil
 			}
-			if retryErr := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID); retryErr != nil {
+			if retryErr := s.recordMerged(ctx, source, target, strategy, head, preMergeHead, message, userID, mergeContext); retryErr != nil {
 				if warning, ok := recordMergedPostCommitWarning(retryErr); ok {
 					successResponse["warning"] = warning
 					response = successResponse
@@ -2361,6 +2467,7 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 	if err := s.prepareSourceBeforeMerge(ctx, source, target, project.GitPath.String, requireReview); err != nil {
 		return nil, err
 	}
+	mergeContext := s.collectMergeSummaryContext(ctx, project.GitPath.String, source)
 	status, err := s.Git.Status(ctx, *target.WorktreePath)
 	if err != nil {
 		return nil, err
@@ -2383,8 +2490,8 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 			return nil, err
 		}
 		successPayload := map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}}
-		if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); err != nil {
-			if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload); rollbackResult != nil {
+		if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, mergeContext); err != nil {
+			if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload, mergeContext); rollbackResult != nil {
 				return rollbackResult, nil
 			}
 		}
@@ -2431,8 +2538,8 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 		return nil, err
 	}
 	successPayload := withAIResolveCompatibilityContract(map[string]any{"resolved": true, "mergeResult": map[string]any{"success": true, "commitSha": commitSHA}, "narratorId": narratorID, "assistantMessage": result.Text}, "one-shot-basic-fallback", "", "")
-	if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); err != nil {
-		if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload); rollbackResult != nil {
+	if err := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, mergeContext); err != nil {
+		if rollbackResult := s.handleAIResolveRecordMergedFailure(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, *target.WorktreePath, err, successPayload, mergeContext); rollbackResult != nil {
 			return rollbackResult, nil
 		}
 	}
@@ -2467,12 +2574,12 @@ func withAIResolveCompatibilityContract(payload map[string]any, mode, fallbackFe
 	return payload
 }
 
-func (s *Service) handleAIResolveRecordMergedFailure(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID, targetWorktree string, initialErr error, successPayload map[string]any) map[string]any {
+func (s *Service) handleAIResolveRecordMergedFailure(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID, targetWorktree string, initialErr error, successPayload map[string]any, mergeContext mergeSummaryContext) map[string]any {
 	if warning, ok := recordMergedPostCommitWarning(initialErr); ok {
 		successPayload["warning"] = warning
 		return successPayload
 	}
-	if retryErr := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID); retryErr != nil {
+	if retryErr := s.recordMerged(ctx, source, target, strategy, commitSHA, preMergeHead, message, userID, mergeContext); retryErr != nil {
 		if warning, ok := recordMergedPostCommitWarning(retryErr); ok {
 			successPayload["warning"] = warning
 			return successPayload
@@ -2533,7 +2640,19 @@ func recordMergedPostCommitWarning(err error) (string, bool) {
 	return fmt.Sprintf("Merge database state was recorded, but post-merge follow-up failed (%s). Git was not rolled back; retry cleanup or inspect merge summary state. Error: %v", postCommitErr.step, postCommitErr.err), true
 }
 
-func (s *Service) recordMerged(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID string) error {
+func (s *Service) collectMergeSummaryContext(ctx context.Context, gitPath string, source Chapter) mergeSummaryContext {
+	if s == nil || s.Git == nil || strings.TrimSpace(gitPath) == "" || strings.TrimSpace(source.Branch) == "" || strings.TrimSpace(source.BaseBranch) == "" {
+		return mergeSummaryContext{}
+	}
+	commits, commitErr := s.Git.CommitSubjectsRange(ctx, gitPath, source.BaseBranch, source.Branch, 50)
+	diffStat, diffErr := s.Git.DiffStatRange(ctx, gitPath, source.BaseBranch, source.Branch, 30)
+	if commitErr != nil && diffErr != nil {
+		return mergeSummaryContext{}
+	}
+	return mergeSummaryContext{Commits: commits, DiffStat: diffStat, Collected: true}
+}
+
+func (s *Service) recordMerged(ctx context.Context, source, target Chapter, strategy, commitSHA, preMergeHead, message, userID string, mergeContext mergeSummaryContext) error {
 	now := db.NowISO()
 	count := 0
 	if target.WorktreePath != nil && *target.WorktreePath != "" {
@@ -2566,12 +2685,29 @@ func (s *Service) recordMerged(ctx context.Context, source, target Chapter, stra
 			return recordMergedPostCommit("record chapter commit", err)
 		}
 	}
+	s.broadcastChapterMerged(source.ProjectID, source.ID, target.ID, userID)
 	cleanupErr := s.cleanupMergedSourceWorktree(ctx, source)
-	summaryErr := s.injectMergeSummaryFallback(ctx, source, target, strategy, commitSHA, message, userID)
+	summaryErr := s.injectMergeSummaryFallback(ctx, source, target, strategy, commitSHA, message, userID, mergeContext)
 	if cleanupErr != nil {
 		return recordMergedPostCommit("cleanup merged source worktree", cleanupErr)
 	}
 	return recordMergedPostCommit("inject merge summary fallback", summaryErr)
+}
+
+func (s *Service) broadcastChapterMerged(projectID, sourceID, targetID, userID string) {
+	if s == nil || s.BroadcastChapterLifecycle == nil {
+		return
+	}
+	payload := map[string]any{
+		"type":      "chapter:merged",
+		"sourceId":  sourceID,
+		"targetId":  targetID,
+		"projectId": projectID,
+	}
+	if strings.TrimSpace(userID) != "" {
+		payload["userId"] = userID
+	}
+	s.BroadcastChapterLifecycle(payload)
 }
 
 func (s *Service) cleanupMergedSourceWorktree(ctx context.Context, source Chapter) error {
@@ -2734,7 +2870,327 @@ func boundedAIResolveTranscriptText(text string) string {
 	return text[:aiResolveTranscriptTextLimit] + "\n... [truncated by Go AIResolve transcript fallback]"
 }
 
-func (s *Service) injectMergeSummaryFallback(ctx context.Context, source, target Chapter, strategy, commitSHA, message, userID string) error {
+func (s *Service) mergeSummaryText(ctx context.Context, input mergeSummaryGenerationInput) (string, string) {
+	fallback := firstNonEmptyString(input.MergeMessage, fmt.Sprintf("Merged %s into %s using %s.", input.Source.Branch, input.Target.Branch, input.Strategy))
+	if len(input.Context.Commits) == 0 {
+		return fallback, "deterministic_fallback"
+	}
+	generator := s.MergeSummaryGenerator
+	if generator == nil {
+		generator = s.generateMergeSummaryWithModel
+	}
+	text, err := s.runTrackedMergeSummaryGenerator(ctx, generator, input)
+	if err != nil {
+		if !isMergeSummaryProviderUnavailable(err) {
+			s.broadcastSummaryModelError(err)
+		}
+		slog.Warn(
+			"merge summary model generation failed; using deterministic fallback",
+			"sourceChapterId", input.Source.ID,
+			"targetChapterId", input.Target.ID,
+			"error", err,
+		)
+		return fallback, "deterministic_fallback"
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return fallback, "deterministic_fallback"
+	}
+	return text, "model"
+}
+
+const summaryModelErrorDebounce = 30 * time.Second
+
+func (s *Service) mergeSummaryModelName() string {
+	if s == nil || s.Settings == nil {
+		return ""
+	}
+	return strings.TrimSpace(s.Settings.Core().Agent.SummaryModel)
+}
+
+const summaryMaxTransientRetries = 3
+
+func (s *Service) runTrackedMergeSummaryGenerator(ctx context.Context, generator mergeSummaryGenerator, input mergeSummaryGenerationInput) (string, error) {
+	if generator == nil {
+		return "", nil
+	}
+	model := s.mergeSummaryModelName()
+	track := s != nil && s.DB != nil && strings.TrimSpace(input.NarratorID) != "" && model != ""
+	var lastErr error
+	for attempt := 0; attempt <= summaryMaxTransientRetries; attempt++ {
+		started := time.Now()
+		text, err := generator(ctx, input)
+		if track {
+			s.recordMergeSummaryAPIRequest(ctx, input.NarratorID, model, time.Since(started), err)
+		}
+		if err == nil {
+			return text, nil
+		}
+		lastErr = err
+		if isMergeSummaryProviderUnavailable(err) {
+			s.broadcastSummaryModelUnavailable(err)
+			return "", err
+		}
+		if attempt < summaryMaxTransientRetries && isMergeSummaryRetryable(err) {
+			delay := s.mergeSummaryRetryDelay(attempt)
+			slog.Warn("merge summary transient model error; retrying", "attempt", attempt+1, "maxRetries", summaryMaxTransientRetries, "delayMs", delay.Milliseconds(), "error", err)
+			if delay > 0 {
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
+			}
+			continue
+		}
+		return "", err
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", nil
+}
+
+func (s *Service) recordMergeSummaryAPIRequest(ctx context.Context, narratorID, model string, duration time.Duration, requestErr error) {
+	if s == nil || s.DB == nil || strings.TrimSpace(narratorID) == "" || strings.TrimSpace(model) == "" {
+		return
+	}
+	providerName, resolvedModel := s.resolveMergeSummaryProviderModel(model)
+	errorMessage := any(nil)
+	if requestErr != nil {
+		errorMessage = requestErr.Error()
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO api_requests (id, narrator_id, message_id, kind, provider, credential_id, model, input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_tokens, ttft_ms, duration_ms, cost_usd, context_percent, meter_usage, meter_unit, error_message, raw_dump_json, created_at) VALUES (?, ?, NULL, 'merge_summary', ?, NULL, ?, 0, 0, 0, 0, 0, 0, 0, NULL, ?, NULL, NULL, NULL, NULL, ?, NULL, ?)`, id.Must(21), narratorID, providerName, resolvedModel, int(duration.Milliseconds()), errorMessage, db.NowISO()); err != nil {
+		slog.Warn("failed to record merge summary API request", "narratorId", narratorID, "error", err)
+	}
+}
+
+func (s *Service) resolveMergeSummaryProviderModel(model string) (string, string) {
+	if s != nil && s.Settings != nil {
+		if resolved, err := agentbasic.ResolveProviderAndModel(s.Settings, model); err == nil {
+			return resolved.Provider, resolved.Model
+		}
+	}
+	parts := strings.SplitN(model, ":", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return "", strings.TrimSpace(model)
+}
+
+func (s *Service) mergeSummaryRetryDelay(attempt int) time.Duration {
+	var base, maxDelay time.Duration
+	if s != nil {
+		base = s.SummaryRetryBaseDelay
+		maxDelay = s.SummaryRetryMaxDelay
+	}
+	if base == 0 {
+		base = 3 * time.Second
+	}
+	if maxDelay == 0 {
+		maxDelay = 15 * time.Second
+	}
+	if base < 0 {
+		return 0
+	}
+	delay := base
+	for i := 0; i < attempt; i++ {
+		delay *= 2
+	}
+	if maxDelay > 0 && delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
+func isMergeSummaryProviderUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"not configured", "not available", "provider unavailable", "provider disabled", "is disabled", "missing api key", "no api key"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isMergeSummaryRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{"429", "rate limit", "too many requests", "overloaded", "temporarily", "timeout", "deadline exceeded", "502", "503", "504", "eof", "connection reset", "connection refused"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) broadcastSummaryModelUnavailable(err error) {
+	if s == nil || s.BroadcastMergeProgress == nil || err == nil {
+		return
+	}
+	now := time.Now()
+	s.summaryModelErrorMu.Lock()
+	if !s.summaryModelUnavailableLast.IsZero() && now.Sub(s.summaryModelUnavailableLast) < summaryModelErrorDebounce {
+		s.summaryModelErrorMu.Unlock()
+		return
+	}
+	s.summaryModelUnavailableLast = now
+	s.summaryModelErrorMu.Unlock()
+	s.BroadcastMergeProgress(map[string]any{
+		"type":  "summary_model_unavailable",
+		"model": s.mergeSummaryModelName(),
+		"error": err.Error(),
+	})
+}
+
+func (s *Service) broadcastSummaryModelError(err error) {
+	if s == nil || s.BroadcastMergeProgress == nil || err == nil {
+		return
+	}
+	now := time.Now()
+	s.summaryModelErrorMu.Lock()
+	if !s.summaryModelErrorLast.IsZero() && now.Sub(s.summaryModelErrorLast) < summaryModelErrorDebounce {
+		s.summaryModelErrorMu.Unlock()
+		return
+	}
+	s.summaryModelErrorLast = now
+	s.summaryModelErrorMu.Unlock()
+	s.BroadcastMergeProgress(map[string]any{
+		"type":  "summary_model_error",
+		"model": s.mergeSummaryModelName(),
+		"error": err.Error(),
+	})
+}
+
+func (s *Service) generateMergeSummaryWithModel(ctx context.Context, input mergeSummaryGenerationInput) (string, error) {
+	if s == nil || s.Settings == nil {
+		return "", nil
+	}
+	model := s.mergeSummaryModelName()
+	if model == "" {
+		return "", nil
+	}
+	cwd := ""
+	if input.Target.WorktreePath != nil {
+		cwd = strings.TrimSpace(*input.Target.WorktreePath)
+	}
+	result, err := agentbasic.Generate(
+		ctx,
+		s.Settings,
+		model,
+		[]agentbasic.Message{{Role: "user", Content: buildMergeSummaryUserTextGo(input)}},
+		cwd,
+		agentbasic.WithSystemPrompt(mergeSummarySystemPromptGo(input.Locale)),
+		agentbasic.WithReasoningEffort("none"),
+		agentbasic.WithMaxTurns(1),
+		agentbasic.WithToolScope("reflection"),
+		agentbasic.WithToolInventoryEvent(false),
+	)
+	if err != nil {
+		return "", err
+	}
+	return result.Text, nil
+}
+
+func buildMergeSummaryUserTextGo(input mergeSummaryGenerationInput) string {
+	locale := normalizeMergeSummaryLocale(input.Locale)
+	commitLines := make([]string, 0, len(input.Context.Commits))
+	for i, commit := range input.Context.Commits {
+		commitLines = append(commitLines, fmt.Sprintf("%d. %s", i+1, commit))
+	}
+	lines := []string{
+		mergeSummaryLabelGo("branch", locale) + ": " + input.Source.Branch,
+		mergeSummaryLabelGo("mergedInto", locale) + ": " + input.Target.Branch,
+		mergeSummaryLabelGo("strategy", locale) + ": " + input.Strategy,
+	}
+	if strings.TrimSpace(input.CommitSHA) != "" {
+		lines = append(lines, mergeSummaryLabelGo("mergeCommit", locale)+": "+input.CommitSHA)
+	}
+	if strings.TrimSpace(input.MergedBy) != "" {
+		lines = append(lines, mergeSummaryLabelGo("mergedBy", locale)+": "+input.MergedBy)
+	}
+	if strings.TrimSpace(input.Source.Title) != "" {
+		lines = append(lines, mergeSummaryLabelGo("chapterTitle", locale)+": "+input.Source.Title)
+	}
+	if input.Source.Description != nil && strings.TrimSpace(*input.Source.Description) != "" {
+		lines = append(lines, mergeSummaryLabelGo("description", locale)+": "+strings.TrimSpace(*input.Source.Description))
+	}
+	lines = append(lines, "", fmt.Sprintf("%s (%d):", mergeSummaryLabelGo("commits", locale), len(input.Context.Commits)))
+	lines = append(lines, commitLines...)
+	lines = append(lines, "", mergeSummaryLabelGo("diffSummary", locale)+":", input.Context.DiffStat)
+	return strings.Join(lines, "\n")
+}
+
+func mergeSummarySystemPromptGo(locale string) string {
+	if normalizeMergeSummaryLocale(locale) == "zh-CN" {
+		return `你是一个合并摘要生成器。根据刚刚合并的分支的提交历史，生成一个简洁的摘要，描述该分支完成了什么工作。此摘要将注入到父分支的叙述者上下文中，使其感知到已合并的工作内容。
+
+重点关注：
+- 实现了哪些功能、修复或变更
+- 涉及的关键文件和模块
+- 任何值得注意的技术决策
+
+控制在 300 字以内。保持客观和具体。只输出摘要文本。始终使用简体中文回复。`
+	}
+	return `You are a merge summary generator. Given the commit history of a branch that was just merged, produce a concise summary describing what the branch accomplished. This summary will be injected into the parent branch's narrator context so it can be aware of the merged work.
+
+Focus on:
+- What features, fixes, or changes were implemented
+- Key files and modules affected
+- Any notable technical decisions
+
+Keep it under 300 words. Be factual and specific. Output ONLY the summary text. Always respond in English.`
+}
+
+func mergeSummaryLabelGo(key, locale string) string {
+	zh := map[string]string{
+		"branch":       "分支",
+		"mergedInto":   "合并到",
+		"strategy":     "策略",
+		"mergeCommit":  "合并提交",
+		"mergedBy":     "合并者",
+		"chapterTitle": "章节标题",
+		"description":  "描述",
+		"commits":      "提交记录",
+		"diffSummary":  "变更统计",
+		"headerMerged": "分支已合并",
+	}
+	en := map[string]string{
+		"branch":       "Branch",
+		"mergedInto":   "Merged into",
+		"strategy":     "Strategy",
+		"mergeCommit":  "Merge commit",
+		"mergedBy":     "Merged by",
+		"chapterTitle": "Chapter title",
+		"description":  "Description",
+		"commits":      "Commits",
+		"diffSummary":  "Diff summary",
+		"headerMerged": "Branch Merged",
+	}
+	if normalizeMergeSummaryLocale(locale) == "zh-CN" {
+		if value := zh[key]; value != "" {
+			return value
+		}
+	}
+	if value := en[key]; value != "" {
+		return value
+	}
+	return key
+}
+
+func normalizeMergeSummaryLocale(locale string) string {
+	if strings.EqualFold(strings.TrimSpace(locale), "zh-CN") || strings.EqualFold(strings.TrimSpace(locale), "zh") {
+		return "zh-CN"
+	}
+	return "en"
+}
+
+func (s *Service) injectMergeSummaryFallback(ctx context.Context, source, target Chapter, strategy, commitSHA, message, userID string, mergeContext mergeSummaryContext) error {
 	var narratorID string
 	err := s.DB.QueryRowContext(ctx, `SELECT id FROM narrators WHERE chapter_id = ? AND variant = 'primary' ORDER BY created_at ASC LIMIT 1`, target.ID).Scan(&narratorID)
 	if err != nil || narratorID == "" {
@@ -2747,23 +3203,48 @@ func (s *Service) injectMergeSummaryFallback(ctx context.Context, source, target
 	if err != nil {
 		return err
 	}
-	summary := firstNonEmptyString(message, fmt.Sprintf("Merged %s into %s using %s.", source.Branch, target.Branch, strategy))
-	header := fmt.Sprintf(`[Merged] "%s" → "%s" (%s)`, source.Branch, target.Branch, strategy)
+	mergedBy := s.mergeSummaryMergedBy(ctx, userID)
+	locale := s.mergeSummaryLocale(ctx, userID)
+	mergedByText := ""
+	if mergedBy != "" {
+		mergedByText = " by " + mergedBy
+	}
+	summary, summarySource := s.mergeSummaryText(ctx, mergeSummaryGenerationInput{
+		Source:       source,
+		Target:       target,
+		Strategy:     strategy,
+		CommitSHA:    commitSHA,
+		MergeMessage: message,
+		MergedBy:     mergedBy,
+		NarratorID:   narratorID,
+		Locale:       locale,
+		Context:      mergeContext,
+	})
+	header := fmt.Sprintf(`[%s] "%s" → "%s"%s (%s)`, mergeSummaryLabelGo("headerMerged", locale), source.Branch, target.Branch, mergedByText, strategy)
 	contentText := header + "\n\n" + summary
+	summaryBlock := map[string]any{
+		"type":            "merge_summary",
+		"sourceBranch":    source.Branch,
+		"sourceChapterId": source.ID,
+		"targetBranch":    target.Branch,
+		"strategy":        strategy,
+		"commitSha":       nullableString(commitSHA),
+		"mergedBy":        nullableString(mergedBy),
+		"mergeRound":      mergeRound,
+		"isLatest":        true,
+		"summary":         summary,
+		"summarySource":   summarySource,
+	}
+	if mergeContext.Collected {
+		summaryBlock["summaryInput"] = map[string]any{
+			"preCollected": true,
+			"commits":      mergeContext.Commits,
+			"diffStat":     mergeContext.DiffStat,
+		}
+	}
 	blocks := []map[string]any{
 		{"type": "text", "text": contentText},
-		{
-			"type":            "merge_summary",
-			"sourceBranch":    source.Branch,
-			"sourceChapterId": source.ID,
-			"targetBranch":    target.Branch,
-			"strategy":        strategy,
-			"commitSha":       nullableString(commitSHA),
-			"mergedBy":        nullableString(userID),
-			"mergeRound":      mergeRound,
-			"isLatest":        true,
-			"summary":         summary,
-		},
+		summaryBlock,
 	}
 	contentJSON, err := json.Marshal(blocks)
 	if err != nil {
@@ -2796,7 +3277,36 @@ func (s *Service) injectMergeSummaryFallback(ctx context.Context, source, target
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	s.broadcastMergeSummaryMessage(ctx, narratorID, messageID, blocks, contentText, userID, now, nextSeq)
 	return nil
+}
+
+func (s *Service) broadcastMergeSummaryMessage(ctx context.Context, narratorID, messageID string, blocks []map[string]any, contentText, userID, createdAt string, seq int64) {
+	if s == nil || s.BroadcastNarrator == nil || strings.TrimSpace(narratorID) == "" || strings.TrimSpace(messageID) == "" {
+		return
+	}
+	var creator any
+	if creatorPayload := s.mergeSummaryCreatorPayload(ctx, userID); creatorPayload != nil {
+		creator = creatorPayload
+	}
+	message := map[string]any{
+		"id":          messageID,
+		"narratorId":  narratorID,
+		"role":        "user",
+		"contentJson": blocks,
+		"contentText": contentText,
+		"createdBy":   nullableString(userID),
+		"seq":         seq,
+		"createdAt":   createdAt,
+		"toolCalls":   []any{},
+		"children":    []any{},
+		"creator":     creator,
+	}
+	s.BroadcastNarrator(narratorID, map[string]any{
+		"type":       "message",
+		"narratorId": narratorID,
+		"message":    message,
+	})
 }
 
 func (s *Service) markExistingMergeSummariesHistorical(ctx context.Context, sourceID string) error {
@@ -2856,6 +3366,55 @@ func (s *Service) mergeSummaryRound(ctx context.Context, sourceID string) (int, 
 		return 0, fmt.Errorf("count merge summaries: %w", err)
 	}
 	return count + 1, nil
+}
+
+func (s *Service) mergeSummaryMergedBy(ctx context.Context, userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || s == nil || s.DB == nil {
+		return ""
+	}
+	var username sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ?`, userID).Scan(&username); err == nil {
+		if username.Valid && strings.TrimSpace(username.String) != "" {
+			return strings.TrimSpace(username.String)
+		}
+	}
+	return userID
+}
+
+func (s *Service) mergeSummaryLocale(ctx context.Context, userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || s == nil || s.DB == nil {
+		return "en"
+	}
+	var locale sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT language FROM user_preferences WHERE user_id = ?`, userID).Scan(&locale); err != nil {
+		return "en"
+	}
+	if !locale.Valid || strings.TrimSpace(locale.String) == "" {
+		return "en"
+	}
+	return normalizeMergeSummaryLocale(locale.String)
+}
+
+func (s *Service) mergeSummaryCreatorPayload(ctx context.Context, userID string) map[string]any {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || s == nil || s.DB == nil {
+		return nil
+	}
+	var username, avatarColor, avatarImageID sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT username, avatar_color, avatar_image_id FROM users WHERE id = ?`, userID).Scan(&username, &avatarColor, &avatarImageID); err != nil {
+		return nil
+	}
+	if !username.Valid || strings.TrimSpace(username.String) == "" {
+		return nil
+	}
+	return map[string]any{
+		"id":            userID,
+		"username":      strings.TrimSpace(username.String),
+		"avatarColor":   nullableNullString(avatarColor),
+		"avatarImageId": nullableNullString(avatarImageID),
+	}
 }
 
 func (s *Service) primaryNarratorModel(ctx context.Context, chapterID string) (string, string, error) {
@@ -2943,9 +3502,15 @@ func (s *Service) Unmerge(ctx context.Context, sourceID string) (map[string]any,
 		if !project.GitPath.Valid || strings.TrimSpace(project.GitPath.String) == "" {
 			return nil, httpx.BadRequest("Project has no git path")
 		}
-		slug := slugify(source.Title)
-		short := id.Must(6)
-		worktreePath = filepath.Join(project.GitPath.String, ".worktrees", slug+"-"+short)
+		branchSuffix := strings.Join(strings.Split(strings.TrimSpace(source.Branch), "/")[1:], "/")
+		branchPath := filepath.Clean(filepath.FromSlash(branchSuffix))
+		if branchSuffix != "" && branchPath != "." && !filepath.IsAbs(branchPath) && !strings.HasPrefix(branchPath, "..") {
+			worktreePath = filepath.Join(project.GitPath.String, ".worktrees", branchPath)
+		} else {
+			slug := slugify(source.Title)
+			short := id.Must(6)
+			worktreePath = filepath.Join(project.GitPath.String, ".worktrees", slug+"-"+short)
+		}
 		if err := s.Git.CreateWorktree(ctx, project.GitPath.String, worktreePath, source.Branch); err != nil {
 			return nil, err
 		}
@@ -2977,9 +3542,16 @@ func (s *Service) Unmerge(ctx context.Context, sourceID string) (map[string]any,
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
-	if err := s.cleanupMergeSummaryForMerge(ctx, source.ID, mergeSHA); err != nil {
-		return nil, err
+	if _, err := s.syncChapterCommits(ctx, target.ID, chapterCreateCommitSyncLimit); err != nil {
+		slog.Warn("chapters: failed to sync target commits after unmerge", "chapterId", target.ID, "error", err)
 	}
+	if _, err := s.syncChapterCommits(ctx, source.ID, chapterCreateCommitSyncLimit); err != nil {
+		slog.Warn("chapters: failed to sync source commits after unmerge", "chapterId", source.ID, "error", err)
+	}
+	if err := s.cleanupMergeSummaryForMerge(ctx, source.ID, mergeSHA); err != nil {
+		slog.Warn("chapters: failed to clean up merge summary during unmerge", "sourceChapterId", source.ID, "error", err)
+	}
+	s.broadcastContainerLifecycle(map[string]any{"type": "chapter:woken", "chapterId": source.ID, "projectId": source.ProjectID})
 	return map[string]any{"ok": true}, nil
 }
 
@@ -3048,6 +3620,7 @@ func (s *Service) cleanupMergeSummaryForMerge(ctx context.Context, sourceID, com
 	var latestID, contentJSON string
 	err = s.DB.QueryRowContext(ctx, `SELECT id, content_json FROM narrator_messages WHERE content_json LIKE ? AND content_json LIKE ? ORDER BY created_at DESC LIMIT 1`, "%merge_summary%", "%"+sourceID+"%").Scan(&latestID, &contentJSON)
 	if errors.Is(err, sql.ErrNoRows) {
+		s.broadcastMergeSummaryCleanupReloads(narratorSet)
 		return nil
 	}
 	if err != nil {
@@ -3055,6 +3628,7 @@ func (s *Service) cleanupMergeSummaryForMerge(ctx context.Context, sourceID, com
 	}
 	var blocks []map[string]any
 	if err := json.Unmarshal([]byte(contentJSON), &blocks); err != nil {
+		s.broadcastMergeSummaryCleanupReloads(narratorSet)
 		return nil
 	}
 	changed := false
@@ -3065,14 +3639,31 @@ func (s *Service) cleanupMergeSummaryForMerge(ctx context.Context, sourceID, com
 		}
 	}
 	if !changed {
+		s.broadcastMergeSummaryCleanupReloads(narratorSet)
 		return nil
 	}
 	data, err := json.Marshal(blocks)
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx, `UPDATE narrator_messages SET content_json = ? WHERE id = ?`, string(data), latestID)
-	return err
+	if _, err = s.DB.ExecContext(ctx, `UPDATE narrator_messages SET content_json = ? WHERE id = ?`, string(data), latestID); err != nil {
+		return err
+	}
+	s.broadcastMergeSummaryCleanupReloads(narratorSet)
+	return nil
+}
+
+func (s *Service) broadcastMergeSummaryCleanupReloads(narratorSet map[string]bool) {
+	if s == nil || s.BroadcastNarrator == nil || len(narratorSet) == 0 {
+		return
+	}
+	for narratorID := range narratorSet {
+		narratorID = strings.TrimSpace(narratorID)
+		if narratorID == "" {
+			continue
+		}
+		s.BroadcastNarrator(narratorID, map[string]any{"type": "full_reload", "narratorId": narratorID})
+	}
 }
 
 func (s *Service) reviewRequiredBeforeMerge(ctx context.Context, projectID string) (bool, error) {
@@ -3092,13 +3683,58 @@ func (s *Service) reviewRequiredBeforeMerge(ctx context.Context, projectID strin
 }
 
 func (s *Service) prepareSourceBeforeMerge(ctx context.Context, source, target Chapter, gitPath string, requireReview bool) error {
-	if err := s.ensureMergeWorktreeClean(ctx, source, "source"); err != nil {
-		return err
-	}
 	if requireReview {
 		return s.ensureSourceReadyForRequiredReview(ctx, source, gitPath)
 	}
-	return nil
+	return s.autoCommitSourceBeforeMerge(ctx, source, target)
+}
+
+func buildPreMergeAutoCommitMessageGo(source, target Chapter) string {
+	sourceLabel := strings.TrimSpace(source.Title)
+	if sourceLabel == "" {
+		sourceLabel = source.Branch
+	}
+	return fmt.Sprintf("Auto-commit %s changes before merge into %s", sourceLabel, target.Branch)
+}
+
+func (s *Service) autoCommitSourceBeforeMerge(ctx context.Context, source, target Chapter) error {
+	if source.WorktreePath == nil || strings.TrimSpace(*source.WorktreePath) == "" {
+		return nil
+	}
+	sourceWorktree := strings.TrimSpace(*source.WorktreePath)
+	return s.Git.WithWorktreeLock(sourceWorktree, func() error {
+		currentBranch, err := s.Git.CurrentBranch(ctx, sourceWorktree)
+		if err != nil {
+			return err
+		}
+		currentBranch = strings.TrimSpace(currentBranch)
+		if currentBranch != source.Branch {
+			if currentBranch == "" {
+				currentBranch = "(detached)"
+			}
+			return httpx.ValidationError(fmt.Sprintf("Source chapter worktree is on branch %s, expected %s", currentBranch, source.Branch))
+		}
+		status, err := s.Git.Status(ctx, sourceWorktree)
+		if err != nil {
+			return err
+		}
+		if status.Clean {
+			return nil
+		}
+		message := buildPreMergeAutoCommitMessageGo(source, target)
+		commitSHA, err := s.Git.AutoCommit(ctx, sourceWorktree, message)
+		if err != nil {
+			return err
+		}
+		commitSHA = strings.TrimSpace(commitSHA)
+		if commitSHA == "" {
+			return nil
+		}
+		if err := s.recordChapterCommit(ctx, source.ID, commitSHA, message, "auto"); err != nil {
+			slog.Warn("chapters: failed to record pre-merge auto-commit", "sourceChapterId", source.ID, "commitSha", commitSHA, "error", err)
+		}
+		return nil
+	})
 }
 
 func (s *Service) ensureMergeWorktreeClean(ctx context.Context, chapter Chapter, kind string) error {
@@ -3943,48 +4579,8 @@ func nullStringPtr(v sql.NullString) *string {
 	return &v.String
 }
 
-func stringValueOr(value any, fallback string) string {
-	if s, ok := value.(string); ok && strings.TrimSpace(s) != "" {
-		return s
-	}
-	return fallback
-}
-
-func firstNonEmptyAny(values ...any) string {
-	for _, value := range values {
-		if s, ok := value.(string); ok && strings.TrimSpace(s) != "" {
-			return s
-		}
-	}
-	return ""
-}
-
-func stringSliceFromAny(value any) []string {
-	switch typed := value.(type) {
-	case []string:
-		return typed
-	case []any:
-		out := make([]string, 0, len(typed))
-		for _, item := range typed {
-			if s, ok := item.(string); ok {
-				out = append(out, s)
-			}
-		}
-		return out
-	default:
-		return nil
-	}
-}
-
-func mergeCommitFromAIResult(result map[string]any) string {
-	mergeResult, ok := result["mergeResult"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	return firstNonEmptyAny(mergeResult["mergeCommitSha"], mergeResult["commitSha"])
-}
-
 func nullablePtr(v *string) any {
+
 	if v == nil {
 		return nil
 	}

@@ -113,6 +113,7 @@ func (h *Handler) patch(w http.ResponseWriter, r *http.Request) error {
 	}
 	ensureOptionalProviderArraysForResponse(next)
 	normalizeProviderCompatibilityForResponse(next)
+	augmentProviderModelSettings(next)
 	sanitizeSettingsForResponse(next)
 	httpx.WriteJSON(w, http.StatusOK, next)
 	return nil
@@ -545,6 +546,10 @@ func prepareSettingsPatch(current, patch map[string]any) error {
 	if err := validateSettingsPatchKeys(patch); err != nil {
 		return err
 	}
+	if err := rejectAuthJWTSecretPatch(patch); err != nil {
+		return err
+	}
+	stripUnknownSettingsPatchFields(patch)
 	if err := validateServerSettingsPatch(patch); err != nil {
 		return err
 	}
@@ -617,6 +622,156 @@ var allowedSettingsPatchRoots = map[string]struct{}{
 	"update":             {},
 	"vnet":               {},
 	"shares":             {},
+}
+
+var settingsPatchNestedKeyAllowlist = map[string]map[string]struct{}{
+	"server":     stringSet("port", "host", "openBrowser", "tls"),
+	"paths":      stringSet("defaultProjectDir"),
+	"chapters":   stringSet("maxActiveWorktrees", "maxActiveContainers", "worktreeSizeWarningMb", "autoSaveOnDormant", "dormantAfterMinutes"),
+	"containers": stringSet("portRangeStart", "portRangeEnd", "proxy"),
+	"editor":     stringSet("type"),
+	"auth":       stringSet("registrationOpen"),
+	"codex":      stringSet("proxy", "loadBalancingMode", "tierOrder", "defaultReasoningEffort", "useWebSearch", "useImageGeneration"),
+	"routines":   stringSet("disabledRoutines", "enabledRoutines"),
+	"update":     stringSet("serverUrl", "product", "channel", "checkIntervalMinutes", "autoDownload"),
+	"vnet":       stringSet("enabled", "relayToken", "allowAnonymousRelay", "maxPeersPerNetwork", "maxMessageBytes", "udp"),
+	"shares":     stringSet("defaultExpiryHours", "maxFileSizeMb"),
+	"agent": stringSet(
+		"defaultModel", "defaultPermissionMode", "defaultStartInPlanMode", "summaryModel",
+		"customModels", "hiddenModels", "maxTurns", "subagentModels", "subagentAllowedModels",
+		"legacyEncoding", "freshShellEnv", "translateReasoning", "requestDumpEnabled",
+		"requestDumpErrorsOnly", "defaultRelaxedPlan", "planReflectionAutoApprove",
+		"planReflectionAllowAutoCompact", "questionReflectionEnabled", "questionReflectionTimeoutMs",
+		"dangerReflectionLevel", "dangerReflectionEnabled", "dangerSkipReadOnlyConfirmations",
+		"defaultReasoningEffort", "maxTransientRetries", "silentToolCallThreshold",
+		"retryBackoffCeilMs", "firstTokenTimeoutMs", "customRetryRules", "modelContextWindows",
+		"whitelistDirs", "blacklistDirs", "commandWhitelist", "commandBlacklist", "contextThresholds",
+		"autoCompactKeepPairs", "autoCompactPruneThreshold", "webFetchPolicy", "defaultSystemPrompt",
+		"modelAggregations", "providerOrder", "disabledProviders",
+	),
+}
+
+var customAPIProviderPatchAllowedKeys = stringSet(
+	"id", "name", "prefix", "apiKey", "baseUrl", "defaultModel", "protocol",
+	"defaultContextWindow", "defaultReasoningEffort", "proxy", "tlsRejectUnauthorized",
+	"codexAccountId", "codexWebSocket", "codexWebSearch", "codexImageGeneration", "disabled",
+)
+
+var openAIProviderPatchAllowedKeys = stringSet(
+	"id", "name", "prefix", "apiKey", "baseUrl", "defaultModel", "responsesApi", "apiMode",
+	"codexAccountId", "codexWebSocket", "codexWebSearch", "codexImageGeneration",
+	"defaultContextWindow", "disabled",
+)
+
+var anthropicProviderPatchAllowedKeys = stringSet(
+	"id", "name", "prefix", "apiKey", "baseUrl", "defaultModel", "defaultReasoningEffort",
+	"proxy", "tlsRejectUnauthorized", "officialApi", "disabled",
+)
+
+var nkpProviderPatchAllowedKeys = stringSet("id", "name", "prefix", "apiKey", "baseUrl", "defaultModel", "disabled")
+
+var nugProviderPatchAllowedKeys = stringSet(
+	"id", "name", "prefix", "apiKey", "baseUrl", "defaultModel", "nugUsername", "nugUserId",
+	"oauthClientId", "oauthClientSecret", "oauthDeviceId", "oauthCallbackUrl", "disabled",
+)
+
+var clineProviderPatchAllowedKeys = stringSet(
+	"id", "name", "prefix", "baseUrl", "accessToken", "defaultModel", "defaultContextWindow",
+	"enabledModels", "disabled",
+)
+
+func stringSet(keys ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		set[key] = struct{}{}
+	}
+	return set
+}
+
+func rejectAuthJWTSecretPatch(patch map[string]any) error {
+	authPatch, ok := patch["auth"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if _, exists := authPatch["jwtSecret"]; exists {
+		return httpx.ValidationError("auth.jwtSecret cannot be updated")
+	}
+	return nil
+}
+
+func stripUnknownSettingsPatchFields(patch map[string]any) {
+	for root, allowlist := range settingsPatchNestedKeyAllowlist {
+		stripUnknownMapKeys(patch[root], allowlist)
+	}
+	if server, ok := patch["server"].(map[string]any); ok {
+		stripUnknownMapKeys(server["tls"], stringSet("enabled", "certFile", "keyFile", "passphrase", "caFile"))
+	}
+	if containers, ok := patch["containers"].(map[string]any); ok {
+		stripUnknownMapKeys(containers["proxy"], stringSet("enabled", "port"))
+	}
+	if vnet, ok := patch["vnet"].(map[string]any); ok {
+		stripUnknownMapKeys(vnet["udp"], stringSet("enabled", "host", "port"))
+	}
+	stripUnknownAgentPatchFields(patch)
+	stripUnknownProviderPatchFields(patch)
+}
+
+func stripUnknownAgentPatchFields(patch map[string]any) {
+	agent, ok := patch["agent"].(map[string]any)
+	if !ok {
+		return
+	}
+	stripUnknownMapKeys(agent["subagentModels"], stringSet("explore", "plan"))
+	stripUnknownMapKeys(agent["subagentAllowedModels"], stringSet("explore", "plan", "general"))
+	if thresholds, ok := agent["contextThresholds"].(map[string]any); ok {
+		stripUnknownMapKeys(thresholds, stringSet("standard", "large"))
+		stripUnknownMapKeys(thresholds["standard"], stringSet("pruneStart", "compactStart"))
+		stripUnknownMapKeys(thresholds["large"], stringSet("pruneStart", "compactStart"))
+	}
+	if policy, ok := agent["webFetchPolicy"].(map[string]any); ok {
+		stripUnknownMapKeys(policy, stringSet("allowAll", "whitelist", "blacklist", "proxy"))
+		stripUnknownArrayObjectKeys(policy["whitelist"], stringSet("pattern", "enabled"))
+		stripUnknownArrayObjectKeys(policy["blacklist"], stringSet("pattern", "enabled"))
+		stripUnknownMapKeys(policy["proxy"], stringSet("mode", "url"))
+	}
+	stripUnknownArrayObjectKeys(agent["customModels"], stringSet("value", "label", "provider", "channel", "channelType"))
+	stripUnknownArrayObjectKeys(agent["customRetryRules"], stringSet("id", "domain", "statusCode", "keyword", "enabled", "note"))
+	stripUnknownArrayObjectKeys(agent["modelAggregations"], stringSet("id", "name", "models", "routingMode"))
+	stripUnknownArrayObjectKeys(agent["whitelistDirs"], stringSet("path", "accessLevel", "enabled"))
+	stripUnknownArrayObjectKeys(agent["blacklistDirs"], stringSet("path", "denyLevel", "enabled"))
+	stripUnknownArrayObjectKeys(agent["commandWhitelist"], stringSet("pattern", "enabled"))
+	stripUnknownArrayObjectKeys(agent["commandBlacklist"], stringSet("pattern", "denyPrompt", "enabled"))
+}
+
+func stripUnknownProviderPatchFields(patch map[string]any) {
+	stripUnknownArrayObjectKeys(patch["customApiProviders"], customAPIProviderPatchAllowedKeys)
+	stripUnknownArrayObjectKeys(patch["openaiProviders"], openAIProviderPatchAllowedKeys)
+	stripUnknownArrayObjectKeys(patch["anthropicProviders"], anthropicProviderPatchAllowedKeys)
+	stripUnknownArrayObjectKeys(patch["nkpProviders"], nkpProviderPatchAllowedKeys)
+	stripUnknownArrayObjectKeys(patch["nugProviders"], nugProviderPatchAllowedKeys)
+	stripUnknownArrayObjectKeys(patch["clineProviders"], clineProviderPatchAllowedKeys)
+}
+
+func stripUnknownArrayObjectKeys(value any, allowlist map[string]struct{}) {
+	items, ok := value.([]any)
+	if !ok {
+		return
+	}
+	for _, item := range items {
+		stripUnknownMapKeys(item, allowlist)
+	}
+}
+
+func stripUnknownMapKeys(value any, allowlist map[string]struct{}) {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	for key := range item {
+		if _, allowed := allowlist[key]; !allowed {
+			delete(item, key)
+		}
+	}
 }
 
 func validateSettingsPatchKeys(patch map[string]any) error {
@@ -2520,6 +2675,9 @@ func serverURL(host string, port int, tlsEnabled bool) string {
 
 func (h *Handler) serverRestartResponse(ctx context.Context, host string, port int, tlsEnabled bool) (map[string]any, error) {
 	newURL := serverURL(host, port, tlsEnabled)
+	if os.Getenv("NARRAFORK_CONTRACT_SUPPRESS_RESTART") == "1" {
+		return map[string]any{"serverRestarting": true, "manualRestartRequired": false, "newUrl": newURL, "restartSuppressed": true}, nil
+	}
 	if h == nil || h.Restart == nil {
 		return map[string]any{"serverRestarting": false, "manualRestartRequired": true, "newUrl": newURL}, nil
 	}
