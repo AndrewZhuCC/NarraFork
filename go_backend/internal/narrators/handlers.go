@@ -63,6 +63,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Put("/{id}/draft", httpx.Handler(h.putDraft))
 	r.Get("/{id}/usage-stats", httpx.Handler(h.usageStats))
 	r.Get("/{id}/commands", httpx.Handler(h.commands))
+	r.Get("/{id}/skills", httpx.Handler(h.skills))
 	r.Get("/{id}/messages", httpx.Handler(h.messages))
 	r.Post("/{id}/messages", httpx.Handler(h.postMessage))
 	r.Delete("/{id}/messages/batch-blocks", httpx.Handler(h.deleteMessageBlocks))
@@ -131,6 +132,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Post("/{id}/continue", httpx.Handler(h.continueRun))
 	r.Post("/{id}/rollback/{messageId}", httpx.Handler(h.rollbackMessage))
 	r.Post("/{id}/edit-and-regenerate/{messageId}", httpx.Handler(h.editAndRegenerate))
+	r.Post("/{id}/edit-message/{messageId}", httpx.Handler(h.editMessage))
 	r.Post("/{id}/fork", httpx.Handler(h.forkNarrator))
 	r.Post("/{id}/fork-messages", httpx.Handler(h.forkMessages))
 	r.Get("/{id}/browser-sessions", httpx.Handler(h.listBrowserSessions))
@@ -630,6 +632,16 @@ func validateCreateRequest(req createRequest) error {
 	if req.SystemPrompt != nil && len(*req.SystemPrompt) > 10000 {
 		return httpx.BadRequest("systemPrompt must be at most 10000 characters")
 	}
+	// Mirror the TypeScript createNarratorSchema Zod bound: cwd min 1 / max 4096
+	// when provided (consistent with the updateNarratorCwdSchema bound).
+	if req.Cwd != nil {
+		if len(*req.Cwd) < 1 {
+			return httpx.BadRequest("cwd must not be empty")
+		}
+		if len(*req.Cwd) > 4096 {
+			return httpx.BadRequest("cwd must be at most 4096 characters")
+		}
+	}
 	if req.ReasoningEffort != nil && !validReasoningEffort(*req.ReasoningEffort) {
 		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, or null")
 	}
@@ -835,6 +847,14 @@ func (h *Handler) deleteMessageBlocks(w http.ResponseWriter, r *http.Request) er
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript batchDeleteBlocksSchema Zod bound: blocks array
+	// min 1 / max 200.
+	if len(body.Blocks) < 1 {
+		return httpx.BadRequest("blocks is required")
+	}
+	if len(body.Blocks) > 200 {
+		return httpx.BadRequest("blocks must contain at most 200 items")
+	}
 	narratorID := chi.URLParam(r, "id")
 	deleted := 0
 	failed := 0
@@ -859,6 +879,13 @@ func (h *Handler) updateCompactSummary(w http.ResponseWriter, r *http.Request) e
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript `/:id/compact/:messageId` PATCH check: summary must be
+	// a present non-empty string (`!summary`). TypeScript does not trim or cap this
+	// route (the max 100000 bound only applies to the segment-compact route), so
+	// Go matches that looser contract here to avoid diverging from TS behavior.
+	if body.Summary == "" {
+		return httpx.BadRequest("summary is required")
 	}
 	if err := h.updateMessageSummary(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "messageId"), body.Summary); err != nil {
 		return err
@@ -1179,6 +1206,17 @@ func (h *Handler) segmentCompact(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript segmentCompactSchema messageIds bound (max 500, each
+	// entry non-empty) when messageIds are supplied. Go additionally accepts an
+	// explicit from/to range as a documented extension, so the array is optional.
+	if len(body.MessageIDs) > 500 {
+		return httpx.BadRequest("messageIds must contain at most 500 items")
+	}
+	for _, mid := range body.MessageIDs {
+		if strings.TrimSpace(mid) == "" {
+			return httpx.BadRequest("messageIds entries must be non-empty")
+		}
 	}
 	refs, err := h.segmentCompactRefs(r.Context(), narratorID, body.MessageIDs, body.FromID, body.ToID)
 	if err != nil {
@@ -2162,6 +2200,14 @@ func (h *Handler) forkNarrator(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript forkNarratorSchema Zod bounds: forkMessageUuid min 1,
+	// title min 1 / max 200 when provided, inheritMode enum (service-validated).
+	if strings.TrimSpace(body.ForkMessageUUID) == "" {
+		return httpx.BadRequest("forkMessageUuid is required")
+	}
+	if strings.TrimSpace(body.Title) != "" && len(body.Title) > 200 {
+		return httpx.BadRequest("title must be at most 200 characters")
+	}
 	narrator, err := h.Service.ForkNarrator(r.Context(), chi.URLParam(r, "id"), body.ForkMessageUUID, body.Title, body.InheritMode)
 	if err != nil {
 		return err
@@ -2177,6 +2223,22 @@ func (h *Handler) forkMessages(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript forkFromMessagesSchema Zod bounds: messageIds array
+	// min 1 / max 500 with each entry min 1, title max 200 when provided.
+	if len(body.MessageIDs) < 1 {
+		return httpx.BadRequest("messageIds is required")
+	}
+	if len(body.MessageIDs) > 500 {
+		return httpx.BadRequest("messageIds must contain at most 500 items")
+	}
+	for _, mid := range body.MessageIDs {
+		if strings.TrimSpace(mid) == "" {
+			return httpx.BadRequest("messageIds entries must be non-empty")
+		}
+	}
+	if len(body.Title) > 200 {
+		return httpx.BadRequest("title must be at most 200 characters")
 	}
 	narrator, err := h.Service.ForkFromMessages(r.Context(), chi.URLParam(r, "id"), body.MessageIDs, body.Title)
 	if err != nil {
@@ -2995,7 +3057,26 @@ func (h *Handler) segmentCompactMessages(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *Handler) updateSegmentCompactSummary(w http.ResponseWriter, r *http.Request) error {
-	return h.updateCompactSummary(w, r)
+	// Mirror the TypeScript updateSegmentCompactSummarySchema Zod bound for the
+	// segment-compact route: summary min 1 / max 100000 (stricter than the plain
+	// compact route).
+	var peek struct {
+		Summary string `json:"summary"`
+	}
+	if err := httpx.DecodeLooseJSON(r, &peek); err != nil {
+		return err
+	}
+	if strings.TrimSpace(peek.Summary) == "" {
+		return httpx.BadRequest("summary must be a non-empty string")
+	}
+	if len(peek.Summary) > 100000 {
+		return httpx.BadRequest("summary must be at most 100000 characters")
+	}
+	if err := h.updateMessageSummary(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "messageId"), peek.Summary); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
 }
 
 func (h *Handler) clearContext(w http.ResponseWriter, r *http.Request) error {
@@ -3278,6 +3359,13 @@ func (h *Handler) updateTitle(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	title := firstString(stringValue(body["title"]), stringValue(body["name"]))
+	// Mirror the TypeScript updateNarratorTitleSchema Zod bound: title min 1 / max 200.
+	if strings.TrimSpace(title) == "" {
+		return httpx.BadRequest("title must be a non-empty string")
+	}
+	if len(title) > 200 {
+		return httpx.BadRequest("title must be at most 200 characters")
+	}
 	narratorID := chi.URLParam(r, "id")
 	n, err := h.Service.UpdateTextField(r.Context(), narratorID, "title", nullableString(title))
 	if err != nil {
@@ -3296,9 +3384,30 @@ func (h *Handler) updateModel(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	model := firstString(stringValue(body["model"]), stringValue(body["value"]))
+	// Mirror the TypeScript updateNarratorModelSchema Zod bound: model must be
+	// "__default__" or a non-empty string up to 200 characters.
+	if model != "__default__" {
+		if strings.TrimSpace(model) == "" {
+			return httpx.BadRequest("model must be a non-empty string")
+		}
+		if len(model) > 200 {
+			return httpx.BadRequest("model must be at most 200 characters")
+		}
+	}
 	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "model", nullableString(model))
 	if err != nil {
 		return err
+	}
+	// Mirror the TypeScript updateNarratorModel broadcast so connected clients update
+	// the displayed model and any live runtime settings indicator.
+	if h.Service.Hub != nil {
+		narratorID := chi.URLParam(r, "id")
+		var reasoning any
+		if n.ReasoningEffort != nil {
+			reasoning = *n.ReasoningEffort
+		}
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "model_changed", "narratorId": narratorID, "model": model})
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "model_settings_changed", "narratorId": narratorID, "model": model, "reasoningEffort": reasoning, "status": "updated", "applyAt": "next_request"})
 	}
 	httpx.WriteJSON(w, http.StatusOK, n)
 	return nil
@@ -3504,6 +3613,10 @@ func (h *Handler) suggestAnswers(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	questions := parseAskQuestions(body["questions"])
+	// Mirror the TypeScript suggestAnswersSchema Zod bound: questions array min 1.
+	if len(questions) < 1 {
+		return httpx.BadRequest("questions is required")
+	}
 	answers, err := h.Service.GenerateAskUserQuestionAnswers(r.Context(), chi.URLParam(r, "id"), questions, "suggest")
 	if err != nil {
 		return err
@@ -3592,6 +3705,48 @@ func (h *Handler) editAndRegenerate(w http.ResponseWriter, r *http.Request) erro
 	return nil
 }
 
+// editMessage edits an assistant message's displayed text without truncating
+// following messages or re-running the agent, mirroring the TypeScript
+// POST /api/narrators/:id/edit-message/:messageId route.
+func (h *Handler) editMessage(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		return err
+	}
+	content := body.Content
+	if len(content) < 1 {
+		return httpx.ValidationError("content must be at least 1 character")
+	}
+	if len(content) > 100000 {
+		return httpx.ValidationError("content must be at most 100000 characters")
+	}
+	narrator, err := h.Service.Get(r.Context(), narratorID)
+	if err != nil {
+		return err
+	}
+	if (narrator.Variant == "subagent" || narrator.Type == "subagent") && (narrator.Status == "working" || narrator.Status == "waiting") {
+		return httpx.ValidationError("Cannot edit on a running subagent")
+	}
+	if narrator.Status == "archived" {
+		if _, err := h.Service.UpdateTextField(r.Context(), narratorID, "status", "idle"); err != nil {
+			return err
+		}
+	}
+	var editedBy *string
+	if claims := auth.UserFromContext(r.Context()); claims != nil && strings.TrimSpace(claims.Subject) != "" {
+		subject := claims.Subject
+		editedBy = &subject
+	}
+	if _, err := h.Service.EditAssistantMessage(r.Context(), narratorID, chi.URLParam(r, "messageId"), content, editedBy); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
+}
+
 func writeNarratorFeatureDisabled(w http.ResponseWriter, feature, reason string) {
 	httpx.WriteFeatureDisabled(w, feature, reason)
 }
@@ -3647,6 +3802,19 @@ func (h *Handler) putDraft(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript updateNarratorDraftSchema Zod bounds: text max 100000,
+	// sourceId min 1 / max 120 when provided.
+	if len(body.Text) > 100000 {
+		return httpx.BadRequest("text must be at most 100000 characters")
+	}
+	if body.SourceID != nil {
+		if strings.TrimSpace(*body.SourceID) == "" {
+			return httpx.BadRequest("sourceId must be a non-empty string")
+		}
+		if len(*body.SourceID) > 120 {
+			return httpx.BadRequest("sourceId must be at most 120 characters")
+		}
+	}
 	narratorID := chi.URLParam(r, "id")
 	traits, err := h.narratorTraits(r.Context(), narratorID)
 	if err != nil {
@@ -3698,6 +3866,37 @@ func (h *Handler) commands(w http.ResponseWriter, r *http.Request) error {
 	commands = append(commands, mergeCommandLists(userCommands, projectCommands)...)
 	skillRoot, _ := h.Service.skillRootForNarrator(r.Context(), narratorID)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"commands": commands, "skills": simplecontent.SlashSkillSummaries(skillRoot), "tools": optionalToolMenuItems()})
+	return nil
+}
+
+// skills mirrors the TypeScript GET /api/narrators/{id}/skills route: it resolves
+// the narrator's project/cwd context, scans the global/project/workspace skill
+// roots, and returns deduped skill summaries (disabled hidden), per-root scan
+// metadata, and a stable scope key. The `refresh` query param is accepted for
+// TypeScript compatibility but has no effect under Go's live-scan strategy
+// (Wave 309 directoryScanContract).
+func (h *Handler) skills(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	projectGitPath, cwd, err := h.Service.skillContextForNarrator(r.Context(), narratorID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return httpx.NotFound("Narrator")
+		}
+		return err
+	}
+	result := simplecontent.NarratorSkillContext(projectGitPath, cwd, db.NowISO())
+	visible := make([]map[string]any, 0, len(result.Skills))
+	for _, skill := range result.Skills {
+		if boolVal, _ := skill["disabled"].(bool); boolVal {
+			continue
+		}
+		visible = append(visible, skill)
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+		"skills":   visible,
+		"roots":    result.Roots,
+		"scopeKey": result.ScopeKey,
+	})
 	return nil
 }
 
@@ -4301,6 +4500,13 @@ func (h *Handler) updateBuffer(w http.ResponseWriter, r *http.Request) error {
 	sets := []string{}
 	args := []any{}
 	if text, ok := body["text"].(string); ok {
+		// Mirror the TypeScript updateBufferedMessageSchema Zod bound: text min 1 / max 100000.
+		if strings.TrimSpace(text) == "" {
+			return httpx.BadRequest("text must be a non-empty string")
+		}
+		if len(text) > 100000 {
+			return httpx.BadRequest("text must be at most 100000 characters")
+		}
 		sets = append(sets, "text = ?")
 		args = append(args, text)
 	}
@@ -4402,6 +4608,16 @@ func (h *Handler) reorderBuffer(w http.ResponseWriter, r *http.Request) error {
 	ids := body.OrderedIDs
 	if len(ids) == 0 {
 		ids = body.MessageIDs
+	}
+	// Mirror the TypeScript reorderBufferSchema Zod bound: orderedIds array min 1
+	// with each entry min 1.
+	if len(ids) < 1 {
+		return httpx.BadRequest("orderedIds is required")
+	}
+	for _, idValue := range ids {
+		if strings.TrimSpace(idValue) == "" {
+			return httpx.BadRequest("orderedIds entries must be non-empty")
+		}
 	}
 	currentIDs, err := h.bufferIDs(r.Context(), narratorID)
 	if err != nil {
@@ -5062,6 +5278,60 @@ func (h *Handler) listRules(table string) httpx.HandlerFunc {
 	}
 }
 
+// validateNarratorRuleFields mirrors the TypeScript narrator dir/command rule Zod
+// bounds for the create routes. `path` (dirs) is trimmed 1..4096, `pattern` (cmds)
+// is trimmed 1..200, dir access/deny levels are enums, and cmd-blacklist denyPrompt
+// is max 2000.
+func validateNarratorRuleFields(primaryField, secondaryField, primary string, body map[string]any) error {
+	switch primaryField {
+	case "path":
+		trimmed := strings.TrimSpace(primary)
+		if trimmed == "" {
+			return httpx.BadRequest("path must be a non-empty string")
+		}
+		if len(trimmed) > 4096 {
+			return httpx.BadRequest("path must be at most 4096 characters")
+		}
+	case "pattern":
+		trimmed := strings.TrimSpace(primary)
+		if trimmed == "" {
+			return httpx.BadRequest("pattern must be a non-empty string")
+		}
+		if len(trimmed) > 200 {
+			return httpx.BadRequest("pattern must be at most 200 characters")
+		}
+	}
+	secondary, hasSecondary := narratorRuleSecondaryValue(secondaryField, body)
+	switch secondaryField {
+	case "access_level":
+		if hasSecondary && secondary != "readOnly" && secondary != "readWrite" && secondary != "full" {
+			return httpx.BadRequest("accessLevel must be readOnly, readWrite, or full")
+		}
+	case "deny_level":
+		if hasSecondary && secondary != "denyWrite" && secondary != "denyAll" {
+			return httpx.BadRequest("denyLevel must be denyWrite or denyAll")
+		}
+	case "deny_prompt":
+		if hasSecondary && len(secondary) > 2000 {
+			return httpx.BadRequest("denyPrompt must be at most 2000 characters")
+		}
+	}
+	return nil
+}
+
+func narratorRuleSecondaryValue(secondaryField string, body map[string]any) (string, bool) {
+	if secondaryField == "" {
+		return "", false
+	}
+	if v, ok := body[snakeToCamel(secondaryField)].(string); ok {
+		return v, true
+	}
+	if v, ok := body[secondaryField].(string); ok {
+		return v, true
+	}
+	return "", false
+}
+
 func (h *Handler) createRule(table, primaryField, secondaryField, defaultSecondary string) httpx.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		var body map[string]any
@@ -5074,6 +5344,11 @@ func (h *Handler) createRule(table, primaryField, secondaryField, defaultSeconda
 		}
 		if primary == "" {
 			return httpx.BadRequest(primaryField + " is required")
+		}
+		// Mirror the TypeScript narrator rule Zod bounds: dir `path` trim 1..4096,
+		// cmd `pattern` trim 1..200, dir secondary enum, cmd-blacklist denyPrompt max 2000.
+		if err := validateNarratorRuleFields(primaryField, secondaryField, primary, body); err != nil {
+			return err
 		}
 		entryID := id.New()
 		now := db.NowISO()
@@ -5592,6 +5867,14 @@ func (h *Handler) updateCwd(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript updateNarratorCwdSchema Zod bound: cwd trimmed min 1 / max 4096.
+	trimmedCwd := strings.TrimSpace(body.Cwd)
+	if trimmedCwd == "" {
+		return httpx.BadRequest("cwd must be a non-empty string")
+	}
+	if len(trimmedCwd) > 4096 {
+		return httpx.BadRequest("cwd must be at most 4096 characters")
+	}
 	_, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "cwd", body.Cwd)
 	if err != nil {
 		return err
@@ -5618,9 +5901,23 @@ func (h *Handler) updateReasoningEffort(w http.ResponseWriter, r *http.Request) 
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	_, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "reasoning_effort", nullableStringValue(body.ReasoningEffort))
+	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "reasoning_effort", nullableStringValue(body.ReasoningEffort))
 	if err != nil {
 		return err
+	}
+	// Mirror the TypeScript updateNarratorReasoningEffort broadcast so connected
+	// clients see the updated runtime settings indicator.
+	if h.Service.Hub != nil {
+		narratorID := chi.URLParam(r, "id")
+		var reasoning any
+		if n.ReasoningEffort != nil {
+			reasoning = *n.ReasoningEffort
+		}
+		var modelValue any
+		if n.Model != nil {
+			modelValue = *n.Model
+		}
+		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "model_settings_changed", "narratorId": narratorID, "model": modelValue, "reasoningEffort": reasoning, "status": "updated", "applyAt": "next_request"})
 	}
 	return h.ok(w, r)
 }

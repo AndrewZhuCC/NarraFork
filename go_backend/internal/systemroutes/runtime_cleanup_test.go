@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"narrafork-go/internal/httpx"
 )
@@ -80,6 +81,91 @@ func TestRuntimeScanReportsBrowserRuntimeAndPersistedSessions(t *testing.T) {
 	browsers, _ := body["browsers"].(map[string]any)
 	if browsers["supported"] != true || browsers["fallback"] != false || browsers["runtime"] != "go-rod" || browsers["activeSessions"] != float64(2) || browsers["persistedSessions"] != float64(2) || browsers["sessionApiSupported"] != true || browsers["cleanupSupported"] != true || browsers["dbTableAvailable"] != true {
 		t.Fatalf("browser runtime payload should expose supported Go Browser runtime and persisted sessions, got %#v", browsers)
+	}
+}
+
+func TestCachedRuntimeExpiresAfterTTLLikeTypeScript(t *testing.T) {
+	previous := runtimeCache
+	t.Cleanup(func() { runtimeCache = previous })
+	h := &Handler{TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+
+	// Fresh cache within the 30s TTL window is served as cached=true.
+	runtimeCache = map[string]any{
+		"terminals": map[string]any{},
+		"scannedAt": time.Now().Add(-5 * time.Second).UnixMilli(),
+	}
+	fresh := callCachedRuntime(t, h)
+	if fresh["cached"] != true {
+		t.Fatalf("fresh runtime cache should report cached=true, got %#v", fresh)
+	}
+
+	// Cache older than the TTL window is treated as expired, cleared, and not served.
+	runtimeCache = map[string]any{
+		"terminals": map[string]any{},
+		"scannedAt": time.Now().Add(-(runtimeCacheTTL + time.Second)).UnixMilli(),
+	}
+	stale := callCachedRuntime(t, h)
+	if stale["cached"] != false {
+		t.Fatalf("stale runtime cache should report cached=false, got %#v", stale)
+	}
+	if _, hasData := stale["data"]; hasData {
+		t.Fatalf("expired runtime cache response must omit data, got %#v", stale)
+	}
+	if runtimeCache != nil {
+		t.Fatalf("expired runtime cache must be cleared, got %#v", runtimeCache)
+	}
+}
+
+func callCachedRuntime(t *testing.T, h *Handler) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/runtime/cached", nil)
+	w := httptest.NewRecorder()
+	if err := h.cachedRuntime(w, req); err != nil {
+		t.Fatalf("cached runtime: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("cached runtime status = %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode cached runtime: %v", err)
+	}
+	return body
+}
+
+// Wave 280: the TypeScript runtime-service cleanup emits no event-bus frames and
+// acquires no global lock; it simply runs per-target cleanup and logs. Go must
+// match that no-event/no-lock contract, so the cleanup response must not carry
+// any event/lock/broadcast fields that would imply a serialized or event-driven
+// cleanup the TypeScript backend does not perform.
+func TestRuntimeCleanupEmitsNoEventOrGlobalLockLikeTypeScript(t *testing.T) {
+	previous := runtimeCache
+	t.Cleanup(func() { runtimeCache = previous })
+	sqlDB := newRuntimeCleanupTestDB(t)
+	defer sqlDB.Close()
+	mustExec(t, sqlDB, `INSERT INTO terminals (id, status, exit_code) VALUES ('exited-term', 'exited', 0);`)
+	h := &Handler{DB: sqlDB, TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/runtime/cleanup", strings.NewReader(`{"target":"terminals","execute":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.cleanupRuntime(w, req); err != nil {
+		t.Fatalf("cleanupRuntime: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", w.Code, w.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for _, forbidden := range []string{"event", "events", "eventId", "lock", "lockId", "globalLock", "locked", "broadcast", "broadcasts"} {
+		if _, present := raw[forbidden]; present {
+			t.Fatalf("runtime cleanup response must not expose %q (TS emits no events/lock): %#v", forbidden, raw)
+		}
+	}
+	if raw["ok"] != true {
+		t.Fatalf("expected cleanup ok=true, got %#v", raw)
 	}
 }
 

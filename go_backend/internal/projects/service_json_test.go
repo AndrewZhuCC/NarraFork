@@ -39,7 +39,7 @@ func TestProjectUpdateMergesChapterSettingsWithExistingValues(t *testing.T) {
 
 	project, err := (&Service{DB: sqlDB}).Update(context.Background(), "p1", map[string]any{
 		"chapterSettings": map[string]any{
-			"routines":             map[string]any{"enabledRoutines": []any{"test"}},
+			"routines":            map[string]any{"enabledRoutines": []any{"test"}},
 			"autoCreateNarrator":  false,
 			"autoStartContainers": true,
 		},
@@ -129,6 +129,89 @@ func TestProjectUpdateIgnoresFlowModeLikeTSSchema(t *testing.T) {
 	if project.Name != "Renamed" || project.FlowMode != "classic" {
 		t.Fatalf("flowMode should not be mutable through PATCH, got name=%q flowMode=%q", project.Name, project.FlowMode)
 	}
+}
+
+func TestProjectUpdateValidatesChapterSettingsNestedZodBounds(t *testing.T) {
+	sqlDB := openProjectJSONTestDB(t)
+	defer sqlDB.Close()
+	insertProjectJSONTestRow(t, sqlDB, `{}`)
+	service := &Service{DB: sqlDB}
+
+	tooManyCommands := make([]any, 101)
+	for i := range tooManyCommands {
+		tooManyCommands[i] = map[string]any{"name": "cmd", "prompt": "do"}
+	}
+	tooManyDirs := make([]any, 51)
+	for i := range tooManyDirs {
+		tooManyDirs[i] = map[string]any{"path": "/tmp"}
+	}
+
+	cases := []struct {
+		name string
+		data map[string]any
+		want string
+	}{
+		{name: "commands not array", data: map[string]any{"commands": "x"}, want: "chapterSettings.commands must be an array"},
+		{name: "commands too many", data: map[string]any{"commands": tooManyCommands}, want: "must contain at most 100 items"},
+		{name: "command empty name", data: map[string]any{"commands": []any{map[string]any{"name": "", "prompt": "p"}}}, want: "name must not be empty"},
+		{name: "command bad name regex", data: map[string]any{"commands": []any{map[string]any{"name": "bad name!", "prompt": "p"}}}, want: "letters, numbers, hyphens"},
+		{name: "command missing prompt", data: map[string]any{"commands": []any{map[string]any{"name": "ship"}}}, want: "prompt is required"},
+		{name: "command long description", data: map[string]any{"commands": []any{map[string]any{"name": "ship", "prompt": "p", "description": strings.Repeat("x", 501)}}}, want: "description must be at most 500 characters"},
+		{name: "command params too many", data: map[string]any{"commands": []any{map[string]any{"name": "ship", "prompt": "p", "params": makeParams(21)}}}, want: "params must contain at most 20 items"},
+		{name: "command modelOverride bad mode", data: map[string]any{"commands": []any{map[string]any{"name": "ship", "prompt": "p", "modelOverride": map[string]any{"model": "gpt", "mode": "forever"}}}}, want: "mode must be temporary or permanent"},
+		{name: "whitelistDirs too many", data: map[string]any{"whitelistDirs": tooManyDirs}, want: "whitelistDirs must contain at most 50 items"},
+		{name: "whitelistDir missing path", data: map[string]any{"whitelistDirs": []any{map[string]any{"accessLevel": "readOnly"}}}, want: "path is required"},
+		{name: "whitelistDir bad accessLevel", data: map[string]any{"whitelistDirs": []any{map[string]any{"path": "/tmp", "accessLevel": "superuser"}}}, want: "accessLevel must be one of"},
+		{name: "blacklistDir bad denyLevel", data: map[string]any{"blacklistDirs": []any{map[string]any{"path": "/tmp", "denyLevel": "denyEverything"}}}, want: "denyLevel must be one of"},
+		{name: "commandWhitelist long pattern", data: map[string]any{"commandWhitelist": []any{map[string]any{"pattern": strings.Repeat("x", 201)}}}, want: "pattern must be at most 200 characters"},
+		{name: "commandBlacklist long denyPrompt", data: map[string]any{"commandBlacklist": []any{map[string]any{"pattern": "rm", "denyPrompt": strings.Repeat("x", 2001)}}}, want: "denyPrompt must be at most 2000 characters"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := service.Update(context.Background(), "p1", map[string]any{"chapterSettings": tc.data})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q validation error, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestProjectUpdateAcceptsValidChapterSettingsBounds(t *testing.T) {
+	sqlDB := openProjectJSONTestDB(t)
+	defer sqlDB.Close()
+	insertProjectJSONTestRow(t, sqlDB, `{}`)
+	service := &Service{DB: sqlDB}
+
+	_, err := service.Update(context.Background(), "p1", map[string]any{
+		"chapterSettings": map[string]any{
+			"commands": []any{
+				map[string]any{
+					"name":          "ship-it_2",
+					"prompt":        "Deploy the build",
+					"description":   "Ship",
+					"runBashFirst":  true,
+					"bashCommand":   "echo hi",
+					"params":        makeParams(3),
+					"modelOverride": map[string]any{"model": "gpt-5", "mode": "temporary"},
+				},
+			},
+			"whitelistDirs":    []any{map[string]any{"path": "/src", "accessLevel": "readWrite", "enabled": true}},
+			"blacklistDirs":    []any{map[string]any{"path": "/secret", "denyLevel": "denyAll"}},
+			"commandWhitelist": []any{map[string]any{"pattern": "git *", "enabled": true}},
+			"commandBlacklist": []any{map[string]any{"pattern": "rm -rf", "denyPrompt": "Are you sure?"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("valid chapterSettings should pass validation, got %v", err)
+	}
+}
+
+func makeParams(n int) []any {
+	params := make([]any, n)
+	for i := range params {
+		params[i] = map[string]any{"name": "param", "description": "p", "required": false, "defaultValue": "x"}
+	}
+	return params
 }
 
 func openProjectJSONTestDB(t *testing.T) *sql.DB {

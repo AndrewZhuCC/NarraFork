@@ -128,30 +128,6 @@
 		},
 		{
 			"type": "index",
-			"name": "idx_container_instances_chapter",
-			"table": "container_instances",
-			"sql": "CREATE INDEX idx_container_instances_chapter ON container_instances(chapter_id)"
-		},
-		{
-			"type": "index",
-			"name": "idx_container_instances_chapter_service",
-			"table": "container_instances",
-			"sql": "CREATE INDEX idx_container_instances_chapter_service ON container_instances(chapter_id, service_name)"
-		},
-		{
-			"type": "index",
-			"name": "idx_container_instances_container",
-			"table": "container_instances",
-			"sql": "CREATE INDEX idx_container_instances_container ON container_instances(container_id)"
-		},
-		{
-			"type": "index",
-			"name": "idx_container_instances_status",
-			"table": "container_instances",
-			"sql": "CREATE INDEX idx_container_instances_status ON container_instances(chapter_id, status)"
-		},
-		{
-			"type": "index",
 			"name": "idx_fav_dirs_user",
 			"table": "user_favorite_directories",
 			"sql": "CREATE INDEX `idx_fav_dirs_user` ON `user_favorite_directories` (`user_id`,`sort_order`)"
@@ -191,12 +167,6 @@
 			"name": "idx_hooks_event",
 			"table": "hooks",
 			"sql": "CREATE INDEX `idx_hooks_event` ON `hooks` (`event`,`enabled`)"
-		},
-		{
-			"type": "index",
-			"name": "idx_hooks_event_enabled",
-			"table": "hooks",
-			"sql": "CREATE INDEX idx_hooks_event_enabled ON hooks(event, enabled)"
 		},
 		{
 			"type": "index",
@@ -332,9 +302,21 @@
 		},
 		{
 			"type": "index",
-			"name": "idx_snapshot_applications_applied_by",
-			"table": "volume_snapshot_applications",
-			"sql": "CREATE INDEX idx_snapshot_applications_applied_by ON volume_snapshot_applications(applied_by)"
+			"name": "idx_skill_dir_cache_expires",
+			"table": "skill_directory_caches",
+			"sql": "CREATE INDEX `idx_skill_dir_cache_expires` ON `skill_directory_caches` (`expires_at`)"
+		},
+		{
+			"type": "index",
+			"name": "idx_skill_dir_cache_last_accessed",
+			"table": "skill_directory_caches",
+			"sql": "CREATE INDEX `idx_skill_dir_cache_last_accessed` ON `skill_directory_caches` (`last_accessed_at`)"
+		},
+		{
+			"type": "index",
+			"name": "idx_skill_dir_cache_root",
+			"table": "skill_directory_caches",
+			"sql": "CREATE UNIQUE INDEX `idx_skill_dir_cache_root` ON `skill_directory_caches` (`root_kind`,`normalized_root_path`)"
 		},
 		{
 			"type": "index",
@@ -422,33 +404,9 @@
 		},
 		{
 			"type": "index",
-			"name": "idx_volume_snapshots_created_by",
-			"table": "volume_snapshots",
-			"sql": "CREATE INDEX idx_volume_snapshots_created_by ON volume_snapshots(created_by)"
-		},
-		{
-			"type": "index",
 			"name": "idx_volume_snapshots_project",
 			"table": "volume_snapshots",
 			"sql": "CREATE INDEX `idx_volume_snapshots_project` ON `volume_snapshots` (`project_id`)"
-		},
-		{
-			"type": "index",
-			"name": "idx_volume_snapshots_project_created",
-			"table": "volume_snapshots",
-			"sql": "CREATE INDEX idx_volume_snapshots_project_created ON volume_snapshots(project_id, created_at)"
-		},
-		{
-			"type": "index",
-			"name": "idx_volume_snapshots_project_service",
-			"table": "volume_snapshots",
-			"sql": "CREATE INDEX idx_volume_snapshots_project_service ON volume_snapshots(project_id, service_name)"
-		},
-		{
-			"type": "index",
-			"name": "idx_volume_snapshots_source",
-			"table": "volume_snapshots",
-			"sql": "CREATE INDEX idx_volume_snapshots_source ON volume_snapshots(source_chapter_id)"
 		},
 		{
 			"type": "index",
@@ -550,7 +508,7 @@
 			"type": "table",
 			"name": "chapters",
 			"table": "chapters",
-			"sql": "CREATE TABLE `chapters` ( `id` text PRIMARY KEY NOT NULL, `project_id` text NOT NULL, `title` text NOT NULL, `description` text, `status` text DEFAULT 'active' NOT NULL, `role` text DEFAULT 'branch' NOT NULL, `branch` text NOT NULL, `worktree_path` text, `base_branch` text NOT NULL, `parent_chapter_id` text, `fork_point` text, `merged_into_chapter_id` text, `merge_commit_sha` text, `merge_strategy` text, `container_config` text, `exploration_group_id` text, `is_root` integer DEFAULT 0, `head_commit_sha` text, `start_commit_sha` text, `commit_count` integer DEFAULT 0, `color` text, `group_label` text, `pinned` integer DEFAULT 0, `panel_expanded` integer DEFAULT 0, `panel_width` real, `panel_height` real, `last_accessed_at` text, `created_at` text NOT NULL, `updated_at` text NOT NULL, `pre_merge_target_sha` text, `review_source_chapter_id` text REFERENCES chapters(id), `review_status` text, \"anchor_commit_sha\" TEXT, \"axis_offset\" INTEGER NOT NULL DEFAULT 0, \"cross_offset\" INTEGER NOT NULL DEFAULT 0, FOREIGN KEY (`project_id`) REFERENCES `projects`(`id`) ON UPDATE no action ON DELETE cascade, FOREIGN KEY (`parent_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE set null, FOREIGN KEY (`merged_into_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE set null, FOREIGN KEY (`exploration_group_id`) REFERENCES `exploration_groups`(`id`) ON UPDATE no action ON DELETE set null )"
+			"sql": "CREATE TABLE `chapters` ( `id` text PRIMARY KEY NOT NULL, `project_id` text NOT NULL, `title` text NOT NULL, `description` text, `status` text DEFAULT 'active' NOT NULL, `role` text DEFAULT 'branch' NOT NULL, `branch` text NOT NULL, `worktree_path` text, `base_branch` text NOT NULL, `parent_chapter_id` text, `fork_point` text, `merged_into_chapter_id` text, `merge_commit_sha` text, `merge_strategy` text, `pre_merge_target_sha` text, `container_config` text, `exploration_group_id` text, `is_root` integer DEFAULT 0, `head_commit_sha` text, `start_commit_sha` text, `commit_count` integer DEFAULT 0, `color` text, `group_label` text, `pinned` integer DEFAULT 0, `panel_expanded` integer DEFAULT 0, `panel_width` real, `panel_height` real, `review_source_chapter_id` text, `review_status` text, `last_accessed_at` text, `created_at` text NOT NULL, `updated_at` text NOT NULL, `anchor_commit_sha` text, `axis_offset` real DEFAULT 0, `cross_offset` real DEFAULT 0, FOREIGN KEY (`project_id`) REFERENCES `projects`(`id`) ON UPDATE no action ON DELETE cascade, FOREIGN KEY (`parent_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE set null, FOREIGN KEY (`merged_into_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE set null, FOREIGN KEY (`exploration_group_id`) REFERENCES `exploration_groups`(`id`) ON UPDATE no action ON DELETE set null, FOREIGN KEY (`review_source_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE set null )"
 		},
 		{
 			"type": "table",
@@ -670,7 +628,7 @@
 			"type": "table",
 			"name": "narrator_messages",
 			"table": "narrator_messages",
-			"sql": "CREATE TABLE `narrator_messages` ( `id` text PRIMARY KEY NOT NULL, `narrator_id` text NOT NULL, `sdk_message_uuid` text, `parent_tool_use_id` text, `role` text NOT NULL, `content_json` text NOT NULL, `content_text` text, `tokens_in` integer, `cost_usd` real, `turn_usage_json` text, `context_percent` real, `meter_usage` real, `meter_unit` text, `commit_sha` text, `command_text` text, `created_by` text, `created_at` text NOT NULL, `provider` text, `model` text, `output_tokens` integer, `cached_input_tokens` integer, `cache_creation_input_tokens` integer, `cache_creation_5m_tokens` integer, `cache_creation_1h_tokens` integer, `reasoning_tokens` integer, `ttft_ms` integer, `duration_ms` integer, `credential_id` text, FOREIGN KEY (`narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`created_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action )"
+			"sql": "CREATE TABLE `narrator_messages` ( `id` text PRIMARY KEY NOT NULL, `narrator_id` text NOT NULL, `sdk_message_uuid` text, `parent_tool_use_id` text, `role` text NOT NULL, `content_json` text NOT NULL, `content_text` text, `tokens_in` integer, `cost_usd` real, `turn_usage_json` text, `context_percent` real, `meter_usage` real, `meter_unit` text, `commit_sha` text, `command_text` text, `created_by` text, `created_at` text NOT NULL, `provider` text, `model` text, `output_tokens` integer, `cached_input_tokens` integer, `cache_creation_input_tokens` integer, `cache_creation_5m_tokens` integer, `cache_creation_1h_tokens` integer, `reasoning_tokens` integer, `ttft_ms` integer, `duration_ms` integer, `credential_id` text, `edited_at` text, `edited_by` text REFERENCES users(id), `original_content_json` text, FOREIGN KEY (`narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`created_by`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action )"
 		},
 		{
 			"type": "table",
@@ -736,7 +694,7 @@
 			"type": "table",
 			"name": "narrators",
 			"table": "narrators",
-			"sql": "CREATE TABLE `narrators` ( `id` text PRIMARY KEY NOT NULL, `chapter_id` text, `api_conversation_id` text, `fork_message_id` text, `type` text DEFAULT 'primary' NOT NULL, `subagent_type` text, `title` text, `inherit_mode` text DEFAULT 'fresh' NOT NULL, `parent_narrator_id` text, `context_summary` text, `model` text DEFAULT 'claude-sonnet', `system_prompt` text, `permission_mode` text DEFAULT 'default', `previous_permission_mode` text, `reasoning_effort` text, `fast_mode` integer DEFAULT false NOT NULL, `message_count` integer DEFAULT 0, `total_cost_usd` real DEFAULT 0, `last_message_at` text, `status` text DEFAULT 'idle' NOT NULL, `plan_mode` integer DEFAULT false NOT NULL, `cwd` text, `error_message` text, `todos_json` text, `todos_tool_use_id` text, `prune_boundary_message_id` text, `pruned_percent` integer, `prune_enabled` integer DEFAULT true NOT NULL, `is_background` integer DEFAULT false NOT NULL, `background_status` text, `background_result` text, `background_completed_at` text, `created_at` text NOT NULL, `updated_at` text NOT NULL, `relaxed_plan` integer DEFAULT false NOT NULL, \"enabled_tools\" TEXT, `turn_started_at` text, `message_version` integer DEFAULT 0 NOT NULL, `pending_model_restore` text, `is_ask_in_passing` integer DEFAULT false NOT NULL, `substatus` text DEFAULT '[]' NOT NULL, `variant` text DEFAULT 'primary' NOT NULL, `traits` text DEFAULT '[]' NOT NULL, `plan_file_id` text, `plan_reflection_auto_approve_override` text DEFAULT 'inherit' NOT NULL, `danger_reflection_override` text DEFAULT 'inherit' NOT NULL, FOREIGN KEY (`chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`fork_message_id`) REFERENCES `narrator_messages`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`parent_narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`prune_boundary_message_id`) REFERENCES `narrator_messages`(`id`) ON UPDATE no action ON DELETE no action )"
+			"sql": "CREATE TABLE `narrators` ( `id` text PRIMARY KEY NOT NULL, `chapter_id` text, `api_conversation_id` text, `fork_message_id` text, `type` text DEFAULT 'primary' NOT NULL, `subagent_type` text, `title` text, `inherit_mode` text DEFAULT 'fresh' NOT NULL, `parent_narrator_id` text, `context_summary` text, `model` text DEFAULT 'claude-sonnet-4.5', `system_prompt` text, `permission_mode` text DEFAULT 'default', `previous_permission_mode` text, `reasoning_effort` text, `fast_mode` integer DEFAULT false NOT NULL, `relaxed_plan` integer DEFAULT false NOT NULL, `message_count` integer DEFAULT 0, `total_cost_usd` real DEFAULT 0, `last_message_at` text, `status` text DEFAULT 'idle' NOT NULL, `plan_mode` integer DEFAULT false NOT NULL, `cwd` text, `error_message` text, `todos_json` text, `todos_tool_use_id` text, `prune_boundary_message_id` text, `pruned_percent` integer, `prune_enabled` integer DEFAULT true NOT NULL, `is_background` integer DEFAULT false NOT NULL, `background_status` text, `background_result` text, `background_completed_at` text, `created_at` text NOT NULL, `updated_at` text NOT NULL, `enabled_tools` text, `turn_started_at` text, `message_version` integer DEFAULT 0 NOT NULL, `pending_model_restore` text, `is_ask_in_passing` integer DEFAULT false NOT NULL, `substatus` text DEFAULT '[]' NOT NULL, `variant` text DEFAULT 'primary' NOT NULL, `traits` text DEFAULT '[]' NOT NULL, `plan_file_id` text, `plan_reflection_auto_approve_override` text DEFAULT 'inherit' NOT NULL, `danger_reflection_override` text DEFAULT 'inherit' NOT NULL, FOREIGN KEY (`chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`fork_message_id`) REFERENCES `narrator_messages`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`parent_narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`prune_boundary_message_id`) REFERENCES `narrator_messages`(`id`) ON UPDATE no action ON DELETE no action )"
 		},
 		{
 			"type": "table",
@@ -778,13 +736,19 @@
 			"type": "table",
 			"name": "projects",
 			"table": "projects",
-			"sql": "CREATE TABLE `projects` ( `id` text PRIMARY KEY NOT NULL, `name` text NOT NULL, `description` text, `status` text DEFAULT 'active' NOT NULL, `git_path` text, `remote_url` text, `default_branch` text DEFAULT 'main', `startup_script` text, `copy_files` text, `chapter_settings` text, `proxy_domain` text, `created_at` text NOT NULL, `updated_at` text NOT NULL , `flow_mode` text DEFAULT 'classic' NOT NULL)"
+			"sql": "CREATE TABLE `projects` ( `id` text PRIMARY KEY NOT NULL, `name` text NOT NULL, `description` text, `status` text DEFAULT 'active' NOT NULL, `flow_mode` text DEFAULT 'classic' NOT NULL, `git_path` text, `remote_url` text, `default_branch` text DEFAULT 'main', `startup_script` text, `copy_files` text, `chapter_settings` text, `proxy_domain` text, `created_at` text NOT NULL, `updated_at` text NOT NULL )"
 		},
 		{
 			"type": "table",
 			"name": "review_conclusions",
 			"table": "review_conclusions",
 			"sql": "CREATE TABLE `review_conclusions` ( `id` text PRIMARY KEY NOT NULL, `review_chapter_id` text NOT NULL, `source_chapter_id` text NOT NULL, `verdict` text NOT NULL, `findings_json` text, `created_at` text NOT NULL, FOREIGN KEY (`review_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE cascade, FOREIGN KEY (`source_chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE cascade )"
+		},
+		{
+			"type": "table",
+			"name": "skill_directory_caches",
+			"table": "skill_directory_caches",
+			"sql": "CREATE TABLE `skill_directory_caches` ( `id` text PRIMARY KEY NOT NULL, `root_kind` text NOT NULL, `normalized_root_path` text NOT NULL, `skills_json` text NOT NULL, `signature_json` text NOT NULL, `scanned_at` text NOT NULL, `last_accessed_at` text NOT NULL, `expires_at` text NOT NULL )"
 		},
 		{
 			"type": "table",
@@ -802,7 +766,7 @@
 			"type": "table",
 			"name": "terminals",
 			"table": "terminals",
-			"sql": "CREATE TABLE `terminals` ( `id` text PRIMARY KEY NOT NULL, `chapter_id` text, `narrator_id` text, `name` text NOT NULL, `cwd` text, `dtach_socket` text, `status` text DEFAULT 'running' NOT NULL, `exit_code` integer, `created_at` text NOT NULL, `graph_opened` integer DEFAULT 0 NOT NULL, `graph_x` real, `graph_y` real, `graph_width` real, `graph_height` real, FOREIGN KEY (`chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action )"
+			"sql": "CREATE TABLE `terminals` ( `id` text PRIMARY KEY NOT NULL, `chapter_id` text, `narrator_id` text, `name` text NOT NULL, `cwd` text, `dtach_socket` text, `status` text DEFAULT 'running' NOT NULL, `exit_code` integer, `graph_opened` integer DEFAULT 0 NOT NULL, `graph_x` real, `graph_y` real, `graph_width` real, `graph_height` real, `created_at` text NOT NULL, FOREIGN KEY (`chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE no action, FOREIGN KEY (`narrator_id`) REFERENCES `narrators`(`id`) ON UPDATE no action ON DELETE no action )"
 		},
 		{
 			"type": "table",
@@ -814,13 +778,13 @@
 			"type": "table",
 			"name": "user_preferences",
 			"table": "user_preferences",
-			"sql": "CREATE TABLE `user_preferences` ( `id` text PRIMARY KEY NOT NULL, `user_id` text NOT NULL, `auto_load_older_messages` integer DEFAULT true NOT NULL, `language` text DEFAULT 'en' NOT NULL, `word_wrap_markdown` integer DEFAULT true NOT NULL, `word_wrap_code` integer DEFAULT true NOT NULL, `word_wrap_diff` integer DEFAULT true NOT NULL, `reply_in_user_language` integer DEFAULT true NOT NULL, `show_token_usage` integer DEFAULT false NOT NULL, `show_output_stats` integer DEFAULT true NOT NULL, `terminal_theme` text DEFAULT 'auto' NOT NULL, `terminal_font_size` integer DEFAULT 14 NOT NULL, `recent_tabs` text DEFAULT '[]' NOT NULL, `notify_on_done` integer DEFAULT true NOT NULL, `notify_on_waiting` integer DEFAULT true NOT NULL, `notify_pwa_enabled` integer DEFAULT false NOT NULL, `notify_sound_enabled` integer DEFAULT true NOT NULL, `notify_sound_type` text DEFAULT 'builtin' NOT NULL, `notify_sound_builtin` text DEFAULT 'gentle' NOT NULL, `notify_sound_file_id` text, `notify_dingtalk_enabled` integer DEFAULT false NOT NULL, `notify_dingtalk_webhook` text DEFAULT '' NOT NULL, `notify_dingtalk_secret` text DEFAULT '' NOT NULL, `notify_feishu_enabled` integer DEFAULT false NOT NULL, `notify_feishu_webhook` text DEFAULT '' NOT NULL, `notify_feishu_secret` text DEFAULT '' NOT NULL, `commands` text DEFAULT '[]' NOT NULL, `created_at` text NOT NULL, `updated_at` text NOT NULL , `setup_wizard_completed` integer DEFAULT false NOT NULL, `graph_viewports` text DEFAULT '{}' NOT NULL, `send_mode` text DEFAULT 'enter' NOT NULL, `gateway_config` text DEFAULT '{}' NOT NULL, `add_subagent_to_recent_tabs` integer DEFAULT true NOT NULL, `fast_mode_default` integer DEFAULT false NOT NULL)"
+			"sql": "CREATE TABLE `user_preferences` ( `id` text PRIMARY KEY NOT NULL, `user_id` text NOT NULL, `auto_load_older_messages` integer DEFAULT true NOT NULL, `language` text DEFAULT 'en' NOT NULL, `word_wrap_markdown` integer DEFAULT true NOT NULL, `word_wrap_code` integer DEFAULT true NOT NULL, `word_wrap_diff` integer DEFAULT true NOT NULL, `reply_in_user_language` integer DEFAULT true NOT NULL, `show_token_usage` integer DEFAULT false NOT NULL, `show_output_stats` integer DEFAULT true NOT NULL, `terminal_theme` text DEFAULT 'auto' NOT NULL, `terminal_font_size` integer DEFAULT 14 NOT NULL, `recent_tabs` text DEFAULT '[]' NOT NULL, `notify_on_done` integer DEFAULT true NOT NULL, `notify_on_waiting` integer DEFAULT true NOT NULL, `notify_pwa_enabled` integer DEFAULT false NOT NULL, `notify_sound_enabled` integer DEFAULT true NOT NULL, `notify_sound_type` text DEFAULT 'builtin' NOT NULL, `notify_sound_builtin` text DEFAULT 'gentle' NOT NULL, `notify_sound_file_id` text, `notify_dingtalk_enabled` integer DEFAULT false NOT NULL, `notify_dingtalk_webhook` text DEFAULT '' NOT NULL, `notify_dingtalk_secret` text DEFAULT '' NOT NULL, `notify_feishu_enabled` integer DEFAULT false NOT NULL, `notify_feishu_webhook` text DEFAULT '' NOT NULL, `notify_feishu_secret` text DEFAULT '' NOT NULL, `commands` text DEFAULT '[]' NOT NULL, `graph_viewports` text DEFAULT '{}' NOT NULL, `send_mode` text DEFAULT 'enter' NOT NULL, `setup_wizard_completed` integer DEFAULT false NOT NULL, `created_at` text NOT NULL, `updated_at` text NOT NULL , `gateway_config` text DEFAULT '{}' NOT NULL, `add_subagent_to_recent_tabs` integer DEFAULT true NOT NULL, `fast_mode_default` integer DEFAULT false NOT NULL)"
 		},
 		{
 			"type": "table",
 			"name": "users",
 			"table": "users",
-			"sql": "CREATE TABLE `users` ( `id` text PRIMARY KEY NOT NULL, `username` text NOT NULL, `password_hash` text NOT NULL, `role` text DEFAULT 'user' NOT NULL, `avatar_color` text, `avatar_image_id` text, `created_at` text NOT NULL , `git_username` text, `git_email` text)"
+			"sql": "CREATE TABLE `users` ( `id` text PRIMARY KEY NOT NULL, `username` text NOT NULL, `password_hash` text NOT NULL, `role` text DEFAULT 'user' NOT NULL, `avatar_color` text, `avatar_image_id` text, `git_username` text, `git_email` text, `created_at` text NOT NULL )"
 		},
 		{
 			"type": "table",
@@ -1861,20 +1825,27 @@
 				},
 				{
 					"cid": 14,
-					"name": "container_config",
+					"name": "pre_merge_target_sha",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
 					"cid": 15,
-					"name": "exploration_group_id",
+					"name": "container_config",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
 					"cid": 16,
+					"name": "exploration_group_id",
+					"type": "TEXT",
+					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 17,
 					"name": "is_root",
 					"type": "INTEGER",
 					"notNull": false,
@@ -1882,21 +1853,21 @@
 					"pk": 0
 				},
 				{
-					"cid": 17,
+					"cid": 18,
 					"name": "head_commit_sha",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 18,
+					"cid": 19,
 					"name": "start_commit_sha",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 19,
+					"cid": 20,
 					"name": "commit_count",
 					"type": "INTEGER",
 					"notNull": false,
@@ -1904,21 +1875,21 @@
 					"pk": 0
 				},
 				{
-					"cid": 20,
+					"cid": 21,
 					"name": "color",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 21,
+					"cid": 22,
 					"name": "group_label",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 22,
+					"cid": 23,
 					"name": "pinned",
 					"type": "INTEGER",
 					"notNull": false,
@@ -1926,7 +1897,7 @@
 					"pk": 0
 				},
 				{
-					"cid": 23,
+					"cid": 24,
 					"name": "panel_expanded",
 					"type": "INTEGER",
 					"notNull": false,
@@ -1934,59 +1905,52 @@
 					"pk": 0
 				},
 				{
-					"cid": 24,
+					"cid": 25,
 					"name": "panel_width",
 					"type": "REAL",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 25,
+					"cid": 26,
 					"name": "panel_height",
 					"type": "REAL",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 26,
-					"name": "last_accessed_at",
-					"type": "TEXT",
-					"notNull": false,
-					"pk": 0
-				},
-				{
 					"cid": 27,
-					"name": "created_at",
-					"type": "TEXT",
-					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 28,
-					"name": "updated_at",
-					"type": "TEXT",
-					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 29,
-					"name": "pre_merge_target_sha",
-					"type": "TEXT",
-					"notNull": false,
-					"pk": 0
-				},
-				{
-					"cid": 30,
 					"name": "review_source_chapter_id",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 31,
+					"cid": 28,
 					"name": "review_status",
 					"type": "TEXT",
 					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 29,
+					"name": "last_accessed_at",
+					"type": "TEXT",
+					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 30,
+					"name": "created_at",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 31,
+					"name": "updated_at",
+					"type": "TEXT",
+					"notNull": true,
 					"pk": 0
 				},
 				{
@@ -1999,16 +1963,16 @@
 				{
 					"cid": 33,
 					"name": "axis_offset",
-					"type": "INTEGER",
-					"notNull": true,
+					"type": "REAL",
+					"notNull": false,
 					"defaultValue": "0",
 					"pk": 0
 				},
 				{
 					"cid": 34,
 					"name": "cross_offset",
-					"type": "INTEGER",
-					"notNull": true,
+					"type": "REAL",
+					"notNull": false,
 					"defaultValue": "0",
 					"pk": 0
 				}
@@ -3352,6 +3316,27 @@
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
+				},
+				{
+					"cid": 28,
+					"name": "edited_at",
+					"type": "TEXT",
+					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 29,
+					"name": "edited_by",
+					"type": "TEXT",
+					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 30,
+					"name": "original_content_json",
+					"type": "TEXT",
+					"notNull": false,
+					"pk": 0
 				}
 			]
 		},
@@ -4013,7 +3998,7 @@
 					"name": "model",
 					"type": "TEXT",
 					"notNull": false,
-					"defaultValue": "'claude-sonnet'",
+					"defaultValue": "'claude-sonnet-4.5'",
 					"pk": 0
 				},
 				{
@@ -4055,6 +4040,14 @@
 				},
 				{
 					"cid": 16,
+					"name": "relaxed_plan",
+					"type": "INTEGER",
+					"notNull": true,
+					"defaultValue": "false",
+					"pk": 0
+				},
+				{
+					"cid": 17,
 					"name": "message_count",
 					"type": "INTEGER",
 					"notNull": false,
@@ -4062,7 +4055,7 @@
 					"pk": 0
 				},
 				{
-					"cid": 17,
+					"cid": 18,
 					"name": "total_cost_usd",
 					"type": "REAL",
 					"notNull": false,
@@ -4070,14 +4063,14 @@
 					"pk": 0
 				},
 				{
-					"cid": 18,
+					"cid": 19,
 					"name": "last_message_at",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 19,
+					"cid": 20,
 					"name": "status",
 					"type": "TEXT",
 					"notNull": true,
@@ -4085,7 +4078,7 @@
 					"pk": 0
 				},
 				{
-					"cid": 20,
+					"cid": 21,
 					"name": "plan_mode",
 					"type": "INTEGER",
 					"notNull": true,
@@ -4093,49 +4086,49 @@
 					"pk": 0
 				},
 				{
-					"cid": 21,
+					"cid": 22,
 					"name": "cwd",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 22,
+					"cid": 23,
 					"name": "error_message",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 23,
+					"cid": 24,
 					"name": "todos_json",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 24,
+					"cid": 25,
 					"name": "todos_tool_use_id",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 25,
+					"cid": 26,
 					"name": "prune_boundary_message_id",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 26,
+					"cid": 27,
 					"name": "pruned_percent",
 					"type": "INTEGER",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 27,
+					"cid": 28,
 					"name": "prune_enabled",
 					"type": "INTEGER",
 					"notNull": true,
@@ -4143,7 +4136,7 @@
 					"pk": 0
 				},
 				{
-					"cid": 28,
+					"cid": 29,
 					"name": "is_background",
 					"type": "INTEGER",
 					"notNull": true,
@@ -4151,46 +4144,38 @@
 					"pk": 0
 				},
 				{
-					"cid": 29,
+					"cid": 30,
 					"name": "background_status",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 30,
+					"cid": 31,
 					"name": "background_result",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 31,
+					"cid": 32,
 					"name": "background_completed_at",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 32,
+					"cid": 33,
 					"name": "created_at",
 					"type": "TEXT",
 					"notNull": true,
 					"pk": 0
 				},
 				{
-					"cid": 33,
+					"cid": 34,
 					"name": "updated_at",
 					"type": "TEXT",
 					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 34,
-					"name": "relaxed_plan",
-					"type": "INTEGER",
-					"notNull": true,
-					"defaultValue": "false",
 					"pk": 0
 				},
 				{
@@ -4441,20 +4426,28 @@
 				},
 				{
 					"cid": 4,
+					"name": "flow_mode",
+					"type": "TEXT",
+					"notNull": true,
+					"defaultValue": "'classic'",
+					"pk": 0
+				},
+				{
+					"cid": 5,
 					"name": "git_path",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 5,
+					"cid": 6,
 					"name": "remote_url",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 6,
+					"cid": 7,
 					"name": "default_branch",
 					"type": "TEXT",
 					"notNull": false,
@@ -4462,53 +4455,45 @@
 					"pk": 0
 				},
 				{
-					"cid": 7,
+					"cid": 8,
 					"name": "startup_script",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 8,
+					"cid": 9,
 					"name": "copy_files",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 9,
+					"cid": 10,
 					"name": "chapter_settings",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 10,
+					"cid": 11,
 					"name": "proxy_domain",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 11,
+					"cid": 12,
 					"name": "created_at",
 					"type": "TEXT",
 					"notNull": true,
 					"pk": 0
 				},
 				{
-					"cid": 12,
+					"cid": 13,
 					"name": "updated_at",
 					"type": "TEXT",
 					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 13,
-					"name": "flow_mode",
-					"type": "TEXT",
-					"notNull": true,
-					"defaultValue": "'classic'",
 					"pk": 0
 				}
 			]
@@ -4554,6 +4539,67 @@
 				{
 					"cid": 5,
 					"name": "created_at",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				}
+			]
+		},
+		{
+			"name": "skill_directory_caches",
+			"columns": [
+				{
+					"cid": 0,
+					"name": "id",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 1
+				},
+				{
+					"cid": 1,
+					"name": "root_kind",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 2,
+					"name": "normalized_root_path",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 3,
+					"name": "skills_json",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 4,
+					"name": "signature_json",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 5,
+					"name": "scanned_at",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 6,
+					"name": "last_accessed_at",
+					"type": "TEXT",
+					"notNull": true,
+					"pk": 0
+				},
+				{
+					"cid": 7,
+					"name": "expires_at",
 					"type": "TEXT",
 					"notNull": true,
 					"pk": 0
@@ -4732,13 +4778,6 @@
 				},
 				{
 					"cid": 8,
-					"name": "created_at",
-					"type": "TEXT",
-					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 9,
 					"name": "graph_opened",
 					"type": "INTEGER",
 					"notNull": true,
@@ -4746,31 +4785,38 @@
 					"pk": 0
 				},
 				{
-					"cid": 10,
+					"cid": 9,
 					"name": "graph_x",
 					"type": "REAL",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 11,
+					"cid": 10,
 					"name": "graph_y",
 					"type": "REAL",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 12,
+					"cid": 11,
 					"name": "graph_width",
 					"type": "REAL",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 13,
+					"cid": 12,
 					"name": "graph_height",
 					"type": "REAL",
 					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 13,
+					"name": "created_at",
+					"type": "TEXT",
+					"notNull": true,
 					"pk": 0
 				}
 			]
@@ -5041,16 +5087,18 @@
 				},
 				{
 					"cid": 27,
-					"name": "created_at",
+					"name": "graph_viewports",
 					"type": "TEXT",
 					"notNull": true,
+					"defaultValue": "'{}'",
 					"pk": 0
 				},
 				{
 					"cid": 28,
-					"name": "updated_at",
+					"name": "send_mode",
 					"type": "TEXT",
 					"notNull": true,
+					"defaultValue": "'enter'",
 					"pk": 0
 				},
 				{
@@ -5063,18 +5111,16 @@
 				},
 				{
 					"cid": 30,
-					"name": "graph_viewports",
+					"name": "created_at",
 					"type": "TEXT",
 					"notNull": true,
-					"defaultValue": "'{}'",
 					"pk": 0
 				},
 				{
 					"cid": 31,
-					"name": "send_mode",
+					"name": "updated_at",
 					"type": "TEXT",
 					"notNull": true,
-					"defaultValue": "'enter'",
 					"pk": 0
 				},
 				{
@@ -5151,23 +5197,23 @@
 				},
 				{
 					"cid": 6,
-					"name": "created_at",
-					"type": "TEXT",
-					"notNull": true,
-					"pk": 0
-				},
-				{
-					"cid": 7,
 					"name": "git_username",
 					"type": "TEXT",
 					"notNull": false,
 					"pk": 0
 				},
 				{
-					"cid": 8,
+					"cid": 7,
 					"name": "git_email",
 					"type": "TEXT",
 					"notNull": false,
+					"pk": 0
+				},
+				{
+					"cid": 8,
+					"name": "created_at",
+					"type": "TEXT",
+					"notNull": true,
 					"pk": 0
 				}
 			]
@@ -5349,7 +5395,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["created_at"]
+			"columns": [
+				"created_at"
+			]
 		},
 		{
 			"table": "api_requests",
@@ -5357,7 +5405,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["kind", "created_at"]
+			"columns": [
+				"kind",
+				"created_at"
+			]
 		},
 		{
 			"table": "api_requests",
@@ -5365,7 +5416,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["message_id"]
+			"columns": [
+				"message_id"
+			]
 		},
 		{
 			"table": "api_requests",
@@ -5373,7 +5426,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "api_requests",
@@ -5381,7 +5437,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["provider", "created_at"]
+			"columns": [
+				"provider",
+				"created_at"
+			]
 		},
 		{
 			"table": "background_tasks",
@@ -5389,7 +5448,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["parent_narrator_id", "status"]
+			"columns": [
+				"parent_narrator_id",
+				"status"
+			]
 		},
 		{
 			"table": "background_tasks",
@@ -5397,7 +5459,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["subagent_narrator_id"]
+			"columns": [
+				"subagent_narrator_id"
+			]
 		},
 		{
 			"table": "benchmark_task_results",
@@ -5405,7 +5469,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["run_id", "status"]
+			"columns": [
+				"run_id",
+				"status"
+			]
 		},
 		{
 			"table": "chapter_commits",
@@ -5413,7 +5480,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id", "authored_at"]
+			"columns": [
+				"chapter_id",
+				"authored_at"
+			]
 		},
 		{
 			"table": "chapter_commits",
@@ -5421,7 +5491,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "chapter_commits",
@@ -5429,7 +5501,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id", "sha"]
+			"columns": [
+				"chapter_id",
+				"sha"
+			]
 		},
 		{
 			"table": "chapter_edges",
@@ -5437,7 +5512,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["project_id"]
+			"columns": [
+				"project_id"
+			]
 		},
 		{
 			"table": "chapter_edges",
@@ -5445,7 +5522,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["source_id"]
+			"columns": [
+				"source_id"
+			]
 		},
 		{
 			"table": "chapter_edges",
@@ -5453,7 +5532,11 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["source_id", "target_id", "type"]
+			"columns": [
+				"source_id",
+				"target_id",
+				"type"
+			]
 		},
 		{
 			"table": "chapter_edges",
@@ -5461,7 +5544,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["target_id"]
+			"columns": [
+				"target_id"
+			]
 		},
 		{
 			"table": "chapters",
@@ -5469,7 +5554,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["parent_chapter_id"]
+			"columns": [
+				"parent_chapter_id"
+			]
 		},
 		{
 			"table": "chapters",
@@ -5477,7 +5564,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["project_id", "status"]
+			"columns": [
+				"project_id",
+				"status"
+			]
 		},
 		{
 			"table": "chapters",
@@ -5485,39 +5575,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["project_id", "branch"]
-		},
-		{
-			"table": "container_instances",
-			"name": "idx_container_instances_chapter",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["chapter_id"]
-		},
-		{
-			"table": "container_instances",
-			"name": "idx_container_instances_chapter_service",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["chapter_id", "service_name"]
-		},
-		{
-			"table": "container_instances",
-			"name": "idx_container_instances_container",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["container_id"]
-		},
-		{
-			"table": "container_instances",
-			"name": "idx_container_instances_status",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["chapter_id", "status"]
+			"columns": [
+				"project_id",
+				"branch"
+			]
 		},
 		{
 			"table": "gateway_session_mappings",
@@ -5525,7 +5586,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["app_user_id"]
+			"columns": [
+				"app_user_id"
+			]
 		},
 		{
 			"table": "gateway_session_mappings",
@@ -5533,7 +5596,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "gateway_session_mappings",
@@ -5541,7 +5606,11 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["platform", "chat_id", "user_id"]
+			"columns": [
+				"platform",
+				"chat_id",
+				"user_id"
+			]
 		},
 		{
 			"table": "hooks",
@@ -5549,15 +5618,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["event", "enabled"]
-		},
-		{
-			"table": "hooks",
-			"name": "idx_hooks_event_enabled",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["event", "enabled"]
+			"columns": [
+				"event",
+				"enabled"
+			]
 		},
 		{
 			"table": "hooks",
@@ -5565,7 +5629,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["project_id"]
+			"columns": [
+				"project_id"
+			]
 		},
 		{
 			"table": "narrator_blacklist_cmds",
@@ -5573,7 +5639,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "narrator_blacklist_cmds",
@@ -5581,7 +5649,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "pattern"]
+			"columns": [
+				"narrator_id",
+				"pattern"
+			]
 		},
 		{
 			"table": "narrator_blacklist_dirs",
@@ -5589,7 +5660,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "narrator_blacklist_dirs",
@@ -5597,7 +5670,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "path"]
+			"columns": [
+				"narrator_id",
+				"path"
+			]
 		},
 		{
 			"table": "narrator_buffered_messages",
@@ -5605,7 +5681,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "seq"]
+			"columns": [
+				"narrator_id",
+				"seq"
+			]
 		},
 		{
 			"table": "narrator_file_snapshots",
@@ -5613,7 +5692,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "narrator_file_snapshots",
@@ -5621,7 +5702,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "file_path"]
+			"columns": [
+				"narrator_id",
+				"file_path"
+			]
 		},
 		{
 			"table": "narrator_goals",
@@ -5629,7 +5713,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "sort_order"]
+			"columns": [
+				"narrator_id",
+				"sort_order"
+			]
 		},
 		{
 			"table": "narrator_goals",
@@ -5637,7 +5724,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "status"]
+			"columns": [
+				"narrator_id",
+				"status"
+			]
 		},
 		{
 			"table": "narrator_message_refs",
@@ -5645,7 +5735,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["message_id"]
+			"columns": [
+				"message_id"
+			]
 		},
 		{
 			"table": "narrator_message_refs",
@@ -5653,7 +5745,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["segment_compact_id"]
+			"columns": [
+				"segment_compact_id"
+			]
 		},
 		{
 			"table": "narrator_message_refs",
@@ -5661,7 +5755,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "seq"]
+			"columns": [
+				"narrator_id",
+				"seq"
+			]
 		},
 		{
 			"table": "narrator_message_refs",
@@ -5669,7 +5766,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "message_id"]
+			"columns": [
+				"narrator_id",
+				"message_id"
+			]
 		},
 		{
 			"table": "narrator_messages",
@@ -5677,7 +5777,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "narrator_messages",
@@ -5685,7 +5788,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "parent_tool_use_id"]
+			"columns": [
+				"narrator_id",
+				"parent_tool_use_id"
+			]
 		},
 		{
 			"table": "narrator_messages",
@@ -5693,7 +5799,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["parent_tool_use_id"]
+			"columns": [
+				"parent_tool_use_id"
+			]
 		},
 		{
 			"table": "narrator_messages",
@@ -5701,7 +5809,11 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "parent_tool_use_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"parent_tool_use_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "narrator_patches",
@@ -5709,7 +5821,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["message_id"]
+			"columns": [
+				"message_id"
+			]
 		},
 		{
 			"table": "narrator_patches",
@@ -5717,7 +5831,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "narrator_patches",
@@ -5725,7 +5842,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["tool_use_id"]
+			"columns": [
+				"tool_use_id"
+			]
 		},
 		{
 			"table": "narrator_sidecars",
@@ -5733,7 +5852,11 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["message_id", "target", "order_index"]
+			"columns": [
+				"message_id",
+				"target",
+				"order_index"
+			]
 		},
 		{
 			"table": "narrator_sidecars",
@@ -5741,7 +5864,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "narrator_sidecars",
@@ -5749,7 +5875,11 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["tool_use_id", "target", "order_index"]
+			"columns": [
+				"tool_use_id",
+				"target",
+				"order_index"
+			]
 		},
 		{
 			"table": "narrator_tool_calls",
@@ -5757,7 +5887,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "created_at"]
+			"columns": [
+				"narrator_id",
+				"created_at"
+			]
 		},
 		{
 			"table": "narrator_tool_calls",
@@ -5765,7 +5898,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["message_id"]
+			"columns": [
+				"message_id"
+			]
 		},
 		{
 			"table": "narrator_tool_calls",
@@ -5773,7 +5908,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "status"]
+			"columns": [
+				"narrator_id",
+				"status"
+			]
 		},
 		{
 			"table": "narrator_tool_calls",
@@ -5781,7 +5919,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["tool_use_id"]
+			"columns": [
+				"tool_use_id"
+			]
 		},
 		{
 			"table": "narrator_whitelist_cmds",
@@ -5789,7 +5929,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "narrator_whitelist_cmds",
@@ -5797,7 +5939,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "pattern"]
+			"columns": [
+				"narrator_id",
+				"pattern"
+			]
 		},
 		{
 			"table": "narrator_whitelist_dirs",
@@ -5805,7 +5950,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "narrator_whitelist_dirs",
@@ -5813,7 +5960,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "path"]
+			"columns": [
+				"narrator_id",
+				"path"
+			]
 		},
 		{
 			"table": "narrators",
@@ -5821,7 +5971,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id"]
+			"columns": [
+				"chapter_id"
+			]
 		},
 		{
 			"table": "narrators",
@@ -5829,7 +5981,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["parent_narrator_id"]
+			"columns": [
+				"parent_narrator_id"
+			]
 		},
 		{
 			"table": "review_conclusions",
@@ -5837,7 +5991,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["review_chapter_id"]
+			"columns": [
+				"review_chapter_id"
+			]
 		},
 		{
 			"table": "review_conclusions",
@@ -5845,7 +6001,40 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["source_chapter_id"]
+			"columns": [
+				"source_chapter_id"
+			]
+		},
+		{
+			"table": "skill_directory_caches",
+			"name": "idx_skill_dir_cache_expires",
+			"unique": false,
+			"origin": "c",
+			"partial": false,
+			"columns": [
+				"expires_at"
+			]
+		},
+		{
+			"table": "skill_directory_caches",
+			"name": "idx_skill_dir_cache_last_accessed",
+			"unique": false,
+			"origin": "c",
+			"partial": false,
+			"columns": [
+				"last_accessed_at"
+			]
+		},
+		{
+			"table": "skill_directory_caches",
+			"name": "idx_skill_dir_cache_root",
+			"unique": true,
+			"origin": "c",
+			"partial": false,
+			"columns": [
+				"root_kind",
+				"normalized_root_path"
+			]
 		},
 		{
 			"table": "terminal_tabs",
@@ -5853,7 +6042,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id", "sort_order"]
+			"columns": [
+				"chapter_id",
+				"sort_order"
+			]
 		},
 		{
 			"table": "terminal_tabs",
@@ -5861,7 +6053,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id", "sort_order"]
+			"columns": [
+				"narrator_id",
+				"sort_order"
+			]
 		},
 		{
 			"table": "terminal_view_state",
@@ -5869,7 +6064,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["user_id", "chapter_id"]
+			"columns": [
+				"user_id",
+				"chapter_id"
+			]
 		},
 		{
 			"table": "terminal_view_state",
@@ -5877,7 +6075,10 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["user_id", "narrator_id"]
+			"columns": [
+				"user_id",
+				"narrator_id"
+			]
 		},
 		{
 			"table": "terminals",
@@ -5885,7 +6086,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id"]
+			"columns": [
+				"chapter_id"
+			]
 		},
 		{
 			"table": "terminals",
@@ -5893,7 +6096,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["narrator_id"]
+			"columns": [
+				"narrator_id"
+			]
 		},
 		{
 			"table": "terminals",
@@ -5901,7 +6106,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["status"]
+			"columns": [
+				"status"
+			]
 		},
 		{
 			"table": "user_favorite_directories",
@@ -5909,7 +6116,10 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["user_id", "sort_order"]
+			"columns": [
+				"user_id",
+				"sort_order"
+			]
 		},
 		{
 			"table": "user_preferences",
@@ -5917,7 +6127,9 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["user_id"]
+			"columns": [
+				"user_id"
+			]
 		},
 		{
 			"table": "users",
@@ -5925,15 +6137,9 @@
 			"unique": true,
 			"origin": "c",
 			"partial": false,
-			"columns": ["username"]
-		},
-		{
-			"table": "volume_snapshot_applications",
-			"name": "idx_snapshot_applications_applied_by",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["applied_by"]
+			"columns": [
+				"username"
+			]
 		},
 		{
 			"table": "volume_snapshot_applications",
@@ -5941,7 +6147,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["chapter_id"]
+			"columns": [
+				"chapter_id"
+			]
 		},
 		{
 			"table": "volume_snapshot_applications",
@@ -5949,15 +6157,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["snapshot_id"]
-		},
-		{
-			"table": "volume_snapshots",
-			"name": "idx_volume_snapshots_created_by",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["created_by"]
+			"columns": [
+				"snapshot_id"
+			]
 		},
 		{
 			"table": "volume_snapshots",
@@ -5965,31 +6167,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["project_id"]
-		},
-		{
-			"table": "volume_snapshots",
-			"name": "idx_volume_snapshots_project_created",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["project_id", "created_at"]
-		},
-		{
-			"table": "volume_snapshots",
-			"name": "idx_volume_snapshots_project_service",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["project_id", "service_name"]
-		},
-		{
-			"table": "volume_snapshots",
-			"name": "idx_volume_snapshots_source",
-			"unique": false,
-			"origin": "c",
-			"partial": false,
-			"columns": ["source_chapter_id"]
+			"columns": [
+				"project_id"
+			]
 		},
 		{
 			"table": "volume_snapshots",
@@ -5997,7 +6177,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["source_chapter_id"]
+			"columns": [
+				"source_chapter_id"
+			]
 		},
 		{
 			"table": "workspaces",
@@ -6005,7 +6187,9 @@
 			"unique": false,
 			"origin": "c",
 			"partial": false,
-			"columns": ["user_id"]
+			"columns": [
+				"user_id"
+			]
 		}
 	],
 	"foreignKeys": [
@@ -6156,8 +6340,8 @@
 			"table": "chapters",
 			"id": 0,
 			"seq": 0,
-			"referencedTable": "exploration_groups",
-			"from": "exploration_group_id",
+			"referencedTable": "chapters",
+			"from": "review_source_chapter_id",
 			"to": "id",
 			"onUpdate": "NO ACTION",
 			"onDelete": "SET NULL",
@@ -6167,8 +6351,8 @@
 			"table": "chapters",
 			"id": 1,
 			"seq": 0,
-			"referencedTable": "chapters",
-			"from": "merged_into_chapter_id",
+			"referencedTable": "exploration_groups",
+			"from": "exploration_group_id",
 			"to": "id",
 			"onUpdate": "NO ACTION",
 			"onDelete": "SET NULL",
@@ -6179,7 +6363,7 @@
 			"id": 2,
 			"seq": 0,
 			"referencedTable": "chapters",
-			"from": "parent_chapter_id",
+			"from": "merged_into_chapter_id",
 			"to": "id",
 			"onUpdate": "NO ACTION",
 			"onDelete": "SET NULL",
@@ -6189,22 +6373,22 @@
 			"table": "chapters",
 			"id": 3,
 			"seq": 0,
-			"referencedTable": "projects",
-			"from": "project_id",
+			"referencedTable": "chapters",
+			"from": "parent_chapter_id",
 			"to": "id",
 			"onUpdate": "NO ACTION",
-			"onDelete": "CASCADE",
+			"onDelete": "SET NULL",
 			"match": "NONE"
 		},
 		{
 			"table": "chapters",
 			"id": 4,
 			"seq": 0,
-			"referencedTable": "chapters",
-			"from": "review_source_chapter_id",
+			"referencedTable": "projects",
+			"from": "project_id",
 			"to": "id",
 			"onUpdate": "NO ACTION",
-			"onDelete": "NO ACTION",
+			"onDelete": "CASCADE",
 			"match": "NONE"
 		},
 		{
@@ -6411,6 +6595,17 @@
 			"seq": 0,
 			"referencedTable": "narrators",
 			"from": "narrator_id",
+			"to": "id",
+			"onUpdate": "NO ACTION",
+			"onDelete": "NO ACTION",
+			"match": "NONE"
+		},
+		{
+			"table": "narrator_messages",
+			"id": 2,
+			"seq": 0,
+			"referencedTable": "users",
+			"from": "edited_by",
 			"to": "id",
 			"onUpdate": "NO ACTION",
 			"onDelete": "NO ACTION",
@@ -6747,5 +6942,5 @@
 			"match": "NONE"
 		}
 	],
-	"hash": "6978b55693a2394768a2353e200a8add8149e714e468a8a6347598c0702f5960"
+	"hash": "169fb305063b85d337954204b213379f837abc6db13ac924dfe71125745d6b5a"
 }

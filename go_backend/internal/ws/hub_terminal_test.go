@@ -328,6 +328,72 @@ func TestTerminalCreateInputResizeKillPayloads(t *testing.T) {
 	}
 }
 
+func TestTerminalWSCreateResizeRenameBoundsRejectOutOfRange(t *testing.T) {
+	sqlDB := newTerminalTestDB(t)
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, worktree_path) VALUES ('chapter-1', '/tmp')`); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeTerminalRuntime{snapshots: map[string]map[string]any{}}
+	h, c, wsClient := newTerminalHubClient(t, sqlDB, runtime)
+	defer wsClient.Close()
+
+	// create with cols above 500 should error before persisting a terminal row.
+	h.handleMessage(c, map[string]any{
+		"type":      "create",
+		"requestId": "req-bad",
+		"chapterId": "chapter-1",
+		"cols":      float64(900),
+		"rows":      float64(40),
+	})
+	msg := readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "Invalid terminal create request" {
+		t.Fatalf("expected create bounds error, got %#v", msg)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM terminals`).Scan(&count); err != nil {
+		t.Fatalf("count terminals: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("invalid create should not persist a terminal row, count=%d", count)
+	}
+
+	// Create a valid terminal to exercise resize/rename bounds.
+	h.handleMessage(c, map[string]any{
+		"type":      "create",
+		"requestId": "req-ok",
+		"chapterId": "chapter-1",
+		"name":      "Shell",
+	})
+	created := readWSMessage(t, wsClient)
+	terminal, _ := created["terminal"].(map[string]any)
+	terminalID, _ := terminal["id"].(string)
+	if terminalID == "" {
+		t.Fatalf("expected created terminal id, got %#v", created)
+	}
+	ready := readWSMessage(t, wsClient)
+	if ready["type"] != "ready" {
+		t.Fatalf("expected ready after create, got %#v", ready)
+	}
+
+	// resize with rows below 2 should error.
+	h.handleMessage(c, map[string]any{"type": "resize", "terminalId": terminalID, "cols": float64(100), "rows": float64(1)})
+	msg = readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "Invalid terminal resize request" {
+		t.Fatalf("expected resize bounds error, got %#v", msg)
+	}
+
+	// rename with a name longer than 100 chars should error.
+	longName := make([]byte, 101)
+	for i := range longName {
+		longName[i] = 'n'
+	}
+	h.handleMessage(c, map[string]any{"type": "rename", "terminalId": terminalID, "name": string(longName)})
+	msg = readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "name must be at most 100 characters" {
+		t.Fatalf("expected rename bounds error, got %#v", msg)
+	}
+}
+
 func TestTerminalCreateWithNarratorUsesChapterWorktreeCwd(t *testing.T) {
 	sqlDB := newTerminalTestDB(t)
 	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, worktree_path) VALUES ('chapter-1', '/repo/.worktrees/chapter-1')`); err != nil {

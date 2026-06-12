@@ -440,6 +440,120 @@ func TestResolveProviderAndModelResolvesDefaultAggregation(t *testing.T) {
 	}
 }
 
+func TestResolveAggregationSkipsDisabledProviderMembers(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{
+			"defaultModel": "__agg__:primary",
+			"disabledProviders": []any{
+				"openai",
+			},
+			"modelAggregations": []any{
+				map[string]any{
+					"id":          "primary",
+					"name":        "Primary",
+					"models":      []any{"openai:gpt-test", "anthropic:claude-test"},
+					"routingMode": "priority",
+				},
+			},
+		},
+		"anthropicProviders": []any{
+			map[string]any{
+				"prefix":  "anthropic",
+				"apiKey":  "test-key",
+				"baseUrl": "https://example.invalid",
+			},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "__default__")
+	if err != nil {
+		t.Fatalf("ResolveProviderAndModel returned error: %v", err)
+	}
+	if resolution.Provider != "anthropic" || resolution.Model != "claude-test" {
+		t.Fatalf("expected disabled openai member to be skipped, got %#v", resolution)
+	}
+}
+
+func TestResolveAggregationHonorsPerProviderDisabledFlag(t *testing.T) {
+	store := testConfigStore(t, map[string]any{
+		"agent": map[string]any{
+			"defaultModel": "__agg__:primary",
+			"modelAggregations": []any{
+				map[string]any{
+					"id":          "primary",
+					"name":        "Primary",
+					"models":      []any{"customx:gpt-test", "anthropic:claude-test"},
+					"routingMode": "priority",
+				},
+			},
+		},
+		"customApiProviders": []any{
+			map[string]any{
+				"prefix":   "customx",
+				"apiKey":   "test-key",
+				"baseUrl":  "https://example.invalid/v1",
+				"protocol": "openai",
+				"disabled": true,
+			},
+		},
+		"anthropicProviders": []any{
+			map[string]any{
+				"prefix":  "anthropic",
+				"apiKey":  "test-key",
+				"baseUrl": "https://example.invalid",
+			},
+		},
+	})
+	resolution, err := ResolveProviderAndModel(store, "__default__")
+	if err != nil {
+		t.Fatalf("ResolveProviderAndModel returned error: %v", err)
+	}
+	if resolution.Provider != "anthropic" || resolution.Model != "claude-test" {
+		t.Fatalf("expected per-provider disabled member to be skipped, got %#v", resolution)
+	}
+}
+
+func TestResolveAggregationBalancedModeRoundRobinsEnabledMembers(t *testing.T) {
+	raw := map[string]any{
+		"agent": map[string]any{
+			"modelAggregations": []any{
+				map[string]any{
+					"id":          "rr",
+					"models":      []any{"openai:disabled-a", "anthropic:claude-test", "openai2:gpt-test"},
+					"routingMode": "balanced",
+				},
+			},
+			"disabledProviders": []any{"openai"},
+		},
+	}
+	aggRoundRobinMu.Lock()
+	delete(aggRoundRobin, "rr")
+	aggRoundRobinMu.Unlock()
+	want := []string{"anthropic:claude-test", "openai2:gpt-test", "anthropic:claude-test", "openai2:gpt-test"}
+	for i, expected := range want {
+		got := resolveAggregationFromRaw(raw, "rr")
+		if got != expected {
+			t.Fatalf("balanced round-robin call %d: expected %q, got %q", i, expected, got)
+		}
+	}
+}
+
+func TestResolveAggregationReturnsEmptyWhenAllMembersDisabled(t *testing.T) {
+	raw := map[string]any{
+		"agent": map[string]any{
+			"modelAggregations": []any{
+				map[string]any{
+					"id":     "primary",
+					"models": []any{"openai:gpt-test", "openai:gpt-test-2"},
+				},
+			},
+			"disabledProviders": []any{"openai"},
+		},
+	}
+	if got := resolveAggregationFromRaw(raw, "primary"); got != "" {
+		t.Fatalf("expected empty resolution when all members disabled, got %q", got)
+	}
+}
+
 func TestResolveProviderRejectsUnsupportedKiroFallbackUnlessExplicitlyAllowed(t *testing.T) {
 	raw := map[string]any{
 		"openaiProviders": []any{

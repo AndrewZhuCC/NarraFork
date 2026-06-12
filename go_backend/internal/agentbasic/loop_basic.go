@@ -954,7 +954,14 @@ func emitProviderLifecycleEvents(
 		if ig.Final {
 			emitAgentEvent(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "image_generation", ID: ig.ID, Status: ig.Status, RevisedPrompt: ig.RevisedPrompt, Result: ig.Result, OutputIndex: ig.OutputIndex}})
 		}
-		emitAgentEvent(ctx, out, AgentEvent{Type: "image_generation", ToolUseID: ig.ID, Message: ig.Status, OutputIndex: ig.OutputIndex, Metadata: map[string]any{"revisedPrompt": ig.RevisedPrompt, "result": ig.Result}})
+		imageMeta := map[string]any{"revisedPrompt": ig.RevisedPrompt, "result": ig.Result}
+		if ig.PartialImageIndex != nil {
+			imageMeta["partialImageIndex"] = *ig.PartialImageIndex
+		}
+		if ig.PartialImageB64 != "" {
+			imageMeta["partialImageB64"] = ig.PartialImageB64
+		}
+		emitAgentEvent(ctx, out, AgentEvent{Type: "image_generation", ToolUseID: ig.ID, Message: ig.Status, OutputIndex: ig.OutputIndex, Metadata: imageMeta})
 	}
 	if parsed.OutputTruncated != "" {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "output_truncated", Message: parsed.OutputTruncated})

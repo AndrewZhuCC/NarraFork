@@ -282,3 +282,63 @@ func TestResolveCustomResponsesProviderUsesResponsesMode(t *testing.T) {
 		t.Fatalf("expected responses api mode, got %#v", resolution.Config)
 	}
 }
+
+// Wave 312: response.image_generation_call.partial_image must carry the
+// partialImageIndex/partialImageB64 streaming preview fields (TS parity), while
+// generating/completed events must not, on both the OpenAI Responses SSE parser
+// and the Codex WebSocket parser (they share handleResponsesJSONEvent).
+func TestResponsesImageGenerationPartialStreamingFieldsParity(t *testing.T) {
+	out := make(chan StreamEvent, 16)
+	toolsByItem := map[string]*openAIStreamingTool{}
+	inputs := []string{
+		`{"type":"response.image_generation_call.generating","item_id":"img_partial","output_index":2}`,
+		`{"type":"response.image_generation_call.partial_image","item_id":"img_partial","output_index":2,"partial_image_index":0,"partial_image_b64":"AAAA"}`,
+		`{"type":"response.image_generation_call.partial_image","item_id":"img_partial","output_index":2,"partial_image_index":1,"partial_image_b64":"BBBB"}`,
+		`{"type":"response.image_generation_call.completed","item_id":"img_partial","output_index":2}`,
+	}
+	for _, input := range inputs {
+		if err := handleResponsesJSONEvent(context.Background(), out, toolsByItem, []byte(input)); err != nil {
+			t.Fatalf("handle responses event: %v", err)
+		}
+	}
+	close(out)
+
+	type sample struct {
+		status     string
+		hasPartial bool
+		index      int
+		b64        string
+	}
+	var samples []sample
+	for event := range out {
+		if event.Err != nil {
+			t.Fatalf("unexpected stream error: %v", event.Err)
+		}
+		img := event.Parsed.ImageGeneration
+		if img == nil || img.ID != "img_partial" {
+			continue
+		}
+		s := sample{status: img.Status}
+		if img.PartialImageIndex != nil {
+			s.hasPartial = true
+			s.index = *img.PartialImageIndex
+			s.b64 = img.PartialImageB64
+		}
+		samples = append(samples, s)
+	}
+	if len(samples) != 4 {
+		t.Fatalf("expected 4 image-generation events, got %d: %#v", len(samples), samples)
+	}
+	if samples[0].status != "generating" || samples[0].hasPartial {
+		t.Fatalf("generating event must not carry partial fields: %#v", samples[0])
+	}
+	if samples[1].status != "generating" || !samples[1].hasPartial || samples[1].index != 0 || samples[1].b64 != "AAAA" {
+		t.Fatalf("first partial_image event wrong: %#v", samples[1])
+	}
+	if samples[2].status != "generating" || !samples[2].hasPartial || samples[2].index != 1 || samples[2].b64 != "BBBB" {
+		t.Fatalf("second partial_image event wrong: %#v", samples[2])
+	}
+	if samples[3].status != "completed" || samples[3].hasPartial {
+		t.Fatalf("completed event must not carry partial fields: %#v", samples[3])
+	}
+}

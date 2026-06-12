@@ -36,6 +36,13 @@ func TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields(t *testi
 		Metadata:    map[string]any{"revisedPrompt": "draw a graph", "result": "image-data"},
 	})
 	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
+		Type:        "image_generation",
+		ToolUseID:   "image-partial",
+		Message:     "generating",
+		OutputIndex: intPtrForFrontendContract(2),
+		Metadata:    map[string]any{"partialImageIndex": 1, "partialImageB64": "AAAA"},
+	})
+	service.broadcastAgentEvent("nar-frontend", agentbasic.AgentEvent{
 		Type: "metering",
 		Metadata: map[string]any{
 			"unit":       "request",
@@ -124,6 +131,13 @@ func TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields(t *testi
 	if imageGeneration["id"] != "image-1" || imageGeneration["status"] != "completed" || imageGeneration["revisedPrompt"] != "draw a graph" || intNumber(imageGeneration["outputIndex"]) != 2 {
 		t.Fatalf("image_generation should expose useNarratorWS fields: %#v", imageGeneration)
 	}
+	if _, ok := imageGeneration["partialImageIndex"]; ok {
+		t.Fatalf("completed image_generation frame must not carry partial fields: %#v", imageGeneration)
+	}
+	partialImage := requireFrameByID(t, frames, "image_generation", "image-partial")
+	if partialImage["status"] != "generating" || intNumber(partialImage["partialImageIndex"]) != 1 || partialImage["partialImageB64"] != "AAAA" {
+		t.Fatalf("partial image_generation frame should expose partialImageIndex/partialImageB64: %#v", partialImage)
+	}
 	metering := requireFrameType(t, frames, "metering")
 	meteringMetadata, _ := metering["metadata"].(map[string]any)
 	if metering["unit"] != "request" || metering["unitPlural"] != "requests" || intNumber(metering["usage"]) != 3 || intNumber(meteringMetadata["limit"]) != 10 {
@@ -184,6 +198,17 @@ func requireFrameType(t *testing.T, frames []map[string]any, typ string) map[str
 		}
 	}
 	t.Fatalf("missing frame type %s in %#v", typ, frames)
+	return nil
+}
+
+func requireFrameByID(t *testing.T, frames []map[string]any, typ, id string) map[string]any {
+	t.Helper()
+	for _, frame := range frames {
+		if frame["type"] == typ && frame["id"] == id {
+			return frame
+		}
+	}
+	t.Fatalf("missing frame type %s with id %s in %#v", typ, id, frames)
 	return nil
 }
 

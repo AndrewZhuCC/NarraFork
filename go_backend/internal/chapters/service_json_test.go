@@ -136,6 +136,59 @@ func TestChapterUpdateAllowsRootTitleAndBranchRoleChanges(t *testing.T) {
 	}
 }
 
+func TestChapterUpdateValidatesZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openChapterUpdateInvariantDB(t)
+	defer sqlDB.Close()
+	service := &Service{DB: sqlDB}
+
+	cases := []struct {
+		name string
+		data map[string]any
+		want string
+	}{
+		{name: "empty title", data: map[string]any{"title": "  "}, want: "title must be a non-empty string"},
+		{name: "overlong title", data: map[string]any{"title": strings.Repeat("x", 201)}, want: "title must be at most 200 characters"},
+		{name: "overlong description", data: map[string]any{"description": strings.Repeat("d", 2001)}, want: "description must be at most 2000 characters"},
+		{name: "invalid status", data: map[string]any{"status": "archived"}, want: "status must be one of active, dormant, merged, abandoned, frozen"},
+		{name: "invalid role", data: map[string]any{"role": "reviewer"}, want: "role must be one of trunk, branch, exploration, review"},
+		{name: "overlong color", data: map[string]any{"color": strings.Repeat("c", 21)}, want: "color must be at most 20 characters"},
+		{name: "overlong groupLabel", data: map[string]any{"groupLabel": strings.Repeat("g", 101)}, want: "groupLabel must be at most 100 characters"},
+		{name: "container composeFile too long", data: map[string]any{"containerConfig": map[string]any{"composeFile": strings.Repeat("f", 501)}}, want: "containerConfig.composeFile must be at most 500 characters"},
+		{name: "container empty service", data: map[string]any{"containerConfig": map[string]any{"services": []any{""}}}, want: "containerConfig.services[0] must be a non-empty string"},
+		{name: "container port out of range", data: map[string]any{"containerConfig": map[string]any{"ports": []any{map[string]any{"containerPort": float64(70000), "serviceName": "web"}}}}, want: "containerConfig.ports[0].containerPort must be between 1 and 65535"},
+		{name: "container port missing service", data: map[string]any{"containerConfig": map[string]any{"ports": []any{map[string]any{"containerPort": float64(8080), "serviceName": ""}}}}, want: "containerConfig.ports[0].serviceName must be a non-empty string"},
+		{name: "container env non-string", data: map[string]any{"containerConfig": map[string]any{"env": map[string]any{"KEY": float64(1)}}}, want: "containerConfig.env.KEY must be a string"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := service.Update(context.Background(), "branch", tc.data)
+			assertChapterValidationError(t, err, tc.want)
+		})
+	}
+
+	// A valid update with the full containerConfig shape and enum values passes.
+	updated, err := service.Update(context.Background(), "branch", map[string]any{
+		"title":       "Renamed branch",
+		"description": "ok",
+		"status":      "dormant",
+		"role":        "exploration",
+		"color":       "#abcdef",
+		"groupLabel":  "Group A",
+		"containerConfig": map[string]any{
+			"composeFile": "docker-compose.yml",
+			"services":    []any{"web", "db"},
+			"ports":       []any{map[string]any{"containerPort": float64(8080), "serviceName": "web"}},
+			"env":         map[string]any{"NODE_ENV": "production"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("valid chapter update should pass, got %v", err)
+	}
+	if updated.Title != "Renamed branch" || updated.Status != "dormant" || updated.Role != "exploration" {
+		t.Fatalf("unexpected valid update result: %#v", updated)
+	}
+}
+
 func openChapterUpdateInvariantDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")

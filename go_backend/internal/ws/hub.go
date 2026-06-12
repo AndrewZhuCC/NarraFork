@@ -1095,6 +1095,11 @@ func (h *Hub) handleMessage(c *client, msg map[string]any) {
 				c.sendJSON(map[string]any{"type": "error", "message": "terminalId is required"})
 				return
 			}
+			// Mirror the TypeScript terminalWsMessageSchema resize bounds: cols 10..500, rows 2..200.
+			if cols < 10 || cols > 500 || rows < 2 || rows > 200 {
+				c.sendJSON(map[string]any{"type": "error", "terminalId": terminalID, "message": "Invalid terminal resize request"})
+				return
+			}
 			if !h.isSubscribed(c, terminalID) {
 				return
 			}
@@ -1381,6 +1386,11 @@ func (h *Hub) handleBufferMessage(c *client, msg map[string]any) {
 	}
 	if strings.TrimSpace(text) == "" {
 		c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text is required"})
+		return
+	}
+	// Mirror the TypeScript narratorWsMessageSchema buffer_message bound: text max 100000.
+	if len(text) > 100000 {
+		c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text must be at most 100000 characters"})
 		return
 	}
 	if action, toolID, ok := parseWSOptionalToolSlashCommand(text); ok {
@@ -1723,6 +1733,15 @@ func (h *Hub) handleUpdateBuffer(c *client, msg map[string]any) {
 	sets := []string{}
 	args := []any{}
 	if text, ok := msg["text"].(string); ok {
+		// Mirror the TypeScript narratorWsMessageSchema update_buffer bound: text min 1 / max 100000.
+		if strings.TrimSpace(text) == "" {
+			c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text is required"})
+			return
+		}
+		if len(text) > 100000 {
+			c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text must be at most 100000 characters"})
+			return
+		}
 		sets = append(sets, "text = ?")
 		args = append(args, text)
 	}
@@ -1789,6 +1808,17 @@ func (h *Hub) handleUpdateTimeout(c *client, msg map[string]any) {
 	toolUseID := strings.TrimSpace(stringValue(msg["toolUseId"]))
 	if toolUseID == "" {
 		c.sendJSON(map[string]any{"type": "error", "message": "toolUseId is required"})
+		return
+	}
+	// Mirror the TypeScript narratorWsMessageSchema update_timeout bound:
+	// timeoutMs int 1000..86400000. Validate before any DB lookup/mutation.
+	rawTimeout := msg["timeout"]
+	if rawTimeout == nil {
+		rawTimeout = msg["timeoutMs"]
+	}
+	timeoutMs := intNumber(rawTimeout)
+	if timeoutMs < 1000 || timeoutMs > 86_400_000 {
+		c.sendJSON(map[string]any{"type": "error", "toolUseId": toolUseID, "message": "timeoutMs must be between 1000 and 86400000"})
 		return
 	}
 	var narratorID, inputRaw sql.NullString
@@ -2521,6 +2551,23 @@ func (h *Hub) createTerminal(ctx context.Context, msg map[string]any) (map[strin
 		return nil, errors.New("chapterId or narratorId is required")
 	}
 	name, _ := msg["name"].(string)
+	// Mirror the TypeScript terminalWsMessageSchema create bounds: name max 100,
+	// cols 10..500 and rows 2..200 when provided.
+	if len(name) > 100 {
+		return nil, errors.New("Invalid terminal create request")
+	}
+	if _, ok := msg["cols"]; ok {
+		cols := intNumber(msg["cols"])
+		if cols < 10 || cols > 500 {
+			return nil, errors.New("Invalid terminal create request")
+		}
+	}
+	if _, ok := msg["rows"]; ok {
+		rows := intNumber(msg["rows"])
+		if rows < 2 || rows > 200 {
+			return nil, errors.New("Invalid terminal create request")
+		}
+	}
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "Terminal"
@@ -2574,6 +2621,10 @@ func (h *Hub) renameTerminal(ctx context.Context, terminalID, name string) error
 	}
 	if name == "" {
 		return errors.New("name is required")
+	}
+	// Mirror the TypeScript terminalWsMessageSchema rename bound: name min 1 / max 100.
+	if len(name) > 100 {
+		return errors.New("name must be at most 100 characters")
 	}
 	res, err := sqlDB.ExecContext(ctx, `UPDATE terminals SET name = ? WHERE id = ?`, name, terminalID)
 	if err != nil {

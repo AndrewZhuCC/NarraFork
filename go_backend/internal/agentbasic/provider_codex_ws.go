@@ -122,8 +122,10 @@ func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, tools
 		emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "searching", parsed.OutputIndex)
 	case "response.web_search_call.completed":
 		emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
-	case "response.image_generation_call.generating", "response.image_generation_call.partial_image":
+	case "response.image_generation_call.generating":
 		emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "generating", parsed.OutputIndex)
+	case "response.image_generation_call.partial_image":
+		emitResponsesImageGenerationPartial(ctx, out, parsed.ItemID, parsed.OutputIndex, parsed.PartialImageIndex, parsed.PartialImageB64)
 	case "response.image_generation_call.completed":
 		emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
 	case "response.function_call_arguments.delta":

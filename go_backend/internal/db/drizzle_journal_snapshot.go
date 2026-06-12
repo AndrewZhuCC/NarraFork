@@ -48,4 +48,6 @@ var embeddedDrizzleMigrationSnapshot = []drizzleMigrationSnapshotEntry{
 	{Tag: "0038_spotty_metal_master", When: 1778067344612, Hash: "6b4dd65908dfe0ae4b7173fae738b7998867f232cd9078bf8328c51dd592d195"},
 	{Tag: "0039_mature_reptil", When: 1778258355695, Hash: "2da342ecb4ab254d8e46fa428ae38b346c71c3b5c82122aa7e4f737c4459e237"},
 	{Tag: "0040_talented_pandemic", When: 1778483346461, Hash: "b110cd1c783f2959b91322c23ebae9d239215d3321fbb725b3aa90955af8f81e"},
+	{Tag: "0041_exotic_nekra", When: 1781187476955, Hash: "5b6892b1717ea94d0d6768c9ee9765200662cfc2dedccc6a8b87b69f11f68d7c"},
+	{Tag: "0042_shocking_naoko", When: 1781278512923, Hash: "a905aa05262b28902f5e8873004172e0e6237b8c400ec4f959b5c4c4a2a5460a"},
 }

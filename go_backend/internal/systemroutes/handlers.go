@@ -157,6 +157,11 @@ func (h *Handler) RegisterAdmin(r chi.Router) {
 
 var runtimeCache map[string]any
 
+// runtimeCacheTTL mirrors the TypeScript runtime-service CACHE_TTL_MS (30s):
+// runtime state changes fast, so a cached scan older than this window must be
+// treated as expired and cleared instead of served indefinitely.
+const runtimeCacheTTL = 30 * time.Second
+
 func (h *Handler) RegisterProjectDB(r chi.Router) {
 	r.Get("/status", func(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": "project-routes", "message": "Use /api/projects/:id/backup/status and /api/projects/:id/backup/sync"})
@@ -8516,12 +8521,42 @@ func (h *Handler) browserRuntimePayload(ctx context.Context) map[string]any {
 }
 
 func (h *Handler) cachedRuntime(w http.ResponseWriter, r *http.Request) error {
-	if runtimeCache == nil {
-		httpx.WriteJSON(w, http.StatusOK, map[string]any{"cached": false})
+	if cached := validRuntimeCache(); cached != nil {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"cached": true, "data": cached})
 		return nil
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"cached": true, "data": runtimeCache})
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"cached": false})
 	return nil
+}
+
+// validRuntimeCache returns the cached runtime scan if present and within the
+// TTL window, clearing it otherwise to match the TypeScript getCachedResult TTL
+// expiry behavior.
+func validRuntimeCache() map[string]any {
+	if runtimeCache == nil {
+		return nil
+	}
+	scannedAt := runtimeCacheScannedAt(runtimeCache["scannedAt"])
+	if scannedAt > 0 && time.Since(time.UnixMilli(scannedAt)) > runtimeCacheTTL {
+		runtimeCache = nil
+		return nil
+	}
+	return runtimeCache
+}
+
+// runtimeCacheScannedAt extracts the cached scannedAt millisecond timestamp,
+// tolerating the int64 stored by scanRuntime as well as JSON-decoded float64.
+func runtimeCacheScannedAt(value any) int64 {
+	switch v := value.(type) {
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case float64:
+		return int64(v)
+	default:
+		return 0
+	}
 }
 
 const runtimeCleanupItemLimit = 100

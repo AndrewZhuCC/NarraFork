@@ -522,3 +522,89 @@ func insertNarratorForCopyOnWriteTest(t *testing.T, sqlDB *sql.DB, narratorID st
 	}
 	return narratorID
 }
+
+func TestEditAssistantMessageUpdatesTextAndPreservesOriginalContent(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	ctx := context.Background()
+	// Seed an assistant message with a text block plus a non-text block to confirm
+	// the non-text block is preserved and the text is replaced.
+	blocks := []map[string]any{
+		{"type": "text", "text": "original assistant text"},
+		{"type": "tool_use", "id": "tu-1", "name": "Read", "input": map[string]any{}},
+	}
+	assistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "original assistant text", blocks, nil)
+	if err != nil {
+		t.Fatalf("seed assistant message: %v", err)
+	}
+
+	editor := "user-123"
+	updated, err := service.EditAssistantMessage(ctx, narratorID, assistant.ID, "edited assistant text", &editor)
+	if err != nil {
+		t.Fatalf("edit assistant message: %v", err)
+	}
+	if updated.ContentText == nil || *updated.ContentText != "edited assistant text" {
+		t.Fatalf("content text not updated: %#v", updated.ContentText)
+	}
+	if updated.EditedAt == nil || *updated.EditedAt == "" {
+		t.Fatalf("editedAt should be set, got %#v", updated.EditedAt)
+	}
+	if updated.EditedBy == nil || *updated.EditedBy != editor {
+		t.Fatalf("editedBy mismatch: %#v", updated.EditedBy)
+	}
+	editedBlocks, ok := updated.ContentJSON.([]any)
+	if !ok || len(editedBlocks) != 2 {
+		t.Fatalf("expected 2 blocks after edit, got %#v", updated.ContentJSON)
+	}
+	first, _ := editedBlocks[0].(map[string]any)
+	second, _ := editedBlocks[1].(map[string]any)
+	if first["type"] != "text" || first["text"] != "edited assistant text" {
+		t.Fatalf("first block should be edited text: %#v", first)
+	}
+	if second["type"] != "tool_use" {
+		t.Fatalf("non-text block should be preserved: %#v", second)
+	}
+	// original_content_json should hold the pre-edit content on first edit.
+	if updated.OriginalContentJSON == nil {
+		t.Fatalf("originalContentJson should be set on first edit")
+	}
+	origBlocks, ok := updated.OriginalContentJSON.([]any)
+	if !ok || len(origBlocks) != 2 {
+		t.Fatalf("original content should hold 2 original blocks, got %#v", updated.OriginalContentJSON)
+	}
+	origFirst, _ := origBlocks[0].(map[string]any)
+	if origFirst["text"] != "original assistant text" {
+		t.Fatalf("original content should preserve pre-edit text: %#v", origFirst)
+	}
+
+	// Re-editing must not overwrite the preserved original content.
+	reupdated, err := service.EditAssistantMessage(ctx, narratorID, assistant.ID, "second edit", &editor)
+	if err != nil {
+		t.Fatalf("second edit: %v", err)
+	}
+	reBlocks, _ := reupdated.OriginalContentJSON.([]any)
+	if len(reBlocks) != 2 {
+		t.Fatalf("re-edit original content should be unchanged, got %#v", reupdated.OriginalContentJSON)
+	}
+	reFirst, _ := reBlocks[0].(map[string]any)
+	if reFirst["text"] != "original assistant text" {
+		t.Fatalf("re-edit must preserve first-edit original text: %#v", reFirst)
+	}
+	if reupdated.ContentText == nil || *reupdated.ContentText != "second edit" {
+		t.Fatalf("re-edit text not applied: %#v", reupdated.ContentText)
+	}
+}
+
+func TestEditAssistantMessageRejectsNonAssistantAndMissing(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	ctx := context.Background()
+	var userMsgID string
+	if err := service.DB.QueryRow(`SELECT id FROM narrator_messages WHERE narrator_id = ? AND role = 'user' ORDER BY created_at ASC LIMIT 1`, narratorID).Scan(&userMsgID); err != nil {
+		t.Fatalf("load user message: %v", err)
+	}
+	if _, err := service.EditAssistantMessage(ctx, narratorID, userMsgID, "x", nil); err == nil {
+		t.Fatalf("editing a user message should fail")
+	}
+	if _, err := service.EditAssistantMessage(ctx, narratorID, "missing-id", "x", nil); err == nil {
+		t.Fatalf("editing a missing message should fail")
+	}
+}

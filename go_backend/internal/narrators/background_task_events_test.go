@@ -386,6 +386,39 @@ func TestAttachRunningBackgroundReportsParentBlockingWhenRuntimeActive(t *testin
 	}
 }
 
+func TestForegroundSubagentCompletionBroadcastsSubagentStatusChangedToParent(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	parentID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	parent, err := service.Get(context.Background(), parentID)
+	if err != nil {
+		t.Fatalf("load parent: %v", err)
+	}
+	// Foreground subagent (isBackground=false).
+	child, err := service.createSubagentNarrator(context.Background(), parent, "general", "Foreground worker", "openai:test", "", "", "fg-worker", false)
+	if err != nil {
+		t.Fatalf("create child: %v", err)
+	}
+
+	state := &agentRunState{narratorID: child.ID, narrator: child, assistantText: "done"}
+	if err := service.finishAgentRunSuccess(context.Background(), state); err != nil {
+		t.Fatalf("finish foreground subagent run: %v", err)
+	}
+
+	payload := findBroadcast(events(), parentID, "subagent_status_changed")
+	if payload == nil {
+		t.Fatalf("expected subagent_status_changed broadcast to parent, got %#v", events())
+	}
+	if payload["subagentNarratorId"] != child.ID || payload["status"] != "idle" {
+		t.Fatalf("unexpected subagent_status_changed payload: %#v", payload)
+	}
+	if !hasBroadcast(events(), child.ID, "status") {
+		t.Fatalf("expected subagent's own status broadcast, got %#v", events())
+	}
+}
+
 func TestBackgroundAgentCompletionSyncsTaskRecordAndBroadcastsParentEvents(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

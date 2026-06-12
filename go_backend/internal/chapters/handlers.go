@@ -269,6 +269,20 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
 	}
+	// Mirror the TypeScript createChapterSchema Zod bounds: projectId min 1,
+	// title min 1 / max 200, description max 2000.
+	if strings.TrimSpace(req.ProjectID) == "" {
+		return httpx.BadRequest("projectId is required")
+	}
+	if strings.TrimSpace(req.Title) == "" {
+		return httpx.BadRequest("title is required")
+	}
+	if len(req.Title) > 200 {
+		return httpx.BadRequest("title must be at most 200 characters")
+	}
+	if req.Description != nil && len(*req.Description) > 2000 {
+		return httpx.BadRequest("description must be at most 2000 characters")
+	}
 	chapter, err := h.Service.Create(r.Context(), CreateInput{ProjectID: req.ProjectID, Title: req.Title, Description: req.Description, BaseBranch: req.BaseBranch})
 	if err != nil {
 		return err
@@ -329,6 +343,29 @@ func (h *Handler) fork(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
 	}
+	// Mirror the TypeScript forkChapterSchema Zod bounds: title min 1 / max 200,
+	// description max 2000, role enum ["branch","exploration"], crossOffset min 0,
+	// inheritMode enum ["full","compressed","fresh"].
+	if req.Title != nil {
+		if strings.TrimSpace(*req.Title) == "" {
+			return httpx.BadRequest("title must be a non-empty string")
+		}
+		if len(*req.Title) > 200 {
+			return httpx.BadRequest("title must be at most 200 characters")
+		}
+	}
+	if req.Description != nil && len(*req.Description) > 2000 {
+		return httpx.BadRequest("description must be at most 2000 characters")
+	}
+	if strings.TrimSpace(req.Role) != "" && req.Role != "branch" && req.Role != "exploration" {
+		return httpx.BadRequest("role must be branch or exploration")
+	}
+	if req.InheritMode != "" && normalizeInheritMode(req.InheritMode) == "" {
+		return httpx.BadRequest("inheritMode must be full, compressed, or fresh")
+	}
+	if req.CrossOffset != nil && *req.CrossOffset < 0 {
+		return httpx.BadRequest("crossOffset must be greater than or equal to 0")
+	}
 	chapter, err := h.Service.Fork(r.Context(), chi.URLParam(r, "id"), ForkInput{
 		Title:             req.Title,
 		Description:       req.Description,
@@ -357,6 +394,13 @@ func (h *Handler) batchFork(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript batchForkSchema Zod bound: forks array min 1 / max 10.
+	if len(body.Forks) < 1 {
+		return httpx.BadRequest("forks is required")
+	}
+	if len(body.Forks) > 10 {
+		return httpx.BadRequest("forks must contain at most 10 items")
 	}
 	created := []Chapter{}
 	failed := []map[string]any{}
@@ -428,8 +472,18 @@ func (h *Handler) cherryPick(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript cherryPickSchema Zod bounds: sourceChapterId min 1,
+	// commitShas array min 1 with each entry min 1.
+	if strings.TrimSpace(body.SourceChapterID) == "" {
+		return httpx.BadRequest("sourceChapterId is required")
+	}
 	if len(body.CommitSHAs) == 0 {
 		return httpx.BadRequest("commitShas is required")
+	}
+	for _, sha := range body.CommitSHAs {
+		if strings.TrimSpace(sha) == "" {
+			return httpx.BadRequest("commitShas entries must be non-empty")
+		}
 	}
 	target, err := h.Service.Get(r.Context(), chi.URLParam(r, "id"))
 	if err != nil {
@@ -665,6 +719,22 @@ func (h *Handler) createReview(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
 	}
+	// Mirror the TypeScript createReviewSchema Zod bounds: title min 1 / max 200,
+	// locale enum ["en","zh-CN"], crossOffset min 0.
+	if req.Title != nil {
+		if strings.TrimSpace(*req.Title) == "" {
+			return httpx.BadRequest("title must be a non-empty string")
+		}
+		if len(*req.Title) > 200 {
+			return httpx.BadRequest("title must be at most 200 characters")
+		}
+	}
+	if strings.TrimSpace(req.Locale) != "" && req.Locale != "en" && req.Locale != "zh-CN" {
+		return httpx.BadRequest("locale must be en or zh-CN")
+	}
+	if req.CrossOffset != nil && *req.CrossOffset < 0 {
+		return httpx.BadRequest("crossOffset must be greater than or equal to 0")
+	}
 	user := auth.UserFromContext(r.Context())
 	userID := ""
 	if user != nil {
@@ -708,6 +778,10 @@ func (h *Handler) merge(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
+	}
+	// Mirror the TypeScript mergeChapterSchema Zod bound: message max 500 chars.
+	if len(req.Message) > 500 {
+		return httpx.BadRequest("message must be at most 500 characters")
 	}
 	userID := ""
 	if user := auth.UserFromContext(r.Context()); user != nil {

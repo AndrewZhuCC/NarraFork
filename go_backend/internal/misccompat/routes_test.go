@@ -516,6 +516,92 @@ func TestDatabaseCleanupPreviewMarksApiDumpStatsErrorsDegraded(t *testing.T) {
 	}
 }
 
+func TestDatabaseCleanupPreviewRejectsOutOfRangeZodBounds(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	h := NewHandler(database)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"olderThanDays-too-large", `{"target":"apiRequestDumps","olderThanDays":3651}`},
+		{"olderThanDays-non-positive", `{"target":"apiRequestDumps","olderThanDays":0}`},
+		{"sampleLimit-too-large", `{"target":"apiRequestDumps","sampleLimit":26}`},
+		{"sampleLimit-negative", `{"target":"apiRequestDumps","sampleLimit":-1}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/storage/database/preview", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			err := h.databaseCleanupPreview(w, req)
+			var appErr *httpx.AppError
+			if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+				t.Fatalf("expected 400 AppError for %s, got %T %v (status w=%d)", tc.name, err, err, w.Code)
+			}
+		})
+	}
+
+	// In-range bounds still succeed (max olderThanDays/sampleLimit).
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/preview", strings.NewReader(`{"target":"apiRequestDumps","olderThanDays":3650,"sampleLimit":25}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.databaseCleanupPreview(w, req); err != nil {
+		t.Fatalf("in-range preview returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected in-range preview 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestDatabaseCleanupRejectsOutOfRangeOlderThanDays(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	h := NewHandler(database)
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"too-large", `{"target":"apiRequestDumps","olderThanDays":3651}`},
+		{"non-positive", `{"target":"apiRequestDumps","olderThanDays":0}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			err := h.databaseCleanup(w, req)
+			var appErr *httpx.AppError
+			if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+				t.Fatalf("expected 400 AppError for %s, got %T %v (status w=%d)", tc.name, err, err, w.Code)
+			}
+		})
+	}
+
+	// In-range max olderThanDays still runs cleanup (apiRequestDumps clears dumps).
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/database/cleanup", strings.NewReader(`{"target":"apiRequestDumps","olderThanDays":3650}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.databaseCleanup(w, req); err != nil {
+		t.Fatalf("in-range cleanup returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected in-range cleanup 200, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestDatabaseCleanupArchivedSessionsDeletesThroughNarratorService(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	database := openDatabaseCleanupNarratorTestDB(t)
@@ -612,6 +698,48 @@ func TestRulerMutationsMissingServicesExposeFeatureDisabledFallback(t *testing.T
 		reason, _ := body["reason"].(string)
 		if reason == "" || body["error"] != reason || body["message"] != reason {
 			t.Fatalf("ruler fallback for %s should expose reason/error/message, got %#v", tc.path, body)
+		}
+	}
+}
+
+func TestRulerMergeRejectsInvalidStrategyAndOverlongMessage(t *testing.T) {
+	h := NewHandler(nil)
+	router := chi.NewRouter()
+	router.Route("/projects", h.RegisterRuler)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "invalid-strategy", body: `{"sourceChapterId":"ch1","strategy":"cherry-pick"}`},
+		{name: "unknown-strategy", body: `{"sourceChapterId":"ch1","strategy":"rebase"}`},
+		{name: "overlong-message", body: `{"sourceChapterId":"ch1","message":"` + strings.Repeat("x", 501) + `"}`},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/projects/p1/ruler/merge", strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: expected 400, got %d body=%s", tc.name, w.Code, w.Body.String())
+		}
+	}
+
+	// Valid strategy/message values still pass validation and reach the
+	// chapter-service-unavailable fallback (nil service in this handler).
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "default-strategy", body: `{"sourceChapterId":"ch1"}`},
+		{name: "explicit-merge", body: `{"sourceChapterId":"ch1","strategy":"merge"}`},
+		{name: "squash", body: `{"sourceChapterId":"ch1","strategy":"squash"}`},
+		{name: "message-at-limit", body: `{"sourceChapterId":"ch1","message":"` + strings.Repeat("x", 500) + `"}`},
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/projects/p1/ruler/merge", strings.NewReader(tc.body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNotImplemented {
+			t.Fatalf("%s: expected 501 feature-disabled fallback, got %d body=%s", tc.name, w.Code, w.Body.String())
 		}
 	}
 }

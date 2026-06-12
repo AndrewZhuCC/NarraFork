@@ -148,6 +148,9 @@ func createNarratorTestSchema(db *sql.DB) error {
 			commit_sha TEXT,
 			command_text TEXT,
 			created_by TEXT,
+			edited_at TEXT,
+			edited_by TEXT,
+			original_content_json TEXT,
 			created_at TEXT
 		)`,
 		`CREATE TABLE narrator_message_refs (
@@ -1607,6 +1610,44 @@ func TestRunBasicAgentDangerReflectionCanCancelDangerousTool(t *testing.T) {
 	}
 	if status != "fail" || !strings.Contains(outputRaw, "Do not run") {
 		t.Fatalf("unexpected danger tool result status=%s output=%s", status, outputRaw)
+	}
+}
+
+func TestRunBasicAgentDangerReflectionBroadcastsStartedAndResolved(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		if requestHasTool(body, "DangerCancel") {
+			if requestHasToolResult(body) {
+				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger reflection done"}}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-cancel-1", "type": "function", "function": map[string]any{"name": "DangerCancel", "arguments": `{"confirm":true,"feedback":"Do not run this command."}`}}}}}}})
+			return
+		}
+		if requestHasToolResult(body) {
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger cancelled"}}}})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch should-not-run"}`}}}}}}})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	if _, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("enable danger reflection: %v", err)
+	}
+	service.runBasicAgent(context.Background(), narratorID)
+
+	started := findBroadcast(events(), narratorID, "danger_reflection_started")
+	if started == nil || started["toolUseId"] != "danger-bash-1" || started["toolName"] != "Bash" {
+		t.Fatalf("expected danger_reflection_started for the Bash call, got %#v", events())
+	}
+	resolved := findBroadcast(events(), narratorID, "danger_reflection_resolved")
+	if resolved == nil || resolved["toolUseId"] != "danger-bash-1" || resolved["decision"] != "deny" {
+		t.Fatalf("expected danger_reflection_resolved deny, got %#v", resolved)
 	}
 }
 

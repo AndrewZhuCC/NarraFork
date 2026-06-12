@@ -186,22 +186,25 @@ type ToolCallRecord struct {
 }
 
 type Message struct {
-	ID              string           `json:"id"`
-	NarratorID      string           `json:"narratorId"`
-	MessageUUID     *string          `json:"sdkMessageUuid,omitempty"`
-	ParentToolUseID *string          `json:"parentToolUseId,omitempty"`
-	Role            string           `json:"role"`
-	ContentJSON     any              `json:"contentJson"`
-	ContentText     *string          `json:"contentText"`
-	Model           *string          `json:"model,omitempty"`
-	CommitSHA       *string          `json:"commitSha,omitempty"`
-	CommandText     *string          `json:"commandText,omitempty"`
-	CreatedBy       *string          `json:"createdBy,omitempty"`
-	Seq             int              `json:"seq,omitempty"`
-	CreatedAt       string           `json:"createdAt"`
-	ToolCalls       []ToolCallRecord `json:"toolCalls"`
-	SideCars        []SideCarRecord  `json:"sideCars,omitempty"`
-	Children        []Message        `json:"children"`
+	ID                  string           `json:"id"`
+	NarratorID          string           `json:"narratorId"`
+	MessageUUID         *string          `json:"sdkMessageUuid,omitempty"`
+	ParentToolUseID     *string          `json:"parentToolUseId,omitempty"`
+	Role                string           `json:"role"`
+	ContentJSON         any              `json:"contentJson"`
+	ContentText         *string          `json:"contentText"`
+	Model               *string          `json:"model,omitempty"`
+	CommitSHA           *string          `json:"commitSha,omitempty"`
+	CommandText         *string          `json:"commandText,omitempty"`
+	CreatedBy           *string          `json:"createdBy,omitempty"`
+	EditedAt            *string          `json:"editedAt"`
+	EditedBy            *string          `json:"editedBy"`
+	OriginalContentJSON any              `json:"originalContentJson"`
+	Seq                 int              `json:"seq,omitempty"`
+	CreatedAt           string           `json:"createdAt"`
+	ToolCalls           []ToolCallRecord `json:"toolCalls"`
+	SideCars            []SideCarRecord  `json:"sideCars,omitempty"`
+	Children            []Message        `json:"children"`
 }
 
 func (m Message) MarshalJSON() ([]byte, error) {
@@ -218,6 +221,9 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		CommitSHA       *string          `json:"commitSha,omitempty"`
 		CommandText     *string          `json:"commandText,omitempty"`
 		CreatedBy       *string          `json:"createdBy,omitempty"`
+		EditedAt        *string          `json:"editedAt"`
+		EditedBy        *string          `json:"editedBy"`
+		OriginalContent any              `json:"originalContentJson"`
 		Seq             int              `json:"seq,omitempty"`
 		CreatedAt       string           `json:"createdAt"`
 		ToolCalls       []ToolCallRecord `json:"toolCalls"`
@@ -237,6 +243,9 @@ func (m Message) MarshalJSON() ([]byte, error) {
 		CommitSHA:       m.CommitSHA,
 		CommandText:     m.CommandText,
 		CreatedBy:       m.CreatedBy,
+		EditedAt:        m.EditedAt,
+		EditedBy:        m.EditedBy,
+		OriginalContent: m.OriginalContentJSON,
 		Seq:             m.Seq,
 		CreatedAt:       m.CreatedAt,
 		ToolCalls:       m.ToolCalls,
@@ -1540,7 +1549,7 @@ func (s *Service) loadMessagesByRefs(ctx context.Context, refs []messageRef) ([]
 		seqByID[ref.MessageID] = ref.Seq
 	}
 	placeholders, idArgs := inPlaceholders(ids)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, created_at, 0 AS seq FROM narrator_messages WHERE id IN (`+placeholders+`)`, idArgs...)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE id IN (`+placeholders+`)`, idArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -1603,7 +1612,7 @@ func collectMessageToolUseIDs(messages []Message) []string {
 
 func (s *Service) loadChildMessagesForToolUses(ctx context.Context, toolUseIDs []string) ([]Message, error) {
 	placeholders, args := inPlaceholders(toolUseIDs)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, created_at, 0 AS seq FROM narrator_messages WHERE parent_tool_use_id IN (`+placeholders+`) ORDER BY created_at ASC LIMIT 500`, args...)
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE parent_tool_use_id IN (`+placeholders+`) ORDER BY created_at ASC LIMIT 500`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2857,11 +2866,26 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			return run, nil
 		}
 		if shouldRunDangerReflectionBeforeExecution(s.Settings, narrator, permission, execCwd, call) {
+			if s.Hub != nil {
+				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_started", "narratorId": narratorID, "toolUseId": call.ID, "toolName": call.Function.Name})
+			}
 			decision, err := s.runDangerReflection(execCtx, narratorID, call)
 			if err != nil {
+				if s.Hub != nil {
+					s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "toolUseId": call.ID, "decision": "error", "reason": err.Error()})
+				}
 				run.Status = "error"
 				run.Output = "Danger reflection failed: " + err.Error()
 				return run, nil
+			}
+			if s.Hub != nil {
+				resolvedDecision := "allow"
+				resolvedReason := strings.TrimSpace(decision.Reflection)
+				if decision.Action == "cancel" {
+					resolvedDecision = "deny"
+					resolvedReason = firstNonEmptyString(decision.Feedback, "Danger reflection rejected this tool call.")
+				}
+				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "toolUseId": call.ID, "decision": resolvedDecision, "reason": resolvedReason})
 			}
 			if decision.Action == "cancel" {
 				run.Status = "denied"
@@ -6758,6 +6782,51 @@ func (s *Service) skillRootForNarrator(ctx context.Context, narratorID string) (
 	return "", nil
 }
 
+// skillContextForNarrator mirrors the TypeScript resolveSkillContextForNarrator:
+// it returns the narrator's project git path (empty when the narrator is
+// standalone or its chapter/project lacks a git path) and the effective cwd used
+// to derive the workspace skill root (chapter worktree -> narrator cwd ->
+// project git path -> home). The narrator must exist (sql.ErrNoRows surfaces).
+func (s *Service) skillContextForNarrator(ctx context.Context, narratorID string) (projectGitPath string, cwd string, err error) {
+	var chapterID, narratorCwd sql.NullString
+	if err = s.DB.QueryRowContext(ctx, `SELECT chapter_id, cwd FROM narrators WHERE id = ?`, narratorID).Scan(&chapterID, &narratorCwd); err != nil {
+		return "", "", err
+	}
+	home, _ := os.UserHomeDir()
+	narratorCwdValue := strings.TrimSpace(narratorCwd.String)
+	if !chapterID.Valid || strings.TrimSpace(chapterID.String) == "" {
+		cwd = narratorCwdValue
+		if cwd == "" {
+			cwd = home
+		}
+		return "", cwd, nil
+	}
+	var worktreePath, gitPath sql.NullString
+	row := s.DB.QueryRowContext(ctx, `SELECT c.worktree_path, p.git_path FROM chapters c LEFT JOIN projects p ON p.id = c.project_id WHERE c.id = ?`, strings.TrimSpace(chapterID.String))
+	if scanErr := row.Scan(&worktreePath, &gitPath); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			cwd = narratorCwdValue
+			if cwd == "" {
+				cwd = home
+			}
+			return "", cwd, nil
+		}
+		return "", "", scanErr
+	}
+	projectGitPath = strings.TrimSpace(gitPath.String)
+	switch {
+	case strings.TrimSpace(worktreePath.String) != "":
+		cwd = strings.TrimSpace(worktreePath.String)
+	case narratorCwdValue != "":
+		cwd = narratorCwdValue
+	case projectGitPath != "":
+		cwd = projectGitPath
+	default:
+		cwd = home
+	}
+	return projectGitPath, cwd, nil
+}
+
 func findGitRoot(startDir string) string {
 	dir, err := filepath.Abs(startDir)
 	if err != nil {
@@ -10104,7 +10173,7 @@ func (s *Service) updateAssistantDraft(ctx context.Context, narratorID, messageI
 }
 
 func (s *Service) messageByID(ctx context.Context, narratorID, messageID string) (Message, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, created_at, 0 AS seq FROM narrator_messages WHERE id = ? AND narrator_id = ?`, messageID, narratorID)
+	row := s.DB.QueryRowContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE id = ? AND narrator_id = ?`, messageID, narratorID)
 	msg, err := scanMessage(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Message{}, httpx.NotFound("Message")
@@ -12249,9 +12318,9 @@ func scanNarrator(row rowScanner) (Narrator, error) {
 
 func scanMessage(row rowScanner) (Message, error) {
 	var msg Message
-	var messageUUID, parentToolUseID, contentText, model, commitSHA, commandText, createdBy sql.NullString
+	var messageUUID, parentToolUseID, contentText, model, commitSHA, commandText, createdBy, editedAt, editedBy, originalContentJSON sql.NullString
 	var raw string
-	if err := row.Scan(&msg.ID, &msg.NarratorID, &messageUUID, &parentToolUseID, &msg.Role, &raw, &contentText, &model, &commitSHA, &commandText, &createdBy, &msg.CreatedAt, &msg.Seq); err != nil {
+	if err := row.Scan(&msg.ID, &msg.NarratorID, &messageUUID, &parentToolUseID, &msg.Role, &raw, &contentText, &model, &commitSHA, &commandText, &createdBy, &editedAt, &editedBy, &originalContentJSON, &msg.CreatedAt, &msg.Seq); err != nil {
 		return Message{}, err
 	}
 	msg.MessageUUID = nullStringPtr(messageUUID)
@@ -12261,6 +12330,15 @@ func scanMessage(row rowScanner) (Message, error) {
 	msg.CommitSHA = nullStringPtr(commitSHA)
 	msg.CommandText = nullStringPtr(commandText)
 	msg.CreatedBy = nullStringPtr(createdBy)
+	msg.EditedAt = nullStringPtr(editedAt)
+	msg.EditedBy = nullStringPtr(editedBy)
+	if originalContentJSON.Valid && strings.TrimSpace(originalContentJSON.String) != "" {
+		var original any
+		if err := json.Unmarshal([]byte(originalContentJSON.String), &original); err != nil {
+			original = originalContentJSON.String
+		}
+		msg.OriginalContentJSON = original
+	}
 	var content any
 	if err := json.Unmarshal([]byte(raw), &content); err != nil {
 		content = raw

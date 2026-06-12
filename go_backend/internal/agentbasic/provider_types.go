@@ -152,6 +152,10 @@ type ImageGenerationEvent struct {
 	Result        string
 	OutputIndex   *int
 	Final         bool
+	// PartialImageIndex/PartialImageB64 mirror the TypeScript partial-image
+	// streaming preview fields emitted on response.image_generation_call.partial_image.
+	PartialImageIndex *int
+	PartialImageB64   string
 }
 
 type ModelSwitchedEvent struct {

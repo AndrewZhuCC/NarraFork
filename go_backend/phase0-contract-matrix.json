@@ -200,6 +200,7 @@
 				"content.projectRoutines.replacementContract.frontendRoutineArtifactSmoke",
 				"content.projectRoutines.replacementContract.fullTSRoutineArtifactParity",
 				"content.projectSkills.supported",
+				"content.projectSkills.replacementContract.projectSkillWriteRoutesProof",
 				"content.projectSkills.replacementContract.replacementSafe",
 				"content.projectSkills.replacementContract.symlinkPathEdgeSmoke",
 				"content.projectSkills.replacementContract.companionDepthCountBreadth",
@@ -307,7 +308,15 @@
 				"go_backend/internal/chapters/service_merge_parity_test.go::TestDeleteChapterRecentTabsCleanupFailureIsNonFatal",
 				"go_backend/internal/chapters/terminal_lifecycle_test.go",
 				"frontend/hooks/useChapters.test.ts",
-				"go_backend/testtools/ts-go-api-contract-diff.ts::chapterDeleteFixture"
+				"go_backend/testtools/ts-go-api-contract-diff.ts::chapterDeleteFixture",
+				"go_backend/internal/app/route_contract_test.go::TestDependencyInstallRejectsUnknownNameWith400",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::dependencyInstallUnknownName",
+				"go_backend/internal/simplecontent/skills_routines_parity_test.go::TestPutGlobalPromptDefaultsToFirstExistingCandidate",
+				"go_backend/internal/simplecontent/skills_routines_parity_test.go::TestProjectSkillScanIsLiveAndReflectsNewlyAddedSkills",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::projectSkillWriteCreate",
+				"go_backend/internal/simplecontent/skills_routines_parity_test.go::TestProjectSkillWriteRoutesMatchTSStatusAndSideEffects",
+				"go_backend/internal/narrators/handlers_patches_test.go::TestNarratorSkillsRouteReturnsContextScopedSummaries",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::narratorSkillsContext"
 			]
 		},
 		{
@@ -371,7 +380,8 @@
 				"ruler-airesolve-fallback-payload-contract",
 				"ruler-mutation-lifecycle-db-git-graph-focused-proof",
 				"ts-go-ruler-merge-lifecycle-db-git-graph-diff",
-				"ruler-temp-chapter-ai-fallback-contract"
+				"ruler-temp-chapter-ai-fallback-contract",
+				"ruler-merge-strategy-message-zod-bounds"
 			],
 			"knownGaps": [
 				"Wave 264 closes the remaining Ruler merge mutation-lifecycle TS-Go DB/Git/graph diff proof by adding a dedicated /api/projects/{id}/ruler/merge fixture to the shared contract harness. The fixture samples response normalization, source merged fields, target head/count, merge-edge metadata, source branch state, worktree cleanup, target file state, and project graph visibility across TypeScript and Go. Wave 263 makes the remaining temp-chapter AI gap an explicit fallback contract: health and Ruler AI responses expose unsupported-one-shot-fallback mode, merge.aiResolveOneShotBasic fallback code, requires-narrator false, no preserved temp chapter, and a proof id without claiming TypeScript temp-chapter parity. Wave 262 adds a focused Go DB/Git/graph lifecycle proof for Ruler-delegated merge. Ruler replacement remains unsafe until true temp-chapter AI conflict resolution and full TS Ruler lifecycle parity are implemented or explicitly accepted as product deferrals."
@@ -384,9 +394,11 @@
 				"go_backend/internal/misccompat/ruler_parity_test.go::TestRulerMergeAIResolveResponsesExposeFallbackContract",
 				"go_backend/internal/chapters/service_merge_parity_test.go::TestRulerMergeLifecycleDBGitGraphProof",
 				"go_backend/internal/misccompat/ruler_parity_test.go::TestRulerRebaseConflictPromptMatchesTypeScriptLocaleContract",
+				"go_backend/internal/misccompat/routes_test.go::TestRulerMergeRejectsInvalidStrategyAndOverlongMessage",
 				"go_backend/testtools/ts-go-api-contract-diff.ts::rulerSegmentSummary",
 				"go_backend/testtools/ts-go-api-contract-diff.ts::rulerPositionsValid",
 				"go_backend/testtools/ts-go-api-contract-diff.ts::rulerMergeFixture",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::rulerMergeInvalidStrategy",
 				"frontend/components/ruler/RulerFlow.test.tsx"
 			]
 		},
@@ -653,7 +665,14 @@
 				"dependency-event-bus-and-project-db-sync-parity",
 				"chapter-create-settings-rollback-event-commit-sync-parity",
 				"chapter-aggregate-frontend-graph-refresh-no-crash",
-				"chapter-aggregate-ts-go-db-git-fs-diff-suite"
+				"chapter-aggregate-ts-go-db-git-fs-diff-suite",
+				"chapter-create-projectid-title-description-zod-bounds",
+				"chapter-fork-role-inheritmode-title-crossoffset-zod-bounds",
+				"chapter-merge-message-zod-bound",
+				"chapter-review-locale-title-crossoffset-zod-bounds",
+				"chapter-batch-fork-count-bounds-go-extension",
+				"chapter-cherry-pick-source-commitshas-zod-bounds-go-extension",
+				"chapter-update-status-role-color-grouplabel-containerconfig-zod-bounds"
 			],
 			"knownFallbacks": [
 				"chapters.replacementContract.dormantWakeRealRuntimeSmoke=false",
@@ -701,8 +720,11 @@
 				"go_backend/internal/chapteredges",
 				"go_backend/internal/misccompat",
 				"go_backend/internal/narrators",
-				"go_backend/internal/chapters/batch_merge_test.go::TestBatchMergeHandlerStartAndSessionRoutes",
-				"go_backend/testtools/ts-go-api-contract-diff.ts::chapterBatchMergeFixtureSession"
+				"go_backend/internal/chapters/batch_merge_test.go::TestBatchMergeRouteReturnsAsyncSessionContractAndSessionEndpoint",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::chapterBatchMergeFixtureSession",
+				"go_backend/internal/chapters/route_contract_test.go::TestChapterCriticalRoutesExposeValidationContracts",
+				"go_backend/internal/chapters/service_json_test.go::TestChapterUpdateValidatesZodBoundsLikeTypeScript",
+				"go_backend/testtools/ts-go-api-contract-diff.ts::chapterUpdateInvalidStatus"
 			]
 		},
 		{
@@ -835,7 +857,17 @@
 				"narrator.advancedObservabilityContract.replacementContract.providerSpecificLiveSmoke",
 				"narrator.advancedObservabilityContract.replacementContract.longSessionTSCreatedFixtureSmoke",
 				"narrator.advancedObservabilityContract.replacementContract.foregroundToolProgressParity",
-				"narrator.advancedObservabilityContract.replacementContract.activeRunReconnectSmoke"
+				"narrator.advancedObservabilityContract.replacementContract.activeRunReconnectSmoke",
+				"narrator.dangerReflectionClassification.severityBehaviorParity",
+				"narrator.dangerReflectionClassification.bashUncertainSeverity",
+				"narrator.dangerReflectionClassification.bashDangerousSeverity",
+				"narrator.dangerReflectionClassification.emitsStartedEvent",
+				"narrator.dangerReflectionClassification.emitsResolvedEvent",
+				"narrator.dangerReflectionClassification.interactiveStopEvent",
+				"narrator.dangerReflectionClassification.stopReflectionRoute",
+				"narrator.dangerReflectionClassification.stopReflectionEmits",
+				"narrator.dangerReflectionClassification.stopReflectionParity",
+				"narrator.dangerReflectionClassification.resolvedDecisions"
 			],
 			"sampledProofs": [
 				"structured-content-message-history",
@@ -855,6 +887,7 @@
 			"tests": [
 				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
 				"go_backend/internal/narrators",
+				"go_backend/internal/narrators/permission_test.go::TestDangerReflectionClassifiesRepresentativeToolCalls",
 				"go_backend/internal/ws",
 				"go_backend/internal/agentbasic"
 			]
@@ -1016,7 +1049,11 @@
 				"narrator.agentRuntime.providerPrefixSwitch",
 				"narrator.agentRuntime.defaultModelReResolve",
 				"narrator.agentRuntime.unsupportedProviderFailFast",
-				"narrator.agentRuntime.fullSessionMiddlewareParity"
+				"narrator.agentRuntime.fullSessionMiddlewareParity",
+				"narrator.agentRuntime.aggregationRouting.supported",
+				"narrator.agentRuntime.aggregationRouting.skipsDisabledProviders",
+				"narrator.agentRuntime.aggregationRouting.honorsPerProviderDisabledFlag",
+				"narrator.agentRuntime.aggregationRouting.balancedRoundRobin"
 			],
 			"features": [
 				"before-turn history replacement",
@@ -1026,7 +1063,8 @@
 				"provider prefix switch before follow-up provider request",
 				"default-model re-resolution before follow-up provider request",
 				"unsupported provider fail-fast by default",
-				"model_switched broadcast"
+				"model_switched broadcast",
+				"aggregation routing skips disabled providers (agent.disabledProviders + per-provider disabled flag) with priority/balanced round-robin"
 			],
 			"knownGaps": [
 				"provider-change edge cases beyond the OpenAI-compatible prefix switch fixture",
@@ -1040,6 +1078,8 @@
 				"go_backend/internal/agentbasic/agent_loop_test.go::TestRuntimeSettingsOverrideSwitchesModelAndReasoningBeforeNextTurn",
 				"go_backend/internal/agentbasic/openai_test.go::TestResolveProviderRejectsUnsupportedKiroFallbackUnlessExplicitlyAllowed",
 				"go_backend/internal/agentbasic/openai_test.go::TestResolveProviderFallsBackFromUnsupportedKiroToConfiguredOpenAIWhenOptedIn",
+				"go_backend/internal/agentbasic/openai_test.go::TestResolveAggregationSkipsDisabledProviderMembers",
+				"go_backend/internal/agentbasic/openai_test.go::TestResolveAggregationBalancedModeRoundRobinsEnabledMembers",
 				"go_backend/internal/narrators/agent_event_integration_test.go::TestRunBasicAgentAppliesRuntimeModelReasoningAndSystemPromptBeforeNextRequest",
 				"go_backend/internal/narrators/agent_event_integration_test.go::TestRunBasicAgentCanSwitchProviderPrefixBeforeFollowUpRequest",
 				"go_backend/internal/narrators/agent_event_integration_test.go::TestRunBasicAgentReResolvesDefaultModelBeforeFollowUpRequest",
@@ -1691,7 +1731,9 @@
 				"storage.replacementContract.fullTSStorageCleanupParity",
 				"storage.replacementContract.fullTSDatabaseMaintenanceParity",
 				"storage.replacementContract.storageCacheInvalidationParity",
-				"storage.replacementContract.replacementSafe"
+				"storage.replacementContract.replacementSafe",
+				"storage.database.requestContract.goSampleLimitMaxEnforced",
+				"storage.database.requestContract.goOlderThanDaysMaxEnforced"
 			],
 			"sampledProofs": [
 				"storage-scan-sse-order-contract",
@@ -1703,7 +1745,8 @@
 				"ts-go-storage-cleanup-invalid-target-smoke",
 				"storage-cleanup-cache-invalidation-smoke",
 				"storage-database-cleanup-cache-invalidation-smoke",
-				"ts-go-storage-cache-invalidation-flow-smoke"
+				"ts-go-storage-cache-invalidation-flow-smoke",
+				"ts-go-storage-database-validation-bounds-smoke"
 			],
 			"knownFallbacks": [
 				"storage.cleanup.worktrees.supported=false",
@@ -1718,7 +1761,7 @@
 				"storage.replacementContract.replacementSafe=false"
 			],
 			"knownGaps": [
-				"Wave 277 adds a shared TS-Go storage cache-invalidation flow: both backends run /api/storage/scan to completion (cached:true), then prove supported upload cleanup and apiRequestDumps database cleanup each return the cached scan result to cached:false. Wave 276 had already added the Go-side cache invalidation plus focused tests, and Wave 275 added the shared upload/share cleanup response smoke. Go still keeps storage worktree/container cleanup disabled or rerouted, staleSessions cleanup disabled behind archived-only policy, request-path VACUUM disabled, full cache invalidation parity across unsupported TS cleanup targets false, and broader storage-service runtime smoke unproven."
+				"Wave 281 enforces the TypeScript Zod database preview/cleanup bounds in Go (olderThanDays positive <=3650, sampleLimit 0..25) returning 400 on violation, flipping storage.database.requestContract.goSampleLimitMaxEnforced/goOlderThanDaysMaxEnforced true with a shared ts-go-storage-database-validation-bounds-smoke. Wave 277 adds a shared TS-Go storage cache-invalidation flow: both backends run /api/storage/scan to completion (cached:true), then prove supported upload cleanup and apiRequestDumps database cleanup each return the cached scan result to cached:false. Wave 276 had already added the Go-side cache invalidation plus focused tests, and Wave 275 added the shared upload/share cleanup response smoke. Go still keeps storage worktree/container cleanup disabled or rerouted, staleSessions cleanup disabled behind archived-only policy, request-path VACUUM disabled, full cache invalidation parity across unsupported TS cleanup targets false, and broader storage-service runtime smoke unproven."
 			],
 			"frontendConsumerPolicy": "Storage UI must use health capabilities for cleanup targets. Upload/share cleanup can use the compatible Go route subset, but worktree/container cleanup, staleSessions cleanup, and VACUUM/compaction must stay disabled or routed to explicit runtime/maintenance flows until product decisions or equivalent implementations land.",
 			"sideEffectPolicy": "Supported upload/share cleanup and supported database cleanup clear the storage scan cache after successful mutation, and a shared TS-Go scan->cleanup->cached flow proves both backends invalidate identically for the supported subset. Unsupported worktree/container/stale-session/VACUUM paths remain non-mutating fallback/disabled paths and must not imply TS-equivalent destructive cleanup, Podman prune, git worktree deletion, or request-path SQLite compaction.",
@@ -1726,11 +1769,13 @@
 				"go_backend/testtools/ts-go-api-contract-diff.ts::storageCleanupUploads/storageCleanupShares/storageCleanupInvalidTarget",
 				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
 				"go_backend/internal/app/router_test.go::TestHealthExposesVersionCommitAndRuntimeCapabilities",
-				"go_backend/internal/misccompat/routes_test.go::TestStorageCleanupUnsupportedTargetsReturnStableFallbackWithoutMutation",
+				"go_backend/internal/misccompat/routes_test.go::TestStorageCleanupUnsupportedTargetsDoNotFakeSuccessOrMutate",
 				"go_backend/internal/misccompat/share_security_test.go::TestCleanupSharesClearsMemoryAndDisk",
 				"go_backend/internal/misccompat/routes_test.go::TestStorageCleanupInvalidatesCompletedScanCache",
 				"go_backend/internal/misccompat/routes_test.go::TestDatabaseCleanupInvalidatesStorageScanCache",
-				"go_backend/testtools/ts-go-api-contract-diff.ts::storageCacheAfterScan/storageCacheAfterUploadCleanup/storageCacheAfterDatabaseCleanup"
+				"go_backend/testtools/ts-go-api-contract-diff.ts::storageCacheAfterScan/storageCacheAfterUploadCleanup/storageCacheAfterDatabaseCleanup",
+				"go_backend/internal/misccompat/routes_test.go::TestDatabaseCleanupPreviewRejectsOutOfRangeZodBounds",
+				"go_backend/internal/misccompat/routes_test.go::TestDatabaseCleanupRejectsOutOfRangeOlderThanDays"
 			]
 		},
 		{
@@ -1938,6 +1983,9 @@
 				"narrator.wsEvents.p0.events",
 				"narrator.wsEvents.p1.events",
 				"narrator.wsEvents.p1.mode",
+				"narrator.wsClientMessageBounds.bufferMessageTextMaxChars",
+				"narrator.wsClientMessageBounds.updateBufferTextBounds",
+				"narrator.wsClientMessageBounds.updateTimeoutMsBounds",
 				"narrator.wsEvents.reconnect.supported",
 				"narrator.wsEvents.reconnect.streamingSnapshot",
 				"narrator.wsEvents.reconnect.queueStatusReplay",
@@ -1945,17 +1993,22 @@
 				"narrator.wsEvents.reconnect.snapshotBeforeCatchUp",
 				"narrator.wsEvents.progress.backgroundTaskOutput",
 				"narrator.wsEvents.progress.fullTSToolProgress",
+				"narrator.wsEvents.imageGenerationStreaming.partialImageStreaming",
+				"narrator.wsEvents.imageGenerationStreaming.partialImageIndexField",
+				"narrator.wsEvents.imageGenerationStreaming.partialImageB64Field",
 				"narrator.wsEvents.unclaimedContract.supported",
 				"narrator.wsEvents.unclaimedContract.fullTSWSEventParity",
 				"narrator.wsEvents.unclaimedContract.tsGoLiveSessionSmoke",
 				"narrator.wsEvents.unclaimedContract.realReconnectUnderActiveRunSmoke",
 				"narrator.wsEvents.unclaimedContract.messageMutationEventSmoke",
 				"narrator.wsEvents.unclaimedContract.compactProgressEventSmoke",
+				"narrator.wsEvents.unclaimedContract.compactProgressEventName",
+				"narrator.wsEvents.unclaimedContract.claimedCompactLifecycleEvents",
 				"narrator.wsEvents.unclaimedContract.foregroundToolProgressSmoke",
 				"narrator.wsEvents.unclaimedContract.browserSessionCountSmoke",
 				"narrator.wsEvents.unclaimedContract.unclaimedFamilies"
 			],
-			"sideEffectPolicy": "Go narrator WS keeps TS-compatible duplicate frames for legacy/raw events, caches in-flight streaming blocks/tool chunks for reconnect streaming_snapshot, and replays cached queue_status / nkp_queue_status on subscribe before catch-up when a provider/gateway queue is active. Health exposes the P0 and P1 event-list contracts, reconnect sub-capability, wsEvents.progress (backgroundTaskOutput=true, fullTSToolProgress=false), and Wave 93's unclaimedContract so frontend/runtime gates do not infer broader live-stream, foreground tool-progress, message mutation, compact progress, browser/session/container, or active-run reconnect parity from the current P0/P1 lists.",
+			"sideEffectPolicy": "Go narrator WS keeps TS-compatible duplicate frames for legacy/raw events, caches in-flight streaming blocks/tool chunks for reconnect streaming_snapshot, and replays cached queue_status / nkp_queue_status on subscribe before catch-up when a provider/gateway queue is active. Health exposes the P0 and P1 event-list contracts, reconnect sub-capability, wsEvents.progress (backgroundTaskOutput=true, fullTSToolProgress=false), and the corrected unclaimedContract: compact_progress was a phantom label, while actual TS/frontend compact lifecycle events compacting/compact_done/compact_failed are claimed; foreground tool progress, long-running output, broader reflection families, and active-run reconnect remain explicit gaps.",
 			"phase2RequiredEvents": [
 				"message",
 				"user_message",
@@ -1997,7 +2050,10 @@
 				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
 				"go_backend/internal/ws/frontend_contract_smoke_test.go",
 				"go_backend/internal/ws/hub_test.go",
-				"go_backend/internal/ws/hub_narrator_events_test.go"
+				"go_backend/internal/ws/hub_narrator_events_test.go",
+				"go_backend/internal/ws/hub_narrator_client_messages_test.go::TestNarratorWSMessageBoundsRejectOutOfRangeValues",
+				"go_backend/internal/agentbasic/provider_openai_responses_test.go::TestResponsesImageGenerationPartialStreamingFieldsParity",
+				"go_backend/internal/narrators/agent_event_frontend_contract_test.go::TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields"
 			]
 		},
 		{
@@ -2013,6 +2069,11 @@
 				"terminal.ws.subscribeReplayEvents",
 				"terminal.ws.snapshotFallback.code",
 				"terminal.ws.resizeScope",
+				"terminal.ws.clientMessageBounds.inputValidationParity",
+				"terminal.ws.clientMessageBounds.resizeColsBounds",
+				"terminal.ws.clientMessageBounds.resizeRowsBounds",
+				"terminal.ws.clientMessageBounds.createNameMaxChars",
+				"terminal.ws.clientMessageBounds.renameNameBounds",
 				"terminal.replayContract.mode",
 				"terminal.replayContract.tsXtermHeadlessParity",
 				"terminal.replayContract.xtermSerializedStateKeys",
@@ -2080,6 +2141,7 @@
 			"tests": [
 				"go_backend/internal/ws/frontend_contract_smoke_test.go",
 				"go_backend/internal/ws/hub_terminal_test.go",
+				"go_backend/internal/ws/hub_terminal_test.go::TestTerminalWSCreateResizeRenameBoundsRejectOutOfRange",
 				"go_backend/internal/terminalruntime/manager_test.go::TestSnapshotUsesRawCappedReplayWithoutXtermSerializedState",
 				"go_backend/internal/app/route_contract_test.go"
 			]

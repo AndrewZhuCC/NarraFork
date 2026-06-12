@@ -74,6 +74,49 @@ func TestNarratorBufferClientMessagesBroadcastBufferState(t *testing.T) {
 	}
 }
 
+func TestNarratorWSMessageBoundsRejectOutOfRangeValues(t *testing.T) {
+	sqlDB := openNarratorWSDB(t)
+	hub := ws.NewHub()
+	hub.SetTerminalDB(sqlDB)
+
+	conn, cleanup := dialNarratorHub(t, hub)
+	defer cleanup()
+	subscribeNarrator(t, conn, "nar_bounds")
+	waitForNarratorSubscription(t, hub, conn, "nar_bounds")
+
+	overlong := make([]byte, 100_001)
+	for i := range overlong {
+		overlong[i] = 'x'
+	}
+
+	// buffer_message text max 100000.
+	if err := conn.WriteJSON(map[string]any{"type": "buffer_message", "narratorId": "nar_bounds", "text": string(overlong)}); err != nil {
+		t.Fatalf("write overlong buffer_message: %v", err)
+	}
+	msg := readWSMessage(t, conn)
+	if msg["type"] != "error" || msg["message"] != "text must be at most 100000 characters" {
+		t.Fatalf("expected buffer_message length error, got %#v", msg)
+	}
+
+	// update_timeout timeoutMs below the 1000 lower bound.
+	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeoutMs": 500}); err != nil {
+		t.Fatalf("write small update_timeout: %v", err)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "error" || msg["message"] != "timeoutMs must be between 1000 and 86400000" {
+		t.Fatalf("expected update_timeout lower-bound error, got %#v", msg)
+	}
+
+	// update_timeout timeoutMs above the 86400000 upper bound.
+	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeoutMs": 90_000_000}); err != nil {
+		t.Fatalf("write large update_timeout: %v", err)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "error" || msg["message"] != "timeoutMs must be between 1000 and 86400000" {
+		t.Fatalf("expected update_timeout upper-bound error, got %#v", msg)
+	}
+}
+
 func TestNarratorBufferLoadToolSlashUpdatesEnabledTools(t *testing.T) {
 	sqlDB := openNarratorWSDB(t)
 	ensureWSOptionalToolSchema(t, sqlDB)
@@ -256,14 +299,14 @@ func TestNarratorStatsAndTimeoutClientMessages(t *testing.T) {
 		t.Fatalf("expected output_stats unsubscribe ack, got %#v", msg)
 	}
 
-	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeout": 123}); err != nil {
+	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeout": 60000}); err != nil {
 		t.Fatalf("write update_timeout: %v", err)
 	}
 	msg = readWSMessage(t, conn)
 	if msg["type"] == "error" && msg["message"] == "Unknown or unsupported WebSocket message type" {
 		t.Fatalf("update_timeout returned unsupported: %#v", msg)
 	}
-	if msg["type"] != "timeout_updated" || msg["toolUseId"] != "tool_1" || msg["timeout"] != float64(123) {
+	if msg["type"] != "timeout_updated" || msg["toolUseId"] != "tool_1" || msg["timeout"] != float64(60000) {
 		t.Fatalf("expected timeout_updated, got %#v", msg)
 	}
 
@@ -275,7 +318,7 @@ func TestNarratorStatsAndTimeoutClientMessages(t *testing.T) {
 	if err := json.Unmarshal([]byte(inputRaw), &input); err != nil {
 		t.Fatalf("decode input_json: %v", err)
 	}
-	if input["existing"] != true || input["timeout"] != float64(123) {
+	if input["existing"] != true || input["timeout"] != float64(60000) {
 		t.Fatalf("timeout update did not preserve input object: %#v", input)
 	}
 }

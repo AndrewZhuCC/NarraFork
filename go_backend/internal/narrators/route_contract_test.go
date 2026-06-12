@@ -933,3 +933,44 @@ func TestSubagentDetachAttachRoutesExposeParentBlockingStatus(t *testing.T) {
 		t.Fatalf("unexpected attach stale recovery payload: %#v", attached)
 	}
 }
+
+func TestValidateCreateRequestEnforcesCwdAndOtherZodBounds(t *testing.T) {
+	overlong := strings.Repeat("x", 4097)
+	emptyCwd := ""
+	longCwd := overlong
+	longPrompt := strings.Repeat("p", 10001)
+	badEffort := "extreme"
+	cases := []struct {
+		name string
+		req  createRequest
+		want string
+	}{
+		{name: "empty cwd", req: createRequest{Cwd: &emptyCwd}, want: "cwd must not be empty"},
+		{name: "overlong cwd", req: createRequest{Cwd: &longCwd}, want: "cwd must be at most 4096 characters"},
+		{name: "overlong systemPrompt", req: createRequest{SystemPrompt: &longPrompt}, want: "systemPrompt must be at most 10000 characters"},
+		{name: "invalid reasoningEffort", req: createRequest{ReasoningEffort: &badEffort}, want: "reasoningEffort must be one of"},
+		{name: "invalid planReflection override", req: createRequest{PlanReflectionAutoApproveOverride: "maybe"}, want: "planReflectionAutoApproveOverride must be inherit, on, or off"},
+		{name: "invalid dangerReflection override", req: createRequest{DangerReflectionOverride: "extreme"}, want: "dangerReflectionOverride must be inherit, on, off, light, standard, or strict"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCreateRequest(tc.req)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("expected %q validation error, got %v", tc.want, err)
+			}
+		})
+	}
+
+	validCwd := "/workspace/project"
+	validPrompt := "You are helpful"
+	validEffort := "high"
+	if err := validateCreateRequest(createRequest{
+		Cwd:                               &validCwd,
+		SystemPrompt:                      &validPrompt,
+		ReasoningEffort:                   &validEffort,
+		PlanReflectionAutoApproveOverride: "inherit",
+		DangerReflectionOverride:          "strict",
+	}); err != nil {
+		t.Fatalf("valid create request should pass, got %v", err)
+	}
+}

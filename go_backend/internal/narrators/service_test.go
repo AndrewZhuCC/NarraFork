@@ -832,6 +832,14 @@ func TestReflectionDecisionFromToolCall(t *testing.T) {
 	if decision.Action != "revise" || decision.Feedback == "" {
 		t.Fatalf("expected exit plan revise decision, got %#v", decision)
 	}
+	// Go always routes ExitPlanMode through explicit user approval after readiness reflection
+	// and does not implement the TypeScript planReflectionAutoApprove skip path, so the
+	// auto-compact reflection tool (ExitPlanConfirmAndCompact / confirm_compact) is intentionally
+	// not a recognized reflection action. User-driven compactAfter is handled at approval time.
+	decision, output = reflectionDecisionFromToolCall("ExitPlanConfirmAndCompact", `{"confirm":true,"reflection":"reset context"}`)
+	if decision.Action != "" || !strings.Contains(output, "not supported") {
+		t.Fatalf("expected ExitPlanConfirmAndCompact to be unsupported by the reflection loop, got %#v output=%q", decision, output)
+	}
 	decision, output = reflectionDecisionFromToolCall("GoalCompleteConfirm", `{"confirm":false,"evidence":"Verified tests passed and schema stayed untouched."}`)
 	if decision.Action != "" || output == "" {
 		t.Fatalf("expected invalid decision without confirm=true, got %#v output=%q", decision, output)

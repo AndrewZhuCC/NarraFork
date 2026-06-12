@@ -32,6 +32,13 @@ type deleteMessageBlockResult struct {
 type copyOnWriteOverrides struct {
 	ContentText *string
 	ContentJSON any
+	// EditedAt/EditedBy/OriginalContentJSON support display-only assistant message
+	// edits (migration 0042). A non-nil pointer means "set this column"; the inner
+	// pointer/value may itself be nil to write SQL NULL.
+	EditedAt            *string
+	EditedBy            **string
+	OriginalContentJSON *any
+	SetEditMetadata     bool
 }
 
 type editAndRegenerateResult struct {
@@ -45,6 +52,9 @@ type editAndRegenerateResult struct {
 type storedMessageForMutation struct {
 	Message
 	RawContentJSON string
+	// OriginalContentRaw is the raw JSON of original_content_json, preserved so
+	// copy-on-write re-inserts can carry the first-edit snapshot forward verbatim.
+	OriginalContentRaw *string
 }
 
 type optionalNarratorTables struct {
@@ -407,7 +417,19 @@ func (s *Service) copyOnWriteMessage(ctx context.Context, narratorID, messageID 
 		if overrides.ContentText != nil {
 			contentText = overrides.ContentText
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE narrator_messages SET content_json = ?, content_text = ? WHERE id = ?`, string(data), nullableStringPtr(contentText), messageID); err != nil {
+		setClauses := []string{"content_json = ?", "content_text = ?"}
+		args := []any{string(data), nullableStringPtr(contentText)}
+		if overrides.SetEditMetadata {
+			setClauses = append(setClauses, "edited_at = ?", "edited_by = ?")
+			args = append(args, nullableStringPtr(overrides.EditedAt))
+			args = append(args, editedByArg(overrides.EditedBy))
+			if overrides.OriginalContentJSON != nil {
+				setClauses = append(setClauses, "original_content_json = ?")
+				args = append(args, originalContentJSONArg(*overrides.OriginalContentJSON))
+			}
+		}
+		args = append(args, messageID)
+		if _, err := tx.ExecContext(ctx, `UPDATE narrator_messages SET `+strings.Join(setClauses, ", ")+` WHERE id = ?`, args...); err != nil {
 			return "", err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE narrators SET message_version = message_version + 1, updated_at = ? WHERE id = ?`, db.NowISO(), narratorID); err != nil {
@@ -431,7 +453,23 @@ func (s *Service) copyMessageForNarratorTx(ctx context.Context, tx *sql.Tx, narr
 	if overrides.ContentText != nil {
 		contentText = overrides.ContentText
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_messages (id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, newID, narratorID, nullableStringPtr(message.MessageUUID), nullableStringPtr(message.ParentToolUseID), message.Role, string(contentData), nullableStringPtr(contentText), nullableStringPtr(message.Model), nullableStringPtr(message.CommitSHA), nullableStringPtr(message.CommandText), nullableStringPtr(message.CreatedBy), message.CreatedAt); err != nil {
+	var editedAtArg, editedByVal, originalContentArg any
+	if overrides.SetEditMetadata {
+		editedAtArg = nullableStringPtr(overrides.EditedAt)
+		editedByVal = editedByArg(overrides.EditedBy)
+		if overrides.OriginalContentJSON != nil {
+			originalContentArg = originalContentJSONArg(*overrides.OriginalContentJSON)
+		} else {
+			// Preserve the existing original content when the caller does not
+			// explicitly override it (e.g. re-editing an already-edited message).
+			originalContentArg = nullableStringPtr(message.OriginalContentRaw)
+		}
+	} else {
+		editedAtArg = nullableStringPtr(message.EditedAt)
+		editedByVal = nullableStringPtr(message.EditedBy)
+		originalContentArg = nullableStringPtr(message.OriginalContentRaw)
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO narrator_messages (id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, newID, narratorID, nullableStringPtr(message.MessageUUID), nullableStringPtr(message.ParentToolUseID), message.Role, string(contentData), nullableStringPtr(contentText), nullableStringPtr(message.Model), nullableStringPtr(message.CommitSHA), nullableStringPtr(message.CommandText), nullableStringPtr(message.CreatedBy), editedAtArg, editedByVal, originalContentArg, message.CreatedAt); err != nil {
 		return "", err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE narrator_message_refs SET message_id = ? WHERE narrator_id = ? AND message_id = ?`, newID, narratorID, message.ID); err != nil {
@@ -471,7 +509,7 @@ func (s *Service) copyToolCallsForMessageTx(ctx context.Context, tx *sql.Tx, nar
 }
 
 func (s *Service) messageForNarratorRef(ctx context.Context, narratorID, messageID string) (storedMessageForMutation, error) {
-	row := s.DB.QueryRowContext(ctx, `SELECT m.id, m.narrator_id, m.sdk_message_uuid, m.parent_tool_use_id, m.role, COALESCE(m.content_json, '[]'), m.content_text, m.model, m.commit_sha, m.command_text, m.created_by, m.created_at, r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? AND r.message_id = ?`, narratorID, messageID)
+	row := s.DB.QueryRowContext(ctx, `SELECT m.id, m.narrator_id, m.sdk_message_uuid, m.parent_tool_use_id, m.role, COALESCE(m.content_json, '[]'), m.content_text, m.model, m.commit_sha, m.command_text, m.created_by, m.edited_at, m.edited_by, m.original_content_json, m.created_at, r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ? AND r.message_id = ?`, narratorID, messageID)
 	msg, err := scanMessage(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -485,7 +523,13 @@ func (s *Service) messageForNarratorRef(ctx context.Context, narratorID, message
 	}
 	msg.ToolCalls = calls
 	raw, _ := json.Marshal(msg.ContentJSON)
-	return storedMessageForMutation{Message: msg, RawContentJSON: string(raw)}, nil
+	stored := storedMessageForMutation{Message: msg, RawContentJSON: string(raw)}
+	if msg.OriginalContentJSON != nil {
+		originalRaw, _ := json.Marshal(msg.OriginalContentJSON)
+		text := string(originalRaw)
+		stored.OriginalContentRaw = &text
+	}
+	return stored, nil
 }
 
 func (s *Service) messageSharedByMultipleNarrators(ctx context.Context, messageID string) (bool, error) {
@@ -859,6 +903,100 @@ func buildEditedUserContentJSON(contentJSON any, newContent string, fallbackUplo
 		newBlocks = append(newBlocks, map[string]any{"type": "text", "text": newContent})
 	}
 	return newBlocks
+}
+
+// buildEditedAssistantContentJSON mirrors the TypeScript buildEditedAssistantContentJson:
+// replace the first text block with the edited text, drop any additional text blocks
+// (the single-textarea edit consolidates text), and preserve all non-text blocks.
+func buildEditedAssistantContentJSON(contentJSON any, newContent string) []map[string]any {
+	blocks := messageContentBlocks(contentJSON)
+	newBlocks := []map[string]any{}
+	replacedText := false
+	for _, block := range blocks {
+		if stringFromAny(block["type"]) == "text" {
+			if !replacedText {
+				updated := map[string]any{}
+				for k, v := range block {
+					updated[k] = v
+				}
+				updated["text"] = newContent
+				newBlocks = append(newBlocks, updated)
+				replacedText = true
+			}
+			continue
+		}
+		newBlocks = append(newBlocks, block)
+	}
+	if !replacedText {
+		newBlocks = append(newBlocks, map[string]any{"type": "text", "text": newContent})
+	}
+	return newBlocks
+}
+
+func editedByArg(editedBy **string) any {
+	if editedBy == nil {
+		return nil
+	}
+	return nullableStringPtr(*editedBy)
+}
+
+func originalContentJSONArg(original any) any {
+	if original == nil {
+		return nil
+	}
+	if s, ok := original.(string); ok {
+		return s
+	}
+	data, err := json.Marshal(original)
+	if err != nil {
+		return nil
+	}
+	return string(data)
+}
+
+// EditAssistantMessage edits the displayed text of an assistant message without
+// truncating following messages or re-running the agent. The edit metadata
+// (edited_at / edited_by / original_content_json) lives on the message row and is
+// never sent to the AI provider. Shared messages are copy-on-write protected.
+func (s *Service) EditAssistantMessage(ctx context.Context, narratorID, messageID, newContent string, editedBy *string) (Message, error) {
+	target, err := s.messageForNarratorRef(ctx, narratorID, messageID)
+	if err != nil {
+		return Message{}, err
+	}
+	if target.Role != "assistant" {
+		return Message{}, httpx.NotFound("Can only edit assistant messages")
+	}
+
+	newBlocks := buildEditedAssistantContentJSON(target.ContentJSON, newContent)
+	now := db.NowISO()
+	editedByPtr := editedBy
+	overrides := copyOnWriteOverrides{
+		ContentText:     &newContent,
+		ContentJSON:     newBlocks,
+		SetEditMetadata: true,
+		EditedAt:        &now,
+		EditedBy:        &editedByPtr,
+	}
+	// Preserve the original content the first time a message is edited so the
+	// front-end can always reveal the unedited version.
+	if target.EditedAt == nil {
+		original := any(target.RawContentJSON)
+		overrides.OriginalContentJSON = &original
+	}
+
+	privateMessageID, err := s.copyOnWriteMessage(ctx, narratorID, messageID, overrides)
+	if err != nil {
+		return Message{}, err
+	}
+	updated, err := s.messageForNarratorRef(ctx, narratorID, privateMessageID)
+	if err != nil {
+		return Message{}, err
+	}
+	s.broadcastMessageUpdated(ctx, narratorID, updated.Message)
+	if privateMessageID != messageID && s.Hub != nil {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "full_reload", "narratorId": narratorID})
+	}
+	return updated.Message, nil
 }
 
 func contentTextFromMapBlocks(blocks []map[string]any) string {

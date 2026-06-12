@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -414,7 +415,277 @@ func validateProjectChapterSettings(value any) (map[string]any, error) {
 		}
 		filtered[key] = item
 	}
+	// Mirror the TypeScript updateProjectSchema.chapterSettings Zod bounds so that
+	// nested arrays/objects are rejected with 400 before persistence, matching the
+	// settings-route policy validators.
+	if err := validateChapterSettingsCommands(filtered["commands"]); err != nil {
+		return nil, err
+	}
+	if err := validateChapterSettingsPathRules(filtered["whitelistDirs"], "whitelistDirs", true); err != nil {
+		return nil, err
+	}
+	if err := validateChapterSettingsPathRules(filtered["blacklistDirs"], "blacklistDirs", false); err != nil {
+		return nil, err
+	}
+	if err := validateChapterSettingsCommandRules(filtered["commandWhitelist"], "commandWhitelist", false); err != nil {
+		return nil, err
+	}
+	if err := validateChapterSettingsCommandRules(filtered["commandBlacklist"], "commandBlacklist", true); err != nil {
+		return nil, err
+	}
 	return filtered, nil
+}
+
+var chapterCommandNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+// validateChapterSettingsCommands mirrors z.array(commandSchema).max(100).
+func validateChapterSettingsCommands(value any) error {
+	if value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("chapterSettings.commands must be an array")
+	}
+	if len(items) > 100 {
+		return httpx.ValidationError("chapterSettings.commands must contain at most 100 items")
+	}
+	for i, item := range items {
+		path := "chapterSettings.commands[" + strconv.Itoa(i) + "]"
+		cmd, ok := item.(map[string]any)
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := chapterSettingsRequiredString(cmd, "name", path, 1, 50); err != nil {
+			return err
+		}
+		if name, _ := cmd["name"].(string); !chapterCommandNamePattern.MatchString(name) {
+			return httpx.ValidationError(path + ".name must contain only letters, numbers, hyphens, and underscores")
+		}
+		if err := chapterSettingsRequiredString(cmd, "prompt", path, 1, 400000); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalStringMax(cmd, "description", path, 500); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalBool(cmd, "runBashFirst", path); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalStringMax(cmd, "bashCommand", path, 400000); err != nil {
+			return err
+		}
+		if err := validateChapterSettingsCommandParams(cmd["params"], path); err != nil {
+			return err
+		}
+		if err := validateChapterSettingsModelOverride(cmd["modelOverride"], path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateChapterSettingsCommandParams(value any, parentPath string) error {
+	if value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError(parentPath + ".params must be an array")
+	}
+	if len(items) > 20 {
+		return httpx.ValidationError(parentPath + ".params must contain at most 20 items")
+	}
+	for i, item := range items {
+		path := parentPath + ".params[" + strconv.Itoa(i) + "]"
+		param, ok := item.(map[string]any)
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := chapterSettingsRequiredString(param, "name", path, 1, 50); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalStringMax(param, "description", path, 500); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalBool(param, "required", path); err != nil {
+			return err
+		}
+		if err := chapterSettingsOptionalStringMax(param, "defaultValue", path, 1000); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateChapterSettingsModelOverride(value any, parentPath string) error {
+	if value == nil {
+		return nil
+	}
+	override, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError(parentPath + ".modelOverride must be an object")
+	}
+	path := parentPath + ".modelOverride"
+	if err := chapterSettingsRequiredString(override, "model", path, 1, 100); err != nil {
+		return err
+	}
+	mode, ok := override["mode"].(string)
+	if !ok || (mode != "temporary" && mode != "permanent") {
+		return httpx.ValidationError(path + ".mode must be temporary or permanent")
+	}
+	return nil
+}
+
+// validateChapterSettingsPathRules mirrors z.array(whitelist/blacklistDirEntrySchema).max(50).
+func validateChapterSettingsPathRules(value any, key string, whitelist bool) error {
+	if value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("chapterSettings." + key + " must be an array")
+	}
+	if len(items) > 50 {
+		return httpx.ValidationError("chapterSettings." + key + " must contain at most 50 items")
+	}
+	for i, item := range items {
+		path := "chapterSettings." + key + "[" + strconv.Itoa(i) + "]"
+		rule, ok := item.(map[string]any)
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := chapterSettingsRequiredTrimmedString(rule, "path", path, 1, 4096); err != nil {
+			return err
+		}
+		if whitelist {
+			if err := chapterSettingsOptionalEnum(rule, "accessLevel", path, []string{"readOnly", "readWrite", "full"}); err != nil {
+				return err
+			}
+		} else {
+			if err := chapterSettingsOptionalEnum(rule, "denyLevel", path, []string{"denyWrite", "denyAll"}); err != nil {
+				return err
+			}
+		}
+		if err := chapterSettingsOptionalBool(rule, "enabled", path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateChapterSettingsCommandRules mirrors z.array(command(White|Black)listEntrySchema).max(50).
+func validateChapterSettingsCommandRules(value any, key string, includeDenyPrompt bool) error {
+	if value == nil {
+		return nil
+	}
+	items, ok := value.([]any)
+	if !ok {
+		return httpx.ValidationError("chapterSettings." + key + " must be an array")
+	}
+	if len(items) > 50 {
+		return httpx.ValidationError("chapterSettings." + key + " must contain at most 50 items")
+	}
+	for i, item := range items {
+		path := "chapterSettings." + key + "[" + strconv.Itoa(i) + "]"
+		rule, ok := item.(map[string]any)
+		if !ok {
+			return httpx.ValidationError(path + " must be an object")
+		}
+		if err := chapterSettingsRequiredTrimmedString(rule, "pattern", path, 1, 200); err != nil {
+			return err
+		}
+		if includeDenyPrompt {
+			if err := chapterSettingsOptionalStringMax(rule, "denyPrompt", path, 2000); err != nil {
+				return err
+			}
+		}
+		if err := chapterSettingsOptionalBool(rule, "enabled", path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func chapterSettingsRequiredString(item map[string]any, key, path string, minLen, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	count := utf8.RuneCountInString(text)
+	if count < minLen {
+		return httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if count > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func chapterSettingsRequiredTrimmedString(item map[string]any, key, path string, minLen, maxLen int) error {
+	value, ok := item[key]
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " is required")
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	text = strings.TrimSpace(text)
+	count := utf8.RuneCountInString(text)
+	if count < minLen {
+		return httpx.ValidationError(path + "." + key + " must not be empty")
+	}
+	if count > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func chapterSettingsOptionalStringMax(item map[string]any, key, path string, maxLen int) error {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	if utf8.RuneCountInString(text) > maxLen {
+		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
+	}
+	return nil
+}
+
+func chapterSettingsOptionalBool(item map[string]any, key, path string) error {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return nil
+	}
+	if _, ok := value.(bool); !ok {
+		return httpx.ValidationError(path + "." + key + " must be a boolean")
+	}
+	return nil
+}
+
+func chapterSettingsOptionalEnum(item map[string]any, key, path string, allowed []string) error {
+	value, ok := item[key]
+	if !ok || value == nil {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return httpx.ValidationError(path + "." + key + " must be a string")
+	}
+	for _, candidate := range allowed {
+		if text == candidate {
+			return nil
+		}
+	}
+	return httpx.ValidationError(path + "." + key + " must be one of " + strings.Join(allowed, ", "))
 }
 
 func (s *Service) Delete(ctx context.Context, projectID string) (DeleteResult, error) {

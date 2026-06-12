@@ -451,7 +451,10 @@ type responsesStreamEvent struct {
 	Delta       string `json:"delta"`
 	ItemID      string `json:"item_id"`
 	OutputIndex *int   `json:"output_index"`
-	Response    struct {
+	// Present on response.image_generation_call.partial_image events.
+	PartialImageIndex *int   `json:"partial_image_index"`
+	PartialImageB64   string `json:"partial_image_b64"`
+	Response          struct {
 		ID                string           `json:"id"`
 		Usage             *openAIUsage     `json:"usage"`
 		Error             *apiErrorPayload `json:"error"`
@@ -693,8 +696,10 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 			emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "searching", parsed.OutputIndex)
 		case "response.web_search_call.completed":
 			emitResponsesWebSearchStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
-		case "response.image_generation_call.generating", "response.image_generation_call.partial_image":
+		case "response.image_generation_call.generating":
 			emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "generating", parsed.OutputIndex)
+		case "response.image_generation_call.partial_image":
+			emitResponsesImageGenerationPartial(ctx, out, parsed.ItemID, parsed.OutputIndex, parsed.PartialImageIndex, parsed.PartialImageB64)
 		case "response.image_generation_call.completed":
 			emitResponsesImageGenerationStatus(ctx, out, parsed.ItemID, "completed", parsed.OutputIndex)
 		case "response.function_call_arguments.delta":
@@ -1077,6 +1082,13 @@ func emitResponsesWebSearchStatus(ctx context.Context, out chan<- StreamEvent, i
 
 func emitResponsesImageGenerationStatus(ctx context.Context, out chan<- StreamEvent, idValue, status string, outputIndex *int) {
 	emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: idValue, Status: status, OutputIndex: outputIndex}, ResponsesAPI: true}})
+}
+
+// emitResponsesImageGenerationPartial mirrors the TypeScript
+// response.image_generation_call.partial_image handling: it emits a "generating"
+// status event that also carries the partial image index/base64 preview payload.
+func emitResponsesImageGenerationPartial(ctx context.Context, out chan<- StreamEvent, idValue string, outputIndex, partialIndex *int, partialB64 string) {
+	emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{ID: idValue, Status: "generating", OutputIndex: outputIndex, PartialImageIndex: partialIndex, PartialImageB64: partialB64}, ResponsesAPI: true}})
 }
 
 func responsesWebSearchQueryAndQueries(item *responsesOutputItem) (string, []string) {

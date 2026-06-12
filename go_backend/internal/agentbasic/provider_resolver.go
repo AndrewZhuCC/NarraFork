@@ -120,22 +120,88 @@ func parseAggregationModelValue(model string) (string, string, bool) {
 	return rest, "", true
 }
 
+// aggRoundRobin tracks the next index for balanced aggregation routing,
+// mirroring the in-memory counter used by the TypeScript backend.
+var (
+	aggRoundRobinMu sync.Mutex
+	aggRoundRobin   = map[string]int{}
+)
+
+// disabledProviderPrefixes mirrors TS getDisabledProviderPrefixes: it unions the
+// explicit agent.disabledProviders list with the prefixes of any provider record
+// that carries a per-provider disabled flag, so aggregation routing and model
+// resolution skip disabled providers consistently.
+func disabledProviderPrefixes(raw map[string]any) map[string]struct{} {
+	disabled := map[string]struct{}{}
+	agent, _ := raw["agent"].(map[string]any)
+	for _, item := range readArray(agent["disabledProviders"]) {
+		if prefix := strings.TrimSpace(stringValue(item)); prefix != "" {
+			disabled[prefix] = struct{}{}
+		}
+	}
+	for _, key := range []string{
+		"customApiProviders",
+		"openaiProviders",
+		"anthropicProviders",
+		"nkpProviders",
+		"nugProviders",
+		"clineProviders",
+	} {
+		for _, item := range readArray(raw[key]) {
+			provider, ok := item.(map[string]any)
+			if !ok || !boolValue(provider["disabled"]) {
+				continue
+			}
+			if prefix := strings.TrimSpace(stringValue(provider["prefix"])); prefix != "" {
+				disabled[prefix] = struct{}{}
+			}
+		}
+	}
+	return disabled
+}
+
+// isModelProviderDisabled reports whether the model's provider prefix resolves to
+// a disabled provider, matching the TS isModelProviderDisabled helper.
+func isModelProviderDisabled(disabled map[string]struct{}, model string) bool {
+	prefix, _ := splitModel(model)
+	if prefix == "" {
+		return false
+	}
+	_, found := disabled[prefix]
+	return found
+}
+
 func resolveAggregationFromRaw(raw map[string]any, aggID string) string {
 	aggID = strings.TrimSpace(aggID)
 	if aggID == "" {
 		return ""
 	}
 	agent, _ := raw["agent"].(map[string]any)
+	disabled := disabledProviderPrefixes(raw)
 	for _, item := range readArray(agent["modelAggregations"]) {
 		agg, ok := item.(map[string]any)
 		if !ok || strings.TrimSpace(stringValue(agg["id"])) != aggID {
 			continue
 		}
+		candidates := make([]string, 0, len(readArray(agg["models"])))
 		for _, model := range readArray(agg["models"]) {
-			if candidate := strings.TrimSpace(stringValue(model)); candidate != "" {
-				return candidate
+			candidate := strings.TrimSpace(stringValue(model))
+			if candidate == "" || isModelProviderDisabled(disabled, candidate) {
+				continue
 			}
+			candidates = append(candidates, candidate)
 		}
+		if len(candidates) == 0 {
+			return ""
+		}
+		if strings.EqualFold(strings.TrimSpace(stringValue(agg["routingMode"])), "balanced") {
+			aggRoundRobinMu.Lock()
+			idx := aggRoundRobin[aggID]
+			aggRoundRobin[aggID] = idx + 1
+			aggRoundRobinMu.Unlock()
+			return candidates[idx%len(candidates)]
+		}
+		return candidates[0]
 	}
 	return ""
 }

@@ -387,6 +387,33 @@ func (s *Service) Log(ctx context.Context, path string, limit int) ([]Commit, er
 	return s.LogRef(ctx, path, "", limit)
 }
 
+// LogPaged mirrors the TypeScript gitService.getLog pagination: it clamps limit to
+// 1..200 (default 50) and applies a non-negative `skip` offset via git log --skip.
+func (s *Service) LogPaged(ctx context.Context, path string, limit, skip int) ([]Commit, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	if skip < 0 {
+		skip = 0
+	}
+	format := "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI"
+	args := []string{"log", "--max-count", strconv.Itoa(limit), "--skip", strconv.Itoa(skip), "--pretty=format:" + format}
+	out, err := s.run(ctx, path, "git", args...)
+	if err != nil {
+		return nil, err
+	}
+	lines := splitLines(out)
+	commits := make([]Commit, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.Split(line, "\x1f")
+		if len(parts) < 6 {
+			continue
+		}
+		commits = append(commits, Commit{SHA: parts[0], ShortSHA: parts[1], Message: parts[2], Author: parts[3], AuthorName: parts[3], AuthorEmail: parts[4], Date: parts[5], AuthoredAt: parts[5]})
+	}
+	return commits, nil
+}
+
 func (s *Service) LogRef(ctx context.Context, path, ref string, limit int) ([]Commit, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 50

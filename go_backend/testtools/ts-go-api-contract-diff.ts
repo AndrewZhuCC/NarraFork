@@ -3240,6 +3240,47 @@ async function sampleStorageCacheInvalidationFlow(
 	};
 }
 
+// Wave 281: prove the storage database preview/cleanup Zod bounds reject
+// out-of-range olderThanDays/sampleLimit identically across TypeScript and Go.
+// TS uses z.coerce.number().int().positive().max(3650) for olderThanDays and
+// .min(0).max(25) for sampleLimit; both backends must return 400 on violation
+// and accept the in-range boundary values.
+async function sampleStorageDatabaseValidationBounds(
+	baseUrl: string,
+	token: string,
+): Promise<Record<string, JsonSample>> {
+	return {
+		dbPreviewOlderThanDaysTooLarge: await sampleJSON(
+			baseUrl,
+			"/api/storage/database/preview",
+			token,
+			{ method: "POST", body: { target: "apiRequestDumps", olderThanDays: 3651 } },
+		),
+		dbPreviewOlderThanDaysNonPositive: await sampleJSON(
+			baseUrl,
+			"/api/storage/database/preview",
+			token,
+			{ method: "POST", body: { target: "apiRequestDumps", olderThanDays: 0 } },
+		),
+		dbPreviewSampleLimitTooLarge: await sampleJSON(
+			baseUrl,
+			"/api/storage/database/preview",
+			token,
+			{ method: "POST", body: { target: "apiRequestDumps", sampleLimit: 26 } },
+		),
+		dbPreviewInRangeBounds: await sampleJSON(baseUrl, "/api/storage/database/preview", token, {
+			method: "POST",
+			body: { target: "apiRequestDumps", olderThanDays: 3650, sampleLimit: 25 },
+		}),
+		dbCleanupOlderThanDaysTooLarge: await sampleJSON(
+			baseUrl,
+			"/api/storage/database/cleanup",
+			token,
+			{ method: "POST", body: { target: "apiRequestDumps", olderThanDays: 3651 } },
+		),
+	};
+}
+
 async function waitClineBrowserAuthSideEffects(
 	baseUrl: string,
 	token: string,
@@ -3482,6 +3523,11 @@ async function collect(
 		token,
 	);
 	const gitLog = await sampleJSON(baseUrl, `${gitPanelBase}/log?limit=5`, token);
+	const gitLogSkipBeyondHistory = await sampleJSON(
+		baseUrl,
+		`${gitPanelBase}/log?limit=5&skip=1`,
+		token,
+	);
 	const gitStageAll = await sampleJSON(baseUrl, `${gitPanelBase}/stage`, token, {
 		method: "POST",
 		body: { all: true },
@@ -3668,6 +3714,62 @@ async function collect(
 		"/api/skills/global/missing/toggle",
 		token,
 		{ method: "POST", body: { enabled: true } },
+	);
+	// Wave 316: project-skill write routes (POST/PUT/DELETE /api/skills?projectId=...).
+	const projectSkillWriteBase = "/api/skills?projectId=p_search_fixture";
+	const projectSkillWriteCreate = await sampleJSON(baseUrl, projectSkillWriteBase, token, {
+		method: "POST",
+		body: {
+			name: "Write Contract Skill",
+			description: "Project write parity",
+			content: "Initial project write content.",
+		},
+	});
+	const projectSkillWritePath = "/api/skills/Write%20Contract%20Skill?projectId=p_search_fixture";
+	const projectSkillWriteDetailCreated = await sampleJSON(baseUrl, projectSkillWritePath, token);
+	const projectSkillWriteCreateDuplicate = await sampleJSON(baseUrl, projectSkillWriteBase, token, {
+		method: "POST",
+		body: {
+			name: "Write Contract Skill",
+			description: "Duplicate should fail",
+			content: "Duplicate project write content.",
+		},
+	});
+	const projectSkillWriteCreateOverlongName = await sampleJSON(
+		baseUrl,
+		projectSkillWriteBase,
+		token,
+		{
+			method: "POST",
+			body: { name: "n".repeat(101), description: "ok", content: "ok" },
+		},
+	);
+	const projectSkillWriteUpdateMissing = await sampleJSON(
+		baseUrl,
+		"/api/skills/missing?projectId=p_search_fixture",
+		token,
+		{ method: "PUT", body: { description: "x", content: "x" } },
+	);
+	const projectSkillWriteUpdateValid = await sampleJSON(baseUrl, projectSkillWritePath, token, {
+		method: "PUT",
+		body: {
+			description: "Updated project write parity",
+			content: "Updated project write content.",
+		},
+	});
+	const projectSkillWriteDeleteMissing = await sampleJSON(
+		baseUrl,
+		"/api/skills/missing?projectId=p_search_fixture",
+		token,
+		{ method: "DELETE" },
+	);
+	const projectSkillWriteDeleteValid = await sampleJSON(baseUrl, projectSkillWritePath, token, {
+		method: "DELETE",
+	});
+	const projectSkillWriteDetailAfterDelete = await sampleJSON(
+		baseUrl,
+		projectSkillWritePath,
+		token,
 	);
 	const customSubagentCreateValid = await sampleJSON(baseUrl, "/api/custom-subagents", token, {
 		method: "POST",
@@ -4105,6 +4207,7 @@ async function collect(
 			gitDiffTracked,
 			gitDiffUntracked,
 			gitLog,
+			gitLogSkipBeyondHistory,
 			gitStageAll,
 			gitUnstageAll,
 			gitDiscardTracked,
@@ -4352,6 +4455,75 @@ async function collect(
 				"/api/narrators/n_search_fixture/browser-sessions",
 				token,
 			),
+			narratorTitleOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/title",
+				token,
+				{ method: "PATCH", body: { title: "x".repeat(201) } },
+			),
+			narratorModelOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/model",
+				token,
+				{ method: "PATCH", body: { model: "m".repeat(201) } },
+			),
+			narratorCwdOverlong: await sampleJSON(baseUrl, "/api/narrators/n_search_fixture/cwd", token, {
+				method: "PATCH",
+				body: { cwd: "/c".repeat(2049) },
+			}),
+			narratorSkillsContext: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/skills",
+				token,
+			),
+			narratorDirPathOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/whitelist-dirs",
+				token,
+				{ method: "POST", body: { path: "/p".repeat(2049) } },
+			),
+			narratorCmdPatternOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/cmd-whitelist",
+				token,
+				{ method: "POST", body: { pattern: "x".repeat(201) } },
+			),
+			narratorDraftTextOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/draft",
+				token,
+				{ method: "PUT", body: { text: "t".repeat(100001) } },
+			),
+			narratorForkMissingUuid: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/fork",
+				token,
+				{ method: "POST", body: { title: "Fork" } },
+			),
+			narratorSuggestEmptyQuestions: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/suggest-answers",
+				token,
+				{ method: "POST", body: { questions: [] } },
+			),
+			narratorBufferTextOverlong: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/buffer/buf-missing",
+				token,
+				{ method: "PATCH", body: { text: "t".repeat(100001) } },
+			),
+			narratorReorderEmptyIds: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/buffer/reorder",
+				token,
+				{ method: "PUT", body: { orderedIds: [] } },
+			),
+			narratorSegmentCompactTooMany: await sampleJSON(
+				baseUrl,
+				"/api/narrators/n_search_fixture/segment-compact",
+				token,
+				{ method: "POST", body: { messageIds: Array.from({ length: 501 }, () => "m") } },
+			),
 			rulerSegmentSummary: await sampleJSON(
 				baseUrl,
 				"/api/projects/p_search_fixture/ruler/segment?from=commit-alpha&detail=summary",
@@ -4430,6 +4602,24 @@ async function collect(
 					},
 				},
 			),
+			rulerMergeInvalidStrategy: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture/ruler/merge",
+				token,
+				{
+					method: "POST",
+					body: { sourceChapterId: "c_graph_target", strategy: "cherry-pick" },
+				},
+			),
+			rulerMergeOverlongMessage: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture/ruler/merge",
+				token,
+				{
+					method: "POST",
+					body: { sourceChapterId: "c_graph_target", message: "x".repeat(501) },
+				},
+			),
 			rulerSegmentAfterPositions: await sampleJSON(
 				baseUrl,
 				"/api/projects/p_search_fixture/ruler/segment?from=commit-alpha",
@@ -4438,6 +4628,100 @@ async function collect(
 			projectGraph: await sampleJSON(baseUrl, "/api/projects/p_search_fixture/graph", token),
 			chapterCreateFixtureStateBefore: chapterCreateFixtureState(home),
 			chapterCreateFixture: await createChapterCreateFixture(baseUrl, token, home),
+			chapterCreateMissingProjectId: await sampleJSON(baseUrl, "/api/chapters", token, {
+				method: "POST",
+				body: { title: "Missing Project" },
+			}),
+			chapterCreateOverlongTitle: await sampleJSON(baseUrl, "/api/chapters", token, {
+				method: "POST",
+				body: { projectId: "p_chapter_create_fixture", title: "x".repeat(201) },
+			}),
+			chapterCreateOverlongDescription: await sampleJSON(baseUrl, "/api/chapters", token, {
+				method: "POST",
+				body: {
+					projectId: "p_chapter_create_fixture",
+					title: "Valid Title",
+					description: "d".repeat(2001),
+				},
+			}),
+			chapterForkInvalidRole: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture/fork",
+				token,
+				{
+					method: "POST",
+					body: { role: "trunk" },
+				},
+			),
+			chapterForkInvalidInheritMode: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture/fork",
+				token,
+				{ method: "POST", body: { inheritMode: "partial" } },
+			),
+			chapterForkNegativeCrossOffset: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture/fork",
+				token,
+				{ method: "POST", body: { crossOffset: -1 } },
+			),
+			chapterMergeOverlongMessage: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture/merge",
+				token,
+				{ method: "POST", body: { targetChapterId: "c_graph_target", message: "m".repeat(501) } },
+			),
+			chapterUpdateInvalidStatus: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: { status: "archived" },
+				},
+			),
+			chapterUpdateInvalidRole: await sampleJSON(baseUrl, "/api/chapters/c_search_fixture", token, {
+				method: "PATCH",
+				body: { role: "reviewer" },
+			}),
+			chapterUpdateOverlongColor: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: { color: "c".repeat(21) },
+				},
+			),
+			chapterUpdateInvalidContainerPort: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: {
+						containerConfig: { ports: [{ containerPort: 70000, serviceName: "web" }] },
+					},
+				},
+			),
+			chapterReviewInvalidLocale: await sampleJSON(
+				baseUrl,
+				"/api/chapters/c_search_fixture/review",
+				token,
+				{ method: "POST", body: { locale: "fr" } },
+			),
+			narratorCreateOverlongCwd: await sampleJSON(baseUrl, "/api/narrators", token, {
+				method: "POST",
+				body: { cwd: "x".repeat(4097) },
+			}),
+			narratorCreateOverlongSystemPrompt: await sampleJSON(baseUrl, "/api/narrators", token, {
+				method: "POST",
+				body: { systemPrompt: "p".repeat(10001) },
+			}),
+			narratorCreateInvalidReasoningEffort: await sampleJSON(baseUrl, "/api/narrators", token, {
+				method: "POST",
+				body: { reasoningEffort: "extreme" },
+			}),
 			chapterCreateFixtureStateAfter: chapterCreateFixtureState(home),
 			projectGraphAfterChapterCreate: await sampleJSON(
 				baseUrl,
@@ -4521,7 +4805,63 @@ async function collect(
 				},
 			}),
 			projectCreateFixtureStateAfter: projectCreateFixtureState(home),
+			projectCreateOverlongName: await sampleJSON(baseUrl, "/api/projects", token, {
+				method: "POST",
+				body: {
+					name: "x".repeat(201),
+					repoMode: "existing",
+					gitPath: projectCreateFixtureRepoPath(home),
+				},
+			}),
+			projectCreateOverlongDescription: await sampleJSON(baseUrl, "/api/projects", token, {
+				method: "POST",
+				body: {
+					name: "Valid Name",
+					description: "d".repeat(2001),
+					repoMode: "existing",
+					gitPath: projectCreateFixtureRepoPath(home),
+				},
+			}),
 			projectsAfterProjectCreate: await sampleJSON(baseUrl, "/api/projects", token),
+			projectUpdateInvalidCommandName: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: {
+						chapterSettings: {
+							commands: [{ name: "bad name!", prompt: "do something" }],
+						},
+					},
+				},
+			),
+			projectUpdateOverlongCommandPattern: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: {
+						chapterSettings: {
+							commandWhitelist: [{ pattern: "x".repeat(201) }],
+						},
+					},
+				},
+			),
+			projectUpdateInvalidAccessLevel: await sampleJSON(
+				baseUrl,
+				"/api/projects/p_search_fixture",
+				token,
+				{
+					method: "PATCH",
+					body: {
+						chapterSettings: {
+							whitelistDirs: [{ path: "/tmp", accessLevel: "superuser" }],
+						},
+					},
+				},
+			),
 			projectRealCleanupWarningStateBefore: projectRealCleanupWarningFixtureState(home),
 			projectRealCleanupWarning: await sampleJSON(
 				baseUrl,
@@ -4641,6 +4981,15 @@ async function collect(
 				"/api/skills/project-contract?projectId=p_search_fixture",
 				token,
 			),
+			projectSkillWriteCreate,
+			projectSkillWriteDetailCreated,
+			projectSkillWriteCreateDuplicate,
+			projectSkillWriteCreateOverlongName,
+			projectSkillWriteUpdateMissing,
+			projectSkillWriteUpdateValid,
+			projectSkillWriteDeleteMissing,
+			projectSkillWriteDeleteValid,
+			projectSkillWriteDetailAfterDelete,
 			mcpServers,
 			mcpTools,
 			mcpCreateInvalidArgs,
@@ -5095,6 +5444,13 @@ async function collect(
 				body: { target: "not-a-storage-target" },
 			}),
 			...(await sampleStorageCacheInvalidationFlow(baseUrl, token)),
+			...(await sampleStorageDatabaseValidationBounds(baseUrl, token)),
+			dependencyInstallUnknownName: await sampleJSON(
+				baseUrl,
+				"/api/dependencies/not-a-dependency/install",
+				token,
+				{ method: "POST", body: {} },
+			),
 			userStorageCached: await sampleJSON(baseUrl, "/api/storage/cached", userToken),
 			userStorageCleanup: await sampleJSON(baseUrl, "/api/storage/cleanup", userToken, {
 				method: "POST",
@@ -6155,6 +6511,14 @@ function expectGitPanelFixtureContracts(
 	if (sampleJSONArray(sample, "gitLog").length === 0) {
 		diffs.push(`semantic.${label}.json.gitLog expected at least one commit`);
 	}
+	// Wave 305: git log skip pagination. The fixture has a single seed commit, so
+	// skip=1 must page past it and return an empty array on both backends.
+	expectJSONStatus(label, sample, "gitLogSkipBeyondHistory", 200, diffs);
+	if (sampleJSONArray(sample, "gitLogSkipBeyondHistory").length !== 0) {
+		diffs.push(
+			`semantic.${label}.json.gitLogSkipBeyondHistory expected empty array after skip past history`,
+		);
+	}
 	for (const name of ["gitStashListEmpty", "gitStashListAfterPush"]) {
 		expectJSONStatus(label, sample, name, 200, diffs);
 		if (!Array.isArray(sample.json[name]?.body)) {
@@ -6331,6 +6695,43 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	if (!Array.isArray(sample.json.browserSessionsEmpty?.body)) {
 		diffs.push(`semantic.${label}.json.browserSessionsEmpty expected array`);
 	}
+	// Wave 294: narrator title/model/cwd updates reject out-of-range Zod bounds with
+	// 400 on both backends.
+	expectJSONStatus(label, sample, "narratorTitleOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorModelOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorCwdOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorDirPathOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorCmdPatternOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorDraftTextOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorForkMissingUuid", 400, diffs);
+	expectJSONStatus(label, sample, "narratorSuggestEmptyQuestions", 400, diffs);
+	expectJSONStatus(label, sample, "narratorBufferTextOverlong", 400, diffs);
+	expectJSONStatus(label, sample, "narratorReorderEmptyIds", 400, diffs);
+	expectJSONStatus(label, sample, "narratorSegmentCompactTooMany", 400, diffs);
+	// Wave 310: narrator skill-context route returns {skills, roots, scopeKey}. Both
+	// backends resolve the same global/project roots for the fixture narrator; Go uses
+	// a live filesystem scan (root cache meta is additive and not asserted here).
+	expectJSONStatus(label, sample, "narratorSkillsContext", 200, diffs);
+	{
+		const body = recordBody(sample.json.narratorSkillsContext?.body);
+		if (!Array.isArray(body.skills)) {
+			diffs.push(`semantic.${label}.json.narratorSkillsContext.skills expected array`);
+		}
+		if (!Array.isArray(body.roots)) {
+			diffs.push(`semantic.${label}.json.narratorSkillsContext.roots expected array`);
+		}
+		if (typeof body.scopeKey !== "string" || body.scopeKey.length === 0) {
+			diffs.push(`semantic.${label}.json.narratorSkillsContext.scopeKey expected non-empty string`);
+		}
+		for (const root of Array.isArray(body.roots) ? body.roots : []) {
+			const kind = recordBody(root).rootKind;
+			if (kind !== "global" && kind !== "project" && kind !== "workspace") {
+				diffs.push(
+					`semantic.${label}.json.narratorSkillsContext.roots.rootKind unexpected ${String(kind)}`,
+				);
+			}
+		}
+	}
 	for (const name of ["rulerSegmentSummary", "rulerSegmentFull"]) {
 		expectJSONStatus(label, sample, name, 200, diffs);
 		const chapter = expectArrayObject(
@@ -6358,6 +6759,11 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	if (recordBody(sample.json.rulerPositionsValid?.body).success !== true) {
 		diffs.push(`semantic.${label}.json.rulerPositionsValid.success expected true`);
 	}
+	// Wave 300: ruler merge enforces the TypeScript rulerMergeSchema Zod bounds
+	// (strategy enum merge/squash, message max 500) and rejects with 400 on both
+	// backends before any chapter-service work.
+	expectJSONStatus(label, sample, "rulerMergeInvalidStrategy", 400, diffs);
+	expectJSONStatus(label, sample, "rulerMergeOverlongMessage", 400, diffs);
 	expectJSONStatus(label, sample, "rulerSegmentAfterPositions", 200, diffs);
 	const graphPositionChapter = expectArrayObject(
 		label,
@@ -6471,6 +6877,33 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	expectJSONValue(label, sample, "chapterCreateFixture", "role", "branch", diffs);
 	expectJSONValue(label, sample, "chapterCreateFixture", "branchHasExpectedPrefix", true, diffs);
 	expectJSONValue(label, sample, "chapterCreateFixture", "worktreePathInFixtureRepo", true, diffs);
+	// Wave 287: chapter create Zod bounds (projectId required, title 1..200, description max 2000)
+	// reject out-of-range bodies with 400 on both backends.
+	expectJSONStatus(label, sample, "chapterCreateMissingProjectId", 400, diffs);
+	expectJSONStatus(label, sample, "chapterCreateOverlongTitle", 400, diffs);
+	expectJSONStatus(label, sample, "chapterCreateOverlongDescription", 400, diffs);
+	// Wave 288: chapter fork Zod bounds (role/inheritMode enums, crossOffset min 0)
+	// reject invalid bodies with 400 on both backends before any git/DB mutation.
+	expectJSONStatus(label, sample, "chapterForkInvalidRole", 400, diffs);
+	expectJSONStatus(label, sample, "chapterForkInvalidInheritMode", 400, diffs);
+	expectJSONStatus(label, sample, "chapterForkNegativeCrossOffset", 400, diffs);
+	// Wave 289: merge message max 500 and review locale enum reject invalid bodies
+	// with 400 on both backends before any mutation. (batch-fork is a Go-only route.)
+	expectJSONStatus(label, sample, "chapterMergeOverlongMessage", 400, diffs);
+	expectJSONStatus(label, sample, "chapterReviewInvalidLocale", 400, diffs);
+	// Wave 303: chapter update Zod bounds (status/role enums, color max 20, nested
+	// containerConfig.ports containerPort 1..65535) reject invalid PATCH bodies with
+	// 400 on both backends before any DB write.
+	expectJSONStatus(label, sample, "chapterUpdateInvalidStatus", 400, diffs);
+	expectJSONStatus(label, sample, "chapterUpdateInvalidRole", 400, diffs);
+	expectJSONStatus(label, sample, "chapterUpdateOverlongColor", 400, diffs);
+	expectJSONStatus(label, sample, "chapterUpdateInvalidContainerPort", 400, diffs);
+	// Wave 304: narrator create Zod bounds (cwd 1..4096, systemPrompt max 10000,
+	// reasoningEffort enum) reject invalid POST bodies with 400 on both backends
+	// before any narrator/session creation.
+	expectJSONStatus(label, sample, "narratorCreateOverlongCwd", 400, diffs);
+	expectJSONStatus(label, sample, "narratorCreateOverlongSystemPrompt", 400, diffs);
+	expectJSONStatus(label, sample, "narratorCreateInvalidReasoningEffort", 400, diffs);
 	expectJSONStatus(label, sample, "chapterCreateFixtureStateAfter", 200, diffs);
 	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "projectRows", 1, diffs);
 	expectJSONValue(label, sample, "chapterCreateFixtureStateAfter", "chapterRows", 1, diffs);
@@ -8392,6 +8825,15 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "repoExists", true, diffs);
 	expectJSONValue(label, sample, "projectCreateFixtureStateBefore", "backupDbExists", false, diffs);
 	expectJSONStatus(label, sample, "projectCreateFixture", 201, diffs);
+	// Wave 291: project create Zod bounds (name 1..200, description max 2000) reject
+	// out-of-range bodies with 400 on both backends.
+	expectJSONStatus(label, sample, "projectCreateOverlongName", 400, diffs);
+	expectJSONStatus(label, sample, "projectCreateOverlongDescription", 400, diffs);
+	// Wave 301: project update chapterSettings nested Zod bounds (command name regex,
+	// command pattern max 200, accessLevel enum) reject with 400 on both backends.
+	expectJSONStatus(label, sample, "projectUpdateInvalidCommandName", 400, diffs);
+	expectJSONStatus(label, sample, "projectUpdateOverlongCommandPattern", 400, diffs);
+	expectJSONStatus(label, sample, "projectUpdateInvalidAccessLevel", 400, diffs);
 	expectJSONStatus(label, sample, "projectCreateFixtureStateAfter", 200, diffs);
 	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "projectRows", 1, diffs);
 	expectJSONValue(label, sample, "projectCreateFixtureStateAfter", "rootChapterRows", 1, diffs);
@@ -10220,11 +10662,20 @@ function appendSemanticDiffs(label: string, sample: BackendSample, diffs: string
 		expectJSONValue(label, sample, name, "ok", true, diffs);
 	}
 	expectJSONStatus(label, sample, "storageCleanupInvalidTarget", 400, diffs);
+	// Wave 306: dependency install rejects an unknown dependency name with 400 on both
+	// backends (TS ValidationError, Go pre-install allow-list check) instead of 500.
+	expectJSONStatus(label, sample, "dependencyInstallUnknownName", 400, diffs);
 	// Wave 277: scan populates the cache, supported upload/database cleanup invalidates it.
 	expectJSONValue(label, sample, "storageCacheAfterScan", "cached", true, diffs);
 	expectJSONValue(label, sample, "storageCacheAfterUploadCleanup", "cached", false, diffs);
 	expectJSONValue(label, sample, "storageCacheAfterRescan", "cached", true, diffs);
 	expectJSONValue(label, sample, "storageCacheAfterDatabaseCleanup", "cached", false, diffs);
+	// Wave 281: database preview/cleanup Zod bounds reject out-of-range values with 400.
+	expectJSONStatus(label, sample, "dbPreviewOlderThanDaysTooLarge", 400, diffs);
+	expectJSONStatus(label, sample, "dbPreviewOlderThanDaysNonPositive", 400, diffs);
+	expectJSONStatus(label, sample, "dbPreviewSampleLimitTooLarge", 400, diffs);
+	expectJSONStatus(label, sample, "dbPreviewInRangeBounds", 200, diffs);
+	expectJSONStatus(label, sample, "dbCleanupOlderThanDaysTooLarge", 400, diffs);
 	for (const name of ["userStorageCached", "userStorageCleanup", "userStorageVacuum"]) {
 		expectJSONStatus(label, sample, name, 403, diffs);
 	}

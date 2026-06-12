@@ -97,6 +97,9 @@ func (h *Handler) stage(w http.ResponseWriter, r *http.Request) error {
 	if err := validateFiles(body.Files); err != nil {
 		return err
 	}
+	if err := requireFilesOrAll(body.Files, body.All); err != nil {
+		return err
+	}
 	if body.All {
 		err = h.Git.StageAll(r.Context(), worktree)
 	} else {
@@ -119,6 +122,9 @@ func (h *Handler) unstage(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if err := validateFiles(body.Files); err != nil {
+		return err
+	}
+	if err := requireFilesOrAll(body.Files, body.All); err != nil {
 		return err
 	}
 	if body.All {
@@ -145,6 +151,13 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript gitCommitSchema Zod bound: message min 1 / max 500.
+	if strings.TrimSpace(body.Message) == "" {
+		return httpx.BadRequest("message is required")
+	}
+	if len(body.Message) > 500 {
+		return httpx.BadRequest("message must be at most 500 characters")
+	}
 	sha, err := h.Git.Commit(r.Context(), worktree, body.Message)
 	if err != nil {
 		return err
@@ -168,6 +181,9 @@ func (h *Handler) discard(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if err := validateFiles(body.Files); err != nil {
+		return err
+	}
+	if err := requireFilesOrAll(body.Files, body.All); err != nil {
 		return err
 	}
 	if body.All {
@@ -228,6 +244,11 @@ func (h *Handler) stash(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript gitStashSchema bound: message max 200 (Go also supports
+	// an "apply" action as a documented extension beyond the TS push/pop/drop enum).
+	if len(body.Message) > 200 {
+		return httpx.BadRequest("message must be at most 200 characters")
+	}
 	hasConflicts := false
 	switch body.Action {
 	case "push":
@@ -259,8 +280,26 @@ func (h *Handler) log(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	items, err := h.Git.Log(r.Context(), worktree, limit)
+	// Mirror the TypeScript gitLogQuerySchema: limit coerces to an int 1..200
+	// (default 50) and skip coerces to an int >= 0 (default 0). Missing params use
+	// defaults; explicitly out-of-range params reject with 400.
+	limit := 50
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, convErr := strconv.Atoi(raw)
+		if convErr != nil || parsed < 1 || parsed > 200 {
+			return httpx.BadRequest("limit must be an integer between 1 and 200")
+		}
+		limit = parsed
+	}
+	skip := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("skip")); raw != "" {
+		parsed, convErr := strconv.Atoi(raw)
+		if convErr != nil || parsed < 0 {
+			return httpx.BadRequest("skip must be a non-negative integer")
+		}
+		skip = parsed
+	}
+	items, err := h.Git.LogPaged(r.Context(), worktree, limit, skip)
 	if err != nil {
 		return err
 	}
@@ -282,6 +321,13 @@ func (h *Handler) reset(w http.ResponseWriter, r *http.Request) error {
 	}
 	if body.Target == "" {
 		return httpx.BadRequest("target is required")
+	}
+	// Mirror the TypeScript gitResetSchema Zod bounds: target max 100, mode enum [soft, hard].
+	if len(body.Target) > 100 {
+		return httpx.BadRequest("target must be at most 100 characters")
+	}
+	if body.Mode != "soft" && body.Mode != "hard" {
+		return httpx.BadRequest("mode must be soft or hard")
 	}
 	if err := h.Git.Reset(r.Context(), worktree, body.Target, body.Mode); err != nil {
 		return err
@@ -524,9 +570,21 @@ func (h *Handler) worktree(r *http.Request) (string, error) {
 
 func validateFiles(files []string) error {
 	for _, file := range files {
+		if strings.TrimSpace(file) == "" {
+			return httpx.BadRequest("file path must be a non-empty string")
+		}
 		if strings.Contains(file, "..") || strings.HasPrefix(file, "/") || strings.HasPrefix(file, "\\") {
 			return httpx.BadRequest("invalid file path: " + file)
 		}
+	}
+	return nil
+}
+
+// requireFilesOrAll mirrors the TypeScript gitStage/gitUnstage/gitDiscard refine:
+// either a non-empty files array or all=true must be provided.
+func requireFilesOrAll(files []string, all bool) error {
+	if len(files) == 0 && !all {
+		return httpx.BadRequest("Provide files array or set all=true")
 	}
 	return nil
 }

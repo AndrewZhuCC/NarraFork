@@ -96,8 +96,31 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if body.ProjectID == "" || body.Title == "" || baseChapterID == "" {
 		return httpx.ValidationError("projectId, title, and baseChapterId are required")
 	}
+	// Mirror the TypeScript createExplorationGroupSchema Zod bounds: title max 200,
+	// description max 2000, branches 2..10 with each branch title 1..200 /
+	// description max 2000 / inheritMode enum.
+	if len(body.Title) > 200 {
+		return httpx.ValidationError("title must be at most 200 characters")
+	}
+	if body.Description != nil && len(*body.Description) > 2000 {
+		return httpx.ValidationError("description must be at most 2000 characters")
+	}
 	if len(body.Branches) < 2 || len(body.Branches) > 10 {
 		return httpx.ValidationError("branches must contain 2 to 10 items")
+	}
+	for _, branch := range body.Branches {
+		if strings.TrimSpace(branch.Title) == "" {
+			return httpx.ValidationError("branch title is required")
+		}
+		if len(branch.Title) > 200 {
+			return httpx.ValidationError("branch title must be at most 200 characters")
+		}
+		if branch.Description != nil && len(*branch.Description) > 2000 {
+			return httpx.ValidationError("branch description must be at most 2000 characters")
+		}
+		if branch.InheritMode != "" && branch.InheritMode != "full" && branch.InheritMode != "compressed" && branch.InheritMode != "fresh" {
+			return httpx.ValidationError("branch inheritMode must be full, compressed, or fresh")
+		}
 	}
 	if h.Chapters == nil {
 		return httpx.Error(http.StatusNotImplemented, "FEATURE_UNAVAILABLE", "Exploration branch creation requires chapter service support")
@@ -173,6 +196,26 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) error {
 	var body map[string]any
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript updateExplorationGroupSchema Zod bounds: title min 1 /
+	// max 200, description max 2000 (when provided).
+	if raw, ok := body["title"]; ok {
+		title, isString := raw.(string)
+		if !isString || strings.TrimSpace(title) == "" {
+			return httpx.ValidationError("title must be a non-empty string")
+		}
+		if len(title) > 200 {
+			return httpx.ValidationError("title must be at most 200 characters")
+		}
+	}
+	if raw, ok := body["description"]; ok && raw != nil {
+		description, isString := raw.(string)
+		if !isString {
+			return httpx.ValidationError("description must be a string")
+		}
+		if len(description) > 2000 {
+			return httpx.ValidationError("description must be at most 2000 characters")
+		}
 	}
 	sets := []string{}
 	args := []any{}

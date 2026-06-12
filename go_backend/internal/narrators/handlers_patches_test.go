@@ -171,25 +171,15 @@ func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
 			},
 		},
 		{
-			name:      "reflection overrides",
+			name:      "model",
 			method:    http.MethodPatch,
-			path:      "/narrators/" + narratorID + "/reflection-overrides",
-			body:      `{"dangerReflectionOverride":"strict"}`,
-			eventType: "reflection_overrides_changed",
+			path:      "/narrators/" + narratorID + "/model",
+			body:      `{"model":"anthropic:claude-test"}`,
+			eventType: "model_changed",
 			assert: func(t *testing.T, payload map[string]any) {
 				t.Helper()
-				if payload["dangerReflectionOverride"] != "strict" {
-					t.Fatalf("unexpected reflection override event: %#v", payload)
-				}
-				var persisted string
-				if err := sqlDB.QueryRow(`SELECT danger_reflection_override FROM narrators WHERE id = ?`, narratorID).Scan(&persisted); err != nil {
-					t.Fatalf("query persisted danger reflection override: %v", err)
-				}
-				if persisted != "strict" {
-					t.Fatalf("persisted danger reflection override = %q, want strict", persisted)
-				}
-				if _, ok := payload["planReflectionAutoApproveOverride"]; ok {
-					t.Fatalf("missing reflection override keys must not be broadcast as null: %#v", payload)
+				if payload["model"] != "anthropic:claude-test" {
+					t.Fatalf("unexpected model_changed event: %#v", payload)
 				}
 			},
 		},
@@ -212,6 +202,46 @@ func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
 			}
 			tc.assert(t, payload)
 		})
+	}
+}
+
+func TestReasoningEffortAndModelBroadcastModelSettingsChanged(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	// Reasoning-effort change broadcasts model_settings_changed with the new effort.
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+	req := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/reasoning-effort", strings.NewReader(`{"reasoningEffort":"high"}`))
+	req.Header.Set("Content-Type", "application/json")
+	if w := serveNarratorHandlerWithService(service, req); w.Code < 200 || w.Code >= 300 {
+		t.Fatalf("reasoning-effort patch failed: %d body=%s", w.Code, w.Body.String())
+	}
+	payload := findBroadcast(events(), narratorID, "model_settings_changed")
+	if payload == nil {
+		t.Fatalf("expected model_settings_changed broadcast, got %#v", events())
+	}
+	if payload["reasoningEffort"] != "high" || payload["status"] != "updated" || payload["applyAt"] != "next_request" {
+		t.Fatalf("unexpected model_settings_changed event: %#v", payload)
+	}
+
+	// Model change broadcasts both model_changed and model_settings_changed carrying
+	// the persisted reasoning effort.
+	hub2, events2 := captureNarratorBroadcasts()
+	service2 := &Service{DB: sqlDB, Hub: hub2}
+	req2 := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/model", strings.NewReader(`{"model":"anthropic:claude-test"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	if w := serveNarratorHandlerWithService(service2, req2); w.Code < 200 || w.Code >= 300 {
+		t.Fatalf("model patch failed: %d body=%s", w.Code, w.Body.String())
+	}
+	all := events2()
+	if mc := findBroadcast(all, narratorID, "model_changed"); mc == nil || mc["model"] != "anthropic:claude-test" {
+		t.Fatalf("expected model_changed with new model, got %#v", all)
+	}
+	ms := findBroadcast(all, narratorID, "model_settings_changed")
+	if ms == nil || ms["reasoningEffort"] != "high" {
+		t.Fatalf("model change should carry the persisted reasoning effort, got %#v", ms)
 	}
 }
 
@@ -1081,4 +1111,257 @@ func ensureSlashCommandTables(t *testing.T, sqlDB *sql.DB) {
 			t.Fatalf("create slash command table: %v", err)
 		}
 	}
+}
+
+// Wave 294: Go narrator title/model/cwd updates must mirror the TypeScript
+// updateNarratorTitleSchema/updateNarratorModelSchema/updateNarratorCwdSchema Zod
+// bounds and reject out-of-range values with 400.
+func TestNarratorTitleModelCwdUpdatesValidateZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	longTitle := strings.Repeat("x", 201)
+	longModel := strings.Repeat("m", 201)
+	longCwd := strings.Repeat("/c", 2049) // > 4096 chars
+	for _, tc := range []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{"empty title", "/narrators/n1/title", map[string]any{"title": "  "}},
+		{"overlong title", "/narrators/n1/title", map[string]any{"title": longTitle}},
+		{"empty model", "/narrators/n1/model", map[string]any{"model": ""}},
+		{"overlong model", "/narrators/n1/model", map[string]any{"model": longModel}},
+		{"empty cwd", "/narrators/n1/cwd", map[string]any{"cwd": "   "}},
+		{"overlong cwd", "/narrators/n1/cwd", map[string]any{"cwd": longCwd}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("narrator update %q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 295: Go narrator dir/command rule create + draft must mirror the TypeScript
+// Zod bounds (path 1..4096, pattern 1..200, accessLevel/denyLevel enums,
+// denyPrompt max 2000, draft text max 100000 / sourceId 1..120).
+func TestNarratorRuleAndDraftCreateValidateZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	longPath := strings.Repeat("/p", 2049) // > 4096 chars
+	longPattern := strings.Repeat("x", 201)
+	longPrompt := strings.Repeat("d", 2001)
+	longDraft := strings.Repeat("t", 100001)
+	longSource := strings.Repeat("s", 121)
+	for _, tc := range []struct {
+		name string
+		path string
+		body map[string]any
+	}{
+		{"dir path overlong", "/narrators/n1/whitelist-dirs", map[string]any{"path": longPath}},
+		{"dir invalid accessLevel", "/narrators/n1/whitelist-dirs", map[string]any{"path": "/repo", "accessLevel": "superuser"}},
+		{"blacklist dir invalid denyLevel", "/narrators/n1/blacklist-dirs", map[string]any{"path": "/repo", "denyLevel": "denyNothing"}},
+		{"cmd pattern overlong", "/narrators/n1/cmd-whitelist", map[string]any{"pattern": longPattern}},
+		{"cmd-blacklist denyPrompt overlong", "/narrators/n1/cmd-blacklist", map[string]any{"pattern": "rm -rf", "denyPrompt": longPrompt}},
+		{"draft text overlong", "/narrators/n1/draft", map[string]any{"text": longDraft}},
+		{"draft sourceId overlong", "/narrators/n1/draft", map[string]any{"text": "hi", "sourceId": longSource}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, tc.path, tc.body)
+			if strings.Contains(tc.path, "/draft") {
+				w = serveNarratorHandlerJSON(sqlDB, http.MethodPut, tc.path, tc.body)
+			}
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 296: Go narrator fork / fork-messages / compact-summary updates must mirror
+// the TypeScript forkNarratorSchema / forkFromMessagesSchema /
+// updateSegmentCompactSummarySchema Zod bounds and reject out-of-range values with 400.
+func TestNarratorForkAndCompactSummaryValidateZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	longTitle := strings.Repeat("x", 201)
+	longSummary := strings.Repeat("s", 100001)
+	tooManyIDs := make([]string, 501)
+	for i := range tooManyIDs {
+		tooManyIDs[i] = "m"
+	}
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{"fork missing forkMessageUuid", http.MethodPost, "/narrators/n1/fork", map[string]any{"title": "Fork"}},
+		{"fork overlong title", http.MethodPost, "/narrators/n1/fork", map[string]any{"forkMessageUuid": "m1", "title": longTitle}},
+		{"fork-messages empty", http.MethodPost, "/narrators/n1/fork-messages", map[string]any{"messageIds": []string{}}},
+		{"fork-messages too many", http.MethodPost, "/narrators/n1/fork-messages", map[string]any{"messageIds": tooManyIDs}},
+		{"fork-messages overlong title", http.MethodPost, "/narrators/n1/fork-messages", map[string]any{"messageIds": []string{"m1"}, "title": longTitle}},
+		{"compact summary empty string", http.MethodPatch, "/narrators/n1/compact/msg1", map[string]any{"summary": ""}},
+		{"segment-compact summary empty", http.MethodPatch, "/narrators/n1/segment-compact/msg1", map[string]any{"summary": "  "}},
+		{"segment-compact summary overlong", http.MethodPatch, "/narrators/n1/segment-compact/msg1", map[string]any{"summary": longSummary}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveNarratorHandlerJSON(sqlDB, tc.method, tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 297: Go narrator batch-delete-blocks / buffered-message / reorder /
+// suggest-answers must mirror the TypeScript Zod bounds and reject out-of-range
+// values with 400.
+func TestNarratorBatchAndBufferValidateZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	tooManyBlocks := make([]map[string]any, 201)
+	for i := range tooManyBlocks {
+		tooManyBlocks[i] = map[string]any{"messageId": "m", "blockIndex": 0}
+	}
+	longText := strings.Repeat("t", 100001)
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{"batch-blocks empty", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []any{}}},
+		{"batch-blocks too many", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": tooManyBlocks}},
+		{"suggest empty questions", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []any{}}},
+		{"buffer text empty", http.MethodPatch, "/narrators/" + narratorID + "/buffer/buf1", map[string]any{"text": "  "}},
+		{"buffer text overlong", http.MethodPatch, "/narrators/" + narratorID + "/buffer/buf1", map[string]any{"text": longText}},
+		{"reorder empty ids", http.MethodPut, "/narrators/" + narratorID + "/buffer/reorder", map[string]any{"orderedIds": []string{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveNarratorHandlerJSON(sqlDB, tc.method, tc.path, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 298: Go segment-compact must mirror the TypeScript segmentCompactSchema
+// messageIds bound (max 500, non-empty entries) while keeping the Go from/to range
+// extension; out-of-range messageIds reject with 400.
+func TestSegmentCompactMessageIdsValidateZodBoundsLikeTypeScript(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	tooManyIDs := make([]string, 501)
+	for i := range tooManyIDs {
+		tooManyIDs[i] = "m"
+	}
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"too many messageIds", map[string]any{"messageIds": tooManyIDs}},
+		{"empty messageId entry", map[string]any{"messageIds": []string{"m1", "  "}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/segment-compact", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 310: GET /api/narrators/{id}/skills resolves the narrator project/cwd
+// context, scans global+project skill roots, dedupes by name, hides disabled
+// skills, and returns Go live-scan cache metadata per root.
+func TestNarratorSkillsRouteReturnsContextScopedSummaries(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+
+	writeNarratorSkillFixture(t, filepath.Join(home, ".narrafork", "skills", "globalskill"), "globalskill", "A global skill", "global body")
+	writeNarratorSkillFixture(t, filepath.Join(project, ".narrafork", "skills", "projectskill"), "projectskill", "A project skill", "project body")
+	// A disabled project skill must be hidden from the response.
+	writeNarratorSkillFixture(t, filepath.Join(project, ".narrafork", "skills", "hidden"), "hidden", "Disabled skill", "hidden body")
+	if err := os.Rename(
+		filepath.Join(project, ".narrafork", "skills", "hidden", "SKILL.md"),
+		filepath.Join(project, ".narrafork", "skills", "hidden", "SKILL.md.disabled"),
+	); err != nil {
+		t.Fatalf("disable skill: %v", err)
+	}
+
+	sqlDB := openNarratorSkillsTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`INSERT INTO projects (id, git_path) VALUES ('proj_skills', ?)`, project); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, worktree_path) VALUES ('chap_skills', 'proj_skills', ?)`, project); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO narrators (id, chapter_id, cwd) VALUES ('nar_skills', 'chap_skills', '')`); err != nil {
+		t.Fatalf("insert narrator: %v", err)
+	}
+
+	w := serveNarratorHandlerRequest(sqlDB, "GET", "/narrators/nar_skills/skills")
+	if w.Code != 200 {
+		t.Fatalf("skills status = %d body=%s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Skills []map[string]any `json:"skills"`
+		Roots  []map[string]any `json:"roots"`
+		Scope  string           `json:"scopeKey"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode skills: %v", err)
+	}
+	names := map[string]string{}
+	for _, s := range resp.Skills {
+		names[stringValue(s["name"])] = stringValue(s["source"])
+	}
+	if names["globalskill"] != "global" || names["projectskill"] != "project" {
+		t.Fatalf("unexpected skill sources: %#v", names)
+	}
+	if _, ok := names["hidden"]; ok {
+		t.Fatalf("disabled skill should be hidden: %#v", names)
+	}
+	if len(resp.Roots) < 2 {
+		t.Fatalf("expected at least global+project roots, got %#v", resp.Roots)
+	}
+	for _, root := range resp.Roots {
+		if root["cacheHit"] != false || root["cacheable"] != false || root["refreshed"] != true {
+			t.Fatalf("Go live-scan root meta should be cacheHit/cacheable=false, refreshed=true: %#v", root)
+		}
+	}
+	if resp.Scope == "" {
+		t.Fatalf("expected non-empty scopeKey")
+	}
+}
+
+func TestNarratorSkillsRouteMissingNarratorReturns404(t *testing.T) {
+	sqlDB := openNarratorSkillsTestDB(t)
+	defer sqlDB.Close()
+	w := serveNarratorHandlerRequest(sqlDB, "GET", "/narrators/missing/skills")
+	if w.Code != 404 {
+		t.Fatalf("expected 404 for missing narrator, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func openNarratorSkillsTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	for _, stmt := range []string{
+		`CREATE TABLE projects (id TEXT PRIMARY KEY, git_path TEXT)`,
+		`CREATE TABLE chapters (id TEXT PRIMARY KEY, project_id TEXT, worktree_path TEXT)`,
+		`CREATE TABLE narrators (id TEXT PRIMARY KEY, chapter_id TEXT, cwd TEXT)`,
+	} {
+		if _, err := sqlDB.Exec(stmt); err != nil {
+			sqlDB.Close()
+			t.Fatalf("create skills test schema: %v", err)
+		}
+	}
+	return sqlDB
 }

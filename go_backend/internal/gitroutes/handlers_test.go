@@ -433,3 +433,98 @@ func writeGitRoutesFile(t *testing.T, repo, name, content string) {
 		t.Fatalf("write %s: %v", name, err)
 	}
 }
+
+// Wave 299: Go git commit/reset/stash/stage validation must mirror the TypeScript
+// gitCommitSchema/gitResetSchema/gitStashSchema/gitStageSchema Zod bounds and reject
+// out-of-range values with 400.
+func TestGitMutationRoutesValidateZodBoundsLikeTypeScript(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	handler := NewHandler(database, gitx.NewService())
+	longMessage := strings.Repeat("m", 501)
+	longTarget := strings.Repeat("t", 101)
+	longStash := strings.Repeat("s", 201)
+	for _, tc := range []struct {
+		name   string
+		target string
+		body   string
+	}{
+		{"commit empty message", "/c1/git/commit", `{"message":"  "}`},
+		{"commit overlong message", "/c1/git/commit", `{"message":"` + longMessage + `"}`},
+		{"reset overlong target", "/c1/git/reset", `{"target":"` + longTarget + `","mode":"hard"}`},
+		{"reset invalid mode", "/c1/git/reset", `{"target":"HEAD","mode":"mixed"}`},
+		{"stash overlong message", "/c1/git/stash", `{"action":"push","message":"` + longStash + `"}`},
+		{"stage neither files nor all", "/c1/git/stage", `{}`},
+		{"discard neither files nor all", "/c1/git/discard", `{"files":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveGitRoutesRecorder(t, handler, http.MethodPost, tc.target, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 305: Go git log route must mirror the TypeScript gitLogQuerySchema pagination
+// (limit 1..200 default 50, skip >= 0 default 0) and apply the skip offset.
+func TestGitLogRouteSupportsSkipPaginationAndValidatesBounds(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	// newGitRoutesRepo creates the "base" commit; add three more so we have four total.
+	for _, subject := range []string{"second", "third", "fourth"} {
+		writeGitRoutesFile(t, repo, "file.txt", subject+"\n")
+		runGitRoutesGit(t, repo, "add", ".")
+		runGitRoutesGit(t, repo, "commit", "-m", subject)
+	}
+	handler := NewHandler(database, gitx.NewService())
+
+	all := serveGitRoutesArrayRequest(t, handler, http.MethodGet, "/c1/git/log?limit=10")
+	if len(all) != 4 {
+		t.Fatalf("expected 4 commits, got %d: %#v", len(all), all)
+	}
+	firstSubject, _ := all[0].(map[string]any)["message"].(string)
+	if firstSubject != "fourth" {
+		t.Fatalf("expected newest commit first, got %q", firstSubject)
+	}
+
+	// skip=1 should drop the newest commit; the new head becomes "third".
+	skipped := serveGitRoutesArrayRequest(t, handler, http.MethodGet, "/c1/git/log?limit=10&skip=1")
+	if len(skipped) != 3 {
+		t.Fatalf("expected 3 commits after skip=1, got %d: %#v", len(skipped), skipped)
+	}
+	if subject, _ := skipped[0].(map[string]any)["message"].(string); subject != "third" {
+		t.Fatalf("expected skip=1 to start at \"third\", got %q", subject)
+	}
+
+	// limit caps the returned count.
+	limited := serveGitRoutesArrayRequest(t, handler, http.MethodGet, "/c1/git/log?limit=2")
+	if len(limited) != 2 {
+		t.Fatalf("expected 2 commits with limit=2, got %d", len(limited))
+	}
+
+	for _, tc := range []struct {
+		name   string
+		target string
+	}{
+		{"limit zero", "/c1/git/log?limit=0"},
+		{"limit too large", "/c1/git/log?limit=201"},
+		{"limit non-numeric", "/c1/git/log?limit=abc"},
+		{"skip negative", "/c1/git/log?skip=-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			rec := httptest.NewRecorder()
+			router := chi.NewRouter()
+			handler.RegisterRoutes(router)
+			router.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+}

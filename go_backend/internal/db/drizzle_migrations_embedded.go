@@ -298,6 +298,18 @@ var embeddedDrizzleMigrations = []embeddedDrizzleMigration{
 		Hash: "b110cd1c783f2959b91322c23ebae9d239215d3321fbb725b3aa90955af8f81e",
 		SQL:  "ALTER TABLE `user_preferences` ADD `fast_mode_default` integer DEFAULT false NOT NULL;",
 	},
+	{
+		Tag:  "0041_exotic_nekra",
+		When: 1781187476955,
+		Hash: "5b6892b1717ea94d0d6768c9ee9765200662cfc2dedccc6a8b87b69f11f68d7c",
+		SQL:  "CREATE TABLE `skill_directory_caches` (\n\t`id` text PRIMARY KEY NOT NULL,\n\t`root_kind` text NOT NULL,\n\t`normalized_root_path` text NOT NULL,\n\t`skills_json` text NOT NULL,\n\t`signature_json` text NOT NULL,\n\t`scanned_at` text NOT NULL,\n\t`last_accessed_at` text NOT NULL,\n\t`expires_at` text NOT NULL\n);\n--\u003e statement-breakpoint\nCREATE UNIQUE INDEX `idx_skill_dir_cache_root` ON `skill_directory_caches` (`root_kind`,`normalized_root_path`);--\u003e statement-breakpoint\nCREATE INDEX `idx_skill_dir_cache_last_accessed` ON `skill_directory_caches` (`last_accessed_at`);--\u003e statement-breakpoint\nCREATE INDEX `idx_skill_dir_cache_expires` ON `skill_directory_caches` (`expires_at`);",
+	},
+	{
+		Tag:  "0042_shocking_naoko",
+		When: 1781278512923,
+		Hash: "a905aa05262b28902f5e8873004172e0e6237b8c400ec4f959b5c4c4a2a5460a",
+		SQL:  "ALTER TABLE `narrator_messages` ADD `edited_at` text;--\u003e statement-breakpoint\nALTER TABLE `narrator_messages` ADD `edited_by` text REFERENCES users(id);--\u003e statement-breakpoint\nALTER TABLE `narrator_messages` ADD `original_content_json` text;",
+	},
 }
 
 func init() {

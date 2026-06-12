@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,6 +144,37 @@ func createExplorationGroupFixture(t *testing.T, router http.Handler) (string, [
 		t.Fatalf("expected two fixture branches, got %#v", group)
 	}
 	return group.ID, []string{group.Branches[0].ID, group.Branches[1].ID}
+}
+
+// Wave 292: Go exploration group create must mirror the TypeScript
+// createExplorationGroupSchema Zod bounds — title max 200, description max 2000,
+// branches 2..10 with each branch title 1..200 / description max 2000 /
+// inheritMode enum — and reject out-of-range values with 400.
+func TestCreateExplorationGroupValidatesZodBoundsLikeTypeScript(t *testing.T) {
+	router, _ := newExplorationTestRouter(t)
+	longText := strings.Repeat("x", 201)
+	longDesc := strings.Repeat("d", 2001)
+	validBranches := []any{
+		map[string]any{"title": "A", "inheritMode": "fresh"},
+		map[string]any{"title": "B", "inheritMode": "fresh"},
+	}
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"overlong title", map[string]any{"projectId": "project", "title": longText, "baseChapterId": "root", "branches": validBranches}},
+		{"overlong description", map[string]any{"projectId": "project", "title": "Exp", "description": longDesc, "baseChapterId": "root", "branches": validBranches}},
+		{"too few branches", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": "A"}}}},
+		{"branch title overlong", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": longText}, map[string]any{"title": "B"}}}},
+		{"branch invalid inheritMode", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": "A", "inheritMode": "partial"}, map[string]any{"title": "B"}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := postExplorationJSON(t, router, "/", tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("create exploration %q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
 }
 
 func postExplorationJSON(t *testing.T, router http.Handler, path string, body map[string]any) *httptest.ResponseRecorder {

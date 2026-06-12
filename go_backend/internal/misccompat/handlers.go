@@ -1824,22 +1824,52 @@ func candidateSummaryFromPreview(preview map[string]any, retentionDays int) map[
 	return summary
 }
 
+// validDatabaseOlderThanDays mirrors the TypeScript Zod
+// `z.coerce.number().int().positive().max(3650).optional()` bound: a provided
+// value must be a positive integer no greater than 3650; an omitted value is fine.
+func validDatabaseOlderThanDays(value *int) bool {
+	if value == nil {
+		return true
+	}
+	return *value > 0 && *value <= 3650
+}
+
+// validDatabaseSampleLimit mirrors the TypeScript Zod
+// `z.coerce.number().int().min(0).max(25).optional()` bound: a provided value
+// must be an integer in 0..25; an omitted value is fine.
+func validDatabaseSampleLimit(value *int) bool {
+	if value == nil {
+		return true
+	}
+	return *value >= 0 && *value <= 25
+}
+
 func (h *Handler) databaseCleanupPreview(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Target        string `json:"target"`
-		OlderThanDays int    `json:"olderThanDays"`
-		SampleLimit   int    `json:"sampleLimit"`
+		OlderThanDays *int   `json:"olderThanDays"`
+		SampleLimit   *int   `json:"sampleLimit"`
 	}
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if body.SampleLimit <= 0 {
-		body.SampleLimit = 10
+	// Mirror the TypeScript Zod databasePreviewSchema bounds: olderThanDays is a
+	// positive int <= 3650 when provided, sampleLimit is an int 0..25 when provided.
+	if !validDatabaseOlderThanDays(body.OlderThanDays) || !validDatabaseSampleLimit(body.SampleLimit) {
+		return httpx.BadRequest("Invalid database cleanup preview request")
 	}
-	if body.OlderThanDays <= 0 {
-		body.OlderThanDays = defaultDatabaseRetentionDays(body.Target)
+	sampleLimit := 10
+	if body.SampleLimit != nil {
+		sampleLimit = *body.SampleLimit
 	}
-	preview := h.previewDatabaseCleanup(r, body.Target, body.OlderThanDays, body.SampleLimit)
+	olderThanDays := 0
+	if body.OlderThanDays != nil {
+		olderThanDays = *body.OlderThanDays
+	}
+	if olderThanDays <= 0 {
+		olderThanDays = defaultDatabaseRetentionDays(body.Target)
+	}
+	preview := h.previewDatabaseCleanup(r, body.Target, olderThanDays, sampleLimit)
 	if preview == nil {
 		return httpx.BadRequest("Invalid database cleanup target")
 	}
@@ -1850,13 +1880,22 @@ func (h *Handler) databaseCleanupPreview(w http.ResponseWriter, r *http.Request)
 func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
 		Target        string `json:"target"`
-		OlderThanDays int    `json:"olderThanDays"`
+		OlderThanDays *int   `json:"olderThanDays"`
 	}
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if body.OlderThanDays <= 0 {
-		body.OlderThanDays = defaultDatabaseRetentionDays(body.Target)
+	// Mirror the TypeScript Zod databaseCleanupSchema bound: olderThanDays is a
+	// positive int <= 3650 when provided.
+	if !validDatabaseOlderThanDays(body.OlderThanDays) {
+		return httpx.BadRequest("Invalid database cleanup request")
+	}
+	olderThanDays := 0
+	if body.OlderThanDays != nil {
+		olderThanDays = *body.OlderThanDays
+	}
+	if olderThanDays <= 0 {
+		olderThanDays = defaultDatabaseRetentionDays(body.Target)
 	}
 	if body.Target == "staleSessions" {
 		httpx.WriteFeatureDisabled(w, "storage.database.cleanup."+body.Target, databaseCleanupStaleSessionsDisabledReason)
@@ -1867,21 +1906,21 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 		return nil
 	}
 	before, _, _ := databaseFileSizes()
-	preview := h.previewDatabaseCleanup(r, body.Target, body.OlderThanDays, 10)
+	preview := h.previewDatabaseCleanup(r, body.Target, olderThanDays, 10)
 	if preview == nil {
 		return httpx.BadRequest("Invalid database cleanup target")
 	}
 	changed := false
 	switch body.Target {
 	case "apiRequestDumps":
-		cutoff := time.Now().AddDate(0, 0, -body.OlderThanDays).Format(time.RFC3339)
+		cutoff := time.Now().AddDate(0, 0, -olderThanDays).Format(time.RFC3339)
 		res, err := h.DB.ExecContext(r.Context(), `UPDATE api_requests SET raw_dump_json = NULL WHERE raw_dump_json IS NOT NULL AND raw_dump_json != '' AND created_at < ?`, cutoff)
 		if err != nil {
 			return err
 		}
 		changed = rowsAffected(res) > 0
 	case "archivedSessions":
-		ids, err := h.databaseCleanupNarratorIDs(r, body.Target, body.OlderThanDays)
+		ids, err := h.databaseCleanupNarratorIDs(r, body.Target, olderThanDays)
 		if err != nil {
 			return err
 		}
@@ -2910,10 +2949,6 @@ func stringPtrValue(value *string) string {
 }
 
 func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
-	if h.Chapters == nil {
-		rulerFeatureDisabled(w, "merge", "Ruler merge requires chapter service support that is not available in this go_backend runtime")
-		return nil
-	}
 	projectID := chi.URLParam(r, "projectId")
 	var body struct {
 		SourceChapterID string `json:"sourceChapterId"`
@@ -2926,6 +2961,25 @@ func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
 	sourceID := strings.TrimSpace(body.SourceChapterID)
 	if sourceID == "" {
 		return httpx.BadRequest("sourceChapterId is required")
+	}
+	// Mirror the TypeScript rulerMergeSchema Zod bounds: strategy is restricted to
+	// merge/squash (defaulting to merge) and message is capped at 500 characters.
+	// Unlike the chapter merge route, the ruler route does not accept cherry-pick.
+	// TypeScript validates the body (safeParse -> 400) before any service work, so
+	// validation runs ahead of the chapter-service availability fallback here too.
+	strategy := strings.TrimSpace(body.Strategy)
+	if strategy == "" {
+		strategy = "merge"
+	}
+	if strategy != "merge" && strategy != "squash" {
+		return httpx.BadRequest("strategy must be merge or squash")
+	}
+	if len(body.Message) > 500 {
+		return httpx.BadRequest("message must be at most 500 characters")
+	}
+	if h.Chapters == nil {
+		rulerFeatureDisabled(w, "merge", "Ruler merge requires chapter service support that is not available in this go_backend runtime")
+		return nil
 	}
 	if ok, err := h.chapterBelongsToProject(r.Context(), sourceID, projectID); err != nil {
 		return err
@@ -2943,13 +2997,13 @@ func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	userID := optionalUserID(r)
-	result, err := h.Chapters.Merge(r.Context(), sourceID, targetID, body.Strategy, body.Message, userID)
+	result, err := h.Chapters.Merge(r.Context(), sourceID, targetID, strategy, body.Message, userID)
 	if err != nil {
 		return err
 	}
 	if ok, _ := result["ok"].(bool); !ok {
 		locale := h.userLanguage(r.Context(), userID)
-		aiResult, err := h.Chapters.AIResolve(r.Context(), sourceID, targetID, body.Strategy, body.Message, userID, locale)
+		aiResult, err := h.Chapters.AIResolve(r.Context(), sourceID, targetID, strategy, body.Message, userID, locale)
 		if err != nil {
 			return err
 		}

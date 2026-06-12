@@ -819,6 +819,12 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 			if result, ok := event.Metadata["result"]; ok {
 				payload["result"] = result
 			}
+			if partialImageIndex, ok := event.Metadata["partialImageIndex"]; ok {
+				payload["partialImageIndex"] = partialImageIndex
+			}
+			if partialImageB64, ok := event.Metadata["partialImageB64"]; ok {
+				payload["partialImageB64"] = partialImageB64
+			}
 		}
 	}
 	if event.Type == "metering" && event.Metadata != nil {
@@ -1279,6 +1285,27 @@ func (s *Service) backgroundTaskRunning(ctx context.Context, parentID, taskID st
 	return count > 0
 }
 
+// broadcastSubagentStatusChanged notifies the parent narrator that one of its
+// foreground subagents changed status (mirrors the TypeScript subagent-executor
+// subagent_status_changed broadcast). No-op for non-subagent narrators, orphan
+// subagents, or when the Hub is unavailable.
+func (s *Service) broadcastSubagentStatusChanged(latest Narrator, subagentID, status string, substatus []string) {
+	if s.Hub == nil {
+		return
+	}
+	if latest.Type != "subagent" && latest.Variant != "subagent" {
+		return
+	}
+	if latest.ParentNarratorID == nil || strings.TrimSpace(*latest.ParentNarratorID) == "" {
+		return
+	}
+	parentID := strings.TrimSpace(*latest.ParentNarratorID)
+	if substatus == nil {
+		substatus = []string{}
+	}
+	s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "subagent_status_changed", "narratorId": parentID, "subagentNarratorId": subagentID, "status": status, "substatus": substatus})
+}
+
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	if state.draftMessageID != nil && strings.TrimSpace(*state.draftMessageID) != "" {
@@ -1338,6 +1365,11 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 			backgroundStatus = nullableTrimmedString("completed")
 		}
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": substatus, "isBackground": latest.IsBackground, "backgroundStatus": backgroundStatus})
+		// Mirror the TypeScript subagent-executor broadcast: notify the parent narrator
+		// that a (foreground) subagent finished so its subagent status badge updates.
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", substatus)
+		}
 	}
 	if !treatAsBackground && latest.Type != "subagent" && latest.Variant != "subagent" {
 		_, _ = s.consumeNextBufferedMessage(context.Background(), state.narratorID)
@@ -1376,6 +1408,9 @@ func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunStat
 			payload["backgroundStatus"] = "failed"
 		}
 		s.Hub.BroadcastNarrator(state.narratorID, payload)
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"timeout"})
+		}
 	}
 	return nil
 }
@@ -1409,6 +1444,9 @@ func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *age
 			payload["backgroundStatus"] = "failed"
 		}
 		s.Hub.BroadcastNarrator(state.narratorID, payload)
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"silent_disconnect"})
+		}
 	}
 	return nil
 }
@@ -1436,6 +1474,9 @@ func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunSt
 	}
 	if s.Hub != nil {
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "cancelled", false: ""}[treatAsBackground])})
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{})
+		}
 	}
 	return nil
 }
@@ -1467,6 +1508,9 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 	if s.Hub != nil {
 		errorCode := firstNonEmptyString(state.errorCode, "AGENT_ERROR")
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"error"}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "failed", false: ""}[treatAsBackground])})
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"error"})
+		}
 		s.broadcastNarratorError(state.narratorID, message, errorCode)
 	}
 	return nil

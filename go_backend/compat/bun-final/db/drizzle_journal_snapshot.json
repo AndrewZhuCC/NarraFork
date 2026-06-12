@@ -2,9 +2,9 @@
 	"version": "1",
 	"dialect": "sqlite",
 	"drizzleJournalVersion": "7",
-	"lastTag": "0040_talented_pandemic",
-	"expectedMigrationCount": 41,
-	"expectedJournalHash": "c260ac8a49bee7c8027b77690b6faedb226179e9aa001e1fddf75cbf838874bf",
+	"lastTag": "0042_shocking_naoko",
+	"expectedMigrationCount": 43,
+	"expectedJournalHash": "b3096fb0aac667a3d4df1d6611a0392783501e4589b7b170132ada9ae5995df2",
 	"entries": [
 		{
 			"idx": 0,
@@ -251,6 +251,18 @@
 			"tag": "0040_talented_pandemic",
 			"when": 1778483346461,
 			"hash": "b110cd1c783f2959b91322c23ebae9d239215d3321fbb725b3aa90955af8f81e"
+		},
+		{
+			"idx": 41,
+			"tag": "0041_exotic_nekra",
+			"when": 1781187476955,
+			"hash": "5b6892b1717ea94d0d6768c9ee9765200662cfc2dedccc6a8b87b69f11f68d7c"
+		},
+		{
+			"idx": 42,
+			"tag": "0042_shocking_naoko",
+			"when": 1781278512923,
+			"hash": "a905aa05262b28902f5e8873004172e0e6237b8c400ec4f959b5c4c4a2a5460a"
 		}
 	]
 }

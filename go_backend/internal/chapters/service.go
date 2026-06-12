@@ -12,9 +12,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/config"
@@ -1780,7 +1782,152 @@ func (s *Service) Get(ctx context.Context, chapterID string) (Chapter, error) {
 	return ch, err
 }
 
+// validateChapterUpdateFields mirrors the TypeScript updateChapterSchema Zod bounds:
+// title 1..200, description max 2000, status/role enums, color max 20, groupLabel max 100,
+// and the nested containerConfig schema. Out-of-range values reject with 400 before any
+// database write, matching the safeParse-first ordering of the TypeScript PATCH route.
+func validateChapterUpdateFields(fields map[string]any) error {
+	if value, ok := fields["title"]; ok && value != nil {
+		title, valid := value.(string)
+		if !valid || strings.TrimSpace(title) == "" {
+			return httpx.ValidationError("title must be a non-empty string")
+		}
+		if utf8.RuneCountInString(title) > 200 {
+			return httpx.ValidationError("title must be at most 200 characters")
+		}
+	}
+	if value, ok := fields["description"]; ok && value != nil {
+		description, valid := value.(string)
+		if !valid || utf8.RuneCountInString(description) > 2000 {
+			return httpx.ValidationError("description must be at most 2000 characters")
+		}
+	}
+	if value, ok := fields["status"]; ok && value != nil {
+		status, valid := value.(string)
+		if !valid || !chapterStatusEnum[status] {
+			return httpx.ValidationError("status must be one of active, dormant, merged, abandoned, frozen")
+		}
+	}
+	if value, ok := fields["role"]; ok && value != nil {
+		role, valid := value.(string)
+		if !valid || !chapterRoleEnum[role] {
+			return httpx.ValidationError("role must be one of trunk, branch, exploration, review")
+		}
+	}
+	if value, ok := fields["color"]; ok && value != nil {
+		color, valid := value.(string)
+		if !valid || utf8.RuneCountInString(color) > 20 {
+			return httpx.ValidationError("color must be at most 20 characters")
+		}
+	}
+	if value, ok := fields["groupLabel"]; ok && value != nil {
+		label, valid := value.(string)
+		if !valid || utf8.RuneCountInString(label) > 100 {
+			return httpx.ValidationError("groupLabel must be at most 100 characters")
+		}
+	}
+	if value, ok := fields["containerConfig"]; ok && value != nil {
+		if err := validateChapterContainerConfig(value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+var chapterStatusEnum = map[string]bool{
+	"active": true, "dormant": true, "merged": true, "abandoned": true, "frozen": true,
+}
+
+var chapterRoleEnum = map[string]bool{
+	"trunk": true, "branch": true, "exploration": true, "review": true,
+}
+
+// validateChapterContainerConfig mirrors the TypeScript containerConfigSchema:
+// composeFile max 500, services array of non-empty strings, ports array of
+// {containerPort 1..65535, serviceName min 1}, env record of strings.
+func validateChapterContainerConfig(value any) error {
+	cfg, ok := jsondb.DecodeValue(value).(map[string]any)
+	if !ok {
+		return httpx.ValidationError("containerConfig must be an object")
+	}
+	if composeFile, ok := cfg["composeFile"]; ok && composeFile != nil {
+		text, valid := composeFile.(string)
+		if !valid || utf8.RuneCountInString(text) > 500 {
+			return httpx.ValidationError("containerConfig.composeFile must be at most 500 characters")
+		}
+	}
+	if services, ok := cfg["services"]; ok && services != nil {
+		items, valid := services.([]any)
+		if !valid {
+			return httpx.ValidationError("containerConfig.services must be an array")
+		}
+		for i, item := range items {
+			text, valid := item.(string)
+			if !valid || strings.TrimSpace(text) == "" {
+				return httpx.ValidationError("containerConfig.services[" + strconv.Itoa(i) + "] must be a non-empty string")
+			}
+		}
+	}
+	if ports, ok := cfg["ports"]; ok && ports != nil {
+		items, valid := ports.([]any)
+		if !valid {
+			return httpx.ValidationError("containerConfig.ports must be an array")
+		}
+		for i, item := range items {
+			port, valid := item.(map[string]any)
+			path := "containerConfig.ports[" + strconv.Itoa(i) + "]"
+			if !valid {
+				return httpx.ValidationError(path + " must be an object")
+			}
+			containerPort, ok := numberAsInt(port["containerPort"])
+			if !ok || containerPort < 1 || containerPort > 65535 {
+				return httpx.ValidationError(path + ".containerPort must be between 1 and 65535")
+			}
+			serviceName, valid := port["serviceName"].(string)
+			if !valid || strings.TrimSpace(serviceName) == "" {
+				return httpx.ValidationError(path + ".serviceName must be a non-empty string")
+			}
+		}
+	}
+	if env, ok := cfg["env"]; ok && env != nil {
+		record, valid := env.(map[string]any)
+		if !valid {
+			return httpx.ValidationError("containerConfig.env must be an object")
+		}
+		for key, item := range record {
+			if _, valid := item.(string); !valid {
+				return httpx.ValidationError("containerConfig.env." + key + " must be a string")
+			}
+		}
+	}
+	return nil
+}
+
+func numberAsInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed), typed == float64(int(typed))
+	case float32:
+		return int(typed), float64(typed) == float64(int(typed))
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	default:
+		return 0, false
+	}
+}
+
 func (s *Service) Update(ctx context.Context, chapterID string, fields map[string]any) (Chapter, error) {
+	if err := validateChapterUpdateFields(fields); err != nil {
+		return Chapter{}, err
+	}
 	existing, err := s.Get(ctx, chapterID)
 	if err != nil {
 		return Chapter{}, err

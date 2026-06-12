@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -79,6 +80,39 @@ func TestProjectImportRouteRestoresBackupContract(t *testing.T) {
 	}
 	if got := countProjectRouteRows(t, target, "narrator_messages"); got != 1 {
 		t.Fatalf("imported narrator_messages count=%d", got)
+	}
+}
+
+// Wave 291: Go project create must mirror the TypeScript createProjectSchema Zod
+// bounds — name min 1 / max 200, description max 2000, cloneUsername/clonePassword
+// max 200 — and reject out-of-range values with 400 before touching git.
+func TestCreateProjectValidatesZodBoundsLikeTypeScript(t *testing.T) {
+	h := NewHandler(&Service{})
+	r := chi.NewRouter()
+	r.Route("/projects", h.RegisterRoutes)
+
+	longName := strings.Repeat("x", 201)
+	longText := strings.Repeat("d", 2001)
+	longCred := strings.Repeat("c", 201)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"empty name", `{"name":"  ","repoMode":"existing","gitPath":"/tmp/x"}`},
+		{"overlong name", `{"name":"` + longName + `","repoMode":"existing","gitPath":"/tmp/x"}`},
+		{"overlong description", `{"name":"Proj","description":"` + longText + `","repoMode":"existing","gitPath":"/tmp/x"}`},
+		{"overlong cloneUsername", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","cloneUsername":"` + longCred + `"}`},
+		{"overlong clonePassword", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","clonePassword":"` + longCred + `"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/projects", bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("create project %q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
 	}
 }
 

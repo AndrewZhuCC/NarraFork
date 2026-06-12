@@ -627,8 +627,11 @@ func (h *Handler) RegisterSkills(r chi.Router) {
 	r.Delete("/global/{name}", httpx.Handler(h.deleteGlobalSkill))
 	r.Post("/global/{name}/toggle", httpx.Handler(h.toggleGlobalSkill))
 	r.Get("/", httpx.Handler(h.listProjectSkills))
+	r.Post("/", httpx.Handler(h.createProjectSkill))
 	r.Get("/{name}/files/*", httpx.Handler(h.getSkillFile))
 	r.Get("/{name}", httpx.Handler(h.getProjectSkill))
+	r.Put("/{name}", httpx.Handler(h.updateProjectSkill))
+	r.Delete("/{name}", httpx.Handler(h.deleteProjectSkill))
 }
 
 func (h *Handler) listGlobalSkills(w http.ResponseWriter, r *http.Request) error {
@@ -675,6 +678,266 @@ func (h *Handler) getProjectSkill(w http.ResponseWriter, r *http.Request) error 
 	return nil
 }
 
+// createProjectSkill mirrors the TypeScript `POST /api/skills?projectId=...` route:
+// it validates the Zod bounds, sanitizes the directory name, rejects duplicates,
+// enforces project-path/symlink safety, writes SKILL.md, and returns the skill with 201.
+func (h *Handler) createProjectSkill(w http.ResponseWriter, r *http.Request) error {
+	if h.DB == nil {
+		writeProjectSkillsDisabled(w)
+		return nil
+	}
+	gitPath, err := h.projectGitPath(r.Context(), r.URL.Query().Get("projectId"))
+	if err != nil {
+		return err
+	}
+	var body struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Content     string `json:"content"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		return err
+	}
+	if msg := validateProjectSkillBounds(body.Name, body.Description, body.Content); msg != "" {
+		return httpx.BadRequest(msg)
+	}
+	name := strings.TrimSpace(body.Name)
+	description := strings.TrimSpace(body.Description)
+	content := strings.TrimSpace(body.Content)
+	if name == "" {
+		return httpx.BadRequest("name is required")
+	}
+	if description == "" {
+		return httpx.BadRequest("description is required")
+	}
+	dirName := sanitizeProjectSkillDirName(name)
+	if dirName == "" {
+		return httpx.BadRequest("Invalid skill name")
+	}
+	if existing, _ := loadProjectSkillByName(gitPath, name); existing != nil {
+		return httpx.BadRequest("Project skill already exists: " + name)
+	}
+	skillDir := filepath.Join(gitPath, ".narrafork", "skills", dirName)
+	skillFile := filepath.Join(skillDir, "SKILL.md")
+	if err := assertNoSkillSymlinkAncestor(gitPath, skillDir); err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(skillDir); statErr == nil {
+		return httpx.BadRequest("Skill directory already exists: " + dirName)
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		return err
+	}
+	if err := assertSkillPathInsideProject(gitPath, skillDir); err != nil {
+		return err
+	}
+	if err := os.WriteFile(skillFile, []byte(buildSkillMarkdown(name, description, content)), 0o644); err != nil {
+		return err
+	}
+	item, err := loadProjectSkillByName(gitPath, name)
+	if err != nil || item == nil {
+		return httpx.Error(http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to create project skill — parse error")
+	}
+	httpx.WriteJSON(w, http.StatusCreated, item)
+	return nil
+}
+
+// updateProjectSkill mirrors the TypeScript `PUT /api/skills/{name}?projectId=...` route.
+func (h *Handler) updateProjectSkill(w http.ResponseWriter, r *http.Request) error {
+	if h.DB == nil {
+		writeProjectSkillsDisabled(w)
+		return nil
+	}
+	gitPath, err := h.projectGitPath(r.Context(), r.URL.Query().Get("projectId"))
+	if err != nil {
+		return err
+	}
+	currentName := chi.URLParam(r, "name")
+	var body struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Content     string `json:"content"`
+	}
+	if err := httpx.DecodeJSON(r, &body); err != nil {
+		return err
+	}
+	if msg := validateProjectSkillBounds(body.Name, body.Description, body.Content); msg != "" {
+		return httpx.BadRequest(msg)
+	}
+	existing, err := loadProjectSkillByName(gitPath, currentName)
+	if err != nil || existing == nil {
+		return httpx.NotFound("Project skill")
+	}
+	name := strings.TrimSpace(body.Name)
+	if name == "" {
+		name = strings.TrimSpace(currentName)
+	}
+	description := strings.TrimSpace(body.Description)
+	content := strings.TrimSpace(body.Content)
+	if description == "" {
+		return httpx.BadRequest("description is required")
+	}
+	existingLocation := stringValue(existing["location"])
+	if name != currentName {
+		if duplicate, _ := loadProjectSkillByName(gitPath, name); duplicate != nil && stringValue(duplicate["location"]) != existingLocation {
+			return httpx.BadRequest("Project skill already exists: " + name)
+		}
+	}
+	if err := assertSkillPathInsideProject(gitPath, existingLocation); err != nil {
+		return err
+	}
+	if err := os.WriteFile(existingLocation, []byte(buildSkillMarkdown(name, description, content)), 0o644); err != nil {
+		return err
+	}
+	item, err := loadProjectSkillByName(gitPath, name)
+	if err != nil || item == nil {
+		return httpx.Error(http.StatusInternalServerError, "INTERNAL_ERROR", "Failed to update project skill — parse error")
+	}
+	httpx.WriteJSON(w, http.StatusOK, item)
+	return nil
+}
+
+// deleteProjectSkill mirrors the TypeScript `DELETE /api/skills/{name}?projectId=...` route.
+func (h *Handler) deleteProjectSkill(w http.ResponseWriter, r *http.Request) error {
+	if h.DB == nil {
+		writeProjectSkillsDisabled(w)
+		return nil
+	}
+	gitPath, err := h.projectGitPath(r.Context(), r.URL.Query().Get("projectId"))
+	if err != nil {
+		return err
+	}
+	existing, err := loadProjectSkillByName(gitPath, chi.URLParam(r, "name"))
+	if err != nil || existing == nil {
+		return httpx.NotFound("Project skill")
+	}
+	location := stringValue(existing["location"])
+	if err := assertSkillPathInsideProject(gitPath, location); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(filepath.Dir(location)); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
+}
+
+// validateProjectSkillBounds mirrors the TypeScript project skill Zod bounds:
+// name max 100, description max 2000, content max 200000. Returns an error
+// message when a bound is exceeded, or "" when valid.
+func validateProjectSkillBounds(name, description, content string) string {
+	if len(name) > 100 {
+		return "name must be at most 100 characters"
+	}
+	if len(description) > 2000 {
+		return "description must be at most 2000 characters"
+	}
+	if len(content) > 200000 {
+		return "content must be at most 200000 characters"
+	}
+	return ""
+}
+
+// sanitizeProjectSkillDirName mirrors the TypeScript sanitizeSkillDirName helper:
+// lowercase, replace any char outside [a-z0-9\u4e00-\u9fff_-] with a hyphen,
+// collapse consecutive hyphens, and trim leading/trailing hyphens.
+func sanitizeProjectSkillDirName(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	var builder strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || (r >= '\u4e00' && r <= '\u9fff') {
+			builder.WriteRune(r)
+			continue
+		}
+		builder.WriteByte('-')
+	}
+	collapsed := builder.String()
+	for strings.Contains(collapsed, "--") {
+		collapsed = strings.ReplaceAll(collapsed, "--", "-")
+	}
+	return strings.Trim(collapsed, "-")
+}
+
+// loadProjectSkillByName returns the project-scoped skill with the given name, or nil.
+func loadProjectSkillByName(gitPath, name string) (map[string]any, error) {
+	for _, skill := range loadProjectSkills(gitPath) {
+		if stringValue(skill["name"]) == name {
+			return skill, nil
+		}
+	}
+	return nil, nil
+}
+
+// assertSkillPathInsideProject mirrors the TypeScript assertPathInsideProject guard:
+// the target must resolve inside the project repository both lexically and after
+// resolving symlinks (best-effort when the target does not yet exist).
+func assertSkillPathInsideProject(gitPath, target string) error {
+	projectRoot, err := filepath.Abs(gitPath)
+	if err != nil {
+		return err
+	}
+	resolvedTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	if !isInsidePath(projectRoot, resolvedTarget) {
+		return httpx.BadRequest("Skill path must be inside the project repository")
+	}
+	realRoot, rootErr := filepath.EvalSymlinks(projectRoot)
+	realTarget, targetErr := filepath.EvalSymlinks(resolvedTarget)
+	if rootErr == nil && targetErr == nil && !isInsidePath(realRoot, realTarget) {
+		return httpx.BadRequest("Skill path must be inside the project repository")
+	}
+	return nil
+}
+
+// assertNoSkillSymlinkAncestor mirrors the TypeScript assertNoSymlinkAncestor guard:
+// no existing path component between the project root and the target may be a symlink.
+func assertNoSkillSymlinkAncestor(gitPath, target string) error {
+	projectRoot, err := filepath.Abs(gitPath)
+	if err != nil {
+		return err
+	}
+	resolvedTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	if !isInsidePath(projectRoot, resolvedTarget) {
+		return httpx.BadRequest("Skill path must be inside the project repository")
+	}
+	rel, err := filepath.Rel(projectRoot, resolvedTarget)
+	if err != nil || rel == "" || rel == "." || strings.HasPrefix(rel, "..") {
+		return nil
+	}
+	current := projectRoot
+	for _, part := range strings.FieldsFunc(rel, func(r rune) bool { return r == '/' || r == '\\' }) {
+		current = filepath.Join(current, part)
+		info, statErr := os.Lstat(current)
+		if statErr != nil {
+			// Remaining path does not exist yet, so it cannot already be a symlink.
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return httpx.BadRequest("Project skill paths cannot contain symbolic links")
+		}
+	}
+	return nil
+}
+
+// isInsidePath reports whether target is the root itself or nested inside it.
+func isInsidePath(root, target string) bool {
+	if root == target {
+		return true
+	}
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && rel != "."
+}
+
 func (h *Handler) createGlobalSkill(w http.ResponseWriter, r *http.Request) error {
 	return h.writeSkill(w, r, "", http.StatusCreated)
 }
@@ -701,6 +964,17 @@ func (h *Handler) writeSkill(w http.ResponseWriter, r *http.Request, currentName
 	}
 	if description == "" {
 		return httpx.BadRequest("description is required")
+	}
+	// Mirror the TypeScript project skill Zod bounds: name max 100,
+	// description max 2000, content max 200000.
+	if len(body.Name) > 100 {
+		return httpx.BadRequest("name must be at most 100 characters")
+	}
+	if len(body.Description) > 2000 {
+		return httpx.BadRequest("description must be at most 2000 characters")
+	}
+	if len(body.Content) > 200000 {
+		return httpx.BadRequest("content must be at most 200000 characters")
 	}
 	var targetPath string
 	if currentName == "" {
@@ -952,6 +1226,151 @@ func SlashSkillSummaries(gitPath string) []map[string]any {
 	return items
 }
 
+// skillDescriptionMaxChars mirrors the TypeScript MAX_SKILL_DESCRIPTION_CHARS bound
+// applied to skill summaries surfaced through the narrator skill-context route.
+const skillDescriptionMaxChars = 1000
+
+// maxSkillSummaryFiles mirrors the TypeScript files.slice(0, 20) bound.
+const maxSkillSummaryFiles = 20
+
+// NarratorSkillContextResult mirrors the TypeScript SkillContextLoadResult shape
+// returned by GET /api/narrators/{id}/skills: deduped skill summaries, per-root
+// scan metadata, and a stable scope key. Go scans the filesystem live on every
+// call (see Wave 309 directoryScanContract), so each root reports
+// cacheHit=false/refreshed=true/cacheable=false.
+type NarratorSkillContextResult struct {
+	Skills   []map[string]any
+	Roots    []map[string]any
+	ScopeKey string
+}
+
+// NarratorSkillContext resolves the global/project/workspace skill roots for a
+// narrator context and returns the deduped skill summaries plus per-root scan
+// metadata. projectGitPath may be empty; cwd is used to derive the workspace
+// root (its git root or the cwd itself). Roots are deduped by absolute path in
+// global -> project -> workspace precedence, and skills are deduped by name with
+// later roots overriding earlier ones (matching the TypeScript skill-service).
+func NarratorSkillContext(projectGitPath, cwd, nowISO string) NarratorSkillContextResult {
+	type skillRoot struct {
+		kind       string
+		normalized string
+	}
+	roots := []skillRoot{}
+	seen := map[string]bool{}
+	addRoot := func(kind, path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		normalized := path
+		if abs, err := filepath.Abs(path); err == nil {
+			normalized = abs
+		}
+		if seen[normalized] {
+			return
+		}
+		seen[normalized] = true
+		roots = append(roots, skillRoot{kind: kind, normalized: normalized})
+	}
+
+	addRoot("global", homeDir())
+	addRoot("project", projectGitPath)
+	if workspace := strings.TrimSpace(cwd); workspace != "" {
+		normalizedCwd := workspace
+		if abs, err := filepath.Abs(workspace); err == nil {
+			normalizedCwd = abs
+		}
+		if gitRoot := findSkillWorkspaceGitRoot(normalizedCwd); gitRoot != "" {
+			addRoot("workspace", gitRoot)
+		} else {
+			addRoot("workspace", normalizedCwd)
+		}
+	}
+
+	skillMap := map[string]map[string]any{}
+	skillOrder := []string{}
+	rootMetas := make([]map[string]any, 0, len(roots))
+	scopeParts := make([]string, 0, len(roots))
+	for _, root := range roots {
+		scopeParts = append(scopeParts, root.kind+":"+root.normalized)
+		scanned := mergeSkillsByName(scanSkillDirs(root.normalized))
+		for _, skill := range scanned {
+			name := stringValue(skill["name"])
+			if name == "" {
+				continue
+			}
+			summary := map[string]any{
+				"name":               name,
+				"description":        truncateSkillDescription(stringValue(skill["description"])),
+				"location":           skill["location"],
+				"files":              limitSkillFiles(skill["files"]),
+				"disabled":           boolValue(skill["disabled"]),
+				"source":             root.kind,
+				"rootKind":           root.kind,
+				"normalizedRootPath": root.normalized,
+			}
+			if _, exists := skillMap[name]; !exists {
+				skillOrder = append(skillOrder, name)
+			}
+			skillMap[name] = summary
+		}
+		rootMetas = append(rootMetas, map[string]any{
+			"rootKind":           root.kind,
+			"rootPath":           root.normalized,
+			"normalizedRootPath": root.normalized,
+			"scannedAt":          nowISO,
+			"lastAccessedAt":     nowISO,
+			"expiresAt":          nil,
+			"cacheHit":           false,
+			"refreshed":          true,
+			"cacheable":          false,
+			"skillCount":         len(scanned),
+		})
+	}
+
+	skills := make([]map[string]any, 0, len(skillOrder))
+	for _, name := range skillOrder {
+		skills = append(skills, skillMap[name])
+	}
+	return NarratorSkillContextResult{Skills: skills, Roots: rootMetas, ScopeKey: strings.Join(scopeParts, "|")}
+}
+
+func truncateSkillDescription(description string) string {
+	runes := []rune(description)
+	if len(runes) > skillDescriptionMaxChars {
+		return string(runes[:skillDescriptionMaxChars]) + "…"
+	}
+	return description
+}
+
+func limitSkillFiles(value any) []string {
+	raw, ok := value.([]string)
+	if !ok {
+		return []string{}
+	}
+	if len(raw) > maxSkillSummaryFiles {
+		return append([]string(nil), raw[:maxSkillSummaryFiles]...)
+	}
+	return append([]string(nil), raw...)
+}
+
+func findSkillWorkspaceGitRoot(startDir string) string {
+	dir, err := filepath.Abs(startDir)
+	if err != nil {
+		return ""
+	}
+	for {
+		if info, statErr := os.Stat(filepath.Join(dir, ".git")); statErr == nil && info != nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
 func findSkill(skills []map[string]any, name string) (map[string]any, error) {
 	name = strings.TrimSpace(name)
 	for _, skill := range skills {
@@ -1201,7 +1620,18 @@ func (h *Handler) putGlobalPrompt(w http.ResponseWriter, r *http.Request) error 
 	candidates := globalPromptCandidates()
 	target := body.FilePath
 	if target == "" {
-		target = candidates[0]
+		// Mirror the TypeScript write path: default to the first *existing* candidate
+		// so an existing ~/.claude/CLAUDE.md is updated in place; only fall back to
+		// the first candidate (~/.agents/AGENT.md) when none of them exist yet.
+		for _, candidate := range candidates {
+			if _, err := os.Stat(candidate); err == nil {
+				target = candidate
+				break
+			}
+		}
+		if target == "" {
+			target = candidates[0]
+		}
 	}
 	abs, err := filepath.Abs(target)
 	if err != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -138,9 +139,9 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	var req struct {
 		ChapterID  *string `json:"chapterId"`
 		NarratorID *string `json:"narratorId"`
-		Name       string  `json:"name"`
-		Cols       int     `json:"cols"`
-		Rows       int     `json:"rows"`
+		Name       *string `json:"name"`
+		Cols       *int    `json:"cols"`
+		Rows       *int    `json:"rows"`
 	}
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
@@ -148,7 +149,21 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if req.ChapterID == nil && req.NarratorID == nil {
 		return httpx.BadRequest("chapterId or narratorId is required")
 	}
-	name := strings.TrimSpace(req.Name)
+	// Mirror the TypeScript createTerminalSchema Zod bounds: name max length 100,
+	// cols int 10..500, rows int 2..200 when provided.
+	if req.Name != nil && len(*req.Name) > 100 {
+		return httpx.BadRequest("Invalid terminal create request")
+	}
+	if req.Cols != nil && (*req.Cols < 10 || *req.Cols > 500) {
+		return httpx.BadRequest("Invalid terminal create request")
+	}
+	if req.Rows != nil && (*req.Rows < 2 || *req.Rows > 200) {
+		return httpx.BadRequest("Invalid terminal create request")
+	}
+	name := ""
+	if req.Name != nil {
+		name = strings.TrimSpace(*req.Name)
+	}
 	if name == "" {
 		name = "Terminal"
 	}
@@ -163,13 +178,13 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if h.Runtime != nil {
-		cols := req.Cols
-		if cols <= 0 {
-			cols = 80
+		cols := 80
+		if req.Cols != nil && *req.Cols > 0 {
+			cols = *req.Cols
 		}
-		rows := req.Rows
-		if rows <= 0 {
-			rows = 24
+		rows := 24
+		if req.Rows != nil && *req.Rows > 0 {
+			rows = *req.Rows
 		}
 		if runtime, ok := h.Runtime.(sizedRuntime); ok {
 			err = runtime.EnsureSize(r.Context(), termID, cols, rows)
@@ -208,7 +223,14 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) error {
 	}
 	sets := []string{}
 	args := []any{}
-	if name, ok := body["name"].(string); ok && strings.TrimSpace(name) != "" {
+	// Mirror the TypeScript PATCH name validation: when `name` is provided it
+	// must be a non-empty (trimmed) string, otherwise return 400 rather than
+	// silently ignoring the field.
+	if rawName, present := body["name"]; present {
+		name, ok := rawName.(string)
+		if !ok || strings.TrimSpace(name) == "" {
+			return httpx.BadRequest("name must be a non-empty string")
+		}
 		sets = append(sets, "name = ?")
 		args = append(args, strings.TrimSpace(name))
 	}
@@ -299,7 +321,13 @@ func (h *Handler) processes(w http.ResponseWriter, r *http.Request) error {
 	}
 	items, err := ProcessTree(r.Context(), shellPID)
 	if err != nil {
-		return err
+		// Mirror the TypeScript getProcessInfoBatch behavior: process snapshot
+		// (`ps`) failures are swallowed and fall back to an empty list rather
+		// than surfacing a 500. Log non-fatally for diagnostics.
+		slog.Warn("terminal process snapshot failed; returning empty list",
+			"terminalId", terminalID, "shellPid", shellPID, "error", err)
+		httpx.WriteJSON(w, http.StatusOK, []any{})
+		return nil
 	}
 	httpx.WriteJSON(w, http.StatusOK, items)
 	return nil
@@ -484,6 +512,13 @@ func (h *Handler) createTab(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return httpx.BadRequest("name is required")
 	}
+	// Mirror the TypeScript createTerminalTabSchema refine: exactly one of
+	// chapterId or narratorId is required (XOR), not zero and not both.
+	hasChapter := req.ChapterID != nil && strings.TrimSpace(*req.ChapterID) != ""
+	hasNarrator := req.NarratorID != nil && strings.TrimSpace(*req.NarratorID) != ""
+	if hasChapter == hasNarrator {
+		return httpx.BadRequest("Exactly one of chapterId or narratorId is required")
+	}
 	tabID := id.New()
 	now := db.NowISO()
 	var sortOrder int
@@ -583,6 +618,38 @@ func (h *Handler) getViewState(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+// validTerminalViewStateLayout mirrors the TypeScript
+// `z.enum(["single", "split-h", "split-v", "triple", "quad"])` layout values.
+func validTerminalViewStateLayout(layout string) bool {
+	switch layout {
+	case "single", "split-h", "split-v", "triple", "quad":
+		return true
+	default:
+		return false
+	}
+}
+
+// validTerminalPanelAssignments mirrors the TypeScript panelAssignments record
+// schema: each value must be a string or an array of strings. A nil/absent map
+// (omitted or JSON null) is valid; arrays may only contain strings.
+func validTerminalPanelAssignments(assignments map[string]any) bool {
+	for _, value := range assignments {
+		switch v := value.(type) {
+		case string:
+			continue
+		case []any:
+			for _, item := range v {
+				if _, ok := item.(string); !ok {
+					return false
+				}
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func (h *Handler) putViewState(w http.ResponseWriter, r *http.Request) error {
 	claims := auth.UserFromContext(r.Context())
 	if claims == nil {
@@ -597,6 +664,23 @@ func (h *Handler) putViewState(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript updateTerminalViewStateSchema: at least one of
+	// chapterId or narratorId is required, and layout (when provided) must be
+	// one of the allowed enum values.
+	hasChapter := body.ChapterID != nil && strings.TrimSpace(*body.ChapterID) != ""
+	hasNarrator := body.NarratorID != nil && strings.TrimSpace(*body.NarratorID) != ""
+	if !hasChapter && !hasNarrator {
+		return httpx.BadRequest("Either chapterId or narratorId is required")
+	}
+	if body.Layout != "" && !validTerminalViewStateLayout(body.Layout) {
+		return httpx.BadRequest("Invalid terminal view state")
+	}
+	// Mirror the TypeScript panelAssignments schema:
+	// z.record(z.string(), z.union([z.string(), z.array(z.string())])).nullable().optional().
+	// Each value must be a string or an array of strings when provided.
+	if !validTerminalPanelAssignments(body.PanelAssignments) {
+		return httpx.BadRequest("Invalid terminal view state")
 	}
 	if body.Layout == "" {
 		body.Layout = "single"
