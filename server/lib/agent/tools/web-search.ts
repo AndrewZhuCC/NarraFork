@@ -1,7 +1,12 @@
 import { z } from "zod/v4";
 import { isKiroAvailable, kiroMcpCall, type McpResponse } from "../../kiro-adapter";
 import { logger } from "../../logger";
-import { getFirstNkpProvider, hasConfiguredNkpProvider } from "../../settings";
+import {
+	getFirstNkpProvider,
+	getFirstNugProvider,
+	hasConfiguredNkpProvider,
+	hasConfiguredNugProvider,
+} from "../../settings";
 import type { ToolDefinition, ToolResult } from "../types";
 
 function isAbortError(err: unknown): boolean {
@@ -11,6 +16,30 @@ function isAbortError(err: unknown): boolean {
 			err instanceof DOMException &&
 			err.name === "AbortError")
 	);
+}
+
+/** Call MCP search via NUG provider. */
+async function nugMcpSearch(query: string, signal?: AbortSignal): Promise<McpResponse> {
+	const config = getFirstNugProvider();
+	if (!config) throw new Error("No NUG provider configured");
+
+	const baseUrl = config.baseUrl.replace(/\/+$/, "");
+	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
+		method: "POST",
+		headers: {
+			"Content-Type": "application/json",
+			Authorization: `Bearer ${config.apiKey}`,
+		},
+		body: JSON.stringify({ query }),
+		signal,
+	});
+
+	if (!response.ok) {
+		const errText = await response.text().catch(() => "");
+		throw new Error(`NUG MCP search error ${response.status}: ${errText}`);
+	}
+
+	return (await response.json()) as McpResponse;
 }
 
 /** Call MCP search via NKP provider. */
@@ -89,17 +118,18 @@ export const webSearchTool: ToolDefinition = {
 	parameters: z.object({
 		query: z.string().describe("Search query string"),
 	}),
-	isAvailable: () => isKiroAvailable() || hasConfiguredNkpProvider(),
+	isAvailable: () => isKiroAvailable() || hasConfiguredNugProvider() || hasConfiguredNkpProvider(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { query } = args as { query: string };
 
 		const kiroUp = isKiroAvailable();
+		const nugUp = hasConfiguredNugProvider();
 		const nkpUp = hasConfiguredNkpProvider();
 
-		if (!kiroUp && !nkpUp) {
+		if (!kiroUp && !nugUp && !nkpUp) {
 			return {
 				output:
-					"Web search is not available: Kiro plugin is not loaded and no NKP provider configured",
+					"Web search is not available: Kiro plugin is not loaded and no NUG/NKP provider configured",
 				isError: true,
 			};
 		}
@@ -107,7 +137,7 @@ export const webSearchTool: ToolDefinition = {
 		try {
 			if (ctx.signal.aborted) throw new Error("Aborted");
 
-			// Try Kiro first; on failure, fall back to NKP if available.
+			// Try Kiro first; on failure, fall back to NUG then NKP.
 			// Do not fall back when the failure was caused by narrator interruption;
 			// that must unwind immediately so the agent loop can clean up.
 			let response: McpResponse | undefined;
@@ -116,13 +146,44 @@ export const webSearchTool: ToolDefinition = {
 					response = await kiroMcpCall("web_search", { query }, ctx.signal);
 				} catch (kiroErr) {
 					if (ctx.signal.aborted || isAbortError(kiroErr)) throw kiroErr;
-					if (nkpUp) {
+					if (nugUp) {
+						logger.warn("Kiro web search failed, falling back to NUG", {
+							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
+						});
+						try {
+							response = await nugMcpSearch(query, ctx.signal);
+						} catch (nugErr) {
+							if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
+							if (nkpUp) {
+								logger.warn("NUG web search failed, falling back to NKP", {
+									error: nugErr instanceof Error ? nugErr.message : String(nugErr),
+								});
+								response = await nkpMcpSearch(query, ctx.signal);
+							} else {
+								throw nugErr;
+							}
+						}
+					} else if (nkpUp) {
 						logger.warn("Kiro web search failed, falling back to NKP", {
 							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
 						});
 						response = await nkpMcpSearch(query, ctx.signal);
 					} else {
 						throw kiroErr;
+					}
+				}
+			} else if (nugUp) {
+				try {
+					response = await nugMcpSearch(query, ctx.signal);
+				} catch (nugErr) {
+					if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
+					if (nkpUp) {
+						logger.warn("NUG web search failed, falling back to NKP", {
+							error: nugErr instanceof Error ? nugErr.message : String(nugErr),
+						});
+						response = await nkpMcpSearch(query, ctx.signal);
+					} else {
+						throw nugErr;
 					}
 				}
 			} else {
