@@ -4,6 +4,7 @@ import type {
 	KiroHistoryMessage,
 	KiroHistoryUserMessage,
 	KiroImage,
+	KiroReasoningContent,
 	KiroToolResult,
 	StreamEvent,
 } from "../kiro-adapter";
@@ -21,6 +22,60 @@ import {
 /**
  * Shared Kiro protocol helpers used by both KiroProvider and NkpProvider.
  */
+
+/** A reasoning block as produced by the agent loop / stored in contentJson. */
+export interface KiroReasoningBlockInput {
+	text: string;
+	providerMetadata?: import("./types").ReasoningProviderMetadata;
+	outputIndex?: number;
+}
+
+/** A redacted (encrypted) thinking block. */
+export interface KiroRedactedThinkingInput {
+	data: string;
+	outputIndex?: number;
+}
+
+/**
+ * Merge streamed reasoning / redacted-thinking blocks into the single
+ * `reasoningContent` object that Kiro expects on an assistant history message.
+ *
+ * Kiro's `ReasoningContentForHistory` is a single object (not an array), so when
+ * a turn produced multiple reasoning blocks we concatenate their text and keep
+ * the signature of the last signed block (the signature covers the full thinking
+ * for that turn). A redacted block, when present, is carried alongside.
+ *
+ * Returns `undefined` when there is no reasoning to echo back.
+ */
+export function buildKiroReasoningContent(
+	reasoningBlocks?: KiroReasoningBlockInput[],
+	redactedThinkingBlocks?: KiroRedactedThinkingInput[],
+): KiroReasoningContent | undefined {
+	const texts: string[] = [];
+	let signature: string | undefined;
+	for (const rb of reasoningBlocks ?? []) {
+		if (rb.text) texts.push(rb.text);
+		const sig = rb.providerMetadata?.anthropic?.signature;
+		if (sig) signature = sig;
+	}
+
+	const redacted = redactedThinkingBlocks?.find((rb) => rb.data)?.data;
+
+	const hasText = texts.length > 0;
+	if (!hasText && !redacted) return undefined;
+
+	const reasoningContent: KiroReasoningContent = {};
+	if (hasText) {
+		reasoningContent.reasoningText = {
+			text: texts.join("\n"),
+			...(signature ? { signature } : {}),
+		};
+	}
+	if (redacted) {
+		reasoningContent.redactedContent = redacted;
+	}
+	return reasoningContent;
+}
 
 export function buildKiroRequest(params: ChatParams): KiroChatRequest {
 	const modelId = resolveModel(params.model);
@@ -537,9 +592,28 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 	}
 
 	if (evt.eventType === "reasoningContentEvent") {
+		// Kiro reasoning chunks carry the visible thinking text plus, on the
+		// Anthropic-backed channels, a `signature` and/or a base64
+		// `redactedContent` block. All three must survive so the assistant turn
+		// can be echoed back verbatim on the next request (see buildKiroHistory
+		// and the providers' pushAssistantTurn).
 		const content = evt.data.content ?? evt.data.text;
 		if (content != null) {
 			result.reasoning = String(content);
+		}
+		const signature = evt.data.signature ?? evt.data.reasoningSignature;
+		if (signature != null) {
+			result.reasoningMetadata = {
+				...result.reasoningMetadata,
+				anthropic: {
+					...result.reasoningMetadata?.anthropic,
+					signature: String(signature),
+				},
+			};
+		}
+		const redacted = evt.data.redactedContent ?? evt.data.redacted_content;
+		if (redacted != null) {
+			result.redactedThinking = { data: String(redacted) };
 		}
 	}
 
@@ -755,6 +829,26 @@ export async function buildKiroHistory(
 				.map((b: { text: string }) => b.text);
 			const text = textParts.join("\n") || msg.contentText || "";
 
+			// Rebuild reasoning content from stored blocks so previous thinking
+			// (and its signature) is echoed back across turns.
+			// NOTE: upstream Kiro service requires snake_case "reasoning_content".
+			const reasoningBlocks = content
+				.filter((b: { type: string }) => b.type === "reasoning")
+				.map(
+					(b: {
+						text?: string;
+						providerMetadata?: import("./types").ReasoningProviderMetadata;
+					}) => ({
+						text: b.text ?? "",
+						providerMetadata: b.providerMetadata,
+					}),
+				);
+			const redactedThinkingBlocks = content
+				.filter((b: { type: string }) => b.type === "redacted_thinking")
+				.map((b: { data?: string }) => ({ data: b.data ?? "" }))
+				.filter((b: { data: string }) => b.data);
+			const reasoningContent = buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks);
+
 			// Only include tool uses that have completed results (success/fail).
 			// Kiro rejects tool_uses without matching tool_results.
 			const completedToolUseIds = new Set(
@@ -775,6 +869,7 @@ export async function buildKiroHistory(
 			const assistantMsg: KiroHistoryAssistantMessage = {
 				assistantResponseMessage: {
 					content: text || "",
+					...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 					...(toolUses.length > 0 ? { toolUses } : {}),
 				},
 			};

@@ -19,6 +19,7 @@ import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import {
 	buildKiroHistory,
+	buildKiroReasoningContent,
 	buildKiroRequest,
 	extractImageFileName,
 	parseSSEStream,
@@ -506,9 +507,13 @@ export class NugProvider implements ProviderAdapter {
 			return;
 		}
 		const h = history as KiroHistoryMessage[];
+		// NOTE: upstream Kiro service requires snake_case "reasoning_content",
+		// not camelCase "reasoningContent".
+		const reasoningContent = buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks);
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
 				content: text || "",
+				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 				...(toolUses.length > 0
 					? {
 							toolUses: toolUses.map((tu) => ({

@@ -161,6 +161,23 @@ export interface KiroUserInputMessageContext {
 	tools?: KiroTool[];
 }
 
+/**
+ * Reasoning/thinking content echoed back in the conversation history.
+ *
+ * Mirrors the Kiro native `ReasoningContentForHistory` shape (verified against
+ * the kiro-cli 2.2.1 binary): a single object holding the visible thinking text
+ * with its verification `signature`, and/or a base64 `redactedContent` block for
+ * encrypted thinking. The Anthropic-backed Kiro models require the signature to
+ * be echoed verbatim so previous thinking can be reused across turns.
+ */
+export interface KiroReasoningContent {
+	reasoningText?: {
+		text: string;
+		signature?: string;
+	};
+	redactedContent?: string;
+}
+
 export interface KiroHistoryUserMessage {
 	userInputMessage: {
 		content: string;
@@ -174,6 +191,17 @@ export interface KiroHistoryUserMessage {
 export interface KiroHistoryAssistantMessage {
 	assistantResponseMessage: {
 		content?: string;
+		/**
+		 * Reasoning/thinking content to echo back to the Kiro service.
+		 *
+		 * NOTE: The Kiro streaming client binary (chat_cli) serializes this
+		 * field as `reasoning_content` (snake_case) rather than camelCase,
+		 * despite most other Kiro protocol fields using camelCase.  When this
+		 * field is sent as camelCase the upstream NUG/Kiro proxy returns a
+		 * 400 ValidationException.  Using snake_case here to match the actual
+		 * wire format expected by the service.
+		 */
+		reasoning_content?: KiroReasoningContent;
 		toolUses?: Array<{
 			toolUseId: string;
 			name: string;

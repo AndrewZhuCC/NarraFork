@@ -13,6 +13,7 @@ import type { NKPProviderConfig } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import {
 	buildKiroHistory,
+	buildKiroReasoningContent,
 	buildKiroRequest,
 	extractImageFileName,
 	normalizeKiroChatRequest,
@@ -215,9 +216,10 @@ export class NkpProvider implements ProviderAdapter {
 		history: unknown[],
 		text: string,
 		toolUses: AgentToolUse[],
-		_reasoningBlocks?: Array<{
+		reasoningBlocks?: Array<{
 			text: string;
 			providerMetadata?: import("./types").ReasoningProviderMetadata;
+			outputIndex?: number;
 		}>,
 		_webSearches?: Array<{
 			id: string;
@@ -226,11 +228,22 @@ export class NkpProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		_messageId?: string,
+		_imageGenerations?: Array<{
+			id: string;
+			revisedPrompt?: string;
+			result?: string;
+			outputIndex?: number;
+		}>,
+		_textOutputIndex?: number,
+		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
 	): void {
 		const h = history as KiroHistoryMessage[];
+		// NOTE: upstream Kiro service requires snake_case "reasoning_content".
+		const reasoningContent = buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks);
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
 				content: text || "",
+				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
 				...(toolUses.length > 0
 					? {
 							toolUses: toolUses.map((tu) => ({
