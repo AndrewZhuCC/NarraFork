@@ -2523,6 +2523,18 @@ export function NarratorPanel({
 		[narratorId, t],
 	);
 
+	const handleRestoreAssistantMessage = useCallback(
+		async (messageId: string) => {
+			try {
+				await api.restoreAssistantMessage(narratorId, messageId);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "Failed to restore message";
+				notifications.show({ title: t("editFailed"), message, color: "red" });
+			}
+		},
+		[narratorId, t],
+	);
+
 	// --- Editing message state ---
 	// Tracks when a MessageBubble is in edit mode so the bottom send/retry
 	// button can trigger the edit submit instead of the default action.
@@ -4571,6 +4583,7 @@ export function NarratorPanel({
 					rollbackEditRegenerateSupported ? handleRollback : undefined,
 					rollbackEditRegenerateSupported ? handleEditAndRegenerate : undefined,
 					handleEditAssistantMessage,
+					handleRestoreAssistantMessage,
 					lastUserMessageId,
 					hasChapter,
 					onViewSubagentSession,
@@ -4711,6 +4724,7 @@ export function NarratorPanel({
 		handleRollback,
 		handleEditAndRegenerate,
 		handleEditAssistantMessage,
+		handleRestoreAssistantMessage,
 		rollbackEditRegenerateSupported,
 		pruneBoundaryMessageId,
 		pruneDividerLabel,
