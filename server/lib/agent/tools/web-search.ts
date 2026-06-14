@@ -18,6 +18,68 @@ function isAbortError(err: unknown): boolean {
 	);
 }
 
+function createNamedError(message: string, name: "AbortError" | "TimeoutError"): Error {
+	if (typeof DOMException !== "undefined") {
+		return new DOMException(message, name);
+	}
+	const err = new Error(message);
+	err.name = name;
+	return err;
+}
+
+function normalizeAbortReason(reason: unknown): Error {
+	return reason instanceof Error ? reason : createNamedError("Aborted", "AbortError");
+}
+
+/** Per-call timeout for a single web search attempt (ms). */
+const WEB_SEARCH_TIMEOUT_MS = 60_000;
+
+/**
+ * Run a single search attempt with a hard timeout, while still honouring the
+ * caller's abort signal.
+ *
+ * The timeout races the provider call instead of merely aborting its signal, so
+ * fallback can continue even if a lower layer ignores AbortSignal (for example,
+ * while queued behind a provider-local concurrency limiter). User interruption
+ * is still surfaced as AbortError and must not fall through to another provider.
+ */
+export async function withSearchTimeout<T>(
+	ctxSignal: AbortSignal | undefined,
+	fn: (signal: AbortSignal) => Promise<T>,
+	timeoutMs = WEB_SEARCH_TIMEOUT_MS,
+): Promise<T> {
+	if (ctxSignal?.aborted) throw normalizeAbortReason(ctxSignal.reason);
+
+	const controller = new AbortController();
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let onAbort: (() => void) | undefined;
+
+	const operation = Promise.resolve().then(() => fn(controller.signal));
+	const timeoutOrAbort = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			const err = createNamedError("Web search timed out", "TimeoutError");
+			controller.abort(err);
+			reject(err);
+		}, timeoutMs);
+
+		if (ctxSignal) {
+			onAbort = () => {
+				const err = normalizeAbortReason(ctxSignal.reason);
+				controller.abort(err);
+				reject(err);
+			};
+			ctxSignal.addEventListener("abort", onAbort, { once: true });
+		}
+	});
+
+	try {
+		return await Promise.race([operation, timeoutOrAbort]);
+	} finally {
+		if (timer) clearTimeout(timer);
+		if (ctxSignal && onAbort) ctxSignal.removeEventListener("abort", onAbort);
+	}
+}
+
 /** Call MCP search via NUG provider. */
 async function nugMcpSearch(query: string, signal?: AbortSignal): Promise<McpResponse> {
 	const config = getFirstNugProvider();
@@ -143,7 +205,9 @@ export const webSearchTool: ToolDefinition = {
 			let response: McpResponse | undefined;
 			if (kiroUp) {
 				try {
-					response = await kiroMcpCall("web_search", { query }, ctx.signal);
+					response = await withSearchTimeout(ctx.signal, (signal) =>
+						kiroMcpCall("web_search", { query }, signal),
+					);
 				} catch (kiroErr) {
 					if (ctx.signal.aborted || isAbortError(kiroErr)) throw kiroErr;
 					if (nugUp) {
@@ -151,14 +215,18 @@ export const webSearchTool: ToolDefinition = {
 							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
 						});
 						try {
-							response = await nugMcpSearch(query, ctx.signal);
+							response = await withSearchTimeout(ctx.signal, (signal) =>
+								nugMcpSearch(query, signal),
+							);
 						} catch (nugErr) {
 							if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
 							if (nkpUp) {
 								logger.warn("NUG web search failed, falling back to NKP", {
 									error: nugErr instanceof Error ? nugErr.message : String(nugErr),
 								});
-								response = await nkpMcpSearch(query, ctx.signal);
+								response = await withSearchTimeout(ctx.signal, (signal) =>
+									nkpMcpSearch(query, signal),
+								);
 							} else {
 								throw nugErr;
 							}
@@ -167,27 +235,27 @@ export const webSearchTool: ToolDefinition = {
 						logger.warn("Kiro web search failed, falling back to NKP", {
 							error: kiroErr instanceof Error ? kiroErr.message : String(kiroErr),
 						});
-						response = await nkpMcpSearch(query, ctx.signal);
+						response = await withSearchTimeout(ctx.signal, (signal) => nkpMcpSearch(query, signal));
 					} else {
 						throw kiroErr;
 					}
 				}
 			} else if (nugUp) {
 				try {
-					response = await nugMcpSearch(query, ctx.signal);
+					response = await withSearchTimeout(ctx.signal, (signal) => nugMcpSearch(query, signal));
 				} catch (nugErr) {
 					if (ctx.signal.aborted || isAbortError(nugErr)) throw nugErr;
 					if (nkpUp) {
 						logger.warn("NUG web search failed, falling back to NKP", {
 							error: nugErr instanceof Error ? nugErr.message : String(nugErr),
 						});
-						response = await nkpMcpSearch(query, ctx.signal);
+						response = await withSearchTimeout(ctx.signal, (signal) => nkpMcpSearch(query, signal));
 					} else {
 						throw nugErr;
 					}
 				}
 			} else {
-				response = await nkpMcpSearch(query, ctx.signal);
+				response = await withSearchTimeout(ctx.signal, (signal) => nkpMcpSearch(query, signal));
 			}
 
 			if (response.error) {
