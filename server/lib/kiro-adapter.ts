@@ -137,6 +137,13 @@ export interface StreamEvent {
 export interface KiroImage {
 	format: "jpeg" | "png" | "gif" | "webp";
 	source: { bytes: string };
+	/**
+	 * Optional content-addressed reference (e.g. "sha256:<hex>") used by the NUG
+	 * image dedup protocol. When set on a history image, `source.bytes` may be
+	 * empty: the NUG gateway restores the payload from its cache by this ref.
+	 * Ignored by all non-NUG transports.
+	 */
+	imageRef?: string;
 }
 
 export interface KiroToolSpecification {
