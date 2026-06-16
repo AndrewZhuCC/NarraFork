@@ -348,6 +348,7 @@ interface NarratorWSCallbacks {
 		}>;
 	}) => void;
 	onBrowserSessionCount?: (count: number) => void;
+	onBrowserSessionVisualChange?: (sessionId: string) => void;
 }
 
 function getDeepestMessageId(message: TreeMessage | undefined): string | undefined {
@@ -1029,6 +1030,9 @@ export function useNarratorWS(
 						callbacksRef.current.onBrowserSessionCount?.(
 							(data.activeBrowserSessions as number) ?? 0,
 						);
+						break;
+					case "browser_session_visual_change":
+						callbacksRef.current.onBrowserSessionVisualChange?.(data.sessionId as string);
 						break;
 				}
 			},
