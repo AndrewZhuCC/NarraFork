@@ -1564,6 +1564,27 @@ function getCodexReasoningEffortOptions(
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_REASONING_EFFORT_OPTIONS;
 }
 
+/**
+ * Map a NUG kiro model's advertised effort levels (low/medium/high/xhigh/max)
+ * onto the UI's unified enum. Upstream "max" is presented as "xhigh" (the
+ * unified enum has no "max"; the NUG kiro channel bridges xhigh→max on the
+ * wire). Always prepends "none" so the user can disable thinking.
+ */
+function getKiroReasoningEffortOptions(
+	modelOption?: ModelOption,
+): readonly ReasoningEffortValue[] | undefined {
+	const levels = modelOption?.effortLevels;
+	if (!levels || levels.length === 0) return undefined;
+	const order: ReasoningEffortValue[] = ["low", "medium", "high", "xhigh"];
+	const present = new Set<ReasoningEffortValue>();
+	for (const level of levels) {
+		const mapped = level === "max" ? "xhigh" : (level as ReasoningEffortValue);
+		if (order.includes(mapped)) present.add(mapped);
+	}
+	const ordered = order.filter((l) => present.has(l));
+	return ["none", ...ordered];
+}
+
 function isDeepSeekModel(model?: string): boolean {
 	if (!model) return false;
 	return model.toLowerCase().includes("deepseek");
@@ -2388,6 +2409,11 @@ export function NarratorPanel({
 		if (!resolvedModel) return DEFAULT_REASONING_EFFORT_OPTIONS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
+		// NUG kiro models: use the per-model effort levels reported by the gateway.
+		if (resolvedModelOption?.channelType === "kiro") {
+			const kiroOptions = getKiroReasoningEffortOptions(resolvedModelOption);
+			if (kiroOptions) return kiroOptions;
+		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
 			return getCodexReasoningEffortOptions(resolvedModel, resolvedModelOption);

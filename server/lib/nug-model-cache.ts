@@ -17,6 +17,7 @@ export interface NugModelInfo extends Record<string, unknown> {
 	available?: boolean;
 	contextLength?: number;
 	contextWindow?: number;
+	effortLevels?: string[];
 }
 
 export interface ResolvedNugModelMeta {
@@ -29,6 +30,7 @@ export interface ResolvedNugModelMeta {
 	bareModel: string;
 	name?: string;
 	available?: boolean;
+	effortLevels?: string[];
 }
 
 export interface NugModelsGroup {
@@ -78,7 +80,23 @@ function toNugModelInfo(raw: Record<string, unknown>): NugModelInfo | null {
 		info.contextLength = contextLength;
 		info.contextWindow = contextLength;
 	}
+	const effortLevels = stringArrayField(raw, ["effortLevels", "effort_levels"]);
+	if (effortLevels && effortLevels.length > 0) info.effortLevels = effortLevels;
 	return info;
+}
+
+function stringArrayField(raw: Record<string, unknown>, keys: string[]): string[] | undefined {
+	for (const key of keys) {
+		const value = raw[key];
+		if (Array.isArray(value)) {
+			const out = value
+				.filter((v): v is string => typeof v === "string")
+				.map((v) => v.trim())
+				.filter((v) => v !== "");
+			if (out.length > 0) return out;
+		}
+	}
+	return undefined;
 }
 
 function normalizeModels(models: Array<Record<string, unknown>>): NugModelInfo[] {
@@ -261,6 +279,7 @@ export function resolveNugModelMeta(
 			bareModel,
 			name: hit.name,
 			available: hit.available,
+			effortLevels: hit.effortLevels,
 		};
 	}
 

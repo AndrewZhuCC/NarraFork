@@ -172,6 +172,8 @@ export interface NugBillingOrderResponse {
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
+/** Effort levels accepted as a Kiro reasoning hint (mirrors the Go backend whitelist). */
+const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh"]);
 
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
@@ -207,7 +209,7 @@ export class NugProvider implements ProviderAdapter {
 		return { [NUG_MODEL_HASH_HEADER]: this.modelHashHeaderValue() };
 	}
 
-	private chatHeaders(conversationId?: string): Record<string, string> {
+	private chatHeaders(conversationId?: string, effort?: string): Record<string, string> {
 		const h: Record<string, string> = {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${this.config.apiKey}`,
@@ -216,6 +218,12 @@ export class NugProvider implements ProviderAdapter {
 		};
 		if (conversationId) {
 			h["X-Conversation-ID"] = conversationId;
+		}
+		// Kiro reasoning-effort hint. NUG's kiro channel injects the upstream
+		// additionalModelRequestFields based on this and the model's effort schema.
+		// Mirror the Go backend's whitelist so only valid effort levels are sent.
+		if (effort && KIRO_EFFORT_HINTS.has(effort)) {
+			h["X-Kiro-Effort"] = effort;
 		}
 		return h;
 	}
@@ -487,7 +495,7 @@ export class NugProvider implements ProviderAdapter {
 
 		const body = { model: meta.routedModel, ...request };
 		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
-		const headers = this.chatHeaders(conversationId);
+		const headers = this.chatHeaders(conversationId, params.reasoningEffort);
 		params.requestDump?.setRequest({
 			transport: "http",
 			url: `${this.baseUrl}/v1/kiro/chat`,
@@ -719,7 +727,7 @@ export class NugProvider implements ProviderAdapter {
 		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.chatHeaders(request.conversationState.conversationId),
+			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
 			body: JSON.stringify(body),
 		});
 
@@ -837,7 +845,7 @@ export class NugProvider implements ProviderAdapter {
 		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
-			headers: this.chatHeaders(request.conversationState.conversationId),
+			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
 			body: JSON.stringify(body),
 		});
 

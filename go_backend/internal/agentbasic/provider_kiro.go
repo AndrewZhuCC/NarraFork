@@ -180,6 +180,12 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	// Kiro reasoning-effort hint. The NUG kiro channel injects the upstream
+	// additionalModelRequestFields from this header plus the model's effort
+	// schema; NKP and the local plugin bridge ignore it harmlessly.
+	if effort := normalizeReasoningEffort(firstNonEmpty(params.ReasoningEffort, provider.DefaultReasoningEffort)); effort != "" && effort != "none" {
+		req.Header.Set("X-Kiro-Effort", effort)
+	}
 	if provider.Kind == "nkp" {
 		req.Header.Set("X-NKP-Request-Token", buildNkpRequestToken(provider.APIKey))
 	}
