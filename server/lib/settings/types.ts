@@ -202,6 +202,46 @@ export interface ClineProviderConfig {
 	enabledModels?: string[];
 }
 
+export type SearchChannelKind =
+	| "native"
+	| "kiro-mcp"
+	| "nug-mcp"
+	| "nkp-mcp"
+	| "custom-api"
+	| "subagent";
+
+export type CustomSearchProviderProtocol = "narrafork-search-v1";
+
+export interface SearchChannelConfig {
+	/** Stable channel ID: native, kiro:local, nug:{id}, nkp:{id}, custom:{id}, subagent. */
+	id: string;
+	kind: SearchChannelKind;
+	enabled: boolean;
+	providerId?: string;
+	model?: string;
+	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+	maxTurns?: number;
+	timeoutMs?: number;
+}
+
+export interface CustomSearchProviderConfig {
+	id: string;
+	name: string;
+	disabled?: boolean;
+	protocol: CustomSearchProviderProtocol;
+	baseUrl: string;
+	apiKey?: string;
+	headers?: Record<string, string>;
+	timeoutMs?: number;
+}
+
+export interface SearchSettings {
+	channels: SearchChannelConfig[];
+	customProviders: CustomSearchProviderConfig[];
+	defaultTimeoutMs?: number;
+	maxOutputChars?: number;
+}
+
 export interface ModelAggregation {
 	/** Unique short ID (8 chars, nanoid). */
 	id: string;
@@ -284,12 +324,14 @@ export interface NarraForkSettings {
 		subagentModels: {
 			explore: string;
 			plan: string;
+			search?: string;
 		};
 		/** Per-type allowed model pools for subagents. Empty array = no restriction. */
 		subagentAllowedModels: {
 			explore: string[];
 			plan: string[];
 			general: string[];
+			search?: string[];
 		};
 		legacyEncoding: boolean;
 		/**
@@ -479,6 +521,8 @@ export interface NarraForkSettings {
 		/** Allow the native image_generation tool to be sent to Codex models. Enabled by default. */
 		useImageGeneration?: boolean;
 	};
+	/** Unified web search channel configuration. */
+	search?: SearchSettings;
 	/** Built-in routines configuration. */
 	routines: {
 		/** Globally disabled routine IDs (blacklist — all enabled by default). */
