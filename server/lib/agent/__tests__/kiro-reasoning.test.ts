@@ -4,12 +4,12 @@ import type {
 	KiroHistoryMessage,
 	StreamEvent,
 } from "../../kiro-adapter";
-import { KiroProvider } from "../kiro-provider";
 import {
 	buildKiroHistory,
 	buildKiroReasoningContent,
 	parseKiroStreamEvent,
 } from "../kiro-protocol";
+import { KiroProvider } from "../kiro-provider";
 import type { DbMessage } from "../provider";
 
 function assistantOf(history: KiroHistoryMessage[]): KiroHistoryAssistantMessage {
@@ -61,10 +61,7 @@ describe("kiro reasoning — buildKiroReasoningContent helper", () => {
 	});
 
 	test("carries redactedContent alongside text", () => {
-		const result = buildKiroReasoningContent(
-			[{ text: "visible" }],
-			[{ data: "ZW5j" }],
-		);
+		const result = buildKiroReasoningContent([{ text: "visible" }], [{ data: "ZW5j" }]);
 		expect(result).toEqual({
 			reasoningText: { text: "visible" },
 			redactedContent: "ZW5j",
