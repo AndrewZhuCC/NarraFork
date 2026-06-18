@@ -1110,7 +1110,8 @@
 			],
 			"knownGaps": [
 				"full TS-created live-session failure transcript fixtures",
-				"provider SSE/live-stream edge cases beyond focused Responses native lifecycle fixtures"
+				"provider SSE/live-stream edge cases beyond focused Responses native lifecycle fixtures",
+				"stateful-provider outer retry with rebuilt history: TS narrator-session/subagent-executor re-runs the agent loop rebuilding history from the DB for stateful providers (responses/codex), with codex quota-failover bypassRetryLimit making it unbounded; Go's loop emits retryable_error with code codex_quota_failover_rebuild (metadata preserved through WS/narrator_error) and stateless in-loop transient retries are at parity, but the session-level rebuilt-history outer retry and bypassRetryLimit unbounded retry are not implemented (large feature gated on live codex multi-credential/quota-failover + DB history rebuild). Stateful retryable errors finalize as narrator_error. Tracked via narrator.agentFinalization.statefulOuterRetryWithRebuiltHistory=false; guarded by TestStatefulRetryableErrorFinalizesWithoutSessionRerun."
 			],
 			"sideEffectPolicy": "If assistant transcript persistence succeeds but the final success status update fails, Go preserves the assistant message, persists a display error through the existing agent-error path, sets the narrator to idle/error when possible, and broadcasts narrator_error. If tool-result persistence fails after an assistant tool_use draft is written, Go preserves the tool_use transcript and uses the same display-error/status/broadcast compensation path when possible. Health exposes these bounded guarantees under narrator.agentFinalization while fullTSFailureParity remains false, so callers do not infer complete TS session failure parity.",
 			"tests": [

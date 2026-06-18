@@ -191,13 +191,13 @@ func (h *Handler) createBenchmarkSuite(w http.ResponseWriter, r *http.Request) e
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if err := validateBenchmarkSuitePayload(body["tasks"]); err != nil {
+	if err := validateBenchmarkSuiteBody(body); err != nil {
 		return err
 	}
 	suiteID := id.New()
 	now := db.NowISO()
 	tasks, _ := jsonMarshalString(body["tasks"])
-	_, err := h.DB.ExecContext(r.Context(), `INSERT INTO benchmark_suites (id,name,version,description,tasks_json,created_at) VALUES (?,?,?,?,?,?)`, suiteID, stringMap(body, "name", "Suite"), nullableMapString(body, "version"), nullableMapString(body, "description"), tasks, now)
+	_, err := h.DB.ExecContext(r.Context(), `INSERT INTO benchmark_suites (id,name,version,description,tasks_json,created_at) VALUES (?,?,?,?,?,?)`, suiteID, strings.TrimSpace(stringMap(body, "name", "Suite")), nullableMapString(body, "version"), nullableMapString(body, "description"), tasks, now)
 	if err != nil {
 		return err
 	}
@@ -240,7 +240,42 @@ func (h *Handler) createBenchmarkRun(w http.ResponseWriter, r *http.Request) err
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	suiteID := stringMap(body, "suiteId", "")
+	// Mirror the TypeScript createRunSchema (server/routes/benchmarks.ts):
+	// suiteId min1/max120, name min1/max120, model min1/max200, systemPrompt
+	// max100000 optional, permissionMode strict 5-value enum optional. Go
+	// previously read these via stringMap defaults with no bounds/enum checks, so
+	// a missing/over-long name/model, an empty suiteId (which fell through to a 404
+	// instead of a 400), or an invalid permissionMode was accepted.
+	suiteID := strings.TrimSpace(stringMap(body, "suiteId", ""))
+	if suiteID == "" || httpx.JSStringLength(suiteID) > 120 {
+		return httpx.BadRequest("benchmark run suiteId must be 1-120 characters")
+	}
+	runName := strings.TrimSpace(stringMap(body, "name", ""))
+	if runName == "" || httpx.JSStringLength(runName) > 120 {
+		return httpx.BadRequest("benchmark run name must be 1-120 characters")
+	}
+	model := strings.TrimSpace(stringMap(body, "model", ""))
+	if model == "" || httpx.JSStringLength(model) > 200 {
+		return httpx.BadRequest("benchmark run model must be 1-200 characters")
+	}
+	if value, ok := body["systemPrompt"]; ok && value != nil {
+		systemPrompt, isStr := value.(string)
+		if !isStr || httpx.JSStringLength(systemPrompt) > 100_000 {
+			return httpx.BadRequest("benchmark run systemPrompt must be <= 100000 characters")
+		}
+	}
+	if value, ok := body["permissionMode"]; ok && value != nil {
+		mode, isStr := value.(string)
+		if !isStr || !validStrictBenchmarkPermissionMode(mode) {
+			return httpx.BadRequest("permissionMode must be one of: default, acceptEdits, bypassPermissions, readOnly, dontAsk")
+		}
+	}
+	// config: optional metadataSchema (record key max100, jsonSize <= 200000).
+	if value, ok := body["config"]; ok && value != nil {
+		if err := validateBenchmarkMetadata(value, "benchmark run config"); err != nil {
+			return err
+		}
+	}
 	var rawTasks sql.NullString
 	if err := h.DB.QueryRowContext(r.Context(), `SELECT tasks_json FROM benchmark_suites WHERE id=?`, suiteID).Scan(&rawTasks); err != nil {
 		if err == sql.ErrNoRows {
@@ -252,7 +287,7 @@ func (h *Handler) createBenchmarkRun(w http.ResponseWriter, r *http.Request) err
 	runID := id.New()
 	now := db.NowISO()
 	config, _ := jsonMarshalDefault(body["config"], "{}")
-	_, err := h.DB.ExecContext(r.Context(), `INSERT INTO benchmark_runs (id,suite_id,name,model,system_prompt,permission_mode,status,config,total_tasks,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`, runID, suiteID, stringMap(body, "name", "Run"), stringMap(body, "model", ""), nullableMapString(body, "systemPrompt"), stringMap(body, "permissionMode", "bypassPermissions"), "pending", config, len(tasks), now)
+	_, err := h.DB.ExecContext(r.Context(), `INSERT INTO benchmark_runs (id,suite_id,name,model,system_prompt,permission_mode,status,config,total_tasks,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)`, runID, suiteID, runName, model, nullableMapString(body, "systemPrompt"), stringMap(body, "permissionMode", "bypassPermissions"), "pending", config, len(tasks), now)
 	if err != nil {
 		return err
 	}
@@ -264,6 +299,15 @@ func (h *Handler) createBenchmarkRun(w http.ResponseWriter, r *http.Request) err
 	}
 	return h.getBenchmarkRunByID(w, r, runID, http.StatusCreated)
 }
+func validStrictBenchmarkPermissionMode(value string) bool {
+	switch value {
+	case "default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk":
+		return true
+	default:
+		return false
+	}
+}
+
 func (h *Handler) listBenchmarkRuns(w http.ResponseWriter, r *http.Request) error {
 	q := `SELECT id,suite_id,name,model,system_prompt,permission_mode,status,config,total_tasks,completed_tasks,passed_tasks,failed_tasks,total_cost_usd,total_tokens_in,total_tokens_out,total_duration_ms,created_at,started_at,completed_at FROM benchmark_runs`
 	args := []any{}
@@ -1336,7 +1380,13 @@ func trustedUpdateReleaseFromV2(source trustedUpdateSource, current string, data
 	expectedBytes := size
 	downloadSize := size
 	strategy := ""
-	if zstd, ok := data["zstdPatch"].(map[string]any); ok && zstd != nil {
+	// Mirror TS update-service: only select the zstd delta-patch download
+	// strategy when the patch's fromVersion matches the CURRENT build version
+	// (`data.zstdPatch.fromVersion === APP_VERSION`). A delta patch is only valid
+	// from its declared base version; applying one whose fromVersion differs from
+	// the running binary would corrupt the result, so a mismatch falls through to
+	// the patch chain (if any) or a full download.
+	if zstd, ok := data["zstdPatch"].(map[string]any); ok && zstd != nil && trustedUpdateVersionMatches(stringMap(zstd, "fromVersion", ""), current) {
 		if patchSize := int64(numericMapOr(zstd, "patchSize", 0)); patchSize > 0 {
 			downloadSize = patchSize
 			strategy = "zstd"
@@ -1407,6 +1457,19 @@ func trustedUpdateAbsoluteURL(serverURL, value string) string {
 		ref.Path = "/" + value
 	}
 	return base.ResolveReference(ref).String()
+}
+
+// trustedUpdateVersionMatches reports whether a patch's declared fromVersion
+// equals the current build version, mirroring the TS `=== APP_VERSION` check.
+// Both sides are trimmed and a leading "v" is ignored defensively; an empty
+// fromVersion never matches (so a patch with no base version is not applied).
+func trustedUpdateVersionMatches(fromVersion, current string) bool {
+	f := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(fromVersion), "v"))
+	c := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(current), "v"))
+	if f == "" {
+		return false
+	}
+	return f == c
 }
 
 func updateCurrentVersionAllowsDownload(current string) bool {
@@ -2498,16 +2561,26 @@ func (h *Handler) kiroImportCredentials(w http.ResponseWriter, r *http.Request) 
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	inputs := []any{}
-	if m, ok := body.(map[string]any); ok {
-		if arr, ok := m["credentials"].([]any); ok {
-			inputs = arr
-		}
-	} else if arr, ok := body.([]any); ok {
-		inputs = arr
-	}
-	if inputs == nil {
+	// Mirror the TypeScript /credentials/import validation (server/routes/kiro.ts):
+	// it reads `body?.credentials` and requires Array.isArray(credentials) (else
+	// 400 "credentials must be an array"), and every entry must be a plain object —
+	// typeof === "object" && !null && !Array (else 400 "each credential must be a
+	// plain object"). A bare-array body has no `.credentials`, so TS rejects it too.
+	// Go previously initialized inputs to an empty slice and only rejected a nil
+	// slice (unreachable), so a missing/non-array `credentials` silently imported 0
+	// entries with a 200, and non-object entries were silently skipped.
+	bodyMap, ok := body.(map[string]any)
+	if !ok {
 		return httpx.BadRequest("credentials must be an array")
+	}
+	inputs, ok := bodyMap["credentials"].([]any)
+	if !ok {
+		return httpx.BadRequest("credentials must be an array")
+	}
+	for _, item := range inputs {
+		if _, ok := item.(map[string]any); !ok {
+			return httpx.BadRequest("each credential must be a plain object")
+		}
 	}
 	if err := h.ensureKiroPaths(); err != nil {
 		return err
@@ -2608,6 +2681,27 @@ func (h *Handler) kiroCredentialUpdate(w http.ResponseWriter, r *http.Request) e
 	var body map[string]any
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript updateCredentialSchema Zod bounds (server/routes/kiro.ts):
+	// email/displayName max 200, region max 50. Go previously applied no length
+	// bounds, so an over-long value was persisted instead of returning a 400.
+	for _, field := range []struct {
+		key string
+		max int
+	}{
+		{"email", 200},
+		{"displayName", 200},
+		{"region", 50},
+	} {
+		if value, ok := body[field.key]; ok && value != nil {
+			text, isString := value.(string)
+			if !isString {
+				return httpx.BadRequest(field.key + " must be a string")
+			}
+			if httpx.JSStringLength(text) > field.max {
+				return httpx.BadRequest(field.key + " must be at most " + strconv.Itoa(field.max) + " characters")
+			}
+		}
 	}
 	allowed := map[string]bool{"email": true, "displayName": true, "region": true, "authRegion": true, "apiRegion": true, "subscriptionTitle": true}
 	return h.updateKiroCredential(w, chi.URLParam(r, "id"), func(entry map[string]any) error {
@@ -3545,10 +3639,41 @@ func (h *Handler) nugBillingConfig(w http.ResponseWriter, r *http.Request) error
 	return nil
 }
 
+// nugCoerceAmount mirrors the TypeScript `Number(body.amount)` + Number.isFinite
+// check for billing-order amount: a JSON number is used directly (NaN/Inf
+// rejected), a string is coerced via JS Number() semantics (httpx.CoerceNumberJS,
+// where ""/whitespace -> 0), and booleans/null/objects/absent are treated as
+// non-finite (NaN) and rejected.
+func nugCoerceAmount(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return 0, false
+		}
+		return v, true
+	case string:
+		return httpx.CoerceNumberJS(v)
+	default:
+		return 0, false
+	}
+}
+
 func (h *Handler) nugBillingCreateOrder(w http.ResponseWriter, r *http.Request) error {
 	var payload map[string]any
 	if err := httpx.DecodeLooseJSON(r, &payload); err != nil {
 		return err
+	}
+	// Mirror the TypeScript billing-orders create validation (server/routes/nug.ts):
+	// amount must coerce to a finite number > 0, and provider is required. TS runs
+	// these BEFORE the upstream call; Go previously forwarded the raw payload with
+	// no validation, so a missing/zero/negative amount or missing provider reached
+	// the upstream instead of returning a 400.
+	amount, ok := nugCoerceAmount(payload["amount"])
+	if !ok || amount <= 0 {
+		return httpx.BadRequest("amount must be greater than 0")
+	}
+	if strings.TrimSpace(stringMap(payload, "provider", "")) == "" {
+		return httpx.BadRequest("provider is required")
 	}
 	data, err := h.fetchNugJSONWithBody(r.Context(), chi.URLParam(r, "id"), http.MethodPost, "/v1/billing/orders", url.Values{}, payload)
 	if err != nil {
@@ -3970,8 +4095,11 @@ func safeNugUsageExtra(record map[string]any) map[string]any {
 			if prefix != "" {
 				label = prefix + "." + key
 			}
-			if len(label) > 80 {
-				label = label[:80]
+			// Mirror TS `label.slice(0, USAGE_EXTRA_KEY_MAX_CHARS)` (80, UTF-16 code
+			// units; nug.ts:399). Go previously used a byte slice, which for a
+			// non-ASCII usage key would cut at the wrong boundary / mid-rune.
+			if httpx.JSStringLength(label) > 80 {
+				label = httpx.JSStringSlicePrefix(label, 80)
 			}
 			if _, exists := out[label]; exists {
 				continue
@@ -4026,8 +4154,11 @@ func sanitizeNugUsageExtraValue(value any) (any, bool) {
 		if text == "" {
 			return nil, false
 		}
-		if len(text) > 300 {
-			text = text[:300] + "…"
+		// Mirror TS `text.length > 300 ? text.slice(0, 300)+"…"` (UTF-16 code units;
+		// nug.ts:383). Go previously used byte length + a byte slice, which for a
+		// non-ASCII usage value diverged on the >300 gate and could cut mid-rune.
+		if httpx.JSStringLength(text) > 300 {
+			text = httpx.JSStringSlicePrefix(text, 300) + "…"
 		}
 		return text, true
 	case float64, float32, int, int64, bool, json.Number:
@@ -4038,8 +4169,8 @@ func sanitizeNugUsageExtraValue(value any) (any, bool) {
 			return nil, false
 		}
 		text := string(encoded)
-		if len(text) > 300 {
-			text = text[:300] + "…"
+		if httpx.JSStringLength(text) > 300 {
+			text = httpx.JSStringSlicePrefix(text, 300) + "…"
 		}
 		return text, true
 	}
@@ -4514,35 +4645,93 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	if _, hasUsername := body["username"]; !hasUsername {
-		if _, hasPassword := body["password"]; !hasPassword {
-			if _, hasRole := body["role"]; !hasRole {
-				return httpx.BadRequest("At least one field is required")
+	ctx := r.Context()
+	targetID := chi.URLParam(r, "id")
+
+	// Mirror the TS admin update-user route ordering exactly:
+	//   1. adminUpdateUserSchema.safeParse validates ALL field shapes/bounds up
+	//      front (username regex+3..50, password 8..128, role enum) -> 400.
+	//   2. at-least-one-field.
+	//   3. self-demote (SELF_DEMOTE).
+	//   4. last-admin (LAST_ADMIN) — fetches target role only here.
+	//   5. username-taken (USERNAME_TAKEN 409).
+	//   6. password hash.
+	//   7. UPDATE; a missing target surfaces as 404 from the zero-rows result.
+	// Go previously interleaved per-field shape checks with business rules and
+	// fetched the target up front, so error precedence (e.g. invalid password vs
+	// self-demote, username-taken vs self-demote, validation vs 404) diverged.
+
+	// Step 1: validate every present field's shape/bounds before any business rule.
+	var (
+		username, password, role          string
+		hasUsername, hasPassword, hasRole bool
+	)
+	if raw, ok := body["username"]; ok {
+		s, isStr := raw.(string)
+		if !isStr || !adminUsernamePattern.MatchString(s) || httpx.JSStringLength(s) < 3 || httpx.JSStringLength(s) > 50 {
+			return httpx.ValidationError("username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores")
+		}
+		username, hasUsername = s, true
+	}
+	if raw, ok := body["password"]; ok {
+		s, isStr := raw.(string)
+		if !isStr || httpx.JSStringLength(s) < 8 || httpx.JSStringLength(s) > 128 {
+			return httpx.ValidationError("password must be 8-128 characters")
+		}
+		password, hasPassword = s, true
+	}
+	if raw, ok := body["role"]; ok {
+		s, isStr := raw.(string)
+		if !isStr || (s != "admin" && s != "user") {
+			return httpx.ValidationError("role must be admin or user")
+		}
+		role, hasRole = s, true
+	}
+
+	// Step 2: at least one field.
+	if !hasUsername && !hasPassword && !hasRole {
+		// TS: throw new AppError("At least one field is required", 400,
+		// "VALIDATION_ERROR"). Go previously used BadRequest (code BAD_REQUEST).
+		return httpx.ValidationError("At least one field is required")
+	}
+
+	// Step 3: self-demote.
+	if hasRole && role != "admin" {
+		if claims := auth.UserFromContext(ctx); claims != nil && claims.Subject == targetID {
+			return httpx.Error(http.StatusBadRequest, "SELF_DEMOTE", "Cannot demote yourself")
+		}
+	}
+
+	// Step 4: last-admin (only when demoting someone else who is currently admin).
+	if hasRole && role == "user" {
+		claims := auth.UserFromContext(ctx)
+		if claims == nil || claims.Subject != targetID {
+			var targetRole string
+			err := h.DB.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, targetID).Scan(&targetRole)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if targetRole == "admin" {
+				adminCount, err := h.adminUserCount(ctx)
+				if err != nil {
+					return err
+				}
+				if adminCount <= 1 {
+					return httpx.Error(http.StatusBadRequest, "LAST_ADMIN", "Cannot demote the last administrator")
+				}
 			}
 		}
 	}
 
-	ctx := r.Context()
-	targetID := chi.URLParam(r, "id")
-	var targetRole string
-	if err := h.DB.QueryRowContext(ctx, `SELECT role FROM users WHERE id = ?`, targetID).Scan(&targetRole); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return httpx.NotFound("User")
-		}
-		return err
-	}
-
 	sets := []string{}
 	args := []any{}
-	if rawUsername, ok := body["username"]; ok {
-		username, ok := rawUsername.(string)
-		if !ok {
-			return httpx.ValidationError("username must be a string")
-		}
+	if hasRole {
+		sets = append(sets, "role = ?")
+		args = append(args, role)
+	}
+	// Step 5: username uniqueness (after role business rules, matching TS).
+	if hasUsername {
 		username = strings.TrimSpace(username)
-		if !adminUsernamePattern.MatchString(username) || len(username) < 3 || len(username) > 50 {
-			return httpx.ValidationError("username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores")
-		}
 		var existingID string
 		err := h.DB.QueryRowContext(ctx, `SELECT id FROM users WHERE username = ? AND id != ? LIMIT 1`, username, targetID).Scan(&existingID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -4554,41 +4743,14 @@ func (h *Handler) updateUser(w http.ResponseWriter, r *http.Request) error {
 		sets = append(sets, "username = ?")
 		args = append(args, username)
 	}
-	if rawRole, ok := body["role"]; ok {
-		role, ok := rawRole.(string)
-		if !ok || (role != "admin" && role != "user") {
-			return httpx.ValidationError("role must be admin or user")
-		}
-		claims := auth.UserFromContext(ctx)
-		if claims != nil && claims.Subject == targetID && role != "admin" {
-			return httpx.Error(http.StatusBadRequest, "SELF_DEMOTE", "Cannot demote yourself")
-		}
-		if targetRole == "admin" && role == "user" {
-			adminCount, err := h.adminUserCount(ctx)
-			if err != nil {
-				return err
-			}
-			if adminCount <= 1 {
-				return httpx.Error(http.StatusBadRequest, "LAST_ADMIN", "Cannot demote the last administrator")
-			}
-		}
-		sets = append(sets, "role = ?")
-		args = append(args, role)
-	}
-	if rawPassword, ok := body["password"]; ok {
-		password, ok := rawPassword.(string)
-		if !ok || len(password) < 8 || len(password) > 128 {
-			return httpx.ValidationError("password must be 8-128 characters")
-		}
+	// Step 6: password hash.
+	if hasPassword {
 		hash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
 		if err != nil {
 			return err
 		}
 		sets = append(sets, "password_hash = ?")
 		args = append(args, string(hash))
-	}
-	if len(sets) == 0 {
-		return httpx.BadRequest("At least one field is required")
 	}
 	args = append(args, targetID)
 	res, err := h.DB.ExecContext(ctx, `UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
@@ -4645,7 +4807,16 @@ func (h *Handler) updateAdminSettings(w http.ResponseWriter, r *http.Request) er
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	next, err := h.Settings.Patch(map[string]any{"auth": map[string]any{"registrationOpen": body["registrationOpen"]}})
+	// Mirror the TS adminUpdateSettingsSchema (z.object({registrationOpen:
+	// z.boolean()})): registrationOpen is REQUIRED and must be a boolean, so a
+	// missing or non-boolean value is a 400 VALIDATION_ERROR. Go previously
+	// passed body["registrationOpen"] straight into Settings.Patch, which would
+	// clobber the persisted boolean to null (missing) or write a non-boolean.
+	registrationOpen, ok := body["registrationOpen"].(bool)
+	if !ok {
+		return httpx.ValidationError("registrationOpen must be a boolean")
+	}
+	next, err := h.Settings.Patch(map[string]any{"auth": map[string]any{"registrationOpen": registrationOpen}})
 	if err != nil {
 		return err
 	}
@@ -4732,14 +4903,30 @@ func (h *Handler) killTerminal(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) batchKillTerminals(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		IDs []string `json:"ids"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeJSON(r, &raw); err != nil {
 		return err
 	}
+	// Mirror TS (server/routes/admin.ts): `if (!Array.isArray(ids) || ids.length
+	// === 0 || !ids.every(id => typeof id === "string")) throw 400 "ids must be a
+	// non-empty string array"`. Go previously decoded into a typed []string (a
+	// non-array/non-string value gave a generic "invalid JSON" message) AND ran no
+	// non-empty/string check, so an empty array silently returned {results:[]} 200
+	// instead of the TS 400.
+	idsRaw, ok := raw["ids"].([]any)
+	if !ok || len(idsRaw) == 0 {
+		return httpx.Error(http.StatusBadRequest, "VALIDATION_ERROR", "ids must be a non-empty string array")
+	}
+	ids := make([]string, 0, len(idsRaw))
+	for _, item := range idsRaw {
+		text, isStr := item.(string)
+		if !isStr {
+			return httpx.Error(http.StatusBadRequest, "VALIDATION_ERROR", "ids must be a non-empty string array")
+		}
+		ids = append(ids, text)
+	}
 	results := []map[string]any{}
-	for _, id := range body.IDs {
+	for _, id := range ids {
 		if h.TerminalRuntime != nil {
 			_ = h.TerminalRuntime.Kill(r.Context(), id)
 		}
@@ -4751,15 +4938,9 @@ func (h *Handler) batchKillTerminals(w http.ResponseWriter, r *http.Request) err
 }
 
 func (h *Handler) killOrphanTerminal(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	terminalID, err := decodeRequiredTerminalID(r)
+	if err != nil {
 		return err
-	}
-	terminalID := strings.TrimSpace(body.TerminalID)
-	if terminalID == "" {
-		return httpx.BadRequest("terminalId is required")
 	}
 	orphanRuntime, ok := h.TerminalRuntime.(orphanTerminalRuntime)
 	if h.TerminalRuntime == nil || !ok {
@@ -4787,17 +4968,29 @@ func (h *Handler) reattachTerminal(w http.ResponseWriter, r *http.Request) error
 }
 
 func (h *Handler) reattachOrphanTerminal(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		TerminalID string `json:"terminalId"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	terminalID, err := decodeRequiredTerminalID(r)
+	if err != nil {
 		return err
 	}
-	terminalID := strings.TrimSpace(body.TerminalID)
-	if terminalID == "" {
-		return httpx.BadRequest("terminalId is required")
-	}
 	return h.reattachTerminalID(w, r, terminalID, "admin.terminal.reattachOrphan")
+}
+
+// decodeRequiredTerminalID mirrors the TS admin terminal orphan routes
+// (server/routes/admin.ts): `if (!terminalId || typeof terminalId !== "string")
+// throw new AppError("terminalId is required", 400, "VALIDATION_ERROR")`. A
+// missing, empty, or non-string terminalId rejects with a VALIDATION_ERROR (not
+// the generic BAD_REQUEST/"invalid JSON" Go previously produced for a non-string
+// value, nor BAD_REQUEST for the missing/empty case).
+func decodeRequiredTerminalID(r *http.Request) (string, error) {
+	var raw map[string]any
+	if err := httpx.DecodeJSON(r, &raw); err != nil {
+		return "", err
+	}
+	terminalID, ok := raw["terminalId"].(string)
+	if !ok || terminalID == "" {
+		return "", httpx.Error(http.StatusBadRequest, "VALIDATION_ERROR", "terminalId is required")
+	}
+	return terminalID, nil
 }
 
 func (h *Handler) reattachTerminalID(w http.ResponseWriter, r *http.Request, terminalID, feature string) error {
@@ -4827,10 +5020,16 @@ func writeTerminalAdminUnsupported(w http.ResponseWriter, feature, message strin
 }
 
 func (h *Handler) usageHistoryList(w http.ResponseWriter, r *http.Request) error {
-	page := intQuery(r, "page", 1)
-	pageSize := intQuery(r, "pageSize", 50)
-	if pageSize <= 0 || pageSize > 100 {
-		pageSize = 50
+	// Mirror TS listQuerySchema: page = z.coerce.number().int().positive()
+	// .default(1); pageSize = ...positive().max(100).default(50). Invalid or
+	// out-of-range values reject with 400 instead of silently clamping.
+	page, err := coercePositiveIntQuery(r, "page", 1, 0)
+	if err != nil {
+		return err
+	}
+	pageSize, err := coercePositiveIntQuery(r, "pageSize", 50, 100)
+	if err != nil {
+		return err
 	}
 	schema, err := h.usageHistorySchema(r.Context())
 	if err != nil {
@@ -4921,9 +5120,16 @@ func (h *Handler) usageHistoryStats(w http.ResponseWriter, r *http.Request) erro
 }
 
 func (h *Handler) usageHistoryTimeseries(w http.ResponseWriter, r *http.Request) error {
-	granularity := r.URL.Query().Get("granularity")
-	if granularity != "hour" && granularity != "month" {
-		granularity = "day"
+	// Mirror TS timeSeriesQuerySchema: granularity =
+	// z.enum(["hour","day","month"]).default("day"). An absent param defaults to
+	// "day"; a present but out-of-enum value rejects with 400 rather than
+	// silently falling back to "day".
+	granularity := "day"
+	if r.URL.Query().Has("granularity") {
+		granularity = r.URL.Query().Get("granularity")
+		if granularity != "hour" && granularity != "day" && granularity != "month" {
+			return httpx.BadRequest("granularity must be one of hour, day, month")
+		}
 	}
 	config := usageTimeSeriesConfig(granularity)
 	now := time.Now().UTC()
@@ -5489,6 +5695,33 @@ func intQuery(r *http.Request, key string, fallback int) int {
 	}
 	return v
 }
+
+// coercePositiveIntQuery mirrors a Zod z.coerce.number().int().positive()[.max(max)]
+// .default(fallback) query param. An ABSENT param uses the default; a present
+// param is coerced like JavaScript Number() (whole-string numeric, so "50x" ->
+// NaN and "5.5" -> 5.5), then rejected with 400 unless it is a positive integer
+// within the optional max. maxValue <= 0 means no upper bound. This matches the
+// TS usage-history listQuerySchema, which throws a ValidationError (400) on
+// invalid/out-of-range page/pageSize rather than silently clamping.
+func coercePositiveIntQuery(r *http.Request, key string, fallback, maxValue int) (int, error) {
+	raw := r.URL.Query().Get(key)
+	if strings.TrimSpace(raw) == "" && !r.URL.Query().Has(key) {
+		return fallback, nil
+	}
+	// Mirror Zod z.coerce.number().int().positive(): coerce like JS Number()
+	// (httpx.CoerceIntJS handles whitespace trim, empty->0, scientific notation,
+	// and hex/octal/binary integer literals such as "0x10"=16 that strconv.ParseFloat
+	// rejects), then require a positive integer. A present-empty "key=" coerces to
+	// Number("")===0 and fails .positive() -> 400.
+	value, ok := httpx.CoerceIntJS(raw)
+	if !ok || value <= 0 {
+		return 0, httpx.BadRequest(key + " must be a positive integer")
+	}
+	if maxValue > 0 && value > maxValue {
+		return 0, httpx.BadRequest(key + " must be at most " + strconv.Itoa(maxValue))
+	}
+	return value, nil
+}
 func nullableString(v sql.NullString) any {
 	if !v.Valid {
 		return nil
@@ -5683,16 +5916,26 @@ func clineRecommendedCachePath() (string, error) {
 }
 
 func (h *Handler) clineSetEnabledModels(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		Models []string `json:"models"`
-	}
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
 		return err
 	}
-	if body.Models == nil {
+	// Mirror TS `if (!Array.isArray(body.models)) return 400 "models must be an
+	// array"`: a missing OR non-array `models` (string/number/object/null) must
+	// reject with this exact message. Go previously decoded into a typed
+	// `struct{ Models []string }`, so a non-array value failed the unmarshal with a
+	// generic "invalid JSON: ..." message instead of the TS message.
+	modelsRaw, ok := raw["models"].([]any)
+	if !ok {
 		return httpx.BadRequest("models must be an array")
 	}
-	count, modelContextWindows, err := h.updateClineEnabledModels(body.Models)
+	models := make([]string, 0, len(modelsRaw))
+	for _, item := range modelsRaw {
+		if text, ok := item.(string); ok {
+			models = append(models, text)
+		}
+	}
+	count, modelContextWindows, err := h.updateClineEnabledModels(models)
 	if err != nil {
 		return err
 	}
@@ -6552,16 +6795,26 @@ func (h *Handler) codexCredentialDeleteUnhealthy(w http.ResponseWriter, r *http.
 }
 
 func (h *Handler) codexCredentialBatchDelete(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		IDs []string `json:"ids"`
-	}
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
 		return err
 	}
-	if len(body.IDs) == 0 {
+	// Mirror TS `if (!Array.isArray(ids) || ids.length === 0) throw 400 "ids must
+	// be a non-empty array"`: a missing OR non-array `ids` (string/number/object)
+	// must reject with this exact message. Go previously decoded into a typed
+	// `struct{ IDs []string }`, so a non-array value failed the unmarshal with a
+	// generic "invalid JSON: ..." message instead of the TS message.
+	idsRaw, ok := raw["ids"].([]any)
+	if !ok || len(idsRaw) == 0 {
 		return httpx.BadRequest("ids must be a non-empty array")
 	}
-	removed, err := removeCodexCredentials(body.IDs)
+	ids := make([]string, 0, len(idsRaw))
+	for _, item := range idsRaw {
+		if text, ok := item.(string); ok {
+			ids = append(ids, text)
+		}
+	}
+	removed, err := removeCodexCredentials(ids)
 	if err != nil {
 		return err
 	}
@@ -6570,7 +6823,7 @@ func (h *Handler) codexCredentialBatchDelete(w http.ResponseWriter, r *http.Requ
 		removedSet[item] = true
 	}
 	notFound := []string{}
-	for _, item := range body.IDs {
+	for _, item := range ids {
 		if !removedSet[item] {
 			notFound = append(notFound, item)
 		}
@@ -7152,12 +7405,28 @@ func codexTokenInfo(idToken, accessToken string) map[string]any {
 
 func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 	var body struct {
-		Credentials []any  `json:"credentials"`
+		Credentials any    `json:"credentials"`
 		Text        string `json:"text"`
 		ImportText  string `json:"importText"`
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TypeScript /import credentials coercion (server/routes/codex.ts):
+	// `credentials === undefined ? [] : Array.isArray(credentials) ? credentials :
+	// [credentials]`. A single object/string `credentials` is wrapped into a
+	// one-element list rather than rejected. Go previously decoded `credentials`
+	// into a typed []any, so a single-object `{credentials:{...}}` (or a scalar)
+	// failed the unmarshal with a generic "invalid JSON" message instead of being
+	// wrapped and imported.
+	var credentialItems []any
+	switch value := body.Credentials.(type) {
+	case nil:
+		credentialItems = []any{}
+	case []any:
+		credentialItems = value
+	default:
+		credentialItems = []any{value}
 	}
 	entries, _ := loadCodexCredentials()
 	existing := map[string]bool{}
@@ -7166,7 +7435,7 @@ func (h *Handler) codexImport(w http.ResponseWriter, r *http.Request) error {
 			existing[key] = true
 		}
 	}
-	importCredentials := codexImportCredentialsFromBody(body.Credentials, body.Text, body.ImportText)
+	importCredentials := codexImportCredentialsFromBody(credentialItems, body.Text, body.ImportText)
 	if len(importCredentials) == 0 {
 		httpx.WriteJSON(w, http.StatusBadRequest, map[string]any{"error": "No credentials provided"})
 		return nil
@@ -8669,7 +8938,13 @@ func (h *Handler) cleanupRuntime(w http.ResponseWriter, r *http.Request) error {
 	}
 	target := normalizeRuntimeCleanupTarget(body.Target)
 	if target == "" {
-		return httpx.BadRequest("invalid runtime cleanup target")
+		// Mirror the TypeScript runtime cleanup route (server/routes/runtime.ts):
+		// an unrecognized target fails cleanupTargetSchema and returns 400 "Invalid
+		// target". Go keeps its documented capability extension where an omitted/empty
+		// target defaults to "all" (matrix Wave 82) and additionally accepts the
+		// Go-only "worktrees" target, so only a genuinely unknown non-empty value
+		// reaches this branch. The error message is aligned to the TS string.
+		return httpx.BadRequest("Invalid target")
 	}
 	// Frontend cleanup actions are confirmed destructive actions and historically send
 	// only {target}. Treat an omitted dryRun flag as execute=true so the route does
@@ -9332,6 +9607,17 @@ func (h *Handler) codexStatus(w http.ResponseWriter, r *http.Request) {
 func paginateCodexStatusEntries(entries []map[string]any, page int, pageSize int) []map[string]any {
 	if pageSize <= 0 || page < 1 {
 		return entries
+	}
+	// Mirror the TS codex-manager slicePage clamp: safePage = min(page, maxPage)
+	// where maxPage = max(1, ceil(len/pageSize)). An out-of-range high page must
+	// return the LAST page, not an empty slice (Go previously returned [] when
+	// start >= len).
+	maxPage := (len(entries) + pageSize - 1) / pageSize
+	if maxPage < 1 {
+		maxPage = 1
+	}
+	if page > maxPage {
+		page = maxPage
 	}
 	start := (page - 1) * pageSize
 	if start >= len(entries) {

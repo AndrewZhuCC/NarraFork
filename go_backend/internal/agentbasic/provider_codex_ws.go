@@ -63,8 +63,16 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 	if provider.PreviousResponseID != "" {
 		body["previous_response_id"] = provider.PreviousResponseID
 	}
-	if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
-		body["reasoning"] = map[string]any{"effort": effort}
+	if effort := normalizeCodexReasoningEffort(provider.Model, reasoningEffort); effort != "" {
+		// Mirror the TS openai-provider codex reasoning config: official Codex
+		// requests send `reasoning:{effort, summary:"auto"}` AND request encrypted
+		// reasoning replay via `include:["reasoning.encrypted_content"]`. Go already
+		// REPLAYS encrypted_content on input but previously never asked the API to
+		// return it, breaking cross-turn reasoning continuity with previous_response_id.
+		// normalizeCodexReasoningEffort clamps the effort to the model's supported
+		// levels (per-model CODEX_MODEL_REASONING_LEVELS) and passes "none" through.
+		body["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
+		body["include"] = []string{"reasoning.encrypted_content"}
 	}
 	if err := conn.WriteJSON(body); err != nil {
 		return err

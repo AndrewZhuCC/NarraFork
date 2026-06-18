@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,7 @@ import (
 
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
+	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/narrators"
 )
 
@@ -682,6 +684,60 @@ func TestCodexStatusPaginatesAvailableAndUnavailableEntries(t *testing.T) {
 	}
 }
 
+// TestPaginateCodexStatusEntriesMatchesTSSlicePage pins paginateCodexStatusEntries
+// to the TS codex-manager slicePage contract: pageSize<=0 or page<1 disables
+// pagination (returns all), and an out-of-range high page clamps to the LAST
+// page (safePage = min(page, maxPage)) rather than returning an empty slice.
+func TestPaginateCodexStatusEntriesMatchesTSSlicePage(t *testing.T) {
+	mk := func(n int) []map[string]any {
+		out := make([]map[string]any, 0, n)
+		for i := 0; i < n; i++ {
+			out = append(out, map[string]any{"id": strconv.Itoa(i)})
+		}
+		return out
+	}
+	ids := func(entries []map[string]any) []string {
+		out := make([]string, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e["id"].(string))
+		}
+		return out
+	}
+	join := func(s []string) string { return strings.Join(s, ",") }
+
+	five := mk(5)
+
+	// pageSize <= 0 -> no pagination (full list), regardless of page.
+	if got := paginateCodexStatusEntries(five, 3, 0); join(ids(got)) != "0,1,2,3,4" {
+		t.Fatalf("pageSize=0 should return all entries, got %v", ids(got))
+	}
+	// page < 1 -> no pagination (full list).
+	if got := paginateCodexStatusEntries(five, 0, 2); join(ids(got)) != "0,1,2,3,4" {
+		t.Fatalf("page=0 should return all entries, got %v", ids(got))
+	}
+	// page 1, pageSize 2 -> first page.
+	if got := paginateCodexStatusEntries(five, 1, 2); join(ids(got)) != "0,1" {
+		t.Fatalf("page 1 size 2, got %v", ids(got))
+	}
+	// page 3, pageSize 2 -> last partial page (entry 4).
+	if got := paginateCodexStatusEntries(five, 3, 2); join(ids(got)) != "4" {
+		t.Fatalf("page 3 size 2 should be last page [4], got %v", ids(got))
+	}
+	// Out-of-range high page must clamp to the LAST page, not return empty
+	// (the key TS parity fix): maxPage = ceil(5/2) = 3 -> page 99 clamps to 3 -> [4].
+	if got := paginateCodexStatusEntries(five, 99, 2); join(ids(got)) != "4" {
+		t.Fatalf("out-of-range page should clamp to last page [4], got %v", ids(got))
+	}
+	// Exact multiple: 4 entries, pageSize 2, page 99 -> maxPage 2 -> [2,3].
+	if got := paginateCodexStatusEntries(mk(4), 99, 2); join(ids(got)) != "2,3" {
+		t.Fatalf("out-of-range page on exact multiple should be last page [2,3], got %v", ids(got))
+	}
+	// Empty input with pagination -> empty slice (maxPage clamps to 1, start 0 >= 0).
+	if got := paginateCodexStatusEntries([]map[string]any{}, 5, 2); len(got) != 0 {
+		t.Fatalf("empty input should stay empty, got %v", ids(got))
+	}
+}
+
 func TestCodexStatusFiltersInvalidAndDuplicatePersistedCredentials(t *testing.T) {
 	store := newSystemRoutesTestStore(t)
 	dataDir, err := narraforkDataDir()
@@ -990,6 +1046,57 @@ func TestAdminUpdateUserValidatesDuplicateAndMissingUsers(t *testing.T) {
 	router.ServeHTTP(missingW, missingReq)
 	if missingW.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 missing update target, got %d body=%s", missingW.Code, missingW.Body.String())
+	}
+}
+
+// TestAdminUpdateUserErrorPrecedenceMatchesTS pins the TS admin update-user error
+// ordering: field-shape validation (safeParse) runs before any business rule, and
+// among business rules self-demote/last-admin (role) precede username-taken. Go
+// previously validated/checked username before role and fetched the target up
+// front, so these precedences diverged.
+func TestAdminUpdateUserErrorPrecedenceMatchesTS(t *testing.T) {
+	// (a) self-demote takes precedence over an also-taken username (TS checks role
+	// business rules before username uniqueness).
+	router, token, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}, {"admin-2", "ops", "admin"}}, "admin-1")
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/admin-1", strings.NewReader(`{"role":"user","username":"ops"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if w.Code != http.StatusBadRequest || body["code"] != "SELF_DEMOTE" {
+		t.Fatalf("self-demote should take precedence over username-taken, got %d %#v", w.Code, body)
+	}
+
+	// (b) invalid field shape (bad role enum) is rejected before the 404 for a
+	// missing target (TS safeParse precedes the update/404).
+	router2, token2, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}}, "admin-1")
+	badReq := httptest.NewRequest(http.MethodPatch, "/admin/users/missing", strings.NewReader(`{"role":"superuser"}`))
+	badReq.Header.Set("Authorization", "Bearer "+token2)
+	badReq.Header.Set("Content-Type", "application/json")
+	badW := httptest.NewRecorder()
+	router2.ServeHTTP(badW, badReq)
+	if badW.Code != http.StatusBadRequest {
+		t.Fatalf("invalid role on a missing target should be 400 (validation before 404), got %d body=%s", badW.Code, badW.Body.String())
+	}
+}
+
+// TestAdminUpdateUserEmptyBodyUsesValidationErrorCode pins the "no fields" rejection
+// code against TS (server/routes/admin.ts): `throw new AppError("At least one field
+// is required", 400, "VALIDATION_ERROR")`. Go previously used BadRequest, which
+// emits code BAD_REQUEST instead of VALIDATION_ERROR.
+func TestAdminUpdateUserEmptyBodyUsesValidationErrorCode(t *testing.T) {
+	router, token, _ := newAdminRoutesTestRouter(t, []struct{ id, username, role string }{{"admin-1", "root", "admin"}}, "admin-1")
+	req := httptest.NewRequest(http.MethodPatch, "/admin/users/admin-1", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if w.Code != http.StatusBadRequest || body["code"] != "VALIDATION_ERROR" || body["error"] != "At least one field is required" {
+		t.Fatalf("expected 400 VALIDATION_ERROR \"At least one field is required\", got %d %#v", w.Code, body)
 	}
 }
 
@@ -2226,6 +2333,103 @@ func TestUsageHistoryListAndDetailExposeFrontendFields(t *testing.T) {
 	}
 }
 
+// TestUsageHistoryListValidatesPageAndPageSizeLikeTS pins the page/pageSize query
+// validation to the TS listQuerySchema (z.coerce.number().int().positive() and
+// .positive().max(100), default 1/50): invalid or out-of-range values reject with
+// 400 instead of silently clamping (the previous intQuery behavior). The
+// validation runs before any DB access, so the api_requests table is enough.
+func TestUsageHistoryListValidatesPageAndPageSizeLikeTS(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, provider TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	h := &Handler{DB: sqlDB}
+
+	for _, bad := range []string{
+		"page=0", "page=-1", "page=abc", "page=5.5", "page=50x", "page=",
+		"pageSize=0", "pageSize=-1", "pageSize=abc", "pageSize=5.5", "pageSize=50x", "pageSize=101", "pageSize=1000", "pageSize=",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/usage-history?"+bad, nil)
+		w := httptest.NewRecorder()
+		err := h.usageHistoryList(w, req)
+		// usageHistoryList returns an *httpx.AppError (400) for invalid params,
+		// which the router converts to a 400 response; a returned error is the
+		// validation-failure signal here.
+		if err == nil {
+			t.Fatalf("usage-history?%s should reject with a 400 error, got nil (status %d body=%s)", bad, w.Code, w.Body.String())
+		}
+		if !strings.Contains(err.Error(), "must be a positive integer") && !strings.Contains(err.Error(), "must be at most") {
+			t.Fatalf("usage-history?%s should reject with a bounds error, got %v", bad, err)
+		}
+	}
+
+	// Absent params (defaults 1/50) and in-range values succeed. z.coerce.number()
+	// uses JS Number() coercion, so scientific-notation and hex/octal integer
+	// literals that strconv.ParseFloat rejected must now be accepted like TS
+	// (page=0x2 -> 2, pageSize=1e1 -> 10).
+	for _, ok := range []string{"", "page=1", "page=2&pageSize=100", "pageSize=1", "page=0x2", "pageSize=1e1", "page=%2010%20"} {
+		path := "/api/usage-history"
+		if ok != "" {
+			path += "?" + ok
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		if err := h.usageHistoryList(w, req); err != nil {
+			t.Fatalf("usage-history %q should succeed, got error %v", path, err)
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("usage-history %q should be 200, got %d body=%s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestUsageHistoryTimeseriesValidatesGranularityLikeTS pins granularity to the TS
+// timeSeriesQuerySchema enum (z.enum(["hour","day","month"]).default("day")): an
+// absent param defaults to "day", a present out-of-enum value rejects with 400
+// rather than silently falling back to "day".
+func TestUsageHistoryTimeseriesValidatesGranularityLikeTS(t *testing.T) {
+	sqlDB, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, provider TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	h := &Handler{DB: sqlDB}
+
+	for _, bad := range []string{"granularity=year", "granularity=minute", "granularity=Day", "granularity=", "granularity=hours"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/usage-history/time-series?"+bad, nil)
+		w := httptest.NewRecorder()
+		err := h.usageHistoryTimeseries(w, req)
+		if err == nil {
+			t.Fatalf("time-series?%s should reject with a 400 error, got nil (status %d body=%s)", bad, w.Code, w.Body.String())
+		}
+		if !strings.Contains(err.Error(), "granularity must be one of") {
+			t.Fatalf("time-series?%s should reject with the granularity enum error, got %v", bad, err)
+		}
+	}
+
+	for _, ok := range []string{"", "granularity=hour", "granularity=day", "granularity=month"} {
+		path := "/api/usage-history/time-series"
+		if ok != "" {
+			path += "?" + ok
+		}
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		w := httptest.NewRecorder()
+		if err := h.usageHistoryTimeseries(w, req); err != nil {
+			t.Fatalf("time-series %q should succeed, got error %v", path, err)
+		}
+		if w.Code != http.StatusOK {
+			t.Fatalf("time-series %q should be 200, got %d body=%s", path, w.Code, w.Body.String())
+		}
+	}
+}
+
 func TestGatewayStatusMarksConfiguredUserCountErrorsDegraded(t *testing.T) {
 	sqlDB := openGatewayTestDB(t)
 	defer sqlDB.Close()
@@ -2693,6 +2897,64 @@ func TestCodexCredentialMissingResponsesMatchTS(t *testing.T) {
 	}
 }
 
+// TestCodexCredentialBatchDeleteRejectsNonArrayWithTSMessage locks the
+// DELETE /codex/credentials/batch validation against TS (server/routes/codex.ts):
+// `if (!Array.isArray(ids) || ids.length === 0) throw "ids must be a non-empty
+// array"`. A missing OR non-array `ids` (string/number/object) must return this
+// exact message. Go previously decoded into a typed []string, so non-array values
+// failed with a generic "invalid JSON" message.
+func TestCodexCredentialBatchDeleteRejectsNonArrayWithTSMessage(t *testing.T) {
+	r, token := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
+	for _, tc := range []struct{ name, body string }{
+		{"missing ids", `{}`},
+		{"ids string", `{"ids":"foo"}`},
+		{"ids number", `{"ids":123}`},
+		{"ids object", `{"ids":{"a":1}}`},
+		{"ids empty array", `{"ids":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodDelete, "/codex/credentials/batch", strings.NewReader(tc.body))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "ids must be a non-empty array") {
+				t.Fatalf("expected 400 with TS message for %s, got %d body=%s", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// TestBatchKillTerminalsValidatesIdsLikeTS locks POST /admin/terminals/batch-kill
+// validation against TS (server/routes/admin.ts): `if (!Array.isArray(ids) ||
+// ids.length === 0 || !ids.every(id => typeof id === "string")) throw 400 "ids
+// must be a non-empty string array"`. Go previously decoded into a typed []string
+// and ran NO non-empty/string check, so an empty array silently returned 200.
+func TestBatchKillTerminalsValidatesIdsLikeTS(t *testing.T) {
+	h := &Handler{TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+	for _, tc := range []struct{ name, body string }{
+		{"missing ids", `{}`},
+		{"ids string", `{"ids":"foo"}`},
+		{"ids number", `{"ids":123}`},
+		{"ids empty array", `{"ids":[]}`},
+		{"ids non-string element", `{"ids":["a",123]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/admin/terminals/batch-kill", strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			err := h.batchKillTerminals(w, req)
+			var appErr *httpx.AppError
+			if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+				t.Fatalf("expected 400 AppError for %s, got %T %v", tc.name, err, err)
+			}
+			if appErr.Message != "ids must be a non-empty string array" {
+				t.Fatalf("expected TS message for %s, got %q", tc.name, appErr.Message)
+			}
+		})
+	}
+}
+
 func TestCodexCredentialDeleteUnhealthyRemovesAcrossPages(t *testing.T) {
 	r, token := newProviderRoutesTestRouterWithStore(t, newSystemRoutesTestStore(t), "admin")
 	dataDir, err := narraforkDataDir()
@@ -2909,6 +3171,45 @@ func TestCodexImportAcceptsAccessTokenOnlyCredential(t *testing.T) {
 	}
 }
 
+// TestCodexImportWrapsSingleObjectCredentialsLikeTS locks the /codex/import
+// credentials coercion against TS (server/routes/codex.ts): `credentials ===
+// undefined ? [] : Array.isArray(credentials) ? credentials : [credentials]`.
+// A single (non-array) object credentials value must be wrapped and imported, not
+// rejected. Go previously decoded credentials into a typed []any, so a
+// single-object value failed the unmarshal with a generic "invalid JSON" message.
+func TestCodexImportWrapsSingleObjectCredentialsLikeTS(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	accessToken := testJWT(map[string]any{
+		"sub":                "user-single-obj",
+		"email":              "single-obj@example.com",
+		"chatgpt_account_id": "acc-single-obj",
+	})
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	// credentials is a single object (NOT an array) -> TS wraps to [credentials].
+	payload, _ := json.Marshal(map[string]any{"credentials": map[string]any{
+		"refresh_token": "",
+		"access_token":  accessToken,
+	}})
+	req := httptest.NewRequest(http.MethodPost, "/codex/import", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for single-object credentials, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	decodeJSONBody(t, w, &body)
+	if body["added"] != float64(1) {
+		t.Fatalf("expected single-object credentials to import, got %#v", body)
+	}
+}
+
 func TestCodexImportParsesAtMarkerAccountLine(t *testing.T) {
 	store := newSystemRoutesTestStore(t)
 	dataDir := filepath.Join(os.Getenv("HOME"), ".narrafork")
@@ -3024,6 +3325,54 @@ func TestClineEnabledModelsStoresContextWindowsFromCache(t *testing.T) {
 	windows, _ := agent["modelContextWindows"].(map[string]any)
 	if windows["cline:anthropic/claude-test"] != float64(200000) {
 		t.Fatalf("context window not stored: %#v", windows)
+	}
+}
+
+func TestClineEnabledModelsRejectsNonArrayWithTSMessage(t *testing.T) {
+	store := newSystemRoutesTestStore(t)
+	provider := map[string]any{"id": "cline1", "name": "Cline", "prefix": "cline", "enabledModels": []any{}}
+	if _, err := store.Patch(map[string]any{"clineProviders": []any{provider}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	r, token := newProviderRoutesTestRouterWithStore(t, store, "admin")
+
+	// Mirror TS `!Array.isArray(body.models) -> 400 "models must be an array"`: a
+	// missing OR non-array models (string/number/object/null) returns this exact
+	// message. Go previously decoded into a typed []string, so non-array values
+	// failed with a generic "invalid JSON" message.
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"missing models", `{}`},
+		{"models string", `{"models":"foo"}`},
+		{"models number", `{"models":123}`},
+		{"models object", `{"models":{"a":1}}`},
+		{"models null", `{"models":null}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/cline/enabled-models", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s, got %d body=%s", tc.name, w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "models must be an array") {
+				t.Fatalf("expected TS message for %s, got body=%s", tc.name, w.Body.String())
+			}
+		})
+	}
+
+	// An empty array is a valid request (count 0).
+	req := httptest.NewRequest(http.MethodPost, "/cline/enabled-models", bytes.NewReader([]byte(`{"models":[]}`)))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for empty array, got %d body=%s", w.Code, w.Body.String())
 	}
 }
 

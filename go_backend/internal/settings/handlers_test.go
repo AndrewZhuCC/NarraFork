@@ -580,10 +580,28 @@ func TestPatchRejectsInvalidAgentScalarSettings(t *testing.T) {
 	}
 }
 
+func TestPatchAcceptsFractionalContextThresholds(t *testing.T) {
+	// TS contextThresholds use z.number() (NOT .int()), so a fractional in-range
+	// value like 95.5 must be accepted. Go previously used an integer range
+	// validator that rejected non-integers, diverging from TS for decimals the
+	// frontend NumberInput can produce.
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+	payload := `{"agent":{"contextThresholds":{"standard":{"pruneStart":95.5,"compactStart":99.25},"large":{"pruneStart":12.5,"compactStart":50.5}}}}`
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(payload)))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("fractional contextThresholds should be accepted, got error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for fractional contextThresholds, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestPatchNormalizesDangerReflectionLevelCompatibility(t *testing.T) {
 	store := newTestStore(t)
 	h := &Handler{Store: store}
-
 	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader([]byte(`{"agent":{"dangerReflectionLevel":"off"}}`)))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -808,7 +826,6 @@ func TestPatchRejectsInvalidCodexAndRoutineSettings(t *testing.T) {
 		field   string
 	}{
 		{payload: `{"codex":{"proxy":null}}`, field: "codex.proxy"},
-		{payload: `{"codex":{"proxy":"ftp://proxy.example.test"}}`, field: "codex.proxy"},
 		{payload: `{"codex":{"loadBalancingMode":"random"}}`, field: "codex.loadBalancingMode"},
 		{payload: `{"codex":{"tierOrder":["pro","vip"]}}`, field: "codex.tierOrder[1]"},
 		{payload: `{"codex":{"defaultReasoningEffort":"extreme"}}`, field: "codex.defaultReasoningEffort"},
@@ -1066,6 +1083,62 @@ func TestPatchNormalizesProxyURLs(t *testing.T) {
 	anthropicProvider, _ := anthropicProviders[0].(map[string]any)
 	if anthropicProvider["proxy"] != "http://provider-proxy.example.test:8082" {
 		t.Fatalf("derived anthropic provider proxy was not normalized: %#v", anthropicProvider["proxy"])
+	}
+}
+
+// TestNormalizeProxyURLMatchesTSProtocolRegex pins normalizeProxyURL to the TS
+// normalizeProxyUrl + PROXY_PROTOCOL_RE (/^[a-z][a-z0-9+.-]*:\/\//i): a scheme
+// token must appear at the START (letter, then alnum/+/-/. ) immediately before
+// "://", otherwise "http://" is prefixed. A plain strings.Contains("://") check
+// diverges for inputs where "://" is not a leading scheme.
+func TestNormalizeProxyURLMatchesTSProtocolRegex(t *testing.T) {
+	cases := map[string]string{
+		"":                     "",
+		"   ":                  "",
+		"host:8080":            "http://host:8080",
+		"user:pass@host:8080":  "http://user:pass@host:8080",
+		"http://host:8080":     "http://host:8080",
+		"https://host":         "https://host",
+		"socks5h://host:1080":  "socks5h://host:1080",
+		"HTTP://Host":          "HTTP://Host", // scheme match is case-insensitive
+		"custom+scheme.v1://h": "custom+scheme.v1://h",
+		// "host://..." IS a valid leading scheme token per the regex (host is
+		// letters), so both TS and Go leave it as-is.
+		"host://weird/path": "host://weird/path",
+		// "://" present but NOT a valid leading scheme -> TS prefixes http://; a
+		// Contains("://") check would wrongly leave these as-is.
+		"://no-scheme":       "http://://no-scheme",
+		"1abc://digit-start": "http://1abc://digit-start",
+		" host:8080 ":        "http://host:8080", // trims first
+	}
+	for in, want := range cases {
+		if got := normalizeProxyURL(in); got != want {
+			t.Fatalf("normalizeProxyURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestPatchCodexProxyAcceptsAnySchemeLikeTS pins codex.proxy to the TS
+// proxyUrlSchema (z.preprocess(normalizeProxyUrl, z.string().optional())), which
+// does NOT validate the scheme — a non-http value like "ftp://..." is accepted
+// (normalized) and stored, matching TS and Go's own customApi/anthropic proxy
+// handling. Only null/non-string is rejected (z.string()).
+func TestPatchCodexProxyAcceptsAnySchemeLikeTS(t *testing.T) {
+	store := newTestStore(t)
+	h := &Handler{Store: store}
+	payload := []byte(`{"codex":{"proxy":"ftp://proxy.example.test:8080"}}`)
+	req := httptest.NewRequest(http.MethodPatch, "/api/settings", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	if err := h.patch(w, req); err != nil {
+		t.Fatalf("patch codex ftp proxy returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("codex.proxy=ftp:// should be accepted (TS proxyUrlSchema has no scheme check), got %d body=%s", w.Code, w.Body.String())
+	}
+	codexSettings, _ := store.Raw()["codex"].(map[string]any)
+	if codexSettings["proxy"] != "ftp://proxy.example.test:8080" {
+		t.Fatalf("codex.proxy ftp value should be stored as-is (already schemed), got %#v", codexSettings["proxy"])
 	}
 }
 

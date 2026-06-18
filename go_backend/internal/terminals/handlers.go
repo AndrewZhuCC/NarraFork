@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os/exec"
 	"runtime"
@@ -146,12 +147,18 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
 	}
-	if req.ChapterID == nil && req.NarratorID == nil {
-		return httpx.BadRequest("chapterId or narratorId is required")
+	// Mirror the TypeScript createTerminalSchema + terminalService.create: both
+	// chapterId and narratorId are optional. Providing BOTH is rejected, while
+	// providing NEITHER yields a standalone terminal (cwd = home), used by global
+	// flows such as the setup wizard. Go previously required at least one target
+	// (rejecting standalone) and silently accepted both.
+	if req.ChapterID != nil && strings.TrimSpace(*req.ChapterID) != "" &&
+		req.NarratorID != nil && strings.TrimSpace(*req.NarratorID) != "" {
+		return httpx.BadRequest("Only one of chapterId or narratorId may be provided")
 	}
 	// Mirror the TypeScript createTerminalSchema Zod bounds: name max length 100,
 	// cols int 10..500, rows int 2..200 when provided.
-	if req.Name != nil && len(*req.Name) > 100 {
+	if req.Name != nil && httpx.JSStringLength(*req.Name) > 100 {
 		return httpx.BadRequest("Invalid terminal create request")
 	}
 	if req.Cols != nil && (*req.Cols < 10 || *req.Cols > 500) {
@@ -169,7 +176,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	}
 	termID := id.New()
 	now := db.NowISO()
-	cwd, err := terminaldb.ResolveCwd(r.Context(), h.DB, ptrValue(req.ChapterID), ptrValue(req.NarratorID))
+	cwd, err := terminaldb.ResolveCreateCwd(r.Context(), h.DB, ptrValue(req.ChapterID), ptrValue(req.NarratorID))
 	if err != nil {
 		return terminalCwdError(err)
 	}
@@ -234,19 +241,54 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) error {
 		sets = append(sets, "name = ?")
 		args = append(args, strings.TrimSpace(name))
 	}
-	for jsonKey, col := range map[string]string{"graphOpened": "graph_opened", "graphX": "graph_x", "graphY": "graph_y", "graphWidth": "graph_width", "graphHeight": "graph_height"} {
-		if value, ok := body[jsonKey]; ok {
-			sets = append(sets, col+" = ?")
-			if jsonKey == "graphOpened" {
-				if value == true {
-					args = append(args, 1)
-				} else {
-					args = append(args, 0)
-				}
-			} else {
-				args = append(args, value)
-			}
+	// Graph-state update mirrors the TS PATCH /:id path: it runs
+	// updateTerminalGraphStateSchema.safeParse(body) and only applies the graph
+	// fields when the parse SUCCEEDS. The Zod schema requires graphOpened to be a
+	// boolean and graphX/Y/Width/Height to be finite numbers, so a malformed type
+	// (e.g. graphX:"abc" or a non-finite number) makes safeParse fail and the
+	// whole graph update is skipped (not written, not a 400). Go previously
+	// appended the raw value with no type check, writing garbage into the REAL
+	// columns. Build the graph SET clause separately and discard it on any invalid
+	// provided graph field, matching the TS all-or-nothing safeParse semantics.
+	graphSets := []string{}
+	graphArgs := []any{}
+	graphValid := true
+	for _, field := range []struct{ jsonKey, col string }{
+		{"graphOpened", "graph_opened"},
+		{"graphX", "graph_x"},
+		{"graphY", "graph_y"},
+		{"graphWidth", "graph_width"},
+		{"graphHeight", "graph_height"},
+	} {
+		value, present := body[field.jsonKey]
+		if !present {
+			continue
 		}
+		if field.jsonKey == "graphOpened" {
+			boolVal, ok := value.(bool)
+			if !ok {
+				graphValid = false
+				break
+			}
+			graphSets = append(graphSets, field.col+" = ?")
+			if boolVal {
+				graphArgs = append(graphArgs, 1)
+			} else {
+				graphArgs = append(graphArgs, 0)
+			}
+			continue
+		}
+		num, ok := value.(float64)
+		if !ok || math.IsInf(num, 0) || math.IsNaN(num) {
+			graphValid = false
+			break
+		}
+		graphSets = append(graphSets, field.col+" = ?")
+		graphArgs = append(graphArgs, num)
+	}
+	if graphValid && len(graphSets) > 0 {
+		sets = append(sets, graphSets...)
+		args = append(args, graphArgs...)
 	}
 	statusChanged := false
 	if status, ok := body["status"].(string); ok {
@@ -512,6 +554,11 @@ func (h *Handler) createTab(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return httpx.BadRequest("name is required")
 	}
+	// Mirror the TypeScript createTerminalTabSchema name bound: z.string().min(1).max(100).
+	// Go previously only checked non-empty, letting >100-char names through.
+	if httpx.JSStringLength(req.Name) > 100 {
+		return httpx.BadRequest("name must be at most 100 characters")
+	}
 	// Mirror the TypeScript createTerminalTabSchema refine: exactly one of
 	// chapterId or narratorId is required (XOR), not zero and not both.
 	hasChapter := req.ChapterID != nil && strings.TrimSpace(*req.ChapterID) != ""
@@ -545,6 +592,11 @@ func (h *Handler) updateTab(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if strings.TrimSpace(req.Name) != "" {
+		// Mirror the TypeScript updateTerminalTabSchema name bound:
+		// z.string().min(1).max(100).optional() — reject a >100-char name with 400.
+		if httpx.JSStringLength(req.Name) > 100 {
+			return httpx.BadRequest("name must be at most 100 characters")
+		}
 		if _, err := h.DB.ExecContext(r.Context(), `UPDATE terminal_tabs SET name = ? WHERE id = ?`, strings.TrimSpace(req.Name), chi.URLParam(r, "id")); err != nil {
 			return err
 		}
@@ -575,6 +627,18 @@ func (h *Handler) reorderTabs(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		return err
+	}
+	// Mirror the TypeScript reorderTerminalTabsSchema: ids = z.array(z.string()
+	// .min(1)).min(1). A non-empty array of non-empty strings is required; the TS
+	// route safeParse rejects an empty array (or empty-string entries) with 400
+	// rather than performing a silent no-op / writing an empty id.
+	if len(req.IDs) < 1 {
+		return httpx.BadRequest("ids must contain at least 1 item")
+	}
+	for _, tabID := range req.IDs {
+		if tabID == "" {
+			return httpx.BadRequest("ids entries must be non-empty strings")
+		}
 	}
 	tx, err := h.DB.BeginTx(r.Context(), nil)
 	if err != nil {

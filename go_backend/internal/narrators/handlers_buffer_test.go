@@ -145,6 +145,43 @@ func TestReorderBufferRequiresExactIDsAndUsesZeroBasedSeqs(t *testing.T) {
 	}
 }
 
+// TestReorderGoalsRequiresOrderedIdsArrayLikeTS locks PUT /narrators/{id}/goals/reorder
+// against TS (server/routes/narrators.ts): `if (!Array.isArray(body.orderedIds))
+// throw "orderedIds is required"`. A missing OR non-array orderedIds must 400; an
+// empty array is valid (no-op). Go previously decoded into a typed []string, so a
+// missing orderedIds became a nil slice that silently returned 200, and a
+// non-array value failed with a generic "invalid JSON" message.
+func TestReorderGoalsRequiresOrderedIdsArrayLikeTS(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+
+	for _, tc := range []struct{ name, body string }{
+		{"missing orderedIds", `{}`},
+		{"orderedIds string", `{"orderedIds":"foo"}`},
+		{"orderedIds number", `{"orderedIds":123}`},
+		{"orderedIds object", `{"orderedIds":{"a":1}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/goals/reorder", bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := serveNarratorHandlerWithService(service, req)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "orderedIds is required") {
+				t.Fatalf("expected 400 \"orderedIds is required\" for %s, got %d body=%s", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// An empty array is valid (Array.isArray([]) is true) -> 200 no-op reorder.
+	emptyReq := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/goals/reorder", bytes.NewBufferString(`{"orderedIds":[]}`))
+	emptyReq.Header.Set("Content-Type", "application/json")
+	empty := serveNarratorHandlerWithService(service, emptyReq)
+	if empty.Code != http.StatusOK {
+		t.Fatalf("expected empty orderedIds array to 200, got %d body=%s", empty.Code, empty.Body.String())
+	}
+}
+
 func TestPostMessageBuffersMultipartTextFileWithoutDuplicatingAttachmentHint(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	sqlDB := openNarratorHandlerTestDB(t)
@@ -245,6 +282,178 @@ func TestPostMessageBuffersMultipartTextFileWithoutDuplicatingAttachmentHint(t *
 	materializedPath := filepath.Join(cwd, ".narrafork", "attached", "notes.md")
 	if data, err := os.ReadFile(materializedPath); err != nil || string(data) != "queued attachment body" {
 		t.Fatalf("unexpected materialized worktree file data=%q err=%v", string(data), err)
+	}
+}
+
+func TestPostMessageImmediateMultipartPersistsImageAndTextFileBlocks(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write git marker: %v", err)
+	}
+	// Idle narrator with a cwd: the POST must send immediately (201) instead of buffering.
+	if _, err := sqlDB.Exec(`UPDATE narrators SET status = 'idle', cwd = ? WHERE id = ?`, cwd, narratorID); err != nil {
+		t.Fatalf("set narrator cwd: %v", err)
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	if err := writer.WriteField("message", "look at these"); err != nil {
+		t.Fatalf("write message field: %v", err)
+	}
+	imagePart, err := writer.CreateFormFile("images", "diagram.png")
+	if err != nil {
+		t.Fatalf("create image part: %v", err)
+	}
+	// Minimal valid PNG header so content-type detection accepts it.
+	pngHeader := []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a}
+	if _, err := imagePart.Write(append(pngHeader, []byte("fake-image-bytes")...)); err != nil {
+		t.Fatalf("write image part: %v", err)
+	}
+	textPart, err := writer.CreateFormFile("textFiles", "notes.md")
+	if err != nil {
+		t.Fatalf("create text file part: %v", err)
+	}
+	if _, err := textPart.Write([]byte("attached note body")); err != nil {
+		t.Fatalf("write text file part: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/narrators/"+narratorID+"/messages", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	w := serveNarratorHandlerHTTPRequest(sqlDB, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected immediate multipart send 201, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	var contentJSON, contentText string
+	if err := sqlDB.QueryRow(`SELECT content_json, content_text FROM narrator_messages WHERE narrator_id = ? AND role = 'user' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&contentJSON, &contentText); err != nil {
+		t.Fatalf("load persisted user message: %v", err)
+	}
+	var blocks []map[string]any
+	if err := json.Unmarshal([]byte(contentJSON), &blocks); err != nil {
+		t.Fatalf("decode content blocks: %v raw=%s", err, contentJSON)
+	}
+	imageBlocks, textFileBlocks, textBlocks := 0, 0, 0
+	for _, block := range blocks {
+		switch block["type"] {
+		case "image":
+			imageBlocks++
+			if stringFromAny(block["imageId"]) == "" || stringFromAny(block["filename"]) != "diagram.png" {
+				t.Fatalf("unexpected image block: %#v", block)
+			}
+		case "text_file":
+			textFileBlocks++
+			if got := stringFromAny(block["filePath"]); got == "" || !strings.Contains(got, filepath.Join(cwd, ".narrafork", "attached", "notes")) {
+				t.Fatalf("unexpected text_file block: %#v", block)
+			}
+		case "text":
+			textBlocks++
+		}
+	}
+	if imageBlocks != 1 || textFileBlocks != 1 || textBlocks != 1 {
+		t.Fatalf("expected one image + one text_file + one text block, got image=%d textFile=%d text=%d blocks=%#v", imageBlocks, textFileBlocks, textBlocks, blocks)
+	}
+	if !strings.Contains(contentText, "look at these") || !strings.Contains(contentText, "<attached_files>") {
+		t.Fatalf("content text should include message plus attachment hint, got %q", contentText)
+	}
+	// The text file must be materialized into the worktree for the immediate send.
+	materialized := filepath.Join(cwd, ".narrafork", "attached", "notes.md")
+	if data, err := os.ReadFile(materialized); err != nil || string(data) != "attached note body" {
+		t.Fatalf("unexpected materialized worktree file data=%q err=%v", string(data), err)
+	}
+	// Image upload must be persisted under the narrator uploads directory.
+	imageID := ""
+	for _, block := range blocks {
+		if block["type"] == "image" {
+			imageID = stringFromAny(block["imageId"])
+		}
+	}
+	uploadDir := filepath.Join(narratorUploadsRoot(), narratorID)
+	entries, err := os.ReadDir(uploadDir)
+	if err != nil || len(entries) == 0 {
+		t.Fatalf("expected persisted image upload under %s, entries=%#v err=%v", uploadDir, entries, err)
+	}
+	foundImage := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), imageID) {
+			foundImage = true
+		}
+	}
+	if !foundImage {
+		t.Fatalf("expected uploaded image file prefixed with %q in %#v", imageID, entries)
+	}
+}
+
+func TestBufferUpdateRemoveClearBroadcastBufferSet(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := sqlDB.Exec(`INSERT INTO narrator_buffered_messages (id, narrator_id, text, images_json, command_text, created_by, creator_json, text_file_paths_json, priority, seq, buffered_at) VALUES (?, ?, ?, NULL, NULL, ?, NULL, NULL, 0, 0, ?), (?, ?, ?, NULL, NULL, ?, NULL, NULL, 0, 1, ?)`, "buf-a", narratorID, "first", "user-1", now, "buf-b", narratorID, "second", "user-1", now); err != nil {
+		t.Fatalf("insert buffered rows: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	updateReq := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/buffer/buf-a", bytes.NewBufferString(`{"text":"updated first","priority":true,"commandText":"/review updated first"}`))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updated := serveNarratorHandlerWithService(service, updateReq)
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update buffer got %d body=%s", updated.Code, updated.Body.String())
+	}
+	var updatePayload map[string]any
+	if err := json.Unmarshal(updated.Body.Bytes(), &updatePayload); err != nil {
+		t.Fatalf("decode update buffer: %v", err)
+	}
+	message, ok := updatePayload["message"].(map[string]any)
+	if !ok || message["text"] != "updated first" || message["priority"] != true || message["commandText"] != "/review updated first" {
+		t.Fatalf("unexpected updated buffer payload: %#v", updatePayload)
+	}
+	updateEvent := waitForBroadcast(t, events, narratorID, "buffer_set")
+	messages, ok := updateEvent["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("expected update buffer_set with two messages, got %#v", updateEvent)
+	}
+
+	removeReq := httptest.NewRequest(http.MethodDelete, "/narrators/"+narratorID+"/buffer/buf-a", nil)
+	removed := serveNarratorHandlerWithService(service, removeReq)
+	if removed.Code != http.StatusOK {
+		t.Fatalf("remove buffer got %d body=%s", removed.Code, removed.Body.String())
+	}
+	var removePayload map[string]any
+	if err := json.Unmarshal(removed.Body.Bytes(), &removePayload); err != nil {
+		t.Fatalf("decode remove buffer: %v", err)
+	}
+	bufferAfterRemove, ok := removePayload["buffer"].([]any)
+	if removePayload["removed"] != true || !ok || len(bufferAfterRemove) != 1 {
+		t.Fatalf("unexpected remove buffer payload: %#v", removePayload)
+	}
+
+	clearReq := httptest.NewRequest(http.MethodDelete, "/narrators/"+narratorID+"/buffer", nil)
+	cleared := serveNarratorHandlerWithService(service, clearReq)
+	if cleared.Code != http.StatusOK {
+		t.Fatalf("clear buffer got %d body=%s", cleared.Code, cleared.Body.String())
+	}
+	var clearPayload map[string]any
+	if err := json.Unmarshal(cleared.Body.Bytes(), &clearPayload); err != nil {
+		t.Fatalf("decode clear buffer: %v", err)
+	}
+	if clearPayload["ok"] != true || clearPayload["cleared"] != float64(1) {
+		t.Fatalf("unexpected clear buffer payload: %#v", clearPayload)
+	}
+	bufferEvents := 0
+	for _, event := range events() {
+		if event.NarratorID == narratorID && event.Payload["type"] == "buffer_set" {
+			bufferEvents++
+		}
+	}
+	if bufferEvents != 3 {
+		t.Fatalf("expected update/remove/clear buffer_set broadcasts, got %d events=%#v", bufferEvents, events())
 	}
 }
 
@@ -408,4 +617,114 @@ func serveNarratorHandlerHTTPRequest(sqlDB *sql.DB, req *http.Request) *httptest
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+func TestRetryLastUserMessageDeletesTrailingMessagesAndReturnsUserMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "retried answer"}}},
+		})
+	}))
+	defer server.Close()
+
+	service, narratorID, _ := newBufferedTestNarratorService(t, "openai:test-model", server.URL)
+	defer service.DB.Close()
+	// Idle narrator so retry restarts a fresh run instead of buffering.
+	if _, err := service.DB.Exec(`UPDATE narrators SET status = 'idle' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark idle: %v", err)
+	}
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+
+	ctx := context.Background()
+	userMsg, err := service.SeedUserMessage(ctx, narratorID, "user-1", "first question")
+	if err != nil {
+		t.Fatalf("seed user message: %v", err)
+	}
+	assistantMsg, err := service.addMessage(ctx, narratorID, "assistant", "stale answer", nil)
+	if err != nil {
+		t.Fatalf("seed assistant message: %v", err)
+	}
+
+	retried, deletedIDs, err := service.RetryLastUserMessage(ctx, narratorID)
+	if err != nil {
+		t.Fatalf("retry last user message: %v", err)
+	}
+	if retried.ID != userMsg.ID {
+		t.Fatalf("retry should return the last user message, got %q want %q", retried.ID, userMsg.ID)
+	}
+	foundAssistant := false
+	for _, id := range deletedIDs {
+		if id == assistantMsg.ID {
+			foundAssistant = true
+		}
+	}
+	if !foundAssistant {
+		t.Fatalf("retry should delete the trailing assistant message, deletedIDs=%#v", deletedIDs)
+	}
+	// The trailing assistant ref must be removed while the user message ref survives.
+	var assistantRefs, userRefs int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?`, narratorID, assistantMsg.ID).Scan(&assistantRefs); err != nil {
+		t.Fatalf("count assistant refs: %v", err)
+	}
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?`, narratorID, userMsg.ID).Scan(&userRefs); err != nil {
+		t.Fatalf("count user refs: %v", err)
+	}
+	if assistantRefs != 0 || userRefs != 1 {
+		t.Fatalf("retry should drop trailing assistant ref and keep the user ref, assistantRefs=%d userRefs=%d", assistantRefs, userRefs)
+	}
+	if event := waitForBroadcast(t, events, narratorID, "messages_deleted"); event["deletedMessageIds"] == nil {
+		t.Fatalf("retry should broadcast messages_deleted, got %#v", event)
+	}
+	// Allow the restarted run to settle so the deferred goroutine does not race the DB close.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		_ = service.DB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status)
+		if status == "idle" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestContinueRunInjectsContinueUserMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "continued answer"}}},
+		})
+	}))
+	defer server.Close()
+
+	service, narratorID, _ := newBufferedTestNarratorService(t, "openai:test-model", server.URL)
+	defer service.DB.Close()
+	if _, err := service.DB.Exec(`UPDATE narrators SET status = 'idle' WHERE id = ?`, narratorID); err != nil {
+		t.Fatalf("mark idle: %v", err)
+	}
+
+	msg, err := service.AddUserMessage(context.Background(), narratorID, "user-1", "Continue.")
+	if err != nil {
+		t.Fatalf("continue run: %v", err)
+	}
+	if msg.ContentText == nil || *msg.ContentText != "Continue." || msg.Role != "user" {
+		t.Fatalf("continue should inject a Continue. user message, got %#v", msg)
+	}
+	var count int
+	if err := service.DB.QueryRow(`SELECT COUNT(*) FROM narrator_messages WHERE narrator_id = ? AND role = 'user' AND content_text = 'Continue.'`, narratorID).Scan(&count); err != nil {
+		t.Fatalf("count continue messages: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected one persisted Continue. user message, got %d", count)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		_ = service.DB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status)
+		if status == "idle" {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

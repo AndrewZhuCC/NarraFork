@@ -1,0 +1,4 @@
+services:
+  app:
+    image: docker.io/library/golang:1.26-alpine
+    entrypoint: ["sleep", "150"]

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -446,6 +447,12 @@ func TestGitMutationRoutesValidateZodBoundsLikeTypeScript(t *testing.T) {
 	longMessage := strings.Repeat("m", 501)
 	longTarget := strings.Repeat("t", 101)
 	longStash := strings.Repeat("s", 201)
+	// Astral (emoji) cases: each emoji is 1 rune but 2 UTF-16 units, so these are
+	// just over each Zod .max() in UTF-16 units (the metric str.length counts).
+	// A rune-count implementation would under-count and wrongly accept them.
+	emojiMessage := strings.Repeat("😀", 251) // 502 UTF-16 units > max 500
+	emojiTarget := strings.Repeat("😀", 51)   // 102 UTF-16 units > max 100
+	emojiStash := strings.Repeat("😀", 101)   // 202 UTF-16 units > max 200
 	for _, tc := range []struct {
 		name   string
 		target string
@@ -453,9 +460,13 @@ func TestGitMutationRoutesValidateZodBoundsLikeTypeScript(t *testing.T) {
 	}{
 		{"commit empty message", "/c1/git/commit", `{"message":"  "}`},
 		{"commit overlong message", "/c1/git/commit", `{"message":"` + longMessage + `"}`},
+		{"commit overlong emoji message", "/c1/git/commit", `{"message":"` + emojiMessage + `"}`},
 		{"reset overlong target", "/c1/git/reset", `{"target":"` + longTarget + `","mode":"hard"}`},
+		{"reset overlong emoji target", "/c1/git/reset", `{"target":"` + emojiTarget + `","mode":"hard"}`},
 		{"reset invalid mode", "/c1/git/reset", `{"target":"HEAD","mode":"mixed"}`},
 		{"stash overlong message", "/c1/git/stash", `{"action":"push","message":"` + longStash + `"}`},
+		{"stash overlong emoji message", "/c1/git/stash", `{"action":"push","message":"` + emojiStash + `"}`},
+		{"stash negative index", "/c1/git/stash", `{"action":"drop","index":-1}`},
 		{"stage neither files nor all", "/c1/git/stage", `{}`},
 		{"discard neither files nor all", "/c1/git/discard", `{"files":[]}`},
 	} {
@@ -514,7 +525,11 @@ func TestGitLogRouteSupportsSkipPaginationAndValidatesBounds(t *testing.T) {
 		{"limit zero", "/c1/git/log?limit=0"},
 		{"limit too large", "/c1/git/log?limit=201"},
 		{"limit non-numeric", "/c1/git/log?limit=abc"},
+		{"limit fractional", "/c1/git/log?limit=5.5"},
+		{"limit trailing garbage", "/c1/git/log?limit=10x"},
+		{"limit present empty", "/c1/git/log?limit="},
 		{"skip negative", "/c1/git/log?skip=-1"},
+		{"skip fractional", "/c1/git/log?skip=1.5"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
@@ -526,5 +541,178 @@ func TestGitLogRouteSupportsSkipPaginationAndValidatesBounds(t *testing.T) {
 				t.Fatalf("%q status = %d body=%s, want 400", tc.name, rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// Wave 565: the Go git log route uses gitLogQuerySchema = z.coerce.number().int()
+// for limit/skip, i.e. JS Number() coercion, NOT strconv.Atoi. So
+// integral-float, scientific-notation, hex, and whitespace-padded values that
+// Atoi rejected must now be accepted exactly like the TypeScript route. This
+// locks the coercion parity that strconv.Atoi previously broke (it 400-ed
+// "10.0"/"1e1"/" 10 "/"0xA" even though Number() yields valid integers).
+func TestGitLogRouteCoercesNumberLikeQueryParamsLikeTypeScript(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	for _, subject := range []string{"second", "third", "fourth"} {
+		writeGitRoutesFile(t, repo, "file.txt", subject+"\n")
+		runGitRoutesGit(t, repo, "add", ".")
+		runGitRoutesGit(t, repo, "commit", "-m", subject)
+	}
+	handler := NewHandler(database, gitx.NewService())
+
+	// All of these coerce to integer 10 via Number(); Atoi rejected each.
+	for _, raw := range []string{"10.0", "1e1", "0xA", " 10 "} {
+		got := serveGitRoutesArrayRequest(t, handler, http.MethodGet, "/c1/git/log?limit="+url.QueryEscape(raw))
+		if len(got) != 4 {
+			t.Fatalf("limit=%q: expected 4 commits (coerced to 10), got %d", raw, len(got))
+		}
+	}
+
+	// skip coerces too: "1.0"/"1e0" => 1, dropping the newest commit.
+	for _, raw := range []string{"1.0", "1e0"} {
+		got := serveGitRoutesArrayRequest(t, handler, http.MethodGet, "/c1/git/log?limit=10&skip="+url.QueryEscape(raw))
+		if len(got) != 3 {
+			t.Fatalf("skip=%q: expected 3 commits (coerced to 1), got %d", raw, len(got))
+		}
+		if subject, _ := got[0].(map[string]any)["message"].(string); subject != "third" {
+			t.Fatalf("skip=%q: expected start at \"third\", got %q", raw, subject)
+		}
+	}
+}
+
+// Wave 535: Go git routes must mirror the TypeScript validateFilePaths guard,
+// which rejects any file path containing ".." or starting with "/" or "\\" on
+// every mutating file endpoint (stage/unstage/discard) and the single-file diff
+// endpoint. The TS rule lives in server/routes/git.ts and is applied at four
+// call sites; the Go validateFiles helper must reject the same inputs so a
+// caller cannot escape the worktree via a crafted path.
+func TestGitFilePathTraversalRejectedLikeTypeScript(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	handler := NewHandler(database, gitx.NewService())
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		target string
+		body   string
+	}{
+		{"stage parent traversal", http.MethodPost, "/c1/git/stage", `{"files":["../secret.txt"]}`},
+		{"stage nested traversal", http.MethodPost, "/c1/git/stage", `{"files":["a/../../etc/passwd"]}`},
+		{"stage absolute posix", http.MethodPost, "/c1/git/stage", `{"files":["/etc/passwd"]}`},
+		{"stage absolute windows", http.MethodPost, "/c1/git/stage", `{"files":["\\windows\\system32"]}`},
+		{"unstage parent traversal", http.MethodPost, "/c1/git/unstage", `{"files":["../secret.txt"]}`},
+		{"unstage absolute posix", http.MethodPost, "/c1/git/unstage", `{"files":["/etc/passwd"]}`},
+		{"discard parent traversal", http.MethodPost, "/c1/git/discard", `{"files":["../secret.txt"]}`},
+		{"discard absolute posix", http.MethodPost, "/c1/git/discard", `{"files":["/etc/passwd"]}`},
+		{"diff parent traversal", http.MethodGet, "/c1/git/diff?file=" + url.QueryEscape("../secret.txt"), ""},
+		{"diff absolute posix", http.MethodGet, "/c1/git/diff?file=" + url.QueryEscape("/etc/passwd"), ""},
+		{"diff absolute windows", http.MethodGet, "/c1/git/diff?file=" + url.QueryEscape("\\windows\\system32"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveGitRoutesRecorder(t, handler, tc.method, tc.target, tc.body)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("%q status = %d body=%s, want 400", tc.name, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// Wave 569: TS filePathArray = z.array(z.string().min(1)).min(1) on the
+// stage/unstage/discard `files` field, validated BEFORE the
+// "files or all" refine. So a PRESENT but empty files array is rejected with 400
+// even when all=true (the .min(1) runs first), while an ABSENT files field with
+// all=true is accepted. Go previously conflated empty and absent (both len==0),
+// so {"files":[],"all":true} wrongly succeeded. The *[]string presence check now
+// distinguishes them.
+func TestGitFilesArrayMinOneItemMatchesTypeScript(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	handler := NewHandler(database, gitx.NewService())
+
+	// Present-but-empty files array is a 400 even with all=true (TS .min(1)).
+	for _, ep := range []string{"/c1/git/stage", "/c1/git/unstage", "/c1/git/discard"} {
+		w := serveGitRoutesRecorder(t, handler, http.MethodPost, ep, `{"files":[],"all":true}`)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("%s with empty files array should be 400, got %d body=%s", ep, w.Code, w.Body.String())
+		}
+		// Neither files nor all → 400 (refine).
+		w2 := serveGitRoutesRecorder(t, handler, http.MethodPost, ep, `{}`)
+		if w2.Code != http.StatusBadRequest {
+			t.Fatalf("%s with neither files nor all should be 400, got %d", ep, w2.Code)
+		}
+	}
+
+	// Absent files with all=true is accepted (200, OK to operate on whole tree).
+	for _, ep := range []string{"/c1/git/stage", "/c1/git/unstage", "/c1/git/discard"} {
+		w := serveGitRoutesRecorder(t, handler, http.MethodPost, ep, `{"all":true}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s with all=true (no files) should be 200, got %d body=%s", ep, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestAICommitMessageLengthBoundUsesJSStringLength pins the >200 fallback check
+// to the TS message.length (UTF-16 code units), not Go byte length. A 200-char
+// CJK commit message (600 UTF-8 bytes) must be KEPT, not replaced with the
+// "chore: update files" fallback.
+func TestAICommitMessageLengthBoundUsesJSStringLength(t *testing.T) {
+	requireGit(t)
+	database := newGitRoutesTestDB(t)
+	repo := newGitRoutesRepo(t)
+	insertGitRoutesChapter(t, database, "c1", repo)
+	writeGitRoutesFile(t, repo, "file.txt", "base\nchanged\n")
+
+	t.Setenv("HOME", t.TempDir())
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	if _, err := settings.Patch(map[string]any{"agent": map[string]any{"defaultModel": "openai:default-model", "summaryModel": "openai:summary-model"}}); err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	oldGenerate := generateCommitMessage
+	t.Cleanup(func() { generateCommitMessage = oldGenerate })
+
+	cjk200 := strings.Repeat("更", 200) // 200 UTF-16 units, 600 bytes
+	generateCommitMessage = func(context.Context, *config.Store, string, string, string, string) (string, error) {
+		return cjk200, nil
+	}
+	body := serveGitRoutesRequest(t, NewHandler(database, gitx.NewService(), settings), http.MethodPost, "/c1/git/ai-commit-message", `{}`)
+	if body["message"] != cjk200 {
+		t.Fatalf("200-char CJK commit message should be kept (<=200 UTF-16 units), got %q", body["message"])
+	}
+
+	// 201 CJK chars exceeds the 200 UTF-16 bound -> fallback.
+	cjk201 := strings.Repeat("更", 201)
+	generateCommitMessage = func(context.Context, *config.Store, string, string, string, string) (string, error) {
+		return cjk201, nil
+	}
+	body = serveGitRoutesRequest(t, NewHandler(database, gitx.NewService(), settings), http.MethodPost, "/c1/git/ai-commit-message", `{}`)
+	if body["message"] != "chore: update files" {
+		t.Fatalf("201-char CJK message should fall back, got %q", body["message"])
+	}
+}
+
+// TestSanitizeCommitMessageMatchesTS pins the quote-stripping + first-line + trim
+// post-processing to the TS regex/split (server/routes/git.ts:238-242).
+func TestSanitizeCommitMessageMatchesTS(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"\"fix: update file\"\nextra", "fix: update file"},
+		{"  feat: thing  ", "feat: thing"},
+		{"`chore: x`", "chore: x"},
+		{"\u201cdocs: y\u201d", "docs: y"},
+		{"refactor: z\nbody line", "refactor: z"},
+	}
+	for _, tc := range cases {
+		if got := sanitizeCommitMessage(tc.in); got != tc.want {
+			t.Fatalf("sanitizeCommitMessage(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

@@ -356,6 +356,61 @@ func TestSearchIgnoresInvalidEntitiesAndReturnsEmptyResultSet(t *testing.T) {
 	}
 }
 
+// TestSearchEntitiesParsingMatchesTSNullishAndExactFilter locks the TS search
+// route's entities parsing: entitiesParam = query("entities") ?? default. The
+// ?? only substitutes the default when the param is ABSENT, so a present-empty
+// "entities=" splits to [""], which the exact-match includes() filter drops →
+// empty result set. The filter has no per-entity trim, so "chapters, narrators"
+// (space-padded) drops " narrators". Go previously defaulted on any empty value
+// and trimmed each entity, diverging on both.
+func TestSearchEntitiesParsingMatchesTSNullishAndExactFilter(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	insertSearchContractFixtures(t, sqlDB)
+	h := NewHandler(sqlDB)
+
+	decode := func(target string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		w := httptest.NewRecorder()
+		if err := h.search(w, req); err != nil {
+			t.Fatalf("search returned error: %v", err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode search response: %v", err)
+		}
+		return body
+	}
+
+	// Present-but-empty entities= → empty set → empty results (NOT defaulted).
+	emptyBody := decode("/api/search?q=Alpha&entities=")
+	if results := emptyBody["results"].([]any); len(results) != 0 {
+		t.Fatalf("present-empty entities= should yield empty results (TS ??-on-absent), got %#v", results)
+	}
+	emptyMeta := emptyBody["searchMetadata"].(map[string]any)
+	if requested := emptyMeta["requestedEntities"].([]any); len(requested) != 0 {
+		t.Fatalf("present-empty entities= should request no entities, got %#v", requested)
+	}
+
+	// Absent entities → default chapters,messages,narrators → Alpha matches all 3.
+	absentBody := decode("/api/search?q=Alpha")
+	absentMeta := absentBody["searchMetadata"].(map[string]any)
+	if requested := absentMeta["requestedEntities"].([]any); len(requested) != 3 {
+		t.Fatalf("absent entities should default to 3 entities, got %#v", requested)
+	}
+
+	// Space-padded CSV: " narrators" is not an exact match and is dropped, so
+	// only "chapters" is requested (no per-entity trim, matching TS includes()).
+	spacedBody := decode("/api/search?q=Alpha&entities=chapters,%20narrators")
+	spacedMeta := spacedBody["searchMetadata"].(map[string]any)
+	requested := spacedMeta["requestedEntities"].([]any)
+	if len(requested) != 1 || requested[0] != "chapters" {
+		t.Fatalf("space-padded entity should be dropped by exact-match filter, got %#v", requested)
+	}
+}
+
 func openSearchContractDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")

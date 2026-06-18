@@ -1259,10 +1259,10 @@ func validateOptionalString(value any, key string, maxLength int, minOne bool) (
 	if !ok {
 		return "", httpx.BadRequest(key + " must be a string")
 	}
-	if minOne && len(text) < 1 {
+	if minOne && httpx.JSStringLength(text) < 1 {
 		return "", httpx.BadRequest(key + " is required")
 	}
-	if len(text) > maxLength {
+	if httpx.JSStringLength(text) > maxLength {
 		return "", httpx.BadRequest(key + " is too long")
 	}
 	return text, nil
@@ -1303,10 +1303,11 @@ func copyOptionalServerFieldsStrict(dst map[string]any, src map[string]any) erro
 			return err
 		}
 		if spec.key == "url" {
-			parsed, err := url.Parse(text)
-			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			normalized, valid := httpx.CoerceURLZod(text)
+			if !valid {
 				return httpx.BadRequest("url must be a valid URL")
 			}
+			text = normalized
 		}
 		dst[spec.key] = text
 	}
@@ -1348,7 +1349,7 @@ func stringArrayValueStrict(value any, key string, maxItems int, maxItemLength i
 		if !ok {
 			return nil, httpx.BadRequest(fmt.Sprintf("%s[%d] must be a string", key, idx))
 		}
-		if len(text) > maxItemLength {
+		if httpx.JSStringLength(text) > maxItemLength {
 			return nil, httpx.BadRequest(fmt.Sprintf("%s[%d] is too long", key, idx))
 		}
 		out = append(out, text)
@@ -1363,14 +1364,14 @@ func stringObjectValueStrict(value any, key string, maxKeyLength int, maxValueLe
 	}
 	out := map[string]any{}
 	for name, raw := range object {
-		if len(name) > maxKeyLength {
+		if httpx.JSStringLength(name) > maxKeyLength {
 			return nil, httpx.BadRequest(key + " key is too long")
 		}
 		text, ok := raw.(string)
 		if !ok {
 			return nil, httpx.BadRequest(key + "." + name + " must be a string")
 		}
-		if len(text) > maxValueLength {
+		if httpx.JSStringLength(text) > maxValueLength {
 			return nil, httpx.BadRequest(key + "." + name + " is too long")
 		}
 		out[name] = text
@@ -1422,7 +1423,11 @@ func applyToolPermissionPatch(server map[string]any, patch map[string]any) error
 	if toolName == "" {
 		return httpx.BadRequest("toolName is required")
 	}
-	if len(toolName) > 200 {
+	// Mirror the TS mcpToolPermissionPatchSchema toolName bound
+	// (z.string().min(1).max(200)) using UTF-16 code-unit length, consistent with
+	// the other MCP string bounds in this file. Go previously used byte length,
+	// which would wrongly reject a <=200-character non-ASCII tool name.
+	if httpx.JSStringLength(toolName) > 200 {
 		return httpx.BadRequest("toolName is too long")
 	}
 	current, err := normalizeToolPermissions(server["toolPermissions"])
@@ -1505,7 +1510,10 @@ func normalizeToolPermissionItems(items []any) ([]any, error) {
 		if toolName == "" {
 			return nil, httpx.BadRequest("toolPermissions.toolName is required")
 		}
-		if len(toolName) > 200 {
+		// Mirror the TS mcpToolPermissionInputSchema toolName bound
+		// (z.string().min(1).max(200)) using UTF-16 code-unit length. Go
+		// previously used byte length, wrongly rejecting <=200-char non-ASCII names.
+		if httpx.JSStringLength(toolName) > 200 {
 			return nil, httpx.BadRequest("toolPermissions.toolName is too long")
 		}
 		behavior, err := normalizeMcpBehavior(raw["behavior"])
@@ -1826,8 +1834,13 @@ func narratorContextSummaryText(n narrators.Narrator, messages []narrators.Messa
 			if text == "" {
 				continue
 			}
-			if len(text) > 500 {
-				text = text[:500] + "…"
+			// Truncate the per-message preview by UTF-16 code units (consistent with
+			// the TS string-slice discipline) rather than a byte slice, so a non-ASCII
+			// message is not cut mid-rune into invalid UTF-8 in this model-visible MCP
+			// tool output. (The surrounding summary format is a go_backend-specific
+			// deterministic builder, but the truncation must still be UTF-8-safe.)
+			if httpx.JSStringLength(text) > 500 {
+				text = httpx.JSStringSlicePrefix(text, 500) + "…"
 			}
 			b.WriteString("- ")
 			b.WriteString(msg.Role)

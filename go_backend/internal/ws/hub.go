@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -56,6 +57,7 @@ type Hub struct {
 	vnetRelay              *vnet.RelayHub
 	narratorBroadcastHooks []func(narratorID string, payload any, data []byte)
 	upgrader               websocket.Upgrader
+	outputStats            outputStatsTracker
 }
 
 // NarratorSyncProvider supplies the lightweight message-version and catch-up
@@ -76,13 +78,14 @@ type streamingSnapshot struct {
 }
 
 type client struct {
-	conn        *websocket.Conn
-	sendMu      sync.Mutex
-	sendSlots   chan struct{}
-	kind        string
-	userID      string
-	viewer      viewerInfo
-	subscribers map[string]struct{}
+	conn            *websocket.Conn
+	sendMu          sync.Mutex
+	sendSlots       chan struct{}
+	kind            string
+	userID          string
+	viewer          viewerInfo
+	subscribers     map[string]struct{}
+	subscribedStats bool
 }
 
 type viewerInfo struct {
@@ -769,6 +772,8 @@ func (h *Hub) remove(c *client) {
 		h.vnetRelay.DetachSocket(c)
 	}
 	h.mu.Lock()
+	wasStatsSubscriber := c.subscribedStats
+	c.subscribedStats = false
 	delete(h.narrators, c)
 	delete(h.terminals, c)
 	for terminalID, active := range h.activeTerminalClients {
@@ -787,6 +792,9 @@ func (h *Hub) remove(c *client) {
 		broadcasts = append(broadcasts, h.presenceBroadcastLocked(narratorID))
 	}
 	h.mu.Unlock()
+	if wasStatsSubscriber {
+		h.removeOutputStatsSubscriber()
+	}
 	_ = c.conn.Close()
 	h.sendBroadcasts(broadcasts)
 }
@@ -1089,14 +1097,16 @@ func (h *Hub) handleMessage(c *client, msg map[string]any) {
 	case "resize":
 		if c.kind == "terminal" && h.terminalRuntime != nil {
 			terminalID := strings.TrimSpace(stringValue(msg["terminalId"]))
-			cols := intNumber(msg["cols"])
-			rows := intNumber(msg["rows"])
+			cols, colsOK := intStrict(msg["cols"])
+			rows, rowsOK := intStrict(msg["rows"])
 			if terminalID == "" {
 				c.sendJSON(map[string]any{"type": "error", "message": "terminalId is required"})
 				return
 			}
 			// Mirror the TypeScript terminalWsMessageSchema resize bounds: cols 10..500, rows 2..200.
-			if cols < 10 || cols > 500 || rows < 2 || rows > 200 {
+			// z.number().int() rejects non-integer/non-number cols/rows, so a fractional
+			// value like 10.5 must fail rather than be truncated.
+			if !colsOK || !rowsOK || cols < 10 || cols > 500 || rows < 2 || rows > 200 {
 				c.sendJSON(map[string]any{"type": "error", "terminalId": terminalID, "message": "Invalid terminal resize request"})
 				return
 			}
@@ -1389,7 +1399,7 @@ func (h *Hub) handleBufferMessage(c *client, msg map[string]any) {
 		return
 	}
 	// Mirror the TypeScript narratorWsMessageSchema buffer_message bound: text max 100000.
-	if len(text) > 100000 {
+	if httpx.JSStringLength(text) > 100000 {
 		c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text must be at most 100000 characters"})
 		return
 	}
@@ -1738,7 +1748,7 @@ func (h *Hub) handleUpdateBuffer(c *client, msg map[string]any) {
 			c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text is required"})
 			return
 		}
-		if len(text) > 100000 {
+		if httpx.JSStringLength(text) > 100000 {
 			c.sendJSON(map[string]any{"type": "error", "narratorId": narratorID, "message": "text must be at most 100000 characters"})
 			return
 		}
@@ -1791,7 +1801,23 @@ func (h *Hub) handleRemoveBuffer(c *client, msg map[string]any) {
 
 func (h *Hub) handleStatsSubscription(c *client, msg map[string]any, subscribed bool) {
 	narratorID := strings.TrimSpace(stringValue(msg["narratorId"]))
-	payload := map[string]any{"type": "output_stats", "charsPerSecond": 0, "tokensPerSecond": 0, "subscribed": subscribed}
+	// Track subscription state + the global tracker subscriber count so the 1s
+	// broadcast loop runs only while at least one client is subscribed (mirrors TS
+	// addStatsSubscriber/removeStatsSubscriber).
+	h.mu.Lock()
+	wasSubscribed := c.subscribedStats
+	c.subscribedStats = subscribed
+	h.mu.Unlock()
+	if subscribed && !wasSubscribed {
+		h.addOutputStatsSubscriber()
+	} else if !subscribed && wasSubscribed {
+		h.removeOutputStatsSubscriber()
+	}
+	// Reply with the current snapshot so a fresh subscriber sees real values
+	// immediately (charsPerSec/totalChars), matching the TS output_stats payload
+	// shape consumed by the frontend useOutputStats hook.
+	rate, total := h.outputStatsSnapshot()
+	payload := map[string]any{"type": "output_stats", "charsPerSec": rate, "totalChars": total, "subscribed": subscribed}
 	if narratorID != "" {
 		payload["narratorId"] = narratorID
 	}
@@ -1811,13 +1837,15 @@ func (h *Hub) handleUpdateTimeout(c *client, msg map[string]any) {
 		return
 	}
 	// Mirror the TypeScript narratorWsMessageSchema update_timeout bound:
-	// timeoutMs int 1000..86400000. Validate before any DB lookup/mutation.
+	// timeoutMs int 1000..86400000. z.number().int() rejects non-integer/non-number
+	// values, so a fractional timeoutMs like 1500.5 must fail rather than be
+	// truncated. Validate before any DB lookup/mutation.
 	rawTimeout := msg["timeout"]
 	if rawTimeout == nil {
 		rawTimeout = msg["timeoutMs"]
 	}
-	timeoutMs := intNumber(rawTimeout)
-	if timeoutMs < 1000 || timeoutMs > 86_400_000 {
+	timeoutMs, timeoutOK := intStrict(rawTimeout)
+	if !timeoutOK || timeoutMs < 1000 || timeoutMs > 86_400_000 {
 		c.sendJSON(map[string]any{"type": "error", "toolUseId": toolUseID, "message": "timeoutMs must be between 1000 and 86400000"})
 		return
 	}
@@ -2552,19 +2580,20 @@ func (h *Hub) createTerminal(ctx context.Context, msg map[string]any) (map[strin
 	}
 	name, _ := msg["name"].(string)
 	// Mirror the TypeScript terminalWsMessageSchema create bounds: name max 100,
-	// cols 10..500 and rows 2..200 when provided.
-	if len(name) > 100 {
+	// cols 10..500 and rows 2..200 when provided. z.number().int() rejects
+	// non-integer/non-number cols/rows, so a fractional value like 10.5 must fail.
+	if httpx.JSStringLength(name) > 100 {
 		return nil, errors.New("Invalid terminal create request")
 	}
 	if _, ok := msg["cols"]; ok {
-		cols := intNumber(msg["cols"])
-		if cols < 10 || cols > 500 {
+		cols, colsOK := intStrict(msg["cols"])
+		if !colsOK || cols < 10 || cols > 500 {
 			return nil, errors.New("Invalid terminal create request")
 		}
 	}
 	if _, ok := msg["rows"]; ok {
-		rows := intNumber(msg["rows"])
-		if rows < 2 || rows > 200 {
+		rows, rowsOK := intStrict(msg["rows"])
+		if !rowsOK || rows < 2 || rows > 200 {
 			return nil, errors.New("Invalid terminal create request")
 		}
 	}
@@ -2623,7 +2652,7 @@ func (h *Hub) renameTerminal(ctx context.Context, terminalID, name string) error
 		return errors.New("name is required")
 	}
 	// Mirror the TypeScript terminalWsMessageSchema rename bound: name min 1 / max 100.
-	if len(name) > 100 {
+	if httpx.JSStringLength(name) > 100 {
 		return errors.New("name must be at most 100 characters")
 	}
 	res, err := sqlDB.ExecContext(ctx, `UPDATE terminals SET name = ? WHERE id = ?`, name, terminalID)
@@ -2762,6 +2791,39 @@ func intNumber(v any) int {
 		return int(value)
 	default:
 		return 0
+	}
+}
+
+// intStrict mirrors Zod's z.number().int(): the value must be a JSON number
+// (float64 from encoding/json, or json.Number) with no fractional part. Strings,
+// bools, missing values, and non-integer numbers (e.g. 10.5) are rejected. This
+// differs from intNumber, which truncates fractional floats and coerces unknown
+// types to 0 — behavior that would silently accept inputs TS rejects.
+func intStrict(v any) (int, bool) {
+	switch typed := v.(type) {
+	case float64:
+		if typed != math.Trunc(typed) || math.IsInf(typed, 0) || math.IsNaN(typed) {
+			return 0, false
+		}
+		return int(typed), true
+	case float32:
+		f := float64(typed)
+		if f != math.Trunc(f) {
+			return 0, false
+		}
+		return int(f), true
+	case int:
+		return typed, true
+	case int64:
+		return int(typed), true
+	case json.Number:
+		i, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	default:
+		return 0, false
 	}
 }
 

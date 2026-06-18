@@ -310,6 +310,12 @@ var embeddedDrizzleMigrations = []embeddedDrizzleMigration{
 		Hash: "a905aa05262b28902f5e8873004172e0e6237b8c400ec4f959b5c4c4a2a5460a",
 		SQL:  "ALTER TABLE `narrator_messages` ADD `edited_at` text;--\u003e statement-breakpoint\nALTER TABLE `narrator_messages` ADD `edited_by` text REFERENCES users(id);--\u003e statement-breakpoint\nALTER TABLE `narrator_messages` ADD `original_content_json` text;",
 	},
+	{
+		Tag:  "0043_sturdy_young_avengers",
+		When: 1781381544318,
+		Hash: "e19e23c738446c77ecfb96ee307da7076f3b9e1b1e276092d33a0fdba3427f35",
+		SQL:  "CREATE INDEX `idx_narrator_refs_compact_seq` ON `narrator_message_refs` (`narrator_id`,`is_compact`,`seq`);--\u003e statement-breakpoint\nCREATE INDEX `idx_toolcalls_status_narrator_created` ON `narrator_tool_calls` (`status`,`narrator_id`,`created_at`);",
+	},
 }
 
 func init() {

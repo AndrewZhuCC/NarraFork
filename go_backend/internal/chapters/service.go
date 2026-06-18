@@ -16,7 +16,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
+	"unicode"
+
+	"golang.org/x/text/runes"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/config"
@@ -368,9 +372,19 @@ func (s *Service) syncRootChapterCommits(ctx context.Context, chapterID, gitPath
 	return inserted, nil
 }
 
+// chapterBaseBranchPattern mirrors the TS gitBranchName schema
+// (server/lib/validators/common.ts: z.string().regex(/^[a-zA-Z0-9._\-/]+$/)) used
+// for createChapterSchema.baseBranch. A non-empty baseBranch must match this
+// charset; an empty/omitted value falls back to the project default (TS treats
+// baseBranch as optional, so only a present invalid value is a 400).
+var chapterBaseBranchPattern = regexp.MustCompile(`^[a-zA-Z0-9._\-/]+$`)
+
 func (s *Service) Create(ctx context.Context, input CreateInput) (Chapter, error) {
 	if strings.TrimSpace(input.Title) == "" {
 		return Chapter{}, httpx.BadRequest("title is required")
+	}
+	if input.BaseBranch != "" && !chapterBaseBranchPattern.MatchString(input.BaseBranch) {
+		return Chapter{}, httpx.BadRequest("Invalid branch name")
 	}
 	project, err := s.getProject(ctx, input.ProjectID)
 	if err != nil {
@@ -445,7 +459,12 @@ func (s *Service) Fork(ctx context.Context, sourceID string, input ForkInput) (C
 	if source.Status != "active" {
 		return Chapter{}, httpx.BadRequest("Can only fork active chapters")
 	}
-	title := source.Title + " fork"
+	// Mirror the TS fork auto title (server/services/chapter-fork.ts:72):
+	// `${parent.title.slice(0, 180)}-fork-${generateShortId(6)}`. Go previously
+	// used "<title> fork" (a space, no 180-char UTF-16 slice, and no unique
+	// short-id suffix), so auto-named forks had a different — and non-unique —
+	// title than TS.
+	title := httpx.JSStringSlicePrefix(source.Title, 180) + "-fork-" + id.Must(6)
 	if input.Title != nil && strings.TrimSpace(*input.Title) != "" {
 		title = strings.TrimSpace(*input.Title)
 	}
@@ -924,7 +943,10 @@ func copyFile(src, dest string) error {
 func runStartupScript(ctx context.Context, worktreePath, chapterID, script string) []string {
 	warnings := []string{}
 	if isRiskyStartupScript(script, worktreePath) {
-		warnings = append(warnings, "Startup script appears to start NarraFork or a dev server from the forked worktree; this can lock the shared database.")
+		// Mirror the TS chapter-fork risky-script warning text exactly
+		// (server/services/chapter-fork.ts:336-337) so the user-visible fork
+		// warning matches. Go previously used a paraphrased wording.
+		warnings = append(warnings, "Startup script appears to start a NarraFork/dev server from the forked worktree; a second server process can lock the shared NarraFork database.")
 	}
 	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
@@ -999,10 +1021,14 @@ func (s *Service) CreateReview(ctx context.Context, sourceID string, input Revie
 	if err != nil {
 		return Chapter{}, err
 	}
-	title := "Review: " + source.Title
-	if len(title) > 168 {
-		title = title[:168]
-	}
+	// Mirror the TS review-service auto title (server/services/review-service.ts):
+	// `Review: ${source.title.slice(0, 160)}` — the SOURCE title is sliced to 160
+	// UTF-16 code units first, then the "Review: " prefix is prepended. Go
+	// previously built "Review: " + full title and byte-truncated the COMBINED
+	// string to 168, which (a) used byte length so CJK source titles were cut far
+	// shorter than TS, (b) could split a multi-byte rune, and (c) trimmed the
+	// prefix budget differently.
+	title := "Review: " + httpx.JSStringSlicePrefix(source.Title, 160)
 	if input.Title != nil && strings.TrimSpace(*input.Title) != "" {
 		title = strings.TrimSpace(*input.Title)
 	}
@@ -1787,28 +1813,32 @@ func (s *Service) Get(ctx context.Context, chapterID string) (Chapter, error) {
 // and the nested containerConfig schema. Out-of-range values reject with 400 before any
 // database write, matching the safeParse-first ordering of the TypeScript PATCH route.
 func validateChapterUpdateFields(fields map[string]any) error {
-	if value, ok := fields["title"]; ok && value != nil {
+	// TS updateChapterSchema: title/description/status/role are .optional() but
+	// NOT .nullable(), so an explicit null is a 400 (expected string/enum, received
+	// null) rather than a column clear. color/groupLabel/containerConfig ARE
+	// .nullable().optional(), so a present null legitimately clears them.
+	if value, ok := fields["title"]; ok {
 		title, valid := value.(string)
 		if !valid || strings.TrimSpace(title) == "" {
 			return httpx.ValidationError("title must be a non-empty string")
 		}
-		if utf8.RuneCountInString(title) > 200 {
+		if httpx.JSStringLength(title) > 200 {
 			return httpx.ValidationError("title must be at most 200 characters")
 		}
 	}
-	if value, ok := fields["description"]; ok && value != nil {
+	if value, ok := fields["description"]; ok {
 		description, valid := value.(string)
-		if !valid || utf8.RuneCountInString(description) > 2000 {
+		if !valid || httpx.JSStringLength(description) > 2000 {
 			return httpx.ValidationError("description must be at most 2000 characters")
 		}
 	}
-	if value, ok := fields["status"]; ok && value != nil {
+	if value, ok := fields["status"]; ok {
 		status, valid := value.(string)
 		if !valid || !chapterStatusEnum[status] {
 			return httpx.ValidationError("status must be one of active, dormant, merged, abandoned, frozen")
 		}
 	}
-	if value, ok := fields["role"]; ok && value != nil {
+	if value, ok := fields["role"]; ok {
 		role, valid := value.(string)
 		if !valid || !chapterRoleEnum[role] {
 			return httpx.ValidationError("role must be one of trunk, branch, exploration, review")
@@ -1816,13 +1846,13 @@ func validateChapterUpdateFields(fields map[string]any) error {
 	}
 	if value, ok := fields["color"]; ok && value != nil {
 		color, valid := value.(string)
-		if !valid || utf8.RuneCountInString(color) > 20 {
+		if !valid || httpx.JSStringLength(color) > 20 {
 			return httpx.ValidationError("color must be at most 20 characters")
 		}
 	}
 	if value, ok := fields["groupLabel"]; ok && value != nil {
 		label, valid := value.(string)
-		if !valid || utf8.RuneCountInString(label) > 100 {
+		if !valid || httpx.JSStringLength(label) > 100 {
 			return httpx.ValidationError("groupLabel must be at most 100 characters")
 		}
 	}
@@ -1852,7 +1882,7 @@ func validateChapterContainerConfig(value any) error {
 	}
 	if composeFile, ok := cfg["composeFile"]; ok && composeFile != nil {
 		text, valid := composeFile.(string)
-		if !valid || utf8.RuneCountInString(text) > 500 {
+		if !valid || httpx.JSStringLength(text) > 500 {
 			return httpx.ValidationError("containerConfig.composeFile must be at most 500 characters")
 		}
 	}
@@ -1966,6 +1996,13 @@ func (s *Service) Update(ctx context.Context, chapterID string, fields map[strin
 	_, err = s.DB.ExecContext(ctx, `UPDATE chapters SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...)
 	if err != nil {
 		return Chapter{}, err
+	}
+	// Mirror the TS chapter PATCH route: when the title was updated, sync it to the
+	// chapter's primary narrator (server/routes/chapters.ts -> syncTitleToNarrator).
+	if titleVal, ok := fields["title"]; ok && s.Narrators != nil {
+		if title, isStr := titleVal.(string); isStr {
+			s.Narrators.SyncTitleToNarrator(ctx, chapterID, title)
+		}
 	}
 	return s.Get(ctx, chapterID)
 }
@@ -4107,13 +4144,18 @@ func (s *Service) ChapterGitStatus(ctx context.Context, chapterID string) (Chapt
 	return result, nil
 }
 
-func (s *Service) Commits(ctx context.Context, chapterID string, limit int) ([]gitx.Commit, error) {
+func (s *Service) Commits(ctx context.Context, chapterID string, limit int, sync bool) ([]gitx.Commit, error) {
 	limit = normalizeChapterCommitLimit(limit)
-	if s.DB != nil && s.Git != nil {
-		if _, err := s.syncChapterCommits(ctx, chapterID, limit); err == nil {
-			if commits, loaded, err := s.loadChapterCommitsFromDB(ctx, chapterID, limit); err == nil && loaded {
-				return commits, nil
-			}
+	if s.DB != nil {
+		// Mirror TS commitSyncService.getChapterCommits: only run the live git
+		// sync when the caller requested it (?sync=true); otherwise serve the
+		// DB-cached commits directly. A failed sync is non-fatal — TS logs and
+		// returns cached data — so we ignore the sync error and still load.
+		if sync && s.Git != nil {
+			_, _ = s.syncChapterCommits(ctx, chapterID, limit)
+		}
+		if commits, loaded, err := s.loadChapterCommitsFromDB(ctx, chapterID, limit); err == nil && loaded {
+			return commits, nil
 		}
 	}
 	ch, err := s.Get(ctx, chapterID)
@@ -4693,15 +4735,29 @@ func copyFileWithMode(src, dst string, mode os.FileMode) error {
 	return err
 }
 
+// slugify mirrors the TypeScript server/lib/slug.ts slugify: NFKD normalize,
+// strip combining diacritical marks, keep Unicode letters/digits (so CJK is
+// preserved), replace other runs with "-", trim dashes, lowercase, and cap at
+// 30 runes with a "chapter" fallback for empty results.
+var slugifyNonAlnumRE = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+var slugifyStripMarks = runes.Remove(runes.In(unicode.Mn))
+
 func slugify(input string) string {
-	s := strings.ToLower(strings.TrimSpace(input))
-	re := regexp.MustCompile(`[^a-z0-9]+`)
-	s = strings.Trim(re.ReplaceAllString(s, "-"), "-")
+	normalized, _, err := transform.String(slugifyStripMarks, norm.NFKD.String(input))
+	if err != nil {
+		normalized = input
+	}
+	s := slugifyNonAlnumRE.ReplaceAllString(normalized, "-")
+	s = strings.Trim(s, "-")
+	s = strings.ToLower(s)
+	// Mirror the TS slugify final step (server/lib/slug.ts): `.slice(0, 30)` over
+	// UTF-16 code units, applied AFTER the dash-trim and with NO post-slice trim.
+	// Go previously used `[]rune(s)[:30]` (Unicode code points, so astral letters
+	// counted as 1 instead of TS's 2) AND re-trimmed dashes after slicing (TS keeps
+	// a trailing dash that the 30-unit cut lands on).
+	s = httpx.JSStringSlicePrefix(s, 30)
 	if s == "" {
 		s = "chapter"
-	}
-	if len(s) > 48 {
-		s = strings.Trim(s[:48], "-")
 	}
 	return s
 }

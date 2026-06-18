@@ -39,7 +39,7 @@ func TestAgentHistoryIncludesStoredSideCarsInModelContext(t *testing.T) {
 		t.Fatalf("insert sidecars: %v", err)
 	}
 
-	history, err := service.agentHistory(context.Background(), narratorID, 20)
+	history, err := service.agentHistory(context.Background(), narratorID)
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestAgentHistoryRebuildsStructuredContentJSON(t *testing.T) {
 	insertHistoryMessage(t, sqlDB, narratorID, 2, "user1", "user", []map[string]any{{"type": "tool_result", "tool_use_id": "manual_call", "content": "manual output"}, {"type": "text", "text": "Thanks"}}, "stale user text", false)
 	insertHistoryMessage(t, sqlDB, narratorID, 3, "assistant2", "assistant", []map[string]any{{"type": "redacted_thinking", "data": "secret"}, {"type": "text", "text": "Done"}}, "legacy done", false)
 
-	history, err := service.agentHistory(context.Background(), narratorID, 20)
+	history, err := service.agentHistory(context.Background(), narratorID)
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestAgentHistorySubagentTreatsOwnParentToolUseMessagesAsTopLevel(t *testing
 		t.Fatalf("insert child tool call: %v", err)
 	}
 
-	parentHistory, err := service.agentHistory(context.Background(), parentID, 20)
+	parentHistory, err := service.agentHistory(context.Background(), parentID)
 	if err != nil {
 		t.Fatalf("parent agentHistory returned error: %v", err)
 	}
@@ -152,7 +152,7 @@ func TestAgentHistorySubagentTreatsOwnParentToolUseMessagesAsTopLevel(t *testing
 		t.Fatalf("parent history should filter parent_tool_use_id child-tree messages, got %#v", parentHistory)
 	}
 
-	childHistory, err := service.agentHistory(context.Background(), childID, 20)
+	childHistory, err := service.agentHistory(context.Background(), childID)
 	if err != nil {
 		t.Fatalf("child agentHistory returned error: %v", err)
 	}
@@ -190,7 +190,7 @@ func TestAgentHistoryKeepsTextFileAttachmentHintForProviderReplay(t *testing.T) 
 		{"type": "text", "text": "Review notes"},
 	}, effective, false)
 
-	history, err := service.agentHistory(context.Background(), narratorID, 20)
+	history, err := service.agentHistory(context.Background(), narratorID)
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
@@ -231,7 +231,7 @@ func TestAgentHistoryEmbedsUploadedImageBlocksForProviderReplay(t *testing.T) {
 		{"type": "text", "text": "describe image"},
 	}, "describe image", false)
 
-	history, err := service.agentHistory(context.Background(), narratorID, 20)
+	history, err := service.agentHistory(context.Background(), narratorID)
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
@@ -284,18 +284,21 @@ func TestAgentHistoryReplaysSharedTSCreatedLongTranscriptWithOriginalUploadOwner
 		insertSharedHistoryMessage(t, sqlDB, ownerID, forkID, seq, messageID, "user", blocks, text, false)
 	}
 
-	history, err := service.agentHistory(context.Background(), forkID, 20)
+	history, err := service.agentHistory(context.Background(), forkID)
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
-	if len(history) != 21 {
-		t.Fatalf("expected compact summary plus last 20 long-session messages, got %d: %#v", len(history), history)
+	// Wave 525: agentHistory now loads ALL messages since the compact boundary
+	// (matching TS getMessagesSinceLastCompact) instead of the former last-20/80
+	// cap. Compact summary (1) + every message seq 11..100 (90) = 91 entries.
+	if len(history) != 91 {
+		t.Fatalf("expected compact summary plus all 90 since-compact messages, got %d: %#v", len(history), history)
 	}
 	if history[0].Role != "user" || history[0].Content != "Prior compacted conversation summary:\nTS compact summary" {
 		t.Fatalf("compact summary mismatch: %#v", history[0])
 	}
-	if history[1].Content != "ts message 81" || history[len(history)-1].Content != "ts message 100" {
-		t.Fatalf("long transcript limit/reversal mismatch: first=%#v last=%#v", history[1], history[len(history)-1])
+	if history[1].Content != "ts message 11" || history[len(history)-1].Content != "ts message 100" {
+		t.Fatalf("long transcript order mismatch: first=%#v last=%#v", history[1], history[len(history)-1])
 	}
 	var sharedImage map[string]any
 	for _, msg := range history {

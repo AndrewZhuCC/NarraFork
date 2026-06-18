@@ -212,6 +212,12 @@
 		},
 		{
 			"type": "index",
+			"name": "idx_narrator_refs_compact_seq",
+			"table": "narrator_message_refs",
+			"sql": "CREATE INDEX `idx_narrator_refs_compact_seq` ON `narrator_message_refs` (`narrator_id`,`is_compact`,`seq`)"
+		},
+		{
+			"type": "index",
 			"name": "idx_narrator_refs_message",
 			"table": "narrator_message_refs",
 			"sql": "CREATE INDEX `idx_narrator_refs_message` ON `narrator_message_refs` (`message_id`)"
@@ -386,6 +392,12 @@
 		},
 		{
 			"type": "index",
+			"name": "idx_toolcalls_status_narrator_created",
+			"table": "narrator_tool_calls",
+			"sql": "CREATE INDEX `idx_toolcalls_status_narrator_created` ON `narrator_tool_calls` (`status`,`narrator_id`,`created_at`)"
+		},
+		{
+			"type": "index",
 			"name": "idx_toolcalls_tool_use_id",
 			"table": "narrator_tool_calls",
 			"sql": "CREATE INDEX `idx_toolcalls_tool_use_id` ON `narrator_tool_calls` (`tool_use_id`)"
@@ -460,7 +472,7 @@
 			"type": "table",
 			"name": "__drizzle_migrations",
 			"table": "__drizzle_migrations",
-			"sql": "CREATE TABLE \"__drizzle_migrations\" ( id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric )"
+			"sql": "CREATE TABLE __drizzle_migrations ( id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric )"
 		},
 		{
 			"type": "table",
@@ -5731,6 +5743,18 @@
 		},
 		{
 			"table": "narrator_message_refs",
+			"name": "idx_narrator_refs_compact_seq",
+			"unique": false,
+			"origin": "c",
+			"partial": false,
+			"columns": [
+				"narrator_id",
+				"is_compact",
+				"seq"
+			]
+		},
+		{
+			"table": "narrator_message_refs",
 			"name": "idx_narrator_refs_message",
 			"unique": false,
 			"origin": "c",
@@ -5911,6 +5935,18 @@
 			"columns": [
 				"narrator_id",
 				"status"
+			]
+		},
+		{
+			"table": "narrator_tool_calls",
+			"name": "idx_toolcalls_status_narrator_created",
+			"unique": false,
+			"origin": "c",
+			"partial": false,
+			"columns": [
+				"status",
+				"narrator_id",
+				"created_at"
 			]
 		},
 		{
@@ -6942,5 +6978,5 @@
 			"match": "NONE"
 		}
 	],
-	"hash": "169fb305063b85d337954204b213379f837abc6db13ac924dfe71125745d6b5a"
+	"hash": "63e1eacca25c6c9bef8e2173d61264636f7c870929f59b8b45756e06c2dac13f"
 }

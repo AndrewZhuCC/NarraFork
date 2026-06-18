@@ -68,9 +68,25 @@ func (h *Handler) browse(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Mirror the TS /api/fs/browse error contract (server/routes/fs.ts): an
+	// absent path -> "Path does not exist: <abs>", a non-directory ->
+	// "Not a directory: <abs>", and any other stat failure -> "Cannot access:
+	// <abs>". Go previously returned the raw os.ReadDir error string (e.g.
+	// "open /foo: no such file or directory"), which differs from TS's messages
+	// and did not distinguish the not-a-directory case.
+	info, statErr := os.Stat(resolved)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return httpx.ValidationError("Path does not exist: " + resolved)
+		}
+		return httpx.ValidationError("Cannot access: " + resolved)
+	}
+	if !info.IsDir() {
+		return httpx.ValidationError("Not a directory: " + resolved)
+	}
 	items, err := os.ReadDir(resolved)
 	if err != nil {
-		return httpx.BadRequest(err.Error())
+		return httpx.ValidationError("Cannot access: " + resolved)
 	}
 	result := make([]entry, 0, len(items))
 	for _, item := range items {

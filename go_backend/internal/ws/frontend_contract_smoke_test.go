@@ -27,6 +27,34 @@ func (f fakeNarratorSync) NarratorMessagesAfter(context.Context, string, any, in
 	return map[string]any{"topLevel": []any{}, "orphanChildren": []any{}, "hitLimit": false, "cursor": nil}, nil
 }
 
+type sequencedNarratorSync struct {
+	versions     []int
+	pages        []map[string]any
+	versionCalls int
+	pageCalls    int
+}
+
+func (f *sequencedNarratorSync) NarratorMessageVersion(context.Context, string) (int, error) {
+	if len(f.versions) == 0 {
+		return 0, nil
+	}
+	idx := f.versionCalls
+	f.versionCalls++
+	if idx >= len(f.versions) {
+		idx = len(f.versions) - 1
+	}
+	return f.versions[idx], nil
+}
+
+func (f *sequencedNarratorSync) NarratorMessagesAfter(context.Context, string, any, int) (map[string]any, error) {
+	idx := f.pageCalls
+	f.pageCalls++
+	if idx < len(f.pages) && f.pages[idx] != nil {
+		return f.pages[idx], nil
+	}
+	return map[string]any{"topLevel": []any{}, "orphanChildren": []any{}, "hitLimit": false, "cursor": nil}, nil
+}
+
 func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testing.T) {
 	h, c, wsClient := newNarratorHubClient(t)
 	defer wsClient.Close()
@@ -88,6 +116,13 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	}
 	if !h.isSubscribed(c, "narrator-1") {
 		t.Fatal("subscribe with catch-up should subscribe after sending catch_up")
+	}
+	h.BroadcastNarrator("narrator-1", map[string]any{"type": "stream_text", "text": "after-catch-up", "outputIndex": 1})
+	live := readWSMessageOfType(t, wsClient, "stream_event")
+	liveEvent, _ := live["event"].(map[string]any)
+	liveDelta, _ := liveEvent["delta"].(map[string]any)
+	if live["narratorId"] != "narrator-1" || liveEvent["type"] != "content_block_delta" || liveDelta["type"] != "text_delta" || liveDelta["text"] != "after-catch-up" || intNumber(liveEvent["outputIndex"]) != 1 {
+		t.Fatalf("active reconnect should receive live stream_event after catch_up: %#v", live)
 	}
 
 	h.handleMessage(c, map[string]any{"type": "presence_join", "narratorId": "narrator-1"})
@@ -151,6 +186,52 @@ func TestFrontendUseNarratorWSContractSubscribeCatchupPresenceAndEvents(t *testi
 	toolCompleted := readWSMessage(t, wsClient)
 	if legacyTool["type"] != "tool_result" || toolCompleted["type"] != "tool_completed" || toolCompleted["toolUseId"] != "tool-1" {
 		t.Fatalf("unexpected tool compatibility frames: %#v %#v", legacyTool, toolCompleted)
+	}
+}
+
+func TestFrontendUseNarratorWSContractSubscribeCatchesUpMessagesArrivingDuringReconnect(t *testing.T) {
+	h, c, wsClient := newNarratorHubClient(t)
+	defer wsClient.Close()
+	provider := &sequencedNarratorSync{
+		versions: []int{3, 4},
+		pages: []map[string]any{
+			{
+				"topLevel":       []any{map[string]any{"id": "msg-1", "role": "assistant", "contentText": "first"}},
+				"orphanChildren": []any{},
+				"hitLimit":       false,
+				"cursor":         map[string]any{"parentLastMessageId": "msg-1", "childAnchors": []any{}},
+			},
+			{
+				"topLevel":       []any{map[string]any{"id": "msg-2", "role": "assistant", "contentText": "arrived-during-catchup"}},
+				"orphanChildren": []any{},
+				"hitLimit":       false,
+				"cursor":         map[string]any{"parentLastMessageId": "msg-2", "childAnchors": []any{}},
+			},
+		},
+	}
+	h.SetNarratorSyncProvider(provider)
+
+	h.handleMessage(c, map[string]any{"type": "subscribe", "narratorIds": []any{"narrator-race"}, "lastMessageId": "msg-0"})
+
+	initial := readWSMessage(t, wsClient)
+	if initial["type"] != "catch_up" || initial["narratorId"] != "narrator-race" || intNumber(initial["messageVersion"]) != 3 {
+		t.Fatalf("expected initial reconnect catch_up version 3, got %#v", initial)
+	}
+	initialTop, _ := initial["topLevel"].([]any)
+	if len(initialTop) != 1 || initialTop[0].(map[string]any)["id"] != "msg-1" {
+		t.Fatalf("initial catch_up should include msg-1, got %#v", initial)
+	}
+
+	delta := readWSMessage(t, wsClient)
+	if delta["type"] != "catch_up" || delta["narratorId"] != "narrator-race" || intNumber(delta["messageVersion"]) != 4 {
+		t.Fatalf("expected race delta catch_up version 4, got %#v", delta)
+	}
+	deltaTop, _ := delta["topLevel"].([]any)
+	if len(deltaTop) != 1 || deltaTop[0].(map[string]any)["id"] != "msg-2" {
+		t.Fatalf("race delta catch_up should include msg-2, got %#v", delta)
+	}
+	if !h.isSubscribed(c, "narrator-race") {
+		t.Fatal("client should stay subscribed after reconnect catch-up race handling")
 	}
 }
 

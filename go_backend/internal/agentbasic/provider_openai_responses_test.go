@@ -245,6 +245,63 @@ func TestOpenAIResponsesSendsPreviousResponseID(t *testing.T) {
 	}
 }
 
+// TestOpenAIResponsesCodexReasoningConfigMatchesTS pins the codex-mode reasoning
+// request shape to the TS openai-provider: codex requests send
+// `reasoning:{effort, summary:"auto"}` AND `include:["reasoning.encrypted_content"]`
+// (so the API returns encrypted reasoning for cross-turn replay via
+// previous_response_id), while a generic responses-API provider sends only
+// `reasoning:{effort}` with no summary/include.
+func TestOpenAIResponsesCodexReasoningConfigMatchesTS(t *testing.T) {
+	run := func(t *testing.T, kind, apiMode string) map[string]any {
+		var requestBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&requestBody)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+`)
+		}))
+		defer server.Close()
+		adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: kind, Kind: kind, APIKey: "k", BaseURL: server.URL, Model: "gpt-5-codex", APIMode: apiMode, DefaultReasoningEffort: "high"}}
+		stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+		if err != nil {
+			t.Fatalf("Chat error: %v", err)
+		}
+		for event := range stream {
+			if event.Err != nil {
+				t.Fatalf("stream error: %v", event.Err)
+			}
+		}
+		return requestBody
+	}
+
+	t.Run("codex mode includes summary and encrypted-content", func(t *testing.T) {
+		body := run(t, "codex", "codex")
+		reasoning, _ := body["reasoning"].(map[string]any)
+		if reasoning == nil || reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+			t.Fatalf("codex reasoning should be {effort:high, summary:auto}, got %#v", body["reasoning"])
+		}
+		include, _ := body["include"].([]any)
+		if len(include) != 1 || include[0] != "reasoning.encrypted_content" {
+			t.Fatalf("codex request should include reasoning.encrypted_content, got %#v", body["include"])
+		}
+	})
+
+	t.Run("generic responses mode omits summary and include", func(t *testing.T) {
+		body := run(t, "openai", "responses")
+		reasoning, _ := body["reasoning"].(map[string]any)
+		if reasoning == nil || reasoning["effort"] != "high" {
+			t.Fatalf("responses reasoning should be {effort:high}, got %#v", body["reasoning"])
+		}
+		if _, hasSummary := reasoning["summary"]; hasSummary {
+			t.Fatalf("generic responses reasoning must not set summary, got %#v", reasoning)
+		}
+		if _, hasInclude := body["include"]; hasInclude {
+			t.Fatalf("generic responses request must not set include, got %#v", body["include"])
+		}
+	})
+}
+
 func TestOpenAIResponsesInputReplaysAssistantFunctionCallsAndToolOutputs(t *testing.T) {
 	call := newFunctionToolCall("call_1", "Read", `{"file_path":"note.txt"}`)
 	input := openAIResponsesInput([]Message{

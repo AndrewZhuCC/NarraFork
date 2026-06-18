@@ -158,6 +158,13 @@ func TestChapterUpdateValidatesZodBoundsLikeTypeScript(t *testing.T) {
 		{name: "container port out of range", data: map[string]any{"containerConfig": map[string]any{"ports": []any{map[string]any{"containerPort": float64(70000), "serviceName": "web"}}}}, want: "containerConfig.ports[0].containerPort must be between 1 and 65535"},
 		{name: "container port missing service", data: map[string]any{"containerConfig": map[string]any{"ports": []any{map[string]any{"containerPort": float64(8080), "serviceName": ""}}}}, want: "containerConfig.ports[0].serviceName must be a non-empty string"},
 		{name: "container env non-string", data: map[string]any{"containerConfig": map[string]any{"env": map[string]any{"KEY": float64(1)}}}, want: "containerConfig.env.KEY must be a string"},
+		// TS updateChapterSchema: title/description/status/role are .optional() but
+		// NOT .nullable(), so an explicit null is rejected with 400 rather than
+		// writing NULL to the column (color/groupLabel/containerConfig ARE nullable).
+		{name: "null title", data: map[string]any{"title": nil}, want: "title must be a non-empty string"},
+		{name: "null description", data: map[string]any{"description": nil}, want: "description must be at most 2000 characters"},
+		{name: "null status", data: map[string]any{"status": nil}, want: "status must be one of active, dormant, merged, abandoned, frozen"},
+		{name: "null role", data: map[string]any{"role": nil}, want: "role must be one of trunk, branch, exploration, review"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -186,6 +193,31 @@ func TestChapterUpdateValidatesZodBoundsLikeTypeScript(t *testing.T) {
 	}
 	if updated.Title != "Renamed branch" || updated.Status != "dormant" || updated.Role != "exploration" {
 		t.Fatalf("unexpected valid update result: %#v", updated)
+	}
+}
+
+// TestChapterUpdateNullableFieldsAcceptNullToClear confirms the nullable-vs-optional
+// distinction: color/groupLabel/containerConfig are .nullable().optional() in TS,
+// so an explicit null clears them (does NOT 400), while title/description/status/
+// role reject null (covered by the validation table above).
+func TestChapterUpdateNullableFieldsAcceptNullToClear(t *testing.T) {
+	sqlDB := openChapterUpdateInvariantDB(t)
+	defer sqlDB.Close()
+	service := &Service{DB: sqlDB}
+
+	// Seed non-null values, then clear them with null.
+	if _, err := sqlDB.Exec(`UPDATE chapters SET color = '#abcdef', group_label = 'G', container_config = '{"composeFile":"c.yml"}' WHERE id = 'branch'`); err != nil {
+		t.Fatalf("seed nullable fields: %v", err)
+	}
+	if _, err := service.Update(context.Background(), "branch", map[string]any{"color": nil, "groupLabel": nil, "containerConfig": nil}); err != nil {
+		t.Fatalf("null should be accepted to clear nullable fields, got %v", err)
+	}
+	var color, groupLabel, containerConfig sql.NullString
+	if err := sqlDB.QueryRow(`SELECT color, group_label, container_config FROM chapters WHERE id = 'branch'`).Scan(&color, &groupLabel, &containerConfig); err != nil {
+		t.Fatalf("read cleared fields: %v", err)
+	}
+	if color.Valid || groupLabel.Valid || containerConfig.Valid {
+		t.Fatalf("nullable fields should be cleared to NULL, got color=%#v group=%#v container=%#v", color, groupLabel, containerConfig)
 	}
 }
 

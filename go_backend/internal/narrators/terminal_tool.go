@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
@@ -38,8 +39,12 @@ var terminalReadCursors sync.Map
 const (
 	terminalReadWaitForTimeout = 30 * time.Second
 	terminalReadPollInterval   = 250 * time.Millisecond
-	terminalDefaultMaxLength   = 20000
-	terminalMaxLength          = 100000
+	// Incremental-read tail caps mirror the TS terminal tool
+	// (server/lib/agent/tools/terminal.ts READ_INCREMENTAL_MAX_LINES/CHARS): the
+	// most recent terminal output is the most relevant, so incremental reads keep
+	// the last 200 lines and then the last 40000 UTF-16 chars.
+	terminalReadIncrementalMaxLines = 200
+	terminalReadIncrementalMaxChars = 40000
 )
 
 var terminalANSIRe = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(\x07|\x1b\\)`)
@@ -219,7 +224,6 @@ func (s *Service) terminalToolRead(ctx context.Context, narratorID string, narra
 	}
 	waitFor := strings.TrimSpace(stringFromAny(args["wait_for"]))
 	lastNLines := anyInt(args["last_n_lines"], 0)
-	maxLength := normalizeTerminalMaxLength(anyInt(args["max_length"], terminalDefaultMaxLength))
 	key := terminalCursorKey(narratorID, row.ID)
 	waitTimedOut := false
 	if waitFor != "" {
@@ -251,9 +255,13 @@ func (s *Service) terminalToolRead(ctx context.Context, narratorID string, narra
 	start := terminalCursorOffset(key, text)
 	output := ""
 	if lastNLines > 0 {
+		// Explicit last_n_lines bypasses the incremental tail cap (TS terminal tool);
+		// the final TruncateToolOutput tail-cap below still bounds very large reads.
 		output = lastTerminalLines(text, lastNLines)
 	} else {
-		output = text[start:]
+		// Incremental: keep the most recent 200 lines / 40000 chars, mirroring the
+		// TS tailSlice. This already bounds output below the final dual cap.
+		output = tailSliceTerminalOutput(text[start:], terminalReadIncrementalMaxLines, terminalReadIncrementalMaxChars)
 	}
 	terminalReadCursors.Store(key, len(text))
 	if strings.TrimSpace(output) == "" {
@@ -262,7 +270,11 @@ func (s *Service) terminalToolRead(ctx context.Context, narratorID string, narra
 	if waitTimedOut {
 		output = "[wait_for timed out]\n" + output
 	}
-	return truncateTerminalOutput(output, maxLength), "", nil
+	// Final tail dual-cap (50KB / 2000 lines), mirroring the TS truncateOutput
+	// applied to header+text. The incremental branch is already under this cap; the
+	// last_n_lines branch is bounded here.
+	truncated, _ := agentbasic.TruncateToolOutput(output)
+	return truncated, "", nil
 }
 
 func (s *Service) terminalToolWrite(ctx context.Context, narratorID string, narrator Narrator, args map[string]any) (string, string, error) {
@@ -418,21 +430,28 @@ func lastTerminalLines(text string, count int) string {
 	return strings.Join(lines[len(lines)-count:], "\n")
 }
 
-func normalizeTerminalMaxLength(value int) int {
-	if value <= 0 {
-		return terminalDefaultMaxLength
+// tailSliceTerminalOutput keeps the most recent maxLines lines and then the last
+// maxChars UTF-16 code units, mirroring the TS tailSlice helper
+// (server/lib/agent/tools/terminal.ts): when the char cap trims mid-line it drops
+// the leading (likely partial) line for cleanliness. maxChars is measured in
+// UTF-16 code units to match the JS string slice semantics.
+func tailSliceTerminalOutput(text string, maxLines, maxChars int) string {
+	lines := strings.Split(text, "\n")
+	if maxLines > 0 && len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
 	}
-	if value > terminalMaxLength {
-		return terminalMaxLength
+	result := strings.Join(lines, "\n")
+	if maxChars > 0 {
+		units := utf16.Encode([]rune(result))
+		if len(units) > maxChars {
+			result = string(utf16.Decode(units[len(units)-maxChars:]))
+			// Drop the first (likely partial) line for cleanliness.
+			if nl := strings.IndexByte(result, '\n'); nl != -1 {
+				result = result[nl+1:]
+			}
+		}
 	}
-	return value
-}
-
-func truncateTerminalOutput(value string, maxLength int) string {
-	if len(value) <= maxLength {
-		return value
-	}
-	return value[:maxLength] + "\n[truncated]"
+	return result
 }
 
 func nullableToolString(value string) any {

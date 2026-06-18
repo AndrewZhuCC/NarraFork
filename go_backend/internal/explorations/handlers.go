@@ -99,10 +99,10 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	// Mirror the TypeScript createExplorationGroupSchema Zod bounds: title max 200,
 	// description max 2000, branches 2..10 with each branch title 1..200 /
 	// description max 2000 / inheritMode enum.
-	if len(body.Title) > 200 {
+	if httpx.JSStringLength(body.Title) > 200 {
 		return httpx.ValidationError("title must be at most 200 characters")
 	}
-	if body.Description != nil && len(*body.Description) > 2000 {
+	if body.Description != nil && httpx.JSStringLength(*body.Description) > 2000 {
 		return httpx.ValidationError("description must be at most 2000 characters")
 	}
 	if len(body.Branches) < 2 || len(body.Branches) > 10 {
@@ -112,10 +112,10 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 		if strings.TrimSpace(branch.Title) == "" {
 			return httpx.ValidationError("branch title is required")
 		}
-		if len(branch.Title) > 200 {
+		if httpx.JSStringLength(branch.Title) > 200 {
 			return httpx.ValidationError("branch title must be at most 200 characters")
 		}
-		if branch.Description != nil && len(*branch.Description) > 2000 {
+		if branch.Description != nil && httpx.JSStringLength(*branch.Description) > 2000 {
 			return httpx.ValidationError("branch description must be at most 2000 characters")
 		}
 		if branch.InheritMode != "" && branch.InheritMode != "full" && branch.InheritMode != "compressed" && branch.InheritMode != "fresh" {
@@ -204,7 +204,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) error {
 		if !isString || strings.TrimSpace(title) == "" {
 			return httpx.ValidationError("title must be a non-empty string")
 		}
-		if len(title) > 200 {
+		if httpx.JSStringLength(title) > 200 {
 			return httpx.ValidationError("title must be at most 200 characters")
 		}
 	}
@@ -213,7 +213,7 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) error {
 		if !isString {
 			return httpx.ValidationError("description must be a string")
 		}
-		if len(description) > 2000 {
+		if httpx.JSStringLength(description) > 2000 {
 			return httpx.ValidationError("description must be at most 2000 characters")
 		}
 	}
@@ -298,7 +298,52 @@ func (h *Handler) getByID(r *http.Request, id string) (Group, error) {
 	if err == sql.ErrNoRows {
 		return Group{}, httpx.NotFound("Exploration group")
 	}
-	return group, err
+	if err != nil {
+		return Group{}, err
+	}
+	branches, err := h.branchesForGroup(r, id)
+	if err != nil {
+		return Group{}, err
+	}
+	group.Branches = branches
+	return group, nil
+}
+
+// branchesForGroup loads the exploration branch chapters linked to a group so the
+// detail response mirrors the create response shape (which also returns branches).
+func (h *Handler) branchesForGroup(r *http.Request, groupID string) ([]chaptersvc.Chapter, error) {
+	rows, err := h.DB.QueryContext(r.Context(), `SELECT id FROM chapters WHERE exploration_group_id = ? ORDER BY created_at ASC`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{}
+	for rows.Next() {
+		var chapterID string
+		if err := rows.Scan(&chapterID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, chapterID)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	branches := make([]chaptersvc.Chapter, 0, len(ids))
+	if h.Chapters == nil {
+		return branches, nil
+	}
+	for _, chapterID := range ids {
+		chapter, err := h.Chapters.Get(r.Context(), chapterID)
+		if err != nil {
+			return nil, err
+		}
+		branches = append(branches, chapter)
+	}
+	return branches, nil
 }
 
 type rowScanner interface{ Scan(dest ...any) error }

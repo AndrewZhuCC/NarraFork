@@ -254,6 +254,15 @@ func run() error {
 	}
 	projectService := projects.NewService(dbStore.SQL, gitService, chapterService, settings)
 	projectService.SetUserBroadcaster(hub.BroadcastUser)
+	// Reconcile container states on startup: mark running container_instances rows
+	// as stopped when their Podman container is actually gone (mirrors the
+	// TypeScript reconcileContainerStates()). Done before starting the proxy so its
+	// first DB read does not target dead container IPs.
+	if stale, err := chapterService.ReconcileContainerStatesOnStartup(ctx); err != nil {
+		slog.Warn("container state reconciliation failed", "error", err)
+	} else if stale > 0 {
+		slog.Info("startup reconciliation: marked stale containers as stopped", "stale", stale)
+	}
 	containerProxy := containerproxy.New(dbStore.SQL, settings)
 	projectService.SetProxyCacheRefresher(containerProxy.EnsureCurrent)
 	if err := containerProxy.EnsureCurrent(ctx); err != nil {

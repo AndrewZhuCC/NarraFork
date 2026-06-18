@@ -8,11 +8,11 @@ import (
 	"math"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"github.com/go-chi/chi/v5"
 
@@ -201,8 +201,13 @@ func (h *Handler) upsertRecentTab(w http.ResponseWriter, r *http.Request) error 
 				}
 				mergeMapInPlace(tabs[idx], patch)
 			} else {
+				// Tab already exists: merge fields in place but KEEP its current
+				// position, mirroring TS (server/routes/user-preferences.ts):
+				// "Re-visiting an existing tab must not reorder the list - only
+				// manual moves/pins change order. Only brand-new tabs are inserted
+				// at the top." Previously Go promoted the tab to the front of the
+				// unpinned section here, which reordered on every revisit.
 				mergeMapInPlace(tabs[idx], tab)
-				tabs = promoteTopLevelTabRespectingPins(tabs, idx)
 			}
 		} else if updateOnly {
 			return tabs, nil
@@ -222,7 +227,7 @@ func (h *Handler) upsertRecentTab(w http.ResponseWriter, r *http.Request) error 
 			tabs = insertTopLevelTabRespectingPins(tabs, tab)
 		}
 		if len(tabs) > maxRecentTabs {
-			tabs = tabs[:maxRecentTabs]
+			tabs = trimRecentTabs(tabs, maxRecentTabs)
 		}
 		tabs = regroupWorkspaces(tabs)
 		return tabs, nil
@@ -304,7 +309,9 @@ func (h *Handler) moveRecentTab(w http.ResponseWriter, r *http.Request) error {
 				if headerIdx := indexByKey(tabs, "workspace:"+wsID); headerIdx >= 0 {
 					movedGroup, tabs = extractMovableGroup(tabs, headerIdx)
 				} else {
-					movedGroup, tabs = nil, tabs
+					// Header missing: the child was already put back at putBackAt above.
+					// Clear movedGroup so the early-return below leaves the list as-is.
+					movedGroup = nil
 				}
 			}
 			if len(movedGroup) == 0 {
@@ -337,22 +344,27 @@ func (h *Handler) pinRecentTab(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	var body struct {
-		Key    string `json:"key"`
-		Pinned bool   `json:"pinned"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeJSON(r, &raw); err != nil {
 		return err
 	}
-	if strings.TrimSpace(body.Key) == "" || len(body.Key) > 100 {
+	key, _ := raw["key"].(string)
+	if strings.TrimSpace(key) == "" || httpx.JSStringLength(key) > 100 {
 		return httpx.ValidationError("key is required")
 	}
+	// Mirror TS pinRecentTabSchema `pinned: z.boolean()` (required): a missing or
+	// non-boolean value must reject, not silently decode to false (which would
+	// UNPIN the tab).
+	pinned, ok := raw["pinned"].(bool)
+	if !ok {
+		return httpx.ValidationError("pinned must be a boolean")
+	}
 	tabs, err := h.mutateRecentTabs(r, userID, func(tabs []map[string]any) ([]map[string]any, error) {
-		idx := indexByKey(tabs, body.Key)
+		idx := indexByKey(tabs, key)
 		if idx < 0 {
 			return tabs, nil
 		}
-		if body.Pinned {
+		if pinned {
 			tabs[idx]["pinned"] = true
 		} else {
 			delete(tabs[idx], "pinned")
@@ -615,12 +627,12 @@ func validateUpsertRecentTab(tab map[string]any) (map[string]any, bool, error) {
 		}
 		clean["workspaceId"] = value
 	}
-	title, err := requiredStringField(tab, "title", "recentTab", 0, 200)
+	title, err := requiredStringField(tab, "title", "recentTab", 0, 1000)
 	if err != nil {
 		return nil, false, err
 	}
 	clean["title"] = title
-	if err := optionalStringField(tab, "subtitle", "recentTab", 0, 200); err != nil {
+	if err := optionalStringField(tab, "subtitle", "recentTab", 0, 1000); err != nil {
 		return nil, false, err
 	}
 	if value, ok := tab["subtitle"]; ok {
@@ -692,7 +704,7 @@ func validatePreferencePatch(patch map[string]any) error {
 			continue
 		}
 		text := stringValue(value)
-		if len(text) > 500 {
+		if jsStringLength(text) > 500 {
 			return httpx.ValidationError(field + " must be at most 500 characters")
 		}
 		if preferenceWebhookFields[field] && text != "" && !strings.HasPrefix(text, "*") && !strings.HasPrefix(text, "https://") {
@@ -731,10 +743,10 @@ func validateStringPreference(patch map[string]any, key string, minLen int, maxL
 	if !ok {
 		return httpx.ValidationError(key + " must be a string")
 	}
-	if len(text) < minLen {
+	if jsStringLength(text) < minLen {
 		return httpx.ValidationError(key + " must not be empty")
 	}
-	if len(text) > maxLen {
+	if jsStringLength(text) > maxLen {
 		return httpx.ValidationError(key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return nil
@@ -871,10 +883,10 @@ func requiredStringField(item map[string]any, key string, path string, minLen in
 	if !ok {
 		return "", httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	if len(text) < minLen {
+	if jsStringLength(text) < minLen {
 		return "", httpx.ValidationError(path + "." + key + " must not be empty")
 	}
-	if len(text) > maxLen {
+	if jsStringLength(text) > maxLen {
 		return "", httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return text, nil
@@ -889,10 +901,10 @@ func optionalStringField(item map[string]any, key string, path string, minLen in
 	if !ok {
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	if len(text) < minLen {
+	if jsStringLength(text) < minLen {
 		return httpx.ValidationError(path + "." + key + " must not be empty")
 	}
-	if len(text) > maxLen {
+	if jsStringLength(text) > maxLen {
 		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return nil
@@ -1097,7 +1109,7 @@ func validateGatewayStringArray(platform map[string]any, key string, path string
 		if !ok {
 			return httpx.ValidationError(itemPath + " must be a string")
 		}
-		if len(text) > 100 {
+		if jsStringLength(text) > 100 {
 			return httpx.ValidationError(itemPath + " must be at most 100 characters")
 		}
 	}
@@ -1237,15 +1249,29 @@ func maskSecret(value string) string {
 	if value == "" {
 		return ""
 	}
-	if len(value) <= 4 {
-		return strings.Repeat("*", len(value))
+	// Mirror the TS user-preferences maskSecret (server/routes/user-preferences.ts):
+	// `val.length<=4 -> "*".repeat(val.length)`, else `"*".repeat(8)+val.slice(-4)`,
+	// measured in UTF-16 code units. Go previously used byte length + a byte suffix
+	// slice, which for a non-ASCII gateway token/secret would emit the wrong star
+	// count and could cut mid-rune, producing invalid UTF-8 in the masked value.
+	if jsStringLength(value) <= 4 {
+		return strings.Repeat("*", jsStringLength(value))
 	}
-	return "********" + value[len(value)-4:]
+	return "********" + httpx.JSStringSliceFromEnd(value, 4)
 }
 
 func stringValue(value any) string {
 	s, _ := value.(string)
 	return s
+}
+
+// jsStringLength mirrors JavaScript String.prototype.length (and therefore the
+// Zod .min()/.max() string-length checks used by the TS user-preferences route),
+// which counts UTF-16 code units. utf8.RuneCountInString would be too permissive
+// for astral characters (e.g. an emoji is 2 UTF-16 units in JS but 1 rune in Go),
+// so input that TS rejects at a .max() boundary must also be rejected here.
+func jsStringLength(value string) int {
+	return len(utf16.Encode([]rune(value)))
 }
 
 func (h *Handler) recentTabs(r *http.Request, userID string) ([]map[string]any, error) {
@@ -1407,8 +1433,16 @@ func tabNarratorIDs(tabs []map[string]any) []string {
 
 func regroupWorkspaces(tabs []map[string]any) []map[string]any {
 	childrenByWorkspace := map[string][]map[string]any{}
+	// orphanOrder records workspace IDs in the order their first child appears in
+	// the tab list, matching the TS regroupWorkspaces, which appends orphan children
+	// in childrenByWs Map insertion order (first-appearance order). Sorting the IDs
+	// (e.g. alphabetically) would diverge whenever two or more workspaces are orphaned.
+	orphanOrder := make([]string, 0)
 	for _, tab := range tabs {
 		if wsID := stringValue(tab["workspaceId"]); wsID != "" {
+			if _, seen := childrenByWorkspace[wsID]; !seen {
+				orphanOrder = append(orphanOrder, wsID)
+			}
 			childrenByWorkspace[wsID] = append(childrenByWorkspace[wsID], tab)
 		}
 	}
@@ -1432,18 +1466,53 @@ func regroupWorkspaces(tabs []map[string]any) []map[string]any {
 		headerIDs[wsID] = struct{}{}
 		result = append(result, childrenByWorkspace[wsID]...)
 	}
-	orphanIDs := make([]string, 0)
-	for wsID := range childrenByWorkspace {
-		if _, ok := headerIDs[wsID]; !ok {
-			orphanIDs = append(orphanIDs, wsID)
+	for _, wsID := range orphanOrder {
+		if _, ok := headerIDs[wsID]; ok {
+			continue
 		}
-	}
-	sort.Strings(orphanIDs)
-	for _, wsID := range orphanIDs {
 		for _, child := range childrenByWorkspace[wsID] {
 			delete(child, "workspaceId")
 			result = append(result, child)
 		}
+	}
+	return result
+}
+
+// trimRecentTabs mirrors the TS trimRecentTabs (server/routes/user-preferences.ts):
+// when the tab list exceeds max, it removes tabs from the END but pin/type-aware:
+// first the last unpinned subagent tab, then the last unpinned tab, and only as a
+// last resort (all remaining pinned) the very last tab. This preserves pinned
+// tabs (and prefers dropping transient subagent tabs) instead of the prior naive
+// tabs[:max] truncation, which could drop pinned tabs sitting at the tail.
+func trimRecentTabs(tabs []map[string]any, max int) []map[string]any {
+	if max < 0 {
+		max = 0
+	}
+	if len(tabs) <= max {
+		return tabs
+	}
+	result := append([]map[string]any{}, tabs...)
+	removeFirstMatching := func(predicate func(map[string]any) bool) bool {
+		for i := len(result) - 1; i >= 0; i-- {
+			if predicate(result[i]) {
+				result = append(result[:i], result[i+1:]...)
+				return true
+			}
+		}
+		return false
+	}
+	for len(result) > max {
+		if removeFirstMatching(func(tab map[string]any) bool {
+			return stringValue(tab["type"]) == "subagent" && !boolValue(tab["pinned"])
+		}) {
+			continue
+		}
+		if removeFirstMatching(func(tab map[string]any) bool {
+			return !boolValue(tab["pinned"])
+		}) {
+			continue
+		}
+		result = result[:len(result)-1]
 	}
 	return result
 }
@@ -1468,18 +1537,6 @@ func getPinnedSectionEndIndex(tabs []map[string]any) int {
 		}
 	}
 	return idx
-}
-
-func promoteTopLevelTabRespectingPins(tabs []map[string]any, idx int) []map[string]any {
-	if idx < 0 || idx >= len(tabs) {
-		return tabs
-	}
-	tab := tabs[idx]
-	if stringValue(tab["workspaceId"]) != "" || boolValue(tab["pinned"]) {
-		return tabs
-	}
-	moved, remaining := extractMovableGroup(tabs, idx)
-	return insertTabs(remaining, getPinnedSectionEndIndex(remaining), moved)
 }
 
 func insertTopLevelTabRespectingPins(tabs []map[string]any, tab map[string]any) []map[string]any {
@@ -1566,14 +1623,19 @@ func validateRemoveRecentTab(tabType string, tabID string) error {
 	default:
 		return httpx.ValidationError("recentTab.type is not supported")
 	}
-	if strings.TrimSpace(tabID) == "" || len(tabID) > 50 {
+	// Mirror the TS removeRecentTabSchema `id: z.string().min(1).max(50)` using
+	// UTF-16 code-unit length (httpx.JSStringLength), consistent with the rest of
+	// this file (e.g. moveRecentTab key). Go previously used byte length, which
+	// would wrongly reject a <=50-character CJK id whose UTF-8 byte count exceeds
+	// 50.
+	if strings.TrimSpace(tabID) == "" || httpx.JSStringLength(tabID) > 50 {
 		return httpx.ValidationError("recentTab.id is required")
 	}
 	return nil
 }
 
 func validateMoveRecentTab(key string, toIndex *int, position string) error {
-	if strings.TrimSpace(key) == "" || len(key) > 100 {
+	if strings.TrimSpace(key) == "" || httpx.JSStringLength(key) > 100 {
 		return httpx.ValidationError("key is required")
 	}
 	if toIndex == nil && position == "" {

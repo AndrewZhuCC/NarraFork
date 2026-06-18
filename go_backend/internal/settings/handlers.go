@@ -19,7 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -204,10 +203,15 @@ func maskProviderArray(raw map[string]any, field, secretKey string) {
 }
 
 func maskSecret(value string) string {
-	if len(value) <= 4 {
-		return strings.Repeat("*", len(value))
+	// Mirror the TypeScript maskApiKey (server/routes/settings.ts): operate on
+	// UTF-16 code units (key.length / key.slice(-4)), not Go byte length. For the
+	// usual ASCII API keys these are identical, but a non-ASCII secret (e.g. a
+	// relay token) would otherwise diverge on the <=4 length check and could be
+	// byte-sliced mid-rune, emitting invalid UTF-8 in the masked display value.
+	if httpx.JSStringLength(value) <= 4 {
+		return strings.Repeat("*", httpx.JSStringLength(value))
 	}
-	return "********" + value[len(value)-4:]
+	return "********" + httpx.JSStringSliceFromEnd(value, 4)
 }
 
 func lanAddresses() []string {
@@ -829,7 +833,7 @@ func validateServerSettingsPatch(patch map[string]any) error {
 				return httpx.ValidationError("server.port must be an integer between 1 and 65535")
 			}
 		case "host":
-			if strings.TrimSpace(stringValue(value)) == "" || len(strings.TrimSpace(stringValue(value))) > 255 {
+			if strings.TrimSpace(stringValue(value)) == "" || httpx.JSStringLength(strings.TrimSpace(stringValue(value))) > 255 {
 				return httpx.ValidationError("server.host must be a non-empty string up to 255 characters")
 			}
 		case "openBrowser":
@@ -979,7 +983,7 @@ func validateAgentPromptAndAggregations(agentPatch map[string]any) error {
 		if !ok {
 			return httpx.ValidationError("agent.defaultSystemPrompt must be a string")
 		}
-		if len(prompt) > 50000 {
+		if httpx.JSStringLength(prompt) > 50000 {
 			return httpx.ValidationError("agent.defaultSystemPrompt must be at most 50000 characters")
 		}
 	}
@@ -1047,10 +1051,10 @@ func validateSettingsStringFieldBounds(item map[string]any, key string, path str
 	if !ok {
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	if len(text) < minLen {
+	if httpx.JSStringLength(text) < minLen {
 		return httpx.ValidationError(path + "." + key + " must not be empty")
 	}
-	if len(text) > maxLen {
+	if httpx.JSStringLength(text) > maxLen {
 		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return nil
@@ -1388,12 +1392,15 @@ func settingsRequiredTrimmedString(item map[string]any, key string, path string,
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
 	text = strings.TrimSpace(text)
-	if len(text) < minLen {
+	if httpx.JSStringLength(text) < minLen {
 		return httpx.ValidationError(path + "." + key + " must not be empty")
 	}
-	if len(text) > maxLen {
+	if httpx.JSStringLength(text) > maxLen {
 		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
+	// TS uses z.string().trim() for these fields, which stores the trimmed value.
+	// Write it back so persisted settings match TS exactly.
+	item[key] = text
 	return nil
 }
 
@@ -1406,14 +1413,14 @@ func settingsOptionalStringMaxField(item map[string]any, key string, path string
 	if !ok {
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	if len(text) > maxLen {
+	if httpx.JSStringLength(text) > maxLen {
 		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return nil
 }
 
 func validateAgentContextThresholds(thresholds map[string]any) error {
-	for tier, minValue := range map[string]int{"standard": 50, "large": 10} {
+	for tier, minValue := range map[string]float64{"standard": 50, "large": 10} {
 		value, ok := thresholds[tier]
 		if !ok {
 			continue
@@ -1424,7 +1431,11 @@ func validateAgentContextThresholds(thresholds map[string]any) error {
 		}
 		for _, key := range []string{"pruneStart", "compactStart"} {
 			if value, ok := cfg[key]; ok {
-				if err := validateSettingsIntRange(value, "agent.contextThresholds."+tier+"."+key, minValue, 100); err != nil {
+				// TS contextThresholds use z.number() (NOT .int()), so fractional
+				// values like 95.5 are valid. Use the float range validator rather
+				// than the integer one to avoid rejecting decimals the frontend's
+				// NumberInput can produce.
+				if err := validateSettingsFloatRange(value, "agent.contextThresholds."+tier+"."+key, minValue, 100); err != nil {
 					return err
 				}
 			}
@@ -1502,14 +1513,14 @@ func validateCodexSettingsPatch(patch map[string]any) error {
 			if !ok {
 				return httpx.ValidationError("codex.proxy must be a string")
 			}
-			proxy = normalizeProxyURL(proxy)
-			codexPatch["proxy"] = proxy
-			if proxy != "" {
-				parsed, err := url.Parse(proxy)
-				if err != nil || parsed.Scheme == "" || parsed.Host == "" || !validProxyScheme(parsed.Scheme) {
-					return httpx.ValidationError("codex.proxy must be an http, https, socks4, socks5, or socks5h URL")
-				}
-			}
+			// Mirror TS proxyUrlSchema (z.preprocess(normalizeProxyUrl,
+			// z.string().optional())): normalize only, NO scheme validation. TS
+			// rejects null/non-string (z.string()) but accepts any normalized
+			// string — including non-http schemes like "ftp://". Go previously
+			// rejected non-http/socks schemes here, which (a) diverged from TS and
+			// (b) was inconsistent with Go's own customApi/anthropic proxy handling
+			// (normalizeProxyField, no scheme check) that uses the same TS schema.
+			codexPatch["proxy"] = normalizeProxyURL(proxy)
 		case "loadBalancingMode":
 			mode := stringValue(value)
 			if mode != "priority" && mode != "balanced" && mode != "tier-balanced" {
@@ -1579,10 +1590,37 @@ func normalizeProxyURL(value string) string {
 	if trimmed == "" {
 		return ""
 	}
-	if strings.Contains(trimmed, "://") {
+	if hasProxyProtocolPrefix(trimmed) {
 		return trimmed
 	}
 	return "http://" + trimmed
+}
+
+// hasProxyProtocolPrefix mirrors the TypeScript PROXY_PROTOCOL_RE
+// (/^[a-z][a-z0-9+.-]*:\/\//i): a scheme token at the START — a letter followed
+// by letters/digits/`+`/`.`/`-` — immediately followed by "://". A plain
+// strings.Contains("://") check diverges, treating e.g. "host://weird" or
+// "1abc://x" as already-schemed when TS would prefix "http://".
+func hasProxyProtocolPrefix(value string) bool {
+	i := 0
+	n := len(value)
+	if i >= n || !isASCIILetter(value[i]) {
+		return false
+	}
+	i++
+	for i < n {
+		c := value[i]
+		if isASCIILetter(c) || (c >= '0' && c <= '9') || c == '+' || c == '.' || c == '-' {
+			i++
+			continue
+		}
+		break
+	}
+	return strings.HasPrefix(value[i:], "://")
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 func normalizeProxyField(item map[string]any, key string) {
@@ -1781,7 +1819,7 @@ func validateVNetUDPSettingsPatch(udpPatch map[string]any) error {
 			}
 		case "host":
 			host := strings.TrimSpace(stringValue(value))
-			if host == "" || len(host) > 255 {
+			if host == "" || httpx.JSStringLength(host) > 255 {
 				return httpx.ValidationError("vnet.udp.host must be a non-empty string up to 255 characters")
 			}
 		case "port":
@@ -1799,6 +1837,18 @@ func validateSettingsIntRange(value any, path string, minValue int, maxValue int
 	number, ok := value.(float64)
 	if !ok || number != float64(int(number)) || number < float64(minValue) || number > float64(maxValue) {
 		return httpx.ValidationError(path + " must be an integer between " + strconv.Itoa(minValue) + " and " + strconv.Itoa(maxValue))
+	}
+	return nil
+}
+
+// validateSettingsFloatRange mirrors a TS z.number().min(a).max(b) WITHOUT
+// .int(): fractional values are allowed, so it must NOT reject non-integers the
+// way validateSettingsIntRange does. Used for contextThresholds pruneStart/
+// compactStart, which TS defines as z.number() (not z.number().int()).
+func validateSettingsFloatRange(value any, path string, minValue float64, maxValue float64) error {
+	number, ok := value.(float64)
+	if !ok || number < minValue || number > maxValue {
+		return httpx.ValidationError(path + " must be a number between " + strconv.FormatFloat(minValue, 'f', -1, 64) + " and " + strconv.FormatFloat(maxValue, 'f', -1, 64))
 	}
 	return nil
 }
@@ -2841,7 +2891,7 @@ func (h *Handler) testModel(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(body.Model) == "" || strings.TrimSpace(body.Prompt) == "" {
 		return httpx.ValidationError("model and prompt are required")
 	}
-	if utf8.RuneCountInString(body.Prompt) > testModelPromptMaxChars {
+	if httpx.JSStringLength(body.Prompt) > testModelPromptMaxChars {
 		return httpx.ValidationError("prompt must be at most 10000 characters")
 	}
 	if _, err := agentbasic.ResolveProviderAndModel(h.Store, body.Model); err != nil {

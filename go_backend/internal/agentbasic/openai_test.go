@@ -1047,7 +1047,7 @@ func TestGlobToolSupportsRecursivePatternsAndPath(t *testing.T) {
 func TestEditToolCreatesFileWhenOldStringEmpty(t *testing.T) {
 	cwd := t.TempDir()
 	out := ExecuteTool(context.Background(), cwd, "Edit", `{"file_path":"new/deep/file.txt","old_string":"","new_string":"brand new"}`)
-	if !strings.Contains(out, "created") {
+	if !strings.Contains(out, "Created/overwritten") {
 		t.Fatalf("expected create success, got: %s", out)
 	}
 	data, err := os.ReadFile(filepath.Join(cwd, "new", "deep", "file.txt"))
@@ -1070,7 +1070,7 @@ func TestEditToolRequiresUniqueMatchUnlessReplaceAll(t *testing.T) {
 		t.Fatalf("expected non-unique match error, got: %s", out)
 	}
 	out = ExecuteTool(context.Background(), cwd, "Edit", `{"file_path":"edit.txt","old_string":"foo","new_string":"baz","replace_all":true}`)
-	if !strings.Contains(out, "2 replacements") {
+	if !strings.Contains(out, "Edited") {
 		t.Fatalf("expected replace_all success, got: %s", out)
 	}
 	data, err := os.ReadFile(path)
@@ -1136,8 +1136,21 @@ func TestReadToolListsDirectories(t *testing.T) {
 		t.Fatalf("write fixture: %v", err)
 	}
 	out := ExecuteTool(context.Background(), cwd, "Read", `{"file_path":"dir"}`)
-	if !strings.Contains(out, "Directory:") || !strings.Contains(out, "file.txt") || !strings.Contains(out, "nested/") {
-		t.Fatalf("unexpected directory listing: %s", out)
+	// Mirror the TS Read-tool listDirectory format: "Directory listing for <path>"
+	// header (original display path), two-space-indented entries, dirs first, and a
+	// "(N entries)" footer.
+	if !strings.Contains(out, "Directory listing for dir") {
+		t.Fatalf("expected TS-style directory header, got: %s", out)
+	}
+	if !strings.Contains(out, "  file.txt") || !strings.Contains(out, "  nested/") {
+		t.Fatalf("expected two-space-indented entries with dir slash, got: %s", out)
+	}
+	if !strings.Contains(out, "(2 entries)") {
+		t.Fatalf("expected entry-count footer, got: %s", out)
+	}
+	// Directories sort before files: "nested/" must appear before "file.txt".
+	if strings.Index(out, "nested/") > strings.Index(out, "file.txt") {
+		t.Fatalf("directories should sort before files, got: %s", out)
 	}
 }
 
@@ -1153,6 +1166,21 @@ func TestReadToolSupportsOffsetAndLimit(t *testing.T) {
 	full := ExecuteTool(context.Background(), cwd, "Read", `{"file_path":"sample.txt","offset":3,"limit":-1}`)
 	if full != "     3│line3\n     4│line4\n     5│" {
 		t.Fatalf("expected numbered read to EOF, got %q", full)
+	}
+}
+
+// TestReadToolOutOfRangeOffsetReturnsEmptyFilePlaceholder pins the small-file
+// out-of-range offset behavior to TS (read.ts:236 `numbered || "(empty file)"`):
+// an offset past EOF yields the "(empty file)" placeholder, not an empty string.
+// Go previously early-returned "" for start >= len(lines).
+func TestReadToolOutOfRangeOffsetReturnsEmptyFilePlaceholder(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "sample.txt"), []byte("line1\nline2\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "Read", `{"file_path":"sample.txt","offset":999}`)
+	if out != "(empty file)" {
+		t.Fatalf("expected (empty file) placeholder for out-of-range offset, got %q", out)
 	}
 }
 
@@ -1176,8 +1204,12 @@ func TestBashToolRejectsEmptyCommand(t *testing.T) {
 
 func TestBashToolHonorsTimeout(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "Bash", `{"command":"sleep 2","timeout":1000}`)
-	if !strings.Contains(out, "[timeout]") {
-		t.Fatalf("expected timeout marker, got: %s", out)
+	// TS appends a <bash_metadata> block "Command timed out after Nms".
+	if !strings.Contains(out, "Command timed out after 1000ms") {
+		t.Fatalf("expected TS-style timeout metadata, got: %s", out)
+	}
+	if !strings.Contains(out, "<bash_metadata>") {
+		t.Fatalf("expected bash_metadata wrapper, got: %s", out)
 	}
 }
 
@@ -1693,7 +1725,7 @@ func TestWebFetchToolFetchesAndTruncatesHTTP(t *testing.T) {
 	}))
 	defer server.Close()
 
-	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"`+server.URL+`","max_length":10}`)
+	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"`+server.URL+`","mode":"raw","max_length":10}`)
 	if !strings.Contains(out, "Status: 200 OK") {
 		t.Fatalf("expected status line, got: %s", out)
 	}
@@ -1710,26 +1742,26 @@ func TestWebFetchToolRejectsNonHTTPURL(t *testing.T) {
 }
 
 func TestWebFetchToolSupportsDataURL(t *testing.T) {
-	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;base64,aGVsbG8gd29ybGQ=","max_length":20}`)
+	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;base64,aGVsbG8gd29ybGQ=","mode":"raw","max_length":20}`)
 	if !strings.Contains(out, "Status: 200 OK") || !strings.Contains(out, "Content-Type: text/plain") || !strings.Contains(out, "hello world") {
 		t.Fatalf("expected decoded data URL output, got: %s", out)
 	}
 
-	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;charset=utf-8,hello%20inline","max_length":5}`)
+	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain;charset=utf-8,hello%20inline","mode":"raw","max_length":5}`)
 	if !strings.Contains(out, "Content-Type: text/plain;charset=utf-8") || !strings.Contains(out, "hello") || !strings.Contains(out, "[truncated]") {
 		t.Fatalf("expected plain data URL output with truncation, got: %s", out)
 	}
 }
 
 func TestWebFetchToolRejectsUnsupportedModeInsteadOfIgnoring(t *testing.T) {
-	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","mode":"readability"}`)
-	if !strings.Contains(out, "unsupported WebFetch mode") || !strings.Contains(out, "readability") {
+	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","mode":"smart"}`)
+	if !strings.Contains(out, "unsupported WebFetch mode") || !strings.Contains(out, "smart") {
 		t.Fatalf("expected unsupported mode error, got: %s", out)
 	}
 
 	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","selector":"main"}`)
-	if !strings.Contains(out, "selector and purpose parameters") {
-		t.Fatalf("expected unsupported selector error, got: %s", out)
+	if !strings.Contains(out, "selector requires dom mode") {
+		t.Fatalf("expected selector-requires-dom error, got: %s", out)
 	}
 
 	out = ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"data:text/plain,hello","mode":"raw"}`)
@@ -1830,5 +1862,35 @@ func TestAnthropicToolLoopHonorsMaxTurns(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("expected one request due to maxTurns=1, got %d", requests)
+	}
+}
+
+// TestReadToolWholeOutputCapUsesUTF16Boundary verifies the small-file Read path
+// caps its numbered output by UTF-16 code units (consistent with the TS
+// READ_ALL_MAX_CHARS char budget) and never emits invalid UTF-8 by cutting a
+// multi-byte rune mid-sequence. A CJK file whose numbered output exceeds 100000
+// UTF-16 units would, under a byte slice, be cut mid-rune.
+func TestReadToolWholeOutputCapUsesUTF16Boundary(t *testing.T) {
+	cwd := t.TempDir()
+	// 120000 CJK chars on one logical block split into lines so formatNumberedLines
+	// produces > 100000 UTF-16 units of output. Use 4000 lines of 30 CJK chars.
+	var b strings.Builder
+	for i := 0; i < 4000; i++ {
+		b.WriteString(strings.Repeat("章", 30))
+		b.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "big_cjk.txt"), []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "Read", `{"file_path":"big_cjk.txt","limit":-1}`)
+	if !strings.Contains(out, "[truncated]") {
+		t.Fatalf("expected Read output to be truncated")
+	}
+	if strings.ContainsRune(out, 0xFFFD) {
+		t.Fatalf("Read truncation produced invalid UTF-8 (U+FFFD)")
+	}
+	// UTF-16 cap keeps ~100000 units; a byte cap on 3-byte CJK would keep ~33334.
+	if units := len([]rune(out)); units < 90000 {
+		t.Fatalf("Read output kept only %d runes — looks byte-capped, want UTF-16 cap (~100000)", units)
 	}
 }

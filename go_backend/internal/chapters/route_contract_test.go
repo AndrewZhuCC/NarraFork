@@ -39,11 +39,6 @@ func TestSplitRouteValidatesInputBeforeMutation(t *testing.T) {
 			want: "newFork.description must be at most 2000 characters",
 		},
 		{
-			name: "inheritMode required",
-			body: `{"commitSha":"abc123","newFork":{"title":"Fork"}}`,
-			want: "newFork.inheritMode must be full, compressed, or fresh",
-		},
-		{
 			name: "inheritMode enum",
 			body: `{"commitSha":"abc123","newFork":{"title":"Fork","inheritMode":"summary"}}`,
 			want: "newFork.inheritMode must be full, compressed, or fresh",
@@ -63,6 +58,24 @@ func TestSplitRouteValidatesInputBeforeMutation(t *testing.T) {
 				t.Fatalf("unexpected split validation body: %#v", body)
 			}
 		})
+	}
+}
+
+// TestSplitDefaultsOmittedInheritModeToFull is a regression test for a Zod
+// .default() divergence: TS splitChapterSchema newFork.inheritMode is
+// z.enum([...]).default("full"), so an omitted value defaults to "full" rather
+// than being rejected. Go previously returned 400 for the omitted field.
+func TestSplitDefaultsOmittedInheritModeToFull(t *testing.T) {
+	// Nil DB/Git: a request that passes validation reaches SplitAtCommit and is
+	// rejected with the services-required error, NOT the inheritMode enum error.
+	h := NewHandler(&Service{})
+	w := serveChapterRouteContractRequest(h, http.MethodPost, "/chapters/source/split",
+		`{"commitSha":"abc123","newFork":{"title":"Fork"}}`)
+	if strings.Contains(w.Body.String(), "inheritMode must be full") {
+		t.Fatalf("omitted inheritMode should default to full, not be rejected: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Chapter split requires database and git services") {
+		t.Fatalf("expected to reach SplitAtCommit services guard, got %s", w.Body.String())
 	}
 }
 
@@ -125,6 +138,13 @@ func TestChapterCriticalRoutesExposeValidationContracts(t *testing.T) {
 			want:   "strategy must be merge, squash, or cherry-pick",
 		},
 		{
+			name:   "ai-resolve rejects over-long message (same mergeChapterSchema as /merge)",
+			method: http.MethodPost,
+			path:   "/chapters/source/ai-resolve",
+			body:   `{"targetChapterId":"target","message":"` + strings.Repeat("x", 501) + `"}`,
+			want:   "message must be at most 500 characters",
+		},
+		{
 			name:   "batch-merge requires base chapter",
 			method: http.MethodPost,
 			path:   "/chapters/batch-merge",
@@ -137,6 +157,55 @@ func TestChapterCriticalRoutesExposeValidationContracts(t *testing.T) {
 			path:   "/chapters/batch-merge",
 			body:   `{"baseChapterId":"base","sourceChapterIds":[]}`,
 			want:   "sourceChapterIds is required",
+		},
+		{
+			name:   "batch-merge requires title when no targetChapterId",
+			method: http.MethodPost,
+			path:   "/chapters/batch-merge",
+			body:   `{"baseChapterId":"base","sourceChapterIds":["source"]}`,
+			want:   "title is required when not merging into an existing chapter",
+		},
+		{
+			name:   "batch-merge rejects overlong title",
+			method: http.MethodPost,
+			path:   "/chapters/batch-merge",
+			body:   `{"baseChapterId":"base","sourceChapterIds":["source"],"title":"` + strings.Repeat("x", 201) + `"}`,
+			want:   "title must be at most 200 characters",
+		},
+		{
+			name:   "batch-merge rejects overlong description",
+			method: http.MethodPost,
+			path:   "/chapters/batch-merge",
+			body:   `{"baseChapterId":"base","sourceChapterIds":["source"],"targetChapterId":"target","description":"` + strings.Repeat("d", 2001) + `"}`,
+			want:   "description must be at most 2000 characters",
+		},
+		{
+			name:   "batch-merge rejects invalid strategy",
+			method: http.MethodPost,
+			path:   "/chapters/batch-merge",
+			body:   `{"baseChapterId":"base","sourceChapterIds":["source"],"targetChapterId":"target","strategy":"rebase"}`,
+			want:   "strategy must be merge, squash, or cherry-pick",
+		},
+		{
+			name:   "cleanup requires non-empty chapterIds",
+			method: http.MethodPost,
+			path:   "/chapters/cleanup",
+			body:   `{}`,
+			want:   "chapterIds must contain at least one item",
+		},
+		{
+			name:   "cleanup rejects empty chapterIds array",
+			method: http.MethodPost,
+			path:   "/chapters/cleanup",
+			body:   `{"chapterIds":[]}`,
+			want:   "chapterIds must contain at least one item",
+		},
+		{
+			name:   "cleanup rejects empty-string chapterId entry",
+			method: http.MethodPost,
+			path:   "/chapters/cleanup",
+			body:   `{"chapterIds":[""]}`,
+			want:   "chapterIds entries must be non-empty strings",
 		},
 		{
 			name:   "create requires projectId",
@@ -228,6 +297,48 @@ func TestChapterCriticalRoutesExposeValidationContracts(t *testing.T) {
 			path:   "/chapters/source/batch-fork",
 			body:   `{"forks":[]}`,
 			want:   "forks is required",
+		},
+		{
+			name:   "batch-fork rejects more than 10 forks",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"a"},{"title":"b"},{"title":"c"},{"title":"d"},{"title":"e"},{"title":"f"},{"title":"g"},{"title":"h"},{"title":"i"},{"title":"j"},{"title":"k"}]}`,
+			want:   "forks must contain at most 10 items",
+		},
+		{
+			name:   "batch-fork rejects empty title item (whole-request 400, not per-item failed[])",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"ok"},{"title":"  "}]}`,
+			want:   "forks[1].title is required",
+		},
+		{
+			name:   "batch-fork rejects over-long title",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"` + strings.Repeat("x", 201) + `"}]}`,
+			want:   "forks[0].title must be at most 200 characters",
+		},
+		{
+			name:   "batch-fork rejects over-long description",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"ok","description":"` + strings.Repeat("y", 2001) + `"}]}`,
+			want:   "forks[0].description must be at most 2000 characters",
+		},
+		{
+			name:   "batch-fork rejects invalid inheritMode",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"ok","inheritMode":"bogus"}]}`,
+			want:   "forks[0].inheritMode must be full, compressed, or fresh",
+		},
+		{
+			name:   "batch-fork rejects invalid role (TS enum [branch, exploration], not silent coerce)",
+			method: http.MethodPost,
+			path:   "/chapters/source/batch-fork",
+			body:   `{"forks":[{"title":"ok","role":"trunk"}]}`,
+			want:   "forks[0].role must be branch or exploration",
 		},
 		{
 			name:   "cherry-pick requires sourceChapterId",

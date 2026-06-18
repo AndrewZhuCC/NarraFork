@@ -602,6 +602,49 @@ func TestDatabaseCleanupRejectsOutOfRangeOlderThanDays(t *testing.T) {
 	}
 }
 
+func TestDatabaseCleanupInvalidTargetMatchesTSSchemaMessage(t *testing.T) {
+	database, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.Exec(`CREATE TABLE api_requests (id TEXT PRIMARY KEY, raw_dump_json TEXT, created_at TEXT)`); err != nil {
+		t.Fatalf("create api_requests: %v", err)
+	}
+	h := NewHandler(database)
+
+	// Mirror the TypeScript storage routes: an unknown `target` fails the Zod enum
+	// in databasePreviewSchema/databaseCleanupSchema and returns the single unified
+	// 400 message, NOT the deeper "Invalid database cleanup target" string.
+	for _, tc := range []struct {
+		name    string
+		path    string
+		body    string
+		handler func(http.ResponseWriter, *http.Request) error
+		want    string
+	}{
+		{"preview unknown target", "/api/storage/database/preview", `{"target":"bogus"}`, h.databaseCleanupPreview, "Invalid database cleanup preview request"},
+		{"preview missing target", "/api/storage/database/preview", `{"olderThanDays":30}`, h.databaseCleanupPreview, "Invalid database cleanup preview request"},
+		{"preview uploads target", "/api/storage/database/preview", `{"target":"uploads"}`, h.databaseCleanupPreview, "Invalid database cleanup preview request"},
+		{"cleanup unknown target", "/api/storage/database/cleanup", `{"target":"bogus"}`, h.databaseCleanup, "Invalid database cleanup request"},
+		{"cleanup missing target", "/api/storage/database/cleanup", `{"olderThanDays":30}`, h.databaseCleanup, "Invalid database cleanup request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			err := tc.handler(w, req)
+			var appErr *httpx.AppError
+			if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+				t.Fatalf("expected 400 AppError for %s, got %T %v (status w=%d)", tc.name, err, err, w.Code)
+			}
+			if appErr.Message != tc.want {
+				t.Fatalf("expected message %q for %s, got %q", tc.want, tc.name, appErr.Message)
+			}
+		})
+	}
+}
+
 func TestDatabaseCleanupArchivedSessionsDeletesThroughNarratorService(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	database := openDatabaseCleanupNarratorTestDB(t)

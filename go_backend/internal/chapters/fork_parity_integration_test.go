@@ -389,3 +389,38 @@ func hasForkFallback(fallbacks []ForkFallback, feature string) bool {
 	}
 	return false
 }
+
+// TestForkAutoTitleMatchesTSFormat pins the no-explicit-title fork auto title to
+// the TS derivation (server/services/chapter-fork.ts:72:
+// `${parent.title.slice(0, 180)}-fork-${generateShortId(6)}`). Go previously used
+// "<title> fork" (a space, no slice, no unique suffix).
+func TestForkAutoTitleMatchesTSFormat(t *testing.T) {
+	ctx := context.Background()
+	sqlDB := newForkParityDB(t)
+	repo := newForkParityRepo(t)
+	baseSHA := gitOutput(t, repo, "rev-parse", "HEAD")
+	if _, err := sqlDB.Exec(`INSERT INTO projects (id, name, git_path, default_branch, created_at, updated_at) VALUES ('p1', 'Project', ?, 'master', 'now', 'now')`, repo); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, worktree_path, base_branch, is_root, head_commit_sha, commit_count, axis_offset, cross_offset, last_accessed_at, created_at, updated_at) VALUES ('c_parent', 'p1', 'Parent', 'active', 'branch', 'master', ?, 'master', 0, ?, 1, 10, 20, 'now', 'now', 'now')`, repo, baseSHA); err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+	insertForkParityNarratorFixture(t, sqlDB, repo, baseSHA)
+	service := &Service{DB: sqlDB, Git: gitx.NewService(), Narrators: &narrators.Service{DB: sqlDB}}
+
+	chapter, err := service.Fork(ctx, "c_parent", ForkInput{InheritMode: "full"})
+	if err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	// Format: "Parent-fork-<6 chars>".
+	if !strings.HasPrefix(chapter.Title, "Parent-fork-") {
+		t.Fatalf("auto fork title should be %q + '-fork-' + id, got %q", "Parent", chapter.Title)
+	}
+	suffix := strings.TrimPrefix(chapter.Title, "Parent-fork-")
+	if len(suffix) != 6 {
+		t.Fatalf("auto fork title suffix should be a 6-char short id, got %q (len %d)", suffix, len(suffix))
+	}
+	if strings.Contains(chapter.Title, " fork") {
+		t.Fatalf("auto fork title should not use the old ' fork' wording, got %q", chapter.Title)
+	}
+}

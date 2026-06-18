@@ -237,6 +237,75 @@ func toolBrowser(ctx context.Context, cwd string, args map[string]any) string {
 	headless := boolArg(args, "headless", true)
 	coordinate, hasCoordinate := coordinateValue(args["coordinate"])
 
+	result := browserDispatch(ctx, cwd, action, args, headless, coordinate, hasCoordinate, timeoutMs, maxLength)
+	// Mirror the TS touchSessionVisual contract (browser/session.ts + actions.ts):
+	// page-modifying actions emit a browser_session_visual_change event so the
+	// frontend BrowserSessionBar refreshes its live screenshot. Read-only actions
+	// (screenshot/get_text/dom/get_attribute/get_console/get_network/perf_*) do not.
+	// Only emit on a successful action result (success returns JSON with session_id;
+	// errors return a plain string).
+	if browserVisualChangeActions[action] && browserResultIsSuccess(result) {
+		notifyBrowserVisualChange(ctx, stringValue(args["session_id"]))
+	}
+	return result
+}
+
+// browserVisualChangeActions enumerates the Browser tool actions that modify the
+// visible page state, matching the TS actions that call touchSessionVisual
+// (server/lib/browser/actions.ts): navigate, click, fill, select, type, hover,
+// evaluate, evaluate_capture, wait, scroll.
+var browserVisualChangeActions = map[string]bool{
+	"navigate":         true,
+	"click":            true,
+	"fill":             true,
+	"select":           true,
+	"type":             true,
+	"hover":            true,
+	"evaluate":         true,
+	"evaluate_capture": true,
+	"wait":             true,
+	"scroll":           true,
+}
+
+// browserResultIsSuccess reports whether a Browser action result string is a
+// successful JSON payload (which always carries a session_id) rather than a
+// plain-text error message.
+func browserResultIsSuccess(result string) bool {
+	trimmed := strings.TrimSpace(result)
+	if !strings.HasPrefix(trimmed, "{") {
+		return false
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return false
+	}
+	_, ok := decoded["session_id"]
+	return ok
+}
+
+// notifyBrowserVisualChange emits a "visual_change" browser session event for the
+// given session (the observer maps it to the browser_session_visual_change WS
+// frame). It is narrator-scoped: when the calling context binds a narrator, only
+// that narrator's own session triggers the event. No-op for unknown sessions.
+func notifyBrowserVisualChange(ctx context.Context, sessionID string) {
+	if strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	browserSessions.Lock()
+	session, ok := browserSessions.items[sessionID]
+	browserSessions.Unlock()
+	if !ok {
+		return
+	}
+	if execInfo, hasExecInfo := BrowserExecutionFromContext(ctx); hasExecInfo {
+		if narratorID := strings.TrimSpace(execInfo.NarratorID); narratorID != "" && session.NarratorID != narratorID {
+			return
+		}
+	}
+	notifyBrowserSessionEvent(ctx, "visual_change", session.snapshot())
+}
+
+func browserDispatch(ctx context.Context, cwd, action string, args map[string]any, headless bool, coordinate browserCoordinate, hasCoordinate bool, timeoutMs, maxLength int) string {
 	switch action {
 	case "launch":
 		return browserLaunch(ctx, stringValue(args["url"]), headless, intValue(args["ttl_ms"], int(browserDefaultSessionTTL/time.Millisecond)), boolValue(args["capture_network"]), timeoutMs, maxLength)
@@ -277,7 +346,7 @@ func toolBrowser(ctx context.Context, cwd string, args map[string]any) string {
 	case "scroll":
 		return browserScroll(ctx, stringValue(args["session_id"]), stringValue(args["selector"]), coordinate, hasCoordinate, strings.TrimSpace(stringValue(args["direction"])), intValue(args["amount"], 500), timeoutMs)
 	case "set_ttl":
-		return browserSetTTL(ctx, stringValue(args["session_id"]), intValue(args["ttl_ms"], 0))
+		return browserSetTTL(ctx, stringValue(args["session_id"]), intValue(args["ttl_ms"], int(browserDefaultSessionTTL/time.Millisecond)))
 	case "list_sessions":
 		return browserListSessions(ctx)
 	case "perf_start":
@@ -2059,9 +2128,11 @@ func normalizeBrowserTimeoutMs(timeoutMs int) int {
 }
 
 func normalizeBrowserSessionTTL(ttl time.Duration) (time.Duration, error) {
-	if ttl <= 0 {
-		return browserDefaultSessionTTL, nil
-	}
+	// Mirror the TS normalizeSessionTtlMs (server/lib/browser/session.ts): the
+	// DEFAULT is applied ONLY for an absent value (handled by the caller passing
+	// browserDefaultSessionTTL when the ttl_ms arg is missing). An EXPLICIT value
+	// out of [MIN, MAX] - including 0 or negative - is rejected, not silently
+	// defaulted.
 	if ttl < browserMinSessionTTL || ttl > browserMaxSessionTTL {
 		return 0, fmt.Errorf("Browser session TTL must be between %dms and %dms", browserMinSessionTTL/time.Millisecond, browserMaxSessionTTL/time.Millisecond)
 	}

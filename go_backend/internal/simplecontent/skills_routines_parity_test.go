@@ -57,6 +57,44 @@ func TestCreateGlobalSkillValidatesZodBoundsLikeTypeScript(t *testing.T) {
 	}
 }
 
+// TestCreateGlobalSkillTrimsContentLikeTypeScript pins the global-skill write path
+// to the TS skills.ts behavior (content = body.content?.trim()), which stores the
+// trimmed content. This also matches the project-skill create/update path in this
+// package (which trims via strings.TrimSpace before persisting). The raw SKILL.md
+// body must contain the trimmed content with no leading/trailing whitespace.
+func TestCreateGlobalSkillTrimsContentLikeTypeScript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	h := NewHandler()
+
+	w := serveSimpleSkillsRequest(h, http.MethodPost, "/skills/global", map[string]any{
+		"name":        "Trimmed Skill",
+		"description": "demo",
+		"content":     "  \n\tactual body\n\n  ",
+	})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create global skill status = %d body=%s, want 201", w.Code, w.Body.String())
+	}
+
+	// The stored SKILL.md frontmatter is followed by the content. After the closing
+	// "---\n\n" delimiter, the body must be exactly the trimmed content + "\n".
+	skillFile := filepath.Join(home, ".narrafork", "skills", "trimmed-skill", "SKILL.md")
+	raw, err := os.ReadFile(skillFile)
+	if err != nil {
+		t.Fatalf("read SKILL.md: %v", err)
+	}
+	text := string(raw)
+	marker := "---\n\n"
+	idx := strings.LastIndex(text, marker)
+	if idx < 0 {
+		t.Fatalf("SKILL.md missing frontmatter delimiter: %q", text)
+	}
+	body := text[idx+len(marker):]
+	if body != "actual body\n" {
+		t.Fatalf("stored content should be trimmed; got %q (full file %q)", body, text)
+	}
+}
+
 func TestSkillCompanionFileReadsAreBounded(t *testing.T) {
 	dir := t.TempDir()
 	skillPath := filepath.Join(dir, "SKILL.md")
@@ -188,6 +226,28 @@ func TestGlobalSkillCRUDMatchesTSStatusAndSideEffects(t *testing.T) {
 	missingToggleBody := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", map[string]any{})
 	if missingToggleBody.Code != http.StatusBadRequest {
 		t.Fatalf("missing enabled toggle status = %d body=%s", missingToggleBody.Code, missingToggleBody.Body.String())
+	}
+
+	// Mirror TS `if (typeof body.enabled !== "boolean") throw 400 "enabled
+	// (boolean) is required"`: missing/non-boolean value all reject with that same
+	// message (not a generic "invalid JSON"), and a valid `enabled` with an extra
+	// sibling field is still accepted (TS ignores unknown keys).
+	for _, tc := range []struct {
+		name string
+		body map[string]any
+	}{
+		{"string enabled", map[string]any{"enabled": "yes"}},
+		{"numeric enabled", map[string]any{"enabled": 1}},
+		{"null enabled", map[string]any{"enabled": nil}},
+	} {
+		w := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", tc.body)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "enabled (boolean) is required") {
+			t.Fatalf("%s toggle should be 400 with TS message, got %d body=%s", tc.name, w.Code, w.Body.String())
+		}
+	}
+	extraField := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", map[string]any{"enabled": false, "ignored": "x"})
+	if extraField.Code != http.StatusOK {
+		t.Fatalf("toggle with extra sibling field should be accepted (TS ignores unknown keys), got %d body=%s", extraField.Code, extraField.Body.String())
 	}
 
 	disable := serveSimpleSkillsRequest(handler, http.MethodPost, "/skills/global/Contract%20Skill/toggle", map[string]any{"enabled": false})
@@ -525,6 +585,17 @@ func TestProjectSkillWriteRoutesMatchTSStatusAndSideEffects(t *testing.T) {
 		t.Fatalf("missing update status = %d body=%s", missingUpdate.Code, missingUpdate.Body.String())
 	}
 
+	// Mirror TS PUT /:name ordering: body validation (description required) runs
+	// BEFORE the skill-existence lookup, so an empty description on a missing
+	// skill returns 400 "description is required", not 404.
+	missingEmptyDesc := serveProjectSkillsRequest(handler, http.MethodPut, "/skills/missing?projectId=p1", map[string]any{"description": "  ", "content": "x"})
+	if missingEmptyDesc.Code != http.StatusBadRequest {
+		t.Fatalf("missing update with empty description should be 400 (validate before existence), got %d body=%s", missingEmptyDesc.Code, missingEmptyDesc.Body.String())
+	}
+	if !strings.Contains(missingEmptyDesc.Body.String(), "description is required") {
+		t.Fatalf("empty description should return the description-required error, got %s", missingEmptyDesc.Body.String())
+	}
+
 	// Update succeeds and the new content is reflected.
 	update := serveProjectSkillsRequest(handler, http.MethodPut, "/skills/Project%20Skill?projectId=p1", map[string]any{"description": "Updated description", "content": "Updated project content."})
 	if update.Code != http.StatusOK {
@@ -572,5 +643,52 @@ func TestSanitizeProjectSkillDirNameMatchesTS(t *testing.T) {
 		if got := sanitizeProjectSkillDirName(input); got != want {
 			t.Fatalf("sanitizeProjectSkillDirName(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// TestSkillToolOutputDoesNotEscapeFilePaths pins the <file> rendering to TS
+// (server/lib/agent/tools/skill.ts:188): `<file>${join(skillDir, f)}</file>` is
+// emitted verbatim, NOT XML-escaped (only name/args are escaped). A companion
+// file path containing '&' must appear literally, not as "&amp;".
+func TestSkillToolOutputDoesNotEscapeFilePaths(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSkillFixture(t, filepath.Join(project, ".narrafork", "skills", "demo"), "demo", "Project demo", "instructions", map[string]string{"a&b/guide.md": "guide"})
+
+	out := SkillToolOutput("demo", "", project)
+	wantFile := filepath.Join(project, ".narrafork", "skills", "demo", "a&b", "guide.md")
+	if !strings.Contains(out, "<file>"+wantFile+"</file>") {
+		t.Fatalf("expected unescaped file path %q in output:\n%s", wantFile, out)
+	}
+	if strings.Contains(out, "a&amp;b") {
+		t.Fatalf("file path must NOT be XML-escaped (TS does not escape it), got:\n%s", out)
+	}
+}
+
+// TestTruncateSkillDescriptionUsesUTF16 pins truncateSkillDescription to the TS
+// truncateDescription (server/services/skill-service.ts:363): slice(0, 1000) over
+// UTF-16 code units + "…". Go previously used []rune (code points), which cut
+// astral-character descriptions at a different boundary than TS.
+func TestTruncateSkillDescriptionUsesUTF16(t *testing.T) {
+	// <=1000 chars: returned unchanged.
+	short := strings.Repeat("a", 1000)
+	if got := truncateSkillDescription(short); got != short {
+		t.Fatalf("1000-char description should be unchanged")
+	}
+	// 1001 ASCII chars: truncated to 1000 + "…".
+	long := strings.Repeat("a", 1001)
+	got := truncateSkillDescription(long)
+	if got != strings.Repeat("a", 1000)+"…" {
+		t.Fatalf("1001-char description should truncate to 1000+…, got len=%d", len([]rune(got)))
+	}
+	// Astral characters (U+1D400, 2 UTF-16 units each): 600 of them = 1200 UTF-16
+	// units -> sliced to 1000 units = 500 astral chars + "…". A rune-count cap
+	// would wrongly keep 600.
+	astral := strings.Repeat("\U0001D400", 600)
+	gotAstral := truncateSkillDescription(astral)
+	trimmed := strings.TrimSuffix(gotAstral, "…")
+	if r := []rune(trimmed); len(r) != 500 {
+		t.Fatalf("astral description should keep 500 runes (1000 UTF-16 units), got %d", len(r))
 	}
 }

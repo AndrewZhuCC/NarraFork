@@ -57,16 +57,16 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(req.Name) == "" {
 		return httpx.BadRequest("name is required")
 	}
-	if len(req.Name) > 200 {
+	if httpx.JSStringLength(req.Name) > 200 {
 		return httpx.BadRequest("name must be at most 200 characters")
 	}
-	if req.Description != nil && len(*req.Description) > 2000 {
+	if req.Description != nil && httpx.JSStringLength(*req.Description) > 2000 {
 		return httpx.BadRequest("description must be at most 2000 characters")
 	}
-	if len(req.CloneUsername) > 200 {
+	if httpx.JSStringLength(req.CloneUsername) > 200 {
 		return httpx.BadRequest("cloneUsername must be at most 200 characters")
 	}
-	if len(req.ClonePassword) > 200 {
+	if httpx.JSStringLength(req.ClonePassword) > 200 {
 		return httpx.BadRequest("clonePassword must be at most 200 characters")
 	}
 	input := CreateInput{Name: req.Name, Description: req.Description, RepoMode: req.RepoMode, GitPath: req.GitPath, FlowMode: req.FlowMode, CloneURL: req.CloneURL, CloneBranch: req.CloneBranch, CloneUsername: req.CloneUsername, ClonePassword: req.ClonePassword}

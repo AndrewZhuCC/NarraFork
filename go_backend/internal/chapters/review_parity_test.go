@@ -64,6 +64,11 @@ func TestCreateReviewIncludesDiffContextAndCopiesDirtyFiles(t *testing.T) {
 	if review.WorktreePath == nil || strings.TrimSpace(*review.WorktreePath) == "" {
 		t.Fatalf("review worktree missing: %#v", review)
 	}
+	// Mirror the TS auto title `Review: ${source.title.slice(0,160)}` — for the
+	// "Source" fixture title this is exactly "Review: Source".
+	if review.Title != "Review: Source" {
+		t.Fatalf("review title = %q, want %q", review.Title, "Review: Source")
+	}
 	if review.HeadCommitSHA == nil || *review.HeadCommitSHA != head || review.CommitCount != 2 {
 		t.Fatalf("review head/count = %#v/%d, want %s/2", review.HeadCommitSHA, review.CommitCount, head)
 	}

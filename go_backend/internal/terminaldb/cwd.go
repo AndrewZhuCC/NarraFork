@@ -33,6 +33,29 @@ func ResolveCwd(ctx context.Context, sqlDB *sql.DB, chapterID, narratorID string
 	return resolveNarratorCwd(ctx, sqlDB, narratorID)
 }
 
+// ResolveCreateCwd mirrors the TypeScript terminalService.create branch exactly,
+// which differs from ResolveCwd in the neither/both cases: providing BOTH a
+// chapterId and narratorId is rejected ("Only one of chapterId or narratorId may
+// be provided"), while providing NEITHER is allowed and yields a standalone
+// terminal rooted at the home directory (used by global flows such as the setup
+// wizard). The tab/view-state/tool paths keep using ResolveCwd, which requires
+// exactly one target.
+func ResolveCreateCwd(ctx context.Context, sqlDB *sql.DB, chapterID, narratorID string) (sql.NullString, error) {
+	chapterID = strings.TrimSpace(chapterID)
+	narratorID = strings.TrimSpace(narratorID)
+	if chapterID != "" && narratorID != "" {
+		return sql.NullString{}, ErrTargetAmbiguous
+	}
+	if chapterID != "" {
+		return resolveChapterCwd(ctx, sqlDB, chapterID)
+	}
+	if narratorID != "" {
+		return resolveNarratorCwd(ctx, sqlDB, narratorID)
+	}
+	// Standalone terminal: no chapter/narrator binding -> home directory.
+	return homeCwd(), nil
+}
+
 func resolveChapterCwd(ctx context.Context, sqlDB *sql.DB, chapterID string) (sql.NullString, error) {
 	var cwd sql.NullString
 	err := sqlDB.QueryRowContext(ctx, `SELECT worktree_path FROM chapters WHERE id = ?`, chapterID).Scan(&cwd)

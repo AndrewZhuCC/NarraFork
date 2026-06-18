@@ -102,8 +102,12 @@ func TestBrowseHonorsShowHidden(t *testing.T) {
 func TestMkdirRejectsUnsafeNamesAndCreatesSingleDirectory(t *testing.T) {
 	settings := loadFSTestSettings(t)
 	parent := t.TempDir()
-	for _, name := range []string{"../escape", "nested/child", "nested\\child", "bad<name", "..", string([]byte{'b', 'a', 'd', 0x01})} {
-		w := serveFSRaw(t, settings, http.MethodPost, "/fs/mkdir", `{"parent":"`+parent+`","name":"`+name+`"}`)
+	for _, name := range []string{"../escape", "nested/child", "nested\\child", "bad<name", "bad>name", "bad:name", "bad\"name", "bad|name", "bad?name", "bad*name", "..", ".", string([]byte{'b', 'a', 'd', 0x01}), string([]byte{'b', 'a', 'd', 0x1f})} {
+		bodyBytes, err := json.Marshal(map[string]string{"parent": parent, "name": name})
+		if err != nil {
+			t.Fatalf("marshal mkdir body for %q: %v", name, err)
+		}
+		w := serveFSRaw(t, settings, http.MethodPost, "/fs/mkdir", string(bodyBytes))
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("mkdir %q should be rejected, got %d body=%s", name, w.Code, w.Body.String())
 		}
@@ -191,6 +195,32 @@ func TestPreviewUsesTextSizeLimitAndInlineHeaders(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/plain") || w.Header().Get("Content-Disposition") != "inline" {
 		t.Fatalf("small text preview headers/status mismatch: code=%d headers=%v body=%s", w.Code, w.Header(), w.Body.String())
 	}
+
+	// Parity guard: the binary (image/PDF) limit is 20MB while text is 1MB, so a
+	// file just over the text limit must be REJECTED as text (.log) yet ACCEPTED
+	// as an image (.png) of the same size. This mirrors the TS branch
+	// `stat.size > (mime ? MAX_PREVIEW_BYTES : MAX_TEXT_PREVIEW_BYTES)`.
+	betweenSize := maxTextPreview + 1 // > 1MB text limit, < 20MB binary limit
+	binaryMid := filepath.Join(dir, "image.png")
+	if err := os.WriteFile(binaryMid, []byte(strings.Repeat("x", betweenSize)), 0o644); err != nil {
+		t.Fatalf("write mid-size binary: %v", err)
+	}
+	w = serveFSRaw(t, settings, http.MethodGet, "/fs/preview?path="+binaryMid, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("mid-size image should use the 20MB binary limit and be served (200), got %d body=%s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("Content-Type") != "image/png" || w.Header().Get("Content-Disposition") != "inline" {
+		t.Fatalf("mid-size image preview headers mismatch: headers=%v", w.Header())
+	}
+	// The same size as a text file (.log) must be rejected by the 1MB text limit.
+	textMid := filepath.Join(dir, "midsize.log")
+	if err := os.WriteFile(textMid, []byte(strings.Repeat("x", betweenSize)), 0o644); err != nil {
+		t.Fatalf("write mid-size text: %v", err)
+	}
+	w = serveFSRaw(t, settings, http.MethodGet, "/fs/preview?path="+textMid, "")
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("mid-size text should exceed the 1MB text limit and be 413, got %d body=%s", w.Code, w.Body.String())
+	}
 }
 
 func loadFSTestSettings(t *testing.T) *config.Store {
@@ -241,4 +271,35 @@ func entryNames(body map[string]any) map[string]bool {
 		}
 	}
 	return names
+}
+
+// TestBrowseErrorMessagesMatchTS pins the /api/fs/browse error contract to TS
+// (server/routes/fs.ts): a missing path returns "Path does not exist: <abs>",
+// a file (non-directory) returns "Not a directory: <abs>". Go previously
+// returned the raw os.ReadDir error string and did not distinguish the
+// not-a-directory case.
+func TestBrowseErrorMessagesMatchTS(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	dir := t.TempDir()
+
+	// Missing path -> "Path does not exist".
+	missing := filepath.Join(dir, "does-not-exist")
+	rec := serveFSRaw(t, settings, http.MethodGet, "/fs/browse?path="+missing, "")
+	if rec.Code == http.StatusOK || !strings.Contains(rec.Body.String(), "Path does not exist") {
+		t.Fatalf("missing path should report 'Path does not exist', got %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// A file path -> "Not a directory".
+	filePath := filepath.Join(dir, "note.txt")
+	if err := os.WriteFile(filePath, []byte("hello"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	rec = serveFSRaw(t, settings, http.MethodGet, "/fs/browse?path="+filePath, "")
+	if rec.Code == http.StatusOK || !strings.Contains(rec.Body.String(), "Not a directory") {
+		t.Fatalf("file path should report 'Not a directory', got %d body=%s", rec.Code, rec.Body.String())
+	}
 }

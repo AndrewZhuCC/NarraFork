@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"narrafork-go/internal/auth"
@@ -82,6 +83,34 @@ func TestUserPreferencesLoadRedactsNotificationAndGatewaySecrets(t *testing.T) {
 	assertMasked(t, platform["clientSecret"], "client-secret-2468")
 	if platform["appId"] != "public-app" {
 		t.Fatalf("non-secret appId should be preserved, got %#v", platform["appId"])
+	}
+}
+
+// TestMaskSecretMatchesTSMaskApiKey pins the user-preferences maskSecret to the TS
+// maskSecret (server/routes/user-preferences.ts): empty -> "", length<=4 -> stars
+// of that length, else 8 stars + last 4 chars, measured in UTF-16 code units (not
+// Go bytes). The non-ASCII cases guard against byte-length divergence and mid-rune
+// byte slicing that would emit invalid UTF-8 in the masked gateway secret value.
+func TestMaskSecretMatchesTSMaskApiKey(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"ab", "**"},
+		{"abcd", "****"},
+		{"abcdef", "********cdef"},
+		{"telegram-token-1234", "********1234"},
+		{"密钥串", "***"},
+		{"超长密钥令牌", "********密钥令牌"},
+	}
+	for _, tc := range cases {
+		got := maskSecret(tc.in)
+		if got != tc.want {
+			t.Fatalf("maskSecret(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		for _, r := range got {
+			if r == 0xFFFD {
+				t.Fatalf("maskSecret(%q) produced invalid UTF-8 (U+FFFD): %q", tc.in, got)
+			}
+		}
 	}
 }
 
@@ -320,6 +349,52 @@ func TestRecentTabUpsertValidatesTSShapeAndStripsUnknownFields(t *testing.T) {
 	}
 }
 
+// TestRecentTabTitleAllowsUpToThousandChars is a regression test for a recentTab
+// title length-limit mismatch: TS recentTabSchema uses
+// title: z.string().max(RECENT_TAB_TEXT_MAX_CHARS=1000), but Go previously
+// capped title/subtitle at 200, wrongly rejecting titles of 201..1000 chars.
+func TestRecentTabTitleAllowsUpToThousandChars(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := newUserPrefsTestDB(t)
+	if _, err := sqlDB.Exec(`INSERT INTO users (id, username, role, created_at) VALUES ('u1', 'alice', 'admin', 'now')`); err != nil {
+		t.Fatalf("insert user: %v", err)
+	}
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	authService := auth.NewService(sqlDB, settings)
+	token, err := authService.CreateToken("u1", "admin")
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+	wrapped := authService.Middleware(httpx.Handler((&Handler{DB: sqlDB}).upsertRecentTab))
+
+	// 1000-char title (previously rejected at >200) must now be accepted.
+	title := strings.Repeat("t", 1000)
+	payload := []byte(`{"type":"project","id":"p1","title":"` + title + `","lastVisitedAt":1700000000000}`)
+	req := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader(payload))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	wrapped.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("1000-char title should be accepted, got %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	// 1001-char title must still be rejected.
+	tooLong := strings.Repeat("t", 1001)
+	payload2 := []byte(`{"type":"project","id":"p2","title":"` + tooLong + `","lastVisitedAt":1700000000000}`)
+	req2 := httptest.NewRequest(http.MethodPut, "/api/user-preferences/recent-tabs", bytes.NewReader(payload2))
+	req2.Header.Set("Authorization", "Bearer "+token)
+	req2.Header.Set("Content-Type", "application/json")
+	resp2 := httptest.NewRecorder()
+	wrapped.ServeHTTP(resp2, req2)
+	if resp2.Code != http.StatusBadRequest {
+		t.Fatalf("1001-char title should be rejected, got %d", resp2.Code)
+	}
+}
+
 func TestRecentTabMutationsBroadcastUserScopedSnapshot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	sqlDB := newUserPrefsTestDB(t)
@@ -404,7 +479,10 @@ func TestRecentTabUpsertMatchesTSPinnedAndWorkspaceSemantics(t *testing.T) {
 	}
 
 	tabs = callRecentTabsEndpoint(t, sqlDB, h.upsertRecentTab, http.MethodPut, "/api/user-preferences/recent-tabs", `{"type":"project","id":"p2","title":"Project 2 visited","lastVisitedAt":6}`, token)
-	assertTabOrder(t, tabs, "project:pin", "project:p2", "chapter:c1", "workspace:ws")
+	// Re-visiting an existing tab (non-updateOnly) merges in place and must NOT
+	// reorder the list, matching TS (only manual moves/pins change order). p2
+	// keeps its current position rather than being promoted to the unpinned top.
+	assertTabOrder(t, tabs, "project:pin", "chapter:c1", "project:p2", "workspace:ws")
 
 	tabs = callRecentTabsEndpoint(t, sqlDB, h.upsertRecentTab, http.MethodPut, "/api/user-preferences/recent-tabs", `{"type":"narrator","id":"n1","title":"Workspace child","workspaceId":"ws","lastVisitedAt":7,"updateOnly":true}`, token)
 	assertTabOrder(t, tabs, "project:pin", "project:p2", "workspace:ws", "chapter:c1")
@@ -570,6 +648,76 @@ func assertTabOrder(t *testing.T, tabs []map[string]any, keys ...string) {
 		if got := tabKey(tabs[i]); got != key {
 			t.Fatalf("tab[%d]=%s want %s full=%#v", i, got, key, tabs)
 		}
+	}
+}
+
+// recentTabsEndpointStatus invokes a recent-tabs handler and returns the HTTP
+// status code (for asserting validation rejections rather than success).
+func recentTabsEndpointStatus(t *testing.T, sqlDB *sql.DB, handler func(http.ResponseWriter, *http.Request) error, method, path, body, token string) (int, string) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader([]byte(body)))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	auth.NewService(sqlDB, settings).Middleware(httpx.Handler(handler)).ServeHTTP(resp, req)
+	return resp.Code, resp.Body.String()
+}
+
+// TestRecentTabPinAndClearRejectInvalidInputMatchTS covers the deterministic
+// validation guards that mirror the TypeScript Zod schemas (pinRecentTabSchema:
+// key string.min(1).max(100); clearRecentTabsSchema: scope enum) but were not
+// exercised by the happy-path move/pin/clear test: pinning with an empty or
+// overlong key, and clearing with an unsupported scope, must be rejected with
+// 400 before mutating recent tabs.
+func TestRecentTabPinAndClearRejectInvalidInputMatchTS(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	sqlDB := newUserPrefsTestDB(t)
+	token := userPrefsTestToken(t, sqlDB)
+	createRecentTabsRuntimeTables(t, sqlDB)
+	h := &Handler{DB: sqlDB}
+	seedRecentTabs(t, sqlDB, `[{"type":"project","id":"p","title":"P","lastVisitedAt":1}]`)
+
+	overlongKey := strings.Repeat("k", 101)
+	cases := []struct {
+		name    string
+		handler func(http.ResponseWriter, *http.Request) error
+		method  string
+		path    string
+		body    string
+	}{
+		{"pin empty key", h.pinRecentTab, http.MethodPatch, "/api/user-preferences/recent-tabs/pin", `{"key":"","pinned":true}`},
+		{"pin overlong key", h.pinRecentTab, http.MethodPatch, "/api/user-preferences/recent-tabs/pin", `{"key":"` + overlongKey + `","pinned":true}`},
+		{"pin missing pinned", h.pinRecentTab, http.MethodPatch, "/api/user-preferences/recent-tabs/pin", `{"key":"project:p"}`},
+		{"pin non-boolean pinned", h.pinRecentTab, http.MethodPatch, "/api/user-preferences/recent-tabs/pin", `{"key":"project:p","pinned":"yes"}`},
+		{"pin null pinned", h.pinRecentTab, http.MethodPatch, "/api/user-preferences/recent-tabs/pin", `{"key":"project:p","pinned":null}`},
+		{"clear unsupported scope", h.clearRecentTabs, http.MethodPost, "/api/user-preferences/recent-tabs/clear", `{"scope":"everything"}`},
+		{"clear empty scope", h.clearRecentTabs, http.MethodPost, "/api/user-preferences/recent-tabs/clear", `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, body := recentTabsEndpointStatus(t, sqlDB, tc.handler, tc.method, tc.path, tc.body, token)
+			if status != http.StatusBadRequest {
+				t.Fatalf("expected 400, got %d body=%s", status, body)
+			}
+		})
+	}
+
+	// The seeded recent_tabs must survive every rejected request (no mutation):
+	// the stored JSON still contains the single project tab and nothing else.
+	var stored string
+	if err := sqlDB.QueryRow(`SELECT recent_tabs FROM user_preferences WHERE user_id = 'u1'`).Scan(&stored); err != nil {
+		t.Fatalf("read recent_tabs: %v", err)
+	}
+	var storedTabs []map[string]any
+	if err := json.Unmarshal([]byte(stored), &storedTabs); err != nil {
+		t.Fatalf("decode stored recent_tabs %q: %v", stored, err)
+	}
+	if len(storedTabs) != 1 || tabKey(storedTabs[0]) != "project:p" {
+		t.Fatalf("rejected requests must not mutate recent tabs, got %#v", storedTabs)
 	}
 }
 

@@ -21,8 +21,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
+	"unicode/utf16"
 
 	"narrafork-go/internal/config"
 	"narrafork-go/internal/id"
@@ -49,6 +49,7 @@ type ToolCall struct {
 
 type Provider struct {
 	Prefix                 string
+	ID                     string
 	Kind                   string
 	APIKey                 string
 	BaseURL                string
@@ -132,15 +133,24 @@ type ExternalToolSpec struct {
 }
 
 const (
-	DefaultSystemPrompt         = "You are NarraFork Go backend's coding assistant. Use available tools when needed, keep answers concise, and explain important changes."
-	defaultMaxTurns             = 4
-	maxAllowedTurns             = 200
+	DefaultSystemPrompt = "You are NarraFork Go backend's coding assistant. Use available tools when needed, keep answers concise, and explain important changes."
+	defaultMaxTurns     = 4
+	// maxAllowedTurns mirrors the TS agent.maxTurns settings ceiling (valid range
+	// 1-1000 per server/lib/settings/defaults.ts and the Go settings validator);
+	// the TS agent loop applies no additional cap, so the loop must honor the
+	// full validated range rather than silently truncating 201-1000 to 200.
+	maxAllowedTurns             = 1000
 	defaultMaxChatRetries       = 3
 	defaultEmptyResponseRetries = 3
-	maxToolWriteBytes           = 2 * 1024 * 1024
-	maxToolEditFileBytes        = 2 * 1024 * 1024
-	maxToolShareSourceBytes     = 512 * 1024 * 1024
-	defaultToolShareExpiry      = 24 * time.Hour
+	// defaultRetryBaseDelay / defaultRetryBackoffCeil mirror the TS transient
+	// retry backoff (server/lib/agent/loop.ts + types.ts): delay =
+	// min(TRANSIENT_RETRY_BASE_MS(5000) * 2^(attempt-1), retryBackoffCeilMs(20000)).
+	defaultRetryBaseDelay   = 5000 * time.Millisecond
+	defaultRetryBackoffCeil = 20000 * time.Millisecond
+	maxToolWriteBytes       = 2 * 1024 * 1024
+	maxToolEditFileBytes    = 2 * 1024 * 1024
+	maxToolShareSourceBytes = 512 * 1024 * 1024
+	defaultToolShareExpiry  = 24 * time.Hour
 )
 
 var safeShareIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
@@ -166,6 +176,7 @@ type generateOptions struct {
 	maxChatRetries                    int
 	emptyResponseRetries              int
 	retryBaseDelay                    time.Duration
+	retryBackoffCeil                  time.Duration
 	customRetryRules                  []customRetryRule
 	stickySessionKey                  string
 	sideCarCollector                  SideCarCollector
@@ -178,6 +189,7 @@ type generateOptions struct {
 	beforeTurnReplacementHook         BeforeTurnReplacementHook
 	runtimeSettingsOverrideHook       RuntimeSettingsOverrideHook
 	shouldStopHook                    ShouldStopHook
+	contextWindow                     int
 }
 
 type SideCarRequest struct {
@@ -231,6 +243,15 @@ func WithMaxChatRetries(maxRetries int) GenerateOption {
 func WithRetryBaseDelay(delay time.Duration) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.retryBaseDelay = delay
+	}
+}
+
+// WithRetryBackoffCeil sets the maximum transient-retry backoff delay, mirroring
+// the TS agent.retryBackoffCeilMs setting (default 20000ms). A non-positive value
+// restores the default.
+func WithRetryBackoffCeil(ceil time.Duration) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.retryBackoffCeil = ceil
 	}
 }
 
@@ -318,7 +339,8 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 		toolScope:               "normal",
 		maxChatRetries:          defaultMaxChatRetries,
 		emptyResponseRetries:    defaultEmptyResponseRetries,
-		retryBaseDelay:          200 * time.Millisecond,
+		retryBaseDelay:          defaultRetryBaseDelay,
+		retryBackoffCeil:        defaultRetryBackoffCeil,
 		silentToolCallThreshold: 20,
 	}
 	for _, opt := range opts {
@@ -346,14 +368,19 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 	if options.firstTokenTimeout < 0 {
 		options.firstTokenTimeout = 0
 	}
-	if options.maxChatRetries < 0 {
-		options.maxChatRetries = 0
+	if options.maxChatRetries < -1 {
+		// -1 is the infinite-retry sentinel (TS agent.maxTransientRetries = -1);
+		// anything below that is clamped up to it.
+		options.maxChatRetries = -1
 	}
 	if options.emptyResponseRetries < 0 {
 		options.emptyResponseRetries = 0
 	}
 	if options.retryBaseDelay < 0 {
 		options.retryBaseDelay = 0
+	}
+	if options.retryBackoffCeil <= 0 {
+		options.retryBackoffCeil = defaultRetryBackoffCeil
 	}
 	return options
 }
@@ -675,10 +702,10 @@ func toolSpecs() []toolSpec {
 				"type": "object",
 				"properties": map[string]any{
 					"url":        stringProp("HTTP, HTTPS, or data URL to fetch"),
-					"mode":       map[string]any{"type": "string", "enum": []string{"readability", "screenshot", "dom", "smart"}, "description": "TS extraction mode; Go runtime rejects these modes and defaults to raw fetch when omitted"},
-					"selector":   stringProp("CSS selector for dom mode; unsupported in Go raw-only runtime"),
+					"mode":       map[string]any{"type": "string", "enum": []string{"readability", "screenshot", "dom", "smart"}, "description": "Extraction mode; Go runtime supports raw (default) and dom (no-browser HTTP fetch). readability, smart, and screenshot are rejected explicitly."},
+					"selector":   stringProp("CSS selector for dom mode (tag, .class, #id, tag.class subset)"),
 					"max_length": map[string]any{"type": "number", "description": "Maximum response bytes to return"},
-					"purpose":    stringProp("Purpose for smart mode; unsupported in Go raw-only runtime"),
+					"purpose":    stringProp("Purpose for smart mode; unsupported in Go runtime"),
 				},
 				"required":             []string{"url"},
 				"additionalProperties": false,
@@ -1205,13 +1232,28 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 		}), nil
 	case "WebFetch":
 		mode := strings.TrimSpace(stringValue(args["mode"]))
-		if mode != "" && !strings.EqualFold(mode, "raw") {
-			return fmt.Sprintf("unsupported WebFetch mode %q in Go backend; supported mode: raw. TS extraction modes readability, dom, smart, and screenshot are not implemented yet.", mode), nil
+		selector := strings.TrimSpace(stringValue(args["selector"]))
+		purpose := strings.TrimSpace(stringValue(args["purpose"]))
+		if strings.EqualFold(mode, "dom") {
+			return fetchDomHTTP(ctx, stringValue(args["url"]), selector, intValue(args["max_length"], webFetchDomDefaultMaxLength)), nil
 		}
-		if strings.TrimSpace(stringValue(args["selector"])) != "" || strings.TrimSpace(stringValue(args["purpose"])) != "" {
-			return "WebFetch selector and purpose parameters require TS extraction modes and are not supported in the Go backend yet.", nil
+		// readability is the TS default mode (web-fetch.ts). An empty mode maps to
+		// readability so Go's default WebFetch returns clean article text rather
+		// than raw HTML, matching TS behavior. selector/purpose are only meaningful
+		// for dom/smart, so reject them outside dom mode.
+		if selector != "" {
+			return "WebFetch selector requires dom mode; use mode=dom with selector.", nil
 		}
-		return toolWebFetch(ctx, stringValue(args["url"]), intValue(args["max_length"], 20000)), nil
+		if purpose != "" {
+			return "WebFetch purpose requires smart mode (not implemented in the Go backend); omit purpose.", nil
+		}
+		if mode == "" || strings.EqualFold(mode, "readability") {
+			return fetchReadabilityHTTP(ctx, stringValue(args["url"]), intValue(args["max_length"], webFetchReadabilityDefaultMaxLength)), nil
+		}
+		if strings.EqualFold(mode, "raw") {
+			return toolWebFetch(ctx, stringValue(args["url"]), intValue(args["max_length"], 20000)), nil
+		}
+		return fmt.Sprintf("unsupported WebFetch mode %q in Go backend; supported modes: readability (default), raw, dom. TS modes smart and screenshot are not implemented yet.", mode), nil
 	case "WebSearch":
 		return toolWebSearch(ctx, stringValue(args["query"]), stringList(args["allowed_domains"]), stringList(args["blocked_domains"])), nil
 	case "ShareFile":
@@ -1247,7 +1289,7 @@ func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	defer cancel()
 	cmd := exec.CommandContext(toolCtx, "bash", "-lc", command)
 	cmd.Dir = cwd
-	buf := &cappedBuffer{limit: 64 * 1024, onWrite: func(output string) { EmitToolRuntimeOutput(ctx, output) }}
+	buf := newTailCaptureBuffer(toolOutputMaxBytes, func(output string) { EmitToolRuntimeOutput(ctx, output) })
 	cmd.Stdout = buf
 	cmd.Stderr = buf
 	started := time.Now()
@@ -1274,15 +1316,41 @@ func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	}
 	err := cmd.Run()
 	close(longRunningDone)
-	result := buf.String()
-	if buf.Truncated() {
-		result += "\n[truncated]"
+	// truncateToolOutput keeps the TAIL of the command output (last 50KB / 2000
+	// lines), mirroring the TS bash tool. bash_metadata and the exit code are then
+	// appended AFTER truncation so they always remain visible at the end (TS
+	// appends them before truncateOutput, but because truncation keeps the tail the
+	// observable result is identical: the trailing metadata survives).
+	result, _ := truncateToolOutput(buf.Tail(), buf.TotalBytes(), buf.TotalLines())
+	// Mirror the TS bash tool result formatting (server/lib/agent/tools/bash.ts):
+	// - a timeout appends a <bash_metadata> block "Command timed out after Nms";
+	// - a non-zero exit appends "\n[exit code: N]" with the NUMERIC exit code;
+	// - empty output becomes "(no output)".
+	// Go previously emitted "[timeout] command exceeded timeout" and
+	// "[exit error] <go-error-string>" (e.g. "exit status 1"), which the model sees
+	// differently from TS's numeric "[exit code: N]".
+	timedOut := errors.Is(toolCtx.Err(), context.DeadlineExceeded)
+	if timedOut {
+		result += fmt.Sprintf("\n\n<bash_metadata>\nCommand timed out after %dms\n</bash_metadata>", timeoutMs)
 	}
-	if err != nil {
-		if errors.Is(toolCtx.Err(), context.DeadlineExceeded) {
-			result += "\n[timeout] command exceeded timeout"
+	exitCode := 0
+	if cmd.ProcessState != nil {
+		exitCode = cmd.ProcessState.ExitCode()
+	}
+	if exitCode < 0 {
+		// Process killed by signal (e.g. timeout/abort) — no clean exit code; TS
+		// falls back to 1 in the timed-out/aborted case.
+		if timedOut {
+			exitCode = 1
+		} else if err != nil {
+			exitCode = 1
 		}
-		result += "\n[exit error] " + err.Error()
+	}
+	if exitCode != 0 {
+		result += fmt.Sprintf("\n[exit code: %d]", exitCode)
+	}
+	if result == "" {
+		result = "(no output)"
 	}
 	EmitToolRuntimeOutput(ctx, result)
 	return result
@@ -1298,7 +1366,7 @@ func toolRead(cwd, path string, offset, limit int) string {
 		return err.Error()
 	}
 	if info.IsDir() {
-		return listDirectoryForRead(resolved)
+		return listDirectoryForRead(path, resolved)
 	}
 	if info.Size() > 2*1024*1024 {
 		return readNumberedLinesStream(resolved, offset, limit)
@@ -1316,16 +1384,25 @@ func toolRead(cwd, path string, offset, limit int) string {
 		offset = 1
 	}
 	start := offset - 1
-	if start >= len(lines) {
-		return ""
-	}
+	// Mirror the TS small-file path (read.ts:230-236): an out-of-range offset
+	// yields an empty slice and falls through to the `numbered || "(empty file)"`
+	// fallback, NOT an empty string. Go previously early-returned "" here, a
+	// model-visible divergence (TS shows "(empty file)").
 	end := len(lines)
+	if start > len(lines) {
+		start = len(lines)
+	}
 	if limit > 0 && start+limit < end {
 		end = start + limit
 	}
 	out := formatNumberedLines(lines[start:end], start+1)
-	if len(out) > 100000 {
-		out = out[:100000] + "\n[truncated]"
+	// Cap the whole Read output as a Go resource-safety boundary (CLAUDE.md: tool
+	// reads must be size-bounded). Truncate by UTF-16 code units (consistent with
+	// truncateDisplayLine and the TS READ_ALL_MAX_CHARS char budget) instead of a
+	// byte slice, so a non-ASCII file is not cut mid-rune into invalid UTF-8 in the
+	// model-visible Read output.
+	if units := utf16.Encode([]rune(out)); len(units) > 100000 {
+		out = string(utf16.Decode(units[:100000])) + "\n[truncated]"
 	}
 	if out == "" {
 		return "(empty file)"
@@ -1361,7 +1438,10 @@ func readNumberedLinesStream(path string, offset, limit int) string {
 			continue
 		}
 		lines = append(lines, line)
-		chars += len(line)
+		// Mirror the TS READ_ALL_MAX_CHARS budget (read.ts), which counts UTF-16
+		// code units, not bytes, so the stream caps at the same point as TS for a
+		// non-ASCII file. The break is at a line boundary so no rune is split.
+		chars += len(utf16.Encode([]rune(line)))
 		if limit > 0 && len(lines) >= limit {
 			truncated = true
 			break
@@ -1391,34 +1471,85 @@ func readNumberedLinesStream(path string, offset, limit int) string {
 func formatNumberedLines(lines []string, startLine int) string {
 	out := make([]string, 0, len(lines))
 	for i, line := range lines {
-		out = append(out, fmt.Sprintf("%6d│%s", startLine+i, line))
+		out = append(out, fmt.Sprintf("%6d│%s", startLine+i, truncateDisplayLine(line)))
 	}
 	return strings.Join(out, "\n")
 }
 
-func listDirectoryForRead(path string) string {
-	entries, err := os.ReadDir(path)
+// readMaxLineChars mirrors the TS read tool MAX_LINE_CHARS (server/lib/agent/
+// tools/read.ts): lines longer than 2000 (UTF-16) characters are truncated in the
+// numbered output. The read tool description ("Any lines longer than 2000
+// characters will be truncated") documents this contract.
+const readMaxLineChars = 2000
+
+// truncateDisplayLine mirrors the TS truncateDisplayLine: a line longer than
+// readMaxLineChars is cut to the first 2000 UTF-16 code units followed by
+// "… [line truncated, N chars total]" where N is the full UTF-16 length. Go
+// previously emitted full lines, dumping minified/huge single lines into the model
+// context unbounded (only the whole-output 100KB cap applied).
+func truncateDisplayLine(line string) string {
+	units := utf16.Encode([]rune(line))
+	if len(units) <= readMaxLineChars {
+		return line
+	}
+	head := string(utf16.Decode(units[:readMaxLineChars]))
+	return fmt.Sprintf("%s… [line truncated, %d chars total]", head, len(units))
+}
+
+// listDirectoryForRead mirrors the TS Read-tool listDirectory helper
+// (server/lib/agent/tools/read.ts:440): when Read targets a directory it returns
+// a listing instead of erroring. The format is model-visible and deterministic:
+//   - header "Directory listing for <displayPath>\n" (displayPath is the original
+//     arg, not the resolved absolute path);
+//   - entries sorted directories-first then alphabetically, each rendered as
+//     "  <name>" (two-space indent) with a trailing "/" for directories;
+//   - capped at MAX_DIR_ENTRIES=500 (TS), with footer
+//     "\n(<N> entries[, showing first 500])" where N is the FULL entry count.
+//
+// Go previously emitted "Directory: <abspath>", unsorted/unindented names, a
+// 200 cap, and a bare "[truncated]" marker — several divergences from TS.
+func listDirectoryForRead(displayPath, resolvedPath string) string {
+	entries, err := os.ReadDir(resolvedPath)
 	if err != nil {
 		return err.Error()
 	}
-	lines := []string{"Directory: " + path}
-	limit := len(entries)
-	truncated := false
-	if limit > 200 {
-		limit = 200
-		truncated = true
+	// Sort directories first, then files, alphabetical within each group —
+	// mirroring the TS toSorted((a,b) => dir-rank then a.name.localeCompare(b.name)).
+	sort.SliceStable(entries, func(i, j int) bool {
+		di, dj := entries[i].IsDir(), entries[j].IsDir()
+		if di != dj {
+			return di // directories (true) sort before files (false)
+		}
+		return entries[i].Name() < entries[j].Name()
+	})
+
+	const maxDirEntries = 500
+	total := len(entries)
+	truncated := total > maxDirEntries
+	visible := entries
+	if truncated {
+		visible = entries[:maxDirEntries]
 	}
-	for _, entry := range entries[:limit] {
-		name := entry.Name()
+
+	lines := make([]string, 0, len(visible))
+	for _, entry := range visible {
+		name := "  " + entry.Name()
 		if entry.IsDir() {
 			name += "/"
 		}
 		lines = append(lines, name)
 	}
+	footer := fmt.Sprintf("\n(%d entries", total)
 	if truncated {
-		lines = append(lines, "[truncated]")
+		footer += fmt.Sprintf(", showing first %d", maxDirEntries)
 	}
-	return strings.Join(lines, "\n")
+	footer += ")"
+	// Mirror the TS concatenation `header + lines.join("\n") + footer` exactly,
+	// where header carries a trailing newline. For an empty directory this yields
+	// a blank line between the header and footer (header "\n" + empty join + footer
+	// "\n(...)"), matching TS rather than collapsing the two.
+	header := "Directory listing for " + displayPath + "\n"
+	return header + strings.Join(lines, "\n") + footer
 }
 
 func toolWrite(cwd, path, content string) string {
@@ -1435,7 +1566,12 @@ func toolWrite(cwd, path, content string) string {
 	if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
 		return err.Error()
 	}
-	return "wrote " + resolved
+	// Mirror the TS write tool success message exactly: `Wrote ${content.length}
+	// bytes to ${file_path}` where content.length is the JS string length (UTF-16
+	// code units, not bytes despite the wording) and file_path is the original arg
+	// (not the resolved absolute path). Go previously returned `wrote <abspath>`,
+	// a model-visible divergence.
+	return fmt.Sprintf("Wrote %d bytes to %s", len(utf16.Encode([]rune(content))), path)
 }
 
 func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
@@ -1453,10 +1589,16 @@ func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
 		if err := os.WriteFile(resolved, []byte(newString), 0o644); err != nil {
 			return err.Error()
 		}
-		return "created " + resolved
+		// Mirror the TS edit create-new-file message (old_string == "").
+		return "Created/overwritten " + path
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// Mirror the TS edit tool's clean missing-file message instead of leaking
+			// the raw OS stat error (e.g. "stat /abs/path: no such file or directory").
+			return "File not found: " + path
+		}
 		return err.Error()
 	}
 	if info.Size() > maxToolEditFileBytes {
@@ -1466,35 +1608,52 @@ func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
 	if err != nil {
 		return err.Error()
 	}
-	text := string(data)
 	if oldString == newString {
 		return "No changes to apply: old_string and new_string are identical."
 	}
-	count := strings.Count(text, oldString)
-	if count == 0 {
-		return "old_string not found"
+	// Mirror the TS edit tool: normalize CRLF -> LF on the file content and both
+	// strings before matching, and write back the normalized (LF) content. Then
+	// run the cascading replacer chain (exact → line-trimmed → whitespace/indent
+	// normalized → trimmed-boundary → multi-occurrence) so an old_string with
+	// slightly different indentation/whitespace still matches like TS instead of
+	// failing with "old_string not found".
+	text := normalizeEditLineEndings(string(data))
+	normalizedOld := normalizeEditLineEndings(oldString)
+	normalizedNew := normalizeEditLineEndings(newString)
+	match, found, unique := findEditReplaceMatch(text, normalizedOld, replaceAll)
+	if !found {
+		return "old_string not found in the file. It must match exactly, including whitespace, indentation, and line endings."
 	}
-	if count > 1 && !replaceAll {
+	if !unique {
 		return "Found multiple matches for old_string. Provide more surrounding context to make the match unique, or use replace_all."
 	}
-	replaceCount := 1
 	targetReplacements := 1
+	count := strings.Count(text, match.search)
 	if replaceAll {
-		replaceCount = -1
 		targetReplacements = count
 	}
-	updatedBytes := len(data) - targetReplacements*len([]byte(oldString)) + targetReplacements*len([]byte(newString))
+	updatedBytes := len(text) - targetReplacements*len(match.search) + targetReplacements*len(normalizedNew)
 	if updatedBytes > maxToolWriteBytes {
 		return fmt.Sprintf("edited content would be too large (%d bytes; max %d bytes)", updatedBytes, maxToolWriteBytes)
 	}
-	updated := strings.Replace(text, oldString, newString, replaceCount)
+	var updated string
+	if replaceAll {
+		updated = strings.ReplaceAll(text, match.search, normalizedNew)
+	} else {
+		updated = text[:match.index] + normalizedNew + text[match.index+len(match.search):]
+	}
 	if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
 		return err.Error()
 	}
-	if replaceAll {
-		return fmt.Sprintf("edited %s (%d replacements)", resolved, count)
-	}
-	return "edited " + resolved
+	// Mirror the TS edit success message exactly: `Edited ${file_path}` (original
+	// arg, no replacement count — TS conveys line info via metadata, not the
+	// output string).
+	return "Edited " + path
+}
+
+// normalizeEditLineEndings mirrors the TS edit tool normalizeLineEndings: CRLF -> LF.
+func normalizeEditLineEndings(text string) string {
+	return strings.ReplaceAll(text, "\r\n", "\n")
 }
 
 func toolGlob(cwd, pattern, searchPath string) string {
@@ -1515,7 +1674,20 @@ func toolGlob(cwd, pattern, searchPath string) string {
 	}
 	matches := []string{}
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
+			return nil
+		}
+		// Mirror Bun.Glob scan({ dot: false }) used by the TS glob tool: entries
+		// whose path contains any segment starting with "." (dotfiles and files
+		// inside dot-directories like .git/.hidden) are excluded. Skip descending
+		// into dot-directories entirely for efficiency and correctness.
+		if d.IsDir() {
+			if path != root && strings.HasPrefix(d.Name(), ".") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		rel, _ := filepath.Rel(root, path)
@@ -1583,6 +1755,11 @@ type grepOptions struct {
 	Type            string
 	Multiline       bool
 }
+
+// grepHeadLimitMax is the safe upper bound for an explicit Grep head_limit. The
+// Go grep walk stops early once enough matches are collected, so an explicit
+// value is honored up to this ceiling instead of being clamped to the default.
+const grepHeadLimitMax = 10000
 
 var grepTypeExtensions = map[string][]string{
 	"c":      {".c", ".h"},
@@ -1671,14 +1848,25 @@ func toolGrep(cwd string, opts grepOptions) string {
 	if mode == "" {
 		mode = "files_with_matches"
 	}
-	if opts.HeadLimit <= 0 || opts.HeadLimit > 1000 {
+	// head_limit default mirrors the Go-side bounded default (TS defaults to 0 =
+	// unlimited, but Go's custom WalkDir grep stops early for performance, so it
+	// keeps a bounded default — recorded as a capability divergence). An explicit
+	// value is honored up to grepHeadLimitMax instead of being silently downgraded
+	// to the default, matching TS's "honor any head_limit" behaviour within a safe
+	// upper bound.
+	if opts.HeadLimit <= 0 {
 		opts.HeadLimit = 200
+	} else if opts.HeadLimit > grepHeadLimitMax {
+		opts.HeadLimit = grepHeadLimitMax
 	}
 	if opts.Offset < 0 {
 		opts.Offset = 0
 	}
 	before, after := grepContextBounds(opts)
-	collectLimit := opts.HeadLimit + opts.Offset
+	// Collect one extra entry beyond the requested window so we can tell the model
+	// when more results are available (the early-stop walk cannot know the exact
+	// total, so the suffix reports "more available" without an exact count).
+	collectLimit := opts.HeadLimit + opts.Offset + 1
 	outputs := []string{}
 	_ = filepath.WalkDir(walkRoot, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
@@ -1759,13 +1947,21 @@ func toolGrep(cwd string, opts grepOptions) string {
 		}
 		outputs = outputs[opts.Offset:]
 	}
-	if len(outputs) > opts.HeadLimit {
+	truncated := len(outputs) > opts.HeadLimit
+	if truncated {
 		outputs = outputs[:opts.HeadLimit]
 	}
 	if len(outputs) == 0 {
 		return "No matches found"
 	}
-	return strings.Join(outputs, "\n")
+	result := strings.Join(outputs, "\n")
+	if truncated {
+		// Mirror the TS grep truncation notice so the model knows results were
+		// limited and can page with offset. Go's early-stop walk cannot report an
+		// exact remaining count, so the suffix omits the precise "M more" number.
+		result += fmt.Sprintf("\n(Results limited to %d entries. More results available — increase head_limit or use offset to page.)", opts.HeadLimit)
+	}
+	return result
 }
 
 func grepMultilineMatchLines(text string, ranges [][]int) []int {
@@ -2578,67 +2774,6 @@ func pathWithinBase(baseAbs, targetAbs string) bool {
 		return false
 	}
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel))
-}
-
-type cappedBuffer struct {
-	limit     int
-	buf       bytes.Buffer
-	truncated bool
-	onWrite   func(string)
-	mu        sync.Mutex
-}
-
-func (b *cappedBuffer) Write(p []byte) (int, error) {
-	var current string
-	b.mu.Lock()
-	if b.limit <= 0 {
-		b.truncated = true
-		current = b.buf.String()
-		b.mu.Unlock()
-		if b.onWrite != nil {
-			b.onWrite(current)
-		}
-		return len(p), nil
-	}
-	remaining := b.limit - b.buf.Len()
-	if remaining <= 0 {
-		b.truncated = true
-		current = b.buf.String()
-		b.mu.Unlock()
-		if b.onWrite != nil {
-			b.onWrite(current)
-		}
-		return len(p), nil
-	}
-	if len(p) > remaining {
-		_, _ = b.buf.Write(p[:remaining])
-		b.truncated = true
-		current = b.buf.String()
-		b.mu.Unlock()
-		if b.onWrite != nil {
-			b.onWrite(current)
-		}
-		return len(p), nil
-	}
-	_, err := b.buf.Write(p)
-	current = b.buf.String()
-	b.mu.Unlock()
-	if b.onWrite != nil {
-		b.onWrite(current)
-	}
-	return len(p), err
-}
-
-func (b *cappedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buf.String()
-}
-
-func (b *cappedBuffer) Truncated() bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.truncated
 }
 
 func stringValue(v any) string {

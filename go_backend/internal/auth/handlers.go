@@ -111,8 +111,11 @@ func (h *Handler) uploadAvatar(w http.ResponseWriter, r *http.Request) error {
 	if claims == nil {
 		return httpx.Unauthorized("Authentication required")
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 5*1024*1024)
-	if err := r.ParseMultipartForm(5 * 1024 * 1024); err != nil {
+	// MaxBytesReader caps the multipart read defensively; the clean 2MB limit
+	// (matching TS MAX_AVATAR_SIZE in server/lib/uploads.ts) is enforced below via
+	// the part size so an oversize avatar returns a 400 rather than a read error.
+	r.Body = http.MaxBytesReader(w, r.Body, maxAvatarUploadBytes+512*1024)
+	if err := r.ParseMultipartForm(maxAvatarUploadBytes + 512*1024); err != nil {
 		return err
 	}
 	file, header, err := r.FormFile("file")
@@ -124,8 +127,15 @@ func (h *Handler) uploadAvatar(w http.ResponseWriter, r *http.Request) error {
 	if ext == "" {
 		return httpx.BadRequest("Unsupported avatar image type")
 	}
+	// Mirror the TS 2MB avatar size limit (MAX_AVATAR_SIZE) with a clean 400.
+	if header.Size > maxAvatarUploadBytes {
+		return httpx.BadRequest("Avatar too large: max 2MB")
+	}
 	imageID := id.Must(12)
 	dir := filepath.Join(uploadsRoot(), "avatars", claims.Subject)
+	// Mirror the TS saveAvatarImage: remove any existing avatar dir before writing
+	// the new file so only one avatar file per user ever exists (no stale files).
+	_ = os.RemoveAll(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
@@ -146,6 +156,8 @@ func (h *Handler) uploadAvatar(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
+const maxAvatarUploadBytes = 2 * 1024 * 1024
+
 func (h *Handler) deleteAvatar(w http.ResponseWriter, r *http.Request) error {
 	claims := UserFromContext(r.Context())
 	if claims == nil {
@@ -165,6 +177,9 @@ func uploadsRoot() string {
 	return filepath.Join(home, ".narrafork", "uploads")
 }
 
+// avatarExt mirrors the TS AVATAR_MIME_TYPES allowlist (server/lib/uploads.ts),
+// which is {image/png, image/jpeg, image/webp} — NOTE: GIF is allowed for inline
+// images but NOT for avatars. Returns "" for unsupported types.
 func avatarExt(mediaType, fallback string) string {
 	if mediaType == "" {
 		mediaType = mime.TypeByExtension(fallback)
@@ -174,13 +189,11 @@ func avatarExt(mediaType, fallback string) string {
 		return ".jpg"
 	case "image/png":
 		return ".png"
-	case "image/gif":
-		return ".gif"
 	case "image/webp":
 		return ".webp"
 	}
 	fallback = strings.ToLower(fallback)
-	if fallback == ".jpg" || fallback == ".jpeg" || fallback == ".png" || fallback == ".gif" || fallback == ".webp" {
+	if fallback == ".jpg" || fallback == ".jpeg" || fallback == ".png" || fallback == ".webp" {
 		return fallback
 	}
 	return ""

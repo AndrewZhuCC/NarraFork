@@ -275,7 +275,8 @@ func TestEditAndRegeneratePreservesImageBlocksDeletesOldResponseAndReruns(t *tes
 func TestEditAndRegenerateCanSkipRerunAndFileRevert(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
-	service := &Service{DB: sqlDB}
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
 	cwd := t.TempDir()
 	if _, err := sqlDB.Exec(`UPDATE narrators SET cwd = ? WHERE id = ?`, cwd, narratorID); err != nil {
@@ -305,6 +306,18 @@ func TestEditAndRegenerateCanSkipRerunAndFileRevert(t *testing.T) {
 	}
 	if len(result.DeletedMessageIDs) != 1 || result.DeletedMessageIDs[0] != assistant.ID {
 		t.Fatalf("expected old assistant deletion, got %#v", result.DeletedMessageIDs)
+	}
+	updatedFrame := findBroadcast(events(), narratorID, "message_updated")
+	if updatedFrame == nil || updatedFrame["narratorId"] != narratorID || updatedFrame["message"] == nil {
+		t.Fatalf("expected message_updated broadcast with updated message, got %#v", events())
+	}
+	deletedFrame := findBroadcast(events(), narratorID, "messages_deleted")
+	if deletedFrame == nil || deletedFrame["narratorId"] != narratorID {
+		t.Fatalf("expected messages_deleted broadcast for old assistant, got %#v", events())
+	}
+	deletedIDs, _ := deletedFrame["deletedMessageIds"].([]any)
+	if len(deletedIDs) != 1 || deletedIDs[0] != assistant.ID {
+		t.Fatalf("expected messages_deleted ids to include old assistant, got %#v", deletedFrame)
 	}
 	var status string
 	if err := sqlDB.QueryRow(`SELECT status FROM narrators WHERE id = ?`, narratorID).Scan(&status); err != nil {
@@ -406,7 +419,7 @@ func TestEditAndRegeneratePreservesCompactBoundaryAndDeletesLongToolChain(t *tes
 	if staleToolCalls != 0 {
 		t.Fatalf("deleted long tool chain should remove tool calls, got %d", staleToolCalls)
 	}
-	history, err := service.agentHistory(ctx, narratorID, 20)
+	history, err := service.agentHistory(ctx, narratorID)
 	if err != nil {
 		t.Fatalf("agent history: %v", err)
 	}
@@ -591,6 +604,83 @@ func TestEditAssistantMessageUpdatesTextAndPreservesOriginalContent(t *testing.T
 	}
 	if reupdated.ContentText == nil || *reupdated.ContentText != "second edit" {
 		t.Fatalf("re-edit text not applied: %#v", reupdated.ContentText)
+	}
+}
+
+func TestRestoreAssistantMessageRevertsToOriginalAndClearsEditMetadata(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	ctx := context.Background()
+	blocks := []map[string]any{
+		{"type": "text", "text": "original assistant text"},
+		{"type": "tool_use", "id": "tu-1", "name": "Read", "input": map[string]any{}},
+	}
+	assistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "original assistant text", blocks, nil)
+	if err != nil {
+		t.Fatalf("seed assistant message: %v", err)
+	}
+
+	editor := "user-123"
+	if _, err := service.EditAssistantMessage(ctx, narratorID, assistant.ID, "edited assistant text", &editor); err != nil {
+		t.Fatalf("edit assistant message: %v", err)
+	}
+
+	restored, err := service.RestoreAssistantMessage(ctx, narratorID, assistant.ID)
+	if err != nil {
+		t.Fatalf("restore assistant message: %v", err)
+	}
+	if restored.ContentText == nil || *restored.ContentText != "original assistant text" {
+		t.Fatalf("restore should revert text to original, got %#v", restored.ContentText)
+	}
+	if restored.EditedAt != nil {
+		t.Fatalf("restore should clear editedAt, got %#v", restored.EditedAt)
+	}
+	if restored.EditedBy != nil {
+		t.Fatalf("restore should clear editedBy, got %#v", restored.EditedBy)
+	}
+	if restored.OriginalContentJSON != nil {
+		t.Fatalf("restore should clear originalContentJson, got %#v", restored.OriginalContentJSON)
+	}
+	restoredBlocks, ok := restored.ContentJSON.([]any)
+	if !ok || len(restoredBlocks) != 2 {
+		t.Fatalf("restore should reinstate original 2 blocks, got %#v", restored.ContentJSON)
+	}
+	first, _ := restoredBlocks[0].(map[string]any)
+	if first["type"] != "text" || first["text"] != "original assistant text" {
+		t.Fatalf("restored first block should be original text: %#v", first)
+	}
+}
+
+func TestRestoreAssistantMessageNoopWhenNeverEdited(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	ctx := context.Background()
+	assistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "untouched", []map[string]any{{"type": "text", "text": "untouched"}}, nil)
+	if err != nil {
+		t.Fatalf("seed assistant message: %v", err)
+	}
+	restored, err := service.RestoreAssistantMessage(ctx, narratorID, assistant.ID)
+	if err != nil {
+		t.Fatalf("restore never-edited message: %v", err)
+	}
+	if restored.EditedAt != nil {
+		t.Fatalf("never-edited message should stay unedited, got %#v", restored.EditedAt)
+	}
+	if restored.ContentText == nil || *restored.ContentText != "untouched" {
+		t.Fatalf("never-edited restore should keep text, got %#v", restored.ContentText)
+	}
+}
+
+func TestRestoreAssistantMessageRejectsNonAssistant(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	ctx := context.Background()
+	userMsg, err := service.SeedUserMessage(ctx, narratorID, "user-1", "hello")
+	if err != nil {
+		t.Fatalf("seed user message: %v", err)
+	}
+	if _, err := service.RestoreAssistantMessage(ctx, narratorID, userMsg.ID); err == nil {
+		t.Fatalf("restore on user message should fail")
+	}
+	if _, err := service.RestoreAssistantMessage(ctx, narratorID, "missing-id"); err == nil {
+		t.Fatalf("restore on missing message should fail")
 	}
 }
 

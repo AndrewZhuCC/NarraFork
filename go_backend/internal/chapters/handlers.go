@@ -149,6 +149,7 @@ type batchMergeRequest struct {
 	BaseChapterID    string   `json:"baseChapterId"`
 	SourceChapterIDs []string `json:"sourceChapterIds"`
 	Title            string   `json:"title"`
+	Description      *string  `json:"description"`
 	Strategy         string   `json:"strategy"`
 	TargetChapterID  string   `json:"targetChapterId"`
 	Locale           string   `json:"locale"`
@@ -175,6 +176,37 @@ func (h *Handler) batchMerge(w http.ResponseWriter, r *http.Request) error {
 	var req batchMergeRequest
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
+	}
+	// Mirror the TypeScript batchMergeSchema Zod bounds + refine: title max 200,
+	// description max 2000, strategy enum, and "title is required when not merging
+	// into an existing chapter" (targetChapterId || title.length > 0). Go
+	// previously skipped body validation and silently auto-generated a title when
+	// none was provided, instead of rejecting with 400. Zod evaluates object
+	// fields BEFORE the .refine(), so the required-field errors (baseChapterId,
+	// sourceChapterIds) must fire before the title refine to match TS ordering.
+	if strings.TrimSpace(req.BaseChapterID) == "" {
+		return httpx.BadRequest("baseChapterId is required")
+	}
+	if len(dedupeNonEmpty(req.SourceChapterIDs)) == 0 {
+		return httpx.BadRequest("sourceChapterIds is required")
+	}
+	if httpx.JSStringLength(req.Title) > 200 {
+		return httpx.BadRequest("title must be at most 200 characters")
+	}
+	if req.Description != nil && httpx.JSStringLength(*req.Description) > 2000 {
+		return httpx.BadRequest("description must be at most 2000 characters")
+	}
+	if strings.TrimSpace(req.Strategy) != "" {
+		switch req.Strategy {
+		case "merge", "squash", "cherry-pick":
+		default:
+			return httpx.BadRequest("strategy must be merge, squash, or cherry-pick")
+		}
+	}
+	// Zod refine: title is required (length > 0, raw — not trimmed) unless an
+	// existing targetChapterId is provided. path: ["title"].
+	if req.TargetChapterID == "" && len(req.Title) == 0 {
+		return httpx.BadRequest("title is required when not merging into an existing chapter")
 	}
 	userID := ""
 	if claims := auth.UserFromContext(r.Context()); claims != nil {
@@ -277,10 +309,10 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(req.Title) == "" {
 		return httpx.BadRequest("title is required")
 	}
-	if len(req.Title) > 200 {
+	if httpx.JSStringLength(req.Title) > 200 {
 		return httpx.BadRequest("title must be at most 200 characters")
 	}
-	if req.Description != nil && len(*req.Description) > 2000 {
+	if req.Description != nil && httpx.JSStringLength(*req.Description) > 2000 {
 		return httpx.BadRequest("description must be at most 2000 characters")
 	}
 	chapter, err := h.Service.Create(r.Context(), CreateInput{ProjectID: req.ProjectID, Title: req.Title, Description: req.Description, BaseBranch: req.BaseBranch})
@@ -330,6 +362,17 @@ func (h *Handler) cleanup(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
 	}
+	// Mirror the TypeScript batchCleanupSchema: chapterIds is a non-empty array
+	// (.min(1)) of non-empty strings (z.string().min(1)). Go previously skipped
+	// validation and returned an empty 200 report for a missing/empty array.
+	if len(req.ChapterIDs) == 0 {
+		return httpx.BadRequest("chapterIds must contain at least one item")
+	}
+	for _, id := range req.ChapterIDs {
+		if id == "" {
+			return httpx.BadRequest("chapterIds entries must be non-empty strings")
+		}
+	}
 	report, err := h.Service.BatchCleanup(r.Context(), req.ChapterIDs, req.Force, req.DeleteBranch)
 	if err != nil {
 		return err
@@ -350,11 +393,11 @@ func (h *Handler) fork(w http.ResponseWriter, r *http.Request) error {
 		if strings.TrimSpace(*req.Title) == "" {
 			return httpx.BadRequest("title must be a non-empty string")
 		}
-		if len(*req.Title) > 200 {
+		if httpx.JSStringLength(*req.Title) > 200 {
 			return httpx.BadRequest("title must be at most 200 characters")
 		}
 	}
-	if req.Description != nil && len(*req.Description) > 2000 {
+	if req.Description != nil && httpx.JSStringLength(*req.Description) > 2000 {
 		return httpx.BadRequest("description must be at most 2000 characters")
 	}
 	if strings.TrimSpace(req.Role) != "" && req.Role != "branch" && req.Role != "exploration" {
@@ -402,14 +445,46 @@ func (h *Handler) batchFork(w http.ResponseWriter, r *http.Request) error {
 	if len(body.Forks) > 10 {
 		return httpx.BadRequest("forks must contain at most 10 items")
 	}
+	// Mirror the TypeScript batchForkSchema per-item field validation, which runs
+	// at the SCHEMA level (safeParse) BEFORE any fork is created: title min1/max200,
+	// description max2000, inheritMode enum(["full","compressed","fresh"]) default
+	// "full", role enum(["branch","exploration"]) default "branch". A single
+	// malformed item rejects the WHOLE request with 400. Go previously only checked
+	// per-item title!="" (pushing the rest into failed[]) and silently coerced an
+	// invalid role to "branch" / relied on Service.Fork for inheritMode, so an
+	// over-long title, over-long description, or an invalid inheritMode/role was
+	// either accepted or surfaced as a per-item failure instead of a 400.
+	for i := range body.Forks {
+		fork := &body.Forks[i]
+		fork.Title = strings.TrimSpace(fork.Title)
+		if fork.Title == "" {
+			return httpx.BadRequest("forks[" + strconv.Itoa(i) + "].title is required")
+		}
+		if httpx.JSStringLength(fork.Title) > splitTitleMaxLength {
+			return httpx.BadRequest("forks[" + strconv.Itoa(i) + "].title must be at most 200 characters")
+		}
+		if fork.Description != nil && httpx.JSStringLength(*fork.Description) > splitDescriptionMaxLength {
+			return httpx.BadRequest("forks[" + strconv.Itoa(i) + "].description must be at most 2000 characters")
+		}
+		fork.InheritMode = strings.TrimSpace(fork.InheritMode)
+		if fork.InheritMode == "" {
+			fork.InheritMode = "full"
+		}
+		if fork.InheritMode != "full" && fork.InheritMode != "compressed" && fork.InheritMode != "fresh" {
+			return httpx.BadRequest("forks[" + strconv.Itoa(i) + "].inheritMode must be full, compressed, or fresh")
+		}
+		fork.Role = strings.TrimSpace(fork.Role)
+		if fork.Role == "" {
+			fork.Role = "branch"
+		}
+		if fork.Role != "branch" && fork.Role != "exploration" {
+			return httpx.BadRequest("forks[" + strconv.Itoa(i) + "].role must be branch or exploration")
+		}
+	}
 	created := []Chapter{}
 	failed := []map[string]any{}
 	for _, input := range body.Forks {
-		title := strings.TrimSpace(input.Title)
-		if title == "" {
-			failed = append(failed, map[string]any{"input": input, "error": "title is required"})
-			continue
-		}
+		title := input.Title
 		chapter, err := h.Service.Fork(r.Context(), chi.URLParam(r, "id"), ForkInput{
 			Title:       &title,
 			Description: input.Description,
@@ -439,13 +514,19 @@ func (h *Handler) split(w http.ResponseWriter, r *http.Request) error {
 	if title == "" {
 		return httpx.BadRequest("newFork.title is required")
 	}
-	if len(title) > splitTitleMaxLength {
+	if httpx.JSStringLength(title) > splitTitleMaxLength {
 		return httpx.BadRequest("newFork.title must be at most 200 characters")
 	}
-	if req.NewFork.Description != nil && len(*req.NewFork.Description) > splitDescriptionMaxLength {
+	if req.NewFork.Description != nil && httpx.JSStringLength(*req.NewFork.Description) > splitDescriptionMaxLength {
 		return httpx.BadRequest("newFork.description must be at most 2000 characters")
 	}
+	// Mirror the TypeScript splitChapterSchema newFork.inheritMode
+	// z.enum([...]).default("full"): an omitted/empty value defaults to "full"
+	// rather than being rejected.
 	inheritMode := strings.TrimSpace(req.NewFork.InheritMode)
+	if inheritMode == "" {
+		inheritMode = "full"
+	}
 	if inheritMode != "full" && inheritMode != "compressed" && inheritMode != "fresh" {
 		return httpx.BadRequest("newFork.inheritMode must be full, compressed, or fresh")
 	}
@@ -725,7 +806,7 @@ func (h *Handler) createReview(w http.ResponseWriter, r *http.Request) error {
 		if strings.TrimSpace(*req.Title) == "" {
 			return httpx.BadRequest("title must be a non-empty string")
 		}
-		if len(*req.Title) > 200 {
+		if httpx.JSStringLength(*req.Title) > 200 {
 			return httpx.BadRequest("title must be at most 200 characters")
 		}
 	}
@@ -780,7 +861,7 @@ func (h *Handler) merge(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// Mirror the TypeScript mergeChapterSchema Zod bound: message max 500 chars.
-	if len(req.Message) > 500 {
+	if httpx.JSStringLength(req.Message) > 500 {
 		return httpx.BadRequest("message must be at most 500 characters")
 	}
 	userID := ""
@@ -799,6 +880,13 @@ func (h *Handler) aiResolve(w http.ResponseWriter, r *http.Request) error {
 	var req aiResolveRequest
 	if err := httpx.DecodeLooseJSON(r, &req); err != nil {
 		return err
+	}
+	// Mirror the TypeScript ai-resolve route, which validates the SAME
+	// mergeChapterSchema as /merge (message max 500 chars). Go validated the
+	// message bound in the /merge handler but not here, so an over-long message
+	// reached the AI resolver instead of returning a 400.
+	if httpx.JSStringLength(req.Message) > 500 {
+		return httpx.BadRequest("message must be at most 500 characters")
 	}
 	userID := ""
 	if user := auth.UserFromContext(r.Context()); user != nil {
@@ -852,8 +940,29 @@ func (h *Handler) gitStatus(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) commits(w http.ResponseWriter, r *http.Request) error {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	commits, err := h.Service.Commits(r.Context(), chi.URLParam(r, "id"), limit)
+	// Mirror the TypeScript listCommitsSchema (server/lib/validators/git.ts):
+	// limit = z.coerce.number().int().min(1).max(200).default(50). A missing
+	// limit uses the default 50; an explicitly out-of-range or non-integer limit
+	// rejects with 400 rather than silently clamping (which the previous
+	// strconv.Atoi-with-ignored-error path did, turning "abc"/0/negative into 0
+	// -> normalized 50 with no error). z.coerce.number().int() uses JS Number()
+	// coercion (accepts "50.0", "1e2", " 10 ", "0x10"), NOT strconv.Atoi
+	// whole-string-integer parsing, so use the shared httpx.CoerceIntJS helper.
+	// The `sync` query param gates the live git sync: TS only syncs when
+	// ?sync=true, otherwise it returns DB-cached commits.
+	limit := 50
+	if r.URL.Query().Has("limit") {
+		// A present-but-empty "limit=" coerces to Number("")===0 and fails .min(1)
+		// -> 400 in TS; only an ABSENT limit uses .default(50). Use Has() to tell
+		// present-empty from absent (TrimSpace=="" wrongly treated "limit=" as absent).
+		parsed, ok := httpx.CoerceIntJS(r.URL.Query().Get("limit"))
+		if !ok || parsed < 1 || parsed > 200 {
+			return httpx.BadRequest("limit must be an integer between 1 and 200")
+		}
+		limit = parsed
+	}
+	sync := r.URL.Query().Get("sync") == "true"
+	commits, err := h.Service.Commits(r.Context(), chi.URLParam(r, "id"), limit, sync)
 	if err != nil {
 		return err
 	}
@@ -1012,15 +1121,15 @@ func (h *Handler) containerSetup(w http.ResponseWriter, r *http.Request) error {
 	compose := composeVersion(r.Context())
 	backend := ""
 	if podman != "" {
-		backend = strings.ToLower(strings.Trim(strings.TrimSpace(mustCommandOutput(r.Context(), "podman", "info", "--format", "{{.Host.RootlessNetworkCmd}}")), "'\""))
+		backend = parseRootlessNetworkBackend(mustCommandOutput(r.Context(), "podman", "info", "--format", "{{.Host.RootlessNetworkCmd}}"))
 	}
 	rootlessOK := backend == "pasta" || backend == "passt"
 	passtVersion := commandVersion(r.Context(), "passt", "--version")
 	payload := map[string]any{
-		"podman":          map[string]any{"ok": podman != "", "version": podman},
-		"podmanCompose":   map[string]any{"ok": compose.version != "", "version": compose.version},
+		"podman":          map[string]any{"ok": podman != "", "version": cleanVersionString(podman)},
+		"podmanCompose":   map[string]any{"ok": compose.version != "", "version": cleanComposeVersionString(compose.version)},
 		"composeProvider": map[string]any{"ok": len(compose.command) > 0, "provider": strings.Join(compose.command, " ")},
-		"passt":           map[string]any{"ok": passtVersion != "", "version": passtVersion},
+		"passt":           map[string]any{"ok": passtVersion != "", "version": cleanVersionString(passtVersion)},
 		"rootlessNetwork": map[string]any{"ok": rootlessOK, "backend": backend},
 		"allReady":        podman != "" && len(compose.command) > 0 && rootlessOK,
 	}
@@ -1177,16 +1286,50 @@ func (h *Handler) containers(w http.ResponseWriter, r *http.Request) error {
 		writeContainerListFallback(w, stored, "PROXY_BACKEND_UNAVAILABLE", proxyMessage)
 		return nil
 	}
-	items, liveErr := h.Service.liveComposeContainerInstances(r.Context(), chapterID, cwd, cmd, nil, cfg, proxyInfo)
+	// compose ps must run with the same COMPOSE_PROJECT_NAME the start path used,
+	// otherwise it inspects the default project namespace, finds no containers, and
+	// (via persistContainerInstances' delete+reinsert) wipes the persisted
+	// instances and port allocations on every list refresh. buildComposeEnv derives
+	// the project name deterministically from the chapter id.
+	listEnv := buildComposeEnv(chapterID, cfg, nil, proxyInfo)
+	items, liveErr := h.Service.liveComposeContainerInstances(r.Context(), chapterID, cwd, cmd, listEnv, cfg, proxyInfo)
 	if liveErr != nil {
 		writeContainerListFallback(w, stored, "CONTAINER_STATE_UNAVAILABLE", "live container state is unavailable; returning persisted container state")
 		return nil
+	}
+	// Legacy (non-proxy) mode: the live list is re-derived from compose ps, which
+	// does not carry the host port allocated at start time. Without this, every
+	// list refresh would re-persist instances with host_port=null and wipe the
+	// port_allocations row (persistContainerInstances deletes+reinserts). Merge the
+	// host port from the already-persisted instances (by service) so it survives,
+	// matching TS listByChapter which simply reads persisted rows.
+	if proxyInfo == nil {
+		mergeAllocatedHostPorts(items, storedHostPortMappings(stored))
 	}
 	if err := h.Service.persistContainerInstances(r.Context(), chapterID, items); err != nil {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, items)
 	return nil
+}
+
+// storedHostPortMappings projects persisted container instances into the
+// {serviceName, hostPort, containerPort} mapping shape consumed by
+// mergeAllocatedHostPorts, preserving host ports across live list refreshes.
+func storedHostPortMappings(stored []map[string]any) []map[string]any {
+	mappings := make([]map[string]any, 0, len(stored))
+	for _, item := range stored {
+		hostPort := intValue(item["hostPort"])
+		if hostPort <= 0 {
+			continue
+		}
+		mappings = append(mappings, map[string]any{
+			"serviceName":   stringValue(item["serviceName"]),
+			"hostPort":      hostPort,
+			"containerPort": intValue(item["containerPort"]),
+		})
+	}
+	return mappings
 }
 
 func (h *Handler) liveContainerInstances(ctx context.Context, chapterID, cwd string) ([]map[string]any, error) {
@@ -1999,6 +2142,23 @@ func (h *Handler) syncContainerActionState(ctx context.Context, chapterID, cwd s
 		if args[0] == "up" && proxyInfo != nil && len(items) == 0 {
 			return httpx.BadRequest("No proxy routes resolved from running containers. Check compose service ports or image EXPOSE settings.")
 		}
+		// Legacy (non-proxy) mode: merge the allocated host port onto the matching
+		// instance (compose ps does not surface it), mirroring the TypeScript
+		// _recordContainerInstances userMapping fallback so the host port and the
+		// port_allocations row survive. Matches startChapterContainersLocked.
+		if proxyInfo == nil && len(mappings) > 0 {
+			mergeAllocatedHostPorts(items, mappings)
+		}
+		// Unpause re-persists live instances but does not re-allocate ports, so
+		// `mappings` is empty. compose ps does not surface the host port in the
+		// non-proxy path (see W448), so without merging the already persisted host
+		// ports back in, persistContainerInstances would wipe host_port to 0 on
+		// every resume (the W450-class state-erasure bug, here on the unpause path).
+		if proxyInfo == nil && len(mappings) == 0 {
+			if stored, err := h.Service.persistedContainerInstances(ctx, chapterID); err == nil {
+				mergeAllocatedHostPorts(items, storedHostPortMappings(stored))
+			}
+		}
 		return h.Service.persistContainerInstances(ctx, chapterID, items)
 	case "pause":
 		_, err := h.Service.DB.ExecContext(ctx, `UPDATE container_instances SET status = 'paused', updated_at = ? WHERE chapter_id = ?`, db.NowISO(), chapterID)
@@ -2048,7 +2208,11 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	tail := 200
-	if parsed, parseErr := strconv.Atoi(r.URL.Query().Get("tail")); parseErr == nil && parsed > 0 {
+	// Mirror TS Number.parseInt(tail,10): a leading-digit prefix like "50x"
+	// parses to 50 (strconv.Atoi would reject it and wrongly keep the default).
+	// Only a positive parsed value overrides the default; the >1000 clamp below
+	// enforces the documented logsMaxTail output bound.
+	if parsed, ok := httpx.ParseIntJS(r.URL.Query().Get("tail")); ok && parsed > 0 {
 		tail = parsed
 	}
 	if tail > 1000 {
@@ -2058,7 +2222,12 @@ func (h *Handler) containerLogs(w http.ResponseWriter, r *http.Request) error {
 	if svc := strings.TrimSpace(r.URL.Query().Get("service")); svc != "" && !strings.ContainsAny(svc, "/\\\x00") {
 		args = append(args, svc)
 	}
-	out, runErr := runLimitedEnv(r.Context(), cwd, nil, cmd[0], args...)
+	// compose logs must run under the chapter's COMPOSE_PROJECT_NAME (derived from
+	// the chapter id), otherwise it targets the default project and returns no
+	// logs for the chapter's containers. The project name is independent of
+	// proxy/host-port mappings, so a mapping-free env is sufficient here.
+	logsEnv := buildComposeEnv(chapterID, cfg, nil, nil)
+	out, runErr := runLimitedEnv(r.Context(), cwd, logsEnv, cmd[0], args...)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": runErr == nil, "logs": out, "truncated": strings.Contains(out, "[truncated]")})
 	return nil
 }
@@ -2094,6 +2263,68 @@ func commandVersion(ctx context.Context, name string, args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(out)
+}
+
+// cleanVersionString extracts a clean, single-line version string from combined
+// stdout+stderr output. runLimited merges streams, so a provider/rootless
+// warning (sometimes ANSI-formatted) can precede the real version line (e.g.
+// `podman compose version` prints a ">>>> Executing external compose provider"
+// banner). TS reports stdout-only trimmed output, so without this the Go
+// container-setup preflight would surface a multi-line, ANSI-polluted version
+// field. Prefer the last line that contains "version" with a digit; otherwise
+// fall back to the last non-empty cleaned line.
+func cleanVersionString(raw string) string {
+	cleaned := stripANSIEscapes(raw)
+	best := ""
+	last := ""
+	for _, line := range strings.Split(cleaned, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		last = line
+		if strings.Contains(strings.ToLower(line), "version") && strings.ContainsAny(line, "0123456789") {
+			best = line
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return last
+}
+
+// cleanComposeVersionString mirrors the TypeScript compose-version extraction
+// (`/podman-compose\s+version\s+([\d.]+)/i`, else last line): it returns the
+// bare version number when the "podman-compose version X.Y.Z" line is present,
+// otherwise the cleaned last line.
+func cleanComposeVersionString(raw string) string {
+	cleaned := stripANSIEscapes(raw)
+	for _, line := range strings.Split(cleaned, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		// Match "podman-compose version X.Y.Z" anywhere on the line.
+		for i := 0; i+2 < len(fields); i++ {
+			if strings.EqualFold(fields[i], "podman-compose") && strings.EqualFold(fields[i+1], "version") && isVersionNumber(fields[i+2]) {
+				return fields[i+2]
+			}
+		}
+	}
+	return cleanVersionString(raw)
+}
+
+// isVersionNumber reports whether s looks like a dotted numeric version (digits
+// and dots only, at least one digit).
+func isVersionNumber(s string) bool {
+	hasDigit := false
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			continue
+		}
+		if r != '.' {
+			return false
+		}
+	}
+	return hasDigit
 }
 
 func mustCommandOutput(ctx context.Context, name string, args ...string) string {

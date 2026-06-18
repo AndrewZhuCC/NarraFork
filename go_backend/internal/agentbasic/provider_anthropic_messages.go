@@ -245,13 +245,15 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 	messages = cleanAnthropicHistoryForProvider(messages, provider)
 	body := map[string]any{
 		"model":      provider.Model,
-		"max_tokens": 4096,
+		"max_tokens": anthropicMaxTokens(provider.Model),
 		"system":     anthropicSystemBlocks(systemPrompt),
 		"messages":   messages,
 		"tools":      anthropicToolDefinitions(toolScope),
 		"stream":     true,
 	}
-	if thinking := anthropicThinkingConfig(provider.Model, reasoningEffort); thinking != nil {
+	thinking := anthropicThinkingConfig(provider.Model, reasoningEffort)
+	thinkingEnabled := thinking != nil && thinking["type"] != "disabled"
+	if thinking != nil {
 		body["thinking"] = thinking
 	}
 	payload, _ := json.Marshal(body)
@@ -261,7 +263,9 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 		return err
 	}
 	setAnthropicHeaders(req, provider)
-	if body["thinking"] != nil {
+	// The interleaved-thinking beta header must only be sent when thinking is
+	// actually enabled (adaptive/enabled), not when it is explicitly disabled.
+	if thinkingEnabled {
 		req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
 	}
 	req.Header.Set("Accept", "text/event-stream")
@@ -306,6 +310,13 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 	blocks := map[int]*anthropicStreamingBlock{}
 	messageID := ""
 	completed := false
+	// Accumulate usage across message_start/message_delta. Anthropic sends the
+	// prompt footprint (input_tokens / cache_read / cache_creation) on
+	// message_start and output_tokens on message_delta, where message_delta may
+	// omit or zero the input/cache fields. Mirror the TS AnthropicUsageAccum: only
+	// overwrite input/cache fields when the incoming value is > 0 so a later
+	// message_delta does not erase the real values from message_start.
+	usageAccum := &anthropicUsageAccum{}
 	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
 		if data == "" {
@@ -327,7 +338,8 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 		case "message_start":
 			messageID = parsed.Message.ID
 			if parsed.Message.Usage != nil {
-				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Usage: anthropicUsageSnapshot(parsed.Message.Usage)}})
+				usageAccum.merge(parsed.Message.Usage)
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Usage: usageAccum.snapshot()}})
 			}
 		case "content_block_start":
 			handleAnthropicBlockStart(blocks, parsed.Index, parsed.ContentBlock)
@@ -345,9 +357,11 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 		case "message_delta":
 			streamEvent := ParsedStreamEvent{MessageID: messageID, StopReason: parsed.Delta.StopReason}
 			if parsed.Usage != nil {
-				streamEvent.Usage = anthropicUsageSnapshot(parsed.Usage)
+				usageAccum.merge(parsed.Usage)
+				streamEvent.Usage = usageAccum.snapshot()
 			} else if parsed.Delta.Usage != nil {
-				streamEvent.Usage = anthropicUsageSnapshot(parsed.Delta.Usage)
+				usageAccum.merge(parsed.Delta.Usage)
+				streamEvent.Usage = usageAccum.snapshot()
 			}
 			if invalid := anthropicInvalidStateFromStopReason(parsed.Delta.StopReason); invalid != nil {
 				streamEvent.InvalidState = invalid
@@ -429,7 +443,75 @@ func anthropicUsageSnapshot(usage *anthropicUsage) *UsageSnapshot {
 	if usage == nil {
 		return nil
 	}
-	return &UsageSnapshot{InputTokens: usage.InputTokens, PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, CachedInputTokens: usage.CacheReadInputTokens, CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheCreation5mTokens: usage.CacheCreation.Ephemeral5mInputTokens, CacheCreation1hTokens: usage.CacheCreation.Ephemeral1hInputTokens}
+	cacheCreation := usage.CacheCreationInputTokens
+	if cacheCreation == 0 && (usage.CacheCreation.Ephemeral5mInputTokens != 0 || usage.CacheCreation.Ephemeral1hInputTokens != 0) {
+		cacheCreation = usage.CacheCreation.Ephemeral5mInputTokens + usage.CacheCreation.Ephemeral1hInputTokens
+	}
+	// promptTokens is the full prompt footprint (input + cache_read +
+	// cache_creation), mirroring TS promptTokensFromAnthropicPayload. This
+	// drives context-usage percent; cost/DB input_tokens use InputTokens.
+	return &UsageSnapshot{InputTokens: usage.InputTokens, PromptTokens: usage.InputTokens + usage.CacheReadInputTokens + cacheCreation, CompletionTokens: usage.OutputTokens, CachedInputTokens: usage.CacheReadInputTokens, CacheCreationInputTokens: usage.CacheCreationInputTokens, CacheCreation5mTokens: usage.CacheCreation.Ephemeral5mInputTokens, CacheCreation1hTokens: usage.CacheCreation.Ephemeral1hInputTokens}
+}
+
+// anthropicUsageAccum accumulates usage across the Anthropic SSE message_start
+// and message_delta events. It mirrors the TS updateAnthropicUsageAccum
+// (anthropic-provider.ts:459-487): input/cache fields are only overwritten when
+// the incoming value is > 0 (so a later message_delta's zero/omitted input/cache
+// does not erase the real prompt footprint from message_start), output_tokens is
+// taken as the latest cumulative value, and cacheCreationInputTokens is derived
+// from the 5m+1h breakdown when the top-level field is absent.
+type anthropicUsageAccum struct {
+	inputTokens              int
+	outputTokens             int
+	cachedInputTokens        int
+	cacheCreationInputTokens int
+	cacheCreation5mTokens    int
+	cacheCreation1hTokens    int
+}
+
+func (a *anthropicUsageAccum) merge(usage *anthropicUsage) {
+	if usage == nil {
+		return
+	}
+	if usage.InputTokens > 0 {
+		a.inputTokens = usage.InputTokens
+	}
+	if usage.CacheReadInputTokens > 0 {
+		a.cachedInputTokens = usage.CacheReadInputTokens
+	}
+	if usage.CacheCreationInputTokens > 0 {
+		a.cacheCreationInputTokens = usage.CacheCreationInputTokens
+	}
+	if usage.OutputTokens != 0 {
+		a.outputTokens = usage.OutputTokens
+	}
+	if usage.CacheCreation.Ephemeral5mInputTokens != 0 {
+		a.cacheCreation5mTokens = usage.CacheCreation.Ephemeral5mInputTokens
+	}
+	if usage.CacheCreation.Ephemeral1hInputTokens != 0 {
+		a.cacheCreation1hTokens = usage.CacheCreation.Ephemeral1hInputTokens
+	}
+	// Derive the top-level cache-creation total from the 5m+1h breakdown when the
+	// provider did not send cache_creation_input_tokens directly (mirrors TS
+	// anthropic-provider.ts:480-486).
+	if usage.CacheCreationInputTokens == 0 && (usage.CacheCreation.Ephemeral5mInputTokens != 0 || usage.CacheCreation.Ephemeral1hInputTokens != 0) {
+		a.cacheCreationInputTokens = a.cacheCreation5mTokens + a.cacheCreation1hTokens
+	}
+}
+
+func (a *anthropicUsageAccum) snapshot() *UsageSnapshot {
+	return &UsageSnapshot{
+		InputTokens: a.inputTokens,
+		// Full prompt footprint (input + cache_read + cache_creation), mirroring
+		// TS anthropicPromptFootprintTokens. Drives context-usage percent; the DB
+		// input_tokens column and cost use InputTokens, so this is display-only.
+		PromptTokens:             a.inputTokens + a.cachedInputTokens + a.cacheCreationInputTokens,
+		CompletionTokens:         a.outputTokens,
+		CachedInputTokens:        a.cachedInputTokens,
+		CacheCreationInputTokens: a.cacheCreationInputTokens,
+		CacheCreation5mTokens:    a.cacheCreation5mTokens,
+		CacheCreation1hTokens:    a.cacheCreation1hTokens,
+	}
 }
 
 func anthropicInvalidStateFromError(err *anthropicErrorPayload) *InvalidState {
@@ -452,24 +534,84 @@ func anthropicInvalidStateFromStopReason(stopReason string) *InvalidState {
 	}
 }
 
-func anthropicThinkingConfig(model, reasoningEffort string) map[string]any {
+// anthropicSupportsThinking mirrors the TS supportsThinking (anthropic-provider.ts):
+// extended thinking is supported by DeepSeek, Claude 3.7 Sonnet, and the Claude 4+
+// families (opus-4/sonnet-4/haiku-4).
+func anthropicSupportsThinking(model string) bool {
+	lower := strings.ToLower(model)
+	if strings.Contains(lower, "deepseek") {
+		return true
+	}
+	if strings.Contains(lower, "3-7") || strings.Contains(lower, "3.7") {
+		return true
+	}
+	if strings.Contains(lower, "opus-4") || strings.Contains(lower, "sonnet-4") || strings.Contains(lower, "haiku-4") {
+		return true
+	}
+	return false
+}
+
+// anthropicIsDeepSeekModel mirrors the TS isDeepSeekModel (types.ts).
+func anthropicIsDeepSeekModel(model string) bool {
+	return isDeepSeekModelName(model)
+}
+
+// isDeepSeekModelName mirrors the TS isDeepSeekModel (types.ts): a model id whose
+// (case-insensitive) name contains "deepseek".
+func isDeepSeekModelName(model string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// mapDeepSeekEffort mirrors the TS mapDeepSeekEffort (types.ts): none/empty -> "",
+// xhigh -> "max", everything else -> "high". DeepSeek's Anthropic/OpenAI-compatible
+// API exposes only "high" and "max" thinking-intensity tiers.
+func mapDeepSeekEffort(reasoningEffort string) string {
 	effort := normalizeReasoningEffort(reasoningEffort)
 	if effort == "" || effort == "none" {
-		return nil
+		return ""
 	}
-	budget := 1024
-	switch effort {
-	case "low":
-		budget = 1024
-	case "medium":
-		budget = 4096
-	case "high", "xhigh":
-		budget = 8192
+	if effort == "xhigh" {
+		return "max"
 	}
+	return "high"
+}
+
+// anthropicThinkingConfig mirrors the TS buildThinkingConfig (anthropic-provider.ts,
+// matching Claude Code v2.1.71):
+//   - models that don't support thinking → nil (no thinking field)
+//   - reasoningEffort == "none" → {type:"disabled"} (thinking explicitly off)
+//   - DeepSeek → {type:"enabled", budget_tokens:10000} (DeepSeek ignores the value
+//     but the schema requires it; effort is controlled via output_config elsewhere)
+//   - all other supported models → {type:"adaptive"}
+//
+// The previous Go implementation used the deprecated {type:"enabled",
+// budget_tokens:N} form (1024/4096/8192 by effort) for EVERY model regardless of
+// thinking support, and returned nil for "none" (so thinking-capable models could
+// silently default thinking on instead of being explicitly disabled).
+// anthropicMaxTokens mirrors the TS getTokenLimits default (anthropic-provider.ts):
+// the main streaming chat request sends max_tokens = 32000 for every model (the
+// `default` tier; the 64000 `upperLimit` for Claude 4 families is not used in the
+// request body). Go previously hardcoded 4096, which truncated long responses on
+// the main chat path. The non-streaming generate/title/summary helper
+// (doAnthropicRequest) keeps 4096, matching the TS generate helper.
+func anthropicMaxTokens(model string) int {
+	return 32000
+}
+
+func anthropicThinkingConfig(model, reasoningEffort string) map[string]any {
 	if strings.TrimSpace(model) == "" {
 		return nil
 	}
-	return map[string]any{"type": "enabled", "budget_tokens": budget}
+	if !anthropicSupportsThinking(model) {
+		return nil
+	}
+	if normalizeReasoningEffort(reasoningEffort) == "none" {
+		return map[string]any{"type": "disabled"}
+	}
+	if anthropicIsDeepSeekModel(model) {
+		return map[string]any{"type": "enabled", "budget_tokens": 10000}
+	}
+	return map[string]any{"type": "adaptive"}
 }
 
 func doAnthropicRequest(ctx context.Context, client *http.Client, provider Provider, systemPrompt string, messages []map[string]any, toolScope string) (anthropicResponse, error) {

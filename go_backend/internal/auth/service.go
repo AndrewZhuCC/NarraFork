@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
-	"net/mail"
 	"regexp"
 	"strings"
 	"time"
@@ -66,13 +65,13 @@ func NewService(sqlDB *sql.DB, settings *config.Store) *Service {
 }
 
 func (s *Service) Register(ctx context.Context, username, password, language string) (AuthResult, error) {
-	if len(username) < 3 || len(username) > 50 || !usernamePattern.MatchString(username) {
+	if httpx.JSStringLength(username) < 3 || httpx.JSStringLength(username) > 50 || !usernamePattern.MatchString(username) {
 		return AuthResult{}, httpx.ValidationError("username must be 3-50 characters and contain only letters, numbers, hyphens, and underscores")
 	}
-	if len(password) < 8 || len(password) > 128 {
+	if httpx.JSStringLength(password) < 8 || httpx.JSStringLength(password) > 128 {
 		return AuthResult{}, httpx.ValidationError("password must be 8-128 characters")
 	}
-	if len(language) < 1 || len(language) > 10 {
+	if httpx.JSStringLength(language) < 1 || httpx.JSStringLength(language) > 10 {
 		return AuthResult{}, httpx.ValidationError("language must be 1-10 characters")
 	}
 
@@ -283,7 +282,7 @@ func (s *Service) UpdateProfile(ctx context.Context, userID string, gitUsername,
 	sets := make([]string, 0, 2)
 	args := make([]any, 0, 3)
 	if gitUsername != nil {
-		if len(*gitUsername) > 100 {
+		if httpx.JSStringLength(*gitUsername) > 100 {
 			return httpx.ValidationError("gitUsername must be at most 100 characters")
 		}
 		sets = append(sets, "git_username = ?")
@@ -291,7 +290,7 @@ func (s *Service) UpdateProfile(ctx context.Context, userID string, gitUsername,
 	}
 	if gitEmail != nil {
 		if *gitEmail != "" {
-			if len(*gitEmail) > 254 || !isValidEmail(*gitEmail) {
+			if httpx.JSStringLength(*gitEmail) > 254 || !isValidEmail(*gitEmail) {
 				return httpx.ValidationError("gitEmail must be a valid email address")
 			}
 		}
@@ -370,7 +369,25 @@ func isSerializationFailure(err error) bool {
 		strings.Contains(message, "serialization")
 }
 
+// zodEmailBodyPattern mirrors the Zod v4 "practical email" regex
+// (node_modules/zod/v4/core/regexes.js) MINUS its two negative lookaheads, which
+// RE2 cannot express:
+//
+//	/^(?!\.)(?!.*\.\.)([A-Za-z0-9_'+\-\.]*)[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$/
+//
+// The "(?!\.)" (no leading dot) and "(?!.*\.\.)" (no consecutive dots) constraints
+// are enforced separately in isValidEmail. This is what z.string().email() applies
+// to gitEmail (server/lib/validators/auth.ts), so it must match here rather than
+// net/mail.ParseAddress, which is RFC-5322 permissive and wrongly accepts forms Zod
+// rejects (e.g. "user@localhost" / "a@b" with no dotted TLD).
+var zodEmailBodyPattern = regexp.MustCompile(`^[A-Za-z0-9_'+\-.]*[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$`)
+
 func isValidEmail(v string) bool {
-	addr, err := mail.ParseAddress(v)
-	return err == nil && addr.Address == v
+	if strings.HasPrefix(v, ".") {
+		return false
+	}
+	if strings.Contains(v, "..") {
+		return false
+	}
+	return zodEmailBodyPattern.MatchString(v)
 }

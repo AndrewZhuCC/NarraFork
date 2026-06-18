@@ -235,10 +235,11 @@ func LearningGuideOutput(mode, query, idValue, lang string) string {
 	case "search":
 		query = strings.ToLower(strings.TrimSpace(query))
 		if query == "" {
-			if locale == "zh-CN" {
-				return "请提供搜索关键词，或使用 mode=list 查看全部文档。"
-			}
-			return "Please provide a search query, or use mode=list to see all documents."
+			// Mirror the TS learningGuideTool: an empty search query returns the
+			// full summary list (renderSummaryList(getLearningDocSummaries)), NOT a
+			// "please provide a query" help message. Go previously returned a help
+			// string here, diverging from TS.
+			return renderLearningSummaries(learningSummaries(locale), locale)
 		}
 		results := []map[string]any{}
 		for _, doc := range learningSummaries(locale) {
@@ -270,9 +271,37 @@ func renderLearningSummaries(docs []map[string]any, locale string) string {
 			}
 			line += "\n  " + label + ": " + strings.Join(tags, ", ")
 		}
+		// Mirror the TS renderSummaryList (server/lib/agent/tools/learning-guide.ts):
+		// append up to the first 3 actions as "label → href" joined by "；" under a
+		// "Shortcuts"/"入口" label. Go previously omitted action shortcuts entirely.
+		if shortcuts := learningActionShortcuts(doc["actions"]); shortcuts != "" {
+			label := "Shortcuts"
+			if locale == "zh-CN" {
+				label = "入口"
+			}
+			line += "\n  " + label + ": " + shortcuts
+		}
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// learningActionShortcuts mirrors the TS summary-action rendering: the first 3
+// actions as "label → href" joined by the fullwidth semicolon "；". Returns ""
+// when there are no actions.
+func learningActionShortcuts(value any) string {
+	actions, ok := value.([]map[string]any)
+	if !ok || len(actions) == 0 {
+		return ""
+	}
+	parts := []string{}
+	for _, action := range actions {
+		if len(parts) >= 3 {
+			break
+		}
+		parts = append(parts, stringValue(action["label"])+" → "+stringValue(action["href"]))
+	}
+	return strings.Join(parts, "；")
 }
 
 func renderLearningDetail(doc map[string]any, locale string) string {
@@ -305,7 +334,26 @@ func renderLearningDetail(doc map[string]any, locale string) string {
 	appendList("bestPractices", "Best practices", "最佳实践")
 	appendList("pitfalls", "Common pitfalls", "常见坑")
 	appendList("agentHints", "Agent hints", "Agent 查阅提示")
-	lines = append(lines, "Document ID: "+stringValue(doc["id"]))
+	// Mirror the TS renderActions (server/lib/agent/tools/learning-guide.ts):
+	// a "## Feature shortcuts"/"## 可跳转功能入口" section listing each action as
+	// "- label: description (href)", placed before the Document ID footer. Go
+	// previously omitted the actions section from the detail view.
+	if actions, ok := doc["actions"].([]map[string]any); ok && len(actions) > 0 {
+		title := "Feature shortcuts"
+		if locale == "zh-CN" {
+			title = "可跳转功能入口"
+		}
+		lines = append(lines, "## "+title)
+		for _, action := range actions {
+			lines = append(lines, "- "+stringValue(action["label"])+": "+stringValue(action["description"])+" ("+stringValue(action["href"])+")")
+		}
+		lines = append(lines, "")
+	}
+	docIDLabel := "Document ID"
+	if locale == "zh-CN" {
+		docIDLabel = "文档 ID"
+	}
+	lines = append(lines, docIDLabel+": "+stringValue(doc["id"]))
 	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
@@ -356,11 +404,16 @@ func (h *Handler) listRoutines(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) toggleRoutine(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		Enabled bool `json:"enabled"`
-	}
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
 		return err
+	}
+	// Mirror TS `if (typeof body.enabled !== "boolean") throw 400`: a missing or
+	// non-boolean `enabled` must reject with 400, not silently decode to the Go
+	// zero value `false` (which would disable the routine).
+	enabledValue, ok := raw["enabled"].(bool)
+	if !ok {
+		return httpx.BadRequest("enabled must be a boolean")
 	}
 	routineID := safeName(chi.URLParam(r, "id"))
 	if !routineExists(routineID) {
@@ -368,7 +421,7 @@ func (h *Handler) toggleRoutine(w http.ResponseWriter, r *http.Request) error {
 	}
 	enabled := h.globalRoutineList("enabledRoutines")
 	disabled := h.globalRoutineList("disabledRoutines")
-	if body.Enabled {
+	if enabledValue {
 		enabled = appendMissing(enabled, routineID)
 		disabled = removeString(disabled, routineID)
 	} else {
@@ -766,10 +819,10 @@ func (h *Handler) updateProjectSkill(w http.ResponseWriter, r *http.Request) err
 	if msg := validateProjectSkillBounds(body.Name, body.Description, body.Content); msg != "" {
 		return httpx.BadRequest(msg)
 	}
-	existing, err := loadProjectSkillByName(gitPath, currentName)
-	if err != nil || existing == nil {
-		return httpx.NotFound("Project skill")
-	}
+	// Mirror TS PUT /:name ordering (server/routes/skills.ts): validate the body
+	// (bounds + name fallback to the URL param + description required) BEFORE the
+	// skill-existence lookup, so an empty description returns 400 even when the
+	// skill does not exist (Go previously did the NotFound 404 first).
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
 		name = strings.TrimSpace(currentName)
@@ -778,6 +831,10 @@ func (h *Handler) updateProjectSkill(w http.ResponseWriter, r *http.Request) err
 	content := strings.TrimSpace(body.Content)
 	if description == "" {
 		return httpx.BadRequest("description is required")
+	}
+	existing, err := loadProjectSkillByName(gitPath, currentName)
+	if err != nil || existing == nil {
+		return httpx.NotFound("Project skill")
 	}
 	existingLocation := stringValue(existing["location"])
 	if name != currentName {
@@ -828,13 +885,13 @@ func (h *Handler) deleteProjectSkill(w http.ResponseWriter, r *http.Request) err
 // name max 100, description max 2000, content max 200000. Returns an error
 // message when a bound is exceeded, or "" when valid.
 func validateProjectSkillBounds(name, description, content string) string {
-	if len(name) > 100 {
+	if httpx.JSStringLength(name) > 100 {
 		return "name must be at most 100 characters"
 	}
-	if len(description) > 2000 {
+	if httpx.JSStringLength(description) > 2000 {
 		return "description must be at most 2000 characters"
 	}
-	if len(content) > 200000 {
+	if httpx.JSStringLength(content) > 200000 {
 		return "content must be at most 200000 characters"
 	}
 	return ""
@@ -967,13 +1024,13 @@ func (h *Handler) writeSkill(w http.ResponseWriter, r *http.Request, currentName
 	}
 	// Mirror the TypeScript project skill Zod bounds: name max 100,
 	// description max 2000, content max 200000.
-	if len(body.Name) > 100 {
+	if httpx.JSStringLength(body.Name) > 100 {
 		return httpx.BadRequest("name must be at most 100 characters")
 	}
-	if len(body.Description) > 2000 {
+	if httpx.JSStringLength(body.Description) > 2000 {
 		return httpx.BadRequest("description must be at most 2000 characters")
 	}
-	if len(body.Content) > 200000 {
+	if httpx.JSStringLength(body.Content) > 200000 {
 		return httpx.BadRequest("content must be at most 200000 characters")
 	}
 	var targetPath string
@@ -1025,13 +1082,18 @@ func (h *Handler) deleteGlobalSkill(w http.ResponseWriter, r *http.Request) erro
 }
 func (h *Handler) toggleGlobalSkill(w http.ResponseWriter, r *http.Request) error {
 	name := chi.URLParam(r, "name")
-	var body struct {
-		Enabled *bool `json:"enabled"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
 		return err
 	}
-	if body.Enabled == nil {
+	// Mirror TS `if (typeof body.enabled !== "boolean") throw 400 "enabled
+	// (boolean) is required"`: a missing OR non-boolean value rejects with the
+	// same message. Go previously used a strict *bool decode, which gave the
+	// right 400 for missing/null but a generic "invalid JSON" message (and
+	// rejected unknown sibling fields) for a non-boolean value, diverging from
+	// the TS message and TS's lenient extra-field handling.
+	enabledValue, ok := raw["enabled"].(bool)
+	if !ok {
 		return httpx.BadRequest("enabled (boolean) is required")
 	}
 	item, err := findSkill(loadGlobalSkills(), name)
@@ -1042,10 +1104,10 @@ func (h *Handler) toggleGlobalSkill(w http.ResponseWriter, r *http.Request) erro
 	dir := filepath.Dir(location)
 	enabledPath := filepath.Join(dir, "SKILL.md")
 	disabledPath := filepath.Join(dir, "SKILL.md.disabled")
-	if *body.Enabled && boolValue(item["disabled"]) {
+	if enabledValue && boolValue(item["disabled"]) {
 		_ = os.Rename(disabledPath, enabledPath)
 		_ = os.Remove(filepath.Join(dir, ".disabled"))
-	} else if !*body.Enabled && !boolValue(item["disabled"]) {
+	} else if !enabledValue && !boolValue(item["disabled"]) {
 		_ = os.Rename(enabledPath, disabledPath)
 	}
 	updated, _ := findSkill(loadGlobalSkills(), name)
@@ -1136,7 +1198,11 @@ func SkillToolOutput(skillName, skillArgs, gitPath string) string {
 	if files := learningStringSlice(found["files"]); len(files) > 0 {
 		lines = append(lines, "", "<skill_files>")
 		for _, file := range files {
-			lines = append(lines, "<file>"+escapeSkillXML(filepath.Join(skillDir, file))+"</file>")
+			// Match the TS skill tool exactly (server/lib/agent/tools/skill.ts:188):
+			// `<file>${join(skillDir, f)}</file>` — the joined file path is NOT
+			// XML-escaped (only name/args are). Go previously escaped it, so a path
+			// containing &/<>/" would render differently from TS.
+			lines = append(lines, "<file>"+filepath.Join(skillDir, file)+"</file>")
 		}
 		lines = append(lines, "</skill_files>")
 	}
@@ -1336,9 +1402,12 @@ func NarratorSkillContext(projectGitPath, cwd, nowISO string) NarratorSkillConte
 }
 
 func truncateSkillDescription(description string) string {
-	runes := []rune(description)
-	if len(runes) > skillDescriptionMaxChars {
-		return string(runes[:skillDescriptionMaxChars]) + "…"
+	// Mirror the TS truncateDescription (server/services/skill-service.ts:363):
+	// `description.length > MAX ? description.slice(0, MAX)+"…" : description` over
+	// UTF-16 code units. Go previously used []rune (Unicode code points), so a
+	// description with astral characters truncated at a different boundary than TS.
+	if httpx.JSStringLength(description) > skillDescriptionMaxChars {
+		return httpx.JSStringSlicePrefix(description, skillDescriptionMaxChars) + "…"
 	}
 	return description
 }
@@ -1610,15 +1679,27 @@ func (h *Handler) getGlobalPrompt(w http.ResponseWriter, r *http.Request) error 
 }
 
 func (h *Handler) putGlobalPrompt(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		Content  string `json:"content"`
-		FilePath string `json:"filePath"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeJSON(r, &raw); err != nil {
 		return err
 	}
+	// Mirror TS `if (typeof body.content !== "string") throw 400 "content must be
+	// a string"`: a missing or non-string content must reject, not silently
+	// decode to "" and write an empty global prompt file.
+	content, ok := raw["content"].(string)
+	if !ok {
+		return httpx.BadRequest("content must be a string")
+	}
+	filePath := ""
+	if value, exists := raw["filePath"]; exists && value != nil {
+		text, isString := value.(string)
+		if !isString {
+			return httpx.BadRequest("filePath must be one of the known global prompt paths")
+		}
+		filePath = text
+	}
 	candidates := globalPromptCandidates()
-	target := body.FilePath
+	target := filePath
 	if target == "" {
 		// Mirror the TypeScript write path: default to the first *existing* candidate
 		// so an existing ~/.claude/CLAUDE.md is updated in place; only fall back to
@@ -1650,7 +1731,7 @@ func (h *Handler) putGlobalPrompt(w http.ResponseWriter, r *http.Request) error 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(abs, []byte(body.Content), 0o644); err != nil {
+	if err := os.WriteFile(abs, []byte(content), 0o644); err != nil {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "filePath": abs})

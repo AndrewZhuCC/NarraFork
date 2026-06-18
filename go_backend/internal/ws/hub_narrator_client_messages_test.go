@@ -3,6 +3,7 @@ package ws_test
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -98,6 +99,18 @@ func TestNarratorWSMessageBoundsRejectOutOfRangeValues(t *testing.T) {
 		t.Fatalf("expected buffer_message length error, got %#v", msg)
 	}
 
+	// buffer_message text max 100000 counted in UTF-16 code units (JS .length):
+	// 50001 emoji = 100002 UTF-16 units (> 100000) must error even though a
+	// rune-count check would see only 50001 and wrongly accept it.
+	emojiText := strings.Repeat("😀", 50_001)
+	if err := conn.WriteJSON(map[string]any{"type": "buffer_message", "narratorId": "nar_bounds", "text": emojiText}); err != nil {
+		t.Fatalf("write emoji buffer_message: %v", err)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "error" || msg["message"] != "text must be at most 100000 characters" {
+		t.Fatalf("expected emoji buffer_message (100002 UTF-16 units) length error, got %#v", msg)
+	}
+
 	// update_timeout timeoutMs below the 1000 lower bound.
 	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeoutMs": 500}); err != nil {
 		t.Fatalf("write small update_timeout: %v", err)
@@ -114,6 +127,18 @@ func TestNarratorWSMessageBoundsRejectOutOfRangeValues(t *testing.T) {
 	msg = readWSMessage(t, conn)
 	if msg["type"] != "error" || msg["message"] != "timeoutMs must be between 1000 and 86400000" {
 		t.Fatalf("expected update_timeout upper-bound error, got %#v", msg)
+	}
+
+	// update_timeout with a fractional timeoutMs (1500.5) must error: the TS
+	// narratorWsMessageSchema uses z.number().int(), which rejects non-integer
+	// numbers. The previous Go code used intNumber, which truncated 1500.5 ->
+	// 1500 (in range) and wrongly accepted it.
+	if err := conn.WriteJSON(map[string]any{"type": "update_timeout", "toolUseId": "tool_1", "timeoutMs": 1500.5}); err != nil {
+		t.Fatalf("write fractional update_timeout: %v", err)
+	}
+	msg = readWSMessage(t, conn)
+	if msg["type"] != "error" || msg["message"] != "timeoutMs must be between 1000 and 86400000" {
+		t.Fatalf("expected fractional update_timeout error, got %#v", msg)
 	}
 }
 
@@ -288,7 +313,10 @@ func TestNarratorStatsAndTimeoutClientMessages(t *testing.T) {
 	if msg["type"] == "error" && msg["message"] == "Unknown or unsupported WebSocket message type" {
 		t.Fatalf("subscribe_stats returned unsupported: %#v", msg)
 	}
-	if msg["type"] != "output_stats" || msg["charsPerSecond"] != float64(0) || msg["tokensPerSecond"] != float64(0) {
+	// Mirror the TS output_stats payload shape consumed by useOutputStats:
+	// {type:"output_stats", charsPerSec, totalChars, subscribed}. A fresh
+	// subscriber with no streamed output sees zero values.
+	if msg["type"] != "output_stats" || msg["charsPerSec"] != float64(0) || msg["totalChars"] != float64(0) || msg["subscribed"] != true {
 		t.Fatalf("expected output_stats, got %#v", msg)
 	}
 

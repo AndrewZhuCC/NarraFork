@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net/http"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/go-chi/chi/v5"
 
@@ -315,7 +316,7 @@ func requiredStringField(raw map[string]any, field string, minLength, maxLength 
 	if err != nil {
 		return "", err
 	}
-	if len(text) < minLength {
+	if jsStringLength(text) < minLength {
 		return "", httpx.BadRequest(field + " must be at least 1 character")
 	}
 	return text, nil
@@ -326,10 +327,19 @@ func optionalStringValue(value any, field string, maxLength int) (string, error)
 	if !ok {
 		return "", httpx.BadRequest(field + " must be a string")
 	}
-	if len(text) > maxLength {
+	if jsStringLength(text) > maxLength {
 		return "", httpx.BadRequest(field + " is too long")
 	}
 	return text, nil
+}
+
+// jsStringLength mirrors JavaScript String.prototype.length (and therefore the
+// Zod .min()/.max() string-length checks in server/lib/validators/settings.ts),
+// which counts UTF-16 code units. Using utf8.RuneCountInString here would be too
+// permissive for astral characters (e.g. emoji count as 2 UTF-16 units in JS but
+// 1 rune in Go), so a 200-emoji label that TS rejects must also be rejected here.
+func jsStringLength(value string) int {
+	return len(utf16.Encode([]rune(value)))
 }
 
 func intField(value any, field string) (int, error) {

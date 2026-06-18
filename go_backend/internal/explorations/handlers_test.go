@@ -150,6 +150,25 @@ func createExplorationGroupFixture(t *testing.T, router http.Handler) (string, [
 // createExplorationGroupSchema Zod bounds — title max 200, description max 2000,
 // branches 2..10 with each branch title 1..200 / description max 2000 /
 // inheritMode enum — and reject out-of-range values with 400.
+func TestCreateExplorationGroupAcceptsCJKTitleUpToCharLimit(t *testing.T) {
+	// Regression: title/description bounds count characters (TS z.string().max),
+	// not UTF-8 bytes. A 200-char CJK title is 600 bytes and must be accepted.
+	router, _ := newExplorationTestRouter(t)
+	body := map[string]any{
+		"projectId":     "project",
+		"title":         strings.Repeat("验", 200),
+		"baseChapterId": "root",
+		"branches": []any{
+			map[string]any{"title": strings.Repeat("甲", 200), "inheritMode": "fresh"},
+			map[string]any{"title": "B", "description": strings.Repeat("乙", 2000), "inheritMode": "fresh"},
+		},
+	}
+	w := postExplorationJSON(t, router, "/", body)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("200-char CJK title/branch should be accepted, got %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateExplorationGroupValidatesZodBoundsLikeTypeScript(t *testing.T) {
 	router, _ := newExplorationTestRouter(t)
 	longText := strings.Repeat("x", 201)
@@ -158,14 +177,26 @@ func TestCreateExplorationGroupValidatesZodBoundsLikeTypeScript(t *testing.T) {
 		map[string]any{"title": "A", "inheritMode": "fresh"},
 		map[string]any{"title": "B", "inheritMode": "fresh"},
 	}
+	// 11 branches exceeds the .max(10) bound.
+	elevenBranches := make([]any, 11)
+	for i := range elevenBranches {
+		elevenBranches[i] = map[string]any{"title": "B", "inheritMode": "fresh"}
+	}
+	// Astral (emoji) title/branch: each emoji is 1 rune but 2 UTF-16 units, so 101
+	// emoji = 202 UTF-16 units, just over the .max(200) bound. A rune-count
+	// implementation would under-count (101 <= 200) and wrongly accept it.
+	emojiTitle := strings.Repeat("😀", 101)
 	for _, tc := range []struct {
 		name string
 		body map[string]any
 	}{
 		{"overlong title", map[string]any{"projectId": "project", "title": longText, "baseChapterId": "root", "branches": validBranches}},
+		{"overlong emoji title", map[string]any{"projectId": "project", "title": emojiTitle, "baseChapterId": "root", "branches": validBranches}},
 		{"overlong description", map[string]any{"projectId": "project", "title": "Exp", "description": longDesc, "baseChapterId": "root", "branches": validBranches}},
 		{"too few branches", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": "A"}}}},
+		{"too many branches", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": elevenBranches}},
 		{"branch title overlong", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": longText}, map[string]any{"title": "B"}}}},
+		{"branch title overlong emoji", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": emojiTitle}, map[string]any{"title": "B"}}}},
 		{"branch invalid inheritMode", map[string]any{"projectId": "project", "title": "Exp", "baseChapterId": "root", "branches": []any{map[string]any{"title": "A", "inheritMode": "partial"}, map[string]any{"title": "B"}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -175,6 +206,127 @@ func TestCreateExplorationGroupValidatesZodBoundsLikeTypeScript(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestListExplorationGroupsRequiresProjectIdAndReturnsArray(t *testing.T) {
+	router, _ := newExplorationTestRouter(t)
+	groupID, _ := createExplorationGroupFixture(t, router)
+
+	// Missing projectId must be rejected before any query.
+	missing := serveExploration(t, router, http.MethodGet, "/")
+	if missing.Code != http.StatusBadRequest {
+		t.Fatalf("list without projectId should be 400, got %d body=%s", missing.Code, missing.Body.String())
+	}
+
+	ok := serveExploration(t, router, http.MethodGet, "/?projectId=project")
+	if ok.Code != http.StatusOK {
+		t.Fatalf("list should be 200, got %d body=%s", ok.Code, ok.Body.String())
+	}
+	var groups []map[string]any
+	if err := json.Unmarshal(ok.Body.Bytes(), &groups); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(groups) != 1 || groups[0]["id"] != groupID {
+		t.Fatalf("expected one group %q in direct array, got %#v", groupID, groups)
+	}
+	for _, key := range []string{"id", "projectId", "title", "status", "createdAt", "updatedAt"} {
+		if _, ok := groups[0][key]; !ok {
+			t.Fatalf("list group missing %q field: %#v", key, groups[0])
+		}
+	}
+}
+
+func TestGetExplorationGroupReturnsGroupWithBranches(t *testing.T) {
+	router, _ := newExplorationTestRouter(t)
+	groupID, branchIDs := createExplorationGroupFixture(t, router)
+
+	ok := serveExploration(t, router, http.MethodGet, "/"+groupID)
+	if ok.Code != http.StatusOK {
+		t.Fatalf("get should be 200, got %d body=%s", ok.Code, ok.Body.String())
+	}
+	var group struct {
+		ID       string `json:"id"`
+		Branches []struct {
+			ID string `json:"id"`
+		} `json:"branches"`
+	}
+	if err := json.Unmarshal(ok.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode get: %v", err)
+	}
+	if group.ID != groupID || len(group.Branches) != 2 {
+		t.Fatalf("get should return group with 2 branches, got %#v", group)
+	}
+	got := map[string]bool{group.Branches[0].ID: true, group.Branches[1].ID: true}
+	for _, id := range branchIDs {
+		if !got[id] {
+			t.Fatalf("get branches missing %q: %#v", id, group.Branches)
+		}
+	}
+
+	missing := serveExploration(t, router, http.MethodGet, "/does-not-exist")
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("get missing group should be 404, got %d body=%s", missing.Code, missing.Body.String())
+	}
+}
+
+func TestUpdateExplorationGroupAppliesTitleDescriptionAndValidatesBounds(t *testing.T) {
+	router, database := newExplorationTestRouter(t)
+	groupID, _ := createExplorationGroupFixture(t, router)
+
+	updated := patchExplorationJSON(t, router, "/"+groupID, map[string]any{"title": "Renamed Group", "description": "new desc"})
+	if updated.Code != http.StatusOK {
+		t.Fatalf("update should be 200, got %d body=%s", updated.Code, updated.Body.String())
+	}
+	var group struct {
+		ID          string  `json:"id"`
+		Title       string  `json:"title"`
+		Description *string `json:"description"`
+	}
+	if err := json.Unmarshal(updated.Body.Bytes(), &group); err != nil {
+		t.Fatalf("decode update: %v", err)
+	}
+	if group.ID != groupID || group.Title != "Renamed Group" || group.Description == nil || *group.Description != "new desc" {
+		t.Fatalf("update should apply title/description, got %#v", group)
+	}
+	var dbTitle, dbDesc string
+	if err := database.QueryRow(`SELECT title, description FROM exploration_groups WHERE id = ?`, groupID).Scan(&dbTitle, &dbDesc); err != nil {
+		t.Fatalf("query updated group: %v", err)
+	}
+	if dbTitle != "Renamed Group" || dbDesc != "new desc" {
+		t.Fatalf("update should persist title/description, got title=%s desc=%s", dbTitle, dbDesc)
+	}
+
+	// Empty title must be rejected (Zod min(1)).
+	emptyTitle := patchExplorationJSON(t, router, "/"+groupID, map[string]any{"title": "  "})
+	if emptyTitle.Code != http.StatusBadRequest {
+		t.Fatalf("update with empty title should be 400, got %d body=%s", emptyTitle.Code, emptyTitle.Body.String())
+	}
+	// Overlong description must be rejected (Zod max(2000)).
+	overlong := patchExplorationJSON(t, router, "/"+groupID, map[string]any{"description": strings.Repeat("d", 2001)})
+	if overlong.Code != http.StatusBadRequest {
+		t.Fatalf("update with overlong description should be 400, got %d body=%s", overlong.Code, overlong.Body.String())
+	}
+}
+
+func serveExploration(t *testing.T, router http.Handler, method, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func patchExplorationJSON(t *testing.T, router http.Handler, path string, body map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	data, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPatch, path, bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
 }
 
 func postExplorationJSON(t *testing.T, router http.Handler, path string, body map[string]any) *httptest.ResponseRecorder {
@@ -203,6 +355,47 @@ func newExplorationTestRouter(t *testing.T) (*chi.Mux, *sql.DB) {
 	router := chi.NewRouter()
 	router.Route("/", handler.RegisterRoutes)
 	return router, database
+}
+
+// TestCreateExplorationGroupTitleLengthUsesJSStringLength pins the exploration
+// group create handler's title length validation to JavaScript
+// String.prototype.length (UTF-16 code units), matching the TS
+// createExplorationGroupSchema (server/lib/validators/explorations.ts:
+// title z.string().min(1).max(200)). An emoji is 1 rune but 2 UTF-16 units, so
+// 101 emoji = 202 units must be rejected even though a rune-count check would
+// see only 101 and wrongly accept it.
+func TestCreateExplorationGroupTitleLengthUsesJSStringLength(t *testing.T) {
+	router, _ := newExplorationTestRouter(t)
+
+	branches := []any{
+		map[string]any{"title": "Approach A", "inheritMode": "fresh"},
+		map[string]any{"title": "Approach B", "inheritMode": "fresh"},
+	}
+
+	// 101 emoji = 202 UTF-16 units: must be rejected with the length error.
+	emoji101 := strings.Repeat("😀", 101)
+	w := postExplorationJSON(t, router, "/", map[string]any{
+		"projectId":     "project",
+		"title":         emoji101,
+		"baseChapterId": "root",
+		"branches":      branches,
+	})
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "title must be at most 200 characters") {
+		t.Fatalf("101-emoji title (202 UTF-16 units) should be rejected with length error, got %d %s", w.Code, w.Body.String())
+	}
+
+	// 100 emoji = 200 UTF-16 units: must pass the length guard (no length error;
+	// it proceeds to forking, which is the non-length-validation path).
+	emoji100 := strings.Repeat("😀", 100)
+	w2 := postExplorationJSON(t, router, "/", map[string]any{
+		"projectId":     "project",
+		"title":         emoji100,
+		"baseChapterId": "root",
+		"branches":      branches,
+	})
+	if strings.Contains(w2.Body.String(), "title must be at most 200 characters") {
+		t.Fatalf("100-emoji title (200 UTF-16 units) should pass the length guard, got %d %s", w2.Code, w2.Body.String())
+	}
 }
 
 func openExplorationTestDB(t *testing.T) *sql.DB {

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -41,6 +42,37 @@ func TestCreateTabRequiresExactlyOneTargetLikeTypeScript(t *testing.T) {
 			router.ServeHTTP(rec, req)
 			if rec.Code != tc.status {
 				t.Fatalf("create tab %q status = %d body=%s, want %d", tc.name, rec.Code, rec.Body.String(), tc.status)
+			}
+		})
+	}
+}
+
+// Wave 572: Go terminal tab reorder must mirror the TypeScript
+// reorderTerminalTabsSchema — ids = z.array(z.string().min(1)).min(1). An empty
+// ids array (or an empty-string entry) is a 400, not a silent no-op.
+func TestReorderTabsValidatesIdsLikeTypeScript(t *testing.T) {
+	sqlDB := openTerminalBroadcastDB(t)
+	router := chi.NewRouter()
+	NewHandler(sqlDB, nil).RegisterRoutes(router)
+
+	cases := []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"empty ids array", `{"ids":[]}`, http.StatusBadRequest},
+		{"missing ids", `{}`, http.StatusBadRequest},
+		{"empty string entry", `{"ids":["t1",""]}`, http.StatusBadRequest},
+		{"valid ids", `{"ids":["t1","t2"]}`, http.StatusOK},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/tabs/reorder", bytes.NewBufferString(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Code != tc.status {
+				t.Fatalf("reorder %q status = %d body=%s, want %d", tc.name, rec.Code, rec.Body.String(), tc.status)
 			}
 		})
 	}
@@ -131,4 +163,38 @@ func loadTerminalsTestSettings(t *testing.T) *config.Store {
 		t.Fatalf("load settings: %v", err)
 	}
 	return settings
+}
+
+// TestCreateTerminalNameLengthUsesJSStringLength pins the terminal create handler's
+// name length validation to JavaScript String.prototype.length (UTF-16 code
+// units), matching the TS createTerminalSchema
+// (server/lib/validators/terminals.ts: name z.string().max(100)). An emoji is 1
+// rune but 2 UTF-16 units, so 51 emoji = 102 units must be rejected even though a
+// rune-count check would see only 51 and accept it.
+func TestCreateTerminalNameLengthUsesJSStringLength(t *testing.T) {
+	sqlDB := openTerminalBroadcastDB(t)
+	router := chi.NewRouter()
+	NewHandler(sqlDB, nil).RegisterRoutes(router)
+
+	// 51 emoji = 102 UTF-16 units: must be rejected by the name length guard
+	// (400) before any runtime/DB work. A rune-count check would see 51 and pass.
+	emoji51 := strings.Repeat("😀", 51)
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"chapterId":"chapter-1","name":"`+emoji51+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Invalid terminal create request") {
+		t.Fatalf("51-emoji name (102 UTF-16 units) should be rejected with 400, got %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 50 emoji = 100 UTF-16 units: passes the length guard (boundary). It must NOT
+	// fail with the length-validation 400 error.
+	emoji50 := strings.Repeat("😀", 50)
+	req2 := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"chapterId":"chapter-1","name":"`+emoji50+`"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code == http.StatusBadRequest && strings.Contains(rec2.Body.String(), "Invalid terminal create request") {
+		t.Fatalf("50-emoji name (100 UTF-16 units) should pass the length guard, got %d %s", rec2.Code, rec2.Body.String())
+	}
 }

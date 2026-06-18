@@ -116,6 +116,49 @@ func TestPermissionDenyRouteDoesNotMergeExitPlanUpdatedPlan(t *testing.T) {
 	}
 }
 
+// TestPermissionApproveAnswersMustBeStringValues mirrors permissionDecisionSchema
+// answers: z.record(z.string(), z.string()). Valid string-valued answers merge into
+// the tool-call input; a non-string answer value fails safeParse so TS drops ALL
+// optional updates (answers/updatedPlan/compactAfter) rather than merging them. Go
+// previously accepted map[string]any answers and merged non-string values.
+func TestPermissionApproveAnswersMustBeStringValues(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	insert := func(id string) {
+		if _, err := sqlDB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES (?, ?, ?, 'AskUserQuestion', '{}', 'pending', ?)`, id, narratorID, id+"-tu", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatalf("insert pending: %v", err)
+		}
+	}
+	readAnswers := func(id string) any {
+		var raw string
+		if err := sqlDB.QueryRow(`SELECT input_json FROM narrator_tool_calls WHERE id = ?`, id).Scan(&raw); err != nil {
+			t.Fatalf("load input: %v", err)
+		}
+		input := map[string]any{}
+		_ = json.Unmarshal([]byte(raw), &input)
+		return input["answers"]
+	}
+
+	// Valid string answers merge.
+	insert("req-ans-ok")
+	if w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/permissions/req-ans-ok/approve", map[string]any{"answers": map[string]any{"q1": "yes"}}); w.Code != http.StatusOK {
+		t.Fatalf("valid answers approve got %d body=%s", w.Code, w.Body.String())
+	}
+	if ans, ok := readAnswers("req-ans-ok").(map[string]any); !ok || ans["q1"] != "yes" {
+		t.Fatalf("valid string answers should merge, got %#v", readAnswers("req-ans-ok"))
+	}
+
+	// Non-string answer value -> safeParse fails -> answers dropped (not merged).
+	insert("req-ans-bad")
+	if w := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/permissions/req-ans-bad/approve", map[string]any{"answers": map[string]any{"q1": 123}}); w.Code != http.StatusOK {
+		t.Fatalf("non-string answers approve should still be 200 (TS drops, not rejects), got %d body=%s", w.Code, w.Body.String())
+	}
+	if got := readAnswers("req-ans-bad"); got != nil {
+		t.Fatalf("non-string answer value should be dropped, not merged, got %#v", got)
+	}
+}
+
 func TestNarratorSettingsMutationsBroadcastTSCompatibleEvents(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -245,13 +288,56 @@ func TestReasoningEffortAndModelBroadcastModelSettingsChanged(t *testing.T) {
 	}
 }
 
+func TestReasoningEffortPatchValidatesEnum(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+
+	// A present non-null reasoningEffort outside the enum must be rejected with 400,
+	// matching the TS PATCH /:id/reasoning-effort guard. Go previously persisted any
+	// arbitrary string to the column without validation.
+	bad := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/reasoning-effort", strings.NewReader(`{"reasoningEffort":"bogus"}`))
+	bad.Header.Set("Content-Type", "application/json")
+	if w := serveNarratorHandlerWithService(service, bad); w.Code != http.StatusBadRequest {
+		t.Fatalf("bogus reasoningEffort should be 400, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// A valid enum value is accepted and persisted.
+	good := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/reasoning-effort", strings.NewReader(`{"reasoningEffort":"medium"}`))
+	good.Header.Set("Content-Type", "application/json")
+	if w := serveNarratorHandlerWithService(service, good); w.Code < 200 || w.Code >= 300 {
+		t.Fatalf("valid reasoningEffort should succeed, got %d body=%s", w.Code, w.Body.String())
+	}
+	var stored string
+	if err := sqlDB.QueryRow(`SELECT reasoning_effort FROM narrators WHERE id = ?`, narratorID).Scan(&stored); err != nil {
+		t.Fatalf("read reasoning_effort: %v", err)
+	}
+	if stored != "medium" {
+		t.Fatalf("reasoning_effort = %q, want medium", stored)
+	}
+
+	// An explicit null clears the field (nullable), not a 400.
+	clear := httptest.NewRequest(http.MethodPatch, "/narrators/"+narratorID+"/reasoning-effort", strings.NewReader(`{"reasoningEffort":null}`))
+	clear.Header.Set("Content-Type", "application/json")
+	if w := serveNarratorHandlerWithService(service, clear); w.Code < 200 || w.Code >= 300 {
+		t.Fatalf("null reasoningEffort should clear (success), got %d body=%s", w.Code, w.Body.String())
+	}
+	var nullable sql.NullString
+	if err := sqlDB.QueryRow(`SELECT reasoning_effort FROM narrators WHERE id = ?`, narratorID).Scan(&nullable); err != nil {
+		t.Fatalf("read reasoning_effort after clear: %v", err)
+	}
+	if nullable.Valid && nullable.String != "" {
+		t.Fatalf("reasoning_effort should be cleared, got %q", nullable.String)
+	}
+}
+
 func TestPersistAgentErrorBroadcastsNarratorError(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
 	hub, events := captureNarratorBroadcasts()
 	service := &Service{DB: sqlDB, Hub: hub}
-
 	if err := service.persistAgentError(context.Background(), narratorID, errors.New("model exploded"), false); err != nil {
 		t.Fatalf("persistAgentError returned error: %v", err)
 	}
@@ -754,6 +840,68 @@ func TestGoalRESTMutationsBroadcastGoalsSetAndSoftCancel(t *testing.T) {
 	}
 }
 
+func TestNarratorDraftPutGetClearBroadcastsTSCompatibleShape(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	hub, events := captureNarratorBroadcasts()
+	service := &Service{DB: sqlDB, Hub: hub}
+
+	putReq := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/draft", strings.NewReader(`{"text":"queued draft prompt","sourceId":"msg-1"}`))
+	putReq.Header.Set("Content-Type", "application/json")
+	put := serveNarratorHandlerWithService(service, putReq)
+	if put.Code != http.StatusOK {
+		t.Fatalf("put draft got %d body=%s", put.Code, put.Body.String())
+	}
+	var putPayload map[string]any
+	if err := json.Unmarshal(put.Body.Bytes(), &putPayload); err != nil {
+		t.Fatalf("decode put draft: %v", err)
+	}
+	if putPayload["hasDraft"] != true || putPayload["text"] != "queued draft prompt" || putPayload["sourceId"] != "msg-1" {
+		t.Fatalf("unexpected put draft payload: %#v", putPayload)
+	}
+	event := waitForBroadcast(t, events, narratorID, "draft_changed")
+	if event["hasDraft"] != true || event["text"] != "queued draft prompt" || event["sourceId"] != "msg-1" {
+		t.Fatalf("unexpected draft_changed event: %#v", event)
+	}
+
+	getReq := httptest.NewRequest(http.MethodGet, "/narrators/"+narratorID+"/draft", nil)
+	get := serveNarratorHandlerWithService(service, getReq)
+	if get.Code != http.StatusOK {
+		t.Fatalf("get draft got %d body=%s", get.Code, get.Body.String())
+	}
+	var getPayload map[string]any
+	if err := json.Unmarshal(get.Body.Bytes(), &getPayload); err != nil {
+		t.Fatalf("decode get draft: %v", err)
+	}
+	if getPayload["hasDraft"] != true || getPayload["text"] != "queued draft prompt" || getPayload["sourceId"] != "msg-1" {
+		t.Fatalf("unexpected get draft payload: %#v", getPayload)
+	}
+
+	clearReq := httptest.NewRequest(http.MethodPut, "/narrators/"+narratorID+"/draft", strings.NewReader(`{"text":"   "}`))
+	clearReq.Header.Set("Content-Type", "application/json")
+	clear := serveNarratorHandlerWithService(service, clearReq)
+	if clear.Code != http.StatusOK {
+		t.Fatalf("clear draft got %d body=%s", clear.Code, clear.Body.String())
+	}
+	var clearPayload map[string]any
+	if err := json.Unmarshal(clear.Body.Bytes(), &clearPayload); err != nil {
+		t.Fatalf("decode clear draft: %v", err)
+	}
+	if clearPayload["hasDraft"] != false || clearPayload["text"] != "" || clearPayload["sourceId"] != nil {
+		t.Fatalf("unexpected clear draft payload: %#v", clearPayload)
+	}
+	draftEvents := 0
+	for _, ev := range events() {
+		if ev.NarratorID == narratorID && ev.Payload["type"] == "draft_changed" {
+			draftEvents++
+		}
+	}
+	if draftEvents != 2 {
+		t.Fatalf("expected put+clear draft_changed broadcasts, got %d events=%#v", draftEvents, events())
+	}
+}
+
 func TestAddGoalHandlerReturnsQueryErrorWithoutInsertingFallbackState(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -1231,7 +1379,20 @@ func TestNarratorBatchAndBufferValidateZodBoundsLikeTypeScript(t *testing.T) {
 	}{
 		{"batch-blocks empty", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []any{}}},
 		{"batch-blocks too many", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": tooManyBlocks}},
+		// Per-block Zod validation: messageId z.string().min(1), blockIndex
+		// z.number().int().min(0). TS rejects a malformed block with 400 BEFORE any
+		// deletion; Go previously counted them as failed and returned 200.
+		{"batch-blocks empty messageId", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []map[string]any{{"messageId": "", "blockIndex": 0}}}},
+		{"batch-blocks negative blockIndex", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []map[string]any{{"messageId": "m1", "blockIndex": -1}}}},
+		{"batch-blocks fractional blockIndex", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []map[string]any{{"messageId": "m1", "blockIndex": 1.5}}}},
+		{"batch-blocks missing blockIndex", http.MethodDelete, "/narrators/" + narratorID + "/messages/batch-blocks", map[string]any{"blocks": []map[string]any{{"messageId": "m1"}}}},
 		{"suggest empty questions", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []any{}}},
+		// Per-question Zod validation (suggestAnswersSchema): TS safeParse rejects a
+		// malformed question with 400 rather than silently dropping it.
+		{"suggest missing options", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []map[string]any{{"question": "q", "header": "h"}}}},
+		{"suggest option missing description", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []map[string]any{{"question": "q", "header": "h", "options": []map[string]any{{"label": "a"}}}}}},
+		{"suggest empty question text", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []map[string]any{{"question": "", "header": "h", "options": []any{}}}}},
+		{"suggest non-bool multiSelect", http.MethodPost, "/narrators/" + narratorID + "/suggest-answers", map[string]any{"questions": []map[string]any{{"question": "q", "header": "h", "options": []any{}, "multiSelect": "yes"}}}},
 		{"buffer text empty", http.MethodPatch, "/narrators/" + narratorID + "/buffer/buf1", map[string]any{"text": "  "}},
 		{"buffer text overlong", http.MethodPatch, "/narrators/" + narratorID + "/buffer/buf1", map[string]any{"text": longText}},
 		{"reorder empty ids", http.MethodPut, "/narrators/" + narratorID + "/buffer/reorder", map[string]any{"orderedIds": []string{}}},
@@ -1245,9 +1406,29 @@ func TestNarratorBatchAndBufferValidateZodBoundsLikeTypeScript(t *testing.T) {
 	}
 }
 
-// Wave 298: Go segment-compact must mirror the TypeScript segmentCompactSchema
-// messageIds bound (max 500, non-empty entries) while keeping the Go from/to range
-// extension; out-of-range messageIds reject with 400.
+// TestValidateSuggestAnswersQuestionsAcceptsWellFormed confirms the strict
+// suggestAnswersSchema mirror accepts a valid questions array (non-empty
+// question/header, options array with string label+description, optional bool
+// multiSelect) so the added validation does not reject legitimate requests.
+func TestValidateSuggestAnswersQuestionsAcceptsWellFormed(t *testing.T) {
+	valid := []any{
+		map[string]any{
+			"question": "Which approach?",
+			"header":   "Approach",
+			"options": []any{
+				map[string]any{"label": "A", "description": "First"},
+				map[string]any{"label": "B", "description": "Second"},
+			},
+			"multiSelect": true,
+		},
+		// Empty options array is allowed (z.array with no .min()).
+		map[string]any{"question": "Q2", "header": "H2", "options": []any{}},
+	}
+	if err := validateSuggestAnswersQuestions(valid); err != nil {
+		t.Fatalf("well-formed questions should pass, got %v", err)
+	}
+}
+
 func TestSegmentCompactMessageIdsValidateZodBoundsLikeTypeScript(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
@@ -1364,4 +1545,92 @@ func openNarratorSkillsTestDB(t *testing.T) *sql.DB {
 		}
 	}
 	return sqlDB
+}
+
+// TestRollbackPreviewBlockIndexValidationMatchesTS pins the rollback-preview
+// query-param validation to server/routes/narrators.ts: params are validated
+// BEFORE the narrator lookup (so a bad/missing blockIndex returns 400 even when
+// the narrator does not exist), missing blockIndex returns the "required"
+// message, and a NaN/negative blockIndex returns the "must be a non-negative
+// integer" message. parseIntJS also accepts a leading-digit prefix like "3abc".
+func TestRollbackPreviewBlockIndexValidationMatchesTS(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+
+	// messageId missing -> 400 required (narrator does not exist, but validation
+	// runs first so the result is 400, not 404).
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/ghost/rollback-preview")
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "messageId query param is required") {
+		t.Fatalf("missing messageId should be 400 required, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// blockIndex missing -> 400 required (validated before the narrator lookup).
+	w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/ghost/rollback-preview?messageId=m1")
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "blockIndex query param is required") {
+		t.Fatalf("missing blockIndex should be 400 required, got %d body=%s", w.Code, w.Body.String())
+	}
+
+	// blockIndex non-numeric / negative -> 400 must-be-non-negative.
+	for _, bad := range []string{"abc", "-1", "x9"} {
+		w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/ghost/rollback-preview?messageId=m1&blockIndex="+bad)
+		if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "blockIndex must be a non-negative integer") {
+			t.Fatalf("blockIndex=%q should be 400 non-negative, got %d body=%s", bad, w.Code, w.Body.String())
+		}
+	}
+
+	// Valid params on a non-existent narrator pass validation and reach the
+	// narrator lookup -> 404 (proving the param checks did NOT short-circuit a
+	// well-formed request). A leading-digit prefix "3abc" is accepted as 3.
+	for _, okIdx := range []string{"0", "3abc"} {
+		w = serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/ghost/rollback-preview?messageId=m1&blockIndex="+okIdx)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("blockIndex=%q with unknown narrator should reach lookup -> 404, got %d body=%s", okIdx, w.Code, w.Body.String())
+		}
+	}
+}
+
+// TestUpdateBoolEndpointsValidateBooleanAndExistenceLikeTS pins the shared
+// fast-mode/relaxed-plan/prune-enabled PATCH handlers (updateBool) to the TS
+// routes (server/routes/narrators.ts): a missing or non-boolean field rejects
+// with 400 "<field> must be a boolean" (typeof check), and an unknown narrator
+// returns 404 (getById existence check) — Go previously decoded a missing field
+// to false and updated 0 rows while still returning ok.
+func TestUpdateBoolEndpointsValidateBooleanAndExistenceLikeTS(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	endpoints := []struct {
+		path string
+		key  string
+	}{
+		{"/narrators/" + narratorID + "/fast-mode", "fastMode"},
+		{"/narrators/" + narratorID + "/relaxed-plan", "relaxedPlan"},
+		{"/narrators/" + narratorID + "/prune-enabled", "pruneEnabled"},
+	}
+	for _, ep := range endpoints {
+		// Missing field -> 400 (not silent false).
+		missing := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, ep.path, map[string]any{})
+		if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), ep.key+" must be a boolean") {
+			t.Fatalf("%s missing field should be 400 boolean error, got %d body=%s", ep.path, missing.Code, missing.Body.String())
+		}
+		// Non-boolean field -> 400.
+		for _, bad := range []any{"true", 1, nil} {
+			w := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, ep.path, map[string]any{ep.key: bad})
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), ep.key+" must be a boolean") {
+				t.Fatalf("%s non-boolean %#v should be 400, got %d body=%s", ep.path, bad, w.Code, w.Body.String())
+			}
+		}
+		// Valid boolean -> 200.
+		ok := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, ep.path, map[string]any{ep.key: true})
+		if ok.Code != http.StatusOK {
+			t.Fatalf("%s valid boolean should be 200, got %d body=%s", ep.path, ok.Code, ok.Body.String())
+		}
+	}
+
+	// Unknown narrator with a valid boolean -> 404 (existence check).
+	unknown := serveNarratorHandlerJSON(sqlDB, http.MethodPatch, "/narrators/ghost/relaxed-plan", map[string]any{"relaxedPlan": true})
+	if unknown.Code != http.StatusNotFound {
+		t.Fatalf("unknown narrator should be 404, got %d body=%s", unknown.Code, unknown.Body.String())
+	}
 }

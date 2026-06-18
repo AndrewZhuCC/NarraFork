@@ -2,7 +2,12 @@
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { initKiro, kiroChatRaw, kiroSnapshot, type KiroChatRequest } from "../../server/lib/kiro-adapter";
+import {
+	initKiro,
+	type KiroChatRequest,
+	kiroChatRaw,
+	kiroSnapshot,
+} from "../../server/lib/kiro-adapter";
 
 function readStdin(): string {
 	return readFileSync(0, "utf8");
@@ -54,7 +59,9 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-	process.stderr.write(`${error instanceof Error ? error.stack || error.message : String(error)}\n`);
+	process.stderr.write(
+		`${error instanceof Error ? error.stack || error.message : String(error)}\n`,
+	);
 	const diagnostic = sanitizedKiroDiagnostic();
 	if (diagnostic) {
 		process.stderr.write(`Kiro bridge diagnostic: ${diagnostic}\n`);

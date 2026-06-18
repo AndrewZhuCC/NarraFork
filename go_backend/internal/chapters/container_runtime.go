@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +27,10 @@ const (
 	containerCommandOutputLimit = 64 * 1024
 	composeFileReadLimit        = 512 * 1024
 )
+
+// composePortPrefixRe mirrors the TS regex /^(\d+):(\d+)/ used to parse compose
+// "ports:" entries: it matches only a leading numeric host:container pair.
+var composePortPrefixRe = regexp.MustCompile(`^(\d+):(\d+)`)
 
 var chapterContainerLocks = struct {
 	sync.Mutex
@@ -277,6 +282,83 @@ func (s *Service) removeChapterContainersIfPossible(ctx context.Context, ch Chap
 	_ = s.removeContainerRecordsAndPorts(ctx, ch.ID)
 }
 
+// inspectContainerRunning reports whether a container is actually running per
+// `podman inspect`. A missing container (non-zero exit) is treated as not
+// running. runLimited combines stdout+stderr so provider/rootless warning noise
+// is tolerated by matching the boolean token rather than requiring exact output.
+func inspectContainerRunning(ctx context.Context, containerID string) bool {
+	containerID = strings.TrimSpace(containerID)
+	if containerID == "" {
+		return false
+	}
+	out, err := runLimited(ctx, "", "podman", "inspect", "--format", "{{.State.Running}}", containerID)
+	if err != nil {
+		return false
+	}
+	for _, field := range strings.Fields(stripANSIEscapes(out)) {
+		switch field {
+		case "true":
+			return true
+		case "false":
+			return false
+		}
+	}
+	return false
+}
+
+// ReconcileContainerStatesOnStartup marks container_instances rows that are
+// recorded as running but whose Podman container is actually gone/stopped as
+// "stopped". This mirrors the TypeScript reconcileContainerStates() invoked at
+// server startup: after a restart where rootless containers did not survive, the
+// DB would otherwise keep reporting them running and the proxy/UI would target
+// dead container IPs. Returns the number of rows marked stale. It is a no-op
+// when Podman is unavailable so a missing runtime never erases recorded state.
+func (s *Service) ReconcileContainerStatesOnStartup(ctx context.Context) (int, error) {
+	if s == nil || s.DB == nil {
+		return 0, nil
+	}
+	if !commandExists("podman") {
+		return 0, nil
+	}
+	rows, err := s.DB.QueryContext(ctx, `SELECT id, container_id FROM container_instances WHERE status = 'running'`)
+	if err != nil {
+		return 0, err
+	}
+	type runningInstance struct {
+		id          string
+		containerID string
+	}
+	instances := []runningInstance{}
+	for rows.Next() {
+		var id string
+		var containerID sql.NullString
+		if err := rows.Scan(&id, &containerID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		instances = append(instances, runningInstance{id: id, containerID: strings.TrimSpace(containerID.String)})
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	stale := 0
+	for _, inst := range instances {
+		// Without a container id we cannot inspect; leave the row untouched (TS
+		// also skips instances lacking a container id).
+		if inst.containerID == "" {
+			continue
+		}
+		if inspectContainerRunning(ctx, inst.containerID) {
+			continue
+		}
+		if _, err := s.DB.ExecContext(ctx, `UPDATE container_instances SET status = 'stopped', updated_at = ? WHERE id = ?`, db.NowISO(), inst.id); err != nil {
+			return stale, err
+		}
+		stale++
+	}
+	return stale, nil
+}
+
 func commandExists(name string) bool {
 	_, err := os.Stat(name)
 	if err == nil && strings.ContainsRune(name, filepath.Separator) {
@@ -395,28 +477,27 @@ func sanitizeComposeName(value string) string {
 }
 
 func generateProxyLabel(chapterShortID, serviceName string, containerPort int) string {
-	serviceName = strings.ToLower(strings.TrimSpace(serviceName))
+	// Mirror TS generateProxyLabel (server/services/container-proxy.ts):
+	// serviceName.toLowerCase().replace(/[^a-z0-9-]/g, "-"). Each character that
+	// is not [a-z0-9-] becomes a single dash; existing dashes are kept and
+	// consecutive dashes are NOT collapsed; there is no whitespace trim, no
+	// leading/trailing dash trim, and no "service" fallback.
+	lowered := strings.ToLower(serviceName)
 	var b strings.Builder
-	lastDash := false
-	for _, r := range serviceName {
-		ok := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		if ok {
+	for _, r := range lowered {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
 			b.WriteRune(r)
-			lastDash = false
-		} else if !lastDash {
+		} else {
 			b.WriteByte('-')
-			lastDash = true
 		}
 	}
-	sanitized := strings.Trim(b.String(), "-")
-	if sanitized == "" {
-		sanitized = "service"
-	}
-	return fmt.Sprintf("%s-%s-%d", chapterShortID, sanitized, containerPort)
+	return fmt.Sprintf("%s-%s-%d", chapterShortID, b.String(), containerPort)
 }
 
 func buildProxyURL(label, domain string, port int) string {
-	if port == 80 || port == 0 {
+	// Mirror TS buildProxyUrl: only port 80 omits the port suffix; every other
+	// port (including 0) is appended.
+	if port == 80 {
 		return fmt.Sprintf("http://%s.%s", label, domain)
 	}
 	return fmt.Sprintf("http://%s.%s:%d", label, domain, port)
@@ -468,8 +549,32 @@ func isPastaBackend(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	backend := strings.ToLower(strings.Trim(strings.TrimSpace(out), "'\""))
+	backend := parseRootlessNetworkBackend(out)
 	return backend == "pasta" || backend == "passt"
+}
+
+// parseRootlessNetworkBackend extracts the rootless network backend token from
+// `podman info --format {{.Host.RootlessNetworkCmd}}` output. runLimited combines
+// stdout+stderr, so a rootless/provider warning line can precede the real value;
+// scanning ANSI-stripped, quote-trimmed tokens for a known backend keyword keeps
+// detection robust (mirrors the W446/W447 stdout-noise hardening) instead of
+// trimming the whole blob, which would silently fail to match and wrongly block
+// proxy mode. Falls back to the last non-empty token when no keyword is present
+// so a clean single-line value (e.g. "slirp4netns") is still surfaced.
+func parseRootlessNetworkBackend(out string) string {
+	fields := strings.Fields(stripANSIEscapes(out))
+	last := ""
+	for _, field := range fields {
+		token := strings.ToLower(strings.Trim(strings.TrimSpace(field), "'\""))
+		if token == "" {
+			continue
+		}
+		if token == "pasta" || token == "passt" || token == "slirp4netns" {
+			return token
+		}
+		last = token
+	}
+	return last
 }
 
 func writeProxyOverride(worktreePath string, services []map[string]any) (string, error) {
@@ -591,17 +696,21 @@ func parseComposeServicesFromData(data string) []map[string]any {
 	return services
 }
 
+// parseComposePort mirrors the TypeScript compose port parsing in
+// parseComposeYaml (server/services/container-service.ts), which matches the
+// regex /^(\d+):(\d+)/ against the port entry: ONLY the leading numeric
+// "host:container" form is accepted. A single port with no colon ("3000"), an
+// IP-prefixed mapping ("127.0.0.1:8080:80"), or any non-numeric leading segment
+// does NOT match and is skipped (returns 0,0). The "/tcp" protocol suffix and a
+// trailing ":extra" segment are ignored because the regex is a prefix match.
 func parseComposePort(value string) (int, int) {
-	value = strings.SplitN(value, "/", 2)[0]
-	parts := strings.Split(value, ":")
-	if len(parts) == 1 {
-		container, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
-		return 0, container
+	value = strings.TrimSpace(value)
+	matches := composePortPrefixRe.FindStringSubmatch(value)
+	if matches == nil {
+		return 0, 0
 	}
-	hostText := parts[len(parts)-2]
-	containerText := parts[len(parts)-1]
-	host, _ := strconv.Atoi(strings.TrimSpace(hostText))
-	container, _ := strconv.Atoi(strings.TrimSpace(containerText))
+	host, _ := strconv.Atoi(matches[1])
+	container, _ := strconv.Atoi(matches[2])
 	return host, container
 }
 
@@ -610,15 +719,25 @@ func parseContainerJSONList(out string) []map[string]any {
 	if out == "" {
 		return nil
 	}
-	var items []map[string]any
-	if err := json.Unmarshal([]byte(out), &items); err == nil {
+	if items := parseContainerJSONListStrict(out); items != nil {
 		return items
 	}
-	var single map[string]any
-	if err := json.Unmarshal([]byte(out), &single); err == nil {
-		return []map[string]any{single}
+	// runLimitedEnv combines stdout+stderr, so the compose provider can prefix
+	// the JSON payload with ANSI escapes and warning lines (e.g. podman-compose's
+	// "Executing external compose provider..." / "WARNING:podman_compose:..."). TS
+	// reads clean stdout, so to match it we strip ANSI escapes and re-parse from
+	// each array/object delimiter until one yields valid JSON.
+	cleaned := stripANSIEscapes(out)
+	for idx := 0; idx < len(cleaned); idx++ {
+		if cleaned[idx] != '[' && cleaned[idx] != '{' {
+			continue
+		}
+		if items := parseContainerJSONListStrict(strings.TrimSpace(cleaned[idx:])); items != nil {
+			return items
+		}
 	}
-	for _, line := range strings.Split(out, "\n") {
+	items := []map[string]any{}
+	for _, line := range strings.Split(cleaned, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -629,6 +748,42 @@ func parseContainerJSONList(out string) []map[string]any {
 		}
 	}
 	return items
+}
+
+// parseContainerJSONListStrict parses a JSON array or single object of container
+// records, returning nil when the input is not parseable as either.
+func parseContainerJSONListStrict(out string) []map[string]any {
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(out), &items); err == nil {
+		return items
+	}
+	var single map[string]any
+	if err := json.Unmarshal([]byte(out), &single); err == nil {
+		return []map[string]any{single}
+	}
+	return nil
+}
+
+// stripANSIEscapes removes ANSI/VT100 escape sequences (e.g. "\x1b[4m") that
+// compose providers may emit into the combined stdout+stderr stream.
+func stripANSIEscapes(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			// Skip CSI sequence: ESC '[' ... final byte in 0x40-0x7e.
+			i += 2
+			for i < len(s) && (s[i] < 0x40 || s[i] > 0x7e) {
+				i++
+			}
+			continue // i now at final byte; loop's i++ skips it
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 func containerPortsFromRaw(raw map[string]any) []int {
@@ -708,11 +863,15 @@ func inspectContainerIP(ctx context.Context, containerID string) string {
 	if err != nil {
 		return ""
 	}
-	fields := strings.Fields(out)
-	if len(fields) == 0 {
-		return ""
+	// runLimited combines stdout+stderr; strip ANSI and pick the first token that
+	// actually parses as an IP so provider/rootless warnings don't masquerade as
+	// the container IP.
+	for _, field := range strings.Fields(stripANSIEscapes(out)) {
+		if net.ParseIP(field) != nil {
+			return field
+		}
 	}
-	return fields[0]
+	return ""
 }
 
 func (h *Handler) inspectContainerExposedPorts(ctx context.Context, containerID string) []int {
@@ -732,8 +891,8 @@ func inspectContainerExposedPorts(ctx context.Context, containerID string) []int
 	if out == "" || out == "<nil>" || out == "null" {
 		return nil
 	}
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(out), &parsed); err != nil {
+	parsed := parseExposedPortsObject(out)
+	if parsed == nil {
 		return nil
 	}
 	ports := []int{}
@@ -745,6 +904,29 @@ func inspectContainerExposedPorts(ctx context.Context, containerID string) []int
 	}
 	sort.Ints(ports)
 	return ports
+}
+
+// parseExposedPortsObject parses the `{json .Config.ExposedPorts}` payload of
+// `podman inspect`. Because runLimited combines stdout+stderr, the JSON object
+// can be prefixed with ANSI escapes / provider or rootless warnings; mirror
+// parseContainerJSONList's tolerance by stripping ANSI and scanning '{'
+// delimiters until one yields a valid object.
+func parseExposedPortsObject(out string) map[string]any {
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(out), &parsed); err == nil {
+		return parsed
+	}
+	cleaned := stripANSIEscapes(out)
+	for idx := 0; idx < len(cleaned); idx++ {
+		if cleaned[idx] != '{' {
+			continue
+		}
+		var candidate map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(cleaned[idx:])), &candidate); err == nil {
+			return candidate
+		}
+	}
+	return nil
 }
 
 func enrichContainerProxyURL(items []map[string]any, domain string, port int) []map[string]any {
@@ -1028,10 +1210,53 @@ func (s *Service) startChapterContainersLocked(ctx context.Context, ch Chapter) 
 	if err != nil {
 		return err
 	}
+	// Legacy (non-proxy) mode: compose ps does not carry the host port that was
+	// allocated and injected via PORT_<n> env, so merge the allocated mapping's
+	// hostPort into the matching-service instance before persisting. This mirrors
+	// the TypeScript _recordContainerInstances `userMapping?.hostPort` fallback so
+	// Go persists the host port (and keeps the port_allocations row) the same way.
+	if proxyInfo == nil && len(mappings) > 0 {
+		mergeAllocatedHostPorts(items, mappings)
+	}
 	if proxyInfo != nil && len(items) == 0 {
 		return httpx.BadRequest("No proxy routes resolved from running containers. Check compose service ports or image EXPOSE settings.")
 	}
 	return s.persistContainerInstances(ctx, ch.ID, items)
+}
+
+// mergeAllocatedHostPorts fills in each instance's hostPort/containerPort from
+// the allocated port mappings (keyed by service name) when compose ps did not
+// surface a published port. Mirrors the TypeScript legacy-mode userMapping
+// fallback so non-proxy starts persist the allocated host port (and keep the
+// port_allocations row).
+func mergeAllocatedHostPorts(items []map[string]any, mappings []map[string]any) {
+	if len(items) == 0 || len(mappings) == 0 {
+		return
+	}
+	byService := map[string]map[string]any{}
+	for _, mapping := range mappings {
+		service := stringValue(mapping["serviceName"])
+		if service != "" {
+			byService[service] = mapping
+		}
+	}
+	for _, item := range items {
+		if intValue(item["hostPort"]) > 0 {
+			continue // ps already surfaced a published host port
+		}
+		mapping := byService[stringValue(item["serviceName"])]
+		if mapping == nil {
+			continue
+		}
+		if hostPort := intValue(mapping["hostPort"]); hostPort > 0 {
+			item["hostPort"] = hostPort
+		}
+		if intValue(item["containerPort"]) <= 0 {
+			if containerPort := intValue(mapping["containerPort"]); containerPort > 0 {
+				item["containerPort"] = containerPort
+			}
+		}
+	}
 }
 
 func (s *Service) removeChapterContainersLocked(ctx context.Context, ch Chapter, deleteVolumes bool) error {

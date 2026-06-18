@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -183,12 +184,13 @@ func (a *hangingAdapter) BuildHistory(messages []Message, _ string, _ string) (B
 func (a *hangingAdapter) InjectSystemPrompt(*BuiltHistory, string, string, string) {}
 func (a *hangingAdapter) Chat(ctx context.Context, params ChatParams) (<-chan StreamEvent, error) {
 	a.chatCalls++
-	a.done = make(chan struct{})
+	done := make(chan struct{})
+	a.done = done
 	ch := make(chan StreamEvent)
 	go func() {
 		<-ctx.Done()
 		close(ch)
-		close(a.done)
+		close(done)
 	}()
 	return ch, nil
 }
@@ -199,22 +201,40 @@ func (a *hangingAdapter) PushUserTurn(history *BuiltHistory, content string, too
 func (a *hangingAdapter) PushAssistantTurn(history *BuiltHistory, text string, toolUses []ToolCall, rawContent any) {
 }
 
-func TestFirstTokenTimeoutEmitsTerminalEventWithoutRetry(t *testing.T) {
+func TestFirstTokenTimeoutRetriesAndExhaustsToRetryableError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	adapter := &hangingAdapter{}
-	stream := runAgentLoop(ctx, ProviderResolution{Provider: "fake", Model: "model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithMaxTurns(1), WithFirstTokenTimeout(5*time.Millisecond), WithMaxChatRetries(3)))
+	// Mirror TS loop.ts: a first-token timeout is retried up to maxFirstTokenRetries
+	// (here 2) with `retrying` events, then surfaces a retryable_error (NOT a
+	// terminal first_token_timeout). 3 total chat attempts = 1 initial + 2 retries.
+	stream := runAgentLoop(ctx, ProviderResolution{Provider: "fake", Model: "model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithMaxTurns(1), WithFirstTokenTimeout(5*time.Millisecond), WithMaxChatRetries(2), WithRetryBaseDelay(0)))
 	events := collectEvents(stream)
-	if eventTypeCount(events, "first_token_timeout") != 1 {
-		t.Fatalf("expected first_token_timeout event, got %v", eventTypes(events))
+	if eventTypeCount(events, "retrying") != 2 {
+		t.Fatalf("expected 2 retrying events for first-token timeout, got %v", eventTypes(events))
 	}
-	if eventTypeCount(events, "retrying") != 0 || adapter.chatCalls != 1 {
-		t.Fatalf("first-token timeout should not enter transient retry loop, events=%v chatCalls=%d", eventTypes(events), adapter.chatCalls)
+	if eventTypeCount(events, "retryable_error") != 1 {
+		t.Fatalf("expected retryable_error after exhausting first-token retries, got %v", eventTypes(events))
 	}
-	select {
-	case <-adapter.done:
-	case <-time.After(time.Second):
-		t.Fatalf("first-token timeout should cancel the provider stream context")
+	if eventTypeCount(events, "first_token_timeout") != 0 {
+		t.Fatalf("first-token timeout should no longer emit a terminal first_token_timeout event, got %v", eventTypes(events))
+	}
+	if adapter.chatCalls != 3 {
+		t.Fatalf("expected 3 chat attempts (1 + 2 retries), got %d", adapter.chatCalls)
+	}
+}
+
+func TestFirstTokenTimeoutZeroRetriesEmitsRetryableErrorImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adapter := &hangingAdapter{}
+	stream := runAgentLoop(ctx, ProviderResolution{Provider: "fake", Model: "model", Adapter: adapter}, []Message{{Role: "user", Content: "hi"}}, t.TempDir(), normalizeGenerateOptions(WithMaxTurns(1), WithFirstTokenTimeout(5*time.Millisecond), WithMaxChatRetries(0), WithRetryBaseDelay(0)))
+	events := collectEvents(stream)
+	if eventTypeCount(events, "retrying") != 0 {
+		t.Fatalf("zero retries should not emit retrying, got %v", eventTypes(events))
+	}
+	if eventTypeCount(events, "retryable_error") != 1 || adapter.chatCalls != 1 {
+		t.Fatalf("expected immediate retryable_error with one chat attempt, events=%v chatCalls=%d", eventTypes(events), adapter.chatCalls)
 	}
 }
 
@@ -536,7 +556,7 @@ func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
 		{{Parsed: ParsedStreamEvent{ToolUses: calls}}},
 		{{Parsed: ParsedStreamEvent{Text: "final"}}},
 	}}
-	seenCount := 0
+	seenCount := int64(0)
 	stream := runAgentLoop(
 		context.Background(),
 		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
@@ -551,7 +571,9 @@ func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
 				if request.Phase != "tool_result" {
 					return nil
 				}
-				seenCount = request.CompletedToolCount
+				// The collector runs from parallel tool-execution goroutines, so use an
+				// atomic store to avoid a benign test-level data race on seenCount.
+				atomic.StoreInt64(&seenCount, int64(request.CompletedToolCount))
 				if request.CompletedToolCount != 4 {
 					return nil
 				}
@@ -560,8 +582,8 @@ func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
 		),
 	)
 	events := collectEvents(stream)
-	if seenCount != 4 {
-		t.Fatalf("expected sidecar collector at 4 completed tools, got %d", seenCount)
+	if atomic.LoadInt64(&seenCount) != 4 {
+		t.Fatalf("expected sidecar collector at 4 completed tools, got %d", atomic.LoadInt64(&seenCount))
 	}
 	var sideCarEvent *AgentEvent
 	for i := range events {
@@ -580,6 +602,72 @@ func TestRunAgentLoopCollectsToolResultSideCarsForModelAndEvents(t *testing.T) {
 	content, _ := fourth["content"].(string)
 	if !strings.Contains(content, "output tool-4\n\n<side_car") || !strings.Contains(content, `source="todo_reminder"`) || !strings.Contains(content, "todo detail") {
 		t.Fatalf("expected fourth model tool result to include sidecar text, got %#v", fourth)
+	}
+}
+
+// TestDrainSettledToolResultsStopsAtUnsettledPrefix pins the drain-prefix
+// contract: drainSettledToolResults emits tool_result events (and assigns
+// completedToolCount via ensureOutcomeSideCars) strictly in call order. When an
+// earlier tool has not settled yet, draining must STOP rather than skip ahead to
+// a later tool that happens to be ready. Skipping ahead would let a later tool be
+// counted first and mis-attribute cadence-based sidecars (e.g. todo reminders) to
+// the wrong tool result. This guards the regression exposed by the progress
+// ticker timing change.
+func TestDrainSettledToolResultsStopsAtUnsettledPrefix(t *testing.T) {
+	calls := []ToolCall{
+		newFunctionToolCall("tool-1", "Read", `{"file_path":"a"}`),
+		newFunctionToolCall("tool-2", "Read", `{"file_path":"b"}`),
+		newFunctionToolCall("tool-3", "Read", `{"file_path":"c"}`),
+		newFunctionToolCall("tool-4", "Read", `{"file_path":"d"}`),
+	}
+	settled := func(id string) <-chan toolExecOutcome {
+		ch := make(chan toolExecOutcome, 1)
+		ch <- toolExecOutcome{Run: ToolRun{ID: id, Name: "Read", Output: "output " + id, Status: "completed"}}
+		return ch
+	}
+	pending := func() <-chan toolExecOutcome { return make(chan toolExecOutcome) }
+
+	state := newTurnState(0, 0)
+	state.toolUses = calls
+	// tool-1, tool-2 settled; tool-3 still pending; tool-4 already settled.
+	state.earlyExec = map[string]<-chan toolExecOutcome{
+		"tool-1": settled("tool-1"),
+		"tool-2": settled("tool-2"),
+		"tool-3": pending(),
+		"tool-4": settled("tool-4"),
+	}
+
+	out := make(chan AgentEvent, 16)
+	completedCounts := []int{}
+	options := normalizeGenerateOptions(
+		WithSideCarCollector(0, func(ctx context.Context, request SideCarRequest) []AgentSideCar {
+			completedCounts = append(completedCounts, request.CompletedToolCount)
+			return nil
+		}, nil),
+	)
+	if !drainSettledToolResults(context.Background(), out, state, options) {
+		t.Fatalf("drain returned false unexpectedly")
+	}
+	close(out)
+	emitted := []string{}
+	for ev := range out {
+		if ev.Type == "tool_result" {
+			emitted = append(emitted, ev.ToolUseID)
+		}
+	}
+	// Only the in-order settled prefix (tool-1, tool-2) should be drained; tool-4
+	// must NOT jump ahead of the still-pending tool-3.
+	if len(emitted) != 2 || emitted[0] != "tool-1" || emitted[1] != "tool-2" {
+		t.Fatalf("expected drain prefix [tool-1 tool-2], got %v", emitted)
+	}
+	if state.completedToolCount != 2 {
+		t.Fatalf("expected completedToolCount=2 after prefix drain, got %d", state.completedToolCount)
+	}
+	if len(completedCounts) != 2 || completedCounts[0] != 1 || completedCounts[1] != 2 {
+		t.Fatalf("expected sidecar counts [1 2] in call order, got %v", completedCounts)
+	}
+	if state.yieldedToolResults["tool-4"] {
+		t.Fatalf("tool-4 must not be yielded ahead of pending tool-3")
 	}
 }
 
@@ -922,6 +1010,57 @@ func TestRunAgentLoopEmptyResponseRetriesThenInvalidState(t *testing.T) {
 	if eventTypeCount(events, "retrying") != 1 || events[len(events)-1].Type != "invalid_state" {
 		t.Fatalf("expected retrying then invalid_state, got %#v", eventTypes(events))
 	}
+	// Mirror the TS EMPTY_RESPONSE_MESSAGE surfaced in both the retrying and the
+	// final invalid_state events.
+	for _, ev := range events {
+		if ev.Type == "retrying" || ev.Type == "invalid_state" {
+			if !strings.Contains(ev.Message, "Provider returned an empty response") || !strings.Contains(ev.Message, "API configuration error") {
+				t.Fatalf("expected TS empty-response message on %s, got %q", ev.Type, ev.Message)
+			}
+		}
+	}
+}
+
+func TestRunAgentLoopWebSearchOnlyResponseNotTreatedAsEmpty(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{WebSearch: &WebSearchEvent{Status: "completed", Query: "golang"}}}},
+		{{Parsed: ParsedStreamEvent{Text: "done"}}},
+	}}
+	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter}, []Message{{Role: "user", Content: "search"}}, t.TempDir(), normalizeGenerateOptions(WithRetryBaseDelay(0), WithEmptyResponseRetries(2)))
+	events := collectEvents(stream)
+	// A web-search-only turn carries meaningful content, so it must not be treated
+	// as an empty response (no retrying / empty_response invalid_state).
+	if eventTypeCount(events, "retrying") != 0 {
+		t.Fatalf("web-search-only response must not trigger empty-response retry, got %v", eventTypes(events))
+	}
+	for _, ev := range events {
+		if ev.Type == "invalid_state" && ev.Reason == "empty_response" {
+			t.Fatalf("web-search-only response must not be classified as empty_response, got %v", eventTypes(events))
+		}
+	}
+	if events[len(events)-1].Type != "done" {
+		t.Fatalf("expected run to complete with done, got %v", eventTypes(events))
+	}
+}
+
+func TestRunAgentLoopImageGenerationOnlyResponseNotTreatedAsEmpty(t *testing.T) {
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ImageGeneration: &ImageGenerationEvent{Status: "completed"}}}},
+		{{Parsed: ParsedStreamEvent{Text: "done"}}},
+	}}
+	stream := runAgentLoop(context.Background(), ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter}, []Message{{Role: "user", Content: "image"}}, t.TempDir(), normalizeGenerateOptions(WithRetryBaseDelay(0), WithEmptyResponseRetries(2)))
+	events := collectEvents(stream)
+	if eventTypeCount(events, "retrying") != 0 {
+		t.Fatalf("image-generation-only response must not trigger empty-response retry, got %v", eventTypes(events))
+	}
+	for _, ev := range events {
+		if ev.Type == "invalid_state" && ev.Reason == "empty_response" {
+			t.Fatalf("image-generation-only response must not be classified as empty_response, got %v", eventTypes(events))
+		}
+	}
+	if events[len(events)-1].Type != "done" {
+		t.Fatalf("expected run to complete with done, got %v", eventTypes(events))
+	}
 }
 
 func TestRunAgentLoopStreamingToolChunksExtractFields(t *testing.T) {
@@ -1026,4 +1165,44 @@ func TestRunAgentLoopEmitsToolRuntimeProgressOutputAndLongRunning(t *testing.T) 
 	if eventTypeCount(events, "tool_output") == 0 || eventTypeCount(events, "tool_long_running") == 0 || eventTypeCount(events, "tool_progress") == 0 {
 		t.Fatalf("expected runtime output/long-running/progress events, got %v", eventTypes(events))
 	}
+}
+
+// TestExecuteToolCallTickerDoesNotEmitAfterReturn guards the fix for the
+// send-on-closed-channel race: with a very small progress interval and a tool
+// that produces many ticks, the progress ticker goroutine must fully exit before
+// executeToolCall returns, so the agent loop can close `out` without a panic or
+// race. Run under `go test -race` to catch regressions.
+func TestExecuteToolCallTickerDoesNotEmitAfterReturn(t *testing.T) {
+	oldProgress := toolProgressInterval
+	toolProgressInterval = time.Millisecond
+	defer func() { toolProgressInterval = oldProgress }()
+	// Two sequential tool turns so the loop spawns and tears down tickers twice.
+	callA := newFunctionToolCall("ticker-A", "Read", `{"file_path":"a.txt"}`)
+	callB := newFunctionToolCall("ticker-B", "Read", `{"file_path":"b.txt"}`)
+	adapter := &scriptedAdapter{turns: [][]StreamEvent{
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{callA}}}},
+		{{Parsed: ParsedStreamEvent{ToolUses: []ToolCall{callB}}}},
+		{{Parsed: ParsedStreamEvent{Text: "done"}}},
+	}}
+	stream := runAgentLoop(
+		context.Background(),
+		ProviderResolution{Provider: "fake", Model: "fake-model", Adapter: adapter},
+		[]Message{{Role: "user", Content: "go"}},
+		t.TempDir(),
+		normalizeGenerateOptions(
+			WithRetryBaseDelay(0),
+			WithToolExecutor(func(ctx context.Context, cwd string, call ToolCall) (ToolRun, error) {
+				// Sleep long enough to generate many progress ticks per tool.
+				time.Sleep(20 * time.Millisecond)
+				return ToolRun{ID: call.ID, Name: call.Function.Name, Output: "ok", Status: "completed"}, nil
+			}),
+		),
+	)
+	// Drain slowly to apply backpressure on the buffered out channel, maximizing
+	// the chance a ticker send is in-flight when the tool finishes.
+	for range stream {
+		time.Sleep(time.Millisecond)
+	}
+	// Reaching here without a panic/race (under -race) confirms tickers never emit
+	// after the loop closes the channel.
 }

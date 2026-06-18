@@ -23,14 +23,34 @@ func TestCreateChapterEdgeValidationErrorsUseTSShape(t *testing.T) {
 		wantError string
 	}{
 		{
+			name:      "missing both ids",
+			body:      `{"type":"dependency"}`,
+			wantError: "sourceId and targetId are required",
+		},
+		{
+			name:      "missing source id",
+			body:      `{"targetId":"chapter-b","type":"dependency"}`,
+			wantError: "sourceId and targetId are required",
+		},
+		{
+			name:      "missing target id",
+			body:      `{"sourceId":"chapter-a","type":"dependency"}`,
+			wantError: "sourceId and targetId are required",
+		},
+		{
+			name:      "blank source id",
+			body:      `{"sourceId":"   ","targetId":"chapter-b","type":"dependency"}`,
+			wantError: "sourceId and targetId are required",
+		},
+		{
 			name:      "self edge",
 			body:      `{"sourceId":"chapter-a","targetId":"chapter-a","type":"dependency"}`,
-			wantError: "Cannot create a chapter edge to itself",
+			wantError: "Cannot create a dependency edge to itself",
 		},
 		{
 			name:      "cross project",
 			body:      `{"sourceId":"chapter-a","targetId":"chapter-other","type":"dependency"}`,
-			wantError: "Cannot create chapter edge between chapters of different projects",
+			wantError: "Cannot create dependency between chapters of different projects",
 		},
 		{
 			name:      "invalid type",
@@ -41,6 +61,23 @@ func TestCreateChapterEdgeValidationErrorsUseTSShape(t *testing.T) {
 			name:      "review type not accepted by public create schema",
 			body:      `{"sourceId":"chapter-a","targetId":"chapter-b","type":"review"}`,
 			wantError: "Invalid type: review",
+		},
+		{
+			// Error precedence: TS runs createChapterEdgeSchema (type enum) BEFORE
+			// the createDependencyEdge self-edge business rule, so a request that is
+			// both a self-edge AND an invalid type must surface the type error, not
+			// the self-edge error.
+			name:      "invalid type takes precedence over self-edge",
+			body:      `{"sourceId":"chapter-a","targetId":"chapter-a","type":"sidequest"}`,
+			wantError: "Invalid type: sidequest",
+		},
+		{
+			// Error precedence: TS schema metadata.description.max(500) is validated
+			// BEFORE the self-edge business rule, so a self-edge with an over-long
+			// description must surface the description error.
+			name:      "over-long description takes precedence over self-edge",
+			body:      `{"sourceId":"chapter-a","targetId":"chapter-a","type":"dependency","metadata":{"description":"` + strings.Repeat("x", 501) + `"}}`,
+			wantError: "metadata.description must be at most 500 characters",
 		},
 	}
 

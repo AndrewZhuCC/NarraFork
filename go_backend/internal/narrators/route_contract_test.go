@@ -231,7 +231,10 @@ func TestPermissionDecisionMergesAnswersAndBroadcastsResolved(t *testing.T) {
 		t.Fatalf("expected permission_resolved allow broadcast, got %#v", *events)
 	}
 	updated, _ := (*events)[0].Payload["updatedInput"].(map[string]any)
-	answers, _ := updated["answers"].(map[string]any)
+	// answers is map[string]string after the W641 permissionDecisionSchema parity
+	// fix (z.record(z.string(), z.string())); the JSON wire shape to clients is
+	// unchanged.
+	answers, _ := updated["answers"].(map[string]string)
 	if answers["file_path"] != "new.txt" {
 		t.Fatalf("permission_resolved should include updated input answers, got %#v", (*events)[0].Payload)
 	}
@@ -857,6 +860,38 @@ func TestStandaloneNarratorListUsesTSPaginatedShape(t *testing.T) {
 	}
 }
 
+// TestNarratorListLimitZeroReturnsEmptyWithHasMore locks the TS list limit
+// semantics: Math.min(rawLimit, 100) with NO lower-bound clamp, so ?limit=0
+// yields LIMIT 1 + slice(0,0) -> empty items but hasMore=true (when rows exist).
+// Go previously forced limit<=0 up to 20 and returned the rows.
+func TestNarratorListLimitZeroReturnsEmptyWithHasMore(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	if _, err := sqlDB.Exec(`CREATE TABLE terminals (id TEXT PRIMARY KEY, narrator_id TEXT, status TEXT)`); err != nil {
+		t.Fatalf("create terminals table: %v", err)
+	}
+	insertNarratorHandlerTestRow(t, sqlDB)
+
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/?standalone=true&limit=0")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected limit=0 list 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode limit=0 list: %v", err)
+	}
+	items, _ := body["items"].([]any)
+	if len(items) != 0 {
+		t.Fatalf("limit=0 should return empty items (TS slice(0,0)), got %d items", len(items))
+	}
+	if body["hasMore"] != true {
+		t.Fatalf("limit=0 with an existing row should report hasMore=true, got %#v", body["hasMore"])
+	}
+	if body["totalCount"].(float64) != 1 {
+		t.Fatalf("limit=0 totalCount should still reflect all rows, got %#v", body["totalCount"])
+	}
+}
+
 func TestPaginatedNarratorListWithHasViewersDoesNotForceEmpty(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -972,5 +1007,46 @@ func TestValidateCreateRequestEnforcesCwdAndOtherZodBounds(t *testing.T) {
 		DangerReflectionOverride:          "strict",
 	}); err != nil {
 		t.Fatalf("valid create request should pass, got %v", err)
+	}
+}
+
+// TestAskInPassingTitleTruncatesByUTF16 pins the ask-in-passing child title to
+// the TS derivation (server/routes/narrators.ts:2169:
+// question.replace(/\n.*/s, "").slice(0, 80)): the first line sliced to 80
+// UTF-16 code units. A long CJK question must keep 80 characters (not ~26 from a
+// byte slice) and remain valid UTF-8.
+func TestAskInPassingTitleTruncatesByUTF16(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+
+	start := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/ask-in-passing/start", map[string]any{"sourceMessageId": "source-msg", "sourceMessageUuid": "uuid-1"})
+	if start.Code != http.StatusCreated {
+		t.Fatalf("expected ask-in-passing start 201, got %d body=%s", start.Code, start.Body.String())
+	}
+	var startBody map[string]any
+	if err := json.Unmarshal(start.Body.Bytes(), &startBody); err != nil {
+		t.Fatalf("decode start response: %v", err)
+	}
+	pendingID := startBody["messageId"].(string)
+
+	// 100 CJK chars (300 UTF-8 bytes). TS slices to 80 chars; a byte slice to 80
+	// would keep only ~26 chars.
+	question := strings.Repeat("题", 100)
+	resolved := serveNarratorHandlerJSON(sqlDB, http.MethodPost, "/narrators/"+narratorID+"/ask-in-passing", map[string]any{"question": question, "pendingMessageId": pendingID})
+	if resolved.Code != http.StatusCreated {
+		t.Fatalf("expected resolve 201, got %d body=%s", resolved.Code, resolved.Body.String())
+	}
+	var resolvedBody map[string]any
+	if err := json.Unmarshal(resolved.Body.Bytes(), &resolvedBody); err != nil {
+		t.Fatalf("decode resolve: %v", err)
+	}
+	childID := resolvedBody["id"].(string)
+	var childTitle string
+	if err := sqlDB.QueryRow(`SELECT title FROM narrators WHERE id = ?`, childID).Scan(&childTitle); err != nil {
+		t.Fatalf("load child title: %v", err)
+	}
+	if childTitle != strings.Repeat("题", 80) {
+		t.Fatalf("child title should be 80 CJK chars (UTF-16 slice), got %d chars %q", len([]rune(childTitle)), childTitle)
 	}
 }

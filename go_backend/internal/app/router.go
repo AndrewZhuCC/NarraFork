@@ -1629,6 +1629,37 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					},
 				},
 			},
+			"backup": map[string]any{
+				"supported": true,
+				"routes": map[string]any{
+					"sync":   "POST /api/projects/{id}/backup/sync",
+					"status": "GET /api/projects/{id}/backup/status",
+				},
+				"statusContract": map[string]any{
+					"responseFields":           []string{"projectId", "backupExists", "scope"},
+					"scopeListsBackupTables":   true,
+					"backupExistsReflectsFile": true,
+				},
+				"syncContract": map[string]any{
+					"responseFields":                     []string{"projectId", "backupPath", "synced"},
+					"syncedCountsPerTable":               true,
+					"fullScopeIncludesNarratorMessages":  true,
+					"fullScopeIncludesMergeSessions":     true,
+					"fullScopeIncludesReviewConclusions": true,
+				},
+				"writesProjectDBSidecar": true,
+				"fullTSBackupParity":     false,
+			},
+			"import": map[string]any{
+				"supported":               true,
+				"route":                   "POST /api/projects/import",
+				"gitPathRequired":         true,
+				"restoresFullBackupScope": true,
+				"createdStatus":           float64(201),
+				"skippedExistingStatus":   float64(200),
+				"responseFields":          []string{"projectId", "skipped"},
+				"fullTSImportParity":      false,
+			},
 			"replacementContract": map[string]any{
 				"boundaryTracked":                          true,
 				"runtimeRow":                               "PROJECT-LIFECYCLE-01",
@@ -2231,6 +2262,38 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					"acceptedDecision":            "Go re-scans the skill directories on each list request and does not persist the TypeScript skill_directory_caches table (signature-invalidated, 7-day TTL, hourly cleanup). The list/detail API output is identical; the cache is a TS-side performance optimization, so the table is created for write-compat but not consumed by Go.",
 				},
 			},
+			"learning": map[string]any{
+				"supported": true,
+				"routes": map[string]any{
+					"index":  "GET /api/learning",
+					"search": "GET /api/learning/search",
+					"doc":    "GET /api/learning/{id}",
+				},
+				"localeQueryParam":     "lang",
+				"localeEnum":           []string{"en", "zh-CN"},
+				"defaultLocale":        "en",
+				"staticBuiltinContent": true,
+				"docCount":             float64(14),
+				"categories":           []string{"start", "agent", "automation", "runtime", "admin"},
+				"indexContract": map[string]any{
+					"responseFields": []string{"categories", "docs"},
+					"categoryFields": []string{"id", "label", "description"},
+					"docFields":      []string{"id", "category", "tags", "title", "summary", "actions"},
+				},
+				"searchContract": map[string]any{
+					"queryParam":                        "q",
+					"emptyQueryReturnsAll":              true,
+					"caseInsensitive":                   true,
+					"matchesIdCategoryTitleSummaryTags": true,
+					"responseField":                     "results",
+				},
+				"docContract": map[string]any{
+					"missingStatus": float64(404),
+					"detailFields":  []string{"id", "category", "tags", "title", "summary", "sections", "workflow", "bestPractices", "pitfalls", "agentHints", "actions"},
+					"localizedBody": true,
+				},
+				"fullTSLearningParity": false,
+			},
 			"projectSkills": map[string]any{
 				"supported":                       true,
 				"storage":                         "project-git-path-scan",
@@ -2277,6 +2340,14 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 					"reason": "Wave 316 adds the project-skill write routes (POST/PUT/DELETE /api/skills) with TS-parity Zod bounds, duplicate handling, 201/400/404 status codes, and inside-project/no-symlink-ancestor path safety, closing the previous read-only project-skill route gap. Wave 140 keeps project skills replacement-unsafe beyond focused companion-file safety proof. Project/global merge, override, disabled hiding, traversal guard, bounded reads, and write-route create/update/delete bounds are sampled, but symlink/path edge cases, companion depth/count breadth, frontend companion UI smoke, full TypeScript companion output golden parity, and TS-Go project-skill route diff smoke remain unproven.",
 				},
 			},
+			// content-domain feature pointers: hooks, workspaces, customSubagents and
+			// mcp are full capability blocks at the top level of this payload; these
+			// supported-flags mark that the content domain covers them and point to
+			// the authoritative top-level block via detailsAt.
+			"hooks":           map[string]any{"supported": true, "detailsAt": "capabilities.hooks"},
+			"workspaces":      map[string]any{"supported": true, "detailsAt": "capabilities.workspaces"},
+			"customSubagents": map[string]any{"supported": true, "detailsAt": "capabilities.customSubagents"},
+			"mcp":             map[string]any{"supported": true, "detailsAt": "capabilities.mcp"},
 		},
 		"customSubagents": map[string]any{
 			"supported": true,
@@ -2455,6 +2526,7 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			},
 		},
 		"mcp": map[string]any{
+			"supported": true,
 			"routes": map[string]any{
 				"protocol":         "POST /api/mcp",
 				"serversList":      "GET /api/mcp/servers",
@@ -2704,6 +2776,160 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 				"lookupFailureNoInsert":      true,
 			},
 		},
+		"fsBrowser": map[string]any{
+			"supported": true,
+			"routes": map[string]any{
+				"browse":    "GET /api/fs/browse",
+				"shortcuts": "GET /api/fs/shortcuts",
+				"mkdir":     "POST /api/fs/mkdir",
+				"reveal":    "POST /api/fs/reveal",
+				"preview":   "GET /api/fs/preview",
+			},
+			"browseContract": map[string]any{
+				"directoriesOnly":           true,
+				"hidesDotEntriesDefault":    true,
+				"showHiddenQueryFlag":       "showHidden=1",
+				"maxEntries":                float64(500),
+				"sortedDirsFirstByName":     true,
+				"responseFields":            []string{"path", "parent", "sep", "drives", "entries"},
+				"entryFields":               []string{"name", "path", "type", "isDir"},
+				"emptyPathHomeFallback":     true,
+				"windowsEmptyPathDriveRoot": true,
+				"tildeExpansion":            true,
+				"absolutePathResolution":    true,
+			},
+			"shortcutsContract": map[string]any{
+				"responseFields":   []string{"shortcuts", "drives", "sep"},
+				"existingDirsOnly": true,
+				"keys":             []string{"home", "desktop", "documents", "downloads", "root", "projects"},
+				"rootUnixOnly":     true,
+			},
+			"mkdirContract": map[string]any{
+				"parentAndNameRequired":      true,
+				"folderNameValidation":       true,
+				"rejectsPathSeparators":      true,
+				"rejectsControlChars":        true,
+				"rejectsDotAndDotDot":        true,
+				"parentMustExist":            true,
+				"alreadyExistsStatus":        400,
+				"singleDirectoryNotMkdirAll": true,
+			},
+			"revealContract": map[string]any{
+				"pathMustBeExistingDir":              true,
+				"darwinCommand":                      "open",
+				"windowsCommand":                     "explorer",
+				"unsupportedPlatformValidationError": true,
+				"detachesProcess":                    true,
+			},
+			"previewContract": map[string]any{
+				"rejectsDirectory":    true,
+				"maxTextBytes":        float64(1024 * 1024),
+				"maxBinaryBytes":      float64(20 * 1024 * 1024),
+				"tooLargeStatus":      413,
+				"tooLargeCode":        "FS_PREVIEW_TOO_LARGE",
+				"inlineDisposition":   true,
+				"privateCacheControl": true,
+				"imageMimeTypes":      []string{"image/jpeg", "image/png", "image/gif", "image/webp", "image/svg+xml", "image/avif", "image/bmp", "image/x-icon", "application/pdf"},
+				"defaultTextMime":     "text/plain; charset=utf-8",
+			},
+			"fullTSFsBrowserParity": false,
+		},
+		"notifications": map[string]any{
+			"supported": true,
+			"webhookTest": map[string]any{
+				"routes": map[string]any{
+					"dingtalk": "POST /api/notifications/test-dingtalk",
+					"feishu":   "POST /api/notifications/test-feishu",
+				},
+				"webhookRequired":         true,
+				"missingWebhookStatus":    float64(400),
+				"hmacSignedWhenSecretSet": true,
+				"dingtalkMessageType":     "markdown",
+				"feishuMessageType":       "interactive",
+				"upstreamFailureStatus":   float64(502),
+				"failureCodes":            []string{"NOTIFICATION_DINGTALK_WEBHOOK_FAILED", "NOTIFICATION_FEISHU_WEBHOOK_FAILED"},
+				"failureErrorShape":       []string{"ok", "code", "reason", "error", "message"},
+				"webhookTimeoutSeconds":   float64(15),
+			},
+			"sounds": map[string]any{
+				"routes": map[string]any{
+					"upload": "POST /api/notification-sounds",
+					"serve":  "GET /api/notification-sounds/{id}",
+					"delete": "DELETE /api/notification-sounds/{id}",
+				},
+				"userScopedStorage":       true,
+				"storageRoot":             "~/.narrafork/notification-sounds/{userId}",
+				"maxBytes":                float64(1024 * 1024),
+				"multipartMaxBytes":       float64(2 * 1024 * 1024),
+				"allowedMimeTypes":        []string{"audio/mpeg", "audio/wav", "audio/x-wav", "audio/ogg", "audio/webm"},
+				"missingFileStatus":       float64(400),
+				"unsupportedMimeStatus":   float64(400),
+				"oversizeStatus":          float64(400),
+				"missingServeStatus":      float64(404),
+				"missingDeleteStatus":     float64(404),
+				"uploadResponseFields":    []string{"id", "filename", "mediaType"},
+				"servePublicCacheControl": true,
+			},
+			"fullTSNotificationParity": false,
+		},
+		"auth": map[string]any{
+			"supported": true,
+			"routes": map[string]any{
+				"register":     "POST /api/auth/register",
+				"login":        "POST /api/auth/login",
+				"me":           "GET /api/auth/me",
+				"updateMe":     "PATCH /api/auth/me",
+				"uploadAvatar": "PATCH /api/auth/me/avatar",
+				"deleteAvatar": "DELETE /api/auth/me/avatar",
+				"status":       "GET /api/auth/status",
+			},
+			"publicRoutes": []string{"POST /api/auth/register", "POST /api/auth/login", "GET /api/auth/status"},
+			"jwtAlgorithm": "HS256",
+			"registerContract": map[string]any{
+				"usernamePattern":                "^[a-zA-Z0-9_-]+$",
+				"usernameBounds":                 "3..50",
+				"passwordBounds":                 "8..128",
+				"languageDefaultsEn":             true,
+				"firstUserBecomesAdmin":          true,
+				"bootstrapAdminWhenClosed":       true,
+				"concurrentBootstrapSingleAdmin": true,
+				"createdStatus":                  float64(201),
+			},
+			"loginContract": map[string]any{
+				"requiredFieldsValidatedBeforeQuery": true,
+				"responseStatus":                     float64(200),
+			},
+			"profileContract": map[string]any{
+				"meRequiresAuth":         true,
+				"updateGitUsernameEmail": true,
+				"clearableGitFields":     true,
+			},
+			"avatarContract": map[string]any{
+				"maxBytes":         float64(5 * 1024 * 1024),
+				"allowedMimeTypes": []string{"image/jpeg", "image/png", "image/gif", "image/webp"},
+				"deleteSupported":  true,
+			},
+			"statusContract": map[string]any{
+				"public":         true,
+				"responseFields": []string{"hasUsers", "registrationOpen"},
+			},
+			"fullTSAuthParity": false,
+		},
+		"changelog": map[string]any{
+			"supported":                true,
+			"route":                    "GET /api/changelog",
+			"public":                   true,
+			"directArrayResponse":      true,
+			"sortedByVersionDesc":      true,
+			"requiresVersionField":     true,
+			"envDirOverride":           "NARRAFORK_CHANGELOG_DIR",
+			"candidateDirsFallback":    true,
+			"filesystemFirst":          true,
+			"embeddedFallbackInBinary": true,
+			"embeddedFallbackReason":   "Go changelog handler reads filesystem candidate directories first (env override or changelogs/ next to cwd/executable); when none are present it falls back to the build-time embedded changelog generated by scripts/generate-go-changelog.ts, mirroring the TypeScript embedded-changelog.ts behavior so a compiled binary without a sidecar changelogs/ directory still serves the changelog.",
+			"entryFields":              []string{"version", "date", "en", "zh-CN"},
+			"fullTSChangelogParity":    false,
+		},
 		"settings": map[string]any{
 			"storage": map[string]any{
 				"supported": true,
@@ -2887,6 +3113,53 @@ func runtimeCapabilities(platform string, terminalCapabilities map[string]any, e
 			"retryRules":                true,
 		},
 		"providers": providerCapabilities(),
+		"adminPanel": map[string]any{
+			"supported": true,
+			"adminOnly": true,
+			"routes": map[string]any{
+				"listUsers":              "GET /api/admin/users",
+				"updateUser":             "PATCH /api/admin/users/{id}",
+				"deleteUser":             "DELETE /api/admin/users/{id}",
+				"updateSettings":         "PATCH /api/admin/settings",
+				"listTerminals":          "GET /api/admin/terminals",
+				"killTerminal":           "DELETE /api/admin/terminals/{id}",
+				"batchKillTerminals":     "POST /api/admin/terminals/batch-kill",
+				"killOrphanTerminal":     "POST /api/admin/terminals/kill-orphan",
+				"reattachTerminal":       "POST /api/admin/terminals/{id}/reattach",
+				"reattachOrphanTerminal": "POST /api/admin/terminals/reattach-orphan",
+				"diagnostics":            "GET /api/admin/diagnostics",
+			},
+			"usersContract": map[string]any{
+				"listResponseDirectArray":     true,
+				"userFields":                  []string{"id", "username", "role", "avatarColor", "avatarImageId", "createdAt"},
+				"updateResponseFields":        []string{"id", "username", "role"},
+				"usernamePattern":             "^[a-zA-Z0-9_-]+$",
+				"usernameBounds":              "3..50",
+				"passwordBounds":              "8..128",
+				"roleEnum":                    []string{"admin", "user"},
+				"duplicateUsernameStatus":     float64(409),
+				"missingUserStatus":           float64(404),
+				"selfDemoteRejectedCode":      "SELF_DEMOTE",
+				"lastAdminDemoteRejectedCode": "LAST_ADMIN",
+				"selfDeleteRejectedCode":      "SELF_DELETE",
+				"lastAdminDeleteProtected":    true,
+				"atLeastOneFieldRequired":     true,
+			},
+			"settingsContract": map[string]any{
+				"registrationOpenToggle": true,
+				"responseField":          "registrationOpen",
+			},
+			"diagnosticsContract": map[string]any{
+				"responseFields": []string{"goRoutines", "memory", "eventLoopLagMs"},
+			},
+			"terminalsContract": map[string]any{
+				"listResponseDirectArray": true,
+				"killByID":                true,
+				"batchKill":               true,
+				"orphanKillAndReattach":   true,
+			},
+			"fullTSAdminParity": false,
+		},
 		"usageHistory": map[string]any{
 			"admin": map[string]any{
 				"supported":        true,
@@ -4870,6 +5143,12 @@ func changelogHandler(w http.ResponseWriter, r *http.Request) error {
 		}
 		break
 	}
+	// Fall back to the build-time embedded changelog when no sidecar changelogs/
+	// directory is present (e.g. a compiled binary shipped without the JSON files),
+	// mirroring the TypeScript embedded-changelog.ts behavior.
+	if len(entries) == 0 {
+		entries = append(entries, embeddedChangelogEntries...)
+	}
 	sort.Slice(entries, func(i, j int) bool {
 		return compareSemverDesc(stringValue(entries[i]["version"]), stringValue(entries[j]["version"])) < 0
 	})
@@ -5042,10 +5321,22 @@ func checkDependency(ctx context.Context, name string, git *gitx.Service) map[st
 		} else if _, err := exec.LookPath("git"); err == nil {
 			installed = true
 		}
-		return map[string]any{"name": "git", "required": true, "installed": installed, "version": commandVersion(ctx, "git", "--version"), "platformSupported": true, "installCommands": dependencyInstallCommands["git"]}
+		gitDep := map[string]any{"name": "git", "required": true, "installed": installed, "platformSupported": true, "installCommands": dependencyInstallCommands["git"]}
+		if installed {
+			if v := extractToolVersion(commandVersion(ctx, "git", "--version"), "git version"); v != "" {
+				gitDep["version"] = v
+			}
+		}
+		return gitDep
 	case "rg":
 		_, err := exec.LookPath("rg")
-		return map[string]any{"name": "rg", "required": false, "installed": err == nil, "version": firstLine(commandVersion(ctx, "rg", "--version")), "platformSupported": true, "installCommands": dependencyInstallCommands["rg"]}
+		rgDep := map[string]any{"name": "rg", "required": false, "installed": err == nil, "platformSupported": true, "installCommands": dependencyInstallCommands["rg"]}
+		if err == nil {
+			if v := extractToolVersion(commandVersion(ctx, "rg", "--version"), "ripgrep"); v != "" {
+				rgDep["version"] = v
+			}
+		}
+		return rgDep
 	case "dtach":
 		if runtime.GOOS == "windows" {
 			return map[string]any{"name": "dtach", "required": false, "installed": false, "platformSupported": false, "installCommands": map[string]string{}}
@@ -5172,6 +5463,59 @@ func firstLine(value string) string {
 		return strings.TrimSpace(value[:idx])
 	}
 	return value
+}
+
+// extractToolVersion mirrors the TypeScript dependency-service version parsing
+// (e.g. /git version ([\d.]+)/, /ripgrep ([\d.]+)/): it locates the marker
+// phrase and returns the bare dotted-numeric version token that follows it.
+// Returns "" when the marker or a numeric token is absent so callers can omit
+// the version field like TS (version?: string -> undefined). Without this the Go
+// /api/dependencies status would surface the full "git version X.Y.Z" string
+// while TS reports just "X.Y.Z", a cross-backend display mismatch.
+func extractToolVersion(out, marker string) string {
+	out = firstLine(out)
+	if out == "" {
+		return ""
+	}
+	lower := strings.ToLower(out)
+	markerLower := strings.ToLower(strings.TrimSpace(marker))
+	idx := strings.Index(lower, markerLower)
+	if idx < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(out[idx+len(markerLower):])
+	for _, field := range strings.Fields(rest) {
+		if v := leadingVersionNumber(field); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// leadingVersionNumber returns the leading run of digits-and-dots from s (e.g.
+// "2.43.0" from "2.43.0" or "14.1.0" from "14.1.0)"), or "" if s does not start
+// with a digit.
+func leadingVersionNumber(s string) string {
+	end := 0
+	hasDigit := false
+	for end < len(s) {
+		c := s[end]
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			end++
+			continue
+		}
+		if c == '.' {
+			end++
+			continue
+		}
+		break
+	}
+	token := strings.TrimRight(s[:end], ".")
+	if !hasDigit || token == "" {
+		return ""
+	}
+	return token
 }
 
 func registerKnownPlaceholders(r chi.Router) {

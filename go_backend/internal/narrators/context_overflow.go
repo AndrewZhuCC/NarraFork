@@ -7,6 +7,7 @@ import (
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
+	"narrafork-go/internal/httpx"
 )
 
 const contextOverflowKeepRecentMessages = 4
@@ -24,14 +25,27 @@ func isContextOverflowAgentEvent(event agentbasic.AgentEvent) bool {
 		return false
 	}
 	needle := strings.ToLower(strings.TrimSpace(event.Reason + " " + event.Message + " " + event.Code))
+	// Mirror the TS detection in server/lib/agent/error-handling.ts, which combines
+	// CONTEXT_OVERFLOW_PATTERNS (message substrings) with isContextOverflowReason
+	// (reason/code forms). Because needle merges reason+message+code and we match by
+	// substring, both families collapse into one marker list here.
 	markers := []string{
+		// isContextOverflowReason forms (reason / code)
 		"model_context_window_exceeded",
-		"context_length_exceeded",
+		"context_length", // covers context_length_exceeded + context_length
+		"context_window", // covers context_window* reason/code
+		"input_too_long",
+		"prompt_too_long",
+		"context_overflow",
+		// CONTEXT_OVERFLOW_PATTERNS message substrings
+		"exceeds the context window",
 		"context window",
 		"context length",
+		"maximum context length",
 		"maximum context",
-		"too many tokens",
 		"input is too long",
+		"prompt is too long",
+		"too many tokens",
 	}
 	for _, marker := range markers {
 		if strings.Contains(needle, marker) {
@@ -105,7 +119,10 @@ func (s *Service) compactForContextOverflow(ctx context.Context, narratorID stri
 	insertSeq := refs[boundaryIndex].Seq
 	summary := buildContextOverflowSummary(compactRefs)
 	content := []map[string]any{{"type": "compact", "status": "compacted", "summary": summary, "subtype": "context_overflow"}}
-	text := "[Compact]\n" + summary
+	// Mirror the TS finalizeCompactingMessage contentText (narrator-persistence.ts):
+	// `[Compact] ${summary.slice(0, 200)}...` (summary sliced to 200 UTF-16 code
+	// units, always-on "..."). Go previously used `[Compact]\n` + full summary.
+	text := "[Compact] " + httpx.JSStringSlicePrefix(summary, 200) + "..."
 	msg, err := s.addMessageWithBlocksAtSeq(ctx, narratorID, "system", text, content, nil, &insertSeq, true)
 	if err != nil {
 		return Message{}, "", err

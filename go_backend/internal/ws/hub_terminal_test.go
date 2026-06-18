@@ -357,6 +357,20 @@ func TestTerminalWSCreateResizeRenameBoundsRejectOutOfRange(t *testing.T) {
 		t.Fatalf("invalid create should not persist a terminal row, count=%d", count)
 	}
 
+	// create with a 51-emoji name = 102 UTF-16 units (> max 100) should error.
+	// JS String.prototype.length counts UTF-16 units; a rune-count check would see
+	// only 51 and wrongly accept it, diverging from the TS terminalWsMessageSchema.
+	h.handleMessage(c, map[string]any{
+		"type":      "create",
+		"requestId": "req-emoji",
+		"chapterId": "chapter-1",
+		"name":      strings.Repeat("😀", 51),
+	})
+	emojiMsg := readWSMessage(t, wsClient)
+	if emojiMsg["type"] != "error" || emojiMsg["message"] != "Invalid terminal create request" {
+		t.Fatalf("expected 51-emoji name (102 UTF-16 units) create error, got %#v", emojiMsg)
+	}
+
 	// Create a valid terminal to exercise resize/rename bounds.
 	h.handleMessage(c, map[string]any{
 		"type":      "create",
@@ -391,6 +405,87 @@ func TestTerminalWSCreateResizeRenameBoundsRejectOutOfRange(t *testing.T) {
 	msg = readWSMessage(t, wsClient)
 	if msg["type"] != "error" || msg["message"] != "name must be at most 100 characters" {
 		t.Fatalf("expected rename bounds error, got %#v", msg)
+	}
+
+	// rename with a 51-emoji name = 102 UTF-16 units (> max 100) should error too.
+	h.handleMessage(c, map[string]any{"type": "rename", "terminalId": terminalID, "name": strings.Repeat("😀", 51)})
+	msg = readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "name must be at most 100 characters" {
+		t.Fatalf("expected 51-emoji rename bounds error, got %#v", msg)
+	}
+}
+
+func TestTerminalWSResizeCreateRejectNonIntegerColsRows(t *testing.T) {
+	sqlDB := newTerminalTestDB(t)
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, worktree_path) VALUES ('chapter-1', '/tmp')`); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeTerminalRuntime{snapshots: map[string]map[string]any{}}
+	h, c, wsClient := newTerminalHubClient(t, sqlDB, runtime)
+	defer wsClient.Close()
+
+	// create with a fractional cols (10.5) must error: the TS terminalWsMessageSchema
+	// uses z.number().int(), which rejects non-integer numbers. The previous Go code
+	// used intNumber, which truncated 10.5 -> 10 and wrongly accepted it.
+	h.handleMessage(c, map[string]any{
+		"type":      "create",
+		"requestId": "req-frac",
+		"chapterId": "chapter-1",
+		"cols":      float64(10.5),
+		"rows":      float64(40),
+	})
+	msg := readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "Invalid terminal create request" {
+		t.Fatalf("expected fractional create cols error, got %#v", msg)
+	}
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM terminals`).Scan(&count); err != nil {
+		t.Fatalf("count terminals: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("fractional create should not persist a terminal row, count=%d", count)
+	}
+
+	// Create a valid terminal to exercise the resize path.
+	h.handleMessage(c, map[string]any{
+		"type":      "create",
+		"requestId": "req-ok",
+		"chapterId": "chapter-1",
+		"name":      "Shell",
+	})
+	created := readWSMessage(t, wsClient)
+	terminal, _ := created["terminal"].(map[string]any)
+	terminalID, _ := terminal["id"].(string)
+	if terminalID == "" {
+		t.Fatalf("expected created terminal id, got %#v", created)
+	}
+	if ready := readWSMessage(t, wsClient); ready["type"] != "ready" {
+		t.Fatalf("expected ready after create, got %#v", ready)
+	}
+
+	// resize with a fractional rows (24.5) must error rather than truncate to 24.
+	h.handleMessage(c, map[string]any{"type": "resize", "terminalId": terminalID, "cols": float64(100), "rows": float64(24.5)})
+	msg = readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "Invalid terminal resize request" {
+		t.Fatalf("expected fractional resize rows error, got %#v", msg)
+	}
+
+	// resize with a string cols (not a JSON number) must also error: z.number()
+	// rejects strings, whereas the old intNumber coerced unknown types to 0.
+	h.handleMessage(c, map[string]any{"type": "resize", "terminalId": terminalID, "cols": "100", "rows": float64(24)})
+	msg = readWSMessage(t, wsClient)
+	if msg["type"] != "error" || msg["message"] != "Invalid terminal resize request" {
+		t.Fatalf("expected string resize cols error, got %#v", msg)
+	}
+
+	// A clean integer resize still succeeds (sanity: the guard is not over-rejecting).
+	h.handleMessage(c, map[string]any{"type": "resize", "terminalId": terminalID, "cols": float64(120), "rows": float64(40)})
+	// A successful resize produces no error frame; send a follow-up rename and
+	// confirm the next frame is the rename broadcast, not a resize error.
+	h.handleMessage(c, map[string]any{"type": "rename", "terminalId": terminalID, "name": "Renamed"})
+	next := readWSMessage(t, wsClient)
+	if next["type"] != "renamed" {
+		t.Fatalf("expected integer resize to succeed (next frame renamed), got %#v", next)
 	}
 }
 

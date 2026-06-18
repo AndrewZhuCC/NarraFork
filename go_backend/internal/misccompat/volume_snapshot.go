@@ -165,29 +165,37 @@ func ensureVolumeSnapshotDir(projectID string) (string, error) {
 }
 
 func validateContainerSnapshotPath(value string) (string, error) {
-	value = strings.TrimSpace(value)
+	// TS createVolumeSnapshotSchema.containerPath is z.string().min(1).max(1000)
+	// .refine(startsWith("/")).refine(!includes("..")) — with NO .trim(). TS
+	// therefore validates the RAW value and stores/execs it verbatim (podman exec
+	// ... tar -C <containerPath>). A previous Go version did strings.TrimSpace +
+	// filepath.Clean first, which (a) wrongly ACCEPTED leading/trailing-whitespace
+	// paths like "  /data" that TS rejects via startsWith("/"), and (b) mutated the
+	// stored/exec value (e.g. "/data/" -> "/data"). Validate the raw value to match
+	// TS exactly.
 	if value == "" {
 		return "", httpx.BadRequest("containerPath is required")
 	}
-	if len(value) > 1000 {
+	if httpx.JSStringLength(value) > 1000 {
 		return "", httpx.BadRequest("containerPath is too long")
 	}
+	// Go-only defensive hardening: a NUL byte in an exec argument is dangerous and
+	// cannot appear in a legitimate path. TS lacks this check, so Go is a strict
+	// safety superset here (rejects something TS would pass through to podman).
 	if strings.ContainsRune(value, '\x00') {
 		return "", httpx.BadRequest("containerPath contains an invalid NUL byte")
 	}
 	if !strings.HasPrefix(value, "/") {
 		return "", httpx.BadRequest("containerPath must be absolute")
 	}
-	for _, part := range strings.Split(value, "/") {
-		if part == ".." {
-			return "", httpx.BadRequest("containerPath must not contain '..'")
-		}
+	// Mirror the TS createVolumeSnapshotSchema refine `!p.includes("..")`, which is
+	// a pure SUBSTRING check: any occurrence of ".." is rejected, not just a whole
+	// "/.." path segment. A segment-only check would wrongly accept paths like
+	// "/data/my..backup/file" that TS rejects with 400.
+	if strings.Contains(value, "..") {
+		return "", httpx.BadRequest("containerPath must not contain '..'")
 	}
-	cleaned := filepath.Clean(value)
-	if cleaned == "." {
-		return "", httpx.BadRequest("containerPath is invalid")
-	}
-	return cleaned, nil
+	return value, nil
 }
 
 func runVolumeSnapshotCommand(ctx context.Context, timeout time.Duration, stdin io.Reader, stdout io.Writer, name string, args ...string) (string, error) {

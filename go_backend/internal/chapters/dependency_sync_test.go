@@ -25,7 +25,34 @@ func TestCommitsRouteSyncsGitHistoryIntoDatabase(t *testing.T) {
 	}
 
 	handler := NewHandler(&Service{DB: database, Git: gitx.NewService()})
-	w := serveChapterRouteJSON(t, handler, http.MethodGet, "/source/commits?limit=10", "")
+
+	// Parity with TS: the list endpoint only runs the live git sync when
+	// ?sync=true. Without it (the frontend's default call) the route returns the
+	// DB cache as-is and must NOT spawn a git sync. Verify the no-sync default
+	// first: the chapter_commits table is empty, so the cached result is empty
+	// and the chapter metadata is left untouched.
+	noSync := serveChapterRouteJSON(t, handler, http.MethodGet, "/source/commits?limit=10", "")
+	if noSync.Code != http.StatusOK {
+		t.Fatalf("expected 200 for default (no-sync) commits, got %d body=%s", noSync.Code, noSync.Body.String())
+	}
+	var cached []map[string]any
+	if err := json.Unmarshal(noSync.Body.Bytes(), &cached); err != nil {
+		t.Fatalf("decode cached commits: %v", err)
+	}
+	if len(cached) != 0 {
+		t.Fatalf("default list must return DB cache (empty here) without syncing, got %#v", cached)
+	}
+	var preSyncCount int
+	if err := database.QueryRow(`SELECT COUNT(*) FROM chapter_commits WHERE chapter_id = 'source'`).Scan(&preSyncCount); err != nil {
+		t.Fatalf("count chapter commits before sync: %v", err)
+	}
+	if preSyncCount != 0 {
+		t.Fatalf("default list must not sync git history into DB, found %d rows", preSyncCount)
+	}
+
+	// With ?sync=true the route mirrors TS sync:true and pulls git history into
+	// the DB, then returns it newest-first with preserved metadata + diff stats.
+	w := serveChapterRouteJSON(t, handler, http.MethodGet, "/source/commits?limit=10&sync=true", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 commits, got %d body=%s", w.Code, w.Body.String())
 	}
@@ -59,6 +86,49 @@ func TestCommitsRouteSyncsGitHistoryIntoDatabase(t *testing.T) {
 	}
 	if storedCommits < 2 {
 		t.Fatalf("expected commits inserted into DB, count=%d", storedCommits)
+	}
+}
+
+// TestCommitsRouteValidatesLimitLikeListCommitsSchema locks the limit query
+// param to the TS listCommitsSchema (server/lib/validators/git.ts):
+// z.coerce.number().int().min(1).max(200).default(50). A missing limit succeeds
+// (default 50); an out-of-range or non-integer limit rejects with 400 rather
+// than the previous strconv.Atoi-with-ignored-error behavior that silently
+// turned "abc"/0/negative/oversized into a normalized 50.
+func TestCommitsRouteValidatesLimitLikeListCommitsSchema(t *testing.T) {
+	repo, _, _, baseHead, _ := setupDependencySyncRepo(t)
+	database := openMergeParityDB(t)
+	database.SetMaxOpenConns(1)
+	defer database.Close()
+	if _, err := database.Exec(`INSERT INTO projects (id, name, git_path, default_branch, chapter_settings) VALUES ('project', 'Project', ?, 'main', '{}')`, repo); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := database.Exec(`INSERT INTO chapters (id, project_id, title, status, role, branch, worktree_path, base_branch, head_commit_sha, start_commit_sha, commit_count, is_root, created_at, updated_at)
+		VALUES ('source', 'project', 'Source', 'active', 'branch', 'main', ?, 'main', ?, ?, 1, 1, 'now', 'now')`, repo, baseHead, baseHead); err != nil {
+		t.Fatalf("insert source chapter: %v", err)
+	}
+	handler := NewHandler(&Service{DB: database, Git: gitx.NewService()})
+
+	for _, bad := range []string{"limit=0", "limit=-1", "limit=201", "limit=abc", "limit=12.5", "limit=10x", "limit="} {
+		w := serveChapterRouteJSON(t, handler, http.MethodGet, "/source/commits?"+bad, "")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("commits?%s should be 400 (limit must be int 1..200), got %d body=%s", bad, w.Code, w.Body.String())
+		}
+	}
+
+	// Missing limit and in-range limits succeed (default 50 / explicit bounds).
+	// z.coerce.number().int() uses JS Number() coercion, so integral-float,
+	// scientific-notation, hex, and whitespace-padded forms that strconv.Atoi
+	// previously rejected must now be accepted exactly like the TypeScript route.
+	for _, ok := range []string{"", "limit=1", "limit=50", "limit=200", "limit=50.0", "limit=1e2", "limit=0xA", "limit=%2010%20"} {
+		path := "/source/commits"
+		if ok != "" {
+			path += "?" + ok
+		}
+		w := serveChapterRouteJSON(t, handler, http.MethodGet, path, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("commits %q should be 200, got %d body=%s", path, w.Code, w.Body.String())
+		}
 	}
 }
 

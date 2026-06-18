@@ -12,7 +12,9 @@
 				"EnterPlanMode and ExitPlanMode tools are available through the reflection tool scope",
 				"ExitPlanMode persists an approved compact plan marker when invoked by the agent runtime",
 				"ExitPlanMode always requires explicit user approval after readiness reflection; Go does not implement the TS planReflectionAutoApprove skip-user path, so the TS auto-compact reflection sub-feature (planReflectionAllowAutoCompact / ExitPlanConfirmAndCompact / confirm_compact) is an accepted divergence, while user-driven compactAfter context reset on approval is supported",
-				"TypeScript plan_reflection_started/resolved/stopped WS events are scoped to the asynchronous planReflectionAutoApprove loop; Go does not emit plan_reflection_* and instead exposes the explicit permission_request/permission_resolved approval flow as the supported frontend contract"
+				"TypeScript plan_reflection_started/resolved/stopped WS events are scoped to the asynchronous planReflectionAutoApprove loop; Go does not emit plan_reflection_* and instead exposes the explicit permission_request/permission_resolved approval flow as the supported frontend contract",
+				"Goal-completion reflection is not part of the plan auto-approval divergence: Go broadcasts goal_reflection_started and goal_reflection_resolved for UpdateGoal reflection and records goal_reflection suggestions on the tool call",
+				"AskUserQuestion reflection is also covered: Go broadcasts question_reflection_started and question_reflection_resolved around ReflectPendingAskUserQuestion, then emits permission_resolved with the reflected updated input"
 			],
 			"goSources": [
 				"go_backend/internal/narrators/handlers.go",
@@ -23,6 +25,8 @@
 				"go_backend/internal/narrators/route_contract_test.go",
 				"go_backend/internal/narrators/handlers_compact_test.go",
 				"go_backend/internal/narrators/agent_event_integration_test.go",
+				"go_backend/internal/narrators/agent_event_integration_test.go::TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop",
+				"go_backend/internal/narrators/agent_event_integration_test.go::TestReflectPendingAskUserQuestionBroadcastsQuestionReflectionLifecycle",
 				"go_backend/internal/agentbasic/tool_inventory_test.go",
 				"go_backend/internal/narrators/service_test.go::TestReflectionDecisionFromToolCall",
 				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks"

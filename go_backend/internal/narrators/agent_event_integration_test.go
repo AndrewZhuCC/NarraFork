@@ -170,6 +170,7 @@ func createNarratorTestSchema(db *sql.DB) error {
 			input_json TEXT,
 			output_json TEXT,
 			status TEXT,
+			duration_ms INTEGER,
 			permission_started_at TEXT,
 			permission_suggestions TEXT,
 			is_background INTEGER DEFAULT 0,
@@ -998,6 +999,8 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 	}))
 	defer server.Close()
 	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
 	payload, err := service.addGoal(context.Background(), narratorID, "Complete P3 reflection coverage", "tester")
 	if err != nil {
 		t.Fatalf("add goal: %v", err)
@@ -1005,6 +1008,14 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 	goal, _ := payload["goal"].(map[string]any)
 	goalID = stringFromAny(goal["id"])
 	service.runBasicAgent(context.Background(), narratorID)
+	started := findBroadcast(events(), narratorID, "goal_reflection_started")
+	if started == nil || started["toolUseId"] != "goal-update-1" || started["toolName"] != "UpdateGoal" || started["activeGoal"] == nil {
+		t.Fatalf("expected goal_reflection_started for UpdateGoal, got %#v", events())
+	}
+	resolved := findBroadcast(events(), narratorID, "goal_reflection_resolved")
+	if resolved == nil || resolved["toolUseId"] != "goal-update-1" || resolved["decision"] != "allow" {
+		t.Fatalf("expected goal_reflection_resolved allow for UpdateGoal, got %#v", events())
+	}
 	var status string
 	if err := service.DB.QueryRow(`SELECT status FROM narrator_goals WHERE id = ?`, goalID).Scan(&status); err != nil {
 		t.Fatalf("load goal: %v", err)
@@ -1018,6 +1029,48 @@ func TestRunBasicAgentPlanAndGoalReflectionToolsWorkThroughEventLoop(t *testing.
 	}
 	if toolStatus != "success" || !strings.Contains(suggestionsRaw, "goal_reflection") || !strings.Contains(suggestionsRaw, "confirmed") || decisionReason == "" {
 		t.Fatalf("unexpected goal reflection tool call status=%s suggestions=%s reason=%q", toolStatus, suggestionsRaw, decisionReason)
+	}
+}
+
+func TestReflectPendingAskUserQuestionBroadcastsQuestionReflectionLifecycle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": `{"choice":"B"}`}}}})
+	}))
+	defer server.Close()
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
+	hub, events := captureNarratorBroadcasts()
+	service.Hub = hub
+	input := `{"questions":[{"question":"choice","header":"Pick one","options":[{"label":"A","description":"First"},{"label":"B","description":"Second"}],"multiSelect":false}]}`
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := service.DB.Exec(`INSERT INTO narrator_tool_calls (id, narrator_id, tool_use_id, tool_name, input_json, status, created_at) VALUES ('req-question-reflection', ?, 'ask-question-1', 'AskUserQuestion', ?, 'pending', ?)`, narratorID, input, now); err != nil {
+		t.Fatalf("insert pending AskUserQuestion: %v", err)
+	}
+	answers, err := service.ReflectPendingAskUserQuestion(context.Background(), narratorID, "ask-question-1", false)
+	if err != nil {
+		t.Fatalf("reflect pending question: %v", err)
+	}
+	if answers["choice"] != "B" {
+		t.Fatalf("expected reflected answer B, got %#v", answers)
+	}
+	started := findBroadcast(events(), narratorID, "question_reflection_started")
+	if started == nil || started["requestId"] != "req-question-reflection" || started["toolUseId"] != "ask-question-1" || started["toolName"] != "AskUserQuestion" || started["inputJson"] == nil {
+		t.Fatalf("expected question_reflection_started, got %#v", events())
+	}
+	resolved := findBroadcast(events(), narratorID, "question_reflection_resolved")
+	if resolved == nil || resolved["requestId"] != "req-question-reflection" || resolved["toolUseId"] != "ask-question-1" || resolved["decision"] != "allow" {
+		t.Fatalf("expected question_reflection_resolved allow, got %#v", events())
+	}
+	permissionResolved := findBroadcast(events(), narratorID, "permission_resolved")
+	if permissionResolved == nil || permissionResolved["requestId"] != "req-question-reflection" || permissionResolved["decision"] != "allow" || permissionResolved["updatedInput"] == nil {
+		t.Fatalf("expected permission_resolved with reflected input, got %#v", events())
+	}
+	var status, decidedBy, suggestions string
+	if err := service.DB.QueryRow(`SELECT status, COALESCE(permission_decided_by, ''), COALESCE(permission_suggestions, '') FROM narrator_tool_calls WHERE id = 'req-question-reflection'`).Scan(&status, &decidedBy, &suggestions); err != nil {
+		t.Fatalf("load reflected question tool call: %v", err)
+	}
+	if status != "running" || decidedBy != "reflection" || !strings.Contains(suggestions, "question_reflection") || !strings.Contains(suggestions, "confirmed") {
+		t.Fatalf("unexpected reflected question status=%s decidedBy=%s suggestions=%s", status, decidedBy, suggestions)
 	}
 }
 
@@ -2795,7 +2848,8 @@ func TestBroadcastGitStatusAfterFileMutatingTool(t *testing.T) {
 	hub, events := captureNarratorBroadcasts()
 	service.Hub = hub
 	service.broadcastGitStatusAfterTool(context.Background(), narratorID, narrator, "Write", "tool-git-track-1")
-	event := findBroadcast(events(), narratorID, "git_status")
+	// git_status broadcasts are throttled (800ms trailing); poll until it fires.
+	event := waitForBroadcast(t, events, narratorID, "git_status")
 	if event == nil || event["chapterId"] != "chapter-git-track" || event["toolUseId"] != "tool-git-track-1" {
 		t.Fatalf("expected git_status broadcast for mutating tool, got %#v events=%#v", event, events())
 	}
@@ -3764,4 +3818,108 @@ func waitForActiveRun(t *testing.T, service *Service, narratorID string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("run %s did not become active", narratorID)
+}
+
+// TestHandleAgentEventRecordsOutputStats verifies handleAgentEvent feeds the
+// global output-stats tracker from stream_text/stream_reasoning text (UTF-16
+// length) and tool_use_chunk InputCharsTotal deltas, mirroring the TS
+// narrator-event-handler recordOutputChunk call sites.
+func TestHandleAgentEventRecordsOutputStats(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	hub, _ := captureNarratorBroadcasts()
+	service.Hub = hub
+	narrator, err := service.Get(context.Background(), narratorID)
+	if err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator}
+	ctx := context.Background()
+
+	// stream_text (10 chars) + stream_reasoning (5 chars) -> 15 chars.
+	_ = service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "stream_text", Text: "0123456789"})
+	_ = service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "stream_reasoning", Text: "abcde"})
+
+	// tool_use_chunk: cumulative InputCharsTotal 8 then 20 -> deltas 8 + 12 = 20.
+	_ = service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "tool_use_chunk", ToolUseID: "tool_a", Streaming: &agentbasic.ToolUseChunk{ToolUseID: "tool_a", InputCharsTotal: 8}})
+	_ = service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "tool_use_chunk", ToolUseID: "tool_a", Streaming: &agentbasic.ToolUseChunk{ToolUseID: "tool_a", InputCharsTotal: 20}})
+	// A non-increasing cumulative value records nothing (delta <= 0).
+	_ = service.handleAgentEvent(ctx, state, agentbasic.AgentEvent{Type: "tool_use_chunk", ToolUseID: "tool_a", Streaming: &agentbasic.ToolUseChunk{ToolUseID: "tool_a", InputCharsTotal: 20}})
+
+	_, total := hub.OutputStatsSnapshot()
+	if total != 35 {
+		t.Fatalf("totalChars = %d, want 35 (10 text + 5 reasoning + 20 tool-input delta)", total)
+	}
+}
+
+// TestHandleAgentEventPaymentRequired verifies the payment_required event from
+// a NUG provider persists status=idle + substatus=["payment_required"] with a
+// JSON error_message blob the frontend parses, mirroring the TS
+// narrator-session.ts payment_required branch.
+func TestHandleAgentEventPaymentRequired(t *testing.T) {
+	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", "")
+	hub, drain := captureNarratorBroadcasts()
+	service.Hub = hub
+	narrator, err := service.Get(context.Background(), narratorID)
+	if err != nil {
+		t.Fatalf("load narrator: %v", err)
+	}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator}
+	balance := 1.5
+	required := 10.0
+	event := agentbasic.AgentEvent{
+		Type:           "payment_required",
+		Message:        "Insufficient balance",
+		ProviderID:     "nug12345",
+		ProviderPrefix: "nug",
+		Balance:        &balance,
+		Required:       &required,
+		ResumeAction:   "continue",
+	}
+	if err := service.handleAgentEvent(context.Background(), state, event); err != nil {
+		t.Fatalf("handleAgentEvent: %v", err)
+	}
+
+	var status, substatus, errorMessage string
+	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
+		t.Fatalf("load narrator row: %v", err)
+	}
+	if status != "idle" {
+		t.Fatalf("status = %q, want idle", status)
+	}
+	if substatus != `["payment_required"]` {
+		t.Fatalf("substatus = %q, want [\"payment_required\"]", substatus)
+	}
+	var blob map[string]any
+	if err := json.Unmarshal([]byte(errorMessage), &blob); err != nil {
+		t.Fatalf("error_message is not valid JSON (%q): %v", errorMessage, err)
+	}
+	if blob["type"] != "payment_required" {
+		t.Fatalf("blob.type = %v, want payment_required", blob["type"])
+	}
+	if blob["providerId"] != "nug12345" {
+		t.Fatalf("blob.providerId = %v, want nug12345", blob["providerId"])
+	}
+	if blob["resumeAction"] != "continue" {
+		t.Fatalf("blob.resumeAction = %v, want continue", blob["resumeAction"])
+	}
+	if b, _ := blob["balance"].(float64); b != 1.5 {
+		t.Fatalf("blob.balance = %v, want 1.5", blob["balance"])
+	}
+
+	// The structured payment_required event must be broadcast to the narrator.
+	sawPaymentRequired := false
+	for _, ev := range drain() {
+		if ev.Payload["type"] == "payment_required" {
+			sawPaymentRequired = true
+			if ev.Payload["providerId"] != "nug12345" {
+				t.Fatalf("broadcast providerId = %v, want nug12345", ev.Payload["providerId"])
+			}
+			if ev.Payload["resumeAction"] != "continue" {
+				t.Fatalf("broadcast resumeAction = %v, want continue", ev.Payload["resumeAction"])
+			}
+		}
+	}
+	if !sawPaymentRequired {
+		t.Fatal("expected a payment_required broadcast")
+	}
 }

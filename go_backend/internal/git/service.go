@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"narrafork-go/internal/httpx"
 )
 
 const (
@@ -1237,20 +1239,26 @@ func (s *Service) FullDiff(ctx context.Context, path string) (string, error) {
 	}
 	parts := []string{}
 	total := 0
+	// Mirror the TS getFullDiff cap (git-service.ts:818): the `maxBytes` budget is
+	// actually measured in UTF-16 code units (`totalLen + text.length`,
+	// `text.slice(0, remaining)`). Go previously used true byte length + byte slice,
+	// diverging on the gate and risking a mid-rune cut (invalid UTF-8) for a
+	// non-ASCII diff in the model-visible diff context.
 	addPart := func(text string) bool {
 		if text == "" {
 			return true
 		}
-		if total+len(text) > 100000 {
+		textLen := httpx.JSStringLength(text)
+		if total+textLen > 100000 {
 			remaining := 100000 - total
 			if remaining > 0 {
-				parts = append(parts, text[:remaining])
+				parts = append(parts, httpx.JSStringSlicePrefix(text, remaining))
 			}
 			parts = append(parts, "\n\n[diff truncated — exceeded size limit]")
 			return false
 		}
 		parts = append(parts, text)
-		total += len(text)
+		total += textLen
 		return true
 	}
 	if !addPart(out) {
@@ -1282,8 +1290,13 @@ func (s *Service) DiffBetweenRefs(ctx context.Context, repoPath, baseRef, headRe
 	if err != nil {
 		return "", err
 	}
-	if len(out) > 100000 {
-		return out[:100000] + "\n\n[diff truncated — exceeded size limit]", nil
+	// Mirror the TS getDiffBetweenRefs cap (git-service.ts:881): despite the
+	// `maxBytes` name, TS truncates by `stdout.length` / `stdout.slice(0, maxBytes)`
+	// — UTF-16 code units. Go previously used a true byte length + byte slice, which
+	// for a non-ASCII diff (CJK code/comments) diverged on the >100000 gate and
+	// could cut mid-rune, emitting invalid UTF-8 into the model-visible diff context.
+	if httpx.JSStringLength(out) > 100000 {
+		return httpx.JSStringSlicePrefix(out, 100000) + "\n\n[diff truncated — exceeded size limit]", nil
 	}
 	return out, nil
 }

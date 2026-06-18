@@ -103,6 +103,10 @@ func TestCreateProjectValidatesZodBoundsLikeTypeScript(t *testing.T) {
 		{"overlong description", `{"name":"Proj","description":"` + longText + `","repoMode":"existing","gitPath":"/tmp/x"}`},
 		{"overlong cloneUsername", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","cloneUsername":"` + longCred + `"}`},
 		{"overlong clonePassword", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","clonePassword":"` + longCred + `"}`},
+		{"invalid flowMode", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","flowMode":"weird"}`},
+		{"invalid cloneBranch", `{"name":"Proj","repoMode":"existing","gitPath":"/tmp/x","cloneBranch":"bad branch"}`},
+		{"missing repoMode", `{"name":"Proj","gitPath":"/tmp/x"}`},
+		{"invalid repoMode", `{"name":"Proj","repoMode":"bogus","gitPath":"/tmp/x"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/projects", bytes.NewBufferString(tc.body))

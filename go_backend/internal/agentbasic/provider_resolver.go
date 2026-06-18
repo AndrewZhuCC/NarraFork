@@ -206,6 +206,144 @@ func resolveAggregationFromRaw(raw map[string]any, aggID string) string {
 	return ""
 }
 
+// normalizeModelReference mirrors the TS normalizeModelReference: trims, maps the
+// legacy literal "default" to the follow-default sentinel, and treats empty as "".
+func normalizeModelReference(model string) string {
+	trimmed := strings.TrimSpace(model)
+	if trimmed == "" {
+		return ""
+	}
+	if trimmed == "default" {
+		return followDefaultModelSentinel
+	}
+	return trimmed
+}
+
+// isMetaModelReference reports whether a model string is a placeholder that needs
+// expansion (the follow-default sentinel or an aggregation reference) rather than a
+// concrete provider:model. Mirrors the TS isMetaModelReference.
+func isMetaModelReference(model string) bool {
+	if isFollowDefaultModelValue(model) {
+		return true
+	}
+	_, _, ok := parseAggregationModelValue(model)
+	return ok
+}
+
+// aggregationMembersFromRaw returns the configured member models of an aggregation
+// WITHOUT triggering balanced round-robin routing (unlike resolveAggregationFromRaw).
+// Used only for allowed-pool matching so validation never advances routing state.
+func aggregationMembersFromRaw(raw map[string]any, aggID string) []string {
+	aggID = strings.TrimSpace(aggID)
+	if aggID == "" {
+		return nil
+	}
+	agent, _ := raw["agent"].(map[string]any)
+	for _, item := range readArray(agent["modelAggregations"]) {
+		agg, ok := item.(map[string]any)
+		if !ok || strings.TrimSpace(stringValue(agg["id"])) != aggID {
+			continue
+		}
+		members := []string{}
+		for _, model := range readArray(agg["models"]) {
+			if candidate := strings.TrimSpace(stringValue(model)); candidate != "" {
+				members = append(members, candidate)
+			}
+		}
+		return members
+	}
+	return nil
+}
+
+// expandModelReferenceForMatching mirrors the TS helper of the same name: it
+// recursively expands a model reference into the ordered set of concrete/meta
+// values it can resolve to (following __default__ -> agent.defaultModel and
+// __agg__:id -> pinnedModel or aggregation members), guarding against cycles via
+// seen. The returned slice preserves first-insertion order (matching the TS Set
+// iteration order) and contains no duplicates.
+func expandModelReferenceForMatching(raw map[string]any, model string, seen map[string]struct{}) []string {
+	added := map[string]struct{}{}
+	values := []string{}
+	add := func(v string) {
+		if _, ok := added[v]; ok {
+			return
+		}
+		added[v] = struct{}{}
+		values = append(values, v)
+	}
+	normalized := normalizeModelReference(model)
+	if normalized == "" {
+		return values
+	}
+	add(normalized)
+	if _, ok := seen[normalized]; ok {
+		return values
+	}
+	seen[normalized] = struct{}{}
+
+	if isFollowDefaultModelValue(normalized) {
+		agent, _ := raw["agent"].(map[string]any)
+		for _, v := range expandModelReferenceForMatching(raw, stringValue(agent["defaultModel"]), seen) {
+			add(v)
+		}
+		return values
+	}
+	aggID, pinnedModel, ok := parseAggregationModelValue(normalized)
+	if !ok {
+		return values
+	}
+	if pinnedModel != "" {
+		for _, v := range expandModelReferenceForMatching(raw, pinnedModel, seen) {
+			add(v)
+		}
+		return values
+	}
+	for _, member := range aggregationMembersFromRaw(raw, aggID) {
+		for _, v := range expandModelReferenceForMatching(raw, member, seen) {
+			add(v)
+		}
+	}
+	return values
+}
+
+// ResolveAllowedModelCandidate mirrors the TS resolveAllowedModelCandidate: it
+// resolves a candidate model against an allowed-model pool without triggering
+// aggregation routing. Returns the resolved concrete model when the candidate is
+// permitted by the pool, or "" when it is not. An empty pool imposes no restriction
+// (the normalized candidate is returned as-is).
+func ResolveAllowedModelCandidate(raw map[string]any, candidate string, allowedPool []string) string {
+	rawRef := normalizeModelReference(candidate)
+	if rawRef == "" {
+		return ""
+	}
+	if len(allowedPool) == 0 {
+		return rawRef
+	}
+	candidateValues := expandModelReferenceForMatching(raw, rawRef, map[string]struct{}{})
+	for _, allowedRaw := range allowedPool {
+		allowed := normalizeModelReference(allowedRaw)
+		if allowed == "" {
+			continue
+		}
+		allowedSlice := expandModelReferenceForMatching(raw, allowed, map[string]struct{}{})
+		allowedSet := make(map[string]struct{}, len(allowedSlice))
+		for _, v := range allowedSlice {
+			allowedSet[v] = struct{}{}
+		}
+		if _, ok := allowedSet[rawRef]; ok {
+			return rawRef
+		}
+		// First concrete (non-meta) candidate value also present in the allowed set,
+		// iterated in candidate insertion order to match the TS findConcreteIntersection.
+		for _, value := range candidateValues {
+			if _, ok := allowedSet[value]; ok && !isMetaModelReference(value) {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
 func resolveProviderFromRaw(raw map[string]any, model string) (Provider, error) {
 	effectiveModel := resolveEffectiveModelFromRaw(raw, model)
 	provider, err := resolveProviderExact(raw, effectiveModel)
@@ -377,7 +515,7 @@ func resolveProviderExact(raw map[string]any, model string) (Provider, error) {
 					}
 				}
 			}
-			return Provider{Prefix: pfx, Kind: spec.Kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode}, nil
+			return Provider{Prefix: pfx, ID: stringValue(provider["id"]), Kind: spec.Kind, APIKey: apiKey, BaseURL: baseURL, Model: bareModel, APIMode: apiMode}, nil
 		}
 	}
 	for _, key := range []string{"openaiProviders", "customApiProviders"} {

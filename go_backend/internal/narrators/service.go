@@ -1,6 +1,7 @@
 package narrators
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/config"
@@ -80,6 +82,9 @@ type Service struct {
 
 	goalMu      sync.Mutex
 	goalNotices map[string]string
+
+	gitTrackMu     sync.Mutex
+	gitTrackTimers map[string]*time.Timer
 }
 
 type teamInboxMessage struct {
@@ -920,7 +925,12 @@ func (s *Service) Messages(ctx context.Context, narratorID string, limit int) ([
 }
 
 func (s *Service) MessagesCursor(ctx context.Context, narratorID string, limit int, cursor, direction string) (MessagePage, error) {
-	limit = normalizeMessageLimit(limit, 50, 200)
+	// Mirror the TS /:id/messages route limit = Math.min(rawLimit, 200): the NaN ->
+	// 50 fallback is applied by the handler's queryInt, and only the UPPER bound is
+	// clamped here. A present 0/negative limit passes through (LIMIT limit+1 + the
+	// len(refs) > limit / refs[:limit] slice below yield empty messages + hasMore,
+	// like the TS getMessagesCursor slice(0, limit)) instead of being forced to 50.
+	limit = clampMessageLimitUpper(limit, 200)
 	if direction != "newer" {
 		direction = "older"
 	}
@@ -952,7 +962,7 @@ func (s *Service) MessagesCursor(ctx context.Context, narratorID string, limit i
 	}
 	hasMoreInDirection := len(refs) > limit
 	if hasMoreInDirection {
-		refs = refs[:limit]
+		refs = jsSliceStart0(refs, limit)
 	}
 	if direction == "older" {
 		reverseMessageRefs(refs)
@@ -975,8 +985,8 @@ func (s *Service) MessagesCursor(ctx context.Context, narratorID string, limit i
 }
 
 func (s *Service) MessagesAround(ctx context.Context, narratorID, messageID string, before, after int) (MessagePage, error) {
-	before = normalizeWindowSize(before, 5)
-	after = normalizeWindowSize(after, 20)
+	before = normalizeWindowSize(before)
+	after = normalizeWindowSize(after)
 	fallbackLimit := before + after + 1
 	if fallbackLimit < 10 {
 		fallbackLimit = 10
@@ -1294,9 +1304,24 @@ func normalizeMessageLimit(limit, fallback, max int) int {
 	return limit
 }
 
-func normalizeWindowSize(value, fallback int) int {
+// clampMessageLimitUpper mirrors the TS `Math.min(limit, max)` with NO lower
+// bound (the NaN->default substitution is done earlier by the handler). A present
+// 0/negative limit is preserved so the cursor pagination can return empty + hasMore
+// exactly like the TS getMessagesCursor slice(0, limit).
+func clampMessageLimitUpper(limit, max int) int {
+	if limit > max {
+		return max
+	}
+	return limit
+}
+
+func normalizeWindowSize(value int) int {
+	// Mirror the TS parseWindowSize clamp Math.min(Math.max(value, 0), 100)
+	// (server/routes/narrators.ts). The NaN->fallback step is handled earlier by
+	// queryInt at the handler, so this is purely the [0,100] clamp: a NEGATIVE
+	// value clamps to 0 (NOT to the 5/20 default).
 	if value < 0 {
-		return fallback
+		return 0
 	}
 	if value > 100 {
 		return 100
@@ -1548,25 +1573,36 @@ func (s *Service) loadMessagesByRefs(ctx context.Context, refs []messageRef) ([]
 		ids = append(ids, ref.MessageID)
 		seqByID[ref.MessageID] = ref.Seq
 	}
-	placeholders, idArgs := inPlaceholders(ids)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE id IN (`+placeholders+`)`, idArgs...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	// Chunk the IN clause so the read never exceeds the SQLite bound-parameter
+	// limit even when the messages-since-compact history is large (agentHistory
+	// no longer caps the row count); each chunk query stays bounded.
 	byID := map[string]Message{}
-	for rows.Next() {
-		msg, err := scanMessage(rows)
+	for start := 0; start < len(ids); start += messageRefInChunkSize {
+		end := start + messageRefInChunkSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		placeholders, idArgs := inPlaceholders(ids[start:end])
+		rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE id IN (`+placeholders+`)`, idArgs...)
 		if err != nil {
 			return nil, err
 		}
-		if seq, ok := seqByID[msg.ID]; ok {
-			msg.Seq = seq
+		for rows.Next() {
+			msg, err := scanMessage(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if seq, ok := seqByID[msg.ID]; ok {
+				msg.Seq = seq
+			}
+			byID[msg.ID] = msg
 		}
-		byID[msg.ID] = msg
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
 	messages := make([]Message, 0, len(refs))
 	for _, ref := range refs {
@@ -1611,21 +1647,35 @@ func collectMessageToolUseIDs(messages []Message) []string {
 }
 
 func (s *Service) loadChildMessagesForToolUses(ctx context.Context, toolUseIDs []string) ([]Message, error) {
-	placeholders, args := inPlaceholders(toolUseIDs)
-	rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE parent_tool_use_id IN (`+placeholders+`) ORDER BY created_at ASC LIMIT 500`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	messages := []Message{}
-	for rows.Next() {
-		msg, err := scanMessage(rows)
+	// Chunk the parent_tool_use_id IN clause so a large messages-since-compact set
+	// (with many tool calls) never exceeds the SQLite bound-parameter limit. The
+	// per-query LIMIT keeps each chunk bounded and caps total children overall.
+	for start := 0; start < len(toolUseIDs); start += messageRefInChunkSize {
+		end := start + messageRefInChunkSize
+		if end > len(toolUseIDs) {
+			end = len(toolUseIDs)
+		}
+		placeholders, args := inPlaceholders(toolUseIDs[start:end])
+		rows, err := s.DB.QueryContext(ctx, `SELECT id, narrator_id, sdk_message_uuid, parent_tool_use_id, role, content_json, content_text, model, commit_sha, command_text, created_by, edited_at, edited_by, original_content_json, created_at, 0 AS seq FROM narrator_messages WHERE parent_tool_use_id IN (`+placeholders+`) ORDER BY created_at ASC LIMIT 500`, args...)
 		if err != nil {
 			return nil, err
 		}
-		messages = append(messages, msg)
+		for rows.Next() {
+			msg, err := scanMessage(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			messages = append(messages, msg)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
 	}
-	return messages, rows.Err()
+	return messages, nil
 }
 
 func buildMessageTree(flat []Message) []Message {
@@ -1808,6 +1858,24 @@ func (s *Service) startUserMessageRunWithParentToolUse(ctx context.Context, narr
 		return Message{}, err
 	}
 	s.broadcastMessage(ctx, narratorID, msg)
+	// Mirror the TS sendMessage auto-title trigger (narrator-session.ts): on the
+	// first user message of a titleless primary narrator, set a deterministic
+	// provisional title immediately, then fire-and-forget a quick AI title. The
+	// `narrator` snapshot here predates this message, so MessageCount == 0 marks
+	// the first message (TS checks the post-add count <= 1). Skips subagents
+	// (parentToolUseID set) and non-primary narrators.
+	if parentToolUseID == "" && narrator.Type == "primary" && narrator.MessageCount == 0 &&
+		(narrator.Title == nil || strings.TrimSpace(*narrator.Title) == "") {
+		cwd := ""
+		if narrator.Cwd != nil {
+			cwd = *narrator.Cwd
+		}
+		locale := s.userLocale(ctx, userID)
+		if provisional := buildProvisionalTitle(contentText); provisional != "" {
+			s.persistGeneratedTitle(ctx, narratorID, provisional)
+		}
+		go s.generateQuickTitle(context.Background(), narratorID, contentText, cwd, locale)
+	}
 	if err := s.startNarratorRun(ctx, narratorID, narrator); err != nil {
 		return Message{}, err
 	}
@@ -2322,9 +2390,14 @@ func (s *Service) broadcastBufferSet(ctx context.Context, narratorID string) {
 func bufferSummaries(items []BufferedMessage) []map[string]any {
 	summaries := []map[string]any{}
 	for _, item := range items {
+		// Mirror TS toBufferSummary (server/services/narrator-buffer.ts):
+		// creator is ALWAYS present (null when absent) and priority is present
+		// only when truthy (omitted otherwise via `priority || undefined`).
 		summary := map[string]any{"id": item.ID, "text": item.Text, "bufferedAt": item.BufferedAt, "imageCount": bufferedImageCount(item.ImagesJSON)}
 		if item.CreatorJSON != nil {
 			summary["creator"] = item.CreatorJSON
+		} else {
+			summary["creator"] = nil
 		}
 		if item.Priority {
 			summary["priority"] = true
@@ -2544,6 +2617,32 @@ func (s *Service) userLocale(ctx context.Context, userID string) string {
 		return "zh-CN"
 	}
 	return "en"
+}
+
+// toolLocale resolves the locale used for a narrator's tool-result messages,
+// mirroring the TS ctx.locale (which derives from the narrator owner's language
+// preference). It resolves the narrator's created_by user's user_preferences
+// language, defaulting to "en".
+func (s *Service) toolLocale(ctx context.Context, narratorID string) string {
+	if s == nil || s.DB == nil {
+		return "en"
+	}
+	var createdBy sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT created_by FROM narrators WHERE id = ?`, narratorID).Scan(&createdBy); err != nil {
+		return "en"
+	}
+	if !createdBy.Valid || strings.TrimSpace(createdBy.String) == "" {
+		return "en"
+	}
+	return s.userLocale(ctx, strings.TrimSpace(createdBy.String))
+}
+
+// planModeEnteredMessage mirrors the TS i18n tool.enterPlanModeOutput message.
+func planModeEnteredMessage(locale string) string {
+	if locale == "zh-CN" {
+		return "已进入计划模式。请先分析和规划，再进行修改。"
+	}
+	return "Entered plan mode. Analyze and plan before making changes."
 }
 
 func toolNameBoolSet(values []string) map[string]bool {
@@ -2784,7 +2883,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	if err != nil {
 		return
 	}
-	history, err := s.agentHistory(ctx, narratorID, s.agentHistoryLimit())
+	history, err := s.agentHistory(ctx, narratorID)
 	if err != nil {
 		s.persistAgentError(ctx, narratorID, err, narrator.IsBackground)
 		return
@@ -3141,7 +3240,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			state.narrator = currentNarrator
 			return nil, nil
 		}
-		rebuiltHistory, err := s.agentHistory(runCtx, narratorID, s.agentHistoryLimit())
+		rebuiltHistory, err := s.agentHistory(runCtx, narratorID)
 		if err != nil {
 			return nil, err
 		}
@@ -3163,6 +3262,9 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		agentbasic.WithDisabledTools(disabledToolsFromTraits(narrator.Traits)),
 		agentbasic.WithExternalTools(externalTools),
 		agentbasic.WithFirstTokenTimeout(s.agentFirstTokenTimeout()),
+		agentbasic.WithRetryBackoffCeil(s.agentRetryBackoffCeil()),
+		agentbasic.WithMaxChatRetries(s.agentMaxTransientRetries()),
+		agentbasic.WithSilentToolCallThreshold(s.agentSilentToolCallThreshold()),
 		agentbasic.WithToolInventoryEvent(true),
 		agentbasic.WithStickySessionKey(narratorID),
 		agentbasic.WithSideCarCollector(state.sideCarToolCount, sideCarCollector, func(count int) { state.sideCarToolCount = count }),
@@ -3370,17 +3472,6 @@ func (s *Service) agentMaxTurns() int {
 	}
 }
 
-func (s *Service) agentHistoryLimit() int {
-	limit := s.agentIntSetting("historyLimit", 80)
-	if limit <= 0 {
-		limit = 80
-	}
-	if limit > 200 {
-		limit = 200
-	}
-	return limit
-}
-
 func (s *Service) agentFirstTokenTimeout() time.Duration {
 	value := s.agentIntSetting("firstTokenTimeoutMs", 60000)
 	if value <= 0 {
@@ -3390,6 +3481,46 @@ func (s *Service) agentFirstTokenTimeout() time.Duration {
 		value = 600000
 	}
 	return time.Duration(value) * time.Millisecond
+}
+
+func (s *Service) agentRetryBackoffCeil() time.Duration {
+	// Mirror the TS backoffCeil = config.retryBackoffCeilMs ?? 20000
+	// (server/lib/agent/loop.ts). The Go settings validator bounds the stored
+	// value to [1000, 300000]; an absent/zero setting falls back to 20000ms.
+	value := s.agentIntSetting("retryBackoffCeilMs", 20000)
+	if value <= 0 {
+		value = 20000
+	}
+	return time.Duration(value) * time.Millisecond
+}
+
+func (s *Service) agentMaxTransientRetries() int {
+	// Mirror the TS maxConfiguredRetries = config.maxTransientRetries ?? 0 with the
+	// settings default of 10 (server/lib/settings/defaults.ts). The Go settings
+	// validator bounds the value to [-1, 100], where -1 is the infinite-retry
+	// sentinel. An absent setting falls back to the 10 default; values below -1
+	// clamp to -1, above 100 clamp to 100.
+	value := s.agentIntSetting("maxTransientRetries", 10)
+	if value < -1 {
+		value = -1
+	}
+	if value > 100 {
+		value = 100
+	}
+	return value
+}
+
+func (s *Service) agentSilentToolCallThreshold() int {
+	// Mirror the TS getSilentToolCallThreshold() = settings.agent.silentToolCallThreshold
+	// (default 20, server/lib/settings/defaults.ts) with the loop's normalize
+	// clamp (value < -1 -> -1; -1 disables the silent-tool-call wrap-up). The Go
+	// settings validator bounds the stored value to [-1, 1000]; an absent setting
+	// falls back to the 20 default.
+	value := s.agentIntSetting("silentToolCallThreshold", 20)
+	if value < -1 {
+		value = -1
+	}
+	return value
 }
 
 func (s *Service) agentIntSetting(key string, fallback int) int {
@@ -3415,36 +3546,40 @@ func (s *Service) agentIntSetting(key string, fallback int) int {
 	return fallback
 }
 
-func (s *Service) agentHistory(ctx context.Context, narratorID string, limit int) ([]agentbasic.Message, error) {
-	if limit <= 0 {
-		limit = 80
-	}
-	if limit > 200 {
-		limit = 200
-	}
+// agentHistoryBatchSize bounds each cursor page of the messages-since-compact
+// read so no single query is unbounded (honoring the backend rule against
+// unbounded .all() on narrator_message_refs). agentHistoryMaxRefs is a defensive
+// absolute ceiling against pathological data; normal conversations are bounded by
+// the token/context-window compact mechanism (context_overflow.go) far below it,
+// so unlike the former 80/200 cap it does not silently truncate before compact.
+const (
+	agentHistoryBatchSize = 500
+	agentHistoryMaxRefs   = 100000
+	// messageRefInChunkSize bounds IN-clause parameter counts when loading messages
+	// or child messages by id, keeping each query under the SQLite bound-parameter
+	// limit now that agentHistory can return an uncapped messages-since-compact set.
+	messageRefInChunkSize = 500
+)
+
+// agentHistory builds the per-turn agent history from all messages after the
+// last compact boundary, matching the TS buildHistory/getMessagesSinceLastCompact
+// (server/services/narrator-messages.ts) which loads every message since compact
+// with no row-count limit. To honor the backend performance rule it reads the refs
+// in bounded cursor pages (agentHistoryBatchSize) rather than a single unbounded
+// query, and applies a defensive agentHistoryMaxRefs ceiling.
+func (s *Service) agentHistory(ctx context.Context, narratorID string) ([]agentbasic.Message, error) {
 	compactRef, hasCompact, err := s.lastCompactRef(ctx, narratorID)
 	if err != nil {
 		return nil, err
-	}
-	conditions := []string{"r.narrator_id = ?", "r.segment_compact_id IS NULL"}
-	args := []any{narratorID}
-	if hasCompact {
-		conditions = append(conditions, "r.seq > ?")
-		args = append(args, compactRef.Seq)
 	}
 	isSubagent, err := s.isSubagentNarrator(ctx, narratorID)
 	if err != nil {
 		return nil, err
 	}
-	if !isSubagent {
-		conditions = append(conditions, "m.parent_tool_use_id IS NULL")
-	}
-	args = append(args, limit)
-	refs, err := s.queryMessageRefs(ctx, strings.Join(conditions, " AND "), "r.seq DESC", args...)
+	refs, err := s.agentHistoryRefsSinceCompact(ctx, narratorID, compactRef, hasCompact, isSubagent)
 	if err != nil {
 		return nil, err
 	}
-	reverseMessageRefs(refs)
 	messages, err := s.loadMessagesForRefs(ctx, narratorID, refs)
 	if err != nil {
 		return nil, err
@@ -3474,6 +3609,51 @@ func (s *Service) agentHistory(ctx context.Context, narratorID string, limit int
 	return history, nil
 }
 
+// agentHistoryRefsSinceCompact reads every message ref after the compact
+// boundary using bounded cursor pages, returning them in ascending seq order.
+// Each query is LIMIT-bound (agentHistoryBatchSize) so the read is never a
+// single unbounded scan. To honour the defensive agentHistoryMaxRefs ceiling
+// WITHOUT silently dropping the most recent conversation, pages are collected
+// in descending seq order (newest first) and the scan stops once the ceiling is
+// reached; the result is then reversed back to ascending order. This keeps the
+// freshest messages the model needs and discards only the oldest overflow.
+func (s *Service) agentHistoryRefsSinceCompact(ctx context.Context, narratorID string, compactRef messageRef, hasCompact, isSubagent bool) ([]messageRef, error) {
+	lowerBound := -1 << 62
+	if hasCompact {
+		lowerBound = compactRef.Seq
+	}
+	beforeSeq := 1 << 62
+	all := []messageRef{}
+	for {
+		conditions := []string{"r.narrator_id = ?", "r.segment_compact_id IS NULL", "r.seq > ?", "r.seq < ?"}
+		args := []any{narratorID, lowerBound, beforeSeq}
+		if !isSubagent {
+			conditions = append(conditions, "m.parent_tool_use_id IS NULL")
+		}
+		args = append(args, agentHistoryBatchSize)
+		page, err := s.queryMessageRefs(ctx, strings.Join(conditions, " AND "), "r.seq DESC", args...)
+		if err != nil {
+			return nil, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		all = append(all, page...)
+		beforeSeq = page[len(page)-1].Seq
+		if len(page) < agentHistoryBatchSize || len(all) >= agentHistoryMaxRefs {
+			break
+		}
+	}
+	if len(all) > agentHistoryMaxRefs {
+		all = all[:agentHistoryMaxRefs]
+	}
+	// Pages were collected newest-first; reverse to ascending seq order.
+	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
+		all[i], all[j] = all[j], all[i]
+	}
+	return all, nil
+}
+
 func (s *Service) lastCompactRef(ctx context.Context, narratorID string) (messageRef, bool, error) {
 	var ref messageRef
 	err := s.DB.QueryRowContext(ctx, `SELECT message_id, seq FROM narrator_message_refs WHERE narrator_id = ? AND is_compact = 1 ORDER BY seq DESC LIMIT 1`, narratorID).Scan(&ref.MessageID, &ref.Seq)
@@ -3501,27 +3681,59 @@ type agentPipelineCapture struct {
 	Alias string
 	Tool  string
 	Text  string
+	Bytes int
 }
 
 type agentPipelineState struct {
 	Active     bool
 	Label      string
 	MaxPreview int
+	NextAlias  int
 	Captures   []agentPipelineCapture
 }
 
-func (p *agentPipelineState) start(label string, maxPreview int) string {
-	if maxPreview <= 0 || maxPreview > 100 {
-		maxPreview = 100
+func clampPipelinePreviewChars(value int) int {
+	if value <= 0 || value > 100 {
+		return 100
 	}
+	return value
+}
+
+func (p *agentPipelineState) start(label string, maxPreview int) string {
+	maxPreview = clampPipelinePreviewChars(maxPreview)
 	p.Active = true
 	p.Label = strings.TrimSpace(label)
 	p.MaxPreview = maxPreview
+	p.NextAlias = 1
 	p.Captures = nil
+	// Mirror the TS startPipelineTool output (server/lib/agent/tools/pipeline.ts):
+	// "Pipeline mode started[ (<label>)]. Future tool outputs will be captured as
+	// p1, p2, ... with previews capped at <N> characters. Use EndPipeline with a
+	// rule such as: from p1 | grep -i \"error|failed\" | head -n 20". Go previously
+	// returned a terse "Pipeline capture started[: label]" line.
+	labelSuffix := ""
 	if p.Label != "" {
-		return "Pipeline capture started: " + p.Label
+		labelSuffix = " (" + p.Label + ")"
 	}
-	return "Pipeline capture started."
+	return fmt.Sprintf(
+		"Pipeline mode started%s. Future tool outputs will be captured as p1, p2, ... with previews capped at %d characters. Use EndPipeline with a rule such as: from p1 | grep -i \"error|failed\" | head -n 20",
+		labelSuffix, maxPreview,
+	)
+}
+
+// pipelineClipText mirrors the TS clipText (pipeline-state.ts): when the UTF-16
+// length exceeds the (clamped) limit, keep the first limit-1 code units and
+// append the single-character ellipsis "…".
+func pipelineClipText(text string, maxChars int) string {
+	limit := clampPipelinePreviewChars(maxChars)
+	if recallJSLen(text) <= limit {
+		return text
+	}
+	keep := limit - 1
+	if keep < 0 {
+		keep = 0
+	}
+	return recallJSSlice(text, keep) + "…"
 }
 
 func (p *agentPipelineState) capture(run *agentbasic.ToolRun) {
@@ -3531,145 +3743,499 @@ func (p *agentPipelineState) capture(run *agentbasic.ToolRun) {
 	if run.Name == "StartPipeline" || run.Name == "EndPipeline" {
 		return
 	}
-	alias := fmt.Sprintf("p%d", len(p.Captures)+1)
-	text := run.Output
-	p.Captures = append(p.Captures, agentPipelineCapture{Alias: alias, Tool: run.Name, Text: text})
-	preview := text
-	if len(preview) > p.MaxPreview {
-		preview = preview[:p.MaxPreview] + "..."
+	if p.NextAlias <= 0 {
+		p.NextAlias = 1
 	}
-	run.Output = fmt.Sprintf("Captured as %s (%d chars). Preview:\n%s", alias, len(text), preview)
+	alias := fmt.Sprintf("p%d", p.NextAlias)
+	p.NextAlias++
+	text := run.Output
+	bytes := len(text) // UTF-8 byte length, matching Buffer.byteLength(output, "utf-8")
+	p.Captures = append(p.Captures, agentPipelineCapture{Alias: alias, Tool: run.Name, Text: text, Bytes: bytes})
+	// Mirror the TS formatCapturedPreview (pipeline-state.ts): a multi-line
+	// "Pipeline capture alias: <alias>\nTool: <name>\nBytes: <n>\nPreview:\n<preview>"
+	// block, where preview is clipText(output, maxPreviewChars) and an empty
+	// preview renders as "(empty)". Go previously emitted a single-line
+	// "Captured as p1 (N chars). Preview:\n..." form.
+	preview := pipelineClipText(text, p.MaxPreview)
+	if preview == "" {
+		preview = "(empty)"
+	}
+	run.Output = strings.Join([]string{
+		"Pipeline capture alias: " + alias,
+		"Tool: " + run.Name,
+		fmt.Sprintf("Bytes: %d", bytes),
+		"Preview:",
+		preview,
+	}, "\n")
+}
+
+// pipelineClipFinal mirrors the TS clipFinal (pipeline.ts): when the UTF-16
+// length exceeds maxChars, keep the first maxChars-120 code units and append a
+// truncation notice reporting the omitted-char count (length - maxChars).
+func pipelineClipFinal(text string, maxChars int) string {
+	total := recallJSLen(text)
+	if total <= maxChars {
+		return text
+	}
+	keep := maxChars - 120
+	if keep < 0 {
+		keep = 0
+	}
+	return fmt.Sprintf("%s\n\n...pipeline result truncated (%d chars omitted)...", recallJSSlice(text, keep), total-maxChars)
+}
+
+func clampPipelineFinalChars(value int) int {
+	if value <= 0 {
+		return 12000
+	}
+	if value > 50000 {
+		return 50000
+	}
+	return value
 }
 
 func (p *agentPipelineState) end(rule string, aliases []string, format string, maxChars int) string {
 	if p == nil || !p.Active {
-		return "No active pipeline."
+		// Mirror the TS endPipelineTool guard message exactly.
+		return "Pipeline mode is not active."
 	}
-	if maxChars <= 0 || maxChars > 50000 {
-		maxChars = 12000
+	maxChars = clampPipelineFinalChars(maxChars)
+	sources := make([]pipelineCaptureSource, 0, len(p.Captures))
+	captureSummaryParts := make([]string, 0, len(p.Captures))
+	for _, capture := range p.Captures {
+		sources = append(sources, pipelineCaptureSource{Alias: capture.Alias, Text: capture.Text})
+		captureSummaryParts = append(captureSummaryParts, fmt.Sprintf("%s=%s(%dB)", capture.Alias, capture.Tool, capture.Bytes))
 	}
-	selected := p.selectCaptures(rule, aliases)
-	lines := []string{}
-	plain := strings.EqualFold(format, "plain")
-	for _, capture := range selected {
-		if plain {
-			lines = append(lines, capture.Text)
-		} else {
-			lines = append(lines, fmt.Sprintf("## %s — %s\n%s", capture.Alias, capture.Tool, capture.Text))
-		}
-	}
-	if len(lines) == 0 {
-		lines = append(lines, "No captured pipeline output matched the rule.")
-	}
-	out := strings.Join(lines, "\n\n")
-	out = applyPipelineRule(out, rule)
-	if len(out) > maxChars {
-		out = out[:maxChars] + "\n[truncated]"
-	}
+	result, ruleErr := executePipelineRule(sources, rule, aliases)
+	// Clear pipeline state regardless of outcome, matching TS which clears state
+	// after a successful run and surfaces rule errors as a separate result.
 	p.Active = false
 	p.Captures = nil
-	return out
+	p.NextAlias = 1
+	if ruleErr != nil {
+		// TS: PipelineRuleError -> "Pipeline rule error: <message>" (isError).
+		return "Pipeline rule error: " + ruleErr.Error()
+	}
+	bodyText := result.Text
+	if bodyText == "" {
+		bodyText = "(empty)"
+	}
+	body := pipelineClipFinal(bodyText, maxChars)
+	if strings.EqualFold(format, "plain") {
+		return body
+	}
+	captureSummary := strings.Join(captureSummaryParts, ", ")
+	if captureSummary == "" {
+		captureSummary = "(none)"
+	}
+	aliasesUsed := strings.Join(result.Aliases, ", ")
+	if aliasesUsed == "" {
+		aliasesUsed = "(none)"
+	}
+	stageSummary := "cat"
+	if len(result.Stages) > 0 {
+		stageSummary = strings.Join(result.Stages, " | ")
+	}
+	ruleLine := strings.TrimSpace(rule)
+	if ruleLine == "" {
+		ruleLine = stageSummary
+	}
+	return strings.Join([]string{
+		"Pipeline result",
+		"Aliases used: " + aliasesUsed,
+		"Captured: " + captureSummary,
+		"Rule: " + ruleLine,
+		"",
+		body,
+	}, "\n")
 }
 
-func (p *agentPipelineState) selectCaptures(rule string, aliases []string) []agentPipelineCapture {
-	aliasSet := map[string]bool{}
-	if strings.HasPrefix(strings.TrimSpace(rule), "from ") {
-		left := strings.TrimSpace(rule)
-		if idx := strings.Index(left, "|"); idx >= 0 {
-			left = left[:idx]
-		}
-		for _, token := range strings.Fields(strings.TrimPrefix(left, "from")) {
-			aliasSet[strings.TrimSpace(token)] = true
-		}
-	}
-	for _, alias := range aliases {
-		if strings.TrimSpace(alias) != "" {
-			aliasSet[strings.TrimSpace(alias)] = true
-		}
-	}
-	if len(aliasSet) == 0 {
-		return p.Captures
-	}
-	out := []agentPipelineCapture{}
-	for _, capture := range p.Captures {
-		if aliasSet[capture.Alias] {
-			out = append(out, capture)
-		}
-	}
-	return out
+// --- Restricted pipeline rule engine (mirrors server/lib/agent/pipeline-rules.ts) ---
+
+type pipelineCaptureSource struct {
+	Alias string
+	Text  string
 }
 
-func applyPipelineRule(input string, rule string) string {
-	out := input
-	for _, part := range strings.Split(rule, "|") {
-		part = strings.TrimSpace(part)
-		if part == "" || strings.HasPrefix(part, "from ") {
+type pipelineExecutionResult struct {
+	Aliases []string
+	Text    string
+	Stages  []string
+}
+
+type pipelineStage struct {
+	Command string
+	Args    []string
+	Raw     string
+}
+
+// splitPipelineStages tokenizes a pipeline rule into stages on unquoted "|",
+// honoring single/double quotes and backslash escapes, mirroring the TS
+// splitPipelineStages. Returns an error on an unclosed quote.
+func splitPipelineStages(rule string) ([][]string, error) {
+	stages := [][]string{}
+	current := []string{}
+	token := strings.Builder{}
+	var quote rune
+	escaping := false
+
+	pushToken := func() {
+		if token.Len() > 0 {
+			current = append(current, token.String())
+			token.Reset()
+		}
+	}
+	pushStage := func() {
+		pushToken()
+		if len(current) > 0 {
+			stages = append(stages, current)
+			current = []string{}
+		}
+	}
+
+	for _, ch := range rule {
+		if escaping {
+			token.WriteRune(ch)
+			escaping = false
 			continue
 		}
-		fields := strings.Fields(part)
-		if len(fields) == 0 {
+		if ch == '\\' && quote != '\'' {
+			escaping = true
 			continue
 		}
-		switch fields[0] {
-		case "grep":
-			ignoreCase := len(fields) > 1 && fields[1] == "-i"
-			patternIndex := 1
-			if ignoreCase {
-				patternIndex = 2
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			} else {
+				token.WriteRune(ch)
 			}
-			if len(fields) > patternIndex {
-				out = pipelineGrep(out, strings.Join(fields[patternIndex:], " "), ignoreCase)
-			}
-		case "head":
-			out = pipelineHeadTail(out, pipelineCount(fields, 20), true)
-		case "tail":
-			out = pipelineHeadTail(out, pipelineCount(fields, 20), false)
+			continue
 		}
+		if ch == '\'' || ch == '"' {
+			quote = ch
+			continue
+		}
+		if ch == '|' {
+			pushStage()
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v' {
+			pushToken()
+			continue
+		}
+		token.WriteRune(ch)
 	}
-	return out
+	if escaping {
+		token.WriteRune('\\')
+	}
+	if quote != 0 {
+		name := "double"
+		if quote == '\'' {
+			name = "single"
+		}
+		return nil, fmt.Errorf("Unclosed %s quote", name)
+	}
+	pushStage()
+	return stages, nil
 }
 
-func pipelineGrep(input, pattern string, ignoreCase bool) string {
-	pattern = strings.Trim(pattern, `"'`)
-	if ignoreCase {
-		pattern = strings.ToLower(pattern)
+func parsePipelineStages(rule string) ([]pipelineStage, error) {
+	trimmed := strings.TrimSpace(rule)
+	if trimmed == "" {
+		return []pipelineStage{{Command: "cat", Args: nil, Raw: "cat"}}, nil
+	}
+	parts, err := splitPipelineStages(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	stages := make([]pipelineStage, 0, len(parts))
+	for _, p := range parts {
+		if len(p) == 0 {
+			continue
+		}
+		stages = append(stages, pipelineStage{
+			Command: strings.ToLower(p[0]),
+			Args:    p[1:],
+			Raw:     strings.Join(p, " "),
+		})
+	}
+	return stages, nil
+}
+
+func executePipelineRule(sources []pipelineCaptureSource, rule string, defaultAliases []string) (pipelineExecutionResult, error) {
+	stages, err := parsePipelineStages(rule)
+	if err != nil {
+		return pipelineExecutionResult{}, err
+	}
+	byAlias := map[string]pipelineCaptureSource{}
+	for _, src := range sources {
+		byAlias[src.Alias] = src
+	}
+	selected := []string{}
+	if len(defaultAliases) > 0 {
+		selected = append(selected, defaultAliases...)
+	} else {
+		for _, src := range sources {
+			selected = append(selected, src.Alias)
+		}
+	}
+	startIndex := 0
+	if len(stages) > 0 && stages[0].Command == "from" {
+		if len(stages[0].Args) == 0 {
+			return pipelineExecutionResult{}, fmt.Errorf("from requires at least one alias")
+		}
+		selected = stages[0].Args
+		startIndex = 1
+	}
+	for _, alias := range selected {
+		if _, ok := byAlias[alias]; !ok {
+			return pipelineExecutionResult{}, fmt.Errorf("Unknown pipeline alias: %s", alias)
+		}
 	}
 	lines := []string{}
-	for _, line := range strings.Split(input, "\n") {
-		matchLine := line
-		if ignoreCase {
-			matchLine = strings.ToLower(line)
-		}
-		if strings.Contains(matchLine, pattern) {
-			lines = append(lines, line)
+	for _, alias := range selected {
+		src := byAlias[alias]
+		lines = append(lines, splitPipelineLines(src.Text)...)
+	}
+	executed := []string{}
+	for _, stage := range stages[startIndex:] {
+		executed = append(executed, stage.Raw)
+		lines, err = applyPipelineStage(lines, stage)
+		if err != nil {
+			return pipelineExecutionResult{}, err
 		}
 	}
-	return strings.Join(lines, "\n")
+	return pipelineExecutionResult{Aliases: selected, Text: strings.Join(lines, "\n"), Stages: executed}, nil
 }
 
-func pipelineHeadTail(input string, count int, head bool) string {
-	lines := strings.Split(input, "\n")
-	if count < 0 {
-		count = 0
-	}
-	if count > len(lines) {
-		count = len(lines)
-	}
-	if head {
-		return strings.Join(lines[:count], "\n")
-	}
-	return strings.Join(lines[len(lines)-count:], "\n")
+// splitPipelineLines splits on \r?\n, matching the TS String.split(/\r?\n/).
+func splitPipelineLines(text string) []string {
+	normalized := strings.ReplaceAll(text, "\r\n", "\n")
+	return strings.Split(normalized, "\n")
 }
 
-func pipelineCount(fields []string, fallback int) int {
-	for i, field := range fields {
-		if field == "-n" && i+1 < len(fields) {
-			if n, err := strconv.Atoi(fields[i+1]); err == nil {
-				return n
+func applyPipelineStage(lines []string, stage pipelineStage) ([]string, error) {
+	switch stage.Command {
+	case "cat":
+		if len(stage.Args) > 0 {
+			return nil, fmt.Errorf("cat does not accept arguments")
+		}
+		return lines, nil
+	case "grep":
+		return applyPipelineGrep(lines, stage.Args)
+	case "head":
+		count, err := parsePipelineCount(stage.Args, "head")
+		if err != nil {
+			return nil, err
+		}
+		if count >= len(lines) {
+			return lines, nil
+		}
+		return lines[:count], nil
+	case "tail":
+		count, err := parsePipelineCount(stage.Args, "tail")
+		if err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return []string{}, nil
+		}
+		if count >= len(lines) {
+			return lines, nil
+		}
+		return lines[len(lines)-count:], nil
+	case "sort":
+		return applyPipelineSort(lines, stage.Args)
+	case "uniq":
+		return applyPipelineUniq(lines, stage.Args)
+	case "cut":
+		return applyPipelineCut(lines, stage.Args)
+	case "from":
+		return nil, fmt.Errorf("from can only appear as the first stage")
+	default:
+		return nil, fmt.Errorf("Unsupported pipeline command: %s", stage.Command)
+	}
+}
+
+func parsePipelineCount(args []string, command string) (int, error) {
+	var raw string
+	switch {
+	case len(args) == 1:
+		raw = args[0]
+	case len(args) == 2 && args[0] == "-n":
+		raw = args[1]
+	default:
+		return 0, fmt.Errorf("%s expects N or -n N", command)
+	}
+	count, err := strconv.Atoi(raw)
+	if err != nil || count < 0 {
+		return 0, fmt.Errorf("%s count must be a non-negative integer", command)
+	}
+	return count, nil
+}
+
+func applyPipelineGrep(lines []string, args []string) ([]string, error) {
+	ignoreCase := false
+	invert := false
+	rest := []string{}
+	for _, arg := range args {
+		switch arg {
+		case "-i":
+			ignoreCase = true
+		case "-v":
+			invert = true
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	if len(rest) != 1 {
+		return nil, fmt.Errorf("grep expects exactly one pattern argument")
+	}
+	pattern := rest[0]
+	if ignoreCase {
+		pattern = "(?i)" + pattern
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("Invalid grep pattern: %s", err.Error())
+	}
+	out := []string{}
+	for _, line := range lines {
+		matched := re.MatchString(line)
+		if matched != invert {
+			out = append(out, line)
+		}
+	}
+	return out, nil
+}
+
+func applyPipelineSort(lines []string, args []string) ([]string, error) {
+	reverse := false
+	for _, arg := range args {
+		if arg == "-r" {
+			reverse = true
+		} else {
+			return nil, fmt.Errorf("Unsupported sort option: %s", arg)
+		}
+	}
+	sorted := make([]string, len(lines))
+	copy(sorted, lines)
+	// NOTE: TS applySort uses String.prototype.localeCompare (locale-aware ICU
+	// collation), whereas Go sorts by Unicode code point. For pure-ASCII
+	// same-case content the order is identical; mixed-case/non-ASCII lines can
+	// order differently (e.g. localeCompare folds case in the primary level).
+	// Go's standard library has no built-in ICU collator; code-point order is a
+	// deterministic, documented minor divergence (see EndPipeline capability
+	// contract "sortCollation").
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i] < sorted[j]
+	})
+	if reverse {
+		for i, j := 0, len(sorted)-1; i < j; i, j = i+1, j-1 {
+			sorted[i], sorted[j] = sorted[j], sorted[i]
+		}
+	}
+	return sorted, nil
+}
+
+func applyPipelineUniq(lines []string, args []string) ([]string, error) {
+	if len(args) > 0 {
+		return nil, fmt.Errorf("uniq does not accept arguments")
+	}
+	seen := map[string]bool{}
+	out := []string{}
+	for _, line := range lines {
+		if seen[line] {
+			continue
+		}
+		seen[line] = true
+		out = append(out, line)
+	}
+	return out, nil
+}
+
+func applyPipelineCut(lines []string, args []string) ([]string, error) {
+	delimiter := "\t"
+	fieldsSpec := ""
+	haveFields := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-d":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("cut -d requires a delimiter")
+			}
+			i++
+			delimiter = args[i]
+		case "-f":
+			if i+1 >= len(args) {
+				return nil, fmt.Errorf("cut -f requires a field list")
+			}
+			i++
+			fieldsSpec = args[i]
+			haveFields = true
+		default:
+			return nil, fmt.Errorf("Unsupported cut option: %s", args[i])
+		}
+	}
+	if !haveFields {
+		return nil, fmt.Errorf("cut requires -f <fields>")
+	}
+	fields, err := parsePipelineFields(fieldsSpec)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		parts := strings.Split(line, delimiter)
+		picked := make([]string, 0, len(fields))
+		for _, idx := range fields {
+			if idx-1 >= 0 && idx-1 < len(parts) {
+				picked = append(picked, parts[idx-1])
+			} else {
+				picked = append(picked, "")
 			}
 		}
+		out = append(out, strings.Join(picked, delimiter))
 	}
-	return fallback
+	return out, nil
+}
+
+func parsePipelineFields(spec string) ([]int, error) {
+	result := []int{}
+	for _, chunk := range strings.Split(spec, ",") {
+		if chunk == "" {
+			return nil, fmt.Errorf("cut field list contains an empty field")
+		}
+		if start, end, ok := parsePipelineFieldRange(chunk); ok {
+			if start < 1 || end < start {
+				return nil, fmt.Errorf("Invalid cut field range: %s", chunk)
+			}
+			for i := start; i <= end; i++ {
+				result = append(result, i)
+			}
+			continue
+		}
+		field, err := strconv.Atoi(chunk)
+		if err != nil || field < 1 {
+			return nil, fmt.Errorf("Invalid cut field: %s", chunk)
+		}
+		result = append(result, field)
+	}
+	return result, nil
+}
+
+func parsePipelineFieldRange(chunk string) (int, int, bool) {
+	dash := strings.IndexByte(chunk, '-')
+	if dash <= 0 || dash == len(chunk)-1 {
+		return 0, 0, false
+	}
+	startStr, endStr := chunk[:dash], chunk[dash+1:]
+	start, err1 := strconv.Atoi(startStr)
+	end, err2 := strconv.Atoi(endStr)
+	if err1 != nil || err2 != nil {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
 func (s *Service) reviewMetaForNarrator(ctx context.Context, narrator Narrator) (reviewChapterMeta, bool) {
@@ -3809,18 +4375,30 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = output
 		return run, true, nil
 	case "EnterPlanMode":
-		payload, err := s.setNarratorPlanMode(ctx, narratorID, true)
-		if err != nil {
+		if _, err := s.setNarratorPlanMode(ctx, narratorID, true); err != nil {
 			return run, true, err
 		}
-		run.Output = jsonToolOutput(payload)
+		// Mirror the TS enterPlanModeTool result (server/lib/agent/tools/plan-mode.ts
+		// + i18n tool.enterPlanModeOutput): the MODEL sees the plain confirmation
+		// text, not the structured plan-mode state payload. The DB update and
+		// plan_mode_changed WS broadcast (the real state) happen inside
+		// setNarratorPlanMode. Go previously returned jsonToolOutput(payload),
+		// showing the model a JSON blob instead of the TS sentence.
+		run.Output = planModeEnteredMessage(s.toolLocale(ctx, narratorID))
 		return run, true, nil
 	case "GetGoals":
 		goals, err := s.loadGoals(ctx, narratorID)
 		if err != nil {
 			return run, true, err
 		}
-		run.Output = jsonToolOutput(map[string]any{"goals": goals})
+		// Mirror the TS getGoalsTool output (server/lib/agent/tools/goal.ts):
+		// { goals, active, summary }. Go previously returned only { goals },
+		// omitting the active goal and the human-readable summary the model sees.
+		run.Output = jsonToolOutput(map[string]any{
+			"goals":   goals,
+			"active":  activeGoalFromList(goals),
+			"summary": formatGoals(goals),
+		})
 		return run, true, nil
 	case "AddGoal":
 		objective := strings.TrimSpace(stringFromAny(args["objective"]))
@@ -3828,7 +4406,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 			run.Output = "objective is required"
 			return run, true, nil
 		}
-		if len([]rune(objective)) > 4000 {
+		if httpx.JSStringLength(objective) > 4000 {
 			run.Output = "objective must be at most 4000 characters"
 			return run, true, nil
 		}
@@ -3836,7 +4414,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		if err != nil {
 			return run, true, err
 		}
-		run.Output = jsonToolOutput(payload)
+		run.Output = jsonToolOutput(addGoalToolOutput(payload))
 		return run, true, nil
 	case "UpdateGoal":
 		if err := s.ensureSpecialToolCallRecorded(ctx, narratorID, narrator, draftMessageID, call, args); err != nil {
@@ -3881,6 +4459,15 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		payload, err := s.completeActiveGoalWithReflectionContext(ctx, narratorID, goalID, stringFromAny(args["evidence"]), stringFromAny(args["reflection"]), history, reflectionMeta)
 		if err != nil {
 			return run, true, err
+		}
+		// Mirror the TS updateGoalTool success output (goal.ts): add the
+		// human-readable `summary` over the resulting goal list. Only on the
+		// success path (no error key); the error/denied payloads keep their
+		// TS-matching error/feedback/nextSteps shape unchanged.
+		if strings.TrimSpace(stringFromAny(payload["error"])) == "" {
+			if goalsList, ok := payload["goals"].([]map[string]any); ok {
+				payload["summary"] = formatGoals(goalsList)
+			}
 		}
 		run.Output = jsonToolOutput(payload)
 		if strings.TrimSpace(stringFromAny(payload["error"])) != "" {
@@ -4000,7 +4587,10 @@ func toolHookInputFromCall(call agentbasic.ToolCall) map[string]any {
 
 func truncateToolHookInput(input map[string]any) map[string]any {
 	serialized, err := json.Marshal(input)
-	if err != nil || len(serialized) <= 8000 {
+	// Mirror TS `JSON.stringify(input).length <= MAX_HOOK_INPUT_SIZE` (8000) using
+	// UTF-16 code-unit length so a non-ASCII tool_input is gated at the same size
+	// boundary as TS rather than at a byte count.
+	if err != nil || httpx.JSStringLength(string(serialized)) <= 8000 {
 		return input
 	}
 	truncated, ok := truncateToolHookValue(input).(map[string]any)
@@ -4013,8 +4603,14 @@ func truncateToolHookInput(input map[string]any) map[string]any {
 func truncateToolHookValue(value any) any {
 	switch typed := value.(type) {
 	case string:
-		if len(typed) > 500 {
-			return typed[:500] + fmt.Sprintf("… [truncated, %d chars total]", len(typed))
+		// Mirror the TS truncateValue (server/lib/agent/tool-executor.ts):
+		// `val.length > 500` and `val.slice(0, 500)` with `${val.length}`, all in
+		// UTF-16 code units. Go previously used byte length + a byte slice, which for
+		// a non-ASCII tool_input value would diverge on the >500 gate, report the
+		// wrong "chars total" count, and could cut mid-rune (invalid UTF-8 in the
+		// hook payload).
+		if httpx.JSStringLength(typed) > 500 {
+			return httpx.JSStringSlicePrefix(typed, 500) + fmt.Sprintf("… [truncated, %d chars total]", httpx.JSStringLength(typed))
 		}
 		return typed
 	case []any:
@@ -4196,8 +4792,61 @@ func (b *limitedHookBuffer) Truncated() bool {
 	return b.truncated
 }
 
+// gitStatusTrackThrottle matches the TS 800ms trailing throttle
+// (narrator-session.ts:1339) used to collapse rapid file-mutating tool calls
+// into a single trailing git-status query.
+const gitStatusTrackThrottle = 800 * time.Millisecond
+
+// gitStatusBroadcastTimeout bounds the detached trailing git-status broadcast so
+// a stuck git subprocess cannot leak the AfterFunc goroutine indefinitely.
+const gitStatusBroadcastTimeout = 15 * time.Second
+
+// broadcastGitStatusAfterTool schedules a throttled git-status broadcast after a
+// git-status-tracking tool runs. A burst of rapid tool calls collapses into a
+// single trailing query using the most recent toolUseID, mirroring TS's
+// active._gitTrackTimer clearTimeout/setTimeout pattern and avoiding repeated
+// synchronous `git status`/`git rev-list` subprocess calls in the tool path.
 func (s *Service) broadcastGitStatusAfterTool(ctx context.Context, narratorID string, narrator Narrator, toolName, toolUseID string) {
 	if s.Hub == nil || !isGitStatusTrackingTool(toolName) || narrator.ChapterID == nil || strings.TrimSpace(*narrator.ChapterID) == "" {
+		return
+	}
+	s.gitTrackMu.Lock()
+	defer s.gitTrackMu.Unlock()
+	if s.gitTrackTimers == nil {
+		s.gitTrackTimers = map[string]*time.Timer{}
+	}
+	if existing := s.gitTrackTimers[narratorID]; existing != nil {
+		existing.Stop()
+	}
+	// Detach from the request context: like the TS setTimeout, the trailing query
+	// must still run after the tool call (and its execCtx) has returned. Use a
+	// bounded timeout so a stuck `git status`/`git rev-list` subprocess can never
+	// leak this detached goroutine (per backend perf rules: subprocess calls must
+	// have a timeout).
+	s.gitTrackTimers[narratorID] = time.AfterFunc(gitStatusTrackThrottle, func() {
+		s.gitTrackMu.Lock()
+		delete(s.gitTrackTimers, narratorID)
+		s.gitTrackMu.Unlock()
+		bgCtx, cancel := context.WithTimeout(context.Background(), gitStatusBroadcastTimeout)
+		defer cancel()
+		s.runGitStatusBroadcast(bgCtx, narratorID, narrator, toolUseID)
+	})
+}
+
+// clearGitTrackTimer stops and removes any pending trailing git-status timer for
+// the narrator, used when a run finishes so no stale broadcast fires afterwards
+// (mirrors the TS clearTimeout(active._gitTrackTimer) on cleanup/finalize).
+func (s *Service) clearGitTrackTimer(narratorID string) {
+	s.gitTrackMu.Lock()
+	defer s.gitTrackMu.Unlock()
+	if timer := s.gitTrackTimers[narratorID]; timer != nil {
+		timer.Stop()
+		delete(s.gitTrackTimers, narratorID)
+	}
+}
+
+func (s *Service) runGitStatusBroadcast(ctx context.Context, narratorID string, narrator Narrator, toolUseID string) {
+	if s.Hub == nil || narrator.ChapterID == nil || strings.TrimSpace(*narrator.ChapterID) == "" {
 		return
 	}
 	chapterID := strings.TrimSpace(*narrator.ChapterID)
@@ -4818,6 +5467,155 @@ func disabledToolsFromTraits(traits []string) []string {
 	return nil
 }
 
+// subagentModelPolicy mirrors the TS resolveEffectiveSubagentModelPolicy
+// (server/lib/narrator-custom-traits.ts): a per-narrator subagent-model-restriction
+// trait pool (custom) takes precedence over the global
+// settings.agent.subagentAllowedModels[poolKey] (settings); when neither applies the
+// source is "none" (no restriction). poolKey is explore/plan/general (anything else
+// maps to general). models is the allowed pool; isExplicitEmpty marks a custom pool
+// that was explicitly configured empty (no model allowed).
+func (s *Service) subagentModelPolicy(parentTraits []string, subagentType string) (source, poolKey string, models []string, isExplicitEmpty bool) {
+	switch subagentType {
+	case "explore", "plan", "general":
+		poolKey = subagentType
+	default:
+		poolKey = "general"
+	}
+	// 1. Per-narrator custom restriction trait.
+	if restriction := parseEncodedTrait(parentTraits, subagentModelRestrictionTraitPrefix); restriction != nil {
+		if pools, ok := restriction["pools"].(map[string]any); ok {
+			directKey := normalizePoolKey(subagentType)
+			builtin := directKey == "explore" || directKey == "plan" || directKey == "general"
+			if directKey != "" {
+				if entries, exists := pools[directKey]; exists {
+					list := subagentPoolModels(entries)
+					return "custom", directKey, list, len(list) == 0
+				}
+			}
+			if !builtin {
+				if entries, exists := pools["general"]; exists {
+					list := subagentPoolModels(entries)
+					return "custom", "general", list, len(list) == 0
+				}
+			}
+		}
+	}
+	// 2. Global settings.agent.subagentAllowedModels[poolKey].
+	settingsPool := s.subagentAllowedModelsSetting(poolKey)
+	if len(settingsPool) == 0 {
+		return "none", poolKey, nil, false
+	}
+	return "settings", poolKey, settingsPool, false
+}
+
+// subagentPoolModels extracts the ordered model strings from a restriction pool
+// entry list (each entry is a string or an object with a "model" field).
+func subagentPoolModels(entries any) []string {
+	list, ok := entries.([]any)
+	if !ok {
+		return []string{}
+	}
+	models := make([]string, 0, len(list))
+	for _, item := range list {
+		switch v := item.(type) {
+		case string:
+			if m := strings.TrimSpace(v); m != "" {
+				models = append(models, m)
+			}
+		case map[string]any:
+			if m := strings.TrimSpace(stringFromAny(v["model"])); m != "" {
+				models = append(models, m)
+			}
+		}
+	}
+	return models
+}
+
+// subagentAllowedModelsSetting reads settings.agent.subagentAllowedModels[poolKey].
+func (s *Service) subagentAllowedModelsSetting(poolKey string) []string {
+	if s.Settings == nil {
+		return nil
+	}
+	agent, _ := s.Settings.Raw()["agent"].(map[string]any)
+	allowed, _ := agent["subagentAllowedModels"].(map[string]any)
+	list, _ := allowed[poolKey].([]any)
+	models := make([]string, 0, len(list))
+	for _, item := range list {
+		if m := strings.TrimSpace(stringFromAny(item)); m != "" {
+			models = append(models, m)
+		}
+	}
+	return models
+}
+
+// subagentModelDefaultPref mirrors the TS subagentPref resolution: explore/plan use
+// settings.agent.subagentModels[type]; a custom (non-builtin) subagent type uses its
+// SUBAGENT.md defaultModel. Returns "" when no preference applies.
+func (s *Service) subagentModelDefaultPref(subagentType string) string {
+	if subagentType == "explore" || subagentType == "plan" {
+		if s.Settings == nil {
+			return ""
+		}
+		agent, _ := s.Settings.Raw()["agent"].(map[string]any)
+		models, _ := agent["subagentModels"].(map[string]any)
+		return strings.TrimSpace(stringFromAny(models[subagentType]))
+	}
+	if subagentType == "general" || subagentType == "review" || subagentType == "" {
+		return ""
+	}
+	// Custom subagent type: read its defaultModel from SUBAGENT.md frontmatter.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(home, ".narrafork", "subagents", subagentType, "SUBAGENT.md"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(parseCustomSubagentFrontmatterForTools(string(data))["defaultModel"])
+}
+
+// resolveSubagentModelFromPolicy mirrors the TS resolveSubagentModelFromPolicy:
+// when there is no restriction (source "none") it returns the explicit model or the
+// first non-empty candidate; otherwise it filters through the allowed pool. The
+// bool result is false only when a restriction applies but no candidate is allowed
+// (the caller rejects the spawn).
+func (s *Service) resolveSubagentModelFromPolicy(source string, models []string, isExplicitEmpty bool, explicitModel string, candidates []string) (string, bool) {
+	raw := map[string]any{}
+	if s.Settings != nil {
+		raw = s.Settings.Raw()
+	}
+	if source == "none" {
+		if explicitModel != "" {
+			return explicitModel, true
+		}
+		for _, candidate := range candidates {
+			if strings.TrimSpace(candidate) != "" {
+				return candidate, true
+			}
+		}
+		return "", true
+	}
+	if isExplicitEmpty {
+		return "", false
+	}
+	if explicitModel != "" {
+		if resolved := agentbasic.ResolveAllowedModelCandidate(raw, explicitModel, models); resolved != "" {
+			return resolved, true
+		}
+		return "", false
+	}
+	for _, candidate := range candidates {
+		if resolved := agentbasic.ResolveAllowedModelCandidate(raw, candidate, models); resolved != "" {
+			return resolved, true
+		}
+	}
+	if len(models) > 0 {
+		return models[0], true
+	}
+	return "", false
+}
+
 func (s *Service) executeAgentTool(ctx context.Context, parentID string, args map[string]any) (map[string]any, error) {
 	if stopID := strings.TrimSpace(stringFromAny(args["stop"])); stopID != "" {
 		child, err := s.resolveChildNarrator(ctx, parentID, stopID)
@@ -4844,7 +5642,37 @@ func (s *Service) executeAgentTool(ctx context.Context, parentID string, args ma
 		return nil, err
 	}
 	subagentType := normalizeSubagentType(stringFromAny(args["subagent_type"]))
-	model := firstNonEmptyString(stringFromAny(args["model"]), ptrString(parent.Model), s.defaultNarratorModel())
+	explicitModel := strings.TrimSpace(stringFromAny(args["model"]))
+	// Resolve the subagent model through the same policy chain as TS subagent-runner:
+	// explicit > per-type/custom default > parent model > settings default, filtered
+	// through the allowed-model pool (settings.agent.subagentAllowedModels or the
+	// per-narrator subagent-model-restriction trait), matching expandModelReference.
+	parentModelCandidate := "__default__"
+	if pm := strings.TrimSpace(ptrString(parent.Model)); pm != "" {
+		parentModelCandidate = pm
+	}
+	candidates := []string{
+		s.subagentModelDefaultPref(subagentType),
+		parentModelCandidate,
+		s.defaultNarratorModel(),
+	}
+	source, poolKey, poolModels, isExplicitEmpty := s.subagentModelPolicy(parent.Traits, subagentType)
+	model, allowed := s.resolveSubagentModelFromPolicy(source, poolModels, isExplicitEmpty, explicitModel, candidates)
+	if source != "none" && !allowed {
+		if isExplicitEmpty {
+			return toolValidationErrorPayload(
+				"AGENT_MODEL_NOT_ALLOWED",
+				"No models are allowed for \""+poolKey+"\" subagents by this narrator's custom trait.",
+			), nil
+		}
+		return toolValidationErrorPayload(
+			"AGENT_MODEL_NOT_ALLOWED",
+			"No candidate model is in the allowed pool for \""+poolKey+"\" subagents. Allowed models: "+strings.Join(poolModels, ", ")+". Please specify one of these models explicitly.",
+		), nil
+	}
+	if strings.TrimSpace(model) == "" {
+		model = s.defaultNarratorModel()
+	}
 	reasoningEffort := firstNonEmptyString(stringFromAny(args["reasoning_effort"]), ptrString(parent.ReasoningEffort))
 	cwd, cwdErr := resolveSubagentCwd(ptrString(parent.Cwd), stringFromAny(args["workdir"]))
 	if cwdErr != nil {
@@ -4971,6 +5799,18 @@ const (
 	exitPlanFileMaxBytes         = 256 * 1024
 )
 
+// backgroundBashTitle mirrors the TS `description || command.slice(0, 80)`
+// (server/lib/agent/tools/bash.ts:182): a non-empty description is used verbatim;
+// otherwise the command is sliced to 80 UTF-16 code units. The empty check uses
+// TrimSpace so a whitespace-only description falls back to the command (a small
+// Go robustness choice; TS would keep the whitespace description).
+func backgroundBashTitle(description, command string) string {
+	if strings.TrimSpace(description) != "" {
+		return description
+	}
+	return httpx.JSStringSlicePrefix(command, 80)
+}
+
 func (s *Service) createBackgroundBashTask(ctx context.Context, parentID, taskID, command, toolUseID, alias, title string) error {
 	now := db.NowISO()
 	_, err := s.DB.ExecContext(ctx, `INSERT OR REPLACE INTO background_tasks (
@@ -5001,13 +5841,12 @@ func (s *Service) executeBackgroundBashTool(ctx context.Context, parentID string
 	}
 	taskID := "bash_" + id.Must(8)
 	alias := taskID
-	title := strings.TrimSpace(stringFromAny(args["description"]))
-	if title == "" {
-		title = command
-	}
-	if len([]rune(title)) > 80 {
-		title = string([]rune(title)[:80])
-	}
+	// Mirror the TS bash background title (server/lib/agent/tools/bash.ts:182):
+	// `const title = description || command.slice(0, 80)`. A non-empty description
+	// is used VERBATIM (not truncated); only the command fallback is sliced to 80
+	// UTF-16 code units. Go previously truncated BOTH to 80 runes, which (a) wrongly
+	// capped a provided description and (b) used rune count instead of UTF-16.
+	title := backgroundBashTitle(stringFromAny(args["description"]), command)
 	if err := s.createBackgroundBashTask(ctx, parentID, taskID, command, call.ID, alias, title); err != nil {
 		return "", err
 	}
@@ -5381,11 +6220,14 @@ func backgroundTaskStoredOutput(output string) (string, int, bool) {
 }
 
 func backgroundTaskPreview(output string) string {
-	if len([]rune(output)) <= backgroundTaskPreviewLength {
+	// Mirror the TS background-task outputPreview (background-task-service.ts:220):
+	// `output.length > PREVIEW_LENGTH ? output.slice(0, PREVIEW_LENGTH)+"…" : output`
+	// over UTF-16 code units. Go previously used []rune (Unicode code points), so
+	// astral-character output truncated at a different boundary than TS.
+	if httpx.JSStringLength(output) <= backgroundTaskPreviewLength {
 		return output
 	}
-	runes := []rune(output)
-	return string(runes[:backgroundTaskPreviewLength]) + "…"
+	return httpx.JSStringSlicePrefix(output, backgroundTaskPreviewLength) + "…"
 }
 
 func (s *Service) awaitBackgroundBashTool(ctx context.Context, parentID string, args map[string]any) (map[string]any, error) {
@@ -5590,8 +6432,13 @@ func normalizeBackgroundCompletionNotice(notice backgroundCompletionNotice) back
 	if strings.TrimSpace(notice.Title) == "" {
 		notice.Title = notice.ID
 	}
-	if len(notice.Result) > 12000 {
-		notice.Result = notice.Result[:12000]
+	// Mirror the TS capResult (server/services/bg-completion-queue.ts): cap the
+	// full background result at 12000 UTF-16 code units (`result.length` /
+	// `result.slice(0, 12000)`). Go previously used byte length + a byte slice,
+	// which for a non-ASCII result diverged on the >12000 gate and could cut
+	// mid-rune (invalid UTF-8 in the result injected to wake the parent narrator).
+	if httpx.JSStringLength(notice.Result) > 12000 {
+		notice.Result = httpx.JSStringSlicePrefix(notice.Result, 12000)
 		notice.ResultTruncated = true
 	}
 	if strings.TrimSpace(notice.ResultPreview) == "" {
@@ -6032,6 +6879,19 @@ func (s *Service) UpdateSubagentConclusion(ctx context.Context, subagentID strin
 			return nil, fmt.Errorf("clear subagent manual override: %w", err)
 		}
 	}
+	// Notify the parent narrator so its SubagentCard can refresh the concluded
+	// subagent output, mirroring the TS subagent conclusion broadcast
+	// (server/services/narrator-session.ts:2903).
+	if rows > 0 && s.Hub != nil {
+		s.Hub.BroadcastNarrator(strings.TrimSpace(*child.ParentNarratorID), map[string]any{
+			"type":               "subagent_conclusion_updated",
+			"narratorId":         strings.TrimSpace(*child.ParentNarratorID),
+			"subagentNarratorId": subagentID,
+			"toolUseId":          toolUseID,
+			"output":             finalText,
+			"hasError":           hasError,
+		})
+	}
 	fallback := rows == 0 || manualOverride
 	message := "Go backend updated the parent tool call conclusion when present; in-memory manual override waiters are not implemented, so any manual override is cleared as a fallback rather than resuming a blocked parent promise."
 	payload := map[string]any{
@@ -6346,11 +7206,11 @@ func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string,
 		_ = s.setNarratorRunSubstatus(ctx, narratorID, narrator.IsBackground, []string{"calling_model"})
 		return run, nil
 	}
-	answers, err := s.askUserQuestionAnswers(ctx, narratorID, call.ID)
+	answers, answerOrder, err := s.askUserQuestionAnswers(ctx, narratorID, call.ID)
 	if err != nil {
 		return agentbasic.ToolRun{}, err
 	}
-	run.Output = formatAskUserAnswers(answers)
+	run.Output = formatAskUserAnswers(answers, answerOrder)
 	if err := s.finishRecordedToolCall(ctx, narratorID, call.ID, *draftMessageID, run, decision, "success"); err != nil {
 		return agentbasic.ToolRun{}, err
 	}
@@ -6418,21 +7278,107 @@ func (s *Service) askQuestionAutoReflectionAllowed(ctx context.Context, narrator
 	return count > 0
 }
 
-func (s *Service) askUserQuestionAnswers(ctx context.Context, narratorID, toolUseID string) (map[string]any, error) {
+func (s *Service) askUserQuestionAnswers(ctx context.Context, narratorID, toolUseID string) (map[string]any, []string, error) {
 	var inputRaw sql.NullString
 	err := s.DB.QueryRowContext(ctx, `SELECT input_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = ? ORDER BY created_at DESC LIMIT 1`, narratorID, toolUseID).Scan(&inputRaw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if !inputRaw.Valid || strings.TrimSpace(inputRaw.String) == "" {
+		return map[string]any{}, nil, nil
 	}
 	input := map[string]any{}
-	if inputRaw.Valid && strings.TrimSpace(inputRaw.String) != "" {
-		_ = json.Unmarshal([]byte(inputRaw.String), &input)
-	}
+	_ = json.Unmarshal([]byte(inputRaw.String), &input)
 	answers, _ := input["answers"].(map[string]any)
 	if answers == nil {
-		return map[string]any{}, nil
+		return map[string]any{}, nil, nil
 	}
-	return answers, nil
+	// Preserve the JSON insertion order of the answers object so the formatted
+	// output matches the TS `Object.entries(answers)` iteration order (which is
+	// the question order), instead of Go's map iteration / alphabetical sort.
+	order := jsonObjectKeyOrder([]byte(inputRaw.String), "answers")
+	return answers, order, nil
+}
+
+// jsonObjectKeyOrder returns the keys of the object at top-level field `field`
+// in raw JSON, in their original textual (insertion) order. Returns nil when the
+// field is absent or not an object. This lets formatters mirror the JS
+// Object.entries iteration order that encoding/json's map decode discards.
+func jsonObjectKeyOrder(raw []byte, field string) []string {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// Expect the opening brace of the top-level object.
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, _ := keyTok.(string)
+		if key == field {
+			return jsonReadObjectKeyOrder(dec)
+		}
+		// Skip this field's value.
+		if err := skipJSONValue(dec); err != nil {
+			return nil
+		}
+	}
+	return nil
+}
+
+// jsonReadObjectKeyOrder reads an object value from dec (whose next token must be
+// '{') and returns its keys in order, skipping each value.
+func jsonReadObjectKeyOrder(dec *json.Decoder) []string {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil
+	}
+	keys := []string{}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil
+		}
+		key, _ := keyTok.(string)
+		keys = append(keys, key)
+		if err := skipJSONValue(dec); err != nil {
+			return nil
+		}
+	}
+	return keys
+}
+
+// skipJSONValue consumes one JSON value from dec, descending into arrays/objects.
+func skipJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := tok.(json.Delim); ok && (delim == '{' || delim == '[') {
+		depth := 1
+		for depth > 0 {
+			inner, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			if d, ok := inner.(json.Delim); ok {
+				if d == '{' || d == '[' {
+					depth++
+				} else {
+					depth--
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Service) askQuestionReflectionSystemPrompt(mode string) string {
@@ -6483,7 +7429,7 @@ func parseAskQuestions(raw any) []askQuestionInput {
 }
 
 func (s *Service) buildQuestionReflectionContext(ctx context.Context, narratorID string) string {
-	history, err := s.agentHistory(ctx, narratorID, 80)
+	history, err := s.agentHistory(ctx, narratorID)
 	if err != nil {
 		return ""
 	}
@@ -6739,26 +7685,37 @@ func mustJSON(value any) string {
 	return string(data)
 }
 
-func formatAskUserAnswers(answers map[string]any) string {
+func formatAskUserAnswers(answers map[string]any, order []string) string {
 	if len(answers) == 0 {
 		return "No answers were provided by the user."
 	}
-	keys := make([]string, 0, len(answers))
-	for key := range answers {
-		keys = append(keys, key)
+	// Mirror the TS Object.entries(answers) iteration order (question/insertion
+	// order) using the JSON-parsed key order; fall back to a deterministic sort
+	// only when the order is unavailable (e.g. legacy rows). Go previously always
+	// sorted alphabetically, reordering multi-question answers vs TS.
+	keys := order
+	if len(keys) == 0 {
+		keys = make([]string, 0, len(answers))
+		for key := range answers {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
 	}
-	sort.Strings(keys)
 	lines := []string{"User answered:"}
 	for _, key := range keys {
-		switch value := answers[key].(type) {
+		value, ok := answers[key]
+		if !ok {
+			continue
+		}
+		switch v := value.(type) {
 		case []any:
 			parts := []string{}
-			for _, item := range value {
+			for _, item := range v {
 				parts = append(parts, fmt.Sprint(item))
 			}
 			lines = append(lines, "- "+key+": "+strings.Join(parts, ", "))
 		default:
-			lines = append(lines, "- "+key+": "+fmt.Sprint(value))
+			lines = append(lines, "- "+key+": "+fmt.Sprint(v))
 		}
 	}
 	return strings.Join(lines, "\n")
@@ -6888,8 +7845,84 @@ func (s *Service) updateTodos(ctx context.Context, narratorID, toolUseID string,
 	}
 	if s.Hub != nil {
 		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "todos_updated", "narratorId": narratorID, "todos": todos, "toolUseId": toolUseID})
+		// When the narrator is a subagent, also notify the parent narrator so its
+		// SubagentCard can render the subagent's todos, mirroring the TS
+		// subagent-executor onTodoWrite dual broadcast (subagent-executor.ts:439-447).
+		s.broadcastSubagentTodosUpdated(ctx, narratorID, todos, toolUseID)
 	}
-	return fmt.Sprintf("Todos updated: %d total, %d completed, %d in progress, %d pending.", len(todos), counts["completed"], counts["in_progress"], counts["pending"]), nil
+	// Mirror the TS taskCreateTool result (server/lib/agent/tools/todo.ts): a
+	// localized header line followed by a blank line and the per-item formatted
+	// list (status icon + [id] + content + optional [priority]). Go previously
+	// returned only a single summary line ("Todos updated: ...") and OMITTED the
+	// formatted list entirely, so the model saw a different tool result than TS.
+	// The English header wording matches the TS i18n "tool.todoWriteOutput"
+	// ("Updated todos: N total (C completed, I in progress, P pending)").
+	header := fmt.Sprintf("Updated todos: %d total (%d completed, %d in progress, %d pending)",
+		len(todos), counts["completed"], counts["in_progress"], counts["pending"])
+	return header + "\n\n" + formatTodosForToolResult(todos), nil
+}
+
+// broadcastSubagentTodosUpdated notifies a subagent's parent narrator that the
+// subagent updated its todos, so the parent's SubagentCard can render them. It
+// mirrors the TS subagent-executor onTodoWrite dual broadcast
+// (server/services/subagent-executor.ts:439-447). No-op for primary narrators or
+// when the Hub is unset.
+func (s *Service) broadcastSubagentTodosUpdated(ctx context.Context, narratorID string, todos []map[string]any, toolUseID string) {
+	if s.Hub == nil {
+		return
+	}
+	var variant, narratorType string
+	var parentID sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT COALESCE(type, ''), COALESCE(variant, ''), parent_narrator_id FROM narrators WHERE id = ?`, narratorID).Scan(&narratorType, &variant, &parentID); err != nil {
+		return
+	}
+	if narratorType != "subagent" && variant != "subagent" {
+		return
+	}
+	parent := strings.TrimSpace(parentID.String)
+	if !parentID.Valid || parent == "" {
+		return
+	}
+	s.Hub.BroadcastNarrator(parent, map[string]any{
+		"type":               "subagent_todos_updated",
+		"narratorId":         parent,
+		"subagentNarratorId": narratorID,
+		"todos":              todos,
+		"toolUseId":          toolUseID,
+	})
+}
+
+// formatTodosForToolResult mirrors the TS formatTodos helper
+// (server/lib/agent/tools/todo.ts): each todo renders as
+// "<icon> [<id>] <content><priority?>" where the icon is ✓ (completed), → (in
+// progress), or ○ (pending), and the priority suffix " [<priority>]" is shown
+// only when present and not "medium". Empty list yields "No todos.".
+func formatTodosForToolResult(todos []map[string]any) string {
+	if len(todos) == 0 {
+		return "No todos."
+	}
+	lines := make([]string, 0, len(todos))
+	for _, todo := range todos {
+		status := strings.TrimSpace(stringFromAny(todo["status"]))
+		icon := "?"
+		switch status {
+		case "completed":
+			icon = "✓"
+		case "in_progress":
+			icon = "→"
+		case "pending":
+			icon = "○"
+		}
+		idValue := strings.TrimSpace(stringFromAny(todo["id"]))
+		content := stringFromAny(todo["content"])
+		priority := strings.TrimSpace(stringFromAny(todo["priority"]))
+		prioritySuffix := ""
+		if priority != "" && priority != "medium" {
+			prioritySuffix = " [" + priority + "]"
+		}
+		lines = append(lines, fmt.Sprintf("%s [%s] %s%s", icon, idValue, content, prioritySuffix))
+	}
+	return strings.Join(lines, "\n")
 }
 
 type reflectionDecision struct {
@@ -7677,19 +8710,52 @@ func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID st
 		run.Error = allowedPromptsError
 		return call, &run, "", nil
 	}
+	// Broadcast plan-reflection lifecycle events so the frontend can render the
+	// ExitPlanMode tool card's reflection progress, mirroring TS exit-plan-reflection.ts
+	// (server/lib/agent/tools/exit-plan-reflection.ts). Go runs the reflection
+	// synchronously (no awaiting_user pause), so only started/resolved are emitted,
+	// matching the Go question_reflection behaviour.
+	planReflectionRequestID := "plan_reflection_" + call.ID
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{
+			"type":       "plan_reflection_started",
+			"narratorId": narratorID,
+			"requestId":  planReflectionRequestID,
+			"toolUseId":  call.ID,
+			"toolName":   call.Function.Name,
+			"inputJson":  args,
+			"reason":     "Reviewing plan readiness before user approval",
+		})
+	}
+	broadcastPlanReflectionResolved := func(decision, reason string) {
+		if s.Hub == nil {
+			return
+		}
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{
+			"type":       "plan_reflection_resolved",
+			"narratorId": narratorID,
+			"requestId":  planReflectionRequestID,
+			"toolUseId":  call.ID,
+			"decision":   decision,
+			"reason":     strings.TrimSpace(reason),
+		})
+	}
 	decision, err := s.runExitPlanReflection(ctx, narratorID, plan, allowedPrompts)
 	if err != nil {
+		broadcastPlanReflectionResolved("deny", err.Error())
 		run.Status = "error"
 		run.Output = jsonToolOutput(map[string]any{"ok": false, "planMode": true, "error": err.Error()})
 		run.Error = err.Error()
 		return call, &run, "", nil
 	}
 	if decision.Action != "confirm" {
+		broadcastPlanReflectionResolved("deny", firstNonEmptyString(decision.Feedback, "ExitPlanMode reflection requested revision."))
 		run.Status = "denied"
 		run.Output = jsonToolOutput(map[string]any{"ok": false, "planMode": true, "feedback": decision.Feedback, "reflectionDecision": decision.Action})
 		run.Error = firstNonEmptyString(decision.Feedback, "ExitPlanMode reflection requested revision.")
 		return call, &run, "", nil
 	}
+	broadcastPlanReflectionResolved("allow", firstNonEmptyString(decision.Reflection, "Plan passed readiness reflection; awaiting user approval."))
 	args["plan"] = plan
 	args["planSource"] = planSource
 	args["allowedPrompts"] = allowedPrompts
@@ -7875,10 +8941,14 @@ func readExitPlanFile(path string) (string, error) {
 
 func (s *Service) persistPlanCompact(ctx context.Context, narratorID, plan string) (Message, error) {
 	content := []map[string]any{{"type": "compact", "status": "compacted", "subtype": "plan", "summary": plan}}
-	contentText := "[Plan] " + plan
-	if len(contentText) > 220 {
-		contentText = contentText[:220] + "..."
-	}
+	// Mirror the TS persistPlanMessage contentText (server/services/narrator-persistence.ts):
+	// `[Plan] ${content.slice(0, 200)}...` — the PLAN BODY is sliced to 200 UTF-16
+	// code units, then wrapped with the "[Plan] " prefix and a trailing "..." that
+	// is ALWAYS appended (even for short plans). Go previously concatenated the full
+	// "[Plan] " + plan and only byte-truncated the whole string to 220 when it
+	// exceeded that, so the slice target, length metric (bytes vs UTF-16), boundary
+	// (220 total vs 200 body), and the always-on "..." all diverged.
+	contentText := "[Plan] " + httpx.JSStringSlicePrefix(plan, 200) + "..."
 	msg, err := s.addMessageWithBlocks(ctx, narratorID, "system", contentText, content, nil)
 	if err != nil {
 		return Message{}, err
@@ -8002,7 +9072,65 @@ func (s *Service) loadGoals(ctx context.Context, narratorID string) ([]map[strin
 		}
 		items = append(items, map[string]any{"id": idValue, "narratorId": narratorIDValue, "objective": objective, "status": status, "sortOrder": sortOrder, "tokensUsed": tokensUsed, "timeUsedSeconds": timeUsedSeconds, "createdBy": sqlNullString(createdBy), "completedAt": sqlNullString(completedAt), "createdAt": createdAt, "updatedAt": updatedAt})
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	s.attachGoalCreators(ctx, items)
+	return items, nil
+}
+
+// attachGoalCreators enriches goal maps with a "creator" field, mirroring the
+// TypeScript attachCreators (server/services/narrator-goal-service.ts): every
+// goal gets a creator key (the GoalCreator object when createdBy resolves to a
+// known user, otherwise null). Creators are batch-loaded by distinct createdBy
+// id. The query is best-effort; on error each goal still receives creator=null
+// so the wire shape stays consistent with TS.
+func (s *Service) attachGoalCreators(ctx context.Context, items []map[string]any) {
+	if len(items) == 0 {
+		return
+	}
+	idSet := map[string]struct{}{}
+	for _, item := range items {
+		if createdBy, ok := item["createdBy"].(string); ok && strings.TrimSpace(createdBy) != "" {
+			idSet[createdBy] = struct{}{}
+		}
+	}
+	creators := map[string]map[string]any{}
+	if len(idSet) > 0 && s.DB != nil {
+		ids := make([]any, 0, len(idSet))
+		for id := range idSet {
+			ids = append(ids, id)
+		}
+		placeholders := strings.TrimRight(strings.Repeat("?,", len(ids)), ",")
+		rows, err := s.DB.QueryContext(ctx, `SELECT id, username, avatar_color, avatar_image_id FROM users WHERE id IN (`+placeholders+`)`, ids...)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var userID string
+				var username, avatarColor, avatarImageID sql.NullString
+				if err := rows.Scan(&userID, &username, &avatarColor, &avatarImageID); err != nil {
+					continue
+				}
+				if !username.Valid || strings.TrimSpace(username.String) == "" {
+					continue
+				}
+				creators[userID] = map[string]any{
+					"id":            userID,
+					"username":      username.String,
+					"avatarColor":   nullString(avatarColor),
+					"avatarImageId": nullString(avatarImageID),
+				}
+			}
+		}
+	}
+	for _, item := range items {
+		createdBy, _ := item["createdBy"].(string)
+		if creator, ok := creators[createdBy]; ok && strings.TrimSpace(createdBy) != "" {
+			item["creator"] = creator
+		} else {
+			item["creator"] = nil
+		}
+	}
 }
 
 func (s *Service) broadcastGoalsSet(narratorID string, goals []map[string]any) {
@@ -8238,7 +9366,7 @@ func normalizeGoalObjective(objective string) (string, error) {
 	if trimmed == "" {
 		return "", httpx.BadRequest("objective is required")
 	}
-	if len([]rune(trimmed)) > 4000 {
+	if httpx.JSStringLength(trimmed) > 4000 {
 		return "", httpx.BadRequest("objective must be at most 4000 characters")
 	}
 	return trimmed, nil
@@ -8628,6 +9756,52 @@ func activeGoalFromList(goals []map[string]any) map[string]any {
 	return nil
 }
 
+// formatGoals mirrors the TS goal-tool formatGoals helper
+// (server/lib/agent/tools/goal.ts): an empty list yields
+// "No goals are currently set."; otherwise each goal renders as
+// "<n>. [<status>] <objective> (time=<t>s tokens=<k>)" (1-based index). This is
+// the model-visible `summary` field returned by GetGoals/AddGoal/UpdateGoal.
+func formatGoals(goals []map[string]any) string {
+	if len(goals) == 0 {
+		return "No goals are currently set."
+	}
+	lines := make([]string, 0, len(goals))
+	for index, goal := range goals {
+		status := stringFromAny(goal["status"])
+		objective := stringFromAny(goal["objective"])
+		timeUsed := intFromAny(goal["timeUsedSeconds"])
+		tokensUsed := intFromAny(goal["tokensUsed"])
+		lines = append(lines, fmt.Sprintf("%d. [%s] %s (time=%ds tokens=%d)", index+1, status, objective, timeUsed, tokensUsed))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// addGoalToolOutput maps the Go addGoal payload ({goal, goals, created}) to the
+// TS addGoalTool output shape (server/lib/agent/tools/goal.ts):
+// { added: created ? goal : null, alreadyExists: !created, goal, goals, summary }
+// where summary is formatGoals(goals) when created, or a "matching open goal
+// already exists" preamble + formatGoals(goals) when a duplicate was skipped.
+func addGoalToolOutput(payload map[string]any) map[string]any {
+	created, _ := payload["created"].(bool)
+	goal := payload["goal"]
+	goalsList, _ := payload["goals"].([]map[string]any)
+	summary := formatGoals(goalsList)
+	if !created {
+		summary = "A matching open goal already exists; no duplicate was added.\n" + summary
+	}
+	var added any
+	if created {
+		added = goal
+	}
+	return map[string]any{
+		"added":         added,
+		"alreadyExists": !created,
+		"goal":          goal,
+		"goals":         goalsList,
+		"summary":       summary,
+	}
+}
+
 func (s *Service) completeActiveGoalBasic(ctx context.Context, narratorID string) (map[string]any, error) {
 	goals, err := s.loadGoals(ctx, narratorID)
 	if err != nil {
@@ -8756,7 +9930,7 @@ func (s *Service) recallSearch(ctx context.Context, narratorID string, args map[
 }
 
 func (s *Service) recallSearchOne(ctx context.Context, narratorID, query string, limit int, filter recallTimeFilter) (string, error) {
-	safeQuery := strings.TrimSpace(query)
+	safeQuery := recallSanitizeQuery(query)
 	if safeQuery == "" {
 		return "Query is empty after sanitization.", nil
 	}
@@ -8873,14 +10047,17 @@ func (s *Service) recallConversationMessages(ctx context.Context, narratorID, me
 		if err := s.DB.QueryRowContext(ctx, `SELECT seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ? LIMIT 1`, narratorID, messageID).Scan(&seq); err != nil {
 			return nil, err
 		}
-		start := seq - limit/2
-		if start < 1 {
-			start = 1
-		}
+		// Mirror TS handleReadConversation: a closed symmetric window around the
+		// target seq with NO LIMIT — half = floor(cap/2), seq in
+		// [ref.seq - half, ref.seq + (cap - half)] (up to cap+1 rows), rather
+		// than an open lower-bounded range capped by LIMIT.
+		half := limit / 2
+		low := seq - half
+		high := seq + (limit - half)
 		return s.recallMessageRows(ctx, `SELECT m.id, r.seq, m.role, COALESCE(m.content_text, ''), COALESCE(m.created_at, '')
 			FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
-			WHERE r.narrator_id = ? AND r.seq >= ?
-			ORDER BY r.seq ASC LIMIT ?`, narratorID, start, limit)
+			WHERE r.narrator_id = ? AND r.seq >= ? AND r.seq <= ?
+			ORDER BY r.seq ASC`, narratorID, low, high)
 	}
 	messages, err := s.recallMessageRows(ctx, `SELECT m.id, r.seq, m.role, COALESCE(m.content_text, ''), COALESCE(m.created_at, '')
 		FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id
@@ -8907,7 +10084,10 @@ func (s *Service) recallMessageRows(ctx context.Context, query string, args ...a
 		if err := rows.Scan(&msg.ID, &msg.Seq, &msg.Role, &msg.Text, &msg.CreatedAt); err != nil {
 			return nil, err
 		}
-		msg.Text = truncateString(msg.Text, recallMessagePreviewChars)
+		// Mirror TS `(row.content_text ?? "").slice(0, 500)`: plain UTF-16
+		// code-unit slice with no ellipsis, so CJK previews match TS rather than
+		// cutting at Go byte offsets.
+		msg.Text = recallJSSlice(msg.Text, recallMessagePreviewChars)
 		messages = append(messages, msg)
 	}
 	return messages, rows.Err()
@@ -8958,33 +10138,41 @@ func (s *Service) recallReadToolCall(ctx context.Context, narratorID string, arg
 	}
 	var toolName, status, createdAt, ownerID string
 	var inputRaw, outputRaw, errorMessage, narratorTitle sql.NullString
-	row := s.DB.QueryRowContext(ctx, `SELECT tc.tool_name, COALESCE(tc.status, ''), tc.input_json, tc.output_json, tc.error_message, COALESCE(tc.created_at, ''), tc.narrator_id, n.title
+	var durationMs sql.NullInt64
+	row := s.DB.QueryRowContext(ctx, `SELECT tc.tool_name, COALESCE(tc.status, ''), tc.input_json, tc.output_json, tc.error_message, COALESCE(tc.created_at, ''), tc.narrator_id, n.title, tc.duration_ms
 		FROM narrator_tool_calls tc LEFT JOIN narrators n ON n.id = tc.narrator_id
 		WHERE tc.narrator_id = ? AND tc.tool_use_id = ?
 		ORDER BY tc.created_at DESC LIMIT 1`, narratorID, toolUseID)
-	if err := row.Scan(&toolName, &status, &inputRaw, &outputRaw, &errorMessage, &createdAt, &ownerID, &narratorTitle); err != nil {
+	if err := row.Scan(&toolName, &status, &inputRaw, &outputRaw, &errorMessage, &createdAt, &ownerID, &narratorTitle, &durationMs); err != nil {
 		if err == sql.ErrNoRows {
 			return fmt.Sprintf("Tool call %q not found in the current narrator.", toolUseID), "error", nil
 		}
 		return "", "", err
 	}
-	inputParsed := decodeAny(inputRaw)
+	inputParsed, inputOK := recallParseJSON(inputRaw)
 	summary := recallToolCallSummary(toolName, inputParsed)
 	label := ownerID
-	if narratorTitle.Valid && strings.TrimSpace(narratorTitle.String) != "" {
+	// Mirror TS `tc.narrator_title ?? tc.narrator_id`: use the title whenever it
+	// is present (non-NULL), even if blank; only a NULL title falls back to the
+	// narrator id.
+	if narratorTitle.Valid {
 		label = narratorTitle.String
+	}
+	statusLine := fmt.Sprintf("Status: %s", status)
+	if durationMs.Valid {
+		statusLine += fmt.Sprintf(" (%dms)", durationMs.Int64)
 	}
 	lines := []string{
 		fmt.Sprintf("Tool: %s — %s", toolName, summary),
-		fmt.Sprintf("Status: %s", status),
+		statusLine,
 		fmt.Sprintf("Narrator: %s", label),
 		fmt.Sprintf("Created: %s", createdAt),
 	}
-	if errorMessage.Valid && strings.TrimSpace(errorMessage.String) != "" {
+	if errorMessage.Valid && errorMessage.String != "" {
 		lines = append(lines, "\nError: "+errorMessage.String)
 	}
-	lines = append(lines, "\n--- Input ---", recallFormatJSONRaw(inputRaw, inputParsed, recallToolCallOutputChars))
-	lines = append(lines, "\n--- Output ---", recallFormatOutputRaw(outputRaw, recallToolCallOutputChars))
+	lines = append(lines, "\n--- Input ---", recallFormatInput(inputRaw, inputParsed, inputOK, recallToolCallOutputChars))
+	lines = append(lines, "\n--- Output ---", recallFormatOutput(outputRaw, recallToolCallOutputChars))
 	return strings.Join(lines, "\n"), "", nil
 }
 
@@ -9097,6 +10285,22 @@ func recallParseRelativeTimeRange(value string) (recallTimeFilter, bool) {
 	return recallTimeFilter{From: from.Format(time.RFC3339Nano), To: now.Format(time.RFC3339Nano), TimeRange: value}, true
 }
 
+// recallSanitizeQuery mirrors the TypeScript sanitizeQuery
+// (server/services/search-service.ts): strip the FTS/SQL special characters
+// ['"*(){}[]^~@:;!&|,<>\] and then trim surrounding whitespace. This makes the
+// recall search "Query is empty after sanitization." branch reachable for
+// pure-special-character queries and keeps those characters out of the LIKE
+// pattern, matching the TS handleSearch contract.
+func recallSanitizeQuery(query string) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if strings.ContainsRune("'\"*(){}[]^~@:;!&|,<>\\", r) {
+			return -1
+		}
+		return r
+	}, query)
+	return strings.TrimSpace(cleaned)
+}
+
 func recallLikePattern(query string) string {
 	replacer := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
 	return "%" + replacer.Replace(query) + "%"
@@ -9116,62 +10320,123 @@ func recallDescribeTimeFilter(filter recallTimeFilter) string {
 	return " " + strings.Join(parts, " ")
 }
 
-func recallToolCallSummary(toolName string, input any) string {
-	inputMap, _ := input.(map[string]any)
-	extract := func(keys ...string) string {
-		for _, key := range keys {
-			if text := strings.TrimSpace(stringFromAny(inputMap[key])); text != "" {
-				return text
-			}
-		}
+// recallJSLen returns the JavaScript String.length (UTF-16 code-unit count) of
+// value, so recall tool-call summaries truncate at the same boundaries as the
+// TypeScript getToolCallSummary helper rather than at Go byte offsets.
+func recallJSLen(value string) int {
+	return len(utf16.Encode([]rune(value)))
+}
+
+// recallJSSlice mirrors JavaScript String.prototype.slice(0, end) operating on
+// UTF-16 code units, decoding back to a valid UTF-8 string. A lone surrogate
+// produced by slicing in the middle of an astral character is dropped, matching
+// how such a fragment would render once re-encoded.
+func recallJSSlice(value string, end int) string {
+	if end <= 0 {
 		return ""
+	}
+	units := utf16.Encode([]rune(value))
+	if end >= len(units) {
+		return value
+	}
+	return string(utf16.Decode(units[:end]))
+}
+
+// recallSummaryTruncate reproduces the TypeScript pattern
+// `text.length > limit ? text.slice(0, limit-3) + "..." : text`: when the
+// UTF-16 length exceeds limit, keep limit-3 code units and append an ASCII
+// ellipsis; otherwise return the value unchanged.
+func recallSummaryTruncate(value string, limit int) string {
+	if recallJSLen(value) <= limit {
+		return value
+	}
+	return recallJSSlice(value, limit-3) + "..."
+}
+
+// recallExtractStr mirrors the TypeScript extractStr: it returns the first key
+// whose value is a string (no trimming, no emptiness skipping), else "".
+func recallExtractStr(input map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := input[key].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// recallBasename mirrors the TypeScript basename helper: split on "/" and return
+// the last non-empty segment, falling back to the whole path. Unlike
+// filepath.Base it does not special-case Windows separators or strip trailing
+// slashes, so it matches the TS recall summary exactly.
+func recallBasename(p string) string {
+	parts := strings.Split(p, "/")
+	last := parts[len(parts)-1]
+	if last == "" {
+		return p
+	}
+	return last
+}
+
+func recallToolCallSummary(toolName string, input any) string {
+	inputMap, ok := input.(map[string]any)
+	if !ok || inputMap == nil {
+		return toolName
 	}
 	switch toolName {
 	case "Read", "Write", "Edit", "Glob":
-		if value := extract("file_path", "filePath", "path", "pattern"); value != "" {
-			return filepath.Base(value)
+		if value := recallExtractStr(inputMap, "file_path", "filePath", "path", "pattern"); value != "" {
+			return recallBasename(value)
 		}
+		return toolName
 	case "Bash", "Shell":
-		if value := extract("command"); value != "" {
-			return truncateString(value, 80)
+		value := recallExtractStr(inputMap, "command")
+		if value == "" {
+			return toolName
 		}
+		return recallSummaryTruncate(value, 80)
 	case "Grep":
-		if value := extract("pattern"); value != "" {
-			return truncateString(value, 60)
+		value := recallExtractStr(inputMap, "pattern")
+		if value == "" {
+			return toolName
 		}
+		return recallSummaryTruncate(value, 60)
 	case "WebSearch":
-		if value := extract("query"); value != "" {
-			return truncateString(value, 60)
+		value := recallExtractStr(inputMap, "query")
+		if value == "" {
+			return "Web Search"
 		}
-		return "Web Search"
+		return recallSummaryTruncate(value, 60)
 	case "WebFetch":
-		url := extract("url")
-		mode := extract("mode")
+		url := recallExtractStr(inputMap, "url")
+		mode := recallExtractStr(inputMap, "mode")
 		if url == "" {
 			return firstNonEmptyString(mode, "WebFetch")
 		}
-		short := truncateString(url, 50)
+		short := recallSummaryTruncate(url, 50)
 		if mode != "" {
 			return mode + ": " + short
 		}
 		return short
 	case "Agent", "Send":
-		if value := extract("description", "prompt", "message"); value != "" {
-			return truncateString(value, 60)
+		value := recallJSSlice(recallExtractStr(inputMap, "description", "prompt", "message"), 60)
+		if value == "" {
+			return toolName
 		}
+		return value
 	case "Terminal":
-		if value := extract("action"); value != "" {
+		if value := recallExtractStr(inputMap, "action"); value != "" {
 			return value
 		}
+		return "Terminal"
 	case "ShareFile":
-		if value := extract("path"); value != "" {
-			return filepath.Base(value)
+		if value := recallExtractStr(inputMap, "path"); value != "" {
+			return recallBasename(value)
 		}
 		return "Share"
 	case "AskUserQuestion":
 		if questions, ok := inputMap["questions"].([]any); ok && len(questions) > 0 {
 			if first, ok := questions[0].(map[string]any); ok {
-				if header := strings.TrimSpace(stringFromAny(first["header"])); header != "" {
+				if header := recallExtractStr(first, "header"); header != "" {
 					return header
 				}
 			}
@@ -9187,36 +10452,109 @@ func recallToolCallSummary(toolName string, input any) string {
 	return toolName
 }
 
-func recallFormatJSONRaw(raw sql.NullString, parsed any, maxChars int) string {
-	if parsed != nil {
-		if data, err := json.MarshalIndent(parsed, "", "  "); err == nil {
-			return recallTruncate(string(data), maxChars)
-		}
+// recallParseJSON mirrors the TS pattern `tc.input_json ? JSON.parse(...) : null`
+// guarded by try/catch: a NULL/empty raw or a parse failure yields (nil, false)
+// so the caller falls back to the raw text, exactly like TS keeping inputParsed
+// = null. ok is true only when the raw parsed into a JSON value.
+func recallParseJSON(raw sql.NullString) (any, bool) {
+	if !raw.Valid || raw.String == "" {
+		return nil, false
 	}
-	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
-		return "(none)"
+	var value any
+	if err := json.Unmarshal([]byte(raw.String), &value); err != nil {
+		return nil, false
 	}
-	return recallTruncate(raw.String, maxChars)
+	return value, true
 }
 
-func recallFormatOutputRaw(raw sql.NullString, maxChars int) string {
-	parsed := decodeAny(raw)
-	if parsedMap, ok := parsed.(map[string]any); ok {
-		if text := strings.TrimSpace(stringFromAny(parsedMap["_text"])); text != "" {
-			return recallTruncate(text, maxChars)
-		}
-		if text := strings.TrimSpace(stringFromAny(parsedMap["output"])); text != "" {
-			return recallTruncate(text, maxChars)
-		}
+// recallTruthy mirrors JavaScript truthiness for a parsed JSON value: null,
+// false, 0, "" and (after JSON parsing) absent values are falsy. TS uses
+// `inputParsed ? ... : raw`, so a parsed value that is JS-falsy falls back to
+// the raw string.
+func recallTruthy(value any) bool {
+	switch v := value.(type) {
+	case nil:
+		return false
+	case bool:
+		return v
+	case float64:
+		return v != 0
+	case string:
+		return v != ""
+	default:
+		return true
 	}
-	return recallFormatJSONRaw(raw, parsed, maxChars)
 }
 
+// recallFormatInput mirrors the TS Input rendering:
+//
+//	const inputStr = inputParsed ? JSON.stringify(inputParsed, null, 2) : (tc.input_json ?? "(none)")
+//	inputStr.length > MAX ? `${inputStr.slice(0, MAX)}\n... (truncated, ${inputStr.length} chars total)` : inputStr
+func recallFormatInput(raw sql.NullString, parsed any, parsedOK bool, maxChars int) string {
+	if parsedOK && recallTruthy(parsed) {
+		if data, err := recallMarshalIndent(parsed); err == nil {
+			return recallTruncate(data, maxChars)
+		}
+	}
+	rawStr := "(none)"
+	if raw.Valid {
+		rawStr = raw.String
+	}
+	return recallTruncate(rawStr, maxChars)
+}
+
+// recallFormatOutput mirrors the TS Output rendering: when output_json parses to
+// a truthy value, use outputParsed._text if it is a string (including ""), else
+// JSON.stringify(outputParsed, null, 2); otherwise fall back to the raw
+// output_json (or "(none)" when null).
+func recallFormatOutput(raw sql.NullString, maxChars int) string {
+	parsed, ok := recallParseJSON(raw)
+	if ok && recallTruthy(parsed) {
+		if parsedMap, isMap := parsed.(map[string]any); isMap {
+			if text, isStr := parsedMap["_text"].(string); isStr {
+				return recallTruncate(text, maxChars)
+			}
+		}
+		if data, err := recallMarshalIndent(parsed); err == nil {
+			return recallTruncate(data, maxChars)
+		}
+	}
+	rawStr := "(none)"
+	if raw.Valid {
+		rawStr = raw.String
+	}
+	return recallTruncate(rawStr, maxChars)
+}
+
+// recallMarshalIndent mirrors JavaScript JSON.stringify(value, null, 2): a
+// 2-space indent and, crucially, NO HTML escaping of <, > and & (Go's default
+// json.Marshal escapes these to \u003c/\u003e/\u0026, which would diverge from
+// the TS recall output shown to the model for bash commands and HTML content).
+// Note: Go map iteration loses original key order, so json re-marshalling sorts
+// object keys alphabetically — the key ORDER of re-marshalled objects is a known
+// remaining divergence from TS (which preserves JSON.parse insertion order).
+func recallMarshalIndent(value any) (string, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(value); err != nil {
+		return "", err
+	}
+	// json.Encoder.Encode appends a trailing newline; JSON.stringify does not.
+	return strings.TrimSuffix(buf.String(), "\n"), nil
+}
+
+// recallTruncate mirrors the TypeScript recall read_tool_call truncation:
+// `value.length > maxChars ? value.slice(0, maxChars) + "\n... (truncated, " +
+// value.length + " chars total)" : value`, using JavaScript String.length /
+// slice (UTF-16 code-unit) semantics so CJK output truncates and reports the
+// same character count as the TS implementation rather than Go byte offsets.
 func recallTruncate(value string, maxChars int) string {
-	if maxChars <= 0 || len(value) <= maxChars {
+	if maxChars <= 0 || recallJSLen(value) <= maxChars {
 		return value
 	}
-	return value[:maxChars] + fmt.Sprintf("\n... (truncated, %d chars total)", len(value))
+	return recallJSSlice(value, maxChars) + fmt.Sprintf("\n... (truncated, %d chars total)", recallJSLen(value))
 }
 
 func boundedInt(value, min, max int) int {
@@ -10583,6 +11921,22 @@ func stringFromAny(value any) string {
 	return ""
 }
 
+// intFromAny coerces the numeric goal-map fields (timeUsedSeconds/tokensUsed)
+// to int. loadGoals stores them as int, but JSON round-trips can surface
+// float64, so both are handled for robustness.
+func intFromAny(value any) int {
+	switch v := value.(type) {
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case float64:
+		return int(v)
+	default:
+		return 0
+	}
+}
+
 func nullableStringPtr(value *string) any {
 	if value == nil {
 		return nil
@@ -11832,6 +13186,18 @@ func toolPermissionPaths(cwd, name string, args map[string]any) []string {
 			return []string{path}
 		}
 		return []string{"."}
+	case "browser":
+		// Mirror the TypeScript extractToolPaths Browser case: only the
+		// screenshot action writes a file, so its file_path must be subject to
+		// the same blacklist/whitelist path enforcement as Write/Edit. Without
+		// this, a Browser screenshot to a blacklisted directory bypassed Go's
+		// path-permission gate (it returned no paths), unlike TS.
+		if strings.ToLower(strings.TrimSpace(stringFromAny(args["action"]))) != "screenshot" {
+			return nil
+		}
+		if path := strings.TrimSpace(stringFromAny(args["file_path"])); path != "" {
+			return []string{path}
+		}
 	case "sharefile":
 		paths := []string{}
 		paths = appendIfNonEmpty(paths, stringFromAny(args["path"]))
@@ -12122,12 +13488,44 @@ func matchCommandPattern(tokens []string, pattern string) bool {
 		return false
 	}
 	for i, part := range parts {
-
-		if ok, _ := filepath.Match(part, tokens[i]); !ok {
+		if !tsGlobMatch(tokens[i], part) {
 			return false
 		}
 	}
 	return true
+}
+
+// tsGlobMatch mirrors the TypeScript narrator-permission globMatch so the Go
+// command whitelist/blacklist matcher is parity-identical: only '*' is a
+// wildcard (matching any run of characters, INCLUDING '/'), and every other
+// character is matched literally. The previous Go implementation used
+// filepath.Match, which diverged from TS by (a) not letting '*' cross '/'
+// (e.g. "origin/*" vs "origin/sub/path"), and (b) treating '?' / '[' / ']' as
+// glob metacharacters rather than literals (e.g. "[abc]" wrongly matching "a").
+// Those divergences meant a blacklist/whitelist pattern could match in one
+// backend but not the other — a security-relevant gap.
+func tsGlobMatch(text, pattern string) bool {
+	if pattern == "*" {
+		return true
+	}
+	if !strings.Contains(pattern, "*") {
+		return text == pattern
+	}
+	var b strings.Builder
+	b.WriteString("^")
+	for _, r := range pattern {
+		if r == '*' {
+			b.WriteString(".*")
+			continue
+		}
+		b.WriteString(regexp.QuoteMeta(string(r)))
+	}
+	b.WriteString("$")
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return false
+	}
+	return re.MatchString(text)
 }
 
 func normalizePermissionMode(value, fallback string) string {

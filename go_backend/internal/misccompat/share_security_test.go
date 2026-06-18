@@ -724,3 +724,32 @@ func assertSharesRootEmpty(t *testing.T) {
 		t.Fatalf("expected shares root to be empty, got %v", names)
 	}
 }
+
+// TestShareAttachmentDispositionMatchesTSEncoding pins the filename* RFC 5987
+// encoding to the TS shares route (encodeURIComponent(base).replace(/%20/g,"+")).
+// The expected encoded values were captured from bun's encodeURIComponent.
+func TestShareAttachmentDispositionMatchesTSEncoding(t *testing.T) {
+	cases := []struct {
+		name        string
+		wantEncoded string
+		wantAscii   string
+	}{
+		{"my file.txt", "my+file.txt", "my file.txt"},
+		{"résumé.pdf", "r%C3%A9sum%C3%A9.pdf", "r_sum_.pdf"},
+		{"a+b&c=d.txt", "a%2Bb%26c%3Dd.txt", "a+b&c=d.txt"},
+		{"数据.csv", "%E6%95%B0%E6%8D%AE.csv", "__.csv"},
+		{"a(1)*'~!.log", "a(1)*'~!.log", "a(1)*'~!.log"},
+		{"100% done.md", "100%25+done.md", "100% done.md"},
+	}
+	for _, tc := range cases {
+		got := shareAttachmentDisposition(tc.name)
+		wantSuffix := "filename*=UTF-8''" + tc.wantEncoded
+		if !strings.HasSuffix(got, wantSuffix) {
+			t.Fatalf("disposition for %q should end with %q, got %q", tc.name, wantSuffix, got)
+		}
+		wantPrefix := `attachment; filename="` + tc.wantAscii + `"; `
+		if !strings.HasPrefix(got, wantPrefix) {
+			t.Fatalf("disposition for %q should start with %q, got %q", tc.name, wantPrefix, got)
+		}
+	}
+}

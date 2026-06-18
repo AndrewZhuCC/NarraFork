@@ -75,6 +75,39 @@ func TestSearchReportsShortQueryLikeModeWithoutFallbacks(t *testing.T) {
 	}
 }
 
+// TestSearchUseFtsThresholdUsesJSStringLength pins the FTS-vs-LIKE gate
+// (useFts := safeQuery length >= 3) to JavaScript String.prototype.length
+// (UTF-16 code units), matching the TS search-service (server/services/
+// search-service.ts: safeQuery.length >= 3). A 2-emoji query is 4 UTF-16 units
+// (>= 3 -> NOT a short query, uses FTS) but only 2 runes; a rune-count
+// implementation would mark it shortQuery=true and diverge from TS.
+func TestSearchUseFtsThresholdUsesJSStringLength(t *testing.T) {
+	sqlDB := openSearchTestDB(t)
+	defer sqlDB.Close()
+	createSearchBaseTables(t, sqlDB)
+	insertSearchRows(t, sqlDB)
+
+	// 2 emoji = 4 UTF-16 units. shortQuery must be false (FTS path), matching TS.
+	q := url.Values{}
+	q.Set("q", strings.Repeat("😀", 2))
+	q.Set("entities", "chapters")
+	response := runSearchRequest(t, sqlDB, "/api/search?"+q.Encode())
+	metadata := response["searchMetadata"].(map[string]any)
+	if metadata["shortQuery"] != false {
+		t.Fatalf("2-emoji query (4 UTF-16 units) should NOT be shortQuery, got %#v", metadata["shortQuery"])
+	}
+
+	// 1 emoji = 2 UTF-16 units (< 3): IS a short query (LIKE path), matching TS.
+	q2 := url.Values{}
+	q2.Set("q", "😀")
+	q2.Set("entities", "chapters")
+	response2 := runSearchRequest(t, sqlDB, "/api/search?"+q2.Encode())
+	metadata2 := response2["searchMetadata"].(map[string]any)
+	if metadata2["shortQuery"] != true {
+		t.Fatalf("1-emoji query (2 UTF-16 units) should be shortQuery, got %#v", metadata2["shortQuery"])
+	}
+}
+
 type searchRoundtripArtifact struct {
 	Cases []searchRoundtripCase `json:"cases"`
 }

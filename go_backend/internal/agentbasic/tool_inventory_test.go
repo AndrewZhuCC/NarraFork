@@ -192,7 +192,7 @@ func TestToolInventoryExposesWebFetchModeParityMetadata(t *testing.T) {
 			continue
 		}
 		found = true
-		if tool.Metadata["parity"] != "partial" || tool.Metadata["mode"] != "raw-only" || tool.Metadata["defaultMode"] != "raw" {
+		if tool.Metadata["parity"] != "partial" || tool.Metadata["mode"] != "readability+raw+dom-http" || tool.Metadata["defaultMode"] != "readability" {
 			t.Fatalf("unexpected WebFetch tool metadata: %#v", tool.Metadata)
 		}
 	}
@@ -207,7 +207,7 @@ func TestToolInventoryExposesWebFetchModeParityMetadata(t *testing.T) {
 		}
 		menuFound = true
 		itemMetadata, _ := item["metadata"].(map[string]any)
-		if itemMetadata["parity"] != "partial" || itemMetadata["mode"] != "raw-only" {
+		if itemMetadata["parity"] != "partial" || itemMetadata["mode"] != "readability+raw+dom-http" {
 			t.Fatalf("unexpected WebFetch menu metadata: %#v", item)
 		}
 	}
@@ -265,16 +265,55 @@ func TestToolInventoryCapabilityMatrixContractFields(t *testing.T) {
 	if readMetadata["pdfPages"] != false || readMetadata["imageContent"] != false || readMetadata["pagesSchemaOnly"] != true || !stringSliceHas(readMetadata["knownDegraded"], "pdfPages") || !stringSliceHas(readMetadata["knownDegraded"], "imageContent") {
 		t.Fatalf("Read degraded modes should document unsupported pdf/image handling: %#v", readMetadata)
 	}
+	if readMetadata["binaryFileRejected"] != true || readMetadata["binaryRejectMessage"] != "binary file cannot be read as text" {
+		t.Fatalf("Read should document the Go-only binary-file rejection contract: %#v", readMetadata)
+	}
 
 	webFetchMetadata := metadataForTool(t, metadata, "WebFetch")
 	assertContractFields(t, webFetchMetadata)
-	if webFetchMetadata["schemaCompatible"] != true || webFetchMetadata["runtimeCompatible"] != "partial" || webFetchMetadata["mode"] != "raw-only" || webFetchMetadata["fallbackBehavior"] != "explicit_error/raw_text" || webFetchMetadata["frontendRendering"] != "raw_text" {
+	if webFetchMetadata["schemaCompatible"] != true || webFetchMetadata["runtimeCompatible"] != "partial" || webFetchMetadata["mode"] != "readability+raw+dom-http" || webFetchMetadata["fallbackBehavior"] != "explicit_error/raw_text" || webFetchMetadata["frontendRendering"] != "raw_text" {
 		t.Fatalf("unexpected WebFetch capability contract: %#v", webFetchMetadata)
 	}
-	for _, mode := range []string{"readability", "dom", "smart", "screenshot"} {
+	for _, mode := range []string{"smart", "screenshot"} {
 		if !stringSliceHas(webFetchMetadata["knownDegraded"], mode) || !stringSliceHas(webFetchMetadata["unsupportedModes"], mode) {
 			t.Fatalf("WebFetch should mark %s as unsupported/degraded: %#v", mode, webFetchMetadata)
 		}
+	}
+	for _, mode := range []string{"readability", "dom"} {
+		if stringSliceHas(webFetchMetadata["unsupportedModes"], mode) || !stringSliceHas(webFetchMetadata["supportedModes"], mode) {
+			t.Fatalf("WebFetch %s mode should be supported, not degraded: %#v", mode, webFetchMetadata)
+		}
+	}
+
+	grepMetadata := metadataForTool(t, metadata, "Grep")
+	assertContractFields(t, grepMetadata)
+	if grepMetadata["schemaCompatible"] != true || grepMetadata["runtimeCompatible"] != "partial" || grepMetadata["fallbackBehavior"] != "native_regexp_walkdir" || grepMetadata["searchBackend"] != "go-regexp-walkdir" {
+		t.Fatalf("unexpected Grep capability contract: %#v", grepMetadata)
+	}
+	if grepMetadata["respectsGitignore"] != false || grepMetadata["truncationSuffix"] != false || grepMetadata["includesHidden"] != true {
+		t.Fatalf("Grep fallback contract should document gitignore/suffix/hidden semantics: %#v", grepMetadata)
+	}
+	for _, degraded := range []string{"pcre_regex", "gitignore_rules", "unbounded_head_limit", "truncation_suffix"} {
+		if !stringSliceHas(grepMetadata["knownDegraded"], degraded) {
+			t.Fatalf("Grep should mark %s as degraded: %#v", degraded, grepMetadata)
+		}
+	}
+
+	endPipelineMetadata := metadataForTool(t, metadata, "EndPipeline")
+	assertContractFields(t, endPipelineMetadata)
+	if endPipelineMetadata["fallbackBehavior"] != "ts_rule_engine_port" || endPipelineMetadata["quoteAwareParser"] != true || endPipelineMetadata["resultEnvelope"] != "pipeline-result-sections" {
+		t.Fatalf("unexpected EndPipeline capability contract: %#v", endPipelineMetadata)
+	}
+	for _, stage := range []string{"from", "cat", "grep", "head", "tail", "sort", "uniq", "cut"} {
+		if !stringSliceHas(endPipelineMetadata["supportedRuleStages"], stage) {
+			t.Fatalf("EndPipeline should mark %s as supported: %#v", stage, endPipelineMetadata)
+		}
+	}
+	if unsupported, ok := endPipelineMetadata["unsupportedRuleStages"].([]string); ok && len(unsupported) != 0 {
+		t.Fatalf("EndPipeline should not mark any rule stage unsupported now: %#v", endPipelineMetadata)
+	}
+	if endPipelineMetadata["sortCollation"] != "code-point" || !stringSliceHas(endPipelineMetadata["knownDegraded"], "sort_collation") {
+		t.Fatalf("EndPipeline should document the sort code-point collation divergence: %#v", endPipelineMetadata)
 	}
 
 	browserMetadata := metadataForTool(t, metadata, "Browser")

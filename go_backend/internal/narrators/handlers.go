@@ -50,13 +50,13 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Post("/permissions/{requestId}/deny", httpx.Handler(h.decidePermission("denied")))
 	r.Post("/permissions/{requestId}/stop-reflection", httpx.Handler(h.stopDangerReflection))
 	r.Post("/permissions/{requestId}/stop-plan-reflection", httpx.Handler(h.decidePermission("cancelled")))
-	r.Patch("/whitelist-dirs/{entryId}", httpx.Handler(h.updateRule("narrator_whitelist_dirs", "access_level")))
+	r.Patch("/whitelist-dirs/{entryId}", httpx.Handler(h.updateRule("narrator_whitelist_dirs", ruleUpdateWhitelistDir)))
 	r.Delete("/whitelist-dirs/{entryId}", httpx.Handler(h.deleteRule("narrator_whitelist_dirs")))
-	r.Patch("/blacklist-dirs/{entryId}", httpx.Handler(h.updateRule("narrator_blacklist_dirs", "deny_level")))
+	r.Patch("/blacklist-dirs/{entryId}", httpx.Handler(h.updateRule("narrator_blacklist_dirs", ruleUpdateBlacklistDir)))
 	r.Delete("/blacklist-dirs/{entryId}", httpx.Handler(h.deleteRule("narrator_blacklist_dirs")))
-	r.Patch("/cmd-whitelist/{entryId}", httpx.Handler(h.updateRule("narrator_whitelist_cmds", "pattern")))
+	r.Patch("/cmd-whitelist/{entryId}", httpx.Handler(h.updateRule("narrator_whitelist_cmds", ruleUpdateWhitelistCmd)))
 	r.Delete("/cmd-whitelist/{entryId}", httpx.Handler(h.deleteRule("narrator_whitelist_cmds")))
-	r.Patch("/cmd-blacklist/{entryId}", httpx.Handler(h.updateRule("narrator_blacklist_cmds", "pattern")))
+	r.Patch("/cmd-blacklist/{entryId}", httpx.Handler(h.updateRule("narrator_blacklist_cmds", ruleUpdateBlacklistCmd)))
 	r.Delete("/cmd-blacklist/{entryId}", httpx.Handler(h.deleteRule("narrator_blacklist_cmds")))
 	r.Get("/{id}", httpx.Handler(h.get))
 	r.Get("/{id}/draft", httpx.Handler(h.getDraft))
@@ -133,6 +133,7 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Post("/{id}/rollback/{messageId}", httpx.Handler(h.rollbackMessage))
 	r.Post("/{id}/edit-and-regenerate/{messageId}", httpx.Handler(h.editAndRegenerate))
 	r.Post("/{id}/edit-message/{messageId}", httpx.Handler(h.editMessage))
+	r.Post("/{id}/restore-message/{messageId}", httpx.Handler(h.restoreMessage))
 	r.Post("/{id}/fork", httpx.Handler(h.forkNarrator))
 	r.Post("/{id}/fork-messages", httpx.Handler(h.forkMessages))
 	r.Get("/{id}/browser-sessions", httpx.Handler(h.listBrowserSessions))
@@ -221,9 +222,10 @@ func (h *Handler) listPaginated(w http.ResponseWriter, r *http.Request) error {
 	// Without a presence snapshot provider (for example in narrow handler tests),
 	// hasViewers safely falls back to the normal list instead of forcing empty.
 	limit := queryInt(query.Get("limit"), 20)
-	if limit <= 0 {
-		limit = 20
-	}
+	// Mirror the TS list route: limit = Math.min(Number.isNaN(rawLimit) ? 20 :
+	// rawLimit, 100). Only the UPPER bound is clamped — a present 0/negative limit
+	// passes through (TS LIMIT limit+1 + slice(0, limit)), so ?limit=0 returns []
+	// with hasMore rather than the previous Go behavior of forcing 20.
 	if limit > 100 {
 		limit = 100
 	}
@@ -275,7 +277,7 @@ func (h *Handler) listPaginated(w http.ResponseWriter, r *http.Request) error {
 	}
 	hasMore := len(items) > limit
 	if hasMore {
-		items = items[:limit]
+		items = jsSliceStart0(items, limit)
 	}
 	enriched, err := h.enrichNarratorList(r.Context(), items)
 	if err != nil {
@@ -288,6 +290,25 @@ func (h *Handler) listPaginated(w http.ResponseWriter, r *http.Request) error {
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": enriched, "hasMore": hasMore, "nextCursor": nextCursor, "totalCount": totalCount})
 	return nil
+}
+
+// jsSliceStart0 mirrors JavaScript Array.prototype.slice(0, end): a negative end
+// counts from the array length, and the result is clamped to [0, len]. This keeps
+// the narrator list parity with the TS `list.slice(0, limit)` for degenerate
+// limits (e.g. ?limit=0 -> empty, ?limit=-1 -> drop the last item) without the
+// panic a raw Go items[:limit] would cause for a negative/oversized index.
+func jsSliceStart0[T any](items []T, end int) []T {
+	n := len(items)
+	if end < 0 {
+		end = n + end
+	}
+	if end < 0 {
+		end = 0
+	}
+	if end > n {
+		end = n
+	}
+	return items[:end]
 }
 
 func paginatedNarratorWhere(standalone, status, filter string, values url.Values) (string, []any) {
@@ -591,12 +612,19 @@ func inPlaceholders(values []string) (string, []any) {
 	return strings.Join(placeholders, ","), args
 }
 
+// parseIntJS mirrors JavaScript Number.parseInt(value, 10) for the narrator
+// pagination/blockIndex params. It delegates to the shared httpx.ParseIntJS so
+// the parse semantics stay identical across the search, narrators and chapters
+// routes. Per-endpoint range clamping/validation is applied by callers after
+// this parse, matching TS.
+func parseIntJS(value string) (int, bool) {
+	return httpx.ParseIntJS(value)
+}
+
+// queryInt is the fallback-returning form used by the pagination routes (the TS
+// `Number.isNaN(parseInt(v)) ? fallback : parseInt(v)` idiom).
 func queryInt(value string, fallback int) int {
-	parsed, err := strconv.Atoi(value)
-	if err != nil {
-		return fallback
-	}
-	return parsed
+	return httpx.ParseIntJSOr(value, fallback)
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
@@ -629,7 +657,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 }
 
 func validateCreateRequest(req createRequest) error {
-	if req.SystemPrompt != nil && len(*req.SystemPrompt) > 10000 {
+	if req.SystemPrompt != nil && httpx.JSStringLength(*req.SystemPrompt) > 10000 {
 		return httpx.BadRequest("systemPrompt must be at most 10000 characters")
 	}
 	// Mirror the TypeScript createNarratorSchema Zod bound: cwd min 1 / max 4096
@@ -638,7 +666,7 @@ func validateCreateRequest(req createRequest) error {
 		if len(*req.Cwd) < 1 {
 			return httpx.BadRequest("cwd must not be empty")
 		}
-		if len(*req.Cwd) > 4096 {
+		if httpx.JSStringLength(*req.Cwd) > 4096 {
 			return httpx.BadRequest("cwd must be at most 4096 characters")
 		}
 	}
@@ -653,7 +681,27 @@ func validateCreateRequest(req createRequest) error {
 			"dangerReflectionOverride must be inherit, on, off, light, standard, or strict",
 		)
 	}
+	// Mirror the TypeScript createNarratorSchema.permissionMode:
+	// permissionModeSchema.optional() — this is the STRICT 5-value enum
+	// (default/acceptEdits/bypassPermissions/readOnly/dontAsk), NOT the legacy
+	// schema, so a present value outside that set (including legacy aliases like
+	// "allowByDefault" or an unknown string) is rejected with 400. Go previously
+	// passed permissionMode straight to Service.Create's lenient
+	// normalizePermissionMode, which silently coerced legacy aliases and fell back
+	// to "default" for unknown values instead of returning a 400.
+	if req.PermissionMode != "" && !validStrictPermissionMode(req.PermissionMode) {
+		return httpx.BadRequest("permissionMode must be one of: default, acceptEdits, bypassPermissions, readOnly, dontAsk")
+	}
 	return nil
+}
+
+func validStrictPermissionMode(value string) bool {
+	switch value {
+	case "default", "acceptEdits", "bypassPermissions", "readOnly", "dontAsk":
+		return true
+	default:
+		return false
+	}
 }
 
 func validReasoningEffort(value string) bool {
@@ -825,9 +873,12 @@ func (h *Handler) deleteCompactMessage(w http.ResponseWriter, r *http.Request) e
 }
 
 func (h *Handler) deleteMessageBlock(w http.ResponseWriter, r *http.Request) error {
-	blockIndex, err := strconv.Atoi(chi.URLParam(r, "blockIndex"))
-	if err != nil || blockIndex < 0 {
-		return httpx.BadRequest("invalid blockIndex")
+	// Mirror TS Number.parseInt(blockIndex,10) + (NaN || <0) reject. parseIntJS
+	// accepts a leading-digit prefix like "3abc" -> 3 (strconv.Atoi would reject
+	// it), then NaN (no digits) or a negative value rejects with 400.
+	blockIndex, ok := parseIntJS(chi.URLParam(r, "blockIndex"))
+	if !ok || blockIndex < 0 {
+		return httpx.BadRequest("Invalid block index")
 	}
 	messageDeleted, err := h.deleteMessageBlockCore(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "messageId"), blockIndex)
 	if err != nil {
@@ -838,31 +889,48 @@ func (h *Handler) deleteMessageBlock(w http.ResponseWriter, r *http.Request) err
 }
 
 func (h *Handler) deleteMessageBlocks(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		Blocks []struct {
-			MessageID  string `json:"messageId"`
-			BlockIndex int    `json:"blockIndex"`
-		} `json:"blocks"`
+	var raw struct {
+		Blocks []map[string]any `json:"blocks"`
 	}
-	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
+	if err := httpx.DecodeLooseJSON(r, &raw); err != nil {
 		return err
 	}
-	// Mirror the TypeScript batchDeleteBlocksSchema Zod bound: blocks array
-	// min 1 / max 200.
-	if len(body.Blocks) < 1 {
+	// Mirror the TypeScript batchDeleteBlocksSchema: blocks array min 1 / max 200,
+	// and EACH block must have messageId (z.string().min(1)) and blockIndex
+	// (z.number().int().min(0)). TS validates every block up-front and throws 400
+	// before any deletion, so a malformed block rejects the whole request rather
+	// than being silently counted as failed (the previous Go behavior, which also
+	// treated a MISSING blockIndex as 0 and could delete the wrong block).
+	if len(raw.Blocks) < 1 {
 		return httpx.BadRequest("blocks is required")
 	}
-	if len(body.Blocks) > 200 {
+	if len(raw.Blocks) > 200 {
 		return httpx.BadRequest("blocks must contain at most 200 items")
+	}
+	type parsedBlock struct {
+		MessageID  string
+		BlockIndex int
+	}
+	blocks := make([]parsedBlock, 0, len(raw.Blocks))
+	for _, block := range raw.Blocks {
+		messageID, ok := block["messageId"].(string)
+		if !ok || messageID == "" {
+			return httpx.BadRequest("messageId must be a non-empty string")
+		}
+		rawIndex, exists := block["blockIndex"]
+		if !exists {
+			return httpx.BadRequest("blockIndex is required")
+		}
+		indexFloat, ok := rawIndex.(float64)
+		if !ok || indexFloat != float64(int(indexFloat)) || indexFloat < 0 {
+			return httpx.BadRequest("blockIndex must be a non-negative integer")
+		}
+		blocks = append(blocks, parsedBlock{MessageID: messageID, BlockIndex: int(indexFloat)})
 	}
 	narratorID := chi.URLParam(r, "id")
 	deleted := 0
 	failed := 0
-	for _, block := range body.Blocks {
-		if block.MessageID == "" || block.BlockIndex < 0 {
-			failed++
-			continue
-		}
+	for _, block := range blocks {
 		if _, err := h.deleteMessageBlockCore(r.Context(), narratorID, block.MessageID, block.BlockIndex); err != nil {
 			failed++
 		} else {
@@ -1067,9 +1135,20 @@ func (h *Handler) updateMessageSummary(ctx context.Context, narratorID, messageI
 	block["summary"] = summary
 	content := []map[string]any{block}
 	data, _ := json.Marshal(content)
-	contentText := "[Compact] " + summary
-	if blockType == "segment_compact" {
-		contentText = "[Segment Compact]\n" + summary
+	// contentText parity with TS. For the segment-compact branch TS
+	// updateSegmentCompactSummary stores `[Segment Compact]\n${summary}` (full, no
+	// slice). For the compact branch TS updateCompactSummary stores
+	// `${prefix} ${summary.slice(0, 200)}...` where prefix is "[Plan]" when the
+	// block subtype is "plan" else "[Compact]" — the summary is sliced to 200
+	// UTF-16 code units and "..." is ALWAYS appended. Go previously used
+	// `[Compact] ` + full summary with no slice/"..." and ignored the plan subtype.
+	contentText := "[Segment Compact]\n" + summary
+	if blockType != "segment_compact" {
+		prefix := "[Compact]"
+		if stringValue(block["subtype"]) == "plan" {
+			prefix = "[Plan]"
+		}
+		contentText = prefix + " " + httpx.JSStringSlicePrefix(summary, 200) + "..."
 	}
 	tx, err := h.Service.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -1154,19 +1233,25 @@ func (h *Handler) buildSummaryFromRefs(ctx context.Context, refs []map[string]an
 }
 
 func (h *Handler) createCompactMessage(ctx context.Context, narratorID, summary, kind string, insertSeq *int) (Message, error) {
-	textPrefix := "[Compact]"
 	role := "system"
 	isCompact := true
 	content := []map[string]any{{"type": "compact", "status": "compacted", "summary": summary}}
+	// contentText parity with TS. The regular compact finalization
+	// (narrator-persistence.ts finalizeCompactingMessage) stores
+	// `[Compact] ${summary.slice(0, 200)}...` — summary sliced to 200 UTF-16 code
+	// units with an always-present trailing "...". The segment-compact finalization
+	// (finalizeSegmentCompactMessage) stores `[Segment Compact]\n${summary}` (full,
+	// no slice). Go previously used `[Compact]\n` + full summary for both, diverging
+	// from the regular-compact slice/"..." format.
+	text := "[Compact] " + httpx.JSStringSlicePrefix(summary, 200) + "..."
 	if kind == "segment_compact" {
-		textPrefix = "[Segment Compact]"
 		role = "user"
 		isCompact = false
 		content = []map[string]any{{"type": "segment_compact", "status": "compacted", "summary": summary}}
-	}
-	text := textPrefix
-	if summary != "" {
-		text += "\n" + summary
+		text = "[Segment Compact]"
+		if summary != "" {
+			text += "\n" + summary
+		}
 	}
 	return h.Service.addMessageWithBlocksAtSeq(ctx, narratorID, role, text, content, nil, insertSeq, isCompact)
 }
@@ -1978,17 +2063,27 @@ func (h *Handler) deletePreview(w http.ResponseWriter, r *http.Request) error {
 
 func (h *Handler) rollbackPreview(w http.ResponseWriter, r *http.Request) error {
 	narratorID := chi.URLParam(r, "id")
-	narrator, err := h.Service.Get(r.Context(), narratorID)
-	if err != nil {
-		return err
-	}
+	// Mirror TS ordering (server/routes/narrators.ts): validate the messageId and
+	// blockIndex query params BEFORE the narrator existence lookup, so a bad/
+	// missing param returns 400 even when the narrator does not exist (Go
+	// previously did the Get first and returned 404 in that case).
 	messageID := strings.TrimSpace(r.URL.Query().Get("messageId"))
 	if messageID == "" {
 		return httpx.BadRequest("messageId query param is required")
 	}
-	blockIndex, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("blockIndex")))
-	if err != nil || blockIndex < 0 {
+	blockIndexStr := strings.TrimSpace(r.URL.Query().Get("blockIndex"))
+	if blockIndexStr == "" {
+		return httpx.BadRequest("blockIndex query param is required")
+	}
+	// Mirror TS Number.parseInt + (NaN || <0) reject; parseIntJS accepts a
+	// leading-digit prefix (e.g. "3abc" -> 3) unlike strconv.Atoi.
+	blockIndex, ok := parseIntJS(blockIndexStr)
+	if !ok || blockIndex < 0 {
 		return httpx.BadRequest("blockIndex must be a non-negative integer")
+	}
+	narrator, err := h.Service.Get(r.Context(), narratorID)
+	if err != nil {
+		return err
 	}
 	seq, ok, err := h.narratorMessageSeq(r.Context(), narratorID, messageID)
 	if err != nil {
@@ -2205,7 +2300,7 @@ func (h *Handler) forkNarrator(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(body.ForkMessageUUID) == "" {
 		return httpx.BadRequest("forkMessageUuid is required")
 	}
-	if strings.TrimSpace(body.Title) != "" && len(body.Title) > 200 {
+	if strings.TrimSpace(body.Title) != "" && httpx.JSStringLength(body.Title) > 200 {
 		return httpx.BadRequest("title must be at most 200 characters")
 	}
 	narrator, err := h.Service.ForkNarrator(r.Context(), chi.URLParam(r, "id"), body.ForkMessageUUID, body.Title, body.InheritMode)
@@ -2237,7 +2332,7 @@ func (h *Handler) forkMessages(w http.ResponseWriter, r *http.Request) error {
 			return httpx.BadRequest("messageIds entries must be non-empty")
 		}
 	}
-	if len(body.Title) > 200 {
+	if httpx.JSStringLength(body.Title) > 200 {
 		return httpx.BadRequest("title must be at most 200 characters")
 	}
 	narrator, err := h.Service.ForkFromMessages(r.Context(), chi.URLParam(r, "id"), body.MessageIDs, body.Title)
@@ -2299,7 +2394,7 @@ func (h *Handler) askInPassing(w http.ResponseWriter, r *http.Request) error {
 	if question == "" {
 		return httpx.ValidationError("question is required")
 	}
-	if len(question) > 10000 {
+	if httpx.JSStringLength(question) > 10000 {
 		return httpx.ValidationError("question must be at most 10000 characters")
 	}
 	pendingMessageID := strings.TrimSpace(body.PendingMessageID)
@@ -2315,9 +2410,13 @@ func (h *Handler) askInPassing(w http.ResponseWriter, r *http.Request) error {
 	if sourceMessageID == "" && sourceMessageUUID == "" {
 		return httpx.ValidationError("Pending ask-in-passing message is missing source reference")
 	}
+	// Mirror the TS ask-in-passing title (server/routes/narrators.ts:2169):
+	// question.replace(/\n.*/s, "").slice(0, 80) — first line, then a UTF-16
+	// code-unit slice to 80. Go previously byte-sliced title[:80], which truncated
+	// CJK questions to ~26 characters and could split a multi-byte rune.
 	title := firstLine(question)
-	if len(title) > 80 {
-		title = title[:80]
+	if httpx.JSStringLength(title) > 80 {
+		title = httpx.JSStringSlicePrefix(title, 80)
 	}
 	model := ""
 	if parent.Model != nil {
@@ -2706,26 +2805,30 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 		if claims != nil {
 			decider = claims.Subject
 		}
-		var body struct {
-			Reason       string         `json:"reason"`
-			Message      string         `json:"message"`
-			Answers      map[string]any `json:"answers"`
-			UpdatedPlan  string         `json:"updatedPlan"`
-			CompactAfter bool           `json:"compactAfter"`
-		}
-		if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
+		var rawBody map[string]any
+		if err := httpx.DecodeOptionalLooseJSON(r, &rawBody); err != nil {
 			return err
 		}
+		// Mirror the TS approve/deny routes (server/routes/narrators.ts), which run
+		// permissionDecisionSchema.safeParse and then use `parsed.success ? data : undefined`
+		// for answers/updatedPlan/compactAfter — i.e. if the body does NOT fully match
+		// the schema (e.g. answers is z.record(z.string(), z.string()) and a value is not
+		// a string, or compactAfter is not a boolean), ALL of these optional updates are
+		// dropped rather than rejected. Go previously accepted answers with non-string
+		// values (map[string]any) and merged them.
+		reason := stringFromAny(rawBody["reason"])
+		message := stringFromAny(rawBody["message"])
+		answers, updatedPlan, compactAfter := parsePermissionDecisionUpdates(rawBody)
 		var updatedInput any
 		var err error
 		if status == "approved" {
-			updatedInput, err = h.mergePermissionInputUpdates(r.Context(), requestID, body.Answers, body.UpdatedPlan, body.CompactAfter)
+			updatedInput, err = h.mergePermissionInputUpdates(r.Context(), requestID, answers, updatedPlan, compactAfter)
 			if err != nil {
 				return err
 			}
 		}
 		dbStatus := permissionDecisionDBStatus(status)
-		_, err = h.Service.DB.ExecContext(r.Context(), `UPDATE narrator_tool_calls SET status = ?, permission_decided_by = ?, permission_decided_at = ?, permission_decision_reason = ?, permission_deny_message = ? WHERE id = ? OR tool_use_id = ?`, dbStatus, decider, db.NowISO(), nullableString(body.Reason), nullableString(body.Message), requestID, requestID)
+		_, err = h.Service.DB.ExecContext(r.Context(), `UPDATE narrator_tool_calls SET status = ?, permission_decided_by = ?, permission_decided_at = ?, permission_decision_reason = ?, permission_deny_message = ? WHERE id = ? OR tool_use_id = ?`, dbStatus, decider, db.NowISO(), nullableString(reason), nullableString(message), requestID, requestID)
 		if err != nil {
 			return err
 		}
@@ -2742,6 +2845,14 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 				if updatedInput != nil {
 					payload["updatedInput"] = updatedInput
 				}
+				// On deny, surface the denial reason so the frontend can render it on
+				// the tool card live, mirroring TS permission_resolved feedbackText
+				// (= denyMessage || feedbackText; narrator-permission.ts:2926-2928).
+				if status != "approved" {
+					if denyFeedback := firstNonEmptyString(message, strings.TrimSpace(stringFromAny(rawBody["feedbackText"]))); denyFeedback != "" {
+						payload["feedbackText"] = denyFeedback
+					}
+				}
 				h.Service.Hub.BroadcastNarrator(narratorID, payload)
 			}
 		}
@@ -2750,7 +2861,51 @@ func (h *Handler) decidePermission(status string) httpx.HandlerFunc {
 	}
 }
 
-func (h *Handler) mergePermissionInputUpdates(ctx context.Context, requestID string, answers map[string]any, updatedPlan string, compactAfter bool) (any, error) {
+// parsePermissionDecisionUpdates mirrors permissionDecisionSchema.safeParse on the
+// approve/deny body, returning the answers/updatedPlan/compactAfter updates only
+// when the WHOLE optional-field set validates (TS uses `parsed.success ? data :
+// undefined`, so a single invalid field drops them all). Validation: message,
+// feedbackText, updatedPlan must be strings when present; compactAfter must be a
+// boolean when present; answers must be an object whose every value is a string.
+func parsePermissionDecisionUpdates(body map[string]any) (map[string]string, string, bool) {
+	if body == nil {
+		return nil, "", false
+	}
+	stringFieldOK := func(key string) bool {
+		v, ok := body[key]
+		if !ok {
+			return true
+		}
+		_, isStr := v.(string)
+		return isStr
+	}
+	if !stringFieldOK("message") || !stringFieldOK("feedbackText") || !stringFieldOK("updatedPlan") {
+		return nil, "", false
+	}
+	if v, ok := body["compactAfter"]; ok {
+		if _, isBool := v.(bool); !isBool {
+			return nil, "", false
+		}
+	}
+	answers := map[string]string{}
+	if v, ok := body["answers"]; ok {
+		record, isObj := v.(map[string]any)
+		if !isObj {
+			return nil, "", false
+		}
+		for key, val := range record {
+			str, isStr := val.(string)
+			if !isStr {
+				return nil, "", false
+			}
+			answers[key] = str
+		}
+	}
+	compactAfter, _ := body["compactAfter"].(bool)
+	return answers, stringFromAny(body["updatedPlan"]), compactAfter
+}
+
+func (h *Handler) mergePermissionInputUpdates(ctx context.Context, requestID string, answers map[string]string, updatedPlan string, compactAfter bool) (any, error) {
 	updatedPlan = strings.TrimSpace(updatedPlan)
 	if len(answers) == 0 && updatedPlan == "" && !compactAfter {
 		return nil, nil
@@ -3069,7 +3224,7 @@ func (h *Handler) updateSegmentCompactSummary(w http.ResponseWriter, r *http.Req
 	if strings.TrimSpace(peek.Summary) == "" {
 		return httpx.BadRequest("summary must be a non-empty string")
 	}
-	if len(peek.Summary) > 100000 {
+	if httpx.JSStringLength(peek.Summary) > 100000 {
 		return httpx.BadRequest("summary must be at most 100000 characters")
 	}
 	if err := h.updateMessageSummary(r.Context(), chi.URLParam(r, "id"), chi.URLParam(r, "messageId"), peek.Summary); err != nil {
@@ -3363,7 +3518,7 @@ func (h *Handler) updateTitle(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(title) == "" {
 		return httpx.BadRequest("title must be a non-empty string")
 	}
-	if len(title) > 200 {
+	if httpx.JSStringLength(title) > 200 {
 		return httpx.BadRequest("title must be at most 200 characters")
 	}
 	narratorID := chi.URLParam(r, "id")
@@ -3374,6 +3529,13 @@ func (h *Handler) updateTitle(w http.ResponseWriter, r *http.Request) error {
 	if h.Service.Hub != nil {
 		h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "title_updated", "narratorId": narratorID, "title": title})
 	}
+	// Mirror the TS persistTitle side effect (narrator:title_updated event ->
+	// syncNarratorTitleToRecentTabs): propagate the new title into every user's
+	// recent_tabs and rebroadcast.
+	h.Service.syncTitleToRecentTabs(r.Context(), narratorID, title)
+	// Mirror the TS persistTitle syncTitleToChapter: a chapter-bound primary
+	// narrator's title change propagates to the bound chapter's title.
+	h.Service.syncTitleToChapter(r.Context(), narratorID, title)
 	httpx.WriteJSON(w, http.StatusOK, n)
 	return nil
 }
@@ -3390,7 +3552,7 @@ func (h *Handler) updateModel(w http.ResponseWriter, r *http.Request) error {
 		if strings.TrimSpace(model) == "" {
 			return httpx.BadRequest("model must be a non-empty string")
 		}
-		if len(model) > 200 {
+		if httpx.JSStringLength(model) > 200 {
 			return httpx.BadRequest("model must be at most 200 characters")
 		}
 	}
@@ -3612,8 +3774,17 @@ func (h *Handler) suggestAnswers(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript suggestAnswersSchema (server/routes/narrators.ts uses
+	// safeParse → 400 on any malformed input): questions is a non-empty array, and
+	// EACH question must have a non-empty question + header, an options ARRAY whose
+	// every entry carries string label + description, and an optional boolean
+	// multiSelect. The downstream parseAskQuestions is intentionally lenient (it is
+	// reused to parse trusted persisted tool-call input), so the strict request
+	// contract is enforced here rather than silently dropping invalid questions.
+	if err := validateSuggestAnswersQuestions(body["questions"]); err != nil {
+		return err
+	}
 	questions := parseAskQuestions(body["questions"])
-	// Mirror the TypeScript suggestAnswersSchema Zod bound: questions array min 1.
 	if len(questions) < 1 {
 		return httpx.BadRequest("questions is required")
 	}
@@ -3622,6 +3793,54 @@ func (h *Handler) suggestAnswers(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"answers": answers})
+	return nil
+}
+
+// validateSuggestAnswersQuestions enforces the TS suggestAnswersSchema shape on an
+// inbound request body, returning a 400 for any malformed entry (matching the
+// route's safeParse) instead of the lenient drop-and-continue parsing used for
+// stored tool-call inputs.
+func validateSuggestAnswersQuestions(raw any) error {
+	items, ok := raw.([]any)
+	if !ok {
+		return httpx.BadRequest("questions must be an array")
+	}
+	if len(items) < 1 {
+		return httpx.BadRequest("questions is required")
+	}
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return httpx.BadRequest("each question must be an object")
+		}
+		if question, ok := entry["question"].(string); !ok || question == "" {
+			return httpx.BadRequest("question must be a non-empty string")
+		}
+		if header, ok := entry["header"].(string); !ok || header == "" {
+			return httpx.BadRequest("header must be a non-empty string")
+		}
+		options, ok := entry["options"].([]any)
+		if !ok {
+			return httpx.BadRequest("options must be an array")
+		}
+		for _, optRaw := range options {
+			opt, ok := optRaw.(map[string]any)
+			if !ok {
+				return httpx.BadRequest("each option must be an object")
+			}
+			if _, ok := opt["label"].(string); !ok {
+				return httpx.BadRequest("option label must be a string")
+			}
+			if _, ok := opt["description"].(string); !ok {
+				return httpx.BadRequest("option description must be a string")
+			}
+		}
+		if value, exists := entry["multiSelect"]; exists {
+			if _, ok := value.(bool); !ok {
+				return httpx.BadRequest("multiSelect must be a boolean")
+			}
+		}
+	}
 	return nil
 }
 
@@ -3720,7 +3939,7 @@ func (h *Handler) editMessage(w http.ResponseWriter, r *http.Request) error {
 	if len(content) < 1 {
 		return httpx.ValidationError("content must be at least 1 character")
 	}
-	if len(content) > 100000 {
+	if httpx.JSStringLength(content) > 100000 {
 		return httpx.ValidationError("content must be at most 100000 characters")
 	}
 	narrator, err := h.Service.Get(r.Context(), narratorID)
@@ -3741,6 +3960,30 @@ func (h *Handler) editMessage(w http.ResponseWriter, r *http.Request) error {
 		editedBy = &subject
 	}
 	if _, err := h.Service.EditAssistantMessage(r.Context(), narratorID, chi.URLParam(r, "messageId"), content, editedBy); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
+}
+
+// restoreMessage reverts a previously-edited assistant message back to its
+// original text, clearing the edit metadata. Mirrors the TypeScript
+// POST /api/narrators/:id/restore-message/:messageId route.
+func (h *Handler) restoreMessage(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	narrator, err := h.Service.Get(r.Context(), narratorID)
+	if err != nil {
+		return err
+	}
+	if (narrator.Variant == "subagent" || narrator.Type == "subagent") && (narrator.Status == "working" || narrator.Status == "waiting") {
+		return httpx.ValidationError("Cannot restore on a running subagent")
+	}
+	if narrator.Status == "archived" {
+		if _, err := h.Service.UpdateTextField(r.Context(), narratorID, "status", "idle"); err != nil {
+			return err
+		}
+	}
+	if _, err := h.Service.RestoreAssistantMessage(r.Context(), narratorID, chi.URLParam(r, "messageId")); err != nil {
 		return err
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -3804,14 +4047,14 @@ func (h *Handler) putDraft(w http.ResponseWriter, r *http.Request) error {
 	}
 	// Mirror the TypeScript updateNarratorDraftSchema Zod bounds: text max 100000,
 	// sourceId min 1 / max 120 when provided.
-	if len(body.Text) > 100000 {
+	if httpx.JSStringLength(body.Text) > 100000 {
 		return httpx.BadRequest("text must be at most 100000 characters")
 	}
 	if body.SourceID != nil {
 		if strings.TrimSpace(*body.SourceID) == "" {
 			return httpx.BadRequest("sourceId must be a non-empty string")
 		}
-		if len(*body.SourceID) > 120 {
+		if httpx.JSStringLength(*body.SourceID) > 120 {
 			return httpx.BadRequest("sourceId must be at most 120 characters")
 		}
 	}
@@ -3820,18 +4063,25 @@ func (h *Handler) putDraft(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Capture whether a draft already existed so we can mirror the TS promote rule
+	// syncNarratorDraftToRecentTabs(promote: !previousDraft && !!newDraft): a tab is
+	// only promoted when a draft transitions from absent to present.
+	hadDraft := parseDraftTrait(traits) != nil
 	userID := ""
 	if claims := auth.UserFromContext(r.Context()); claims != nil {
 		userID = claims.Subject
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
+	hasNewDraft := strings.TrimSpace(body.Text) != ""
 	updated := upsertDraftTrait(traits, map[string]any{"text": body.Text, "updatedAt": now, "updatedBy": userID, "sourceId": body.SourceID})
-	if strings.TrimSpace(body.Text) == "" {
+	if !hasNewDraft {
 		updated = removeTraitPrefix(traits, draftTraitPrefix)
 	}
 	if err := h.saveNarratorTraits(r.Context(), narratorID, updated); err != nil {
 		return err
 	}
+	// Mirror the TS draft PUT recent-tabs promote/broadcast side effect.
+	h.Service.syncDraftPromoteToRecentTabs(r.Context(), narratorID, !hadDraft && hasNewDraft)
 	response := draftTraitResponse(updated)
 	if h.Service.Hub != nil {
 		h.Service.Hub.BroadcastNarrator(narratorID, mergeMaps(map[string]any{"type": "draft_changed", "narratorId": narratorID}, response))
@@ -4441,13 +4691,27 @@ func (h *Handler) clearGoals(w http.ResponseWriter, r *http.Request) error {
 }
 
 func (h *Handler) reorderGoals(w http.ResponseWriter, r *http.Request) error {
-	var body struct {
-		OrderedIDs []string `json:"orderedIds"`
-	}
-	if err := httpx.DecodeJSON(r, &body); err != nil {
+	var raw map[string]any
+	if err := httpx.DecodeJSON(r, &raw); err != nil {
 		return err
 	}
-	payload, err := h.Service.reorderGoals(r.Context(), chi.URLParam(r, "id"), body.OrderedIDs)
+	// Mirror TS `if (!Array.isArray(body.orderedIds)) throw "orderedIds is
+	// required"` (server/routes/narrators.ts): a missing OR non-array orderedIds
+	// rejects with 400. An empty array is valid (Array.isArray([]) is true) and
+	// performs a no-op reorder. Go previously decoded into a typed []string, so a
+	// missing orderedIds became a nil slice that silently proceeded (200), and a
+	// non-array value failed with a generic "invalid JSON" message.
+	orderedRaw, ok := raw["orderedIds"].([]any)
+	if !ok {
+		return httpx.BadRequest("orderedIds is required")
+	}
+	orderedIDs := make([]string, 0, len(orderedRaw))
+	for _, item := range orderedRaw {
+		if text, ok := item.(string); ok {
+			orderedIDs = append(orderedIDs, text)
+		}
+	}
+	payload, err := h.Service.reorderGoals(r.Context(), chi.URLParam(r, "id"), orderedIDs)
 	if err != nil {
 		return err
 	}
@@ -4471,7 +4735,11 @@ func (h *Handler) loadGoals(r *http.Request, narratorID string) ([]map[string]an
 		}
 		items = append(items, map[string]any{"id": idValue, "narratorId": narratorIDValue, "objective": objective, "status": status, "sortOrder": sortOrder, "tokensUsed": tokensUsed, "timeUsedSeconds": timeUsedSeconds, "createdBy": nullString(createdBy), "completedAt": nullString(completedAt), "createdAt": createdAt, "updatedAt": updatedAt})
 	}
-	return items, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	h.Service.attachGoalCreators(r.Context(), items)
+	return items, nil
 }
 
 func (h *Handler) getBuffer(w http.ResponseWriter, r *http.Request) error {
@@ -4504,7 +4772,7 @@ func (h *Handler) updateBuffer(w http.ResponseWriter, r *http.Request) error {
 		if strings.TrimSpace(text) == "" {
 			return httpx.BadRequest("text must be a non-empty string")
 		}
-		if len(text) > 100000 {
+		if httpx.JSStringLength(text) > 100000 {
 			return httpx.BadRequest("text must be at most 100000 characters")
 		}
 		sets = append(sets, "text = ?")
@@ -5289,7 +5557,7 @@ func validateNarratorRuleFields(primaryField, secondaryField, primary string, bo
 		if trimmed == "" {
 			return httpx.BadRequest("path must be a non-empty string")
 		}
-		if len(trimmed) > 4096 {
+		if httpx.JSStringLength(trimmed) > 4096 {
 			return httpx.BadRequest("path must be at most 4096 characters")
 		}
 	case "pattern":
@@ -5297,7 +5565,7 @@ func validateNarratorRuleFields(primaryField, secondaryField, primary string, bo
 		if trimmed == "" {
 			return httpx.BadRequest("pattern must be a non-empty string")
 		}
-		if len(trimmed) > 200 {
+		if httpx.JSStringLength(trimmed) > 200 {
 			return httpx.BadRequest("pattern must be at most 200 characters")
 		}
 	}
@@ -5312,7 +5580,7 @@ func validateNarratorRuleFields(primaryField, secondaryField, primary string, bo
 			return httpx.BadRequest("denyLevel must be denyWrite or denyAll")
 		}
 	case "deny_prompt":
-		if hasSecondary && len(secondary) > 2000 {
+		if hasSecondary && httpx.JSStringLength(secondary) > 2000 {
 			return httpx.BadRequest("denyPrompt must be at most 2000 characters")
 		}
 	}
@@ -5349,6 +5617,11 @@ func (h *Handler) createRule(table, primaryField, secondaryField, defaultSeconda
 		// cmd `pattern` trim 1..200, dir secondary enum, cmd-blacklist denyPrompt max 2000.
 		if err := validateNarratorRuleFields(primaryField, secondaryField, primary, body); err != nil {
 			return err
+		}
+		// TS uses z.string().trim() for path/pattern, which stores the trimmed
+		// value. Trim before persisting so stored rules match TS exactly.
+		if primaryField == "path" || primaryField == "pattern" {
+			primary = strings.TrimSpace(primary)
 		}
 		entryID := id.New()
 		now := db.NowISO()
@@ -5388,7 +5661,27 @@ func (h *Handler) createRule(table, primaryField, secondaryField, defaultSeconda
 	}
 }
 
-func (h *Handler) updateRule(table, secondaryField string) httpx.HandlerFunc {
+// ruleUpdateKind identifies which TS update schema a PATCH rule route follows.
+// The four narrator rule update routes have DIFFERENT allowed fields:
+//   - whitelist-dirs: accessLevel (enum), enabled        (updateWhitelistDirSchema)
+//   - blacklist-dirs: denyLevel (enum), enabled          (updateBlacklistDirSchema)
+//   - cmd-whitelist : pattern (trim 1..200), enabled     (updateWhitelistCmdSchema)
+//   - cmd-blacklist : pattern, denyPrompt (≤2000, nullable), enabled (updateBlacklistCmdSchema)
+//
+// Dir routes do NOT allow updating the path; cmd routes DO allow updating the
+// pattern. denyPrompt is nullable (null clears); enabled/accessLevel/denyLevel are
+// non-nullable so an explicit null is a 400. Empty body (no recognized field) is a
+// 400 "No fields to update", matching the TS routes.
+type ruleUpdateKind int
+
+const (
+	ruleUpdateWhitelistDir ruleUpdateKind = iota
+	ruleUpdateBlacklistDir
+	ruleUpdateWhitelistCmd
+	ruleUpdateBlacklistCmd
+)
+
+func (h *Handler) updateRule(table string, kind ruleUpdateKind) httpx.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		var body map[string]any
 		if err := httpx.DecodeLooseJSON(r, &body); err != nil {
@@ -5396,7 +5689,72 @@ func (h *Handler) updateRule(table, secondaryField string) httpx.HandlerFunc {
 		}
 		sets := []string{}
 		args := []any{}
-		if enabled, ok := body["enabled"].(bool); ok {
+
+		// pattern: cmd routes only, z.string().trim().min(1).max(200).optional().
+		if kind == ruleUpdateWhitelistCmd || kind == ruleUpdateBlacklistCmd {
+			if value, ok := body["pattern"]; ok {
+				pattern, isString := value.(string)
+				if !isString {
+					return httpx.BadRequest("pattern must be a non-empty string")
+				}
+				trimmed := strings.TrimSpace(pattern)
+				if trimmed == "" {
+					return httpx.BadRequest("pattern must be a non-empty string")
+				}
+				if httpx.JSStringLength(trimmed) > 200 {
+					return httpx.BadRequest("pattern must be at most 200 characters")
+				}
+				sets = append(sets, "pattern = ?")
+				args = append(args, trimmed)
+			}
+		}
+
+		// accessLevel / denyLevel: dir routes only, non-nullable enum.
+		switch kind {
+		case ruleUpdateWhitelistDir:
+			if value, ok := body["accessLevel"]; ok {
+				level, isString := value.(string)
+				if !isString || (level != "readOnly" && level != "readWrite" && level != "full") {
+					return httpx.BadRequest("accessLevel must be readOnly, readWrite, or full")
+				}
+				sets = append(sets, "access_level = ?")
+				args = append(args, level)
+			}
+		case ruleUpdateBlacklistDir:
+			if value, ok := body["denyLevel"]; ok {
+				level, isString := value.(string)
+				if !isString || (level != "denyWrite" && level != "denyAll") {
+					return httpx.BadRequest("denyLevel must be denyWrite or denyAll")
+				}
+				sets = append(sets, "deny_level = ?")
+				args = append(args, level)
+			}
+		}
+
+		// denyPrompt: cmd-blacklist only, z.string().max(2000).nullable().optional()
+		// (null clears the prompt; a non-string non-null value is a 400).
+		if kind == ruleUpdateBlacklistCmd {
+			if value, ok := body["denyPrompt"]; ok {
+				if value == nil {
+					sets = append(sets, "deny_prompt = ?")
+					args = append(args, nil)
+				} else {
+					prompt, isString := value.(string)
+					if !isString || httpx.JSStringLength(prompt) > 2000 {
+						return httpx.BadRequest("denyPrompt must be at most 2000 characters")
+					}
+					sets = append(sets, "deny_prompt = ?")
+					args = append(args, prompt)
+				}
+			}
+		}
+
+		// enabled: all routes, z.boolean().optional() (non-nullable).
+		if value, ok := body["enabled"]; ok {
+			enabled, isBool := value.(bool)
+			if !isBool {
+				return httpx.BadRequest("enabled must be a boolean")
+			}
 			sets = append(sets, "enabled = ?")
 			if enabled {
 				args = append(args, 1)
@@ -5404,17 +5762,14 @@ func (h *Handler) updateRule(table, secondaryField string) httpx.HandlerFunc {
 				args = append(args, 0)
 			}
 		}
-		if secondaryField != "" {
-			if value, ok := body[snakeToCamel(secondaryField)]; ok {
-				sets = append(sets, secondaryField+" = ?")
-				args = append(args, value)
-			}
+
+		// Mirror the TS routes: an update body with no recognized field is a 400.
+		if len(sets) == 0 {
+			return httpx.BadRequest("No fields to update")
 		}
-		if len(sets) > 0 {
-			args = append(args, chi.URLParam(r, "entryId"))
-			if _, err := h.Service.DB.ExecContext(r.Context(), `UPDATE `+table+` SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
-				return err
-			}
+		args = append(args, chi.URLParam(r, "entryId"))
+		if _, err := h.Service.DB.ExecContext(r.Context(), `UPDATE `+table+` SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+			return err
 		}
 		return h.ok(w, r)
 	}
@@ -5868,28 +6223,119 @@ func (h *Handler) updateCwd(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	// Mirror the TypeScript updateNarratorCwdSchema Zod bound: cwd trimmed min 1 / max 4096.
+	// z.string().trim() validates AND stores the trimmed value, so persist trimmedCwd.
 	trimmedCwd := strings.TrimSpace(body.Cwd)
 	if trimmedCwd == "" {
 		return httpx.BadRequest("cwd must be a non-empty string")
 	}
-	if len(trimmedCwd) > 4096 {
+	if httpx.JSStringLength(trimmedCwd) > 4096 {
 		return httpx.BadRequest("cwd must be at most 4096 characters")
 	}
-	_, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "cwd", body.Cwd)
+	// Mirror the TS cwd PATCH route (server/routes/narrators.ts): after schema parse
+	// it requires isAbsolute(cwd) (400 "cwd must be an absolute path") and then
+	// fs.access(cwd, R_OK|X_OK) so a relative or non-existent/inaccessible directory
+	// is rejected before any persist. Go previously only checked length and would
+	// store a relative or bogus path.
+	if !filepath.IsAbs(trimmedCwd) {
+		return httpx.BadRequest("cwd must be an absolute path")
+	}
+	if err := accessReadExec(trimmedCwd); err != nil {
+		return httpx.BadRequest("Working directory does not exist or is not accessible")
+	}
+	narratorID := chi.URLParam(r, "id")
+	// Mirror the TS unchanged short-circuit: when the trimmed previous cwd equals the
+	// new cwd, return changed:false WITHOUT persisting or emitting a reminder message.
+	existing, err := h.Service.Get(r.Context(), narratorID)
 	if err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "cwd": body.Cwd, "changed": true})
+	previousCwd := ""
+	if existing.Cwd != nil {
+		previousCwd = strings.TrimSpace(*existing.Cwd)
+	}
+	if previousCwd == trimmedCwd {
+		httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "cwd": trimmedCwd, "changed": false})
+		return nil
+	}
+	if _, err := h.Service.UpdateTextField(r.Context(), narratorID, "cwd", trimmedCwd); err != nil {
+		return err
+	}
+	// Mirror the TS localized display-message reminder on a real cwd change.
+	userID := ""
+	if claims := auth.UserFromContext(r.Context()); claims != nil {
+		userID = claims.Subject
+	}
+	reminder := cwdUpdateReminder(h.Service.userLocale(r.Context(), userID), previousCwd, trimmedCwd)
+	if _, err := h.Service.persistDisplayMessage(r.Context(), narratorID, reminder); err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "cwd": trimmedCwd, "changed": true})
 	return nil
 }
-func (h *Handler) generateTitle(w http.ResponseWriter, r *http.Request) error {
-	n, err := h.Service.Get(r.Context(), chi.URLParam(r, "id"))
+
+// accessReadExec mirrors the TS fs.access(path, R_OK | X_OK) existence check at
+// the cwd PATCH boundary. The primary intent is to reject a path that does not
+// exist or is not a directory before persisting it as the narrator working
+// directory. A cross-platform os.Stat is used (the project also builds for
+// Windows, where the Unix R_OK/X_OK permission bits do not apply); the fine-
+// grained read/execute permission bits are left to the OS at actual use time.
+func accessReadExec(path string) error {
+	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	title := "Narrator"
+	if !info.IsDir() {
+		return fmt.Errorf("cwd is not a directory")
+	}
+	return nil
+}
+
+// cwdUpdateReminder mirrors the TS localized working-directory reminder text.
+func cwdUpdateReminder(locale, previousCwd, cwd string) string {
+	if locale == "zh-CN" {
+		if previousCwd != "" {
+			return "工作目录已更新：" + previousCwd + " → " + cwd
+		}
+		return "工作目录已设置为：" + cwd
+	}
+	if previousCwd != "" {
+		return "Working directory updated: " + previousCwd + " → " + cwd
+	}
+	return "Working directory set to: " + cwd
+}
+func (h *Handler) generateTitle(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	n, err := h.Service.Get(r.Context(), narratorID)
+	if err != nil {
+		return err
+	}
+	existing := ""
 	if n.Title != nil {
-		title = *n.Title
+		existing = *n.Title
+	}
+	userID := ""
+	if claims := auth.UserFromContext(r.Context()); claims != nil {
+		userID = claims.Subject
+	}
+	locale := h.Service.userLocale(r.Context(), userID)
+	cwd := ""
+	if n.Cwd != nil {
+		cwd = *n.Cwd
+	}
+	// Mirror the TS POST /:id/generate-title: generate a fresh title from the
+	// conversation via the summary model, then persistTitle (DB update + broadcast +
+	// chapter sync + recent_tabs sync). Generation falls back to the existing title
+	// when the summary model is unset or the provider call fails.
+	title := h.Service.generateNarratorTitle(r.Context(), narratorID, cwd, locale, existing)
+	if strings.TrimSpace(title) != "" && title != existing {
+		if _, err := h.Service.UpdateTextField(r.Context(), narratorID, "title", nullableString(title)); err != nil {
+			return err
+		}
+		if h.Service.Hub != nil {
+			h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "title_updated", "narratorId": narratorID, "title": title})
+		}
+		h.Service.syncTitleToRecentTabs(r.Context(), narratorID, title)
+		h.Service.syncTitleToChapter(r.Context(), narratorID, title)
 	}
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{"title": title})
 	return nil
@@ -5900,6 +6346,13 @@ func (h *Handler) updateReasoningEffort(w http.ResponseWriter, r *http.Request) 
 	}
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
+	}
+	// Mirror the TS PATCH /:id/reasoning-effort guard (server/routes/narrators.ts):
+	// a present non-null reasoningEffort must be one of none/low/medium/high/xhigh,
+	// else 400. A null clears the field. Go previously persisted any arbitrary
+	// string straight to the column without enum validation.
+	if body.ReasoningEffort != nil && !validReasoningEffort(*body.ReasoningEffort) {
+		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, or null")
 	}
 	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "reasoning_effort", nullableStringValue(body.ReasoningEffort))
 	if err != nil {
@@ -5927,15 +6380,27 @@ func (h *Handler) updateBool(column, jsonKey string) httpx.HandlerFunc {
 		if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 			return err
 		}
+		// Mirror TS `if (typeof <field> !== "boolean") throw 400 "<field> must be a
+		// boolean"`: a missing or non-boolean value must reject, not silently
+		// decode to false (which `body[jsonKey] == true` did).
+		boolValue, ok := body[jsonKey].(bool)
+		if !ok {
+			return httpx.BadRequest(jsonKey + " must be a boolean")
+		}
 		value := 0
-		boolValue := body[jsonKey] == true
 		if boolValue {
 			value = 1
 		}
 		narratorID := chi.URLParam(r, "id")
-		_, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET `+column+` = ?, updated_at = ? WHERE id = ?`, value, db.NowISO(), narratorID)
+		// Mirror TS `await narratorService.getById(id)` existence check (404 for an
+		// unknown narrator) before the update: previously Go's UPDATE affected 0
+		// rows and still returned ok.
+		res, err := h.Service.DB.ExecContext(r.Context(), `UPDATE narrators SET `+column+` = ?, updated_at = ? WHERE id = ?`, value, db.NowISO(), narratorID)
 		if err != nil {
 			return err
+		}
+		if count, _ := res.RowsAffected(); count == 0 {
+			return httpx.NotFound("Narrator")
 		}
 		if h.Service.Hub != nil && jsonKey == "relaxedPlan" {
 			h.Service.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "relaxed_plan_changed", "narratorId": narratorID, "relaxedPlan": boolValue})

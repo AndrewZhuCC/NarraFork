@@ -32,8 +32,8 @@ type deleteMessageBlockResult struct {
 type copyOnWriteOverrides struct {
 	ContentText *string
 	ContentJSON any
-	// EditedAt/EditedBy/OriginalContentJSON support display-only assistant message
-	// edits (migration 0042). A non-nil pointer means "set this column"; the inner
+	// EditedAt/EditedBy/OriginalContentJSON support assistant message text edits
+	// that persist without regenerating (migration 0042). A non-nil pointer means "set this column"; the inner
 	// pointer/value may itself be nil to write SQL NULL.
 	EditedAt            *string
 	EditedBy            **string
@@ -997,6 +997,73 @@ func (s *Service) EditAssistantMessage(ctx context.Context, narratorID, messageI
 		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "full_reload", "narratorId": narratorID})
 	}
 	return updated.Message, nil
+}
+
+// RestoreAssistantMessage reverts a previously-edited assistant message back to
+// its original content, clearing the edit metadata so the message looks like it
+// was never edited. Mirrors the TypeScript restoreAssistantMessage service.
+func (s *Service) RestoreAssistantMessage(ctx context.Context, narratorID, messageID string) (Message, error) {
+	target, err := s.messageForNarratorRef(ctx, narratorID, messageID)
+	if err != nil {
+		return Message{}, err
+	}
+	if target.Role != "assistant" {
+		return Message{}, httpx.NotFound("Can only restore assistant messages")
+	}
+	// Nothing to restore if the message was never edited.
+	if target.EditedAt == nil {
+		return target.Message, nil
+	}
+
+	originalBlocks := []map[string]any{}
+	if blocks, ok := target.OriginalContentJSON.([]map[string]any); ok {
+		originalBlocks = blocks
+	} else if rawBlocks, ok := target.OriginalContentJSON.([]any); ok {
+		for _, raw := range rawBlocks {
+			if block, ok := raw.(map[string]any); ok {
+				originalBlocks = append(originalBlocks, block)
+			}
+		}
+	}
+	originalText := contentTextFromTextBlocksJoined(originalBlocks, "\n\n")
+
+	clearedOriginal := any(nil)
+	var clearedEditedBy *string
+	overrides := copyOnWriteOverrides{
+		ContentText:         &originalText,
+		ContentJSON:         originalBlocks,
+		SetEditMetadata:     true,
+		EditedAt:            nil,
+		EditedBy:            &clearedEditedBy,
+		OriginalContentJSON: &clearedOriginal,
+	}
+
+	privateMessageID, err := s.copyOnWriteMessage(ctx, narratorID, messageID, overrides)
+	if err != nil {
+		return Message{}, err
+	}
+	updated, err := s.messageForNarratorRef(ctx, narratorID, privateMessageID)
+	if err != nil {
+		return Message{}, err
+	}
+	s.broadcastMessageUpdated(ctx, narratorID, updated.Message)
+	if privateMessageID != messageID && s.Hub != nil {
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "full_reload", "narratorId": narratorID})
+	}
+	return updated.Message, nil
+}
+
+func contentTextFromTextBlocksJoined(blocks []map[string]any, sep string) string {
+	texts := []string{}
+	for _, block := range blocks {
+		if stringFromAny(block["type"]) != "text" {
+			continue
+		}
+		if text := stringFromAny(block["text"]); text != "" {
+			texts = append(texts, text)
+		}
+	}
+	return strings.Join(texts, sep)
 }
 
 func contentTextFromMapBlocks(blocks []map[string]any) string {

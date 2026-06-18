@@ -40,6 +40,11 @@ type AgentEvent struct {
 	UpdatedInput        map[string]any      `json:"updatedInput,omitempty"`
 	BrokenInputOverride map[string]any      `json:"brokenInputOverride,omitempty"`
 	ParentToolUseID     string              `json:"parentToolUseId,omitempty"`
+	Balance             *float64            `json:"balance,omitempty"`
+	Required            *float64            `json:"required,omitempty"`
+	ProviderID          string              `json:"providerId,omitempty"`
+	ProviderPrefix      string              `json:"providerPrefix,omitempty"`
+	ResumeAction        string              `json:"resumeAction,omitempty"`
 }
 
 // AgentSideCar carries auxiliary model-visible context that is persisted separately

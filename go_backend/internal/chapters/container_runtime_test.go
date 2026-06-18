@@ -937,6 +937,19 @@ func TestContainerLogsCapTailTruncateAndIgnoreUnsafeService(t *testing.T) {
 	if strings.Contains(last, "../bad") {
 		t.Fatalf("unsafe service should not be passed to compose, last command=%q", last)
 	}
+
+	// Parity: tail is parsed with JS Number.parseInt semantics, so a leading-digit
+	// prefix like "50x" yields --tail 50. The previous strconv.Atoi parse rejected
+	// "50x" and silently used the default 200, so this asserts the prefix parse.
+	recorder = httptest.NewRecorder()
+	newChapterRouter(handler).ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/c1/containers/logs?tail=50x&service=web", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("logs status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	last = lastNonEmptyLine(readTextFile(t, logPath))
+	if !strings.Contains(last, " logs --tail 50 web") {
+		t.Fatalf(`tail="50x" should parse to 50 (not fall back to 200), last command=%q`, last)
+	}
 }
 
 type chapterBroadcastEvent struct {
@@ -1414,4 +1427,25 @@ func lastNonEmptyLine(value string) string {
 		}
 	}
 	return ""
+}
+
+// TestRunStartupScriptRiskyWarningMatchesTS pins the risky-startup-script warning
+// text to the TS chapter-fork wording (server/services/chapter-fork.ts:336-337).
+// Go previously used a paraphrased message.
+func TestRunStartupScriptRiskyWarningMatchesTS(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("startup scripts use POSIX sh")
+	}
+	// A script that mentions narrafork is flagged risky by isRiskyStartupScript.
+	warnings := runStartupScript(context.Background(), t.TempDir(), "chapter-1", "echo narrafork dev")
+	want := "Startup script appears to start a NarraFork/dev server from the forked worktree; a second server process can lock the shared NarraFork database."
+	found := false
+	for _, w := range warnings {
+		if w == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected exact TS risky-script warning, got %#v", warnings)
+	}
 }

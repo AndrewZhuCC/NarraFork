@@ -181,6 +181,108 @@ func TestPersistPlanCompactReturnsErrorWhenNarratorSummaryUpdateFails(t *testing
 	}
 }
 
+// TestPersistPlanCompactContentTextMatchesTS pins the stored content_text to the TS
+// persistPlanMessage shape (server/services/narrator-persistence.ts):
+// `[Plan] ${content.slice(0, 200)}...` — the plan body is sliced to 200 UTF-16
+// code units, wrapped with the "[Plan] " prefix and an always-present trailing
+// "...". Go previously truncated the whole "[Plan] " + plan to 220 bytes with a
+// conditional "...", diverging on slice target, metric, boundary, and the suffix.
+func TestPersistPlanCompactContentTextMatchesTS(t *testing.T) {
+	readContentText := func(t *testing.T, sqlDB *sql.DB, msgID string) string {
+		t.Helper()
+		var ct string
+		if err := sqlDB.QueryRow(`SELECT content_text FROM narrator_messages WHERE id = ?`, msgID).Scan(&ct); err != nil {
+			t.Fatalf("read content_text: %v", err)
+		}
+		return ct
+	}
+
+	// Short plan: always-on "..." even though no truncation happens.
+	shortDB := openNarratorHandlerTestDB(t)
+	defer shortDB.Close()
+	shortService := &Service{DB: shortDB}
+	short := insertNarratorHandlerTestRow(t, shortDB)
+	msg, err := shortService.persistPlanCompact(context.Background(), short, "do the thing")
+	if err != nil {
+		t.Fatalf("persist short plan: %v", err)
+	}
+	if got := readContentText(t, shortDB, msg.ID); got != "[Plan] do the thing..." {
+		t.Fatalf("short plan content_text = %q, want %q", got, "[Plan] do the thing...")
+	}
+
+	// Long CJK plan: body sliced to 200 UTF-16 units (valid UTF-8), prefix + "...".
+	cjkDB := openNarratorHandlerTestDB(t)
+	defer cjkDB.Close()
+	cjkService := &Service{DB: cjkDB}
+	cjk := insertNarratorHandlerTestRow(t, cjkDB)
+	plan := strings.Repeat("章", 250)
+	msg2, err := cjkService.persistPlanCompact(context.Background(), cjk, plan)
+	if err != nil {
+		t.Fatalf("persist cjk plan: %v", err)
+	}
+	got := readContentText(t, cjkDB, msg2.ID)
+	want := "[Plan] " + strings.Repeat("章", 200) + "..."
+	if got != want {
+		t.Fatalf("cjk plan content_text mismatch:\n got %q\nwant %q", got, want)
+	}
+	for _, r := range got {
+		if r == 0xFFFD {
+			t.Fatalf("cjk plan content_text has invalid UTF-8 (U+FFFD): %q", got)
+		}
+	}
+}
+
+// TestUpdateMessageSummaryContentTextMatchesTS pins the PATCH /compact/{messageId}
+// content_text against TS updateCompactSummary (server/services/narrator-messages.ts):
+// `${prefix} ${summary.slice(0, 200)}...` where prefix is "[Plan]" for a plan-subtype
+// block else "[Compact]", with the summary sliced to 200 UTF-16 units and a trailing
+// "..." always appended. The segment-compact branch keeps `[Segment Compact]\n${summary}`
+// (full, no slice). Go previously used `[Compact] ` + full summary with no slice/"..."
+// and ignored the plan subtype.
+func TestUpdateMessageSummaryContentTextMatchesTS(t *testing.T) {
+	readContentText := func(t *testing.T, sqlDB *sql.DB, msgID string) string {
+		t.Helper()
+		var ct string
+		if err := sqlDB.QueryRow(`SELECT content_text FROM narrator_messages WHERE id = ?`, msgID).Scan(&ct); err != nil {
+			t.Fatalf("read content_text: %v", err)
+		}
+		return ct
+	}
+	insertCompactMsg := func(t *testing.T, sqlDB *sql.DB, narratorID, msgID, contentJSON string) {
+		t.Helper()
+		if _, err := sqlDB.Exec(`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at) VALUES (?, ?, 'system', ?, 'old', 'now')`, msgID, narratorID, contentJSON); err != nil {
+			t.Fatalf("insert compact message: %v", err)
+		}
+	}
+
+	cases := []struct {
+		name        string
+		contentJSON string
+		summary     string
+		want        string
+	}{
+		{"compact short", `[{"type":"compact","status":"compacted","summary":"old"}]`, "a new summary", "[Compact] a new summary..."},
+		{"plan subtype", `[{"type":"compact","status":"compacted","subtype":"plan","summary":"old"}]`, "the plan body", "[Plan] the plan body..."},
+		{"segment full", `[{"type":"segment_compact","status":"compacted","summary":"old"}]`, "seg summary", "[Segment Compact]\nseg summary"},
+		{"compact cjk slice", `[{"type":"compact","status":"compacted","summary":"old"}]`, strings.Repeat("章", 250), "[Compact] " + strings.Repeat("章", 200) + "..."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlDB := openNarratorHandlerTestDB(t)
+			defer sqlDB.Close()
+			narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+			insertCompactMsg(t, sqlDB, narratorID, "msg1", tc.contentJSON)
+			h := NewHandler(&Service{DB: sqlDB})
+			if err := h.updateMessageSummary(context.Background(), narratorID, "msg1", tc.summary); err != nil {
+				t.Fatalf("updateMessageSummary: %v", err)
+			}
+			if got := readContentText(t, sqlDB, "msg1"); got != tc.want {
+				t.Fatalf("%s content_text = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSegmentCompactReturnsErrorWhenNarratorUpdateFails(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -553,4 +655,57 @@ func serveNarratorHandlerRawJSON(sqlDB *sql.DB, method string, path string, body
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
 	return w
+}
+
+// TestCreateCompactMessageContentTextMatchesTS pins createCompactMessage (manual
+// compact endpoint) content_text against the TS finalizeCompactingMessage format
+// (narrator-persistence.ts): regular compact -> `[Compact] ${summary.slice(0, 200)}...`
+// (200 UTF-16 units, always-on "..."), segment compact -> `[Segment Compact]\n${summary}`
+// (full). Go previously used `[Compact]\n` + full summary for the regular compact.
+func TestCreateCompactMessageContentTextMatchesTS(t *testing.T) {
+	readContentText := func(t *testing.T, sqlDB *sql.DB, msgID string) string {
+		t.Helper()
+		var ct string
+		if err := sqlDB.QueryRow(`SELECT content_text FROM narrator_messages WHERE id = ?`, msgID).Scan(&ct); err != nil {
+			t.Fatalf("read content_text: %v", err)
+		}
+		return ct
+	}
+
+	regDB := openNarratorHandlerTestDB(t)
+	defer regDB.Close()
+	regNar := insertNarratorHandlerTestRow(t, regDB)
+	h := NewHandler(&Service{DB: regDB})
+	msg, err := h.createCompactMessage(context.Background(), regNar, "a compact summary", "compact", nil)
+	if err != nil {
+		t.Fatalf("createCompactMessage compact: %v", err)
+	}
+	if got := readContentText(t, regDB, msg.ID); got != "[Compact] a compact summary..." {
+		t.Fatalf("compact content_text = %q, want %q", got, "[Compact] a compact summary...")
+	}
+
+	segDB := openNarratorHandlerTestDB(t)
+	defer segDB.Close()
+	segNar := insertNarratorHandlerTestRow(t, segDB)
+	hSeg := NewHandler(&Service{DB: segDB})
+	segMsg, err := hSeg.createCompactMessage(context.Background(), segNar, "seg summary", "segment_compact", nil)
+	if err != nil {
+		t.Fatalf("createCompactMessage segment: %v", err)
+	}
+	if got := readContentText(t, segDB, segMsg.ID); got != "[Segment Compact]\nseg summary" {
+		t.Fatalf("segment content_text = %q, want %q", got, "[Segment Compact]\nseg summary")
+	}
+
+	cjkDB := openNarratorHandlerTestDB(t)
+	defer cjkDB.Close()
+	cjkNar := insertNarratorHandlerTestRow(t, cjkDB)
+	hCJK := NewHandler(&Service{DB: cjkDB})
+	cjkMsg, err := hCJK.createCompactMessage(context.Background(), cjkNar, strings.Repeat("章", 250), "compact", nil)
+	if err != nil {
+		t.Fatalf("createCompactMessage cjk: %v", err)
+	}
+	want := "[Compact] " + strings.Repeat("章", 200) + "..."
+	if got := readContentText(t, cjkDB, cjkMsg.ID); got != want {
+		t.Fatalf("compact cjk content_text mismatch:\n got %q\nwant %q", got, want)
+	}
 }

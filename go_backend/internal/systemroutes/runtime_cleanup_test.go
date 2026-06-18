@@ -61,6 +61,28 @@ func TestRuntimeCleanupRejectsOversizedOptionalJSONBody(t *testing.T) {
 	}
 }
 
+// TestRuntimeCleanupUnknownTargetMatchesTSMessage locks the invalid-target error
+// string against the TypeScript runtime cleanup route (server/routes/runtime.ts),
+// which returns 400 "Invalid target". Go keeps its documented capability extension
+// (empty/omitted target -> "all"; Go-only "worktrees" target), so only a genuinely
+// unrecognized non-empty target reaches the 400 path; the message is aligned to TS.
+func TestRuntimeCleanupUnknownTargetMatchesTSMessage(t *testing.T) {
+	h := &Handler{TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+	for _, body := range []string{`{"target":"bogus"}`, `{"target":"sessions"}`} {
+		req := httptest.NewRequest(http.MethodPost, "/runtime/cleanup", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		err := h.cleanupRuntime(w, req)
+		var appErr *httpx.AppError
+		if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+			t.Fatalf("expected 400 AppError for %s, got %T %v", body, err, err)
+		}
+		if appErr.Message != "Invalid target" {
+			t.Fatalf("expected message \"Invalid target\" for %s, got %q", body, appErr.Message)
+		}
+	}
+}
+
 func TestRuntimeScanReportsBrowserRuntimeAndPersistedSessions(t *testing.T) {
 	sqlDB := newRuntimeCleanupTestDB(t)
 	defer sqlDB.Close()
@@ -261,6 +283,43 @@ func TestAdminTerminalDetachedActionsReturnUnsupportedWhenRuntimeCannotAct(t *te
 		t.Fatalf("kill orphan terminal: %v", err)
 	}
 	assertTerminalUnsupported(t, kill, "admin.terminal.killOrphan")
+}
+
+// TestOrphanTerminalRoutesRequireStringTerminalIdLikeTS locks the kill-orphan and
+// reattach-orphan validation against TS (server/routes/admin.ts): `if (!terminalId
+// || typeof terminalId !== "string") throw new AppError("terminalId is required",
+// 400, "VALIDATION_ERROR")`. A missing/empty/non-string terminalId must return 400
+// with code VALIDATION_ERROR. Go previously decoded into a typed string (a
+// non-string value gave a generic "invalid JSON") and used BadRequest (code
+// BAD_REQUEST) instead of VALIDATION_ERROR.
+func TestOrphanTerminalRoutesRequireStringTerminalIdLikeTS(t *testing.T) {
+	h := &Handler{TerminalRuntime: &fakeRuntimeCleanupTerminalRuntime{}}
+	handlers := map[string]func(http.ResponseWriter, *http.Request) error{
+		"kill-orphan":     h.killOrphanTerminal,
+		"reattach-orphan": h.reattachOrphanTerminal,
+	}
+	for route, handler := range handlers {
+		for _, tc := range []struct{ name, body string }{
+			{"missing terminalId", `{}`},
+			{"empty terminalId", `{"terminalId":""}`},
+			{"terminalId number", `{"terminalId":123}`},
+			{"terminalId object", `{"terminalId":{"a":1}}`},
+		} {
+			t.Run(route+"/"+tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, "/api/admin/terminals/"+route, strings.NewReader(tc.body))
+				req.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				err := handler(w, req)
+				var appErr *httpx.AppError
+				if !errors.As(err, &appErr) || appErr.Status != http.StatusBadRequest {
+					t.Fatalf("expected 400 AppError for %s/%s, got %T %v", route, tc.name, err, err)
+				}
+				if appErr.Code != "VALIDATION_ERROR" || appErr.Message != "terminalId is required" {
+					t.Fatalf("expected VALIDATION_ERROR \"terminalId is required\" for %s/%s, got code=%q msg=%q", route, tc.name, appErr.Code, appErr.Message)
+				}
+			})
+		}
+	}
 }
 
 func TestRuntimeCleanupDryRunReportsScopedRemovedWithoutSideEffects(t *testing.T) {

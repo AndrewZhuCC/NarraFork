@@ -70,24 +70,32 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) error {
 	projectID := strings.TrimSpace(r.URL.Query().Get("projectId"))
 	chapterID := strings.TrimSpace(r.URL.Query().Get("chapterId"))
 	typeValue := strings.TrimSpace(r.URL.Query().Get("type"))
-	if typeValue != "" && !validEdgeTypes[typeValue] {
-		return validationError("Invalid type: " + typeValue)
-	}
-	query := `SELECT id, project_id, source_id, target_id, type, metadata, created_at FROM chapter_edges WHERE 1=1`
-	args := []any{}
-	if projectID != "" {
-		query += ` AND project_id = ?`
-		args = append(args, projectID)
-	}
-	if chapterID != "" {
-		query += ` AND (source_id = ? OR target_id = ?)`
-		args = append(args, chapterID, chapterID)
-	}
-	if typeValue != "" {
-		query += ` AND type = ?`
-		args = append(args, typeValue)
-	}
-	if projectID == "" && chapterID == "" {
+
+	// Mirror the TypeScript chapter-edges GET branching cascade exactly
+	// (server/routes/chapter-edges.ts): chapterId wins and returns ALL edges
+	// touching that chapter (projectId and type are ignored); otherwise a
+	// projectId+type pair filters by type (type validated ONLY in this branch);
+	// otherwise projectId alone returns the project's edges; otherwise 400. Go
+	// previously built one combined query that applied projectId+chapterId+type
+	// filters together and validated type up front, so requests like
+	// ?chapterId=X&type=fork (TS: type ignored) or ?projectId=P&chapterId=X (TS:
+	// chapter branch ignores projectId) diverged.
+	query := `SELECT id, project_id, source_id, target_id, type, metadata, created_at FROM chapter_edges WHERE `
+	var args []any
+	switch {
+	case chapterID != "":
+		query += `(source_id = ? OR target_id = ?)`
+		args = []any{chapterID, chapterID}
+	case projectID != "" && typeValue != "":
+		if !validEdgeTypes[typeValue] {
+			return validationError("Invalid type: " + typeValue)
+		}
+		query += `project_id = ? AND type = ?`
+		args = []any{projectID, typeValue}
+	case projectID != "":
+		query += `project_id = ?`
+		args = []any{projectID}
+	default:
 		return validationError("projectId or chapterId required")
 	}
 	rows, err := h.DB.QueryContext(r.Context(), query, args...)
@@ -123,17 +131,29 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 	sourceID := strings.TrimSpace(body.SourceID)
 	targetID := strings.TrimSpace(body.TargetID)
 	typeValue := strings.TrimSpace(body.Type)
+	// Mirror the TypeScript error precedence exactly. TS runs
+	// createChapterEdgeSchema.safeParse FIRST (sourceId.min(1) -> targetId.min(1)
+	// -> type enum(["dependency"]) -> metadata.description.max(500)), and only
+	// then the createDependencyEdge service business rules (self-edge -> source
+	// exists -> target exists -> cross-project). Go previously checked the
+	// self-edge guard BEFORE the type/metadata schema bounds, so a request that
+	// was both a self-edge and had an invalid type (or an over-long description)
+	// surfaced the self-edge error where TS surfaced the schema error.
 	if sourceID == "" || targetID == "" {
 		return validationError("sourceId and targetId are required")
-	}
-	if sourceID == targetID {
-		return validationError("Cannot create a chapter edge to itself")
 	}
 	if !validEdgeTypes[typeValue] {
 		return validationError("Invalid type: " + typeValue)
 	}
 	if !manualEdgeTypes[typeValue] {
 		return validationError("Manual chapter edge create is only supported for dependency edges")
+	}
+	metadataPayload, err := dependencyEdgeMetadata(body.Metadata)
+	if err != nil {
+		return err
+	}
+	if sourceID == targetID {
+		return validationError("Cannot create a dependency edge to itself")
 	}
 
 	sourceProjectID, err := h.chapterProjectID(r, sourceID)
@@ -145,7 +165,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if sourceProjectID != targetProjectID {
-		return validationError("Cannot create chapter edge between chapters of different projects")
+		return validationError("Cannot create dependency between chapters of different projects")
 	}
 	if exists, err := h.edgeExists(r, sourceID, targetID, typeValue); err != nil {
 		return err
@@ -153,10 +173,6 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) error {
 		return validationError("Chapter edge already exists")
 	}
 
-	metadataPayload, err := dependencyEdgeMetadata(body.Metadata)
-	if err != nil {
-		return err
-	}
 	metadata, _ := json.Marshal(metadataPayload)
 	edgeID := id.New()
 	now := db.NowISO()
@@ -296,7 +312,7 @@ func dependencyEdgeMetadata(raw map[string]any) (map[string]any, error) {
 	if !ok {
 		return nil, validationError("metadata.description must be a string")
 	}
-	if len([]rune(description)) > 500 {
+	if httpx.JSStringLength(description) > 500 {
 		return nil, validationError("metadata.description must be at most 500 characters")
 	}
 	metadata["description"] = description

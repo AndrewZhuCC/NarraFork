@@ -50,6 +50,35 @@ func TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren(t *testing.T) {
 	}
 }
 
+// TestMessagesCursorLimitZeroReturnsEmpty locks the TS /:id/messages limit
+// semantics Math.min(rawLimit, 200) with NO lower clamp: limit=0 fetches LIMIT 1
+// and slice(0,0) -> empty pageRows, and TS then early-returns hasMore=false /
+// nextCursor=null for an empty page. Go previously forced limit<=0 up to the 50
+// fallback and returned rows.
+func TestMessagesCursorLimitZeroReturnsEmpty(t *testing.T) {
+	sqlDB := openNarratorHandlerTestDB(t)
+	defer sqlDB.Close()
+	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+	service := &Service{DB: sqlDB}
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if _, err := service.addMessage(ctx, narratorID, "user", "m"+string(rune('0'+i)), nil); err != nil {
+			t.Fatalf("add message %d: %v", i, err)
+		}
+	}
+	page, err := service.MessagesCursor(ctx, narratorID, 0, "", "older")
+	if err != nil {
+		t.Fatalf("limit=0 cursor page: %v", err)
+	}
+	if len(page.Messages) != 0 {
+		t.Fatalf("limit=0 should return empty messages (TS slice(0,0)), got %d", len(page.Messages))
+	}
+	// TS early-returns hasMore:false / nextCursor:null when pageRows is empty.
+	if page.HasMore || page.NextCursor != nil {
+		t.Fatalf("limit=0 empty page should report HasMore=false / NextCursor=nil (TS empty-page early return), got %#v", page)
+	}
+}
+
 func TestMessagesCursorAttachesChildTreeForTopLevelRefs(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()

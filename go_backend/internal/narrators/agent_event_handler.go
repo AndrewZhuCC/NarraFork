@@ -51,6 +51,7 @@ type agentRunState struct {
 	planApprovedPrompt     string
 	planApprovedBy         string
 	sideCarToolCount       int
+	toolUseCharsMap        map[string]int
 }
 
 func (state *agentRunState) resetAssistantDraft() {
@@ -70,12 +71,55 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		state.providerPrefix = event.Provider
 	}
 	s.broadcastAgentEvent(state.narratorID, event)
+	// Mirror the TS narrator-event-handler recordOutputChunk calls: record streamed
+	// assistant text and reasoning lengths (UTF-16 code units) into the global
+	// output-stats rate tracker so the output_stats WS feed reports real chars/sec.
+	if s.Hub != nil && event.Text != "" && (event.Type == "stream_text" || event.Type == "stream_reasoning") {
+		s.Hub.RecordOutputText(event.Text)
+	}
+	// Mirror the TS tool-input streaming contribution: tool_use_chunk carries a
+	// cumulative InputCharsTotal per tool; record the positive delta from the last
+	// seen value for that toolUseId (TS narrator-event-handler.ts:609-616). Go's
+	// InputCharsTotal is the byte length of the accumulating tool-input JSON, which
+	// equals the UTF-16 length for the overwhelmingly ASCII tool-input JSON.
+	if s.Hub != nil && event.Type == "tool_use_chunk" && event.Streaming != nil && event.Streaming.InputCharsTotal > 0 {
+		toolUseID := strings.TrimSpace(event.ToolUseID)
+		if toolUseID == "" {
+			toolUseID = strings.TrimSpace(event.Streaming.ToolUseID)
+		}
+		if toolUseID != "" {
+			if state.toolUseCharsMap == nil {
+				state.toolUseCharsMap = map[string]int{}
+			}
+			prev := state.toolUseCharsMap[toolUseID]
+			if delta := event.Streaming.InputCharsTotal - prev; delta > 0 {
+				s.Hub.RecordOutputChunk(delta)
+				state.toolUseCharsMap[toolUseID] = event.Streaming.InputCharsTotal
+			}
+		}
+	}
 	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil && (event.Type == "stream_text" || event.Type == "stream_reasoning") && event.Text != "" {
 		state.streamedBytes += len([]byte(event.Text))
 		s.broadcastBackgroundTaskOutput(*state.narrator.ParentNarratorID, state.narratorID, state.streamedBytes)
 	}
 	switch event.Type {
-	case "stream_text", "stream_reasoning", "tool_use_chunk", "retrying", "web_search", "image_generation", "output_truncated", "model_switched", "tool_inventory":
+	case "retrying":
+		// The raw `retrying` frame was already broadcast above (and the hub maps it
+		// to a `warning` frame for this narrator's own subscribers). When this
+		// narrator is a subagent, additionally notify its parent so the parent's
+		// SubagentCard can render the inline retry status, mirroring the TS
+		// narrator-recovery subagent_warning dual broadcast.
+		s.broadcastSubagentWarning(state.narrator, state.narratorID, event)
+		return nil
+	case "model_switched":
+		// The raw `model_switched` frame was already broadcast above. Mirror the TS
+		// narrator-event-handler dual broadcast (narrator-event-handler.ts:1712-1730)
+		// by additionally emitting the model_settings_applied companion frame so the
+		// frontend's model_settings_applied handler receives the applied runtime
+		// model/provider/reasoningEffort.
+		s.broadcastModelSettingsApplied(state.narratorID, event)
+		return nil
+	case "stream_text", "stream_reasoning", "tool_use_chunk", "web_search", "image_generation", "output_truncated", "tool_inventory":
 		return nil
 	case "turn_complete":
 		state.resetAssistantDraft()
@@ -185,6 +229,8 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		return s.finishAgentRunTimeout(ctx, state, state.errorMessage)
 	case "silent_disconnect":
 		return s.finishAgentRunSilentDisconnect(ctx, state)
+	case "payment_required":
+		return s.finishAgentRunPaymentRequired(ctx, state, event)
 	case "error", "retryable_error", "invalid_state":
 		if isContextOverflowAgentEvent(event) {
 			return s.finishAgentRunContextOverflow(ctx, state, event)
@@ -782,6 +828,21 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	if event.RequestID != "" {
 		payload["requestId"] = event.RequestID
 	}
+	if event.ProviderID != "" {
+		payload["providerId"] = event.ProviderID
+	}
+	if event.ProviderPrefix != "" {
+		payload["providerPrefix"] = event.ProviderPrefix
+	}
+	if event.Balance != nil {
+		payload["balance"] = *event.Balance
+	}
+	if event.Required != nil {
+		payload["required"] = *event.Required
+	}
+	if event.ResumeAction != "" {
+		payload["resumeAction"] = event.ResumeAction
+	}
 	if event.Provider != "" {
 		payload["provider"] = event.Provider
 	}
@@ -1306,6 +1367,75 @@ func (s *Service) broadcastSubagentStatusChanged(latest Narrator, subagentID, st
 	s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "subagent_status_changed", "narratorId": parentID, "subagentNarratorId": subagentID, "status": status, "substatus": substatus})
 }
 
+// broadcastSubagentWarning notifies the parent narrator that one of its
+// subagents emitted a retryable warning (`retrying` agent event), mirroring the
+// TypeScript narrator-recovery subagent_warning dual broadcast
+// (server/services/narrator-recovery.ts:354-364). It carries the retry metadata
+// (retryCount/maxRetries/delayMs) so the parent's SubagentCard can render the
+// inline retry status. No-op for primary narrators, orphan subagents, or when the
+// Hub is unavailable.
+func (s *Service) broadcastSubagentWarning(latest Narrator, subagentID string, event agentbasic.AgentEvent) {
+	if s.Hub == nil {
+		return
+	}
+	if latest.Type != "subagent" && latest.Variant != "subagent" {
+		return
+	}
+	if latest.ParentNarratorID == nil || strings.TrimSpace(*latest.ParentNarratorID) == "" {
+		return
+	}
+	parentID := strings.TrimSpace(*latest.ParentNarratorID)
+	payload := map[string]any{
+		"type":               "subagent_warning",
+		"narratorId":         parentID,
+		"subagentNarratorId": subagentID,
+		"message":            event.Message,
+	}
+	// retryCount maps to the agent loop attempt counter, matching the hub's
+	// retrying->warning translation (retryCount=attempt). Optional retry metadata
+	// is included only when present, mirroring the TS optional fields.
+	if event.Attempt != 0 {
+		payload["retryCount"] = event.Attempt
+	}
+	if event.MaxRetries != 0 {
+		payload["maxRetries"] = event.MaxRetries
+	}
+	if event.DelayMs != 0 {
+		payload["delayMs"] = event.DelayMs
+	}
+	s.Hub.BroadcastNarrator(parentID, payload)
+}
+
+// broadcastModelSettingsApplied emits the model_settings_applied companion frame
+// alongside a raw model_switched event, mirroring the TS narrator-event-handler
+// dual broadcast (narrator-event-handler.ts:1712-1730). It carries the applied
+// runtime model/provider plus the optional reasoningEffort (from the
+// ModelSwitched detail or the event metadata). No-op when the Hub is unavailable.
+func (s *Service) broadcastModelSettingsApplied(narratorID string, event agentbasic.AgentEvent) {
+	if s.Hub == nil {
+		return
+	}
+	payload := map[string]any{
+		"type":       "model_settings_applied",
+		"narratorId": narratorID,
+		"model":      event.Model,
+		"provider":   event.Provider,
+	}
+	reasoningEffort := ""
+	if event.ModelSwitched != nil {
+		reasoningEffort = strings.TrimSpace(event.ModelSwitched.ReasoningEffort)
+	}
+	if reasoningEffort == "" {
+		reasoningEffort = strings.TrimSpace(stringFromMetadata(event.Metadata, "reasoningEffort"))
+	}
+	// reasoningEffort is optional in the TS type (reasoningEffort?: string | null);
+	// only include it when present.
+	if reasoningEffort != "" {
+		payload["reasoningEffort"] = reasoningEffort
+	}
+	s.Hub.BroadcastNarrator(narratorID, payload)
+}
+
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	if state.draftMessageID != nil && strings.TrimSpace(*state.draftMessageID) != "" {
@@ -1512,6 +1642,75 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"error"})
 		}
 		s.broadcastNarratorError(state.narratorID, message, errorCode)
+		// When the loop ends with an error while queued (buffered) messages remain,
+		// notify the frontend so it keeps showing them (and re-syncs the authoritative
+		// list). Mirrors the TS buffer_preserved error-path broadcast
+		// (narrator-session.ts:2565-2577); the DB rows are already preserved. The
+		// interrupted/cancelled path intentionally does NOT emit this because
+		// auto-resume immediately consumes the first message.
+		if remaining, err := s.loadBufferedMessages(ctx, state.narratorID, 200); err == nil && len(remaining) > 0 {
+			s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "buffer_preserved", "narratorId": state.narratorID, "messages": bufferSummaries(remaining)})
+		}
+	}
+	return nil
+}
+
+// finishAgentRunPaymentRequired finalizes a run that ended because a NUG
+// provider reported insufficient balance / payment required. It mirrors the TS
+// narrator-session.ts payment_required branch: persist status=idle with
+// substatus=["payment_required"], store a JSON error_message blob the frontend
+// parses (parsePersistedPaymentRequired) and broadcast the status. The
+// structured payment_required WS event itself is broadcast by
+// broadcastAgentEvent before this finalizer runs.
+func (s *Service) finishAgentRunPaymentRequired(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
+	state.completed = true
+	state.errored = true
+	message := strings.TrimSpace(event.Message)
+	if message == "" {
+		message = "Insufficient balance"
+	}
+	blob := map[string]any{
+		"type":         "payment_required",
+		"message":      message,
+		"resumeAction": firstNonEmptyString(event.ResumeAction, "retry"),
+	}
+	if event.ProviderID != "" {
+		blob["providerId"] = event.ProviderID
+	}
+	if event.ProviderPrefix != "" {
+		blob["providerPrefix"] = event.ProviderPrefix
+	}
+	if event.Balance != nil {
+		blob["balance"] = *event.Balance
+	}
+	if event.Required != nil {
+		blob["required"] = *event.Required
+	}
+	errorMessageJSON, err := json.Marshal(blob)
+	if err != nil {
+		return err
+	}
+	latest := s.latestRunNarrator(ctx, state)
+	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
+	if treatAsBackground {
+		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["payment_required"]', background_status = 'failed', background_result = ?, background_completed_at = ?, error_message = ?, updated_at = ? WHERE id = ?`, message, db.NowISO(), string(errorMessageJSON), db.NowISO(), state.narratorID)
+	} else {
+		_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'idle', substatus = '["payment_required"]', error_message = ?, updated_at = ? WHERE id = ?`, string(errorMessageJSON), db.NowISO(), state.narratorID)
+	}
+	if err != nil {
+		return err
+	}
+	if treatAsBackground && strings.TrimSpace(backgroundParentID) != "" {
+		if err := s.finishBackgroundTaskRecord(ctx, backgroundParentID, state.narratorID, "failed", message); err != nil {
+			s.broadcastAgentErrorPersistenceFailure(state.narratorID, "background_task", err)
+			return err
+		}
+	}
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "idle", "substatus": []string{"payment_required"}, "isBackground": latest.IsBackground, "backgroundStatus": nullableTrimmedString(map[bool]string{true: "failed", false: ""}[treatAsBackground])})
+		if !treatAsBackground {
+			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"payment_required"})
+		}
 	}
 	return nil
 }
@@ -1537,6 +1736,9 @@ func (s *Service) unregisterActiveRun(narratorID string, runToken string) {
 	if s.activeRunToken[narratorID] == runToken {
 		delete(s.activeRuns, narratorID)
 		delete(s.activeRunToken, narratorID)
+		// Cancel any pending trailing git-status broadcast so it does not fire
+		// after the run has finished (mirrors TS clearTimeout on finalize).
+		s.clearGitTrackTimer(narratorID)
 	}
 }
 

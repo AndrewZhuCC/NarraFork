@@ -2,6 +2,7 @@ package agentbasic
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,94 @@ import (
 	"strings"
 	"testing"
 )
+
+// TestOpenAIChatCompletionsDeepSeekReasoningMatchesTS pins the DeepSeek
+// chat-completions reasoning shape to the TS openai-provider: DeepSeek sends a
+// `thinking` config plus a DeepSeek-tiered reasoning_effort. `none` ->
+// thinking:{type:"disabled"} with no reasoning_effort; low/medium/high ->
+// thinking:{type:"enabled"} + reasoning_effort:"high"; xhigh -> reasoning_effort:"max".
+func TestOpenAIChatCompletionsDeepSeekReasoningMatchesTS(t *testing.T) {
+	run := func(t *testing.T, effort string) map[string]any {
+		var requestBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&requestBody)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		}))
+		defer server.Close()
+		adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "openai", Kind: "openai", APIKey: "k", BaseURL: server.URL, Model: "deepseek-chat", DefaultReasoningEffort: effort}}
+		stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+		if err != nil {
+			t.Fatalf("Chat error: %v", err)
+		}
+		for event := range stream {
+			if event.Err != nil {
+				t.Fatalf("stream error: %v", event.Err)
+			}
+		}
+		return requestBody
+	}
+
+	t.Run("xhigh maps to max with thinking enabled", func(t *testing.T) {
+		body := run(t, "xhigh")
+		thinking, _ := body["thinking"].(map[string]any)
+		if thinking == nil || thinking["type"] != "enabled" {
+			t.Fatalf("expected thinking enabled, got %#v", body["thinking"])
+		}
+		if body["reasoning_effort"] != "max" {
+			t.Fatalf("xhigh should map to reasoning_effort max, got %#v", body["reasoning_effort"])
+		}
+	})
+
+	t.Run("medium maps to high", func(t *testing.T) {
+		body := run(t, "medium")
+		if body["reasoning_effort"] != "high" {
+			t.Fatalf("medium should map to reasoning_effort high, got %#v", body["reasoning_effort"])
+		}
+	})
+
+	t.Run("none disables thinking with no effort", func(t *testing.T) {
+		body := run(t, "none")
+		thinking, _ := body["thinking"].(map[string]any)
+		if thinking == nil || thinking["type"] != "disabled" {
+			t.Fatalf("none should disable thinking, got %#v", body["thinking"])
+		}
+		if _, has := body["reasoning_effort"]; has {
+			t.Fatalf("none must not send reasoning_effort, got %#v", body["reasoning_effort"])
+		}
+	})
+}
+
+// TestClineChatCompletionsOmitsReasoningLikeTS pins the Cline provider's
+// chat-completions body to the TS cline-provider.ts: it sends
+// model/messages/stream/stream_options/tools only and NEVER a reasoning_effort or
+// thinking field, even for a gpt-5-named (Cline-proxied) model that would
+// otherwise match the generic reasoning gate.
+func TestClineChatCompletionsOmitsReasoningLikeTS(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&requestBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "cline", Kind: "cline", APIKey: "k", BaseURL: server.URL, Model: "openai/gpt-5", DefaultReasoningEffort: "high"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+	}
+	if _, has := requestBody["reasoning_effort"]; has {
+		t.Fatalf("Cline must not send reasoning_effort, got %#v", requestBody["reasoning_effort"])
+	}
+	if _, has := requestBody["thinking"]; has {
+		t.Fatalf("Cline must not send thinking, got %#v", requestBody["thinking"])
+	}
+}
 
 func TestOpenAIChatCompletionsStreamsTextAndUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

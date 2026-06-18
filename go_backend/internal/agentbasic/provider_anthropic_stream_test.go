@@ -137,7 +137,7 @@ data: {"type":"message_stop"}
 `)
 	}))
 	defer server.Close()
-	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-test", DefaultReasoningEffort: "medium"}}
+	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-opus-4-6", DefaultReasoningEffort: "medium"}}
 	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{map[string]any{"role": "user", "content": "hi"}}}, SystemPrompt: "system prompt"})
 	if err != nil {
 		t.Fatalf("Chat returned error: %v", err)
@@ -184,6 +184,95 @@ data: {"type":"message_stop"}
 	}
 	if usage == nil || usage.CompletionTokens != 5 || usage.CacheCreationInputTokens != 3 || usage.CacheCreation5mTokens != 1 || usage.CacheCreation1hTokens != 2 {
 		t.Fatalf("unexpected usage: %#v", usage)
+	}
+	// The prompt footprint from message_start (input_tokens / cache_read) must
+	// survive the message_delta (which omits them), matching the TS usage
+	// accumulator. Previously Go emitted the raw per-event snapshot, so the final
+	// (message_delta) usage reported InputTokens=0 / CachedInputTokens=0.
+	// PromptTokens is the full prompt footprint (input + cache_read +
+	// cache_creation = 10 + 2 + 3 = 15), mirroring TS anthropicPromptFootprintTokens.
+	if usage.InputTokens != 10 || usage.PromptTokens != 15 || usage.CachedInputTokens != 2 {
+		t.Fatalf("message_start prompt footprint must persist through message_delta, got InputTokens=%d PromptTokens=%d CachedInputTokens=%d", usage.InputTokens, usage.PromptTokens, usage.CachedInputTokens)
+	}
+	// max_tokens on the main streaming chat must be 32000 (TS getTokenLimits
+	// default), not the legacy hardcoded 4096 that truncated long responses.
+	if mt, _ := requestBody["max_tokens"].(float64); mt != 32000 {
+		t.Fatalf("expected max_tokens 32000 on streaming chat, got %#v", requestBody["max_tokens"])
+	}
+}
+
+// finalAnthropicUsageForSSE runs an Anthropic streaming Chat against a server that
+// returns the given SSE body and returns the last usage snapshot observed.
+func finalAnthropicUsageForSSE(t *testing.T, sseBody string) *UsageSnapshot {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, sseBody)
+	}))
+	defer server.Close()
+	adapter := &AnthropicMessagesAdapter{Provider: Provider{Prefix: "anthropic", Kind: "anthropic", APIKey: "test-key", BaseURL: server.URL, Model: "claude-opus-4-6"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{map[string]any{"role": "user", "content": "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat returned error: %v", err)
+	}
+	var usage *UsageSnapshot
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+		if event.Parsed.Usage != nil {
+			usage = event.Parsed.Usage
+		}
+	}
+	if usage == nil {
+		t.Fatalf("expected a usage snapshot")
+	}
+	return usage
+}
+
+// TestAnthropicUsageDerivesCacheCreationFrom5mAnd1h verifies that when the
+// top-level cache_creation_input_tokens is absent but the 5m/1h breakdown is
+// present, the cache-creation total is derived from 5m+1h (mirrors TS).
+func TestAnthropicUsageDerivesCacheCreationFrom5mAnd1h(t *testing.T) {
+	usage := finalAnthropicUsageForSSE(t, `event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":20}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":6}}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`)
+	if usage.CacheCreation5mTokens != 4 || usage.CacheCreation1hTokens != 6 {
+		t.Fatalf("expected 5m=4 1h=6, got %#v", usage)
+	}
+	if usage.CacheCreationInputTokens != 10 {
+		t.Fatalf("cacheCreationInputTokens should be derived as 5m+1h=10, got %d", usage.CacheCreationInputTokens)
+	}
+	if usage.InputTokens != 20 || usage.CompletionTokens != 7 {
+		t.Fatalf("unexpected input/output tokens: %#v", usage)
+	}
+}
+
+// TestAnthropicUsageMessageDeltaZeroInputDoesNotEraseStart verifies that an
+// explicit input_tokens:0 in message_delta does not erase the message_start value.
+func TestAnthropicUsageMessageDeltaZeroInputDoesNotEraseStart(t *testing.T) {
+	usage := finalAnthropicUsageForSSE(t, `event: message_start
+data: {"type":"message_start","message":{"id":"m","usage":{"input_tokens":100,"cache_read_input_tokens":40}}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"cache_read_input_tokens":0,"output_tokens":12}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`)
+	if usage.InputTokens != 100 || usage.CachedInputTokens != 40 {
+		t.Fatalf("message_delta zeroes must not erase message_start footprint, got InputTokens=%d CachedInputTokens=%d", usage.InputTokens, usage.CachedInputTokens)
+	}
+	if usage.CompletionTokens != 12 {
+		t.Fatalf("expected output_tokens=12, got %d", usage.CompletionTokens)
 	}
 }
 

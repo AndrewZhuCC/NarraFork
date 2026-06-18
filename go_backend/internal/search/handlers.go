@@ -5,10 +5,9 @@ import (
 	"database/sql"
 	"math"
 	"net/http"
+	"net/url"
 	"sort"
-	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -85,15 +84,23 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 	limit := 50
-	if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
-		if parsed, err := strconv.Atoi(rawLimit); err == nil {
-			limit = parsed
-		}
+	if parsed, ok := jsParseInt10(r.URL.Query().Get("limit")); ok {
+		limit = parsed
 	}
-	if limit <= 0 || limit > 100 {
+	// Mirror the TypeScript route: limit = Math.min(Number.isNaN(rawLimit) ? 50 :
+	// rawLimit, 100). The raw value is parsed with JavaScript Number.parseInt
+	// semantics (jsParseInt10): a leading integer prefix is taken and trailing
+	// non-digits are ignored, so "120x" -> 120 (clamped to 100) and "12.9" -> 12,
+	// exactly like TS. strconv.Atoi would instead reject "120x"/"12.9" wholesale
+	// and wrongly fall back to 50. Only the upper bound is clamped; a
+	// non-numeric/absent limit falls back to 50, and zero/negative values pass
+	// through to the SQL LIMIT exactly like TS (SQLite LIMIT 0 -> no rows,
+	// LIMIT -1 -> unbounded). Clamping <=0 up to 100 (the previous Go behavior)
+	// diverged from TS for ?limit=0 and negative limits.
+	if limit > 100 {
 		limit = 100
 	}
-	entitySet := parseEntities(r.URL.Query().Get("entities"))
+	entitySet := parseEntities(r.URL.Query(), "entities")
 	diagnostics.RequestedEntities = requestedEntityList(entitySet)
 	if len(entitySet) == 0 {
 		writeSearchJSON(w, emptySearchPayload(), diagnostics)
@@ -106,7 +113,11 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 	}
 	like := "%" + escapeLike(safeQuery) + "%"
 	ftsQuery := `"` + strings.ReplaceAll(safeQuery, `"`, `""`) + `"`
-	useFts := utf8.RuneCountInString(safeQuery) >= 3
+	// Trigram tokenizer requires >= 3 characters; fall back to LIKE for shorter
+	// queries. Match the TS search-service useFts gate (safeQuery.length >= 3),
+	// which counts UTF-16 code units, so the FTS/LIKE decision is identical for
+	// astral-character queries (e.g. a 2-emoji query is 4 UTF-16 units -> FTS).
+	useFts := httpx.JSStringLength(safeQuery) >= 3
 	diagnostics.ShortQuery = !useFts
 	if h.isPostgres() {
 		useFts = false
@@ -145,9 +156,11 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) error {
 	sort.SliceStable(results, func(i, j int) bool {
 		return searchResultLess(results[i], results[j])
 	})
-	if len(results) > limit {
-		results = results[:limit]
-	}
+	// TypeScript merges the per-entity results (each already SQL-LIMITed) and
+	// returns them sorted without a further truncation to `limit`. A previous Go
+	// `results[:limit]` post-slice diverged (it capped the merged multi-entity set
+	// to a single entity's worth) and would panic on a negative limit, so it is
+	// intentionally not applied here.
 	stripSearchInternalFields(results)
 	writeSearchJSON(w, map[string]any{"results": results, "projects": projects, "chapters": chapters, "narrators": narrators}, diagnostics)
 	return nil
@@ -410,19 +423,36 @@ func requestedEntityList(entitySet map[string]bool) []string {
 	return entities
 }
 
-func parseEntities(raw string) map[string]bool {
-	if strings.TrimSpace(raw) == "" {
-		raw = "chapters,messages,narrators"
+func parseEntities(query url.Values, key string) map[string]bool {
+	// Mirror the TypeScript search route exactly:
+	//   const entitiesParam = c.req.query("entities") ?? "chapters,messages,narrators";
+	//   const entities = entitiesParam.split(",").filter((e) => [...].includes(e));
+	// The `??` only substitutes the default when the param is ABSENT (undefined),
+	// NOT when it is present-but-empty ("entities="): an empty string splits to
+	// [""], which the includes() filter drops, yielding an empty set (→ empty
+	// results). The filter is also an EXACT membership check with no per-entity
+	// trim, so "chapters, messages" (with a space) drops " messages". Go
+	// previously defaulted on any empty/whitespace value and trimmed each entity,
+	// diverging for ?entities= and space-padded CSV entries.
+	raw := "chapters,messages,narrators"
+	if query.Has(key) {
+		raw = query.Get(key)
 	}
 	allowed := map[string]bool{"chapters": true, "messages": true, "narrators": true}
 	out := map[string]bool{}
 	for _, value := range strings.Split(raw, ",") {
-		value = strings.TrimSpace(value)
 		if allowed[value] {
 			out[value] = true
 		}
 	}
 	return out
+}
+
+// jsParseInt10 mirrors JavaScript Number.parseInt(value, 10) for the limit query
+// param. It delegates to the shared httpx.ParseIntJS so the parse semantics stay
+// identical across the search, narrators and chapters routes.
+func jsParseInt10(value string) (int, bool) {
+	return httpx.ParseIntJS(value)
 }
 
 func emptySearchPayload() map[string]any {

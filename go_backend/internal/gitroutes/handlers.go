@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 
@@ -68,8 +67,8 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 }
 
 type filesBody struct {
-	Files []string `json:"files"`
-	All   bool     `json:"all"`
+	Files *[]string `json:"files"`
+	All   bool      `json:"all"`
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) error {
@@ -103,7 +102,7 @@ func (h *Handler) stage(w http.ResponseWriter, r *http.Request) error {
 	if body.All {
 		err = h.Git.StageAll(r.Context(), worktree)
 	} else {
-		err = h.Git.StageFiles(r.Context(), worktree, body.Files)
+		err = h.Git.StageFiles(r.Context(), worktree, *body.Files)
 	}
 	if err != nil {
 		return err
@@ -130,7 +129,7 @@ func (h *Handler) unstage(w http.ResponseWriter, r *http.Request) error {
 	if body.All {
 		err = h.Git.UnstageAll(r.Context(), worktree)
 	} else {
-		err = h.Git.UnstageFiles(r.Context(), worktree, body.Files)
+		err = h.Git.UnstageFiles(r.Context(), worktree, *body.Files)
 	}
 	if err != nil {
 		return err
@@ -155,7 +154,7 @@ func (h *Handler) commit(w http.ResponseWriter, r *http.Request) error {
 	if strings.TrimSpace(body.Message) == "" {
 		return httpx.BadRequest("message is required")
 	}
-	if len(body.Message) > 500 {
+	if httpx.JSStringLength(body.Message) > 500 {
 		return httpx.BadRequest("message must be at most 500 characters")
 	}
 	sha, err := h.Git.Commit(r.Context(), worktree, body.Message)
@@ -189,7 +188,7 @@ func (h *Handler) discard(w http.ResponseWriter, r *http.Request) error {
 	if body.All {
 		err = h.Git.DiscardAll(r.Context(), worktree)
 	} else {
-		err = h.Git.DiscardFiles(r.Context(), worktree, body.Files)
+		err = h.Git.DiscardFiles(r.Context(), worktree, *body.Files)
 	}
 	if err != nil {
 		return err
@@ -207,7 +206,7 @@ func (h *Handler) diff(w http.ResponseWriter, r *http.Request) error {
 	if file == "" {
 		return httpx.BadRequest("file is required")
 	}
-	if err := validateFiles([]string{file}); err != nil {
+	if err := validateFilePath(file); err != nil {
 		return err
 	}
 	result, err := h.Git.FileDiff(r.Context(), worktree, file, r.URL.Query().Get("staged") == "true")
@@ -244,10 +243,14 @@ func (h *Handler) stash(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
-	// Mirror the TypeScript gitStashSchema bound: message max 200 (Go also supports
-	// an "apply" action as a documented extension beyond the TS push/pop/drop enum).
-	if len(body.Message) > 200 {
+	// Mirror the TypeScript gitStashSchema bounds: message max 200 and
+	// index int .min(0) (Go also supports an "apply" action as a documented
+	// extension beyond the TS push/pop/drop enum).
+	if httpx.JSStringLength(body.Message) > 200 {
 		return httpx.BadRequest("message must be at most 200 characters")
+	}
+	if body.Index < 0 {
+		return httpx.BadRequest("index must be a non-negative integer")
 	}
 	hasConflicts := false
 	switch body.Action {
@@ -282,19 +285,27 @@ func (h *Handler) log(w http.ResponseWriter, r *http.Request) error {
 	}
 	// Mirror the TypeScript gitLogQuerySchema: limit coerces to an int 1..200
 	// (default 50) and skip coerces to an int >= 0 (default 0). Missing params use
-	// defaults; explicitly out-of-range params reject with 400.
+	// defaults; explicitly out-of-range params reject with 400. The schema uses
+	// z.coerce.number().int(), i.e. JS Number() coercion (accepts "50.0", "1e2",
+	// " 10 ", "0x10"), NOT strconv.Atoi whole-string-integer parsing — so use the
+	// shared httpx.CoerceIntJS helper instead of strconv.Atoi.
 	limit := 50
-	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
-		parsed, convErr := strconv.Atoi(raw)
-		if convErr != nil || parsed < 1 || parsed > 200 {
+	if r.URL.Query().Has("limit") {
+		// TS parses c.req.query() through z.coerce.number(): a PRESENT-but-empty
+		// "limit=" coerces to Number("")===0 and then fails .min(1) -> 400. Only an
+		// ABSENT param uses the .default(50). Distinguish present-empty from absent
+		// via Has() rather than skipping on TrimSpace=="" (which treated "limit="
+		// as absent and wrongly returned the default).
+		parsed, ok := httpx.CoerceIntJS(r.URL.Query().Get("limit"))
+		if !ok || parsed < 1 || parsed > 200 {
 			return httpx.BadRequest("limit must be an integer between 1 and 200")
 		}
 		limit = parsed
 	}
 	skip := 0
-	if raw := strings.TrimSpace(r.URL.Query().Get("skip")); raw != "" {
-		parsed, convErr := strconv.Atoi(raw)
-		if convErr != nil || parsed < 0 {
+	if r.URL.Query().Has("skip") {
+		parsed, ok := httpx.CoerceIntJS(r.URL.Query().Get("skip"))
+		if !ok || parsed < 0 {
 			return httpx.BadRequest("skip must be a non-negative integer")
 		}
 		skip = parsed
@@ -323,7 +334,7 @@ func (h *Handler) reset(w http.ResponseWriter, r *http.Request) error {
 		return httpx.BadRequest("target is required")
 	}
 	// Mirror the TypeScript gitResetSchema Zod bounds: target max 100, mode enum [soft, hard].
-	if len(body.Target) > 100 {
+	if httpx.JSStringLength(body.Target) > 100 {
 		return httpx.BadRequest("target must be at most 100 characters")
 	}
 	if body.Mode != "soft" && body.Mode != "hard" {
@@ -368,7 +379,12 @@ Rules:
 		if genErr != nil {
 			return genErr
 		}
-		if cleaned := sanitizeCommitMessage(generated); cleaned != "" && len(cleaned) <= 200 {
+		// Mirror the TS post-processing (server/routes/git.ts:244):
+		// `if (!message || message.length > 200) message = "chore: update files"`.
+		// message.length is the JS UTF-16 code-unit count, so a CJK commit message
+		// of <=200 characters (but >200 UTF-8 bytes) must be kept, not discarded.
+		// Go previously used byte length here.
+		if cleaned := sanitizeCommitMessage(generated); cleaned != "" && httpx.JSStringLength(cleaned) <= 200 {
 			message = cleaned
 		}
 	}
@@ -568,22 +584,43 @@ func (h *Handler) worktree(r *http.Request) (string, error) {
 	return worktree.String, nil
 }
 
-func validateFiles(files []string) error {
-	for _, file := range files {
-		if strings.TrimSpace(file) == "" {
-			return httpx.BadRequest("file path must be a non-empty string")
-		}
-		if strings.Contains(file, "..") || strings.HasPrefix(file, "/") || strings.HasPrefix(file, "\\") {
-			return httpx.BadRequest("invalid file path: " + file)
+func validateFiles(files *[]string) error {
+	if files == nil {
+		return nil
+	}
+	// TS filePathArray = z.array(z.string().min(1)).min(1): a PRESENT files array
+	// must contain at least one item, and every item must be a non-empty string.
+	if len(*files) == 0 {
+		return httpx.BadRequest("files must contain at least 1 item")
+	}
+	for _, file := range *files {
+		if err := validateFilePath(file); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
+// validateFilePath enforces the per-item file path guard (non-empty + no traversal)
+// shared by the files-array routes and the single-file diff route.
+func validateFilePath(file string) error {
+	if strings.TrimSpace(file) == "" {
+		return httpx.BadRequest("file path must be a non-empty string")
+	}
+	if strings.Contains(file, "..") || strings.HasPrefix(file, "/") || strings.HasPrefix(file, "\\") {
+		return httpx.BadRequest("invalid file path: " + file)
+	}
+	return nil
+}
+
 // requireFilesOrAll mirrors the TypeScript gitStage/gitUnstage/gitDiscard refine:
-// either a non-empty files array or all=true must be provided.
-func requireFilesOrAll(files []string, all bool) error {
-	if len(files) == 0 && !all {
+// either a non-empty files array or all=true must be provided. Note the TS schema
+// runs filePathArray.min(1) on a PRESENT files field BEFORE this refine, so an
+// explicit empty files array is rejected by validateFiles above even when all=true;
+// this helper only covers the "neither provided" case.
+func requireFilesOrAll(files *[]string, all bool) error {
+	hasFiles := files != nil && len(*files) > 0
+	if !hasFiles && !all {
 		return httpx.BadRequest("Provide files array or set all=true")
 	}
 	return nil

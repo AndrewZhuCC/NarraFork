@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"narrafork-go/internal/httpx"
 
 	_ "modernc.org/sqlite"
 )
@@ -294,5 +298,26 @@ func assertColumnValue(t *testing.T, db *sql.DB, table, keyColumn string, keyVal
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("%s.%s = %v, want %v", table, column, got, want)
+	}
+}
+
+// TestImportBackupRejectsMissingGitPathWith400 pins the TS /api/projects/import
+// behavior (server/routes/project-db.ts): a gitPath whose directory does not
+// exist yields a 400 ValidationError "Path does not exist: <resolved>" BEFORE
+// the backup-database check. Go previously skipped the directory check and
+// returned a 404 "Project database" not-found instead.
+func TestImportBackupRejectsMissingGitPathWith400(t *testing.T) {
+	ctx := context.Background()
+	missing := filepath.Join(t.TempDir(), "no-such-project")
+	_, err := (&Service{}).ImportBackup(ctx, missing)
+	if err == nil {
+		t.Fatalf("expected error for missing gitPath")
+	}
+	appErr, ok := err.(*httpx.AppError)
+	if !ok || appErr.Status != http.StatusBadRequest {
+		t.Fatalf("expected 400 AppError, got %#v", err)
+	}
+	if !strings.Contains(appErr.Message, "Path does not exist") {
+		t.Fatalf("expected 'Path does not exist' message, got %q", appErr.Message)
 	}
 }

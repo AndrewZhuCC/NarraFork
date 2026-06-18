@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -82,6 +83,38 @@ var activeBenchmarkRuns = struct {
 	cancels map[string]context.CancelFunc
 }{cancels: map[string]context.CancelFunc{}}
 
+var benchmarkTaskIDPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
+
+// validateBenchmarkSuiteBody mirrors the TypeScript createSuiteSchema +
+// benchmarkTaskSchema (server/routes/benchmarks.ts): suite name min1/max120,
+// version min1/max120 optional, description max2000 optional, tasks min1/max1000,
+// and per-task id (min1/max120 + charset regex, unique), name min1/max300, prompt
+// min1/max200000, language min1/max50 optional, expectedOutput/testCode max bounds,
+// rubric array(max100) of {name min1/max120, description min1/max5000, maxPoints
+// positive<=1000}, timeoutMs int positive<=86400000. Go previously validated only
+// tasks-present / count<=1000 / prompt-present-and-<=200000, so a suite or task
+// missing name, with an over-long field, a bad task-id charset, a duplicate task
+// id, or a malformed rubric/timeout was accepted instead of returning a 400.
+func validateBenchmarkSuiteBody(body map[string]any) error {
+	name := strings.TrimSpace(stringMap(body, "name", ""))
+	if name == "" || httpx.JSStringLength(name) > 120 {
+		return httpx.BadRequest("benchmark suite name must be 1-120 characters")
+	}
+	if value, ok := body["version"]; ok && value != nil {
+		version, isStr := value.(string)
+		if !isStr || httpx.JSStringLength(version) < 1 || httpx.JSStringLength(version) > 120 {
+			return httpx.BadRequest("benchmark suite version must be 1-120 characters")
+		}
+	}
+	if value, ok := body["description"]; ok && value != nil {
+		description, isStr := value.(string)
+		if !isStr || httpx.JSStringLength(description) > 2000 {
+			return httpx.BadRequest("benchmark suite description must be <= 2000 characters")
+		}
+	}
+	return validateBenchmarkSuitePayload(body["tasks"])
+}
+
 func validateBenchmarkSuitePayload(raw any) error {
 	tasks, ok := raw.([]any)
 	if !ok || len(tasks) == 0 {
@@ -97,17 +130,130 @@ func validateBenchmarkSuitePayload(raw any) error {
 	if len(payload) > 20_000_000 {
 		return httpx.BadRequest("benchmark suite payload must be <= 20000000 JSON bytes")
 	}
+	seenTaskIDs := map[string]bool{}
 	for i, item := range tasks {
 		task, ok := item.(map[string]any)
 		if !ok {
 			return httpx.BadRequest(fmt.Sprintf("benchmark task %d must be an object", i+1))
 		}
-		if strings.TrimSpace(stringMap(task, "prompt", "")) == "" {
+		// id: min1/max120 + charset regex, unique across the suite (TS superRefine).
+		taskID, isStr := task["id"].(string)
+		if !isStr || httpx.JSStringLength(taskID) < 1 || httpx.JSStringLength(taskID) > 120 {
+			return httpx.BadRequest(fmt.Sprintf("benchmark task %d id must be 1-120 characters", i+1))
+		}
+		if !benchmarkTaskIDPattern.MatchString(taskID) {
+			return httpx.BadRequest(fmt.Sprintf("benchmark task %d id may only contain letters, numbers, '.', '_', ':' and '-'", i+1))
+		}
+		if seenTaskIDs[taskID] {
+			return httpx.BadRequest("Duplicate task ID: " + taskID)
+		}
+		seenTaskIDs[taskID] = true
+		// name: min1/max300.
+		taskName, isStr := task["name"].(string)
+		if !isStr || strings.TrimSpace(taskName) == "" || httpx.JSStringLength(taskName) > 300 {
+			return httpx.BadRequest(fmt.Sprintf("benchmark task %d name must be 1-300 characters", i+1))
+		}
+		// prompt: min1/max200000.
+		prompt, isStr := task["prompt"].(string)
+		if !isStr || strings.TrimSpace(prompt) == "" {
 			return httpx.BadRequest(fmt.Sprintf("benchmark task %d prompt is required", i+1))
 		}
-		if len(stringMap(task, "prompt", "")) > 200_000 {
+		if httpx.JSStringLength(prompt) > 200_000 {
 			return httpx.BadRequest(fmt.Sprintf("benchmark task %d prompt must be <= 200000 characters", i+1))
 		}
+		// language: min1/max50 optional.
+		if value, ok := task["language"]; ok && value != nil {
+			language, isStr := value.(string)
+			if !isStr || httpx.JSStringLength(language) < 1 || httpx.JSStringLength(language) > 50 {
+				return httpx.BadRequest(fmt.Sprintf("benchmark task %d language must be 1-50 characters", i+1))
+			}
+		}
+		// expectedOutput / testCode: max bounds optional.
+		for _, field := range []struct {
+			key string
+			max int
+		}{{"expectedOutput", 500_000}, {"testCode", 500_000}} {
+			if value, ok := task[field.key]; ok && value != nil {
+				text, isStr := value.(string)
+				if !isStr || httpx.JSStringLength(text) > field.max {
+					return httpx.BadRequest(fmt.Sprintf("benchmark task %d %s must be <= %d characters", i+1, field.key, field.max))
+				}
+			}
+		}
+		// rubric: array(max100) of {name min1/max120, description min1/max5000, maxPoints positive<=1000}.
+		if value, ok := task["rubric"]; ok && value != nil {
+			rubric, isArr := value.([]any)
+			if !isArr {
+				return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric must be an array", i+1))
+			}
+			if len(rubric) > 100 {
+				return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric must contain at most 100 items", i+1))
+			}
+			for j, ritem := range rubric {
+				criterion, isObj := ritem.(map[string]any)
+				if !isObj {
+					return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric[%d] must be an object", i+1, j))
+				}
+				cname, isStr := criterion["name"].(string)
+				if !isStr || httpx.JSStringLength(cname) < 1 || httpx.JSStringLength(cname) > 120 {
+					return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric[%d] name must be 1-120 characters", i+1, j))
+				}
+				cdesc, isStr := criterion["description"].(string)
+				if !isStr || httpx.JSStringLength(cdesc) < 1 || httpx.JSStringLength(cdesc) > 5000 {
+					return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric[%d] description must be 1-5000 characters", i+1, j))
+				}
+				points, isNum := criterion["maxPoints"].(float64)
+				if !isNum || points <= 0 || points > 1000 {
+					return httpx.BadRequest(fmt.Sprintf("benchmark task %d rubric[%d] maxPoints must be a positive number <= 1000", i+1, j))
+				}
+			}
+		}
+		// metadata: record(key max100, unknown value) with jsonSize <= 200000.
+		if value, ok := task["metadata"]; ok && value != nil {
+			if err := validateBenchmarkMetadata(value, fmt.Sprintf("benchmark task %d metadata", i+1)); err != nil {
+				return err
+			}
+		}
+		// timeoutMs: int positive <= 86400000 optional.
+		if value, ok := task["timeoutMs"]; ok && value != nil {
+			timeout, isNum := value.(float64)
+			if !isNum || timeout != float64(int64(timeout)) || timeout <= 0 || timeout > 24*60*60*1000 {
+				return httpx.BadRequest(fmt.Sprintf("benchmark task %d timeoutMs must be a positive integer <= 86400000", i+1))
+			}
+		}
+	}
+	return nil
+}
+
+// validateBenchmarkMetadata mirrors the TypeScript metadataSchema
+// (server/routes/benchmarks.ts): z.record(z.string().max(100), z.unknown())
+// refined to jsonSize(value) <= 200000. The value must be a JSON object, every
+// key must be <= 100 UTF-16 code units, and the JSON.stringify length (UTF-16
+// code units) must not exceed 200000. Used by both per-task `metadata` and run
+// `config`, which previously had no Go-side validation at all.
+func validateBenchmarkMetadata(value any, label string) error {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return httpx.BadRequest(label + " must be an object")
+	}
+	for key := range object {
+		if httpx.JSStringLength(key) > 100 {
+			return httpx.BadRequest(label + " keys must be <= 100 characters")
+		}
+	}
+	// jsonSize mirrors JSON.stringify(value).length (UTF-16 code units). Disable
+	// HTML escaping so the serialized form matches JS JSON.stringify, then measure
+	// in UTF-16 code units; a serialization failure mirrors the TS catch -> Infinity
+	// (always over the limit).
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(value); err != nil {
+		return httpx.BadRequest(label + " must be <= 200000 JSON characters")
+	}
+	serialized := strings.TrimRight(buf.String(), "\n")
+	if httpx.JSStringLength(serialized) > 200_000 {
+		return httpx.BadRequest(label + " must be <= 200000 JSON characters")
 	}
 	return nil
 }

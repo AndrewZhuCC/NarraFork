@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"narrafork-go/internal/chapters"
 	"narrafork-go/internal/config"
@@ -211,9 +210,23 @@ func (s *Service) Create(ctx context.Context, input CreateInput) (Project, error
 	if strings.TrimSpace(input.Name) == "" {
 		return Project{}, httpx.BadRequest("name is required")
 	}
+	// Mirror the TS createProjectSchema enums/regex (server/lib/validators/projects.ts)
+	// that the length-only handler validation does not cover: flowMode is
+	// z.enum(["classic","ruler"]).default("classic") so a present non-empty value
+	// must be one of the two (empty falls back to classic below), and cloneBranch is
+	// gitBranchName.optional() so a present value must match the branch-name charset.
+	if input.FlowMode != "" && input.FlowMode != "classic" && input.FlowMode != "ruler" {
+		return Project{}, httpx.BadRequest("flowMode must be classic or ruler")
+	}
+	if input.CloneBranch != "" && !gitBranchNamePattern.MatchString(input.CloneBranch) {
+		return Project{}, httpx.BadRequest("Invalid branch name")
+	}
+	// Mirror the TS createProjectSchema repoMode: z.enum(["existing","init","clone"])
+	// — it is REQUIRED (no .default()/.optional()), so a missing or out-of-enum
+	// value must reject with 400 rather than silently defaulting to "existing".
 	mode := input.RepoMode
-	if mode == "" {
-		mode = "existing"
+	if mode != "existing" && mode != "init" && mode != "clone" {
+		return Project{}, httpx.BadRequest("repoMode must be existing, init, or clone")
 	}
 	gitPath, err := expandPath(input.GitPath)
 	if err != nil {
@@ -354,13 +367,16 @@ var gitBranchNamePattern = regexp.MustCompile(`^[a-zA-Z0-9._\-/]+$`)
 func validateProjectUpdateFields(fields map[string]any) error {
 	if value, ok := fields["name"]; ok {
 		name, valid := value.(string)
-		if !valid || strings.TrimSpace(name) == "" || utf8.RuneCountInString(name) > 200 {
+		if !valid || strings.TrimSpace(name) == "" || httpx.JSStringLength(name) > 200 {
 			return httpx.ValidationError("name must be a non-empty string up to 200 characters")
 		}
 	}
-	if value, ok := fields["description"]; ok && value != nil {
+	if value, ok := fields["description"]; ok {
+		// TS updateProjectSchema.description is z.string().max(2000).optional() —
+		// optional but NOT nullable, so an explicit null is rejected with 400
+		// ("expected string, received null") rather than clearing the column.
 		description, valid := value.(string)
-		if !valid || utf8.RuneCountInString(description) > 2000 {
+		if !valid || httpx.JSStringLength(description) > 2000 {
 			return httpx.ValidationError("description must be a string up to 2000 characters")
 		}
 	}
@@ -370,7 +386,9 @@ func validateProjectUpdateFields(fields map[string]any) error {
 			return httpx.ValidationError("status must be active or archived")
 		}
 	}
-	if value, ok := fields["defaultBranch"]; ok && value != nil {
+	if value, ok := fields["defaultBranch"]; ok {
+		// gitBranchName.optional() is non-nullable: a present null is a 400, not a
+		// branch clear (TS rejects null before the regex refine).
 		branch, valid := value.(string)
 		if !valid || !gitBranchNamePattern.MatchString(branch) {
 			return httpx.ValidationError("Invalid branch name")
@@ -379,14 +397,14 @@ func validateProjectUpdateFields(fields map[string]any) error {
 	for _, key := range []string{"startupScript", "copyFiles"} {
 		if value, ok := fields[key]; ok && value != nil {
 			text, valid := value.(string)
-			if !valid || utf8.RuneCountInString(text) > 5000 {
+			if !valid || httpx.JSStringLength(text) > 5000 {
 				return httpx.ValidationError(key + " must be a string up to 5000 characters")
 			}
 		}
 	}
 	if value, ok := fields["proxyDomain"]; ok && value != nil {
 		domain, valid := value.(string)
-		if !valid || utf8.RuneCountInString(domain) > 200 {
+		if !valid || httpx.JSStringLength(domain) > 200 {
 			return httpx.ValidationError("proxyDomain must be a string up to 200 characters")
 		}
 	}
@@ -433,7 +451,51 @@ func validateProjectChapterSettings(value any) (map[string]any, error) {
 	if err := validateChapterSettingsCommandRules(filtered["commandBlacklist"], "commandBlacklist", true); err != nil {
 		return nil, err
 	}
+	// Mirror the remaining TS chapterSettings fields:
+	// autoCreateNarrator/requireReviewBeforeMerge are z.boolean().optional() and
+	// routines is z.object({disabledRoutines, enabledRoutines: z.array(z.string())
+	// .optional()}).optional(). Go previously allow-listed these keys but never
+	// type-checked them, so a non-boolean flag or a malformed routines object was
+	// persisted instead of being rejected with 400 as TS Zod does.
+	if err := chapterSettingsOptionalBool(filtered, "autoCreateNarrator", "chapterSettings"); err != nil {
+		return nil, err
+	}
+	if err := chapterSettingsOptionalBool(filtered, "requireReviewBeforeMerge", "chapterSettings"); err != nil {
+		return nil, err
+	}
+	if err := validateChapterSettingsRoutines(filtered["routines"]); err != nil {
+		return nil, err
+	}
 	return filtered, nil
+}
+
+// validateChapterSettingsRoutines mirrors the TS chapterSettings.routines schema:
+// z.object({disabledRoutines: z.array(z.string()).optional(), enabledRoutines:
+// z.array(z.string()).optional()}).optional().
+func validateChapterSettingsRoutines(value any) error {
+	if value == nil {
+		return nil
+	}
+	routines, ok := value.(map[string]any)
+	if !ok {
+		return httpx.ValidationError("chapterSettings.routines must be an object")
+	}
+	for _, key := range []string{"disabledRoutines", "enabledRoutines"} {
+		raw, ok := routines[key]
+		if !ok || raw == nil {
+			continue
+		}
+		items, ok := raw.([]any)
+		if !ok {
+			return httpx.ValidationError("chapterSettings.routines." + key + " must be an array")
+		}
+		for i, item := range items {
+			if _, ok := item.(string); !ok {
+				return httpx.ValidationError("chapterSettings.routines." + key + "[" + strconv.Itoa(i) + "] must be a string")
+			}
+		}
+	}
+	return nil
 }
 
 var chapterCommandNamePattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -615,7 +677,7 @@ func chapterSettingsRequiredString(item map[string]any, key, path string, minLen
 	if !ok {
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	count := utf8.RuneCountInString(text)
+	count := httpx.JSStringLength(text)
 	if count < minLen {
 		return httpx.ValidationError(path + "." + key + " must not be empty")
 	}
@@ -635,7 +697,7 @@ func chapterSettingsRequiredTrimmedString(item map[string]any, key, path string,
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
 	text = strings.TrimSpace(text)
-	count := utf8.RuneCountInString(text)
+	count := httpx.JSStringLength(text)
 	if count < minLen {
 		return httpx.ValidationError(path + "." + key + " must not be empty")
 	}
@@ -654,7 +716,7 @@ func chapterSettingsOptionalStringMax(item map[string]any, key, path string, max
 	if !ok {
 		return httpx.ValidationError(path + "." + key + " must be a string")
 	}
-	if utf8.RuneCountInString(text) > maxLen {
+	if httpx.JSStringLength(text) > maxLen {
 		return httpx.ValidationError(path + "." + key + " must be at most " + strconv.Itoa(maxLen) + " characters")
 	}
 	return nil
@@ -1310,6 +1372,14 @@ func (s *Service) ImportBackup(ctx context.Context, gitPath string) (map[string]
 	}
 	if path == "" {
 		return nil, httpx.BadRequest("gitPath is required")
+	}
+	// Mirror the TS /api/projects/import route (server/routes/project-db.ts):
+	// after `~` expansion + resolve, it checks `!existsSync(gitPath)` and throws a
+	// 400 ValidationError "Path does not exist: <resolved>" BEFORE attempting the
+	// import. Go previously skipped the directory check and reported a 404
+	// "Project database" not-found instead, diverging on both status and message.
+	if _, statErr := os.Stat(path); statErr != nil {
+		return nil, httpx.BadRequest("Path does not exist: " + path)
 	}
 	backupPath := projectDBPath(path)
 	if _, err := os.Stat(backupPath); err != nil {

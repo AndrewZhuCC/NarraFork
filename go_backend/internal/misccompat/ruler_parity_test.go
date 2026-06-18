@@ -374,6 +374,101 @@ func serveRulerParityJSON(t *testing.T, h *Handler, path string) map[string]any 
 	return body
 }
 
+func TestRulerRebaseResolveValidatesActionBeforeServiceFallback(t *testing.T) {
+	sqlDB := newRulerParityTestDB(t)
+	h := NewHandler(sqlDB) // h.Git is nil → would otherwise hit the feature-disabled fallback
+
+	// Mirror TS rulerRebaseResolveSchema: action enum is validated by safeParse
+	// BEFORE any service work, so an invalid action must 400 even though git is
+	// unavailable (which would otherwise return a feature-disabled fallback).
+	invalid := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/rebase-resolve", `{"chapterId":"c1","action":"skip"}`)
+	if invalid.Code != http.StatusBadRequest || !strings.Contains(invalid.Body.String(), "action must be abort or continue") {
+		t.Fatalf("invalid action should 400 before git fallback, got %d body=%s", invalid.Code, invalid.Body.String())
+	}
+
+	// Missing chapterId still 400s (and before the action check, mirroring the
+	// Zod field order chapterId → action).
+	missing := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/rebase-resolve", `{"action":"abort"}`)
+	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), "chapterId is required") {
+		t.Fatalf("missing chapterId should 400, got %d body=%s", missing.Code, missing.Body.String())
+	}
+
+	// A valid action with git unavailable falls through to the feature-disabled
+	// fallback (501 with disabled metadata), proving validation passed first.
+	valid := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/rebase-resolve", `{"chapterId":"c1","action":"abort"}`)
+	if valid.Code != http.StatusNotImplemented || !strings.Contains(valid.Body.String(), "rebaseResolve") {
+		t.Fatalf("valid action with no git should hit feature-disabled fallback, got %d body=%s", valid.Code, valid.Body.String())
+	}
+}
+
+func TestRulerForkValidatesForkChapterSchemaBeforeServiceFallback(t *testing.T) {
+	sqlDB := newRulerParityTestDB(t)
+	h := NewHandler(sqlDB) // h.Chapters is nil → would otherwise hit the feature-disabled fallback
+
+	// Mirror TS forkChapterSchema (shared with the chapter fork route): title
+	// min1/max200, description max2000, role/inheritMode enums, crossOffset min 0
+	// — all validated by safeParse BEFORE any service work, so a malformed body
+	// must 400 even though the chapter service is unavailable.
+	cases := []struct{ name, body, want string }{
+		{"over-long title", `{"startCommitSha":"abc","title":"` + strings.Repeat("x", 201) + `"}`, "title must be at most 200 characters"},
+		{"empty title", `{"startCommitSha":"abc","title":"  "}`, "title must be a non-empty string"},
+		{"over-long description", `{"startCommitSha":"abc","description":"` + strings.Repeat("y", 2001) + `"}`, "description must be at most 2000 characters"},
+		{"bad role", `{"startCommitSha":"abc","role":"trunk"}`, "role must be branch or exploration"},
+		{"bad inheritMode", `{"startCommitSha":"abc","inheritMode":"bogus"}`, "inheritMode must be full, compressed, or fresh"},
+		{"negative crossOffset", `{"startCommitSha":"abc","crossOffset":-1}`, "crossOffset must be greater than or equal to 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/fork", tc.body)
+			if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), tc.want) {
+				t.Fatalf("expected 400 %q before service fallback, got %d body=%s", tc.want, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// startCommitSha is still required (ruler-specific) and checked before the
+	// service fallback.
+	missing := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/fork", `{"title":"ok"}`)
+	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), "startCommitSha is required") {
+		t.Fatalf("missing startCommitSha should 400, got %d body=%s", missing.Code, missing.Body.String())
+	}
+
+	// A valid body with the chapter service unavailable falls through to the
+	// feature-disabled fallback (501), proving validation passed first.
+	valid := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/fork", `{"startCommitSha":"abc","title":"ok","role":"exploration","inheritMode":"full"}`)
+	if valid.Code != http.StatusNotImplemented || !strings.Contains(valid.Body.String(), "ruler.fork") {
+		t.Fatalf("valid body with no chapter service should hit feature-disabled fallback, got %d body=%s", valid.Code, valid.Body.String())
+	}
+}
+
+func TestRulerRebaseAndAbandonValidateChapterIdBeforeServiceFallback(t *testing.T) {
+	sqlDB := newRulerParityTestDB(t)
+	h := NewHandler(sqlDB) // h.Git and h.Chapters are nil → would hit feature-disabled fallback
+
+	// Mirror TS rulerRebaseSchema / rulerAbandonSchema: chapterId (min 1) is
+	// validated by safeParse BEFORE any service work, so a missing chapterId must
+	// 400 even though the underlying service is unavailable.
+	rebaseMissing := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/rebase", `{}`)
+	if rebaseMissing.Code != http.StatusBadRequest || !strings.Contains(rebaseMissing.Body.String(), "chapterId is required") {
+		t.Fatalf("rebase missing chapterId should 400 before git fallback, got %d body=%s", rebaseMissing.Code, rebaseMissing.Body.String())
+	}
+	abandonMissing := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/abandon", `{}`)
+	if abandonMissing.Code != http.StatusBadRequest || !strings.Contains(abandonMissing.Body.String(), "chapterId is required") {
+		t.Fatalf("abandon missing chapterId should 400 before chapter fallback, got %d body=%s", abandonMissing.Code, abandonMissing.Body.String())
+	}
+
+	// A valid chapterId with the service unavailable falls through to the
+	// feature-disabled fallback (501), proving validation passed first.
+	rebaseValid := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/rebase", `{"chapterId":"c1"}`)
+	if rebaseValid.Code != http.StatusNotImplemented || !strings.Contains(rebaseValid.Body.String(), "ruler.rebase") {
+		t.Fatalf("rebase valid chapterId with no git should hit feature-disabled fallback, got %d body=%s", rebaseValid.Code, rebaseValid.Body.String())
+	}
+	abandonValid := serveRulerParityRaw(t, h, http.MethodPost, "/p1/ruler/abandon", `{"chapterId":"c1"}`)
+	if abandonValid.Code != http.StatusNotImplemented || !strings.Contains(abandonValid.Body.String(), "ruler.abandon") {
+		t.Fatalf("abandon valid chapterId with no chapter service should hit feature-disabled fallback, got %d body=%s", abandonValid.Code, abandonValid.Body.String())
+	}
+}
+
 func serveRulerParityRaw(t *testing.T, h *Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	router := chi.NewRouter()

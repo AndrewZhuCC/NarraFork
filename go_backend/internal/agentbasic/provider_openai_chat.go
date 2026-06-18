@@ -221,7 +221,31 @@ func streamChatCompletions(ctx context.Context, client *http.Client, provider Pr
 			"include_usage": true,
 		},
 	}
-	if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
+	// Mirror the TS openai-provider chat-completions DeepSeek handling: DeepSeek
+	// carries a `thinking` config plus a DeepSeek-tiered reasoning_effort. `none`
+	// sends `thinking:{type:"disabled"}` (and no reasoning_effort); otherwise
+	// `thinking:{type:"enabled"}` plus reasoning_effort mapped to DeepSeek's
+	// "high"/"max" tiers (mapDeepSeekEffort: low/medium/high -> "high", xhigh -> "max").
+	// Non-DeepSeek models keep the generic effort (Go routes gpt-5/o1/o3 through
+	// this chat-completions path, so dropping their reasoning_effort would lose
+	// reasoning entirely rather than matching TS, which routes them to /responses).
+	// The TS Cline provider (cline-provider.ts) is a dedicated adapter whose
+	// chat-completions body is model/messages/stream/stream_options/tools ONLY — it
+	// never sends reasoning_effort or thinking. Go routes Cline through this shared
+	// chat-completions path, so skip all reasoning config for Cline to match TS
+	// (otherwise a gpt-5-named Cline-proxied model would wrongly gain reasoning_effort).
+	if strings.TrimSpace(provider.Kind) == "cline" {
+		// no reasoning config for Cline
+	} else if isDeepSeekModelName(provider.Model) {
+		if normalizeReasoningEffort(reasoningEffort) == "none" {
+			body["thinking"] = map[string]any{"type": "disabled"}
+		} else {
+			body["thinking"] = map[string]any{"type": "enabled"}
+			if effort := mapDeepSeekEffort(reasoningEffort); effort != "" {
+				body["reasoning_effort"] = effort
+			}
+		}
+	} else if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
 		body["reasoning_effort"] = effort
 	}
 	payload, _ := json.Marshal(body)
@@ -609,7 +633,16 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 		body["parallel_tool_calls"] = true
 		body["prompt_cache_key"] = codexPromptCacheKey(provider)
 	}
-	if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
+	if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
+		// Codex Responses requests: clamp effort to the model's supported levels
+		// (per-model CODEX_MODEL_REASONING_LEVELS), then send
+		// reasoning:{effort, summary:"auto"} + include:["reasoning.encrypted_content"]
+		// (encrypted reasoning replay), matching the TS openai-provider codex path.
+		if effort := normalizeCodexReasoningEffort(provider.Model, reasoningEffort); effort != "" {
+			body["reasoning"] = map[string]any{"effort": effort, "summary": "auto"}
+			body["include"] = []string{"reasoning.encrypted_content"}
+		}
+	} else if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
 		body["reasoning"] = map[string]any{"effort": effort}
 	}
 	payload, _ := json.Marshal(body)
@@ -1168,6 +1201,68 @@ func doChatRequest(ctx context.Context, client *http.Client, provider Provider, 
 		return chatResponse{}, fmt.Errorf("provider returned status %d", res.StatusCode)
 	}
 	return decoded, nil
+}
+
+// codexModelReasoningLevels mirrors the TS CODEX_MODEL_REASONING_LEVELS table
+// (server/lib/agent/openai-provider.ts), extracted from the codex model catalog's
+// supported_reasoning_levels. "none" is intentionally absent: it is handled by an
+// early return in normalizeCodexReasoningEffort before this table is consulted.
+var codexModelReasoningLevels = map[string][]string{
+	"gpt-5.3-codex-spark": {"low", "medium", "high", "xhigh"},
+	"gpt-5.3-codex":       {"low", "medium", "high", "xhigh"},
+	"gpt-5.2-codex":       {"low", "medium", "high", "xhigh"},
+	"gpt-5.1-codex-max":   {"low", "medium", "high", "xhigh"},
+	"gpt-5.1-codex":       {"low", "medium", "high"},
+	"gpt-5.1-codex-mini":  {"medium", "high"},
+	"gpt-5.2":             {"low", "medium", "high", "xhigh"},
+	"gpt-5.5":             {"low", "medium", "high", "xhigh"},
+	"gpt-5.4":             {"low", "medium", "high", "xhigh"},
+	"gpt-5.4-mini":        {"low", "medium", "high", "xhigh"},
+}
+
+// normalizeCodexReasoningEffort mirrors the TS normalizeCodexReasoningEffort:
+// it clamps a requested reasoning effort to the per-model supported levels from
+// codexModelReasoningLevels. Returns "" for an empty effort (no reasoning field);
+// "none" passes through verbatim (codex sends effort:"none"); a supported level
+// passes through; an unsupported level degrades via xhigh->high or low->medium,
+// otherwise clamps to the model's lowest supported level. Models absent from the
+// table keep the requested effort unchanged (matching TS `supported ?? requested`).
+func normalizeCodexReasoningEffort(model, reasoningEffort string) string {
+	effort := normalizeReasoningEffort(reasoningEffort)
+	if effort == "" {
+		return ""
+	}
+	if effort == "none" {
+		return "none"
+	}
+	_, bare := splitModel(model)
+	supported, ok := codexModelReasoningLevels[bare]
+	if !ok {
+		return effort
+	}
+	for _, level := range supported {
+		if level == effort {
+			return effort
+		}
+	}
+	contains := func(target string) bool {
+		for _, level := range supported {
+			if level == target {
+				return true
+			}
+		}
+		return false
+	}
+	if effort == "xhigh" && contains("high") {
+		return "high"
+	}
+	if effort == "low" && contains("medium") {
+		return "medium"
+	}
+	if len(supported) > 0 {
+		return supported[0]
+	}
+	return effort
 }
 
 func chatReasoningEffort(model, reasoningEffort string) string {

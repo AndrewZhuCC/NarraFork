@@ -182,6 +182,40 @@ func TestChangelogReadsConfiguredDirectoryAndSortsDescending(t *testing.T) {
 	}
 }
 
+func TestChangelogFallsBackToEmbeddedEntriesWhenNoSidecarDirectory(t *testing.T) {
+	// Point the env override at an empty directory and isolate cwd/exe candidate
+	// dirs by using an empty temp dir, so the only available source is the
+	// build-time embedded changelog.
+	emptyDir := t.TempDir()
+	t.Setenv("NARRAFORK_CHANGELOG_DIR", emptyDir)
+	if len(embeddedChangelogEntries) == 0 {
+		t.Skip("no embedded changelog entries generated")
+	}
+	router := NewRouter(Services{Auth: &auth.Service{}, Hub: ws.NewHub()})
+	req := httptest.NewRequest(http.MethodGet, "/api/changelog", nil)
+	w := httptest.NewRecorder()
+
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected changelog 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var entries []map[string]any
+	decodeRouterJSON(t, w, &entries)
+	if len(entries) != len(embeddedChangelogEntries) {
+		t.Fatalf("expected %d embedded entries, got %d", len(embeddedChangelogEntries), len(entries))
+	}
+	// Embedded entries must be served in descending semver order.
+	for i := 1; i < len(entries); i++ {
+		if compareSemverDesc(stringValue(entries[i-1]["version"]), stringValue(entries[i]["version"])) > 0 {
+			t.Fatalf("embedded changelog not sorted desc at %d: %v before %v", i, entries[i-1]["version"], entries[i]["version"])
+		}
+	}
+	if _, ok := entries[0]["version"].(string); !ok {
+		t.Fatalf("embedded entry missing version field: %#v", entries[0])
+	}
+}
+
 func TestStaticFrontendHostingAndAPIOnlyFallback(t *testing.T) {
 	t.Run("serves bundled frontend", func(t *testing.T) {
 		dir := t.TempDir()

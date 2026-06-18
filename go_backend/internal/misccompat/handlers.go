@@ -372,7 +372,7 @@ func decodeWorkspaceBody(r *http.Request, requireTree bool) (workspaceBody, erro
 		if !ok {
 			return workspaceBody{}, httpx.BadRequest("title must be a string")
 		}
-		if len(text) > 200 {
+		if httpx.JSStringLength(text) > 200 {
 			return workspaceBody{}, httpx.BadRequest("title is too long")
 		}
 		body.Title = text
@@ -383,10 +383,10 @@ func decodeWorkspaceBody(r *http.Request, requireTree bool) (workspaceBody, erro
 		if !ok {
 			return workspaceBody{}, httpx.BadRequest("tree must be a string")
 		}
-		if len(text) < 2 {
+		if httpx.JSStringLength(text) < 2 {
 			return workspaceBody{}, httpx.BadRequest("tree must be at least 2 characters")
 		}
-		if len(text) > 50000 {
+		if httpx.JSStringLength(text) > 50000 {
 			return workspaceBody{}, httpx.BadRequest("tree is too long")
 		}
 		body.Tree = text
@@ -594,7 +594,7 @@ func decodeCreateHookBody(r *http.Request) (hookCreateBody, error) {
 	body := hookCreateBody{Matcher: "", Headers: nil, Timeout: 30, Enabled: true, SortOrder: 0}
 	if value, exists := raw["projectId"]; exists {
 		text, ok := value.(string)
-		if !ok || text == "" || len(text) > 100 {
+		if !ok || text == "" || httpx.JSStringLength(text) > 100 {
 			return hookCreateBody{}, httpx.BadRequest("projectId must be a non-empty string")
 		}
 		body.ProjectID = text
@@ -606,7 +606,7 @@ func decodeCreateHookBody(r *http.Request) (hookCreateBody, error) {
 	body.Event = event
 	if value, exists := raw["matcher"]; exists {
 		text, ok := value.(string)
-		if !ok || len(text) > 200 {
+		if !ok || httpx.JSStringLength(text) > 200 {
 			return hookCreateBody{}, httpx.BadRequest("matcher must be a string up to 200 characters")
 		}
 		body.Matcher = text
@@ -618,20 +618,26 @@ func decodeCreateHookBody(r *http.Request) (hookCreateBody, error) {
 	body.Type = hookType
 	if value, exists := raw["command"]; exists {
 		text, ok := value.(string)
-		if !ok || len(text) > 10000 {
+		if !ok || httpx.JSStringLength(text) > 10000 {
 			return hookCreateBody{}, httpx.BadRequest("command must be a string up to 10000 characters")
 		}
 		body.Command = text
 	}
 	if value, exists := raw["url"]; exists {
 		text, ok := value.(string)
-		if !ok || len(text) > 2000 {
+		if !ok {
 			return hookCreateBody{}, httpx.BadRequest("url must be a string up to 2000 characters")
 		}
-		if !isValidHookURL(text) {
+		// Zod z.string().url().max(2000): .url() runs new URL(value.trim()) and
+		// stores the trimmed value, then .max(2000) measures the trimmed value.
+		normalized, valid := httpx.CoerceURLZod(text)
+		if !valid {
 			return hookCreateBody{}, httpx.BadRequest("url must be a valid URL")
 		}
-		body.URL = text
+		if httpx.JSStringLength(normalized) > 2000 {
+			return hookCreateBody{}, httpx.BadRequest("url must be a string up to 2000 characters")
+		}
+		body.URL = normalized
 	}
 	if hookType == "command" && body.Command == "" {
 		return hookCreateBody{}, httpx.BadRequest("Missing required field for hook type")
@@ -685,7 +691,7 @@ func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePa
 	}
 	if value, exists := raw["matcher"]; exists {
 		text, ok := value.(string)
-		if !ok || len(text) > 200 {
+		if !ok || httpx.JSStringLength(text) > 200 {
 			return patch, httpx.BadRequest("matcher must be a string up to 200 characters")
 		}
 		patch.MatcherSet = true
@@ -705,7 +711,7 @@ func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePa
 			patch.Command = nil
 		} else {
 			text, ok := value.(string)
-			if !ok || len(text) > 10000 {
+			if !ok || httpx.JSStringLength(text) > 10000 {
 				return patch, httpx.BadRequest("command must be a string up to 10000 characters")
 			}
 			patch.Command = text
@@ -717,13 +723,17 @@ func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePa
 			patch.URL = nil
 		} else {
 			text, ok := value.(string)
-			if !ok || len(text) > 2000 {
+			if !ok {
 				return patch, httpx.BadRequest("url must be a string up to 2000 characters")
 			}
-			if !isValidHookURL(text) {
+			normalized, valid := httpx.CoerceURLZod(text)
+			if !valid {
 				return patch, httpx.BadRequest("url must be a valid URL")
 			}
-			patch.URL = text
+			if httpx.JSStringLength(normalized) > 2000 {
+				return patch, httpx.BadRequest("url must be a string up to 2000 characters")
+			}
+			patch.URL = normalized
 		}
 	}
 	if value, exists := raw["headers"]; exists {
@@ -790,11 +800,6 @@ func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePa
 	return patch, nil
 }
 
-func isValidHookURL(text string) bool {
-	parsed, err := url.Parse(text)
-	return err == nil && parsed.Scheme != "" && parsed.Host != ""
-}
-
 func stringMapField(value any, field string, maxValueLength int) (map[string]string, error) {
 	object, ok := value.(map[string]any)
 	if !ok {
@@ -806,7 +811,7 @@ func stringMapField(value any, field string, maxValueLength int) (map[string]str
 		if !ok {
 			return nil, httpx.BadRequest(field + "." + key + " must be a string")
 		}
-		if len(text) > maxValueLength {
+		if httpx.JSStringLength(text) > maxValueLength {
 			return nil, httpx.BadRequest(field + "." + key + " is too long")
 		}
 		out[key] = text
@@ -1308,8 +1313,34 @@ func shareAttachmentDisposition(name string) string {
 		}
 		return r
 	}, base)
-	encoded := url.PathEscape(base)
+	// Mirror the TS RFC 5987 encoding (server/routes/shares.ts):
+	// encodeURIComponent(base).replace(/%20/g, "+"). Go's url.PathEscape uses a
+	// different reserved set than JS encodeURIComponent (e.g. it leaves $&+,/:;=?@
+	// unescaped and does not turn spaces into "+"), so the filename* value would
+	// diverge for filenames containing those characters.
+	encoded := strings.ReplaceAll(jsEncodeURIComponent(base), "%20", "+")
 	return `attachment; filename="` + asciiFallback + `"; filename*=UTF-8''` + encoded
+}
+
+// jsEncodeURIComponent mirrors JavaScript encodeURIComponent: every byte is
+// percent-encoded except the unreserved set A-Za-z0-9 and -_.!~*'(). This
+// differs from Go url.QueryEscape (which encodes space as "+" and escapes
+// ~!*'()) and url.PathEscape (which leaves many reserved characters unescaped).
+func jsEncodeURIComponent(s string) string {
+	const upperhex = "0123456789ABCDEF"
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '.' || c == '!' || c == '~' || c == '*' || c == '\'' || c == '(' || c == ')' {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(upperhex[c>>4])
+		b.WriteByte(upperhex[c&0x0f])
+	}
+	return b.String()
 }
 
 func resolveShare(shareID string) (string, string) {
@@ -1834,6 +1865,18 @@ func validDatabaseOlderThanDays(value *int) bool {
 	return *value > 0 && *value <= 3650
 }
 
+// validDatabaseCleanupTarget mirrors the TypeScript Zod databaseCleanupTargetSchema
+// `z.enum(["archivedSessions","staleSessions","apiRequestDumps"])`: only these three
+// targets are accepted, any other value is a schema-level failure (400).
+func validDatabaseCleanupTarget(target string) bool {
+	switch target {
+	case "archivedSessions", "staleSessions", "apiRequestDumps":
+		return true
+	default:
+		return false
+	}
+}
+
 // validDatabaseSampleLimit mirrors the TypeScript Zod
 // `z.coerce.number().int().min(0).max(25).optional()` bound: a provided value
 // must be an integer in 0..25; an omitted value is fine.
@@ -1853,9 +1896,16 @@ func (h *Handler) databaseCleanupPreview(w http.ResponseWriter, r *http.Request)
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	// Mirror the TypeScript Zod databasePreviewSchema bounds: olderThanDays is a
-	// positive int <= 3650 when provided, sampleLimit is an int 0..25 when provided.
-	if !validDatabaseOlderThanDays(body.OlderThanDays) || !validDatabaseSampleLimit(body.SampleLimit) {
+	// Mirror the TypeScript Zod databasePreviewSchema: the `target` enum and the
+	// numeric bounds are validated together by safeParse, so any schema-level
+	// failure (unknown target, olderThanDays not a positive int <= 3650, sampleLimit
+	// not an int 0..25) returns the single 400 "Invalid database cleanup preview
+	// request". Go previously let an unknown target slip past this check and only
+	// rejected it deep inside previewDatabaseCleanup with a different message
+	// ("Invalid database cleanup target").
+	if !validDatabaseCleanupTarget(body.Target) ||
+		!validDatabaseOlderThanDays(body.OlderThanDays) ||
+		!validDatabaseSampleLimit(body.SampleLimit) {
 		return httpx.BadRequest("Invalid database cleanup preview request")
 	}
 	sampleLimit := 10
@@ -1885,9 +1935,13 @@ func (h *Handler) databaseCleanup(w http.ResponseWriter, r *http.Request) error 
 	if err := httpx.DecodeOptionalLooseJSON(r, &body); err != nil {
 		return err
 	}
-	// Mirror the TypeScript Zod databaseCleanupSchema bound: olderThanDays is a
-	// positive int <= 3650 when provided.
-	if !validDatabaseOlderThanDays(body.OlderThanDays) {
+	// Mirror the TypeScript Zod databaseCleanupSchema: the `target` enum and the
+	// olderThanDays bound are validated together by safeParse, so any schema-level
+	// failure (unknown target, olderThanDays not a positive int <= 3650) returns the
+	// single 400 "Invalid database cleanup request". Go previously let an unknown
+	// target slip past this check and only rejected it deep inside
+	// previewDatabaseCleanup with a different message.
+	if !validDatabaseCleanupTarget(body.Target) || !validDatabaseOlderThanDays(body.OlderThanDays) {
 		return httpx.BadRequest("Invalid database cleanup request")
 	}
 	olderThanDays := 0
@@ -2395,12 +2449,31 @@ func intMapOr(values url.Values, key string, fallback int) int {
 	if values == nil {
 		return fallback
 	}
+	// Mirror the TS ruler route's Number.parseInt(param, 10): a leading-digit
+	// prefix like "5x" parses to 5 and only a value with no leading digits falls
+	// back. strconv.Atoi would reject "5x"/"12.9" wholesale and wrongly use the
+	// fallback (diverging from TS for ?skip=5x etc.).
 	if v := strings.TrimSpace(values.Get(key)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, ok := httpx.ParseIntJS(v); ok {
 			return n
 		}
 	}
 	return fallback
+}
+
+// normalizeRulerLimit bounds the GET /:id/ruler commit-page size. The TS ruler
+// route (server/routes/ruler.ts) uses the raw `limit` query value with NO upper
+// bound (limit = limitParam ? parseInt : 200), feeding it straight into git log -n.
+// Go caps it at 200 as a Go-only guard against an unbounded git log read in the
+// request path (the backend performance rule). This is functionally equivalent for
+// the real frontend, which only ever requests limit<=200 and pages via cursor
+// (useRulerData/useRulerInfinite, limit:200). Non-positive values also fall back to
+// the 200 default.
+func normalizeRulerLimit(limit int) int {
+	if limit <= 0 || limit > 200 {
+		return 200
+	}
+	return limit
 }
 
 func stringMap(m map[string]any, key, fallback string) string {
@@ -2813,10 +2886,6 @@ func (h *Handler) singleMap(ctx context.Context, query string, args ...any) (map
 }
 
 func (h *Handler) rulerFork(w http.ResponseWriter, r *http.Request) error {
-	if h.Chapters == nil {
-		rulerFeatureDisabled(w, "fork", "Ruler fork requires chapter service support that is not available in this go_backend runtime")
-		return nil
-	}
 	projectID := chi.URLParam(r, "projectId")
 	var body struct {
 		StartCommitSHA  string   `json:"startCommitSha"`
@@ -2832,9 +2901,44 @@ func (h *Handler) rulerFork(w http.ResponseWriter, r *http.Request) error {
 	if err := httpx.DecodeLooseJSON(r, &body); err != nil {
 		return err
 	}
+	// Mirror the TypeScript forkChapterSchema Zod bounds, which the ruler fork
+	// route shares with the chapter fork route (server/lib/validators): title
+	// min1/max200, description max2000, role enum ["branch","exploration"],
+	// inheritMode enum ["full","compressed","fresh"], crossOffset min 0. Go
+	// previously validated only startCommitSha here and relied on the downstream
+	// Fork/SplitAtCommit services, which do not enforce title/description/
+	// crossOffset bounds, so an over-long title or negative crossOffset was
+	// silently accepted on the ruler route where the chapter route returns 400.
+	if body.Title != nil {
+		if strings.TrimSpace(*body.Title) == "" {
+			return httpx.BadRequest("title must be a non-empty string")
+		}
+		if httpx.JSStringLength(*body.Title) > 200 {
+			return httpx.BadRequest("title must be at most 200 characters")
+		}
+	}
+	if body.Description != nil && httpx.JSStringLength(*body.Description) > 2000 {
+		return httpx.BadRequest("description must be at most 2000 characters")
+	}
+	if strings.TrimSpace(body.Role) != "" && body.Role != "branch" && body.Role != "exploration" {
+		return httpx.BadRequest("role must be branch or exploration")
+	}
+	if body.InheritMode != "" && body.InheritMode != "full" && body.InheritMode != "compressed" && body.InheritMode != "fresh" {
+		return httpx.BadRequest("inheritMode must be full, compressed, or fresh")
+	}
+	if body.CrossOffset != nil && *body.CrossOffset < 0 {
+		return httpx.BadRequest("crossOffset must be greater than or equal to 0")
+	}
 	start := strings.TrimSpace(body.StartCommitSHA)
 	if start == "" {
 		return httpx.BadRequest("startCommitSha is required for ruler fork")
+	}
+	// Service-availability fallback runs AFTER schema validation (mirroring TS
+	// safeParse-before-work ordering), so a malformed body returns 400 even when
+	// the chapter service is unavailable.
+	if h.Chapters == nil {
+		rulerFeatureDisabled(w, "fork", "Ruler fork requires chapter service support that is not available in this go_backend runtime")
+		return nil
 	}
 	parentID := strings.TrimSpace(body.ParentChapterID)
 	var err error
@@ -2974,7 +3078,7 @@ func (h *Handler) rulerMerge(w http.ResponseWriter, r *http.Request) error {
 	if strategy != "merge" && strategy != "squash" {
 		return httpx.BadRequest("strategy must be merge or squash")
 	}
-	if len(body.Message) > 500 {
+	if httpx.JSStringLength(body.Message) > 500 {
 		return httpx.BadRequest("message must be at most 500 characters")
 	}
 	if h.Chapters == nil {
@@ -3093,10 +3197,6 @@ func copyRulerAIResolveContractFields(response map[string]any, aiResult map[stri
 }
 
 func (h *Handler) rulerRebase(w http.ResponseWriter, r *http.Request) error {
-	if h.Git == nil {
-		rulerFeatureDisabled(w, "rebase", "Ruler rebase requires git service support that is not available in this go_backend runtime")
-		return nil
-	}
 	projectID := chi.URLParam(r, "projectId")
 	var body struct {
 		ChapterID string `json:"chapterId"`
@@ -3107,6 +3207,13 @@ func (h *Handler) rulerRebase(w http.ResponseWriter, r *http.Request) error {
 	chapterID := strings.TrimSpace(body.ChapterID)
 	if chapterID == "" {
 		return httpx.BadRequest("chapterId is required")
+	}
+	// Mirror the TypeScript rulerRebaseSchema: chapterId (min 1) is validated by
+	// safeParse BEFORE any service work, so a missing chapterId returns 400 even
+	// when git is unavailable (which otherwise yields a feature-disabled fallback).
+	if h.Git == nil {
+		rulerFeatureDisabled(w, "rebase", "Ruler rebase requires git service support that is not available in this go_backend runtime")
+		return nil
 	}
 	if ok, err := h.chapterBelongsToProject(r.Context(), chapterID, projectID); err != nil {
 		return err
@@ -3166,10 +3273,6 @@ func (h *Handler) updateRebasedChapterMetadata(ctx context.Context, chapterID, t
 }
 
 func (h *Handler) rulerRebaseResolve(w http.ResponseWriter, r *http.Request) error {
-	if h.Git == nil {
-		rulerFeatureDisabled(w, "rebaseResolve", "Ruler rebase conflict resolution requires git service support that is not available in this go_backend runtime")
-		return nil
-	}
 	projectID := chi.URLParam(r, "projectId")
 	var body struct {
 		ChapterID string `json:"chapterId"`
@@ -3181,6 +3284,19 @@ func (h *Handler) rulerRebaseResolve(w http.ResponseWriter, r *http.Request) err
 	chapterID := strings.TrimSpace(body.ChapterID)
 	if chapterID == "" {
 		return httpx.BadRequest("chapterId is required")
+	}
+	// Mirror the TypeScript rulerRebaseResolveSchema: chapterId (min 1) AND action
+	// (enum ["abort","continue"]) are both validated by safeParse BEFORE any work,
+	// including before the chapter-service / git-service availability fallback.
+	// Go previously checked git==nil and validated `action` only in the switch's
+	// default case (after chapter/worktree lookups), so an invalid action surfaced
+	// the wrong error instead of the TS 400 action error.
+	if body.Action != "abort" && body.Action != "continue" {
+		return httpx.BadRequest("action must be abort or continue")
+	}
+	if h.Git == nil {
+		rulerFeatureDisabled(w, "rebaseResolve", "Ruler rebase conflict resolution requires git service support that is not available in this go_backend runtime")
+		return nil
 	}
 	if ok, err := h.chapterBelongsToProject(r.Context(), chapterID, projectID); err != nil {
 		return err
@@ -3235,10 +3351,6 @@ func (h *Handler) rulerRebaseResolve(w http.ResponseWriter, r *http.Request) err
 }
 
 func (h *Handler) rulerAbandon(w http.ResponseWriter, r *http.Request) error {
-	if h.Chapters == nil {
-		rulerFeatureDisabled(w, "abandon", "Ruler abandon requires chapter service support that is not available in this go_backend runtime")
-		return nil
-	}
 	projectID := chi.URLParam(r, "projectId")
 	var body struct {
 		ChapterID string `json:"chapterId"`
@@ -3249,6 +3361,13 @@ func (h *Handler) rulerAbandon(w http.ResponseWriter, r *http.Request) error {
 	chapterID := strings.TrimSpace(body.ChapterID)
 	if chapterID == "" {
 		return httpx.BadRequest("chapterId is required")
+	}
+	// Mirror the TypeScript rulerAbandonSchema: chapterId (min 1) is validated by
+	// safeParse BEFORE any service work, so a missing chapterId returns 400 even
+	// when the chapter service is unavailable.
+	if h.Chapters == nil {
+		rulerFeatureDisabled(w, "abandon", "Ruler abandon requires chapter service support that is not available in this go_backend runtime")
+		return nil
 	}
 	if ok, err := h.chapterBelongsToProject(r.Context(), chapterID, projectID); err != nil {
 		return err
@@ -3513,10 +3632,7 @@ func fallbackCodeIfDisabled(supported bool) any {
 
 func (h *Handler) rulerData(w http.ResponseWriter, r *http.Request) error {
 	projectID := chi.URLParam(r, "projectId")
-	limit := intMapOr(r.URL.Query(), "limit", 200)
-	if limit <= 0 || limit > 200 {
-		limit = 200
-	}
+	limit := normalizeRulerLimit(intMapOr(r.URL.Query(), "limit", 200))
 	skip := intMapOr(r.URL.Query(), "skip", 0)
 	cursor := strings.TrimSpace(r.URL.Query().Get("cursor"))
 	direction := strings.TrimSpace(r.URL.Query().Get("direction"))
@@ -3650,28 +3766,7 @@ func (h *Handler) rulerData(w http.ResponseWriter, r *http.Request) error {
 			"isExpandable":       len(chaptersAtSha) > 0,
 		})
 	}
-	activeChapters := []map[string]any{}
-	mergedChapters := []map[string]any{}
-	for _, ch := range projectChapters {
-		item := map[string]any{
-			"id":              stringMap(ch, "id", ""),
-			"title":           stringMap(ch, "title", ""),
-			"branch":          stringMap(ch, "branch", ""),
-			"role":            stringMap(ch, "role", ""),
-			"parentChapterId": nullIfEmpty(stringMap(ch, "parentChapterId", "")),
-			"startCommitSha":  nullIfEmpty(stringMap(ch, "startCommitSha", "")),
-			"mergeCommitSha":  nullIfEmpty(stringMap(ch, "mergeCommitSha", "")),
-			"narratorId":      nullIfEmpty(stringMap(ch, "narratorId", "")),
-			"narratorStatus":  nullIfEmpty(stringMap(ch, "narratorStatus", "")),
-			"axisOffset":      numericMapOr(ch, "axisOffset", 0),
-			"crossOffset":     numericMapOr(ch, "crossOffset", 0),
-		}
-		if stringMap(ch, "status", "") == "active" {
-			activeChapters = append(activeChapters, item)
-		} else if stringMap(ch, "status", "") == "merged" {
-			mergedChapters = append(mergedChapters, item)
-		}
-	}
+	activeChapters, mergedChapters := rulerChapterSummaries(projectChapters)
 	httpx.WriteJSON(w, http.StatusOK, map[string]any{
 		"commits":           commits,
 		"segments":          segments,
@@ -3685,6 +3780,52 @@ func (h *Handler) rulerData(w http.ResponseWriter, r *http.Request) error {
 		"fallbacks":         fallbacks,
 	})
 	return nil
+}
+
+// rulerChapterSummaries builds the activeChapters and mergedChapters payloads
+// for the Ruler data response, mirroring server/routes/ruler.ts exactly:
+//   - active chapters carry narratorId/narratorStatus from the chapter's primary
+//     narrator and DO NOT include a mergeCommitSha key;
+//   - merged chapters include mergeCommitSha and force narratorId/narratorStatus
+//     to null regardless of any narrator row that still references the chapter.
+//
+// Chapters in any other status (dormant/abandoned/frozen/review) are omitted
+// from both lists, matching the TS status filters.
+func rulerChapterSummaries(projectChapters []map[string]any) (active, merged []map[string]any) {
+	active = []map[string]any{}
+	merged = []map[string]any{}
+	for _, ch := range projectChapters {
+		switch stringMap(ch, "status", "") {
+		case "active":
+			active = append(active, map[string]any{
+				"id":              stringMap(ch, "id", ""),
+				"title":           stringMap(ch, "title", ""),
+				"branch":          stringMap(ch, "branch", ""),
+				"role":            stringMap(ch, "role", ""),
+				"parentChapterId": nullIfEmpty(stringMap(ch, "parentChapterId", "")),
+				"startCommitSha":  nullIfEmpty(stringMap(ch, "startCommitSha", "")),
+				"narratorId":      nullIfEmpty(stringMap(ch, "narratorId", "")),
+				"narratorStatus":  nullIfEmpty(stringMap(ch, "narratorStatus", "")),
+				"axisOffset":      numericMapOr(ch, "axisOffset", 0),
+				"crossOffset":     numericMapOr(ch, "crossOffset", 0),
+			})
+		case "merged":
+			merged = append(merged, map[string]any{
+				"id":              stringMap(ch, "id", ""),
+				"title":           stringMap(ch, "title", ""),
+				"branch":          stringMap(ch, "branch", ""),
+				"role":            stringMap(ch, "role", ""),
+				"parentChapterId": nullIfEmpty(stringMap(ch, "parentChapterId", "")),
+				"startCommitSha":  nullIfEmpty(stringMap(ch, "startCommitSha", "")),
+				"mergeCommitSha":  nullIfEmpty(stringMap(ch, "mergeCommitSha", "")),
+				"narratorId":      nil,
+				"narratorStatus":  nil,
+				"axisOffset":      numericMapOr(ch, "axisOffset", 0),
+				"crossOffset":     numericMapOr(ch, "crossOffset", 0),
+			})
+		}
+	}
+	return active, merged
 }
 
 func (h *Handler) rulerSegment(w http.ResponseWriter, r *http.Request) error {
@@ -3855,18 +3996,22 @@ func resolveRulerNarratorDisplayStatus(status, substatusRaw string) string {
 	return status
 }
 
+// parseRulerSubstatus mirrors the TypeScript parseSubstatus
+// (server/lib/narrator-utils.ts): a null/empty raw yields no tags, otherwise the
+// raw is JSON-parsed and returned only when it is a JSON array of strings; any
+// parse failure or non-array value yields no tags. It deliberately does NOT do a
+// lenient comma/bracket split — substatus is always persisted as a JSON array
+// string, and a CSV-style fallback would diverge from TS (which returns []).
 func parseRulerSubstatus(raw string) []string {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || raw == "null" {
 		return nil
 	}
 	var values []string
-	if err := json.Unmarshal([]byte(raw), &values); err == nil {
-		return values
+	if err := json.Unmarshal([]byte(raw), &values); err != nil {
+		return nil
 	}
-	return strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '[' || r == ']' || r == '"' || r == '\''
-	})
+	return values
 }
 
 func stringSetHas(values []string, target string) bool {
@@ -3899,22 +4044,22 @@ func (h *Handler) rulerProjectChapters(ctx context.Context, projectID string) ([
 			(
 				SELECT n.id
 				FROM narrators n
-				WHERE n.chapter_id = c.id
-				ORDER BY CASE WHEN n.variant = 'primary' OR n.type = 'primary' THEN 0 ELSE 1 END, n.created_at ASC
+				WHERE n.chapter_id = c.id AND n.variant = 'primary'
+				ORDER BY n.created_at ASC
 				LIMIT 1
 			) AS narrator_id,
 			(
 				SELECT n.status
 				FROM narrators n
-				WHERE n.chapter_id = c.id
-				ORDER BY CASE WHEN n.variant = 'primary' OR n.type = 'primary' THEN 0 ELSE 1 END, n.created_at ASC
+				WHERE n.chapter_id = c.id AND n.variant = 'primary'
+				ORDER BY n.created_at ASC
 				LIMIT 1
 			) AS narrator_status,
 			(
 				SELECT n.substatus
 				FROM narrators n
-				WHERE n.chapter_id = c.id
-				ORDER BY CASE WHEN n.variant = 'primary' OR n.type = 'primary' THEN 0 ELSE 1 END, n.created_at ASC
+				WHERE n.chapter_id = c.id AND n.variant = 'primary'
+				ORDER BY n.created_at ASC
 				LIMIT 1
 			) AS narrator_substatus,
 			c.review_source_chapter_id,
@@ -4092,7 +4237,7 @@ func (h *Handler) createVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 	if serviceName == "" {
 		return httpx.BadRequest("serviceName is required")
 	}
-	if len(serviceName) > 200 {
+	if httpx.JSStringLength(serviceName) > 200 {
 		return httpx.BadRequest("serviceName is too long")
 	}
 	containerPath, err := validateContainerSnapshotPath(stringOr(body["containerPath"], ""))
@@ -4103,7 +4248,7 @@ func (h *Handler) createVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 	if name == "" {
 		return httpx.BadRequest("name is required")
 	}
-	if len(name) > 200 {
+	if httpx.JSStringLength(name) > 200 {
 		return httpx.BadRequest("name is too long")
 	}
 	var description any
@@ -4150,7 +4295,7 @@ func (h *Handler) updateVolumeSnapshot(w http.ResponseWriter, r *http.Request) e
 		if name == "" {
 			return httpx.BadRequest("name is required")
 		}
-		if len(name) > 200 {
+		if httpx.JSStringLength(name) > 200 {
 			return httpx.BadRequest("name is too long")
 		}
 		sets = append(sets, "name=?")
@@ -4234,7 +4379,7 @@ func validateVolumeSnapshotDescription(value any, nullable bool) (any, error) {
 	if !ok {
 		return nil, httpx.BadRequest("description must be a string")
 	}
-	if len(description) > 2000 {
+	if httpx.JSStringLength(description) > 2000 {
 		return nil, httpx.BadRequest("description is too long")
 	}
 	return description, nil

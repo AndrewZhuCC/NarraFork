@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-chi/chi/v5"
@@ -14,6 +16,67 @@ import (
 	"narrafork-go/internal/auth"
 	"narrafork-go/internal/config"
 )
+
+// TestFavoriteBoundaryAndTypeGuardsMatchTS covers the deterministic create/update/
+// reorder validation guards that mirror the TypeScript Zod bounds (path 1..4096,
+// label max 200, sortOrder int>=0, reorder ids = non-empty array of non-empty
+// strings) but were not exercised by the existing happy/missing-state table:
+// overlong path/label, negative sortOrder, reorder with a non-array ids value,
+// and reorder with a non-string id element. All must be rejected with 400 before
+// any DB mutation.
+func TestFavoriteBoundaryAndTypeGuardsMatchTS(t *testing.T) {
+	sqlDB := openFavoritesParityTestDB(t)
+	settings := loadFavoritesTestSettings(t)
+	authService := auth.NewService(sqlDB, settings)
+	result, err := authService.Register(context.Background(), "member", "password123", "en")
+	if err != nil {
+		t.Fatalf("register user: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Group(func(r chi.Router) {
+		r.Use(authService.Middleware)
+		NewHandler(sqlDB).RegisterRoutes(r)
+	})
+
+	overlongPath := strings.Repeat("p", 4097)
+	overlongLabel := strings.Repeat("l", 201)
+
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{"create overlong path", http.MethodPost, "/", fmt.Sprintf(`{"path":%q}`, overlongPath), http.StatusBadRequest},
+		{"create overlong label", http.MethodPost, "/", fmt.Sprintf(`{"path":"/contract/ok","label":%q}`, overlongLabel), http.StatusBadRequest},
+		{"create empty path string", http.MethodPost, "/", `{"path":""}`, http.StatusBadRequest},
+		{"reorder ids not array", http.MethodPut, "/reorder", `{"ids":"not-an-array"}`, http.StatusBadRequest},
+		{"reorder ids non-string element", http.MethodPut, "/reorder", `{"ids":[123]}`, http.StatusBadRequest},
+		{"reorder ids empty-string element", http.MethodPut, "/reorder", `{"ids":[""]}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, bytes.NewBufferString(tc.body))
+			req.Header.Set("Authorization", "Bearer "+result.Token)
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("expected %d, got %d body=%s", tc.status, w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// No favorite rows should have been created by any rejected request.
+	var count int
+	if err := sqlDB.QueryRow(`SELECT COUNT(*) FROM user_favorite_directories`).Scan(&count); err != nil {
+		t.Fatalf("count favorites: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rejected requests must not insert favorites, got %d rows", count)
+	}
+}
 
 func TestFavoriteValidationAndMissingStatesMatchTS(t *testing.T) {
 	sqlDB := openFavoritesParityTestDB(t)

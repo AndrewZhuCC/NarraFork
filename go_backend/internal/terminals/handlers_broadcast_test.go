@@ -192,6 +192,11 @@ func TestCreateTerminalValidatesZodBoundsLikeTypeScript(t *testing.T) {
 		{"rows too small", `{"chapterId":"chapter-1","rows":1}`, http.StatusBadRequest},
 		{"rows too large", `{"chapterId":"chapter-1","rows":201}`, http.StatusBadRequest},
 		{"in-range bounds", `{"chapterId":"chapter-1","name":"Shell","cols":120,"rows":40}`, http.StatusCreated},
+		// Mirror TS createTerminalSchema refine + terminalService.create: both
+		// targets is rejected, neither is a standalone terminal (cwd=home, 201).
+		{"both targets rejected", `{"chapterId":"chapter-1","narratorId":"nar-1"}`, http.StatusBadRequest},
+		{"neither target is standalone", `{"name":"Standalone"}`, http.StatusCreated},
+		{"empty body is standalone", `{}`, http.StatusCreated},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,6 +208,27 @@ func TestCreateTerminalValidatesZodBoundsLikeTypeScript(t *testing.T) {
 				t.Fatalf("create terminal %q status = %d body=%s, want %d", tc.name, rec.Code, rec.Body.String(), tc.status)
 			}
 		})
+	}
+}
+
+// TestCreateTerminalBothTargetsReturnsTSMessage locks the both-provided rejection
+// to the exact TypeScript terminalService.create message rather than the shared
+// ResolveCwd "exactly one ... is required" wording.
+func TestCreateTerminalBothTargetsReturnsTSMessage(t *testing.T) {
+	sqlDB := openTerminalBroadcastDB(t)
+	handler := NewHandler(sqlDB, nil)
+	router := chi.NewRouter()
+	handler.RegisterRoutes(router)
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"chapterId":"chapter-1","narratorId":"nar-1"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("both targets should be 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Only one of chapterId or narratorId may be provided") {
+		t.Fatalf("both targets should use the TS create message, got %s", rec.Body.String())
 	}
 }
 
@@ -446,5 +472,102 @@ func intFromAny(value any) int {
 		return int(typed)
 	default:
 		return -1
+	}
+}
+
+// TestTerminalUpdateGraphStateValidatesNumericTypes mirrors the TS PATCH /:id
+// path (updateTerminalGraphStateSchema.safeParse): graph fields are applied only
+// when they parse as finite numbers / boolean; a malformed graph field (e.g.
+// graphX:"abc") makes the safeParse fail so the WHOLE graph update is skipped
+// (not written, not a 500). Go previously wrote the raw value into the REAL
+// column.
+func TestTerminalUpdateGraphStateValidatesNumericTypes(t *testing.T) {
+	sqlDB := openTerminalBroadcastDB(t)
+	handler := NewHandler(sqlDB, nil, &terminalBroadcastRecorder{})
+	router := chi.NewRouter()
+	handler.RegisterRoutes(router)
+
+	// Create a terminal to update.
+	createRec := httptest.NewRecorder()
+	router.ServeHTTP(createRec, httptest.NewRequest(http.MethodPost, "/", bytes.NewBufferString(`{"narratorId":"nar-1","name":"Shell"}`)))
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create status = %d body=%s", createRec.Code, createRec.Body.String())
+	}
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created: %v", err)
+	}
+
+	// Valid graph state is applied.
+	validRec := httptest.NewRecorder()
+	router.ServeHTTP(validRec, httptest.NewRequest(http.MethodPatch, "/"+created.ID, bytes.NewBufferString(`{"graphOpened":true,"graphX":12.5,"graphY":-3}`)))
+	if validRec.Code != http.StatusOK {
+		t.Fatalf("valid patch status = %d body=%s", validRec.Code, validRec.Body.String())
+	}
+	var gx sql.NullFloat64
+	var gOpened int
+	if err := sqlDB.QueryRow(`SELECT graph_opened, graph_x FROM terminals WHERE id = ?`, created.ID).Scan(&gOpened, &gx); err != nil {
+		t.Fatalf("query graph state: %v", err)
+	}
+	if gOpened != 1 || !gx.Valid || gx.Float64 != 12.5 {
+		t.Fatalf("valid graph state not applied: opened=%d x=%#v", gOpened, gx)
+	}
+
+	// Invalid graphX (string) -> whole graph update skipped, graph_x unchanged, no 500.
+	invalidRec := httptest.NewRecorder()
+	router.ServeHTTP(invalidRec, httptest.NewRequest(http.MethodPatch, "/"+created.ID, bytes.NewBufferString(`{"graphX":"abc","graphY":99}`)))
+	if invalidRec.Code != http.StatusOK {
+		t.Fatalf("invalid graph patch should still return 200 (TS skips, no error), got %d body=%s", invalidRec.Code, invalidRec.Body.String())
+	}
+	var gx2, gy2 sql.NullFloat64
+	if err := sqlDB.QueryRow(`SELECT graph_x, graph_y FROM terminals WHERE id = ?`, created.ID).Scan(&gx2, &gy2); err != nil {
+		t.Fatalf("query graph state 2: %v", err)
+	}
+	// graph_x must remain the previous valid value, and graph_y must remain the
+	// first patch's value (-3), NOT updated to 99 (all-or-nothing like TS
+	// safeParse: the invalid graphX discards the whole graph batch).
+	if !gx2.Valid || gx2.Float64 != 12.5 {
+		t.Fatalf("graph_x should be unchanged after invalid patch, got %#v", gx2)
+	}
+	if !gy2.Valid || gy2.Float64 != -3 {
+		t.Fatalf("graph_y should remain -3 (99 skipped because graphX was invalid), got %#v", gy2)
+	}
+}
+
+// TestTerminalTabNameLengthBoundMatchesTS pins the create/update tab name max
+// length to the TS createTerminalTabSchema/updateTerminalTabSchema bound
+// (z.string().min(1).max(100)). The length check happens before any DB access,
+// so a handler without a usable DB still returns the 400 BadRequest. Go
+// previously only checked non-empty, letting >100-char names through.
+func TestTerminalTabNameLengthBoundMatchesTS(t *testing.T) {
+	handler := NewHandler(nil, nil)
+	longName := strings.Repeat("x", 101)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/tabs", bytes.NewBufferString(`{"chapterId":"chapter-1","name":"`+longName+`"}`))
+	createReq.Header.Set("Content-Type", "application/json")
+	createErr := handler.createTab(httptest.NewRecorder(), createReq)
+	if createErr == nil || !strings.Contains(createErr.Error(), "at most 100 characters") {
+		t.Fatalf("createTab should reject a >100-char name with 400, got %v", createErr)
+	}
+
+	updateReq := httptest.NewRequest(http.MethodPatch, "/tabs/tab-1", bytes.NewBufferString(`{"name":"`+longName+`"}`))
+	updateReq.Header.Set("Content-Type", "application/json")
+	updateErr := handler.updateTab(httptest.NewRecorder(), updateReq)
+	if updateErr == nil || !strings.Contains(updateErr.Error(), "at most 100 characters") {
+		t.Fatalf("updateTab should reject a >100-char name with 400, got %v", updateErr)
+	}
+
+	// A 100-char name passes the length bound: create against a real DB succeeds (201).
+	sqlDB := openTerminalBroadcastDB(t)
+	okHandler := NewHandler(sqlDB, nil, &terminalBroadcastRecorder{})
+	router := chi.NewRouter()
+	okHandler.RegisterRoutes(router)
+	okName := strings.Repeat("y", 100)
+	okRec := httptest.NewRecorder()
+	router.ServeHTTP(okRec, httptest.NewRequest(http.MethodPost, "/tabs", bytes.NewBufferString(`{"chapterId":"chapter-1","name":"`+okName+`"}`)))
+	if okRec.Code != http.StatusCreated {
+		t.Fatalf("a 100-char tab name must be accepted (201), got %d body=%s", okRec.Code, okRec.Body.String())
 	}
 }

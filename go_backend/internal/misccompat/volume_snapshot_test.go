@@ -200,6 +200,17 @@ func TestVolumeSnapshotRejectsUnsafePathAndOversizedArchive(t *testing.T) {
 		t.Fatalf("unsafe path status = %d, body %s", unsafeRec.Code, unsafeRec.Body.String())
 	}
 
+	// Mirror the TS refine `!p.includes("..")` which is a pure SUBSTRING check:
+	// ".." anywhere (even inside a filename like "my..backup") is rejected, not
+	// just a "/.." path-traversal segment. A segment-only Go check would wrongly
+	// accept this path while TS returns 400.
+	substringReq := httptest.NewRequest(http.MethodPost, "/api/projects/p1/volume-snapshots", bytes.NewBufferString(`{"chapterId":"c1","serviceName":"db","containerPath":"/data/my..backup/file","name":"Substring dots"}`))
+	substringRec := httptest.NewRecorder()
+	router.ServeHTTP(substringRec, substringReq)
+	if substringRec.Code != http.StatusBadRequest {
+		t.Fatalf("substring '..' path status = %d, body %s", substringRec.Code, substringRec.Body.String())
+	}
+
 	oversizedReq := httptest.NewRequest(http.MethodPost, "/api/projects/p1/volume-snapshots", bytes.NewBufferString(`{"chapterId":"c1","serviceName":"db","containerPath":"/data","name":"Too large"}`))
 	oversizedRec := httptest.NewRecorder()
 	router.ServeHTTP(oversizedRec, oversizedReq)
@@ -290,4 +301,46 @@ func countVolumeSnapshotRows(t *testing.T, sqlDB *sql.DB, table string) int {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	return count
+}
+
+// TestValidateContainerSnapshotPathMatchesTSNoTrim pins validateContainerSnapshotPath
+// to the TS createVolumeSnapshotSchema.containerPath schema, which is
+// z.string().min(1).max(1000).refine(startsWith("/")).refine(!includes(".."))
+// with NO .trim(). TS validates the RAW value and stores/execs it verbatim.
+// A previous Go version trimmed + filepath.Clean'd the value first, which both
+// wrongly accepted whitespace-padded paths TS rejects and mutated the stored path.
+func TestValidateContainerSnapshotPathMatchesTSNoTrim(t *testing.T) {
+	// Leading whitespace: TS "  /data".startsWith("/") is false -> 400. A trim-first
+	// Go check would see "/data" and wrongly accept.
+	if _, err := validateContainerSnapshotPath("  /data"); err == nil {
+		t.Fatal("leading-whitespace containerPath should be rejected (not absolute), but was accepted")
+	}
+	// Trailing whitespace is part of the raw value; the path still starts with "/"
+	// and contains no "..", so TS accepts it AND preserves it verbatim. A trim-first
+	// Go version would strip the trailing space, diverging from the stored TS value.
+	got, err := validateContainerSnapshotPath("/data ")
+	if err != nil {
+		t.Fatalf("trailing-whitespace absolute path should be accepted like TS, got error: %v", err)
+	}
+	if got != "/data " {
+		t.Fatalf("containerPath must be preserved verbatim like TS, got %q want %q", got, "/data ")
+	}
+	// Trailing slash must be preserved (TS stores raw; filepath.Clean would strip it).
+	if got, err := validateContainerSnapshotPath("/data/"); err != nil || got != "/data/" {
+		t.Fatalf("trailing-slash path should be preserved verbatim, got %q err %v", got, err)
+	}
+	// Double slash must be preserved (filepath.Clean would collapse "//" to "/").
+	if got, err := validateContainerSnapshotPath("/data//sub"); err != nil || got != "/data//sub" {
+		t.Fatalf("double-slash path should be preserved verbatim, got %q err %v", got, err)
+	}
+	// Sanity: the TS-mirrored rejections still hold on the raw value.
+	if _, err := validateContainerSnapshotPath("relative/path"); err == nil {
+		t.Fatal("non-absolute path should be rejected")
+	}
+	if _, err := validateContainerSnapshotPath("/data/../etc"); err == nil {
+		t.Fatal("'..' path should be rejected")
+	}
+	if _, err := validateContainerSnapshotPath(""); err == nil {
+		t.Fatal("empty path should be rejected")
+	}
 }

@@ -106,6 +106,11 @@ func TestProjectUpdateValidatesTSProjectSchemaEnumsAndLengths(t *testing.T) {
 		{name: "invalid branch", data: map[string]any{"defaultBranch": "--delete main"}, want: "Invalid branch name"},
 		{name: "long proxy", data: map[string]any{"proxyDomain": strings.Repeat("x", 201)}, want: "proxyDomain must be a string up to 200 characters"},
 		{name: "chapter settings type", data: map[string]any{"chapterSettings": "not-an-object"}, want: "chapterSettings must be an object"},
+		// TS updateProjectSchema: description and defaultBranch are .optional() but
+		// NOT .nullable(), so an explicit null is rejected with 400 rather than
+		// clearing the column (startupScript/copyFiles/proxyDomain ARE nullable).
+		{name: "null description", data: map[string]any{"description": nil}, want: "description must be a string up to 2000 characters"},
+		{name: "null defaultBranch", data: map[string]any{"defaultBranch": nil}, want: "Invalid branch name"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -128,6 +133,32 @@ func TestProjectUpdateIgnoresFlowModeLikeTSSchema(t *testing.T) {
 	}
 	if project.Name != "Renamed" || project.FlowMode != "classic" {
 		t.Fatalf("flowMode should not be mutable through PATCH, got name=%q flowMode=%q", project.Name, project.FlowMode)
+	}
+}
+
+// TestProjectUpdateNullableFieldsAcceptNullToClear confirms the nullable-vs-optional
+// distinction: startupScript/copyFiles/proxyDomain are z.string()...nullable()
+// .optional() in TS, so an explicit null clears the column (does NOT 400), while
+// description/defaultBranch reject null (covered by the validation table).
+func TestProjectUpdateNullableFieldsAcceptNullToClear(t *testing.T) {
+	sqlDB := openProjectJSONTestDB(t)
+	defer sqlDB.Close()
+	insertProjectJSONTestRow(t, sqlDB, `{}`)
+	if _, err := sqlDB.Exec(`UPDATE projects SET startup_script = 'echo hi', copy_files = 'a.txt', proxy_domain = 'dev.test' WHERE id = 'p1'`); err != nil {
+		t.Fatalf("seed nullable fields: %v", err)
+	}
+	service := &Service{DB: sqlDB}
+	for _, key := range []string{"startupScript", "copyFiles", "proxyDomain"} {
+		if _, err := service.Update(context.Background(), "p1", map[string]any{key: nil}); err != nil {
+			t.Fatalf("%s: null should be accepted to clear, got %v", key, err)
+		}
+	}
+	var startup, copyFiles, proxyDomain sql.NullString
+	if err := sqlDB.QueryRow(`SELECT startup_script, copy_files, proxy_domain FROM projects WHERE id = 'p1'`).Scan(&startup, &copyFiles, &proxyDomain); err != nil {
+		t.Fatalf("read cleared fields: %v", err)
+	}
+	if startup.Valid || copyFiles.Valid || proxyDomain.Valid {
+		t.Fatalf("nullable fields should be cleared to NULL, got startup=%#v copy=%#v proxy=%#v", startup, copyFiles, proxyDomain)
 	}
 }
 
@@ -165,6 +196,11 @@ func TestProjectUpdateValidatesChapterSettingsNestedZodBounds(t *testing.T) {
 		{name: "blacklistDir bad denyLevel", data: map[string]any{"blacklistDirs": []any{map[string]any{"path": "/tmp", "denyLevel": "denyEverything"}}}, want: "denyLevel must be one of"},
 		{name: "commandWhitelist long pattern", data: map[string]any{"commandWhitelist": []any{map[string]any{"pattern": strings.Repeat("x", 201)}}}, want: "pattern must be at most 200 characters"},
 		{name: "commandBlacklist long denyPrompt", data: map[string]any{"commandBlacklist": []any{map[string]any{"pattern": "rm", "denyPrompt": strings.Repeat("x", 2001)}}}, want: "denyPrompt must be at most 2000 characters"},
+		{name: "autoCreateNarrator not boolean", data: map[string]any{"autoCreateNarrator": "yes"}, want: "autoCreateNarrator must be a boolean"},
+		{name: "requireReviewBeforeMerge not boolean", data: map[string]any{"requireReviewBeforeMerge": 1.0}, want: "requireReviewBeforeMerge must be a boolean"},
+		{name: "routines not object", data: map[string]any{"routines": "x"}, want: "chapterSettings.routines must be an object"},
+		{name: "routines disabledRoutines not array", data: map[string]any{"routines": map[string]any{"disabledRoutines": "x"}}, want: "chapterSettings.routines.disabledRoutines must be an array"},
+		{name: "routines enabledRoutines non-string item", data: map[string]any{"routines": map[string]any{"enabledRoutines": []any{"ok", 3.0}}}, want: "chapterSettings.routines.enabledRoutines[1] must be a string"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,10 +231,13 @@ func TestProjectUpdateAcceptsValidChapterSettingsBounds(t *testing.T) {
 					"modelOverride": map[string]any{"model": "gpt-5", "mode": "temporary"},
 				},
 			},
-			"whitelistDirs":    []any{map[string]any{"path": "/src", "accessLevel": "readWrite", "enabled": true}},
-			"blacklistDirs":    []any{map[string]any{"path": "/secret", "denyLevel": "denyAll"}},
-			"commandWhitelist": []any{map[string]any{"pattern": "git *", "enabled": true}},
-			"commandBlacklist": []any{map[string]any{"pattern": "rm -rf", "denyPrompt": "Are you sure?"}},
+			"whitelistDirs":            []any{map[string]any{"path": "/src", "accessLevel": "readWrite", "enabled": true}},
+			"blacklistDirs":            []any{map[string]any{"path": "/secret", "denyLevel": "denyAll"}},
+			"commandWhitelist":         []any{map[string]any{"pattern": "git *", "enabled": true}},
+			"commandBlacklist":         []any{map[string]any{"pattern": "rm -rf", "denyPrompt": "Are you sure?"}},
+			"autoCreateNarrator":       true,
+			"requireReviewBeforeMerge": false,
+			"routines":                 map[string]any{"disabledRoutines": []any{"a"}, "enabledRoutines": []any{"b", "c"}},
 		},
 	})
 	if err != nil {
