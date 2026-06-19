@@ -173,7 +173,7 @@ const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
 /** Effort levels accepted as a Kiro reasoning hint (mirrors the Go backend whitelist). */
-const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh"]);
+const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
@@ -1007,6 +1007,7 @@ export class NugProvider implements ProviderAdapter {
 		models: Array<Record<string, unknown>>;
 		modelHash?: string;
 		hash?: string;
+		usdRate?: number;
 	}> {
 		const response = await fetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
@@ -1019,6 +1020,7 @@ export class NugProvider implements ProviderAdapter {
 			models?: Array<Record<string, unknown>>;
 			modelHash?: string;
 			hash?: string;
+			usdRate?: number;
 		};
 		const headerHash = response.headers.get("X-NUG-Model-Hash")?.trim();
 		if (!data.modelHash && headerHash) {
@@ -1027,6 +1029,7 @@ export class NugProvider implements ProviderAdapter {
 		if (!data.hash && data.modelHash) {
 			data.hash = data.modelHash;
 		}
-		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash };
+		const usdRate = typeof data.usdRate === "number" ? data.usdRate : undefined;
+		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash, usdRate };
 	}
 }

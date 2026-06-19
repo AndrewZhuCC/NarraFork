@@ -93,7 +93,7 @@ const customApiProviderSchema = z.object({
 	defaultModel: z.string(),
 	protocol: customApiProtocolSchema,
 	defaultContextWindow: z.number().int().min(1).optional(),
-	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
 	proxy: proxyUrlSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	codexAccountId: z.string().optional(),
@@ -127,7 +127,7 @@ const anthropicProviderSchema = z.object({
 	apiKey: z.string(),
 	baseUrl: z.string(),
 	defaultModel: z.string(),
-	defaultReasoningEffort: z.enum(["none", "low", "medium", "high"]).nullable().optional(),
+	defaultReasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).nullable().optional(),
 	proxy: proxyUrlSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
@@ -302,6 +302,7 @@ const updateSettingsSchema = z
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				autoCompactPruneThreshold: z.number().int().min(0).max(100).optional(),
+				minPruneRatio: z.number().int().min(0).max(100).optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),

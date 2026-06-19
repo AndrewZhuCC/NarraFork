@@ -38,17 +38,21 @@ export interface NugModelsGroup {
 	providerName: string;
 	models: NugModelInfo[];
 	modelHash?: string;
+	/** USD→billing-unit exchange rate from NUG (0/undefined = unset). */
+	usdRate?: number;
 }
 
 export interface NugModelCacheEntry {
 	models: NugModelInfo[];
 	modelHash?: string;
 	fetchedAt?: number;
+	usdRate?: number;
 }
 
 const cachedModelsByProvider = new Map<string, NugModelInfo[]>();
 const cachedModelHashByProvider = new Map<string, string>();
 const cachedModelsFetchedAtByProvider = new Map<string, number>();
+const cachedUsdRateByProvider = new Map<string, number>();
 
 const knownChannelTypes = new Set(["kiro", "codex", "openai", "anthropic"]);
 
@@ -139,6 +143,8 @@ function loadProviderCacheEntry(providerId: string, value: unknown): void {
 	if (modelHash) cachedModelHashByProvider.set(providerId, modelHash);
 	const fetchedAt = typeof value.fetchedAt === "number" ? value.fetchedAt : undefined;
 	if (fetchedAt != null) cachedModelsFetchedAtByProvider.set(providerId, fetchedAt);
+	const usdRate = typeof value.usdRate === "number" ? value.usdRate : undefined;
+	if (usdRate != null) cachedUsdRateByProvider.set(providerId, usdRate);
 }
 
 export function loadAllCachedNugModels(): void {
@@ -148,6 +154,7 @@ export function loadAllCachedNugModels(): void {
 		cachedModelsByProvider.clear();
 		cachedModelHashByProvider.clear();
 		cachedModelsFetchedAtByProvider.clear();
+		cachedUsdRateByProvider.clear();
 		const providers = isRecord(data) && isRecord(data.providers) ? data.providers : data;
 		if (!isRecord(providers)) return;
 		for (const [id, value] of Object.entries(providers)) {
@@ -167,6 +174,7 @@ export function saveAllCachedNugModels(): void {
 				models,
 				modelHash: cachedModelHashByProvider.get(id),
 				fetchedAt: cachedModelsFetchedAtByProvider.get(id),
+				usdRate: cachedUsdRateByProvider.get(id),
 			};
 		}
 		writeFileSync(cachePath, JSON.stringify({ version: 1, providers }));
@@ -179,6 +187,7 @@ export function setNugCachedModels(
 	providerId: string,
 	models: Array<Record<string, unknown>>,
 	modelHash?: string | null,
+	usdRate?: number | null,
 ): NugModelInfo[] {
 	const normalized = normalizeModels(models);
 	cachedModelsByProvider.set(providerId, normalized);
@@ -190,6 +199,9 @@ export function setNugCachedModels(
 		cachedModelHashByProvider.delete(providerId);
 		cachedModelsFetchedAtByProvider.delete(providerId);
 	}
+	if (typeof usdRate === "number" && Number.isFinite(usdRate)) {
+		cachedUsdRateByProvider.set(providerId, usdRate);
+	}
 	return normalized;
 }
 
@@ -197,7 +209,8 @@ export function deleteNugCachedModels(providerId: string): boolean {
 	const deletedModels = cachedModelsByProvider.delete(providerId);
 	const deletedHash = cachedModelHashByProvider.delete(providerId);
 	const deletedFetchedAt = cachedModelsFetchedAtByProvider.delete(providerId);
-	return deletedModels || deletedHash || deletedFetchedAt;
+	const deletedUsdRate = cachedUsdRateByProvider.delete(providerId);
+	return deletedModels || deletedHash || deletedFetchedAt || deletedUsdRate;
 }
 
 export function getNugCachedModelsByProvider(providerId: string): NugModelInfo[] {
@@ -238,6 +251,7 @@ export function getNugCachedModelsGrouped(providers: NUGProviderConfig[] = []): 
 			providerName: p.name,
 			models: cachedModelsByProvider.get(p.id) ?? [],
 			modelHash: cachedModelHashByProvider.get(p.id),
+			usdRate: cachedUsdRateByProvider.get(p.id),
 		}));
 }
 
