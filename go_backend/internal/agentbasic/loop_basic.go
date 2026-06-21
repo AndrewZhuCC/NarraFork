@@ -105,7 +105,7 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, settings *conf
 	// that do not supply it directly (Anthropic/OpenAI). Kiro supplies the
 	// percentage itself, so this is a no-op there.
 	options.contextWindow = resolveModelContextWindow(settings, resolution.Model, resolution.Provider)
-	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0}
+	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0, DisableInlinePlan: options.disableInlinePlan}
 	if options.emitToolInventory {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "tool_inventory", Metadata: map[string]any{"inventory": ToolInventoryMetadataForOptions(inventoryOptions)}})
 	}
@@ -458,7 +458,7 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 	effectiveToolScope := encodedToolScope(options.toolScope, options.enabledTools, options.disabledTools)
 	turnCtx, cancelTurn := context.WithCancel(ctx)
 	defer cancelTurn()
-	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0}
+	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0, DisableInlinePlan: options.disableInlinePlan}
 	requestID := id.New()
 	requestStartedAt := time.Now()
 	requestCredentialID := strings.TrimSpace(resolution.Config.CredentialID)

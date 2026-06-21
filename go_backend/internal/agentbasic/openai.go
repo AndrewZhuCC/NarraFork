@@ -190,6 +190,7 @@ type generateOptions struct {
 	runtimeSettingsOverrideHook       RuntimeSettingsOverrideHook
 	shouldStopHook                    ShouldStopHook
 	contextWindow                     int
+	disableInlinePlan                 bool
 }
 
 type SideCarRequest struct {
@@ -231,6 +232,15 @@ func WithReasoningEffort(reasoningEffort string) GenerateOption {
 func WithToolScope(scope string) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.toolScope = strings.TrimSpace(scope)
+	}
+}
+
+// WithDisableInlinePlan removes the inline `plan` parameter from the ExitPlanMode
+// tool schema and switches its description/system reminder to the file-only flow.
+// Mirrors the TS settings.agent.planModeAllowInlinePlan=false path.
+func WithDisableInlinePlan(disable bool) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.disableInlinePlan = disable
 	}
 }
 

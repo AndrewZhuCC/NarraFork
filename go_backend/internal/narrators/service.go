@@ -3258,6 +3258,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		agentbasic.WithMaxTurns(s.agentMaxTurns()),
 		agentbasic.WithReasoningEffort(reasoningEffort),
 		agentbasic.WithToolScope(toolScope),
+		agentbasic.WithDisableInlinePlan(narrator.PlanMode && !s.agentPlanModeAllowInlinePlan()),
 		agentbasic.WithEnabledTools(anyStringSlice(narrator.EnabledTools)),
 		agentbasic.WithDisabledTools(disabledToolsFromTraits(narrator.Traits)),
 		agentbasic.WithExternalTools(externalTools),
@@ -3404,7 +3405,11 @@ func (s *Service) agentSystemPrompt(ctx context.Context, narrator Narrator) stri
 		if narrator.PlanFileID != nil && strings.TrimSpace(*narrator.PlanFileID) != "" {
 			planFile = planFileRelativePath(strings.TrimSpace(*narrator.PlanFileID))
 		}
-		prompt = appendPromptSection(prompt, "Plan Mode", "You are currently in NarraFork plan mode. Explore and design an implementation plan first; do not modify implementation files until the plan is explicitly approved. Write/Edit are restricted to the designated plan file "+planFile+", or pass the complete plan directly to ExitPlanMode. If TS-style plan compact cannot be persisted, the Go backend will fall back to normal message history/compact context.")
+		if s.agentPlanModeAllowInlinePlan() {
+			prompt = appendPromptSection(prompt, "Plan Mode", "You are currently in NarraFork plan mode. Explore and design an implementation plan first; do not modify implementation files until the plan is explicitly approved. Write/Edit are restricted to the designated plan file "+planFile+", or pass the complete plan directly to ExitPlanMode. If TS-style plan compact cannot be persisted, the Go backend will fall back to normal message history/compact context.")
+		} else {
+			prompt = appendPromptSection(prompt, "Plan Mode", "You are currently in NarraFork plan mode. Explore and design an implementation plan first; do not modify implementation files until the plan is explicitly approved. Inline plans are disabled in this instance — you MUST write the complete plan to the designated plan file "+planFile+" (Write/Edit are restricted to that file), then call ExitPlanMode without any plan parameter; the backend reads the plan from that file. If TS-style plan compact cannot be persisted, the Go backend will fall back to normal message history/compact context.")
+		}
 	}
 	_ = ctx
 	return prompt
@@ -3470,6 +3475,23 @@ func (s *Service) agentMaxTurns() int {
 	default:
 		return 0
 	}
+}
+
+// agentPlanModeAllowInlinePlan reports whether plan mode accepts inline plans
+// (the ExitPlanMode `plan` parameter). Defaults to true when unset, mirroring the
+// TS settings.agent.planModeAllowInlinePlan default.
+func (s *Service) agentPlanModeAllowInlinePlan() bool {
+	if s.Settings == nil {
+		return true
+	}
+	agent, ok := s.Settings.Raw()["agent"].(map[string]any)
+	if !ok {
+		return true
+	}
+	if value, ok := agent["planModeAllowInlinePlan"].(bool); ok {
+		return value
+	}
+	return true
 }
 
 func (s *Service) agentFirstTokenTimeout() time.Duration {
@@ -8698,6 +8720,9 @@ func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID st
 			planFile = planFileRelativePath(strings.TrimSpace(*narrator.PlanFileID))
 		}
 		message := "ExitPlanMode requires a complete plan of at least 40 characters before leaving plan mode. Provide a non-empty plan parameter or write it to " + planFile + "."
+		if !s.agentPlanModeAllowInlinePlan() {
+			message = "ExitPlanMode requires a complete plan of at least 40 characters before leaving plan mode. Inline plans are disabled in this instance — write the plan to " + planFile + " first; the backend reads it automatically."
+		}
 		run.Status = "error"
 		run.Output = jsonToolOutput(map[string]any{"ok": false, "planMode": true, "error": message})
 		run.Error = message
@@ -8890,6 +8915,9 @@ func (s *Service) resolveExitPlanModePlan(narrator Narrator, args map[string]any
 	if narrator.Cwd != nil {
 		cwd = *narrator.Cwd
 	}
+	// When inline plans are disabled, the plan must come from the designated plan
+	// file; never fall back to the inline `plan` argument.
+	allowInline := s.agentPlanModeAllowInlinePlan()
 	if narrator.PlanFileID != nil && strings.TrimSpace(*narrator.PlanFileID) != "" {
 		path := planFileRelativePath(strings.TrimSpace(*narrator.PlanFileID))
 		resolved := path
@@ -8899,16 +8927,20 @@ func (s *Service) resolveExitPlanModePlan(narrator Narrator, args map[string]any
 		if text, err := readExitPlanFile(resolved); err == nil && strings.TrimSpace(text) != "" {
 			return strings.TrimSpace(text), "planFile", nil
 		} else if err != nil && !os.IsNotExist(err) {
-			plan := strings.TrimSpace(stringFromAny(args["plan"]))
-			if plan != "" {
-				return plan, "argument", nil
+			if allowInline {
+				plan := strings.TrimSpace(stringFromAny(args["plan"]))
+				if plan != "" {
+					return plan, "argument", nil
+				}
 			}
 			return "", "", err
 		}
 	}
-	plan := strings.TrimSpace(stringFromAny(args["plan"]))
-	if plan != "" {
-		return plan, "argument", nil
+	if allowInline {
+		plan := strings.TrimSpace(stringFromAny(args["plan"]))
+		if plan != "" {
+			return plan, "argument", nil
+		}
 	}
 	return "", "", nil
 }

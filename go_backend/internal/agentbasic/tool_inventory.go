@@ -23,6 +23,10 @@ type ToolInventoryOptions struct {
 	DisabledTools            []string
 	ExternalTools            []ExternalToolSpec
 	MCPExternalToolInjection bool
+	// DisableInlinePlan removes the inline `plan` parameter from the ExitPlanMode
+	// tool schema and rewrites its description so only the file-based plan flow is
+	// advertised. Mirrors the TS settings.agent.planModeAllowInlinePlan=false path.
+	DisableInlinePlan bool
 }
 
 type ToolCapability struct {
@@ -203,7 +207,40 @@ func resolveToolSpecs(opts ToolInventoryOptions) []toolSpec {
 		}
 		out = append(out, spec)
 	}
+	if opts.DisableInlinePlan {
+		for i := range out {
+			if out[i].Name == "ExitPlanMode" {
+				out[i] = exitPlanModeSpecWithoutInline(out[i])
+			}
+		}
+	}
 	return out
+}
+
+// exitPlanModeSpecWithoutInline returns a copy of the ExitPlanMode tool spec with
+// the inline `plan` parameter removed and a file-only description, mirroring the
+// TS dynamic schema when settings.agent.planModeAllowInlinePlan is false.
+func exitPlanModeSpecWithoutInline(spec toolSpec) toolSpec {
+	spec.Description = "Exit NarraFork plan mode after writing a complete implementation plan to the designated .narrafork/plan-{id}.md file. Inline plans are disabled in this instance — this tool takes no plan parameter; the backend reads the plan exclusively from the designated plan file. The plan is validated, reflected on, permissions are restored, and a plan compact is attempted with a documented fallback."
+	params := map[string]any{}
+	for key, value := range spec.Parameters {
+		if key == "properties" {
+			continue
+		}
+		params[key] = value
+	}
+	if original, ok := spec.Parameters["properties"].(map[string]any); ok {
+		props := map[string]any{}
+		for key, value := range original {
+			if key == "plan" {
+				continue
+			}
+			props[key] = value
+		}
+		params["properties"] = props
+	}
+	spec.Parameters = params
+	return spec
 }
 
 func toolNameSet(values []string) map[string]bool {

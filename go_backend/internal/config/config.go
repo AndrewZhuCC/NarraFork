@@ -143,6 +143,7 @@ func defaultRaw(home string) map[string]any {
 			"modelContextWindows":             map[string]any{},
 			"translateReasoning":              false,
 			"defaultRelaxedPlan":              false,
+			"planModeAllowInlinePlan":         true,
 			"planReflectionAutoApprove":       false,
 			"questionReflectionEnabled":       false,
 			"questionReflectionTimeoutMs":     float64(300000),

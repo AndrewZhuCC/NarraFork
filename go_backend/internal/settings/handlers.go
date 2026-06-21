@@ -644,7 +644,8 @@ var settingsPatchNestedKeyAllowlist = map[string]map[string]struct{}{
 		"defaultModel", "defaultPermissionMode", "defaultStartInPlanMode", "summaryModel",
 		"customModels", "hiddenModels", "maxTurns", "subagentModels", "subagentAllowedModels",
 		"legacyEncoding", "freshShellEnv", "translateReasoning", "requestDumpEnabled",
-		"requestDumpErrorsOnly", "defaultRelaxedPlan", "planReflectionAutoApprove",
+		"requestDumpErrorsOnly", "defaultRelaxedPlan", "planModeAllowInlinePlan",
+		"planReflectionAutoApprove",
 		"planReflectionAllowAutoCompact", "questionReflectionEnabled", "questionReflectionTimeoutMs",
 		"dangerReflectionLevel", "dangerReflectionEnabled", "dangerSkipReadOnlyConfirmations",
 		"defaultReasoningEffort", "maxTransientRetries", "silentToolCallThreshold",
@@ -898,7 +899,7 @@ func validateAgentSettingsPatch(patch map[string]any) error {
 	if !ok {
 		return httpx.ValidationError("agent must be an object")
 	}
-	for _, key := range []string{"defaultStartInPlanMode", "legacyEncoding", "freshShellEnv", "translateReasoning", "requestDumpEnabled", "requestDumpErrorsOnly", "defaultRelaxedPlan", "planReflectionAutoApprove", "questionReflectionEnabled", "dangerReflectionEnabled", "dangerSkipReadOnlyConfirmations"} {
+	for _, key := range []string{"defaultStartInPlanMode", "legacyEncoding", "freshShellEnv", "translateReasoning", "requestDumpEnabled", "requestDumpErrorsOnly", "defaultRelaxedPlan", "planModeAllowInlinePlan", "planReflectionAutoApprove", "questionReflectionEnabled", "dangerReflectionEnabled", "dangerSkipReadOnlyConfirmations"} {
 		if value, ok := agentPatch[key]; ok {
 			if _, ok := value.(bool); !ok {
 				return httpx.ValidationError("agent." + key + " must be boolean")
