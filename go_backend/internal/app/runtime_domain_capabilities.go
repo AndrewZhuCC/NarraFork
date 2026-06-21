@@ -1880,7 +1880,7 @@ func narratorRuntimeCapabilities() map[string]any {
 			"inputValidationParity":        true,
 			"systemPromptMaxChars":         float64(10000),
 			"cwdBounds":                    "1..4096",
-			"reasoningEffortEnum":          []string{"none", "low", "medium", "high", "xhigh"},
+			"reasoningEffortEnum":          []string{"none", "low", "medium", "high", "xhigh", "max"},
 			"planReflectionOverrideEnum":   []string{"inherit", "on", "off"},
 			"dangerReflectionOverrideEnum": []string{"inherit", "on", "off", "light", "standard", "strict"},
 			"validatesBeforeDBWrite":       true,

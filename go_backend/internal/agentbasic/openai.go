@@ -426,7 +426,7 @@ func cloneMetadata(input map[string]any) map[string]any {
 
 func normalizeReasoningEffort(value string) string {
 	switch strings.TrimSpace(value) {
-	case "none", "low", "medium", "high", "xhigh":
+	case "none", "low", "medium", "high", "xhigh", "max":
 		return strings.TrimSpace(value)
 	default:
 		return ""
@@ -752,7 +752,7 @@ func toolSpecs() []toolSpec {
 					"subagent_type":     stringProp("explore, plan, general, review, or a custom subagent type name"),
 					"prompt":            stringProp("Task prompt for the subagent"),
 					"model":             stringProp("Optional model override"),
-					"reasoning_effort":  map[string]any{"type": "string", "enum": []string{"none", "low", "medium", "high", "xhigh"}, "description": "Optional reasoning effort"},
+					"reasoning_effort":  map[string]any{"type": "string", "enum": []string{"none", "low", "medium", "high", "xhigh", "max"}, "description": "Optional reasoning effort"},
 					"workdir":           stringProp("Optional working directory under the parent cwd"),
 					"alias":             stringProp("Optional alias for later Await calls"),
 					"stop":              stringProp("Subagent id or alias to stop"),

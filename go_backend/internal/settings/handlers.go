@@ -1870,7 +1870,7 @@ var providerPatchSchemas = map[string]providerPatchSchema{
 		optionalBools:   []string{"tlsRejectUnauthorized", "codexWebSocket", "codexWebSearch", "codexImageGeneration", "disabled"},
 
 		optionalEnums:   map[string][]string{"protocol": {"anthropic-official", "anthropic-compatible", "codex-native", "responses-compatible", "completions-compatible"}},
-		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high"}},
+		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high", "max"}},
 		optionalIntsMin: map[string]int{"defaultContextWindow": 1},
 	},
 	"openaiProviders": {
@@ -1884,7 +1884,7 @@ var providerPatchSchemas = map[string]providerPatchSchema{
 		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},
 		optionalStrings: []string{"proxy"},
 		optionalBools:   []string{"tlsRejectUnauthorized", "officialApi", "disabled"},
-		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high"}},
+		nullableEnums:   map[string][]string{"defaultReasoningEffort": {"none", "low", "medium", "high", "max"}},
 	},
 	"nkpProviders": {
 		requiredStrings: map[string]int{"id": 1, "name": 0, "prefix": 1, "apiKey": 0, "baseUrl": 0, "defaultModel": 0},

@@ -671,7 +671,7 @@ func validateCreateRequest(req createRequest) error {
 		}
 	}
 	if req.ReasoningEffort != nil && !validReasoningEffort(*req.ReasoningEffort) {
-		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, or null")
+		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, max, or null")
 	}
 	if req.PlanReflectionAutoApproveOverride != "" && !validBooleanOverride(req.PlanReflectionAutoApproveOverride) {
 		return httpx.BadRequest("planReflectionAutoApproveOverride must be inherit, on, or off")
@@ -706,7 +706,7 @@ func validStrictPermissionMode(value string) bool {
 
 func validReasoningEffort(value string) bool {
 	switch value {
-	case "none", "low", "medium", "high", "xhigh":
+	case "none", "low", "medium", "high", "xhigh", "max":
 		return true
 	default:
 		return false
@@ -6352,7 +6352,7 @@ func (h *Handler) updateReasoningEffort(w http.ResponseWriter, r *http.Request) 
 	// else 400. A null clears the field. Go previously persisted any arbitrary
 	// string straight to the column without enum validation.
 	if body.ReasoningEffort != nil && !validReasoningEffort(*body.ReasoningEffort) {
-		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, or null")
+		return httpx.BadRequest("reasoningEffort must be one of: none, low, medium, high, xhigh, max, or null")
 	}
 	n, err := h.Service.UpdateTextField(r.Context(), chi.URLParam(r, "id"), "reasoning_effort", nullableStringValue(body.ReasoningEffort))
 	if err != nil {

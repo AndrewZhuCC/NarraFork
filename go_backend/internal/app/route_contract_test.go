@@ -4318,7 +4318,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"cwdBounds":              "1..4096",
 		"validatesBeforeDBWrite": true,
 	})
-	assertStringSliceCapability(t, caps, []string{"narrator", "create"}, "reasoningEffortEnum", []string{"none", "low", "medium", "high", "xhigh"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "create"}, "reasoningEffortEnum", []string{"none", "low", "medium", "high", "xhigh", "max"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "create"}, "planReflectionOverrideEnum", []string{"inherit", "on", "off"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "create"}, "dangerReflectionOverrideEnum", []string{"inherit", "on", "off", "light", "standard", "strict"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "create"}, "sampledProofs", []string{"create-systemprompt-cwd-reasoning-reflection-zod-bounds"})

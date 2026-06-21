@@ -1237,14 +1237,6 @@ func normalizeCodexReasoningEffort(model, reasoningEffort string) string {
 	}
 	_, bare := splitModel(model)
 	supported, ok := codexModelReasoningLevels[bare]
-	if !ok {
-		return effort
-	}
-	for _, level := range supported {
-		if level == effort {
-			return effort
-		}
-	}
 	contains := func(target string) bool {
 		for _, level := range supported {
 			if level == target {
@@ -1252,6 +1244,30 @@ func normalizeCodexReasoningEffort(model, reasoningEffort string) string {
 			}
 		}
 		return false
+	}
+	// Codex has no "max" tier; degrade it to the model's highest available tier.
+	if effort == "max" {
+		if !ok {
+			return "xhigh"
+		}
+		if contains("xhigh") {
+			return "xhigh"
+		}
+		if contains("high") {
+			return "high"
+		}
+		if len(supported) > 0 {
+			return supported[len(supported)-1]
+		}
+		return "high"
+	}
+	if !ok {
+		return effort
+	}
+	for _, level := range supported {
+		if level == effort {
+			return effort
+		}
 	}
 	if effort == "xhigh" && contains("high") {
 		return "high"
@@ -1280,7 +1296,7 @@ func chatReasoningEffort(model, reasoningEffort string) string {
 	if !supportsReasoning {
 		return ""
 	}
-	if reasoningEffort == "xhigh" {
+	if reasoningEffort == "xhigh" || reasoningEffort == "max" {
 		return "high"
 	}
 	return reasoningEffort

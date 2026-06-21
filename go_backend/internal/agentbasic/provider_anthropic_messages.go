@@ -570,7 +570,7 @@ func mapDeepSeekEffort(reasoningEffort string) string {
 	if effort == "" || effort == "none" {
 		return ""
 	}
-	if effort == "xhigh" {
+	if effort == "xhigh" || effort == "max" {
 		return "max"
 	}
 	return "high"
