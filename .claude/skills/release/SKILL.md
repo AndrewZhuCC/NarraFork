@@ -60,6 +60,8 @@ description: 完整的版本发布流程：从 git 提交记录生成双语更�
    }
    ```
 
+> ⚠️ **不要手动 `git commit` 这个 changelog 文件**。它会由阶段二的 `release.ts` 在 `release: v{version}` 提交中自动一起提交（脚本会把 `changelogs/v{version}.json` 和 `package.json` 一并 `git add`）。手动提前提交会导致改动分散在两个提交里。
+
 ### Changelog 规则
 
 - 不要逐字翻译 commit message，用简洁的用户视角描述变更
@@ -82,7 +84,7 @@ bun scripts/release.ts <version>
 
 `release.ts` 会自动从 `changelogs/v<version>.json` 读取 changelog，依次执行：
 1. 修改 `package.json` 版本号
-2. Git commit (`release: v{version}`) + tag (`v{version}`)
+2. Git commit (`release: v{version}`) + tag (`v{version}`)：提交时会把 `package.json` **和** `changelogs/v{version}.json` 一并 `git add`，确保 changelog 不会被遗漏
 3. 跨平台编译（调用 `scripts/build-cross-platform.ts`）
 4. 上传编译产物到更新服务器
 
@@ -112,5 +114,5 @@ bun scripts/release.ts <version>
 
 ## 工作流总结
 
-1. 生成 changelog → `changelogs/v{version}.json`
-2. 立即执行 `bun scripts/release.ts <version>` 完成发布（不要询问确认）
+1. 生成 changelog → `changelogs/v{version}.json`（写文件即可，**不要**单独提交）
+2. 立即执行 `bun scripts/release.ts <version>` 完成发布（不要询问确认）；脚本会把 changelog 随 `release: v{version}` 提交一起提交并打 tag

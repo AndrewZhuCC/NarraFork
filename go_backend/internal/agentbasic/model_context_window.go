@@ -49,6 +49,13 @@ var builtinModelContextWindows = map[string]int{
 	"claude-opus-4-6":   1000000,
 	"claude-sonnet-4.6": 1000000,
 	"claude-opus-4.6":   1000000,
+	// Claude 4.5 models (Kiro exposes these; 200k context)
+	"claude-sonnet-4-5": 200000,
+	"claude-sonnet-4.5": 200000,
+	"claude-haiku-4-5":  200000,
+	"claude-haiku-4.5":  200000,
+	"claude-opus-4-5":   200000,
+	"claude-opus-4.5":   200000,
 	// Anthropic native API models
 	"claude-sonnet-4-20250514":   200000,
 	"claude-opus-4-20250514":     200000,

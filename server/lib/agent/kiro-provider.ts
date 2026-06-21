@@ -202,7 +202,11 @@ export class KiroProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<import("./provider").GenerateMetaResult> {
+		if (options?.signal?.aborted) {
+			throw new DOMException("Kiro generation aborted", "AbortError");
+		}
 		const modelId = resolveModel(model);
 		const kiroAdapter = await import("../kiro-adapter");
 		const request: import("../kiro-adapter").KiroChatRequest = {
@@ -243,7 +247,13 @@ export class KiroProvider implements ProviderAdapter {
 		let credentialId: string | undefined;
 		let meterUsage: number | undefined;
 		let meterUnit: string | undefined;
-		for await (const rawEvent of kiroAdapter.kiroChatRaw(request)) {
+		// Pass the signal into kiroChatRaw so the underlying HTTP request is
+		// actually aborted; the in-loop check is a fast-path guard for events
+		// already buffered before the abort propagates.
+		for await (const rawEvent of kiroAdapter.kiroChatRaw(request, options?.signal)) {
+			if (options?.signal?.aborted) {
+				throw new DOMException("Kiro generation aborted", "AbortError");
+			}
 			const evt = parseKiroStreamEvent(rawEvent);
 			if (evt.text != null) chunks.push(evt.text);
 			if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;

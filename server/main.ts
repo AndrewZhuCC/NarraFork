@@ -49,6 +49,7 @@ import {
 } from "./services/narrator-session";
 import "./services/notification-service"; // Register notification event listeners
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { registerProjectDbSync } from "./services/project-db-sync";
 import { initReviewEventHandler } from "./services/review-event-handler";
@@ -968,6 +969,9 @@ initReviewEventHandler();
 
 // Register container event handler (inject access info + auto-enable Browser on container start)
 initContainerEventHandler();
+
+// Register chat-group event handler (notify controlling named narrators of permission requests)
+registerChatGroupEventListeners();
 
 // Fetch NKP quota balances on startup
 import("./routes/nkp")

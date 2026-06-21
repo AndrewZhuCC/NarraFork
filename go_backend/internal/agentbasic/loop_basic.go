@@ -596,7 +596,33 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			}
 			if parsed.ContextUsagePercentage != nil {
 				requestContextPercent = *parsed.ContextUsagePercentage
-				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Percentage: *parsed.ContextUsagePercentage, Usage: parsed.Usage})
+				// Kiro reports a context-window occupancy percentage instead of
+				// raw token counts. Derive an estimated input/prompt token count
+				// from the percentage and the model's context window, and estimate
+				// output tokens from the accumulated assistant text. Both are
+				// flagged as estimated so downstream consumers can distinguish
+				// them from provider-reported counts.
+				usage := parsed.Usage
+				if options.contextWindow > 0 {
+					promptTokens := estimateTokensFromContextPercent(*parsed.ContextUsagePercentage, options.contextWindow)
+					completionTokens := estimateTokens(state.assistantText)
+					if usage == nil {
+						usage = &UsageSnapshot{}
+					}
+					usage.ContextWindow = options.contextWindow
+					if usage.PromptTokens == 0 {
+						usage.PromptTokens = promptTokens
+					}
+					if usage.InputTokens == 0 {
+						usage.InputTokens = promptTokens
+					}
+					if usage.CompletionTokens == 0 {
+						usage.CompletionTokens = completionTokens
+					}
+					usage.Estimated = true
+					lastUsage = usage
+				}
+				emitAgentEvent(ctx, out, AgentEvent{Type: "context_usage", Percentage: *parsed.ContextUsagePercentage, Usage: usage})
 			} else if parsed.Usage != nil {
 				pct := usageContextPercent(parsed.Usage)
 				if pct > 0 {

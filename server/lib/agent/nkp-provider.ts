@@ -267,6 +267,7 @@ export class NkpProvider implements ProviderAdapter {
 		text: string,
 		model: string,
 		systemInstruction?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<GenerateMetaResult> {
 		const modelId = resolveModel(model);
 		const request: KiroChatRequest = {
@@ -313,6 +314,7 @@ export class NkpProvider implements ProviderAdapter {
 				"X-NKP-Request-Token": buildNkpRequestToken(this.config.apiKey),
 			},
 			body: JSON.stringify(request),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {

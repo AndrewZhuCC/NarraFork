@@ -341,8 +341,6 @@ export interface UseNarratorPanelWSReturn {
 	// Tool expand
 	expandedToolUseId: string | null;
 	setExpandedToolUseId: React.Dispatch<React.SetStateAction<string | null>>;
-	editExpandOverride: boolean | null;
-	setEditExpandOverride: React.Dispatch<React.SetStateAction<boolean | null>>;
 	// Unread
 	unreadCount: number;
 	setUnreadCount: React.Dispatch<React.SetStateAction<number>>;
@@ -881,7 +879,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 
 	// --- Tool expand ---
 	const [expandedToolUseId, setExpandedToolUseId] = useState<string | null>(null);
-	const [editExpandOverride, setEditExpandOverride] = useState<boolean | null>(null);
 
 	useEffect(() => {
 		if (!expandedToolUseId) return;
@@ -3416,14 +3413,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			todosToolUseId,
 			expandedToolUseId,
 			setExpandedToolUseId,
-			editExpandOverride,
-			setEditExpandOverride,
 			unreadCount,
 			setUnreadCount,
 			viewers,
 		}),
 		// Note: streamingBlocksRef (useRef) and useState setters (setQueuedMessages,
-		// setExpandedToolUseId, setEditExpandOverride, setUnreadCount, setPaymentRequired)
+		// setExpandedToolUseId, setUnreadCount, setPaymentRequired)
 		// are stable references and intentionally omitted from the dependency array.
 		[
 			connected,
@@ -3458,7 +3453,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			currentTodos,
 			todosToolUseId,
 			expandedToolUseId,
-			editExpandOverride,
 			unreadCount,
 			viewers,
 		],

@@ -315,6 +315,28 @@ export function isKiroAvailable(): boolean {
 	return mod?.isKiroAvailable() ?? false;
 }
 
+/**
+ * Stricter availability check for the Kiro MCP search channel.
+ *
+ * `isKiroAvailable()` only reports whether the plugin is loaded and initialized.
+ * That is not enough for search routing: if every credential is disabled
+ * (quota_exhausted / too_many_failures / account_suspended / manual), the
+ * upstream MCP call will hang until the 60s search timeout instead of failing
+ * fast, which makes the whole serial channel chain look like it takes ~1 minute
+ * before falling back to the next channel (e.g. NUG/NKP).
+ *
+ * Returns true only when the plugin is available AND the manager reports at
+ * least one usable credential. When the snapshot is unavailable we fall back to
+ * the plugin-level availability so behavior is unchanged for plugin builds that
+ * do not expose a snapshot.
+ */
+export function isKiroSearchUsable(): boolean {
+	if (!isKiroAvailable()) return false;
+	const snapshot = kiroSnapshot();
+	if (!snapshot) return true;
+	return (snapshot.available ?? 0) > 0;
+}
+
 /** Test helper: replace the optional Kiro plugin module for runtime fixture tests. */
 export function __setKiroModuleForTests(module: Partial<KiroModule> | null): void {
 	mod = module as KiroModule | null;

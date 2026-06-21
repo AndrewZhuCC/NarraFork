@@ -225,6 +225,8 @@ export interface ChatParams {
 export interface GenerateOptions {
 	/** Optional reasoning/thinking effort for lightweight generation helpers. */
 	reasoningEffort?: ChatParams["reasoningEffort"];
+	/** Optional abort signal to cancel the underlying upstream request. */
+	signal?: AbortSignal;
 }
 
 export interface GenerateMetaResult {

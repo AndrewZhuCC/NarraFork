@@ -729,6 +729,7 @@ export class NugProvider implements ProviderAdapter {
 			method: "POST",
 			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
 			body: JSON.stringify(body),
+			signal: options?.signal,
 		});
 
 		if (!response.ok) {

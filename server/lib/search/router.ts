@@ -1,4 +1,4 @@
-import { isKiroAvailable, kiroMcpCall, type McpResponse } from "../kiro-adapter";
+import { isKiroSearchUsable, kiroMcpCall, type McpResponse } from "../kiro-adapter";
 import { logger } from "../logger";
 import { resolveEffectiveModel, resolveProvider, settings } from "../settings";
 import type {
@@ -234,7 +234,7 @@ async function kiroMcpSearch(
 	request: SearchRequest,
 	signal: AbortSignal,
 ): Promise<SearchChannelResult> {
-	if (!isKiroAvailable()) throw new Error("Kiro MCP search is not available");
+	if (!isKiroSearchUsable()) throw new Error("Kiro MCP search is not available");
 	const response = await kiroMcpCall("web_search", { query: request.query }, signal);
 	const parsed = textFromMcpResponse(response);
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
@@ -334,7 +334,7 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 	if (!channel.enabled || channel.id === SEARCH_NATIVE_CHANNEL_ID) return false;
 	switch (channel.kind) {
 		case "kiro-mcp":
-			return isKiroAvailable();
+			return isKiroSearchUsable();
 		case "nug-mcp": {
 			const provider = findNugProvider(channel);
 			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;
