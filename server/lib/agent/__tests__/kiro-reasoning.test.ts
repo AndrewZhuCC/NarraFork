@@ -41,6 +41,154 @@ describe("kiro reasoning — receive side (parseKiroStreamEvent)", () => {
 		expect(parsed.reasoningMetadata).toBeUndefined();
 		expect(parsed.redactedThinking).toBeUndefined();
 	});
+
+	test("parses leaked XML invoke blocks from assistant content when enabled", () => {
+		const content = [
+			"更新 packet staging 与 correction 初始化条目，反映坐标查表已闭合。",
+			"",
+			"count",
+			'<invoke name="Edit">',
+			'<parameter name="file_path">D:/GoSLAM Mapping Master Pro/docs/example.md</parameter>',
+			'<parameter name="old_string">old value</parameter>',
+			'<parameter name="new_string">`GeneralParser<LidarPointXYZIRT>` &amp; LUT</parameter>',
+			"</invoke>",
+		].join("\n");
+
+		const parsed = parseKiroStreamEvent(
+			{ eventType: "assistantResponseEvent", data: { content } },
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.text).toBe(
+			"更新 packet staging 与 correction 初始化条目，反映坐标查表已闭合。\n\n",
+		);
+		expect(parsed.text).not.toContain("<invoke");
+		expect(parsed.text).not.toContain("count");
+		expect(parsed.toolUses).toHaveLength(1);
+		const toolUse = parsed.toolUses?.[0];
+		expect(toolUse?.toolUseId.startsWith("kiro_xml_")).toBe(true);
+		expect(toolUse?.name).toBe("Edit");
+		expect(toolUse?.input).toEqual({
+			file_path: "D:/GoSLAM Mapping Master Pro/docs/example.md",
+			old_string: "old value",
+			new_string: "`GeneralParser<LidarPointXYZIRT>` & LUT",
+		});
+	});
+
+	test("removes short marker text on the line immediately before leaked invoke blocks", () => {
+		const content = [
+			"准备执行工具。",
+			"call",
+			'<invoke name="Bash">',
+			'<parameter name="command">pwd</parameter>',
+			"</invoke>",
+		].join("\n");
+
+		const parsed = parseKiroStreamEvent(
+			{ eventType: "assistantResponseEvent", data: { content } },
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.text).toBe("准备执行工具。\n");
+		expect(parsed.text).not.toContain("call");
+		expect(parsed.toolUses?.[0].name).toBe("Bash");
+		expect(parsed.toolUses?.[0].input).toEqual({ command: "pwd" });
+	});
+
+	test("keeps leaked XML invoke blocks as text for plain generation parsing", () => {
+		const content = '<invoke name="Bash"><parameter name="command">pwd</parameter></invoke>';
+		const parsed = parseKiroStreamEvent({ eventType: "assistantResponseEvent", data: { content } });
+		expect(parsed.text).toBe(content);
+		expect(parsed.toolUses).toBeUndefined();
+	});
+
+	test("strips leaked XML without duplicating native tool uses", () => {
+		const content = '<invoke name="Bash"><parameter name="command">pwd</parameter></invoke>';
+		const parsed = parseKiroStreamEvent(
+			{
+				eventType: "assistantResponseEvent",
+				data: {
+					content,
+					toolUses: [{ toolUseId: "native_1", name: "Bash", input: { command: "pwd" } }],
+				},
+			},
+			{ parseTextToolCalls: true },
+		);
+		expect(parsed.text).toBe("");
+		expect(parsed.toolUses).toEqual([
+			{ toolUseId: "native_1", name: "Bash", input: { command: "pwd" } },
+		]);
+	});
+
+	test("keeps distinct leaked XML tool calls alongside native tool uses", () => {
+		const content = [
+			'<invoke name="Edit">',
+			'<parameter name="file_path">/tmp/a.txt</parameter>',
+			'<parameter name="old_string">a</parameter>',
+			'<parameter name="new_string">b</parameter>',
+			"</invoke>",
+		].join("\n");
+		const parsed = parseKiroStreamEvent(
+			{
+				eventType: "assistantResponseEvent",
+				data: {
+					content,
+					toolUses: [{ toolUseId: "native_1", name: "Bash", input: { command: "pwd" } }],
+				},
+			},
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.text).toBe("");
+		expect(parsed.toolUses).toHaveLength(2);
+		expect(parsed.toolUses?.[0]).toEqual({
+			toolUseId: "native_1",
+			name: "Bash",
+			input: { command: "pwd" },
+		});
+		expect(parsed.toolUses?.[1].name).toBe("Edit");
+		expect(parsed.toolUses?.[1].input).toEqual({
+			file_path: "/tmp/a.txt",
+			old_string: "a",
+			new_string: "b",
+		});
+	});
+
+	test("coerces common leaked XML parameter scalar types", () => {
+		const content = [
+			'<invoke name="Bash">',
+			'<parameter name="command">pwd</parameter>',
+			'<parameter name="timeout">1000</parameter>',
+			'<parameter name="run_in_background">true</parameter>',
+			"</invoke>",
+		].join("\n");
+		const parsed = parseKiroStreamEvent(
+			{ eventType: "assistantResponseEvent", data: { content } },
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.toolUses?.[0].input).toEqual({
+			command: "pwd",
+			timeout: 1000,
+			run_in_background: true,
+		});
+	});
+
+	test("keeps legitimate short prose before leaked invoke blocks", () => {
+		const content = [
+			"运行测试",
+			'<invoke name="Bash">',
+			'<parameter name="command">bun test</parameter>',
+			"</invoke>",
+		].join("\n");
+		const parsed = parseKiroStreamEvent(
+			{ eventType: "assistantResponseEvent", data: { content } },
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.text).toBe("运行测试\n");
+		expect(parsed.toolUses?.[0].name).toBe("Bash");
+	});
 });
 
 describe("kiro reasoning — buildKiroReasoningContent helper", () => {

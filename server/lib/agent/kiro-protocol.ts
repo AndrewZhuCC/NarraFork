@@ -1,3 +1,4 @@
+import { generateId } from "../id";
 import type {
 	KiroChatRequest,
 	KiroHistoryAssistantMessage,
@@ -34,6 +35,15 @@ export interface KiroReasoningBlockInput {
 export interface KiroRedactedThinkingInput {
 	data: string;
 	outputIndex?: number;
+}
+
+export interface KiroStreamParseOptions {
+	/**
+	 * Some Kiro agent responses leak XML-formatted tool calls into
+	 * assistantResponseEvent.content instead of the native toolUse/toolUses fields.
+	 * Enable this only for agent chats with tools; plain generation should keep text verbatim.
+	 */
+	parseTextToolCalls?: boolean;
 }
 
 /**
@@ -519,7 +529,187 @@ function parseUsagePayload(data: Record<string, unknown>): ParsedStreamEvent["us
 	};
 }
 
-export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
+type ParsedKiroTextToolUse = NonNullable<ParsedStreamEvent["toolUses"]>[number];
+
+function readXmlAttribute(attrs: string, name: string): string | undefined {
+	const match = attrs.match(new RegExp(`\\b${name}\\s*=\\s*(["'])([\\s\\S]*?)\\1`, "i"));
+	return match ? decodeXmlEntities(match[2]) : undefined;
+}
+
+function decodeXmlEntities(value: string): string {
+	return value.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (entity, body: string) => {
+		const lower = body.toLowerCase();
+		if (lower === "amp") return "&";
+		if (lower === "lt") return "<";
+		if (lower === "gt") return ">";
+		if (lower === "quot") return '"';
+		if (lower === "apos") return "'";
+		if (lower.startsWith("#x")) {
+			const code = Number.parseInt(lower.slice(2), 16);
+			return Number.isInteger(code) && code >= 0 && code <= 0x10ffff
+				? String.fromCodePoint(code)
+				: entity;
+		}
+		if (lower.startsWith("#")) {
+			const code = Number.parseInt(lower.slice(1), 10);
+			return Number.isInteger(code) && code >= 0 && code <= 0x10ffff
+				? String.fromCodePoint(code)
+				: entity;
+		}
+		return entity;
+	});
+}
+
+const MALFORMED_INVOKE_MARKERS = new Set(["call", "count"]);
+const XML_BOOLEAN_PARAMETER_NAMES = new Set([
+	"replace_all",
+	"run_in_background",
+	"strict_serial",
+	"compress",
+	"preview",
+	"await",
+	"doInterrupt",
+	"multiSelect",
+]);
+const XML_NUMBER_PARAMETER_NAMES = new Set([
+	"timeout",
+	"limit",
+	"offset",
+	"head_limit",
+	"maxChars",
+	"max_length",
+	"pageno",
+	"duration",
+	"count",
+]);
+const XML_JSON_PARAMETER_NAMES = new Set([
+	"ids",
+	"names",
+	"paths",
+	"todos",
+	"questions",
+	"answers",
+	"annotations",
+	"metadata",
+	"headers",
+	"options",
+	"tool_uses",
+]);
+
+function stripMalformedInvokeMarker(text: string): string {
+	// Kiro can prefix leaked XML tool calls with short standalone marker lines
+	// (observed: "call" / "count"). Remove only known markers so legitimate
+	// short prose such as "运行测试" or "I will run" stays visible.
+	return text.replace(
+		/(^|\r?\n)([^\r\n]*?)(?:\r?\n[ \t]*)*$/u,
+		(match, lineBreak: string, marker: string) => {
+			const trimmed = marker.trim().toLowerCase();
+			return MALFORMED_INVOKE_MARKERS.has(trimmed) ? lineBreak : match;
+		},
+	);
+}
+
+function coerceKiroXmlParameter(paramName: string, value: string): unknown {
+	const trimmed = value.trim();
+	if (XML_BOOLEAN_PARAMETER_NAMES.has(paramName)) {
+		if (/^(true|false)$/i.test(trimmed)) return trimmed.toLowerCase() === "true";
+	}
+	if (XML_NUMBER_PARAMETER_NAMES.has(paramName)) {
+		if (/^-?(?:\d+|\d*\.\d+)$/.test(trimmed)) {
+			const parsed = Number(trimmed);
+			if (Number.isFinite(parsed)) return parsed;
+		}
+	}
+	if (
+		XML_JSON_PARAMETER_NAMES.has(paramName) &&
+		(trimmed.startsWith("[") || trimmed.startsWith("{"))
+	) {
+		try {
+			return JSON.parse(trimmed);
+		} catch {
+			// Keep the original string when the model emitted JSON-like prose.
+		}
+	}
+	return value;
+}
+
+export function parseKiroTextToolCalls(text: string): {
+	text: string;
+	toolUses: ParsedKiroTextToolUse[];
+} {
+	const invokeRe = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
+	const parameterRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
+	let cursor = 0;
+	let rewrittenText = "";
+	const toolUses: ParsedKiroTextToolUse[] = [];
+
+	for (const invokeMatch of text.matchAll(invokeRe)) {
+		const matchIndex = invokeMatch.index ?? 0;
+		const rawInvoke = invokeMatch[0];
+		const name = readXmlAttribute(invokeMatch[1] ?? "", "name");
+		if (!name) continue;
+
+		const input: Record<string, unknown> = {};
+		parameterRe.lastIndex = 0;
+		for (const parameterMatch of (invokeMatch[2] ?? "").matchAll(parameterRe)) {
+			const paramName = readXmlAttribute(parameterMatch[1] ?? "", "name");
+			if (!paramName) continue;
+			input[paramName] = coerceKiroXmlParameter(
+				paramName,
+				decodeXmlEntities(parameterMatch[2] ?? ""),
+			);
+		}
+
+		rewrittenText += stripMalformedInvokeMarker(text.slice(cursor, matchIndex));
+		toolUses.push({
+			toolUseId: `kiro_xml_${generateId(12)}`,
+			name,
+			input,
+		});
+		cursor = matchIndex + rawInvoke.length;
+	}
+
+	if (toolUses.length === 0) return { text, toolUses };
+	rewrittenText += text.slice(cursor);
+	return { text: rewrittenText, toolUses };
+}
+
+function stableJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+	if (value && typeof value === "object") {
+		const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+			a.localeCompare(b),
+		);
+		return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+	}
+	return JSON.stringify(value);
+}
+
+function isDuplicateToolUse(
+	candidate: ParsedKiroTextToolUse,
+	existing: ParsedKiroTextToolUse,
+): boolean {
+	return (
+		candidate.name === existing.name && stableJson(candidate.input) === stableJson(existing.input)
+	);
+}
+
+function appendDedupedToolUses(
+	result: ParsedStreamEvent,
+	toolUses: ParsedKiroTextToolUse[] | undefined,
+): void {
+	if (!toolUses?.length) return;
+	const next = [...(result.toolUses ?? [])];
+	for (const toolUse of toolUses) {
+		if (!next.some((item) => isDuplicateToolUse(toolUse, item))) next.push(toolUse);
+	}
+	result.toolUses = next;
+}
+
+export function parseKiroStreamEvent(
+	evt: StreamEvent,
+	options: KiroStreamParseOptions = {},
+): ParsedStreamEvent {
 	const gatewayEvent = parseGatewaySSEEvent(evt.eventType, evt.data);
 	if (gatewayEvent) return gatewayEvent;
 
@@ -528,8 +718,23 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 	if (usage) result.usage = usage;
 
 	if (evt.eventType === "assistantResponseEvent") {
+		const toolUse = evt.data.toolUse as
+			| { toolUseId: string; name: string; input: Record<string, unknown> }
+			| undefined;
+		const toolUses = evt.data.toolUses as
+			| Array<{ toolUseId: string; name: string; input: Record<string, unknown> }>
+			| undefined;
+		let parsedTextToolUses: ParsedKiroTextToolUse[] | undefined;
+
 		if (evt.data.content != null) {
-			result.text = String(evt.data.content);
+			const contentText = String(evt.data.content);
+			if (options.parseTextToolCalls) {
+				const parsedContent = parseKiroTextToolCalls(contentText);
+				result.text = parsedContent.text;
+				parsedTextToolUses = parsedContent.toolUses;
+			} else {
+				result.text = contentText;
+			}
 		}
 		if (evt.data.messageId) {
 			result.messageId = String(evt.data.messageId);
@@ -552,30 +757,28 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
 		}
 
 		// Non-streaming tool use (single)
-		const toolUse = evt.data.toolUse as
-			| { toolUseId: string; name: string; input: Record<string, unknown> }
-			| undefined;
 		if (toolUse?.toolUseId) {
-			result.toolUses = [
+			appendDedupedToolUses(result, [
 				{
 					toolUseId: toolUse.toolUseId,
 					name: toolUse.name,
 					input: toolUse.input ?? {},
 				},
-			];
+			]);
 		}
 
 		// Non-streaming tool uses (array)
-		const toolUses = evt.data.toolUses as
-			| Array<{ toolUseId: string; name: string; input: Record<string, unknown> }>
-			| undefined;
 		if (Array.isArray(toolUses) && toolUses.length > 0) {
-			result.toolUses = toolUses.map((tu) => ({
-				toolUseId: tu.toolUseId,
-				name: tu.name,
-				input: tu.input ?? {},
-			}));
+			appendDedupedToolUses(
+				result,
+				toolUses.map((tu) => ({
+					toolUseId: tu.toolUseId,
+					name: tu.name,
+					input: tu.input ?? {},
+				})),
+			);
 		}
+		appendDedupedToolUses(result, parsedTextToolUses);
 	}
 
 	// Streaming tool use chunks
@@ -683,6 +886,7 @@ export function parseKiroStreamEvent(evt: StreamEvent): ParsedStreamEvent {
  */
 export async function* parseSSEStream(
 	body: ReadableStream<Uint8Array>,
+	options: KiroStreamParseOptions = {},
 ): AsyncGenerator<ParsedStreamEvent> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
@@ -711,7 +915,7 @@ export async function* parseSSEStream(
 							eventType: currentEventType || embeddedEventType || "assistantResponseEvent",
 							data,
 						};
-						yield parseKiroStreamEvent(evt);
+						yield parseKiroStreamEvent(evt, options);
 					} catch {
 						// Malformed JSON — skip
 					}

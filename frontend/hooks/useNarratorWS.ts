@@ -373,9 +373,12 @@ export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
 	lastMessageId?: string,
+	options?: { trackRealtimeMessageVersion?: boolean },
 ) {
 	const callbacksRef = useRef(callbacks);
 	callbacksRef.current = callbacks;
+	const trackRealtimeMessageVersionRef = useRef(options?.trackRealtimeMessageVersion ?? true);
+	trackRealtimeMessageVersionRef.current = options?.trackRealtimeMessageVersion ?? true;
 	const providedLastMessageIdRef = useRef(lastMessageId);
 	const lastMessageIdRef = useRef(lastMessageId);
 	useEffect(() => {
@@ -423,7 +426,9 @@ export function useNarratorWS(
 							const msg = data.message as TreeMessage;
 							lastMessageIdRef.current = msg.id;
 							narratorWSManager.noteMessage(subscribedId, msg);
-							narratorWSManager.bumpMessageVersion(subscribedId);
+							if (trackRealtimeMessageVersionRef.current) {
+								narratorWSManager.bumpMessageVersion(subscribedId);
+							}
 						}
 						break;
 					case "user_message":
@@ -434,7 +439,9 @@ export function useNarratorWS(
 							const msg = data.message as TreeMessage;
 							lastMessageIdRef.current = msg.id;
 							narratorWSManager.noteMessage(subscribedId, msg);
-							narratorWSManager.bumpMessageVersion(subscribedId);
+							if (trackRealtimeMessageVersionRef.current) {
+								narratorWSManager.bumpMessageVersion(subscribedId);
+							}
 						}
 						break;
 					case "stream_event":
@@ -586,7 +593,9 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 							data.sideCars as SideCarRecord[] | undefined,
 						);
-						narratorWSManager.bumpMessageVersion(subscribedId);
+						if (trackRealtimeMessageVersionRef.current) {
+							narratorWSManager.bumpMessageVersion(subscribedId);
+						}
 						break;
 					case "sidecars":
 						callbacksRef.current.onSideCars?.(
@@ -873,13 +882,17 @@ export function useNarratorWS(
 					case "messages_deleted":
 						if (data.deletedMessageIds) {
 							callbacksRef.current.onMessagesDeleted?.(data.deletedMessageIds as string[]);
-							narratorWSManager.bumpMessageVersion(subscribedId);
+							if (trackRealtimeMessageVersionRef.current) {
+								narratorWSManager.bumpMessageVersion(subscribedId);
+							}
 						}
 						break;
 					case "message_updated":
 						if (data.message) {
 							callbacksRef.current.onMessageUpdated?.(data.message as TreeMessage);
-							narratorWSManager.bumpMessageVersion(subscribedId);
+							if (trackRealtimeMessageVersionRef.current) {
+								narratorWSManager.bumpMessageVersion(subscribedId);
+							}
 						}
 						break;
 					case "commits_updated":
@@ -943,7 +956,9 @@ export function useNarratorWS(
 							data.output as string,
 							data.hasError as boolean,
 						);
-						narratorWSManager.bumpMessageVersion(subscribedId);
+						if (trackRealtimeMessageVersionRef.current) {
+							narratorWSManager.bumpMessageVersion(subscribedId);
+						}
 						break;
 					case "background_task_completed":
 						callbacksRef.current.onBackgroundTaskCompleted?.(

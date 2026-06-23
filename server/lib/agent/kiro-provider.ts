@@ -92,7 +92,7 @@ export class KiroProvider implements ProviderAdapter {
 		params.onRequestStart?.();
 		for await (const evt of kiroChatRaw(request, params.signal)) {
 			rawEvents.push(evt);
-			yield parseKiroStreamEvent(evt);
+			yield parseKiroStreamEvent(evt, { parseTextToolCalls: params.tools.length > 0 });
 		}
 		params.requestDump?.setResponseEvents(rawEvents);
 	}

@@ -51,6 +51,7 @@ export type {
 	ChangelogEntry,
 	ChunkManifest,
 	ChunkManifestEntry,
+	ChunkManifestTuple,
 	ChunkRangeResult,
 	CodexCredentialEntry,
 	CodexUsageData,

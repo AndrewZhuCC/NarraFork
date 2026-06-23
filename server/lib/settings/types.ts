@@ -210,7 +210,7 @@ export type SearchChannelKind =
 	| "custom-api"
 	| "subagent";
 
-export type CustomSearchProviderProtocol = "narrafork-search-v1";
+export type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
 
 export interface SearchChannelConfig {
 	/** Stable channel ID: native, kiro:local, nug:{id}, nkp:{id}, custom:{id}, subagent. */
@@ -232,6 +232,7 @@ export interface CustomSearchProviderConfig {
 	baseUrl: string;
 	apiKey?: string;
 	headers?: Record<string, string>;
+	options?: Record<string, unknown>;
 	timeoutMs?: number;
 }
 

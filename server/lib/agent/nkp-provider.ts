@@ -157,7 +157,7 @@ export class NkpProvider implements ProviderAdapter {
 			throw new Error("NKP returned no response body");
 		}
 
-		yield* parseSSEStream(response.body);
+		yield* parseSSEStream(response.body, { parseTextToolCalls: params.tools.length > 0 });
 		if (responseTextPromise) {
 			params.requestDump?.setResponseBodyText(await responseTextPromise);
 		}

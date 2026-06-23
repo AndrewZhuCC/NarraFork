@@ -207,3 +207,76 @@
   7. WS 断线重连后 manifest 短路或增量修复。
   8. 乐观发送→服务端确认替换。
   9. iOS Safari 真机滚动 + 加载。
+
+---
+
+# 修订记录与当前分阶段计划（2026-06，权威版本）
+
+> 上方原始 Phase 0–3 部分为早期设计，部分已被后续决策取代。**本节为当前权威计划，subagent 必须以本节为准。**
+
+## 已完成（不要重做）
+
+- **Phase 0 切片**：后端 `getChunkManifest` + `getChunksByRange` 两端点；前端 feature flag（localStorage `narrafork_chunk_list`，设置页 Agent→调试区开关）；裸 chunk 列表骨架。
+- **路线 1（manifest 驱动稀疏加载）**：`useNarratorChunks` 改为 manifest 全集 + `Map<chunkId, messages>` 稀疏加载 + `ensureLoaded`；`ChunkedMessageList` 用前缀和 spacer 覆盖全集、二分定位滚动跳转、center 用 chunkId 锚定抗 prepend 漂移、哨兵+scroll 兜底。**滚动/拖拽/加载已可靠。**
+- **性能优化**：manifest 查询对 primary 叙述者跳过 JOIN（child refs 恒为 0），126ms→23ms；服务端按 `(narratorId, messageVersion)` 的 LRU(64) 缓存 manifest；payload 元组化 `[id,firstSeq,lastSeq,count]` 去掉 hash 字段，134KB→~50KB。off-thread 评估后降级（25ms 一次性，不上 worker）。
+
+## 终局目标
+
+chunk 模式**完全替代** Query 分页模式，最终删除 `useInfiniteQuery` 分页（`fetchNextPage`/`fetchPreviousPage`）和 `BroadMessageList` 路径。chunk 数据层（`useNarratorChunks`）成为消息的**唯一真相源**，自己接 WS，Query 缓存完全不参与消息存储。
+
+## 核心架构决策（彻底派）
+
+- chunk 数据层自管 WS：把 `useNarratorPanelWS` 的全部消息更新逻辑在 `Map<chunkId, TreeMessage[]>` 上重新实现。
+- **尾部 chunk 常驻**（不卸载），作为流式/新消息/工具完成的落点。
+- 每个 chunk 的 `messages[]` 按 seq 升序；跨 chunk 按 seq 有序。
+- **结构性变更**（中段插入 compact/ask_in_passing、删除、segment-hide、compact_done）→ 视为 **structural dirty**：刷新 manifest（`?since=messageVersion`）+ 重取受影响/中心 chunk，而非朴素 in-place 改（会让 seq 与 manifest 失同步）。`full_reload` 为硬兜底。
+- WS 消息更新规格见“WS message-data mutation spec”（已由 subagent 提取，下方“规格要点”浓缩；完整逻辑须对照 `useNarratorPanelWS.ts` 行号）。
+
+## 规格要点（WS → chunk Map 的映射契约）
+
+数据模型对应：旧 `pages[0].messages` 尾部 ≈ 新“尾部 chunk 的 messages 数组”。“insert by seq into pages[0]” → “insert by seq into 拥有该 seq 的 chunk；超出末 chunk lastSeq 的全新尾部 seq 则扩展尾部 chunk + manifest 末项 lastSeq/count”。
+
+可**原样复用**（纯数组/树操作）：`insertTopLevelMessageBySeq`、`preserveLiveSideCars`、`appendSideCarsToLatestAssistant`、`preserveCompleteStreamedOutput`、`appendStreamingTextPreview`、`buildStreamingMsg`、`upsertStreamingToolBlock`，以及 message-tree-utils 的 DFS 形式 `mergeToolCallFieldsInTree`/`updateToolCallInTree`/`findMsgByToolUseIdInTree`/`insertChildIntoMessages`/`removeStreamingChildInMessages`/`upsertStreamingChildInMessages`。
+
+需**适配**（`{pages}`+`MessageIndex` 绑定）：`insertChildIntoCache`/`removeSubagentStreamingChunk`/`upsertSubagentStreamingChunk`/`mergeFieldsByIndex`/`updateToolCallByIndex`/`mergeAtPath` — 最廉价适配：把目标 chunk 包成 `{pages:[{messages: chunkArr}]}` 调用再解包；或直接用其 DFS 兜底形式在 chunk 数组上跑。需建 `toolUseId → chunkId` 索引扫描已加载 chunk。
+
+**丢弃**：`evictOldestPages`（改 chunk-LRU，只卸 DOM，超 LRU 才丢数据）；`getRenderableMessageOrder`/`hasRenderableMessageOrderAnomaly`（chunk 原生 seq 有序）。
+
+保留的非消息副作用：未读计数（§2C 非贴底且 assistant 才 +1）、catch-up 后贴底自动滚、streamingVersion/topLevelChunksVersion 与 synthetic-strip 同批 flush、messageVersion 用 manifest/range 的版本播种 `narratorWSManager.updateMessageVersion`。
+
+## 分阶段执行（每阶段独立 commit + flag 实测 + 可回退）
+
+### 阶段 1（地基）：chunk 数据层尾部活跃 + WS 接入骨架 + 新消息 + 流式
+- 尾部 chunk 常驻不卸载。
+- WS 订阅 + catch-up：subscribe(fullSubscribe)、catch_up/sync_ok/full_reload、lastMessageId 锚点（=尾部 chunk 末消息深层末子，跳过 synthetic；around/jumped 态抑制）。
+- `scheduleCacheUpdate` 的 chunk 版：批量 updater 折叠后 `setState(loaded)`（新 Map + 仅改动 chunk 的新数组），不写 query cache。
+- 实现：新消息追加（§2C 决策树：synthetic-strip、id-dedupe via preserveLiveSideCars、乐观替换 3 规则、insertTopLevelMessageBySeq、unread、needsStreamingVersionBump 同批 flush）；user_message（§3 三匹配规则）；流式注入尾部 render-chunk（§6：streamingBlocksRef + topLevelStreamingChunkRef + topLevelStreamingChunks memo + buildStreamingMsg + STREAMING_CHUNKS_MSG_ID 落在尾 chunk）。
+- **代码组织**：WS 逻辑拆独立文件（如 `useNarratorChunksWS.ts` 或 `narrator-chunks-ws.ts`），`useNarratorChunks` 调用之，保持可维护。
+- **验证门**：活跃叙述者实时显示新消息 + 流式文本/推理输出；发送消息乐观显示并被服务端确认替换。
+
+### 阶段 2（工具与子代理）：tool_completed / tool_use_chunk / 子代理树 / reflection
+- 建 `toolUseId → chunkId` 索引；tool_completed（updateToolCallByIndex + mergeFieldsByIndex + preserveCompleteStreamedOutput）；tool_use_chunk（subagent→upsertSubagentStreamingChunk，top-level→topLevelStreamingChunkRef）；子代理消息（insertChildIntoCache/removeSubagentStreamingChunk）；各 reflection（danger/plan/goal/question）+ permission_request/resolved + tool_started/long_running/output/timeout + subagent_started/conclusion + background_task_*。
+- **验证门**：工具卡实时更新状态/输出/时长，子代理消息树正确，权限审批 UI 正常。
+
+### 阶段 3（结构变更）：编辑/删除/compact → chunks_dirty 失效重载
+- `message_updated`（按 id 合并保留 children）；`messages_deleted`（结构 dirty）；`segment_compact_hide`；`compact_done`。
+- 实现 manifest diff 增量：`getChunkManifest?since=version` → unchanged 短路 / 重取脏 chunk + 中心带；full_reload 硬兜底（重置 manifest + 重取尾部）。
+- **验证门**：编辑/删除/压缩后 chunk 正确刷新，seq 不错乱，未涉及 chunk 不动。
+
+### 阶段 4（交互回调 + 滚动 + 多选）
+- 透传 ~20 回调（fork/compactBefore/clearContextBefore/manualSummarize/deleteBlock/rollback/editAndRegenerate/editAssistant/restoreAssistant/onViewSubagentSession/onAskInPassing/resolvePerm）+ showTokenUsage/highlightedId/expandedToolUseId/pruneBoundaryMessageId/pruneDividerLabel/lastUserMessageId 到 renderTreeMessages（注意 enableBlurIn 传 false 与旧路径一致）。
+- 跟随底部（startFollowing/stopFollowing 等价）、isAtBottom、未读计数、滚到底按钮；深链 highlightMessageId（around 初始定位）、scrollToMessageTarget 等价、ScrollbarUserMarkers、搜索/todos 跳转。
+- 多选/批量：暴露稳定 contentRef；批量操作改走 chunk 数据层；处理虚拟化下跨未挂载 chunk 的选择。
+- **验证门**：逐项对齐旧列表交互。
+
+### 阶段 5（收尾）：删除 Query 分页模式 + 旧 BroadMessageList 路径；flag 默认开启后移除。
+
+## 验证手段（每阶段）
+- 静态：`bunx @biomejs/biome check .`、`bunx tsgo --noEmit`（白名单，无需批准）。
+- flag 开启手测对应阶段验证门场景。
+- 关键纯函数加 `*.test.ts`（分段打包、seq→chunk 映射、manifest diff）。
+
+## 给 subagent 的强制要求
+- 动手前必须先 Read 本文件（`docs/plans/chunk-virtualized-message-list.md`），以“修订记录与当前分阶段计划”节为准。
+- 严守 CLAUDE.md 主线程性能红线、禁改 `drizzle/`、禁删数据库、i18n 双语同步。
+- 不要重做“已完成”清单中的工作。
