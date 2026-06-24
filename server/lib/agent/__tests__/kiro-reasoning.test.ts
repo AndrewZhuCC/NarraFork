@@ -75,9 +75,10 @@ describe("kiro reasoning — receive side (parseKiroStreamEvent)", () => {
 		});
 	});
 
-	test("removes short marker text on the line immediately before leaked invoke blocks", () => {
+	test("removes short marker text after blank-line boundary before leaked invoke blocks", () => {
 		const content = [
 			"准备执行工具。",
+			"",
 			"call",
 			'<invoke name="Bash">',
 			'<parameter name="command">pwd</parameter>',
@@ -89,10 +90,28 @@ describe("kiro reasoning — receive side (parseKiroStreamEvent)", () => {
 			{ parseTextToolCalls: true },
 		);
 
-		expect(parsed.text).toBe("准备执行工具。\n");
+		expect(parsed.text).toBe("准备执行工具。\n\n");
 		expect(parsed.text).not.toContain("call");
 		expect(parsed.toolUses?.[0].name).toBe("Bash");
 		expect(parsed.toolUses?.[0].input).toEqual({ command: "pwd" });
+	});
+
+	test("keeps non-blank-line short text before leaked invoke blocks", () => {
+		const content = [
+			"准备执行工具。",
+			"ok",
+			'<invoke name="Bash">',
+			'<parameter name="command">pwd</parameter>',
+			"</invoke>",
+		].join("\n");
+
+		const parsed = parseKiroStreamEvent(
+			{ eventType: "assistantResponseEvent", data: { content } },
+			{ parseTextToolCalls: true },
+		);
+
+		expect(parsed.text).toBe("准备执行工具。\nok\n");
+		expect(parsed.toolUses?.[0].name).toBe("Bash");
 	});
 
 	test("keeps leaked XML invoke blocks as text for plain generation parsing", () => {

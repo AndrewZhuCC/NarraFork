@@ -316,21 +316,43 @@ export function isKiroAvailable(): boolean {
 }
 
 /**
+ * Whether the built-in Kiro provider is disabled by the user.
+ *
+ * The Kiro plugin can be loaded (credentials present on disk) while the user
+ * has explicitly turned off the built-in Kiro provider via Settings
+ * (`agent.disabledProviders` contains "kiro") or the
+ * `NARRAFORK_DISABLE_KIRO_PROVIDER` environment variable. In both cases the
+ * Kiro-backed channels (chat AND MCP search) must be treated as off.
+ */
+function isKiroProviderDisabled(): boolean {
+	if (process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1") return true;
+	return (settings.agent?.disabledProviders ?? []).includes("kiro");
+}
+
+/**
  * Stricter availability check for the Kiro MCP search channel.
  *
  * `isKiroAvailable()` only reports whether the plugin is loaded and initialized.
- * That is not enough for search routing: if every credential is disabled
- * (quota_exhausted / too_many_failures / account_suspended / manual), the
- * upstream MCP call will hang until the 60s search timeout instead of failing
- * fast, which makes the whole serial channel chain look like it takes ~1 minute
- * before falling back to the next channel (e.g. NUG/NKP).
+ * That is not enough for search routing for two reasons:
  *
- * Returns true only when the plugin is available AND the manager reports at
- * least one usable credential. When the snapshot is unavailable we fall back to
- * the plugin-level availability so behavior is unchanged for plugin builds that
- * do not expose a snapshot.
+ * 1. The user may have disabled the built-in Kiro provider (Settings →
+ *    disabledProviders, or NARRAFORK_DISABLE_KIRO_PROVIDER=1) while leaving
+ *    credentials.json on disk. The plugin still initializes, so without this
+ *    guard the Kiro MCP search channel would keep being attempted even though
+ *    the provider is off.
+ * 2. Even when enabled, if every credential is disabled (quota_exhausted /
+ *    too_many_failures / account_suspended / manual), the upstream MCP call
+ *    will hang until the 60s search timeout instead of failing fast, which
+ *    makes the whole serial channel chain look like it takes ~1 minute before
+ *    falling back to the next channel (e.g. NUG/NKP).
+ *
+ * Returns true only when the plugin is available, the provider is not disabled,
+ * AND the manager reports at least one usable credential. When the snapshot is
+ * unavailable we fall back to the plugin-level availability so behavior is
+ * unchanged for plugin builds that do not expose a snapshot.
  */
 export function isKiroSearchUsable(): boolean {
+	if (isKiroProviderDisabled()) return false;
 	if (!isKiroAvailable()) return false;
 	const snapshot = kiroSnapshot();
 	if (!snapshot) return true;

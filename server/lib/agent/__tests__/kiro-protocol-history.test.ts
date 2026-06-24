@@ -45,6 +45,19 @@ function makeAssistantMessage(overrides: Partial<DbMessage> = {}): DbMessage {
 	};
 }
 
+function makeSysMessage(overrides: Partial<DbMessage> = {}): DbMessage {
+	return {
+		id: "sys-1",
+		role: "sys",
+		contentJson: [],
+		contentText: null,
+		parentToolUseId: null,
+		messageUuid: null,
+		toolCalls: [],
+		...overrides,
+	};
+}
+
 function streamFromText(text: string): ReadableStream<Uint8Array> {
 	return new ReadableStream({
 		start(controller) {
@@ -98,6 +111,31 @@ describe("buildKiroHistory", () => {
 		expect(historyJson).toContain("Inspect this screenshot");
 		expect(historyJson).toContain(SAMPLE_PNG_BASE64);
 		expect(historyJson).toContain('"images"');
+	});
+
+	test("moves trailing sys goal continuation into trailing user text", async () => {
+		const dbMessages: DbMessage[] = [
+			makeUserMessage({ id: "user-start", contentText: "start" }),
+			makeAssistantMessage({ id: "assistant-start", contentText: "ready" }),
+			makeSysMessage({
+				id: "sys-goal",
+				contentJson: [
+					{
+						type: "text",
+						text: "Continue working toward the active NarraFork goal.",
+					},
+					{ type: "goal_continuation", goalId: "goal-1", objective: "finish it" },
+				],
+				contentText: "Continue working toward the active NarraFork goal.",
+			}),
+		];
+
+		const result = await buildKiroHistory(dbMessages, "kiro:claude-sonnet-4.6");
+		const historyJson = JSON.stringify(result.history);
+
+		expect(result.trailingUserText).toBe("Continue working toward the active NarraFork goal.");
+		expect(historyJson).not.toContain("Continue working toward the active NarraFork goal.");
+		expect(result.history.at(-1)).toEqual({ assistantResponseMessage: { content: "ready" } });
 	});
 });
 

@@ -23,6 +23,7 @@ import {
 	buildKiroReasoningContent,
 	buildKiroRequest,
 	extractImageFileName,
+	normalizeKiroChatRequest,
 	parseSSEStream,
 } from "./kiro-protocol";
 import {
@@ -490,7 +491,9 @@ export class NugProvider implements ProviderAdapter {
 		params: ChatParams,
 		meta: ResolvedNugModelMeta,
 	): AsyncGenerator<ParsedStreamEvent> {
-		const request = buildKiroRequest({ ...params, model: meta.bareModel });
+		const request = normalizeKiroChatRequest(
+			buildKiroRequest({ ...params, model: meta.bareModel }),
+		);
 		prepareNkpRequest(request);
 
 		const body = { model: meta.routedModel, ...request };

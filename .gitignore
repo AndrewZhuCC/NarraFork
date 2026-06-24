@@ -13,6 +13,7 @@ server/generated/
 
 analyze/
 analyze2/
+.perf-analysis/
 .narrafork/
 .idea/
 

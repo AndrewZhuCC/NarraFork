@@ -23,7 +23,8 @@ import type { ApiRequestDumpCollector } from "./request-dump";
 import type { AgentSideCar, AgentToolUse } from "./types";
 
 function isKiroProviderDisabled(): boolean {
-	return process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1";
+	if (process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1") return true;
+	return (settings.agent?.disabledProviders ?? []).includes("kiro");
 }
 
 // === Web search action types (matches OpenAI Responses API web_search_call action) ===
@@ -485,8 +486,7 @@ export function resolveProviderAndModel(
 	if (requestedProvider === "kiro") {
 		if (isKiroProviderDisabled()) {
 			throw new Error(
-				`Kiro provider is disabled (NARRAFORK_DISABLE_KIRO_PROVIDER=1). ` +
-					`Please choose a different model or remove the environment variable.`,
+				"Kiro provider is disabled. Please choose a different model or enable Kiro in settings.",
 			);
 		}
 

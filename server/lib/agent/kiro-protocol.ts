@@ -560,6 +560,7 @@ function decodeXmlEntities(value: string): string {
 	});
 }
 
+const MAX_MALFORMED_INVOKE_MARKER_LENGTH = 10;
 const MALFORMED_INVOKE_MARKERS = new Set(["call", "count"]);
 const XML_BOOLEAN_PARAMETER_NAMES = new Set([
 	"replace_all",
@@ -597,14 +598,23 @@ const XML_JSON_PARAMETER_NAMES = new Set([
 ]);
 
 function stripMalformedInvokeMarker(text: string): string {
-	// Kiro can prefix leaked XML tool calls with short standalone marker lines
-	// (observed: "call" / "count"). Remove only known markers so legitimate
-	// short prose such as "运行测试" or "I will run" stays visible.
+	// Kiro can prefix leaked XML tool calls with a short standalone marker line
+	// (for example "call" or "count"). The observed boundary is:
+	//   normal text + "\n\n" + short marker + "\n" + "<invoke"
+	// Keep the blank-line separator and remove only the short marker line.
 	return text.replace(
-		/(^|\r?\n)([^\r\n]*?)(?:\r?\n[ \t]*)*$/u,
-		(match, lineBreak: string, marker: string) => {
-			const trimmed = marker.trim().toLowerCase();
-			return MALFORMED_INVOKE_MARKERS.has(trimmed) ? lineBreak : match;
+		/(\r?\n[ \t]*\r?\n[ \t]*)([^\r\n]*?)(?:\r?\n[ \t]*)*$/u,
+		(match, blankSeparator: string, marker: string) => {
+			const trimmed = marker.trim();
+			const normalized = trimmed.toLowerCase();
+			const isKnownMarker = MALFORMED_INVOKE_MARKERS.has(normalized);
+			if (
+				trimmed.length === 0 ||
+				(trimmed.length > MAX_MALFORMED_INVOKE_MARKER_LENGTH && !isKnownMarker)
+			) {
+				return match;
+			}
+			return blankSeparator;
 		},
 	);
 }
@@ -929,6 +939,18 @@ export async function* parseSSEStream(
 	}
 }
 
+function dbMessageText(msg: DbMessage): string {
+	const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const textParts = content
+		.filter((b): b is { type: string; text: string } => {
+			if (!b || typeof b !== "object") return false;
+			const block = b as { type?: unknown; text?: unknown };
+			return block.type === "text" && typeof block.text === "string";
+		})
+		.map((b) => b.text);
+	return textParts.join("\n") || msg.contentText || "";
+}
+
 export async function buildKiroHistory(
 	dbMessages: DbMessage[],
 	model: string,
@@ -945,6 +967,17 @@ export async function buildKiroHistory(
 	const topLevel = dbMessages.filter(
 		(m) => !m.parentToolUseId && (m.role === "user" || m.role === "assistant" || m.role === "sys"),
 	);
+
+	// A trailing sys message is fresh model-visible context (for example goal continuation).
+	// Kiro history requires user→assistant pairs, so keeping it in history would make us
+	// append a synthetic assistant "OK" below and the real currentMessage would be empty.
+	// Move it into trailingUserText so the caller sends it as the current user content.
+	const trailingSysMessages: DbMessage[] = [];
+	while (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "sys") {
+		const msg = topLevel.pop();
+		if (msg) trailingSysMessages.unshift(msg);
+	}
+	const trailingSysText = trailingSysMessages.map(dbMessageText).filter(Boolean).join("\n\n");
 
 	// Drop the last user message — it's the current message being sent via currentMessage
 	if (topLevel.length > 0 && topLevel[topLevel.length - 1].role === "user") {
@@ -1174,7 +1207,7 @@ export async function buildKiroHistory(
 	return {
 		history,
 		trailingToolResults: pendingToolResults,
-		trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
+		trailingUserText: appendSideCarsForApi(trailingSysText, pendingUserSideCars) || undefined,
 	};
 }
 
