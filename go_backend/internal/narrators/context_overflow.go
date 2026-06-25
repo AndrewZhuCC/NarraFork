@@ -94,6 +94,23 @@ func resetTransientRetries(narratorID string) {
 	transientRetryMu.Unlock()
 }
 
+// resetRunRetryCounters clears BOTH the context-overflow and transient retry
+// counters for a narrator. It must run from every terminal finalizer that ends
+// the whole run (success / error / timeout / cancelled / payment / silent
+// disconnect exhausted), mirroring TS where the loop-local
+// contextOverflowRetries/transientRetries counters simply disappear once the
+// session loop exits. Without this, a run that ends in a non-success terminal
+// state would leave a stale per-narrator count behind: because the maps are
+// keyed by the (persistent) narrator id, the NEXT run would resume counting from
+// that residual value and exhaust its overflow/transient retries early, and the
+// map entries would never be released. The non-terminal retry paths
+// (scheduleContextOverflowRetry / handleSilentDisconnectRetry) intentionally do
+// NOT reset, so the count accumulates across the inner retry loop as intended.
+func resetRunRetryCounters(narratorID string) {
+	resetContextOverflowRetries(narratorID)
+	resetTransientRetries(narratorID)
+}
+
 type contextOverflowRef struct {
 	MessageID string
 	Seq       int

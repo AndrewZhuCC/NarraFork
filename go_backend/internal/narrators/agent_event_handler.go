@@ -2014,14 +2014,11 @@ func (s *Service) broadcastModelSettingsApplied(narratorID string, event agentba
 
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
-	// A clean (non-overflow) completion resets the per-narrator context-overflow
-	// attempt counter, mirroring the TS loop resetting its local
-	// `contextOverflowRetries` to 0 once a turn completes without overflow so a
-	// future independent overflow starts counting from zero again.
-	resetContextOverflowRetries(state.narratorID)
-	// Likewise reset the transient (silent-disconnect) retry counter on a clean
-	// completion, mirroring TS `transientRetries = 0` (narrator-session.ts:2044).
-	resetTransientRetries(state.narratorID)
+	// A clean (non-overflow) completion resets the per-narrator retry counters,
+	// mirroring the TS loop resetting its local `contextOverflowRetries` /
+	// `transientRetries` to 0 once a turn completes cleanly so a future
+	// independent overflow/disconnect starts counting from zero again.
+	resetRunRetryCounters(state.narratorID)
 	if draftID := strings.TrimSpace(state.draftID()); draftID != "" {
 		msg, err := s.messageByID(ctx, state.narratorID, draftID)
 		if err == nil {
@@ -2095,6 +2092,9 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunState, message string) error {
 	state.completed = true
 	state.errored = true
+	// Terminal timeout ends the whole run: clear the per-narrator overflow/transient
+	// retry counters so the next run does not inherit a stale count.
+	resetRunRetryCounters(state.narratorID)
 	if strings.TrimSpace(message) == "" {
 		message = "Provider did not produce a response before the first-token timeout"
 	}
@@ -2155,6 +2155,11 @@ func (s *Service) prepareSilentDisconnectRetry(ctx context.Context, state *agent
 func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	state.errored = true
+	// Terminal silent disconnect (transient retries exhausted) ends the whole run:
+	// clear the per-narrator overflow/transient retry counters so the next run does
+	// not inherit a stale count. The caller (runBasicAgent) also resets before this
+	// for clarity, but doing it here keeps the finalizer self-contained.
+	resetRunRetryCounters(state.narratorID)
 	message := "Provider stream disconnected before completion"
 	// Convert any in-flight tool calls (recorded as running when their tool_call
 	// event streamed, but never executed because the stream cut off) into explicit
@@ -2263,6 +2268,10 @@ func orphanedToolOutputForError(locale string) string {
 func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	state.errored = true
+	// Terminal cancellation ends the whole run: clear the per-narrator
+	// overflow/transient retry counters so the next run does not inherit a stale
+	// count.
+	resetRunRetryCounters(state.narratorID)
 	message := "Cancelled"
 	// Convert in-flight tool calls into explicit interrupted failures before
 	// finalizing the narrator status, mirroring the TS interrupt cleanup
@@ -2300,6 +2309,9 @@ func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunSt
 func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState, message string) error {
 	state.completed = true
 	state.errored = true
+	// Terminal error ends the whole run: clear the per-narrator overflow/transient
+	// retry counters so the next run does not inherit a stale count.
+	resetRunRetryCounters(state.narratorID)
 	if strings.TrimSpace(message) == "" {
 		message = "agent run failed"
 	}
@@ -2359,6 +2371,10 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 func (s *Service) finishAgentRunPaymentRequired(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
 	state.completed = true
 	state.errored = true
+	// Terminal payment_required ends the whole run: clear the per-narrator
+	// overflow/transient retry counters so the next run does not inherit a stale
+	// count.
+	resetRunRetryCounters(state.narratorID)
 	// Fail any in-flight tool calls so they do not stay stuck "running" after the
 	// run finalizes on payment_required. TS routes payment_required through the
 	// same finalizeOrCleanupPartialMessage path as the error/silent-disconnect

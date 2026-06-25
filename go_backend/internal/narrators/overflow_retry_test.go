@@ -126,6 +126,64 @@ func TestContextOverflowRetriesResetOnSuccess(t *testing.T) {
 	}
 }
 
+// TestRunRetryCountersResetOnTerminalFinalizers verifies that every terminal
+// finalizer that ends the whole run clears BOTH the context-overflow and the
+// transient retry counters, so a subsequent run for the same (persistent)
+// narrator id does not inherit a stale count and exhaust its retries early.
+// Before this fix only finishAgentRunSuccess reset the counters, so a run that
+// ended in error/timeout/cancelled/payment leaked its counts into the next run.
+func TestRunRetryCountersResetOnTerminalFinalizers(t *testing.T) {
+	cases := []struct {
+		name     string
+		finalize func(service *Service, ctx context.Context, state *agentRunState) error
+	}{
+		{"error", func(service *Service, ctx context.Context, state *agentRunState) error {
+			return service.finishAgentRunError(ctx, state, "boom")
+		}},
+		{"timeout", func(service *Service, ctx context.Context, state *agentRunState) error {
+			return service.finishAgentRunTimeout(ctx, state, "slow")
+		}},
+		{"cancelled", func(service *Service, ctx context.Context, state *agentRunState) error {
+			return service.finishAgentRunCancelled(ctx, state)
+		}},
+		{"payment_required", func(service *Service, ctx context.Context, state *agentRunState) error {
+			return service.finishAgentRunPaymentRequired(ctx, state, agentbasic.AgentEvent{Type: "payment_required"})
+		}},
+		{"silent_disconnect", func(service *Service, ctx context.Context, state *agentRunState) error {
+			return service.finishAgentRunSilentDisconnect(ctx, state)
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sqlDB := openNarratorHandlerTestDB(t)
+			defer sqlDB.Close()
+			service := &Service{DB: sqlDB}
+			ctx := context.Background()
+			narratorID := insertNarratorHandlerTestRow(t, sqlDB)
+			defer resetRunRetryCounters(narratorID)
+
+			// Simulate a run that consumed both overflow and transient retries.
+			incrementContextOverflowRetries(narratorID)
+			incrementTransientRetries(narratorID)
+
+			state := &agentRunState{narratorID: narratorID, narrator: mustGetNarrator(t, service, narratorID)}
+			if err := tc.finalize(service, ctx, state); err != nil {
+				t.Fatalf("%s finalizer: %v", tc.name, err)
+			}
+
+			// After a terminal finalize, both counters must restart from zero, i.e.
+			// the next increment returns 1 (proving the stale count was cleared).
+			if got := incrementContextOverflowRetries(narratorID); got != 1 {
+				t.Fatalf("%s: overflow counter not reset, next increment = %d, want 1", tc.name, got)
+			}
+			if got := incrementTransientRetries(narratorID); got != 1 {
+				t.Fatalf("%s: transient counter not reset, next increment = %d, want 1", tc.name, got)
+			}
+		})
+	}
+}
+
 func mustGetNarrator(t *testing.T, service *Service, narratorID string) Narrator {
 	t.Helper()
 	narrator, err := service.Get(context.Background(), narratorID)
