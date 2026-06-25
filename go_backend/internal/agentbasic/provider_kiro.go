@@ -212,14 +212,21 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 	if !isSSEContentType(res.Header) {
 		return errors.New("kiro provider returned non-SSE response")
 	}
-	completed := false
+	// The Kiro/CodeWhisperer SSE protocol signals completion by CLOSING the
+	// stream — it does not reliably emit a [DONE]/message_stop/stopReason marker
+	// on every turn. TS kiro-protocol.ts reads until the stream ends and treats a
+	// clean close as a successful completion (it never emits silentDisconnect for
+	// Kiro). Mirror that here: a normal readSSE return (err == nil) is success.
+	// Only a genuine transport error (readSSE returns err, e.g. the connection
+	// dropped mid-event) is surfaced as an error. Emitting silent_disconnect on a
+	// normal close made EVERY Kiro turn fail, because the loop's errTerminalEvent
+	// path aborted the run before the accumulated text/tool turn could complete.
 	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
 		if data == "" {
 			return nil
 		}
 		if data == "[DONE]" {
-			completed = true
 			return nil
 		}
 		var payload map[string]any
@@ -237,17 +244,11 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 			eventType = "assistantResponseEvent"
 		}
 		parsed := parseKiroEvent(eventType, payload, len(params.Tools) > 0)
-		if parsed.StopReason != "" || eventType == "message_stop" || eventType == "response.completed" || eventType == "done" || eventType == "complete" {
-			completed = true
-		}
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: parsed})
 		return nil
 	})
 	if err != nil {
 		return err
-	}
-	if !completed {
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{SilentDisconnect: true}})
 	}
 	return nil
 }

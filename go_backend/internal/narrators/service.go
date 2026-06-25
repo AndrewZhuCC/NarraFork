@@ -2986,13 +2986,25 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			return run, nil
 		}
 		if shouldRunDangerReflectionBeforeExecution(s.Settings, narrator, permission, execCwd, call) {
+			// Classify once so the started/resolved broadcasts carry the same danger
+			// payload the frontend renders (requestId + danger), mirroring the TS
+			// danger_reflection_started/resolved contract (narrator-ws-types.ts:15-30).
+			// requestId mirrors TS where the pending reflection row id == the tool-call
+			// id, which the frontend ToolCallCard take-over button keys on.
+			reflectionRequestID := call.ID
+			dangerPayload := dangerReflectionInfoPayload(s.dangerReflectionInfoForCall(execCwd, call), true)
+			// Durably mark the running tool-call row as reflecting BEFORE the (slow,
+			// synchronous) reflection runs, so the state survives any refetch/catch-up
+			// even if the live started frame races ahead of tool_started.
+			s.persistDangerReflectionStatus(execCtx, narratorID, call.ID, "running", "", dangerPayload)
 			if s.Hub != nil {
-				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_started", "narratorId": narratorID, "toolUseId": call.ID, "toolName": call.Function.Name})
+				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_started", "narratorId": narratorID, "requestId": reflectionRequestID, "toolUseId": call.ID, "toolName": call.Function.Name, "danger": dangerPayload})
 			}
 			decision, err := s.runDangerReflection(execCtx, narratorID, narrator, execCwd, call, history)
 			if err != nil {
+				s.persistDangerReflectionStatus(execCtx, narratorID, call.ID, "aborted", err.Error(), dangerPayload)
 				if s.Hub != nil {
-					s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "toolUseId": call.ID, "decision": "error", "reason": err.Error()})
+					s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "requestId": reflectionRequestID, "toolUseId": call.ID, "decision": "error", "reason": err.Error()})
 				}
 				run.Status = "error"
 				run.Output = "Danger reflection failed: " + err.Error()
@@ -3005,7 +3017,8 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 					resolvedDecision = "deny"
 					resolvedReason = firstNonEmptyString(decision.Feedback, "Danger reflection rejected this tool call.")
 				}
-				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "toolUseId": call.ID, "decision": resolvedDecision, "reason": resolvedReason})
+				s.persistDangerReflectionStatus(execCtx, narratorID, call.ID, map[bool]string{true: "cancelled", false: "confirmed"}[decision.Action == "cancel"], resolvedReason, dangerPayload)
+				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "requestId": reflectionRequestID, "toolUseId": call.ID, "decision": resolvedDecision, "reason": resolvedReason})
 			}
 			if decision.Action == "cancel" {
 				run.Status = "denied"
@@ -7857,6 +7870,44 @@ func questionReflectionSuggestions(status, requestID, reason string) []map[strin
 	return []map[string]any{suggestion}
 }
 
+// dangerReflectionSuggestions builds the permissionSuggestions entry the frontend
+// ToolCallCard renders for a danger reflection, mirroring questionReflectionSuggestions.
+func dangerReflectionSuggestions(status, requestID, reason string, danger map[string]any) []map[string]any {
+	suggestion := map[string]any{"type": "danger_reflection", "status": status, "requestId": requestID}
+	if danger != nil {
+		suggestion["danger"] = danger
+	}
+	if status != "running" {
+		suggestion["resolvedAt"] = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if strings.TrimSpace(reason) != "" {
+		suggestion["reason"] = strings.TrimSpace(reason)
+	}
+	return []map[string]any{suggestion}
+}
+
+// persistDangerReflectionStatus durably records the danger reflection state onto
+// the running tool-call row (keyed by narrator + tool_use_id), mirroring how
+// markQuestionReflectionStatus persists question reflections. Without this, the
+// danger reflection state lived only in the live WS broadcast: if the
+// danger_reflection_started frame raced ahead of the tool_started frame (the
+// reflection is broadcast directly from the tool-executor goroutine while
+// tool_started is routed through the buffered agent-event channel), or the client
+// reconnected/refetched mid-reflection, the reflecting state was lost from the UI
+// and only reappeared once another event (e.g. an interrupt) forced a refetch.
+// Persisting permission_suggestions makes the reflecting state survive any
+// catch-up/refetch built from the DB.
+func (s *Service) persistDangerReflectionStatus(ctx context.Context, narratorID, toolUseID, status, reason string, danger map[string]any) {
+	if s == nil || s.DB == nil {
+		return
+	}
+	suggestionsJSON, err := json.Marshal(dangerReflectionSuggestions(status, toolUseID, reason, danger))
+	if err != nil {
+		return
+	}
+	_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET permission_suggestions = ?, permission_decision_reason = COALESCE(?, permission_decision_reason) WHERE narrator_id = ? AND tool_use_id = ?`, string(suggestionsJSON), nullableTrimmedString(reason), narratorID, toolUseID)
+}
+
 func (s *Service) markQuestionReflectionStatus(ctx context.Context, narratorID, requestID, toolUseID, status, reason string, input any) {
 	suggestionsJSON, _ := json.Marshal(questionReflectionSuggestions(status, requestID, reason))
 	_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET permission_suggestions = ?, permission_decision_reason = COALESCE(?, permission_decision_reason) WHERE id = ?`, string(suggestionsJSON), nullableTrimmedString(reason), requestID)
@@ -8368,7 +8419,7 @@ func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, g
 	}
 	locale := s.toolLocale(ctx, narratorID)
 	prompt := goalCompletionReflectionPrompt(requestID, inputJSON, activeGoalJSON, goalsJSON, formatGoalReflectionHistory(history, 16000), evidence, reflection, locale)
-	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"GoalCompleteConfirm": true, "GoalCompleteRevise": true})
+	return s.runReflectionWithHistory(ctx, narratorID, history, prompt, map[string]bool{"GoalCompleteConfirm": true, "GoalCompleteRevise": true})
 }
 
 // goalCompletionReflectionPrompt mirrors the TS prompts.goalCompletionReflection
@@ -8561,6 +8612,36 @@ func danger(summary string, consequences, saferAlternatives, details []string, s
 		SaferAlternatives: saferAlternatives,
 		Details:           details,
 	}
+}
+
+// dangerReflectionInfoPayload serializes a dangerReflectionInfo into the JSON
+// shape the frontend expects on the danger_reflection_started/stopped events
+// (the `danger` field). It mirrors the TS DangerInfo object so ToolCallCard can
+// render danger.summary/severity. When the call could not be structurally
+// classified (ok == false), it returns nil so the frontend falls back to the
+// permissionDecisionReason text.
+func dangerReflectionInfoPayload(info dangerReflectionInfo, ok bool) map[string]any {
+	if !ok {
+		return nil
+	}
+	severity := string(info.Severity)
+	if severity == "" {
+		severity = string(dangerSeverityMedium)
+	}
+	payload := map[string]any{
+		"severity": severity,
+		"summary":  info.Summary,
+	}
+	if len(info.Consequences) > 0 {
+		payload["consequences"] = info.Consequences
+	}
+	if len(info.SaferAlternatives) > 0 {
+		payload["saferAlternatives"] = info.SaferAlternatives
+	}
+	if len(info.Details) > 0 {
+		payload["details"] = info.Details
+	}
+	return payload
 }
 
 func normalizeDangerReflectionLevel(value any, legacyEnabled bool) dangerReflectionLevel {
@@ -9134,26 +9215,34 @@ func (s *Service) runDangerReflection(ctx context.Context, narratorID string, na
 	if level == dangerReflectionOff {
 		level = dangerReflectionStandard
 	}
-	info, ok := classifyDangerReflectionToolCall(cwd, call, dangerSkipReadOnlyConfirmations(s.Settings))
-	if !ok {
-		// The permission-driven "ask" path can reach danger reflection without a
-		// structured classification; synthesize a generic medium-severity info so
-		// the verbatim TS template still renders its consequences/alternatives.
-		info = danger(
-			"This tool call requires review before it executes.",
-			[]string{"The tool call may modify files or system state.", "In Bypass All mode it would otherwise execute without user approval."},
-			[]string{"Confirm only if the operation clearly matches the current task.", "Cancel if necessity is unclear or a safer alternative exists."},
-			nil,
-			dangerSeverityMedium,
-		)
-	}
+	info := s.dangerReflectionInfoForCall(cwd, call)
 	locale := s.toolLocale(ctx, narratorID)
 	inputJSON := call.Function.Arguments
 	if formatted := formatDangerInputJSON(call.Function.Arguments); formatted != "" {
 		inputJSON = formatted
 	}
 	prompt := dangerReflectionPrompt(call.ID, call.Function.Name, inputJSON, info, level, formatGoalReflectionHistory(history, 16000), locale)
-	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"DangerConfirm": true, "DangerCancel": true}, parseDangerReflectionTextFallback)
+	return s.runReflectionWithHistory(ctx, narratorID, history, prompt, map[string]bool{"DangerConfirm": true, "DangerCancel": true}, parseDangerReflectionTextFallback)
+}
+
+// dangerReflectionInfoForCall returns the danger classification for a tool call,
+// synthesizing a generic medium-severity info when the call has no structured
+// classification (the permission-driven "ask" path reaches danger reflection
+// without one). This is the single source of truth for both the reflection
+// prompt and the danger_reflection_started/resolved broadcast payload, so the
+// frontend always receives a non-empty danger summary while a reflection runs.
+func (s *Service) dangerReflectionInfoForCall(cwd string, call agentbasic.ToolCall) dangerReflectionInfo {
+	info, ok := classifyDangerReflectionToolCall(cwd, call, dangerSkipReadOnlyConfirmations(s.Settings))
+	if ok {
+		return info
+	}
+	return danger(
+		"This tool call requires review before it executes.",
+		[]string{"The tool call may modify files or system state.", "In Bypass All mode it would otherwise execute without user approval."},
+		[]string{"Confirm only if the operation clearly matches the current task.", "Cancel if necessity is unclear or a safer alternative exists."},
+		nil,
+		dangerSeverityMedium,
+	)
 }
 
 // formatDangerInputJSON pretty-prints the tool arguments to mirror TS
@@ -9327,6 +9416,17 @@ func dangerReflectionPrompt(requestID, toolName, inputJSON string, info dangerRe
 }
 
 func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, allowed map[string]bool, fallbackParsers ...func(text string) (reflectionDecision, bool)) (reflectionDecision, error) {
+	return s.runReflectionWithHistory(ctx, narratorID, nil, prompt, allowed, fallbackParsers...)
+}
+
+// runReflectionWithHistory runs a reflection loop, optionally seeding it with the
+// parent conversation history as real provider messages before the reflection
+// prompt (mirroring TS runReflectionLoop, which calls agentLoop(prompt, history)).
+// Passing real history — rather than only inlining a text summary into the prompt
+// — gives the reflection model genuine conversation context so it does not
+// misjudge a well-formed tool call as having "no input/evidence". history is
+// copied defensively; the prompt is appended as the final user turn.
+func (s *Service) runReflectionWithHistory(ctx context.Context, narratorID string, history []agentbasic.Message, prompt string, allowed map[string]bool, fallbackParsers ...func(text string) (reflectionDecision, bool)) (reflectionDecision, error) {
 	narrator, err := s.Get(ctx, narratorID)
 	if err != nil {
 		return reflectionDecision{}, err
@@ -9351,7 +9451,20 @@ func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, 
 		run.Output = output
 		return run, nil
 	}
-	stream, err := agentbasic.RunAgentLoop(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: prompt}}, cwd,
+	// Seed the reflection loop with the parent conversation history followed by
+	// the reflection prompt as the final user turn, matching TS agentLoop(prompt,
+	// [...history]). Only model-visible roles are kept so the reflection sees the
+	// same conversation the parent did.
+	messages := make([]agentbasic.Message, 0, len(history)+1)
+	for _, msg := range history {
+		role := strings.TrimSpace(msg.Role)
+		if role != "user" && role != "assistant" && role != "sys" {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+	messages = append(messages, agentbasic.Message{Role: "user", Content: prompt})
+	stream, err := agentbasic.RunAgentLoop(ctx, s.Settings, model, messages, cwd,
 		agentbasic.WithToolScope("reflection"),
 		agentbasic.WithMaxTurns(3),
 		agentbasic.WithToolExecutor(executor),
@@ -14219,6 +14332,19 @@ func bashCommandFilePaths(toolCwd, command string) []string {
 				}
 			}
 		}
+		// git has subcommand-specific path semantics (clone/init/worktree target
+		// dirs, -C <dir>), so it is handled exclusively by extractGitPaths rather
+		// than the generic per-token heuristic — matching TS analyzeBashCommand,
+		// which never runs extractPathArgs on git (e.g. `git checkout feat/x` must
+		// not treat the branch ref `feat/x` as a path). Redirect targets above
+		// still apply.
+		if strings.TrimSpace(tokens[0]) == "git" {
+			gitPaths, _ := extractGitPaths(tokens, func(p string) string {
+				return resolvePermissionPath(toolCwd, p)
+			})
+			paths = append(paths, gitPaths...)
+			continue
+		}
 		for i, token := range tokens[1:] {
 			index := i + 1
 			if redirectIndexes[index] || !looksLikeShellPathToken(token) {
@@ -14385,24 +14511,33 @@ func commandWhitelistDecision(command string, narrator Narrator) toolPermissionD
 	}
 }
 
-var simpleSafeBashPermissionCommands = map[string]bool{
-	"basename": true, "cat": true, "cut": true, "date": true, "dirname": true,
-	"echo": true, "file": true, "grep": true, "head": true, "hostname": true,
-	"id": true, "less": true, "ls": true, "more": true, "printf": true,
-	"pwd": true, "realpath": true, "rg": true, "stat": true, "tail": true,
-	"test": true, "true": true, "type": true, "uname": true, "wc": true,
-	"which": true, "whoami": true,
-	// Worktree-local write helpers that TS allows in acceptEdits when no external path is involved.
-	"cp": true, "mkdir": true, "mv": true, "touch": true,
-}
-
 func bashCommandSafeForReadOnly(command string) bool {
 	return bashCommandAllowedBySimplePolicy(command) && !shellCommandAppearsWrite(command)
 }
 
+// bashCommandAllowedBySimplePolicy reports whether every sub-command of a shell
+// chain is recognized as safe, mirroring the TS analyzeShellCommand
+// `nonWhitelisted.length === 0` determination (bash-analyze.ts:1970-2055). A
+// command is recognized when its name is in the rich SAFE_COMMANDS set
+// (safeBashCommands) or is a CONDITIONAL command whose dangerous-argument
+// detectors did not fire (conditionalCommandKeys; the firing case is caught by
+// the bashCommandHasConditionalDanger / bashCommandHasAlwaysAskCommand /
+// classify*Danger checks that run before this in classifyBashDanger). Previously
+// this used a much smaller hand-rolled allowlist that omitted common read-only
+// commands like `find`, `sort`, `tree`, `diff`, `seq`, etc., so an ordinary
+// read-only command such as `ls && find . | head` falsely triggered danger
+// reflection. Env-var assignment prefixes and input redirects still fail closed.
 func bashCommandAllowedBySimplePolicy(command string) bool {
 	commands := splitShellCommands(command)
 	if len(commands) == 0 {
+		return false
+	}
+	// Reject when any sub-command is an always-ask command or a firing
+	// conditional-danger use (npm install, sed -i, tar -x, git push --force, …),
+	// mirroring the TS nonWhitelisted markers for ALWAYS_ASK and CONDITIONAL
+	// detectors that fired. Recognized commands whose conditional detectors did
+	// NOT fire (e.g. `npm ls`, bare `find`) remain allowed.
+	if bashCommandHasAlwaysAskCommand(command) || bashCommandHasConditionalDanger(command) {
 		return false
 	}
 	for _, tokens := range commands {
@@ -14410,7 +14545,7 @@ func bashCommandAllowedBySimplePolicy(command string) bool {
 			continue
 		}
 		name := strings.TrimSpace(tokens[0])
-		if !simpleSafeBashPermissionCommands[name] {
+		if !safeBashCommands[name] && !conditionalCommandKeys[name] {
 			return false
 		}
 		for _, token := range tokens {
@@ -14864,6 +14999,17 @@ func bashCommandHasDangerousExecution(command string) bool {
 		if len(tokens) > 0 && isShellPathExecution(tokens[0]) {
 			return true
 		}
+	}
+	// AST-based pipe-to-shell detection (mirrors TS detectPipeToShell): a `|`
+	// inside quotes is correctly not a pipeline. Falls back to the legacy
+	// byte-scan only when the command cannot be parsed.
+	if lastCmds, ok := astPipelineLastCommands(command); ok {
+		for _, name := range lastCmds {
+			if pipeToShellInterpreters[name] {
+				return true
+			}
+		}
+		return false
 	}
 	for _, statement := range splitTopLevelStatements(command) {
 		if pipeToShellInterpreters[lastPipeSegmentCommand(statement)] {
@@ -15487,15 +15633,7 @@ func indexOfString(tokens []string, target string) int {
 }
 
 func splitShellCommands(command string) [][]string {
-	command = strings.NewReplacer("&&", "\n", "||", "\n", ";", "\n", "|", "\n").Replace(command)
-	out := [][]string{}
-	for _, part := range strings.Split(command, "\n") {
-		tokens := strings.Fields(strings.TrimSpace(part))
-		if len(tokens) > 0 {
-			out = append(out, tokens)
-		}
-	}
-	return out
+	return splitShellCommandsAST(command)
 }
 
 func matchCommandPattern(tokens []string, pattern string) bool {

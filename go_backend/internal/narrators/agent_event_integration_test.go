@@ -1698,9 +1698,21 @@ func TestRunBasicAgentDangerReflectionBroadcastsStartedAndResolved(t *testing.T)
 	if started == nil || started["toolUseId"] != "danger-bash-1" || started["toolName"] != "Bash" {
 		t.Fatalf("expected danger_reflection_started for the Bash call, got %#v", events())
 	}
+	// The frontend ToolCallCard keys the take-over button on requestId and renders
+	// danger.summary; both must be present on the started event (TS contract).
+	if started["requestId"] != "danger-bash-1" {
+		t.Fatalf("danger_reflection_started must carry requestId == toolUseId, got %#v", started["requestId"])
+	}
+	dangerPayload, ok := started["danger"].(map[string]any)
+	if !ok || strings.TrimSpace(stringFromAny(dangerPayload["summary"])) == "" {
+		t.Fatalf("danger_reflection_started must carry a danger payload with summary, got %#v", started["danger"])
+	}
 	resolved := findBroadcast(events(), narratorID, "danger_reflection_resolved")
 	if resolved == nil || resolved["toolUseId"] != "danger-bash-1" || resolved["decision"] != "deny" {
 		t.Fatalf("expected danger_reflection_resolved deny, got %#v", resolved)
+	}
+	if resolved["requestId"] != "danger-bash-1" {
+		t.Fatalf("danger_reflection_resolved must carry requestId == toolUseId, got %#v", resolved["requestId"])
 	}
 }
 

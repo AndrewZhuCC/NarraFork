@@ -341,6 +341,10 @@ func runAgentTurnWithRetry(ctx context.Context, out chan<- AgentEvent, adapter P
 			return state, true
 		}
 		if errors.Is(err, errTerminalEvent) {
+			// The terminal event (silent_disconnect / drain abort) was already
+			// emitted by runAgentTurnAttempt, which also flushed the accumulated
+			// text/reasoning blocks before emitting it (matching the block_complete
+			// → terminal-event order used by every other error branch below).
 			return nil, false
 		}
 		// First-token timeout retries up to maxFirstTokenRetries (= the configured
@@ -553,6 +557,12 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			}
 			if parsed.SilentDisconnect {
 				message := "Provider stream ended without a final response"
+				// Flush accumulated text/reasoning as block_complete BEFORE the
+				// terminal event so partial streamed content is persisted (mirrors
+				// TS flushPartialContent on early-return paths). Without this, a
+				// silent disconnect after the model already streamed text/reasoning
+				// would drop that content from the persisted assistant message.
+				flushTurnBlocks(ctx, out, state)
 				finishAPIRequest(message)
 				emitAgentEvent(ctx, out, AgentEvent{Type: "silent_disconnect", Provider: resolution.Provider, Model: resolution.Model, Message: message})
 				return state, errTerminalEvent
@@ -662,6 +672,10 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 				addToolUse(ctx, out, state, call, cwd, toolExecutor)
 			}
 			if !drainSettledToolResults(ctx, out, state, options) {
+				// Abort during settled-tool drain: flush accumulated text/reasoning
+				// before the terminal error so streamed content is persisted. ctx is
+				// already cancelled here, so flushTurnBlocks uses its detached emit.
+				flushTurnBlocks(ctx, out, state)
 				emitAgentEvent(context.Background(), out, AgentEvent{Type: "error", Message: "Aborted"})
 				return state, errTerminalEvent
 			}

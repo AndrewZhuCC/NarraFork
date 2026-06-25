@@ -190,7 +190,10 @@ func dangerReflectionPromptCaptureServer(t *testing.T, capture *string, mu *sync
 		w.Header().Set("Content-Type", "application/json")
 		if requestHasTool(body, "DangerCancel") {
 			mu.Lock()
-			*capture = firstUserMessageText(body)
+			// The danger reflection prompt is the FINAL user turn — the parent
+			// conversation history is now threaded in before it (TS parity), so the
+			// prompt is no longer messages[0].
+			*capture = lastUserMessageText(body)
 			mu.Unlock()
 			if requestHasToolResult(body) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger reflection done"}}}})

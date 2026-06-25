@@ -87,7 +87,9 @@ func goalReflectionPromptCaptureServer(t *testing.T, capture *string, mu *sync.M
 		w.Header().Set("Content-Type", "application/json")
 		if requestHasTool(body, "GoalCompleteConfirm") {
 			mu.Lock()
-			*capture = firstUserMessageText(body)
+			// The reflection prompt is the FINAL user turn now that the parent
+			// conversation history is threaded into the reflection loop (TS parity).
+			*capture = lastUserMessageText(body)
 			mu.Unlock()
 			if requestHasToolResult(body) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "reflection done"}}}})

@@ -3246,6 +3246,18 @@ func readArray(value any) []any {
 			out = append(out, item)
 		}
 		return out
+	case []map[string]any:
+		// In-memory request/history structures (e.g. Kiro toolUses/tools built by
+		// kiroToolUses/FormatTools) use concrete []map[string]any rather than []any.
+		// Without this case readArray returned nil for them, which silently dropped
+		// assistant toolUses / current-message toolResults during Kiro request
+		// sanitization, producing orphaned tool calls and an empty current message
+		// (the model then saw a degenerate conversation, e.g. "user sent just a .").
+		out := make([]any, 0, len(typed))
+		for _, item := range typed {
+			out = append(out, item)
+		}
+		return out
 	default:
 		return nil
 	}

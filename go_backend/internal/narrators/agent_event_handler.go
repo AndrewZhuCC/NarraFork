@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -263,7 +264,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			state.hadToolUses = true
 			upsertToolUseBlock(state, block)
 		} else {
-			state.blocks = append(state.blocks, block)
+			insertAssistantBlock(state, block)
 		}
 		if block["type"] == "text" {
 			state.assistantText = strings.TrimSpace(stringFromAny(block["text"]))
@@ -1321,7 +1322,7 @@ func contentBlockToMap(block *agentbasic.ContentBlock) map[string]any {
 func upsertToolUseBlock(state *agentRunState, block map[string]any) {
 	idValue := strings.TrimSpace(stringFromAny(block["id"]))
 	if idValue == "" {
-		state.blocks = append(state.blocks, block)
+		insertAssistantBlock(state, block)
 		return
 	}
 	for i, existing := range state.blocks {
@@ -1330,7 +1331,78 @@ func upsertToolUseBlock(state *agentRunState, block map[string]any) {
 			return
 		}
 	}
-	state.blocks = append(state.blocks, block)
+	insertAssistantBlock(state, block)
+}
+
+// blockOutputIndex extracts a block's numeric outputIndex, handling both the
+// in-memory int form (freshly built maps) and the float64 form (JSON round-trip).
+func blockOutputIndex(block map[string]any) (int, bool) {
+	switch v := block["outputIndex"].(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	}
+	return 0, false
+}
+
+// insertAssistantBlock inserts a freshly completed assistant block into
+// state.blocks in the correct position, mirroring the TS appendBlockToMessage
+// ordering contract (narrator-persistence.ts:777-804). Without this, blocks were
+// appended in event-arrival order, so a reasoning/text block flushed at turn end
+// (block_complete) landed AFTER a tool_use block emitted earlier during the
+// stream, producing the wrong [tool_use, reasoning] order in the persisted
+// assistant message.
+//
+// Rules (matching TS):
+//  1. Block carries a numeric outputIndex → append then stable-sort all blocks by
+//     outputIndex (blocks without an index sort to the end, ties keep insertion order).
+//  2. reasoning without outputIndex → insert before the first non-reasoning block
+//     (reasoning leads the message).
+//  3. text without outputIndex → insert before the first tool_use block
+//     (visible text precedes tool calls).
+//  4. otherwise (tool_use, redacted_thinking, web_search, …) → append at the end.
+func insertAssistantBlock(state *agentRunState, block map[string]any) {
+	if state == nil || block == nil {
+		return
+	}
+	if _, ok := blockOutputIndex(block); ok {
+		state.blocks = append(state.blocks, block)
+		sort.SliceStable(state.blocks, func(i, j int) bool {
+			ai, aok := blockOutputIndex(state.blocks[i])
+			bi, bok := blockOutputIndex(state.blocks[j])
+			if !aok {
+				return false // i has no index → sorts after j
+			}
+			if !bok {
+				return true // j has no index → i sorts before
+			}
+			return ai < bi
+		})
+		return
+	}
+	switch block["type"] {
+	case "reasoning":
+		for i, existing := range state.blocks {
+			if existing["type"] != "reasoning" {
+				state.blocks = append(state.blocks[:i], append([]map[string]any{block}, state.blocks[i:]...)...)
+				return
+			}
+		}
+		state.blocks = append(state.blocks, block)
+	case "text":
+		for i, existing := range state.blocks {
+			if existing["type"] == "tool_use" {
+				state.blocks = append(state.blocks[:i], append([]map[string]any{block}, state.blocks[i:]...)...)
+				return
+			}
+		}
+		state.blocks = append(state.blocks, block)
+	default:
+		state.blocks = append(state.blocks, block)
+	}
 }
 
 func (s *Service) recordRunningToolCall(ctx context.Context, narratorID, messageID string, narrator Narrator, event agentbasic.AgentEvent) error {
@@ -1677,6 +1749,11 @@ func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunStat
 	if strings.TrimSpace(message) == "" {
 		message = "Provider did not produce a response before the first-token timeout"
 	}
+	// Fail any in-flight tool calls so they do not stay stuck "running" after a
+	// timeout finalizes the run (mirrors TS closeNarrator → cleanupOrphanedToolCalls).
+	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
+	}
 	latest := s.latestRunNarrator(ctx, state)
 	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	if treatAsBackground {
@@ -1713,6 +1790,14 @@ func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *age
 	state.completed = true
 	state.errored = true
 	message := "Provider stream disconnected before completion"
+	// Convert any in-flight tool calls (recorded as running when their tool_call
+	// event streamed, but never executed because the stream cut off) into explicit
+	// failures, mirroring the TS closeNarrator → cleanupOrphanedToolCalls path that
+	// runs on every terminal close. Without this, the tools stay "running" forever
+	// and the UI shows them stuck executing after reload. Non-fatal.
+	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
+	}
 	latest := s.latestRunNarrator(ctx, state)
 	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	if treatAsBackground {
@@ -1818,6 +1903,12 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 	state.errored = true
 	if strings.TrimSpace(message) == "" {
 		message = "agent run failed"
+	}
+	// Fail any in-flight tool calls so they do not stay stuck "running" after an
+	// error finalizes the run (mirrors TS closeNarrator → cleanupOrphanedToolCalls).
+	// Non-fatal: the disp message + status update below must still run.
+	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
 	}
 	_, _ = s.addMessage(ctx, state.narratorID, "disp", "AI provider call failed: "+message, nil)
 	latest := s.latestRunNarrator(ctx, state)

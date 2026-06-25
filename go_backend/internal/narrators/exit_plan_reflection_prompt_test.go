@@ -141,6 +141,34 @@ func firstUserMessageText(body map[string]any) string {
 	return ""
 }
 
+// lastUserMessageText returns the text of the FINAL user-role message in a
+// request body. Reflection loops that thread the parent conversation history
+// before the reflection prompt make the prompt the last user turn, so tests that
+// assert prompt content read this rather than the first user message.
+func lastUserMessageText(body map[string]any) string {
+	messages, _ := body["messages"].([]any)
+	result := ""
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok || stringFromAny(msg["role"]) != "user" {
+			continue
+		}
+		switch content := msg["content"].(type) {
+		case string:
+			result = content
+		case []any:
+			parts := []string{}
+			for _, c := range content {
+				if cm, ok := c.(map[string]any); ok {
+					parts = append(parts, stringFromAny(cm["text"]))
+				}
+			}
+			result = strings.Join(parts, "")
+		}
+	}
+	return result
+}
+
 // TestRunBasicAgentExitPlanReflectionUsesTSPromptText verifies the reflection
 // loop is driven by the new TS-aligned prompt text rather than the old Go
 // single-paragraph English prompt.
