@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
@@ -11,6 +12,48 @@ import (
 )
 
 const contextOverflowKeepRecentMessages = 4
+
+// maxContextOverflowRetries mirrors the TS MAX_CONTEXT_OVERFLOW_RETRIES constant
+// (narrator-recovery.ts:26): after this many automatic compact+retry attempts the
+// recovery gives up and the run is finalized as an error instead of looping
+// forever. TS tracks the per-run counter on the session loop's local
+// `contextOverflowRetries`; Go's finalizer-driven retry has no equivalent local,
+// so the count is kept in a package-level map keyed by narrator id below.
+const maxContextOverflowRetries = 2
+
+// contextOverflowRetries tracks how many context-overflow compact+retry attempts
+// each narrator has consumed in the current run. TS increments a loop-local
+// counter per overflow (narrator-recovery.ts:131) and resets it to 0 whenever a
+// turn completes without overflow; Go mirrors that with this guarded map because
+// the overflow finalizer (finishAgentRunContextOverflow) and the retry it
+// schedules run across separate goroutines/stack frames and need a shared,
+// narrator-scoped counter. The counter is reset by resetContextOverflowRetries on
+// every successful (non-overflow) run completion.
+var (
+	contextOverflowRetryMu sync.Mutex
+	contextOverflowRetries = map[string]int{}
+)
+
+// incrementContextOverflowRetries records one more overflow attempt for the
+// narrator and returns the new count, mirroring the TS `overflowRetries++` at the
+// top of handleContextOverflow (narrator-recovery.ts:131).
+func incrementContextOverflowRetries(narratorID string) int {
+	contextOverflowRetryMu.Lock()
+	defer contextOverflowRetryMu.Unlock()
+	contextOverflowRetries[narratorID]++
+	return contextOverflowRetries[narratorID]
+}
+
+// resetContextOverflowRetries clears the overflow attempt counter for a narrator.
+// Mirrors the TS reset of the loop-local `contextOverflowRetries`/`transientRetries`
+// to 0 on a clean (non-overflow) completion (narrator-session.ts), so a later
+// independent overflow starts counting from zero again. Called from the run
+// completion finalizer (finishAgentRunSuccess) in agent_event_handler.go.
+func resetContextOverflowRetries(narratorID string) {
+	contextOverflowRetryMu.Lock()
+	delete(contextOverflowRetries, narratorID)
+	contextOverflowRetryMu.Unlock()
+}
 
 type contextOverflowRef struct {
 	MessageID string
@@ -56,6 +99,20 @@ func isContextOverflowAgentEvent(event agentbasic.AgentEvent) bool {
 }
 
 func (s *Service) finishAgentRunContextOverflow(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
+	// Enforce the TS MAX_CONTEXT_OVERFLOW_RETRIES cap (narrator-recovery.ts:131-135):
+	// increment the per-narrator attempt counter and, once it exceeds the max, stop
+	// the compact+retry loop and finalize the run as an error
+	// (reason=max_retries_exceeded) instead of scheduling yet another retry. Without
+	// this Go would compact+retry forever on a conversation that cannot be shrunk
+	// below the model window.
+	attempt := incrementContextOverflowRetries(state.narratorID)
+	if attempt > maxContextOverflowRetries {
+		resetContextOverflowRetries(state.narratorID)
+		// Mirror the TS getContextOverflowFailureError("max_retries_exceeded")
+		// user-visible message/errorCode (narrator-recovery.ts:85-89).
+		state.errorCode = "context_too_long_recovery_exhausted"
+		return s.finishAgentRunError(ctx, state, "Context is still too long after automatic recovery attempts")
+	}
 	state.completed = true
 	state.errored = false
 	state.skipGoalContinuation = true
@@ -68,6 +125,7 @@ func (s *Service) finishAgentRunContextOverflow(ctx context.Context, state *agen
 		if s.Hub != nil {
 			s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "compact_failed", "narratorId": state.narratorID, "mode": "blocking", "error": err.Error()})
 		}
+		resetContextOverflowRetries(state.narratorID)
 		return s.finishAgentRunError(ctx, state, "context length exceeded; automatic compact failed: "+err.Error())
 	}
 	if s.Hub != nil {

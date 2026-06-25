@@ -68,7 +68,10 @@ func TestConcludeReviewToolPersistsTSConclusionAndInjectsFeedback(t *testing.T) 
 		t.Fatalf("bad TS conclusion row verdict=%q findings=%s", verdict, findings)
 	}
 	var feedbackText, feedbackJSON string
-	if err := sqlDB.QueryRow(`SELECT content_text, content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'system' ORDER BY created_at DESC LIMIT 1`, sourceNarrator.ID).Scan(&feedbackText, &feedbackJSON); err != nil {
+	// review_feedback is persisted with role="sys" (model-visible) via
+	// narratorService.persistSystemMessage (narrator-persistence.ts:221), so the
+	// feedback reaches the source narrator's model. role="system" would be dropped.
+	if err := sqlDB.QueryRow(`SELECT content_text, content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'sys' ORDER BY created_at DESC LIMIT 1`, sourceNarrator.ID).Scan(&feedbackText, &feedbackJSON); err != nil {
 		t.Fatalf("load feedback message: %v", err)
 	}
 	if !strings.Contains(feedbackText, "Changes Requested") || !strings.Contains(feedbackText, "main.go:42") || !strings.Contains(feedbackJSON, "review_feedback") {

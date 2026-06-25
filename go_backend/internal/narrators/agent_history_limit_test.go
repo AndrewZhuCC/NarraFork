@@ -3,6 +3,7 @@ package narrators
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -45,19 +46,23 @@ func TestAgentHistoryLoadsAllMessagesSinceCompact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
-	// 1 compact-summary user message + 250 user messages.
-	if len(history) != total+1 {
-		t.Fatalf("expected %d history entries (summary + %d messages), got %d", total+1, total, len(history))
+	// 250 user messages. The compact summary reaches the model ONLY through the
+	// system prompt's "## Conversation Context" section, never as a history
+	// message, so it is not present here.
+	if len(history) != total {
+		t.Fatalf("expected %d history entries (%d messages), got %d", total, total, len(history))
 	}
-	if history[0].Role != "user" || history[0].Content != "Prior compacted conversation summary:\nEarlier summary" {
-		t.Fatalf("first entry should be the compact summary, got %#v", history[0])
+	for _, msg := range history {
+		if strings.Contains(msg.Content, "Prior compacted conversation summary") {
+			t.Fatalf("compact summary must NOT be injected into history; got %#v", msg)
+		}
 	}
 	// Order must be ascending by seq: first real message is "msg 1", last is "msg 250".
-	if history[1].Content != "msg 1" {
-		t.Fatalf("first real message should be \"msg 1\", got %q", history[1].Content)
+	if history[0].Content != "msg 1" {
+		t.Fatalf("first real message should be \"msg 1\", got %q", history[0].Content)
 	}
-	if history[total].Content != "msg "+itoa(total) {
-		t.Fatalf("last message should be %q, got %q", "msg "+itoa(total), history[total].Content)
+	if history[total-1].Content != "msg "+itoa(total) {
+		t.Fatalf("last message should be %q, got %q", "msg "+itoa(total), history[total-1].Content)
 	}
 }
 

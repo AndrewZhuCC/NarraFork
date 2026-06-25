@@ -92,11 +92,22 @@ func (a *KiroProviderAdapter) BuildHistory(messages []Message, model string, _ s
 				history = append(history, kiroUserMessage("", model, nil, pendingToolResults))
 				pendingToolResults = nil
 			}
-			entry := map[string]any{"assistantResponseMessage": map[string]any{"content": message.Content}}
-			if len(message.ToolCalls) > 0 {
-				entry["assistantResponseMessage"].(map[string]any)["toolUses"] = kiroToolUses(message.ToolCalls)
+			assistant := map[string]any{"content": message.Content}
+			// Rebuild reasoning_content from stored blocks so previous thinking
+			// (and its signature) is echoed back across turns. Mirrors TS
+			// buildKiroHistory (kiro-protocol.ts:1069-1112): reasoning goes into the
+			// snake_case "reasoning_content" field the upstream Kiro service
+			// requires, and the visible content is rebuilt from text-only blocks so
+			// the reasoning text is not duplicated into content (messageTextForAgent
+			// otherwise folds reasoning into Message.Content).
+			if reasoningContent := buildKiroReasoningContent(message.ContentBlocks); reasoningContent != nil {
+				assistant["reasoning_content"] = reasoningContent
+				assistant["content"] = chatVisibleTextFromBlocks(message.ContentBlocks)
 			}
-			history = append(history, entry)
+			if len(message.ToolCalls) > 0 {
+				assistant["toolUses"] = kiroToolUses(message.ToolCalls)
+			}
+			history = append(history, map[string]any{"assistantResponseMessage": assistant})
 		case "tool":
 			if strings.TrimSpace(message.ToolCallID) != "" {
 				pendingToolResults = append(pendingToolResults, map[string]any{"toolUseId": message.ToolCallID, "content": []map[string]any{{"text": message.Content}}, "status": "success", "isError": false})
@@ -677,7 +688,26 @@ func parseKiroEvent(eventType string, data map[string]any, parseTextToolCalls bo
 			result.ToolUseChunk = &ToolUseChunk{ToolUseID: toolUseID, Name: stringValue(data["name"]), Input: stringValue(data["input"]), Stop: boolValue(data["stop"])}
 		}
 	case "reasoningContentEvent":
+		// Mirror TS kiro-protocol.ts:807-831. Kiro reasoning chunks carry the
+		// visible thinking text plus, on the Anthropic-backed channels, a
+		// `signature` and/or a base64 `redactedContent` block. All three must
+		// survive so the assistant turn can be echoed back verbatim on the next
+		// request (see BuildHistory reasoning_content replay and
+		// buildKiroReasoningContent). Go previously dropped signature +
+		// redactedContent, which invalidated thinking blocks when replayed to the
+		// Anthropic-style history (signature covers the thinking for that turn).
 		result.Reasoning = firstNonEmpty(stringValue(data["content"]), stringValue(data["text"]))
+		// TS: signature = data.signature ?? data.reasoningSignature → nested under
+		// reasoningMetadata.anthropic.signature (the shape buildKiroReasoningContent /
+		// anthropicSignature read back). The Go loop accumulates this into the
+		// reasoning block's providerMetadata.
+		if signature := firstNonEmpty(stringValue(data["signature"]), stringValue(data["reasoningSignature"])); signature != "" {
+			result.ReasoningMetadata = map[string]any{"anthropic": map[string]any{"signature": signature}}
+		}
+		// TS: redacted = data.redactedContent ?? data.redacted_content → redactedThinking{data}.
+		if redacted := firstNonEmpty(stringValue(data["redactedContent"]), stringValue(data["redacted_content"])); redacted != "" {
+			result.RedactedThinking = &RedactedThinking{Data: redacted}
+		}
 	case "contextUsageEvent":
 		if pct, ok := kiroNumberValue(data["contextUsagePercentage"]); ok {
 			result.ContextUsagePercentage = &pct
@@ -703,9 +733,16 @@ func parseKiroEvent(eventType string, data map[string]any, parseTextToolCalls bo
 		depth := intValue(data["queueDepth"], 0)
 		result.NkpQueue = &QueueSnapshot{Position: position, QueueDepth: depth, QueueMessage: stringValue(data["message"])}
 	case "queueEvent":
+		// Gateway-injected queue status (TS gateway-events.ts parseGatewaySSEEvent
+		// QUEUE_EVENT): reads position/queueDepth/queueMessage. TS only emits the
+		// snapshot when position!=null || queueMessage!=null. Go keeps a superset
+		// (also accepts the legacy "message" key) but mirrors the TS gating.
 		position := intValue(data["position"], 0)
 		depth := intValue(data["queueDepth"], 0)
-		result.QueueStatus = &QueueSnapshot{Position: position, QueueDepth: depth, QueueMessage: stringValue(data["message"])}
+		message := firstNonEmpty(stringValue(data["queueMessage"]), stringValue(data["message"]))
+		if data["position"] != nil || message != "" {
+			result.QueueStatus = &QueueSnapshot{Position: position, QueueDepth: depth, QueueMessage: message}
+		}
 	case "quotaBalanceEvent":
 		balance := firstNonEmpty(stringValue(data["quotaBalance"]), stringValue(data["balance"]), stringValue(data["message"]))
 		detailedBalance := firstNonEmpty(stringValue(data["detailedQuotaBalance"]), formatExtraDetails(data["extra"]))

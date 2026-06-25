@@ -98,7 +98,12 @@ type ToolRun struct {
 	// (mirrors TS narrator-permission fatal decisions for catastrophic commands).
 	// When set, executeTurnTools emits an error event with Output as the message
 	// and stops the loop after the current turn's tool_result events are emitted.
-	Fatal      bool
+	Fatal bool
+	// Broken marks a tool result whose input was truncated/malformed (the tool was
+	// NOT executed). Mirrors TS executeTool's `broken: true` return
+	// (tool-executor.ts:213-249): the executor persists a specific isError result,
+	// and the loop additionally injects a brokenToolCallReminder into the next turn.
+	Broken     bool
 	FileChange *FileChange
 }
 

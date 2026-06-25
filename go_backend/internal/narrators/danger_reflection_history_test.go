@@ -50,15 +50,17 @@ func TestDangerReflectionLoopReceivesParentHistory(t *testing.T) {
 			return
 		}
 		// First parent turn: emit a dangerous Bash tool call.
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch made-by-test"}`}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"rm -rf made-by-test"}`}}}}}}})
 	}))
 	defer server.Close()
 
 	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
-	// Default permission mode + danger reflection on: a Bash tool call hits the
-	// permission "ask" path which triggers danger reflection (matches the other
-	// danger reflection integration tests).
-	if _, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
+	// Danger reflection is the bypass-allow gate: it fires only when permissions are
+	// already opened (bypassPermissions) AND the auto-running command is dangerous
+	// (narrator-permission.ts:2497). Use bypassPermissions so the dangerous Bash is
+	// auto-allowed and then routed into danger reflection (instead of pausing for an
+	// interactive permission decision, which would never resolve in this test).
+	if _, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'bypassPermissions', danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
 		t.Fatalf("enable danger reflection: %v", err)
 	}
 	service.runBasicAgent(context.Background(), narratorID)

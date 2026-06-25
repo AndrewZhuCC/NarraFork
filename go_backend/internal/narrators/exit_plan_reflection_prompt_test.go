@@ -91,9 +91,12 @@ func exitPlanReflectionPromptCaptureServer(t *testing.T, capture *string, mu *sy
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
 		if requestHasTool(body, "ExitPlanConfirm") {
-			// Reflection turn: record the user-message prompt text.
+			// Reflection turn: record the reflection prompt. The reflection loop now
+			// threads the parent conversation history before the prompt, so the
+			// prompt is the FINAL user message (not the first, which is the parent's
+			// original user turn).
 			mu.Lock()
-			*capture = firstUserMessageText(body)
+			*capture = lastUserMessageText(body)
 			mu.Unlock()
 			if requestHasToolResult(body) {
 				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "plan reflection done"}}}})
@@ -111,34 +114,6 @@ func exitPlanReflectionPromptCaptureServer(t *testing.T, capture *string, mu *sy
 	}))
 	t.Cleanup(server.Close)
 	return server
-}
-
-// firstUserMessageText returns the concatenated text content of the first user
-// message in an OpenAI-style request body.
-func firstUserMessageText(body map[string]any) string {
-	messages, _ := body["messages"].([]any)
-	for _, raw := range messages {
-		msg, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if stringFromAny(msg["role"]) != "user" {
-			continue
-		}
-		switch content := msg["content"].(type) {
-		case string:
-			return content
-		case []any:
-			parts := []string{}
-			for _, c := range content {
-				if cm, ok := c.(map[string]any); ok {
-					parts = append(parts, stringFromAny(cm["text"]))
-				}
-			}
-			return strings.Join(parts, "")
-		}
-	}
-	return ""
 }
 
 // lastUserMessageText returns the text of the FINAL user-role message in a

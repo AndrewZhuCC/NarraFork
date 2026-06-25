@@ -19,7 +19,19 @@ func agentMessagesFromStoredMessage(msg Message) []agentbasic.Message {
 	text := messageTextForAgent(msg, blocks)
 	switch role {
 	case "assistant":
-		assistant := agentbasic.Message{Role: "assistant", Content: text, ContentBlocks: blocks, ToolCalls: toolCallsForAgent(msg, blocks)}
+		// Gate orphan tool_use blocks out of the model-facing ContentBlocks. A
+		// tool_use block must have a matching terminal tool result to be replayed;
+		// otherwise it is an orphan (the tool was never executed — e.g. a broken
+		// call whose input was truncated mid-stream, or an interrupted run) and
+		// sending a tool_use without its tool_result wastes context and can trigger
+		// provider validation errors / retry loops. Mirrors TS buildHistory which
+		// only emits tool_use blocks whose toolCall status is success/fail
+		// (anthropic-provider.ts:1909-1927, completedToolUseIds gate). toolCallsForAgent
+		// (below) already applies the same gate to the OpenAI ToolCalls path; this
+		// closes the parallel gap on the content-block path. text/thinking/
+		// reasoning/redacted_thinking blocks are preserved in their original order.
+		gatedBlocks := filterOrphanToolUseBlocks(blocks, msg.ToolCalls)
+		assistant := agentbasic.Message{Role: "assistant", Content: text, ContentBlocks: gatedBlocks, ToolCalls: toolCallsForAgent(msg, blocks)}
 		messages := []agentbasic.Message{assistant}
 		messages = append(messages, toolResultMessagesFromToolCalls(msg.ToolCalls)...)
 		if sideCarText := appendSideCarsForAgent("", sideCarsForUserMessage(msg.SideCars)); sideCarText != "" {
@@ -171,6 +183,48 @@ func messageTextForAgent(msg Message, blocks []map[string]any) string {
 		}
 	}
 	return text
+}
+
+// filterOrphanToolUseBlocks removes assistant tool_use content blocks that have
+// no matching terminal tool result. A tool_use is "matched" when msg.ToolCalls
+// has a record for its id in a terminal state (success/fail/error/completed, via
+// completedToolStatus). Orphan tool_use blocks (truncated/broken calls, or
+// interrupted runs whose result was never recorded) are dropped so the model
+// never receives a tool_use without its tool_result. All non-tool_use blocks
+// (text/thinking/reasoning/redacted_thinking/image/web_search/etc.) are preserved
+// in their original order. Mirrors TS buildHistory completedToolUseIds gating
+// (anthropic-provider.ts:1909-1927) and matches the toolCallsForAgent gate.
+func filterOrphanToolUseBlocks(blocks []map[string]any, records []ToolCallRecord) []map[string]any {
+	if len(blocks) == 0 {
+		return blocks
+	}
+	completed := map[string]bool{}
+	for _, record := range records {
+		if completedToolStatus(record.Status) && strings.TrimSpace(record.ToolUseID) != "" {
+			completed[record.ToolUseID] = true
+		}
+	}
+	hasToolUse := false
+	for _, block := range blocks {
+		if historyStringFromAny(block["type"]) == "tool_use" {
+			hasToolUse = true
+			break
+		}
+	}
+	if !hasToolUse {
+		return blocks
+	}
+	filtered := make([]map[string]any, 0, len(blocks))
+	for _, block := range blocks {
+		if historyStringFromAny(block["type"]) == "tool_use" {
+			id := strings.TrimSpace(historyStringFromAny(block["id"]))
+			if id == "" || !completed[id] {
+				continue
+			}
+		}
+		filtered = append(filtered, block)
+	}
+	return filtered
 }
 
 func toolCallsForAgent(msg Message, blocks []map[string]any) []agentbasic.ToolCall {

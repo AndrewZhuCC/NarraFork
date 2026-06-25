@@ -88,8 +88,13 @@ func TestContextOverflowInvalidStateCompactsAndSchedulesRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agent history: %v", err)
 	}
-	if len(history) < 2 || !strings.Contains(history[0].Content, "Prior compacted conversation summary") {
-		t.Fatalf("expected compact summary at start of rebuilt history, got %#v", history)
+	if len(history) < 2 {
+		t.Fatalf("expected post-compact messages in rebuilt history, got %#v", history)
+	}
+	for _, item := range history {
+		if strings.Contains(item.Content, "Prior compacted conversation summary") {
+			t.Fatalf("compact summary must NOT be injected into history; got %#v", item)
+		}
 	}
 	joined := ""
 	for _, item := range history {

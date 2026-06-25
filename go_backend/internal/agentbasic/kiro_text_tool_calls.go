@@ -273,6 +273,59 @@ func kiroAppendDedupedToolUses(existing []ToolCall, add []ToolCall) []ToolCall {
 	return next
 }
 
+// buildKiroReasoningContent merges stored reasoning / redacted-thinking content
+// blocks into the single `reasoning_content` object Kiro expects on an assistant
+// history message, mirroring TS buildKiroReasoningContent (kiro-protocol.ts:60-88).
+//
+// Kiro's ReasoningContentForHistory is a single object (not an array), so when a
+// turn produced multiple reasoning blocks we concatenate their text and keep the
+// signature of the last signed block (the signature covers the full thinking for
+// that turn, TS:64-70). A redacted block, when present, is carried alongside in
+// `redactedContent` (TS:72,84-86). The signature is read from the reasoning
+// block's providerMetadata.anthropic.signature (the shape parseKiroEvent's
+// reasoningContentEvent fix and the Anthropic stream populate). Returns nil when
+// there is no reasoning to echo back (TS returns undefined, TS:75).
+func buildKiroReasoningContent(blocks []map[string]any) map[string]any {
+	texts := []string{}
+	signature := ""
+	redacted := ""
+	for _, block := range blocks {
+		switch stringValue(block["type"]) {
+		case "reasoning":
+			if text := stringValue(block["text"]); text != "" {
+				texts = append(texts, text)
+			}
+			// providerMetadata.anthropic.signature — reuse the shared reader so the
+			// nested shape stays in lock-step with history_content.go.
+			if sig := anthropicSignature(block["providerMetadata"]); sig != "" {
+				signature = sig
+			}
+		case "redacted_thinking":
+			if redacted == "" {
+				if data := stringValue(block["data"]); data != "" {
+					redacted = data
+				}
+			}
+		}
+	}
+	hasText := len(texts) > 0
+	if !hasText && redacted == "" {
+		return nil
+	}
+	reasoningContent := map[string]any{}
+	if hasText {
+		reasoningText := map[string]any{"text": strings.Join(texts, "\n")}
+		if signature != "" {
+			reasoningText["signature"] = signature
+		}
+		reasoningContent["reasoningText"] = reasoningText
+	}
+	if redacted != "" {
+		reasoningContent["redactedContent"] = redacted
+	}
+	return reasoningContent
+}
+
 // kiroRequestHasTools reports whether a built Kiro chat request body declares tools
 // (conversationState.currentMessage.userInputMessage.userInputMessageContext.tools),
 // used by the plugin-bridge path to gate leaked-XML parsing like TS

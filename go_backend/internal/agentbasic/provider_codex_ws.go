@@ -3,6 +3,7 @@ package agentbasic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -136,7 +137,7 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 		"tools": appendCodexNativeTools(
 			openAIResponsesTools(toolScope),
 			provider.Model,
-			optionalBoolDefault(provider.UseWebSearch, true),
+			codexWebSearchEnabledForScope(provider, toolScope),
 			optionalBoolDefault(provider.UseImageGeneration, true),
 		),
 		"stream":              true,
@@ -169,6 +170,14 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 	}
 	toolsByItem := map[string]*openAIStreamingTool{}
 	reasoningByIndex := map[int]*responsesReasoningAccum{}
+	// sawCompleted tracks whether the stream delivered a response.completed event
+	// before the socket closed. Mirrors the TS codex-websocket `completed` flag:
+	// a close/EOF *before* completion is NOT a success — it must surface as a
+	// silentDisconnect (so the loop flushes partial content and ends the turn) or
+	// as a retryable/failover error (when the close carries an error envelope).
+	// Go previously returned nil on close (`IsUnexpectedCloseError(err)==false`),
+	// which silently treated a premature disconnect as a clean finish.
+	sawCompleted := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -177,24 +186,94 @@ func streamCodexResponsesWebSocket(ctx context.Context, provider Provider, messa
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) || websocket.IsUnexpectedCloseError(err) == false {
+			if sawCompleted {
 				return nil
 			}
-			return err
+			// Extract the close reason (gorilla puts the server's close-frame text on
+			// *CloseError.Text) and try to parse a wrapped error envelope from it. A
+			// classified error (quota/auth/5xx) is returned so streamCodexCandidate
+			// fails over to the next credential / HTTP fallback (mirrors TS, which
+			// throws formatWrappedError on a close reason carrying an error payload).
+			closeReason := codexWebSocketCloseReason(err)
+			if wrapped := codexWrappedFrameError(closeReason); wrapped != nil {
+				if isCodexFailoverError(wrapped) {
+					return wrapped
+				}
+				return wrapped
+			}
+			// A non-error close before response.completed is a silent disconnect: the
+			// loop persists any partial streamed content and ends the turn rather than
+			// pretending the model finished cleanly.
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{SilentDisconnect: true, ResponsesAPI: true}})
+			return nil
 		}
 		if len(data) == 0 || strings.TrimSpace(string(data)) == "[DONE]" {
 			continue
 		}
-		if err := handleResponsesJSONEvent(ctx, out, toolsByItem, reasoningByIndex, data); err != nil {
+		// A text frame carrying a wrapped error envelope (not a normal Responses
+		// event) classifies for failover, mirroring TS parseCodexWrappedError on the
+		// message path.
+		if wrapped := codexWrappedFrameError(string(data)); wrapped != nil {
+			return wrapped
+		}
+		completed, err := handleResponsesWebSocketEvent(ctx, out, toolsByItem, reasoningByIndex, data)
+		if err != nil {
 			return err
 		}
+		if completed {
+			sawCompleted = true
+			return nil
+		}
 	}
+}
+
+// codexWebSocketCloseReason returns the server-provided close-frame reason text
+// from a gorilla read error, or the raw error string when it is not a close
+// error. Mirrors the TS `frame.reason` carried on the ws "close" event.
+func codexWebSocketCloseReason(err error) string {
+	var closeErr *websocket.CloseError
+	if errors.As(err, &closeErr) {
+		return closeErr.Text
+	}
+	if err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// handleResponsesWebSocketEvent decodes one Codex WebSocket frame and dispatches
+// it. It first checks for a unified-gateway data-embedded event (queue/quota/
+// modelCatalog/imageCacheAck), mirroring the TS codex-websocket parseGatewayDataEvent
+// branch, then falls through to the shared Responses event handler. Returns
+// (completed, err): completed is true when the frame was response.completed so the
+// read loop can record success (so a later close is treated as a clean finish,
+// not a silent disconnect).
+func handleResponsesWebSocketEvent(ctx context.Context, out chan<- StreamEvent, toolsByItem map[string]*openAIStreamingTool, reasoningByIndex map[int]*responsesReasoningAccum, data []byte) (bool, error) {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err == nil {
+		if gwEvent, ok := parseGatewayDataEvent(raw); ok {
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: gwEvent})
+			return false, nil
+		}
+	}
+	completed := stringValue(raw["type"]) == "response.completed"
+	if err := handleResponsesJSONEvent(ctx, out, toolsByItem, reasoningByIndex, data); err != nil {
+		return false, err
+	}
+	return completed, nil
 }
 
 func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, toolsByItem map[string]*openAIStreamingTool, reasoningByIndex map[int]*responsesReasoningAccum, data []byte) error {
 	var parsed responsesStreamEvent
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return fmt.Errorf("decode responses event: %w", err)
+	}
+	// Top-level usage can appear on any event from some gateways (mirrors TS
+	// parseResponsesAPIEvent `chunk.response?.usage || chunk.usage`). response.completed
+	// carries usage in Response.Usage and is emitted in its own case below, so only
+	// surface a standalone top-level usage here to avoid double counting.
+	if parsed.Usage != nil && parsed.Type != "response.completed" {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Usage: openAIUsageSnapshot(parsed.Usage), ResponsesAPI: true, ResponseID: parsed.Response.ID}})
 	}
 	if invalid := openAIInvalidStateFromResponsesEvent(parsed); invalid != nil {
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{InvalidState: invalid, ResponsesAPI: true, ResponseID: parsed.Response.ID}})
@@ -213,6 +292,13 @@ func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, tools
 			break
 		}
 		if parsed.Item != nil {
+			// Capture the assistant message item id so the loop can persist/replay it
+			// as the canonical message id instead of synthesizing one (mirrors TS
+			// parseResponsesAPIEvent results.push({messageId: chunk.item.id})).
+			if parsed.Item.Type == "message" && parsed.Item.Role == "assistant" && parsed.Item.ID != "" {
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: parsed.Item.ID, ResponsesAPI: true}})
+				break
+			}
 			handleResponsesOutputItemAdded(ctx, out, toolsByItem, parsed.Item, parsed.OutputIndex)
 		}
 	case "response.output_item.done":
@@ -220,6 +306,10 @@ func handleResponsesJSONEvent(ctx context.Context, out chan<- StreamEvent, tools
 			break
 		}
 		if parsed.Item != nil {
+			if parsed.Item.Type == "message" && parsed.Item.Role == "assistant" && parsed.Item.ID != "" {
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: parsed.Item.ID, ResponsesAPI: true}})
+				break
+			}
 			handleResponsesOutputItemDone(ctx, out, parsed.Item, parsed.OutputIndex)
 		}
 	case "response.web_search_call.in_progress":

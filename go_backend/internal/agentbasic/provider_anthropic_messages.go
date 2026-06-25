@@ -7,12 +7,37 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 )
+
+// anthropicWebSearchQueryRe extracts the "query" string from a partially streamed
+// server_tool_use input JSON (mirrors the TS /"query"\s*:\s*"((?:[^"\\]|\\.)*)"/).
+var anthropicWebSearchQueryRe = regexp.MustCompile(`"query"\s*:\s*"((?:[^"\\]|\\.)*)"`)
 
 type AnthropicMessagesAdapter struct {
 	Provider Provider
 	Client   *http.Client
+}
+
+// anthropicWebSearchMaxUses mirrors the TS WEB_SEARCH_MAX_USES
+// (anthropic-provider.ts:40): the max server-side web searches per API call.
+const anthropicWebSearchMaxUses = 8
+
+// anthropicNativeWebSearchEnabledForScope reports whether the official Anthropic
+// native server-side web_search tool should be attached, mirroring the TS
+// `shouldUseNativeSearch` intent. Go does not yet read the unified search-channel
+// ordering from settings here; it approximates the native-search-channel-first
+// gate with the WebSearch tool's scope visibility (so reflection scope, which
+// hides WebSearch, does not advertise native web_search either). Tracked boundary:
+// anthropicNativeWebSearchChannelFirstGating:false.
+func anthropicNativeWebSearchEnabledForScope(_ Provider, toolScope string) bool {
+	for _, spec := range visibleToolSpecs(toolScope) {
+		if spec.Name == "WebSearch" {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *AnthropicMessagesAdapter) ProviderName() string {
@@ -241,6 +266,12 @@ type anthropicStreamingBlock struct {
 	Index      int
 	Stopped    bool
 	IsThinking bool
+	// IsServerTool marks a server_tool_use block (native web_search). Its input
+	// JSON is accumulated to extract the query for progress events, but it is NOT
+	// surfaced as a local tool call (mirrors TS serverToolAccum). Query holds the
+	// last extracted "query" value.
+	IsServerTool bool
+	Query        string
 }
 
 func streamAnthropicMessages(ctx context.Context, client *http.Client, provider Provider, systemPrompt string, messages []map[string]any, toolScope string, reasoningEffort string, out chan<- StreamEvent) error {
@@ -259,6 +290,23 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 		"messages":   messages,
 		"tools":      tools,
 		"stream":     true,
+	}
+	// Native server-side web_search: the official Anthropic API appends a
+	// server-side web_search tool when native search is the first-enabled channel
+	// (mirrors TS anthropic-provider.ts:910-923 `isOfficial && shouldUseNativeSearch`).
+	// Proxy mode (non-official) uses function tools only. The cache breakpoints are
+	// applied above to the function tools first, then the server tool is appended
+	// after them (matching TS [...cachedTools, ...serverTools]). The
+	// native-search-channel-first ordering is approximated by the WebSearch tool's
+	// scope visibility (anthropicNativeWebSearchChannelFirstGating:false), so a scope
+	// that hides WebSearch (e.g. reflection) does not advertise native web_search.
+	if provider.OfficialAPI && anthropicNativeWebSearchEnabledForScope(provider, toolScope) {
+		body["tools"] = append(append([]map[string]any{}, tools...), map[string]any{
+			"type":     "web_search_20250305",
+			"name":     "web_search",
+			"max_uses": anthropicWebSearchMaxUses,
+		})
+		body["tool_choice"] = map[string]any{"type": "auto"}
 	}
 	thinking := anthropicThinkingConfig(provider.Model, reasoningEffort)
 	thinkingEnabled := thinking != nil && thinking["type"] != "disabled"
@@ -391,10 +439,18 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 				outputIndex := parsed.Index
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, RedactedThinking: &RedactedThinking{Data: firstNonEmpty(stringValue(parsed.ContentBlock["data"]), stringValue(parsed.ContentBlock["text"])), OutputIndex: &outputIndex}}})
 			}
+			// Native server-side web_search start/result events (mirrors TS
+			// content_block_start server_tool_use / web_search_tool_result).
+			if ws := anthropicWebSearchFromBlockStart(blocks, parsed.Index, parsed.ContentBlock); ws != nil {
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, WebSearch: ws}})
+			}
+			if ws := anthropicWebSearchFromToolResult(blocks, parsed.ContentBlock); ws != nil {
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, WebSearch: ws}})
+			}
 		case "content_block_delta":
 			handleAnthropicBlockDelta(ctx, out, blocks, parsed.Index, parsed.Delta, messageID)
 		case "content_block_stop":
-			if block := blocks[parsed.Index]; block != nil && block.Name != "" && !block.Stopped {
+			if block := blocks[parsed.Index]; block != nil && block.Name != "" && !block.Stopped && !block.IsServerTool {
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ToolUseChunk: &ToolUseChunk{ToolUseID: block.ID, Name: block.Name, Stop: true, OutputIndex: &block.Index, InputCharsTotal: len(block.Arguments)}}})
 				block.Stopped = true
 			}
@@ -532,6 +588,40 @@ func handleAnthropicBlockStart(blocks map[int]*anthropicStreamingBlock, index in
 	}
 }
 
+// anthropicWebSearchFromBlockStart returns a WebSearchEvent for a native
+// server_tool_use (web_search) start block and tracks it in blocks so subsequent
+// input_json deltas can extract the query, mirroring TS content_block_start
+// `server_tool_use` handling. Returns nil for any other block type.
+func anthropicWebSearchFromBlockStart(blocks map[int]*anthropicStreamingBlock, index int, block map[string]any) *WebSearchEvent {
+	if stringValue(block["type"]) != "server_tool_use" {
+		return nil
+	}
+	id := stringValue(block["id"])
+	if id == "" || stringValue(block["name"]) == "" {
+		return nil
+	}
+	blocks[index] = &anthropicStreamingBlock{ID: id, Name: stringValue(block["name"]), Index: index, IsServerTool: true}
+	return &WebSearchEvent{ID: id, Status: "in_progress"}
+}
+
+// anthropicWebSearchFromToolResult returns a completed WebSearchEvent for a
+// web_search_tool_result block, resolving the query from the matching
+// server_tool_use accumulator (mirrors TS web_search_tool_result handling).
+func anthropicWebSearchFromToolResult(blocks map[int]*anthropicStreamingBlock, block map[string]any) *WebSearchEvent {
+	if stringValue(block["type"]) != "web_search_tool_result" {
+		return nil
+	}
+	toolUseID := firstNonEmpty(stringValue(block["tool_use_id"]), stringValue(block["toolUseId"]))
+	query := ""
+	for _, tracked := range blocks {
+		if tracked != nil && tracked.IsServerTool && tracked.ID == toolUseID {
+			query = tracked.Query
+			break
+		}
+	}
+	return &WebSearchEvent{ID: toolUseID, Status: "completed", Query: query}
+}
+
 func handleAnthropicBlockDelta(ctx context.Context, out chan<- StreamEvent, blocks map[int]*anthropicStreamingBlock, index int, delta struct {
 	Type             string          `json:"type"`
 	Text             string          `json:"text"`
@@ -567,12 +657,38 @@ func handleAnthropicBlockDelta(ctx context.Context, out chan<- StreamEvent, bloc
 			blocks[index] = block
 		}
 		block.Arguments += delta.PartialJSON
+		// Server-side web_search: accumulate input JSON to extract the query for a
+		// "searching" progress event; do NOT surface it as a local tool call
+		// (mirrors TS serverToolAccum input_json_delta handling).
+		if block.IsServerTool {
+			if query := anthropicExtractWebSearchQuery(block.Arguments); query != "" && query != block.Query {
+				block.Query = query
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, WebSearch: &WebSearchEvent{ID: block.ID, Status: "searching", Query: query}}})
+			}
+			return
+		}
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ToolUseChunk: &ToolUseChunk{ToolUseID: block.ID, Name: block.Name, Input: delta.PartialJSON, OutputIndex: &block.Index, InputCharsTotal: len(block.Arguments)}}})
 		if !block.Stopped && isParsableJSON(block.Arguments) {
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ToolUseChunk: &ToolUseChunk{ToolUseID: block.ID, Name: block.Name, Stop: true, OutputIndex: &block.Index, InputCharsTotal: len(block.Arguments)}}})
 			block.Stopped = true
 		}
 	}
+}
+
+// anthropicExtractWebSearchQuery pulls the "query" string out of a partially
+// streamed server_tool_use input JSON, mirroring the TS regex
+// /"query"\s*:\s*"((?:[^"\\]|\\.)*)"/ + JSON.parse unescape. Returns "" when no
+// complete query string is present yet.
+func anthropicExtractWebSearchQuery(args string) string {
+	match := anthropicWebSearchQueryRe.FindStringSubmatch(args)
+	if len(match) < 2 {
+		return ""
+	}
+	var query string
+	if err := json.Unmarshal([]byte(`"`+match[1]+`"`), &query); err != nil {
+		return ""
+	}
+	return query
 }
 
 func anthropicUsageSnapshot(usage *anthropicUsage) *UsageSnapshot {

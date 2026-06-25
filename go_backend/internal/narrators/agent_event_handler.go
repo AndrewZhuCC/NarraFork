@@ -16,6 +16,7 @@ import (
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
+	"narrafork-go/internal/httpx"
 	"narrafork-go/internal/id"
 )
 
@@ -65,6 +66,14 @@ type agentRunState struct {
 	providerPrefix         string
 	sideCarToolCount       int
 	toolUseCharsMap        map[string]int
+	// Subagent live-broadcast routing, resolved once per run (lazily on the first
+	// event) and cached so the per-event forwarding below never issues a DB query
+	// on the hot streaming path. Mirrors the TS EventHandlerContext fields
+	// broadcastTargetId(=parentNarratorId) / parentToolUseId, which are likewise
+	// computed once when the subagent context is built (narrator-event-handler.ts:48-68).
+	subagentRouteResolved   bool
+	subagentParentID        string
+	subagentParentToolUseID string
 }
 
 // draftID returns the current assistant draft message id under the lock.
@@ -156,7 +165,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 	// state.narrator between turns via the runtime-settings/before-turn hooks, so a
 	// single consistent read avoids a torn struct mid-handler.
 	narrator := state.currentNarrator()
-	s.broadcastAgentEvent(state.narratorID, event)
+	s.broadcastAgentEventForRun(ctx, state, narrator, event)
 	// Mirror the TS narrator-event-handler recordOutputChunk calls: record streamed
 	// assistant text and reasoning lengths (UTF-16 code units) into the global
 	// output-stats rate tracker so the output_stats WS feed reports real chars/sec.
@@ -315,7 +324,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 				return err
 			}
 		}
-		s.broadcastMessage(ctx, state.narratorID, msg)
+		s.broadcastMessage(ctx, state.narratorID, s.enrichAndTruncateMessageForBroadcast(msg))
 		return nil
 	case "done":
 		return s.finishAgentRunSuccess(ctx, state)
@@ -324,6 +333,17 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		return s.finishAgentRunTimeout(ctx, state, state.errorMessage)
 	case "silent_disconnect":
 		return s.finishAgentRunSilentDisconnect(ctx, state)
+	case "max_turns_exceeded":
+		// P1's loop emits max_turns_exceeded with Metadata.maxTurns when the agent
+		// loop hits the hard round cap. Mirror TS narrator-executor.ts:163-167:
+		// set the final error text "Max turns (N) exceeded" and finalize via the
+		// error path (which fails orphaned tool calls + fixes the draft). The raw
+		// frame was already broadcast at the top of handleAgentEvent.
+		maxTurns := int64FromMetadata(event.Metadata, "maxTurns")
+		state.errored = true
+		state.errorCode = "max_turns_exceeded"
+		state.errorMessage = fmt.Sprintf("Max turns (%d) exceeded", maxTurns)
+		return s.finishAgentRunError(ctx, state, state.errorMessage)
 	case "payment_required":
 		return s.finishAgentRunPaymentRequired(ctx, state, event)
 	case "error", "retryable_error", "invalid_state":
@@ -394,6 +414,159 @@ func cleanProviderErrorMessageForDisplay(raw string) string {
 		return string(runes[:1000]) + "..."
 	}
 	return result
+}
+
+// toolIOTruncateMaxLen mirrors the TS truncateToolIO default maxLen (2000 UTF-16
+// code units) used to bound tool input/output before broadcasting a message frame
+// (narrator-messages.ts:567).
+const toolIOTruncateMaxLen = 2000
+
+// skipTruncateTools / skipInputTruncateTools mirror the TS SKIP_TRUNCATE_TOOLS and
+// SKIP_INPUT_TRUNCATE_TOOLS sets (narrator-messages.ts:444-447).
+var (
+	skipTruncateTools      = map[string]bool{"ExitPlanMode": true}
+	skipInputTruncateTools = map[string]bool{"Agent": true, "Task": true, "Send": true}
+)
+
+// enrichAndTruncateMessageForBroadcast applies the TS enrichToolUseBlocks +
+// truncateToolIO pipeline (narrator-event-handler.ts:1077) to a message before it
+// is broadcast: tool_use blocks in contentJson are enriched with their tool-call
+// fields (status, output, timings, ...) so WS clients receive the same shape as
+// the HTTP API, and tool input/output JSON is bounded so a large tool result does
+// not bloat the WS frame. The message is shallow-copied; the input msg is not
+// mutated.
+func (s *Service) enrichAndTruncateMessageForBroadcast(msg Message) Message {
+	truncated := truncateMessageToolIO(msg)
+	return enrichMessageToolUseBlocks(truncated)
+}
+
+// truncateMessageToolIO mirrors TS truncateToolIO (narrator-messages.ts:567):
+// bound each tool call's inputJson/outputJson to toolIOTruncateMaxLen, skipping
+// the configured tools, and recurse into children.
+func truncateMessageToolIO(msg Message) Message {
+	out := msg
+	if len(msg.ToolCalls) > 0 {
+		calls := make([]ToolCallRecord, len(msg.ToolCalls))
+		for i, tc := range msg.ToolCalls {
+			calls[i] = tc
+			if skipTruncateTools[tc.ToolName] {
+				continue
+			}
+			if !skipInputTruncateTools[tc.ToolName] {
+				calls[i].InputJSON = truncateToolJSONValue(tc.InputJSON, toolIOTruncateMaxLen)
+			}
+			calls[i].OutputJSON = truncateToolJSONValue(tc.OutputJSON, toolIOTruncateMaxLen)
+		}
+		out.ToolCalls = calls
+	}
+	if len(msg.Children) > 0 {
+		children := make([]Message, len(msg.Children))
+		for i, child := range msg.Children {
+			children[i] = truncateMessageToolIO(child)
+		}
+		out.Children = children
+	}
+	return out
+}
+
+// truncateToolJSONValue mirrors TS truncateJson (narrator-messages.ts:436): a
+// value whose JSON-stringified form exceeds maxLen UTF-16 code units is replaced
+// with {_truncated:true, preview:<first maxLen units>, fullLength:N}; smaller
+// values pass through unchanged.
+func truncateToolJSONValue(val any, maxLen int) any {
+	if val == nil {
+		return val
+	}
+	str, isString := val.(string)
+	if !isString {
+		encoded, err := json.Marshal(val)
+		if err != nil {
+			return val
+		}
+		str = string(encoded)
+	}
+	if httpx.JSStringLength(str) <= maxLen {
+		return val
+	}
+	return map[string]any{
+		"_truncated": true,
+		"preview":    httpx.JSStringSlicePrefix(str, maxLen),
+		"fullLength": httpx.JSStringLength(str),
+	}
+}
+
+// enrichMessageToolUseBlocks mirrors TS enrichToolUseBlocks
+// (narrator-messages.ts:613): for each tool_use block in contentJson, merge in the
+// matching tool call's fields (status, output, timings, sidecars, ...) so the
+// broadcast frame matches the enriched HTTP API shape. Recurses into children.
+func enrichMessageToolUseBlocks(msg Message) Message {
+	out := msg
+	if len(msg.Children) > 0 {
+		children := make([]Message, len(msg.Children))
+		for i, child := range msg.Children {
+			children[i] = enrichMessageToolUseBlocks(child)
+		}
+		out.Children = children
+	}
+	if len(msg.ToolCalls) == 0 {
+		return out
+	}
+	blocks, ok := msg.ContentJSON.([]any)
+	if !ok {
+		return out
+	}
+	tcMap := map[string]ToolCallRecord{}
+	for _, tc := range msg.ToolCalls {
+		tcMap[tc.ToolUseID] = tc
+	}
+	enriched := make([]any, len(blocks))
+	for i, raw := range blocks {
+		block, ok := raw.(map[string]any)
+		if !ok || stringFromAny(block["type"]) != "tool_use" {
+			enriched[i] = raw
+			continue
+		}
+		tc, found := tcMap[stringFromAny(block["id"])]
+		if !found {
+			enriched[i] = raw
+			continue
+		}
+		merged := map[string]any{}
+		for k, v := range block {
+			merged[k] = v
+		}
+		if tc.InputJSON != nil {
+			merged["inputJson"] = tc.InputJSON
+		} else if _, ok := merged["inputJson"]; !ok {
+			merged["inputJson"] = block["input"]
+		}
+		merged["outputJson"] = tc.OutputJSON
+		merged["status"] = tc.Status
+		if tc.ErrorMessage != nil {
+			merged["errorMessage"] = *tc.ErrorMessage
+		}
+		if tc.PermissionDecisionReason != nil {
+			merged["permissionDecisionReason"] = *tc.PermissionDecisionReason
+		}
+		if tc.PermissionSuggestions != nil {
+			merged["permissionSuggestions"] = tc.PermissionSuggestions
+		}
+		if len(tc.SideCars) > 0 {
+			merged["sideCars"] = tc.SideCars
+		}
+		merged["tcId"] = tc.ID
+		merged["tcCreatedAt"] = tc.CreatedAt
+		// Surface the tool result _metadata onto the block, mirroring TS which lifts
+		// outputJson._metadata to the block level for the frontend.
+		if outputMap, ok := tc.OutputJSON.(map[string]any); ok {
+			if meta, ok := outputMap["_metadata"]; ok {
+				merged["_metadata"] = meta
+			}
+		}
+		enriched[i] = merged
+	}
+	out.ContentJSON = enriched
+	return out
 }
 
 func rememberAPIRequestStart(state *agentRunState, event agentbasic.AgentEvent) {
@@ -870,6 +1043,145 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 	if s.Hub == nil {
 		return
 	}
+	payload := s.agentEventPayload(narratorID, event)
+	s.Hub.BroadcastNarrator(narratorID, payload)
+}
+
+// broadcastAgentEventForRun broadcasts a live agent event to the narrator's own
+// subscribers and, when the narrator is a subagent, additionally mirrors the
+// frame to its parent narrator (broadcastTargetId=parentNarratorId) so a viewer
+// watching the parent sees the subagent's streaming in real time. This mirrors
+// the TS dualBroadcast contract (narrator-event-handler.ts:276-304): the parent
+// copy carries the subagent linking fields (subagentNarratorId + parentToolUseId),
+// while the self copy stays scoped to the subagent's own id. context_usage and
+// metering frames additionally get the isSubagent flag on the PARENT copy only,
+// matching TS (the self copy strips isSubagent).
+//
+// The subagent route (parent id + parent tool_use id) is resolved once per run
+// and cached on the run state so the hot streaming path never issues a DB query
+// per event, honoring the backend main-thread performance rules.
+func (s *Service) broadcastAgentEventForRun(ctx context.Context, state *agentRunState, narrator Narrator, event agentbasic.AgentEvent) {
+	if s.Hub == nil {
+		return
+	}
+	isSubagent := narrator.Type == "subagent" || narrator.Variant == "subagent"
+	// Self broadcast (scoped to the subagent/narrator's own id). For subagents the
+	// isSubagent flag is intentionally NOT added here (TS strips it from the self
+	// copy); it is only attached to the parent mirror below.
+	selfPayload := s.agentEventPayload(state.narratorID, event)
+	s.Hub.BroadcastNarrator(state.narratorID, selfPayload)
+
+	if !isSubagent {
+		return
+	}
+	// Only mirror live streaming/content frames to the parent. Terminal and
+	// lifecycle frames (done/error/status/quota/payment/etc.) are delivered to the
+	// parent through dedicated broadcasts (subagent_status_changed,
+	// background_task_output/completed, ...), so forwarding the raw passthrough
+	// here would duplicate or confuse those. This set matches the frames TS
+	// dualBroadcasts with subagent linking (narrator-event-handler.ts).
+	if !subagentLiveMirrorEventTypes[event.Type] {
+		return
+	}
+	parentID, parentToolUseID := s.subagentBroadcastRoute(ctx, state, narrator)
+	if parentID == "" || parentID == state.narratorID {
+		return
+	}
+	parentPayload := s.agentEventPayload(parentID, event)
+	parentPayload["subagentNarratorId"] = state.narratorID
+	if parentToolUseID != "" {
+		parentPayload["parentToolUseId"] = parentToolUseID
+	}
+	if event.Type == "context_usage" || event.Type == "metering" {
+		parentPayload["isSubagent"] = true
+	}
+	s.Hub.BroadcastNarrator(parentID, parentPayload)
+}
+
+// subagentLiveMirrorEventTypes is the set of live streaming/content agent event
+// types that are mirrored from a subagent to its parent narrator in real time.
+// It matches the frames TS dualBroadcasts with subagent linking fields; terminal
+// and lifecycle frames are intentionally excluded because the parent receives
+// those via dedicated broadcasts.
+var subagentLiveMirrorEventTypes = map[string]bool{
+	"stream_text":      true,
+	"stream_reasoning": true,
+	"tool_use_chunk":   true,
+	"tool_call":        true,
+	"tool_result":      true,
+	"block_complete":   true,
+	"context_usage":    true,
+	"metering":         true,
+	"web_search":       true,
+	"image_generation": true,
+}
+
+// subagentBroadcastRoute resolves and caches a subagent run's parent narrator id
+// and parent tool_use id. The lookup runs at most once per run; subsequent events
+// reuse the cached values so live streaming never hits the DB per frame.
+func (s *Service) subagentBroadcastRoute(ctx context.Context, state *agentRunState, narrator Narrator) (string, string) {
+	if state.subagentRouteResolved {
+		return state.subagentParentID, state.subagentParentToolUseID
+	}
+	state.subagentRouteResolved = true
+	if narrator.ParentNarratorID != nil {
+		state.subagentParentID = strings.TrimSpace(*narrator.ParentNarratorID)
+	}
+	if state.subagentParentID != "" {
+		if toolUseID, err := s.subagentParentToolUseID(ctx, state.narratorID); err == nil {
+			state.subagentParentToolUseID = strings.TrimSpace(toolUseID)
+		}
+	}
+	return state.subagentParentID, state.subagentParentToolUseID
+}
+
+// contextUsageThresholds resolves the active prune/compact thresholds for a
+// reported context window, mirroring the TS getContextThresholds tier selection
+// (settings/provider.ts:826-837) and DEFAULT_CONTEXT_THRESHOLDS fallback (95/99).
+// A context window above LARGE_CONTEXT_BOUNDARY (600_000) selects the "large"
+// tier; otherwise "standard". User overrides under agent.contextThresholds[tier]
+// are honored when present.
+func (s *Service) contextUsageThresholds(contextWindow int) (pruneStart, compactStart int) {
+	pruneStart, compactStart = 95, 99
+	tier := "standard"
+	if contextWindow > 600000 {
+		tier = "large"
+	}
+	if s == nil || s.Settings == nil {
+		return pruneStart, compactStart
+	}
+	agent, _ := s.Settings.Raw()["agent"].(map[string]any)
+	all, _ := agent["contextThresholds"].(map[string]any)
+	cfg, _ := all[tier].(map[string]any)
+	if cfg == nil {
+		return pruneStart, compactStart
+	}
+	pruneStart = s.agentSettingIntFromMap(cfg, "pruneStart", pruneStart)
+	compactStart = s.agentSettingIntFromMap(cfg, "compactStart", compactStart)
+	return pruneStart, compactStart
+}
+
+func (s *Service) agentSettingIntFromMap(cfg map[string]any, key string, fallback int) int {
+	switch value := cfg[key].(type) {
+	case float64:
+		return int(value)
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return int(parsed)
+		}
+	}
+	return fallback
+}
+
+// agentEventPayload builds the WS frame for a single agent event for the given
+// narrator id. Extracted from broadcastAgentEvent so the same shaping logic can be
+// reused to mirror a subagent's live frames to its parent (with subagent linking
+// fields) without re-deriving every field.
+func (s *Service) agentEventPayload(narratorID string, event agentbasic.AgentEvent) map[string]any {
 	payload := map[string]any{"type": event.Type, "narratorId": narratorID}
 	if event.Text != "" {
 		payload["text"] = event.Text
@@ -987,6 +1299,21 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 			payload["percentage"] = 0
 		}
 	}
+	// context_usage frames carry the active prune/compact thresholds so the
+	// frontend status bar can render the recovery boundaries, mirroring the TS
+	// dualBroadcast context_usage payload (narrator-event-handler.ts:1485-1487 and
+	// the SSE copy at 1496-1498). Thresholds are tier-resolved from the reported
+	// context window (large tier above LARGE_CONTEXT_BOUNDARY), falling back to the
+	// TS DEFAULT_CONTEXT_THRESHOLDS (95/99) when no override is configured.
+	if event.Type == "context_usage" {
+		ctxWin := 0
+		if event.Usage != nil {
+			ctxWin = event.Usage.ContextWindow
+		}
+		pruneStart, compactStart := s.contextUsageThresholds(ctxWin)
+		payload["pruneStart"] = pruneStart
+		payload["compactStart"] = compactStart
+	}
 	if event.RequestID != "" {
 		payload["requestId"] = event.RequestID
 	}
@@ -1097,7 +1424,7 @@ func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentE
 		}
 		payload["detailedQuotaBalance"] = stringFromMetadata(event.Metadata, "detailedQuotaBalance")
 	}
-	s.Hub.BroadcastNarrator(narratorID, payload)
+	return payload
 }
 
 func (s *Service) persistCustomApiQuotaBalance(providerPrefix, quotaBalance, detailedQuotaBalance string) {
@@ -1673,6 +2000,11 @@ func (s *Service) broadcastModelSettingsApplied(narratorID string, event agentba
 
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
+	// A clean (non-overflow) completion resets the per-narrator context-overflow
+	// attempt counter, mirroring the TS loop resetting its local
+	// `contextOverflowRetries` to 0 once a turn completes without overflow so a
+	// future independent overflow starts counting from zero again.
+	resetContextOverflowRetries(state.narratorID)
 	if draftID := strings.TrimSpace(state.draftID()); draftID != "" {
 		msg, err := s.messageByID(ctx, state.narratorID, draftID)
 		if err == nil {
@@ -1751,7 +2083,9 @@ func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunStat
 	}
 	// Fail any in-flight tool calls so they do not stay stuck "running" after a
 	// timeout finalizes the run (mirrors TS closeNarrator → cleanupOrphanedToolCalls).
-	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+	// Use error/timeout wording rather than the user-interrupt text so the orphan
+	// is not mislabeled as a user cancellation.
+	if err := s.markOrphanedToolCalls(ctx, state.narratorID, "Narrator run timed out", orphanedToolOutputForError(s.toolLocale(ctx, state.narratorID))); err != nil {
 		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
 	}
 	latest := s.latestRunNarrator(ctx, state)
@@ -1794,8 +2128,10 @@ func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *age
 	// event streamed, but never executed because the stream cut off) into explicit
 	// failures, mirroring the TS closeNarrator → cleanupOrphanedToolCalls path that
 	// runs on every terminal close. Without this, the tools stay "running" forever
-	// and the UI shows them stuck executing after reload. Non-fatal.
-	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+	// and the UI shows them stuck executing after reload. Use disconnect wording
+	// rather than the user-interrupt text so the orphan reflects the real cause.
+	// Non-fatal.
+	if err := s.markOrphanedToolCalls(ctx, state.narratorID, "Provider stream disconnected before completion", orphanedToolOutputForError(s.toolLocale(ctx, state.narratorID))); err != nil {
 		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
 	}
 	latest := s.latestRunNarrator(ctx, state)
@@ -1852,13 +2188,44 @@ func (s *Service) markInterruptedToolCalls(ctx context.Context, narratorID strin
 	}
 	const interruptErrorMessage = "Narrator interrupted by user"
 	output := interruptedByUserToolOutput(s.toolLocale(ctx, narratorID))
-	outputJSON, err := json.Marshal(map[string]any{"output": output})
+	return s.markOrphanedToolCalls(ctx, narratorID, interruptErrorMessage, output)
+}
+
+// markOrphanedToolCalls converts a narrator's in-flight tool calls
+// (initializing/pending/running) into explicit failures with the given internal
+// errorMessage and MODEL-FACING output_json. It is the shared primitive behind
+// the user-interrupt path (markInterruptedToolCalls) and the abnormal-termination
+// paths (error/timeout/silent_disconnect/payment_required) so each can attach the
+// reason-appropriate wording instead of mislabeling an error/timeout orphan as a
+// user interrupt. output_json is wrapped as {"output": ...} to match how Go
+// reconstructs tool_result content from stored output_json
+// (agent_history_content.go:outputTextForAgent) and is only written when NULL so
+// an already-finished call is never clobbered; completed_at is likewise only set
+// when currently NULL.
+func (s *Service) markOrphanedToolCalls(ctx context.Context, narratorID, internalErrorMessage, modelOutput string) error {
+	if s == nil || s.DB == nil || strings.TrimSpace(narratorID) == "" {
+		return nil
+	}
+	outputJSON, err := json.Marshal(map[string]any{"output": modelOutput})
 	if err != nil {
 		return err
 	}
 	now := db.NowISO()
-	_, err = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?), completed_at = COALESCE(completed_at, ?) WHERE narrator_id = ? AND status IN ('initializing', 'pending', 'running')`, interruptErrorMessage, string(outputJSON), now, narratorID)
+	_, err = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?), completed_at = COALESCE(completed_at, ?) WHERE narrator_id = ? AND status IN ('initializing', 'pending', 'running')`, internalErrorMessage, string(outputJSON), now, narratorID)
 	return err
+}
+
+// orphanedToolOutputForError returns the bilingual MODEL-FACING tool result text
+// for a tool call that never finished because the run terminated abnormally
+// (provider error, first-token timeout, or silent disconnect). Distinct from
+// interruptedByUserToolOutput so the model is told the run failed/disconnected
+// rather than that the user cancelled it. The locale mirrors the narrator owner's
+// locale (toolLocale), aligning with the user-interrupt path.
+func orphanedToolOutputForError(locale string) string {
+	if locale == "zh-CN" {
+		return "此工具调用在执行前因会话异常结束（错误、超时或连接中断）而被中断。"
+	}
+	return "This tool call was interrupted before it could finish because the run ended abnormally (error, timeout, or disconnect)."
 }
 
 func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunState) error {
@@ -1906,8 +2273,10 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 	}
 	// Fail any in-flight tool calls so they do not stay stuck "running" after an
 	// error finalizes the run (mirrors TS closeNarrator → cleanupOrphanedToolCalls).
+	// Use error wording rather than the user-interrupt text so the orphan is not
+	// mislabeled as a user cancellation.
 	// Non-fatal: the disp message + status update below must still run.
-	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+	if err := s.markOrphanedToolCalls(ctx, state.narratorID, "Narrator run failed", orphanedToolOutputForError(s.toolLocale(ctx, state.narratorID))); err != nil {
 		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
 	}
 	_, _ = s.addMessage(ctx, state.narratorID, "disp", "AI provider call failed: "+message, nil)
@@ -1958,6 +2327,17 @@ func (s *Service) finishAgentRunError(ctx context.Context, state *agentRunState,
 func (s *Service) finishAgentRunPaymentRequired(ctx context.Context, state *agentRunState, event agentbasic.AgentEvent) error {
 	state.completed = true
 	state.errored = true
+	// Fail any in-flight tool calls so they do not stay stuck "running" after the
+	// run finalizes on payment_required. TS routes payment_required through the
+	// same finalizeOrCleanupPartialMessage path as the error/silent-disconnect
+	// branches (narrator-session.ts:1827-1843), so the orphaned-tool cleanup must
+	// run here too — otherwise a tool that streamed-but-never-executed before the
+	// provider reported insufficient balance stays "running" forever in the UI.
+	// Use error wording (not the user-interrupt text) since this is an abnormal
+	// termination. Non-fatal: the status persistence below must still run.
+	if err := s.markOrphanedToolCalls(ctx, state.narratorID, "Narrator run stopped: payment required", orphanedToolOutputForError(s.toolLocale(ctx, state.narratorID))); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
+	}
 	message := strings.TrimSpace(event.Message)
 	if message == "" {
 		message = "Insufficient balance"

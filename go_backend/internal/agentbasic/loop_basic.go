@@ -3,10 +3,12 @@ package agentbasic
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +39,7 @@ type toolChunkAccum struct {
 type toolExecOutcome struct {
 	Run           ToolRun
 	IsError       bool
+	Broken        bool
 	DurationMs    int64
 	SideCars      []AgentSideCar
 	SideCarsReady bool
@@ -140,28 +143,96 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, settings *conf
 		}
 		flushTurnBlocks(ctx, out, state)
 		emitAgentEvent(ctx, out, AgentEvent{Type: "assistant_message", Text: state.assistantText, ToolUses: append([]ToolCall(nil), state.toolUses...), CredentialID: state.credentialID})
+		// Reminder for orphaned tool uses (streaming chunks cut off before Stop).
+		// Mirrors TS loop.ts:3553-3556. When committed broken tool_uses also exist
+		// below, the broken reminder overrides this (matching TS:3857-3885).
+		orphanReminder := ""
+		if len(state.orphanedToolNames) > 0 {
+			orphanReminder = brokenToolCallReminder(strings.Join(state.orphanedToolNames, ", "), options.locale)
+		}
 		if len(state.toolUses) == 0 {
+			if orphanReminder != "" {
+				// Orphaned tool uses but nothing committed this turn: push an
+				// assistant turn with no tool uses + a user turn carrying the
+				// reminder, then continue (mirrors TS loop.ts:3557-3583 where the
+				// reminder becomes the next turn's content). Without this the loop
+				// would mis-emit "done" on a truncated tool call.
+				adapter.PushAssistantTurn(&built, state.assistantText, nil, nil)
+				adapter.PushUserTurn(&built, orphanReminder, nil)
+				emitAgentEvent(ctx, out, AgentEvent{Type: "turn_complete", TurnIndex: turn})
+				if options.shouldStopHook != nil && options.shouldStopHook() {
+					return
+				}
+				continue
+			}
 			emitAgentEvent(ctx, out, AgentEvent{Type: "done"})
 			return
 		}
-		adapter.PushAssistantTurn(&built, state.assistantText, state.toolUses, nil)
+		// Execute this turn's tools FIRST. The executor records each result and
+		// flags truncated/malformed input via ToolRun.Broken, populating
+		// state.brokenToolUses. Mirrors TS where broken ids come from settled
+		// executor results (loop.ts:1895) before the assistant turn is pushed.
 		toolResults, ok := executeTurnTools(ctx, out, adapter, cwd, toolExecutor, state, options, turn, options.maxTurns)
 		if !ok {
 			return
 		}
+		// Strip broken tool calls from the assistant turn sent to the model. The UI
+		// already has the full picture (block_complete + tool_call + the executor's
+		// isError tool_result were emitted), but the model should not see the broken
+		// tool_use + tool_result pair (mirrors TS loop.ts:3853-3876). The broken
+		// results were already excluded from toolResults inside executeTurnTools.
+		cleanToolUses, brokenNames := splitBrokenToolUses(state)
+		adapter.PushAssistantTurn(&built, state.assistantText, cleanToolUses, nil)
 		options.sideCarInitialCompletedToolCount = state.completedToolCount
 		options.silentToolCallCount = state.silentToolCallCount
 		afterToolsSideCars := collectAfterToolsSideCars(ctx, options)
 		if len(afterToolsSideCars) > 0 {
 			emitAgentEvent(ctx, out, AgentEvent{Type: "sidecars", SideCars: afterToolsSideCars})
 		}
-		adapter.PushUserTurn(&built, appendAgentSideCarsForProvider("", afterToolsSideCars), toolResults)
+		// Inject the broken-tool reminder (overriding any orphan reminder) into the
+		// next user turn content, mirroring TS nextTurnContent assembly
+		// (loop.ts:3878-3909): reminder first, then after-tools sidecars.
+		reminder := orphanReminder
+		if len(brokenNames) > 0 {
+			reminder = brokenToolCallReminder(strings.Join(brokenNames, ", "), options.locale)
+		}
+		nextContent := appendAgentSideCarsForProvider("", afterToolsSideCars)
+		if reminder != "" {
+			if strings.TrimSpace(nextContent) != "" {
+				nextContent = reminder + "\n\n" + nextContent
+			} else {
+				nextContent = reminder
+			}
+		}
+		adapter.PushUserTurn(&built, nextContent, toolResults)
 		emitAgentEvent(ctx, out, AgentEvent{Type: "turn_complete", TurnIndex: turn})
 		if options.shouldStopHook != nil && options.shouldStopHook() {
 			return
 		}
 	}
-	emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: "tool loop reached maximum rounds without final answer"})
+	// Reaching maxTurns is not an error: mirror TS loop.ts:3916 which yields a
+	// dedicated max_turns_exceeded event after the turnLoop exits. The narrator
+	// event handler surfaces it (TS narrator-executor.ts:163-167 sets a clear
+	// "Max turns (N) exceeded" message) rather than the misleading generic
+	// "maximum rounds" provider error Go previously emitted.
+	emitAgentEvent(ctx, out, AgentEvent{Type: "max_turns_exceeded", Metadata: map[string]any{"maxTurns": options.maxTurns}})
+}
+
+// splitBrokenToolUses partitions a turn's committed tool uses into the non-broken
+// calls (sent to the model) and the names of the broken calls (used for the
+// brokenToolCallReminder). Order follows state.toolUses so the reminder lists the
+// tools in call order. Mirrors TS loop.ts:3858-3884.
+func splitBrokenToolUses(state *turnState) ([]ToolCall, []string) {
+	clean := make([]ToolCall, 0, len(state.toolUses))
+	var brokenNames []string
+	for _, tu := range state.toolUses {
+		if state.brokenToolUses[tu.ID] {
+			brokenNames = append(brokenNames, tu.Function.Name)
+			continue
+		}
+		clean = append(clean, tu)
+	}
+	return clean, brokenNames
 }
 
 func applyRuntimeSettingsOverride(ctx context.Context, out chan<- AgentEvent, settings *config.Store, turn int, resolution *ProviderResolution, adapter *ProviderAdapter, options *generateOptions) bool {
@@ -256,10 +327,22 @@ type turnState struct {
 	silentToolCallCount   int
 	outputTruncated       bool
 	sawMeaningfulResponse bool
+	// brokenToolUses tracks committed tool_use calls whose streamed input was cut
+	// off mid-stream (malformed/truncated JSON, or empty input for file-writing
+	// tools). Mirrors TS brokenToolUseIds (loop.ts:1844). Broken tools are not
+	// executed, their tool_result carries the brokenToolCallResult message + a
+	// sanitized brokenInputOverride, they are stripped from the model history, and
+	// a brokenToolCallReminder is injected into the next turn (loop.ts:3853-3885).
+	brokenToolUses map[string]bool
+	// orphanedToolNames collects names of streaming tool chunks that never received
+	// a Stop signal before the stream ended (truncated by max_tokens). Mirrors TS
+	// orphanedToolNames (loop.ts:3500-3505). They are not committed as tool_uses;
+	// they only drive the brokenToolCallReminder injected into the next turn.
+	orphanedToolNames []string
 }
 
 func newTurnState(initialCompletedToolCount, silentToolCallCount int) *turnState {
-	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}, completedOutcomes: map[string]toolExecOutcome{}, yieldedToolResults: map[string]bool{}, completedToolCount: initialCompletedToolCount, silentToolCallCount: silentToolCallCount}
+	return &turnState{seenToolUses: map[string]bool{}, emittedToolCalls: map[string]bool{}, reasoning: map[string]*reasoningAccum{}, earlyExec: map[string]<-chan toolExecOutcome{}, completedOutcomes: map[string]toolExecOutcome{}, yieldedToolResults: map[string]bool{}, brokenToolUses: map[string]bool{}, completedToolCount: initialCompletedToolCount, silentToolCallCount: silentToolCallCount}
 }
 
 // hasStartedEarlyToolExecution reports whether any eager (early) tool execution
@@ -529,6 +612,16 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 			return state, &firstTokenTimeoutError{Message: message}
 		case event, ok := <-stream:
 			if !ok {
+				// Detect orphaned tool uses — streaming tool chunks that never
+				// received a Stop signal before the stream ended (typically API
+				// max_tokens truncation). They were never committed as tool_uses,
+				// so they only drive the brokenToolCallReminder for the next turn.
+				// Mirrors TS orphanedToolNames (loop.ts:3500-3505).
+				for _, acc := range chunks {
+					if name := strings.TrimSpace(acc.Name); name != "" {
+						state.orphanedToolNames = append(state.orphanedToolNames, name)
+					}
+				}
 				return state, nil
 			}
 			if event.Err != nil {
@@ -797,6 +890,14 @@ func addToolUse(ctx context.Context, out chan<- AgentEvent, state *turnState, ca
 	}
 	state.seenToolUses[call.ID] = true
 	state.toolUses = append(state.toolUses, call)
+	// Broken tool calls (truncated/malformed input) are detected by the tool
+	// executor at execution time (it returns ToolRun.Broken with a specific
+	// isError result that is persisted), mirroring TS executeTool broken handling
+	// (tool-executor.ts:213-249) where brokenToolUseIds is populated from
+	// settled.broken (loop.ts:1895), NOT from a pre-stream check. We therefore let
+	// every committed tool_use flow to the executor so its result is recorded; the
+	// loop strips broken tool_uses from the model history + injects the reminder
+	// once executeTurnTools reports them via state.brokenToolUses.
 	emitAgentEvent(ctx, out, AgentEvent{Type: "block_complete", Block: toolUseBlock(call)})
 	emitToolCallIfMissing(ctx, out, call, state.emittedToolCalls)
 	if isStrictSerialTool(call) {
@@ -830,6 +931,14 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 	// tool_result events are still shown to the UI, but the history is not pushed.
 	hasFatal := false
 	fatalMessage := ""
+	// All committed tool_uses run through the executor so their results are
+	// recorded/persisted (mirroring TS where broken detection lives inside
+	// executeTool, tool-executor.ts:213-249). The executor returns ToolRun.Broken
+	// for truncated/malformed input; we collect those ids below into
+	// state.brokenToolUses so the broken tool_use is later stripped from the
+	// model-facing history and a brokenToolCallReminder is injected
+	// (loop.ts:3853-3885). Broken results are still recorded with their specific
+	// isError output (the executor's guarded message), matching TS.
 	for _, group := range toolExecutionGroups(state.toolUses) {
 		outcomes := make([]toolExecOutcome, len(group))
 		if len(group) == 1 {
@@ -889,6 +998,15 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 			processed++
 			if !state.yieldedToolResults[call.ID] {
 				emitToolResultEvent(ctx, out, state, call, outcome)
+			}
+			// A broken tool (truncated/malformed input) was detected by the executor:
+			// its specific isError result was already recorded + emitted above, but
+			// the broken tool_use + result pair is stripped from the model-facing
+			// history (loop.ts:3853-3865) and triggers the next-turn reminder. Record
+			// the id so runAgentLoopSync can strip it from the assistant turn.
+			if outcome.Broken {
+				state.brokenToolUses[call.ID] = true
+				continue
 			}
 			toolResults = append(toolResults, adapter.FormatToolResult(call.ID, outputForModel, outcome.IsError))
 			if run.Fatal && !hasFatal {
@@ -968,6 +1086,134 @@ func turnNudgeReminder(turnIndex, maxTurns int, locale string) string {
 		return fmt.Sprintf("\n\n[系统提示：你已使用 %d/%d 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]", turnIndex, maxTurns)
 	}
 	return fmt.Sprintf("\n\n[SYSTEM: You have used %d of %d turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]", turnIndex, maxTurns)
+}
+
+// brokenToolCallResultMessage mirrors the TS tool.brokenToolCallResult i18n
+// message (i18n.ts:226-230). It replaces the model-facing tool result for a tool
+// whose streamed input was truncated by the token limit so the model is told the
+// call was not executed and how to recover (skeleton-first + 10k char cap).
+func brokenToolCallResultMessage(locale string) string {
+	if locale == "zh-CN" {
+		return "工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。"
+	}
+	return "Tool input was truncated by token limit — not executed. Each call must be under 10,000 chars. Use skeleton-first approach: Write a skeleton with SPLICE markers, then Edit to fill each marker."
+}
+
+// brokenToolCallReminder mirrors the TS tool.brokenToolCallReminder i18n message
+// (i18n.ts:204-221). It is prepended to the next turn's user message naming the
+// broken tool(s) so the model switches strategy instead of blindly retrying the
+// same oversized write. The {toolNames} placeholder is the comma-joined list of
+// broken tool names.
+func brokenToolCallReminder(toolNames, locale string) string {
+	if locale == "zh-CN" {
+		return fmt.Sprintf(`[系统提示：你上一次的 %s 调用已损坏——输出在工具输入完成前被 token 限制截断，因此未被执行。损坏的调用已从历史中移除以节省上下文。
+
+严格规则——你必须严格遵守以下规则，避免重复截断：
+1. 每次工具调用的总输入必须小于 10,000 字符（包括 file_path、old_string、new_string、content 等所有字段）。
+2. 骨架优先策略（新文件）：用 Write 创建文件骨架——包含真实的开头代码，然后在需要大段内容的位置放置编号的拼接标记，最后是真实的结尾代码。骨架本身必须小于 10,000 字符。根据文件类型使用对应注释语法（如 JS/TS 用 // SPLICE_1，Jinja 用 {# SPLICE_1 #}，HTML 用 <!-- SPLICE_1 -->）。标记按顺序编号：SPLICE_1、SPLICE_2、SPLICE_3 等。
+3. 用 Edit 填充：对每个标记，调用 Edit，old_string="// SPLICE_1"（只写标记本身，不要多写），new_string=<该段的真实内容>。如果某段仍然过大，将标记替换为部分内容 + 新的子标记（如 SPLICE_1a、SPLICE_1b）。
+4. 绝对不要在单次调用中写入/编辑超过 10,000 字符。绝对不要用 Write 覆盖已有内容的文件。
+5. 大范围替换已有文件：拆分为多个小 Edit，用不同的唯一短锚点作为 old_string。]`, toolNames)
+	}
+	return fmt.Sprintf(`[SYSTEM: Your previous %s call(s) were broken — the output was cut off by the token limit before the tool input was complete, so they were not executed. The broken call has been removed from history to save context.
+
+STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
+1. Each tool call's TOTAL input must be under 10,000 characters (including file_path, old_string, new_string, content — everything).
+2. SKELETON-FIRST approach for new files: Use Write to create the file with a SKELETON — include the real opening code, then place numbered splice markers where large sections will go, then the real closing code. The skeleton itself must be under 10,000 chars. Use the file type's comment syntax for markers (e.g. // SPLICE_1 for JS/TS, {# SPLICE_1 #} for Jinja, <!-- SPLICE_1 --> for HTML). Number markers sequentially: SPLICE_1, SPLICE_2, SPLICE_3, etc.
+3. FILL via Edit: For each marker, call Edit with old_string="// SPLICE_1" (just the marker, nothing more) and new_string=<the real content for that section>. If a section is still too large, replace the marker with partial content + a new sub-marker (e.g. SPLICE_1a, SPLICE_1b).
+4. NEVER write/edit more than 10,000 characters in a single tool call. NEVER use Write to overwrite a file that already exists with content.
+5. For large replacements in existing files: split into multiple small Edit calls with different unique short anchors as old_string.]`, toolNames)
+}
+
+// brokenToolInputPlaceholder mirrors the TS tool.brokenToolCallInputPlaceholder
+// i18n message (i18n.ts:222-225). It replaces large content fields in a broken
+// tool's sanitized input for persistence.
+func brokenToolInputPlaceholder(locale string) string {
+	if locale == "zh-CN" {
+		return "[过长的单次输出，输出被截断]"
+	}
+	return "[Content too large for single output — output was truncated]"
+}
+
+var brokenInputFilePathRe = regexp.MustCompile(`"file_path"\s*:\s*"([^"]+)"`)
+
+// sanitizeBrokenInput mirrors the TS sanitizeBrokenInput (tool-executor.ts:450).
+// It builds a readable sanitized input for a broken tool call: structural fields
+// (file_path, etc.) are kept while large content fields (content/old_string/
+// new_string) are replaced with a short placeholder. When the input is only the
+// raw truncated JSON ({"_raw": "..."}), it extracts file_path from the raw text.
+func sanitizeBrokenInput(toolName string, input map[string]any, locale string) map[string]any {
+	placeholder := brokenToolInputPlaceholder(locale)
+	clean := map[string]any{}
+	isEdit := toolName == "Edit"
+
+	if raw, ok := input["_raw"]; ok && len(input) == 1 {
+		rawStr, _ := raw.(string)
+		filePath := ""
+		if match := brokenInputFilePathRe.FindStringSubmatch(rawStr); len(match) == 2 {
+			filePath = match[1]
+		}
+		clean["file_path"] = filePath
+		if isEdit {
+			clean["old_string"] = placeholder
+			clean["new_string"] = placeholder
+		} else {
+			clean["content"] = placeholder
+		}
+		return clean
+	}
+
+	for key, value := range input {
+		if key == "_raw" {
+			continue
+		}
+		if key == "content" || key == "old_string" || key == "new_string" {
+			clean[key] = placeholder
+		} else {
+			clean[key] = value
+		}
+	}
+	if _, ok := clean["file_path"]; !ok {
+		clean["file_path"] = ""
+	}
+	if isEdit {
+		if _, ok := clean["old_string"]; !ok {
+			clean["old_string"] = placeholder
+		}
+		if _, ok := clean["new_string"]; !ok {
+			clean["new_string"] = placeholder
+		}
+	} else if _, ok := clean["content"]; !ok {
+		clean["content"] = placeholder
+	}
+	return clean
+}
+
+// isBrokenToolCall reports whether a committed tool_use call carries truncated /
+// malformed input that must not be executed. Mirrors the TS tool-executor broken
+// detection (tool-executor.ts:212-249): (1) the arguments did not parse as a JSON
+// object so toolCallInput surfaced a `_raw` field, or (2) a file-writing tool
+// (Write/Edit) received an empty input object (complete truncation). Go infers
+// "broken" from the accumulated argument string + tool name (no provider type
+// changes needed) at the point the Stop signal commits the call.
+func isBrokenToolCall(name, arguments string) bool {
+	trimmed := strings.TrimSpace(arguments)
+	// Non-empty argument text that does not parse as a JSON object is malformed —
+	// it would surface as {"_raw": ...} downstream. newFunctionToolCall normalizes
+	// "" to "{}", so an empty/"{}" payload is handled by the file-tool check below.
+	if trimmed != "" && trimmed != "{}" && !json.Valid([]byte(trimmed)) {
+		return true
+	}
+	var obj map[string]any
+	if trimmed != "" && json.Unmarshal([]byte(trimmed), &obj) != nil {
+		// Valid JSON that is not an object (array/scalar) is also malformed input.
+		return true
+	}
+	// Complete truncation: file-writing tools that received no input at all.
+	if (name == "Write" || name == "Edit") && len(obj) == 0 {
+		return true
+	}
+	return false
 }
 
 func normalizeAgentSideCars(sideCars []AgentSideCar, fallbackToolUseID string, forceToolUseID bool) []AgentSideCar {
@@ -1203,7 +1449,7 @@ func executeToolCall(ctx context.Context, out chan<- AgentEvent, cwd string, too
 	if strings.TrimSpace(run.Error) != "" {
 		isError = true
 	}
-	return toolExecOutcome{Run: run, IsError: isError, DurationMs: time.Since(started).Milliseconds()}
+	return toolExecOutcome{Run: run, IsError: isError, Broken: run.Broken, DurationMs: time.Since(started).Milliseconds()}
 }
 
 func toolExecutionGroups(toolUses []ToolCall) [][]ToolCall {
@@ -1376,6 +1622,16 @@ func collectAgentResult(stream <-chan AgentEvent) (Result, error) {
 			return Result{}, errors.New(event.Message)
 		case "invalid_state":
 			return Result{}, errors.New(firstNonEmpty(event.Message, event.Reason))
+		case "max_turns_exceeded":
+			// The non-streaming Generate path treats hitting maxTurns as an error
+			// (no final answer was produced). Mirrors TS narrator-executor.ts:163-167
+			// which marks max_turns_exceeded as hasError. The message retains
+			// "maximum rounds" wording for the bare-agent Generate callers.
+			maxTurns := 0
+			if v, ok := event.Metadata["maxTurns"].(int); ok {
+				maxTurns = v
+			}
+			return Result{}, fmt.Errorf("tool loop reached maximum rounds (%d) without final answer", maxTurns)
 		}
 	}
 	if strings.TrimSpace(result.Text) != "" {

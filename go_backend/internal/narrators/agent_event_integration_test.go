@@ -1348,11 +1348,15 @@ func TestRunBasicAgentGoalContinuationPersistsSystemMessageAndCompletesGoal(t *t
 		t.Fatalf("expected continuation to complete goal, got %s", status)
 	}
 	var role, contentJSON string
-	if err := service.DB.QueryRow(`SELECT role, content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'system' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&role, &contentJSON); err != nil {
+	// goal_continuation is persisted with role="sys" (model-visible) to mirror TS
+	// narratorService.persistSystemMessage (narrator-persistence.ts:221), so the
+	// continuation prompt actually reaches the model. role="system" would be dropped
+	// by agent_history_content.go's default branch.
+	if err := service.DB.QueryRow(`SELECT role, content_json FROM narrator_messages WHERE narrator_id = ? AND role = 'sys' ORDER BY created_at DESC LIMIT 1`, narratorID).Scan(&role, &contentJSON); err != nil {
 		t.Fatalf("load continuation message: %v", err)
 	}
-	if role != "system" || !strings.Contains(contentJSON, "goal_continuation") {
-		t.Fatalf("expected persisted goal continuation system block, role=%s content=%s", role, contentJSON)
+	if role != "sys" || !strings.Contains(contentJSON, "goal_continuation") {
+		t.Fatalf("expected persisted goal continuation sys block, role=%s content=%s", role, contentJSON)
 	}
 	seenEvent := false
 	for _, event := range events() {
@@ -1628,41 +1632,89 @@ func TestManualPlanModeExitCancelsPendingExitPlanModeApproval(t *testing.T) {
 	}
 }
 
-func TestRunBasicAgentDangerReflectionCanCancelDangerousTool(t *testing.T) {
+// TestRunBasicAgentDefaultModeDangerousToolAsksInsteadOfReflecting asserts the
+// TS-parity gate: in the interactive "default" permission mode a dangerous write
+// command must NOT trigger AI danger reflection. Danger reflection is the
+// BYPASS-ALLOW gate only (narrator-permission.ts:2497-2519 fires solely under
+// `decision === "allow" && effectiveMode === "bypassPermissions"`). In default
+// mode the dangerous write resolves to `decision === "ask"`
+// (narrator-permission.ts:495) and pauses for an interactive permission request,
+// so the tool call is recorded as pending/awaiting_permission and reflection is
+// never invoked. The bypass-mode reflection path is covered by
+// TestRunBasicAgentBypassPermissionsStillRunsDangerReflection.
+func TestRunBasicAgentDefaultModeDangerousToolAsksInsteadOfReflecting(t *testing.T) {
+	reflectionRequested := false
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		w.Header().Set("Content-Type", "application/json")
+		// A DangerCancel tool in the request payload means a danger-reflection
+		// loop was started — which must never happen in default mode.
 		if requestHasTool(body, "DangerCancel") {
-			if requestHasToolResult(body) {
-				_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger reflection done"}}}})
-				return
-			}
+			reflectionRequested = true
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-cancel-1", "type": "function", "function": map[string]any{"name": "DangerCancel", "arguments": `{"confirm":true,"feedback":"Do not run this command."}`}}}}}}})
 			return
 		}
 		if requestHasToolResult(body) {
-			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger cancelled"}}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "done"}}}})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch should-not-run"}`}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"rm -rf protected-dir"}`}}}}}}})
 	}))
 	defer server.Close()
 	service, narratorID, cwd := newTestNarratorService(t, "openai:gpt-test", server.URL)
-	_, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'on' WHERE id = ?`, narratorID)
-	if err != nil {
+	// danger_reflection_override='on' must NOT promote an interactive "ask" into a
+	// reflection: the override raises the reflection sensitivity level, but the
+	// bypass-allow gate still controls whether reflection actually runs.
+	if _, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
 		t.Fatalf("enable danger reflection: %v", err)
 	}
-	service.runBasicAgent(context.Background(), narratorID)
-	if _, err := os.Stat(filepath.Join(cwd, "should-not-run")); err == nil {
-		t.Fatalf("danger reflection should have prevented Bash execution")
+
+	// Run the agent in the background: the dangerous Bash will pause on an
+	// interactive permission request (waitForPermissionDecision), so we poll for
+	// the pending tool-call row and then cancel to unblock the loop.
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		service.runBasicAgent(ctx, narratorID)
+		close(done)
+	}()
+
+	deadline := time.After(15 * time.Second)
+	sawPending := false
+	for !sawPending {
+		var status sql.NullString
+		err := service.DB.QueryRow(`SELECT status FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'danger-bash-1'`, narratorID).Scan(&status)
+		if err == nil && strings.EqualFold(strings.TrimSpace(status.String), "pending") {
+			sawPending = true
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("dangerous Bash never reached interactive permission request (status query err=%v)", err)
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	var status, outputRaw string
-	if err := service.DB.QueryRow(`SELECT status, output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'danger-bash-1'`, narratorID).Scan(&status, &outputRaw); err != nil {
+	cancel()
+	<-done
+
+	if reflectionRequested {
+		t.Fatalf("default mode must NOT run danger reflection for a dangerous tool (bypass-allow gate only)")
+	}
+	// The dangerous command must never have executed while awaiting approval.
+	if _, err := os.Stat(filepath.Join(cwd, "protected-dir")); err == nil {
+		t.Fatalf("dangerous Bash must not execute before permission approval")
+	}
+	// The tool call must be persisted as a pending interactive permission request,
+	// proving the default-mode "ask" path was taken instead of reflection.
+	var status sql.NullString
+	if err := service.DB.QueryRow(`SELECT status FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'danger-bash-1'`, narratorID).Scan(&status); err != nil {
 		t.Fatalf("load danger tool call: %v", err)
 	}
-	if status != "fail" || !strings.Contains(outputRaw, "Do not run") {
-		t.Fatalf("unexpected danger tool result status=%s output=%s", status, outputRaw)
+	if !strings.EqualFold(strings.TrimSpace(status.String), "pending") {
+		t.Fatalf("expected dangerous tool to await interactive permission (pending), got %q", status.String)
 	}
 }
 
@@ -1683,13 +1735,17 @@ func TestRunBasicAgentDangerReflectionBroadcastsStartedAndResolved(t *testing.T)
 			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "danger cancelled"}}}})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"touch should-not-run"}`}}}}}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"choices": []map[string]any{{"message": map[string]any{"role": "assistant", "content": "", "tool_calls": []map[string]any{{"id": "danger-bash-1", "type": "function", "function": map[string]any{"name": "Bash", "arguments": `{"command":"rm -rf protected-data"}`}}}}}}})
 	}))
 	defer server.Close()
 	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
 	hub, events := captureNarratorBroadcasts()
 	service.Hub = hub
-	if _, err := service.DB.Exec(`UPDATE narrators SET danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
+	// Danger reflection is the bypass-allow gate: it only fires when permissions are
+	// already opened (bypassPermissions) AND the auto-running command is dangerous
+	// (narrator-permission.ts:2497). Use bypassPermissions so the reflection actually
+	// runs and emits the started/resolved broadcasts this test validates.
+	if _, err := service.DB.Exec(`UPDATE narrators SET permission_mode = 'bypassPermissions', danger_reflection_override = 'on' WHERE id = ?`, narratorID); err != nil {
 		t.Fatalf("enable danger reflection: %v", err)
 	}
 	service.runBasicAgent(context.Background(), narratorID)

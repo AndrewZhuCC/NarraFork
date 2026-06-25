@@ -423,14 +423,16 @@ func TestEditAndRegeneratePreservesCompactBoundaryAndDeletesLongToolChain(t *tes
 	if err != nil {
 		t.Fatalf("agent history: %v", err)
 	}
-	if len(history) != 2 {
-		t.Fatalf("expected compact summary plus edited user only, got %#v", history)
+	if len(history) != 1 {
+		t.Fatalf("expected edited user only, got %#v", history)
 	}
-	if history[0].Role != "user" || !strings.Contains(history[0].Content, "Prior compacted conversation summary:\nPrior compacted context") {
-		t.Fatalf("compact boundary summary mismatch: %#v", history[0])
+	for _, msg := range history {
+		if strings.Contains(msg.Content, "Prior compacted conversation summary") {
+			t.Fatalf("compact summary must NOT be injected into history; got %#v", msg)
+		}
 	}
-	if history[1].Role != "user" || history[1].Content != "new question" {
-		t.Fatalf("edited user history mismatch: %#v", history[1])
+	if history[0].Role != "user" || history[0].Content != "new question" {
+		t.Fatalf("edited user history mismatch: %#v", history[0])
 	}
 }
 

@@ -267,6 +267,89 @@ func numericJSONPath(raw string, key string) float64 {
 	return value
 }
 
+// codexWrappedFrameError parses a Codex WebSocket frame (or close reason) that
+// carries a wrapped error payload and returns a classified error, or nil when
+// the text is not an error envelope. Mirrors the TS codex-websocket
+// parseCodexWrappedError + formatWrappedError + classification flow: an "error"
+// envelope ({type:"error", error:{code,message,type}, status/status_code}) or a
+// flat {message|code|status} object is turned into an error whose message embeds
+// the status/code so classifyCodexRuntimeError can decide failover (quota/auth/
+// 5xx) downstream. A close reason may prefix the JSON with descriptive text, so
+// the embedded {...} substring is also tried (mirrors TS candidate list).
+func codexWrappedFrameError(text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+	candidates := []string{trimmed}
+	if start := strings.Index(trimmed, "{"); start >= 0 {
+		if end := strings.LastIndex(trimmed, "}"); end > start {
+			embedded := trimmed[start : end+1]
+			if embedded != trimmed {
+				candidates = append(candidates, embedded)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		var raw map[string]any
+		if err := json.Unmarshal([]byte(candidate), &raw); err != nil {
+			continue
+		}
+		if wrapped := codexWrappedErrorFromMap(raw); wrapped != nil {
+			return wrapped
+		}
+	}
+	return nil
+}
+
+// codexWrappedErrorFromMap mirrors the TS coerceWrappedError + formatWrappedError:
+// it recognizes a structured error envelope (type:"error" or a nested error
+// object with message/code/type) or a flat error object (message/code/status/
+// status_code) and formats a single error message embedding status/code.
+func codexWrappedErrorFromMap(raw map[string]any) error {
+	if raw == nil {
+		return nil
+	}
+	nested, _ := raw["error"].(map[string]any)
+	hasStructuredError := nested != nil && (stringValue(nested["message"]) != "" || stringValue(nested["code"]) != "" || stringValue(nested["type"]) != "")
+	_, hasStatus := raw["status"]
+	_, hasStatusCode := raw["status_code"]
+	hasFlatError := stringValue(raw["message"]) != "" || stringValue(raw["code"]) != "" || hasStatus || hasStatusCode
+	if stringValue(raw["type"]) != "error" && !hasStructuredError && !hasFlatError {
+		return nil
+	}
+	status := intValue(raw["status"], 0)
+	if status == 0 {
+		status = intValue(raw["status_code"], 0)
+	}
+	code := ""
+	message := ""
+	if nested != nil {
+		code = firstNonEmpty(stringValue(nested["code"]), stringValue(nested["type"]))
+		message = stringValue(nested["message"])
+	}
+	if code == "" {
+		code = stringValue(raw["code"])
+	}
+	if message == "" {
+		message = stringValue(raw["message"])
+	}
+	if message == "" {
+		message = "Codex WebSocket request failed"
+	}
+	suffix := []string{}
+	if status != 0 {
+		suffix = append(suffix, fmt.Sprintf("status=%d", status))
+	}
+	if code != "" {
+		suffix = append(suffix, "code="+code)
+	}
+	if len(suffix) > 0 {
+		return fmt.Errorf("%s (%s)", message, strings.Join(suffix, ", "))
+	}
+	return errors.New(message)
+}
+
 func codexResponsesAPIError(parsed responsesStreamEvent) *apiErrorPayload {
 	if parsed.Error != nil && (parsed.Error.Message != "" || parsed.Error.Code != nil || parsed.Error.Type != "") {
 		return parsed.Error

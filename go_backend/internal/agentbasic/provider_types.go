@@ -83,6 +83,26 @@ type ParsedStreamEvent struct {
 	ResponsesAPI           bool
 	StopReason             string
 	SilentDisconnect       bool
+	// NugModelCatalog / NugImageCacheAck carry the unified-gateway
+	// modelCatalogEvent / imageCacheAckEvent payloads (mirrors the TS
+	// ParsedStreamEvent.nugModelCatalog / nugImageCacheAck). They are emitted by
+	// the shared gateway data-event parser (parseGatewayDataEvent) on the
+	// OpenAI/Codex SSE+WebSocket paths and consumed by the Kiro/NUG layers.
+	NugModelCatalog  *NugModelCatalogSnapshot
+	NugImageCacheAck *NugImageCacheAckSnapshot
+}
+
+// NugModelCatalogSnapshot mirrors the TS nugModelCatalog gateway payload
+// ({ modelHash?, models }). Emitted on a unified-gateway modelCatalogEvent.
+type NugModelCatalogSnapshot struct {
+	ModelHash string
+	Models    []map[string]any
+}
+
+// NugImageCacheAckSnapshot mirrors the TS nugImageCacheAck gateway payload
+// ({ refs }). Emitted on a unified-gateway imageCacheAckEvent.
+type NugImageCacheAckSnapshot struct {
+	Refs []string
 }
 
 type ToolUseChunk struct {

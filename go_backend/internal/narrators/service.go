@@ -2744,6 +2744,7 @@ func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun,
 			run.Status = "error"
 			run.Output = "Tool input was malformed or truncated; refusing to execute " + strings.TrimSpace(call.Function.Name) + "."
 			run.Error = run.Output
+			run.Broken = true
 			return run, true
 		}
 	}
@@ -2754,6 +2755,7 @@ func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun,
 		run.Status = "error"
 		run.Output = "Tool input was malformed or truncated; refusing to execute " + strings.TrimSpace(call.Function.Name) + "."
 		run.Error = run.Output
+		run.Broken = true
 		return run, true
 	}
 	name := strings.ToLower(strings.TrimSpace(call.Function.Name))
@@ -2761,6 +2763,7 @@ func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun,
 		run.Status = "error"
 		run.Output = strings.TrimSpace(call.Function.Name) + " received empty input; refusing to execute."
 		run.Error = run.Output
+		run.Broken = true
 		return run, true
 	}
 	return run, false
@@ -2951,7 +2954,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		}
 		exitPlanApprovalReason := ""
 		if strings.EqualFold(strings.TrimSpace(call.Function.Name), "ExitPlanMode") {
-			preparedCall, handledRun, reason, err := s.prepareExitPlanModeApproval(execCtx, narratorID, call)
+			preparedCall, handledRun, reason, err := s.prepareExitPlanModeApproval(execCtx, narratorID, call, history)
 			if err != nil {
 				return agentbasic.ToolRun{}, err
 			}
@@ -3422,6 +3425,17 @@ func (s *Service) agentSystemPrompt(ctx context.Context, narrator Narrator) stri
 	if narrator.Cwd != nil {
 		cwd = strings.TrimSpace(*narrator.Cwd)
 	}
+	// Conversation Context (compact summary) is injected FIRST, immediately after
+	// the base prompt and BEFORE the working-directory / project / global sections.
+	// Mirrors TS narrator-prompt.ts buildEffectiveSystemPrompt step 1 (lines 64-70):
+	// the order is contextSummary → CWD → AGENT.md → global → language → plan mode.
+	// Placing it before CWD keeps the prompt-cache prefix and section ordering
+	// identical to the TS backend.
+	if narrator.ContextSummary != nil {
+		if summary := strings.TrimSpace(*narrator.ContextSummary); summary != "" {
+			prompt = appendPromptSection(prompt, "Conversation Context", summary)
+		}
+	}
 	if cwd != "" {
 		prompt = appendPromptSection(prompt, "Current Working Directory", "`"+cwd+"`\n\nAll tools already use this as their default working directory. Do NOT `cd` into it in Bash commands — it is redundant.")
 		if projectPrompt := firstReadableFile(filepath.Join(cwd, "AGENT.md"), filepath.Join(cwd, "CLAUDE.md")); projectPrompt != "" {
@@ -3432,11 +3446,6 @@ func (s *Service) agentSystemPrompt(ctx context.Context, narrator Narrator) stri
 	}
 	if globalPrompt := firstReadableFile(globalPromptFileCandidates()...); globalPrompt != "" {
 		prompt = appendPromptSection(prompt, "Global Instructions", truncateString(globalPrompt, 50000))
-	}
-	if narrator.ContextSummary != nil {
-		if summary := strings.TrimSpace(*narrator.ContextSummary); summary != "" {
-			prompt = appendPromptSection(prompt, "Conversation Context", summary)
-		}
 	}
 	// Reply-language instruction (mirrors TS narrator-prompt buildEffectiveSystemPrompt
 	// step 4): append the "## Language" section when the owner wants replies in their
@@ -3656,11 +3665,15 @@ func (s *Service) agentHistory(ctx context.Context, narratorID string) ([]agentb
 		return nil, err
 	}
 	history := []agentbasic.Message{}
-	if hasCompact {
-		if summary, err := s.compactSummary(ctx, compactRef.MessageID); err == nil && strings.TrimSpace(summary) != "" {
-			history = append(history, agentbasic.Message{Role: "user", Content: "Prior compacted conversation summary:\n" + strings.TrimSpace(summary)})
-		}
-	}
+	// NOTE: the compact summary is intentionally NOT injected into the model
+	// history here. On finalize-compact the summary is persisted to
+	// narrators.context_summary (context_overflow.go / handlers.go) and surfaces
+	// to the model via the system prompt's "## Conversation Context" section
+	// (agentSystemPrompt). TS mirrors this exactly: getMessagesSinceLastCompact
+	// (server/services/narrator-messages.ts:787) returns only messages strictly
+	// after the compact marker and never re-emits the summary as a history
+	// message. Re-adding it here would double-inject the summary (once in the
+	// system prompt, once in history).
 	for _, msg := range messages {
 		if msg.Role == "system" {
 			if prompt, ok := goalContinuationPromptFromMessage(msg); ok {
@@ -5068,7 +5081,12 @@ func (s *Service) injectReviewFeedback(ctx context.Context, reviewChapterID, sou
 	}
 	text := buildReviewFeedbackText(verdict, findings)
 	content := []map[string]any{{"type": "review_feedback", "verdict": verdict, "findings": findings, "reviewChapterId": reviewChapterID}}
-	msg, err := s.addMessageWithBlocks(ctx, sourceNarratorID, "system", text, content, nil)
+	// Model-visible system insertion: TS persists review feedback via
+	// narratorService.persistSystemMessage (role="sys") in
+	// server/services/review-event-handler.ts:92. role="sys" renders to the
+	// model through agent_history_content.go case "sys"; role="system" would be
+	// dropped by the default branch and never reach the model.
+	msg, err := s.addMessageWithBlocks(ctx, sourceNarratorID, "sys", text, content, nil)
 	if err != nil {
 		return err
 	}
@@ -8490,7 +8508,7 @@ func formatGoalReflectionHistory(history []agentbasic.Message, maxChars int) str
 	return text
 }
 
-func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, requestID, plan string, args map[string]any, allowedPrompts any) (reflectionDecision, error) {
+func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, requestID, plan string, args map[string]any, allowedPrompts any, history []agentbasic.Message) (reflectionDecision, error) {
 	// Build the reflection input mirroring TS resolveExitPlanModeInput's
 	// effectiveInput = {...input, plan: <resolved>}: copy the original args and
 	// overwrite plan with the resolved plan text so {inputJson} reflects what the
@@ -8506,7 +8524,13 @@ func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, request
 	}
 	locale := s.toolLocale(ctx, narratorID)
 	prompt := exitPlanReflectionPrompt(requestID, inputJSON, plan, formatExitPlanAllowedPromptsList(allowedPrompts), locale)
-	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"ExitPlanConfirm": true, "ExitPlanRevise": true})
+	// Seed the reflection loop with the real parent conversation history,
+	// mirroring TS runExitPlanModeReflectionLoop(config, history, ...)
+	// (loop.ts:1235) which calls agentLoop(reflectionConfig, prompt, [...history]).
+	// Danger and goal-completion reflections already thread history here; exit-plan
+	// must match so the readiness gate judges the plan against the actual
+	// conversation rather than the prompt text alone.
+	return s.runReflectionWithHistory(ctx, narratorID, history, prompt, map[string]bool{"ExitPlanConfirm": true, "ExitPlanRevise": true})
 }
 
 // formatExitPlanAllowedPromptsList mirrors TS formatAllowedPrompts
@@ -8744,9 +8768,17 @@ func shouldRunDangerReflectionBeforeExecution(settings *config.Store, narrator N
 	case "exitplanmode", "askuserquestion":
 		return false
 	}
-	if permission.Action == "ask" {
-		return true
-	}
+	// Danger reflection is the BYPASS-ALLOW gate only: it fires when the user has
+	// already opened permissions (bypassPermissions) AND the about-to-auto-run
+	// command is dangerous. This mirrors TS narrator-permission.ts:2497-2519,
+	// where the danger-reflection pause is reached solely under
+	// `decision === "allow" && effectiveMode === "bypassPermissions"`. A normal
+	// interactive "ask" decision must NOT trigger reflection — the user is already
+	// being prompted, so running an AI self-check first would double-gate the call
+	// and over-trigger reflection on every approval prompt. (The catastrophic→fatal
+	// "deny" path is handled earlier in the executor and never reaches here, so the
+	// fatal decision stays ordered before any danger reflection, matching TS where
+	// `decision === "fatal"` returns before the allow/bypass reflection block.)
 	if permission.Action != "allow" {
 		return false
 	}
@@ -9464,11 +9496,21 @@ func (s *Service) runReflectionWithHistory(ctx context.Context, narratorID strin
 		messages = append(messages, msg)
 	}
 	messages = append(messages, agentbasic.Message{Role: "user", Content: prompt})
+	// Inherit the parent narrator's full system prompt, matching TS
+	// runReflectionLoop (loop.ts:909) which builds reflectionConfig as
+	// {...parentConfig} and therefore reuses parentConfig.systemPrompt (the
+	// parent's CWD/AGENT.md/Conversation Context/etc.). The "call exactly one
+	// allowed reflection tool" constraint is carried by the reflection user
+	// prompt itself (dangerReflectionPrompt / goalCompletionReflectionPrompt /
+	// exitPlanReflectionPrompt all state it), not by a separate gate system
+	// prompt — so seeding a fixed gate string here would diverge from TS and
+	// strip the parent context the reflection model needs.
+	reflectionSystemPrompt := s.agentSystemPrompt(ctx, narrator)
 	stream, err := agentbasic.RunAgentLoop(ctx, s.Settings, model, messages, cwd,
 		agentbasic.WithToolScope("reflection"),
 		agentbasic.WithMaxTurns(3),
 		agentbasic.WithToolExecutor(executor),
-		agentbasic.WithSystemPrompt("You are a strict NarraFork reflection gate. You must call exactly one allowed reflection tool; do not answer in plain text."),
+		agentbasic.WithSystemPrompt(reflectionSystemPrompt),
 	)
 	if err != nil {
 		return reflectionDecision{}, fmt.Errorf("reflection failed: %w", err)
@@ -9618,7 +9660,7 @@ func normalizeExitPlanAllowedPrompts(raw any) (any, string) {
 	return normalized, ""
 }
 
-func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID string, call agentbasic.ToolCall) (agentbasic.ToolCall, *agentbasic.ToolRun, string, error) {
+func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID string, call agentbasic.ToolCall, history []agentbasic.Message) (agentbasic.ToolCall, *agentbasic.ToolRun, string, error) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
 	args := map[string]any{}
 	if strings.TrimSpace(call.Function.Arguments) != "" {
@@ -9694,7 +9736,7 @@ func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID st
 			"reason":     strings.TrimSpace(reason),
 		})
 	}
-	decision, err := s.runExitPlanReflection(ctx, narratorID, planReflectionRequestID, plan, args, allowedPrompts)
+	decision, err := s.runExitPlanReflection(ctx, narratorID, planReflectionRequestID, plan, args, allowedPrompts, history)
 	if err != nil {
 		broadcastPlanReflectionResolved("deny", err.Error())
 		run.Status = "error"
@@ -10184,7 +10226,13 @@ func (s *Service) maybeStartGoalContinuation(ctx context.Context, narratorID str
 	}
 	prompt := buildGoalContinuationPrompt(active, goals, noToolContinuationCount)
 	block := map[string]any{"type": "goal_continuation", "goalId": active["id"], "objective": active["objective"]}
-	msg, err := s.addMessageWithBlocks(ctx, narratorID, "system", prompt, []map[string]any{block}, nil)
+	// Model-visible system insertion: TS persists the goal-continuation prompt
+	// via narratorService.persistSystemMessage (role="sys") in
+	// server/services/narrator-session.ts:631. role="sys" renders to the model
+	// through agent_history_content.go case "sys"; role="system" would be
+	// dropped by the default branch, so the continuation would never reach the
+	// model and the goal loop would stall.
+	msg, err := s.addMessageWithBlocks(ctx, narratorID, "sys", prompt, []map[string]any{block}, nil)
 	if err != nil {
 		return false, err
 	}

@@ -84,29 +84,31 @@ func TestAgentHistoryRebuildsStructuredContentJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("agentHistory returned error: %v", err)
 	}
-	if len(history) != 6 {
-		t.Fatalf("expected compact summary, assistant, tool result, content_json tool result, user, assistant; got %#v", history)
+	if len(history) != 5 {
+		t.Fatalf("expected assistant, tool result, content_json tool result, user, assistant; got %#v", history)
 	}
-	if history[0].Role != "user" || history[0].Content != "Prior compacted conversation summary:\nEarlier summary" {
-		t.Fatalf("compact summary mismatch: %#v", history[0])
+	for _, msg := range history {
+		if strings.Contains(msg.Content, "Prior compacted conversation summary") {
+			t.Fatalf("compact summary must NOT be injected into history; got %#v", msg)
+		}
 	}
-	if history[1].Role != "assistant" || history[1].Content != "thinking text\nI will inspect" || len(history[1].ToolCalls) != 1 {
-		t.Fatalf("assistant content/tool calls not rebuilt from content_json: %#v", history[1])
+	if history[0].Role != "assistant" || history[0].Content != "thinking text\nI will inspect" || len(history[0].ToolCalls) != 1 {
+		t.Fatalf("assistant content/tool calls not rebuilt from content_json: %#v", history[0])
 	}
-	if history[1].ToolCalls[0].ID != "call_read" || history[1].ToolCalls[0].Function.Name != "Read" || history[1].ToolCalls[0].Function.Arguments != `{"file_path":"README.md"}` {
-		t.Fatalf("tool_use mismatch: %#v", history[1].ToolCalls[0])
+	if history[0].ToolCalls[0].ID != "call_read" || history[0].ToolCalls[0].Function.Name != "Read" || history[0].ToolCalls[0].Function.Arguments != `{"file_path":"README.md"}` {
+		t.Fatalf("tool_use mismatch: %#v", history[0].ToolCalls[0])
 	}
-	if history[2].Role != "tool" || history[2].ToolCallID != "call_read" || history[2].Content != "read output" {
-		t.Fatalf("tool_result not rebuilt from narrator_tool_calls: %#v", history[2])
+	if history[1].Role != "tool" || history[1].ToolCallID != "call_read" || history[1].Content != "read output" {
+		t.Fatalf("tool_result not rebuilt from narrator_tool_calls: %#v", history[1])
 	}
-	if history[3].Role != "tool" || history[3].ToolCallID != "manual_call" || history[3].Content != "manual output" {
-		t.Fatalf("tool_result not rebuilt from user content_json: %#v", history[3])
+	if history[2].Role != "tool" || history[2].ToolCallID != "manual_call" || history[2].Content != "manual output" {
+		t.Fatalf("tool_result not rebuilt from user content_json: %#v", history[2])
 	}
-	if history[4].Role != "user" || history[4].Content != "Thanks" || len(history[4].ContentBlocks) != 1 {
-		t.Fatalf("user text should come from content_json text block without duplicating tool_result: %#v", history[4])
+	if history[3].Role != "user" || history[3].Content != "Thanks" || len(history[3].ContentBlocks) != 1 {
+		t.Fatalf("user text should come from content_json text block without duplicating tool_result: %#v", history[3])
 	}
-	if history[5].Role != "assistant" || history[5].Content != "Done" || len(history[5].ContentBlocks) != 2 {
-		t.Fatalf("assistant redacted/text blocks not preserved: %#v", history[5])
+	if history[4].Role != "assistant" || history[4].Content != "Done" || len(history[4].ContentBlocks) != 2 {
+		t.Fatalf("assistant redacted/text blocks not preserved: %#v", history[4])
 	}
 }
 
@@ -290,15 +292,19 @@ func TestAgentHistoryReplaysSharedTSCreatedLongTranscriptWithOriginalUploadOwner
 	}
 	// Wave 525: agentHistory now loads ALL messages since the compact boundary
 	// (matching TS getMessagesSinceLastCompact) instead of the former last-20/80
-	// cap. Compact summary (1) + every message seq 11..100 (90) = 91 entries.
-	if len(history) != 91 {
-		t.Fatalf("expected compact summary plus all 90 since-compact messages, got %d: %#v", len(history), history)
+	// cap. The compact summary reaches the model ONLY through the system prompt's
+	// "## Conversation Context" section, never as a history message, so the
+	// replay is exactly every message seq 11..100 (90) entries.
+	if len(history) != 90 {
+		t.Fatalf("expected all 90 since-compact messages, got %d: %#v", len(history), history)
 	}
-	if history[0].Role != "user" || history[0].Content != "Prior compacted conversation summary:\nTS compact summary" {
-		t.Fatalf("compact summary mismatch: %#v", history[0])
+	for _, msg := range history {
+		if strings.Contains(msg.Content, "Prior compacted conversation summary") {
+			t.Fatalf("compact summary must NOT be injected into history; got %#v", msg)
+		}
 	}
-	if history[1].Content != "ts message 11" || history[len(history)-1].Content != "ts message 100" {
-		t.Fatalf("long transcript order mismatch: first=%#v last=%#v", history[1], history[len(history)-1])
+	if history[0].Content != "ts message 11" || history[len(history)-1].Content != "ts message 100" {
+		t.Fatalf("long transcript order mismatch: first=%#v last=%#v", history[0], history[len(history)-1])
 	}
 	var sharedImage map[string]any
 	for _, msg := range history {
