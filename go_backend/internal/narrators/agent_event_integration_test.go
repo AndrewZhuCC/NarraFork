@@ -3797,6 +3797,19 @@ func TestFirstTokenTimeoutAndSilentDisconnectPersistRunStatus(t *testing.T) {
 	if err := service.handleAgentEvent(ctx, disconnectState, agentbasic.AgentEvent{Type: "silent_disconnect"}); err != nil {
 		t.Fatalf("handle silent disconnect: %v", err)
 	}
+	// The handler now marks the run as a silent disconnect and finalizes partial
+	// state (orphaned tools) but DEFERS the terminal idle status to the outer
+	// session loop, which retries with backoff up to maxTransientRetries before
+	// giving up (mirrors TS narrator-session.ts:1977). So the narrator must NOT yet
+	// be idle here — it stays working pending the loop's retry/terminal decision.
+	if !disconnectState.silentDisconnect {
+		t.Fatalf("silent disconnect handler must set state.silentDisconnect for the outer loop to retry")
+	}
+	// Finalizing terminally (after retries are exhausted) persists the idle +
+	// silent_disconnect substatus and clears the error message.
+	if err := service.finishAgentRunSilentDisconnect(ctx, disconnectState); err != nil {
+		t.Fatalf("finalize silent disconnect: %v", err)
+	}
 	if err := service.DB.QueryRow(`SELECT status, substatus, COALESCE(error_message, '') FROM narrators WHERE id = ?`, narratorID).Scan(&status, &substatus, &errorMessage); err != nil {
 		t.Fatalf("query silent disconnect status: %v", err)
 	}

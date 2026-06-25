@@ -37,23 +37,29 @@ type agentRunState struct {
 	// concurrently and both touch draftMessageID / narrator / planApproved*.
 	// Fields that are ONLY touched by the caller goroutine (handleAgentEvent and
 	// the run finalizers) do not need the lock and are left unguarded.
-	mu                     sync.Mutex
-	draftCreateMu          sync.Mutex // serializes lazy assistant-draft creation across goroutines
-	narrator               Narrator   // guarded by mu
-	draftMessageID         string     // guarded by mu
-	planApprovedMode       string     // guarded by mu
-	planApprovedPrompt     string     // guarded by mu
-	planApprovedBy         string     // guarded by mu
-	blocks                 []map[string]any
-	assistantText          string
-	lastMessage            *Message
-	completed              bool
-	errored                bool
-	errorMessage           string
-	errorCode              string
-	hadToolUses            bool
-	skipGoalContinuation   bool
-	outputTruncated        bool
+	mu                   sync.Mutex
+	draftCreateMu        sync.Mutex // serializes lazy assistant-draft creation across goroutines
+	narrator             Narrator   // guarded by mu
+	draftMessageID       string     // guarded by mu
+	planApprovedMode     string     // guarded by mu
+	planApprovedPrompt   string     // guarded by mu
+	planApprovedBy       string     // guarded by mu
+	blocks               []map[string]any
+	assistantText        string
+	lastMessage          *Message
+	completed            bool
+	errored              bool
+	errorMessage         string
+	errorCode            string
+	hadToolUses          bool
+	skipGoalContinuation bool
+	outputTruncated      bool
+	// silentDisconnect is set when the provider stream ended without a final
+	// response (Codex WebSocket close, etc.). The outer session loop (runBasicAgent)
+	// treats it as a transient error and re-runs the agent with backoff up to
+	// maxTransientRetries, mirroring TS narrator-session.ts:1977. Only once retries
+	// are exhausted does the run finalize via finishAgentRunSilentDisconnect.
+	silentDisconnect       bool
 	goalTurnStartedAt      time.Time
 	goalTokenUsageBaseline *agentbasic.UsageSnapshot
 	lastTokenUsage         *agentbasic.UsageSnapshot
@@ -332,7 +338,15 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		state.errorMessage = firstNonEmptyString(event.Message, "Provider did not produce a response before the first-token timeout")
 		return s.finishAgentRunTimeout(ctx, state, state.errorMessage)
 	case "silent_disconnect":
-		return s.finishAgentRunSilentDisconnect(ctx, state)
+		// Mark the run as a silent disconnect and finalize partial state (orphaned
+		// tool cleanup + draft fix), but DEFER the terminal idle status to the outer
+		// session loop (runBasicAgent), which retries with backoff up to
+		// maxTransientRetries before giving up — mirroring TS narrator-session.ts:1977
+		// where result.silentDisconnect drives handleTransientError + continue. When
+		// retries are exhausted the loop calls finishAgentRunSilentDisconnect.
+		state.silentDisconnect = true
+		state.completed = true
+		return s.prepareSilentDisconnectRetry(ctx, state)
 	case "max_turns_exceeded":
 		// P1's loop emits max_turns_exceeded with Metadata.maxTurns when the agent
 		// loop hits the hard round cap. Mirror TS narrator-executor.ts:163-167:
@@ -2005,6 +2019,9 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 	// `contextOverflowRetries` to 0 once a turn completes without overflow so a
 	// future independent overflow starts counting from zero again.
 	resetContextOverflowRetries(state.narratorID)
+	// Likewise reset the transient (silent-disconnect) retry counter on a clean
+	// completion, mirroring TS `transientRetries = 0` (narrator-session.ts:2044).
+	resetTransientRetries(state.narratorID)
 	if draftID := strings.TrimSpace(state.draftID()); draftID != "" {
 		msg, err := s.messageByID(ctx, state.narratorID, draftID)
 		if err == nil {
@@ -2116,6 +2133,21 @@ func (s *Service) finishAgentRunTimeout(ctx context.Context, state *agentRunStat
 		if !treatAsBackground {
 			s.broadcastSubagentStatusChanged(latest, state.narratorID, "idle", []string{"timeout"})
 		}
+	}
+	return nil
+}
+
+// prepareSilentDisconnectRetry finalizes the partial state of a silently
+// disconnected run WITHOUT marking the narrator terminally idle. It mirrors the
+// TS narrator-session.ts:1996-2000 path that finalizes/cleans the partial message
+// before a transient retry: orphaned in-flight tool calls are failed with the
+// disconnect wording so they don't stay "running", and the assistant draft is
+// fixed up. The terminal idle/silent_disconnect status is intentionally left to
+// the outer session loop (runBasicAgent), which either re-runs the agent (when
+// transient retries remain) or calls finishAgentRunSilentDisconnect to finalize.
+func (s *Service) prepareSilentDisconnectRetry(ctx context.Context, state *agentRunState) error {
+	if err := s.markOrphanedToolCalls(ctx, state.narratorID, "Provider stream disconnected before completion", orphanedToolOutputForError(s.toolLocale(ctx, state.narratorID))); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
 	}
 	return nil
 }

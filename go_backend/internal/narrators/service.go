@@ -2696,6 +2696,77 @@ func (s *Service) markRunStarted(ctx context.Context, narratorID string, narrato
 	return err
 }
 
+// handleSilentDisconnectRetry performs one transient-retry step for a silently
+// disconnected run, mirroring TS handleTransientError (narrator-recovery.ts:306)
+// + the narrator-session.ts:1977 retry path: broadcast a `retrying` warning (the
+// hub translates it to a `warning` frame with retryCount/maxRetries/delayMs and
+// dual-broadcasts to a subagent's parent), sleep for an exponential backoff
+// (TRANSIENT_RETRY_BASE_MS=5000 * 2^(attempt-1), capped at retryBackoffCeilMs),
+// then re-mark the run as started so runBasicAgent's outer loop re-runs the
+// agent. Returns false if the run was cancelled/interrupted during the backoff
+// (the interrupt handler owns the terminal status in that case) so the caller
+// stops instead of retrying.
+func (s *Service) handleSilentDisconnectRetry(ctx context.Context, narratorID string, narrator Narrator, attempt, maxRetries int) bool {
+	message := "Provider stream disconnected before completion"
+	ceil := s.agentRetryBackoffCeil()
+	// Exponential backoff capped at the configured ceiling, mirroring TS
+	// handleTransientError delayMs = min(BASE * 2^(attempt-1), backoffCeil).
+	delay := transientRetryBaseDelay
+	for i := 1; i < attempt && delay < ceil; i++ {
+		delay *= 2
+	}
+	if delay > ceil {
+		delay = ceil
+	}
+	if s.Hub != nil {
+		// Broadcast as a `retrying` event so the hub translates it to a `warning`
+		// frame (retryCount/maxRetries/delayMs) and mirrors it to a subagent's
+		// parent, matching the loop's transient-retry warnings.
+		s.Hub.BroadcastNarrator(narratorID, map[string]any{
+			"type":       "retrying",
+			"narratorId": narratorID,
+			"message":    message,
+			"attempt":    attempt,
+			"maxRetries": maxRetries,
+			"delayMs":    delay.Milliseconds(),
+		})
+		s.broadcastSubagentWarning(narrator, narratorID, agentbasic.AgentEvent{Type: "retrying", Message: message, Attempt: attempt, MaxRetries: maxRetries})
+	}
+	// Sleep for the backoff. Abort early if the outer context is cancelled. Note
+	// runBasicAgent is started with context.Background() (the per-turn cancelable
+	// context lives inside runBasicAgentOnce), so we also re-check the narrator's
+	// persisted state after the sleep to detect a user interrupt that landed during
+	// the backoff window.
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(delay):
+	}
+	// Re-fetch the narrator and bail out if it was interrupted/cancelled during the
+	// backoff: the interrupt handler owns the terminal status in that case, so a
+	// re-run would fight it. A retry only proceeds when the narrator is still in an
+	// active (non-idle, non-interrupted) state.
+	latest, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return false
+	}
+	if s.narratorRunCancelled(ctx, narratorID) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(latest.Status), "idle") {
+		if containsString(latest.Substatus, "interrupted") || containsString(latest.Substatus, "manual_override") {
+			return false
+		}
+	}
+	// Re-mark the run as started (status=working) so the re-run resumes cleanly,
+	// mirroring TS which continues the session loop after a transient retry.
+	if err := s.markRunStarted(ctx, narratorID, latest); err != nil {
+		_ = s.persistAgentError(ctx, narratorID, err, latest.IsBackground)
+		return false
+	}
+	return true
+}
+
 func nullableStringPtrValue(value string) *string {
 	if strings.TrimSpace(value) == "" {
 		return nil
@@ -2810,13 +2881,48 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	previousWasGoalContinuation := false
 	interruptionRetries := 0
 	var goalTokenUsageBaseline *agentbasic.UsageSnapshot
+	// Stop-hook tracking: capture the most recent run state so a single Stop hook
+	// fires when the whole session loop ends, covering every termination path
+	// (done / error / aborted / max_turns / silent disconnect). Mirrors TS
+	// narrator-session.ts:2505 which runs the Stop hook once after the loop exits.
+	var lastState *agentRunState
+	defer func() {
+		s.runStopHooks(context.Background(), narratorID, lastState)
+	}()
 	for {
 		state, completed := s.runBasicAgentOnce(ctx, narratorID, goalTokenUsageBaseline)
+		if state != nil {
+			lastState = state
+		}
 		if !completed || state == nil {
 			return
 		}
 		goalTokenUsageBaseline = cloneUsageSnapshot(state.lastTokenUsage)
 		stateNarrator := state.currentNarrator()
+		// Silent-disconnect transient retry (mirrors TS narrator-session.ts:1977):
+		// the provider stream ended without a final response (Codex WebSocket close,
+		// etc.). Re-run the agent with exponential backoff up to maxTransientRetries
+		// before giving up. The handler already finalized partial state
+		// (prepareSilentDisconnectRetry: orphaned tools failed) without marking the
+		// narrator terminally idle, so a retry resumes cleanly. Skipped for
+		// ask-in-passing runs, matching the transient-retry exclusions.
+		if state.silentDisconnect && !stateNarrator.IsAskInPassing {
+			maxRetries := s.agentMaxTransientRetries()
+			attempt := incrementTransientRetries(narratorID)
+			if maxRetries == -1 || attempt <= maxRetries {
+				if !s.handleSilentDisconnectRetry(ctx, narratorID, stateNarrator, attempt, maxRetries) {
+					return
+				}
+				previousWasGoalContinuation = false
+				continue
+			}
+			// Retries exhausted: finalize the run terminally as a silent disconnect.
+			resetTransientRetries(narratorID)
+			if err := s.finishAgentRunSilentDisconnect(ctx, state); err != nil {
+				_ = s.persistAgentError(ctx, narratorID, err, stateNarrator.IsBackground)
+			}
+			return
+		}
 		if state.planApprovedModeValue() != "" {
 			if err := s.persistPlanApprovalContinuation(ctx, state); err != nil {
 				_ = s.persistAgentError(ctx, narratorID, err, stateNarrator.IsBackground)
@@ -4623,6 +4729,81 @@ func (s *Service) runPostToolUseHooks(ctx context.Context, narratorID string, na
 		"tool_output":   output,
 		"tool_is_error": toolRunLooksError(run),
 	})
+	go func() {
+		for _, hook := range hooks {
+			_ = s.executeAgentHook(context.Background(), hook, input, cwd)
+		}
+	}()
+}
+
+// runStopHooks fires the "Stop" agent hooks once when a narrator's response loop
+// ends, mirroring TS narrator-session.ts:2505-2548. It runs for the MAIN narrator
+// only (subagents are skipped), covers every termination path (done / error /
+// aborted / max_turns), and is fire-and-forget — hook failures never affect
+// narrator state. The Stop input carries stop_reason, stop_error, and the
+// truncated last_assistant_text (matching the TS HookInput Stop extras).
+func (s *Service) runStopHooks(ctx context.Context, narratorID string, state *agentRunState) {
+	// Re-fetch the narrator for the authoritative final variant/status/chapter.
+	narrator, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return
+	}
+	// Main narrator only — subagents do not fire Stop hooks (TS isSubagentVariant
+	// guard, narrator-session.ts:2517).
+	if narrator.Type == "subagent" || narrator.Variant == "subagent" {
+		return
+	}
+	projectID := s.hookProjectID(ctx, narrator)
+	hooks := s.matchingAgentHooks(ctx, "Stop", projectID, "")
+	if len(hooks) == 0 {
+		return
+	}
+	// Derive the stop reason from the final run state + persisted status, mapping to
+	// the TS stop_reason union ("done" | "error" | "aborted" | "max_turns").
+	stopReason := "done"
+	stopError := false
+	lastText := ""
+	if state != nil {
+		lastText = state.assistantText
+		switch {
+		case state.errored && strings.EqualFold(strings.TrimSpace(state.errorCode), "max_turns_exceeded"):
+			stopReason = "max_turns"
+			stopError = true
+		case state.silentDisconnect:
+			stopReason = "error"
+			stopError = true
+		case state.errored:
+			stopReason = "error"
+			stopError = true
+		}
+		if strings.TrimSpace(lastText) == "" && strings.TrimSpace(state.errorMessage) != "" {
+			lastText = state.errorMessage
+		}
+	}
+	// A run that ended idle with the interrupted substatus was aborted by the user.
+	if stopReason == "done" && strings.EqualFold(strings.TrimSpace(narrator.Status), "idle") && containsString(narrator.Substatus, "interrupted") {
+		stopReason = "aborted"
+	}
+	cwd := ""
+	if narrator.Cwd != nil {
+		cwd = strings.TrimSpace(*narrator.Cwd)
+	}
+	input := map[string]any{
+		"hook_event_name":     "Stop",
+		"narrator_id":         narratorID,
+		"cwd":                 cwd,
+		"stop_reason":         stopReason,
+		"stop_error":          stopError,
+		"last_assistant_text": truncateString(lastText, 2000),
+	}
+	if narrator.ChapterID != nil && strings.TrimSpace(*narrator.ChapterID) != "" {
+		input["chapter_id"] = strings.TrimSpace(*narrator.ChapterID)
+	}
+	if projectID != "" {
+		input["project_id"] = projectID
+	}
+	// Fire-and-forget: hook failures must never affect narrator state (TS wraps the
+	// Stop hook run in a detached promise + try/catch).
 	go func() {
 		for _, hook := range hooks {
 			_ = s.executeAgentHook(context.Background(), hook, input, cwd)

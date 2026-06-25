@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"narrafork-go/internal/agentbasic"
 	"narrafork-go/internal/db"
@@ -53,6 +54,44 @@ func resetContextOverflowRetries(narratorID string) {
 	contextOverflowRetryMu.Lock()
 	delete(contextOverflowRetries, narratorID)
 	contextOverflowRetryMu.Unlock()
+}
+
+// transientRetries tracks how many transient-error retries (currently driven by
+// Codex/provider silent disconnects) each narrator has consumed in the current
+// run. TS keeps a loop-local `transientRetries` counter on the session loop
+// (narrator-session.ts:1024) that it increments per transient error
+// (handleTransientError) and resets to 0 on a clean completion
+// (narrator-session.ts:2044). Go mirrors that with this guarded, narrator-scoped
+// map because the silent-disconnect handling and the retry the outer loop
+// schedules run across separate stack frames.
+var (
+	transientRetryMu sync.Mutex
+	transientRetries = map[string]int{}
+)
+
+// transientRetryBaseDelay is the base backoff for silent-disconnect transient
+// retries, mirroring TS TRANSIENT_RETRY_BASE_MS (5000ms). The actual delay is
+// min(base * 2^(attempt-1), retryBackoffCeilMs). It is a package var (not a
+// const) so tests can shrink it to keep retry integration tests fast.
+var transientRetryBaseDelay = 5 * time.Second
+
+// incrementTransientRetries records one more transient retry attempt for the
+// narrator and returns the new count, mirroring TS `transientRetries++`
+// (narrator-session.ts:1979).
+func incrementTransientRetries(narratorID string) int {
+	transientRetryMu.Lock()
+	defer transientRetryMu.Unlock()
+	transientRetries[narratorID]++
+	return transientRetries[narratorID]
+}
+
+// resetTransientRetries clears the transient retry counter for a narrator,
+// mirroring the TS `transientRetries = 0` reset on a clean completion
+// (narrator-session.ts:2044). Called from finishAgentRunSuccess.
+func resetTransientRetries(narratorID string) {
+	transientRetryMu.Lock()
+	delete(transientRetries, narratorID)
+	transientRetryMu.Unlock()
 }
 
 type contextOverflowRef struct {

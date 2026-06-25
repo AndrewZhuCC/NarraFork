@@ -49,6 +49,15 @@ func TestRunBasicAgentSilentDisconnectPreservesBlocksAndFailsRunningTools(t *tes
 
 	service, narratorID, _ := newTestNarratorService(t, "openai:gpt-test", server.URL)
 	service.Hub = ws.NewHub()
+	// Disable transient retries so the silent disconnect finalizes terminally on the
+	// first occurrence. With the default maxTransientRetries (10) a silent
+	// disconnect is treated as transient and retried with exponential backoff
+	// (mirroring TS narrator-session.ts:1977); since this mock ALWAYS disconnects,
+	// the terminal state this test asserts only appears after retries are exhausted.
+	// Setting maxTransientRetries=0 exercises the terminal path directly.
+	if _, err := service.Settings.Patch(map[string]any{"agent": map[string]any{"maxTransientRetries": float64(0)}}); err != nil {
+		t.Fatalf("patch maxTransientRetries: %v", err)
+	}
 	// Bypass permissions so the streamed Bash tool call is recorded as "running"
 	// (the real failing run used "全部允许"/bypass), exercising the orphaned-tool
 	// cleanup on the silent-disconnect finalizer.
