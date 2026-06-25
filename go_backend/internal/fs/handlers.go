@@ -254,12 +254,25 @@ func (h *Handler) preview(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	info, err := os.Stat(resolved)
-	if err != nil {
-		return httpx.BadRequest(err.Error())
+	// Mirror the TS /api/fs/preview error contract (server/routes/fs.ts): a
+	// missing path -> "File does not exist: <abs>", any other stat failure ->
+	// "Cannot access: <abs>", and a non-regular file (directory, socket,
+	// device, FIFO, ...) -> "Not a file: <abs>", all as VALIDATION_ERROR (same
+	// as the sibling browse handler). Go previously returned the raw os.Stat
+	// error string (e.g. "stat /foo: no such file or directory"), which leaked
+	// the absolute worktree path and OS-specific wording, used the BAD_REQUEST
+	// code instead of VALIDATION_ERROR, and reported directories with the
+	// generic "path is a directory" instead of TS's "Not a file" while only
+	// rejecting directories rather than every non-regular file (TS !stat.isFile()).
+	info, statErr := os.Stat(resolved)
+	if statErr != nil {
+		if os.IsNotExist(statErr) {
+			return httpx.ValidationError("File does not exist: " + resolved)
+		}
+		return httpx.ValidationError("Cannot access: " + resolved)
 	}
-	if info.IsDir() {
-		return httpx.BadRequest("path is a directory")
+	if !info.Mode().IsRegular() {
+		return httpx.ValidationError("Not a file: " + resolved)
 	}
 	ctype := previewMimeType(filepath.Ext(resolved))
 	limit := int64(maxTextPreview)

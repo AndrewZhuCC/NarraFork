@@ -103,8 +103,9 @@ func runAgentLoopSync(ctx context.Context, out chan<- AgentEvent, settings *conf
 	// Resolve the model's effective context window so usage snapshots carry a
 	// ContextWindow and the context-usage percentage can be computed for providers
 	// that do not supply it directly (Anthropic/OpenAI). Kiro supplies the
-	// percentage itself, so this is a no-op there.
-	options.contextWindow = resolveModelContextWindow(settings, resolution.Model, resolution.Provider)
+	// percentage itself, so this is a no-op there. The Anthropic official API
+	// applies a 1M uplift for 1M-capable models (effectiveModelContextWindow).
+	options.contextWindow = effectiveModelContextWindow(settings, resolution.Model, resolution.Provider, resolution.Config.Kind, resolution.Config.OfficialAPI)
 	inventoryOptions := ToolInventoryOptions{Scope: options.toolScope, EnabledTools: options.enabledTools, DisabledTools: options.disabledTools, ExternalTools: options.externalTools, MCPExternalToolInjection: len(options.externalTools) > 0, DisableInlinePlan: options.disableInlinePlan}
 	if options.emitToolInventory {
 		emitAgentEvent(ctx, out, AgentEvent{Type: "tool_inventory", Metadata: map[string]any{"inventory": ToolInventoryMetadataForOptions(inventoryOptions)}})
@@ -197,7 +198,7 @@ func applyRuntimeSettingsOverride(ctx context.Context, out chan<- AgentEvent, se
 		*adapter = nextResolution.Adapter
 		// Re-resolve the context window for the new model so context-usage
 		// percentage stays accurate after a runtime model switch.
-		options.contextWindow = resolveModelContextWindow(settings, resolution.Model, resolution.Provider)
+		options.contextWindow = effectiveModelContextWindow(settings, resolution.Model, resolution.Provider, resolution.Config.Kind, resolution.Config.OfficialAPI)
 	}
 	if override.ReasoningEffort != nil {
 		nextReasoning := normalizeReasoningEffort(*override.ReasoningEffort)
@@ -491,6 +492,7 @@ func runAgentTurnAttempt(ctx context.Context, out chan<- AgentEvent, adapter Pro
 		History:          built,
 		Tools:            formatToolsForAdapter(adapter, inventoryOptions),
 		ReasoningEffort:  options.reasoningEffort,
+		ServiceTier:      options.serviceTier,
 		SystemPrompt:     options.systemPrompt,
 		ToolScope:        effectiveToolScope,
 		StickySessionKey: options.stickySessionKey,
@@ -808,6 +810,12 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 	// final tool of the turn.
 	shouldNudge := maxTurns > 0 && turn >= maxTurns*4/5
 	processed := 0
+	// Track a fatal tool result (catastrophic command deny). When present, the
+	// entire agent loop must terminate after this turn's tool_result events are
+	// emitted, mirroring TS loop.ts:3721-3730 (yield error + return). The
+	// tool_result events are still shown to the UI, but the history is not pushed.
+	hasFatal := false
+	fatalMessage := ""
 	for _, group := range toolExecutionGroups(state.toolUses) {
 		outcomes := make([]toolExecOutcome, len(group))
 		if len(group) == 1 {
@@ -862,14 +870,29 @@ func executeTurnTools(ctx context.Context, out chan<- AgentEvent, adapter Provid
 			run := outcome.Run
 			outputForModel := appendAgentSideCarsForProvider(run.Output, outcome.SideCars)
 			if shouldNudge && processed == len(state.toolUses)-1 {
-				outputForModel += turnNudgeReminder(turn+1, maxTurns)
+				outputForModel += turnNudgeReminder(turn+1, maxTurns, options.locale)
 			}
 			processed++
 			if !state.yieldedToolResults[call.ID] {
 				emitToolResultEvent(ctx, out, state, call, outcome)
 			}
 			toolResults = append(toolResults, adapter.FormatToolResult(call.ID, outputForModel, outcome.IsError))
+			if run.Fatal && !hasFatal {
+				hasFatal = true
+				fatalMessage = strings.TrimSpace(run.Output)
+			}
 		}
+	}
+	if hasFatal {
+		// A catastrophic command was denied as fatal. The tool_result events above
+		// were emitted for UI visibility, but we terminate the loop here (before the
+		// caller pushes the tool results back into history), matching TS behavior of
+		// yielding an error event and returning without continuing the conversation.
+		if fatalMessage == "" {
+			fatalMessage = "Narrator terminated for safety."
+		}
+		emitAgentEvent(ctx, out, AgentEvent{Type: "error", Message: fatalMessage})
+		return nil, false
 	}
 	return toolResults, true
 }
@@ -893,7 +916,7 @@ func collectToolResultSideCars(ctx context.Context, options generateOptions, sta
 	if !outcome.IsError && options.silentToolCallThreshold >= 0 {
 		state.silentToolCallCount++
 		if state.silentToolCallCount >= options.silentToolCallThreshold {
-			sideCars = append(sideCars, AgentSideCar{Target: "tool_result", Source: "silent_progress", Content: silentProgressReminder(state.silentToolCallCount), ToolUseID: call.ID, OrderIndex: 10})
+			sideCars = append(sideCars, AgentSideCar{Target: "tool_result", Source: "silent_progress", Content: silentProgressReminder(state.silentToolCallCount, options.locale), ToolUseID: call.ID, OrderIndex: 10})
 			state.silentToolCallCount = 0
 		}
 	}
@@ -913,16 +936,23 @@ func collectToolResultSideCars(ctx context.Context, options generateOptions, sta
 	return normalizeAgentSideCars(sideCars, call.ID, true)
 }
 
-func silentProgressReminder(count int) string {
+func silentProgressReminder(count int, locale string) string {
+	if locale == "zh-CN" {
+		return fmt.Sprintf("<progress_update_request>\n你已经连续 %d 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。\n</progress_update_request>", count)
+	}
 	return fmt.Sprintf("<progress_update_request>\nYou have completed %d tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.\n</progress_update_request>", count)
 }
 
-// turnNudgeReminder mirrors the TS tool.turnNudge i18n message (English): it is
-// appended to the last tool result of a turn once >=80% of maxTurns is used so
-// the model wraps up before hitting the hard max-rounds error. English-only to
-// match Go's other agent reminders (locale-aware tool messages are a separate
-// gap).
-func turnNudgeReminder(turnIndex, maxTurns int) string {
+// turnNudgeReminder mirrors the TS tool.turnNudge i18n message (i18n.ts:191-195)
+// in both locales: it is appended to the last tool result of a turn once >=80%
+// of maxTurns is used so the model wraps up before hitting the hard max-rounds
+// error. The locale is threaded from the narrator owner via WithLocale. Note the
+// en/zh separator difference is verbatim from TS ("{turnIndex} of {maxTurns}
+// turns" vs "{turnIndex}/{maxTurns} 轮").
+func turnNudgeReminder(turnIndex, maxTurns int, locale string) string {
+	if locale == "zh-CN" {
+		return fmt.Sprintf("\n\n[系统提示：你已使用 %d/%d 轮。请尽快收尾——如果无法及时完成，请总结剩余步骤。]", turnIndex, maxTurns)
+	}
 	return fmt.Sprintf("\n\n[SYSTEM: You have used %d of %d turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]", turnIndex, maxTurns)
 }
 
@@ -1213,17 +1243,29 @@ func isStrictSerialTool(call ToolCall) bool {
 }
 
 func flushTurnBlocks(ctx context.Context, out chan<- AgentEvent, state *turnState) {
+	// When the run was aborted (user interrupt), ctx is already cancelled. A plain
+	// emitAgentEvent would then hit its `<-ctx.Done()` branch and silently DROP the
+	// block_complete events, losing any text/reasoning the model had already
+	// streamed before the interrupt. The agent event channel is buffered and the
+	// consumer keeps draining it (persisting via the parent ctx) until the loop
+	// closes it, so on abort we send the accumulated blocks with a detached context
+	// to guarantee they reach persistence. Mirrors the TS fix that keeps draining
+	// block_complete after abort (narrator-executor.ts).
+	emit := emitAgentEvent
+	if ctx.Err() != nil {
+		emit = emitAgentEventDetached
+	}
 	for _, entry := range state.reasoning {
 		if entry.Text == "" && entry.ProviderMetadata == nil {
 			continue
 		}
-		emitAgentEvent(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "reasoning", Text: entry.Text, OutputIndex: entry.OutputIndex, ProviderMetadata: entry.ProviderMetadata}})
+		emit(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "reasoning", Text: entry.Text, OutputIndex: entry.OutputIndex, ProviderMetadata: entry.ProviderMetadata}})
 	}
 	for _, block := range state.redacted {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "redacted_thinking", Data: block.Data, OutputIndex: block.OutputIndex}})
+		emit(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "redacted_thinking", Data: block.Data, OutputIndex: block.OutputIndex}})
 	}
 	if state.assistantText != "" {
-		emitAgentEvent(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "text", Text: state.assistantText, OutputIndex: state.textOutputIndex}})
+		emit(ctx, out, AgentEvent{Type: "block_complete", Block: &ContentBlock{Type: "text", Text: state.assistantText, OutputIndex: state.textOutputIndex}})
 	}
 }
 
@@ -1348,6 +1390,18 @@ func emitAgentEvent(ctx context.Context, out chan<- AgentEvent, event AgentEvent
 	}
 }
 
+// emitAgentEventDetached sends an event without honoring ctx cancellation. It is
+// used on the abort path to flush already-accumulated content blocks
+// (block_complete) that must still be persisted even though the run context is
+// cancelled. The agent event channel is buffered and the consumer keeps draining
+// it until the loop closes it, so this send does not deadlock in practice. The
+// `ctx` parameter is unused but kept so the signature matches emitAgentEvent,
+// allowing the two to be used interchangeably via a function value.
+func emitAgentEventDetached(_ context.Context, out chan<- AgentEvent, event AgentEvent) bool {
+	out <- event
+	return true
+}
+
 func sleepWithContext(ctx context.Context, delay time.Duration) bool {
 	if delay <= 0 {
 		select {
@@ -1410,6 +1464,19 @@ func effectiveMaxChatRetries(options generateOptions, resolution ProviderResolut
 
 // retryableErrorPatterns mirrors TS RETRYABLE_PATTERNS (error-handling.ts),
 // lower-cased message substrings that indicate a transient, retryable failure.
+// retryableReasonMarkers mirrors the TS isRetryableError step-2 reason/code
+// branch (obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE" || obj.__type ===
+// "com.amazon.aws.codewhisperer#InternalServerException"). These are checked
+// before the HTTP-status/429 branches so a Kiro/CodeWhisperer transient error
+// surfaced as an in-stream error (HTTP 200) or wrapped in a 429 still retries.
+// Lower-cased because Go matches the flattened lower-cased error text; the
+// CodeWhisperer marker uses the bare exception type which is robust to whether
+// the full "com.amazon.aws.codewhisperer#" namespace prefix is present.
+var retryableReasonMarkers = []string{
+	"model_temporarily_unavailable",
+	"codewhisperer#internalserverexception",
+}
+
 var retryableErrorPatterns = []string{
 	"model_temporarily_unavailable",
 	"overload",
@@ -1542,6 +1609,16 @@ func isTransientAgentError(err error, customRules []customRetryRule) bool {
 	// This runs after the non-retryable short-circuit so a quota/billing message
 	// still wins, matching TS order.
 	if reason := invalidStateReason(err); reason != "" && retryableInvalidStateReasons[reason] {
+		return true
+	}
+	// Known retryable reason/code markers, mirroring the TS isRetryableError
+	// step-2 branch (obj.reason === "MODEL_TEMPORARILY_UNAVAILABLE" ||
+	// obj.__type === "com.amazon.aws.codewhisperer#InternalServerException").
+	// This runs BEFORE the HTTP-status/429 checks so a 429-wrapped or in-stream
+	// (HTTP 200) CodeWhisperer/Kiro transient error still retries rather than
+	// short-circuiting to custom-rules-only in the bare-429 branch. Go matches
+	// the lower-cased flattened error text (err + body + provider).
+	if containsAnyMarker(message, retryableReasonMarkers) {
 		return true
 	}
 	statusCodes := retryRuleStatusCodes(err)

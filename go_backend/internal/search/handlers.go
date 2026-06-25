@@ -238,11 +238,19 @@ func chapterResult(id, title string, description sql.NullString, status, role, c
 	if strings.Contains(strings.ToLower(title), needle) {
 		matchField = "title"
 	}
+	// Mirror the TS chapter snippet fallback chain exactly (search-service.ts:194):
+	// `row.snippet || row.description || ""`. Chapters fall back ONLY to description,
+	// then to the empty string — they do NOT fall back to the title (unlike the
+	// narrator/message branches, which use title/content_preview). Go previously
+	// added an extra `snippet = title` fallback here, so a chapter that matched via
+	// FTS on its title but had an empty/NULL description returned snippet=<title>
+	// where TS returns "" — a user/model-visible search-result field divergence.
+	// (The LIKE path already mirrors TS by selecting
+	// substr(COALESCE(description, title, ''), ...) at the SQL level, so dropping the
+	// title fallback here does not regress LIKE results that legitimately carry a
+	// title-derived snippet.)
 	if snippet == "" {
 		snippet = sqlString(description)
-	}
-	if snippet == "" {
-		snippet = title
 	}
 	return map[string]any{"type": "chapter", "id": id, "title": title, "projectName": projectName, "status": status, "role": role, "createdAt": createdAt, "updatedAt": updatedAt, "matchField": matchField, "matchScore": score, "snippet": snippet}
 }

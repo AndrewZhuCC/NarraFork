@@ -298,7 +298,16 @@ func (h *Handler) updatePositions(w http.ResponseWriter, r *http.Request) error 
 		if panelHeight == nil {
 			panelHeight = pos.Height
 		}
-		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height), updated_at = ? WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), *pos.AxisOffset, *pos.CrossOffset, panelExpanded, nullableFloatPtr(panelWidth), nullableFloatPtr(panelHeight), db.NowISO(), pos.ChapterID, projectID)
+		// Mirror the TS graph positions route (server/routes/graph.ts:305-317):
+		// it sets ONLY anchorCommitSha/axisOffset/crossOffset (+optional panel
+		// fields) and never touches updatedAt. The chapters.updatedAt column has
+		// no drizzle $onUpdate hook (schema.ts:143), so TS leaves it unchanged on
+		// a drag. Go previously also wrote `updated_at = NowISO()` here, bumping
+		// the chapter's updatedAt on every node drag — a user-visible divergence
+		// (GET /chapters and list responses showed a fresh updatedAt for a purely
+		// visual layout change). Dropping it aligns Go with TS: position-only
+		// edits do not count as a content update.
+		_, err := tx.ExecContext(r.Context(), `UPDATE chapters SET anchor_commit_sha = ?, axis_offset = ?, cross_offset = ?, panel_expanded = COALESCE(?, panel_expanded), panel_width = COALESCE(?, panel_width), panel_height = COALESCE(?, panel_height) WHERE id = ? AND project_id = ?`, nullablePtr(pos.AnchorCommitSHA), *pos.AxisOffset, *pos.CrossOffset, panelExpanded, nullableFloatPtr(panelWidth), nullableFloatPtr(panelHeight), pos.ChapterID, projectID)
 		if err != nil {
 			return err
 		}

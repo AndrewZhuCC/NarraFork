@@ -142,6 +142,7 @@ func TestOpenAIResponsesStreamsTextReasoningToolAndUsage(t *testing.T) {
 func TestCodexResponsesWebSocketParserNativeToolLifecycle(t *testing.T) {
 	out := make(chan StreamEvent, 16)
 	toolsByItem := map[string]*openAIStreamingTool{}
+	reasoningByIndex := map[int]*responsesReasoningAccum{}
 	inputs := []string{
 		`{"type":"response.output_item.added","output_index":4,"item":{"type":"web_search_call","id":"ws_ws"}}`,
 		`{"type":"response.web_search_call.searching","item_id":"ws_ws","output_index":4}`,
@@ -151,7 +152,7 @@ func TestCodexResponsesWebSocketParserNativeToolLifecycle(t *testing.T) {
 		`{"type":"response.output_item.done","output_index":5,"item":{"type":"image_generation_call","id":"img_ws","status":"completed","revised_prompt":"draw ws","result":"base64-ws"}}`,
 	}
 	for _, input := range inputs {
-		if err := handleResponsesJSONEvent(context.Background(), out, toolsByItem, []byte(input)); err != nil {
+		if err := handleResponsesJSONEvent(context.Background(), out, toolsByItem, reasoningByIndex, []byte(input)); err != nil {
 			t.Fatalf("handle websocket responses event: %v", err)
 		}
 	}
@@ -249,8 +250,18 @@ func TestOpenAIResponsesSendsPreviousResponseID(t *testing.T) {
 // request shape to the TS openai-provider: codex requests send
 // `reasoning:{effort, summary:"auto"}` AND `include:["reasoning.encrypted_content"]`
 // (so the API returns encrypted reasoning for cross-turn replay via
-// previous_response_id), while a generic responses-API provider sends only
-// `reasoning:{effort}` with no summary/include.
+// previous_response_id).
+//
+// For the generic (non-codex) "responses" apiMode, Go INTENTIONALLY sends
+// `reasoning:{effort}` (no summary/include) to honor the user's reasoning-effort
+// setting on the OpenAI Responses API. This is a DOCUMENTED, intentional Go
+// enhancement over TS, NOT TS parity: TS only sets body.reasoning when
+// apiMode==="codex" (streamChat openai-provider.ts:706 + applyGenerateReasoningOptions
+// :233), so a non-codex responses request in TS sends NO reasoning field and the
+// provider falls back to its default effort. See TestOpenAIResponsesNonCodexReasoningIsIntentionalGoEnhancement
+// for the explicit divergence contract and W799. (The earlier W575 comment that
+// claimed TS "sends only reasoning:{effort}" for generic responses was factually
+// wrong; the request shape below is Go's choice, not a TS mirror.)
 func TestOpenAIResponsesCodexReasoningConfigMatchesTS(t *testing.T) {
 	run := func(t *testing.T, kind, apiMode string) map[string]any {
 		var requestBody map[string]any
@@ -302,6 +313,88 @@ func TestOpenAIResponsesCodexReasoningConfigMatchesTS(t *testing.T) {
 	})
 }
 
+// TestOpenAIResponsesNonCodexReasoningIsIntentionalGoEnhancement documents and
+// pins the deliberate divergence (W799) between Go and TS for the generic
+// (non-codex) "responses" apiMode reasoning field:
+//
+//   - TS openai-provider.ts only sets body.reasoning when apiMode==="codex"
+//     (streamChat:706 and applyGenerateReasoningOptions:233 both gate reasoning on
+//     codex; the non-codex "responses" branch sets NOTHING and the provider uses
+//     its own default reasoning effort). There is no other request-body reasoning
+//     site in the TS provider files.
+//   - Go's streamOpenAIResponses INTENTIONALLY sends reasoning:{effort} for
+//     non-codex responses reasoning models (gpt-5/o1/o3/o4/deepseek via
+//     chatReasoningEffort) so the user's configured reasoning effort is honored on
+//     the OpenAI Responses API instead of being silently dropped.
+//
+// This is an accepted Go enhancement, NOT a parity bug: matching TS here would
+// silently ignore the user's reasoning-effort setting for all non-codex responses
+// models. This test pins both the Go behavior (effort sent) and the
+// summary/include exclusivity (those remain codex-only, matching TS), so a future
+// change toward strict TS mirroring (dropping the effort) would fail here and
+// force an explicit contract update rather than a silent functional regression.
+func TestOpenAIResponsesNonCodexReasoningIsIntentionalGoEnhancement(t *testing.T) {
+	captureBody := func(t *testing.T, model, effort string) map[string]any {
+		t.Helper()
+		var requestBody map[string]any
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_ = json.NewDecoder(r.Body).Decode(&requestBody)
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+`)
+		}))
+		defer server.Close()
+		adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "openai", Kind: "openai", APIKey: "k", BaseURL: server.URL, Model: model, APIMode: "responses", DefaultReasoningEffort: effort}}
+		stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+		if err != nil {
+			t.Fatalf("Chat error: %v", err)
+		}
+		for event := range stream {
+			if event.Err != nil {
+				t.Fatalf("stream error: %v", event.Err)
+			}
+		}
+		return requestBody
+	}
+
+	t.Run("reasoning model sends effort but never summary/include (codex-only fields)", func(t *testing.T) {
+		body := captureBody(t, "gpt-5", "high")
+		reasoning, ok := body["reasoning"].(map[string]any)
+		if !ok || reasoning["effort"] != "high" {
+			t.Fatalf("non-codex responses should send reasoning:{effort:high} (Go enhancement), got %#v", body["reasoning"])
+		}
+		if _, hasSummary := reasoning["summary"]; hasSummary {
+			t.Fatalf("summary is codex-only and must NOT appear on non-codex responses, got %#v", reasoning)
+		}
+		if _, hasInclude := body["include"]; hasInclude {
+			t.Fatalf("include is codex-only and must NOT appear on non-codex responses, got %#v", body["include"])
+		}
+	})
+
+	t.Run("xhigh clamps to high on non-codex responses", func(t *testing.T) {
+		body := captureBody(t, "o3", "xhigh")
+		reasoning, ok := body["reasoning"].(map[string]any)
+		if !ok || reasoning["effort"] != "high" {
+			t.Fatalf("xhigh should clamp to high via chatReasoningEffort, got %#v", body["reasoning"])
+		}
+	})
+
+	t.Run("non-reasoning model sends no reasoning field", func(t *testing.T) {
+		body := captureBody(t, "gpt-4o", "high")
+		if _, has := body["reasoning"]; has {
+			t.Fatalf("non-reasoning model must not send reasoning, got %#v", body["reasoning"])
+		}
+	})
+
+	t.Run("effort none sends no reasoning field", func(t *testing.T) {
+		body := captureBody(t, "gpt-5", "none")
+		if _, has := body["reasoning"]; has {
+			t.Fatalf("reasoning effort 'none' must not send reasoning, got %#v", body["reasoning"])
+		}
+	})
+}
+
 func TestOpenAIResponsesInputReplaysAssistantFunctionCallsAndToolOutputs(t *testing.T) {
 	call := newFunctionToolCall("call_1", "Read", `{"file_path":"note.txt"}`)
 	input := openAIResponsesInput([]Message{
@@ -347,6 +440,7 @@ func TestResolveCustomResponsesProviderUsesResponsesMode(t *testing.T) {
 func TestResponsesImageGenerationPartialStreamingFieldsParity(t *testing.T) {
 	out := make(chan StreamEvent, 16)
 	toolsByItem := map[string]*openAIStreamingTool{}
+	reasoningByIndex := map[int]*responsesReasoningAccum{}
 	inputs := []string{
 		`{"type":"response.image_generation_call.generating","item_id":"img_partial","output_index":2}`,
 		`{"type":"response.image_generation_call.partial_image","item_id":"img_partial","output_index":2,"partial_image_index":0,"partial_image_b64":"AAAA"}`,
@@ -354,7 +448,7 @@ func TestResponsesImageGenerationPartialStreamingFieldsParity(t *testing.T) {
 		`{"type":"response.image_generation_call.completed","item_id":"img_partial","output_index":2}`,
 	}
 	for _, input := range inputs {
-		if err := handleResponsesJSONEvent(context.Background(), out, toolsByItem, []byte(input)); err != nil {
+		if err := handleResponsesJSONEvent(context.Background(), out, toolsByItem, reasoningByIndex, []byte(input)); err != nil {
 			t.Fatalf("handle responses event: %v", err)
 		}
 	}

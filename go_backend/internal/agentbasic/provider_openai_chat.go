@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -56,12 +57,17 @@ func (a *OpenAIChatCompletionsAdapter) Chat(ctx context.Context, params ChatPara
 	messages := openAIHistoryMessages(params.History)
 	go func() {
 		defer close(ch)
-		apiMode := strings.ToLower(strings.TrimSpace(a.Provider.APIMode))
-		reasoningEffort := firstNonEmpty(params.ReasoningEffort, a.Provider.DefaultReasoningEffort)
+		// Unified local provider copy carrying request-scoped fields (service tier
+		// from fastMode). Never mutate the shared a.Provider. All codex-capable
+		// paths below use this local copy so ServiceTier reaches both the
+		// Kind=="codex" and the apiMode=="codex" (responses) request bodies.
+		provider := a.Provider
+		provider.ServiceTier = params.ServiceTier
+		apiMode := strings.ToLower(strings.TrimSpace(provider.APIMode))
+		reasoningEffort := firstNonEmpty(params.ReasoningEffort, provider.DefaultReasoningEffort)
 		var err error
-		if strings.TrimSpace(a.Provider.Kind) == "codex" {
+		if strings.TrimSpace(provider.Kind) == "codex" {
 			sessionKey := firstNonEmpty(params.StickySessionKey, params.ConversationID)
-			provider := a.Provider
 			provider.PromptCacheKey = firstNonEmpty(params.ConversationID, provider.PromptCacheKey)
 			if len(provider.CredentialPool) > 0 {
 				err = streamCodexWithFailover(ctx, client, provider, messages, reasoningEffort, params.ToolScope, sessionKey, ch)
@@ -75,14 +81,14 @@ func (a *OpenAIChatCompletionsAdapter) Chat(ctx context.Context, params ChatPara
 		} else {
 			switch apiMode {
 			case "responses", "codex":
-				err = streamOpenAIResponses(ctx, client, a.Provider, messages, reasoningEffort, params.ToolScope, ch)
+				err = streamOpenAIResponses(ctx, client, provider, messages, reasoningEffort, params.ToolScope, ch)
 			default:
-				err = streamChatCompletions(ctx, client, a.Provider, messages, reasoningEffort, params.ToolScope, ch)
+				err = streamChatCompletions(ctx, client, provider, messages, reasoningEffort, params.ToolScope, ch)
 			}
 		}
-		if err != nil && strings.TrimSpace(a.Provider.Kind) == "cline" && isProviderUnauthorized(err) {
+		if err != nil && strings.TrimSpace(provider.Kind) == "cline" && isProviderUnauthorized(err) {
 			if refreshed, ok := refreshClineCredentialFromDisk(); ok {
-				retryProvider := a.Provider
+				retryProvider := provider
 				retryProvider.APIKey = stringValue(refreshed["accessToken"])
 				err = streamChatCompletions(ctx, client, retryProvider, messages, reasoningEffort, params.ToolScope, ch)
 			}
@@ -183,9 +189,13 @@ type chatStreamChunk struct {
 	Choices []struct {
 		Index int `json:"index"`
 		Delta struct {
-			Role      string `json:"role"`
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+			// ReasoningContent carries extended-thinking text for models that stream
+			// it over the chat-completions delta (e.g. DeepSeek, QwQ), mirroring TS
+			// openai-provider.ts reading delta.reasoning_content.
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				Index    int    `json:"index"`
 				ID       string `json:"id"`
 				Type     string `json:"type"`
@@ -212,11 +222,14 @@ type openAIStreamingTool struct {
 
 func streamChatCompletions(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, out chan<- StreamEvent) error {
 	body := map[string]any{
-		"model":       provider.Model,
-		"messages":    openAIChatCompletionMessages(messages),
-		"temperature": 0.2,
-		"tools":       toolDefinitions(toolScope),
-		"stream":      true,
+		"model":    provider.Model,
+		"messages": openAIChatCompletionMessages(messages, provider.Model),
+		// No temperature: TS openai-provider.ts sends model/messages/stream/
+		// stream_options/tools only and never sets temperature, letting the provider
+		// use its own default. Go previously hardcoded temperature:0.2, which
+		// silently forced low-variance generation diverging from TS.
+		"tools":  toolDefinitions(toolScope),
+		"stream": true,
 		"stream_options": map[string]any{
 			"include_usage": true,
 		},
@@ -310,6 +323,10 @@ func streamChatCompletions(ctx context.Context, client *http.Client, provider Pr
 				idx := choice.Index
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Text: choice.Delta.Content, TextOutputIndex: &idx}})
 			}
+			if choice.Delta.ReasoningContent != "" {
+				idx := choice.Index
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Reasoning: choice.Delta.ReasoningContent, ReasoningOutputIndex: &idx}})
+			}
 			for _, delta := range choice.Delta.ToolCalls {
 				tool := acc[delta.Index]
 				if tool == nil {
@@ -381,6 +398,27 @@ func emitStreamEvent(ctx context.Context, out chan<- StreamEvent, event StreamEv
 	}
 }
 
+// clineAgentVersion is the Cline extension version reported in client-identifying
+// headers, kept in sync with the TS cline-auth CLINE_VERSION.
+const clineAgentVersion = "3.74.0"
+
+// clineAgentRequestHeaders mirrors the TS cline-auth buildOpenRouterHeaders +
+// buildClineHeaders set used by the Cline provider's chat requests. X-PLATFORM-
+// VERSION uses the Go runtime version (TS uses the Bun/Node version); this is a
+// platform-identifier adaptation, the other values match TS exactly.
+func clineAgentRequestHeaders() map[string]string {
+	return map[string]string{
+		"User-Agent":         "Cline/" + clineAgentVersion,
+		"X-PLATFORM":         "node",
+		"X-PLATFORM-VERSION": runtime.Version(),
+		"X-CLIENT-TYPE":      "extension",
+		"X-CLIENT-VERSION":   clineAgentVersion,
+		"X-CORE-VERSION":     clineAgentVersion,
+		"HTTP-Referer":       "https://cline.bot",
+		"X-Title":            "Cline",
+	}
+}
+
 func setOpenAICompatibleHeaders(req *http.Request, provider Provider) {
 	apiKey := provider.APIKey
 	if strings.TrimSpace(provider.Kind) == "cline" && apiKey != "" && !strings.HasPrefix(apiKey, "workos:") {
@@ -388,14 +426,35 @@ func setOpenAICompatibleHeaders(req *http.Request, provider Provider) {
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	if strings.TrimSpace(provider.Kind) == "cline" {
-		req.Header.Set("HTTP-Referer", "https://narrafork.local")
-		req.Header.Set("X-Title", "NarraFork")
+		// Mimic the Cline VS Code extension headers (TS cline-auth
+		// buildOpenRouterHeaders + buildClineHeaders), which the Cline/OpenRouter
+		// backend validates. Go previously sent narrafork-branded HTTP-Referer/
+		// X-Title and omitted the User-Agent / X-PLATFORM* / X-CLIENT* / X-CORE*
+		// client-identifying headers entirely.
+		for key, value := range clineAgentRequestHeaders() {
+			req.Header.Set(key, value)
+		}
 	}
 	if strings.TrimSpace(provider.Kind) == "codex" || strings.EqualFold(provider.APIMode, "codex") {
 		req.Header.Set("originator", "narrafork")
-		if provider.AccountID != "" {
+		// ChatGPT-Account-Id is only sent to official ChatGPT domains (mirrors TS
+		// openai-provider buildHeaders), so it is not leaked to proxy endpoints.
+		if provider.AccountID != "" && isOfficialChatGPTDomain(provider.BaseURL) {
 			req.Header.Set("ChatGPT-Account-Id", provider.AccountID)
 		}
+	}
+	applyProviderExtraHeaders(req, provider)
+}
+
+// applyProviderExtraHeaders applies provider-scoped extra request headers (e.g.
+// the NUG provider injects X-NUG-Model-Hash / X-Conversation-ID via this). A nil
+// map is a no-op, so providers that do not use it are unaffected.
+func applyProviderExtraHeaders(req *http.Request, provider Provider) {
+	for key, value := range provider.ExtraHeaders {
+		if key == "" {
+			continue
+		}
+		req.Header.Set(key, value)
 	}
 }
 
@@ -473,6 +532,7 @@ func openAIInvalidStateFromResponsesEvent(parsed responsesStreamEvent) *InvalidS
 type responsesStreamEvent struct {
 	Type        string `json:"type"`
 	Delta       string `json:"delta"`
+	Text        string `json:"text"`
 	ItemID      string `json:"item_id"`
 	OutputIndex *int   `json:"output_index"`
 	// Present on response.image_generation_call.partial_image events.
@@ -502,16 +562,126 @@ type responsesStreamEvent struct {
 }
 
 type responsesOutputItem struct {
-	Type          string         `json:"type"`
-	ID            string         `json:"id"`
-	CallID        string         `json:"call_id"`
-	Name          string         `json:"name"`
-	Arguments     string         `json:"arguments"`
-	Status        string         `json:"status"`
-	Query         string         `json:"query"`
-	Action        map[string]any `json:"action"`
-	RevisedPrompt string         `json:"revised_prompt"`
-	Result        string         `json:"result"`
+	Type             string         `json:"type"`
+	ID               string         `json:"id"`
+	CallID           string         `json:"call_id"`
+	Name             string         `json:"name"`
+	Arguments        string         `json:"arguments"`
+	Status           string         `json:"status"`
+	Query            string         `json:"query"`
+	Action           map[string]any `json:"action"`
+	RevisedPrompt    string         `json:"revised_prompt"`
+	Result           string         `json:"result"`
+	EncryptedContent string         `json:"encrypted_content"`
+}
+
+// responsesReasoningAccum tracks a Responses API reasoning item by output_index,
+// mirroring the TS ResponsesReasoningAccum. It captures the item id and
+// encrypted_content (for cross-turn encrypted reasoning replay) and how much
+// reasoning text was already streamed via deltas, so a trailing .done event only
+// emits the full text when no delta preceded it (matching emitOnlyIfAccumulatorEmpty).
+type responsesReasoningAccum struct {
+	ItemID           string
+	EncryptedContent string
+	EmittedLen       int
+}
+
+// reasoningMetadataFromAccum builds the providerMetadata.openai payload the loop
+// persists onto reasoning content blocks and replays as encrypted_content on the
+// next turn (openAIResponsesAssistantItems rebuild). Returns nil when there is
+// nothing to carry.
+func reasoningMetadataFromAccum(acc *responsesReasoningAccum) map[string]any {
+	if acc == nil {
+		return nil
+	}
+	openai := map[string]any{}
+	if acc.ItemID != "" {
+		openai["itemId"] = acc.ItemID
+	}
+	if acc.EncryptedContent != "" {
+		openai["reasoningEncryptedContent"] = acc.EncryptedContent
+	}
+	if len(openai) == 0 {
+		return nil
+	}
+	return map[string]any{"openai": openai}
+}
+
+// resolveResponsesReasoningAccum returns (creating if needed) the reasoning
+// accumulator for the event's output_index. Responses reasoning events always
+// carry output_index, so a nil index yields no accumulator.
+func resolveResponsesReasoningAccum(reasoning map[int]*responsesReasoningAccum, outputIndex *int) *responsesReasoningAccum {
+	if outputIndex == nil {
+		return nil
+	}
+	acc := reasoning[*outputIndex]
+	if acc == nil {
+		acc = &responsesReasoningAccum{}
+		reasoning[*outputIndex] = acc
+	}
+	return acc
+}
+
+// handleResponsesReasoningEvent handles the four Responses reasoning event types
+// (summary/text delta+done, and output_item.added/done with item.type=reasoning),
+// capturing itemId/encrypted_content for cross-turn encrypted reasoning replay
+// and emitting reasoning text/metadata events. Returns true when the event was a
+// reasoning event (handled), so callers can skip their default handling. Shared
+// by the SSE (streamOpenAIResponses) and Codex WebSocket (handleResponsesJSONEvent)
+// paths so both capture encrypted reasoning identically. Mirrors the TS
+// openai-provider reasoning accumulator (pushReasoningTextEvent + output_item).
+func handleResponsesReasoningEvent(ctx context.Context, out chan<- StreamEvent, reasoning map[int]*responsesReasoningAccum, parsed responsesStreamEvent) bool {
+	switch parsed.Type {
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		// Streamed reasoning text: append to the accumulator and carry the
+		// captured itemId/encrypted_content metadata so the loop persists it
+		// for cross-turn encrypted reasoning replay (mirrors TS pushReasoningTextEvent).
+		acc := resolveResponsesReasoningAccum(reasoning, parsed.OutputIndex)
+		if acc != nil {
+			acc.EmittedLen += len(parsed.Delta)
+		}
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Reasoning: parsed.Delta, ReasoningMetadata: reasoningMetadataFromAccum(acc), ReasoningOutputIndex: parsed.OutputIndex, ResponsesAPI: true}})
+		return true
+	case "response.reasoning_summary_text.done", "response.reasoning_text.done":
+		// Final reasoning text: emit only when no delta preceded it (a provider
+		// that streams only the .done full text), mirroring TS emitOnlyIfAccumulatorEmpty.
+		acc := resolveResponsesReasoningAccum(reasoning, parsed.OutputIndex)
+		if parsed.Text != "" && (acc == nil || acc.EmittedLen == 0) {
+			if acc != nil {
+				acc.EmittedLen += len(parsed.Text)
+			}
+			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Reasoning: parsed.Text, ReasoningMetadata: reasoningMetadataFromAccum(acc), ReasoningOutputIndex: parsed.OutputIndex, ResponsesAPI: true}})
+		}
+		return true
+	case "response.output_item.added":
+		if parsed.Item != nil && parsed.Item.Type == "reasoning" {
+			if acc := resolveResponsesReasoningAccum(reasoning, parsed.OutputIndex); acc != nil {
+				acc.ItemID = parsed.Item.ID
+				acc.EncryptedContent = parsed.Item.EncryptedContent
+			}
+			return true
+		}
+		return false
+	case "response.output_item.done":
+		if parsed.Item != nil && parsed.Item.Type == "reasoning" {
+			// Update the final encrypted_content and emit a metadata-only event
+			// so the loop persists the final value for continuation (mirrors TS).
+			if acc := resolveResponsesReasoningAccum(reasoning, parsed.OutputIndex); acc != nil {
+				if parsed.Item.ID != "" {
+					acc.ItemID = parsed.Item.ID
+				}
+				if parsed.Item.EncryptedContent != "" {
+					acc.EncryptedContent = parsed.Item.EncryptedContent
+				}
+				if metadata := reasoningMetadataFromAccum(acc); metadata != nil {
+					emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ReasoningMetadata: metadata, ReasoningOutputIndex: parsed.OutputIndex, ResponsesAPI: true}})
+				}
+			}
+			return true
+		}
+		return false
+	}
+	return false
 }
 
 func streamCodexWithFailover(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string, sessionKey string, out chan<- StreamEvent) error {
@@ -627,11 +797,16 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 	if instructions != "" {
 		body["instructions"] = instructions
 	} else if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
-		body["instructions"] = "You are an AI coding agent working inside NarraFork."
+		body["instructions"] = codexDefaultInstructions
 	}
 	if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
 		body["parallel_tool_calls"] = true
 		body["prompt_cache_key"] = codexPromptCacheKey(provider)
+		// Codex fast mode: narrator fastMode maps to service_tier:"priority"
+		// (priority processing), mirroring TS. Only codex bodies emit it.
+		if provider.ServiceTier != "" {
+			body["service_tier"] = provider.ServiceTier
+		}
 	}
 	if strings.EqualFold(provider.APIMode, "codex") || provider.Kind == "codex" {
 		// Codex Responses requests: clamp effort to the model's supported levels
@@ -656,7 +831,8 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 	setOpenAICompatibleHeaders(req, provider)
 	if strings.EqualFold(provider.APIMode, "codex") {
 		req.Header.Set("originator", "narrafork")
-		if provider.AccountID != "" {
+		// Only sent to official ChatGPT domains (mirrors TS), not proxy endpoints.
+		if provider.AccountID != "" && isOfficialChatGPTDomain(provider.BaseURL) {
 			req.Header.Set("ChatGPT-Account-Id", provider.AccountID)
 		}
 	}
@@ -685,6 +861,7 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 		return nil
 	}
 	toolsByItem := map[string]*openAIStreamingTool{}
+	reasoningByIndex := map[int]*responsesReasoningAccum{}
 	completed := false
 	err = readSSE(ctx, res.Body, 0, func(event sseEvent) error {
 		data := strings.TrimSpace(event.Data)
@@ -713,13 +890,20 @@ func streamOpenAIResponses(ctx context.Context, client *http.Client, provider Pr
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{ResponseID: parsed.Response.ID, ResponsesAPI: true}})
 		case "response.output_text.delta":
 			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Text: parsed.Delta, TextOutputIndex: parsed.OutputIndex, ResponsesAPI: true}})
-		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
-			emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{Reasoning: parsed.Delta, ReasoningOutputIndex: parsed.OutputIndex, ResponsesAPI: true}})
+		case "response.reasoning_summary_text.delta", "response.reasoning_text.delta",
+			"response.reasoning_summary_text.done", "response.reasoning_text.done":
+			handleResponsesReasoningEvent(ctx, out, reasoningByIndex, parsed)
 		case "response.output_item.added":
+			if handleResponsesReasoningEvent(ctx, out, reasoningByIndex, parsed) {
+				break
+			}
 			if parsed.Item != nil {
 				handleResponsesOutputItemAdded(ctx, out, toolsByItem, parsed.Item, parsed.OutputIndex)
 			}
 		case "response.output_item.done":
+			if handleResponsesReasoningEvent(ctx, out, reasoningByIndex, parsed) {
+				break
+			}
 			if parsed.Item != nil {
 				handleResponsesOutputItemDone(ctx, out, parsed.Item, parsed.OutputIndex)
 			}
@@ -784,7 +968,8 @@ func emitResponsesCompletedOutput(ctx context.Context, out chan<- StreamEvent, d
 	}
 }
 
-func openAIChatCompletionMessages(messages []Message) []map[string]any {
+func openAIChatCompletionMessages(messages []Message, model string) []map[string]any {
+	deepSeek := isDeepSeekModelName(model)
 	out := make([]map[string]any, 0, len(messages))
 	for _, message := range messages {
 		if message.Role == "assistant" {
@@ -808,9 +993,60 @@ func openAIChatCompletionMessages(messages []Message) []map[string]any {
 		} else {
 			item["content"] = message.Content
 		}
+		if message.Role == "assistant" {
+			// Mirror TS buildOAIHistory + buildHistory post-processing: reasoning is
+			// replayed in a separate reasoning_content field (models like DeepSeek/QwQ
+			// require it). When the stored ContentBlocks carry reasoning blocks, set
+			// reasoning_content from them and rebuild content from text blocks only so
+			// reasoning is not duplicated into the visible content (messageTextForAgent
+			// otherwise folds reasoning into Content).
+			if reasoningText := chatReasoningTextFromBlocks(message.ContentBlocks); reasoningText != "" {
+				item["reasoning_content"] = reasoningText
+				item["content"] = chatVisibleTextFromBlocks(message.ContentBlocks)
+			}
+			// DeepSeek thinking mode requires reasoning_content on ALL assistant
+			// messages; patch missing ones with an empty string so the API does not
+			// reject the request (mirrors TS openai-provider.ts:559-560).
+			if deepSeek {
+				if _, has := item["reasoning_content"]; !has {
+					item["reasoning_content"] = ""
+				}
+			}
+		}
 		out = append(out, item)
 	}
 	return out
+}
+
+// chatReasoningTextFromBlocks joins the text of all reasoning content blocks with
+// blank lines, mirroring TS reasoningBlocks.map(b=>b.text).join("\n\n").
+func chatReasoningTextFromBlocks(blocks []map[string]any) string {
+	parts := []string{}
+	for _, block := range blocks {
+		if stringValue(block["type"]) != "reasoning" {
+			continue
+		}
+		if text := stringValue(block["text"]); strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// chatVisibleTextFromBlocks joins the text of all text content blocks with
+// newlines, mirroring TS buildOAIHistory which sets assistant content from text
+// blocks only (reasoning goes to reasoning_content).
+func chatVisibleTextFromBlocks(blocks []map[string]any) string {
+	parts := []string{}
+	for _, block := range blocks {
+		if stringValue(block["type"]) != "text" {
+			continue
+		}
+		if text := stringValue(block["text"]); strings.TrimSpace(text) != "" {
+			parts = append(parts, text)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func openAIResponsesInput(messages []Message) []any {
@@ -1006,6 +1242,63 @@ func imageGenerationSavedPathInstruction(savedPath string) string {
 		"If you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it."
 }
 
+// codexImageGenerationPartialImages mirrors the TS
+// CODEX_IMAGE_GENERATION_PARTIAL_IMAGES (openai-provider.ts:125): the number of
+// streaming partial preview images requested from codex. Go already consumes
+// the resulting response.image_generation_call.partial_image events
+// (loop_basic.go / provider_codex_ws.go), so the request must ask for them.
+const codexImageGenerationPartialImages = 2
+
+// codexModelInputModalities mirrors the TS CODEX_MODEL_INPUT_MODALITIES table
+// (openai-provider.ts:128-139): codex models that do NOT list "image" as an
+// input modality must not receive the native image_generation tool. Models not
+// in the table default to text+image (DEFAULT_CODEX_INPUT_MODALITIES).
+var codexModelInputModalities = map[string][]string{
+	"gpt-5.5":             {"text", "image"},
+	"gpt-5.4":             {"text", "image"},
+	"gpt-5.4-mini":        {"text", "image"},
+	"gpt-5.3-codex-spark": {"text"},
+	"gpt-5.3-codex":       {"text", "image"},
+	"gpt-5.2-codex":       {"text", "image"},
+	"gpt-5.2":             {"text", "image"},
+	"gpt-5.1-codex-max":   {"text", "image"},
+	"gpt-5.1-codex":       {"text", "image"},
+	"gpt-5.1-codex-mini":  {"text", "image"},
+}
+
+// supportsCodexImageGeneration mirrors the TS supportsCodexImageGeneration
+// (openai-provider.ts:169-173): look up the bare model's input modalities
+// (defaulting to text+image) and report whether "image" is supported.
+func supportsCodexImageGeneration(model string) bool {
+	modalities, ok := codexModelInputModalities[bareModelID(model)]
+	if !ok {
+		return true // DEFAULT_CODEX_INPUT_MODALITIES = ["text", "image"]
+	}
+	for _, modality := range modalities {
+		if modality == "image" {
+			return true
+		}
+	}
+	return false
+}
+
+// applyCodexImageGenerationDefaults mirrors the TS
+// applyCodexImageGenerationDefaults (openai-provider.ts:157-167): backfill
+// output_format and partial_images on an already-present image_generation tool.
+func applyCodexImageGenerationDefaults(tools []map[string]any) {
+	for _, tool := range tools {
+		if stringValue(tool["type"]) != "image_generation" {
+			continue
+		}
+		if _, ok := tool["output_format"]; !ok {
+			tool["output_format"] = "png"
+		}
+		if _, ok := tool["partial_images"]; !ok {
+			tool["partial_images"] = codexImageGenerationPartialImages
+		}
+	}
+}
+
 func appendCodexNativeTools(tools []map[string]any, model string, useWebSearch bool, useImageGeneration bool) []map[string]any {
 	if useWebSearch {
 		if !hasResponseTool(tools, "web_search") {
@@ -1017,9 +1310,22 @@ func appendCodexNativeTools(tools []map[string]any, model string, useWebSearch b
 	if !useImageGeneration {
 		return removeResponseTool(tools, "image_generation")
 	}
-	if strings.Contains(strings.ToLower(model), "gpt") && !hasResponseTool(tools, "image_generation") {
-		tools = append(tools, map[string]any{"type": "image_generation", "output_format": "png"})
+	// Mirror TS appendCodexNativeTools (openai-provider.ts:189-198): gate the
+	// image_generation tool on the model's input modalities (not a coarse
+	// Contains("gpt")), and request partial_images so codex streams partial
+	// previews. Backfill defaults when the tool is already present.
+	if !supportsCodexImageGeneration(model) {
+		return tools
 	}
+	if !hasResponseTool(tools, "image_generation") {
+		tools = append(tools, map[string]any{
+			"type":           "image_generation",
+			"output_format":  "png",
+			"partial_images": codexImageGenerationPartialImages,
+		})
+		return tools
+	}
+	applyCodexImageGenerationDefaults(tools)
 	return tools
 }
 
@@ -1170,10 +1476,10 @@ func responsesToolCall(idValue, name, arguments string) ToolCall {
 
 func doChatRequest(ctx context.Context, client *http.Client, provider Provider, messages []Message, reasoningEffort string, toolScope string) (chatResponse, error) {
 	body := map[string]any{
-		"model":       provider.Model,
-		"messages":    messages,
-		"temperature": 0.2,
-		"tools":       toolDefinitions(toolScope),
+		"model":    provider.Model,
+		"messages": messages,
+		// No temperature, matching TS openai-provider.ts (see streamChatCompletions).
+		"tools": toolDefinitions(toolScope),
 	}
 	if effort := chatReasoningEffort(provider.Model, reasoningEffort); effort != "" {
 		body["reasoning_effort"] = effort

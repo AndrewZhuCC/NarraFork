@@ -112,6 +112,14 @@ func (s *Service) generateNarratorTitle(ctx context.Context, narratorID, cwd, lo
 		return existingTitle
 	}
 	title := sanitizeGeneratedTitle(generated)
+	// Mirror the TS generateTitle guard (narrator-title.ts:174-177): if the model
+	// returned something too long (>80 UTF-16 units) it is not a valid title, so
+	// keep only the first 50. sanitizeGeneratedTitle's 200-cap is a looser
+	// defensive bound; this matches the exact TS contract (and the sibling
+	// generateQuickTitle, which already applies the same >80->50 cap).
+	if httpx.JSStringLength(title) > 80 {
+		title = httpx.JSStringSlicePrefix(title, 50)
+	}
 	if title == "" {
 		return existingTitle
 	}

@@ -599,9 +599,18 @@ func decodeCreateHookBody(r *http.Request) (hookCreateBody, error) {
 		}
 		body.ProjectID = text
 	}
+	// Mirror the TS hookEventEnum = z.enum(["PreToolUse", "PostToolUse", "Stop"])
+	// (server/lib/validators/hooks.ts:3), used by createHookSchema.event. Go
+	// previously accepted only PreToolUse/PostToolUse, so a POST /api/hooks with
+	// event:"Stop" (a valid TS hook event — hook-service.ts treats PostToolUse/Stop
+	// as the non-blocking class) was rejected 400 while TS persisted it. The hooks
+	// table event column is plain TEXT (no CHECK), and the Go runtime queries hooks
+	// by exact `event = ?` for PreToolUse/PostToolUse, so a stored Stop hook is
+	// simply never triggered as a tool hook — matching TS, where Stop runtime
+	// execution is a separate concern outside CRUD.
 	event, ok := raw["event"].(string)
-	if !ok || (event != "PreToolUse" && event != "PostToolUse") {
-		return hookCreateBody{}, httpx.BadRequest("event must be PreToolUse or PostToolUse")
+	if !ok || (event != "PreToolUse" && event != "PostToolUse" && event != "Stop") {
+		return hookCreateBody{}, httpx.BadRequest("event must be PreToolUse, PostToolUse, or Stop")
 	}
 	body.Event = event
 	if value, exists := raw["matcher"]; exists {
@@ -683,8 +692,10 @@ func decodeUpdateHookBody(raw map[string]any, existingType string) (hookUpdatePa
 	patch := hookUpdatePatch{}
 	if value, exists := raw["event"]; exists {
 		text, ok := value.(string)
-		if !ok || (text != "PreToolUse" && text != "PostToolUse") {
-			return patch, httpx.BadRequest("event must be PreToolUse or PostToolUse")
+		// Mirror updateHookSchema.event = hookEventEnum.optional() — the same
+		// three-value enum (PreToolUse/PostToolUse/Stop) as create.
+		if !ok || (text != "PreToolUse" && text != "PostToolUse" && text != "Stop") {
+			return patch, httpx.BadRequest("event must be PreToolUse, PostToolUse, or Stop")
 		}
 		patch.EventSet = true
 		patch.Event = text
@@ -2378,23 +2389,66 @@ func contentJSONHasImageBlocks(raw string) bool {
 	return false
 }
 
+// searchTablePrefixes mirrors the TS SEARCH_TABLE_PREFIXES
+// (database-cleanup-service.ts:71): a table is a "search" table when its name
+// equals one of these prefixes or starts with "<prefix>_" (FTS5 shadow tables).
+var searchTablePrefixes = []string{"chapters_fts", "narrator_messages_fts", "narrators_fts"}
+
+// databaseStorageCategorySets mirrors the exact-table-name whitelists in TS
+// getDatabaseStorageCategory (database-cleanup-service.ts:327-389). Go previously
+// used coarse HasPrefix matching (e.g. any "narrator*"/"terminal*"/api_requests →
+// "sessions", any "project*"/"chapter*" → "projects"), which miscategorized many
+// tables: api_requests (should be apiRequests, not sessions), terminal/container/
+// port/volume runtime tables (should be runtime, not sessions/other),
+// exploration_groups/merge_sessions/review_conclusions (should be projects, not
+// other), and workspaces/hooks (should be users, not other). That made the
+// apiRequests and runtime categories never appear in /api/storage/scan and
+// misattributed their byte/row counts on the frontend Storage settings page.
+var databaseStorageCategorySets = map[string]string{
+	// sessions — narrator-owned conversation/session state + background tasks.
+	"narrators": "sessions", "narrator_goals": "sessions", "narrator_messages": "sessions",
+	"narrator_message_refs": "sessions", "narrator_sidecars": "sessions", "narrator_tool_calls": "sessions",
+	"narrator_buffered_messages": "sessions", "narrator_file_snapshots": "sessions", "narrator_patches": "sessions",
+	"narrator_whitelist_dirs": "sessions", "narrator_blacklist_dirs": "sessions",
+	"narrator_whitelist_cmds": "sessions", "narrator_blacklist_cmds": "sessions",
+	"background_tasks": "sessions",
+	// apiRequests — provider API request/usage records.
+	"api_requests": "apiRequests",
+	// projects — project/chapter graph + merge/review records.
+	"projects": "projects", "exploration_groups": "projects", "chapters": "projects",
+	"chapter_edges": "projects", "chapter_commits": "projects", "merge_sessions": "projects",
+	"review_conclusions": "projects",
+	// runtime — terminals, containers, ports, volume snapshots.
+	"terminals": "runtime", "terminal_tabs": "runtime", "terminal_view_state": "runtime",
+	"container_instances": "runtime", "port_allocations": "runtime", "volume_snapshots": "runtime",
+	"volume_snapshot_applications": "runtime",
+	// users — user accounts, preferences, favorites, workspaces, hooks.
+	"users": "users", "user_preferences": "users", "user_favorite_directories": "users",
+	"workspaces": "users", "hooks": "users",
+	// gateway — gateway session mappings.
+	"gateway_session_mappings": "gateway",
+	// benchmarks — benchmark suites/runs/results.
+	"benchmark_suites": "benchmarks", "benchmark_runs": "benchmarks", "benchmark_task_results": "benchmarks",
+}
+
+// databaseTableCategory mirrors TS getDatabaseStorageCategory
+// (database-cleanup-service.ts:327-389) exactly: sqlite_* internal tables →
+// "internal"; FTS prefix tables → "search"; otherwise an exact table-name
+// whitelist for sessions/apiRequests/projects/runtime/users/gateway/benchmarks;
+// everything else → "other".
 func databaseTableCategory(name string) string {
-	switch {
-	case strings.HasPrefix(name, "narrator") || strings.HasPrefix(name, "terminal") || name == "api_requests":
-		return "sessions"
-	case strings.HasPrefix(name, "project") || strings.HasPrefix(name, "chapter"):
-		return "projects"
-	case strings.HasPrefix(name, "user"):
-		return "users"
-	case strings.Contains(name, "fts"):
-		return "search"
-	case strings.HasPrefix(name, "gateway"):
-		return "gateway"
-	case strings.HasPrefix(name, "benchmark"):
-		return "benchmarks"
-	default:
-		return "other"
+	if strings.HasPrefix(name, "sqlite_") {
+		return "internal"
 	}
+	for _, prefix := range searchTablePrefixes {
+		if name == prefix || strings.HasPrefix(name, prefix+"_") {
+			return "search"
+		}
+	}
+	if category, ok := databaseStorageCategorySets[name]; ok {
+		return category
+	}
+	return "other"
 }
 
 func int64Number(value any) int64 {

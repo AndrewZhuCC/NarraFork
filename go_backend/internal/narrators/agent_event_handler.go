@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"narrafork-go/internal/agentbasic"
@@ -25,9 +26,22 @@ type apiRequestRunState struct {
 }
 
 type agentRunState struct {
-	narratorID             string
-	narrator               Narrator
-	draftMessageID         *string
+	narratorID string
+	// mu guards the fields that are accessed concurrently by the agent loop
+	// goroutine (the tool executor + runtime hooks run inside agentbasic.RunAgentLoop)
+	// and the caller goroutine (handleAgentEvent draining the event channel).
+	// agentbasic.RunAgentLoop runs the executor on its own goroutine while the
+	// caller consumes events from a buffered channel, so these two goroutines run
+	// concurrently and both touch draftMessageID / narrator / planApproved*.
+	// Fields that are ONLY touched by the caller goroutine (handleAgentEvent and
+	// the run finalizers) do not need the lock and are left unguarded.
+	mu                     sync.Mutex
+	draftCreateMu          sync.Mutex // serializes lazy assistant-draft creation across goroutines
+	narrator               Narrator   // guarded by mu
+	draftMessageID         string     // guarded by mu
+	planApprovedMode       string     // guarded by mu
+	planApprovedPrompt     string     // guarded by mu
+	planApprovedBy         string     // guarded by mu
 	blocks                 []map[string]any
 	assistantText          string
 	lastMessage            *Message
@@ -37,6 +51,7 @@ type agentRunState struct {
 	errorCode              string
 	hadToolUses            bool
 	skipGoalContinuation   bool
+	outputTruncated        bool
 	goalTurnStartedAt      time.Time
 	goalTokenUsageBaseline *agentbasic.UsageSnapshot
 	lastTokenUsage         *agentbasic.UsageSnapshot
@@ -47,20 +62,86 @@ type agentRunState struct {
 	apiRequests            map[string]apiRequestRunState
 	streamedBytes          int
 	providerPrefix         string
-	planApprovedMode       string
-	planApprovedPrompt     string
-	planApprovedBy         string
 	sideCarToolCount       int
 	toolUseCharsMap        map[string]int
+}
+
+// draftID returns the current assistant draft message id under the lock.
+func (state *agentRunState) draftID() string {
+	if state == nil {
+		return ""
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.draftMessageID
+}
+
+// setDraftID stores the assistant draft message id under the lock.
+func (state *agentRunState) setDraftID(id string) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.draftMessageID = id
+	state.mu.Unlock()
+}
+
+// currentNarrator returns a copy of the narrator snapshot under the lock so
+// callers never observe a torn struct while a runtime hook is replacing it.
+func (state *agentRunState) currentNarrator() Narrator {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.narrator
+}
+
+// setNarrator replaces the narrator snapshot under the lock.
+func (state *agentRunState) setNarrator(narrator Narrator) {
+	state.mu.Lock()
+	state.narrator = narrator
+	state.mu.Unlock()
+}
+
+// setNarratorModel updates only the model/reasoning fields under the lock,
+// mirroring the runtime-settings override hook which mutates them in place.
+func (state *agentRunState) setNarratorModel(model, reasoningEffort *string) {
+	state.mu.Lock()
+	state.narrator.Model = model
+	state.narrator.ReasoningEffort = reasoningEffort
+	state.mu.Unlock()
+}
+
+// setPlanApproval records an approved ExitPlanMode continuation under the lock.
+func (state *agentRunState) setPlanApproval(mode, prompt, decidedBy string) {
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	state.planApprovedMode = mode
+	state.planApprovedPrompt = prompt
+	state.planApprovedBy = decidedBy
+	state.mu.Unlock()
+}
+
+// planApproval reads the approved ExitPlanMode continuation under the lock.
+func (state *agentRunState) planApproval() (mode, prompt, decidedBy string) {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.planApprovedMode, state.planApprovedPrompt, state.planApprovedBy
+}
+
+// planApprovedModeValue returns just the approved continuation mode under the
+// lock (the stream loop polls this to detect plan approval).
+func (state *agentRunState) planApprovedModeValue() string {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.planApprovedMode
 }
 
 func (state *agentRunState) resetAssistantDraft() {
 	if state == nil {
 		return
 	}
-	if state.draftMessageID != nil {
-		*state.draftMessageID = ""
-	}
+	state.setDraftID("")
 	state.blocks = nil
 	state.assistantText = ""
 	state.hadToolUses = false
@@ -70,6 +151,10 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 	if strings.TrimSpace(event.Provider) != "" {
 		state.providerPrefix = event.Provider
 	}
+	// Snapshot the narrator once per event: the agent loop goroutine may replace
+	// state.narrator between turns via the runtime-settings/before-turn hooks, so a
+	// single consistent read avoids a torn struct mid-handler.
+	narrator := state.currentNarrator()
 	s.broadcastAgentEvent(state.narratorID, event)
 	// Mirror the TS narrator-event-handler recordOutputChunk calls: record streamed
 	// assistant text and reasoning lengths (UTF-16 code units) into the global
@@ -98,9 +183,9 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			}
 		}
 	}
-	if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil && (event.Type == "stream_text" || event.Type == "stream_reasoning") && event.Text != "" {
+	if narrator.IsBackground && narrator.ParentNarratorID != nil && (event.Type == "stream_text" || event.Type == "stream_reasoning") && event.Text != "" {
 		state.streamedBytes += len([]byte(event.Text))
-		s.broadcastBackgroundTaskOutput(*state.narrator.ParentNarratorID, state.narratorID, state.streamedBytes)
+		s.broadcastBackgroundTaskOutput(*narrator.ParentNarratorID, state.narratorID, state.streamedBytes)
 	}
 	switch event.Type {
 	case "retrying":
@@ -109,7 +194,7 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		// narrator is a subagent, additionally notify its parent so the parent's
 		// SubagentCard can render the inline retry status, mirroring the TS
 		// narrator-recovery subagent_warning dual broadcast.
-		s.broadcastSubagentWarning(state.narrator, state.narratorID, event)
+		s.broadcastSubagentWarning(narrator, state.narratorID, event)
 		return nil
 	case "model_switched":
 		// The raw `model_switched` frame was already broadcast above. Mirror the TS
@@ -119,7 +204,13 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		// model/provider/reasoningEffort.
 		s.broadcastModelSettingsApplied(state.narratorID, event)
 		return nil
-	case "stream_text", "stream_reasoning", "tool_use_chunk", "web_search", "image_generation", "output_truncated", "tool_inventory":
+	case "stream_text", "stream_reasoning", "tool_use_chunk", "web_search", "image_generation", "tool_inventory":
+		return nil
+	case "output_truncated":
+		// Mark the run as completion-token-limited so the session loop
+		// (runBasicAgent) can auto-continue with an interruptionContinue prompt,
+		// mirroring the TS completion-limit continuation (narrator-session.ts).
+		state.outputTruncated = true
 		return nil
 	case "turn_complete":
 		state.resetAssistantDraft()
@@ -163,7 +254,8 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		if event.Block == nil {
 			return nil
 		}
-		if err := s.ensureAssistantDraft(ctx, state); err != nil {
+		draftID, err := s.ensureDraftID(ctx, state)
+		if err != nil {
 			return err
 		}
 		block := contentBlockToMap(event.Block)
@@ -176,10 +268,11 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		if block["type"] == "text" {
 			state.assistantText = strings.TrimSpace(stringFromAny(block["text"]))
 		}
-		return s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks)
+		return s.updateAssistantDraft(ctx, state.narratorID, draftID, state.assistantText, state.blocks)
 	case "tool_call":
 		state.hadToolUses = true
-		if err := s.ensureAssistantDraft(ctx, state); err != nil {
+		draftID, err := s.ensureDraftID(ctx, state)
+		if err != nil {
 			return err
 		}
 		block := map[string]any{"type": "tool_use", "id": event.ToolUseID, "name": event.ToolName, "input": event.Input}
@@ -187,36 +280,37 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 			block["streamStartedAt"] = event.StreamStartedAt
 		}
 		upsertToolUseBlock(state, block)
-		if err := s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks); err != nil {
+		if err := s.updateAssistantDraft(ctx, state.narratorID, draftID, state.assistantText, state.blocks); err != nil {
 			return err
 		}
-		if toolRequiresApproval(state.narrator.PermissionMode, event.ToolName) {
+		if toolRequiresApproval(narrator.PermissionMode, event.ToolName) {
 			return nil
 		}
-		return s.recordRunningToolCall(ctx, state.narratorID, *state.draftMessageID, state.narrator, event)
+		return s.recordRunningToolCall(ctx, state.narratorID, draftID, narrator, event)
 	case "tool_result":
-		if err := s.ensureAssistantDraft(ctx, state); err != nil {
+		if _, err := s.ensureDraftID(ctx, state); err != nil {
 			return err
 		}
 		return s.finishToolCallFromEvent(ctx, state, event)
 	case "assistant_message":
-		if err := s.ensureAssistantDraft(ctx, state); err != nil {
+		draftID, err := s.ensureDraftID(ctx, state)
+		if err != nil {
 			return err
 		}
 		if strings.TrimSpace(event.Text) != "" {
 			state.assistantText = event.Text
 		}
-		if err := s.updateAssistantDraft(ctx, state.narratorID, *state.draftMessageID, state.assistantText, state.blocks); err != nil {
+		if err := s.updateAssistantDraft(ctx, state.narratorID, draftID, state.assistantText, state.blocks); err != nil {
 			return err
 		}
-		_ = s.updateAssistantMessageUsage(ctx, state, *state.draftMessageID, event)
-		_ = s.linkPendingAPIRequestsToMessage(ctx, state, *state.draftMessageID)
-		msg, err := s.messageByID(ctx, state.narratorID, *state.draftMessageID)
+		_ = s.updateAssistantMessageUsage(ctx, state, draftID, event)
+		_ = s.linkPendingAPIRequestsToMessage(ctx, state, draftID)
+		msg, err := s.messageByID(ctx, state.narratorID, draftID)
 		if err != nil {
 			return err
 		}
-		if state.narrator.IsBackground && state.narrator.ParentNarratorID != nil {
-			if err := s.finishBackgroundTaskRecord(ctx, *state.narrator.ParentNarratorID, state.narratorID, "completed", state.assistantText); err != nil {
+		if narrator.IsBackground && narrator.ParentNarratorID != nil {
+			if err := s.finishBackgroundTaskRecord(ctx, *narrator.ParentNarratorID, state.narratorID, "completed", state.assistantText); err != nil {
 				return err
 			}
 		}
@@ -241,10 +335,64 @@ func (s *Service) handleAgentEvent(ctx context.Context, state *agentRunState, ev
 		if isCancelledError(errors.New(state.errorMessage)) {
 			return s.finishAgentRunCancelled(ctx, state)
 		}
-		return s.finishAgentRunError(ctx, state, state.errorMessage)
+		// state.errorMessage stays raw above so the cancellation check (and the
+		// upstream overflow/retry classification) keep matching the original
+		// provider body. Only the user-visible display string handed to
+		// finishAgentRunError is cleaned, mirroring TS extractApiErrorMessage.
+		return s.finishAgentRunError(ctx, state, cleanProviderErrorMessageForDisplay(state.errorMessage))
 	default:
 		return nil
 	}
+}
+
+// cleanProviderErrorMessageForDisplay shortens a verbose provider error string
+// for user-visible display, mirroring TS extractApiErrorMessage
+// (server/lib/agent/openai-provider.ts:1346). Go providerHTTPError.Error()
+// embeds the full response body, e.g.
+// `openai provider returned status 400: {"error":{"message":"...","type":"..."}}`,
+// which can carry up to 64KB of raw JSON. This finds the first embedded JSON
+// object and, when it exposes error.message or a top-level message, replaces
+// the JSON span with that clean message while preserving the surrounding
+// prefix/suffix (the "<provider> provider returned status <N>: " prefix).
+//
+// This is a DISPLAY-ONLY transform applied to the argument handed to
+// finishAgentRunError. The raw text is still used for retry/overflow/cancel
+// classification upstream (agent loop + handleAgentEvent overflow check +
+// isCancelledError), so no matching token is lost here.
+func cleanProviderErrorMessageForDisplay(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return raw
+	}
+	start := strings.Index(raw, "{")
+	end := strings.LastIndex(raw, "}")
+	if start < 0 || end <= start {
+		return raw
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(raw[start:end+1]), &parsed); err != nil {
+		return raw
+	}
+	clean := ""
+	if errObj, ok := parsed["error"].(map[string]any); ok {
+		if msg, ok := errObj["message"].(string); ok && strings.TrimSpace(msg) != "" {
+			clean = msg
+		}
+	}
+	if clean == "" {
+		if msg, ok := parsed["message"].(string); ok && strings.TrimSpace(msg) != "" {
+			clean = msg
+		}
+	}
+	if clean == "" {
+		// No extractable message (e.g. {"error":{"code":"x"}}); keep the raw
+		// text so any diagnostic detail survives.
+		return raw
+	}
+	result := raw[:start] + clean + raw[end+1:]
+	if runes := []rune(result); len(runes) > 1000 {
+		return string(runes[:1000]) + "..."
+	}
+	return result
 }
 
 func rememberAPIRequestStart(state *agentRunState, event agentbasic.AgentEvent) {
@@ -260,7 +408,7 @@ func rememberAPIRequestStart(state *agentRunState, event agentbasic.AgentEvent) 
 	}
 	state.apiRequests[requestID] = apiRequestRunState{
 		Provider:     firstNonEmptyString(strings.TrimSpace(event.Provider), state.providerPrefix),
-		Model:        firstNonEmptyString(strings.TrimSpace(event.Model), ptrString(state.narrator.Model)),
+		Model:        firstNonEmptyString(strings.TrimSpace(event.Model), ptrString(state.currentNarrator().Model)),
 		CredentialID: strings.TrimSpace(event.CredentialID),
 		StartedAt:    time.Now(),
 	}
@@ -283,7 +431,7 @@ func (s *Service) persistAPIRequestEvent(ctx context.Context, state *agentRunSta
 		request.StartedAt = time.Now()
 	}
 	provider := firstNonEmptyString(strings.TrimSpace(event.Provider), request.Provider, state.providerPrefix)
-	model := firstNonEmptyString(strings.TrimSpace(event.Model), request.Model, ptrString(state.narrator.Model))
+	model := firstNonEmptyString(strings.TrimSpace(event.Model), request.Model, ptrString(state.currentNarrator().Model))
 	credentialID := firstNonEmptyString(strings.TrimSpace(event.CredentialID), request.CredentialID)
 	durationMs := event.DurationMs
 	if durationMs == 0 && !request.StartedAt.IsZero() {
@@ -302,10 +450,7 @@ func (s *Service) persistAPIRequestEvent(ctx context.Context, state *agentRunSta
 		stringFromMetadata(event.Metadata, "meterUnit"),
 		stringFromMetadata(event.Metadata, "meter_unit"),
 	)
-	messageID := ""
-	if state.draftMessageID != nil {
-		messageID = strings.TrimSpace(*state.draftMessageID)
-	}
+	messageID := strings.TrimSpace(state.draftID())
 	values := map[string]any{
 		"id":                          requestID,
 		"narrator_id":                 state.narratorID,
@@ -435,7 +580,7 @@ func (s *Service) updateAssistantMessageUsage(ctx context.Context, state *agentR
 	}
 	usage := state.lastTokenUsage
 	provider := firstNonEmptyString(state.providerPrefix, event.Provider)
-	model := firstNonEmptyString(ptrString(state.narrator.Model), event.Model)
+	model := firstNonEmptyString(ptrString(state.currentNarrator().Model), event.Model)
 	credentialID := strings.TrimSpace(event.CredentialID)
 	values := map[string]any{
 		"provider":                    nullableTrimmedString(provider),
@@ -689,19 +834,35 @@ func floatFromMetadata(metadata map[string]any, key string) float64 {
 }
 
 func (s *Service) ensureAssistantDraft(ctx context.Context, state *agentRunState) error {
-	if state.draftMessageID != nil && strings.TrimSpace(*state.draftMessageID) != "" {
-		return nil
+	_, err := s.ensureDraftID(ctx, state)
+	return err
+}
+
+// ensureDraftID returns the assistant draft message id for the run, creating it
+// lazily if needed. It is safe to call from both the agent loop goroutine (tool
+// executor) and the caller goroutine (handleAgentEvent): draftCreateMu serializes
+// the create path so concurrent callers never insert two drafts, and the id is
+// published through the mu-guarded value field.
+func (s *Service) ensureDraftID(ctx context.Context, state *agentRunState) (string, error) {
+	if state == nil {
+		return "", nil
+	}
+	if existing := state.draftID(); strings.TrimSpace(existing) != "" {
+		return existing, nil
+	}
+	state.draftCreateMu.Lock()
+	defer state.draftCreateMu.Unlock()
+	// Re-check after acquiring the create lock: another goroutine may have created
+	// the draft while we were blocked.
+	if existing := state.draftID(); strings.TrimSpace(existing) != "" {
+		return existing, nil
 	}
 	msg, err := s.addMessageWithBlocks(ctx, state.narratorID, "assistant", "", []map[string]any{}, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if state.draftMessageID == nil {
-		state.draftMessageID = &msg.ID
-	} else {
-		*state.draftMessageID = msg.ID
-	}
-	return nil
+	state.setDraftID(msg.ID)
+	return msg.ID, nil
 }
 
 func (s *Service) broadcastAgentEvent(narratorID string, event agentbasic.AgentEvent) {
@@ -1208,16 +1369,17 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 	if event.ToolRun == nil {
 		return nil
 	}
+	draftID := state.draftID()
 	run := *event.ToolRun
 	if run.Recorded {
-		return s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars)
+		return s.persistToolResultSideCars(ctx, state.narratorID, draftID, event.ToolUseID, event.SideCars)
 	}
 	status := toolRunDBStatus(run.Status, event.IsError || strings.TrimSpace(run.Error) != "")
 	outputJSON, _ := json.Marshal(map[string]any{"output": run.Output})
 	inputJSON := toolRunArgumentsInputJSON(run.Arguments)
 	now := db.NowISO()
 	sets := []string{"status = ?", "input_json = COALESCE(?, input_json)", "output_json = ?", "execution_started_at = COALESCE(execution_started_at, ?)", "completed_at = ?", "error_message = ?", "result_message_id = ?"}
-	args := []any{status, inputJSON, string(outputJSON), now, now, nullableTrimmedString(run.Error), *state.draftMessageID}
+	args := []any{status, inputJSON, string(outputJSON), now, now, nullableTrimmedString(run.Error), draftID}
 	if columns, colErr := db.TableColumnSet(ctx, s.DB, "narrator_tool_calls"); colErr == nil && columns["duration_ms"] && event.DurationMs > 0 {
 		sets = append(sets, "duration_ms = ?")
 		args = append(args, event.DurationMs)
@@ -1229,10 +1391,10 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 	}
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		if err := s.persistToolRun(ctx, state.narratorID, *state.draftMessageID, run); err != nil {
+		if err := s.persistToolRun(ctx, state.narratorID, draftID, run); err != nil {
 			return err
 		}
-		return s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars)
+		return s.persistToolResultSideCars(ctx, state.narratorID, draftID, event.ToolUseID, event.SideCars)
 	}
 	_ = s.ensureGoalReflectionMetadata(ctx, state.narratorID, run)
 	var toolCallID sql.NullString
@@ -1241,10 +1403,10 @@ func (s *Service) finishToolCallFromEvent(ctx context.Context, state *agentRunSt
 			return fmt.Errorf("query finished tool call: %w", err)
 		}
 	}
-	if err := s.persistToolResultSideCars(ctx, state.narratorID, *state.draftMessageID, event.ToolUseID, event.SideCars); err != nil {
+	if err := s.persistToolResultSideCars(ctx, state.narratorID, draftID, event.ToolUseID, event.SideCars); err != nil {
 		return err
 	}
-	return s.persistFileSnapshot(ctx, state.narratorID, *state.draftMessageID, sqlNullString(toolCallID), run)
+	return s.persistFileSnapshot(ctx, state.narratorID, draftID, sqlNullString(toolCallID), run)
 }
 
 func (s *Service) ensureGoalReflectionMetadata(ctx context.Context, narratorID string, run agentbasic.ToolRun) error {
@@ -1302,7 +1464,7 @@ func (s *Service) latestRunNarrator(ctx context.Context, state *agentRunState) N
 	if latest, err := s.Get(ctx, state.narratorID); err == nil {
 		return latest
 	}
-	return state.narrator
+	return state.currentNarrator()
 }
 
 func (s *Service) finishAgentRunReviewReset(ctx context.Context, state *agentRunState, message string) error {
@@ -1317,18 +1479,19 @@ func (s *Service) finishAgentRunReviewReset(ctx context.Context, state *agentRun
 		return err
 	}
 	if s.Hub != nil {
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.narrator.IsBackground})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.currentNarrator().IsBackground})
 	}
 	s.scheduleNarratorRetry(state.narratorID)
 	return nil
 }
 
 func (s *Service) backgroundRunParent(ctx context.Context, state *agentRunState, latest Narrator) (string, bool) {
+	stateNarrator := state.currentNarrator()
 	if latest.ParentNarratorID == nil || strings.TrimSpace(*latest.ParentNarratorID) == "" {
-		if state.narrator.ParentNarratorID == nil || strings.TrimSpace(*state.narrator.ParentNarratorID) == "" {
+		if stateNarrator.ParentNarratorID == nil || strings.TrimSpace(*stateNarrator.ParentNarratorID) == "" {
 			return "", latest.IsBackground
 		}
-		parentID := strings.TrimSpace(*state.narrator.ParentNarratorID)
+		parentID := strings.TrimSpace(*stateNarrator.ParentNarratorID)
 		return parentID, latest.IsBackground || s.backgroundTaskRunning(ctx, parentID, state.narratorID)
 	}
 	parentID := strings.TrimSpace(*latest.ParentNarratorID)
@@ -1438,8 +1601,8 @@ func (s *Service) broadcastModelSettingsApplied(narratorID string, event agentba
 
 func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunState) error {
 	state.completed = true
-	if state.draftMessageID != nil && strings.TrimSpace(*state.draftMessageID) != "" {
-		msg, err := s.messageByID(ctx, state.narratorID, *state.draftMessageID)
+	if draftID := strings.TrimSpace(state.draftID()); draftID != "" {
+		msg, err := s.messageByID(ctx, state.narratorID, draftID)
 		if err == nil {
 			msg.ToolCalls, _ = s.loadToolCalls(ctx, msg.ID)
 			state.lastMessage = &msg
@@ -1448,12 +1611,13 @@ func (s *Service) finishAgentRunSuccess(ctx context.Context, state *agentRunStat
 	// TS treats goal usage accounting as best-effort; never fail a completed run
 	// because active-goal counters could not be persisted.
 	_ = s.accountGoalUsageForTurn(ctx, state)
-	if state.narrator.ChapterID != nil {
-		if isReview, reset, message := s.checkAndResetReviewGitState(ctx, *state.narrator.ChapterID); isReview {
+	narrator := state.currentNarrator()
+	if narrator.ChapterID != nil {
+		if isReview, reset, message := s.checkAndResetReviewGitState(ctx, *narrator.ChapterID); isReview {
 			if reset && strings.TrimSpace(message) != "" {
 				return s.finishAgentRunReviewReset(ctx, state, message)
 			}
-			_ = s.concludeReviewChapter(ctx, *state.narrator.ChapterID)
+			_ = s.concludeReviewChapter(ctx, *narrator.ChapterID)
 		}
 	}
 	latest := s.latestRunNarrator(ctx, state)
@@ -1581,10 +1745,48 @@ func (s *Service) finishAgentRunSilentDisconnect(ctx context.Context, state *age
 	return nil
 }
 
+// markInterruptedToolCalls converts a narrator's in-flight tool calls into
+// explicit interrupted failures when the user interrupts the run. It mirrors the
+// TS markInterruptedToolCallsForMessage + cleanupOrphanedToolCalls pair
+// (narrator-session.ts:4162-4205): for every tool call still in an interruptable
+// status (initializing/pending/running), set status='fail', the internal
+// errorMessage to "Narrator interrupted by user", and the MODEL-FACING output_json
+// to the locale-resolved tool.interruptedByUser text. The output_json is wrapped
+// as {"output": ...} to match how Go reconstructs tool_result content from stored
+// output_json (agent_history_content.go:outputTextForAgent) and how the
+// server-restart path stores it (service.go RecoverOnStartup). Without this, Go
+// left interrupted tool calls orphaned until a server restart, which then
+// mislabeled them with the server-restart text instead of the user-interrupt text.
+//
+// The locale is the narrator owner's locale (toolLocale), aligning with TS
+// active.locale. completed_at is only set when currently NULL so an already
+// finished call is never clobbered.
+func (s *Service) markInterruptedToolCalls(ctx context.Context, narratorID string) error {
+	if s == nil || s.DB == nil || strings.TrimSpace(narratorID) == "" {
+		return nil
+	}
+	const interruptErrorMessage = "Narrator interrupted by user"
+	output := interruptedByUserToolOutput(s.toolLocale(ctx, narratorID))
+	outputJSON, err := json.Marshal(map[string]any{"output": output})
+	if err != nil {
+		return err
+	}
+	now := db.NowISO()
+	_, err = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?), completed_at = COALESCE(completed_at, ?) WHERE narrator_id = ? AND status IN ('initializing', 'pending', 'running')`, interruptErrorMessage, string(outputJSON), now, narratorID)
+	return err
+}
+
 func (s *Service) finishAgentRunCancelled(ctx context.Context, state *agentRunState) error {
 	state.completed = true
 	state.errored = true
 	message := "Cancelled"
+	// Convert in-flight tool calls into explicit interrupted failures before
+	// finalizing the narrator status, mirroring the TS interrupt cleanup
+	// (narrator-session.ts:507/519). A failure here is non-fatal: the narrator
+	// status update below must still run so the run does not stay stuck working.
+	if err := s.markInterruptedToolCalls(ctx, state.narratorID); err != nil {
+		s.broadcastAgentErrorPersistenceFailure(state.narratorID, "interrupted_tool_calls", err)
+	}
 	latest := s.latestRunNarrator(ctx, state)
 	backgroundParentID, treatAsBackground := s.backgroundRunParent(ctx, state, latest)
 	var err error

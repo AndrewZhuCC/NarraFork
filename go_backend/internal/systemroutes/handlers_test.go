@@ -899,6 +899,14 @@ func TestCodexSettingsMutationsMatchTSValidation(t *testing.T) {
 	if strings.Join(anyStrings(tierOrder), ",") != "team,pro" {
 		t.Fatalf("valid tierOrder should be normalized after TS validation, got %#v", tierOrder)
 	}
+	// POST /tier-order must return the full effectiveTierOrder (normalized prefix
+	// + remaining ALL_CODEX_TIER_ORDER tiers appended), matching TS
+	// snapshot.effectiveTierOrder and Go's own GET /codex/status. Go previously
+	// echoed `normalized` here, dropping the unspecified tiers.
+	postEffective, _ := body["effectiveTierOrder"].([]any)
+	if strings.Join(anyStrings(postEffective), ",") != "team,pro,prolite,plus,free,other" {
+		t.Fatalf("POST tier-order effectiveTierOrder should append remaining tiers, got %#v", postEffective)
+	}
 }
 
 func TestCodexQuotaOverviewRemainsAvailableToAuthenticatedUsers(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -825,15 +826,25 @@ func insertParentAgentToolCallForTest(t *testing.T, service *Service, parentID, 
 
 func captureNarratorBroadcasts() (*ws.Hub, func() []capturedBroadcast) {
 	hub := ws.NewHub()
+	var mu sync.Mutex
 	events := []capturedBroadcast{}
 	hub.SetNarratorBroadcastHook(func(narratorID string, payload any, data []byte) {
 		decoded := map[string]any{}
 		if err := json.Unmarshal(data, &decoded); err != nil {
 			return
 		}
+		// The broadcast hook fires from both the agent loop goroutine (tool
+		// executor) and the caller goroutine (event handler), so the capture
+		// slice must be guarded.
+		mu.Lock()
 		events = append(events, capturedBroadcast{NarratorID: narratorID, Payload: decoded})
+		mu.Unlock()
 	})
-	return hub, func() []capturedBroadcast { return append([]capturedBroadcast(nil), events...) }
+	return hub, func() []capturedBroadcast {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]capturedBroadcast(nil), events...)
+	}
 }
 
 func hasBroadcast(events []capturedBroadcast, narratorID string, eventType string) bool {

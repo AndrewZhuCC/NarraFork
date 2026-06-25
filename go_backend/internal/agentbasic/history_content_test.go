@@ -81,7 +81,7 @@ func TestOpenAIHistoryPreservesUserImageBlocks(t *testing.T) {
 			{"type": "text", "text": "describe it"},
 		},
 	}
-	chat := openAIChatCompletionMessages([]Message{message})
+	chat := openAIChatCompletionMessages([]Message{message}, "")
 	chatParts, _ := chat[0]["content"].([]map[string]any)
 	if len(chatParts) != 2 || chatParts[0]["type"] != "image_url" {
 		t.Fatalf("chat image parts not preserved: %#v", chat[0]["content"])
@@ -120,7 +120,7 @@ func TestProviderHistoryReplaysNativeWebSearchBlocks(t *testing.T) {
 		t.Fatalf("Anthropic web search context mismatch: %#v", anthropicSearch)
 	}
 
-	chat := openAIChatCompletionMessages([]Message{message})
+	chat := openAIChatCompletionMessages([]Message{message}, "")
 	if len(chat) != 2 || chat[0]["role"] != "user" || chat[0]["content"] != "[Web search: narrafork go backend]" {
 		t.Fatalf("OpenAI chat web search context mismatch: %#v", chat)
 	}

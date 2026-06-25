@@ -416,7 +416,7 @@ func TestSegmentCompactInsertsMarkerAndHidesRefs(t *testing.T) {
 		t.Fatalf("segment messages route should expose two hidden refs, got %#v", messagesBody)
 	}
 
-	page, err := service.MessagesCursor(context.Background(), narratorID, 10, "", "older")
+	page, err := service.ChunksByRange(context.Background(), narratorID, nil, "older", intPtr(1))
 	if err != nil {
 		t.Fatalf("load visible messages: %v", err)
 	}

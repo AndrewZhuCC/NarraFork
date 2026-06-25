@@ -1,6 +1,6 @@
 {
 	"name": "go-backend-phase0-contract-matrix",
-	"updatedAt": "2026-06-11",
+	"updatedAt": "2026-06-12",
 	"scope": "Freeze the transitional TypeScript-owned SQLite DB compatibility mode, document the future pure-Go DB target, and make Go unsupported/degraded behavior discoverable before users trigger side effects.",
 	"principles": [
 		{
@@ -867,7 +867,28 @@
 				"narrator.dangerReflectionClassification.stopReflectionRoute",
 				"narrator.dangerReflectionClassification.stopReflectionEmits",
 				"narrator.dangerReflectionClassification.stopReflectionParity",
-				"narrator.dangerReflectionClassification.resolvedDecisions"
+				"narrator.dangerReflectionClassification.resolvedDecisions",
+				"narrator.dangerReflectionClassification.structuredDangerFieldsParity",
+				"narrator.dangerReflectionPrompt.matchesTS",
+				"narrator.dangerReflectionPrompt.bilingual",
+				"narrator.dangerReflectionPrompt.structuredFieldsPopulated",
+				"narrator.dangerReflectionPrompt.levelGuidanceRendered",
+				"narrator.dangerReflectionPrompt.detailsSectionOptional",
+				"narrator.dangerReflectionPrompt.fallbackTagSupported",
+				"narrator.dangerReflectionPrompt.inlinedHistoryContext",
+				"narrator.dangerReflectionPrompt.localeFromOwner",
+				"narrator.exitPlanContinueI18n.exitPlanModeApprovedBilingual",
+				"narrator.exitPlanContinueI18n.exitPlanModeApprovedWithDiffBilingual",
+				"narrator.exitPlanContinueI18n.planCompactContinueBilingual",
+				"narrator.exitPlanContinueI18n.localeFromOwner",
+				"narrator.serverRestartToolOutput.matchesTS",
+				"narrator.serverRestartToolOutput.modelOutputDistinctFromError",
+				"narrator.serverRestartToolOutput.localeDefaultEnglish",
+				"narrator.interruptedByUserToolOutput.matchesTS",
+				"narrator.interruptedByUserToolOutput.modelOutputDistinctFromError",
+				"narrator.interruptedByUserToolOutput.localeFromOwner",
+				"narrator.planModeFileRedirectedI18n.noticeBilingual",
+				"narrator.planModeFileRedirectedI18n.localeFromOwner"
 			],
 			"sampledProofs": [
 				"structured-content-message-history",
@@ -1053,7 +1074,13 @@
 				"narrator.agentRuntime.aggregationRouting.supported",
 				"narrator.agentRuntime.aggregationRouting.skipsDisabledProviders",
 				"narrator.agentRuntime.aggregationRouting.honorsPerProviderDisabledFlag",
-				"narrator.agentRuntime.aggregationRouting.balancedRoundRobin"
+				"narrator.agentRuntime.aggregationRouting.balancedRoundRobin",
+				"narrator.agentRuntime.readToolOffsetLimitRounding.matchesTS",
+				"narrator.agentRuntime.readToolOffsetLimitRounding.jsMathRoundSemantics",
+				"narrator.agentRuntime.readToolOffsetLimitRounding.appliesToReadOnly",
+				"narrator.agentRuntime.bashToolTimeout.defaultTimeoutMs",
+				"narrator.agentRuntime.bashToolTimeout.matchesTSDefault",
+				"narrator.agentRuntime.bashToolTimeout.bashMaxTimeoutDivergesFromTS"
 			],
 			"features": [
 				"before-turn history replacement",
@@ -2045,7 +2072,7 @@
 				"queue_status"
 			],
 			"knownGaps": [
-				"Health reports the current P0/P1 event lists but does not claim every TypeScript narrator WS family; Wave 93 lists message_updated/messages_deleted, reflection, compact progress, subagent lifecycle breadth, browser/session/container events, foreground tool progress, long-running output, and active-run reconnect as unclaimed families or smoke gaps."
+				"Health reports the current P0/P1 event lists but does not claim every TypeScript narrator WS family; Wave 93 lists reflection, compact progress, subagent lifecycle breadth, browser/session/container events, foreground tool progress, long-running output, and active-run reconnect as unclaimed families or smoke gaps. Wave 786 claims narrator_forked: Go now broadcasts {type:narrator_forked,narratorId,parentNarratorId} to the parent narrator from the central ForkNarratorWithOptions path after a successful fork (mirroring TS narrator-service.forkNarrator), while ForkFromMessages stays silent like TS forkFromMessages; message_updated/messages_deleted were already claimed. The remaining W742-listed TS-only WS events prune_boundary and queued_new_narrator_created stay deferred because they depend on unimplemented Go runtimes (TS dynamic pruning-window computeAndUpdatePruneBoundary, tracked under narrator.compact.replacementContract.exactPruneBoundaryParity:false and wsEvents.settingsMutation.pruneBoundaryEventEmitted:false; and the /new queued slash-command runtime parseQueuedNewCommand/executeQueuedNewCommand)."
 			],
 			"tests": [
 				"go_backend/internal/app/route_contract_test.go::TestPhase0HealthCapabilitiesExposeKnownGoFallbacks",
@@ -2054,7 +2081,9 @@
 				"go_backend/internal/ws/hub_narrator_events_test.go",
 				"go_backend/internal/ws/hub_narrator_client_messages_test.go::TestNarratorWSMessageBoundsRejectOutOfRangeValues",
 				"go_backend/internal/agentbasic/provider_openai_responses_test.go::TestResponsesImageGenerationPartialStreamingFieldsParity",
-				"go_backend/internal/narrators/agent_event_frontend_contract_test.go::TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields"
+				"go_backend/internal/narrators/agent_event_frontend_contract_test.go::TestAgentEventBroadcastsFrontendMeterQuotaQueueUseNarratorWSFields",
+				"go_backend/internal/narrators/narrator_forked_test.go::TestForkNarratorBroadcastsNarratorForkedToParent",
+				"go_backend/internal/narrators/narrator_forked_test.go::TestForkFromMessagesDoesNotBroadcastNarratorForked"
 			]
 		},
 		{

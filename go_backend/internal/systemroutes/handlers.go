@@ -6629,7 +6629,13 @@ func (h *Handler) codexSetTierOrder(w http.ResponseWriter, r *http.Request) erro
 	if err := h.patchCodexSetting("tierOrder", normalized); err != nil {
 		return err
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "tierOrder": normalized, "effectiveTierOrder": normalized})
+	// Mirror the TS POST /tier-order response (server/routes/codex.ts:450), which
+	// returns snapshot.effectiveTierOrder — the normalized order with the
+	// remaining ALL_CODEX_TIER_ORDER tiers appended (codex-manager.ts
+	// getEffectiveTierOrder). Go previously returned `normalized` here, so
+	// effectiveTierOrder dropped the unspecified tiers — diverging from TS AND
+	// from Go's own GET /codex/status which already uses codexEffectiveTierOrder.
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "tierOrder": normalized, "effectiveTierOrder": codexEffectiveTierOrder(normalized)})
 	return nil
 }
 

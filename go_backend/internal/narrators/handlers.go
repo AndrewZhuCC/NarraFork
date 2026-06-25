@@ -64,7 +64,9 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Get("/{id}/usage-stats", httpx.Handler(h.usageStats))
 	r.Get("/{id}/commands", httpx.Handler(h.commands))
 	r.Get("/{id}/skills", httpx.Handler(h.skills))
-	r.Get("/{id}/messages", httpx.Handler(h.messages))
+	r.Get("/{id}/chunk-manifest", httpx.Handler(h.chunkManifest))
+	r.Get("/{id}/chunks", httpx.Handler(h.chunks))
+	r.Get("/{id}/message-location/{messageId}", httpx.Handler(h.messageLocation))
 	r.Post("/{id}/messages", httpx.Handler(h.postMessage))
 	r.Delete("/{id}/messages/batch-blocks", httpx.Handler(h.deleteMessageBlocks))
 	r.Delete("/{id}/messages/{messageId}", httpx.Handler(h.deleteMessage))
@@ -309,6 +311,27 @@ func jsSliceStart0[T any](items []T, end int) []T {
 		end = n
 	}
 	return items[:end]
+}
+
+// jsSliceRange mirrors JS Array.slice(start, end) for already-validated indices:
+// it clamps start/end into [0, len] and returns an empty slice when start >= end,
+// avoiding the panic a raw Go items[start:end] would cause for out-of-range or
+// inverted bounds.
+func jsSliceRange[T any](items []T, start, end int) []T {
+	n := len(items)
+	if start < 0 {
+		start = 0
+	}
+	if start > n {
+		start = n
+	}
+	if end < start {
+		end = start
+	}
+	if end > n {
+		end = n
+	}
+	return items[start:end]
 }
 
 func paginatedNarratorWhere(standalone, status, filter string, values url.Values) (string, []any) {
@@ -740,40 +763,66 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func (h *Handler) messages(w http.ResponseWriter, r *http.Request) error {
+// chunkManifest returns the lightweight chunk manifest for the virtualized
+// message list. `since` short-circuits with { unchanged: true } when the
+// structure version has not changed. `limitChunks`/`beforeSeq` request a
+// tail-anchored window (reverse infinite scroll), mirroring the TS route.
+func (h *Handler) chunkManifest(w http.ResponseWriter, r *http.Request) error {
 	narratorID := chi.URLParam(r, "id")
 	query := r.URL.Query()
-	var page MessagePage
-	var err error
-	if around := strings.TrimSpace(query.Get("around")); around != "" {
-		before := queryInt(query.Get("before"), 5)
-		after := queryInt(query.Get("after"), 20)
-		page, err = h.Service.MessagesAround(r.Context(), narratorID, around, before, after)
-	} else if afterCursor := strings.TrimSpace(query.Get("catchUpCursor")); afterCursor != "" || strings.TrimSpace(query.Get("after")) != "" {
-		catchUpCursor, parseErr := parseCatchUpCursorQuery(query.Get("catchUpCursor"), query.Get("after"))
-		if parseErr != nil {
-			return parseErr
+	var since *int
+	if raw := strings.TrimSpace(query.Get("since")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			since = &parsed
 		}
-		limit := queryInt(query.Get("limit"), 40)
-		catchUpPage, err := h.Service.MessagesAfter(r.Context(), narratorID, catchUpCursor, limit)
-		if err != nil {
-			return err
-		}
-		meta, err := h.messagePageMeta(r.Context(), narratorID)
-		if err != nil {
-			return err
-		}
-		response := map[string]any{"topLevel": catchUpPage.TopLevel, "orphanChildren": catchUpPage.OrphanChildren, "hitLimit": catchUpPage.HitLimit, "cursor": catchUpPage.Cursor, "messages": catchUpPage.TopLevel}
-		for key, value := range meta {
-			response[key] = value
-		}
-		httpx.WriteJSON(w, http.StatusOK, response)
-		return nil
-	} else {
-		limit := queryInt(query.Get("limit"), 50)
-		direction := query.Get("direction")
-		page, err = h.Service.MessagesCursor(r.Context(), narratorID, limit, query.Get("cursor"), direction)
 	}
+	var window *manifestWindow
+	if raw := strings.TrimSpace(query.Get("limitChunks")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			if window == nil {
+				window = &manifestWindow{}
+			}
+			window.limitChunks = &parsed
+		}
+	}
+	if raw := strings.TrimSpace(query.Get("beforeSeq")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			if window == nil {
+				window = &manifestWindow{}
+			}
+			window.beforeSeq = &parsed
+		}
+	}
+	result, err := h.Service.ChunkManifest(r.Context(), narratorID, since, window)
+	if err != nil {
+		return err
+	}
+	httpx.WriteJSON(w, http.StatusOK, result)
+	return nil
+}
+
+// chunks fetches a contiguous range of chunks (full message trees) for the
+// virtualized list. Replaces the legacy cursor/around message query.
+func (h *Handler) chunks(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	query := r.URL.Query()
+	var fromSeq *int
+	if raw := strings.TrimSpace(query.Get("fromSeq")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			fromSeq = &parsed
+		}
+	}
+	direction := "older"
+	if query.Get("direction") == "newer" {
+		direction = "newer"
+	}
+	var count *int
+	if raw := strings.TrimSpace(query.Get("count")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			count = &parsed
+		}
+	}
+	result, err := h.Service.ChunksByRange(r.Context(), narratorID, fromSeq, direction, count)
 	if err != nil {
 		return err
 	}
@@ -781,7 +830,16 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	response := map[string]any{"messages": page.Messages, "hasMore": page.HasMore, "nextCursor": page.NextCursor, "hasMoreAfter": page.HasMoreAfter, "prevCursor": page.PrevCursor}
+	response := map[string]any{
+		"messages":       result.Messages,
+		"minSeq":         result.MinSeq,
+		"maxSeq":         result.MaxSeq,
+		"hasOlder":       result.HasOlder,
+		"hasNewer":       result.HasNewer,
+		"messageVersion": result.MessageVersion,
+	}
+	// meta overrides messageVersion and adds pruneBoundaryMessageId/prunedPercent,
+	// matching the TS /:id/chunks handler.
 	for key, value := range meta {
 		response[key] = value
 	}
@@ -789,32 +847,17 @@ func (h *Handler) messages(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-func parseCatchUpCursorQuery(rawCursor, rawAfter string) (CatchUpCursor, error) {
-	rawCursor = strings.TrimSpace(rawCursor)
-	if rawCursor != "" {
-		decoded, err := url.QueryUnescape(rawCursor)
-		if err != nil {
-			return CatchUpCursor{}, httpx.BadRequest("invalid catchUpCursor")
-		}
-		var cursor CatchUpCursor
-		if err := json.Unmarshal([]byte(decoded), &cursor); err != nil {
-			return CatchUpCursor{}, httpx.BadRequest("invalid catchUpCursor")
-		}
-		return cursor, nil
+// messageLocation resolves a message id to the chunk coordinate (top-level seq)
+// used by the virtualized list.
+func (h *Handler) messageLocation(w http.ResponseWriter, r *http.Request) error {
+	narratorID := chi.URLParam(r, "id")
+	messageID := chi.URLParam(r, "messageId")
+	location, err := h.Service.MessageLocation(r.Context(), narratorID, messageID)
+	if err != nil {
+		return err
 	}
-	rawAfter = strings.TrimSpace(rawAfter)
-	if strings.HasPrefix(rawAfter, "{") {
-		decoded, err := url.QueryUnescape(rawAfter)
-		if err != nil {
-			return CatchUpCursor{}, httpx.BadRequest("invalid after cursor")
-		}
-		var cursor CatchUpCursor
-		if err := json.Unmarshal([]byte(decoded), &cursor); err != nil {
-			return CatchUpCursor{}, httpx.BadRequest("invalid after cursor")
-		}
-		return cursor, nil
-	}
-	return CatchUpCursor{ParentLastMessageID: nullableStringPtrValue(rawAfter), ChildAnchors: []CatchUpChildAnchor{}}, nil
+	httpx.WriteJSON(w, http.StatusOK, location)
+	return nil
 }
 
 func (h *Handler) messagePageMeta(ctx context.Context, narratorID string) (map[string]any, error) {
@@ -3104,7 +3147,7 @@ func (h *Handler) continueRun(w http.ResponseWriter, r *http.Request) error {
 	if claims != nil {
 		userID = claims.Subject
 	}
-	msg, err := h.Service.AddUserMessage(r.Context(), chi.URLParam(r, "id"), userID, "Continue.")
+	msg, err := h.Service.AddUserMessage(r.Context(), chi.URLParam(r, "id"), userID, userContinueMessage(h.Service.userLocale(r.Context(), userID)))
 	if err != nil {
 		return err
 	}
@@ -3788,7 +3831,11 @@ func (h *Handler) suggestAnswers(w http.ResponseWriter, r *http.Request) error {
 	if len(questions) < 1 {
 		return httpx.BadRequest("questions is required")
 	}
-	answers, err := h.Service.GenerateAskUserQuestionAnswers(r.Context(), chi.URLParam(r, "id"), questions, "suggest")
+	userID := "system"
+	if claims := auth.UserFromContext(r.Context()); claims != nil && strings.TrimSpace(claims.Subject) != "" {
+		userID = claims.Subject
+	}
+	answers, err := h.Service.GenerateAskUserQuestionAnswers(r.Context(), chi.URLParam(r, "id"), questions, "suggest", h.Service.userLocale(r.Context(), userID))
 	if err != nil {
 		return err
 	}

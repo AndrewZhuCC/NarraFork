@@ -1103,6 +1103,35 @@ func TestHookPositiveCRUDAndUpdateValidationMatchTS(t *testing.T) {
 	if clearActiveURL.Code != http.StatusBadRequest {
 		t.Fatalf("clear active url status = %d body=%s", clearActiveURL.Code, clearActiveURL.Body.String())
 	}
+
+	// The "Stop" event is a valid TS hookEventEnum value (validators/hooks.ts:3),
+	// so create and update must accept it (Go previously rejected it 400). Mirror
+	// TS: POST with event:"Stop" -> 201 persisting event=="Stop"; PUT event:"Stop"
+	// -> 200 persisting event=="Stop".
+	stopCreated := request(http.MethodPost, "/hooks", `{"event":"Stop","type":"command","command":"echo done","timeout":5}`)
+	if stopCreated.Code != http.StatusCreated {
+		t.Fatalf("create Stop hook status = %d body=%s", stopCreated.Code, stopCreated.Body.String())
+	}
+	var stopCreateBody map[string]any
+	if err := json.Unmarshal(stopCreated.Body.Bytes(), &stopCreateBody); err != nil {
+		t.Fatalf("decode Stop create: %v", err)
+	}
+	stopHookID, _ := stopCreateBody["id"].(string)
+	if stopHookID == "" || stopCreateBody["event"] != "Stop" {
+		t.Fatalf("Stop hook create should persist event=Stop, got %#v", stopCreateBody)
+	}
+	stopUpdated := request(http.MethodPut, "/hooks/"+hookID, `{"event":"Stop"}`)
+	if stopUpdated.Code != http.StatusOK {
+		t.Fatalf("update to Stop status = %d body=%s", stopUpdated.Code, stopUpdated.Body.String())
+	}
+	var stopUpdateBody map[string]any
+	if err := json.Unmarshal(stopUpdated.Body.Bytes(), &stopUpdateBody); err != nil {
+		t.Fatalf("decode Stop update: %v", err)
+	}
+	if stopUpdateBody["event"] != "Stop" {
+		t.Fatalf("update should persist event=Stop, got %#v", stopUpdateBody)
+	}
+
 	missingInvalid := request(http.MethodPut, "/hooks/missing", `{"type":"bad"}`)
 	if missingInvalid.Code != http.StatusNotFound {
 		t.Fatalf("missing update should 404 before body validation, got %d body=%s", missingInvalid.Code, missingInvalid.Body.String())

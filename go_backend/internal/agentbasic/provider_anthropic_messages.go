@@ -221,40 +221,71 @@ type anthropicStreamEvent struct {
 	} `json:"message"`
 	ContentBlock map[string]any `json:"content_block"`
 	Delta        struct {
-		Type        string          `json:"type"`
-		Text        string          `json:"text"`
-		PartialJSON string          `json:"partial_json"`
-		Thinking    string          `json:"thinking"`
-		Signature   string          `json:"signature"`
-		StopReason  string          `json:"stop_reason"`
-		Usage       *anthropicUsage `json:"usage"`
+		Type             string          `json:"type"`
+		Text             string          `json:"text"`
+		PartialJSON      string          `json:"partial_json"`
+		Thinking         string          `json:"thinking"`
+		ReasoningContent string          `json:"reasoning_content"`
+		Signature        string          `json:"signature"`
+		StopReason       string          `json:"stop_reason"`
+		Usage            *anthropicUsage `json:"usage"`
 	} `json:"delta"`
 	Usage *anthropicUsage        `json:"usage"`
 	Error *anthropicErrorPayload `json:"error"`
 }
 
 type anthropicStreamingBlock struct {
-	ID        string
-	Name      string
-	Arguments string
-	Index     int
-	Stopped   bool
+	ID         string
+	Name       string
+	Arguments  string
+	Index      int
+	Stopped    bool
+	IsThinking bool
 }
 
 func streamAnthropicMessages(ctx context.Context, client *http.Client, provider Provider, systemPrompt string, messages []map[string]any, toolScope string, reasoningEffort string, out chan<- StreamEvent) error {
 	messages = cleanAnthropicHistoryForProvider(messages, provider)
+	tools := anthropicToolDefinitions(toolScope)
+	// Apply prompt-cache breakpoints on tools + message-history prefix only for the
+	// official API (proxies do not support cache_control), mirroring TS isOfficial
+	// gating. The system block carries cache_control via anthropicSystemBlocks.
+	if provider.OfficialAPI {
+		applyAnthropicCacheBreakpoints(messages, tools)
+	}
 	body := map[string]any{
 		"model":      provider.Model,
 		"max_tokens": anthropicMaxTokens(provider.Model),
-		"system":     anthropicSystemBlocks(systemPrompt),
+		"system":     anthropicSystemBlocks(systemPrompt, provider.OfficialAPI),
 		"messages":   messages,
-		"tools":      anthropicToolDefinitions(toolScope),
+		"tools":      tools,
 		"stream":     true,
 	}
 	thinking := anthropicThinkingConfig(provider.Model, reasoningEffort)
 	thinkingEnabled := thinking != nil && thinking["type"] != "disabled"
 	if thinking != nil {
 		body["thinking"] = thinking
+	}
+	// Temperature: only set when thinking is disabled (Anthropic rejects temperature
+	// alongside thinking). Mirrors TS anthropic-provider.ts:886-889 (temperature=1).
+	if !thinkingEnabled {
+		body["temperature"] = 1
+	}
+	// output_config.effort: effort-capable models (Opus 4.6 / Sonnet 4.6) and
+	// DeepSeek carry their thinking-intensity via output_config.effort when thinking
+	// is enabled (mirrors TS anthropic-provider.ts:894-906). The two branches are
+	// mutually exclusive (DeepSeek is not an adaptive-thinking model).
+	if thinkingEnabled {
+		if anthropicSupportsEffort(provider.Model) {
+			effort := mapAnthropicEffortParam(reasoningEffort)
+			if effort == "" {
+				effort = "medium"
+			}
+			body["output_config"] = map[string]any{"effort": effort}
+		} else if anthropicIsDeepSeekModel(provider.Model) {
+			if effort := mapDeepSeekEffort(reasoningEffort); effort != "" {
+				body["output_config"] = map[string]any{"effort": effort}
+			}
+		}
 	}
 	payload, _ := json.Marshal(body)
 	endpoint := strings.TrimRight(provider.BaseURL, "/") + "/messages"
@@ -264,9 +295,18 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 	}
 	setAnthropicHeaders(req, provider)
 	// The interleaved-thinking beta header must only be sent when thinking is
-	// actually enabled (adaptive/enabled), not when it is explicitly disabled.
+	// actually enabled (adaptive/enabled), not when it is explicitly disabled. For
+	// effort-capable models, also declare the adaptive-thinking/effort beta flags so
+	// output_config.effort is honored (mirrors TS, which sends ANTHROPIC_EFFORT_BETA_FLAGS
+	// for supportsEffort models). The full Claude Code official beta flag set
+	// (claude-code-*/context-1m/context-management) remains a tracked official-spoof
+	// boundary (see W771 anthropicOfficialThreeBlockSystemSpoof) and is NOT sent here.
 	if thinkingEnabled {
-		req.Header.Set("anthropic-beta", "interleaved-thinking-2025-05-14")
+		betaFlags := "interleaved-thinking-2025-05-14"
+		if anthropicSupportsEffort(provider.Model) {
+			betaFlags += ",adaptive-thinking-2026-01-28,effort-2025-11-24"
+		}
+		req.Header.Set("anthropic-beta", betaFlags)
 	}
 	req.Header.Set("Accept", "text/event-stream")
 	res, err := client.Do(req)
@@ -342,7 +382,11 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Usage: usageAccum.snapshot()}})
 			}
 		case "content_block_start":
-			handleAnthropicBlockStart(blocks, parsed.Index, parsed.ContentBlock)
+			initialThinking := handleAnthropicBlockStart(blocks, parsed.Index, parsed.ContentBlock)
+			if initialThinking != "" {
+				outputIndex := parsed.Index
+				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Reasoning: initialThinking, ReasoningMetadata: map[string]any{"blockIndex": parsed.Index}, ReasoningOutputIndex: &outputIndex}})
+			}
 			if stringValue(parsed.ContentBlock["type"]) == "redacted_thinking" {
 				outputIndex := parsed.Index
 				emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, RedactedThinking: &RedactedThinking{Data: firstNonEmpty(stringValue(parsed.ContentBlock["data"]), stringValue(parsed.ContentBlock["text"])), OutputIndex: &outputIndex}}})
@@ -382,11 +426,78 @@ func streamAnthropicMessages(ctx context.Context, client *http.Client, provider 
 	return nil
 }
 
-func anthropicSystemBlocks(systemPrompt string) any {
+// anthropicSystemBlocks builds the top-level `system` field. Mirrors the TS
+// anthropic-provider system construction: prompt caching (cache_control) is
+// gated on the official API. For the official API the system block carries
+// cache_control:{type:ephemeral}; for proxy/non-official providers the system is
+// a plain text block with NO cache_control (proxies do not support it), matching
+// TS which only applies cache_control when isOfficial.
+func anthropicSystemBlocks(systemPrompt string, officialAPI bool) any {
 	if strings.TrimSpace(systemPrompt) == "" {
 		return systemPrompt
 	}
-	return []map[string]any{{"type": "text", "text": systemPrompt, "cache_control": map[string]any{"type": "ephemeral"}}}
+	block := map[string]any{"type": "text", "text": systemPrompt}
+	if officialAPI {
+		block["cache_control"] = map[string]any{"type": "ephemeral"}
+	}
+	return []map[string]any{block}
+}
+
+// applyAnthropicCacheBreakpoints places cache_control breakpoints on the last
+// tool definition and the last non-thinking content block of the message-history
+// prefix (skipping the current user turn), mirroring the TS applyCacheBreakpoints
+// (anthropic-provider.ts). It first strips any existing cache_control from
+// message content blocks. Only called for the official API (proxies do not
+// support cache_control). At most one message breakpoint is placed (the system
+// already uses cache_control, keeping within Anthropic's 4-block limit).
+func applyAnthropicCacheBreakpoints(messages []map[string]any, tools []map[string]any) {
+	// Strip any existing cache_control from all message content blocks.
+	for _, msg := range messages {
+		content, ok := msg["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range content {
+			if block, ok := raw.(map[string]any); ok {
+				delete(block, "cache_control")
+			}
+		}
+	}
+
+	// Breakpoint 1: last tool definition.
+	if len(tools) > 0 {
+		tools[len(tools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+	}
+
+	// Breakpoint 2: last non-thinking content block in the message-history prefix
+	// (skip the current user turn at messages[len-1]). Place at most one.
+	placed := 0
+	for i := len(messages) - 2; i >= 0 && placed < 1; i-- {
+		content := messages[i]["content"]
+		if blocks, ok := content.([]any); ok && len(blocks) > 0 {
+			targetIdx := -1
+			for j := len(blocks) - 1; j >= 0; j-- {
+				block, ok := blocks[j].(map[string]any)
+				if !ok {
+					continue
+				}
+				blockType, _ := block["type"].(string)
+				if blockType != "thinking" && blockType != "redacted_thinking" {
+					targetIdx = j
+					break
+				}
+			}
+			if targetIdx >= 0 {
+				if block, ok := blocks[targetIdx].(map[string]any); ok {
+					block["cache_control"] = map[string]any{"type": "ephemeral"}
+					placed++
+				}
+			}
+		} else if text, ok := content.(string); ok {
+			messages[i]["content"] = []any{map[string]any{"type": "text", "text": text, "cache_control": map[string]any{"type": "ephemeral"}}}
+			placed++
+		}
+	}
 }
 
 func decodeAnthropicNonStream(res *http.Response) (anthropicResponse, error) {
@@ -400,28 +511,53 @@ func decodeAnthropicNonStream(res *http.Response) (anthropicResponse, error) {
 	return decoded, nil
 }
 
-func handleAnthropicBlockStart(blocks map[int]*anthropicStreamingBlock, index int, block map[string]any) {
-	if stringValue(block["type"]) != "tool_use" {
-		return
+// handleAnthropicBlockStart registers a streaming content block. tool_use blocks
+// are tracked for input-json accumulation. thinking blocks are tracked so that
+// subsequent text_delta/reasoning_content deltas on the same index are routed to
+// the reasoning channel (some Anthropic-compatible relays, e.g. DeepSeek over the
+// Anthropic protocol, stream thinking via a thinking block + text_delta rather
+// than thinking_delta). Returns the initial thinking text to emit (non-empty only
+// for a thinking block that carries it on the start event), mirroring TS
+// anthropic-provider.ts content_block_start handling.
+func handleAnthropicBlockStart(blocks map[int]*anthropicStreamingBlock, index int, block map[string]any) string {
+	switch stringValue(block["type"]) {
+	case "tool_use":
+		blocks[index] = &anthropicStreamingBlock{ID: stringValue(block["id"]), Name: stringValue(block["name"]), Index: index}
+		return ""
+	case "thinking":
+		blocks[index] = &anthropicStreamingBlock{Index: index, IsThinking: true}
+		return firstNonEmpty(stringValue(block["thinking"]), stringValue(block["reasoning_content"]), stringValue(block["text"]))
+	default:
+		return ""
 	}
-	blocks[index] = &anthropicStreamingBlock{ID: stringValue(block["id"]), Name: stringValue(block["name"]), Index: index}
 }
 
 func handleAnthropicBlockDelta(ctx context.Context, out chan<- StreamEvent, blocks map[int]*anthropicStreamingBlock, index int, delta struct {
-	Type        string          `json:"type"`
-	Text        string          `json:"text"`
-	PartialJSON string          `json:"partial_json"`
-	Thinking    string          `json:"thinking"`
-	Signature   string          `json:"signature"`
-	StopReason  string          `json:"stop_reason"`
-	Usage       *anthropicUsage `json:"usage"`
+	Type             string          `json:"type"`
+	Text             string          `json:"text"`
+	PartialJSON      string          `json:"partial_json"`
+	Thinking         string          `json:"thinking"`
+	ReasoningContent string          `json:"reasoning_content"`
+	Signature        string          `json:"signature"`
+	StopReason       string          `json:"stop_reason"`
+	Usage            *anthropicUsage `json:"usage"`
 }, messageID string) {
 	outputIndex := index
+	// Thinking pre-check (mirrors TS isThinkingBlockDelta + thinking??reasoning_content??text):
+	// official streams use thinking_delta; some Anthropic-compatible relays stream a
+	// thinking block via text_delta or reasoning_content. When the delta is a
+	// thinking_delta OR the current block was opened as a thinking block, route the
+	// text (thinking/reasoning_content/text precedence) to the reasoning channel
+	// instead of visible assistant text. Empty thinking deltas are dropped (noise).
+	isThinking := delta.Type == "thinking_delta" || (blocks[index] != nil && blocks[index].IsThinking)
+	thinkingText := firstNonEmpty(delta.Thinking, delta.ReasoningContent, delta.Text)
+	if isThinking && thinkingText != "" {
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Reasoning: thinkingText, ReasoningMetadata: map[string]any{"blockIndex": index}, ReasoningOutputIndex: &outputIndex}})
+		return
+	}
 	switch delta.Type {
 	case "text_delta":
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Text: delta.Text, TextOutputIndex: &outputIndex}})
-	case "thinking_delta":
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, Reasoning: delta.Thinking, ReasoningOutputIndex: &outputIndex}})
 	case "signature_delta":
 		emitStreamEvent(ctx, out, StreamEvent{Parsed: ParsedStreamEvent{MessageID: messageID, ReasoningMetadata: map[string]any{"signature": delta.Signature}, ReasoningOutputIndex: &outputIndex}})
 	case "input_json_delta":
@@ -576,12 +712,44 @@ func mapDeepSeekEffort(reasoningEffort string) string {
 	return "high"
 }
 
+// anthropicSupportsEffort mirrors the TS supportsAdaptiveThinking/supportsEffort
+// (anthropic-provider.ts): only the adaptive-thinking models (Opus 4.6 / Sonnet
+// 4.6) accept the output_config.effort parameter and the effort beta flags.
+func anthropicSupportsEffort(model string) bool {
+	lower := strings.ToLower(model)
+	return strings.Contains(lower, "opus-4-6") ||
+		strings.Contains(lower, "opus-4.6") ||
+		strings.Contains(lower, "sonnet-4-6") ||
+		strings.Contains(lower, "sonnet-4.6")
+}
+
+// mapAnthropicEffortParam mirrors the TS mapEffortParam (anthropic-provider.ts):
+// none/empty -> "", low -> low, medium -> medium, high -> high, xhigh -> high
+// (Anthropic has no xhigh tier), max -> max.
+func mapAnthropicEffortParam(reasoningEffort string) string {
+	switch normalizeReasoningEffort(reasoningEffort) {
+	case "", "none":
+		return ""
+	case "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "xhigh":
+		return "high"
+	case "max":
+		return "max"
+	default:
+		return ""
+	}
+}
+
 // anthropicThinkingConfig mirrors the TS buildThinkingConfig (anthropic-provider.ts,
 // matching Claude Code v2.1.71):
 //   - models that don't support thinking → nil (no thinking field)
 //   - reasoningEffort == "none" → {type:"disabled"} (thinking explicitly off)
 //   - DeepSeek → {type:"enabled", budget_tokens:10000} (DeepSeek ignores the value
-//     but the schema requires it; effort is controlled via output_config elsewhere)
+//     but the schema requires it; effort is controlled via output_config.effort,
+//     set in streamAnthropicMessages)
 //   - all other supported models → {type:"adaptive"}
 //
 // The previous Go implementation used the deprecated {type:"enabled",
@@ -592,8 +760,18 @@ func mapDeepSeekEffort(reasoningEffort string) string {
 // the main streaming chat request sends max_tokens = 32000 for every model (the
 // `default` tier; the 64000 `upperLimit` for Claude 4 families is not used in the
 // request body). Go previously hardcoded 4096, which truncated long responses on
-// the main chat path. The non-streaming generate/title/summary helper
-// (doAnthropicRequest) keeps 4096, matching the TS generate helper.
+// the main chat path.
+//
+// Architectural divergence (W800, tracked via capability
+// narrator.agentRuntime.anthropicGenerateReusesAgentLoop): TS has a dedicated
+// lightweight non-streaming generate path (generateWithMeta -> /messages,
+// max_tokens:4096, no tools) for title/summary helpers. Go has NO such path:
+// title/summary generation reuses the full agent loop (agentbasic.Generate ->
+// RunAgentLoop -> streamAnthropicMessages), so every Anthropic generate also
+// sends max_tokens 32000 with readonly tools. The previous comment here claimed a
+// non-streaming "doAnthropicRequest" helper kept 4096 "matching the TS generate
+// helper"; that helper was dead code (never called) and has been removed, so this
+// 32000 value is the only Anthropic request-body max_tokens Go ever sends.
 func anthropicMaxTokens(model string) int {
 	return 32000
 }
@@ -614,39 +792,6 @@ func anthropicThinkingConfig(model, reasoningEffort string) map[string]any {
 	return map[string]any{"type": "adaptive"}
 }
 
-func doAnthropicRequest(ctx context.Context, client *http.Client, provider Provider, systemPrompt string, messages []map[string]any, toolScope string) (anthropicResponse, error) {
-	body := map[string]any{
-		"model":      provider.Model,
-		"max_tokens": 4096,
-		"system":     systemPrompt,
-		"messages":   messages,
-		"tools":      anthropicToolDefinitions(toolScope),
-	}
-	payload, _ := json.Marshal(body)
-	endpoint := strings.TrimRight(provider.BaseURL, "/") + "/messages"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
-	if err != nil {
-		return anthropicResponse{}, err
-	}
-	setAnthropicHeaders(req, provider)
-	res, err := client.Do(req)
-	if err != nil {
-		return anthropicResponse{}, err
-	}
-	defer res.Body.Close()
-	var decoded anthropicResponse
-	if err := json.NewDecoder(res.Body).Decode(&decoded); err != nil {
-		return anthropicResponse{}, err
-	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		if decoded.Error != nil && decoded.Error.Message != "" {
-			return anthropicResponse{}, errors.New(decoded.Error.Message)
-		}
-		return anthropicResponse{}, fmt.Errorf("anthropic provider returned status %d", res.StatusCode)
-	}
-	return decoded, nil
-}
-
 func setAnthropicHeaders(req *http.Request, provider Provider) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("anthropic-version", "2023-06-01")
@@ -655,6 +800,7 @@ func setAnthropicHeaders(req *http.Request, provider Provider) {
 	} else {
 		req.Header.Set("x-api-key", provider.APIKey)
 	}
+	applyProviderExtraHeaders(req, provider)
 }
 
 func anthropicToolCall(block map[string]any) ToolCall {

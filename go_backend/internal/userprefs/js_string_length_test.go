@@ -61,3 +61,48 @@ func TestValidateRemoveRecentTabIDUsesJSStringLength(t *testing.T) {
 		t.Fatalf("session type should be accepted by removeRecentTab: %v", err)
 	}
 }
+
+// TestRecentTabValidatorsAcceptGroupType pins the "group" tab type to the TS
+// recentTabSchema/removeRecentTabSchema enums (settings.ts:104,122). The frontend
+// creates group tabs (RecentTabs.tsx:311 addRecentTab({type:"group"}) on
+// group:ready) and removes them via DELETE /recent-tabs/group/{id}; Go previously
+// rejected both with 400 "recentTab.type is not supported", so chat/exploration
+// group tabs could neither persist nor be removed. group is a generic top-level
+// tab (TS has no group-specific service branch), so it must pass validation and
+// flow through the same upsert/remove path as project/subagent.
+func TestRecentTabValidatorsAcceptGroupType(t *testing.T) {
+	// upsert: a minimal valid group tab must validate and keep type:"group".
+	clean, _, err := validateUpsertRecentTab(map[string]any{
+		"type":          "group",
+		"id":            "grp_123",
+		"title":         "Exploration A/B",
+		"lastVisitedAt": float64(1_700_000_000_000),
+	})
+	if err != nil {
+		t.Fatalf("group upsert should be accepted (TS recentTabSchema includes group): %v", err)
+	}
+	if clean["type"] != "group" {
+		t.Fatalf("cleaned tab type should be %q, got %#v", "group", clean["type"])
+	}
+	if clean["id"] != "grp_123" {
+		t.Fatalf("cleaned tab id should be preserved, got %#v", clean["id"])
+	}
+
+	// remove: a group tab must not be rejected as an unsupported type.
+	if err := validateRemoveRecentTab("group", "grp_123"); err != nil {
+		t.Fatalf("group remove should be accepted (TS removeRecentTabSchema includes group): %v", err)
+	}
+
+	// Guard: a genuinely unknown type is still rejected on both paths.
+	if _, _, err := validateUpsertRecentTab(map[string]any{
+		"type":          "bogus",
+		"id":            "x",
+		"title":         "t",
+		"lastVisitedAt": float64(1),
+	}); err == nil {
+		t.Fatal("unknown upsert tab type should still be rejected")
+	}
+	if err := validateRemoveRecentTab("bogus", "x"); err == nil {
+		t.Fatal("unknown remove tab type should still be rejected")
+	}
+}

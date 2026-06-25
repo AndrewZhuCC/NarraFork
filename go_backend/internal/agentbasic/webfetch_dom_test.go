@@ -143,12 +143,14 @@ func TestWebFetchDomModeTruncatesByUTF16CodeUnits(t *testing.T) {
 }
 
 // TestWebFetchDomModeRejectsUnsupportedScheme confirms dom mode only fetches
-// http/https/data schemes (file: is rejected like the Read-tool boundary).
+// http/https/data schemes (file: is rejected like the Read-tool boundary) and
+// mirrors the TS web-fetch "Unsupported protocol" message including the
+// Read-tool guidance.
 func TestWebFetchDomModeRejectsUnsupportedScheme(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch",
 		`{"url":"file:///etc/passwd","mode":"dom"}`)
-	if !strings.Contains(out, "only http, https, and data") {
-		t.Fatalf("dom mode should reject file URLs, got: %s", out)
+	if !strings.Contains(out, "Unsupported protocol: file:") || !strings.Contains(out, "Use the Read tool for local files") {
+		t.Fatalf("dom mode should reject file URLs with the TS-aligned message, got: %s", out)
 	}
 }
 

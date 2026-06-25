@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -872,8 +873,58 @@ func (h *Handler) merge(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Mirror the TS POST /:id/merge response contract (server/routes/chapters.ts:159-168):
+	// a non-success merge result (conflict / failure) is returned with HTTP 409 and a
+	// constructed human-readable `error` field, NOT 200. Go previously always wrote
+	// HTTP 200, so the frontend mergeChapter mutation never entered its error branch:
+	// request() does not throw on 2xx -> onSuccess closed the modal and refreshed the
+	// graph, silently treating a failed/conflicted merge as a success.
+	if success, _ := result["success"].(bool); !success {
+		result["error"] = mergeConflictErrorText(result["conflictFiles"])
+		httpx.WriteJSON(w, http.StatusConflict, result)
+		return nil
+	}
 	httpx.WriteJSON(w, http.StatusOK, result)
 	return nil
+}
+
+// mergeConflictErrorText builds the TS-shaped merge-failure error string
+// (server/routes/chapters.ts:163-165): when there are conflict files it reports
+// `Merge conflicts in N file(s): f1, f2, ...` listing at most the first 5 files
+// (appending an ellipsis when more exist); otherwise it falls back to "Merge failed".
+// The ellipsis is the single character "…" (U+2026), matching the TS template literal.
+func mergeConflictErrorText(rawConflictFiles any) string {
+	files := toStringSlice(rawConflictFiles)
+	if len(files) == 0 {
+		return "Merge failed"
+	}
+	shown := files
+	suffix := ""
+	if len(files) > 5 {
+		shown = files[:5]
+		suffix = "…"
+	}
+	return fmt.Sprintf("Merge conflicts in %d file(s): %s%s", len(files), strings.Join(shown, ", "), suffix)
+}
+
+// toStringSlice coerces a conflictFiles value (which may be []string from the Go
+// merge service, or []any if it ever round-trips through generic JSON) into a
+// []string, skipping non-string entries.
+func toStringSlice(value any) []string {
+	switch typed := value.(type) {
+	case []string:
+		return typed
+	case []any:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
 }
 
 func (h *Handler) aiResolve(w http.ResponseWriter, r *http.Request) error {

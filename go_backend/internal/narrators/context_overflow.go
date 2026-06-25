@@ -78,7 +78,7 @@ func (s *Service) finishAgentRunContextOverflow(ctx context.Context, state *agen
 		return err
 	}
 	if s.Hub != nil {
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.narrator.IsBackground})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.currentNarrator().IsBackground})
 	}
 	_ = summary
 	s.scheduleContextOverflowRetry(state.narratorID)

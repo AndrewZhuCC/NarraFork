@@ -174,13 +174,17 @@ data: {"type":"message_stop"}
 	if !seenText || !seenThinking || !seenStop || !seenSignature || !seenRedacted {
 		t.Fatalf("missing expected anthropic events text=%v thinking=%v stop=%v signature=%v redacted=%v", seenText, seenThinking, seenStop, seenSignature, seenRedacted)
 	}
+	// Proxy mode (OfficialAPI=false): the system block is a plain text block with
+	// NO cache_control, mirroring TS which only applies cache_control on the
+	// official API. The cache_control-present (official) case is covered by
+	// TestAnthropicSystemBlocksGatedOnOfficial and the TS-parity fixture tests.
 	systemBlocks, _ := requestBody["system"].([]any)
 	if len(systemBlocks) == 0 {
-		t.Fatalf("expected system cache_control block in request: %#v", requestBody["system"])
+		t.Fatalf("expected system block in request: %#v", requestBody["system"])
 	}
 	firstBlock, _ := systemBlocks[0].(map[string]any)
-	if firstBlock["cache_control"] == nil {
-		t.Fatalf("expected cache_control on system block: %#v", firstBlock)
+	if firstBlock["cache_control"] != nil {
+		t.Fatalf("proxy-mode system block must not carry cache_control: %#v", firstBlock)
 	}
 	if usage == nil || usage.CompletionTokens != 5 || usage.CacheCreationInputTokens != 3 || usage.CacheCreation5mTokens != 1 || usage.CacheCreation1hTokens != 2 {
 		t.Fatalf("unexpected usage: %#v", usage)

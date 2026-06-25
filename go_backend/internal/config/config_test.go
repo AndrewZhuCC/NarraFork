@@ -49,7 +49,7 @@ func TestDefaultRawMatchesTypeScriptReadinessDefaults(t *testing.T) {
 	expectDefaultValue(t, raw, "agent.dangerReflectionLevel", "standard")
 	expectDefaultValue(t, raw, "agent.dangerReflectionEnabled", true)
 	expectDefaultValue(t, raw, "agent.maxTransientRetries", float64(10))
-	expectDefaultValue(t, raw, "agent.firstTokenTimeoutMs", float64(60000))
+	expectDefaultValue(t, raw, "agent.firstTokenTimeoutMs", float64(300000))
 	expectDefaultValue(t, raw, "agent.autoCompactPruneThreshold", float64(80))
 
 	expectDefaultValue(t, raw, "chapters.maxActiveWorktrees", float64(10))

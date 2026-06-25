@@ -238,7 +238,7 @@ func TestChapterEdgeManualOperationsOnlyAllowDependency(t *testing.T) {
 		t.Fatalf("expected manual fork delete to be rejected, got %d: %s", forkDelete.Code, forkDelete.Body.String())
 	}
 	decoded := decodeJSONBody(t, forkDelete)
-	if decoded["code"] != "VALIDATION_ERROR" || decoded["error"] != "Manual chapter edge delete is only supported for dependency edges" {
+	if decoded["code"] != "VALIDATION_ERROR" || decoded["error"] != "Only dependency edges can be manually deleted" {
 		t.Fatalf("unexpected manual delete rejection: %#v", decoded)
 	}
 	var forkCount int

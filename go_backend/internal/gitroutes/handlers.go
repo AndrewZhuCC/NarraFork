@@ -608,7 +608,7 @@ func validateFilePath(file string) error {
 		return httpx.BadRequest("file path must be a non-empty string")
 	}
 	if strings.Contains(file, "..") || strings.HasPrefix(file, "/") || strings.HasPrefix(file, "\\") {
-		return httpx.BadRequest("invalid file path: " + file)
+		return httpx.BadRequest("Invalid file path: " + file)
 	}
 	return nil
 }

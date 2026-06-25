@@ -155,3 +155,60 @@ func TestEditToolEscapeNormalizedMatchLikeTS(t *testing.T) {
 		t.Fatalf("unexpected edited content: %q", string(data))
 	}
 }
+
+// TestEditWhitespaceNormalizedSingleLinePartialMatch drives the replacer directly
+// to pin the TS edit.ts:151-166 else-branch: when the normalized find is a
+// substring within a single line whose internal whitespace differs, the replacer
+// yields the matched ORIGINAL substring (not the whole line) via a words-joined-
+// by-\s+ regex over the original line.
+func TestEditWhitespaceNormalizedSingleLinePartialMatch(t *testing.T) {
+	// Partial match within a line: file has two spaces, find has one.
+	got := editWhitespaceNormalizedReplacer("  result = call(a,  b, c)", "call(a, b, c)")
+	foundPartial := false
+	for _, s := range got {
+		if s == "call(a,  b, c)" {
+			foundPartial = true
+		}
+		if s == "  result = call(a,  b, c)" {
+			t.Fatalf("expected the partial substring, not the whole line: %q", s)
+		}
+	}
+	if !foundPartial {
+		t.Fatalf("expected partial substring `call(a,  b, c)` in candidates, got: %#v", got)
+	}
+
+	// Whole-line equality still goes through branch (a) and yields the full line.
+	got = editWhitespaceNormalizedReplacer("call(a,  b, c)", "call(a, b, c)")
+	if len(got) == 0 || got[0] != "call(a,  b, c)" {
+		t.Fatalf("whole-line normalized match should yield the line, got: %#v", got)
+	}
+
+	// A find not present in the line yields nothing (no false match).
+	got = editWhitespaceNormalizedReplacer("totally unrelated text", "call(a, b, c)")
+	if len(got) != 0 {
+		t.Fatalf("non-matching find must yield no candidates, got: %#v", got)
+	}
+}
+
+// TestEditToolWhitespaceNormalizedPartialMatchLikeTS is the end-to-end proof: an
+// old_string that is a single-line substring whose internal whitespace differs
+// from the file matches and replaces just that substring, mirroring TS. Without
+// the WhitespaceNormalized single-line partial branch this returns "not found".
+func TestEditToolWhitespaceNormalizedPartialMatchLikeTS(t *testing.T) {
+	cwd := t.TempDir()
+	path := filepath.Join(cwd, "ws.txt")
+	// File uses two spaces inside the call; the surrounding line has a prefix.
+	if err := os.WriteFile(path, []byte("  result = compute(x,  y)\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	out := ExecuteTool(context.Background(), cwd, "Edit",
+		`{"file_path":"ws.txt","old_string":"compute(x, y)","new_string":"compute(x, z)"}`)
+	if strings.Contains(out, "not found") || strings.Contains(out, "multiple matches") {
+		t.Fatalf("whitespace-normalized partial edit should succeed, got: %s", out)
+	}
+	data, _ := os.ReadFile(path)
+	// Only the matched substring is replaced; the prefix and trailing newline stay.
+	if string(data) != "  result = compute(x, z)\n" {
+		t.Fatalf("unexpected edited content: %q", string(data))
+	}
+}

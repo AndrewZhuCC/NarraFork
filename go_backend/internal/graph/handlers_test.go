@@ -442,6 +442,41 @@ func TestUpdatePositionsPanelWidthHeightTakePrecedenceOverAliases(t *testing.T) 
 	}
 }
 
+// TestUpdatePositionsDoesNotBumpUpdatedAt locks parity with the TS graph
+// positions route (server/routes/graph.ts:305-317), which sets only
+// anchorCommitSha/axisOffset/crossOffset (+optional panel fields) and never
+// touches updatedAt (chapters.updatedAt has no $onUpdate hook, schema.ts:143).
+// Go previously wrote `updated_at = NowISO()` here, bumping the chapter's
+// updatedAt on every drag — a user-visible divergence. A purely visual layout
+// change must not count as a content update.
+func TestUpdatePositionsDoesNotBumpUpdatedAt(t *testing.T) {
+	sqlDB := newGraphTestDB(t)
+	_, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, status, branch, role, is_root, axis_offset, cross_offset, commit_count, panel_expanded, created_at, updated_at)
+		VALUES ('c1', 'p1', 'Chapter 1', 'active', 'main', 'branch', 1, 1, 2, 0, 0, 'created-ts', 'fixed-updated-ts')`)
+	if err != nil {
+		t.Fatalf("insert chapter: %v", err)
+	}
+
+	body := serveGraphRaw(t, NewHandler(sqlDB), http.MethodPatch, "/p1/graph/positions", `{"positions":[{"chapterId":"c1","axisOffset":10,"crossOffset":20}]}`)
+	if body.Code != http.StatusOK {
+		t.Fatalf("PATCH positions should succeed, got status %d body %s", body.Code, body.Body.String())
+	}
+
+	var axis, cross float64
+	var updatedAt string
+	if err := sqlDB.QueryRow(`SELECT axis_offset, cross_offset, updated_at FROM chapters WHERE id = 'c1'`).Scan(&axis, &cross, &updatedAt); err != nil {
+		t.Fatalf("load chapter after position update: %v", err)
+	}
+	// Position fields written (write path is active)...
+	if axis != 10 || cross != 20 {
+		t.Fatalf("position offsets not applied: axis=%v cross=%v", axis, cross)
+	}
+	// ...but updatedAt must remain untouched, matching TS.
+	if updatedAt != "fixed-updated-ts" {
+		t.Fatalf("updatedAt must not be bumped on a position-only drag (TS parity), got %q", updatedAt)
+	}
+}
+
 func newGraphTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")

@@ -2489,7 +2489,7 @@ func TestRecordedToolResultEventPersistsSideCars(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load narrator: %v", err)
 	}
-	state := &agentRunState{narratorID: narratorID, narrator: narrator, draftMessageID: &msg.ID}
+	state := &agentRunState{narratorID: narratorID, narrator: narrator, draftMessageID: msg.ID}
 	if err := service.handleAgentEvent(context.Background(), state, agentbasic.AgentEvent{Type: "tool_result", ToolUseID: "recorded-tool-1", ToolName: "Write", Output: "ok", ToolRun: &agentbasic.ToolRun{ID: "recorded-tool-1", Name: "Write", Output: "ok", Status: "completed", Recorded: true}, SideCars: []agentbasic.AgentSideCar{{Target: "tool_result", Source: "relaxed_plan", Content: "plan notice"}}}); err != nil {
 		t.Fatalf("handle recorded tool result: %v", err)
 	}
@@ -3017,7 +3017,7 @@ func TestRunBasicAgentPlanModeRedirectsMarkdownWriteToPlanFile(t *testing.T) {
 	if err := service.DB.QueryRow(`SELECT status, input_json, output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id = 'plan-write-1'`, narratorID).Scan(&status, &inputRaw, &outputRaw); err != nil {
 		t.Fatalf("load plan write tool call: %v", err)
 	}
-	if status != "success" || !strings.Contains(inputRaw, `.narrafork/plan-plan1234.md`) || !strings.Contains(outputRaw, "File path redirected") {
+	if status != "success" || !strings.Contains(inputRaw, `.narrafork/plan-plan1234.md`) || !strings.Contains(outputRaw, "[Plan Mode] Note: Your write target was redirected") {
 		t.Fatalf("unexpected plan redirect tool call status=%s input=%s output=%s", status, inputRaw, outputRaw)
 	}
 }

@@ -269,11 +269,45 @@ func loadProviderModelCache(kind string) map[string][]map[string]any {
 	if err != nil {
 		return map[string][]map[string]any{}
 	}
+	// Preferred: flat schema { "<providerId>": [ ...models... ] }.
 	cache := map[string][]map[string]any{}
-	if err := json.Unmarshal(data, &cache); err != nil {
+	if err := json.Unmarshal(data, &cache); err == nil {
+		return cache
+	}
+	// Fallback: nested schema { "version": n, "providers": { "<providerId>": { "models": [...] } } }
+	// written by saveNugProviderModelCache. Without this branch nugModelsGrouped is always
+	// empty and the frontend shows no NUG models even though refresh succeeded.
+	decoded := map[string]any{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
 		return map[string][]map[string]any{}
 	}
-	return cache
+	providers := decoded
+	if nested, ok := decoded["providers"].(map[string]any); ok {
+		providers = nested
+	}
+	out := map[string][]map[string]any{}
+	for providerID, value := range providers {
+		switch typed := value.(type) {
+		case []any:
+			out[providerID] = mapsFromAnyValues(typed)
+		case map[string]any:
+			if models, ok := typed["models"].([]any); ok {
+				out[providerID] = mapsFromAnyValues(models)
+			}
+		}
+	}
+	return out
+}
+
+// mapsFromAnyValues filters a []any down to its map[string]any entries.
+func mapsFromAnyValues(values []any) []map[string]any {
+	out := make([]map[string]any, 0, len(values))
+	for _, item := range values {
+		if model, ok := item.(map[string]any); ok {
+			out = append(out, model)
+		}
+	}
+	return out
 }
 
 func loadObjectCache(fileName string) map[string]any {
@@ -2817,6 +2851,22 @@ func contextWindowForModel(raw map[string]any, model, provider string) int {
 	}
 	if strings.HasPrefix(bare, "gpt-5") || strings.HasPrefix(bare, "gpt-4.1") {
 		return 272000
+	}
+	// Claude 4.6 models serve a 1M context window (TS BUILTIN_CONTEXT_WINDOWS
+	// provider.ts:721-725: claude-sonnet-4-6 / claude-opus-4-6 / claude-sonnet-4.6 /
+	// claude-opus-4.6 = 1_000_000). TS getBuiltinModelContextWindow does exact +
+	// longest-prefix fuzzy match, so dated variants like claude-opus-4-6-20251101
+	// also resolve to 1M. This must be checked BEFORE the generic claude→200000
+	// fallback below, otherwise these models never cross the 600000 large-tier
+	// boundary in getContextThresholds and large-tier prune/compact config is
+	// silently ignored (returns standard-tier values instead of TS's large-tier).
+	// Note: claude-sonnet-4-20250514 etc. do NOT have these prefixes → stay 200000,
+	// matching TS (longest-prefix match picks claude-sonnet-4, not -4-6).
+	lowerBare := strings.ToLower(bare)
+	for _, prefix := range []string{"claude-sonnet-4-6", "claude-opus-4-6", "claude-sonnet-4.6", "claude-opus-4.6"} {
+		if strings.HasPrefix(lowerBare, prefix) {
+			return 1000000
+		}
 	}
 	if strings.Contains(bare, "200k") || strings.Contains(bare, "claude") || provider == "kiro" || strings.HasPrefix(provider, "nkp") {
 		return 200000

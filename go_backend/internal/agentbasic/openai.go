@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,6 +60,8 @@ type Provider struct {
 	AccountID              string
 	CredentialID           string
 	PromptCacheKey         string
+	ServiceTier            string
+	ExtraHeaders           map[string]string
 	CredentialPool         []Provider
 	LoadBalancingMode      string
 	KiroCredentialsPath    string
@@ -70,6 +73,12 @@ type Provider struct {
 	DefaultReasoningEffort string
 	ProxyURL               string
 	TLSRejectUnauthorized  *bool
+	// NugKiroRoutedModel, when non-empty, makes the kiro request path wrap the
+	// standard kiro conversationState body with a top-level "model" field set to
+	// this value (the NUG channel-prefixed routedModel, e.g. "kiro:claude-opus-4.8").
+	// This mirrors TS nug-provider.ts chatKiro: `{ model: meta.routedModel, ...request }`.
+	// Only set for NUG kiro-channel requests; empty for native kiro/nkp providers.
+	NugKiroRoutedModel string
 }
 
 type Result struct {
@@ -78,13 +87,18 @@ type Result struct {
 }
 
 type ToolRun struct {
-	ID         string
-	Name       string
-	Arguments  string
-	Output     string
-	Status     string
-	Error      string
-	Recorded   bool
+	ID        string
+	Name      string
+	Arguments string
+	Output    string
+	Status    string
+	Error     string
+	Recorded  bool
+	// Fatal marks a tool result that must terminate the entire agent loop
+	// (mirrors TS narrator-permission fatal decisions for catastrophic commands).
+	// When set, executeTurnTools emits an error event with Output as the message
+	// and stops the loop after the current turn's tool_result events are emitted.
+	Fatal      bool
 	FileChange *FileChange
 }
 
@@ -167,6 +181,7 @@ type generateOptions struct {
 	systemPrompt                      string
 	maxTurns                          int
 	reasoningEffort                   string
+	serviceTier                       string
 	toolScope                         string
 	enabledTools                      []string
 	disabledTools                     []string
@@ -191,6 +206,7 @@ type generateOptions struct {
 	shouldStopHook                    ShouldStopHook
 	contextWindow                     int
 	disableInlinePlan                 bool
+	locale                            string
 }
 
 type SideCarRequest struct {
@@ -226,6 +242,15 @@ func WithMaxTurns(maxTurns int) GenerateOption {
 func WithReasoningEffort(reasoningEffort string) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.reasoningEffort = strings.TrimSpace(reasoningEffort)
+	}
+}
+
+// WithServiceTier sets the service tier for the request. Only codex request
+// bodies emit it (as service_tier); other providers ignore it. Mirrors TS where
+// narrator fastMode maps to service_tier:"priority" for codex models.
+func WithServiceTier(tier string) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.serviceTier = strings.TrimSpace(tier)
 	}
 }
 
@@ -310,6 +335,15 @@ func WithSilentToolCallThreshold(threshold int) GenerateOption {
 	}
 }
 
+// WithLocale sets the locale used for loop-level model-facing reminders
+// (turn nudge, silent-progress). Mirrors the TS reminder i18n: only "en" and
+// "zh-CN" are recognized; anything else falls back to "en".
+func WithLocale(locale string) GenerateOption {
+	return func(opts *generateOptions) {
+		opts.locale = strings.TrimSpace(locale)
+	}
+}
+
 func WithBeforeTurnHook(hook BeforeTurnHook) GenerateOption {
 	return func(opts *generateOptions) {
 		opts.beforeTurnHook = hook
@@ -352,6 +386,7 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 		retryBaseDelay:          defaultRetryBaseDelay,
 		retryBackoffCeil:        defaultRetryBackoffCeil,
 		silentToolCallThreshold: 20,
+		locale:                  "en",
 	}
 	for _, opt := range opts {
 		if opt != nil {
@@ -372,6 +407,9 @@ func normalizeGenerateOptions(opts ...GenerateOption) generateOptions {
 	}
 	options.reasoningEffort = normalizeReasoningEffort(options.reasoningEffort)
 	options.toolScope = normalizeToolScopeName(options.toolScope)
+	if options.locale != "zh-CN" {
+		options.locale = "en"
+	}
 	options.enabledTools = normalizedToolNames(options.enabledTools)
 	options.disabledTools = normalizedToolNames(options.disabledTools)
 	options.externalTools = normalizeExternalTools(options.externalTools)
@@ -537,7 +575,7 @@ func formatToolsForAdapter(adapter ProviderAdapter, opts ToolInventoryOptions) [
 	case *KiroProviderAdapter:
 		return kiroToolDefinitionsFromSpecs(specs)
 	case *NugProviderAdapter:
-		return formatToolsForAdapter(typed.delegate(), opts)
+		return formatToolsForAdapter(typed.delegate(nil), opts)
 	default:
 		return openAIToolDefinitionsFromSpecs(specs)
 	}
@@ -615,7 +653,7 @@ func toolSpecs() []toolSpec {
 				"properties": map[string]any{
 					"command":           stringProp("Command to execute"),
 					"description":       stringProp("Short description of what the command does"),
-					"timeout":           map[string]any{"type": "number", "description": "Timeout in milliseconds, capped at 600000"},
+					"timeout":           map[string]any{"type": "number", "description": "Optional timeout in milliseconds (default 120000 = 2 minutes, capped at 600000)"},
 					"workdir":           stringProp("Optional working directory under the narrator cwd"),
 					"run_in_background": map[string]any{"type": "boolean", "description": "Run in background and return a task ID when executed through a narrator session"},
 					"strict_serial":     map[string]any{"type": "boolean", "description": "Execute strictly serially instead of parallelizing with other eager tools"},
@@ -669,7 +707,7 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "Glob",
-			Description: "List files whose relative path matches a glob pattern such as **/*.go or *.ts.",
+			Description: "List files whose relative path matches a glob pattern such as **/*.go, *.ts, or *.{ts,tsx}.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -688,7 +726,7 @@ func toolSpecs() []toolSpec {
 				"properties": map[string]any{
 					"pattern":     stringProp("Regex pattern"),
 					"path":        stringProp("Optional file or directory under the working directory to search in"),
-					"glob":        stringProp("Optional glob filter, such as **/*.go"),
+					"glob":        stringProp("Optional glob filter, such as **/*.go or *.{ts,tsx}"),
 					"output_mode": map[string]any{"type": "string", "enum": []string{"content", "files_with_matches", "count"}, "description": "content, files_with_matches, or count; defaults to files_with_matches"},
 					"context":     map[string]any{"type": "number", "description": "Lines before and after each match in content mode"},
 					"-B":          map[string]any{"type": "number", "description": "Lines before each match in content mode"},
@@ -707,12 +745,12 @@ func toolSpecs() []toolSpec {
 		},
 		{
 			Name:        "WebFetch",
-			Description: "Fetch an HTTP, HTTPS, or data URL and return truncated response text.",
+			Description: "Fetch and extract content from an HTTP, HTTPS, or data URL and return truncated text. Defaults to readability mode (clean article text).",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"url":        stringProp("HTTP, HTTPS, or data URL to fetch"),
-					"mode":       map[string]any{"type": "string", "enum": []string{"readability", "screenshot", "dom", "smart"}, "description": "Extraction mode; Go runtime supports raw (default) and dom (no-browser HTTP fetch). readability, smart, and screenshot are rejected explicitly."},
+					"mode":       map[string]any{"type": "string", "enum": []string{"readability", "screenshot", "dom", "smart"}, "description": "Extraction mode. Defaults to readability (heuristic main-content extraction). Supported here: readability (default), raw (verbose status/headers/body), and dom (no-browser HTML clean/selector). smart and screenshot are not implemented and are rejected explicitly."},
 					"selector":   stringProp("CSS selector for dom mode (tag, .class, #id, tag.class subset)"),
 					"max_length": map[string]any{"type": "number", "description": "Maximum response bytes to return"},
 					"purpose":    stringProp("Purpose for smart mode; unsupported in Go runtime"),
@@ -1146,6 +1184,17 @@ func browserToolSpec() toolSpec {
 
 type ToolRuntimeSettings struct {
 	WebFetchProxy WebFetchProxyPolicy
+	// LegacyEncoding mirrors settings.agent.legacyEncoding. When true, the Read
+	// tool's small-file path detects and decodes non-UTF-8 charsets (GBK, Big5,
+	// Shift_JIS, ...) and Write/Edit preserve a file's existing non-UTF-8 encoding
+	// on write-back, matching TS encoding.ts.
+	LegacyEncoding bool
+	// FreshShellEnv mirrors settings.agent.freshShellEnv. When true, the Bash tool
+	// runs commands in a login shell (bash -l -c) with a minimal environment so the
+	// shell's profile repopulates the rest from a clean slate; when false (default)
+	// it runs a non-login shell (bash -c) inheriting the server's environment,
+	// matching TS bash.ts.
+	FreshShellEnv bool
 }
 
 type WebFetchProxyPolicy struct {
@@ -1167,7 +1216,28 @@ func ToolRuntimeSettingsFromRawSettings(raw map[string]any) ToolRuntimeSettings 
 	if mode == "" {
 		mode = "system"
 	}
-	return ToolRuntimeSettings{WebFetchProxy: WebFetchProxyPolicy{Mode: mode, URL: stringValue(proxy["url"])}}
+	legacyEncoding, _ := agent["legacyEncoding"].(bool)
+	freshShellEnv, _ := agent["freshShellEnv"].(bool)
+	return ToolRuntimeSettings{
+		WebFetchProxy:  WebFetchProxyPolicy{Mode: mode, URL: stringValue(proxy["url"])},
+		LegacyEncoding: legacyEncoding,
+		FreshShellEnv:  freshShellEnv,
+	}
+}
+
+// legacyEncodingFromContext returns whether settings.agent.legacyEncoding is
+// enabled for the current tool run, mirroring how webFetchHTTPClient reads the
+// proxy policy from the context-carried ToolRuntimeSettings.
+func legacyEncodingFromContext(ctx context.Context) bool {
+	settings, _ := ctx.Value(toolRuntimeSettingsContextKey{}).(ToolRuntimeSettings)
+	return settings.LegacyEncoding
+}
+
+// freshShellEnvFromContext returns whether settings.agent.freshShellEnv is enabled
+// for the current tool run.
+func freshShellEnvFromContext(ctx context.Context) bool {
+	settings, _ := ctx.Value(toolRuntimeSettingsContextKey{}).(ToolRuntimeSettings)
+	return settings.FreshShellEnv
 }
 
 func ExecuteTool(ctx context.Context, cwd, name, rawArgs string) string {
@@ -1207,16 +1277,16 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 			}
 			bashCwd = resolved
 		}
-		return toolBash(ctx, bashCwd, stringValue(args["command"]), intValue(args["timeout"], 30000)), nil
+		return toolBash(ctx, bashCwd, stringValue(args["command"]), intValue(args["timeout"], bashDefaultTimeoutMs)), nil
 	case "Read":
 		if strings.TrimSpace(stringValue(args["pages"])) != "" {
 			return "Read pages/PDF extraction is not supported in the Go backend yet; omit pages and read text files only.", nil
 		}
-		return toolRead(cwd, stringValue(args["file_path"]), intValue(args["offset"], 1), intValue(args["limit"], 0)), nil
+		return toolRead(cwd, stringValue(args["file_path"]), readArgInt(args["offset"], 1), readArgInt(args["limit"], 0), legacyEncodingFromContext(ctx)), nil
 	case "Write":
-		return toolWrite(cwd, pathValue(args["file_path"]), stringValue(args["content"])), nil
+		return toolWrite(cwd, pathValue(args["file_path"]), stringValue(args["content"]), legacyEncodingFromContext(ctx)), nil
 	case "Edit":
-		return toolEdit(cwd, pathValue(args["file_path"]), stringValue(args["old_string"]), stringValue(args["new_string"]), boolValue(args["replace_all"])), nil
+		return toolEdit(cwd, pathValue(args["file_path"]), stringValue(args["old_string"]), stringValue(args["new_string"]), boolValue(args["replace_all"]), legacyEncodingFromContext(ctx)), nil
 	case "Glob":
 		return toolGlob(cwd, stringValue(args["pattern"]), stringValue(args["path"])), nil
 	case "Grep":
@@ -1239,6 +1309,7 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 			Insensitive:     boolValue(args["-i"]),
 			Type:            stringValue(args["type"]),
 			Multiline:       boolValue(args["multiline"]),
+			LegacyEncoding:  legacyEncodingFromContext(ctx),
 		}), nil
 	case "WebFetch":
 		mode := strings.TrimSpace(stringValue(args["mode"]))
@@ -1282,22 +1353,49 @@ func executeTool(ctx context.Context, cwd, name, rawArgs string) (string, error)
 var bashLongRunningThreshold = 60 * time.Second
 var bashLongRunningCheckInterval = time.Second
 
+// bashDefaultTimeoutMs mirrors the TS bash tool DEFAULT_TIMEOUT_MS
+// (server/lib/agent/tools/bash.ts:16 = 120_000): a foreground Bash command with
+// no explicit timeout runs for up to 2 minutes. Go previously defaulted to
+// 30_000 (30s), so a 30s-2min command that succeeds in TS was killed early in
+// Go — a model-visible behavioral divergence on the most common tool.
+const bashDefaultTimeoutMs = 120000
+
+// bashMaxTimeoutMs caps the foreground Bash timeout. TS clamps to MAX_TIMEOUT_MS
+// = 86_400_000 (24h), but Go keeps a 10-minute hard cap as a deliberate
+// resource-safety bound (CLAUDE.md: tool execution must be bounded); a 24h
+// foreground command would pin the event loop / a worker indefinitely. This is a
+// documented divergence (bashMaxTimeoutDivergesFromTS), distinct from the default
+// which now matches TS exactly.
+const bashMaxTimeoutMs = 600000
+
 func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	if strings.TrimSpace(command) == "" {
 		return "command is required"
 	}
 	if timeoutMs <= 0 {
-		timeoutMs = 30000
+		timeoutMs = bashDefaultTimeoutMs
 	}
 	if timeoutMs < 1000 {
 		timeoutMs = 1000
 	}
-	if timeoutMs > 600000 {
-		timeoutMs = 600000
+	if timeoutMs > bashMaxTimeoutMs {
+		timeoutMs = bashMaxTimeoutMs
 	}
 	toolCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
 	defer cancel()
-	cmd := exec.CommandContext(toolCtx, "bash", "-lc", command)
+	// Mirror the TS bash tool shell/env selection (server/lib/agent/tools/bash.ts):
+	// freshShellEnv=true runs a login shell (bash -l -c) with a minimal environment
+	// so the shell's profile repopulates the rest from a clean slate; the default
+	// (false) runs a NON-login shell (bash -c) inheriting the server environment.
+	// Go previously always used login `bash -lc` with the full inherited env, which
+	// both ignored freshShellEnv and diverged from the TS default (non-login).
+	var cmd *exec.Cmd
+	if freshShellEnvFromContext(ctx) {
+		cmd = exec.CommandContext(toolCtx, "bash", "-l", "-c", command)
+		cmd.Env = BuildMinimalBashEnv()
+	} else {
+		cmd = exec.CommandContext(toolCtx, "bash", "-c", command)
+	}
 	cmd.Dir = cwd
 	buf := newTailCaptureBuffer(toolOutputMaxBytes, func(output string) { EmitToolRuntimeOutput(ctx, output) })
 	cmd.Stdout = buf
@@ -1366,7 +1464,7 @@ func toolBash(ctx context.Context, cwd, command string, timeoutMs int) string {
 	return result
 }
 
-func toolRead(cwd, path string, offset, limit int) string {
+func toolRead(cwd, path string, offset, limit int, legacyEncoding bool) string {
 	resolved, err := resolveWithin(cwd, path)
 	if err != nil {
 		return err.Error()
@@ -1378,6 +1476,20 @@ func toolRead(cwd, path string, offset, limit int) string {
 	if info.IsDir() {
 		return listDirectoryForRead(path, resolved)
 	}
+	// Image handling: detect image extensions and produce an image-aware output
+	// instead of treating the file as unreadable binary text (mirrors TS read.ts
+	// image branch, which runs before the text-size split). This backend only
+	// supports text tool output, so the image bytes are NOT attached to the model;
+	// the placeholder text says so honestly rather than claiming the image was
+	// shown visually (TS attaches base64; full multimodal tool-result image
+	// threading is a tracked capability boundary).
+	if format, ok := readImageExtensions[strings.ToLower(filepath.Ext(resolved))]; ok {
+		size := info.Size()
+		if size > readMaxImageBytes {
+			return fmt.Sprintf("Image file too large (%.1f MB). Maximum supported size is 5 MB.", float64(size)/1024/1024)
+		}
+		return fmt.Sprintf("[Image: %s (%.1f KB, %s) — image bytes are not attached to the model in this backend; only text tool output is supported]", path, float64(size)/1024, format)
+	}
 	if info.Size() > 2*1024*1024 {
 		return readNumberedLinesStream(resolved, offset, limit)
 	}
@@ -1388,7 +1500,19 @@ func toolRead(cwd, path string, offset, limit int) string {
 	if bytes.IndexByte(data, 0) >= 0 {
 		return "binary file cannot be read as text"
 	}
-	text := string(data)
+	// Mirror the TS readFileText legacy-encoding branch (encoding.ts:23-29): only
+	// the small-file non-streaming path decodes a detected non-UTF-8 charset (GBK,
+	// Big5, Shift_JIS, ...). The NUL check above runs on the raw bytes first;
+	// legacy CJK/single-byte encodings do not contain NUL bytes, so real binary
+	// files are still rejected. The streaming path (readNumberedLinesStream, >2MB
+	// or readAll) intentionally stays UTF-8, matching TS's createReadStream({
+	// encoding:"utf-8" }) which never applies legacy decoding.
+	var text string
+	if legacyEncoding {
+		text, _ = legacyDecodeFileText(data)
+	} else {
+		text = string(data)
+	}
 	lines := strings.Split(text, "\n")
 	if offset <= 0 {
 		offset = 1
@@ -1492,6 +1616,21 @@ func formatNumberedLines(lines []string, startLine int) string {
 // characters will be truncated") documents this contract.
 const readMaxLineChars = 2000
 
+// readMaxImageBytes mirrors the TS read tool MAX_IMAGE_BYTES (5 MB): an image
+// larger than this is rejected with a "too large" message.
+const readMaxImageBytes = 5 * 1024 * 1024
+
+// readImageExtensions mirrors the TS read tool IMAGE_EXTENSIONS map (extension →
+// format string). Used to detect image files in the Read tool and produce an
+// image-aware output instead of treating them as unreadable binary text.
+var readImageExtensions = map[string]string{
+	".png":  "png",
+	".jpg":  "jpeg",
+	".jpeg": "jpeg",
+	".gif":  "gif",
+	".webp": "webp",
+}
+
 // truncateDisplayLine mirrors the TS truncateDisplayLine: a line longer than
 // readMaxLineChars is cut to the first 2000 UTF-16 code units followed by
 // "… [line truncated, N chars total]" where N is the full UTF-16 length. Go
@@ -1562,7 +1701,7 @@ func listDirectoryForRead(displayPath, resolvedPath string) string {
 	return header + strings.Join(lines, "\n") + footer
 }
 
-func toolWrite(cwd, path, content string) string {
+func toolWrite(cwd, path, content string, legacyEncoding bool) string {
 	resolved, err := resolveWithin(cwd, path)
 	if err != nil {
 		return err.Error()
@@ -1573,7 +1712,21 @@ func toolWrite(cwd, path, content string) string {
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
 		return err.Error()
 	}
-	if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
+	// Mirror the TS write tool (write.ts:44-61): when legacy encoding is enabled,
+	// detect the existing file's encoding before overwriting and write the new
+	// content back in that same encoding, so editing a GBK/Shift_JIS file does not
+	// silently transcode it to UTF-8 (data corruption). New files are written as
+	// UTF-8 (TS writeFileText defaults to utf-8).
+	payload := []byte(content)
+	if legacyEncoding {
+		if existing, readErr := os.ReadFile(resolved); readErr == nil {
+			_, existingEncoding := legacyDecodeFileText(existing)
+			if encoded, encErr := legacyEncodeText(content, existingEncoding); encErr == nil {
+				payload = encoded
+			}
+		}
+	}
+	if err := os.WriteFile(resolved, payload, 0o644); err != nil {
 		return err.Error()
 	}
 	// Mirror the TS write tool success message exactly: `Wrote ${content.length}
@@ -1584,7 +1737,7 @@ func toolWrite(cwd, path, content string) string {
 	return fmt.Sprintf("Wrote %d bytes to %s", len(utf16.Encode([]rune(content))), path)
 }
 
-func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
+func toolEdit(cwd, path, oldString, newString string, replaceAll bool, legacyEncoding bool) string {
 	resolved, err := resolveWithin(cwd, path)
 	if err != nil {
 		return err.Error()
@@ -1627,7 +1780,17 @@ func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
 	// normalized → trimmed-boundary → multi-occurrence) so an old_string with
 	// slightly different indentation/whitespace still matches like TS instead of
 	// failing with "old_string not found".
-	text := normalizeEditLineEndings(string(data))
+	//
+	// When legacy encoding is enabled (edit.ts:491/497), decode the file from its
+	// detected charset before matching and remember the encoding so the edited
+	// content is written back in the same charset rather than silently transcoded
+	// to UTF-8 (data corruption).
+	fileContent := string(data)
+	fileEncoding := "utf-8"
+	if legacyEncoding {
+		fileContent, fileEncoding = legacyDecodeFileText(data)
+	}
+	text := normalizeEditLineEndings(fileContent)
 	normalizedOld := normalizeEditLineEndings(oldString)
 	normalizedNew := normalizeEditLineEndings(newString)
 	match, found, unique := findEditReplaceMatch(text, normalizedOld, replaceAll)
@@ -1652,7 +1815,13 @@ func toolEdit(cwd, path, oldString, newString string, replaceAll bool) string {
 	} else {
 		updated = text[:match.index] + normalizedNew + text[match.index+len(match.search):]
 	}
-	if err := os.WriteFile(resolved, []byte(updated), 0o644); err != nil {
+	payload := []byte(updated)
+	if legacyEncoding {
+		if encoded, encErr := legacyEncodeText(updated, fileEncoding); encErr == nil {
+			payload = encoded
+		}
+	}
+	if err := os.WriteFile(resolved, payload, 0o644); err != nil {
 		return err.Error()
 	}
 	// Mirror the TS edit success message exactly: `Edited ${file_path}` (original
@@ -1702,7 +1871,7 @@ func toolGlob(cwd, pattern, searchPath string) string {
 		}
 		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
-		if globMatch(pattern, rel) {
+		if globMatchGlobTool(pattern, rel) {
 			matches = append(matches, rel)
 			if len(matches) >= 500 {
 				return filepath.SkipAll
@@ -1720,9 +1889,52 @@ func toolGlob(cwd, pattern, searchPath string) string {
 	return out
 }
 
+// globBraceExpansionLimit bounds how many patterns a single brace expansion may
+// produce, preventing combinatorial blow-up from patterns like {a,b}{c,d}{e,f}...
+const globBraceExpansionLimit = 64
+
+// globMatch reports whether rel matches pattern. It first expands any brace
+// groups that contain a top-level comma (e.g. `*.{ts,tsx}` -> `*.ts`, `*.tsx`),
+// mirroring Bun.Glob / ripgrep --glob used by the TS Glob/Grep tools, then matches
+// rel against each expanded pattern. Brace groups without a top-level comma
+// (`{1..9}`, `{foo}`, `{}`) are left literal, matching minimatch/Bun.Glob and
+// preserving Go's prior literal-brace behavior with zero regression.
+//
+// This is the Grep-tool flavour: a slash-less pattern (no "/") also matches a
+// path's basename, mirroring ripgrep --glob "*.go" which matches files named
+// *.go at ANY depth. The Glob tool uses globMatchGlobTool instead, which omits
+// that basename fallback to mirror Bun.Glob (slash-less `*` does not cross "/").
 func globMatch(pattern, rel string) bool {
+	for _, p := range expandGlobBraces(pattern) {
+		if globMatchSingle(p, rel, true) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatchGlobTool is the Glob-tool flavour of globMatch. It mirrors
+// Bun.Glob(pattern).scan() semantics used by the TS Glob tool: a slash-less
+// pattern such as "*.go" matches only top-level entries (the `*` wildcard does
+// NOT cross "/"), so "*.go" matches "a.go" but not "sub/b.go". A "**" pattern
+// such as "**/*.go" still matches across directories via globDoubleStarMatch.
+// Go previously routed the Glob tool through globMatch's basename fallback,
+// which wrongly returned nested same-suffix files (sub/b.go, sub/deep/c.go) for
+// a slash-less "*.go" — diverging from Bun.Glob's top-level-only result and, in
+// large trees, flooding the output (and hitting the 500 cap) with files the
+// model never asked for. The Grep tool keeps globMatch (rg basename semantics).
+func globMatchGlobTool(pattern, rel string) bool {
+	for _, p := range expandGlobBraces(pattern) {
+		if globMatchSingle(p, rel, false) {
+			return true
+		}
+	}
+	return false
+}
+
+func globMatchSingle(pattern, rel string, matchBasename bool) bool {
 	candidates := []string{rel}
-	if !strings.Contains(pattern, "/") {
+	if matchBasename && !strings.Contains(pattern, "/") {
 		candidates = append(candidates, filepath.Base(rel))
 	}
 	for _, candidate := range candidates {
@@ -1734,6 +1946,95 @@ func globMatch(pattern, rel string) bool {
 		}
 	}
 	return false
+}
+
+// expandGlobBraces expands brace groups containing a top-level comma into the
+// cartesian product of their alternatives. Groups without a top-level comma keep
+// their literal braces (so `{1..9}`/`{foo}`/`{}` are unchanged). Unbalanced braces
+// or no comma-bearing group yield the original pattern unchanged. The result is
+// bounded by globBraceExpansionLimit; exceeding it returns the original pattern.
+func expandGlobBraces(pattern string) []string {
+	// Find the first balanced brace group that contains a top-level comma.
+	depth := 0
+	openIdx := -1
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '{':
+			if depth == 0 {
+				openIdx = i
+			}
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+				if depth == 0 {
+					inner := pattern[openIdx+1 : i]
+					if braceInnerHasTopLevelComma(inner) {
+						prefix := pattern[:openIdx]
+						suffix := pattern[i+1:]
+						results := []string{}
+						for _, alt := range splitTopLevelBraceAlternatives(inner) {
+							for _, expanded := range expandGlobBraces(prefix + alt + suffix) {
+								results = append(results, expanded)
+								if len(results) > globBraceExpansionLimit {
+									return []string{pattern}
+								}
+							}
+						}
+						return results
+					}
+					// No top-level comma: leave this group literal and keep scanning.
+				}
+			}
+		}
+	}
+	return []string{pattern}
+}
+
+// braceInnerHasTopLevelComma reports whether the contents of a brace group
+// contain a comma that is not nested inside a deeper brace group.
+func braceInnerHasTopLevelComma(inner string) bool {
+	depth := 0
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// splitTopLevelBraceAlternatives splits brace-group contents on top-level commas
+// (commas nested in deeper brace groups are preserved within their alternative).
+func splitTopLevelBraceAlternatives(inner string) []string {
+	alternatives := []string{}
+	depth := 0
+	start := 0
+	for i := 0; i < len(inner); i++ {
+		switch inner[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				alternatives = append(alternatives, inner[start:i])
+				start = i + 1
+			}
+		}
+	}
+	alternatives = append(alternatives, inner[start:])
+	return alternatives
 }
 
 func globDoubleStarMatch(pattern, rel string) bool {
@@ -1764,6 +2065,7 @@ type grepOptions struct {
 	Insensitive     bool
 	Type            string
 	Multiline       bool
+	LegacyEncoding  bool
 }
 
 // grepHeadLimitMax is the safe upper bound for an explicit Grep head_limit. The
@@ -1898,7 +2200,18 @@ func toolGrep(cwd string, opts grepOptions) string {
 		if err != nil || bytes.IndexByte(data, 0) >= 0 {
 			return nil
 		}
+		// Mirror the TS grep legacy-encoding path (grep.ts:198-284): when
+		// legacyEncoding is enabled, rg searches raw bytes (--encoding none) and the
+		// output is charset-detected + decoded. Go reads the file bytes directly, so
+		// decode the file content from its detected charset before matching/printing
+		// so GBK/Shift_JIS/... content is searched and shown as text rather than
+		// mojibake. The NUL check above runs on the raw bytes first (legacy CJK/
+		// single-byte encodings contain no NUL, so real binary files are still
+		// skipped, matching the existing Go-only binary guard).
 		text := string(data)
+		if opts.LegacyEncoding {
+			text, _ = legacyDecodeFileText(data)
+		}
 		fileLines := strings.Split(text, "\n")
 		matchLines := []int{}
 		matchCount := 0
@@ -2012,19 +2325,19 @@ func grepMultilineMatchLines(text string, ranges [][]int) []int {
 }
 
 func grepContextBounds(opts grepOptions) (int, int) {
-	contextLines := opts.Context
-	if opts.ContextAlias >= 0 {
-		contextLines = opts.ContextAlias
-	}
-	if contextLines < 0 {
-		contextLines = 0
-	}
-	if contextLines > 20 {
-		contextLines = 20
-	}
-	before, after := contextLines, contextLines
-	if opts.Before >= 0 || opts.After >= 0 {
-		before, after = 0, 0
+	// Mirror the TS grep.ts:215-222 precedence exactly: effectiveC = cAlias ??
+	// contextLines (i.e. -C wins over context), and when EITHER -C or context is
+	// provided the tool emits a symmetric -C and IGNORES -B/-A. Only when both -C
+	// and context are absent do -B/-A apply. Go previously inverted this: it let
+	// -B/-A override -C/context, so a request like {context:5, "-A":2} produced
+	// (0,2) on Go but (5,5) on TS. The -1 sentinel marks "not provided".
+	var before, after int
+	switch {
+	case opts.ContextAlias >= 0:
+		before, after = opts.ContextAlias, opts.ContextAlias
+	case opts.Context >= 0:
+		before, after = opts.Context, opts.Context
+	default:
 		if opts.Before >= 0 {
 			before = opts.Before
 		}
@@ -2032,6 +2345,8 @@ func grepContextBounds(opts grepOptions) (int, int) {
 			after = opts.After
 		}
 	}
+	// Defensive Go resource bound: cap each side at 20 (a documented Go-only
+	// limit, see W585/W594; TS passes the value to rg unbounded).
 	if before > 20 {
 		before = 20
 	}
@@ -2185,26 +2500,61 @@ func domainSuffixMatch(host, domain string) bool {
 	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
+// validateWebFetchURL mirrors the TS web-fetch tool's upfront URL validation
+// (server/lib/agent/tools/web-fetch.ts:88-101), which runs ONCE before mode
+// dispatch and produces two model-facing messages:
+//   - a URL that does not parse (or is relative/has no scheme) ->
+//     "Invalid URL: <url>" (echoes the offending URL so the model can fix it);
+//   - a scheme outside {http, https, data} ->
+//     "Unsupported protocol: <scheme>: — only http://, https://, and data: URLs
+//     are supported. Use the Read tool for local files." (the trailing guidance
+//     steers the model away from re-trying file:// paths).
+//
+// It returns a non-nil parsed URL and ("", "") when the URL is acceptable;
+// otherwise the last return is the model-facing error string (and the parsed URL
+// may be nil for the unparseable branch). Go previously scattered three
+// inconsistent messages across the readability/dom/raw paths ("invalid URL",
+// "only http, https, and data URLs are supported", "...for dom mode"), dropped
+// the URL echo and the Read-tool guidance, and — because Go's url.Parse accepts
+// scheme-less relative URLs — misreported a relative URL as an empty
+// "Unsupported protocol". Returning the parsed URL also lets callers reuse it
+// instead of parsing the same string a second time.
+func validateWebFetchURL(rawURL string) (parsed *url.URL, parsedScheme string, errMessage string) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, "", "Invalid URL: " + rawURL
+	}
+	// TS uses `new URL(url)`, which rejects relative URLs (no scheme). Go's
+	// url.Parse accepts them, so treat a missing scheme as an invalid URL to
+	// match the TS "Invalid URL" branch rather than the protocol branch.
+	if parsed.Scheme == "" {
+		return nil, "", "Invalid URL: " + rawURL
+	}
+	switch parsed.Scheme {
+	case "http", "https", "data":
+		return parsed, parsed.Scheme, ""
+	default:
+		return parsed, parsed.Scheme, "Unsupported protocol: " + parsed.Scheme + ": — only http://, https://, and data: URLs are supported. Use the Read tool for local files."
+	}
+}
+
 func toolWebFetch(ctx context.Context, rawURL string, maxLength int) string {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
 		return "url is required"
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "invalid URL"
+	parsed, scheme, errMessage := validateWebFetchURL(rawURL)
+	if errMessage != "" {
+		return errMessage
 	}
 	if maxLength <= 0 || maxLength > 200000 {
 		maxLength = 20000
 	}
-	if parsed.Scheme == "data" {
+	if scheme == "data" {
 		return toolWebFetchDataURL(rawURL, maxLength)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "only http, https, and data URLs are supported"
-	}
 	if parsed.Host == "" {
-		return "invalid URL"
+		return "Invalid URL: " + rawURL
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
@@ -2803,6 +3153,31 @@ func intValue(v any, fallback int) int {
 	switch typed := v.(type) {
 	case float64:
 		return int(typed)
+	case int:
+		return typed
+	default:
+		return fallback
+	}
+}
+
+// jsRound mirrors JavaScript Math.round: round half toward +Infinity
+// (Math.round(2.5)==3, Math.round(-2.5)==-2), which differs from Go's
+// math.Round (round half away from zero). Used for Read offset/limit coercion
+// to match TS read.ts exactly.
+func jsRound(x float64) int {
+	return int(math.Floor(x + 0.5))
+}
+
+// readArgInt coerces a Read tool offset/limit argument to an integer using
+// JavaScript Math.round semantics, mirroring TS read.ts:111-119 which does
+// Math.round(rawOffset)/Math.round(rawLimit) on the raw numeric arg before
+// clamping. Go previously truncated floats via intValue (int(2.7)==2), so a
+// float offset/limit read from a different line than TS (Math.round(2.7)==3).
+// A missing/non-numeric arg returns the fallback unchanged.
+func readArgInt(v any, fallback int) int {
+	switch typed := v.(type) {
+	case float64:
+		return jsRound(typed)
 	case int:
 		return typed
 	default:

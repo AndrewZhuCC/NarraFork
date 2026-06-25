@@ -99,6 +99,39 @@ func TestClineChatCompletionsOmitsReasoningLikeTS(t *testing.T) {
 	}
 }
 
+// TestChatCompletionsOmitsTemperatureLikeTS pins the streaming chat-completions
+// body to the TS openai-provider.ts shape: it sends model/messages/stream/
+// stream_options/tools and NEVER a temperature field (Go previously hardcoded
+// temperature:0.2, silently forcing low-variance generation). stream_options is
+// still present.
+func TestChatCompletionsOmitsTemperatureLikeTS(t *testing.T) {
+	var requestBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&requestBody)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer server.Close()
+	adapter := &OpenAIChatCompletionsAdapter{Provider: Provider{Prefix: "openai", Kind: "openai", APIKey: "k", BaseURL: server.URL, Model: "gpt-4o-mini"}}
+	stream, err := adapter.Chat(context.Background(), ChatParams{History: &BuiltHistory{History: []any{Message{Role: "user", Content: "hi"}}}})
+	if err != nil {
+		t.Fatalf("Chat error: %v", err)
+	}
+	for event := range stream {
+		if event.Err != nil {
+			t.Fatalf("stream error: %v", event.Err)
+		}
+	}
+	if _, has := requestBody["temperature"]; has {
+		t.Fatalf("chat-completions body must not send temperature, got %#v", requestBody["temperature"])
+	}
+	// stream_options.include_usage is still expected (parity with TS).
+	streamOpts, _ := requestBody["stream_options"].(map[string]any)
+	if streamOpts == nil || streamOpts["include_usage"] != true {
+		t.Fatalf("expected stream_options.include_usage:true, got %#v", requestBody["stream_options"])
+	}
+}
+
 func TestOpenAIChatCompletionsStreamsTextAndUsage(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/chat/completions" {

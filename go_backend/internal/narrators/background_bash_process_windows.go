@@ -10,14 +10,18 @@ import (
 	"time"
 )
 
-func configureBackgroundBashCommand(cmd *exec.Cmd) func() {
+// configureBackgroundBashCommand mirrors the Unix variant: the kill logic is
+// installed as cmd.Cancel (invoked by os/exec on its watch goroutine after
+// cmd.Process is set) so reading cmd.Process is race-free. Cancellation flows
+// through the command's context.
+func configureBackgroundBashCommand(cmd *exec.Cmd) {
 	if cmd == nil {
-		return func() {}
+		return
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000200}
-	return func() {
+	cmd.Cancel = func() error {
 		if cmd.Process == nil || cmd.Process.Pid <= 0 {
-			return
+			return nil
 		}
 		pid := strconv.Itoa(cmd.Process.Pid)
 		go func() {
@@ -25,6 +29,7 @@ func configureBackgroundBashCommand(cmd *exec.Cmd) func() {
 			defer cancel()
 			_ = exec.CommandContext(ctx, "taskkill", "/T", "/F", "/PID", pid).Run()
 		}()
-		_ = cmd.Process.Kill()
+		return cmd.Process.Kill()
 	}
+	cmd.WaitDelay = 2 * time.Second
 }

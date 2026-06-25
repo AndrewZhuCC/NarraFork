@@ -205,11 +205,11 @@ func TestCompleteExitPlanModeSkipsPlanCompactWithoutCompactAfter(t *testing.T) {
 }
 
 func TestExitPlanContinuePromptIncludesDiffAndCompactMode(t *testing.T) {
-	diffPrompt := exitPlanContinuePrompt(false, "- old\n+ new")
+	diffPrompt := exitPlanContinuePrompt(false, "- old\n+ new", "en")
 	if !strings.Contains(diffPrompt, "- old") || !strings.Contains(diffPrompt, "+ new") || !strings.Contains(diffPrompt, "edited your plan") {
 		t.Fatalf("expected diff continuation prompt, got %q", diffPrompt)
 	}
-	compactPrompt := exitPlanContinuePrompt(true, "- ignored\n+ ignored")
+	compactPrompt := exitPlanContinuePrompt(true, "- ignored\n+ ignored", "en")
 	if !strings.Contains(compactPrompt, "context has been reset") || strings.Contains(compactPrompt, "ignored") {
 		t.Fatalf("expected compact continuation prompt without diff body, got %q", compactPrompt)
 	}

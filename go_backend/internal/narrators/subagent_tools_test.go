@@ -19,6 +19,9 @@ func TestSubagentAllowedToolSetsMatchTS(t *testing.T) {
 	}
 	// TS GENERAL_TOOLS = EXPLORE_PLAN_TOOLS + Skill.
 	generalTS := append(append([]string{}, explorePlanTS...), "Skill")
+	// TS SEARCH_TOOLS (server/services/subagent-tools.ts:24-25): WebFetch + helpers,
+	// with NO Read/Glob/Grep/Bash/Write/Edit/WebSearch.
+	searchTS := []string{"WebFetch", "TaskCreate", "TeamStatus", "Await", "Send"}
 
 	check := func(subagentType string, wantList []string) {
 		allowed := allowedToolsForSubagentType(subagentType, customSubagentToolAccess{})
@@ -47,6 +50,7 @@ func TestSubagentAllowedToolSetsMatchTS(t *testing.T) {
 	check("plan", explorePlanTS)
 	check("review", explorePlanTS)
 	check("general", generalTS)
+	check("search", searchTS)
 	// Unknown builtin type falls back to the read-only explore/plan set.
 	check("", explorePlanTS)
 }

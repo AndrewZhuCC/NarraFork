@@ -116,9 +116,9 @@ func TestFrontendContractSmokeHTTPPaths(t *testing.T) {
 			assert:     assertJSONField("id", "narrator-1"),
 		},
 		{
-			name:       "narrator messages page",
+			name:       "narrator chunks page",
 			method:     http.MethodGet,
-			path:       "/api/narrators/narrator-1/messages?limit=20",
+			path:       "/api/narrators/narrator-1/chunks?direction=older&count=1",
 			wantStatus: http.StatusOK,
 			assert: func(t *testing.T, body map[string]any) {
 				assertArrayField(t, body, "messages")

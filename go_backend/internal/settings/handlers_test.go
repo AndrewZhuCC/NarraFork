@@ -393,6 +393,69 @@ func TestContextThresholdsUsesConfiguredLargeTier(t *testing.T) {
 	}
 }
 
+// TestContextThresholdsSelectsLargeTierFor1MClaudeModels locks parity with TS
+// getContextThresholds (provider.ts:826-837): the four Claude 4.6 models have a
+// 1M built-in context window (provider.ts:721-725), which exceeds the 600000
+// LARGE_CONTEXT_BOUNDARY, so they must select the large tier. Go previously
+// returned 200000 for any "claude" model (handlers.go contextWindowForModel),
+// so these models silently fell to the standard tier and large-tier prune/
+// compact config was ignored. Dated variants resolve via longest-prefix fuzzy
+// match in TS, so they also map to 1M.
+func TestContextThresholdsSelectsLargeTierFor1MClaudeModels(t *testing.T) {
+	store := newTestStore(t)
+	// No modelContextWindows override → forces the built-in heuristic fallback.
+	_, err := store.Patch(map[string]any{"agent": map[string]any{
+		"contextThresholds": map[string]any{
+			"standard": map[string]any{"pruneStart": float64(80), "compactStart": float64(90)},
+			"large":    map[string]any{"pruneStart": float64(70), "compactStart": float64(85)},
+		},
+	}})
+	if err != nil {
+		t.Fatalf("patch settings: %v", err)
+	}
+	h := &Handler{Store: store}
+
+	largeTierModels := []string{
+		"claude-sonnet-4-6",
+		"claude-opus-4-6",
+		"claude-sonnet-4.6",
+		"claude-opus-4.6",
+		"claude-opus-4-6-20251101", // dated variant → longest-prefix fuzzy match in TS
+	}
+	for _, model := range largeTierModels {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/context-thresholds?model="+model+"&provider=anthropic", nil)
+		w := httptest.NewRecorder()
+		if err := h.contextThresholds(w, req); err != nil {
+			t.Fatalf("contextThresholds(%q) returned error: %v", model, err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response for %q: %v", model, err)
+		}
+		if body["pruneStart"] != float64(70) || body["compactStart"] != float64(85) {
+			t.Fatalf("model %q should select large tier (70/85), got %#v", model, body)
+		}
+	}
+
+	// Control: a 200k Claude model must stay on the standard tier (matching TS,
+	// where claude-sonnet-4-20250514 = 200000 < 600000).
+	standardTierModels := []string{"claude-sonnet-4-20250514", "claude-3-5-sonnet", "claude-sonnet-4"}
+	for _, model := range standardTierModels {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/context-thresholds?model="+model+"&provider=anthropic", nil)
+		w := httptest.NewRecorder()
+		if err := h.contextThresholds(w, req); err != nil {
+			t.Fatalf("contextThresholds(%q) returned error: %v", model, err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode response for %q: %v", model, err)
+		}
+		if body["pruneStart"] != float64(80) || body["compactStart"] != float64(90) {
+			t.Fatalf("model %q should select standard tier (80/90), got %#v", model, body)
+		}
+	}
+}
+
 func TestTestModelRejectsOverlongPrompt(t *testing.T) {
 	h := &Handler{}
 	payload, _ := json.Marshal(map[string]any{
@@ -1886,5 +1949,83 @@ func TestPatchProviderRemovalPurgesCachesAndAgentRefs(t *testing.T) {
 	cache := loadProviderModelCache("openai")
 	if _, ok := cache["old"]; ok || len(cache["keep"]) == 0 {
 		t.Fatalf("provider cache not purged correctly: %#v", cache)
+	}
+}
+
+// TestLoadProviderModelCacheNestedSchema pins the regression where NUG model
+// caches written as {version, providers:{id:{models}}} were parsed by the flat
+// loader as having providerIds "version"/"providers", yielding an empty
+// nugModelsGrouped and "no models" in the UI even though refresh succeeded.
+func TestLoadProviderModelCacheNestedSchema(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	nested := map[string]any{
+		"version": 1,
+		"providers": map[string]any{
+			"prov-1": map[string]any{
+				"modelHash": "sha256:abc",
+				"models": []any{
+					map[string]any{"id": "codex:gpt-5.4", "name": "GPT-5.4", "channel": "codex"},
+					map[string]any{"id": "kiro:claude-opus-4.8", "name": "Opus", "channel": "kiro"},
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(nested)
+	if err != nil {
+		t.Fatalf("marshal nested cache: %v", err)
+	}
+	if err := os.MkdirAll(dataDir(), 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir(), "nug-models-providers.json"), data, 0o600); err != nil {
+		t.Fatalf("write nug cache: %v", err)
+	}
+
+	cache := loadProviderModelCache("nug")
+	if got := len(cache["prov-1"]); got != 2 {
+		t.Fatalf("expected 2 models for prov-1, got %d (cache=%#v)", got, cache)
+	}
+	if _, ok := cache["providers"]; ok {
+		t.Fatalf("nested wrapper key \"providers\" leaked as a providerId: %#v", cache)
+	}
+	if _, ok := cache["version"]; ok {
+		t.Fatalf("nested wrapper key \"version\" leaked as a providerId: %#v", cache)
+	}
+
+	// groupedSettingsModels must now surface the provider's models.
+	raw := map[string]any{
+		"nugProviders": []any{
+			map[string]any{"id": "prov-1", "name": "NUG", "prefix": "nug"},
+		},
+	}
+	groups := groupedSettingsModels(raw, "nugProviders", "nug", cache)
+	if len(groups) != 1 {
+		t.Fatalf("expected 1 grouped provider, got %d (%#v)", len(groups), groups)
+	}
+	group, _ := groups[0].(map[string]any)
+	if models, _ := group["models"].([]map[string]any); len(models) != 2 {
+		t.Fatalf("expected 2 grouped models, got %#v", group["models"])
+	}
+}
+
+// TestLoadProviderModelCacheFlatSchema ensures the flat schema still works after
+// adding nested-schema support.
+func TestLoadProviderModelCacheFlatSchema(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	flat := map[string]any{
+		"prov-1": []any{
+			map[string]any{"id": "codex:gpt-5.4", "name": "GPT-5.4"},
+		},
+	}
+	data, _ := json.Marshal(flat)
+	if err := os.MkdirAll(dataDir(), 0o700); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir(), "nug-models-providers.json"), data, 0o600); err != nil {
+		t.Fatalf("write nug cache: %v", err)
+	}
+	cache := loadProviderModelCache("nug")
+	if got := len(cache["prov-1"]); got != 1 {
+		t.Fatalf("expected 1 model for prov-1, got %d (%#v)", got, cache)
 	}
 }

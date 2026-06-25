@@ -31,7 +31,7 @@ func TestTSParityFixtureCodexNativeTools(t *testing.T) {
 }
 
 func TestTSParityFixtureAnthropicSystemCacheControl(t *testing.T) {
-	system := anthropicSystemBlocks("system instructions")
+	system := anthropicSystemBlocks("system instructions", true)
 	blocks, ok := system.([]map[string]any)
 	if !ok || len(blocks) != 1 {
 		t.Fatalf("expected Anthropic system content block fixture, got %#v", system)

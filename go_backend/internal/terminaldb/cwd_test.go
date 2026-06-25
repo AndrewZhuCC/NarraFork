@@ -65,6 +65,18 @@ func TestResolveCwdValidatesTerminalTarget(t *testing.T) {
 	}
 }
 
+// TestErrChapterDormantMessageMatchesTS pins the dormant-chapter error text to
+// the TS terminal-service.ts:238 message verbatim ("Chapter has no worktree
+// (dormant?)", capital C). terminals/handlers.go surfaces this string verbatim
+// to the user via httpx.BadRequest(err.Error()) (HTTP 400), so any casing drift
+// is a user-visible parity divergence.
+func TestErrChapterDormantMessageMatchesTS(t *testing.T) {
+	const want = "Chapter has no worktree (dormant?)"
+	if got := ErrChapterDormant.Error(); got != want {
+		t.Fatalf("ErrChapterDormant message = %q, want %q (TS terminal-service.ts:238)", got, want)
+	}
+}
+
 func newResolveCwdTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")

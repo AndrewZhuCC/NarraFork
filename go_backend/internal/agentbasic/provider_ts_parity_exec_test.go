@@ -121,7 +121,7 @@ func TestGoMatchesExecutableTSProviderFixtures(t *testing.T) {
 		t.Fatalf("NKP traceId length differs TS=%d Go=%#v", tsFixture.NkpWorkspaceStateShape.TraceIDLength, workspace)
 	}
 
-	systemBlocks, ok := anthropicSystemBlocks("system").([]map[string]any)
+	systemBlocks, ok := anthropicSystemBlocks("system", true).([]map[string]any)
 	if !ok || len(systemBlocks) != 1 {
 		t.Fatalf("unexpected Go Anthropic system blocks: %#v", systemBlocks)
 	}

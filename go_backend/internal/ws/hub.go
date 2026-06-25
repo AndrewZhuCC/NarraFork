@@ -632,12 +632,45 @@ func narratorBroadcastPayloads(narratorID string, payload any) []any {
 			"toolUseId": base["toolUseId"],
 			"toolName":  base["toolName"],
 			"status":    status,
-			"output":    base["output"],
+			"output":    truncateJSONForBroadcast(base["output"], 2000),
 		}
 		copyOptionalFields(compat, base, "durationMs", "updatedInput", "metadata", "sideCars", "parentToolUseId")
 		appendPayload(compat)
 	}
 	return items
+}
+
+// truncateJSONForBroadcast mirrors the TS truncateJson
+// (server/services/narrator-messages.ts:436-441) used for the tool_completed WS
+// broadcast (narrator-event-handler.ts:1198 truncateJson(event.output, 2000)).
+// Strings longer than maxLen UTF-16 code units (and non-string values whose
+// JSON.stringify form exceeds maxLen) are replaced with
+// {_truncated:true, preview:<first maxLen units>, fullLength:N} so the frontend
+// (isTruncatedToolOutput / preserveCompleteStreamedOutput) receives the same
+// shape and the WS frame stays bounded instead of forwarding the full (~50KB)
+// tool output. Length/slice use UTF-16 code units to match JS str.length /
+// str.slice(0, maxLen) exactly (CJK/emoji cut at the same boundary as TS).
+func truncateJSONForBroadcast(val any, maxLen int) any {
+	if val == nil {
+		return val
+	}
+	str, isString := val.(string)
+	if !isString {
+		// Mirror TS `JSON.stringify(val)` for non-string values.
+		encoded, err := json.Marshal(val)
+		if err != nil {
+			return val
+		}
+		str = string(encoded)
+	}
+	if httpx.JSStringLength(str) <= maxLen {
+		return val
+	}
+	return map[string]any{
+		"_truncated": true,
+		"preview":    httpx.JSStringSlicePrefix(str, maxLen),
+		"fullLength": httpx.JSStringLength(str),
+	}
 }
 
 func copyOptionalFields(dst, src map[string]any, fields ...string) {

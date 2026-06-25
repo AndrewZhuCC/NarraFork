@@ -298,6 +298,67 @@ func TestSearchLikeChapterSnippetMatchesTypeScriptFallback(t *testing.T) {
 	}
 }
 
+// TestSearchFTSChapterEmptyDescriptionSnippetMatchesTSFallback pins the chapter
+// FTS snippet fallback to the TS chain `row.snippet || row.description || ""`
+// (search-service.ts:194). When a chapter matches via FTS on its TITLE but has a
+// NULL/empty description, the description-column snippet() is empty and the chain
+// resolves to "" — chapters do NOT fall back to the title (only narrator/message
+// branches do). Go previously added an extra `snippet = title` fallback, so this
+// case wrongly returned snippet=<title>. The query is >=3 chars so it uses FTS,
+// not the LIKE path (which carries a SQL-level COALESCE(description,title) snippet).
+func TestSearchFTSChapterEmptyDescriptionSnippetMatchesTSFallback(t *testing.T) {
+	sqlDB := openSearchContractDB(t)
+	defer sqlDB.Close()
+	createSearchContractBaseTables(t, sqlDB)
+	createSearchContractFTS(t, sqlDB)
+	// A chapter whose title contains the query token "Zenith" with a NULL
+	// description. The FTS insert trigger indexes (title, description); matching on
+	// the title yields an empty description-column snippet.
+	if _, err := sqlDB.Exec(`INSERT INTO projects (id, name, description) VALUES ('p1', 'Alpha Project', 'demo')`); err != nil {
+		t.Fatalf("insert project: %v", err)
+	}
+	if _, err := sqlDB.Exec(`INSERT INTO chapters (id, project_id, title, description, status, role, created_at, updated_at) VALUES ('c_titleonly', 'p1', 'Zenith Chapter', NULL, 'active', 'branch', '2026-05-14T00:00:00Z', '2026-05-15T00:00:00Z')`); err != nil {
+		t.Fatalf("insert title-only chapter: %v", err)
+	}
+
+	h := NewHandler(sqlDB)
+	req := httptest.NewRequest(http.MethodGet, "/api/search?q=Zenith&entities=chapters", nil)
+	w := httptest.NewRecorder()
+	if err := h.search(w, req); err != nil {
+		t.Fatalf("search returned error: %v", err)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	// Confirm FTS mode (not the LIKE path) so we exercise the FTS snippet fallback.
+	metadata, _ := body["searchMetadata"].(map[string]any)
+	if metadata["ftsReady"] != true || metadata["shortQuery"] != false {
+		t.Fatalf("expected FTS-ready non-short-query metadata, got %#v", metadata)
+	}
+	results, _ := body["results"].([]any)
+	var titleOnly map[string]any
+	for _, raw := range results {
+		r, _ := raw.(map[string]any)
+		if r["id"] == "c_titleonly" {
+			titleOnly = r
+			break
+		}
+	}
+	if titleOnly == nil {
+		t.Fatalf("expected the title-only chapter in results, got %#v", results)
+	}
+	if titleOnly["matchField"] != "title" {
+		t.Fatalf("title-only chapter should report matchField=title, got %#v", titleOnly)
+	}
+	if snippet, ok := titleOnly["snippet"].(string); !ok || snippet != "" {
+		t.Fatalf("chapter FTS snippet with empty description must be \"\" (TS fallback), not the title, got %#v", titleOnly)
+	}
+}
+
 func TestSearchSanitizesSpecialCharactersWithoutFailing(t *testing.T) {
 	sqlDB := openSearchContractDB(t)
 	defer sqlDB.Close()

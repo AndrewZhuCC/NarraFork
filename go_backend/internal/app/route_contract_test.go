@@ -3209,6 +3209,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	})
 	assertNestedCapability(t, caps, []string{"chapters", "merge"}, map[string]any{"supported": true, "aiResolveMode": "one-shot-basic", "aiResolveUsesNarratorSession": false, "aiResolveRequiresFullNarrator": false, "aiResolveFallbackPayload": true, "aiResolveCherryPickContinuation": false, "aiResolveMultiCommitContinuation": false, "aiResolveContinuationFallbackCode": "AI_RESOLVE_CHERRY_PICK_CONFLICT_UNSUPPORTED", "inputValidationParity": true, "messageMaxChars": float64(500)})
 	assertStringSliceCapability(t, caps, []string{"chapters", "merge"}, "strategyEnum", []string{"merge", "squash", "cherry-pick"})
+	assertNestedCapability(t, caps, []string{"chapters", "merge", "aiResolveConflictPrompt"}, map[string]any{"baseMatchesTS": true, "enhancedVariantWithCommitsAndDiffStat": true, "bilingual": true, "fileListFormatMatchesTS": true, "modelOnlyResolvesBackendAutoCommits": true, "rebaseConflictPromptAlreadyAligned": true})
 	assertNestedCapability(t, caps, []string{"chapters", "merge", "dataIntegrityContract"}, map[string]any{
 		"boundaryTracked":                       true,
 		"dirtySourceRejectsInsteadOfAutoCommit": false,
@@ -3677,6 +3678,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"fsBrowser", "mkdirContract"}, map[string]any{"parentAndNameRequired": true, "folderNameValidation": true, "rejectsPathSeparators": true, "rejectsControlChars": true, "rejectsDotAndDotDot": true, "parentMustExist": true, "alreadyExistsStatus": float64(400), "singleDirectoryNotMkdirAll": true})
 	assertNestedCapability(t, caps, []string{"fsBrowser", "revealContract"}, map[string]any{"pathMustBeExistingDir": true, "darwinCommand": "open", "windowsCommand": "explorer", "unsupportedPlatformValidationError": true, "detachesProcess": true})
 	assertNestedCapability(t, caps, []string{"fsBrowser", "previewContract"}, map[string]any{"rejectsDirectory": true, "maxTextBytes": float64(1024 * 1024), "maxBinaryBytes": float64(20 * 1024 * 1024), "tooLargeStatus": float64(413), "tooLargeCode": "FS_PREVIEW_TOO_LARGE", "inlineDisposition": true, "privateCacheControl": true, "defaultTextMime": "text/plain; charset=utf-8"})
+	assertNestedCapability(t, caps, []string{"fsBrowser", "previewContract", "errorContract"}, map[string]any{"missingMessagePrefix": "File does not exist: ", "notAFileMessagePrefix": "Not a file: ", "accessMessagePrefix": "Cannot access: ", "errorCode": "VALIDATION_ERROR", "rejectsNonRegular": true, "noRawStatLeak": true})
 	assertNestedCapability(t, caps, []string{"notifications"}, map[string]any{"supported": true, "fullTSNotificationParity": false})
 	assertNestedCapability(t, caps, []string{"notifications", "webhookTest"}, map[string]any{"webhookRequired": true, "missingWebhookStatus": float64(400), "hmacSignedWhenSecretSet": true, "dingtalkMessageType": "markdown", "feishuMessageType": "interactive", "upstreamFailureStatus": float64(502), "webhookTimeoutSeconds": float64(15)})
 	assertNestedCapability(t, caps, []string{"notifications", "webhookTest", "routes"}, map[string]any{"dingtalk": "POST /api/notifications/test-dingtalk", "feishu": "POST /api/notifications/test-feishu"})
@@ -3969,13 +3971,13 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertStringSliceCapability(t, caps, []string{"narrator", "wsEvents", "unclaimedContract"}, "claimedCompactLifecycleEvents", []string{"compacting", "compact_done", "compact_failed"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "wsEvents", "unclaimedContract"}, "claimedSubagentLifecycleEvents", []string{"subagent_started", "subagent_attached", "subagent_detached", "subagent_status_changed", "subagent_todos_updated", "subagent_conclusion_updated", "subagent_warning"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "wsEvents", "unclaimedContract"}, "acceptedSubagentLifecycleDivergences", []string{"subagent_suspended"})
-	assertStringSliceCapability(t, caps, []string{"narrator", "wsEvents", "unclaimedContract"}, "claimedAdditionalFamilies", []string{"message_updated", "messages_deleted", "browser_session_count", "browser_session_lifecycle", "container_status_changed"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "wsEvents", "unclaimedContract"}, "claimedAdditionalFamilies", []string{"message_updated", "messages_deleted", "narrator_forked", "browser_session_count", "browser_session_lifecycle", "container_status_changed"})
 	assertNestedCapability(t, caps, []string{"narrator", "advancedObservabilityContract"}, map[string]any{
 		"supported":                       true,
 		"scope":                           "p1-critical-rollup",
 		"messageHistoryStructuredContent": true,
 		"messageHistoryPaginationCatchUpContract": true,
-		"messageHistoryPaginationCatchUpProof":    "TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren, TestMessagesAroundReturnsBoundedWindow, TestMessagesAfterCatchUpTracksChildAnchors, and TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata cover cursor older/newer paging, around windows, child tree/tool-call attachment, child-anchor catch-up cursors, orphanChildren, messageVersion, and TS-compatible messageUuid aliases without claiming live-session catch-up parity.",
+		"messageHistoryPaginationCatchUpProof":    "TestChunkManifestBuildsTuplesAndShortCircuits, TestChunksByRangeBoundaryFlags, TestChunksByRangeAttachesChildTree, TestMessageLocationResolvesTopLevelSeq, TestMessageLocationIgnoresDuplicateToolUseOutsideNarrator, and TestMessagesAfterCatchUpTracksChildAnchors cover chunk manifest tuples/version short-circuit, chunk-range older/newer windows with exact hasOlder/hasNewer probes, child tree/tool-call attachment, message-id to top-level seq location, and child-anchor catch-up cursors over WS without claiming live-session catch-up parity.",
 		"permissionApproveDenyFocusedContract":    true,
 		"permissionApproveDenyFocusedProof":       "TestPermissionApproveRouteMergesExitPlanUpdatedPlanAndCompactAfter, TestPermissionDenyRouteDoesNotMergeExitPlanUpdatedPlan, TestPermissionLifecycleClosestTranscriptFrontendGolden, and TestRunBasicAgentPermissionFlowStillWorksWithEventLoop cover separate approve/deny routes, updated input merge-on-approve only, pending DB state, permission_request/permission_resolved frontend frames, and event-loop resume without claiming full TS permission runtime parity.",
 		"subagentRuntimeContract":                 true,
@@ -4040,7 +4042,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"rollupOnly":                              true,
 		"messageHistoryStructuredContent":         true,
 		"messageHistoryPaginationCatchUpContract": true,
-		"messageHistoryPaginationCatchUpProof":    "TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren, TestMessagesAroundReturnsBoundedWindow, TestMessagesAfterCatchUpTracksChildAnchors, and TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata cover cursor older/newer paging, around windows, child tree/tool-call attachment, child-anchor catch-up cursors, orphanChildren, messageVersion, and TS-compatible messageUuid aliases without claiming live-session catch-up parity.",
+		"messageHistoryPaginationCatchUpProof":    "TestChunkManifestBuildsTuplesAndShortCircuits, TestChunksByRangeBoundaryFlags, TestChunksByRangeAttachesChildTree, TestMessageLocationResolvesTopLevelSeq, TestMessageLocationIgnoresDuplicateToolUseOutsideNarrator, and TestMessagesAfterCatchUpTracksChildAnchors cover chunk manifest tuples/version short-circuit, chunk-range older/newer windows with exact hasOlder/hasNewer probes, child tree/tool-call attachment, message-id to top-level seq location, and child-anchor catch-up cursors over WS without claiming live-session catch-up parity.",
 		"permissionApproveDenyFocusedContract":    true,
 		"permissionApproveDenyFocusedProof":       "TestPermissionApproveRouteMergesExitPlanUpdatedPlanAndCompactAfter, TestPermissionDenyRouteDoesNotMergeExitPlanUpdatedPlan, TestPermissionLifecycleClosestTranscriptFrontendGolden, and TestRunBasicAgentPermissionFlowStillWorksWithEventLoop cover separate approve/deny routes, updated input merge-on-approve only, pending DB state, permission_request/permission_resolved frontend frames, and event-loop resume without claiming full TS permission runtime parity.",
 		"subagentRuntimeContract":                 true,
@@ -4104,7 +4106,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"runtimeRow":                              "NARRATOR-AGENT-01",
 		"messageHistoryStructuredContent":         true,
 		"messageHistoryPaginationCatchUpContract": true,
-		"messageHistoryPaginationCatchUpProof":    "TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren, TestMessagesAroundReturnsBoundedWindow, TestMessagesAfterCatchUpTracksChildAnchors, and TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata cover cursor older/newer paging, around windows, child tree/tool-call attachment, child-anchor catch-up cursors, orphanChildren, messageVersion, and TS-compatible messageUuid aliases without claiming live-session catch-up parity.",
+		"messageHistoryPaginationCatchUpProof":    "TestChunkManifestBuildsTuplesAndShortCircuits, TestChunksByRangeBoundaryFlags, TestChunksByRangeAttachesChildTree, TestMessageLocationResolvesTopLevelSeq, TestMessageLocationIgnoresDuplicateToolUseOutsideNarrator, and TestMessagesAfterCatchUpTracksChildAnchors cover chunk manifest tuples/version short-circuit, chunk-range older/newer windows with exact hasOlder/hasNewer probes, child tree/tool-call attachment, message-id to top-level seq location, and child-anchor catch-up cursors over WS without claiming live-session catch-up parity.",
 		"permissionApproveDenyFocusedContract":    true,
 		"permissionApproveDenyFocusedProof":       "TestPermissionApproveRouteMergesExitPlanUpdatedPlanAndCompactAfter, TestPermissionDenyRouteDoesNotMergeExitPlanUpdatedPlan, TestPermissionLifecycleClosestTranscriptFrontendGolden, and TestRunBasicAgentPermissionFlowStillWorksWithEventLoop cover separate approve/deny routes, updated input merge-on-approve only, pending DB state, permission_request/permission_resolved frontend frames, and event-loop resume without claiming full TS permission runtime parity.",
 		"goalsBufferDraftFocusedContract":         true,
@@ -4174,20 +4176,17 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 		"provider-specific-active-run-reconnect-live-session-smoke",
 	})
 	assertNestedCapability(t, caps, []string{"narrator", "messageHistory"}, map[string]any{
-		"supported":                         true,
-		"catchUp":                           true,
-		"messageVersion":                    true,
-		"childOrphans":                      true,
-		"toolCalls":                         true,
-		"compactMarkers":                    true,
-		"structuredContent":                 true,
-		"cursorPaginationWindowContract":    true,
-		"afterCatchUpChildAnchorContract":   true,
-		"routeAfterCatchUpMetadataContract": true,
-		"paginationCatchUpProof":            "TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren, TestMessagesAroundReturnsBoundedWindow, TestMessagesAfterCatchUpTracksChildAnchors, and TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata cover cursor older/newer paging, around windows, child tree/tool-call attachment, child-anchor catch-up cursors, orphanChildren, messageVersion, and TS-compatible messageUuid aliases without claiming live-session catch-up parity.",
-		"fullTSCatchUpCursorParity":         false,
+		"supported":                    true,
+		"compactMarkers":               true,
+		"structuredContent":            true,
+		"chunkManifestContract":        true,
+		"chunkRangeWindowContract":     true,
+		"messageLocationContract":      true,
+		"wsCatchUpChildAnchorContract": true,
+		"chunkPaginationCatchUpProof":  "TestChunkManifestBuildsTuplesAndShortCircuits, TestChunksByRangeBoundaryFlags, TestChunksByRangeAttachesChildTree, TestMessageLocationResolvesTopLevelSeq, TestMessageLocationIgnoresDuplicateToolUseOutsideNarrator, and TestMessagesAfterCatchUpTracksChildAnchors cover chunk manifest tuples/version short-circuit, chunk-range older/newer windows with exact hasOlder/hasNewer probes, child tree/tool-call attachment, message-id to top-level seq location, and child-anchor catch-up cursors over WS without claiming live-session catch-up parity.",
+		"fullTSCatchUpCursorParity":    false,
 	})
-	assertNestedCapability(t, caps, []string{"narrator", "messages"}, map[string]any{"supported": true, "route": "POST /api/narrators/{id}/messages", "readRoute": "GET /api/narrators/{id}/messages", "structuredSendErrors": true, "statusCreated": float64(201), "busyBufferStatus": float64(202), "fullTSMessageSendParity": false})
+	assertNestedCapability(t, caps, []string{"narrator", "messages"}, map[string]any{"supported": true, "route": "POST /api/narrators/{id}/messages", "readRoute": "GET /api/narrators/{id}/chunks", "chunkManifestRoute": "GET /api/narrators/{id}/chunk-manifest", "messageLocationRoute": "GET /api/narrators/{id}/message-location/{messageId}", "structuredSendErrors": true, "statusCreated": float64(201), "busyBufferStatus": float64(202), "fullTSMessageSendParity": false})
 	assertNestedCapability(t, caps, []string{"narrator", "messages", "busyBuffer"}, map[string]any{"supported": true, "activeRunDetection": true, "priority": true})
 	assertStringSliceCapability(t, caps, []string{"narrator", "messages", "busyBuffer"}, "acceptedStatuses", []string{"working", "waiting"})
 	assertNestedCapability(t, caps, []string{"narrator", "messages", "busyBuffer", "response"}, map[string]any{"ok": true, "queued": true, "buffered": true, "fallback": false, "id": true, "bufferedAt": true})
@@ -4292,11 +4291,38 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	})
 	assertStringSliceCapability(t, caps, []string{"narrator", "drafts"}, "responseKeys", []string{"hasDraft", "text", "updatedAt", "updatedBy", "sourceId"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "drafts"}, "sampledProofs", []string{"draft-put-get-clear-broadcast-contract", "dir-cmd-rule-draft-zod-bounds"})
-	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime"}, map[string]any{"supported": true, "beforeTurnReplacement": true, "runtimeSettingsOverride": true, "providerPrefixSwitch": true, "defaultModelReResolve": true, "unsupportedProviderFailFast": true, "legacyProviderFallbackOptIn": "agent.allowGoProviderFallback", "modelSwitchedEvent": true, "turnNudgeEnabled": true, "turnNudgeThresholdPercent": float64(80), "firstTokenTimeoutRetry": true, "firstTokenTimeoutRetryUngatedByStateful": true, "mimoEllipsisReasoningRetry": true, "emptyAfterTransientErrorContinuation": true, "invalidStateRetryGuardsYieldedToolResults": true, "paymentRequiredResumeActionParity": true, "anthropicStreamingUsageAccumulation": true, "contextWindowResolution": true, "anthropicOpenAIContextPercentComputed": true, "anthropicPromptFootprintTokens": true, "proactiveAutoCompactThresholds": false, "emptyResponseMessageParity": true, "fullSessionMiddlewareParity": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime"}, map[string]any{"supported": true, "beforeTurnReplacement": true, "runtimeSettingsOverride": true, "providerPrefixSwitch": true, "defaultModelReResolve": true, "unsupportedProviderFailFast": true, "legacyProviderFallbackOptIn": "agent.allowGoProviderFallback", "modelSwitchedEvent": true, "turnNudgeEnabled": true, "turnNudgeThresholdPercent": float64(80), "firstTokenTimeoutRetry": true, "firstTokenTimeoutRetryUngatedByStateful": true, "mimoEllipsisReasoningRetry": true, "emptyAfterTransientErrorContinuation": true, "invalidStateRetryGuardsYieldedToolResults": true, "paymentRequiredResumeActionParity": true, "anthropicStreamingUsageAccumulation": true, "contextWindowResolution": true, "anthropicOpenAIContextPercentComputed": true, "anthropicPromptFootprintTokens": true, "kiroPromptFootprintTokens": true, "anthropicOfficial1mContextUplift": true, "openaiResponsesEncryptedReasoningCapture": true, "proactiveAutoCompactThresholds": false, "emptyResponseMessageParity": true, "fullSessionMiddlewareParity": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "readToolOffsetLimitRounding"}, map[string]any{"matchesTS": true, "jsMathRoundSemantics": true, "appliesToReadOnly": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "readToolImageOutput"}, map[string]any{"detectsImageExtensions": true, "honestPlaceholderText": true, "tooLargeGuardBytes": float64(5242880), "multimodalImageBlocksToProvider": false, "formatFromExtensionNotMagicBytes": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "legacyEncodingSupport"}, map[string]any{"detectsCharset": true, "confidenceThreshold": float64(70), "appliesToReadWriteEdit": true, "appliesToGrep": true, "preservesExistingEncodingOnWrite": true, "detector": "saintfish-chardet-icu", "detectorExactParity": false, "streamingPathUtf8Only": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "bashToolTimeout"}, map[string]any{"defaultTimeoutMs": float64(120000), "matchesTSDefault": true, "minTimeoutMs": float64(1000), "maxTimeoutMs": float64(600000), "backgroundTimeoutMs": float64(1800000), "bashMaxTimeoutDivergesFromTS": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "bashFreshShellEnv"}, map[string]any{"supported": true, "minimalEnvInFreshMode": true, "loginShellInFreshMode": true, "nonLoginShellByDefault": true, "appliesToToolBashSlashCommandAndBackground": true, "shellPathDetection": false, "windowsPowershellShellDetection": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "searchSubagentBuiltinType"}, map[string]any{"recognizedAsBuiltin": true, "searchModelPool": true, "searchModelPreference": true, "inheritsParentPermission": true, "nativeWebSearchRoutingParity": false, "searchPromptSpecialization": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "builtinSubagentPrompts"}, map[string]any{"bilingual": true, "tsAligned": true, "shellTokenFixedBash": true, "exploreplanConclusionFileAdaptedToFinalReply": true, "tsConclusionFileRedirect": false, "reviewNotTSBuiltinKeepsGoOneLiner": true})
+	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime", "builtinSubagentPrompts"}, "types", []string{"explore", "plan", "general", "search"})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "chatCompletionsNoTemperatureOverride"}, map[string]any{"omitsTemperature": true, "appliesToStreamingAndNonStreaming": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "openaiResponsesNonCodexReasoningEffort"}, map[string]any{"sendsReasoningEffortForNonCodexResponses": true, "summaryAndIncludeRemainCodexOnly": true, "clampsXhighMaxToHigh": true, "noReasoningForNonReasoningModelsOrNone": true, "tsParity": false, "intentionalGoEnhancement": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "anthropicGenerateReusesAgentLoop"}, map[string]any{"dedicatedLightweightGeneratePath": false, "generateUsesStreamingAgentLoop": true, "generateMaxTokens": float64(32000), "tsGenerateMaxTokens": float64(4096), "generateUsesReadonlyTools": true, "tsParity": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "kiroRequestShellName"}, map[string]any{"derivedFromShellEnv": true, "fallback": "bash", "appliesToKiroNkpNugKiro": true, "emptyBasenameFallsBackToBash": true, "tsEmptyBasenameDivergence": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "anthropicOutputConfigEffort"}, map[string]any{"outputConfigForEffortModels": true, "outputConfigForDeepSeek": true, "effortDefaultsMedium": true, "temperatureWhenThinkingDisabled": true, "effortBetaFlagsWhenSupported": true, "officialFullClaudeCodeBetaSpoof": false})
+	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime", "anthropicOutputConfigEffort"}, "effortCapableModels", []string{"opus-4.6", "sonnet-4.6"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime", "searchSubagentBuiltinType"}, "searchToolSet", []string{"WebFetch", "TaskCreate", "TeamStatus", "Await", "Send"})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "anthropicCacheBreakpoints"}, map[string]any{"systemBlockGatedOnOfficial": true, "toolAndMessagePrefixBreakpoints": true, "proxyModeNoCacheControl": true, "anthropicOfficialThreeBlockSystemSpoof": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "anthropicThinkingBlockRelay"}, map[string]any{"relayTextDeltaToReasoning": true, "relayReasoningContentDelta": true, "initialThinkingOnBlockStart": true, "reasoningBlockIndexMetadata": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "kiroLeakedXmlToolCalls"}, map[string]any{"extractsInvokeBlocksFromContent": true, "gatedOnToolsPresent": true, "stripsMalformedMarkers": true, "decodesXmlEntities": true, "coercesScalarParams": true, "dedupsAgainstNativeToolUses": true, "appliesToNkp": true, "xmlToolUseIdPrefix": "kiro_xml_"})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "codexFastModeServiceTier"}, map[string]any{"fastModeMapsToPriorityServiceTier": true, "gatedToCodexBody": true, "coversKindCodexAndApiModeCodex": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "codexDefaultInstructions"}, map[string]any{"textMatchesTS": true, "text": "You are NarraFork Narrator. Follow the user's request and answer concisely.", "gatedToCodexBody": true, "appliesToHTTPResponsesAndWebSocket": true, "systemMessageOverridesDefault": true})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "codexWebSocketHandshake"}, map[string]any{"userAgent": true, "originHeader": true, "sessionAndClientRequestIdHeaders": true, "chatGptAccountIdGatedToOfficialDomain": true, "chatGptAccountIdGatedOnSSEPathToo": true, "turnStateMetadataHeaders": false, "userAgentExactTSMatch": false})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "clineRequestHeaders"}, map[string]any{"fullClineExtensionHeaderSet": true, "clineVersion": "3.74.0", "platformVersionFromGoRuntime": true})
+	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime", "clineRequestHeaders"}, "headers", []string{"User-Agent", "X-PLATFORM", "X-PLATFORM-VERSION", "X-CLIENT-TYPE", "X-CLIENT-VERSION", "X-CORE-VERSION", "HTTP-Referer", "X-Title"})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "nugRequestHeaders"}, map[string]any{"modelHashHeaderAllChannels": true, "conversationIdHeaderKiroChannelOnly": true, "kiroEffortHeaderAlreadySentByKiroPath": true, "unknownModelHashFallback": "none"})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "providerErrorDisplayExtraction"}, map[string]any{"extractsErrorMessageForDisplay": true, "preservesStatusPrefix": true, "matchingUsesRawBodyUnchanged": true, "displayTruncateChars": float64(1000)})
+	assertNestedCapability(t, caps, []string{"narrator", "agentRuntime", "chatCompletionsReasoningContent"}, map[string]any{"streamCapture": true, "storedHistoryReasoningReplay": true, "deepSeekEmptyPatch": true, "liveTurnReasoningReplay": false})
 	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime"}, "emptyResponseDetectionMeaningfulEvents", []string{"text", "tool_use", "tool_use_chunk", "reasoning", "web_search", "image_generation", "nkp_queue", "queue_status"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime"}, "retryableInvalidStateReasons", []string{"server_error", "internal_error", "internal_server_error", "service_unavailable", "temporarily_unavailable", "stream_closed_before_response_completed", "stream_read_error"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "agentRuntime"}, "retryableReasonMarkers", []string{"model_temporarily_unavailable", "codewhisperer#internalserverexception"})
 	assertNestedCapability(t, caps, []string{"narrator", "agentFinalization"}, map[string]any{"supported": true, "assistantTranscriptPreservedOnStatusFailure": true, "toolUseTranscriptPreservedOnToolResultFailure": true, "errorBroadcast": "narrator_error", "statusFallback": "idle-error-when-possible", "completionLimitGracefulTruncation": true, "statelessInLoopRetryParity": true, "statefulOuterRetryWithRebuiltHistory": false, "bypassRetryLimitHonored": false, "codexQuotaFailoverRebuildSignal": "loop-emits-retryable-error-with-code; session-finalizes-as-error-without-rerun", "fullTSFailureParity": false})
-	assertNestedCapability(t, caps, []string{"narrator", "messageHistory"}, map[string]any{"supported": true, "catchUp": true, "childOrphans": true, "toolCalls": true, "compactMarkers": true})
+	assertNestedCapability(t, caps, []string{"narrator", "messageHistory"}, map[string]any{"supported": true, "chunkManifestContract": true, "chunkRangeWindowContract": true, "messageLocationContract": true, "wsCatchUpChildAnchorContract": true, "compactMarkers": true})
 	assertNestedCapability(t, caps, []string{"narrator", "fieldUpdates"}, map[string]any{"supported": true, "inputValidationParity": true, "titleBounds": "1..200", "modelDefaultSentinel": "__default__", "modelBounds": "1..200", "cwdBounds": "1..4096", "draftTextMaxChars": float64(100000), "draftSourceIdBounds": "1..120", "dirPathBounds": "1..4096", "cmdPatternBounds": "1..200", "denyPromptMaxChars": float64(2000), "forkMessageUuidRequired": true, "forkMessagesCountBounds": "1..500", "segmentCompactSummaryBounds": "1..100000", "compactSummaryRequiresNonEmpty": true, "batchDeleteBlocksCountBounds": "1..200", "bufferedMessageTextBounds": "1..100000", "reorderOrderedIdsMinItems": float64(1), "suggestQuestionsMinItems": float64(1), "segmentCompactMessageIdsMaxItems": float64(500), "permissionDecisionRouteMode": "separate-approve-deny-routes", "codexTierOrderMaxItems": float64(6)})
 	assertStringSliceCapability(t, caps, []string{"narrator", "fieldUpdates"}, "accessLevelEnum", []string{"readOnly", "readWrite", "full"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "fieldUpdates"}, "denyLevelEnum", []string{"denyWrite", "denyAll"})
@@ -4379,10 +4405,14 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "recall"}, map[string]any{"supported": true, "readOnly": true, "scope": "self", "crossNarrator": false, "searchMode": "bounded-like", "maxSearchLimit": float64(50), "maxReadLimit": float64(50), "maxBatchQueries": float64(10), "maxToolCallOutputChars": float64(4000)})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory"}, map[string]any{"capabilityContract": true})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "read"}, map[string]any{"supported": true, "parity": "partial", "schemaCompatible": true, "runtimeCompatible": "partial", "fallbackBehavior": "explicit_error", "frontendRendering": "text_or_directory_listing", "textFiles": true, "directories": true, "offsetLimit": true, "pdfPages": false, "pagesSchemaOnly": true, "imageContent": false})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "edit"}, map[string]any{"supported": true, "parity": "full", "cascadingReplacers": true, "whitespaceNormalizedSingleLinePartial": true, "crlfNormalized": true})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "bash"}, map[string]any{"supported": true, "parity": "partial", "outputTruncation": "tail", "outputMaxBytes": float64(50 * 1024), "outputMaxLines": float64(2000), "fullOutputPersistedToFile": false})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "terminal"}, map[string]any{"supported": true, "parity": "partial", "outputTruncation": "tail", "incrementalTailLines": float64(200), "incrementalTailChars": float64(40000), "maxLengthParam": false})
-	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "grep"}, map[string]any{"supported": true, "parity": "partial", "headLimitDefault": float64(200), "headLimitMax": float64(10000), "truncationSuffix": true, "exactRemainingCount": false})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "grep"}, map[string]any{"supported": true, "parity": "partial", "headLimitDefault": float64(200), "headLimitMax": float64(10000), "truncationSuffix": true, "exactRemainingCount": false, "braceExpansion": true})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "glob"}, map[string]any{"supported": true, "parity": "partial", "braceExpansion": true, "braceExpansionScope": "comma-lists-and-nesting-not-ranges", "maxBraceExpansions": float64(64)})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "webFetch"}, map[string]any{"supported": true, "parity": "partial", "schemaCompatible": true, "runtimeCompatible": "partial", "fallbackBehavior": "explicit_error/raw_text", "frontendRendering": "raw_text", "mode": "readability+raw+dom-http", "defaultMode": "readability", "domMode": "http-fetch-no-browser", "domRequiresChrome": false, "policy": "permission-policy-and-proxy-consumed", "rawRequiresChrome": false, "screenshotRequiresChrome": true, "smartRequiresProvider": true, "readabilityImplemented": true, "readabilityMode": "heuristic", "smartImplemented": false, "screenshotImplemented": false})
+	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "webFetch", "urlValidation"}, map[string]any{"sharedUpfrontValidator": true, "invalidUrlEchoesInput": true, "relativeUrlRejected": true, "unsupportedProtocolGuidance": "Use the Read tool for local files", "matchesTS": true})
+	assertStringSliceCapability(t, caps, []string{"narrator", "toolInventory", "webFetch", "urlValidation"}, "allowedSchemes", []string{"http", "https", "data"})
 	assertNestedCapability(t, caps, []string{"narrator", "toolInventory", "browser"}, map[string]any{"supported": true, "parity": "partial", "schemaCompatible": true, "runtimeCompatible": "partial", "fallbackBehavior": "file_or_base64_artifact", "frontendRendering": "file_or_base64_artifact", "runtime": "go-rod", "screenshotPreviewMode": "inline-base64-or-file-artifact", "sharePreview": false, "imageContentBlock": false, "fileOutput": true, "traceFormat": "chrome-devtools-json", "traceShare": true, "traceFileOutput": true, "traceShareUrl": "/api/shares/{shareId}"})
 	assertNestedCapability(t, caps, []string{"narrator", "planMode"}, map[string]any{"supported": true, "api": true, "toolReflection": true, "previousModeRestore": true})
 	assertNestedCapability(t, caps, []string{"narrator", "planMode", "exitPlanApproval"}, map[string]any{
@@ -4398,24 +4428,213 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertStringSliceCapability(t, caps, []string{"narrator", "planMode", "exitPlanApproval"}, "continueModeMetadata", []string{"continue", "compact"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "planMode", "exitPlanApproval"}, "tsPlanReflectionEvents", []string{"plan_reflection_started", "plan_reflection_resolved", "plan_reflection_stopped"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "planMode", "exitPlanApproval"}, "goApprovalEventFamily", []string{"permission_request", "permission_resolved"})
+	assertNestedCapability(t, caps, []string{"narrator", "planMode", "systemReminder"}, map[string]any{
+		"format":               "<system-reminder>-block",
+		"matchesTS":            true,
+		"bilingual":            true,
+		"allowInlineBranching": true,
+		"planFileExceptionMatchesRuntimeRedirect": true,
+		"shellTokenFixedBash":                     true,
+		"appendedRawNotAsMarkdownSection":         true,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "planMode", "reflectionPrompt"}, map[string]any{
+		"matchesTS":                     true,
+		"bilingual":                     true,
+		"referencesConversationHistory": false,
+		"autoCompactSuffixPorted":       false,
+		"requestIdMatchesWSEvent":       true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "planMode", "reflectionPrompt"}, "placeholdersSubstituted", []string{"requestId", "inputJson", "planText", "allowedPromptsList"})
+	assertNestedCapability(t, caps, []string{"narrator", "planMode", "continuePromptI18n"}, map[string]any{
+		"matchesTS":          true,
+		"bilingual":          true,
+		"localeFromOwner":    true,
+		"diffEmbedded":       true,
+		"compactIgnoresDiff": true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "planMode", "continuePromptI18n"}, "keys", []string{"exitPlanModeApproved", "exitPlanModeApprovedWithDiff", "planCompactContinue"})
+	assertNestedCapability(t, caps, []string{"narrator", "goalReflection"}, map[string]any{
+		"matchesTS":                         true,
+		"bilingual":                         true,
+		"requestIdMatchesWSEvent":           true,
+		"activeGoalFullJson":                true,
+		"includesOpenGoalList":              true,
+		"inlinedHistoryContext":             true,
+		"historylessLoopInlineCompensation": true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "goalReflection"}, "placeholdersSubstituted", []string{"requestId", "inputJson", "activeGoalJson", "goalsJson"})
+	assertNestedCapability(t, caps, []string{"narrator", "sidecarReminderI18n"}, map[string]any{
+		"relaxedPlanToolReminderBilingual":  true,
+		"todoReminderBilingual":             true,
+		"localeFromOwner":                   true,
+		"loopLevelRemindersBilingual":       true,
+		"loopLevelRemindersLocaleViaOption": true,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "continueRouteI18n"}, map[string]any{
+		"userContinueMessageBilingual": true,
+		"localeFromRequestingUser":     true,
+		"interruptionContinueAligned":  false,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "interruptedByUserToolOutput"}, map[string]any{
+		"matchesTS":                    true,
+		"modelOutputDistinctFromError": true,
+		"localeFromOwner":              true,
+		"modelOutputEn":                "The user interrupted this tool call before it could execute.",
+		"modelOutputZh":                "用户在此工具调用执行前中断了会话。",
+		"internalErrorMessage":         "Narrator interrupted by user",
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "serverRestartToolOutput"}, map[string]any{
+		"matchesTS":                    true,
+		"modelOutputDistinctFromError": true,
+		"localeDefaultEnglish":         true,
+		"modelOutput":                  "Tool execution was interrupted by a server restart.",
+		"internalErrorMessage":         "Interrupted by server restart",
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "exitPlanContinueI18n"}, map[string]any{
+		"exitPlanModeApprovedBilingual":         true,
+		"exitPlanModeApprovedWithDiffBilingual": true,
+		"planCompactContinueBilingual":          true,
+		"localeFromOwner":                       true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "exitPlanContinueI18n"}, "keysCovered", []string{"exitPlanModeApproved", "exitPlanModeApprovedWithDiff", "planCompactContinue"})
+	assertNestedCapability(t, caps, []string{"narrator", "todoWriteOutputI18n"}, map[string]any{
+		"headerBilingual": true,
+		"localeFromOwner": true,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "planModeFileRedirectedI18n"}, map[string]any{
+		"noticeBilingual": true,
+		"localeFromOwner": true,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "askQuestionReflectionI18n"}, map[string]any{
+		"suggestAnswerSystemBilingual":            true,
+		"questionReflectionSystemBilingual":       true,
+		"suggestLocaleFromRequestingUser":         true,
+		"reflectionLocaleFromOwner":               true,
+		"suggestFullConversationContextTextFixed": true,
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "completionLimitContinuation"}, map[string]any{
+		"supported":                            true,
+		"autoContinueOnOutputTruncated":        true,
+		"maxInterruptionRetries":               float64(3),
+		"interruptionContinueMessageBilingual": true,
+		"localeFromOwner":                      true,
+		"replayBranchImplemented":              false,
+	})
 	assertNestedCapability(t, caps, []string{"narrator", "dangerReflectionClassification"}, map[string]any{
-		"supported":              true,
-		"bashUncertainSeverity":  "medium",
-		"bashDangerousSeverity":  "high",
-		"severityBehaviorParity": true,
-		"summaryTextParity":      false,
-		"emitsStartedEvent":      true,
-		"emitsResolvedEvent":     true,
-		"interactiveStopEvent":   false,
-		"stopReflectionRoute":    "POST /api/narrators/permissions/{requestId}/stop-reflection",
-		"stopReflectionEmits":    "danger_reflection_resolved(decision=aborted)",
-		"stopReflectionTSEmits":  "danger_reflection_stopped",
-		"stopReflectionParity":   "frontend-compatible: the danger_reflection_resolved handler accepts decision allow/deny/aborted, so Go's aborted-resolved on stop matches the synchronous model without a separate stopped transition",
+		"supported":                    true,
+		"bashUncertainSeverity":        "medium",
+		"bashDangerousSeverity":        "high",
+		"severityBehaviorParity":       true,
+		"summaryTextParity":            false,
+		"structuredDangerFieldsParity": true,
+		"emitsStartedEvent":            true,
+		"emitsResolvedEvent":           true,
+		"interactiveStopEvent":         false,
+		"stopReflectionRoute":          "POST /api/narrators/permissions/{requestId}/stop-reflection",
+		"stopReflectionEmits":          "danger_reflection_resolved(decision=aborted)",
+		"stopReflectionTSEmits":        "danger_reflection_stopped",
+		"stopReflectionParity":         "frontend-compatible: the danger_reflection_resolved handler accepts decision allow/deny/aborted, so Go's aborted-resolved on stop matches the synchronous model without a separate stopped transition",
 	})
 	assertStringSliceCapability(t, caps, []string{"narrator", "dangerReflectionClassification"}, "wsEvents", []string{"danger_reflection_started", "danger_reflection_resolved"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "dangerReflectionClassification"}, "resolvedDecisions", []string{"allow", "deny", "error", "aborted"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "dangerReflectionClassification"}, "severityTiers", []string{"low", "medium", "high", "critical"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "dangerReflectionClassification"}, "levelEnum", []string{"off", "light", "standard", "strict"})
+	assertNestedCapability(t, caps, []string{"narrator", "dangerReflectionPrompt"}, map[string]any{
+		"matchesTS":                         true,
+		"bilingual":                         true,
+		"structuredFieldsPopulated":         true,
+		"severityLineRendered":              true,
+		"levelLabelRendered":                true,
+		"levelGuidanceRendered":             true,
+		"detailsSectionOptional":            true,
+		"consequencesAlternatives":          true,
+		"fallbackTagSupported":              true,
+		"fallbackTagName":                   "DangerDecision",
+		"inlinedHistoryContext":             true,
+		"historylessLoopInlineCompensation": true,
+		"localeFromOwner":                   true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "dangerReflectionPrompt"}, "placeholdersSubstituted", []string{"requestId", "toolName", "inputJson", "severity", "reflectionLevel", "levelGuidance", "summary", "detailsSection", "consequencesList", "alternativesList"})
+	assertNestedCapability(t, caps, []string{"narrator", "bashCatastrophicHardDeny"}, map[string]any{
+		"supported":                            true,
+		"deniesBeforePermissionMode":           true,
+		"parserStrategy":                       "go-token-split",
+		"tsParserStrategy":                     "ts-tree-sitter-wasm-ast",
+		"forkBombDetectionSuperset":            true,
+		"terminatesLoopAsFatal":                true,
+		"fatalMessageFormat":                   "FATAL: <reason>. Narrator terminated for safety.",
+		"fatalEmitsErrorEventAfterToolResults": true,
+		"fatalToolStatus":                      "denied",
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashCatastrophicHardDeny"}, "commandFamilies", []string{"forkBomb", "rmRecursiveCriticalPath", "rmNonRecursiveRoot", "ddWriteBlockDeviceOrCriticalPath", "mkfsFilesystemFormat", "systemPowerControl", "redirectToBlockDevice", "recursiveChmodChownChgrpCriticalPath"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashCatastrophicHardDeny"}, "powerControlCommands", []string{"shutdown", "reboot", "halt", "poweroff"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashCatastrophicHardDeny"}, "blockDevicePrefixes", []string{"/dev/sd", "/dev/hd", "/dev/nvme", "/dev/vd", "/dev/xvd", "/dev/mmcblk", "/dev/loop"})
+	assertNestedCapability(t, caps, []string{"narrator", "bashEnvInjectionDetection"}, map[string]any{
+		"supported":                    true,
+		"blocksWhitelistAutoAllow":     true,
+		"prefixAssignmentOnly":         true,
+		"parserStrategy":               "go-token-split",
+		"tsParserStrategy":             "ts-tree-sitter-variable-assignment",
+		"bypassPermissionsStillAllows": true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashEnvInjectionDetection"}, "dangerousEnvVars", []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH", "PYTHONPATH", "NODE_OPTIONS", "NODE_PATH", "PERL5LIB", "RUBYLIB", "CLASSPATH", "BASH_ENV", "ENV", "PROMPT_COMMAND"})
+	assertNestedCapability(t, caps, []string{"narrator", "chapterGitBranchGate"}, map[string]any{
+		"supported":                    true,
+		"gatedOnChapterBinding":        true,
+		"blocksWhitelistAutoAllow":     true,
+		"literalSecondTokenSubcommand": true,
+		"mergesViolationsAndWarnings":  true,
+		"parserStrategy":               "go-token-split",
+		"tsParserStrategy":             "ts-tree-sitter-ast",
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "chapterGitBranchGate", "decisions"}, map[string]any{
+		"bypassPermissions": "allow",
+		"dontAsk":           "deny",
+		"readOnly":          "deny",
+		"default":           "ask",
+		"acceptEdits":       "ask",
+	})
+	assertNestedCapability(t, caps, []string{"narrator", "bashDangerousExecutionGate"}, map[string]any{
+		"supported":                    true,
+		"blocksPathWhitelistAutoAllow": true,
+		"commandWhitelistUnaffected":   true,
+		"pipeToShellLastSegmentOnly":   true,
+		"parserStrategy":               "go-token-split",
+		"tsParserStrategy":             "ts-tree-sitter-ast",
+		"subsetOfTSNonWhitelisted":     true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashDangerousExecutionGate"}, "patterns", []string{"pathExecution", "pipeToShell"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashDangerousExecutionGate"}, "pipeToShellInterpreters", []string{"bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "python", "python3", "node", "perl", "ruby"})
+	assertNestedCapability(t, caps, []string{"narrator", "bashAlwaysAskCommandGate"}, map[string]any{
+		"supported":                         true,
+		"blocksPathWhitelistAutoAllow":      true,
+		"commandWhitelistUnaffected":        true,
+		"commandCount":                      float64(72),
+		"precedesConditionalClassification": true,
+		"parserStrategy":                    "go-token-split",
+		"tsParserStrategy":                  "ts-tree-sitter-ast",
+		"subsetOfTSNonWhitelisted":          true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashAlwaysAskCommandGate"}, "categories", []string{"delete", "privilege", "perms", "process", "disk", "systemControl", "firewall", "codeExec", "shellNesting", "indirectExec", "remote", "container", "interpreters", "runtimeBuildTools", "sourceDot", "alias", "cron"})
+	assertNestedCapability(t, caps, []string{"narrator", "bashConditionalDangerGate"}, map[string]any{
+		"supported":                                 true,
+		"blocksPathWhitelistAutoAllow":              true,
+		"commandWhitelistUnaffected":                true,
+		"awkGawkPerStatementApprox":                 true,
+		"recursiveDetectorsCovered":                 true,
+		"recursiveDepthLimit":                       float64(5),
+		"safeCommandCount":                          float64(80),
+		"conditionalCommandCount":                   float64(33),
+		"awkGawkRecursiveTokenApprox":               true,
+		"packageRunnerHasWriteOperationLevelNuance": false,
+		"parserStrategy":                            "go-token-split",
+		"tsParserStrategy":                          "ts-tree-sitter-ast",
+		"subsetOfTSConditional":                     true,
+	})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashConditionalDangerGate"}, "coveredCommands", []string{"git", "npm", "bun", "yarn", "pnpm", "sed", "tar", "tee", "awk", "gawk", "npx", "bunx", "find", "xargs"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashConditionalDangerGate"}, "deferredRecursiveAndPackageRunner", []string{})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashConditionalDangerGate"}, "packageRunnerAllowlist", []string{"tsc", "tsgo", "typescript", "@typescript/native-preview", "biome", "@biomejs/biome", "prettier", "eslint"})
+	assertStringSliceCapability(t, caps, []string{"narrator", "bashConditionalDangerGate"}, "packageRunnerDangerChecks", []string{"dangerousFlags", "remoteSource", "unstableTag", "packageNotInAllowlist", "dynamicCodeLoadingFlag", "unsafeArg"})
 	assertNestedCapability(t, caps, []string{"narrator", "compact"}, map[string]any{"supported": true, "markers": true, "segmentCompact": true, "contextClear": true, "fallbackSummary": true, "fallbackReason": "TS-equivalent model-generated compaction is not implemented in go_backend; summaries are caller-provided or deterministic from refs.", "mode": "deterministic-fallback-or-caller-summary", "contextOverflowRecoveryFocusedSmoke": true, "contextOverflowRecoveryFocusedProof": "TestContextOverflowInvalidStateCompactsAndSchedulesRetry covers overflow invalid_state compact/retry scheduling, compact lifecycle broadcasts, context_summary persistence, and rebuilt compact-summary history without claiming full TS compact recovery parity.", "fullTSCompactRecoveryParity": false})
 	assertNestedCapability(t, caps, []string{"narrator", "compact", "routes"}, map[string]any{"compact": true, "segmentCompact": true, "segmentSummary": true, "segmentMessages": true, "updateSummary": true, "deleteCompact": true, "deleteSegment": true, "clearContext": true, "legacyPatchUpdate": true})
 	assertNestedCapability(t, caps, []string{"narrator", "compact", "mutationContract"}, map[string]any{"markerMessages": true, "setsIsCompact": true, "segmentHidesRefs": true, "clearsConversationState": true, "clearsPruneState": true, "transactionalSummaryUpdate": true, "modelGeneratedSummaries": false})
@@ -4490,6 +4709,8 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertStringSliceCapability(t, caps, []string{"narrator", "subagents", "awaitContract"}, "supportedTypes", []string{"agent", "bash"})
 	assertNestedCapability(t, caps, []string{"narrator", "subagents", "teamStatusContract"}, map[string]any{"unsupportedActionFallback": true, "reasonErrorMessage": true, "fileChangesLimit": float64(1000), "missingTargetCode": "TEAM_FILE_CHANGES_TARGET_NOT_FOUND", "targetIDRequiredCode": "TEAM_TARGET_ID_REQUIRED"})
 	assertStringSliceCapability(t, caps, []string{"narrator", "subagents", "teamStatusContract"}, "actions", []string{"list", "file_changes", "broadcast", "send"})
+	assertNestedCapability(t, caps, []string{"narrator", "toolLocaleResolution"}, map[string]any{"source": "earliest-top-level-user-message-created-by", "narratorsTableHasNoCreatedByColumn": true, "affectsSubagentPromptLocaleAndPlanModeMessages": true, "defaultsToEn": true})
+	assertNestedCapability(t, caps, []string{"narrator", "replyLanguageInstruction"}, map[string]any{"injectedSection": "## Language", "condition": "replyInUserLanguage || locale != en", "replyInUserLanguageDefaultsTrue": true, "bilingual": true, "ownerResolvedFromEarliestUserMessage": true})
 	assertNestedCapability(t, caps, []string{"narrator", "subagents", "detachAttachContract"}, map[string]any{"detachUnblocksParent": true, "attachParentBlocking": true, "attachStaleRecovery": true, "reattachBlocksParent": false, "reattachFallback": true})
 	assertStringSliceCapability(t, caps, []string{"narrator", "subagents", "detachAttachContract"}, "detachBroadcasts", []string{"subagent_detached", "background_task_started"})
 	assertNestedCapability(t, caps, []string{"narrator", "subagents", "updateConclusionContract"}, map[string]any{"parentToolCallUpdate": true, "manualOverrideCleared": true, "fallback": true, "reasonErrorMessage": true})
@@ -4864,6 +5085,7 @@ func TestPhase0HealthCapabilitiesExposeKnownGoFallbacks(t *testing.T) {
 	assertNestedCapability(t, caps, []string{"content", "learning", "searchContract"}, map[string]any{"queryParam": "q", "emptyQueryReturnsAll": true, "caseInsensitive": true, "matchesIdCategoryTitleSummaryTags": true, "responseField": "results"})
 	assertNestedCapability(t, caps, []string{"content", "learning", "docContract"}, map[string]any{"missingStatus": float64(404), "localizedBody": true})
 	assertStringSliceCapability(t, caps, []string{"content", "learning", "docContract"}, "detailFields", []string{"id", "category", "tags", "title", "summary", "sections", "workflow", "bestPractices", "pitfalls", "agentHints", "actions"})
+	assertNestedCapability(t, caps, []string{"content", "learning", "docContract", "detailContentParity"}, map[string]any{"summaryAndTagsPerDoc": true, "sectionsPerDocUnique": false, "workflowPerDocUnique": false, "bestPracticesPerDocUnique": false, "pitfallsPerDocUnique": false, "agentHintsPerDocUnique": false, "actionsPerDocUnique": false, "detailBodyContentMatchesTS": false})
 	// content-domain feature pointers to the authoritative top-level blocks.
 	assertNestedCapability(t, caps, []string{"content", "hooks"}, map[string]any{"supported": true, "detailsAt": "capabilities.hooks"})
 	assertNestedCapability(t, caps, []string{"content", "workspaces"}, map[string]any{"supported": true, "detailsAt": "capabilities.workspaces"})

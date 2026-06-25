@@ -303,3 +303,56 @@ func TestBrowseErrorMessagesMatchTS(t *testing.T) {
 		t.Fatalf("file path should report 'Not a directory', got %d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestPreviewErrorMessagesMatchTS pins the /api/fs/preview error contract to TS
+// (server/routes/fs.ts). A missing path returns "File does not exist: <abs>", a
+// directory returns "Not a file: <abs>", both as VALIDATION_ERROR. Go previously
+// returned the raw os.Stat error string (leaking the absolute path and the
+// OS-specific "no such file or directory" wording under the BAD_REQUEST code)
+// for missing paths and the generic "path is a directory" for directories.
+func TestPreviewErrorMessagesMatchTS(t *testing.T) {
+	settings := loadFSTestSettings(t)
+	dir := t.TempDir()
+
+	// Missing path -> clean "File does not exist", VALIDATION_ERROR, and no raw
+	// OS error leak.
+	missing := filepath.Join(dir, "does-not-exist.txt")
+	rec := serveFSRaw(t, settings, http.MethodGet, "/fs/preview?path="+missing, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing preview path should be 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var missingBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &missingBody); err != nil {
+		t.Fatalf("decode missing preview body: %v body=%s", err, rec.Body.String())
+	}
+	if missingBody["code"] != "VALIDATION_ERROR" {
+		t.Fatalf("missing preview should use VALIDATION_ERROR, got %#v", missingBody)
+	}
+	msg, _ := missingBody["error"].(string)
+	if !strings.HasPrefix(msg, "File does not exist: ") {
+		t.Fatalf("missing preview should report 'File does not exist: <abs>', got %#v", missingBody)
+	}
+	if strings.Contains(rec.Body.String(), "no such file") || strings.Contains(rec.Body.String(), "stat ") {
+		t.Fatalf("missing preview must not leak the raw os.Stat error, got body=%s", rec.Body.String())
+	}
+
+	// Directory -> "Not a file" (not the old "path is a directory").
+	rec = serveFSRaw(t, settings, http.MethodGet, "/fs/preview?path="+dir, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("directory preview should be 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	var dirBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &dirBody); err != nil {
+		t.Fatalf("decode directory preview body: %v body=%s", err, rec.Body.String())
+	}
+	if dirBody["code"] != "VALIDATION_ERROR" {
+		t.Fatalf("directory preview should use VALIDATION_ERROR, got %#v", dirBody)
+	}
+	dirMsg, _ := dirBody["error"].(string)
+	if !strings.HasPrefix(dirMsg, "Not a file: ") {
+		t.Fatalf("directory preview should report 'Not a file: <abs>', got %#v", dirBody)
+	}
+	if strings.Contains(rec.Body.String(), "path is a directory") {
+		t.Fatalf("directory preview must not use the old 'path is a directory' wording, got body=%s", rec.Body.String())
+	}
+}

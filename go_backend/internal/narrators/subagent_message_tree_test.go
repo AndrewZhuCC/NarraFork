@@ -49,7 +49,7 @@ func TestH04SubagentEventMessagesBindParentToolUseAndParentTree(t *testing.T) {
 	}
 
 	assertAllSubagentMessagesHaveParentToolUse(t, sqlDB, child.ID, "h04_tool")
-	page, err := service.MessagesCursor(ctx, parentID, 20, "", "older")
+	page, err := service.ChunksByRange(ctx, parentID, nil, "older", intPtr(1))
 	if err != nil {
 		t.Fatalf("load parent messages: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestH04AgentToolForegroundBackgroundSendAwaitAndTeamStatusKeepChildTree(t *
 		t.Fatalf("await validation error should expose diagnostics, got %#v", missingAwaitID)
 	}
 
-	page, err := service.MessagesCursor(ctx, parentID, 20, "", "older")
+	page, err := service.ChunksByRange(ctx, parentID, nil, "older", intPtr(1))
 	if err != nil {
 		t.Fatalf("load parent tree: %v", err)
 	}

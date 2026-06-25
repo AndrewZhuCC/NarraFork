@@ -170,3 +170,59 @@ func TestLearningGuideOutputRendersActionsAndEmptySearchListsAll(t *testing.T) {
 		t.Fatalf("empty search should equal the full list output")
 	}
 }
+
+// TestLearningDetailContentIsGenericTemplated pins the documented content-parity
+// boundary (health content.learning.docContract.detailContentParity): Go's per-doc
+// DETAIL body (sections/workflow/bestPractices/pitfalls/agentHints) and actions are
+// GENERIC-TEMPLATED — the same boilerplate for every doc — rather than the unique
+// per-doc content authored in TS shared/learning-content.ts. Title/summary/tags ARE
+// per-doc correct. This test locks the current state so a future faithful port flips
+// the capability flags (detailBodyContentMatchesTS:false -> true) deliberately rather
+// than silently. If you port the real per-doc content, update both this test and the
+// detailContentParity capability block.
+func TestLearningDetailContentIsGenericTemplated(t *testing.T) {
+	// The generic section title is the same for every doc.
+	overview := learningDocByID(t, "overview").Detail("en")
+	narrators := learningDocByID(t, "narrators").Detail("en")
+
+	overviewSections, _ := overview["sections"].([]map[string]any)
+	narratorsSections, _ := narrators["sections"].([]map[string]any)
+	if len(overviewSections) != 1 || len(narratorsSections) != 1 {
+		t.Fatalf("expected exactly one generic section per doc, got overview=%d narrators=%d", len(overviewSections), len(narratorsSections))
+	}
+	if got := stringValue(overviewSections[0]["title"]); got != "How to use this" {
+		t.Fatalf("overview section title = %q, want generic 'How to use this'", got)
+	}
+	if got := stringValue(narratorsSections[0]["title"]); got != "How to use this" {
+		t.Fatalf("narrators section title = %q, want generic 'How to use this' (NOT TS per-doc 'Standalone vs project-bound')", got)
+	}
+
+	// TS-unique per-doc body text must be ABSENT (confirming the gap): the TS
+	// narrators doc has a "Standalone vs project-bound" section, never emitted by Go.
+	narratorsBody := stringValue(narratorsSections[0]["body"])
+	if strings.Contains(narratorsBody, "Standalone narrators are best for") {
+		t.Fatalf("narrators detail unexpectedly contains TS per-doc body text; if the real content was ported, update the detailContentParity capability and this test")
+	}
+
+	// actions are the SAME generic two-item list for every doc (TS gives per-doc actions).
+	for _, id := range []string{"overview", "narrators", "permissions-and-safety"} {
+		actions, _ := learningDocByID(t, id).Detail("en")["actions"].([]map[string]any)
+		if len(actions) != 2 {
+			t.Fatalf("%s: expected 2 generic actions, got %d", id, len(actions))
+		}
+		if stringValue(actions[0]["href"]) != "/settings" || stringValue(actions[1]["href"]) != "/narrators" {
+			t.Fatalf("%s: expected generic actions (/settings, /narrators), got %q + %q", id, stringValue(actions[0]["href"]), stringValue(actions[1]["href"]))
+		}
+	}
+}
+
+func learningDocByID(t *testing.T, id string) learningEntry {
+	t.Helper()
+	for _, entry := range learningDocs {
+		if entry.ID == id {
+			return entry
+		}
+	}
+	t.Fatalf("learning doc %q not found", id)
+	return learningEntry{}
+}

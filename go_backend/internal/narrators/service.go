@@ -85,6 +85,14 @@ type Service struct {
 
 	gitTrackMu     sync.Mutex
 	gitTrackTimers map[string]*time.Timer
+
+	// manifestCacheMu guards the lazily-initialized per-narrator chunk-manifest
+	// LRU. The cache lives on the Service instance (not a package global) so each
+	// instance — including the throwaway ones tests build with &Service{DB:...} —
+	// owns an isolated cache and cannot leak entries across independent in-memory
+	// DBs that happen to reuse the same narrator id + messageVersion.
+	manifestCacheMu sync.Mutex
+	manifestCache   *manifestLRUCache
 }
 
 type teamInboxMessage struct {
@@ -447,7 +455,14 @@ func (s *Service) RecoverOnStartup(ctx context.Context) error {
 		}
 	}
 
-	outputJSON, _ := json.Marshal(map[string]any{"output": restartMessage})
+	// The model-facing tool result output mirrors the TS tool.interruptedByServerRestart
+	// i18n message (i18n.ts:30-33), which is intentionally distinct from the internal
+	// errorMessage ("Interrupted by server restart"). TS resolves it via
+	// getToolMessage("interruptedByServerRestart") WITHOUT a locale (recoverActiveRuns
+	// runs at process startup with no narrator-owner locale context), so it is the
+	// English default; Go mirrors that here.
+	const restartToolOutput = "Tool execution was interrupted by a server restart."
+	outputJSON, _ := json.Marshal(map[string]any{"output": restartToolOutput})
 	if _, err := s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET status = 'fail', error_message = ?, output_json = COALESCE(output_json, ?) WHERE status = 'running'`, restartMessage, string(outputJSON)); err != nil {
 		return err
 	}
@@ -667,6 +682,14 @@ func (s *Service) ForkNarratorWithOptions(ctx context.Context, parentID, forkMes
 	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET parent_narrator_id = ?, fork_message_id = ?, inherit_mode = ?, context_summary = ?, system_prompt = ?, message_count = ?, last_message_at = (SELECT MAX(m.created_at) FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE r.narrator_id = ?), updated_at = ? WHERE id = ?`, parentID, nullableString(forkMessageID), inheritMode, nullablePtr(contextSummary), nullablePtr(systemPrompt), len(refs), child.ID, now, child.ID)
 	if err != nil {
 		return Narrator{}, err
+	}
+	// Mirror TS narrator-service.forkNarrator (narrator-service.ts:1444-1449): after
+	// a successful fork, broadcast narrator_forked to the PARENT narrator so the
+	// frontend can refresh its fork list/graph. ForkFromMessages does not broadcast
+	// (TS forkFromMessages returns without broadcasting), so the broadcast lives in
+	// this central fork path only.
+	if s.Hub != nil {
+		s.Hub.BroadcastNarrator(parentID, map[string]any{"type": "narrator_forked", "narratorId": child.ID, "parentNarratorId": parentID})
 	}
 	return s.Get(ctx, child.ID)
 }
@@ -916,150 +939,30 @@ func (s *Service) SetArchived(ctx context.Context, narratorID string, archived b
 	return s.UpdateTextField(ctx, narratorID, "status", status)
 }
 
+// Messages returns the most recent up-to-`limit` top-level messages (with child
+// trees), oldest-first. It is a small standalone read used by the MCP-compat
+// context summary; the virtualized message list uses ChunksByRange instead.
 func (s *Service) Messages(ctx context.Context, narratorID string, limit int) ([]Message, error) {
-	page, err := s.MessagesCursor(ctx, narratorID, limit, "", "older")
+	if limit > 200 {
+		limit = 200
+	}
+	if limit <= 0 {
+		return []Message{}, nil
+	}
+	isSubagent, err := s.isSubagentNarrator(ctx, narratorID)
 	if err != nil {
 		return nil, err
 	}
-	return page.Messages, nil
-}
-
-func (s *Service) MessagesCursor(ctx context.Context, narratorID string, limit int, cursor, direction string) (MessagePage, error) {
-	// Mirror the TS /:id/messages route limit = Math.min(rawLimit, 200): the NaN ->
-	// 50 fallback is applied by the handler's queryInt, and only the UPPER bound is
-	// clamped here. A present 0/negative limit passes through (LIMIT limit+1 + the
-	// len(refs) > limit / refs[:limit] slice below yield empty messages + hasMore,
-	// like the TS getMessagesCursor slice(0, limit)) instead of being forced to 50.
-	limit = clampMessageLimitUpper(limit, 200)
-	if direction != "newer" {
-		direction = "older"
-	}
-	isSubagent, err := s.isSubagentNarrator(ctx, narratorID)
-	if err != nil {
-		return MessagePage{}, err
-	}
 	conditions := []string{"r.narrator_id = ?", "r.segment_compact_id IS NULL"}
-	args := []any{narratorID}
 	if !isSubagent {
 		conditions = append(conditions, "m.parent_tool_use_id IS NULL")
 	}
-	if cursorSeq, ok := parseSeqCursor(cursor); ok {
-		if direction == "newer" {
-			conditions = append(conditions, "r.seq > ?")
-		} else {
-			conditions = append(conditions, "r.seq < ?")
-		}
-		args = append(args, cursorSeq)
-	}
-	order := "r.seq DESC"
-	if direction == "newer" {
-		order = "r.seq ASC"
-	}
-	args = append(args, limit+1)
-	refs, err := s.queryMessageRefs(ctx, strings.Join(conditions, " AND "), order, args...)
+	refs, err := s.queryMessageRefs(ctx, strings.Join(conditions, " AND "), "r.seq DESC", narratorID, limit)
 	if err != nil {
-		return MessagePage{}, err
+		return nil, err
 	}
-	hasMoreInDirection := len(refs) > limit
-	if hasMoreInDirection {
-		refs = jsSliceStart0(refs, limit)
-	}
-	if direction == "older" {
-		reverseMessageRefs(refs)
-	}
-	messages, err := s.loadMessagesForRefs(ctx, narratorID, refs)
-	if err != nil {
-		return MessagePage{}, err
-	}
-	page := MessagePage{Messages: messages}
-	if hasMoreInDirection && len(refs) > 0 {
-		if direction == "older" {
-			page.HasMore = true
-			page.NextCursor = stringPtr(strconv.Itoa(refs[0].Seq))
-		} else {
-			page.HasMoreAfter = true
-			page.PrevCursor = stringPtr(strconv.Itoa(refs[len(refs)-1].Seq))
-		}
-	}
-	return page, nil
-}
-
-func (s *Service) MessagesAround(ctx context.Context, narratorID, messageID string, before, after int) (MessagePage, error) {
-	before = normalizeWindowSize(before)
-	after = normalizeWindowSize(after)
-	fallbackLimit := before + after + 1
-	if fallbackLimit < 10 {
-		fallbackLimit = 10
-	}
-	isSubagent, err := s.isSubagentNarrator(ctx, narratorID)
-	if err != nil {
-		return MessagePage{}, err
-	}
-	anchorMessageID := messageID
-	if !isSubagent {
-		if parentToolUseID, ok, err := s.messageParentToolUseID(ctx, messageID); err != nil {
-			return MessagePage{}, err
-		} else if ok && parentToolUseID != "" {
-			if parentMessageID, ok, err := s.parentMessageForToolUse(ctx, narratorID, parentToolUseID); err != nil {
-				return MessagePage{}, err
-			} else if ok {
-				anchorMessageID = parentMessageID
-			}
-		}
-	}
-	anchor, err := s.anchorRef(ctx, narratorID, anchorMessageID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return s.MessagesCursor(ctx, narratorID, fallbackLimit, "", "older")
-	}
-	if err != nil {
-		return MessagePage{}, err
-	}
-	baseConditions := []string{"r.narrator_id = ?", "r.segment_compact_id IS NULL"}
-	if !isSubagent {
-		baseConditions = append(baseConditions, "m.parent_tool_use_id IS NULL")
-	}
-	olderConditions := append(append([]string{}, baseConditions...), "r.seq < ?")
-	olderArgs := []any{narratorID, anchor.Seq, before + 1}
-	olderRefs, err := s.queryMessageRefs(ctx, strings.Join(olderConditions, " AND "), "r.seq DESC", olderArgs...)
-	if err != nil {
-		return MessagePage{}, err
-	}
-	hasMore := len(olderRefs) > before
-	if hasMore {
-		olderRefs = olderRefs[:before]
-	}
-	reverseMessageRefs(olderRefs)
-	newerConditions := append(append([]string{}, baseConditions...), "r.seq > ?")
-	newerArgs := []any{narratorID, anchor.Seq, after + 1}
-	newerRefs, err := s.queryMessageRefs(ctx, strings.Join(newerConditions, " AND "), "r.seq ASC", newerArgs...)
-	if err != nil {
-		return MessagePage{}, err
-	}
-	hasMoreAfter := len(newerRefs) > after
-	if hasMoreAfter {
-		newerRefs = newerRefs[:after]
-	}
-	refs := append(append(append([]messageRef{}, olderRefs...), anchor), newerRefs...)
-	messages, err := s.loadMessagesForRefs(ctx, narratorID, refs)
-	if err != nil {
-		return MessagePage{}, err
-	}
-	page := MessagePage{Messages: messages, HasMore: hasMore, HasMoreAfter: hasMoreAfter}
-	if hasMore {
-		cursorSeq := anchor.Seq
-		if len(olderRefs) > 0 {
-			cursorSeq = olderRefs[0].Seq
-		}
-		page.NextCursor = stringPtr(strconv.Itoa(cursorSeq))
-	}
-	if hasMoreAfter {
-		cursorSeq := anchor.Seq
-		if len(newerRefs) > 0 {
-			cursorSeq = newerRefs[len(newerRefs)-1].Seq
-		}
-		page.PrevCursor = stringPtr(strconv.Itoa(cursorSeq))
-	}
-	return page, nil
+	reverseMessageRefs(refs)
+	return s.loadMessagesForRefs(ctx, narratorID, refs)
 }
 
 func (s *Service) NarratorMessageVersion(ctx context.Context, narratorID string) (int, error) {
@@ -1304,31 +1207,6 @@ func normalizeMessageLimit(limit, fallback, max int) int {
 	return limit
 }
 
-// clampMessageLimitUpper mirrors the TS `Math.min(limit, max)` with NO lower
-// bound (the NaN->default substitution is done earlier by the handler). A present
-// 0/negative limit is preserved so the cursor pagination can return empty + hasMore
-// exactly like the TS getMessagesCursor slice(0, limit).
-func clampMessageLimitUpper(limit, max int) int {
-	if limit > max {
-		return max
-	}
-	return limit
-}
-
-func normalizeWindowSize(value int) int {
-	// Mirror the TS parseWindowSize clamp Math.min(Math.max(value, 0), 100)
-	// (server/routes/narrators.ts). The NaN->fallback step is handled earlier by
-	// queryInt at the handler, so this is purely the [0,100] clamp: a NEGATIVE
-	// value clamps to 0 (NOT to the 5/20 default).
-	if value < 0 {
-		return 0
-	}
-	if value > 100 {
-		return 100
-	}
-	return value
-}
-
 func upsertCatchUpAnchor(anchors map[string]CatchUpChildAnchor, anchor CatchUpChildAnchor) {
 	anchor.ParentToolUseID = strings.TrimSpace(anchor.ParentToolUseID)
 	if anchor.ParentToolUseID == "" {
@@ -1402,18 +1280,6 @@ func (s *Service) countMessageRefs(ctx context.Context, where string, args ...an
 	return count, err
 }
 
-func (s *Service) messageParentToolUseID(ctx context.Context, messageID string) (string, bool, error) {
-	var parent sql.NullString
-	err := s.DB.QueryRowContext(ctx, `SELECT parent_tool_use_id FROM narrator_messages WHERE id = ?`, messageID).Scan(&parent)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	return sqlNullString(parent), true, nil
-}
-
 func (s *Service) messageCatchUpInfo(ctx context.Context, messageID string) (string, string, bool, error) {
 	var narratorID string
 	var parent sql.NullString
@@ -1425,11 +1291,6 @@ func (s *Service) messageCatchUpInfo(ctx context.Context, messageID string) (str
 		return "", "", false, err
 	}
 	return narratorID, sqlNullString(parent), true, nil
-}
-
-func (s *Service) parentMessageForToolUse(ctx context.Context, narratorID, toolUseID string) (string, bool, error) {
-	messageID, _, ok, err := s.parentMessageRefForToolUse(ctx, narratorID, toolUseID)
-	return messageID, ok, err
 }
 
 func (s *Service) parentMessageRefForToolUse(ctx context.Context, narratorID, toolUseID string) (string, int, bool, error) {
@@ -1520,18 +1381,6 @@ func (s *Service) isSubagentNarrator(ctx context.Context, narratorID string) (bo
 	return (variant.Valid && strings.Contains(variant.String, "subagent")) || (typ.Valid && typ.String == "subagent"), nil
 }
 
-func parseSeqCursor(cursor string) (int, bool) {
-	cursor = strings.TrimSpace(cursor)
-	if cursor == "" {
-		return 0, false
-	}
-	seq, err := strconv.Atoi(cursor)
-	if err != nil {
-		return 0, false
-	}
-	return seq, true
-}
-
 func (s *Service) queryMessageRefs(ctx context.Context, where, order string, args ...any) ([]messageRef, error) {
 	rows, err := s.DB.QueryContext(ctx, `SELECT r.narrator_id, r.message_id, r.seq FROM narrator_message_refs r JOIN narrator_messages m ON m.id = r.message_id WHERE `+where+` ORDER BY `+order+` LIMIT ?`, args...)
 	if err != nil {
@@ -1547,12 +1396,6 @@ func (s *Service) queryMessageRefs(ctx context.Context, where, order string, arg
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
-}
-
-func (s *Service) anchorRef(ctx context.Context, narratorID, messageID string) (messageRef, error) {
-	var ref messageRef
-	err := s.DB.QueryRowContext(ctx, `SELECT narrator_id, message_id, seq FROM narrator_message_refs WHERE narrator_id = ? AND message_id = ?`, narratorID, messageID).Scan(&ref.NarratorID, &ref.MessageID, &ref.Seq)
-	return ref, err
 }
 
 func (s *Service) loadMessagesForRefs(ctx context.Context, narratorID string, refs []messageRef) ([]Message, error) {
@@ -2621,14 +2464,16 @@ func (s *Service) userLocale(ctx context.Context, userID string) string {
 
 // toolLocale resolves the locale used for a narrator's tool-result messages,
 // mirroring the TS ctx.locale (which derives from the narrator owner's language
-// preference). It resolves the narrator's created_by user's user_preferences
-// language, defaulting to "en".
+// preference). The narrators table has NO created_by column, so the owner is
+// resolved from the narrator's earliest top-level user message's created_by
+// (narrator_messages.created_by), defaulting to "en". parent_tool_use_id IS NULL
+// keeps it to the top-level conversation (not subagent message-tree entries).
 func (s *Service) toolLocale(ctx context.Context, narratorID string) string {
 	if s == nil || s.DB == nil {
 		return "en"
 	}
 	var createdBy sql.NullString
-	if err := s.DB.QueryRowContext(ctx, `SELECT created_by FROM narrators WHERE id = ?`, narratorID).Scan(&createdBy); err != nil {
+	if err := s.DB.QueryRowContext(ctx, `SELECT created_by FROM narrator_messages WHERE narrator_id = ? AND role = 'user' AND parent_tool_use_id IS NULL AND created_by IS NOT NULL AND TRIM(created_by) != '' ORDER BY created_at ASC LIMIT 1`, narratorID).Scan(&createdBy); err != nil {
 		return "en"
 	}
 	if !createdBy.Valid || strings.TrimSpace(createdBy.String) == "" {
@@ -2637,12 +2482,133 @@ func (s *Service) toolLocale(ctx context.Context, narratorID string) string {
 	return s.userLocale(ctx, strings.TrimSpace(createdBy.String))
 }
 
+// narratorOwnerUserID resolves the narrator owner's user id from the narrator's
+// earliest top-level user message created_by (narrators has no created_by column;
+// see W804). Returns "" when no owning user message exists.
+func (s *Service) narratorOwnerUserID(ctx context.Context, narratorID string) string {
+	if s == nil || s.DB == nil {
+		return ""
+	}
+	var createdBy sql.NullString
+	if err := s.DB.QueryRowContext(ctx, `SELECT created_by FROM narrator_messages WHERE narrator_id = ? AND role = 'user' AND parent_tool_use_id IS NULL AND created_by IS NOT NULL AND TRIM(created_by) != '' ORDER BY created_at ASC LIMIT 1`, narratorID).Scan(&createdBy); err != nil {
+		return ""
+	}
+	if !createdBy.Valid {
+		return ""
+	}
+	return strings.TrimSpace(createdBy.String)
+}
+
+// narratorReplyLanguage resolves the narrator owner's (locale, replyInUserLanguage)
+// preference, mirroring the TS getUserLanguage + getUserReplyInLanguage pair used
+// by narrator-prompt buildEffectiveSystemPrompt. The owner is resolved from the
+// earliest top-level user message created_by (W804). Defaults to ("en", true)
+// when no owner/preference exists (TS getUserReplyInLanguage defaults true), so
+// the "## Language" section is appended by default just like TS.
+func (s *Service) narratorReplyLanguage(ctx context.Context, narratorID string) (string, bool) {
+	userID := s.narratorOwnerUserID(ctx, narratorID)
+	if userID == "" {
+		return "en", true
+	}
+	var language sql.NullString
+	var replyInUser sql.NullBool
+	if err := s.DB.QueryRowContext(ctx, `SELECT language, reply_in_user_language FROM user_preferences WHERE user_id = ?`, userID).Scan(&language, &replyInUser); err != nil {
+		return "en", true
+	}
+	locale := "en"
+	if strings.TrimSpace(language.String) == "zh-CN" {
+		locale = "zh-CN"
+	}
+	reply := true
+	if replyInUser.Valid {
+		reply = replyInUser.Bool
+	}
+	return locale, reply
+}
+
+// replyLanguageInstruction mirrors the TS prompt-i18n languageInstructions map.
+func replyLanguageInstruction(locale string) string {
+	if locale == "zh-CN" {
+		return "始终使用简体中文回复。无论上下文摘要或对话历史中使用了什么语言，你的回复必须使用简体中文。"
+	}
+	return "Always reply in English."
+}
+
+// planModeSystemReminder mirrors the TS getPlanModeSystemReminder
+// (prompt-i18n.ts:656-760): a full <system-reminder> block (en/zh-CN, with an
+// allowInline branch for the plan-submission section). The plan-file exception
+// matches Go's runtime plan-mode Write/Edit redirect (planModeToolRestriction),
+// so it is ported verbatim. The TS ${SH}/${sh} shell tokens are fixed to
+// Bash/bash (Go does not implement TS detectShell Windows/zsh selection; W794).
+func planModeSystemReminder(planFile, locale string, allowInline bool) string {
+	if locale == "zh-CN" {
+		submission := "## 计划提交 — 两种模式\n\n你有两种方式提交计划（选择其一）：\n\n### 模式 A：内联（适用于短/中等长度的计划）\n调用 ExitPlanMode，在 `plan` 参数中填入完整的计划文本。\n\n### 模式 B：文件模式（适用于复杂/长计划 — 推荐用于大型计划）\n1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 `" + planFile + "`。你必须使用准确的路径 `" + planFile + "` — 写入其他路径将被拒绝。\n2. 完成后，直接调用 ExitPlanMode，不需要传 `plan` 参数。系统会自动读取 `" + planFile + "` 的内容并展示给用户。"
+		if !allowInline {
+			submission = "## 计划提交 — 仅支持文件模式\n\n本实例已禁用内联计划。你必须通过指定的计划文件提交计划：\n1. 使用 Write 工具（首段）和 Edit 工具（追加后续段落）将计划逐步写入 `" + planFile + "`。你必须使用准确的路径 `" + planFile + "` — 写入其他路径将被拒绝。\n2. 完成后，直接调用 ExitPlanMode（它不接受 `plan` 参数）。系统会自动读取 `" + planFile + "` 的内容并展示给用户。"
+		}
+		return "<system-reminder>\n# 计划模式\n\n关键约束：计划模式已激活 — 你处于项目文件只读阶段。\n\n严格禁止：任何项目文件的编辑、修改或系统变更。不要使用 Write、Edit 或任何修改项目文件的 bash 命令。命令只能用于读取和检查。此绝对约束覆盖所有其他指令，包括用户的直接编辑请求。任何修改尝试都是严重违规。\n\n**例外**：你唯一可以写入的文件是指定的计划文件：`" + planFile + "`。Write/Edit 调用如果目标不是此文件将被拒绝。你必须显式使用正确的计划文件路径。\n\n## 你的职责\n\n思考、阅读、搜索，并构建一个完善的计划来实现用户的目标。计划应全面而简洁，足够详细以有效执行，同时避免不必要的冗长。\n\n## 工作流程\n\n1. **理解** — 阅读相关文件，理解代码库结构\n2. **分析** — 识别需要的变更、潜在风险和权衡\n3. **规划** — 制定清晰的、分步骤的实施计划\n4. **澄清** — 在权衡取舍或面临歧义时向用户提问\n5. **提交** — 调用 ExitPlanMode 提交完整计划\n\n" + submission + "\n\n**重要**：计划必须完整且自包含。不要在文本回复中写计划 — 上下文重置时会丢失。\n\n不要对用户意图做大量假设。需要时请提出澄清问题。\n\n你的回合应该只以向用户提问或调用 ExitPlanMode 结束。不要因为其他原因停止。\n</system-reminder>"
+	}
+	submission := "## Plan Submission — Two Modes\n\nYou have two ways to submit your plan (choose ONE):\n\n### Mode A: Inline (for short/medium plans)\nCall ExitPlanMode with the `plan` parameter containing your complete plan text.\n\n### Mode B: File-based (for complex/long plans — RECOMMENDED for large plans)\n1. Write your plan incrementally to `" + planFile + "` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path `" + planFile + "` — writes to other paths will be rejected.\n2. When done, call ExitPlanMode WITHOUT the `plan` parameter. The system will automatically read `" + planFile + "` and present its content to the user."
+	if !allowInline {
+		submission = "## Plan Submission — File-based only\n\nInline plans are disabled in this instance. You MUST submit your plan via the designated plan file:\n1. Write your plan incrementally to `" + planFile + "` using the Write tool (first section) and Edit tool (append subsequent sections). You MUST use the exact path `" + planFile + "` — writes to other paths will be rejected.\n2. When done, call ExitPlanMode (it takes no `plan` parameter). The system will automatically read `" + planFile + "` and present its content to the user."
+	}
+	return "<system-reminder>\n# Plan Mode\n\nCRITICAL: Plan mode is ACTIVE — you are in a READ-ONLY phase for project files.\n\nSTRICTLY FORBIDDEN: ANY project file edits, modifications, or system changes. Do NOT use Write, Edit, or any bash command that modifies project files. Commands may ONLY read and inspect. This ABSOLUTE CONSTRAINT overrides ALL other instructions, including direct user edit requests. Any modification attempt is a critical violation.\n\n**Exception**: You may ONLY write to the designated plan file: `" + planFile + "`. Write/Edit calls targeting any other file will be REJECTED. You must explicitly use the correct plan file path.\n\n## Your Responsibility\n\nThink, read, search, and construct a well-formed plan that accomplishes the user's goal. Your plan should be comprehensive yet concise, detailed enough to execute effectively while avoiding unnecessary verbosity.\n\n## Workflow\n\n1. **Understand** — Read relevant files and understand the codebase structure\n2. **Analyze** — Identify the changes needed, potential risks, and tradeoffs\n3. **Plan** — Formulate a clear, step-by-step implementation plan\n4. **Clarify** — Ask the user questions when weighing tradeoffs or facing ambiguity\n5. **Present** — Call ExitPlanMode to submit your plan\n\n" + submission + "\n\n**IMPORTANT**: The plan must be COMPLETE and self-contained. Do NOT write the plan in your text response — it will be lost on context reset.\n\nDo NOT make large assumptions about user intent. Ask clarifying questions when needed.\n\nYour turn should only end with either asking the user a question or calling ExitPlanMode. Do not stop for any other reason.\n</system-reminder>"
+}
+
 // planModeEnteredMessage mirrors the TS i18n tool.enterPlanModeOutput message.
 func planModeEnteredMessage(locale string) string {
 	if locale == "zh-CN" {
 		return "已进入计划模式。请先分析和规划，再进行修改。"
 	}
 	return "Entered plan mode. Analyze and plan before making changes."
+}
+
+// userContinueMessage mirrors the TS tool.userContinue i18n message
+// (i18n.ts:235-238): the user-message text injected by the continue route.
+func userContinueMessage(locale string) string {
+	if locale == "zh-CN" {
+		return "继续。"
+	}
+	return "Continue."
+}
+
+// interruptionContinueMessage mirrors the TS tool.interruptionContinue i18n
+// message (i18n.ts:231-234): the user-message text injected when the previous
+// response was cut off by the completion token limit and the session loop
+// auto-continues.
+func interruptionContinueMessage(locale string) string {
+	if locale == "zh-CN" {
+		return "你上一条回复因 completion token 限制被截断，请从中断处继续。"
+	}
+	return "Your previous response was cut off by the completion token limit. Please continue from where you left off."
+}
+
+// interruptedByUserToolOutput mirrors the TS tool.interruptedByUser i18n message
+// (i18n.ts:26-29): the MODEL-FACING tool result output written into a tool call's
+// output_json when the user interrupts the narrator before the in-flight tool
+// could finish. TS markInterruptedToolCallsForMessage / cleanupOrphanedToolCalls
+// (narrator-session.ts:4162-4205) localize this via getToolMessage("interruptedByUser",
+// active.locale), i.e. the narrator owner's locale — distinct from the internal
+// errorMessage ("Narrator interrupted by user"), which TS leaves un-localized.
+func interruptedByUserToolOutput(locale string) string {
+	if locale == "zh-CN" {
+		return "用户在此工具调用执行前中断了会话。"
+	}
+	return "The user interrupted this tool call before it could execute."
+}
+
+// planModeFileRedirectedNotice mirrors the TS tool.planModeFileRedirected i18n
+// message (i18n.ts:147-150): the MODEL-facing notice appended to a Write/Edit
+// tool result when plan mode redirects the write target to the designated plan
+// file. TS resolves it via getToolMessageWithParams("planModeFileRedirected",
+// locale, {originalPath, planFile}) using the narrator owner's locale
+// (narrator-permission.ts:2093). originalPath/planFile are substituted verbatim
+// between the localized static segments.
+func planModeFileRedirectedNotice(locale, originalPath, planFile string) string {
+	if locale == "zh-CN" {
+		return "[计划模式] 注意：你的写入目标已从 \"" + originalPath + "\" 重定向到指定的计划文件 \"" + planFile + "\"。在计划模式下，请直接使用正确的计划文件路径。"
+	}
+	return "[Plan Mode] Note: Your write target was redirected from \"" + originalPath + "\" to the designated plan file \"" + planFile + "\". In plan mode, please use the exact plan file path directly."
 }
 
 func toolNameBoolSet(values []string) map[string]bool {
@@ -2682,7 +2648,14 @@ func (s *Service) HandleBashCommand(ctx context.Context, narratorID, command, ra
 	bashCall.Function.Name = "Bash"
 	bashCall.Function.Arguments = string(argsJSON)
 	fileChange := prepareToolFileChange(ctx, cwd, bashCall)
-	output := agentbasic.ExecuteTool(ctx, cwd, "Bash", string(argsJSON))
+	// Inject tool runtime settings (freshShellEnv, legacyEncoding, web-fetch proxy)
+	// so the slash-command Bash path honors the same agent settings as the
+	// agent-loop Bash path (executeBuiltInAgentTool already does this).
+	bashCtx := ctx
+	if s.Settings != nil {
+		bashCtx = agentbasic.ContextWithToolRuntimeSettings(ctx, agentbasic.ToolRuntimeSettingsFromRawSettings(s.Settings.Raw()))
+	}
+	output := agentbasic.ExecuteTool(bashCtx, cwd, "Bash", string(argsJSON))
 	completeToolFileChange(ctx, cwd, fileChange)
 	isError := strings.Contains(output, "[exit error]") || strings.Contains(output, "[timeout]")
 	toolUseBlock := map[string]any{"type": "tool_use", "id": toolUseID, "name": "Bash", "input": input, "streamStartedAt": started.UnixMilli()}
@@ -2795,6 +2768,10 @@ func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun,
 
 const maxGoalContinuationNoToolTurns = 3
 
+// maxInterruptionRetries bounds the completion-token-limit auto-continuation loop,
+// mirroring the TS MAX_INTERRUPTION_RETRIES (narrator-session.ts:1028).
+const maxInterruptionRetries = 3
+
 func narratorModelFollowsDefault(model string) bool {
 	model = strings.TrimSpace(model)
 	if model == "" || model == "__default__" {
@@ -2828,6 +2805,7 @@ func currentResolvedDefaultModel(settings *config.Store, model string) (string, 
 func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 	noToolContinuationCount := 0
 	previousWasGoalContinuation := false
+	interruptionRetries := 0
 	var goalTokenUsageBaseline *agentbasic.UsageSnapshot
 	for {
 		state, completed := s.runBasicAgentOnce(ctx, narratorID, goalTokenUsageBaseline)
@@ -2835,15 +2813,48 @@ func (s *Service) runBasicAgent(ctx context.Context, narratorID string) {
 			return
 		}
 		goalTokenUsageBaseline = cloneUsageSnapshot(state.lastTokenUsage)
-		if state.planApprovedMode != "" {
+		stateNarrator := state.currentNarrator()
+		if state.planApprovedModeValue() != "" {
 			if err := s.persistPlanApprovalContinuation(ctx, state); err != nil {
-				_ = s.persistAgentError(ctx, narratorID, err, state.narrator.IsBackground)
+				_ = s.persistAgentError(ctx, narratorID, err, stateNarrator.IsBackground)
 				return
 			}
 			previousWasGoalContinuation = false
 			continue
 		}
-		if state.errored || state.skipGoalContinuation || state.narrator.IsBackground || state.narrator.IsAskInPassing {
+		// Completion-token-limit auto-continuation (mirrors TS narrator-session.ts
+		// interruption continuation): when the turn ended because the model hit its
+		// output token cap, inject an interruptionContinue user message and re-run,
+		// bounded by maxInterruptionRetries. This runs before goal continuation so a
+		// truncated turn resumes the model's own work first. Errored / background /
+		// ask-in-passing runs are excluded.
+		if state.outputTruncated && !state.errored && !state.skipGoalContinuation && !stateNarrator.IsBackground && !stateNarrator.IsAskInPassing {
+			interruptionRetries++
+			if interruptionRetries <= maxInterruptionRetries {
+				started, err := s.maybeStartInterruptionContinuation(ctx, narratorID)
+				if err != nil {
+					_ = s.persistAgentError(ctx, narratorID, err, false)
+					return
+				}
+				if started {
+					latest, err := s.Get(ctx, narratorID)
+					if err != nil {
+						return
+					}
+					if err := s.markRunStarted(ctx, narratorID, latest); err != nil {
+						_ = s.persistAgentError(ctx, narratorID, err, false)
+						return
+					}
+					previousWasGoalContinuation = false
+					continue
+				}
+			}
+			// Max retries reached (or continuation declined): stop auto-continuing and
+			// fall through to normal completion handling.
+		} else {
+			interruptionRetries = 0
+		}
+		if state.errored || state.skipGoalContinuation || stateNarrator.IsBackground || stateNarrator.IsAskInPassing {
 			return
 		}
 		if previousWasGoalContinuation {
@@ -2907,12 +2918,10 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	if narrator.Cwd != nil {
 		cwd = *narrator.Cwd
 	}
-	draftMessageID := ""
 	pipeline := &agentPipelineState{}
 	state = &agentRunState{
 		narratorID:             narratorID,
 		narrator:               narrator,
-		draftMessageID:         &draftMessageID,
 		goalTurnStartedAt:      time.Now(),
 		goalTokenUsageBaseline: cloneUsageSnapshot(goalTokenUsageBaseline),
 		providerPrefix:         providerPrefixFromModelValue(model),
@@ -2920,7 +2929,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	executor := func(execCtx context.Context, execCwd string, call agentbasic.ToolCall) (agentbasic.ToolRun, error) {
 		run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
 		if !narratorToolRequiresPermission(call.Function.Name) {
-			if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, &draftMessageID, pipeline, call, history); handled || err != nil {
+			if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, state, pipeline, call, history); handled || err != nil {
 				pipeline.capture(&specialRun)
 				if err == nil && handled {
 					s.runPostToolUseHooks(execCtx, narratorID, narrator, execCwd, call, specialRun)
@@ -2929,7 +2938,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			}
 		}
 		planRedirectNotice := ""
-		if redirectedCall, notice, redirected := planModeToolRedirect(execCwd, narrator, call); redirected {
+		if redirectedCall, notice, redirected := planModeToolRedirect(execCwd, narrator, call, s.toolLocale(execCtx, narratorID)); redirected {
 			call = redirectedCall
 			run.Arguments = call.Function.Arguments
 			planRedirectNotice = notice
@@ -2959,6 +2968,18 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			return agentbasic.ToolRun{}, err
 		}
 		if permission.Action == "deny" {
+			if permission.Fatal {
+				// Catastrophic command: mark the result fatal so the agent loop
+				// terminates the entire narrator for safety (mirrors TS fatal
+				// decision). The command itself was never executed. Status stays
+				// "denied" (Go's existing blocked-command status); Fatal drives loop
+				// termination and Output carries the FATAL message.
+				run.Status = "denied"
+				run.Fatal = true
+				run.Output = "FATAL: " + firstNonEmptyString(permission.Reason, "catastrophic command blocked") + ". Narrator terminated for safety."
+				pipeline.capture(&run)
+				return run, nil
+			}
 			run.Status = "denied"
 			run.Output = firstNonEmptyString(permission.Reason, "Permission denied.")
 			pipeline.capture(&run)
@@ -2968,7 +2989,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			if s.Hub != nil {
 				s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_started", "narratorId": narratorID, "toolUseId": call.ID, "toolName": call.Function.Name})
 			}
-			decision, err := s.runDangerReflection(execCtx, narratorID, call)
+			decision, err := s.runDangerReflection(execCtx, narratorID, narrator, execCwd, call, history)
 			if err != nil {
 				if s.Hub != nil {
 					s.Hub.BroadcastNarrator(narratorID, map[string]any{"type": "danger_reflection_resolved", "narratorId": narratorID, "toolUseId": call.ID, "decision": "error", "reason": err.Error()})
@@ -2993,11 +3014,9 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			}
 		}
 		if permission.Action == "ask" {
-			if draftMessageID == "" {
-				draftMessageID, err = s.createAssistantDraft(execCtx, narratorID)
-				if err != nil {
-					return agentbasic.ToolRun{}, err
-				}
+			draftMessageID, err := s.ensureDraftID(execCtx, state)
+			if err != nil {
+				return agentbasic.ToolRun{}, err
 			}
 			run.Recorded = true
 			pendingReason := firstNonEmptyString(exitPlanApprovalReason, permission.Reason)
@@ -3059,7 +3078,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 				return agentbasic.ToolRun{}, err
 			}
 			if narratorToolRequiresPermission(call.Function.Name) {
-				if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, &draftMessageID, pipeline, call, history); handled || err != nil {
+				if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, state, pipeline, call, history); handled || err != nil {
 					run = specialRun
 					if err != nil {
 						return agentbasic.ToolRun{}, err
@@ -3103,7 +3122,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			return guardedRun, nil
 		}
 		if narratorToolRequiresPermission(call.Function.Name) {
-			if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, &draftMessageID, pipeline, call, history); handled || err != nil {
+			if specialRun, handled, err := s.executeNarratorTool(execCtx, narratorID, narrator, state, pipeline, call, history); handled || err != nil {
 				run = specialRun
 				if err != nil {
 					return agentbasic.ToolRun{}, err
@@ -3213,8 +3232,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			replacementNeeded = true
 			currentNarrator.Model = refreshed.Model
 			currentNarrator.ReasoningEffort = refreshed.ReasoningEffort
-			state.narrator.Model = refreshed.Model
-			state.narrator.ReasoningEffort = refreshed.ReasoningEffort
+			state.setNarratorModel(refreshed.Model, refreshed.ReasoningEffort)
 			return override, nil
 		}
 		return nil, nil
@@ -3237,7 +3255,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			currentNarrator.ContextSummary = refreshed.ContextSummary
 			currentNarrator.PlanMode = refreshed.PlanMode
 			currentNarrator.PlanFileID = refreshed.PlanFileID
-			state.narrator = currentNarrator
+			state.setNarrator(currentNarrator)
 			return nil, nil
 		}
 		rebuiltHistory, err := s.agentHistory(runCtx, narratorID)
@@ -3247,12 +3265,12 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		history = rebuiltHistory
 		currentSystemPrompt = nextSystemPrompt
 		currentNarrator = refreshed
-		state.narrator = refreshed
+		state.setNarrator(refreshed)
 		replacementNeeded = false
 		return &agentbasic.BeforeTurnReplacement{Messages: rebuiltHistory, SystemPrompt: &nextSystemPrompt}, nil
 	}
 
-	stream, err := agentbasic.RunAgentLoop(runCtx, s.Settings, model, history, cwd,
+	runOptions := []agentbasic.GenerateOption{
 		agentbasic.WithToolExecutor(executor),
 		agentbasic.WithSystemPrompt(currentSystemPrompt),
 		agentbasic.WithMaxTurns(s.agentMaxTurns()),
@@ -3266,13 +3284,20 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 		agentbasic.WithRetryBackoffCeil(s.agentRetryBackoffCeil()),
 		agentbasic.WithMaxChatRetries(s.agentMaxTransientRetries()),
 		agentbasic.WithSilentToolCallThreshold(s.agentSilentToolCallThreshold()),
+		agentbasic.WithLocale(s.toolLocale(ctx, narratorID)),
 		agentbasic.WithToolInventoryEvent(true),
 		agentbasic.WithStickySessionKey(narratorID),
 		agentbasic.WithSideCarCollector(state.sideCarToolCount, sideCarCollector, func(count int) { state.sideCarToolCount = count }),
 		agentbasic.WithRuntimeSettingsOverrideHook(runtimeSettingsOverrideHook),
 		agentbasic.WithBeforeTurnReplacementHook(beforeTurnReplacementHook),
 		agentbasic.WithShouldStop(shouldStopAfterPriorityBuffer),
-	)
+	}
+	// Fast mode maps to service_tier:"priority" (codex priority processing),
+	// mirroring TS. Only codex request bodies emit it; other providers ignore it.
+	if narrator.FastMode {
+		runOptions = append(runOptions, agentbasic.WithServiceTier("priority"))
+	}
+	stream, err := agentbasic.RunAgentLoop(runCtx, s.Settings, model, history, cwd, runOptions...)
 	if err != nil {
 		if narrator.IsBackground && s.narratorRunCancelled(ctx, narratorID) {
 			return
@@ -3283,7 +3308,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 	for event := range stream {
 		if err := s.handleAgentEvent(ctx, state, event); err != nil {
 			if isCancelledError(err) || runCtx.Err() != nil {
-				if state.planApprovedMode != "" {
+				if state.planApprovedModeValue() != "" {
 					state.completed = true
 					state.errored = false
 					return state, true
@@ -3294,12 +3319,12 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			s.persistAgentError(ctx, narratorID, err, narrator.IsBackground)
 			return
 		}
-		if state.planApprovedMode != "" && runCtx.Err() == nil {
+		if state.planApprovedModeValue() != "" && runCtx.Err() == nil {
 			cancel()
 		}
 	}
 	if runCtx.Err() != nil && !state.completed {
-		if state.planApprovedMode != "" {
+		if state.planApprovedModeValue() != "" {
 			state.completed = true
 			state.errored = false
 			return state, true
@@ -3400,18 +3425,26 @@ func (s *Service) agentSystemPrompt(ctx context.Context, narrator Narrator) stri
 			prompt = appendPromptSection(prompt, "Conversation Context", summary)
 		}
 	}
+	// Reply-language instruction (mirrors TS narrator-prompt buildEffectiveSystemPrompt
+	// step 4): append the "## Language" section when the owner wants replies in their
+	// language (default true) or the locale is non-English. Placed after global/context
+	// and before plan mode, matching the TS ordering. The resolved locale is hoisted to
+	// function scope so the plan-mode <system-reminder> block below reuses it without a
+	// second owner lookup.
+	locale, replyInUserLanguage := s.narratorReplyLanguage(ctx, narrator.ID)
+	if replyInUserLanguage || locale != "en" {
+		prompt = appendPromptSection(prompt, "Language", replyLanguageInstruction(locale))
+	}
 	if narrator.PlanMode {
 		planFile := ".narrafork/plan-<id>.md"
 		if narrator.PlanFileID != nil && strings.TrimSpace(*narrator.PlanFileID) != "" {
 			planFile = planFileRelativePath(strings.TrimSpace(*narrator.PlanFileID))
 		}
-		if s.agentPlanModeAllowInlinePlan() {
-			prompt = appendPromptSection(prompt, "Plan Mode", "You are currently in NarraFork plan mode. Explore and design an implementation plan first; do not modify implementation files until the plan is explicitly approved. Write/Edit are restricted to the designated plan file "+planFile+", or pass the complete plan directly to ExitPlanMode. If TS-style plan compact cannot be persisted, the Go backend will fall back to normal message history/compact context.")
-		} else {
-			prompt = appendPromptSection(prompt, "Plan Mode", "You are currently in NarraFork plan mode. Explore and design an implementation plan first; do not modify implementation files until the plan is explicitly approved. Inline plans are disabled in this instance — you MUST write the complete plan to the designated plan file "+planFile+" (Write/Edit are restricted to that file), then call ExitPlanMode without any plan parameter; the backend reads the plan from that file. If TS-style plan compact cannot be persisted, the Go backend will fall back to normal message history/compact context.")
-		}
+		// Mirror TS narrator-prompt.ts:160-164: append the full plan-mode
+		// <system-reminder> block verbatim (no "## " markdown-section wrapper), with
+		// the allowInline branch driven by the instance setting.
+		prompt = prompt + "\n\n" + planModeSystemReminder(planFile, locale, s.agentPlanModeAllowInlinePlan())
 	}
-	_ = ctx
 	return prompt
 }
 
@@ -3495,7 +3528,10 @@ func (s *Service) agentPlanModeAllowInlinePlan() bool {
 }
 
 func (s *Service) agentFirstTokenTimeout() time.Duration {
-	value := s.agentIntSetting("firstTokenTimeoutMs", 60000)
+	// Mirror TS defaults.ts:52 firstTokenTimeoutMs:300_000 and loop.ts:2015
+	// `config.firstTokenTimeoutMs ?? 300_000` (5 min default). The 0..600000
+	// clamp (0 = disabled) matches the TS validator bounds.
+	value := s.agentIntSetting("firstTokenTimeoutMs", 300000)
 	if value <= 0 {
 		return 0
 	}
@@ -3707,6 +3743,10 @@ type agentPipelineCapture struct {
 }
 
 type agentPipelineState struct {
+	// mu guards all fields: parallel tool groups run the executor on multiple
+	// goroutines simultaneously (see agentbasic.executeTurnTools), and each may
+	// call capture()/start()/end() concurrently.
+	mu         sync.Mutex
 	Active     bool
 	Label      string
 	MaxPreview int
@@ -3723,19 +3763,22 @@ func clampPipelinePreviewChars(value int) int {
 
 func (p *agentPipelineState) start(label string, maxPreview int) string {
 	maxPreview = clampPipelinePreviewChars(maxPreview)
+	p.mu.Lock()
 	p.Active = true
 	p.Label = strings.TrimSpace(label)
 	p.MaxPreview = maxPreview
 	p.NextAlias = 1
 	p.Captures = nil
+	resolvedLabel := p.Label
+	p.mu.Unlock()
 	// Mirror the TS startPipelineTool output (server/lib/agent/tools/pipeline.ts):
 	// "Pipeline mode started[ (<label>)]. Future tool outputs will be captured as
 	// p1, p2, ... with previews capped at <N> characters. Use EndPipeline with a
 	// rule such as: from p1 | grep -i \"error|failed\" | head -n 20". Go previously
 	// returned a terse "Pipeline capture started[: label]" line.
 	labelSuffix := ""
-	if p.Label != "" {
-		labelSuffix = " (" + p.Label + ")"
+	if resolvedLabel != "" {
+		labelSuffix = " (" + resolvedLabel + ")"
 	}
 	return fmt.Sprintf(
 		"Pipeline mode started%s. Future tool outputs will be captured as p1, p2, ... with previews capped at %d characters. Use EndPipeline with a rule such as: from p1 | grep -i \"error|failed\" | head -n 20",
@@ -3759,10 +3802,15 @@ func pipelineClipText(text string, maxChars int) string {
 }
 
 func (p *agentPipelineState) capture(run *agentbasic.ToolRun) {
-	if p == nil || !p.Active || run == nil {
+	if p == nil || run == nil {
 		return
 	}
 	if run.Name == "StartPipeline" || run.Name == "EndPipeline" {
+		return
+	}
+	p.mu.Lock()
+	if !p.Active {
+		p.mu.Unlock()
 		return
 	}
 	if p.NextAlias <= 0 {
@@ -3773,12 +3821,14 @@ func (p *agentPipelineState) capture(run *agentbasic.ToolRun) {
 	text := run.Output
 	bytes := len(text) // UTF-8 byte length, matching Buffer.byteLength(output, "utf-8")
 	p.Captures = append(p.Captures, agentPipelineCapture{Alias: alias, Tool: run.Name, Text: text, Bytes: bytes})
+	maxPreview := p.MaxPreview
+	p.mu.Unlock()
 	// Mirror the TS formatCapturedPreview (pipeline-state.ts): a multi-line
 	// "Pipeline capture alias: <alias>\nTool: <name>\nBytes: <n>\nPreview:\n<preview>"
 	// block, where preview is clipText(output, maxPreviewChars) and an empty
 	// preview renders as "(empty)". Go previously emitted a single-line
 	// "Captured as p1 (N chars). Preview:\n..." form.
-	preview := pipelineClipText(text, p.MaxPreview)
+	preview := pipelineClipText(text, maxPreview)
 	if preview == "" {
 		preview = "(empty)"
 	}
@@ -3817,7 +3867,12 @@ func clampPipelineFinalChars(value int) int {
 }
 
 func (p *agentPipelineState) end(rule string, aliases []string, format string, maxChars int) string {
-	if p == nil || !p.Active {
+	if p == nil {
+		return "Pipeline mode is not active."
+	}
+	p.mu.Lock()
+	if !p.Active {
+		p.mu.Unlock()
 		// Mirror the TS endPipelineTool guard message exactly.
 		return "Pipeline mode is not active."
 	}
@@ -3828,12 +3883,13 @@ func (p *agentPipelineState) end(rule string, aliases []string, format string, m
 		sources = append(sources, pipelineCaptureSource{Alias: capture.Alias, Text: capture.Text})
 		captureSummaryParts = append(captureSummaryParts, fmt.Sprintf("%s=%s(%dB)", capture.Alias, capture.Tool, capture.Bytes))
 	}
-	result, ruleErr := executePipelineRule(sources, rule, aliases)
 	// Clear pipeline state regardless of outcome, matching TS which clears state
 	// after a successful run and surfaces rule errors as a separate result.
 	p.Active = false
 	p.Captures = nil
 	p.NextAlias = 1
+	p.mu.Unlock()
+	result, ruleErr := executePipelineRule(sources, rule, aliases)
 	if ruleErr != nil {
 		// TS: PipelineRuleError -> "Pipeline rule error: <message>" (isError).
 		return "Pipeline rule error: " + ruleErr.Error()
@@ -4276,18 +4332,15 @@ func (s *Service) reviewMetaForChapter(ctx context.Context, chapterID string) (r
 	return meta, true
 }
 
-func (s *Service) ensureSpecialToolCallRecorded(ctx context.Context, narratorID string, narrator Narrator, draftMessageID *string, call agentbasic.ToolCall, input map[string]any) error {
-	if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" || draftMessageID == nil {
+func (s *Service) ensureSpecialToolCallRecorded(ctx context.Context, narratorID string, narrator Narrator, state *agentRunState, call agentbasic.ToolCall, input map[string]any) error {
+	if strings.TrimSpace(call.ID) == "" || strings.TrimSpace(call.Function.Name) == "" || state == nil {
 		return nil
 	}
-	if strings.TrimSpace(*draftMessageID) == "" {
-		messageID, err := s.createAssistantDraft(ctx, narratorID)
-		if err != nil {
-			return err
-		}
-		*draftMessageID = messageID
+	draftMessageID, err := s.ensureDraftID(ctx, state)
+	if err != nil {
+		return err
 	}
-	return s.recordRunningToolCall(ctx, narratorID, *draftMessageID, narrator, agentbasic.AgentEvent{ToolUseID: call.ID, ToolName: call.Function.Name, Input: input})
+	return s.recordRunningToolCall(ctx, narratorID, draftMessageID, narrator, agentbasic.AgentEvent{ToolUseID: call.ID, ToolName: call.Function.Name, Input: input})
 }
 
 func narratorToolRequiresPermission(toolName string) bool {
@@ -4299,7 +4352,7 @@ func narratorToolRequiresPermission(toolName string) bool {
 	}
 }
 
-func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, narrator Narrator, draftMessageID *string, pipeline *agentPipelineState, call agentbasic.ToolCall, history []agentbasic.Message) (agentbasic.ToolRun, bool, error) {
+func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, narrator Narrator, state *agentRunState, pipeline *agentPipelineState, call agentbasic.ToolCall, history []agentbasic.Message) (agentbasic.ToolRun, bool, error) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
 	var args map[string]any
 	if strings.TrimSpace(call.Function.Arguments) != "" {
@@ -4327,7 +4380,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = pipeline.end(stringFromAny(args["rule"]), anyStringSlice(args["aliases"]), format, anyInt(args["maxChars"], 12000))
 		return run, true, nil
 	case "AskUserQuestion":
-		askRun, err := s.executeAskUserQuestion(ctx, narratorID, narrator, draftMessageID, call)
+		askRun, err := s.executeAskUserQuestion(ctx, narratorID, narrator, state, call)
 		return askRun, true, err
 	case "Agent":
 		args["_tool_use_id"] = call.ID
@@ -4439,7 +4492,7 @@ func (s *Service) executeNarratorTool(ctx context.Context, narratorID string, na
 		run.Output = jsonToolOutput(addGoalToolOutput(payload))
 		return run, true, nil
 	case "UpdateGoal":
-		if err := s.ensureSpecialToolCallRecorded(ctx, narratorID, narrator, draftMessageID, call, args); err != nil {
+		if err := s.ensureSpecialToolCallRecorded(ctx, narratorID, narrator, state, call, args); err != nil {
 			return run, true, err
 		}
 		status := normalizeGoalStatus(stringFromAny(args["status"]))
@@ -5361,6 +5414,10 @@ func disabledToolsForSubagentType(subagentType string) []string {
 func allowedToolsForSubagentType(subagentType string, access customSubagentToolAccess) map[string]bool {
 	explorePlan := []string{"Read", "Glob", "Grep", "WebSearch", "WebFetch", "Bash", "Write", "Edit", "TaskCreate", "TeamStatus", "Await", "Send"}
 	general := append(append([]string{}, explorePlan...), "Skill")
+	// search subagents get a web-research-only tool set (mirrors TS SEARCH_TOOLS in
+	// subagent-tools.ts:24-25): WebFetch for follow-up URLs plus the non-interactive
+	// helpers, with NO Read/Glob/Grep/Bash/Write/Edit/WebSearch.
+	searchTools := []string{"WebFetch", "TaskCreate", "TeamStatus", "Await", "Send"}
 	allowed := map[string]bool{}
 	add := func(values []string) {
 		for _, value := range values {
@@ -5385,6 +5442,8 @@ func allowedToolsForSubagentType(subagentType string, access customSubagentToolA
 	switch subagentType {
 	case "general":
 		add(general)
+	case "search":
+		add(searchTools)
 	case "explore", "plan", "review":
 		add(explorePlan)
 	default:
@@ -5395,7 +5454,7 @@ func allowedToolsForSubagentType(subagentType string, access customSubagentToolA
 
 func customSubagentToolAccessForType(subagentType string) customSubagentToolAccess {
 	subagentType = strings.TrimSpace(subagentType)
-	if subagentType == "" || subagentType == "general" || subagentType == "explore" || subagentType == "plan" || subagentType == "review" {
+	if subagentType == "" || subagentType == "general" || subagentType == "explore" || subagentType == "plan" || subagentType == "review" || subagentType == "search" {
 		return customSubagentToolAccess{}
 	}
 	home, err := os.UserHomeDir()
@@ -5493,12 +5552,12 @@ func disabledToolsFromTraits(traits []string) []string {
 // (server/lib/narrator-custom-traits.ts): a per-narrator subagent-model-restriction
 // trait pool (custom) takes precedence over the global
 // settings.agent.subagentAllowedModels[poolKey] (settings); when neither applies the
-// source is "none" (no restriction). poolKey is explore/plan/general (anything else
+// source is "none" (no restriction). poolKey is explore/plan/search/general (anything else
 // maps to general). models is the allowed pool; isExplicitEmpty marks a custom pool
 // that was explicitly configured empty (no model allowed).
 func (s *Service) subagentModelPolicy(parentTraits []string, subagentType string) (source, poolKey string, models []string, isExplicitEmpty bool) {
 	switch subagentType {
-	case "explore", "plan", "general":
+	case "explore", "plan", "search", "general":
 		poolKey = subagentType
 	default:
 		poolKey = "general"
@@ -5507,7 +5566,7 @@ func (s *Service) subagentModelPolicy(parentTraits []string, subagentType string
 	if restriction := parseEncodedTrait(parentTraits, subagentModelRestrictionTraitPrefix); restriction != nil {
 		if pools, ok := restriction["pools"].(map[string]any); ok {
 			directKey := normalizePoolKey(subagentType)
-			builtin := directKey == "explore" || directKey == "plan" || directKey == "general"
+			builtin := directKey == "explore" || directKey == "plan" || directKey == "general" || directKey == "search"
 			if directKey != "" {
 				if entries, exists := pools[directKey]; exists {
 					list := subagentPoolModels(entries)
@@ -5570,11 +5629,11 @@ func (s *Service) subagentAllowedModelsSetting(poolKey string) []string {
 	return models
 }
 
-// subagentModelDefaultPref mirrors the TS subagentPref resolution: explore/plan use
+// subagentModelDefaultPref mirrors the TS subagentPref resolution: explore/plan/search use
 // settings.agent.subagentModels[type]; a custom (non-builtin) subagent type uses its
 // SUBAGENT.md defaultModel. Returns "" when no preference applies.
 func (s *Service) subagentModelDefaultPref(subagentType string) string {
-	if subagentType == "explore" || subagentType == "plan" {
+	if subagentType == "explore" || subagentType == "plan" || subagentType == "search" {
 		if s.Settings == nil {
 			return ""
 		}
@@ -5781,7 +5840,7 @@ func (s *Service) createSubagentNarrator(ctx context.Context, parent Narrator, s
 	if subagentType == "explore" || subagentType == "review" {
 		permission = "readOnly"
 	}
-	systemPrompt := subagentSystemPrompt(subagentType, cwd)
+	systemPrompt := subagentSystemPrompt(subagentType, s.toolLocale(ctx, parent.ID), cwd)
 	traits := []string{"subagent", "subagent-type:" + subagentType}
 	if disabled := disabledToolsForSubagentType(subagentType); len(disabled) > 0 {
 		traits = append(traits, disabledToolsTrait(disabled))
@@ -5921,10 +5980,22 @@ func (s *Service) runBackgroundBashTask(ctx context.Context, cancel context.Canc
 			timeoutCancel()
 		}
 	}()
-	cmd := exec.CommandContext(ctx, "bash", "-lc", command)
-	processCancel := configureBackgroundBashCommand(cmd)
+	// Mirror the foreground Bash tool's shell/env selection (freshShellEnv):
+	// fresh mode runs a login shell with a minimal environment, the default runs a
+	// non-login shell inheriting the server environment.
+	var cmd *exec.Cmd
+	if s.Settings != nil && agentbasic.ToolRuntimeSettingsFromRawSettings(s.Settings.Raw()).FreshShellEnv {
+		cmd = exec.CommandContext(ctx, "bash", "-l", "-c", command)
+		cmd.Env = agentbasic.BuildMinimalBashEnv()
+	} else {
+		cmd = exec.CommandContext(ctx, "bash", "-c", command)
+	}
+	configureBackgroundBashCommand(cmd)
+	// Cancellation flows through the command context: cancel() triggers ctx.Done(),
+	// which makes os/exec invoke cmd.Cancel on its watch goroutine to terminate the
+	// process group. This avoids touching cmd.Process from the caller's goroutine
+	// (which would race with cmd.Run()/Start()).
 	s.registerBackgroundBashCancel(taskID, func() {
-		processCancel()
 		if cancel != nil {
 			cancel()
 		}
@@ -7079,7 +7150,7 @@ func normalizeSubagentType(value string) string {
 	switch value {
 	case "", "general":
 		return "general"
-	case "explore", "plan", "review":
+	case "explore", "plan", "review", "search":
 		return value
 	}
 	cleaned := strings.Builder{}
@@ -7097,20 +7168,180 @@ func normalizeSubagentType(value string) string {
 	return cleaned.String()
 }
 
-func subagentSystemPrompt(subagentType, cwd string) string {
-	base := "You are a NarraFork subagent. Work on the delegated task only and report a concise conclusion."
+// builtinSubagentPrompt returns the bilingual system prompt for the TS
+// BuiltinSubagentType set (explore/plan/general/search), mirroring TS
+// prompt-i18n.ts getSubagentPrompt. Returns ("", false) for review and custom
+// types (review is NOT a TS BuiltinSubagentType — getSubagentPrompt("review")
+// returns null in TS; Go keeps its own one-liner for review).
+//
+// Two adaptations to Go runtime reality (documented in W802 / capability
+// builtinSubagentPrompts):
+//   - explore/plan: the TS "Output — Write your findings/plan to the conclusion
+//     file (Write/Edit auto-redirected)" section references a conclusion-file
+//     redirect mechanism Go does NOT implement (Go explore subagents run readOnly
+//     so Write/Edit are denied, and subagent conclusions are returned as the final
+//     assistant reply via lastAssistantText). Those output sections are rewritten
+//     to instruct returning the distilled findings/plan as the final reply, while
+//     preserving the distillation discipline.
+//   - ${SH}/${sh} shell-tool tokens are fixed to "Bash"/"bash"; Go does not
+//     implement TS detectShell Windows/zsh selection (W794 shellPathDetection:false).
+func builtinSubagentPrompt(subagentType, locale string) (string, bool) {
+	zh := strings.TrimSpace(locale) == "zh-CN"
 	switch subagentType {
 	case "explore":
-		base += " You are in explore mode: inspect and summarize; avoid modifying files."
+		if zh {
+			return `你是一个代码库探索专家。你的职责是搜索、过滤和提炼代码库中的信息，让调用者只获得他们需要的内容——而不是你读到的所有东西。
+
+你的优势：
+- 使用 glob 模式快速查找文件
+- 使用强大的正则表达式搜索代码和文本
+- 阅读和分析文件内容以提取相关细节
+
+准则：
+- 使用 Glob 进行广泛的文件模式匹配
+- 使用 Grep 通过正则搜索文件内容
+- 当你知道具体文件路径时使用 Read
+- Bash 仅用于其他工具无法完成的命令（如 ` + "`ls`、`git log`、`wc -l`、`find`" + `）
+- 返回绝对路径
+- 不要创建任何文件或运行修改系统状态的 bash 命令
+
+Bash 限制——严格执行：
+- 绝对不要使用输出重定向（` + "`>`、`>>`、`|`、`tee`" + `）将结果写入文件。
+- 绝对不要使用 ` + "`cat`、`head`、`tail`、`sed`、`awk`" + ` 读取或输出文件内容。请使用 Read 工具。
+- Bash 仅用于元数据和检查类命令——不用于读写文件内容。
+
+输出——将提炼后的发现作为你的最终回复返回：
+- 你的结论必须是提炼后的摘要，而非原始内容转储。
+- 绝对不要返回完整的文件内容。如果调用者需要完整内容，他们会自己读。
+- 只提取并返回相关的代码片段、函数签名、关键发现或回答问题所需的结构信息。
+- 总结模式和关系，而不是逐字复制代码。
+- 如果你读了 10 个文件但只有 2 个相关，只报告那 2 个文件的具体相关部分。
+- 你的价值在于过滤噪音——如果你的结论和你读的文件一样长，说明你没有完成你的职责。
+
+高效完成搜索请求。`, true
+		}
+		return `You are a codebase exploration specialist. Your purpose is to search, filter, and distill information from codebases so the caller gets only what they need — not everything you read.
+
+Your strengths:
+- Rapidly finding files using glob patterns
+- Searching code and text with powerful regex patterns
+- Reading and analyzing file contents to extract relevant details
+
+Guidelines:
+- Use Glob for broad file pattern matching
+- Use Grep for searching file contents with regex
+- Use Read when you know the specific file path
+- Use Bash only for commands that cannot be done with other tools (e.g. ` + "`ls`, `git log`, `wc -l`, `find`" + `)
+- Return file paths as absolute paths
+- Do not create any files or run bash commands that modify system state
+
+Bash restrictions — STRICTLY ENFORCED:
+- NEVER use output redirection (` + "`>`, `>>`, `|`, `tee`" + `) to write results to files.
+- NEVER use ` + "`cat`, `head`, `tail`, `sed`, `awk`" + ` to read or dump file contents. Use the Read tool instead.
+- Bash is for metadata and inspection commands only — not for reading or writing file content.
+
+Output — return your distilled findings as your final reply:
+- Your conclusion must be a distilled summary, NOT a raw dump.
+- NEVER return full file contents. The caller can read files themselves if they need the complete content.
+- Extract and return ONLY the relevant snippets, function signatures, key findings, or structural information that answers the question.
+- Summarize patterns and relationships instead of copying code verbatim.
+- If you read 10 files but only 2 are relevant, report only those 2 with the specific relevant parts.
+- Your value is in filtering noise — if your conclusion is as long as the files you read, you've failed your purpose.
+
+Complete the search request efficiently.`, true
 	case "plan":
-		base += " You are in plan mode: produce an implementation plan before edits."
-	case "review":
-		base += " You are in review mode: focus on correctness, regressions, security, and maintainability; avoid modifying files."
-	default:
-		base += " This is a custom subagent type; Go backend stores the custom type but does not load SUBAGENT.md prompts yet, so follow the caller prompt exactly."
+		if zh {
+			return `你是一个软件架构师代理，擅长分析代码库和设计实施方案。
+
+你的优势：
+- 理解现有代码模式和架构
+- 识别关键文件和依赖关系
+- 设计分步实施策略
+- 权衡不同方案的利弊
+
+准则：
+- 使用 Read、Glob、Grep 全面探索代码库
+- 识别应复用的现有模式
+- 考虑多种方案并推荐最佳方案
+- 在计划中包含具体的文件路径
+- 不要创建任何文件或运行修改系统状态的 bash 命令
+- 绝对不要使用输出重定向（` + "`>`、`>>`、`|`、`tee`" + `）将结果写入文件
+- 绝对不要使用 ` + "`cat`、`head`、`tail`" + ` 读取文件内容——请使用 Read 工具
+
+输出——将完整的实施方案作为你的最终回复返回。提供一个具体的、可执行的实施方案。`, true
+		}
+		return `You are a software architect agent. You excel at analyzing codebases and designing implementation plans.
+
+Your strengths:
+- Understanding existing code patterns and architecture
+- Identifying critical files and dependencies
+- Designing step-by-step implementation strategies
+- Considering trade-offs between approaches
+
+Guidelines:
+- Use Read, Glob, Grep to explore the codebase thoroughly
+- Identify existing patterns that should be reused
+- Consider multiple approaches and recommend the best one
+- Include specific file paths in your plan
+- Do not create any files or run bash commands that modify system state
+- NEVER use output redirection (` + "`>`, `>>`, `|`, `tee`" + `) to write results to files
+- NEVER use ` + "`cat`, `head`, `tail`" + ` to read file contents — use the Read tool instead
+
+Output — provide the complete implementation plan as your final reply. Provide a concrete, actionable implementation plan.`, true
+	case "general":
+		if zh {
+			return "你是一个执行委派任务的子代理。完成任务并简洁地报告结果。", true
+		}
+		return "You are a subagent executing a delegated task. Complete the task and report your results concisely.", true
+	case "search":
+		if zh {
+			return `你是一个网络搜索专家。你的唯一职责是围绕明确目的调查网页信息，核验最相关的事实，并返回紧凑结果。
+
+规则：
+- 优先使用 provider 原生网络搜索。
+- 只有在搜索后需要展开具体 URL 时才使用 WebFetch。
+- 不要检查或修改本地文件。
+- 不要写代码或执行 shell 命令。
+- 严格围绕给定搜索目的，不要泛化。
+- 如果缺少或不清楚搜索目的，说明必须提供目的。
+
+输出：
+- 简短答案或发现。
+- 关键事实；时间敏感信息必须带日期。
+- 有 URL 时用 markdown 链接列出来源。`, true
+		}
+		return `You are a web search specialist. Your only job is to investigate the requested web topic with a clear purpose, verify the most relevant facts, and return a compact result.
+
+Rules:
+- Use provider-native web search when available.
+- Use WebFetch only for URLs that need more detail after search.
+- Do not inspect or modify local files.
+- Do not write code or execute shell commands.
+- Stay strictly focused on the provided search purpose.
+- If the purpose is missing or unclear, say that a purpose is required.
+
+Output:
+- Brief answer or findings.
+- Key facts with dates when relevant.
+- Sources as markdown links when URLs are available.`, true
 	}
-	if strings.TrimSpace(cwd) != "" {
-		base += " Working directory: " + strings.TrimSpace(cwd)
+	return "", false
+}
+
+func subagentSystemPrompt(subagentType, locale, cwd string) string {
+	_ = cwd // cwd / AGENT.md sections are appended at runtime by agentSystemPrompt; not duplicated here.
+	if prompt, ok := builtinSubagentPrompt(subagentType, locale); ok {
+		return prompt
+	}
+	// review is NOT a TS BuiltinSubagentType (getSubagentPrompt returns null); keep
+	// the Go one-liner. ConcludeReview requires a review-role chapter context that a
+	// general-narrator-spawned review subagent does not necessarily have, so the TS
+	// reviewPrompts text (which mandates ConcludeReview) is intentionally not used here.
+	base := "You are a NarraFork subagent. Work on the delegated task only and report a concise conclusion."
+	if subagentType == "review" {
+		base += " You are in review mode: focus on correctness, regressions, security, and maintainability; avoid modifying files."
+	} else {
+		base += " This is a custom subagent type; Go backend stores the custom type but does not load SUBAGENT.md prompts yet, so follow the caller prompt exactly."
 	}
 	return base
 }
@@ -7192,20 +7423,24 @@ func (s *Service) narratorRunCancelled(ctx context.Context, narratorID string) b
 	return status.Valid && status.String == "cancelled"
 }
 
-func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string, narrator Narrator, draftMessageID *string, call agentbasic.ToolCall) (agentbasic.ToolRun, error) {
+func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string, narrator Narrator, state *agentRunState, call agentbasic.ToolCall) (agentbasic.ToolRun, error) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed", Recorded: true}
-	if draftMessageID == nil {
-		local := ""
-		draftMessageID = &local
-	}
-	if *draftMessageID == "" {
+	var draftMessageID string
+	if state != nil {
+		var err error
+		if draftMessageID, err = s.ensureDraftID(ctx, state); err != nil {
+			return agentbasic.ToolRun{}, err
+		}
+	} else {
+		// Defensive fallback for callers without a run state (e.g. unit tests):
+		// create a standalone assistant draft so the pending tool call has a home.
 		messageID, err := s.createAssistantDraft(ctx, narratorID)
 		if err != nil {
 			return agentbasic.ToolRun{}, err
 		}
-		*draftMessageID = messageID
+		draftMessageID = messageID
 	}
-	if err := s.recordPendingToolCall(ctx, narratorID, *draftMessageID, narrator, call, ""); err != nil {
+	if err := s.recordPendingToolCall(ctx, narratorID, draftMessageID, narrator, call, ""); err != nil {
 		return agentbasic.ToolRun{}, err
 	}
 	s.scheduleAskUserQuestionReflection(ctx, narratorID, call.ID)
@@ -7222,7 +7457,7 @@ func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string,
 		if run.Output == "" {
 			run.Output = "Question was cancelled."
 		}
-		if err := s.finishRecordedToolCall(ctx, narratorID, call.ID, *draftMessageID, run, decision, "fail"); err != nil {
+		if err := s.finishRecordedToolCall(ctx, narratorID, call.ID, draftMessageID, run, decision, "fail"); err != nil {
 			return agentbasic.ToolRun{}, err
 		}
 		_ = s.setNarratorRunSubstatus(ctx, narratorID, narrator.IsBackground, []string{"calling_model"})
@@ -7233,7 +7468,7 @@ func (s *Service) executeAskUserQuestion(ctx context.Context, narratorID string,
 		return agentbasic.ToolRun{}, err
 	}
 	run.Output = formatAskUserAnswers(answers, answerOrder)
-	if err := s.finishRecordedToolCall(ctx, narratorID, call.ID, *draftMessageID, run, decision, "success"); err != nil {
+	if err := s.finishRecordedToolCall(ctx, narratorID, call.ID, draftMessageID, run, decision, "success"); err != nil {
 		return agentbasic.ToolRun{}, err
 	}
 	_ = s.setNarratorRunSubstatus(ctx, narratorID, narrator.IsBackground, []string{"calling_model"})
@@ -7403,9 +7638,18 @@ func skipJSONValue(dec *json.Decoder) error {
 	return nil
 }
 
-func (s *Service) askQuestionReflectionSystemPrompt(mode string) string {
+// askQuestionReflectionSystemPrompt mirrors the TS tool.suggestAnswerSystem
+// (suggest mode) and tool.questionReflectionSystem (reflection mode) i18n
+// messages (i18n.ts:181-190) in both locales.
+func (s *Service) askQuestionReflectionSystemPrompt(mode, locale string) string {
 	if mode == "suggest" {
-		return "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences."
+		if locale == "zh-CN" {
+			return "你是一位资深软件工程顾问。用户正在一次对话中被 AI 编程助手提问。你会收到 <conversation> 标签中的完整对话上下文和 <questions> 标签中的问题。对于每个问题，请结合具体的项目上下文和对话历史，建议最佳实践答案。如果提供了选项，从中选择；否则给出简洁的自由文本答案。只回复一个有效的 JSON 对象，将每个问题的 key 映射到你推荐的答案字符串。不要解释，不要 markdown 代码块。"
+		}
+		return "You are a senior software engineering advisor. The user is being asked one or more questions by an AI coding assistant during a conversation. You will receive the full conversation context in <conversation> tags and the questions in <questions> tags. For each question, suggest the best-practice answer considering the specific project context and conversation history. If options are provided, pick from them; otherwise give a concise free-text answer. Reply with ONLY a valid JSON object mapping each question key to your recommended answer string. No explanation, no markdown fences."
+	}
+	if locale == "zh-CN" {
+		return "你是 NarraFork 的问题反思关卡。AI 编程助手向用户提出了一个或多个问题，但当前会话允许自动继续。请根据对话上下文和项目意图，像谨慎的用户一样回答：选择安全、实用的默认值；当助手推荐项合理时优先采用；不要添加新的需求。如果提供了选项，请精确返回选项 label；多选问题返回用逗号分隔的选项 label。自由文本问题请给出简洁回答。只回复一个有效的 JSON 对象，将每个问题 key 映射到答案字符串。不要解释，不要 markdown 代码块。"
 	}
 	return "You are NarraFork's question reflection gate. An AI coding assistant asked the user one or more questions, but the session is allowed to proceed automatically. Use the conversation context and project intent to answer as a careful user would: choose the safest practical default, prefer the assistant's recommended option when it is reasonable, and avoid adding new requirements. If options are provided, pick option labels exactly; for multi-select questions, return comma-separated option labels. For free-text questions, give a concise answer. Reply with ONLY a valid JSON object mapping each question key to your answer string. No explanation, no markdown fences."
 }
@@ -7572,7 +7816,7 @@ func splitAnswerParts(value string) []string {
 	return out
 }
 
-func (s *Service) GenerateAskUserQuestionAnswers(ctx context.Context, narratorID string, questions []askQuestionInput, mode string) (map[string]string, error) {
+func (s *Service) GenerateAskUserQuestionAnswers(ctx context.Context, narratorID string, questions []askQuestionInput, mode, locale string) (map[string]string, error) {
 	if len(questions) == 0 {
 		return map[string]string{}, nil
 	}
@@ -7590,7 +7834,7 @@ func (s *Service) GenerateAskUserQuestionAnswers(ctx context.Context, narratorID
 	if strings.TrimSpace(contextText) != "" {
 		userMessage = "<conversation>\n" + contextText + "\n</conversation>\n\n<questions>\n" + questionsText + "\n</questions>"
 	}
-	result, err := agentbasic.Generate(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: userMessage}}, "", agentbasic.WithSystemPrompt(s.askQuestionReflectionSystemPrompt(mode)), agentbasic.WithReasoningEffort("none"), agentbasic.WithMaxTurns(1), agentbasic.WithToolScope("reflection"), agentbasic.WithDisabledTools([]string{"DangerConfirm", "DangerCancel", "ExitPlanConfirm", "ExitPlanRevise", "GoalCompleteConfirm", "GoalCompleteRevise"}))
+	result, err := agentbasic.Generate(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: userMessage}}, "", agentbasic.WithSystemPrompt(s.askQuestionReflectionSystemPrompt(mode, locale)), agentbasic.WithReasoningEffort("none"), agentbasic.WithMaxTurns(1), agentbasic.WithToolScope("reflection"), agentbasic.WithDisabledTools([]string{"DangerConfirm", "DangerCancel", "ExitPlanConfirm", "ExitPlanRevise", "GoalCompleteConfirm", "GoalCompleteRevise"}))
 	if err != nil {
 		return nil, err
 	}
@@ -7677,7 +7921,7 @@ func (s *Service) ReflectPendingAskUserQuestion(ctx context.Context, narratorID,
 		return nil, errors.New("no AskUserQuestion questions found")
 	}
 	s.markQuestionReflectionStatus(ctx, narratorID, requestID, toolUseID, "running", "Question reflection is answering AskUserQuestion", input)
-	answers, err := s.GenerateAskUserQuestionAnswers(ctx, narratorID, questions, "reflection")
+	answers, err := s.GenerateAskUserQuestionAnswers(ctx, narratorID, questions, "reflection", s.toolLocale(ctx, narratorID))
 	if err != nil {
 		s.markQuestionReflectionStatus(ctx, narratorID, requestID, toolUseID, "awaiting_user", err.Error(), input)
 		return nil, err
@@ -7877,11 +8121,21 @@ func (s *Service) updateTodos(ctx context.Context, narratorID, toolUseID string,
 	// list (status icon + [id] + content + optional [priority]). Go previously
 	// returned only a single summary line ("Todos updated: ...") and OMITTED the
 	// formatted list entirely, so the model saw a different tool result than TS.
-	// The English header wording matches the TS i18n "tool.todoWriteOutput"
-	// ("Updated todos: N total (C completed, I in progress, P pending)").
-	header := fmt.Sprintf("Updated todos: %d total (%d completed, %d in progress, %d pending)",
-		len(todos), counts["completed"], counts["in_progress"], counts["pending"])
+	// The header text is localized via todoWriteOutputHeader to mirror the TS
+	// i18n "tool.todoWriteOutput" (i18n.ts:164-167) using the narrator owner
+	// locale (TS uses ctx.locale).
+	header := todoWriteOutputHeader(s.toolLocale(ctx, narratorID), len(todos), counts["completed"], counts["in_progress"], counts["pending"])
 	return header + "\n\n" + formatTodosForToolResult(todos), nil
+}
+
+// todoWriteOutputHeader mirrors the TS tool.todoWriteOutput i18n message
+// (i18n.ts:164-167) in both locales, substituting the {total}/{completed}/
+// {inProgress}/{pending} placeholders. Used by the TaskCreate tool result.
+func todoWriteOutputHeader(locale string, total, completed, inProgress, pending int) string {
+	if locale == "zh-CN" {
+		return fmt.Sprintf("已更新待办事项：共 %d 项（%d 已完成，%d 进行中，%d 待处理）", total, completed, inProgress, pending)
+	}
+	return fmt.Sprintf("Updated todos: %d total (%d completed, %d in progress, %d pending)", total, completed, inProgress, pending)
 }
 
 // broadcastSubagentTodosUpdated notifies a subagent's parent narrator that the
@@ -8091,8 +8345,11 @@ func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, g
 	if goal == nil {
 		return reflectionDecision{}, errors.New("goal not found")
 	}
+	requestID := "goal_complete_unknown"
 	if meta != nil {
+		meta.ensure(narratorID)
 		meta.ActiveGoal = goal
+		requestID = meta.RequestID
 		s.markGoalReflectionStatus(ctx, narratorID, meta, "running", "", "")
 	}
 	inputJSON := "{}"
@@ -8101,35 +8358,46 @@ func (s *Service) runGoalCompletionReflection(ctx context.Context, narratorID, g
 			inputJSON = string(raw)
 		}
 	}
-	prompt := fmt.Sprintf(`Goal-completion reflection: the narrator is attempting to mark a user-set goal complete.
-
-Original UpdateGoal input:
-%s
-
-Active goal:
-%s
-
-Recent conversation and tool-result context:
-%s
-
-Agent-provided completion evidence, if any:
-%s
-
-Agent reflection, if any:
-%s
-
-Your job is to prevent premature or lazy completion. Audit the active goal against the conversation, tool-result context, and any explicit evidence above.
-
-Confirm ONLY if every material requirement in the active goal is satisfied by concrete evidence, the result has been verified enough for the task's risk level, and no required work remains. Progress, intent, partial implementation, or a vague final statement is not enough.
-
-Reject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved. When rejecting, include both why completion is blocked and concrete next steps the main narrator should take before trying UpdateGoal again.
-
-You have exactly one response, and you MUST call exactly one tool:
-- GoalCompleteConfirm if the active goal is actually achieved. Include objective-specific evidence.
-- GoalCompleteRevise if more work or verification is needed. Provide feedback and nextSteps. nextSteps must be actionable: name the next verification, implementation, question, or blocker-handling action.
-If you do not call either tool in this one response, the goal completion will be rejected.
-Do not call UpdateGoal from this reflection loop.`, inputJSON, stringFromAny(goal["objective"]), formatGoalReflectionHistory(history, 16000), evidence, reflection)
+	activeGoalJSON := stringFromAny(goal["objective"])
+	if raw, err := json.MarshalIndent(goal, "", "  "); err == nil {
+		activeGoalJSON = string(raw)
+	}
+	goalsJSON := "[]"
+	if raw, err := json.MarshalIndent(goals, "", "  "); err == nil {
+		goalsJSON = string(raw)
+	}
+	locale := s.toolLocale(ctx, narratorID)
+	prompt := goalCompletionReflectionPrompt(requestID, inputJSON, activeGoalJSON, goalsJSON, formatGoalReflectionHistory(history, 16000), evidence, reflection, locale)
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"GoalCompleteConfirm": true, "GoalCompleteRevise": true})
+}
+
+// goalCompletionReflectionPrompt mirrors the TS prompts.goalCompletionReflection
+// template (prompt-i18n.ts:283-329) for both locales, substituting requestId,
+// inputJson, activeGoalJson (the full active goal object, matching TS), and
+// goalsJson (the open goal list). The TS phrasing "the conversation and
+// tool-result evidence available in this reflection loop" is honest in Go even
+// though Go's reflection loop carries no message history: Go inlines that context
+// directly into the prompt via the appended "Recent conversation and tool-result
+// context" / completion-evidence / agent-reflection sections below, so the
+// reflection model genuinely sees the evidence. These inlined sections are a Go
+// addition (history-less reflection loop compensation), kept after the verbatim
+// TS body and separated by a divider.
+func goalCompletionReflectionPrompt(requestID, inputJSON, activeGoalJSON, goalsJSON, historyText, evidence, reflection, locale string) string {
+	if strings.TrimSpace(historyText) == "" {
+		historyText = "(no prior conversation context available)"
+	}
+	if strings.TrimSpace(evidence) == "" {
+		evidence = "(none)"
+	}
+	if strings.TrimSpace(reflection) == "" {
+		reflection = "(none)"
+	}
+	if locale == "zh-CN" {
+		base := "目标完成反思：叙述者正在尝试把一个用户设定的目标标记为完成。\n\n待反思 ID：" + requestID + "\n原始 UpdateGoal 输入：\n" + inputJSON + "\n\n当前活跃目标：\n" + activeGoalJSON + "\n\n开放目标列表：\n" + goalsJSON + "\n\n你的职责是防止过早或偷懒地完成目标。请根据这个 reflection loop 能看到的会话历史和工具结果证据，审计当前活跃目标是否真的达成。\n\n只有在当前活跃目标的每一项实质要求都有具体证据表明已满足、结果已按任务风险程度完成足够验证，并且没有剩余必做工作时，才能确认完成。仅有进展、意图、部分实现，或一句含糊的收尾说明，都不够。\n\n如果任何要求尚未验证、存在歧义、只是部分完成、仍被阻塞、依赖失败/缺失的检查，或会话中缺少具体证据，就必须拒绝完成。把不确定视为尚未达成。拒绝时必须同时说明为什么不能完成，以及主叙述者下一步应该怎么做，避免只返回\u201c未通过\u201d。\n\n你只有一次回复机会，并且必须且只能调用一个工具：\n- 如果当前活跃目标确实已经达成，调用 GoalCompleteConfirm，并给出针对该目标的具体证据。\n- 如果还需要继续工作或补充验证，调用 GoalCompleteRevise，并提供 feedback 和 nextSteps。nextSteps 必须可执行：指出下一步要补充的验证、实现、提问或阻塞处理动作。\n如果你在这一次回复中没有调用任一工具，本次目标完成将被拒绝。\n不要在这个 reflection loop 中调用 UpdateGoal。"
+		return base + "\n\n---\n\n这个 reflection loop 能看到的会话历史和工具结果上下文（由 Go 内联，因为反思 loop 本身不携带消息历史）：\nRecent conversation and tool-result context:\n" + historyText + "\n\nAgent-provided completion evidence, if any:\n" + evidence + "\n\nAgent reflection, if any:\n" + reflection
+	}
+	base := "Goal-completion reflection: the narrator is attempting to mark a user-set goal complete.\n\nPending reflection ID: " + requestID + "\nOriginal UpdateGoal input:\n" + inputJSON + "\n\nActive goal:\n" + activeGoalJSON + "\n\nOpen goal list:\n" + goalsJSON + "\n\nYour job is to prevent premature or lazy completion. Audit the active goal against the conversation and tool-result evidence available in this reflection loop.\n\nConfirm ONLY if every material requirement in the active goal is satisfied by concrete evidence, the result has been verified enough for the task's risk level, and no required work remains. Progress, intent, partial implementation, or a vague final statement is not enough.\n\nReject completion if any requirement is unverified, ambiguous, only partially done, blocked, dependent on a failed/missing check, or if the conversation lacks concrete evidence. Treat uncertainty as not achieved. When rejecting, include both why completion is blocked and concrete next steps the main narrator should take before trying UpdateGoal again.\n\nYou have exactly one response, and you MUST call exactly one tool:\n- GoalCompleteConfirm if the active goal is actually achieved. Include objective-specific evidence.\n- GoalCompleteRevise if more work or verification is needed. Provide feedback and nextSteps. nextSteps must be actionable: name the next verification, implementation, question, or blocker-handling action.\nIf you do not call either tool in this one response, the goal completion will be rejected.\nDo not call UpdateGoal from this reflection loop."
+	return base + "\n\n---\n\nConversation and tool-result evidence available to this reflection loop (inlined by Go because the reflection loop itself carries no message history):\nRecent conversation and tool-result context:\n" + historyText + "\n\nAgent-provided completion evidence, if any:\n" + evidence + "\n\nAgent reflection, if any:\n" + reflection
 }
 
 func formatGoalReflectionHistory(history []agentbasic.Message, maxChars int) string {
@@ -8171,18 +8439,85 @@ func formatGoalReflectionHistory(history []agentbasic.Message, maxChars int) str
 	return text
 }
 
-func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, plan string, allowedPrompts any) (reflectionDecision, error) {
-	allowedJSON, _ := json.MarshalIndent(allowedPrompts, "", "  ")
-	prompt := fmt.Sprintf(`Review this ExitPlanMode plan before it is submitted for user approval.
-
-Plan:
-%s
-
-Allowed command prompt categories:
-%s
-
-If the plan is concrete, actionable, and has no obvious gaps, call ExitPlanConfirm with confirm=true. If it needs more detail, has unresolved decisions, or should be revised first, call ExitPlanRevise with confirm=true and actionable feedback.`, plan, string(allowedJSON))
+func (s *Service) runExitPlanReflection(ctx context.Context, narratorID, requestID, plan string, args map[string]any, allowedPrompts any) (reflectionDecision, error) {
+	// Build the reflection input mirroring TS resolveExitPlanModeInput's
+	// effectiveInput = {...input, plan: <resolved>}: copy the original args and
+	// overwrite plan with the resolved plan text so {inputJson} reflects what the
+	// user will actually approve.
+	reflectionInput := map[string]any{}
+	for k, v := range args {
+		reflectionInput[k] = v
+	}
+	reflectionInput["plan"] = plan
+	inputJSON := "{}"
+	if raw, err := json.MarshalIndent(reflectionInput, "", "  "); err == nil {
+		inputJSON = string(raw)
+	}
+	locale := s.toolLocale(ctx, narratorID)
+	prompt := exitPlanReflectionPrompt(requestID, inputJSON, plan, formatExitPlanAllowedPromptsList(allowedPrompts), locale)
 	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"ExitPlanConfirm": true, "ExitPlanRevise": true})
+}
+
+// formatExitPlanAllowedPromptsList mirrors TS formatAllowedPrompts
+// (loop.ts:716-726): empty / non-array -> "- (none)", otherwise one
+// "- [tool: ]prompt" line per entry with a non-empty prompt (entries with an
+// empty prompt are skipped; if all are skipped the result is "- (none)").
+// Accepts both the normalized []map[string]any shape (after
+// normalizeExitPlanAllowedPrompts) and a raw []any of map entries.
+func formatExitPlanAllowedPromptsList(value any) string {
+	none := "- (none)"
+	var items []any
+	switch v := value.(type) {
+	case []map[string]any:
+		for _, entry := range v {
+			items = append(items, entry)
+		}
+	case []any:
+		items = v
+	default:
+		return none
+	}
+	if len(items) == 0 {
+		return none
+	}
+	lines := []string{}
+	for _, raw := range items {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		prompt := strings.TrimSpace(stringFromAny(entry["prompt"]))
+		if prompt == "" {
+			continue
+		}
+		tool := strings.TrimSpace(stringFromAny(entry["tool"]))
+		if tool != "" {
+			lines = append(lines, "- "+tool+": "+prompt)
+		} else {
+			lines = append(lines, "- "+prompt)
+		}
+	}
+	if len(lines) == 0 {
+		return none
+	}
+	return strings.Join(lines, "\n")
+}
+
+// exitPlanReflectionPrompt mirrors the TS prompts.exitPlanReflection base
+// template (prompt-i18n.ts:235-273) for both locales, substituting the four
+// placeholders. The exitPlanReflectionAutoCompact suffix is intentionally NOT
+// ported: Go does not implement ExitPlanConfirmAndCompact
+// (planMode.exitPlanApproval.reflectionAutoCompactSupported=false), and TS only
+// appends that suffix when planReflectionAllowAutoCompact is enabled. This base
+// template does not reference conversation history, so it ports cleanly to Go's
+// history-less reflection loop (unlike dangerReflection/goalCompletionReflection,
+// which reference the parent conversation history that the Go reflection loop
+// does not carry).
+func exitPlanReflectionPrompt(requestID, inputJSON, planText, allowedPromptsList, locale string) string {
+	if locale == "zh-CN" {
+		return "ExitPlanMode 反思：一个计划即将提交给用户审批。\n\n待反思 ID：" + requestID + "\n原始 ExitPlanMode 输入：\n" + inputJSON + "\n\n已解析计划：\n" + planText + "\n\n可选的实现权限说明（仅用于就绪度检查，不授予权限）：\n" + allowedPromptsList + "\n\n请在计划触达用户前检查其是否已准备好：是否具体、可执行、范围匹配用户请求，并且没有本应提前澄清的未决选择。\n\n你只有一次回复机会，并且必须且只能调用一个允许的工具：\n- 如果计划已经可以提交给用户审批，调用 ExitPlanConfirm。\n- 如果计划还需要更多细节、存在未决选择，或应先修改再给用户审批，调用 ExitPlanRevise。\n如果你在这一次回复中没有调用允许的 reflection 工具，该计划提交将被视为需要修改。\n不要在这个反思 loop 中调用 ExitPlanMode。"
+	}
+	return "ExitPlanMode reflection: a plan is about to be submitted to the user for approval.\n\nPending reflection ID: " + requestID + "\nOriginal ExitPlanMode input:\n" + inputJSON + "\n\nResolved plan:\n" + planText + "\n\nPrompt-based permissions requested:\n" + allowedPromptsList + "\n\nReview the plan for readiness before it reaches the user. Check that it is specific, actionable, scoped to the request, and does not contain unresolved choices that should have been clarified first.\n\nYou have exactly one response, and you MUST call exactly one allowed tool:\n- ExitPlanConfirm if the plan is ready to present to the user for approval.\n- ExitPlanRevise if the plan needs more detail, has unresolved decisions, or should be revised before user approval.\nIf you do not call an allowed reflection tool in this one response, the plan submission will be treated as needing revision.\nDo not call ExitPlanMode from this reflection loop."
 }
 
 type dangerReflectionLevel string
@@ -8204,6 +8539,28 @@ const (
 type dangerReflectionInfo struct {
 	Severity dangerSeverity
 	Summary  string
+	// Consequences, SaferAlternatives and Details mirror the TS DangerInfo
+	// structured fields (server/services/narrator-permission.ts danger()).
+	// They feed the verbatim TS dangerReflection prompt template
+	// (prompt-i18n.ts:331-400) via dangerReflectionPrompt.
+	Consequences      []string
+	SaferAlternatives []string
+	Details           []string
+}
+
+// danger mirrors the TS danger() factory (narrator-permission.ts:1171-1179):
+// it assembles a dangerReflectionInfo with a default severity of medium.
+func danger(summary string, consequences, saferAlternatives, details []string, severity dangerSeverity) dangerReflectionInfo {
+	if severity == "" {
+		severity = dangerSeverityMedium
+	}
+	return dangerReflectionInfo{
+		Severity:          severity,
+		Summary:           summary,
+		Consequences:      consequences,
+		SaferAlternatives: saferAlternatives,
+		Details:           details,
+	}
 }
 
 func normalizeDangerReflectionLevel(value any, legacyEnabled bool) dangerReflectionLevel {
@@ -8334,7 +8691,19 @@ func classifyDangerReflectionToolCall(cwd string, call agentbasic.ToolCall, skip
 	case "write", "notebookedit":
 		paths := toolPermissionPaths(cwd, name, args)
 		if hasExternalToolPath(cwd, paths) {
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: name + " targets paths outside the current working directory."}, true
+			return danger(
+				name+" targets paths outside the current working directory.",
+				[]string{
+					"The operation crosses the chapter/worktree boundary.",
+					"External files may not be covered by project git history or NarraFork snapshots.",
+				},
+				[]string{
+					"Operate inside the worktree when possible.",
+					"Use explicit user approval for external files.",
+				},
+				externalPathDetails(cwd, paths),
+				dangerSeverityHigh,
+			), true
 		}
 	case "agent":
 		subagentType := strings.ToLower(strings.TrimSpace(stringFromAny(args["subagent_type"])))
@@ -8348,7 +8717,19 @@ func classifyDangerReflectionToolCall(cwd string, call agentbasic.ToolCall, skip
 		base := resolvePermissionPath(cwd, ".")
 		resolved := resolvePermissionPath(cwd, workdir)
 		if !pathInsideOrEqual(base, resolved) || resolved != base {
-			return dangerReflectionInfo{Severity: dangerSeverityMedium, Summary: "Write-capable subagent requests a custom working directory."}, true
+			return danger(
+				"Write-capable subagent requests a custom working directory.",
+				[]string{
+					"The subagent may operate outside the parent narrator's current workspace.",
+					"A write-capable subagent can modify files the parent did not inspect.",
+				},
+				[]string{
+					"Use the inherited working directory when possible.",
+					"Use an explore/plan subagent for read-only investigation first.",
+				},
+				[]string{"Requested workdir: " + resolved},
+				dangerSeverityMedium,
+			), true
 		}
 	}
 	return dangerReflectionInfo{}, false
@@ -8362,29 +8743,81 @@ func classifyBashDanger(cwd string, args map[string]any, skipReadOnlyConfirmatio
 	if info, ok := classifyGitDanger(command); ok {
 		return info, true
 	}
-	if hasDestructiveShellPattern(command) {
-		return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command deletes files or executes a broad find action."}, true
+	if info, ok := classifyDestructiveShellDanger(command); ok {
+		return info, true
 	}
 	if hasDangerousShellExecutionPattern(command) {
-		return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command contains dangerous execution patterns."}, true
+		return danger(
+			"Shell command contains dangerous execution patterns.",
+			[]string{
+				"The command may execute downloaded, nested, or environment-injected code.",
+				"Side effects may be broader than the visible command line suggests.",
+			},
+			[]string{
+				"Inspect the command source first.",
+				"Break the command into read-only inspection and explicit execution steps.",
+			},
+			[]string{"Command: " + command},
+			dangerSeverityHigh,
+		), true
 	}
 	if !bashCommandAllowedBySimplePolicy(command) {
-		return dangerReflectionInfo{Severity: dangerSeverityMedium, Summary: "Shell command includes commands outside the safety allowlist."}, true
+		return danger(
+			"Shell command includes commands outside the safety allowlist.",
+			[]string{
+				"The command may run code, invoke a package/script, change system state, or perform side effects that NarraFork cannot classify as read-only.",
+				"In Bypass All mode this would otherwise execute without user approval.",
+			},
+			[]string{
+				"Use a dedicated NarraFork tool for read/write operations when possible.",
+				"Break the command into smaller inspected steps or add a narrow command whitelist rule if this exact command is trusted.",
+			},
+			[]string{"Command: " + command},
+			dangerSeverityMedium,
+		), true
 	}
 	paths := toolPermissionPaths(cwd, "bash", args)
 	if hasExternalToolPath(cwd, paths) {
 		if shellCommandAppearsWrite(command) {
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Shell command writes outside the current working directory."}, true
+			return danger(
+				"Shell command accesses paths outside the current working directory.",
+				[]string{
+					"The command may read or modify files outside this chapter/worktree boundary.",
+					"Those files may not be covered by NarraFork snapshots or git recovery.",
+				},
+				[]string{
+					"Copy needed data into the worktree first.",
+					"Use a narrower command scoped to explicit paths.",
+				},
+				externalPathDetails(cwd, paths),
+				dangerSeverityHigh,
+			), true
 		}
 		if skipReadOnlyConfirmations {
 			return dangerReflectionInfo{}, false
 		}
-		return dangerReflectionInfo{Severity: dangerSeverityLow, Summary: "Shell command reads paths outside the current working directory."}, true
+		return danger(
+			"Shell command accesses paths outside the current working directory.",
+			[]string{
+				"The command may read or modify files outside this chapter/worktree boundary.",
+				"Those files may not be covered by NarraFork snapshots or git recovery.",
+			},
+			[]string{
+				"Copy needed data into the worktree first.",
+				"Use a narrower command scoped to explicit paths.",
+			},
+			externalPathDetails(cwd, paths),
+			dangerSeverityLow,
+		), true
 	}
 	return dangerReflectionInfo{}, false
 }
 
-func hasDestructiveShellPattern(command string) bool {
+// classifyDestructiveShellDanger mirrors the TS classifyShellDanger rm/rmdir/shred
+// and find -delete/-exec branches (narrator-permission.ts:1506-1532), producing
+// the verbatim structured consequences/saferAlternatives/details for the danger
+// reflection prompt. Returns (info, true) for the first destructive command.
+func classifyDestructiveShellDanger(command string) (dangerReflectionInfo, bool) {
 	for _, tokens := range splitShellCommands(command) {
 		if len(tokens) == 0 {
 			continue
@@ -8392,16 +8825,55 @@ func hasDestructiveShellPattern(command string) bool {
 		name := strings.TrimSpace(tokens[0])
 		switch name {
 		case "rm", "rmdir", "shred":
-			return true
+			recursive := false
+			for _, arg := range tokens[1:] {
+				if arg == "--recursive" || (strings.HasPrefix(arg, "-") && strings.Contains(arg, "r")) {
+					recursive = true
+					break
+				}
+			}
+			suffix := ""
+			if recursive {
+				suffix = " recursively"
+			}
+			return danger(
+				name+" deletes files"+suffix+".",
+				[]string{
+					"Deleted files may not be recoverable from git if they are untracked or ignored.",
+					"The operation can remove user work that the agent did not create.",
+				},
+				[]string{
+					"List the target paths first.",
+					"Prefer moving files to a temporary trash directory.",
+				},
+				[]string{"Command: " + shellCommandText(tokens)},
+				dangerSeverityHigh,
+			), true
 		case "find":
-			for _, token := range tokens[1:] {
-				if token == "-delete" || token == "-exec" {
-					return true
+			for _, arg := range tokens[1:] {
+				if arg == "-delete" || arg == "-exec" {
+					return danger(
+						"Find is being used with deletion or command execution.",
+						[]string{"It can affect many matching files at once, including files the agent did not inspect."},
+						[]string{
+							"Run the same find command without -delete/-exec first.",
+							"Apply changes to explicit paths.",
+						},
+						[]string{"Command: " + shellCommandText(tokens)},
+						dangerSeverityHigh,
+					), true
 				}
 			}
 		}
 	}
-	return false
+	return dangerReflectionInfo{}, false
+}
+
+// shellCommandText reassembles a token slice into a readable command string for
+// danger detail lines (the Go shell splitter loses original spacing, so this is
+// a best-effort space-joined reconstruction).
+func shellCommandText(tokens []string) string {
+	return strings.Join(tokens, " ")
 }
 
 func hasDangerousShellExecutionPattern(command string) bool {
@@ -8439,50 +8911,155 @@ func classifyGitDanger(command string) (dangerReflectionInfo, bool) {
 			continue
 		}
 		sub, args := gitSubcommand(tokens)
-		summary := "Git " + sub + " may change repository state."
+		detail := []string{"Command: " + shellCommandText(tokens)}
 		switch sub {
 		case "reset":
 			if len(args) > 0 || hasAnyArg(args, "--hard", "--merge", "--keep") {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git reset may rewrite the current worktree/index state."}, true
+				return danger(
+					"Git reset may rewrite the current worktree/index state.",
+					[]string{
+						"Uncommitted work can be discarded or unstaged.",
+						"HEAD/index changes can be hard to reconstruct without reflog or backups.",
+					},
+					[]string{"Run git status and git diff first.", "Create a backup branch or stash before resetting."},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 		case "clean":
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git clean removes untracked files from the worktree."}, true
+			return danger(
+				"Git clean removes untracked files from the worktree.",
+				[]string{
+					"Untracked files are often not recoverable from git.",
+					"Generated artifacts, local notes, or new source files may be deleted.",
+				},
+				[]string{"Run git clean -nd first to preview.", "Delete only specific paths if possible."},
+				detail,
+				dangerSeverityHigh,
+			), true
 		case "checkout":
 			if checkoutRestoresPath(args) {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git checkout may discard local path changes."}, true
+				return danger(
+					"Git checkout is being used to restore paths and may discard local changes.",
+					[]string{"Modified files can be reverted without preserving the previous content."},
+					[]string{"Inspect git diff first.", "Restore only the specific files that must be reverted."},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 		case "restore":
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git restore may discard local file changes."}, true
+			return danger(
+				"Git restore may discard local file changes.",
+				[]string{"Affected files can be reverted without preserving the previous content."},
+				[]string{"Inspect git diff first.", "Restore only specific files rather than the whole tree."},
+				detail,
+				dangerSeverityHigh,
+			), true
 		case "push":
 			if hasAnyArg(args, "--force", "-f", "--force-with-lease", "--delete", "-d") || hasArgPrefix(args, "--force-with-lease=") {
-				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git push may rewrite or delete remote history."}, true
+				return danger(
+					"Git push may rewrite or delete remote history.",
+					[]string{
+						"Remote commits or branches can be overwritten or removed for collaborators.",
+						"Recovery may require remote reflogs or manual intervention.",
+					},
+					[]string{
+						"Prefer a normal push.",
+						"If force is necessary, verify the remote branch and use --force-with-lease.",
+					},
+					detail,
+					dangerSeverityCritical,
+				), true
 			}
 		case "branch":
 			if hasAnyArg(args, "-d", "-D", "--delete") {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git branch deletion removes a local branch reference."}, true
+				return danger(
+					"Git branch deletion removes a local branch reference.",
+					[]string{"Commits reachable only from that branch can become difficult to find."},
+					[]string{"Check git branch --merged and note the commit hash before deleting."},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 		case "worktree":
 			if hasAnyArg(args, "remove") {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git worktree remove deletes a worktree checkout."}, true
+				return danger(
+					"Git worktree remove deletes a worktree checkout.",
+					[]string{"Uncommitted files in that worktree may be lost."},
+					[]string{
+						"Run git -C <worktree> status first.",
+						"Commit, stash, or copy important files before removal.",
+					},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 		case "filter-branch", "filter-repo", "rebase":
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: summary}, true
+			return danger(
+				"Git "+sub+" rewrites commit history.",
+				[]string{"Commit hashes change and collaborators may need manual recovery steps."},
+				[]string{
+					"Create a backup branch first.",
+					"Prefer a new commit if history rewriting is not required.",
+				},
+				detail,
+				dangerSeverityHigh,
+			), true
 		case "rm":
-			return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git rm deletes tracked files from the worktree and index."}, true
+			return danger(
+				"Git rm deletes tracked files from the worktree and index.",
+				[]string{"Files will be removed and staged for deletion."},
+				[]string{"Use git status first.", "Remove only specific intended files."},
+				detail,
+				dangerSeverityHigh,
+			), true
 		case "reflog":
 			if hasAnyArg(args, "expire") {
-				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git reflog expire can destroy recovery points."}, true
+				return danger(
+					"Git reflog expire can destroy recovery points.",
+					[]string{"Future recovery from accidental resets or rebases may become impossible."},
+					[]string{"Avoid expiring reflogs during agent work unless explicitly required."},
+					detail,
+					dangerSeverityCritical,
+				), true
 			}
 		case "stash":
 			if len(args) > 0 && args[0] == "drop" {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git stash drop permanently removes a stash entry."}, true
+				return danger(
+					"Git stash drop permanently removes a stash entry.",
+					[]string{
+						"The stashed changes cannot be recovered after dropping.",
+						"If the stash contains important uncommitted work, it will be lost.",
+					},
+					[]string{"Run git stash list first to inspect.", "Apply the stash before dropping it."},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 			if len(args) > 0 && args[0] == "clear" {
-				return dangerReflectionInfo{Severity: dangerSeverityCritical, Summary: "Git stash clear removes all stash entries."}, true
+				return danger(
+					"Git stash clear removes all stash entries.",
+					[]string{
+						"All stashed changes will be permanently lost.",
+						"Recovery is not possible after clearing the stash.",
+					},
+					[]string{"Run git stash list first to inspect.", "Apply or pop important stashes before clearing."},
+					detail,
+					dangerSeverityCritical,
+				), true
 			}
 		case "gc":
 			if hasArgPrefix(args, "--prune") {
-				return dangerReflectionInfo{Severity: dangerSeverityHigh, Summary: "Git gc --prune can permanently remove unreachable objects."}, true
+				return danger(
+					"Git gc --prune can permanently remove unreachable objects.",
+					[]string{"Commits/files recoverable only via dangling objects may be deleted."},
+					[]string{
+						"Avoid aggressive pruning during agent work.",
+						"Create a backup ref first if pruning is required.",
+					},
+					detail,
+					dangerSeverityHigh,
+				), true
 			}
 		}
 	}
@@ -8552,18 +9129,204 @@ func checkoutRestoresPath(args []string) bool {
 	return false
 }
 
-func (s *Service) runDangerReflection(ctx context.Context, narratorID string, call agentbasic.ToolCall) (reflectionDecision, error) {
-	prompt := fmt.Sprintf(`Review this potentially dangerous tool call before it is executed.
-
-Tool: %s
-Input JSON:
-%s
-
-If this tool call is acceptable, call DangerConfirm with confirm=true. If it should not run, call DangerCancel with confirm=true and actionable feedback.`, call.Function.Name, call.Function.Arguments)
-	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"DangerConfirm": true, "DangerCancel": true})
+func (s *Service) runDangerReflection(ctx context.Context, narratorID string, narrator Narrator, cwd string, call agentbasic.ToolCall, history []agentbasic.Message) (reflectionDecision, error) {
+	level := effectiveDangerReflectionLevel(s.Settings, narrator)
+	if level == dangerReflectionOff {
+		level = dangerReflectionStandard
+	}
+	info, ok := classifyDangerReflectionToolCall(cwd, call, dangerSkipReadOnlyConfirmations(s.Settings))
+	if !ok {
+		// The permission-driven "ask" path can reach danger reflection without a
+		// structured classification; synthesize a generic medium-severity info so
+		// the verbatim TS template still renders its consequences/alternatives.
+		info = danger(
+			"This tool call requires review before it executes.",
+			[]string{"The tool call may modify files or system state.", "In Bypass All mode it would otherwise execute without user approval."},
+			[]string{"Confirm only if the operation clearly matches the current task.", "Cancel if necessity is unclear or a safer alternative exists."},
+			nil,
+			dangerSeverityMedium,
+		)
+	}
+	locale := s.toolLocale(ctx, narratorID)
+	inputJSON := call.Function.Arguments
+	if formatted := formatDangerInputJSON(call.Function.Arguments); formatted != "" {
+		inputJSON = formatted
+	}
+	prompt := dangerReflectionPrompt(call.ID, call.Function.Name, inputJSON, info, level, formatGoalReflectionHistory(history, 16000), locale)
+	return s.runReflection(ctx, narratorID, prompt, map[string]bool{"DangerConfirm": true, "DangerCancel": true}, parseDangerReflectionTextFallback)
 }
 
-func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, allowed map[string]bool) (reflectionDecision, error) {
+// formatDangerInputJSON pretty-prints the tool arguments to mirror TS
+// JSON.stringify(input, null, 2). Returns "" on parse failure so the caller can
+// fall back to the raw arguments string.
+func formatDangerInputJSON(rawArgs string) string {
+	var parsed any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(rawArgs)), &parsed); err != nil {
+		return ""
+	}
+	out, err := json.MarshalIndent(parsed, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+// dangerBulletList mirrors the TS bulletList helper (loop.ts:611-613):
+// one "- item" line per entry. Empty input yields "- (none)" so the rendered
+// prompt never leaves a blank section.
+func dangerBulletList(items []string) string {
+	if len(items) == 0 {
+		return "- (none)"
+	}
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		lines = append(lines, "- "+item)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatDangerDetails mirrors the TS formatDangerDetails helper (loop.ts:615-620):
+// empty details render to "" (no Details section), otherwise a leading newline +
+// localized "Details:" header + bullet list.
+func formatDangerDetails(details []string, locale string) string {
+	if len(details) == 0 {
+		return ""
+	}
+	if locale == "zh-CN" {
+		return "\n详情：\n" + dangerBulletList(details)
+	}
+	return "\nDetails:\n" + dangerBulletList(details)
+}
+
+// formatDangerReflectionLevelForPrompt mirrors the TS helper (loop.ts:622-644).
+func formatDangerReflectionLevelForPrompt(level dangerReflectionLevel, locale string) string {
+	if locale == "zh-CN" {
+		switch level {
+		case dangerReflectionLight:
+			return "宽松"
+		case dangerReflectionStrict:
+			return "严格"
+		default:
+			return "中等"
+		}
+	}
+	switch level {
+	case dangerReflectionLight:
+		return "Light"
+	case dangerReflectionStrict:
+		return "Strict"
+	default:
+		return "Medium"
+	}
+}
+
+// buildDangerReflectionLevelGuidance mirrors the TS helper (loop.ts:646-692).
+func buildDangerReflectionLevelGuidance(level dangerReflectionLevel, locale string) string {
+	if locale == "zh-CN" {
+		switch level {
+		case dangerReflectionLight:
+			return strings.Join([]string{
+				"当前为宽松档：通常只会拦截高风险或关键风险。",
+				"本轮反思应重点寻找真实的破坏性、状态变更、网络/供应链、权限提升、历史改写或外部路径风险。",
+				"如果操作与用户意图明确一致、范围清楚、收益必要且没有明显误操作迹象，可以确认；不要因为只是存在抽象风险就取消。",
+			}, "\n")
+		case dangerReflectionStrict:
+			return strings.Join([]string{
+				"当前为严格档：低风险也可能触发反思，审查应更保守，但不要机械拒绝。",
+				"低影响、只读、边界明确且紧扣任务的操作可以确认；任何写入、删除、网络、供应链、外部路径或难以检查的副作用都需要更强的必要性证明。",
+				"若上下文不足、命令可能过期/误复制、或替代方案能显著降低风险，应取消。",
+			}, "\n")
+		default:
+			return strings.Join([]string{
+				"当前为中等档：对中风险及以上操作做平衡审查。",
+				"确认前必须同时满足：符合当前任务、仍有必要、目标范围明确、风险收益成立。",
+				"如果存在实质更安全且不会丢失任务目标的替代方案，或者必要性不清楚，应取消。",
+			}, "\n")
+		}
+	}
+	switch level {
+	case dangerReflectionLight:
+		return strings.Join([]string{
+			"Current level: Light. This level usually pauses only high or critical risks.",
+			"Focus on real destructive, state-changing, network/supply-chain, privilege, history-rewrite, or external-path risk.",
+			"If the operation clearly matches user intent, has a bounded scope, is necessary, and does not look accidental, you may confirm; do not cancel merely for abstract risk.",
+		}, "\n")
+	case dangerReflectionStrict:
+		return strings.Join([]string{
+			"Current level: Strict. Even low-risk operations may pause, so be conservative but not mechanical.",
+			"Low-impact, read-only, bounded, task-aligned operations can be confirmed; writes, deletions, network/supply-chain actions, external paths, or hard-to-inspect side effects require stronger necessity.",
+			"Cancel when context is insufficient, the command may be stale/accidental, or a safer alternative materially reduces risk.",
+		}, "\n")
+	default:
+		return strings.Join([]string{
+			"Current level: Medium. This level performs balanced review for medium and higher risks.",
+			"Confirm only when the operation matches the current task, remains necessary, has a clear target scope, and has a justified risk/reward tradeoff.",
+			"Cancel if a materially safer alternative preserves the task goal, or if necessity is unclear.",
+		}, "\n")
+	}
+}
+
+// dangerReflectionPrompt mirrors the TS prompts.dangerReflection template
+// (prompt-i18n.ts:331-400) substituted via buildDangerReflectionPrompt
+// (loop.ts:696-714) for both locales. The TS template references "the
+// conversation history available to this reflection loop"; Go's reflection loop
+// carries no message history (runReflection passes only the prompt), so the same
+// recent conversation/tool-result context is inlined after the verbatim TS body
+// (the documented history-less reflection-loop compensation, identical to
+// goalCompletionReflectionPrompt).
+func dangerReflectionPrompt(requestID, toolName, inputJSON string, info dangerReflectionInfo, level dangerReflectionLevel, historyText, locale string) string {
+	severity := string(info.Severity)
+	if severity == "" {
+		severity = string(dangerSeverityMedium)
+	}
+	levelLabel := formatDangerReflectionLevelForPrompt(level, locale)
+	levelGuidance := buildDangerReflectionLevelGuidance(level, locale)
+	detailsSection := formatDangerDetails(info.Details, locale)
+	consequences := dangerBulletList(info.Consequences)
+	alternatives := dangerBulletList(info.SaferAlternatives)
+	if strings.TrimSpace(historyText) == "" {
+		historyText = "(no prior conversation context available)"
+	}
+
+	if locale == "zh-CN" {
+		base := "危险反思暂停：一个风险工具调用正在等待确认，尚未执行。\n\n待确认请求 ID：" + requestID +
+			"\n原始工具：" + toolName + "\n原始输入：\n" + inputJSON +
+			"\n\n检测到的风险：\n- 风险等级：" + severity + "\n- 反思档位：" + levelLabel + "\n- " + info.Summary + detailsSection +
+			"\n\n可能后果：\n" + consequences +
+			"\n\n可考虑的更安全替代方案：\n" + alternatives +
+			"\n\n当前档位审查策略：\n" + levelGuidance +
+			"\n\n请简短反思。利用这个 reflection loop 能看到的会话历史：判断这个精确操作是否符合用户请求和当前任务，是否有足够必要性继续执行，以及它是否像误操作、过期命令或复制错的命令。" +
+			"\n\n判断具体输入，而不是只看通用风险标签。语法上高风险的包装（例如 `bun -e`、`node -e` 或 shell 串联）在可见 payload 有边界、仅用于检查/输出，并且不写入/删除文件、不安装包、不拉取远程代码、不派生子进程、不修改环境或状态、不访问敏感外部路径时，仍可以接受。" +
+			"\n\n权衡风险和必要性。低影响/只读的具体输入在符合任务时可以较容易确认。真正危险或会改变状态的操作也可以确认，但必须经过当前档位对应的审视：它需要明确符合用户意图，足够重要，没有能保留任务目标且实质更安全的替代方案，并且预期收益足以证明风险合理。" +
+			"\n\n你只有一次回复机会，并且必须且只能调用一个工具；不要只输出普通文本。" +
+			"\n- 在确认该操作是有意的、由会话/任务上下文支撑、仍然必要或有价值，并且满足当前档位审查策略之后，调用 DangerConfirm，可附带可选的 reflection。这可以包括明确符合意图且再三考虑后非常必要的危险操作。" +
+			"\n- 如果该操作不明确符合会话/任务、可能是误操作、已经不再必要、存在未被必要性证明的破坏性/状态变更/网络/供应链/提权/难以检查的副作用风险，或替代方案能在不丢失关键信息的前提下实质降低风险，调用 DangerCancel，可附带可选的 reason。" +
+			"\n不要仅仅因为理论上可能存在更安全替代方案就取消；但如果必要性不清楚，或不满足当前档位审查策略，应取消。" +
+			"\n如果 provider/工具限制导致无法发出工具调用，则只能输出一个精确 fallback 标签：<DangerDecision>{\"action\":\"confirm\",\"reflection\":\"...\"}</DangerDecision> 或 <DangerDecision>{\"action\":\"cancel\",\"reason\":\"...\"}</DangerDecision>。" +
+			"\n如果你在这一次回复中没有调用任一工具，也没有输出有效 fallback 标签，该操作将被视为已取消。" +
+			"\n不要在这个反思 loop 中调用原始工具。"
+		return base + "\n\n---\n\n这个 reflection loop 能看到的会话历史和工具结果上下文（由 Go 内联，因为反思 loop 本身不携带消息历史）：\nRecent conversation and tool-result context:\n" + historyText
+	}
+
+	base := "Danger reflection pause: a risky tool call is pending and has NOT executed yet.\n\nPending request ID: " + requestID +
+		"\nOriginal tool: " + toolName + "\nOriginal input:\n" + inputJSON +
+		"\n\nDetected risk:\n- Severity: " + severity + "\n- Reflection level: " + levelLabel + "\n- " + info.Summary + detailsSection +
+		"\n\nPossible consequences:\n" + consequences +
+		"\n\nSafer alternatives to consider:\n" + alternatives +
+		"\n\nLevel-specific review policy:\n" + levelGuidance +
+		"\n\nReflect briefly. Use the conversation history available to this reflection loop: judge whether this exact operation matches the user's request and the current task, whether it is necessary enough to proceed, and whether it looks like an accidental or stale command." +
+		"\n\nJudge the concrete input, not just the generic risk label. A syntactically risky wrapper (for example `bun -e`, `node -e`, or a shell chain) can still be acceptable when the visible payload is bounded, inspection-only, and does not write/delete files, install packages, fetch remote code, spawn subprocesses, modify environment/state, or access sensitive external paths." +
+		"\n\nYou have exactly one response, and you MUST call exactly one tool. Do not answer with plain text only." +
+		"\n- Call DangerConfirm with an optional reflection after confirming the operation is intentional, contextually justified by the conversation/task, still useful, and acceptable under the current reflection level's review policy." +
+		"\n- Call DangerCancel with an optional reason if the operation does not clearly match the conversation/task, may be accidental, is no longer necessary, has meaningful destructive/state-changing/network/supply-chain/privilege/hard-to-inspect side-effect risk that is not justified by necessity, or if a materially safer alternative preserves the task without losing important information." +
+		"\nDo not cancel merely because some safer alternative might exist in theory, but do cancel if necessity is unclear or the current level-specific review policy is not satisfied." +
+		"\nIf a provider/tooling limitation prevents a tool call, output exactly one fallback tag instead: <DangerDecision>{\"action\":\"confirm\",\"reflection\":\"...\"}</DangerDecision> or <DangerDecision>{\"action\":\"cancel\",\"reason\":\"...\"}</DangerDecision>." +
+		"\nIf you do not call either tool or emit a valid fallback tag in this one response, the operation will be treated as cancelled." +
+		"\nDo not call the original tool from this reflection loop."
+	return base + "\n\n---\n\nConversation and tool-result evidence available to this reflection loop (inlined by Go because the reflection loop itself carries no message history):\nRecent conversation and tool-result context:\n" + historyText
+}
+
+func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, allowed map[string]bool, fallbackParsers ...func(text string) (reflectionDecision, bool)) (reflectionDecision, error) {
 	narrator, err := s.Get(ctx, narratorID)
 	if err != nil {
 		return reflectionDecision{}, err
@@ -8598,8 +9361,13 @@ func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, 
 		return reflectionDecision{}, fmt.Errorf("reflection failed: %w", err)
 	}
 	var loopErr error
+	var assistantText string
 	for event := range stream {
 		switch event.Type {
+		case "assistant_message":
+			if strings.TrimSpace(event.Text) != "" {
+				assistantText = event.Text
+			}
 		case "error", "retryable_error", "invalid_state":
 			loopErr = errors.New(firstNonEmptyString(event.Message, event.Reason, "reflection loop failed"))
 		}
@@ -8607,11 +9375,59 @@ func (s *Service) runReflection(ctx context.Context, narratorID, prompt string, 
 	if decision.Action != "" {
 		return decision, nil
 	}
+	// Tool-less fallback: if the model emitted a recognized fallback tag in its
+	// assistant text (e.g. <DangerDecision>...), honor it. Mirrors TS
+	// parseDangerReflectionTextFallback (loop.ts:1085-1112).
+	if assistantText != "" {
+		for _, parse := range fallbackParsers {
+			if parse == nil {
+				continue
+			}
+			if fallback, ok := parse(assistantText); ok && fallback.Action != "" {
+				return fallback, nil
+			}
+		}
+	}
 	if loopErr != nil {
 		return reflectionDecision{}, fmt.Errorf("reflection failed: %w", loopErr)
 	}
 	return reflectionDecision{}, errors.New("reflection did not call a confirm or revise tool")
 }
+
+// parseDangerReflectionTextFallback mirrors TS parseDangerReflectionTextFallback
+// (loop.ts:1085-1112): extract the first <DangerDecision>{json}</DangerDecision>
+// tag and decode {action, reflection|reason}. Returns a confirm/cancel decision
+// for a valid tag, otherwise (zero, false).
+func parseDangerReflectionTextFallback(text string) (reflectionDecision, bool) {
+	match := dangerDecisionTagPattern.FindStringSubmatch(text)
+	if len(match) < 2 {
+		return reflectionDecision{}, false
+	}
+	var parsed struct {
+		Action     string `json:"action"`
+		Reflection string `json:"reflection"`
+		Reason     string `json:"reason"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(match[1])), &parsed); err != nil {
+		return reflectionDecision{}, false
+	}
+	switch parsed.Action {
+	case "confirm":
+		return reflectionDecision{Action: "confirm", ToolName: "DangerConfirm", Reflection: strings.TrimSpace(parsed.Reflection)}, true
+	case "cancel":
+		feedback := strings.TrimSpace(parsed.Reason)
+		if feedback == "" {
+			feedback = "Danger reflection rejected this tool call."
+		}
+		return reflectionDecision{Action: "cancel", ToolName: "DangerCancel", Feedback: feedback}, true
+	default:
+		return reflectionDecision{}, false
+	}
+}
+
+// dangerDecisionTagPattern matches the TS fallback tag (case-insensitive,
+// dot-matches-newline) used by parseDangerReflectionTextFallback.
+var dangerDecisionTagPattern = regexp.MustCompile(`(?is)<DangerDecision>\s*(.*?)\s*</DangerDecision>`)
 
 func reflectionDecisionFromToolCall(name, rawArgs string) (reflectionDecision, string) {
 	args := map[string]any{}
@@ -8765,7 +9581,7 @@ func (s *Service) prepareExitPlanModeApproval(ctx context.Context, narratorID st
 			"reason":     strings.TrimSpace(reason),
 		})
 	}
-	decision, err := s.runExitPlanReflection(ctx, narratorID, plan, allowedPrompts)
+	decision, err := s.runExitPlanReflection(ctx, narratorID, planReflectionRequestID, plan, args, allowedPrompts)
 	if err != nil {
 		broadcastPlanReflectionResolved("deny", err.Error())
 		run.Status = "error"
@@ -8805,9 +9621,7 @@ func (s *Service) captureExitPlanContinuation(state *agentRunState, run agentbas
 	if !ok {
 		return
 	}
-	state.planApprovedMode = mode
-	state.planApprovedPrompt = prompt
-	state.planApprovedBy = strings.TrimSpace(decidedBy)
+	state.setPlanApproval(mode, prompt, strings.TrimSpace(decidedBy))
 }
 
 func exitPlanContinuationFromOutput(output string) (string, string, bool) {
@@ -8827,29 +9641,47 @@ func exitPlanContinuationFromOutput(output string) (string, string, bool) {
 }
 
 func (s *Service) persistPlanApprovalContinuation(ctx context.Context, state *agentRunState) error {
-	prompt := strings.TrimSpace(state.planApprovedPrompt)
+	_, prompt, decidedBy := state.planApproval()
+	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return nil
 	}
-	createdBy := nullableStringPtrValue(state.planApprovedBy)
+	createdBy := nullableStringPtrValue(decidedBy)
 	msg, err := s.addMessageWithBlocks(ctx, state.narratorID, "user", prompt, []map[string]any{{"type": "text", "text": prompt}}, createdBy)
 	if err != nil {
 		return err
 	}
 	if s.Hub != nil {
 		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "user_message", "narratorId": state.narratorID, "message": msg})
-		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.narrator.IsBackground})
+		s.Hub.BroadcastNarrator(state.narratorID, map[string]any{"type": "status", "narratorId": state.narratorID, "status": "working", "substatus": []string{"calling_model"}, "isBackground": state.currentNarrator().IsBackground})
 	}
 	_, err = s.DB.ExecContext(ctx, `UPDATE narrators SET status = 'working', substatus = '["calling_model"]', error_message = NULL, updated_at = ? WHERE id = ?`, db.NowISO(), state.narratorID)
 	return err
 }
 
-func exitPlanContinuePrompt(compactAfter bool, planDiff string) string {
+// exitPlanContinuePrompt mirrors the TS plan-approval continuation messages
+// injected as the user-message that drives plan execution after ExitPlanMode is
+// approved (narrator-session.ts:2099-2113). It covers three TS i18n keys for
+// both locales: planCompactContinue (compactAfter), exitPlanModeApprovedWithDiff
+// (non-compact + planDiff), and exitPlanModeApproved (non-compact, no diff). The
+// locale is the narrator owner locale (TS uses active.locale), resolved by the
+// caller via toolLocale.
+func exitPlanContinuePrompt(compactAfter bool, planDiff, locale string) string {
 	if compactAfter {
+		if locale == "zh-CN" {
+			return "用户批准了你的计划，上下文已重置。你的计划现在位于系统提示的 Conversation Context 部分。请开始执行计划。"
+		}
 		return "The user approved your plan and the context has been reset. Your plan is now in the system prompt under Conversation Context. Please begin executing the plan."
 	}
 	if strings.TrimSpace(planDiff) != "" {
-		return "The user edited your plan before approving it. The following changes were made:\n\n" + strings.TrimSpace(planDiff) + "\n\nPlease follow the edited plan."
+		diff := strings.TrimSpace(planDiff)
+		if locale == "zh-CN" {
+			return "用户在批准前编辑了你的计划。以下是修改内容：\n\n" + diff + "\n\n请按照编辑后的计划执行。"
+		}
+		return "The user edited your plan before approving it. The following changes were made:\n\n" + diff + "\n\nPlease follow the edited plan."
+	}
+	if locale == "zh-CN" {
+		return "用户批准了你的计划，可以开始执行。"
 	}
 	return "The user approved your plan. You may now begin execution."
 }
@@ -8894,7 +9726,7 @@ func (s *Service) completeExitPlanModeTool(ctx context.Context, narratorID strin
 	compactAfter := anyBool(args["compactAfter"])
 	payload["compactAfter"] = compactAfter
 	payload["continueMode"] = map[bool]string{true: "compact", false: "continue"}[compactAfter]
-	payload["continuePrompt"] = exitPlanContinuePrompt(compactAfter, planDiff)
+	payload["continuePrompt"] = exitPlanContinuePrompt(compactAfter, planDiff, s.toolLocale(ctx, narratorID))
 	if compactAfter {
 		if msg, err := s.persistPlanCompact(ctx, narratorID, plan); err == nil {
 			payload["planCompact"] = map[string]any{"ok": true, "messageId": msg.ID}
@@ -9195,6 +10027,30 @@ func goalContinuationPromptFromMessage(msg Message) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// maybeStartInterruptionContinuation injects an interruptionContinue user
+// message after a completion-token-limit truncation so the session loop can
+// auto-continue, mirroring the TS completion-limit continuation
+// (narrator-session.ts:2046-2078). Background / ask-in-passing narrators do not
+// auto-continue (consistent with goal continuation). The locale is resolved from
+// the narrator owner (W804 toolLocale), matching the TS owner locale.
+func (s *Service) maybeStartInterruptionContinuation(ctx context.Context, narratorID string) (bool, error) {
+	narrator, err := s.Get(ctx, narratorID)
+	if err != nil {
+		return false, err
+	}
+	if narrator.IsBackground || narrator.IsAskInPassing {
+		return false, nil
+	}
+	// Persist the continuation as a user message WITHOUT starting a new run
+	// (the session loop re-runs it via markRunStarted); AddUserMessage would
+	// spawn a competing run. Mirrors TS persistUserMessage.
+	text := interruptionContinueMessage(s.toolLocale(ctx, narratorID))
+	if _, err := s.persistUserMessageWithContent(ctx, narratorID, "system", text, []map[string]any{{"type": "text", "text": text}}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) maybeStartGoalContinuation(ctx context.Context, narratorID string, noToolContinuationCount int) (bool, error) {
@@ -10819,7 +11675,7 @@ func (s *Service) agentSideCarCollector(narratorID string) agentbasic.SideCarCol
 		}
 		sideCars := []agentbasic.AgentSideCar{}
 		if s.shouldInjectRelaxedPlanToolReminder(ctx, narratorID, request) {
-			sideCars = append(sideCars, agentbasic.AgentSideCar{Target: "tool_result", Source: "relaxed_plan", Content: relaxedPlanToolReminder(), ToolUseID: request.ToolUseID, OrderIndex: 20})
+			sideCars = append(sideCars, agentbasic.AgentSideCar{Target: "tool_result", Source: "relaxed_plan", Content: relaxedPlanToolReminder(s.toolLocale(ctx, narratorID)), ToolUseID: request.ToolUseID, OrderIndex: 20})
 		}
 		if request.CompletedToolCount%4 == 0 {
 			if reminder := s.buildTodoToolResultReminder(ctx, narratorID); reminder != "" {
@@ -11256,7 +12112,13 @@ func argsContainAny(values []string, needles []string) bool {
 	return false
 }
 
-func relaxedPlanToolReminder() string {
+// relaxedPlanToolReminder mirrors the TS tool.relaxedPlanToolReminder i18n
+// message (i18n.ts:152-159) in both locales. Injected as a tool_result sidecar
+// after a non-read-only tool call is allowed in relaxed plan mode.
+func relaxedPlanToolReminder(locale string) string {
+	if locale == "zh-CN" {
+		return "<relaxed_plan_reminder>\n你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。\n</relaxed_plan_reminder>"
+	}
 	return "<relaxed_plan_reminder>\nYou are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.\n</relaxed_plan_reminder>"
 }
 
@@ -11298,7 +12160,14 @@ func (s *Service) buildTodoToolResultReminder(ctx context.Context, narratorID st
 	if len(lines) == 0 {
 		return ""
 	}
-	return "<todo_reminder>\nCurrent active todos:\n" + strings.Join(lines, "\n") + "\nIf any todo state changes, call TaskCreate with the complete updated list.\n</todo_reminder>"
+	// Mirror the TS tool.todoReminder i18n message (i18n.ts:169-180): bilingual
+	// wrapper around the Go-rendered {todos} list. Locale resolves from the
+	// narrator owner (W804 toolLocale).
+	todosText := strings.Join(lines, "\n")
+	if s.toolLocale(ctx, narratorID) == "zh-CN" {
+		return "<todo_reminder>\n当前未完成待办：\n" + todosText + "\n如果待办状态发生变化，请调用 TaskCreate 并传入完整更新后的列表。\n</todo_reminder>"
+	}
+	return "<todo_reminder>\nCurrent active todos:\n" + todosText + "\nIf any todo state changes, call TaskCreate with the complete updated list.\n</todo_reminder>"
 }
 
 func (s *Service) persistToolResultSideCars(ctx context.Context, narratorID, messageID, toolUseID string, sideCars []agentbasic.AgentSideCar) error {
@@ -11309,10 +12178,7 @@ func (s *Service) persistStandaloneSideCars(ctx context.Context, state *agentRun
 	if state == nil {
 		return nil
 	}
-	messageID := ""
-	if state.draftMessageID != nil {
-		messageID = strings.TrimSpace(*state.draftMessageID)
-	}
+	messageID := strings.TrimSpace(state.draftID())
 	if messageID == "" {
 		messageID = latestAssistantMessageID(ctx, s.DB, state.narratorID)
 	}
@@ -12169,7 +13035,7 @@ func (s *Service) setNarratorRunSubstatus(ctx context.Context, narratorID string
 	return nil
 }
 
-func planModeToolRedirect(cwd string, narrator Narrator, call agentbasic.ToolCall) (agentbasic.ToolCall, string, bool) {
+func planModeToolRedirect(cwd string, narrator Narrator, call agentbasic.ToolCall, locale string) (agentbasic.ToolCall, string, bool) {
 	if !narrator.PlanMode || narrator.RelaxedPlan {
 		return call, "", false
 	}
@@ -12206,7 +13072,7 @@ func planModeToolRedirect(cwd string, narrator Narrator, call agentbasic.ToolCal
 		return call, "", false
 	}
 	call.Function.Arguments = string(updatedArgs)
-	notice := fmt.Sprintf("[PLAN MODE] File path redirected from %q to the designated plan file %q. Implementation changes remain blocked until plan mode exits.", filePath, planRelPath)
+	notice := planModeFileRedirectedNotice(locale, filePath, planRelPath)
 	return call, notice, true
 }
 
@@ -12320,6 +13186,11 @@ func toolPathsEqual(cwd, requested, expectedRel string) bool {
 type toolPermissionDecision struct {
 	Action string
 	Reason string
+	// Fatal marks a deny that must terminate the entire agent loop (catastrophic
+	// command). Only the catastrophic-command branch sets this; all other deny
+	// paths (protected/blacklist/dontAsk/readOnly/env-injection/conditional) leave
+	// it false, mirroring TS where isCatastrophic → "fatal" decision.
+	Fatal bool
 }
 
 type permissionPathRule struct {
@@ -12417,7 +13288,7 @@ func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, 
 	if name == "bash" {
 		command := strings.TrimSpace(stringFromAny(args["command"]))
 		if reason := catastrophicBashCommandDeny(command); reason != "" {
-			return toolPermissionDecision{Action: "deny", Reason: reason}, nil
+			return toolPermissionDecision{Action: "deny", Reason: reason, Fatal: true}, nil
 		}
 		if reason := protectedBashCommandDeny(command, bashToolCwd(cwd, args), s.projectGitPathForNarrator(ctx, narrator)); reason != "" {
 			return toolPermissionDecision{Action: "deny", Reason: reason}, nil
@@ -12429,10 +13300,37 @@ func (s *Service) resolveToolPermission(ctx context.Context, narrator Narrator, 
 			}
 			return toolPermissionDecision{Action: "deny", Reason: reason}, nil
 		}
-		if commandWhitelistCovered(command, whitelistCmds) {
+		// Chapter mode restricts the agent to the current branch: a git
+		// branch/worktree issue blocks the whitelist auto-allow and forces an
+		// ask/deny, mirroring TS detectGitBranchViolations gated by isChapter
+		// (narrator-permission.ts:388). Placed after the blacklist denies and
+		// before the whitelist auto-allow, matching the TS ordering.
+		if narrator.ChapterID != nil && strings.TrimSpace(*narrator.ChapterID) != "" && gitBranchChapterIssues(command) {
+			return chapterGitIssueDecision(narrator), nil
+		}
+		// A dangerous command-prefix environment-variable assignment blocks the
+		// command/path whitelist auto-allow, mirroring TS hasEnvInjection
+		// (narrator-permission.ts:192). The call then falls through to the
+		// permission-mode switch below (bypassPermissions still allows; readOnly
+		// denies; default/acceptEdits ask).
+		envInjection := bashCommandHasEnvInjection(command)
+		if !envInjection && commandWhitelistCovered(command, whitelistCmds) {
 			return commandWhitelistDecision(command, narrator), nil
 		}
-		if len(paths) > 0 {
+		// A path-execution (./foo, /abs/bin), pipe-to-shell (curl x | bash), an
+		// ALWAYS_ASK command name (sudo/kill/python3/make/ssh/...), or a dangerous
+		// CONDITIONAL_COMMANDS use (git push --force, npm run, sed -i, tar -x, tee,
+		// awk system(), ...) blocks the PATH whitelist auto-allow, mirroring TS
+		// resolveWhitelistDecision returning null on nonWhitelisted/dangerousPatterns
+		// (narrator-permission.ts:188). The command-whitelist path above is
+		// intentionally NOT gated by these: TS isCommandWhitelistCovered handles them
+		// via token-pattern matching, which Go's commandWhitelistCovered already
+		// mirrors. The call falls through to the permission-mode switch
+		// (bypassPermissions allows; readOnly denies; default/acceptEdits ask).
+		dangerousExec := bashCommandHasDangerousExecution(command)
+		alwaysAsk := bashCommandHasAlwaysAskCommand(command)
+		conditionalDanger := bashCommandHasConditionalDanger(command)
+		if !envInjection && !dangerousExec && !alwaysAsk && !conditionalDanger && len(paths) > 0 {
 			requiredLevel := "readOnly"
 			if operation == "write" {
 				requiredLevel = "readWrite"
@@ -12921,20 +13819,29 @@ func catastrophicBashCommandDeny(command string) string {
 		}
 		name := strings.TrimSpace(tokens[0])
 		args := tokens[1:]
-		switch name {
-		case "rm":
-			if !shellArgsHaveRecursiveFlag(args) {
-				continue
+		switch {
+		case name == "rm":
+			if shellArgsHaveRecursiveFlag(args) {
+				for _, arg := range args {
+					if strings.HasPrefix(arg, "-") {
+						continue
+					}
+					if isCatastrophicShellTarget(arg) {
+						return "Catastrophic Bash command denied: rm recursive on critical path " + arg
+					}
+				}
 			}
+			// rm without -r still wipes the root when targeting "/" or "/*"
+			// (mirrors TS detectCatastrophic "rm on root").
 			for _, arg := range args {
 				if strings.HasPrefix(arg, "-") {
 					continue
 				}
-				if isCatastrophicShellTarget(arg) {
-					return "Catastrophic Bash command denied: rm recursive on critical path " + arg
+				if arg == "/" || arg == "/*" {
+					return "Catastrophic Bash command denied: rm on root " + arg
 				}
 			}
-		case "dd":
+		case name == "dd":
 			for i, arg := range args {
 				target := ""
 				if strings.HasPrefix(arg, "of=") {
@@ -12946,7 +13853,13 @@ func catastrophicBashCommandDeny(command string) string {
 					return "Catastrophic Bash command denied: dd write to critical target " + target
 				}
 			}
-		case "chmod", "chown", "chgrp":
+		case name == "mkfs" || strings.HasPrefix(name, "mkfs."):
+			// Filesystem format (mirrors TS detectCatastrophic "filesystem format").
+			return "Catastrophic Bash command denied: filesystem format " + name
+		case name == "shutdown" || name == "reboot" || name == "halt" || name == "poweroff":
+			// System power control (mirrors TS detectCatastrophic "system power control").
+			return "Catastrophic Bash command denied: system power control " + name
+		case name == "chmod" || name == "chown" || name == "chgrp":
 			if !shellArgsHaveRecursiveFlag(args) {
 				continue
 			}
@@ -12957,6 +13870,15 @@ func catastrophicBashCommandDeny(command string) string {
 				if isCatastrophicShellTarget(arg) {
 					return "Catastrophic Bash command denied: recursive permission change on critical path " + arg
 				}
+			}
+		}
+		// Redirect to a block device (mirrors TS detectCatastrophic
+		// "redirect to block device", e.g. `echo x > /dev/sda`). Scanned per
+		// sub-command across redirect tokens so attached (`>/dev/sda`) and
+		// spaced (`> /dev/sda`) forms are both caught.
+		for i, token := range tokens {
+			if target, ok := shellRedirectPath(tokens, i, token); ok && isBlockDevicePermissionPath(target) {
+				return "Catastrophic Bash command denied: redirect to block device " + target
 			}
 		}
 	}
@@ -13196,6 +14118,27 @@ func hasExternalToolPath(cwd string, paths []string) bool {
 		}
 	}
 	return false
+}
+
+// externalPathDetails mirrors the TS danger detail line "External paths: <joined>"
+// (narrator-permission.ts classifyDanger), listing only the resolved paths that
+// fall outside the current working directory. Returns nil when none are external.
+func externalPathDetails(cwd string, paths []string) []string {
+	base := resolvePermissionPath(cwd, ".")
+	external := []string{}
+	for _, item := range paths {
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		resolved := resolvePermissionPath(cwd, item)
+		if !pathInsideOrEqual(base, resolved) {
+			external = append(external, resolved)
+		}
+	}
+	if len(external) == 0 {
+		return nil
+	}
+	return []string{"External paths: " + strings.Join(external, ", ")}
 }
 
 func toolOperation(name string) string {
@@ -13500,6 +14443,1047 @@ func shellCommandAppearsWrite(command string) bool {
 		}
 	}
 	return false
+}
+
+// dangerousEnvVarNames mirrors the TypeScript DANGEROUS_ENV_VARS set
+// (server/lib/agent/bash-analyze.ts:999): environment variables that can hijack
+// dynamic linking, interpreter module resolution, or shell startup to execute
+// attacker-controlled code, even in front of an otherwise-whitelisted command.
+var dangerousEnvVarNames = map[string]bool{
+	"LD_PRELOAD": true, "LD_LIBRARY_PATH": true, "DYLD_INSERT_LIBRARIES": true,
+	"DYLD_LIBRARY_PATH": true, "PYTHONPATH": true, "NODE_OPTIONS": true,
+	"NODE_PATH": true, "PERL5LIB": true, "RUBYLIB": true, "CLASSPATH": true,
+	"BASH_ENV": true, "ENV": true, "PROMPT_COMMAND": true,
+}
+
+// envAssignmentName returns (NAME, true) when token is a shell variable
+// assignment of the form NAME=value (NAME matching the POSIX name grammar),
+// mirroring how tree-sitter exposes a command-prefix variable_assignment node.
+func envAssignmentName(token string) (string, bool) {
+	eq := strings.IndexByte(token, '=')
+	if eq <= 0 {
+		return "", false
+	}
+	name := token[:eq]
+	for i, r := range name {
+		isLetter := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_'
+		isDigit := r >= '0' && r <= '9'
+		if i == 0 && !isLetter {
+			return "", false
+		}
+		if i > 0 && !isLetter && !isDigit {
+			return "", false
+		}
+	}
+	return name, true
+}
+
+// bashCommandHasEnvInjection reports whether any sub-command is prefixed by a
+// dangerous environment-variable assignment, mirroring TS detectEnvInjection
+// (bash-analyze.ts:1147): only command-prefix assignments count (a
+// variable_assignment whose parent is a command). A bare assignment with no
+// following command (e.g. `LD_PRELOAD=x`) or a dangerous string passed as a
+// command argument (e.g. `export LD_PRELOAD=x`, `echo LD_PRELOAD=x`) is NOT an
+// injection. When present, this blocks the command/path whitelist auto-allow so
+// the call falls through to the permission-mode decision (matching TS, where
+// hasEnvInjection makes resolveWhitelistDecision return null and the readOnly /
+// default / acceptEdits branches deny/ask).
+func bashCommandHasEnvInjection(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		sawDangerous := false
+		for _, token := range tokens {
+			name, ok := envAssignmentName(token)
+			if !ok {
+				// First non-assignment token is the actual command; the
+				// preceding assignments were a command prefix.
+				if sawDangerous {
+					return true
+				}
+				break
+			}
+			if dangerousEnvVarNames[name] {
+				sawDangerous = true
+			}
+		}
+	}
+	return false
+}
+
+// gitReadonlySubcommands mirrors TS GIT_READONLY_SUBCOMMANDS
+// (bash-analyze.ts:1467): pure read-only git subcommands that never affect
+// branch state and are always allowed in chapter mode.
+var gitReadonlySubcommands = map[string]bool{
+	"status": true, "log": true, "diff": true, "show": true, "blame": true,
+	"shortlog": true, "describe": true, "rev-parse": true, "rev-list": true,
+	"ls-files": true, "ls-tree": true, "ls-remote": true, "cat-file": true,
+	"name-rev": true, "reflog": true, "for-each-ref": true, "count-objects": true,
+	"fsck": true, "verify-pack": true, "hash-object": true, "diff-tree": true,
+	"diff-files": true, "diff-index": true, "merge-base": true, "show-ref": true,
+	"verify-commit": true, "verify-tag": true, "var": true, "get-tar-commit-id": true,
+	"whatchanged": true, "check-ignore": true,
+}
+
+// gitCurrentBranchSafe mirrors TS GIT_CURRENT_BRANCH_SAFE (bash-analyze.ts:1508):
+// write operations that only touch the current branch's worktree/index/commits/
+// local config, allowed in chapter mode because they do not change branches.
+var gitCurrentBranchSafe = map[string]bool{
+	"add": true, "commit": true, "restore": true, "rm": true, "mv": true,
+	"apply": true, "cherry-pick": true, "am": true, "notes": true, "bisect": true,
+	"grep": true, "archive": true, "bundle": true, "format-patch": true,
+	"send-email": true, "request-pull": true, "svn": true, "init": true,
+	"clone": true, "fetch": true, "pull": true, "submodule": true,
+	"config": true, "remote": true,
+}
+
+var (
+	gitCommitRefHeadPattern = regexp.MustCompile(`(?i)^(HEAD|ORIG_HEAD|MERGE_HEAD|CHERRY_PICK_HEAD|FETCH_HEAD|@)([~^@{}\d]|$)`)
+	gitCommitRefHexPattern  = regexp.MustCompile(`(?i)^[0-9a-f]{7,40}$`)
+	gitCommitRefTagPattern  = regexp.MustCompile(`(?i)^v\d+\.\d+`)
+)
+
+// looksLikeGitCommitRef mirrors TS looksLikeCommitRef (bash-analyze.ts:1815):
+// heuristically decides whether an argument looks like a git commit-ish (used to
+// distinguish `git reset <commit>` from `git reset <file>`).
+func looksLikeGitCommitRef(arg string) bool {
+	return gitCommitRefHeadPattern.MatchString(arg) ||
+		gitCommitRefHexPattern.MatchString(arg) ||
+		gitCommitRefTagPattern.MatchString(arg)
+}
+
+// gitBranchChapterIssues reports whether any git sub-command in command performs
+// a branch/worktree operation that is forbidden or warned about in chapter mode,
+// mirroring TS detectGitBranchViolations (bash-analyze.ts:1545). The permission
+// decision does not distinguish violations from warnings (it acts on the merged
+// non-empty set, matching narrator-permission.ts:265), so this returns a single
+// boolean.
+//
+// Like TS, the sub-command is the LITERAL second token (tokens[1]); git global
+// flags such as `-C <path>` are NOT skipped, so `git -C /repo status` is treated
+// as an unknown-subcommand issue (sub == "-C"), matching TS's tree-sitter token
+// list semantics.
+func gitBranchChapterIssues(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) == 0 || strings.TrimSpace(tokens[0]) != "git" {
+			continue
+		}
+		if len(tokens) < 2 {
+			continue
+		}
+		sub := tokens[1]
+		if gitReadonlySubcommands[sub] || gitCurrentBranchSafe[sub] {
+			continue
+		}
+		args := tokens[2:]
+		switch sub {
+		case "checkout":
+			if hasAnyArg(tokens, "--", "--ours", "--theirs") ||
+				hasArgPrefix(tokens, "--conflict") ||
+				hasAnyArg(tokens, "-p", "--patch") ||
+				hasArgPrefix(tokens, "--pathspec-from-file") {
+				continue
+			}
+			return true
+		case "switch":
+			return true
+		case "branch":
+			if gitBranchSubcommandIsWrite(args) {
+				return true
+			}
+		case "push":
+			if hasAnyArg(args, "--force", "-f", "--force-with-lease", "--delete", "-d", "--all", "--mirror") {
+				return true
+			}
+			// refspec src:dst beyond the remote name may target another branch.
+			nonFlag := []string{}
+			for _, a := range args {
+				if !strings.HasPrefix(a, "-") {
+					nonFlag = append(nonFlag, a)
+				}
+			}
+			for _, a := range sliceFrom(nonFlag, 1) {
+				if strings.Contains(a, ":") {
+					return true
+				}
+			}
+		case "merge":
+			if hasAnyArg(tokens, "--abort", "--continue", "--quit") {
+				continue
+			}
+			return true
+		case "rebase":
+			if hasAnyArg(tokens, "--abort", "--continue", "--skip", "--quit", "--edit-todo", "--show-current-patch") {
+				continue
+			}
+			return true
+		case "reset":
+			if gitResetIsBranchIssue(args) {
+				return true
+			}
+		case "stash":
+			if len(args) > 0 && args[0] == "branch" {
+				return true
+			}
+		case "symbolic-ref":
+			if gitSymbolicRefIsWrite(args) {
+				return true
+			}
+		case "clean":
+			continue
+		case "worktree":
+			if hasAnyArg(args, "add", "remove") {
+				return true
+			}
+		case "filter-branch", "filter-repo":
+			return true
+		case "tag", "gc":
+			continue
+		default:
+			// Unknown git subcommand in chapter mode -> conservative issue.
+			return true
+		}
+	}
+	return false
+}
+
+// gitBranchSubcommandIsWrite mirrors the TS `git branch` analysis
+// (bash-analyze.ts:1592): a non-flag argument (branch name) or a write flag
+// (-d/-D/-m/-M/-c/-C/--delete/--move/--copy) makes it a write operation;
+// read-only listing flags do not.
+func gitBranchSubcommandIsWrite(args []string) bool {
+	readonlyFlags := map[string]bool{
+		"-a": true, "--all": true, "-r": true, "--remotes": true, "--list": true,
+		"-v": true, "--verbose": true, "-vv": true, "--no-color": true, "--color": true,
+	}
+	flagsWithValue := map[string]bool{
+		"--sort": true, "--format": true, "--contains": true, "--no-contains": true,
+		"--merged": true, "--no-merged": true, "--points-at": true,
+	}
+	hasWriteFlag := false
+	hasNonFlagArg := false
+	skipNext := false
+	for _, arg := range args {
+		if skipNext {
+			skipNext = false
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			flagName := arg
+			eqIdx := strings.IndexByte(arg, '=')
+			if eqIdx >= 0 {
+				flagName = arg[:eqIdx]
+			}
+			if flagsWithValue[flagName] {
+				if eqIdx < 0 {
+					skipNext = true
+				}
+			} else if !readonlyFlags[arg] {
+				hasWriteFlag = true
+			}
+		} else {
+			hasNonFlagArg = true
+		}
+	}
+	return hasNonFlagArg || hasWriteFlag
+}
+
+// gitResetIsBranchIssue mirrors the TS `git reset` analysis (bash-analyze.ts:1703):
+// --hard/--merge/--keep and --soft/--mixed are issues; an implicit-mixed reset to
+// a single commit-ish argument is an issue; plain unstage forms are not.
+func gitResetIsBranchIssue(args []string) bool {
+	if hasAnyArg(args, "--hard", "--merge", "--keep", "--soft", "--mixed") {
+		return true
+	}
+	if hasAnyArg(args, "--", "-p", "--patch") {
+		return false
+	}
+	nonFlag := []string{}
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			nonFlag = append(nonFlag, a)
+		}
+	}
+	if len(nonFlag) == 0 || len(nonFlag) >= 2 {
+		return false
+	}
+	return looksLikeGitCommitRef(nonFlag[0])
+}
+
+// gitSymbolicRefIsWrite mirrors the TS `git symbolic-ref` analysis
+// (bash-analyze.ts:1754): --delete or a two-argument (name ref) form changes the
+// branch pointer; a one-argument read form does not.
+func gitSymbolicRefIsWrite(args []string) bool {
+	if hasAnyArg(args, "-d", "--delete") {
+		return true
+	}
+	symFlags := map[string]bool{"-q": true, "--quiet": true, "--short": true, "--recurse": true, "--no-recurse": true}
+	clean := []string{}
+	for i := 0; i < len(args); i++ {
+		t := args[i]
+		if t == "-m" {
+			i++ // skip reason message value
+			continue
+		}
+		if symFlags[t] || strings.HasPrefix(t, "-") {
+			continue
+		}
+		clean = append(clean, t)
+	}
+	return len(clean) >= 2
+}
+
+// sliceFrom returns s[n:] or an empty slice when n is out of range.
+func sliceFrom(s []string, n int) []string {
+	if n >= len(s) {
+		return nil
+	}
+	return s[n:]
+}
+
+// chapterGitIssueDecision mirrors TS resolveChapterGitIssueDecision
+// (narrator-permission.ts:268): bypassPermissions allows, dontAsk/readOnly deny,
+// and every other mode asks for confirmation.
+func chapterGitIssueDecision(narrator Narrator) toolPermissionDecision {
+	reason := "Chapter mode restricts git branch/worktree operations to the current branch."
+	switch normalizePermissionMode(ptrString(narrator.PermissionMode), "default") {
+	case "bypassPermissions":
+		return toolPermissionDecision{Action: "allow"}
+	case "dontAsk", "readOnly":
+		return toolPermissionDecision{Action: "deny", Reason: reason}
+	default:
+		return toolPermissionDecision{Action: "ask", Reason: reason}
+	}
+}
+
+// pipeToShellInterpreters mirrors the TS pipe-to-shell target set
+// (bash-analyze.ts detectPipeToShell: SHELL_COMMANDS + python/python3/node/perl/
+// ruby): interpreters that execute piped stdin as code, the classic
+// `curl ... | bash` remote-code-execution vector.
+var pipeToShellInterpreters = map[string]bool{
+	"bash": true, "sh": true, "zsh": true, "fish": true, "dash": true,
+	"ksh": true, "csh": true, "tcsh": true,
+	"python": true, "python3": true, "node": true, "perl": true, "ruby": true,
+}
+
+// isShellPathExecution mirrors TS isPathExecution (bash-analyze.ts:1095): the
+// command name is an absolute/relative path or a Windows drive-letter absolute
+// path, i.e. executing a file directly rather than a known command.
+func isShellPathExecution(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	fwd := filepath.ToSlash(name)
+	if strings.HasPrefix(fwd, "/") || strings.HasPrefix(fwd, "./") || strings.HasPrefix(fwd, "../") {
+		return true
+	}
+	// Windows drive-letter absolute path, e.g. C:/... or C:\...
+	if len(name) >= 3 {
+		c := name[0]
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) && name[1] == ':' && (name[2] == '/' || name[2] == '\\') {
+			return true
+		}
+	}
+	return false
+}
+
+// splitTopLevelStatements splits a shell command into top-level statements on
+// `;`, `&&`, and `||`, preserving `|` (pipe) so pipeline structure survives.
+// It does NOT reuse splitShellCommands (which also splits on `|`). The parser is
+// naive (no quote/escape handling), matching the existing splitShellCommands
+// fidelity boundary.
+func splitTopLevelStatements(command string) []string {
+	out := []string{}
+	var b strings.Builder
+	flush := func() {
+		if s := strings.TrimSpace(b.String()); s != "" {
+			out = append(out, s)
+		}
+		b.Reset()
+	}
+	for i := 0; i < len(command); i++ {
+		c := command[i]
+		if c == ';' {
+			flush()
+			continue
+		}
+		if (c == '&' || c == '|') && i+1 < len(command) && command[i+1] == c {
+			// && or || : statement boundary, skip both characters.
+			flush()
+			i++
+			continue
+		}
+		b.WriteByte(c)
+	}
+	flush()
+	return out
+}
+
+// lastPipeSegmentCommand returns the first token (command name) of the LAST pipe
+// segment of statement, or "" when the statement has no single-pipe pipeline.
+// It mirrors TS detectPipeToShell, which inspects only the last command of each
+// pipeline. Splits on single `|` (not `||`).
+func lastPipeSegmentCommand(statement string) string {
+	segments := []string{}
+	var b strings.Builder
+	for i := 0; i < len(statement); i++ {
+		c := statement[i]
+		if c == '|' {
+			if i+1 < len(statement) && statement[i+1] == '|' {
+				// || : not a pipe; keep both characters in the current segment.
+				b.WriteByte(c)
+				b.WriteByte(statement[i+1])
+				i++
+				continue
+			}
+			segments = append(segments, b.String())
+			b.Reset()
+			continue
+		}
+		b.WriteByte(c)
+	}
+	segments = append(segments, b.String())
+	if len(segments) < 2 {
+		return "" // no pipeline
+	}
+	fields := strings.Fields(strings.TrimSpace(segments[len(segments)-1]))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// bashCommandHasDangerousExecution reports whether the command contains a
+// path-execution or a pipe-to-shell pattern, mirroring the unconditional
+// dangerousPatterns/nonWhitelisted markers TS sets in analyzeBashCommand
+// (isPathExecution + detectPipeToShell). When true, the call must NOT be
+// auto-allowed by the path whitelist (mirrors TS resolveWhitelistDecision
+// returning null on nonWhitelisted/dangerousPatterns) and falls through to the
+// permission-mode decision.
+func bashCommandHasDangerousExecution(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) > 0 && isShellPathExecution(tokens[0]) {
+			return true
+		}
+	}
+	for _, statement := range splitTopLevelStatements(command) {
+		if pipeToShellInterpreters[lastPipeSegmentCommand(statement)] {
+			return true
+		}
+	}
+	return false
+}
+
+// alwaysAskBashCommands mirrors TS ALWAYS_ASK_COMMANDS (bash-analyze.ts:163):
+// command names that are unconditionally marked nonWhitelisted regardless of
+// arguments, covering deletion, privilege escalation, permission/process/disk
+// control, system/firewall control, code execution, shell nesting, indirect
+// execution, remote execution, containers, interpreters, runtime/build tools,
+// source/dot, alias, and cron families. In TS this check precedes the
+// CONDITIONAL_COMMANDS classification, so names appearing in both (node,
+// python, python3, go, cargo, pip, pip3, make) are treated as always-ask.
+var alwaysAskBashCommands = map[string]bool{
+	// deletion
+	"rm": true, "rmdir": true, "shred": true,
+	// privilege escalation
+	"sudo": true, "su": true, "doas": true, "pkexec": true,
+	// permission modification
+	"chmod": true, "chown": true, "chgrp": true,
+	// process management
+	"kill": true, "killall": true, "pkill": true,
+	// disk / partition
+	"dd": true, "mkfs": true, "fdisk": true, "parted": true, "mount": true, "umount": true,
+	// system control
+	"reboot": true, "shutdown": true, "halt": true, "poweroff": true, "systemctl": true, "service": true,
+	// firewall
+	"iptables": true, "ip6tables": true, "nft": true, "ufw": true,
+	// code execution
+	"eval": true, "exec": true,
+	// shell nesting
+	"bash": true, "sh": true, "zsh": true, "fish": true, "dash": true, "ksh": true, "csh": true, "tcsh": true,
+	// indirect command execution
+	"env": true, "nohup": true, "timeout": true, "strace": true, "ltrace": true, "nice": true, "ionice": true, "chroot": true,
+	// remote execution
+	"ssh": true, "scp": true, "rsync": true,
+	// containers
+	"podman": true, "podman-compose": true, "kubectl": true,
+	// script interpreters
+	"perl": true, "ruby": true, "lua": true, "php": true,
+	// runtime / build / package tools
+	"node": true, "python": true, "python3": true, "go": true, "cargo": true, "pip": true, "pip3": true, "make": true,
+	// source / dot
+	"source": true, ".": true,
+	// alias
+	"alias": true, "unalias": true,
+	// cron
+	"crontab": true, "at": true, "batch": true,
+}
+
+// bashCommandHasAlwaysAskCommand reports whether any sub-command's name is in the
+// ALWAYS_ASK set, mirroring the TS nonWhitelisted marker for those commands.
+// When true the call must NOT be auto-allowed by the path whitelist (mirrors TS
+// resolveWhitelistDecision returning null on nonWhitelisted) and falls through to
+// the permission-mode decision.
+func bashCommandHasAlwaysAskCommand(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) > 0 && alwaysAskBashCommands[strings.TrimSpace(tokens[0])] {
+			return true
+		}
+	}
+	return false
+}
+
+// tarExtractTokenPattern matches a bare tar option group containing `x` (e.g.
+// `xzf`), mirroring the TS tar extract regex /^[a-zA-Z]*x[a-zA-Z]*$/.
+var tarExtractTokenPattern = regexp.MustCompile(`^[a-zA-Z]*x[a-zA-Z]*$`)
+
+// bashCommandHasConditionalDanger reports whether any sub-command is a dangerous
+// use of a CONDITIONAL_COMMANDS entry (bash-analyze.ts:558), mirroring the TS
+// detectors that push dangerousPatterns/nonWhitelisted. Covers git, npm, bun,
+// yarn, pnpm, sed, tar, tee, awk, gawk. The recursive (find/xargs) and
+// package-runner (npx/bunx) detectors are intentionally not covered here. When
+// true the call must NOT be auto-allowed by the path whitelist and falls through
+// to the permission-mode decision.
+func bashCommandHasConditionalDanger(command string) bool {
+	for _, tokens := range splitShellCommands(command) {
+		if len(tokens) == 0 {
+			continue
+		}
+		switch strings.TrimSpace(tokens[0]) {
+		case "git":
+			if gitConditionalDanger(tokens) {
+				return true
+			}
+		case "npm":
+			if npmConditionalDanger(tokens) {
+				return true
+			}
+		case "bun":
+			if bunConditionalDanger(tokens) {
+				return true
+			}
+		case "yarn":
+			if yarnConditionalDanger(tokens) {
+				return true
+			}
+		case "pnpm":
+			if pnpmConditionalDanger(tokens) {
+				return true
+			}
+		case "npx", "bunx":
+			if packageRunnerHasDanger(tokens) {
+				return true
+			}
+		case "find":
+			if findConditionalDanger(tokens, 0) {
+				return true
+			}
+		case "xargs":
+			if xargsConditionalDanger(tokens, 0) {
+				return true
+			}
+		case "sed":
+			for _, tok := range tokens[1:] {
+				if tok == "-i" || strings.HasPrefix(tok, "-i") {
+					return true
+				}
+			}
+		case "tar":
+			if tarIsExtract(tokens[1:]) {
+				return true
+			}
+		case "tee":
+			return true
+		}
+	}
+	// awk/gawk system()/getline: per-statement approximation (preserve `|`).
+	for _, statement := range splitTopLevelStatements(command) {
+		fields := strings.Fields(strings.TrimSpace(statement))
+		if len(fields) == 0 {
+			continue
+		}
+		if name := fields[0]; name == "awk" || name == "gawk" {
+			if strings.Contains(statement, "system(") || strings.Contains(statement, "| getline") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// gitConditionalDanger mirrors the TS git CONDITIONAL detector (bash-analyze.ts:561).
+func gitConditionalDanger(tokens []string) bool {
+	if len(tokens) < 2 {
+		return false
+	}
+	sub := tokens[1]
+	rest := tokens[2:]
+	switch sub {
+	case "push":
+		if hasAnyArg(tokens, "--force", "-f", "--force-with-lease", "--mirror", "--delete", "-d") {
+			return true
+		}
+		return false
+	case "reset":
+		return hasAnyArg(tokens, "--hard")
+	case "clean":
+		return true
+	case "checkout":
+		return hasAnyArg(tokens, "--")
+	case "rebase", "merge", "filter-branch", "filter-repo":
+		return true
+	case "reflog":
+		return hasAnyArg(tokens, "expire")
+	case "gc":
+		return hasArgPrefix(tokens, "--prune")
+	case "branch":
+		return hasAnyArg(rest, "-d", "-D", "--delete")
+	case "submodule":
+		return hasAnyArg(tokens, "deinit")
+	case "worktree":
+		return hasAnyArg(tokens, "remove")
+	}
+	return false
+}
+
+var npmReadOnlySubcommands = map[string]bool{
+	"ls": true, "list": true, "ll": true, "la": true, "view": true, "info": true,
+	"show": true, "outdated": true, "search": true, "find": true, "help": true,
+	"config": true, "get": true, "prefix": true, "root": true, "bin": true,
+	"version": true, "--version": true, "-v": true, "explain": true, "why": true,
+	"fund": true, "audit": true, "doctor": true, "ping": true, "whoami": true,
+	"token": true, "pack": true, "diff": true, "pkg": true, "query": true,
+	"completion": true, "explore": true,
+}
+
+// npmConditionalDanger mirrors the TS npm CONDITIONAL detector (bash-analyze.ts:625).
+func npmConditionalDanger(tokens []string) bool {
+	if hasAnyArg(tokens, "exec") {
+		return true
+	}
+	if len(tokens) < 2 {
+		return false // bare npm shows help
+	}
+	sub := tokens[1]
+	if npmReadOnlySubcommands[sub] {
+		return false
+	}
+	if sub == "cache" {
+		return hasAnyArg(tokens, "clean")
+	}
+	// run/test/install/uninstall/update/publish/link/prune/rebuild + unknown -> danger
+	return true
+}
+
+var bunReadOnlySubcommands = map[string]bool{
+	"pm": true, "--version": true, "-v": true, "--help": true, "-h": true, "--revision": true,
+}
+
+// bunConditionalDanger mirrors the TS bun CONDITIONAL detector (bash-analyze.ts:712).
+func bunConditionalDanger(tokens []string) bool {
+	if hasAnyArg(tokens, "-e", "--eval") {
+		return true
+	}
+	if len(tokens) < 2 {
+		return false // bare bun shows help
+	}
+	if bunReadOnlySubcommands[tokens[1]] {
+		return false
+	}
+	return true
+}
+
+var yarnReadOnlySubcommands = map[string]bool{
+	"list": true, "info": true, "why": true, "outdated": true, "config": true,
+	"--version": true, "-v": true, "--help": true, "-h": true, "audit": true,
+	"licenses": true, "bin": true, "versions": true, "policies": true, "workspaces": true,
+}
+
+// yarnConditionalDanger mirrors the TS yarn CONDITIONAL detector (bash-analyze.ts:893).
+func yarnConditionalDanger(tokens []string) bool {
+	if len(tokens) < 2 {
+		return false
+	}
+	if yarnReadOnlySubcommands[tokens[1]] {
+		return false
+	}
+	return true
+}
+
+var pnpmReadOnlySubcommands = map[string]bool{
+	"list": true, "ls": true, "ll": true, "la": true, "why": true, "outdated": true,
+	"audit": true, "config": true, "--version": true, "-v": true, "--help": true,
+	"-h": true, "root": true, "bin": true, "store": true,
+}
+
+// pnpmConditionalDanger mirrors the TS pnpm CONDITIONAL detector (bash-analyze.ts:931).
+func pnpmConditionalDanger(tokens []string) bool {
+	if len(tokens) < 2 {
+		return false
+	}
+	if pnpmReadOnlySubcommands[tokens[1]] {
+		return false
+	}
+	return true
+}
+
+// tarIsExtract mirrors the TS tar CONDITIONAL detector (bash-analyze.ts:864):
+// detects -x/--extract, short option groups containing x, and bare option groups
+// matching /^[a-zA-Z]*x[a-zA-Z]*$/.
+func tarIsExtract(args []string) bool {
+	for _, t := range args {
+		if t == "-x" || t == "--extract" {
+			return true
+		}
+		if strings.HasPrefix(t, "-") && strings.Contains(t, "x") {
+			return true
+		}
+		if !strings.HasPrefix(t, "-") && t != "tar" && tarExtractTokenPattern.MatchString(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// packageRunnerDangerousFlags mirrors TS PACKAGE_RUNNER_DANGEROUS_FLAGS
+// (bash-analyze.ts:413): flags that trigger remote/dynamic package sources.
+var packageRunnerDangerousFlags = map[string]bool{
+	"-p": true, "--package": true, "--registry": true, "--userconfig": true, "--ignore-existing": true,
+}
+
+// safePackageRunners mirrors TS SAFE_PACKAGE_RUNNERS (bash-analyze.ts:262):
+// packages allowed through npx/bunx (type-checkers and lint/format tools).
+var safePackageRunners = map[string]bool{
+	"tsc": true, "tsgo": true, "typescript": true, "@typescript/native-preview": true,
+	"biome": true, "@biomejs/biome": true, "prettier": true, "eslint": true,
+}
+
+// safePackageArgs mirrors TS SAFE_PACKAGE_ARGS (bash-analyze.ts:276).
+var safePackageArgs = map[string]bool{
+	"check": true, "--check": true, "--noEmit": true, "--write=false": true, "--version": true, "-v": true,
+}
+
+// biomeSafeArgPrefixes mirrors TS BIOME_SAFE_ARG_PREFIXES (bash-analyze.ts:286);
+// matched by exact argName (arg before '=').
+var biomeSafeArgPrefixes = map[string]bool{
+	"--max-diagnostics": true, "--diagnostic-level": true, "--colors": true, "--no-colors": true,
+	"--use-server": true, "--verbose": true, "--log-level": true, "--log-kind": true,
+	"--config-path": true, "--reporter": true, "--formatter-enabled": true, "--linter-enabled": true,
+	"--organize-imports-enabled": true, "--assists-enabled": true, "--stdin-file-path": true,
+	"--vcs-enabled": true, "--vcs-client-kind": true, "--vcs-use-ignore-file": true, "--vcs-root": true,
+	"--vcs-default-branch": true, "--files-max-size": true, "--files-ignore-unknown": true,
+	"--indent-style": true, "--indent-width": true, "--line-ending": true, "--line-width": true,
+	"--json-formatter-enabled": true, "--json-formatter-indent-style": true, "--json-formatter-indent-width": true,
+	"--json-formatter-line-ending": true, "--json-formatter-line-width": true,
+	"--javascript-formatter-enabled": true, "--javascript-formatter-indent-style": true,
+	"--javascript-formatter-indent-width": true, "--javascript-formatter-line-ending": true,
+	"--javascript-formatter-line-width": true,
+}
+
+// biomeWriteArgPrefixes mirrors TS BIOME_WRITE_ARG_PREFIXES (bash-analyze.ts:326).
+var biomeWriteArgPrefixes = map[string]bool{
+	"--write": true, "--fix": true, "--unsafe": true,
+}
+
+// tscSafeArgPrefixes mirrors TS TSC_SAFE_ARG_PREFIXES (bash-analyze.ts:333).
+var tscSafeArgPrefixes = map[string]bool{
+	"--pretty": true, "--listFiles": true, "--listFilesOnly": true, "--explainFiles": true,
+	"--showConfig": true, "--traceResolution": true, "--diagnostics": true, "--extendedDiagnostics": true,
+	"--generateTrace": true, "--sourceMap": true, "--inlineSourceMap": true, "--rootDir": true,
+	"--removeComments": true, "--importHelpers": true, "--downlevelIteration": true, "--isolatedModules": true,
+	"--strict": true, "--noImplicitAny": true, "--strictNullChecks": true, "--strictFunctionTypes": true,
+	"--strictBindCallApply": true, "--strictPropertyInitialization": true, "--noImplicitThis": true,
+	"--alwaysStrict": true, "--noUnusedLocals": true, "--noUnusedParameters": true, "--noImplicitReturns": true,
+	"--noFallthroughCasesInSwitch": true, "--noUncheckedIndexedAccess": true, "--noImplicitOverride": true,
+	"--allowUnusedLabels": true, "--allowUnreachableCode": true, "--skipLibCheck": true, "--skipDefaultLibCheck": true,
+	"--moduleResolution": true, "--module": true, "--target": true, "--lib": true, "--jsx": true,
+	"--jsxFactory": true, "--jsxFragmentFactory": true, "--jsxImportSource": true, "--experimentalDecorators": true,
+	"--emitDecoratorMetadata": true, "--resolveJsonModule": true, "--esModuleInterop": true,
+	"--allowSyntheticDefaultImports": true, "--forceConsistentCasingInFileNames": true, "--allowJs": true,
+	"--checkJs": true, "--maxNodeModuleJsDepth": true, "--types": true, "--typeRoots": true, "--paths": true,
+	"--baseUrl": true, "--rootDirs": true, "--preserveSymlinks": true, "--charset": true, "--newLine": true,
+	"--useDefineForClassFields": true, "--preserveConstEnums": true, "--preserveValueImports": true,
+	"--assumeChangesOnlyAffectDirectDependencies": true,
+}
+
+// tscWriteArgPrefixes mirrors TS TSC_WRITE_ARG_PREFIXES (bash-analyze.ts:400).
+var tscWriteArgPrefixes = map[string]bool{
+	"--incremental": true, "--tsBuildInfoFile": true, "--composite": true, "--declaration": true,
+	"--declarationMap": true, "--emitDeclarationOnly": true, "--declarationDir": true,
+	"--outDir": true, "--outFile": true,
+}
+
+var packageRunnerUnstableTagPattern = regexp.MustCompile(`(?i)@(latest|next|canary|beta|alpha|rc)$`)
+
+// packageRunnerHasDanger mirrors the TS classifyPackageRunner error!=null result
+// (bash-analyze.ts:433): tokens[0] is npx/bunx. It returns true when the runner
+// invocation is dangerous (dynamic package source flag, no explicit command,
+// remote source, unstable package tag, package not in the allowlist, dynamic
+// code loading flag, or an argument not in the safe allowlist). The TS
+// hasWriteOperation result (which only affects the path-whitelist requiredLevel)
+// is not tracked here; this gate only needs the danger boolean.
+func packageRunnerHasDanger(tokens []string) bool {
+	i := 1
+	for i < len(tokens) && strings.HasPrefix(tokens[i], "-") {
+		flag := tokens[i]
+		if packageRunnerDangerousFlags[flag] {
+			return true
+		}
+		if flag == "--package" || flag == "-p" {
+			i += 2
+			continue
+		}
+		i++
+	}
+	if i >= len(tokens) {
+		return true // no explicit command
+	}
+	execCmd := tokens[i]
+	if strings.Contains(execCmd, "://") ||
+		strings.HasPrefix(execCmd, "git+") ||
+		strings.HasPrefix(execCmd, "file:") ||
+		strings.HasPrefix(execCmd, "http:") ||
+		strings.HasPrefix(execCmd, "https:") {
+		return true // remote source
+	}
+	if packageRunnerUnstableTagPattern.MatchString(execCmd) {
+		return true // unstable package tag
+	}
+	var packageName string
+	if strings.HasPrefix(execCmd, "@") {
+		parts := strings.Split(execCmd, "@")
+		// @scope/pkg@version -> keep first two segments (["", "scope/pkg"]) joined with @.
+		if len(parts) >= 2 {
+			packageName = "@" + parts[1]
+		} else {
+			packageName = execCmd
+		}
+	} else {
+		packageName = strings.Split(execCmd, "@")[0]
+	}
+	if !safePackageRunners[packageName] {
+		return true // package not in allowlist
+	}
+	isBiome := packageName == "biome" || packageName == "@biomejs/biome"
+	isTsc := packageName == "tsc" || packageName == "tsgo" || packageName == "typescript" || packageName == "@typescript/native-preview"
+	for _, arg := range tokens[i+1:] {
+		if strings.HasPrefix(arg, "--config") || strings.HasPrefix(arg, "--plugin") || strings.HasPrefix(arg, "--require") {
+			return true // dynamic code loading flag
+		}
+		if strings.HasPrefix(arg, "-") {
+			if safePackageArgs[arg] {
+				continue
+			}
+			argName := strings.Split(arg, "=")[0]
+			if isBiome && (biomeSafeArgPrefixes[argName] || biomeWriteArgPrefixes[argName]) {
+				continue
+			}
+			if isTsc && (tscSafeArgPrefixes[argName] || tscWriteArgPrefixes[argName]) {
+				continue
+			}
+			return true // flag not in safe allowlist
+		}
+		// Non-flag argument (subcommand / target path).
+		if arg == "check" || arg == "version" || arg == "." {
+			continue
+		}
+		if isBiome || isTsc {
+			continue // biome/tsc accept file path targets (read-only checks)
+		}
+		return true // argument not in safe allowlist
+	}
+	return false
+}
+
+// safeBashCommands mirrors TS SAFE_COMMANDS (bash-analyze.ts): pure read-only /
+// no-side-effect commands that are safe as the target of find -exec / xargs.
+var safeBashCommands = map[string]bool{
+	"git": true, "ls": true, "dir": true, "tree": true, "pwd": true, "cat": true,
+	"head": true, "tail": true, "wc": true, "less": true, "more": true, "grep": true,
+	"rg": true, "ag": true, "fd": true, "echo": true, "printf": true, "basename": true,
+	"dirname": true, "realpath": true, "readlink": true, "stat": true, "file": true,
+	"which": true, "type": true, "command": true, "date": true, "whoami": true,
+	"uname": true, "hostname": true, "id": true, "uptime": true, "sort": true,
+	"uniq": true, "diff": true, "tr": true, "cut": true, "paste": true, "column": true,
+	"rev": true, "tac": true, "nl": true, "seq": true, "yes": true, "tsc": true,
+	"tsgo": true, "eslint": true, "prettier": true, "biome": true, "test": true,
+	"true": true, "false": true, "sleep": true, "cd": true, "pushd": true, "popd": true,
+	"printenv": true, "jq": true, "npx": true, "bunx": true, "npm": true, "bun": true,
+	"yarn": true, "pnpm": true, "cp": true, "mv": true, "mkdir": true, "touch": true,
+	"curl": true, "wget": true, "sed": true, "awk": true, "gawk": true, "find": true,
+	"xargs": true, "tar": true, "zip": true, "unzip": true, "gzip": true, "gunzip": true,
+}
+
+// conditionalCommandKeys mirrors the TS CONDITIONAL_COMMANDS key set
+// (bash-analyze.ts:558): commands that have a dangerous-argument detector. Used
+// by the find/xargs recursive classifier to decide whether to recurse into a
+// detector. node/python/python3/go/cargo/pip/pip3/make are present (as in TS),
+// but ALWAYS_ASK is checked first in the recursion so they never reach here.
+var conditionalCommandKeys = map[string]bool{
+	"git": true, "node": true, "python": true, "python3": true, "npm": true,
+	"pip": true, "pip3": true, "go": true, "cargo": true, "bun": true, "find": true,
+	"sed": true, "awk": true, "gawk": true, "xargs": true, "tee": true, "curl": true,
+	"wget": true, "tar": true, "cp": true, "mv": true, "mkdir": true, "touch": true,
+	"make": true, "diff": true, "zip": true, "unzip": true, "gzip": true,
+	"gunzip": true, "yarn": true, "pnpm": true, "npx": true, "bunx": true,
+}
+
+const findXargsRecursionDepthLimit = 5
+
+// conditionalExecCmdDanger is the recursion-only CONDITIONAL dispatcher used by
+// find/xargs: given an exec command name and its sub-tokens, it reports whether
+// the command is a dangerous use of a CONDITIONAL_COMMANDS entry. It reuses the
+// W782/W783 detectors. awk/gawk use a token-join approximation here (only on the
+// recursive path); the top-level bashCommandHasConditionalDanger keeps its
+// per-statement awk detection unchanged.
+func conditionalExecCmdDanger(execCmd string, subTokens []string, depth int) bool {
+	switch execCmd {
+	case "git":
+		return gitConditionalDanger(subTokens)
+	case "npm":
+		return npmConditionalDanger(subTokens)
+	case "bun":
+		return bunConditionalDanger(subTokens)
+	case "yarn":
+		return yarnConditionalDanger(subTokens)
+	case "pnpm":
+		return pnpmConditionalDanger(subTokens)
+	case "sed":
+		for _, tok := range sliceFrom(subTokens, 1) {
+			if tok == "-i" || strings.HasPrefix(tok, "-i") {
+				return true
+			}
+		}
+		return false
+	case "tar":
+		return tarIsExtract(sliceFrom(subTokens, 1))
+	case "tee":
+		return true
+	case "awk", "gawk":
+		joined := strings.Join(subTokens, " ")
+		return strings.Contains(joined, "system(") || strings.Contains(joined, "| getline")
+	case "npx", "bunx":
+		return packageRunnerHasDanger(subTokens)
+	case "find":
+		return findConditionalDanger(subTokens, depth)
+	case "xargs":
+		return xargsConditionalDanger(subTokens, depth)
+	}
+	// Other CONDITIONAL keys (node/python/go/cargo/pip/make/cp/mv/curl/...) have
+	// no dangerous-argument detector here (node/python/etc. are caught by
+	// ALWAYS_ASK before reaching this dispatcher; cp/mv/curl/etc. are safe).
+	return false
+}
+
+// findConditionalDanger mirrors the TS find CONDITIONAL detector
+// (bash-analyze.ts:738): -delete is dangerous, and each -exec/-execdir/-ok/-okdir
+// target command is classified ALWAYS_ASK -> CONDITIONAL (recurse) -> SAFE ->
+// unknown.
+func findConditionalDanger(tokens []string, depth int) bool {
+	if depth > findXargsRecursionDepthLimit {
+		return false
+	}
+	for _, t := range tokens {
+		if t == "-delete" {
+			return true
+		}
+	}
+	for _, flag := range []string{"-exec", "-execdir", "-ok", "-okdir"} {
+		idx := indexOfString(tokens, flag)
+		if idx < 0 {
+			continue
+		}
+		if idx+1 >= len(tokens) {
+			return true // empty command after the exec flag
+		}
+		execCmd := tokens[idx+1]
+		if alwaysAskBashCommands[execCmd] {
+			return true
+		}
+		if conditionalCommandKeys[execCmd] {
+			end := -1
+			for i := idx + 1; i < len(tokens); i++ {
+				if tokens[i] == ";" || tokens[i] == "+" {
+					end = i
+					break
+				}
+			}
+			var subTokens []string
+			if end > 0 {
+				subTokens = tokens[idx+1 : end]
+			} else {
+				subTokens = tokens[idx+1:]
+			}
+			if conditionalExecCmdDanger(execCmd, subTokens, depth+1) {
+				return true
+			}
+		}
+		if safeBashCommands[execCmd] {
+			continue // this exec target is safe; check any further exec flags
+		}
+		return true // unknown command
+	}
+	return false
+}
+
+var xargsSkipFlags = map[string]bool{
+	"-0": true, "--null": true, "-d": true, "--delimiter": true, "-n": true,
+	"--max-args": true, "-P": true, "--max-procs": true, "-I": true, "-i": true,
+	"--replace": true, "-L": true, "--max-lines": true, "-s": true, "--max-chars": true,
+	"-t": true, "--verbose": true, "-p": true, "--interactive": true, "-r": true,
+	"--no-run-if-empty": true, "--show-limits": true,
+}
+
+var xargsValueFlags = map[string]bool{
+	"-d": true, "--delimiter": true, "-n": true, "--max-args": true, "-P": true,
+	"--max-procs": true, "-I": true, "-i": true, "--replace": true, "-L": true,
+	"--max-lines": true, "-s": true, "--max-chars": true,
+}
+
+// xargsConditionalDanger mirrors the TS xargs CONDITIONAL detector
+// (bash-analyze.ts:788): skip xargs' own flags, then classify the executed
+// command ALWAYS_ASK -> CONDITIONAL (recurse) -> SAFE -> unknown. An empty
+// command (default echo) is safe.
+func xargsConditionalDanger(tokens []string, depth int) bool {
+	if depth > findXargsRecursionDepthLimit {
+		return false
+	}
+	i := 1
+	for i < len(tokens) {
+		t := tokens[i]
+		if strings.HasPrefix(t, "-") && xargsSkipFlags[t] {
+			i++
+			if xargsValueFlags[t] && i < len(tokens) {
+				i++ // skip the flag's value
+			}
+		} else if strings.HasPrefix(t, "-") {
+			i++ // unknown flag, skip
+		} else {
+			break
+		}
+	}
+	if i >= len(tokens) {
+		return false // no explicit command -> default echo
+	}
+	execCmd := tokens[i]
+	if alwaysAskBashCommands[execCmd] {
+		return true
+	}
+	if conditionalCommandKeys[execCmd] {
+		return conditionalExecCmdDanger(execCmd, tokens[i:], depth+1)
+	}
+	if safeBashCommands[execCmd] {
+		return false
+	}
+	return true // unknown command
+}
+
+func indexOfString(tokens []string, target string) int {
+	for i, t := range tokens {
+		if t == target {
+			return i
+		}
+	}
+	return -1
 }
 
 func splitShellCommands(command string) [][]string {

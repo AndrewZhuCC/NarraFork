@@ -99,3 +99,38 @@ func TestIsTransientAgentErrorBare429FallsBackToCustomRules(t *testing.T) {
 		t.Fatal("bare 429 should retry when a custom keyword rule matches")
 	}
 }
+
+// TestIsTransientAgentErrorRetryableReasonMarkers verifies the TS step-2
+// reason/code branch (MODEL_TEMPORARILY_UNAVAILABLE / CodeWhisperer
+// InternalServerException) is honored BEFORE the HTTP-status/429 checks, so a
+// Kiro/CodeWhisperer transient error wrapped in a 429 or surfaced as an
+// in-stream (HTTP 200) error still retries instead of short-circuiting to the
+// bare-429 custom-rules-only branch.
+func TestIsTransientAgentErrorRetryableReasonMarkers(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		// CodeWhisperer InternalServerException surfaced in a 200 in-stream error
+		// body — no retryable HTTP status, so only the step-2 marker can retry it.
+		{"codewhisperer internal server exception in-stream", errors.New(`kiro provider error: {"__type":"com.amazon.aws.codewhisperer#InternalServerException","message":"internal failure"}`)},
+		// Same marker wrapped in a 429: without the step-2 branch this would fall
+		// into the bare-429 custom-rules-only path and NOT retry.
+		{"codewhisperer internal server exception wrapped in 429", &providerHTTPError{StatusCode: 429, Provider: "kiro", Body: `{"__type":"com.amazon.aws.codewhisperer#InternalServerException"}`}},
+		// MODEL_TEMPORARILY_UNAVAILABLE arriving with a 429 status: the step-2
+		// branch must retry before the bare-429 short-circuit.
+		{"model temporarily unavailable wrapped in 429", &providerHTTPError{StatusCode: 429, Provider: "nug", Body: "MODEL_TEMPORARILY_UNAVAILABLE"}},
+	}
+	for _, tc := range cases {
+		if !isTransientAgentError(tc.err, nil) {
+			t.Errorf("expected %q to be retryable via the step-2 reason marker branch", tc.name)
+		}
+	}
+
+	// A hard quota/billing message must still win over the step-2 markers,
+	// matching the TS order where NON_RETRYABLE_PATTERNS short-circuits first.
+	quota := &providerHTTPError{StatusCode: 429, Provider: "kiro", Body: `insufficient_quota: {"__type":"com.amazon.aws.codewhisperer#InternalServerException"}`}
+	if isTransientAgentError(quota, nil) {
+		t.Fatal("a hard quota message must override the step-2 retryable reason marker")
+	}
+}

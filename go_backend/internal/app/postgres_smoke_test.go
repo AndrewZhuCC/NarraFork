@@ -95,7 +95,7 @@ func TestPostgresPostMigrationFrontendSmoke(t *testing.T) {
 		{"graph", "/api/projects/project-1/graph"},
 		{"chapters", "/api/chapters/?projectId=project-1"},
 		{"chapter", "/api/chapters/chapter-1"},
-		{"messages", "/api/narrators/narrator-1/messages?limit=20"},
+		{"chunks", "/api/narrators/narrator-1/chunks?direction=older&count=1"},
 		{"terminals", "/api/terminals?chapterId=chapter-1"},
 		{"terminal-tabs", "/api/terminals/tabs?chapterId=chapter-1"},
 		{"search", "/api/search?q=Alpha&entities=chapters,messages,narrators"},

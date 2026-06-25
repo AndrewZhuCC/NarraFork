@@ -439,8 +439,16 @@ func TestClineProviderAddsWorkOSTokenAndOpenRouterHeaders(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer workos:cline-token" {
 			t.Fatalf("unexpected cline auth header: %s", got)
 		}
-		if r.Header.Get("X-Title") == "" || r.Header.Get("HTTP-Referer") == "" {
-			t.Fatalf("expected cline OpenRouter headers")
+		// Cline VS Code extension header set (TS buildOpenRouterHeaders +
+		// buildClineHeaders): exact values, not narrafork-branded.
+		if r.Header.Get("HTTP-Referer") != "https://cline.bot" || r.Header.Get("X-Title") != "Cline" {
+			t.Fatalf("cline HTTP-Referer/X-Title must be cline-branded, got referer=%q title=%q", r.Header.Get("HTTP-Referer"), r.Header.Get("X-Title"))
+		}
+		if r.Header.Get("User-Agent") != "Cline/3.74.0" || r.Header.Get("X-PLATFORM") != "node" || r.Header.Get("X-CLIENT-TYPE") != "extension" || r.Header.Get("X-CLIENT-VERSION") != "3.74.0" || r.Header.Get("X-CORE-VERSION") != "3.74.0" {
+			t.Fatalf("missing/incorrect cline client headers: ua=%q platform=%q clientType=%q clientVer=%q coreVer=%q", r.Header.Get("User-Agent"), r.Header.Get("X-PLATFORM"), r.Header.Get("X-CLIENT-TYPE"), r.Header.Get("X-CLIENT-VERSION"), r.Header.Get("X-CORE-VERSION"))
+		}
+		if r.Header.Get("X-PLATFORM-VERSION") == "" {
+			t.Fatalf("expected non-empty X-PLATFORM-VERSION")
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"content":"cline ok"}}]}
@@ -603,8 +611,11 @@ func TestCodexProviderFailsOverAcrossCredentialPool(t *testing.T) {
 			http.Error(w, "quota exhausted", http.StatusTooManyRequests)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer good-token" || r.Header.Get("ChatGPT-Account-Id") != "good-acct" {
-			t.Fatalf("expected failover credential, auth=%s account=%s", r.Header.Get("Authorization"), r.Header.Get("ChatGPT-Account-Id"))
+		// ChatGPT-Account-Id is gated to official ChatGPT domains (TS parity), so
+		// it is NOT sent to this non-official test server even though the
+		// credential has an accountId.
+		if r.Header.Get("Authorization") != "Bearer good-token" || r.Header.Get("ChatGPT-Account-Id") != "" {
+			t.Fatalf("expected failover credential without account header on non-official domain, auth=%s account=%s", r.Header.Get("Authorization"), r.Header.Get("ChatGPT-Account-Id"))
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"failover ok"}
@@ -797,7 +808,9 @@ func TestCodexProviderUsesResponsesEndpointAndHeaders(t *testing.T) {
 		if r.URL.Path != "/responses" {
 			t.Fatalf("unexpected codex path: %s", r.URL.Path)
 		}
-		if r.Header.Get("Authorization") != "Bearer codex-token" || r.Header.Get("originator") != "narrafork" || r.Header.Get("ChatGPT-Account-Id") != "acct_1" {
+		// ChatGPT-Account-Id is gated to official ChatGPT domains (TS parity), so
+		// it is NOT sent to this non-official test server.
+		if r.Header.Get("Authorization") != "Bearer codex-token" || r.Header.Get("originator") != "narrafork" || r.Header.Get("ChatGPT-Account-Id") != "" {
 			t.Fatalf("unexpected codex headers authorization=%q originator=%q account=%q", r.Header.Get("Authorization"), r.Header.Get("originator"), r.Header.Get("ChatGPT-Account-Id"))
 		}
 		_ = json.NewDecoder(r.Body).Decode(&requestBody)

@@ -682,6 +682,7 @@ func TestAnthropicToolLoopUsesToolsAndSystemPrompt(t *testing.T) {
 				"apiKey":       "test-key",
 				"baseUrl":      server.URL,
 				"defaultModel": "claude-test",
+				"officialApi":  true,
 			},
 		},
 	})
@@ -960,6 +961,11 @@ func TestChatCompletionsSendsSupportedReasoningEffort(t *testing.T) {
 	if requestBody["reasoning_effort"] != "high" {
 		t.Fatalf("expected xhigh to be clamped to high, got %#v", requestBody["reasoning_effort"])
 	}
+	// TS openai-provider.ts never sets temperature on the chat-completions body;
+	// Go must not hardcode one either (previously it sent temperature:0.2).
+	if _, has := requestBody["temperature"]; has {
+		t.Fatalf("chat-completions body must not send temperature, got %#v", requestBody["temperature"])
+	}
 	messages, ok := requestBody["messages"].([]any)
 	if !ok || len(messages) == 0 {
 		t.Fatalf("expected messages in request: %#v", requestBody["messages"])
@@ -1041,6 +1047,60 @@ func TestGlobToolSupportsRecursivePatternsAndPath(t *testing.T) {
 	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.go","path":"../outside"}`)
 	if !strings.Contains(out, "path escapes working directory") {
 		t.Fatalf("expected path escape rejection, got: %s", out)
+	}
+}
+
+// TestGlobToolSlashlessPatternIsTopLevelOnlyLikeBun locks the W843 fix: a
+// slash-less Glob pattern (e.g. "*.go") matches only top-level entries, mirroring
+// Bun.Glob(pattern).scan() used by the TS Glob tool (the `*` wildcard does not
+// cross "/"). Go previously routed the Glob tool through the Grep-style basename
+// fallback, wrongly returning nested same-suffix files for "*.go". A "**" pattern
+// still matches across directories. The Grep tool keeps rg basename semantics
+// (regression-guarded here so the shared-matcher split does not break it).
+func TestGlobToolSlashlessPatternIsTopLevelOnlyLikeBun(t *testing.T) {
+	cwd := t.TempDir()
+	for _, file := range []string{"a.go", "a.txt", "sub/b.go", "sub/deep/c.go"} {
+		full := filepath.Join(cwd, filepath.FromSlash(file))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatalf("mkdir fixture: %v", err)
+		}
+		if err := os.WriteFile(full, []byte(file), 0o644); err != nil {
+			t.Fatalf("write fixture: %v", err)
+		}
+	}
+
+	// Slash-less "*.go" -> top-level only (Bun.Glob => ["a.go"]).
+	out := ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.go"}`)
+	if !strings.Contains(out, "a.go") {
+		t.Fatalf(`Glob "*.go" should match top-level a.go, got: %s`, out)
+	}
+	if strings.Contains(out, "sub/b.go") || strings.Contains(out, "sub/deep/c.go") {
+		t.Fatalf(`Glob "*.go" must NOT match nested files (Bun top-level-only), got: %s`, out)
+	}
+
+	// "**/*.go" -> recursive (regression: ** still crosses directories).
+	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"**/*.go"}`)
+	if !strings.Contains(out, "a.go") || !strings.Contains(out, "sub/b.go") || !strings.Contains(out, "sub/deep/c.go") {
+		t.Fatalf(`Glob "**/*.go" should match all .go at any depth, got: %s`, out)
+	}
+
+	// Brace expansion stays top-level-only too: "*.{go,txt}" => a.go + a.txt only.
+	out = ExecuteTool(context.Background(), cwd, "Glob", `{"pattern":"*.{go,txt}"}`)
+	if !strings.Contains(out, "a.go") || !strings.Contains(out, "a.txt") {
+		t.Fatalf(`Glob "*.{go,txt}" should match top-level a.go and a.txt, got: %s`, out)
+	}
+	if strings.Contains(out, "sub/b.go") {
+		t.Fatalf(`Glob "*.{go,txt}" must NOT match nested files, got: %s`, out)
+	}
+
+	// Grep regression: the Grep tool's glob filter keeps rg basename semantics
+	// (slash-less "*.go" matches nested files at any depth), via the unchanged
+	// shared globMatch.
+	if !globMatch("*.go", "sub/b.go") {
+		t.Fatal("Grep globMatch should still match nested basename for slash-less *.go (rg parity)")
+	}
+	if globMatchGlobTool("*.go", "sub/b.go") {
+		t.Fatal("Glob globMatchGlobTool must NOT match nested basename for slash-less *.go (Bun parity)")
 	}
 }
 
@@ -1736,8 +1796,8 @@ func TestWebFetchToolFetchesAndTruncatesHTTP(t *testing.T) {
 
 func TestWebFetchToolRejectsNonHTTPURL(t *testing.T) {
 	out := ExecuteTool(context.Background(), t.TempDir(), "WebFetch", `{"url":"file:///etc/passwd"}`)
-	if !strings.Contains(out, "only http, https, and data") {
-		t.Fatalf("expected non-HTTP rejection, got: %s", out)
+	if !strings.Contains(out, "Unsupported protocol: file:") || !strings.Contains(out, "Use the Read tool for local files") {
+		t.Fatalf("expected TS-aligned non-HTTP rejection, got: %s", out)
 	}
 }
 

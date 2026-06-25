@@ -12,6 +12,11 @@ import (
 // Mirrors the TS getModelContextWindow `?? 128_000` default.
 const defaultModelContextWindow = 128000
 
+// anthropicOfficial1mContextWindow is the 1M-token window the Anthropic official
+// API serves for 1M-context-capable models, mirroring the TS
+// getAnthropicEffectiveContextWindow uplift (Math.max(window, 1_000_000)).
+const anthropicOfficial1mContextWindow = 1000000
+
 // builtinModelContextWindows mirrors the TS BUILTIN_CONTEXT_WINDOWS table
 // (server/lib/settings/provider.ts). Codex entries use their contextLength.
 var builtinModelContextWindows = map[string]int{
@@ -137,6 +142,30 @@ func resolveModelContextWindow(settings *config.Store, model, providerPrefix str
 		return window
 	}
 	return defaultModelContextWindow
+}
+
+// supportsOfficialAnthropic1mContext reports whether a model serves a 1M context
+// window on the Anthropic official API, mirroring the TS
+// supportsOfficialAnthropic1mContext (claude-sonnet-4* / opus-4-6 / opus-4.6).
+func supportsOfficialAnthropic1mContext(model string) bool {
+	lower := strings.ToLower(bareModelID(model))
+	return strings.Contains(lower, "claude-sonnet-4") ||
+		strings.Contains(lower, "opus-4-6") ||
+		strings.Contains(lower, "opus-4.6")
+}
+
+// effectiveModelContextWindow resolves the context window and, for the Anthropic
+// official API on 1M-capable models, applies the 1M uplift (max with the
+// resolved window), mirroring the TS getAnthropicEffectiveContextWindow. Other
+// providers/models return the plain resolved window.
+func effectiveModelContextWindow(settings *config.Store, model, providerPrefix, providerKind string, officialAPI bool) int {
+	window := resolveModelContextWindow(settings, model, providerPrefix)
+	if officialAPI && providerKind == "anthropic" && supportsOfficialAnthropic1mContext(model) {
+		if anthropicOfficial1mContextWindow > window {
+			return anthropicOfficial1mContextWindow
+		}
+	}
+	return window
 }
 
 // providerDefaultContextWindow looks up a configured provider's

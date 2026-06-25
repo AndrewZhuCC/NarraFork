@@ -61,9 +61,9 @@ func fetchDomHTTP(ctx context.Context, rawURL, selector string, maxLength int) s
 	if rawURL == "" {
 		return "url is required"
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "invalid URL"
+	parsed, _, errMessage := validateWebFetchURL(rawURL)
+	if errMessage != "" {
+		return errMessage
 	}
 	if maxLength <= 0 || maxLength > 200000 {
 		maxLength = webFetchDomDefaultMaxLength
@@ -80,7 +80,7 @@ func fetchDomHTTP(ctx context.Context, rawURL, selector string, maxLength int) s
 		rawHTML = decoded
 	case "http", "https":
 		if parsed.Host == "" {
-			return "invalid URL"
+			return "Invalid URL: " + rawURL
 		}
 		fetched, fetchErr := webFetchRawHTML(ctx, parsed.String())
 		if fetchErr != "" {
@@ -88,7 +88,7 @@ func fetchDomHTTP(ctx context.Context, rawURL, selector string, maxLength int) s
 		}
 		rawHTML = fetched
 	default:
-		return "only http, https, and data URLs are supported for dom mode"
+		return "Unsupported protocol: " + parsed.Scheme + ": — only http://, https://, and data: URLs are supported. Use the Read tool for local files."
 	}
 
 	doc, err := html.Parse(strings.NewReader(rawHTML))

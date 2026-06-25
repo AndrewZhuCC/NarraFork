@@ -153,7 +153,7 @@ func defaultRaw(home string) map[string]any {
 			"maxTransientRetries":             float64(10),
 			"silentToolCallThreshold":         float64(20),
 			"retryBackoffCeilMs":              float64(20000),
-			"firstTokenTimeoutMs":             float64(60000),
+			"firstTokenTimeoutMs":             float64(300000),
 			"autoCompactKeepPairs":            float64(2),
 			"autoCompactPruneThreshold":       float64(80),
 		},

@@ -34,8 +34,8 @@ func TestAgentEventTranscriptTextOnlyFrontendGolden(t *testing.T) {
 	}
 	wantBlocks := []map[string]any{{"type": "text", "text": "Hello world"}}
 	assertJSONBlocks(t, messages[0].ContentJSON, wantBlocks)
-	if fixture.state.draftMessageID == nil || *fixture.state.draftMessageID != "" {
-		t.Fatalf("turn_complete should reset current draft pointer, got %#v", fixture.state.draftMessageID)
+	if fixture.state.draftID() != "" {
+		t.Fatalf("turn_complete should reset current draft pointer, got %#v", fixture.state.draftID())
 	}
 
 	stream := fixture.firstBroadcast("stream_text")
@@ -164,7 +164,7 @@ func TestPermissionLifecycleClosestTranscriptFrontendGolden(t *testing.T) {
 	call.Function.Arguments = `{"file_path":"approved.txt","content":"ok"}`
 
 	fixture.feed(agentbasic.AgentEvent{Type: "tool_call", ToolUseID: call.ID, ToolName: call.Function.Name, Input: map[string]any{"file_path": "approved.txt", "content": "ok"}})
-	if err := fixture.service.recordPendingToolCall(context.Background(), fixture.narratorID, *fixture.state.draftMessageID, fixture.state.narrator, call, "Write requires approval"); err != nil {
+	if err := fixture.service.recordPendingToolCall(context.Background(), fixture.narratorID, fixture.state.draftID(), fixture.state.narrator, call, "Write requires approval"); err != nil {
 		t.Fatalf("record pending permission: %v", err)
 	}
 
@@ -184,7 +184,7 @@ func TestPermissionLifecycleClosestTranscriptFrontendGolden(t *testing.T) {
 
 	decision := permissionDecision{Status: "approved", Reason: "looks safe", Message: "approved by tester", DecidedBy: "tester", DecidedAt: "2026-06-01T00:00:00Z"}
 	run := agentbasic.ToolRun{ID: call.ID, Name: "Write", Arguments: call.Function.Arguments, Output: "Wrote approved.txt", Status: "completed"}
-	if err := fixture.service.finishRecordedToolCall(context.Background(), fixture.narratorID, call.ID, *fixture.state.draftMessageID, run, decision, "success"); err != nil {
+	if err := fixture.service.finishRecordedToolCall(context.Background(), fixture.narratorID, call.ID, fixture.state.draftID(), run, decision, "success"); err != nil {
 		t.Fatalf("finish recorded tool call: %v", err)
 	}
 

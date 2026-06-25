@@ -3,7 +3,6 @@ package agentbasic
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 	"unicode/utf16"
 
@@ -51,9 +50,9 @@ func fetchReadabilityHTTP(ctx context.Context, rawURL string, maxLength int) str
 	if rawURL == "" {
 		return "url is required"
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "invalid URL"
+	parsed, _, errMessage := validateWebFetchURL(rawURL)
+	if errMessage != "" {
+		return errMessage
 	}
 	if maxLength <= 0 || maxLength > 200000 {
 		maxLength = webFetchReadabilityDefaultMaxLength
@@ -69,7 +68,7 @@ func fetchReadabilityHTTP(ctx context.Context, rawURL string, maxLength int) str
 		rawHTML = decoded
 	case "http", "https":
 		if parsed.Host == "" {
-			return "invalid URL"
+			return "Invalid URL: " + rawURL
 		}
 		fetched, fetchErr := webFetchRawHTML(ctx, parsed.String())
 		if fetchErr != "" {
@@ -77,7 +76,7 @@ func fetchReadabilityHTTP(ctx context.Context, rawURL string, maxLength int) str
 		}
 		rawHTML = fetched
 	default:
-		return "only http, https, and data URLs are supported"
+		return "Unsupported protocol: " + parsed.Scheme + ": — only http://, https://, and data: URLs are supported. Use the Read tool for local files."
 	}
 
 	doc, err := html.Parse(strings.NewReader(rawHTML))

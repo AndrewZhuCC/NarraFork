@@ -9,133 +9,6 @@ import (
 	"time"
 )
 
-func TestMessagesCursorPaginatesTopLevelRefsAndAttachesChildren(t *testing.T) {
-	sqlDB := openNarratorHandlerTestDB(t)
-	defer sqlDB.Close()
-	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	service := &Service{DB: sqlDB}
-	ctx := context.Background()
-
-	for i := 1; i <= 6; i++ {
-		if _, err := service.addMessage(ctx, narratorID, "user", "top "+string(rune('0'+i)), nil); err != nil {
-			t.Fatalf("add top message %d: %v", i, err)
-		}
-	}
-
-	first, err := service.MessagesCursor(ctx, narratorID, 2, "", "older")
-	if err != nil {
-		t.Fatalf("latest page: %v", err)
-	}
-	if len(first.Messages) != 2 || first.Messages[0].Seq != 5 || first.Messages[1].Seq != 6 {
-		t.Fatalf("expected latest seqs [5 6], got %#v", messageSeqs(first.Messages))
-	}
-	if !first.HasMore || first.NextCursor == nil || *first.NextCursor != "5" {
-		t.Fatalf("expected older cursor at seq 5, got %#v", first)
-	}
-
-	older, err := service.MessagesCursor(ctx, narratorID, 2, *first.NextCursor, "older")
-	if err != nil {
-		t.Fatalf("older page: %v", err)
-	}
-	if len(older.Messages) != 2 || older.Messages[0].Seq != 3 || older.Messages[1].Seq != 4 {
-		t.Fatalf("expected older seqs [3 4], got %#v", messageSeqs(older.Messages))
-	}
-
-	newer, err := service.MessagesCursor(ctx, narratorID, 2, "4", "newer")
-	if err != nil {
-		t.Fatalf("newer page: %v", err)
-	}
-	if len(newer.Messages) != 2 || newer.Messages[0].Seq != 5 || newer.Messages[1].Seq != 6 {
-		t.Fatalf("expected newer seqs [5 6], got %#v", messageSeqs(newer.Messages))
-	}
-}
-
-// TestMessagesCursorLimitZeroReturnsEmpty locks the TS /:id/messages limit
-// semantics Math.min(rawLimit, 200) with NO lower clamp: limit=0 fetches LIMIT 1
-// and slice(0,0) -> empty pageRows, and TS then early-returns hasMore=false /
-// nextCursor=null for an empty page. Go previously forced limit<=0 up to the 50
-// fallback and returned rows.
-func TestMessagesCursorLimitZeroReturnsEmpty(t *testing.T) {
-	sqlDB := openNarratorHandlerTestDB(t)
-	defer sqlDB.Close()
-	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	service := &Service{DB: sqlDB}
-	ctx := context.Background()
-	for i := 1; i <= 3; i++ {
-		if _, err := service.addMessage(ctx, narratorID, "user", "m"+string(rune('0'+i)), nil); err != nil {
-			t.Fatalf("add message %d: %v", i, err)
-		}
-	}
-	page, err := service.MessagesCursor(ctx, narratorID, 0, "", "older")
-	if err != nil {
-		t.Fatalf("limit=0 cursor page: %v", err)
-	}
-	if len(page.Messages) != 0 {
-		t.Fatalf("limit=0 should return empty messages (TS slice(0,0)), got %d", len(page.Messages))
-	}
-	// TS early-returns hasMore:false / nextCursor:null when pageRows is empty.
-	if page.HasMore || page.NextCursor != nil {
-		t.Fatalf("limit=0 empty page should report HasMore=false / NextCursor=nil (TS empty-page early return), got %#v", page)
-	}
-}
-
-func TestMessagesCursorAttachesChildTreeForTopLevelRefs(t *testing.T) {
-	sqlDB := openNarratorHandlerTestDB(t)
-	defer sqlDB.Close()
-	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	childNarratorID := insertChildNarratorTestRow(t, sqlDB, "tree_child")
-	service := &Service{DB: sqlDB}
-	ctx := context.Background()
-
-	assistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "launch child", []map[string]any{{"type": "tool_use", "id": "tree_tool", "name": "Task", "input": map[string]any{"prompt": "go"}}}, nil)
-	if err != nil {
-		t.Fatalf("add assistant: %v", err)
-	}
-	insertToolCallTestRow(t, sqlDB, narratorID, assistant.ID, "tree_tool")
-	childID := insertChildMessageTestRow(t, sqlDB, childNarratorID, "tree_tool", 1, "tree child")
-
-	page, err := service.MessagesCursor(ctx, narratorID, 10, "", "older")
-	if err != nil {
-		t.Fatalf("message page: %v", err)
-	}
-	if len(page.Messages) != 1 || len(page.Messages[0].Children) != 1 || page.Messages[0].Children[0].ID != childID {
-		t.Fatalf("expected child tree attached to top-level ref, got %#v", page.Messages)
-	}
-	if len(page.Messages[0].ToolCalls) != 1 || page.Messages[0].ToolCalls[0].ToolUseID != "tree_tool" || page.Messages[0].ToolCalls[0].ToolName != "Task" {
-		t.Fatalf("expected tool call attached to top-level assistant message, got %#v", page.Messages[0].ToolCalls)
-	}
-}
-
-func TestMessagesAroundReturnsBoundedWindow(t *testing.T) {
-	sqlDB := openNarratorHandlerTestDB(t)
-	defer sqlDB.Close()
-	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	service := &Service{DB: sqlDB}
-	ctx := context.Background()
-
-	var anchor Message
-	for i := 1; i <= 6; i++ {
-		msg, err := service.addMessage(ctx, narratorID, "user", "top "+string(rune('0'+i)), nil)
-		if err != nil {
-			t.Fatalf("add top message %d: %v", i, err)
-		}
-		if i == 4 {
-			anchor = msg
-		}
-	}
-
-	page, err := service.MessagesAround(ctx, narratorID, anchor.ID, 1, 1)
-	if err != nil {
-		t.Fatalf("around page: %v", err)
-	}
-	if len(page.Messages) != 3 || page.Messages[0].Seq != 3 || page.Messages[1].Seq != 4 || page.Messages[2].Seq != 5 {
-		t.Fatalf("expected around seqs [3 4 5], got %#v", messageSeqs(page.Messages))
-	}
-	if !page.HasMore || !page.HasMoreAfter || page.NextCursor == nil || page.PrevCursor == nil {
-		t.Fatalf("expected both window cursors, got %#v", page)
-	}
-}
-
 func TestMessagesAfterCatchUpTracksChildAnchors(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
@@ -182,45 +55,17 @@ func TestMessagesAfterCatchUpTracksChildAnchors(t *testing.T) {
 	}
 }
 
-func TestMessagesRouteSupportsAfterCatchUpResponseWithMetadata(t *testing.T) {
+func TestMessagesRouteRejectsRemovedCursorEndpoint(t *testing.T) {
 	sqlDB := openNarratorHandlerTestDB(t)
 	defer sqlDB.Close()
 	narratorID := insertNarratorHandlerTestRow(t, sqlDB)
-	childNarratorID := insertChildNarratorTestRow(t, sqlDB, "route_child")
-	service := &Service{DB: sqlDB}
-	ctx := context.Background()
 
-	assistant, err := service.addMessageWithBlocks(ctx, narratorID, "assistant", "launch child", []map[string]any{{"type": "tool_use", "id": "route_tool", "name": "Task", "input": map[string]any{"prompt": "go"}}}, nil)
-	if err != nil {
-		t.Fatalf("add assistant: %v", err)
-	}
-	insertToolCallTestRow(t, sqlDB, narratorID, assistant.ID, "route_tool")
-	childID := insertChildMessageTestRow(t, sqlDB, childNarratorID, "route_tool", 1, "route child")
-	if _, err := sqlDB.Exec(`UPDATE narrator_messages SET sdk_message_uuid = ? WHERE id = ?`, "sdk-msg-route", childID); err != nil {
-		t.Fatalf("set child sdk uuid: %v", err)
-	}
-
-	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/messages?after="+assistant.ID)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
-	}
-	var body map[string]any
-	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode catch-up response: %v body=%s", err, w.Body.String())
-	}
-	if _, ok := body["messageVersion"]; !ok {
-		t.Fatalf("expected messageVersion metadata, got %#v", body)
-	}
-	orphans, _ := body["orphanChildren"].([]any)
-	if len(orphans) != 1 || orphans[0].(map[string]any)["id"] != childID {
-		t.Fatalf("expected route orphan child %s, got %#v", childID, body["orphanChildren"])
-	}
-	child, _ := orphans[0].(map[string]any)
-	if child["messageUuid"] != "sdk-msg-route" || child["sdkMessageUuid"] != "sdk-msg-route" {
-		t.Fatalf("expected TS-compatible messageUuid alias, got %#v", child)
-	}
-	if _, ok := body["cursor"].(map[string]any); !ok {
-		t.Fatalf("expected cursor metadata, got %#v", body["cursor"])
+	// The legacy GET /:id/messages cursor/around/catch-up endpoint was removed in
+	// favor of the chunk virtualization endpoints; catch-up now flows over the
+	// WebSocket only. The route must no longer be served.
+	w := serveNarratorHandlerRequest(sqlDB, http.MethodGet, "/narrators/"+narratorID+"/messages")
+	if w.Code != http.StatusNotFound && w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected legacy GET /messages to be gone (404/405), got %d body=%s", w.Code, w.Body.String())
 	}
 }
 

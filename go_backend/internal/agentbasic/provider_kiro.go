@@ -172,6 +172,13 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 	if provider.Kind == "nkp" {
 		prepareNkpRequest(body)
 	}
+	// NUG kiro channel wraps the kiro conversationState body with a top-level
+	// "model" field (the channel-prefixed routedModel), mirroring TS
+	// nug-provider.ts chatKiro `{ model: meta.routedModel, ...request }`. Native
+	// kiro/nkp providers leave NugKiroRoutedModel empty and send no top-level model.
+	if provider.NugKiroRoutedModel != "" {
+		body["model"] = provider.NugKiroRoutedModel
+	}
 	payload, _ := json.Marshal(body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, kiroChatEndpoint(provider.BaseURL), bytes.NewReader(payload))
 	if err != nil {
@@ -189,6 +196,7 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 	if provider.Kind == "nkp" {
 		req.Header.Set("X-NKP-Request-Token", buildNkpRequestToken(provider.APIKey))
 	}
+	applyProviderExtraHeaders(req, provider)
 	res, err := client.Do(req)
 	if err != nil {
 		return err
@@ -228,7 +236,7 @@ func streamKiroChat(ctx context.Context, client *http.Client, provider Provider,
 		if eventType == "" {
 			eventType = "assistantResponseEvent"
 		}
-		parsed := parseKiroEvent(eventType, payload)
+		parsed := parseKiroEvent(eventType, payload, len(params.Tools) > 0)
 		if parsed.StopReason != "" || eventType == "message_stop" || eventType == "response.completed" || eventType == "done" || eventType == "complete" {
 			completed = true
 		}
@@ -291,6 +299,7 @@ func streamKiroPluginBridge(ctx context.Context, provider Provider, request map[
 	}()
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	hasTools := kiroRequestHasTools(request)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -309,7 +318,7 @@ func streamKiroPluginBridge(ctx context.Context, provider Provider, request map[
 		if raw.EventType == "" {
 			raw.EventType = "assistantResponseEvent"
 		}
-		emitStreamEvent(ctx, out, StreamEvent{Parsed: parseKiroEvent(raw.EventType, raw.Data)})
+		emitStreamEvent(ctx, out, StreamEvent{Parsed: parseKiroEvent(raw.EventType, raw.Data, hasTools)})
 	}
 	if err := scanner.Err(); err != nil {
 		return err
@@ -355,7 +364,7 @@ func buildKiroChatRequest(model string, params ChatParams) map[string]any {
 			"operatingSystem":         kiroOperatingSystem(),
 			"currentWorkingDirectory": params.Cwd,
 		},
-		"shellState": map[string]any{"shellName": "bash"},
+		"shellState": map[string]any{"shellName": kiroShellName()},
 	}
 	if len(history) > 0 {
 		state["history"] = history
@@ -626,15 +635,22 @@ func newKiroConversationID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-func parseKiroEvent(eventType string, data map[string]any) ParsedStreamEvent {
+func parseKiroEvent(eventType string, data map[string]any, parseTextToolCalls bool) ParsedStreamEvent {
 	result := ParsedStreamEvent{}
 	if usage := kiroUsageSnapshot(data); usage != nil {
 		result.Usage = usage
 	}
+	var xmlToolUses []ToolCall
 	switch eventType {
 	case "assistantResponseEvent":
 		if content := stringValue(data["content"]); content != "" {
-			result.Text = content
+			if parseTextToolCalls {
+				rewritten, extracted := kiroParseTextToolCalls(content)
+				result.Text = rewritten
+				xmlToolUses = extracted
+			} else {
+				result.Text = content
+			}
 		}
 		result.MessageID = stringValue(data["messageId"])
 		result.ConversationID = stringValue(data["conversationId"])
@@ -652,6 +668,9 @@ func parseKiroEvent(eventType string, data map[string]any) ParsedStreamEvent {
 				result.ToolUses = append(result.ToolUses, kiroToolCall(toolUse))
 			}
 		}
+		// Append leaked-XML tool uses after native ones, deduped (mirrors TS
+		// appendDedupedToolUses ordering at kiro-protocol.ts:791).
+		result.ToolUses = kiroAppendDedupedToolUses(result.ToolUses, xmlToolUses)
 	case "toolUseEvent":
 		if toolUseID := stringValue(data["toolUseId"]); toolUseID != "" {
 			result.ToolUseChunk = &ToolUseChunk{ToolUseID: toolUseID, Name: stringValue(data["name"]), Input: stringValue(data["input"]), Stop: boolValue(data["stop"])}
@@ -740,10 +759,38 @@ func kiroUsageSnapshot(data map[string]any) *UsageSnapshot {
 	output := intValue(firstPresent(usage, "outputTokens", "output_tokens", "completionTokens", "completion_tokens"), 0)
 	cached := intValue(firstPresent(usage, "cachedInputTokens", "cached_input_tokens", "cacheReadInputTokens", "cache_read_input_tokens"), 0)
 	reasoning := intValue(firstPresent(usage, "reasoningTokens", "reasoning_tokens"), 0)
-	if input == 0 && output == 0 && cached == 0 && reasoning == 0 {
+	// Mirror the TS parseUsagePayload prompt footprint (kiro-protocol.ts:463-529):
+	// cacheCreation comes from cacheCreationInputTokens (or cacheWrite aliases),
+	// and when that is absent it is derived from the 5m + 1h ephemeral buckets.
+	cacheCreation := intValue(firstPresent(usage, "cacheCreationInputTokens", "cache_creation_input_tokens", "cacheWriteInputTokens", "cache_write_input_tokens"), 0)
+	cacheCreation5m := intValue(firstPresent(usage, "cacheCreation5mTokens", "cache_creation_5m_tokens", "ephemeral5mInputTokens", "ephemeral_5m_input_tokens"), 0)
+	cacheCreation1h := intValue(firstPresent(usage, "cacheCreation1hTokens", "cache_creation_1h_tokens", "ephemeral1hInputTokens", "ephemeral_1h_input_tokens"), 0)
+	// hasAny mirrors the TS guard over all seven usage fields.
+	if input == 0 && output == 0 && cached == 0 && reasoning == 0 && cacheCreation == 0 && cacheCreation5m == 0 && cacheCreation1h == 0 {
 		return nil
 	}
-	return &UsageSnapshot{InputTokens: input, PromptTokens: input, CompletionTokens: output, CachedInputTokens: cached, ReasoningTokens: reasoning}
+	derivedCacheCreation := cacheCreation
+	if derivedCacheCreation == 0 && (cacheCreation5m != 0 || cacheCreation1h != 0) {
+		derivedCacheCreation = cacheCreation5m + cacheCreation1h
+	}
+	// promptTokens: an explicit promptTokens/prompt_tokens key wins; otherwise it
+	// is the full prompt footprint (input + cached + derivedCacheCreation),
+	// matching TS. Go previously set PromptTokens = input only, which understated
+	// context-usage percent and dropped cache-creation cost for Kiro/NKP.
+	promptTokens := input + cached + derivedCacheCreation
+	if explicit := firstPresent(usage, "promptTokens", "prompt_tokens"); explicit != nil {
+		promptTokens = intValue(explicit, promptTokens)
+	}
+	return &UsageSnapshot{
+		InputTokens:              input,
+		PromptTokens:             promptTokens,
+		CompletionTokens:         output,
+		CachedInputTokens:        cached,
+		ReasoningTokens:          reasoning,
+		CacheCreationInputTokens: derivedCacheCreation,
+		CacheCreation5mTokens:    cacheCreation5m,
+		CacheCreation1hTokens:    cacheCreation1h,
+	}
 }
 
 func firstPresent(values map[string]any, keys ...string) any {
@@ -828,4 +875,34 @@ func kiroOperatingSystem() string {
 	default:
 		return "LINUX"
 	}
+}
+
+// kiroShellName mirrors the TS buildKiroRequest shellState.shellName
+// (kiro-protocol.ts:152): process.env.SHELL?.split("/").pop() ?? "bash" — the
+// basename of the $SHELL environment variable. Go previously hardcoded "bash" on
+// every Kiro/NKP/NUG-kiro request, so the conversationState shellState reported
+// the wrong shell whenever the user ran a non-bash login shell (zsh, fish, etc.).
+// This is the shell context advertised to the Kiro service, distinct from the
+// agent Bash tool's own shell selection (W794 shellPathDetection:false).
+//
+// The normal-path basename extraction matches TS exactly (e.g. "/bin/zsh" -> "zsh",
+// "zsh" -> "zsh"). One documented divergence on degenerate input: TS's `??`
+// only falls back to "bash" when SHELL is null/undefined (unset), so a SHELL that
+// is set-but-empty ("") or ends in a slash ("/bin/") yields an empty TS
+// shellName, whereas Go returns the defensive "bash" fallback for any empty
+// basename. Go cannot distinguish unset from set-empty without os.LookupEnv, and
+// emitting an empty shellName is a likely TS bug, so Go deliberately keeps "bash".
+func kiroShellName() string {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		return "bash"
+	}
+	base := shell
+	if idx := strings.LastIndex(shell, "/"); idx >= 0 {
+		base = shell[idx+1:]
+	}
+	if base == "" {
+		return "bash"
+	}
+	return base
 }

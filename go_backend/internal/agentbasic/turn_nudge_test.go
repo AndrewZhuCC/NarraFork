@@ -7,7 +7,7 @@ import (
 )
 
 func TestTurnNudgeReminderFormat(t *testing.T) {
-	out := turnNudgeReminder(5, 5)
+	out := turnNudgeReminder(5, 5, "en")
 	if !strings.Contains(out, "You have used 5 of 5 turns") {
 		t.Fatalf("turnNudgeReminder missing turn counts: %q", out)
 	}

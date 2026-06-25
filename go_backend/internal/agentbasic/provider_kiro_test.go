@@ -237,15 +237,15 @@ func TestNormalizeKiroChatRequestFiltersStaleToolResults(t *testing.T) {
 }
 
 func TestKiroParserMapsQueueQuotaAndMeteringEvents(t *testing.T) {
-	metering := parseKiroEvent("meteringEvent", map[string]any{"usage": float64(3), "unit": "credit", "unitPlural": "credits"})
+	metering := parseKiroEvent("meteringEvent", map[string]any{"usage": float64(3), "unit": "credit", "unitPlural": "credits"}, false)
 	if metering.Metering == nil || metering.Metering.Usage != 3 {
 		t.Fatalf("unexpected metering event: %#v", metering.Metering)
 	}
-	queue := parseKiroEvent("queueEvent", map[string]any{"position": float64(2), "queueDepth": float64(5), "message": "waiting"})
+	queue := parseKiroEvent("queueEvent", map[string]any{"position": float64(2), "queueDepth": float64(5), "message": "waiting"}, false)
 	if queue.QueueStatus == nil || queue.QueueStatus.Position != 2 || queue.QueueStatus.QueueDepth != 5 {
 		t.Fatalf("unexpected queue event: %#v", queue.QueueStatus)
 	}
-	quota := parseKiroEvent("quotaBalanceEvent", map[string]any{"quotaBalance": "42"})
+	quota := parseKiroEvent("quotaBalanceEvent", map[string]any{"quotaBalance": "42"}, false)
 	if quota.QuotaBalance == nil || *quota.QuotaBalance != "42" {
 		t.Fatalf("unexpected quota event: %#v", quota.QuotaBalance)
 	}
@@ -289,4 +289,84 @@ data: {"stopReason":"end_turn"}
 	if eventTypeCount(events, "tool_call") != 1 || eventTypeCount(events, "tool_result") != 1 {
 		t.Fatalf("unexpected events: %#v", eventTypes(events))
 	}
+}
+
+// TestKiroUsageSnapshotPromptFootprint locks the W840 fix: kiroUsageSnapshot
+// mirrors the TS parseUsagePayload prompt footprint (kiro-protocol.ts:463-529).
+// PromptTokens must be input + cached + cacheCreation (not input alone), the
+// cacheCreation buckets must be parsed (and derived from 5m+1h when the top-level
+// field is absent), and an explicit promptTokens key must win.
+func TestKiroUsageSnapshotPromptFootprint(t *testing.T) {
+	t.Run("footprint is input+cached+cacheCreation", func(t *testing.T) {
+		snap := kiroUsageSnapshot(map[string]any{"usage": map[string]any{
+			"inputTokens":              float64(100),
+			"outputTokens":             float64(20),
+			"cachedInputTokens":        float64(40),
+			"cacheCreationInputTokens": float64(10),
+		}})
+		if snap == nil {
+			t.Fatal("expected non-nil usage snapshot")
+		}
+		if snap.InputTokens != 100 || snap.CachedInputTokens != 40 || snap.CompletionTokens != 20 {
+			t.Fatalf("base fields wrong: %#v", snap)
+		}
+		if snap.CacheCreationInputTokens != 10 {
+			t.Fatalf("CacheCreationInputTokens = %d, want 10", snap.CacheCreationInputTokens)
+		}
+		if snap.PromptTokens != 150 {
+			t.Fatalf("PromptTokens = %d, want 150 (100+40+10)", snap.PromptTokens)
+		}
+	})
+
+	t.Run("derives cacheCreation from 5m+1h", func(t *testing.T) {
+		snap := kiroUsageSnapshot(map[string]any{"usage": map[string]any{
+			"inputTokens":           float64(100),
+			"cacheCreation5mTokens": float64(7),
+			"cacheCreation1hTokens": float64(3),
+		}})
+		if snap == nil {
+			t.Fatal("expected non-nil usage snapshot")
+		}
+		if snap.CacheCreation5mTokens != 7 || snap.CacheCreation1hTokens != 3 {
+			t.Fatalf("ephemeral buckets wrong: %#v", snap)
+		}
+		if snap.CacheCreationInputTokens != 10 {
+			t.Fatalf("derived CacheCreationInputTokens = %d, want 10 (7+3)", snap.CacheCreationInputTokens)
+		}
+		if snap.PromptTokens != 110 {
+			t.Fatalf("PromptTokens = %d, want 110 (100+0+10)", snap.PromptTokens)
+		}
+	})
+
+	t.Run("explicit promptTokens wins", func(t *testing.T) {
+		snap := kiroUsageSnapshot(map[string]any{"usage": map[string]any{
+			"promptTokens":      float64(222),
+			"inputTokens":       float64(100),
+			"cachedInputTokens": float64(40),
+		}})
+		if snap == nil {
+			t.Fatal("expected non-nil usage snapshot")
+		}
+		if snap.PromptTokens != 222 {
+			t.Fatalf("PromptTokens = %d, want 222 (explicit key wins)", snap.PromptTokens)
+		}
+	})
+
+	t.Run("cacheCreation-only payload is not dropped by hasAny guard", func(t *testing.T) {
+		snap := kiroUsageSnapshot(map[string]any{"usage": map[string]any{
+			"cacheCreationInputTokens": float64(15),
+		}})
+		if snap == nil {
+			t.Fatal("cacheCreation-only payload should produce a snapshot (hasAny includes cacheCreation)")
+		}
+		if snap.CacheCreationInputTokens != 15 || snap.PromptTokens != 15 {
+			t.Fatalf("cacheCreation-only: %#v (want CacheCreation=15, Prompt=15)", snap)
+		}
+	})
+
+	t.Run("empty usage returns nil", func(t *testing.T) {
+		if snap := kiroUsageSnapshot(map[string]any{"usage": map[string]any{}}); snap != nil {
+			t.Fatalf("empty usage should return nil, got %#v", snap)
+		}
+	})
 }

@@ -208,7 +208,16 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) error {
 		return err
 	}
 	if !manualEdgeTypes[edge.Type] {
-		return validationError("Manual chapter edge delete is only supported for dependency edges")
+		// Mirror the TS delete error text verbatim. TS `deleteEdge`
+		// (server/services/chapter-edge-service.ts:146) rejects non-dependency
+		// edges with `ValidationError("Only dependency edges can be manually
+		// deleted")`. Go previously used its own phrasing ("Manual chapter edge
+		// delete is only supported for dependency edges"), a user-visible text
+		// divergence (frontend getErrorMessage surfaces the `error` field). The
+		// behavior (reject all non-dependency types with 400) already matched;
+		// only the wording differed. W660 aligned the create-side self-edge /
+		// cross-project texts but missed this delete-side text.
+		return validationError("Only dependency edges can be manually deleted")
 	}
 	tx, err := h.DB.BeginTx(r.Context(), nil)
 	if err != nil {

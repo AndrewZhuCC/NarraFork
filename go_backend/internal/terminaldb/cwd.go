@@ -13,7 +13,11 @@ var (
 	ErrTargetAmbiguous  = errors.New("exactly one of chapterId or narratorId is required")
 	ErrChapterNotFound  = errors.New("chapter not found")
 	ErrNarratorNotFound = errors.New("narrator not found")
-	ErrChapterDormant   = errors.New("chapter has no worktree (dormant?)")
+	// ErrChapterDormant mirrors the TS terminal-service.ts:238 ValidationError
+	// message verbatim ("Chapter has no worktree (dormant?)", capital C). It is
+	// surfaced to the user verbatim via httpx.BadRequest(err.Error()) (HTTP 400)
+	// in terminals/handlers.go terminalCwdError, so the casing must match TS.
+	ErrChapterDormant = errors.New("Chapter has no worktree (dormant?)")
 )
 
 // ResolveCwd mirrors the TypeScript terminalService.create cwd resolution order.

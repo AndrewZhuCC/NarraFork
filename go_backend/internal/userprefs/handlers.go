@@ -597,7 +597,14 @@ func validateUpsertRecentTab(tab map[string]any) (map[string]any, bool, error) {
 		return nil, false, err
 	}
 	switch tabType {
-	case "chapter", "narrator", "project", "workspace", "subagent":
+	// Mirror the TS recentTabSchema.type enum (server/lib/validators/settings.ts:104):
+	// [chapter, narrator, project, workspace, subagent, group]. "group" (chat/
+	// exploration group tabs created by frontend RecentTabs.tsx on group:ready) was
+	// previously missing here, so a PUT /recent-tabs with type:"group" was rejected
+	// 400 "recentTab.type is not supported" while TS accepted it. group is a generic
+	// top-level tab with no special service-layer branch (TS has none), so it flows
+	// through the same upsert/promote/regroup logic as project/subagent tabs.
+	case "chapter", "narrator", "project", "workspace", "subagent", "group":
 		clean["type"] = tabType
 	default:
 		return nil, false, httpx.ValidationError("recentTab.type is not supported")
@@ -1619,7 +1626,12 @@ func clampInt(value int, minValue int, maxValue int) int {
 
 func validateRemoveRecentTab(tabType string, tabID string) error {
 	switch tabType {
-	case "chapter", "narrator", "session", "project", "workspace", "subagent":
+	// Mirror the TS removeRecentTabSchema.type enum (settings.ts:122):
+	// [chapter, narrator, session, project, workspace, subagent, group]. Like the
+	// upsert validator, "group" was missing, so DELETE /recent-tabs/group/{id} was
+	// rejected 400 while TS accepted it — leaving group tabs un-removable in Go.
+	// (remove additionally allows the legacy "session" alias, which upsert does not.)
+	case "chapter", "narrator", "session", "project", "workspace", "subagent", "group":
 	default:
 		return httpx.ValidationError("recentTab.type is not supported")
 	}

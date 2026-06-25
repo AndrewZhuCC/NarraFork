@@ -75,6 +75,27 @@ func editWhitespaceNormalizedReplacer(content, find string) []string {
 	for _, line := range lines {
 		if normalize(line) == normalizedFind {
 			out = append(out, line)
+		} else if normalizedLine := normalize(line); strings.Contains(normalizedLine, normalizedFind) {
+			// Mirror TS edit.ts:151-166: the normalized find is a substring of this
+			// line but the line as a whole differs. Build a regex from the find's
+			// words (escaped) joined by \s+, match it against the ORIGINAL line, and
+			// yield the matched substring so a single-line partial match with
+			// differing internal whitespace still resolves.
+			words := whitespaceRun.Split(strings.TrimSpace(find), -1)
+			escaped := make([]string, 0, len(words))
+			for _, w := range words {
+				if w == "" {
+					continue
+				}
+				escaped = append(escaped, regexp.QuoteMeta(w))
+			}
+			if len(escaped) > 0 {
+				if re, err := regexp.Compile(strings.Join(escaped, `\s+`)); err == nil {
+					if loc := re.FindStringIndex(line); loc != nil {
+						out = append(out, line[loc[0]:loc[1]])
+					}
+				}
+			}
 		}
 	}
 	findLines := strings.Split(find, "\n")

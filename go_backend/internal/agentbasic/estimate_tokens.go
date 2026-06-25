@@ -1,6 +1,9 @@
 package agentbasic
 
-import "math"
+import (
+	"math"
+	"unicode/utf16"
+)
 
 // estimateTokens estimates the token count of a string using a character-based
 // heuristic, mirroring server/lib/agent/estimate-tokens.ts:
@@ -10,13 +13,20 @@ import "math"
 // The estimate is intentionally conservative (slightly over-estimating) and the
 // result is rounded up. It is used to estimate Kiro output tokens, which the
 // upstream never reports.
+//
+// Iteration is over UTF-16 code units (not Go runes) to match the TS source,
+// which loops `for (i=0; i<text.length; i++)` over text.charCodeAt(i). An astral
+// character (emoji / CJK Ext-B / etc.) is two UTF-16 code units, so it
+// contributes 2*0.3 = 0.6 like TS, instead of the 0.3 a single Go rune would
+// add. None of the wide ranges below cover the surrogate range (0xD800-0xDFFF),
+// so astral surrogate halves each fall into the 0.3 bucket exactly as in TS.
 func estimateTokens(text string) int {
 	if text == "" {
 		return 0
 	}
 	tokens := 0.0
-	for _, r := range text {
-		if isWideRune(r) {
+	for _, unit := range utf16.Encode([]rune(text)) {
+		if isWideCodeUnit(unit) {
 			tokens += 0.6
 		} else {
 			tokens += 0.3
@@ -39,21 +49,22 @@ func estimateTokensFromContextPercent(percent float64, contextWindow int) int {
 	return int(math.Round(percent / 100 * float64(contextWindow)))
 }
 
-// isWideRune reports whether r falls in a CJK / fullwidth / kana range, matching
-// the character buckets used by estimate-tokens.ts.
-func isWideRune(r rune) bool {
+// isWideCodeUnit reports whether a UTF-16 code unit falls in a CJK / fullwidth /
+// kana range, matching the character buckets and code-unit comparison used by
+// estimate-tokens.ts (which tests charCodeAt(i) against these ranges).
+func isWideCodeUnit(u uint16) bool {
 	switch {
-	case r >= 0x2e80 && r <= 0x9fff: // CJK radicals, ideographs, extension A
+	case u >= 0x2e80 && u <= 0x9fff: // CJK radicals, ideographs, extension A
 		return true
-	case r >= 0xac00 && r <= 0xd7af: // Hangul syllables
+	case u >= 0xac00 && u <= 0xd7af: // Hangul syllables
 		return true
-	case r >= 0xf900 && r <= 0xfaff: // CJK compatibility ideographs
+	case u >= 0xf900 && u <= 0xfaff: // CJK compatibility ideographs
 		return true
-	case r >= 0xff00 && r <= 0xffef: // Fullwidth forms
+	case u >= 0xff00 && u <= 0xffef: // Fullwidth forms
 		return true
-	case r >= 0x3000 && r <= 0x303f: // CJK symbols and punctuation
+	case u >= 0x3000 && u <= 0x303f: // CJK symbols and punctuation
 		return true
-	case r >= 0x3040 && r <= 0x30ff: // Hiragana + Katakana
+	case u >= 0x3040 && u <= 0x30ff: // Hiragana + Katakana
 		return true
 	default:
 		return false

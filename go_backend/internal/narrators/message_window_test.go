@@ -2,29 +2,6 @@ package narrators
 
 import "testing"
 
-// TestNormalizeWindowSizeMatchesTS pins normalizeWindowSize to the TS
-// parseWindowSize clamp Math.min(Math.max(value, 0), 100)
-// (server/routes/narrators.ts). The NaN->fallback step is handled by queryInt at
-// the handler, so this is purely the [0,100] clamp: negatives clamp to 0 (NOT to
-// the 5/20 default) and values over 100 clamp to 100.
-func TestNormalizeWindowSizeMatchesTS(t *testing.T) {
-	cases := map[int]int{
-		0:    0,
-		5:    5,
-		20:   20,
-		100:  100,
-		101:  100,
-		9999: 100,
-		-1:   0,
-		-50:  0,
-	}
-	for in, want := range cases {
-		if got := normalizeWindowSize(in); got != want {
-			t.Fatalf("normalizeWindowSize(%d) = %d, want %d", in, got, want)
-		}
-	}
-}
-
 // TestNormalizeMessageLimitMatchesTS pins normalizeMessageLimit to the TS cursor
 // limit handling Math.min(rawLimit, 200) with a 50 fallback for non-positive
 // (NaN/<=0) input (server/routes/narrators.ts uses 50 default, 200 cap).

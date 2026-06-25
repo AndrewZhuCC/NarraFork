@@ -620,6 +620,26 @@ func TestGitFilePathTraversalRejectedLikeTypeScript(t *testing.T) {
 			}
 		})
 	}
+
+	// The traversal rejection message must match the TS ValidationError text
+	// verbatim — `Invalid file path: ${f}` (capital I). Go previously emitted a
+	// lowercase "invalid file path: ..." which diverged from the TS wording the
+	// frontend git error UI / model surface. Assert the exact casing on one case.
+	w := serveGitRoutesRecorder(t, handler, http.MethodPost, "/c1/git/stage", `{"files":["../secret.txt"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("traversal message case: status = %d body=%s, want 400", w.Code, w.Body.String())
+	}
+	var errBody map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode traversal error body: %v body=%s", err, w.Body.String())
+	}
+	msg, _ := errBody["error"].(string)
+	if msg != "Invalid file path: ../secret.txt" {
+		t.Fatalf("traversal message should match TS 'Invalid file path: ../secret.txt' exactly, got %q (full=%#v)", msg, errBody)
+	}
+	if strings.Contains(w.Body.String(), "invalid file path") {
+		t.Fatalf("traversal message must not use the old lowercase wording, got body=%s", w.Body.String())
+	}
 }
 
 // Wave 569: TS filePathArray = z.array(z.string().min(1)).min(1) on the

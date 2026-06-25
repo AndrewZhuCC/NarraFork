@@ -2695,7 +2695,7 @@ func (s *Service) AIResolve(ctx context.Context, sourceID, targetID, strategy, m
 	if model == "" && s.Settings != nil {
 		model = s.Settings.Core().Agent.DefaultModel
 	}
-	prompt := buildConflictResolutionPromptGo(mergeResult.ConflictFiles, source.Branch, target.Branch, locale)
+	prompt := buildConflictResolutionPromptGo(mergeResult.ConflictFiles, source.Branch, target.Branch, locale, mergeContext)
 	_ = userID
 	result, err := agentbasic.Generate(ctx, s.Settings, model, []agentbasic.Message{{Role: "user", Content: prompt}}, *target.WorktreePath)
 	if err != nil {
@@ -4522,30 +4522,118 @@ func jsonObjectString(v any) string {
 	return string(data)
 }
 
-func buildConflictResolutionPromptGo(conflictFiles []string, sourceBranch, targetBranch, locale string) string {
-	var builder strings.Builder
-	if strings.HasPrefix(strings.ToLower(locale), "zh") {
-		builder.WriteString("你正在处理一次 Git 合并冲突。请直接修改工作区中的冲突文件，保留正确的最终内容，删除所有冲突标记。\n\n")
-		builder.WriteString(fmt.Sprintf("源分支：%s\n目标分支：%s\n\n冲突文件：\n", sourceBranch, targetBranch))
-	} else {
-		builder.WriteString("You are resolving a Git merge conflict. Edit the conflicted files in the working tree, keep the correct final content, and remove all conflict markers.\n\n")
-		builder.WriteString(fmt.Sprintf("Source branch: %s\nTarget branch: %s\n\nConflicted files:\n", sourceBranch, targetBranch))
-	}
-	if len(conflictFiles) == 0 {
-		builder.WriteString("  - (git did not report file names; inspect the repository status)\n")
-	} else {
-		for _, file := range conflictFiles {
-			builder.WriteString("  - ")
-			builder.WriteString(file)
-			builder.WriteString("\n")
+// buildConflictResolutionPromptGo mirrors the TS chapter-merge buildConflictResolutionPrompt
+// (server/services/chapter-merge.ts:1281) + prompt-i18n.ts conflictResolution /
+// conflictResolutionEnhanced. When merge context (commit subjects or diff stat) is
+// available it uses the enhanced variant so the model can understand the intent of
+// each side; otherwise it uses the base variant. The "Do NOT run git add or git
+// commit" instruction matches Go's runtime: the model only resolves conflicts in
+// the working tree, then the ai-resolve success path auto-commits via
+// s.Git.AutoCommit once ConflictFiles is empty (service.go AutoCommit call).
+func buildConflictResolutionPromptGo(conflictFiles []string, sourceBranch, targetBranch, locale string, mergeContext mergeSummaryContext) string {
+	zh := strings.HasPrefix(strings.ToLower(locale), "zh")
+	fileList := conflictResolutionFileList(conflictFiles)
+	enhanced := mergeContext.Collected && (len(mergeContext.Commits) > 0 || strings.TrimSpace(mergeContext.DiffStat) != "")
+	if enhanced {
+		commitMessages := strings.Join(mergeContext.Commits, "\n")
+		if strings.TrimSpace(commitMessages) == "" {
+			commitMessages = "(none)"
 		}
+		diffStat := mergeContext.DiffStat
+		if strings.TrimSpace(diffStat) == "" {
+			diffStat = "(none)"
+		}
+		var tmpl string
+		if zh {
+			tmpl = `从分支 "{sourceBranch}" 合并到 "{targetBranch}" 时产生了冲突。
+
+源分支的变更摘要（commit messages）：
+{commitMessages}
+
+变更统计：
+{diffStat}
+
+冲突文件：
+{fileList}
+
+请解决这些文件中的所有合并冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 结合上方的 commit messages 和变更统计，理解双方的变更意图
+3. 编辑文件以生成正确的合并结果，移除所有冲突标记
+4. 确保解决后的代码可以编译且逻辑正确
+
+不要运行 git add 或 git commit —— 只需解决文件中的冲突。`
+		} else {
+			tmpl = `A git merge from branch "{sourceBranch}" into "{targetBranch}" has produced conflicts.
+
+Source branch change summary (commit messages):
+{commitMessages}
+
+Change statistics:
+{diffStat}
+
+Conflicting files:
+{fileList}
+
+Please resolve all merge conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Use the commit messages and change statistics above to understand the intent of each side
+3. Edit the file to produce the correct merged result, removing all conflict markers
+4. Make sure the resolved code compiles and makes sense
+
+Do NOT run git add or git commit — just resolve the conflicts in the files.`
+		}
+		replacer := strings.NewReplacer(
+			"{sourceBranch}", sourceBranch,
+			"{targetBranch}", targetBranch,
+			"{commitMessages}", commitMessages,
+			"{diffStat}", diffStat,
+			"{fileList}", fileList,
+		)
+		return replacer.Replace(tmpl)
 	}
-	if strings.HasPrefix(strings.ToLower(locale), "zh") {
-		builder.WriteString("\n完成后不要提交；后端会检查冲突是否清空并自动提交。")
+	var tmpl string
+	if zh {
+		tmpl = `从分支 "{sourceBranch}" 合并到 "{targetBranch}" 时，以下文件产生了冲突：
+
+{fileList}
+
+请解决这些文件中的所有合并冲突。冲突标记（<<<<<<< HEAD、=======、>>>>>>>）已存在于工作目录中。对于每个文件：
+1. 读取文件以理解冲突双方的内容
+2. 编辑文件以生成正确的合并结果，移除所有冲突标记
+3. 确保解决后的代码可以编译且逻辑正确
+
+不要运行 git add 或 git commit —— 只需解决文件中的冲突。`
 	} else {
-		builder.WriteString("\nDo not create a commit; the backend will verify that conflicts are cleared and commit automatically.")
+		tmpl = `A git merge from branch "{sourceBranch}" into "{targetBranch}" has produced conflicts in the following files:
+
+{fileList}
+
+Please resolve all merge conflicts in these files. The conflict markers (<<<<<<< HEAD, =======, >>>>>>>) are already present in the working directory. For each file:
+1. Read the file to understand both sides of the conflict
+2. Edit the file to produce the correct merged result, removing all conflict markers
+3. Make sure the resolved code compiles and makes sense
+
+Do NOT run git add or git commit — just resolve the conflicts in the files.`
 	}
-	return builder.String()
+	replacer := strings.NewReplacer(
+		"{sourceBranch}", sourceBranch,
+		"{targetBranch}", targetBranch,
+		"{fileList}", fileList,
+	)
+	return replacer.Replace(tmpl)
+}
+
+// conflictResolutionFileList mirrors TS conflictFiles.map(f => `  - ${f}`).join("\n").
+func conflictResolutionFileList(conflictFiles []string) string {
+	if len(conflictFiles) == 0 {
+		return ""
+	}
+	lines := make([]string, 0, len(conflictFiles))
+	for _, file := range conflictFiles {
+		lines = append(lines, "  - "+file)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (s *Service) buildReviewDiffContext(ctx context.Context, gitPath string, source Chapter, sourceHead string) string {

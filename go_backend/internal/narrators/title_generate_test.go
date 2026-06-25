@@ -74,6 +74,82 @@ func containsAll(s string, subs ...string) bool {
 	return true
 }
 
+// TestGenerateNarratorTitleClampsOverlongTitle verifies the W838 fix: the full
+// generate-title path mirrors the TS generateTitle guard (narrator-title.ts:
+// 174-177) — when the model returns a title longer than 80 UTF-16 units it is
+// truncated to the first 50, matching the sibling generateQuickTitle. Titles
+// of 80 units or fewer pass through unchanged.
+func TestGenerateNarratorTitleClampsOverlongTitle(t *testing.T) {
+	sqlDB := openTitleGenTestDB(t)
+	defer sqlDB.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	settings, err := config.Load()
+	if err != nil {
+		t.Fatalf("config load: %v", err)
+	}
+	service := &Service{DB: sqlDB, Settings: settings}
+	insertTitleGenMessage(t, sqlDB, "nar_long", "lm1", 1, "user", "hello")
+
+	orig := titleGenGenerate
+	defer func() { titleGenGenerate = orig }()
+
+	cases := []struct {
+		name      string
+		generated string
+		want      string
+	}{
+		{
+			// 100 ASCII chars (100 UTF-16 units > 80) -> first 50.
+			name:      "overlong ASCII truncated to 50",
+			generated: strings.Repeat("a", 100),
+			want:      strings.Repeat("a", 50),
+		},
+		{
+			// Exactly 80 units -> unchanged.
+			name:      "exactly 80 unchanged",
+			generated: strings.Repeat("b", 80),
+			want:      strings.Repeat("b", 80),
+		},
+		{
+			// 81 units -> first 50.
+			name:      "81 truncated to 50",
+			generated: strings.Repeat("c", 81),
+			want:      strings.Repeat("c", 50),
+		},
+		{
+			// 60 CJK chars = 60 UTF-16 units (each BMP) > 80? No: 60 <= 80, unchanged.
+			name:      "60 CJK unchanged",
+			generated: strings.Repeat("中", 60),
+			want:      strings.Repeat("中", 60),
+		},
+		{
+			// 90 CJK chars = 90 UTF-16 units > 80 -> first 50 (still whole chars).
+			name:      "90 CJK truncated to 50",
+			generated: strings.Repeat("中", 90),
+			want:      strings.Repeat("中", 50),
+		},
+		{
+			// 45 emoji = 90 UTF-16 units (each a surrogate pair) > 80 -> first 50
+			// units = first 25 whole emoji (no lone surrogate).
+			name:      "emoji truncated on UTF-16 boundary",
+			generated: strings.Repeat("\U0001F600", 45),
+			want:      strings.Repeat("\U0001F600", 25),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			titleGenGenerate = func(_ context.Context, _ *Service, _, _, _, _ string) (string, error) {
+				return tc.generated, nil
+			}
+			got := service.generateNarratorTitle(context.Background(), "nar_long", "/tmp", "en", "Old")
+			if got != tc.want {
+				t.Fatalf("generateNarratorTitle = %q (len %d), want %q (len %d)", got, len([]rune(got)), tc.want, len([]rune(tc.want)))
+			}
+		})
+	}
+}
+
 func openTitleGenTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("sqlite", ":memory:")
