@@ -1,1 +1,0 @@
-import{t as e}from"./createReactComponent-CJTJT963.js";var t=e(`outline`,`minus`,`Minus`,[[`path`,{d:`M5 12l14 0`,key:`svg-0`}]]);export{t};

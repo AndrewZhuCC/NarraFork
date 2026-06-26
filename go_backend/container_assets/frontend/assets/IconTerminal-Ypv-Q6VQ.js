@@ -1,1 +1,0 @@
-import{t as e}from"./createReactComponent-CJTJT963.js";var t=e(`outline`,`terminal`,`Terminal`,[[`path`,{d:`M5 7l5 5l-5 5`,key:`svg-0`}],[`path`,{d:`M12 19l7 0`,key:`svg-1`}]]);export{t};

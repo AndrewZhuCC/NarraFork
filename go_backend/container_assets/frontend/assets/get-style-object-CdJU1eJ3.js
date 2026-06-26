@@ -1,1 +1,0 @@
-function e(t,n){return Array.isArray(t)?[...t].reduce((t,r)=>({...t,...e(r,n)}),{}):typeof t==`function`?t(n):t??{}}export{e as t};

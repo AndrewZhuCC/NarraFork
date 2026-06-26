@@ -1,1 +1,0 @@
-function e(){return typeof process<`u`?`production`:`development`}export{e as t};

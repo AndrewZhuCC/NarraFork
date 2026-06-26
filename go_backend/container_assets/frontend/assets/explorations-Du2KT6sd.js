@@ -1,1 +1,0 @@
-var e=`Exploration Groups`,t=`Create Exploration Group`,n=`Decide Winner`,r=`Abandon Exploration`,i={active:`Active`,decided:`Decided`,abandoned:`Abandoned`},a={title:e,create:t,decide:n,abandon:r,status:i};export{r as abandon,t as create,n as decide,a as default,i as status,e as title};
