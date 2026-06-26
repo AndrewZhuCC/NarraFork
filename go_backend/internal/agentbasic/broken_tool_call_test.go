@@ -7,44 +7,14 @@ import (
 	"testing"
 )
 
-// TestBrokenToolCallDetection covers the isBrokenToolCall classifier that mirrors
-// the TS tool-executor broken detection (tool-executor.ts:212-249): malformed /
-// truncated JSON is broken, and a file-writing tool with empty input (complete
-// truncation) is broken. Well-formed input and empty input for non-file tools is
-// not broken.
-func TestBrokenToolCallDetection(t *testing.T) {
-	cases := []struct {
-		name string
-		tool string
-		args string
-		want bool
-	}{
-		{"truncated json edit", "Edit", `{"file_path":"a.txt","new_string":"abc`, true},
-		{"truncated json write", "Write", `{"file_path":"a.txt","content":"`, true},
-		{"valid edit", "Edit", `{"file_path":"a.txt","old_string":"x","new_string":"y"}`, false},
-		{"valid read", "Read", `{"file_path":"a.txt"}`, false},
-		{"empty write is complete truncation", "Write", `{}`, true},
-		{"empty edit is complete truncation", "Edit", ``, true},
-		{"empty read is fine", "Read", `{}`, false},
-		{"json array is malformed object", "Read", `[1,2,3]`, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isBrokenToolCall(tc.tool, tc.args); got != tc.want {
-				t.Fatalf("isBrokenToolCall(%q, %q) = %v, want %v", tc.tool, tc.args, got, tc.want)
-			}
-		})
-	}
-}
-
-// TestBrokenToolCallSanitizeInput pins sanitizeBrokenInput parity with TS
+// TestBrokenToolCallSanitizeInput pins SanitizeBrokenInput parity with TS
 // (tool-executor.ts:450-495): _raw-only input extracts file_path and stubs
 // content fields; normal input keeps structural fields and replaces large
 // content fields with the placeholder.
 func TestBrokenToolCallSanitizeInput(t *testing.T) {
-	placeholder := brokenToolInputPlaceholder("en")
+	placeholder := BrokenToolInputPlaceholder("en")
 
-	raw := sanitizeBrokenInput("Write", map[string]any{"_raw": `{"file_path":"big.txt","content":"aaaa`}, "en")
+	raw := SanitizeBrokenInput("Write", map[string]any{"_raw": `{"file_path":"big.txt","content":"aaaa`}, "en")
 	if raw["file_path"] != "big.txt" {
 		t.Fatalf("expected file_path extracted from _raw, got %#v", raw)
 	}
@@ -52,12 +22,12 @@ func TestBrokenToolCallSanitizeInput(t *testing.T) {
 		t.Fatalf("expected content placeholder, got %#v", raw)
 	}
 
-	rawEdit := sanitizeBrokenInput("Edit", map[string]any{"_raw": `{"file_path":"e.txt"`}, "en")
+	rawEdit := SanitizeBrokenInput("Edit", map[string]any{"_raw": `{"file_path":"e.txt"`}, "en")
 	if rawEdit["old_string"] != placeholder || rawEdit["new_string"] != placeholder {
 		t.Fatalf("expected edit placeholders, got %#v", rawEdit)
 	}
 
-	normal := sanitizeBrokenInput("Write", map[string]any{"file_path": "n.txt", "content": "huge"}, "en")
+	normal := SanitizeBrokenInput("Write", map[string]any{"file_path": "n.txt", "content": "huge"}, "en")
 	if normal["file_path"] != "n.txt" || normal["content"] != placeholder {
 		t.Fatalf("expected structural file_path kept + content replaced, got %#v", normal)
 	}
@@ -66,11 +36,11 @@ func TestBrokenToolCallSanitizeInput(t *testing.T) {
 // TestBrokenToolCallMessagesLocalized verifies the broken-tool i18n helpers carry
 // both locales and that the reminder names the broken tool(s).
 func TestBrokenToolCallMessagesLocalized(t *testing.T) {
-	if !strings.Contains(brokenToolCallResultMessage("en"), "truncated by token limit") {
-		t.Fatalf("en broken result message missing expected text: %q", brokenToolCallResultMessage("en"))
+	if !strings.Contains(BrokenToolCallResultMessage("en"), "truncated by token limit") {
+		t.Fatalf("en broken result message missing expected text: %q", BrokenToolCallResultMessage("en"))
 	}
-	if !strings.Contains(brokenToolCallResultMessage("zh-CN"), "token 限制截断") {
-		t.Fatalf("zh broken result message missing expected text: %q", brokenToolCallResultMessage("zh-CN"))
+	if !strings.Contains(BrokenToolCallResultMessage("zh-CN"), "token 限制截断") {
+		t.Fatalf("zh broken result message missing expected text: %q", BrokenToolCallResultMessage("zh-CN"))
 	}
 	enReminder := brokenToolCallReminder("Write, Edit", "en")
 	if !strings.Contains(enReminder, "Write, Edit") || !strings.Contains(enReminder, "SKELETON-FIRST") {
@@ -166,7 +136,7 @@ func TestBrokenToolCallNotExecutedAndReminderInjected(t *testing.T) {
 			WithToolExecutor(func(_ context.Context, _ string, call ToolCall) (ToolRun, error) {
 				executedArgs = call.Function.Arguments
 				if !json.Valid([]byte(call.Function.Arguments)) {
-					return ToolRun{ID: call.ID, Name: call.Function.Name, Status: "error", Output: brokenToolCallResultMessage("en"), Error: "broken", Broken: true}, nil
+					return ToolRun{ID: call.ID, Name: call.Function.Name, Status: "error", Output: BrokenToolCallResultMessage("en"), Error: "broken", Broken: true}, nil
 				}
 				return ToolRun{Output: "ran"}, nil
 			}),

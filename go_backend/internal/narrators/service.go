@@ -2806,38 +2806,77 @@ func (s *Service) executeExternalTool(ctx context.Context, call agentbasic.ToolC
 	return run, true
 }
 
-func guardedMalformedToolInputRun(call agentbasic.ToolCall) (agentbasic.ToolRun, bool) {
+// guardedMalformedToolInputRun detects a committed tool_use whose streamed input
+// was truncated/malformed and must NOT be executed, mirroring the TS tool-executor
+// broken handling (tool-executor.ts:212-249) + the loop's broken persistence
+// (loop.ts:3704-3718). On a broken call it returns a ToolRun with Broken=true and,
+// to match TS exactly:
+//   - the model-facing Output is the bilingual brokenToolCallResult message
+//     (loop.ts:3714 getToolMessage("brokenToolCallResult", locale)), NOT a raw
+//     English "refusing to execute" string;
+//   - run.Arguments is replaced with the SanitizeBrokenInput JSON (loop.ts:3717
+//     brokenInputOverride) so every downstream input_json persistence point — the
+//     assistant tool_use block (addAssistantMessage) and the tool-call record
+//     (finishToolCallFromEvent) — shows the clean placeholder instead of the
+//     truncated garbage. The 3190 ask-path persists via finishRecordedToolCall
+//     (which does not write input_json), so that caller overwrites input_json
+//     from run.Arguments explicitly.
+//
+// locale resolves the bilingual messages (en / zh-CN) from the narrator owner.
+func guardedMalformedToolInputRun(call agentbasic.ToolCall, locale string) (agentbasic.ToolRun, bool) {
 	run := agentbasic.ToolRun{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments, Status: "completed"}
+	markBroken := func(rawInput map[string]any) (agentbasic.ToolRun, bool) {
+		run.Status = "error"
+		run.Output = agentbasic.BrokenToolCallResultMessage(locale)
+		run.Error = run.Output
+		run.Broken = true
+		// Persist the sanitized input (mirrors TS brokenInputOverride) in place of
+		// the truncated arguments so the DB/assistant block show a clean placeholder.
+		sanitized := agentbasic.SanitizeBrokenInput(strings.TrimSpace(call.Function.Name), rawInput, locale)
+		if encoded, err := json.Marshal(sanitized); err == nil {
+			run.Arguments = string(encoded)
+		}
+		return run, true
+	}
 	trimmedArgs := strings.TrimSpace(call.Function.Arguments)
 	args := map[string]any{}
 	if trimmedArgs != "" {
 		if err := json.Unmarshal([]byte(trimmedArgs), &args); err != nil {
-			run.Status = "error"
-			run.Output = "Tool input was malformed or truncated; refusing to execute " + strings.TrimSpace(call.Function.Name) + "."
-			run.Error = run.Output
-			run.Broken = true
-			return run, true
+			// Unparseable JSON surfaces downstream as {"_raw": <original text>};
+			// SanitizeBrokenInput extracts file_path from the raw text.
+			return markBroken(map[string]any{"_raw": call.Function.Arguments})
 		}
 	}
 	if args == nil {
 		args = map[string]any{}
 	}
 	if _, ok := args["_raw"]; ok {
-		run.Status = "error"
-		run.Output = "Tool input was malformed or truncated; refusing to execute " + strings.TrimSpace(call.Function.Name) + "."
-		run.Error = run.Output
-		run.Broken = true
-		return run, true
+		return markBroken(args)
 	}
 	name := strings.ToLower(strings.TrimSpace(call.Function.Name))
 	if (name == "write" || name == "edit") && len(args) == 0 {
-		run.Status = "error"
-		run.Output = strings.TrimSpace(call.Function.Name) + " received empty input; refusing to execute."
-		run.Error = run.Output
-		run.Broken = true
-		return run, true
+		return markBroken(args)
 	}
 	return run, false
+}
+
+// overwriteBrokenToolCallInput overwrites the persisted input_json of a broken
+// tool-call row with the sanitized input carried on run.Arguments, mirroring TS
+// brokenInputOverride → narratorService.overwriteToolCallInput
+// (narrator-event-handler.ts:1151). It is only needed on the ask-path, whose
+// finishRecordedToolCall does not touch input_json (the non-ask path persists via
+// finishToolCallFromEvent, which already writes input_json from run.Arguments).
+// run.Arguments holds the SanitizeBrokenInput JSON at this point; an invalid /
+// empty payload is skipped so a normal (non-broken) run never clobbers input_json.
+func (s *Service) overwriteBrokenToolCallInput(ctx context.Context, narratorID, toolUseID string, run agentbasic.ToolRun) {
+	if s == nil || s.DB == nil || !run.Broken {
+		return
+	}
+	sanitized := strings.TrimSpace(run.Arguments)
+	if sanitized == "" || !json.Valid([]byte(sanitized)) {
+		return
+	}
+	_, _ = s.DB.ExecContext(ctx, `UPDATE narrator_tool_calls SET input_json = ? WHERE narrator_id = ? AND tool_use_id = ?`, sanitized, narratorID, toolUseID)
 }
 
 const maxGoalContinuationNoToolTurns = 3
@@ -3187,12 +3226,17 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 				_ = s.setNarratorRunSubstatus(execCtx, narratorID, narrator.IsBackground, []string{"calling_model"})
 				return run, nil
 			}
-			if guardedRun, blocked := guardedMalformedToolInputRun(call); blocked {
+			if guardedRun, blocked := guardedMalformedToolInputRun(call, s.toolLocale(execCtx, narratorID)); blocked {
 				guardedRun.Recorded = true
 				pipeline.capture(&guardedRun)
 				if err := s.finishRecordedToolCall(execCtx, narratorID, call.ID, draftMessageID, guardedRun, decision, "fail"); err != nil {
 					return agentbasic.ToolRun{}, err
 				}
+				// finishRecordedToolCall does not write input_json, so explicitly
+				// overwrite it with the sanitized input (guardedRun.Arguments now holds
+				// the SanitizeBrokenInput JSON), mirroring TS brokenInputOverride →
+				// overwriteToolCallInput (narrator-event-handler.ts:1151).
+				s.overwriteBrokenToolCallInput(execCtx, narratorID, call.ID, guardedRun)
 				_ = s.setNarratorRunSubstatus(execCtx, narratorID, narrator.IsBackground, []string{"calling_model"})
 				return guardedRun, nil
 			}
@@ -3239,7 +3283,11 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			pipeline.capture(&run)
 			return run, nil
 		}
-		if guardedRun, blocked := guardedMalformedToolInputRun(call); blocked {
+		if guardedRun, blocked := guardedMalformedToolInputRun(call, s.toolLocale(execCtx, narratorID)); blocked {
+			// This non-ask path persists via the loop's finishToolCallFromEvent, which
+			// writes input_json from run.Arguments — already replaced with the
+			// SanitizeBrokenInput JSON inside guardedMalformedToolInputRun — so no
+			// explicit input_json overwrite is needed here.
 			pipeline.capture(&guardedRun)
 			return guardedRun, nil
 		}

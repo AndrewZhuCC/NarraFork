@@ -3,7 +3,6 @@ package agentbasic
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1088,11 +1087,13 @@ func turnNudgeReminder(turnIndex, maxTurns int, locale string) string {
 	return fmt.Sprintf("\n\n[SYSTEM: You have used %d of %d turns. Please wrap up your work soon — summarize remaining steps if you cannot finish in time.]", turnIndex, maxTurns)
 }
 
-// brokenToolCallResultMessage mirrors the TS tool.brokenToolCallResult i18n
+// BrokenToolCallResultMessage mirrors the TS tool.brokenToolCallResult i18n
 // message (i18n.ts:226-230). It replaces the model-facing tool result for a tool
 // whose streamed input was truncated by the token limit so the model is told the
-// call was not executed and how to recover (skeleton-first + 10k char cap).
-func brokenToolCallResultMessage(locale string) string {
+// call was not executed and how to recover (skeleton-first + 10k char cap). It is
+// exported so the narrator-layer broken detection (guardedMalformedToolInputRun)
+// can return the same bilingual model-facing result the loop uses.
+func BrokenToolCallResultMessage(locale string) string {
 	if locale == "zh-CN" {
 		return "工具输入被 token 限制截断，未执行。每次调用总输入须小于 10,000 字符，请使用骨架优先策略：先 Write 骨架（含 SPLICE 标记），再用 Edit 逐个填充。"
 	}
@@ -1125,10 +1126,10 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 5. For large replacements in existing files: split into multiple small Edit calls with different unique short anchors as old_string.]`, toolNames)
 }
 
-// brokenToolInputPlaceholder mirrors the TS tool.brokenToolCallInputPlaceholder
+// BrokenToolInputPlaceholder mirrors the TS tool.brokenToolCallInputPlaceholder
 // i18n message (i18n.ts:222-225). It replaces large content fields in a broken
-// tool's sanitized input for persistence.
-func brokenToolInputPlaceholder(locale string) string {
+// tool's sanitized input for persistence. Exported for the narrator layer.
+func BrokenToolInputPlaceholder(locale string) string {
 	if locale == "zh-CN" {
 		return "[过长的单次输出，输出被截断]"
 	}
@@ -1137,13 +1138,15 @@ func brokenToolInputPlaceholder(locale string) string {
 
 var brokenInputFilePathRe = regexp.MustCompile(`"file_path"\s*:\s*"([^"]+)"`)
 
-// sanitizeBrokenInput mirrors the TS sanitizeBrokenInput (tool-executor.ts:450).
+// SanitizeBrokenInput mirrors the TS sanitizeBrokenInput (tool-executor.ts:450).
 // It builds a readable sanitized input for a broken tool call: structural fields
 // (file_path, etc.) are kept while large content fields (content/old_string/
 // new_string) are replaced with a short placeholder. When the input is only the
 // raw truncated JSON ({"_raw": "..."}), it extracts file_path from the raw text.
-func sanitizeBrokenInput(toolName string, input map[string]any, locale string) map[string]any {
-	placeholder := brokenToolInputPlaceholder(locale)
+// Exported so the narrator-layer broken detection can persist the same sanitized
+// input the TS brokenInputOverride writes (mirrors loop.ts:3706-3718).
+func SanitizeBrokenInput(toolName string, input map[string]any, locale string) map[string]any {
+	placeholder := BrokenToolInputPlaceholder(locale)
 	clean := map[string]any{}
 	isEdit := toolName == "Edit"
 
@@ -1187,33 +1190,6 @@ func sanitizeBrokenInput(toolName string, input map[string]any, locale string) m
 		clean["content"] = placeholder
 	}
 	return clean
-}
-
-// isBrokenToolCall reports whether a committed tool_use call carries truncated /
-// malformed input that must not be executed. Mirrors the TS tool-executor broken
-// detection (tool-executor.ts:212-249): (1) the arguments did not parse as a JSON
-// object so toolCallInput surfaced a `_raw` field, or (2) a file-writing tool
-// (Write/Edit) received an empty input object (complete truncation). Go infers
-// "broken" from the accumulated argument string + tool name (no provider type
-// changes needed) at the point the Stop signal commits the call.
-func isBrokenToolCall(name, arguments string) bool {
-	trimmed := strings.TrimSpace(arguments)
-	// Non-empty argument text that does not parse as a JSON object is malformed —
-	// it would surface as {"_raw": ...} downstream. newFunctionToolCall normalizes
-	// "" to "{}", so an empty/"{}" payload is handled by the file-tool check below.
-	if trimmed != "" && trimmed != "{}" && !json.Valid([]byte(trimmed)) {
-		return true
-	}
-	var obj map[string]any
-	if trimmed != "" && json.Unmarshal([]byte(trimmed), &obj) != nil {
-		// Valid JSON that is not an object (array/scalar) is also malformed input.
-		return true
-	}
-	// Complete truncation: file-writing tools that received no input at all.
-	if (name == "Write" || name == "Edit") && len(obj) == 0 {
-		return true
-	}
-	return false
 }
 
 func normalizeAgentSideCars(sideCars []AgentSideCar, fallbackToolUseID string, forceToolUseID bool) []AgentSideCar {

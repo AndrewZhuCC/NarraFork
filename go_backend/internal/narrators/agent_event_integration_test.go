@@ -3021,26 +3021,33 @@ func TestRunBasicAgentRejectsMalformedAndEmptyWriteInputsBeforeMutation(t *testi
 	if _, err := os.Stat(filepath.Join(cwd, "danger.txt")); !os.IsNotExist(err) {
 		t.Fatalf("malformed Write input should not create danger.txt, stat err=%v", err)
 	}
-	rows, err := service.DB.Query(`SELECT tool_use_id, status, COALESCE(error_message, ''), output_json FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id IN ('raw-write-1', 'empty-write-1') ORDER BY tool_use_id`, narratorID)
+	rows, err := service.DB.Query(`SELECT tool_use_id, status, COALESCE(error_message, ''), output_json, COALESCE(input_json, '') FROM narrator_tool_calls WHERE narrator_id = ? AND tool_use_id IN ('raw-write-1', 'empty-write-1') ORDER BY tool_use_id`, narratorID)
 	if err != nil {
 		t.Fatalf("load guarded tool calls: %v", err)
 	}
 	defer rows.Close()
 	seen := map[string]bool{}
+	placeholder := agentbasic.BrokenToolInputPlaceholder("en")
 	for rows.Next() {
-		var toolUseID, status, errorMessage, outputRaw string
-		if err := rows.Scan(&toolUseID, &status, &errorMessage, &outputRaw); err != nil {
+		var toolUseID, status, errorMessage, outputRaw, inputRaw string
+		if err := rows.Scan(&toolUseID, &status, &errorMessage, &outputRaw, &inputRaw); err != nil {
 			t.Fatalf("scan guarded tool call: %v", err)
 		}
 		seen[toolUseID] = true
 		if status != "fail" || errorMessage == "" {
 			t.Fatalf("guarded tool call %s should fail with error, status=%s error=%q output=%s", toolUseID, status, errorMessage, outputRaw)
 		}
-		if toolUseID == "raw-write-1" && !strings.Contains(outputRaw, "malformed or truncated") {
-			t.Fatalf("raw malformed guard output mismatch: %s", outputRaw)
+		// The model-facing output must now be the bilingual brokenToolCallResult
+		// message (parity with TS loop.ts:3714), not the old English-only
+		// "malformed or truncated" / "empty input" strings.
+		if !strings.Contains(outputRaw, "truncated by token limit") {
+			t.Fatalf("guard output for %s must carry the bilingual brokenToolCallResult message, got: %s", toolUseID, outputRaw)
 		}
-		if toolUseID == "empty-write-1" && !strings.Contains(outputRaw, "empty input") {
-			t.Fatalf("empty input guard output mismatch: %s", outputRaw)
+		// The persisted input_json must be sanitized (parity with TS
+		// brokenInputOverride): large content fields collapse to the placeholder so
+		// the DB never stores the truncated garbage that arrived from the model.
+		if !strings.Contains(inputRaw, placeholder) {
+			t.Fatalf("guard input_json for %s must be sanitized with the placeholder, got: %s", toolUseID, inputRaw)
 		}
 	}
 	if err := rows.Err(); err != nil {
