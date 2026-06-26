@@ -3156,6 +3156,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 				}
 				run.Status = "error"
 				run.Output = "Danger reflection failed: " + err.Error()
+				pipeline.capture(&run)
 				return run, nil
 			}
 			if s.Hub != nil {
@@ -3171,6 +3172,7 @@ func (s *Service) runBasicAgentOnce(ctx context.Context, narratorID string, goal
 			if decision.Action == "cancel" {
 				run.Status = "denied"
 				run.Output = firstNonEmptyString(decision.Feedback, "Danger reflection rejected this tool call.")
+				pipeline.capture(&run)
 				return run, nil
 			}
 		}
@@ -14603,7 +14605,12 @@ func bashCommandFilePaths(toolCwd, command string) []string {
 		redirectIndexes := map[int]bool{}
 		for i, token := range tokens {
 			if path, ok := shellRedirectPath(tokens, i, token); ok {
-				paths = append(paths, resolvePermissionPath(toolCwd, path))
+				// Skip special device paths (/dev/null, /dev/stderr etc.) — they are
+				// not real filesystem targets. Mirrors TS bash-analyze.ts:1195-1196
+				// `if (target.startsWith("/dev/")) continue`.
+				if !strings.HasPrefix(strings.TrimSpace(path), "/dev/") {
+					paths = append(paths, resolvePermissionPath(toolCwd, path))
+				}
 				if shellRedirectTokenConsumesNext(token) && i+1 < len(tokens) {
 					redirectIndexes[i+1] = true
 				}
