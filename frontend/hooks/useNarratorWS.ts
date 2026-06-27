@@ -249,6 +249,14 @@ interface NarratorWSCallbacks {
 		maxRetries?: number;
 		delayMs?: number;
 	}) => void;
+	/** Leaked XML tool-call diagnostic (Kiro/NUG/NKP). Not persisted. */
+	onLeakedToolCall?: (info: {
+		phase: "stream_captured" | "recovered" | "unrecovered";
+		apiRequestId: string;
+		toolUseIds?: string[];
+		toolNames?: string[];
+		snippet?: string;
+	}) => void;
 	onModelChanged?: (model: string) => void;
 	onCatchUp?: (orphanChildren: TreeMessage[], topLevel: TreeMessage[]) => void;
 	onFullReload?: () => void;
@@ -833,6 +841,15 @@ export function useNarratorWS(
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
+						});
+						break;
+					case "leaked_tool_call_notice":
+						callbacksRef.current.onLeakedToolCall?.({
+							phase: data.phase as "stream_captured" | "recovered" | "unrecovered",
+							apiRequestId: data.apiRequestId as string,
+							toolUseIds: data.toolUseIds as string[] | undefined,
+							toolNames: data.toolNames as string[] | undefined,
+							snippet: data.snippet as string | undefined,
 						});
 						break;
 					case "model_changed":

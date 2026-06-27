@@ -10,6 +10,7 @@ import { prepareNkpRequest } from "../nkp-ext";
 import { buildNkpRequestToken } from "../nkp-token";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import type { NKPProviderConfig } from "../settings";
+import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import {
 	buildKiroHistory,
@@ -26,7 +27,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
+import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -59,6 +60,7 @@ function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
  */
 export class NkpProvider implements ProviderAdapter {
 	private config: NKPProviderConfig;
+	readonly mayLeakXmlToolCalls = true;
 
 	constructor(config: NKPProviderConfig) {
 		this.config = config;
@@ -159,7 +161,10 @@ export class NkpProvider implements ProviderAdapter {
 
 		yield* parseSSEStream(response.body, { parseTextToolCalls: params.tools.length > 0 });
 		if (responseTextPromise) {
-			params.requestDump?.setResponseBodyText(await responseTextPromise);
+			params.requestDump?.setResponseBodyTextWithLimit(
+				await responseTextPromise,
+				settings.agent?.requestDumpMaxSize ?? DEFAULT_DUMP_MAX_BYTES,
+			);
 		}
 	}
 

@@ -6,6 +6,7 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { getToolMessage, type Locale } from "../prompt-i18n";
+import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import {
 	buildKiroHistory,
@@ -17,6 +18,7 @@ import {
 	parseKiroStreamEvent,
 } from "./kiro-protocol";
 import type { ChatParams, DbMessage, ParsedStreamEvent, ProviderAdapter } from "./provider";
+import { DEFAULT_DUMP_MAX_BYTES, MAX_DUMP_EVENT_COUNT } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -40,6 +42,8 @@ function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
 }
 
 export class KiroProvider implements ProviderAdapter {
+	readonly mayLeakXmlToolCalls = true;
+
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
 		return tools.map((tool) => ({
 			toolSpecification: {
@@ -89,7 +93,10 @@ export class KiroProvider implements ProviderAdapter {
 			transport: "kiro-plugin",
 			body: request,
 		});
-		const rawEvents: import("../kiro-adapter").StreamEvent[] = [];
+		// Only retain raw events when a dump collector is present, and cap the buffer so a
+		// long stream cannot grow an unbounded array on the main thread (see CLAUDE.md).
+		const dump = params.requestDump;
+		const rawEvents: import("../kiro-adapter").StreamEvent[] | undefined = dump ? [] : undefined;
 		// Leaked XML tool calls may span multiple streamed text deltas, so buffer text
 		// at the stream level and lift completed tool calls out of it. Parse each raw
 		// event with parseTextToolCalls disabled to avoid double parsing.
@@ -98,12 +105,18 @@ export class KiroProvider implements ProviderAdapter {
 		});
 		params.onRequestStart?.();
 		for await (const evt of kiroChatRaw(request, params.signal)) {
-			rawEvents.push(evt);
+			if (rawEvents && rawEvents.length < MAX_DUMP_EVENT_COUNT) rawEvents.push(evt);
 			yield toolCallAccumulator.process(parseKiroStreamEvent(evt, { parseTextToolCalls: false }));
 		}
 		const trailing = toolCallAccumulator.finalize();
 		if (trailing) yield trailing;
-		params.requestDump?.setResponseEvents(rawEvents);
+		if (dump && rawEvents) {
+			dump.setResponseEventsWithLimit(
+				rawEvents,
+				MAX_DUMP_EVENT_COUNT,
+				settings.agent?.requestDumpMaxSize ?? DEFAULT_DUMP_MAX_BYTES,
+			);
+		}
 	}
 
 	formatToolResult(

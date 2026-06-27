@@ -18,6 +18,7 @@ import {
 	isRetryableInvalidStateReason,
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
+import { parseKiroTextToolCalls } from "./kiro-protocol";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
@@ -1964,6 +1965,12 @@ export async function* agentLoop(
 		 *  running on the same iteration. */
 		let sawErrorEvent = false;
 		let requestDump: ApiRequestDumpCollector | undefined;
+		/**
+		 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
+		 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
+		 * data is downloadable for debugging.
+		 */
+		let forceDumpPersist = false;
 		let requestStarted = false;
 		let requestStartPending = false;
 		let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -2006,6 +2013,7 @@ export async function* agentLoop(
 				meterUnit: requestMeterUnit,
 				rawDump: requestDump?.snapshot(),
 				errorMessage,
+				forceDumpPersist,
 			};
 		}
 
@@ -2052,6 +2060,9 @@ export async function* agentLoop(
 			credentialId = undefined;
 			earlyExecMap.clear();
 			settledResults.clear();
+			// Leak-detection dump flag is per successful attempt; clear stale state so a
+			// retry that no longer leaks does not force-persist the previous attempt's dump.
+			forceDumpPersist = false;
 			yieldedToolResults.clear();
 			brokenToolUseIds.clear();
 			toolUseAccum.clear();
@@ -2086,13 +2097,17 @@ export async function* agentLoop(
 			requestMeterUsage = undefined;
 			requestMeterUnit = undefined;
 
-			// Initialize request dump collector if enabled
-			requestDump = settings.agent.requestDumpEnabled
-				? new ApiRequestDumpCollector({
-						provider: effectiveProvider,
-						model: effectiveModel,
-					})
-				: undefined;
+			// Initialize request dump collector when explicitly enabled, OR when the provider
+			// may leak XML tool calls (Kiro/NUG/NKP) so leaked-tool diagnostics always have a
+			// bounded raw dump to persist on detection. Providers write bodyText/events through
+			// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
+			requestDump =
+				settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls
+					? new ApiRequestDumpCollector({
+							provider: effectiveProvider,
+							model: effectiveModel,
+						})
+					: undefined;
 
 			const attemptAbort = new AbortController();
 			let firstTokenTimeoutTriggered = false;
@@ -2184,10 +2199,16 @@ export async function* agentLoop(
 						//    so the streaming stop handler doesn't re-process them.
 						// 3. Yield block_complete + tool_call + start eager execution here,
 						//    mirroring what the streaming stop path would have done.
+						// Track XML-captured tool calls (kiro_xml_*) surfaced this event so a
+						// single aggregated leaked_tool_call(stream_captured) diagnostic can be
+						// emitted after the loop.
+						const streamCapturedLeaked: AgentToolUse[] = [];
 						for (const tu of parsed.toolUses) {
 							// Skip duplicates — the streaming path may have already
 							// completed this tool call via toolUseChunk stop.
 							if (toolUses.some((t) => t.toolUseId === tu.toolUseId)) continue;
+
+							if (tu.toolUseId.startsWith("kiro_xml_")) streamCapturedLeaked.push(tu);
 
 							toolUses.push(tu);
 
@@ -2240,6 +2261,19 @@ export async function* agentLoop(
 								toolUseId: tu.toolUseId,
 								toolName: tu.name,
 								input: tu.input,
+							};
+						}
+
+						// Diagnostic: surface XML-captured tool calls so the UI can mark them
+						// as recovered-from-stream (non-persisted notice). Emitted after the
+						// loop so a single event covers all leaked tools in this stream event.
+						if (streamCapturedLeaked.length > 0) {
+							yield {
+								type: "leaked_tool_call",
+								phase: "stream_captured",
+								requestId,
+								toolUseIds: streamCapturedLeaked.map((t) => t.toolUseId),
+								toolNames: streamCapturedLeaked.map((t) => t.name),
 							};
 						}
 					}
@@ -3204,7 +3238,28 @@ export async function* agentLoop(
 			// Empty response check — request succeeded but returned no content.
 			// IMPORTANT: Skip this check if we already yielded an error/invalid_state event
 			// during this attempt — otherwise the empty-response message masks the real error.
-			if (!sawErrorEvent && !sawMeaningfulResponse && !assistantText && toolUses.length === 0) {
+			//
+			// We base this on what actually landed as persistable output, NOT on the
+			// optimistic `sawMeaningfulResponse` flag. `sawMeaningfulResponse` is set by
+			// `isMeaningfulStreamEvent` the moment any "interesting" stream event arrives
+			// (text/toolUseChunk/reasoning/webSearch/imageGeneration/nkpQueue/queueStatus),
+			// but some of those events never produce committed content:
+			//   - a `toolUseChunk` carrying a toolUseId but no `name` never creates an
+			//     accumulator (loop ~L2285) and is never pushed to `toolUses`, so it leaves
+			//     no orphaned entry either;
+			//   - pure `nkpQueue`/`queueStatus` status events carry no content at all.
+			// In those cases the optimistic flag would suppress the empty-response guard and
+			// the turn would silently persist an empty assistant message and go idle. Compute
+			// the real picture from the accumulators instead so the guard still fires.
+			const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
+			const hasAnyPersistableOutput =
+				!!assistantText ||
+				toolUses.length > 0 ||
+				hasOrphanedToolAccum ||
+				!!collectReasoningBlocks(reasoningBlockMap) ||
+				!!collectCompletedWebSearches(webSearchAccum) ||
+				!!collectCompletedImageGenerations(imageGenAccum);
+			if (!sawErrorEvent && !hasAnyPersistableOutput) {
 				if (!requestStarted) {
 					const message =
 						`${effectiveProvider}: Provider finished without starting an API request. ` +
@@ -3449,6 +3504,70 @@ export async function* agentLoop(
 		// Final safety net: if a provider/parser accidentally surfaced the same toolUseId
 		// multiple times in one turn, collapse them before any drain/execution logic below.
 		dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
+
+		// Safety net for leaked XML tool calls (Kiro/NUG/NKP): the streaming accumulator
+		// lifts `<invoke>...</invoke>` blocks out of the text deltas as they stream, but if
+		// anything prevented that (mid-block retry, an event-shape edge case, or a buffer
+		// boundary the streaming parser couldn't reconcile), a complete block can still be
+		// sitting in the finished `assistantText`. Re-run the stateless parser on the full
+		// text so a closed block always becomes an executable tool call instead of leaking
+		// to the UI. This is idempotent: the streaming layer already stripped any block it
+		// successfully parsed, so only un-lifted blocks remain here.
+		if (assistantText.includes("<invoke")) {
+			const recovered = parseKiroTextToolCalls(assistantText);
+			if (recovered.toolUses.length > 0) {
+				logger.warn("Recovered leaked XML tool calls from assistant text", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					recoveredCount: recovered.toolUses.length,
+					toolNames: recovered.toolUses.map((tu) => tu.name).slice(0, 10),
+				});
+				assistantText = recovered.text;
+				const recoveredIds: string[] = [];
+				for (const tu of recovered.toolUses) {
+					if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
+						toolUses.push(tu);
+						recoveredIds.push(tu.toolUseId);
+					}
+				}
+				// The raw block was already streamed to the UI as text; tell the frontend to
+				// discard the live streaming snapshot so the clean `block_complete` below
+				// (emitted by flushPartialContent) becomes the authoritative rendering.
+				yield { type: "stream_reset" };
+				// Force the raw SSE dump to persist so the recovery is downloadable, then emit
+				// a diagnostic so the UI can prompt the user to download the raw data.
+				forceDumpPersist = true;
+				yield {
+					type: "leaked_tool_call",
+					phase: "recovered",
+					requestId,
+					toolUseIds: recoveredIds,
+					toolNames: recovered.toolUses.map((tu) => tu.name),
+				};
+			} else {
+				// Leaked `<invoke` text remained but no complete block could be parsed — a
+				// closing tag may be missing or the block was malformed. The tool was NOT
+				// executed. Force-persist the dump and surface a diagnostic with a snippet.
+				const idx = assistantText.indexOf("<invoke");
+				const snippet = assistantText.slice(Math.max(0, idx - 40), idx + 200);
+				logger.warn("Unrecovered leaked XML in assistant text (no parseable tool call)", {
+					narratorId: config.narratorId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					requestId,
+					snippetLength: snippet.length,
+				});
+				forceDumpPersist = true;
+				yield {
+					type: "leaked_tool_call",
+					phase: "unrecovered",
+					requestId,
+					snippet,
+				};
+			}
+		}
 
 		// ── Estimate token usage when provider doesn't report it ──
 		// Some providers (e.g., Kiro, NKP) don't report token usage in their API responses.

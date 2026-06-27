@@ -16,6 +16,7 @@ import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
+import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import {
@@ -48,7 +49,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
+import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
 import { resolveModel } from "./resolve-model";
 import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
 import type { AgentToolUse, ResolvedToolDefinition } from "./types";
@@ -193,6 +194,15 @@ export class NugProvider implements ProviderAdapter {
 
 	constructor(config: NUGProviderConfig) {
 		this.config = config;
+	}
+
+	/**
+	 * NUG only leaks XML tool calls on its native Kiro channel (no delegate). When a
+	 * delegate handles the request (anthropic/openai/codex/responses) it uses native
+	 * tool-use fields, so leak diagnostics/recovery are unnecessary there.
+	 */
+	get mayLeakXmlToolCalls(): boolean {
+		return this.activeDelegate == null;
 	}
 
 	private get baseUrl(): string {
@@ -540,7 +550,10 @@ export class NugProvider implements ProviderAdapter {
 
 		yield* parseSSEStream(response.body, { parseTextToolCalls: params.tools.length > 0 });
 		if (responseTextPromise) {
-			params.requestDump?.setResponseBodyText(await responseTextPromise);
+			params.requestDump?.setResponseBodyTextWithLimit(
+				await responseTextPromise,
+				settings.agent?.requestDumpMaxSize ?? DEFAULT_DUMP_MAX_BYTES,
+			);
 		}
 	}
 

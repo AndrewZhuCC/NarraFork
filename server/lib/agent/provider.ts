@@ -245,6 +245,14 @@ export interface ProviderAdapter {
 	/** Convert ToolDefinition[] to provider-specific tool format */
 	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 
+	/**
+	 * True when this provider can leak XML tool calls (`<invoke>...</invoke>`) into the
+	 * assistant text stream instead of using native tool-use fields (Kiro/NUG/NKP). The
+	 * agent loop uses this to always collect a bounded raw dump so leaked-tool diagnostics
+	 * have downloadable SSE data, and to run the post-turn stateless recovery safety net.
+	 */
+	mayLeakXmlToolCalls?: boolean;
+
 	/** Convert DB messages to provider history + trailing tool results */
 	buildHistory(dbMessages: DbMessage[], model: string, narratorId?: string): Promise<BuiltHistory>;
 
