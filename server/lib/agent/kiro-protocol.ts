@@ -643,12 +643,30 @@ function coerceKiroXmlParameter(paramName: string, value: string): unknown {
 	return value;
 }
 
+/** Build a tool use from a leaked `<invoke>` open-tag attribute string and body. */
+function buildInvokeToolUse(attrs: string, body: string): ParsedKiroTextToolUse | null {
+	const name = readXmlAttribute(attrs, "name");
+	if (!name) return null;
+
+	const input: Record<string, unknown> = {};
+	const parameterRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
+	for (const parameterMatch of body.matchAll(parameterRe)) {
+		const paramName = readXmlAttribute(parameterMatch[1] ?? "", "name");
+		if (!paramName) continue;
+		input[paramName] = coerceKiroXmlParameter(
+			paramName,
+			decodeXmlEntities(parameterMatch[2] ?? ""),
+		);
+	}
+
+	return { toolUseId: `kiro_xml_${generateId(12)}`, name, input };
+}
+
 export function parseKiroTextToolCalls(text: string): {
 	text: string;
 	toolUses: ParsedKiroTextToolUse[];
 } {
 	const invokeRe = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
-	const parameterRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
 	let cursor = 0;
 	let rewrittenText = "";
 	const toolUses: ParsedKiroTextToolUse[] = [];
@@ -656,32 +674,161 @@ export function parseKiroTextToolCalls(text: string): {
 	for (const invokeMatch of text.matchAll(invokeRe)) {
 		const matchIndex = invokeMatch.index ?? 0;
 		const rawInvoke = invokeMatch[0];
-		const name = readXmlAttribute(invokeMatch[1] ?? "", "name");
-		if (!name) continue;
-
-		const input: Record<string, unknown> = {};
-		parameterRe.lastIndex = 0;
-		for (const parameterMatch of (invokeMatch[2] ?? "").matchAll(parameterRe)) {
-			const paramName = readXmlAttribute(parameterMatch[1] ?? "", "name");
-			if (!paramName) continue;
-			input[paramName] = coerceKiroXmlParameter(
-				paramName,
-				decodeXmlEntities(parameterMatch[2] ?? ""),
-			);
-		}
+		const toolUse = buildInvokeToolUse(invokeMatch[1] ?? "", invokeMatch[2] ?? "");
+		if (!toolUse) continue;
 
 		rewrittenText += stripMalformedInvokeMarker(text.slice(cursor, matchIndex));
-		toolUses.push({
-			toolUseId: `kiro_xml_${generateId(12)}`,
-			name,
-			input,
-		});
+		toolUses.push(toolUse);
 		cursor = matchIndex + rawInvoke.length;
 	}
 
 	if (toolUses.length === 0) return { text, toolUses };
 	rewrittenText += text.slice(cursor);
 	return { text: rewrittenText, toolUses };
+}
+
+const INVOKE_OPEN_RE = /<invoke\b/i;
+const INVOKE_BLOCK_FROM_START_RE = /^<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/i;
+
+/**
+ * Stateful parser for leaked XML tool calls that may be split across multiple
+ * streaming text deltas.
+ *
+ * Kiro/NUG/NKP stream `assistantResponseEvent.content` as incremental chunks, so a
+ * single `<invoke>...</invoke>` block frequently spans several deltas. The stateless
+ * {@link parseKiroTextToolCalls} only matches blocks fully contained in one chunk, so
+ * split blocks would leak to the UI as raw text and never execute. This parser buffers
+ * text across `push()` calls, only emitting text that is provably outside any pending
+ * `<invoke>` block, and surfaces a tool use as soon as its closing tag arrives.
+ */
+export class KiroTextToolCallStreamParser {
+	private buffer = "";
+
+	/** Feed a streamed text delta. Returns text safe to emit plus any completed tool uses. */
+	push(delta: string): { text: string; toolUses: ParsedKiroTextToolUse[] } {
+		this.buffer += delta;
+		return this.drain(false);
+	}
+
+	/** Flush any buffered text/tool calls at end of stream. */
+	flush(): { text: string; toolUses: ParsedKiroTextToolUse[] } {
+		return this.drain(true);
+	}
+
+	private drain(final: boolean): { text: string; toolUses: ParsedKiroTextToolUse[] } {
+		let emittedText = "";
+		const toolUses: ParsedKiroTextToolUse[] = [];
+
+		while (this.buffer.length > 0) {
+			const open = INVOKE_OPEN_RE.exec(this.buffer);
+			if (!open) {
+				// No `<invoke` start in the buffer. Flush everything except a tail that
+				// could still become the start of a leaked tool call (or its marker).
+				const keep = final ? this.buffer.length : this.retentionStart(this.buffer);
+				emittedText += this.buffer.slice(0, keep);
+				this.buffer = this.buffer.slice(keep);
+				break;
+			}
+
+			const openIdx = open.index;
+			const block = INVOKE_BLOCK_FROM_START_RE.exec(this.buffer.slice(openIdx));
+			if (block) {
+				emittedText += stripMalformedInvokeMarker(this.buffer.slice(0, openIdx));
+				const toolUse = buildInvokeToolUse(block[1] ?? "", block[2] ?? "");
+				if (toolUse) {
+					toolUses.push(toolUse);
+				} else {
+					// Malformed (e.g. missing name) — keep the raw block as text, like the
+					// stateless parser, and advance past it.
+					emittedText += block[0];
+				}
+				this.buffer = this.buffer.slice(openIdx + block[0].length);
+				continue;
+			}
+
+			// An `<invoke` start without a closing tag yet.
+			if (final) {
+				// Stream ended mid-block — emit the remainder verbatim rather than dropping it.
+				emittedText += this.buffer;
+				this.buffer = "";
+				break;
+			}
+			emittedText += stripMalformedInvokeMarker(this.buffer.slice(0, openIdx));
+			this.buffer = this.buffer.slice(openIdx);
+			break;
+		}
+
+		return { text: emittedText, toolUses };
+	}
+
+	/**
+	 * Compute the index from which the buffer tail must be retained because it could
+	 * still grow into a leaked `<invoke>` block (a partial `<invoke` prefix) or its
+	 * malformed marker line. Everything before this index is safe to emit.
+	 */
+	private retentionStart(buf: string): number {
+		let start = buf.length;
+
+		// Partial "<invoke" prefix at the very end (e.g. the chunk ended on "<inv").
+		const target = "<invoke";
+		const max = Math.min(target.length - 1, buf.length);
+		for (let len = max; len >= 1; len--) {
+			if (buf.slice(buf.length - len).toLowerCase() === target.slice(0, len).toLowerCase()) {
+				start = buf.length - len;
+				break;
+			}
+		}
+
+		// A short marker line after a trailing blank-line boundary. Kiro sometimes emits
+		// a stray "call"/"count" marker between text and a leaked `<invoke>`; if it lands
+		// in its own delta we must hold it back so it can be stripped once the block opens.
+		const markerTail = /(\r?\n[ \t]*\r?\n[ \t]*)([^\r\n]*)((?:\r?\n[ \t]*)*)$/.exec(buf);
+		if (markerTail && markerTail.index < start) {
+			const marker = markerTail[2].trim();
+			const isKnown = MALFORMED_INVOKE_MARKERS.has(marker.toLowerCase());
+			if (marker.length === 0 || marker.length <= MAX_MALFORMED_INVOKE_MARKER_LENGTH || isKnown) {
+				start = markerTail.index;
+			}
+		}
+
+		return start;
+	}
+}
+
+/**
+ * Stateful accumulator that moves leaked XML tool calls out of streamed assistant text.
+ *
+ * Wraps {@link KiroTextToolCallStreamParser} at the {@link ParsedStreamEvent} level so the
+ * Kiro/NUG/NKP streaming paths can reuse identical logic. Callers must parse each raw event
+ * with `parseTextToolCalls: false` (so the per-event regex does not run) and route the result
+ * through {@link process}; after the stream ends they must emit {@link finalize}.
+ */
+export class KiroStreamToolCallAccumulator {
+	private readonly parser: KiroTextToolCallStreamParser | null;
+
+	constructor(options: KiroStreamParseOptions = {}) {
+		this.parser = options.parseTextToolCalls ? new KiroTextToolCallStreamParser() : null;
+	}
+
+	/** Adjust a parsed event in place, lifting any completed leaked tool calls out of text. */
+	process(parsed: ParsedStreamEvent): ParsedStreamEvent {
+		if (!this.parser || parsed.text == null) return parsed;
+		const { text, toolUses } = this.parser.push(parsed.text);
+		parsed.text = text;
+		appendDedupedToolUses(parsed, toolUses);
+		return parsed;
+	}
+
+	/** Return a trailing event for any buffered text/tool calls, or null if nothing remains. */
+	finalize(): ParsedStreamEvent | null {
+		if (!this.parser) return null;
+		const { text, toolUses } = this.parser.flush();
+		if (!text && toolUses.length === 0) return null;
+		const parsed: ParsedStreamEvent = {};
+		if (text) parsed.text = text;
+		appendDedupedToolUses(parsed, toolUses);
+		return parsed;
+	}
 }
 
 function stableJson(value: unknown): string {
@@ -900,6 +1047,10 @@ export async function* parseSSEStream(
 ): AsyncGenerator<ParsedStreamEvent> {
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
+	// Leaked XML tool calls can be split across streamed text deltas, so buffer the
+	// text at the stream level and lift completed tool calls out of it. The per-event
+	// regex must stay off here (parseTextToolCalls: false) to avoid double parsing.
+	const toolCallAccumulator = new KiroStreamToolCallAccumulator(options);
 	let buf = "";
 	let currentEventType = "";
 
@@ -925,7 +1076,9 @@ export async function* parseSSEStream(
 							eventType: currentEventType || embeddedEventType || "assistantResponseEvent",
 							data,
 						};
-						yield parseKiroStreamEvent(evt, options);
+						yield toolCallAccumulator.process(
+							parseKiroStreamEvent(evt, { ...options, parseTextToolCalls: false }),
+						);
 					} catch {
 						// Malformed JSON — skip
 					}
@@ -934,6 +1087,8 @@ export async function* parseSSEStream(
 				}
 			}
 		}
+		const trailing = toolCallAccumulator.finalize();
+		if (trailing) yield trailing;
 	} finally {
 		reader.releaseLock();
 	}

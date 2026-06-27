@@ -12,6 +12,7 @@ import {
 	buildKiroReasoningContent,
 	buildKiroRequest,
 	extractImageFileName,
+	KiroStreamToolCallAccumulator,
 	normalizeKiroChatRequest,
 	parseKiroStreamEvent,
 } from "./kiro-protocol";
@@ -89,11 +90,19 @@ export class KiroProvider implements ProviderAdapter {
 			body: request,
 		});
 		const rawEvents: import("../kiro-adapter").StreamEvent[] = [];
+		// Leaked XML tool calls may span multiple streamed text deltas, so buffer text
+		// at the stream level and lift completed tool calls out of it. Parse each raw
+		// event with parseTextToolCalls disabled to avoid double parsing.
+		const toolCallAccumulator = new KiroStreamToolCallAccumulator({
+			parseTextToolCalls: params.tools.length > 0,
+		});
 		params.onRequestStart?.();
 		for await (const evt of kiroChatRaw(request, params.signal)) {
 			rawEvents.push(evt);
-			yield parseKiroStreamEvent(evt, { parseTextToolCalls: params.tools.length > 0 });
+			yield toolCallAccumulator.process(parseKiroStreamEvent(evt, { parseTextToolCalls: false }));
 		}
+		const trailing = toolCallAccumulator.finalize();
+		if (trailing) yield trailing;
 		params.requestDump?.setResponseEvents(rawEvents);
 	}
 
