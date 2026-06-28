@@ -1644,6 +1644,7 @@ export async function* agentLoop(
 					config.userId,
 					result.output,
 					knowledgeInjectedEntryIds,
+					{ projectId: config.projectId ?? undefined },
 				);
 				if (block) {
 					sideCars.push({

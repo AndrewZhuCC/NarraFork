@@ -1622,6 +1622,7 @@ export async function runAgentLoop(
 				projectGitPath: active._projectGitPath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
 				userId: active._currentUserId ?? null,
+				projectId: active._projectId ?? null,
 				reasoningEffort: resolvedReasoningEffort,
 				serviceTier: resolvedServiceTier,
 				maxTransientRetries: getMaxTransientRetries(),
@@ -1867,7 +1868,7 @@ export async function runAgentLoop(
 					const hits = await knowledgeInjection.resolveInjections(
 						active._currentUserId,
 						effectiveText,
-						{ already: knowledgeInjectedIds },
+						{ already: knowledgeInjectedIds, projectId: active._projectId ?? undefined },
 					);
 					if (hits.length > 0) {
 						for (const h of hits) knowledgeInjectedIds.add(h.entryId);
@@ -3707,6 +3708,8 @@ export async function reExecuteDeniedToolCall(
 		skillRoot: active._skillRoot ?? undefined,
 		projectGitPath: active._projectGitPath ?? undefined,
 		skillScopeKey: active._skillScopeKey ?? undefined,
+		userId: active._currentUserId ?? null,
+		projectId: active._projectId ?? null,
 		disabledTools: active._disabledTools,
 		permissionHandler: (tName, input, tUseId) =>
 			handlePermission(
