@@ -43,7 +43,13 @@ interface NKPProvidersSectionProps {
 	customModels: CustomModelEntry[];
 	onCustomModelsChange: (models: CustomModelEntry[]) => void;
 	getPrefixError?: (prefix: string, providerId: string) => string | undefined;
+	getUniquePrefix?: (base: string, providerId: string) => string;
 	onTestModel?: (model: string) => void;
+}
+
+/** Sanitize a prefix value: any text except an ASCII colon is allowed. */
+function sanitizePrefix(value: string): string {
+	return value.replace(/:/g, "");
 }
 
 export const NKPProvidersSection = React.memo(function NKPProvidersSection({
@@ -60,6 +66,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 	customModels,
 	onCustomModelsChange,
 	getPrefixError,
+	getUniquePrefix,
 	onTestModel,
 }: NKPProvidersSectionProps) {
 	const { t } = useTranslation("settings");
@@ -91,6 +98,42 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 			onProvidersChange((prev) => prev.map((p) => (p.id === id ? { ...p, [field]: value } : p)));
 		},
 		[onProvidersChange],
+	);
+
+	// Track which providers have a manually-edited prefix (keyed by id). A provider
+	// that already has a prefix is treated as locked; new ones start name-driven.
+	const [manualPrefixIds, setManualPrefixIds] = useState<Set<string>>(
+		() => new Set(providers.filter((p) => p.prefix).map((p) => p.id)),
+	);
+
+	const handleNameChange = useCallback(
+		(id: string, name: string) => {
+			const manual = manualPrefixIds.has(id);
+			onProvidersChange((prev) =>
+				prev.map((p) => {
+					if (p.id !== id) return p;
+					if (manual) return { ...p, name };
+					const base = sanitizePrefix(name.trim());
+					const nextPrefix = base ? (getUniquePrefix?.(base, p.id) ?? base) : "";
+					return { ...p, name, prefix: nextPrefix };
+				}),
+			);
+		},
+		[onProvidersChange, manualPrefixIds, getUniquePrefix],
+	);
+
+	const handlePrefixChange = useCallback(
+		(id: string, value: string) => {
+			const next = sanitizePrefix(value);
+			setManualPrefixIds((prev) => {
+				const updated = new Set(prev);
+				if (next.length > 0) updated.add(id);
+				else updated.delete(id);
+				return updated;
+			});
+			updateProvider(id, "prefix", next);
+		},
+		[updateProvider],
 	);
 
 	const toggleProviderDisabled = useCallback(
@@ -179,7 +222,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 								placeholder={t("nkpProviderNamePlaceholder")}
 								value={p.name}
 								size="xs"
-								onChange={(e) => updateProvider(p.id, "name", e.currentTarget.value)}
+								onChange={(e) => handleNameChange(p.id, e.currentTarget.value)}
 							/>
 							<TextInput
 								label={t("nkpProviderPrefix")}
@@ -188,13 +231,7 @@ export const NKPProvidersSection = React.memo(function NKPProvidersSection({
 								value={p.prefix}
 								size="xs"
 								error={getPrefixError?.(p.prefix, p.id)}
-								onChange={(e) =>
-									updateProvider(
-										p.id,
-										"prefix",
-										e.currentTarget.value.toLowerCase().replace(/[^a-z0-9_-]/g, ""),
-									)
-								}
+								onChange={(e) => handlePrefixChange(p.id, e.currentTarget.value)}
 							/>
 							<PasswordInput
 								label={t("nkpApiKey")}
