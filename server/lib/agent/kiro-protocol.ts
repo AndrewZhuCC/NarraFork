@@ -571,6 +571,12 @@ const XML_BOOLEAN_PARAMETER_NAMES = new Set([
 	"await",
 	"doInterrupt",
 	"multiSelect",
+	// Reflection/goal gate tools (DangerConfirm/DangerCancel, ExitPlanConfirm/Revise,
+	// GoalCompleteConfirm/Revise, UpdateGoal, GetGoals) use a boolean `confirm` parameter,
+	// usually typed as z.literal(true). Without coercion, leaked XML `<parameter
+	// name="confirm">true</parameter>` arrives as the string "true", fails schema
+	// validation, and the gate silently falls back to cancelling the operation.
+	"confirm",
 ]);
 const XML_NUMBER_PARAMETER_NAMES = new Set([
 	"timeout",
