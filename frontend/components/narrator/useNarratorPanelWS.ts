@@ -199,6 +199,13 @@ export interface UseNarratorPanelWSReturn {
 	substatus: string[];
 	contextPercent: number | null;
 	setContextPercent: React.Dispatch<React.SetStateAction<number | null>>;
+	/**
+	 * True when the displayed context usage may be inaccurate because the
+	 * conversation history changed locally (compact / clear / delete) without a
+	 * fresh server-reported `context_usage`. Cleared on the next real
+	 * `context_usage` event.
+	 */
+	contextStale: boolean;
 	promptTokens: number | null;
 	contextWindow: number | null;
 	isEstimated: boolean;
@@ -253,6 +260,7 @@ interface ToolOutputPreviewState {
 interface StatusState {
 	substatus: string[];
 	contextPercent: number | null;
+	contextStale: boolean;
 	promptTokens: number | null;
 	contextWindow: number | null;
 	isEstimated: boolean;
@@ -620,6 +628,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const [statusState, dispatchStatus] = useReducer(statusReducer, {
 		substatus: [],
 		contextPercent: null,
+		contextStale: false,
 		promptTokens: null,
 		contextWindow: null,
 		isEstimated: false,
@@ -631,6 +640,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	const {
 		substatus,
 		contextPercent,
+		contextStale,
 		promptTokens,
 		contextWindow,
 		isEstimated,
@@ -742,6 +752,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset only when narratorId changes
 	useEffect(() => {
 		contextInitRef.current = false;
+		// A different narrator starts with a fresh (non-stale) context reading —
+		// the staleness flag is per-session and must not leak across switches.
+		dispatchStatus({ type: "patch", payload: { contextStale: false } });
 	}, [narratorId]);
 	useEffect(() => {
 		if (contextInitRef.current) return;
@@ -2414,6 +2427,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					type: "patch",
 					payload: {
 						contextPercent: percentage,
+						contextStale: false,
 						promptTokens: pTokens ?? null,
 						contextWindow: ctxWindow ?? null,
 						isEstimated: !!isEst,
@@ -2655,6 +2669,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 						substatus: nextSubstatus,
 						pruneBoundaryMessageId: null,
 						prunedPercent: null,
+						// Compact / clear-context changed the history without a fresh
+						// server-side context_usage. Mark the indicator inaccurate until
+						// the next real turn reports usage.
+						contextStale: true,
 					},
 				});
 				qc.setQueryData(["narrators", narratorId], (old: Record<string, unknown> | undefined) =>
@@ -2839,6 +2857,10 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					}));
 					return { ...old, pages };
 				});
+				// Deleting messages (rollback / edit-regenerate / retry / segment
+				// compact undo) shrinks the history, so the last reported context
+				// usage no longer reflects what the next request will send.
+				dispatchStatus({ type: "patch", payload: { contextStale: true } });
 			},
 			onMessageUpdated: (updatedMsg: NarratorMsg) => {
 				// Update the message in cache
@@ -3193,6 +3215,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			substatus,
 			contextPercent,
 			setContextPercent,
+			contextStale,
 			promptTokens,
 			contextWindow,
 			isEstimated,
@@ -3237,6 +3260,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			substatus,
 			contextPercent,
 			setContextPercent,
+			contextStale,
 			promptTokens,
 			contextWindow,
 			isEstimated,
