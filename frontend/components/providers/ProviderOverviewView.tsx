@@ -20,7 +20,7 @@ import { ProviderCard } from "./ProviderCard";
 import type { ProviderStatus } from "./ProviderStatusBadge";
 import type { CustomApiProtocol } from "./types";
 
-export type AddProviderType = "nkp" | "nug" | CustomApiProtocol;
+export type AddProviderType = "nug" | CustomApiProtocol;
 
 const ADD_PROVIDER_OPTIONS: Array<{
 	type: AddProviderType;
@@ -79,14 +79,6 @@ const ADD_PROVIDER_OPTIONS: Array<{
 		descriptionKey: "addProviderNugDesc",
 		hintKey: "addProviderNugHint",
 		color: "indigo",
-	},
-	{
-		type: "nkp",
-		labelKey: "addProviderNkp",
-		badgeKey: "addProviderBadgeProxy",
-		descriptionKey: "addProviderNkpDesc",
-		hintKey: "addProviderNkpHint",
-		color: "grape",
 	},
 ];
 

@@ -94,9 +94,6 @@ export function SetupWizard({
 	const providerCount =
 		(settings?.openaiProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
 		(settings?.anthropicProviders?.filter((p: { apiKey?: string }) => p.apiKey)?.length ?? 0) +
-		(settings?.nkpProviders?.filter(
-			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
-		)?.length ?? 0) +
 		(settings?.nugProviders?.filter(
 			(p: { apiKey?: string; baseUrl?: string }) => p.apiKey && p.baseUrl,
 		)?.length ?? 0) +

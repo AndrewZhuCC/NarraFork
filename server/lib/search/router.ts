@@ -4,7 +4,6 @@ import { resolveEffectiveModel, resolveProvider, settings } from "../settings";
 import type {
 	CustomSearchProviderConfig,
 	NarraForkSettings,
-	NKPProviderConfig,
 	NUGProviderConfig,
 	SearchChannelConfig,
 } from "../settings/types";
@@ -45,8 +44,6 @@ function channelLabel(channel: SearchChannelConfig, config: NarraForkSettings = 
 			return "Kiro MCP search";
 		case "nug-mcp":
 			return `NUG: ${findNugProvider(channel, config)?.name ?? channel.providerId ?? channel.id}`;
-		case "nkp-mcp":
-			return `NKP: ${findNkpProvider(channel, config)?.name ?? channel.providerId ?? channel.id}`;
 		case "custom-api":
 			return `Custom: ${findCustomProvider(channel, config)?.name ?? channel.providerId ?? channel.id}`;
 		case "subagent":
@@ -59,13 +56,6 @@ function findNugProvider(
 	config: NarraForkSettings = settings,
 ): NUGProviderConfig | undefined {
 	return (config.nugProviders ?? []).find((provider) => provider.id === channel.providerId);
-}
-
-function findNkpProvider(
-	channel: SearchChannelConfig,
-	config: NarraForkSettings = settings,
-): NKPProviderConfig | undefined {
-	return (config.nkpProviders ?? []).find((provider) => provider.id === channel.providerId);
 }
 
 function findCustomProvider(
@@ -99,34 +89,6 @@ async function nugMcpSearch(
 	if (!response.ok) {
 		const errText = await response.text().catch(() => "");
 		throw new Error(`NUG MCP search error ${response.status}: ${errText}`);
-	}
-	const mcp = (await response.json()) as McpResponse;
-	const parsed = textFromMcpResponse(mcp);
-	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
-}
-
-async function nkpMcpSearch(
-	channel: SearchChannelConfig,
-	request: SearchRequest,
-	signal: AbortSignal,
-): Promise<SearchChannelResult> {
-	const config = findNkpProvider(channel);
-	if (!config || config.disabled || !config.apiKey || !config.baseUrl) {
-		throw new Error("NKP provider is not configured or is disabled");
-	}
-	const baseUrl = config.baseUrl.replace(/\/+$/, "");
-	const response = await fetch(`${baseUrl}/v1/mcp/search`, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${config.apiKey}`,
-		},
-		body: JSON.stringify({ query: request.query }),
-		signal,
-	});
-	if (!response.ok) {
-		const errText = await response.text().catch(() => "");
-		throw new Error(`NKP MCP search error ${response.status}: ${errText}`);
 	}
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
@@ -222,12 +184,6 @@ async function runChannel(
 				(signal) => nugMcpSearch(channel, request, signal),
 				channelTimeout(channel),
 			);
-		case "nkp-mcp":
-			return withSearchTimeout(
-				request.signal,
-				(signal) => nkpMcpSearch(channel, request, signal),
-				channelTimeout(channel),
-			);
 		case "custom-api": {
 			const provider = findCustomProvider(channel);
 			if (!provider) throw new Error("Custom search provider is not configured");
@@ -258,10 +214,6 @@ function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boole
 			return isKiroSearchUsable();
 		case "nug-mcp": {
 			const provider = findNugProvider(channel);
-			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;
-		}
-		case "nkp-mcp": {
-			const provider = findNkpProvider(channel);
 			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;
 		}
 		case "custom-api": {

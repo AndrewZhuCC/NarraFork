@@ -55,7 +55,6 @@ export function useAllModels() {
 		collectDisabledProviderPrefixes(settingsData?.customApiProviders);
 		collectDisabledProviderPrefixes(settingsData?.openaiProviders);
 		collectDisabledProviderPrefixes(settingsData?.anthropicProviders);
-		collectDisabledProviderPrefixes(settingsData?.nkpProviders);
 		collectDisabledProviderPrefixes(settingsData?.nugProviders);
 		collectDisabledProviderPrefixes(settingsData?.clineProviders);
 		const providerAgentModeSupported = (provider: ProviderCapabilityKey) =>
@@ -161,43 +160,6 @@ export function useAllModels() {
 				fetchedAnthropicModels.push(opt);
 			}
 			anthropicByProvider.push({ prefix, name, models, agentProviderType: "anthropic" });
-		}
-
-		// --- NKP models (per-provider, Kiro-compatible format) ---
-		const nkpModelsGrouped: Array<{
-			providerId: string;
-			providerName: string;
-			models: Array<Record<string, unknown>>;
-		}> = settingsData?.nkpModelsGrouped ?? [];
-
-		const serverNkpProviders: Array<{ id: string; prefix?: string; name?: string }> =
-			settingsData?.nkpProviders ?? [];
-
-		const fetchedNkpModels: ModelOption[] = [];
-		const nkpByProvider: ProviderModels[] = [];
-
-		for (const group of nkpModelsGrouped) {
-			const cfg = serverNkpProviders.find((p) => p.id === group.providerId);
-			const prefix = cfg?.prefix ?? "nkp";
-			const name = group.providerName || cfg?.name || prefix;
-			providerLabels[prefix] = name;
-			const models: ModelOption[] = [];
-			for (const m of group.models) {
-				const id = String(m.model_id ?? m.modelId ?? "");
-				if (!id) continue;
-				const rawRate = m.rate_multiplier ?? m.rateMultiplier;
-				const opt: ModelOption = {
-					value: `${prefix}:${id}`,
-					label: String(
-						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
-					),
-					provider: prefix,
-					rateMultiplier: typeof rawRate === "number" ? rawRate : undefined,
-				};
-				models.push(opt);
-				fetchedNkpModels.push(opt);
-			}
-			nkpByProvider.push({ prefix, name, models, agentProviderType: "nkp" });
 		}
 
 		// --- Cline models (per-provider, OpenRouter-based) ---
@@ -348,8 +310,6 @@ export function useAllModels() {
 			});
 		};
 
-		for (const group of nkpByProvider)
-			addGroup(group.prefix, group.models, group.agentProviderType);
 		if (kiroModels.length > 0) addGroup("kiro", kiroModels, "kiro");
 		for (const group of openaiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
@@ -488,8 +448,6 @@ export function useAllModels() {
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */
 			anthropicByProvider,
-			/** NKP models grouped by provider. */
-			nkpByProvider,
 			/** Cline models grouped by provider. */
 			clineByProvider,
 			/** NUG models grouped by provider. */

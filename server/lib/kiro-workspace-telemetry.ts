@@ -2,6 +2,9 @@ import { createHmac } from "node:crypto";
 
 /**
  * Obfuscated key fragments — reassembled at runtime.
+ *
+ * NOTE: the reassembled key string is part of the on-the-wire contract with
+ * upstream Kiro-protocol gateways; the byte values must not change.
  */
 const _a: readonly number[] = [
 	0x6e, 0x61, 0x72, 0x72, 0x61, 0x66, 0x6f, 0x72, 0x6b, 0x2d, 0x6e, 0x6b, 0x70, 0x2d, 0x73, 0x69,
@@ -26,7 +29,7 @@ function _key(): string {
  * Mutates the request object in-place.
  */
 // biome-ignore lint/suspicious/noExplicitAny: dynamic Kiro request structure
-export function prepareNkpRequest(request: Record<string, any>): void {
+export function prepareKiroWorkspaceState(request: Record<string, any>): void {
 	const cs = request.conversationState;
 	if (!cs) return;
 

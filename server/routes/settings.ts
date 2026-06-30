@@ -45,7 +45,6 @@ import { ensureContainerProxyRuntime } from "../services/container-proxy";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
-import { getAllNkpCachedQuotas, getNkpCachedModelsGrouped, purgeNkpProviderCache } from "./nkp";
 import { purgeNugProviderCache } from "./nug";
 import {
 	getOpenaiCachedModels,
@@ -134,16 +133,6 @@ const anthropicProviderSchema = z.object({
 	disabled: z.boolean().optional(),
 });
 
-const nkpProviderSchema = z.object({
-	id: z.string().min(1),
-	name: z.string(),
-	prefix: z.string().min(1),
-	apiKey: z.string(),
-	baseUrl: z.string(),
-	defaultModel: z.string(),
-	disabled: z.boolean().optional(),
-});
-
 const nugProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -174,7 +163,7 @@ const clineProviderSchema = z.object({
 
 const searchChannelSchema = z.object({
 	id: z.string().min(1),
-	kind: z.enum(["native", "kiro-mcp", "nug-mcp", "nkp-mcp", "custom-api", "subagent"]),
+	kind: z.enum(["native", "kiro-mcp", "nug-mcp", "custom-api", "subagent"]),
 	enabled: z.boolean(),
 	providerId: z.string().optional(),
 	model: z.string().optional(),
@@ -390,7 +379,6 @@ const updateSettingsSchema = z
 		customApiProviders: z.array(customApiProviderSchema).optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
-		nkpProviders: z.array(nkpProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
 		clineProviders: z.array(clineProviderSchema).optional(),
 		codex: z
@@ -618,10 +606,6 @@ function buildSettingsResponse(
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
-		nkpProviders: (source.nkpProviders ?? []).map((p) => ({
-			...p,
-			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
-		})),
 		nugProviders: (source.nugProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
@@ -637,11 +621,9 @@ function buildSettingsResponse(
 		openaiModels: getOpenaiCachedModels(),
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
-		nkpModelsGrouped: getNkpCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
-		nkpQuotas: getAllNkpCachedQuotas(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -748,11 +730,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn: purgeAnthropicProviderCache,
 		},
 		{
-			type: "nkp",
-			ids: getRemovedProviderIds(prev.nkpProviders, next.nkpProviders),
-			fn: purgeNkpProviderCache,
-		},
-		{
 			type: "nug",
 			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
 			fn: purgeNugProviderCache,
@@ -787,10 +764,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	const removedPrefixes = new Set<string>();
 	const removedProviderGroups = [
 		{ ids: removedCustomApiIds, providers: prev.customApiProviders },
-		{
-			ids: getRemovedProviderIds(prev.nkpProviders, next.nkpProviders),
-			providers: prev.nkpProviders,
-		},
 		{
 			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
 			providers: prev.nugProviders,
@@ -916,9 +889,6 @@ settingsRoutes.patch("/", async (c) => {
 				allPrefixes.push({ prefix: p.prefix, source: `Custom API "${p.name || p.id}"` });
 			}
 		}
-		for (const p of validated.nkpProviders ?? current.nkpProviders ?? []) {
-			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NKP "${p.name || p.id}"` });
-		}
 		for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
 			if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
 		}
@@ -1037,17 +1007,6 @@ settingsRoutes.patch("/", async (c) => {
 		);
 	}
 
-	// Preserve real API keys for NKP providers
-	if (validated.nkpProviders) {
-		const currentProviders = current.nkpProviders ?? [];
-		for (const p of validated.nkpProviders) {
-			if (p.apiKey?.startsWith("*")) {
-				const existing = currentProviders.find((cp) => cp.id === p.id);
-				p.apiKey = existing?.apiKey ?? "";
-			}
-		}
-	}
-
 	// Preserve real API keys and OAuth secrets for NUG providers
 	if (validated.nugProviders) {
 		const currentProviders = current.nugProviders ?? [];
@@ -1102,7 +1061,6 @@ settingsRoutes.patch("/", async (c) => {
 			key === "customApiProviders" ||
 			key === "openaiProviders" ||
 			key === "anthropicProviders" ||
-			key === "nkpProviders" ||
 			key === "nugProviders" ||
 			key === "clineProviders"
 		) {

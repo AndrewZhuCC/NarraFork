@@ -3292,22 +3292,6 @@ export function NarratorPanel({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	}, [(narrator as any)?.substatus]);
 
-	// Resolve NKP provider info for initial quota balance
-	const nkpProviderInfo = useMemo(() => {
-		const prefix = resolvedModel?.split(":")[0];
-		if (!prefix) return null;
-		const nkpProviders: Array<{ id: string; prefix?: string }> = settingsData?.nkpProviders ?? [];
-		const cfg = nkpProviders.find((p) => p.prefix === prefix);
-		if (!cfg) return null;
-		const quotas = settingsData?.nkpQuotas as
-			| Record<string, { quotaBalance: number | null }>
-			| undefined;
-		return {
-			providerId: cfg.id,
-			quotaBalance: quotas?.[cfg.id]?.quotaBalance ?? null,
-		};
-	}, [resolvedModel, settingsData?.nkpProviders, settingsData?.nkpQuotas]);
-
 	// Resolve custom API provider info for initial generic quota balance
 	const customApiProviderInfo = useMemo(() => {
 		const prefix = resolvedModel?.split(":")[0];
@@ -3358,8 +3342,6 @@ export function NarratorPanel({
 		narratorTodosToolUseId: narrator?.todosToolUseId,
 		isSubagent,
 		narratorSubstatus,
-		initialNkpQuotaBalance: nkpProviderInfo?.quotaBalance,
-		nkpProviderId: nkpProviderInfo?.providerId,
 		initialQuotaBalance: customApiProviderInfo?.quotaBalance ?? nugProviderInfo?.quotaBalance,
 		initialDetailedQuotaBalance:
 			customApiProviderInfo?.detailedQuotaBalance ?? nugProviderInfo?.detailedQuotaBalance,
@@ -3391,7 +3373,6 @@ export function NarratorPanel({
 		activeCompactStart,
 		pruneBoundaryMessageId,
 		prunedPercent,
-		nkpQuotaBalance,
 		quotaBalance,
 		detailedQuotaBalance,
 		retryInfo,
@@ -3899,11 +3880,11 @@ export function NarratorPanel({
 	const isBlockingCompacting = substatus.includes("compacting");
 	const isBackgroundCompacting = substatus.includes("background_compacting");
 	const isCompacting = isBlockingCompacting || isBackgroundCompacting;
-	const nkpQueuePosition = substatus.find((s) => s.startsWith("queue_position:"));
-	const nkpQueueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
+	const queuePosition = substatus.find((s) => s.startsWith("queue_position:"));
+	const queueDepth = substatus.find((s) => s.startsWith("queue_depth:"));
 	const queueMessage = substatus.find((s) => s.startsWith("queue_message:"));
-	const nkpQueuePositionValue = nkpQueuePosition ? Number(nkpQueuePosition.split(":")[1]) : null;
-	const nkpQueueDepthValue = nkpQueueDepth ? Number(nkpQueueDepth.split(":")[1]) : null;
+	const queuePositionValue = queuePosition ? Number(queuePosition.split(":")[1]) : null;
+	const queueDepthValue = queueDepth ? Number(queueDepth.split(":")[1]) : null;
 	const queueMessageValue = queueMessage
 		? decodeURIComponent(queueMessage.slice("queue_message:".length))
 		: null;
@@ -8217,15 +8198,15 @@ export function NarratorPanel({
 																? t("backgroundCompacting")
 																: t("thinking")}
 									</Text>
-									{(nkpQueuePosition != null || queueMessageValue) && (
+									{(queuePosition != null || queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
 											{queueMessageValue ??
 												t(
-													nkpQueueDepthValue != null && nkpQueueDepthValue > 0
-														? "nkpQueuePositionWithDepth"
-														: "nkpQueuePosition",
-													{ position: nkpQueuePositionValue, queueDepth: nkpQueueDepthValue },
+													queueDepthValue != null && queueDepthValue > 0
+														? "queuePositionWithDepth"
+														: "queuePosition",
+													{ position: queuePositionValue, queueDepth: queueDepthValue },
 												)}
 										</Text>
 									)}
@@ -8304,14 +8285,6 @@ export function NarratorPanel({
 										isAdmin={currentUser?.role === "admin"}
 										compact={isMobileViewport}
 									/>
-									{/* NKP quota balance */}
-									{nkpQuotaBalance != null && (
-										<Tooltip label={t("nkpQuotaBalance", { balance: nkpQuotaBalance.toFixed(2) })}>
-											<Text size="xs" c="dimmed" style={{ flexShrink: 0, cursor: "default" }}>
-												${nkpQuotaBalance.toFixed(2)}
-											</Text>
-										</Tooltip>
-									)}
 									{/* Generic gateway/API quota balance */}
 									{quotaBalance != null &&
 										(hasQuotaDetailsPopover ? (

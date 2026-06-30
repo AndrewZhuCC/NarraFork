@@ -320,20 +320,6 @@ describe("normalizeKiroChatRequest", () => {
 });
 
 describe("parseSSEStream", () => {
-	test("parses NKP queue events from data-embedded SSE frames", async () => {
-		const events: ParsedStreamEvent[] = [];
-		const body = streamFromText(
-			'data: {"type":"nkpQueueEvent","position":2,"queueDepth":5}\n\n' +
-				'data: {"content":"hello"}\n\n',
-		);
-
-		for await (const event of parseSSEStream(body)) {
-			events.push(event);
-		}
-
-		expect(events).toEqual([{ nkpQueue: { position: 2, queueDepth: 5 } }, { text: "hello" }]);
-	});
-
 	test("parses generic gateway queue events in Kiro-compatible streams", async () => {
 		const events: ParsedStreamEvent[] = [];
 		const body = streamFromText(

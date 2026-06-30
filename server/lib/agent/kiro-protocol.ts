@@ -21,7 +21,7 @@ import {
 } from "./sidecar";
 
 /**
- * Shared Kiro protocol helpers used by both KiroProvider and NkpProvider.
+ * Shared Kiro protocol helpers used by KiroProvider and the NUG Kiro channel.
  */
 
 /** A reasoning block as produced by the agent loop / stored in contentJson. */
@@ -394,7 +394,7 @@ function sanitizeKiroToolPairs(
 }
 
 /**
- * Normalize the Kiro native request immediately before it leaves Kiro/NKP providers.
+ * Normalize the Kiro native request immediately before it leaves Kiro/NUG providers.
  * This is intentionally Kiro-protocol scoped: other providers keep their own history logic.
  *
  * The Kiro API is strict about user/assistant alternation and requires every toolResult
@@ -700,7 +700,7 @@ const INVOKE_BLOCK_FROM_START_RE = /^<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/i;
  * Stateful parser for leaked XML tool calls that may be split across multiple
  * streaming text deltas.
  *
- * Kiro/NUG/NKP stream `assistantResponseEvent.content` as incremental chunks, so a
+ * Kiro/NUG stream `assistantResponseEvent.content` as incremental chunks, so a
  * single `<invoke>...</invoke>` block frequently spans several deltas. The stateless
  * {@link parseKiroTextToolCalls} only matches blocks fully contained in one chunk, so
  * split blocks would leak to the UI as raw text and never execute. This parser buffers
@@ -805,7 +805,7 @@ export class KiroTextToolCallStreamParser {
  * Stateful accumulator that moves leaked XML tool calls out of streamed assistant text.
  *
  * Wraps {@link KiroTextToolCallStreamParser} at the {@link ParsedStreamEvent} level so the
- * Kiro/NUG/NKP streaming paths can reuse identical logic. Callers must parse each raw event
+ * Kiro/NUG streaming paths can reuse identical logic. Callers must parse each raw event
  * with `parseTextToolCalls: false` (so the per-event regex does not run) and route the result
  * through {@link process}; after the stream ends they must emit {@link finalize}.
  */
@@ -1015,28 +1015,12 @@ export function parseKiroStreamEvent(
 		};
 	}
 
-	// NKP-specific: error event from the proxy layer
-	// Harmless for kiro-provider since kiro won't send this event type.
+	// Proxy-layer error event (harmless for kiro-provider since kiro won't send it).
 	if (evt.eventType === "error") {
 		result.invalidState = {
-			reason: "nkp_error",
-			message: String(evt.data.message ?? "NKP proxy error"),
+			reason: "gateway_error",
+			message: String(evt.data.message ?? "Gateway proxy error"),
 		};
-	}
-
-	// NKP-specific: quota balance event sent after each request
-	if (evt.eventType === "nkpQuotaBalanceEvent") {
-		const balance = evt.data.quotaBalance;
-		result.nkpQuotaBalance = balance != null ? Number(balance) : null;
-	}
-
-	// NKP-specific: queue status event sent while waiting for a concurrency slot
-	if (evt.eventType === "nkpQueueEvent") {
-		const position = evt.data.position;
-		const queueDepth = evt.data.queueDepth;
-		if (position != null) {
-			result.nkpQueue = { position: Number(position), queueDepth: Number(queueDepth ?? 0) };
-		}
 	}
 
 	return result;
@@ -1044,7 +1028,7 @@ export function parseKiroStreamEvent(
 
 /**
  * Parse a raw HTTP SSE response body into a stream of ParsedStreamEvents.
- * Used by NkpProvider to avoid duplicating SSE line-parsing logic across
+ * Used by Kiro-protocol providers to avoid duplicating SSE line-parsing logic across
  * chat(), generateWithMeta(), and generateWithHistory().
  */
 export async function* parseSSEStream(
@@ -1372,7 +1356,7 @@ export async function buildKiroHistory(
 	};
 }
 
-// ── Shared image helpers for KiroProvider / NkpProvider ──
+// ── Shared image helpers for Kiro-protocol providers ──
 
 /** Extract a human-readable file name from the Read tool's image output placeholder. */
 export function extractImageFileName(output: string): string | null {

@@ -408,7 +408,7 @@ export type NarratorServerMessage =
 	  }
 	| {
 			/**
-			 * Non-persisted diagnostic for leaked XML tool calls (Kiro/NUG/NKP). The frontend
+			 * Non-persisted diagnostic for leaked XML tool calls (Kiro/NUG). The frontend
 			 * uses it to mark stream-captured tool calls and to prompt downloading the raw SSE
 			 * dump when capture failed. `apiRequestId` points at the persisted api_requests row
 			 * for the leaked-tool-dump download endpoint.
@@ -460,17 +460,6 @@ export type NarratorServerMessage =
 			narratorId: string;
 			chapterId: string;
 			containerStatus: string | null;
-	  }
-	| {
-			type: "nkp_quota_balance";
-			narratorId: string;
-			quotaBalance: number | null;
-	  }
-	| {
-			type: "nkp_queue_status";
-			narratorId: string;
-			position: number;
-			queueDepth: number;
 	  }
 	| {
 			type: "quota_balance";

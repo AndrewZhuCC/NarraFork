@@ -578,19 +578,6 @@ export const miscApi = {
 			resolvedBaseUrl?: string;
 		}>(`/anthropic/providers/${providerId}/models/refresh`, { method: "POST" }),
 
-	// NKP models
-	nkpRefreshProviderModels: (providerId: string) =>
-		request<{
-			models: Array<{ id: string; owned_by?: string }>;
-			fromCache: boolean;
-		}>(`/nkp/providers/${providerId}/models/refresh`, { method: "POST" }),
-
-	// NKP quota
-	getNkpProviderQuota: (providerId: string) =>
-		request<{ quotaBalance: number; quotaTotalGranted: number }>(
-			`/nkp/providers/${providerId}/quota`,
-		),
-
 	// NUG
 	nugLogin: (providerId: string, body: { username: string; password: string }) =>
 		request<{ apiKey: string }>(`/nug/providers/${providerId}/login`, {
@@ -1235,7 +1222,7 @@ export const miscApi = {
 				};
 				providers?: Partial<
 					Record<
-						"kiro" | "openai" | "anthropic" | "nkp" | "nug" | "codex" | "cline",
+						"kiro" | "openai" | "anthropic" | "nug" | "codex" | "cline",
 						{
 							auth?: { supported?: boolean; fallback?: boolean; code?: string; reason?: string };
 							models?: { supported?: boolean; refreshSupported?: boolean; reason?: string };

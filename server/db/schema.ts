@@ -1030,7 +1030,7 @@ export const apiRequests = sqliteTable(
 		costUsd: real("cost_usd"),
 		// 上下文使用率
 		contextPercent: real("context_percent"),
-		// Metering（Kiro/NKP）
+		// Metering（Kiro/NUG）
 		meterUsage: real("meter_usage"),
 		meterUnit: text("meter_unit"),
 		// 错误信息（请求失败时记录）

@@ -16,7 +16,6 @@ import {
 import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
-import { NKPProvidersSection } from "../../components/providers/NKPProvidersSection";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import {
@@ -68,7 +67,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 	const migratedWindows = { ...state.modelContextWindows };
 	for (const providers of [
 		{ cur: state.customApiProviders, saved: savedSnapshot.customApiProviders },
-		{ cur: state.nkpProviders, saved: savedSnapshot.nkpProviders },
 		{ cur: state.nugProviders, saved: savedSnapshot.nugProviders },
 	]) {
 		for (const provider of providers.cur) {
@@ -90,10 +88,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
 		proxy: normalizeProxyUrl(provider.proxy) ?? "",
 	}));
-	const normalizedNkpProviders = state.nkpProviders.map((provider) => ({
-		...provider,
-		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
-	}));
 	const normalizedNugProviders = state.nugProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
@@ -101,7 +95,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 	const normalizedState: ProvidersState = {
 		...state,
 		customApiProviders: normalizedCustomApiProviders,
-		nkpProviders: normalizedNkpProviders,
 		nugProviders: normalizedNugProviders,
 		modelContextWindows: migratedWindows,
 	};
@@ -112,7 +105,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 		snapshot,
 		payload: {
 			customApiProviders: normalizedCustomApiProviders,
-			nkpProviders: normalizedNkpProviders,
 			nugProviders: normalizedNugProviders,
 			agent: {
 				hiddenModels: [...state.hiddenModels],
@@ -205,10 +197,6 @@ function SettingsProvidersPage() {
 		() => getDirtyProviderIds(state.customApiProviders, savedProviderSnapshot.customApiProviders),
 		[state.customApiProviders, savedProviderSnapshot],
 	);
-	const nkpDirtyProviderIds = useMemo(
-		() => getDirtyProviderIds(state.nkpProviders, savedProviderSnapshot.nkpProviders),
-		[state.nkpProviders, savedProviderSnapshot],
-	);
 	const nugDirtyProviderIds = useMemo(
 		() => getDirtyProviderIds(state.nugProviders, savedProviderSnapshot.nugProviders),
 		[state.nugProviders, savedProviderSnapshot],
@@ -216,10 +204,6 @@ function SettingsProvidersPage() {
 	const isCustomApiProviderDirty = useCallback(
 		(providerId: string) => customApiDirtyProviderIds.has(providerId),
 		[customApiDirtyProviderIds],
-	);
-	const isNkpProviderDirty = useCallback(
-		(providerId: string) => nkpDirtyProviderIds.has(providerId),
-		[nkpDirtyProviderIds],
 	);
 	const isNugProviderDirty = useCallback(
 		(providerId: string) => nugDirtyProviderIds.has(providerId),
@@ -238,14 +222,13 @@ function SettingsProvidersPage() {
 		const map = new Map<string, string>();
 		for (const p of [
 			...state.customApiProviders,
-			...state.nkpProviders,
 			...state.nugProviders,
 			...clineProviderPrefixes,
 		]) {
 			if (p.prefix) map.set(p.prefix, p.id);
 		}
 		return map;
-	}, [state.customApiProviders, state.nkpProviders, state.nugProviders, clineProviderPrefixes]);
+	}, [state.customApiProviders, state.nugProviders, clineProviderPrefixes]);
 	const getPrefixError = useCallback(
 		(prefix: string, currentProviderId: string): string | undefined => {
 			if (!prefix) return undefined;
@@ -354,12 +337,6 @@ function SettingsProvidersPage() {
 		(type: AddProviderType) => {
 			const id = Math.random().toString(36).slice(2, 10);
 			switch (type) {
-				case "nkp":
-					dispatchers.setNkpProviders((prev) => [
-						...prev,
-						{ id, name: "NKP", prefix: "", apiKey: "", baseUrl: "", defaultModel: "" },
-					]);
-					break;
 				case "nug":
 					dispatchers.setNugProviders((prev) => [
 						...prev,
@@ -367,7 +344,7 @@ function SettingsProvidersPage() {
 					]);
 					break;
 				default: {
-					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nkp" | "nug">, string> = {
+					const defaultNameByProtocol: Record<Exclude<AddProviderType, "nug">, string> = {
 						"anthropic-compatible": t("addProviderAnthropicCompatible"),
 						"anthropic-official": t("addProviderClaudeCode"),
 						"codex-native": t("addProviderCodex"),
@@ -466,7 +443,6 @@ function SettingsProvidersPage() {
 		codexModels,
 		openaiByProvider,
 		anthropicByProvider,
-		nkpByProvider,
 		clineByProvider,
 		nugByProvider,
 	} = useAllModels();
@@ -519,38 +495,6 @@ function SettingsProvidersPage() {
 		return map;
 	}, [settings?.anthropicProviders, settings?.anthropicModelsGrouped]);
 
-	const nkpModelsMap = useMemo(() => {
-		const map: Record<string, ModelOption[]> = {};
-		const prefixMap: Record<string, string> = {};
-		const groups = (settings?.nkpModelsGrouped ?? []) as Array<{
-			providerId: string;
-			models: Array<Record<string, unknown>>;
-		}>;
-		for (const p of (settings?.nkpProviders ?? []) as Array<{
-			id: string;
-			prefix?: string;
-		}>) {
-			prefixMap[p.id] = p.prefix ?? "nkp";
-		}
-		for (const group of groups) {
-			const prefix = prefixMap[group.providerId] ?? "nkp";
-			const models: ModelOption[] = [];
-			for (const m of group.models) {
-				const id = String(m.model_id ?? m.modelId ?? "");
-				if (!id) continue;
-				models.push({
-					value: `${prefix}:${id}`,
-					label: String(
-						m.model_short_name ?? m.modelShortName ?? m.model_name ?? m.modelName ?? id,
-					),
-					provider: prefix,
-				});
-			}
-			map[group.providerId] = models;
-		}
-		return map;
-	}, [settings?.nkpProviders, settings?.nkpModelsGrouped]);
-
 	const nugModelsMap = useMemo(() => {
 		const map: Record<string, ModelOption[]> = {};
 		const prefixMap: Record<string, string> = {};
@@ -602,7 +546,6 @@ function SettingsProvidersPage() {
 		const getBadgeLabel = (prefix: string): string | undefined => {
 			const customApiProvider = state.customApiProviders.find((p) => p.prefix === prefix);
 			if (customApiProvider) return t(CUSTOM_API_PROTOCOL_LABEL_KEYS[customApiProvider.protocol]);
-			if (state.nkpProviders.some((p) => p.prefix === prefix)) return "nkp";
 			if (state.nugProviders.some((p) => p.prefix === prefix)) return "nug";
 			return undefined;
 		};
@@ -623,7 +566,6 @@ function SettingsProvidersPage() {
 		for (const m of codexModels) addModel("codex", m);
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
-		for (const g of nkpByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of nugByProvider) for (const m of g.models) addModel(g.prefix, m);
 
@@ -637,7 +579,6 @@ function SettingsProvidersPage() {
 		for (const p of platformPrefixes) ensureEmpty(p);
 		// Ensure multi-instance providers always present (even disabled)
 		for (const p of state.customApiProviders) ensureEmpty(p.prefix);
-		for (const p of state.nkpProviders) ensureEmpty(p.prefix);
 		for (const p of state.nugProviders) ensureEmpty(p.prefix);
 
 		return [...byPrefix].map(([prefix, models]) => {
@@ -647,7 +588,6 @@ function SettingsProvidersPage() {
 			// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
 			const match = !isPlatform
 				? (state.customApiProviders.find((p) => p.prefix === prefix) ??
-					state.nkpProviders.find((p) => p.prefix === prefix) ??
 					state.nugProviders.find((p) => p.prefix === prefix))
 				: undefined;
 			const providerId = match?.id;
@@ -668,14 +608,12 @@ function SettingsProvidersPage() {
 		codexModels,
 		openaiByProvider,
 		anthropicByProvider,
-		nkpByProvider,
 		clineByProvider,
 		nugByProvider,
 		state.customModels,
 		providerLabels,
 		state.disabledProviders,
 		state.customApiProviders,
-		state.nkpProviders,
 		state.nugProviders,
 		t,
 	]);
@@ -690,17 +628,10 @@ function SettingsProvidersPage() {
 		// Multi-instance providers: selectedProvider is the provider ID
 		const p =
 			state.customApiProviders.find((p) => p.id === selectedProvider) ??
-			state.nkpProviders.find((p) => p.id === selectedProvider) ??
 			state.nugProviders.find((p) => p.id === selectedProvider);
 		if (p?.prefix) return providerLabels[p.prefix] ?? p.prefix;
 		return p?.name ?? "";
-	}, [
-		selectedProvider,
-		state.customApiProviders,
-		state.nkpProviders,
-		state.nugProviders,
-		providerLabels,
-	]);
+	}, [selectedProvider, state.customApiProviders, state.nugProviders, providerLabels]);
 
 	// ── Auto-fetch models + fill default context windows after a manual save ──
 	// Triggered by handleSave (only when a provider is being edited). Refreshes the
@@ -713,7 +644,6 @@ function SettingsProvidersPage() {
 		if (["kiro", "codex", "cline"].includes(providerId)) return;
 
 		const customApi = state.customApiProviders.find((p) => p.id === providerId);
-		const nkp = state.nkpProviders.find((p) => p.id === providerId);
 		const nug = state.nugProviders.find((p) => p.id === providerId);
 
 		try {
@@ -724,9 +654,6 @@ function SettingsProvidersPage() {
 				} else {
 					await api.openaiRefreshProviderModels(providerId);
 				}
-			} else if (nkp) {
-				if (!nkp.apiKey || !nkp.baseUrl) return;
-				await api.nkpRefreshProviderModels(providerId);
 			} else if (nug) {
 				if (!nug.apiKey || !nug.baseUrl) return;
 				await api.nugRefreshProviderModels(providerId);
@@ -751,16 +678,14 @@ function SettingsProvidersPage() {
 		}
 
 		// Resolve this provider's prefix and the list of model ids from grouped data.
-		const prefix = customApi?.prefix ?? nkp?.prefix ?? nug?.prefix ?? "";
+		const prefix = customApi?.prefix ?? nug?.prefix ?? "";
 		if (!prefix) return;
 
 		const groupedKey = customApi
 			? isAnthropicProtocol(customApi.protocol)
 				? "anthropicModelsGrouped"
 				: "openaiModelsGrouped"
-			: nkp
-				? "nkpModelsGrouped"
-				: "nugModelsGrouped";
+			: "nugModelsGrouped";
 		const grouped = (freshSettings[groupedKey] ?? []) as Array<{
 			providerId: string;
 			models: Array<Record<string, unknown>>;
@@ -815,10 +740,8 @@ function SettingsProvidersPage() {
 						dispatchers={dispatchers}
 						providerModelsMap={providerModelsMap}
 						anthropicModelsMap={anthropicModelsMap}
-						nkpModelsMap={nkpModelsMap}
 						nugModelsMap={nugModelsMap}
 						isCustomApiProviderDirty={isCustomApiProviderDirty}
-						isNkpProviderDirty={isNkpProviderDirty}
 						isNugProviderDirty={isNugProviderDirty}
 						getPrefixError={getPrefixError}
 						getUniquePrefix={getUniquePrefix}
@@ -940,10 +863,8 @@ interface ProviderSectionContentProps {
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
 	providerModelsMap: Record<string, ModelOption[]>;
 	anthropicModelsMap: Record<string, ModelOption[]>;
-	nkpModelsMap: Record<string, ModelOption[]>;
 	nugModelsMap: Record<string, ModelOption[]>;
 	isCustomApiProviderDirty: (id: string) => boolean;
-	isNkpProviderDirty: (id: string) => boolean;
 	isNugProviderDirty: (id: string) => boolean;
 	getPrefixError: (prefix: string, id: string) => string | undefined;
 	getUniquePrefix: (base: string, id: string) => string;
@@ -961,10 +882,8 @@ function ProviderSectionContent({
 	dispatchers,
 	providerModelsMap,
 	anthropicModelsMap,
-	nkpModelsMap,
 	nugModelsMap,
 	isCustomApiProviderDirty,
-	isNkpProviderDirty,
 	isNugProviderDirty,
 	getPrefixError,
 	getUniquePrefix,
@@ -1033,28 +952,6 @@ function ProviderSectionContent({
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				isProviderDirty={isCustomApiProviderDirty}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				getPrefixError={getPrefixError}
-				getUniquePrefix={getUniquePrefix}
-				onTestModel={onTestModel}
-				onSaveBeforeRefresh={onSaveBeforeRefresh}
-			/>
-		);
-	}
-	const nkpMatch = state.nkpProviders.find((p) => p.id === providerKey);
-	if (nkpMatch) {
-		return (
-			<NKPProvidersSection
-				providers={[nkpMatch]}
-				onProvidersChange={dispatchers.setNkpProviders}
-				providerModelsMap={nkpModelsMap}
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				isProviderDirty={isNkpProviderDirty}
-				quotas={settings?.nkpQuotas}
 				customModels={state.customModels}
 				onCustomModelsChange={dispatchers.setCustomModels}
 				getPrefixError={getPrefixError}

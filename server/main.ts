@@ -979,13 +979,6 @@ initContainerEventHandler();
 // Register chat-group event handler (notify controlling named narrators of permission requests)
 registerChatGroupEventListeners();
 
-// Fetch NKP quota balances on startup
-import("./routes/nkp")
-	.then(({ fetchAllNkpQuotas }) => fetchAllNkpQuotas())
-	.catch((err) => {
-		logger.warn("NKP quota startup fetch failed", { error: String(err) });
-	});
-
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {
 	logger.warn("Container state reconciliation failed", { error: String(err) });

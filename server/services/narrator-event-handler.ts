@@ -72,7 +72,7 @@ export interface EventHandlerContext {
 	conversationId: string;
 	/** Locale for the narrator session (used for reasoning translation) */
 	locale?: string;
-	/** Provider prefix (e.g. "nkp", "kiro") for the current session */
+	/** Provider prefix (e.g. "nug", "kiro") for the current session */
 	providerPrefix?: string;
 	/** Resolved provider for the current turn */
 	provider?: string;
@@ -211,10 +211,10 @@ export interface StreamingSnapshot {
 	/** Ordered streaming blocks — preserves temporal order of reasoning, web_search, and text. */
 	streamingBlocks: SnapshotStreamingBlock[];
 	toolChunks: Map<string, ToolChunkSnapshot>;
-	/** Cached NKP queue position (> 0 means queued). */
-	nkpQueuePosition?: number;
-	/** Cached NKP queue depth. */
-	nkpQueueDepth?: number;
+	/** Cached gateway queue position (> 0 means queued). */
+	queuePosition?: number;
+	/** Cached gateway queue depth. */
+	queueDepth?: number;
 	/** Cached generic gateway queue message. */
 	queueMessage?: string;
 }
@@ -1543,48 +1543,14 @@ export async function processEvent(
 			return null;
 		}
 
-		case "nkp_quota_balance": {
-			dualBroadcast(ctx, {
-				type: "nkp_quota_balance",
-				narratorId: broadcastTargetId,
-				quotaBalance: event.quotaBalance,
-			});
-			// Update the global in-memory quota cache so the provider management page
-			// can display the latest balance without an extra network round-trip.
-			if (ctx.providerPrefix) {
-				try {
-					const { updateNkpQuotaByPrefix } = await import("../routes/nkp");
-					updateNkpQuotaByPrefix(ctx.providerPrefix, event.quotaBalance);
-				} catch {
-					// nkp module not loaded — ignore
-				}
-			}
-			return null;
-		}
-
-		case "nkp_queue_status": {
-			// Cache queue position in the streaming snapshot so late-joining
-			// subscribers see it immediately via streaming_snapshot.
-			const qSnap = getOrCreateSnapshot(narratorId);
-			qSnap.nkpQueuePosition = event.position;
-			qSnap.nkpQueueDepth = event.queueDepth;
-			dualBroadcast(ctx, {
-				type: "nkp_queue_status",
-				narratorId: broadcastTargetId,
-				position: event.position,
-				queueDepth: event.queueDepth,
-			});
-			return null;
-		}
-
-		// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway).
+		// Generic gateway-injected queue/quota events (providers via unified gateway).
 		case "queue_status": {
 			const qsSnap = getOrCreateSnapshot(narratorId);
 			if (event.position !== undefined) {
-				qsSnap.nkpQueuePosition = event.position;
+				qsSnap.queuePosition = event.position;
 			}
 			if (event.queueDepth !== undefined) {
-				qsSnap.nkpQueueDepth = event.queueDepth;
+				qsSnap.queueDepth = event.queueDepth;
 			}
 			qsSnap.queueMessage = event.queueMessage;
 			dualBroadcast(ctx, {

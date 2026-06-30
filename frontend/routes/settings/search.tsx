@@ -27,7 +27,7 @@ export const Route = createFileRoute("/settings/search")({
 	component: SettingsSearchPage,
 });
 
-type SearchChannelKind = "native" | "kiro-mcp" | "nug-mcp" | "nkp-mcp" | "custom-api" | "subagent";
+type SearchChannelKind = "native" | "kiro-mcp" | "nug-mcp" | "custom-api" | "subagent";
 
 interface SearchChannelConfig {
 	id: string;
@@ -64,7 +64,6 @@ interface SearchSettingsState {
 interface SearchSettingsResponse {
 	search?: Partial<SearchSettingsState>;
 	nugProviders?: Array<{ id: string; name?: string }>;
-	nkpProviders?: Array<{ id: string; name?: string }>;
 }
 
 function asSearchSettingsResponse(value: unknown): SearchSettingsResponse | undefined {
@@ -115,8 +114,6 @@ function channelBadgeColor(kind: SearchChannelKind): string {
 			return "blue";
 		case "nug-mcp":
 			return "green";
-		case "nkp-mcp":
-			return "cyan";
 		case "custom-api":
 			return "orange";
 		case "subagent":
@@ -135,10 +132,6 @@ function channelLabel(
 	if (channel.kind === "nug-mcp") {
 		const provider = settings?.nugProviders?.find((p) => p.id === providerId);
 		return `NUG: ${provider?.name ?? providerId ?? channel.id}`;
-	}
-	if (channel.kind === "nkp-mcp") {
-		const provider = settings?.nkpProviders?.find((p) => p.id === providerId);
-		return `NKP: ${provider?.name ?? providerId ?? channel.id}`;
 	}
 	const provider = settings?.search?.customProviders?.find((p) => p.id === providerId);
 	return `Custom: ${provider?.name ?? providerId ?? channel.id}`;

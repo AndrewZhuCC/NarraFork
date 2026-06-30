@@ -6,7 +6,7 @@ import type {
 	KiroImage,
 	KiroToolResult,
 } from "../kiro-adapter";
-import { prepareNkpRequest } from "../nkp-ext";
+import { prepareKiroWorkspaceState } from "../kiro-workspace-telemetry";
 import {
 	getNugCachedModelHash,
 	type ResolvedNugModelMeta,
@@ -181,11 +181,11 @@ const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh", "max"]);
  * NUG (Narrafork Unified Gateway) provider adapter.
  *
  * Communicates with a remote NUG service. For Kiro-channel models, uses the
- * Kiro native protocol (same as NkpProvider). For other channels, uses the
+ * Kiro native protocol (same as the standalone Kiro provider). For other channels, uses the
  * unified /v1/chat endpoint or channel-specific endpoints.
  *
  * The Kiro protocol path reuses the same request building, history formatting,
- * and SSE event parsing as KiroProvider / NkpProvider.
+ * and SSE event parsing as KiroProvider.
  */
 export class NugProvider implements ProviderAdapter {
 	private config: NUGProviderConfig;
@@ -504,7 +504,7 @@ export class NugProvider implements ProviderAdapter {
 		const request = normalizeKiroChatRequest(
 			buildKiroRequest({ ...params, model: meta.bareModel }),
 		);
-		prepareNkpRequest(request);
+		prepareKiroWorkspaceState(request);
 
 		const body = { model: meta.routedModel, ...request };
 		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
@@ -739,7 +739,7 @@ export class NugProvider implements ProviderAdapter {
 			},
 		};
 
-		prepareNkpRequest(request);
+		prepareKiroWorkspaceState(request);
 		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
@@ -858,7 +858,7 @@ export class NugProvider implements ProviderAdapter {
 			},
 		};
 
-		prepareNkpRequest(request);
+		prepareKiroWorkspaceState(request);
 		const body = { model: meta.routedModel, ...request };
 		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",

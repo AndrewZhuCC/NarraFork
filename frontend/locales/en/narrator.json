@@ -413,7 +413,6 @@
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"contextStaleHint": "Context usage shown is inaccurate after compacting/clearing/deleting messages. The accurate value will be available after the next request to the server.",
 	"estimated": "estimated",
-	"nkpQuotaBalance": "NKP Quota: ${{balance}}",
 	"quotaBalance": "API balance: {{balance}}",
 	"recharge": {
 		"title": "NUG Recharge",
@@ -563,8 +562,8 @@
 	"splitDown": "Split down",
 	"closePanel": "Close panel",
 	"lastTurnDuration": "last turn {{duration}}",
-	"nkpQueuePosition": "queued #{{position}}",
-	"nkpQueuePositionWithDepth": "queued #{{position}} of {{queueDepth}}",
+	"queuePosition": "queued #{{position}}",
+	"queuePositionWithDepth": "queued #{{position}} of {{queueDepth}}",
 	"fileMod_title": "File Modifications",
 	"fileMod_tabSummary": "Summary",
 	"fileMod_tabApproval": "Approval",

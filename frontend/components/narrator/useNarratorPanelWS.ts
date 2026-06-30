@@ -142,10 +142,6 @@ export interface UseNarratorPanelWSOptions {
 	narratorTodosToolUseId?: string | null;
 	/** Whether this narrator is a subagent — skip mark-read to preserve done/error status for follow-up Send */
 	isSubagent?: boolean;
-	/** Initial NKP quota balance from settings cache (before any streaming events arrive) */
-	initialNkpQuotaBalance?: number | null;
-	/** NKP provider ID for the current narrator model (used to sync quota back to settings cache) */
-	nkpProviderId?: string | null;
 	/** Initial generic gateway/API quota balance from settings cache. */
 	initialQuotaBalance?: string | null;
 	/** Initial generic gateway/API quota details from settings cache. */
@@ -213,7 +209,6 @@ export interface UseNarratorPanelWSReturn {
 	activeCompactStart: number | null;
 	pruneBoundaryMessageId: string | null;
 	prunedPercent: number | null;
-	nkpQuotaBalance: number | null;
 	quotaBalance: string | null;
 	detailedQuotaBalance: string | null;
 	// Browser sessions
@@ -378,8 +373,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		narratorTodosJson,
 		narratorTodosToolUseId,
 		isSubagent,
-		initialNkpQuotaBalance,
-		nkpProviderId,
 		initialQuotaBalance,
 		initialDetailedQuotaBalance,
 		customApiProviderId,
@@ -692,9 +685,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		sessionId: string;
 		seq: number;
 	} | null>(null);
-	const [nkpQuotaBalance, setNkpQuotaBalance] = useState<number | null>(
-		initialNkpQuotaBalance ?? null,
-	);
 	const [quotaBalance, setQuotaBalance] = useState<string | null>(initialQuotaBalance ?? null);
 	const [detailedQuotaBalance, setDetailedQuotaBalance] = useState<string | null>(
 		initialDetailedQuotaBalance ?? null,
@@ -706,14 +696,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		setDetailedQuotaBalance(initialDetailedQuotaBalance ?? null);
 		setPaymentRequired(null);
 	}, [narratorId, quotaProviderKey, initialQuotaBalance, initialDetailedQuotaBalance]);
-	// Sync initial NKP quota when the narrator switches to a different NKP provider
-	const prevInitialNkpRef = useRef(initialNkpQuotaBalance);
-	useEffect(() => {
-		if (prevInitialNkpRef.current !== initialNkpQuotaBalance) {
-			prevInitialNkpRef.current = initialNkpQuotaBalance;
-			setNkpQuotaBalance(initialNkpQuotaBalance ?? null);
-		}
-	}, [initialNkpQuotaBalance]);
 	const [retryInfo, setRetryInfo] = useState<RetryInfo | null>(null);
 	const [paymentRequired, setPaymentRequired] = useState<PaymentRequiredInfo | null>(null);
 	const [leakedToolEvent, setLeakedToolEvent] = useState<LeakedToolEvent | null>(null);
@@ -2445,29 +2427,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					},
 				});
 			},
-			onNkpQuotaBalance: (balance) => {
-				setNkpQuotaBalance(balance);
-				// Sync back to settings cache so provider info stays up-to-date
-				if (nkpProviderId && balance != null) {
-					// biome-ignore lint/suspicious/noExplicitAny: dynamic settings shape
-					qc.setQueryData(["settings"], (old: any) => {
-						if (!old?.nkpQuotas) return old;
-						return {
-							...old,
-							nkpQuotas: {
-								...old.nkpQuotas,
-								[nkpProviderId]: {
-									...old.nkpQuotas[nkpProviderId],
-									quotaBalance: balance,
-								},
-							},
-						};
-					});
-				}
-			},
-			onNkpQueueStatus: (position, queueDepth) => {
-				applyQueueStatus(position, queueDepth);
-			},
 			onQuotaBalance: (balance, detailedBalance) => {
 				setQuotaBalance(balance);
 				setDetailedQuotaBalance(detailedBalance ?? null);
@@ -3223,7 +3182,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
-			nkpQuotaBalance,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,
@@ -3268,7 +3226,6 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			activeCompactStart,
 			pruneBoundaryMessageId,
 			prunedPercent,
-			nkpQuotaBalance,
 			quotaBalance,
 			detailedQuotaBalance,
 			browserSessionCount,

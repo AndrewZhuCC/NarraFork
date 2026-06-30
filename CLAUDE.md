@@ -76,7 +76,7 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 - **禁止使用 `npx`** — 可能解析到错误或缺失的包，始终使用 `bunx` 代替
 - **后端：** Hono v4 运行于 Bun.serve()，SQLite 通过 `bun:sqlite`，Drizzle ORM
 - **前端：** React 19 + Mantine v7（暗色主题，indigo 主色），TanStack Router（基于文件），TanStack React Query，@xyflow/react（图可视化），xterm.js（终端），react-i18next（国际化）
-- **AI：** 自定义 Agent Loop 架构（`server/lib/agent/`），支持多提供商：Anthropic API、OpenAI API、Kiro 适配器、Codex、NKP；MCP 集成通过 `@modelcontextprotocol/sdk`
+- **AI：** 自定义 Agent Loop 架构（`server/lib/agent/`），支持多提供商：Anthropic API、OpenAI API、Kiro 适配器、Codex、NUG（统一网关）；MCP 集成通过 `@modelcontextprotocol/sdk`
 - **校验：** Zod v4
 - **代码规范：** Biome v2（tab 缩进，100 字符行宽，推荐规则集）
 - **外部依赖：** git、可选 podman（容器）
@@ -122,7 +122,7 @@ server/
     project-db.ts   — 项目数据库工具
     codex-*.ts      — Codex 认证/管理/使用统计
     kiro-adapter.ts — Kiro 适配器
-    nkp-*.ts        — NKP 令牌管理/扩展
+    kiro-workspace-telemetry.ts — Kiro 协议工作区遥测注入（NUG/Kiro 共用）
     agent/          — 自定义 AI Agent 框架（loop、多提供商、工具注册、19 个内置工具）
     kiro/           — Kiro 平台集成（token 管理、多令牌管理、API 客户端、MCP 客户端、事件流解析）
     mcp/            — MCP 集成（manager、tool-bridge、transports）
@@ -135,8 +135,8 @@ server/
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
-- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Kiro、Codex、NKP）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
-- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NKP 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
+- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Kiro、Codex、NUG）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。

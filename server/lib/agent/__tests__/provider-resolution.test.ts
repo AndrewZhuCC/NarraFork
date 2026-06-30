@@ -7,7 +7,6 @@ mock.module("../anthropic-provider", () => ({ AnthropicProvider: MockProvider })
 mock.module("../cline-provider", () => ({ ClineProvider: MockProvider }));
 mock.module("../codex-provider", () => ({ CodexProvider: MockProvider }));
 mock.module("../kiro-provider", () => ({ KiroProvider: MockProvider }));
-mock.module("../nkp-provider", () => ({ NkpProvider: MockProvider }));
 mock.module("../nug-provider", () => ({ NugProvider: MockProvider }));
 mock.module("../openai-provider", () => ({ OpenAIProvider: MockProvider }));
 

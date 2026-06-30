@@ -177,7 +177,7 @@ describe("KiroTextToolCallStreamParser", () => {
 	});
 
 	test("coerces the reflection-gate `confirm` parameter to a boolean", () => {
-		// Reproduces a leaked DangerConfirm tool call (Kiro/NUG/NKP). The `confirm`
+		// Reproduces a leaked DangerConfirm tool call (Kiro/NUG). The `confirm`
 		// parameter must coerce to boolean true so z.literal(true) schema validation
 		// passes; otherwise the danger gate silently falls back to cancelling.
 		const { tools } = runParser([

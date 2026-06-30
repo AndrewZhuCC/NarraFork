@@ -344,7 +344,7 @@ function isKiroProviderDisabled(): boolean {
  *    too_many_failures / account_suspended / manual), the upstream MCP call
  *    will hang until the 60s search timeout instead of failing fast, which
  *    makes the whole serial channel chain look like it takes ~1 minute before
- *    falling back to the next channel (e.g. NUG/NKP).
+ *    falling back to the next channel (e.g. NUG).
  *
  * Returns true only when the plugin is available, the provider is not disabled,
  * AND the manager reports at least one usable credential. When the snapshot is

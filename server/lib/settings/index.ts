@@ -48,21 +48,17 @@ export {
 	getBuiltinModelContextWindows,
 	getClineProviderConfig,
 	getContextThresholds,
-	getFirstNkpProvider,
 	getFirstNugProvider,
 	getModelContextWindow,
 	getModelMaxCompletionTokens,
-	getNkpProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	hasConfiguredClineProvider,
-	hasConfiguredNkpProvider,
 	hasConfiguredNugProvider,
 	isAnthropicProvider,
 	LARGE_CONTEXT_BOUNDARY,
-	nkpProviderPrefix,
 	nugProviderPrefix,
 	openaiProviderPrefix,
 	parseAggModelValue,
@@ -75,8 +71,6 @@ export {
 	registerCodexModelLister,
 	registerKiroModelChecker,
 	registerKiroModelLister,
-	registerNkpModelChecker,
-	registerNkpModelLister,
 	registerNugModelChecker,
 	registerNugModelLister,
 	registerOpenaiModelChecker,
@@ -346,9 +340,6 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const prov of merged.anthropicProviders ?? []) {
-		if (prov.prefix) activePrefixes.add(prov.prefix);
-	}
-	for (const prov of merged.nkpProviders ?? []) {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const prov of merged.nugProviders ?? []) {

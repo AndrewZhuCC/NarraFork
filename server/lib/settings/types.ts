@@ -135,23 +135,6 @@ export interface AnthropicProviderConfig {
 	extraHeaders?: Record<string, string>;
 }
 
-export interface NKPProviderConfig {
-	/** Unique short ID (8 chars). */
-	id: string;
-	/** User-defined display name, e.g. "NKP Production". */
-	name: string;
-	/** Whether this provider is disabled (keeps config but excluded from resolution). */
-	disabled?: boolean;
-	/** Provider prefix used in model IDs, e.g. "nkp". */
-	prefix: string;
-	/** NKP API Key for authentication. */
-	apiKey: string;
-	/** NKP service base URL, e.g. "http://127.0.0.1:7789". */
-	baseUrl: string;
-	/** Default model (bare name without prefix). */
-	defaultModel: string;
-}
-
 export interface NUGProviderConfig {
 	/** Unique short ID (8 chars). */
 	id: string;
@@ -202,18 +185,12 @@ export interface ClineProviderConfig {
 	enabledModels?: string[];
 }
 
-export type SearchChannelKind =
-	| "native"
-	| "kiro-mcp"
-	| "nug-mcp"
-	| "nkp-mcp"
-	| "custom-api"
-	| "subagent";
+export type SearchChannelKind = "native" | "kiro-mcp" | "nug-mcp" | "custom-api" | "subagent";
 
 export type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
 
 export interface SearchChannelConfig {
-	/** Stable channel ID: native, kiro:local, nug:{id}, nkp:{id}, custom:{id}, subagent. */
+	/** Stable channel ID: native, kiro:local, nug:{id}, custom:{id}, subagent. */
 	id: string;
 	kind: SearchChannelKind;
 	enabled: boolean;
@@ -577,8 +554,6 @@ export interface NarraForkSettings {
 	openaiProviders?: OpenAIProviderConfig[];
 	/** Anthropic native API providers (derived from customApiProviders). */
 	anthropicProviders?: AnthropicProviderConfig[];
-	/** NKP (Native Kiro Proxy) providers — remote Kiro protocol proxies. */
-	nkpProviders?: NKPProviderConfig[];
 	/** NUG (Narrafork Unified Gateway) providers — unified AI gateway. */
 	nugProviders?: NUGProviderConfig[];
 	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */

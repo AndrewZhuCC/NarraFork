@@ -9,7 +9,6 @@ import type {
 	ClineProviderConfig,
 	ModelAggregation,
 	NarraForkSettings,
-	NKPProviderConfig,
 	NUGProviderConfig,
 	OpenAIProviderConfig,
 } from "./types";
@@ -65,14 +64,12 @@ let openaiModelChecker: ((model: string) => boolean) | null = null;
 let kiroModelChecker: ((model: string) => boolean) | null = null;
 let anthropicModelChecker: ((model: string) => boolean) | null = null;
 let codexModelChecker: ((model: string) => boolean) | null = null;
-let nkpModelChecker: ((model: string) => boolean) | null = null;
 let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let kiroModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
 let codexModelLister: (() => string[]) | null = null;
-let nkpModelLister: (() => string[]) | null = null;
 let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
 
@@ -103,12 +100,6 @@ export function registerCodexModelChecker(checker: (model: string) => boolean): 
 }
 export function registerCodexModelLister(lister: () => string[]): void {
 	codexModelLister = lister;
-}
-export function registerNkpModelChecker(checker: (model: string) => boolean): void {
-	nkpModelChecker = checker;
-}
-export function registerNkpModelLister(lister: () => string[]): void {
-	nkpModelLister = lister;
 }
 export function registerNugModelChecker(checker: (model: string) => boolean): void {
 	nugModelChecker = checker;
@@ -201,7 +192,6 @@ function getDisabledProviderPrefixes(): Set<string> {
 		...(s().customApiProviders ?? []),
 		...(s().openaiProviders ?? []),
 		...(s().anthropicProviders ?? []),
-		...(s().nkpProviders ?? []),
 		...(s().nugProviders ?? []),
 		...(s().clineProviders ?? []),
 	]) {
@@ -507,7 +497,6 @@ export function getVisibleModels(): string[] {
 	const openai = openaiModelLister?.() ?? [];
 	const anthropic = anthropicModelLister?.() ?? [];
 	const codex = codexModelLister?.() ?? [];
-	const nkp = nkpModelLister?.() ?? [];
 	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
 	const custom = (s().agent.customModels ?? []).map((m) => {
@@ -516,16 +505,7 @@ export function getVisibleModels(): string[] {
 	});
 	const seen = new Set<string>();
 	const result: string[] = [];
-	for (const v of [
-		...kiro,
-		...openai,
-		...anthropic,
-		...codex,
-		...nkp,
-		...nug,
-		...cline,
-		...custom,
-	]) {
+	for (const v of [...kiro, ...openai, ...anthropic, ...codex, ...nug, ...cline, ...custom]) {
 		if (seen.has(v) || hidden.has(v)) continue;
 		const colonIdx = v.indexOf(":");
 		if (colonIdx > 0 && disabledPrefixes.has(v.slice(0, colonIdx))) continue;
@@ -616,16 +596,6 @@ export function anthropicProviderPrefix(config: AnthropicProviderConfig): string
 	return config.prefix;
 }
 
-export function getNkpProviderConfig(prefix?: string): NKPProviderConfig | undefined {
-	const providers = (s().nkpProviders ?? []).filter((p) => !p.disabled);
-	if (!prefix) return providers[0];
-	return providers.find((p) => p.prefix === prefix);
-}
-
-export function nkpProviderPrefix(config: NKPProviderConfig): string {
-	return config.prefix;
-}
-
 export function getNugProviderConfig(prefix?: string): NUGProviderConfig | undefined {
 	const providers = (s().nugProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
@@ -674,15 +644,6 @@ function hasConfiguredCodexProvider(): boolean {
 	}
 }
 
-export function hasConfiguredNkpProvider(): boolean {
-	const providers = s().nkpProviders ?? [];
-	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
-}
-
-export function getFirstNkpProvider(): NKPProviderConfig | undefined {
-	return (s().nkpProviders ?? []).find((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
-}
-
 export function hasConfiguredNugProvider(): boolean {
 	const providers = s().nugProviders ?? [];
 	return providers.some((p) => !p.disabled && !!p.apiKey && !!p.baseUrl);
@@ -710,11 +671,6 @@ function getConfiguredProviderCandidates(): string[] {
 	}
 	if (hasConfiguredCodexProvider()) {
 		available.add("codex");
-	}
-	if (hasConfiguredNkpProvider()) {
-		for (const p of s().nkpProviders ?? []) {
-			if (!p.disabled && p.apiKey && p.baseUrl) available.add(p.prefix || "nkp");
-		}
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {
@@ -772,7 +728,6 @@ export function resolveProvider(model?: string): string {
 		if (openaiModelChecker?.(bare)) return "openai";
 		if (anthropicModelChecker?.(bare)) return "anthropic";
 		if (codexModelChecker?.(bare)) return "codex";
-		if (nkpModelChecker?.(bare)) return "nkp";
 		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
 	}
@@ -970,13 +925,13 @@ export const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 /**
  * Resolve the summary model's effective context window (tokens).
- * kiro / nkp providers default to 200K; others use the built-in table.
+ * kiro provider defaults to 200K; others use the built-in table.
  */
 export function getSummaryModelContextWindow(): number {
 	const summaryModel = s().agent.summaryModel;
 	const parsed = parseModelId(summaryModel);
 	const prov = parsed.provider ?? "kiro";
-	if (prov === "kiro" || prov.startsWith("nkp")) return 200_000;
+	if (prov === "kiro") return 200_000;
 	return getModelContextWindow(parsed.model, prov) ?? 128_000;
 }
 

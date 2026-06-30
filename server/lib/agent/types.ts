@@ -242,7 +242,7 @@ export type AgentEvent =
 	| { type: "stream_reset" }
 	| {
 			/**
-			 * Diagnostic signal for leaked XML tool calls (Kiro/NUG/NKP).
+			 * Diagnostic signal for leaked XML tool calls (Kiro/NUG).
 			 * - `stream_captured`: the streaming accumulator lifted a `<invoke>` block out of
 			 *   the text deltas successfully (kiro_xml_* tool calls were produced).
 			 * - `recovered`: the streaming layer missed it, but the post-turn stateless safety
@@ -300,8 +300,6 @@ export type AgentEvent =
 			isEstimated?: boolean;
 	  }
 	| { type: "metering"; unit: string; unitPlural: string; usage: number; credentialId?: string }
-	| { type: "nkp_quota_balance"; quotaBalance: number | null }
-	| { type: "nkp_queue_status"; position: number; queueDepth: number }
 	| { type: "queue_status"; position?: number; queueDepth?: number; queueMessage?: string }
 	| { type: "quota_balance"; quotaBalance: string | null; detailedQuotaBalance?: string | null }
 	| { type: "invalid_state"; reason: string; message: string }

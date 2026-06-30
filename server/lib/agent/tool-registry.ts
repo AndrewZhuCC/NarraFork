@@ -198,7 +198,7 @@ function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 
 /**
  * Ensure a JSON Schema has at least one required property.
- * Kiro/NKP APIs truncate tool definitions when the schema has no required
+ * Kiro/NUG APIs truncate tool definitions when the schema has no required
  * parameters, so we inject a dummy `confirm` property when needed.
  */
 export function ensureNonEmptySchema(schema: Record<string, unknown>): Record<string, unknown> {

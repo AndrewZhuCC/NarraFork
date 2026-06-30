@@ -211,8 +211,6 @@ interface NarratorWSCallbacks {
 		linesRemoved: number;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
-	onNkpQuotaBalance?: (quotaBalance: number | null) => void;
-	onNkpQueueStatus?: (position: number, queueDepth: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
 	onPaymentRequired?: (info: {
 		providerId?: string;
@@ -249,7 +247,7 @@ interface NarratorWSCallbacks {
 		maxRetries?: number;
 		delayMs?: number;
 	}) => void;
-	/** Leaked XML tool-call diagnostic (Kiro/NUG/NKP). Not persisted. */
+	/** Leaked XML tool-call diagnostic (Kiro/NUG). Not persisted. */
 	onLeakedToolCall?: (info: {
 		phase: "stream_captured" | "recovered" | "unrecovered";
 		apiRequestId: string;
@@ -769,15 +767,6 @@ export function useNarratorWS(
 								data.usage as number,
 							);
 						}
-						break;
-					case "nkp_quota_balance":
-						callbacksRef.current.onNkpQuotaBalance?.((data.quotaBalance as number) ?? null);
-						break;
-					case "nkp_queue_status":
-						callbacksRef.current.onNkpQueueStatus?.(
-							data.position as number,
-							data.queueDepth as number,
-						);
 						break;
 					case "quota_balance": {
 						const quotaBalance = data.quotaBalance;

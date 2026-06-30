@@ -412,7 +412,6 @@
 	"contextUsageTokensWithWindow": "{{tokens}} / {{window}} tokens",
 	"contextStaleHint": "压缩、清空或删除消息后，上下文展示目前不准确，下次请求服务器后才可获知准确数值。",
 	"estimated": "估算",
-	"nkpQuotaBalance": "NKP 余额: ${{balance}}",
 	"quotaBalance": "API 余额：{{balance}}",
 	"recharge": {
 		"title": "NUG 充值",
@@ -562,8 +561,8 @@
 	"splitDown": "向下分割",
 	"closePanel": "关闭面板",
 	"lastTurnDuration": "上轮耗时 {{duration}}",
-	"nkpQueuePosition": "排队中 第{{position}}位",
-	"nkpQueuePositionWithDepth": "排队中 第{{position}}位 / 共{{queueDepth}}个",
+	"queuePosition": "排队中 第{{position}}位",
+	"queuePositionWithDepth": "排队中 第{{position}}位 / 共{{queueDepth}}个",
 	"fileMod_title": "文件修改",
 	"fileMod_tabSummary": "汇总",
 	"fileMod_tabApproval": "审批",

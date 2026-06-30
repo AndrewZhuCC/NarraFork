@@ -4,7 +4,6 @@ import type {
 	AnthropicProviderState,
 	CustomApiProtocol,
 	CustomApiProviderState,
-	NKPProviderState,
 	OpenAIProviderState,
 } from "./types";
 
@@ -20,7 +19,6 @@ export interface ProvidersState {
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
-	nkpProviders: NKPProviderState[];
 	nugProviders: NUGProviderState[];
 	hiddenModels: Set<string>;
 	customModels: CustomModelEntry[];
@@ -34,7 +32,6 @@ export interface SavedSnapshot {
 	customApiProviders: CustomApiProviderState[];
 	openaiProviders: OpenAIProviderState[];
 	anthropicProviders: AnthropicProviderState[];
-	nkpProviders: NKPProviderState[];
 	nugProviders: NUGProviderState[];
 	hiddenModels: string[];
 	customModels: CustomModelEntry[];
@@ -51,7 +48,6 @@ export type ProvidersAction =
 	| { type: "SET_CUSTOM_API_PROVIDERS"; providers: Updater<CustomApiProviderState[]> }
 	| { type: "SET_OPENAI_PROVIDERS"; providers: Updater<OpenAIProviderState[]> }
 	| { type: "SET_ANTHROPIC_PROVIDERS"; providers: Updater<AnthropicProviderState[]> }
-	| { type: "SET_NKP_PROVIDERS"; providers: Updater<NKPProviderState[]> }
 	| { type: "SET_NUG_PROVIDERS"; providers: Updater<NUGProviderState[]> }
 	| { type: "TOGGLE_HIDDEN"; modelVal: string }
 	| { type: "BATCH_TOGGLE_HIDDEN"; modelValues: string[]; hidden: boolean }
@@ -221,7 +217,6 @@ export const initialProvidersState: ProvidersState = {
 	customApiProviders: [],
 	openaiProviders: [],
 	anthropicProviders: [],
-	nkpProviders: [],
 	nugProviders: [],
 	hiddenModels: new Set(),
 	customModels: [],
@@ -284,17 +279,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const splitCustomApiProviders = deriveSplitProviders(customApiProviders);
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const nkp = (s.nkpProviders ?? []).map((p: any) => ({
-				id: p.id ?? "",
-				name: p.name ?? "",
-				prefix: p.prefix ?? "nkp",
-				apiKey: p.apiKey ?? "",
-				baseUrl: p.baseUrl ?? "",
-				defaultModel: p.defaultModel ?? "",
-				disabled: p.disabled ?? false,
-			}));
-
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			const nug = (s.nugProviders ?? []).map((p: any) => ({
 				id: p.id ?? "",
 				name: p.name ?? "",
@@ -342,7 +326,7 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			const disabledProviders = new Set<string>((agent.disabledProviders as string[]) ?? []);
 
 			// Sync: multi-instance providers with disabled=true → disabledProviders
-			for (const p of [...openai, ...anthropic, ...nkp, ...nug]) {
+			for (const p of [...openai, ...anthropic, ...nug]) {
 				if (p.disabled && p.prefix) disabledProviders.add(p.prefix);
 			}
 
@@ -350,7 +334,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				customApiProviders,
 				openaiProviders: splitCustomApiProviders.openai,
 				anthropicProviders: splitCustomApiProviders.anthropic,
-				nkpProviders: nkp,
 				nugProviders: nug,
 				hiddenModels: new Set(hidden),
 				customModels: custom,
@@ -377,12 +360,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			return {
 				...state,
 				anthropicProviders: resolveUpdater(state.anthropicProviders, action.providers),
-			};
-
-		case "SET_NKP_PROVIDERS":
-			return {
-				...state,
-				nkpProviders: resolveUpdater(state.nkpProviders, action.providers),
 			};
 
 		case "SET_NUG_PROVIDERS":
@@ -461,7 +438,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 			};
 
 			const nextCustomApi = syncDisabled(state.customApiProviders);
-			const nextNkp = syncDisabled(state.nkpProviders);
 			const nextNug = syncDisabled(state.nugProviders);
 			const customApiChanged = nextCustomApi !== state.customApiProviders;
 
@@ -483,7 +459,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 					: state.customApiProviders,
 				openaiProviders: nextOpenai,
 				anthropicProviders: nextAnthropic,
-				nkpProviders: nextNkp,
 				nugProviders: nextNug,
 				disabledProviders: next,
 			};
@@ -496,7 +471,6 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				customApiProviders: snap.customApiProviders.map((p) => ({ ...p })),
 				openaiProviders: snap.openaiProviders.map((p) => ({ ...p })),
 				anthropicProviders: snap.anthropicProviders.map((p) => ({ ...p })),
-				nkpProviders: snap.nkpProviders.map((p) => ({ ...p })),
 				nugProviders: snap.nugProviders.map((p) => ({ ...p })),
 				hiddenModels: new Set(snap.hiddenModels),
 				customModels: snap.customModels.map((m) => ({ ...m })),
@@ -526,7 +500,6 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (!state.initialized) return false;
 		// Fast path: array length comparison
 		if (state.customApiProviders.length !== savedSnapshot.customApiProviders.length) return true;
-		if (state.nkpProviders.length !== savedSnapshot.nkpProviders.length) return true;
 		if (state.nugProviders.length !== savedSnapshot.nugProviders.length) return true;
 		if (state.hiddenModels.size !== savedSnapshot.hiddenModels.length) return true;
 		if (state.customModels.length !== savedSnapshot.customModels.length) return true;
@@ -537,8 +510,6 @@ export function useIsDirty(state: ProvidersState, savedSnapshot: SavedSnapshot):
 		if (
 			JSON.stringify(state.customApiProviders) !== JSON.stringify(savedSnapshot.customApiProviders)
 		)
-			return true;
-		if (JSON.stringify(state.nkpProviders) !== JSON.stringify(savedSnapshot.nkpProviders))
 			return true;
 		if (JSON.stringify(state.nugProviders) !== JSON.stringify(savedSnapshot.nugProviders))
 			return true;
@@ -572,7 +543,6 @@ export function createSnapshot(state: ProvidersState): SavedSnapshot {
 		customApiProviders: state.customApiProviders.map((p) => ({ ...p })),
 		openaiProviders: state.openaiProviders.map((p) => ({ ...p })),
 		anthropicProviders: state.anthropicProviders.map((p) => ({ ...p })),
-		nkpProviders: state.nkpProviders.map((p) => ({ ...p })),
 		nugProviders: state.nugProviders.map((p) => ({ ...p })),
 		hiddenModels: [...state.hiddenModels],
 		customModels: state.customModels.map((m) => ({ ...m })),
@@ -605,12 +575,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 				| AnthropicProviderState[]
 				| ((prev: AnthropicProviderState[]) => AnthropicProviderState[]),
 		) => dispatch({ type: "SET_ANTHROPIC_PROVIDERS", providers: updater }),
-		[dispatch],
-	);
-
-	const setNkpProviders = useCallback(
-		(updater: NKPProviderState[] | ((prev: NKPProviderState[]) => NKPProviderState[])) =>
-			dispatch({ type: "SET_NKP_PROVIDERS", providers: updater }),
 		[dispatch],
 	);
 
@@ -662,7 +626,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
-			setNkpProviders,
 			setNugProviders,
 			toggleHidden,
 			batchToggleHidden,
@@ -676,7 +639,6 @@ export function useProvidersDispatch(dispatch: React.Dispatch<ProvidersAction>) 
 			setCustomApiProviders,
 			setOpenaiProviders,
 			setAnthropicProviders,
-			setNkpProviders,
 			setNugProviders,
 			toggleHidden,
 			batchToggleHidden,

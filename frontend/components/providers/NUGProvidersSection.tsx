@@ -979,7 +979,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 									)}
 									{!p.disabled && providerModelCount > 0 && (
 										<Badge size="xs" variant="light">
-											{t("nkpModelsCount", { count: providerModelCount })}
+											{t("nugModelsCount", { count: providerModelCount })}
 										</Badge>
 									)}
 									{p.nugUsername && (
@@ -1149,7 +1149,7 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 								</Button>
 								{providerModelCount > 0 && (
 									<Text size="xs" c="dimmed">
-										{t("nkpModelsCount", { count: providerModelCount })}
+										{t("nugModelsCount", { count: providerModelCount })}
 									</Text>
 								)}
 							</Group>

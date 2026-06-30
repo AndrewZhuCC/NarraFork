@@ -367,7 +367,6 @@ function isMeaningfulStreamEvent(parsed: ParsedStreamEvent): boolean {
 		parsed.reasoning ||
 		parsed.webSearch ||
 		parsed.imageGeneration ||
-		parsed.nkpQueue ||
 		parsed.queueStatus
 	);
 }
@@ -2065,7 +2064,7 @@ export async function* agentLoop(
 		}
 
 		// ── Transient-error retry loop ──
-		// For stateless providers (kiro, nkp, anthropic, openai-completions, cline)
+		// For stateless providers (kiro, anthropic, openai-completions, cline)
 		// we can safely retry the exact same provider.chat() call with identical
 		// history, content, and toolResults — no server-side state was mutated.
 		// Stateful providers (responses/codex) cannot retry here because the
@@ -2145,7 +2144,7 @@ export async function* agentLoop(
 			requestMeterUnit = undefined;
 
 			// Initialize request dump collector when explicitly enabled, OR when the provider
-			// may leak XML tool calls (Kiro/NUG/NKP) so leaked-tool diagnostics always have a
+			// may leak XML tool calls (Kiro/NUG) so leaked-tool diagnostics always have a
 			// bounded raw dump to persist on detection. Providers write bodyText/events through
 			// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
 			requestDump =
@@ -2801,17 +2800,7 @@ export async function* agentLoop(
 							credentialId,
 						};
 					}
-					if (parsed.nkpQuotaBalance !== undefined) {
-						yield { type: "nkp_quota_balance", quotaBalance: parsed.nkpQuotaBalance };
-					}
-					if (parsed.nkpQueue) {
-						yield {
-							type: "nkp_queue_status",
-							position: parsed.nkpQueue.position,
-							queueDepth: parsed.nkpQueue.queueDepth,
-						};
-					}
-					// Generic gateway-injected queue/quota events (OpenAI/Anthropic via unified gateway)
+					// Generic gateway-injected queue/quota events (via unified gateway)
 					if (parsed.queueStatus) {
 						yield {
 							type: "queue_status",
@@ -3289,12 +3278,12 @@ export async function* agentLoop(
 			// We base this on what actually landed as persistable output, NOT on the
 			// optimistic `sawMeaningfulResponse` flag. `sawMeaningfulResponse` is set by
 			// `isMeaningfulStreamEvent` the moment any "interesting" stream event arrives
-			// (text/toolUseChunk/reasoning/webSearch/imageGeneration/nkpQueue/queueStatus),
+			// (text/toolUseChunk/reasoning/webSearch/imageGeneration/queueStatus),
 			// but some of those events never produce committed content:
 			//   - a `toolUseChunk` carrying a toolUseId but no `name` never creates an
 			//     accumulator (loop ~L2285) and is never pushed to `toolUses`, so it leaves
 			//     no orphaned entry either;
-			//   - pure `nkpQueue`/`queueStatus` status events carry no content at all.
+			//   - pure `queueStatus` status events carry no content at all.
 			// In those cases the optimistic flag would suppress the empty-response guard and
 			// the turn would silently persist an empty assistant message and go idle. Compute
 			// the real picture from the accumulators instead so the guard still fires.
@@ -3553,7 +3542,7 @@ export async function* agentLoop(
 		// multiple times in one turn, collapse them before any drain/execution logic below.
 		dedupeToolUsesInPlace(toolUses, effectiveProvider, effectiveModel);
 
-		// Safety net for leaked XML tool calls (Kiro/NUG/NKP): the streaming accumulator
+		// Safety net for leaked XML tool calls (Kiro/NUG): the streaming accumulator
 		// lifts `<invoke>...</invoke>` blocks out of the text deltas as they stream, but if
 		// anything prevented that (mid-block retry, an event-shape edge case, or a buffer
 		// boundary the streaming parser couldn't reconcile), a complete block can still be
@@ -3618,7 +3607,7 @@ export async function* agentLoop(
 		}
 
 		// ── Estimate token usage when provider doesn't report it ──
-		// Some providers (e.g., Kiro, NKP) don't report token usage in their API responses.
+		// Some providers (e.g., Kiro) don't report token usage in their API responses.
 		// For these cases, we estimate based on text length to provide usage statistics.
 		if (!requestUsage) {
 			const historyText = JSON.stringify(history);

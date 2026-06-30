@@ -170,8 +170,6 @@ function getProviderColor(provider: string | null) {
 			return "blue";
 		case "codex":
 			return "cyan";
-		case "nkp":
-			return "grape";
 		default:
 			return "gray";
 	}
@@ -621,7 +619,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 								<DetailField
 									label={t("usageHistoryTableCost")}
 									value={
-										record.provider === "kiro" || record.provider === "nkp"
+										record.provider === "kiro"
 											? record.meterUsage != null
 												? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
 												: "-"
@@ -770,7 +768,7 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										</Group>
 									</Table.Td>
 									<Table.Td>
-										{record.provider === "kiro" || record.provider === "nkp" ? (
+										{record.provider === "kiro" ? (
 											<Text size="sm" fw={500} c={record.meterUsage ? "blue" : "dimmed"}>
 												{record.meterUsage != null
 													? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`

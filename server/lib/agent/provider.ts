@@ -3,7 +3,6 @@ import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
 	getClineProviderConfig,
-	getNkpProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
@@ -16,7 +15,6 @@ import { AnthropicProvider } from "./anthropic-provider";
 import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
 import { KiroProvider } from "./kiro-provider";
-import { NkpProvider } from "./nkp-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
@@ -93,13 +91,9 @@ export interface ParsedStreamEvent {
 	invalidState?: { reason: string; message: string };
 	/** Kiro credential ID that served this request */
 	credentialId?: string;
-	/** NKP quota balance returned after each request */
-	nkpQuotaBalance?: number | null;
-	/** NKP queue status — sent while waiting for a concurrency slot */
-	nkpQueue?: { position: number; queueDepth: number };
-	/** Gateway-injected queue status (generic, for non-NKP providers via unified gateway) */
+	/** Gateway-injected queue status (generic, for providers via unified gateway) */
 	queueStatus?: { position?: number; queueDepth?: number; queueMessage?: string };
-	/** Gateway-injected quota balance (generic, for non-NKP providers via unified gateway).
+	/** Gateway-injected quota balance (generic, for providers via unified gateway).
 	 *  Accepts arbitrary string values (e.g. "$12.50", "100 credits") from the gateway. */
 	quotaBalance?: string | null;
 	/** Optional multiline quota details to show in the quota tooltip. */
@@ -247,7 +241,7 @@ export interface ProviderAdapter {
 
 	/**
 	 * True when this provider can leak XML tool calls (`<invoke>...</invoke>`) into the
-	 * assistant text stream instead of using native tool-use fields (Kiro/NUG/NKP). The
+	 * assistant text stream instead of using native tool-use fields (Kiro/NUG). The
 	 * agent loop uses this to always collect a bounded raw dump so leaked-tool diagnostics
 	 * have downloadable SSE data, and to run the post-turn stateless recovery safety net.
 	 */
@@ -371,11 +365,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new AnthropicProvider(anthropicConfig);
 	}
 
-	const nkpConfig = getNkpProviderConfig(provider);
-	if (nkpConfig) {
-		return new NkpProvider(nkpConfig);
-	}
-
 	const nugConfig = getNugProviderConfig(provider);
 	if (nugConfig) {
 		return new NugProvider(nugConfig);
@@ -431,9 +420,6 @@ function defaultModelForProvider(provider: string): string | null {
 		getAnthropicProviderConfig(provider)?.defaultModel,
 	);
 	if (anthropicDefault) return anthropicDefault;
-
-	const nkpDefault = prefixProviderModel(provider, getNkpProviderConfig(provider)?.defaultModel);
-	if (nkpDefault) return nkpDefault;
 
 	const nugDefault = prefixProviderModel(provider, getNugProviderConfig(provider)?.defaultModel);
 	if (nugDefault) return nugDefault;
