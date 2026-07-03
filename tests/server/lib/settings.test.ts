@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { deepMerge } from "../../../server/lib/settings";
+import { deepMerge, stripObsoleteSettingsKeys } from "../../../server/lib/settings";
 
 describe("settings deepMerge", () => {
 	it("merges nested objects", () => {
@@ -33,5 +33,26 @@ describe("settings deepMerge", () => {
 		expect(result.a).toBe(2);
 		// biome-ignore lint/suspicious/noExplicitAny: test utility cast
 		expect((result as any).unknown).toBe("foo");
+	});
+});
+
+describe("stripObsoleteSettingsKeys", () => {
+	it("removes legacy NKP settings without touching supported provider settings", () => {
+		const value: Record<string, unknown> = {
+			customApiProviders: [],
+			nugProviders: [],
+			nkpProviders: [{ id: "old-nkp" }],
+			nkpQuotas: { "old-nkp": { quotaBalance: "1" } },
+		};
+
+		expect(stripObsoleteSettingsKeys(value)).toBe(true);
+		expect(value).toEqual({ customApiProviders: [], nugProviders: [] });
+	});
+
+	it("reports unchanged when no obsolete NKP keys are present", () => {
+		const value: Record<string, unknown> = { customApiProviders: [] };
+
+		expect(stripObsoleteSettingsKeys(value)).toBe(false);
+		expect(value).toEqual({ customApiProviders: [] });
 	});
 });
