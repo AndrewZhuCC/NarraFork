@@ -6,7 +6,7 @@
 
 - `index.md`：总览
 - `tasks.json`：最小任务队列
-- `protected_requirements`：模拟只读监督要求
+- `behavior_fence`：模拟行为护栏（agent 只读 / UI 可编辑）
 - `HOW_TO_USE_SPEC.md`：使用说明
 - `designs/`：详细设计
 

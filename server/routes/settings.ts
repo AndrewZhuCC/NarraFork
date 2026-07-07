@@ -217,6 +217,12 @@ const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
+		proxy: z
+			.object({
+				mode: z.enum(["system", "direct", "custom"]),
+				url: webFetchProxyUrlSchema,
+			})
+			.optional(),
 		paths: z
 			.object({ defaultProjectDir: z.string().min(1) })
 			.partial()
@@ -1070,6 +1076,10 @@ settingsRoutes.patch("/", async (c) => {
 			// Array — replace entirely, don't merge
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			(merged as any)[key] = val;
+		} else if (key === "proxy") {
+			// Replace entirely so switching modes drops the stale custom url.
+			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			(merged as any).proxy = val;
 		} else if (key === "vnet" && val && typeof val === "object" && !Array.isArray(val)) {
 			const vnetPatch = val as NonNullable<NarraForkSettings["vnet"]>;
 			merged.vnet = {

@@ -7,6 +7,7 @@ import type {
 	KiroToolResult,
 } from "../kiro-adapter";
 import { prepareKiroWorkspaceState } from "../kiro-workspace-telemetry";
+import { resolveProxyForUrl } from "../net/proxy";
 import {
 	getNugCachedModelHash,
 	type ResolvedNugModelMeta,
@@ -194,6 +195,21 @@ export class NugProvider implements ProviderAdapter {
 
 	constructor(config: NUGProviderConfig) {
 		this.config = config;
+	}
+
+	/**
+	 * Proxy-aware fetch. Resolves the global outbound proxy per target URL so
+	 * NUG requests follow the global proxy policy; local gateways (127.0.0.1)
+	 * are auto-exempted via loopback/NO_PROXY, remote NUG hosts go through it.
+	 */
+	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+		const target = input instanceof Request ? input.url : input;
+		const proxy = resolveProxyForUrl(target);
+		if (proxy) {
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			return fetch(input, { ...init, proxy } as any);
+		}
+		return fetch(input, init);
 	}
 
 	/**
@@ -518,7 +534,7 @@ export class NugProvider implements ProviderAdapter {
 
 		const bodyText = JSON.stringify(body);
 		params.onRequestStart?.();
-		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers,
 			body: bodyText,
@@ -741,7 +757,7 @@ export class NugProvider implements ProviderAdapter {
 
 		prepareKiroWorkspaceState(request);
 		const body = { model: meta.routedModel, ...request };
-		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
 			body: JSON.stringify(body),
@@ -860,7 +876,7 @@ export class NugProvider implements ProviderAdapter {
 
 		prepareKiroWorkspaceState(request);
 		const body = { model: meta.routedModel, ...request };
-		const response = await fetch(`${this.baseUrl}/v1/kiro/chat`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
 			method: "POST",
 			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
 			body: JSON.stringify(body),
@@ -900,7 +916,7 @@ export class NugProvider implements ProviderAdapter {
 	// === NUG-specific methods (for frontend proxy routes) ===
 
 	async getChannelsHealth(): Promise<{ channels: NugChannelHealthStatus[] }> {
-		const response = await fetch(`${this.baseUrl}/v1/channels/health`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/channels/health`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
@@ -911,7 +927,7 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	async getQuota(): Promise<NugQuota> {
-		const response = await fetch(`${this.baseUrl}/v1/quota`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/quota`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
@@ -922,7 +938,7 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	async getBillingConfig(): Promise<NugBillingConfig> {
-		const response = await fetch(`${this.baseUrl}/v1/billing/config`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/billing/config`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
@@ -937,7 +953,7 @@ export class NugProvider implements ProviderAdapter {
 		provider: string;
 		channel?: "alipay" | "wechat" | string;
 	}): Promise<NugBillingOrderResponse> {
-		const response = await fetch(`${this.baseUrl}/v1/billing/orders`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/billing/orders`, {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -957,7 +973,7 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	async getBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
-		const response = await fetch(
+		const response = await this.pfetch(
 			`${this.baseUrl}/v1/billing/orders/${encodeURIComponent(orderId)}`,
 			{
 				headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
@@ -971,7 +987,7 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	async repayBillingOrder(orderId: string): Promise<NugBillingOrderResponse> {
-		const response = await fetch(
+		const response = await this.pfetch(
 			`${this.baseUrl}/v1/billing/orders/${encodeURIComponent(orderId)}/repay`,
 			{
 				method: "POST",
@@ -997,7 +1013,7 @@ export class NugProvider implements ProviderAdapter {
 		url.searchParams.set("limit", String(limit));
 		url.searchParams.set("offset", String(offset));
 		if (period) url.searchParams.set("period", period);
-		const response = await fetch(url.toString(), {
+		const response = await this.pfetch(url.toString(), {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
@@ -1010,7 +1026,7 @@ export class NugProvider implements ProviderAdapter {
 	async getUsageSummary(period?: string): Promise<NugUsageSummary> {
 		const url = new URL(`${this.baseUrl}/v1/usage/summary`);
 		if (period) url.searchParams.set("period", period);
-		const response = await fetch(url.toString(), {
+		const response = await this.pfetch(url.toString(), {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {
@@ -1026,7 +1042,7 @@ export class NugProvider implements ProviderAdapter {
 		hash?: string;
 		usdRate?: number;
 	}> {
-		const response = await fetch(`${this.baseUrl}/v1/models`, {
+		const response = await this.pfetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
 		});
 		if (!response.ok) {

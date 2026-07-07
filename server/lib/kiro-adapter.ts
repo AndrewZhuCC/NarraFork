@@ -6,6 +6,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { getOutboundProxy } from "./net/proxy";
 import { registerKiroModelChecker, registerKiroModelLister, settings } from "./settings";
 
 // --- Inlined types (mirror of kiro/types.ts public surface) ---
@@ -298,8 +299,8 @@ if (!isKiroPluginDisabled) {
 		const kiroPath = `./kiro/${"index"}`;
 		const loaded: KiroModule = await import(kiroPath);
 		mod = loaded;
-		// Register proxy resolver so kiro plugin reads proxy from settings at runtime
-		loaded.registerProxyResolver(() => settings.kiro?.proxy);
+		// Register proxy resolver so kiro plugin reads the global outbound proxy at runtime
+		loaded.registerProxyResolver(() => getOutboundProxy());
 	} catch {
 		// kiro directory absent — plugin unavailable
 	}

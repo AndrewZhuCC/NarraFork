@@ -36,7 +36,6 @@ import { useAllModels } from "../../hooks/useModels";
 import { useSettingsFeatureCapability } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
-import { normalizeProxyUrl } from "../../lib/proxy";
 import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/settings/providers")({
@@ -86,7 +85,6 @@ function prepareProviderSettingsSave(state: ProvidersState, savedSnapshot: Saved
 	const normalizedCustomApiProviders = state.customApiProviders.map((provider) => ({
 		...provider,
 		baseUrl: normalizeUrlProtocol(provider.baseUrl) ?? "",
-		proxy: normalizeProxyUrl(provider.proxy) ?? "",
 	}));
 	const normalizedNugProviders = state.nugProviders.map((provider) => ({
 		...provider,

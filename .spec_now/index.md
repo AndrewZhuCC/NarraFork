@@ -7,7 +7,7 @@ NarraFork 的 plan、todo、goal 不应继续作为三套并列心智模型暴�
 - 用数据库存储 Work Spec。
 - 用 `spec://` 虚拟 URL 让模型通过现有 Read/Edit/Write/Grep 访问。
 - 用 `spec://tasks.json` 承担任务调度和自动 continuation。
-- 用 `spec://protected_requirements` 保存只读监督原则。
+- 用 `spec://behavior_fence` 保存行为护栏（对 agent 只读，用户可在 UI 编辑，编辑通过 sidecar 提醒 agent）。
 - 用 taskReflection 替代现有 goal completion reflection。
 - fork narrator/chapter 时，spec 虚拟目录一起 fork，并采用写时复制。
 
@@ -19,7 +19,7 @@ NarraFork 的 plan、todo、goal 不应继续作为三套并列心智模型暴�
 | --- | --- | --- |
 | `spec://index.md` | `.spec_now/index.md` | spec 总览 |
 | `spec://tasks.json` | `.spec_now/tasks.json` | 最小任务队列 |
-| `spec://protected_requirements` | `.spec_now/protected_requirements` | 只读监督要求 |
+| `spec://behavior_fence` | `.spec_now/behavior_fence` | 行为护栏（agent 只读 / UI 可编辑） |
 | `spec://HOW_TO_USE_SPEC.md` | `.spec_now/HOW_TO_USE_SPEC.md` | 内置使用说明 |
 | `spec://designs/*.md` | `.spec_now/designs/*.md` | 模型自行组织的详细设计 |
 

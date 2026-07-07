@@ -61,7 +61,8 @@ kiroRoutes.get("/status", (c) => {
 		snapshot,
 		usageCache: kiroGetAllUsageCache(),
 		usageQueue: kiroUsageQueueSnapshot(),
-		globalProxy: settings.kiro?.proxy,
+		// Backward-compat: surface the custom proxy URL from the global policy.
+		globalProxy: settings.proxy?.mode === "custom" ? settings.proxy.url : undefined,
 	};
 
 	// Auto-fetch usage for credentials that have never been queried
@@ -317,8 +318,11 @@ kiroRoutes.post("/global-proxy", async (c) => {
 		return c.json({ error: parsed.error.issues[0]?.message ?? "Invalid proxy URL" }, 400);
 	}
 
-	settings.kiro = settings.kiro || { credentialsPath: "", configPath: "" };
-	settings.kiro.proxy = parsed.data.proxy || undefined;
+	// Backward-compat: map the legacy per-provider proxy onto the unified global
+	// policy. A URL switches to "custom"; clearing it falls back to "system".
+	settings.proxy = parsed.data.proxy
+		? { mode: "custom", url: parsed.data.proxy }
+		: { mode: "system" };
 	saveSettings(settings);
 
 	return c.json({ ok: true });

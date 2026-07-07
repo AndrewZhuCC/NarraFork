@@ -42,5 +42,5 @@
 
 - `.spec_now/index.md`：总览和设计入口。
 - `.spec_now/tasks.json`：唯一任务调度源。
-- `.spec_now/protected_requirements`：模拟只读监督要求。
+- `.spec_now/behavior_fence`：模拟行为护栏（对 agent 只读，用户可在 UI 编辑）。
 - `.spec_now/designs/*.md`：复杂设计细节，可按需创建。
