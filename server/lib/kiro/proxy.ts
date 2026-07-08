@@ -1,5 +1,7 @@
 // Proxy resolver — decoupled from index.ts to avoid circular imports.
 
+import { recordRequestUrl } from "../agent/request-url-tracker";
+
 /** Callback to resolve the current proxy URL at runtime (registered by adapter). */
 let proxyResolver: (() => string | undefined) | null = null;
 
@@ -18,6 +20,8 @@ export function getProxy(): string | undefined {
  * Centralised here so all kiro modules share a single implementation.
  */
 export function pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+	const target = input instanceof Request ? input.url : input;
+	recordRequestUrl(String(target), init?.method);
 	const proxy = getProxy();
 	if (proxy) {
 		// Bun's fetch natively supports `proxy` — cast to satisfy the standard RequestInit type.

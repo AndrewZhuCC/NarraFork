@@ -20,7 +20,6 @@ NarraFork 的 plan、todo、goal 不应继续作为三套并列心智模型暴�
 | `spec://index.md` | `.spec_now/index.md` | spec 总览 |
 | `spec://tasks.json` | `.spec_now/tasks.json` | 最小任务队列 |
 | `spec://behavior_fence` | `.spec_now/behavior_fence` | 行为护栏（agent 只读 / UI 可编辑） |
-| `spec://HOW_TO_USE_SPEC.md` | `.spec_now/HOW_TO_USE_SPEC.md` | 内置使用说明 |
 | `spec://designs/*.md` | `.spec_now/designs/*.md` | 模型自行组织的详细设计 |
 
 ## 公开给模型的最小任务格式

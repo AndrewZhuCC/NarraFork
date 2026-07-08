@@ -30,8 +30,10 @@ import {
 } from "../../hooks/usePlatform";
 import { api } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
+import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
@@ -165,6 +167,14 @@ export const KiroSection = React.memo(function KiroSection({
 		mutationFn: (mode: "priority" | "balanced") => api.kiroSetLoadBalancingMode(mode),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
 	});
+	const kiroProxy = settings?.kiro?.proxy as ProxyOverride | undefined;
+	const proxyMut = useMutation({
+		mutationFn: (proxy: ProxyOverride | undefined) => api.updateSettings({ kiro: { proxy } }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+	});
 	const priorityMut = useMutation({
 		mutationFn: ({ id, priority }: { id: string; priority: number }) =>
 			api.kiroSetPriority(id, priority),
@@ -267,6 +277,13 @@ export const KiroSection = React.memo(function KiroSection({
 					{kiroPluginBridgeRequirementReason}
 				</Alert>
 			)}
+
+			{/* Proxy override */}
+			<ProxyOverrideField
+				value={kiroProxy}
+				onChange={(next) => proxyMut.mutate(next)}
+				disabled={proxyMut.isPending}
+			/>
 
 			{/* Load balancing mode */}
 			{snapshot && (

@@ -9,7 +9,6 @@
 - `spec://index.md`：总览入口，可编辑但可被结构校验。
 - `spec://tasks.json`：最小任务队列，可编辑但受 protected task 规则约束。
 - `spec://behavior_fence`：行为护栏，对 agent 只读；用户可在 UI 编辑，编辑通过 sidecar 提醒 agent。
-- `spec://HOW_TO_USE_SPEC.md`：系统内置只读说明。
 - `spec://designs/*`：模型自行创建的设计文件。
 
 ## 数据库语义

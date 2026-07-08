@@ -54,6 +54,7 @@ export interface InstanceSettingsState {
 	maxTransientRetries: number;
 	silentToolCallThreshold: number;
 	behaviorFenceInterval: number;
+	tasksReminderInterval: number;
 	behaviorFenceAttachTasks: boolean;
 	retryBackoffCeilMs: number;
 	firstTokenTimeoutMs: number;
@@ -124,7 +125,7 @@ function makeDefaults(): InstanceSettingsState {
 		defaultModel: "kiro:claude-sonnet-4.5",
 		permissionMode: "acceptEdits",
 		summaryModel: "kiro:claude-haiku-4.5",
-		maxTurns: 200,
+		maxTurns: 1000,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
 		subagentAllowedModels: { explore: [], plan: [], general: [], search: [] },
@@ -148,6 +149,7 @@ function makeDefaults(): InstanceSettingsState {
 		maxTransientRetries: 10,
 		silentToolCallThreshold: 20,
 		behaviorFenceInterval: -1,
+		tasksReminderInterval: 15,
 		behaviorFenceAttachTasks: true,
 		retryBackoffCeilMs: 20000,
 		firstTokenTimeoutMs: 300000,
@@ -218,7 +220,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? "kiro:claude-haiku-4.5"),
-				maxTurns: settings.agent?.maxTurns ?? 200,
+				maxTurns: settings.agent?.maxTurns ?? 1000,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
 				subagentAllowedModels: {
@@ -249,6 +251,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				maxTransientRetries: settings.agent?.maxTransientRetries ?? 10,
 				silentToolCallThreshold: settings.agent?.silentToolCallThreshold ?? 20,
 				behaviorFenceInterval: settings.agent?.behaviorFenceInterval ?? -1,
+				tasksReminderInterval: settings.agent?.tasksReminderInterval ?? 15,
 				behaviorFenceAttachTasks: settings.agent?.behaviorFenceAttachTasks ?? true,
 				retryBackoffCeilMs: settings.agent?.retryBackoffCeilMs ?? 20000,
 				firstTokenTimeoutMs: settings.agent?.firstTokenTimeoutMs ?? 300000,
@@ -348,6 +351,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					dangerSkipReadOnlyConfirmations: state.dangerSkipReadOnlyConfirmations,
 					autoContinuationMode: state.autoContinuationMode,
 					behaviorFenceInterval: state.behaviorFenceInterval,
+					tasksReminderInterval: state.tasksReminderInterval,
 					behaviorFenceAttachTasks: state.behaviorFenceAttachTasks,
 					defaultReasoningEffort:
 						(state.agentDefaultReasoningEffort as "none" | "low" | "medium" | "high" | "xhigh") ||
