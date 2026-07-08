@@ -4,7 +4,7 @@
 
 ## 用户意图
 
-- 将 NarraFork 当前的 plan、todo、goal 收敛为一套 Living Work Spec 机制。
+- 将 NarraFork 当前的 plan、todo、goal 收敛为一套 Dynamic Spec 机制。
 - 不通过增加大量专用工具解决问题；优先复用 Read、Edit、Write、Grep 等现有文件工具。
 - Work Spec 存储在数据库中，通过 `spec://` 虚拟 URL 暴露给模型访问。
 - spec 虚拟目录随 narrator/chapter fork，并支持写时复制。

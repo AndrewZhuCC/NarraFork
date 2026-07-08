@@ -211,24 +211,37 @@ describe("kiro reasoning — receive side (parseKiroStreamEvent)", () => {
 });
 
 describe("kiro reasoning — buildKiroReasoningContent helper", () => {
+	const SRC = "nug:kiro";
+
 	test("returns undefined when there is nothing to echo", () => {
-		expect(buildKiroReasoningContent(undefined, undefined)).toBeUndefined();
-		expect(buildKiroReasoningContent([], [])).toBeUndefined();
+		expect(buildKiroReasoningContent(undefined, undefined, SRC)).toBeUndefined();
+		expect(buildKiroReasoningContent([], [], SRC)).toBeUndefined();
 	});
 
-	test("merges reasoning text and keeps the last signature", () => {
+	test("merges reasoning text and keeps the last matching-source signature", () => {
 		const result = buildKiroReasoningContent(
 			[
-				{ text: "step 1", providerMetadata: { anthropic: { signature: "sig_1" } } },
-				{ text: "step 2", providerMetadata: { anthropic: { signature: "sig_2" } } },
+				{
+					text: "step 1",
+					providerMetadata: { anthropic: { signature: "sig_1" }, signatureSource: SRC },
+				},
+				{
+					text: "step 2",
+					providerMetadata: { anthropic: { signature: "sig_2" }, signatureSource: SRC },
+				},
 			],
 			undefined,
+			SRC,
 		);
 		expect(result).toEqual({ reasoningText: { text: "step 1\nstep 2", signature: "sig_2" } });
 	});
 
-	test("carries redactedContent alongside text", () => {
-		const result = buildKiroReasoningContent([{ text: "visible" }], [{ data: "ZW5j" }]);
+	test("carries redactedContent alongside text when source matches", () => {
+		const result = buildKiroReasoningContent(
+			[{ text: "visible" }],
+			[{ data: "ZW5j", signatureSource: SRC }],
+			SRC,
+		);
 		expect(result).toEqual({
 			reasoningText: { text: "visible" },
 			redactedContent: "ZW5j",
@@ -236,8 +249,65 @@ describe("kiro reasoning — buildKiroReasoningContent helper", () => {
 	});
 
 	test("supports redacted-only thinking with no visible text", () => {
-		const result = buildKiroReasoningContent([], [{ data: "ZW5j" }]);
+		const result = buildKiroReasoningContent([], [{ data: "ZW5j", signatureSource: SRC }], SRC);
 		expect(result).toEqual({ redactedContent: "ZW5j" });
+	});
+
+	test("drops the signature when it was minted by a different channel", () => {
+		// nug:antigravity and nug:kiro share the Kiro protocol but are different
+		// upstream servers — their signatures are NOT interchangeable.
+		const result = buildKiroReasoningContent(
+			[
+				{
+					text: "cross-channel thought",
+					providerMetadata: {
+						anthropic: { signature: "sig_ag" },
+						signatureSource: "nug:antigravity",
+					},
+				},
+			],
+			undefined,
+			"nug:kiro",
+		);
+		// Text is preserved, signature is dropped.
+		expect(result).toEqual({ reasoningText: { text: "cross-channel thought" } });
+	});
+
+	test("drops a cross-channel redacted block but keeps matching text", () => {
+		const result = buildKiroReasoningContent(
+			[
+				{
+					text: "kept text",
+					providerMetadata: { anthropic: { signature: "sig_ok" }, signatureSource: "nug:kiro" },
+				},
+			],
+			[{ data: "ZW5j", signatureSource: "nug:antigravity" }],
+			"nug:kiro",
+		);
+		expect(result).toEqual({ reasoningText: { text: "kept text", signature: "sig_ok" } });
+	});
+
+	test("drops the signature for legacy blocks with no recorded source", () => {
+		const result = buildKiroReasoningContent(
+			[{ text: "legacy", providerMetadata: { anthropic: { signature: "sig_legacy" } } }],
+			undefined,
+			"nug:kiro",
+		);
+		expect(result).toEqual({ reasoningText: { text: "legacy" } });
+	});
+
+	test("drops the signature when the current source is unknown", () => {
+		const result = buildKiroReasoningContent(
+			[
+				{
+					text: "orphan",
+					providerMetadata: { anthropic: { signature: "sig_x" }, signatureSource: "nug:kiro" },
+				},
+			],
+			undefined,
+			undefined,
+		);
+		expect(result).toEqual({ reasoningText: { text: "orphan" } });
 	});
 });
 
@@ -245,23 +315,54 @@ describe("kiro reasoning — pushAssistantTurn (KiroProvider)", () => {
 	const provider = new KiroProvider();
 
 	test("writes reasoning_content (snake_case) into the assistant message", () => {
+		// A direct KiroProvider reports source "kiro"; same-turn blocks carry that
+		// source, so their signature/redacted content is echoed back.
 		const history: KiroHistoryMessage[] = [];
 		provider.pushAssistantTurn(
 			history,
 			"Here is the answer",
 			[],
-			[{ text: "let me think", providerMetadata: { anthropic: { signature: "sig_x" } } }],
+			[
+				{
+					text: "let me think",
+					providerMetadata: { anthropic: { signature: "sig_x" }, signatureSource: "kiro" },
+				},
+			],
 			undefined,
 			undefined,
 			undefined,
 			undefined,
-			[{ data: "cmVk" }],
+			[{ data: "cmVk", signatureSource: "kiro" }],
 		);
 		const assistant = assistantOf(history).assistantResponseMessage;
 		expect(assistant.content).toBe("Here is the answer");
 		expect((assistant as Record<string, unknown>).reasoning_content).toEqual({
 			reasoningText: { text: "let me think", signature: "sig_x" },
 			redactedContent: "cmVk",
+		});
+	});
+
+	test("drops a signature minted by a different upstream", () => {
+		// Blocks stored from a different channel (e.g. nug:antigravity) must not
+		// have their signature replayed to a direct kiro upstream.
+		const history: KiroHistoryMessage[] = [];
+		provider.pushAssistantTurn(
+			history,
+			"answer",
+			[],
+			[
+				{
+					text: "foreign thought",
+					providerMetadata: {
+						anthropic: { signature: "sig_ag" },
+						signatureSource: "nug:antigravity",
+					},
+				},
+			],
+		);
+		const assistant = assistantOf(history).assistantResponseMessage;
+		expect((assistant as Record<string, unknown>).reasoning_content).toEqual({
+			reasoningText: { text: "foreign thought" },
 		});
 	});
 
@@ -292,9 +393,9 @@ describe("kiro reasoning — buildKiroHistory (DB → history rebuild)", () => {
 					{
 						type: "reasoning",
 						text: "deep thought",
-						providerMetadata: { anthropic: { signature: "sig_db" } },
+						providerMetadata: { anthropic: { signature: "sig_db" }, signatureSource: "kiro" },
 					},
-					{ type: "redacted_thinking", data: "cmVkX2Ri" },
+					{ type: "redacted_thinking", data: "cmVkX2Ri", signatureSource: "kiro" },
 					{ type: "text", text: "final answer" },
 				],
 				contentText: null,
@@ -304,12 +405,59 @@ describe("kiro reasoning — buildKiroHistory (DB → history rebuild)", () => {
 			},
 		];
 
-		const { history } = await buildKiroHistory(dbMessages, "claude-sonnet-4");
+		const { history } = await buildKiroHistory(dbMessages, "claude-sonnet-4", undefined, "kiro");
 		const assistant = assistantOf(history as KiroHistoryMessage[]).assistantResponseMessage;
 		expect(assistant.content).toBe("final answer");
 		expect((assistant as Record<string, unknown>).reasoning_content).toEqual({
 			reasoningText: { text: "deep thought", signature: "sig_db" },
 			redactedContent: "cmVkX2Ri",
+		});
+	});
+
+	test("drops signature and redacted content when replaying to a different channel", async () => {
+		const dbMessages: DbMessage[] = [
+			{
+				id: "user-1",
+				role: "user",
+				contentJson: [],
+				contentText: "hi",
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+			{
+				id: "assistant-1",
+				role: "assistant",
+				contentJson: [
+					{
+						type: "reasoning",
+						text: "thought from antigravity",
+						providerMetadata: {
+							anthropic: { signature: "sig_ag" },
+							signatureSource: "nug:antigravity",
+						},
+					},
+					{ type: "redacted_thinking", data: "cmVkX2Ri", signatureSource: "nug:antigravity" },
+					{ type: "text", text: "final answer" },
+				],
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+				toolCalls: [],
+			},
+		];
+
+		// Rebuilding for the nug:kiro channel must strip the antigravity signature
+		// and encrypted block while keeping the visible thinking text.
+		const { history } = await buildKiroHistory(
+			dbMessages,
+			"claude-sonnet-4",
+			undefined,
+			"nug:kiro",
+		);
+		const assistant = assistantOf(history as KiroHistoryMessage[]).assistantResponseMessage;
+		expect((assistant as Record<string, unknown>).reasoning_content).toEqual({
+			reasoningText: { text: "thought from antigravity" },
 		});
 	});
 

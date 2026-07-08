@@ -36,21 +36,21 @@ describe("KiroTextToolCallStreamParser", () => {
 	test("parses an invoke block split across many deltas", () => {
 		const { text, tools } = runParser([
 			"计划已批准。",
-			"让我先用 todo 列表跟踪进度。\n\n",
+			"让我先读取文件。\n\n",
 			"call\n",
-			'<invoke name="Task',
-			'Create">',
-			'<parameter name="todos">[{"id":"t0","content":"x"}]',
+			'<invoke name="Re',
+			'ad">',
+			'<parameter name="file_path">spec://tasks.json',
 			"</parameter>",
 			"</invoke>",
 		]);
 
-		expect(text).toBe("计划已批准。让我先用 todo 列表跟踪进度。\n\n");
+		expect(text).toBe("计划已批准。让我先读取文件。\n\n");
 		expect(text).not.toContain("<invoke");
 		expect(text).not.toContain("call");
 		expect(tools).toHaveLength(1);
-		expect(tools[0].name).toBe("TaskCreate");
-		expect(tools[0].input).toEqual({ todos: [{ id: "t0", content: "x" }] });
+		expect(tools[0].name).toBe("Read");
+		expect(tools[0].input).toEqual({ file_path: "spec://tasks.json" });
 	});
 
 	test("parses a block delivered as a single delta", () => {
@@ -201,8 +201,8 @@ describe("parseSSEStream — leaked tool calls split across frames", () => {
 		const body = sseStreamFromFrames([
 			{ content: "计划已批准。\n\n" },
 			{ content: "call\n" },
-			{ content: '<invoke name="TaskCreate">' },
-			{ content: '<parameter name="todos">[{"id":"t0"}]' },
+			{ content: '<invoke name="Read">' },
+			{ content: '<parameter name="file_path">spec://tasks.json' },
 			{ content: "</parameter></invoke>" },
 		]);
 
@@ -217,8 +217,8 @@ describe("parseSSEStream — leaked tool calls split across frames", () => {
 		expect(text).not.toContain("<invoke");
 		expect(text).not.toContain("call");
 		expect(toolUses).toHaveLength(1);
-		expect(toolUses[0].name).toBe("TaskCreate");
-		expect(toolUses[0].input).toEqual({ todos: [{ id: "t0" }] });
+		expect(toolUses[0].name).toBe("Read");
+		expect(toolUses[0].input).toEqual({ file_path: "spec://tasks.json" });
 	});
 
 	test("keeps text verbatim when parseTextToolCalls is disabled", async () => {

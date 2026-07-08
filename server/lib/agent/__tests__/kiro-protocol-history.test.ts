@@ -113,28 +113,28 @@ describe("buildKiroHistory", () => {
 		expect(historyJson).toContain('"images"');
 	});
 
-	test("moves trailing sys goal continuation into trailing user text", async () => {
+	test("moves trailing sys spec continuation into trailing user text", async () => {
 		const dbMessages: DbMessage[] = [
 			makeUserMessage({ id: "user-start", contentText: "start" }),
 			makeAssistantMessage({ id: "assistant-start", contentText: "ready" }),
 			makeSysMessage({
-				id: "sys-goal",
+				id: "sys-spec",
 				contentJson: [
 					{
 						type: "text",
-						text: "Continue working toward the active NarraFork goal.",
+						text: "Continue working on the current Dynamic Spec task.",
 					},
-					{ type: "goal_continuation", goalId: "goal-1", objective: "finish it" },
+					{ type: "spec_continuation", task: "finish it", protected: false },
 				],
-				contentText: "Continue working toward the active NarraFork goal.",
+				contentText: "Continue working on the current Dynamic Spec task.",
 			}),
 		];
 
 		const result = await buildKiroHistory(dbMessages, "kiro:claude-sonnet-4.6");
 		const historyJson = JSON.stringify(result.history);
 
-		expect(result.trailingUserText).toBe("Continue working toward the active NarraFork goal.");
-		expect(historyJson).not.toContain("Continue working toward the active NarraFork goal.");
+		expect(result.trailingUserText).toBe("Continue working on the current Dynamic Spec task.");
+		expect(historyJson).not.toContain("Continue working on the current Dynamic Spec task.");
 		expect(result.history.at(-1)).toEqual({ assistantResponseMessage: { content: "ready" } });
 	});
 });

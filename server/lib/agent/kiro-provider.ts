@@ -59,8 +59,14 @@ export class KiroProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildKiroHistory(dbMessages, model, narratorId);
+		return buildKiroHistory(dbMessages, model, narratorId, this.getActiveReasoningSource());
 	}
+
+	getActiveReasoningSource(): string | undefined {
+		// A direct Kiro provider is a single upstream — its own identity.
+		return "kiro";
+	}
+
 	injectSystemPrompt(
 		history: unknown[],
 		systemPrompt: string,
@@ -190,11 +196,19 @@ export class KiroProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		_textOutputIndex?: number,
-		redactedThinkingBlocks?: Array<{ data: string; outputIndex?: number }>,
+		redactedThinkingBlocks?: Array<{
+			data: string;
+			outputIndex?: number;
+			signatureSource?: string;
+		}>,
 	): void {
 		const h = history as KiroHistoryMessage[];
 		// NOTE: upstream Kiro service requires snake_case "reasoning_content".
-		const reasoningContent = buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks);
+		const reasoningContent = buildKiroReasoningContent(
+			reasoningBlocks,
+			redactedThinkingBlocks,
+			this.getActiveReasoningSource(),
+		);
 		const assistantMsg: KiroHistoryAssistantMessage = {
 			assistantResponseMessage: {
 				content: text || "",

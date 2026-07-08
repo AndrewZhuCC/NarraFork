@@ -12,6 +12,7 @@ import type {
 import { getImagePath, imageToBase64 } from "../uploads";
 import { parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent } from "./provider";
+import { signatureSourcesCompatible } from "./reasoning-source";
 import { resolveModel } from "./resolve-model";
 import {
 	appendSideCarsForApi,
@@ -35,6 +36,8 @@ export interface KiroReasoningBlockInput {
 export interface KiroRedactedThinkingInput {
 	data: string;
 	outputIndex?: number;
+	/** Upstream identity that produced this encrypted block (see reasoning-source.ts). */
+	signatureSource?: string;
 }
 
 export interface KiroStreamParseOptions {
@@ -55,21 +58,34 @@ export interface KiroStreamParseOptions {
  * the signature of the last signed block (the signature covers the full thinking
  * for that turn). A redacted block, when present, is carried alongside.
  *
+ * `currentSource` identifies the upstream that will receive this history. A
+ * stored signature (or encrypted redacted block) is only echoed back when it
+ * was minted by that same upstream — replaying it to a different server (e.g. a
+ * different NUG channel) fails signature verification. Mismatched or unknown
+ * (legacy) sources drop the signature/redacted payload but keep the thinking
+ * text.
+ *
  * Returns `undefined` when there is no reasoning to echo back.
  */
 export function buildKiroReasoningContent(
 	reasoningBlocks?: KiroReasoningBlockInput[],
 	redactedThinkingBlocks?: KiroRedactedThinkingInput[],
+	currentSource?: string,
 ): KiroReasoningContent | undefined {
 	const texts: string[] = [];
 	let signature: string | undefined;
 	for (const rb of reasoningBlocks ?? []) {
 		if (rb.text) texts.push(rb.text);
 		const sig = rb.providerMetadata?.anthropic?.signature;
-		if (sig) signature = sig;
+		// Only carry the signature when it belongs to the current upstream.
+		if (sig && signatureSourcesCompatible(rb.providerMetadata?.signatureSource, currentSource)) {
+			signature = sig;
+		}
 	}
 
-	const redacted = redactedThinkingBlocks?.find((rb) => rb.data)?.data;
+	const redacted = redactedThinkingBlocks?.find(
+		(rb) => rb.data && signatureSourcesCompatible(rb.signatureSource, currentSource),
+	)?.data;
 
 	const hasText = texts.length > 0;
 	if (!hasText && !redacted) return undefined;
@@ -1100,6 +1116,7 @@ export async function buildKiroHistory(
 	dbMessages: DbMessage[],
 	model: string,
 	narratorId?: string,
+	currentSource?: string,
 ): Promise<{
 	history: KiroHistoryMessage[];
 	trailingToolResults: KiroToolResult[];
@@ -1212,7 +1229,9 @@ export async function buildKiroHistory(
 			const text = textParts.join("\n") || msg.contentText || "";
 
 			// Rebuild reasoning content from stored blocks so previous thinking
-			// (and its signature) is echoed back across turns.
+			// (and its signature) is echoed back across turns. Signatures/redacted
+			// blocks are gated by source inside buildKiroReasoningContent so we
+			// never replay one server's signature to another.
 			// NOTE: upstream Kiro service requires snake_case "reasoning_content".
 			const reasoningBlocks = content
 				.filter((b: { type: string }) => b.type === "reasoning")
@@ -1227,9 +1246,16 @@ export async function buildKiroHistory(
 				);
 			const redactedThinkingBlocks = content
 				.filter((b: { type: string }) => b.type === "redacted_thinking")
-				.map((b: { data?: string }) => ({ data: b.data ?? "" }))
+				.map((b: { data?: string; signatureSource?: string }) => ({
+					data: b.data ?? "",
+					signatureSource: b.signatureSource,
+				}))
 				.filter((b: { data: string }) => b.data);
-			const reasoningContent = buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks);
+			const reasoningContent = buildKiroReasoningContent(
+				reasoningBlocks,
+				redactedThinkingBlocks,
+				currentSource,
+			);
 
 			// Only include tool uses that have completed results (success/fail).
 			// Kiro rejects tool_uses without matching tool_results.

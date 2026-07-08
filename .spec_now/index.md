@@ -1,4 +1,4 @@
-# Living Work Spec: DB-backed `spec://` 虚拟目录
+# Dynamic Spec: DB-backed `spec://` 虚拟目录
 
 ## 当前结论
 
