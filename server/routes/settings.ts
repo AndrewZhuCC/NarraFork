@@ -89,6 +89,9 @@ const customApiProtocolSchema = z.enum([
 	"completions-compatible",
 ]);
 
+const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
+const customUserAgentSchema = z.string().max(500).optional();
+
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
 	name: z.string(),
@@ -105,6 +108,8 @@ const customApiProviderSchema = z.object({
 	codexWebSocket: z.boolean().optional(),
 	codexWebSearch: z.boolean().optional(),
 	codexImageGeneration: z.boolean().optional(),
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -123,6 +128,8 @@ const openaiProviderSchema = z.object({
 	codexImageGeneration: z.boolean().optional(),
 	defaultContextWindow: z.number().int().min(1).optional(),
 	proxy: proxyOverrideSchema,
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -137,6 +144,8 @@ const anthropicProviderSchema = z.object({
 	proxy: proxyOverrideSchema,
 	tlsRejectUnauthorized: z.boolean().optional(),
 	officialApi: z.boolean().optional(),
+	userAgentMode: userAgentModeSchema,
+	customUserAgent: customUserAgentSchema,
 	disabled: z.boolean().optional(),
 });
 
@@ -329,6 +338,7 @@ const updateSettingsSchema = z
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				autoCompactPruneThreshold: z.number().int().min(0).max(100).optional(),
 				minPruneRatio: z.number().int().min(0).max(100).optional(),
+				queueDuringCompaction: z.boolean().optional(),
 				webFetchPolicy: z
 					.object({
 						allowAll: z.boolean().optional(),
