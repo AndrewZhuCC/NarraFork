@@ -91,6 +91,7 @@ const customApiProtocolSchema = z.enum([
 
 const userAgentModeSchema = z.enum(["narrafork", "claude-code", "codex", "custom"]).optional();
 const customUserAgentSchema = z.string().max(500).optional();
+const extraHeadersSchema = z.record(z.string(), z.string().max(2048)).optional();
 
 const customApiProviderSchema = z.object({
 	id: z.string().min(1),
@@ -110,6 +111,8 @@ const customApiProviderSchema = z.object({
 	codexImageGeneration: z.boolean().optional(),
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -130,6 +133,8 @@ const openaiProviderSchema = z.object({
 	proxy: proxyOverrideSchema,
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -146,6 +151,8 @@ const anthropicProviderSchema = z.object({
 	officialApi: z.boolean().optional(),
 	userAgentMode: userAgentModeSchema,
 	customUserAgent: customUserAgentSchema,
+	extraHeaders: extraHeadersSchema,
+	emulateCodexHeaders: z.boolean().optional(),
 	disabled: z.boolean().optional(),
 });
 
@@ -439,6 +446,16 @@ const updateSettingsSchema = z
 					.optional(),
 				useWebSearch: z.boolean().optional(),
 				useImageGeneration: z.boolean().optional(),
+				userAgentMode: userAgentModeSchema,
+				customUserAgent: customUserAgentSchema,
+				extraHeaders: extraHeadersSchema,
+				emulateCodexHeaders: z.boolean().optional(),
+			})
+			.partial()
+			.optional(),
+		clientFingerprint: z
+			.object({
+				installationId: z.string().uuid().optional(),
 			})
 			.partial()
 			.optional(),
