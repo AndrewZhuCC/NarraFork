@@ -2989,7 +2989,7 @@ export async function runAgentLoop(
 							buffered.bashCommand,
 							`/bash ${buffered.bashCommand}`,
 							buffered.createdBy ?? undefined,
-							{ skipUserMessage: true },
+							{ skipUserMessage: true, signal: active.abortController.signal },
 						);
 						currentText = "";
 						currentImages = undefined;
@@ -3541,6 +3541,7 @@ async function feedMessage(
 			userId ?? undefined,
 			{
 				skipUserMessage: true,
+				signal: active.abortController.signal,
 			},
 		);
 		runAgentLoop(active, "", undefined).catch(async (err) => {

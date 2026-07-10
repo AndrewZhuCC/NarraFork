@@ -216,8 +216,12 @@ export const KiroSection = React.memo(function KiroSection({
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			qc.invalidateQueries({ queryKey: ["settings"] });
 			qc.invalidateQueries({ queryKey: ["kiro", "models"] });
-		} catch {
-			notifications.show({ color: "red", title: t("openaiRefreshModelsError"), message: "" });
+		} catch (err) {
+			notifications.show({
+				color: "red",
+				title: t("openaiRefreshModelsError"),
+				message: err instanceof Error ? err.message : String(err),
+			});
 		} finally {
 			setRefreshingKiro(false);
 		}
