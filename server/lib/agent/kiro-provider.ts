@@ -108,6 +108,7 @@ export class KiroProvider implements ProviderAdapter {
 		// event with parseTextToolCalls disabled to avoid double parsing.
 		const toolCallAccumulator = new KiroStreamToolCallAccumulator({
 			parseTextToolCalls: params.tools.length > 0,
+			model: params.model,
 		});
 		params.onRequestStart?.();
 		for await (const evt of kiroChatRaw(request, params.signal)) {

@@ -2892,7 +2892,12 @@ export function NarratorPanel({
 			messageId: string,
 			newContent: string,
 			rollback: boolean,
-			opts?: { keepImageIds: string[]; newImages: File[] },
+			opts?: {
+				keepImageIds: string[];
+				newImages: File[];
+				keepTextFilePaths: string[];
+				newTextFiles: File[];
+			},
 		) => {
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({

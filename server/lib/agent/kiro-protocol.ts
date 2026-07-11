@@ -47,6 +47,12 @@ export interface KiroStreamParseOptions {
 	 * Enable this only for agent chats with tools; plain generation should keep text verbatim.
 	 */
 	parseTextToolCalls?: boolean;
+	/**
+	 * The model driving this stream (raw, provider-prefixed name is fine). Used to enable
+	 * model-specific stream repairs — currently the opus-4.8 hallucinated line-head marker
+	 * filter (see {@link KiroHallucinationMarkerFilter}).
+	 */
+	model?: string;
 }
 
 /**
@@ -818,6 +824,103 @@ export class KiroTextToolCallStreamParser {
 }
 
 /**
+ * opus-4.8 (via Kiro/NUG) has a known failure mode where it compulsively repeats a short
+ * junk token at the start of freshly wrapped lines — e.g. a run of lines each beginning with
+ * "course", "card", "call", or the Chinese "课". This is a decoding hallucination, not real
+ * content, so we strip the junk token when it immediately follows a newline.
+ *
+ * The filter is intentionally narrow: it only removes one of the known markers when it sits
+ * right after a line break (with optional surrounding spaces) and is followed by either
+ * another break, whitespace, or end-of-text. Markers embedded mid-sentence (e.g. the English
+ * word "course" inside a sentence) are left untouched because they are not at a line head.
+ */
+const HALLUCINATION_LINE_HEAD_MARKERS = ["course", "card", "call", "课"] as const;
+const HALLUCINATION_MODEL_PATTERN = /opus-4[.-]8/i;
+
+/** Whether the opus-4.8 line-head marker filter should run for the given model. */
+export function shouldFilterHallucinatedMarkers(model?: string): boolean {
+	return model != null && HALLUCINATION_MODEL_PATTERN.test(model);
+}
+
+// Match a newline, optional inline indentation, one known marker, then a boundary that is
+// either horizontal whitespace, another newline, or end of string. The marker and the single
+// run of horizontal whitespace separating it from real content are both consumed and dropped,
+// keeping only the leading newline + indentation (group 1). So "\ncourse Look" → "\nLook",
+// "\n    course foo" → "\n    foo", and a bare "\ncourse\n" → "\n" (the following newline is
+// preserved because the lookahead does not consume it).
+const HALLUCINATION_MARKER_ALTERNATION = HALLUCINATION_LINE_HEAD_MARKERS.map((m) =>
+	m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+).join("|");
+const HALLUCINATION_MARKER_RE = new RegExp(
+	`(\\r?\\n[ \\t]*)(?:${HALLUCINATION_MARKER_ALTERNATION})(?=$|[ \\t]|\\r?\\n)[ \\t]*`,
+	"gu",
+);
+
+/**
+ * Stateful filter that removes opus-4.8 hallucinated line-head markers from streamed text.
+ *
+ * Because markers land at the start of a line and the offending token can be split across
+ * streaming deltas (e.g. "\nco" + "urse Look"), the filter buffers the shortest tail that could
+ * still grow into a `\n`-prefixed marker and only emits text proven to be safe.
+ */
+export class KiroHallucinationMarkerFilter {
+	private buffer = "";
+
+	push(delta: string): string {
+		this.buffer += delta;
+		// Emit everything except a trailing region that might still be completing a marker.
+		const keepFrom = this.retentionStart(this.buffer);
+		const emit = this.stripMarkers(this.buffer.slice(0, keepFrom));
+		this.buffer = this.buffer.slice(keepFrom);
+		return emit;
+	}
+
+	flush(): string {
+		const emit = this.stripMarkers(this.buffer);
+		this.buffer = "";
+		return emit;
+	}
+
+	private stripMarkers(text: string): string {
+		if (!text) return text;
+		// Collapse "\n<indent>marker<sep>" down to "\n<indent>", dropping the junk marker and the
+		// single whitespace run that separated it from the real line content.
+		return text.replace(HALLUCINATION_MARKER_RE, (_match, lead: string) => lead);
+	}
+
+	/**
+	 * Index from which the tail must be retained because it could still complete a `\n`-prefixed
+	 * marker on the next delta. We hold back from the last newline whose following text is still
+	 * short enough to be a partial marker.
+	 */
+	private retentionStart(buf: string): number {
+		const lastNewline = buf.lastIndexOf("\n");
+		if (lastNewline < 0) return buf.length;
+		// Text after the final newline, skipping inline indentation. Only the segment up to the
+		// next horizontal-whitespace/newline boundary can be a marker; once real content follows
+		// the marker slot the line is settled and safe to emit.
+		const afterNewline = buf.slice(lastNewline + 1).replace(/^[ \t]*/, "");
+		const firstToken = afterNewline.split(/[ \t\r\n]/, 1)[0] ?? afterNewline;
+		// Only when the first token is still a possible (incomplete) marker prefix AND nothing
+		// yet follows it do we need to hold back — otherwise the marker (if any) is already
+		// fully present and will be handled by stripMarkers.
+		if (firstToken === afterNewline && couldBeMarkerPrefix(firstToken)) {
+			return lastNewline;
+		}
+		return buf.length;
+	}
+}
+
+/** Whether `text` is a (possibly empty) prefix of one of the known hallucination markers. */
+function couldBeMarkerPrefix(text: string): boolean {
+	if (text.length === 0) return true;
+	for (const marker of HALLUCINATION_LINE_HEAD_MARKERS) {
+		if (marker.startsWith(text) && text.length <= marker.length) return true;
+	}
+	return false;
+}
+
+/**
  * Stateful accumulator that moves leaked XML tool calls out of streamed assistant text.
  *
  * Wraps {@link KiroTextToolCallStreamParser} at the {@link ParsedStreamEvent} level so the
@@ -827,13 +930,20 @@ export class KiroTextToolCallStreamParser {
  */
 export class KiroStreamToolCallAccumulator {
 	private readonly parser: KiroTextToolCallStreamParser | null;
+	private readonly markerFilter: KiroHallucinationMarkerFilter | null;
 
 	constructor(options: KiroStreamParseOptions = {}) {
 		this.parser = options.parseTextToolCalls ? new KiroTextToolCallStreamParser() : null;
+		this.markerFilter = shouldFilterHallucinatedMarkers(options.model)
+			? new KiroHallucinationMarkerFilter()
+			: null;
 	}
 
 	/** Adjust a parsed event in place, lifting any completed leaked tool calls out of text. */
 	process(parsed: ParsedStreamEvent): ParsedStreamEvent {
+		if (parsed.text != null && this.markerFilter) {
+			parsed.text = this.markerFilter.push(parsed.text);
+		}
 		if (!this.parser || parsed.text == null) return parsed;
 		const { text, toolUses } = this.parser.push(parsed.text);
 		parsed.text = text;
@@ -843,8 +953,26 @@ export class KiroStreamToolCallAccumulator {
 
 	/** Return a trailing event for any buffered text/tool calls, or null if nothing remains. */
 	finalize(): ParsedStreamEvent | null {
-		if (!this.parser) return null;
-		const { text, toolUses } = this.parser.flush();
+		let markerTail = "";
+		if (this.markerFilter) markerTail = this.markerFilter.flush();
+
+		if (!this.parser) {
+			if (!markerTail) return null;
+			return { text: markerTail };
+		}
+
+		// Feed any buffered marker-filter tail through the tool-call parser before flushing so a
+		// leaked tool call that straddled the two buffers is still recovered.
+		let pushedText = "";
+		const pushedToolUses: ParsedKiroTextToolUse[] = [];
+		if (markerTail) {
+			const pushed = this.parser.push(markerTail);
+			pushedText = pushed.text;
+			pushedToolUses.push(...pushed.toolUses);
+		}
+		const { text: flushedText, toolUses: flushedToolUses } = this.parser.flush();
+		const text = pushedText + flushedText;
+		const toolUses = [...pushedToolUses, ...flushedToolUses];
 		if (!text && toolUses.length === 0) return null;
 		const parsed: ParsedStreamEvent = {};
 		if (text) parsed.text = text;
