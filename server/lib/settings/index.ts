@@ -512,8 +512,8 @@ export function normalizeSettingsProxyUrls(settings: NarraForkSettings): boolean
  *
  * Precedence for a custom URL: legacy WebFetch custom url → kiro.proxy →
  * codex.proxy → first Anthropic provider's proxy. When no URL is found, the
- * mode defaults to "system" (follow the OS/env proxy) unless the legacy
- * WebFetch mode was explicitly "direct".
+ * mode defaults to "direct" (no proxy) unless the legacy WebFetch mode was
+ * explicitly "system" (follow the OS/env proxy), which is preserved.
  */
 export function migrateGlobalProxy(
 	settings: NarraForkSettings,
@@ -551,10 +551,10 @@ export function migrateGlobalProxy(
 		);
 		if (customUrl) {
 			settings.proxy = { mode: "custom", url: customUrl };
-		} else if (legacyWebFetch?.mode === "direct") {
-			settings.proxy = { mode: "direct" };
-		} else {
+		} else if (legacyWebFetch?.mode === "system") {
 			settings.proxy = { mode: "system" };
+		} else {
+			settings.proxy = { mode: "direct" };
 		}
 		changed = true;
 	}
