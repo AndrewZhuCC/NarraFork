@@ -1914,6 +1914,18 @@ const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 ];
 
 /**
+ * Gemini exposes a three-tier thinking level (low/medium/high) plus "none" to
+ * disable thinking. NarraFork's higher tiers (xhigh/max) collapse onto "high"
+ * upstream, so they are not offered here.
+ */
+const GEMINI_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
+	"none",
+	"low",
+	"medium",
+	"high",
+];
+
+/**
  * Anthropic effort API tiers (Opus 4.6 / Sonnet 4.6 and Anthropic-compatible
  * relays). Anthropic has no "xhigh" tier — it exposes low/medium/high/max, plus
  * "none" to disable thinking.
@@ -2712,6 +2724,11 @@ export function NarratorPanel({
 		if (anthropicProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
 			return true;
 		}
+		// Check Gemini providers (gemini-compatible) — Gemini models support thinking
+		const geminiProviders = settingsData?.geminiProviders ?? [];
+		if (geminiProviders.some((p: { prefix?: string }) => p.prefix === providerPrefix)) {
+			return true;
+		}
 		// Check OpenAI providers (completions mode) — DeepSeek models support thinking
 		if (isDeepSeekModel(resolvedModel)) {
 			const openaiProviders = settingsData?.openaiProviders ?? [];
@@ -2723,6 +2740,7 @@ export function NarratorPanel({
 		isCodexChannelModel,
 		resolvedModelOption,
 		settingsData?.anthropicProviders,
+		settingsData?.geminiProviders,
 		settingsData?.openaiProviders,
 		resolvedModel,
 	]);
@@ -2750,6 +2768,15 @@ export function NarratorPanel({
 		if (isAnthropic) {
 			return ANTHROPIC_REASONING_EFFORT_OPTIONS;
 		}
+		// Gemini (gemini-compatible): low/medium/high plus none.
+		const isGemini =
+			!!providerPrefix &&
+			(settingsData?.geminiProviders ?? []).some(
+				(p: { prefix?: string }) => p.prefix === providerPrefix,
+			);
+		if (isGemini) {
+			return GEMINI_REASONING_EFFORT_OPTIONS;
+		}
 		return DEFAULT_REASONING_EFFORT_OPTIONS;
 	}, [
 		codexCapableProviders,
@@ -2757,6 +2784,7 @@ export function NarratorPanel({
 		resolvedModel,
 		resolvedModelOption,
 		settingsData?.anthropicProviders,
+		settingsData?.geminiProviders,
 	]);
 
 	const displayedReasoningEffort = useMemo(() => {
@@ -2883,7 +2911,12 @@ export function NarratorPanel({
 			messageId: string,
 			newContent: string,
 			rollback: boolean,
-			opts?: { keepImageIds: string[]; newImages: File[] },
+			opts?: {
+				keepImageIds: string[];
+				newImages: File[];
+				keepTextFilePaths?: string[];
+				newTextFiles?: File[];
+			},
 		) => {
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({

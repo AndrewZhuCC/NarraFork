@@ -861,6 +861,7 @@ export async function processEvent(
 					input: block.input,
 					streamStartedAt: block.streamStartedAt,
 					outputIndex: block.outputIndex,
+					...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
 				});
 			} else if (block.type === "web_search") {
 				await narratorService.appendBlockToMessage(partialId, narratorId, {
@@ -1018,6 +1019,7 @@ export async function processEvent(
 						id: tu.toolUseId,
 						name: tu.name,
 						input: tu.input,
+						...(tu.thoughtSignature ? { thoughtSignature: tu.thoughtSignature } : {}),
 					});
 				}
 
