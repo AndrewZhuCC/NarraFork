@@ -402,7 +402,6 @@ export const miscApi = {
 			available: number;
 			stickySessionCount: number;
 			globalProxy?: string;
-			defaultReasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 			useWebSocket?: boolean;
 			useWebSearch?: boolean;
 			useImageGeneration?: boolean;
@@ -514,20 +513,6 @@ export const miscApi = {
 		request<{ ok: boolean }>("/codex/global-proxy", {
 			method: "POST",
 			body: JSON.stringify({ proxy }),
-		}),
-	codexGetDefaultReasoningEffort: () =>
-		request<{ reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null }>(
-			"/codex/default-reasoning-effort",
-		),
-	codexSetDefaultReasoningEffort: (
-		reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null,
-	) =>
-		request<{
-			ok: boolean;
-			reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" | "max" | null;
-		}>("/codex/default-reasoning-effort", {
-			method: "POST",
-			body: JSON.stringify({ reasoningEffort }),
 		}),
 	codexGetFingerprint: () =>
 		request<{

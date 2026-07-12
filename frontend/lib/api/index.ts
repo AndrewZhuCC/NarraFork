@@ -165,6 +165,7 @@ export type {
 	SideCarRecord,
 	StorageCategoryResult,
 	StorageScanResult,
+	SubagentChildrenResult,
 	ToolCallRecord,
 	ToolUseContentBlock,
 	TreeMessage,
