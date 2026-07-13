@@ -57,6 +57,7 @@ export function useAllModels() {
 		collectDisabledProviderPrefixes(settingsData?.anthropicProviders);
 		collectDisabledProviderPrefixes(settingsData?.nugProviders);
 		collectDisabledProviderPrefixes(settingsData?.clineProviders);
+		collectDisabledProviderPrefixes(settingsData?.geminiProviders);
 		const providerAgentModeSupported = (provider: ProviderCapabilityKey) =>
 			getProviderAgentModeCapability(runtimeCapabilities, provider).supported;
 
@@ -90,7 +91,11 @@ export function useAllModels() {
 		const serverProviders: Array<{ id: string; prefix?: string; name?: string }> =
 			settingsData?.openaiProviders ?? [];
 
-		const providerLabels: Record<string, string> = { kiro: "Kiro", codex: "Codex" };
+		const providerLabels: Record<string, string> = {
+			kiro: "Kiro",
+			codex: "Codex",
+			gemini: "Gemini",
+		};
 		const fetchedOpenaiModels: ModelOption[] = [];
 		const openaiByProvider: ProviderModels[] = [];
 
@@ -191,6 +196,37 @@ export function useAllModels() {
 				fetchedClineModels.push(opt);
 			}
 			clineByProvider.push({ prefix, name, models, agentProviderType: "cline" });
+		}
+
+		// --- Gemini models (per-provider, native Google API) ---
+		const geminiModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<{ id: string; name?: string }>;
+		}> = settingsData?.geminiModelsGrouped ?? [];
+
+		const serverGeminiProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.geminiProviders ?? [];
+
+		const fetchedGeminiModels: ModelOption[] = [];
+		const geminiByProvider: ProviderModels[] = [];
+
+		for (const group of geminiModelsGrouped) {
+			const cfg = serverGeminiProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "gemini";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const opt: ModelOption = {
+					value: `${prefix}:${m.id}`,
+					label: m.name || m.id,
+					provider: prefix,
+				};
+				models.push(opt);
+				fetchedGeminiModels.push(opt);
+			}
+			geminiByProvider.push({ prefix, name, models, agentProviderType: "gemini" });
 		}
 
 		// --- NUG models (per-provider, channel metadata aware) ---
@@ -316,6 +352,8 @@ export function useAllModels() {
 		for (const group of anthropicByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of clineByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		for (const group of geminiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of nugByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
@@ -458,6 +496,8 @@ export function useAllModels() {
 			anthropicByProvider,
 			/** Cline models grouped by provider. */
 			clineByProvider,
+			/** Gemini models grouped by provider. */
+			geminiByProvider,
 			/** NUG models grouped by provider. */
 			nugByProvider,
 			/** Custom models. */

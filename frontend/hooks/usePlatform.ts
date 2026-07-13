@@ -28,7 +28,14 @@ interface FeatureCapability {
 	mode?: string;
 }
 
-export type ProviderCapabilityKey = "kiro" | "openai" | "anthropic" | "nug" | "codex" | "cline";
+export type ProviderCapabilityKey =
+	| "kiro"
+	| "openai"
+	| "anthropic"
+	| "nug"
+	| "codex"
+	| "cline"
+	| "gemini";
 type ChapterContainerRoute =
 	| "setup"
 	| "podmanStatus"
