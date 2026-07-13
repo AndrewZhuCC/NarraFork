@@ -295,19 +295,24 @@ kiroRoutes.post("/chat", async (c) => {
  */
 const proxySchema = z.object({
 	proxy: z
-		.preprocess((v) => (typeof v === "string" ? normalizeProxyUrl(v) : v), z.string().optional())
+		.preprocess((v) => {
+			if (typeof v !== "string") return v;
+			const trimmed = v.trim();
+			if (!trimmed) return undefined;
+			return normalizeProxyUrl(trimmed) ?? trimmed;
+		}, z.string().optional())
 		.refine(
 			(v) => {
 				if (!v) return true;
 				try {
 					const url = new URL(v);
-					return ["http:", "https:", "socks5:", "socks5h:", "socks4:"].includes(url.protocol);
+					return ["http:", "https:"].includes(url.protocol);
 				} catch {
 					return false;
 				}
 			},
 			{
-				message: "Proxy must be a valid URL with http, https, socks5, socks5h, or socks4 protocol",
+				message: "Proxy must be a valid URL with http or https protocol",
 			},
 		),
 });
