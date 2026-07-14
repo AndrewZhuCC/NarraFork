@@ -48,6 +48,9 @@ const testProvider: ProviderAdapter = {
 	generateWithHistory: async () => "",
 };
 
+// Snapshot real provider before mocking; afterAll re-points it back (Bun mock.module is global and leaks; mock.restore() does not undo it).
+const realProviderModule = { ...(await import("../provider")) };
+
 mock.module("../provider", () => ({
 	getProvider: () => testProvider,
 	resolveProviderAndModel: () => ({
@@ -62,6 +65,7 @@ mock.module("../provider", () => ({
 const { agentLoop } = await import("../loop");
 
 afterAll(() => {
+	mock.module("../provider", () => realProviderModule);
 	mock.restore();
 });
 

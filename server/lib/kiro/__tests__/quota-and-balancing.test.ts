@@ -185,7 +185,7 @@ describe("Kiro credential balancing", () => {
 		const originalFetch = globalThis.fetch;
 		const requestedTokens: string[] = [];
 		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-			requestedTokens.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""));
+			requestedTokens.push(new Headers(init?.headers).get("Authorization") ?? "");
 			return requestedTokens.length === 1
 				? new Response("unauthorized", { status: 401 })
 				: new Response("", { status: 200 });
@@ -218,7 +218,7 @@ describe("Kiro credential balancing", () => {
 			message: "Suspicious activity detected",
 		});
 		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-			requestedTokens.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""));
+			requestedTokens.push(new Headers(init?.headers).get("Authorization") ?? "");
 			return requestedTokens.length === 1
 				? new Response(suspiciousBody, { status: 429 })
 				: new Response("", { status: 200 });
@@ -256,7 +256,7 @@ describe("Kiro credential balancing", () => {
 			message: "Suspicious activity detected",
 		});
 		globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-			requestedTokens.push(String((init?.headers as Record<string, string>)?.Authorization ?? ""));
+			requestedTokens.push(new Headers(init?.headers).get("Authorization") ?? "");
 			return requestedTokens.length === 1
 				? new Response(suspiciousBody, { status: 429 })
 				: new Response("", { status: 200 });
