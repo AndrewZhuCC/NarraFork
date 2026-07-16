@@ -31,6 +31,7 @@ export { toolRegistry } from "./tool-registry";
 export type {
 	AgentConfig,
 	AgentEvent,
+	AgentHistoryReplacement,
 	AgentToolUse,
 	DangerInfo,
 	DangerSeverity,

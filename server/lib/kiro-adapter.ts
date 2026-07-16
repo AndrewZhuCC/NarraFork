@@ -4,8 +4,7 @@
 // Types are inlined here so this file compiles even when server/lib/kiro/ is absent.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { resolve } from "node:path";
+import { getNarraforkHome, getNarraforkPath } from "./narrafork-home";
 import { resolveOverride } from "./net/proxy";
 import { registerKiroModelChecker, registerKiroModelLister, settings } from "./settings";
 
@@ -500,7 +499,7 @@ export async function kiroFetchAllCredentialModels(): Promise<Array<Record<strin
 
 // --- Cached model list for system-wide use ---
 
-const modelCachePath = resolve(homedir(), ".narrafork", "model-cache.json");
+const modelCachePath = getNarraforkPath("model-cache.json");
 
 let cachedKiroModels: Array<Record<string, unknown>> = [];
 
@@ -521,7 +520,7 @@ function loadModelCacheFromDisk(): void {
 /** Persist model cache to disk. */
 function saveModelCacheToDisk(models: Array<Record<string, unknown>>): void {
 	try {
-		mkdirSync(resolve(homedir(), ".narrafork"), { recursive: true });
+		mkdirSync(getNarraforkHome(), { recursive: true });
 		writeFileSync(modelCachePath, JSON.stringify(models, null, 2));
 	} catch {
 		// Non-critical — cache will still work in-memory

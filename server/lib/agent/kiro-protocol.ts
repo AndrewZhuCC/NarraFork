@@ -10,6 +10,7 @@ import type {
 	StreamEvent,
 } from "../kiro-adapter";
 import { getImagePath, imageToBase64 } from "../uploads";
+import { parseErrorDiagnostics } from "./error-diagnostics";
 import { parseGatewaySSEEvent } from "./gateway-events";
 import type { ChatParams, DbMessage, ParsedStreamEvent } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
@@ -1156,14 +1157,23 @@ export function parseKiroStreamEvent(
 		result.invalidState = {
 			reason: String(evt.data.reason ?? "unknown"),
 			message: String(evt.data.message ?? evt.data.content ?? "Invalid state"),
+			diagnostics: parseErrorDiagnostics(evt.data, {
+				source: "provider",
+				phase: "invalid_state_event",
+			}),
 		};
 	}
 
-	// Proxy-layer error event (harmless for kiro-provider since kiro won't send it).
+	// Proxy-layer error event (harmless for the native kiro provider; NUG emits it).
 	if (evt.eventType === "error") {
+		const diagnostics = parseErrorDiagnostics(evt.data, {
+			source: "gateway",
+			phase: "sse_error",
+		});
 		result.invalidState = {
-			reason: "gateway_error",
-			message: String(evt.data.message ?? "Gateway proxy error"),
+			reason: diagnostics?.reason ?? "gateway_error",
+			message: diagnostics?.message ?? String(evt.data.message ?? "Gateway proxy error"),
+			diagnostics,
 		};
 	}
 

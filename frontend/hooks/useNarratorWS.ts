@@ -245,7 +245,11 @@ interface NarratorWSCallbacks {
 		height?: number,
 		parentToolUseId?: string,
 	) => void;
-	onNarratorError?: (error: string, errorCode?: string) => void;
+	onNarratorError?: (
+		error: string,
+		errorCode?: string,
+		diagnostics?: Record<string, unknown>,
+	) => void;
 	onNarratorWarning?: (info: {
 		message: string;
 		retryCount?: number;
@@ -825,6 +829,11 @@ export function useNarratorWS(
 						callbacksRef.current.onNarratorError?.(
 							eventDiagnosticMessage(data),
 							data.errorCode as string | undefined,
+							data.diagnostics &&
+								typeof data.diagnostics === "object" &&
+								!Array.isArray(data.diagnostics)
+								? (data.diagnostics as Record<string, unknown>)
+								: undefined,
 						);
 						break;
 					case "warning":

@@ -2,8 +2,8 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { getNarraforkPath } from "../narrafork-home";
 import { KiroApiClient } from "./api-client";
 import {
 	loadAllCredentials,
@@ -227,7 +227,7 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 	}
 	// Kiro not yet initialized — bootstrap with default config if needed
 	if (!pluginConfig) {
-		const kiroDir = resolve(homedir(), ".narrafork", "kiro");
+		const kiroDir = getNarraforkPath("kiro");
 		mkdirSync(kiroDir, { recursive: true });
 		pluginConfig = {
 			credentialsPath: resolve(kiroDir, "credentials.json"),
@@ -235,7 +235,7 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 		};
 		credentialsPath = pluginConfig.credentialsPath;
 		// Persist kiro config to settings.json so it survives restart
-		const settingsPath = resolve(homedir(), ".narrafork", "settings.json");
+		const settingsPath = getNarraforkPath("settings.json");
 		try {
 			if (existsSync(settingsPath)) {
 				const raw = JSON.parse(readFileSync(settingsPath, "utf-8"));

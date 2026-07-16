@@ -10,6 +10,7 @@ import { shouldUseNativeSearch } from "../search/native";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
+import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
 	extractErrorMessage,
 	getPaymentRequiredErrorInfo,
@@ -61,8 +62,10 @@ import {
 import type {
 	AgentConfig,
 	AgentEvent,
+	AgentHistoryReplacement,
 	AgentSideCar,
 	AgentToolUse,
+	ApiRequestDiagnostics,
 	ContentBlock,
 	PermissionResult,
 	ResolvedToolDefinition,
@@ -262,9 +265,8 @@ const TOOL_FIELD_CONFIG: Record<string, { short: string[]; large: string[] }> = 
 	WebFetch: { short: ["url", "mode"], large: [] },
 	Skill: { short: ["skill"], large: [] },
 	ExitPlanMode: { short: [], large: ["plan"] },
-	StartPipeline: { short: ["label", "maxPreviewChars"], large: [] },
+	StartPipeline: { short: ["label", "maxPreviewChars", "maxUnusedToolCalls"], large: [] },
 	ExtractPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
-	EndPipeline: { short: ["aliases", "format", "maxChars"], large: ["rule"] },
 	AskUserQuestion: { short: [], large: [] },
 };
 
@@ -324,6 +326,9 @@ const EMPTY_RESPONSE_MESSAGE =
 
 /** Max retries specifically for empty responses (request succeeded but no content). */
 const MAX_EMPTY_RESPONSE_RETRIES = 3;
+
+/** Reasoning-only responses above this occupancy trigger one blocking compact attempt. */
+const REASONING_ONLY_COMPACT_THRESHOLD = 95;
 
 const REASONING_ONLY_MESSAGE =
 	"Provider returned only reasoning with no answer or tool call. Retrying.";
@@ -456,7 +461,6 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"LearningGuide",
 	"StartPipeline",
 	"ExtractPipeline",
-	"EndPipeline",
 	"AskUserQuestion",
 	"EnterPlanMode",
 	"ExitPlanMode",
@@ -554,7 +558,6 @@ function isStrictSerial(tu: AgentToolUse): boolean {
 		(tu.name === SHELL_TOOL_NAME && tu.input.strict_serial === true) ||
 		tu.name === "StartPipeline" ||
 		tu.name === "ExtractPipeline" ||
-		tu.name === "EndPipeline" ||
 		tu.name === "ExitPlanMode"
 	);
 }
@@ -1907,14 +1910,13 @@ export async function* agentLoop(
 	// and no tool calls). Declared at function scope so the ceiling is shared across
 	// the turn boundary when a dead turn is recovered by injecting a "continue" turn.
 	let reasoningOnlyRetries = 0;
+	// A high-context dead-turn sequence may compact only once. Reset after a
+	// meaningful response so a later, independent sequence can recover normally.
+	let reasoningOnlyCompactAttempted = false;
 
 	let resetUpstreamSessionOnNextRequest = !!config.resetUpstreamSessionOnFirstRequest;
 
-	function applyHistoryReplacement(replacement: {
-		history: unknown[];
-		pendingToolResults: unknown[];
-		systemPrompt?: string;
-	}) {
+	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
 		if (replacement.systemPrompt != null) {
@@ -2182,10 +2184,12 @@ export async function* agentLoop(
 		 *  misleading "Provider returned an empty response" text.  Reset to
 		 *  undefined only when a retry produces meaningful content. */
 		let lastRetryErrorMessage: string | undefined;
+		let lastRetryDiagnostics: ApiRequestDiagnostics | undefined;
 		/** Set to true when the current attempt already yielded a terminal
 		 *  error/invalid_state event.  Prevents the empty-response check from
 		 *  running on the same iteration. */
 		let sawErrorEvent = false;
+		let requestDiagnostics: ApiRequestDiagnostics | undefined;
 		let requestDump: ApiRequestDumpCollector | undefined;
 		/**
 		 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
@@ -2223,6 +2227,15 @@ export async function* agentLoop(
 		function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
 			if (!requestStarted) return;
 			yield* flushRequestStart();
+			const diagnostics = requestDiagnostics
+				? normalizeApiRequestDiagnostics({
+						...requestDiagnostics,
+						provider: requestDiagnostics.provider ?? effectiveProvider,
+						model: requestDiagnostics.model ?? effectiveModel,
+						message: requestDiagnostics.message ?? errorMessage,
+					})
+				: undefined;
+			requestDump?.setDiagnostics(diagnostics);
 			yield {
 				type: "api_request_end",
 				requestId,
@@ -2235,6 +2248,7 @@ export async function* agentLoop(
 				meterUnit: requestMeterUnit,
 				rawDump: requestDump?.snapshot(),
 				errorMessage,
+				diagnostics,
 				forceDumpPersist,
 			};
 		}
@@ -2260,6 +2274,7 @@ export async function* agentLoop(
 			emptyResponseRetries = 0;
 			reasoningOnlyRetries = 0;
 			lastRetryErrorMessage = undefined;
+			lastRetryDiagnostics = undefined;
 		};
 
 		for (;;) {
@@ -2318,6 +2333,7 @@ export async function* agentLoop(
 			requestContextPercent = undefined;
 			requestMeterUsage = undefined;
 			requestMeterUnit = undefined;
+			requestDiagnostics = undefined;
 
 			// Initialize request dump collector when explicitly enabled, OR when the provider
 			// may leak XML tool calls (Kiro/NUG) so leaked-tool diagnostics always have a
@@ -2396,6 +2412,7 @@ export async function* agentLoop(
 						// A successful response clears any prior retry error so the
 						// empty-response guard won't resurface a stale message.
 						lastRetryErrorMessage = undefined;
+						lastRetryDiagnostics = undefined;
 					}
 
 					if (parsed.text) {
@@ -3146,6 +3163,15 @@ export async function* agentLoop(
 					if (parsed.invalidState) {
 						const reason = String(parsed.invalidState.reason ?? "api_error");
 						const message = String(parsed.invalidState.message ?? "Unknown provider error");
+						requestDiagnostics = normalizeApiRequestDiagnostics({
+							...parsed.invalidState.diagnostics,
+							source: parsed.invalidState.diagnostics?.source ?? "provider",
+							phase: parsed.invalidState.diagnostics?.phase ?? "invalid_state",
+							reason,
+							message,
+							provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
+							model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
+						});
 						if (isContextOverflowReason(reason) || isContextOverflowMessage(message)) {
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield* finishRequest(message);
@@ -3180,6 +3206,7 @@ export async function* agentLoop(
 									type: "invalid_state",
 									reason,
 									message,
+									diagnostics: requestDiagnostics,
 								};
 								return;
 							}
@@ -3192,6 +3219,7 @@ export async function* agentLoop(
 							) {
 								chatRetryCount++;
 								lastRetryErrorMessage = message;
+								lastRetryDiagnostics = requestDiagnostics;
 								const delayMs = Math.min(
 									TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 									backoffCeil,
@@ -3202,6 +3230,7 @@ export async function* agentLoop(
 									attempt: chatRetryCount,
 									maxRetries: getMaxChatRetries(),
 									delayMs,
+									diagnostics: requestDiagnostics,
 								};
 								yield* finishRequest(message);
 								await abortableSleep(delayMs, config.signal);
@@ -3224,7 +3253,7 @@ export async function* agentLoop(
 							// then signal retryable_error to the caller.
 							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 							yield* finishRequest(message);
-							yield { type: "retryable_error", message };
+							yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
 							return;
 						}
 						// Non-retryable invalidState — treat as a terminal error.
@@ -3239,6 +3268,7 @@ export async function* agentLoop(
 							type: "invalid_state",
 							reason,
 							message,
+							diagnostics: requestDiagnostics,
 						};
 						return;
 					}
@@ -3259,12 +3289,21 @@ export async function* agentLoop(
 					return;
 				}
 				if (firstTokenTimeoutTriggered) {
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						source: "agent",
+						phase: "first_token",
+						reason: "first_token_timeout",
+						message: firstTokenTimeoutMessage,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
 					if (
 						(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
 						!config.signal.aborted
 					) {
 						chatRetryCount++;
 						lastRetryErrorMessage = firstTokenTimeoutMessage;
+						lastRetryDiagnostics = requestDiagnostics;
 						const delayMs = Math.min(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 							backoffCeil,
@@ -3284,6 +3323,7 @@ export async function* agentLoop(
 							attempt: chatRetryCount,
 							maxRetries: maxFirstTokenRetries,
 							delayMs,
+							diagnostics: requestDiagnostics,
 						};
 						yield* finishRequest(firstTokenTimeoutMessage);
 						await abortableSleep(delayMs, config.signal);
@@ -3303,7 +3343,11 @@ export async function* agentLoop(
 						}
 					}
 					yield* finishRequest(firstTokenTimeoutMessage);
-					yield { type: "retryable_error", message: firstTokenTimeoutMessage };
+					yield {
+						type: "retryable_error",
+						message: firstTokenTimeoutMessage,
+						diagnostics: requestDiagnostics,
+					};
 					return;
 				}
 				if (isCodexRebuildHistoryRetryError(err)) {
@@ -3324,10 +3368,17 @@ export async function* agentLoop(
 						message,
 						code: CODEX_REBUILD_HISTORY_RETRY_CODE,
 						bypassRetryLimit: true,
+						diagnostics: requestDiagnostics,
 					};
 					return;
 				}
 				const msg = extractErrorMessage(err);
+				requestDiagnostics = normalizeApiRequestDiagnostics({
+					...diagnosticsFromError(err),
+					message: msg,
+					provider: effectiveProvider,
+					model: effectiveModel,
+				});
 				const nugProvider = (settings.nugProviders ?? []).find(
 					(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
 				);
@@ -3381,6 +3432,7 @@ export async function* agentLoop(
 					) {
 						chatRetryCount++;
 						lastRetryErrorMessage = msg;
+						lastRetryDiagnostics = requestDiagnostics;
 						const delayMs = Math.min(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 							backoffCeil,
@@ -3391,6 +3443,7 @@ export async function* agentLoop(
 							attempt: chatRetryCount,
 							maxRetries: getMaxChatRetries(),
 							delayMs,
+							diagnostics: requestDiagnostics,
 						};
 						yield* finishRequest(msg);
 						await abortableSleep(delayMs, config.signal);
@@ -3412,13 +3465,13 @@ export async function* agentLoop(
 					// Exhausted retries — persist partial content and signal caller
 					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 					yield* finishRequest(msg);
-					yield { type: "retryable_error", message: msg };
+					yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				}
 				// Non-retryable error — persist partial content and signal caller
 				yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 				yield* finishRequest(msg);
-				yield { type: "error", message: msg };
+				yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 				return;
 			} finally {
 				clearFirstTokenTimer();
@@ -3427,12 +3480,21 @@ export async function* agentLoop(
 			}
 
 			if (firstTokenTimeoutTriggered) {
+				requestDiagnostics = normalizeApiRequestDiagnostics({
+					source: "agent",
+					phase: "first_token",
+					reason: "first_token_timeout",
+					message: firstTokenTimeoutMessage,
+					provider: effectiveProvider,
+					model: effectiveModel,
+				});
 				if (
 					(maxFirstTokenRetries === -1 || chatRetryCount < maxFirstTokenRetries) &&
 					!config.signal.aborted
 				) {
 					chatRetryCount++;
 					lastRetryErrorMessage = firstTokenTimeoutMessage;
+					lastRetryDiagnostics = requestDiagnostics;
 					const delayMs = Math.min(
 						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
 						backoffCeil,
@@ -3443,6 +3505,7 @@ export async function* agentLoop(
 						attempt: chatRetryCount,
 						maxRetries: maxFirstTokenRetries,
 						delayMs,
+						diagnostics: requestDiagnostics,
 					};
 					yield* finishRequest(firstTokenTimeoutMessage);
 					await abortableSleep(delayMs, config.signal);
@@ -3462,7 +3525,11 @@ export async function* agentLoop(
 					}
 				}
 				yield* finishRequest(firstTokenTimeoutMessage);
-				yield { type: "retryable_error", message: firstTokenTimeoutMessage };
+				yield {
+					type: "retryable_error",
+					message: firstTokenTimeoutMessage,
+					diagnostics: requestDiagnostics,
+				};
 				return;
 			}
 
@@ -3477,6 +3544,7 @@ export async function* agentLoop(
 					attempt: chatRetryCount,
 					maxRetries: getMaxChatRetries(),
 					delayMs,
+					diagnostics: requestDiagnostics,
 				};
 				yield* finishRequest("mimo ellipsis reasoning");
 				await abortableSleep(delayMs, config.signal);
@@ -3541,6 +3609,14 @@ export async function* agentLoop(
 				// mode working and avoids surfacing the misleading "empty
 				// response" message.
 				if (lastRetryErrorMessage) {
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						source: "agent",
+						phase: "response",
+						reason: "empty_response",
+						message: `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
 					if (
 						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 						!config.signal.aborted
@@ -3568,6 +3644,7 @@ export async function* agentLoop(
 							attempt: chatRetryCount,
 							maxRetries: getMaxChatRetries(),
 							delayMs,
+							diagnostics: lastRetryDiagnostics,
 						};
 						yield* finishRequest(lastRetryErrorMessage);
 						await abortableSleep(delayMs, config.signal);
@@ -3588,7 +3665,11 @@ export async function* agentLoop(
 					}
 					// Chat retries exhausted — surface the original error
 					yield* finishRequest(lastRetryErrorMessage);
-					yield { type: "retryable_error", message: lastRetryErrorMessage };
+					yield {
+						type: "retryable_error",
+						message: lastRetryErrorMessage,
+						diagnostics: lastRetryDiagnostics,
+					};
 					return;
 				}
 
@@ -3601,6 +3682,15 @@ export async function* agentLoop(
 						backoffCeil,
 					);
 					const message = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+					requestDiagnostics = normalizeApiRequestDiagnostics({
+						source: "agent",
+						phase: "response",
+						reason: "empty_response",
+						message,
+						provider: effectiveProvider,
+						model: effectiveModel,
+					});
+					lastRetryDiagnostics = requestDiagnostics;
 					logger.warn("Provider returned empty response, retrying", {
 						narratorId: config.narratorId,
 						provider: effectiveProvider,
@@ -3615,6 +3705,7 @@ export async function* agentLoop(
 						attempt: emptyResponseRetries,
 						maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 						delayMs,
+						diagnostics: requestDiagnostics,
 					};
 					yield* finishRequest(message);
 					await abortableSleep(delayMs, config.signal);
@@ -3625,6 +3716,14 @@ export async function* agentLoop(
 					continue; // retry provider.chat()
 				}
 				const emptyResponseMessage = `${effectiveProvider}: ${EMPTY_RESPONSE_MESSAGE}`;
+				requestDiagnostics = normalizeApiRequestDiagnostics({
+					source: "agent",
+					phase: "response",
+					reason: "empty_response",
+					message: emptyResponseMessage,
+					provider: effectiveProvider,
+					model: effectiveModel,
+				});
 				if (hasPendingRuntimeSettingsOverride()) {
 					yield* finishRequest(emptyResponseMessage);
 					const switchEvent = await applyPendingRuntimeSettings("retry");
@@ -3646,6 +3745,7 @@ export async function* agentLoop(
 					type: "invalid_state",
 					reason: "empty_response",
 					message: emptyResponseMessage,
+					diagnostics: requestDiagnostics,
 				};
 				return;
 			}
@@ -3677,9 +3777,71 @@ export async function* agentLoop(
 				// Tell the frontend to discard the live streaming reasoning it is showing.
 				yield { type: "stream_reset" };
 				yield* finishRequest(REASONING_ONLY_MESSAGE);
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
+
+				// A positive provider usage event is preferred; the caller's latest usage
+				// is a fallback for providers that only emit an initial 0% event or do
+				// not repeat usage on every response.
+				const callerContextUsagePercentage = config.getContextUsagePercentage?.();
+				const contextUsagePercentage =
+					requestContextPercent != null && requestContextPercent > 0
+						? requestContextPercent
+						: (callerContextUsagePercentage ?? requestContextPercent);
+				let compactReplacement: AgentHistoryReplacement | null = null;
+				if (
+					!reasoningOnlyCompactAttempted &&
+					contextUsagePercentage != null &&
+					contextUsagePercentage > REASONING_ONLY_COMPACT_THRESHOLD &&
+					config.onReasoningOnlyHighContext
+				) {
+					reasoningOnlyCompactAttempted = true;
+					logger.warn("Provider returned only reasoning at high context usage", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						contextUsagePercentage,
+						threshold: REASONING_ONLY_COMPACT_THRESHOLD,
+					});
+					try {
+						// The callback is intentionally awaited: retrying before compact has
+						// finished would send the same oversized context again.
+						compactReplacement = await config.onReasoningOnlyHighContext(
+							contextUsagePercentage,
+							config.signal,
+						);
+					} catch (err) {
+						if (!config.signal.aborted) {
+							logger.error("High-context reasoning-only recovery failed", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								contextUsagePercentage,
+								error: String(err),
+							});
+						}
+					}
+					if (compactReplacement) {
+						applyHistoryReplacement(compactReplacement);
+						logger.info("High-context reasoning-only recovery completed", {
+							narratorId: config.narratorId,
+							provider: effectiveProvider,
+							model: effectiveModel,
+							contextUsagePercentage,
+						});
+					}
+				}
+
+				if (config.signal.aborted) {
+					yield { type: "error", message: "Aborted" };
+					return;
+				}
 
 				// Shared retry ceiling with empty responses to avoid infinite loops.
-				if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES || config.signal.aborted) {
+				if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES) {
 					if (hasPendingRuntimeSettingsOverride()) {
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
@@ -3700,10 +3862,9 @@ export async function* agentLoop(
 					return;
 				}
 				reasoningOnlyRetries++;
-				const delayMs = Math.min(
-					TRANSIENT_RETRY_BASE_MS * 2 ** (reasoningOnlyRetries - 1),
-					backoffCeil,
-				);
+				const delayMs = compactReplacement
+					? 0
+					: Math.min(TRANSIENT_RETRY_BASE_MS * 2 ** (reasoningOnlyRetries - 1), backoffCeil);
 				logger.warn("Provider returned only reasoning, recovering", {
 					narratorId: config.narratorId,
 					provider: effectiveProvider,
@@ -3713,6 +3874,8 @@ export async function* agentLoop(
 					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 					isFirstTurn,
 					pendingToolResults: pendingToolResults.length,
+					contextUsagePercentage,
+					compacted: !!compactReplacement,
 				});
 				yield {
 					type: "retrying",
@@ -3720,8 +3883,11 @@ export async function* agentLoop(
 					attempt: reasoningOnlyRetries,
 					maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
 					delayMs,
+					diagnostics: requestDiagnostics,
 				};
-				await abortableSleep(delayMs, config.signal);
+				if (delayMs > 0) {
+					await abortableSleep(delayMs, config.signal);
+				}
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
 					return;
@@ -3850,6 +4016,7 @@ export async function* agentLoop(
 		// across a long session don't accumulate toward the fatal ceiling.
 		chatRetryCount = 0;
 		reasoningOnlyRetries = 0;
+		reasoningOnlyCompactAttempted = false;
 
 		// ── Fallback: estimate context usage when the provider reported nothing ──
 		if (!receivedUsage) {

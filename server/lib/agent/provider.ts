@@ -21,7 +21,7 @@ import { KiroProvider } from "./kiro-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
-import type { AgentSideCar, AgentToolUse } from "./types";
+import type { AgentSideCar, AgentToolUse, ApiRequestDiagnostics } from "./types";
 
 function isKiroProviderDisabled(): boolean {
 	if (process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1") return true;
@@ -91,7 +91,7 @@ export interface ParsedStreamEvent {
 	redactedThinking?: { data: string; outputIndex?: number };
 	contextUsagePercentage?: number;
 	metering?: { unit: string; unitPlural: string; usage: number };
-	invalidState?: { reason: string; message: string };
+	invalidState?: { reason: string; message: string; diagnostics?: ApiRequestDiagnostics };
 	/** Kiro credential ID that served this request */
 	credentialId?: string;
 	/** Gateway-injected queue status (generic, for providers via unified gateway) */
