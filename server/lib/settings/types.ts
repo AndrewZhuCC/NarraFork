@@ -269,7 +269,7 @@ export interface ClineProviderConfig {
 
 export type SearchChannelKind = "native" | "kiro-mcp" | "nug-mcp" | "custom-api" | "subagent";
 
-export type CustomSearchProviderProtocol = "zhipu-web-search-v1" | "tavily-mcp";
+export type CustomSearchProviderProtocol = string;
 
 export interface SearchChannelConfig {
 	/** Stable channel ID: native, kiro:local, nug:{id}, custom:{id}, subagent. */
