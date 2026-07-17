@@ -3610,6 +3610,7 @@ export async function runAgentLoop(
 								finalText: lastFinalText,
 								hasError: loopHadError,
 								resultMessageId: resultMsgId,
+								refreshTiming: true,
 							});
 						}
 						await narratorService.removeSubstatus(narratorId, "taken_over").catch(() => {});
@@ -3629,6 +3630,7 @@ export async function runAgentLoop(
 							finalText: lastFinalText,
 							hasError: loopHadError,
 							resultMessageId: resultMsgId,
+							refreshTiming: true,
 						});
 					}
 				}
@@ -4078,6 +4080,36 @@ export async function getSubagentResultMessageId(narratorId: string): Promise<st
 	return undefined;
 }
 
+function parsePersistedToolTime(value: string | number | Date | null | undefined): number | null {
+	if (value == null) return null;
+	const time =
+		value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
+	return Number.isFinite(time) ? time : null;
+}
+
+interface ToolCallConclusionTimingSource {
+	streamStartedAt?: string | number | Date | null;
+	createdAt?: string | number | Date | null;
+	permissionStartedAt?: string | number | Date | null;
+	executionStartedAt?: string | number | Date | null;
+}
+
+/** Calculate final timing when an automatic conclusion handoff completes. */
+export function resolveToolCallConclusionTiming(
+	existingToolCall: ToolCallConclusionTimingSource | null | undefined,
+	now = Date.now(),
+): { completedAt: number; durationMs: number } {
+	const startedAt =
+		parsePersistedToolTime(existingToolCall?.streamStartedAt) ??
+		parsePersistedToolTime(existingToolCall?.createdAt) ??
+		parsePersistedToolTime(existingToolCall?.permissionStartedAt) ??
+		parsePersistedToolTime(existingToolCall?.executionStartedAt);
+	return {
+		completedAt: now,
+		durationMs: startedAt != null ? Math.max(0, now - startedAt) : 0,
+	};
+}
+
 /**
  * Update the parent narrator's tool_call outputJson with a new conclusion.
  * Used for scenario 2 (conclusion watcher) and the update-conclusion API.
@@ -4092,6 +4124,11 @@ export async function updateToolCallConclusion(opts: {
 	messageId?: string;
 	/** The subagent assistant message that produced this result. */
 	resultMessageId?: string;
+	/**
+	 * Re-finalize execution timing at this conclusion handoff. Defaults to false so
+	 * manual/third-party conclusion text updates preserve the original execution timing.
+	 */
+	refreshTiming?: boolean;
 }): Promise<void> {
 	const {
 		subagentId,
@@ -4101,9 +4138,13 @@ export async function updateToolCallConclusion(opts: {
 		hasError,
 		messageId,
 		resultMessageId,
+		refreshTiming = false,
 	} = opts;
 	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
 	const output = resultPrefix + (finalText || "(no output)");
+	const timing = refreshTiming
+		? resolveToolCallConclusionTiming(await narratorService.getToolCallByToolUseId(toolUseId))
+		: undefined;
 
 	await narratorService.updateToolCallResult(
 		toolUseId,
@@ -4112,6 +4153,7 @@ export async function updateToolCallConclusion(opts: {
 			status: hasError ? "fail" : "success",
 			errorMessage: hasError ? finalText : undefined,
 			resultMessageId,
+			...(timing ?? { preserveTiming: true }),
 		},
 		messageId,
 	);
@@ -4124,6 +4166,7 @@ export async function updateToolCallConclusion(opts: {
 		toolUseId,
 		output,
 		hasError,
+		...timing,
 	});
 }
 

@@ -323,6 +323,8 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		output: string,
 		hasError: boolean,
+		completedAt?: string | number,
+		durationMs?: number,
 	) => void;
 	onBackgroundTaskCompleted?: (
 		taskNarratorId: string,
@@ -1024,6 +1026,8 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.output as string,
 							data.hasError as boolean,
+							data.completedAt as string | number | undefined,
+							data.durationMs as number | undefined,
 						);
 						if (trackRealtimeMessageVersionRef.current) {
 							narratorWSManager.bumpMessageVersion(subscribedId);
