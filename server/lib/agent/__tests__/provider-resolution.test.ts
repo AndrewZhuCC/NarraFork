@@ -29,7 +29,7 @@ mock.module("../kiro-provider", () => ({ KiroProvider: MockProvider }));
 mock.module("../nug-provider", () => ({ NugProvider: MockProvider }));
 mock.module("../openai-provider", () => ({ OpenAIProvider: MockProvider }));
 
-const { resolveProviderAndModel } = await import("../provider");
+const { registerExternalProviderResolver, resolveProviderAndModel } = await import("../provider");
 
 describe("resolveProviderAndModel", () => {
 	let originalDisabledProviders: string[] | undefined;
@@ -61,5 +61,54 @@ describe("resolveProviderAndModel", () => {
 		expect(() => resolveProviderAndModel("kiro:claude-sonnet-4.6")).toThrow(
 			/Kiro provider is disabled/,
 		);
+	});
+
+	test("delegates unknown provider prefixes to the registered plugin resolver", () => {
+		const adapter = {} as never;
+		const unregister = registerExternalProviderResolver((provider, model) => {
+			expect(provider).toBe("acme");
+			expect(model).toBe("acme:chat:large");
+			return adapter as never;
+		});
+
+		try {
+			const resolved = resolveProviderAndModel("acme:chat:large");
+			expect(resolved.provider).toBe("acme");
+			expect(resolved.model).toBe("acme:chat:large");
+			expect(resolved.adapter).toBe(adapter);
+		} finally {
+			unregister();
+		}
+	});
+
+	test("preserves the existing error semantics when the plugin resolver declines", () => {
+		const unregister = registerExternalProviderResolver(() => null);
+		try {
+			expect(() => resolveProviderAndModel("acme:chat:large")).toThrow(
+				/Provider "acme" is not configured/,
+			);
+		} finally {
+			unregister();
+		}
+	});
+
+	test("builtin providers are consulted before the plugin resolver for their own prefix", () => {
+		let pluginResolverCalls = 0;
+		const unregister = registerExternalProviderResolver(() => {
+			pluginResolverCalls += 1;
+			return null;
+		});
+		try {
+			// kiro is a builtin provider resolved before the external resolver hook.
+			// Asking for a kiro model must never reach the plugin resolver.
+			expect(() => resolveProviderAndModel("kiro:claude-sonnet-4.6")).toThrow();
+			expect(pluginResolverCalls).toBe(0);
+
+			// An unknown prefix does fall through to the plugin resolver.
+			expect(() => resolveProviderAndModel("acme:chat:large")).toThrow(/not configured/);
+			expect(pluginResolverCalls).toBe(1);
+		} finally {
+			unregister();
+		}
 	});
 });
