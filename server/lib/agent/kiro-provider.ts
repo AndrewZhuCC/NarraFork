@@ -229,10 +229,7 @@ export class KiroProvider implements ProviderAdapter {
 	}
 
 	async generate(text: string, model: string): Promise<string> {
-		const { kiroGenerate } = await import("../kiro-adapter");
-		const modelId = resolveModel(model);
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		return kiroGenerate(text, modelId as any);
+		return (await this.generateWithMeta(text, model)).text;
 	}
 
 	async generateWithMeta(
@@ -292,7 +289,10 @@ export class KiroProvider implements ProviderAdapter {
 				throw new DOMException("Kiro generation aborted", "AbortError");
 			}
 			const evt = parseKiroStreamEvent(rawEvent);
-			if (evt.text != null) chunks.push(evt.text);
+			if (evt.text != null) {
+				chunks.push(evt.text);
+				await options?.onTextDelta?.(evt.text);
+			}
 			if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 			if (evt.usage) usage = toUsageData(evt.usage);
 			if (evt.credentialId) credentialId = evt.credentialId;
@@ -309,12 +309,14 @@ export class KiroProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<string> {
 		const result = await this.generateWithHistoryWithMeta(
 			systemInstruction,
 			content,
 			model,
 			locale,
+			options,
 		);
 		return result.text;
 	}
@@ -324,6 +326,7 @@ export class KiroProvider implements ProviderAdapter {
 		content: string,
 		model: string,
 		locale?: string,
+		options?: import("./provider").GenerateOptions,
 	): Promise<import("./provider").GenerateMetaResult> {
 		const kiroAdapter = await import("../kiro-adapter");
 		const modelId = resolveModel(model);
@@ -365,9 +368,15 @@ export class KiroProvider implements ProviderAdapter {
 		let credentialId: string | undefined;
 		let meterUsage: number | undefined;
 		let meterUnit: string | undefined;
-		for await (const rawEvent of kiroAdapter.kiroChatRaw(request)) {
+		for await (const rawEvent of kiroAdapter.kiroChatRaw(request, options?.signal)) {
+			if (options?.signal?.aborted) {
+				throw new DOMException("Kiro generation aborted", "AbortError");
+			}
 			const evt = parseKiroStreamEvent(rawEvent);
-			if (evt.text != null) chunks.push(evt.text);
+			if (evt.text != null) {
+				chunks.push(evt.text);
+				await options?.onTextDelta?.(evt.text);
+			}
 			if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 			if (evt.usage) usage = toUsageData(evt.usage);
 			if (evt.credentialId) credentialId = evt.credentialId;

@@ -1022,8 +1022,8 @@ export const DEFAULT_MIN_PRUNE_RATIO = 30;
  * Resolve the summary model's effective context window (tokens).
  * kiro provider defaults to 200K; others use the built-in table.
  */
-export function getSummaryModelContextWindow(): number {
-	const summaryModel = s().agent.summaryModel;
+export function getSummaryModelContextWindow(modelOverride?: string): number {
+	const summaryModel = modelOverride?.trim() || s().agent.summaryModel;
 	const parsed = parseModelId(summaryModel);
 	const prov = parsed.provider ?? "kiro";
 	if (prov === "kiro") return 200_000;

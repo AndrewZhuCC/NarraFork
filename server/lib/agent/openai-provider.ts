@@ -18,6 +18,7 @@ import {
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
+import { ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import type {
@@ -435,7 +436,13 @@ interface OAIStreamChunk {
 		completion_tokens_details?: { reasoning_tokens?: number };
 		prompt_tokens_details?: { cached_tokens?: number };
 	};
-	error?: { message?: string; type?: string; code?: string | number };
+	error?: {
+		message?: string;
+		type?: string;
+		code?: string | number;
+		statusCode?: number;
+		status_code?: number;
+	};
 	// --- Responses API fields (used by some gateways/proxies) ---
 	/** Responses API: top-level argument delta string for function calls */
 	delta?: string;
@@ -803,10 +810,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
 			params.requestDump?.setResponseBodyText(errText);
-			throw new ApiError(
-				response.status,
-				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
-			);
+			throw createOpenAIApiError(response, errText);
 		}
 
 		if (!response.body) {
@@ -974,12 +978,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				// Codex gateway requires non-empty instructions on /responses.
 				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
 			}
-			if (this.apiMode === "codex") {
-				// Codex gateway requires stream=true on /responses.
-				body.stream = true;
-			}
+			// Responses and Codex lightweight generation always use the streaming API.
+			body.stream = true;
 			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal);
+			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 		}
 
 		// Completions: POST /chat/completions
@@ -991,34 +993,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		const body: Record<string, unknown> = {
 			model: bareModel,
 			messages,
+			stream: true,
+			stream_options: { include_usage: true },
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
-			method: "POST",
-			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw new ApiError(
-				response.status,
-				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
-			);
-		}
-
-		const raw = await response.text();
-		const json = parseJsonWithPreview<{
-			choices?: Array<{ message?: { content?: string } }>;
-			usage?: { prompt_tokens: number; completion_tokens: number; total_tokens?: number };
-		}>(raw, "OpenAI chat/completions returned non-JSON payload");
-
-		return {
-			text: json.choices?.[0]?.message?.content ?? "",
-			contextPercent: undefined,
-			usage: json.usage ? extractOpenAIUsage(json.usage) : null,
-		};
+		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 	}
 
 	async generateWithHistory(
@@ -1062,12 +1041,10 @@ export class OpenAIProvider implements ProviderAdapter {
 				input: [{ role: "user", content: `${reminder}\n\n${content}` }],
 				store: false,
 			};
-			if (this.apiMode === "codex") {
-				// Codex gateway requires stream=true on /responses.
-				body.stream = true;
-			}
+			// Responses and Codex lightweight generation always use the streaming API.
+			body.stream = true;
 			applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body);
+			return this.requestResponsesTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 		}
 
 		// Completions
@@ -1077,32 +1054,11 @@ export class OpenAIProvider implements ProviderAdapter {
 				{ role: "system", content: systemInstruction },
 				{ role: "user", content: `${reminder}\n\n${content}` },
 			],
+			stream: true,
+			stream_options: { include_usage: true },
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, bareModel, options);
-		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
-			method: "POST",
-			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw new ApiError(
-				response.status,
-				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
-			);
-		}
-
-		const raw = await response.text();
-		const json = parseJsonWithPreview<{
-			choices?: Array<{ message?: { content?: string } }>;
-			usage?: { prompt_tokens: number; completion_tokens: number; total_tokens?: number };
-		}>(raw, "OpenAI chat/completions returned non-JSON payload");
-
-		return {
-			text: json.choices?.[0]?.message?.content ?? "",
-			usage: json.usage ? extractOpenAIUsage(json.usage) : null,
-		};
+		return this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, body, options?.signal, options);
 	}
 
 	private async requestResponsesTextWithMeta(
@@ -1110,7 +1066,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		apiKey: string,
 		body: Record<string, unknown>,
 		signal?: AbortSignal,
+		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
+		if (body.stream !== true) {
+			throw new Error("OpenAI lightweight Responses generation requires stream=true");
+		}
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
@@ -1119,20 +1079,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			throw new ApiError(
-				response.status,
-				`OpenAI API error ${response.status}: ${extractApiErrorMessage(errText)}`,
-			);
-		}
-
-		const isStreaming = body.stream === true;
-		if (!isStreaming) {
-			const raw = await response.text();
-			const json = parseResponsesJson(raw);
-			return {
-				text: extractResponsesText(json.output),
-				usage: parsedUsageToUsageData(json.usage),
-			};
+			throw createOpenAIApiError(response, errText);
 		}
 
 		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
@@ -1140,8 +1087,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (looksJson) {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
+			const text = extractResponsesText(json.output);
+			if (text) await options?.onTextDelta?.(text);
 			return {
-				text: extractResponsesText(json.output),
+				text,
 				usage: parsedUsageToUsageData(json.usage),
 			};
 		}
@@ -1153,15 +1102,86 @@ export class OpenAIProvider implements ProviderAdapter {
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
 		for await (const evt of _parseResponsesAPIStream(response.body)) {
-			if (evt.text) text += evt.text;
+			if (evt.text) {
+				text += evt.text;
+				await options?.onTextDelta?.(evt.text);
+			}
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
-				throw new Error(
+				throw new ProviderInvalidStateError(
+					evt.invalidState.reason,
 					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
+					{ diagnostics: evt.invalidState.diagnostics },
 				);
 			}
 		}
 		return { text, usage };
+	}
+
+	private async requestChatCompletionsTextWithMeta(
+		baseUrl: string,
+		apiKey: string,
+		body: Record<string, unknown>,
+		signal?: AbortSignal,
+		options?: GenerateOptions,
+	): Promise<GenerateMetaResult> {
+		if (body.stream !== true) {
+			throw new Error("OpenAI lightweight Chat Completions generation requires stream=true");
+		}
+		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
+			method: "POST",
+			headers: this.buildHeaders(apiKey),
+			body: JSON.stringify(body),
+			signal,
+		});
+
+		if (!response.ok) {
+			const errText = await response.text().catch(() => "");
+			throw createOpenAIApiError(response, errText);
+		}
+
+		const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+		if (contentType.includes("application/json")) {
+			const raw = await response.text();
+			const json = parseJsonWithPreview<{
+				choices?: Array<{ message?: { content?: string } }>;
+				usage?: {
+					prompt_tokens?: number;
+					completion_tokens?: number;
+					prompt_tokens_details?: { cached_tokens?: number };
+					completion_tokens_details?: { reasoning_tokens?: number };
+				};
+			}>(raw, "OpenAI chat/completions returned non-JSON payload");
+			const text = json.choices?.[0]?.message?.content ?? "";
+			if (text) await options?.onTextDelta?.(text);
+			return {
+				text,
+				contextPercent: undefined,
+				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+			};
+		}
+
+		if (!response.body) {
+			throw new Error("OpenAI API returned no body");
+		}
+
+		let text = "";
+		let usage: GenerateMetaResult["usage"] = null;
+		for await (const evt of parseSSEStream(response.body)) {
+			if (evt.text) {
+				text += evt.text;
+				await options?.onTextDelta?.(evt.text);
+			}
+			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
+			if (evt.invalidState) {
+				throw new ProviderInvalidStateError(
+					evt.invalidState.reason,
+					`OpenAI Chat Completions stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
+					{ diagnostics: evt.invalidState.diagnostics },
+				);
+			}
+		}
+		return { text, contextPercent: undefined, usage };
 	}
 
 	/**
@@ -1424,6 +1444,38 @@ function extractApiErrorMessage(rawBody: string): string {
 	}
 	// Return raw body, truncated if very long
 	return rawBody.length > 500 ? `${rawBody.slice(0, 500)}...` : rawBody;
+}
+
+function createOpenAIApiError(response: Response, rawBody: string): ApiError {
+	let payload: Record<string, unknown> = {};
+	try {
+		const parsed = JSON.parse(rawBody);
+		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+			payload = parsed as Record<string, unknown>;
+		}
+	} catch {
+		// Keep the bounded raw message below when the provider did not return JSON.
+	}
+	const message = extractApiErrorMessage(rawBody);
+	const diagnostics = parseErrorDiagnostics(
+		{
+			...payload,
+			statusCode: response.status,
+			message,
+			responseHeaders: Object.fromEntries(response.headers.entries()),
+		},
+		{
+			source: "provider",
+			phase: "http_error",
+			statusCode: response.status,
+			message,
+		},
+	);
+	return new ApiError(
+		response.status,
+		`OpenAI API error ${response.status}: ${message}`,
+		diagnostics,
+	);
 }
 
 /** Parse a /responses JSON payload with a clearer error message. */
@@ -2099,15 +2151,28 @@ export function parseResponsesAPIEvent(
 
 	// ── Error states ──
 	if (type === "response.failed") {
-		const errMsg = chunk.response?.error?.message ?? "Response failed";
-		const reason =
-			String(chunk.response?.error?.code ?? chunk.response?.error?.type ?? "api_error") ||
-			"api_error";
+		const response = chunk.response ?? {};
+		const responseError = response.error ?? {};
+		const errMsg = responseError.message ?? "Response failed";
+		const reason = String(responseError.code ?? responseError.type ?? "api_error") || "api_error";
+		const statusCode =
+			responseError.status_code ??
+			responseError.statusCode ??
+			response.status_code ??
+			response.statusCode ??
+			response.status;
+		const diagnosticsPayload = {
+			...(chunk as unknown as Record<string, unknown>),
+			error: responseError,
+			statusCode,
+			code: responseError.code ?? responseError.type,
+			message: errMsg,
+		};
 		results.push({
 			invalidState: {
 				reason,
 				message: errMsg,
-				diagnostics: parseErrorDiagnostics(chunk as unknown as Record<string, unknown>, {
+				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
 					source: "provider",
 					phase: "response_failed",
 					reason,
@@ -2118,13 +2183,20 @@ export function parseResponsesAPIEvent(
 		return results;
 	}
 	if (type === "response.incomplete") {
-		const reason = chunk.response?.incomplete_details?.reason ?? "unknown";
+		const response = chunk.response ?? {};
+		const reason = response.incomplete_details?.reason ?? "unknown";
 		const message = `Response incomplete: ${reason}`;
+		const diagnosticsPayload = {
+			...(chunk as unknown as Record<string, unknown>),
+			statusCode: response.status_code ?? response.statusCode,
+			reason,
+			message,
+		};
 		results.push({
 			invalidState: {
 				reason,
 				message,
-				diagnostics: parseErrorDiagnostics(chunk as unknown as Record<string, unknown>, {
+				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
 					source: "provider",
 					phase: "response_incomplete",
 					reason,
@@ -2151,11 +2223,21 @@ export function parseResponsesAPIEvent(
 					c.code ??
 					"api_error",
 			) || "api_error";
+		const diagnosticsPayload = {
+			...(c as Record<string, unknown>),
+			statusCode:
+				c.statusCode ??
+				c.status_code ??
+				(nested && typeof nested === "object"
+					? (nested.statusCode ?? nested.status_code)
+					: undefined),
+			message: errMsg,
+		};
 		results.push({
 			invalidState: {
 				reason,
 				message: errMsg,
-				diagnostics: parseErrorDiagnostics(c as Record<string, unknown>, {
+				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
 					source: c.diagnostics ? "gateway" : "provider",
 					phase: "sse_error",
 					reason,
@@ -2301,17 +2383,24 @@ function parseSSELine(
 	if (chunk.error) {
 		const msg = chunk.error.message || "Unknown OpenAI API error";
 		const reason = String(chunk.error.code ?? chunk.error.type ?? "api_error");
+		const statusCode =
+			chunk.error.statusCode ??
+			chunk.error.status_code ??
+			(typeof chunk.error.code === "number" ? chunk.error.code : undefined);
 		return [
 			{
 				invalidState: {
 					reason,
 					message: msg,
-					diagnostics: parseErrorDiagnostics(data, {
-						source: data.diagnostics ? "gateway" : "provider",
-						phase: "sse_error",
-						reason,
-						message: msg,
-					}),
+					diagnostics: parseErrorDiagnostics(
+						{ ...data, statusCode, message: msg },
+						{
+							source: data.diagnostics ? "gateway" : "provider",
+							phase: "sse_error",
+							reason,
+							message: msg,
+						},
+					),
 				},
 			},
 		];
@@ -2513,24 +2602,47 @@ function parseSSELine(
 			case "tool_calls":
 				// Normal completion — no action needed
 				break;
-			case "length":
+			case "length": {
+				const message = "Response truncated: model reached maximum token limit.";
 				result.invalidState = {
 					reason: "max_tokens",
-					message: "Response truncated: model reached maximum token limit.",
+					message,
+					diagnostics: parseErrorDiagnostics(
+						{ reason: "max_tokens", message },
+						{ source: "provider", phase: "finish_reason", reason: "max_tokens", message },
+					),
 				};
 				break;
-			case "content_filter":
+			}
+			case "content_filter": {
+				const message = "Response blocked by content filter.";
 				result.invalidState = {
 					reason: "content_filter",
-					message: "Response blocked by content filter.",
+					message,
+					diagnostics: parseErrorDiagnostics(
+						{ reason: "content_filter", message },
+						{ source: "provider", phase: "finish_reason", reason: "content_filter", message },
+					),
 				};
 				break;
-			case "model_context_window_exceeded":
+			}
+			case "model_context_window_exceeded": {
+				const message = "The model has reached its context window limit.";
 				result.invalidState = {
 					reason: "model_context_window_exceeded",
-					message: "The model has reached its context window limit.",
+					message,
+					diagnostics: parseErrorDiagnostics(
+						{ reason: "model_context_window_exceeded", message },
+						{
+							source: "provider",
+							phase: "finish_reason",
+							reason: "model_context_window_exceeded",
+							message,
+						},
+					),
 				};
 				break;
+			}
 			default:
 				logger.warn("Unknown OpenAI finish reason", { finishReason: choice.finish_reason });
 		}
