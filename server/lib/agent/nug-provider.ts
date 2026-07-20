@@ -220,7 +220,7 @@ export interface NugBillingOrderResponse {
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
-/** Effort levels accepted as a Kiro reasoning hint (mirrors the Go backend whitelist). */
+/** Effort levels accepted as a Kiro reasoning hint. */
 const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 /**
@@ -290,7 +290,7 @@ export class NugProvider implements ProviderAdapter {
 		}
 		// Kiro reasoning-effort hint. NUG's kiro channel injects the upstream
 		// additionalModelRequestFields based on this and the model's effort schema.
-		// Mirror the Go backend's whitelist so only valid effort levels are sent.
+		// Send only effort levels accepted by the Kiro channel.
 		if (effort && KIRO_EFFORT_HINTS.has(effort)) {
 			h["X-Kiro-Effort"] = effort;
 		}

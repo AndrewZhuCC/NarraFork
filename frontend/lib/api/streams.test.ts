@@ -77,14 +77,14 @@ describe("kiroStreamChat", () => {
 					routes: {
 						supported: true,
 						chat: false,
-						chatReason: "Kiro chat streaming is disabled in Go",
+						chatReason: "Kiro chat streaming is disabled on this backend",
 					},
 				},
 			},
 		};
 
 		expect(() => assertKiroChatRouteSupported(capabilities)).toThrow(
-			"Kiro chat streaming is disabled in Go",
+			"Kiro chat streaming is disabled on this backend",
 		);
 		const generator = guardedKiroStreamChat(capabilities, "hello", "model-1");
 		try {

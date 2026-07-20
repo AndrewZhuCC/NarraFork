@@ -35,6 +35,7 @@ import { geminiRoutes } from "./routes/gemini";
 import { gitRoutes } from "./routes/git";
 import { graphRoutes } from "./routes/graph";
 import { hookRoutes } from "./routes/hooks";
+import { integrationRoutes } from "./routes/integrations";
 import { kiroRoutes } from "./routes/kiro";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
@@ -47,7 +48,6 @@ import { handleNugOAuthCallback, nugRoutes } from "./routes/nug";
 import { oauthRoutes } from "./routes/oauth";
 import { oauthAppRoutes } from "./routes/oauth-apps";
 import { oauthGrantRoutes } from "./routes/oauth-grants";
-import { oauthProvisionRoutes } from "./routes/oauth-provision";
 import { openaiRoutes } from "./routes/openai";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
@@ -191,10 +191,6 @@ app.route("/api/oauth", oauthRoutes);
 // but the router itself requires an OAuth principal and enforces scope + resource ownership.
 app.route("/api/external/v1", externalV1Routes);
 
-// Deprecated compatibility shim for clients that still use the original provisioning paths.
-// The shim delegates to the same external resource service and remains isolated from internal APIs.
-app.route("/api/oauth/provision", oauthProvisionRoutes);
-
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
@@ -267,6 +263,7 @@ app.route("/api/plugins", pluginRoutes);
 app.route("/api/uploads", uploadRoutes);
 app.route("/api/favorites", favoriteRoutes);
 app.route("/api/devices", deviceRoutes);
+app.route("/api/integrations", integrationRoutes);
 app.route("/api/oauth-apps", oauthAppRoutes);
 app.route("/api/oauth/grants", oauthGrantRoutes);
 app.route("/api/fs", fsRoutes);
