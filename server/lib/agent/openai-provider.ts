@@ -1222,7 +1222,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const fingerprint = this.resolveFingerprint(conversationId);
 		const headers: Record<string, string> = {
 			"Content-Type": "application/json",
-			Authorization: `Bearer ${apiKey}`,
+			Authorization: this.config.authorizationHeader?.trim() || `Bearer ${apiKey}`,
 			"User-Agent": fingerprint.userAgent,
 		};
 		if (this.apiMode === "codex") {
@@ -1290,6 +1290,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			for await (const event of streamCodexResponsesWebSocket({
 				baseUrl,
 				apiKey,
+				authorization: this.config.authorizationHeader,
 				accountId: this.config.codexAccountId,
 				proxy: this.proxy,
 				sessionKey,

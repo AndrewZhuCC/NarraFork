@@ -1186,7 +1186,12 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(
 			agentTool.parameters.safeParse({ prompt: "inspect", timeout: 2_147_483_648 }).success,
 		).toBe(true);
-		expect(agentTool.parameters.safeParse({ prompt: "inspect", timeout: -1 }).success).toBe(false);
+		// Lenient numeric handling: out-of-range/negative timeouts no longer fail
+		// validation — they are clamped at execution time (negative → 0 = no limit).
+		expect(agentTool.parameters.safeParse({ prompt: "inspect", timeout: -1 }).success).toBe(true);
+		expect(agentTool.parameters.safeParse({ prompt: "inspect", timeout: "3000" }).success).toBe(
+			true,
+		);
 	});
 
 	test("model description includes available models list", () => {
