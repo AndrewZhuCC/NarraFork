@@ -265,6 +265,10 @@ export const agentTool: ToolDefinition = {
 		if (!toolUseId) {
 			return { output: "Internal error: missing toolUseId", isError: true };
 		}
+		const updateExecutionLease = ctx.updateExecutionLease;
+		if (!updateExecutionLease) {
+			return { output: "Internal error: missing Agent update execution lease", isError: true };
+		}
 
 		// Lazy import to avoid circular dependency at module load time
 		const { runSubagent, registerTaskAlias } = await import("@server/services/narrator-subagent");
@@ -285,6 +289,7 @@ export const agentTool: ToolDefinition = {
 				title: description || undefined,
 				cwd: resolvedWorkdir,
 				signal: ctx.signal,
+				updateExecutionLease,
 				locale: ctx.locale,
 				model: model || undefined,
 				reasoningEffort: reasoning_effort,

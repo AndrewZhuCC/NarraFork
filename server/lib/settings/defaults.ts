@@ -4,6 +4,7 @@
  */
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import type { FieldDoc, NarraForkSettings } from "./types";
 
@@ -26,6 +27,7 @@ export const DEFAULTS: NarraForkSettings = {
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
 		summaryModel: "kiro:claude-haiku-4.5",
+		translationModel: "__summary__",
 		customModels: [],
 		hiddenModels: [],
 		maxTurns: 1000,
@@ -71,6 +73,7 @@ export const DEFAULTS: NarraForkSettings = {
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
 		queueDuringCompaction: false,
+		contextThresholds: cloneDefaultContextThresholds(),
 	},
 	chapters: {
 		maxActiveWorktrees: 10,
@@ -360,7 +363,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	"agent.summaryModel": {
-		desc: "用于生成摘要的模型。用于压缩上下文、翻译推理块等辅助任务。应选择速度快成本低的模型。",
+		desc: "用于生成摘要的模型。用于压缩上下文、标题生成等辅助任务。应选择速度快成本低的模型。",
+		type: "string",
+	},
+	"agent.translationModel": {
+		desc: "用于翻译 reasoning/thinking 块的模型。默认 __summary__，动态跟随 summaryModel。",
 		type: "string",
 	},
 	"agent.customModels": {
@@ -429,7 +436,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "Record<string, number>",
 	},
 	"agent.translateReasoning": {
-		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 summaryModel 翻译成用户语言（非英文时）。",
+		desc: "启用后，每个 reasoning/thinking 块完成后自动通过 translationModel 翻译成用户语言（非英文时）。",
 		type: "boolean",
 	},
 	"agent.defaultRelaxedPlan": {
