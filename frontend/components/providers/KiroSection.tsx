@@ -1,3 +1,4 @@
+import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import {
 	ActionIcon,
 	Alert,
@@ -485,7 +486,7 @@ interface CredentialListProps {
 }
 
 function CredentialList(props: CredentialListProps) {
-	const isMobile = useMediaQuery("(max-width: 768px)");
+	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
 	return isMobile ? <CredentialCards {...props} /> : <CredentialTable {...props} />;
 }
 
