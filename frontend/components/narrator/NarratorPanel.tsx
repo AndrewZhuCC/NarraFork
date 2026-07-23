@@ -7194,6 +7194,7 @@ export function NarratorPanel({
 																	onTailMetaChange={handleChunkTailMetaChange}
 																	onLodStep={handleLodStep}
 																	onSelectionResolverChange={setChunkSelectionResolver}
+																	pruneDividerLabel={pruneDividerLabel}
 																	tailFooter={
 																		isSubagent &&
 																		narrator &&
