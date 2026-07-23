@@ -616,7 +616,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
-		if (!apiKey) {
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
 			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
 		}
 
@@ -960,7 +960,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
-		if (!apiKey) {
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
 			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
 		}
 
@@ -1027,7 +1027,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
-		if (!apiKey) {
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
 			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
 		}
 
@@ -1259,7 +1259,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const apiKey = await this.getEffectiveApiKey();
 		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
 
-		if (!apiKey) {
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
 			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
 		}
 

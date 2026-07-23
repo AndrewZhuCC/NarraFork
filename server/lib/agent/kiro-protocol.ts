@@ -830,12 +830,26 @@ export class KiroTextToolCallStreamParser {
  * "course", "card", "call", or the Chinese "课". This is a decoding hallucination, not real
  * content, so we strip the junk token when it immediately follows a newline.
  *
- * The filter is intentionally narrow: it only removes one of the known markers when it sits
- * right after a line break (with optional surrounding spaces) and is followed by either
- * another break, whitespace, or end-of-text. Markers embedded mid-sentence (e.g. the English
- * word "course" inside a sentence) are left untouched because they are not at a line head.
+ * The filter is intentionally narrow but aggressive for the Latin markers. When a *lowercase*
+ * "course" / "card" / "call" sits at a line head (right after a newline, with optional inline
+ * indentation), it is stripped no matter what follows — a space, a CJK character, an ASCII
+ * period ("course. 验证…"), other punctuation, or end-of-text. This is safe because a genuine
+ * English sentence would capitalize a word at the start of a line; a lowercase marker there is
+ * almost always the opus-4.8 hallucination. The ONLY exception is when the marker is really the
+ * prefix of a longer word (e.g. "coursework" / "called" / "cards"): if the next character is an
+ * ASCII letter or digit, the token is left untouched. A single trailing ASCII sentence-punctuation
+ * mark (". , ; : ! ?") is also consumed so lines like "course. 验证…" become "验证…" instead of
+ * leaving a stray ". " behind.
+ *
+ * The Chinese marker "课" keeps a stricter whitespace/newline/EOF boundary so that legitimate
+ * Chinese words such as "课程" / "课件" / "功课" are never mangled.
  */
-const HALLUCINATION_LINE_HEAD_MARKERS = ["course", "card", "call", "课"] as const;
+const HALLUCINATION_LATIN_MARKERS = ["course", "card", "call"] as const;
+const HALLUCINATION_CJK_MARKERS = ["课"] as const;
+const HALLUCINATION_LINE_HEAD_MARKERS = [
+	...HALLUCINATION_LATIN_MARKERS,
+	...HALLUCINATION_CJK_MARKERS,
+] as const;
 const HALLUCINATION_MODEL_PATTERN = /opus-4[.-]8/i;
 
 /** Whether the opus-4.8 line-head marker filter should run for the given model. */
@@ -843,18 +857,27 @@ export function shouldFilterHallucinatedMarkers(model?: string): boolean {
 	return model != null && HALLUCINATION_MODEL_PATTERN.test(model);
 }
 
-// Match a newline, optional inline indentation, one known marker, then a boundary that is
-// either horizontal whitespace, another newline, or end of string. The marker and the single
-// run of horizontal whitespace separating it from real content are both consumed and dropped,
-// keeping only the leading newline + indentation (group 1). So "\ncourse Look" → "\nLook",
-// "\n    course foo" → "\n    foo", and a bare "\ncourse\n" → "\n" (the following newline is
-// preserved because the lookahead does not consume it).
-const HALLUCINATION_MARKER_ALTERNATION = HALLUCINATION_LINE_HEAD_MARKERS.map((m) =>
-	m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-).join("|");
+const escapeMarker = (m: string) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const LATIN_MARKER_ALTERNATION = HALLUCINATION_LATIN_MARKERS.map(escapeMarker).join("|");
+const CJK_MARKER_ALTERNATION = HALLUCINATION_CJK_MARKERS.map(escapeMarker).join("|");
+
+// Match a newline, optional inline indentation, one known marker, then drop it. Only the leading
+// newline + indentation (group 1) is kept. Latin markers are stripped unless the next char is an
+// ASCII letter/digit (a real longer word like "coursework"); a single trailing ASCII punctuation
+// mark plus the run of horizontal whitespace is also consumed. The CJK marker "课" only matches
+// when followed by whitespace/newline/EOF. So "\ncourse Look" → "\nLook", "\ncourse还有" → "\n还有",
+// "\ncourse. 验证" → "\n验证", "\n    course foo" → "\n    foo", and a bare "\ncourse\n" → "\n".
 const HALLUCINATION_MARKER_RE = new RegExp(
-	`(\\r?\\n[ \\t]*)(?:${HALLUCINATION_MARKER_ALTERNATION})(?=$|[ \\t]|\\r?\\n)[ \\t]*`,
+	`(\\r?\\n[ \\t]*)(?:(?:${LATIN_MARKER_ALTERNATION})(?![a-zA-Z0-9])[.,;:!?]?|(?:${CJK_MARKER_ALTERNATION})(?=$|[ \\t]|\\r?\\n))[ \\t]*`,
 	"gu",
+);
+
+// A line head that is a *complete* Latin marker plus an optional trailing sentence-punctuation
+// mark and run of horizontal whitespace, with no real content yet. While streaming we must keep
+// holding such a tail: the punctuation/whitespace run may still grow, or real content may arrive
+// on the next delta, and only then is the exact span the marker regex will consume settled.
+const LATIN_MARKER_UNSETTLED_TAIL_RE = new RegExp(
+	`^(?:${LATIN_MARKER_ALTERNATION})[.,;:!?]?[ \\t]*$`,
 );
 
 /**
@@ -897,17 +920,16 @@ export class KiroHallucinationMarkerFilter {
 	private retentionStart(buf: string): number {
 		const lastNewline = buf.lastIndexOf("\n");
 		if (lastNewline < 0) return buf.length;
-		// Text after the final newline, skipping inline indentation. Only the segment up to the
-		// next horizontal-whitespace/newline boundary can be a marker; once real content follows
-		// the marker slot the line is settled and safe to emit.
+		// Text after the final newline, skipping inline indentation.
 		const afterNewline = buf.slice(lastNewline + 1).replace(/^[ \t]*/, "");
-		const firstToken = afterNewline.split(/[ \t\r\n]/, 1)[0] ?? afterNewline;
-		// Only when the first token is still a possible (incomplete) marker prefix AND nothing
-		// yet follows it do we need to hold back — otherwise the marker (if any) is already
-		// fully present and will be handled by stripMarkers.
-		if (firstToken === afterNewline && couldBeMarkerPrefix(firstToken)) {
-			return lastNewline;
-		}
+		// Hold back while the line head is still an incomplete marker prefix (e.g. "cou") with
+		// nothing after it — the next delta may complete it into a marker. couldBeMarkerPrefix
+		// requires the whole segment to be a prefix, so it already fails once real content follows.
+		if (couldBeMarkerPrefix(afterNewline)) return lastNewline;
+		// Also hold a *complete* Latin marker plus optional trailing punctuation/whitespace when no
+		// real content has arrived yet: the exact span the marker regex will consume (including the
+		// trailing whitespace run separating it from content) is not settled until content appears.
+		if (LATIN_MARKER_UNSETTLED_TAIL_RE.test(afterNewline)) return lastNewline;
 		return buf.length;
 	}
 }

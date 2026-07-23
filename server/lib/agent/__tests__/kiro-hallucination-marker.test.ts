@@ -99,6 +99,53 @@ describe("KiroHallucinationMarkerFilter", () => {
 	test("handles CRLF line endings", () => {
 		expect(runFilter(["a\r\ncourse foo"])).toBe("a\r\nfoo");
 	});
+
+	test("removes a Latin marker glued directly onto Chinese content (no space)", () => {
+		expect(runFilter(["行1\ncourse还有两处 mock.module 的路径也要改。"])).toBe(
+			"行1\n还有两处 mock.module 的路径也要改。",
+		);
+		expect(runFilter(["行1\ncourse用 replace_all。"])).toBe("行1\n用 replace_all。");
+		expect(runFilter(["行1\ncourse执行。"])).toBe("行1\n执行。");
+	});
+
+	test("removes a Latin marker followed by Chinese punctuation", () => {
+		expect(runFilter(["行1\ncall，继续"])).toBe("行1\n，继续");
+	});
+
+	test("removes a Latin marker followed by an ASCII period and space", () => {
+		expect(runFilter(["行1\ncourse. 验证审查目录里现在四份产物"])).toBe(
+			"行1\n验证审查目录里现在四份产物",
+		);
+		expect(runFilter(["行1\ncourse. run."])).toBe("行1\nrun.");
+		expect(runFilter(["a\ncourse.\nb"])).toBe("a\n\nb");
+	});
+
+	test("removes a Latin marker with trailing period split across deltas", () => {
+		expect(runFilter(["行1\ncourse.", " 验证审查"])).toBe("行1\n验证审查");
+		expect(runFilter(["行1\ncourse", ". 验证审查"])).toBe("行1\n验证审查");
+		expect(runFilter(["行1\ncour", "se. run."])).toBe("行1\nrun.");
+	});
+
+	test("removes a Latin marker glued to Chinese split across deltas", () => {
+		expect(runFilter(["行1\ncourse", "还有两处"])).toBe("行1\n还有两处");
+		expect(runFilter(["行1\ncou", "rse用 replace_all"])).toBe("行1\n用 replace_all");
+	});
+
+	test("does not touch the CJK marker 课 when part of a real Chinese word", () => {
+		expect(runFilter(["行1\n课件：mock.module 出现2次。"])).toBe(
+			"行1\n课件：mock.module 出现2次。",
+		);
+		expect(runFilter(["行1\n课程安排"])).toBe("行1\n课程安排");
+	});
+
+	test("still removes the bare CJK marker 课 at a line head", () => {
+		expect(runFilter(["行1\n课 邻居数组"])).toBe("行1\n邻居数组");
+		expect(runFilter(["行1\n课\n下一行"])).toBe("行1\n\n下一行");
+	});
+
+	test("keeps a longer Latin word even when followed by Chinese", () => {
+		expect(runFilter(["\ncoursework是作业"])).toBe("\ncoursework是作业");
+	});
 });
 
 describe("KiroStreamToolCallAccumulator marker filtering", () => {
