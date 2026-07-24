@@ -10,6 +10,11 @@ server/generated/
 *.db-shm
 .worktrees/
 .kiro-dumps/
+.tanstack/
+
+# Virtual-list layout calibration harness artifacts (dev-only)
+vlist-harness-calibration.json
+vlist-harness-calibration.png
 
 analyze/
 analyze2/

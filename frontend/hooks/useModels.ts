@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo } from "react";
 import { api } from "../lib/api";
 import {
 	AGG_MODEL_PREFIX,
@@ -150,6 +150,7 @@ export function getConfiguredFallbackModels(
  * sessions/index, settings/index, and kiro-chat.
  */
 export function useAllModels() {
+	const qc = useQueryClient();
 	const { data: settingsData } = useQuery({
 		queryKey: ["settings"],
 		queryFn: api.getSettings,
@@ -157,6 +158,26 @@ export function useAllModels() {
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
 	const runtimeCapabilities = useRuntimeCapabilities();
+
+	// The shared NUG availability poller refreshes model availability while a
+	// narrator waits for a temporarily-unavailable model to recover. Re-fetch
+	// settings (which carry the NUG model list + `available` flags) so the picker
+	// reflects recovery/outage live.
+	useEffect(() => {
+		const onAvailabilityChanged = () => {
+			qc.invalidateQueries({ queryKey: ["settings"] });
+		};
+		window.addEventListener(
+			"narrafork:nug-model-availability-changed",
+			onAvailabilityChanged as EventListener,
+		);
+		return () => {
+			window.removeEventListener(
+				"narrafork:nug-model-availability-changed",
+				onAvailabilityChanged as EventListener,
+			);
+		};
+	}, [qc]);
 
 	return useMemo(() => {
 		const hidden = new Set<string>(settingsData?.agent?.hiddenModels ?? []);
@@ -416,6 +437,10 @@ export function useAllModels() {
 							}
 						: {}),
 					...(groupUsdRate != null ? { usdRate: groupUsdRate } : {}),
+					// A NUG model whose upstream is temporarily unavailable (whole
+					// credential pool disabled) is kept in the list but flagged so the
+					// picker can mark it "temporarily unavailable".
+					...(typeof m.available === "boolean" ? { available: m.available } : {}),
 				});
 			}
 			nugByProvider.push({ prefix, name, models, agentProviderType: "nug" });
