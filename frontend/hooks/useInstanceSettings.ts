@@ -35,6 +35,8 @@ export interface InstanceSettingsState {
 	maxTurns: number;
 	subagentExploreModel: string;
 	subagentPlanModel: string;
+	subagentSearchModel: string;
+	subagentReviewModel: string;
 	subagentAllowedModels: SubagentAllowedModels;
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
@@ -132,7 +134,9 @@ function makeDefaults(): InstanceSettingsState {
 		maxTurns: 1000,
 		subagentExploreModel: "",
 		subagentPlanModel: "",
-		subagentAllowedModels: { explore: [], plan: [], general: [], search: [] },
+		subagentSearchModel: "",
+		subagentReviewModel: "",
+		subagentAllowedModels: { explore: [], plan: [], general: [], search: [], review: [] },
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
@@ -228,11 +232,14 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				maxTurns: settings.agent?.maxTurns ?? 1000,
 				subagentExploreModel: ensurePrefix(settings.agent?.subagentModels?.explore ?? ""),
 				subagentPlanModel: ensurePrefix(settings.agent?.subagentModels?.plan ?? ""),
+				subagentSearchModel: ensurePrefix(settings.agent?.subagentModels?.search ?? ""),
+				subagentReviewModel: ensurePrefix(settings.agent?.subagentModels?.review ?? ""),
 				subagentAllowedModels: {
 					explore: settings.agent?.subagentAllowedModels?.explore ?? [],
 					plan: settings.agent?.subagentAllowedModels?.plan ?? [],
 					general: settings.agent?.subagentAllowedModels?.general ?? [],
 					search: settings.agent?.subagentAllowedModels?.search ?? [],
+					review: settings.agent?.subagentAllowedModels?.review ?? [],
 				},
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
@@ -336,6 +343,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					subagentModels: {
 						explore: state.subagentExploreModel,
 						plan: state.subagentPlanModel,
+						search: state.subagentSearchModel,
+						review: state.subagentReviewModel,
 					},
 					subagentAllowedModels: state.subagentAllowedModels,
 					legacyEncoding: state.legacyEncoding,
