@@ -24,6 +24,11 @@ import {
 } from "./error-handling";
 import { estimateTokens } from "./estimate-tokens";
 import { parseKiroTextToolCalls } from "./kiro-protocol";
+import {
+	buildMalformedCaptureRecord,
+	isMalformedRequestBodyError,
+	writeMalformedRequestDump,
+} from "./malformed-request-dump";
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
@@ -2410,6 +2415,11 @@ export async function* agentLoop(
 			 * data is downloadable for debugging.
 			 */
 			let forceDumpPersist = false;
+			/**
+			 * Replacement raw dump used when the upstream rejected the request body as
+			 * malformed. The full body goes to a file on disk; this small record points at it.
+			 */
+			let malformedRequestRecord: unknown;
 			let requestStarted = false;
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
@@ -2437,6 +2447,38 @@ export async function* agentLoop(
 				};
 			}
 
+			/**
+			 * Special case: the upstream rejected the request body as malformed
+			 * (`REQUEST_BODY_INVALID` / "Improperly formed request.") without saying which
+			 * field was wrong. Force-save the exact request that produced it to disk so the
+			 * root cause is investigable, and swap the DB-side dump for a small record that
+			 * only points at the file (a full Kiro body can be multiple MB — see the
+			 * large-field rules in CLAUDE.md).
+			 */
+			const captureMalformedRequest = async (errorMessage?: string): Promise<void> => {
+				const snapshot = requestDump?.snapshot();
+				const filePath = await writeMalformedRequestDump({
+					narratorId: config.narratorId,
+					requestId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					errorMessage,
+					diagnostics: requestDiagnostics,
+					dump: snapshot,
+				});
+				malformedRequestRecord = buildMalformedCaptureRecord({
+					narratorId: config.narratorId,
+					requestId,
+					provider: effectiveProvider,
+					model: effectiveModel,
+					errorMessage,
+					diagnostics: requestDiagnostics,
+					dump: snapshot,
+					filePath,
+				});
+				forceDumpPersist = true;
+			};
+
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
 				if (!requestStarted) return;
 				yield* flushRequestStart();
@@ -2459,7 +2501,7 @@ export async function* agentLoop(
 					contextPercent: requestContextPercent,
 					meterUsage: requestMeterUsage,
 					meterUnit: requestMeterUnit,
-					rawDump: requestDump?.snapshot(),
+					rawDump: malformedRequestRecord ?? requestDump?.snapshot(),
 					errorMessage,
 					diagnostics,
 					forceDumpPersist,
@@ -2535,6 +2577,7 @@ export async function* agentLoop(
 				// Leak-detection dump flag is per successful attempt; clear stale state so a
 				// retry that no longer leaks does not force-persist the previous attempt's dump.
 				forceDumpPersist = false;
+				malformedRequestRecord = undefined;
 				yieldedToolResults.clear();
 				brokenToolUseIds.clear();
 				toolUseAccum.clear();
@@ -3444,6 +3487,14 @@ export async function* agentLoop(
 								provider: parsed.invalidState.diagnostics?.provider ?? effectiveProvider,
 								model: parsed.invalidState.diagnostics?.model ?? effectiveModel,
 							});
+							// Opaque upstream "malformed request body" rejection delivered as a stream
+							// error event (NUG relays the Kiro ValidationException this way). Capture
+							// the exact request before any classification path consumes the error.
+							if (
+								isMalformedRequestBodyError({ reason, message, diagnostics: requestDiagnostics })
+							) {
+								await captureMalformedRequest(message);
+							}
 							const classification = classifyInvalidState(reason, message, requestDiagnostics);
 							if (classification.category === "context_overflow") {
 								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
@@ -3708,6 +3759,11 @@ export async function* agentLoop(
 						provider: effectiveProvider,
 						model: effectiveModel,
 					});
+					// Opaque upstream "malformed request body" rejection: capture the exact
+					// request before any retry/classification path can discard it.
+					if (isMalformedRequestBodyError(err)) {
+						await captureMalformedRequest(msg);
+					}
 					const nugProvider = (settings.nugProviders ?? []).find(
 						(p) => !p.disabled && (p.prefix === effectiveProvider || p.id === effectiveProvider),
 					);

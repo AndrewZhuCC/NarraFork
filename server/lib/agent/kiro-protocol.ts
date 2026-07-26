@@ -1,3 +1,4 @@
+import { getToolMessage } from "../i18n";
 import { generateId } from "../id";
 import type {
 	KiroChatRequest,
@@ -9,6 +10,7 @@ import type {
 	KiroToolResult,
 	StreamEvent,
 } from "../kiro-adapter";
+import { logger } from "../logger";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { parseGatewaySSEEvent } from "./gateway-events";
@@ -50,8 +52,8 @@ export interface KiroStreamParseOptions {
 	parseTextToolCalls?: boolean;
 	/**
 	 * The model driving this stream (raw, provider-prefixed name is fine). Used to enable
-	 * model-specific stream repairs — currently the opus-4.8 hallucinated line-head marker
-	 * filter (see {@link KiroHallucinationMarkerFilter}).
+	 * model-specific stream repairs — currently the opus-4.8 / opus-5 hallucinated line-head
+	 * marker filter (see {@link KiroHallucinationMarkerFilter}).
 	 */
 	model?: string;
 }
@@ -310,6 +312,50 @@ function mergeAssistantMessages(
 	}
 }
 
+/**
+ * Whether the message that will be sent as `currentMessage` actually carries something
+ * for the model to act on.
+ *
+ * Deliberately different from {@link hasUserPayload}: that helper counts `tools` as
+ * payload (correct for history entries), but `currentMessage` always ships the tool
+ * specs, so counting them here would make every empty turn look valid.
+ */
+function currentMessageCarriesTurn(message: KiroHistoryUserMessage): boolean {
+	const user = message.userInputMessage;
+	const ctx = user.userInputMessageContext;
+	return Boolean(
+		user.content.trim() || (user.images?.length ?? 0) > 0 || (ctx?.toolResults?.length ?? 0) > 0,
+	);
+}
+
+/**
+ * Last-resort guard against an empty `currentMessage`.
+ *
+ * The Kiro service rejects a request whose current message has no content, no tool
+ * results and no images with an opaque
+ * `{"__type":"…#ValidationException","message":"Improperly formed request.","reason":"REQUEST_BODY_INVALID"}`
+ * — it never says which field was at fault.
+ *
+ * That shape is reachable from at least two directions:
+ *  1. A transient failure (e.g. Kiro "unexpected EOF") leaves a kept reasoning-only
+ *     partial assistant message. The retry clears the user text because the partial was
+ *     kept, but a reasoning-only partial has no tool_uses, so no tool results are
+ *     produced either — nothing carries the turn.
+ *  2. `sanitizeKiroToolPairs` strips tool results that no longer answer the immediately
+ *     preceding assistant toolUse. A caller can pass tool results in good faith and
+ *     still end up with an empty current message *after* sanitization.
+ *
+ * Because route 2 only materializes after sanitization, this must run on the final
+ * normalized shape rather than at request-build time. Injecting a minimal continuation
+ * instruction keeps the turn semantically correct (the model resumes where it stopped)
+ * and is strictly better than a request the upstream refuses outright.
+ */
+function ensureCurrentMessageCarriesTurn(message: KiroHistoryUserMessage): boolean {
+	if (currentMessageCarriesTurn(message)) return false;
+	message.userInputMessage.content = getToolMessage("resumeAfterTransientError");
+	return true;
+}
+
 function cleanupUserContext(message: KiroHistoryUserMessage): void {
 	const user = message.userInputMessage;
 	const ctx = user.userInputMessageContext;
@@ -452,9 +498,30 @@ export function normalizeKiroChatRequest(request: KiroChatRequest): KiroChatRequ
 	const current = normalized[effectiveCurrentIndex]?.message;
 
 	if (!current || !isKiroUserMessage(current)) {
+		// Sanitization consumed the current turn entirely (or left an assistant message in
+		// its place). Fall back to the pre-normalization current message, which may itself
+		// be empty — hence the same guard applies.
+		const fallbackCurrent = currentMessage;
+		const injected = ensureCurrentMessageCarriesTurn(fallbackCurrent);
+		if (injected) {
+			logger.warn("Kiro request had an empty current message; injected a continuation prompt", {
+				model: modelId,
+				route: "current_turn_not_user",
+				historyLength: beforeCurrent.length,
+			});
+		}
 		cs.history = beforeCurrent.map((entry) => entry.message);
-		cs.currentMessage = { userInputMessage: currentMessage.userInputMessage };
+		cs.currentMessage = { userInputMessage: fallbackCurrent.userInputMessage };
 		return request;
+	}
+
+	const injected = ensureCurrentMessageCarriesTurn(current);
+	if (injected) {
+		logger.warn("Kiro request had an empty current message; injected a continuation prompt", {
+			model: modelId,
+			route: "empty_after_normalize",
+			historyLength: beforeCurrent.length,
+		});
 	}
 
 	cs.history = beforeCurrent.length > 0 ? beforeCurrent.map((entry) => entry.message) : undefined;
@@ -672,23 +739,67 @@ function coerceKiroXmlParameter(paramName: string, value: string): unknown {
 	return value;
 }
 
+const PARAMETER_OPEN_PATTERN = /<parameter\b([^>]*)>/gi;
+const PARAMETER_CLOSE_PATTERN = /<\/parameter\s*>/i;
+
+/**
+ * Trim the artifacts left behind when a `<parameter>` value was never closed.
+ *
+ * The observed malformation ends the value with a stray `">` — the model closing an
+ * attribute quote it never opened — followed by a newline before the next tag. Neither
+ * the quote/bracket nor the trailing newline belongs to the intended value.
+ */
+function normalizeUnterminatedParameterValue(value: string): string {
+	return value.replace(/\s+$/u, "").replace(/"?>$/u, "").replace(/\s+$/u, "");
+}
+
+/**
+ * Extract the `name`/value pairs from a leaked `<invoke>` body.
+ *
+ * A single `<parameter ...>(.*?)</parameter>` regex is not enough: Kiro/NUG sometimes
+ * drop one parameter's closing tag, and the lazy body then swallows every following
+ * parameter tag into that value. Observed in the wild as a Bash `workdir` that became
+ * `D:/Some Project">\n<parameter name="description">…`, a path no filesystem can
+ * resolve — the tool reported a missing working directory for a directory that exists.
+ *
+ * So scan the open tags and terminate each value at whichever comes first: its own
+ * closing tag, the next parameter's open tag, or the end of the body. The last case also
+ * recovers a trailing parameter whose closing tag never arrived instead of dropping it.
+ */
+function parseInvokeParameters(body: string): Record<string, unknown> {
+	const input: Record<string, unknown> = {};
+	// Fresh regex instance: the shared literal is stateful (`g`) and this parser can
+	// run re-entrantly from both the streaming and stateless paths.
+	const openRe = new RegExp(PARAMETER_OPEN_PATTERN.source, PARAMETER_OPEN_PATTERN.flags);
+
+	let openMatch = openRe.exec(body);
+	while (openMatch) {
+		const valueStart = openMatch.index + openMatch[0].length;
+		const nextOpenMatch = openRe.exec(body);
+		const nextOpenIndex = nextOpenMatch?.index ?? body.length;
+
+		const rest = body.slice(valueStart, nextOpenIndex);
+		const closeMatch = PARAMETER_CLOSE_PATTERN.exec(rest);
+		const rawValue = closeMatch ? rest.slice(0, closeMatch.index) : rest;
+		const value = closeMatch ? rawValue : normalizeUnterminatedParameterValue(rawValue);
+
+		const paramName = readXmlAttribute(openMatch[1] ?? "", "name");
+		if (paramName) {
+			input[paramName] = coerceKiroXmlParameter(paramName, decodeXmlEntities(value));
+		}
+
+		openMatch = nextOpenMatch;
+	}
+
+	return input;
+}
+
 /** Build a tool use from a leaked `<invoke>` open-tag attribute string and body. */
 function buildInvokeToolUse(attrs: string, body: string): ParsedKiroTextToolUse | null {
 	const name = readXmlAttribute(attrs, "name");
 	if (!name) return null;
 
-	const input: Record<string, unknown> = {};
-	const parameterRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
-	for (const parameterMatch of body.matchAll(parameterRe)) {
-		const paramName = readXmlAttribute(parameterMatch[1] ?? "", "name");
-		if (!paramName) continue;
-		input[paramName] = coerceKiroXmlParameter(
-			paramName,
-			decodeXmlEntities(parameterMatch[2] ?? ""),
-		);
-	}
-
-	return { toolUseId: `kiro_xml_${generateId(12)}`, name, input };
+	return { toolUseId: `kiro_xml_${generateId(12)}`, name, input: parseInvokeParameters(body) };
 }
 
 export function parseKiroTextToolCalls(text: string): {
@@ -825,34 +936,38 @@ export class KiroTextToolCallStreamParser {
 }
 
 /**
- * opus-4.8 (via Kiro/NUG) has a known failure mode where it compulsively repeats a short
- * junk token at the start of freshly wrapped lines — e.g. a run of lines each beginning with
- * "course", "card", "call", or the Chinese "课". This is a decoding hallucination, not real
- * content, so we strip the junk token when it immediately follows a newline.
+ * opus-4.8 / opus-5 (via Kiro/NUG) share a known failure mode where the model compulsively
+ * repeats a short junk token at the start of freshly wrapped lines — e.g. a run of lines each
+ * beginning with "course", "card", "call", "count", or the Chinese "课". This is a decoding
+ * hallucination, not real content, so we strip the junk token when it immediately follows a
+ * newline.
  *
  * The filter is intentionally narrow but aggressive for the Latin markers. When a *lowercase*
- * "course" / "card" / "call" sits at a line head (right after a newline, with optional inline
- * indentation), it is stripped no matter what follows — a space, a CJK character, an ASCII
- * period ("course. 验证…"), other punctuation, or end-of-text. This is safe because a genuine
- * English sentence would capitalize a word at the start of a line; a lowercase marker there is
- * almost always the opus-4.8 hallucination. The ONLY exception is when the marker is really the
- * prefix of a longer word (e.g. "coursework" / "called" / "cards"): if the next character is an
- * ASCII letter or digit, the token is left untouched. A single trailing ASCII sentence-punctuation
- * mark (". , ; : ! ?") is also consumed so lines like "course. 验证…" become "验证…" instead of
- * leaving a stray ". " behind.
+ * "course" / "card" / "call" / "count" sits at a line head (right after a newline, with optional
+ * inline indentation), it is stripped no matter what follows — a space, a CJK character, an ASCII
+ * period ("course. 验证…"), other punctuation, or end-of-text. This is safe enough because the
+ * filter only ever sees streamed *assistant prose*, and a genuine English sentence would capitalize
+ * a word at the start of a line; a lowercase marker there is almost always the hallucination. The
+ * ONLY exception is when the marker is really the prefix of a longer word (e.g. "coursework" /
+ * "called" / "cards" / "counts"): if the next character is an ASCII letter or digit, the token is
+ * left untouched. A single trailing ASCII sentence-punctuation mark (". , ; : ! ?") is also consumed
+ * so lines like "course. 验证…" become "验证…" instead of leaving a stray ". " behind.
  *
  * The Chinese marker "课" keeps a stricter whitespace/newline/EOF boundary so that legitimate
  * Chinese words such as "课程" / "课件" / "功课" are never mangled.
  */
-const HALLUCINATION_LATIN_MARKERS = ["course", "card", "call"] as const;
+const HALLUCINATION_LATIN_MARKERS = ["course", "card", "call", "count"] as const;
 const HALLUCINATION_CJK_MARKERS = ["课"] as const;
 const HALLUCINATION_LINE_HEAD_MARKERS = [
 	...HALLUCINATION_LATIN_MARKERS,
 	...HALLUCINATION_CJK_MARKERS,
 ] as const;
-const HALLUCINATION_MODEL_PATTERN = /opus-4[.-]8/i;
+// The `5` branch needs a right boundary: a bare `opus-5` prefix would also match a future
+// `opus-50`. `(?!\d)` keeps `opus-5`, `opus-5.1`, `opus-5-thinking` matching while rejecting
+// any longer version number.
+const HALLUCINATION_MODEL_PATTERN = /opus-(?:4[.-]8|5(?!\d))/i;
 
-/** Whether the opus-4.8 line-head marker filter should run for the given model. */
+/** Whether the opus-4.8 / opus-5 line-head marker filter should run for the given model. */
 export function shouldFilterHallucinatedMarkers(model?: string): boolean {
 	return model != null && HALLUCINATION_MODEL_PATTERN.test(model);
 }
@@ -861,16 +976,37 @@ const escapeMarker = (m: string) => m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const LATIN_MARKER_ALTERNATION = HALLUCINATION_LATIN_MARKERS.map(escapeMarker).join("|");
 const CJK_MARKER_ALTERNATION = HALLUCINATION_CJK_MARKERS.map(escapeMarker).join("|");
 
-// Match a newline, optional inline indentation, one known marker, then drop it. Only the leading
-// newline + indentation (group 1) is kept. Latin markers are stripped unless the next char is an
-// ASCII letter/digit (a real longer word like "coursework"); a single trailing ASCII punctuation
-// mark plus the run of horizontal whitespace is also consumed. The CJK marker "课" only matches
-// when followed by whitespace/newline/EOF. So "\ncourse Look" → "\nLook", "\ncourse还有" → "\n还有",
-// "\ncourse. 验证" → "\n验证", "\n    course foo" → "\n    foo", and a bare "\ncourse\n" → "\n".
-const HALLUCINATION_MARKER_RE = new RegExp(
-	`(\\r?\\n[ \\t]*)(?:(?:${LATIN_MARKER_ALTERNATION})(?![a-zA-Z0-9])[.,;:!?]?|(?:${CJK_MARKER_ALTERNATION})(?=$|[ \\t]|\\r?\\n))[ \\t]*`,
-	"gu",
+// Match one known marker at the very start of a line, then drop it. Only the leading indentation
+// (group 1) is kept. Latin markers are stripped unless the next char is an ASCII letter/digit (a
+// real longer word like "coursework"); a single trailing ASCII punctuation mark plus the run of
+// horizontal whitespace is also consumed. The CJK marker "课" only matches when followed by
+// whitespace/newline/EOF. So "course Look" → "Look", "course还有" → "还有", "course. 验证" → "验证",
+// "    course foo" → "    foo", and a bare "course\n" → "\n". The filter applies this only to lines
+// that follow a newline and sit outside a fenced code block.
+const HALLUCINATION_LINE_HEAD_RE = new RegExp(
+	`^([ \\t]*)(?:(?:${LATIN_MARKER_ALTERNATION})(?![a-zA-Z0-9])[.,;:!?]?|(?:${CJK_MARKER_ALTERNATION})(?=$|[ \\t\\r\\n]))[ \\t]*`,
+	"u",
 );
+
+/**
+ * A fenced code block delimiter: up to 3 leading spaces/tabs, then a run of 3+ backticks or
+ * tildes, then the rest of the line (the info string for an opener). Markers are never stripped
+ * from lines inside a fenced block, so code the model shows us survives verbatim.
+ */
+const CODE_FENCE_RE = /^[ \t]{0,3}(`{3,}|~{3,})([^\r\n]*)$/;
+
+/**
+ * An unterminated line at a line head that could still turn out to be a fence delimiter: either a
+ * short run of 1-2 fence chars with nothing after it (the next delta may extend it to 3+), or an
+ * already-complete run of 3+ whose info string is still arriving (an info string means "opener",
+ * an empty one may mean "closer", so the decision needs the whole line).
+ */
+const PARTIAL_CODE_FENCE_RE = /^[ \t]{0,3}(?:(?:`{1,2}|~{1,2})$|(?:`{3,}|~{3,})[^\r\n]*$)/;
+
+interface OpenCodeFence {
+	char: string;
+	length: number;
+}
 
 // A line head that is a *complete* Latin marker plus an optional trailing sentence-punctuation
 // mark and run of horizontal whitespace, with no real content yet. While streaming we must keep
@@ -881,56 +1017,125 @@ const LATIN_MARKER_UNSETTLED_TAIL_RE = new RegExp(
 );
 
 /**
- * Stateful filter that removes opus-4.8 hallucinated line-head markers from streamed text.
+ * Stateful filter that removes opus-4.8 / opus-5 hallucinated line-head markers from streamed text.
  *
  * Because markers land at the start of a line and the offending token can be split across
  * streaming deltas (e.g. "\nco" + "urse Look"), the filter buffers the shortest tail that could
- * still grow into a `\n`-prefixed marker and only emits text proven to be safe.
+ * still grow into a marker line and only emits text proven to be safe.
+ *
+ * Fenced code blocks (``` / ~~~) are exempt: inside a fence, `count = 0` or `call(foo)` at a line
+ * head is real code, so lines are passed through untouched until the fence closes. The fence state
+ * is tracked line by line across deltas, and only a matching-or-longer run of the same fence
+ * character closes a block (CommonMark rules), so a ``` block can contain ~~~ lines and vice versa.
+ * The very first line of the stream is also never filtered, since a marker must follow a newline.
  */
 export class KiroHallucinationMarkerFilter {
 	private buffer = "";
+	/** Whether the next buffered line starts a fresh line (i.e. a newline was already emitted). */
+	private atLineStart = false;
+	/** The currently open fence, or null when outside a fenced code block. */
+	private openFence: OpenCodeFence | null = null;
 
 	push(delta: string): string {
 		this.buffer += delta;
-		// Emit everything except a trailing region that might still be completing a marker.
-		const keepFrom = this.retentionStart(this.buffer);
-		const emit = this.stripMarkers(this.buffer.slice(0, keepFrom));
-		this.buffer = this.buffer.slice(keepFrom);
-		return emit;
+		let out = "";
+		// Consume every complete line first, so fence/line-start state is current before we judge
+		// the unterminated tail.
+		const lastNewline = this.buffer.lastIndexOf("\n");
+		if (lastNewline >= 0) {
+			out += this.consume(this.buffer.slice(0, lastNewline + 1));
+			this.buffer = this.buffer.slice(lastNewline + 1);
+		}
+		// Emit the trailing partial line too, unless it could still change meaning.
+		if (this.canEmitPartialLine(this.buffer)) {
+			out += this.consume(this.buffer);
+			this.buffer = "";
+		}
+		return out;
 	}
 
 	flush(): string {
-		const emit = this.stripMarkers(this.buffer);
+		const emit = this.consume(this.buffer);
 		this.buffer = "";
 		return emit;
 	}
 
-	private stripMarkers(text: string): string {
+	/**
+	 * Strip markers from every line in `text`, tracking code-fence state as we go. `text` is only
+	 * ever the settled prefix of the buffer, so a trailing line without a newline here is either
+	 * final (flush) or already proven safe to emit (push).
+	 */
+	private consume(text: string): string {
 		if (!text) return text;
-		// Collapse "\n<indent>marker<sep>" down to "\n<indent>", dropping the junk marker and the
-		// single whitespace run that separated it from the real line content.
-		return text.replace(HALLUCINATION_MARKER_RE, (_match, lead: string) => lead);
+		let out = "";
+		let pos = 0;
+		while (pos < text.length) {
+			const nl = text.indexOf("\n", pos);
+			const lineEnd = nl < 0 ? text.length : nl + 1;
+			const raw = text.slice(pos, lineEnd);
+			out += this.consumeLine(raw);
+			// A marker only ever sits at the head of a line that follows a newline.
+			this.atLineStart = nl >= 0;
+			pos = lineEnd;
+		}
+		return out;
+	}
+
+	/** Handle one line (including its trailing newline, when present). */
+	private consumeLine(raw: string): string {
+		// Line content without its trailing newline, for fence detection.
+		const content = raw.replace(/\r?\n$/, "");
+		const fence = CODE_FENCE_RE.exec(content);
+
+		if (this.openFence) {
+			// Inside a fence everything is verbatim; a bare matching delimiter closes the block.
+			if (fence && this.closesFence(fence[1], fence[2])) this.openFence = null;
+			return raw;
+		}
+		if (fence) {
+			this.openFence = { char: fence[1][0], length: fence[1].length };
+			return raw;
+		}
+		if (!this.atLineStart) return raw;
+		return raw.replace(HALLUCINATION_LINE_HEAD_RE, (_m, indent: string) => indent);
+	}
+
+	/** Whether a fence delimiter closes the currently open fence (CommonMark rules). */
+	private closesFence(run: string, info: string): boolean {
+		const open = this.openFence;
+		if (!open) return false;
+		// Same fence character, at least as long, and no info string.
+		return run[0] === open.char && run.length >= open.length && info.trim().length === 0;
 	}
 
 	/**
-	 * Index from which the tail must be retained because it could still complete a `\n`-prefixed
-	 * marker on the next delta. We hold back from the last newline whose following text is still
-	 * short enough to be a partial marker.
+	 * Whether the buffered partial line (no trailing newline) can be emitted now, or must be held
+	 * because the next delta could still change how it is treated — by completing a marker or by
+	 * turning the line into a code-fence delimiter.
 	 */
-	private retentionStart(buf: string): number {
-		const lastNewline = buf.lastIndexOf("\n");
-		if (lastNewline < 0) return buf.length;
-		// Text after the final newline, skipping inline indentation.
-		const afterNewline = buf.slice(lastNewline + 1).replace(/^[ \t]*/, "");
+	private canEmitPartialLine(tail: string): boolean {
+		if (tail.length === 0) return true;
+		// A trailing CR belongs with a not-yet-arrived LF; holding it keeps CRLF splitting correct.
+		if (tail === "\r") return false;
+		// A tail continuing a line whose head was already emitted holds no marker or fence position,
+		// so it goes out immediately — mid-line inline code like "use `x`" must not stall the stream.
+		if (!this.atLineStart) return true;
+		// Hold a tail that might still become a fence delimiter: opening or closing a block changes
+		// whether *subsequent* lines get filtered, so the full delimiter line must be settled first.
+		if (PARTIAL_CODE_FENCE_RE.test(tail)) return false;
+		// Inside a fenced block nothing is stripped, so no marker retention is needed.
+		if (this.openFence) return true;
+		// Line head without its inline indentation.
+		const head = tail.replace(/^[ \t]*/, "");
 		// Hold back while the line head is still an incomplete marker prefix (e.g. "cou") with
 		// nothing after it — the next delta may complete it into a marker. couldBeMarkerPrefix
 		// requires the whole segment to be a prefix, so it already fails once real content follows.
-		if (couldBeMarkerPrefix(afterNewline)) return lastNewline;
+		if (couldBeMarkerPrefix(head)) return false;
 		// Also hold a *complete* Latin marker plus optional trailing punctuation/whitespace when no
 		// real content has arrived yet: the exact span the marker regex will consume (including the
 		// trailing whitespace run separating it from content) is not settled until content appears.
-		if (LATIN_MARKER_UNSETTLED_TAIL_RE.test(afterNewline)) return lastNewline;
-		return buf.length;
+		if (LATIN_MARKER_UNSETTLED_TAIL_RE.test(head)) return false;
+		return true;
 	}
 }
 

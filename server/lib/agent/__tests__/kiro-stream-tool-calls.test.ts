@@ -176,6 +176,70 @@ describe("KiroTextToolCallStreamParser", () => {
 		});
 	});
 
+	test("does not let an unterminated parameter swallow the following parameters", () => {
+		// Reproduces the Windows report: the model dropped `workdir`'s closing tag and
+		// ended the value with a stray `">`. A lazy `<parameter>...</parameter>` match
+		// folded every later parameter into that value, producing a `workdir` no
+		// filesystem could resolve — the Bash tool then reported a missing working
+		// directory for a directory that exists and killed the narrator.
+		const { tools } = runParser([
+			'<invoke name="Bash">',
+			"<parameter name=\"command\">sed -n '20,95p' export-for-ai-2/decompile/7FF70B449BA0.c</parameter>",
+			'<parameter name="workdir">D:/GoSLAM Mapping Master Pro">\n',
+			'<parameter name="description">读 449BA0 全文确认与 449DE0 的差异</parameter>',
+			"</invoke>",
+		]);
+
+		expect(tools).toHaveLength(1);
+		expect(tools[0].input).toEqual({
+			command: "sed -n '20,95p' export-for-ai-2/decompile/7FF70B449BA0.c",
+			workdir: "D:/GoSLAM Mapping Master Pro",
+			description: "读 449BA0 全文确认与 449DE0 的差异",
+		});
+	});
+
+	test("recovers a trailing parameter whose closing tag never arrived", () => {
+		const { tools } = runParser([
+			'<invoke name="Bash">',
+			'<parameter name="command">pwd</parameter>',
+			'<parameter name="description">Show working directory',
+			"</invoke>",
+		]);
+
+		expect(tools).toHaveLength(1);
+		expect(tools[0].input).toEqual({ command: "pwd", description: "Show working directory" });
+	});
+
+	test("still coerces typed parameters when a closing tag is missing", () => {
+		const { tools } = runParser([
+			'<invoke name="Bash">',
+			'<parameter name="command">sleep 1</parameter>',
+			'<parameter name="run_in_background">true">\n',
+			'<parameter name="timeout">5000</parameter>',
+			"</invoke>",
+		]);
+
+		expect(tools[0].input).toEqual({
+			command: "sleep 1",
+			run_in_background: true,
+			timeout: 5000,
+		});
+	});
+
+	test("keeps multi-line values that contain their own closing tag intact", () => {
+		const { tools } = runParser([
+			'<invoke name="Write">',
+			'<parameter name="file_path">/tmp/a.md</parameter>',
+			'<parameter name="content">line 1\n\nline 2  \n</parameter>',
+			"</invoke>",
+		]);
+
+		expect(tools[0].input).toEqual({
+			file_path: "/tmp/a.md",
+			content: "line 1\n\nline 2  \n",
+		});
+	});
+
 	test("coerces the reflection-gate `confirm` parameter to a boolean", () => {
 		// Reproduces a leaked DangerConfirm tool call (Kiro/NUG). The `confirm`
 		// parameter must coerce to boolean true so z.literal(true) schema validation
