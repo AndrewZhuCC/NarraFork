@@ -59,7 +59,10 @@ export {
 export type { ChatGroup, ChatGroupMember, ChatGroupMessage, ChatGroupSummary } from "./chat-groups";
 export {
 	ApiError,
+	absorbRenewedToken,
+	authorizedFetch,
 	clearToken,
+	clearTokenOnSessionFailure,
 	getToken,
 	isAbortError,
 	readFetchError,
@@ -190,6 +193,7 @@ export type {
 	DatabaseStorageBreakdown,
 	DatabaseStorageCategoryKey,
 	DatabaseStorageCategorySummary,
+	DatabaseStorageReadFailures,
 	DatabaseStorageTableSummary,
 	DatabaseTableKind,
 	DatabaseVacuumResult,
