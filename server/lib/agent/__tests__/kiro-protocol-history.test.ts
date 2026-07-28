@@ -3,7 +3,9 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { KiroChatRequest, KiroToolResult } from "../../kiro-adapter";
+import { StreamStaleError } from "../../stream-timeout";
 import { setUploadsDirForTests } from "../../uploads";
+import { isRetryableError } from "../error-handling";
 import { buildKiroHistory, normalizeKiroChatRequest, parseSSEStream } from "../kiro-protocol";
 import type { DbMessage, ParsedStreamEvent } from "../provider";
 
@@ -333,5 +335,31 @@ describe("parseSSEStream", () => {
 		}
 
 		expect(events).toEqual([{ queueStatus: { position: 3, queueDepth: 8 } }, { text: "ready" }]);
+	});
+
+	// A half-open gateway connection delivers no bytes and no FIN. Without a guarded
+	// read the generator hangs forever, leaving the in-flight tool call stuck at
+	// "initializing" — its own timeout never arms because the tool never executes.
+	test("raises StreamStaleError when the gateway stops sending", async () => {
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode('data: {"content":"partial"}\n\n'));
+				// Never closes: emulates a stalled upstream.
+			},
+		});
+
+		const events: ParsedStreamEvent[] = [];
+		let caught: unknown;
+		try {
+			for await (const event of parseSSEStream(body, { staleTimeoutMs: 50 })) {
+				events.push(event);
+			}
+		} catch (err) {
+			caught = err;
+		}
+
+		expect(events).toEqual([{ text: "partial" }]);
+		expect(caught).toBeInstanceOf(StreamStaleError);
+		expect(isRetryableError(caught)).toBe(true);
 	});
 });

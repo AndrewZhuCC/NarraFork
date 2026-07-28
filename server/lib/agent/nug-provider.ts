@@ -872,6 +872,7 @@ export class NugProvider implements ProviderAdapter {
 					chunks.push(evt.text);
 					await options?.onTextDelta?.(evt.text);
 				}
+				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
 				if (evt.credentialId) credentialId = evt.credentialId;
@@ -996,6 +997,7 @@ export class NugProvider implements ProviderAdapter {
 					chunks.push(evt.text);
 					await options?.onTextDelta?.(evt.text);
 				}
+				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
 				if (evt.usage) usage = toUsageData(evt.usage);
 				if (evt.credentialId) credentialId = evt.credentialId;

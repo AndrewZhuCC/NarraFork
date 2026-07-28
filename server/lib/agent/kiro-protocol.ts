@@ -11,6 +11,7 @@ import type {
 	StreamEvent,
 } from "../kiro-adapter";
 import { logger } from "../logger";
+import { readWithTimeout } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { parseGatewaySSEEvent } from "./gateway-events";
@@ -56,6 +57,13 @@ export interface KiroStreamParseOptions {
 	 * marker filter (see {@link KiroHallucinationMarkerFilter}).
 	 */
 	model?: string;
+	/**
+	 * Per-read inactivity budget (ms) for {@link parseSSEStream}. Omitted → the
+	 * `readWithTimeout` default. A half-open SSE connection never delivers FIN, so
+	 * without this guard the read would hang forever and the in-flight tool call
+	 * would stay at "initializing" with no deadline of its own.
+	 */
+	staleTimeoutMs?: number;
 }
 
 /**
@@ -1427,7 +1435,10 @@ export async function* parseSSEStream(
 
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			// Guarded read, matching the native Kiro binary parser (kiro/event-stream-parser.ts)
+			// and every other provider. A stalled gateway stream raises StreamStaleError, which
+			// isRetryableError() always treats as retryable, instead of hanging the turn.
+			const { done, value } = await readWithTimeout(reader, options.staleTimeoutMs);
 			if (done) break;
 			buf += decoder.decode(value, { stream: true });
 
