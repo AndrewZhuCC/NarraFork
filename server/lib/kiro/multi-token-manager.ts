@@ -5,6 +5,12 @@ import { createHash, randomUUID } from "node:crypto";
 import { generateShortId } from "../id";
 import { logger } from "../logger";
 import {
+	apiKeyOf,
+	applyKiroTokenTypeHeader,
+	canonicalKiroAuthMethod,
+	isApiKeyCredential,
+} from "./auth-method";
+import {
 	getAllStates,
 	getHeadroom,
 	getRpmCounts,
@@ -54,11 +60,28 @@ function sha256Hex(input: string): string {
 }
 
 function isExpired(creds: KiroCredentials): boolean {
+	// Static API keys never expire.
+	if (canonicalKiroAuthMethod(creds) === "api_key") return false;
 	return isExpiringWithin(creds, 5) ?? true;
 }
 
 function isExpiringSoon(creds: KiroCredentials): boolean {
+	// Static API keys are never pre-refreshed.
+	if (canonicalKiroAuthMethod(creds) === "api_key") return false;
 	return isExpiringWithin(creds, 10) ?? false;
+}
+
+/**
+ * Secret used to deduplicate credentials.
+ *
+ * Refresh-token credentials dedupe on the refresh token; static API key
+ * credentials dedupe on the key value itself (NUG stores the key in
+ * refresh_token for the same reason).
+ */
+function dedupeSecret(creds: KiroCredentials): string | undefined {
+	const refreshToken = creds.refreshToken?.trim();
+	if (refreshToken) return refreshToken;
+	return apiKeyOf(creds);
 }
 
 function isExpiringWithin(creds: KiroCredentials, minutes: number): boolean | null {
@@ -81,7 +104,9 @@ export function classifyKiroCredentialTier(creds: KiroCredentials): AccountTier 
 		if (lower.includes("free")) return "free";
 		return "paid";
 	}
-	if (creds.authMethod === "idc" && creds.clientId && creds.clientSecret) return "enterprise";
+	if (canonicalKiroAuthMethod(creds) === "idc" && creds.clientId && creds.clientSecret) {
+		return "enterprise";
+	}
 	return "free";
 }
 
@@ -158,12 +183,13 @@ export class MultiTokenManager {
 			}
 		}
 
-		// SHA-256 dedup based on refreshToken
+		// SHA-256 dedup based on refreshToken (or the API key for api_key creds)
 		const seen = new Set<string>();
 		const deduped: KiroCredentials[] = [];
 		for (const c of credentials) {
-			if (c.refreshToken) {
-				const hash = sha256Hex(c.refreshToken);
+			const secret = dedupeSecret(c);
+			if (secret) {
+				const hash = sha256Hex(secret);
 				if (seen.has(hash)) continue;
 				seen.add(hash);
 			}
@@ -344,6 +370,18 @@ export class MultiTokenManager {
 
 	private async tryEnsureToken(entry: CredentialEntry): Promise<CallContext | null> {
 		const creds = entry.credentials;
+
+		// Static API keys are used directly as the bearer token — never refreshed.
+		if (canonicalKiroAuthMethod(creds) === "api_key") {
+			const key = apiKeyOf(creds);
+			if (!key) {
+				logger.warn("[kiro] api_key credential missing stored key", { credentialId: entry.id });
+				return null;
+			}
+			this.currentId = entry.id;
+			return { id: entry.id, credentials: creds, token: key };
+		}
+
 		const needsRefresh = isExpired(creds) || isExpiringSoon(creds);
 
 		if (!needsRefresh) {
@@ -571,7 +609,10 @@ export class MultiTokenManager {
 				hasProfileArn: !!e.credentials.profileArn,
 				hasStartUrl: !!e.credentials.startUrl,
 				expiresAt: e.credentials.expiresAt,
+				// Reported as stored (already canonicalized on load) so existing UI
+				// tier classification for legacy values like "builder-id" is unchanged.
 				authMethod: e.credentials.authMethod,
+				isApiKey: isApiKeyCredential(e.credentials),
 				subscriptionTitle: e.credentials.subscriptionTitle,
 				region: e.credentials.region,
 				meterUsage: e.credentials.meterUsage,
@@ -654,6 +695,13 @@ export class MultiTokenManager {
 	async manualRefresh(id: string): Promise<void> {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
+		// A static API key has nothing to refresh. The UI hides the button for these,
+		// but the route is callable directly — without this guard the request would
+		// stamp a fresh far-future expiry and rewrite the credentials file for no
+		// reason. Rejecting is also the honest answer for the caller.
+		if (canonicalKiroAuthMethod(entry.credentials) === "api_key") {
+			throw new Error("Static API key credentials are never refreshed");
+		}
 		const refreshed = await this.deduplicatedRefresh(id, entry.credentials);
 		entry.credentials = refreshed;
 		this.persistCredentials();
@@ -676,23 +724,23 @@ export class MultiTokenManager {
 	// ==================== Import Credentials ====================
 
 	addCredentials(newCreds: KiroCredentials[]): { added: number; duplicates: number } {
-		// Build set of existing refreshToken hashes
+		// Build set of existing dedupe-secret hashes (refreshToken, or API key)
 		const existingHashes = new Set<string>();
 		for (const e of this.entries) {
-			if (e.credentials.refreshToken) {
-				existingHashes.add(sha256Hex(e.credentials.refreshToken));
-			}
+			const secret = dedupeSecret(e.credentials);
+			if (secret) existingHashes.add(sha256Hex(secret));
 		}
 
 		let added = 0;
 		let duplicates = 0;
 
 		for (const cred of newCreds) {
-			if (!cred.refreshToken) {
+			const secret = dedupeSecret(cred);
+			if (!secret) {
 				duplicates++;
 				continue;
 			}
-			const hash = sha256Hex(cred.refreshToken);
+			const hash = sha256Hex(secret);
 			if (existingHashes.has(hash)) {
 				duplicates++;
 				continue;
@@ -761,6 +809,7 @@ export class MultiTokenManager {
 			"amz-sdk-request": "attempt=1; max=1",
 			Authorization: `Bearer ${ctx.token}`,
 		};
+		applyKiroTokenTypeHeader(headers, creds);
 
 		logger.debug("[kiro:usage] fetch POST", { url });
 		let res: Response;
@@ -934,6 +983,7 @@ export class MultiTokenManager {
 				"amz-sdk-request": "attempt=1; max=1",
 				Authorization: `Bearer ${ctx.token}`,
 			};
+			applyKiroTokenTypeHeader(headers, creds);
 
 			logger.debug("[kiro:models] fetch POST", { url: requestUrl });
 			let res: Response;

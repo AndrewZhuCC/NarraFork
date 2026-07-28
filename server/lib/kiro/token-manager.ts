@@ -1,6 +1,7 @@
 // Token manager — reverse-engineered from kiro CLI chat
 // Single-credential mode with auto-refresh (Social + IdC)
 
+import { apiKeyOf, canonicalKiroAuthMethod } from "./auth-method";
 import { effectiveAuthRegion, loadCredentials, saveCredentials } from "./config";
 import { generateMachineId } from "./machine-id";
 import { pfetch } from "./proxy";
@@ -9,30 +10,56 @@ import { KiroAuthError, type KiroConfig, type KiroCredentials } from "./types";
 const IDC_AMZ_USER_AGENT =
 	"aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
 
+/** Nominal expiry for static API keys so they never look expired. */
+const API_KEY_EXPIRY_MS = 10 * 365 * 24 * 60 * 60 * 1000;
+
+/** Far-future ISO expiry stamped onto static API key credentials. */
+export function apiKeyFarFutureExpiry(): string {
+	return new Date(Date.now() + API_KEY_EXPIRY_MS).toISOString();
+}
+
 /**
  * Standalone credential refresh — used by both KiroTokenManager and MultiTokenManager.
  * Detects auth method and delegates to Social or IdC refresh.
+ *
+ * Static API key credentials are never refreshed: the stored key is returned as
+ * the access token with a far-future expiry.
  */
 export async function refreshCredentials(
 	creds: KiroCredentials,
 	config: KiroConfig,
 ): Promise<KiroCredentials> {
+	const authMethod = canonicalKiroAuthMethod(creds);
+	if (authMethod === "api_key") return refreshApiKey(creds);
+
 	const rt = creds.refreshToken;
 	if (!rt) throw new KiroAuthError("Missing refreshToken");
 	if (rt.length < 100 || rt.includes("...")) {
 		throw new KiroAuthError(`refreshToken appears truncated (${rt.length} chars)`);
 	}
 
-	const authMethod = detectAuthMethod(creds);
 	return authMethod === "idc" ? refreshIdc(creds, config) : refreshSocial(creds, config);
 }
 
-function detectAuthMethod(creds: KiroCredentials): string {
-	const m = creds.authMethod?.toLowerCase();
-	if (m === "idc" || m === "builder-id" || m === "iam") return "idc";
-	if (m === "social") return "social";
-	if (creds.clientId && creds.clientSecret) return "idc";
-	return "social";
+/**
+ * "Refresh" a static API key credential.
+ *
+ * Defensive by design: the callers all short-circuit before reaching a refresh —
+ * `MultiTokenManager.tryEnsureToken` returns the key directly, its `isExpired` /
+ * `isExpiringSoon` never report an api_key credential as stale, and
+ * `KiroTokenManager.ensureValidToken` returns early. When something reaches here
+ * anyway, normalize the credential instead of hitting the network.
+ */
+function refreshApiKey(creds: KiroCredentials): KiroCredentials {
+	const key = apiKeyOf(creds);
+	if (!key) throw new KiroAuthError("api_key credential missing stored key");
+	return {
+		...creds,
+		authMethod: "api_key",
+		apiKey: key,
+		accessToken: key,
+		expiresAt: apiKeyFarFutureExpiry(),
+	};
 }
 
 async function refreshSocial(creds: KiroCredentials, config: KiroConfig): Promise<KiroCredentials> {
@@ -157,6 +184,12 @@ export class KiroTokenManager {
 
 	/** Ensure token is valid, refresh if needed. Returns accessToken. */
 	async ensureValidToken(): Promise<string> {
+		// Static API keys are long-lived bearer tokens: never refresh them.
+		if (canonicalKiroAuthMethod(this.credentials) === "api_key") {
+			const key = apiKeyOf(this.credentials);
+			if (!key) throw new KiroAuthError("api_key credential missing stored key");
+			return key;
+		}
 		if (this.isExpired() || this.isExpiringSoon()) {
 			await this.refresh();
 		}

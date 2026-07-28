@@ -1,6 +1,7 @@
 // MCP Client — reverse-engineered from kiro CLI chat
 
 import { randomUUID } from "node:crypto";
+import { applyKiroTokenTypeHeader } from "./auth-method";
 import {
 	acquireSlot,
 	acquireSlotPriority,
@@ -258,7 +259,7 @@ export class KiroMcpClient {
 		const { kiroVersion } = config;
 		const [os, osVersion] = config.systemVersion.split("#");
 
-		return {
+		const headers: Record<string, string> = {
 			"Content-Type": "application/x-amz-json-1.0",
 			"x-amz-target": "AmazonCodeWhispererStreamingService.InvokeMCP",
 			"x-amzn-codewhisperer-optout": "true",
@@ -272,6 +273,8 @@ export class KiroMcpClient {
 			"x-amzn-codewhisperer-ide": "kiro",
 			"x-amzn-codewhisperer-ide-version": kiroVersion,
 		};
+		applyKiroTokenTypeHeader(headers, ctx.credentials);
+		return headers;
 	}
 
 	private delay(attempt: number, signal?: AbortSignal): Promise<void> {

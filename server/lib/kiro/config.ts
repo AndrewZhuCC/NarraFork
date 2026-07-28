@@ -2,6 +2,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { isApiKeyAuthMethod } from "./auth-method";
 import type {
 	AccountTier,
 	ConcurrencyPlanConfig,
@@ -35,12 +36,26 @@ const CONFIG_DEFAULTS: KiroConfig = {
 	requestInterval: { ...DEFAULT_REQUEST_INTERVAL },
 };
 
+/**
+ * Normalize an on-disk credential in place.
+ *
+ * - Legacy `iam` auth method maps to `idc`.
+ * - Any api_key spelling (`apiKey`, `api-key`, `API_KEY`) maps to `api_key`,
+ *   and the stored key is mirrored onto `apiKey`/`accessToken` so both the
+ *   bearer-token path and the dedupe path can read it.
+ */
 function canonicalizeAuthMethod(creds: KiroCredentials): void {
-	const m = creds.authMethod;
-	if (!m) return;
-	const lower = m.toLowerCase();
+	const lower = creds.authMethod?.toLowerCase();
 	if (lower === "iam") {
 		creds.authMethod = "idc";
+		return;
+	}
+	if (isApiKeyAuthMethod(lower) || (!creds.refreshToken && creds.apiKey?.trim())) {
+		const key = creds.apiKey?.trim() || creds.accessToken?.trim();
+		if (!key) return;
+		creds.authMethod = "api_key";
+		creds.apiKey = key;
+		creds.accessToken = key;
 	}
 }
 

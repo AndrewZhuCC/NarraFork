@@ -26,7 +26,8 @@ function sha256Hex(input: string): string {
 
 /**
  * Generate machineId from credentials and config.
- * Priority: cred.machineId > config.machineId > SHA256("KotlinNativeAPI/" + refreshToken)
+ * Priority: cred.machineId > config.machineId > SHA256("KotlinNativeAPI/" + secret)
+ * where secret is the refreshToken, or the static API key for api_key credentials.
  */
 export function generateMachineId(creds: KiroCredentials, config: KiroConfig): string | null {
 	if (creds.machineId) {
@@ -39,8 +40,9 @@ export function generateMachineId(creds: KiroCredentials, config: KiroConfig): s
 		if (normalized) return normalized;
 	}
 
-	if (creds.refreshToken) {
-		return sha256Hex(`KotlinNativeAPI/${creds.refreshToken}`);
+	const secret = creds.refreshToken || creds.apiKey;
+	if (secret) {
+		return sha256Hex(`KotlinNativeAPI/${secret}`);
 	}
 
 	return null;

@@ -43,6 +43,8 @@ export interface CredentialSnapshot {
 	hasProfileArn: boolean;
 	expiresAt?: string;
 	authMethod?: string;
+	/** True for static Kiro API key credentials (never refreshed, never expire). */
+	isApiKey?: boolean;
 	subscriptionTitle?: string;
 	region?: string;
 	meterUsage?: number;
@@ -114,6 +116,13 @@ export interface UsageQueueSnapshot {
 
 export interface ImportCredentialInput {
 	refreshToken?: string;
+	/**
+	 * Static Kiro API key (KIRO_API_KEY). Accepted in place of `refreshToken`;
+	 * `authMethod` is inferred as "api_key" when only a key is supplied.
+	 * The import path also accepts the `kiroApiKey` / `kiro_api_key` aliases.
+	 */
+	apiKey?: string;
+	accessToken?: string;
 	authMethod?: string;
 	clientId?: string;
 	clientSecret?: string;
@@ -122,6 +131,8 @@ export interface ImportCredentialInput {
 	authRegion?: string;
 	apiRegion?: string;
 	email?: string;
+	displayName?: string;
+	profileArn?: string;
 	proxyUrl?: string;
 	proxyUsername?: string;
 	proxyPassword?: string;

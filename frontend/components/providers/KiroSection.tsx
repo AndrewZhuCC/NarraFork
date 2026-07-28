@@ -38,7 +38,18 @@ import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import { ModelList } from "./ModelList";
-import { classifyKiroTier, type KiroAccountTier, TIER_CONFIG } from "./types";
+import {
+	classifyKiroTier,
+	isKiroApiKeyAuthMethod,
+	type KiroAccountTier,
+	TIER_CONFIG,
+} from "./types";
+
+/** Whether a credential snapshot entry is a static Kiro API key credential. */
+// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+function isApiKeyEntry(entry: any): boolean {
+	return entry?.isApiKey === true || isKiroApiKeyAuthMethod(entry?.authMethod);
+}
 
 const KIRO_STATUS_GC_TIME_MS = 60_000;
 
@@ -332,6 +343,9 @@ export const KiroSection = React.memo(function KiroSection({
 				autosize
 				styles={{ input: { fontFamily: "monospace", fontSize: 12 } }}
 			/>
+			<Text size="xs" c="dimmed">
+				{t("kiroImportApiKeyHint")}
+			</Text>
 			{importError && (
 				<Text c="red" size="sm">
 					{importError}
@@ -523,6 +537,12 @@ function CredentialActions({
 	const canToggleEnabled = entry.disabled
 		? muts.canEnableKiroCredential
 		: muts.canDisableKiroCredential;
+	// Static API keys are long-lived bearer tokens — there is nothing to refresh.
+	const isApiKey = isApiKeyEntry(entry);
+	const canRefresh = muts.canRefreshKiroCredential && !isApiKey;
+	const refreshDisabledReason = isApiKey
+		? t("kiroApiKeyNoRefresh")
+		: muts.credentialRouteUnsupportedReason;
 	return (
 		<Group gap="xs" wrap="wrap">
 			<Switch
@@ -535,14 +555,14 @@ function CredentialActions({
 					entry.disabled ? muts.enableMut.mutate(entry.id) : muts.disableMut.mutate(entry.id);
 				}}
 			/>
-			<Tooltip label={t("kiroRefreshToken")}>
+			<Tooltip label={isApiKey ? refreshDisabledReason : t("kiroRefreshToken")}>
 				<ActionIcon
 					variant="subtle"
 					size="sm"
-					onClick={() => muts.canRefreshKiroCredential && muts.refreshMut.mutate(entry.id)}
+					onClick={() => canRefresh && muts.refreshMut.mutate(entry.id)}
 					loading={muts.refreshMut.isPending}
-					disabled={!muts.canRefreshKiroCredential}
-					title={!muts.canRefreshKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
+					disabled={!canRefresh}
+					title={!canRefresh ? refreshDisabledReason : undefined}
 				>
 					<IconRefresh size={14} />
 				</ActionIcon>
@@ -744,6 +764,11 @@ function CredentialCard({
 						</Text>
 					</Group>
 					<Group gap="xs">
+						{isApiKeyEntry(entry) && (
+							<Badge color="teal" size="sm" variant="light">
+								{t("kiroApiKeyBadge")}
+							</Badge>
+						)}
 						{entry.disabled ? (
 							<Badge color="red" size="sm">
 								{entry.disabledReason ?? "disabled"}
@@ -829,7 +854,11 @@ function CredentialCard({
 									{t("kiroColExpires")}
 								</Text>
 								<Text size="xs" c="dimmed">
-									{entry.expiresAt ? relativeTime(entry.expiresAt) : "-"}
+									{isApiKeyEntry(entry)
+										? t("kiroApiKeyNeverExpires")
+										: entry.expiresAt
+											? relativeTime(entry.expiresAt)
+											: "-"}
 								</Text>
 							</Group>
 							<Group justify="space-between" wrap="nowrap">
@@ -1039,19 +1068,30 @@ function CredentialTableRow({
 				<Text size="sm">{entry.priority}</Text>
 			</Table.Td>
 			<Table.Td>
-				{entry.disabled ? (
-					<Badge color="red" size="sm">
-						{entry.disabledReason ?? "disabled"}
-					</Badge>
-				) : (
-					<Badge color="green" size="sm">
-						enabled
-					</Badge>
-				)}
+				<Group gap={4} wrap="wrap">
+					{isApiKeyEntry(entry) && (
+						<Badge color="teal" size="sm" variant="light">
+							{t("kiroApiKeyBadge")}
+						</Badge>
+					)}
+					{entry.disabled ? (
+						<Badge color="red" size="sm">
+							{entry.disabledReason ?? "disabled"}
+						</Badge>
+					) : (
+						<Badge color="green" size="sm">
+							enabled
+						</Badge>
+					)}
+				</Group>
 			</Table.Td>
 			<Table.Td>
 				<Text size="xs" c="dimmed">
-					{entry.expiresAt ? relativeTime(entry.expiresAt) : "-"}
+					{isApiKeyEntry(entry)
+						? t("kiroApiKeyNeverExpires")
+						: entry.expiresAt
+							? relativeTime(entry.expiresAt)
+							: "-"}
 				</Text>
 			</Table.Td>
 			<Table.Td>

@@ -29,9 +29,15 @@ export interface KiroCredentials {
 	id?: string;
 	accessToken?: string;
 	refreshToken?: string;
+	/**
+	 * Static Kiro API key (KIRO_API_KEY / "ksk_..."). Present only for
+	 * `authMethod: "api_key"` credentials, where it is used directly as the
+	 * bearer token and never refreshed.
+	 */
+	apiKey?: string;
 	profileArn?: string;
 	expiresAt?: string; // RFC3339
-	authMethod?: string; // "social" | "idc"
+	authMethod?: string; // "social" | "idc" | "api_key"
 	clientId?: string;
 	clientSecret?: string;
 	priority?: number; // lower = higher priority, default 0
@@ -165,6 +171,8 @@ export interface CredentialSnapshot {
 	hasStartUrl: boolean;
 	expiresAt?: string;
 	authMethod?: string;
+	/** True for static API key credentials (never refreshed, never expire). */
+	isApiKey?: boolean;
 	subscriptionTitle?: string;
 	region?: string;
 	meterUsage?: number;

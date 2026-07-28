@@ -90,6 +90,18 @@ export function ensurePrefix(val: string): string {
 	return `openai:${val}`;
 }
 
+/** Whether an auth-method string denotes a static Kiro API key credential. */
+export function isKiroApiKeyAuthMethod(method?: string): boolean {
+	switch (method?.trim().toLowerCase()) {
+		case "api_key":
+		case "apikey":
+		case "api-key":
+			return true;
+		default:
+			return false;
+	}
+}
+
 /**
  * Classify a Kiro credential's account tier.
  *
@@ -98,6 +110,9 @@ export function ensurePrefix(val: string): string {
  * 2. subscriptionTitle contains "enterprise" / "business" → enterprise
  * 3. subscriptionTitle contains "pro" / "individual" / "paid" / "builder" / "power" → paid
  * 4. subscriptionTitle contains "free" or is absent → free
+ *
+ * Static api_key credentials carry no OAuth profile, so they fall through to the
+ * subscriptionTitle-based branches like any other non-enterprise credential.
  */
 export function classifyKiroTier(entry: {
 	authMethod?: string;

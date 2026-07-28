@@ -14,6 +14,7 @@ import {
 	saveUsageCache,
 } from "./config";
 import { parseEventStream, type StreamEvent } from "./event-stream-parser";
+import { hasImportableSecret, normalizeImportCredentials } from "./import-normalize";
 import { KiroMcpClient } from "./mcp-client";
 import { MultiTokenManager } from "./multi-token-manager";
 import type {
@@ -34,8 +35,12 @@ let defaultModel: KiroModel = "claude-sonnet-4.5";
 let credentialsPath: string | null = null;
 let pluginConfig: KiroPluginConfig | null = null;
 
-function hasRefreshToken(creds: KiroCredentials): boolean {
-	return typeof creds.refreshToken === "string" && creds.refreshToken.trim().length > 0;
+/**
+ * Whether a credential carries usable token material: a refresh token
+ * (social/idc) or a static API key (api_key).
+ */
+function hasUsableSecret(creds: KiroCredentials): boolean {
+	return hasImportableSecret(creds);
 }
 
 export { getProxy, registerProxyResolver } from "./proxy";
@@ -45,7 +50,7 @@ export function initKiro(config: KiroPluginConfig): boolean {
 	pluginConfig = config;
 	credentialsPath = config.credentialsPath;
 	const { credentials, isMultipleFormat } = loadAllCredentials(config.credentialsPath);
-	const usableCredentials = credentials.filter(hasRefreshToken);
+	const usableCredentials = credentials.filter(hasUsableSecret);
 	if (usableCredentials.length === 0) return false;
 	if (usableCredentials.length !== credentials.length && isMultipleFormat) {
 		try {
@@ -219,8 +224,11 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 	added: number;
 	duplicates: number;
 } {
-	const importableCreds = creds.filter(hasRefreshToken);
-	const ignored = creds.length - importableCreds.length;
+	// Normalize alias keys (kiroApiKey/kiro_api_key/...) and account wrappers, and
+	// infer api_key auth for payloads that only carry a static key.
+	const normalized = normalizeImportCredentials(creds);
+	const importableCreds = normalized.filter(hasUsableSecret);
+	const ignored = normalized.length - importableCreds.length;
 	if (tokenManager) {
 		const result = tokenManager.addCredentials(importableCreds);
 		return { ...result, duplicates: result.duplicates + ignored };
@@ -254,15 +262,17 @@ export function kiroImportCredentials(creds: KiroCredentials[]): {
 	// Write credentials to file, then init. Empty/plain `{}` imports are treated as a reload
 	// trigger for existing credentials and are not persisted as bogus accounts.
 	const { credentials: existing } = loadAllCredentials(pluginConfig.credentialsPath);
-	const existingImportable = existing.filter(hasRefreshToken);
+	const existingImportable = existing.filter(hasUsableSecret);
 	const merged = [...existingImportable, ...importableCreds];
 	if (merged.length === 0) {
-		throw new Error("No credentials with refreshToken to import");
+		throw new Error("No credentials with refreshToken or apiKey to import");
 	}
 	mkdirSync(dirname(pluginConfig.credentialsPath), { recursive: true });
 	saveAllCredentials(pluginConfig.credentialsPath, merged);
 	const ok = initKiro(pluginConfig);
-	if (!ok) throw new Error("Imported credentials but initKiro still failed — check refreshTokens");
+	if (!ok) {
+		throw new Error("Imported credentials but initKiro still failed — check refreshToken/apiKey");
+	}
 	const afterCount = kiroSnapshot()?.total ?? 0;
 	const added = afterCount - existingImportable.length;
 	return { added: Math.max(added, 0), duplicates: creds.length - Math.max(added, 0) };
