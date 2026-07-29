@@ -222,6 +222,7 @@ export type {
 	SubagentActivitySummary,
 	SubagentToolCallHeader,
 	SubagentToolCallTiming,
+	SubagentToolInputSummary,
 	ToolCallRecord,
 	ToolUseContentBlock,
 	TreeMessage,
