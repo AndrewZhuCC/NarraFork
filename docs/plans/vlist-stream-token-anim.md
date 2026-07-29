@@ -1,5 +1,13 @@
 # virtual 模式流式消息 flowtoken 式动画
 
+> **架构已变更（本文档部分过时）**：文中描述的「流式 tail 作为画布下方独立 overlay」已被移除。
+> `useExactStreamingTail` / `vlist-streaming-tail-retirement` 两个模块已删除，流式输出改为
+> **文档内的最后一行普通消息**（`useVListStreamingMessage` → `coordinator.setStreamingMessage`），
+> 退役判定改为结构性的 `streaming-handoff.ts`（不再有计时握手），
+> 增量 markdown 准备见 `streaming-block-cache.ts`。
+> 动画本身的设计结论（只用 opacity/transform/filter、追加边界的单调性、零 DOM 测量约束）仍然有效，
+> 但涉及 tail 容器与 `useExactStreamingTail` 的具体接线描述应按上述新架构理解。
+
 ## 目标
 
 在「高级动画」开关（`narrafork_advanced_anim`，默认开）打开时，为 virtual 模式（vlist / `PretextExactMessageList`）的**流式 tail**加上与 classic 模式（`MarkdownContent` 的 `AnimatedMarkdownText`）一致的逐字/逐词淡入（blur-in）效果。我们自己实现，不引入 flowtoken 依赖。

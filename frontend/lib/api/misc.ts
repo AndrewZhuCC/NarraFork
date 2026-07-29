@@ -274,7 +274,7 @@ export const miscApi = {
 	kiroListMcpTools: () =>
 		// biome-ignore lint/suspicious/noExplicitAny: MCP tool response structure varies
 		request<any>("/kiro/mcp-tools"),
-	kiroImportCredentials: (credentials: Array<Record<string, unknown>>) =>
+	kiroImportCredentials: (credentials: Array<Record<string, unknown> | string>) =>
 		request<{ added: number; duplicates: number }>("/kiro/credentials/import", {
 			method: "POST",
 			body: JSON.stringify({ credentials }),

@@ -51,6 +51,17 @@ function isApiKeyEntry(entry: any): boolean {
 	return entry?.isApiKey === true || isKiroApiKeyAuthMethod(entry?.authMethod);
 }
 
+/**
+ * Static Kiro API keys in pasted text. Mirrors the server-side pattern in
+ * `server/lib/kiro-import-text.ts` so the UI can validate before posting.
+ */
+const KIRO_API_KEY_PATTERN = /ksk[_-][A-Za-z0-9._-]+/;
+
+/** Whether pasted text carries at least one static Kiro API key. */
+function containsKiroApiKey(text: string): boolean {
+	return KIRO_API_KEY_PATTERN.test(text);
+}
+
 const KIRO_STATUS_GC_TIME_MS = 60_000;
 
 /** Format a number to exactly 2 decimal places. */
@@ -211,13 +222,21 @@ export const KiroSection = React.memo(function KiroSection({
 		if (!canImportKiroCredentials) return;
 		setImportError(null);
 		setImportResult(null);
+		const text = importJson.trim();
+		if (!text) return;
 		try {
-			const parsed = JSON.parse(importJson);
-			const arr = Array.isArray(parsed) ? parsed : [parsed];
-			importMut.mutate(arr);
+			const parsed = JSON.parse(text);
+			importMut.mutate(Array.isArray(parsed) ? parsed : [parsed]);
+			return;
 		} catch {
-			setImportError(t("kiroImportInvalidJson"));
+			// Not JSON — fall back to plain-text "ksk_..." key lists, which the
+			// server parses per line/comma.
 		}
+		if (!containsKiroApiKey(text)) {
+			setImportError(t("kiroImportInvalidJson"));
+			return;
+		}
+		importMut.mutate([text]);
 	}, [importJson, importMut, t, canImportKiroCredentials]);
 
 	const handleRefreshKiro = useCallback(async () => {

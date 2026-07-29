@@ -1,5 +1,6 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { resolveModel } from "../lib/agent/resolve-model";
@@ -27,6 +28,7 @@ import {
 	kiroUpdateCredential,
 	kiroUsageQueueSnapshot,
 } from "../lib/kiro-adapter";
+import { kiroCredentialsFromImportPayload } from "../lib/kiro-import-text";
 import { logger } from "../lib/logger";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
@@ -49,6 +51,20 @@ function requireKiro(c: Context): Response | null {
 		return c.json({ error: "Kiro plugin is not available" }, 503);
 	}
 	return null;
+}
+
+/**
+ * Cap on a credential-import body.
+ *
+ * Import parsing (JSON.parse plus the API-key scan) is synchronous main-thread
+ * work, so the payload must stay small. Real inputs are a handful of tokens.
+ */
+const MAX_CREDENTIAL_IMPORT_BYTES = 1024 * 1024;
+
+/** Accepted `credentials[]` entry: a credential object or a raw token string. */
+function isImportableItem(item: unknown): boolean {
+	if (typeof item === "string") return true;
+	return typeof item === "object" && item !== null && !Array.isArray(item);
 }
 
 /** Track in-flight auto-fetch to avoid duplicate requests from polling. */
@@ -86,42 +102,86 @@ kiroRoutes.get("/status", (c) => {
 
 // Import must be registered before :id routes to avoid param matching
 // No requireKiro guard — import is needed precisely when kiro has no credentials yet
-kiroRoutes.post("/credentials/import", async (c) => {
-	const body = await c.req.json();
-	const credentials = body?.credentials;
-	if (!Array.isArray(credentials)) {
-		return c.json({ error: "credentials must be an array" }, 400);
-	}
-	// Basic shape validation — each entry must be a plain object
-	if (credentials.some((c) => typeof c !== "object" || c === null || Array.isArray(c))) {
-		return c.json({ error: "each credential must be a plain object" }, 400);
-	}
-	try {
-		const result = kiroImportCredentials(credentials);
-		// Synchronously fetch model lists for newly added credentials
-		const modelResults: Record<string, string[] | string> = {};
-		if (result.added > 0) {
-			const snap = kiroSnapshot();
-			if (snap) {
-				for (const entry of snap.entries) {
-					if (!entry.disabled && !entry.availableModels?.length) {
-						try {
-							const models = await kiroFetchCredentialModels(entry.id);
-							modelResults[entry.id] = models;
-						} catch (err) {
-							modelResults[entry.id] =
-								err instanceof Error ? err.message : "Failed to fetch models";
+//
+// Body-capped: parsing and key extraction are SYNCHRONOUS work on the single JS
+// thread that also serves every other request and WebSocket, so an oversized paste
+// would stall the whole server. A credential list is kilobytes; 1 MiB is generous.
+kiroRoutes.post(
+	"/credentials/import",
+	bodyLimit({
+		maxSize: MAX_CREDENTIAL_IMPORT_BYTES,
+		onError: (c) =>
+			c.json(
+				{
+					error: "Credential import exceeds the 1 MiB limit",
+					code: "CREDENTIAL_IMPORT_TOO_LARGE",
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		let body: Record<string, unknown> | null;
+		try {
+			body = (await c.req.json()) as Record<string, unknown> | null;
+		} catch (err) {
+			// A body rejected by the size cap must surface as 413, not as a generic
+			// "malformed credentials" 400. When the request carries no Content-Length,
+			// bodyLimit enforces the cap by ERRORING THE BODY STREAM, so the overflow
+			// arrives here as a failed read; rethrowing lets that middleware turn it
+			// into its own 413 response.
+			if (err instanceof Error && err.name === "BodyLimitError") throw err;
+			body = null;
+		}
+		if (!body || typeof body !== "object" || Array.isArray(body)) {
+			return c.json({ error: "credentials must be an array" }, 400);
+		}
+		// `credentials` keeps accepting the historical object array. Strings (either in
+		// that array or via `text` / `importText`) let callers paste bare "ksk_..." key
+		// lists without JSON wrapping.
+		const raw = body.credentials;
+		if (raw !== undefined && !Array.isArray(raw) && typeof raw !== "string") {
+			return c.json({ error: "credentials must be an array" }, 400);
+		}
+		if (Array.isArray(raw) && raw.some((item) => !isImportableItem(item))) {
+			return c.json({ error: "each credential must be a plain object" }, 400);
+		}
+		const credentials = [
+			...kiroCredentialsFromImportPayload(raw),
+			...kiroCredentialsFromImportPayload(body.text),
+			...kiroCredentialsFromImportPayload(body.importText),
+		];
+		// An explicitly empty `credentials` array stays a reload trigger for existing
+		// credentials; anything else with no usable material is a client error.
+		if (credentials.length === 0 && !(Array.isArray(raw) && raw.length === 0)) {
+			return c.json({ error: "No credentials provided" }, 400);
+		}
+		try {
+			const result = kiroImportCredentials(credentials);
+			// Synchronously fetch model lists for newly added credentials
+			const modelResults: Record<string, string[] | string> = {};
+			if (result.added > 0) {
+				const snap = kiroSnapshot();
+				if (snap) {
+					for (const entry of snap.entries) {
+						if (!entry.disabled && !entry.availableModels?.length) {
+							try {
+								const models = await kiroFetchCredentialModels(entry.id);
+								modelResults[entry.id] = models;
+							} catch (err) {
+								modelResults[entry.id] =
+									err instanceof Error ? err.message : "Failed to fetch models";
+							}
 						}
 					}
 				}
 			}
+			return c.json({ ...result, modelResults });
+		} catch (err: unknown) {
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			return c.json({ error: msg }, 500);
 		}
-		return c.json({ ...result, modelResults });
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		return c.json({ error: msg }, 500);
-	}
-});
+	},
+);
 
 kiroRoutes.post("/credentials/:id/disable", (c) => {
 	const guard = requireKiro(c);
