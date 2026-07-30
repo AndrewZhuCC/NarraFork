@@ -80,6 +80,8 @@ export interface InstanceSettingsState {
 	minPruneRatio: number;
 	queueDuringCompaction: boolean;
 	agentDefaultReasoningEffort: string;
+	/** Models excluded from receiving a reasoning-effort hint. */
+	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
 	globalWhitelistDirs: Array<{ path: string; accessLevel: string; enabled?: boolean }>;
 	globalBlacklistDirs: Array<{ path: string; denyLevel: string; enabled?: boolean }>;
 	globalCommandWhitelist: Array<{ pattern: string; enabled?: boolean }>;
@@ -169,6 +171,7 @@ function makeDefaults(): InstanceSettingsState {
 		minPruneRatio: 30,
 		queueDuringCompaction: false,
 		agentDefaultReasoningEffort: "",
+		reasoningEffortBlocklist: [],
 		globalWhitelistDirs: [],
 		globalBlacklistDirs: [],
 		globalCommandWhitelist: [],
@@ -276,6 +279,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
+				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				globalWhitelistDirs: settings.agent?.whitelistDirs ?? [],
 				globalBlacklistDirs: settings.agent?.blacklistDirs ?? [],
 				globalCommandWhitelist: settings.agent?.commandWhitelist ?? [],
@@ -378,6 +382,9 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						| "xhigh"
 						| "max"
 						| "",
+					// Blank patterns are dropped so an empty row left in the editor
+					// cannot become a rule that matches every model.
+					reasoningEffortBlocklist: state.reasoningEffortBlocklist.filter((r) => r.pattern.trim()),
 					maxTransientRetries: state.maxTransientRetries,
 					silentToolCallThreshold: state.silentToolCallThreshold,
 					pipelineUnusedToolCallThreshold:
