@@ -7,6 +7,7 @@ import { db } from "../../../../db";
 import { narrators } from "../../../../db/schema";
 import { KiroMcpClient } from "../../../kiro/mcp-client";
 import type { ExecutionBackend } from "../../execution/backend";
+import { targetPathSemantics } from "../../execution/path-semantics";
 import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
 import {
@@ -57,6 +58,9 @@ function makeTruncatedBackend(onWrite: () => void): ExecutionBackend {
 	return {
 		kind: "remote",
 		deviceId: "remote-truncated",
+		paths: targetPathSemantics("posix"),
+		pathFlavor: "posix",
+		runtimeGeneration: 1,
 		statFile: async () => ({ isDirectory: false, isFile: true, size: 20_000_000 }),
 		readFileBytes: async () => ({
 			bytes: new TextEncoder().encode("truncated prefix"),

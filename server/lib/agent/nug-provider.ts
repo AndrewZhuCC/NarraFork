@@ -20,6 +20,7 @@ import type { NUGProviderConfig } from "../settings";
 import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
+import { hostHistoryRuntime, hostNormalizeRuntime } from "./codewhisperer-host-runtime";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { normalizeApiRequestDiagnostics, parseErrorDiagnostics } from "./error-diagnostics";
 import {
@@ -453,6 +454,7 @@ export class NugProvider implements ProviderAdapter {
 			meta.bareModel,
 			narratorId,
 			this.getActiveReasoningSource(),
+			hostHistoryRuntime(),
 		);
 	}
 
@@ -580,6 +582,7 @@ export class NugProvider implements ProviderAdapter {
 	): AsyncGenerator<ParsedStreamEvent> {
 		const request = normalizeKiroChatRequest(
 			buildKiroRequest({ ...params, model: meta.bareModel }),
+			hostNormalizeRuntime(),
 		);
 		prepareKiroWorkspaceState(request);
 

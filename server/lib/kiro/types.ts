@@ -64,6 +64,34 @@ export interface KiroCredentials {
 	disabledAt?: string;
 }
 
+/**
+ * Editable subset of a credential.
+ *
+ * Text fields clear when set to an empty string. Secrets (`refreshToken`,
+ * `apiKey`, `clientSecret`, `proxyPassword`) are never returned by the API, so an
+ * empty value there means "leave the stored secret alone".
+ */
+export interface KiroCredentialPatch {
+	email?: string;
+	displayName?: string;
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+	profileArn?: string;
+	subscriptionTitle?: string;
+	startUrl?: string;
+	machineId?: string;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	authMethod?: string;
+	priority?: number;
+	refreshToken?: string;
+	apiKey?: string;
+	clientId?: string;
+	clientSecret?: string;
+	proxyPassword?: string;
+}
+
 export interface KiroConfig {
 	region: string;
 	authRegion?: string;
@@ -175,6 +203,19 @@ export interface CredentialSnapshot {
 	isApiKey?: boolean;
 	subscriptionTitle?: string;
 	region?: string;
+	/** Auth/refresh region override (`prod.<region>.auth...` / `oidc.<region>...`). */
+	authRegion?: string;
+	/** Data-plane region override (`q.<region>.amazonaws.com`). */
+	apiRegion?: string;
+	profileArn?: string;
+	startUrl?: string;
+	machineId?: string;
+	/** Whether IdC client credentials are stored (values themselves stay server-side). */
+	hasClientId?: boolean;
+	hasClientSecret?: boolean;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	hasProxyPassword?: boolean;
 	meterUsage?: number;
 	availableModels?: string[];
 	tier?: AccountTier;

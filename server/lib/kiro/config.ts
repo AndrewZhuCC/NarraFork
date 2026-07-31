@@ -1,6 +1,14 @@
 // Config loading — reads kiro CLI credentials.json and config.json
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { isApiKeyAuthMethod } from "./auth-method";
 import type {
@@ -12,6 +20,32 @@ import type {
 	RequestIntervalSettings,
 	UsageCacheEntry,
 } from "./types";
+
+/**
+ * Atomically write JSON to a file with restricted permissions (0o600).
+ * Uses write-to-temp + rename to avoid corruption on crash.
+ * Ensures existing files also get chmod'd to 0o600 (covers legacy deployments).
+ */
+function writeSecureJson(filePath: string, value: unknown): void {
+	const dir = dirname(filePath);
+	mkdirSync(dir, { recursive: true });
+	const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+	try {
+		writeFileSync(tempPath, JSON.stringify(value, null, 2), { mode: 0o600 });
+		renameSync(tempPath, filePath);
+		// rename preserves the temp file's mode, but if the target already existed
+		// with wider permissions on some platforms we explicitly set 0o600.
+		try {
+			chmodSync(filePath, 0o600);
+		} catch {
+			// chmod may fail on Windows or network FS — non-fatal since the temp
+			// file was already created with 0o600.
+		}
+	} catch (error) {
+		rmSync(tempPath, { force: true });
+		throw error;
+	}
+}
 
 const SYSTEM_VERSIONS = ["darwin#24.6.0", "win32#10.0.22631"] as const;
 
@@ -159,21 +193,47 @@ export function loadConfig(path: string): KiroConfig {
 }
 
 export function saveConfig(path: string, config: KiroConfig): void {
-	writeFileSync(path, JSON.stringify(config, null, 2));
+	writeSecureJson(path, config);
 }
 
 export function saveCredentials(path: string, creds: KiroCredentials): void {
-	writeFileSync(path, JSON.stringify(creds, null, 2));
+	writeSecureJson(path, creds);
+}
+
+/** Region used when nothing else is configured. */
+export const DEFAULT_KIRO_REGION = "us-east-1";
+
+function trimmedOrUndefined(value?: string | null): string | undefined {
+	const trimmed = value?.trim();
+	return trimmed || undefined;
 }
 
 /** cred.authRegion > cred.region > config.authRegion > config.region */
 export function effectiveAuthRegion(creds: KiroCredentials, config: KiroConfig): string {
-	return creds.authRegion ?? creds.region ?? config.authRegion ?? config.region;
+	return (
+		trimmedOrUndefined(creds.authRegion) ??
+		trimmedOrUndefined(creds.region) ??
+		trimmedOrUndefined(config.authRegion) ??
+		trimmedOrUndefined(config.region) ??
+		DEFAULT_KIRO_REGION
+	);
 }
 
-/** config.apiRegion > config.region (credential region only used for token refresh) */
-export function effectiveApiRegion(config: KiroConfig): string {
-	return config.apiRegion ?? config.region;
+/**
+ * Data-plane region: cred.apiRegion > config.apiRegion > config.region.
+ *
+ * A credential's own `apiRegion` wins so per-account overrides actually reach
+ * `q.<region>.amazonaws.com`. `cred.region` is deliberately NOT consulted here:
+ * it is the auth/refresh region, and pointing the data plane at it would break
+ * credentials whose sign-in region differs from their serving region.
+ */
+export function effectiveApiRegion(config: KiroConfig, creds?: KiroCredentials): string {
+	return (
+		trimmedOrUndefined(creds?.apiRegion) ??
+		trimmedOrUndefined(config.apiRegion) ??
+		trimmedOrUndefined(config.region) ??
+		DEFAULT_KIRO_REGION
+	);
 }
 
 // --- Multi-credential support ---
@@ -209,7 +269,7 @@ export function loadAllCredentials(path: string): {
 
 /** Save all credentials as array format. */
 export function saveAllCredentials(path: string, creds: KiroCredentials[]): void {
-	writeFileSync(path, JSON.stringify(creds, null, 2));
+	writeSecureJson(path, creds);
 }
 
 /** Load stats from kiro_stats.json in the same directory as credentialsPath. */
@@ -226,7 +286,7 @@ export function loadStats(credentialsPath: string): Record<string, StatsEntry> {
 /** Save stats to kiro_stats.json in the same directory as credentialsPath. */
 export function saveStats(credentialsPath: string, stats: Record<string, StatsEntry>): void {
 	const statsPath = join(dirname(credentialsPath), "kiro_stats.json");
-	writeFileSync(statsPath, JSON.stringify(stats, null, 2));
+	writeSecureJson(statsPath, stats);
 }
 
 // --- Usage cache ---
@@ -248,5 +308,5 @@ export function saveUsageCache(
 	cache: Record<string, UsageCacheEntry>,
 ): void {
 	const usagePath = join(dirname(credentialsPath), "kiro_usage.json");
-	writeFileSync(usagePath, JSON.stringify(cache, null, 2));
+	writeSecureJson(usagePath, cache);
 }

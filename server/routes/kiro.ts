@@ -33,11 +33,47 @@ import { logger } from "../lib/logger";
 import { normalizeProxyUrl, saveSettings, settings } from "../lib/settings";
 import { requireAdmin, requireAuth } from "../middleware/auth";
 
-const updateCredentialSchema = z
+/**
+ * AWS region identifier. Kept permissive (the service adds regions over time)
+ * but restricted to the `xx-yyy-N` shape so a typo cannot inject an arbitrary
+ * host into `q.<region>.amazonaws.com`.
+ */
+const regionField = z
+	.string()
+	.max(50)
+	.refine((v) => v === "" || /^[a-z]{2}(-[a-z]+)+-\d+$/.test(v), {
+		message: "region must look like us-east-1",
+	});
+
+/**
+ * Credential patch.
+ *
+ * Text fields accept an empty string to clear the stored value; secrets treat
+ * empty as "leave unchanged" since the API never echoes them back.
+ *
+ * Exported for tests: the region validator is the boundary that keeps a typo from
+ * becoming an arbitrary request host.
+ */
+export const updateCredentialSchema = z
 	.object({
 		email: z.string().max(200).optional(),
 		displayName: z.string().max(200).optional(),
-		region: z.string().max(50).optional(),
+		region: regionField.optional(),
+		authRegion: regionField.optional(),
+		apiRegion: regionField.optional(),
+		profileArn: z.string().max(500).optional(),
+		subscriptionTitle: z.string().max(200).optional(),
+		startUrl: z.string().max(500).optional(),
+		machineId: z.string().max(200).optional(),
+		proxyUrl: z.string().max(500).optional(),
+		proxyUsername: z.string().max(200).optional(),
+		authMethod: z.enum(["social", "idc", "api_key"]).optional(),
+		priority: z.number().int().min(0).max(10_000).optional(),
+		refreshToken: z.string().max(8192).optional(),
+		apiKey: z.string().max(8192).optional(),
+		clientId: z.string().max(500).optional(),
+		clientSecret: z.string().max(8192).optional(),
+		proxyPassword: z.string().max(500).optional(),
 	})
 	.strict();
 
@@ -60,6 +96,12 @@ function requireKiro(c: Context): Response | null {
  * work, so the payload must stay small. Real inputs are a handful of tokens.
  */
 const MAX_CREDENTIAL_IMPORT_BYTES = 1024 * 1024;
+
+/**
+ * Cap on a single-credential patch body. Every field is bounded by the schema,
+ * so a legitimate patch is a few kilobytes at most.
+ */
+const MAX_CREDENTIAL_PATCH_BYTES = 64 * 1024;
 
 /** Accepted `credentials[]` entry: a credential object or a raw token string. */
 function isImportableItem(item: unknown): boolean {
@@ -157,25 +199,21 @@ kiroRoutes.post(
 		}
 		try {
 			const result = kiroImportCredentials(credentials);
-			// Synchronously fetch model lists for newly added credentials
-			const modelResults: Record<string, string[] | string> = {};
+			// Queue background model-list fetching for newly added credentials.
+			// This is fire-and-forget: the route returns immediately with import counts,
+			// and models will be available once the background fetch completes. The
+			// front-end already polls `["kiro", "status"]` which includes model lists.
 			if (result.added > 0) {
 				const snap = kiroSnapshot();
 				if (snap) {
 					for (const entry of snap.entries) {
 						if (!entry.disabled && !entry.availableModels?.length) {
-							try {
-								const models = await kiroFetchCredentialModels(entry.id);
-								modelResults[entry.id] = models;
-							} catch (err) {
-								modelResults[entry.id] =
-									err instanceof Error ? err.message : "Failed to fetch models";
-							}
+							void kiroFetchCredentialModels(entry.id).catch(() => {});
 						}
 					}
 				}
 			}
-			return c.json({ ...result, modelResults });
+			return c.json(result);
 		} catch (err: unknown) {
 			const msg = err instanceof Error ? err.message : "Unknown error";
 			return c.json({ error: msg }, 500);
@@ -247,20 +285,48 @@ kiroRoutes.post("/credentials/:id/refresh", async (c) => {
 	}
 });
 
-kiroRoutes.patch("/credentials/:id", async (c) => {
-	const guard = requireKiro(c);
-	if (guard) return guard;
-	try {
-		const body = await c.req.json();
-		const parsed = updateCredentialSchema.safeParse(body);
-		if (!parsed.success) return c.json({ error: parsed.error.message }, 400);
-		kiroUpdateCredential(c.req.param("id"), parsed.data);
-		return c.json({ ok: true });
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : "Unknown error";
-		return c.json({ error: msg }, 500);
-	}
-});
+/**
+ * Rejected patches are the caller's fault, not a server fault: switching auth
+ * methods without the matching secret, or reusing a secret another credential
+ * already stores. These must surface as 400 so the editor can show them inline.
+ */
+function isCredentialPatchRejection(message: string): boolean {
+	return (
+		message.includes("is required") ||
+		message.includes("already used by") ||
+		message.includes("must carry")
+	);
+}
+
+kiroRoutes.patch(
+	"/credentials/:id",
+	bodyLimit({
+		maxSize: MAX_CREDENTIAL_PATCH_BYTES,
+		onError: (c) =>
+			c.json(
+				{ error: "Credential patch exceeds the 64 KiB limit", code: "CREDENTIAL_PATCH_TOO_LARGE" },
+				413,
+			),
+	}),
+	async (c) => {
+		const guard = requireKiro(c);
+		if (guard) return guard;
+		try {
+			const body = await c.req.json();
+			const parsed = updateCredentialSchema.safeParse(body);
+			if (!parsed.success) {
+				return c.json({ error: parsed.error.issues[0]?.message ?? parsed.error.message }, 400);
+			}
+			kiroUpdateCredential(c.req.param("id"), parsed.data);
+			return c.json({ ok: true });
+		} catch (err: unknown) {
+			if (err instanceof Error && err.name === "BodyLimitError") throw err;
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			if (msg.startsWith("Credential not found")) return c.json({ error: msg }, 404);
+			return c.json({ error: msg }, isCredentialPatchRejection(msg) ? 400 : 500);
+		}
+	},
+);
 
 kiroRoutes.get("/credentials/:id/usage", async (c) => {
 	const guard = requireKiro(c);

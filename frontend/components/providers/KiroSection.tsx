@@ -6,7 +6,6 @@ import {
 	Button,
 	Divider,
 	Group,
-	NumberInput,
 	Paper,
 	Progress,
 	SegmentedControl,
@@ -15,12 +14,11 @@ import {
 	Table,
 	Text,
 	Textarea,
-	TextInput,
 	Tooltip,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
-import { IconDeviceFloppy, IconRefresh, IconTrash } from "@tabler/icons-react";
+import { IconRefresh, IconTrash } from "@tabler/icons-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import React, { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -29,7 +27,7 @@ import {
 	useProviderRouteCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
-import { api } from "../../lib/api";
+import { api, type KiroCredentialPatch } from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
@@ -37,6 +35,10 @@ import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
+import {
+	KiroCredentialEditModal,
+	type KiroCredentialSnapshotView,
+} from "./KiroCredentialEditModal";
 import { ModelList } from "./ModelList";
 import {
 	classifyKiroTier,
@@ -176,15 +178,25 @@ export const KiroSection = React.memo(function KiroSection({
 		mutationFn: (id: string) => api.kiroDeleteCredential(id),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
 	});
+	const [editingCredential, setEditingCredential] = useState<KiroCredentialSnapshotView | null>(
+		null,
+	);
+	const [editError, setEditError] = useState<string | null>(null);
 	const updateMut = useMutation({
-		mutationFn: ({
-			id,
-			fields,
-		}: {
-			id: string;
-			fields: { email?: string; displayName?: string; region?: string };
-		}) => api.kiroUpdateCredential(id, fields),
+		mutationFn: ({ id, fields }: { id: string; fields: KiroCredentialPatch }) =>
+			api.kiroUpdateCredential(id, fields),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["kiro", "status"] });
+			setEditingCredential(null);
+			setEditError(null);
+		},
+		onError: (err: Error) => setEditError(err.message),
+	});
+	const priorityMut = useMutation({
+		mutationFn: ({ id, priority }: { id: string; priority: number }) =>
+			api.kiroSetPriority(id, priority),
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
+		onError: (err: Error) => setEditError(err.message),
 	});
 	const lbModeMut = useMutation({
 		mutationFn: (mode: "priority" | "balanced") => api.kiroSetLoadBalancingMode(mode),
@@ -197,11 +209,6 @@ export const KiroSection = React.memo(function KiroSection({
 			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
 			notifications.show({ message: t("proxySaved"), color: "green" });
 		},
-	});
-	const priorityMut = useMutation({
-		mutationFn: ({ id, priority }: { id: string; priority: number }) =>
-			api.kiroSetPriority(id, priority),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
 	});
 	const importMut = useMutation({
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -238,6 +245,43 @@ export const KiroSection = React.memo(function KiroSection({
 		}
 		importMut.mutate([text]);
 	}, [importJson, importMut, t, canImportKiroCredentials]);
+
+	const handleEditCredential = useCallback((entry: KiroCredentialSnapshotView) => {
+		setEditError(null);
+		setEditingCredential(entry);
+	}, []);
+
+	/**
+	 * Apply a credential patch.
+	 *
+	 * `priority` has its own route (separately gated by runtime capabilities), so
+	 * it is split out of the PATCH body and only sent when it actually changed.
+	 */
+	const handleSubmitEdit = useCallback(
+		(patch: KiroCredentialPatch) => {
+			const entry = editingCredential;
+			if (!entry || !canUpdateKiroCredential) return;
+			const { priority, ...fields } = patch;
+			if (priority !== undefined && canSetKiroCredentialPriority) {
+				priorityMut.mutate({ id: entry.id, priority });
+			}
+			if (Object.keys(fields).length > 0) {
+				updateMut.mutate({ id: entry.id, fields });
+				return;
+			}
+			// Priority-only edits (or a no-op save) close the modal directly since the
+			// PATCH mutation that normally closes it never ran.
+			setEditingCredential(null);
+			setEditError(null);
+		},
+		[
+			editingCredential,
+			canUpdateKiroCredential,
+			canSetKiroCredentialPriority,
+			priorityMut,
+			updateMut,
+		],
+	);
 
 	const handleRefreshKiro = useCallback(async () => {
 		if (!canRefreshKiroModels) return;
@@ -418,12 +462,10 @@ export const KiroSection = React.memo(function KiroSection({
 							refreshMut={refreshMut}
 							usageMut={usageMut}
 							deleteMut={deleteMut}
-							updateMut={updateMut}
-							priorityMut={priorityMut}
+							onEditCredential={handleEditCredential}
 							canDisableKiroCredential={canDisableKiroCredential}
 							canEnableKiroCredential={canEnableKiroCredential}
 							canResetKiroCredential={canResetKiroCredential}
-							canSetKiroCredentialPriority={canSetKiroCredentialPriority}
 							canRefreshKiroCredential={canRefreshKiroCredential}
 							canQueryKiroCredentialUsage={canQueryKiroCredentialUsage}
 							canUpdateKiroCredential={canUpdateKiroCredential}
@@ -478,6 +520,18 @@ export const KiroSection = React.memo(function KiroSection({
 				onContextWindowChange={onContextWindowChange}
 				onTestModel={onTestModel}
 			/>
+
+			<KiroCredentialEditModal
+				entry={editingCredential}
+				opened={editingCredential != null}
+				onClose={() => {
+					setEditingCredential(null);
+					setEditError(null);
+				}}
+				onSubmit={handleSubmitEdit}
+				loading={updateMut.isPending || priorityMut.isPending}
+				error={editError}
+			/>
 		</Stack>
 	);
 });
@@ -503,14 +557,10 @@ interface CredentialListProps {
 	usageMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types
 	deleteMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types
-	updateMut: any;
-	// biome-ignore lint/suspicious/noExplicitAny: mutation types
-	priorityMut: any;
+	onEditCredential: (entry: KiroCredentialSnapshotView) => void;
 	canDisableKiroCredential: boolean;
 	canEnableKiroCredential: boolean;
 	canResetKiroCredential: boolean;
-	canSetKiroCredentialPriority: boolean;
 	canRefreshKiroCredential: boolean;
 	canQueryKiroCredentialUsage: boolean;
 	canUpdateKiroCredential: boolean;
@@ -523,16 +573,30 @@ function CredentialList(props: CredentialListProps) {
 	return isMobile ? <CredentialCards {...props} /> : <CredentialTable {...props} />;
 }
 
+/**
+ * Compact region summary: base region plus any auth/api overrides.
+ *
+ * All three are shown because they resolve independently — `authRegion` overrides
+ * the token-refresh endpoint while `apiRegion` overrides the data-plane endpoint.
+ */
+function formatRegions(entry: {
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+}): string {
+	const parts: string[] = [];
+	if (entry.region) parts.push(entry.region);
+	if (entry.authRegion) parts.push(`auth ${entry.authRegion}`);
+	if (entry.apiRegion) parts.push(`api ${entry.apiRegion}`);
+	return parts.length > 0 ? parts.join(" · ") : "-";
+}
+
 function CredentialActions({
 	entry,
-	editing,
-	onEdit,
 	...muts
 }: {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	entry: any;
-	editing?: boolean;
-	onEdit?: () => void;
 } & Pick<
 	CredentialListProps,
 	| "disableMut"
@@ -541,7 +605,7 @@ function CredentialActions({
 	| "refreshMut"
 	| "usageMut"
 	| "deleteMut"
-	| "updateMut"
+	| "onEditCredential"
 	| "canDisableKiroCredential"
 	| "canEnableKiroCredential"
 	| "canResetKiroCredential"
@@ -598,17 +662,15 @@ function CredentialActions({
 			>
 				{t("kiroQueryUsage")}
 			</Button>
-			{onEdit && !editing && (
-				<Button
-					variant="subtle"
-					size="compact-xs"
-					onClick={() => muts.canUpdateKiroCredential && onEdit()}
-					disabled={!muts.canUpdateKiroCredential}
-					title={!muts.canUpdateKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
-				>
-					{t("kiroEdit")}
-				</Button>
-			)}
+			<Button
+				variant="subtle"
+				size="compact-xs"
+				onClick={() => muts.canUpdateKiroCredential && muts.onEditCredential(entry)}
+				disabled={!muts.canUpdateKiroCredential}
+				title={!muts.canUpdateKiroCredential ? muts.credentialRouteUnsupportedReason : undefined}
+			>
+				{t("kiroEdit")}
+			</Button>
 			<Button
 				variant="subtle"
 				size="compact-xs"
@@ -729,12 +791,10 @@ function CredentialCard({
 	| "refreshMut"
 	| "usageMut"
 	| "deleteMut"
-	| "updateMut"
-	| "priorityMut"
+	| "onEditCredential"
 	| "canDisableKiroCredential"
 	| "canEnableKiroCredential"
 	| "canResetKiroCredential"
-	| "canSetKiroCredentialPriority"
 	| "canRefreshKiroCredential"
 	| "canQueryKiroCredentialUsage"
 	| "canUpdateKiroCredential"
@@ -742,25 +802,7 @@ function CredentialCard({
 	| "credentialRouteUnsupportedReason"
 >) {
 	const { t } = useTranslation("settings");
-	const [editing, setEditing] = useState(false);
-	const [editEmail, setEditEmail] = useState(entry.email ?? "");
-	const [editDisplayName, setEditDisplayName] = useState(entry.displayName ?? "");
-	const [editRegion, setEditRegion] = useState(entry.region ?? "");
-	const [editPriority, setEditPriority] = useState<number>(entry.priority ?? 0);
 	const isCurrent = entry.id === snapshot?.currentId;
-
-	const handleSave = () => {
-		if (!muts.canUpdateKiroCredential) return;
-		muts.updateMut.mutate({
-			id: entry.id,
-			fields: { email: editEmail, displayName: editDisplayName, region: editRegion },
-		});
-		if (editPriority !== (entry.priority ?? 0) && muts.canSetKiroCredentialPriority) {
-			muts.priorityMut.mutate({ id: entry.id, priority: editPriority });
-		}
-		setEditing(false);
-	};
-
 	const displayLabel = entry.displayName || entry.email || entry.id;
 
 	return (
@@ -800,121 +842,68 @@ function CredentialCard({
 					</Group>
 				</Group>
 
-				{/* Inline edit form */}
-				{editing ? (
-					<Stack gap="xs">
-						<TextInput
-							size="xs"
-							label={t("kiroEditDisplayName")}
-							value={editDisplayName}
-							onChange={(e) => setEditDisplayName(e.currentTarget.value)}
-						/>
-						<TextInput
-							size="xs"
-							label="Email"
-							value={editEmail}
-							onChange={(e) => setEditEmail(e.currentTarget.value)}
-						/>
-						<TextInput
-							size="xs"
-							label={t("kiroEditRegion")}
-							value={editRegion}
-							onChange={(e) => setEditRegion(e.currentTarget.value)}
-						/>
-						<NumberInput
-							size="xs"
-							label={t("kiroColPriority")}
-							value={editPriority}
-							onChange={(v) => setEditPriority(Number(v) || 0)}
-							min={0}
-							step={1}
-						/>
-						<Group gap="xs">
-							<Button
-								size="compact-xs"
-								onClick={handleSave}
-								leftSection={<IconDeviceFloppy size={12} />}
-							>
-								{t("kiroEditSave")}
-							</Button>
-							<Button size="compact-xs" variant="subtle" onClick={() => setEditing(false)}>
-								{t("kiroEditCancel")}
-							</Button>
-						</Group>
-					</Stack>
-				) : (
-					<>
-						{/* Row 2: Details */}
-						<Stack gap={4}>
-							{entry.email && (
-								<Group justify="space-between" wrap="nowrap">
-									<Text size="xs" c="dimmed">
-										Email
-									</Text>
-									<Text size="xs">{entry.email}</Text>
-								</Group>
-							)}
-							{entry.region && (
-								<Group justify="space-between" wrap="nowrap">
-									<Text size="xs" c="dimmed">
-										{t("kiroEditRegion")}
-									</Text>
-									<Text size="xs">{entry.region}</Text>
-								</Group>
-							)}
-							<Group justify="space-between" wrap="nowrap">
-								<Text size="xs" c="dimmed">
-									{t("kiroColPriority")}
-								</Text>
-								<Text size="xs">{entry.priority}</Text>
-							</Group>
-							<Group justify="space-between" wrap="nowrap">
-								<Text size="xs" c="dimmed">
-									{t("kiroColExpires")}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{isApiKeyEntry(entry)
-										? t("kiroApiKeyNeverExpires")
-										: entry.expiresAt
-											? relativeTime(entry.expiresAt)
-											: "-"}
-								</Text>
-							</Group>
-							<Group justify="space-between" wrap="nowrap">
-								<Text size="xs" c="dimmed">
-									{t("kiroColStats")}
-								</Text>
-								<Text size="xs">
-									{t("kiroSuccess")}: {entry.successCount} / {t("kiroFail")}: {entry.failureCount}
-								</Text>
-							</Group>
-							<Group justify="space-between" wrap="nowrap">
-								<Text size="xs" c="dimmed">
-									{t("kiroColLastUsed")}
-								</Text>
-								<Text size="xs" c="dimmed">
-									{entry.lastUsedAt ? relativeTime(entry.lastUsedAt) : "-"}
-								</Text>
-							</Group>
-						</Stack>
-
-						{/* Row 3: Usage */}
-						<Stack gap={4}>
+				{/* Row 2: Details */}
+				<Stack gap={4}>
+					{entry.email && (
+						<Group justify="space-between" wrap="nowrap">
 							<Text size="xs" c="dimmed">
-								{t("kiroColUsage")}
+								Email
 							</Text>
-							<UsageDisplay entry={entry} usage={usage} />
-						</Stack>
-					</>
-				)}
+							<Text size="xs">{entry.email}</Text>
+						</Group>
+					)}
+					<Group justify="space-between" wrap="nowrap">
+						<Text size="xs" c="dimmed">
+							{t("kiroEditRegion")}
+						</Text>
+						<Text size="xs">{formatRegions(entry)}</Text>
+					</Group>
+					<Group justify="space-between" wrap="nowrap">
+						<Text size="xs" c="dimmed">
+							{t("kiroColPriority")}
+						</Text>
+						<Text size="xs">{entry.priority}</Text>
+					</Group>
+					<Group justify="space-between" wrap="nowrap">
+						<Text size="xs" c="dimmed">
+							{t("kiroColExpires")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{isApiKeyEntry(entry)
+								? t("kiroApiKeyNeverExpires")
+								: entry.expiresAt
+									? relativeTime(entry.expiresAt)
+									: "-"}
+						</Text>
+					</Group>
+					<Group justify="space-between" wrap="nowrap">
+						<Text size="xs" c="dimmed">
+							{t("kiroColStats")}
+						</Text>
+						<Text size="xs">
+							{t("kiroSuccess")}: {entry.successCount} / {t("kiroFail")}: {entry.failureCount}
+						</Text>
+					</Group>
+					<Group justify="space-between" wrap="nowrap">
+						<Text size="xs" c="dimmed">
+							{t("kiroColLastUsed")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{entry.lastUsedAt ? relativeTime(entry.lastUsedAt) : "-"}
+						</Text>
+					</Group>
+				</Stack>
+
+				{/* Row 3: Usage */}
+				<Stack gap={4}>
+					<Text size="xs" c="dimmed">
+						{t("kiroColUsage")}
+					</Text>
+					<UsageDisplay entry={entry} usage={usage} />
+				</Stack>
 
 				{/* Row 4: Actions */}
-				<CredentialActions
-					entry={entry}
-					editing={editing}
-					onEdit={() => setEditing(true)}
-					{...muts}
-				/>
+				<CredentialActions entry={entry} {...muts} />
 			</Stack>
 		</Paper>
 	);
@@ -933,6 +922,7 @@ function CredentialTable({ entries, snapshot, usageCache, ...muts }: CredentialL
 					<Table.Th>{t("kiroEditDisplayName")}</Table.Th>
 					<Table.Th>Email</Table.Th>
 					<Table.Th>{t("kiroColPriority")}</Table.Th>
+					<Table.Th>{t("kiroEditRegion")}</Table.Th>
 					<Table.Th>{t("kiroColStatus")}</Table.Th>
 					<Table.Th>{t("kiroColExpires")}</Table.Th>
 					<Table.Th>{t("kiroColStats")}</Table.Th>
@@ -977,12 +967,10 @@ function CredentialTableRow({
 	| "refreshMut"
 	| "usageMut"
 	| "deleteMut"
-	| "updateMut"
-	| "priorityMut"
+	| "onEditCredential"
 	| "canDisableKiroCredential"
 	| "canEnableKiroCredential"
 	| "canResetKiroCredential"
-	| "canSetKiroCredentialPriority"
 	| "canRefreshKiroCredential"
 	| "canQueryKiroCredentialUsage"
 	| "canUpdateKiroCredential"
@@ -990,85 +978,6 @@ function CredentialTableRow({
 	| "credentialRouteUnsupportedReason"
 >) {
 	const { t } = useTranslation("settings");
-	const [editing, setEditing] = useState(false);
-	const [editDisplayName, setEditDisplayName] = useState(entry.displayName ?? "");
-	const [editEmail, setEditEmail] = useState(entry.email ?? "");
-	const [editRegion, setEditRegion] = useState(entry.region ?? "");
-	const [editPriority, setEditPriority] = useState<number>(entry.priority ?? 0);
-
-	const handleSave = () => {
-		if (!muts.canUpdateKiroCredential) return;
-		muts.updateMut.mutate({
-			id: entry.id,
-			fields: { email: editEmail, displayName: editDisplayName, region: editRegion },
-		});
-		if (editPriority !== (entry.priority ?? 0) && muts.canSetKiroCredentialPriority) {
-			muts.priorityMut.mutate({ id: entry.id, priority: editPriority });
-		}
-		setEditing(false);
-	};
-
-	if (editing) {
-		return (
-			<Table.Tr>
-				<Table.Td>
-					<Text size="xs" ff="monospace">
-						{entry.id}
-					</Text>
-				</Table.Td>
-				<Table.Td>
-					<TextInput
-						size="xs"
-						value={editDisplayName}
-						onChange={(e) => setEditDisplayName(e.currentTarget.value)}
-					/>
-				</Table.Td>
-				<Table.Td>
-					<TextInput
-						size="xs"
-						value={editEmail}
-						onChange={(e) => setEditEmail(e.currentTarget.value)}
-					/>
-				</Table.Td>
-				<Table.Td>
-					<NumberInput
-						size="xs"
-						value={editPriority}
-						onChange={(v) => setEditPriority(Number(v) || 0)}
-						min={0}
-						step={1}
-						style={{ width: 70 }}
-					/>
-				</Table.Td>
-				<Table.Td colSpan={3}>
-					<TextInput
-						size="xs"
-						label={t("kiroEditRegion")}
-						value={editRegion}
-						onChange={(e) => setEditRegion(e.currentTarget.value)}
-					/>
-				</Table.Td>
-				<Table.Td colSpan={2}>
-					<Group gap="xs">
-						<Button
-							size="compact-xs"
-							onClick={handleSave}
-							leftSection={<IconDeviceFloppy size={12} />}
-							disabled={!muts.canUpdateKiroCredential}
-							title={
-								!muts.canUpdateKiroCredential ? muts.credentialRouteUnsupportedReason : undefined
-							}
-						>
-							{t("kiroEditSave")}
-						</Button>
-						<Button size="compact-xs" variant="subtle" onClick={() => setEditing(false)}>
-							{t("kiroEditCancel")}
-						</Button>
-					</Group>
-				</Table.Td>
-			</Table.Tr>
-		);
-	}
 
 	return (
 		<Table.Tr>
@@ -1085,6 +994,11 @@ function CredentialTableRow({
 			</Table.Td>
 			<Table.Td>
 				<Text size="sm">{entry.priority}</Text>
+			</Table.Td>
+			<Table.Td>
+				<Text size="xs" c="dimmed">
+					{formatRegions(entry)}
+				</Text>
 			</Table.Td>
 			<Table.Td>
 				<Group gap={4} wrap="wrap">
@@ -1127,12 +1041,7 @@ function CredentialTableRow({
 				</Text>
 			</Table.Td>
 			<Table.Td>
-				<CredentialActions
-					entry={entry}
-					editing={editing}
-					onEdit={() => setEditing(true)}
-					{...muts}
-				/>
+				<CredentialActions entry={entry} {...muts} />
 			</Table.Td>
 		</Table.Tr>
 	);

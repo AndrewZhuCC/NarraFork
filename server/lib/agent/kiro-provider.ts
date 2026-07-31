@@ -8,6 +8,7 @@ import type {
 import { getToolMessage, type Locale } from "../prompt-i18n";
 import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
+import { hostHistoryRuntime, hostNormalizeRuntime } from "./codewhisperer-host-runtime";
 import {
 	buildKiroHistory,
 	buildKiroReasoningContent,
@@ -59,7 +60,13 @@ export class KiroProvider implements ProviderAdapter {
 		model: string,
 		narratorId?: string,
 	): Promise<{ history: unknown[]; trailingToolResults: unknown[] }> {
-		return buildKiroHistory(dbMessages, model, narratorId, this.getActiveReasoningSource());
+		return buildKiroHistory(
+			dbMessages,
+			model,
+			narratorId,
+			this.getActiveReasoningSource(),
+			hostHistoryRuntime(),
+		);
 	}
 
 	getActiveReasoningSource(): string | undefined {
@@ -94,7 +101,7 @@ export class KiroProvider implements ProviderAdapter {
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
 		const { kiroChatRaw } = await import("../kiro-adapter");
-		const request = normalizeKiroChatRequest(buildKiroRequest(params));
+		const request = normalizeKiroChatRequest(buildKiroRequest(params), hostNormalizeRuntime());
 		params.requestDump?.setRequest({
 			transport: "kiro-plugin",
 			body: request,

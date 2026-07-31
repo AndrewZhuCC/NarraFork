@@ -1,17 +1,8 @@
-import { parseModelId } from "../settings";
-
 /**
- * Resolve user-facing model names to Kiro API model IDs.
+ * Re-export shim for CodeWhisperer model-ID resolution.
  *
- * Strips the "provider:" prefix if present and returns the bare model name as-is.
- * Falls back to "claude-sonnet-4.5" when no model is specified.
+ * The implementation moved to `@shared/codewhisperer/resolve-model` so the
+ * CodeWhisperer protocol layer — reused by bundled plugin code — has no
+ * `server/` imports. Host importers keep using this path unchanged.
  */
-export function resolveModel(model?: string): string {
-	if (!model) return "claude-sonnet-4.5";
-
-	// Strip provider prefix if present (e.g. "kiro:claude-sonnet-4.6" → "claude-sonnet-4.6")
-	const { model: bare } = parseModelId(model);
-	if (!bare) return "claude-sonnet-4.5";
-
-	return bare;
-}
+export { resolveModel } from "@shared/codewhisperer/resolve-model";

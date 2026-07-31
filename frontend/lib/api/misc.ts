@@ -15,6 +15,7 @@ import type {
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
 	HookApiRecord,
+	KiroCredentialPatch,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
@@ -258,10 +259,7 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ mode }),
 		}),
-	kiroUpdateCredential: (
-		id: string,
-		fields: { email?: string; displayName?: string; region?: string },
-	) =>
+	kiroUpdateCredential: (id: string, fields: KiroCredentialPatch) =>
 		request<{ ok: boolean }>(`/kiro/credentials/${id}`, {
 			method: "PATCH",
 			body: JSON.stringify(fields),

@@ -19,6 +19,7 @@ import { KiroMcpClient } from "./mcp-client";
 import { MultiTokenManager } from "./multi-token-manager";
 import type {
 	KiroChatRequest,
+	KiroCredentialPatch,
 	KiroCredentials,
 	KiroModel,
 	KiroPluginConfig,
@@ -212,10 +213,7 @@ export async function kiroManualRefresh(id: string): Promise<void> {
 	await tokenManager.manualRefresh(id);
 }
 
-export function kiroUpdateCredential(
-	id: string,
-	fields: { email?: string; displayName?: string; region?: string },
-): void {
+export function kiroUpdateCredential(id: string, fields: KiroCredentialPatch): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.updateCredential(id, fields);
 }

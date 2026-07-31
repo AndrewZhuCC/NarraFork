@@ -65,7 +65,7 @@ export class KiroApiClient {
 			if (!body.profileArn && ctx.credentials.profileArn) {
 				body.profileArn = ctx.credentials.profileArn;
 			}
-			const region = effectiveApiRegion(this.tokenManager.currentConfig);
+			const region = effectiveApiRegion(this.tokenManager.currentConfig, ctx.credentials);
 			const url = `https://q.${region}.amazonaws.com`;
 			const tier = classifyKiroCredentialTier(ctx.credentials);
 			const slotState = { held: false };
@@ -225,7 +225,7 @@ export class KiroApiClient {
 		agentMode: string,
 	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
-		const region = effectiveApiRegion(config);
+		const region = effectiveApiRegion(config, ctx.credentials);
 		const { kiroVersion } = config;
 		const [os, osVersion] = config.systemVersion.split("#");
 

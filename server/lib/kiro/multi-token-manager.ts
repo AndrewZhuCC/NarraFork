@@ -7,6 +7,7 @@ import { logger } from "../logger";
 import {
 	apiKeyOf,
 	applyKiroTokenTypeHeader,
+	canonicalizeAuthMethodValue,
 	canonicalKiroAuthMethod,
 	isApiKeyCredential,
 } from "./auth-method";
@@ -20,6 +21,7 @@ import {
 	updateLimits,
 } from "./concurrency-control";
 import {
+	DEFAULT_KIRO_REGION,
 	effectiveApiRegion,
 	loadStats,
 	loadUsageCache,
@@ -38,11 +40,33 @@ import {
 	type DisabledReason,
 	KiroAuthError,
 	type KiroConfig,
+	type KiroCredentialPatch,
 	type KiroCredentials,
 	type LoadBalancingMode,
 	type ManagerSnapshot,
 	type UsageCacheEntry,
 } from "./types";
+
+/**
+ * Credential fields a patch may set or clear as plain text.
+ *
+ * Secrets (refreshToken / apiKey / clientSecret / proxyPassword) are handled
+ * separately: an empty value there means "leave unchanged" rather than "clear",
+ * because the editor never receives their current value to echo back.
+ */
+const OPTIONAL_TEXT_FIELDS = [
+	"email",
+	"displayName",
+	"region",
+	"authRegion",
+	"apiRegion",
+	"profileArn",
+	"subscriptionTitle",
+	"startUrl",
+	"machineId",
+	"proxyUrl",
+	"proxyUsername",
+] as const satisfies ReadonlyArray<keyof KiroCredentials & keyof KiroCredentialPatch>;
 
 const MAX_FAILURES_PER_CREDENTIAL = 3;
 const STATS_SAVE_DEBOUNCE_MS = 30_000;
@@ -51,6 +75,10 @@ const METER_PERSIST_DEBOUNCE_MS = 60_000;
 const USAGE_CACHE_PERSIST_DEBOUNCE_MS = 60_000;
 const SUSPICIOUS_THROTTLE_COOLDOWN_MS = 5 * 60_000;
 const RECOVERY_RETRY_MS = 30_000;
+/** Maximum time to wait for an upstream API response (usage / models endpoints). */
+const UPSTREAM_REQUEST_TIMEOUT_MS = 30_000;
+/** Maximum number of pages to fetch from paginated upstream endpoints. */
+const MAX_PAGINATION_PAGES = 10;
 const OVERAGE_BONUS_CREDITS = 10_000;
 const FREE_TIER_BLOCKED_MODELS = new Set(["auto"]);
 const DEFAULT_TIER_PRIORITY: AccountTier[] = ["free", "enterprise", "paid"];
@@ -615,6 +643,17 @@ export class MultiTokenManager {
 				isApiKey: isApiKeyCredential(e.credentials),
 				subscriptionTitle: e.credentials.subscriptionTitle,
 				region: e.credentials.region,
+				authRegion: e.credentials.authRegion,
+				apiRegion: e.credentials.apiRegion,
+				profileArn: e.credentials.profileArn,
+				startUrl: e.credentials.startUrl,
+				machineId: e.credentials.machineId,
+				// Secret presence only — values stay server-side.
+				hasClientId: !!e.credentials.clientId,
+				hasClientSecret: !!e.credentials.clientSecret,
+				proxyUrl: e.credentials.proxyUrl,
+				proxyUsername: e.credentials.proxyUsername,
+				hasProxyPassword: !!e.credentials.proxyPassword,
 				meterUsage: e.credentials.meterUsage,
 				availableModels: e.credentials.availableModels,
 				tier: classifyKiroCredentialTier(e.credentials),
@@ -709,15 +748,101 @@ export class MultiTokenManager {
 
 	// ==================== Update Credential Fields ====================
 
-	updateCredential(
-		id: string,
-		fields: { email?: string; displayName?: string; region?: string },
-	): void {
+	/**
+	 * Patch an existing credential.
+	 *
+	 * Semantics match the gateway's credential editor:
+	 * - Only keys present in `fields` are touched; omitted keys keep their value.
+	 * - An empty string clears an optional field (so a wrong `apiRegion` can be
+	 *   removed), while secrets treat empty as "leave unchanged" and are only
+	 *   replaced when a non-empty value is supplied.
+	 * - Switching auth method must leave usable token material behind, and the
+	 *   new secret must not collide with another stored credential.
+	 */
+	updateCredential(id: string, fields: KiroCredentialPatch): void {
 		const entry = this.entries.find((e) => e.id === id);
 		if (!entry) throw new Error(`Credential not found: ${id}`);
-		if (fields.email !== undefined) entry.credentials.email = fields.email;
-		if (fields.displayName !== undefined) entry.credentials.displayName = fields.displayName;
-		if (fields.region !== undefined) entry.credentials.region = fields.region;
+
+		// Patch a copy so a rejected update cannot leave the entry half-written.
+		const next: KiroCredentials = { ...entry.credentials };
+
+		for (const key of OPTIONAL_TEXT_FIELDS) {
+			const value = fields[key];
+			if (value === undefined) continue;
+			const trimmed = value.trim();
+			if (trimmed) next[key] = trimmed;
+			else delete next[key];
+		}
+
+		// Secrets are never echoed back to the editor, so an empty value here means
+		// "keep the stored one" rather than "clear it".
+		const refreshToken = fields.refreshToken?.trim();
+		if (refreshToken) next.refreshToken = refreshToken;
+		const apiKey = fields.apiKey?.trim();
+		const clientId = fields.clientId?.trim();
+		if (clientId) next.clientId = clientId;
+		const clientSecret = fields.clientSecret?.trim();
+		if (clientSecret) next.clientSecret = clientSecret;
+		const proxyPassword = fields.proxyPassword?.trim();
+		if (proxyPassword) next.proxyPassword = proxyPassword;
+
+		if (fields.priority !== undefined) next.priority = fields.priority;
+
+		// Auth method: an explicit value wins, otherwise supplying a new API key
+		// implies api_key just like the import path does.
+		const requestedAuthMethod = canonicalizeAuthMethodValue(fields.authMethod ?? next.authMethod);
+		const becomesApiKey = apiKey ? true : requestedAuthMethod === "api_key";
+
+		if (becomesApiKey) {
+			const key = apiKey ?? apiKeyOf(entry.credentials);
+			if (!key) {
+				throw new Error("apiKey is required when switching to api_key credentials");
+			}
+			next.authMethod = "api_key";
+			next.apiKey = key;
+			next.accessToken = key;
+			// Static keys never expire; drop any inherited expiry.
+			delete next.expiresAt;
+		} else {
+			if (isApiKeyCredential(entry.credentials) && !refreshToken) {
+				throw new Error("refreshToken is required when switching api_key credentials to OAuth");
+			}
+			if (refreshToken) {
+				// A replaced refresh token invalidates the cached access token.
+				delete next.accessToken;
+				delete next.expiresAt;
+			}
+			if (!next.refreshToken?.trim()) {
+				throw new Error("refreshToken is required for non-api_key credentials");
+			}
+			// Leaving api_key behind must clear the stale static key.
+			if (isApiKeyCredential(entry.credentials)) delete next.apiKey;
+			next.authMethod = requestedAuthMethod ?? canonicalKiroAuthMethod(next);
+		}
+
+		const nextSecret = dedupeSecret(next);
+		if (!nextSecret) throw new Error("Credential must carry a refreshToken or apiKey");
+		const nextHash = sha256Hex(nextSecret);
+		for (const other of this.entries) {
+			if (other.id === id) continue;
+			const secret = dedupeSecret(other.credentials);
+			if (secret && sha256Hex(secret) === nextHash) {
+				throw new Error(`Credential secret already used by ${other.id}`);
+			}
+		}
+
+		// machineId is derived from the secret when not set explicitly, so a new
+		// secret must not keep a machineId that was derived from the old one.
+		if (!fields.machineId?.trim() && dedupeSecret(entry.credentials) !== nextSecret) {
+			const derivedFromOld = generateMachineId(entry.credentials, this.config);
+			if (next.machineId && next.machineId === derivedFromOld) delete next.machineId;
+		}
+		if (!next.machineId) {
+			const mid = generateMachineId(next, this.config);
+			if (mid) next.machineId = mid;
+		}
+
+		entry.credentials = next;
 		this.persistCredentials();
 	}
 
@@ -787,10 +912,8 @@ export class MultiTokenManager {
 		logger.debug("[kiro:usage] token ok");
 
 		const creds = entry.credentials;
-		const region = effectiveApiRegion(this.config);
+		const region = effectiveApiRegion(this.config, creds);
 		const { kiroVersion } = this.config;
-		const host = `q.${region}.amazonaws.com`;
-		const url = `https://${host}`;
 
 		const reqBody: Record<string, string> = {
 			origin: "AI_EDITOR",
@@ -800,33 +923,65 @@ export class MultiTokenManager {
 			reqBody.profileArn = creds.profileArn;
 		}
 
-		const headers: Record<string, string> = {
-			"Content-Type": "application/x-amz-json-1.0",
-			"x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
-			"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
-			Host: host,
-			"amz-sdk-invocation-id": randomUUID(),
-			"amz-sdk-request": "attempt=1; max=1",
-			Authorization: `Bearer ${ctx.token}`,
-		};
-		applyKiroTokenTypeHeader(headers, creds);
+		const requestUsage = async (usageRegion: string): Promise<Response> => {
+			const host = `q.${usageRegion}.amazonaws.com`;
+			const url = `https://${host}`;
+			const headers: Record<string, string> = {
+				"Content-Type": "application/x-amz-json-1.0",
+				"x-amz-target": "AmazonCodeWhispererService.GetUsageLimits",
+				"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
+				Host: host,
+				"amz-sdk-invocation-id": randomUUID(),
+				"amz-sdk-request": "attempt=1; max=1",
+				Authorization: `Bearer ${ctx.token}`,
+			};
+			applyKiroTokenTypeHeader(headers, creds);
 
-		logger.debug("[kiro:usage] fetch POST", { url });
+			logger.debug("[kiro:usage] fetch POST", { url });
+			let res: Response;
+			try {
+				res = await pfetch(url, {
+					method: "POST",
+					headers,
+					body: JSON.stringify(reqBody),
+					signal: AbortSignal.timeout(UPSTREAM_REQUEST_TIMEOUT_MS),
+				});
+			} catch (err) {
+				logger.error("[kiro:usage] fetch threw", { error: String(err) });
+				throw new Error(
+					`getUsageLimits network error: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			logger.debug("[kiro:usage] response", { status: res.status });
+			if (!res.ok) {
+				const body = await res.text().catch(() => "");
+				logger.warn("[kiro:usage] not ok", { status: res.status, body: body.slice(0, 200) });
+				throw new Error(`getUsageLimits failed: ${res.status} ${body}`);
+			}
+			return res;
+		};
+
+		// A custom API region may not serve the usage endpoint even when it serves
+		// chat, so fall back to the default endpoint before surfacing the failure.
 		let res: Response;
 		try {
-			res = await pfetch(url, { method: "POST", headers, body: JSON.stringify(reqBody) });
+			res = await requestUsage(region);
 		} catch (err) {
-			logger.error("[kiro:usage] fetch threw", { error: String(err) });
-			throw new Error(
-				`getUsageLimits network error: ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-
-		logger.debug("[kiro:usage] response", { status: res.status });
-		if (!res.ok) {
-			const body = await res.text().catch(() => "");
-			logger.warn("[kiro:usage] not ok", { status: res.status, body: body.slice(0, 200) });
-			throw new Error(`getUsageLimits failed: ${res.status} ${body}`);
+			if (region === DEFAULT_KIRO_REGION) throw err;
+			logger.warn("[kiro:usage] region failed, retrying default region", {
+				credentialId: id,
+				region,
+				error: String(err),
+			});
+			try {
+				res = await requestUsage(DEFAULT_KIRO_REGION);
+			} catch (fallbackErr) {
+				throw new Error(
+					`getUsageLimits failed for region ${region} (${err instanceof Error ? err.message : String(err)}) and ${DEFAULT_KIRO_REGION} fallback: ${
+						fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)
+					}`,
+				);
+			}
 		}
 
 		logger.debug("[kiro:usage] parsing json");
@@ -946,7 +1101,7 @@ export class MultiTokenManager {
 		if (!ctx) throw new KiroAuthError(`Cannot acquire valid token for credential ${entry.id}`);
 
 		const creds = entry.credentials;
-		const region = effectiveApiRegion(this.config);
+		const region = effectiveApiRegion(this.config, creds);
 		const { kiroVersion } = this.config;
 		const host = `q.${region}.amazonaws.com`;
 		const url = `https://${host}`;
@@ -959,6 +1114,7 @@ export class MultiTokenManager {
 
 		const allModels: Array<Record<string, unknown>> = [];
 		let nextToken: string | undefined;
+		let pageCount = 0;
 
 		logger.debug("[kiro:models] start", { credentialId: entry.id, region });
 
@@ -992,6 +1148,7 @@ export class MultiTokenManager {
 					method: "POST",
 					headers,
 					body: JSON.stringify(reqBody),
+					signal: AbortSignal.timeout(UPSTREAM_REQUEST_TIMEOUT_MS),
 				});
 			} catch (err) {
 				throw new Error(
@@ -1028,6 +1185,16 @@ export class MultiTokenManager {
 			}
 			if (Array.isArray(data.models)) allModels.push(...data.models);
 			nextToken = (data.nextToken as string) || undefined;
+			pageCount++;
+
+			if (nextToken && pageCount >= MAX_PAGINATION_PAGES) {
+				logger.warn("[kiro:models] pagination limit reached, truncating", {
+					credentialId: entry.id,
+					pageCount,
+					totalModelsSoFar: allModels.length,
+				});
+				break;
+			}
 		} while (nextToken);
 
 		logger.debug("[kiro:models] done", { total: allModels.length });

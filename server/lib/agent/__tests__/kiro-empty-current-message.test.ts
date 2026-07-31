@@ -72,19 +72,22 @@ function buildRequest(options: {
 	toolResults: unknown[];
 	images?: ChatParams["images"];
 }): KiroChatRequest {
-	return normalizeKiroChatRequest(
-		buildKiroRequest({
-			conversationId: "conv-eof-retry",
-			content: options.content,
-			model: "claude-opus-5",
-			cwd: "/tmp",
-			history: options.history,
-			tools: [{ toolSpecification: { name: "Bash", description: "d", inputSchema: { json: {} } } }],
-			toolResults: options.toolResults,
-			signal: new AbortController().signal,
-			...(options.images ? { images: options.images } : {}),
-		} satisfies ChatParams),
-	);
+	// Bound to a variable so this exercises the real host `ChatParams` (which
+	// carries `signal` and other host-only fields) being accepted by the shared
+	// request builder, rather than an inline literal checked against the narrower
+	// protocol subset.
+	const params: ChatParams = {
+		conversationId: "conv-eof-retry",
+		content: options.content,
+		model: "claude-opus-5",
+		cwd: "/tmp",
+		history: options.history,
+		tools: [{ toolSpecification: { name: "Bash", description: "d", inputSchema: { json: {} } } }],
+		toolResults: options.toolResults,
+		signal: new AbortController().signal,
+		...(options.images ? { images: options.images } : {}),
+	};
+	return normalizeKiroChatRequest(buildKiroRequest(params));
 }
 
 describe("Kiro empty-currentMessage guard (upstream REQUEST_BODY_INVALID)", () => {

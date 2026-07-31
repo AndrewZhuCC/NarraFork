@@ -94,7 +94,13 @@ function describeProvider(id, params) {
 				configSchema: {
 					type: "object",
 					properties: {
-						apiMode: { type: "string", enum: ["offline"], default: "offline" },
+						apiMode: {
+							type: "string",
+							title: "Reply style",
+							description: "Chooses which deterministic reply the provider streams.",
+							enum: ["offline", "verbose"],
+							default: "offline",
+						},
 					},
 					additionalProperties: false,
 				},
@@ -142,6 +148,121 @@ function listModels(id, params) {
 	});
 }
 
+// --- Streaming chat -------------------------------------------------------
+//
+// Operations are tracked so `provider.cancel` can stop an in-flight stream. Each
+// operation emits `provider.event` notifications with a monotonic `seq`, then
+// exactly one terminal event (`done` or `error`). The host rejects any event that
+// arrives before the accept response, so emission is deferred until after it.
+
+const operations = new Map();
+
+function emit(operationId, event) {
+	const operation = operations.get(operationId);
+	if (!operation) return;
+	operation.seq += 1;
+	send({
+		jsonrpc: "2.0",
+		method: "provider.event",
+		params: {
+			protocolVersion: PROVIDER_PROTOCOL,
+			operationId,
+			seq: operation.seq,
+			event,
+		},
+	});
+}
+
+function finishOperation(operationId, event) {
+	const operation = operations.get(operationId);
+	if (!operation) return;
+	if (operation.timer) clearTimeout(operation.timer);
+	emit(operationId, event);
+	operations.delete(operationId);
+}
+
+/**
+ * Deterministic word-by-word replies so tests can assert exact streamed text.
+ *
+ * Two variants exist so `apiMode` has an observable effect: a config value that changes
+ * nothing cannot demonstrate that host-side persistence actually reaches the plugin.
+ */
+const CHAT_WORDS_BY_MODE = {
+	offline: ["Hello", " from", " the", " example", " provider", "."],
+	verbose: ["Hello", " from", " the", " example", " provider", " in", " verbose", " mode", "."],
+};
+
+/** Fall back to `offline` for an absent or unknown mode, matching the schema default. */
+function chatWordsFor(config) {
+	const mode = object(config)?.apiMode;
+	return CHAT_WORDS_BY_MODE[mode] ?? CHAT_WORDS_BY_MODE.offline;
+}
+
+function streamChat(operationId) {
+	const operation = operations.get(operationId);
+	if (!operation) return;
+	const words = operation.words;
+	if (operation.wordIndex >= words.length) {
+		finishOperation(operationId, {
+			type: "done",
+			status: "completed",
+			stopReason: "end_turn",
+			usage: { inputTokens: 8, completionTokens: words.length },
+		});
+		return;
+	}
+	emit(operationId, {
+		type: "text.delta",
+		text: words[operation.wordIndex],
+		outputIndex: 0,
+	});
+	operation.wordIndex += 1;
+	// A real provider streams as bytes arrive; the small delay here keeps the stream
+	// observable so a cancel can land mid-stream.
+	operation.timer = setTimeout(() => streamChat(operationId), 5);
+}
+
+function startChat(id, params) {
+	const operationId = typeof params?.operationId === "string" ? params.operationId : undefined;
+	if (!operationId) {
+		reject(id, -32602, "chat requires an operationId", { code: "INVALID_PARAMS" });
+		return;
+	}
+	if (params?.providerTypeId !== `${PLUGIN_ID}/example-provider`) {
+		reject(id, -32602, "Unknown provider type", { code: "INVALID_PARAMS" });
+		return;
+	}
+	// Resolve the reply once per operation so a mid-stream config change cannot splice
+	// two different replies into one response.
+	operations.set(operationId, {
+		seq: 0,
+		wordIndex: 0,
+		timer: undefined,
+		words: chatWordsFor(params?.config),
+	});
+	// Accept first: the host treats an event before the accept as a protocol error.
+	send({ jsonrpc: "2.0", id, result: { operationId, accepted: true } }, () => {
+		const operation = operations.get(operationId);
+		if (!operation) return;
+		operation.timer = setTimeout(() => streamChat(operationId), 5);
+	});
+}
+
+function cancelOperation(id, params) {
+	const operationId = typeof params?.operationId === "string" ? params.operationId : undefined;
+	if (!operationId) {
+		reject(id, -32602, "cancel requires an operationId", { code: "INVALID_PARAMS" });
+		return;
+	}
+	if (!operations.has(operationId)) {
+		respond(id, { operationId, state: "unknown_operation" });
+		return;
+	}
+	respond(id, { operationId, state: "cancelling" });
+	// A cancelled operation still owes the host exactly one terminal event.
+	finishOperation(operationId, { type: "done", status: "cancelled", stopReason: "cancelled" });
+}
+
 function handleRequest(message) {
 	const params = object(message.params);
 	switch (message.method) {
@@ -180,19 +301,55 @@ function handleRequest(message) {
 			}
 			describeProvider(message.id, params);
 			return;
-		case "provider.validateConfig":
-			respond(message.id, { valid: true, issues: [], capabilities: { offline: true } });
+		case "provider.validateConfig": {
+			// The host validates against the schema already; this reports the resolved mode
+			// back so a caller can confirm which reply the provider would stream.
+			const mode = object(params?.config)?.apiMode;
+			if (mode !== undefined && !(mode in CHAT_WORDS_BY_MODE)) {
+				respond(message.id, {
+					valid: false,
+					issues: [{ path: "/apiMode", message: "must be offline or verbose" }],
+				});
+				return;
+			}
+			respond(message.id, {
+				valid: true,
+				issues: [],
+				capabilities: { offline: true, apiMode: mode ?? "offline" },
+			});
 			return;
+		}
 		case "provider.listModels":
 			listModels(message.id, params);
 			return;
+		case "provider.chat":
+			if (!active) {
+				reject(message.id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
+				return;
+			}
+			startChat(message.id, params);
+			return;
+		case "provider.cancel":
+			cancelOperation(message.id, params);
+			return;
 		case "deactivate":
 			active = false;
+			for (const operationId of [...operations.keys()]) {
+				finishOperation(operationId, {
+					type: "done",
+					status: "cancelled",
+					stopReason: "cancelled",
+				});
+			}
 			respond(message.id, { deactivated: true });
 			return;
 		case "shutdown":
 			active = false;
 			initialized = false;
+			for (const operation of operations.values()) {
+				if (operation.timer) clearTimeout(operation.timer);
+			}
+			operations.clear();
 			send({ jsonrpc: "2.0", id: message.id, result: { shutdown: true } }, () => {
 				process.exit(0);
 			});
@@ -248,6 +405,9 @@ send({
 		pluginId: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		rpcProtocol: RPC_PROTOCOL,
-		features: [],
+		// A streaming provider must negotiate these: the host drops `provider.event`
+		// notifications from a plugin that did not declare `host_api.notifications`,
+		// and `rpc.cancel` is required to stop an in-flight stream.
+		features: ["host_api.notifications", "rpc.cancel"],
 	},
 });

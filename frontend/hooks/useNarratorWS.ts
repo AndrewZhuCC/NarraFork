@@ -520,6 +520,9 @@ interface NarratorWSCallbacks {
 		retryCount?: number;
 		maxRetries?: number;
 		delayMs?: number;
+		/** Structured cause of the retry. The server always sends this; dropping it
+		 *  here is what forced retry toasts to show raw English provider text. */
+		diagnostics?: Record<string, unknown>;
 	}) => void;
 	/** Leaked XML tool-call diagnostic (Kiro/NUG). Not persisted. */
 	onLeakedToolCall?: (info: {
@@ -648,6 +651,12 @@ interface NarratorWSCallbacks {
 	onBrowserSessionVisualChange?: (sessionId: string) => void;
 	/** A reasoning-only dead turn was discarded — drop any live streaming blocks. */
 	onStreamingReset?: (parentToolUseId?: string) => void;
+	/**
+	 * Live tool cards whose attempt was abandoned and replayed. They never
+	 * persisted, so nothing else will retire them — drop them or they stay
+	 * "running" forever with a live elapsed timer.
+	 */
+	onToolUseDiscarded?: (toolUseIds: string[], parentToolUseId?: string) => void;
 }
 
 export function useNarratorWS(
@@ -1169,6 +1178,12 @@ export function useNarratorWS(
 							retryCount: data.retryCount as number | undefined,
 							maxRetries: data.maxRetries as number | undefined,
 							delayMs: data.delayMs as number | undefined,
+							diagnostics:
+								data.diagnostics &&
+								typeof data.diagnostics === "object" &&
+								!Array.isArray(data.diagnostics)
+									? (data.diagnostics as Record<string, unknown>)
+									: undefined,
 						});
 						break;
 					case "leaked_tool_call_notice":
@@ -1409,6 +1424,12 @@ export function useNarratorWS(
 						break;
 					case "streaming_reset":
 						callbackOwner.callbacks.onStreamingReset?.(data.parentToolUseId as string | undefined);
+						break;
+					case "tool_use_discarded":
+						callbackOwner.callbacks.onToolUseDiscarded?.(
+							(data.toolUseIds ?? []) as string[],
+							data.parentToolUseId as string | undefined,
+						);
 						break;
 				}
 			},

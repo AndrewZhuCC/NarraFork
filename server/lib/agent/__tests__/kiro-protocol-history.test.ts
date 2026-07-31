@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import type { KiroChatRequest, KiroToolResult } from "../../kiro-adapter";
 import { StreamStaleError } from "../../stream-timeout";
 import { setUploadsDirForTests } from "../../uploads";
+import { hostHistoryRuntime } from "../codewhisperer-host-runtime";
 import { isRetryableError } from "../error-handling";
 import { buildKiroHistory, normalizeKiroChatRequest, parseSSEStream } from "../kiro-protocol";
 import type { DbMessage, ParsedStreamEvent } from "../provider";
@@ -107,12 +108,53 @@ describe("buildKiroHistory", () => {
 			}),
 		];
 
-		const result = await buildKiroHistory(dbMessages, "kiro:claude-sonnet-4.6", "forked-narrator");
+		// Images are host-owned, so the production path supplies the upload-backed
+		// resolver from the host runtime binding rather than reaching into `uploads`.
+		const result = await buildKiroHistory(
+			dbMessages,
+			"kiro:claude-sonnet-4.6",
+			"forked-narrator",
+			undefined,
+			hostHistoryRuntime(),
+		);
 		const historyJson = JSON.stringify(result.history);
 
 		expect(historyJson).toContain("Inspect this screenshot");
 		expect(historyJson).toContain(SAMPLE_PNG_BASE64);
 		expect(historyJson).toContain('"images"');
+	});
+
+	test("omits images when no host image resolver is supplied", async () => {
+		registerTestImage("source-narrator", "img_no_resolver");
+		const dbMessages: DbMessage[] = [
+			makeUserMessage({
+				id: "user-image-bare",
+				narratorId: "source-narrator",
+				contentJson: [
+					{
+						type: "image",
+						imageId: "img_no_resolver",
+						filename: "sample.png",
+						mediaType: "image/png",
+					},
+					{ type: "text", text: "Inspect this screenshot" },
+				],
+				contentText: "Inspect this screenshot",
+			}),
+			makeAssistantMessage({
+				id: "assistant-after-bare",
+				contentJson: [{ type: "text", text: "done" }],
+				contentText: "done",
+			}),
+		];
+
+		const result = await buildKiroHistory(dbMessages, "kiro:claude-sonnet-4.6", "forked-narrator");
+		const historyJson = JSON.stringify(result.history);
+
+		// Text still replays; only the image attachment is skipped.
+		expect(historyJson).toContain("Inspect this screenshot");
+		expect(historyJson).not.toContain(SAMPLE_PNG_BASE64);
+		expect(historyJson).not.toContain('"images"');
 	});
 
 	test("moves trailing sys spec continuation into trailing user text", async () => {
