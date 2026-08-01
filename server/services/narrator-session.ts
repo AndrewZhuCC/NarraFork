@@ -358,6 +358,7 @@ import {
 	exitNarratorPlanMode,
 	prepareNarratorPlanMode,
 } from "./narrator-plan-mode";
+import type { RevertScope, RevertWarning } from "./snapshot-revert";
 
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
@@ -5528,8 +5529,8 @@ export async function rollbackToBlock(
 	narratorId: string,
 	messageId: string,
 	blockIndex: number,
-	opts?: { skipRevert?: boolean },
-): Promise<{ ok: boolean; warnings?: string[] }> {
+	opts?: { skipRevert?: boolean; scope?: RevertScope },
+): Promise<{ ok: boolean; warnings?: RevertWarning[] }> {
 	const targetRef = await db.query.narratorMessageRefs.findFirst({
 		where: and(
 			eq(narratorMessageRefs.narratorId, narratorId),
@@ -5568,6 +5569,7 @@ export async function rollbackToBlock(
 		{
 			preserveConversationId: true,
 			skipRevert: opts?.skipRevert,
+			...(opts?.scope ? { scope: opts.scope } : {}),
 		},
 	);
 	if (deletedMessageIds.length > 0) {
@@ -5585,6 +5587,10 @@ export async function rollbackToBlock(
 	}
 
 	if (blocksToDelete.length > 0) {
+		// No scope here on purpose: block deletion removes single blocks while keeping
+		// everything after them, so it deliberately uses per-file replay (see
+		// `deleteMessageBlock`) rather than any tree-based scope. Forwarding `scope`
+		// would look meaningful while being ignored.
 		const blockDeleteResult = await narratorService.deleteMessageBlocks(
 			narratorId,
 			blocksToDelete,
