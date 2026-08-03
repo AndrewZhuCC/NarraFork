@@ -1,0 +1,215 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.narrafork.kiro-external",
+	"version": "0.1.0",
+	"displayName": "Kiro (External)",
+	"description": "Kiro provider running as an out-of-process plugin, alongside the built-in adapter.",
+	"publisher": {
+		"id": "com.narrafork",
+		"name": "NarraFork"
+	},
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": ["host_api.notifications", "rpc.cancel"],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onProvider:kiro"],
+	"contributes": {
+		"providers": [
+			{
+				"id": "kiro",
+				"title": "Kiro (External)",
+				"description": "Claude and partner models through a Kiro subscription.",
+				"providerPrefix": "kiro-ext",
+				"defaultModelId": "claude-sonnet-4.5",
+				"modelDiscovery": true,
+				"sessionMode": "stateless",
+				"maxConcurrency": 2,
+				"capabilities": {
+					"validateConfig": true,
+					"listModels": true,
+					"chat": true,
+					"generate": true,
+					"reasoningContinuation": true,
+					"inputImages": true
+				},
+				"limits": {
+					"maxConcurrentChat": 2,
+					"maxConcurrentGenerate": 1,
+					"maxConfigBytes": 16384,
+					"maxModelPageSize": 50
+				},
+				"configSchema": {
+					"credentialsBundle": {
+						"type": "string",
+						"title": "Credentials",
+						"description": "All Kiro credentials as one JSON array. Managed from the credentials page; not meant to be edited by hand.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					},
+					"loadBalancingMode": {
+						"type": "string",
+						"title": "Load balancing",
+						"description": "How requests are spread across credentials.",
+						"enum": ["priority", "balanced"],
+						"default": "priority"
+					},
+					"authMethod": {
+						"type": "string",
+						"title": "Authentication method",
+						"description": "Legacy single-credential field. social and idc refresh an access token; api_key uses a long-lived key.",
+						"enum": ["social", "idc", "api_key"],
+						"default": "social"
+					},
+					"refreshToken": {
+						"type": "string",
+						"title": "Refresh token",
+						"description": "Required for social and idc. Exchanged for a short-lived access token.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					},
+					"apiKey": {
+						"type": "string",
+						"title": "API key",
+						"description": "Required for api_key auth (ksk_...). Used directly, never refreshed.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					},
+					"clientId": {
+						"type": "string",
+						"title": "Client ID",
+						"description": "Required for idc (AWS IAM Identity Center) refresh.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					},
+					"clientSecret": {
+						"type": "string",
+						"title": "Client secret",
+						"description": "Required for idc refresh.",
+						"writeOnly": true,
+						"x-narrafork-secret": true
+					},
+					"profileArn": {
+						"type": "string",
+						"title": "Profile ARN",
+						"description": "Sent with data-plane calls when the account requires it.",
+						"maxLength": 2048
+					},
+					"region": {
+						"type": "string",
+						"title": "Region",
+						"description": "AWS region for both auth and data-plane endpoints.",
+						"default": "us-east-1",
+						"maxLength": 64
+					}
+				}
+			}
+		],
+		"tools": [],
+		"commands": [
+			{
+				"id": "status",
+				"title": "Kiro credential status",
+				"description": "Credential list, per-credential state and load balancing mode.",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.import",
+				"title": "Import Kiro credentials",
+				"description": "Add credentials from a pasted export.",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.setState",
+				"title": "Enable, disable or reset a credential",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.remove",
+				"title": "Remove a credential",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.setPriority",
+				"title": "Change credential priority",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.refresh",
+				"title": "Refresh a credential token",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.update",
+				"title": "Edit credential details",
+				"description": "Region, profile ARN and display name. Secrets are rotated through import.",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.usage",
+				"title": "Fetch credential usage",
+				"handler": "server"
+			},
+			{
+				"id": "config.setLoadBalancing",
+				"title": "Set load balancing mode",
+				"handler": "server"
+			},
+			{
+				"id": "verify-credential",
+				"title": "Verify Kiro credential",
+				"handler": "server"
+			}
+		],
+		"events": [],
+		"views": [
+			{
+				"id": "kiro-external-settings",
+				"title": "Kiro credentials",
+				"entry": "ui/provider-settings.iife.js",
+				"surfaces": ["provider-settings"],
+				"scope": "global",
+				"instance": "singleton",
+				"providerId": "kiro"
+			}
+		]
+	},
+	"ui": {
+		"entry": "ui/provider-settings.iife.js"
+	},
+	"permissions": {
+		"host": ["provider.register", "provider.use", "ui.panel", "config.read_self"],
+		"network": {
+			"mode": "allowlist",
+			"allow": ["https://q.us-east-1.amazonaws.com", "https://oidc.us-east-1.amazonaws.com"],
+			"domains": ["q.us-east-1.amazonaws.com", "oidc.us-east-1.amazonaws.com"],
+			"ports": [443],
+			"protocols": ["https"],
+			"followRedirects": false,
+			"maxConnections": 8
+		},
+		"filesystem": {
+			"package": "readOnly",
+			"pluginData": "readWrite",
+			"workspace": "none"
+		},
+		"process": {
+			"spawn": "none"
+		}
+	}
+}

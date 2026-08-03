@@ -25,7 +25,9 @@
 			"!**/.worktrees",
 			"!**/server/generated",
 			"!**/frontend/routeTree.gen.ts",
-			"!**/drizzle"
+			"!**/drizzle",
+			"!**/examples/plugins/kiro-external/server/index.js",
+			"!**/examples/plugins/kiro-external/ui/*.iife.js"
 		]
 	}
 }
