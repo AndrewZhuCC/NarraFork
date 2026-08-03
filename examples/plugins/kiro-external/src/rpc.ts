@@ -33,6 +33,18 @@ export interface JsonRpcRequest {
 	params?: unknown;
 }
 
+export interface JsonRpcResponse {
+	jsonrpc: "2.0";
+	id: string | number;
+	result?: unknown;
+	error?: { code: number; message: string; data?: unknown };
+}
+
+export interface HostRequestError extends Error {
+	code: number;
+	data?: unknown;
+}
+
 export function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -114,9 +126,92 @@ export function notify(method: string, params: unknown): void {
 	send({ jsonrpc: "2.0", method, params });
 }
 
+// ---------------------------------------------------------------------------
+// Plugin → Host request initiator
+// ---------------------------------------------------------------------------
+
 /**
- * Read framed requests from stdin and dispatch them.
+ * Monotonically increasing ID for outgoing requests to the host.
  *
+ * String prefix "p2h-" avoids collision with host-generated numeric IDs on the same
+ * transport. The host does not restrict ID types: JSON-RPC 2.0 allows strings.
+ */
+let nextRequestId = 1;
+
+interface PendingRequest {
+	resolve: (result: unknown) => void;
+	reject: (error: HostRequestError) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+const pendingRequests = new Map<string, PendingRequest>();
+
+/** Default timeout for Plugin→Host requests (30 seconds). */
+const HOST_REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * Send a JSON-RPC request to the host and await the response.
+ *
+ * The host processes Plugin→Host requests via `plugin-host-services.ts` and always
+ * replies with either `result` or `error`. If the host closes the transport before
+ * replying, the promise rejects with a timeout (the connection-end handler in `listen`
+ * will call `process.exit(0)`, which cleans up all pending timers implicitly).
+ *
+ * Timeout is generous (30s) because the host may be writing to disk or contending with
+ * other plugin calls. A `secrets.set` is a JSON read-modify-write on a vault file.
+ */
+export function request(method: string, params: unknown): Promise<unknown> {
+	const id = `p2h-${nextRequestId++}`;
+	return new Promise<unknown>((resolve, rejectFn) => {
+		const timer = setTimeout(() => {
+			pendingRequests.delete(id);
+			const error = new Error(`Host request timed out: ${method}`) as HostRequestError;
+			error.code = -32001;
+			rejectFn(error);
+		}, HOST_REQUEST_TIMEOUT_MS);
+
+		pendingRequests.set(id, { resolve, reject: rejectFn, timer });
+		send({ jsonrpc: "2.0", id, method, params });
+	});
+}
+
+/**
+ * Resolve a pending request when the host sends a response frame.
+ *
+ * Returns true if the message was consumed as a response (so the caller does not try
+ * to dispatch it as an inbound request).
+ */
+function handleResponse(message: Record<string, unknown>): boolean {
+	if (typeof message.method === "string") return false; // It's a request, not a response.
+	if (!("id" in message)) return false;
+	if (!("result" in message || "error" in message)) return false;
+
+	const id = String(message.id);
+	const pending = pendingRequests.get(id);
+	if (!pending) return true; // Already timed out or spurious; either way, consumed.
+
+	clearTimeout(pending.timer);
+	pendingRequests.delete(id);
+
+	if ("error" in message && isRecord(message.error)) {
+		const err = message.error;
+		const error = new Error(
+			typeof err.message === "string" ? err.message : "Host request failed",
+		) as HostRequestError;
+		error.code = typeof err.code === "number" ? err.code : -32603;
+		error.data = err.data;
+		pending.reject(error);
+	} else {
+		pending.resolve(message.result);
+	}
+	return true;
+}
+
+/**
+ * Read framed messages from stdin and dispatch them.
+ *
+ * Requests (messages with `method` + `id`) go to `onRequest`.
+ * Responses (messages with `id` + `result`/`error`, no `method`) resolve pending host requests.
  * Notifications and malformed messages are dropped rather than answered: a response to a
  * message with no `id` would itself be a protocol violation.
  */
@@ -138,12 +233,12 @@ export function listen(onRequest: (request: JsonRpcRequest) => void): void {
 			if (buffer.byteLength < frameEnd) return;
 			const message: unknown = JSON.parse(decoder.decode(buffer.slice(bodyStart, frameEnd)));
 			buffer = buffer.slice(frameEnd);
-			if (
-				isRecord(message) &&
-				message.jsonrpc === "2.0" &&
-				typeof message.method === "string" &&
-				"id" in message
-			) {
+			if (!isRecord(message) || message.jsonrpc !== "2.0") continue;
+
+			// Route responses to the pending-request map before trying to dispatch as request.
+			if (handleResponse(message)) continue;
+
+			if (typeof message.method === "string" && "id" in message) {
 				onRequest(message as unknown as JsonRpcRequest);
 			}
 		}

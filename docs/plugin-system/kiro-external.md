@@ -12,6 +12,7 @@
 | 凭据存储 | `~/.narrafork/kiro/credentials.json` | 宿主 secret vault（`provider.kiro.credentialsBundle`） |
 | 多令牌轮换 | 有（`multi-token-manager` 全功能） | **有**（同一模块，凭据以 bundle 形式存储） |
 | 凭据 UI | 宿主 React 组件（1468 行） | 插件自己的 iframe（原生 DOM） |
+| web 搜索 | `kiro:local` 通道（硬编码 kind） | `contributes.searchProviders` → `provider.search` |
 | 运行位置 | 宿主进程内 | 独立子进程 |
 
 ## 功能对等矩阵
@@ -30,11 +31,12 @@
 | `credentials.usage` | `GET /credentials/:id/usage` |
 | `config.setLoadBalancing` | `POST /load-balancing-mode` |
 | （`provider.listModels`） | `GET /models`、`POST /models/refresh` |
+| （`provider.search`） | `POST /mcp-search` |
 
-**不做的 4 个，及理由**：
+**不做的 3 个，及理由**：
 
-- `GET /mcp-tools`、`POST /mcp-search` —— Kiro 自带 MCP 客户端（`mcp-client.ts`，298 行）。它与宿主
-  MCP manager 的归属是独立问题，本轮不做。
+- `GET /mcp-tools` —— 列举 Kiro 自带 MCP 客户端（`mcp-client.ts`）的全部工具。它与宿主 MCP manager 的归属
+  是独立问题，本轮不做；只有 `web_search` 这一个工具通过 `contributes.searchProviders` 落地了。
 - `POST /chat` —— 内置的调试端点；插件对话走 `provider.chat`，无需对等。
 - `POST /global-proxy` —— 写的是**宿主全局** `settings.proxy`。`07-security-and-sandbox.md` §6.2 明文
   禁止插件覆盖宿主代理策略，插件继承宿主代理即可。
@@ -43,10 +45,11 @@
 
 ## 已验证（自动化）
 
-- `server/lib/kiro/plugin-bundle.guard.test.ts` —— 6 项，钉住可打包边界
+- `server/lib/kiro/plugin-bundle.guard.test.ts` —— 6 项，钉住可打包边界（含 `mcp-client.ts`）
 - `tests/server/integration/plugins/kiro-external-event-mapping.test.ts` —— 23 项，事件映射逐条对宿主真实 `providerStreamEventSchema` 校验
+- `tests/server/integration/plugins/kiro-external-search.test.ts` —— 18 项，搜索参数解析与 MCP 响应映射逐条对 `providerSearchResultSchema` 校验
 - `bun run plugins:check-artifacts` —— 产物与源码一致性
-- `bun test tests/server/` —— 1103 pass / 0 fail（基线 1080）
+- `bun test tests/server/` —— 全绿
 
 ## 已验证（真实上游，手工脚本）
 
@@ -73,6 +76,10 @@
 8. **对话中 credit 消耗与上下文占用百分比在前端可见**
 9. 重启后凭据与各项状态仍生效
 10. 内置 `kiro` 供应商行为不变
+11. 设置页「搜索」出现 `Kiro web search (plugin)` 通道，badge 为 `plugin`；未配置凭据时显示「未配置」
+12. 该通道的「测试」按钮能返回真实搜索结果
+13. 把它排到内置 `kiro:local` 之前，WebSearch 工具确实走插件通道（观察返回内容与日志）
+14. 禁用插件后该通道标记为不可用，重新启用后恢复，且用户排序未丢失
 
 ## 关键设计点
 
@@ -81,6 +88,23 @@
 上游发 `meteringEvent`（credit 消耗）与 `contextUsageEvent`（上下文占用百分比），不发 token 数。两者映射到契约既有字段 `metering{unit,unitPlural,usage}` 与 `contextUsagePercentage`——**没有新增任何自定义事件类型**（契约每个事件 schema 都是 `.strict()`，新增会被拒）。
 
 **token 字段留空，绝不填 0。** 宿主会把 0 当作真实测量：报告零成本请求，并按「prompt 为空」计算上下文余量。留空则宿主回落到百分比，这是此处唯一诚实的信号。有测试专门钉这一点。
+
+### web 搜索：与内置通道并存
+
+Kiro 订阅自带一个托管的 `web_search` MCP 工具。内置实现把它做成 `kiro:local` 搜索通道，`lib/search/router.ts`
+直接调 `kiro-adapter` 的 `kiroMcpCall()`。插件侧通过 `contributes.searchProviders` 贡献同一能力，宿主注册成
+`plugin:com.narrafork.kiro-external:web-search` 通道。
+
+**内置通道一行未改**，与 provider 侧同样的「并存不替代」决定 —— 同一账号可在两条路径上比对行为。代价是设置页
+会同时出现两条 Kiro 搜索通道，用户需要知道哪条是哪条（标签分别是「Kiro MCP search」和「Kiro web search
+(plugin)」）。
+
+**凭据不用录第二遍。** 搜索贡献用 `providerId: "kiro"` 绑定既有 provider 贡献，读的是同一份
+`provider.kiro.credentialsBundle`。`resolveManager` 也原样复用，包括它按凭据内容哈希缓存 manager 的逻辑，所以
+搜索和对话共用一个已刷新的 access token，而不是各自触发一次刷新。
+
+`mcp-client.ts` 因此加入了 `PLUGIN_BUNDLE_ENTRYPOINTS`。它的 import 全部落在 `server/lib/kiro/` 内部，guard
+测试的 bundle 断言确认它没有拖进 settings/db/ORM。
 
 ### 复用而非复制
 
@@ -120,6 +144,13 @@
 **5. 双消费者一致性。** 内置与插件解析同一套上游事件。guard 测试保证可打包，但不保证两者行为一致——映射层有自己的测试，不依赖巧合。
 
 **6. 自动化测试不打真实上游。** 避免 CI 依赖外部账号与配额，代价是上游协议漂移不会被 CI 发现，需要定期跑 `--live` 脚本。
+
+**7. 两条 Kiro 搜索通道会同时出现在设置页。** 内置 `kiro:local` 与插件通道服务同一个上游 `web_search` 工具，
+但凭据来自不同存储，用户需要自己分辨。这是「并存不替代」的必然结果，与 provider 侧一致，也提供 A/B 对照。
+
+**8. 搜索通道可用性只看凭据字段是否已设置。** `requiresConfig: ["credentialsBundle"]` 判断不了 bundle 里的凭据
+是否有效或是否已耗尽配额。无效凭据会得到一条「看起来可用、执行时失败」的通道，随后 router 落到下一条。这与内置
+`custom-api` 通道的行为一致，但对搜索这种有回退链的场景，失败的那次调用是真实的时间成本。
 
 ## 构建
 

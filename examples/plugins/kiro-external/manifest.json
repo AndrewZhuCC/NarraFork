@@ -14,7 +14,7 @@
 		"runtimeVersion": ">=1.2 <2",
 		"hostApi": ">=1.0 <2",
 		"rpc": "narrafork.rpc/1",
-		"features": ["host_api.notifications", "rpc.cancel"],
+		"features": ["host_api.notifications", "rpc.cancel", "host_api.requests"],
 		"os": ["linux", "darwin", "win32"],
 		"arch": ["x64", "arm64"],
 		"runner": "local-process"
@@ -120,6 +120,21 @@
 				}
 			}
 		],
+		"searchProviders": [
+			{
+				"id": "web-search",
+				"title": "Kiro web search (plugin)",
+				"description": "Web search through the Kiro subscription's hosted MCP web_search tool.",
+				"providerId": "kiro",
+				"requiresConfig": ["credentialsBundle"],
+				"capabilities": {
+					"maxResults": true
+				},
+				"limits": {
+					"timeoutMs": 60000
+				}
+			}
+		],
 		"tools": [],
 		"commands": [
 			{
@@ -157,7 +172,7 @@
 			{
 				"id": "credentials.update",
 				"title": "Edit credential details",
-				"description": "Region, profile ARN and display name. Secrets are rotated through import.",
+				"description": "All credential fields including secrets. Empty secrets are kept, non-empty replaced.",
 				"handler": "server"
 			},
 			{
@@ -173,6 +188,18 @@
 			{
 				"id": "verify-credential",
 				"title": "Verify Kiro credential",
+				"handler": "server"
+			},
+			{
+				"id": "models.list",
+				"title": "List available models",
+				"description": "Fetch models visible to one or the current credential.",
+				"handler": "server"
+			},
+			{
+				"id": "models.refresh",
+				"title": "Refresh model cache",
+				"description": "Re-fetch model list from upstream and persist.",
 				"handler": "server"
 			}
 		],
@@ -193,7 +220,7 @@
 		"entry": "ui/provider-settings.iife.js"
 	},
 	"permissions": {
-		"host": ["provider.register", "provider.use", "ui.panel", "config.read_self"],
+		"host": ["provider.register", "provider.use", "search.provide", "ui.panel", "config.read_self"],
 		"network": {
 			"mode": "allowlist",
 			"allow": ["https://q.us-east-1.amazonaws.com", "https://oidc.us-east-1.amazonaws.com"],

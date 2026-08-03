@@ -268,12 +268,22 @@ export interface ClineProviderConfig {
 	proxy?: ProxyOverride;
 }
 
-export type SearchChannelKind = "native" | "kiro-mcp" | "nug-mcp" | "custom-api" | "subagent";
+export type SearchChannelKind =
+	| "native"
+	| "kiro-mcp"
+	| "nug-mcp"
+	| "custom-api"
+	| "subagent"
+	/** Contributed by a plugin through `contributes.searchProviders`. */
+	| "plugin";
 
 export type CustomSearchProviderProtocol = string;
 
 export interface SearchChannelConfig {
-	/** Stable channel ID: native, kiro:local, nug:{id}, custom:{id}, subagent. */
+	/**
+	 * Stable channel ID: native, kiro:local, nug:{id}, custom:{id}, subagent,
+	 * plugin:{pluginId}:{contributionId}.
+	 */
 	id: string;
 	kind: SearchChannelKind;
 	enabled: boolean;

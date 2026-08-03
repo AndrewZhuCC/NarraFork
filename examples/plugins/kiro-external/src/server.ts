@@ -33,6 +33,10 @@ import { KiroQuotaError } from "@server/lib/kiro/types";
 import { buildKiroRequest, parseSSEStream } from "@shared/codewhisperer/protocol";
 import { CommandInputError, findCommand } from "./commands";
 import {
+	credentialFileHash,
+	writebackIfChanged as writebackCredentialsIfChanged,
+} from "./credential-writeback";
+import {
 	credentialsPathFor,
 	MissingCredentialError,
 	resetManager,
@@ -44,6 +48,7 @@ import {
 	type PluginStreamEvent,
 	UsageAccumulator,
 } from "./event-mapping";
+import { applyHostHints, installProxyResolver } from "./host-hints";
 import {
 	isRecord,
 	type JsonRpcRequest,
@@ -52,21 +57,49 @@ import {
 	notify,
 	RPC_PROTOCOL,
 	reject,
+	request,
 	respond,
 	send,
 } from "./rpc";
+import { readSearchParams, runSearch, type SearchParams } from "./search";
 
 const PLUGIN_ID = "com.narrafork.kiro-external";
 const PLUGIN_VERSION = "0.1.0";
 const PROVIDER_PROTOCOL = "1.0";
 const LOCAL_ID = "kiro";
 
+// Wire the Kiro client layer's proxy lookup. `applyHostHints` (called at the top of every
+// provider method below) keeps it current; see `host-hints.ts` for why the value is held in
+// a module variable rather than per-request state.
+installProxyResolver();
+
+// Credential writeback lives in `credential-writeback.ts` so it can be tested against the
+// real implementation; `writebackDeps` binds it to this module's RPC and log functions.
+const writebackDeps = { request, log };
+
+/** Resync the host vault when an operation refreshed (and possibly rotated) a token. */
+function writebackIfChanged(credentialsPath: string, hashBefore: string | null): void {
+	writebackCredentialsIfChanged(credentialsPath, hashBefore, writebackDeps);
+}
+
 /**
  * Context windows per model family.
  *
  * Kiro's `ListAvailableModels` does not report context size, but the host needs it to show
  * absolute headroom next to the percentage Kiro does report. Claude models are 200k; the
- * partner models Kiro exposes are treated conservatively at 128k unless known otherwise.
+ * partner models Kiro exposes are listed with their known sizes below.
+ *
+ * A static table is acceptable here because:
+ * - The upstream API genuinely does not return a contextWindow field (verified: response is
+ *   `{ modelId, name, ... }` with no size information).
+ * - The host's `getModelContextWindow` multi-layer lookup cannot help either: this plugin
+ *   uses the `kiro-ext` prefix, so the host's NUG catalog/settings.json fallback chain has
+ *   no entry for these model IDs under that prefix.
+ * - The only consumer is the "headroom" UI display; Kiro's own `contextUsagePercentage`
+ *   (which IS accurate) is the signal the agent loop actually uses for truncation decisions.
+ *
+ * If a new model is added to Kiro with a significantly different window, the worst case is
+ * the percentage display being slightly off until this table is updated.
  */
 const CONTEXT_WINDOWS: Record<string, number> = {
 	"claude-sonnet-4.5": 200_000,
@@ -74,6 +107,9 @@ const CONTEXT_WINDOWS: Record<string, number> = {
 	"claude-opus-4.5": 200_000,
 	"claude-opus-4.6": 200_000,
 	"claude-haiku-4.5": 200_000,
+	// Partner models observed in real Kiro account responses.
+	"deepseek-chat": 64_000,
+	"deepseek-reasoner": 64_000,
 };
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 
@@ -183,6 +219,7 @@ function describeProvider(id: string | number, params: unknown): void {
  * families (deepseek, minimax) that a Claude-only list would have hidden.
  */
 async function listModels(id: string | number, params: unknown): Promise<void> {
+	applyHostHints(params);
 	const config = isRecord(params) ? params.config : undefined;
 	let manager: ReturnType<typeof resolveManager>;
 	try {
@@ -202,6 +239,11 @@ async function listModels(id: string | number, params: unknown): Promise<void> {
 		reject(id, -32603, classified.message, { code: classified.code });
 		return;
 	}
+	// `listAvailableModels` authenticates, so it can refresh and rotate a token like chat
+	// and search can. Catalog refresh runs on a schedule the user never sees, which makes
+	// this the path most likely to rotate a token with no other traffic to write it back.
+	const credPath = credentialsPathFor(config);
+	const hashBefore = credentialFileHash(credPath);
 	try {
 		const result = await manager.listAvailableModels();
 		const models = result.models
@@ -229,10 +271,47 @@ async function listModels(id: string | number, params: unknown): Promise<void> {
 	} catch (error) {
 		const classified = classifyKiroError(error);
 		reject(id, -32603, classified.message, { code: classified.code });
+	} finally {
+		writebackIfChanged(credPath, hashBefore);
+	}
+}
+
+/**
+ * `provider.search` — unary, so there is no operation to register or cancel.
+ *
+ * Unlike `listModels`, a missing credential is an error rather than an empty success: the
+ * host only dispatches to a channel it already decided was available, so arriving here
+ * unconfigured means something is genuinely wrong, and reporting "no results" would look
+ * like the search simply found nothing.
+ */
+async function search(id: string | number, params: unknown): Promise<void> {
+	applyHostHints(params);
+	let searchParams: SearchParams;
+	try {
+		searchParams = readSearchParams(params);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		reject(id, -32602, message, { code: "INVALID_PARAMS" });
+		return;
+	}
+	const config = isRecord(params) ? params.config : undefined;
+	// Search resolves a manager too, so it can refresh a token and rotate the refresh
+	// token just as chat can. Without this the vault would go stale on any account whose
+	// traffic happens to be search-only until a chat or a credential command ran.
+	const credPath = credentialsPathFor(config);
+	const hashBefore = credentialFileHash(credPath);
+	try {
+		respond(id, await runSearch(config, searchParams));
+	} catch (error) {
+		const classified = classifyKiroError(error);
+		reject(id, -32603, classified.message, { code: classified.code });
+	} finally {
+		writebackIfChanged(credPath, hashBefore);
 	}
 }
 
 async function validateConfig(id: string | number, params: unknown): Promise<void> {
+	applyHostHints(params);
 	const config = isRecord(params) ? params.config : undefined;
 	try {
 		resolveManager(config);
@@ -265,6 +344,7 @@ async function validateConfig(id: string | number, params: unknown): Promise<voi
 }
 
 async function startChat(id: string | number, params: unknown): Promise<void> {
+	applyHostHints(params);
 	const operationId =
 		isRecord(params) && typeof params.operationId === "string" ? params.operationId : undefined;
 	if (!operationId) {
@@ -276,7 +356,7 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 		return;
 	}
 
-	const request = isRecord(params) ? params.request : undefined;
+	const chatRequest = isRecord(params) ? params.request : undefined;
 	const config = isRecord(params) ? params.config : undefined;
 	const modelId = isRecord(params) && typeof params.modelId === "string" ? params.modelId : "";
 
@@ -289,11 +369,15 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 	const usage = new UsageAccumulator();
 	usage.setContextWindow(contextWindowFor(modelId));
 
+	// Capture credential file hash before the upstream call so we can detect token refresh.
+	const credPath = credentialsPathFor(config);
+	const hashBefore = credentialFileHash(credPath);
+
 	try {
 		const manager = resolveManager(config);
 		const client = new KiroApiClient(manager);
 
-		const current = isRecord(request) ? request.current : undefined;
+		const current = isRecord(chatRequest) ? chatRequest.current : undefined;
 		const kiroRequest = buildKiroRequest({
 			conversationId: isRecord(isRecord(params) ? params.conversation : undefined)
 				? String((params as { conversation: Record<string, unknown> }).conversation.conversationId)
@@ -301,8 +385,9 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 			content: isRecord(current) && typeof current.text === "string" ? current.text : "",
 			model: modelId,
 			cwd: process.cwd(),
-			history: isRecord(request) && Array.isArray(request.history) ? request.history : [],
-			tools: isRecord(request) && Array.isArray(request.tools) ? request.tools : [],
+			history:
+				isRecord(chatRequest) && Array.isArray(chatRequest.history) ? chatRequest.history : [],
+			tools: isRecord(chatRequest) && Array.isArray(chatRequest.tools) ? chatRequest.tools : [],
 			toolResults:
 				isRecord(current) && Array.isArray(current.toolResults) ? current.toolResults : [],
 			...(isRecord(current) && Array.isArray(current.images)
@@ -327,8 +412,19 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 
 		if (!response.body) throw new Error("upstream returned no response body");
 
+		// Determine whether tools are present so leaked XML tool calls in the text
+		// stream are extracted and surfaced as real tool_call events. Without this,
+		// a model that emits XML tool calls inline (instead of in the native fields)
+		// would leave the tools unexecuted — matching what the built-in path does via
+		// KiroStreamToolCallAccumulator inside its own stream loop.
+		const hasTools =
+			isRecord(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
+
 		let stopReason = "end_turn";
-		for await (const parsed of parseSSEStream(response.body)) {
+		for await (const parsed of parseSSEStream(response.body, {
+			parseTextToolCalls: hasTools,
+			model: modelId,
+		})) {
 			if (controller.signal.aborted) break;
 			if (parsed.invalidState) {
 				// Upstream told us the conversation cannot continue; surface it rather than
@@ -384,6 +480,12 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 			stopReason: "error",
 			usage: usage.snapshot(),
 		});
+	} finally {
+		// Every exit needs this, not just success: authentication happens before generation,
+		// so a token can rotate and then the turn can fail — or be cancelled, which returns
+		// early from the catch block above and would otherwise skip the writeback entirely,
+		// losing the rotation.
+		writebackIfChanged(credPath, hashBefore);
 	}
 }
 
@@ -503,6 +605,13 @@ function handleRequest(message: JsonRpcRequest): void {
 			}
 			void startChat(id, params);
 			return;
+		case "provider.search":
+			if (!active) {
+				reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
+				return;
+			}
+			void search(id, params);
+			return;
 		case "provider.cancel":
 			cancelOperation(id, params);
 			return;
@@ -544,8 +653,9 @@ send({
 		pluginId: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		rpcProtocol: RPC_PROTOCOL,
-		// Both are required: the host drops `provider.event` from a plugin that did not
-		// declare notifications, and cancellation needs `rpc.cancel`.
-		features: ["host_api.notifications", "rpc.cancel"],
+		// `host_api.notifications`: required — the host drops `provider.event` without it.
+		// `rpc.cancel`: required — cancellation support.
+		// `host_api.requests`: required — Plugin→Host requests (secrets.set for credential writeback).
+		features: ["host_api.notifications", "rpc.cancel", "host_api.requests"],
 	},
 });

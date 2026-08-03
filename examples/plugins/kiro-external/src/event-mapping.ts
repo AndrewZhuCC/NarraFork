@@ -291,7 +291,96 @@ export function classifyKiroError(error: unknown): {
 		return { classification: "invalid_state", code: "NOT_CONFIGURED", message, retryable: false };
 	}
 	if (name === "KiroApiError") {
-		return { classification: "api", code: "UPSTREAM_ERROR", message, retryable: true };
+		// KiroApiError carries a structured `code` and optional `statusCode` from
+		// `api-client.ts`. The built-in path (`server/lib/agent/error-handling.ts`)
+		// classifies each case independently; we must match to avoid the plugin path
+		// retrying errors the built-in path treats as terminal.
+		const apiCode =
+			error && typeof error === "object" && "code" in error
+				? (error as { code: unknown }).code
+				: undefined;
+		const statusCode =
+			error && typeof error === "object" && "statusCode" in error
+				? (error as { statusCode: unknown }).statusCode
+				: undefined;
+		const numericStatus = typeof statusCode === "number" ? statusCode : undefined;
+
+		switch (apiCode) {
+			// 400 + context too long: deterministic, will fail again with the same input.
+			case "CONTEXT_LENGTH_EXCEEDED":
+				return {
+					classification: "api",
+					code: "CONTEXT_LENGTH_EXCEEDED",
+					message,
+					retryable: false,
+					statusCode: numericStatus,
+				};
+			// 400 generic: malformed request, retrying the same payload is pointless.
+			case "BAD_REQUEST":
+				return {
+					classification: "api",
+					code: "BAD_REQUEST",
+					message,
+					retryable: false,
+					statusCode: numericStatus,
+				};
+			// 401/403: credential invalid or account suspended. Retrying will not fix
+			// a revoked token or a banned account. The built-in path also treats these
+			// as non-retryable (they trigger credential failover, not request retry).
+			case "AUTH_FAILED":
+				return {
+					classification: "api",
+					code: "AUTH_FAILED",
+					message,
+					retryable: false,
+					statusCode: numericStatus,
+				};
+			// 429: upstream rate limit. The request itself is fine; retrying after a
+			// back-off period is the correct response, same as the built-in path.
+			case "THROTTLED":
+				return {
+					classification: "api",
+					code: "THROTTLED",
+					message,
+					retryable: true,
+					statusCode: numericStatus,
+				};
+			// 400/402 + monthly quota exhausted: retrying burns time until the billing
+			// window resets. Handled identically to KiroQuotaError but surfaced here
+			// when the multi-credential loop still had alternatives and continued past
+			// the first exhausted credential (the lastError it throws carries this code).
+			case "QUOTA_EXHAUSTED":
+				return {
+					classification: "api",
+					code: "QUOTA_EXHAUSTED",
+					message,
+					retryable: false,
+					statusCode: numericStatus,
+				};
+			// 408/5xx: transient upstream failure. The built-in client already retried
+			// internally; if it still threw, it means all internal retries were spent.
+			// The host-level retry is still worthwhile (different timing, potential
+			// recovery of the upstream).
+			case "TRANSIENT":
+				return {
+					classification: "api",
+					code: "UPSTREAM_ERROR",
+					message,
+					retryable: true,
+					statusCode: numericStatus,
+				};
+			// Catch-all for unknown codes: if the status is a client error (4xx) the
+			// request is likely malformed and retrying won't help; otherwise assume
+			// transient (same heuristic as the built-in `isRetryableError`).
+			default:
+				return {
+					classification: "api",
+					code: typeof apiCode === "string" ? apiCode : "UPSTREAM_ERROR",
+					message,
+					retryable: numericStatus != null ? numericStatus >= 500 || numericStatus === 408 : true,
+					statusCode: numericStatus,
+				};
+		}
 	}
 	return { classification: "transport", code: "REQUEST_FAILED", message, retryable: true };
 }

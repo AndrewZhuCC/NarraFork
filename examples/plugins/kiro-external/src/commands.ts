@@ -87,6 +87,7 @@ function statusOutput(manager: MultiTokenManager): unknown {
 		credentialCount: snapshot.entries.length,
 		availableCount: snapshot.entries.filter((entry) => !entry.disabled).length,
 		loadBalancingMode: snapshot.loadBalancingMode,
+		currentId: snapshot.currentId,
 		entries: snapshot.entries,
 	};
 }
@@ -185,18 +186,62 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 		};
 	},
 
-	/** Edit non-secret fields of one credential (region, profile ARN, display name). */
+	/**
+	 * Edit credential fields including secrets.
+	 *
+	 * Text fields: empty string clears (the manager deletes the key). Secret fields: empty
+	 * string means "keep existing" (the UI never echoes stored secrets back, so blanks are
+	 * intentional no-ops). `authMethod` changes may trigger secret requirements — the
+	 * manager validates internally and throws if switching to api_key without a key, etc.
+	 */
 	"credentials.update": async (input, { manager, credentialsPath }) => {
 		const id = credentialId(input);
 		const patch = isRecord(input) && isRecord(input.fields) ? input.fields : undefined;
 		if (!patch) throw new CommandInputError("fields is required");
-		const allowed: Record<string, string> = {};
-		// Secrets are not editable here: rotating a token goes through the credential page's
-		// import path, which replaces the whole bundle.
-		for (const field of ["region", "authRegion", "apiRegion", "profileArn", "displayName"]) {
+		const allowed: Record<string, unknown> = {};
+
+		// Non-secret text fields: any string (including empty to clear).
+		const textFields = [
+			"email",
+			"displayName",
+			"region",
+			"authRegion",
+			"apiRegion",
+			"profileArn",
+			"subscriptionTitle",
+			"startUrl",
+			"machineId",
+			"proxyUrl",
+			"proxyUsername",
+		] as const;
+		for (const field of textFields) {
 			const value = patch[field];
-			if (typeof value === "string" && value.trim().length > 0) allowed[field] = value.trim();
+			if (typeof value === "string") allowed[field] = value;
 		}
+
+		// Secret fields: non-empty means "replace", empty/absent means "keep".
+		const secretFields = [
+			"refreshToken",
+			"apiKey",
+			"clientId",
+			"clientSecret",
+			"proxyPassword",
+		] as const;
+		for (const field of secretFields) {
+			const value = patch[field];
+			if (typeof value === "string" && value.trim().length > 0) allowed[field] = value;
+		}
+
+		// authMethod: validated by the manager's internal logic.
+		if (typeof patch.authMethod === "string" && patch.authMethod.trim().length > 0) {
+			allowed.authMethod = patch.authMethod.trim();
+		}
+
+		// priority: numeric field.
+		if (typeof patch.priority === "number" && Number.isFinite(patch.priority)) {
+			allowed.priority = Math.trunc(patch.priority);
+		}
+
 		if (Object.keys(allowed).length === 0) {
 			throw new CommandInputError("No editable fields were provided");
 		}
@@ -227,6 +272,40 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 	"verify-credential": async (_input, { manager }) => {
 		const result = await manager.listAvailableModels();
 		return { output: { ok: true, modelCount: result.models.length } };
+	},
+
+	/**
+	 * Fetch available models for one (or the current) credential.
+	 *
+	 * The host's `provider.listModels` manages the global model catalog; this command
+	 * exposes per-credential model lists so the UI can show what each credential sees.
+	 * It does NOT manage hide/show visibility — that belongs to the host's catalog layer.
+	 */
+	"models.list": async (input, { manager }) => {
+		const id = isRecord(input) ? (input.credentialId as string | undefined) : undefined;
+		const result = await manager.listAvailableModels(id || undefined);
+		// Return only safe metadata: model id, display name, context window — never tokens.
+		const models = result.models.map((m) => ({
+			id: String(m.model_id ?? m.modelId ?? ""),
+			displayName: String(m.display_name ?? m.displayName ?? m.model_id ?? m.modelId ?? ""),
+			contextWindow: typeof m.context_window === "number" ? m.context_window : undefined,
+		}));
+		return { output: { credentialId: result.credentialId, models } };
+	},
+
+	/**
+	 * Refresh model cache for one credential and persist updated list.
+	 *
+	 * Calls `fetchAndStoreModels` which re-fetches from upstream and writes back
+	 * to the credential's `availableModels` field, then persist via bundle write.
+	 */
+	"models.refresh": async (input, { manager, credentialsPath }) => {
+		const id = credentialId(input);
+		const modelIds = await manager.fetchAndStoreModels(id);
+		return {
+			output: { credentialId: id, modelCount: modelIds.length, models: modelIds },
+			secretWrites: currentBundle(manager, credentialsPath),
+		};
 	},
 };
 

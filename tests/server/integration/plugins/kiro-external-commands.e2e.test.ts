@@ -312,9 +312,23 @@ describe("kiro-external commands: input validation", () => {
 
 	test("rejects an update with no editable field", async () => {
 		await withPlugin(async ({ invoke }) => {
-			// Secret rotation goes through import, not through this command.
+			// Secrets are editable now (the built-in credential editor allows it too), so the
+			// rejection this asserts is the empty-patch case: a field set the command does not
+			// recognise must fail loudly rather than report a successful no-op edit.
 			await expect(
-				invoke("credentials.update", { credentialId: "a", fields: { refreshToken: "sneaky" } }),
+				invoke("credentials.update", { credentialId: "a", fields: { notAField: "x" } }),
+			).rejects.toThrow();
+		});
+	}, 60_000);
+
+	test("rejects a blank secret instead of clearing the stored one", async () => {
+		await withPlugin(async ({ invoke }) => {
+			// The credential page never echoes stored secrets, so its inputs start blank. An
+			// untouched blank field must mean "keep", never "erase" — otherwise saving an
+			// unrelated field would wipe the refresh token. With only a blank secret in the
+			// patch there is nothing left to apply, so the command rejects.
+			await expect(
+				invoke("credentials.update", { credentialId: "a", fields: { refreshToken: "   " } }),
 			).rejects.toThrow();
 		});
 	}, 60_000);
