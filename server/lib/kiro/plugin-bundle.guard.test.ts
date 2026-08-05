@@ -54,6 +54,9 @@ const PLUGIN_BUNDLE_ENTRYPOINTS = [
 	"api-client.ts",
 	"auth-method.ts",
 	"config.ts",
+	// Bundled so the plugin can serve `provider.search` through Kiro's own MCP `web_search`
+	// tool. Its imports all stay inside this directory, so it pulls in nothing new.
+	"mcp-client.ts",
 	"multi-token-manager.ts",
 	"quota-check.ts",
 	"token-manager.ts",

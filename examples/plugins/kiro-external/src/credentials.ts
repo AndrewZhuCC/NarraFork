@@ -121,6 +121,14 @@ const BUNDLE_TEXT_FIELDS = [
 	"subscriptionTitle",
 	"startUrl",
 	"disabledReason",
+	// Per-credential proxy settings. `proxyPassword` is a secret but receives the same
+	// treatment as `refreshToken`/`apiKey`/`clientSecret` above: it round-trips through
+	// the bundle (a single writeOnly secret field) and never appears in log output.
+	// `serializeBundle` writes the full object, so without these the read path silently
+	// dropped proxy config that the write path preserved — a one-way loss.
+	"proxyUrl",
+	"proxyUsername",
+	"proxyPassword",
 ] as const;
 
 /**

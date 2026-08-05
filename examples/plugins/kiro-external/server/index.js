@@ -17768,6 +17768,30 @@ var $connect = makeDispatcher(api.connect);
 var $upgrade = makeDispatcher(api.upgrade);
 var { EventSource } = require_eventsource();
 
+// server/lib/net/tls-transport-error.ts
+var TRANSIENT_TLS_HANDSHAKE_CODE = "UNKNOWN_CERTIFICATE_VERIFICATION_ERROR";
+var MAX_CAUSE_DEPTH = 5;
+function isTransientTlsHandshakeCode(code) {
+  return typeof code === "string" && code.trim().toUpperCase() === TRANSIENT_TLS_HANDSHAKE_CODE;
+}
+function isTransientTlsHandshakeMessage(message) {
+  return typeof message === "string" && message.toUpperCase().includes(TRANSIENT_TLS_HANDSHAKE_CODE);
+}
+function isTransientTlsHandshakeError(error) {
+  let current = error;
+  for (let depth = 0;current && typeof current === "object" && depth < MAX_CAUSE_DEPTH; depth++) {
+    const value = current;
+    if (isTransientTlsHandshakeCode(value.code))
+      return true;
+    if (isTransientTlsHandshakeMessage(value.message))
+      return true;
+    if (!value.cause || value.cause === current)
+      return false;
+    current = value.cause;
+  }
+  return typeof error === "string" && isTransientTlsHandshakeMessage(error);
+}
+
 // server/lib/net/outbound-fetch.ts
 var MAX_VERBOSE_OUTPUT_CHARS = 64 * 1024;
 var outboundFetchOverride = null;
@@ -17867,16 +17891,25 @@ function retryPolicyAllowsMethod(policy, method) {
     return false;
   return policy === "always" || IDEMPOTENT_HTTP_METHODS.has(method);
 }
-function prepareRetryInput(input, body) {
+function prepareRetryInput(input, body, allowRequestBodyClone) {
   if (body instanceof ReadableStream)
     return;
   if (!(input instanceof Request))
     return input;
+  if (!allowRequestBodyClone && input.body !== null)
+    return;
   try {
     return input.clone();
   } catch {
     return;
   }
+}
+function shouldReplayTransportFailure(error, retryPolicy, methodReplayAllowed) {
+  if (retryPolicy === "never")
+    return false;
+  if (isTransientTlsHandshakeError(error))
+    return true;
+  return methodReplayAllowed && isRetryableTransportError(error);
 }
 async function outboundFetch(input, init, options = {}) {
   if (outboundFetchOverride)
@@ -17893,7 +17926,8 @@ async function outboundFetch(input, init, options = {}) {
     ...options.tlsRejectUnauthorized === false ? { tls: { rejectUnauthorized: false } } : {}
   };
   const retryPolicy = options.retryPolicy ?? "never";
-  const retryInput = retryPolicyAllowsMethod(retryPolicy, method) ? prepareRetryInput(input, init?.body) : undefined;
+  const methodReplayAllowed = retryPolicyAllowsMethod(retryPolicy, method);
+  const retryInput = retryPolicy === "never" ? undefined : prepareRetryInput(input, init?.body, methodReplayAllowed);
   const attempts = retryInput === undefined ? [input] : [input, retryInput];
   const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
   for (const [attempt, attemptInput] of attempts.entries()) {
@@ -17913,7 +17947,7 @@ async function outboundFetch(input, init, options = {}) {
       }
       return response;
     } catch (error) {
-      const shouldRetry = attempt + 1 < attempts.length && !isAbortError(error, signal) && isRetryableTransportError(error);
+      const shouldRetry = attempt + 1 < attempts.length && !isAbortError(error, signal) && shouldReplayTransportFailure(error, retryPolicy, methodReplayAllowed);
       if (options.verbose) {
         const message = redactDiagnosticText(error instanceof Error ? error.message : String(error));
         const code = error && typeof error === "object" && "code" in error ? String(error.code ?? "") : "";
@@ -18230,6 +18264,9 @@ async function fetchWithNetworkDiagnostics(input, init, options = {}) {
 
 // server/lib/kiro/proxy.ts
 var proxyResolver = null;
+function registerProxyResolver(resolver) {
+  proxyResolver = resolver;
+}
 function getProxy() {
   return proxyResolver?.();
 }
@@ -20935,6 +20972,46 @@ function reject(id, code, message, data) {
 function notify(method, params) {
   send({ jsonrpc: "2.0", method, params });
 }
+var nextRequestId = 1;
+var pendingRequests = new Map;
+var HOST_REQUEST_TIMEOUT_MS = 30000;
+function request(method, params) {
+  const id = `p2h-${nextRequestId++}`;
+  return new Promise((resolve3, rejectFn) => {
+    const timer = setTimeout(() => {
+      pendingRequests.delete(id);
+      const error = new Error(`Host request timed out: ${method}`);
+      error.code = -32001;
+      rejectFn(error);
+    }, HOST_REQUEST_TIMEOUT_MS);
+    pendingRequests.set(id, { resolve: resolve3, reject: rejectFn, timer });
+    send({ jsonrpc: "2.0", id, method, params });
+  });
+}
+function handleResponse(message) {
+  if (typeof message.method === "string")
+    return false;
+  if (!("id" in message))
+    return false;
+  if (!(("result" in message) || ("error" in message)))
+    return false;
+  const id = String(message.id);
+  const pending = pendingRequests.get(id);
+  if (!pending)
+    return true;
+  clearTimeout(pending.timer);
+  pendingRequests.delete(id);
+  if ("error" in message && isRecord4(message.error)) {
+    const err = message.error;
+    const error = new Error(typeof err.message === "string" ? err.message : "Host request failed");
+    error.code = typeof err.code === "number" ? err.code : -32603;
+    error.data = err.data;
+    pending.reject(error);
+  } else {
+    pending.resolve(message.result);
+  }
+  return true;
+}
 function listen(onRequest) {
   let buffer = new Uint8Array(0);
   const parseFrames = () => {
@@ -20956,7 +21033,11 @@ function listen(onRequest) {
         return;
       const message = JSON.parse(decoder.decode(buffer.slice(bodyStart, frameEnd)));
       buffer = buffer.slice(frameEnd);
-      if (isRecord4(message) && message.jsonrpc === "2.0" && typeof message.method === "string" && "id" in message) {
+      if (!isRecord4(message) || message.jsonrpc !== "2.0")
+        continue;
+      if (handleResponse(message))
+        continue;
+      if (typeof message.method === "string" && "id" in message) {
         onRequest(message);
       }
     }
@@ -21030,7 +21111,10 @@ var BUNDLE_TEXT_FIELDS = [
   "displayName",
   "subscriptionTitle",
   "startUrl",
-  "disabledReason"
+  "disabledReason",
+  "proxyUrl",
+  "proxyUsername",
+  "proxyPassword"
 ];
 function parseBundle(bundle) {
   let parsed;
@@ -21202,6 +21286,7 @@ function statusOutput(manager) {
     credentialCount: snapshot.entries.length,
     availableCount: snapshot.entries.filter((entry) => !entry.disabled).length,
     loadBalancingMode: snapshot.loadBalancingMode,
+    currentId: snapshot.currentId,
     entries: snapshot.entries
   };
 }
@@ -21270,10 +21355,41 @@ var COMMAND_HANDLERS = {
     if (!patch)
       throw new CommandInputError("fields is required");
     const allowed = {};
-    for (const field of ["region", "authRegion", "apiRegion", "profileArn", "displayName"]) {
+    const textFields = [
+      "email",
+      "displayName",
+      "region",
+      "authRegion",
+      "apiRegion",
+      "profileArn",
+      "subscriptionTitle",
+      "startUrl",
+      "machineId",
+      "proxyUrl",
+      "proxyUsername"
+    ];
+    for (const field of textFields) {
+      const value = patch[field];
+      if (typeof value === "string")
+        allowed[field] = value;
+    }
+    const secretFields = [
+      "refreshToken",
+      "apiKey",
+      "clientId",
+      "clientSecret",
+      "proxyPassword"
+    ];
+    for (const field of secretFields) {
       const value = patch[field];
       if (typeof value === "string" && value.trim().length > 0)
-        allowed[field] = value.trim();
+        allowed[field] = value;
+    }
+    if (typeof patch.authMethod === "string" && patch.authMethod.trim().length > 0) {
+      allowed.authMethod = patch.authMethod.trim();
+    }
+    if (typeof patch.priority === "number" && Number.isFinite(patch.priority)) {
+      allowed.priority = Math.trunc(patch.priority);
     }
     if (Object.keys(allowed).length === 0) {
       throw new CommandInputError("No editable fields were provided");
@@ -21297,10 +21413,53 @@ var COMMAND_HANDLERS = {
   "verify-credential": async (_input, { manager }) => {
     const result = await manager.listAvailableModels();
     return { output: { ok: true, modelCount: result.models.length } };
+  },
+  "models.list": async (input, { manager }) => {
+    const id = isRecord4(input) ? input.credentialId : undefined;
+    const result = await manager.listAvailableModels(id || undefined);
+    const models = result.models.map((m) => ({
+      id: String(m.model_id ?? m.modelId ?? ""),
+      displayName: String(m.display_name ?? m.displayName ?? m.model_id ?? m.modelId ?? ""),
+      contextWindow: typeof m.context_window === "number" ? m.context_window : undefined
+    }));
+    return { output: { credentialId: result.credentialId, models } };
+  },
+  "models.refresh": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const modelIds = await manager.fetchAndStoreModels(id);
+    return {
+      output: { credentialId: id, modelCount: modelIds.length, models: modelIds },
+      secretWrites: currentBundle(manager, credentialsPath)
+    };
   }
 };
 function findCommand(contributionId) {
   return COMMAND_HANDLERS[contributionId];
+}
+
+// examples/plugins/kiro-external/src/credential-writeback.ts
+import { createHash as createHash4 } from "crypto";
+import { readFileSync as readFileSync2 } from "fs";
+var VAULT_BUNDLE_KEY = "provider.kiro.credentialsBundle";
+function credentialFileHash(credentialsPath) {
+  try {
+    return createHash4("sha256").update(readFileSync2(credentialsPath, "utf-8")).digest("hex");
+  } catch {
+    return null;
+  }
+}
+function writebackIfChanged(credentialsPath, hashBefore, deps) {
+  const hashAfter = credentialFileHash(credentialsPath);
+  if (!hashAfter || hashAfter === hashBefore)
+    return;
+  const { credentials } = loadAllCredentials(credentialsPath);
+  if (credentials.length === 0)
+    return;
+  deps.request("secrets.set", { key: VAULT_BUNDLE_KEY, value: serializeBundle(credentials) }).catch((error) => {
+    deps.log("secrets.set failed (credential writeback)", {
+      error: error instanceof Error ? error.message : "unknown"
+    });
+  });
 }
 
 // examples/plugins/kiro-external/src/event-mapping.ts
@@ -21466,9 +21625,363 @@ function classifyKiroError(error) {
     return { classification: "invalid_state", code: "NOT_CONFIGURED", message, retryable: false };
   }
   if (name === "KiroApiError") {
-    return { classification: "api", code: "UPSTREAM_ERROR", message, retryable: true };
+    const apiCode = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    const statusCode = error && typeof error === "object" && "statusCode" in error ? error.statusCode : undefined;
+    const numericStatus = typeof statusCode === "number" ? statusCode : undefined;
+    switch (apiCode) {
+      case "CONTEXT_LENGTH_EXCEEDED":
+        return {
+          classification: "api",
+          code: "CONTEXT_LENGTH_EXCEEDED",
+          message,
+          retryable: false,
+          statusCode: numericStatus
+        };
+      case "BAD_REQUEST":
+        return {
+          classification: "api",
+          code: "BAD_REQUEST",
+          message,
+          retryable: false,
+          statusCode: numericStatus
+        };
+      case "AUTH_FAILED":
+        return {
+          classification: "api",
+          code: "AUTH_FAILED",
+          message,
+          retryable: false,
+          statusCode: numericStatus
+        };
+      case "THROTTLED":
+        return {
+          classification: "api",
+          code: "THROTTLED",
+          message,
+          retryable: true,
+          statusCode: numericStatus
+        };
+      case "QUOTA_EXHAUSTED":
+        return {
+          classification: "api",
+          code: "QUOTA_EXHAUSTED",
+          message,
+          retryable: false,
+          statusCode: numericStatus
+        };
+      case "TRANSIENT":
+        return {
+          classification: "api",
+          code: "UPSTREAM_ERROR",
+          message,
+          retryable: true,
+          statusCode: numericStatus
+        };
+      default:
+        return {
+          classification: "api",
+          code: typeof apiCode === "string" ? apiCode : "UPSTREAM_ERROR",
+          message,
+          retryable: numericStatus != null ? numericStatus >= 500 || numericStatus === 408 : true,
+          statusCode: numericStatus
+        };
+    }
   }
   return { classification: "transport", code: "REQUEST_FAILED", message, retryable: true };
+}
+
+// examples/plugins/kiro-external/src/host-hints.ts
+function isRecord5(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+var currentProxyUrl;
+function installProxyResolver() {
+  registerProxyResolver(() => currentProxyUrl);
+}
+function applyHostHints(params) {
+  if (!isRecord5(params))
+    return;
+  const hostHints = params.hostHints;
+  if (!isRecord5(hostHints))
+    return;
+  const outbound = hostHints.outbound;
+  currentProxyUrl = isRecord5(outbound) && typeof outbound.proxyUrl === "string" && outbound.proxyUrl ? outbound.proxyUrl : undefined;
+}
+
+// server/lib/kiro/mcp-client.ts
+import { randomUUID as randomUUID3 } from "crypto";
+var BASE_DELAY_MS2 = 200;
+var MAX_DELAY_MS2 = 2000;
+var MAX_THROTTLE_RETRIES2 = 3;
+function isAbortError3(err) {
+  return err instanceof Error && (err.name === "AbortError" || err.message === "Aborted");
+}
+function throwIfAborted(signal) {
+  if (signal?.aborted)
+    throw new Error("Aborted");
+}
+
+class KiroMcpClient {
+  tokenManager;
+  constructor(tokenManager) {
+    this.tokenManager = tokenManager;
+  }
+  async callTool(name, args, signal) {
+    const body = {
+      id: randomUUID3(),
+      jsonrpc: "2.0",
+      method: "tools/call",
+      params: { name, arguments: args }
+    };
+    return this.callMcpWithRetry(JSON.stringify(body), signal);
+  }
+  async listTools(signal) {
+    const body = {
+      id: randomUUID3(),
+      jsonrpc: "2.0",
+      method: "tools/list",
+      params: {}
+    };
+    return this.callMcpWithRetry(JSON.stringify(body), signal);
+  }
+  async callGeneric(method, params, signal) {
+    const body = {
+      id: randomUUID3(),
+      jsonrpc: "2.0",
+      method,
+      params
+    };
+    return this.callMcpWithRetry(JSON.stringify(body), signal);
+  }
+  async callMcpWithRetry(body, signal) {
+    const maxRetries = this.tokenManager.maxRetries;
+    const failedCredentialIds = new Set;
+    let lastError = null;
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      throwIfAborted(signal);
+      let ctx;
+      try {
+        ctx = await this.tokenManager.acquireContext(null, failedCredentialIds);
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        break;
+      }
+      throwIfAborted(signal);
+      const headers = this.buildHeaders(ctx, attempt, maxRetries);
+      const url = this.buildUrl(ctx);
+      const tier = classifyKiroCredentialTier(ctx.credentials);
+      let effectiveBody = body;
+      if (ctx.credentials.profileArn) {
+        const parsed = JSON.parse(body);
+        parsed.profileArn = ctx.credentials.profileArn;
+        effectiveBody = JSON.stringify(parsed);
+      }
+      let res;
+      const slotState = { held: false };
+      try {
+        await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
+        slotState.held = true;
+        res = await this.fetchWithThrottleRetry(() => pfetch(url, {
+          method: "POST",
+          headers,
+          body: effectiveBody,
+          signal
+        }), ctx, slotState);
+      } catch (err) {
+        if (slotState.held)
+          releaseSlot(ctx.id);
+        if (signal?.aborted || isAbortError3(err))
+          throw new Error("Aborted");
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt + 1 < maxRetries)
+          await this.delay(attempt, signal);
+        continue;
+      }
+      const releaseHeld = () => {
+        if (!slotState.held)
+          return;
+        releaseSlot(ctx.id);
+        slotState.held = false;
+      };
+      if (res.ok) {
+        onSuccess(ctx.id);
+        releaseHeld();
+        this.tokenManager.reportSuccess(ctx.id);
+        return await res.json();
+      }
+      const resBody = await res.text().catch(() => "");
+      if (isSuspiciousThrottle(resBody)) {
+        onThrottle(ctx.id);
+        touchLastRequest(ctx.id);
+        recordThrottle(ctx.id);
+        releaseHeld();
+        const hasFailoverCredential = this.tokenManager.hasAlternativeAvailableCredential(ctx.id, failedCredentialIds);
+        if (hasFailoverCredential)
+          failedCredentialIds.add(ctx.id);
+        this.tokenManager.reportSuspiciousThrottle(ctx.id, failedCredentialIds);
+        lastError = new KiroApiError("SUSPICIOUS_THROTTLE", resBody, res.status);
+        continue;
+      }
+      if (res.status === 400) {
+        if (isMonthlyRequestLimit(resBody)) {
+          releaseHeld();
+          failedCredentialIds.add(ctx.id);
+          const hasAvailable = this.tokenManager.reportQuotaExhausted(ctx.id);
+          if (!hasAvailable)
+            throw new KiroQuotaError(resBody);
+          lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
+          continue;
+        }
+        releaseHeld();
+        throw new KiroApiError("BAD_REQUEST", resBody, 400);
+      }
+      if (res.status === 402 && isMonthlyRequestLimit(resBody)) {
+        releaseHeld();
+        failedCredentialIds.add(ctx.id);
+        const hasAvailable = this.tokenManager.reportQuotaExhausted(ctx.id);
+        if (!hasAvailable)
+          throw new KiroQuotaError(resBody);
+        lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 402);
+        continue;
+      }
+      if (res.status === 401 || res.status === 403) {
+        releaseHeld();
+        failedCredentialIds.add(ctx.id);
+        const hasAvailable = this.tokenManager.reportFailure(ctx.id, isAccountSuspended(resBody) ? "account_suspended" : undefined);
+        if (!hasAvailable) {
+          throw new KiroApiError("AUTH_FAILED", resBody, res.status);
+        }
+        lastError = new KiroApiError("AUTH_FAILED", resBody, res.status);
+        continue;
+      }
+      if (res.status === 429) {
+        releaseHeld();
+        throw new KiroApiError("THROTTLED", resBody, 429);
+      }
+      if (res.status === 408 || res.status >= 500) {
+        releaseHeld();
+        lastError = new KiroApiError("TRANSIENT", resBody, res.status);
+        if (attempt + 1 < maxRetries)
+          await this.delay(attempt, signal);
+        continue;
+      }
+      releaseHeld();
+      throw new KiroApiError("API_ERROR", resBody, res.status);
+    }
+    throw lastError ?? new Error("MCP: max retries exceeded");
+  }
+  async fetchWithThrottleRetry(fetchFn, ctx, slotState) {
+    const tier = classifyKiroCredentialTier(ctx.credentials);
+    for (let i = 0;; i++) {
+      recordRequest(ctx.id);
+      const response = await fetchFn();
+      if (response.status !== 429 || i >= MAX_THROTTLE_RETRIES2)
+        return response;
+      const bodyText = await response.text().catch(() => "");
+      if (isSuspiciousThrottle(bodyText)) {
+        return new Response(bodyText, { status: 429, headers: response.headers });
+      }
+      if (i === 0)
+        onThrottle(ctx.id);
+      touchLastRequest(ctx.id);
+      recordThrottle(ctx.id);
+      releaseSlot(ctx.id);
+      slotState.held = false;
+      await new Promise((resolve3) => setTimeout(resolve3, getBackoffMs(ctx.id)));
+      await acquireSlotPriority(ctx.id, tier, ctx.credentials.subscriptionTitle);
+      slotState.held = true;
+    }
+  }
+  buildUrl(ctx) {
+    const config = this.tokenManager.currentConfig;
+    const region = effectiveApiRegion(config, ctx.credentials);
+    return `https://q.${region}.amazonaws.com`;
+  }
+  buildHeaders(ctx, attempt, maxRetries) {
+    const config = this.tokenManager.currentConfig;
+    const region = effectiveApiRegion(config, ctx.credentials);
+    const { kiroVersion } = config;
+    const [os, osVersion] = config.systemVersion.split("#");
+    const headers = {
+      "Content-Type": "application/x-amz-json-1.0",
+      "x-amz-target": "AmazonCodeWhispererStreamingService.InvokeMCP",
+      "x-amzn-codewhisperer-optout": "true",
+      "User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
+      Host: `q.${region}.amazonaws.com`,
+      "amz-sdk-invocation-id": randomUUID3(),
+      "amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
+      Authorization: `Bearer ${ctx.token}`,
+      "x-amzn-codewhisperer-os": os ?? "linux",
+      "x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
+      "x-amzn-codewhisperer-ide": "kiro",
+      "x-amzn-codewhisperer-ide-version": kiroVersion
+    };
+    applyKiroTokenTypeHeader(headers, ctx.credentials);
+    return headers;
+  }
+  delay(attempt, signal) {
+    const exp = Math.min(BASE_DELAY_MS2 * 2 ** attempt, MAX_DELAY_MS2);
+    const jitter = Math.random() * (exp / 4);
+    const delayMs = exp + jitter;
+    if (!signal)
+      return new Promise((resolve3) => setTimeout(resolve3, delayMs));
+    throwIfAborted(signal);
+    return new Promise((resolve3, reject2) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject2(new Error("Aborted"));
+      };
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve3();
+      }, delayMs);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+}
+
+// examples/plugins/kiro-external/src/search.ts
+function readSearchParams(params) {
+  if (!params || typeof params !== "object" || Array.isArray(params)) {
+    throw new SearchInputError("provider.search requires an object payload");
+  }
+  const record = params;
+  const query = typeof record.query === "string" ? record.query.trim() : "";
+  if (!query)
+    throw new SearchInputError("provider.search requires a non-empty query");
+  const maxResults = typeof record.maxResults === "number" && Number.isSafeInteger(record.maxResults) ? record.maxResults : undefined;
+  return { query, ...maxResults != null ? { maxResults } : {} };
+}
+
+class SearchInputError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "SearchInputError";
+  }
+}
+function searchResultFromMcp(response, query) {
+  if (response.error) {
+    throw new Error(response.error.message ?? "Kiro MCP search failed");
+  }
+  const text2 = (response.result?.content ?? []).filter((content) => content.type === "text" && content.text).map((content) => content.text).join(`
+
+`).trim();
+  if (response.result?.isError) {
+    throw new Error(text2 || "Kiro MCP search reported an error");
+  }
+  if (!text2) {
+    throw new Error(`Kiro MCP search returned no content for: ${query}`);
+  }
+  return { text: text2 };
+}
+async function runSearch(config, params, signal) {
+  const manager = resolveManager(config);
+  const client = new KiroMcpClient(manager);
+  const args = { query: params.query };
+  if (params.maxResults != null)
+    args.maxResults = params.maxResults;
+  const response = await client.callTool("web_search", args, signal);
+  return searchResultFromMcp(response, params.query);
 }
 
 // examples/plugins/kiro-external/src/server.ts
@@ -21476,12 +21989,19 @@ var PLUGIN_ID = "com.narrafork.kiro-external";
 var PLUGIN_VERSION = "0.1.0";
 var PROVIDER_PROTOCOL = "1.0";
 var LOCAL_ID = "kiro";
+installProxyResolver();
+var writebackDeps = { request, log: log2 };
+function writebackIfChanged2(credentialsPath, hashBefore) {
+  writebackIfChanged(credentialsPath, hashBefore, writebackDeps);
+}
 var CONTEXT_WINDOWS = {
   "claude-sonnet-4.5": 200000,
   "claude-sonnet-4": 200000,
   "claude-opus-4.5": 200000,
   "claude-opus-4.6": 200000,
-  "claude-haiku-4.5": 200000
+  "claude-haiku-4.5": 200000,
+  "deepseek-chat": 64000,
+  "deepseek-reasoner": 64000
 };
 var DEFAULT_CONTEXT_WINDOW = 128000;
 function contextWindowFor(modelId) {
@@ -21568,6 +22088,7 @@ function describeProvider(id, params) {
   });
 }
 async function listModels(id, params) {
+  applyHostHints(params);
   const config = isRecord4(params) ? params.config : undefined;
   let manager;
   try {
@@ -21582,6 +22103,8 @@ async function listModels(id, params) {
     reject(id, -32603, classified.message, { code: classified.code });
     return;
   }
+  const credPath = credentialsPathFor(config);
+  const hashBefore = credentialFileHash(credPath);
   try {
     const result = await manager.listAvailableModels();
     const models = result.models.map((model) => {
@@ -21604,9 +22127,34 @@ async function listModels(id, params) {
   } catch (error) {
     const classified = classifyKiroError(error);
     reject(id, -32603, classified.message, { code: classified.code });
+  } finally {
+    writebackIfChanged2(credPath, hashBefore);
+  }
+}
+async function search(id, params) {
+  applyHostHints(params);
+  let searchParams;
+  try {
+    searchParams = readSearchParams(params);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reject(id, -32602, message, { code: "INVALID_PARAMS" });
+    return;
+  }
+  const config = isRecord4(params) ? params.config : undefined;
+  const credPath = credentialsPathFor(config);
+  const hashBefore = credentialFileHash(credPath);
+  try {
+    respond(id, await runSearch(config, searchParams));
+  } catch (error) {
+    const classified = classifyKiroError(error);
+    reject(id, -32603, classified.message, { code: classified.code });
+  } finally {
+    writebackIfChanged2(credPath, hashBefore);
   }
 }
 async function validateConfig(id, params) {
+  applyHostHints(params);
   const config = isRecord4(params) ? params.config : undefined;
   try {
     resolveManager(config);
@@ -21636,6 +22184,7 @@ async function validateConfig(id, params) {
   }
 }
 async function startChat(id, params) {
+  applyHostHints(params);
   const operationId = isRecord4(params) && typeof params.operationId === "string" ? params.operationId : undefined;
   if (!operationId) {
     reject(id, -32602, "chat requires an operationId", { code: "INVALID_PARAMS" });
@@ -21645,7 +22194,7 @@ async function startChat(id, params) {
     reject(id, -32602, "duplicate operationId", { code: "INVALID_PARAMS" });
     return;
   }
-  const request = isRecord4(params) ? params.request : undefined;
+  const chatRequest = isRecord4(params) ? params.request : undefined;
   const config = isRecord4(params) ? params.config : undefined;
   const modelId = isRecord4(params) && typeof params.modelId === "string" ? params.modelId : "";
   const controller = new AbortController;
@@ -21654,17 +22203,19 @@ async function startChat(id, params) {
   respond(id, { accepted: true, operationId });
   const usage = new UsageAccumulator;
   usage.setContextWindow(contextWindowFor(modelId));
+  const credPath = credentialsPathFor(config);
+  const hashBefore = credentialFileHash(credPath);
   try {
     const manager = resolveManager(config);
     const client = new KiroApiClient(manager);
-    const current = isRecord4(request) ? request.current : undefined;
+    const current = isRecord4(chatRequest) ? chatRequest.current : undefined;
     const kiroRequest = buildKiroRequest({
       conversationId: isRecord4(isRecord4(params) ? params.conversation : undefined) ? String(params.conversation.conversationId) : operationId,
       content: isRecord4(current) && typeof current.text === "string" ? current.text : "",
       model: modelId,
       cwd: process.cwd(),
-      history: isRecord4(request) && Array.isArray(request.history) ? request.history : [],
-      tools: isRecord4(request) && Array.isArray(request.tools) ? request.tools : [],
+      history: isRecord4(chatRequest) && Array.isArray(chatRequest.history) ? chatRequest.history : [],
+      tools: isRecord4(chatRequest) && Array.isArray(chatRequest.tools) ? chatRequest.tools : [],
       toolResults: isRecord4(current) && Array.isArray(current.toolResults) ? current.toolResults : [],
       ...isRecord4(current) && Array.isArray(current.images) ? {
         images: current.images.map((image) => {
@@ -21681,8 +22232,12 @@ async function startChat(id, params) {
     emit(operationId, { type: "request_started", credentialId: credentialId2, reasoningSource: "kiro" });
     if (!response.body)
       throw new Error("upstream returned no response body");
+    const hasTools = isRecord4(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
     let stopReason = "end_turn";
-    for await (const parsed of parseSSEStream(response.body)) {
+    for await (const parsed of parseSSEStream(response.body, {
+      parseTextToolCalls: hasTools,
+      model: modelId
+    })) {
       if (controller.signal.aborted)
         break;
       if (parsed.invalidState) {
@@ -21737,6 +22292,8 @@ async function startChat(id, params) {
       stopReason: "error",
       usage: usage.snapshot()
     });
+  } finally {
+    writebackIfChanged2(credPath, hashBefore);
   }
 }
 function cancelOperation(id, params) {
@@ -21840,6 +22397,13 @@ function handleRequest(message) {
       }
       startChat(id, params);
       return;
+    case "provider.search":
+      if (!active) {
+        reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
+        return;
+      }
+      search(id, params);
+      return;
     case "provider.cancel":
       cancelOperation(id, params);
       return;
@@ -21880,6 +22444,6 @@ send({
     pluginId: PLUGIN_ID,
     version: PLUGIN_VERSION,
     rpcProtocol: RPC_PROTOCOL,
-    features: ["host_api.notifications", "rpc.cancel"]
+    features: ["host_api.notifications", "rpc.cancel", "host_api.requests"]
   }
 });
