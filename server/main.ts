@@ -76,7 +76,6 @@ import {
 import "./services/notification-service"; // Register notification event listeners
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
-import { registerChatGroupEventListeners } from "./services/chat-group-service";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
@@ -1343,9 +1342,6 @@ initReviewEventHandler();
 
 // Register container event handler (inject access info + auto-enable Browser on container start)
 initContainerEventHandler();
-
-// Register chat-group event handler (notify controlling named narrators of permission requests)
-registerChatGroupEventListeners();
 
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
