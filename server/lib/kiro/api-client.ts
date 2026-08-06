@@ -45,6 +45,20 @@ export class KiroApiClient {
 		const maxRetries = this.tokenManager.maxRetries;
 		const failedCredentialIds = new Set<string>();
 		let lastError: Error | null = null;
+		// One id for this whole logical call, minted before the retry loop and reused by
+		// every attempt — that correlation is the header's entire purpose, and it is what
+		// lets the service deduplicate attempts and size its adaptive throttling. The AWS
+		// SDK does exactly this: `@smithy/core` sets amz-sdk-invocation-id once outside the
+		// loop and only rewrites amz-sdk-request per attempt. Regenerating it per attempt
+		// would emit `attempt=2` under an id the server has never seen, which no AWS client
+		// produces and which makes N retries look like N independent first calls.
+		const invocationId = randomUUID();
+		// Attempt numbering spans both retry layers (credential failover here, 429
+		// throttle inside fetchWithThrottleRetry) because every dispatch below is a real
+		// attempt against the service. Counting only the outer loop would report the same
+		// `attempt=` for several distinct requests.
+		const maxAttempts = maxRetries * (MAX_THROTTLE_RETRIES + 1);
+		let attemptNumber = 0;
 
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			let ctx: CallContext;
@@ -59,7 +73,7 @@ export class KiroApiClient {
 				request.conversationState.currentMessage.userInputMessage.agentMode ??
 				request.conversationState.agentTaskType ??
 				"vibe";
-			const headers = this.buildHeaders(ctx, attempt, maxRetries, agentMode);
+			const headers = this.buildHeaders(ctx, agentMode, invocationId);
 			// Inject profileArn from credentials if not already set
 			const body = { ...request };
 			if (!body.profileArn && ctx.credentials.profileArn) {
@@ -75,13 +89,19 @@ export class KiroApiClient {
 				await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
 				slotState.held = true;
 				res = await this.fetchWithThrottleRetry(
-					() =>
-						pfetch(url, {
+					() => {
+						// Stamped immediately before each dispatch, mirroring the AWS SDK, which
+						// rewrites this header inside the retry loop while the invocation id above
+						// stays fixed. fetchWithThrottleRetry can call this several times.
+						attemptNumber++;
+						headers["amz-sdk-request"] = `attempt=${attemptNumber}; max=${maxAttempts}`;
+						return pfetch(url, {
 							method: "POST",
 							headers,
 							body: JSON.stringify(body),
 							signal,
-						}),
+						});
+					},
 					ctx,
 					slotState,
 				);
@@ -218,11 +238,19 @@ export class KiroApiClient {
 		}
 	}
 
+	/**
+	 * Build the request headers for one credential.
+	 *
+	 * `amz-sdk-request` is deliberately NOT set here: it carries the per-attempt
+	 * counter and is stamped by the caller immediately before each dispatch, so a
+	 * value baked in at header-build time cannot go stale across retries.
+	 * `invocationId` is supplied by the caller because it must stay constant for
+	 * every attempt of one logical call.
+	 */
 	private buildHeaders(
 		ctx: CallContext,
-		attempt: number,
-		maxRetries: number,
 		agentMode: string,
+		invocationId: string,
 	): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
 		const region = effectiveApiRegion(config, ctx.credentials);
@@ -236,8 +264,7 @@ export class KiroApiClient {
 			"x-amzn-kiro-agent-mode": agentMode,
 			"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
 			Host: `q.${region}.amazonaws.com`,
-			"amz-sdk-invocation-id": randomUUID(),
-			"amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
+			"amz-sdk-invocation-id": invocationId,
 			Authorization: `Bearer ${ctx.token}`,
 			"x-amzn-codewhisperer-os": os ?? "linux",
 			"x-amzn-codewhisperer-os-version": osVersion ?? "unknown",

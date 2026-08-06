@@ -82,6 +82,13 @@ export class KiroMcpClient {
 		const maxRetries = this.tokenManager.maxRetries;
 		const failedCredentialIds = new Set<string>();
 		let lastError: Error | null = null;
+		// See KiroApiClient.sendChatRequest: one invocation id for the whole logical call
+		// (constant across retries, which is what the header is for), and an attempt
+		// counter that spans both the credential-failover loop here and the 429 loop in
+		// fetchWithThrottleRetry.
+		const invocationId = randomUUID();
+		const maxAttempts = maxRetries * (MAX_THROTTLE_RETRIES + 1);
+		let attemptNumber = 0;
 
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			throwIfAborted(signal);
@@ -95,7 +102,7 @@ export class KiroMcpClient {
 			}
 			throwIfAborted(signal);
 
-			const headers = this.buildHeaders(ctx, attempt, maxRetries);
+			const headers = this.buildHeaders(ctx, invocationId);
 			const url = this.buildUrl(ctx);
 			const tier = classifyKiroCredentialTier(ctx.credentials);
 
@@ -113,13 +120,17 @@ export class KiroMcpClient {
 				await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
 				slotState.held = true;
 				res = await this.fetchWithThrottleRetry(
-					() =>
-						pfetch(url, {
+					() => {
+						// Stamped per dispatch; fetchWithThrottleRetry may call this several times.
+						attemptNumber++;
+						headers["amz-sdk-request"] = `attempt=${attemptNumber}; max=${maxAttempts}`;
+						return pfetch(url, {
 							method: "POST",
 							headers,
 							body: effectiveBody,
 							signal,
-						}),
+						});
+					},
 					ctx,
 					slotState,
 				);
@@ -249,11 +260,14 @@ export class KiroMcpClient {
 		return `https://q.${region}.amazonaws.com`;
 	}
 
-	private buildHeaders(
-		ctx: CallContext,
-		attempt: number,
-		maxRetries: number,
-	): Record<string, string> {
+	/**
+	 * Build the request headers for one credential.
+	 *
+	 * `amz-sdk-request` is stamped by the caller per dispatch rather than here, and
+	 * `invocationId` is supplied by the caller so it stays constant across the
+	 * retries of one logical call.
+	 */
+	private buildHeaders(ctx: CallContext, invocationId: string): Record<string, string> {
 		const config = this.tokenManager.currentConfig;
 		const region = effectiveApiRegion(config, ctx.credentials);
 		const { kiroVersion } = config;
@@ -265,8 +279,7 @@ export class KiroMcpClient {
 			"x-amzn-codewhisperer-optout": "true",
 			"User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
 			Host: `q.${region}.amazonaws.com`,
-			"amz-sdk-invocation-id": randomUUID(),
-			"amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
+			"amz-sdk-invocation-id": invocationId,
 			Authorization: `Bearer ${ctx.token}`,
 			"x-amzn-codewhisperer-os": os ?? "linux",
 			"x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
