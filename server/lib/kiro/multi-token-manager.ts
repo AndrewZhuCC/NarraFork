@@ -44,6 +44,7 @@ import {
 	type KiroCredentials,
 	type LoadBalancingMode,
 	type ManagerSnapshot,
+	type SnapshotOptions,
 	type UsageCacheEntry,
 } from "./types";
 
@@ -82,6 +83,11 @@ const MAX_PAGINATION_PAGES = 10;
 const OVERAGE_BONUS_CREDITS = 10_000;
 const FREE_TIER_BLOCKED_MODELS = new Set(["auto"]);
 const DEFAULT_TIER_PRIORITY: AccountTier[] = ["free", "enterprise", "paid"];
+const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = [
+	"too_many_failures",
+	"account_suspended",
+];
+const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
 
 function sha256Hex(input: string): string {
 	return createHash("sha256").update(input).digest("hex");
@@ -154,6 +160,17 @@ function shouldPersistDisabledReason(reason?: DisabledReason): boolean {
 		reason === "quota_exhausted" ||
 		reason === "account_suspended" ||
 		reason === "suspicious_throttle"
+	);
+}
+
+function isUnhealthyDisabledCredential(entry: {
+	disabled: boolean;
+	disabledReason?: DisabledReason;
+}): boolean {
+	return (
+		entry.disabled &&
+		!!entry.disabledReason &&
+		UNHEALTHY_DISABLED_REASON_SET.has(entry.disabledReason)
 	);
 }
 
@@ -621,43 +638,77 @@ export class MultiTokenManager {
 
 	// ==================== Admin API ====================
 
-	snapshot(): ManagerSnapshot {
+	snapshot(opts?: SnapshotOptions): ManagerSnapshot {
 		const available = this.entries.filter((e) => !e.disabled).length;
+		const unhealthyTotal = this.entries.filter(isUnhealthyDisabledCredential).length;
+		const paid = this.entries.filter(
+			(entry) => classifyKiroCredentialTier(entry.credentials) === "paid",
+		);
+		const enterprise = this.entries.filter(
+			(entry) => classifyKiroCredentialTier(entry.credentials) === "enterprise",
+		);
+		const free = this.entries.filter(
+			(entry) => classifyKiroCredentialTier(entry.credentials) === "free",
+		);
+		const pageSize = opts?.pageSize ?? 0;
+		const isPaged = pageSize > 0;
+		const slicePage = (entries: CredentialEntry[], page?: number): CredentialEntry[] => {
+			if (!isPaged || !page || page < 1) return entries;
+			const maxPage = Math.max(1, Math.ceil(entries.length / pageSize));
+			const safePage = Math.min(page, maxPage);
+			const start = (safePage - 1) * pageSize;
+			return entries.slice(start, start + pageSize);
+		};
+		const mapEntry = (entry: CredentialEntry) => ({
+			id: entry.id,
+			priority: entry.credentials.priority ?? 0,
+			disabled: entry.disabled,
+			disabledReason: entry.disabledReason,
+			failureCount: entry.failureCount,
+			successCount: entry.successCount,
+			lastUsedAt: entry.lastUsedAt,
+			email: entry.credentials.email,
+			displayName: entry.credentials.displayName,
+			hasProfileArn: !!entry.credentials.profileArn,
+			hasStartUrl: !!entry.credentials.startUrl,
+			expiresAt: entry.credentials.expiresAt,
+			// Reported as stored (already canonicalized on load) so existing UI
+			// tier classification for legacy values like "builder-id" is unchanged.
+			authMethod: entry.credentials.authMethod,
+			isApiKey: isApiKeyCredential(entry.credentials),
+			subscriptionTitle: entry.credentials.subscriptionTitle,
+			region: entry.credentials.region,
+			authRegion: entry.credentials.authRegion,
+			apiRegion: entry.credentials.apiRegion,
+			profileArn: entry.credentials.profileArn,
+			startUrl: entry.credentials.startUrl,
+			machineId: entry.credentials.machineId,
+			// Secret presence only — values stay server-side.
+			hasClientId: !!entry.credentials.clientId,
+			hasClientSecret: !!entry.credentials.clientSecret,
+			proxyUrl: entry.credentials.proxyUrl,
+			proxyUsername: entry.credentials.proxyUsername,
+			hasProxyPassword: !!entry.credentials.proxyPassword,
+			meterUsage: entry.credentials.meterUsage,
+			availableModels: entry.credentials.availableModels,
+			tier: classifyKiroCredentialTier(entry.credentials),
+		});
+		const paidEntries = slicePage(paid, opts?.paidPage).map(mapEntry);
+		const enterpriseEntries = slicePage(enterprise, opts?.enterprisePage).map(mapEntry);
+		const freeEntries = slicePage(free, opts?.freePage).map(mapEntry);
+		const entries = isPaged
+			? [...paidEntries, ...enterpriseEntries, ...freeEntries]
+			: this.entries.map(mapEntry);
+
 		return {
-			entries: this.entries.map((e) => ({
-				id: e.id,
-				priority: e.credentials.priority ?? 0,
-				disabled: e.disabled,
-				disabledReason: e.disabledReason,
-				failureCount: e.failureCount,
-				successCount: e.successCount,
-				lastUsedAt: e.lastUsedAt,
-				email: e.credentials.email,
-				displayName: e.credentials.displayName,
-				hasProfileArn: !!e.credentials.profileArn,
-				hasStartUrl: !!e.credentials.startUrl,
-				expiresAt: e.credentials.expiresAt,
-				// Reported as stored (already canonicalized on load) so existing UI
-				// tier classification for legacy values like "builder-id" is unchanged.
-				authMethod: e.credentials.authMethod,
-				isApiKey: isApiKeyCredential(e.credentials),
-				subscriptionTitle: e.credentials.subscriptionTitle,
-				region: e.credentials.region,
-				authRegion: e.credentials.authRegion,
-				apiRegion: e.credentials.apiRegion,
-				profileArn: e.credentials.profileArn,
-				startUrl: e.credentials.startUrl,
-				machineId: e.credentials.machineId,
-				// Secret presence only — values stay server-side.
-				hasClientId: !!e.credentials.clientId,
-				hasClientSecret: !!e.credentials.clientSecret,
-				proxyUrl: e.credentials.proxyUrl,
-				proxyUsername: e.credentials.proxyUsername,
-				hasProxyPassword: !!e.credentials.proxyPassword,
-				meterUsage: e.credentials.meterUsage,
-				availableModels: e.credentials.availableModels,
-				tier: classifyKiroCredentialTier(e.credentials),
-			})),
+			entries,
+			paidEntries,
+			enterpriseEntries,
+			freeEntries,
+			paidTotal: paid.length,
+			enterpriseTotal: enterprise.length,
+			freeTotal: free.length,
+			unhealthyTotal,
 			currentId: this.currentId,
 			loadBalancingMode: this.loadBalancingMode,
 			total: this.entries.length,
@@ -712,14 +763,40 @@ export class MultiTokenManager {
 	}
 
 	removeCredential(id: string): void {
-		const idx = this.entries.findIndex((e) => e.id === id);
-		if (idx === -1) throw new Error(`Credential not found: ${id}`);
-		this.clearRecoveryTimer(id);
-		this.entries.splice(idx, 1);
-		if (this.currentId === id && this.entries.length > 0) {
-			this.currentId = this.entries[0].id;
+		const result = this.removeCredentials([id]);
+		if (result.notFound.length > 0) throw new Error(`Credential not found: ${id}`);
+	}
+
+	removeCredentials(ids: string[]): { removed: string[]; notFound: string[] } {
+		const uniqueIds = [...new Set(ids)];
+		const existingIds = new Set(this.entries.map((entry) => entry.id));
+		const removed = uniqueIds.filter((id) => existingIds.has(id));
+		const notFound = uniqueIds.filter((id) => !existingIds.has(id));
+		if (removed.length === 0) return { removed, notFound };
+
+		const removedIds = new Set(removed);
+		for (const id of removed) {
+			this.clearRecoveryTimer(id);
+			this.refreshPromises.delete(id);
+			delete this.usageCache[id];
 		}
+		this.entries = this.entries.filter((entry) => !removedIds.has(entry.id));
+		if (!this.entries.some((entry) => entry.id === this.currentId)) {
+			this.currentId = this.entries.length
+				? this.entries.reduce((best, entry) => this.comparePriority(entry, best)).id
+				: "";
+		}
+
 		this.persistCredentials();
+		this.flushStats();
+		this.flushUsageCache();
+		return { removed, notFound };
+	}
+
+	removeUnhealthyCredentials(): { removed: string[]; reasons: DisabledReason[] } {
+		const ids = this.entries.filter(isUnhealthyDisabledCredential).map((entry) => entry.id);
+		const result = this.removeCredentials(ids);
+		return { removed: result.removed, reasons: [...UNHEALTHY_DISABLED_REASONS] };
 	}
 
 	private clearRecoveryTimer(id: string): void {

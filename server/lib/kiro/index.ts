@@ -18,6 +18,7 @@ import { hasImportableSecret, normalizeImportCredentials } from "./import-normal
 import { KiroMcpClient } from "./mcp-client";
 import { MultiTokenManager } from "./multi-token-manager";
 import type {
+	DisabledReason,
 	KiroChatRequest,
 	KiroCredentialPatch,
 	KiroCredentials,
@@ -25,6 +26,7 @@ import type {
 	KiroPluginConfig,
 	ManagerSnapshot,
 	McpResponse,
+	SnapshotOptions,
 	UsageCacheEntry,
 } from "./types";
 import { kiroUsageFetchQueue } from "./usage-fetch-queue";
@@ -170,8 +172,8 @@ export async function kiroMcpListTools(): Promise<McpResponse> {
 
 // --- Management API ---
 
-export function kiroSnapshot(): ManagerSnapshot | null {
-	return tokenManager?.snapshot() ?? null;
+export function kiroSnapshot(options?: SnapshotOptions): ManagerSnapshot | null {
+	return tokenManager?.snapshot(options) ?? null;
 }
 
 export function kiroSetDisabled(id: string, disabled: boolean): void {
@@ -204,6 +206,19 @@ export function kiroResetAndEnable(id: string): void {
 export function kiroRemoveCredential(id: string): void {
 	if (!tokenManager) throw new Error("Kiro not initialized");
 	tokenManager.removeCredential(id);
+}
+
+export function kiroRemoveCredentials(ids: string[]): { removed: string[]; notFound: string[] } {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	return tokenManager.removeCredentials(ids);
+}
+
+export function kiroRemoveUnhealthyCredentials(): {
+	removed: string[];
+	reasons: DisabledReason[];
+} {
+	if (!tokenManager) throw new Error("Kiro not initialized");
+	return tokenManager.removeUnhealthyCredentials();
 }
 
 // --- Credential Management API ---
@@ -334,6 +349,7 @@ kiroUsageFetchQueue.setExecutor((credentialId) => kiroGetUsage(credentialId));
 export { EventStreamDecoder, type StreamEvent } from "./event-stream-parser";
 // Re-export types for consumers
 export type {
+	DisabledReason,
 	KiroChatRequest,
 	KiroConversationState,
 	KiroCredentials,
@@ -349,6 +365,7 @@ export type {
 	KiroUserInputMessageContext,
 	ManagerSnapshot,
 	McpResponse,
+	SnapshotOptions,
 	UsageCacheEntry,
 } from "./types";
 export {

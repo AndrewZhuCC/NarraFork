@@ -21,6 +21,7 @@ import type {
 	DatabaseVacuumResult,
 	HookApiRecord,
 	KiroCredentialPatch,
+	KiroStatusResponse,
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
@@ -244,8 +245,20 @@ export const miscApi = {
 		}),
 
 	// Kiro
-	kiroStatus: () =>
-		request<{ available: boolean; snapshot: ApiEntity; globalProxy?: string }>("/kiro/status"),
+	kiroStatus: (params?: {
+		paidPage?: number;
+		enterprisePage?: number;
+		freePage?: number;
+		pageSize?: number;
+	}) => {
+		const qs = new URLSearchParams();
+		if (params?.paidPage) qs.set("paidPage", String(params.paidPage));
+		if (params?.enterprisePage) qs.set("enterprisePage", String(params.enterprisePage));
+		if (params?.freePage) qs.set("freePage", String(params.freePage));
+		if (params?.pageSize) qs.set("pageSize", String(params.pageSize));
+		const suffix = qs.size > 0 ? `?${qs.toString()}` : "";
+		return request<KiroStatusResponse>(`/kiro/status${suffix}`);
+	},
 	kiroDisableCredential: (id: string) =>
 		request<{ ok: boolean }>(`/kiro/credentials/${id}/disable`, { method: "POST" }),
 	kiroEnableCredential: (id: string) =>
@@ -254,6 +267,16 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/kiro/credentials/${id}/reset`, { method: "POST" }),
 	kiroDeleteCredential: (id: string) =>
 		request<{ ok: boolean }>(`/kiro/credentials/${id}`, { method: "DELETE" }),
+	kiroDeleteCredentials: (ids: string[]) =>
+		request<{ removed: string[]; notFound: string[] }>("/kiro/credentials/batch", {
+			method: "DELETE",
+			body: JSON.stringify({ ids }),
+		}),
+	kiroDeleteUnhealthyCredentials: () =>
+		request<{
+			removed: string[];
+			reasons: Array<"too_many_failures" | "account_suspended">;
+		}>("/kiro/credentials/unhealthy", { method: "DELETE" }),
 	kiroSetPriority: (id: string, priority: number) =>
 		request<{ ok: boolean }>(`/kiro/credentials/${id}/priority`, {
 			method: "POST",

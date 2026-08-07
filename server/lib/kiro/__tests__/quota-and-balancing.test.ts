@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { KiroApiClient } from "../api-client";
 import {
 	__resetKiroConcurrencyForTests,
@@ -315,6 +315,129 @@ describe("Kiro credential persistence", () => {
 
 		expect(persisted.metered.currentUsage).toBe(5);
 		expect(persisted.metered.remaining).toBe(95);
+	});
+});
+
+describe("Kiro credential administration", () => {
+	test("paginates each tier independently while preserving the legacy full entries list", () => {
+		const manager = createManager([
+			makeCredential("free-1", { subscriptionTitle: "Free" }),
+			makeCredential("paid-1", { subscriptionTitle: "Kiro Pro" }),
+			makeCredential("enterprise-1", { profileArn: "arn:aws:codewhisperer:profile/one" }),
+			makeCredential("paid-2", { subscriptionTitle: "Kiro Pro Plus" }),
+			makeCredential("free-2", { subscriptionTitle: "Free" }),
+		]);
+		manager.reportFailure("enterprise-1", "account_suspended");
+		for (let i = 0; i < 3; i++) manager.reportFailure("free-2");
+		manager.setDisabled("paid-2", true);
+
+		const full = manager.snapshot();
+		expect(full.entries.map((entry) => entry.id)).toEqual([
+			"free-1",
+			"paid-1",
+			"enterprise-1",
+			"paid-2",
+			"free-2",
+		]);
+		expect(full.paidEntries.map((entry) => entry.id)).toEqual(["paid-1", "paid-2"]);
+		expect(full.enterpriseEntries.map((entry) => entry.id)).toEqual(["enterprise-1"]);
+		expect(full.freeEntries.map((entry) => entry.id)).toEqual(["free-1", "free-2"]);
+		expect(full.unhealthyTotal).toBe(2);
+
+		const paged = manager.snapshot({
+			paidPage: 2,
+			enterprisePage: 1,
+			freePage: 1,
+			pageSize: 1,
+		});
+		expect(paged.paidEntries.map((entry) => entry.id)).toEqual(["paid-2"]);
+		expect(paged.enterpriseEntries.map((entry) => entry.id)).toEqual(["enterprise-1"]);
+		expect(paged.freeEntries.map((entry) => entry.id)).toEqual(["free-1"]);
+		expect(paged.entries.map((entry) => entry.id)).toEqual(["paid-2", "enterprise-1", "free-1"]);
+		expect(paged.paidTotal).toBe(2);
+		expect(paged.enterpriseTotal).toBe(1);
+		expect(paged.freeTotal).toBe(2);
+		expect(paged.unhealthyTotal).toBe(2);
+	});
+
+	test("bulk removal cleans runtime and persisted state and repairs currentId", () => {
+		const { manager, credentialsPath, usagePath } = createManagerFixture(
+			[
+				makeCredential("remove", { subscriptionTitle: "Free", priority: 0 }),
+				makeCredential("keep", { subscriptionTitle: "Free", priority: 1 }),
+			],
+			{},
+			{
+				remove: {
+					id: "remove",
+					currentUsage: 10,
+					usageLimit: 100,
+					remaining: 90,
+					usagePercentage: 10,
+					queriedAt: new Date().toISOString(),
+				},
+				keep: {
+					id: "keep",
+					currentUsage: 20,
+					usageLimit: 100,
+					remaining: 80,
+					usagePercentage: 20,
+					queriedAt: new Date().toISOString(),
+				},
+			},
+		);
+		manager.reportSuccess("remove");
+		manager.reportSuspiciousThrottle("remove");
+		const internals = manager as unknown as {
+			refreshPromises: Map<string, Promise<KiroCredentials>>;
+			throttleRecoveryTimers: Map<string, ReturnType<typeof setTimeout>>;
+		};
+		internals.refreshPromises.set("remove", Promise.resolve(makeCredential("remove")));
+		expect(internals.throttleRecoveryTimers.has("remove")).toBe(true);
+
+		const result = manager.removeCredentials(["remove", "missing", "remove"]);
+		expect(result).toEqual({ removed: ["remove"], notFound: ["missing"] });
+		expect(manager.snapshot().currentId).toBe("keep");
+		expect(internals.refreshPromises.has("remove")).toBe(false);
+		expect(internals.throttleRecoveryTimers.has("remove")).toBe(false);
+		expect(
+			JSON.parse(readFileSync(credentialsPath, "utf-8")).map((entry: { id: string }) => entry.id),
+		).toEqual(["keep"]);
+		expect(Object.keys(JSON.parse(readFileSync(usagePath, "utf-8")))).toEqual(["keep"]);
+		const statsPath = join(dirname(credentialsPath), "kiro_stats.json");
+		expect(Object.keys(JSON.parse(readFileSync(statsPath, "utf-8")))).toEqual(["keep"]);
+
+		manager.removeCredential("keep");
+		expect(manager.snapshot().currentId).toBe("");
+		expect(() => manager.removeCredential("missing")).toThrow("Credential not found: missing");
+	});
+
+	test("unhealthy removal only targets failure and suspension disables", () => {
+		const manager = createManager([
+			makeCredential("fail"),
+			makeCredential("suspended"),
+			makeCredential("manual"),
+			makeCredential("quota"),
+			makeCredential("throttle"),
+			makeCredential("healthy"),
+		]);
+		for (let i = 0; i < 3; i++) manager.reportFailure("fail");
+		manager.reportFailure("suspended", "account_suspended");
+		manager.setDisabled("manual", true);
+		manager.reportQuotaExhausted("quota");
+		manager.reportSuspiciousThrottle("throttle");
+
+		const result = manager.removeUnhealthyCredentials();
+		expect(result).toEqual({
+			removed: ["fail", "suspended"],
+			reasons: ["too_many_failures", "account_suspended"],
+		});
+		expect(manager.snapshot().entries.map((entry) => entry.id)).toEqual([
+			"manual",
+			"quota",
+			"throttle",
+			"healthy",
+		]);
 	});
 });
 

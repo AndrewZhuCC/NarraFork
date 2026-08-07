@@ -842,6 +842,62 @@ export interface CodexCredentialEntry {
 	usage?: CodexUsageData;
 }
 
+export type KiroCredentialTier = "free" | "paid" | "enterprise";
+
+export interface KiroCredentialEntry {
+	id: string;
+	priority: number;
+	disabled: boolean;
+	disabledReason?: string;
+	failureCount: number;
+	successCount: number;
+	lastUsedAt?: string;
+	email?: string;
+	displayName?: string;
+	hasProfileArn: boolean;
+	hasStartUrl?: boolean;
+	expiresAt?: string;
+	authMethod?: string;
+	isApiKey?: boolean;
+	subscriptionTitle?: string;
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+	profileArn?: string;
+	startUrl?: string;
+	machineId?: string;
+	hasClientId?: boolean;
+	hasClientSecret?: boolean;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	hasProxyPassword?: boolean;
+	meterUsage?: number;
+	availableModels?: string[];
+	tier?: KiroCredentialTier;
+}
+
+export interface KiroStatusSnapshot {
+	entries: KiroCredentialEntry[];
+	paidEntries?: KiroCredentialEntry[];
+	enterpriseEntries?: KiroCredentialEntry[];
+	freeEntries?: KiroCredentialEntry[];
+	paidTotal?: number;
+	enterpriseTotal?: number;
+	freeTotal?: number;
+	unhealthyTotal?: number;
+	currentId: string;
+	loadBalancingMode: "priority" | "balanced";
+	total: number;
+	available: number;
+}
+
+export interface KiroStatusResponse {
+	available: boolean;
+	snapshot: KiroStatusSnapshot | null;
+	usageCache?: Record<string, ApiEntity>;
+	globalProxy?: string;
+}
+
 /**
  * Editable subset of a Kiro credential.
  *
