@@ -541,45 +541,15 @@ export const KiroSection = React.memo(function KiroSection({
 
 			{/* === Credentials Sub-section === */}
 			<Divider />
-			<Group justify="space-between" align="center">
-				<Group gap="xs">
-					<Text fw={500} size="sm">
-						{t("kiroCredentialsSection")}
-					</Text>
-					{(snapshot?.total ?? 0) > 0 && (
-						<Badge size="xs" variant="light">
-							{snapshot?.total ?? 0}
-						</Badge>
-					)}
-				</Group>
-				<Group gap="xs">
-					{selectedIds.size > 0 && (
-						<Button
-							size="compact-xs"
-							color="red"
-							variant="light"
-							leftSection={<IconTrash size={14} />}
-							onClick={handleBatchDelete}
-							loading={batchDeleteMut.isPending}
-							disabled={!canBatchDeleteKiroCredentials}
-							title={!canBatchDeleteKiroCredentials ? providerRouteUnsupportedReason : undefined}
-						>
-							{t("credentialBatchDelete")} ({selectedIds.size})
-						</Button>
-					)}
-					<Button
-						size="compact-xs"
-						color="red"
-						variant="outline"
-						leftSection={<IconTrash size={14} />}
-						onClick={handleDeleteUnhealthy}
-						loading={deleteUnhealthyMut.isPending}
-						disabled={!canDeleteUnhealthyKiroCredentials || unhealthyTotal === 0}
-						title={!canDeleteUnhealthyKiroCredentials ? providerRouteUnsupportedReason : undefined}
-					>
-						{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
-					</Button>
-				</Group>
+			<Group gap="xs" align="center" wrap="nowrap">
+				<Text fw={500} size="sm">
+					{t("kiroCredentialsSection")}
+				</Text>
+				{(snapshot?.total ?? 0) > 0 && (
+					<Badge size="xs" variant="light">
+						{snapshot?.total ?? 0}
+					</Badge>
+				)}
 			</Group>
 
 			{/* Import area */}
@@ -621,6 +591,41 @@ export const KiroSection = React.memo(function KiroSection({
 				<Text c="dimmed" size="sm">
 					{t("kiroNoCredentials")}
 				</Text>
+			)}
+
+			{/* Batch actions: kept adjacent to the tables they act on, so a selection made in a
+			    tier list never scrolls its own delete button out of view. `flex-end` anchors the
+			    rightmost button, which keeps "delete unhealthy" in place when the selection-only
+			    button appears next to it instead of shifting it sideways. */}
+			{(snapshot?.total ?? 0) > 0 && (
+				<Group gap="xs" justify="flex-end" align="center" wrap="wrap">
+					{selectedIds.size > 0 && (
+						<Button
+							size="compact-xs"
+							color="red"
+							variant="light"
+							leftSection={<IconTrash size={14} />}
+							onClick={handleBatchDelete}
+							loading={batchDeleteMut.isPending}
+							disabled={!canBatchDeleteKiroCredentials}
+							title={!canBatchDeleteKiroCredentials ? providerRouteUnsupportedReason : undefined}
+						>
+							{t("credentialBatchDelete")} ({selectedIds.size})
+						</Button>
+					)}
+					<Button
+						size="compact-xs"
+						color="red"
+						variant="outline"
+						leftSection={<IconTrash size={14} />}
+						onClick={handleDeleteUnhealthy}
+						loading={deleteUnhealthyMut.isPending}
+						disabled={!canDeleteUnhealthyKiroCredentials || unhealthyTotal === 0}
+						title={!canDeleteUnhealthyKiroCredentials ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
+					</Button>
+				</Group>
 			)}
 
 			{/* Credentials grouped by tier */}
