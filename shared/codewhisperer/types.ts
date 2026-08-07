@@ -206,6 +206,8 @@ export interface ParsedStreamEvent {
 	text?: string;
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;
+	/** The provider has completed this text output item; flush its stream parser now. */
+	textItemDone?: boolean;
 	toolUses?: AgentToolUse[];
 	messageId?: string;
 	conversationId?: string;
