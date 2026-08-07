@@ -4,7 +4,12 @@ import { bodyLimit } from "hono/body-limit";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { resolveModel } from "../lib/agent/resolve-model";
-import type { KiroChatRequest, KiroModel } from "../lib/kiro-adapter";
+import type {
+	CredentialSnapshot,
+	KiroChatRequest,
+	KiroModel,
+	ManagerSnapshot,
+} from "../lib/kiro-adapter";
 import {
 	isKiroAvailable,
 	kiroChat,
@@ -20,6 +25,8 @@ import {
 	kiroQueueUsageFetch,
 	kiroRefreshModelCache,
 	kiroRemoveCredential,
+	kiroRemoveCredentials,
+	kiroRemoveUnhealthyCredentials,
 	kiroResetAndEnable,
 	kiroSetDisabled,
 	kiroSetLoadBalancingMode,
@@ -54,6 +61,19 @@ const regionField = z
  * Exported for tests: the region validator is the boundary that keeps a typo from
  * becoming an arbitrary request host.
  */
+export const credentialIdsSchema = z
+	.object({
+		ids: z.array(z.string().trim().min(1).max(200)).min(1),
+	})
+	.strict();
+
+const statusPaginationQuerySchema = z.object({
+	paidPage: z.coerce.number().int().min(1).max(1_000_000).default(1),
+	enterprisePage: z.coerce.number().int().min(1).max(1_000_000).default(1),
+	freePage: z.coerce.number().int().min(1).max(1_000_000).default(1),
+	pageSize: z.coerce.number().int().min(1).max(100).optional(),
+});
+
 export const updateCredentialSchema = z
 	.object({
 		email: z.string().max(200).optional(),
@@ -89,6 +109,10 @@ function requireKiro(c: Context): Response | null {
 	return null;
 }
 
+function kiroCredentialDeleteErrorStatus(message: string): 409 | 500 {
+	return message.startsWith("Legacy Kiro module supports at most") ? 409 : 500;
+}
+
 /**
  * Cap on a credential-import body.
  *
@@ -102,6 +126,7 @@ const MAX_CREDENTIAL_IMPORT_BYTES = 1024 * 1024;
  * so a legitimate patch is a few kilobytes at most.
  */
 const MAX_CREDENTIAL_PATCH_BYTES = 64 * 1024;
+const MAX_CREDENTIAL_BATCH_DELETE_BYTES = 64 * 1024;
 
 /** Accepted `credentials[]` entry: a credential object or a raw token string. */
 function isImportableItem(item: unknown): boolean {
@@ -112,20 +137,95 @@ function isImportableItem(item: unknown): boolean {
 /** Track in-flight auto-fetch to avoid duplicate requests from polling. */
 const autoFetchingUsage = new Set<string>();
 
+function classifyKiroSnapshotTier(entry: CredentialSnapshot): "paid" | "enterprise" | "free" {
+	if (entry.tier) return entry.tier;
+	if (entry.hasProfileArn || entry.hasStartUrl) return "enterprise";
+	const title = entry.subscriptionTitle?.toLowerCase();
+	if (title) {
+		if (title.includes("enterprise") || title.includes("business")) return "enterprise";
+		if (title.includes("free")) return "free";
+		return "paid";
+	}
+	if (entry.authMethod === "idc" && entry.hasClientId && entry.hasClientSecret) {
+		return "enterprise";
+	}
+	return "free";
+}
+
+function paginateKiroSnapshot(
+	fullSnapshot: ManagerSnapshot,
+	params: z.infer<typeof statusPaginationQuerySchema>,
+): ManagerSnapshot {
+	const { pageSize } = params;
+	if (!pageSize) return fullSnapshot;
+	const paid =
+		fullSnapshot.paidEntries ??
+		fullSnapshot.entries.filter((entry) => classifyKiroSnapshotTier(entry) === "paid");
+	const enterprise =
+		fullSnapshot.enterpriseEntries ??
+		fullSnapshot.entries.filter((entry) => classifyKiroSnapshotTier(entry) === "enterprise");
+	const free =
+		fullSnapshot.freeEntries ??
+		fullSnapshot.entries.filter((entry) => classifyKiroSnapshotTier(entry) === "free");
+	const slicePage = <T>(entries: T[], page: number): T[] => {
+		const maxPage = Math.max(1, Math.ceil(entries.length / pageSize));
+		const safePage = Math.min(page, maxPage);
+		const start = (safePage - 1) * pageSize;
+		return entries.slice(start, start + pageSize);
+	};
+	const paidEntries = slicePage(paid, params.paidPage);
+	const enterpriseEntries = slicePage(enterprise, params.enterprisePage);
+	const freeEntries = slicePage(free, params.freePage);
+	return {
+		...fullSnapshot,
+		entries: [...paidEntries, ...enterpriseEntries, ...freeEntries],
+		paidEntries,
+		enterpriseEntries,
+		freeEntries,
+		paidTotal: paid.length,
+		enterpriseTotal: enterprise.length,
+		freeTotal: free.length,
+		unhealthyTotal:
+			fullSnapshot.unhealthyTotal ??
+			fullSnapshot.entries.filter(
+				(entry) =>
+					entry.disabledReason === "too_many_failures" ||
+					entry.disabledReason === "account_suspended",
+			).length,
+	};
+}
+
 kiroRoutes.get("/status", (c) => {
-	const snapshot = kiroSnapshot();
+	const parsed = statusPaginationQuerySchema.safeParse({
+		paidPage: c.req.query("paidPage"),
+		enterprisePage: c.req.query("enterprisePage"),
+		freePage: c.req.query("freePage"),
+		pageSize: c.req.query("pageSize"),
+	});
+	if (!parsed.success) {
+		return c.json({ error: parsed.error.issues[0]?.message ?? parsed.error.message }, 400);
+	}
+	const fullSnapshot = kiroSnapshot();
+	const snapshot = fullSnapshot ? paginateKiroSnapshot(fullSnapshot, parsed.data) : null;
+	const allUsageCache = kiroGetAllUsageCache();
+	const usageCache = Object.fromEntries(
+		(snapshot?.entries ?? []).flatMap((entry) => {
+			const usage = allUsageCache[entry.id];
+			return usage ? [[entry.id, usage]] : [];
+		}),
+	);
 	const response = {
 		available: isKiroAvailable(),
 		snapshot,
-		usageCache: kiroGetAllUsageCache(),
+		usageCache,
 		usageQueue: kiroUsageQueueSnapshot(),
 		// Backward-compat: surface the custom proxy URL from the global policy.
 		globalProxy: settings.proxy?.mode === "custom" ? settings.proxy.url : undefined,
 	};
 
-	// Auto-fetch usage for credentials that have never been queried
-	if (snapshot) {
-		for (const entry of snapshot.entries) {
+	// Auto-fetch must inspect the complete pool even when the response is paginated.
+	if (fullSnapshot) {
+		for (const entry of fullSnapshot.entries) {
 			if (entry.disabled) continue;
 			if (entry.meterUsage == null && !autoFetchingUsage.has(entry.id)) {
 				autoFetchingUsage.add(entry.id);
@@ -242,6 +342,53 @@ kiroRoutes.post("/credentials/:id/reset", (c) => {
 	return c.json({ ok: true });
 });
 
+kiroRoutes.delete("/credentials/unhealthy", (c) => {
+	const guard = requireKiro(c);
+	if (guard) return guard;
+	try {
+		return c.json(kiroRemoveUnhealthyCredentials());
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : "Unknown error";
+		return c.json({ error: msg }, kiroCredentialDeleteErrorStatus(msg));
+	}
+});
+
+kiroRoutes.delete(
+	"/credentials/batch",
+	bodyLimit({
+		maxSize: MAX_CREDENTIAL_BATCH_DELETE_BYTES,
+		onError: (c) =>
+			c.json(
+				{
+					error: "Credential batch delete exceeds the 64 KiB limit",
+					code: "CREDENTIAL_BATCH_DELETE_TOO_LARGE",
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const guard = requireKiro(c);
+		if (guard) return guard;
+		let body: unknown;
+		try {
+			body = await c.req.json();
+		} catch (err: unknown) {
+			if (err instanceof Error && err.name === "BodyLimitError") throw err;
+			return c.json({ error: "Invalid JSON body" }, 400);
+		}
+		const parsed = credentialIdsSchema.safeParse(body);
+		if (!parsed.success) {
+			return c.json({ error: parsed.error.issues[0]?.message ?? parsed.error.message }, 400);
+		}
+		try {
+			return c.json(kiroRemoveCredentials(parsed.data.ids));
+		} catch (err: unknown) {
+			const msg = err instanceof Error ? err.message : "Unknown error";
+			return c.json({ error: msg }, kiroCredentialDeleteErrorStatus(msg));
+		}
+	},
+);
+
 kiroRoutes.delete("/credentials/:id", (c) => {
 	const guard = requireKiro(c);
 	if (guard) return guard;
@@ -250,7 +397,7 @@ kiroRoutes.delete("/credentials/:id", (c) => {
 		return c.json({ ok: true });
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : "Unknown error";
-		return c.json({ error: msg }, 500);
+		return c.json({ error: msg }, msg.startsWith("Credential not found") ? 404 : 500);
 	}
 });
 
