@@ -46,7 +46,8 @@
 					"chat": true,
 					"generate": true,
 					"reasoningContinuation": true,
-					"inputImages": true
+					"inputImages": true,
+					"mayLeakXmlToolCalls": true
 				},
 				"limits": {
 					"maxConcurrentChat": 2,
