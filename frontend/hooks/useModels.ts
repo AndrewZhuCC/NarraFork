@@ -137,7 +137,7 @@ export function getConfiguredFallbackModels(
 	}
 	for (const current of [
 		settings.agent?.defaultModel || "kiro:claude-sonnet-4.5",
-		settings.agent?.summaryModel || "kiro:claude-haiku-4.5",
+		settings.agent?.summaryModel || "",
 	]) {
 		const value = String(current);
 		const colon = value.indexOf(":");
@@ -680,10 +680,14 @@ export function useAllModels() {
 		);
 
 		// Use `||` (not `??`) so a stored empty string (e.g. after the summary
-		// model becomes unavailable) falls back to the built-in default. An empty
-		// summaryModelValue would otherwise produce an empty follow-option label
-		// and crash the model button's first-letter rendering.
-		const summaryModelValue = settingsData?.agent?.summaryModel || "kiro:claude-haiku-4.5";
+		// model becomes unavailable) falls back to the default model — mirroring
+		// the server-side resolveConfiguredSummaryModel behavior where an unset
+		// summary model follows the default model. Never surface a hardcoded
+		// model that is not actually configured: it would masquerade as a real
+		// selection and mislead the user. defaultModelValue is always non-empty
+		// (server enforces a configured default), so the follow-option label and
+		// the model button's first-letter rendering stay safe.
+		const summaryModelValue = settingsData?.agent?.summaryModel || defaultModelValue;
 		const followSummaryOption = buildFollowOption(
 			FOLLOW_SUMMARY_MODEL,
 			"__summary__",

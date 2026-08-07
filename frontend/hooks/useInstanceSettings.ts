@@ -147,7 +147,7 @@ function makeDefaults(): InstanceSettingsState {
 		updateAutoDownload: false,
 		defaultModel: "kiro:claude-sonnet-4.5",
 		permissionMode: "acceptEdits",
-		summaryModel: "kiro:claude-haiku-4.5",
+		summaryModel: "",
 		translationModel: "__summary__",
 		maxTurns: 1000,
 		subagentExploreModel: "",
@@ -244,7 +244,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
-				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? "kiro:claude-haiku-4.5"),
+				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
 				translationModel: settings.agent?.translationModel?.startsWith("__")
 					? settings.agent.translationModel
 					: ensurePrefix(settings.agent?.translationModel ?? "__summary__"),

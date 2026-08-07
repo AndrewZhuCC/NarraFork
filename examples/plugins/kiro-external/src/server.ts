@@ -20,17 +20,26 @@
  * ever stops being true. `server/lib/kiro/index.ts` is deliberately *not* used: it is the
  * core's barrel and writes the host's `settings.json`.
  *
- * ## Single credential, by design for now
+ * ## Converting the host's canonical request
  *
- * The built-in adapter rotates across many credentials. This plugin takes one credential set
- * from config; multi-credential rotation is a separate, larger change (config becomes a
- * list with per-entry state). Until then this plugin is not a functional replacement for the
- * built-in adapter, which is why the built-in one stays.
+ * The host sends conversations in its provider-neutral DTO (`ProviderMessage[]` with
+ * `role`/`content` blocks) and expects the plugin to produce Kiro's `conversationState`
+ * wire format. That translation is `@shared/codewhisperer/canonical-request`, which also
+ * runs `normalizeKiroChatRequest`, so what reaches the upstream is already repaired for
+ * alternation and tool-call pairing.
+ *
+ * Passing the canonical arrays straight into `buildKiroRequest` looks like it works — the
+ * parameters are `unknown[]` and it casts them — but it sends `{"role":"assistant",...}` to a
+ * service that requires `{"assistantResponseMessage":{...}}`, which fails as a 400. Chat and
+ * generate therefore both go through the converter, and `provider.generate` has its own
+ * entry point because its request shape (`{mode, text, systemInstruction}`) shares nothing
+ * with chat's.
  */
 
 import { KiroApiClient } from "@server/lib/kiro/api-client";
 import { KiroQuotaError } from "@server/lib/kiro/types";
-import { buildKiroRequest, parseSSEStream } from "@shared/codewhisperer/protocol";
+import { toKiroChatRequest, toKiroGenerateRequest } from "@shared/codewhisperer/canonical-request";
+import { parseSSEStream } from "@shared/codewhisperer/protocol";
 import { CommandInputError, findCommand } from "./commands";
 import {
 	credentialFileHash,
@@ -200,6 +209,13 @@ function describeProvider(id: string | number, params: unknown): void {
 					generate: true,
 					reasoningContinuation: true,
 					inputImages: true,
+					// Some Kiro models emit XML tool calls inline in the text stream instead of
+					// in the native fields. This plugin recovers them itself (see
+					// `parseTextToolCalls` below), but the host runs its own recovery pass over
+					// the text it receives, and it only does so for providers that declare this.
+					// Leaving it unset reported `false` for a provider that genuinely does leak
+					// them, turning two independent safety nets into one.
+					mayLeakXmlToolCalls: true,
 				},
 				limits: {
 					maxConcurrentChat: 2,
@@ -343,12 +359,63 @@ async function validateConfig(id: string | number, params: unknown): Promise<voi
 	}
 }
 
-async function startChat(id: string | number, params: unknown): Promise<void> {
+/**
+ * Turn the canonical request into a Kiro request.
+ *
+ * Chat and generate are separate conversions because their canonical shapes have nothing in
+ * common: chat carries `{history, current, tools}`, generate carries
+ * `{mode, text, systemInstruction}`. Routing generate through the chat converter would read
+ * a `current` that does not exist and send an empty prompt upstream.
+ *
+ * The localized strings the in-core generate path uses come from host i18n, which a plugin
+ * process has no access to. `request.options.locale` is populated for generate's `history`
+ * mode, so the converter localizes what it can and falls back to English otherwise.
+ */
+function buildUpstreamRequest(
+	kind: "chat" | "generate",
+	params: unknown,
+	operationId: string,
+	modelId: string,
+) {
+	const request = isRecord(params) ? params.request : undefined;
+	const conversation = isRecord(params) ? params.conversation : undefined;
+	const conversationId =
+		isRecord(conversation) && typeof conversation.conversationId === "string"
+			? conversation.conversationId
+			: operationId;
+
+	if (kind === "generate") {
+		return toKiroGenerateRequest({
+			conversationId,
+			modelId,
+			request,
+			// Mirrors `getToolMessage("titleReminder"/"titleAck")`; English only, since the
+			// plugin cannot reach host i18n and generate's locale is advisory.
+			reminder: "Reply with ONLY a short title (max 50 chars), nothing else.",
+			ack: "Understood. I will generate only a short title. Send me the content.",
+		});
+	}
+
+	const current = isRecord(request) ? request.current : undefined;
+	return toKiroChatRequest({
+		conversationId,
+		modelId,
+		history: isRecord(request) && Array.isArray(request.history) ? request.history : [],
+		tools: isRecord(request) && Array.isArray(request.tools) ? request.tools : [],
+		current: isRecord(current) ? current : {},
+	});
+}
+
+async function startChat(
+	id: string | number,
+	params: unknown,
+	kind: "chat" | "generate" = "chat",
+): Promise<void> {
 	applyHostHints(params);
 	const operationId =
 		isRecord(params) && typeof params.operationId === "string" ? params.operationId : undefined;
 	if (!operationId) {
-		reject(id, -32602, "chat requires an operationId", { code: "INVALID_PARAMS" });
+		reject(id, -32602, `${kind} requires an operationId`, { code: "INVALID_PARAMS" });
 		return;
 	}
 	if (operations.has(operationId)) {
@@ -377,38 +444,23 @@ async function startChat(id: string | number, params: unknown): Promise<void> {
 		const manager = resolveManager(config);
 		const client = new KiroApiClient(manager);
 
-		const current = isRecord(chatRequest) ? chatRequest.current : undefined;
-		const kiroRequest = buildKiroRequest({
-			conversationId: isRecord(isRecord(params) ? params.conversation : undefined)
-				? String((params as { conversation: Record<string, unknown> }).conversation.conversationId)
-				: operationId,
-			content: isRecord(current) && typeof current.text === "string" ? current.text : "",
-			model: modelId,
-			cwd: process.cwd(),
-			history:
-				isRecord(chatRequest) && Array.isArray(chatRequest.history) ? chatRequest.history : [],
-			tools: isRecord(chatRequest) && Array.isArray(chatRequest.tools) ? chatRequest.tools : [],
-			toolResults:
-				isRecord(current) && Array.isArray(current.toolResults) ? current.toolResults : [],
-			...(isRecord(current) && Array.isArray(current.images)
-				? {
-						images: current.images.map((image) => {
-							const record = isRecord(image) ? image : {};
-							return {
-								format: String(record.mediaType ?? "png").replace(/^image\//, ""),
-								base64: String(record.dataBase64 ?? ""),
-							};
-						}),
-					}
-				: {}),
-		});
+		const kiroRequest = buildUpstreamRequest(kind, params, operationId, modelId);
 
 		const { response, credentialId, release } = await client.sendChatRequest(
 			kiroRequest,
 			controller.signal,
 		);
 		operation.release = release;
-		emit(operationId, { type: "request_started", credentialId, reasoningSource: "kiro" });
+		// `reasoningSource` is deliberately NOT sent. The host would adopt it as the identity
+		// that minted any thinking signature in this turn and persist it on the stored
+		// reasoning block — but it only holds that override for the lifetime of one adapter,
+		// and the registry builds a fresh adapter per model resolution. On the next turn the
+		// adapter is back to `plugin:<typeId>:<instanceId>`, which no longer matches what was
+		// stored, so `compatibleContinuation` drops the signature and thinking continuity is
+		// lost. Staying silent lets the host use its own stable identity on both the write and
+		// the read, which round-trips correctly. Verified in
+		// `kiro-external-canonical-request.test.ts`.
+		emit(operationId, { type: "request_started", credentialId });
 
 		if (!response.body) throw new Error("upstream returned no response body");
 
@@ -598,12 +650,18 @@ function handleRequest(message: JsonRpcRequest): void {
 			void listModels(id, params);
 			return;
 		case "provider.chat":
+			if (!active) {
+				reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
+				return;
+			}
+			void startChat(id, params, "chat");
+			return;
 		case "provider.generate":
 			if (!active) {
 				reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
 				return;
 			}
-			void startChat(id, params);
+			void startChat(id, params, "generate");
 			return;
 		case "provider.search":
 			if (!active) {

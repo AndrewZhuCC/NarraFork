@@ -19557,6 +19557,9 @@ class KiroApiClient {
     const maxRetries = this.tokenManager.maxRetries;
     const failedCredentialIds = new Set;
     let lastError = null;
+    const invocationId = randomUUID2();
+    const maxAttempts = maxRetries * (MAX_THROTTLE_RETRIES + 1);
+    let attemptNumber = 0;
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       let ctx;
       try {
@@ -19566,7 +19569,7 @@ class KiroApiClient {
         break;
       }
       const agentMode = request.conversationState.currentMessage.userInputMessage.agentMode ?? request.conversationState.agentTaskType ?? "vibe";
-      const headers = this.buildHeaders(ctx, attempt, maxRetries, agentMode);
+      const headers = this.buildHeaders(ctx, agentMode, invocationId);
       const body = { ...request };
       if (!body.profileArn && ctx.credentials.profileArn) {
         body.profileArn = ctx.credentials.profileArn;
@@ -19579,12 +19582,16 @@ class KiroApiClient {
       try {
         await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
         slotState.held = true;
-        res = await this.fetchWithThrottleRetry(() => pfetch(url, {
-          method: "POST",
-          headers,
-          body: JSON.stringify(body),
-          signal
-        }), ctx, slotState);
+        res = await this.fetchWithThrottleRetry(() => {
+          attemptNumber++;
+          headers["amz-sdk-request"] = `attempt=${attemptNumber}; max=${maxAttempts}`;
+          return pfetch(url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+            signal
+          });
+        }, ctx, slotState);
       } catch (err) {
         if (slotState.held)
           releaseSlot(ctx.id);
@@ -19694,7 +19701,7 @@ class KiroApiClient {
       slotState.held = true;
     }
   }
-  buildHeaders(ctx, attempt, maxRetries, agentMode) {
+  buildHeaders(ctx, agentMode, invocationId) {
     const config = this.tokenManager.currentConfig;
     const region = effectiveApiRegion(config, ctx.credentials);
     const { kiroVersion } = config;
@@ -19706,8 +19713,7 @@ class KiroApiClient {
       "x-amzn-kiro-agent-mode": agentMode,
       "User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
       Host: `q.${region}.amazonaws.com`,
-      "amz-sdk-invocation-id": randomUUID2(),
-      "amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
+      "amz-sdk-invocation-id": invocationId,
       Authorization: `Bearer ${ctx.token}`,
       "x-amzn-codewhisperer-os": os ?? "linux",
       "x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
@@ -19723,6 +19729,14 @@ class KiroApiClient {
     return new Promise((r) => setTimeout(r, exp + jitter));
   }
 }
+
+// shared/codewhisperer/runtime.ts
+var DEFAULT_CONTINUATION_PROMPT = "Your previous response was interrupted by a temporary connection issue. Please continue from where you left off.";
+var silentProtocolLogger = {
+  warn: () => {
+    return;
+  }
+};
 
 // shared/codewhisperer/synthetic-id.ts
 function generateSyntheticId(size = 21) {
@@ -20018,6 +20032,13 @@ function parseGatewaySSEEvent(eventType, data) {
   return null;
 }
 
+// shared/codewhisperer/reasoning-source.ts
+function signatureSourcesCompatible(stored, current) {
+  if (!stored || !current)
+    return false;
+  return stored === current;
+}
+
 // shared/model-id.ts
 function parseModelId(raw) {
   if (!raw)
@@ -20041,6 +20062,34 @@ function resolveModel(model) {
 }
 
 // shared/codewhisperer/protocol.ts
+function buildKiroReasoningContent(reasoningBlocks, redactedThinkingBlocks, currentSource) {
+  const texts = [];
+  let signature;
+  for (const rb of reasoningBlocks ?? []) {
+    if (rb.text)
+      texts.push(rb.text);
+    const sig = rb.providerMetadata?.anthropic?.signature;
+    if (sig && signatureSourcesCompatible(rb.providerMetadata?.signatureSource, currentSource)) {
+      signature = sig;
+    }
+  }
+  const redacted = redactedThinkingBlocks?.find((rb) => rb.data && signatureSourcesCompatible(rb.signatureSource, currentSource))?.data;
+  const hasText = texts.length > 0;
+  if (!hasText && !redacted)
+    return;
+  const reasoningContent = {};
+  if (hasText) {
+    reasoningContent.reasoningText = {
+      text: texts.join(`
+`),
+      ...signature ? { signature } : {}
+    };
+  }
+  if (redacted) {
+    reasoningContent.redactedContent = redacted;
+  }
+  return reasoningContent;
+}
 function buildKiroRequest(params) {
   const modelId = resolveModel(params.model);
   const history = params.history;
@@ -20090,6 +20139,251 @@ function buildKiroRequest(params) {
       }
     }
   };
+}
+function isKiroUserMessage(message) {
+  return "userInputMessage" in message;
+}
+function isKiroAssistantMessage(message) {
+  return "assistantResponseMessage" in message;
+}
+function cloneToolResult(result) {
+  return {
+    ...result,
+    content: result.content.map((block) => ({ ...block }))
+  };
+}
+function cloneUserMessage(message) {
+  const user = message.userInputMessage;
+  const ctx = user.userInputMessageContext;
+  return {
+    userInputMessage: {
+      ...user,
+      ...user.images ? { images: user.images.map((image) => ({ ...image })) } : {},
+      userInputMessageContext: ctx ? {
+        ...ctx,
+        ...ctx.tools ? { tools: ctx.tools.map((tool) => ({ ...tool })) } : {},
+        ...ctx.toolResults ? { toolResults: ctx.toolResults.map((result) => cloneToolResult(result)) } : {}
+      } : {}
+    }
+  };
+}
+function cloneAssistantMessage(message) {
+  const assistant = message.assistantResponseMessage;
+  return {
+    assistantResponseMessage: {
+      ...assistant,
+      ...assistant.toolUses ? {
+        toolUses: assistant.toolUses.map((toolUse) => ({
+          ...toolUse,
+          input: { ...toolUse.input }
+        }))
+      } : {}
+    }
+  };
+}
+function isEmptyAssistant(message) {
+  const assistant = message.assistantResponseMessage;
+  return !assistant.content?.trim() && (assistant.toolUses?.length ?? 0) === 0;
+}
+function hasUserPayload(message) {
+  const user = message.userInputMessage;
+  const ctx = user.userInputMessageContext;
+  return Boolean(user.content.trim() || (user.images?.length ?? 0) > 0 || (ctx?.tools?.length ?? 0) > 0 || (ctx?.toolResults?.length ?? 0) > 0);
+}
+function createSyntheticUser(modelId) {
+  return {
+    userInputMessage: {
+      content: "",
+      modelId,
+      origin: "AI_EDITOR",
+      userInputMessageContext: {}
+    }
+  };
+}
+function createSyntheticAssistantAck() {
+  return { assistantResponseMessage: { content: "OK" } };
+}
+function mergeUserMessages(target, source) {
+  const targetUser = target.userInputMessage;
+  const sourceUser = source.userInputMessage;
+  const sourceContent = sourceUser.content ?? "";
+  if (sourceContent) {
+    targetUser.content = targetUser.content ? `${targetUser.content}
+${sourceContent}` : sourceContent;
+  }
+  if (sourceUser.images?.length) {
+    targetUser.images = [...targetUser.images ?? [], ...sourceUser.images];
+  }
+  const targetCtx = targetUser.userInputMessageContext ?? {};
+  const sourceCtx = sourceUser.userInputMessageContext ?? {};
+  const mergedToolResults = [...targetCtx.toolResults ?? [], ...sourceCtx.toolResults ?? []];
+  targetUser.userInputMessageContext = {
+    ...targetCtx,
+    ...sourceCtx,
+    ...sourceCtx.tools ? { tools: sourceCtx.tools } : {},
+    ...mergedToolResults.length > 0 ? { toolResults: mergedToolResults } : {}
+  };
+}
+function mergeAssistantMessages(target, source) {
+  const targetAssistant = target.assistantResponseMessage;
+  const sourceAssistant = source.assistantResponseMessage;
+  const sourceContent = sourceAssistant.content ?? "";
+  if (sourceContent) {
+    targetAssistant.content = targetAssistant.content ? `${targetAssistant.content}
+${sourceContent}` : sourceContent;
+  }
+  if (sourceAssistant.toolUses?.length) {
+    targetAssistant.toolUses = [...targetAssistant.toolUses ?? [], ...sourceAssistant.toolUses];
+  }
+}
+function currentMessageCarriesTurn(message) {
+  const user = message.userInputMessage;
+  const ctx = user.userInputMessageContext;
+  return Boolean(user.content.trim() || (user.images?.length ?? 0) > 0 || (ctx?.toolResults?.length ?? 0) > 0);
+}
+function ensureCurrentMessageCarriesTurn(message, continuationPrompt) {
+  if (currentMessageCarriesTurn(message))
+    return false;
+  message.userInputMessage.content = continuationPrompt;
+  return true;
+}
+function cleanupUserContext(message) {
+  const user = message.userInputMessage;
+  const ctx = user.userInputMessageContext;
+  if (!ctx) {
+    user.userInputMessageContext = {};
+    return;
+  }
+  if (ctx.toolResults?.length === 0)
+    delete ctx.toolResults;
+  user.userInputMessageContext = ctx;
+}
+function compactKiroMessages(messages, modelId) {
+  const compacted = [];
+  for (const entry of messages) {
+    const msg = entry.message;
+    if (isKiroAssistantMessage(msg) && isEmptyAssistant(msg))
+      continue;
+    if (isKiroUserMessage(msg) && !entry.isCurrent && !hasUserPayload(msg))
+      continue;
+    const prev = compacted[compacted.length - 1];
+    if (isKiroUserMessage(msg)) {
+      cleanupUserContext(msg);
+      if (prev && isKiroUserMessage(prev.message)) {
+        if (entry.isCurrent) {
+          compacted.push({ message: createSyntheticAssistantAck(), isCurrent: false });
+          compacted.push(entry);
+        } else {
+          mergeUserMessages(prev.message, msg);
+          prev.isCurrent = prev.isCurrent || entry.isCurrent;
+        }
+        continue;
+      }
+      compacted.push(entry);
+      continue;
+    }
+    if (prev && isKiroAssistantMessage(prev.message)) {
+      mergeAssistantMessages(prev.message, msg);
+      continue;
+    }
+    if (!prev) {
+      compacted.push({ message: createSyntheticUser(modelId), isCurrent: false });
+    }
+    compacted.push(entry);
+  }
+  return compacted;
+}
+function sanitizeKiroToolPairs(messages) {
+  const consumedToolUseIds = new Set;
+  const keep = new Array(messages.length).fill(true);
+  for (let i = 0;i < messages.length; i++) {
+    const current = messages[i].message;
+    if (!isKiroUserMessage(current))
+      continue;
+    const user = current.userInputMessage;
+    const ctx = user.userInputMessageContext ?? {};
+    const incomingResults = ctx.toolResults ?? [];
+    const prev = i > 0 ? messages[i - 1].message : undefined;
+    const prevAssistant = prev && isKiroAssistantMessage(prev) ? prev : undefined;
+    const expectedToolUses = prevAssistant?.assistantResponseMessage.toolUses ?? [];
+    const expectedIds = new Set(expectedToolUses.map((toolUse) => toolUse.toolUseId).filter((toolUseId) => !consumedToolUseIds.has(toolUseId)));
+    const keptResults = [];
+    const matchedIds = new Set;
+    for (const result of incomingResults) {
+      if (!expectedIds.has(result.toolUseId) || matchedIds.has(result.toolUseId))
+        continue;
+      keptResults.push(result);
+      matchedIds.add(result.toolUseId);
+      consumedToolUseIds.add(result.toolUseId);
+    }
+    if (keptResults.length > 0) {
+      ctx.toolResults = keptResults;
+    } else {
+      delete ctx.toolResults;
+    }
+    user.userInputMessageContext = ctx;
+    if (prevAssistant && expectedToolUses.length > 0) {
+      const filteredToolUses = expectedToolUses.filter((toolUse) => matchedIds.has(toolUse.toolUseId));
+      if (filteredToolUses.length > 0) {
+        prevAssistant.assistantResponseMessage.toolUses = filteredToolUses;
+      } else {
+        delete prevAssistant.assistantResponseMessage.toolUses;
+      }
+      if (isEmptyAssistant(prevAssistant))
+        keep[i - 1] = false;
+    }
+    if (!messages[i].isCurrent && !hasUserPayload(current))
+      keep[i] = false;
+  }
+  return messages.filter((_, index) => keep[index]);
+}
+function normalizeKiroChatRequest(request, runtime = {}) {
+  const log2 = runtime.logger ?? silentProtocolLogger;
+  const continuationPrompt = runtime.continuationPrompt ?? DEFAULT_CONTINUATION_PROMPT;
+  const cs = request.conversationState;
+  const currentMessage = cloneUserMessage(cs.currentMessage);
+  const modelId = currentMessage.userInputMessage.modelId;
+  const initialMessages = [
+    ...(cs.history ?? []).map((message) => ({
+      message: isKiroUserMessage(message) ? cloneUserMessage(message) : cloneAssistantMessage(message),
+      isCurrent: false
+    })),
+    { message: currentMessage, isCurrent: true }
+  ];
+  let normalized = compactKiroMessages(initialMessages, modelId);
+  normalized = sanitizeKiroToolPairs(normalized);
+  normalized = compactKiroMessages(normalized, modelId);
+  normalized = sanitizeKiroToolPairs(normalized);
+  normalized = compactKiroMessages(normalized, modelId);
+  const currentIndex = normalized.findIndex((entry) => entry.isCurrent);
+  const effectiveCurrentIndex = currentIndex >= 0 ? currentIndex : normalized.length - 1;
+  const beforeCurrent = normalized.slice(0, effectiveCurrentIndex);
+  const current = normalized[effectiveCurrentIndex]?.message;
+  if (!current || !isKiroUserMessage(current)) {
+    const fallbackCurrent = currentMessage;
+    const injected2 = ensureCurrentMessageCarriesTurn(fallbackCurrent, continuationPrompt);
+    if (injected2) {
+      log2.warn("Kiro request had an empty current message; injected a continuation prompt", {
+        model: modelId,
+        route: "current_turn_not_user",
+        historyLength: beforeCurrent.length
+      });
+    }
+    cs.history = beforeCurrent.map((entry) => entry.message);
+    cs.currentMessage = { userInputMessage: fallbackCurrent.userInputMessage };
+    return request;
+  }
+  const injected = ensureCurrentMessageCarriesTurn(current, continuationPrompt);
+  if (injected) {
+    log2.warn("Kiro request had an empty current message; injected a continuation prompt", {
+      model: modelId,
+      route: "empty_after_normalize",
+      historyLength: beforeCurrent.length
+    });
+  }
+  cs.history = beforeCurrent.length > 0 ? beforeCurrent.map((entry) => entry.message) : undefined;
+  cs.currentMessage = { userInputMessage: current.userInputMessage };
+  return request;
 }
 function isRecord3(value) {
   return typeof value === "object" && value !== null;
@@ -20744,6 +21038,379 @@ async function* parseSSEStream(body, options = {}) {
   }
 }
 
+// shared/codewhisperer/canonical-request.ts
+var REASONING_SOURCE = "kiro";
+var SYSTEM_PROMPT_ACK_EN = "I will follow these instructions.";
+var SYSTEM_PROMPT_ACK = {
+  en: SYSTEM_PROMPT_ACK_EN,
+  "zh-CN": "\u6211\u4F1A\u9075\u5FAA\u8FD9\u4E9B\u6307\u793A\u3002"
+};
+function systemPromptAck(locale) {
+  if (!locale)
+    return SYSTEM_PROMPT_ACK_EN;
+  return SYSTEM_PROMPT_ACK[locale] ?? SYSTEM_PROMPT_ACK_EN;
+}
+function isRecord4(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function asString(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function blocksOf(message) {
+  if (!Array.isArray(message.content))
+    return [];
+  return message.content.filter((block) => {
+    return isRecord4(block) && typeof block.type === "string";
+  });
+}
+function imageFormat(mediaTypeOrFormat) {
+  const raw = asString(mediaTypeOrFormat)?.toLowerCase() ?? "";
+  const bare = raw.replace(/^image\//, "");
+  if (bare === "jpeg" || bare === "jpg")
+    return "jpeg";
+  if (bare === "gif")
+    return "gif";
+  if (bare === "webp")
+    return "webp";
+  return "png";
+}
+function toKiroImage(block) {
+  const data = asString(block.dataBase64) ?? asString(block.base64);
+  if (!data)
+    return;
+  return {
+    format: imageFormat(block.mediaType ?? block.format),
+    source: { bytes: data }
+  };
+}
+function textOf(blocks) {
+  return blocks.filter((block) => block.type === "text").map((block) => asString(block.text) ?? "").filter((text) => text.length > 0).join(`
+`);
+}
+function auxiliaryText(blocks) {
+  const parts = [];
+  for (const block of blocks) {
+    if (block.type === "web_search") {
+      const queries = Array.isArray(block.queries) ? block.queries.filter((query2) => typeof query2 === "string") : [];
+      const query = asString(block.query) ?? (queries.length > 0 ? queries.join(", ") : "unknown");
+      parts.push(`[Web search: ${query}]`);
+      continue;
+    }
+    if (block.type === "image_generation") {
+      const revised = asString(block.revisedPrompt);
+      parts.push(revised ? `[Image generated: ${revised}]` : "[Image generated]");
+    }
+  }
+  return parts.join(`
+`);
+}
+function reasoningContentOf(blocks) {
+  const reasoningBlocks = [];
+  const redactedBlocks = [];
+  for (const block of blocks) {
+    if (block.type === "reasoning") {
+      const text = asString(block.text) ?? "";
+      const continuation = isRecord4(block.continuation) ? block.continuation : undefined;
+      const signature = continuation?.format === "anthropic" && isRecord4(continuation.data) ? asString(continuation.data.anthropic?.signature) : undefined;
+      reasoningBlocks.push({
+        text,
+        ...signature ? {
+          providerMetadata: {
+            anthropic: { signature },
+            signatureSource: REASONING_SOURCE
+          }
+        } : {}
+      });
+      continue;
+    }
+    if (block.type === "redacted_reasoning") {
+      const data = asString(block.data);
+      if (!data)
+        continue;
+      redactedBlocks.push({
+        data,
+        ...asString(block.source) ? { signatureSource: REASONING_SOURCE } : {}
+      });
+    }
+  }
+  if (reasoningBlocks.length === 0 && redactedBlocks.length === 0)
+    return;
+  return buildKiroReasoningContent(reasoningBlocks, redactedBlocks, REASONING_SOURCE);
+}
+function toKiroToolResult(block) {
+  const toolUseId = asString(block.toolUseId) ?? asString(block.tool_call_id);
+  if (!toolUseId)
+    return;
+  const parts = [];
+  const images = [];
+  const content = Array.isArray(block.content) ? block.content : [];
+  for (const entry of content) {
+    if (!isRecord4(entry))
+      continue;
+    if (entry.type === "text") {
+      const text = asString(entry.text);
+      if (text)
+        parts.push(text);
+      continue;
+    }
+    if (entry.type === "image") {
+      const image = toKiroImage(entry);
+      if (image)
+        images.push(image);
+    }
+  }
+  const isError = block.isError === true || block.is_error === true;
+  return {
+    result: {
+      toolUseId,
+      content: [{ text: parts.join(`
+`) }],
+      status: isError ? "error" : "success",
+      isError
+    },
+    images
+  };
+}
+function toKiroTools(tools) {
+  if (!Array.isArray(tools))
+    return [];
+  const result = [];
+  for (const tool of tools) {
+    if (!isRecord4(tool))
+      continue;
+    const name = asString(tool.name);
+    if (!name)
+      continue;
+    const schema = isRecord4(tool.inputSchema) ? tool.inputSchema : isRecord4(tool.parameters) ? tool.parameters : {};
+    result.push({
+      toolSpecification: {
+        name,
+        description: typeof tool.description === "string" ? tool.description : "",
+        inputSchema: { json: ensureRequiredProperty(schema) }
+      }
+    });
+  }
+  return result;
+}
+function ensureRequiredProperty(schema) {
+  const properties = isRecord4(schema.properties) ? schema.properties : undefined;
+  const required = Array.isArray(schema.required) ? schema.required : undefined;
+  if (required && required.length > 0)
+    return schema;
+  if (!properties || Object.keys(properties).length === 0) {
+    return {
+      ...schema,
+      properties: {
+        confirm: {
+          type: "boolean",
+          description: "Dummy parameter (always pass true)",
+          const: true,
+          default: true
+        }
+      },
+      required: ["confirm"]
+    };
+  }
+  return { ...schema, required: [Object.keys(properties)[0]] };
+}
+function emptyPendingUser() {
+  return { text: [], images: [], toolResults: [] };
+}
+function pendingUserHasContent(pending) {
+  return pending.text.some((text) => text.trim().length > 0) || pending.images.length > 0 || pending.toolResults.length > 0;
+}
+function commitPendingUser(history, pending, modelId) {
+  if (!pendingUserHasContent(pending))
+    return;
+  const context = pending.toolResults.length > 0 ? { toolResults: pending.toolResults } : {};
+  const message = {
+    userInputMessage: {
+      content: pending.text.join(`
+`),
+      modelId,
+      origin: "AI_EDITOR",
+      ...pending.images.length > 0 ? { images: pending.images } : {},
+      userInputMessageContext: context
+    }
+  };
+  history.push(message);
+}
+function toKiroHistory(messages, modelId, locale, ack) {
+  const history = [];
+  if (!Array.isArray(messages))
+    return { history };
+  const systemAck = ack ?? systemPromptAck(locale);
+  let pending = emptyPendingUser();
+  for (const raw of messages) {
+    if (!isRecord4(raw) || typeof raw.role !== "string")
+      continue;
+    const message = { ...raw, role: raw.role };
+    const blocks = blocksOf(message);
+    if (message.role === "system") {
+      commitPendingUser(history, pending, modelId);
+      pending = emptyPendingUser();
+      const text = textOf(blocks);
+      if (!text)
+        continue;
+      history.push({
+        userInputMessage: { content: text, modelId, userInputMessageContext: {} }
+      });
+      history.push({ assistantResponseMessage: { content: systemAck } });
+      continue;
+    }
+    if (message.role === "tool") {
+      for (const block of blocks) {
+        if (block.type !== "tool_result")
+          continue;
+        const converted = toKiroToolResult(block);
+        if (!converted)
+          continue;
+        pending.toolResults.push(converted.result);
+        for (const _image of converted.images) {
+          pending.text.push("[Image omitted from tool result]");
+        }
+      }
+      continue;
+    }
+    if (message.role === "user") {
+      const text = textOf(blocks);
+      if (text)
+        pending.text.push(text);
+      for (const block of blocks) {
+        if (block.type === "image") {
+          const image = toKiroImage(block);
+          if (image)
+            pending.images.push(image);
+          continue;
+        }
+        if (block.type === "tool_result") {
+          const converted = toKiroToolResult(block);
+          if (!converted)
+            continue;
+          pending.toolResults.push(converted.result);
+          for (const image of converted.images)
+            pending.images.push(image);
+        }
+      }
+      commitPendingUser(history, pending, modelId);
+      pending = emptyPendingUser();
+      continue;
+    }
+    if (message.role !== "assistant")
+      continue;
+    commitPendingUser(history, pending, modelId);
+    pending = emptyPendingUser();
+    const texts = [];
+    const primary = textOf(blocks);
+    if (primary)
+      texts.push(primary);
+    const auxiliary = auxiliaryText(blocks);
+    if (auxiliary)
+      texts.push(auxiliary);
+    const toolUses = [];
+    for (const block of blocks) {
+      if (block.type !== "tool_call")
+        continue;
+      const toolUseId = asString(block.toolUseId);
+      const name = asString(block.name);
+      if (!toolUseId || !name)
+        continue;
+      toolUses.push({
+        toolUseId,
+        name,
+        input: isRecord4(block.input) ? block.input : {}
+      });
+    }
+    const reasoningContent = reasoningContentOf(blocks);
+    history.push({
+      assistantResponseMessage: {
+        content: texts.join(`
+`),
+        ...reasoningContent ? { reasoning_content: reasoningContent } : {},
+        ...toolUses.length > 0 ? { toolUses } : {}
+      }
+    });
+  }
+  commitPendingUser(history, pending, modelId);
+  const last = history[history.length - 1];
+  if (last && "userInputMessage" in last) {
+    history.push({ assistantResponseMessage: { content: "OK" } });
+  }
+  return { history };
+}
+function toKiroRequestParts(input) {
+  const { history } = toKiroHistory(input.history, input.modelId, input.locale, input.ack);
+  const tools = toKiroTools(input.tools);
+  const current = input.current ?? {};
+  const toolResults = [];
+  const images = [];
+  if (Array.isArray(current.images)) {
+    for (const entry of current.images) {
+      if (!isRecord4(entry))
+        continue;
+      const image = toKiroImage(entry);
+      if (image)
+        images.push(image);
+    }
+  }
+  if (Array.isArray(current.toolResults)) {
+    for (const entry of current.toolResults) {
+      if (!isRecord4(entry) || typeof entry.type !== "string")
+        continue;
+      const converted = toKiroToolResult(entry);
+      if (!converted)
+        continue;
+      toolResults.push(converted.result);
+      for (const image of converted.images)
+        images.push(image);
+    }
+  }
+  return {
+    history,
+    tools,
+    toolResults,
+    images,
+    content: typeof current.text === "string" ? current.text : ""
+  };
+}
+function toKiroChatRequest(input, runtime) {
+  const parts = toKiroRequestParts(input);
+  const request = buildKiroRequest({
+    conversationId: input.conversationId,
+    content: parts.content,
+    model: input.modelId,
+    cwd: input.cwd ?? process.cwd(),
+    history: parts.history,
+    tools: parts.tools,
+    toolResults: parts.toolResults,
+    images: parts.images.map((image) => ({
+      format: image.format,
+      base64: image.source.bytes
+    }))
+  });
+  return normalizeKiroChatRequest(request, runtime ?? {});
+}
+function toKiroGenerateRequest(input, runtime) {
+  const raw = isRecord4(input.request) ? input.request : {};
+  const mode = raw.mode === "history" ? "history" : "prompt";
+  const systemInstruction = asString(raw.systemInstruction);
+  const content = mode === "history" ? [input.reminder, asString(raw.content)].filter(Boolean).join(`
+
+`) : asString(raw.text) ?? "";
+  const history = systemInstruction ? [{ role: "system", content: [{ type: "text", text: systemInstruction }] }] : [];
+  const locale = mode === "history" ? asString(raw.locale) : undefined;
+  return toKiroChatRequest({
+    conversationId: input.conversationId,
+    modelId: input.modelId,
+    history,
+    tools: [],
+    current: { text: content },
+    ...input.cwd ? { cwd: input.cwd } : {},
+    ...locale ? { locale } : {},
+    ...input.ack ? { ack: input.ack } : {}
+  }, runtime);
+}
+
 // server/lib/kiro/import-normalize.ts
 var KEY_ALIASES = {
   kiroapikey: "apiKey",
@@ -20901,7 +21568,7 @@ var MAX_FRAME_BYTES = 16 * 1024 * 1024;
 var MAX_BUFFER_BYTES = MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4;
 var encoder = new TextEncoder;
 var decoder = new TextDecoder("utf-8", { fatal: true });
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function log2(message, detail) {
@@ -21001,7 +21668,7 @@ function handleResponse(message) {
     return true;
   clearTimeout(pending.timer);
   pendingRequests.delete(id);
-  if ("error" in message && isRecord4(message.error)) {
+  if ("error" in message && isRecord5(message.error)) {
     const err = message.error;
     const error = new Error(typeof err.message === "string" ? err.message : "Host request failed");
     error.code = typeof err.code === "number" ? err.code : -32603;
@@ -21033,7 +21700,7 @@ function listen(onRequest) {
         return;
       const message = JSON.parse(decoder.decode(buffer.slice(bodyStart, frameEnd)));
       buffer = buffer.slice(frameEnd);
-      if (!isRecord4(message) || message.jsonrpc !== "2.0")
+      if (!isRecord5(message) || message.jsonrpc !== "2.0")
         continue;
       if (handleResponse(message))
         continue;
@@ -21079,7 +21746,7 @@ function text(value) {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 function readConfig(raw) {
-  if (!isRecord4(raw))
+  if (!isRecord5(raw))
     return {};
   return {
     credentialsBundle: text(raw.credentialsBundle),
@@ -21126,7 +21793,7 @@ function parseBundle(bundle) {
   const entries = Array.isArray(parsed) ? parsed : [parsed];
   const credentials = [];
   for (const entry of entries) {
-    if (!isRecord4(entry))
+    if (!isRecord5(entry))
       continue;
     const credential = {};
     for (const field of BUNDLE_TEXT_FIELDS) {
@@ -21269,7 +21936,7 @@ function requireString(value, field) {
   return value.trim();
 }
 function credentialId(input) {
-  if (!isRecord4(input))
+  if (!isRecord5(input))
     throw new CommandInputError("credentialId is required");
   return requireString(input.credentialId, "credentialId");
 }
@@ -21293,10 +21960,10 @@ function statusOutput(manager) {
 var COMMAND_HANDLERS = {
   status: async (_input, { manager }) => ({ output: statusOutput(manager) }),
   "credentials.import": async (input, { manager, credentialsPath }) => {
-    if (!isRecord4(input))
+    if (!isRecord5(input))
       throw new CommandInputError("credentials payload is required");
     const raw = input.credentials;
-    const records = Array.isArray(raw) ? raw : isRecord4(raw) ? Object.values(raw) : (() => {
+    const records = Array.isArray(raw) ? raw : isRecord5(raw) ? Object.values(raw) : (() => {
       throw new CommandInputError("credentials must be an array or object");
     })();
     const normalized = normalizeImportCredentials(records).filter(hasImportableSecret);
@@ -21311,7 +21978,7 @@ var COMMAND_HANDLERS = {
   },
   "credentials.setState": async (input, { manager, credentialsPath }) => {
     const id = credentialId(input);
-    const state = requireString(isRecord4(input) ? input.state : undefined, "state");
+    const state = requireString(isRecord5(input) ? input.state : undefined, "state");
     switch (state) {
       case "disabled":
         manager.setDisabled(id, true);
@@ -21334,7 +22001,7 @@ var COMMAND_HANDLERS = {
   },
   "credentials.setPriority": async (input, { manager, credentialsPath }) => {
     const id = credentialId(input);
-    const priority = isRecord4(input) ? input.priority : undefined;
+    const priority = isRecord5(input) ? input.priority : undefined;
     if (typeof priority !== "number" || !Number.isFinite(priority)) {
       throw new CommandInputError("priority must be a number");
     }
@@ -21351,7 +22018,7 @@ var COMMAND_HANDLERS = {
   },
   "credentials.update": async (input, { manager, credentialsPath }) => {
     const id = credentialId(input);
-    const patch = isRecord4(input) && isRecord4(input.fields) ? input.fields : undefined;
+    const patch = isRecord5(input) && isRecord5(input.fields) ? input.fields : undefined;
     if (!patch)
       throw new CommandInputError("fields is required");
     const allowed = {};
@@ -21403,7 +22070,7 @@ var COMMAND_HANDLERS = {
     return { output: { credentialId: id, usage } };
   },
   "config.setLoadBalancing": async (input, { manager }) => {
-    const mode = requireString(isRecord4(input) ? input.mode : undefined, "mode");
+    const mode = requireString(isRecord5(input) ? input.mode : undefined, "mode");
     if (mode !== "priority" && mode !== "balanced") {
       throw new CommandInputError(`mode must be priority or balanced: ${mode}`);
     }
@@ -21415,7 +22082,7 @@ var COMMAND_HANDLERS = {
     return { output: { ok: true, modelCount: result.models.length } };
   },
   "models.list": async (input, { manager }) => {
-    const id = isRecord4(input) ? input.credentialId : undefined;
+    const id = isRecord5(input) ? input.credentialId : undefined;
     const result = await manager.listAvailableModels(id || undefined);
     const models = result.models.map((m) => ({
       id: String(m.model_id ?? m.modelId ?? ""),
@@ -21691,7 +22358,7 @@ function classifyKiroError(error) {
 }
 
 // examples/plugins/kiro-external/src/host-hints.ts
-function isRecord5(value) {
+function isRecord6(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 var currentProxyUrl;
@@ -21699,13 +22366,13 @@ function installProxyResolver() {
   registerProxyResolver(() => currentProxyUrl);
 }
 function applyHostHints(params) {
-  if (!isRecord5(params))
+  if (!isRecord6(params))
     return;
   const hostHints = params.hostHints;
-  if (!isRecord5(hostHints))
+  if (!isRecord6(hostHints))
     return;
   const outbound = hostHints.outbound;
-  currentProxyUrl = isRecord5(outbound) && typeof outbound.proxyUrl === "string" && outbound.proxyUrl ? outbound.proxyUrl : undefined;
+  currentProxyUrl = isRecord6(outbound) && typeof outbound.proxyUrl === "string" && outbound.proxyUrl ? outbound.proxyUrl : undefined;
 }
 
 // server/lib/kiro/mcp-client.ts
@@ -21757,6 +22424,9 @@ class KiroMcpClient {
     const maxRetries = this.tokenManager.maxRetries;
     const failedCredentialIds = new Set;
     let lastError = null;
+    const invocationId = randomUUID3();
+    const maxAttempts = maxRetries * (MAX_THROTTLE_RETRIES2 + 1);
+    let attemptNumber = 0;
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       throwIfAborted(signal);
       let ctx;
@@ -21767,7 +22437,7 @@ class KiroMcpClient {
         break;
       }
       throwIfAborted(signal);
-      const headers = this.buildHeaders(ctx, attempt, maxRetries);
+      const headers = this.buildHeaders(ctx, invocationId);
       const url = this.buildUrl(ctx);
       const tier = classifyKiroCredentialTier(ctx.credentials);
       let effectiveBody = body;
@@ -21781,12 +22451,16 @@ class KiroMcpClient {
       try {
         await acquireSlot(ctx.id, tier, ctx.credentials.subscriptionTitle);
         slotState.held = true;
-        res = await this.fetchWithThrottleRetry(() => pfetch(url, {
-          method: "POST",
-          headers,
-          body: effectiveBody,
-          signal
-        }), ctx, slotState);
+        res = await this.fetchWithThrottleRetry(() => {
+          attemptNumber++;
+          headers["amz-sdk-request"] = `attempt=${attemptNumber}; max=${maxAttempts}`;
+          return pfetch(url, {
+            method: "POST",
+            headers,
+            body: effectiveBody,
+            signal
+          });
+        }, ctx, slotState);
       } catch (err) {
         if (slotState.held)
           releaseSlot(ctx.id);
@@ -21897,7 +22571,7 @@ class KiroMcpClient {
     const region = effectiveApiRegion(config, ctx.credentials);
     return `https://q.${region}.amazonaws.com`;
   }
-  buildHeaders(ctx, attempt, maxRetries) {
+  buildHeaders(ctx, invocationId) {
     const config = this.tokenManager.currentConfig;
     const region = effectiveApiRegion(config, ctx.credentials);
     const { kiroVersion } = config;
@@ -21908,8 +22582,7 @@ class KiroMcpClient {
       "x-amzn-codewhisperer-optout": "true",
       "User-Agent": `AmazonQ-For-CLI/Version/${kiroVersion}`,
       Host: `q.${region}.amazonaws.com`,
-      "amz-sdk-invocation-id": randomUUID3(),
-      "amz-sdk-request": `attempt=${attempt + 1}; max=${maxRetries}`,
+      "amz-sdk-invocation-id": invocationId,
       Authorization: `Bearer ${ctx.token}`,
       "x-amzn-codewhisperer-os": os ?? "linux",
       "x-amzn-codewhisperer-os-version": osVersion ?? "unknown",
@@ -22033,7 +22706,7 @@ function finish(operationId, event) {
   operations.delete(operationId);
 }
 function describeProvider(id, params) {
-  const versions = isRecord4(params) && Array.isArray(params.protocolVersions) ? params.protocolVersions : [];
+  const versions = isRecord5(params) && Array.isArray(params.protocolVersions) ? params.protocolVersions : [];
   if (!versions.includes(PROVIDER_PROTOCOL)) {
     reject(id, -32001, "No supported provider protocol version", {
       code: "INCOMPATIBLE",
@@ -22075,7 +22748,8 @@ function describeProvider(id, params) {
           chat: true,
           generate: true,
           reasoningContinuation: true,
-          inputImages: true
+          inputImages: true,
+          mayLeakXmlToolCalls: true
         },
         limits: {
           maxConcurrentChat: 2,
@@ -22089,7 +22763,7 @@ function describeProvider(id, params) {
 }
 async function listModels(id, params) {
   applyHostHints(params);
-  const config = isRecord4(params) ? params.config : undefined;
+  const config = isRecord5(params) ? params.config : undefined;
   let manager;
   try {
     manager = resolveManager(config);
@@ -22141,7 +22815,7 @@ async function search(id, params) {
     reject(id, -32602, message, { code: "INVALID_PARAMS" });
     return;
   }
-  const config = isRecord4(params) ? params.config : undefined;
+  const config = isRecord5(params) ? params.config : undefined;
   const credPath = credentialsPathFor(config);
   const hashBefore = credentialFileHash(credPath);
   try {
@@ -22155,7 +22829,7 @@ async function search(id, params) {
 }
 async function validateConfig(id, params) {
   applyHostHints(params);
-  const config = isRecord4(params) ? params.config : undefined;
+  const config = isRecord5(params) ? params.config : undefined;
   try {
     resolveManager(config);
   } catch (error) {
@@ -22165,7 +22839,7 @@ async function validateConfig(id, params) {
     }
     throw error;
   }
-  const mode = isRecord4(params) && params.mode === "connectivity" ? "connectivity" : "syntax";
+  const mode = isRecord5(params) && params.mode === "connectivity" ? "connectivity" : "syntax";
   if (mode !== "connectivity") {
     respond(id, { valid: true, issues: [] });
     return;
@@ -22183,20 +22857,42 @@ async function validateConfig(id, params) {
     respond(id, { valid: false, issues: [{ path: "/", message: classified.message }] });
   }
 }
-async function startChat(id, params) {
+function buildUpstreamRequest(kind, params, operationId, modelId) {
+  const request2 = isRecord5(params) ? params.request : undefined;
+  const conversation = isRecord5(params) ? params.conversation : undefined;
+  const conversationId = isRecord5(conversation) && typeof conversation.conversationId === "string" ? conversation.conversationId : operationId;
+  if (kind === "generate") {
+    return toKiroGenerateRequest({
+      conversationId,
+      modelId,
+      request: request2,
+      reminder: "Reply with ONLY a short title (max 50 chars), nothing else.",
+      ack: "Understood. I will generate only a short title. Send me the content."
+    });
+  }
+  const current = isRecord5(request2) ? request2.current : undefined;
+  return toKiroChatRequest({
+    conversationId,
+    modelId,
+    history: isRecord5(request2) && Array.isArray(request2.history) ? request2.history : [],
+    tools: isRecord5(request2) && Array.isArray(request2.tools) ? request2.tools : [],
+    current: isRecord5(current) ? current : {}
+  });
+}
+async function startChat(id, params, kind = "chat") {
   applyHostHints(params);
-  const operationId = isRecord4(params) && typeof params.operationId === "string" ? params.operationId : undefined;
+  const operationId = isRecord5(params) && typeof params.operationId === "string" ? params.operationId : undefined;
   if (!operationId) {
-    reject(id, -32602, "chat requires an operationId", { code: "INVALID_PARAMS" });
+    reject(id, -32602, `${kind} requires an operationId`, { code: "INVALID_PARAMS" });
     return;
   }
   if (operations.has(operationId)) {
     reject(id, -32602, "duplicate operationId", { code: "INVALID_PARAMS" });
     return;
   }
-  const chatRequest = isRecord4(params) ? params.request : undefined;
-  const config = isRecord4(params) ? params.config : undefined;
-  const modelId = isRecord4(params) && typeof params.modelId === "string" ? params.modelId : "";
+  const chatRequest = isRecord5(params) ? params.request : undefined;
+  const config = isRecord5(params) ? params.config : undefined;
+  const modelId = isRecord5(params) && typeof params.modelId === "string" ? params.modelId : "";
   const controller = new AbortController;
   const operation = { seq: 0, controller };
   operations.set(operationId, operation);
@@ -22208,31 +22904,13 @@ async function startChat(id, params) {
   try {
     const manager = resolveManager(config);
     const client = new KiroApiClient(manager);
-    const current = isRecord4(chatRequest) ? chatRequest.current : undefined;
-    const kiroRequest = buildKiroRequest({
-      conversationId: isRecord4(isRecord4(params) ? params.conversation : undefined) ? String(params.conversation.conversationId) : operationId,
-      content: isRecord4(current) && typeof current.text === "string" ? current.text : "",
-      model: modelId,
-      cwd: process.cwd(),
-      history: isRecord4(chatRequest) && Array.isArray(chatRequest.history) ? chatRequest.history : [],
-      tools: isRecord4(chatRequest) && Array.isArray(chatRequest.tools) ? chatRequest.tools : [],
-      toolResults: isRecord4(current) && Array.isArray(current.toolResults) ? current.toolResults : [],
-      ...isRecord4(current) && Array.isArray(current.images) ? {
-        images: current.images.map((image) => {
-          const record = isRecord4(image) ? image : {};
-          return {
-            format: String(record.mediaType ?? "png").replace(/^image\//, ""),
-            base64: String(record.dataBase64 ?? "")
-          };
-        })
-      } : {}
-    });
+    const kiroRequest = buildUpstreamRequest(kind, params, operationId, modelId);
     const { response, credentialId: credentialId2, release } = await client.sendChatRequest(kiroRequest, controller.signal);
     operation.release = release;
-    emit(operationId, { type: "request_started", credentialId: credentialId2, reasoningSource: "kiro" });
+    emit(operationId, { type: "request_started", credentialId: credentialId2 });
     if (!response.body)
       throw new Error("upstream returned no response body");
-    const hasTools = isRecord4(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
+    const hasTools = isRecord5(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
     let stopReason = "end_turn";
     for await (const parsed of parseSSEStream(response.body, {
       parseTextToolCalls: hasTools,
@@ -22297,7 +22975,7 @@ async function startChat(id, params) {
   }
 }
 function cancelOperation(id, params) {
-  const operationId = isRecord4(params) && typeof params.operationId === "string" ? params.operationId : undefined;
+  const operationId = isRecord5(params) && typeof params.operationId === "string" ? params.operationId : undefined;
   if (!operationId) {
     reject(id, -32602, "cancel requires an operationId", { code: "INVALID_PARAMS" });
     return;
@@ -22312,7 +22990,7 @@ function cancelOperation(id, params) {
   finish(operationId, { type: "done", status: "cancelled", stopReason: "cancelled" });
 }
 async function invokeCommand(id, params) {
-  const contributionId = isRecord4(params) ? params.contributionId : undefined;
+  const contributionId = isRecord5(params) ? params.contributionId : undefined;
   if (typeof contributionId !== "string") {
     reject(id, -32602, "commands.invoke requires a contributionId", { code: "INVALID_PARAMS" });
     return;
@@ -22322,8 +23000,8 @@ async function invokeCommand(id, params) {
     reject(id, -32601, `Unknown command: ${contributionId}`, { code: "METHOD_NOT_FOUND" });
     return;
   }
-  const rawInput = isRecord4(params) ? params.input : undefined;
-  const config = isRecord4(rawInput) ? rawInput.config : undefined;
+  const rawInput = isRecord5(params) ? params.input : undefined;
+  const config = isRecord5(rawInput) ? rawInput.config : undefined;
   try {
     const manager = resolveManager(config);
     const result = await handler(rawInput, {
@@ -22347,7 +23025,7 @@ function handleRequest(message) {
   const { id, method, params } = message;
   switch (method) {
     case "initialize": {
-      const record = isRecord4(params) ? params : {};
+      const record = isRecord5(params) ? params : {};
       if (record.protocol !== RPC_PROTOCOL || record.pluginId !== PLUGIN_ID) {
         reject(id, -32602, "initialize identity or protocol mismatch", { code: "INVALID_PARAMS" });
         return;
@@ -22390,12 +23068,18 @@ function handleRequest(message) {
       listModels(id, params);
       return;
     case "provider.chat":
+      if (!active) {
+        reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
+        return;
+      }
+      startChat(id, params, "chat");
+      return;
     case "provider.generate":
       if (!active) {
         reject(id, -32009, "Plugin is not active", { code: "PLUGIN_UNAVAILABLE" });
         return;
       }
-      startChat(id, params);
+      startChat(id, params, "generate");
       return;
     case "provider.search":
       if (!active) {
