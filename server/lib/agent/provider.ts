@@ -10,6 +10,7 @@ import type {
 	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
+	ProviderTextCitation,
 	ReasoningProviderMetadata,
 	WebSearchAction,
 } from "@shared/codewhisperer/types";
@@ -59,6 +60,7 @@ export type {
 	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
+	ProviderTextCitation,
 	ReasoningProviderMetadata,
 	WebSearchAction,
 };
