@@ -182,10 +182,32 @@ export interface BuiltHistory {
 
 // === Stream event emitted by provider.chat() ===
 
+/**
+ * A single source citation reported by a provider for assistant text.
+ *
+ * Providers report positions in their own text coordinates, which may still
+ * contain internal citation markers. The agent loop is responsible for
+ * remapping these onto the cleaned text before persisting.
+ */
+export interface ProviderTextCitation {
+	/** Start of the cited range in provider text coordinates. */
+	startIndex?: number;
+	/** End of the cited range; the reference number renders here. */
+	endIndex: number;
+	url?: string;
+	title?: string;
+	/** Provider-internal reference id (never rendered verbatim). */
+	sourceRef?: string;
+	/** Provider-native content block index this citation belongs to. */
+	outputIndex?: number;
+}
+
 export interface ParsedStreamEvent {
 	text?: string;
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;
+	/** The provider has completed this text output item; flush its stream parser now. */
+	textItemDone?: boolean;
 	toolUses?: AgentToolUse[];
 	messageId?: string;
 	conversationId?: string;
@@ -280,6 +302,12 @@ export interface ParsedStreamEvent {
 		/** True when this event is the final output_item.done payload. */
 		final?: boolean;
 	};
+	/**
+	 * Source citations attached to assistant text (native web search).
+	 * Indices address the provider's own accumulated text for `outputIndex`;
+	 * the loop remaps them onto the cleaned visible text.
+	 */
+	textCitations?: ProviderTextCitation[];
 	/** Response ID from OpenAI Responses API (resp_...) for previous_response_id chaining */
 	responseId?: string;
 	/** Internal: set when Responses API format is detected from the gateway */
