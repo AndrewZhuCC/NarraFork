@@ -17,6 +17,7 @@ import { parseEventStream, type StreamEvent } from "./event-stream-parser";
 import { hasImportableSecret, normalizeImportCredentials } from "./import-normalize";
 import { KiroMcpClient } from "./mcp-client";
 import { MultiTokenManager } from "./multi-token-manager";
+import { isSuspendedExceptionType } from "./quota-check";
 import type {
 	DisabledReason,
 	KiroChatRequest,
@@ -29,6 +30,7 @@ import type {
 	SnapshotOptions,
 	UsageCacheEntry,
 } from "./types";
+import { KiroApiError } from "./types";
 import { kiroUsageFetchQueue } from "./usage-fetch-queue";
 
 let tokenManager: MultiTokenManager | null = null;
@@ -102,26 +104,93 @@ export function buildChatRequest(
 	};
 }
 
-/** Stream structured events from Claude via Kiro API. Accepts full request body. */
+/**
+ * Content event types that represent client-visible output.
+ *
+ * Replaying a request is only safe before any of these reached the consumer.
+ * `credentialIdEvent` is synthetic bookkeeping and `metering`/`contextUsage` are
+ * telemetry, so none of them block a replay.
+ */
+const CONTENT_EVENT_TYPES = new Set([
+	"assistantResponseEvent",
+	"toolUseEvent",
+	"codeReferenceEvent",
+	"followupPromptEvent",
+]);
+
+/**
+ * Stream structured events from Claude via Kiro API. Accepts full request body.
+ *
+ * ── Why this function owns suspension failover ──────────────────────────────
+ * Kiro replies over AWS event-stream, so an upstream verdict can arrive as an
+ * `exception` frame inside an HTTP **200** body. By then `sendChatRequest` has
+ * returned and already recorded the credential as successful, so its own retry
+ * loop can no longer react. An account suspension delivered that way therefore
+ * used to escape every failover path: the credential was never marked, never
+ * excluded, and the next request — including each compact retry — reselected the
+ * very same suspended account and surfaced the raw AWS JSON to the user.
+ *
+ * So the stream boundary attributes the failure itself: mark the credential, then
+ * replay the request on a healthy one. The replay is gated on having produced no
+ * content yet, because re-running a request that already streamed text would
+ * duplicate that text in the transcript. When output already exists we still mark
+ * the credential (so later requests skip it) and let the error propagate.
+ */
 export async function* kiroChatRaw(
 	request: KiroChatRequest,
 	signal?: AbortSignal,
 ): AsyncGenerator<StreamEvent> {
 	if (!apiClient) throw new Error("Kiro not initialized — call initKiro() first");
 
-	const { response: res, credentialId, release } = await apiClient.sendChatRequest(request, signal);
-	if (!res.body) {
-		release();
-		throw new Error("No response body");
-	}
+	let chat = await apiClient.sendChatRequest(request, signal);
 
-	try {
-		// Emit synthetic credential event so consumers can associate metering with the credential
-		yield { eventType: "credentialIdEvent", data: { credentialId } };
-		yield* parseEventStream(res.body);
-	} finally {
-		release();
+	// Bounded by the client's own replay budget; this loop only re-enters after a
+	// successful `retryWithNextCredential`, which decrements it and throws when
+	// spent.
+	while (true) {
+		const { response: res, credentialId, release } = chat;
+		if (!res.body) {
+			release();
+			throw new Error("No response body");
+		}
+
+		let emittedContent = false;
+		let suspensionError: KiroApiError | null = null;
+
+		try {
+			// Emit synthetic credential event so consumers can associate metering with the credential
+			yield { eventType: "credentialIdEvent", data: { credentialId } };
+			try {
+				for await (const evt of parseEventStream(res.body)) {
+					if (CONTENT_EVENT_TYPES.has(evt.eventType)) emittedContent = true;
+					yield evt;
+				}
+			} catch (err) {
+				if (!isSuspensionStreamError(err)) throw err;
+				suspensionError = err;
+			}
+		} finally {
+			release();
+		}
+
+		if (!suspensionError) return;
+
+		// Durable mark: a Kiro suspension is lifted by contacting support, not by
+		// waiting, so this is not a cooldown.
+		const hasAlternative = chat.reportStreamFailure("account_suspended");
+		if (emittedContent || !hasAlternative || signal?.aborted) throw suspensionError;
+
+		// Goes through the client so the replay inherits this call's
+		// `failedCredentialIds` (excluding the suspended credential) and its
+		// remaining replay budget.
+		chat = await chat.retryWithNextCredential();
 	}
+}
+
+/** Whether a stream error is an account suspension reported as an exception frame. */
+function isSuspensionStreamError(err: unknown): err is KiroApiError {
+	if (!(err instanceof KiroApiError)) return false;
+	return isSuspendedExceptionType(err.code, err.message);
 }
 
 /** Convenience: stream events from a simple text prompt. */
