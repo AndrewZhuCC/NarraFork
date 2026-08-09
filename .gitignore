@@ -61,3 +61,6 @@ kiro-cli*-linux-*.7z
 
 # Dynamic Spec runtime state (per-narrator task queue / planning notes)
 spec/
+
+# bun build cache
+.*.bun-build
