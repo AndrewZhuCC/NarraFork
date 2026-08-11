@@ -30,14 +30,19 @@ export type ReasoningSourceKey = string;
  * - Both present and equal → compatible (same server).
  * - Different → incompatible (cross-server, would fail verification).
  * - `stored` missing (legacy messages persisted before signatureSource
- *   existed) → treated as INCOMPATIBLE. Dropping a possibly-valid signature
- *   only costs a little thinking continuity (the text is still replayed as an
- *   unsigned thinking block, which upstreams accept), whereas echoing a
- *   cross-server signature causes a hard request failure. We choose the safe
- *   side.
+ *   existed) → treated as INCOMPATIBLE. Echoing a cross-server signature causes
+ *   a hard request failure, so we choose the safe side.
  * - `current` missing (provider does not expose a source, or does not mint
  *   signatures) → treated as INCOMPATIBLE for the same reason: we cannot prove
  *   the signature belongs to this upstream.
+ *
+ * "Incompatible" does NOT mean "replay the text with a blank signature". There is
+ * no unsigned thinking wire form on the Anthropic path: the official API rejects
+ * an empty or foreign signature with `Invalid \`signature\` in \`thinking\` block`,
+ * and the block sits in replayed history so the failure repeats every turn. A
+ * caller that cannot prove ownership of the signature must drop the whole block —
+ * Anthropic's own replay rule for a model change is "drop them silently". See
+ * `dropUnreplayableThinkingBlocks` in the Anthropic provider for the enforcement.
  */
 export function signatureSourcesCompatible(
 	stored: ReasoningSourceKey | undefined | null,
