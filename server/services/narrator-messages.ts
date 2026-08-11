@@ -1956,6 +1956,7 @@ export const narratorMessageQueries = {
 						target: true,
 						source: true,
 						content: true,
+						bodyJson: true,
 						orderIndex: true,
 						createdAt: true,
 					},

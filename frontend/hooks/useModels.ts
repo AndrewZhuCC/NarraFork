@@ -11,11 +11,7 @@ import {
 	mergeModels,
 	modelValue,
 } from "../lib/constants";
-import {
-	getProviderAgentModeCapability,
-	type ProviderCapabilityKey,
-	useRuntimeCapabilities,
-} from "./usePlatform";
+import type { ProviderCapabilityKey } from "./usePlatform";
 
 const MODELS_SETTINGS_QUERY_GC_TIME_MS = 60_000;
 const MODELS_SETTINGS_QUERY_STALE_TIME_MS = 30_000;
@@ -163,8 +159,6 @@ export function useAllModels() {
 		staleTime: MODELS_SETTINGS_QUERY_STALE_TIME_MS,
 		gcTime: MODELS_SETTINGS_QUERY_GC_TIME_MS,
 	});
-	const runtimeCapabilities = useRuntimeCapabilities();
-
 	// The shared NUG availability poller refreshes model availability while a
 	// narrator waits for a temporarily-unavailable model to recover. Re-fetch
 	// settings (which carry the NUG model list + `available` flags) so the picker
@@ -202,8 +196,9 @@ export function useAllModels() {
 		collectDisabledProviderPrefixes(settingsData?.nugProviders);
 		collectDisabledProviderPrefixes(settingsData?.clineProviders);
 		collectDisabledProviderPrefixes(settingsData?.geminiProviders);
-		const providerAgentModeSupported = (provider: ProviderCapabilityKey) =>
-			getProviderAgentModeCapability(runtimeCapabilities, provider).supported;
+		// Agent mode is supported for every provider: the capability that used to gate this
+		// had no signal behind it and always resolved to supported.
+		const providerAgentModeSupported = (_provider: ProviderCapabilityKey) => true;
 
 		// --- Kiro models ---
 		// Only show kiro models when kiro is available (has enabled credentials).
@@ -772,5 +767,5 @@ export function useAllModels() {
 			/** Set of disabled provider prefixes (for overview). */
 			disabledProviders,
 		};
-	}, [settingsData, runtimeCapabilities]);
+	}, [settingsData]);
 }

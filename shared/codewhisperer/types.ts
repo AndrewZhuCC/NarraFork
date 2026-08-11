@@ -10,6 +10,8 @@
  * the host's `types.ts`.
  */
 
+import type { SideCarBody } from "../sidecar-body";
+
 // === API error and bounded diagnostics ===
 
 export type ApiRequestDiagnosticSource =
@@ -114,7 +116,18 @@ export interface AgentSideCar {
 	id?: string;
 	target: AgentSideCarTarget;
 	source: string;
+	/**
+	 * The model-facing text, exactly as the model saw it. Still the ONLY thing
+	 * `appendSideCarsForApi` and every provider's buildHistory read.
+	 */
 	content: string;
+	/**
+	 * The same injection in structured form, for the UI to render without parsing
+	 * `content` back apart. Produced at the injection point alongside `content` (see
+	 * `sideCarBodyWithText`); absent on rows written before this existed, which the
+	 * UI shows verbatim instead. See `@shared/sidecar-body`.
+	 */
+	body?: SideCarBody;
 	orderIndex?: number;
 	toolUseId?: string | null;
 	knowledgeInjection?: {
