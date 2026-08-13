@@ -346,30 +346,34 @@ export function toKiroTools(tools: readonly unknown[] | undefined): KiroTool[] {
 /**
  * Give a JSON Schema at least one required property.
  *
+ * The required property is ALWAYS an injected dummy `confirm`, never an existing
+ * field: promoting the first declared property misrepresents the tool's contract
+ * (ExitPlanMode once advertised its advisory `allowedPrompts` as the only
+ * required parameter while the plan body stayed optional, so models fabricated
+ * content for it). A `const: true` dummy leaves no room to invent anything.
+ *
  * Behaviourally identical to the host's `ensureNonEmptySchema`
  * (`server/lib/agent/tool-registry.ts`), duplicated because that module imports zod and so
- * cannot be bundled into a plugin. `canonical-request.parity.test.ts` asserts the two agree
- * so this copy cannot drift.
+ * cannot be bundled into a plugin. `kiro-external-canonical-request.test.ts` asserts the two
+ * agree so this copy cannot drift.
  */
 function ensureRequiredProperty(schema: Record<string, unknown>): Record<string, unknown> {
-	const properties = isRecord(schema.properties) ? schema.properties : undefined;
 	const required = Array.isArray(schema.required) ? schema.required : undefined;
 	if (required && required.length > 0) return schema;
-	if (!properties || Object.keys(properties).length === 0) {
-		return {
-			...schema,
-			properties: {
-				confirm: {
-					type: "boolean",
-					description: "Dummy parameter (always pass true)",
-					const: true,
-					default: true,
-				},
+	const properties = isRecord(schema.properties) ? schema.properties : undefined;
+	return {
+		...schema,
+		properties: {
+			...(properties ?? {}),
+			confirm: {
+				type: "boolean",
+				description: "Dummy parameter (always pass true)",
+				const: true,
+				default: true,
 			},
-			required: ["confirm"],
-		};
-	}
-	return { ...schema, required: [Object.keys(properties)[0]] };
+		},
+		required: ["confirm"],
+	};
 }
 
 /** A user message under construction, before it is committed to history. */
