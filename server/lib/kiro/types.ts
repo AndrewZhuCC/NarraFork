@@ -234,6 +234,13 @@ export interface KiroConcurrencySnapshot {
 
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
+	paidEntries: CredentialSnapshot[];
+	enterpriseEntries: CredentialSnapshot[];
+	freeEntries: CredentialSnapshot[];
+	paidTotal: number;
+	enterpriseTotal: number;
+	freeTotal: number;
+	unhealthyTotal: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
@@ -241,6 +248,13 @@ export interface ManagerSnapshot {
 	concurrencyStates?: Record<string, KiroConcurrencySnapshot>;
 	rpmCounts?: Record<string, number>;
 	throttleCounts?: Record<string, { recent: number; total: number }>;
+}
+
+export interface SnapshotOptions {
+	paidPage?: number;
+	enterprisePage?: number;
+	freePage?: number;
+	pageSize?: number;
 }
 
 // --- Usage ---

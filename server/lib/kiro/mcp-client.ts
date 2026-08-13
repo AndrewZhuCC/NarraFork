@@ -181,6 +181,17 @@ export class KiroMcpClient {
 					lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
 					continue;
 				}
+				// Suspension can arrive as 400 here too — mirror the chat client so a
+				// suspended credential is durably marked and skipped instead of throwing
+				// a generic BAD_REQUEST that keeps reselecting it.
+				if (isAccountSuspended(resBody)) {
+					releaseHeld();
+					failedCredentialIds.add(ctx.id);
+					const hasAvailable = this.tokenManager.reportFailure(ctx.id, "account_suspended");
+					if (!hasAvailable) throw new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+					lastError = new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+					continue;
+				}
 				releaseHeld();
 				throw new KiroApiError("BAD_REQUEST", resBody, 400);
 			}
@@ -197,14 +208,16 @@ export class KiroMcpClient {
 			if (res.status === 401 || res.status === 403) {
 				releaseHeld();
 				failedCredentialIds.add(ctx.id);
+				const suspended = isAccountSuspended(resBody);
 				const hasAvailable = this.tokenManager.reportFailure(
 					ctx.id,
-					isAccountSuspended(resBody) ? "account_suspended" : undefined,
+					suspended ? "account_suspended" : undefined,
 				);
+				const code = suspended ? "ACCOUNT_SUSPENDED" : "AUTH_FAILED";
 				if (!hasAvailable) {
-					throw new KiroApiError("AUTH_FAILED", resBody, res.status);
+					throw new KiroApiError(code, resBody, res.status);
 				}
-				lastError = new KiroApiError("AUTH_FAILED", resBody, res.status);
+				lastError = new KiroApiError(code, resBody, res.status);
 				continue;
 			}
 
