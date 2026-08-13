@@ -10,8 +10,6 @@
  * the host's `types.ts`.
  */
 
-import type { SideCarBody } from "../sidecar-body";
-
 // === API error and bounded diagnostics ===
 
 export type ApiRequestDiagnosticSource =
@@ -108,38 +106,25 @@ export interface AgentToolUse {
 	thoughtSignatureSource?: string;
 }
 
-// === Side cars (host-injected context attached to messages) ===
+// === Knowledge-injection bookkeeping ===
 
-export type AgentSideCarTarget = "tool_result" | "user_message";
-
-export interface AgentSideCar {
-	id?: string;
-	target: AgentSideCarTarget;
-	source: string;
-	/**
-	 * The model-facing text, exactly as the model saw it. Still the ONLY thing
-	 * `appendSideCarsForApi` and every provider's buildHistory read.
-	 */
-	content: string;
-	/**
-	 * The same injection in structured form, for the UI to render without parsing
-	 * `content` back apart. Produced at the injection point alongside `content` (see
-	 * `sideCarBodyWithText`); absent on rows written before this existed, which the
-	 * UI shows verbatim instead. See `@shared/sidecar-body`.
-	 */
-	body?: SideCarBody;
-	orderIndex?: number;
-	toolUseId?: string | null;
-	knowledgeInjection?: {
-		narratorId: string;
-		compactSeq: number;
-		triggerToolCallId?: string | null;
-		hits: Array<{
-			entryId: string;
-			entryRevisionId?: string | null;
-			summary?: string | null;
-		}>;
-	};
+/**
+ * Knowledge-base hits an injection surfaced, carried alongside the content so the host
+ * can record them ONCE the content is durable.
+ *
+ * Recorded by the host rather than the producer because the de-dup key lives in the
+ * database: writing the record before the row lands would permanently suppress
+ * re-injecting those entries after a compact reloads the set from that table.
+ */
+export interface KnowledgeInjectionRecord {
+	narratorId: string;
+	compactSeq: number;
+	triggerToolCallId?: string | null;
+	hits: Array<{
+		entryId: string;
+		entryRevisionId?: string | null;
+		summary?: string | null;
+	}>;
 }
 
 // === Provider stream protocol ===
@@ -170,13 +155,6 @@ export interface DbMessage {
 	parentToolUseId: string | null;
 	messageUuid: string | null;
 	toolCalls?: DbToolCall[];
-	sideCars?: DbSideCar[];
-}
-
-export interface DbSideCar extends AgentSideCar {
-	messageId?: string | null;
-	toolUseId?: string | null;
-	createdAt?: string;
 }
 
 export interface DbToolCall {

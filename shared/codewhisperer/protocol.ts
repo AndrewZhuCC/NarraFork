@@ -21,12 +21,7 @@ import { parseErrorDiagnostics } from "./error-diagnostics";
 import { parseGatewaySSEEvent } from "./gateway-events";
 import { signatureSourcesCompatible } from "./reasoning-source";
 import { resolveModel } from "./resolve-model";
-import {
-	appendSideCarsForApi,
-	outputToText,
-	sideCarsForToolResult,
-	sideCarsForUserMessage,
-} from "./sidecar";
+import { outputToText } from "./tool-output";
 import type { DbMessage, ParsedStreamEvent } from "./types";
 
 /**
@@ -1556,7 +1551,6 @@ export async function buildKiroHistory(
 
 	const history: KiroHistoryMessage[] = [];
 	let pendingToolResults: KiroToolResult[] = [];
-	let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 	for (const msg of merged) {
 		if (msg.role === "assistant") {
@@ -1567,14 +1561,13 @@ export async function buildKiroHistory(
 			if (pendingToolResults.length > 0) {
 				history.push({
 					userInputMessage: {
-						content: appendSideCarsForApi("", pendingUserSideCars),
+						content: "",
 						modelId,
 						origin: "AI_EDITOR",
 						userInputMessageContext: { toolResults: pendingToolResults },
 					},
 				});
 				pendingToolResults = [];
-				pendingUserSideCars = [];
 			}
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -1594,14 +1587,13 @@ export async function buildKiroHistory(
 				if (pendingToolResults.length > 0) {
 					history.push({
 						userInputMessage: {
-							content: appendSideCarsForApi(searchSummary, pendingUserSideCars),
+							content: searchSummary,
 							modelId,
 							origin: "AI_EDITOR",
 							userInputMessageContext: { toolResults: pendingToolResults },
 						},
 					});
 					pendingToolResults = [];
-					pendingUserSideCars = [];
 				} else {
 					history.push({
 						userInputMessage: {
@@ -1681,13 +1673,9 @@ export async function buildKiroHistory(
 			if (msg.toolCalls) {
 				for (const tc of msg.toolCalls) {
 					if (tc.status === "success" || tc.status === "fail") {
-						const outputText = appendSideCarsForApi(
-							outputToText(tc.outputJson),
-							sideCarsForToolResult(msg.sideCars, tc.toolUseId),
-						);
 						pendingToolResults.push({
 							toolUseId: tc.toolUseId,
-							content: [{ text: outputText }],
+							content: [{ text: outputToText(tc.outputJson) }],
 							status: tc.status === "fail" ? "error" : "success",
 							isError: tc.status === "fail",
 						});
@@ -1695,10 +1683,8 @@ export async function buildKiroHistory(
 				}
 			}
 		} else if (msg.role === "user") {
-			const text = msg.contentText || "";
+			const userText = msg.contentText || "";
 			const ownerNarratorId = msg.narratorId ?? narratorId;
-
-			const userText = appendSideCarsForApi(text, pendingUserSideCars);
 
 			// Extract images from contentJson if narrator ownership is available.
 			// Image storage is host-owned, so resolution goes through the injected
@@ -1752,10 +1738,6 @@ export async function buildKiroHistory(
 			};
 			history.push(userMsg);
 			pendingToolResults = [];
-			pendingUserSideCars = [];
-		}
-		if (msg.role === "assistant") {
-			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		}
 	}
 
@@ -1769,10 +1751,14 @@ export async function buildKiroHistory(
 		}
 	}
 
+	// `trailingUserText` survives the side-car removal: it carries the trailing `sys`
+	// rows this builder lifts out of history (see the `trailingSysMessages` loop above),
+	// which Kiro needs as the current message because a trailing sys row would otherwise
+	// force a synthetic assistant "OK" and leave the real current message empty.
 	return {
 		history,
 		trailingToolResults: pendingToolResults,
-		trailingUserText: appendSideCarsForApi(trailingSysText, pendingUserSideCars) || undefined,
+		trailingUserText: trailingSysText || undefined,
 	};
 }
 

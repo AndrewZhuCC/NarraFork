@@ -1,13 +1,10 @@
 import type { ChatParams as ProtocolChatParams } from "@shared/codewhisperer/chat-params";
 import type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	BuiltHistory,
 	DbMessage,
-	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
 	ProviderTextCitation,
@@ -50,14 +47,11 @@ function isKiroProviderDisabled(): boolean {
 // `server/`. Re-exported here to keep existing host import paths working.
 
 export type {
-	AgentSideCar,
-	AgentSideCarTarget,
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
 	ApiRequestDiagnostics,
 	BuiltHistory,
 	DbMessage,
-	DbSideCar,
 	DbToolCall,
 	ParsedStreamEvent,
 	ProviderTextCitation,
