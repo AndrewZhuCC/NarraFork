@@ -1877,11 +1877,18 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		_turnIndex,
 		reason,
 	) => {
+		// A background compact mutates persisted history while the foreground loop is
+		// between requests. Serialize the hand-off here: do not let the next provider
+		// request race the marker write or rebuild from a half-settled compact.
+		if (compactLocks.has(narratorId)) {
+			await awaitCompactCompletion(narratorId);
+		}
+
 		// Check if a compact just finished — if so, force a full rebuild
 		// (history + system prompt) so the next API call uses compacted data.
 		// This takes priority over the prune-boundary check below because compact
 		// already clears the prune boundary and returns a fresh message set.
-		const compactJustDone = isCompactDone?.() ?? false;
+		const compactJustDone = (isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId);
 		if (compactJustDone) {
 			clearCompactDone?.();
 			// After compact, pruneBoundary is cleared — sync local cache
@@ -1892,6 +1899,18 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			where: eq(narrators.id, narratorId),
 			columns: { pruneBoundaryMessageId: true },
 		});
+		// The DB read above yields to the event loop, so a background compact may
+		// have acquired the lock after the first check. Re-check before returning
+		// a history replacement to keep the following provider call serialized.
+		if (compactLocks.has(narratorId)) {
+			await awaitCompactCompletion(narratorId);
+			const compactJustDoneAfterWait =
+				(isCompactDone?.() ?? false) || hasPendingHistoryCompact(narratorId);
+			if (compactJustDoneAfterWait) {
+				clearCompactDone?.();
+				return rebuildHistoryForCurrentContext(null, true);
+			}
+		}
 		const thresholds = getContextThresholds(getModel(), getProvider());
 		let newBoundary = row?.pruneBoundaryMessageId ?? null;
 		if (!isDynamicPruningWindowEnabled(thresholds) && newBoundary) {

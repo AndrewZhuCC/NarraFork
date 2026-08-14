@@ -570,6 +570,79 @@ export class OpenAIProvider implements ProviderAdapter {
 		return this.config.codexImageGeneration ?? true;
 	}
 
+	private get codexRemoteCompactEnabled(): boolean {
+		return this.config.codexRemoteCompact === true;
+	}
+
+	isRemoteCompactEnabled(): boolean {
+		return this.apiMode === "codex" && this.codexRemoteCompactEnabled;
+	}
+
+	async compactRemote(
+		input: unknown[],
+		model: string,
+		options?: {
+			conversationId?: string;
+			reasoningEffort?: ReasoningEffort;
+			signal?: AbortSignal;
+			trailingToolResults?: unknown[];
+		},
+	): Promise<{ items: unknown[] }> {
+		if (this.apiMode !== "codex") {
+			throw new Error("Remote compact is only supported for Codex providers");
+		}
+		if (!this.codexRemoteCompactEnabled) {
+			throw new Error("Codex remote compact is disabled");
+		}
+		if (!Array.isArray(input) || input.length === 0) {
+			throw new Error("Codex remote compact requires a non-empty input");
+		}
+		const apiKey = await this.getEffectiveApiKey();
+		if (!apiKey && !this.config.authorizationHeader?.trim()) {
+			throw new Error(`OpenAI API key not configured for provider "${this.config.name}".`);
+		}
+		const baseUrl = (this.config.baseUrl || defaultBaseUrl(this.apiMode)).replace(/\/+$/, "");
+		// Official Desktop 0.147 remote compact: POST {baseUrl}/responses
+		// (baseUrl already includes /v1 or /backend-api/codex). The model
+		// returns a compaction item with encrypted_content in the SSE stream.
+		const prepared = prepareCodexCompactInput(input, options?.trailingToolResults);
+		const body: Record<string, unknown> = {
+			model: parseModelId(model).model,
+			input: prepared,
+			stream: true,
+			store: false,
+		};
+		const conversationId = options?.conversationId?.trim();
+		const reasoningEffort = resolveCodexRequestReasoningEffort(model, options?.reasoningEffort);
+		applyCodexStableRequestFields(body, {
+			identity: createCodexRequestIdentity(conversationId),
+			reasoningEffort,
+		});
+		body.reasoning = {
+			effort: reasoningEffort,
+			summary: "detailed",
+			context: "all_turns",
+		};
+		body.stream_options = { reasoning_summary_delivery: "sequential_cutoff" };
+		const headers = this.buildHeaders(apiKey, options?.conversationId);
+		headers.Accept = "text/event-stream";
+		const response = await this.pfetch(`${baseUrl}/responses`, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(body),
+			signal: options?.signal,
+		});
+		const responseText = await response.text().catch(() => "");
+		if (!response.ok) {
+			throw createOpenAIApiError(response, responseText);
+		}
+		const items = parseCompactOutputItems(responseText);
+		if (items.length === 0) {
+			throw new Error("Codex remote compact response did not contain output items");
+		}
+		return { items };
+	}
+
 	/**
 	 * Proxy-aware fetch. Precedence:
 	 *   1. `this.proxy` — an already-resolved fixed proxy string passed by the
@@ -1548,6 +1621,235 @@ function parseResponsesJson(raw: string): {
 		output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string }> }>;
 		usage?: unknown;
 	}>(raw, "OpenAI API returned non-JSON responses payload");
+}
+
+/** Pull compaction items from a JSON or SSE /responses compact result. */
+function parseCompactOutputItems(raw: string): unknown[] {
+	const fromJson = (value: unknown): unknown[] => {
+		if (!value || typeof value !== "object") return [];
+		const output = (value as { output?: unknown }).output;
+		if (!Array.isArray(output)) return [];
+		return output.filter((item) => {
+			if (!item || typeof item !== "object") return false;
+			const type = (item as { type?: unknown }).type;
+			return type === "compaction" || type === "compaction_summary";
+		});
+	};
+
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		const items = fromJson(parsed);
+		if (items.length > 0) return items;
+	} catch {
+		// SSE stream
+	}
+
+	const collected = new Map<string, unknown>();
+	let completed: unknown[] = [];
+	for (const block of raw.split("\n\n")) {
+		const dataLines = block
+			.split("\n")
+			.filter((line) => line.startsWith("data:"))
+			.map((line) => line.slice(5).trim());
+		if (dataLines.length === 0) continue;
+		const data = dataLines.join("\n");
+		if (!data || data === "[DONE]") continue;
+		let event: { type?: string; item?: unknown; response?: { output?: unknown[] } };
+		try {
+			event = JSON.parse(data) as typeof event;
+		} catch {
+			continue;
+		}
+		if (event.type === "response.output_item.done" || event.type === "response.output_item.added") {
+			const item = event.item;
+			if (item && typeof item === "object") {
+				const type = (item as { type?: unknown }).type;
+				const id = (item as { id?: unknown }).id;
+				if (type === "compaction" || type === "compaction_summary") {
+					collected.set(typeof id === "string" && id ? id : `item-${collected.size}`, item);
+				}
+			}
+		}
+		if (event.type === "response.completed") {
+			completed = fromJson(event.response ?? {});
+		}
+	}
+	if (completed.length > 0) return completed;
+	return [...collected.values()];
+}
+
+const CODEX_ID_PREFIX_BY_TYPE: Record<string, string> = {
+	message: "msg_",
+	reasoning: "rs_",
+	custom_tool_call: "ctc_",
+	custom_tool_call_output: "ctco_",
+	function_call: "fc_",
+	compaction: "cmp_",
+	compaction_summary: "cmp_",
+};
+
+function ensureCodexIdPrefix(id: string, prefix: string): string {
+	if (
+		id.startsWith("msg_") ||
+		id.startsWith("rs_") ||
+		id.startsWith("ctc_") ||
+		id.startsWith("ctco_") ||
+		id.startsWith("fc_") ||
+		id.startsWith("cmp_") ||
+		id.startsWith("call_")
+	) {
+		return id;
+	}
+	return `${prefix}${id}`;
+}
+
+/** Rewrite item ids to official Codex prefixes captured from Desktop compact. */
+function rewriteCompactIds(messages: unknown[]): unknown[] {
+	if (!Array.isArray(messages)) return messages;
+	return messages.map((msg) => {
+		if (!msg || typeof msg !== "object") return msg;
+		const source = msg as Record<string, unknown>;
+		const next: Record<string, unknown> = { ...source };
+		const type = typeof next.type === "string" ? next.type : "";
+		const role = typeof next.role === "string" ? next.role : "";
+		const prefix =
+			CODEX_ID_PREFIX_BY_TYPE[type] ??
+			(role === "user" || role === "assistant" || role === "developer" ? "msg_" : "msg_");
+		if (typeof next.id === "string" && next.id) {
+			next.id = ensureCodexIdPrefix(next.id, prefix);
+		}
+		if (typeof next.call_id === "string" && next.call_id) {
+			next.call_id = ensureCodexIdPrefix(next.call_id, "call_");
+		}
+		return next;
+	});
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function compactItemType(item: unknown): string {
+	return isRecord(item) && typeof item.type === "string" ? item.type : "";
+}
+
+function compactCallId(item: unknown): string {
+	return isRecord(item) && typeof item.call_id === "string" ? item.call_id : "";
+}
+
+function normalizeTrailingCompactOutput(item: unknown): unknown | null {
+	if (!isRecord(item)) return null;
+	if (item.type === "function_call_output" && typeof item.call_id === "string") {
+		return {
+			type: "function_call_output",
+			call_id: item.call_id,
+			output: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? ""),
+		};
+	}
+	if (typeof item.call_id === "string" && item.output != null && item.type == null) {
+		return {
+			type: "function_call_output",
+			call_id: item.call_id,
+			output: typeof item.output === "string" ? item.output : JSON.stringify(item.output),
+		};
+	}
+	return null;
+}
+
+function mergeCodexCompactHistory(
+	history: unknown[],
+	trailingToolResults: unknown[] = [],
+): unknown[] {
+	const withoutTrigger = (Array.isArray(history) ? history : []).filter(
+		(item) => compactItemType(item) !== "compaction_trigger",
+	);
+	const extras = trailingToolResults
+		.map(normalizeTrailingCompactOutput)
+		.filter((item): item is Record<string, unknown> => item != null);
+	return rewriteCompactIds([...withoutTrigger, ...extras]);
+}
+
+function compactOutputCallIds(items: unknown[]): Set<string> {
+	return new Set(
+		items.filter((item) => compactItemType(item) === "function_call_output").map(compactCallId),
+	);
+}
+
+/** Call ids that have a `function_call` but no matching output after trailing results are applied. */
+export function findUnpairedCodexFunctionCallIds(
+	history: unknown[],
+	trailingToolResults: unknown[] = [],
+): string[] {
+	const merged = mergeCodexCompactHistory(history, trailingToolResults);
+	const outputIds = compactOutputCallIds(merged);
+	return merged
+		.filter((item) => compactItemType(item) === "function_call")
+		.map(compactCallId)
+		.filter((callId) => callId && !outputIds.has(callId));
+}
+
+function toolUseIdAliases(id: string): string[] {
+	const raw = id.startsWith("call_") ? id.slice("call_".length) : id;
+	return raw && raw !== id ? [id, raw, `call_${raw}`] : [id, `call_${id}`];
+}
+
+function messageToolUseIds(message: DbMessage): string[] {
+	const ids: string[] = [];
+	for (const toolCall of message.toolCalls ?? []) {
+		if (toolCall.toolUseId) ids.push(toolCall.toolUseId);
+	}
+	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	for (const block of blocks) {
+		if (!isRecord(block) || block.type !== "tool_use") continue;
+		if (typeof block.id === "string" && block.id) ids.push(block.id);
+	}
+	return ids;
+}
+
+/**
+ * Keep the first assistant that still has an unpaired tool call *after* the
+ * compact marker by clipping the compact window to the messages before it.
+ */
+export function clipMessagesBeforeUnpairedToolCalls(
+	messages: DbMessage[],
+	unpairedCallIds: string[],
+): { messages: DbMessage[]; beforeMessageId?: string; clipped: boolean } {
+	if (unpairedCallIds.length === 0) {
+		return { messages, clipped: false };
+	}
+	const unpaired = new Set(unpairedCallIds.flatMap(toolUseIdAliases));
+	const index = messages.findIndex((message) =>
+		messageToolUseIds(message).some((id) => unpaired.has(id)),
+	);
+	if (index < 0) {
+		return { messages, clipped: false };
+	}
+	return {
+		messages: messages.slice(0, index),
+		beforeMessageId: messages[index]?.id,
+		clipped: true,
+	};
+}
+
+/**
+ * Mid-turn compact often ends on an in-flight tool call. Official Codex
+ * compact hangs or returns no compaction item if the last `function_call`
+ * has no matching `function_call_output`. Append trailing outputs, drop
+ * still-unpaired calls, and keep a single `compaction_trigger` at the end.
+ */
+export function prepareCodexCompactInput(
+	history: unknown[],
+	trailingToolResults: unknown[] = [],
+): unknown[] {
+	const merged = mergeCodexCompactHistory(history, trailingToolResults);
+	const outputIds = compactOutputCallIds(merged);
+	const closed = merged.filter((item) => {
+		if (compactItemType(item) !== "function_call") return true;
+		const callId = compactCallId(item);
+		return !callId || outputIds.has(callId);
+	});
+	closed.push({ type: "compaction_trigger" });
+	return closed;
 }
 
 /** Extract text from a Responses API output array. */

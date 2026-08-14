@@ -141,9 +141,55 @@ export interface GenerateMetaResult {
 	meterUnit?: string;
 }
 
+export interface RemoteCompactResult {
+	items: unknown[];
+	summary?: string;
+	usage?: UsageData | null;
+}
+
+export interface RemoteCompactCapableProvider {
+	compactRemote(
+		input: unknown[],
+		model: string,
+		options?: {
+			conversationId?: string;
+			reasoningEffort?: ChatParams["reasoningEffort"];
+			signal?: AbortSignal;
+			trailingToolResults?: unknown[];
+		},
+	): Promise<RemoteCompactResult>;
+}
+
+export function isRemoteCompactCapableProvider(
+	adapter: ProviderAdapter,
+): adapter is ProviderAdapter & RemoteCompactCapableProvider {
+	return typeof adapter.compactRemote === "function";
+}
+
+/**
+ * Official Codex OAuth plus API-key Codex relays both speak the Codex
+ * `/responses` remote-compaction protocol. Detect the protocol, not the
+ * provider prefix. Each adapter still enforces its own remote-compact switch.
+ */
+export function isCodexRemoteCompactAdapter(adapter: ProviderAdapter): boolean {
+	if (!isRemoteCompactCapableProvider(adapter)) return false;
+	if (adapter instanceof CodexProvider) return true;
+	return adapter instanceof OpenAIProvider && adapter.apiMode === "codex";
+}
+
+/** True when this adapter is a Codex compact endpoint and its own switch is on. */
+export function isCodexRemoteCompactEnabled(adapter: ProviderAdapter): boolean {
+	if (!isCodexRemoteCompactAdapter(adapter)) return false;
+	if (adapter instanceof CodexProvider) return adapter.isRemoteCompactEnabled();
+	return adapter instanceof OpenAIProvider && adapter.isRemoteCompactEnabled();
+}
+
 // === The adapter interface ===
 
 export interface ProviderAdapter {
+	/** Optional provider-native history compaction capability. */
+	compactRemote?: RemoteCompactCapableProvider["compactRemote"];
+
 	/** Convert ToolDefinition[] to provider-specific tool format */
 	formatTools(tools: import("./types").ResolvedToolDefinition[]): unknown[];
 
@@ -290,6 +336,7 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 			useWebSocket: settings.codex?.useWebSocket ?? true,
 			useWebSearch: settings.codex?.useWebSearch ?? true,
 			useImageGeneration: settings.codex?.useImageGeneration ?? true,
+			useRemoteCompact: settings.codex?.useRemoteCompact ?? false,
 		});
 	}
 

@@ -155,6 +155,50 @@ describe("narrator model history projection", () => {
 		]);
 	});
 
+	test("keeps a remote-compact marker in model history so encrypted items can be replayed", async () => {
+		await seedNarrator("n-remote");
+		await seedMessage({
+			id: "m-old",
+			narratorId: "n-remote",
+			seq: 1,
+			role: "user",
+			contentText: "old",
+		});
+		await seedMessage({
+			id: "m-remote-compact",
+			narratorId: "n-remote",
+			seq: 2,
+			role: "system",
+			contentText: "Remote Codex compact completed.",
+			contentJson: [
+				{
+					type: "compact",
+					status: "compacted",
+					summary: "Remote Codex compact completed.",
+					remoteCompact: {
+						provider: "codex",
+						version: 1,
+						items: [{ type: "compaction", id: "cmp_1", encrypted_content: "enc" }],
+						model: "ks.codexlb:gpt-5.6-sol",
+						completedAt: now,
+						source: "remote",
+					},
+				},
+			],
+			isCompact: true,
+		});
+		await seedMessage({
+			id: "m-after-remote",
+			narratorId: "n-remote",
+			seq: 3,
+			role: "user",
+			contentText: "continue",
+		});
+
+		const messages = await narratorService.getModelHistorySinceLastCompact("n-remote");
+		expect(messages.map((message) => message.id)).toEqual(["m-remote-compact", "m-after-remote"]);
+	});
+
 	test("excludes metadata-only empty reasoning without hiding trailing tool results", async () => {
 		await seedNarrator();
 		await seedMessage({

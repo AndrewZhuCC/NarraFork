@@ -257,7 +257,9 @@ export function useVListLabels(): VListLabels {
 		() => ({
 			// ── compact / segment-compact indicator lines ───────────────────────────
 			compacting: t("compacting"),
+			compactingRemote: t("compactingRemote"),
 			compacted: t("compacted"),
+			compactedRemote: t("compactedRemote"),
 			compactFailed: t("compactFailed"),
 			compactOutputChars: t("compactOutputChars", { count: COUNT_PLACEHOLDER }),
 			compactThinking: t("compactThinking"),

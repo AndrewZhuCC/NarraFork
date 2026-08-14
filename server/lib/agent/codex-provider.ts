@@ -119,6 +119,8 @@ export interface CodexProviderOptions {
 	useWebSearch?: boolean;
 	/** Allow the native image_generation tool to be sent to Codex models. */
 	useImageGeneration?: boolean;
+	/** Use the official remote Responses compact endpoint. */
+	useRemoteCompact?: boolean;
 }
 
 /**
@@ -133,6 +135,7 @@ export class CodexProvider implements ProviderAdapter {
 	private useWebSocket: boolean;
 	private useWebSearch: boolean;
 	private useImageGeneration: boolean;
+	private useRemoteCompact: boolean;
 	/** Cached dummy provider for synchronous operations (formatToolResult, pushUserTurn, etc.) */
 	private dummyProvider: OpenAIProvider;
 
@@ -145,6 +148,7 @@ export class CodexProvider implements ProviderAdapter {
 		this.useWebSocket = options?.useWebSocket ?? true;
 		this.useWebSearch = options?.useWebSearch ?? true;
 		this.useImageGeneration = options?.useImageGeneration ?? true;
+		this.useRemoteCompact = options?.useRemoteCompact ?? false;
 		// Create dummy provider once and reuse it
 		this.dummyProvider = new OpenAIProvider({
 			id: "codex",
@@ -156,6 +160,7 @@ export class CodexProvider implements ProviderAdapter {
 			apiMode: "codex",
 			codexWebSearch: this.useWebSearch,
 			codexImageGeneration: this.useImageGeneration,
+			codexRemoteCompact: this.useRemoteCompact,
 			...codexFingerprintConfig(),
 		});
 	}
@@ -210,6 +215,7 @@ export class CodexProvider implements ProviderAdapter {
 				codexAccountId: ctx.credential.accountId,
 				codexWebSearch: this.useWebSearch,
 				codexImageGeneration: this.useImageGeneration,
+				codexRemoteCompact: this.useRemoteCompact,
 				...codexFingerprintConfig(),
 			},
 			proxy,
@@ -439,6 +445,28 @@ export class CodexProvider implements ProviderAdapter {
 			codexImageGeneration: this.useImageGeneration,
 		});
 		return dummy.formatTools(tools);
+	}
+
+	async compactRemote(
+		input: unknown[],
+		model: string,
+		options?: {
+			conversationId?: string;
+			reasoningEffort?: ChatParams["reasoningEffort"];
+			signal?: AbortSignal;
+			trailingToolResults?: unknown[];
+		},
+	): Promise<{ items: unknown[] }> {
+		if (!this.useRemoteCompact) {
+			throw new Error("Codex remote compact is disabled");
+		}
+		return this.runWithFailover("compact", (provider) =>
+			provider.compactRemote(input, model, options),
+		);
+	}
+
+	isRemoteCompactEnabled(): boolean {
+		return this.useRemoteCompact;
 	}
 
 	async buildHistory(

@@ -28,6 +28,44 @@ export interface CompactAttempt {
  * All fields beyond `type` and `status` remain optional so messages written by
  * older NarraFork versions continue to parse and render normally.
  */
+export interface CodexRemoteCompactPayload {
+	provider: "codex";
+	version: 1;
+	items: unknown[];
+	model: string;
+	completedAt: string;
+	source?: "remote";
+}
+
+export function summarizeCodexRemoteItems(items: unknown[]): {
+	count: number;
+	types: Record<string, number>;
+	idPrefixes: string[];
+	encryptedCount: number;
+} {
+	const types: Record<string, number> = {};
+	const idPrefixes: string[] = [];
+	let encryptedCount = 0;
+	for (const item of items) {
+		if (!item || typeof item !== "object") continue;
+		const record = item as Record<string, unknown>;
+		const type =
+			typeof record.type === "string"
+				? record.type
+				: typeof record.role === "string"
+					? record.role
+					: "unknown";
+		types[type] = (types[type] ?? 0) + 1;
+		if (typeof record.id === "string" && record.id) {
+			idPrefixes.push(record.id.slice(0, 12));
+		}
+		if (typeof record.encrypted_content === "string" && record.encrypted_content.length > 0) {
+			encryptedCount += 1;
+		}
+	}
+	return { count: items.length, types, idPrefixes, encryptedCount };
+}
+
 export interface CompactMessageBlock {
 	type: "compact";
 	status: CompactMessageStatus;
@@ -51,6 +89,9 @@ export interface CompactMessageBlock {
 	attempts?: CompactAttempt[];
 	/** Successful compact boundary observed when a failed marker retry was prepared. */
 	retryBaseCompactMessageId?: string | null;
+	/** Set while a Codex remote compact is in flight (and kept after success). */
+	source?: "remote" | "local";
+	remoteCompact?: CodexRemoteCompactPayload;
 	[key: string]: unknown;
 }
 

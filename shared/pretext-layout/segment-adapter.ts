@@ -1300,7 +1300,9 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	reasoningCount: "{count} reasoning steps",
 	toolGeneric: "Tool",
 	compacting: "Compacting context…",
+	compactingRemote: "Requesting Codex remote compact…",
 	compacted: "Context compacted",
+	compactedRemote: "Compacted with Codex remote compact",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
 	compactThinking: "thinking",
@@ -1480,9 +1482,17 @@ function composeCompactText(
 		thinkingChars?: number | null;
 		outputChars?: number | null;
 		messageCount?: number | null;
+		isRemote?: boolean;
 	},
 ): string {
 	if (opts.status === "compacting") {
+		const remoteWaiting =
+			opts.isRemote &&
+			opts.phase !== "thinking" &&
+			!(typeof opts.outputChars === "number" && opts.outputChars > 0);
+		if (remoteWaiting) {
+			return sysLabel(ctx, "compactingRemote");
+		}
 		// Thinking phase: the summary model has not produced visible output yet, so
 		// feature the thinking count instead of a stuck "0 chars". A count below the
 		// display threshold shows the bare label (see `@shared/progress-phase`).
@@ -1508,7 +1518,7 @@ function composeCompactText(
 		const count = typeof opts.messageCount === "number" ? opts.messageCount : 0;
 		return sysLabel(ctx, "segmentCompacted").replace(/\{count\}/g, String(count));
 	}
-	return sysLabel(ctx, "compacted");
+	return sysLabel(ctx, opts.isRemote ? "compactedRemote" : "compacted");
 }
 
 /**
@@ -1708,6 +1718,9 @@ function adaptSystemSimpleData(
 					: block.status === "failed"
 						? "failed"
 						: "compacted";
+			const isRemote =
+				block.source === "remote" ||
+				(!!block.remoteCompact && typeof block.remoteCompact === "object");
 			return {
 				kind: "compact",
 				// The label is synthesized from status (parity with CompactIndicator);
@@ -1718,6 +1731,7 @@ function adaptSystemSimpleData(
 					phase: block.progressPhase,
 					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
+					isRemote,
 				}),
 				status: compactStatus,
 				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),

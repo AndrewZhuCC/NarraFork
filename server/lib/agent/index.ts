@@ -1,3 +1,4 @@
+import { summarizeCodexRemoteItems } from "@shared/compact-message";
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
@@ -7,6 +8,7 @@ import { isRetryableError } from "./loop";
 import {
 	type BuiltHistory,
 	type GenerateOptions,
+	isCodexRemoteCompactAdapter,
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
@@ -18,6 +20,20 @@ import { initTruncateCleanup } from "./truncate";
 
 // Start periodic cleanup of truncated output files
 initTruncateCleanup();
+
+/** First injection of a compact marker stays info; later rebuilds are debug. */
+const loggedRemoteCompactInjections = new Set<string>();
+const MAX_LOGGED_REMOTE_COMPACT_INJECTIONS = 256;
+
+function rememberRemoteCompactInjection(key: string): boolean {
+	if (loggedRemoteCompactInjections.has(key)) return false;
+	loggedRemoteCompactInjections.add(key);
+	if (loggedRemoteCompactInjections.size > MAX_LOGGED_REMOTE_COMPACT_INJECTIONS) {
+		const oldest = loggedRemoteCompactInjections.values().next().value;
+		if (oldest !== undefined) loggedRemoteCompactInjections.delete(oldest);
+	}
+	return true;
+}
 
 export { KiroProvider } from "./kiro-provider";
 export type { ReflectionLoopRunOptions } from "./loop";
@@ -85,6 +101,58 @@ export async function buildHistory(
 		provider: resolved.provider,
 		model: resolved.model,
 	});
+	const remoteCompactMarker = uniqueMessages.find((message) => {
+		if (message.role !== "system") return false;
+		const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+		return blocks.some((block) => {
+			if (!block || typeof block !== "object") return false;
+			const remote = (block as Record<string, unknown>).remoteCompact;
+			return (
+				remote &&
+				typeof remote === "object" &&
+				Array.isArray((remote as Record<string, unknown>).items)
+			);
+		});
+	});
+	if (isCodexRemoteCompactAdapter(resolved.adapter) && remoteCompactMarker) {
+		const blocks = (remoteCompactMarker.contentJson as unknown[]).filter(
+			(block): block is Record<string, unknown> => !!block && typeof block === "object",
+		);
+		const remote = blocks.find((block) => {
+			const value = block.remoteCompact;
+			return (
+				value &&
+				typeof value === "object" &&
+				Array.isArray((value as Record<string, unknown>).items)
+			);
+		})?.remoteCompact as { items: unknown[] } | undefined;
+		if (remote) {
+			const history = await resolved.adapter.buildHistory(
+				uniqueMessages,
+				resolved.model,
+				narratorId,
+			);
+			const nextHistory = [
+				...remote.items,
+				...history.history.filter((item) => item !== remoteCompactMarker),
+			];
+			const injection = {
+				narratorId,
+				...summarizeCodexRemoteItems(remote.items),
+				historyCount: nextHistory.length,
+			};
+			const injectionKey = `${narratorId}:${remoteCompactMarker.id}`;
+			if (rememberRemoteCompactInjection(injectionKey)) {
+				logger.info("Codex remote compact items injected into next history", injection);
+			} else {
+				logger.debug("Codex remote compact items injected into next history", injection);
+			}
+			return {
+				history: nextHistory,
+				trailingToolResults: history.trailingToolResults,
+			};
+		}
+	}
 	return resolved.adapter.buildHistory(uniqueMessages, resolved.model, narratorId);
 }
 

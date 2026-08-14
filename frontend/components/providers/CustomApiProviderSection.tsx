@@ -579,6 +579,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 							checked={provider.codexImageGeneration !== false}
 							onChange={(e) => updateProvider("codexImageGeneration", e.currentTarget.checked)}
 						/>
+						<Switch
+							label={t("openaiCodexRemoteCompact")}
+							description={t("openaiCodexRemoteCompactDesc")}
+							size="xs"
+							checked={provider.codexRemoteCompact === true}
+							onChange={(e) => updateProvider("codexRemoteCompact", e.currentTarget.checked)}
+						/>
 					</>
 				)}
 
