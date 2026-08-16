@@ -207,7 +207,11 @@ export class GrokProvider implements ProviderAdapter {
 		const model = parseModelId(params.model).model;
 		const body: Record<string, unknown> = {
 			model,
-			input: messages.map((m) => ({ role: m.role, content: m.content })),
+			// Responses input items keep their full shape: `function_call_output` /
+			// `function_call` entries carry type/call_id/name, which the flat
+			// {role, content} remap would drop and the gateway rejects
+			// ("input[i].content 必须是字符串或数组").
+			input: messages,
 			stream: true,
 			store: false,
 		};
@@ -494,7 +498,7 @@ export class GrokProvider implements ProviderAdapter {
 
 		for (const msg of topLevel) {
 			if (msg.role === "assistant") {
-				history.push(this.assistantToResponsesMessage(msg));
+				history.push(...this.assistantToResponsesMessage(msg));
 				pendingToolResults = [];
 			} else if (msg.role === "user") {
 				history.push({
@@ -510,7 +514,7 @@ export class GrokProvider implements ProviderAdapter {
 		return { history, trailingToolResults: pendingToolResults };
 	}
 
-	private assistantToResponsesMessage(msg: DbMessage): GrokResponsesMessage {
+	private assistantToResponsesMessage(msg: DbMessage): GrokResponsesMessage[] {
 		const text = this.messageText(msg);
 		const result: GrokResponsesMessage[] = [];
 		if (text) {
@@ -527,7 +531,8 @@ export class GrokProvider implements ProviderAdapter {
 				arguments: JSON.stringify(block.input ?? {}),
 			});
 		}
-		return result[0] ?? { role: "assistant", content: null };
+		if (result.length === 0) result.push({ role: "assistant" });
+		return result;
 	}
 
 	private messageText(msg: DbMessage): string {
@@ -604,6 +609,11 @@ export class GrokProvider implements ProviderAdapter {
 					}),
 				);
 			}
+			// An assistant message with neither content nor tool calls must still
+			// carry a content array — the gateway rejects a missing/null content.
+			if (m.role === "assistant" && m.content == null) {
+				return [{ ...m, content: [] }];
+			}
 			return [m];
 		});
 	}
@@ -674,10 +684,16 @@ export class GrokProvider implements ProviderAdapter {
 	): AsyncGenerator<ParsedStreamEvent> {
 		const decoder = new TextDecoder();
 		let buffer = "";
+		// Keyed by output_index (like OpenAIProvider): `function_call_arguments.delta`
+		// carries item_id but NOT call_id, and item_id differs from the accumulator id.
 		const toolAccum = new Map<
-			string,
-			{ name: string; args: string; emitted: boolean }
+			number,
+			{ callId: string; name: string; args: string; emitted: boolean }
 		>();
+		// Tracks whether reasoning text was already streamed via delta events; the
+		// trailing `.done` full-text event must then be skipped (mirrors
+		// OpenAIProvider's emitOnlyIfAccumulatorEmpty).
+		const reasoningSeen = new Set<number>();
 		const textOutputIndex = 0;
 
 		const reader = body.getReader();
@@ -726,6 +742,9 @@ export class GrokProvider implements ProviderAdapter {
 							type === "response.reasoning_text.delta") &&
 						typeof payload.delta === "string"
 					) {
+						if (payload.output_index != null) {
+							reasoningSeen.add(payload.output_index);
+						}
 						event.reasoning = payload.delta;
 						yield event;
 						continue;
@@ -735,6 +754,15 @@ export class GrokProvider implements ProviderAdapter {
 							type === "response.reasoning_text.done") &&
 						typeof payload.text === "string"
 					) {
+						// Delta events already streamed the text; emitting the full
+						// `.done` text again duplicates every block (same sentence
+						// twice). Only fall back to it when nothing was streamed.
+						if (
+							payload.output_index != null &&
+							reasoningSeen.has(payload.output_index)
+						) {
+							continue;
+						}
 						event.reasoning = payload.text;
 						yield event;
 						continue;
@@ -747,19 +775,21 @@ export class GrokProvider implements ProviderAdapter {
 						if (!item) continue;
 						const finalize = type === "response.output_item.done";
 						if (item.type === "message") {
-							const text = readContentText(item.content);
-							if (finalize && text) {
-								event.text = text;
-								event.textOutputIndex = payload.output_index;
+							// The text is already streamed via output_text.delta; the
+							// finalized item must NOT re-emit the full text or every
+							// sentence appears twice. Only surface the stable item id
+							// (mirrors OpenAIProvider).
+							if (item.id) {
+								event.messageId = item.id;
 								yield event;
 							}
 							continue;
 						}
 						if (item.type === "reasoning") {
-							const reasoning = readReasoningItem(item);
-							if (finalize && reasoning) {
-								event.reasoning = reasoning;
-								event.reasoningOutputIndex = payload.output_index;
+							// Reasoning text already streamed via reasoning_text.delta;
+							// the finalized item must not re-emit it.
+							if (item.id) {
+								event.messageId = item.id;
 								yield event;
 							}
 							continue;
@@ -786,15 +816,12 @@ export class GrokProvider implements ProviderAdapter {
 							yield event;
 							continue;
 						}
-						if (
-							item.type === "custom_tool_call" &&
-							isXSearchInternalTool(item.name)
-						) {
-							// x_search is executed upstream as internal custom tools
-							// (x_semantic_search / x_keyword_search). They are already complete
-							// by the time they appear here — their results are folded into the
-							// assistant text with url_citation annotations — so they must NOT be
-							// executed by the host. Surface them as search activity instead.
+						if (item.type === "custom_tool_call") {
+							// custom_tool_call items are upstream-internal (x_search expands
+							// into x_semantic_search / x_keyword_search / x_thread_fetch etc).
+							// They are already executed upstream — their results are folded
+							// into the assistant text with url_citation annotations — so they
+							// must never be executed by the host. Surface as search activity.
 							const id =
 								firstString(item.id, item.call_id) ??
 								`${item.name}-${item.name}`;
@@ -808,33 +835,39 @@ export class GrokProvider implements ProviderAdapter {
 							yield event;
 							continue;
 						}
-						if (
-							item.type === "function_call" ||
-							item.type === "custom_tool_call"
-						) {
-							const id = firstString(item.id, item.call_id) ?? "";
+						if (item.type === "function_call") {
+							const idx = payload.output_index;
+							const callId = item.call_id ?? item.id ?? "";
 							const name = item.name ?? "";
-							if (!id || !name) continue;
-							if (finalize) {
-								const args = firstString(item.arguments, item.input) ?? "";
-								let input: Record<string, unknown> = {};
-								try {
-									input = JSON.parse(args) as Record<string, unknown>;
-								} catch {
-									input = { _raw: args };
+							if (idx == null || !callId || !name) continue;
+							const existing = toolAccum.get(idx);
+							if (existing && existing.callId === callId) {
+								// Finalize on output_item.done when arguments never arrived
+								// via the delta/done events (some gateways skip them).
+								if (finalize && !existing.emitted) {
+									existing.emitted = true;
+									event.toolUseChunk = {
+										toolUseId: callId,
+										name,
+										stop: true,
+									};
+									yield event;
 								}
-								event.toolUses = [{ toolUseId: id, name, input }];
-								yield event;
-							} else {
-								toolAccum.set(id, { name, args: "", emitted: false });
-								event.toolUseChunk = {
-									toolUseId: id,
-									name,
-									input: undefined,
-									stop: false,
-								};
-								yield event;
+								continue;
 							}
+							toolAccum.set(idx, {
+								callId,
+								name,
+								args: "",
+								emitted: false,
+							});
+							event.toolUseChunk = {
+								toolUseId: callId,
+								name,
+								input: undefined,
+								stop: false,
+							};
+							yield event;
 							continue;
 						}
 						continue;
@@ -843,14 +876,14 @@ export class GrokProvider implements ProviderAdapter {
 						type === "response.function_call_arguments.delta" ||
 						type === "response.custom_tool_call_input.delta"
 					) {
-						const id = payload.item_id ?? "";
-						if (!id) continue;
-						const name = toolAccum.get(id)?.name ?? "";
-						if (name && isXSearchInternalTool(name)) continue;
+						const idx = payload.output_index;
+						const acc = idx != null ? toolAccum.get(idx) : undefined;
+						if (!acc || acc.emitted) continue;
 						const detail = payload.delta ?? "";
+						acc.args += detail;
 						event.toolUseChunk = {
-							toolUseId: id,
-							name,
+							toolUseId: acc.callId,
+							name: acc.name,
 							input: detail,
 							stop: false,
 						};
@@ -861,14 +894,15 @@ export class GrokProvider implements ProviderAdapter {
 						type === "response.function_call_arguments.done" ||
 						type === "response.custom_tool_call_input.done"
 					) {
-						const id = payload.item_id ?? "";
-						const name = toolAccum.get(id)?.name ?? "";
-						if (name && isXSearchInternalTool(name)) continue;
-						const args = firstString(payload.arguments, payload.input) ?? "";
+						const idx = payload.output_index;
+						const acc = idx != null ? toolAccum.get(idx) : undefined;
+						if (!acc || acc.emitted) continue;
+						const complete = firstString(payload.arguments, payload.input);
+						if (typeof complete === "string") acc.args = complete;
+						acc.emitted = true;
 						event.toolUseChunk = {
-							toolUseId: id,
-							name,
-							input: args,
+							toolUseId: acc.callId,
+							name: acc.name,
 							stop: true,
 						};
 						yield event;
@@ -929,9 +963,8 @@ function readContentText(content: unknown): string {
 	return parts.join("");
 }
 
-function readReasoningItem(item: GrokResponsesItem): string {
-	const summary = readContentText(item.content);
-	return summary || "";
+function readReasoningItem(_item: GrokResponsesItem): string {
+	return "";
 }
 
 function readError(payload: unknown): { message?: string; code?: string } {
