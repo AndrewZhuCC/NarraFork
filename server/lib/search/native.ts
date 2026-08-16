@@ -1,5 +1,6 @@
 import {
 	getAnthropicProviderConfig,
+	getGrokProviderConfig,
 	isAnthropicProvider,
 	settings,
 	usesCodexModel,
@@ -30,7 +31,13 @@ export function isNativeSearchEnabled(config: NarraForkSettings = settings): boo
  * toggled, not a permanent regression.
  */
 export function usesInlineNativeSearch(provider: string, model: string): boolean {
-	return usesCodexModel(provider, model);
+	if (usesCodexModel(provider, model)) return true;
+	// Grok declares its own server-side search tools (web_search / x_search) in the
+	// main /responses request. Only counts as inline when at least one search switch
+	// is on, otherwise the function WebSearch tool stays visible.
+	const config = getGrokProviderConfig(provider);
+	if (config) return !!config.enableWebSearch || !!config.enableXSearch;
+	return false;
 }
 
 /**

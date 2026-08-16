@@ -268,6 +268,31 @@ export interface ClineProviderConfig {
 	proxy?: ProxyOverride;
 }
 
+export interface GrokProviderConfig {
+	/** Unique short ID (8 chars, nanoid). */
+	id: string;
+	/** User-defined display name, e.g. "Grok", "Grok Production". */
+	name: string;
+	/** Whether this provider is disabled (keeps config but excluded from resolution). */
+	disabled?: boolean;
+	/** Provider prefix used in model IDs, e.g. "grok". */
+	prefix: string;
+	/** xAI API base URL (OpenAI-compatible), e.g. "https://api.x.ai/v1". */
+	baseUrl: string;
+	/** xAI API key (xai-...). */
+	apiKey?: string;
+	/** Default model (bare name without prefix). */
+	defaultModel: string;
+	/** Default context window size (tokens) for models in this provider. */
+	defaultContextWindow?: number;
+	/** Append Grok built-in web_search on chat turns. */
+	enableWebSearch?: boolean;
+	/** Append Grok built-in x_search on chat turns. */
+	enableXSearch?: boolean;
+	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
+	proxy?: ProxyOverride;
+}
+
 export type SearchChannelKind =
 	| "native"
 	| "kiro-mcp"
@@ -859,6 +884,8 @@ export interface NarraForkSettings {
 	nugProviders?: NUGProviderConfig[];
 	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
 	clineProviders?: ClineProviderConfig[];
+	/** Grok API providers — xAI OpenAI-compatible with a plain API key. */
+	grokProviders?: GrokProviderConfig[];
 	/** Google Gemini API providers — native generativelanguage.googleapis.com protocol. */
 	geminiProviders?: GeminiProviderConfig[];
 	/** External MCP server configurations. */

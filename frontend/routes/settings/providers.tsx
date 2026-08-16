@@ -15,6 +15,7 @@ import {
 	isAnthropicProtocol,
 	isGeminiProtocol,
 } from "../../components/providers/CustomApiProviderSection";
+import { GrokSection } from "../../components/providers/GrokSection";
 import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
@@ -481,6 +482,7 @@ function SettingsProvidersPage() {
 		anthropicByProvider,
 		clineByProvider,
 		geminiByProvider,
+		grokByProvider,
 		nugByProvider,
 		pluginProviderGroups,
 	} = useAllModels();
@@ -603,7 +605,7 @@ function SettingsProvidersPage() {
 	// ── Build provider groups for overview ──
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
-		const platformPrefixes = new Set(["kiro", "codex", "cline"]);
+		const platformPrefixes = new Set(["kiro", "codex", "cline", "grok"]);
 		// Executable-plugin providers, keyed by prefix. They are presented like platform
 		// providers (single instance, not user-addable) but need their own lookup because
 		// the detail area has to reach the owning plugin rather than a builtin section.
@@ -649,6 +651,7 @@ function SettingsProvidersPage() {
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of geminiByProvider) for (const m of g.models) addModel(g.prefix, m);
+		for (const g of grokByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of nugByProvider) for (const m of g.models) addModel(g.prefix, m);
 
 		// Add custom models to their respective prefixes
@@ -712,6 +715,7 @@ function SettingsProvidersPage() {
 		anthropicByProvider,
 		clineByProvider,
 		geminiByProvider,
+		grokByProvider,
 		nugByProvider,
 		pluginProviderGroups,
 		state.customModels,
@@ -739,7 +743,7 @@ function SettingsProvidersPage() {
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
 		// Platform providers: selectedProvider is the prefix
-		if (["kiro", "codex", "cline"].includes(selectedProvider)) {
+		if (["kiro", "codex", "cline", "grok"].includes(selectedProvider)) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
 		}
 		// Plugin providers are also addressed by prefix; without this they would fall
@@ -769,7 +773,7 @@ function SettingsProvidersPage() {
 		const providerId = selectedProvider;
 		if (!providerId) return;
 		// Platform providers (kiro/codex/cline) manage their own model lists.
-		if (["kiro", "codex", "cline"].includes(providerId)) return;
+		if (["kiro", "codex", "cline", "grok"].includes(providerId)) return;
 
 		const customApi = state.customApiProviders.find((p) => p.id === providerId);
 		const nug = state.nugProviders.find((p) => p.id === providerId);
@@ -1076,6 +1080,18 @@ function ProviderSectionContent({
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onMergeContextWindows={onServerContextWindowsMerge}
+				onTestModel={onTestModel}
+			/>
+		);
+	}
+	if (providerKey === "grok") {
+		return (
+			<GrokSection
+				settings={settings}
+				hiddenModels={state.hiddenModels}
+				onToggleHidden={dispatchers.toggleHidden}
+				modelContextWindows={state.modelContextWindows}
+				onContextWindowChange={dispatchers.handleContextWindowChange}
 				onTestModel={onTestModel}
 			/>
 		);

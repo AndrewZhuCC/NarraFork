@@ -76,6 +76,7 @@ import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
 import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
 import { getGeminiCachedModelsGrouped, purgeGeminiProviderCache } from "./gemini";
+import { getGrokModelsGrouped, purgeGrokProviderCache } from "./grok";
 import { purgeNugProviderCache } from "./nug";
 import {
 	getOpenaiCachedModels,
@@ -251,6 +252,20 @@ const geminiProviderSchema = z.object({
 		.nullable()
 		.optional(),
 	enabledModels: z.array(z.string()).optional(),
+	proxy: proxyOverrideSchema,
+	disabled: z.boolean().optional(),
+});
+
+const grokProviderSchema = z.object({
+	id: z.string().min(1),
+	name: z.string(),
+	prefix: z.string().min(1),
+	apiKey: z.string().optional(),
+	baseUrl: z.string(),
+	defaultModel: z.string(),
+	defaultContextWindow: z.number().int().min(1).optional(),
+	enableWebSearch: z.boolean().optional(),
+	enableXSearch: z.boolean().optional(),
 	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
 });
@@ -589,6 +604,7 @@ export const updateSettingsSchema = z
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
 		clineProviders: z.array(clineProviderSchema).optional(),
+		grokProviders: z.array(grokProviderSchema).optional(),
 		geminiProviders: z.array(geminiProviderSchema).optional(),
 		codex: z
 			.object({
@@ -869,6 +885,10 @@ function buildSettingsResponse(
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
+		grokProviders: (source.grokProviders ?? []).map((p) => ({
+			...p,
+			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
+		})),
 		vnet: maskVNetSettings(source.vnet),
 		search: maskSearchSettings(source.search),
 		kiroModels: isKiroAvailable() ? kiroGetCachedModels() : null,
@@ -889,6 +909,7 @@ function buildSettingsResponse(
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
 		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
+		grokModelsGrouped: getGrokModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
@@ -1030,6 +1051,11 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			type: "cline",
 			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
 			fn: purgeClineProviderCache,
+		},
+		{
+			type: "grok",
+			ids: getRemovedProviderIds(prev.grokProviders, next.grokProviders),
+			fn: purgeGrokProviderCache,
 		},
 		{
 			type: "gemini",

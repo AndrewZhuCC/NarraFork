@@ -61,7 +61,8 @@ export type ProviderCapabilityKey =
 	| "nug"
 	| "codex"
 	| "cline"
-	| "gemini";
+	| "gemini"
+	| "grok";
 
 type ChapterContainerRoute =
 	| "setup"

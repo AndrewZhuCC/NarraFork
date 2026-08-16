@@ -1973,5 +1973,19 @@
 	"oauthExternalWebSocketMaxBufferedAmount": "发送缓冲最大字节数",
 	"oauthExternalWebSocketSave": "保存 WebSocket 设置",
 	"oauthExternalWebSocketSaved": "外部 OAuth WebSocket 设置已保存",
-	"oauthExternalWebSocketSaveFailed": "保存外部 OAuth WebSocket 设置失败"
+	"oauthExternalWebSocketSaveFailed": "保存外部 OAuth WebSocket 设置失败",
+	"settingsSaved": "设置已保存",
+	"modelsRefreshed": "模型已刷新",
+	"apiBaseUrl": "API 基础地址",
+	"apiKey": "API 密钥",
+	"refreshModels": "刷新模型",
+	"show": "显示",
+	"hide": "隐藏",
+	"test": "测试",
+	"grokNotConfigured": "尚未配置 Grok provider，保存后可开始使用。",
+	"grokNoModelsHint": "暂无模型 — 填入 API 密钥后点击“刷新模型”。",
+	"grokApiKeySetHint": "API 密钥已设置。",
+	"grokApiKeyMissing": "API 密钥未设置，请填入并保存。",
+	"grokEnableWebSearch": "启用网页搜索",
+	"grokEnableXSearch": "启用 X 搜索"
 }

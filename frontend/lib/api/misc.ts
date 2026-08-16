@@ -814,6 +814,13 @@ export const miscApi = {
 	nugOAuthStart: (providerId: string) =>
 		request<{ authorizeUrl: string; state: string }>(`/nug/providers/${providerId}/oauth/start`),
 
+	// Grok
+	grokRefreshModels: (providerId: string) =>
+		request<{ providerId: string; modelCount: number }>(`/grok/refresh`, {
+			method: "POST",
+			body: JSON.stringify({ providerId }),
+		}),
+
 	// Cline
 	clineStatus: () =>
 		request<{

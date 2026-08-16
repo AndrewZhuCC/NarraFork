@@ -17,6 +17,7 @@ import {
 	getAnthropicProviderConfig,
 	getClineProviderConfig,
 	getGeminiProviderConfig,
+	getGrokProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
 	parseModelId,
@@ -30,6 +31,7 @@ import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
+import { GrokProvider } from "./grok-provider";
 import { KiroProvider } from "./kiro-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
@@ -305,6 +307,11 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	const clineConfig = getClineProviderConfig(provider);
 	if (clineConfig) {
 		return new ClineProvider(clineConfig);
+	}
+
+	const grokConfig = getGrokProviderConfig(provider);
+	if (grokConfig) {
+		return new GrokProvider(grokConfig);
 	}
 
 	const geminiConfig = getGeminiProviderConfig(provider);

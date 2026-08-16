@@ -10,6 +10,7 @@ import type {
 	AnthropicProviderConfig,
 	ClineProviderConfig,
 	GeminiProviderConfig,
+	GrokProviderConfig,
 	ModelAggregation,
 	NarraForkSettings,
 	NUGProviderConfig,
@@ -73,6 +74,7 @@ let codexModelChecker: ((model: string) => boolean) | null = null;
 let nugModelChecker: ((model: string) => boolean) | null = null;
 let clineModelChecker: ((model: string) => boolean) | null = null;
 let geminiModelChecker: ((model: string) => string | undefined) | null = null;
+let grokModelChecker: ((model: string) => boolean) | null = null;
 let openaiModelLister: (() => string[]) | null = null;
 let kiroModelLister: (() => string[]) | null = null;
 let anthropicModelLister: (() => string[]) | null = null;
@@ -80,6 +82,7 @@ let codexModelLister: (() => string[]) | null = null;
 let nugModelLister: (() => string[]) | null = null;
 let clineModelLister: (() => string[]) | null = null;
 let geminiModelLister: (() => string[]) | null = null;
+let grokModelLister: (() => string[]) | null = null;
 
 /**
  * Extra model sources contributed at runtime, e.g. by executable plugin providers.
@@ -183,6 +186,12 @@ export function registerGeminiModelChecker(checker: (model: string) => string | 
 }
 export function registerGeminiModelLister(lister: () => string[]): void {
 	geminiModelLister = lister;
+}
+export function registerGrokModelChecker(checker: (model: string) => boolean): void {
+	grokModelChecker = checker;
+}
+export function registerGrokModelLister(lister: () => string[]): void {
+	grokModelLister = lister;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +578,7 @@ export function getVisibleModels(): string[] {
 	const nug = nugModelLister?.() ?? [];
 	const cline = clineModelLister?.() ?? [];
 	const gemini = geminiModelLister?.() ?? [];
+	const grok = grokModelLister?.() ?? [];
 	const custom = (s().agent.customModels ?? []).map((m) => {
 		const value = m.value ?? "";
 		return value.includes(":") ? value : `${m.provider ?? "openai"}:${value}`;
@@ -586,6 +596,7 @@ export function getVisibleModels(): string[] {
 		...nug,
 		...cline,
 		...gemini,
+		...grok,
 		...custom,
 		...extra,
 	]) {
@@ -628,6 +639,11 @@ function resolveNugChannelType(prefix?: string, model?: string): string | undefi
 export function usesCodexModel(prefix?: string, model?: string): boolean {
 	if (usesCodexApiMode(prefix)) return true;
 	return resolveNugChannelType(prefix, model) === "codex";
+}
+
+export function usesGrokModel(prefix?: string): boolean {
+	if (!prefix) return false;
+	return !!getGrokProviderConfig(prefix);
 }
 
 export function usesStatefulApi(prefix?: string): boolean {
@@ -721,6 +737,21 @@ export function hasConfiguredClineProvider(): boolean {
 	return providers.some((p) => !p.disabled && !!p.accessToken);
 }
 
+export function getGrokProviderConfig(prefix?: string): GrokProviderConfig | undefined {
+	const providers = (s().grokProviders ?? []).filter((p) => !p.disabled);
+	if (!prefix) return providers[0];
+	return providers.find((p) => p.prefix === prefix);
+}
+
+export function grokProviderPrefix(config: GrokProviderConfig): string {
+	return config.prefix;
+}
+
+export function hasConfiguredGrokProvider(): boolean {
+	const providers = s().grokProviders ?? [];
+	return providers.some((p) => !p.disabled && !!p.apiKey);
+}
+
 export function getGeminiProviderConfig(prefix?: string): GeminiProviderConfig | undefined {
 	const providers = (s().geminiProviders ?? []).filter((p) => !p.disabled);
 	if (!prefix) return providers[0];
@@ -800,6 +831,11 @@ function getConfiguredProviderCandidates(): string[] {
 			if (!p.disabled && p.accessToken) available.add(p.prefix || "cline");
 		}
 	}
+	if (hasConfiguredGrokProvider()) {
+		for (const p of s().grokProviders ?? []) {
+			if (!p.disabled && p.apiKey) available.add(p.prefix || "grok");
+		}
+	}
 	if (hasConfiguredGeminiProvider()) {
 		for (const p of s().geminiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "gemini");
@@ -850,6 +886,7 @@ export function resolveProvider(model?: string): string {
 		if (codexModelChecker?.(bare)) return "codex";
 		if (nugModelChecker?.(bare)) return "nug";
 		if (clineModelChecker?.(bare)) return "cline";
+		if (grokModelChecker?.(bare)) return "grok";
 		const geminiPrefix = geminiModelChecker?.(bare);
 		if (geminiPrefix) return geminiPrefix;
 		// Consulted only after every builtin declined, so a plugin cannot shadow a

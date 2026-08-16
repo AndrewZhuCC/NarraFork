@@ -368,6 +368,37 @@ export function useAllModels() {
 			geminiByProvider.push({ prefix, name, models, agentProviderType: "gemini" });
 		}
 
+		// --- Grok models (per-provider, xAI OpenAI-compatible) ---
+		const grokModelsGrouped: Array<{
+			providerId: string;
+			providerName: string;
+			models: Array<{ id: string; name?: string }>;
+		}> = settingsData?.grokModelsGrouped ?? [];
+
+		const serverGrokProviders: Array<{ id: string; prefix?: string; name?: string }> =
+			settingsData?.grokProviders ?? [];
+
+		const fetchedGrokModels: ModelOption[] = [];
+		const grokByProvider: ProviderModels[] = [];
+
+		for (const group of grokModelsGrouped) {
+			const cfg = serverGrokProviders.find((p) => p.id === group.providerId);
+			const prefix = cfg?.prefix ?? "grok";
+			const name = group.providerName || cfg?.name || prefix;
+			providerLabels[prefix] = name;
+			const models: ModelOption[] = [];
+			for (const m of group.models) {
+				const opt: ModelOption = {
+					value: `${prefix}:${m.id}`,
+					label: m.name || m.id,
+					provider: prefix,
+				};
+				models.push(opt);
+				fetchedGrokModels.push(opt);
+			}
+			grokByProvider.push({ prefix, name, models, agentProviderType: "grok" });
+		}
+
 		// --- NUG models (per-provider, channel metadata aware) ---
 		const nugModelsGrouped: Array<{
 			providerId: string;
@@ -566,6 +597,8 @@ export function useAllModels() {
 			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of geminiByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType);
+		for (const group of grokByProvider)
+			addGroup(group.prefix, group.models, group.agentProviderType);
 		for (const group of nugByProvider)
 			addGroup(group.prefix, group.models, group.agentProviderType, group.nugProviderId);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
@@ -742,6 +775,8 @@ export function useAllModels() {
 			clineByProvider,
 			/** Gemini models grouped by provider. */
 			geminiByProvider,
+			/** Grok models grouped by provider. */
+			grokByProvider,
 			/** NUG models grouped by provider. */
 			nugByProvider,
 			/** Provider prefix → NUG provider id, for prefix-keyed model pickers. */
