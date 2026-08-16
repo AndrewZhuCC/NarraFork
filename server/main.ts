@@ -4,6 +4,13 @@ import { extname, resolve } from "node:path";
 
 import { eq } from "drizzle-orm";
 
+// Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
+// resolve the tsconfig alias, and this module is dependency-free string constants, so it adds
+// nothing but the literals to the server bundle.
+import {
+	PLUGIN_UI_RUNTIME_CSS_URL,
+	PLUGIN_UI_RUNTIME_JS_URL,
+} from "../frontend/plugin-runtime/paths";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -83,6 +90,7 @@ import {
 import "./services/notification-service"; // Register notification event listeners
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { initChatNotify } from "./services/chat-notify";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
@@ -234,6 +242,13 @@ const NO_CACHE_FRONTEND_PATHS = new Set([
 	"/src-sw.js",
 	"/registerSW.js",
 	"/manifest.webmanifest",
+	// The plugin UI runtime ships at fixed, UNHASHED paths (the iframe shell references them
+	// by constant), so the filename cannot signal a new version. Without these entries the
+	// default `max-age=3600` below would keep serving the previous runtime for up to an hour
+	// after a host upgrade, while freshly loaded plugin panels expect the new
+	// `PLUGIN_UI_RUNTIME_VERSION` — surfacing as HostRuntimeUnavailableError in the panel.
+	PLUGIN_UI_RUNTIME_JS_URL,
+	PLUGIN_UI_RUNTIME_CSS_URL,
 ]);
 
 function getFrontendCacheControl(path: string): string {
@@ -823,7 +838,16 @@ function startServer(listenPort: number) {
 					// Look up user info for presence tracking
 					const user = await db.query.users.findFirst({
 						where: eq(users.id, payload.sub),
-						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+						columns: {
+							id: true,
+							username: true,
+							avatarColor: true,
+							avatarImageId: true,
+							// Read live rather than taken from the token, so a demotion applies to
+							// the next socket instead of riding along until the JWT expires. The
+							// narrator subscribe path uses it for the admin short-circuit.
+							role: true,
+						},
 					});
 					const userInfo = user
 						? {
@@ -831,6 +855,7 @@ function startServer(listenPort: number) {
 								username: user.username,
 								avatarColor: user.avatarColor,
 								avatarImageId: user.avatarImageId,
+								role: user.role,
 							}
 						: undefined;
 
@@ -1404,6 +1429,9 @@ initContainerEventHandler();
 
 // Register knowledge notification bridge (push publish/review state to reviewers + submitters)
 initKnowledgeNotify();
+
+// Register chat notification bridge (room messages to viewers, unread badges to the rest)
+initChatNotify();
 
 // Reconcile container states on startup (mark stale DB records as stopped)
 reconcileContainerStates().catch((err) => {

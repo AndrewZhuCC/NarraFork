@@ -111,7 +111,7 @@ export async function runSearch(
 	params: SearchParams,
 	signal?: AbortSignal,
 ): Promise<SearchResult> {
-	const manager = resolveManager(config);
+	const manager = await resolveManager(config);
 	const client = new KiroMcpClient(manager);
 	const args: Record<string, unknown> = { query: params.query };
 	// Upstream ignores unknown arguments, but only send what was asked for.

@@ -56,10 +56,10 @@
 					"maxModelPageSize": 50
 				},
 				"configSchema": {
-					"credentialsBundle": {
+					"credentialsIndex": {
 						"type": "string",
 						"title": "Credentials",
-						"description": "All Kiro credentials as one JSON array. Managed from the credentials page; not meant to be edited by hand.",
+						"description": "Bookkeeping for the stored credentials. Each credential is kept in its own entry; this records how many there are. Managed from the credentials page; not meant to be edited by hand.",
 						"writeOnly": true,
 						"x-narrafork-secret": true
 					},
@@ -127,7 +127,7 @@
 				"title": "Kiro web search (plugin)",
 				"description": "Web search through the Kiro subscription's hosted MCP web_search tool.",
 				"providerId": "kiro",
-				"requiresConfig": ["credentialsBundle"],
+				"requiresConfig": ["credentialsIndex"],
 				"capabilities": {
 					"maxResults": true
 				},
@@ -158,6 +158,18 @@
 			{
 				"id": "credentials.remove",
 				"title": "Remove a credential",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.removeMany",
+				"title": "Remove several credentials",
+				"description": "Removes a selection in one pass, with a single persisted write.",
+				"handler": "server"
+			},
+			{
+				"id": "credentials.removeUnhealthy",
+				"title": "Remove unhealthy credentials",
+				"description": "Removes credentials disabled for an unrecoverable reason.",
 				"handler": "server"
 			},
 			{
@@ -202,6 +214,12 @@
 				"title": "Refresh model cache",
 				"description": "Re-fetch model list from upstream and persist.",
 				"handler": "server"
+			},
+			{
+				"id": "models.refreshAll",
+				"title": "Refresh every credential's models",
+				"description": "Re-fetch models for all enabled credentials in one pass.",
+				"handler": "server"
 			}
 		],
 		"events": [],
@@ -213,7 +231,8 @@
 				"surfaces": ["provider-settings"],
 				"scope": "global",
 				"instance": "singleton",
-				"providerId": "kiro"
+				"providerId": "kiro",
+				"runtime": "host-react"
 			}
 		]
 	},
@@ -221,7 +240,14 @@
 		"entry": "ui/provider-settings.iife.js"
 	},
 	"permissions": {
-		"host": ["provider.register", "provider.use", "search.provide", "ui.panel", "config.read_self"],
+		"host": [
+			"provider.register",
+			"provider.use",
+			"search.provide",
+			"ui.panel",
+			"config.read_self",
+			"secret.use_self"
+		],
 		"network": {
 			"mode": "allowlist",
 			"allow": ["https://q.us-east-1.amazonaws.com", "https://oidc.us-east-1.amazonaws.com"],

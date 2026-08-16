@@ -31,7 +31,6 @@
  *   is why the plan chose independent credential storage over reuse.
  */
 
-import { createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -39,19 +38,20 @@ import { canonicalizeAuthMethodValue } from "@server/lib/kiro/auth-method";
 import { loadConfig } from "@server/lib/kiro/config";
 import { MultiTokenManager } from "@server/lib/kiro/multi-token-manager";
 import type { KiroCredentials } from "@server/lib/kiro/types";
+import { ensureMigrated } from "./credential-migration";
+import { readCredentials, readIndex, readKeyState } from "./credential-vault";
 import { isRecord, log } from "./rpc";
 
 /** Config keys this plugin understands. Anything else is ignored. */
 export interface KiroPluginConfig {
 	/**
-	 * JSON array of credentials, stored as a single secret field.
+	 * The old single-blob field, no longer part of `configSchema` and therefore never injected.
 	 *
-	 * The vault keys secrets as flat `provider.<contributionId>.<field>` strings, which
-	 * cannot express "the refresh token of the Nth credential". Rather than introduce
-	 * dynamic secret keys — which would require splitting the backend and iframe method
-	 * inventories — the whole list travels as one opaque JSON value. That keeps
-	 * multi-credential support inside the existing contract at the cost of a 64 KB ceiling
-	 * (about ten kilobytes for a dozen credentials).
+	 * Retained on the type only so migration can accept a config that still carries it — a
+	 * host that has not yet reloaded the descriptor could still send one. It is *not* read by
+	 * `resolveManager`; the durable blob is read from the vault by `ensureMigrated`, which is
+	 * the only consumer left. Credentials travelling through `config` is the shape this
+	 * rework exists to remove.
 	 */
 	credentialsBundle?: string;
 	/** Legacy single-credential fields, still accepted. See `readConfig`. */
@@ -231,35 +231,24 @@ export function toCredential(config: KiroPluginConfig): KiroCredentials {
 }
 
 /**
- * Every credential the config describes, newest storage format first.
+ * Every credential a *config* describes. The vault, not this, is the durable store.
  *
- * The bundle wins when present; the flat single-credential fields remain accepted so a
- * provider configured before multi-credential support keeps working without the user
- * re-entering anything.
+ * The blob branch remains because a host that has not reloaded the provider descriptor could
+ * still inject `credentialsBundle`, and refusing it would strand those credentials. It is no
+ * longer the primary path: `resolveManager` consults the vault first and only reaches here
+ * when neither a sentinel nor any credential entry exists.
+ *
+ * Throws `MissingCredentialError` naming the absent fields when there is nothing to build.
  */
 export function toCredentials(config: KiroPluginConfig): KiroCredentials[] {
 	if (config.credentialsBundle) return parseBundle(config.credentialsBundle);
 	return [toCredential(config)];
 }
 
-/**
- * Stable identity for a credential set, without retaining any secret as a key.
- *
- * Only the fields that affect which upstream identity is used participate, so a cosmetic
- * config edit does not throw away a valid access token.
- */
-function fingerprint(credential: KiroCredentials): string {
-	const material = [
-		credential.authMethod ?? "",
-		credential.refreshToken ?? "",
-		credential.apiKey ?? "",
-		credential.clientId ?? "",
-		credential.clientSecret ?? "",
-		credential.profileArn ?? "",
-		credential.region ?? "",
-	].join("\u0000");
-	return createHash("sha256").update(material).digest("hex");
-}
+// A per-credential content fingerprint used to live here, hashing the identity-bearing fields
+// so a cosmetic config edit would not discard a live access token. It is gone because the cache
+// key changed: hashing content requires reading every credential first, which is the expense
+// the revision marker exists to avoid. See `cached` above.
 
 /**
  * Plugin-owned data directory, used only for `MultiTokenManager`'s refreshed-token and
@@ -295,24 +284,116 @@ export function credentialsPathFor(_rawConfig?: unknown): string {
 	return join(pluginDataDir(), "credentials.json");
 }
 
-let cached: { key: string; manager: MultiTokenManager } | undefined;
+/**
+ * The live manager, keyed by the index revision plus the config that shapes it.
+ *
+ * `revision` comes from the sentinel, not from the credentials, and that is the whole point:
+ * the previous cache key was a SHA-256 over the credential set, which only worked because the
+ * credentials were already in `config` and hashing them cost nothing. Now that they live in
+ * the vault, computing that hash would require reading all N first — precisely the expense the
+ * cache exists to avoid. So the key must be something obtainable *before* reading: the
+ * sentinel's revision, which the writer bumps on every change.
+ *
+ * `configKey` is folded in because `loadBalancingMode` and `region` also shape the manager but
+ * do not touch the credential index; without it, a load-balancing change would be ignored
+ * until a credential happened to change.
+ */
+let cached:
+	| { revision: number; configKey: string; count: number; manager: MultiTokenManager }
+	| undefined;
+
+/** The config fields that shape the manager, so a change to them rebuilds it. */
+function managerConfigKey(config: KiroPluginConfig): string {
+	return `${config.loadBalancingMode ?? ""}\u0000${config.region ?? ""}`;
+}
 
 /**
- * Build or reuse the manager for the given config.
+ * Build or reuse the manager, reading credentials from the vault.
  *
- * Throws `MissingCredentialError` when config is incomplete, so callers can report a
+ * Steady state is **one** RPC: read the sentinel, compare `revision`, reuse the cached
+ * manager. Only a changed (or absent) revision triggers the N reads needed to rebuild.
+ *
+ * Throws `MissingCredentialError` when no credential is stored, so callers report a
  * configuration problem rather than an upstream failure.
  */
-export function resolveManager(rawConfig: unknown): MultiTokenManager {
+export async function resolveManager(rawConfig: unknown): Promise<MultiTokenManager> {
 	const config = readConfig(rawConfig);
-	const credentials = toCredentials(config);
-	// One fingerprint over the whole set: adding, removing or rotating any credential must
-	// rebuild the manager, while an unrelated config edit must not discard live access tokens.
-	const key = createHash("sha256")
-		.update(credentials.map(fingerprint).join("\u0001"))
-		.digest("hex");
-	if (cached?.key === key) return cached.manager;
+	const configKey = managerConfigKey(config);
 
+	try {
+		return await resolveFromVault(config, configKey);
+	} catch (error) {
+		// `MissingCredentialError` is a real answer — "nothing is stored" — and must reach the
+		// caller, which reports an unconfigured provider.
+		if (error instanceof MissingCredentialError || error instanceof InvalidBundleError) throw error;
+		// Anything else means credential storage itself is unavailable: a host that serves no
+		// `secrets.*` channel (release validation starts the plugin exactly that way), or a vault
+		// that failed to read. Fall back to whatever the config carries and let that decide.
+		// Propagating a transport error here would present a configuration state as a broken
+		// plugin, which is how a legitimately unconfigured provider came to fail GA validation.
+		log("credential storage is unavailable; falling back to config", {
+			error: error instanceof Error ? error.message : "unknown",
+		});
+		return buildManager(config, toCredentials(config), -1, configKey);
+	}
+}
+
+async function resolveFromVault(
+	config: KiroPluginConfig,
+	configKey: string,
+): Promise<MultiTokenManager> {
+	const index = await readIndex();
+
+	if (index) {
+		if (cached && cached.revision === index.revision && cached.configKey === configKey) {
+			return cached.manager;
+		}
+		const state = await readKeyState();
+		const credentials = await readCredentials(state.credentialKeys);
+		if (credentials.length === 0) {
+			// The sentinel says credentials exist but none could be read. Reporting "not
+			// configured" is the honest answer, and it must not be cached: the next call
+			// should retry rather than inherit a wrong empty state.
+			throw new MissingCredentialError(
+				"Kiro credentials are recorded but could not be read. Re-add a credential.",
+			);
+		}
+		return buildManager(config, credentials, index.revision, configKey);
+	}
+
+	// No sentinel. This does **not** by itself mean "no credentials", and conflating the two is
+	// the mistake that would strand a user's credentials. Three distinct states land here:
+	//
+	//   | no sentinel, no entries, old blob present | never migrated      | migrate
+	//   | no sentinel, entries present              | migration interrupted | resume
+	//   | no sentinel, no entries, no blob          | genuinely empty     | report missing
+	//
+	// So the sentinel — not "does any cred key exist" — is the completion marker, and resolving
+	// which state this is belongs to `ensureMigrated`. It is idempotent and deduplicated, so
+	// calling it here costs nothing when activation already ran it.
+	const migration = await ensureMigrated();
+	if (migration.migrated) {
+		const state = await readKeyState();
+		const credentials = await readCredentials(state.credentialKeys);
+		if (credentials.length > 0) {
+			const revision = (await readIndex())?.revision ?? -1;
+			return buildManager(config, credentials, revision, configKey);
+		}
+	}
+
+	// Legacy flat config fields are the last resort, so a provider configured before
+	// multi-credential support keeps working. `toCredentials` throws `MissingCredentialError`
+	// naming what is absent when there is nothing to build from, which is the right answer
+	// here: no sentinel, nothing migrated, no legacy fields means genuinely unconfigured.
+	return buildManager(config, toCredentials(config), -1, configKey);
+}
+
+function buildManager(
+	config: KiroPluginConfig,
+	credentials: KiroCredentials[],
+	revision: number,
+	configKey: string,
+): MultiTokenManager {
 	const credentialsPath = join(pluginDataDir(), "credentials.json");
 	const kiroConfig = loadConfig(join(pluginDataDir(), "config.json"));
 	const region = config.region ?? credentials[0]?.region ?? kiroConfig.region;
@@ -328,11 +409,8 @@ export function resolveManager(rawConfig: unknown): MultiTokenManager {
 		credentialsPath,
 		true,
 	);
-	cached = { key, manager };
-	log("credential manager built", {
-		credentialCount: credentials.length,
-		keyPrefix: key.slice(0, 8),
-	});
+	cached = { revision, configKey, count: credentials.length, manager };
+	log("credential manager built", { credentialCount: credentials.length, revision });
 	return manager;
 }
 

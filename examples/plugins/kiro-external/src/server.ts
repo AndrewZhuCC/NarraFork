@@ -39,8 +39,8 @@
 import { KiroApiClient } from "@server/lib/kiro/api-client";
 import { KiroQuotaError } from "@server/lib/kiro/types";
 import { toKiroChatRequest, toKiroGenerateRequest } from "@shared/codewhisperer/canonical-request";
-import { parseSSEStream } from "@shared/codewhisperer/protocol";
 import { CommandInputError, findCommand } from "./commands";
+import { ensureMigrated } from "./credential-migration";
 import {
 	credentialFileHash,
 	writebackIfChanged as writebackCredentialsIfChanged,
@@ -71,6 +71,8 @@ import {
 	send,
 } from "./rpc";
 import { readSearchParams, runSearch, type SearchParams } from "./search";
+import { streamWithFailover } from "./stream-failover";
+import { parseKiroWireStream } from "./wire-stream";
 
 const PLUGIN_ID = "com.narrafork.kiro-external";
 const PLUGIN_VERSION = "0.1.0";
@@ -86,9 +88,15 @@ installProxyResolver();
 // real implementation; `writebackDeps` binds it to this module's RPC and log functions.
 const writebackDeps = { request, log };
 
-/** Resync the host vault when an operation refreshed (and possibly rotated) a token. */
+/**
+ * Resync the host vault when an operation refreshed (and possibly rotated) a token.
+ *
+ * Fire-and-forget: the underlying `writebackCredentialsIfChanged` is now async but handles
+ * its own errors internally (never rejects). Using `void` here is safe — there is no
+ * unhandled-rejection risk because the function has a top-level catch.
+ */
 function writebackIfChanged(credentialsPath: string, hashBefore: string | null): void {
-	writebackCredentialsIfChanged(credentialsPath, hashBefore, writebackDeps);
+	void writebackCredentialsIfChanged(credentialsPath, hashBefore, writebackDeps);
 }
 
 /**
@@ -182,9 +190,16 @@ function describeProvider(id: string | number, params: unknown): void {
 				configSchema: {
 					type: "object",
 					properties: {
-						// The whole credential list as one secret value. See `credentials.ts` for why
-						// it is a bundle rather than one secret per credential.
-						credentialsBundle: { type: "string", writeOnly: true, "x-narrafork-secret": true },
+						// Credentials themselves are NOT here. Each lives in its own vault secret
+						// (`provider.kiro.cred.<id>`), read by the plugin, so credential count no
+						// longer inflates a single value. See `credential-vault.ts`.
+						//
+						// This sentinel carries `{ revision, count }`. It is declared because
+						// `requiresConfig`/`secretsSet` only inspect declared keys, and a
+						// per-credential key cannot be declared statically — its id is generated at
+						// runtime. It exists only while at least one credential exists, so
+						// "configured" stays truthful.
+						credentialsIndex: { type: "string", writeOnly: true, "x-narrafork-secret": true },
 						loadBalancingMode: {
 							type: "string",
 							enum: ["priority", "balanced"],
@@ -237,9 +252,9 @@ function describeProvider(id: string | number, params: unknown): void {
 async function listModels(id: string | number, params: unknown): Promise<void> {
 	applyHostHints(params);
 	const config = isRecord(params) ? params.config : undefined;
-	let manager: ReturnType<typeof resolveManager>;
+	let manager: Awaited<ReturnType<typeof resolveManager>>;
 	try {
-		manager = resolveManager(config);
+		manager = await resolveManager(config);
 	} catch (error) {
 		if (error instanceof MissingCredentialError) {
 			// An unconfigured provider is the normal state right after install: the host
@@ -259,7 +274,7 @@ async function listModels(id: string | number, params: unknown): Promise<void> {
 	// and search can. Catalog refresh runs on a schedule the user never sees, which makes
 	// this the path most likely to rotate a token with no other traffic to write it back.
 	const credPath = credentialsPathFor(config);
-	const hashBefore = credentialFileHash(credPath);
+	const hashBefore = await credentialFileHash(credPath);
 	try {
 		const result = await manager.listAvailableModels();
 		const models = result.models
@@ -315,7 +330,7 @@ async function search(id: string | number, params: unknown): Promise<void> {
 	// token just as chat can. Without this the vault would go stale on any account whose
 	// traffic happens to be search-only until a chat or a credential command ran.
 	const credPath = credentialsPathFor(config);
-	const hashBefore = credentialFileHash(credPath);
+	const hashBefore = await credentialFileHash(credPath);
 	try {
 		respond(id, await runSearch(config, searchParams));
 	} catch (error) {
@@ -330,7 +345,7 @@ async function validateConfig(id: string | number, params: unknown): Promise<voi
 	applyHostHints(params);
 	const config = isRecord(params) ? params.config : undefined;
 	try {
-		resolveManager(config);
+		await resolveManager(config);
 	} catch (error) {
 		if (error instanceof MissingCredentialError) {
 			respond(id, { valid: false, issues: [{ path: "/", message: error.message }] });
@@ -346,7 +361,7 @@ async function validateConfig(id: string | number, params: unknown): Promise<voi
 		return;
 	}
 	try {
-		const manager = resolveManager(config);
+		const manager = await resolveManager(config);
 		const result = await manager.listAvailableModels();
 		respond(id, {
 			valid: true,
@@ -438,31 +453,15 @@ async function startChat(
 
 	// Capture credential file hash before the upstream call so we can detect token refresh.
 	const credPath = credentialsPathFor(config);
-	const hashBefore = credentialFileHash(credPath);
+	const hashBefore = await credentialFileHash(credPath);
 
 	try {
-		const manager = resolveManager(config);
+		const manager = await resolveManager(config);
 		const client = new KiroApiClient(manager);
 
 		const kiroRequest = buildUpstreamRequest(kind, params, operationId, modelId);
 
-		const { response, credentialId, release } = await client.sendChatRequest(
-			kiroRequest,
-			controller.signal,
-		);
-		operation.release = release;
-		// `reasoningSource` is deliberately NOT sent. The host would adopt it as the identity
-		// that minted any thinking signature in this turn and persist it on the stored
-		// reasoning block — but it only holds that override for the lifetime of one adapter,
-		// and the registry builds a fresh adapter per model resolution. On the next turn the
-		// adapter is back to `plugin:<typeId>:<instanceId>`, which no longer matches what was
-		// stored, so `compatibleContinuation` drops the signature and thinking continuity is
-		// lost. Staying silent lets the host use its own stable identity on both the write and
-		// the read, which round-trips correctly. Verified in
-		// `kiro-external-canonical-request.test.ts`.
-		emit(operationId, { type: "request_started", credentialId });
-
-		if (!response.body) throw new Error("upstream returned no response body");
+		const first = await client.sendChatRequest(kiroRequest, controller.signal);
 
 		// Determine whether tools are present so leaked XML tool calls in the text
 		// stream are extracted and surfaced as real tool_call events. Without this,
@@ -472,37 +471,79 @@ async function startChat(
 		const hasTools =
 			isRecord(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
 
+		// Inferred from the events seen; only used when upstream did not state a reason.
 		let stopReason = "end_turn";
-		for await (const parsed of parseSSEStream(response.body, {
-			parseTextToolCalls: hasTools,
-			model: modelId,
+		// What upstream actually reported, when it did. Kept separate so a genuine `end_turn` from
+		// the service is not confused with the default above.
+		let reportedStopReason: string | undefined;
+		let emittedContent = false;
+		let credentialId = first.credentialId;
+		let invalidStateSeen = false;
+
+		// A suspension can arrive as an exception frame inside an HTTP 200, after the client has
+		// already recorded this credential as successful. `streamWithFailover` marks it and
+		// replays on a healthy credential when nothing has been emitted yet; see that module for
+		// why the replay is gated on that.
+		for await (const attempt of streamWithFailover(first, {
+			parse: (body) => parseKiroWireStream(body, { parseTextToolCalls: hasTools, model: modelId }),
+			hasEmittedContent: () => emittedContent,
+			isAborted: () => controller.signal.aborted,
+			log,
 		})) {
-			if (controller.signal.aborted) break;
-			if (parsed.invalidState) {
-				// Upstream told us the conversation cannot continue; surface it rather than
-				// ending the turn as if it completed.
-				emit(operationId, {
-					type: "usage",
-					usage: usage.snapshot() ?? {},
-				});
-				finish(operationId, {
-					type: "done",
-					status: "failed",
-					stopReason: "error",
-					credentialId,
-					usage: usage.snapshot(),
-				});
-				manager.reportFailure(credentialId);
-				return;
-			}
-			for (const event of mapKiroEvent(parsed, usage)) {
-				emit(operationId, event);
-				if (event.type === "tool_call.complete" || event.type === "tool_call.end") {
-					stopReason = "tool_use";
+			credentialId = attempt.credentialId;
+			operation.release = attempt.release;
+			// `reasoningSource` is deliberately NOT sent. The host would adopt it as the identity
+			// that minted any thinking signature in this turn and persist it on the stored
+			// reasoning block — but it only holds that override for the lifetime of one adapter,
+			// and the registry builds a fresh adapter per model resolution. On the next turn the
+			// adapter is back to `plugin:<typeId>:<instanceId>`, which no longer matches what was
+			// stored, so `compatibleContinuation` drops the signature and thinking continuity is
+			// lost. Staying silent lets the host use its own stable identity on both the write and
+			// the read, which round-trips correctly. Verified in
+			// `kiro-external-canonical-request.test.ts`.
+			//
+			// Re-emitted per attempt so the host attributes the turn to the credential that
+			// actually served it; it reads this as an update, not as a second turn.
+			emit(operationId, { type: "request_started", credentialId });
+
+			for await (const parsed of attempt.events) {
+				if (controller.signal.aborted) break;
+				if (parsed.invalidState) {
+					// Upstream told us the conversation cannot continue; surface it rather than
+					// ending the turn as if it completed.
+					emit(operationId, { type: "usage", usage: usage.snapshot() ?? {} });
+					finish(operationId, {
+						type: "done",
+						status: "failed",
+						stopReason: "error",
+						credentialId,
+						usage: usage.snapshot(),
+					});
+					manager.reportFailure(credentialId);
+					invalidStateSeen = true;
+					return;
+				}
+				// Upstream states why the turn ended in its `metadataEvent`. Prefer it over the
+				// inference below: a reply cut off at the output limit is otherwise reported as a
+				// normal `end_turn`, and the host — which turns `max_output_tokens` into a visible
+				// truncation notice — has no way to tell the difference.
+				if (parsed.stopReason) reportedStopReason = parsed.stopReason;
+				for (const event of mapKiroEvent(parsed, usage)) {
+					emit(operationId, event);
+					// Tracked so failover knows a replay would duplicate visible output. Usage and
+					// lifecycle events do not count: the host does not render them as content.
+					if (event.type === "text.delta" || event.type === "reasoning.delta") {
+						emittedContent = true;
+					}
+					if (event.type === "tool_call.complete" || event.type === "tool_call.end") {
+						stopReason = "tool_use";
+						emittedContent = true;
+					}
 				}
 			}
 		}
 
+		if (invalidStateSeen) return;
 		if (controller.signal.aborted) {
 			finish(operationId, { type: "done", status: "cancelled", stopReason: "cancelled" });
 			return;
@@ -513,7 +554,9 @@ async function startChat(
 		finish(operationId, {
 			type: "done",
 			status: "completed",
-			stopReason,
+			// Upstream's own verdict wins. The inferred value is the fallback for turns where no
+			// `metadataEvent` arrived, which keeps older/other models working unchanged.
+			stopReason: reportedStopReason ?? stopReason,
 			credentialId,
 			...(finalUsage ? { usage: finalUsage } : {}),
 		});
@@ -582,7 +625,7 @@ async function invokeCommand(id: string | number, params: unknown): Promise<void
 	// call, exactly as it does for provider.chat.
 	const config = isRecord(rawInput) ? rawInput.config : undefined;
 	try {
-		const manager = resolveManager(config);
+		const manager = await resolveManager(config);
 		const result = await handler(rawInput, {
 			manager,
 			credentialsPath: credentialsPathFor(config),
@@ -591,6 +634,11 @@ async function invokeCommand(id: string | number, params: unknown): Promise<void
 			...(result.output === undefined ? {} : { output: result.output as never }),
 			...(result.secretWrites && result.secretWrites.length > 0
 				? { secretWrites: result.secretWrites }
+				: {}),
+			// Non-secret provider settings. Omitted when empty so the response shape is
+			// unchanged for the commands that do not persist config.
+			...(result.configWrites && result.configWrites.length > 0
+				? { configWrites: result.configWrites }
 				: {}),
 		});
 	} catch (error) {
@@ -624,6 +672,16 @@ function handleRequest(message: JsonRpcRequest): void {
 				return;
 			}
 			active = true;
+			// Migrate credentials from the old single-blob layout. Not awaited: activation must
+			// not block on vault I/O, and the migration is idempotent, so a provider request
+			// arriving mid-run joins the same in-flight promise rather than racing it. A failure
+			// is logged and retried on the next request — never fatal to activation, which would
+			// leave the plugin unusable over something recoverable.
+			void ensureMigrated().catch((error: unknown) => {
+				log("credential migration failed; it will be retried on the next request", {
+					error: error instanceof Error ? error.message : "unknown",
+				});
+			});
 			respond(id, { activated: true });
 			return;
 		case "health":

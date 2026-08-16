@@ -78,3 +78,50 @@ describe("provider method wiring", () => {
 		}
 	});
 });
+
+/**
+ * The streaming path must read the format Kiro sends, and must route through failover.
+ *
+ * Both are wiring facts with no visible symptom until they matter:
+ *
+ * - `parseSSEStream` scans for `event:`/`data:` text lines and belongs to NUG, a gateway that
+ *   re-emits Kiro content as text SSE. Kiro answers `GenerateAssistantResponse` over AWS
+ *   event-stream binary frames, so that parser matches nothing and the turn ends **empty** — no
+ *   content, no error. Reintroducing it anywhere in this file would silently break every turn.
+ * - `streamWithFailover` is what marks a credential suspended mid-stream and replays on a healthy
+ *   one. Reading the body directly instead would restore the original bug: an account suspension
+ *   arriving inside an HTTP 200 leaves the credential unmarked, so every later request — each
+ *   compact retry included — reselects the dead account.
+ *
+ * Source inspection for the same reason as above: importing `server.ts` claims stdio. The
+ * behaviour itself is covered against real binary frames in `kiro-external-wire-format.test.ts`
+ * and against a scripted client in `kiro-external-stream-failover.test.ts`.
+ */
+describe("streaming path wiring", () => {
+	test("the plugin never parses Kiro's stream as text SSE", async () => {
+		const source = await Bun.file(SERVER_SOURCE_PATH).text();
+		expect(source).not.toContain("parseSSEStream");
+	});
+
+	test("chat and generate stream through the failover loop", async () => {
+		const source = await Bun.file(SERVER_SOURCE_PATH).text();
+		const body = functionBody(source, "startChat");
+		expect(body, "startChat must route the stream through streamWithFailover").toContain(
+			"streamWithFailover(",
+		);
+		// `provider.generate` shares `startChat`, so one call site covers both; if that ever
+		// splits, generate would silently lose failover.
+		expect(source).toContain('startChat(id, params, "generate")');
+	});
+
+	test("failover is told whether visible content was already emitted", async () => {
+		// The replay is only safe before anything reaches the user, because the host appends
+		// deltas as they arrive and cannot retract a prefix. A `hasEmittedContent` that never
+		// becomes true would duplicate output; one that is always true would disable failover.
+		const source = await Bun.file(SERVER_SOURCE_PATH).text();
+		const body = functionBody(source, "startChat");
+		expect(body).toContain("hasEmittedContent:");
+		expect(body).toContain("emittedContent = true");
+		expect(body, "a cancelled turn must not be replayed").toContain("isAborted:");
+	});
+});

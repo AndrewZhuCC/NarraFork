@@ -18307,6 +18307,15 @@ class KiroQuotaError extends KiroError {
   }
 }
 
+class KiroParseError extends KiroError {
+  kind;
+  constructor(kind, message) {
+    super("PARSE_ERROR", message);
+    this.kind = kind;
+    this.name = "KiroParseError";
+  }
+}
+
 // server/lib/kiro/token-manager.ts
 var IDC_AMZ_USER_AGENT = "aws-sdk-js/3.738.0 ua/2.1 os/other lang/js md/browser#unknown_unknown api/sso-oidc#3.738.0 m/E KiroIDE";
 var API_KEY_EXPIRY_MS = 10 * 365 * 24 * 60 * 60 * 1000;
@@ -19588,6 +19597,12 @@ function isContextLengthExceeded(body) {
 }
 var SUSPENDED_PROSE_RE = /temporarily\s+is\s+suspended|is\s+temporarily\s+suspended|temporarily\s+suspended|locked\s+your\s+account/i;
 var SUSPENDED_EXCEPTION_TYPE_RE = /AccessDeniedException|UnauthorizedException/i;
+function isSuspendedExceptionType(exceptionType, body) {
+  const typeMatches = exceptionType != null && SUSPENDED_EXCEPTION_TYPE_RE.test(exceptionType);
+  if (!typeMatches)
+    return false;
+  return body != null && isAccountSuspended(body);
+}
 function isAccountSuspended(body) {
   if (body.includes("TEMPORARILY_SUSPENDED"))
     return true;
@@ -20953,6 +20968,26 @@ function appendDedupedToolUses(result, toolUses) {
   }
   result.toolUses = next;
 }
+function kiroStopReason(raw) {
+  if (typeof raw !== "string" || raw.trim().length === 0)
+    return;
+  switch (raw.trim().toUpperCase()) {
+    case "END_TURN":
+    case "STOP_SEQUENCE":
+      return "end_turn";
+    case "MAX_TOKENS":
+    case "MAX_OUTPUT_TOKENS":
+    case "LENGTH":
+      return "max_output_tokens";
+    case "TOOL_USE":
+      return "tool_use";
+    case "CONTENT_FILTERED":
+    case "CONTENT_FILTER":
+      return "content_filter";
+    default:
+      return;
+  }
+}
 function parseKiroStreamEvent(evt, options = {}) {
   const gatewayEvent = parseGatewaySSEEvent(evt.eventType, evt.data);
   if (gatewayEvent)
@@ -21053,6 +21088,11 @@ function parseKiroStreamEvent(evt, options = {}) {
       };
     }
   }
+  if (evt.eventType === "metadataEvent") {
+    const reason = kiroStopReason(evt.data.stopReason);
+    if (reason)
+      result.stopReason = reason;
+  }
   if (evt.eventType === "credentialIdEvent") {
     const id = evt.data.credentialId;
     if (id != null) {
@@ -21081,49 +21121,6 @@ function parseKiroStreamEvent(evt, options = {}) {
     };
   }
   return result;
-}
-async function* parseSSEStream(body, options = {}) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder;
-  const toolCallAccumulator = new KiroStreamToolCallAccumulator(options);
-  let buf = "";
-  let currentEventType = "";
-  try {
-    while (true) {
-      const { done, value } = await readWithTimeout(reader, options.staleTimeoutMs);
-      if (done)
-        break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split(`
-`);
-      buf = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.startsWith("event:")) {
-          currentEventType = line.slice(6).trim();
-        } else if (line.startsWith("data:")) {
-          const dataStr = line.slice(5).trimStart();
-          if (!dataStr || dataStr === "[DONE]")
-            continue;
-          try {
-            const data = JSON.parse(dataStr);
-            const embeddedEventType = data && typeof data.type === "string" ? data.type : undefined;
-            const evt = {
-              eventType: currentEventType || embeddedEventType || "assistantResponseEvent",
-              data
-            };
-            yield toolCallAccumulator.process(parseKiroStreamEvent(evt, { ...options, parseTextToolCalls: false }));
-          } catch {}
-        } else if (line.trim() === "") {
-          currentEventType = "";
-        }
-      }
-    }
-    const trailing = toolCallAccumulator.finalize();
-    if (trailing)
-      yield trailing;
-  } finally {
-    reader.releaseLock();
-  }
 }
 
 // shared/codewhisperer/canonical-request.ts
@@ -21641,12 +21638,6 @@ function hasImportableSecret(creds) {
   return !!creds.apiKey?.trim();
 }
 
-// examples/plugins/kiro-external/src/credentials.ts
-import { createHash as createHash3 } from "crypto";
-import { mkdirSync as mkdirSync3 } from "fs";
-import { tmpdir } from "os";
-import { join as join2 } from "path";
-
 // examples/plugins/kiro-external/src/rpc.ts
 var RPC_PROTOCOL = "narrafork.rpc/1";
 var MAX_HEADER_BYTES = 8 * 1024;
@@ -21811,7 +21802,400 @@ function listen(onRequest) {
   process.stdin.on("end", () => process.exit(0));
 }
 
+// examples/plugins/kiro-external/src/credential-vault.ts
+var transport = request;
+function request2(method, params) {
+  return transport(method, params);
+}
+var CREDENTIAL_KEY_PREFIX = "provider.kiro.cred.";
+var INDEX_KEY = "provider.kiro.credentialsIndex";
+var LEGACY_BUNDLE_KEY = "provider.kiro.credentialsBundle";
+var MIGRATED_BUNDLE_KEY = `${LEGACY_BUNDLE_KEY}.migrated`;
+function credentialKey(id) {
+  return `${CREDENTIAL_KEY_PREFIX}${id}`;
+}
+function isCredentialKey(key) {
+  return key.startsWith(CREDENTIAL_KEY_PREFIX);
+}
+async function readKeyState() {
+  const result = await request2("secrets.list", {});
+  const raw = isRecord5(result) && Array.isArray(result.secrets) ? result.secrets : [];
+  const keys = raw.map((item) => isRecord5(item) && typeof item.key === "string" ? item.key : undefined).filter((key) => key !== undefined);
+  return {
+    credentialKeys: keys.filter(isCredentialKey).sort(),
+    hasIndex: keys.includes(INDEX_KEY),
+    hasLegacyBundle: keys.includes(LEGACY_BUNDLE_KEY)
+  };
+}
+async function readSecret(key) {
+  const result = await request2("secrets.get", { key });
+  const value = isRecord5(result) ? result.value : undefined;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+async function writeSecret(key, value) {
+  await request2("secrets.set", { key, value });
+}
+async function deleteSecret(key) {
+  await request2("secrets.delete", { key });
+}
+async function readIndex() {
+  const raw = await readSecret(INDEX_KEY);
+  if (!raw)
+    return;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isRecord5(parsed))
+      return;
+    const revision = typeof parsed.revision === "number" ? parsed.revision : undefined;
+    const count = typeof parsed.count === "number" ? parsed.count : undefined;
+    if (revision === undefined || count === undefined)
+      return;
+    return { revision, count };
+  } catch {
+    log2("credential index is not valid JSON; treating it as absent");
+    return;
+  }
+}
+async function writeIndex(index) {
+  if (index.count <= 0) {
+    await deleteSecret(INDEX_KEY);
+    return;
+  }
+  await writeSecret(INDEX_KEY, JSON.stringify(index));
+}
+async function readLegacyBundle() {
+  return readSecret(LEGACY_BUNDLE_KEY);
+}
+async function readCredential(key) {
+  const raw = await readSecret(key);
+  if (!raw)
+    return;
+  try {
+    const parsed = JSON.parse(raw);
+    return isRecord5(parsed) ? parsed : undefined;
+  } catch {
+    log2(`stored credential could not be parsed: ${key}`);
+    return;
+  }
+}
+async function readCredentials(keys) {
+  const credentials = [];
+  for (const key of keys) {
+    const credential = await readCredential(key);
+    if (credential)
+      credentials.push(credential);
+  }
+  return credentials;
+}
+
+// examples/plugins/kiro-external/src/commands.ts
+function nextRevision(previous) {
+  const now = Date.now();
+  return previous !== undefined && previous >= now ? previous + 1 : now;
+}
+var LOAD_BALANCING_KEY = "provider.kiro.loadBalancingMode";
+
+class CommandInputError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CommandInputError";
+  }
+}
+function requireString(value, field) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new CommandInputError(`${field} is required`);
+  }
+  return value.trim();
+}
+function credentialId(input) {
+  if (!isRecord5(input))
+    throw new CommandInputError("credentialId is required");
+  return requireString(input.credentialId, "credentialId");
+}
+async function currentBundle(manager, credentialsPath) {
+  const { credentials } = loadAllCredentials(credentialsPath);
+  if (credentials.length === 0 && manager.snapshot().entries.length > 0) {
+    throw new CommandInputError("Credential state could not be read back after the change");
+  }
+  const writes = [];
+  const liveKeys = new Set;
+  for (const credential of credentials) {
+    if (!credential.id) {
+      throw new CommandInputError("A credential has no id and cannot be stored");
+    }
+    const key = credentialKey(credential.id);
+    liveKeys.add(key);
+    writes.push({ key, value: JSON.stringify(credential) });
+  }
+  const state = await readKeyState();
+  for (const key of state.credentialKeys) {
+    if (!liveKeys.has(key) && isCredentialKey(key))
+      writes.push({ key, value: null });
+  }
+  const revision = nextRevision((await readIndex())?.revision);
+  writes.push(credentials.length === 0 ? { key: INDEX_KEY, value: null } : { key: INDEX_KEY, value: JSON.stringify({ revision, count: credentials.length }) });
+  return writes;
+}
+function optionalPositiveInt(value, field, max) {
+  if (value === undefined || value === null)
+    return;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
+    throw new CommandInputError(`${field} must be a positive number`);
+  }
+  return Math.min(Math.trunc(value), max);
+}
+function readSnapshotOptions(input) {
+  if (!isRecord5(input))
+    return;
+  const pageSize = optionalPositiveInt(input.pageSize, "pageSize", 100);
+  if (pageSize === undefined)
+    return;
+  return {
+    pageSize,
+    paidPage: optionalPositiveInt(input.paidPage, "paidPage", 1e5) ?? 1,
+    enterprisePage: optionalPositiveInt(input.enterprisePage, "enterprisePage", 1e5) ?? 1,
+    freePage: optionalPositiveInt(input.freePage, "freePage", 1e5) ?? 1
+  };
+}
+function statusOutput(manager, input, credentialsPath) {
+  const options = readSnapshotOptions(input);
+  const snapshot = manager.snapshot(options);
+  const trim = (entries) => entries.map(({ availableModels, ...rest }) => ({
+    ...rest,
+    modelCount: availableModels?.length ?? 0
+  }));
+  const visibleIds = new Set(snapshot.entries.map((entry) => entry.id));
+  const usageCache = {};
+  if (credentialsPath) {
+    try {
+      for (const [id, entry] of Object.entries(loadUsageCache(credentialsPath))) {
+        if (visibleIds.has(id))
+          usageCache[id] = entry;
+      }
+    } catch {}
+  }
+  return {
+    credentialCount: snapshot.total,
+    availableCount: snapshot.available,
+    total: snapshot.total,
+    available: snapshot.available,
+    loadBalancingMode: snapshot.loadBalancingMode,
+    currentId: snapshot.currentId,
+    entries: trim(snapshot.entries),
+    paidEntries: trim(snapshot.paidEntries),
+    enterpriseEntries: trim(snapshot.enterpriseEntries),
+    freeEntries: trim(snapshot.freeEntries),
+    paidTotal: snapshot.paidTotal,
+    enterpriseTotal: snapshot.enterpriseTotal,
+    freeTotal: snapshot.freeTotal,
+    unhealthyTotal: snapshot.unhealthyTotal,
+    usageCache
+  };
+}
+var COMMAND_HANDLERS = {
+  status: async (input, { manager, credentialsPath }) => ({
+    output: statusOutput(manager, input, credentialsPath)
+  }),
+  "credentials.import": async (input, { manager, credentialsPath }) => {
+    if (!isRecord5(input))
+      throw new CommandInputError("credentials payload is required");
+    const raw = input.credentials;
+    const records = Array.isArray(raw) ? raw : isRecord5(raw) ? Object.values(raw) : (() => {
+      throw new CommandInputError("credentials must be an array or object");
+    })();
+    const normalized = normalizeImportCredentials(records).filter(hasImportableSecret);
+    if (normalized.length === 0) {
+      throw new CommandInputError("No importable credentials were found in the payload");
+    }
+    const result = manager.addCredentials(normalized);
+    return {
+      output: { added: result.added, duplicates: result.duplicates },
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.setState": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const state = requireString(isRecord5(input) ? input.state : undefined, "state");
+    switch (state) {
+      case "disabled":
+        manager.setDisabled(id, true);
+        break;
+      case "enabled":
+        manager.setDisabled(id, false);
+        break;
+      case "reset":
+        manager.resetAndEnable(id);
+        break;
+      default:
+        throw new CommandInputError(`state must be disabled, enabled or reset: ${state}`);
+    }
+    return {
+      output: statusOutput(manager, input, credentialsPath),
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.remove": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    manager.removeCredential(id);
+    return {
+      output: statusOutput(manager, input, credentialsPath),
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.removeMany": async (input, { manager, credentialsPath }) => {
+    const raw = isRecord5(input) ? input.credentialIds : undefined;
+    if (!Array.isArray(raw) || raw.length === 0) {
+      throw new CommandInputError("credentialIds must be a non-empty array");
+    }
+    if (raw.length > 500)
+      throw new CommandInputError("credentialIds exceeds the 500 id limit");
+    const ids = raw.map((value, index) => requireString(value, `credentialIds[${index}]`));
+    const result = manager.removeCredentials(ids);
+    return {
+      output: {
+        removed: result.removed,
+        notFound: result.notFound,
+        status: statusOutput(manager, input, credentialsPath)
+      },
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.removeUnhealthy": async (input, { manager, credentialsPath }) => {
+    const result = manager.removeUnhealthyCredentials();
+    return {
+      output: {
+        removed: result.removed,
+        reasons: result.reasons,
+        status: statusOutput(manager, input, credentialsPath)
+      },
+      ...result.removed.length > 0 ? { secretWrites: await currentBundle(manager, credentialsPath) } : {}
+    };
+  },
+  "credentials.setPriority": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const priority = isRecord5(input) ? input.priority : undefined;
+    if (typeof priority !== "number" || !Number.isFinite(priority)) {
+      throw new CommandInputError("priority must be a number");
+    }
+    manager.setPriority(id, Math.trunc(priority));
+    return {
+      output: statusOutput(manager, input, credentialsPath),
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.refresh": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const models = await manager.fetchAndStoreModels(id);
+    return {
+      output: { credentialId: id, modelCount: models.length },
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.update": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const patch = isRecord5(input) && isRecord5(input.fields) ? input.fields : undefined;
+    if (!patch)
+      throw new CommandInputError("fields is required");
+    const allowed = {};
+    const textFields = [
+      "email",
+      "displayName",
+      "region",
+      "authRegion",
+      "apiRegion",
+      "profileArn",
+      "subscriptionTitle",
+      "startUrl",
+      "machineId",
+      "proxyUrl",
+      "proxyUsername"
+    ];
+    for (const field of textFields) {
+      const value = patch[field];
+      if (typeof value === "string")
+        allowed[field] = value;
+    }
+    const secretFields = [
+      "refreshToken",
+      "apiKey",
+      "clientId",
+      "clientSecret",
+      "proxyPassword"
+    ];
+    for (const field of secretFields) {
+      const value = patch[field];
+      if (typeof value === "string" && value.trim().length > 0)
+        allowed[field] = value;
+    }
+    if (typeof patch.authMethod === "string" && patch.authMethod.trim().length > 0) {
+      allowed.authMethod = patch.authMethod.trim();
+    }
+    if (typeof patch.priority === "number" && Number.isFinite(patch.priority)) {
+      allowed.priority = Math.trunc(patch.priority);
+    }
+    if (Object.keys(allowed).length === 0) {
+      throw new CommandInputError("No editable fields were provided");
+    }
+    manager.updateCredential(id, allowed);
+    return {
+      output: statusOutput(manager, input, credentialsPath),
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "credentials.usage": async (input, { manager }) => {
+    const id = credentialId(input);
+    const usage = await manager.getUsageLimits(id);
+    return { output: { credentialId: id, usage } };
+  },
+  "config.setLoadBalancing": async (input, { manager }) => {
+    const mode = requireString(isRecord5(input) ? input.mode : undefined, "mode");
+    if (mode !== "priority" && mode !== "balanced") {
+      throw new CommandInputError(`mode must be priority or balanced: ${mode}`);
+    }
+    manager.setLoadBalancingMode(mode);
+    return {
+      output: { loadBalancingMode: mode },
+      configWrites: [{ key: LOAD_BALANCING_KEY, value: mode }]
+    };
+  },
+  "verify-credential": async (_input, { manager }) => {
+    const result = await manager.listAvailableModels();
+    return { output: { ok: true, modelCount: result.models.length } };
+  },
+  "models.list": async (input, { manager }) => {
+    const id = isRecord5(input) ? input.credentialId : undefined;
+    const result = await manager.listAvailableModels(id || undefined);
+    const models = result.models.map((m) => ({
+      id: String(m.model_id ?? m.modelId ?? ""),
+      displayName: String(m.display_name ?? m.displayName ?? m.model_id ?? m.modelId ?? ""),
+      contextWindow: typeof m.context_window === "number" ? m.context_window : undefined
+    }));
+    return { output: { credentialId: result.credentialId, models } };
+  },
+  "models.refresh": async (input, { manager, credentialsPath }) => {
+    const id = credentialId(input);
+    const modelIds = await manager.fetchAndStoreModels(id);
+    return {
+      output: { credentialId: id, modelCount: modelIds.length, models: modelIds },
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  },
+  "models.refreshAll": async (_input, { manager, credentialsPath }) => {
+    const models = await manager.fetchAllCredentialModels();
+    return {
+      output: { modelCount: models.length },
+      secretWrites: await currentBundle(manager, credentialsPath)
+    };
+  }
+};
+function findCommand(contributionId) {
+  return COMMAND_HANDLERS[contributionId];
+}
+
 // examples/plugins/kiro-external/src/credentials.ts
+import { mkdirSync as mkdirSync3 } from "fs";
+import { tmpdir } from "os";
+import { join as join2 } from "path";
 class MissingCredentialError extends Error {
   constructor(message) {
     super(message);
@@ -21917,9 +22301,6 @@ function hasUsableSecret(credential) {
     return Boolean(credential.clientId && credential.clientSecret);
   return true;
 }
-function serializeBundle(credentials) {
-  return JSON.stringify(credentials);
-}
 function toCredential(config) {
   const authMethod = canonicalizeAuthMethodValue(config.authMethod) ?? "social";
   const missing = [];
@@ -21957,18 +22338,6 @@ function toCredentials(config) {
     return parseBundle(config.credentialsBundle);
   return [toCredential(config)];
 }
-function fingerprint(credential) {
-  const material = [
-    credential.authMethod ?? "",
-    credential.refreshToken ?? "",
-    credential.apiKey ?? "",
-    credential.clientId ?? "",
-    credential.clientSecret ?? "",
-    credential.profileArn ?? "",
-    credential.region ?? ""
-  ].join("\x00");
-  return createHash3("sha256").update(material).digest("hex");
-}
 function pluginDataDir() {
   const base = process.env.NF_PLUGIN_DATA_DIR?.trim();
   const dir = base ? join2(base, "kiro") : join2(tmpdir(), `kiro-external-${process.pid}`);
@@ -21981,12 +22350,48 @@ function credentialsPathFor(_rawConfig) {
   return join2(pluginDataDir(), "credentials.json");
 }
 var cached;
-function resolveManager(rawConfig) {
+function managerConfigKey(config) {
+  return `${config.loadBalancingMode ?? ""}\x00${config.region ?? ""}`;
+}
+async function resolveManager(rawConfig) {
   const config = readConfig(rawConfig);
-  const credentials = toCredentials(config);
-  const key = createHash3("sha256").update(credentials.map(fingerprint).join("\x01")).digest("hex");
-  if (cached?.key === key)
-    return cached.manager;
+  const configKey = managerConfigKey(config);
+  try {
+    return await resolveFromVault(config, configKey);
+  } catch (error) {
+    if (error instanceof MissingCredentialError || error instanceof InvalidBundleError)
+      throw error;
+    log2("credential storage is unavailable; falling back to config", {
+      error: error instanceof Error ? error.message : "unknown"
+    });
+    return buildManager(config, toCredentials(config), -1, configKey);
+  }
+}
+async function resolveFromVault(config, configKey) {
+  const index = await readIndex();
+  if (index) {
+    if (cached && cached.revision === index.revision && cached.configKey === configKey) {
+      return cached.manager;
+    }
+    const state = await readKeyState();
+    const credentials = await readCredentials(state.credentialKeys);
+    if (credentials.length === 0) {
+      throw new MissingCredentialError("Kiro credentials are recorded but could not be read. Re-add a credential.");
+    }
+    return buildManager(config, credentials, index.revision, configKey);
+  }
+  const migration = await ensureMigrated();
+  if (migration.migrated) {
+    const state = await readKeyState();
+    const credentials = await readCredentials(state.credentialKeys);
+    if (credentials.length > 0) {
+      const revision = (await readIndex())?.revision ?? -1;
+      return buildManager(config, credentials, revision, configKey);
+    }
+  }
+  return buildManager(config, toCredentials(config), -1, configKey);
+}
+function buildManager(config, credentials, revision, configKey) {
   const credentialsPath = join2(pluginDataDir(), "credentials.json");
   const kiroConfig = loadConfig(join2(pluginDataDir(), "config.json"));
   const region = config.region ?? credentials[0]?.region ?? kiroConfig.region;
@@ -21995,224 +22400,162 @@ function resolveManager(rawConfig) {
     region,
     ...config.loadBalancingMode === "balanced" || config.loadBalancingMode === "priority" ? { loadBalancingMode: config.loadBalancingMode } : {}
   }, credentials, credentialsPath, true);
-  cached = { key, manager };
-  log2("credential manager built", {
-    credentialCount: credentials.length,
-    keyPrefix: key.slice(0, 8)
-  });
+  cached = { revision, configKey, count: credentials.length, manager };
+  log2("credential manager built", { credentialCount: credentials.length, revision });
   return manager;
 }
 function resetManager() {
   cached = undefined;
 }
 
-// examples/plugins/kiro-external/src/commands.ts
-var BUNDLE_KEY = "provider.kiro.credentialsBundle";
-
-class CommandInputError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "CommandInputError";
+// examples/plugins/kiro-external/src/credential-migration.ts
+var inFlight;
+function ensureMigrated() {
+  if (!inFlight) {
+    inFlight = runMigration().finally(() => {
+      inFlight = undefined;
+    });
   }
+  return inFlight;
 }
-function requireString(value, field) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw new CommandInputError(`${field} is required`);
+async function runMigration() {
+  const state = await readKeyState();
+  if (state.hasIndex) {
+    const index = await readIndex();
+    if (index && index.count === state.credentialKeys.length) {
+      const renamed = state.hasLegacyBundle ? await retireLegacyBundle() : false;
+      return { migrated: true, empty: false, count: index.count, changed: renamed };
+    }
+    log2("credential index disagrees with stored entries; resuming migration", {
+      indexCount: index?.count,
+      storedEntries: state.credentialKeys.length
+    });
   }
-  return value.trim();
-}
-function credentialId(input) {
-  if (!isRecord5(input))
-    throw new CommandInputError("credentialId is required");
-  return requireString(input.credentialId, "credentialId");
-}
-function currentBundle(manager, credentialsPath) {
-  const { credentials } = loadAllCredentials(credentialsPath);
-  if (credentials.length === 0 && manager.snapshot().entries.length > 0) {
-    throw new CommandInputError("Credential state could not be read back after the change");
+  const byId = new Map;
+  for (const credential of await readCredentials(state.credentialKeys)) {
+    if (credential.id)
+      byId.set(credential.id, credential);
   }
-  return [{ key: BUNDLE_KEY, value: serializeBundle(credentials) }];
-}
-function statusOutput(manager) {
-  const snapshot = manager.snapshot();
-  return {
-    credentialCount: snapshot.entries.length,
-    availableCount: snapshot.entries.filter((entry) => !entry.disabled).length,
-    loadBalancingMode: snapshot.loadBalancingMode,
-    currentId: snapshot.currentId,
-    entries: snapshot.entries
-  };
-}
-var COMMAND_HANDLERS = {
-  status: async (_input, { manager }) => ({ output: statusOutput(manager) }),
-  "credentials.import": async (input, { manager, credentialsPath }) => {
-    if (!isRecord5(input))
-      throw new CommandInputError("credentials payload is required");
-    const raw = input.credentials;
-    const records = Array.isArray(raw) ? raw : isRecord5(raw) ? Object.values(raw) : (() => {
-      throw new CommandInputError("credentials must be an array or object");
-    })();
-    const normalized = normalizeImportCredentials(records).filter(hasImportableSecret);
-    if (normalized.length === 0) {
-      throw new CommandInputError("No importable credentials were found in the payload");
+  const alreadyStored = new Set(byId.keys());
+  if (state.hasLegacyBundle) {
+    const blob = await readLegacyBundle();
+    if (blob) {
+      for (const credential of parseBundleSafely(blob)) {
+        if (credential.id && !byId.has(credential.id))
+          byId.set(credential.id, credential);
+      }
     }
-    const result = manager.addCredentials(normalized);
-    return {
-      output: { added: result.added, duplicates: result.duplicates },
-      secretWrites: currentBundle(manager, credentialsPath)
-    };
-  },
-  "credentials.setState": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    const state = requireString(isRecord5(input) ? input.state : undefined, "state");
-    switch (state) {
-      case "disabled":
-        manager.setDisabled(id, true);
-        break;
-      case "enabled":
-        manager.setDisabled(id, false);
-        break;
-      case "reset":
-        manager.resetAndEnable(id);
-        break;
-      default:
-        throw new CommandInputError(`state must be disabled, enabled or reset: ${state}`);
-    }
-    return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
-  },
-  "credentials.remove": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    manager.removeCredential(id);
-    return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
-  },
-  "credentials.setPriority": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    const priority = isRecord5(input) ? input.priority : undefined;
-    if (typeof priority !== "number" || !Number.isFinite(priority)) {
-      throw new CommandInputError("priority must be a number");
-    }
-    manager.setPriority(id, Math.trunc(priority));
-    return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
-  },
-  "credentials.refresh": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    const models = await manager.fetchAndStoreModels(id);
-    return {
-      output: { credentialId: id, modelCount: models.length },
-      secretWrites: currentBundle(manager, credentialsPath)
-    };
-  },
-  "credentials.update": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    const patch = isRecord5(input) && isRecord5(input.fields) ? input.fields : undefined;
-    if (!patch)
-      throw new CommandInputError("fields is required");
-    const allowed = {};
-    const textFields = [
-      "email",
-      "displayName",
-      "region",
-      "authRegion",
-      "apiRegion",
-      "profileArn",
-      "subscriptionTitle",
-      "startUrl",
-      "machineId",
-      "proxyUrl",
-      "proxyUsername"
-    ];
-    for (const field of textFields) {
-      const value = patch[field];
-      if (typeof value === "string")
-        allowed[field] = value;
-    }
-    const secretFields = [
-      "refreshToken",
-      "apiKey",
-      "clientId",
-      "clientSecret",
-      "proxyPassword"
-    ];
-    for (const field of secretFields) {
-      const value = patch[field];
-      if (typeof value === "string" && value.trim().length > 0)
-        allowed[field] = value;
-    }
-    if (typeof patch.authMethod === "string" && patch.authMethod.trim().length > 0) {
-      allowed.authMethod = patch.authMethod.trim();
-    }
-    if (typeof patch.priority === "number" && Number.isFinite(patch.priority)) {
-      allowed.priority = Math.trunc(patch.priority);
-    }
-    if (Object.keys(allowed).length === 0) {
-      throw new CommandInputError("No editable fields were provided");
-    }
-    manager.updateCredential(id, allowed);
-    return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
-  },
-  "credentials.usage": async (input, { manager }) => {
-    const id = credentialId(input);
-    const usage = await manager.getUsageLimits(id);
-    return { output: { credentialId: id, usage } };
-  },
-  "config.setLoadBalancing": async (input, { manager }) => {
-    const mode = requireString(isRecord5(input) ? input.mode : undefined, "mode");
-    if (mode !== "priority" && mode !== "balanced") {
-      throw new CommandInputError(`mode must be priority or balanced: ${mode}`);
-    }
-    manager.setLoadBalancingMode(mode);
-    return { output: { loadBalancingMode: mode } };
-  },
-  "verify-credential": async (_input, { manager }) => {
-    const result = await manager.listAvailableModels();
-    return { output: { ok: true, modelCount: result.models.length } };
-  },
-  "models.list": async (input, { manager }) => {
-    const id = isRecord5(input) ? input.credentialId : undefined;
-    const result = await manager.listAvailableModels(id || undefined);
-    const models = result.models.map((m) => ({
-      id: String(m.model_id ?? m.modelId ?? ""),
-      displayName: String(m.display_name ?? m.displayName ?? m.model_id ?? m.modelId ?? ""),
-      contextWindow: typeof m.context_window === "number" ? m.context_window : undefined
-    }));
-    return { output: { credentialId: result.credentialId, models } };
-  },
-  "models.refresh": async (input, { manager, credentialsPath }) => {
-    const id = credentialId(input);
-    const modelIds = await manager.fetchAndStoreModels(id);
-    return {
-      output: { credentialId: id, modelCount: modelIds.length, models: modelIds },
-      secretWrites: currentBundle(manager, credentialsPath)
-    };
   }
-};
-function findCommand(contributionId) {
-  return COMMAND_HANDLERS[contributionId];
+  if (byId.size === 0) {
+    return { migrated: false, empty: true, count: 0, changed: false };
+  }
+  let written = 0;
+  for (const [id, credential] of byId) {
+    if (alreadyStored.has(id))
+      continue;
+    await writeSecret(credentialKey(id), JSON.stringify(credential));
+    written += 1;
+  }
+  const after = await readKeyState();
+  if (after.credentialKeys.length !== byId.size) {
+    throw new Error(`Credential migration did not converge: expected ${byId.size} entries, found ${after.credentialKeys.length}. The original bundle was left untouched.`);
+  }
+  await writeIndex({ revision: Date.now(), count: byId.size });
+  if (state.hasLegacyBundle)
+    await retireLegacyBundle();
+  log2("credential migration complete", {
+    total: byId.size,
+    written,
+    resumed: alreadyStored.size > 0
+  });
+  return { migrated: true, empty: false, count: byId.size, changed: true };
+}
+async function retireLegacyBundle() {
+  const blob = await readLegacyBundle();
+  if (!blob)
+    return false;
+  await writeSecret(MIGRATED_BUNDLE_KEY, blob);
+  await deleteSecret(LEGACY_BUNDLE_KEY);
+  return true;
+}
+function parseBundleSafely(blob) {
+  try {
+    return parseBundle(blob);
+  } catch (error) {
+    log2("legacy credential bundle could not be parsed; migrating what is already stored", {
+      error: error instanceof Error ? error.message : "unknown"
+    });
+    return [];
+  }
 }
 
 // examples/plugins/kiro-external/src/credential-writeback.ts
-import { createHash as createHash4 } from "crypto";
-import { readFileSync as readFileSync2 } from "fs";
-var VAULT_BUNDLE_KEY = "provider.kiro.credentialsBundle";
-function credentialFileHash(credentialsPath) {
+import { createHash as createHash3 } from "crypto";
+import { readFile } from "fs/promises";
+async function credentialFileHash(credentialsPath) {
   try {
-    return createHash4("sha256").update(readFileSync2(credentialsPath, "utf-8")).digest("hex");
+    const content = await readFile(credentialsPath, "utf-8");
+    return createHash3("sha256").update(content).digest("hex");
   } catch {
     return null;
   }
 }
-function writebackIfChanged(credentialsPath, hashBefore, deps) {
-  const hashAfter = credentialFileHash(credentialsPath);
-  if (!hashAfter || hashAfter === hashBefore)
-    return;
-  const { credentials } = loadAllCredentials(credentialsPath);
-  if (credentials.length === 0)
-    return;
-  deps.request("secrets.set", { key: VAULT_BUNDLE_KEY, value: serializeBundle(credentials) }).catch((error) => {
-    deps.log("secrets.set failed (credential writeback)", {
+async function writebackIfChanged(credentialsPath, hashBefore, deps) {
+  try {
+    const hashAfter = await credentialFileHash(credentialsPath);
+    if (!hashAfter || hashAfter === hashBefore)
+      return;
+    const { credentials } = loadAllCredentials(credentialsPath);
+    if (credentials.length === 0)
+      return;
+    await resyncVault(credentials, deps);
+  } catch (error) {
+    deps.log("credential writeback failed", {
       error: error instanceof Error ? error.message : "unknown"
     });
-  });
+  }
+}
+async function resyncVault(credentials, deps) {
+  try {
+    for (const credential of credentials) {
+      if (!credential.id)
+        continue;
+      await deps.request("secrets.set", {
+        key: credentialKey(credential.id),
+        value: JSON.stringify(credential)
+      });
+    }
+    const raw = await deps.request("secrets.get", { key: INDEX_KEY });
+    const previous = readRevision(raw);
+    const now = Date.now();
+    await deps.request("secrets.set", {
+      key: INDEX_KEY,
+      value: JSON.stringify({
+        revision: previous !== undefined && previous >= now ? previous + 1 : now,
+        count: credentials.length
+      })
+    });
+  } catch (error) {
+    deps.log("credential writeback to the vault failed", {
+      error: error instanceof Error ? error.message : "unknown"
+    });
+  }
+}
+function readRevision(raw) {
+  if (typeof raw !== "object" || raw === null)
+    return;
+  const value = raw.value;
+  if (typeof value !== "string" || value.length === 0)
+    return;
+  try {
+    const parsed = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null)
+      return;
+    const revision = parsed.revision;
+    return typeof revision === "number" ? revision : undefined;
+  } catch {
+    return;
+  }
 }
 
 // examples/plugins/kiro-external/src/event-mapping.ts
@@ -22745,13 +23088,359 @@ function searchResultFromMcp(response, query) {
   return { text: text2 };
 }
 async function runSearch(config, params, signal) {
-  const manager = resolveManager(config);
+  const manager = await resolveManager(config);
   const client = new KiroMcpClient(manager);
   const args = { query: params.query };
   if (params.maxResults != null)
     args.maxResults = params.maxResults;
   const response = await client.callTool("web_search", args, signal);
   return searchResultFromMcp(response, params.query);
+}
+
+// examples/plugins/kiro-external/src/stream-failover.ts
+function isSuspensionStreamError(error) {
+  if (!(error instanceof KiroApiError))
+    return false;
+  return isSuspendedExceptionType(error.code, error.message);
+}
+var MAX_FAILOVER_ITERATIONS = 20;
+async function* streamWithFailover(initial, options) {
+  let chat = initial;
+  let iterations = 0;
+  while (true) {
+    iterations += 1;
+    if (iterations > MAX_FAILOVER_ITERATIONS) {
+      throw new Error(`streamWithFailover exceeded ${MAX_FAILOVER_ITERATIONS} iterations \u2014 ` + "likely a bug in replay budget tracking or suspension detection");
+    }
+    const { response, credentialId: credentialId2, release } = chat;
+    if (!response.body) {
+      release();
+      throw new Error("upstream returned no response body");
+    }
+    const body = response.body;
+    let suspension;
+    try {
+      yield {
+        credentialId: credentialId2,
+        release,
+        events: async function* () {
+          try {
+            yield* options.parse(body);
+          } catch (error) {
+            if (!isSuspensionStreamError(error))
+              throw error;
+            suspension = error;
+          }
+        }()
+      };
+    } finally {
+      release();
+    }
+    if (!suspension)
+      return;
+    const hasAlternative = chat.reportStreamFailure("account_suspended");
+    if (options.hasEmittedContent() || !hasAlternative || options.isAborted()) {
+      options.log("credential suspended mid-stream; not replaying", {
+        emittedContent: options.hasEmittedContent(),
+        hasAlternative,
+        aborted: options.isAborted()
+      });
+      throw suspension;
+    }
+    options.log("credential suspended mid-stream; replaying on another credential");
+    chat = await chat.retryWithNextCredential();
+  }
+}
+// server/lib/kiro/event-stream-parser.ts
+var PRELUDE_SIZE = 12;
+var MIN_MESSAGE_SIZE = PRELUDE_SIZE + 4;
+var MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
+var DEFAULT_MAX_ERRORS = 5;
+var DEFAULT_MAX_BUFFER_SIZE = MAX_MESSAGE_SIZE;
+function crc32(data) {
+  return Bun.hash.crc32(data);
+}
+function readU32BE(buf, offset) {
+  return (buf[offset] << 24 | buf[offset + 1] << 16 | buf[offset + 2] << 8 | buf[offset + 3]) >>> 0;
+}
+function readU16BE(buf, offset) {
+  return buf[offset] << 8 | buf[offset + 1];
+}
+function parseHeaders(data, headerLength) {
+  const result = {};
+  let offset = 0;
+  while (offset < headerLength) {
+    if (offset >= data.length)
+      break;
+    const nameLen = data[offset];
+    offset += 1;
+    if (nameLen === 0 || offset + nameLen > data.length)
+      break;
+    const name = new TextDecoder().decode(data.subarray(offset, offset + nameLen));
+    offset += nameLen;
+    if (offset >= data.length)
+      break;
+    const valueType = data[offset];
+    offset += 1;
+    switch (valueType) {
+      case 0:
+      case 1:
+        break;
+      case 2:
+        offset += 1;
+        break;
+      case 3:
+        offset += 2;
+        break;
+      case 4:
+        offset += 4;
+        break;
+      case 5:
+      case 8:
+        offset += 8;
+        break;
+      case 6: {
+        if (offset + 2 > data.length)
+          return result;
+        const len = readU16BE(data, offset);
+        offset += 2 + len;
+        break;
+      }
+      case 7: {
+        if (offset + 2 > data.length)
+          return result;
+        const len = readU16BE(data, offset);
+        offset += 2;
+        if (offset + len > data.length)
+          return result;
+        const val = new TextDecoder().decode(data.subarray(offset, offset + len));
+        offset += len;
+        if (name === ":message-type")
+          result.messageType = val;
+        else if (name === ":event-type")
+          result.eventType = val;
+        else if (name === ":exception-type")
+          result.exceptionType = val;
+        else if (name === ":error-code")
+          result.errorCode = val;
+        break;
+      }
+      case 9:
+        offset += 16;
+        break;
+      default:
+        return result;
+    }
+  }
+  return result;
+}
+function parseFrameTyped(buffer) {
+  if (buffer.length < PRELUDE_SIZE)
+    return null;
+  const totalLength = readU32BE(buffer, 0);
+  const headerLength = readU32BE(buffer, 4);
+  const preludeCrc = readU32BE(buffer, 8);
+  if (totalLength < MIN_MESSAGE_SIZE) {
+    return {
+      ok: false,
+      error: new KiroParseError("message_too_small", `Message too small: ${totalLength}`)
+    };
+  }
+  if (totalLength > MAX_MESSAGE_SIZE) {
+    return {
+      ok: false,
+      error: new KiroParseError("message_too_large", `Message too large: ${totalLength}`)
+    };
+  }
+  if (headerLength > totalLength - MIN_MESSAGE_SIZE) {
+    return {
+      ok: false,
+      error: new KiroParseError("header_parse_failed", "Header length exceeds frame")
+    };
+  }
+  if (buffer.length < totalLength)
+    return null;
+  const actualPreludeCrc = crc32(buffer.subarray(0, 8));
+  if (actualPreludeCrc !== preludeCrc) {
+    return { ok: false, error: new KiroParseError("prelude_crc_mismatch", "Prelude CRC mismatch") };
+  }
+  const messageCrc = readU32BE(buffer, totalLength - 4);
+  const actualMessageCrc = crc32(buffer.subarray(0, totalLength - 4));
+  if (actualMessageCrc !== messageCrc) {
+    return { ok: false, error: new KiroParseError("message_crc_mismatch", "Message CRC mismatch") };
+  }
+  const headersStart = PRELUDE_SIZE;
+  const headersEnd = headersStart + headerLength;
+  const headers = parseHeaders(buffer.subarray(headersStart, headersEnd), headerLength);
+  const payload = buffer.slice(headersEnd, totalLength - 4);
+  return { ok: true, frame: { headers, payload, consumed: totalLength } };
+}
+
+class EventStreamDecoder {
+  buffer = new Uint8Array(0);
+  state = "ready";
+  framesDecoded = 0;
+  errorCount = 0;
+  maxErrors;
+  maxBufferSize;
+  bytesSkipped = 0;
+  constructor(maxErrors = DEFAULT_MAX_ERRORS, maxBufferSize = DEFAULT_MAX_BUFFER_SIZE) {
+    this.maxErrors = maxErrors;
+    this.maxBufferSize = maxBufferSize;
+  }
+  feed(data) {
+    const newSize = this.buffer.length + data.length;
+    if (newSize > this.maxBufferSize) {
+      throw new KiroParseError("buffer_overflow", `Buffer overflow: ${newSize} > ${this.maxBufferSize}`);
+    }
+    const newBuf = new Uint8Array(newSize);
+    newBuf.set(this.buffer);
+    newBuf.set(data, this.buffer.length);
+    this.buffer = newBuf;
+    if (this.state === "recovering")
+      this.state = "ready";
+  }
+  decode() {
+    if (this.state === "stopped") {
+      throw new KiroParseError("too_many_errors", `Decoder stopped after ${this.errorCount} errors`);
+    }
+    if (this.buffer.length === 0) {
+      this.state = "ready";
+      return null;
+    }
+    this.state = "parsing";
+    const result = parseFrameTyped(this.buffer);
+    if (result === null) {
+      this.state = "ready";
+      return null;
+    }
+    if (result.ok) {
+      this.buffer = this.buffer.subarray(result.frame.consumed);
+      this.state = "ready";
+      this.framesDecoded++;
+      this.errorCount = 0;
+      return result.frame;
+    }
+    this.errorCount++;
+    if (this.errorCount >= this.maxErrors) {
+      this.state = "stopped";
+      throw new KiroParseError("too_many_errors", `Too many errors (${this.errorCount}): ${result.error.message}`);
+    }
+    this.tryRecover(result.error.kind);
+    this.state = "recovering";
+    return null;
+  }
+  *decodeAll() {
+    while (true) {
+      if (this.state === "stopped" || this.state === "recovering")
+        return;
+      const frame = this.decode();
+      if (!frame)
+        return;
+      yield frame;
+    }
+  }
+  tryResume() {
+    if (this.state === "stopped") {
+      this.errorCount = 0;
+      this.state = "ready";
+    }
+  }
+  reset() {
+    this.buffer = new Uint8Array(0);
+    this.state = "ready";
+    this.framesDecoded = 0;
+    this.errorCount = 0;
+    this.bytesSkipped = 0;
+  }
+  get currentState() {
+    return this.state;
+  }
+  get decodedCount() {
+    return this.framesDecoded;
+  }
+  get errors() {
+    return this.errorCount;
+  }
+  get skipped() {
+    return this.bytesSkipped;
+  }
+  get bufferLength() {
+    return this.buffer.length;
+  }
+  tryRecover(kind) {
+    if (this.buffer.length === 0)
+      return;
+    switch (kind) {
+      case "prelude_crc_mismatch":
+      case "message_too_small":
+      case "message_too_large":
+        this.buffer = this.buffer.subarray(1);
+        this.bytesSkipped++;
+        break;
+      case "message_crc_mismatch":
+      case "header_parse_failed": {
+        if (this.buffer.length >= PRELUDE_SIZE) {
+          const totalLength = readU32BE(this.buffer, 0);
+          if (totalLength >= MIN_MESSAGE_SIZE && totalLength <= this.buffer.length) {
+            this.buffer = this.buffer.subarray(totalLength);
+            this.bytesSkipped += totalLength;
+            break;
+          }
+        }
+        this.buffer = this.buffer.subarray(1);
+        this.bytesSkipped++;
+        break;
+      }
+      default:
+        this.buffer = this.buffer.subarray(1);
+        this.bytesSkipped++;
+        break;
+    }
+  }
+}
+async function* parseEventStream(body) {
+  const reader = body.getReader();
+  const decoder2 = new EventStreamDecoder;
+  const td = new TextDecoder;
+  try {
+    while (true) {
+      const { done, value } = await readWithTimeout(reader);
+      if (done)
+        break;
+      decoder2.feed(value);
+      for (const frame of decoder2.decodeAll()) {
+        const { headers, payload } = frame;
+        if (headers.messageType === "exception") {
+          const msg = td.decode(payload);
+          throw new KiroApiError(headers.exceptionType ?? "UnknownException", msg);
+        }
+        if (headers.messageType === "error") {
+          const msg = td.decode(payload);
+          throw new KiroApiError(headers.errorCode ?? "UnknownError", msg);
+        }
+        if (headers.messageType === "event" && headers.eventType) {
+          try {
+            const data = JSON.parse(td.decode(payload));
+            yield { eventType: headers.eventType, data };
+          } catch {}
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+// examples/plugins/kiro-external/src/wire-stream.ts
+async function* parseKiroWireStream(body, options = {}) {
+  const toolCallAccumulator = new KiroStreamToolCallAccumulator(options);
+  for await (const event of parseEventStream(body)) {
+    yield toolCallAccumulator.process(parseKiroStreamEvent(event, { ...options, parseTextToolCalls: false }));
+  }
+  const trailing = toolCallAccumulator.finalize();
+  if (trailing)
+    yield trailing;
 }
 
 // examples/plugins/kiro-external/src/server.ts
@@ -22823,7 +23512,7 @@ function describeProvider(id, params) {
         configSchema: {
           type: "object",
           properties: {
-            credentialsBundle: { type: "string", writeOnly: true, "x-narrafork-secret": true },
+            credentialsIndex: { type: "string", writeOnly: true, "x-narrafork-secret": true },
             loadBalancingMode: {
               type: "string",
               enum: ["priority", "balanced"],
@@ -22863,7 +23552,7 @@ async function listModels(id, params) {
   const config = isRecord5(params) ? params.config : undefined;
   let manager;
   try {
-    manager = resolveManager(config);
+    manager = await resolveManager(config);
   } catch (error) {
     if (error instanceof MissingCredentialError) {
       log2("listModels called before credentials were configured");
@@ -22875,7 +23564,7 @@ async function listModels(id, params) {
     return;
   }
   const credPath = credentialsPathFor(config);
-  const hashBefore = credentialFileHash(credPath);
+  const hashBefore = await credentialFileHash(credPath);
   try {
     const result = await manager.listAvailableModels();
     const models = result.models.map((model) => {
@@ -22914,7 +23603,7 @@ async function search(id, params) {
   }
   const config = isRecord5(params) ? params.config : undefined;
   const credPath = credentialsPathFor(config);
-  const hashBefore = credentialFileHash(credPath);
+  const hashBefore = await credentialFileHash(credPath);
   try {
     respond(id, await runSearch(config, searchParams));
   } catch (error) {
@@ -22928,7 +23617,7 @@ async function validateConfig(id, params) {
   applyHostHints(params);
   const config = isRecord5(params) ? params.config : undefined;
   try {
-    resolveManager(config);
+    await resolveManager(config);
   } catch (error) {
     if (error instanceof MissingCredentialError) {
       respond(id, { valid: false, issues: [{ path: "/", message: error.message }] });
@@ -22942,7 +23631,7 @@ async function validateConfig(id, params) {
     return;
   }
   try {
-    const manager = resolveManager(config);
+    const manager = await resolveManager(config);
     const result = await manager.listAvailableModels();
     respond(id, {
       valid: true,
@@ -22955,24 +23644,24 @@ async function validateConfig(id, params) {
   }
 }
 function buildUpstreamRequest(kind, params, operationId, modelId) {
-  const request2 = isRecord5(params) ? params.request : undefined;
+  const request3 = isRecord5(params) ? params.request : undefined;
   const conversation = isRecord5(params) ? params.conversation : undefined;
   const conversationId = isRecord5(conversation) && typeof conversation.conversationId === "string" ? conversation.conversationId : operationId;
   if (kind === "generate") {
     return toKiroGenerateRequest({
       conversationId,
       modelId,
-      request: request2,
+      request: request3,
       reminder: "Reply with ONLY a short title (max 50 chars), nothing else.",
       ack: "Understood. I will generate only a short title. Send me the content."
     });
   }
-  const current = isRecord5(request2) ? request2.current : undefined;
+  const current = isRecord5(request3) ? request3.current : undefined;
   return toKiroChatRequest({
     conversationId,
     modelId,
-    history: isRecord5(request2) && Array.isArray(request2.history) ? request2.history : [],
-    tools: isRecord5(request2) && Array.isArray(request2.tools) ? request2.tools : [],
+    history: isRecord5(request3) && Array.isArray(request3.history) ? request3.history : [],
+    tools: isRecord5(request3) && Array.isArray(request3.tools) ? request3.tools : [],
     current: isRecord5(current) ? current : {}
   });
 }
@@ -22997,46 +23686,59 @@ async function startChat(id, params, kind = "chat") {
   const usage = new UsageAccumulator;
   usage.setContextWindow(contextWindowFor(modelId));
   const credPath = credentialsPathFor(config);
-  const hashBefore = credentialFileHash(credPath);
+  const hashBefore = await credentialFileHash(credPath);
   try {
-    const manager = resolveManager(config);
+    const manager = await resolveManager(config);
     const client = new KiroApiClient(manager);
     const kiroRequest = buildUpstreamRequest(kind, params, operationId, modelId);
-    const { response, credentialId: credentialId2, release } = await client.sendChatRequest(kiroRequest, controller.signal);
-    operation.release = release;
-    emit(operationId, { type: "request_started", credentialId: credentialId2 });
-    if (!response.body)
-      throw new Error("upstream returned no response body");
+    const first = await client.sendChatRequest(kiroRequest, controller.signal);
     const hasTools = isRecord5(chatRequest) && Array.isArray(chatRequest.tools) && chatRequest.tools.length > 0;
     let stopReason = "end_turn";
-    for await (const parsed of parseSSEStream(response.body, {
-      parseTextToolCalls: hasTools,
-      model: modelId
+    let reportedStopReason;
+    let emittedContent = false;
+    let credentialId2 = first.credentialId;
+    let invalidStateSeen = false;
+    for await (const attempt of streamWithFailover(first, {
+      parse: (body) => parseKiroWireStream(body, { parseTextToolCalls: hasTools, model: modelId }),
+      hasEmittedContent: () => emittedContent,
+      isAborted: () => controller.signal.aborted,
+      log: log2
     })) {
-      if (controller.signal.aborted)
-        break;
-      if (parsed.invalidState) {
-        emit(operationId, {
-          type: "usage",
-          usage: usage.snapshot() ?? {}
-        });
-        finish(operationId, {
-          type: "done",
-          status: "failed",
-          stopReason: "error",
-          credentialId: credentialId2,
-          usage: usage.snapshot()
-        });
-        manager.reportFailure(credentialId2);
-        return;
-      }
-      for (const event of mapKiroEvent(parsed, usage)) {
-        emit(operationId, event);
-        if (event.type === "tool_call.complete" || event.type === "tool_call.end") {
-          stopReason = "tool_use";
+      credentialId2 = attempt.credentialId;
+      operation.release = attempt.release;
+      emit(operationId, { type: "request_started", credentialId: credentialId2 });
+      for await (const parsed of attempt.events) {
+        if (controller.signal.aborted)
+          break;
+        if (parsed.invalidState) {
+          emit(operationId, { type: "usage", usage: usage.snapshot() ?? {} });
+          finish(operationId, {
+            type: "done",
+            status: "failed",
+            stopReason: "error",
+            credentialId: credentialId2,
+            usage: usage.snapshot()
+          });
+          manager.reportFailure(credentialId2);
+          invalidStateSeen = true;
+          return;
+        }
+        if (parsed.stopReason)
+          reportedStopReason = parsed.stopReason;
+        for (const event of mapKiroEvent(parsed, usage)) {
+          emit(operationId, event);
+          if (event.type === "text.delta" || event.type === "reasoning.delta") {
+            emittedContent = true;
+          }
+          if (event.type === "tool_call.complete" || event.type === "tool_call.end") {
+            stopReason = "tool_use";
+            emittedContent = true;
+          }
         }
       }
     }
+    if (invalidStateSeen)
+      return;
     if (controller.signal.aborted) {
       finish(operationId, { type: "done", status: "cancelled", stopReason: "cancelled" });
       return;
@@ -23048,7 +23750,7 @@ async function startChat(id, params, kind = "chat") {
     finish(operationId, {
       type: "done",
       status: "completed",
-      stopReason,
+      stopReason: reportedStopReason ?? stopReason,
       credentialId: credentialId2,
       ...finalUsage ? { usage: finalUsage } : {}
     });
@@ -23100,14 +23802,15 @@ async function invokeCommand(id, params) {
   const rawInput = isRecord5(params) ? params.input : undefined;
   const config = isRecord5(rawInput) ? rawInput.config : undefined;
   try {
-    const manager = resolveManager(config);
+    const manager = await resolveManager(config);
     const result = await handler(rawInput, {
       manager,
       credentialsPath: credentialsPathFor(config)
     });
     respond(id, {
       ...result.output === undefined ? {} : { output: result.output },
-      ...result.secretWrites && result.secretWrites.length > 0 ? { secretWrites: result.secretWrites } : {}
+      ...result.secretWrites && result.secretWrites.length > 0 ? { secretWrites: result.secretWrites } : {},
+      ...result.configWrites && result.configWrites.length > 0 ? { configWrites: result.configWrites } : {}
     });
   } catch (error) {
     if (error instanceof CommandInputError) {
@@ -23139,6 +23842,11 @@ function handleRequest(message) {
         return;
       }
       active = true;
+      ensureMigrated().catch((error) => {
+        log2("credential migration failed; it will be retried on the next request", {
+          error: error instanceof Error ? error.message : "unknown"
+        });
+      });
       respond(id, { activated: true });
       return;
     case "health":

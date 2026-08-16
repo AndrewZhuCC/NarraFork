@@ -160,6 +160,14 @@ effectiveCapabilities =
 
 ## 6. 网络权限
 
+### 6.0 当前实现状态
+
+> **[当前事实]** 截至本文更新，`manifest.permissions.network` 字段**仅用于声明与审计，不是运行时强制的沙箱边界**。`local-process` runner 继承宿主完整网络栈，即使 manifest 声明了严格的域名 allowlist（如 kiro-external 示例中的 `allow: ["*.amazonaws.com", …]`），也没有任何运行时机制过滤出站连接。
+>
+> 强制 allowlist 需要 Linux network namespace（netns + iptables owner-match）或 Podman runner 的 `--network` 隔离。这是独立的大型工程，不应依赖当前字段的存在而假设已有强制。
+>
+> 代理 URL 的 SSRF 缓解已在 `plugin-provider-proxy-policy.ts` 中实现（拒绝私有/保留地址，可通过 `settings.plugins.allowPrivateProxyTarget` 放行），但这只覆盖宿主主动推送给插件的代理配置，不限制插件自身的出站能力。
+
 ### 6.1 默认策略
 
 **[设计建议]** 后端插件和 UI iframe 的默认网络策略都是 `none`：

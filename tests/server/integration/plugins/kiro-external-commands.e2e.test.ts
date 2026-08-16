@@ -24,7 +24,14 @@ import { PluginSecretVault } from "@server/services/plugin-secret-vault";
  */
 
 const PLUGIN_ROOT = resolve(import.meta.dir, "../../../../examples/plugins/kiro-external");
-const BUNDLE_KEY = "provider.kiro.credentialsBundle";
+const PLUGIN_ID = "com.narrafork.kiro-external";
+
+/** Fixed bookkeeping key. Each credential lives under its own `provider.kiro.cred.<id>`. */
+const INDEX_KEY = "provider.kiro.credentialsIndex";
+
+function credKey(id: string): string {
+	return `provider.kiro.cred.${id}`;
+}
 
 const roots: string[] = [];
 
@@ -36,9 +43,49 @@ async function loadManifest() {
 	return parseManifest(JSON.parse(await readFile(join(PLUGIN_ROOT, "manifest.json"), "utf8")));
 }
 
-function createRuntime(manifest: Awaited<ReturnType<typeof loadManifest>>): PluginRuntime {
+/**
+ * Serves the plugin's own `secrets.*` calls out of a real vault.
+ *
+ * Needed because credentials no longer arrive inside `config`: the plugin reads them itself, so
+ * a subprocess with no `secrets.*` channel would find none and every command would report an
+ * unconfigured provider. Only the four secret methods are served — anything else the plugin
+ * asked for would be a change worth noticing rather than silently satisfying.
+ */
+function secretDispatcher(vault: PluginSecretVault) {
+	return {
+		dispatch: async (request: { method: string; params?: unknown }) => {
+			const { key, value } = (request.params ?? {}) as { key?: string; value?: string };
+			switch (request.method) {
+				case "secrets.get":
+					return {
+						value: key ? await vault.getSecret({ pluginId: PLUGIN_ID, key }) : undefined,
+					};
+				case "secrets.set":
+					if (key && value !== undefined) {
+						await vault.setSecret({ pluginId: PLUGIN_ID, key, value });
+					}
+					return { stored: true };
+				case "secrets.delete":
+					if (key) await vault.deleteSecret({ pluginId: PLUGIN_ID, key });
+					return { deleted: true };
+				case "secrets.list":
+					return {
+						secrets: (await vault.listKeys(PLUGIN_ID)).map((name) => ({ key: name })),
+					};
+				default:
+					throw new Error(`unexpected plugin->host method: ${request.method}`);
+			}
+		},
+	};
+}
+
+function createRuntime(
+	manifest: Awaited<ReturnType<typeof loadManifest>>,
+	vault: PluginSecretVault,
+): PluginRuntime {
 	if (!manifest.server) throw new Error("plugin must declare a server entry");
 	return new PluginRuntime({
+		dispatcher: secretDispatcher(vault) as never,
 		pluginId: manifest.pluginId,
 		pluginVersion: manifest.version,
 		command: [process.execPath, join(PLUGIN_ROOT, manifest.server.entry)],
@@ -76,16 +123,44 @@ function createRuntime(manifest: Awaited<ReturnType<typeof loadManifest>>): Plug
 	});
 }
 
-function bundleOf(entries: Array<{ id: string; priority?: number; disabled?: boolean }>): string {
-	return JSON.stringify(
-		entries.map((entry) => ({
-			id: entry.id,
-			authMethod: "social",
-			refreshToken: `rt-${entry.id}`,
-			...(entry.priority === undefined ? {} : { priority: entry.priority }),
-			...(entry.disabled === undefined ? {} : { disabled: entry.disabled }),
-		})),
+/** Write credentials into the vault the way the plugin itself stores them. */
+async function seedCredentials(
+	vault: PluginSecretVault,
+	entries: Array<{ id: string; priority?: number; disabled?: boolean }>,
+): Promise<void> {
+	for (const entry of entries) {
+		await vault.setSecret({
+			pluginId: PLUGIN_ID,
+			key: credKey(entry.id),
+			value: JSON.stringify({
+				id: entry.id,
+				authMethod: "social",
+				refreshToken: `rt-${entry.id}`,
+				...(entry.priority === undefined ? {} : { priority: entry.priority }),
+				...(entry.disabled === undefined ? {} : { disabled: entry.disabled }),
+			}),
+		});
+	}
+	await vault.setSecret({
+		pluginId: PLUGIN_ID,
+		key: INDEX_KEY,
+		value: JSON.stringify({ revision: 1, count: entries.length }),
+	});
+}
+
+/** Every stored credential, read back out of the vault. */
+async function storedCredentials(
+	vault: PluginSecretVault,
+): Promise<Array<Record<string, unknown>>> {
+	const keys = (await vault.listKeys(PLUGIN_ID)).filter((key) =>
+		key.startsWith("provider.kiro.cred."),
 	);
+	const credentials: Array<Record<string, unknown>> = [];
+	for (const key of keys.sort()) {
+		const raw = await vault.getSecret({ pluginId: PLUGIN_ID, key });
+		if (raw) credentials.push(JSON.parse(raw) as Record<string, unknown>);
+	}
+	return credentials;
 }
 
 /** Full host wiring: registry, vault, and the secret-write validator. */
@@ -94,7 +169,7 @@ async function withPlugin<T>(
 		invoke: (
 			contributionId: string,
 			input: Record<string, unknown>,
-		) => Promise<{ output: unknown; applied: string[] }>;
+		) => Promise<{ output: unknown; applied: string[]; deleted: string[] }>;
 		vault: PluginSecretVault;
 		config: Record<string, unknown>;
 	}) => Promise<T>,
@@ -102,8 +177,8 @@ async function withPlugin<T>(
 	const root = await mkdtemp(join(tmpdir(), "nf-kiro-cmd-e2e-"));
 	roots.push(root);
 	const manifest = await loadManifest();
-	const runtime = createRuntime(manifest);
 	const vault = new PluginSecretVault({ root });
+	const runtime = createRuntime(manifest, vault);
 	const providerRegistry = new PluginProviderRegistry();
 	for (const registration of providerRegistrationsFromManifest({
 		manifest,
@@ -115,15 +190,15 @@ async function withPlugin<T>(
 	commandRegistry.registerManifest(manifest);
 
 	try {
+		// Seed the vault, not the config: this is where credentials live now, and seeding them
+		// the old way would leave the plugin reading an empty store.
+		await seedCredentials(vault, [
+			{ id: "a", priority: 0 },
+			{ id: "b", priority: 1 },
+		]);
 		await runtime.start();
 		await runtime.request("provider.describe", { protocolVersions: ["1.0"] });
-		const config: Record<string, unknown> = {
-			credentialsBundle: bundleOf([
-				{ id: "a", priority: 0 },
-				{ id: "b", priority: 1 },
-			]),
-			region: "us-east-1",
-		};
+		const config: Record<string, unknown> = { region: "us-east-1" };
 		let requestSeq = 0;
 		const invoke = async (contributionId: string, input: Record<string, unknown>) => {
 			requestSeq += 1;
@@ -135,18 +210,18 @@ async function withPlugin<T>(
 			);
 			// Apply through the real validator, so an escape would fail here rather than in
 			// production.
-			const applied =
+			// Deletions are reported separately from writes, and both matter now: removing a
+			// credential is a deletion of its own key rather than a rewrite of a shared value.
+			const outcome =
 				result.secretWrites.length > 0
-					? (
-							await applyCommandSecretWrites({
-								pluginId: manifest.pluginId,
-								writes: result.secretWrites,
-								registry: providerRegistry,
-								sink: vault,
-							})
-						).written
-					: [];
-			return { output: result.output, applied };
+					? await applyCommandSecretWrites({
+							pluginId: manifest.pluginId,
+							writes: result.secretWrites,
+							registry: providerRegistry,
+							sink: vault,
+						})
+					: { written: [], deleted: [] };
+			return { output: result.output, applied: outcome.written, deleted: outcome.deleted };
 		};
 		return await run({ invoke, vault, config });
 	} finally {
@@ -185,15 +260,14 @@ describe("kiro-external commands: state changes persist through the vault", () =
 				state: "disabled",
 			});
 			expect(output).toMatchObject({ availableCount: 1 });
-			// The decisive assertion: the change reached the vault under the one key this
-			// plugin is allowed to write.
-			expect(applied).toEqual([BUNDLE_KEY]);
-			const stored = await vault.getSecret({
-				pluginId: "com.narrafork.kiro-external",
-				key: BUNDLE_KEY,
-			});
-			const parsed = JSON.parse(stored ?? "[]") as Array<{ id: string; disabled?: boolean }>;
+			// The decisive assertion: the change reached the vault, under the changed
+			// credential's own key, with the sentinel written last.
+			expect(applied).toEqual([credKey("a"), credKey("b"), INDEX_KEY]);
+			const parsed = await storedCredentials(vault);
 			expect(parsed.find((item) => item.id === "a")?.disabled).toBe(true);
+			// The untouched sibling is still there: per-key storage means one credential's
+			// change cannot drop another.
+			expect(parsed.find((item) => item.id === "b")).toBeDefined();
 		});
 	}, 60_000);
 
@@ -217,25 +291,36 @@ describe("kiro-external commands: state changes persist through the vault", () =
 				credentialId: "b",
 				priority: 7,
 			});
-			expect(applied).toEqual([BUNDLE_KEY]);
-			const stored = await vault.getSecret({
-				pluginId: "com.narrafork.kiro-external",
-				key: BUNDLE_KEY,
-			});
-			const parsed = JSON.parse(stored ?? "[]") as Array<{ id: string; priority?: number }>;
+			expect(applied).toEqual([credKey("a"), credKey("b"), INDEX_KEY]);
+			const parsed = await storedCredentials(vault);
 			expect(parsed.find((item) => item.id === "b")?.priority).toBe(7);
 		});
 	}, 60_000);
 
-	test("removing a credential shrinks the stored bundle", async () => {
+	test("removing a credential deletes its key and updates the count", async () => {
 		await withPlugin(async ({ invoke, vault }) => {
-			const { output } = await invoke("credentials.remove", { credentialId: "a" });
+			const { output, deleted } = await invoke("credentials.remove", { credentialId: "a" });
 			expect(output).toMatchObject({ credentialCount: 1 });
-			const stored = await vault.getSecret({
-				pluginId: "com.narrafork.kiro-external",
-				key: BUNDLE_KEY,
-			});
-			expect(JSON.parse(stored ?? "[]")).toHaveLength(1);
+
+			// Removal is a deletion of the removed credential's own key, not a rewrite of a
+			// shared value, so the remaining one is untouched.
+			expect(await storedCredentials(vault)).toHaveLength(1);
+			expect(deleted).toEqual([credKey("a")]);
+			const index = await vault.getSecret({ pluginId: PLUGIN_ID, key: INDEX_KEY });
+			expect(JSON.parse(index ?? "{}")).toMatchObject({ count: 1 });
+		});
+	}, 60_000);
+
+	test("removing the last credential deletes the sentinel entirely", async () => {
+		// A sentinel of `count: 0` would still read as a non-empty value, so `isUsable()` and
+		// `secretsSet` would both report a configured provider with nothing behind it. The
+		// failure would only surface when a request was finally made.
+		await withPlugin(async ({ invoke, vault }) => {
+			await invoke("credentials.remove", { credentialId: "a" });
+			await invoke("credentials.remove", { credentialId: "b" });
+
+			expect(await storedCredentials(vault)).toHaveLength(0);
+			expect(await vault.getSecret({ pluginId: PLUGIN_ID, key: INDEX_KEY })).toBeUndefined();
 		});
 	}, 60_000);
 
@@ -258,12 +343,7 @@ describe("kiro-external commands: state changes persist through the vault", () =
 				credentialId: "a",
 				fields: { region: "eu-west-1", displayName: "Team account" },
 			});
-			const stored = await vault.getSecret({
-				pluginId: "com.narrafork.kiro-external",
-				key: BUNDLE_KEY,
-			});
-			const parsed = JSON.parse(stored ?? "[]") as Array<Record<string, unknown>>;
-			const target = parsed.find((item) => item.id === "a");
+			const target = (await storedCredentials(vault)).find((item) => item.id === "a");
 			expect(target?.region).toBe("eu-west-1");
 			expect(target?.displayName).toBe("Team account");
 		});
