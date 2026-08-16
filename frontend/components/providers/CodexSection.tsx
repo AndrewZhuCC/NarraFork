@@ -467,6 +467,8 @@ export const CodexSection = React.memo(function CodexSection({
 	const [useWebSearchInitialized, setUseWebSearchInitialized] = useState(false);
 	const [useImageGeneration, setUseImageGeneration] = useState(true);
 	const [useImageGenerationInitialized, setUseImageGenerationInitialized] = useState(false);
+	const [useRemoteCompact, setUseRemoteCompact] = useState(false);
+	const [useRemoteCompactInitialized, setUseRemoteCompactInitialized] = useState(false);
 	const [tierOrder, setTierOrder] = useState<CodexPlanTier[]>(CODEX_DEFAULT_TIER_ORDER);
 	const [fingerprint, setFingerprint] = useState<{
 		userAgentMode: "narrafork" | "claude-code" | "codex" | "custom";
@@ -627,7 +629,17 @@ export const CodexSection = React.memo(function CodexSection({
 			setUseImageGeneration(status.useImageGeneration ?? true);
 			setUseImageGenerationInitialized(true);
 		}
-	}, [status, useWebSocketInitialized, useWebSearchInitialized, useImageGenerationInitialized]);
+		if (!useRemoteCompactInitialized) {
+			setUseRemoteCompact(status.useRemoteCompact ?? false);
+			setUseRemoteCompactInitialized(true);
+		}
+	}, [
+		status,
+		useWebSocketInitialized,
+		useWebSearchInitialized,
+		useImageGenerationInitialized,
+		useRemoteCompactInitialized,
+	]);
 
 	useEffect(() => {
 		if (statusTierOrder === null) return;
@@ -768,6 +780,14 @@ export const CodexSection = React.memo(function CodexSection({
 		onSuccess: () => {
 			qc.invalidateQueries({ queryKey: ["codex", "status"] });
 			notifications.show({ message: t("codexImageGenerationUpdated"), color: "green" });
+		},
+	});
+	const useRemoteCompactMut = useMutation({
+		mutationFn: (useRemoteCompact: boolean) => api.updateSettings({ codex: { useRemoteCompact } }),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["codex", "status"] });
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("codexRemoteCompactUpdated"), color: "green" });
 		},
 	});
 	const tierOrderMut = useMutation({
@@ -1282,6 +1302,31 @@ export const CodexSection = React.memo(function CodexSection({
 						loading={useImageGenerationMut.isPending}
 						disabled={!canSetUseImageGeneration}
 						title={!canSetUseImageGeneration ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("codexSave")}
+					</Button>
+				</Group>
+				<Group align="flex-end">
+					<Stack gap={4} style={{ flex: 1 }}>
+						<Text size="xs" fw={500}>
+							{t("codexUseRemoteCompact")}
+						</Text>
+						<Text size="xs" c="dimmed">
+							{t("codexUseRemoteCompactDesc")}
+						</Text>
+					</Stack>
+					<Switch
+						size="sm"
+						checked={useRemoteCompact}
+						onChange={(e) => setUseRemoteCompact(e.currentTarget.checked)}
+						disabled={!canReadCodexStatus}
+					/>
+					<Button
+						size="xs"
+						onClick={() => canReadCodexStatus && useRemoteCompactMut.mutate(useRemoteCompact)}
+						loading={useRemoteCompactMut.isPending}
+						disabled={!canReadCodexStatus}
+						title={!canReadCodexStatus ? providerRouteUnsupportedReason : undefined}
 					>
 						{t("codexSave")}
 					</Button>

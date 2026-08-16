@@ -145,6 +145,7 @@ export const DEFAULTS: NarraForkSettings = {
 		useWebSocket: true,
 		useWebSearch: true,
 		useImageGeneration: true,
+		useRemoteCompact: false,
 		// Present the built-in Codex adapter as the real Codex CLI by default.
 		userAgentMode: "codex",
 	},

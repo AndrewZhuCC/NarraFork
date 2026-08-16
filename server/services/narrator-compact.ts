@@ -2,11 +2,19 @@ import {
 	type CompactMessageTrigger,
 	normalizeCompactAttempts,
 	parseCompactMessageBlock,
+	summarizeCodexRemoteItems,
+	truncateCompactError,
 } from "@shared/compact-message";
 import { createThrottledProgressReporter } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
+import { buildHistory } from "../lib/agent";
+import {
+	clipMessagesBeforeUnpairedToolCalls,
+	findUnpairedCodexFunctionCallIds,
+} from "../lib/agent/openai-provider";
+import { isCodexRemoteCompactEnabled, resolveProviderAndModel } from "../lib/agent/provider";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -860,16 +868,59 @@ async function doRunCustomCompact({
 		retryingMessageId: options?.reuseFailedMessageId,
 	});
 
-	const messages = beforeMessageId
+	let messages = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
-		: undefined;
+		: await narratorService.getModelHistorySinceLastCompact(narratorId);
+	let compactBeforeMessageId = beforeMessageId;
 	let expectedAttempt = options?.preparedRetryMessage
 		? compactAttemptNumber(options.preparedRetryMessage)
 		: undefined;
 	let expectedSeq = options?.preparedRetryMessage?.seq;
 
-	if (beforeMessageId && (!messages || messages.length === 0)) {
-		logger.info("No messages to compact before target", { narratorId, beforeMessageId });
+	const narrator = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { pruneBoundaryMessageId: true, variant: true, model: true },
+	});
+	const remoteModel = narrator?.model?.trim() || "";
+	const resolvedCompact = remoteModel ? resolveProviderAndModel(remoteModel) : null;
+	if (
+		!options?.preparedRetryMessage &&
+		resolvedCompact &&
+		isCodexRemoteCompactEnabled(resolvedCompact.adapter) &&
+		messages &&
+		messages.length > 0
+	) {
+		const preview = await buildHistory(
+			messages,
+			resolvedCompact.model,
+			resolvedCompact.provider,
+			narratorId,
+		);
+		const unpairedCallIds = findUnpairedCodexFunctionCallIds(
+			preview.history,
+			preview.trailingToolResults,
+		);
+		if (unpairedCallIds.length > 0) {
+			const clipped = clipMessagesBeforeUnpairedToolCalls(messages, unpairedCallIds);
+			if (clipped.clipped) {
+				logger.info("Shifting compact boundary before unpaired tool call", {
+					narratorId,
+					unpairedCallIds,
+					fromBeforeMessageId: beforeMessageId,
+					toBeforeMessageId: clipped.beforeMessageId,
+					keptMessages: clipped.messages.length,
+				});
+				messages = clipped.messages;
+				compactBeforeMessageId = clipped.beforeMessageId;
+			}
+		}
+	}
+
+	if (compactBeforeMessageId && (!messages || messages.length === 0)) {
+		logger.info("No messages to compact before target", {
+			narratorId,
+			beforeMessageId: compactBeforeMessageId,
+		});
 		if (options?.preparedRetryMessage) {
 			const error = "No messages are available before this compact marker";
 			const failedMsg = await narratorService.finalizeCompactingMessage(
@@ -902,10 +953,13 @@ async function doRunCustomCompact({
 
 	const compactingMsg =
 		options?.preparedRetryMessage ??
-		(await narratorService.persistCompactingMessage(narratorId, beforeMessageId, mode, {
+		(await narratorService.persistCompactingMessage(narratorId, compactBeforeMessageId, mode, {
 			trigger: compactTriggerFor(options, mode),
 			model: selectedModel,
 			contextPercentBefore: options?.contextPercentBefore,
+			...(resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)
+				? { source: "remote" as const }
+				: {}),
 		}));
 	expectedAttempt = compactAttemptNumber(compactingMsg);
 	expectedSeq = compactingMsg.seq;
@@ -919,10 +973,6 @@ async function doRunCustomCompact({
 	await setCompactingSubstatus(narratorId, mode, true);
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { pruneBoundaryMessageId: true, variant: true },
-	});
 	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
 	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 	const compactProgress = createCompactProgressReporter({
@@ -933,19 +983,79 @@ async function doRunCustomCompact({
 	});
 
 	try {
-		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
-			narratorId,
-			locale,
-			messages,
-			pruneBoundaryMessageId,
-			signal,
-			selectedModel,
-			compactProgress.onTextDelta,
-			compactProgress.onReasoningDelta,
-			// Chunk boundaries are the only liveness signal for a summary model that
-			// does not stream, so a multi-chunk cascade must not read as a stall.
-			hooks?.beat,
-		);
+		let remoteCompact: import("@shared/compact-message").CodexRemoteCompactPayload | undefined;
+		let compactResult: { summary: string; contextPercent?: number } | undefined;
+		if (resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)) {
+			try {
+				// Use the shared history builder so an EARLIER remote-compact marker's
+				// encrypted items are prepended. Calling the adapter directly drops the
+				// role=system compact marker, which silently discards everything the
+				// previous compaction already folded into `encrypted_content`.
+				const built = await buildHistory(
+					messages ?? [],
+					resolvedCompact.model,
+					resolvedCompact.provider,
+					narratorId,
+				);
+				logger.info("Requesting Codex remote compact", {
+					narratorId,
+					model: resolvedCompact.model,
+					historyCount: built.history.length,
+					trailingToolResultCount: built.trailingToolResults.length,
+				});
+				const remote = await (
+					resolvedCompact.adapter as import("../lib/agent/provider").RemoteCompactCapableProvider
+				).compactRemote(built.history, resolvedCompact.model, {
+					signal,
+					conversationId: narratorId,
+					trailingToolResults: built.trailingToolResults,
+				});
+				remoteCompact = {
+					provider: "codex",
+					version: 1,
+					items: remote.items,
+					model: resolvedCompact.model,
+					completedAt: new Date().toISOString(),
+					source: "remote",
+				};
+				compactResult = { summary: "Remote Codex compact completed." };
+				logger.info("Codex remote compact succeeded", {
+					narratorId,
+					model: resolvedCompact.model,
+					...summarizeCodexRemoteItems(remote.items),
+				});
+			} catch (remoteError) {
+				logger.warn("Codex remote compact failed; falling back to local compact", {
+					narratorId,
+					error: truncateCompactError(remoteError),
+				});
+				compactResult = await narratorContext.generateCompactSummary(
+					narratorId,
+					locale,
+					messages,
+					pruneBoundaryMessageId,
+					signal,
+					selectedModel,
+					compactProgress.onTextDelta,
+					compactProgress.onReasoningDelta,
+					hooks?.beat,
+				);
+			}
+		}
+		if (!compactResult) {
+			compactResult = await narratorContext.generateCompactSummary(
+				narratorId,
+				locale,
+				messages,
+				pruneBoundaryMessageId,
+				signal,
+				selectedModel,
+				compactProgress.onTextDelta,
+				compactProgress.onReasoningDelta,
+				hooks?.beat,
+			);
+		}
+		const { summary, contextPercent } = compactResult;
 		compactProgress.finish();
 		// Providers should honor the signal, but enforce cancellation at the
 		// persistence boundary as well so a late summary can never win the CAS.
@@ -965,6 +1075,7 @@ async function doRunCustomCompact({
 				mode: finalizeMode,
 				expectedAttempt,
 				expectedSeq,
+				...(remoteCompact ? { remoteCompact } : {}),
 				...(options?.preparedRetryMessage
 					? {
 							expectedCompactBoundaryMessageId:
@@ -1026,6 +1137,7 @@ async function doRunCustomCompact({
 			narratorId,
 			model: selectedModel,
 			summaryLength: summary.length,
+			source: remoteCompact ? "remote" : "local",
 		});
 		await broadcastCompactDone(narratorId, {
 			contextPercentAfter,

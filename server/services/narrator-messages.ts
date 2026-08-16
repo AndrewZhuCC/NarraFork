@@ -302,6 +302,19 @@ function isCompactLifecycleMessage(message: { contentJson: unknown }): boolean {
 	return blocks.some((block) => parseCompactMessageBlock(block) !== null);
 }
 
+function hasRemoteCompactPayload(contentJson: unknown): boolean {
+	if (!Array.isArray(contentJson)) return false;
+	return contentJson.some((block) => {
+		if (!block || typeof block !== "object") return false;
+		const remote = (block as Record<string, unknown>).remoteCompact;
+		return (
+			remote &&
+			typeof remote === "object" &&
+			Array.isArray((remote as Record<string, unknown>).items)
+		);
+	});
+}
+
 export const CONTEXT_ASK_HISTORY_MESSAGE_LIMIT = 400;
 const CONTEXT_ASK_MESSAGE_TEXT_LIMIT = 6_000;
 const CONTEXT_ASK_TOOL_INPUT_LIMIT = 1_200;
@@ -1704,7 +1717,7 @@ export const narratorMessageQueries = {
 			.where(
 				and(
 					eq(narratorMessageRefs.narratorId, narratorId),
-					compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : undefined,
+					compactSeq != null ? gte(narratorMessageRefs.seq, compactSeq) : undefined,
 					ne(narratorMessages.role, "disp"),
 					isNull(narratorMessageRefs.segmentCompactId),
 				),
@@ -1753,7 +1766,7 @@ export const narratorMessageQueries = {
 		// but must not become model-history boundaries or hide trailing tool results.
 		const modelMessages = messages.filter(
 			(message) =>
-				!isCompactLifecycleMessage(message) &&
+				(!isCompactLifecycleMessage(message) || hasRemoteCompactPayload(message.contentJson)) &&
 				!isMetadataOnlyEmptyReasoningAssistantMessage(message),
 		);
 		return modelMessages;

@@ -61,6 +61,8 @@ export interface CustomApiProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/** Codex: use this provider's remote Responses compact endpoint. */
+	codexRemoteCompact?: boolean;
 	/**
 	 * Which User-Agent to present on outbound requests. Absent = provider default
 	 * (Claude CLI UA for official Anthropic, narrafork UA otherwise).
@@ -114,6 +116,8 @@ export interface OpenAIProviderConfig {
 	codexWebSearch?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
+	/** Codex: use the official remote Responses compact endpoint. */
+	codexRemoteCompact?: boolean;
 	/** Default context window size (tokens) for models in this provider. */
 	defaultContextWindow?: number;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
@@ -843,6 +847,8 @@ export interface NarraForkSettings {
 		useWebSearch?: boolean;
 		/** Allow the native image_generation tool to be sent to Codex models. Enabled by default. */
 		useImageGeneration?: boolean;
+		/** Use Codex's official remote Responses compact endpoint. Disabled by default. */
+		useRemoteCompact?: boolean;
 		/** Which User-Agent to present on Codex requests. Absent = codex CLI UA (emulation). */
 		userAgentMode?: UserAgentMode;
 		/** Custom User-Agent string, used when userAgentMode === "custom". */

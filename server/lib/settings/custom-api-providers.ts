@@ -80,6 +80,7 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
 		codexImageGeneration: provider.codexImageGeneration,
+		codexRemoteCompact: provider.codexRemoteCompact,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -145,6 +146,7 @@ export function deriveCustomApiProvidersFromLegacy(
 				codexWebSocket: existing.codexWebSocket,
 				codexWebSearch: existing.codexWebSearch,
 				codexImageGeneration: existing.codexImageGeneration,
+				codexRemoteCompact: existing.codexRemoteCompact,
 			});
 			continue;
 		}
@@ -177,6 +179,7 @@ export function customApiProviderToOpenAI(
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
 		codexImageGeneration: provider.codexImageGeneration,
+		codexRemoteCompact: provider.codexRemoteCompact,
 		userAgentMode: provider.userAgentMode,
 		customUserAgent: provider.customUserAgent,
 		extraHeaders: provider.extraHeaders,
@@ -268,6 +271,7 @@ export function normalizeCustomApiProvider(
 		codexWebSocket: provider.codexWebSocket ?? false,
 		codexWebSearch: provider.codexWebSearch ?? true,
 		codexImageGeneration: provider.codexImageGeneration ?? true,
+		codexRemoteCompact: provider.codexRemoteCompact ?? false,
 		tlsRejectUnauthorized: provider.tlsRejectUnauthorized ?? true,
 	};
 }

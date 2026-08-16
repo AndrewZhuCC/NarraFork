@@ -455,6 +455,7 @@ export const miscApi = {
 			useWebSocket?: boolean;
 			useWebSearch?: boolean;
 			useImageGeneration?: boolean;
+			useRemoteCompact?: boolean;
 			lastBrowserAuthError?: string;
 			usageCache: Record<string, CodexUsageData>;
 			usageSummary: CodexUsageSummary;

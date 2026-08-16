@@ -5,6 +5,7 @@ import {
 	MAX_COMPACT_ERROR_CHARS,
 	parseCompactMessageBlock,
 	startCompactAttempt,
+	summarizeCodexRemoteItems,
 	truncateCompactError,
 } from "@shared/compact-message";
 
@@ -42,6 +43,42 @@ describe("compact message compatibility", () => {
 			expect.objectContaining({ status: "failed", model: "provider:first" }),
 			expect.objectContaining({ status: "completed", model: "provider:second" }),
 		]);
+	});
+
+	test("preserves a remoteCompact payload on compacted markers", () => {
+		const parsed = parseCompactMessageBlock({
+			type: "compact",
+			status: "compacted",
+			summary: "Remote Codex compact completed.",
+			remoteCompact: {
+				provider: "codex",
+				version: 1,
+				items: [{ type: "compaction", id: "cmp_1", encrypted_content: "enc" }],
+				model: "ks.codexlb:gpt-5.6-sol",
+				completedAt: "2026-08-14T07:00:00.000Z",
+				source: "remote",
+			},
+		});
+		expect(parsed?.remoteCompact).toMatchObject({
+			provider: "codex",
+			version: 1,
+			source: "remote",
+			items: [{ type: "compaction", id: "cmp_1" }],
+		});
+	});
+
+	test("summarizeCodexRemoteItems counts encrypted compaction items", () => {
+		expect(
+			summarizeCodexRemoteItems([
+				{ type: "compaction", id: "cmp_abcdef1234", encrypted_content: "enc" },
+				{ type: "message", role: "user" },
+			]),
+		).toEqual({
+			count: 2,
+			types: { compaction: 1, message: 1 },
+			idPrefixes: ["cmp_abcdef12"],
+			encryptedCount: 1,
+		});
 	});
 
 	test("shows retry only when the API marks the failed compact as retryable", () => {

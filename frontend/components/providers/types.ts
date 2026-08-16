@@ -31,6 +31,7 @@ export interface CustomApiProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	codexRemoteCompact?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;
@@ -51,6 +52,7 @@ export interface OpenAIProviderState {
 	codexWebSocket?: boolean;
 	codexWebSearch?: boolean;
 	codexImageGeneration?: boolean;
+	codexRemoteCompact?: boolean;
 	userAgentMode?: UserAgentMode;
 	customUserAgent?: string;
 	extraHeaders?: Record<string, string>;

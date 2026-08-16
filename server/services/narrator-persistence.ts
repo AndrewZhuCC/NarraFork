@@ -1,4 +1,5 @@
 import {
+	type CodexRemoteCompactPayload,
 	type CompactMessageMode,
 	type CompactMessageTrigger,
 	finishCompactAttempt,
@@ -891,6 +892,7 @@ export const narratorPersistence = {
 			trigger?: CompactMessageTrigger;
 			model?: string;
 			contextPercentBefore?: number;
+			source?: "remote" | "local";
 		},
 	) {
 		const id = generateId();
@@ -905,6 +907,7 @@ export const narratorPersistence = {
 				...(options?.contextPercentBefore != null
 					? { contextPercentBefore: options.contextPercentBefore }
 					: {}),
+				...(options?.source ? { source: options.source } : {}),
 			},
 			model,
 			createdAt,
@@ -1234,6 +1237,7 @@ export const narratorPersistence = {
 			expectedCompactBoundaryMessageId?: string | null;
 			expectedAttempt?: number;
 			expectedSeq?: number;
+			remoteCompact?: CodexRemoteCompactPayload;
 		},
 	) {
 		const now = new Date().toISOString();
@@ -1311,6 +1315,9 @@ export const narratorPersistence = {
 			const compactBlock = {
 				...finished,
 				...(status === "compacted" ? { summary, contextPercentAfter: contextPercent } : {}),
+				...(status === "compacted" && options?.remoteCompact
+					? { remoteCompact: options.remoteCompact }
+					: {}),
 			};
 			const failureText = truncateCompactError(options?.error ?? "Compact failed");
 			const contentText =

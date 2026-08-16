@@ -206,6 +206,7 @@ codexRoutes.get("/status", (c) => {
 		useWebSocket: settings.codex?.useWebSocket ?? true,
 		useWebSearch: settings.codex?.useWebSearch ?? true,
 		useImageGeneration: settings.codex?.useImageGeneration ?? true,
+		useRemoteCompact: settings.codex?.useRemoteCompact ?? false,
 	});
 });
 
