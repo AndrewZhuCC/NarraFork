@@ -77,11 +77,12 @@ export interface ReasoningProviderMetadata {
 	};
 	/**
 	 * Stable identity ("provider:channel") of the upstream that minted this
-	 * block's thinking signature. Signatures are only valid against the server
-	 * that produced them, so on replay we compare this against the current
-	 * provider's source and drop the signature when they differ (see
-	 * `reasoning-source.ts`). Absent on messages persisted before this field
-	 * existed.
+	 * block's reasoning credential — the Anthropic thinking `signature`, the
+	 * OpenAI Responses `encrypted_content`, or the Gemini thought signature.
+	 * Credentials are only valid against the server that produced them, so on
+	 * replay we compare this against the current provider's source and drop the
+	 * credential when they differ (see `reasoning-source.ts`). Absent on
+	 * messages persisted before this field existed.
 	 */
 	signatureSource?: string;
 }

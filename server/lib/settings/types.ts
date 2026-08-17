@@ -4,6 +4,7 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
+import type { ModelCard } from "@shared/model-card";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
@@ -211,6 +212,21 @@ export interface NUGProviderConfig {
 	oauthCallbackUrl?: string;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
+	/**
+	 * Opt in to the Anthropic Messages protocol for this gateway's Kiro channel
+	 * (`POST /v1/kiro/messages`) instead of the native CodeWhisperer protocol.
+	 *
+	 * Absent/false keeps the native path, which is the only shape older gateways
+	 * serve. The switch is explicit rather than automatic on the gateway's
+	 * advertised capability: the two paths build different requests and parse
+	 * different streams, and a silent switch would make a regression look like a
+	 * model or upstream problem instead of a protocol change. Both conditions must
+	 * hold — this flag AND the gateway advertising `kiro.messages.v1`.
+	 *
+	 * Intended to be turned on per gateway once its endpoint has been verified end
+	 * to end, and to be turned off again as a one-step rollback if it misbehaves.
+	 */
+	kiroAnthropicProtocol?: boolean;
 }
 
 export interface GeminiProviderConfig {
@@ -568,6 +584,20 @@ export interface NarraForkSettings {
 		 * Takes highest priority in getModelContextWindow().
 		 */
 		modelContextWindows: Record<string, number>;
+		/**
+		 * Model cards — per-model metadata templates (context window, max
+		 * completion tokens, reasoning tiers, official USD prices).
+		 *
+		 * Stores only the DIFFERENCE from NarraFork's builtin cards: an entry
+		 * carries its `modelKey` plus the fields the user changed, and a card
+		 * matching its builtin is not stored. So untouched fields track builtin
+		 * updates across releases while edited fields stay pinned.
+		 *
+		 * Distinct from `modelContextWindows`, which stays higher priority: a card
+		 * describes a *class* of model ids (via aliases and prefixes), whereas that
+		 * map force-overrides one exact `provider:model` value.
+		 */
+		modelCards?: ModelCard[];
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */

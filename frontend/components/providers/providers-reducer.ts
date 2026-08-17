@@ -342,6 +342,10 @@ export function providersReducer(state: ProvidersState, action: ProvidersAction)
 				oauthClientSecret: p.oauthClientSecret,
 				oauthDeviceId: p.oauthDeviceId,
 				proxy: p.proxy,
+				// This mapping is a whitelist, so a field omitted here is silently
+				// dropped when settings are loaded back — the control renders from the
+				// default and looks like the save failed.
+				kiroAnthropicProtocol: p.kiroAnthropicProtocol,
 			}));
 
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
