@@ -87,8 +87,27 @@ export const chapters = sqliteTable(
 			.references(() => projects.id, { onDelete: "cascade" }),
 		title: text("title").notNull(),
 		description: text("description"),
+		/**
+		 * `frozen` was removed rather than implemented.
+		 *
+		 * It was declared here and accepted by the validator, but no code path ever
+		 * wrote it, and every operation that matters rejected it: `fork` and `review`
+		 * require active/dormant, `wake` accepts only dormant, `dormant` requires
+		 * active. A chapter that reached `frozen` could therefore never be forked,
+		 * woken, merged or reviewed again — a state with no exit. The one observable
+		 * symptom was `GET /api/chapters?status=frozen` silently returning *every*
+		 * chapter, because the filter's own allowlist omitted it too.
+		 *
+		 * Dropping it needs no migration: Drizzle's `enum` is a TypeScript-level
+		 * constraint, and the SQLite column is a plain `text` with no CHECK (verified
+		 * against the live schema). No row has ever held the value.
+		 *
+		 * The idea it served — "merged chapters freeze on the ruler timeline" — is
+		 * better expressed by `merged`, which already means exactly that and has a
+		 * real exit (`unmerge`).
+		 */
 		status: text("status", {
-			enum: ["active", "dormant", "merged", "abandoned", "frozen"],
+			enum: ["active", "dormant", "merged", "abandoned"],
 		})
 			.notNull()
 			.default("active"),
@@ -195,6 +214,24 @@ export const chapters = sqliteTable(
 		 * the latest state regardless of whether it is also committed.
 		 */
 		dormantSnapshotCommitSha: text("dormant_snapshot_commit_sha"),
+		/**
+		 * Uncommitted work parked so a rebase could run, awaiting reapplication.
+		 *
+		 * Rebase and cherry-pick genuinely require commits — they replay a commit
+		 * sequence — but git also refuses to start either one over a dirty workspace,
+		 * which is what made a chapter with uncommitted work unrebasable at all. The
+		 * work is moved into the DAG first and put back afterwards.
+		 *
+		 * Persisted rather than held in memory because a conflicted rebase deliberately
+		 * *stops* with the worktree mid-rebase, so the reapply happens in a later
+		 * request (resolve, or abort) that has no other way to learn where the work went.
+		 * Non-null therefore means "this chapter owes itself a reapply"; it is cleared at
+		 * every terminal outcome, since a stale value would later restore an old
+		 * workspace over current work.
+		 */
+		parkedSnapshotCommitSha: text("parked_snapshot_commit_sha"),
+		/** Base tree of {@link parkedSnapshotCommitSha}, i.e. the clean state git was handed. */
+		parkedSnapshotBaseTree: text("parked_snapshot_base_tree"),
 
 		// 图可视化
 		color: text("color"),
@@ -234,6 +271,15 @@ export const chapters = sqliteTable(
 		// Looked up on every shadow-repo destroy to decide whether a chapter still
 		// claims it; without an index that is a full table scan per orphan swept.
 		index("idx_chapters_snapshot_shadow_key").on(table.snapshotShadowKey),
+		/**
+		 * Matched on every snapshot-pointer advance, which is the hottest write in the
+		 * system: the workspace watcher polls each active chapter and a narrator's every
+		 * file-mutating tool call crosses two boundaries. `advanceChapterSnapshot` updates
+		 * by workspace path rather than by chapter id — a workspace can back several
+		 * narrators, so the position belongs to the path — and without this index each of
+		 * those updates scanned the whole table.
+		 */
+		index("idx_chapters_worktree_path").on(table.worktreePath),
 	],
 );
 
@@ -500,6 +546,13 @@ export const narrators = sqliteTable(
 		oauthPolicySnapshotJson: text("oauth_policy_snapshot_json", { mode: "json" }).$type<
 			Record<string, unknown>
 		>(),
+		/**
+		 * Custom bitmap avatar for this narrator, keyed into the avatars upload dir by
+		 * narrator id (same scheme as users.avatarImageId). Null → the UI falls back to
+		 * the deterministic identicon derived from the narrator id. Only a custom upload
+		 * is stored; the procedural glyph needs no column.
+		 */
+		avatarImageId: text("avatar_image_id"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -886,36 +939,6 @@ export const narratorMessageRefs = sqliteTable(
 	],
 );
 
-// === narrator_sidecars ===
-export const narratorSidecars = sqliteTable(
-	"narrator_sidecars",
-	{
-		id: text("id").primaryKey(),
-		narratorId: text("narrator_id")
-			.notNull()
-			.references(() => narrators.id, { onDelete: "cascade" }),
-		messageId: text("message_id").references(() => narratorMessages.id, {
-			onDelete: "cascade",
-		}),
-		toolUseId: text("tool_use_id"),
-		target: text("target", { enum: ["tool_result", "user_message"] }).notNull(),
-		source: text("source").notNull(),
-		content: text("content").notNull(),
-		orderIndex: integer("order_index").notNull().default(0),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_sidecars_message").on(table.messageId, table.target, table.orderIndex),
-		index("idx_sidecars_tool_use").on(
-			table.toolUseId,
-			table.target,
-			table.orderIndex,
-			table.createdAt,
-		),
-		index("idx_sidecars_narrator").on(table.narratorId, table.createdAt),
-	],
-);
-
 // === narrator_tool_calls ===
 export const narratorToolCalls = sqliteTable(
 	"narrator_tool_calls",
@@ -967,6 +990,25 @@ export const narratorToolCalls = sqliteTable(
 		permissionStartedAt: text("permission_started_at"),
 		executionStartedAt: text("execution_started_at"),
 		completedAt: text("completed_at"),
+		/**
+		 * Wall-clock moment this call actually began, as ONE indexable value.
+		 *
+		 * The four timestamps above are written by different lifecycle stages, so no
+		 * single one of them can order a global execution log: on a production database
+		 * only ~38% of recent rows carry `execution_started_at`, and every row older than
+		 * migration 0034 has all four NULL. This mirrors the fallback chain
+		 * `subagent-activity.selectActivityTimestamp` already uses for display.
+		 *
+		 * VIRTUAL rather than STORED for two reasons: SQLite outright refuses
+		 * `ALTER TABLE ... ADD` of a stored column, and a virtual one needs no table
+		 * rewrite over the existing rows (measured: 561k rows, 6.6 GB database).
+		 * Generated columns are omitted from every INSERT/UPDATE Drizzle builds, so no
+		 * write path changes; `idx_toolcalls_started_at` is what makes it cheap to read.
+		 */
+		startedAt: text("started_at").generatedAlwaysAs(
+			sql`coalesce("execution_started_at", "permission_started_at", "stream_started_at", "created_at")`,
+			{ mode: "virtual" },
+		),
 		errorMessage: text("error_message"),
 		permissionDecidedBy: text("permission_decided_by"),
 		permissionDecidedAt: text("permission_decided_at"),
@@ -1033,6 +1075,12 @@ export const narratorToolCalls = sqliteTable(
 			table.createdAt,
 		),
 		index("idx_toolcalls_created").on(table.narratorId, table.createdAt),
+		/**
+		 * Global execution-log ordering. `(startedAt, id)` so the admin page can seek a
+		 * keyset cursor with a row-value comparison — measured 0.07ms per page against
+		 * 3.8s for an unindexed `ORDER BY ... LIMIT 51` on the same data.
+		 */
+		index("idx_toolcalls_started_at").on(table.startedAt, table.id),
 	],
 );
 
@@ -1084,7 +1132,16 @@ export const terminals = sqliteTable(
 	"terminals",
 	{
 		id: text("id").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
+		/**
+		 * Cascaded rather than left to explicit clean-up, because the default
+		 * (`NO ACTION`) actively *blocked* deleting a chapter: SQLite refuses the parent
+		 * row while any terminal still references it, so one missed clean-up step turned
+		 * into "FOREIGN KEY constraint failed" and the entire delete failed. A terminal is
+		 * a derived resource with no meaning once its chapter is gone, so cascading is
+		 * both correct and the safer default. `chapter-service` still deletes these rows
+		 * explicitly — that is now defence in depth rather than the only line.
+		 */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		narratorId: text("narrator_id").references(() => narrators.id),
 		name: text("name").notNull(),
 		cwd: text("cwd"),
@@ -1109,22 +1166,15 @@ export const terminals = sqliteTable(
 	],
 );
 
-// === terminal_tabs ===
-export const terminalTabs = sqliteTable(
-	"terminal_tabs",
-	{
-		id: text("id").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
-		narratorId: text("narrator_id").references(() => narrators.id),
-		name: text("name").notNull(),
-		sortOrder: integer("sort_order").notNull().default(0),
-		createdAt: text("created_at").notNull(),
-	},
-	(table) => [
-		index("idx_terminal_tabs_chapter").on(table.chapterId, table.sortOrder),
-		index("idx_terminal_tabs_narrator").on(table.narratorId, table.sortOrder),
-	],
-);
+// === terminal_tabs: removed ===
+//
+// A `terminal_tabs` table used to sit here, with a service, five `/terminals/tabs` routes,
+// three validators, five API clients, a hook and a component. None of it had a consumer:
+// every client had zero call sites and the hook/component had zero importers, so no row was
+// ever written. The live terminal UI (`NarratorTerminal.tsx`) derives tabs from the running
+// terminals and persists only their order, which is why a separate tab entity was never
+// needed. Do not confuse it with `terminal_view_state` below, which is in active use — its
+// `activeTabId` holds a *terminal* id, not a tab id, and never referenced this table.
 
 // === terminal_view_state ===
 export const terminalViewState = sqliteTable(
@@ -1169,9 +1219,10 @@ export const containerInstances = sqliteTable(
 	"container_instances",
 	{
 		id: text("id").primaryKey(),
+		/** Cascaded for the same reason as `terminals.chapterId`; see there. */
 		chapterId: text("chapter_id")
 			.notNull()
-			.references(() => chapters.id),
+			.references(() => chapters.id, { onDelete: "cascade" }),
 		containerId: text("container_id"),
 		serviceName: text("service_name").notNull(),
 		status: text("status", {
@@ -1200,7 +1251,13 @@ export const portAllocations = sqliteTable(
 	"port_allocations",
 	{
 		port: integer("port").primaryKey(),
-		chapterId: text("chapter_id").references(() => chapters.id),
+		/**
+		 * Cascaded for the same reason as `terminals.chapterId`, and this table was the
+		 * most likely one to block a delete: a port stays allocated in proxy mode even
+		 * after the container is removed, so `removeChapterContainers` could return
+		 * successfully while leaving a row that then refused the chapter's deletion.
+		 */
+		chapterId: text("chapter_id").references(() => chapters.id, { onDelete: "cascade" }),
 		serviceName: text("service_name"),
 		allocatedAt: text("allocated_at").notNull(),
 	},
@@ -1404,6 +1461,49 @@ export const userRecentTabsMeta = sqliteTable("user_recent_tabs_meta", {
 	createdAt: text("created_at").notNull(),
 	updatedAt: text("updated_at").notNull(),
 });
+
+// === registration_codes ===
+// Single-use invitations an administrator hands out so someone can self-register
+// while public registration stays closed.
+//
+// Only the SHA-256 hash of a code is stored: the plaintext exists once, in the
+// creation response. That means a database read (backup, support dump) cannot be
+// turned into a usable invitation, and lookup stays an indexed hash probe rather
+// than a scan-and-compare.
+//
+// Rows are kept after redemption instead of being deleted so an administrator can
+// answer "who used which invitation, and who issued it". `used_by_user_id` /
+// `created_by_user_id` are SET NULL rather than CASCADE for the same reason: the
+// audit line must survive the account being removed.
+export const registrationCodes = sqliteTable(
+	"registration_codes",
+	{
+		id: text("id").primaryKey(),
+		codeHash: text("code_hash").notNull(),
+		/** Free-form administrator label, e.g. the name of the intended recipient. */
+		note: text("note"),
+		/** Role granted to the account created with this code. */
+		role: text("role", { enum: ["admin", "user"] })
+			.notNull()
+			.default("user"),
+		/** When set, the code only works for this exact username. */
+		boundUsername: text("bound_username"),
+		/** Mandatory expiry: an invitation that never dies is a standing signup hole. */
+		expiresAt: text("expires_at").notNull(),
+		createdByUserId: text("created_by_user_id").references(() => users.id, {
+			onDelete: "set null",
+		}),
+		usedAt: text("used_at"),
+		usedByUserId: text("used_by_user_id").references(() => users.id, { onDelete: "set null" }),
+		revokedAt: text("revoked_at"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("idx_registration_codes_code_hash").on(table.codeHash),
+		index("idx_registration_codes_created_by").on(table.createdByUserId),
+		index("idx_registration_codes_used_by").on(table.usedByUserId),
+	],
+);
 
 // === narrator_drafts ===
 // Private per-user composer state. Empty text rows are retained as clear tombstones so
@@ -1692,9 +1792,15 @@ export const mergeSessions = sqliteTable(
 	"merge_sessions",
 	{
 		id: text("id").primaryKey(),
+		/**
+		 * Cascaded for the same reason as `terminals.chapterId`. A merge session describes
+		 * work in progress against this target; once the target is gone the session can
+		 * never be resumed, and leaving the row behind both blocked the delete and left
+		 * the startup sweep trying to restore a worktree that no longer exists.
+		 */
 		targetChapterId: text("target_chapter_id")
 			.notNull()
-			.references(() => chapters.id),
+			.references(() => chapters.id, { onDelete: "cascade" }),
 		sourceChapterIds: text("source_chapter_ids", { mode: "json" }).notNull().$type<string[]>(),
 		strategy: text("strategy", { enum: ["merge", "squash", "cherry-pick"] })
 			.notNull()
@@ -2601,7 +2707,10 @@ export const knowledgeSubmissions = sqliteTable(
 		// Lifecycle:
 		//  - pending           → awaiting review
 		//  - approved          → merged / published
-		//  - rejected          → reviewer refused it
+		//  - rejected          → reviewer refused it for good (verdict `reject`). TERMINAL: no
+		//                        resubmit, which is exactly what separates it from
+		//                        changes_requested. The author's personal entry survives, so a
+		//                        fresh proposal is still possible.
 		//  - changes_requested → bounced back to the author (resubmit closes the loop)
 		//  - conflict          → approve hit an unmergeable three-way merge; needs resolve
 		//  - withdrawn         → the SUBMITTER pulled it back before a verdict
@@ -2621,7 +2730,9 @@ export const knowledgeSubmissions = sqliteTable(
 			.notNull()
 			.default("pending"),
 		reviewerUserId: text("reviewer_user_id").references(() => users.id, { onDelete: "set null" }),
-		verdict: text("verdict", { enum: ["approve", "request_changes", "comment_only"] }),
+		// `reject` is the terminal refusal, distinct from `request_changes` (which invites a
+		// resubmit). See the `rejected` status above.
+		verdict: text("verdict", { enum: ["approve", "request_changes", "reject", "comment_only"] }),
 		findingsJson: text("findings_json", { mode: "json" }),
 		reviewedAt: text("reviewed_at"),
 		// The main revision produced when this submission was merged.
@@ -2739,6 +2850,54 @@ export const knowledgeGrants = sqliteTable(
 		uniqueIndex("idx_kgrant_unique_global_untagged")
 			.on(table.principalType, table.principalId, table.grantType)
 			.where(sql`${table.collectionId} is null and ${table.tagId} is null`),
+	],
+);
+
+// === knowledge_acl_events ===
+// Append-only audit of knowledge AUTHORIZATION changes: who granted/revoked what, to whom, when.
+//
+// Why this exists: the knowledge base gates content by classification level + controlled tags, but
+// every mutation of that gate (grants, per-user ACL replacement, entry/collection ACL edits,
+// ownership transfers) used to leave no trace at all — "who gave this account access to the
+// confidential compartment?" was unanswerable after the fact.
+//
+// Shape follows oauth_grant_events (the existing security-audit precedent): actor + target +
+// event type + a small redacted detail blob. Deliberately NOT stored: entry titles, bodies, or
+// anything that would turn the audit log into a way to read content you cannot access.
+//
+// No foreign keys on the actor/target ids: audit rows must survive deletion of the user, entry or
+// collection they describe, which is the whole point of an audit trail.
+export const knowledgeAclEvents = sqliteTable(
+	"knowledge_acl_events",
+	{
+		id: text("id").primaryKey(),
+		// Who performed the change (null = system/automated path).
+		actorUserId: text("actor_user_id"),
+		actorRole: text("actor_role"),
+		// What kind of change. Kept as free text rather than an enum so a new ACL surface can be
+		// audited without a migration; the writers use a fixed vocabulary
+		// (grant_added / grant_removed / user_acl_replaced / entry_acl_updated /
+		//  collection_acl_updated / entry_owner_transferred / collection_owner_transferred).
+		eventType: text("event_type").notNull(),
+		// Whom the change was ABOUT (the principal whose authority moved), when applicable.
+		subjectType: text("subject_type", { enum: ["user", "role"] }),
+		subjectId: text("subject_id"),
+		// What the change was ON (an entry / collection / grant row), when applicable.
+		targetType: text("target_type", { enum: ["entry", "collection", "grant"] }),
+		targetId: text("target_id"),
+		// Redacted detail: level NAMES and tag IDS only, never content. e.g.
+		// { grantType, clearanceLevel, tagId, canWrite } or { before: {...}, after: {...} }.
+		detailJson: text("detail_json", { mode: "json" }).$type<Record<string, unknown>>(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		// Primary read pattern: newest first, optionally filtered. `id` breaks createdAt ties so
+		// cursor pagination is stable.
+		index("idx_kacl_events_created").on(table.createdAt, table.id),
+		index("idx_kacl_events_subject").on(table.subjectType, table.subjectId, table.createdAt),
+		index("idx_kacl_events_target").on(table.targetType, table.targetId, table.createdAt),
+		index("idx_kacl_events_actor").on(table.actorUserId, table.createdAt),
+		index("idx_kacl_events_type").on(table.eventType, table.createdAt),
 	],
 );
 

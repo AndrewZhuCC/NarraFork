@@ -144,8 +144,6 @@ export interface VListRenderLabels {
 			thinkingChars: (chars: number) => string;
 			outputChars: (chars: number) => string;
 		};
-		/** Tool-result sidecar mini-card chrome (copy tooltip). */
-		sidecar: { copy: string; copied: string };
 	};
 	toolCallGroup: { label: string; statusLabel: string };
 	trace: {
@@ -199,8 +197,6 @@ export interface VListRenderLabels {
 		cancel: string;
 		resolvedLabel: string;
 	};
-	/** Standalone sidecar card chrome (copy tooltip). */
-	sidecar: { copy: string; copied: string };
 	planCard: string;
 	pruneDivider: string;
 }
@@ -288,12 +284,21 @@ export function useVListLabels(): VListLabels {
 			originSourceGateway: t("origin.source.gateway"),
 			originSourceOauth: t("origin.source.oauth"),
 			originSourceRecovery: t("origin.source.recovery"),
+			originSourcePlanReflection: t("origin.source.planReflection"),
+			// Periodic task-digest header subtitle ("every N tool calls"). The label
+			// keeps a literal `{n}` placeholder (same convention as tasksCurrent /
+			// tasksTooMany) that the adapter substitutes with the cadence interval.
+			cadenceEveryNTools: t("sidecar.cadence.everyNTools", { n: "{n}" }),
 			// ── image_generation header status ───────────────────────────────────────
 			// The status line wraps together with the revised prompt, so it is MEASURED
 			// and belongs to the adapter labels (the render layer only paints it).
 			imageGenerated: t("imageGenerated"),
 			imageGenerating: t("imageGenerating"),
 			imageGenerationPreparing: t("imageGenerationPreparing"),
+			// ── web_search header status ─────────────────────────────────────────────
+			webSearched: t("webSearched"),
+			webSearching: t("webSearching"),
+			webSearchPreparing: t("webSearchPreparing"),
 			// ── slash-command bubble fold control ───────────────────────────────────
 			// The control is a measured text row inside the bubble, so its wording
 			// belongs to the adapter labels (the render layer only paints it).
@@ -359,12 +364,39 @@ export function useVListLabels(): VListLabels {
 			// through the adapter rather than the render layer.
 			...reflectionTitleLabels(t),
 			reflectionNextSteps: t("reflectionNextSteps", { nextSteps: "{nextSteps}" }),
-			// ── sidecar cards (one collapsible card per system injection) ─────────
-			// The source badge text is composed during adaptation (it sits in the
-			// measured header row), so these flow through the adapter labels. They
-			// reuse the existing `sidecar.sources.*` narrator strings 1:1.
-			sidecarUnknown: t("sidecar.unknownSource"),
-			sidecarTruncated: t("sidecar.truncated"),
+			// ── side-car footnotes (one per system injection) ──────────────────────
+			// All of these are MEASURED text — the source name sits in the header row and
+			// the body lines are wrapped by the measure pass — so they flow through the
+			// adapter labels rather than the render bundle.
+			//
+			// The `presentation*` keys are the reader-facing wording of a structured
+			// body. They are deliberately NOT the model-facing copy (which lives in
+			// server/lib/i18n.ts): the model gets "keep tasks.json to only
+			// text/status/protected…", the reader gets "3 open tasks".
+			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
+			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
+			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
+			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
+			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
+			tasksEmptyDone: t("sidecar.body.tasksEmptyDone"),
+			tasksTooMany: t("sidecar.body.tasksTooMany", { n: "{n}" }),
+			taskRoleDoing: t("sidecar.body.taskRoleDoing"),
+			taskRoleNext: t("sidecar.body.taskRoleNext"),
+			taskRoleTodo: t("sidecar.body.taskRoleTodo"),
+			taskRoleBlocked: t("sidecar.body.taskRoleBlocked"),
+			taskProtected: t("sidecar.body.taskProtected"),
+			knowledgeHeading: t("sidecar.body.knowledgeHeading", { n: "{n}" }),
+			tasksDoneAgentHeading: t("sidecar.body.tasksDoneAgentHeading", { n: "{n}" }),
+			tasksDoneBashHeading: t("sidecar.body.tasksDoneBashHeading", { n: "{n}" }),
+			tasksDoneTruncated: t("sidecar.body.tasksDoneTruncated"),
+			messagesHeading: t("sidecar.body.messagesHeading", { n: "{n}" }),
+			messageFromUnknown: t("sidecar.body.messageFromUnknown"),
+			messageBroadcast: t("sidecar.body.messageBroadcast"),
+			specUpdatesHeading: t("sidecar.body.specUpdatesHeading", { n: "{n}" }),
+			proseFenceHeading: t("sidecar.body.proseFenceHeading"),
+			empty: t("sidecar.body.empty"),
+			sidecarSourceBehaviorFence: t("sidecar.sources.behavior_fence"),
+			sidecarSourcePipelineExit: t("sidecar.sources.pipeline_exit_confirmation"),
 			sidecarSourceSilentProgress: t("sidecar.sources.silent_progress"),
 			sidecarSourceTodoReminder: t("sidecar.sources.todo_reminder"),
 			sidecarSourceRelaxedPlan: t("sidecar.sources.relaxed_plan"),
@@ -373,7 +405,6 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceBgBash: t("sidecar.sources.bg_bash"),
 			sidecarSourceTeamMessage: t("sidecar.sources.team_message"),
 			sidecarSourceBufferedUser: t("sidecar.sources.buffered_user"),
-			sidecarSourceGroupMessage: t("sidecar.sources.group_message"),
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 		}),
@@ -460,7 +491,6 @@ export function useVListLabels(): VListLabels {
 					thinkingChars: (chars: number) => t("reflectionThinkingChars", { count: chars }),
 					outputChars: (chars: number) => t("reflectionOutputChars", { count: chars }),
 				},
-				sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
 			},
 			toolCallGroup: {
 				label: t("toolCalls"),
@@ -512,7 +542,6 @@ export function useVListLabels(): VListLabels {
 				cancel: t("askInPassing_cancel"),
 				resolvedLabel: t("askInPassing_resolvedLabel"),
 			},
-			sidecar: { copy: t("sidecar.copy"), copied: t("sidecar.copied") },
 			planCard: t("perm_plan"),
 			pruneDivider: t("pruneBoundaryLabel"),
 		};
@@ -535,7 +564,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
-		case "sidecar-trace":
 			return labels.trace;
 		case "subagent-card":
 			return labels.subagent;
@@ -545,8 +573,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 			return labels.askUserQuestion;
 		case "ask-in-passing":
 			return labels.askInPassing;
-		case "sidecar":
-			return labels.sidecar;
 		default:
 			return undefined;
 	}

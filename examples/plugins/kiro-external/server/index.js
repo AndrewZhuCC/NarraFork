@@ -18439,6 +18439,11 @@ var MAX_PAGINATION_PAGES = 10;
 var OVERAGE_BONUS_CREDITS = 1e4;
 var FREE_TIER_BLOCKED_MODELS = new Set(["auto"]);
 var DEFAULT_TIER_PRIORITY2 = ["free", "enterprise", "paid"];
+var UNHEALTHY_DISABLED_REASONS = [
+  "too_many_failures",
+  "account_suspended"
+];
+var UNHEALTHY_DISABLED_REASON_SET = new Set(UNHEALTHY_DISABLED_REASONS);
 function sha256Hex2(input) {
   return createHash2("sha256").update(input).digest("hex");
 }
@@ -18498,6 +18503,9 @@ function parseDisabledAt(creds) {
 }
 function shouldPersistDisabledReason(reason) {
   return reason === "manual" || reason === "quota_exhausted" || reason === "account_suspended" || reason === "suspicious_throttle";
+}
+function isUnhealthyDisabledCredential(entry) {
+  return entry.disabled && !!entry.disabledReason && UNHEALTHY_DISABLED_REASON_SET.has(entry.disabledReason);
 }
 function buildTierOrderMap(priority) {
   const map = {};
@@ -18888,40 +18896,66 @@ class MultiTokenManager {
     this.persistCredentials();
     logger.info("[kiro] suspicious-throttled credential recovered", { credentialId: id });
   }
-  snapshot() {
+  snapshot(opts) {
     const available = this.entries.filter((e) => !e.disabled).length;
+    const unhealthyTotal = this.entries.filter(isUnhealthyDisabledCredential).length;
+    const paid = this.entries.filter((entry) => classifyKiroCredentialTier(entry.credentials) === "paid");
+    const enterprise = this.entries.filter((entry) => classifyKiroCredentialTier(entry.credentials) === "enterprise");
+    const free = this.entries.filter((entry) => classifyKiroCredentialTier(entry.credentials) === "free");
+    const pageSize = opts?.pageSize ?? 0;
+    const isPaged = pageSize > 0;
+    const slicePage = (entries2, page) => {
+      if (!isPaged || !page || page < 1)
+        return entries2;
+      const maxPage = Math.max(1, Math.ceil(entries2.length / pageSize));
+      const safePage = Math.min(page, maxPage);
+      const start = (safePage - 1) * pageSize;
+      return entries2.slice(start, start + pageSize);
+    };
+    const mapEntry = (entry) => ({
+      id: entry.id,
+      priority: entry.credentials.priority ?? 0,
+      disabled: entry.disabled,
+      disabledReason: entry.disabledReason,
+      failureCount: entry.failureCount,
+      successCount: entry.successCount,
+      lastUsedAt: entry.lastUsedAt,
+      email: entry.credentials.email,
+      displayName: entry.credentials.displayName,
+      hasProfileArn: !!entry.credentials.profileArn,
+      hasStartUrl: !!entry.credentials.startUrl,
+      expiresAt: entry.credentials.expiresAt,
+      authMethod: entry.credentials.authMethod,
+      isApiKey: isApiKeyCredential(entry.credentials),
+      subscriptionTitle: entry.credentials.subscriptionTitle,
+      region: entry.credentials.region,
+      authRegion: entry.credentials.authRegion,
+      apiRegion: entry.credentials.apiRegion,
+      profileArn: entry.credentials.profileArn,
+      startUrl: entry.credentials.startUrl,
+      machineId: entry.credentials.machineId,
+      hasClientId: !!entry.credentials.clientId,
+      hasClientSecret: !!entry.credentials.clientSecret,
+      proxyUrl: entry.credentials.proxyUrl,
+      proxyUsername: entry.credentials.proxyUsername,
+      hasProxyPassword: !!entry.credentials.proxyPassword,
+      meterUsage: entry.credentials.meterUsage,
+      availableModels: entry.credentials.availableModels,
+      tier: classifyKiroCredentialTier(entry.credentials)
+    });
+    const paidEntries = slicePage(paid, opts?.paidPage).map(mapEntry);
+    const enterpriseEntries = slicePage(enterprise, opts?.enterprisePage).map(mapEntry);
+    const freeEntries = slicePage(free, opts?.freePage).map(mapEntry);
+    const entries = isPaged ? [...paidEntries, ...enterpriseEntries, ...freeEntries] : this.entries.map(mapEntry);
     return {
-      entries: this.entries.map((e) => ({
-        id: e.id,
-        priority: e.credentials.priority ?? 0,
-        disabled: e.disabled,
-        disabledReason: e.disabledReason,
-        failureCount: e.failureCount,
-        successCount: e.successCount,
-        lastUsedAt: e.lastUsedAt,
-        email: e.credentials.email,
-        displayName: e.credentials.displayName,
-        hasProfileArn: !!e.credentials.profileArn,
-        hasStartUrl: !!e.credentials.startUrl,
-        expiresAt: e.credentials.expiresAt,
-        authMethod: e.credentials.authMethod,
-        isApiKey: isApiKeyCredential(e.credentials),
-        subscriptionTitle: e.credentials.subscriptionTitle,
-        region: e.credentials.region,
-        authRegion: e.credentials.authRegion,
-        apiRegion: e.credentials.apiRegion,
-        profileArn: e.credentials.profileArn,
-        startUrl: e.credentials.startUrl,
-        machineId: e.credentials.machineId,
-        hasClientId: !!e.credentials.clientId,
-        hasClientSecret: !!e.credentials.clientSecret,
-        proxyUrl: e.credentials.proxyUrl,
-        proxyUsername: e.credentials.proxyUsername,
-        hasProxyPassword: !!e.credentials.proxyPassword,
-        meterUsage: e.credentials.meterUsage,
-        availableModels: e.credentials.availableModels,
-        tier: classifyKiroCredentialTier(e.credentials)
-      })),
+      entries,
+      paidEntries,
+      enterpriseEntries,
+      freeEntries,
+      paidTotal: paid.length,
+      enterpriseTotal: enterprise.length,
+      freeTotal: free.length,
+      unhealthyTotal,
       currentId: this.currentId,
       loadBalancingMode: this.loadBalancingMode,
       total: this.entries.length,
@@ -18974,15 +19008,36 @@ class MultiTokenManager {
     this.persistCredentials();
   }
   removeCredential(id) {
-    const idx = this.entries.findIndex((e) => e.id === id);
-    if (idx === -1)
+    const result = this.removeCredentials([id]);
+    if (result.notFound.length > 0)
       throw new Error(`Credential not found: ${id}`);
-    this.clearRecoveryTimer(id);
-    this.entries.splice(idx, 1);
-    if (this.currentId === id && this.entries.length > 0) {
-      this.currentId = this.entries[0].id;
+  }
+  removeCredentials(ids) {
+    const uniqueIds = [...new Set(ids)];
+    const existingIds = new Set(this.entries.map((entry) => entry.id));
+    const removed = uniqueIds.filter((id) => existingIds.has(id));
+    const notFound = uniqueIds.filter((id) => !existingIds.has(id));
+    if (removed.length === 0)
+      return { removed, notFound };
+    const removedIds = new Set(removed);
+    for (const id of removed) {
+      this.clearRecoveryTimer(id);
+      this.refreshPromises.delete(id);
+      delete this.usageCache[id];
+    }
+    this.entries = this.entries.filter((entry) => !removedIds.has(entry.id));
+    if (!this.entries.some((entry) => entry.id === this.currentId)) {
+      this.currentId = this.entries.length ? this.entries.reduce((best, entry) => this.comparePriority(entry, best)).id : "";
     }
     this.persistCredentials();
+    this.flushStats();
+    this.flushUsageCache();
+    return { removed, notFound };
+  }
+  removeUnhealthyCredentials() {
+    const ids = this.entries.filter(isUnhealthyDisabledCredential).map((entry) => entry.id);
+    const result = this.removeCredentials(ids);
+    return { removed: result.removed, reasons: [...UNHEALTHY_DISABLED_REASONS] };
   }
   clearRecoveryTimer(id) {
     const timer = this.throttleRecoveryTimers.get(id);
@@ -19531,11 +19586,20 @@ function isContextLengthExceeded(body) {
   const reason = nestedReason(parseJsonObject(body));
   return reason === "CONTENT_LENGTH_EXCEEDS_THRESHOLD";
 }
+var SUSPENDED_PROSE_RE = /temporarily\s+is\s+suspended|is\s+temporarily\s+suspended|temporarily\s+suspended|locked\s+your\s+account/i;
+var SUSPENDED_EXCEPTION_TYPE_RE = /AccessDeniedException|UnauthorizedException/i;
 function isAccountSuspended(body) {
   if (body.includes("TEMPORARILY_SUSPENDED"))
     return true;
-  const reason = nestedReason(parseJsonObject(body));
-  return reason === "TEMPORARILY_SUSPENDED";
+  const json = parseJsonObject(body);
+  if (nestedReason(json) === "TEMPORARILY_SUSPENDED")
+    return true;
+  if (!SUSPENDED_PROSE_RE.test(body))
+    return false;
+  const type = json?.__type;
+  if (type != null && SUSPENDED_EXCEPTION_TYPE_RE.test(String(type)))
+    return true;
+  return json != null && typeof json.message === "string" && SUSPENDED_PROSE_RE.test(json.message);
 }
 function isSuspiciousThrottle(body) {
   const lower = body.toLowerCase();
@@ -19552,10 +19616,11 @@ class KiroApiClient {
   constructor(tokenManager) {
     this.tokenManager = tokenManager;
   }
-  async sendChatRequest(request, signal) {
+  async sendChatRequest(request, signal, carriedFailedCredentialIds, replaysLeft) {
     const model = request.conversationState.currentMessage.userInputMessage.modelId;
     const maxRetries = this.tokenManager.maxRetries;
-    const failedCredentialIds = new Set;
+    const failedCredentialIds = carriedFailedCredentialIds ?? new Set;
+    const remainingReplays = replaysLeft ?? maxRetries;
     let lastError = null;
     const invocationId = randomUUID2();
     const maxAttempts = maxRetries * (MAX_THROTTLE_RETRIES + 1);
@@ -19609,10 +19674,22 @@ class KiroApiClient {
       if (res.ok) {
         onSuccess(ctx.id);
         this.tokenManager.reportSuccess(ctx.id);
+        const failedId = ctx.id;
         return {
           response: res,
-          credentialId: ctx.id,
-          release: releaseHeld
+          credentialId: failedId,
+          release: releaseHeld,
+          reportStreamFailure: (reason) => {
+            failedCredentialIds.add(failedId);
+            return this.tokenManager.reportFailure(failedId, reason);
+          },
+          retryWithNextCredential: () => {
+            if (remainingReplays <= 0) {
+              throw new KiroApiError("STREAM_REPLAY_EXHAUSTED", "Exhausted credential replays after mid-stream failures");
+            }
+            failedCredentialIds.add(failedId);
+            return this.sendChatRequest(request, signal, failedCredentialIds, remainingReplays - 1);
+          }
         };
       }
       const resBody = await res.text().catch(() => "");
@@ -19638,6 +19715,15 @@ class KiroApiClient {
           lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
           continue;
         }
+        if (isAccountSuspended(resBody)) {
+          releaseHeld();
+          failedCredentialIds.add(ctx.id);
+          const hasAvailable = this.tokenManager.reportFailure(ctx.id, "account_suspended");
+          if (!hasAvailable)
+            throw new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+          lastError = new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+          continue;
+        }
         releaseHeld();
         if (isContextLengthExceeded(resBody)) {
           throw new KiroApiError("CONTEXT_LENGTH_EXCEEDED", resBody, 400);
@@ -19656,11 +19742,13 @@ class KiroApiClient {
       if (res.status === 401 || res.status === 403) {
         releaseHeld();
         failedCredentialIds.add(ctx.id);
-        const hasAvailable = this.tokenManager.reportFailure(ctx.id, isAccountSuspended(resBody) ? "account_suspended" : undefined);
+        const suspended = isAccountSuspended(resBody);
+        const hasAvailable = this.tokenManager.reportFailure(ctx.id, suspended ? "account_suspended" : undefined);
+        const code = suspended ? "ACCOUNT_SUSPENDED" : "AUTH_FAILED";
         if (!hasAvailable) {
-          throw new KiroApiError("AUTH_FAILED", resBody, res.status);
+          throw new KiroApiError(code, resBody, res.status);
         }
-        lastError = new KiroApiError("AUTH_FAILED", resBody, res.status);
+        lastError = new KiroApiError(code, resBody, res.status);
         continue;
       }
       if (res.status === 429) {
@@ -21193,25 +21281,23 @@ function toKiroTools(tools) {
   return result;
 }
 function ensureRequiredProperty(schema) {
-  const properties = isRecord4(schema.properties) ? schema.properties : undefined;
   const required = Array.isArray(schema.required) ? schema.required : undefined;
   if (required && required.length > 0)
     return schema;
-  if (!properties || Object.keys(properties).length === 0) {
-    return {
-      ...schema,
-      properties: {
-        confirm: {
-          type: "boolean",
-          description: "Dummy parameter (always pass true)",
-          const: true,
-          default: true
-        }
-      },
-      required: ["confirm"]
-    };
-  }
-  return { ...schema, required: [Object.keys(properties)[0]] };
+  const properties = isRecord4(schema.properties) ? schema.properties : undefined;
+  return {
+    ...schema,
+    properties: {
+      ...properties ?? {},
+      confirm: {
+        type: "boolean",
+        description: "Dummy parameter (always pass true)",
+        const: true,
+        default: true
+      }
+    },
+    required: ["confirm"]
+  };
 }
 function emptyPendingUser() {
   return { text: [], images: [], toolResults: [] };
@@ -22506,6 +22592,15 @@ class KiroMcpClient {
           lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
           continue;
         }
+        if (isAccountSuspended(resBody)) {
+          releaseHeld();
+          failedCredentialIds.add(ctx.id);
+          const hasAvailable = this.tokenManager.reportFailure(ctx.id, "account_suspended");
+          if (!hasAvailable)
+            throw new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+          lastError = new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+          continue;
+        }
         releaseHeld();
         throw new KiroApiError("BAD_REQUEST", resBody, 400);
       }
@@ -22521,11 +22616,13 @@ class KiroMcpClient {
       if (res.status === 401 || res.status === 403) {
         releaseHeld();
         failedCredentialIds.add(ctx.id);
-        const hasAvailable = this.tokenManager.reportFailure(ctx.id, isAccountSuspended(resBody) ? "account_suspended" : undefined);
+        const suspended = isAccountSuspended(resBody);
+        const hasAvailable = this.tokenManager.reportFailure(ctx.id, suspended ? "account_suspended" : undefined);
+        const code = suspended ? "ACCOUNT_SUSPENDED" : "AUTH_FAILED";
         if (!hasAvailable) {
-          throw new KiroApiError("AUTH_FAILED", resBody, res.status);
+          throw new KiroApiError(code, resBody, res.status);
         }
-        lastError = new KiroApiError("AUTH_FAILED", resBody, res.status);
+        lastError = new KiroApiError(code, resBody, res.status);
         continue;
       }
       if (res.status === 429) {

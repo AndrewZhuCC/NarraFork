@@ -1,4 +1,5 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import type { PendingPermission } from "@frontend/types/narrator";
 import {
 	Badge,
@@ -109,7 +110,6 @@ import {
 	api,
 	authorizedFetch,
 	readFetchError,
-	type SideCarRecord,
 	type SubagentActivitySummary,
 } from "../../lib/api";
 import type { ExecutionTargetIdentity } from "../../lib/api/types";
@@ -148,7 +148,6 @@ import {
 import { reflectionProgressLabel } from "./progress-label";
 import { useRenderInteractive, useRenderLod } from "./RenderLodCtx";
 import { useReflectionProgress } from "./reflection-progress-store";
-import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import toolCardClasses from "./ToolCallCard.module.css";
 import { ToolCallInspector } from "./ToolCallInspector";
 import { isSpecTasksToolUse, knowledgeSummary } from "./tool-display";
@@ -328,8 +327,6 @@ export interface ToolCallData {
 	_streamedFullOutput?: boolean;
 	/** Current timeout in ms (set from inputJson.timeout or updated via WS timeout_updated) */
 	_timeoutMs?: number;
-	/** Sidecar system injections attached to this tool result */
-	sideCars?: SideCarRecord[];
 	/** Subagent assistant message ID that produced the result (for scroll-to navigation) */
 	resultMessageId?: string;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
@@ -4897,22 +4894,27 @@ function InlineAllowRetry({
 
 // --- Inline permission UI rendered inside the tool call card ---
 
-const PERMISSION_DRAFT_STORAGE_MAX_CHARS = 256_000;
-const PERMISSION_DRAFT_FIELD_MAX_CHARS = 120_000;
+/**
+ * Ceiling for one stored permission draft (feedback + edited plan).
+ *
+ * Was 256k envelope / 120k per field. These drafts are keyed by PERMISSION ID, an
+ * id space that grows with every prompt the user never decided, so a generous
+ * per-entry ceiling multiplied straight into `sessionStorage` pressure. An edited
+ * plan is the larger of the two fields and still fits comfortably here; anything
+ * past it is kept in component state and simply not mirrored.
+ */
+const PERMISSION_DRAFT_STORAGE_MAX_CHARS = 32_000;
+const PERMISSION_DRAFT_FIELD_MAX_CHARS = 24_000;
 
 interface StoredPermissionDraft {
 	feedback: string;
 	editedPlan: string | null;
 }
 
-function readStoredPermissionDraft(draftKey: string): StoredPermissionDraft | null {
+function readStoredPermissionDraft(draftId: string): StoredPermissionDraft | null {
 	try {
-		const raw = sessionStorage.getItem(draftKey);
+		const raw = readSession("permission-draft", draftId);
 		if (!raw) return null;
-		if (raw.length > PERMISSION_DRAFT_STORAGE_MAX_CHARS) {
-			sessionStorage.removeItem(draftKey);
-			return null;
-		}
 		const parsed = JSON.parse(raw) as { feedback?: unknown; editedPlan?: unknown };
 		const feedback =
 			typeof parsed.feedback === "string" &&
@@ -4974,7 +4976,7 @@ export function InlinePermission({
 	const { focusIndex, setButtonCount, setHasFeedback, registerActions, activePermissionId } =
 		useContext(PermEnterHintCtx);
 	const isActivePermission = permission.id === activePermissionId;
-	const draftKey = `narrafork_perm_draft_${permission.id}`;
+	const draftKey = permission.id;
 	const storedDraftRef = useRef<StoredPermissionDraft | null | undefined>(undefined);
 	const getStoredDraft = () => {
 		if (storedDraftRef.current === undefined) {
@@ -5002,9 +5004,9 @@ export function InlinePermission({
 	useEffect(() => {
 		const hasContent = feedback || editedPlan !== null;
 		if (hasContent && canPersistPermissionDraft(feedback, editedPlan)) {
-			sessionStorage.setItem(draftKey, JSON.stringify({ feedback, editedPlan }));
+			writeSession("permission-draft", draftKey, JSON.stringify({ feedback, editedPlan }));
 		} else {
-			sessionStorage.removeItem(draftKey);
+			removeSession("permission-draft", draftKey);
 		}
 	}, [draftKey, feedback, editedPlan]);
 
@@ -5071,7 +5073,7 @@ export function InlinePermission({
 			setFeedbackConfirmOpen(true);
 			return;
 		}
-		sessionStorage.removeItem(draftKey);
+		removeSession("permission-draft", draftKey);
 		onDecision?.(
 			permission.id,
 			"allow",
@@ -5083,7 +5085,7 @@ export function InlinePermission({
 
 	const handleConfirmExecute = () => {
 		setFeedbackConfirmOpen(false);
-		sessionStorage.removeItem(draftKey);
+		removeSession("permission-draft", draftKey);
 		onDecision?.(
 			permission.id,
 			"allow",
@@ -5095,7 +5097,7 @@ export function InlinePermission({
 
 	const handleConfirmRevise = () => {
 		setFeedbackConfirmOpen(false);
-		sessionStorage.removeItem(draftKey);
+		removeSession("permission-draft", draftKey);
 		onDecision?.(permission.id, "deny", feedback || undefined);
 	};
 
@@ -5189,7 +5191,7 @@ export function InlinePermission({
 					// Enter in feedback textarea → deny with feedback
 					if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && feedback.trim()) {
 						e.preventDefault();
-						sessionStorage.removeItem(draftKey);
+						removeSession("permission-draft", draftKey);
 						onDecision?.(permission.id, "deny", feedback);
 					}
 				}}
@@ -5251,7 +5253,7 @@ export function InlinePermission({
 								color: "red",
 								variant: "light",
 								onClick: () => {
-									sessionStorage.removeItem(draftKey);
+									removeSession("permission-draft", draftKey);
 									onDecision?.(permission.id, "deny", feedback || undefined);
 								},
 							});
@@ -5377,7 +5379,6 @@ function toolCallCardAreEqual(prev: ToolCallCardProps, next: ToolCallCardProps):
 		p.executionCwd !== n.executionCwd ||
 		p.resolvedFilePath !== n.resolvedFilePath ||
 		p.deviceSelectionSource !== n.deviceSelectionSource ||
-		p.sideCars !== n.sideCars ||
 		p.startedAt !== n.startedAt ||
 		p.streamStartedAt !== n.streamStartedAt ||
 		p.permissionStartedAt !== n.permissionStartedAt ||
@@ -5987,7 +5988,6 @@ export const ToolCallCard = memo(function ToolCallCard({
 					</Badge>
 				</Tooltip>
 			)}
-			{hasVisibleSideCars(toolCall.sideCars) && <SideCarNotice sideCars={toolCall.sideCars} />}
 			{isStreaming ? (
 				hasStreamingDetail && <StreamingInputDetail toolCall={toolCall} maxHeight={vpHeight} />
 			) : (

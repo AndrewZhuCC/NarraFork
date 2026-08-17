@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { outputToText } from "@shared/codewhisperer/tool-output";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
 import { getInstallationId } from "../installation-id";
@@ -33,12 +34,6 @@ import type {
 	ProviderTextCitation,
 } from "./provider";
 import { sanitizeHeaders } from "./request-dump";
-import {
-	appendSideCarsForApi,
-	outputToText,
-	sideCarsForToolResult,
-	sideCarsForUserMessage,
-} from "./sidecar";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -3608,7 +3603,6 @@ async function buildResponsesHistory(
 ): Promise<{
 	history: OAIMessage[];
 	trailingToolResults: ResponsesFunctionCallOutputMessage[];
-	trailingUserText?: string;
 }> {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -3622,15 +3616,11 @@ async function buildResponsesHistory(
 
 	const history: OAIMessage[] = [];
 	let pendingToolResults: ResponsesFunctionCallOutputMessage[] = [];
-	let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 	for (const msg of topLevel) {
 		if (msg.role === "assistant") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
-			const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-			if (pendingSideCarText) history.push(buildResponsesUserMessage(pendingSideCarText));
 			pendingToolResults = [];
-			pendingUserSideCars = [];
 
 			const assistantItems = buildResponsesAssistantItemsFromStoredContent(msg);
 			if (assistantItems.length === 0) {
@@ -3641,38 +3631,20 @@ async function buildResponsesHistory(
 			if (msg.toolCalls) {
 				for (const tc of msg.toolCalls) {
 					if (tc.status === "success" || tc.status === "fail") {
-						const outputText = appendSideCarsForApi(
-							outputToText(tc.outputJson),
-							sideCarsForToolResult(msg.sideCars, tc.toolUseId),
+						pendingToolResults.push(
+							buildResponsesToolResultMessage(tc.toolUseId, outputToText(tc.outputJson)),
 						);
-						pendingToolResults.push(buildResponsesToolResultMessage(tc.toolUseId, outputText));
 					}
 				}
 			}
-			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		} else if (msg.role === "user") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 			const userMessage = await buildResponsesUserMessageFromDbMessage(msg, narratorId);
-			const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-			if (userMessage) {
-				if (pendingSideCarText && Array.isArray(userMessage.content)) {
-					(userMessage.content as OAIContentPart[]).push({
-						type: "input_text",
-						text: pendingSideCarText,
-					});
-				}
-				history.push(userMessage);
-			} else if (pendingSideCarText) {
-				history.push(buildResponsesUserMessage(pendingSideCarText));
-			}
-			pendingUserSideCars = [];
+			if (userMessage) history.push(userMessage);
 		} else if (msg.role === "sys") {
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
-			const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-			if (pendingSideCarText) history.push(buildResponsesUserMessage(pendingSideCarText));
 			pendingToolResults = [];
-			pendingUserSideCars = [];
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
 				.filter((b: { type: string }) => b.type === "text")
@@ -3690,17 +3662,12 @@ async function buildResponsesHistory(
 		}
 	}
 
-	return {
-		history,
-		trailingToolResults: pendingToolResults,
-		trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
-	};
+	return { history, trailingToolResults: pendingToolResults };
 }
 
 function buildOAIHistory(dbMessages: DbMessage[]): {
 	history: OAIMessage[];
 	trailingToolResults: OAIToolResult[];
-	trailingUserText?: string;
 } {
 	// Filter model-visible messages: user, assistant, sys (system context)
 	// Exclude: system (legacy, kept for backward compatibility), disp (UI-only display messages)
@@ -3715,7 +3682,6 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 
 	const history: OAIMessage[] = [];
 	let pendingToolResults: OAIToolResult[] = [];
-	let pendingUserSideCars: NonNullable<DbMessage["sideCars"]> = [];
 
 	for (const msg of topLevel) {
 		if (msg.role === "assistant") {
@@ -3723,10 +3689,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			for (const tr of pendingToolResults) {
 				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 			}
-			const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-			if (pendingSideCarText) history.push({ role: "user", content: pendingSideCarText });
 			pendingToolResults = [];
-			pendingUserSideCars = [];
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
@@ -3826,18 +3789,13 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			if (msg.toolCalls) {
 				for (const tc of msg.toolCalls) {
 					if (tc.status === "success" || tc.status === "fail") {
-						const outputText = appendSideCarsForApi(
-							outputToText(tc.outputJson),
-							sideCarsForToolResult(msg.sideCars, tc.toolUseId),
-						);
 						pendingToolResults.push({
 							tool_call_id: tc.toolUseId,
-							content: outputText,
+							content: outputToText(tc.outputJson),
 						});
 					}
 				}
 			}
-			pendingUserSideCars = sideCarsForUserMessage(msg.sideCars);
 		} else if (msg.role === "user") {
 			// Flush pending tool results before user message
 			for (const tr of pendingToolResults) {
@@ -3845,19 +3803,15 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			}
 			pendingToolResults = [];
 
-			const text = appendSideCarsForApi(msg.contentText || "", pendingUserSideCars);
+			const text = msg.contentText || "";
 			if (text) {
 				history.push({ role: "user", content: text });
 			}
-			pendingUserSideCars = [];
 		} else if (msg.role === "sys") {
 			for (const tr of pendingToolResults) {
 				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
 			}
-			const pendingSideCarText = appendSideCarsForApi("", pendingUserSideCars);
-			if (pendingSideCarText) history.push({ role: "user", content: pendingSideCarText });
 			pendingToolResults = [];
-			pendingUserSideCars = [];
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const textParts = content
@@ -3876,11 +3830,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 		}
 	}
 
-	return {
-		history,
-		trailingToolResults: pendingToolResults,
-		trailingUserText: appendSideCarsForApi("", pendingUserSideCars) || undefined,
-	};
+	return { history, trailingToolResults: pendingToolResults };
 }
 
 /**

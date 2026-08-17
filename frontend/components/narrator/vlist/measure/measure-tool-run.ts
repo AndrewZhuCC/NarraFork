@@ -59,6 +59,16 @@
  * reasoning / measure-system-simple templates.
  */
 
+import {
+	BARE_ROW_CHEVRON,
+	BARE_ROW_CONTENT,
+	BARE_ROW_GAP,
+	BARE_ROW_HEIGHT,
+	BARE_ROW_ICON,
+	BARE_ROW_PADDING_Y,
+	BARE_ROW_STATUS,
+	BARE_XS_LINE,
+} from "@shared/pretext-layout/row-metrics";
 // Type-only: the row identity the adapter attaches and the renderer consumes.
 // A type import adds no runtime dependency and stays clear of the measure math.
 import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
@@ -71,12 +81,15 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { FONT_SIZE, LINE_HEIGHT, SPACING } from "../pretext-fonts";
+import { SPACING } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
 // media / permission / reflection / pretext-metrics and never on this module
 // (measure-subagent's dependency on it is one-way for the same reason).
 import {
+	CARD_BORDER,
+	CARD_PADDING,
+	HEADER_ROW_HEIGHT,
 	type MeasuredToolCall,
 	measureToolCall,
 	resolveToolTimingStamps,
@@ -85,26 +98,30 @@ import {
 } from "./measure-tool-call";
 
 // ── Chrome constants (px) — CONTRACT §3/§4 + CollapsibleTrace.tsx ─────────────
+//
+// The per-ROW numbers live in `@shared/pretext-layout/row-metrics` so other measure
+// modules can share them without importing this one (which would close a cycle).
+// They keep their original names below so every caller and test here is unaffected.
 
 /** Outer `<Box py={2}>` around the whole trace. */
 export const TRACE_OUTER_PADDING_Y = 2;
 /** Header `<Group py={2}>`. */
 export const TRACE_HEADER_PADDING_Y = 2;
 /** TraceRow / "show earlier" `<Group py={1}>`. */
-export const TRACE_ROW_PADDING_Y = 1;
+export const TRACE_ROW_PADDING_Y = BARE_ROW_PADDING_Y;
 /** Header ThemeIcon size={16}. */
 export const TRACE_HEADER_ICON = 16;
 /** Per-row ThemeIcon size={14}. */
-export const TRACE_ROW_ICON = 14;
+export const TRACE_ROW_ICON = BARE_ROW_ICON;
 /** Chevron / dot slot icon size (12). */
-export const TRACE_CHEVRON = 12;
+export const TRACE_CHEVRON = BARE_ROW_CHEVRON;
 
 /**
  * xs single-line box = 12 × 1.4 = 16.8px, kept UNROUNDED (see file header). JS
  * float gives 16.799999…; tests assert with toBeCloseTo. Browsers lay out this
  * fractional line box, so the raw value is the most faithful prediction.
  */
-export const TRACE_XS_LINE = FONT_SIZE.xs * LINE_HEIGHT.xs;
+export const TRACE_XS_LINE = BARE_XS_LINE;
 
 /** Header row content lane: max(icon 16, xs line 16.8) = 16.8. */
 export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE);
@@ -114,7 +131,7 @@ export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEAD
 export const TRACE_HEADER_BAND_HEIGHT = TRACE_OUTER_PADDING_Y * 2 + TRACE_HEADER_GROUP_HEIGHT;
 
 /** Trailing status glyph size (12) — same slot the chunk path reserves. */
-export const TRACE_ROW_STATUS = 12;
+export const TRACE_ROW_STATUS = BARE_ROW_STATUS;
 /**
  * Gap between a trace row's cells (`<Group gap={6}>`).
  *
@@ -122,7 +139,7 @@ export const TRACE_ROW_STATUS = 12;
  * trace rows and the subagent card's recent-call rows — which are the same row —
  * read it from one place instead of both hard-coding `6`.
  */
-export const TRACE_ROW_GAP = 6;
+export const TRACE_ROW_GAP = BARE_ROW_GAP;
 /**
  * Row content lane: max(row icon 14, chevron 12, status 12, xs line 16.8) = 16.8.
  *
@@ -130,14 +147,9 @@ export const TRACE_ROW_GAP = 6;
  * trailing status + timing slots are height-neutral: adding them cannot raise this
  * max, so `TRACE_ROW_HEIGHT` is unchanged.
  */
-export const TRACE_ROW_CONTENT = Math.max(
-	TRACE_ROW_ICON,
-	TRACE_CHEVRON,
-	TRACE_ROW_STATUS,
-	TRACE_XS_LINE,
-);
+export const TRACE_ROW_CONTENT = BARE_ROW_CONTENT;
 /** Trace row height: py*2 + content = 2 + 16.8 = 18.8. Shared by rows + toggle. */
-export const TRACE_ROW_HEIGHT = TRACE_ROW_PADDING_Y * 2 + TRACE_ROW_CONTENT;
+export const TRACE_ROW_HEIGHT = BARE_ROW_HEIGHT;
 
 /**
  * Standalone count line (ToolRunCountLine / ReasoningCountLine): a single
@@ -171,12 +183,7 @@ export function traceBodyInnerWidth(contentWidth: number): number {
 // ── Data types ───────────────────────────────────────────────────────────────
 
 /** Which concrete trace this is (renderer picks header icon / colour / label). */
-export type TraceVariant =
-	| "collapsible"
-	| "tool-run-summary"
-	| "activity"
-	| "reasoning-steps"
-	| "sidecar";
+export type TraceVariant = "collapsible" | "tool-run-summary" | "activity" | "reasoning-steps";
 
 /** One trace row. Title is single-line/truncated → height-neutral. */
 export interface TraceItemData {
@@ -370,6 +377,27 @@ export interface MeasuredTraceRow {
 	bodyTop: number;
 	/** Left offset (px) of the body content (pl + border). */
 	bodyLeft: number;
+	/**
+	 * Drill-down header morph target: the nested card's HEADER row rect in the
+	 * row-block coordinate system (drilled-in rows only, else null).
+	 *
+	 * The drilled-in card fills the row block from its top (the summary row is not
+	 * rendered — the card's header visually takes its place). This is the pure
+	 * arithmetic the header-morph controller needs to place the outgoing summary
+	 * row over the incoming card header, so neither the render nor the motion
+	 * layer re-derives it (and no DOM is ever read). Height-neutral: it only
+	 * restates geometry `cardMeasured` + the chrome constants already decided.
+	 */
+	drillHeader: {
+		/** Header row-box top within the row block (border + card padding). */
+		top: number;
+		/** Header row-box left within the row block (border + card padding). */
+		left: number;
+		/** Header row-box width (card inner width). */
+		width: number;
+		/** Header row-box height (`HEADER_ROW_HEIGHT`). */
+		height: number;
+	} | null;
 	/** Selection / context-menu coordinates (renderer only; height-neutral). */
 	identity?: AdapterTraceRowIdentity;
 	/**
@@ -540,17 +568,22 @@ export function measureCollapsibleTrace(
 		let body: MeasuredElement | null = null;
 		let card: MeasuredToolCall | null = null;
 		if (expanded) {
-			const inner = traceBodyInnerWidth(contentWidth);
 			if (item.card) {
 				// Drill-down: a standalone (bordered) card, exactly like a grouped card's
 				// child. `lodUserOverride` is what opens it — see the fn doc.
-				card = measureToolCall({ ...item.card, inRun: false }, inner, lod, {
+				//
+				// The card fills the WHOLE row block (full row width, from the block's
+				// top): the summary title row is NOT painted for a drilled-in row — the
+				// card's own header morphs into its place, so the row block IS the card
+				// (`blockHeight === card.height`). No `traceBodyInnerWidth`, no indent.
+				card = measureToolCall({ ...item.card, inRun: false }, contentWidth, lod, {
 					lodUserOverride: true,
 					isRecent: true,
 					viewportHeight: expandState.viewportHeight,
 				});
-				blockHeight += TRACE_BODY_PADDING_Y * 2 + card.height;
+				blockHeight = card.height;
 			} else if (typeof item.bodyText === "string" && item.bodyText.trim().length > 0) {
+				const inner = traceBodyInnerWidth(contentWidth);
 				body = measureMarkdown(item.bodyText, inner);
 				blockHeight += TRACE_BODY_PADDING_Y * 2 + body.frame.contentHeight;
 			}
@@ -603,6 +636,20 @@ export function measureCollapsibleTrace(
 		// A drilled-in row reports `expanded` too, so the renderer draws the open
 		// chevron and paints the body box for either kind of revealed content.
 		const expanded = body != null || cardMeasured != null;
+		// Header morph target (drilled-in rows only). The card is drawn at the row
+		// block's origin across the FULL row width, so its header row sits at
+		// `border + padding` inside the block. Pure restatement of the card chrome —
+		// the morph controller animates the outgoing summary row toward this rect.
+		const drillBorder = cardMeasured?.hasBorder ? CARD_BORDER : 0;
+		const drillHeader =
+			cardMeasured != null
+				? {
+						top: drillBorder + CARD_PADDING,
+						left: drillBorder + CARD_PADDING,
+						width: Math.max(1, contentWidth - 2 * (drillBorder + CARD_PADDING)),
+						height: HEADER_ROW_HEIGHT,
+					}
+				: null;
 		return {
 			itemIndex,
 			key: item.key ?? `row-${itemIndex}`,
@@ -627,10 +674,16 @@ export function measureCollapsibleTrace(
 			body,
 			cardMeasured,
 			canDrillDown: item.canDrillDown === true,
-			bodyTop: expanded
-				? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
-				: bf.top + TRACE_ROW_HEIGHT,
-			bodyLeft: TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
+			// A drilled-in card starts at the row block's top (no summary row above
+			// it); a markdown body still sits below the 18.8px row it belongs to.
+			bodyTop:
+				cardMeasured != null
+					? bf.top
+					: expanded
+						? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
+						: bf.top + TRACE_ROW_HEIGHT,
+			bodyLeft: cardMeasured != null ? 0 : TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
+			drillHeader,
 			// Passthrough only — never used above in any height computation.
 			identity: item.identity,
 			unitId: item.unitId,
@@ -793,49 +846,6 @@ export function measureReasoningStepsTrace(
 		},
 		contentWidth,
 		expandState,
-	);
-}
-
-/**
- * LOW-LOD sidecar form: ONE record as a bare CollapsibleTrace — the header shows
- * the localized source label, and the single row carries the single-line preview
- * (expanding reveals the full text as a markdown body, exactly like a reasoning
- * step's body). This is the low-LOD redesign form that replaces the full Paper
- * card: no background, no border, the same 24.8px header + 18.8px row geometry
- * every other folded trace uses, so the sidecar reads as one more bare row.
- *
- * The row icon tints by the sidecar's source colour (`iconColor`), which the
- * renderer maps to the same accent the full card would show at high LOD.
- */
-export function measureSidecarTrace(
-	data: {
-		sourceLabel: string;
-		color: string;
-		previewText: string;
-		fullText: string;
-	},
-	contentWidth: number,
-	expandState: TraceExpandState = {},
-	lod: RenderLod = DEFAULT_RENDER_LOD,
-): MeasuredCollapsibleTrace {
-	return measureCollapsibleTrace(
-		{
-			items: [
-				{
-					title: data.previewText,
-					hasIcon: true,
-					iconColor: data.color,
-					bodyText: data.fullText,
-				},
-			],
-			maxVisible: 1,
-			variant: "sidecar",
-			headerLabel: data.sourceLabel,
-			headerCount: "",
-		},
-		contentWidth,
-		expandState,
-		lod,
 	);
 }
 

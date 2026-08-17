@@ -498,12 +498,27 @@ describe("adaptSegment — system message", () => {
 });
 
 describe("adaptSegment — system card body composition (height-critical)", () => {
+	/**
+	 * The card's own data projection.
+	 *
+	 * Some system cards are now WRAPPED in a speaker bubble (`injection-bubble`), which
+	 * carries the card's data untouched under `payload.data`. These assertions are about
+	 * the projection, not the wrapping, so unwrap one level when present — that keeps them
+	 * testing the same property before and after the framing change.
+	 */
 	const sysData = (
 		contentJson: Array<{ type: string; [key: string]: unknown }>,
 		ctx: AdapterContext = CTX,
 		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
-	): any =>
-		adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!.data;
+	): any => {
+		const spec = adaptSegment(
+			{ kind: "message", msg: { id: "s", role: "system", contentJson } },
+			ctx,
+		)[0]!;
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const data = spec.data as any;
+		return spec.kind === "injection-bubble" ? data.payload.data : data;
+	};
 
 	it("info: reads block.message (not empty block.text) as the wrapping body", () => {
 		// persistDisplayMessage writes `[{ type: "info", message }]` with role=disp;
@@ -569,19 +584,44 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(data.badges[1]).toBe("Already tracked");
 	});
 
-	it("spec_continuation: reads block.task + protected flag + badge label", () => {
-		const data = sysData([{ type: "spec_continuation", task: "Wire the flag", protected: true }]);
-		expect(data.kind).toBe("spec_continuation");
-		expect(data.text).toBe("Wire the flag");
-		expect(data.protected).toBe(true);
-		expect(data.badgeLabel).toBe("Task");
-		expect(data.color).toBe("indigo");
+	it("spec_continuation: framed as a bubble task row (glyph + lock + wrapping text)", () => {
+		// The Dynamic Spec continuation is a framed BUBBLE whose body is a task row the
+		// bubble draws itself — not the clamped single-line card it used to nest.
+		const spec = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "s",
+					role: "system",
+					contentJson: [{ type: "spec_continuation", task: "Wire the flag", protected: true }],
+				},
+			},
+			CTX,
+		)[0]!;
+		expect(spec.kind).toBe("injection-bubble");
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const payload = (spec.data as any).payload;
+		expect(payload.kind).toBe("spec-task");
+		expect(payload.data).toEqual({ text: "Wire the flag", protected: true, blocked: false });
 	});
 
-	it("spec_blocked_continuation: orange color + blocked badge", () => {
-		const data = sysData([{ type: "spec_blocked_continuation", task: "Blocked task" }]);
-		expect(data.color).toBe("orange");
-		expect(data.badgeLabel).toBe("Blocked");
+	it("spec_blocked_continuation: blocked flag flips the task row's tone", () => {
+		const spec = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "s",
+					role: "system",
+					contentJson: [{ type: "spec_blocked_continuation", task: "Blocked task" }],
+				},
+			},
+			CTX,
+		)[0]!;
+		expect(spec.kind).toBe("injection-bubble");
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+		const payload = (spec.data as any).payload;
+		expect(payload.kind).toBe("spec-task");
+		expect(payload.data).toEqual({ text: "Blocked task", protected: false, blocked: true });
 	});
 
 	it("spec_fork_carryover: composes a summary description from counts", () => {
@@ -839,6 +879,72 @@ describe("adaptSegment — tool run", () => {
 		expect((specs[0]!.data as { count: number }).count).toBe(3);
 	});
 
+	it("the pinned latest-tasks card stays a full card while neighbours fold", () => {
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolUseId: "t-old", toolName: "Read", status: "completed" },
+				},
+				{
+					blockIndex: 1,
+					isSubagent: false,
+					tc: { toolUseId: "t-tasks", toolName: "Write", status: "completed" },
+				},
+				{
+					blockIndex: 2,
+					isSubagent: false,
+					tc: { toolUseId: "t-new", toolName: "Bash", status: "completed" },
+				},
+			],
+		};
+		const pin = { resolveLatestSpecTasksToolUseId: () => "t-tasks" };
+
+		// L2: the pinned call escapes the count fold; the rest still fold.
+		const l2 = adaptSegment(seg, { lod: 2, ...pin });
+		expect(l2.map((s) => s.kind)).toEqual(["tool-run-count", "tool-call", "tool-run-count"]);
+		expect(l2[1]!.key).toBe("tool-t-tasks");
+		expect(l2[1]!.opts?.forceExpanded).toBe(true);
+
+		// L3: same card escapes the summary fold.
+		const l3 = adaptSegment(seg, { lod: 3, ...pin });
+		expect(l3.map((s) => s.kind)).toEqual(["tool-run-summary", "tool-call", "tool-run-summary"]);
+
+		// No resolver → everything folds exactly as before.
+		const unpinned = adaptSegment(seg, { lod: 2 });
+		expect(unpinned).toHaveLength(1);
+		expect(unpinned[0]!.kind).toBe("tool-run-count");
+	});
+
+	it("L4 keeps every card full but still flags the pinned card forceExpanded", () => {
+		const seg: AdapterSegment = {
+			kind: "tool-run",
+			sourceMessages: [],
+			items: [
+				{
+					blockIndex: 0,
+					isSubagent: false,
+					tc: { toolUseId: "t-tasks", toolName: "Write", status: "completed" },
+				},
+				{
+					blockIndex: 1,
+					isSubagent: false,
+					tc: { toolUseId: "t-other", toolName: "Bash", status: "completed" },
+				},
+			],
+		};
+		const specs = adaptSegment(seg, {
+			lod: 4,
+			resolveLatestSpecTasksToolUseId: () => "t-tasks",
+		});
+		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "tool-call"]);
+		expect(specs[0]!.opts?.forceExpanded).toBe(true);
+		expect(specs[1]!.opts?.forceExpanded).toBeUndefined();
+	});
+
 	it("keeps active tools as standalone full cards even at low LOD", () => {
 		const seg: AdapterSegment = {
 			kind: "tool-run",
@@ -968,6 +1074,89 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		});
 		expect("prompt" in data).toBe(false);
 		expect(data.isBackground).toBe(false);
+	});
+
+	// ── conclusion body (the shared extraction rule) ────────────────────────────
+	// This block used to accept ONLY a bare-string `outputJson`, so the ~43% of real
+	// rows whose output is the runner's `{_text, _metadata}` envelope produced a
+	// finished card with a blank conclusion — no result body expanded, no preview
+	// line collapsed.
+	it("extracts resultText from a bare-string output, stripping the addressing tag", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: "<subagent_id>abc</subagent_id>\n\nthe conclusion",
+		});
+		expect(data.resultText).toBe("the conclusion");
+		expect(data.resultPreview).toBe("the conclusion");
+	});
+
+	it("extracts resultText from the {_text, _metadata} envelope output", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: {
+				_text: "<subagent_id>abc</subagent_id>\n\n# 结论\n\n正文",
+				_metadata: { execDurationMs: 31 },
+			},
+		});
+		expect(data.resultText).toBe("# 结论\n\n正文");
+		expect(data.resultPreview).toBe("# 结论\n\n正文");
+	});
+
+	it("shows a truncated envelope body as its preview rather than a JSON dump", () => {
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: { _text: { _truncated: true, preview: "cut body", fullLength: 9000 } },
+		});
+		expect(data.resultText).toBe("cut body");
+	});
+
+	it("caps resultPreview at 120 chars while resultText keeps the full body", () => {
+		const body = "y".repeat(300);
+		const data = subagentData({
+			toolName: "Task",
+			status: "success",
+			inputJson: { description: "d" },
+			outputJson: { _text: body },
+		});
+		expect(data.resultText).toBe(body);
+		expect(data.resultPreview).toBe(body.slice(0, 120));
+	});
+
+	it("omits resultText when the output carries nothing readable (no fabrication)", () => {
+		for (const outputJson of [null, undefined, "<subagent_id>only-a-tag</subagent_id>"]) {
+			const data = subagentData({
+				toolName: "Task",
+				status: "success",
+				inputJson: { description: "d" },
+				outputJson,
+			});
+			expect(data.resultText).toBeUndefined();
+			expect(data.resultPreview).toBeUndefined();
+		}
+	});
+
+	it("substitutes the fetched full output once the shell resolved it", () => {
+		const ctx: AdapterContext = {
+			...CTX,
+			resolveFullToolOutput: () => ({ _text: "the complete conclusion" }),
+		};
+		const data = subagentData(
+			{
+				toolName: "Task",
+				status: "success",
+				toolUseId: "tu-full",
+				inputJson: { description: "d" },
+				outputJson: { _text: { _truncated: true, preview: "cut", fullLength: 9000 } },
+			},
+			ctx,
+		);
+		expect(data.resultText).toBe("the complete conclusion");
 	});
 
 	it("remains height-safe: measureSubagentCard consumes the enriched data", async () => {
@@ -1291,12 +1480,17 @@ describe("folded tool rows — drill-down payload", () => {
 		expect(activityRows(spec)[0]?.card).toBeUndefined();
 	});
 
+	/** `isRowExpanded` opening exactly `rowKeys` inside `traceKey`. */
+	const openRows = (traceKey: string, ...rowKeys: string[]) => ({
+		isRowExpanded: (key: string, rowKey: string) => key === traceKey && rowKeys.includes(rowKey),
+	});
+
 	it("an expanded row carries the classified card", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
 		const spec = adaptActivityUnit(
 			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
 			"act-1",
-			{ lod: 2, expandedRows: (key) => (key === "act-1" ? [0] : []) },
+			{ lod: 2, ...openRows("act-1", "tool-tu-1") },
 		);
 		const card = activityRows(spec)[0]?.card;
 		expect(card).toBeDefined();
@@ -1310,40 +1504,73 @@ describe("folded tool rows — drill-down payload", () => {
 			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 0, tc: readTc("tu-1") },
 			{ kind: "tool" as const, msg: msgWith([]), blockIndex: 1, tc: readTc("tu-2") },
 		];
-		const spec = adaptActivityUnit(items, "act-1", {
-			lod: 2,
-			expandedRows: (key) => (key === "act-1" ? [1] : []),
-		});
+		const spec = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-2") });
 		expect(activityRows(spec).map((row) => row.card != null)).toEqual([false, true]);
 		// Another trace's expansion must not leak into this one.
-		const other = adaptActivityUnit(items, "act-1", {
-			lod: 2,
-			expandedRows: (key) => (key === "act-2" ? [1] : []),
-		});
+		const other = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-2", "tool-tu-2") });
 		expect(activityRows(other).map((row) => row.card != null)).toEqual([false, false]);
 	});
 
-	it("row indices survive a multi-step reasoning run before the tool", async () => {
+	/**
+	 * The `expandedIndices` the trace reports must number the EMITTED ROW list, since
+	 * the measure layer resolves a visible row back to `startIndex + vi` over that
+	 * same array. A multi-step reasoning run is what pulls the two numberings apart:
+	 * it contributes one row per step, so the tool below it is input item 1 but row 2.
+	 */
+	it("reports the expanded row's index over the EMITTED rows, not the input items", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
-		// This reasoning block parses into TWO step rows, so the tool is input item 1
-		// but ROW index 2. Addressing the emitted row list is what makes the click
-		// land on the tool the reader pointed at rather than a reasoning step.
 		const blocks = [{ type: "reasoning", text: "**A**\n\nfirst\n\n**B**\n\nsecond" }];
 		const msg = msgWith(blocks);
 		const items = [
 			{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
 			{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
 		];
-		const rows = activityRows(
-			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [2] }),
-		);
+		const spec = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-1") });
+		const rows = activityRows(spec);
 		expect(rows).toHaveLength(3);
 		expect(rows[2]?.card).toBeDefined();
-		// The input index (1) must NOT open anything — it points at a reasoning row.
-		const wrong = activityRows(
-			adaptActivityUnit(items, "act-1", { lod: 2, expandedRows: () => [1] }),
-		);
-		expect(wrong.map((row) => row.card != null)).toEqual([false, false, false]);
+		// Row 2, not input item 1 — the reasoning run emitted rows 0 and 1.
+		expect((spec.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([2]);
+	});
+
+	/**
+	 * The regression this whole channel exists for (reported as a folded row that
+	 * would not stay open, and rows overlapping while a turn streamed).
+	 *
+	 * A live reasoning run emits ONE ROW PER STEP, so the next `**title**` shifts
+	 * every row below it down by one. While the reader's intent was stored as a row
+	 * INDEX, that shift silently re-pointed it: the tool they opened folded shut and
+	 * a neighbour opened in its place — a height change with no user action behind
+	 * it, which CONTRACT §0 forbids. A row KEY is stable across exactly those frames.
+	 */
+	it("keeps the SAME tool open as a live reasoning run emits more rows", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const openedFor = (text: string) => {
+			const blocks = [{ type: "reasoning", text }];
+			const msg = msgWith(blocks);
+			const spec = adaptActivityUnit(
+				[
+					{ kind: "reasoning" as const, msg, blockIndex: 0, block: blocks[0] as never },
+					{ kind: "tool" as const, msg, blockIndex: 1, tc: readTc() },
+				],
+				"act-1",
+				{ lod: 2, ...openRows("act-1", "tool-tu-1") },
+			);
+			return activityRows(spec)
+				.map((row, index) => ({ row, index }))
+				.filter(({ row }) => row.card != null);
+		};
+
+		const oneStep = openedFor("**A**\n\nfirst");
+		const threeSteps = openedFor("**A**\n\nfirst\n\n**B**\n\nsecond\n\n**C**\n\nthird");
+		// Still exactly one card, and still the tool's.
+		expect(oneStep).toHaveLength(1);
+		expect(threeSteps).toHaveLength(1);
+		expect(threeSteps[0]?.row.card?.toolName).toBe("Read");
+		// Its INDEX moved (the run grew above it) — which is precisely why the index
+		// could not be the thing stored.
+		expect(oneStep[0]?.index).toBe(1);
+		expect(threeSteps[0]?.index).toBe(3);
 	});
 
 	it("a tool without a toolUseId cannot be drilled into", async () => {
@@ -1351,10 +1578,39 @@ describe("folded tool rows — drill-down payload", () => {
 		const spec = adaptActivityUnit(
 			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: { toolName: "Read" } }],
 			"act-1",
-			{ lod: 2, expandedRows: () => [0] },
+			{ lod: 2, isRowExpanded: () => true },
 		);
 		expect(activityRows(spec)[0]?.canDrillDown).toBeUndefined();
 		expect(activityRows(spec)[0]?.card).toBeUndefined();
+	});
+
+	/**
+	 * A provider retry puts the same tool-use id in two persisted messages, and the
+	 * second row is suffixed (`tool-tu-1#1`) so the two cannot overlap. That suffixed
+	 * key is what the renderer paints and therefore what a click reports, so the
+	 * lookup has to ask with it — asking with the bare id would never match the
+	 * reader's second attempt.
+	 */
+	it("addresses a retried call's suffixed row by its suffixed key", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const items = [
+			{ kind: "tool" as const, msg: msgWith([], "m1"), blockIndex: 0, tc: readTc("tu-1") },
+			{
+				kind: "tool" as const,
+				msg: msgWith([], "m2"),
+				blockIndex: 0,
+				tc: readTc("tu-1"),
+				dedupeSuffix: 1,
+			},
+		];
+		const second = adaptActivityUnit(items, "act-1", {
+			lod: 2,
+			...openRows("act-1", "tool-tu-1#1"),
+		});
+		expect(activityRows(second).map((row) => row.card != null)).toEqual([false, true]);
+		// The bare key opens the FIRST attempt only, so the two stay independent.
+		const first = adaptActivityUnit(items, "act-1", { lod: 2, ...openRows("act-1", "tool-tu-1") });
+		expect(activityRows(first).map((row) => row.card != null)).toEqual([true, false]);
 	});
 
 	it("the L3 tool-run-summary fold drills down under its own spec key", async () => {
@@ -1374,9 +1630,11 @@ describe("folded tool rows — drill-down payload", () => {
 
 		const expanded = adaptSegment(seg, {
 			lod: 3,
-			expandedRows: (key) => (key === "toolrun-summary-tool-tu-1" ? [0] : []),
+			...openRows("toolrun-summary-tool-tu-1", "tool-tu-1"),
 		})[0]!;
 		expect(activityRows(expanded).map((row) => row.card != null)).toEqual([true, false]);
+		// The reported indices are derived from those same rows.
+		expect((expanded.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([0]);
 	});
 
 	it("the drilled-in card matches the standalone card the same tool produces", async () => {
@@ -1393,7 +1651,7 @@ describe("folded tool rows — drill-down payload", () => {
 		const drilled = activityRows(
 			adaptActivityUnit([{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc }], "act-1", {
 				lod: 2,
-				expandedRows: () => [0],
+				...openRows("act-1", "tool-tu-1"),
 			}),
 		)[0]?.card;
 		// One constructor, so the payloads are identical — which is what keeps the
@@ -2272,220 +2530,5 @@ describe("adaptSegment — per-turn usage rows", () => {
 		);
 		expect(short.height).toBe(long.height);
 		expect(short.height).toBeGreaterThan(0);
-	});
-});
-
-describe("adaptSegment — sidecar cards", () => {
-	const sidecarMsg = (
-		role: string,
-		sideCars: Array<Record<string, unknown>>,
-		over: Record<string, unknown> = {},
-	): AdapterSegment => ({
-		kind: "message",
-		msg: {
-			id: "m1",
-			role,
-			contentJson: [{ type: "text", text: "body" }],
-			// The records are structurally AdapterSidecar; the test builds plain literals.
-			sideCars: sideCars as never,
-			...over,
-		},
-	});
-
-	it("assistant message: one sidecar card per visible user_message record, trailing the body", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{ target: "user_message", source: "silent_progress", content: "note one" },
-				{ target: "user_message", source: "bg_agent", content: "agent done" },
-			]),
-			CTX,
-		);
-		// markdown body + two sidecar cards.
-		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar", "sidecar"]);
-		const card = specs[1]!.data as { source: string; previewText: string; fullText: string };
-		expect(card.source).toBe("silent_progress");
-		expect(card.fullText).toBe("note one");
-	});
-
-	it("filters out tool_result records and empty content", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [
-				{ target: "tool_result", source: "x", content: "goes on the tool card" },
-				{ target: "user_message", source: "y", content: "   " },
-				{ target: "user_message", source: "z", content: "kept" },
-			]),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
-	});
-
-	it("user bubble: sidecars trail the bubble", () => {
-		const specs = adaptSegment(
-			sidecarMsg("user", [{ target: "user_message", source: "group_message", content: "hi" }]),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["message-bubble", "sidecar"]);
-	});
-
-	it("origin_notice branch: sidecars still surface (chunk parity)", () => {
-		const specs = adaptSegment(
-			sidecarMsg("user", [{ target: "user_message", source: "bg_bash", content: "done" }], {
-				origin: "system",
-			}),
-			CTX,
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["system-text", "sidecar"]);
-	});
-
-	it("sidecar opts carry the per-card fold state from ctx.isExpanded", () => {
-		const ctx: AdapterContext = { lod: 5, isExpanded: (key) => key === "m1-sc0" };
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			ctx,
-		);
-		expect(specs[1]!.opts?.expanded).toBe(true);
-	});
-
-	it("measures through the registry: collapsed is the constant height", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			CTX,
-		);
-		const measured = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, specs[1]!.opts);
-		expect(measured.height).toBeGreaterThan(0);
-		const open = VLIST_REGISTRY.sidecar.measure(specs[1]!.data, 600, 5, { expanded: true });
-		expect(open.height).toBeGreaterThan(measured.height);
-	});
-
-	// ── Low-LOD degraded form (one bare trace per record, no card skin) ────────
-	it("low LOD (<4): each record becomes a sidecar-trace, not a card", () => {
-		for (const lod of [1, 2, 3] as const) {
-			const specs = adaptSegment(
-				sidecarMsg("assistant", [
-					{ target: "user_message", source: "silent_progress", content: "one" },
-					{ target: "user_message", source: "bg_agent", content: "two" },
-				]),
-				{ lod },
-			);
-			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar-trace", "sidecar-trace"]);
-		}
-	});
-
-	it("high LOD (>=4): each record stays a full sidecar card", () => {
-		for (const lod of [4, 5, 6] as const) {
-			const specs = adaptSegment(
-				sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-				{ lod },
-			);
-			expect(specs.map((s) => s.kind)).toEqual(["markdown", "sidecar"]);
-		}
-	});
-
-	it("low-LOD trace carries the same payload and reads expandedRows for its row fold", () => {
-		const ctx: AdapterContext = { lod: 2, expandedRows: (key) => (key === "m1-sc0" ? [0] : []) };
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "bg_agent", content: "full" }]),
-			ctx,
-		);
-		const trace = specs[1]!;
-		expect(trace.kind).toBe("sidecar-trace");
-		const data = trace.data as { sourceLabel: string; previewText: string; fullText: string };
-		expect(data.sourceLabel).toBeTruthy();
-		expect(data.fullText).toBe("full");
-		expect(trace.opts?.expandedIndices).toEqual([0]);
-	});
-
-	it("low-LOD sidecar-trace measures through the registry (header + one row)", () => {
-		const specs = adaptSegment(
-			sidecarMsg("assistant", [{ target: "user_message", source: "s", content: "x" }]),
-			{ lod: 2 },
-		);
-		const collapsed = VLIST_REGISTRY["sidecar-trace"].measure(
-			specs[1]!.data,
-			600,
-			2,
-			specs[1]!.opts,
-		);
-		expect(collapsed.height).toBeGreaterThan(0);
-		// Expanding the single row reveals the body → taller.
-		const open = VLIST_REGISTRY["sidecar-trace"].measure(specs[1]!.data, 600, 2, {
-			expandedIndices: [0],
-		});
-		expect(open.height).toBeGreaterThan(collapsed.height);
-	});
-});
-
-describe("adaptToolRun — tool-result + tool-only-message sidecars", () => {
-	const toolItem = (
-		toolUseId: string,
-		sideCars: unknown[] | undefined,
-		msg?: { id?: string; contentJson?: unknown[]; sideCars?: unknown[] },
-	) =>
-		({
-			blockIndex: 0,
-			isSubagent: false,
-			tc: { toolName: "Bash", status: "success", toolUseId, sideCars },
-			...(msg ? { msg: { role: "assistant", ...msg } } : {}),
-		}) as never;
-
-	it("tool card data carries tool_result sidecars as mini-card payloads", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", [
-							{ target: "tool_result", source: "silent_progress", content: "injected" },
-						]),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		const card = specs[0]!.data as { sidecars?: { fullText: string }[] | null };
-		expect(card.sidecars).toHaveLength(1);
-		expect(card.sidecars?.[0]?.fullText).toBe("injected");
-	});
-
-	it("a tool-only source message's user_message sidecars trail the run", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", undefined, {
-							id: "src1",
-							contentJson: [{ type: "tool_use" }],
-							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
-						}),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "sidecar"]);
-	});
-
-	it("a source message WITH visible content is NOT duplicated into the run", () => {
-		const specs = adaptSegments(
-			[
-				{
-					kind: "tool-run",
-					sourceMessages: [],
-					items: [
-						toolItem("tu1", undefined, {
-							id: "src1",
-							// visible text block → the bubble segment renders the sidecar instead.
-							contentJson: [{ type: "text", text: "answer" }, { type: "tool_use" }],
-							sideCars: [{ target: "user_message", source: "bg_agent", content: "done" }],
-						}),
-					],
-				},
-			],
-			{ lod: 6 },
-		);
-		expect(specs.map((s) => s.kind)).toEqual(["tool-call"]);
 	});
 });

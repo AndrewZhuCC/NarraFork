@@ -60,6 +60,13 @@ export interface ComputeLayoutOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Row-KEY addressed expansion, for the two traces that fold a LIVE row list
+	 * (`activity-trace` / `tool-run-summary`). See `AdapterContext.isRowExpanded`
+	 * for why an index cannot survive a live run — and why the append-only traces
+	 * stay on `expandedRows`.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
@@ -95,6 +102,8 @@ export interface ComputeLayoutOptions {
 	/** True when a tool/subagent item has a live pending permission request; forces
 	 * its card expanded and folds into the measure cache key. */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
+	/** Tool-use id of the latest spec://tasks.json call; that card never folds. */
+	resolveLatestSpecTasksToolUseId?: () => string | null;
 	/** Plan body from a pending permission when the tool call carries none yet. */
 	resolvePendingPlan?: (toolUseId: string | undefined) => string | undefined;
 	/**
@@ -156,6 +165,7 @@ export function computePretextVListLayout(
 		isLodUserOverride: opts.isLodUserOverride,
 		showEarlier: opts.showEarlier,
 		expandedRows: opts.expandedRows,
+		isRowExpanded: opts.isRowExpanded,
 		showOriginal: opts.showOriginal,
 		isPromptOpen: opts.isPromptOpen,
 		recentMessageIds: opts.recentMessageIds,
@@ -168,6 +178,7 @@ export function computePretextVListLayout(
 		resolveSubagentRecentSummary: opts.resolveSubagentRecentSummary,
 		canOfferProviderFix: opts.canOfferProviderFix,
 		resolveHasPendingPermission: opts.resolveHasPendingPermission,
+		resolveLatestSpecTasksToolUseId: opts.resolveLatestSpecTasksToolUseId,
 		resolvePendingPlan: opts.resolvePendingPlan,
 		resolveFullToolInput: opts.resolveFullToolInput,
 		resolveFullToolOutput: opts.resolveFullToolOutput,

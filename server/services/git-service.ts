@@ -1,50 +1,137 @@
 import { cpSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { worktreeLock } from "../lib/async-mutex";
 import { GitAuthError, GitError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
+import { supportsMergeTree, WORKTREES_DIR_NAME } from "./worktree-tree-snapshot";
 
 interface ExecResult {
 	stdout: string;
 	stderr: string;
 	exitCode: number;
+	/**
+	 * Output exceeded the capture limit, so `stdout` is a prefix of what git printed.
+	 *
+	 * Exposed rather than hidden because for a parser the difference matters: a
+	 * truncated `-z` listing ends mid-record and a truncated merge-tree result loses
+	 * conflict paths. Callers that can be wrong silently must check this; callers
+	 * that only show text to a human can ignore it.
+	 */
+	truncated?: boolean;
 }
 
 interface ExecOptions {
 	silent?: boolean;
 	optionalLocks?: boolean;
+	/**
+	 * Hard timeout in ms. Left undefined for write/network operations (clone, fetch,
+	 * push) where a legitimate run can take minutes and killing it mid-way is worse
+	 * than waiting.
+	 */
+	timeout?: number;
+	maxOutputBytes?: number;
 }
 
 /**
- * Per-worktree mutex to prevent concurrent git write operations.
+ * Ceiling for read-only git commands.
+ *
+ * These all run on the server's single JS thread and are awaited by HTTP handlers,
+ * so an unbounded `git log`/`diff` against a pathological repository stalls every
+ * other request. 60 s is far above any healthy local invocation while still
+ * guaranteeing the request eventually returns.
+ */
+const READ_TIMEOUT_MS = 60_000;
+/**
+ * Capture ceiling for read-only git commands, an order of magnitude below
+ * safeSpawn's 10 MB default.
+ *
+ * Nothing here feeds a client more than ~100 KB (diffs are truncated, listings are
+ * capped at 200 entries), so retaining megabytes only inflates peak heap. The
+ * streams are still drained — only the retained string is bounded.
+ */
+const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/**
+ * Default depth for {@link gitService.findCommitLogIndex}.
+ *
+ * A cursor deeper than this means the client is asking for a position no user
+ * scrolled to, and the caller already has a correct fallback (skip-based paging).
+ */
+const COMMIT_LOG_INDEX_SEARCH_LIMIT = 50_000;
+
+/**
+ * Bytes to retain for a `--format=%H` walk of `n` commits.
+ *
+ * One line is 41 bytes (40 hex + newline). The default `READ_MAX_OUTPUT_BYTES`
+ * (1 MB) holds only ~25k of them, so a 50k-line request silently lost half its
+ * depth: git walked the history, safeSpawn discarded the tail, and the scan
+ * reported "not found" for commits that were in range. Sized from the line count
+ * so the two budgets cannot drift apart again, plus a small slack for a trailing
+ * newline and any truncation marker.
+ */
+function commitLogIndexMaxOutputBytes(searchLimit: number): number {
+	return Math.max(READ_MAX_OUTPUT_BYTES, searchLimit * 41 + 1024);
+}
+
+/**
+ * Serialize git write operations for one worktree.
  *
  * Read-only operations (status, diff, log, etc.) usually don't need this
  * application-level mutex, but Git may still refresh the index and briefly
  * create `.git/index.lock`. Use execRead() for those commands so Git disables
  * optional index writes via `--no-optional-locks`.
+ *
+ * This is `lib/async-mutex`'s shared {@link worktreeLock}, not a module-private
+ * instance. It used to be private, which meant a worktree had two independent locks
+ * over it: this one, and the one the multi-step orchestrations (`chapter-merge`,
+ * `routes/ruler`) take around whole sequences. Two locks over one resource provide no
+ * mutual exclusion between their holders — a merge holding the outer lock and a plain
+ * `POST /api/git/.../commit` taking only this one could interleave their `git`
+ * invocations on the same index, which is the class of corruption both locks exist to
+ * prevent.
+ *
+ * Unifying them makes nesting fatal rather than merely redundant, which is what the
+ * `*Unlocked` variants below address; see the note above them.
  */
-const worktreeLocks = new Map<string, Promise<unknown>>();
-
 async function withWorktreeLock<T>(worktreePath: string, fn: () => Promise<T>): Promise<T> {
-	const prev = worktreeLocks.get(worktreePath) ?? Promise.resolve();
-	let resolve: () => void = () => {};
-	const lock = new Promise<void>((r) => {
-		resolve = r;
-	});
-	worktreeLocks.set(worktreePath, lock);
-	await prev;
-	try {
-		return await fn();
-	} finally {
-		resolve();
-		if (worktreeLocks.get(worktreePath) === lock) {
-			worktreeLocks.delete(worktreePath);
-		}
-	}
+	return worktreeLock.acquire(worktreePath, fn);
 }
+
+/**
+ * Why every locked write method here has an `*Unlocked` twin.
+ *
+ * The multi-step orchestrations (`chapter-merge`, `routes/ruler`,
+ * `snapshot-dirty-git-op`) must hold a worktree exclusively across a *sequence* of
+ * commands — settle, park, rebase, reapply — because each step reads the state the
+ * previous one produced. They take the worktree lock themselves and then call
+ * individual write methods from inside it.
+ *
+ * No mutex here is re-entrant, and `AsyncMutex.acquire` chains behind the current tail
+ * without checking who owns it, so such a nested call waits on a lock its own caller
+ * holds. That is a deterministic self-deadlock, and its symptom is a request that hangs
+ * forever rather than an error — nothing logs, nothing throws, the HTTP handler simply
+ * never returns.
+ *
+ * The alternative of making the mutex re-entrant was rejected: `AsyncMutex` backs 20+
+ * instances with unrelated semantics (`narratorTraitsLock`, plugin locks, draft locks),
+ * and owner tracking would need an `AsyncLocalStorage` context threaded through all of
+ * them, widening the blast radius of a lock bug from one subsystem to every one.
+ *
+ * So the split is explicit instead: `xxxUnlocked` holds the command sequence with no
+ * locking, `xxx` is a thin `withWorktreeLock` wrapper around it. Callers that already
+ * hold the lock call the former; everyone else keeps calling the latter and is
+ * unaffected. This mirrors `worktree-tree-snapshot`'s `captureUnlocked` /
+ * `restoreUnlocked` / `getRefUnlocked` convention.
+ *
+ * Adding a write method? Put the body in `xxxUnlocked` and wrap it. Calling one from
+ * inside a `worktreeLock` block? Use the unlocked variant, and note in a comment that
+ * the caller owns the lock. `git-service-worktree-lock.test.ts` fails on a deadline if
+ * either rule is broken.
+ */
 
 export interface GitStatusFile {
 	/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
@@ -101,12 +188,29 @@ function commandOutputMentionsConflict(result: ExecResult): boolean {
 	return output.includes("conflict") || output.includes("冲突");
 }
 
-function normalizeExecOptions(options: boolean | ExecOptions = {}): Required<ExecOptions> {
+function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions {
 	if (typeof options === "boolean") return { silent: options, optionalLocks: true };
 	return {
 		silent: options.silent ?? false,
 		optionalLocks: options.optionalLocks ?? true,
+		timeout: options.timeout,
+		maxOutputBytes: options.maxOutputBytes,
 	};
+}
+
+/**
+ * Marker safeSpawn appends to a truncated stream.
+ *
+ * Removed here instead of being left in place because git output is *parsed*: a
+ * `-z` listing would gain the marker as a bogus path and a NUL-separated
+ * merge-tree result would gain it as a bogus conflict. The fact of truncation is
+ * carried by `ExecResult.truncated`, which is a signal a parser can act on.
+ */
+const SPAWN_TRUNCATION_MARKER = "[safeSpawn output truncated — exceeded capture limit]";
+
+function stripTruncationMarker(text: string): string {
+	const at = text.lastIndexOf(SPAWN_TRUNCATION_MARKER);
+	return at === -1 ? text : text.slice(0, at);
 }
 
 async function exec(
@@ -114,12 +218,17 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
-	const { silent, optionalLocks } = normalizeExecOptions(options);
+	const { silent, optionalLocks, timeout, maxOutputBytes } = normalizeExecOptions(options);
 	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
 	try {
-		const result = await safeSpawn({ cmd, cwd });
-		const trimmedStdout = stripTrailingLineBreaks(result.stdout);
-		const trimmedStderr = stripTrailingLineBreaks(result.stderr);
+		const result = await safeSpawn({ cmd, cwd, timeout, maxOutputBytes });
+		const truncated = result.stdoutTruncated === true || result.stderrTruncated === true;
+		const trimmedStdout = stripTrailingLineBreaks(
+			result.stdoutTruncated ? stripTruncationMarker(result.stdout) : result.stdout,
+		);
+		const trimmedStderr = stripTrailingLineBreaks(
+			result.stderrTruncated ? stripTruncationMarker(result.stderr) : result.stderr,
+		);
 		if (result.exitCode !== 0 && !silent) {
 			logger.error("git command failed", {
 				args: args.join(" "),
@@ -128,9 +237,22 @@ async function exec(
 				stderr: trimmedStderr ? truncateGitFailureOutput(trimmedStderr) : undefined,
 				exitCode: result.exitCode,
 				optionalLocks,
+				truncated: truncated || undefined,
 			});
 		}
-		return { stdout: trimmedStdout, stderr: trimmedStderr, exitCode: result.exitCode };
+		if (truncated) {
+			logger.warn("git command output truncated", {
+				args: args.join(" "),
+				cwd,
+				limit: maxOutputBytes,
+			});
+		}
+		return {
+			stdout: trimmedStdout,
+			stderr: trimmedStderr,
+			exitCode: result.exitCode,
+			truncated,
+		};
 	} catch (err) {
 		// When silent, swallow spawn errors (e.g. git not found) and return a
 		// synthetic failure result so callers that check exitCode still work.
@@ -148,8 +270,25 @@ async function exec(
 	}
 }
 
-function execRead(args: string[], cwd: string, silent = false): Promise<ExecResult> {
-	return exec(args, cwd, { silent, optionalLocks: false });
+/**
+ * Run a read-only git command.
+ *
+ * Read operations get a timeout and a capture ceiling by default; writes and network
+ * operations deliberately do not, since a slow `clone` or `merge` is normal and
+ * killing it half-done leaves the repository in a worse state than waiting does.
+ */
+function execRead(
+	args: string[],
+	cwd: string,
+	silent = false,
+	options?: { timeout?: number; maxOutputBytes?: number },
+): Promise<ExecResult> {
+	return exec(args, cwd, {
+		silent,
+		optionalLocks: false,
+		timeout: options?.timeout ?? READ_TIMEOUT_MS,
+		maxOutputBytes: options?.maxOutputBytes ?? READ_MAX_OUTPUT_BYTES,
+	});
 }
 
 async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
@@ -160,6 +299,43 @@ async function detectUnmergedFiles(worktreePath: string): Promise<string[]> {
 	);
 	if (statusResult.exitCode !== 0) return [];
 	return statusResult.stdout.split("\n").filter(Boolean);
+}
+
+/**
+ * Whether the repository has no commits at all (unborn HEAD).
+ *
+ * Distinguishes "brand new repository" from "git is broken or the ref is wrong",
+ * which `rev-list` reports identically as exit 128. Checked with
+ * `rev-parse --verify` because it exits 1 (not 128) for an unresolvable HEAD and
+ * prints nothing, so a genuine spawn failure still surfaces as an error elsewhere.
+ */
+async function hasNoCommits(repoPath: string): Promise<boolean> {
+	const result = await execRead(["rev-parse", "--verify", "--quiet", "HEAD"], repoPath, true);
+	return result.exitCode === 1 && !result.stdout.trim();
+}
+
+/**
+ * Whether `ref` names a branch/commit that simply is not in this repository.
+ *
+ * The companion to {@link hasNoCommits}, which only ever recognises an unborn HEAD: a
+ * repository that *has* commits but not under the name being asked about is a different
+ * situation, and `rev-list` reports both as exit 128. `rev-parse --verify --quiet` exits
+ * 1 with no output for an unresolvable ref and 128 only when git itself could not answer,
+ * so a probe of the ref separates "your ref is wrong" from "git is broken".
+ *
+ * A range (`<a>..<b>`) is deliberately never treated as a missing ref. Ranges reach
+ * {@link gitService.getCommitCount} from cursor pagination, where an endpoint that no
+ * longer resolves is a stale cursor the caller has to be *told* about — it falls back to
+ * skip-based loading — whereas answering 0 would page the timeline from the wrong end.
+ */
+async function refIsMissing(repoPath: string, ref: string): Promise<boolean> {
+	if (ref.includes("..")) return false;
+	const result = await execRead(
+		["rev-parse", "--verify", "--quiet", `${ref}^{commit}`],
+		repoPath,
+		true,
+	);
+	return result.exitCode === 1 && !result.stdout.trim();
 }
 
 async function detectConflictFilesAfterFailedGitCommand(
@@ -292,6 +468,33 @@ function parseNumstatZ(
 	return entries;
 }
 
+/**
+ * Parse `--name-status -z` into a path -> raw status letter map.
+ *
+ * The record layout differs by status, which is why this cannot be a simple pairwise
+ * split: `M\0path\0`, but `R085\0old\0new\0`. Rename/copy entries are keyed under the
+ * new path, matching how numstat reports them.
+ */
+function parseNameStatusZ(output: string): Map<string, string> {
+	const fields = output.split("\0");
+	const statuses = new Map<string, string>();
+	let i = 0;
+	while (i < fields.length) {
+		const status = fields[i++];
+		if (!status) continue;
+		const takesTwoPaths = status.startsWith("R") || status.startsWith("C");
+		if (takesTwoPaths) {
+			const newPath = fields[i + 1];
+			i += 2;
+			if (newPath) statuses.set(newPath, status);
+			continue;
+		}
+		const path = fields[i++];
+		if (path) statuses.set(path, status);
+	}
+	return statuses;
+}
+
 function buildLineStatsMap(output: string): Map<string, LineStats> {
 	return new Map(
 		parseNumstatZ(output).map(({ path, added, removed }) => [path, { added, removed }]),
@@ -326,6 +529,35 @@ function parsePorcelainStatusZ(
 
 	return entries;
 }
+
+/**
+ * `git status --porcelain` arguments that list untracked files INDIVIDUALLY.
+ *
+ * ── The bug this closes ──────────────────────────────────────────────────────
+ * By default git COLLAPSES an untracked directory into a single entry with a
+ * trailing slash: a brand-new `src/feature/` holding three files is reported as
+ * one line, `?? src/feature/`. That is a display convenience for the terminal,
+ * and it is actively wrong for every consumer we have:
+ *   - the panel's file tree splits on "/" and drops the trailing empty segment,
+ *     so `src/feature/` became a FILE row named `feature` wearing an `A` badge,
+ *     and the files inside it were nowhere at all;
+ *   - `copyDirtyFiles` called `Bun.file()` on that path, which cannot read a
+ *     directory, so a review worktree silently lost the whole new folder.
+ * Both are the same root cause: a directory entry pretending to be a file.
+ *
+ * `-uall` makes git do the expansion itself, which is the only place it can be
+ * done correctly — walking the directory in our own code would re-implement
+ * gitignore semantics, and getting those subtly wrong is how ignored build
+ * output ends up in a reviewer's diff.
+ *
+ * COST: on a repo with a huge untracked directory (a stray `node_modules`,
+ * a build output folder that is not ignored) this enumerates every file instead
+ * of one line. That is bounded where it matters — `files` is capped at
+ * `MAX_FILES`, and the untracked line-count scan has its own cap — and it is the
+ * honest number: those files ARE uncommitted, and the old single line simply hid
+ * how many.
+ */
+const PORCELAIN_UNTRACKED_ALL = ["status", "--porcelain", "-uall"];
 
 export const gitService = {
 	async getCurrentBranch(repoPath: string): Promise<string> {
@@ -472,28 +704,64 @@ export const gitService = {
 		return result.exitCode === 0;
 	},
 
-	/** Simulate merge using merge-tree to detect conflicts without modifying worktree */
+	/**
+	 * Simulate a merge to detect conflicts without touching any worktree.
+	 *
+	 * Uses `merge-tree --write-tree` (git >= 2.38), whose contract is machine-readable:
+	 * exit 0 means clean, exit 1 means conflicted, and with `--name-only -z` stdout is
+	 * the result tree followed by the conflicting paths. The older three-argument form
+	 * cannot be used for this: it exits 0 either way and describes conflicts by
+	 * inlining `<<<<<<< .our` markers into a diff, so parsing it for `+++ b/` or
+	 * `CONFLICT` lines — patterns that only the new form emits — reported "no
+	 * conflicts" unconditionally and let the UI promise a clean merge that then failed.
+	 *
+	 * Throws on old git rather than falling back to the legacy form. A merge preview
+	 * that cannot see conflicts is worse than no preview: the caller can surface "not
+	 * checkable", but it cannot recover from being told a lie.
+	 */
 	async mergeTree(
 		repoPath: string,
 		baseSha: string,
 		ourBranch: string,
 		theirBranch: string,
 	): Promise<{ hasConflicts: boolean; conflictFiles: string[] }> {
-		const result = await execRead(["merge-tree", baseSha, ourBranch, theirBranch], repoPath);
-		const conflictFiles: string[] = [];
-		const lines = result.stdout.split("\n");
-		for (const line of lines) {
-			// merge-tree "changed in both" sections contain conflict file paths
-			const match = line.match(/^\+\+\+ b\/(.+)$/);
-			if (match) conflictFiles.push(match[1]);
+		if (!(await supportsMergeTree())) {
+			throw new GitError(
+				"Cannot check for merge conflicts: git merge-tree --write-tree is unavailable (requires git >= 2.38)",
+			);
 		}
-		for (const line of lines) {
-			const conflictMatch = line.match(/^CONFLICT \(.+\): .+ (.+)$/);
-			if (conflictMatch && !conflictFiles.includes(conflictMatch[1])) {
-				conflictFiles.push(conflictMatch[1]);
-			}
+		const result = await execRead(
+			[
+				"merge-tree",
+				"--write-tree",
+				"--name-only",
+				"--no-messages",
+				"-z",
+				`--merge-base=${baseSha}`,
+				ourBranch,
+				theirBranch,
+			],
+			repoPath,
+			// exit 1 is the documented "conflicts found" status, so it must not be logged
+			// as a command failure.
+			true,
+		);
+		if (result.exitCode !== 0 && result.exitCode !== 1) {
+			throw new GitError(gitFailureMessage("Merge conflict check failed", result));
 		}
-		return { hasConflicts: conflictFiles.length > 0, conflictFiles };
+		if (result.truncated) {
+			// A cut-off list would understate the conflicts, which is the exact failure
+			// this rewrite exists to remove.
+			throw new GitError("Merge conflict check produced more output than can be read");
+		}
+		const parts = result.stdout.split("\0").filter(Boolean);
+		// parts[0] is the merged tree — written to the object store even when
+		// conflicted, and irrelevant here since nothing gets checked out.
+		const [tree, ...conflictFiles] = parts;
+		if (!tree) throw new GitError("Merge conflict check returned no tree");
+		// Trust the exit code over the path list: `--name-only` omits paths for some
+		// conflict kinds, so exit 1 with no names still means "do not promise clean".
+		return { hasConflicts: result.exitCode === 1, conflictFiles };
 	},
 
 	/** Perform actual merge in a worktree */
@@ -689,24 +957,50 @@ export const gitService = {
 	},
 
 	async getStatus(worktreePath: string): Promise<string> {
-		const result = await execRead(["status", "--porcelain"], worktreePath);
+		// `-uall`: untracked directories are expanded to their files. A consumer
+		// that receives `?? newdir/` cannot tell a directory from a file, and every
+		// one of ours treats it as a file. See PORCELAIN_UNTRACKED_ALL.
+		const result = await execRead(PORCELAIN_UNTRACKED_ALL, worktreePath);
 		return result.stdout;
 	},
 
+	/**
+	 * Stage everything and commit, for unattended saves (e.g. putting a chapter to sleep).
+	 *
+	 * Refuses to run mid-conflict. `git add -A` treats an unmerged path as *resolved*,
+	 * so a worktree parked on `UU` would have its `<<<<<<<` markers committed as if
+	 * they were the author's code — a commit nobody wrote, indistinguishable from real
+	 * work afterwards. Skipping silently is not an option either: the caller would
+	 * record a successful save. Throwing is safe because callers already treat an
+	 * autoCommit failure as "fall back to a snapshot", and it gives them a reason to
+	 * show the user.
+	 */
 	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
-		return withWorktreeLock(worktreePath, async () => {
-			const status = await this.getStatus(worktreePath);
-			if (!status) return null;
+		return withWorktreeLock(worktreePath, () => this.autoCommitUnlocked(worktreePath, message));
+	},
 
-			const addResult = await exec(["add", "-A"], worktreePath);
-			if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
+	/** {@link autoCommit} for callers already holding the worktree lock. */
+	async autoCommitUnlocked(worktreePath: string, message: string): Promise<string | null> {
+		const status = await this.getStatus(worktreePath);
+		if (!status) return null;
 
-			const commitResult = await exec(["commit", "-m", message], worktreePath);
-			if (commitResult.exitCode !== 0)
-				throw new GitError(`git commit failed: ${commitResult.stderr}`);
+		const unmerged = await detectUnmergedFiles(worktreePath);
+		if (unmerged.length > 0) {
+			const shown = unmerged.slice(0, 5).join(", ");
+			const rest = unmerged.length > 5 ? `, +${unmerged.length - 5} more` : "";
+			throw new GitError(
+				`Refusing to auto-commit: ${unmerged.length} file(s) still have unresolved merge conflicts (${shown}${rest})`,
+			);
+		}
 
-			return this.getHeadCommit(worktreePath);
-		});
+		const addResult = await exec(["add", "-A"], worktreePath);
+		if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
+
+		const commitResult = await exec(["commit", "-m", message], worktreePath);
+		if (commitResult.exitCode !== 0)
+			throw new GitError(`git commit failed: ${commitResult.stderr}`);
+
+		return this.getHeadCommit(worktreePath);
 	},
 
 	async getStatusSummary(worktreePath: string): Promise<GitStatusSummary> {
@@ -718,7 +1012,7 @@ export const gitService = {
 			unstagedNumstat,
 			untrackedResult,
 		] = await Promise.all([
-			execRead(["status", "--porcelain", "-z"], worktreePath),
+			execRead([...PORCELAIN_UNTRACKED_ALL, "-z"], worktreePath),
 			execRead(["rev-parse", "HEAD"], worktreePath),
 			execRead(["rev-parse", "--abbrev-ref", "HEAD"], worktreePath),
 			execRead(["diff", "--cached", "--numstat", "-z"], worktreePath, true),
@@ -803,16 +1097,17 @@ export const gitService = {
 
 	/** Get full diff of all uncommitted changes (staged + unstaged + untracked).
 	 *  Truncates at ~100KB to avoid blowing up AI token budgets.
-	 *  Binary files are excluded at the git level to prevent memory blowup. */
+	 *  Binary file *content* never appears — see the note on binary handling below. */
 	async getFullDiff(worktreePath: string, maxBytes = 100_000): Promise<string> {
 		// Diff of tracked files (staged + unstaged combined against HEAD).
-		// --no-binary: suppress binary file content in diff output.
+		//
+		// Binary content is kept out by doing nothing: git's default is a single
+		// "Binary files a/x and b/x differ" line, and only an explicit `--binary`
+		// (or `--text`) makes it emit content. There is no `--no-binary` — passing
+		// one makes git print usage and exit 129, which silently emptied every diff
+		// this method produced, including the one the review agent reads.
 		// -D/--irreversible-delete: omit full content of deleted files.
-		const diffResult = await execRead(
-			["diff", "HEAD", "--no-binary", "-D", "--no-color"],
-			worktreePath,
-			true,
-		);
+		const diffResult = await execRead(["diff", "HEAD", "-D", "--no-color"], worktreePath, true);
 		const parts: string[] = [];
 		let totalLen = 0;
 
@@ -844,9 +1139,9 @@ export const gitService = {
 		const filesToDiff = untrackedFiles.slice(0, MAX_UNTRACKED_DIFFS);
 		for (const file of filesToDiff) {
 			// --no-index always exits 1 when diff is found — silence the expected error log.
-			// --no-binary: skip binary file content.
+			// Binary files again produce only a "Binary files ... differ" line by default.
 			const showResult = await execRead(
-				["diff", "--no-index", "--no-binary", "--no-color", DEV_NULL, file],
+				["diff", "--no-index", "--no-color", DEV_NULL, file],
 				worktreePath,
 				true,
 			);
@@ -865,7 +1160,7 @@ export const gitService = {
 	 * Get diff between two refs (commits, branches, tags).
 	 * Useful for review: shows all changes between a base and head.
 	 * Truncates at maxBytes to avoid blowing up token budgets.
-	 * Binary files are excluded to prevent memory blowup.
+	 * Binary content is left out by git's default one-line summary, not by a flag.
 	 */
 	async getDiffBetweenRefs(
 		repoPath: string,
@@ -873,11 +1168,7 @@ export const gitService = {
 		headRef: string,
 		maxBytes = 100_000,
 	): Promise<string> {
-		const result = await execRead(
-			["diff", "--no-binary", "--no-color", `${baseRef}..${headRef}`],
-			repoPath,
-			true,
-		);
+		const result = await execRead(["diff", "--no-color", `${baseRef}..${headRef}`], repoPath, true);
 		if (!result.stdout) return "";
 		if (result.stdout.length > maxBytes) {
 			return `${result.stdout.slice(0, maxBytes)}\n\n[diff truncated — exceeded size limit]`;
@@ -888,6 +1179,15 @@ export const gitService = {
 	/**
 	 * Get the file list for a specific commit (stats only, no diff content).
 	 * Fast even for huge commits — only runs numstat + name-status.
+	 *
+	 * Both passes must agree on rename detection and quoting, so both get `-M -z`.
+	 * Previously only name-status had `-M`, which made the two views disagree about
+	 * what a rename even is: numstat split it into an add of the new path plus a
+	 * delete of the old one, and since name-status keyed the rename under the new
+	 * path only, the old path fell through to the default "modified" branch and the
+	 * UI listed a phantom file that does not exist in the commit. `-z` additionally
+	 * stops git from octal-escaping non-ASCII paths, which otherwise never matched
+	 * between the two maps for CJK filenames.
 	 */
 	async getCommitFiles(
 		repoPath: string,
@@ -901,51 +1201,31 @@ export const gitService = {
 			linesRemoved: number;
 		}>
 	> {
-		// Get numstat for per-file stats
-		const numstat = await execRead(
-			["diff-tree", "--no-commit-id", "-r", "--numstat", sha],
-			repoPath,
-		);
-		// Get name-status for file status (A/M/D/R)
-		const nameStatus = await execRead(
-			["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", sha],
-			repoPath,
-		);
+		const [numstat, nameStatus] = await Promise.all([
+			execRead(["diff-tree", "--no-commit-id", "-r", "--numstat", "-M", "-z", sha], repoPath),
+			execRead(["diff-tree", "--no-commit-id", "-r", "--name-status", "-M", "-z", sha], repoPath),
+		]);
 
-		const statusMap = new Map<string, { status: string; oldPath?: string }>();
-		for (const line of nameStatus.stdout.split("\n").filter(Boolean)) {
-			const parts = line.split("\t");
-			const st = parts[0];
-			if (st.startsWith("R")) {
-				statusMap.set(parts[2], { status: "renamed", oldPath: parts[1] });
-			} else {
-				statusMap.set(parts[1], { status: st });
-			}
-		}
-
-		const statLines = numstat.stdout.split("\n").filter(Boolean);
-		return statLines.map((line) => {
-			const [addStr, delStr, filePath] = line.split("\t");
-			const linesAdded = addStr === "-" ? 0 : Number.parseInt(addStr, 10) || 0;
-			const linesRemoved = delStr === "-" ? 0 : Number.parseInt(delStr, 10) || 0;
-
-			const info = statusMap.get(filePath);
-			const rawStatus = info?.status ?? "M";
-			const status =
-				rawStatus === "A" || rawStatus === "added"
+		const statusMap = parseNameStatusZ(nameStatus.stdout);
+		return parseNumstatZ(numstat.stdout).map((entry) => {
+			const rawStatus = statusMap.get(entry.path);
+			// Fall back on the numstat record itself: it reports a rename as a pair of
+			// paths, which is enough to classify without name-status agreeing.
+			const status: "added" | "modified" | "deleted" | "renamed" =
+				rawStatus === "A"
 					? "added"
-					: rawStatus === "D" || rawStatus === "deleted"
+					: rawStatus === "D"
 						? "deleted"
-						: rawStatus === "renamed"
+						: rawStatus?.startsWith("R") || entry.oldPath
 							? "renamed"
 							: "modified";
 
 			return {
-				path: filePath,
-				oldPath: info?.oldPath,
-				status: status as "added" | "modified" | "deleted" | "renamed",
-				linesAdded,
-				linesRemoved,
+				path: entry.path,
+				oldPath: entry.oldPath,
+				status,
+				linesAdded: entry.added,
+				linesRemoved: entry.removed,
 			};
 		});
 	},
@@ -1145,97 +1425,131 @@ export const gitService = {
 
 	async stageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stageFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link stageFiles} for callers already holding the worktree lock. */
+	async stageFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		const result = await exec(["add", "--", ...files], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git add failed: ${result.stderr}`);
 	},
 
 	async stageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["add", "-A"], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stageAllUnlocked(worktreePath));
+	},
+
+	/** {@link stageAll} for callers already holding the worktree lock. */
+	async stageAllUnlocked(worktreePath: string): Promise<void> {
+		const result = await exec(["add", "-A"], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git add -A failed: ${result.stderr}`);
 	},
 
 	async unstageFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.unstageFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link unstageFiles} for callers already holding the worktree lock. */
+	async unstageFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		const result = await exec(["reset", "HEAD", "--", ...files], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
 	async unstageAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "HEAD"], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.unstageAllUnlocked(worktreePath));
+	},
+
+	/** {@link unstageAll} for callers already holding the worktree lock. */
+	async unstageAllUnlocked(worktreePath: string): Promise<void> {
+		const result = await exec(["reset", "HEAD"], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
 	async commit(worktreePath: string, message: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["commit", "-m", message], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
-			return this.getHeadCommit(worktreePath);
-		});
+		return withWorktreeLock(worktreePath, () => this.commitUnlocked(worktreePath, message));
+	},
+
+	/** {@link commit} for callers already holding the worktree lock. */
+	async commitUnlocked(worktreePath: string, message: string): Promise<string> {
+		const result = await exec(["commit", "-m", message], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
+		return this.getHeadCommit(worktreePath);
 	},
 
 	async discardFiles(worktreePath: string, files: string[]): Promise<void> {
 		if (files.length === 0) return;
-		return withWorktreeLock(worktreePath, async () => {
-			const statusResult = await execRead(["status", "--porcelain", "--", ...files], worktreePath);
-			const tracked: string[] = [];
-			const untracked: string[] = [];
-			for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
-				const path = line.slice(3);
-				if (line[0] === "?" && line[1] === "?") {
-					untracked.push(path);
-				} else {
-					tracked.push(path);
-				}
+		return withWorktreeLock(worktreePath, () => this.discardFilesUnlocked(worktreePath, files));
+	},
+
+	/** {@link discardFiles} for callers already holding the worktree lock. */
+	async discardFilesUnlocked(worktreePath: string, files: string[]): Promise<void> {
+		if (files.length === 0) return;
+		// `-uall` is a SAFETY requirement here, not just a display one. Collapsed
+		// output would report `?? newdir/` for a request to discard
+		// `newdir/one.txt`, and the `git clean` below would then delete the entire
+		// directory — every sibling the user never asked to touch.
+		const statusResult = await execRead([...PORCELAIN_UNTRACKED_ALL, "--", ...files], worktreePath);
+		const tracked: string[] = [];
+		const untracked: string[] = [];
+		for (const line of statusResult.stdout.split("\n").filter(Boolean)) {
+			const path = line.slice(3);
+			if (line[0] === "?" && line[1] === "?") {
+				untracked.push(path);
+			} else {
+				tracked.push(path);
 			}
-			if (tracked.length > 0) {
-				const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
-				if (r.exitCode !== 0) throw new GitError(`git checkout failed: ${r.stderr}`);
-			}
-			if (untracked.length > 0) {
-				const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
-				if (r.exitCode !== 0) throw new GitError(`git clean failed: ${r.stderr}`);
-			}
-		});
+		}
+		if (tracked.length > 0) {
+			const r = await exec(["checkout", "HEAD", "--", ...tracked], worktreePath);
+			if (r.exitCode !== 0) throw new GitError(`git checkout failed: ${r.stderr}`);
+		}
+		if (untracked.length > 0) {
+			const r = await exec(["clean", "-f", "--", ...untracked], worktreePath);
+			if (r.exitCode !== 0) throw new GitError(`git clean failed: ${r.stderr}`);
+		}
 	},
 
 	async discardAll(worktreePath: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
-			if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
-			const r2 = await exec(["clean", "-fd"], worktreePath);
-			if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.discardAllUnlocked(worktreePath));
+	},
+
+	/** {@link discardAll} for callers already holding the worktree lock. */
+	async discardAllUnlocked(worktreePath: string): Promise<void> {
+		const r1 = await exec(["checkout", "HEAD", "--", "."], worktreePath);
+		if (r1.exitCode !== 0) throw new GitError(`git checkout failed: ${r1.stderr}`);
+		const r2 = await exec(["clean", "-fd"], worktreePath);
+		if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
 	},
 
 	async stash(worktreePath: string, message?: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const args = ["stash", "push", "--include-untracked"];
-			if (message) args.push("-m", message);
-			const result = await exec(args, worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stashUnlocked(worktreePath, message));
+	},
+
+	/** {@link stash} for callers already holding the worktree lock. */
+	async stashUnlocked(worktreePath: string, message?: string): Promise<void> {
+		const args = ["stash", "push", "--include-untracked"];
+		if (message) args.push("-m", message);
+		const result = await exec(args, worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 	},
 
 	async stashPop(worktreePath: string): Promise<{ hasConflicts: boolean }> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["stash", "pop"], worktreePath, true);
-			if (result.exitCode !== 0) {
-				const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
-				if (hasUnmerged || commandOutputMentionsConflict(result)) {
-					return { hasConflicts: true };
-				}
-				throw new GitError(gitFailureMessage("git stash pop failed", result));
+		return withWorktreeLock(worktreePath, () => this.stashPopUnlocked(worktreePath));
+	},
+
+	/** {@link stashPop} for callers already holding the worktree lock. */
+	async stashPopUnlocked(worktreePath: string): Promise<{ hasConflicts: boolean }> {
+		const result = await exec(["stash", "pop"], worktreePath, true);
+		if (result.exitCode !== 0) {
+			const hasUnmerged = (await detectUnmergedFiles(worktreePath)).length > 0;
+			if (hasUnmerged || commandOutputMentionsConflict(result)) {
+				return { hasConflicts: true };
 			}
-			return { hasConflicts: false };
-		});
+			throw new GitError(gitFailureMessage("git stash pop failed", result));
+		}
+		return { hasConflicts: false };
 	},
 
 	async stashList(
@@ -1258,10 +1572,13 @@ export const gitService = {
 	},
 
 	async stashDrop(worktreePath: string, index: number): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git stash drop failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.stashDropUnlocked(worktreePath, index));
+	},
+
+	/** {@link stashDrop} for callers already holding the worktree lock. */
+	async stashDropUnlocked(worktreePath: string, index: number): Promise<void> {
+		const result = await exec(["stash", "drop", `stash@{${index}}`], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git stash drop failed: ${result.stderr}`);
 	},
 
 	// === File diff (working tree) ===
@@ -1272,9 +1589,10 @@ export const gitService = {
 		staged = false,
 		maxBytes = 200_000,
 	): Promise<{ diff: string; truncated: boolean }> {
-		// Check if file is untracked
+		// Check if file is untracked. `-uall` so a file inside a brand-new directory
+		// is reported as itself rather than as its collapsed parent directory.
 		const statusResult = await execRead(
-			["status", "--porcelain", "--", filePath],
+			[...PORCELAIN_UNTRACKED_ALL, "--", filePath],
 			worktreePath,
 			true,
 		);
@@ -1339,26 +1657,189 @@ export const gitService = {
 			});
 	},
 
+	/**
+	 * Number of commits reachable from `branch` (default HEAD).
+	 *
+	 * Returns 0 for the two cases that legitimately mean zero — an unborn HEAD in a fresh
+	 * repository, and a ref that does not exist — and throws for everything else (git
+	 * missing, a broken repository, a timeout), because the previous `|| 0` made a broken
+	 * git indistinguishable from an empty repository and callers rendered "0 commits".
+	 *
+	 * "The ref does not exist" has to be its own case rather than being folded into
+	 * {@link hasNoCommits}, which only recognises an unborn *HEAD*. A repository with
+	 * commits on `master` while `project.defaultBranch` says `main` — a renamed or deleted
+	 * branch, or an import whose default differs — fails `rev-list --count main` with exit
+	 * 128 while HEAD resolves fine, so `hasNoCommits` said false and this threw. The
+	 * ruler timeline calls it inside a `Promise.all` with no catch, so the whole `/ruler`
+	 * endpoint returned 500 and the page would not open at all; before the throw was
+	 * introduced the same repository degraded to displaying 0.
+	 *
+	 * Probed with `rev-parse --verify --quiet` on the ref itself, which answers exactly
+	 * this question: exit 1 with no output for an unresolvable ref (including a range
+	 * whose endpoints do not resolve), exit 128 only when git could not run at all.
+	 */
 	async getCommitCount(worktreePath: string, branch?: string): Promise<number> {
-		const args = ["rev-list", "--count", branch ?? "HEAD"];
-		const result = await execRead(args, worktreePath, true);
-		return Number.parseInt(result.stdout.trim(), 10) || 0;
+		const ref = branch ?? "HEAD";
+		const result = await execRead(["rev-list", "--count", ref], worktreePath, true);
+		if (result.exitCode !== 0) {
+			if (await hasNoCommits(worktreePath)) return 0;
+			if (await refIsMissing(worktreePath, ref)) return 0;
+			throw new GitError(gitFailureMessage(`Failed to count commits for ${ref}`, result));
+		}
+		const count = Number.parseInt(result.stdout.trim(), 10);
+		if (!Number.isFinite(count)) {
+			throw new GitError(`Unexpected commit count output for ${ref}: ${result.stdout.trim()}`);
+		}
+		return count;
+	},
+
+	/**
+	 * Position of `sha` in `git log <branch>` order, or null when it is not in that walk.
+	 *
+	 * Exists because "how many commits are reachable from main but not from X"
+	 * (`rev-list --count X..main`) is NOT X's index in `git log main`, and the two differ by
+	 * exactly the commits that are ordered before X by DATE while not being its ancestors —
+	 * i.e. anything that arrived through a merge. `git log` sorts by commit date by default;
+	 * `rev-list --count A..B` measures a reachability set. On this repository the 200th
+	 * commit sits at log index 199 while the range count says 202, so paging that trusted
+	 * the count skipped three commits per page — and a chapter anchored to one of them lost
+	 * its tick and was reported as "not on this branch".
+	 *
+	 * Implemented with the same `log` walk the pages come from, so the answer is in the same
+	 * order by construction rather than by an assumed correspondence between two orders.
+	 * `--format=%H` + a line scan rather than `--pretty=%H | grep -n`: the position must
+	 * come from the array the caller pages against, and shelling out to grep would add a
+	 * second process and a locale-dependent match for something this is already reading.
+	 *
+	 * Bounded by `searchLimit` (default {@link COMMIT_LOG_INDEX_SEARCH_LIMIT}): an unbounded
+	 * scan on a huge repository is a main-thread cost with no ceiling, and a cursor that far
+	 * back means the client is asking for something no user scrolled to. Returns null past
+	 * the limit, which callers treat as "cursor not usable" and fall back to skip-based
+	 * paging.
+	 *
+	 * The line budget and the byte budget are raised TOGETHER (see the constant): the
+	 * capture ceiling is the real constraint, so a `--max-count` that exceeds what
+	 * `maxOutputBytes` can retain just makes git walk history whose output is then thrown
+	 * away, and silently halves the effective search depth.
+	 */
+	async findCommitLogIndex(
+		worktreePath: string,
+		sha: string,
+		opts: { branch?: string; searchLimit?: number } = {},
+	): Promise<number | null> {
+		if (!sha) return null;
+		const searchLimit = opts.searchLimit ?? COMMIT_LOG_INDEX_SEARCH_LIMIT;
+		const args = ["log", `--max-count=${searchLimit}`, "--format=%H"];
+		if (opts.branch) args.push(opts.branch);
+		const result = await execRead(args, worktreePath, true, {
+			maxOutputBytes: commitLogIndexMaxOutputBytes(searchLimit),
+		});
+		if (result.exitCode !== 0 || !result.stdout.trim()) return null;
+		if (result.truncated) {
+			// Not fatal — the scan below still answers for anything inside the retained
+			// prefix — but it means the effective depth was smaller than requested, and a
+			// null result may be "capture ran out" rather than "not on this branch".
+			logger.warn("Commit log index scan hit its capture ceiling", {
+				worktreePath,
+				searchLimit,
+			});
+		}
+		const lines = result.stdout.trim().split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]?.trim();
+			if (!line) continue;
+			// Accept an abbreviated cursor too: the ruler carries full SHAs, but a caller
+			// passing `shortSha` would otherwise silently never match and page from 0.
+			if (line === sha || (sha.length >= 7 && line.startsWith(sha))) return i;
+		}
+		return null;
 	},
 
 	// === Reset ===
 
 	async resetSoft(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "--soft", target], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.resetSoftUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetSoft} for callers already holding the worktree lock. */
+	async resetSoftUnlocked(worktreePath: string, target: string): Promise<void> {
+		const result = await exec(["reset", "--soft", target], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset --soft failed: ${result.stderr}`);
 	},
 
 	async resetHard(worktreePath: string, target: string): Promise<void> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["reset", "--hard", target], worktreePath);
-			if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
-		});
+		return withWorktreeLock(worktreePath, () => this.resetHardUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetHard} for callers already holding the worktree lock. */
+	async resetHardUnlocked(worktreePath: string, target: string): Promise<void> {
+		const result = await exec(["reset", "--hard", target], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git reset --hard failed: ${result.stderr}`);
+	},
+
+	/**
+	 * Abandon a conflicted merge while keeping unrelated uncommitted work.
+	 *
+	 * The clean-up a failed `--squash` merge needs. `git merge --abort` cannot do it:
+	 * `--squash --no-commit` never writes MERGE_HEAD, so abort exits 128 and leaves the
+	 * conflict markers on disk — where the next auto-commit happily commits them.
+	 *
+	 * `reset --hard` would clear the conflict, but it also discards every other
+	 * uncommitted change in the worktree, which in a chapter someone is working in is
+	 * the loss this whole path exists to prevent. `--merge` resets only the paths that
+	 * differ between the index and the target commit, so the conflicted files are
+	 * restored while an unrelated edit elsewhere survives.
+	 *
+	 * `target` is normally the pre-merge HEAD. Omitting it resets to HEAD, which is
+	 * what a `--no-commit` merge wants since HEAD never moved.
+	 */
+	async resetMerge(worktreePath: string, target?: string): Promise<void> {
+		return withWorktreeLock(worktreePath, () => this.resetMergeUnlocked(worktreePath, target));
+	},
+
+	/** {@link resetMerge} for callers already holding the worktree lock. */
+	async resetMergeUnlocked(worktreePath: string, target?: string): Promise<void> {
+		const result = await exec(["reset", "--merge", ...(target ? [target] : [])], worktreePath);
+		if (result.exitCode !== 0) {
+			throw new GitError(gitFailureMessage("git reset --merge failed", result));
+		}
+	},
+
+	/**
+	 * Delete untracked files and directories, leaving ignored ones and `.worktrees/` alone.
+	 *
+	 * Deliberately `-fd` without `-x`: ignored paths are build outputs, virtualenvs and
+	 * dependency trees, which are excluded from snapshots by design. Removing them would
+	 * be an unrecoverable loss dressed up as tidying, and nothing that needs a clean
+	 * worktree cares about them — git's own checkout only ever collides with untracked,
+	 * non-ignored paths.
+	 *
+	 * `-e /.worktrees/` is the same argument applied to the directory holding every other
+	 * chapter's worktree, and it has to be stated here because the equivalent exclude the
+	 * snapshot engine relies on lives in the *shadow* repository's `info/exclude`, which
+	 * the user's `git clean` cannot see. A registered linked worktree is protected by git
+	 * itself, but anything else under `.worktrees/` is not: measured on a root chapter
+	 * (where `worktreePath` *is* `gitPath`) with no `.gitignore`, `clean -fd` removed
+	 * `.worktrees/loose.txt` and the residue of an unregistered or broken worktree — and
+	 * those are precisely the paths the shadow exclude keeps out of snapshots, so there is
+	 * nothing to restore them from. A `.gitignore` entry covers this when it exists, and
+	 * the write that adds it is best-effort (see project-db-sync), which is the window.
+	 *
+	 * Correct for every caller, not just the parking path: `.worktrees/` is NarraFork's
+	 * own reserved directory, so no caller has a reason to want it deleted, and git will
+	 * not check out over it either — it is not part of any tracked tree.
+	 */
+	async cleanUntracked(worktreePath: string): Promise<void> {
+		return withWorktreeLock(worktreePath, () => this.cleanUntrackedUnlocked(worktreePath));
+	},
+
+	/** {@link cleanUntracked} for callers already holding the worktree lock. */
+	async cleanUntrackedUnlocked(worktreePath: string): Promise<void> {
+		// Anchored with a leading slash and directory-only, matching the shadow repo's
+		// rule: a legitimately-tracked `docs/.worktrees` elsewhere stays cleanable, and
+		// a plain file named `.worktrees` is not silently preserved.
+		const result = await exec(["clean", "-fd", "-e", `/${WORKTREES_DIR_NAME}/`], worktreePath);
+		if (result.exitCode !== 0) throw new GitError(`git clean failed: ${result.stderr}`);
 	},
 
 	// === Revert ===
@@ -1373,34 +1854,42 @@ export const gitService = {
 
 	/** Revert a merge commit (using -m 1 to specify the mainline parent) */
 	async revertMergeCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
-			if (result.exitCode !== 0) {
-				// Abort the failed revert to leave worktree clean
-				await exec(["revert", "--abort"], worktreePath);
-				throw new GitError(
-					`git revert produced conflicts — the merge cannot be automatically undone. ` +
-						`Resolve manually with: git revert -m 1 ${commitSha}`,
-				);
-			}
-			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
-			return head.stdout.trim();
-		});
+		return withWorktreeLock(worktreePath, () =>
+			this.revertMergeCommitUnlocked(worktreePath, commitSha),
+		);
+	},
+
+	/** {@link revertMergeCommit} for callers already holding the worktree lock. */
+	async revertMergeCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
+		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
+		if (result.exitCode !== 0) {
+			// Abort the failed revert to leave worktree clean
+			await exec(["revert", "--abort"], worktreePath);
+			throw new GitError(
+				`git revert produced conflicts — the merge cannot be automatically undone. ` +
+					`Resolve manually with: git revert -m 1 ${commitSha}`,
+			);
+		}
+		const head = await execRead(["rev-parse", "HEAD"], worktreePath);
+		return head.stdout.trim();
 	},
 
 	/** Revert a regular (non-merge) commit */
 	async revertCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, async () => {
-			const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
-			if (result.exitCode !== 0) {
-				await exec(["revert", "--abort"], worktreePath);
-				throw new GitError(
-					`git revert produced conflicts — the merge cannot be automatically undone. ` +
-						`Resolve manually with: git revert ${commitSha}`,
-				);
-			}
-			const head = await execRead(["rev-parse", "HEAD"], worktreePath);
-			return head.stdout.trim();
-		});
+		return withWorktreeLock(worktreePath, () => this.revertCommitUnlocked(worktreePath, commitSha));
+	},
+
+	/** {@link revertCommit} for callers already holding the worktree lock. */
+	async revertCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
+		const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
+		if (result.exitCode !== 0) {
+			await exec(["revert", "--abort"], worktreePath);
+			throw new GitError(
+				`git revert produced conflicts — the merge cannot be automatically undone. ` +
+					`Resolve manually with: git revert ${commitSha}`,
+			);
+		}
+		const head = await execRead(["rev-parse", "HEAD"], worktreePath);
+		return head.stdout.trim();
 	},
 };

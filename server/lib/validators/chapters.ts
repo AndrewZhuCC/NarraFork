@@ -1,3 +1,4 @@
+import { FORK_WORKTREE_SOURCES } from "@shared/chapter-fork";
 import { z } from "zod";
 import { gitBranchName, localeSchema } from "./common";
 
@@ -25,7 +26,8 @@ export const containerConfigSchema = z.object({
 export const updateChapterSchema = z.object({
 	title: z.string().min(1).max(200).optional(),
 	description: z.string().max(2000).optional(),
-	status: z.enum(["active", "dormant", "merged", "abandoned", "frozen"]).optional(),
+	// `frozen` is deliberately absent; see the note on `chapters.status` in schema.ts.
+	status: z.enum(["active", "dormant", "merged", "abandoned"]).optional(),
 	role: z.enum(["trunk", "branch", "exploration", "review"]).optional(),
 	color: z.string().max(20).nullable().optional(),
 	groupLabel: z.string().max(100).nullable().optional(),
@@ -34,23 +36,48 @@ export const updateChapterSchema = z.object({
 
 // === Fork / Merge / Cleanup ===
 
-export const forkChapterSchema = z.object({
-	title: z.string().min(1).max(200).optional(),
-	description: z.string().max(2000).optional(),
-	inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
-	/** Fork point by SDK message uuid (assistant messages only). */
-	forkAtMessageUuid: z.string().min(1).optional(),
-	/** Fork point by local narrator message id (any role) — preferred for UI forks. */
-	forkAtMessageId: z.string().min(1).optional(),
-	/** Explicit commit SHA to fork from (ruler mode). Overrides the fork point. */
-	startCommitSha: z.string().min(1).optional(),
-	/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
-	parentChapterId: z.string().min(1).optional(),
-	role: z.enum(["branch", "exploration"]).default("branch"),
-	anchorCommitSha: z.string().min(1).optional(),
-	axisOffset: z.number().optional(),
-	crossOffset: z.number().min(0).optional(),
-});
+export const forkChapterSchema = z
+	.object({
+		title: z.string().min(1).max(200).optional(),
+		description: z.string().max(2000).optional(),
+		inheritMode: z.enum(["full", "compressed", "fresh"]).optional(),
+		worktreeSource: z.enum(FORK_WORKTREE_SOURCES).optional(),
+		/** Fork point by SDK message uuid (assistant messages only). */
+		forkAtMessageUuid: z.string().min(1).optional(),
+		/** Fork point by local narrator message id (any role) — preferred for UI forks. */
+		forkAtMessageId: z.string().min(1).optional(),
+		/** Explicit commit SHA to fork from. Only valid with commit worktree source. */
+		startCommitSha: z.string().min(1).optional(),
+		/** Explicit parent chapter ID (ruler mode). Defaults to root chapter. */
+		parentChapterId: z.string().min(1).optional(),
+		role: z.enum(["branch", "exploration"]).default("branch"),
+		anchorCommitSha: z.string().min(1).optional(),
+		axisOffset: z.number().optional(),
+		crossOffset: z.number().min(0).optional(),
+	})
+	.superRefine((data, ctx) => {
+		if (data.forkAtMessageId && data.forkAtMessageUuid) {
+			ctx.addIssue({
+				code: "custom",
+				message: "forkAtMessageId and forkAtMessageUuid are mutually exclusive",
+				path: ["forkAtMessageId"],
+			});
+		}
+		if (data.startCommitSha && (data.forkAtMessageId || data.forkAtMessageUuid)) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Message fork coordinates and startCommitSha are mutually exclusive",
+				path: ["startCommitSha"],
+			});
+		}
+		if (data.startCommitSha && data.worktreeSource === "workspace") {
+			ctx.addIssue({
+				code: "custom",
+				message: "startCommitSha requires worktreeSource=commit",
+				path: ["worktreeSource"],
+			});
+		}
+	});
 
 export const mergeChapterSchema = z.object({
 	targetChapterId: z.string().min(1),
@@ -99,18 +126,12 @@ export const createReviewSchema = z.object({
 	crossOffset: z.number().min(0).optional(),
 });
 
-// === chapter edges ===
-
-export const createChapterEdgeSchema = z.object({
-	sourceId: z.string().min(1),
-	targetId: z.string().min(1),
-	type: z.enum(["dependency"]),
-	metadata: z
-		.object({
-			description: z.string().max(500).optional(),
-		})
-		.optional(),
-});
+// === chapter edges: no user-authored edges ===
+//
+// `createChapterEdgeSchema` used to live here, accepting only `type: "dependency"`. Chapter
+// edges are now all derived from the operation that creates them (fork/split, merge,
+// review), so there is no create route left to validate. See `chapter-edge-service.ts` for
+// why the dependency edge went away.
 
 // === graph positions ===
 
@@ -141,25 +162,29 @@ export const splitChapterSchema = z.object({
 	}),
 });
 
-// === batch fork ===
+// === batch fork: not implemented ===
+//
+// `batchForkSchema` used to live here. There was never a `POST /chapters/:id/batch-fork`
+// route to parse with it, nor a `chapterFork` method behind one, and the frontend client
+// that named the endpoint has been removed too. A validator for a request nothing accepts
+// is indistinguishable from one for a request that works, which is how the whole feature
+// came to look implemented in DESIGN.md.
+//
+// Reviving it means a service method plus a route; write the schema then. Note the
+// per-fork `crossOffset` question in `chapter-fork.ts` — a batch is the one caller that
+// can assign slots up front and sidestep the unguarded slot search.
 
-export const batchForkSchema = z.object({
-	forks: z
-		.array(
-			z.object({
-				title: z.string().min(1).max(200),
-				description: z.string().max(2000).optional(),
-				inheritMode: z.enum(["full", "compressed", "fresh"]).default("full"),
-				role: z.enum(["branch", "exploration"]).default("branch"),
-			}),
-		)
-		.min(1)
-		.max(10),
-});
-
-// === cherry-pick ===
-
-export const cherryPickSchema = z.object({
-	sourceChapterId: z.string().min(1),
-	commitShas: z.array(z.string().min(1)).min(1),
-});
+// === chapter-level cherry-pick: not implemented ===
+//
+// `cherryPickSchema` used to live here, in the same shape as the batch-fork stub above:
+// no `POST /chapters/:id/cherry-pick` route parsed it and the frontend client naming that
+// endpoint has been removed.
+//
+// Do not confuse this with cherry-pick as a *merge strategy*, which does work: see
+// `gitService.cherryPick`, reached via `chapter-merge` with `strategy: "cherry-pick"`,
+// which records commits as `source: "cherry_pick"`. What is missing is the standalone
+// feature of picking commits off another chapter and drawing a `cherry_pick` edge for it.
+// Nothing creates edges of that type today, so `CherryPickEdge` never renders.
+//
+// Reviving it means a service method, a route, and a `chapterEdgeService.createCherryPickEdge`;
+// write the schema then.

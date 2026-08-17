@@ -4,8 +4,10 @@ import {
 	Alert,
 	Badge,
 	Button,
+	Checkbox,
 	Divider,
 	Group,
+	Pagination,
 	Paper,
 	Progress,
 	SegmentedControl,
@@ -19,20 +21,29 @@ import {
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { IconRefresh, IconTrash } from "@tabler/icons-react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import React, { useCallback, useState } from "react";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	useProviderModelRefreshCapability,
 	useProviderRouteCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
-import { api, type KiroCredentialPatch } from "../../lib/api";
+import {
+	api,
+	type KiroCredentialEntry,
+	type KiroCredentialPatch,
+	type KiroStatusSnapshot,
+} from "../../lib/api";
 import { type ModelOption, modelValue } from "../../lib/constants";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
+import {
+	getCredentialPageSelectionState,
+	toggleCredentialPageSelection,
+} from "./credential-page-selection";
 import type { CustomModelEntry } from "./InlineCustomModels";
 import { InlineCustomModels } from "./InlineCustomModels";
 import {
@@ -65,6 +76,7 @@ function containsKiroApiKey(text: string): boolean {
 }
 
 const KIRO_STATUS_GC_TIME_MS = 60_000;
+const KIRO_CREDENTIAL_PAGE_SIZE = 20;
 
 /** Format a number to exactly 2 decimal places. */
 function fmtNum(n: number): string {
@@ -109,6 +121,14 @@ export const KiroSection = React.memo(function KiroSection({
 	const kiroCredentialUsageRoute = useProviderRouteCapability("kiro", "credentialUsage");
 	const kiroCredentialUpdateRoute = useProviderRouteCapability("kiro", "credentialUpdate");
 	const kiroCredentialDeleteRoute = useProviderRouteCapability("kiro", "credentialDelete");
+	const kiroCredentialBatchDeleteRoute = useProviderRouteCapability(
+		"kiro",
+		"credentialBatchDelete",
+	);
+	const kiroCredentialDeleteUnhealthyRoute = useProviderRouteCapability(
+		"kiro",
+		"credentialDeleteUnhealthy",
+	);
 	const kiroModelsRefreshRoute = useProviderRouteCapability("kiro", "modelsRefresh");
 	const providerRouteUnsupportedReason = t("providerRouteUnsupported");
 	const kiroPluginBridge = kiroRuntimeCapability?.pluginBridge;
@@ -128,6 +148,8 @@ export const KiroSection = React.memo(function KiroSection({
 	const canQueryKiroCredentialUsage = kiroCredentialUsageRoute.supported;
 	const canUpdateKiroCredential = kiroCredentialUpdateRoute.supported;
 	const canDeleteKiroCredential = kiroCredentialDeleteRoute.supported;
+	const canBatchDeleteKiroCredentials = kiroCredentialBatchDeleteRoute.supported;
+	const canDeleteUnhealthyKiroCredentials = kiroCredentialDeleteUnhealthyRoute.supported;
 	const canRefreshKiroModels = kiroRefreshCapability.supported && kiroModelsRefreshRoute.supported;
 	const kiroRefreshUnsupportedReason = kiroRefreshCapability.supported
 		? (kiroModelsRefreshRoute.reason ?? providerRouteUnsupportedReason)
@@ -138,20 +160,34 @@ export const KiroSection = React.memo(function KiroSection({
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
+	const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+	const [paidPage, setPaidPage] = useState(1);
+	const [enterprisePage, setEnterprisePage] = useState(1);
+	const [freePage, setFreePage] = useState(1);
 
 	const { data: kiroStatus } = useQuery({
-		queryKey: ["kiro", "status"],
-		queryFn: api.kiroStatus,
+		queryKey: [
+			"kiro",
+			"status",
+			{ paidPage, enterprisePage, freePage, pageSize: KIRO_CREDENTIAL_PAGE_SIZE },
+		],
+		queryFn: () =>
+			api.kiroStatus({
+				paidPage,
+				enterprisePage,
+				freePage,
+				pageSize: KIRO_CREDENTIAL_PAGE_SIZE,
+			}),
 		enabled: canReadKiroStatus,
+		placeholderData: keepPreviousData,
 		refetchInterval: 30_000,
 		gcTime: KIRO_STATUS_GC_TIME_MS,
 	});
 
 	const snapshot = kiroStatus?.snapshot;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const usageCache: Record<string, any> = (kiroStatus as any)?.usageCache ?? {};
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const entries: any[] = snapshot?.entries ?? [];
+	// biome-ignore lint/suspicious/noExplicitAny: usage payload varies by Kiro runtime
+	const usageCache: Record<string, any> = kiroStatus?.usageCache ?? {};
+	const entries: KiroCredentialEntry[] = snapshot?.entries ?? [];
 
 	// --- Credential mutations ---
 	const disableMut = useMutation({
@@ -176,7 +212,39 @@ export const KiroSection = React.memo(function KiroSection({
 	});
 	const deleteMut = useMutation({
 		mutationFn: (id: string) => api.kiroDeleteCredential(id),
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["kiro", "status"] }),
+		onSuccess: (_data, id) => {
+			setSelectedIds((prev) => {
+				const next = new Set(prev);
+				next.delete(id);
+				return next;
+			});
+			qc.invalidateQueries({ queryKey: ["kiro", "status"] });
+		},
+		onError: (err: Error) => notifications.show({ message: err.message, color: "red" }),
+	});
+	const batchDeleteMut = useMutation({
+		mutationFn: (ids: string[]) => api.kiroDeleteCredentials(ids),
+		onSuccess: (data) => {
+			setSelectedIds(new Set());
+			qc.invalidateQueries({ queryKey: ["kiro", "status"] });
+			notifications.show({
+				message: t("credentialBatchDeleteSuccess", { count: data.removed.length }),
+				color: "green",
+			});
+		},
+		onError: (err: Error) => notifications.show({ message: err.message, color: "red" }),
+	});
+	const deleteUnhealthyMut = useMutation({
+		mutationFn: () => api.kiroDeleteUnhealthyCredentials(),
+		onSuccess: (data) => {
+			setSelectedIds(new Set());
+			qc.invalidateQueries({ queryKey: ["kiro", "status"] });
+			notifications.show({
+				message: t("credentialDeleteUnhealthySuccess", { count: data.removed.length }),
+				color: "green",
+			});
+		},
+		onError: (err: Error) => notifications.show({ message: err.message, color: "red" }),
 	});
 	const [editingCredential, setEditingCredential] = useState<KiroCredentialSnapshotView | null>(
 		null,
@@ -320,21 +388,109 @@ export const KiroSection = React.memo(function KiroSection({
 		: [];
 
 	// --- Group credentials by account tier ---
-	const tierGroups: Record<KiroAccountTier, typeof entries> = {
-		free: [],
-		paid: [],
-		enterprise: [],
+	// Older backends ignore pagination params and return every entry. Keep a local
+	// fallback so the updated frontend can still paginate those responses.
+	const legacyTierGroups = useMemo(() => {
+		const groups: Record<KiroAccountTier, KiroCredentialEntry[]> = {
+			free: [],
+			paid: [],
+			enterprise: [],
+		};
+		for (const entry of entries) {
+			const usage = usageCache[String(entry.id)];
+			const tier =
+				entry.tier ??
+				classifyKiroTier({
+					authMethod: entry.authMethod,
+					hasProfileArn: entry.hasProfileArn,
+					hasStartUrl: entry.hasStartUrl,
+					subscriptionTitle: usage?.subscriptionTitle ?? entry.subscriptionTitle,
+				});
+			groups[tier].push(entry);
+		}
+		return groups;
+	}, [entries, usageCache]);
+
+	const pageSlice = useCallback((items: KiroCredentialEntry[], page: number) => {
+		const start = (page - 1) * KIRO_CREDENTIAL_PAGE_SIZE;
+		return items.slice(start, start + KIRO_CREDENTIAL_PAGE_SIZE);
+	}, []);
+	const tierGroups: Record<KiroAccountTier, KiroCredentialEntry[]> = {
+		paid: snapshot?.paidEntries ?? pageSlice(legacyTierGroups.paid, paidPage),
+		enterprise:
+			snapshot?.enterpriseEntries ?? pageSlice(legacyTierGroups.enterprise, enterprisePage),
+		free: snapshot?.freeEntries ?? pageSlice(legacyTierGroups.free, freePage),
 	};
-	for (const entry of entries) {
-		const usage = usageCache[String(entry.id)];
-		const tier = classifyKiroTier({
-			authMethod: entry.authMethod,
-			hasProfileArn: entry.hasProfileArn,
-			hasStartUrl: entry.hasStartUrl,
-			subscriptionTitle: usage?.subscriptionTitle ?? entry.subscriptionTitle,
+	const tierTotals: Record<KiroAccountTier, number> = {
+		paid: snapshot?.paidTotal ?? legacyTierGroups.paid.length,
+		enterprise: snapshot?.enterpriseTotal ?? legacyTierGroups.enterprise.length,
+		free: snapshot?.freeTotal ?? legacyTierGroups.free.length,
+	};
+	const unhealthyTotal =
+		snapshot?.unhealthyTotal ??
+		entries.filter(
+			(entry) =>
+				entry.disabledReason === "too_many_failures" ||
+				entry.disabledReason === "account_suspended",
+		).length;
+
+	useEffect(() => {
+		if (!kiroStatus?.snapshot) return;
+		const maxPaidPage = Math.max(1, Math.ceil(tierTotals.paid / KIRO_CREDENTIAL_PAGE_SIZE));
+		const maxEnterprisePage = Math.max(
+			1,
+			Math.ceil(tierTotals.enterprise / KIRO_CREDENTIAL_PAGE_SIZE),
+		);
+		const maxFreePage = Math.max(1, Math.ceil(tierTotals.free / KIRO_CREDENTIAL_PAGE_SIZE));
+		if (paidPage > maxPaidPage) setPaidPage(maxPaidPage);
+		if (enterprisePage > maxEnterprisePage) setEnterprisePage(maxEnterprisePage);
+		if (freePage > maxFreePage) setFreePage(maxFreePage);
+	}, [
+		kiroStatus?.snapshot,
+		tierTotals.paid,
+		tierTotals.enterprise,
+		tierTotals.free,
+		paidPage,
+		enterprisePage,
+		freePage,
+	]);
+
+	const pageState: Record<KiroAccountTier, { page: number; setPage: (page: number) => void }> = {
+		paid: { page: paidPage, setPage: setPaidPage },
+		enterprise: { page: enterprisePage, setPage: setEnterprisePage },
+		free: { page: freePage, setPage: setFreePage },
+	};
+
+	const toggleSelect = useCallback((id: string) => {
+		setSelectedIds((prev) => {
+			const next = new Set(prev);
+			if (next.has(id)) next.delete(id);
+			else next.add(id);
+			return next;
 		});
-		tierGroups[tier].push(entry);
-	}
+	}, []);
+
+	const toggleSelectPage = useCallback((entryIds: string[]) => {
+		setSelectedIds((prev) => toggleCredentialPageSelection(prev, entryIds));
+	}, []);
+
+	const handleBatchDelete = useCallback(async () => {
+		if (!canBatchDeleteKiroCredentials || selectedIds.size === 0) return;
+		if (
+			await confirm({ message: t("credentialBatchDeleteConfirm", { count: selectedIds.size }) })
+		) {
+			batchDeleteMut.mutate([...selectedIds]);
+		}
+	}, [canBatchDeleteKiroCredentials, selectedIds, confirm, t, batchDeleteMut]);
+
+	const handleDeleteUnhealthy = useCallback(async () => {
+		if (!canDeleteUnhealthyKiroCredentials || unhealthyTotal === 0) return;
+		if (
+			await confirm({ message: t("credentialDeleteUnhealthyConfirm", { count: unhealthyTotal }) })
+		) {
+			deleteUnhealthyMut.mutate();
+		}
+	}, [canDeleteUnhealthyKiroCredentials, unhealthyTotal, confirm, t, deleteUnhealthyMut]);
 
 	return (
 		<Stack gap="md">
@@ -385,13 +541,13 @@ export const KiroSection = React.memo(function KiroSection({
 
 			{/* === Credentials Sub-section === */}
 			<Divider />
-			<Group gap="xs">
+			<Group gap="xs" align="center" wrap="nowrap">
 				<Text fw={500} size="sm">
 					{t("kiroCredentialsSection")}
 				</Text>
-				{entries.length > 0 && (
+				{(snapshot?.total ?? 0) > 0 && (
 					<Badge size="xs" variant="light">
-						{entries.length}
+						{snapshot?.total ?? 0}
 					</Badge>
 				)}
 			</Group>
@@ -431,17 +587,54 @@ export const KiroSection = React.memo(function KiroSection({
 				{t("kiroImportBtn")}
 			</Button>
 
-			{entries.length === 0 && (
+			{(snapshot?.total ?? 0) === 0 && (
 				<Text c="dimmed" size="sm">
 					{t("kiroNoCredentials")}
 				</Text>
 			)}
 
+			{/* Batch actions: kept adjacent to the tables they act on, so a selection made in a
+			    tier list never scrolls its own delete button out of view. `flex-end` anchors the
+			    rightmost button, which keeps "delete unhealthy" in place when the selection-only
+			    button appears next to it instead of shifting it sideways. */}
+			{(snapshot?.total ?? 0) > 0 && (
+				<Group gap="xs" justify="flex-end" align="center" wrap="wrap">
+					{selectedIds.size > 0 && (
+						<Button
+							size="compact-xs"
+							color="red"
+							variant="light"
+							leftSection={<IconTrash size={14} />}
+							onClick={handleBatchDelete}
+							loading={batchDeleteMut.isPending}
+							disabled={!canBatchDeleteKiroCredentials}
+							title={!canBatchDeleteKiroCredentials ? providerRouteUnsupportedReason : undefined}
+						>
+							{t("credentialBatchDelete")} ({selectedIds.size})
+						</Button>
+					)}
+					<Button
+						size="compact-xs"
+						color="red"
+						variant="outline"
+						leftSection={<IconTrash size={14} />}
+						onClick={handleDeleteUnhealthy}
+						loading={deleteUnhealthyMut.isPending}
+						disabled={!canDeleteUnhealthyKiroCredentials || unhealthyTotal === 0}
+						title={!canDeleteUnhealthyKiroCredentials ? providerRouteUnsupportedReason : undefined}
+					>
+						{t("credentialDeleteUnhealthy")} ({unhealthyTotal})
+					</Button>
+				</Group>
+			)}
+
 			{/* Credentials grouped by tier */}
 			{(["paid", "enterprise", "free"] as const).map((tier) => {
 				const group = tierGroups[tier];
-				if (group.length === 0) return null;
+				const total = tierTotals[tier];
+				if (total === 0) return null;
 				const cfg = TIER_CONFIG[tier];
+				const { page, setPage } = pageState[tier];
 				return (
 					<Stack key={tier} gap="xs">
 						<Group gap="xs">
@@ -449,11 +642,15 @@ export const KiroSection = React.memo(function KiroSection({
 								{t(cfg.i18nKey)}
 							</Badge>
 							<Text size="xs" c="dimmed">
-								{t(cfg.descKey)} · {group.length}
+								{t(cfg.descKey)} · {total}
 							</Text>
 						</Group>
 						<CredentialList
 							entries={group}
+							totalEntries={total}
+							page={page}
+							pageSize={KIRO_CREDENTIAL_PAGE_SIZE}
+							onPageChange={setPage}
 							snapshot={snapshot}
 							usageCache={usageCache}
 							disableMut={disableMut}
@@ -462,6 +659,9 @@ export const KiroSection = React.memo(function KiroSection({
 							refreshMut={refreshMut}
 							usageMut={usageMut}
 							deleteMut={deleteMut}
+							selectedIds={selectedIds}
+							onToggleSelect={toggleSelect}
+							onToggleSelectPage={toggleSelectPage}
 							onEditCredential={handleEditCredential}
 							canDisableKiroCredential={canDisableKiroCredential}
 							canEnableKiroCredential={canEnableKiroCredential}
@@ -539,11 +739,13 @@ export const KiroSection = React.memo(function KiroSection({
 // --- Credential list (responsive: cards on mobile, table on desktop) ---
 
 interface CredentialListProps {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	entries: any[];
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	snapshot: any;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	entries: KiroCredentialEntry[];
+	totalEntries: number;
+	page: number;
+	pageSize: number;
+	onPageChange: (page: number) => void;
+	snapshot: KiroStatusSnapshot | null | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: usage payload varies by Kiro runtime
 	usageCache: Record<string, any>;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types
 	disableMut: any;
@@ -557,6 +759,9 @@ interface CredentialListProps {
 	usageMut: any;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation types
 	deleteMut: any;
+	selectedIds: Set<string>;
+	onToggleSelect: (id: string) => void;
+	onToggleSelectPage: (entryIds: string[]) => void;
 	onEditCredential: (entry: KiroCredentialSnapshotView) => void;
 	canDisableKiroCredential: boolean;
 	canEnableKiroCredential: boolean;
@@ -570,7 +775,45 @@ interface CredentialListProps {
 
 function CredentialList(props: CredentialListProps) {
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY);
-	return isMobile ? <CredentialCards {...props} /> : <CredentialTable {...props} />;
+	const { t } = useTranslation("settings");
+	const totalPages = Math.max(1, Math.ceil(props.totalEntries / props.pageSize));
+	const entryIds = props.entries.map((entry) => entry.id);
+	const { allSelected, someSelected } = getCredentialPageSelectionState(
+		props.selectedIds,
+		entryIds,
+	);
+
+	return (
+		<Stack gap="xs">
+			{isMobile && (
+				<Checkbox
+					size="xs"
+					checked={allSelected}
+					indeterminate={someSelected}
+					onChange={() => props.onToggleSelectPage(entryIds)}
+					label={`${t("credentialSelectAll")} (${entryIds.length})`}
+				/>
+			)}
+			{isMobile ? <CredentialCards {...props} /> : <CredentialTable {...props} />}
+			{totalPages > 1 && (
+				<Group justify="center">
+					<Pagination
+						size="sm"
+						total={totalPages}
+						value={props.page}
+						onChange={props.onPageChange}
+					/>
+					<Text size="xs" c="dimmed">
+						{t("credentialPageInfo", {
+							current: props.page,
+							total: totalPages,
+							count: props.totalEntries,
+						})}
+					</Text>
+				</Group>
+			)}
+		</Stack>
+	);
 }
 
 /**
@@ -754,16 +997,24 @@ function UsageDisplay({ entry, usage }: { entry: any; usage: any }) {
 
 // --- Mobile: card layout ---
 
-function CredentialCards({ entries, snapshot, usageCache, ...muts }: CredentialListProps) {
+function CredentialCards({
+	entries,
+	snapshot,
+	usageCache,
+	selectedIds,
+	onToggleSelect,
+	...muts
+}: CredentialListProps) {
 	return (
 		<Stack gap="xs">
-			{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-			{entries.map((entry: any) => (
+			{entries.map((entry) => (
 				<CredentialCard
 					key={entry.id}
 					entry={entry}
 					snapshot={snapshot}
 					usage={usageCache[String(entry.id)]}
+					selected={selectedIds.has(entry.id)}
+					onToggleSelect={onToggleSelect}
 					{...muts}
 				/>
 			))}
@@ -775,14 +1026,16 @@ function CredentialCard({
 	entry,
 	snapshot,
 	usage,
+	selected,
+	onToggleSelect,
 	...muts
 }: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	entry: any;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	snapshot: any;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	entry: KiroCredentialEntry;
+	snapshot: KiroStatusSnapshot | null | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: usage payload varies by Kiro runtime
 	usage: any;
+	selected: boolean;
+	onToggleSelect: (id: string) => void;
 } & Pick<
 	CredentialListProps,
 	| "disableMut"
@@ -817,6 +1070,7 @@ function CredentialCard({
 				{/* Row 1: ID + Display name + Status */}
 				<Group justify="space-between" wrap="wrap">
 					<Group gap="xs">
+						<Checkbox size="xs" checked={selected} onChange={() => onToggleSelect(entry.id)} />
 						<Text size="xs" c="dimmed" ff="monospace">
 							{entry.id}
 						</Text>
@@ -911,13 +1165,32 @@ function CredentialCard({
 
 // --- Desktop: table layout ---
 
-function CredentialTable({ entries, snapshot, usageCache, ...muts }: CredentialListProps) {
+function CredentialTable({
+	entries,
+	snapshot,
+	usageCache,
+	selectedIds,
+	onToggleSelect,
+	onToggleSelectPage,
+	...muts
+}: CredentialListProps) {
 	const { t } = useTranslation("settings");
+	const entryIds = entries.map((entry) => entry.id);
+	const { allSelected, someSelected } = getCredentialPageSelectionState(selectedIds, entryIds);
 
 	return (
 		<Table striped highlightOnHover>
 			<Table.Thead>
 				<Table.Tr>
+					<Table.Th w={40}>
+						<Checkbox
+							size="xs"
+							checked={allSelected}
+							indeterminate={someSelected}
+							onChange={() => onToggleSelectPage(entryIds)}
+							aria-label={t("credentialSelectAll")}
+						/>
+					</Table.Th>
 					<Table.Th>ID</Table.Th>
 					<Table.Th>{t("kiroEditDisplayName")}</Table.Th>
 					<Table.Th>Email</Table.Th>
@@ -932,13 +1205,14 @@ function CredentialTable({ entries, snapshot, usageCache, ...muts }: CredentialL
 				</Table.Tr>
 			</Table.Thead>
 			<Table.Tbody>
-				{/* biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure */}
-				{entries.map((entry: any) => (
+				{entries.map((entry) => (
 					<CredentialTableRow
 						key={entry.id}
 						entry={entry}
 						snapshot={snapshot}
 						usage={usageCache[String(entry.id)]}
+						selected={selectedIds.has(entry.id)}
+						onToggleSelect={onToggleSelect}
 						{...muts}
 					/>
 				))}
@@ -951,14 +1225,16 @@ function CredentialTableRow({
 	entry,
 	snapshot,
 	usage,
+	selected,
+	onToggleSelect,
 	...muts
 }: {
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	entry: any;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	snapshot: any;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	entry: KiroCredentialEntry;
+	snapshot: KiroStatusSnapshot | null | undefined;
+	// biome-ignore lint/suspicious/noExplicitAny: usage payload varies by Kiro runtime
 	usage: any;
+	selected: boolean;
+	onToggleSelect: (id: string) => void;
 } & Pick<
 	CredentialListProps,
 	| "disableMut"
@@ -981,6 +1257,9 @@ function CredentialTableRow({
 
 	return (
 		<Table.Tr>
+			<Table.Td>
+				<Checkbox size="xs" checked={selected} onChange={() => onToggleSelect(entry.id)} />
+			</Table.Td>
 			<Table.Td>
 				<Text size="xs" ff="monospace" fw={entry.id === snapshot?.currentId ? 700 : 400}>
 					{entry.id}

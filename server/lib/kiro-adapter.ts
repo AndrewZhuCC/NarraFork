@@ -31,6 +31,13 @@ export type DisabledReason =
 	| "suspicious_throttle";
 export type LoadBalancingMode = "priority" | "balanced";
 
+const UNHEALTHY_DISABLED_REASONS: readonly DisabledReason[] = [
+	"too_many_failures",
+	"account_suspended",
+];
+const UNHEALTHY_DISABLED_REASON_SET = new Set<DisabledReason>(UNHEALTHY_DISABLED_REASONS);
+const LEGACY_BATCH_DELETE_LIMIT = 100;
+
 export interface CredentialSnapshot {
 	id: string;
 	priority: number;
@@ -42,6 +49,7 @@ export interface CredentialSnapshot {
 	email?: string;
 	displayName?: string;
 	hasProfileArn: boolean;
+	hasStartUrl: boolean;
 	expiresAt?: string;
 	authMethod?: string;
 	/** True for static Kiro API key credentials (never refreshed, never expire). */
@@ -107,6 +115,14 @@ export interface KiroConcurrencySnapshot {
 
 export interface ManagerSnapshot {
 	entries: CredentialSnapshot[];
+	/** Tier pagination fields are optional for older external Kiro modules. */
+	paidEntries?: CredentialSnapshot[];
+	enterpriseEntries?: CredentialSnapshot[];
+	freeEntries?: CredentialSnapshot[];
+	paidTotal?: number;
+	enterpriseTotal?: number;
+	freeTotal?: number;
+	unhealthyTotal?: number;
 	currentId: string;
 	loadBalancingMode: LoadBalancingMode;
 	total: number;
@@ -114,6 +130,13 @@ export interface ManagerSnapshot {
 	concurrencyStates?: Record<string, KiroConcurrencySnapshot>;
 	rpmCounts?: Record<string, number>;
 	throttleCounts?: Record<string, { recent: number; total: number }>;
+}
+
+export interface KiroSnapshotOptions {
+	paidPage?: number;
+	enterprisePage?: number;
+	freePage?: number;
+	pageSize?: number;
 }
 
 export interface McpResponse {
@@ -220,12 +243,14 @@ export interface KiroModule {
 		signal?: AbortSignal,
 	): Promise<McpResponse>;
 	kiroMcpListTools(): Promise<McpResponse>;
-	kiroSnapshot(): ManagerSnapshot | null;
+	kiroSnapshot(options?: KiroSnapshotOptions): ManagerSnapshot | null;
 	kiroSetDisabled(id: string, disabled: boolean): void;
 	kiroSetLoadBalancingMode(mode: "priority" | "balanced"): void;
 	kiroSetPriority(id: string, priority: number): void;
 	kiroResetAndEnable(id: string): void;
 	kiroRemoveCredential(id: string): void;
+	kiroRemoveCredentials?(ids: string[]): { removed: string[]; notFound: string[] };
+	kiroRemoveUnhealthyCredentials?(): { removed: string[]; reasons: DisabledReason[] };
 	kiroManualRefresh(id: string): Promise<void>;
 	kiroUpdateCredential(id: string, fields: KiroCredentialPatch): void;
 	kiroImportCredentials(creds: ImportCredentialInput[]): { added: number; duplicates: number };
@@ -358,8 +383,8 @@ export async function kiroMcpListTools(): Promise<McpResponse> {
 	return mod.kiroMcpListTools();
 }
 
-export function kiroSnapshot(): ManagerSnapshot | null {
-	return mod?.kiroSnapshot() ?? null;
+export function kiroSnapshot(options?: KiroSnapshotOptions): ManagerSnapshot | null {
+	return mod?.kiroSnapshot(options) ?? null;
 }
 
 export function kiroSetDisabled(id: string, disabled: boolean): void {
@@ -385,6 +410,52 @@ export function kiroResetAndEnable(id: string): void {
 export function kiroRemoveCredential(id: string): void {
 	if (!mod) throw new Error("Kiro plugin is not installed");
 	mod.kiroRemoveCredential(id);
+}
+
+export function kiroRemoveCredentials(ids: string[]): {
+	removed: string[];
+	notFound: string[];
+} {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	if (mod.kiroRemoveCredentials) return mod.kiroRemoveCredentials(ids);
+
+	const uniqueIds = [...new Set(ids)];
+	if (uniqueIds.length > LEGACY_BATCH_DELETE_LIMIT) {
+		throw new Error(
+			`Legacy Kiro module supports at most ${LEGACY_BATCH_DELETE_LIMIT} credential deletions per request`,
+		);
+	}
+	const removed: string[] = [];
+	const notFound: string[] = [];
+	for (const id of uniqueIds) {
+		try {
+			mod.kiroRemoveCredential(id);
+			removed.push(id);
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			if (!message.startsWith("Credential not found")) throw err;
+			notFound.push(id);
+		}
+	}
+	return { removed, notFound };
+}
+
+export function kiroRemoveUnhealthyCredentials(): {
+	removed: string[];
+	reasons: DisabledReason[];
+} {
+	if (!mod) throw new Error("Kiro plugin is not installed");
+	if (mod.kiroRemoveUnhealthyCredentials) return mod.kiroRemoveUnhealthyCredentials();
+
+	const ids = (mod.kiroSnapshot()?.entries ?? [])
+		.filter(
+			(entry) =>
+				entry.disabled &&
+				!!entry.disabledReason &&
+				UNHEALTHY_DISABLED_REASON_SET.has(entry.disabledReason),
+		)
+		.map((entry) => entry.id);
+	return { removed: kiroRemoveCredentials(ids).removed, reasons: [...UNHEALTHY_DISABLED_REASONS] };
 }
 
 export async function kiroManualRefresh(id: string): Promise<void> {

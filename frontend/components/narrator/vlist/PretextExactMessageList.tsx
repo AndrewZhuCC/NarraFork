@@ -11,6 +11,7 @@
  * completed. The existing PretextMessageList remains the default Virtual route.
  */
 
+import { useCurrentUser } from "@frontend/hooks/useAuth";
 import { useLocalPref } from "@frontend/hooks/useLocalPref";
 import { useInterruptNarrator, useResumeRecoverySubagents } from "@frontend/hooks/useNarrator";
 import { useNarratorWS } from "@frontend/hooks/useNarratorWS";
@@ -48,6 +49,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	useSyncExternalStore,
 } from "react";
 import { useTranslation } from "react-i18next";
 import type { ChunkedMessageListHandle, ChunkTailMeta } from "../ChunkedMessageList";
@@ -64,6 +66,7 @@ import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
 import { useRenderLod } from "../RenderLodCtx";
 import { recentRunSegmentMessageIds } from "../run-segments";
+import { getGlobalSwipeAnchor, subscribeGlobalSwipeAnchor } from "../swipeState";
 import { TraceRowInteraction } from "../TraceRowInteraction";
 import {
 	getCategory,
@@ -108,6 +111,15 @@ import {
 } from "./vlist-content-view-target";
 import { installVListCopyHandler } from "./vlist-copy-text";
 import {
+	buildDrillSnapshots,
+	type DrillRowSnapshot,
+	diffDrillSnapshots,
+} from "./vlist-drill-morph";
+import {
+	createDrillMorphController,
+	prefersReducedMotion as prefersReducedMotionDrill,
+} from "./vlist-drill-morph-motion";
+import {
 	hasEditableTextBlock,
 	resolveVListEditedMeta,
 	resolveVListEditorWidth,
@@ -127,10 +139,12 @@ import {
 	pruneHeightOverrides,
 } from "./vlist-height-overrides";
 import { createHighlightController } from "./vlist-highlight";
+import { injectInjectionBubbleChrome } from "./vlist-injection-header";
 import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
 	isPromptOpenRow,
+	isTraceRowExpanded,
 	markVListFullPayloadRequested,
 	resetVListInteractionStateForLod,
 	setVListExpanded,
@@ -139,6 +153,8 @@ import {
 	toggleVListRow,
 	toggleVListShowEarlier,
 	toggleVListShowOriginal,
+	toggleVListTraceRow,
+	traceRowFoldChannel,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
 import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
@@ -153,6 +169,11 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
+import { buildLodSnapshots, diffLodSnapshots, type LodElementSnapshot } from "./vlist-lod-morph";
+import {
+	createLodMorphController,
+	prefersReducedMotion as prefersReducedMotionLod,
+} from "./vlist-lod-morph-motion";
 import { usePermissionSlots } from "./vlist-permission-bridge";
 import type { VListItem } from "./vlist-pipeline";
 import { createPointerDragTracker } from "./vlist-pointer-drag";
@@ -188,16 +209,21 @@ import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
+import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
 import { hostsUnpredictableBlock } from "./vlist-unpredictable-blocks";
-import { injectUserBubbleAttachmentOpen, injectUserBubbleHeader } from "./vlist-user-bubble-header";
+import {
+	injectUserBubbleAttachmentOpen,
+	injectUserBubbleHeader,
+	injectUserBubbleIsSelf,
+} from "./vlist-user-bubble-header";
 import {
 	collectVListUserMarkers,
 	resolveVListUserMarkerScrollTop,
 	type VListUserMarker,
 } from "./vlist-user-markers";
-import { resolvePinnedRowIndices } from "./vlist-virtualization";
+import { mergePinnedRowIndices, resolvePinnedRowIndices } from "./vlist-virtualization";
 import {
 	bucketViewportHeight,
 	isExternalGeometryChange,
@@ -672,16 +698,9 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	// Slash-command bubbles fold their expanded prompt behind a toggle. Plain user
 	// bubbles carry no `commandText`, so the render layer ignores the callback.
 	"message-bubble",
-	// A sidecar card folds/expands on its own header row (per-record fold).
-	"sidecar",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
-const TRACE_KINDS = new Set([
-	"activity-trace",
-	"tool-run-summary",
-	"reasoning-steps",
-	"sidecar-trace",
-]);
+const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
 /**
  * Folded traces whose individual ROWS get their own interaction surface.
  *
@@ -749,6 +768,43 @@ function resolveTraceRowIdentity(
 }
 
 /**
+ * Every selection blockId one rendered row can answer for.
+ *
+ * Used only to locate the touch swipe ANCHOR's row so it can be pinned into the
+ * mounted window. A row is more than its own element id: a folded trace paints one
+ * independently-swipeable row per tool call / reasoning step, and any of those rows
+ * may be the anchor while the unit that must stay mounted is the trace ELEMENT.
+ *
+ * Tool rows are reported under BOTH aliases because the primary id the anchor
+ * carries (`tc-` vs `sa-`) is decided by child messages the trace row never sees —
+ * the same reason `resolveTraceRowIdentity` has to consult the selection index.
+ * Guessing wrong here would just fail to pin, so both are emitted.
+ *
+ * Returns null for rows with no interaction surface at all (chrome, aggregates
+ * without rows), so the anchor scan skips them without allocating.
+ */
+function rowSelectionBlockIds(
+	item: VListItem,
+	elementBlockId: string | undefined,
+): readonly string[] | null {
+	const rows = TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind)
+		? (item.measured as MeasuredCollapsibleTrace).rows
+		: undefined;
+	if (!rows || rows.length === 0) return elementBlockId ? [elementBlockId] : null;
+	const ids: string[] = elementBlockId ? [elementBlockId] : [];
+	for (const row of rows) {
+		const identity = row.identity;
+		if (!identity?.messageId) continue;
+		if (identity.toolUseId) {
+			ids.push(`tc-${identity.toolUseId}`, `sa-${identity.toolUseId}`);
+		} else {
+			ids.push(makeMessageBlockSelectionId(identity.messageId, identity.blockIndex));
+		}
+	}
+	return ids.length > 0 ? ids : null;
+}
+
+/**
  * Is this row's card currently OPEN? — the value `onToggle` inverts.
  *
  * Answered from the MEASURED element wherever possible, because that is the only
@@ -762,15 +818,9 @@ function resolveTraceRowIdentity(
  *   message-bubble → `form === "command"` + `expanded` (a slash-command bubble's
  *                    `form` is the literal "command", so the generic checks above
  *                    cannot see its fold; plain bubbles have no fold at all)
- *   sidecar        → `expanded` (a per-record card, no LOD involvement)
  *
- * The `state` fallback exists for the keys that have NO measured entry: a tool
- * card's sidecar mini-cards fold under `${rowKey}-sc${index}`, which is not a
- * top-level layout item and therefore never appears in `measuredByKeyRef`. With
- * `undefined` for both measured and fallback the expression collapsed to `false`
- * every time, so each click wrote `expanded = true` and the card could be opened
- * but never closed. The state map IS authoritative for those keys — nothing but
- * this toggle writes them.
+ * The `state` fallback exists for keys that have NO measured entry at all; the
+ * state map is authoritative for those, since nothing but this toggle writes them.
  */
 export function resolveRowOpenState(
 	measuredElement: VListItem["measured"] | undefined,
@@ -792,64 +842,9 @@ export function resolveRowOpenState(
 		if (measured.effectiveOpened !== undefined) return measured.effectiveOpened;
 		if (measured.effectiveExpanded !== undefined) return measured.effectiveExpanded;
 		if (measured.form !== undefined) return measured.form === "expanded";
-		// A standalone sidecar card: no `form`, no LOD-effective flag — just its own
-		// measured fold state.
 		if (measured.expanded !== undefined) return measured.expanded;
 	}
-	// No measured element for this key (a tool card's `-sc{i}` mini-card).
 	return state.expanded.get(key) === true;
-}
-
-/**
- * The fold key of ONE sidecar mini-card inside a row, matching the adapter's own
- * scheme (`${keyBase}-sc${index}` — see segment-adapter's buildSidecarSpecs).
- */
-export function sidecarFoldKey(rowKey: string, index: number): string {
-	return `${rowKey}-sc${index}`;
-}
-
-/** Row key → its stable per-index sidecar fold dispatcher. */
-export type SidecarToggleCache = Map<string, (index: number) => void>;
-
-/**
- * The row's sidecar fold dispatcher, memoized BY ROW KEY.
- *
- * Referential stability is a hard requirement, not an optimization: this is handed
- * to every mounted tool card and the ExactRow memo compares it identity-wise, so a
- * fresh arrow per render re-renders the whole window on every document rebuild (the
- * measured 22.3ms/frame the comparator exists to avoid). Same discipline as
- * `getRowToggles` / `getLoadFullPayload` / `terminateRunningTool`.
- *
- * One dispatcher per ROW rather than per (row, index): the index arrives as an
- * argument, so a single function covers all of that card's mini-cards.
- *
- * Extracted from the component so the stability property can be asserted against
- * the real implementation instead of a re-implementation in a test.
- */
-export function resolveSidecarToggle(
-	cache: SidecarToggleCache,
-	rowKey: string,
-	toggleFold: (foldKey: string) => void,
-): (index: number) => void {
-	const cached = cache.get(rowKey);
-	if (cached) return cached;
-	const toggle = (index: number) => toggleFold(sidecarFoldKey(rowKey, index));
-	cache.set(rowKey, toggle);
-	return toggle;
-}
-
-/**
- * How many sidecar mini-cards this row owns, i.e. how many `-sc{i}` fold keys can
- * exist under it. Read from the MEASURED card, which is where the count is already
- * resolved (the adapter filtered the invisible records out).
- *
- * Only tool cards host mini-cards. A STANDALONE sidecar element carries its own
- * `-sc{i}` suffix in its own spec key and folds through the ordinary `expanded`
- * channel, so it owns no sub-keys of its own.
- */
-export function rowSidecarCount(item: VListItem): number {
-	if (item.spec.kind !== "tool-call") return 0;
-	return (item.measured as MeasuredToolCall).sidecars?.length ?? 0;
 }
 
 /**
@@ -857,35 +852,20 @@ export function rowSidecarCount(item: VListItem): number {
  * single row's height/appearance. Rows whose signature is unchanged (and whose
  * item + geometry are unchanged) can skip re-rendering entirely during scroll.
  */
-export function rowInteractionSig(
-	state: VListInteractionState,
-	key: string,
-	sidecarCount: number,
-): string {
+export function rowInteractionSig(state: VListInteractionState, key: string): string {
 	const expanded = state.expanded.get(key);
 	const lodOverride = state.lodUserOverrides.has(key) ? 1 : 0;
 	const showEarlier = state.showEarlier.has(key) ? 1 : 0;
 	const rows = state.expandedRows.get(key);
 	const rowsSig = rows && rows.size > 0 ? [...rows].sort((a, b) => a - b).join(",") : "";
+	// A folded trace's drill-down lives in its own KEY-addressed channel, so it needs
+	// its own term here: without it a trace row opening changed nothing the memo
+	// compares (the index-addressed `rowsSig` stays empty for traces) and the row
+	// could skip the re-render that paints the revealed card.
+	const traceRows = state.expandedTraceRows.get(key);
+	const traceRowsSig = traceRows && traceRows.size > 0 ? [...traceRows].sort().join(",") : "";
 	const promptOpen = state.promptOpen.has(key) ? 1 : 0;
-	// Tool-result sidecar fold states live under `${key}-sc${index}`. A tool card
-	// can carry several; fold each into the row's signature so expanding one
-	// re-renders the card (its measured height changes).
-	//
-	// Iterated over the row's ACTUAL mini-card count, not "until a key is missing".
-	// The reader is free to expand only the SECOND card, in which case `-sc0` has no
-	// entry at all and a break-on-missing loop stops before ever reading `-sc1` —
-	// leaving that fold out of the signature entirely. It happened not to show,
-	// because the memo's `item.measured` comparison catches the height change
-	// anyway; a signature that silently omits state is still wrong, and relying on
-	// another term to cover for it is exactly how the live-tail bug slipped through.
-	// The count is tiny (injections per tool result), so this stays O(small).
-	let sidecarSig = "";
-	for (let i = 0; i < sidecarCount; i++) {
-		const v = state.expanded.get(sidecarFoldKey(key, i));
-		if (v !== undefined) sidecarSig += `${i}${v ? "1" : "0"}`;
-	}
-	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${promptOpen}:${sidecarSig}`;
+	return `${expanded === undefined ? "u" : expanded ? "1" : "0"}:${lodOverride}:${showEarlier}:${rowsSig}:${traceRowsSig}:${promptOpen}`;
 }
 
 /**
@@ -922,7 +902,11 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 			b.actions as unknown as Record<string, unknown>,
 		) &&
 		// Presence only: the callback closes over `messageId`, already compared above.
-		!!a.onViewOriginal === !!b.onViewOriginal
+		!!a.onViewOriginal === !!b.onViewOriginal &&
+		// The inspector's content is derived from the spec; a different injection body
+		// must not inherit a neighbour's "what the model saw" text.
+		a.inspectContent?.text === b.inspectContent?.text &&
+		a.inspectContent?.title === b.inspectContent?.title
 	);
 }
 
@@ -949,7 +933,15 @@ interface RowToggles {
 	onToggle: () => void;
 	onToggleItems: () => void;
 	onToggleEarlier: () => void;
-	onToggleRow: (rowIndex: number) => void;
+	/**
+	 * Drill into one row.
+	 *
+	 * Passing `rowKey` selects the KEY-addressed channel (`expandedTraceRows`),
+	 * omitting it the index-addressed one (`expandedRows`). Which one an element
+	 * needs is decided by its kind, not by this callback — see
+	 * `traceRowFoldChannel`, and the routing at the `TRACE_KINDS` binding.
+	 */
+	onToggleRow: (rowIndex: number, rowKey?: string) => void;
 	/** Flip a translated body between its translation and the original. */
 	onToggleTranslation: () => void;
 	/**
@@ -982,6 +974,12 @@ interface RowInteraction {
 	 * carries `editedAt`; the modal itself is a single shell-level instance.
 	 */
 	onViewOriginal?: () => void;
+	/**
+	 * Verbatim model-facing content for the "what the model saw" inspector, carried
+	 * by injection-bubble rows (which speak FOR somebody). Read off `spec.data`'s
+	 * `modelFacing`, with the speaker/source label as the inspector's title.
+	 */
+	inspectContent?: { title: string; text: string };
 }
 
 /**
@@ -1031,6 +1029,15 @@ interface ExactRowProps {
 	onOpenFilePanel?: (filePath: string) => void;
 	/** Localized label for a clickable attachment row (tooltip / aria). */
 	openAttachmentLabel?: string;
+	/** Localized "was truncated" note painted inside an injection bubble. */
+	injectionNoteLabel?: string;
+	/**
+	 * The signed-in user, for deciding whether a user bubble is the reader's own turn
+	 * (right + indigo) or a teammate's (left + neutral). HEIGHT-NEUTRAL: both sides
+	 * measure identically, which is why this is a render-layer prop rather than
+	 * adapter data that would fork the measure cache per viewer.
+	 */
+	currentUserId?: string | null;
 	/**
 	 * Live permission form node for a pending-permission tool/subagent card. When
 	 * present, the row hosts a real interactive component whose height is measured
@@ -1107,12 +1114,6 @@ interface ExactRowProps {
 	 * the fade-in on already-settled text.
 	 */
 	animateStreaming?: boolean;
-	/**
-	 * Fold toggle for a tool card's tool-result sidecar mini-card (index-addressed).
-	 * The shell resolves it through the memoized getRowToggles so a sidecar fold
-	 * re-renders exactly like any other row fold. Absent → sidecars render inert.
-	 */
-	onToggleSidecar?: (index: number) => void;
 }
 
 /**
@@ -1135,6 +1136,8 @@ const ExactRow = memo(
 		rowInteraction,
 		onOpenFilePanel,
 		openAttachmentLabel,
+		injectionNoteLabel,
+		currentUserId,
 		narratorId,
 		permissionSlot,
 		editorSlot,
@@ -1151,13 +1154,19 @@ const ExactRow = memo(
 		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
-		onToggleSidecar,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
 		// User bubbles: build the avatar/name/time header node from the forwarded
 		// creator data (the pure render layer cannot construct it itself).
 		injectUserBubbleHeader(kind, extra);
+		// Which side the bubble sits on + its tint. Resolved here, not in the adapter:
+		// a teammate's turn and your own are the same height, so viewer identity must
+		// not reach the measured data (it would fork the cache per user).
+		injectUserBubbleIsSelf(kind, extra, currentUserId);
+		// Injection bubbles: speaker row + the localized trailing note. Both are chrome
+		// the measure pass already reserved space for, so this only fills it in.
+		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel);
 		// User bubbles: make a text-file attachment clickable when the host owns a
 		// dockview surface. The path itself already rode along as height-neutral
 		// measure data, so this only binds the handler.
@@ -1172,17 +1181,20 @@ const ExactRow = memo(
 		if (kind === "reasoning") {
 			extra.onToggleTranslation = toggles.onToggleTranslation;
 		}
-		// A tool card's tool-result sidecars fold independently of the card body.
-		// Their fold state is keyed `${spec.key}-sc${index}` (the adapter's own
-		// scheme); the per-index toggle is resolved by the shell (which owns the
-		// memoized getRowToggles) and handed in as a plain callback.
-		if (kind === "tool-call" && onToggleSidecar) {
-			extra.onToggleSidecar = onToggleSidecar;
-		}
 		if (TRACE_KINDS.has(kind)) {
 			extra.onToggleItems = toggles.onToggleItems;
 			extra.onToggleEarlier = toggles.onToggleEarlier;
-			extra.onToggleRow = toggles.onToggleRow;
+			// Route the row fold to the channel THIS kind's adapter path actually
+			// reads. The render layer always reports both the index and the key, so
+			// without this every trace would write a key — and `reasoning-steps`
+			// (which resolves its `expandedIndices` from `ctx.expandedRows`) would
+			// store the reader's fold where nothing looks for it, leaving those rows
+			// silently unopenable.
+			const foldByKey = traceRowFoldChannel(kind) === "key";
+			const toggleRow = foldByKey
+				? toggles.onToggleRow
+				: (rowIndex: number) => toggles.onToggleRow(rowIndex);
+			extra.onToggleRow = toggleRow;
 			// Folded traces: give each ROW inside the trace its own menu / selection.
 			if (rowInteraction) extra.rowInteraction = rowInteraction;
 			// Drill-down: a row the reader opened nests a REAL tool card, dispatched
@@ -1203,7 +1215,11 @@ const ExactRow = memo(
 					// chevron is the other half of the same toggle). It must NOT be a card
 					// fold: the card is measured force-open, so folding it in place would
 					// paint a collapsed header inside a box reserved for the full card.
-					onToggle: () => toggles.onToggleRow(row.itemIndex),
+					//
+					// Goes through the SAME kind-routed dispatcher as the row's own chevron:
+					// the two halves of one toggle must address the same channel, or closing
+					// from the card would write an index while opening wrote a key.
+					onToggle: () => toggleRow(row.itemIndex, row.key),
 				};
 				if (viewControls) {
 					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
@@ -1391,6 +1407,7 @@ const ExactRow = memo(
 						toolMeta={interaction.toolMeta}
 						toolActions={interaction.toolActions}
 						onViewOriginal={interaction.onViewOriginal}
+						inspectContent={interaction.inspectContent}
 						onOpenFullscreen={
 							menuViewTarget && viewControls
 								? () => viewControls.openFullscreen(menuViewTarget)
@@ -1509,6 +1526,9 @@ const ExactRow = memo(
 		prev.narratorId === next.narratorId &&
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
+		prev.injectionNoteLabel === next.injectionNoteLabel &&
+		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
+		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
 		prev.editorSlot === next.editorSlot &&
 		prev.onUnknownHeight === next.onUnknownHeight &&
@@ -1522,13 +1542,7 @@ const ExactRow = memo(
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
 		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
-		prev.viewControls === next.viewControls &&
-		// The sidecar fold dispatcher IS a prop the row renders from, so it belongs
-		// here like every other callback. It is cached by row key (getSidecarToggle),
-		// so an unchanged row keeps the same identity across document rebuilds and
-		// this term is a hit — the point of comparing it is that a future change to
-		// its construction cannot silently start feeding rows a stale handler.
-		prev.onToggleSidecar === next.onToggleSidecar,
+		prev.viewControls === next.viewControls,
 );
 
 /**
@@ -1859,6 +1873,12 @@ export const PretextExactMessageList = forwardRef<
 		(key: string) => [...(activeInteraction.expandedRows.get(key) ?? [])],
 		[activeInteraction],
 	);
+	// Folded traces resolve their drill-down by ROW KEY; the adapter derives the
+	// indices from the rows it emits (see AdapterContext.isRowExpanded).
+	const resolveTraceRowExpanded = useCallback(
+		(traceKey: string, rowKey: string) => isTraceRowExpanded(activeInteraction, traceKey, rowKey),
+		[activeInteraction],
+	);
 	const resolveShowOriginal = useCallback(
 		(key: string) => activeInteraction.showOriginal.has(key),
 		[activeInteraction],
@@ -1963,6 +1983,35 @@ export const PretextExactMessageList = forwardRef<
 		(() => { geometry: Map<string, FoldRowGeometry>; documentRevision: number }) | null
 	>(null);
 	/**
+	 * Drill-down header morph (see vlist-drill-morph.ts).
+	 *
+	 * DECLARATIVE and diff-driven, not a click capture: after every committed rebuild
+	 * the layout effect below snapshots every visible trace row's drill state, diffs
+	 * it against the previous frame, and morphs each row whose drill flag flipped.
+	 * Any number of rows can flip in one frame (stacked activity), so the controller
+	 * is keyed per-row — there is no single-slot capture to overwrite. Pure data in
+	 * the ref, never React state, never the measure cache.
+	 */
+	const drillMorphRef = useRef(createDrillMorphController());
+	const drillMorphPrevRef = useRef<Map<string, DrillRowSnapshot>>(new Map());
+	/**
+	 * The document revision the last snapshot was taken under. A morph only plays when
+	 * two consecutive snapshots share a revision — a revision move means a live patch
+	 * / page / reload rebuilt the window, and diffing across it would animate a change
+	 * the reader did not make. The snapshot still rolls forward (see the effect).
+	 */
+	const drillMorphRevisionRef = useRef<number>(-1);
+	/**
+	 * LOD-switch morph (see vlist-lod-morph.ts). Diff-driven off the committed layout,
+	 * keyed by `unitId` — the one identity that survives a level switch. The snapshot
+	 * rolls forward every commit so the next diff has a clean baseline; a morph only
+	 * plays when the document revision is unchanged AND the lod moved (pure re-theme).
+	 */
+	const lodMorphRef = useRef(createLodMorphController());
+	const lodMorphPrevRef = useRef<Map<string, LodElementSnapshot> | null>(null);
+	const lodMorphLodRef = useRef<number>(-1);
+	const lodMorphDocRevRef = useRef<number>(-1);
+	/**
 	 * Snapshot the mounted rows' current geometry so the commit this click produces
 	 * can be animated from it.
 	 *
@@ -2021,8 +2070,21 @@ export const PretextExactMessageList = forwardRef<
 					captureFoldBefore(key);
 					setInteraction((prev) => toggleVListShowEarlier(prev, key));
 				},
-				onToggleRow: (rowIndex: number) => {
+				onToggleRow: (rowIndex: number, rowKey?: string) => {
 					captureFoldBefore(key);
+					// The caller decides the channel by whether it passes a key, and the
+					// TRACE_KINDS binding picks that per element kind (traceRowFoldChannel).
+					// A key means the element folds a LIVE row list, where a reasoning step
+					// arriving above the reader's row makes the index they clicked address a
+					// different tool one frame later (see expandedTraceRows).
+					//
+					// No morph capture here: the drill-down header morph is diff-driven off
+					// the committed rebuild (see the drill-morph layout effect), so this
+					// handler only flips the interaction state — nothing to record.
+					if (rowKey !== undefined) {
+						setInteraction((prev) => toggleVListTraceRow(prev, key, rowKey));
+						return;
+					}
 					setInteraction((prev) => toggleVListRow(prev, key, rowIndex));
 				},
 				onToggleTranslation: () => setInteraction((prev) => toggleVListShowOriginal(prev, key)),
@@ -2035,19 +2097,6 @@ export const PretextExactMessageList = forwardRef<
 			return toggles;
 		},
 		[captureFoldBefore],
-	);
-
-	// Per-index sidecar fold dispatcher, cached by row key (see resolveSidecarToggle
-	// for why the identity must be stable). It previously escaped notice as a fresh
-	// arrow per render only because the prop was absent from the ExactRow comparator
-	// — a memo hit that depended on the comparator not looking.
-	const sidecarTogglesCacheRef = useRef<SidecarToggleCache>(new Map());
-	const getSidecarToggle = useCallback(
-		(rowKey: string) =>
-			resolveSidecarToggle(sidecarTogglesCacheRef.current, rowKey, (foldKey) =>
-				getRowToggles(foldKey).onToggle(),
-			),
-		[getRowToggles],
 	);
 
 	// Subagent-recovery card submit. The card's row set tracks DESELECTED indices
@@ -2112,6 +2161,14 @@ export const PretextExactMessageList = forwardRef<
 	// Tooltip / aria label for a clickable text-file attachment. Height-neutral
 	// chrome, so it does NOT participate in the measurement cache key.
 	const openAttachmentLabel = t("contextMenu_openFilePanel");
+	// "…was truncated" note inside an injection bubble. Height-neutral: the measure
+	// pass reserves a fixed line whenever `hasNote` holds, whatever the wording.
+	const injectionNoteLabel = t("sidecar.body.tasksDoneTruncated");
+	// Who is reading. Decides whether a user bubble is drawn as the reader's own turn
+	// or a teammate's — this is a shared deployment, so `role: "user"` alone does not
+	// mean "you". Height-neutral, so it stays out of the measurement cache key.
+	const { data: currentUser } = useCurrentUser();
+	const currentUserId = currentUser?.id ?? null;
 	// Language identity for the measurement cache: localized text is baked into
 	// measured content, so a switch must invalidate cached heights (see
 	// buildPretextDocumentLayout's labelsRevision).
@@ -2131,6 +2188,16 @@ export const PretextExactMessageList = forwardRef<
 			toolUseId ? pendingPermissionToolUseIds.has(toolUseId) : false,
 		[pendingPermissionToolUseIds],
 	);
+	// ⚠️ The pinned latest-tasks card is NOT resolved here.
+	//
+	// The shell tracks its own `latestSpecTasksToolUseId` (the `LatestTodosToolUseIdCtx`
+	// value the chunked path's task-board spinner keys on), and passing it down as a
+	// build option was tempting. It would be wrong: the shell's value is derived from a
+	// DIFFERENT message list (the tail-meta scan) than the one the layout builds over
+	// (persisted window + live streaming row), so the two can disagree — and a value
+	// deliberately kept out of the build deps could never correct itself once stale.
+	// `buildPretextDocumentLayout` therefore derives the id itself, from exactly the
+	// messages it is laying out, using the same rule (`vlist-spec-tasks-pin.ts`).
 	// Plan bodies carried by pending ExitPlanMode permissions. A file-based plan is
 	// resolved server-side into the permission payload and never enters the streamed
 	// tool_use input, so the card's own inputJson stays empty until a reload. The Map
@@ -2237,6 +2304,10 @@ export const PretextExactMessageList = forwardRef<
 	// once, so they must not close over one render's callback. Declared before
 	// usePretextDocument because the assignment reads that hook's result.
 	const appendMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
+	// Same latest-value contract as appendMessageRef, for the two in-place history
+	// mutations (delete / trailing-block truncation).
+	const removeMessagesRef = useRef<(deletedIds: readonly string[]) => boolean>(() => false);
+	const replaceMessageRef = useRef<(message: TreeMessage) => boolean>(() => false);
 	const getReflectionTakeOver = useCallback(
 		(key: string, kind: string | undefined, requestId: string): (() => void) => {
 			const cacheKey = `${key}|${kind ?? ""}|${requestId}`;
@@ -2289,6 +2360,7 @@ export const PretextExactMessageList = forwardRef<
 		isLodUserOverride: resolveLodUserOverride,
 		showEarlier: resolveShowEarlier,
 		expandedRows: resolveExpandedRows,
+		isRowExpanded: resolveTraceRowExpanded,
 		showOriginal: resolveShowOriginal,
 		isPromptOpen: resolvePromptOpen,
 		resolveToolCategory: getCategory,
@@ -2312,6 +2384,8 @@ export const PretextExactMessageList = forwardRef<
 		isSubagent,
 	});
 	appendMessageRef.current = pretextDocument.appendMessage;
+	removeMessagesRef.current = pretextDocument.removeMessages;
+	replaceMessageRef.current = pretextDocument.replaceMessage;
 	// Read by the jump loop, which spans awaits and must see the CURRENT document
 	// (its `readWindow` reads the coordinator snapshot synchronously, so it is also
 	// correct between a commit and the React re-render it triggers).
@@ -2406,6 +2480,44 @@ export const PretextExactMessageList = forwardRef<
 		[bumpMessageRevision],
 	);
 
+	// A deletion is applied to the loaded window IN PLACE for the same reason an
+	// append is — the ids arrive in the event, so a refetch buys nothing — but here
+	// the deferral was the actual bug rather than just latency. A structural reload
+	// waits for the reader to be at the bottom, and a reader who right-clicked a
+	// message in history never is, so their rollback appeared not to happen until
+	// they scrolled back down. `removeMessages` returning false means the removal was
+	// declined (nothing loaded matched, or it would empty the document), which falls
+	// through to the reload exactly as an unappendable message does.
+	const removeOrReload = useCallback(
+		(deletedMessageIds: string[]) => {
+			if (removeMessagesRef.current(deletedMessageIds)) {
+				// Keep the applied revision in step so the reload gate does not treat this
+				// as still pending — that would surface a false "new messages" affordance
+				// and then refetch what is already correct on screen.
+				appliedMessageRevisionRef.current += 1;
+			}
+			bumpMessageRevision();
+		},
+		[bumpMessageRevision],
+	);
+
+	// The other half of a rollback: the boundary message keeps its blocks up to the
+	// rollback point and loses the rest, arriving as `message_updated`. Applying that
+	// truncation in place is what stops a rollback from looking half-done (messages
+	// below gone, the clicked card's tail blocks still there). Anything that is NOT a
+	// trailing truncation is declined by `replaceMessage` and reloads instead —
+	// necessarily so, since a version-neutral rebuild would serve the surviving
+	// blocks' cached heights for changed content.
+	const replaceOrReload = useCallback(
+		(message: TreeMessage | undefined) => {
+			if (message && replaceMessageRef.current(message)) {
+				appliedMessageRevisionRef.current += 1;
+			}
+			bumpMessageRevision();
+		},
+		[bumpMessageRevision],
+	);
+
 	// The exact shell is stable-state only. Subscribe to the existing message
 	// control stream once a complete document exists. Realtime mutations reload
 	// the full exact input; reconnect catch-up reloads only when it reports data.
@@ -2416,8 +2528,8 @@ export const PretextExactMessageList = forwardRef<
 				appendOrReload(wsData.message),
 			onUserMessage: (wsData: { message?: TreeMessage; [key: string]: unknown }) =>
 				appendOrReload(wsData.message),
-			onMessageUpdated: bumpMessageRevision,
-			onMessagesDeleted: bumpMessageRevision,
+			onMessageUpdated: replaceOrReload,
+			onMessagesDeleted: removeOrReload,
 			onPruneBoundary: bumpMessageRevision,
 			onFullReload: bumpMessageRevision,
 			// Live compact-progress ticks patch the loaded compact marker in place
@@ -2840,6 +2952,163 @@ export const PretextExactMessageList = forwardRef<
 	// narrator mid-transition), so the controller is stopped explicitly on unmount.
 	useEffect(() => {
 		const controller = foldMotionRef.current;
+		return () => controller.cancel();
+	}, []);
+
+	/**
+	 * Play drill-down header morphs, driven by a row-level diff of the committed
+	 * rebuild.
+	 *
+	 * DECLARATIVE, not a click capture: every commit rebuilds a snapshot of each
+	 * visible trace row's drill state, diffs it against the previous frame, and
+	 * morphs each row whose drill flag flipped. Any number of rows can flip in one
+	 * frame (stacked activity), and the per-row controller plays them all without one
+	 * overwriting another — the failure mode of the old single-slot capture.
+	 *
+	 * A LAYOUT effect (same discipline as the fold above): it must run in the same
+	 * frame the rebuild commits, before paint. All geometry is pure layout/measured
+	 * arithmetic — no DOM measurement, no React state.
+	 */
+	useLayoutEffect(() => {
+		const node = viewportRef.current;
+		const layout = exactLayoutRef.current;
+		if (!node || !layout) return;
+		// Assemble the visible traces' row-level sources from the layout + measured
+		// payloads. Only kinds that actually nest a drill-down card can flip.
+		const items = renderItemsRef.current;
+		const window = visibleRef.current;
+		const traces: {
+			traceKey: string;
+			top: number;
+			rows: {
+				key: string;
+				top: number;
+				drilled: boolean;
+				drillHeader: { top: number; height: number } | null;
+			}[];
+		}[] = [];
+		for (let index = window.start; index < window.end; index++) {
+			const item = items[index];
+			const geo = layout.items[index];
+			if (!item || !geo) continue;
+			const measured = measuredByKeyRef.current.get(item.spec.key) as
+				| {
+						rows?: {
+							key: string;
+							top: number;
+							cardMeasured: unknown | null;
+							drillHeader: { top: number; height: number } | null;
+						}[];
+				  }
+				| undefined;
+			if (!measured?.rows) continue;
+			traces.push({
+				traceKey: item.spec.key,
+				top: geo.top,
+				rows: measured.rows.map((r) => ({
+					key: r.key,
+					top: r.top,
+					drilled: r.cardMeasured != null,
+					drillHeader: r.drillHeader,
+				})),
+			});
+		}
+		const next = buildDrillSnapshots(traces, node.scrollTop);
+		const prev = drillMorphPrevRef.current;
+		// Only morph across a USER-driven fold: if the document revision moved, a live
+		// patch / page / reload rebuilt the window and the diff would mix the reader's
+		// toggle with a change they did not make. The snapshot still rolls forward so
+		// the NEXT diff has a clean baseline.
+		const revisionUnchanged =
+			foldRevisionOf(foldDocumentRevision) === drillMorphRevisionRef.current;
+		drillMorphRevisionRef.current = foldRevisionOf(foldDocumentRevision);
+		drillMorphPrevRef.current = next;
+		if (!revisionUnchanged || prefersReducedMotionDrill()) return;
+		const plans = diffDrillSnapshots(prev, next);
+		if (plans.length === 0) return;
+		drillMorphRef.current.playAll(plans, (rowUid) => {
+			const sep = rowUid.indexOf("::");
+			const traceKey = rowUid.slice(0, sep);
+			const rowKey = rowUid.slice(sep + 2);
+			const plan = plans.find((p) => p.rowUid === rowUid);
+			const rowNode = node.querySelector<HTMLElement>(
+				`[data-nf-row-key="${cssAttrEscape(traceKey)}"]`,
+			);
+			const toggled = rowNode?.querySelector<HTMLElement>(
+				`[data-nf-trace-row="${cssAttrEscape(rowKey)}"]`,
+			);
+			return toggled?.querySelector<HTMLElement>(
+				plan?.kind === "collapse" ? "[data-nf-trace-titlerow]" : "[data-nf-card-header]",
+			);
+		});
+	});
+
+	// The morph outlives the click for the same reason the fold does; stop it on
+	// unmount so no animation outlives the list.
+	useEffect(() => {
+		const controller = drillMorphRef.current;
+		return () => controller.cancel();
+	}, []);
+
+	/**
+	 * Play LOD-switch morphs, driven by an element-level diff keyed by `unitId`.
+	 *
+	 * An LOD switch re-themes every element into a different component (a card folds
+	 * into a trace row, a row expands into a card), minting new spec keys/kinds — so
+	 * neither the fold (`spec.key`) nor the drill morph (`traceKey::rowKey`) can pair
+	 * across it. What survives is `unitId`. This effect snapshots every unitId-bearing
+	 * element in the viewport×3 window, diffs against the previous commit, and morphs
+	 * each pair from its old screen position to its new one — all in one frame.
+	 *
+	 * Gate: the morph only plays when the document revision is UNCHANGED and the lod
+	 * MOVED (a pure re-theme). A revision move means a live patch / page / reload
+	 * rebuilt the window; diffing across it would animate a change the reader did not
+	 * make. The snapshot rolls forward either way so the next diff has a clean
+	 * baseline. Pure layout arithmetic throughout — no DOM measurement, no React state.
+	 */
+	useLayoutEffect(() => {
+		const node = viewportRef.current;
+		const layout = exactLayoutRef.current;
+		if (!node || !layout) return;
+		const items = renderItemsRef.current;
+		const scrollTop = node.scrollTop;
+		const vh = viewportHeightRef.current;
+		// Assemble the unitId-bearing elements straight from the layout + specs. The
+		// whole committed document is read here (geometry is O(n) plain numbers, cheap);
+		// the viewport×3 crop happens inside buildLodSnapshots.
+		const elements: { unitId: string | null | undefined; top: number; height: number }[] = [];
+		for (let index = 0; index < items.length; index++) {
+			const item = items[index];
+			const geo = layout.items[index];
+			if (!item || !geo) continue;
+			elements.push({ unitId: item.spec.unitId, top: geo.top, height: geo.height });
+		}
+		const next = buildLodSnapshots(elements, scrollTop, vh);
+		const prev = lodMorphPrevRef.current;
+		const docRev = foldRevisionOf(foldDocumentRevision);
+		const lod = pretextDocument.manifest?.lod ?? -1;
+		const isLodSwitch =
+			prev != null &&
+			lodMorphDocRevRef.current === docRev &&
+			lodMorphLodRef.current !== -1 &&
+			lodMorphLodRef.current !== lod;
+		// Roll forward BEFORE the early returns, so the next diff compares against this
+		// frame even when the morph is skipped (non-LOD rebuild, reduced motion, first
+		// paint).
+		lodMorphPrevRef.current = next;
+		lodMorphDocRevRef.current = docRev;
+		lodMorphLodRef.current = lod;
+		if (!isLodSwitch || prefersReducedMotionLod()) return;
+		const plans = diffLodSnapshots(prev, next);
+		if (plans.length === 0) return;
+		lodMorphRef.current.playAll(plans, (unitId) =>
+			node.querySelector<HTMLElement>(`[data-nf-unit="${cssAttrEscape(unitId)}"]`),
+		);
+	});
+
+	// Stop LOD morphs on unmount, same discipline as the other controllers.
+	useEffect(() => {
+		const controller = lodMorphRef.current;
 		return () => controller.cancel();
 	}, []);
 
@@ -3733,6 +4002,29 @@ export const PretextExactMessageList = forwardRef<
 			// An edited message offers "view original"; the modal is a single
 			// shell-level instance, so the row only carries the open callback.
 			const editedMeta = resolveVListEditedMeta(msg);
+			// An injection bubble speaks FOR somebody; its spec carries the verbatim
+			// model-facing copy (`modelFacing`) plus the speaker/source label, which the
+			// inspector shows so the reader can audit what the agent actually received.
+			const injectionData =
+				item.spec.kind === "injection-bubble"
+					? (item.spec.data as {
+							modelFacing?: unknown;
+							speaker?: unknown;
+							source?: unknown;
+						} | null)
+					: null;
+			const modelFacing =
+				typeof injectionData?.modelFacing === "string" ? injectionData.modelFacing : "";
+			const inspectContent =
+				modelFacing.trim().length > 0
+					? {
+							text: modelFacing,
+							title:
+								(typeof injectionData?.speaker === "string" && injectionData.speaker.trim()) ||
+								(typeof injectionData?.source === "string" && injectionData.source) ||
+								"injection",
+						}
+					: undefined;
 			const next: RowInteraction = {
 				blockId: target.blockId,
 				messageId,
@@ -3744,6 +4036,7 @@ export const PretextExactMessageList = forwardRef<
 				toolMeta,
 				toolActions,
 				...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
+				...(inspectContent ? { inspectContent } : {}),
 			};
 			map.set(item.spec.key, reuseRowPayload(previous, item.spec.key, next, sameRowInteraction));
 		}
@@ -3861,6 +4154,38 @@ export const PretextExactMessageList = forwardRef<
 		const index = renderItems.findIndex((item) => item?.spec.key === editingRow.key);
 		return index >= 0 ? index : null;
 	}, [editingRow, renderItems]);
+
+	/**
+	 * The row holding the touch swipe ANCHOR, so it too can be pinned.
+	 *
+	 * Touch range-selection spans two gestures: the first left-swipe reveals a row's
+	 * menu and registers it as the anchor, a left-swipe on another row then selects
+	 * everything between them. `useSwipeMenu` keeps that anchor (and its close
+	 * handler) alive only while the anchor's hook is MOUNTED — so in a virtualized
+	 * list scrolling the anchor past the overscan band unmounted it, silently
+	 * dropping the anchor and turning the second swipe into "open my own menu".
+	 *
+	 * Read through `useSyncExternalStore` because the anchor lives in a module-level
+	 * store that `useSwipeMenu` writes from a touch handler; without a subscription
+	 * this list would never re-render to pin the row. `null` for every non-touch
+	 * session, where the store is never written at all.
+	 */
+	const swipeAnchorBlockId = useSyncExternalStore(
+		subscribeGlobalSwipeAnchor,
+		getGlobalSwipeAnchor,
+		// SSR / hydration: no gesture can be in flight before the first paint.
+		() => null,
+	);
+	const swipeAnchorRowIndex = useMemo(() => {
+		// Scanning the document is gated on an anchor EXISTING, so a plain read /
+		// desktop session never walks the list at all.
+		if (!swipeAnchorBlockId) return null;
+		return resolveSwipeAnchorRowIndex(swipeAnchorBlockId, renderItems.length, (index) => {
+			const item = renderItems[index];
+			if (!item) return null;
+			return rowSelectionBlockIds(item, interactionsByKey.get(item.spec.key)?.blockId);
+		});
+	}, [swipeAnchorBlockId, renderItems, interactionsByKey]);
 
 	/** Mount the shared editor for the row currently in edit mode. */
 	const renderEditorSlot = useCallback(
@@ -4007,9 +4332,18 @@ export const PretextExactMessageList = forwardRef<
 						})}
 						{[
 							...range(visible.start, visible.end),
-							// The row being edited stays mounted even after scrolling out of
-							// the window — unmounting would destroy the draft.
-							...resolvePinnedRowIndices(visible, editingRowIndex),
+							// Rows that must survive scrolling out of the window. Merged (not
+							// spread back to back) because the two reasons can name the SAME
+							// index — the reader may swipe the row they are editing — and that
+							// would mint two children under one key.
+							...mergePinnedRowIndices(
+								// The row being edited: unmounting would destroy the draft.
+								resolvePinnedRowIndices(visible, editingRowIndex),
+								// The swipe anchor's row: unmounting drops the anchor and its
+								// close handler, which is what silently broke touch
+								// range-selection once the first swiped row scrolled away.
+								resolvePinnedRowIndices(visible, swipeAnchorRowIndex),
+							),
 						].map((itemIndex) => {
 							const item = renderItems[itemIndex];
 							const geometry = exactLayout.items[itemIndex];
@@ -4050,15 +4384,16 @@ export const PretextExactMessageList = forwardRef<
 									// the tail is height-neutral. Without this term the memo skips the
 									// re-render and the newest characters never reach the DOM. Empty string
 									// for every settled row, so scroll-time memo hits are unaffected.
-									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key, rowSidecarCount(item))}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
+									interactionSig={`${rowInteractionSig(activeInteraction, item.spec.key)}|${contentView.rowSig(item.spec.key)}|${liveTailSignature(item.spec.data)}`}
 									toggles={getRowToggles(item.spec.key)}
 									renderLabels={renderLabels}
 									interaction={interactionsByKey.get(item.spec.key)}
 									rowInteraction={resolveRowInteraction(item)}
 									narratorId={narratorId}
-									onToggleSidecar={getSidecarToggle(item.spec.key)}
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 									openAttachmentLabel={openAttachmentLabel}
+									injectionNoteLabel={injectionNoteLabel}
+									currentUserId={currentUserId}
 									permissionSlot={permissionSlot}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}

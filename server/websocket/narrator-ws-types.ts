@@ -11,6 +11,7 @@ import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
+import type { BufferMessageSummary } from "../services/narrator-buffer";
 
 export interface CodexQuotaOverviewWsMessage extends Record<string, unknown> {
 	type: "codex_quota_overview_updated";
@@ -309,13 +310,6 @@ export type NarratorServerMessage =
 			durationMs?: number;
 			updatedInput?: Record<string, unknown>;
 			metadata?: Record<string, unknown>;
-			sideCars?: Array<{
-				target: string;
-				source: string;
-				content: string;
-				toolUseId?: string | null;
-				orderIndex?: number;
-			}>;
 			parentToolUseId?: string;
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Only sent on the
@@ -323,18 +317,6 @@ export type NarratorServerMessage =
 			 * withheld. See {@link SubagentToolInputSummary}.
 			 */
 			inputSummary?: SubagentToolInputSummary;
-	  }
-	| {
-			type: "sidecars";
-			narratorId: string;
-			sideCars: Array<{
-				target: string;
-				source: string;
-				content: string;
-				toolUseId?: string | null;
-				orderIndex?: number;
-			}>;
-			parentToolUseId?: string;
 	  }
 	| { type: "title_updated"; narratorId: string; title: string }
 	| {
@@ -351,23 +333,18 @@ export type NarratorServerMessage =
 			/** Set when a controlling named narrator proxy-decided this request. */
 			decidedByNarrator?: { id: string; handle: string | null };
 	  }
-	| {
-			type: "buffer_set";
-			narratorId: string;
-			messages: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
-	  }
+	// The three buffer snapshots all carry `toBufferSummary`'s output. They used to
+	// inline a narrower shape that had already drifted (missing imageCount/creator),
+	// so clients could not see attachments the server was in fact sending.
+	| { type: "buffer_set"; narratorId: string; messages: BufferMessageSummary[] }
 	| {
 			type: "buffer_consumed";
 			narratorId: string;
 			messageId: string;
-			remaining: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
+			remaining: BufferMessageSummary[];
 	  }
 	| { type: "buffer_cleared"; narratorId: string; reason: "cancelled" | "sent" | "narrator_error" }
-	| {
-			type: "buffer_preserved";
-			narratorId: string;
-			messages: Array<{ id: string; text: string; bufferedAt: string; priority?: boolean }>;
-	  }
+	| { type: "buffer_preserved"; narratorId: string; messages: BufferMessageSummary[] }
 	| { type: "permission_mode_changed"; narratorId: string; permissionMode: string }
 	| {
 			type: "model_settings_changed";
@@ -902,4 +879,23 @@ export type NarratorServerMessage =
 			/** Submission status after the change (absent for `submission_created`). */
 			status?: string;
 			entryId?: string | null;
+	  }
+	| {
+			/**
+			 * Something outside the review queue changed for this user's knowledge view:
+			 *  - `entry_drifted`     — a global entry they hold a personal version of moved on,
+			 *                          so their copy needs a rebase.
+			 *  - `acl_changed`       — their knowledge authorization changed; the readable set,
+			 *                          review scope and badges may all differ now.
+			 *  - `owner_transferred` — they gained or lost ownership of an entry/collection.
+			 *
+			 * Same id-only discipline as `review_inbox_changed`: no titles or bodies cross this
+			 * channel, the client refetches through the ACL-checked HTTP endpoints.
+			 */
+			type: "knowledge:library_changed";
+			reason: "entry_drifted" | "acl_changed" | "owner_transferred";
+			/** Set for entry-scoped reasons (`entry_drifted`, entry owner transfer). */
+			entryId?: string | null;
+			/** Set for collection-scoped reasons (collection owner transfer). */
+			collectionId?: string | null;
 	  };

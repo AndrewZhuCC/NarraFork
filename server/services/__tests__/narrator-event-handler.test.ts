@@ -4,7 +4,6 @@ import { getTestDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
@@ -29,11 +28,9 @@ const {
 	clearStreamingSnapshot,
 	CriticalEventPersistenceError,
 	getStreamingSnapshot,
+	isSameReasoningBlock,
 	processEvent,
 } = await import("../narrator-event-handler");
-const { getPipelineState, markPipelineUsed, startPipelineState } = await import(
-	"../../lib/agent/pipeline-state"
-);
 
 type EventHandlerContext = import("../narrator-event-handler").EventHandlerContext;
 
@@ -241,7 +238,7 @@ describe("narrator event handler streaming snapshot", () => {
 		});
 	});
 
-	test("子代理 tool_completed 向父级隐藏 output/metadata/sidecars，self 保持完整", async () => {
+	test("子代理 tool_completed 向父级隐藏 output/metadata，self 保持完整", async () => {
 		const ctx = makeSubagentContext();
 		ctx.toolCallIdsMap?.set("completed-tool", "tc-completed");
 		await processEvent(
@@ -252,7 +249,6 @@ describe("narrator event handler streaming snapshot", () => {
 				output: "sensitive output",
 				isError: false,
 				metadata: { secret: true },
-				sideCars: [{ target: "tool_result", source: "test", content: "sensitive sidecar" }],
 			},
 			ctx,
 		);
@@ -272,10 +268,8 @@ describe("narrator event handler streaming snapshot", () => {
 		});
 		expect(parent).not.toHaveProperty("output");
 		expect(parent).not.toHaveProperty("metadata");
-		expect(parent).not.toHaveProperty("sideCars");
 		expect(self?.output).toBe("sensitive output");
 		expect(self?.metadata).toEqual({ secret: true });
-		expect(self?.sideCars).toHaveLength(1);
 	});
 });
 
@@ -567,7 +561,6 @@ describe("narrator event handler persistence", () => {
 			sqlite.run("PRAGMA foreign_keys = OFF");
 			try {
 				if (savedMessageId) {
-					await db.delete(narratorSidecars).where(eq(narratorSidecars.messageId, savedMessageId));
 					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, savedMessageId));
 					await db
 						.delete(narratorMessageRefs)
@@ -578,43 +571,6 @@ describe("narrator event handler persistence", () => {
 			} finally {
 				sqlite.run("PRAGMA foreign_keys = ON");
 			}
-		}
-	});
-
-	test("Pipeline exit confirmation 仅在 SideCar 成功持久化后确认消费", async () => {
-		const narratorId = `pipeline-sidecar-${Date.now()}`;
-		const now = new Date().toISOString();
-		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
-		try {
-			const state = await startPipelineState(narratorId);
-			await markPipelineUsed(narratorId, state.id);
-			expect((await getPipelineState(narratorId))?.exitConfirmationPending).toBe(true);
-
-			const ctx = makeSubagentContext();
-			ctx.narratorId = narratorId;
-			await processEvent(
-				{
-					type: "tool_result",
-					toolUseId: "pipeline-confirmation-result",
-					toolName: "Read",
-					output: "captured",
-					isError: false,
-					metadata: { pipelineExitConfirmationStateId: state.id },
-					sideCars: [
-						{
-							target: "tool_result",
-							source: "pipeline_exit_confirmation",
-							content: "confirm pipeline exit",
-							toolUseId: "pipeline-confirmation-result",
-						},
-					],
-				},
-				ctx,
-			);
-
-			expect((await getPipelineState(narratorId))?.exitConfirmationPending).toBe(false);
-		} finally {
-			await db.delete(narrators).where(eq(narrators.id, narratorId));
 		}
 	});
 
@@ -733,5 +689,37 @@ describe("narrator event handler persistence", () => {
 		expect(attempts).toBe(2);
 		expect(discards).toEqual(["tool-row-atomic-failure"]);
 		expect(ctx.preparedPlanModeToolCalls.size).toBe(0);
+	});
+});
+
+/**
+ * Reasoning translation lands asynchronously, and an attempt can be discarded and
+ * replayed while it is in flight (`attempt_discarded` truncates that attempt's
+ * blocks). Neither locator key is attempt-scoped — a replay reproduces the same
+ * `outputIndex` — so without a check the translation of a thrown-away thought can be
+ * pasted onto the new attempt's reasoning.
+ */
+describe("isSameReasoningBlock — the translation write-back guard", () => {
+	test("accepts the block whose text is exactly what was translated", () => {
+		expect(isSameReasoningBlock({ type: "reasoning", text: "分析中" }, "分析中")).toBe(true);
+	});
+
+	test("rejects a DIFFERENT reasoning at the same coordinates (the replay case)", () => {
+		// Same outputIndex, different thought: the attempt that produced the original
+		// was discarded and replayed.
+		expect(
+			isSameReasoningBlock({ type: "reasoning", text: "另一段推理", outputIndex: 0 }, "分析中"),
+		).toBe(false);
+	});
+
+	test("rejects a non-reasoning block, and a missing one", () => {
+		expect(isSameReasoningBlock({ type: "text", text: "分析中" }, "分析中")).toBe(false);
+		expect(isSameReasoningBlock(undefined, "分析中")).toBe(false);
+		expect(isSameReasoningBlock(null, "分析中")).toBe(false);
+	});
+
+	test("an empty translated text is still matched exactly, not treated as absent", () => {
+		expect(isSameReasoningBlock({ type: "reasoning", text: "" }, "")).toBe(true);
+		expect(isSameReasoningBlock({ type: "reasoning" }, "")).toBe(false);
 	});
 });

@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, projects } from "../db/schema";
+import { chapterEdges, chapters, projects } from "../db/schema";
 import { generateId } from "../lib/id";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
@@ -143,6 +143,70 @@ describe("forking from uncommitted state", () => {
 		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("uncommitted edit\n");
 		expect(existsSync(join(childPath, "added.txt"))).toBe(true);
 		expect(readFileSync(join(childPath, "added.txt"), "utf-8")).toBe("only in the workspace\n");
+	});
+
+	test("commit source excludes the parent's uncommitted changes and records metadata", async () => {
+		const parent = await createProjectWithChapter();
+		writeFileSync(join(parent.worktree, "app.txt"), "uncommitted edit\n");
+		writeFileSync(join(parent.worktree, "added.txt"), "workspace only\n");
+
+		const child = await chapterFork.fork(parent.chapterId, {
+			inheritMode: "fresh",
+			worktreeSource: "commit",
+		});
+		const childPath = child.worktreePath as string;
+		tempDirs.push(childPath);
+
+		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("committed\n");
+		expect(existsSync(join(childPath, "added.txt"))).toBe(false);
+		expect((child.forkPoint as { worktreeSource?: string }).worktreeSource).toBe("commit");
+
+		const edge = await db.query.chapterEdges.findFirst({
+			where: eq(chapterEdges.targetId, child.id),
+		});
+		expect((edge?.metadata as { worktreeSource?: string })?.worktreeSource).toBe("commit");
+	});
+
+	test("historical startCommitSha does not layer the current workspace on top", async () => {
+		const parent = await createProjectWithChapter();
+		const historical = (
+			await safeSpawn({ cmd: ["git", "rev-parse", "HEAD"], cwd: parent.worktree, timeout: 15_000 })
+		).stdout.trim();
+
+		writeFileSync(join(parent.worktree, "app.txt"), "later committed\n");
+		await safeSpawn({ cmd: ["git", "add", "-A"], cwd: parent.worktree, timeout: 15_000 });
+		await safeSpawn({
+			cmd: ["git", "commit", "-m", "later"],
+			cwd: parent.worktree,
+			timeout: 15_000,
+		});
+		writeFileSync(join(parent.worktree, "app.txt"), "current workspace\n");
+
+		const child = await chapterFork.fork(parent.chapterId, {
+			inheritMode: "fresh",
+			worktreeSource: "commit",
+			startCommitSha: historical,
+		});
+		const childPath = child.worktreePath as string;
+		tempDirs.push(childPath);
+
+		expect(readFileSync(join(childPath, "app.txt"), "utf-8")).toBe("committed\n");
+		expect(child.startCommitSha).toBe(historical);
+	});
+
+	test("explicit workspace source rejects a dormant parent", async () => {
+		const parent = await createProjectWithChapter();
+		await db
+			.update(chapters)
+			.set({ status: "dormant", worktreePath: null })
+			.where(eq(chapters.id, parent.chapterId));
+
+		await expect(
+			chapterFork.fork(parent.chapterId, {
+				inheritMode: "fresh",
+				worktreeSource: "workspace",
+			}),
+		).rejects.toThrow("Cannot fork a dormant chapter from workspace state");
 	});
 
 	test("propagates a file the parent deleted without committing", async () => {
@@ -274,5 +338,50 @@ describe("forking from uncommitted state", () => {
 			timeout: 15_000,
 		});
 		expect(status.stdout).toContain("app.txt");
+	});
+});
+
+describe("graph slot allocation under concurrent forks", () => {
+	test("concurrent forks of one parent still get distinct, contiguous crossOffsets", async () => {
+		const parent = await createProjectWithChapter();
+
+		// The slot search is an unguarded read-then-write, so in principle two forks could
+		// pick the same slot. This documents the observed behaviour rather than a guarantee:
+		// six concurrent forks still come out distinct, because each does seconds of
+		// subprocess git work before reaching the query and they stagger past each other.
+		//
+		// Kept as a regression guard for the collision being *worse* than that — a change
+		// that made the git work cheap, or moved the query later, would show up here. It is
+		// deliberately not asserted as proof of mutual exclusion; see the note in
+		// `chapter-fork.ts` explaining why the fix, if needed, is a DB constraint.
+		const forks = await Promise.all(
+			Array.from({ length: 6 }, (_, i) => chapterFork.fork(parent.chapterId, { title: `F${i}` })),
+		);
+		const forkIds = new Set(forks.map((f) => f.id));
+
+		const rows = await db
+			.select({ id: chapters.id, crossOffset: chapters.crossOffset })
+			.from(chapters)
+			.where(eq(chapters.projectId, parent.projectId));
+		const forked = rows.filter((r) => forkIds.has(r.id));
+		expect(forked).toHaveLength(6);
+
+		const offsets = forked.map((r) => r.crossOffset ?? 0);
+		expect(new Set(offsets).size).toBe(6);
+		// Not merely distinct but contiguous from the ruler: the search must still return
+		// the lowest free slot, so a lock that serialized but recomputed wrongly is caught.
+		expect([...offsets].sort((x, y) => x - y)).toEqual([0, 100, 200, 300, 400, 500]);
+	});
+
+	test("an explicit crossOffset is honoured rather than reallocated", async () => {
+		const parent = await createProjectWithChapter();
+		// The client-chosen position must bypass the slot search entirely. Pins that the
+		// shared-insert refactor did not accidentally route it through the search.
+		const child = await chapterFork.fork(parent.chapterId, {
+			title: "Explicit",
+			crossOffset: 500,
+		});
+		const row = await db.query.chapters.findFirst({ where: eq(chapters.id, child.id) });
+		expect(row?.crossOffset).toBe(500);
 	});
 });

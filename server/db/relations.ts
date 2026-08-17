@@ -22,7 +22,6 @@ import {
 	narratorFileSnapshots,
 	narratorMessageRefs,
 	narratorMessages,
-	narratorSidecars,
 	narrators,
 	narratorToolCalls,
 	narratorWhitelistCmds,
@@ -35,6 +34,7 @@ import {
 	oauthGrants,
 	portAllocations,
 	projects,
+	registrationCodes,
 	remoteDevices,
 	reviewConclusions,
 	specFileRevisions,
@@ -42,7 +42,6 @@ import {
 	specNamespaces,
 	specProtectedTasks,
 	terminals,
-	terminalTabs,
 	terminalViewState,
 	userFavoriteDirectories,
 	userPreferences,
@@ -150,7 +149,6 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	messageRefs: many(narratorMessageRefs),
 	messages: many(narratorMessages),
 	toolCalls: many(narratorToolCalls),
-	sideCars: many(narratorSidecars),
 	fileSnapshots: many(narratorFileSnapshots),
 	terminals: many(terminals),
 	commits: many(chapterCommits),
@@ -239,7 +237,6 @@ export const narratorMessagesRelations = relations(narratorMessages, ({ one, man
 	}),
 	messageRefs: many(narratorMessageRefs),
 	toolCalls: many(narratorToolCalls),
-	sideCars: many(narratorSidecars),
 }));
 
 export const narratorMessageRefsRelations = relations(narratorMessageRefs, ({ one }) => ({
@@ -264,17 +261,6 @@ export const narratorToolCallsRelations = relations(narratorToolCalls, ({ one })
 	}),
 }));
 
-export const narratorSidecarsRelations = relations(narratorSidecars, ({ one }) => ({
-	narrator: one(narrators, {
-		fields: [narratorSidecars.narratorId],
-		references: [narrators.id],
-	}),
-	message: one(narratorMessages, {
-		fields: [narratorSidecars.messageId],
-		references: [narratorMessages.id],
-	}),
-}));
-
 export const narratorFileSnapshotsRelations = relations(narratorFileSnapshots, ({ one }) => ({
 	narrator: one(narrators, {
 		fields: [narratorFileSnapshots.narratorId],
@@ -294,11 +280,6 @@ export const remoteDevicesRelations = relations(remoteDevices, ({ one }) => ({
 export const terminalsRelations = relations(terminals, ({ one }) => ({
 	chapter: one(chapters, { fields: [terminals.chapterId], references: [chapters.id] }),
 	narrator: one(narrators, { fields: [terminals.narratorId], references: [narrators.id] }),
-}));
-
-export const terminalTabsRelations = relations(terminalTabs, ({ one }) => ({
-	chapter: one(chapters, { fields: [terminalTabs.chapterId], references: [chapters.id] }),
-	narrator: one(narrators, { fields: [terminalTabs.narratorId], references: [narrators.id] }),
 }));
 
 export const terminalViewStateRelations = relations(terminalViewState, ({ one }) => ({
@@ -344,6 +325,21 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	oauthAccessTokens: many(oauthAccessTokens, { relationName: "oauthAccessTokenUser" }),
 	oauthAccessTokensRevoked: many(oauthAccessTokens, {
 		relationName: "oauthAccessTokenRevoker",
+	}),
+	registrationCodesCreated: many(registrationCodes, { relationName: "registrationCodeCreator" }),
+	registrationCodesUsed: many(registrationCodes, { relationName: "registrationCodeRedeemer" }),
+}));
+
+export const registrationCodesRelations = relations(registrationCodes, ({ one }) => ({
+	createdBy: one(users, {
+		fields: [registrationCodes.createdByUserId],
+		references: [users.id],
+		relationName: "registrationCodeCreator",
+	}),
+	usedBy: one(users, {
+		fields: [registrationCodes.usedByUserId],
+		references: [users.id],
+		relationName: "registrationCodeRedeemer",
 	}),
 }));
 

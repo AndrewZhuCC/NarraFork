@@ -2,6 +2,8 @@
 
 export {
 	adminAuthConfigSchema,
+	adminCreateRegistrationCodeSchema,
+	adminCreateUserSchema,
 	adminUpdateSettingsSchema,
 	adminUpdateUserSchema,
 	loginSchema,
@@ -21,11 +23,8 @@ export {
 } from "./auth";
 export {
 	batchCleanupSchema,
-	batchForkSchema,
 	batchMergeSchema,
-	cherryPickSchema,
 	containerConfigSchema,
-	createChapterEdgeSchema,
 	createChapterSchema,
 	createReviewSchema,
 	forkChapterSchema,
@@ -93,6 +92,7 @@ export {
 	knowledgeGraphQuerySchema,
 	knowledgeSearchQuerySchema,
 	listDraftSubmissionsQuerySchema,
+	listKnowledgeAclEventsQuerySchema,
 	listKnowledgeLinksQuerySchema,
 	listPersonalEntriesQuerySchema,
 	rebaseKnowledgeDraftQuerySchema,
@@ -123,6 +123,7 @@ export {
 	askInPassingStartSchema,
 	batchDeleteBlocksSchema,
 	browserInteractSchema,
+	codexBrowserCallbackSchema,
 	codexFingerprintSchema,
 	codexTierOrderSchema,
 	codexUseImageGenerationSchema,
@@ -131,6 +132,7 @@ export {
 	createBlacklistCmdSchema,
 	createBlacklistDirSchema,
 	createNarratorSchema,
+	createSetupAssistantSchema,
 	createWhitelistCmdSchema,
 	createWhitelistDirSchema,
 	editAndRegenerateJsonSchema,
@@ -199,10 +201,7 @@ export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
 export {
 	createTerminalSchema,
-	createTerminalTabSchema,
-	reorderTerminalTabsSchema,
 	updateTerminalGraphStateSchema,
-	updateTerminalTabSchema,
 	updateTerminalViewStateSchema,
 } from "./terminals";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";

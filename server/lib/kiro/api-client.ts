@@ -23,7 +23,13 @@ import {
 	isMonthlyRequestLimit,
 	isSuspiciousThrottle,
 } from "./quota-check";
-import { type CallContext, KiroApiError, type KiroChatRequest, KiroQuotaError } from "./types";
+import {
+	type CallContext,
+	type DisabledReason,
+	KiroApiError,
+	type KiroChatRequest,
+	KiroQuotaError,
+} from "./types";
 
 const BASE_DELAY_MS = 200;
 const MAX_DELAY_MS = 2000;
@@ -34,16 +40,55 @@ export interface ChatResponse {
 	credentialId: string;
 	/** Release the held streaming slot. Must be called when response body consumption ends. */
 	release: () => void;
+	/**
+	 * Attribute a failure discovered while CONSUMING the stream to the credential
+	 * that served it.
+	 *
+	 * Kiro speaks AWS event-stream, so an upstream verdict can arrive as an
+	 * `exception` frame inside an HTTP 200 body — after `sendChatRequest` already
+	 * returned and already called `reportSuccess`. Without this hook the retry loop
+	 * below is unreachable from the stream reader, which is exactly how a suspended
+	 * credential kept being reselected on every subsequent request.
+	 *
+	 * Returns whether any other credential remains available.
+	 */
+	reportStreamFailure: (reason?: DisabledReason) => boolean;
+	/**
+	 * Re-dispatch the SAME logical request on a different credential.
+	 *
+	 * Reuses this call's `failedCredentialIds` set, so the credential that just
+	 * failed mid-stream (and any earlier casualty) is excluded by
+	 * `acquireContext`. Bounded by the same `maxRetries` budget as the initial
+	 * dispatch, so a fleet where every credential is suspended terminates instead
+	 * of replaying forever.
+	 *
+	 * Only safe while the failed stream produced no client-visible output — the
+	 * caller owns that judgement.
+	 */
+	retryWithNextCredential: () => Promise<ChatResponse>;
 }
 
 export class KiroApiClient {
 	constructor(private tokenManager: MultiTokenManager) {}
 
-	/** Send a chat request, return raw Response + credential ID for streaming. */
-	async sendChatRequest(request: KiroChatRequest, signal?: AbortSignal): Promise<ChatResponse> {
+	/**
+	 * Send a chat request, return raw Response + credential ID for streaming.
+	 *
+	 * `failedCredentialIds` is threaded through recursive stream-failure replays
+	 * (see {@link ChatResponse.retryWithNextCredential}) so one logical call never
+	 * reuses a credential that already failed for it, no matter which layer
+	 * discovered the failure. `replaysLeft` bounds that recursion.
+	 */
+	async sendChatRequest(
+		request: KiroChatRequest,
+		signal?: AbortSignal,
+		carriedFailedCredentialIds?: Set<string>,
+		replaysLeft?: number,
+	): Promise<ChatResponse> {
 		const model = request.conversationState.currentMessage.userInputMessage.modelId;
 		const maxRetries = this.tokenManager.maxRetries;
-		const failedCredentialIds = new Set<string>();
+		const failedCredentialIds = carriedFailedCredentialIds ?? new Set<string>();
+		const remainingReplays = replaysLeft ?? maxRetries;
 		let lastError: Error | null = null;
 		// One id for this whole logical call, minted before the retry loop and reused by
 		// every attempt — that correlation is the header's entire purpose, and it is what
@@ -121,10 +166,28 @@ export class KiroApiClient {
 			if (res.ok) {
 				concurrencySuccess(ctx.id);
 				this.tokenManager.reportSuccess(ctx.id);
+				const failedId = ctx.id;
 				return {
 					response: res,
-					credentialId: ctx.id,
+					credentialId: failedId,
 					release: releaseHeld,
+					reportStreamFailure: (reason) => {
+						// The stream reader found the real verdict after the HTTP layer had
+						// already accepted this credential. Exclude it from this call and
+						// mark it so later calls skip it too.
+						failedCredentialIds.add(failedId);
+						return this.tokenManager.reportFailure(failedId, reason);
+					},
+					retryWithNextCredential: () => {
+						if (remainingReplays <= 0) {
+							throw new KiroApiError(
+								"STREAM_REPLAY_EXHAUSTED",
+								"Exhausted credential replays after mid-stream failures",
+							);
+						}
+						failedCredentialIds.add(failedId);
+						return this.sendChatRequest(request, signal, failedCredentialIds, remainingReplays - 1);
+					},
 				};
 			}
 
@@ -157,6 +220,18 @@ export class KiroApiClient {
 					lastError = new KiroApiError("QUOTA_EXHAUSTED", resBody, 400);
 					continue;
 				}
+				// A suspension can arrive as 400 rather than 401/403. Without this it fell
+				// into the generic BAD_REQUEST throw below, which neither marks the
+				// credential nor fails over, so every later request picked the same
+				// suspended account again.
+				if (isAccountSuspended(resBody)) {
+					releaseHeld();
+					failedCredentialIds.add(ctx.id);
+					const hasAvailable = this.tokenManager.reportFailure(ctx.id, "account_suspended");
+					if (!hasAvailable) throw new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+					lastError = new KiroApiError("ACCOUNT_SUSPENDED", resBody, 400);
+					continue;
+				}
 				releaseHeld();
 				if (isContextLengthExceeded(resBody)) {
 					throw new KiroApiError("CONTEXT_LENGTH_EXCEEDED", resBody, 400);
@@ -178,14 +253,16 @@ export class KiroApiClient {
 			if (res.status === 401 || res.status === 403) {
 				releaseHeld();
 				failedCredentialIds.add(ctx.id);
+				const suspended = isAccountSuspended(resBody);
 				const hasAvailable = this.tokenManager.reportFailure(
 					ctx.id,
-					isAccountSuspended(resBody) ? "account_suspended" : undefined,
+					suspended ? "account_suspended" : undefined,
 				);
+				const code = suspended ? "ACCOUNT_SUSPENDED" : "AUTH_FAILED";
 				if (!hasAvailable) {
-					throw new KiroApiError("AUTH_FAILED", resBody, res.status);
+					throw new KiroApiError(code, resBody, res.status);
 				}
-				lastError = new KiroApiError("AUTH_FAILED", resBody, res.status);
+				lastError = new KiroApiError(code, resBody, res.status);
 				continue;
 			}
 

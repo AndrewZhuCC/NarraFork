@@ -165,6 +165,7 @@ async function searchSubagent(
 		model: channel.model,
 		reasoningEffort: channel.reasoningEffort,
 		background: false,
+		userId: request.userId ?? null,
 	});
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text };
 }

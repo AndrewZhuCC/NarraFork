@@ -15,7 +15,8 @@
 			"chatGroup": "Group chat",
 			"gateway": "IM gateway",
 			"oauth": "External app",
-			"recovery": "Session recovery"
+			"recovery": "Session recovery",
+			"planReflection": "Plan reflection"
 		}
 	},
 	"narrator": "Narrator",
@@ -236,8 +237,7 @@
 	"loadOlderCalls": "Load earlier tool calls",
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
-	"switchToPixiRenderer": "Switch to experimental PixiJS renderer (read-only)",
-	"switchToReactRenderer": "Switch to React renderer",
+
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
@@ -425,6 +425,9 @@
 	"cancelBuffer": "Remove",
 	"clearAllQueued": "Clear all queued",
 	"queuedCount": "{{count}} queued",
+	"queuedMoreImages": "+{{count}}",
+	"queuedEditEmptyHint": "Add text or an attachment",
+	"editQueuedFailed": "Failed to update queued message",
 	"expandQueue": "Expand",
 	"collapseQueue": "Collapse",
 	"specContinuation": "Task",
@@ -742,6 +745,7 @@
 	"unmergeConfirmDesc": "This will reset the target branch to before the merge of \"{{branch}}\". The source branch will be restored to active. This cannot be undone.",
 	"unmergeSuccess": "Unmerge successful",
 	"unmergeSuccessDesc": "The merge has been reverted and the branch is active again.",
+	"unmergeWarning": "Unmerged with warnings",
 	"unmergeFailed": "Unmerge failed",
 	"showOriginal": "Original",
 	"showTranslated": "Translated",
@@ -775,6 +779,8 @@
 	"browser.title": "Browser",
 	"browser.closeSession": "Close session",
 	"browser.refreshScreenshot": "Refresh",
+	"browser.expandPreview": "Expand preview",
+	"browser.closeExpandedPreview": "Close expanded preview",
 	"browser.lastActive": "active {{time}} ago",
 	"browser.expiresIn": "closes in {{time}}",
 	"browser.autoClose": "Auto-close",
@@ -986,6 +992,8 @@
 	"details.cmdBlacklist": "Command blacklist",
 	"details.emptyRules": "No rules",
 	"details.filterPlaceholder": "Filter settings and details",
+	"details.avatarUpload": "Upload avatar",
+	"details.avatarReset": "Reset to generated glyph",
 	"details.filterNoResults": "Nothing matches \"{{query}}\".",
 	"details.sessionAdvanced": "Advanced ({{count}} at default)",
 	"details.export": "Export transcript",
@@ -1070,14 +1078,13 @@
 		"reattachPartial": "Opening a detached subagent session will not re-block the original parent tool call in this backend runtime."
 	},
 	"sidecar": {
-		"titleWithCount": "System injection ×{{count}}",
 		"unknownSource": "unknown",
-		"copy": "Copy sidecar content",
+		"copy": "Copy injected content",
 		"copied": "Copied",
-		"empty": "No content",
-		"truncated": "[Preview truncated to keep the UI responsive. Use copy if you need the full content.]",
+		"truncated": "[Preview truncated to keep the UI responsive. Use copy for the full content.]",
 		"sources": {
 			"silent_progress": "Progress reminder",
+			"living_work_spec": "Task digest",
 			"todo_reminder": "TODO reminder",
 			"relaxed_plan": "Plan mode reminder",
 			"knowledge_base_hint": "Knowledge base hint",
@@ -1087,7 +1094,43 @@
 			"buffered_user": "Buffered user message",
 			"group_message": "Group message",
 			"subagent_message": "Subagent message",
-			"spec_update": "Outline update"
+			"spec_update": "Outline update",
+			"behavior_fence": "Behavior fence",
+			"pipeline_exit_confirmation": "Pipeline check",
+			"spec_continuation": "Auto-continuation",
+			"spec_blocked_continuation": "Blocked continuation",
+			"spec_goal_added": "Goal added",
+			"spec_fork_carryover": "Outline carried over",
+			"spec_context_cleared": "Context cleared"
+		},
+		"cadence": {
+			"everyNTools": "every {{n}} tool calls"
+		},
+		"showAll": "Show all",
+		"attachedCount": "{{count}} system injection(s) attached",
+		"body": {
+			"noticeSilentProgress": "{{count}} tool calls without a visible reply",
+			"noticeRelaxedPlan": "Still planning — do not implement yet",
+			"noticePipelineExit": "Pipeline still active — confirm it is still needed",
+			"tasksCurrent": "Dynamic Spec — {{n}} open task(s)",
+			"tasksEmptyNever": "Dynamic Spec — no tasks created yet",
+			"tasksEmptyDone": "Dynamic Spec — all tasks done, time to reorganize",
+			"tasksTooMany": "Dynamic Spec — {{n}} tasks, over the threshold",
+			"taskRoleDoing": "doing",
+			"taskRoleNext": "next",
+			"taskRoleTodo": "todo",
+			"taskRoleBlocked": "blocked",
+			"taskProtected": "protected",
+			"knowledgeHeading": "{{n}} relevant knowledge entries",
+			"tasksDoneAgentHeading": "{{n}} background agent(s) finished",
+			"tasksDoneBashHeading": "{{n}} background command(s) finished",
+			"tasksDoneTruncated": "result truncated",
+			"messagesHeading": "{{n}} message(s)",
+			"messageFromUnknown": "unknown sender",
+			"messageBroadcast": "broadcast",
+			"specUpdatesHeading": "{{n}} spec file(s) you updated",
+			"proseFenceHeading": "Behavior fence",
+			"empty": "(empty)"
 		}
 	},
 	"executionTarget": "Execution target",
@@ -1097,6 +1140,12 @@
 	"executionTargetDevice": "Device: {{device}}",
 	"executionTargetCwd": "Working directory: {{cwd}}",
 	"executionTargetPath": "Resolved path: {{path}}",
+	"contentInspector": {
+		"title": "What the model saw",
+		"inspect": "Inspect what the model saw",
+		"copy": "Copy",
+		"copied": "Copied"
+	},
 	"toolCallInspector": {
 		"title": "Tool Call Inspector",
 		"inspect": "Inspect tool call",

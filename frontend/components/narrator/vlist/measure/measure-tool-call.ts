@@ -70,7 +70,6 @@ import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import type { DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ReflectionNoticeData } from "@shared/pretext-layout/reflection";
-import type { SidecarSpecData } from "@shared/pretext-layout/segment-adapter";
 import { MARKDOWN_CONSTANTS } from "../parse-markdown";
 import {
 	accumulateFrame,
@@ -119,7 +118,6 @@ import {
 	type MeasuredReflectionNotice,
 	measureReflectionNotice,
 } from "./measure-reflection-notice";
-import { type MeasuredSidecar, measureSidecar } from "./measure-sidecar";
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -722,13 +720,6 @@ export interface ToolCallData {
 	 * reflection row's height is final on its first paint.
 	 */
 	reflection?: ReflectionNoticeData | null;
-	/**
-	 * Tool-result sidecars (system injections the model saw in this tool's output).
-	 * Each renders as a measured mini-card between the header and the detail, and —
-	 * mirroring the chunked ToolCallCard, whose SideCarNotice sits OUTSIDE the
-	 * collapse — shows even on a folded card. Null/absent → no sidecar region.
-	 */
-	sidecars?: SidecarSpecData[] | null;
 	/** Rendered inside a run: no border, a trailing 1px divider unless last. */
 	inRun?: boolean;
 	/** In-run only: whether this is the last card (drops the divider). */
@@ -820,12 +811,13 @@ export interface MeasureToolCallOpts {
 	 */
 	hasPendingPermission?: boolean;
 	/**
-	 * Indices of the tool-result sidecar mini-cards currently expanded. A plain
-	 * number[] (not a resolver) so the measure cache's digestOpts folds it into
-	 * the cache key — an expanded sidecar measures a taller body, so the fold
-	 * state participates in keying exactly like a trace's `expandedIndices`.
+	 * True when the card is the pinned latest spec://tasks.json call (injected by
+	 * the adapter from the shell's resolver). Forces the card expanded at every
+	 * LOD — the task board is the narrator's live working state, which a reader at
+	 * a low LOD still wants on screen. The boolean folds into the measure cache
+	 * key via digestOpts, so the two geometries never share an entry.
 	 */
-	sidecarExpanded?: readonly number[];
+	forceExpanded?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -985,14 +977,6 @@ export interface MeasuredToolCall extends MeasuredElement {
 	reflection: MeasuredReflectionNotice | null;
 	/** Reflection region top within the card content box. */
 	reflectionTop: number;
-	/**
-	 * Measured tool-result sidecar mini-cards (one per injection), else null. They
-	 * sit between the header and the detail region and — like the chunked card —
-	 * are visible whether or not the card body is expanded.
-	 */
-	sidecars: MeasuredSidecar[] | null;
-	/** Top of the first sidecar within the card content box (== headerHeight). */
-	sidecarsTop: number;
 	/** Passthrough render metadata. */
 	category: ToolCategory;
 	status: ToolCallStatus;
@@ -1090,6 +1074,9 @@ export function isRunningStatus(status: ToolCallStatus): boolean {
  * Derive the default expand state (mirrors ToolCallCard defaultOpen :5483). Used
  * only when `opts.opened` is undefined. Truncation nuances are omitted — this is
  * a best-effort default the caller can override.
+ *
+ * `pendingPermission` here is the merged force-expand flag: a live permission OR
+ * the pinned latest-tasks card (`opts.forceExpanded`) both arrive through it.
  */
 export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolean): boolean {
 	if (pendingPermission) return true;
@@ -2107,7 +2094,7 @@ export function measureToolCall(
 	// a slot). Distinct from `pending` (the zero-DOM measure copy); either one
 	// forces the card expanded so the permission area shows.
 	const hasPendingPermission = opts.hasPendingPermission === true;
-	const forceExpanded = hasPending || hasPendingPermission;
+	const forceExpanded = hasPending || hasPendingPermission || opts.forceExpanded === true;
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 
@@ -2137,11 +2124,13 @@ export function measureToolCall(
 	const frame = accumulateFrame(blocks, innerWidth, RESOLVER);
 
 	// ── Collapsed height ───────────────────────────────────────────────────────
-	// The sidecar band is part of the COLLAPSED card too (the chunked notice is
-	// outside the collapse), so a folded card with sidecars is taller than one
-	// without. The band's height is added below once it is measured; here we only
-	// reserve the header + chrome.
-	const baseCollapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
+	// A folded card measures the SAME whether or not it carries injections. The
+	// chunked path put its notice outside the collapse, and the vlist copied that
+	// for parity — but the reasoning does not survive the footnote redesign: a
+	// side-car is appended to the END of the tool's OUTPUT text, so on a folded card
+	// (which shows no output at all) it is a footnote with nothing to be a footnote
+	// to. The count marker in the header row says it exists; that costs no height.
+	const collapsedHeight = chromeY + HEADER_ROW_HEIGHT + dividerExtra;
 
 	// ── Expanded regions ───────────────────────────────────────────────────────
 	let detail: MeasuredToolDetail | null = null;
@@ -2149,30 +2138,9 @@ export function measureToolCall(
 	let reflection: MeasuredReflectionNotice | null = null;
 	let innerContentH = HEADER_ROW_HEIGHT;
 
-	// ── Sidecar region (tool_result injections) ────────────────────────────────
-	// Mirrors the chunked ToolCallCard, whose SideCarNotice sits OUTSIDE the
-	// collapse: the mini-cards show whether or not the card body is expanded, so
-	// their height is added UNCONDITIONALLY (not gated on effectiveOpened). Each
-	// card keeps its own fold state (the vlist redesign folds per-record).
-	let sidecars: MeasuredSidecar[] | null = null;
-	const sidecarsTop = HEADER_ROW_HEIGHT;
-	let sidecarsHeight = 0;
-	if (data.sidecars && data.sidecars.length > 0) {
-		const expandedSet = new Set(opts.sidecarExpanded ?? []);
-		sidecars = data.sidecars.map((sc, index) =>
-			measureSidecar(sc, innerWidth, lod, { expanded: expandedSet.has(index) }),
-		);
-		sidecarsHeight = sidecars.reduce((sum, sc) => sum + sc.height, 0);
-		innerContentH += sidecarsHeight;
-	}
-	// The expanded regions begin BELOW the sidecar band.
-	const expandedRegionTop = HEADER_ROW_HEIGHT + sidecarsHeight;
-	const detailTop = expandedRegionTop;
-	let permissionTop = expandedRegionTop;
-	let reflectionTop = expandedRegionTop;
-	// Collapsed card = header + chrome + the sidecar band (chunk parity: the
-	// notice is outside the collapse). + the divider.
-	const collapsedHeight = baseCollapsedHeight + sidecarsHeight;
+	const detailTop = HEADER_ROW_HEIGHT;
+	let permissionTop = HEADER_ROW_HEIGHT;
+	let reflectionTop = HEADER_ROW_HEIGHT;
 
 	// A still-truncated payload costs NO geometry: a prefix body already reserves
 	// its full cap (see `cappedBodyHeight`), and the rest is fetched when the reader
@@ -2182,9 +2150,10 @@ export function measureToolCall(
 		if (data.detail) {
 			detail = measureToolDetail(data.detail, innerWidth, opts.viewportHeight);
 			innerContentH += detail.height;
-			permissionTop = expandedRegionTop + detail.height;
-			reflectionTop = permissionTop;
 		}
+		const belowDetail = HEADER_ROW_HEIGHT + (detail?.height ?? 0);
+		permissionTop = belowDetail;
+		reflectionTop = belowDetail;
 		// A reflection notice REPLACES the permission form, mirroring the chunked
 		// precedence (ToolCallCard.tsx:5419). Streaming cards show neither.
 		if (data.reflection && !isStreaming) {
@@ -2226,8 +2195,6 @@ export function measureToolCall(
 		permissionTop,
 		reflection,
 		reflectionTop,
-		sidecars,
-		sidecarsTop,
 		category: data.category,
 		status: data.status,
 		toolName: data.toolName,

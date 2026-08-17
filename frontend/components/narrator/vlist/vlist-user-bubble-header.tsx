@@ -18,11 +18,13 @@
 
 import {
 	MessageOriginBadge,
+	OriginAvatar,
 	resolveUserBubbleName,
 } from "@frontend/components/narrator/MessageOriginBadge";
 import { UserAvatar } from "@frontend/components/UserAvatar";
 import { formatLocaleDateTime, formatLocaleTime } from "@frontend/lib/intl-format";
 import { Group, Text } from "@mantine/core";
+import { parseOriginLabel } from "@shared/message-origin";
 import { useTranslation } from "react-i18next";
 import type { VListElementKind } from "./registry";
 import type { RenderExtra } from "./render-registry";
@@ -73,7 +75,7 @@ export function UserBubbleHeader({
 	const { t } = useTranslation("narrator");
 	return (
 		<Group gap={6} wrap="nowrap" h="100%" align="center">
-			{creator && (
+			{creator ? (
 				<UserAvatar
 					username={creator.username}
 					avatarColor={creator.avatarColor}
@@ -82,6 +84,8 @@ export function UserBubbleHeader({
 					size={20}
 					showTooltip={false}
 				/>
+			) : (
+				<OriginAvatar originLabel={originLabel} size={20} />
 			)}
 			<Text size="xs" fw={600} c="indigo" style={{ whiteSpace: "nowrap" }}>
 				{resolveUserBubbleName({ creator, origin, originLabel }, t)}
@@ -139,5 +143,59 @@ export function injectUserBubbleHeader(kind: VListElementKind, extra: RenderExtr
 			origin={(extra.origin as string | null | undefined) ?? null}
 			originLabel={(extra.originLabel as string | null | undefined) ?? null}
 		/>
+	);
+}
+
+/**
+ * Is this bubble's author the person reading it?
+ *
+ * NarraFork is a shared deployment: one narrator can be driven by several people, so
+ * `role: "user"` means "a human typed this", NOT "you typed this". The right-hand
+ * indigo bubble is a claim of authorship, and painting a teammate's turn there tells
+ * the reader they wrote something they did not.
+ *
+ * Two deliberate fallbacks to `true`, both preserving the historical rendering rather
+ * than guessing:
+ *
+ *   - viewer unknown (`useCurrentUser()` still loading, or no auth in a test): every
+ *     bubble would otherwise flip left for a frame and then flip back.
+ *   - author unknown (`creator` null / no id): pre-`created_by` rows. A row that a
+ *     non-human authored never reaches here — the adapter routes `origin: system` /
+ *     `assistant` to `origin_notice` before the bubble branch.
+ */
+export function resolveBubbleIsSelf(
+	creator: BubbleCreator | null | undefined,
+	currentUserId: string | null | undefined,
+	originLabel?: string | null,
+): boolean {
+	// A turn authored by the plan reflection (a plan auto-approved without a human)
+	// never belongs to the reader, so it always paints on the left even though it
+	// carries no `creator` (which would otherwise fall through to `true`).
+	if (!creator?.id && parseOriginLabel(originLabel)?.source === "planReflection") return false;
+	if (!currentUserId) return true;
+	const authorId = creator?.id;
+	if (!authorId) return true;
+	return authorId === currentUserId;
+}
+
+/**
+ * Attach the authorship flag that decides a bubble's side and tint.
+ *
+ * Lives in the integration layer for the same reason as the header node, plus one
+ * specific to this flag: both sides measure IDENTICALLY, so folding viewer identity
+ * into the adapter's data would fork the measure cache per user for a purely cosmetic
+ * difference. `render-registry`'s `resolveRenderExtra` only forwards `creator`; the
+ * comparison happens here.
+ */
+export function injectUserBubbleIsSelf(
+	kind: VListElementKind,
+	extra: RenderExtra,
+	currentUserId: string | null | undefined,
+): void {
+	if (kind !== "message-bubble" || extra.role !== "user") return;
+	extra.isSelf = resolveBubbleIsSelf(
+		(extra.creator as BubbleCreator | null | undefined) ?? null,
+		currentUserId,
+		(extra.originLabel as string | null | undefined) ?? null,
 	);
 }

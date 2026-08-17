@@ -88,6 +88,15 @@ export type StatusAccent = Pick<StatusEntry, "color" | "accentShade">;
 // Chapter Status
 // ---------------------------------------------------------------------------
 
+/**
+ * `frozen` is kept on the display side only.
+ *
+ * The server stopped producing it (see the note on `chapters.status` in
+ * `server/db/schema.ts`), but this map is what renders a status badge, and a
+ * missing entry would throw on any row that still carries the old value — from a
+ * project database written by an older build, for instance. Rendering it costs
+ * one line; crashing the graph on unexpected data costs a lot more.
+ */
 export type ChapterStatus = "active" | "dormant" | "merged" | "abandoned" | "frozen";
 
 const chapterStatusMap: StatusMap<ChapterStatus> = {
@@ -329,7 +338,28 @@ const projectStatusMap: StatusMap<ProjectStatus> = {
 // Edge Type
 // ---------------------------------------------------------------------------
 
+/**
+ * Every edge type that can REACH the canvas, which is the full `chapter_edges.type` enum —
+ * including the two nothing creates any more.
+ *
+ * `dependency` edges were user-drawn and the feature was removed; `cherry_pick` edges were
+ * never created by anything. Both stay here because rows of either kind may still sit in an
+ * existing database, and a graph that cannot colour a row it loaded would render a default
+ * grey line instead of a labelled one.
+ *
+ * ⚠️ Wider than {@link QueryableEdgeType}: this is a DISPLAY vocabulary, not a request one.
+ */
 export type EdgeType = "fork" | "merge" | "dependency" | "cherry_pick" | "review";
+
+/**
+ * The subset `GET /api/chapter-edges?type=` accepts.
+ *
+ * The route validates against exactly these three (the types operations still produce) and
+ * answers anything else with a 400 — so passing a display-only type from {@link EdgeType} to
+ * a query is a request error, not an empty result. Kept as its own type so that mistake is a
+ * compile error at the call site rather than a runtime 400.
+ */
+export type QueryableEdgeType = "fork" | "merge" | "review";
 
 const edgeTypeMap: StatusMap<EdgeType> = {
 	fork: { color: "#4c6ef5", icon: "", i18nKey: "status.edgeFork" },
@@ -348,6 +378,8 @@ export type GitFileStatus =
 	| "A"
 	| "D"
 	| "R"
+	| "C"
+	| "U"
 	| "??"
 	| "added"
 	| "deleted"
@@ -359,6 +391,10 @@ const gitFileStatusMap: StatusMap<GitFileStatus> = {
 	A: { color: "green", icon: "+", i18nKey: "status.gitAdded" },
 	D: { color: "red", icon: "-", i18nKey: "status.gitDeleted" },
 	R: { color: "blue", icon: "→", i18nKey: "status.gitRenamed" },
+	C: { color: "blue", icon: "⧉", i18nKey: "status.gitCopied" },
+	// A merge conflict needs its own colour: it is the one status that blocks a
+	// commit, so it must not read as an ordinary edit.
+	U: { color: "orange", icon: "!", i18nKey: "status.gitUnmerged" },
 	"??": { color: "gray", icon: "?", i18nKey: "status.gitUntracked" },
 	added: { color: "green", icon: "+", i18nKey: "status.gitAdded" },
 	deleted: { color: "red", icon: "-", i18nKey: "status.gitDeleted" },

@@ -22,6 +22,7 @@ import {
 	IconDatabase,
 	IconGitBranch,
 	IconInfoCircle,
+	IconLock,
 	IconPhoto,
 	IconRefresh,
 	IconShare,
@@ -108,6 +109,7 @@ const CATEGORY_ICONS: Record<string, React.ReactNode> = {
 	shares: <IconShare size={18} />,
 	worktrees: <IconGitBranch size={18} />,
 	treeSnapshots: <IconCamera size={18} />,
+	dormantIgnored: <IconLock size={18} />,
 	containers: <IconBox size={18} />,
 };
 
@@ -117,6 +119,7 @@ const CATEGORY_COLORS: Record<string, string> = {
 	shares: "teal",
 	worktrees: "orange",
 	treeSnapshots: "violet",
+	dormantIgnored: "yellow",
 	containers: "cyan",
 };
 /**
@@ -130,6 +133,7 @@ const DISPLAYED_CATEGORY_KEYS = [
 	"shares",
 	"worktrees",
 	"treeSnapshots",
+	"dormantIgnored",
 	"containers",
 ] as const;
 
@@ -144,6 +148,7 @@ const DATABASE_TARGET_DEFAULT_DAYS: Record<
 > = {
 	staleSessions: 90,
 	apiRequestDumps: 30,
+	toolCallPayloads: 180,
 };
 
 const DATABASE_TARGET_DAY_OPTIONS: Record<
@@ -152,6 +157,9 @@ const DATABASE_TARGET_DAY_OPTIONS: Record<
 > = {
 	staleSessions: ["30", "90", "180", "365"],
 	apiRequestDumps: ["7", "30", "90", "180"],
+	// No option below 90 days: these payloads are what the execution log shows, and a
+	// short window would erase the recent history an administrator actually consults.
+	toolCallPayloads: ["90", "180", "365", "730"],
 };
 
 interface CleanupTarget {
@@ -178,12 +186,11 @@ export function StorageSection() {
 		vacuumSupported,
 		vacuumReason,
 		healthState: storageHealthState,
+		healthReady: storageHealthReady,
 		healthError: storageHealthError,
 		healthFetching: storageHealthFetching,
 		refetchHealth,
 	} = useStorageCapability();
-	const storageHealthReady =
-		storageHealthState === "legacy" || storageHealthState === "capabilities";
 	const storageHealthLoadingMessage = t("storageHealthLoading", {
 		defaultValue: "Loading storage capabilities…",
 	});
@@ -249,6 +256,11 @@ export function StorageSection() {
 				},
 				apiRequestDumps: {
 					...rawDatabaseCleanupCapabilities.apiRequestDumps,
+					supported: false,
+					reason: storageHealthDisabledReason,
+				},
+				toolCallPayloads: {
+					...rawDatabaseCleanupCapabilities.toolCallPayloads,
 					supported: false,
 					reason: storageHealthDisabledReason,
 				},
@@ -514,6 +526,8 @@ export function StorageSection() {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.staleSessions);
 		} else if (target === "apiRequestDumps") {
 			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.apiRequestDumps);
+		} else if (target === "toolCallPayloads") {
+			setDatabaseOlderThanDays(DATABASE_TARGET_DEFAULT_DAYS.toolCallPayloads);
 		}
 	};
 
@@ -603,6 +617,17 @@ export function StorageSection() {
 				return t("storageWorktreeCount", { count: Number(d.worktreeCount ?? 0) });
 			case "treeSnapshots":
 				return t("storageTreeSnapshotRepoCount", { count: Number(d.repoCount ?? 0) });
+			case "dormantIgnored": {
+				const archives = t("storageIgnoredArchiveCount", {
+					count: Number(d.archiveCount ?? 0),
+				});
+				const orphans = Number(d.orphanCount ?? 0);
+				// Orphans are called out because they are the actionable part: an archive
+				// belonging to a live chapter is waiting to be restored, one whose chapter is
+				// gone is untracked secrets nothing will ever read.
+				if (orphans <= 0) return archives;
+				return `${archives} · ${t("storageIgnoredArchiveOrphans", { count: orphans })}`;
+			}
 			case "containers":
 				if (d.available === false) return t("storageContainersUnavailable");
 				return null;
@@ -669,6 +694,13 @@ export function StorageSection() {
 					summary: databaseDetails.cleanupCandidates.apiRequestDumps,
 					description: t("storageDatabaseApiRequestDumpsDesc", {
 						days: databaseDetails.cleanupCandidates.apiRequestDumps.retentionDays ?? 30,
+					}),
+				},
+				{
+					target: "toolCallPayloads" as const,
+					summary: databaseDetails.cleanupCandidates.toolCallPayloads,
+					description: t("storageDatabaseToolCallPayloadsDesc", {
+						days: databaseDetails.cleanupCandidates.toolCallPayloads.retentionDays ?? 180,
 					}),
 				},
 			]
@@ -773,7 +805,7 @@ export function StorageSection() {
 					</Text>
 				)}
 
-				{storageHealthState === "capabilities" && !scanSupported && (
+				{storageHealthReady && !scanSupported && (
 					<Alert color="yellow" variant="light" title={t("storageScanUnsupportedTitle")}>
 						{scanDisabledReason}
 					</Alert>
@@ -1017,9 +1049,13 @@ export function StorageSection() {
 																				? t("storageDatabaseSummaryRequests", {
 																						count: row.summary.count,
 																					})
-																				: t("storageDatabaseSummarySessions", {
-																						count: row.summary.count,
-																					})}
+																				: row.target === "toolCallPayloads"
+																					? t("storageDatabaseSummaryToolCalls", {
+																							count: row.summary.count,
+																						})
+																					: t("storageDatabaseSummarySessions", {
+																							count: row.summary.count,
+																						})}
 																		</Text>
 																		{row.summary.oldestAt && (
 																			<Text size="xs" c="dimmed">
@@ -1166,6 +1202,12 @@ export function StorageSection() {
 											count: databasePreview.counts.dumpsCleared,
 										})}
 									</Text>
+								) : databasePreview.target === "toolCallPayloads" ? (
+									<Text size="sm" c="dimmed">
+										{t("storageDatabaseCountsToolCallPayloads", {
+											count: databasePreview.counts.toolCalls,
+										})}
+									</Text>
 								) : (
 									<>
 										<Text size="sm" c="dimmed">
@@ -1211,7 +1253,9 @@ export function StorageSection() {
 									<Text fw={500} size="sm">
 										{databasePreview.target === "apiRequestDumps"
 											? t("storageDatabaseSampleRequests")
-											: t("storageDatabaseSampleSessions")}
+											: databasePreview.target === "toolCallPayloads"
+												? t("storageDatabaseSampleToolCalls")
+												: t("storageDatabaseSampleSessions")}
 									</Text>
 									<Stack gap="xs" style={{ maxHeight: 260, overflow: "auto" }}>
 										{databasePreview.samples.map((sample) =>
@@ -1348,9 +1392,12 @@ export function StorageSection() {
 	function getDatabaseCleanupCount(
 		result: DatabaseCleanupPreviewResult | DatabaseCleanupExecutionResult,
 	): number {
-		return result.target === "apiRequestDumps"
-			? result.counts.dumpsCleared
-			: result.counts.sessions;
+		if (result.target === "apiRequestDumps") return result.counts.dumpsCleared;
+		// Tool-call payloads are counted by ROW, not by session: the rows survive and only
+		// their payload columns are cleared, so `counts.sessions` would always be 0 and the
+		// confirm button would look like there was nothing to do.
+		if (result.target === "toolCallPayloads") return result.counts.toolCalls;
+		return result.counts.sessions;
 	}
 
 	function formatBlockedReason(item: DatabaseCleanupBlockedItem): string {

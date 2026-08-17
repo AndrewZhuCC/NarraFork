@@ -154,24 +154,28 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 			"[计划模式] 用户拒绝了你的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改你的计划，然后再次调用 ExitPlanMode 提交。不要尝试写代码或做任何修改——你必须先退出计划模式。",
 	},
 	"tool.exitPlanModeDeniedFile": {
-		en: "[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: '[PLAN MODE] The user rejected your file-based plan. You are STILL in plan mode. Revise the designated plan file, then call ExitPlanMode again with mode="file" so the system rereads it. If the feedback only requires a small change, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.',
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			'[计划模式] 用户拒绝了你通过计划文件提交的计划。你仍然处于计划模式中。请修改指定的计划文件，然后以 mode="file" 再次调用 ExitPlanMode，让系统重新读取该文件。若反馈只需要小幅调整，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。',
 	},
 	"tool.exitPlanModeDeniedFileWithMessage": {
-		en: "[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again without the 'inline_plan' parameter so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.",
+		en: '[PLAN MODE] The user rejected your file-based plan with the following feedback: {message}\n\nYou are STILL in plan mode. Revise the designated plan file based on this feedback, then call ExitPlanMode again with mode="file" so the system rereads it. If the requested change is small, prefer using Edit to patch the existing plan file and submit it directly; only rewrite the whole plan file when a full restructure is necessary. Do NOT attempt to write code or make changes — you must exit plan mode first.',
 		"zh-CN":
-			"[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后再次调用 ExitPlanMode（不传 'inline_plan' 参数），让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。",
+			'[计划模式] 用户拒绝了你通过计划文件提交的计划，并附带以下反馈：{message}\n\n你仍然处于计划模式中。请根据此反馈修改指定的计划文件，然后以 mode="file" 再次调用 ExitPlanMode，让系统重新读取该文件。若请求的改动较小，优先用 Edit 修补原计划文件并直接重新提交；只有在结构必须大改时才整体重写计划文件。不要尝试写代码或做任何修改——你必须先退出计划模式。',
 	},
+	// Reached only when NO plan content was obtained from either source. Both routes
+	// are offered without preference: naming one as "the" fix would be wrong for the
+	// case the model actually hit (a declared `file` plan whose file is empty must not
+	// be told to retry inline, since inline fallback is refused under that declaration).
 	"tool.exitPlanModeEmptyPlan": {
-		en: "Error: The plan content is empty. Either provide a non-empty plan in the 'inline_plan' parameter, or write your plan to the designated plan file ({planFile}) first — the system will read it automatically when you call ExitPlanMode without the 'inline_plan' parameter.",
+		en: 'Error: The plan content is empty — neither an inline plan body nor the designated plan file ({planFile}) produced any plan. Pick one and make it real: put the COMPLETE plan text in \'inline_plan\' and call ExitPlanMode with mode="inline", or write the plan into {planFile} and call ExitPlanMode with mode="file". A declared mode is verified, so it must match the source you actually filled in.',
 		"zh-CN":
-			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件（{planFile}）— 当你不传 'inline_plan' 参数调用 ExitPlanMode 时，系统会自动读取该文件。",
+			'错误：计划内容为空 — 内联计划正文和指定的计划文件（{planFile}）都没有提供任何计划。请选定其中一条并落实：把完整的计划正文放入 \'inline_plan\' 并以 mode="inline" 调用 ExitPlanMode，或把计划写入 {planFile} 并以 mode="file" 调用 ExitPlanMode。声明的 mode 会被校验，因此必须与你实际填写的来源一致。',
 	},
 	"tool.exitPlanModeEmptyPlanFallback": {
-		en: "Error: The plan content is empty. Provide a non-empty plan in the 'inline_plan' parameter or write it to the designated plan file first.",
+		en: 'Error: The plan content is empty. Provide the complete plan in \'inline_plan\' with mode="inline", or write it to the designated plan file and submit with mode="file".',
 		"zh-CN":
-			"错误：计划内容为空。请在 'inline_plan' 参数中提供非空的计划内容，或先将计划写入指定的计划文件。",
+			'错误：计划内容为空。请在 \'inline_plan\' 中提供完整计划并以 mode="inline" 提交，或将其写入指定的计划文件后以 mode="file" 提交。',
 	},
 	"tool.exitPlanModeCustomFileNotFound": {
 		en: "Error: The specified plan file \"{planFile}\" does not exist or is empty. Please write your plan to this file first, or omit the 'plan_file_path' parameter to use the default designated plan file.",
@@ -187,10 +191,25 @@ In plan mode, Write/Edit operations are restricted to the plan file only.`,
 		"zh-CN":
 			'错误：计划文件 "{planFile}" 超过最大支持大小 {maxBytes} 字节。请将计划拆分到更小的文件中。',
 	},
-	"tool.exitPlanModePathReference": {
-		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan', or write your plan to the designated plan file ({planFile}) and call ExitPlanMode WITHOUT the 'inline_plan' parameter so the system reads it automatically.",
+	"tool.exitPlanModeInlineWithExistingPlanFile": {
+		en: 'Error: You already wrote {bytes} bytes of plan content to the designated plan file ({planFile}), so an inline submission is refused: the user would review the inline text while the file that recorded your actual planning work is ignored. Call ExitPlanMode with mode="file" to submit what you wrote. If the plan file is stale or wrong, use Read to check it and Write to replace its content, then submit it with mode="file".',
 		"zh-CN":
-			"错误：'inline_plan' 参数看起来是一个文件路径或位置引用，而不是真正的计划内容。'inline_plan' 参数必须包含完整的计划正文本身（所有步骤、文件改动、推理）— 这是用户要审阅的内容。不要传入类似 'plan_path: ...' 的路径或文件引用。请将完整的计划正文粘贴到 'inline_plan' 中，或将计划写入指定的计划文件（{planFile}）后不带 'inline_plan' 参数调用 ExitPlanMode，让系统自动读取。",
+			'错误：你已经向指定的计划文件（{planFile}）写入了 {bytes} 字节的计划内容，因此内联提交被拒绝：那会让用户审阅内联文本，而记录了你实际规划工作的文件被忽略。请以 mode="file" 调用 ExitPlanMode 来提交你写好的内容。如果计划文件已过时或有误，请用 Read 检查、用 Write 替换其内容，然后以 mode="file" 提交。',
+	},
+	"tool.exitPlanModeInlineModeDisabled": {
+		en: 'Error: mode="inline" is disabled in this instance. Write your complete plan to the designated plan file ({planFile}), then call ExitPlanMode with mode="file".',
+		"zh-CN":
+			'错误：本实例已禁用 mode="inline"。请将完整计划写入指定的计划文件（{planFile}），然后以 mode="file" 调用 ExitPlanMode。',
+	},
+	"tool.exitPlanModeInlineWithoutBody": {
+		en: "Error: You declared mode=\"inline\" but did not provide a plan body in 'inline_plan'. This is not treated as a request to read the plan file — a declared inline plan must carry its own content. Either put the COMPLETE plan text in 'inline_plan', or declare mode=\"file\" to submit the plan you wrote to {planFile}.",
+		"zh-CN":
+			"错误：你声明了 mode=\"inline\"，但没有在 'inline_plan' 中提供计划正文。这不会被当作读取计划文件的请求 — 声明为内联的计划必须自带内容。请把完整的计划正文放入 'inline_plan'，或改为声明 mode=\"file\" 来提交你写入 {planFile} 的计划。",
+	},
+	"tool.exitPlanModePathReference": {
+		en: "Error: The 'inline_plan' parameter looks like a file path or location reference, not the actual plan. The 'inline_plan' parameter must contain the COMPLETE plan text itself (all steps, file changes, reasoning) — this is what the user reviews. Do NOT pass a path like 'plan_path: ...' or a file reference. Either paste the full plan body into 'inline_plan' and submit with mode=\"inline\", or write your plan to the designated plan file ({planFile}) and call ExitPlanMode with mode=\"file\" so the system reads it.",
+		"zh-CN":
+			"错误：'inline_plan' 参数看起来是一个文件路径或位置引用，而不是真正的计划内容。'inline_plan' 参数必须包含完整的计划正文本身（所有步骤、文件改动、推理）— 这是用户要审阅的内容。不要传入类似 'plan_path: ...' 的路径或文件引用。请将完整的计划正文粘贴到 'inline_plan' 并以 mode=\"inline\" 提交，或将计划写入指定的计划文件（{planFile}）后以 mode=\"file\" 调用 ExitPlanMode，让系统读取。",
 	},
 	"tool.planModeSoftDenyAskReason": {
 		en: "[Plan Mode] This operation is blocked by plan mode restrictions. Allow to enable relaxed plan mode (tools remain available during planning).",
@@ -348,6 +367,11 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 	"tool.forkNarratorError": {
 		en: "Failed to fork narrator: {error}",
 		"zh-CN": "分叉叙述者失败：{error}",
+	},
+	"tool.forkNarratorDepthExceeded": {
+		en: "Refused: this narrator is already {depth} forks deep, and the limit is {limit}. Each fork creates a chapter, a git worktree and a narrator that can fork again, so the chain is capped. Do the work here, or ask the user to start a new branch.",
+		"zh-CN":
+			"已拒绝：当前叙述者已处于第 {depth} 层分叉，上限是 {limit} 层。每次分叉都会创建章节、git worktree 和一个还能继续分叉的叙述者，因此链条有上限。请在当前叙述者内完成工作，或请用户另起一个分支。",
 	},
 	// --- merge.* (migrated from prompt-i18n.ts mergeSummaryLabels) ---
 	"merge.branch": { en: "Branch", "zh-CN": "分支" },
@@ -554,6 +578,160 @@ STRICT RULES — you MUST follow these exactly to avoid repeated truncation:
 		en: "/deny [reason] — Deny pending permission request",
 		"zh-CN": "/deny [理由] — 拒绝待处理的权限请求",
 	},
+
+	// --- sidecar.* (model-facing templates for structured side-car bodies) ---
+	//
+	// `renderSideCarBodyToText` (@shared/sidecar-body) assembles a side-car's
+	// model-facing text from these. They live here, with the rest of the prompt copy,
+	// because they ARE prompt copy — the shared module owns only the assembly order.
+	//
+	// ⚠️ Every string below reproduces what its predecessor formatter emitted, byte
+	// for byte: this text goes into the model's context, and the migration to
+	// structured bodies must not change a single character of it.
+	// `shared/__tests__/sidecar-body.test.ts` pins that against the originals.
+
+	// notice — fixed reminders, one per source (was: getToolMessage in loop.ts).
+	// These intentionally duplicate `tool.*` keys rather than aliasing them: the
+	// `tool.*` entries have other callers, and a shared prompt string that two
+	// features edit for different reasons is how one feature's tweak silently
+	// changes another's behaviour.
+	"sidecar.noticeSilentProgress": {
+		en: `<progress_update_request>
+You have completed {count} tool call(s) since your last visible text reply. Before calling any more tools, briefly tell the user in one sentence what you are working on right now, then continue.
+</progress_update_request>`,
+		"zh-CN": `<progress_update_request>
+你已经连续 {count} 次工具调用没有向用户输出可见文本。继续调用更多工具前，请先用一句话简短告诉用户你当前正在做什么，然后继续。
+</progress_update_request>`,
+	},
+	"sidecar.noticeRelaxedPlan": {
+		en: `<relaxed_plan_reminder>
+You are still in relaxed plan mode. This non-read-only tool call was allowed only so planning can continue with full context. Do not start implementation work yet. Continue investigating or refining the plan, then call ExitPlanMode to submit the complete plan for approval.
+</relaxed_plan_reminder>`,
+		"zh-CN": `<relaxed_plan_reminder>
+你仍处于宽松计划模式。此次非只读工具调用只是为了让规划能带着完整上下文继续进行，并不表示可以开始实现。不要现在开始写实现代码；请继续调查或完善计划，然后调用 ExitPlanMode 提交完整计划供用户批准。
+</relaxed_plan_reminder>`,
+	},
+	"sidecar.noticePipelineExit": {
+		en: "[SYSTEM: Pipeline has already been used to extract captured output and is still active. Before making more tool calls, confirm whether you still need Pipeline. If not, stop using Pipeline so its captures can be cleaned up by the inactivity limit instead of continuing to accumulate.]",
+		"zh-CN":
+			"[系统提示：Pipeline 已经执行过一次提取，目前仍处于活动状态。继续调用工具前，请确认是否仍需要 Pipeline；如果不再需要，请停止使用 Pipeline，让系统按闲置阈值清理捕获内容，避免继续累积。]",
+	},
+
+	// prose — `{source}Heading` prefixes the text; absent ⇒ emitted bare.
+	// Only behavior_fence has one (was: buildBehaviorFenceReminder). A buffered user
+	// message is the user's own words and gets no prefix.
+	"sidecar.behavior_fenceHeading": {
+		en: "Behavior fence (durable behavior constraints set by the user — you must obey them):",
+		"zh-CN": "行为护栏（用户设定的行为约束，务必遵守）：",
+	},
+
+	// tasks — the Dynamic Spec digest (was: spec-reminder.ts).
+	"sidecar.tasksCurrentHeading": {
+		en: "Current Dynamic Spec reminder (compiled from spec://tasks.json):",
+		"zh-CN": "当前 Dynamic Spec 提醒（由 spec://tasks.json 编译生成）：",
+	},
+	"sidecar.tasksCurrentUpdateNote": {
+		en: "If task state changed, update spec://tasks.json with Read/Edit/Write. Do not add IDs, timestamps, or notes fields to tasks.json.",
+		"zh-CN":
+			"如任务状态已变化，请用 Read/Edit/Write 更新 spec://tasks.json；不要在 tasks.json 中添加 ID、时间戳或说明字段。",
+	},
+	"sidecar.tasksEmptyHeading": {
+		en: "Dynamic Spec reminder (spec://tasks.json has no active tasks):",
+		"zh-CN": "Dynamic Spec 提醒（spec://tasks.json 当前没有进行中的任务）：",
+	},
+	"sidecar.tasksEmptyNeverCreate": {
+		en: "- You have not created any task in spec://tasks.json yet. If this is multi-step or non-trivial work, use Write/Edit to build a task list to track progress, e.g. one doing plus a few todo.",
+		"zh-CN":
+			"- 你还没有在 spec://tasks.json 建立任何任务。如果当前是多步骤或较复杂的工作，请用 Write/Edit 建立任务清单来跟踪进度，例如一条 doing + 若干 todo。",
+	},
+	"sidecar.tasksEmptyNeverSkip": {
+		en: "- If the current work is genuinely simple and does not need to be broken down, you may ignore this reminder.",
+		"zh-CN": "- 如果当前工作确实简单、无需拆分，可以忽略本提醒。",
+	},
+	"sidecar.tasksEmptyDoneReorganize": {
+		en: "- The previous phase is complete. Before starting the next round of work, reassess the current goal and context, then reorganize spec://tasks.json: remove completed ordinary tasks, preserve protected-task intent, and keep only a concise set of necessary doing/todo/blocked tasks for the current phase.",
+		"zh-CN":
+			"- 上一阶段任务已全部完成。现在开始下一轮工作前，请先重新审视当前目标和上下文，整理 spec://tasks.json：清理已完成的普通任务，保留 protected task 的用户意图，并只保留当前阶段必要且精简的 doing/todo/blocked 任务。",
+	},
+	"sidecar.tasksEmptyDoneContinue": {
+		en: "- Continue the work only after the task list is refreshed; do not retain completed tasks merely as history.",
+		"zh-CN": "- 整理完成后再继续当前工作；不要为了保留历史而堆积已完成任务。",
+	},
+	"sidecar.tasksTooManyHeading": {
+		en: "Dynamic Spec reorganization reminder (spec://tasks.json has {count} tasks, exceeding {threshold}):",
+		"zh-CN": `Dynamic Spec 整理提醒（spec://tasks.json 当前有 {count} 条任务，超过 {threshold} 条）：`,
+	},
+	"sidecar.tasksTooManyReorganize": {
+		en: "- Reorganize the task list before continuing: merge duplicate or closely related tasks, remove obsolete ordinary tasks, split oversized tasks, and keep only the necessary doing/todo/blocked tasks for the current phase.",
+		"zh-CN":
+			"- 请先重新整理任务清单，再继续执行：合并重复或高度相关的任务，删除已过期的普通任务，拆分过大的任务，并确保当前阶段只有必要的 doing/todo/blocked 任务。",
+	},
+	"sidecar.tasksTooManyProtected": {
+		en: "- Preserve protected-task intent; do not rewrite, delete, or replace a protected task to bypass its goal.",
+		"zh-CN":
+			"- protected task 的用户意图必须保留；不要通过改写、删除或替换 protected task 来绕过目标。",
+	},
+	"sidecar.tasksFieldsNote": {
+		en: "- Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries, or other fields.",
+		"zh-CN": "- tasks.json 只保留 text/status/protected，不要添加 ID、时间戳、摘要或其他字段。",
+	},
+	"sidecar.tasksSemanticsNote": {
+		en: "- Every open task must be finite, executable, and have a completion condition; an open protected task may trigger automatic continuation. Do not store standing behavior rules or constraints without a terminal state as tasks; those belong in spec://behavior_fence.",
+		"zh-CN":
+			"- 每条开放任务必须有限、可执行且有完成条件；protected task 未完成时可能触发自动续跑。不要把长期行为规则或无终点约束写成任务，这类内容属于 spec://behavior_fence。",
+	},
+
+	// knowledge — was: formatInjectionsBare (knowledge-injection.ts). The heading is
+	// English-only upstream (it is passed as a literal argument), so it stays so here.
+	"sidecar.knowledgeHeading": {
+		en: "Relevant knowledge-base entries were found based on the latest tool output:",
+	},
+	"sidecar.knowledgeReadHint": {
+		en: "(Use KnowledgeRead with an id for full content.)",
+	},
+
+	// tasksDone — was: formatBackgroundCompletionNotifications + the inline bash
+	// formatter in narrator-session.ts. Both are English-only upstream.
+	"sidecar.bgAgentEntry": {
+		en: `[System] Background agent "{title}" (ID: {id}) {status}.
+Result preview: {preview}
+Use Await({ type: "agent", id: "{id}" }) to see the full result, or Send({ id: "{id}", message }) to continue.`,
+	},
+	"sidecar.bgBashEntry": {
+		en: `[System] Background bash "{title}" (ID: {id}) {status}.
+Result preview: {preview}`,
+	},
+	"sidecar.emptyResult": {
+		en: "(empty)",
+	},
+
+	// messages — was: formatParentInboundMessage (parent-inbound-queue.ts) and the
+	// inline team formatter in subagent-executor.ts.
+	"sidecar.subagentMessageEntry": {
+		en: `[Progress report from subagent "{name}" ({type})]:
+{text}`,
+		"zh-CN": `[来自子代理"{name}"（{type}）的进展汇报]：
+{text}`,
+	},
+	"sidecar.teamMessageEntry": {
+		en: "[Team {channel} from {name} ({type})]: {text}",
+	},
+	"sidecar.teamBroadcast": { en: "broadcast" },
+	"sidecar.teamDirect": { en: "message" },
+
+	// specUpdates — was: formatSpecUpdateSideCars (spec-update-queue.ts).
+	"sidecar.specUpdateHeading": {
+		en: "[System] The user updated the following spec files via the Spec panel — align your plan accordingly:",
+		"zh-CN": "[系统] 用户通过 Spec 面板更新了以下文件，请注意同步你的工作计划：",
+	},
+	"sidecar.specUpdateEntry": {
+		en: "User updated {uri} via UI ({timestamp}).",
+		"zh-CN": "用户通过 UI 更新了 {uri}（{timestamp}）。",
+	},
+	"sidecar.specUpdatePreview": {
+		en: "Content preview:",
+		"zh-CN": "内容预览：",
+	},
 };
 
 // ---------------------------------------------------------------------------
@@ -664,6 +842,9 @@ export type ToolMessageKey =
 	| "exitPlanModeCustomFileNotFound"
 	| "exitPlanModePlanFileInvalid"
 	| "exitPlanModePlanFileTooLarge"
+	| "exitPlanModeInlineWithExistingPlanFile"
+	| "exitPlanModeInlineModeDisabled"
+	| "exitPlanModeInlineWithoutBody"
 	| "exitPlanModePathReference"
 	| "planModeSoftDenyAskReason"
 	| "planModeToolDisabled"
@@ -688,7 +869,8 @@ export type ToolMessageKey =
 	| "toolUnloaded"
 	| "forkNarratorSuccess"
 	| "forkNarratorChapterInfo"
-	| "forkNarratorError";
+	| "forkNarratorError"
+	| "forkNarratorDepthExceeded";
 
 export function getToolMessage(key: ToolMessageKey, locale: Locale = DEFAULT_LOCALE): string {
 	return t(`tool.${key}`, locale);

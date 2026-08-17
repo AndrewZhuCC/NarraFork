@@ -20,6 +20,8 @@
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
+import { rawSideCarToMarkdown, readSideCarBody, sideCarBodyToMarkdown } from "../sidecar-body";
+import { subagentResultText } from "../subagent-result-text";
 import type { VListElementKind } from "./element-kinds";
 import type { RenderLod } from "./prepared-block";
 import { type ReasoningLiveTail, resolveReasoningLiveTail } from "./reasoning-live-tail";
@@ -39,15 +41,6 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
-import {
-	type AdapterSidecar,
-	adapterMessageHasVisibleContent,
-	collectVisibleSidecars,
-	SIDECAR_PAYLOAD_KIND,
-	SIDECAR_SOURCE_META,
-	sidecarDetailText,
-	sidecarPreviewText,
-} from "./sidecar";
 import {
 	isLiveStreamingBlock,
 	isLiveStreamingRun,
@@ -119,6 +112,8 @@ export interface AdapterContentBlock {
 	messageCount?: number | null;
 	/** assistant text: source citations indexed against `text`. */
 	citations?: TextCitation[] | null;
+	/** system_injection: which producer injected this (`living_work_spec`, `bg_agent`, …). */
+	source?: string | null;
 	[key: string]: unknown;
 }
 
@@ -174,13 +169,6 @@ export interface AdapterMessage {
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	meterUsage?: number | null;
-	/**
-	 * System-injected sidecar records attached to this message. The adapter reads
-	 * only the `user_message`-targeted ones (the `tool_result` ones are surfaced on
-	 * their owning tool card instead). Each visible record becomes its own small
-	 * collapsible `sidecar` element AFTER the message's other content.
-	 */
-	sideCars?: AdapterSidecar[] | null;
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -503,6 +491,32 @@ export interface AdapterContext {
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
 	/**
+	 * Row-KEY addressed expansion, resolved as `(traceKey, rowKey) => boolean`.
+	 *
+	 * ⚠️ The channel `activity-trace` and `tool-run-summary` must use — and the ONLY
+	 * two that must, because only they can gain a row ABOVE an existing one while a
+	 * turn streams. The activity fold expands one live reasoning block into one row
+	 * PER STEP, so the moment the model emits another `**title**` every row after it
+	 * shifts down by one. An index recorded at click time then addresses a different
+	 * row: the tool the reader opened silently folds shut, and the row that inherited
+	 * the index opens instead — the same click producing a different card mid-stream,
+	 * plus a height change with no user action behind it (the very thing CONTRACT §0
+	 * forbids).
+	 *
+	 * Row keys are hand-off stable by construction: a tool row is `tool-<toolUseId>`
+	 * live and persisted alike, and a reasoning row keys on its run ordinal within
+	 * the unit (`stableKeyBase`). So a key survives exactly the frames an index does
+	 * not.
+	 *
+	 * `expandedRows` stays for the append-only lists, whose ordinals are already
+	 * stable: a `reasoning-steps` element (step N stays row N however many steps
+	 * follow) and the subagent-recovery card's
+	 * checkboxes. The shell routes by kind (`traceRowFoldChannel`); an element read
+	 * here must be written there, or the reader's fold lands in a channel nothing
+	 * reads and the row stops opening.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
+	/**
 	 * Reader asked for the ORIGINAL text of a translated body (reasoning runs).
 	 *
 	 * Height-affecting, so it must be resolved during adaptation like every other
@@ -573,6 +587,20 @@ export interface AdapterContext {
 	 */
 	resolveHasPendingPermission?: (toolUseId: string | undefined) => boolean;
 	/**
+	 * The tool-use id of the MOST RECENT spec://tasks.json operation in the loaded
+	 * window (the same identity the chunked path's task-board spinner keys on).
+	 * That one card keeps its full expanded task board at every LOD — it never
+	 * folds into a summary/count batch and never collapses to a bare header at
+	 * L4 / old-L5.
+	 *
+	 * A resolver (not a snapshot) so the identity the shell tracks can move with
+	 * each rebuild without the adapter caching a stale value; the shell's closure
+	 * reads the current id at adapt time. Height-affecting (the card's expanded
+	 * geometry replaces a folded row's), resolved during adaptation like every
+	 * other interaction state.
+	 */
+	resolveLatestSpecTasksToolUseId?: () => string | null;
+	/**
 	 * Full (un-truncated) tool input / output for a tool use, once the shell has
 	 * fetched it.
 	 *
@@ -637,8 +665,9 @@ const SYSTEM_SIMPLE_SUBTYPES = new Set([
 	"segment_compact",
 	"merge_summary",
 	"review_feedback",
-	"spec_continuation",
-	"spec_blocked_continuation",
+	// spec_continuation / spec_blocked_continuation are NOT here: FRAMED_SPEC_TASK_CARDS
+	// intercepts them first and the bubble draws the task row itself. Listing them here
+	// would route them to the clamped single-line card the redesign removed.
 ]);
 const SYSTEM_TEXT_SUBTYPES = new Set([
 	"info",
@@ -649,6 +678,10 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 	"spec_goal_added",
 	"spec_fork_carryover",
 	"spec_context_cleared",
+	// Server-authored injected content on its OWN message row (see
+	// server/services/narrator-injection.ts). It replaces the side-car channel, whose
+	// rows had no message of their own and had to be hosted by a neighbour.
+	"system_injection",
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
 const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
@@ -669,7 +702,11 @@ function isRecognizedSystemBlockType(type: string): boolean {
 	return (
 		SYSTEM_SIMPLE_SUBTYPES.has(type) ||
 		SYSTEM_TEXT_SUBTYPES.has(type) ||
-		SYSTEM_OTHER_TYPES.has(type)
+		SYSTEM_OTHER_TYPES.has(type) ||
+		// Framed cards (spec_continuation, merge_summary, review_feedback) are recognized
+		// here too: spec_continuation left SYSTEM_SIMPLE_SUBTYPES when the bubble began
+		// drawing its row itself, but the system-block scan must still find it.
+		FRAMED_SYSTEM_CARDS.has(type)
 	);
 }
 
@@ -761,11 +798,18 @@ function reasoningStepsData(
 	};
 }
 
-function webSearchData(block: AdapterContentBlock) {
+function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
+	const isSearching = block.status && block.status !== "completed";
+	const labelKey = isSearching
+		? block.status === "searching"
+			? "webSearching"
+			: "webSearchPreparing"
+		: "webSearched";
 	return {
 		query: block.query ?? null,
 		queries: block.queries ?? null,
 		status: block.status ?? null,
+		label: sysLabel(ctx, labelKey),
 	};
 }
 
@@ -834,136 +878,6 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sidecar element specs (one collapsible card per visible record).
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * The measure/render payload for ONE sidecar card. `previewText` is the
- * collapsed single line; `fullText` the expanded body (capped). Both are
- * composed HERE because the expanded body is measured — the render layer only
- * paints what the measure layer wrapped. Labels (source/target/copy) flow
- * through `ctx.labels` like every other adapter-composed string.
- */
-export interface SidecarSpecData {
-	/**
-	 * Explicit payload discriminant. **Every adapter construction point stamps it**
-	 * (`buildSidecarSpecs`, `buildToolSidecarData`); the invariant is asserted by
-	 * `sidecar-payload-kind.test.ts` rather than by the type, because the field is
-	 * declared optional so hand-written measure fixtures stay valid.
-	 *
-	 * The measure cache has to distinguish a standalone sidecar element's data from
-	 * a tool card's `sidecars` array (different revision branches, therefore
-	 * different heights). It used to do that by sniffing for `fullText` + `source`,
-	 * which any future payload carrying those names would collide with — silently
-	 * taking the wrong branch and being served a stale height. This marker makes
-	 * the identification positive instead of incidental.
-	 */
-	payloadKind?: typeof SIDECAR_PAYLOAD_KIND;
-	source: string;
-	/** Localized source label (badge text). */
-	sourceLabel: string;
-	/** Mantine colour for the accent rail + badge. */
-	color: string;
-	/** "user_message" | "tool_result" (badge text is the raw target). */
-	target: string;
-	/** Collapsed single-line preview (height-neutral: the row is fixed). */
-	previewText: string;
-	/** Expanded body (MEASURED — the card's height comes from this). */
-	fullText: string;
-	/**
-	 * Localized "you are not seeing all of it, use copy" notice.
-	 *
-	 * Composed here (like every other adapter string) and used by BOTH caps: the
-	 * char cap appends it as the last body line (`sidecarDetailText`), and the
-	 * measure layer reserves it as a notice row when the LINE cap clipped the body
-	 * — otherwise an expanded long sidecar just stops after 40 lines inside an
-	 * `overflow:hidden` box with nothing telling the reader why.
-	 *
-	 * Optional for the same reason as `payloadKind`: the adapter always sets it, but
-	 * measure fixtures may omit it (the notice row then reserves nothing).
-	 */
-	truncatedLabel?: string;
-}
-
-/**
- * LOD threshold for the sidecar's visual form. Below it every record renders as
- * a bare CollapsibleTrace (the low-LOD "bare row" paradigm, no card skin); at
- * and above it each record is the full collapsible card. The threshold matches
- * the tool-run fold boundary (L3 folds tools into traces, L4 keeps full cards),
- * so a sidecar never reads as heavier than the tool rows beside it.
- */
-export const SIDECAR_CARD_LOD_THRESHOLD: RenderLod = 4;
-
-/**
- * Build the sidecar specs for a list of records already filtered to one target.
- *
- * Two forms by LOD (the low-LOD redesign — one trace per record, not one card):
- *
- *   - LOW LOD (< SIDECAR_CARD_LOD_THRESHOLD): one `sidecar-trace` spec per
- *     record — a bare CollapsibleTrace whose header shows the source label and
- *     whose single row carries the preview, expanding to the full text. This is
- *     the same bare-row paradigm the folded tool / reasoning traces use, so the
- *     sidecar stops standing out as the only coloured Paper card on screen.
- *   - HIGH LOD: one `sidecar` card per record, each with its own fold state
- *     (the per-card fold the redesign chose over the chunked aggregate notice).
- */
-function buildSidecarSpecs(
-	sideCars: readonly AdapterSidecar[],
-	keyBase: string,
-	ctx: AdapterContext,
-): ElementSpec[] {
-	const specs: ElementSpec[] = [];
-	const lowLod = ctx.lod < SIDECAR_CARD_LOD_THRESHOLD;
-	for (let i = 0; i < sideCars.length; i++) {
-		const sc = sideCars[i];
-		if (!sc) continue;
-		const meta = SIDECAR_SOURCE_META[sc.source];
-		const key = `${keyBase}-sc${i}`;
-		const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
-		const sourceLabel = meta
-			? sysLabel(ctx, meta.labelKey)
-			: sc.source || sysLabel(ctx, "sidecarUnknown");
-		const data: SidecarSpecData = {
-			payloadKind: SIDECAR_PAYLOAD_KIND,
-			source: sc.source,
-			sourceLabel,
-			color: meta?.color ?? "gray",
-			target: sc.target,
-			previewText: sidecarPreviewText(sc.content),
-			fullText: sidecarDetailText(sc.content, truncatedLabel),
-			truncatedLabel,
-		};
-		if (lowLod) {
-			specs.push({
-				kind: "sidecar-trace",
-				key,
-				data,
-				opts: { expandedIndices: ctx.expandedRows?.(key) ?? [] },
-			});
-		} else {
-			specs.push({
-				kind: "sidecar",
-				key,
-				data,
-				opts: { expanded: ctx.isExpanded?.(key) ?? false },
-			});
-		}
-	}
-	return specs;
-}
-
-/** The visible `user_message` sidecars of a message, as element specs. */
-function messageSidecarSpecs(
-	msg: AdapterMessage,
-	idBase: string,
-	ctx: AdapterContext,
-): ElementSpec[] {
-	const visible = collectVisibleSidecars(msg.sideCars, "user_message");
-	if (visible.length === 0) return [];
-	return buildSidecarSpecs(visible, idBase, ctx);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Public: segment → ElementSpec[]
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1001,10 +915,7 @@ function adaptMessage(
 		// them to the same system card the classic renderer uses.
 		const systemCardBlock = blocks.find((b) => USER_SYSTEM_CARD_TYPES.has(b.type));
 		if (systemCardBlock) {
-			return [
-				adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx),
-				...messageSidecarSpecs(msg, idBase, ctx),
-			];
+			return [adaptSystemBlock(systemCardBlock.type, systemCardBlock, idBase, msg, ctx)];
 		}
 		// Turns stored as role=user for protocol/scheduling reasons that no human
 		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
@@ -1028,7 +939,6 @@ function adaptMessage(
 						originLabel: msg.originLabel ?? null,
 					},
 				},
-				...messageSidecarSpecs(msg, idBase, ctx),
 			];
 		}
 		const visible = indices.map((i) => blocks[i]).filter((b): b is AdapterContentBlock => !!b);
@@ -1055,6 +965,13 @@ function adaptMessage(
 					hasHeader: true,
 					creator: msg.creator ?? null,
 					createdAt: msg.createdAt ?? null,
+					// Height-neutral attribution: the bubble header already reserves its
+					// row, so origin/originLabel only change what the header paints
+					// (name / avatar / badge), never the measured height or cache key.
+					// Forwarding these is what lets a plan-reflection-approved turn show
+					// the "计划反思" identity instead of falling back to "you" on the right.
+					origin: msg.origin ?? null,
+					originLabel: msg.originLabel ?? null,
 					...(commandText ? { commandText } : {}),
 					...(attachments.length > 0 ? { attachments } : {}),
 				},
@@ -1076,7 +993,6 @@ function adaptMessage(
 						}
 					: {}),
 			},
-			...messageSidecarSpecs(msg, idBase, ctx),
 		];
 	}
 
@@ -1085,10 +1001,26 @@ function adaptMessage(
 	// NOT necessarily blocks[0] — a leading text block can precede it (e.g.
 	// [{text}, {knowledge_hint}]). Falls back to blocks[0] when none recognized.
 	if (msg.role === "system" || msg.role === "sys" || msg.role === "disp") {
-		const sysBlock = blocks.find((b) => isRecognizedSystemBlockType(b.type)) ??
-			blocks[0] ?? { type: "info" };
+		// Track the index too: an injection is ONE block per row now, and that index is
+		// the row's address for the selection system (msg-{id}-{blockIndex}).
+		const sysBlockIndex = blocks.findIndex((b) => isRecognizedSystemBlockType(b.type));
+		const sysBlock = (sysBlockIndex >= 0 ? blocks[sysBlockIndex] : blocks[0]) ?? { type: "info" };
+		const blockIndex = sysBlockIndex >= 0 ? sysBlockIndex : 0;
+		// The model-facing copy: the message's leading non-empty text block, same fallback
+		// the chunk renderer uses. The context-menu inspector shows this so the reader can
+		// see exactly what the agent received, which the projected bubble body strips down.
+		const modelFacingText =
+			blocks.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, ctx);
+		if (spoken) return [...specs, ...spoken];
+		// Server-authored FACTS that still have an author (a person merged a branch, the
+		// platform brought a container up). Those are statements in the conversation, so
+		// they get the same left bubble — but their existing card becomes the bubble's BODY
+		// rather than being flattened to prose, because it carries structure and
+		// affordances the reader can use (branch names, a commit sha, badges).
+		const framed = adaptFramedSystemCard(sysBlock, idBase, blockIndex, msg, modelFacingText, ctx);
+		if (framed) return [...specs, framed];
 		specs.push(adaptSystemBlock(sysBlock.type, sysBlock, idBase, msg, ctx));
-		specs.push(...messageSidecarSpecs(msg, idBase, ctx));
 		return specs;
 	}
 
@@ -1185,7 +1117,7 @@ function adaptMessage(
 				});
 				break;
 			case "web-search":
-				specs.push({ kind, key, data: webSearchData(block) });
+				specs.push({ kind, key, data: webSearchData(block, ctx) });
 				break;
 			case "media":
 				specs.push({ kind, key, data: mediaData(block, ctx) });
@@ -1205,11 +1137,6 @@ function adaptMessage(
 			},
 		});
 	}
-	// Message-level (user_message) sidecars, one collapsible card per record —
-	// the redesign replaces the chunked aggregate notice. Assistant bubbles render
-	// their content above; the cards trail the body exactly like the chunked
-	// MessageBubble's notice sat after the content blocks.
-	specs.push(...messageSidecarSpecs(msg, idBase, ctx));
 	return specs;
 }
 
@@ -1239,6 +1166,10 @@ function resolveAdapterTurnUsage(msg: AdapterMessage, ctx: AdapterContext) {
  * testable. Keys mirror MessageBubble's i18n keys (narrator namespace).
  */
 const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
+	// Body of a background-task bubble whose task produced no output. Needs a fallback
+	// like every other composed string: without one, `sysLabel` returns the raw key and
+	// the reader would see the literal "empty" in the bubble.
+	empty: "(empty)",
 	specProtectedBadge: "Protected",
 	specGoalAddedBadge: "Goal added",
 	specGoalExistsBadge: "Already tracked",
@@ -1350,8 +1281,6 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	// The source badge text is measured into the card's single-line header, so it
 	// flows through the adapter like every other composed chrome string. Keys map
 	// 1:1 onto the existing `sidecar.sources.*` narrator strings (shell injects).
-	sidecarUnknown: "unknown",
-	sidecarTruncated: "[Preview truncated…]",
 	sidecarSourceSilentProgress: "Progress reminder",
 	sidecarSourceTodoReminder: "TODO reminder",
 	sidecarSourceRelaxedPlan: "Plan mode reminder",
@@ -1360,9 +1289,11 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceBgBash: "Background command",
 	sidecarSourceTeamMessage: "Team message",
 	sidecarSourceBufferedUser: "Buffered user message",
-	sidecarSourceGroupMessage: "Group message",
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
+	// Periodic task-digest subtitle: carries the cadence ("every N tool calls") so a
+	// routine digest reads differently from a turn-end continuation in the header.
+	cadenceEveryNTools: "every {n} tool calls",
 };
 
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
@@ -1404,6 +1335,40 @@ const ORIGIN_SOURCE_LABEL_KEYS: Record<string, string> = {
 	oauth: "originSourceOauth",
 	recovery: "originSourceRecovery",
 };
+
+/**
+ * Producer tag → the label key describing it to a reader.
+ *
+ * Reuses the `sidecarSource*` keys the side-car cards already resolve, so the two
+ * cannot disagree on what to call a producer while both exist, and migrating a
+ * producer needs no new copy.
+ */
+const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
+	silent_progress: "sidecarSourceSilentProgress",
+	living_work_spec: "sidecarSourceTodoReminder",
+	relaxed_plan: "sidecarSourceRelaxedPlan",
+	knowledge_base_hint: "sidecarSourceKnowledgeBaseHint",
+	bg_agent: "sidecarSourceBgAgent",
+	bg_bash: "sidecarSourceBgBash",
+	team_message: "sidecarSourceTeamMessage",
+	buffered_user: "sidecarSourceBufferedUser",
+	subagent_message: "sidecarSourceSubagentMessage",
+	spec_update: "sidecarSourceSpecUpdate",
+	behavior_fence: "sidecarSourceBehaviorFence",
+	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
+};
+
+/**
+ * Heading for an injection card.
+ *
+ * An unmapped source falls back to the generic system label rather than showing its
+ * raw tag: a producer added after this table is a naming gap, not something to leak
+ * an internal identifier over.
+ */
+function injectionHeadingLabel(ctx: AdapterContext, source: string): string {
+	const key = INJECTION_SOURCE_LABEL_KEYS[source];
+	return key ? sysLabel(ctx, key) : sysLabel(ctx, "originKindSystem");
+}
 
 /**
  * Heading for an origin_notice card / the display name of a non-account author.
@@ -1552,6 +1517,454 @@ function compactProgressOpts(
 	};
 }
 
+/**
+ * A server-authored system card, wrapped in a speaker bubble.
+ *
+ * ## Why frame the card instead of projecting it
+ *
+ * These producers own structured, interactive UI: `merge_summary` names both branches
+ * and carries a commit sha, `spec_continuation` shows a badge and a protected marker.
+ * Flattening that into markdown would turn usable structure into prose. So the card
+ * stays exactly as it is and becomes the bubble's body — the bubble only adds the frame
+ * and the speaker row.
+ *
+ * ## Why these rows deserve a speaker at all
+ *
+ * The earlier cut of this design asked "does it have a subject?" and answered no for
+ * platform events. That was wrong: `container_ready`'s own text says "**You can** use
+ * the Browser tool to test these services" — it addresses the model, and the model
+ * answers it. The real distinction is not subject-vs-no-subject but **an utterance in
+ * the conversation vs a note about the conversation**. Compact markers and prune
+ * dividers are the latter; everything here is the former.
+ *
+ * Interactive controls are deliberately excluded (see `FRAMED_SYSTEM_CARDS`): a
+ * permission prompt or an ask-user form is something to OPERATE, not something somebody
+ * finished saying, and giving both one visual language would blur reading and acting.
+ */
+function adaptFramedSystemCard(
+	block: AdapterContentBlock,
+	idBase: string,
+	blockIndex: number,
+	msg: AdapterMessage,
+	modelFacingText: string,
+	ctx: AdapterContext,
+): ElementSpec | null {
+	const kind = block.type;
+	if (!FRAMED_SYSTEM_CARDS.has(kind)) return null;
+	// The Dynamic Spec continuation is a TASK, not a card: the bubble draws its row
+	// itself (status glyph + lock + wrapping text) instead of nesting the clamped
+	// single-line card. See FRAMED_SPEC_TASK_CARDS for why the card is bypassed.
+	if (FRAMED_SPEC_TASK_CARDS.has(kind)) {
+		const blocked = kind === "spec_blocked_continuation";
+		return {
+			kind: "injection-bubble",
+			// `-b{blockIndex}` ties the row to its single content block, so the selection
+			// system can address it for the context menu (delete / rollback / fork).
+			key: `${idBase}-b${blockIndex}-f-${kind}`,
+			data: {
+				payload: {
+					kind: "spec-task",
+					data: {
+						// chunk reads the task off `block.task`, falling back to the row text.
+						text: block.task ?? block.text ?? "",
+						protected: block.protected === true,
+						blocked,
+					},
+				},
+				source: kind,
+				creator: msg.creator ?? null,
+				hasHeader: true,
+				// The verbatim model-facing copy for the context-menu inspector.
+				modelFacing: modelFacingText,
+			},
+		};
+	}
+	// Reuse the card's own data projection verbatim: the bubble must not fork it, or the
+	// framed and standalone forms would drift.
+	const inner = adaptSystemBlock(kind, block, idBase, msg, ctx);
+	return {
+		kind: "injection-bubble",
+		key: `${idBase}-b${blockIndex}-f-${kind}`,
+		data: {
+			payload: { kind: innerPayloadKind(inner), data: inner.data },
+			source: kind,
+			// A merge is authored by whoever pressed the button, and `creator` is already
+			// loaded for system rows — so the header can name a real person with a real
+			// avatar instead of a placeholder.
+			creator: msg.creator ?? null,
+			hasHeader: true,
+			// The verbatim model-facing copy for the context-menu inspector.
+			modelFacing: modelFacingText,
+		},
+	};
+}
+
+/**
+ * The measured element kind the inner card's spec resolved to.
+ *
+ * Taken from the spec `adaptSystemBlock` returned rather than re-deciding here: that
+ * function already owns the simple-vs-text routing, and a second copy would drift.
+ */
+function innerPayloadKind(inner: ElementSpec): string {
+	const data = inner.data as { kind?: unknown } | null;
+	return typeof data?.kind === "string" ? data.kind : inner.kind;
+}
+
+/**
+ * System cards that become speaker bubbles.
+ *
+ * Deliberately an allow-list. Excluded on purpose:
+ *   - `compact` / `segment_compact` — notes ABOUT the conversation (history was
+ *     truncated here), not utterances within it.
+ *   - `ask_in_passing`, `subagent_recovery`, permission / question forms — controls to
+ *     operate, not statements to read.
+ *   - `bash_command`, `tool_loaded`, `tool_unloaded` — receipts for the reader's OWN
+ *     action, so attributing them to another speaker would be backwards.
+ */
+const FRAMED_SYSTEM_CARDS = new Set([
+	"merge_summary",
+	"review_feedback",
+	"spec_continuation",
+	"spec_blocked_continuation",
+]);
+
+/**
+ * Block kinds whose framed body is a TASK ROW, not a nested card.
+ *
+ * The Dynamic Spec scheduler speaks these — a third party telling the model to keep
+ * working. Framing them used to nest the standalone `system-simple` card inside the
+ * bubble, which is the card-in-a-card the redesign removes: the simple card draws a
+ * full-width tinted band, clamps the task to one line, and paints the protected lock
+ * twice. `adaptFramedSystemCard` maps these to a `spec-task` payload instead, and the
+ * bubble measures + draws the task row itself (status glyph + lock + wrapping text) —
+ * no inner card, no band.
+ */
+const FRAMED_SPEC_TASK_CARDS = new Set(["spec_continuation", "spec_blocked_continuation"]);
+
+/**
+ * ⚠️ `spec_goal_added` / `spec_fork_carryover` / `spec_context_cleared` are NOT here.
+ *
+ * Those cards own real BUTTONS whose mutations live outside `vlist/`, so the shell wires
+ * them by matching `kind === "system-text"` (`extra.specCarryoverActions`). Rerouting
+ * them to `injection-bubble` silently unwires every button — they still paint, and
+ * clicking does nothing. Same for the `error` card's retry / dismiss controls.
+ *
+ * Framing them therefore needs the action-injection seam to reach a nested payload
+ * first. Until then they stay standalone cards: a dead button is a worse outcome than a
+ * missing speaker row.
+ */
+
+/**
+ * ⚠️ `container_ready` and `browser_session_lost` are NOT here, and it is not an
+ * oversight: neither block type is recognized by `isRecognizedSystemBlockType`, so a row
+ * carrying one never reaches this routing at all — it falls back to `blocks[0]`, its own
+ * text block, and renders as a plain `info` card. That predates this work (the chunked
+ * renderer never special-cased them either).
+ *
+ * Listing them here would claim support that does not exist. Framing them needs the
+ * block types registered as recognized system cards FIRST, with their own data
+ * projection; that is a separate change from wrapping cards that already render.
+ */
+
+/**
+ * Injected content that speaks for somebody → one FRAMED bubble per speaker.
+ *
+ * ## Why this is not one card
+ *
+ * A single `subagent_message` / `team_message` delivery can carry messages from
+ * SEVERAL senders (the queue caps at 20). The generic injection card flattens them
+ * into one Markdown blob whose sender names survive only as sub-headings — i.e. it
+ * demotes identity to typography. These messages ARE somebody talking, and the data
+ * already carries who (`fromTitle` / `fromId` / `fromType` / `isBroadcast`), so each
+ * one gets its own bubble with its own speaker row.
+ *
+ * Returns null for every other producer, which then takes the ordinary card path:
+ * a routine reminder has no speaker, and giving it a bubble would let system nudges
+ * carry the same visual weight as a teammate's message.
+ *
+ * The body is projected per message rather than for the whole delivery, so a bubble
+ * measures only its own text.
+ */
+function adaptSpokenInjection(
+	block: AdapterContentBlock,
+	idBase: string,
+	blockIndex: number,
+	modelFacingText: string,
+	ctx: AdapterContext,
+): ElementSpec[] | null {
+	if (block.type !== "system_injection") return null;
+	const source = typeof block.source === "string" ? block.source : "";
+	// Both families qualify for a bubble; they differ only in how the delivery splits
+	// (per sender vs one statement), which the branches below decide.
+	if (!SPOKEN_INJECTION_SOURCES.has(source) && !PLATFORM_INJECTION_SOURCES.has(source)) {
+		return null;
+	}
+	const body = readSideCarBody(block);
+	// No structured body → the historical verbatim path, which stays a card: without a
+	// body there is nothing to split and nothing to project.
+	if (!body) return null;
+
+	// Inbound messages: one bubble. Persistence now delivers ONE message per row (the
+	// fan-out loop that used to split a multi-item delivery is gone — see
+	// deliverPendingInjectionsInOrder), so `items` holds a single message and the key
+	// needs no positional suffix.
+	if (body.kind === "messages") {
+		const message = Array.isArray(body.items) ? body.items[0] : undefined;
+		if (!message) return null;
+		const text = (message.text ?? "").trim();
+		if (!text) return null;
+		return [
+			{
+				kind: "injection-bubble",
+				// Keyed by block index + SENDER: the block index ties the row to its single
+				// content block so the selection system can address it; the sender keeps the
+				// key stable across a same-block re-projection.
+				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
+				data: {
+					markdown: rawSideCarToMarkdown(text),
+					speaker: spokenSpeakerLabel(message),
+					// The sender's own id seeds the deterministic identicon in the header.
+					// Titles cluster ("explore-1", "explore-2") so initials collide; the id
+					// does not.
+					speakerId: message.fromId ?? null,
+					speakerKind: message.fromType ?? null,
+					isBroadcast: message.isBroadcast === true,
+					source,
+					hasHeader: true,
+					// The verbatim model-facing copy for the context-menu inspector.
+					modelFacing: modelFacingText,
+				},
+			},
+		];
+	}
+
+	// Finished background work: one bubble per task.
+	//
+	// A background task is an addressable, NAMED thing — `Bash` takes an `alias`
+	// precisely so a later `Await({ id })` can refer to it — so "run-tests finished,
+	// here is its output" has a subject in the same way a teammate's message does.
+	// The alias is what the reader launched it as, so it wins over the derived title.
+	if (body.kind === "tasksDone") {
+		// One finished task per row (persistence delivers them singly now), so the key is
+		// the task id alone — no positional suffix.
+		const task = Array.isArray(body.items) ? body.items[0] : undefined;
+		if (!task) return null;
+		const preview = (task.preview ?? "").trim();
+		return [
+			{
+				kind: "injection-bubble",
+				key: `${idBase}-b${blockIndex}-t-${task.id}`,
+				data: {
+					// An empty preview still gets a bubble: "it finished, with no output" is
+					// itself the result, and the status lives in the header. Dropping the row
+					// would make a silent success indistinguishable from one that never ran.
+					markdown: rawSideCarToMarkdown(preview || sysLabel(ctx, "empty")),
+					speaker: task.alias?.trim() || task.title?.trim() || task.id,
+					// A background task is addressable by id, which is what seeds its glyph.
+					speakerId: task.id ?? null,
+					speakerKind: task.status ?? null,
+					isBroadcast: false,
+					source,
+					hasHeader: true,
+					// The producer already clipped the output; the reader is told so on a
+					// fixed line the measure pass reserves.
+					hasNote: task.truncated === true,
+					// The verbatim model-facing copy for the context-menu inspector.
+					modelFacing: modelFacingText,
+				},
+			},
+		];
+	}
+
+	// Knowledge-base hits: a bubble ONLY when the entries have something to say.
+	//
+	// A hit is addressable and titled, so "this entry is relevant" does have a subject.
+	// But `summary` is frequently empty, and the projection then emits a bullet holding
+	// nothing but the title — so a bubble per hit would be a stack of empty shells whose
+	// body repeats its own header, taking several times the height of the compact list
+	// for strictly less information. The shape therefore follows the DATA, not the tag.
+	if (body.kind === "knowledge") {
+		const hits = Array.isArray(body.hits) ? body.hits : [];
+		const substantive = hits.filter((hit) => (hit?.summary ?? "").trim().length > 0);
+		// All-or-nothing: a mixed batch stays a list rather than splitting one delivery
+		// across two visual languages.
+		if (substantive.length === 0 || substantive.length !== hits.length) return null;
+		// ⚠️ Keyed by the entry's own identity, NOT by array position. `spec.key` is the
+		// measure-cache key, the fold/selection key and the height-override key all at
+		// once (CONTRACT §4.5.1), so a key that shifts when the batch composition changes
+		// makes one entry inherit another's cached height and expand state. Position was
+		// safe here only as long as the all-or-nothing gate above guaranteed
+		// `substantive === hits`; that is an invisible coupling between a VISUAL policy
+		// and key correctness, and relaxing the policy later would silently break it.
+		return substantive.map((hit) => ({
+			kind: "injection-bubble" as const,
+			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
+			data: {
+				markdown: rawSideCarToMarkdown(hit.summary.trim()),
+				speaker: hit.title?.trim() || hit.entryId,
+				// The entry's own id seeds its glyph, so two similarly-titled entries stay
+				// visually distinct.
+				speakerId: hit.entryId ?? null,
+				speakerKind: null,
+				// Without this the row had no context-menu inspector at all.
+				modelFacing: modelFacingText,
+				isBroadcast: false,
+				source,
+				hasHeader: true,
+			},
+		}));
+	}
+
+	// Routine reminders the PLATFORM raises: the task digest, the behaviour fence, a
+	// progress nudge, a spec save. One bubble for the whole delivery — unlike inbound
+	// messages there is no per-sender split to make, because the speaker is the same
+	// platform every time.
+	//
+	// These used to stay full-width notice cards on the theory that a routine reminder
+	// must not carry a teammate's visual weight. Two things were wrong with that. The
+	// scheduler pushing "you still have 3 open tasks" IS an utterance with a speaker —
+	// the same speaker as `spec_continuation`, which was already a bubble, so the split
+	// was internally inconsistent. And full width made the long task lines run far past a
+	// comfortable measure; the bubble's width cap fixes exactly that.
+	// A task DIGEST renders as task ROWS, not markdown bullets — the same rows the
+	// auto-continuation uses. Before this, the periodic reminder and the continuation
+	// showed the same data in two visual languages: the digest demoted `role` to a text
+	// prefix ("doing: …") and `protected` to the words "· protected", while the
+	// continuation had a status glyph and a lock. Same payload, one presentation now.
+	if (PLATFORM_INJECTION_SOURCES.has(source) && body.kind === "tasks") {
+		const variant = typeof body.variant === "string" ? body.variant : "current";
+		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
+		// Empty / over-threshold digests have no rows to draw; they carry the same
+		// localized sentence the markdown projection used as its headline.
+		const emptyLabel =
+			variant === "current" && tasks.length > 0
+				? null
+				: variant === "emptyNever"
+					? sysLabel(ctx, "tasksEmptyNever")
+					: variant === "emptyDone"
+						? sysLabel(ctx, "tasksEmptyDone")
+						: variant === "tooMany"
+							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
+								// interpolation, so substitute here (same as the markdown path).
+								sysLabel(ctx, "tasksTooMany").replace("{n}", String(body.taskCount ?? 0))
+							: null;
+		// A periodic digest names its cadence in the header's subtitle slot, so the
+		// reader can tell "this is the routine every-N-tool-calls summary" apart from
+		// a turn-end continuation listing the same tasks. Height-neutral: the header
+		// row is a fixed single line either way.
+		const cadenceInterval =
+			typeof body.cadenceInterval === "number" && body.cadenceInterval > 0
+				? body.cadenceInterval
+				: null;
+		const speakerKind = cadenceInterval
+			? sysLabel(ctx, "cadenceEveryNTools").replace("{n}", String(cadenceInterval))
+			: null;
+		return [
+			{
+				kind: "injection-bubble",
+				key: `${idBase}-b${blockIndex}-p-${source}`,
+				data: {
+					payload: {
+						kind: "spec-task",
+						data: {
+							...(emptyLabel ? { emptyLabel } : {}),
+							tasks: tasks.map((task) => ({
+								text: task.text ?? "",
+								role: task.role,
+								protected: task.protected === true,
+							})),
+						},
+					},
+					speaker: null,
+					speakerKind,
+					isBroadcast: false,
+					source,
+					hasHeader: true,
+					// The verbatim model-facing copy, so the row can be inspected like any
+					// other injection (this branch previously offered no inspector).
+					modelFacing: modelFacingText,
+				},
+			},
+		];
+	}
+
+	if (PLATFORM_INJECTION_SOURCES.has(source)) {
+		const markdown = sideCarBodyToMarkdown(source, body, ctx.labels);
+		if (!markdown.trim()) return null;
+		return [
+			{
+				kind: "injection-bubble",
+				key: `${idBase}-b${blockIndex}-p-${source}`,
+				data: {
+					markdown,
+					// No speaker name: the integration layer resolves the shared platform
+					// identity from `source` (see `isPlatformSource`). Coining one name per
+					// producer would imply a cast of actors that does not exist.
+					speaker: null,
+					speakerKind: null,
+					isBroadcast: false,
+					source,
+					hasHeader: true,
+					// Same inspector contract as every other injection row.
+					modelFacing: modelFacingText,
+				},
+			},
+		];
+	}
+
+	return null;
+}
+
+/**
+ * Routine reminders raised by the platform itself.
+ *
+ * Separate from {@link SPOKEN_INJECTION_SOURCES} because the split differs, not because
+ * the entitlement does: a message delivery fans out per sender, whereas a reminder is one
+ * statement from one speaker regardless of how many tasks it lists.
+ */
+export const PLATFORM_INJECTION_SOURCES = new Set([
+	"living_work_spec",
+	"todo_reminder",
+	"behavior_fence",
+	"relaxed_plan",
+	"silent_progress",
+	"pipeline_exit_confirmation",
+	"spec_update",
+]);
+
+/**
+ * Producers whose payload is somebody TALKING, as opposed to a system fact.
+ *
+ * Deliberately a small allow-list rather than "anything with a messages body":
+ * adding a producer here is a claim that its content has an author worth naming, and
+ * that claim should be made explicitly at the point someone adds the producer.
+ */
+const SPOKEN_INJECTION_SOURCES = new Set([
+	// Somebody sent the reader something.
+	"subagent_message",
+	"team_message",
+	"group_message",
+	// Work the reader started reporting its own result. `bg_bash` qualifies for the
+	// same reason as `bg_agent`: an aliased background command is a named entity the
+	// system already treats as addressable, not an anonymous event.
+	"bg_agent",
+	"bg_bash",
+	// Reference material with a real excerpt. Gated on the payload as well as the tag —
+	// see the `knowledge` branch above.
+	"knowledge_base_hint",
+]);
+
+/**
+ * Display name for one inbound message's sender.
+ *
+ * Mirrors `senderLabel` in `@shared/sidecar-body` (title, else an 8-char id prefix) so
+ * the bubble header and the model-facing text name the same participant. Falls back to
+ * empty, which the render layer shows as an unnamed speaker rather than inventing one.
+ */
+function spokenSpeakerLabel(message: { fromTitle?: string | null; fromId?: string }): string {
+	return message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+}
+
 function adaptSystemBlock(
 	blockType: string,
 	block: AdapterContentBlock,
@@ -1675,7 +2088,7 @@ function adaptSystemBlock(
 		return {
 			kind: "system-simple",
 			key: `${idBase}-sys`,
-			data: adaptSystemSimpleData(blockType, block, contentText, ctx),
+			data: adaptSystemSimpleData(blockType, block, ctx),
 			...(blockType === "compact" && block.status === "compacting"
 				? compactProgressOpts(
 						"compacting",
@@ -1690,7 +2103,7 @@ function adaptSystemBlock(
 		return {
 			kind: "system-text",
 			key: `${idBase}-sys`,
-			data: adaptSystemTextData(blockType, block, contentText, ctx),
+			data: adaptSystemTextData(blockType, block, contentText, ctx, msg.createdAt),
 		};
 	}
 	// fallback: treat as info text. `message` is checked first because that is
@@ -1707,7 +2120,6 @@ function adaptSystemBlock(
 function adaptSystemSimpleData(
 	blockType: string,
 	block: AdapterContentBlock,
-	contentText: string,
 	ctx: AdapterContext,
 ): Record<string, unknown> {
 	switch (blockType) {
@@ -1750,18 +2162,6 @@ function adaptSystemSimpleData(
 				text: block.text ?? block.summary ?? sysLabel(ctx, "reviewFeedbackLabel"),
 				color: "gray",
 			};
-		case "spec_continuation":
-		case "spec_blocked_continuation": {
-			const isBlocked = blockType === "spec_blocked_continuation";
-			return {
-				kind: blockType,
-				// chunk: specBlock.task ?? message.contentText
-				text: block.task ?? block.text ?? contentText,
-				color: isBlocked ? "orange" : "indigo",
-				badgeLabel: sysLabel(ctx, isBlocked ? "specBlockedContinuation" : "specContinuation"),
-				protected: block.protected === true,
-			};
-		}
 		default:
 			return { kind: blockType, text: block.text ?? block.summary ?? "" };
 	}
@@ -1774,6 +2174,8 @@ function adaptSystemTextData(
 	block: AdapterContentBlock,
 	contentText: string,
 	ctx: AdapterContext,
+	/** Row timestamp, for the kinds whose card carries a heading row. */
+	createdAt?: string | null,
 ): Record<string, unknown> {
 	switch (blockType) {
 		// `info` carries its body in `message`, NOT `text` — persistDisplayMessage
@@ -1808,6 +2210,34 @@ function adaptSystemTextData(
 		case "tool_loaded":
 		case "tool_unloaded":
 			return { kind: blockType, text: block.text ?? block.summary ?? "" };
+		case "system_injection": {
+			// Reuses the `origin_notice` card: a heading row (what injected this, when)
+			// above a wrapping body — exactly the shape an injection needs, and already
+			// measured. No new element kind, no new geometry.
+			//
+			// The body is projected from the STRUCTURED payload, not from the message's
+			// text block: the text block is the model-facing copy, complete with the
+			// instruction boilerplate ("do not add IDs…") that a reader has no use for.
+			// Falls back to that text only when a producer supplied no body.
+			const body = readSideCarBody(block);
+			const source = typeof block.source === "string" ? block.source : "";
+			const markdown = body
+				? sideCarBodyToMarkdown(source, body, ctx.labels)
+				: rawSideCarToMarkdown(block.text ?? contentText);
+			return {
+				kind: "origin_notice",
+				text: markdown || rawSideCarToMarkdown(block.text ?? contentText),
+				title: injectionHeadingLabel(ctx, source),
+				timeLabel: formatOriginNoticeTime(createdAt),
+				origin: "system",
+				originLabel: source || null,
+				// The model-facing copy, verbatim: the body above is the READER's projection
+				// (instruction boilerplate stripped), while this is what the agent actually
+				// received. The context-menu inspector shows this so the reader can see
+				// exactly what the model saw.
+				modelFacing: block.text ?? contentText,
+			};
+		}
 		case "spec_goal_added": {
 			const added = block.added !== false;
 			return {
@@ -1869,9 +2299,22 @@ type ToolLodGroup =
 	| { kind: "active"; item: AdapterToolItem; index: number }
 	| { kind: "folded"; items: AdapterToolItem[]; startIndex: number };
 
+/** True when an item is the pinned latest spec://tasks.json call (see AdapterContext). */
+function isLatestSpecTasksToolItem(
+	item: AdapterToolItem,
+	latestSpecTasksToolUseId: string | null | undefined,
+): boolean {
+	return latestSpecTasksToolUseId != null && item.tc.toolUseId === latestSpecTasksToolUseId;
+}
+
 /** Split a tool run into chronological groups: active items stay standalone,
- * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod. */
-export function groupToolItemsForLod(items: AdapterToolItem[]): ToolLodGroup[] {
+ * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod —
+ * including its second argument: the latest tasks.json call keeps its full card
+ * out of the fold at every LOD. */
+export function groupToolItemsForLod(
+	items: AdapterToolItem[],
+	latestSpecTasksToolUseId?: string | null,
+): ToolLodGroup[] {
 	const groups: ToolLodGroup[] = [];
 	let pending: AdapterToolItem[] = [];
 	let pendingStart = 0;
@@ -1883,7 +2326,7 @@ export function groupToolItemsForLod(items: AdapterToolItem[]): ToolLodGroup[] {
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		if (!item) continue;
-		if (isActiveToolItem(item)) {
+		if (isActiveToolItem(item) || isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)) {
 			flush();
 			groups.push({ kind: "active", item, index: i });
 			continue;
@@ -1923,21 +2366,13 @@ function adaptToolItemFull(
 		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
 	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
-	// Per-sidecar fold states, keyed by index within this card. Carried as a plain
-	// number[] (NOT a resolver closure) so the measure cache's digestOpts can fold
-	// it into the cache key — an expanded sidecar measures a taller body, so the
-	// state must participate in keying exactly like `expandedIndices` does for a
-	// trace. Keyed `${key}-sc${index}` to match the standalone sidecar specs.
-	const sidecarExpandedIndices: number[] = [];
-	{
-		const raw = (item.tc as { sideCars?: unknown }).sideCars;
-		const count = Array.isArray(raw)
-			? collectVisibleSidecars(raw as AdapterSidecar[], "tool_result").length
-			: 0;
-		for (let i = 0; i < count; i++) {
-			if (ctx.isExpanded?.(`${key}-sc${i}`) === true) sidecarExpandedIndices.push(i);
-		}
-	}
+	// The latest tasks.json call stays expanded at every LOD (the task board is the
+	// narrator's live working state). Like the permission flag it folds into the
+	// card's opts, so the measure cache keys the two geometries apart.
+	const isPinnedSpecTasks = isLatestSpecTasksToolItem(
+		item,
+		ctx.resolveLatestSpecTasksToolUseId?.(),
+	);
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -1948,13 +2383,13 @@ function adaptToolItemFull(
 		// Pending-permission cards stay expanded and re-measure when the request
 		// appears/disappears (the boolean folds into the measure cache key).
 		...(hasPendingPermission ? { hasPendingPermission: true } : {}),
+		// Same contract for the pinned tasks card: it never collapses to a header,
+		// even at L4 or as an older card at L5.
+		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
 		collapsesByLod:
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
 			(ctx.lod === 4 || (ctx.lod === 5 && !isRecentToolItem(item, ctx))),
-		// Empty array omits the field (digestOpts skips it), keeping sidecar-free
-		// cards' cache keys byte-identical to before this feature.
-		...(sidecarExpandedIndices.length > 0 ? { sidecarExpanded: sidecarExpandedIndices } : {}),
 	};
 	if (item.isSubagent) {
 		// Map height-relevant SubagentCardData fields (NOT `status` — that field
@@ -1993,7 +2428,13 @@ function adaptToolItemFull(
 		const recentCallCategories = namedRecentCalls.map(
 			(call) => ctx.resolveToolCategory?.(call.toolName as string) ?? null,
 		);
-		const resultText = typeof item.tc.outputJson === "string" ? item.tc.outputJson : undefined;
+		// The conclusion body, via the SHARED extraction rule. A bare `typeof === "string"`
+		// check used to live here, which dropped the result entirely for the ~43% of rows
+		// whose output is the runner's `{_text, _metadata}` envelope — a finished subagent
+		// card with a blank conclusion. `withFullOutput` so a projected/truncated body is
+		// replaced by the real one once the shell fetched it.
+		const resultBody = subagentResultText(withFullOutput(item, ctx));
+		const resultText = resultBody || undefined;
 		const isActive = !isTerminalStatus(item.tc.status);
 		// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
 		// derivations). prompt/isBackground/agentType live on inputJson; Send tools
@@ -2144,12 +2585,6 @@ function buildToolCardData(
 		// permission area, and is MEASURED — the row's height is final on first
 		// paint instead of being corrected by a ResizeObserver afterwards.
 		reflection: resolveToolReflection(item, ctx, hasPendingPermission),
-		// Tool-result sidecars (system injections the model saw in this tool's
-		// output). Each becomes a measured mini-card inside the tool card, between
-		// the header and the detail — the chunked ToolCallCard renders its
-		// SideCarNotice at exactly that spot (outside the collapse, so it shows
-		// even on a folded card). Measured, never a slot.
-		sidecars: buildToolSidecarData(item, ctx),
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
@@ -2167,38 +2602,6 @@ function buildToolCardData(
 			...(ctx.labels ? { labels: ctx.labels } : {}),
 		}),
 	};
-}
-
-/**
- * Build the tool card's tool_result sidecar payloads (the mini-cards rendered
- * between the header and the detail region). Returns null when the tool carries
- * no visible ones so the card data stays byte-identical to a sidecar-free build
- * (keeping the measure cache key stable for the overwhelmingly common case).
- */
-function buildToolSidecarData(
-	item: AdapterToolItem,
-	ctx: AdapterContext,
-): SidecarSpecData[] | null {
-	const raw = (item.tc as { sideCars?: unknown }).sideCars;
-	if (!Array.isArray(raw)) return null;
-	const visible = collectVisibleSidecars(raw as AdapterSidecar[], "tool_result");
-	if (visible.length === 0) return null;
-	const truncatedLabel = sysLabel(ctx, "sidecarTruncated");
-	return visible.map((sc) => {
-		const meta = SIDECAR_SOURCE_META[sc.source];
-		return {
-			payloadKind: SIDECAR_PAYLOAD_KIND,
-			source: sc.source,
-			sourceLabel: meta
-				? sysLabel(ctx, meta.labelKey)
-				: sc.source || sysLabel(ctx, "sidecarUnknown"),
-			color: meta?.color ?? "gray",
-			target: sc.target,
-			previewText: sidecarPreviewText(sc.content),
-			fullText: sidecarDetailText(sc.content, truncatedLabel),
-			truncatedLabel,
-		} satisfies SidecarSpecData;
-	});
 }
 
 /** Chunk parity: Bash falls back to a 120s deadline (ToolCallCard.tsx:1327). */
@@ -2553,19 +2956,27 @@ function toolTraceItem(
 
 /**
  * The folded rows of one tool batch, with the reader's drilled-in rows carrying
- * their full card payload.
+ * their full card payload, plus the row INDICES those rows landed on.
  *
- * `expandedIndices` are indices into THIS array (the measure layer resolves a
- * visible row back to `startIndex + vi`), so the two must agree on the numbering
- * or a click would open a different tool than the one under the cursor.
+ * Expansion is decided per ROW KEY (`ctx.isRowExpanded`) and the indices are
+ * DERIVED from the result, rather than the reverse. The measure layer resolves a
+ * visible row back to `startIndex + vi` over this very array, so deriving the
+ * indices here is what keeps the two sides numbering the same rows — and reading
+ * the reader's intent from a key is what makes the decision survive a row list
+ * that grows mid-stream (see `AdapterContext.isRowExpanded`).
  */
 function foldedToolItems(
 	items: AdapterToolItem[],
 	ctx: AdapterContext,
 	traceKey: string,
-): unknown[] {
-	const expanded = new Set(ctx.expandedRows?.(traceKey) ?? []);
-	return items.map((item, index) => toolTraceItem(item, ctx, expanded.has(index)));
+): { rows: unknown[]; expandedIndices: number[] } {
+	const expandedIndices: number[] = [];
+	const rows = items.map((item, index) => {
+		const expanded = ctx.isRowExpanded?.(traceKey, toolItemKey(item)) ?? false;
+		if (expanded) expandedIndices.push(index);
+		return toolTraceItem(item, ctx, expanded);
+	});
+	return { rows, expandedIndices };
 }
 
 /**
@@ -2575,28 +2986,25 @@ function foldedToolItems(
  *   - L≤2: completed batches fold into `tool-run-count`; active stay standalone.
  * (The cross-segment reasoning+tool→activity fold is applied earlier by the
  * caller's groupRenderUnits, producing an "activity" unit — see adaptActivityUnit.)
+ *
+ * The pinned latest tasks.json call counts as "active" for the grouping: it keeps
+ * its full expanded card at its original position at every LOD.
  */
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
 	const isMultiRun = items.length >= 2;
 	const isSoleSubagent = items.filter((item) => item.isSubagent).length === 1;
-	// Message-level sidecars of PURE-TOOL source messages (no visible content
-	// block): such a message never produces a bubble segment, so its sidecars
-	// would be lost entirely. Surface them at the END of the run — the chunked
-	// MessageRenderer does exactly this (skipping messages that DO have a bubble,
-	// which renders its own sidecars, to avoid duplication).
-	const toolOnlySidecars = collectToolOnlyMessageSidecars(items);
-	const sidecarSpecs = buildSidecarSpecs(toolOnlySidecars, toolRunSidecarKeyBase(items), ctx);
 	if (ctx.lod >= 4) {
-		const specs = items.map((item, index) =>
+		return items.map((item, index) =>
 			adaptToolItemFull(item, ctx, {
 				inRun: isMultiRun,
 				isLast: index === items.length - 1,
 				isSoleSubagent,
 			}),
 		);
-		return [...specs, ...sidecarSpecs];
 	}
-	const groups = groupToolItemsForLod(items);
+	// Resolved once per run: the resolver is a shell closure over the latest id,
+	// and the grouping below only ever compares against it.
+	const groups = groupToolItemsForLod(items, ctx.resolveLatestSpecTasksToolUseId?.());
 	const specs: ElementSpec[] = [];
 	for (const group of groups) {
 		if (group.kind === "active") {
@@ -2617,17 +3025,21 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			// and the per-row drill-down set, which must agree (a row's card is built
 			// from the same key the measure layer resolves `expandedIndices` from).
 			const specKey = `toolrun-summary-${traceKey}`;
+			const folded = foldedToolItems(group.items, ctx, specKey);
 			specs.push({
 				kind: "tool-run-summary",
 				key: specKey,
 				data: {
-					items: foldedToolItems(group.items, ctx, specKey),
+					items: folded.rows,
 					headerLabel: sysLabel(ctx, "toolCalls"),
 					headerCount: countLabel(ctx, "toolCallsCount", group.items.length),
 				},
 				opts: {
 					showEarlier: ctx.showEarlier?.(specKey) ?? false,
-					expandedIndices: ctx.expandedRows?.(specKey) ?? [],
+					// Derived from the rows just built, never resolved independently: the
+					// two must agree on WHICH rows are open, and a second lookup is exactly
+					// where they used to drift (see foldedToolItems).
+					expandedIndices: folded.expandedIndices,
 					viewportHeight: ctx.viewportHeight,
 				},
 			});
@@ -2643,36 +3055,7 @@ function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpe
 			});
 		}
 	}
-	return [...specs, ...sidecarSpecs];
-}
-
-/**
- * The `user_message` sidecars of the run's PURE-TOOL source messages, deduped
- * by message id and ordered by first appearance. A message that has its own
- * visible content block is skipped — its bubble already renders those cards.
- * Mirrors MessageRenderer.tsx:233-243 (same predicate, same dedup).
- */
-function collectToolOnlyMessageSidecars(items: readonly AdapterToolItem[]): AdapterSidecar[] {
-	const seen = new Set<string>();
-	const out: AdapterSidecar[] = [];
-	for (const item of items) {
-		const srcMsg = item.msg;
-		if (!srcMsg) continue;
-		if (srcMsg.id) {
-			if (seen.has(srcMsg.id)) continue;
-			seen.add(srcMsg.id);
-		}
-		if (adapterMessageHasVisibleContent(srcMsg)) continue;
-		out.push(...collectVisibleSidecars(srcMsg.sideCars, "user_message"));
-	}
-	return out;
-}
-
-/** Stable key base for a run's trailing sidecar cards (first member's identity). */
-function toolRunSidecarKeyBase(items: readonly AdapterToolItem[]): string {
-	const first = items[0];
-	if (!first) return "toolrun";
-	return `toolrun-sc-${toolItemKey(first)}`;
+	return specs;
 }
 
 /**
@@ -2761,17 +3144,29 @@ function adaptActivityItems(
 	traceItems: AdapterTraceItem[];
 	reasoningCount: number;
 	toolCount: number;
+	/**
+	 * Indices (into `traceItems`) of the rows that ended up expanded — DERIVED from
+	 * the per-key decisions taken while emitting, never resolved separately.
+	 */
+	expandedIndices: number[];
 } {
 	let reasoningCount = 0;
 	let toolCount = 0;
 	const traceItems: AdapterTraceItem[] = [];
-	// ⚠️ The drill-down set indexes the EMITTED ROW list, not the input `items`:
-	// one reasoning block expands into several rows, so the input index and the row
-	// index drift apart as soon as a multi-step reasoning run precedes a tool. The
-	// measure layer resolves a visible row to `startIndex + vi` over the same
-	// emitted array, so `traceItems.length` (read BEFORE the push) is the only
-	// numbering both sides agree on.
-	const expandedRowIndices = new Set(ctx.expandedRows?.(traceKey) ?? []);
+	// ⚠️ Expansion is decided per ROW KEY, and the index is recorded as the row is
+	// emitted. Both halves of that matter:
+	//
+	//  - The index numbering must be over the EMITTED ROW list, not the input
+	//    `items`: one reasoning block expands into several rows, so the two drift
+	//    apart as soon as a multi-step run precedes a tool. The measure layer
+	//    resolves a visible row to `startIndex + vi` over this same array, so
+	//    `traceItems.length` (read BEFORE the push) is the only numbering both
+	//    sides agree on.
+	//  - The reader's INTENT must not be stored as that index. A live reasoning run
+	//    emits one row per step, so the next `**title**` shifts every following row
+	//    down by one and a stored index starts addressing a different tool. See
+	//    `AdapterContext.isRowExpanded`.
+	const expandedIndices: number[] = [];
 	for (const item of items) {
 		if (item.kind === "reasoning") {
 			const block = item.block;
@@ -2840,27 +3235,35 @@ function adaptActivityItems(
 			});
 			continue;
 		}
-		const toolRow = toolTraceItem(
-			{
-				...item,
-				msg: item.msg,
-				blockIndex: item.blockIndex ?? 0,
-				isSubagent: false,
-				tc: item.tc,
-			},
-			ctx,
-			expandedRowIndices.has(traceItems.length),
-		);
+		const toolItem = {
+			...item,
+			msg: item.msg,
+			blockIndex: item.blockIndex ?? 0,
+			isSubagent: false,
+			tc: item.tc,
+		};
+		// The row's FINAL key, resolved BEFORE the expansion lookup.
+		//
 		// A retry's repeated tool-use id gets a suffix so its row cannot overlap the
-		// earlier one (see AdapterActivityInput.dedupeSuffix). The `unitId` moves with
-		// it: two calls sharing an id are still two distinct pieces of content.
+		// earlier one (see AdapterActivityInput.dedupeSuffix) — and that suffixed key is
+		// what the renderer paints and what the shell therefore records on a click. So
+		// the lookup has to use the same string; asking with the un-suffixed key would
+		// never match the reader's own second attempt.
+		const rowKey = item.dedupeSuffix
+			? `${toolItemKey(toolItem)}#${item.dedupeSuffix}`
+			: toolItemKey(toolItem);
+		const expanded = ctx.isRowExpanded?.(traceKey, rowKey) ?? false;
+		if (expanded) expandedIndices.push(traceItems.length);
+		const toolRow = toolTraceItem(toolItem, ctx, expanded);
+		// `unitId` moves with the key: two calls sharing an id are still two distinct
+		// pieces of content.
 		if (item.dedupeSuffix) {
-			toolRow.key = `${toolRow.key}#${item.dedupeSuffix}`;
+			toolRow.key = rowKey;
 			if (toolRow.unitId) toolRow.unitId = `${toolRow.unitId}#${item.dedupeSuffix}`;
 		}
 		traceItems.push(toolRow);
 	}
-	return { traceItems, reasoningCount, toolCount };
+	return { traceItems, reasoningCount, toolCount, expandedIndices };
 }
 
 /**
@@ -2911,7 +3314,9 @@ export function adaptActivityUnit(
 			collapsed: ctx.lod === 1 && !isRecentActivityUnit(items, ctx),
 			itemsOpened: ctx.isExpanded?.(key) ?? false,
 			showEarlier: ctx.showEarlier?.(key) ?? false,
-			expandedIndices: ctx.expandedRows?.(key) ?? [],
+			// Derived while the rows were emitted, never resolved a second time — see
+			// adaptActivityItems on why a stored index cannot survive a live run.
+			expandedIndices: activity.expandedIndices,
 			// A drilled-in row nests a real tool card, whose `plan` detail caps at
 			// 0.85 × viewport — so the trace needs the viewport height a standalone
 			// card already gets through its own opts.

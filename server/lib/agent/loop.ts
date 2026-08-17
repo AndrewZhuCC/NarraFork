@@ -12,6 +12,7 @@ import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from
 import { shouldUseNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
+import { sideCarBodyWithText } from "../sidecar-templates";
 import { analyzeShellCommand } from "./bash-analyze";
 import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
@@ -36,7 +37,6 @@ import {
 import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
-import { appendSideCarsForApi } from "./sidecar";
 import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
@@ -90,7 +90,6 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
-	AgentSideCar,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -452,6 +451,25 @@ function emptyResponseEvidence(signals: EmptyResponseSignals): string {
 /** Max retries specifically for empty responses (request succeeded but no content). */
 const MAX_EMPTY_RESPONSE_RETRIES = 3;
 
+/**
+ * Replay budget for an empty turn the upstream demonstrably SERVED.
+ *
+ * `usage_only` / `stop_without_content` mean the request reached the model, was
+ * accounted for, and came back with a stop signal but no content. Replaying the
+ * identical request has a poor success rate in practice — production logs show
+ * these failing identically on every attempt — while each replay pays the full
+ * prompt again. One retry covers a genuine one-off; beyond that the turn is
+ * handed back so the caller can rebuild history and issue a fresh request.
+ */
+const MAX_EMPTY_RESPONSE_RETRIES_SERVED = 1;
+
+/** Replay budget for one empty-turn kind. */
+function maxEmptyResponseRetriesFor(kind: EmptyResponseKind): number {
+	return kind === "empty_response_usage_only" || kind === "empty_response_stop_without_content"
+		? MAX_EMPTY_RESPONSE_RETRIES_SERVED
+		: MAX_EMPTY_RESPONSE_RETRIES;
+}
+
 /** Reasoning-only responses above this occupancy trigger one blocking compact attempt. */
 const REASONING_ONLY_COMPACT_THRESHOLD = 95;
 
@@ -599,7 +617,7 @@ function* flushPartialContent(
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
 // Named for the legacy todo reminder it replaced; still the spec-reminder interval.
 export const TODO_REMINDER_TOOL_INTERVAL = 15;
-const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 20;
+const DEFAULT_SILENT_TOOL_CALL_THRESHOLD = 50;
 
 const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Read",
@@ -968,18 +986,6 @@ export function buildDangerReflectionPrompt(
 	return `${basePrompt}\n\n${heading}\n${appendPrompt}`;
 }
 
-function formatAllowedPrompts(value: unknown): string {
-	if (!Array.isArray(value) || value.length === 0) return "- (none)";
-	const items = value.flatMap((entry) => {
-		if (!entry || typeof entry !== "object") return [];
-		const tool = (entry as { tool?: unknown }).tool;
-		const prompt = (entry as { prompt?: unknown }).prompt;
-		if (typeof prompt !== "string" || !prompt.trim()) return [];
-		return [`- ${typeof tool === "string" && tool ? `${tool}: ` : ""}${prompt.trim()}`];
-	});
-	return items.length > 0 ? items.join("\n") : "- (none)";
-}
-
 type ExitPlanReflectionAutoCompactConfig = Pick<AgentConfig, "planReflectionAllowAutoCompact">;
 
 export function shouldAllowExitPlanReflectionAutoCompact(
@@ -1008,8 +1014,7 @@ export function buildExitPlanReflectionPrompt(
 	const basePrompt = getPrompt("exitPlanReflection", locale)
 		.replaceAll("{requestId}", requestId)
 		.replaceAll("{inputJson}", JSON.stringify(input, null, 2))
-		.replaceAll("{planText}", planText)
-		.replaceAll("{allowedPromptsList}", formatAllowedPrompts(input.allowedPrompts));
+		.replaceAll("{planText}", planText);
 	if (!shouldAllowExitPlanReflectionAutoCompact(config)) return basePrompt;
 	return `${basePrompt}\n\n${getPrompt("exitPlanReflectionAutoCompact", locale)}`;
 }
@@ -1297,7 +1302,13 @@ export async function runReflectionLoop(
 			maxTransientRetries: getAuxiliaryMaxRetries(parentConfig.maxTransientRetries),
 			onEvent: undefined,
 			onBeforeTurn: undefined,
-			getSideCars: undefined,
+			// A reflection is an auxiliary call inside the parent's turn. It must not deliver
+			// injections: the reminders belong to the parent conversation, and writing rows
+			// from here would put them in the transcript twice (once now, once when the parent
+			// reaches its own boundary).
+			deliverInjectionRow: undefined,
+			getAfterToolsInjections: undefined,
+			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: undefined,
 			toolFilter: undefined,
@@ -2117,15 +2128,26 @@ async function executeToolAfterReflections(
 				pendingPlanCompact.add(config.narratorId);
 			}
 
+			// Mark the plan-approval source so the `_planApprovedContinue` persistence
+			// branch attributes the injected "plan approved, begin execution" turn to
+			// the plan reflection (left bubble, "计划反思") instead of a generic
+			// auto-continuation system card or a human user.
+			const { pendingPlanApproverSource } = await import("@server/services/narrator-session-state");
+			pendingPlanApproverSource.set(config.narratorId, "reflection");
+
 			// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
 			// original model input so executeTool emits updatedInput and the event handler persists
 			// the resolved plan before onExitPlanMode reads it for optional plan compact.
 			const result = await executeAfterPreAdmission({
 				preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
 			});
-			if (shouldCompact && result.isError) {
+			if (result.isError) {
+				// The plan was never approved-and-continued, so both markers are stale. Left
+				// behind, `pendingPlanApproverSource` would attribute the NEXT approval in
+				// this same loop — possibly a real person's — to the reflection.
 				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-				pendingPlanCompact.delete(config.narratorId);
+				if (shouldCompact) pendingPlanCompact.delete(config.narratorId);
+				pendingPlanApproverSource.delete(config.narratorId);
 			}
 			return result;
 		}
@@ -2299,12 +2321,18 @@ export async function* agentLoop(
 	let tools = provider.formatTools(resolveToolsForProvider(effectiveProvider, effectiveModel));
 	let pendingToolResults: unknown[] = initialToolResults ?? [];
 	let turnIndex = 0;
-	let completedToolCount = config.sideCarInitialCompletedToolCount ?? 0;
+	let completedToolCount = config.initialCompletedToolCount ?? 0;
 	const silentToolCallThreshold = normalizeSilentToolCallThreshold(config.silentToolCallThreshold);
 	let silentToolCallCount = 0;
-	const countedToolUseIds = new Set<string>();
-	const sideCarCheckedToolUseIds = new Set<string>();
-	const toolResultSideCarCache = new Map<string, AgentSideCar[]>();
+	/**
+	 * Tools whose settled result has already been processed for injections.
+	 *
+	 * One set, not the three it replaces: the old code kept a counted-ids set, a
+	 * sidecar-checked set and a result cache, each guarding a different slice of the same
+	 * function against the same re-entry (a result drained during streaming and again by
+	 * the execution-group loop). They could only ever hold the same ids.
+	 */
+	const processedToolUseIds = new Set<string>();
 	const pipelineExitConfirmationAttachedStateIds = new Set<string>();
 	// Knowledge-base entry ids already injected this compact cycle (point B de-dup; shared
 	// across tool outputs). Prefer the session-provided shared set so point A (user message)
@@ -2312,20 +2340,71 @@ export async function* agentLoop(
 	// a compact boundary clears it. Falls back to a local set for standalone/test callers.
 	const knowledgeInjectedEntryIds = config.knowledgeInjectedEntryIds ?? new Set<string>();
 
-	function cacheToolResultSideCars(toolUseId: string, sideCars: AgentSideCar[]): AgentSideCar[] {
-		toolResultSideCarCache.set(toolUseId, sideCars);
-		return sideCars;
+	/**
+	 * Reminders the loop itself raised, awaiting delivery at the turn boundary.
+	 *
+	 * These used to be appended INSIDE the tool result's string. They are now persisted
+	 * as their own message rows by the host (`config.deliverInjectionRow`) and folded into
+	 * the next turn's text, which is why they are queued rather than returned: a row must
+	 * be written once per reminder, not once per tool result that happened to be assembled.
+	 */
+	type LoopInjection = NonNullable<Parameters<NonNullable<typeof config.deliverInjectionRow>>[0]>;
+
+	const pendingLoopInjections: LoopInjection[] = [];
+
+	function queueLoopInjection(injection: LoopInjection): void {
+		if (!injection.content.trim()) return;
+		pendingLoopInjections.push(injection);
 	}
 
-	async function collectToolResultSideCars(
+	/**
+	 * Persist the queued reminders and return the text for the current turn.
+	 *
+	 * A host without the hook gets "" and the reminders are dropped rather than falling
+	 * back to a side-car: delivering both ways is how the same words end up in the
+	 * conversation twice.
+	 */
+	async function flushLoopInjections(): Promise<string> {
+		if (pendingLoopInjections.length === 0) return "";
+		const queued = pendingLoopInjections.splice(0, pendingLoopInjections.length);
+		if (!config.deliverInjectionRow) return "";
+		const parts: string[] = [];
+		for (const injection of queued) {
+			try {
+				const text = await config.deliverInjectionRow(injection);
+				if (text?.trim()) parts.push(text);
+			} catch (err) {
+				logger.warn("Failed to deliver loop injection row", {
+					narratorId: config.narratorId,
+					source: injection.source,
+					error: String(err),
+				});
+			}
+		}
+		return parts.join("\n\n");
+	}
+
+	/**
+	 * Raise the reminders a settled tool result warrants, and advance the tool counter.
+	 *
+	 * Formerly `collectToolResultSideCars`, which returned side-cars to be appended inside
+	 * the tool result's string. Every one of those reminders is now a message row (queued
+	 * here, persisted at the turn boundary by {@link flushLoopInjections}), so nothing is
+	 * returned — but the call sites are unchanged in one respect that matters:
+	 *
+	 * ⚠️ This is called MORE THAN ONCE for the same tool. A result can be drained during
+	 * streaming and again by the execution-group loop, so `processedToolUseIds` makes the
+	 * whole body idempotent. Without it a single silent-progress threshold crossing would
+	 * queue two rows, and the completed-tool count would double-advance — which would in
+	 * turn fire the cadence-driven reminders at twice their configured rate.
+	 */
+	async function processToolResultInjections(
 		tu: AgentToolUse,
 		result: ToolExecResult,
-	): Promise<AgentSideCar[]> {
-		if (toolResultSideCarCache.has(tu.toolUseId)) {
-			return toolResultSideCarCache.get(tu.toolUseId) ?? [];
-		}
+	): Promise<void> {
+		if (processedToolUseIds.has(tu.toolUseId)) return;
+		processedToolUseIds.add(tu.toolUseId);
 
-		const sideCars: AgentSideCar[] = [];
 		const pipelineStateId = result.pipelineExitConfirmationStateId;
 		if (pipelineStateId && !pipelineExitConfirmationAttachedStateIds.has(pipelineStateId)) {
 			pipelineExitConfirmationAttachedStateIds.add(pipelineStateId);
@@ -2333,40 +2412,42 @@ export async function* agentLoop(
 				...result.metadata,
 				pipelineExitConfirmationStateId: pipelineStateId,
 			};
-			sideCars.push({
-				target: "tool_result",
+			queueLoopInjection({
 				source: "pipeline_exit_confirmation",
-				content: getToolMessage("pipelineExitConfirmation", locale),
-				orderIndex: 40,
+				...sideCarBodyWithText("pipeline_exit_confirmation", { kind: "notice" }, locale),
 				toolUseId: tu.toolUseId,
+				// The ack must happen only once the row is durable, which the host knows and
+				// this loop does not. Carrying the id here replaces the old detour through
+				// `result.metadata` and the event handler.
+				pipelineExitConfirmationStateId: pipelineStateId,
 			});
 		}
 
 		if (!result.broken && !result.fatal) {
 			silentToolCallCount++;
 			if (silentToolCallThreshold >= 0 && silentToolCallCount >= silentToolCallThreshold) {
-				sideCars.push({
-					target: "tool_result",
+				queueLoopInjection({
 					source: "silent_progress",
-					content: getToolMessageWithParams("silentToolCallProgressReminder", locale, {
-						count: silentToolCallCount,
-					}),
-					orderIndex: 10,
+					...sideCarBodyWithText(
+						"silent_progress",
+						{ kind: "notice", params: { count: silentToolCallCount } },
+						locale,
+					),
 					toolUseId: tu.toolUseId,
 				});
 				silentToolCallCount = 0;
 			}
 		}
 
-		if (result.broken || result.fatal) {
-			return cacheToolResultSideCars(tu.toolUseId, sideCars);
-		}
+		// A broken or fatal result gets no further reminders: the model needs to see the
+		// failure, not advice about planning or the knowledge base. It also must not count
+		// toward the completed-tool cadence, which measures productive work.
+		if (result.broken || result.fatal) return;
+
 		if (await shouldInjectRelaxedPlanToolReminder(tu, config)) {
-			sideCars.push({
-				target: "tool_result",
+			queueLoopInjection({
 				source: "relaxed_plan",
-				content: getToolMessage("relaxedPlanToolReminder", locale),
-				orderIndex: 20,
+				...sideCarBodyWithText("relaxed_plan", { kind: "notice" }, locale),
 				toolUseId: tu.toolUseId,
 			});
 		}
@@ -2387,11 +2468,23 @@ export async function* agentLoop(
 					},
 				);
 				if (scan) {
-					sideCars.push({
-						target: "tool_result",
+					queueLoopInjection({
 						source: "knowledge_base_hint",
-						content: scan.content,
-						orderIndex: 30,
+						// `scan.content` is the same text this body renders to (asserted in
+						// sidecar-body.test.ts against formatInjectionsBare), so the body is
+						// the authority and the text is derived from it — not both kept.
+						...sideCarBodyWithText(
+							"knowledge_base_hint",
+							{
+								kind: "knowledge",
+								hits: scan.hits.map((hit) => ({
+									entryId: hit.entryId,
+									title: hit.title,
+									summary: hit.summary,
+								})),
+							},
+							locale,
+						),
 						toolUseId: tu.toolUseId,
 						knowledgeInjection: {
 							narratorId: config.narratorId,
@@ -2409,45 +2502,35 @@ export async function* agentLoop(
 				});
 			}
 		}
-		if (!countedToolUseIds.has(tu.toolUseId)) {
-			countedToolUseIds.add(tu.toolUseId);
-			completedToolCount++;
-			config.onSideCarCompletedToolCount?.(completedToolCount);
-		}
-		if (!config.getSideCars || sideCarCheckedToolUseIds.has(tu.toolUseId)) {
-			return cacheToolResultSideCars(tu.toolUseId, sideCars);
-		}
-		sideCarCheckedToolUseIds.add(tu.toolUseId);
-		try {
-			const collected = await config.getSideCars({
-				phase: "tool_result",
-				toolName: tu.name,
-				toolUseId: tu.toolUseId,
-				completedToolCount,
-			});
-			sideCars.push(...collected.filter((sc) => sc.target === "tool_result"));
-		} catch (err) {
-			logger.warn("Failed to collect tool result sidecars", {
-				narratorId: config.narratorId,
-				toolUseId: tu.toolUseId,
-				error: String(err),
-			});
-		}
-		return cacheToolResultSideCars(tu.toolUseId, sideCars);
+		completedToolCount++;
+		config.onCompletedToolCount?.(completedToolCount);
 	}
 
-	async function collectAfterToolsSideCars(): Promise<AgentSideCar[]> {
-		if (!config.getSideCars) return [];
+	/**
+	 * Text to fold into the next turn from producers that persist their OWN message row.
+	 *
+	 * The successor to the `after_tools` side-car phase, and it differs in the one way
+	 * that matters: nothing is yielded for persistence. A producer calling
+	 * `deliverInjection` has already written a row, so emitting a side-car here as well
+	 * would put the same words into the conversation twice — once as a row and once as an
+	 * attachment on somebody else's message.
+	 *
+	 * The text is still needed because this loop rebuilds its in-memory history only at
+	 * pass start: a row written mid-turn is invisible until the next pass, and a
+	 * finished background task should not have to wait that long to be mentioned.
+	 */
+	async function collectAfterToolsInjectionText(): Promise<string> {
+		if (!config.getAfterToolsInjections) return "";
 		try {
-			const sideCars = await config.getSideCars({ phase: "after_tools" });
-			return sideCars.filter((sc) => sc.target === "user_message");
+			const text = await config.getAfterToolsInjections();
+			return text?.trim() ?? "";
 		} catch (err) {
-			logger.warn("Failed to collect after-tools sidecars", {
+			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
 				error: String(err),
 			});
+			return "";
 		}
-		return [];
 	}
 
 	// Shallow-copy to avoid mutating the caller's array
@@ -2791,7 +2874,7 @@ export async function* agentLoop(
 					const brokenOverride = settled.broken
 						? sanitizeBrokenInput(tu.name, tu.input, locale)
 						: undefined;
-					const toolSideCars = await collectToolResultSideCars(tu, settled);
+					await processToolResultInjections(tu, settled);
 					const baseOutput = settled.broken
 						? getToolMessage("brokenToolCallResult", locale)
 						: settled.output;
@@ -2808,7 +2891,6 @@ export async function* agentLoop(
 						brokenInputOverride: brokenOverride,
 						updatedInput: brokenOverride ?? settled.updatedInput,
 						metadata: settled.metadata,
-						sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 					};
 				}
 			}
@@ -3025,17 +3107,66 @@ export async function* agentLoop(
 			 * there is actually partial output to continue from — otherwise it
 			 * degrades to an ordinary retryable/non-retryable error.
 			 */
+			/**
+			 * Names of tool calls the model had STARTED writing arguments for when the
+			 * stream ended, but which never received a stop signal — the accumulator
+			 * still holds a half-written input.
+			 *
+			 * This is the single source of truth for "the model was cut off mid tool
+			 * input". It is deliberately distinct from "only reasoning was produced":
+			 * a truncated tool input proves the model committed to a tool call whose
+			 * arguments did not fit, so the recovery is to tell it to write smaller
+			 * calls (the skeleton-first reminder), NOT to replay the identical request
+			 * and hit the same ceiling again.
+			 *
+			 * Entries without a name are ignored: a `toolUseChunk` carrying only an id
+			 * never creates a real accumulator entry and represents no output.
+			 */
+			const orphanedToolInputNames = (): string[] =>
+				[...toolUseAccum.values()].map((acc) => acc.name).filter((name): name is string => !!name);
+
 			const hasAnyPersistableOutput = (): boolean => {
-				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
 				return (
 					!!assistantText ||
 					toolUses.length > 0 ||
-					hasOrphanedToolAccum ||
+					orphanedToolInputNames().length > 0 ||
 					!!collectReasoningBlocks(reasoningBlockMap) ||
 					!!collectCompletedWebSearches(webSearchAccum) ||
 					!!collectCompletedImageGenerations(imageGenAccum)
 				);
 			};
+
+			/**
+			 * Whether this attempt produced progress that an in-place replay would DESTROY.
+			 *
+			 * Distinct from {@link hasAnyPersistableOutput}, which answers "is there
+			 * anything worth persisting". This answers the question the retry paths
+			 * actually need: would re-sending the identical request lose information the
+			 * model must see?
+			 *
+			 * A completed tool call is the decisive case. Every in-place replay resets the
+			 * per-attempt accumulators (`toolUses`, `settledResults`, `earlyExecMap`), so a
+			 * tool that already ran has its result dropped on the floor while the request
+			 * that goes out is byte-identical to the one before it. The model then asks for
+			 * the same tool again, lands in the same branch, and the loop burns its whole
+			 * budget re-sending the first request — with the transcript growing all the
+			 * while, because each abandoned attempt still persisted its blocks.
+			 *
+			 * When this is true the turn must instead finish (or be handed back to the
+			 * caller), so the completed tool results reach history and the NEXT request
+			 * carries them.
+			 */
+			const hasIrreplaceableProgress = (): boolean =>
+				toolUses.length > 0 ||
+				settledResults.size > 0 ||
+				yieldedToolResults.size > 0 ||
+				hasStartedEarlyToolExecution();
+
+			/**
+			 * Guard for every in-place replay site: replaying is only safe when the
+			 * abandoned attempt left nothing behind that the replay would lose.
+			 */
+			const canReplayInPlace = (): boolean => !hasIrreplaceableProgress();
 
 			/**
 			 * Pick the recovery strategy for a resumable interruption (a transient
@@ -3051,17 +3182,24 @@ export async function* agentLoop(
 			 * - `text_continuation`: visible answer text (or a completed web
 			 *   search / image generation) exists. Flush it and let the caller append
 			 *   a continuation user turn.
-			 * - `reasoning_only_retry`: only reasoning (or a tool call whose input was
-			 *   cut off mid-stream) exists. Nothing client-facing was committed and no
-			 *   side effect occurred, so the safest recovery is to DROP the partial
-			 *   reasoning and re-send the identical request in place. Keeping truncated
-			 *   reasoning would pollute the history and degrade the continuation.
+			 * - `truncated_tool_input`: no tool call completed, but the model was cut off
+			 *   while writing one's arguments. Replaying the identical request is the
+			 *   WRONG recovery here: the most common cause is a tool input that does not
+			 *   fit in one response, so an identical replay reproduces the same
+			 *   truncation until the retry budget dies. Finish the turn through the
+			 *   normal path instead, where the orphaned-tool detector injects the
+			 *   skeleton-first reminder and the model can switch to smaller calls.
+			 * - `reasoning_only_retry`: only reasoning exists. Nothing client-facing was
+			 *   committed and no side effect occurred, so the safest recovery is to DROP
+			 *   the partial reasoning and re-send the identical request in place. Keeping
+			 *   truncated reasoning would pollute the history and degrade the continuation.
 			 * - `none`: nothing to resume from; fall through to ordinary
 			 *   retryable/terminal error handling.
 			 */
 			const classifyResumeStrategy = ():
 				| "tool_continuation"
 				| "text_continuation"
+				| "truncated_tool_input"
 				| "reasoning_only_retry"
 				| "none" => {
 				if (toolUses.length > 0) return "tool_continuation";
@@ -3072,10 +3210,10 @@ export async function* agentLoop(
 				) {
 					return "text_continuation";
 				}
-				const hasOrphanedToolAccum = [...toolUseAccum.values()].some((acc) => !!acc.name);
-				if (!!collectReasoningBlocks(reasoningBlockMap) || hasOrphanedToolAccum) {
-					return "reasoning_only_retry";
-				}
+				// Ranked above reasoning: a model that thinks and THEN gets cut off writing
+				// a tool call must be told to write smaller calls, not asked to try again.
+				if (orphanedToolInputNames().length > 0) return "truncated_tool_input";
+				if (collectReasoningBlocks(reasoningBlockMap)) return "reasoning_only_retry";
 				return "none";
 			};
 
@@ -3149,6 +3287,36 @@ export async function* agentLoop(
 				);
 				if (abandoned.length === 0) return;
 				yield { type: "tool_use_discarded", toolUseIds: abandoned };
+			}
+
+			/**
+			 * Close out an attempt that is about to be replayed in place.
+			 *
+			 * Every replay site must go through here rather than calling `finishRequest`
+			 * directly. `block_complete` persists as it streams, so an abandoned attempt
+			 * has already written its reasoning/text/tool_use rows; `attempt_discarded`
+			 * is what tells the host to drop them. Without it each replay leaves another
+			 * copy behind and the transcript grows while the outgoing request never
+			 * changes.
+			 *
+			 * Ordering matters: the discard has to reach the consumer BEFORE the request
+			 * teardown, mirroring `tool_use_discarded` (which `finishRequest` also emits
+			 * ahead of `api_request_end`).
+			 *
+			 * `requestId` identifies which attempt is being dropped. The consumer needs it
+			 * because `api_request_start` is flushed lazily (first stream event, or request
+			 * teardown), so an attempt that failed before producing anything emits this
+			 * event BEFORE its own `api_request_start`. Keying the truncation baseline on
+			 * the requestId keeps the two correlated regardless of arrival order.
+			 */
+			function* discardAttemptPersistence(): Generator<AgentEvent> {
+				yield { type: "attempt_discarded", requestId };
+			}
+
+			/** Replay teardown: discard what this attempt persisted, then end its request. */
+			function* abandonAttemptForReplay(errorMessage?: string): Generator<AgentEvent> {
+				yield* discardAttemptPersistence();
+				yield* finishRequest(errorMessage);
 			}
 
 			/**
@@ -3821,7 +3989,7 @@ export async function* agentLoop(
 											const brokenOverride = sr.broken
 												? sanitizeBrokenInput(prevTu.name, prevTu.input, locale)
 												: undefined;
-											const toolSideCars = await collectToolResultSideCars(prevTu, sr);
+											await processToolResultInjections(prevTu, sr);
 											const baseOutput = sr.broken
 												? getToolMessage("brokenToolCallResult", locale)
 												: sr.output;
@@ -3838,7 +4006,6 @@ export async function* agentLoop(
 												brokenInputOverride: brokenOverride,
 												updatedInput: brokenOverride ?? sr.updatedInput,
 												metadata: sr.metadata,
-												sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 											};
 											if (sr.fatal) {
 												yield* finishRequest(sr.output);
@@ -4240,7 +4407,7 @@ export async function* agentLoop(
 										delayMs,
 										diagnostics: requestDiagnostics,
 									};
-									yield* finishRequest(message);
+									yield* abandonAttemptForReplay(message);
 									await abortableSleep(delayMs, config.signal);
 									if (config.signal.aborted) {
 										yield { type: "error", message: "Aborted" };
@@ -4286,10 +4453,30 @@ export async function* agentLoop(
 									};
 									break;
 								}
-								if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
-									// Only reasoning (or a tool call with truncated input) was produced.
-									// Drop it and re-send the identical request instead of continuing
-									// from a truncated thought.
+								if (strategy === "truncated_tool_input") {
+									// The model was cut off while writing a tool's arguments. Finish the
+									// turn through the normal path so the orphaned-tool detector injects
+									// the skeleton-first reminder; an identical replay would just hit the
+									// same output ceiling again.
+									logger.warn("Resumable stream interruption mid tool input", {
+										narratorId: config.narratorId,
+										provider: effectiveProvider,
+										model: effectiveModel,
+										requestId,
+										reason,
+										orphanedTools: orphanedToolInputNames(),
+									});
+									yield {
+										type: "resumable_recovered",
+										strategy: "truncated_tool_input",
+										message,
+										diagnostics: requestDiagnostics,
+									};
+									break;
+								}
+								if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
+									// Only reasoning was produced. Drop it and re-send the identical
+									// request instead of continuing from a truncated thought.
 									if (
 										(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 										!config.signal.aborted
@@ -4319,7 +4506,7 @@ export async function* agentLoop(
 											delayMs,
 											diagnostics: requestDiagnostics,
 										};
-										yield* finishRequest(message);
+										yield* abandonAttemptForReplay(message);
 										await abortableSleep(delayMs, config.signal);
 										if (config.signal.aborted) {
 											yield { type: "error", message: "Aborted" };
@@ -4336,24 +4523,42 @@ export async function* agentLoop(
 								return;
 							}
 							if (classification.retryable) {
-								if (hasStartedEarlyToolExecution()) {
-									logger.warn("Retryable provider stream error after tool execution started", {
+								// A completed tool call must never be replayed away: the replay resets
+								// `toolUses`/`settledResults`, so the model would ask for the same tool
+								// again while the result it already produced is lost.
+								//
+								// Widened from `hasStartedEarlyToolExecution()`: a tool whose input closed
+								// but which was deferred (strict-serial, or an eager-disabled tool such as
+								// Bash/Write/Edit) has no entry in `earlyExecMap`, yet replaying it is just
+								// as lossy.
+								if (hasIrreplaceableProgress()) {
+									logger.warn("Retryable provider stream error after tool progress landed", {
 										narratorId: config.narratorId,
 										provider: effectiveProvider,
 										model: effectiveModel,
 										reason,
 										toolCount: toolUses.length,
 										startedToolCount: earlyExecMap.size,
+										settledToolCount: settledResults.size,
 									});
+									// Drain and persist the completed work, then end the turn as
+									// RESUMABLE rather than as a hard failure.
+									//
+									// `resumable_error` is the only exit that both preserves the work and
+									// stays bounded. `invalid_state` / `retryable_error` end the run for a
+									// stateless provider (narrator-executor sets hasError; narrator-session
+									// gives up once in-loop retries are exhausted), stranding tool calls
+									// that already had side effects behind a hard failure. Simply breaking
+									// out of the retry loop to "finish normally" is worse: the upstream is
+									// still failing, so the turn loop would immediately try again with no
+									// budget of its own and spin. Both executors treat `resumable_error` as
+									// an interrupted pass and cap the continuations
+									// (MAX_INTERRUPTION_RETRIES), so the completed tool results reach
+									// history and the retry count is finite.
 									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
 									yield* drainStartedEarlyToolResults();
 									yield* finishRequest(message);
-									yield {
-										type: "invalid_state",
-										reason,
-										message,
-										diagnostics: requestDiagnostics,
-									};
+									yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
 									return;
 								}
 								// In-loop retry: skip block_complete persistence and retry
@@ -4378,7 +4583,7 @@ export async function* agentLoop(
 										delayMs,
 										diagnostics: requestDiagnostics,
 									};
-									yield* finishRequest(message);
+									yield* abandonAttemptForReplay(message);
 									await abortableSleep(delayMs, config.signal);
 									if (config.signal.aborted) {
 										yield { type: "error", message: "Aborted" };
@@ -4390,6 +4595,11 @@ export async function* agentLoop(
 									yield* finishRequest(message);
 									const switchEvent = await applyPendingRuntimeSettings("retry");
 									if (switchEvent) {
+										// Only now is this a replay: discard what the abandoned attempt
+										// persisted. Emitted after the switch is confirmed, because
+										// without one the turn ends here and its partial content must
+										// be kept for the caller.
+										yield* discardAttemptPersistence();
 										yield switchEvent;
 										resetRetryStateAfterModelSwitch();
 										continue chatRetryLoop;
@@ -4473,7 +4683,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(firstTokenTimeoutMessage);
+							yield* abandonAttemptForReplay(firstTokenTimeoutMessage);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4485,6 +4695,7 @@ export async function* agentLoop(
 							yield* finishRequest(firstTokenTimeoutMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -4632,7 +4843,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(msg);
+							yield* abandonAttemptForReplay(msg);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4669,7 +4880,26 @@ export async function* agentLoop(
 							// branch above) so the turn is not cut short.
 							break;
 						}
-						if (strategy === "reasoning_only_retry" && !hasStartedEarlyToolExecution()) {
+						if (strategy === "truncated_tool_input") {
+							// Cut off mid tool input: leave the retry loop so the orphaned-tool
+							// detector can inject the skeleton-first reminder. Replaying the same
+							// request would reproduce the same truncation.
+							logger.warn("Resumable stream interruption mid tool input", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								orphanedTools: orphanedToolInputNames(),
+							});
+							yield {
+								type: "resumable_recovered",
+								strategy: "truncated_tool_input",
+								message: msg,
+								diagnostics: requestDiagnostics,
+							};
+							break;
+						}
+						if (strategy === "reasoning_only_retry" && canReplayInPlace()) {
 							if (
 								(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
 								!config.signal.aborted
@@ -4698,7 +4928,7 @@ export async function* agentLoop(
 									delayMs,
 									diagnostics: requestDiagnostics,
 								};
-								yield* finishRequest(msg);
+								yield* abandonAttemptForReplay(msg);
 								await abortableSleep(delayMs, config.signal);
 								if (config.signal.aborted) {
 									yield { type: "error", message: "Aborted" };
@@ -4717,6 +4947,33 @@ export async function* agentLoop(
 					// Detect transient/retryable API errors (e.g. MODEL_TEMPORARILY_UNAVAILABLE,
 					// throttling, 429/529 overloaded)
 					if (isRetryableError(err)) {
+						// A transient fault can land AFTER the model already produced complete
+						// tool calls (a 429/529 on the tail of the stream, a mid-turn socket
+						// reset). Replaying then destroys those calls and their results while
+						// sending a byte-identical request, so the model reproduces them and the
+						// loop spins until the budget dies.
+						if (hasIrreplaceableProgress()) {
+							logger.warn("Retryable provider error after tool progress landed", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								requestId,
+								toolCount: toolUses.length,
+								startedToolCount: earlyExecMap.size,
+								settledToolCount: settledResults.size,
+							});
+							// Same exit as the matching invalidState branch above: drain and persist
+							// the completed work, then end the turn as RESUMABLE. Keeps the tool
+							// results (a hard failure would strand side effects that already
+							// happened) while staying bounded — both executors cap resumable
+							// continuations, whereas finishing "normally" against a still-failing
+							// upstream would let the turn loop spin without a budget.
+							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* drainStartedEarlyToolResults();
+							yield* finishRequest(msg);
+							yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
+							return;
+						}
 						// In-loop retry for stateless providers
 						// -1 means infinite retries (consistent with handleTransientError)
 						if (
@@ -4738,7 +4995,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: requestDiagnostics,
 							};
-							yield* finishRequest(msg);
+							yield* abandonAttemptForReplay(msg);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4750,6 +5007,7 @@ export async function* agentLoop(
 							yield* finishRequest(msg);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -4800,7 +5058,7 @@ export async function* agentLoop(
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
-						yield* finishRequest(firstTokenTimeoutMessage);
+						yield* abandonAttemptForReplay(firstTokenTimeoutMessage);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -4812,6 +5070,7 @@ export async function* agentLoop(
 						yield* finishRequest(firstTokenTimeoutMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
+							yield* discardAttemptPersistence();
 							yield switchEvent;
 							resetRetryStateAfterModelSwitch();
 							continue;
@@ -4828,7 +5087,11 @@ export async function* agentLoop(
 
 				// ── Mimo ellipsis retry ──
 				// If a mimo model returned "..." as reasoning, discard and retry.
-				if (mimoEllipsisRetry && completionLimitMessage == null) {
+				//
+				// Skipped once tool progress exists: the ellipsis reasoning is degenerate but a
+				// completed tool call is not, and replaying would throw the call (and any result
+				// it already produced) away. The turn then finishes normally instead.
+				if (mimoEllipsisRetry && completionLimitMessage == null && canReplayInPlace()) {
 					chatRetryCount++;
 					const delayMs = Math.min(
 						TRANSIENT_RETRY_BASE_MS * 2 ** (chatRetryCount - 1),
@@ -4842,7 +5105,7 @@ export async function* agentLoop(
 						delayMs,
 						diagnostics: requestDiagnostics,
 					};
-					yield* finishRequest("mimo ellipsis reasoning");
+					yield* abandonAttemptForReplay("mimo ellipsis reasoning");
 					await abortableSleep(delayMs, config.signal);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
@@ -4867,7 +5130,23 @@ export async function* agentLoop(
 				// In those cases the optimistic flag would suppress the empty-response guard and
 				// the turn would silently persist an empty assistant message and go idle. Compute
 				// the real picture from the accumulators instead so the guard still fires.
-				if (!sawErrorEvent && completionLimitMessage == null && !hasAnyPersistableOutput()) {
+				//
+				// `hasIrreplaceableProgress()` is checked as defence in depth, not because a
+				// currently-reachable state needs it: within one attempt `toolUses` and
+				// `settledResults` are cleared together at the top of the retry loop, so
+				// `hasAnyPersistableOutput()` (which tests `toolUses`) already covers every
+				// path that exists today. It is stated explicitly because this guard is the
+				// one place that decides "replay the identical request", and the cost of the
+				// two predicates drifting apart is the whole retry budget spent re-sending a
+				// request whose tool results were thrown away. Keeping the strong condition
+				// here means a future path that settles a result without leaving a `toolUses`
+				// entry cannot silently reintroduce that bug.
+				if (
+					!sawErrorEvent &&
+					completionLimitMessage == null &&
+					!hasAnyPersistableOutput() &&
+					!hasIrreplaceableProgress()
+				) {
 					// Evidence collected while consuming this attempt's stream. It turns the
 					// single generic "empty response" message into a specific sub-reason, so
 					// an upstream fault is no longer reported as a local misconfiguration.
@@ -4953,7 +5232,7 @@ export async function* agentLoop(
 								delayMs,
 								diagnostics: lastRetryDiagnostics,
 							};
-							yield* finishRequest(lastRetryErrorMessage);
+							yield* abandonAttemptForReplay(lastRetryErrorMessage);
 							await abortableSleep(delayMs, config.signal);
 							if (config.signal.aborted) {
 								yield { type: "error", message: "Aborted" };
@@ -4965,6 +5244,7 @@ export async function* agentLoop(
 							yield* finishRequest(lastRetryErrorMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
+								yield* discardAttemptPersistence();
 								yield switchEvent;
 								resetRetryStateAfterModelSwitch();
 								continue;
@@ -4980,10 +5260,19 @@ export async function* agentLoop(
 						return;
 					}
 
-					// Genuine empty response (no prior error).  Use a dedicated
-					// counter (max 3 retries) separate from transient error retries.
+					// Genuine empty response (no prior error). Uses a dedicated counter,
+					// separate from transient error retries.
+					//
+					// The budget depends on what the upstream actually did. When it reported
+					// usage or a stop reason, the request demonstrably reached the model and
+					// came back deliberately empty — replaying the identical bytes rarely
+					// changes that (production logs show these failing the same way on every
+					// attempt) while each replay pays the full prompt again. Kinds that
+					// indicate a transport/protocol fault keep the full budget, because for
+					// those a replay genuinely does tend to succeed.
+					const maxEmptyRetries = maxEmptyResponseRetriesFor(emptyKind);
 					emptyResponseRetries++;
-					if (emptyResponseRetries <= MAX_EMPTY_RESPONSE_RETRIES && !config.signal.aborted) {
+					if (emptyResponseRetries <= maxEmptyRetries && !config.signal.aborted) {
 						const delayMs = Math.min(
 							TRANSIENT_RETRY_BASE_MS * 2 ** (emptyResponseRetries - 1),
 							backoffCeil,
@@ -4997,7 +5286,7 @@ export async function* agentLoop(
 							model: effectiveModel,
 							requestId,
 							attempt: emptyResponseRetries,
-							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							maxRetries: maxEmptyRetries,
 							emptyResponseKind: emptyKind,
 							evidence: emptyEvidence,
 						});
@@ -5005,11 +5294,11 @@ export async function* agentLoop(
 							type: "retrying",
 							message,
 							attempt: emptyResponseRetries,
-							maxRetries: MAX_EMPTY_RESPONSE_RETRIES,
+							maxRetries: maxEmptyRetries,
 							delayMs,
 							diagnostics: requestDiagnostics,
 						};
-						yield* finishRequest(message);
+						yield* abandonAttemptForReplay(message);
 						await abortableSleep(delayMs, config.signal);
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
@@ -5023,6 +5312,7 @@ export async function* agentLoop(
 						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
+							yield* discardAttemptPersistence();
 							yield switchEvent;
 							resetRetryStateAfterModelSwitch();
 							continue;
@@ -5034,6 +5324,8 @@ export async function* agentLoop(
 						provider: effectiveProvider,
 						model: effectiveModel,
 						requestId,
+						attempts: emptyResponseRetries,
+						maxRetries: maxEmptyRetries,
 						emptyResponseKind: emptyKind,
 						evidence: emptyEvidence,
 					});
@@ -5061,19 +5353,37 @@ export async function* agentLoop(
 				// assistant message (content:null) that breaks history replay.
 				// We drop the reasoning (do NOT flush it to the DB), reset the frontend's
 				// streaming snapshot, and recover based on what the previous block was.
+				//
+				// A half-written tool input is deliberately counted as meaningful output
+				// here. It is not a dead turn: the model committed to a tool call whose
+				// arguments were cut off, which the orphaned-tool detector below turns
+				// into the skeleton-first reminder. Treating it as reasoning-only would
+				// discard that evidence and replay the identical request, reproducing the
+				// same truncation until the retry budget is exhausted.
 				const hasMeaningfulOutput =
 					assistantText.trim().length > 0 ||
 					toolUses.length > 0 ||
+					orphanedToolInputNames().length > 0 ||
 					!!collectCompletedWebSearches(webSearchAccum) ||
 					!!collectCompletedImageGenerations(imageGenAccum);
 				const hasReasoning = !!collectReasoningBlocks(reasoningBlockMap);
-				if (completionLimitMessage == null && !hasMeaningfulOutput && hasReasoning) {
+				if (
+					completionLimitMessage == null &&
+					!hasMeaningfulOutput &&
+					hasReasoning &&
+					// A tool that already ran makes this not a dead turn: discarding the
+					// attempt would throw its result away and re-send the same request.
+					canReplayInPlace()
+				) {
 					// Drop accumulated reasoning so flushPartialContent won't persist it.
 					reasoningBlockMap.clear();
 					redactedThinkingBlocks.length = 0;
 					// Tell the frontend to discard the live streaming reasoning it is showing.
 					yield { type: "stream_reset" };
-					yield* finishRequest(REASONING_ONLY_MESSAGE);
+					// The reasoning blocks were already persisted as they streamed, so the
+					// in-memory clear above is not enough on its own — without this the
+					// discarded thinking stays in the transcript and stacks up on every retry.
+					yield* abandonAttemptForReplay(REASONING_ONLY_MESSAGE);
 					if (config.signal.aborted) {
 						yield { type: "error", message: "Aborted" };
 						return;
@@ -5403,9 +5713,15 @@ export async function* agentLoop(
 			// Detect orphaned tool uses — tool calls whose streaming input was cut off
 			// before receiving a stop signal (typically due to API max_tokens truncation).
 			// These are silently dropped by the accumulator, so we must detect and handle them.
-			const orphanedToolNames = [...toolUseAccum.values()].map((acc) => acc.name).filter(Boolean);
+			const orphanedToolNames = orphanedToolInputNames();
 			const hasOrphanedToolUses = orphanedToolNames.length > 0;
-			if (hasOrphanedToolUses) toolUseAccum.clear();
+			if (hasOrphanedToolUses) {
+				// The cards published while the arguments were streaming will never reach
+				// tool_result (these ids execute nothing), so retire them explicitly —
+				// otherwise each truncated call leaves a ghost tool running forever.
+				yield* retractStreamingToolCards();
+				toolUseAccum.clear();
+			}
 
 			// Yield accumulated content before assistant_message so partial-block
 			// persistence is finalized for both normal and truncated turns.
@@ -5427,7 +5743,7 @@ export async function* agentLoop(
 				const brokenOverride = sr.broken
 					? sanitizeBrokenInput(tu.name, tu.input, locale)
 					: undefined;
-				const toolSideCars = await collectToolResultSideCars(tu, sr);
+				await processToolResultInjections(tu, sr);
 				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
 				yield {
 					type: "tool_result",
@@ -5442,7 +5758,6 @@ export async function* agentLoop(
 					brokenInputOverride: brokenOverride,
 					updatedInput: brokenOverride ?? sr.updatedInput,
 					metadata: sr.metadata,
-					sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 				};
 				if (sr.fatal) {
 					yield { type: "error", message: sr.output };
@@ -5555,14 +5870,13 @@ export async function* agentLoop(
 					// update the in-memory tool_use so pushAssistantTurn writes the correct
 					// input into history — otherwise the model sees the original (wrong) path.
 					if (result.updatedInput) tu.input = result.updatedInput;
-					const toolSideCars = await collectToolResultSideCars(tu, result);
+					await processToolResultInjections(tu, result);
 					const isLastTool = toolIndex === toolUses.length - 1;
-					const outputWithReminder =
-						toolSideCars.length > 0
-							? appendSideCarsForApi(result.output, toolSideCars)
-							: result.output;
+					// The turn nudge is still appended inline: it is about THIS being the last
+					// tool of a nearly-exhausted turn, so it has to travel with that result
+					// rather than wait for a boundary the loop may not reach.
 					const outputForModel =
-						isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+						isLastTool && shouldNudge ? result.output + nudgeText : result.output;
 
 					pendingToolResults.push(
 						provider.formatToolResult(
@@ -5625,7 +5939,6 @@ export async function* agentLoop(
 								durationMs !== result.durationMs
 									? { ...result.metadata, execDurationMs: result.durationMs }
 									: result.metadata,
-							sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 						};
 						toolIndex++;
 
@@ -5667,7 +5980,6 @@ export async function* agentLoop(
 					const indexed = execEntries.map((e, i) => e.promise.then((result) => ({ i, result })));
 
 					const settled = new Array<ToolExecResult | undefined>(group.length);
-					const parallelSideCarsByIndex = new Array<AgentSideCar[] | undefined>(group.length);
 					const formattedResults = new Array<unknown>(group.length);
 					const groupStartToolIndex = toolIndex;
 					let remaining = new Set(indexed);
@@ -5686,8 +5998,7 @@ export async function* agentLoop(
 						const effectiveResult = result;
 						if (effectiveResult.broken) brokenToolUseIds.add(tu.toolUseId);
 						if (effectiveResult.updatedInput) tu.input = effectiveResult.updatedInput;
-						const parallelSideCars = await collectToolResultSideCars(tu, effectiveResult);
-						parallelSideCarsByIndex[i] = parallelSideCars;
+						await processToolResultInjections(tu, effectiveResult);
 
 						// Persist and broadcast every completed result immediately in completion order.
 						// Model-facing formatting still happens below in the original call order.
@@ -5715,7 +6026,6 @@ export async function* agentLoop(
 								brokenInputOverride,
 								updatedInput: brokenInputOverride ?? effectiveResult.updatedInput,
 								metadata: effectiveResult.metadata,
-								sideCars: parallelSideCars.length > 0 ? parallelSideCars : undefined,
 							};
 						}
 						if (effectiveResult.durationMs > maxParallelMs)
@@ -5728,14 +6038,11 @@ export async function* agentLoop(
 						const tu = group[i];
 						const effectiveResult = settled[i];
 						if (!effectiveResult) continue;
-						const parallelSideCars = parallelSideCarsByIndex[i] ?? [];
-						const outputWithReminder =
-							parallelSideCars.length > 0
-								? appendSideCarsForApi(effectiveResult.output, parallelSideCars)
-								: effectiveResult.output;
 						const isLastTool = groupStartToolIndex + i === toolUses.length - 1;
 						const outputForModel =
-							isLastTool && shouldNudge ? outputWithReminder + nudgeText : outputWithReminder;
+							isLastTool && shouldNudge
+								? effectiveResult.output + nudgeText
+								: effectiveResult.output;
 						formattedResults[i] = provider.formatToolResult(
 							tu.toolUseId,
 							outputForModel,
@@ -5795,15 +6102,11 @@ export async function* agentLoop(
 						const result = await earlyPromise;
 						if (result.broken) brokenToolUseIds.add(remainingTool.toolUseId);
 						if (result.updatedInput) remainingTool.input = result.updatedInput;
-						const toolSideCars = await collectToolResultSideCars(remainingTool, result);
-						const outputWithSideCars =
-							toolSideCars.length > 0
-								? appendSideCarsForApi(result.output, toolSideCars)
-								: result.output;
+						await processToolResultInjections(remainingTool, result);
 						pendingToolResults.push(
 							provider.formatToolResult(
 								remainingTool.toolUseId,
-								outputWithSideCars,
+								result.output,
 								result.isError ?? false,
 								result.images,
 								remainingTool.name,
@@ -5830,7 +6133,6 @@ export async function* agentLoop(
 								brokenInputOverride,
 								updatedInput: brokenInputOverride ?? result.updatedInput,
 								metadata: result.metadata,
-								sideCars: toolSideCars.length > 0 ? toolSideCars : undefined,
 							};
 						}
 						if (result.fatal && !fatalOutput) fatalOutput = result.output;
@@ -5911,19 +6213,22 @@ export async function* agentLoop(
 			// tool_use with no matching result (and an orphaned result for the old id).
 			remapToolResultIds(pendingToolResults, turnToolUseIdRemap);
 
-			// Collect after-tools sidecars (replaces getInjectedUserText).
-			// These are assembled into the next user turn's text portion.
-			const afterToolsSideCars = await collectAfterToolsSideCars();
-			if (afterToolsSideCars.length > 0) {
-				const injected = appendSideCarsForApi("", afterToolsSideCars);
-				if (injected) {
-					nextTurnContent = nextTurnContent ? `${nextTurnContent}\n\n${injected}` : injected;
-				}
-				yield { type: "sidecars", sideCars: afterToolsSideCars };
+			// Producers that persist their own message row contribute text only — see
+			// `collectAfterToolsInjectionText` on why nothing is yielded for them.
+			// Loop-raised reminders are flushed first so they read in the order they were
+			// raised, before anything the host drained at this same boundary.
+			for (const injectionText of [
+				await flushLoopInjections(),
+				await collectAfterToolsInjectionText(),
+			]) {
+				if (!injectionText) continue;
+				nextTurnContent = nextTurnContent
+					? `${nextTurnContent}\n\n${injectionText}`
+					: injectionText;
 			}
 
 			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools sidecars are collected.
+			// request: direct user feedback may arrive while after-tools injections are drained.
 			if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 			if (gracefulStopRequested) {
 				yield { type: "turn_complete", turnIndex };

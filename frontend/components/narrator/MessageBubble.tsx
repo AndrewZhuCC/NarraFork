@@ -35,6 +35,7 @@ import {
 import { isHumanOrigin } from "@shared/message-origin";
 import { isLiveStreamingRun } from "@shared/pretext-layout/streaming-live-blocks";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import { readSideCarBody } from "@shared/sidecar-body";
 import { formatFileSize } from "@shared/text-file-types";
 import {
 	IconAlertTriangle,
@@ -88,11 +89,11 @@ import {
 	clearTokenOnSessionFailure,
 	getToken,
 	readFetchError,
-	type SideCarRecord,
 } from "../../lib/api";
 import type { RetryFailedCompactResponse } from "../../lib/api/narrators";
 import { formatLocaleDateTime, formatLocaleNumber, formatLocaleTime } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import { notifyResultWarnings } from "../../lib/operation-warnings";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { DirectoryPicker } from "../common/DirectoryPicker";
@@ -118,6 +119,7 @@ import { MessageEditorPanel } from "./MessageEditorPanel";
 import { EditedBadge } from "./MessageOriginalContent";
 import {
 	MessageOriginBadge,
+	OriginAvatar,
 	resolveUserBubbleName,
 	SystemOriginNotice,
 } from "./MessageOriginBadge";
@@ -144,12 +146,12 @@ import {
 	parseReasoningSegments,
 	resolveReasoningRunActionIndices,
 } from "./reasoning-segments";
-import { hasVisibleSideCars, SideCarNotice } from "./SideCarNotice";
 import {
 	type SubagentRecoveryEntry,
 	SubagentRecoveryPendingCard,
 	SubagentRecoveryResolvedCard,
 } from "./SubagentRecoveryCard";
+import { SystemInjectionNotice } from "./SystemInjectionNotice";
 import { type PendingPermission, ToolCallCard } from "./ToolCallCard";
 
 const FIXED_MENU_TRANSITION_PROPS = { duration: 0 };
@@ -380,7 +382,6 @@ interface MessageBubbleProps {
 		contentText?: string | null;
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		toolCalls?: any[];
-		sideCars?: SideCarRecord[];
 		messageUuid?: string | null;
 		commandText?: string | null;
 		createdAt?: string | null;
@@ -489,7 +490,6 @@ function sameMessagePayload(prev: MessageBubbleMessage, next: MessageBubbleMessa
 			prev.contentJson === next.contentJson &&
 			prev.contentText === next.contentText &&
 			prev.toolCalls === next.toolCalls &&
-			prev.sideCars === next.sideCars &&
 			prev.messageUuid === next.messageUuid &&
 			prev.commandText === next.commandText &&
 			prev.createdAt === next.createdAt &&
@@ -1801,7 +1801,6 @@ function ImageBlock({ block, imageNarratorId }: { block: any; imageNarratorId?: 
 	);
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON block
 function TextFileBlock({
 	block,
 	onOpen,
@@ -3799,7 +3798,7 @@ function MergeSummaryCard({
 
 	const unmergeMutation = useMutation({
 		mutationFn: () => api.unmergeChapter(block.sourceChapterId),
-		onSuccess: () => {
+		onSuccess: (result) => {
 			closeConfirm();
 			close();
 			// The backend deletes the merge_summary message during unmerge,
@@ -3807,11 +3806,16 @@ function MergeSummaryCard({
 			onDelete?.();
 			qc.invalidateQueries({ queryKey: ["narraFlow"] });
 			qc.invalidateQueries({ queryKey: ["chapters"] });
-			notifications.show({
-				title: t("unmergeSuccess"),
-				message: t("unmergeSuccessDesc"),
-				color: "green",
-			});
+			// Warnings replace the plain success toast rather than stacking on top of it:
+			// "it worked, but ..." is the whole message, and a green "successful" beside a
+			// yellow caveat reads as though the caveat were incidental.
+			if (!notifyResultWarnings(t("unmergeWarning"), result)) {
+				notifications.show({
+					title: t("unmergeSuccess"),
+					message: t("unmergeSuccessDesc"),
+					color: "green",
+				});
+			}
 		},
 		onError: (err) => {
 			notifications.show({
@@ -4678,6 +4682,30 @@ export const MessageBubble = memo(function MessageBubble({
 				</MessageContextMenuCtx.Provider>
 			);
 		}
+		// Server-authored injected content on its own row (narrator-injection.ts).
+		// Checked BEFORE the plain-text branch below: the row also carries a text
+		// block — the model-facing copy, boilerplate included — and falling through to
+		// that branch would show the reader the prompt engineering instead of the
+		// projected summary.
+		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+		const injectionIndex = blocks.findIndex((b: any) => b.type === "system_injection");
+		if (injectionIndex >= 0) {
+			const injectionBlock = blocks[injectionIndex];
+			const injectionRealIndex = message._blockOriginalIndices?.[injectionIndex] ?? injectionIndex;
+			return (
+				<MessageContextMenuCtx.Provider value={ctxActions}>
+					<SelectableSystemNotice blockIndex={injectionRealIndex} messageId={message.id}>
+						<SystemInjectionNotice
+							source={injectionBlock.source ?? ""}
+							body={readSideCarBody(injectionBlock)}
+							// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+							fallbackText={blocks.find((b: any) => b.type === "text")?.text ?? ""}
+							createdAt={message.createdAt}
+						/>
+					</SelectableSystemNotice>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
 		// Plain-text `sys` messages (browser/container notices, plan-mode exits).
 		// These carry only a `text` block, so before this branch existed they fell
 		// through to `return null` and were invisible in the UI even though the
@@ -4793,7 +4821,7 @@ export const MessageBubble = memo(function MessageBubble({
 					>
 						<Stack gap={4}>
 							<Group gap={6}>
-								{message.creator && (
+								{message.creator ? (
 									<UserAvatar
 										username={message.creator.username}
 										avatarColor={message.creator.avatarColor}
@@ -4802,6 +4830,8 @@ export const MessageBubble = memo(function MessageBubble({
 										size={20}
 										showTooltip={false}
 									/>
+								) : (
+									<OriginAvatar originLabel={message.originLabel} size={20} />
 								)}
 								<Text size="xs" fw={600} c="indigo">
 									{resolveUserBubbleName(message, t)}
@@ -5055,11 +5085,6 @@ export const MessageBubble = memo(function MessageBubble({
 							_longRunning: tc?._longRunning,
 							_streamingOutput: tc?._streamingOutput,
 							_timeoutMs: tc?._timeoutMs,
-							sideCars: Array.isArray(tc?.sideCars)
-								? tc.sideCars
-								: Array.isArray(block.sideCars)
-									? block.sideCars
-									: undefined,
 						};
 						const perm = resolvePerm?.(toolCallData) ?? null;
 						return (
@@ -5080,14 +5105,6 @@ export const MessageBubble = memo(function MessageBubble({
 					}
 					return null;
 				})}
-				{(() => {
-					const userSideCars = message.sideCars?.filter(
-						(sideCar: SideCarRecord) => sideCar.target === "user_message",
-					);
-					return hasVisibleSideCars(userSideCars) ? (
-						<SideCarNotice sideCars={userSideCars} />
-					) : null;
-				})()}
 			</div>
 		</MessageContextMenuCtx.Provider>
 	);

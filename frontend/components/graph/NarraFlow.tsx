@@ -7,7 +7,6 @@ import {
 	type Node,
 	type NodeChange,
 	type NodeMouseHandler,
-	type OnConnect,
 	ReactFlow,
 	type ReactFlowInstance,
 	useReactFlow,
@@ -16,7 +15,6 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "@xyflow/react/dist/style.css";
 import "@frontend/styles/react-flow-controls.css";
-import { useCreateChapterEdge } from "@frontend/hooks/useChapterEdges";
 import { useDeleteChapter, useUpdateChapter } from "@frontend/hooks/useChapters";
 import { useUpdateGraphPositions } from "@frontend/hooks/useGraphPositions";
 import { useNarraFlow } from "@frontend/hooks/useNarraFlow";
@@ -30,7 +28,9 @@ import { useRecentTabs } from "@frontend/hooks/useRecentTabs";
 import { useCreateTerminal, useDeleteTerminal, useTerminals } from "@frontend/hooks/useTerminals";
 import { useUserPreferences } from "@frontend/hooks/useUserPreferences";
 import { api } from "@frontend/lib/api";
+import { buildDraftForkRequest } from "@frontend/lib/chapter-fork-options";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
+import { notifyResultWarnings } from "@frontend/lib/operation-warnings";
 import {
 	Alert,
 	Box,
@@ -49,7 +49,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { ChapterNode } from "./ChapterNode";
 import { CherryPickEdge } from "./CherryPickEdge";
-import { DependencyEdge } from "./DependencyEdge";
+
 import type { DraftMode } from "./DraftNode";
 import { DRAFT_NODE_WIDTH, DraftNode } from "./DraftNode";
 import { ForkEdge } from "./ForkEdge";
@@ -73,7 +73,6 @@ const nodeTypes = {
 const edgeTypes = {
 	fork: ForkEdge,
 	merge: MergeEdge,
-	dependency: DependencyEdge,
 	cherry_pick: CherryPickEdge,
 	terminal: TerminalEdge,
 	review: ReviewEdge,
@@ -287,7 +286,6 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		openedTerminals,
 	} = useNarraFlow(projectId);
 	const { savePosition, savePanelState } = useUpdateGraphPositions(projectId);
-	const createEdge = useCreateChapterEdge();
 	const updateChapter = useUpdateChapter();
 
 	const dormantMutation = useMutation({
@@ -302,7 +300,13 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 
 	const unmergeMutation = useMutation({
 		mutationFn: (id: string) => api.unmergeChapter(id),
-		onSuccess: () => queryClient.invalidateQueries({ queryKey: ["narraFlow"] }),
+		onSuccess: (result) => {
+			// An unmerge can succeed while leaving state behind — a restored worktree it
+			// could not clean, snapshot content it could not verify. The server joins
+			// those into `warning`; invalidating and moving on discarded them.
+			notifyResultWarnings(t("unmergeWarning"), result);
+			queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
+		},
 	});
 
 	const deleteChapter = useDeleteChapter();
@@ -312,7 +316,16 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 	const [terminalContextMenu, setTerminalContextMenu] = useState<TerminalContextMenuState | null>(
 		null,
 	);
-	const [deleteTarget, setDeleteTarget] = useState<{ id: string; title: string } | null>(null);
+	// `hasWorktree` decides which confirmation text is shown. The server only reaches its
+	// `deleteBranch` call inside an `if (chapter.worktreePath)` block, so a chapter
+	// without one — every snapshot-merged chapter, whose worktreePath is cleared on
+	// merge — keeps its git branch after deletion. Promising "the branch will be
+	// removed" there was simply untrue.
+	const [deleteTarget, setDeleteTarget] = useState<{
+		id: string;
+		title: string;
+		hasWorktree: boolean;
+	} | null>(null);
 	const [nodes, setNodes] = useState<Node[]>([]);
 	const [computedEdges, setComputedEdges] = useState<Edge[]>([]);
 
@@ -1267,19 +1280,10 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		});
 	}, []);
 
-	const onConnect: OnConnect = useCallback(
-		(params) => {
-			if (params.source && params.target) {
-				createEdge.mutate({
-					sourceId: params.source,
-					targetId: params.target,
-					type: "dependency",
-					projectId,
-				});
-			}
-		},
-		[createEdge, projectId],
-	);
+	// No `onConnect`: dragging between two node handles used to create a `dependency` edge.
+	// Nothing read those edges, and the canvas had no `onEdgesChange`/`onEdgesDelete`, so a
+	// stray drag left a permanent orange line the user could not remove. See
+	// `server/services/chapter-edge-service.ts` for why the edge type was dropped.
 
 	const onPaneClick = useCallback(() => {
 		setContextMenu(null);
@@ -1537,6 +1541,7 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				title: string;
 				description: string;
 				inheritMode: string;
+				worktreeSource: "workspace" | "commit";
 				mode: DraftMode;
 				parentChapterId?: string;
 				sourceChapterIds?: string[];
@@ -1549,13 +1554,17 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 				const draftY = Math.max(0, draftNode?.position?.y ?? 0);
 
 				api
-					.forkChapter(payload.parentChapterId, {
-						title: payload.title,
-						description: payload.description || undefined,
-						inheritMode: payload.inheritMode,
-						axisOffset: draftX,
-						crossOffset: draftY,
-					})
+					.forkChapter(
+						payload.parentChapterId,
+						buildDraftForkRequest({
+							title: payload.title,
+							description: payload.description,
+							inheritMode: payload.inheritMode as "fresh" | "compressed" | "full",
+							worktreeSource: payload.worktreeSource,
+							axisOffset: draftX,
+							crossOffset: draftY,
+						}),
+					)
 					.then(() => {
 						removeDraft(draftNodeId);
 						queryClient.invalidateQueries({ queryKey: ["narraFlow"] });
@@ -1922,8 +1931,9 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 		(nodeId: string) => {
 			setContextMenu(null);
 			const node = nodes.find((n) => n.id === nodeId);
-			const title = (node?.data as { title?: string } | undefined)?.title ?? nodeId;
-			setDeleteTarget({ id: nodeId, title });
+			const data = node?.data as { title?: string; worktreePath?: string | null } | undefined;
+			const title = data?.title ?? nodeId;
+			setDeleteTarget({ id: nodeId, title, hasWorktree: !!data?.worktreePath });
 		},
 		[nodes],
 	);
@@ -2054,10 +2064,8 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 					onNodeDragStop={onNodeDragStop}
 					onNodeDoubleClick={onNodeDoubleClick}
 					onNodeContextMenu={onNodeContextMenu}
-					onConnect={onConnect}
 					onPaneClick={onPaneClick}
 					nodesDraggable
-					nodesConnectable
 					elementsSelectable
 					onlyRenderVisibleElements
 					panOnDrag={pcDragMode === "pan" ? true : [1]}
@@ -2132,7 +2140,11 @@ export function NarraFlow({ projectId, focusChapterId }: NarraFlowProps) {
 			>
 				<Stack>
 					<Text size="sm">
-						{t("contextMenu.deleteConfirmMessage", { title: deleteTarget?.title ?? "" })}
+						{deleteTarget?.hasWorktree
+							? t("contextMenu.deleteConfirmMessage", { title: deleteTarget?.title ?? "" })
+							: t("contextMenu.deleteConfirmMessageNoWorktree", {
+									title: deleteTarget?.title ?? "",
+								})}
 					</Text>
 					<Group justify="flex-end">
 						<Button variant="default" onClick={() => setDeleteTarget(null)}>

@@ -168,10 +168,19 @@ export interface DatabaseStorageBreakdown {
 		archivedSessions: DatabaseCleanupCandidateSummary;
 		staleSessions: DatabaseCleanupCandidateSummary;
 		apiRequestDumps: DatabaseCleanupCandidateSummary;
+		/**
+		 * Aged tool-call input/output payloads. Clears the columns and KEEPS the rows —
+		 * they carry the tree hashes that file-history revert depends on.
+		 */
+		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
 }
 
-export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "apiRequestDumps";
+export type DatabaseCleanupTarget =
+	| "archivedSessions"
+	| "staleSessions"
+	| "apiRequestDumps"
+	| "toolCallPayloads";
 
 export type DatabaseCleanupBlockedReasonCode =
 	| "chapterBound"
@@ -437,18 +446,8 @@ export interface ToolCallRecord {
 	permissionSuggestions?: unknown[] | null;
 	resultMessageId?: string | null;
 	createdAt?: string | number | null;
-	sideCars?: SideCarRecord[];
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
-}
-
-export interface SideCarRecord {
-	id?: string;
-	target: "tool_result" | "user_message";
-	source: string;
-	content: string;
-	toolUseId?: string | null;
-	orderIndex?: number;
 }
 
 export type PathFlavor = "posix" | "windows";
@@ -618,11 +617,36 @@ export interface BufferCreator {
 	avatarImageId?: string | null;
 }
 
+export interface BufferedImageSummary {
+	imageId: string;
+	filename: string;
+	mediaType: string;
+	width?: number;
+	height?: number;
+	/** Narrator that owns the file, for `/api/uploads/:narratorId/:imageId`. */
+	uploadNarratorId?: string;
+}
+
+/**
+ * Text-file attachment of a queued message.
+ *
+ * `index` is the identity to send back when editing: a taken-over subagent's
+ * queue can hold two files with the same name, so filenames are not unique.
+ */
+export interface BufferedTextFileSummary {
+	index: number;
+	filename: string;
+	size: number;
+}
+
 export interface BufferMessageSummary {
 	id: string;
 	text: string;
 	bufferedAt: string;
 	imageCount: number;
+	/** Optional so a snapshot from an older server still parses. */
+	images?: BufferedImageSummary[];
+	textFiles?: BufferedTextFileSummary[];
 	creator?: BufferCreator | null;
 	priority?: boolean;
 }
@@ -636,7 +660,6 @@ export interface TreeMessage {
 	contentJson: ContentBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
-	sideCars?: SideCarRecord[];
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	turnUsageJson?: {
@@ -844,6 +867,62 @@ export interface CodexCredentialEntry {
 	lastUsedAt?: string;
 	expiresAt?: number;
 	usage?: CodexUsageData;
+}
+
+export type KiroCredentialTier = "free" | "paid" | "enterprise";
+
+export interface KiroCredentialEntry {
+	id: string;
+	priority: number;
+	disabled: boolean;
+	disabledReason?: string;
+	failureCount: number;
+	successCount: number;
+	lastUsedAt?: string;
+	email?: string;
+	displayName?: string;
+	hasProfileArn: boolean;
+	hasStartUrl?: boolean;
+	expiresAt?: string;
+	authMethod?: string;
+	isApiKey?: boolean;
+	subscriptionTitle?: string;
+	region?: string;
+	authRegion?: string;
+	apiRegion?: string;
+	profileArn?: string;
+	startUrl?: string;
+	machineId?: string;
+	hasClientId?: boolean;
+	hasClientSecret?: boolean;
+	proxyUrl?: string;
+	proxyUsername?: string;
+	hasProxyPassword?: boolean;
+	meterUsage?: number;
+	availableModels?: string[];
+	tier?: KiroCredentialTier;
+}
+
+export interface KiroStatusSnapshot {
+	entries: KiroCredentialEntry[];
+	paidEntries?: KiroCredentialEntry[];
+	enterpriseEntries?: KiroCredentialEntry[];
+	freeEntries?: KiroCredentialEntry[];
+	paidTotal?: number;
+	enterpriseTotal?: number;
+	freeTotal?: number;
+	unhealthyTotal?: number;
+	currentId: string;
+	loadBalancingMode: "priority" | "balanced";
+	total: number;
+	available: number;
+}
+
+export interface KiroStatusResponse {
+	available: boolean;
+	snapshot: KiroStatusSnapshot | null;
+	usageCache?: Record<string, ApiEntity>;
+	globalProxy?: string;
 }
 
 /**

@@ -170,7 +170,6 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 			"narrators",
 			"narrator_messages",
 			"narrator_message_refs",
-			"narrator_sidecars",
 			"narrator_tool_calls",
 			"narrator_buffered_messages",
 			"narrator_file_snapshots",
@@ -201,7 +200,6 @@ export function getDatabaseStorageCategory(tableName: string): DatabaseStorageCa
 	if (
 		[
 			"terminals",
-			"terminal_tabs",
 			"terminal_view_state",
 			"container_instances",
 			"port_allocations",

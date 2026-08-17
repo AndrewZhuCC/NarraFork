@@ -816,6 +816,45 @@ describe("measureToolCall — running/pending cards are lodExempt", () => {
 	});
 });
 
+describe("measureToolCall — the pinned latest-tasks card is forceExpanded", () => {
+	it("a completed tasks card stays expanded at L4 (a level that collapses all)", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(
+			baseCard({
+				category: "tasks",
+				toolName: "Write",
+				status: "success",
+				detail: {
+					kind: "spec-tasks",
+					tasks: [{ text: "do the thing", status: "doing", protected: false }],
+				},
+			}),
+			600,
+			4,
+			{ forceExpanded: true },
+		);
+		expect(r.lodExempt).toBe(true);
+		expect(r.effectiveOpened).toBe(true);
+		expect(r.detail).not.toBeNull();
+		expect(r.height).toBeGreaterThan(r.collapsedHeight);
+	});
+
+	it("…and at L1, where the run gate would normally own the card", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(baseCard({ category: "tasks", toolName: "Write" }), 600, 1, {
+			forceExpanded: true,
+		});
+		expect(r.effectiveOpened).toBe(true);
+	});
+
+	it("an unpinned completed card is untouched by the flag's absence", async () => {
+		const { measureToolCall } = await mod();
+		const r = measureToolCall(baseCard({ status: "success" }), 600, 4);
+		expect(r.lodExempt).toBe(false);
+		expect(r.effectiveOpened).toBe(false);
+	});
+});
+
 // ── Pending permission ────────────────────────────────────────────────────────
 describe("measureToolCall — pendingPermission adds the InlinePermission UI", () => {
 	it("pending card is lodExempt, expanded, and includes the permission region", async () => {
@@ -1037,59 +1076,5 @@ describe("measureToolCall — MeasuredElement shape", () => {
 		const narrow = measure(160, 6);
 		expect(collapsed.effectiveOpened).toBe(false);
 		expect(narrow.height).toBeGreaterThan(wide.height);
-	});
-});
-
-// ── Tool-result sidecar band (the mini-cards between header and detail) ──────
-describe("measureToolCall — tool-result sidecar band", () => {
-	const SIDECAR = {
-		source: "silent_progress",
-		sourceLabel: "Progress reminder",
-		color: "indigo",
-		target: "tool_result",
-		previewText: "note",
-		fullText: "note",
-	};
-
-	it("a sidecar grows BOTH the collapsed and the expanded card (chunk parity: outside the collapse)", async () => {
-		const { measureToolCall } = await mod();
-		const { SIDECAR_COLLAPSED_HEIGHT } = await import("./measure-sidecar");
-		const base = baseCard();
-		const withSc = baseCard({ sidecars: [SIDECAR] });
-		// Collapsed (L4 collapses a success card): the band is still measured.
-		const collapsedBase = measureToolCall(base, 600, 4);
-		const collapsedSc = measureToolCall(withSc, 600, 4);
-		expect(collapsedSc.height).toBeGreaterThan(collapsedBase.height);
-		// Expanded too (the band sits above the detail).
-		const openBase = measureToolCall(base, 600, 6);
-		const openSc = measureToolCall(withSc, 600, 6);
-		expect(openSc.height).toBeGreaterThan(openBase.height);
-		// The collapsed delta is exactly one collapsed sidecar card.
-		expect(collapsedSc.height - collapsedBase.height).toBe(SIDECAR_COLLAPSED_HEIGHT);
-	});
-
-	it("the band stacks one measured mini-card per record, top-aligned under the header", async () => {
-		const { measureToolCall, HEADER_ROW_HEIGHT } = await mod();
-		const r = measureToolCall(baseCard({ sidecars: [SIDECAR, SIDECAR] }), 600, 6);
-		expect(r.sidecars).toHaveLength(2);
-		expect(r.sidecarsTop).toBe(HEADER_ROW_HEIGHT);
-	});
-
-	it("an expanded sidecar (via opts.sidecarExpanded) measures a taller band", async () => {
-		const { measureToolCall } = await mod();
-		const data = baseCard({
-			sidecars: [{ ...SIDECAR, fullText: "one\ntwo\nthree" }],
-		});
-		const collapsed = measureToolCall(data, 600, 6, { sidecarExpanded: [] });
-		const expanded = measureToolCall(data, 600, 6, { sidecarExpanded: [0] });
-		expect(expanded.height).toBeGreaterThan(collapsed.height);
-		expect(expanded.sidecars?.[0]?.expanded).toBe(true);
-	});
-
-	it("no sidecars → null band, byte-identical geometry to before the feature", async () => {
-		const { measureToolCall } = await mod();
-		const r = measureToolCall(baseCard(), 600, 6);
-		expect(r.sidecars).toBeNull();
-		expect(r.sidecarsTop).toBeGreaterThanOrEqual(0);
 	});
 });

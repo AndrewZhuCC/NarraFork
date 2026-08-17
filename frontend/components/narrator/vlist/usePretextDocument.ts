@@ -60,6 +60,13 @@ export interface UsePretextDocumentOptions {
 	isLodUserOverride?: (key: string) => boolean;
 	showEarlier?: (key: string) => boolean;
 	expandedRows?: (key: string) => readonly number[];
+	/**
+	 * Row-KEY addressed expansion for `activity-trace` / `tool-run-summary` (see
+	 * `AdapterContext.isRowExpanded`). Its identity moves with the expanded-row
+	 * state, so folding it into `buildOptions` is what rebuilds the document when
+	 * the reader drills into a row.
+	 */
+	isRowExpanded?: (traceKey: string, rowKey: string) => boolean;
 	/** Resolve whether a translated reasoning body shows its ORIGINAL text. */
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
@@ -213,6 +220,20 @@ export interface UsePretextDocumentResult {
 	 * marker, duplicate), so the caller falls back to a structural reload.
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
+	/**
+	 * Drop deleted messages from the loaded window in place. Returns false when the
+	 * deletion cannot be applied locally (nothing loaded matches, or it would empty
+	 * the document), so the caller falls back to a structural reload.
+	 */
+	removeMessages: (deletedIds: readonly string[]) => boolean;
+	/**
+	 * Apply an updated message in place when it is a trailing-block truncation (the
+	 * second half of a rollback). Returns false for any other update, so the caller
+	 * falls back to a structural reload — which is the only correct answer for an
+	 * edit, since a version-neutral rebuild would serve the surviving blocks' cached
+	 * heights.
+	 */
+	replaceMessage: (message: TreeMessage) => boolean;
 }
 
 const EMPTY_MESSAGES: readonly TreeMessage[] = [];
@@ -287,6 +308,7 @@ export function usePretextDocument(
 			isLodUserOverride: options.isLodUserOverride,
 			showEarlier: options.showEarlier,
 			expandedRows: options.expandedRows,
+			isRowExpanded: options.isRowExpanded,
 			showOriginal: options.showOriginal,
 			isPromptOpen: options.isPromptOpen,
 			recentMessageIds: options.recentMessageIds,
@@ -299,6 +321,11 @@ export function usePretextDocument(
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			canOfferProviderFix: options.canOfferProviderFix,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
+			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
+			// is resolved by `buildPretextDocumentLayout` from the exact message list it
+			// lays out, so it needs no build option and cannot go stale: every event that
+			// moves the pin (a new tasks write landing) arrives as a message change, which
+			// already rebuilds through the in-place channels.
 			resolvePendingPlan: options.resolvePendingPlan,
 			resolveFullToolInput: options.resolveFullToolInput,
 			resolveFullToolOutput: options.resolveFullToolOutput,
@@ -317,6 +344,10 @@ export function usePretextDocument(
 			options.formatUsageNumber,
 			options.contentWidth,
 			options.expandedRows,
+			// Drilling into a trace row adds a whole measured card, so the resolver's
+			// identity must move with the expanded-row state or the document never
+			// rebuilds and the row cannot open (same contract as `expandedRows`).
+			options.isRowExpanded,
 			options.gap,
 			options.segmentGap,
 			options.isExpanded,
@@ -599,6 +630,33 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView, options.isSubagent],
 	);
+	// Both in-place history mutations read the view LIVE at patch time, the same
+	// contract as loadOlder / applyLivePatch / appendMessage: a scroll in flight must
+	// not desync the captured anchor from the correction that follows it.
+	const removeMessages = useCallback(
+		(deletedIds: readonly string[]) =>
+			coordinator?.removeMessages(deletedIds, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
+	const replaceMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.replaceMessage(message, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	// Same live-view contract as loadOlder / applyLivePatch: the anchor is captured
 	// from the CURRENT scroll position at publish time, so a scroll in flight cannot
 	// desync it from the correction that follows.
@@ -640,6 +698,8 @@ export function usePretextDocument(
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		removeMessages,
+		replaceMessage,
 	};
 }
 
