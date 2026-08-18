@@ -53,7 +53,7 @@ import {
 	type ToolAdmissionState,
 	type ToolExecResult,
 } from "./tool-executor";
-import { isValidToolName } from "./tool-name";
+import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
 import {
 	applyToolUseIdRemap,
@@ -707,7 +707,7 @@ export async function shouldInjectRelaxedPlanToolReminder(
 		return !subagentType || !RELAXED_PLAN_READ_ONLY_SUBAGENTS.has(subagentType);
 	}
 
-	if (tu.name === SHELL_TOOL_NAME || tu.name === "Shell") {
+	if (isBashToolName(tu.name)) {
 		const command = typeof tu.input.command === "string" ? tu.input.command : "";
 		if (!command) return false;
 		try {
@@ -743,7 +743,6 @@ const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	SHELL_TOOL_NAME,
-	"Shell",
 	"Execute",
 	"Agent",
 	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
@@ -3593,6 +3592,9 @@ export async function* agentLoop(
 							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
 						}
 						if (parsed.toolUses) {
+							// Legacy alias → canonical name, before anything keys off the name
+							// (order identity, TOOL_FIELD_CONFIG, registry lookup, persistence).
+							for (const tu of parsed.toolUses) tu.name = canonicalizeToolName(tu.name);
 							// ── Tool use dedup ──
 							// Some providers (notably Kiro adapter) may emit the same tool call
 							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
@@ -3704,7 +3706,13 @@ export async function* agentLoop(
 
 						// Handle streaming tool use chunks
 						if (parsed.toolUseChunk) {
-							const { toolUseId: id, name, input, stop } = parsed.toolUseChunk;
+							const { toolUseId: id, input, stop } = parsed.toolUseChunk;
+							// Same canonicalization as the non-streaming path: the accumulator
+							// stores this name and every later lookup (field config, registry,
+							// persisted card) reads it from there.
+							const name = parsed.toolUseChunk.name
+								? canonicalizeToolName(parsed.toolUseChunk.name)
+								: parsed.toolUseChunk.name;
 							const chunkThoughtSignature = parsed.toolUseChunk.thoughtSignature;
 							const chunkThoughtSignatureSource =
 								parsed.toolUseChunk.thoughtSignatureSource ??
@@ -5636,6 +5644,7 @@ export async function* agentLoop(
 					assistantText = recovered.text;
 					const recoveredIds: string[] = [];
 					for (const tu of recovered.toolUses) {
+						tu.name = canonicalizeToolName(tu.name);
 						markCompletedToolUse(tu);
 						if (!toolUses.some((existing) => existing.toolUseId === tu.toolUseId)) {
 							toolUses.push(tu);

@@ -715,7 +715,6 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"StartPipeline",
 	"ExtractPipeline",
 	"Bash",
-	"Shell",
 	"Agent",
 	"Await",
 	"Send",
