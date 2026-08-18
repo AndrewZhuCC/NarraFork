@@ -122,6 +122,8 @@ function SettingsModelsPage() {
 				setAgentDefaultReasoningEffort={is.setAgentDefaultReasoningEffort}
 				reasoningEffortBlocklist={is.reasoningEffortBlocklist}
 				setReasoningEffortBlocklist={is.setReasoningEffortBlocklist}
+				routerModels={is.routerModels}
+				setRouterModels={is.setRouterModels}
 				groupedModels={groupedModels}
 				navigate={navigate}
 			/>

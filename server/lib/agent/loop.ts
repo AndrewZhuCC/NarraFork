@@ -90,6 +90,7 @@ import type {
 	AgentConfig,
 	AgentEvent,
 	AgentHistoryReplacement,
+	AgentLoopExtensionContext,
 	AgentToolUse,
 	ApiRequestDiagnostics,
 	ContentBlock,
@@ -2533,6 +2534,38 @@ export async function* agentLoop(
 		}
 	}
 
+	// Request-level extensions: persona injection (agentLoop-level, once)
+	if (config.loopExtensions && config.loopExtensions.length > 0) {
+		for (const ext of config.loopExtensions) {
+			try {
+				const extCtx: AgentLoopExtensionContext = {
+					narratorId: config.narratorId,
+					conversationId: config.conversationId,
+					model: effectiveModel,
+					provider: effectiveProvider,
+					cwd: config.cwd,
+					locale,
+					userText,
+					turnIndex: 0,
+					history,
+					tools: allTools,
+				};
+				const result = await ext.onSystemPrompt?.(extCtx);
+				const suffix = result?.systemPromptSuffix;
+				if (suffix) {
+					config.systemPrompt = config.systemPrompt
+						? `${config.systemPrompt}\n\n${suffix}`
+						: suffix;
+				}
+			} catch (err) {
+				logger.warn("AgentLoopExtension.onSystemPrompt failed", {
+					narratorId: config.narratorId,
+					error: String(err),
+				});
+			}
+		}
+	}
+
 	// Shallow-copy to avoid mutating the caller's array
 	history = [...history];
 
@@ -3327,6 +3360,43 @@ export async function* agentLoop(
 			 */
 			function citationStreamKey(outputIndex?: number): string {
 				return outputIndex == null ? "__default" : `output:${outputIndex}`;
+			}
+
+			// Request-level extensions: near-field guidance + tool anchoring (per turn)
+			if (config.loopExtensions && config.loopExtensions.length > 0) {
+				for (const ext of config.loopExtensions) {
+					try {
+						const extCtx: AgentLoopExtensionContext = {
+							narratorId: config.narratorId,
+							conversationId: config.conversationId,
+							model: effectiveModel,
+							provider: effectiveProvider,
+							cwd: config.cwd,
+							locale,
+							userText: content,
+							turnIndex,
+							history,
+							tools: allTools,
+						};
+						const result = await ext.onRequest?.(extCtx);
+						if (result?.appendMessages && result.appendMessages.length > 0) {
+							history.push(...result.appendMessages);
+						}
+						if (result?.allowTools) {
+							tools = provider.formatTools(
+								resolveToolsForProvider(effectiveProvider, effectiveModel).filter((t) =>
+									result.allowTools?.has(t.name),
+								),
+							);
+						}
+					} catch (err) {
+						logger.warn("AgentLoopExtension.onRequest failed", {
+							narratorId: config.narratorId,
+							turnIndex,
+							error: String(err),
+						});
+					}
+				}
 			}
 
 			chatRetryLoop: for (;;) {

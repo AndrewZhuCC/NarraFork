@@ -166,6 +166,7 @@ import { formatParentInboundMessages } from "./parent-inbound-queue";
 import { drainPendingInjections, type PendingInjection } from "./parent-injection-queue";
 import { resolvePlanApprovalAttribution } from "./plan-approval-attribution";
 import { reviewService } from "./review-service";
+import { registerRouterTools, routerLoopExtension } from "./router";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
@@ -192,6 +193,9 @@ import {
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
 import { registerNarratorLoop } from "./update-coordinator";
 import { worktreeWatcher } from "./worktree-watcher";
+
+// router: 注册 router_* 自优化工具(幂等;进程启动执行一次,热重载安全)。
+registerRouterTools();
 
 // === In-memory state (imported from narrator-session-state) ===
 
@@ -3070,6 +3074,7 @@ export async function runAgentLoop(
 				subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
 					freshNarrator.traits,
 				),
+				loopExtensions: [routerLoopExtension],
 				// Exclude optional tools that haven't been loaded for this session.
 				toolFilter: (tool) => {
 					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;

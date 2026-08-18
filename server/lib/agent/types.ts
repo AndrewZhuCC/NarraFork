@@ -744,6 +744,51 @@ export interface AgentHistoryReplacement {
 	systemPrompt?: string;
 }
 
+/** 请求前扩展上下文（每轮请求构建时提供给扩展） */
+export interface AgentLoopExtensionContext {
+	narratorId: string;
+	conversationId: string;
+	/** 当前模型（可能带 provider 前缀） */
+	model: string;
+	provider: string;
+	cwd: string;
+	locale: string;
+	/** 本轮用户输入文本（首轮为真实用户消息，后续轮为系统续接内容） */
+	userText: string;
+	/** 0 = 首轮请求 */
+	turnIndex: number;
+	/** 当前 history（含已注入的 systemPrompt 标记消息） */
+	history: unknown[];
+	/** 已过滤但未 format 的工具面（即 allTools） */
+	tools: ResolvedToolDefinition[];
+}
+
+/** onSystemPrompt 的返回：persona 追加 */
+export interface AgentLoopPersonaResult {
+	/** 追加到 system prompt 末尾的文本（persona）。agentLoop 级仅应用一次。 */
+	systemPromptSuffix?: string;
+}
+
+/** onRequest 的返回：近距离引导 + 工具面调整 */
+export interface AgentLoopRequestResult {
+	/** 追加到 history 末尾的消息（近距离引导），本轮请求立即生效 */
+	appendMessages?: unknown[];
+	/** 非 null 时按名称白名单过滤工具面（首轮锚定）；null/undefined 不改工具面 */
+	allowTools?: Set<string> | null;
+}
+
+/** 请求前扩展：两阶段钩子 */
+export interface AgentLoopExtension {
+	/** 会话级：systemPrompt 注入前调用一次（agentLoop 级）。persona 注入。 */
+	onSystemPrompt?(
+		ctx: AgentLoopExtensionContext,
+	): AgentLoopPersonaResult | null | undefined | Promise<AgentLoopPersonaResult | null | undefined>;
+	/** 每轮请求前调用（turnLoop 内 chat 前）。近距离引导 + 工具面动态调整。 */
+	onRequest?(
+		ctx: AgentLoopExtensionContext,
+	): AgentLoopRequestResult | null | undefined | Promise<AgentLoopRequestResult | null | undefined>;
+}
+
 export interface AgentConfig {
 	narratorId: string;
 	conversationId: string;
@@ -851,6 +896,8 @@ export interface AgentConfig {
 	resetUpstreamSessionOnFirstRequest?: boolean;
 	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
+	/** Request-level extensions (prompt persona / near-field guidance / tool anchoring). */
+	loopExtensions?: AgentLoopExtension[];
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */
 	disabledTools?: Set<string> | string[];
 	/** Optional hard allow-list. Unlike toolFilter, this is enforced again at execution time. */

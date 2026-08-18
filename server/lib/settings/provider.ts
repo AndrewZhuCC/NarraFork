@@ -698,6 +698,18 @@ export function getReasoningEffortBlocklist(): Array<{ pattern: string; enabled?
 	return s().agent.reasoningEffortBlocklist ?? [];
 }
 
+/**
+ * Models that enable the task-aware reasoning-mode routing.
+ *
+ * Whitelist: routing is disabled by default (empty list) and only activates
+ * for models whose id matches one of the patterns. Match through
+ * `matchesReasoningEffortBlocklist` (same pattern semantics: case-insensitive
+ * substring or `/regex/flags`).
+ */
+export function getRouterModels(): Array<{ pattern: string; enabled?: boolean }> {
+	return s().agent.routerModels ?? [];
+}
+
 export function openaiProviderPrefix(config: OpenAIProviderConfig): string {
 	return config.prefix;
 }

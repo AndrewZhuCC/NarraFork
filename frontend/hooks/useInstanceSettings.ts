@@ -89,6 +89,8 @@ export interface InstanceSettingsState {
 	agentDefaultReasoningEffort: string;
 	/** Models excluded from receiving a reasoning-effort hint. */
 	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
+	/** Models that enable task-aware reasoning-mode routing (whitelist; empty = disabled). */
+	routerModels: Array<{ pattern: string; enabled?: boolean }>;
 	globalWhitelistDirs: DirectoryWhitelistRuleInput[];
 	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
 	globalCommandWhitelist: CommandWhitelistRuleInput[];
@@ -188,6 +190,7 @@ function makeDefaults(): InstanceSettingsState {
 		queueDuringCompaction: false,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
+		routerModels: [],
 		globalWhitelistDirs: [],
 		globalBlacklistDirs: [],
 		globalCommandWhitelist: [],
@@ -296,6 +299,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
+				routerModels: settings.agent?.routerModels ?? [],
 				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(
 					settings.agent?.whitelistDirs,
 				),
@@ -409,6 +413,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					// Blank patterns are dropped so an empty row left in the editor
 					// cannot become a rule that matches every model.
 					reasoningEffortBlocklist: state.reasoningEffortBlocklist.filter((r) => r.pattern.trim()),
+					routerModels: state.routerModels.filter((r) => r.pattern.trim()),
 					maxTransientRetries: state.maxTransientRetries,
 					silentToolCallThreshold: state.silentToolCallThreshold,
 					pipelineUnusedToolCallThreshold:

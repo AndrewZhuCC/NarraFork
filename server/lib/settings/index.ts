@@ -66,6 +66,7 @@ export {
 	getOpenaiProviderConfig,
 	getQueueDuringCompaction,
 	getReasoningEffortBlocklist,
+	getRouterModels,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	grokProviderPrefix,

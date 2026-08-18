@@ -633,6 +633,16 @@ export interface NarraForkSettings {
 		 * substring match on the bare model id; `/regex/flags` is a regex.
 		 */
 		reasoningEffortBlocklist?: Array<{ pattern: string; enabled?: boolean }>;
+		/**
+		 * Models that enable the task-aware reasoning-mode routing.
+		 *
+		 * Whitelist, not blacklist: routing is disabled by default (empty list) and
+		 * only activates for models whose id matches one of these patterns. Plain
+		 * text is a case-insensitive substring match on the bare model id;
+		 * `/regex/flags` is a regex. Persona/guidance texts are measured for
+		 * DeepSeek V4 Flash, so only add models you intend to route.
+		 */
+		routerModels?: Array<{ pattern: string; enabled?: boolean }>;
 		/** Use login shell for Bash tool to source fresh environment variables instead of inheriting server process env. */
 		freshShellEnv: boolean;
 		/** Persist raw request/response dumps for each provider call into usage history. */

@@ -66,6 +66,8 @@ export interface ModelsSectionProps {
 	setAgentDefaultReasoningEffort: (v: string) => void;
 	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
 	setReasoningEffortBlocklist: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
+	routerModels: Array<{ pattern: string; enabled?: boolean }>;
+	setRouterModels: (v: Array<{ pattern: string; enabled?: boolean }>) => void;
 	subagentAllowedModels: SubagentAllowedModels;
 	setSubagentAllowedModels: (v: SubagentAllowedModels) => void;
 	groupedModels: ComboboxData;
@@ -91,6 +93,8 @@ export function ModelsSection({
 	setAgentDefaultReasoningEffort,
 	reasoningEffortBlocklist,
 	setReasoningEffortBlocklist,
+	routerModels,
+	setRouterModels,
 	subagentAllowedModels,
 	setSubagentAllowedModels,
 	groupedModels,
@@ -330,6 +334,24 @@ export function ModelsSection({
 						empty: t("reasoningEffortBlocklistEmpty"),
 						add: t("reasoningEffortBlocklistAdd"),
 						placeholder: t("reasoningEffortBlocklistPlaceholder"),
+					}}
+				/>
+			</Stack>
+			<Stack gap={4}>
+				<Text size="sm" fw={500}>
+					{t("routerModels")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("routerModelsDesc")}
+				</Text>
+				<CmdListEditor
+					commands={routerModels}
+					onChange={setRouterModels}
+					mode="whitelist"
+					labels={{
+						empty: t("routerModelsEmpty"),
+						add: t("routerModelsAdd"),
+						placeholder: t("routerModelsPlaceholder"),
 					}}
 				/>
 			</Stack>

@@ -426,6 +426,17 @@ export const updateSettingsSchema = z
 					)
 					.max(100)
 					.optional(),
+				// Models that enable task-aware routing. Whitelist: empty
+				// by default, routing activates only for matching model ids.
+				routerModels: z
+					.array(
+						z.object({
+							pattern: z.string().max(200),
+							enabled: z.boolean().optional(),
+						}),
+					)
+					.max(100)
+					.optional(),
 				maxTransientRetries: z.number().int().min(-1).max(100),
 				silentToolCallThreshold: z.number().int().min(-1).max(1000),
 				pipelineUnusedToolCallThreshold: z
