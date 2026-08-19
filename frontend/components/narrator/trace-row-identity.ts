@@ -95,6 +95,10 @@ export interface TraceRowIdentity {
 	blockId: string;
 	/** Owning message id (DOM contract + message-level actions). */
 	messageId: string;
+	/** Stable top-level message ordering, when available. */
+	messageSeq?: number;
+	/** Message role, kept raw until a CommentDraft needs normalization. */
+	role?: string;
 	/** Primary block index (rollback target; run START index for reasoning). */
 	blockIndex: number;
 	/** Every source block index this row represents — delete acts on each. */

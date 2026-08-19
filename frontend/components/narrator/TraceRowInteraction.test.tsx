@@ -141,6 +141,8 @@ interface RenderOpts {
 	narratorId?: string;
 	copyText?: string;
 	blockIndices?: readonly number[];
+	messageSeq?: number;
+	role?: string;
 	/** Omit to render with no message-level actions at all. */
 	withMessageActions?: boolean;
 	onViewSubagentSession?: (narratorId: string) => void;
@@ -152,6 +154,8 @@ async function renderRow(opts: RenderOpts = {}) {
 	const identity: TraceRowIdentity = {
 		blockId: opts.tool ? `tc-${opts.tool.toolUseId ?? "x"}` : "msg-m1-0",
 		messageId: "m1",
+		messageSeq: opts.messageSeq,
+		role: opts.role,
 		blockIndex: 0,
 		...(opts.blockIndices ? { blockIndices: opts.blockIndices } : {}),
 		...(opts.tool ? { tool: opts.tool } : {}),
@@ -418,11 +422,17 @@ describe("TraceRowInteraction — shared message items", () => {
 });
 
 describe("TraceRowInteraction — DOM selection contract", () => {
-	test("emits the block/message/index attributes the selection toolbar reads", async () => {
-		await renderRow({ tool: { toolName: "Read", toolUseId: "tu-9" } });
+	test("emits the block/message identity attributes the selection toolbar reads", async () => {
+		await renderRow({
+			tool: { toolName: "Read", toolUseId: "tu-9" },
+			messageSeq: 7,
+			role: "assistant",
+		});
 		const block = container?.querySelector("[data-block-id]");
 		expect(block?.getAttribute("data-block-id")).toBe("tc-tu-9");
 		expect(block?.getAttribute("data-message-id")).toBe("m1");
+		expect(block?.getAttribute("data-message-seq")).toBe("7");
+		expect(block?.getAttribute("data-role")).toBe("assistant");
 		expect(block?.getAttribute("data-block-index")).toBe("0");
 	});
 

@@ -18,6 +18,8 @@ interface SpecMarkdownEditorProps {
 	onSave: () => void;
 	onReload: () => void;
 	isSaving: boolean;
+	/** Reports the live DOM anchor for selection-aware consumers (e.g. Spec comments). */
+	onSelectionAnchor?: (anchorNode: Node | null, anchorPosition: number | null) => void;
 }
 
 /**
@@ -32,6 +34,7 @@ export function SpecMarkdownEditor({
 	onSave,
 	onReload,
 	isSaving,
+	onSelectionAnchor,
 }: SpecMarkdownEditorProps) {
 	const { t } = useTranslation("narrator");
 	const onChangeRef = useRef(onChange);
@@ -58,6 +61,26 @@ export function SpecMarkdownEditor({
 			onChangeRef.current(editor.getMarkdown());
 		},
 	});
+
+	useEffect(() => {
+		if (!editor || editor.isDestroyed || !onSelectionAnchor) return;
+		const reportSelection = () => {
+			if (editor.isDestroyed) return;
+			const dom = editor.view.dom;
+			const selection = dom.ownerDocument.getSelection?.() ?? null;
+			const anchorNode = selection?.anchorNode ?? null;
+			const isInsideEditor = anchorNode ? dom.contains(anchorNode) : false;
+			onSelectionAnchor(
+				isInsideEditor ? anchorNode : null,
+				isInsideEditor ? editor.state.selection.from : null,
+			);
+		};
+		editor.on("selectionUpdate", reportSelection);
+		reportSelection();
+		return () => {
+			editor.off("selectionUpdate", reportSelection);
+		};
+	}, [editor, onSelectionAnchor]);
 
 	// Reset editor content when a new revision is loaded (e.g. agent edited the
 	// file, or the user switched files). Keep local edits otherwise.

@@ -116,6 +116,7 @@ import {
 	useMessageContextMenu,
 } from "./MessageContextMenuCtx";
 import { MessageEditorPanel } from "./MessageEditorPanel";
+import { useMessageIdentityAttributes } from "./MessageIdentityCtx";
 import { EditedBadge } from "./MessageOriginalContent";
 import {
 	MessageOriginBadge,
@@ -552,6 +553,7 @@ function WebSearchBlock({
 	const rootRef = useRef<HTMLDivElement>(null);
 	const selection = useMessageSelection();
 	const msgCtx = useMessageContextMenu();
+	const messageIdentityAttrs = useMessageIdentityAttributes(messageId);
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 	const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
@@ -746,7 +748,7 @@ function WebSearchBlock({
 				ref={rootRef}
 				data-content-block
 				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...messageIdentityAttrs}
 				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 				onContextMenu={handleContextMenu}
 				onClick={handleBlockClick}
@@ -1338,6 +1340,7 @@ function SelectableSystemNotice({
 	const { t } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
 	const msgCtx = useMessageContextMenu();
+	const messageIdentityAttrs = useMessageIdentityAttributes(messageId);
 	const interactive = useRenderInteractive();
 	const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
@@ -1545,7 +1548,7 @@ function SelectableSystemNotice({
 				ref={rootRef}
 				data-content-block
 				{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...messageIdentityAttrs}
 				{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 				onContextMenu={handleContextMenu}
 				onClick={handleBlockClick}
@@ -1975,6 +1978,7 @@ export const ReasoningBlock = memo(
 		const rootRef = useRef<HTMLDivElement>(null);
 		const selection = useMessageSelection();
 		const msgCtx = useMessageContextMenu();
+		const messageIdentityAttrs = useMessageIdentityAttributes(messageId);
 		const isMobile = useMediaQuery(MOBILE_VIEWPORT_MEDIA_QUERY) ?? false;
 
 		const isSelected = !!(selection.selectionMode && selection.selectedBlockIds.has(blockIdStr));
@@ -2074,7 +2078,7 @@ export const ReasoningBlock = memo(
 					align="center"
 					data-content-block
 					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-					{...(messageId ? { "data-message-id": messageId } : {})}
+					{...messageIdentityAttrs}
 					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 					{...(blockIndices.length > 1 ? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") } : {})}
 					onContextMenu={handleContextMenu}
@@ -2335,7 +2339,7 @@ export const ReasoningBlock = memo(
 					ref={rootRef}
 					data-content-block
 					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-					{...(messageId ? { "data-message-id": messageId } : {})}
+					{...messageIdentityAttrs}
 					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 					{...(blockIndices.length > 1 ? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") } : {})}
 					onContextMenu={handleContextMenu}
@@ -3234,6 +3238,7 @@ function CompactIndicator({
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const messageIdentityAttrs = useMessageIdentityAttributes(messageId);
 	const isCompacting = status === "compacting";
 	const isFailed = status === "failed";
 	const [opened, { open, close }] = useDisclosure(false);
@@ -3343,7 +3348,7 @@ function CompactIndicator({
 				justify="center"
 				py={4}
 				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "context" } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...messageIdentityAttrs}
 				style={canClick || canCancel ? { cursor: "pointer" } : undefined}
 				onClick={canCancel ? () => setCancelConfirmOpen(true) : canClick ? handleOpen : undefined}
 				title={canCancel ? t("cancelCompactTitle") : undefined}
@@ -3491,6 +3496,7 @@ function SegmentCompactIndicator({
 	onDelete?: () => void;
 }) {
 	const { t } = useTranslation("narrator");
+	const messageIdentityAttrs = useMessageIdentityAttributes(messageId);
 	const [opened, { open, close }] = useDisclosure(false);
 	const compactSummaryModal = useContext(CompactSummaryModalCtx);
 	const [deleting, setDeleting] = useState(false);
@@ -3601,7 +3607,7 @@ function SegmentCompactIndicator({
 				justify="center"
 				py={4}
 				{...(isCompacting ? { [COMPACTING_MARKER_ATTR]: "segment" } : {})}
-				{...(messageId ? { "data-message-id": messageId } : {})}
+				{...messageIdentityAttrs}
 			>
 				{isCompacting ? (
 					<Loader size={14} color="teal" />

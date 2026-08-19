@@ -50,6 +50,7 @@ import { useDetachFromBottom } from "./DetachFromBottomCtx";
 import { DiffView } from "./DiffView";
 import { MarkdownContent } from "./MarkdownContent";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { useMessageIdentity } from "./MessageIdentityCtx";
 import {
 	BLOCK_ID_ATTR,
 	makeMessageBlockSelectionId,
@@ -241,6 +242,8 @@ export const ContentViewer = memo(
 		const { t: tNarrator } = useTranslation("narrator");
 		const router = useRouter({ warn: false });
 		const msgCtx = useMessageContextMenu();
+		const messageIdentity = useMessageIdentity();
+		const identityMessageId = msgCtx.messageId ?? messageIdentity.messageId;
 		const isPreviewLod = !useRenderInteractive();
 		const detachFromBottom = useDetachFromBottom();
 		const contentViewerEnv = useContext(ContentViewerEnvironmentContext);
@@ -257,8 +260,8 @@ export const ContentViewer = memo(
 		const isMobile = contentViewerEnv.isMobile;
 		const nested = useContext(NestedBlockCtx);
 		const stableBlockId =
-			!nested && msgCtx.messageId && blockIndex != null
-				? makeMessageBlockSelectionId(msgCtx.messageId, blockIndex)
+			!nested && identityMessageId && blockIndex != null
+				? makeMessageBlockSelectionId(identityMessageId, blockIndex)
 				: undefined;
 		const blockIdStr = nested ? undefined : (stableBlockId ?? `cv-${instanceId.current}`);
 		const selection = useMessageSelection();
@@ -678,7 +681,11 @@ export const ContentViewer = memo(
 					data-content-block
 					data-cv-id={instanceId.current}
 					{...(blockIdStr ? { [BLOCK_ID_ATTR]: blockIdStr } : {})}
-					{...(msgCtx.messageId && !nested ? { "data-message-id": msgCtx.messageId } : {})}
+					{...(identityMessageId && !nested ? { "data-message-id": identityMessageId } : {})}
+					{...(messageIdentity.messageSeq != null && !nested
+						? { "data-message-seq": String(messageIdentity.messageSeq) }
+						: {})}
+					{...(messageIdentity.role && !nested ? { "data-role": messageIdentity.role } : {})}
 					{...(blockIndex != null && !nested ? { "data-block-index": String(blockIndex) } : {})}
 					style={{
 						maxWidth: "100%",

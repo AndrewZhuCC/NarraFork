@@ -10,12 +10,13 @@ import { describe, expect, test } from "bun:test";
 import {
 	type ComposerContentState,
 	hasComposerAttachments,
+	hasComposerComments,
 	hasComposerText,
 	hasSendableComposerContent,
 } from "./composer-send-gate";
 
 function state(overrides: Partial<ComposerContentState> = {}): ComposerContentState {
-	return { text: "", imageCount: 0, textFileCount: 0, ...overrides };
+	return { text: "", imageCount: 0, textFileCount: 0, commentCount: 0, ...overrides };
 }
 
 describe("hasSendableComposerContent", () => {
@@ -42,6 +43,14 @@ describe("hasSendableComposerContent", () => {
 	test("typed text alone is sendable", () => {
 		expect(hasSendableComposerContent(state({ text: "看看这个" }))).toBe(true);
 	});
+
+	test("a selection comment alone is sendable", () => {
+		expect(hasSendableComposerContent(state({ commentCount: 1 }))).toBe(true);
+	});
+
+	test("a comment with a blank textarea is sendable", () => {
+		expect(hasSendableComposerContent(state({ text: "  ", commentCount: 2 }))).toBe(true);
+	});
 });
 
 describe("content predicates stay independent", () => {
@@ -54,6 +63,13 @@ describe("content predicates stay independent", () => {
 	test("text does not make the composer count as having attachments", () => {
 		const composer = state({ text: "hi" });
 		expect(hasComposerText(composer)).toBe(true);
+		expect(hasComposerAttachments(composer)).toBe(false);
+	});
+
+	test("comments do not make the composer count as having text or attachments", () => {
+		const composer = state({ commentCount: 1 });
+		expect(hasComposerComments(composer)).toBe(true);
+		expect(hasComposerText(composer)).toBe(false);
 		expect(hasComposerAttachments(composer)).toBe(false);
 	});
 });
@@ -89,6 +105,10 @@ describe("permission Enter-hint gating", () => {
 
 	test("typed text takes Enter back for sending", () => {
 		expect(permHintActive(state({ text: "no" }), { toolName: "Bash" })).toBe(false);
+	});
+
+	test("a staged comment takes Enter back for sending", () => {
+		expect(permHintActive(state({ commentCount: 1 }), { toolName: "Bash" })).toBe(false);
 	});
 
 	test("AskUserQuestion owns its own answer UI, so Enter is never rebound", () => {

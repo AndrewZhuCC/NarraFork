@@ -270,7 +270,10 @@ export const ActivityTrace = memo(function ActivityTrace({
 	};
 
 	const traceItems: CollapsibleTraceItem[] = items.flatMap((item) => {
-		const identity = resolveIdentity(item);
+		const baseIdentity = resolveIdentity(item);
+		const identity = baseIdentity
+			? { ...baseIdentity, messageSeq: item.msg.seq, role: item.msg.role }
+			: undefined;
 		const actions = identity ? resolveActions(item) : undefined;
 		if (item.kind === "reasoning") {
 			const text = (item.block.text as string) ?? (item.block.thinking as string) ?? "";

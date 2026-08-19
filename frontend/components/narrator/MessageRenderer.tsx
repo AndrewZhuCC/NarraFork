@@ -12,6 +12,7 @@ import { getToolCallBlurAnimationId, getUserMessageBlurAnimationId } from "./blu
 import type { ActivityRenderOverrides } from "./cross-chunk-activity";
 import { MessageBubble } from "./MessageBubble";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "./MessageContextMenuCtx";
+import { MessageIdentityCtx } from "./MessageIdentityCtx";
 import {
 	collectSegmentTargetIds,
 	type RenderSegment,
@@ -151,53 +152,61 @@ export function renderToolRun(
 		if (item.isSubagent) {
 			return (
 				<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
+					<MessageIdentityCtx.Provider
+						value={{ messageId: item.msg.id, messageSeq: item.msg.seq, role: item.msg.role }}
+					>
+						{wrapWithBlur(
+							toolAnimationId,
+							<div
+								id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
+								style={hlStyle}
+							>
+								<SubagentCard
+									toolCall={item.tc}
+									narratorId={narratorId}
+									inRun={total >= 2}
+									isLast={idx === total - 1}
+									isSoleInRun={soleSubagent}
+									permCb={permCb}
+									onViewSubagentSession={onViewSubagentSession}
+									blockIndex={item.blockIndex}
+									isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
+								/>
+							</div>,
+						)}
+					</MessageIdentityCtx.Provider>
+				</MessageContextMenuCtx.Provider>
+			);
+		}
+		return (
+			<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
+				<MessageIdentityCtx.Provider
+					value={{ messageId: item.msg.id, messageSeq: item.msg.seq, role: item.msg.role }}
+				>
 					{wrapWithBlur(
 						toolAnimationId,
 						<div
 							id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
 							style={hlStyle}
 						>
-							<SubagentCard
+							<ToolCallCard
 								toolCall={item.tc}
 								narratorId={narratorId}
 								inRun={total >= 2}
 								isLast={idx === total - 1}
-								isSoleInRun={soleSubagent}
-								permCb={permCb}
+								pendingPermission={matchPermission(item.tc)}
+								onPermissionDecision={permCb.onPermissionDecision}
+								onQuestionSubmit={permCb.onQuestionSubmit}
+								onQuestionReflect={permCb.onQuestionReflect}
+								onQuestionDeny={permCb.onQuestionDeny}
 								onViewSubagentSession={onViewSubagentSession}
+								onOpenFilePanel={onOpenFilePanel}
 								blockIndex={item.blockIndex}
 								isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
 							/>
 						</div>,
 					)}
-				</MessageContextMenuCtx.Provider>
-			);
-		}
-		return (
-			<MessageContextMenuCtx.Provider key={key} value={ctxActions}>
-				{wrapWithBlur(
-					toolAnimationId,
-					<div
-						id={item.tc.toolUseId ? `tool-use-${item.tc.toolUseId}` : `msg-${item.msg.id}`}
-						style={hlStyle}
-					>
-						<ToolCallCard
-							toolCall={item.tc}
-							narratorId={narratorId}
-							inRun={total >= 2}
-							isLast={idx === total - 1}
-							pendingPermission={matchPermission(item.tc)}
-							onPermissionDecision={permCb.onPermissionDecision}
-							onQuestionSubmit={permCb.onQuestionSubmit}
-							onQuestionReflect={permCb.onQuestionReflect}
-							onQuestionDeny={permCb.onQuestionDeny}
-							onViewSubagentSession={onViewSubagentSession}
-							onOpenFilePanel={onOpenFilePanel}
-							blockIndex={item.blockIndex}
-							isRecent={recentMessageIds == null || recentMessageIds.has(item.msg.id)}
-						/>
-					</div>,
-				)}
+				</MessageIdentityCtx.Provider>
 			</MessageContextMenuCtx.Provider>
 		);
 	};
@@ -437,6 +446,8 @@ export function renderTreeMessages(
 				key={key}
 				id={domId}
 				data-message-id={targetMsg.id ?? undefined}
+				{...(targetMsg.seq != null ? { "data-message-seq": String(targetMsg.seq) } : {})}
+				{...(targetMsg.role ? { "data-role": targetMsg.role } : {})}
 				style={{
 					borderRadius: "var(--mantine-radius-md)",
 					animation:
@@ -452,32 +463,36 @@ export function renderTreeMessages(
 								: `${(targetMsg.meterUsage as number).toFixed(2)} credits`}
 						</Text>
 					)}
-				<MessageBubble
-					narratorId={narratorId}
-					message={displayMsg}
-					onForkFromMessage={onForkFromMessage}
-					onAskInPassing={onAskInPassing}
-					resolvePerm={
-						resolvePerm ??
-						((tc) => resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermissions))
-					}
-					onPermissionDecision={permCb.onPermissionDecision}
-					onQuestionSubmit={permCb.onQuestionSubmit}
-					onQuestionReflect={permCb.onQuestionReflect}
-					onQuestionDeny={permCb.onQuestionDeny}
-					onCompactBeforeMessage={onCompactBeforeMessage}
-					onClearContextBefore={onClearContextBefore}
-					onManualSummarize={onManualSummarize}
-					onDeleteBlock={onDeleteBlock}
-					onRollbackToBlock={onRollbackToBlock}
-					onEditAndRegenerate={onEditAndRegenerate}
-					onEditAssistantMessage={onEditAssistantMessage}
-					onRestoreAssistantMessage={onRestoreAssistantMessage}
-					onViewSubagentSession={onViewSubagentSession}
-					onOpenFilePanel={foldedSubagentHandlers?.onOpenFilePanel}
-					isLastUserMessage={targetMsg.id === lastUserMessageId}
-					hasChapter={hasChapter}
-				/>
+				<MessageIdentityCtx.Provider
+					value={{ messageId: targetMsg.id, messageSeq: targetMsg.seq, role: targetMsg.role }}
+				>
+					<MessageBubble
+						narratorId={narratorId}
+						message={displayMsg}
+						onForkFromMessage={onForkFromMessage}
+						onAskInPassing={onAskInPassing}
+						resolvePerm={
+							resolvePerm ??
+							((tc) => resolvePendingPerm(tc, permCb.pendingPermission, permCb.pendingPermissions))
+						}
+						onPermissionDecision={permCb.onPermissionDecision}
+						onQuestionSubmit={permCb.onQuestionSubmit}
+						onQuestionReflect={permCb.onQuestionReflect}
+						onQuestionDeny={permCb.onQuestionDeny}
+						onCompactBeforeMessage={onCompactBeforeMessage}
+						onClearContextBefore={onClearContextBefore}
+						onManualSummarize={onManualSummarize}
+						onDeleteBlock={onDeleteBlock}
+						onRollbackToBlock={onRollbackToBlock}
+						onEditAndRegenerate={onEditAndRegenerate}
+						onEditAssistantMessage={onEditAssistantMessage}
+						onRestoreAssistantMessage={onRestoreAssistantMessage}
+						onViewSubagentSession={onViewSubagentSession}
+						onOpenFilePanel={foldedSubagentHandlers?.onOpenFilePanel}
+						isLastUserMessage={targetMsg.id === lastUserMessageId}
+						hasChapter={hasChapter}
+					/>
+				</MessageIdentityCtx.Provider>
 				{showTokenUsage &&
 					(turnUsageSummary != null ||
 						(targetMsg.meterUsage != null && promptTokenFootprint == null)) && (

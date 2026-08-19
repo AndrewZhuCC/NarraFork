@@ -59,6 +59,7 @@ import {
 } from "../chunk-scroll-utils";
 import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "../MessageContextMenuCtx";
+import { MessageIdentityCtx } from "../MessageIdentityCtx";
 import {
 	type MessageSelectionResolver,
 	makeMessageBlockSelectionId,
@@ -1047,6 +1048,8 @@ interface ExactRowProps {
 	contentWidth: number;
 	itemId: string | undefined;
 	sourceIds: readonly string[];
+	messageSeq?: number;
+	messageRole?: string;
 	/** Interaction signature for this row's key; changes force a re-render. */
 	interactionSig: string;
 	toggles: RowToggles;
@@ -1211,6 +1214,8 @@ const ExactRow = memo(
 		contentWidth,
 		itemId,
 		sourceIds,
+		messageSeq,
+		messageRole,
 		toggles,
 		renderLabels,
 		interaction,
@@ -1532,27 +1537,37 @@ const ExactRow = memo(
 		const interactiveBody =
 			interaction && editorSlot === undefined ? (
 				<MessageContextMenuCtx.Provider value={interaction.actions}>
-					<VListRowInteraction
-						blockId={interaction.blockId}
-						messageId={interaction.messageId}
-						blockIndex={interaction.blockIndex}
-						blockIndices={interaction.blockIndices}
-						copyText={interaction.copyText}
-						actions={interaction.actions}
-						narratorId={narratorId}
-						toolUseId={interaction.toolUseId}
-						toolMeta={interaction.toolMeta}
-						toolActions={interaction.toolActions}
-						onViewOriginal={interaction.onViewOriginal}
-						inspectContent={interaction.inspectContent}
-						onOpenFullscreen={
-							menuViewTarget && viewControls
-								? () => viewControls.openFullscreen(menuViewTarget)
-								: undefined
-						}
+					<MessageIdentityCtx.Provider
+						value={{
+							messageId: interaction.messageId,
+							messageSeq,
+							role: messageRole,
+						}}
 					>
-						{viewableBody}
-					</VListRowInteraction>
+						<VListRowInteraction
+							blockId={interaction.blockId}
+							messageId={interaction.messageId}
+							messageSeq={messageSeq}
+							role={messageRole}
+							blockIndex={interaction.blockIndex}
+							blockIndices={interaction.blockIndices}
+							copyText={interaction.copyText}
+							actions={interaction.actions}
+							narratorId={narratorId}
+							toolUseId={interaction.toolUseId}
+							toolMeta={interaction.toolMeta}
+							toolActions={interaction.toolActions}
+							onViewOriginal={interaction.onViewOriginal}
+							inspectContent={interaction.inspectContent}
+							onOpenFullscreen={
+								menuViewTarget && viewControls
+									? () => viewControls.openFullscreen(menuViewTarget)
+									: undefined
+							}
+						>
+							{viewableBody}
+						</VListRowInteraction>
+					</MessageIdentityCtx.Provider>
 				</MessageContextMenuCtx.Provider>
 			) : (
 				viewableBody
@@ -1579,6 +1594,8 @@ const ExactRow = memo(
 			<div
 				id={itemId}
 				data-message-id={sourceIds[0]}
+				{...(messageSeq != null ? { "data-message-seq": String(messageSeq) } : {})}
+				{...(messageRole ? { "data-role": messageRole } : {})}
 				// LOD-independent identity of this row's content (see ElementSpec.unitId).
 				// A tool call carries the same value here as the folded trace row it
 				// becomes at L1/L2, so the two renderings are pairable across a level
@@ -1656,6 +1673,8 @@ const ExactRow = memo(
 		prev.hitHeight === next.hitHeight &&
 		prev.contentWidth === next.contentWidth &&
 		prev.itemId === next.itemId &&
+		prev.messageSeq === next.messageSeq &&
+		prev.messageRole === next.messageRole &&
 		prev.interactionSig === next.interactionSig &&
 		prev.toggles === next.toggles &&
 		prev.interaction === next.interaction &&
@@ -4613,8 +4632,14 @@ export const PretextExactMessageList = forwardRef<
 		const toolMetaIndex = buildToolMetaIndex(pretextDocument.messages as unknown as NarratorMsg[]);
 		const handlers = rowHandlers ?? {};
 		return (row, rowBody) => {
-			const identity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
-			if (!identity) return null;
+			const baseIdentity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
+			if (!baseIdentity) return null;
+			const messageMeta = messagesById.get(baseIdentity.messageId);
+			const identity = {
+				...baseIdentity,
+				messageSeq: messageMeta?.seq,
+				role: messageMeta?.role,
+			};
 			const actions = buildRowCtxActions(
 				{
 					messageId: identity.messageId,
@@ -4625,21 +4650,29 @@ export const PretextExactMessageList = forwardRef<
 			);
 			return (
 				<MessageContextMenuCtx.Provider value={actions}>
-					<TraceRowInteraction
-						identity={identity}
-						actions={actions}
-						narratorId={narratorId}
-						onViewSubagentSession={handlers.onViewSubagentSession}
-						onDetachSubagent={handlers.onDetachSubagent}
-						onCancelBackgroundTask={handlers.onCancelBackgroundTask}
-						onOpenFilePanel={handlers.onOpenFilePanel}
+					<MessageIdentityCtx.Provider
+						value={{
+							messageId: identity.messageId,
+							messageSeq: identity.messageSeq,
+							role: identity.role,
+						}}
 					>
-						{rowBody}
-					</TraceRowInteraction>
+						<TraceRowInteraction
+							identity={identity}
+							actions={actions}
+							narratorId={narratorId}
+							onViewSubagentSession={handlers.onViewSubagentSession}
+							onDetachSubagent={handlers.onDetachSubagent}
+							onCancelBackgroundTask={handlers.onCancelBackgroundTask}
+							onOpenFilePanel={handlers.onOpenFilePanel}
+						>
+							{rowBody}
+						</TraceRowInteraction>
+					</MessageIdentityCtx.Provider>
 				</MessageContextMenuCtx.Provider>
 			);
 		};
-	}, [selectionIndex, rowHandlers, pretextDocument.messages, narratorId]);
+	}, [selectionIndex, rowHandlers, pretextDocument.messages, messagesById, narratorId]);
 
 	/**
 	 * Resolve the row-interaction slot for one list element.
@@ -4890,6 +4923,7 @@ export const PretextExactMessageList = forwardRef<
 							const manifestItem = manifestItems[itemIndex];
 							if (!item || !geometry || !manifestItem) return null;
 							const sourceIds = sourceIdsForItem(item, manifestItem);
+							const messageMeta = messagesById.get(sourceIds[0]);
 							const itemId = domIdForItem(item, sourceIds);
 							const permissionSlot = permissionSlotByKey.get(item.spec.key);
 							const editorSlot =
@@ -4914,6 +4948,8 @@ export const PretextExactMessageList = forwardRef<
 									contentWidth={contentWidth}
 									itemId={itemId}
 									sourceIds={sourceIds}
+									messageSeq={messageMeta?.seq}
+									messageRole={messageMeta?.role}
 									// Layout-affecting interaction state PLUS the viewer's pure render
 									// state, so a wrap / source toggle re-renders just this row.
 									//

@@ -133,6 +133,7 @@ import { FilePreviewModal, MAX_FILE_PREVIEW_BLOB_BYTES } from "./FilePreviewModa
 import { KnowledgeDetail } from "./KnowledgeToolDetail";
 import { LazyCollapse } from "./LazyCollapse";
 import { useMessageContextMenu } from "./MessageContextMenuCtx";
+import { useMessageIdentityAttributes } from "./MessageIdentityCtx";
 import {
 	BLOCK_ID_ATTR,
 	MESSAGE_SELECTION_IGNORE_ATTR,
@@ -5684,6 +5685,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 		permissionCapability.supported && permissionCapability.approveDeny;
 	const allowRetryCtx = useContext(AllowRetryCtx);
 	const msgCtx = useMessageContextMenu();
+	const messageIdentityAttrs = useMessageIdentityAttributes(msgCtx.messageId);
 	const canOfferAllowRetry =
 		!pendingPermission &&
 		permissionDecisionsSupported &&
@@ -6138,7 +6140,7 @@ export const ToolCallCard = memo(function ToolCallCard({
 					onClick={interactionEnabled ? handleTcBlockClick : undefined}
 					style={buildSelectionStyle()}
 					{...(tcBlockId ? { [BLOCK_ID_ATTR]: tcBlockId } : {})}
-					{...(msgCtx.messageId ? { "data-message-id": msgCtx.messageId } : {})}
+					{...messageIdentityAttrs}
 					{...(blockIndex != null ? { "data-block-index": String(blockIndex) } : {})}
 				>
 					<Box ref={isPlan ? cardRef : undefined}>

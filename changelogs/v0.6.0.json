@@ -1,0 +1,6 @@
+{
+	"version": "0.6.0",
+	"date": "2026-08-19",
+	"en": "## New Features\n\n- Add unified team chat, direct messages, and richer workspace collaboration surfaces.\n- Add device enrollment and one-line remote executor setup with path rules.\n- Add model cards, trait layers, project access controls, and detachable chapter panels.\n- Improve provider integrations, remote compaction, shared diff rendering, and agent execution controls.\n\n## Bug Fixes\n\n- Normalize invalid trait JSON during startup instead of failing initialization.\n- Improve Grok tool parsing and text deduplication.",
+	"zh-CN": "## 新功能\n\n- 新增统一团队聊天、私信和更完整的工作区协作界面。\n- 新增设备注册、一键远程执行器安装与路径规则。\n- 新增模型卡、特质层、项目访问控制和可拆分章节面板。\n- 改进 Provider 集成、远程压缩、共享差异渲染和 Agent 执行控制。\n\n## 修复\n\n- 启动时规范化无效的特质 JSON，避免初始化失败。\n- 改进 Grok 工具解析和文本去重。"
+}

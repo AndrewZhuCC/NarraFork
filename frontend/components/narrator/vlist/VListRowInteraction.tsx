@@ -93,6 +93,10 @@ export interface VListRowInteractionProps {
 	blockId: string;
 	/** Owning message id for the DOM contract. */
 	messageId: string;
+	/** Stable top-level message ordering, when available. */
+	messageSeq?: number;
+	/** Message role, kept raw until a CommentDraft needs normalization. */
+	role?: string;
 	/** Primary block index for the DOM contract. */
 	blockIndex: number;
 	/** All source block indices (reasoning runs); emitted as data-block-indices. */
@@ -150,6 +154,8 @@ export interface VListRowInteractionProps {
 export function VListRowInteraction({
 	blockId,
 	messageId,
+	messageSeq,
+	role,
 	blockIndex,
 	blockIndices,
 	copyText,
@@ -497,6 +503,8 @@ export function VListRowInteraction({
 				data-content-block
 				{...{ [BLOCK_ID_ATTR]: blockId }}
 				data-message-id={messageId}
+				{...(messageSeq != null ? { "data-message-seq": String(messageSeq) } : {})}
+				{...(role ? { "data-role": role } : {})}
 				data-block-index={String(blockIndex)}
 				{...(blockIndices && blockIndices.length > 1
 					? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") }

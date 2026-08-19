@@ -176,7 +176,7 @@ import {
 	useProviderModelRefreshCapability,
 	useProviderRuntimeCapability,
 } from "../../hooks/usePlatform";
-import { useSpecTasks } from "../../hooks/useSpec";
+import { useSpecFiles, useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
@@ -211,7 +211,7 @@ import {
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/ConfirmDialogProvider";
 import { useImageViewer } from "../common/ImageViewerProvider";
-import { SelectionPopover } from "../common/SelectionPopover";
+import { type SelectionCommentPayload, SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { TruncatedText } from "../common/TruncatedText";
 import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
@@ -232,12 +232,21 @@ import {
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommandParamHelper } from "./CommandParamHelper";
 import { type CommandItem, CommandPopover } from "./CommandPopover";
+import { CommentDraftChips } from "./CommentDraftChips";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
+import { resolveChatCommentAnchor } from "./comment-anchor";
 import {
-	hasComposerAttachments,
-	hasComposerText,
-	hasSendableComposerContent,
-} from "./composer-send-gate";
+	addCommentDraft,
+	type CommentDraft,
+	clearCommentDrafts,
+	composeUserMessageWithComments,
+	createCommentDraft,
+	getCommentDrafts,
+	removeCommentDraft,
+	setCommentDrafts,
+	useCommentDrafts,
+} from "./comment-draft-store";
+import { hasSendableComposerContent } from "./composer-send-gate";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 import {
 	clearDraftImageAttachments,
@@ -3369,6 +3378,13 @@ export function NarratorPanel({
 	// attachments without re-registering on every change.
 	const attachedTextFilesRef = useRef<File[]>(attachedTextFiles);
 	attachedTextFilesRef.current = attachedTextFiles;
+	const commentDrafts = useCommentDrafts(narratorId);
+	const { data: specFiles } = useSpecFiles(narratorId);
+	const specRevisionByUri = useMemo(() => {
+		const map = new Map<string, string | null>();
+		for (const file of specFiles ?? []) map.set(file.uri, file.revisionId);
+		return map;
+	}, [specFiles]);
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
 	const warnDraftAttachmentsPersistenceFailure = useCallback((action: string, err: unknown) => {
@@ -3531,6 +3547,29 @@ export function NarratorPanel({
 	const [isAtBottom, setIsAtBottom] = useState(true);
 	const viewportRef = useRef<HTMLDivElement>(null);
 	const contentRef = useRef<HTMLDivElement>(null);
+	const handleChatComment = useCallback(
+		({ excerpt, comment, anchorNode }: SelectionCommentPayload) => {
+			const anchor = resolveChatCommentAnchor(anchorNode, contentRef.current);
+			addCommentDraft(
+				narratorId,
+				createCommentDraft({
+					source: "chat",
+					excerpt,
+					comment,
+					...(anchor
+						? {
+								messageId: anchor.messageId,
+								messageSeq: anchor.messageSeq,
+								role: anchor.role,
+								blockIndex: anchor.blockIndex,
+								blockId: anchor.blockId,
+							}
+						: {}),
+				}),
+			);
+		},
+		[narratorId],
+	);
 	const chunkListRef = useRef<ChunkedMessageListHandle>(null);
 	// The message area box — the LOD indicator's containing block, and the hover
 	// region that decides whether holding Alt targets THIS panel.
@@ -4524,12 +4563,13 @@ export function NarratorPanel({
 		[setFileModDrawerOpened],
 	);
 
-	// What the composer currently holds. Attachments count as content, so an
-	// image-only draft behaves like a typed one everywhere below.
+	// What the composer currently holds. Attachments and selection comments count
+	// as content, so an image-only or comments-only draft behaves like a typed one.
 	const composerContent = {
 		text: input,
 		imageCount: attachedImages.length,
 		textFileCount: attachedTextFiles.length,
+		commentCount: commentDrafts.length,
 	};
 
 	// True when the composer carries nothing to send and there's a non-question pending
@@ -5970,22 +6010,31 @@ export function NarratorPanel({
 		msg: string,
 		priority?: boolean,
 		signal?: AbortSignal,
+		includeCommentDrafts = true,
 	): Promise<boolean> => {
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
+		// `/new` is a spawn command — packing comments in front of it would hide the
+		// slash from the backend. Leave drafts in the store for the next real send.
+		// External dock forwards are also standalone messages and must not consume the
+		// operator's in-progress composer comments.
+		const comments =
+			includeCommentDrafts && !/^\/new(?:\s|$)/.test(msg) ? getCommentDrafts(narratorId) : [];
+		const payload = composeUserMessageWithComments(msg, comments);
 		hideInputForSend();
 		hideAttachedFilesForSend();
+		if (comments.length > 0) clearCommentDrafts(narratorId);
 		try {
 			const result = await api.sendNarratorMessage(
 				narratorId,
-				msg,
+				payload,
 				images.length > 0 ? images : undefined,
 				textFiles.length > 0 ? textFiles : undefined,
 				priority,
 				reportUploadProgress,
 				signal,
 			);
-			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
+			const buffered = applyBufferedSendResult(result, payload, images.length, priority);
 			commitInputDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
@@ -5993,10 +6042,11 @@ export function NarratorPanel({
 			scrollToBottom(true);
 			return buffered;
 		} catch (err) {
-			// Restore input and attachments on error
+			// Restore input, attachments and comment drafts on error
 			setInput(msg);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
+			if (comments.length > 0) setCommentDrafts(narratorId, comments);
 			throw err; // Re-throw to let caller handle
 		}
 	};
@@ -6038,7 +6088,12 @@ export function NarratorPanel({
 			progress: attachmentCount > 0 ? 0 : null,
 			canCancel: attachmentCount > 0,
 		});
-		let restoreOnError: { msg: string; images: File[]; textFiles: File[] } | null = null;
+		let restoreOnError: {
+			msg: string;
+			images: File[];
+			textFiles: File[];
+			comments: CommentDraft[];
+		} | null = null;
 		try {
 			inputHistory.push(msg);
 
@@ -6050,12 +6105,15 @@ export function NarratorPanel({
 					return;
 				}
 
-				const initialMessage = newMatch[1]?.trim() ?? "";
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles };
+				const comments = getCommentDrafts(narratorId);
+				// Pack comments into the new narrator's first message, not the `/new` command.
+				const initialMessage = composeUserMessageWithComments(newMatch[1]?.trim() ?? "", comments);
+				restoreOnError = { msg, images, textFiles, comments };
 				hideInputForSend();
 				hideAttachedFilesForSend();
+				if (comments.length > 0) clearCommentDrafts(narratorId);
 
 				const currentCwd =
 					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
@@ -6133,12 +6191,15 @@ export function NarratorPanel({
 			}
 			const images = [...attachedImages];
 			const textFiles = [...attachedTextFiles];
+			const comments = getCommentDrafts(narratorId);
+			const payload = composeUserMessageWithComments(msg, comments);
 			// Remember the draft so a cancelled upload can restore it — submitMessage
 			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles };
+			restoreOnError = { msg, images, textFiles, comments };
 			hideInputForSend();
 			hideAttachedFilesForSend();
-			await submitMessage(msg, images, textFiles, abortController.signal);
+			if (comments.length > 0) clearCommentDrafts(narratorId);
+			await submitMessage(payload, images, textFiles, abortController.signal);
 			commitInputDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			restoreOnError = null;
@@ -6150,6 +6211,9 @@ export function NarratorPanel({
 				setInput(restoreOnError.msg);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
+				if (restoreOnError.comments.length > 0) {
+					setCommentDrafts(narratorId, restoreOnError.comments);
+				}
 			}
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
 			if (isAbortError(err)) {
@@ -6205,7 +6269,7 @@ export function NarratorPanel({
 					setInput(trimmed);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
-					await doSendBufferedRef.current(trimmed, false);
+					await doSendBufferedRef.current(trimmed, false, undefined, false);
 				} catch (err) {
 					notifications.show({
 						color: "red",
@@ -8191,13 +8255,12 @@ export function NarratorPanel({
 							</Box>
 						)}
 
-						{effSendToTerminal && (
-							<SelectionPopover
-								containerRef={contentRef}
-								onAction={effSendToTerminal}
-								label={tt("sendToTerminal")}
-							/>
-						)}
+						<SelectionPopover
+							containerRef={contentRef}
+							onAction={effSendToTerminal}
+							label={tt("sendToTerminal")}
+							onComment={handleChatComment}
+						/>
 
 						{/* Scroll to bottom button */}
 						{!isWorkspacePreview && (
@@ -8343,6 +8406,15 @@ export function NarratorPanel({
 								</Group>
 							))}
 						</Group>
+					)}
+
+					{commentDrafts.length > 0 && (
+						<CommentDraftChips
+							drafts={commentDrafts}
+							onRemove={(id) => removeCommentDraft(narratorId, id)}
+							specRevisionByUri={specRevisionByUri}
+							withTopBorder={attachedImages.length === 0 && attachedTextFiles.length === 0}
+						/>
 					)}
 
 					{/* Upload / send progress — shown while attachments are being uploaded
@@ -9386,13 +9458,12 @@ export function NarratorPanel({
 									/>
 								</Box>
 								{(() => {
-									const hasInput = hasComposerText(composerContent);
-									const hasAttachments = hasComposerAttachments(composerContent);
+									const hasInput = hasSendableComposerContent(composerContent);
 
 									// Takeover button: shown while a subagent is running and not yet
 									// taken over. Clicking it interrupts the current turn and hands
 									// direct control to the user (parent tool call stays blocked).
-									if (canTakeover && !hasInput && !hasAttachments && !editingMessageState) {
+									if (canTakeover && !hasInput && !editingMessageState) {
 										return (
 											<Button
 												key="takeover"
@@ -9410,14 +9481,11 @@ export function NarratorPanel({
 									// queue / edit-submit). Extracted so it can be reused inside the
 									// takeover two-button layout.
 									const renderPrimaryActionButton = () => {
-										const showInterrupt =
-											isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
+										const showInterrupt = isActive && !hasInput && retryRecoveryAllowsInterrupt;
 
 										const hasCutInMessage = !!queuedMessages[0]?.priority;
-										const showRetry =
-											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
-										const showContinue =
-											!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
+										const showRetry = !showInterrupt && !hasInput && canRetryLastUserMessage;
+										const showContinue = !showInterrupt && !hasInput && canContinueNarrator;
 
 										// Wrap a primary button as the right segment of the split
 										// send-options control (three-dots menu on the left). Used for
@@ -9430,7 +9498,7 @@ export function NarratorPanel({
 											<SendOptionsSplitButton
 												enterQueueMode={userPrefs?.enterQueueMode ?? "turn"}
 												ctrlEnterQueueMode={userPrefs?.ctrlEnterQueueMode ?? "tool"}
-												hasInput={hasInput || hasAttachments}
+												hasInput={hasInput}
 												color={opts?.color}
 												variant={opts?.variant}
 												onSelectEnterMode={(mode) =>
@@ -9526,10 +9594,10 @@ export function NarratorPanel({
 													>
 														<Button
 															key="send-priority"
-															disabled={!hasInput && !hasAttachments}
+															disabled={!hasInput}
 															loading={isSending}
 															onPointerDown={(event) => {
-																if (!hasInput && !hasAttachments) return;
+																if (!hasInput) return;
 																startQueueHold(event);
 															}}
 															onPointerUp={handleQueuePointerUp}
@@ -9569,7 +9637,7 @@ export function NarratorPanel({
 													<Button
 														key="send"
 														onClick={handleSend}
-														disabled={!hasInput && !hasAttachments}
+														disabled={!hasInput}
 														loading={isSending}
 													>
 														{tc("send")}

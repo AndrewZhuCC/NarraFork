@@ -142,7 +142,8 @@ export function TraceRowInteraction({
 	const [inspectorOpened, setInspectorOpened] = useState(false);
 	const [previewOpened, setPreviewOpened] = useState(false);
 
-	const { blockId, messageId, blockIndex, blockIndices, copyText, tool } = identity;
+	const { blockId, messageId, messageSeq, role, blockIndex, blockIndices, copyText, tool } =
+		identity;
 	const isSelected = selection.selectedBlockIds.has(blockId);
 
 	const handleDeselectBlock = useCallback(() => {
@@ -437,6 +438,8 @@ export function TraceRowInteraction({
 				data-trace-row
 				{...{ [BLOCK_ID_ATTR]: blockId }}
 				data-message-id={messageId}
+				{...(messageSeq != null ? { "data-message-seq": String(messageSeq) } : {})}
+				{...(role ? { "data-role": role } : {})}
 				data-block-index={String(blockIndex)}
 				{...(blockIndices && blockIndices.length > 1
 					? { [BLOCK_INDICES_ATTR]: blockIndices.join(",") }

@@ -841,15 +841,13 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 						overscrollBehavior: "contain",
 					}}
 				>
-					{onSendToChat && (
-						<SelectionPopover
-							containerRef={containerRef}
-							onAction={handleSendSelection}
-							label={t("sendToChat")}
-							externalSelection={xtermSelection}
-							externalAnchor={selectionAnchor}
-						/>
-					)}
+					<SelectionPopover
+						containerRef={containerRef}
+						onAction={onSendToChat ? handleSendSelection : undefined}
+						label={t("sendToChat")}
+						externalSelection={xtermSelection}
+						externalAnchor={selectionAnchor}
+					/>
 					{disconnected && (
 						<Badge
 							size="xs"

@@ -151,7 +151,12 @@ function createMdComponents(animateText?: AnimateTextFn): Components {
 	function headingComponent({ children, node }: any) {
 		const tag = (node?.tagName ?? "h3") as "h1" | "h2" | "h3" | "h4" | "h5" | "h6";
 		const Tag = tag;
-		return <Tag>{at(children)}</Tag>;
+		const level = Number(tag.slice(1));
+		return (
+			<Tag data-heading={extractText(children)} data-level={level}>
+				{at(children)}
+			</Tag>
+		);
 	}
 
 	return {

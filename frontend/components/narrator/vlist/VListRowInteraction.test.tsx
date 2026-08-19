@@ -136,6 +136,8 @@ interface RenderOpts {
 	narratorId?: string;
 	toolUseId?: string;
 	copyText?: string;
+	messageSeq?: number;
+	role?: string;
 	/** Message-level menu actions (default: id only, no items). */
 	actions?: import("../MessageContextMenuCtx").MessageContextMenuActions;
 	onViewOriginal?: () => void;
@@ -152,6 +154,8 @@ async function renderRow(opts: RenderOpts = {}) {
 				<VListRowInteraction
 					blockId="sa-tu_1"
 					messageId="m1"
+					messageSeq={opts.messageSeq}
+					role={opts.role}
 					blockIndex={0}
 					copyText={opts.copyText}
 					actions={opts.actions ?? { messageId: "m1" }}
@@ -364,6 +368,16 @@ describe("VListRowInteraction — tool card items", () => {
 		expect(labels).not.toContain("contextMenu_copyFilePath");
 		expect(labels).not.toContain("toolCallInspector.inspect");
 		expect(labels).not.toContain("viewSubagentSession");
+	});
+});
+
+describe("VListRowInteraction — DOM selection contract", () => {
+	test("emits message seq and role beside the existing message id", async () => {
+		await renderRow({ messageSeq: 19, role: "user" });
+		const block = container?.querySelector("[data-block-id]");
+		expect(block?.getAttribute("data-message-id")).toBe("m1");
+		expect(block?.getAttribute("data-message-seq")).toBe("19");
+		expect(block?.getAttribute("data-role")).toBe("user");
 	});
 });
 
