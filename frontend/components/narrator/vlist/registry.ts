@@ -33,6 +33,7 @@ import {
 	resolveReasoningDisplayText,
 	resolveReasoningForm,
 } from "./measure/measure-reasoning";
+import { measureReviewCard } from "./measure/measure-review-card";
 import { measureSubagentCard } from "./measure/measure-subagent";
 import { measureSubagentRecovery } from "./measure/measure-subagent-recovery";
 import { measureKnowledgeHint } from "./measure/measure-system-list";
@@ -44,7 +45,6 @@ import {
 	measureReasoningCountLine,
 	measureReasoningStepsTrace,
 	measureToolRunCountLine,
-	measureToolRunSummary,
 } from "./measure/measure-tool-run";
 import { measureTurnUsage } from "./measure/measure-turn-usage";
 import { measureWebSearch } from "./measure/measure-web-search";
@@ -146,6 +146,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		lodSensitive: false,
 		measure: (d, w, l) => measurePlanCard(d as AnyData, w, l),
 	},
+	"review-card": {
+		kind: "review-card",
+		label: "Review card",
+		lodSensitive: false,
+		measure: (d, w, l) => measureReviewCard(d as AnyData, w, l),
+	},
 	"ask-in-passing": {
 		kind: "ask-in-passing",
 		label: "Ask in passing",
@@ -170,27 +176,9 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		lodSensitive: true,
 		measure: (d, w, l, o) => measureToolCallGroup((d as AnyData).toolCalls, w, l, o as AnyData),
 	},
-	"tool-run-summary": {
-		kind: "tool-run-summary",
-		label: "Tool run summary (L3)",
-		lodSensitive: true,
-		// `lod` reaches the trace so a drilled-in row's nested tool card measures its
-		// detail at the same level a standalone card would.
-		measure: (d, w, l, o) =>
-			measureToolRunSummary(
-				(d as AnyData).items,
-				w,
-				o as AnyData,
-				{
-					label: (d as AnyData).headerLabel,
-					count: (d as AnyData).headerCount,
-				},
-				l,
-			),
-	},
 	"tool-run-count": {
 		kind: "tool-run-count",
-		label: "Tool run count line (L2)",
+		label: "Tool run count line (L1/L2)",
 		lodSensitive: true,
 		measure: (d, w) => measureToolRunCountLine((d as AnyData).count, w),
 	},
@@ -198,7 +186,8 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		kind: "activity-trace",
 		label: "Activity trace (L1/L2)",
 		lodSensitive: true,
-		// See tool-run-summary: `lod` is forwarded for the drilled-in card's detail.
+		// `lod` reaches the trace so a drilled-in row's nested tool card measures its
+		// detail at the same level a standalone card would.
 		measure: (d, w, l, o) =>
 			measureActivityTrace(
 				(d as AnyData).items,

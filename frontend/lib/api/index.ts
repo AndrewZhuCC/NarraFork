@@ -1,11 +1,13 @@
 import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
+import { chatApi } from "./chat";
 import { BASE } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { integrationsApi } from "./integrations";
 import { knowledgeApi } from "./knowledge";
 import { miscApi } from "./misc";
+import { modelCardsApi } from "./model-cards";
 import { narratorsApi } from "./narrators";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
@@ -15,6 +17,7 @@ import { scheduledTasksApi } from "./scheduled-tasks";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
 import { terminalsApi } from "./terminals";
+import { traitLayersApi } from "./trait-layers";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
 	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
@@ -24,15 +27,18 @@ export const api = {
 	...authApi,
 	...projectsApi,
 	...chaptersApi,
+	...chatApi,
 	...narratorsApi,
 	...terminalsApi,
 	...settingsApi,
 	...gitApi,
 	...integrationsApi,
 	...miscApi,
+	...modelCardsApi,
 	...knowledgeApi,
 	...specApi,
 	...devicesApi,
+	...traitLayersApi,
 	...oauthAppsApi,
 	...oauthGrantsApi,
 	...scheduledTasksApi,

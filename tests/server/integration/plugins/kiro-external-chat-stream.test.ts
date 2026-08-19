@@ -1,41 +1,93 @@
 import { describe, expect, test } from "bun:test";
 import { providerStreamEventSchema } from "@server/lib/plugins/protocol";
-import { parseSSEStream } from "@shared/codewhisperer/protocol";
 import {
 	mapKiroEvent,
 	type PluginStreamEvent,
 	UsageAccumulator,
 } from "../../../../examples/plugins/kiro-external/src/event-mapping";
+import { parseKiroWireStream } from "../../../../examples/plugins/kiro-external/src/wire-stream";
 
 /**
  * The chat pipeline end to end, from Kiro's wire format to the host's event contract.
  *
  * The mapping unit tests feed `mapKiroEvent` hand-built `ParsedStreamEvent` objects, which
  * leaves one gap: they assume the parser produces the shapes they describe. This suite closes
- * it by driving a real SSE byte stream through `parseSSEStream` — the same function the plugin
- * uses in production — and asserting what comes out the far end.
+ * it by driving a real AWS event-stream byte stream through `parseKiroWireStream` — the same
+ * function the plugin uses in production — and asserting what comes out the far end.
  *
  * A mock upstream rather than a live account, deliberately: this must run in CI without
  * credentials or quota, and the fixture can produce event orderings a live account would only
  * emit occasionally.
  */
 
-/** Build a Kiro-style SSE body from `(eventType, data)` pairs. */
-function sseStream(frames: Array<[string, Record<string, unknown>]>): ReadableStream<Uint8Array> {
-	const encoder = new TextEncoder();
-	const text = frames
-		.map(([eventType, data]) => `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`)
-		.join("");
+/**
+ * Build a real AWS event-stream body from `(eventType, data)` pairs.
+ *
+ * Kiro answers over AWS event-stream — length-prefixed binary frames with CRC32 checksums — and
+ * this fixture used to emit `event:` / `data:` text lines instead. That made the suite assert a
+ * format production never sends, which is how a parser mismatch stayed invisible: the plugin read
+ * binary frames with a text-SSE parser and produced *nothing*, while this suite kept passing
+ * because it fed that parser the one input it could handle.
+ *
+ * CRCs are computed rather than stubbed: the decoder silently skips a frame with a bad checksum,
+ * so an approximated builder would yield an empty stream and look like a parser failure.
+ */
+function wireStream(frames: Array<[string, Record<string, unknown>]>): ReadableStream<Uint8Array> {
+	const encoded = frames.map(([eventType, data]) =>
+		buildFrame({ ":message-type": "event", ":event-type": eventType }, JSON.stringify(data)),
+	);
 	return new ReadableStream({
 		start(controller) {
-			// One chunk per frame, so the parser's cross-chunk buffering is exercised rather
+			// One chunk per frame, so the decoder's cross-chunk buffering is exercised rather
 			// than handed a single convenient blob.
-			for (const frame of text.split(/(?<=\n\n)/)) {
-				if (frame.length > 0) controller.enqueue(encoder.encode(frame));
-			}
+			for (const frame of encoded) controller.enqueue(frame);
 			controller.close();
 		},
 	});
+}
+
+/** Encode one `:name` → string header (value type 7). */
+function encodeStringHeader(name: string, value: string): Uint8Array {
+	const nameBytes = new TextEncoder().encode(name);
+	const valueBytes = new TextEncoder().encode(value);
+	const out = new Uint8Array(1 + nameBytes.length + 1 + 2 + valueBytes.length);
+	let offset = 0;
+	out[offset++] = nameBytes.length;
+	out.set(nameBytes, offset);
+	offset += nameBytes.length;
+	out[offset++] = 7;
+	out[offset++] = (valueBytes.length >> 8) & 0xff;
+	out[offset++] = valueBytes.length & 0xff;
+	out.set(valueBytes, offset);
+	return out;
+}
+
+function writeU32BE(buf: Uint8Array, offset: number, value: number): void {
+	buf[offset] = (value >>> 24) & 0xff;
+	buf[offset + 1] = (value >>> 16) & 0xff;
+	buf[offset + 2] = (value >>> 8) & 0xff;
+	buf[offset + 3] = value & 0xff;
+}
+
+function buildFrame(headers: Record<string, string>, payload: string): Uint8Array {
+	const headerParts = Object.entries(headers).map(([k, v]) => encodeStringHeader(k, v));
+	const headerLength = headerParts.reduce((sum, h) => sum + h.length, 0);
+	const payloadBytes = new TextEncoder().encode(payload);
+	const totalLength = 12 + headerLength + payloadBytes.length + 4;
+
+	const frame = new Uint8Array(totalLength);
+	writeU32BE(frame, 0, totalLength);
+	writeU32BE(frame, 4, headerLength);
+	writeU32BE(frame, 8, Bun.hash.crc32(frame.subarray(0, 8)));
+
+	let offset = 12;
+	for (const part of headerParts) {
+		frame.set(part, offset);
+		offset += part.length;
+	}
+	frame.set(payloadBytes, offset);
+	writeU32BE(frame, totalLength - 4, Bun.hash.crc32(frame.subarray(0, totalLength - 4)));
+	return frame;
 }
 
 /** Run a stream through the plugin's mapping and validate every emitted event. */
@@ -46,7 +98,7 @@ async function collect(
 	const usage = new UsageAccumulator();
 	if (contextWindow !== undefined) usage.setContextWindow(contextWindow);
 	const events: PluginStreamEvent[] = [];
-	for await (const parsed of parseSSEStream(sseStream(frames))) {
+	for await (const parsed of parseKiroWireStream(wireStream(frames))) {
 		for (const event of mapKiroEvent(parsed, usage)) {
 			// Every event must satisfy the host's real `.strict()` schema, so a shape the
 			// parser produces but the contract rejects fails here rather than mid-session.
@@ -159,8 +211,8 @@ describe("kiro-external chat stream: reasoning and tools", () => {
 		// on `request_started`/`done`. Assert the parser exposes it at all.
 		const usage = new UsageAccumulator();
 		const seen: string[] = [];
-		for await (const parsed of parseSSEStream(
-			sseStream([["credentialIdEvent", { credentialId: "cred-7" }]]),
+		for await (const parsed of parseKiroWireStream(
+			wireStream([["credentialIdEvent", { credentialId: "cred-7" }]]),
 		)) {
 			if (parsed.credentialId) seen.push(parsed.credentialId);
 			mapKiroEvent(parsed, usage);

@@ -23,6 +23,8 @@ export type ToolCategory =
 
 const READ_TOOLS = new Set(["Read"]);
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
+// "Shell" is a legacy alias kept only so older stored history still classifies as
+// a shell call; the server always mints "Bash".
 const BASH_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 const SEARCH_TOOLS = new Set(["Grep", "Glob", "Find"]);
 const WEB_SEARCH_TOOLS = new Set(["WebSearch"]);
@@ -196,6 +198,7 @@ import {
 	type SubagentToolInputSummary,
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
+import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -368,14 +371,19 @@ export function getSummary(
 		}
 		case "await": {
 			const awaitType = extractField(input, "type") || "task";
-			const id = extractField(input, "id") || "unknown";
+			// Prefer the server-resolved alias; a bare nanoid selector is truncated.
+			const id =
+				agentTargetDisplay(
+					metadata?.targetLabel as string | undefined,
+					extractField(input, "id"),
+				) || "unknown";
 			const waitForText = extractField(input, "wait_for_text");
 			return waitForText
 				? `${awaitType}: ${id} · wait "${short(waitForText, 24)}"`
 				: `${awaitType}: ${id}`;
 		}
 		case "send": {
-			const targets = getSendTargetLabels(input);
+			const targets = getSendTargetLabels(input).map((target) => formatAgentIdForDisplay(target));
 			const targetLabel = targets.length === 1 ? targets[0] : `${targets.length} targets`;
 			const flags: string[] = [];
 			if (!isTruncated(input) && typeof input === "object" && input) {

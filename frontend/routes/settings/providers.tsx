@@ -343,7 +343,7 @@ function SettingsProvidersPage() {
 							prefix: "",
 							apiKey: "",
 							baseUrl: isGemini ? "https://generativelanguage.googleapis.com/v1beta" : "",
-							defaultModel: isGemini ? "gemini-2.5-flash" : "",
+							defaultModel: isGemini ? "gemini-3-flash-preview" : "",
 							protocol: type,
 							...(isGemini ? { geminiTransport: "generate-content" as const } : {}),
 							codexAccountId: "",
@@ -1105,6 +1105,24 @@ function ProviderSectionContent({
 			<PluginProviderSection
 				pluginId={pluginProvider.pluginId}
 				contributionId={pluginProvider.contributionId}
+				// Model controls are host state, so they are threaded in exactly as they are for
+				// the builtin sections above. Without this a plugin provider had no way to hide a
+				// model, override a context window or run the model tester: those live behind
+				// `/api/settings`, which the plugin's sandboxed iframe cannot reach.
+				models={{
+					// `providerKey` is the provider's prefix for a plugin provider, which is also
+					// how `providerModelsMap` and every model value are keyed.
+					prefix: providerKey,
+					models: providerModelsMap[providerKey] ?? [],
+					hiddenModels: state.hiddenModels,
+					onToggleHidden: dispatchers.toggleHidden,
+					onBatchToggleHidden: dispatchers.batchToggleHidden,
+					modelContextWindows: state.modelContextWindows,
+					onContextWindowChange: dispatchers.handleContextWindowChange,
+					customModels: state.customModels,
+					onCustomModelsChange: dispatchers.setCustomModels,
+					onTestModel,
+				}}
 			/>
 		);
 	}

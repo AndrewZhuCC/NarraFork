@@ -24,6 +24,7 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	plugins: {
 		enabled: true,
+		allowPrivateProxyTarget: false,
 	},
 	agent: {
 		defaultModel: "kiro:claude-sonnet-4.5",
@@ -56,7 +57,11 @@ export const DEFAULTS: NarraForkSettings = {
 		freshShellEnv: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
-		requestDumpMaxSize: 1024 * 1024, // 1MB
+		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
+		// a specific failure, so the ceiling must be high enough that a real request —
+		// full conversation history, replayed tool output, inline images — survives intact.
+		// The old 1MB default silently truncated almost every request worth dumping.
+		requestDumpMaxSize: 32 * 1024 * 1024,
 		modelContextWindows: {},
 		translateReasoning: false,
 		defaultRelaxedPlan: false,
@@ -197,6 +202,7 @@ export const DEFAULTS: NarraForkSettings = {
 		maxConcurrentTransfersPerDevice: 2,
 		transferVerify: "crc32c",
 		transfersDir: null,
+		allowPlaintextEnrollmentOnPrivateNetwork: false,
 	},
 };
 
@@ -296,6 +302,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "是否启用插件子系统（默认启用）。环境变量 NF_PLUGINS_ENABLED / NARRAFORK_PLUGINS_ENABLED 若设置则优先，可作为应急关闭开关。",
 		type: "boolean",
 	},
+	"plugins.allowPrivateProxyTarget": {
+		desc: "允许代理 URL 指向私有/保留 IP 地址（127.x、10.x、172.16-31.x、192.168.x、169.254.x、::1 等）并传递给插件。默认 false 以阻止 SSRF；私有化部署使用内网代理时需显式开启。",
+		type: "boolean",
+	},
 
 	// ── vnet ────────────────────────────────────────────────────────────
 	"vnet.enabled": {
@@ -368,6 +378,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"devices.transfersDir": {
 		desc: "下载文件的默认落盘根目录。为空则使用 ~/.narrafork/transfers。",
 		type: "string",
+	},
+	"devices.allowPlaintextEnrollmentOnPrivateNetwork": {
+		desc: "允许在内网明文 http 下使用一键安装命令自动领取设备密钥。默认关闭：一键安装会让安装命令本身成为凭据，https 下该交换是加密的，明文 http 下不是——开启表示你接受设备密钥在注册那一次以明文经过内网。无论此项如何设置，公网可路由地址上的明文 http 一律拒绝发放密钥；关闭时可改用「手动粘贴密钥」方式安装。内网判定仅限字面 IP 地址，主机名一律不适用（服务器无法验证域名实际解析到哪个网络）。",
+		type: "boolean",
 	},
 
 	// ── agent ───────────────────────────────────────────────────────────
@@ -459,7 +473,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {
-		desc: "Raw dump 响应体文本的最大字节数。默认 1MB (1048576)。设为 -1 表示不限制。超出部分会被截断并标记。",
+		desc: "单条 raw dump 落库的最大字节数。默认 32MB (33554432)。设为 -1 表示不限制。超出时优先丢弃 SSE 事件、再按剩余预算截断请求/响应体，并标记 bodyTextTruncated，不会整包丢弃请求体。",
 		type: "number",
 	},
 	"agent.modelContextWindows": {

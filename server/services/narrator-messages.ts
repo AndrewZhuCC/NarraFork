@@ -2,7 +2,10 @@ import { parseCompactMessageBlock } from "@shared/compact-message";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import { projectToolIO, TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
-import { isMetadataOnlyEmptyReasoningAssistantMessage } from "@shared/reasoning-content";
+import {
+	isDanglingReasoningOnlyAssistantMessage,
+	isMetadataOnlyEmptyReasoningAssistantMessage,
+} from "@shared/reasoning-content";
 import {
 	MAX_SUBAGENT_SUMMARY_INPUT_BYTES,
 	MAX_SUBAGENT_SUMMARY_VALUE_CHARS,
@@ -35,6 +38,11 @@ import { isSubagentVariant } from "../lib/narrator-utils";
 import { resolveDefaultReasoningEffort, resolveProvider } from "../lib/settings";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import {
+	AWAIT_AGENT_RESOLVED_FIELD,
+	attachAwaitAgentNarratorIds,
+	resolveAwaitAgentIdsForToolCalls,
+} from "./await-agent-resolution";
 import {
 	ensureRefsCoverMessage,
 	ensureRefsCoverSeq,
@@ -171,7 +179,7 @@ async function resolveBlockToolUses(
  * A running compact is deliberately NOT checked here: it is enforced inside each
  * transaction by `assertNoRunningCompactRefsTx`, and a compact that starts between this
  * check and the write would slip past anything checked out here anyway. Callers already
- * gate on `assertIdleForBlockDeletion` before reaching this path.
+ * gate on `prepareHistoryRewrite` before reaching this path.
  */
 function assertBlocksDeletable(narratorId: string, grouped: Map<string, number[]>): void {
 	// Kept synchronous-per-message rather than one big query: the batch is small (it comes
@@ -1388,12 +1396,61 @@ async function buildTreeFromTopLevelRefs(
 			: Promise.resolve([]),
 	]);
 	attachSubagentActivities(topMessages, activities);
-	return enrichToolUseBlocks(
+	const enriched = enrichToolUseBlocks(
 		filterExitPlanBeforePlanCompact(
 			truncateToolIO(buildMessageTree([...topMessages, ...childMessages]), ioBudget),
 		),
 	);
+	// A still-waiting Await knows its target only as a selector; resolve it so the
+	// row can open the child's session before the wait returns.
+	return attachAwaitAgentNarratorIds(
+		enriched,
+		await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]),
+	);
 }
+
+/**
+ * Resolve the pending Await-agent selectors across a batch of loaded messages.
+ *
+ * Kept next to its only callers so the extra work is obvious at the call site: it
+ * runs at most two small indexed queries per team scope and returns an empty map
+ * (no queries at all) when the page contains no in-flight Await-agent call, which
+ * is the overwhelmingly common case.
+ */
+async function resolveAwaitAgentIdsForMessages(
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	messages: any[],
+): Promise<Map<string, string>> {
+	const candidates: Array<{
+		toolUseId: string;
+		toolName: string;
+		inputJson?: unknown;
+		outputJson?: unknown;
+		narratorId?: string;
+	}> = [];
+	for (const msg of messages) {
+		for (const tc of msg?.toolCalls ?? []) {
+			if (tc?.toolName !== "Await") continue;
+			candidates.push({
+				toolUseId: tc.toolUseId,
+				toolName: tc.toolName,
+				inputJson: tc.inputJson,
+				outputJson: tc.outputJson,
+				narratorId: tc.narratorId ?? msg?.narratorId,
+			});
+		}
+	}
+	if (candidates.length === 0) return new Map();
+	return resolveAwaitAgentIdsForToolCalls(candidates);
+}
+
+/**
+ * Re-exported so callers already importing the message layer keep working; the
+ * implementation lives in `await-agent-resolution` because this module sits in an
+ * import cycle with `narrator-service` (importing it from a test would evaluate
+ * that cycle and fail at module init).
+ */
+export { AWAIT_AGENT_RESOLVED_FIELD, attachAwaitAgentNarratorIds };
 
 // ── Chunk manifest helpers ─────────────────────────────────────────────────
 
@@ -2788,8 +2845,14 @@ export const narratorMessageQueries = {
 			topMsgs,
 			await loadSubagentActivitiesForToolUseIds([...newTopSubagentToolUseIdSet]),
 		);
-		const tree = enrichToolUseBlocks(
-			filterExitPlanBeforePlanCompact(truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs]))),
+		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
+		const tree = attachAwaitAgentNarratorIds(
+			enrichToolUseBlocks(
+				filterExitPlanBeforePlanCompact(
+					truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
+				),
+			),
+			awaitAgentIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -2810,7 +2873,10 @@ export const narratorMessageQueries = {
 
 		return {
 			topLevel: tree,
-			orphanChildren: enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+			orphanChildren: attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+				awaitAgentIds,
+			),
 			subagentActivities,
 			hitLimit: false,
 			cursor,
@@ -3153,6 +3219,165 @@ export const narratorMessageQueries = {
 				.where(eq(narrators.id, narratorId))
 				.run();
 		});
+	},
+
+	/**
+	 * Mark a review-feedback card as acted on.
+	 *
+	 * Only a UI latch: the conclusion is already in the history (the row IS the user
+	 * message), so this records that a turn was started for it and stops the button
+	 * offering the same thing twice. Nothing to compensate on failure — no content is
+	 * written or delivered here.
+	 *
+	 * `alreadyApplied` lets the caller skip starting a second loop while still reporting
+	 * success: the reader's intent is satisfied either way.
+	 */
+	async markReviewFeedbackApplied(
+		narratorId: string,
+		messageId: string,
+	): Promise<{ alreadyApplied: boolean; message?: typeof narratorMessages.$inferSelect }> {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) throw new NotFoundError("Message", messageId);
+
+		return db.transaction((tx) => {
+			const msg = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
+			const blocks = Array.isArray(msg?.contentJson)
+				? (msg.contentJson as Array<Record<string, unknown>>)
+				: [];
+			const index = blocks.findIndex((block) => block?.type === "review_feedback");
+			if (!msg || index < 0) {
+				throw new ValidationError("Message is not a review feedback card");
+			}
+			if ((blocks[index] as Record<string, unknown>).applied === true) {
+				return { alreadyApplied: true };
+			}
+
+			const patched = blocks.map((entry, i) => (i === index ? { ...entry, applied: true } : entry));
+			const updated = tx
+				.update(narratorMessages)
+				.set({ contentJson: patched })
+				.where(eq(narratorMessages.id, messageId))
+				.returning()
+				.get();
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+			return { alreadyApplied: false, message: updated };
+		});
+	},
+
+	/**
+	 * Release a review-feedback claim when no turn was actually started for it.
+	 *
+	 * The latch is what disables the card's button, and it is taken BEFORE the turn is
+	 * attempted. So every path where the attempt does not result in someone reading the
+	 * row has to give it back: plan mode, a status row that is not idle, or a throw
+	 * inside the continuation. Without this the button reads "Handled" for findings the
+	 * model never saw, and the reader has no way to ask again.
+	 *
+	 * A narrator that was ALREADY running is not such a path — it rebuilds history on
+	 * its next pass and takes the row up on its own — so the caller keeps the latch
+	 * there (see the apply route's `busy` vs `not_started`).
+	 *
+	 * Returns undefined when the row is not a review card or no longer exists: this runs
+	 * on a failure path and must not turn one failure into two.
+	 */
+	async releaseReviewFeedbackClaim(narratorId: string, messageId: string) {
+		return db.transaction((tx) => {
+			const msg = tx.query.narratorMessages
+				.findFirst({ where: eq(narratorMessages.id, messageId) })
+				.sync();
+			const blocks = Array.isArray(msg?.contentJson)
+				? (msg.contentJson as Array<Record<string, unknown>>)
+				: [];
+			const index = blocks.findIndex((block) => block?.type === "review_feedback");
+			if (!msg || index < 0) return undefined;
+			const patched = blocks.map((entry, i) =>
+				i === index ? { ...entry, applied: false } : entry,
+			);
+			const updated = tx
+				.update(narratorMessages)
+				.set({ contentJson: patched })
+				.where(eq(narratorMessages.id, messageId))
+				.returning()
+				.get();
+			tx.update(narrators)
+				.set({
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+			return updated;
+		});
+	},
+
+	/**
+	 * Drop a single reasoning-only assistant record left behind by a turn that died
+	 * after streaming its thinking.
+	 *
+	 * Deliberately narrow, in three ways:
+	 *  - only this one ref is removed, unlike `deleteMessage`, which also removes
+	 *    everything at a higher seq (background subagent traffic that landed after
+	 *    the dead turn must survive)
+	 *  - the caller's classification is re-verified here against the stored row, so a
+	 *    stale id can never take out a real reply
+	 *  - no workspace revert: the record has no tool call, so it changed no files
+	 *
+	 * Returns true when a row was removed, false when the ref is already gone.
+	 * Throws when the target turns out not to be reasoning-only.
+	 */
+	async deleteDanglingReasoningMessage(narratorId: string, messageId: string): Promise<boolean> {
+		const ref = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+		});
+		if (!ref) return false;
+
+		const msg = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true, contentText: true },
+			with: { toolCalls: { columns: { id: true } } },
+		});
+		if (!msg) return false;
+		if (!isDanglingReasoningOnlyAssistantMessage(msg)) {
+			throw new ValidationError("Message is not a reasoning-only assistant record");
+		}
+
+		db.transaction((tx) => {
+			assertNoRunningCompactRefsTx(tx, narratorId, [ref.id]);
+			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.id, ref.id)).run();
+			const otherRef = tx.query.narratorMessageRefs
+				.findFirst({ where: eq(narratorMessageRefs.messageId, messageId) })
+				.sync();
+			if (!otherRef) {
+				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
+			}
+			tx.update(narrators)
+				.set({
+					// The provider-side conversation no longer matches the stored history.
+					apiConversationId: null,
+					messageVersion: sql`${narrators.messageVersion} + 1`,
+					messageStructureVersion: sql`${narrators.messageStructureVersion} + 1`,
+					updatedAt: new Date().toISOString(),
+				})
+				.where(eq(narrators.id, narratorId))
+				.run();
+		});
+		return true;
 	},
 
 	async dismissCwdRecoveryMessage(narratorId: string, messageId: string) {

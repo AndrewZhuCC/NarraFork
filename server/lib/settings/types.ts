@@ -4,6 +4,7 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
+import type { ModelCard } from "@shared/model-card";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
@@ -215,6 +216,21 @@ export interface NUGProviderConfig {
 	oauthCallbackUrl?: string;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
+	/**
+	 * Opt in to the Anthropic Messages protocol for this gateway's Kiro channel
+	 * (`POST /v1/kiro/messages`) instead of the native CodeWhisperer protocol.
+	 *
+	 * Absent/false keeps the native path, which is the only shape older gateways
+	 * serve. The switch is explicit rather than automatic on the gateway's
+	 * advertised capability: the two paths build different requests and parse
+	 * different streams, and a silent switch would make a regression look like a
+	 * model or upstream problem instead of a protocol change. Both conditions must
+	 * hold — this flag AND the gateway advertising `kiro.messages.v1`.
+	 *
+	 * Intended to be turned on per gateway once its endpoint has been verified end
+	 * to end, and to be turned off again as a one-step rollback if it misbehaves.
+	 */
+	kiroAnthropicProtocol?: boolean;
 }
 
 export interface GeminiProviderConfig {
@@ -550,6 +566,15 @@ export interface NarraForkSettings {
 		 * setting them to "0"/"false" force-disables regardless of this setting).
 		 */
 		enabled: boolean;
+		/**
+		 * Allow proxy URLs targeting private/reserved IP addresses (127.x, 10.x, 172.16-31.x,
+		 * 192.168.x, 169.254.x, ::1, fe80::, etc.) to be forwarded to plugins.
+		 *
+		 * Defaults to false. Private deployments using a LAN proxy should enable this
+		 * explicitly. Without it, an SSRF surface exists where a plugin on the host network
+		 * could be directed to reach internal services or cloud metadata endpoints.
+		 */
+		allowPrivateProxyTarget: boolean;
 	};
 	agent: {
 		defaultModel: string;
@@ -588,6 +613,20 @@ export interface NarraForkSettings {
 		 * Takes highest priority in getModelContextWindow().
 		 */
 		modelContextWindows: Record<string, number>;
+		/**
+		 * Model cards — per-model metadata templates (context window, max
+		 * completion tokens, reasoning tiers, official USD prices).
+		 *
+		 * Stores only the DIFFERENCE from NarraFork's builtin cards: an entry
+		 * carries its `modelKey` plus the fields the user changed, and a card
+		 * matching its builtin is not stored. So untouched fields track builtin
+		 * updates across releases while edited fields stay pinned.
+		 *
+		 * Distinct from `modelContextWindows`, which stays higher priority: a card
+		 * describes a *class* of model ids (via aliases and prefixes), whereas that
+		 * map force-overrides one exact `provider:model` value.
+		 */
+		modelCards?: ModelCard[];
 		/** Translate reasoning/thinking blocks via translationModel after each block completes. */
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
@@ -961,6 +1000,23 @@ export interface NarraForkSettings {
 		transferVerify: "crc32c" | "sha256" | "none";
 		/** Default root directory for downloaded files. null → ~/.narrafork/transfers. */
 		transfersDir: string | null;
+		/**
+		 * Allow the automated enrollment exchange over plaintext http when the server
+		 * is reached at a private-network address (RFC 1918 / CGNAT / link-local /
+		 * IPv6 ULA), not just over https or loopback.
+		 *
+		 * Off by default, and it must stay a deliberate choice rather than a
+		 * convenience default. The one-line installer trades the old "script carries
+		 * no credential" property for the ticket becoming the credential; with https
+		 * that exchange is encrypted, and on http it is not. A LAN is a much higher
+		 * bar than the open internet, but "higher" is not "encrypted", so enabling
+		 * this accepts that the device key crosses the local network in the clear
+		 * once, at enrollment.
+		 *
+		 * Public hostnames are never covered by this: no matter what this is set to,
+		 * plaintext http on a routable address refuses to hand out a key.
+		 */
+		allowPlaintextEnrollmentOnPrivateNetwork?: boolean;
 	};
 }
 

@@ -1260,6 +1260,34 @@ function appendDedupedToolUses(
 	result.toolUses = next;
 }
 
+/**
+ * Map Kiro's `metadataEvent.stopReason` onto the stop reasons the host understands.
+ *
+ * Unknown values yield `undefined` rather than a guess. The host branches on this — an
+ * `max_output_tokens` is surfaced to the user as a truncated turn — so inventing a reason is
+ * worse than leaving the turn's own status authoritative. Matching is case-insensitive because
+ * the upstream spelling is not consistent across models.
+ */
+function kiroStopReason(raw: unknown): string | undefined {
+	if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+	switch (raw.trim().toUpperCase()) {
+		case "END_TURN":
+		case "STOP_SEQUENCE":
+			return "end_turn";
+		case "MAX_TOKENS":
+		case "MAX_OUTPUT_TOKENS":
+		case "LENGTH":
+			return "max_output_tokens";
+		case "TOOL_USE":
+			return "tool_use";
+		case "CONTENT_FILTERED":
+		case "CONTENT_FILTER":
+			return "content_filter";
+		default:
+			return undefined;
+	}
+}
+
 export function parseKiroStreamEvent(
 	evt: StreamEvent,
 	options: KiroStreamParseOptions = {},
@@ -1390,6 +1418,16 @@ export function parseKiroStreamEvent(
 				usage: Number(usage),
 			};
 		}
+	}
+
+	if (evt.eventType === "metadataEvent") {
+		// Kiro closes every successful turn with this frame, and it is the only place upstream
+		// states *why* the turn ended. Nothing read it before, so an answer cut off at the output
+		// limit was indistinguishable from one that finished — the host branches on `stopReason`
+		// (`max_output_tokens` becomes an `invalidState`), so discarding it turned a truncated
+		// reply into a silently short one.
+		const reason = kiroStopReason(evt.data.stopReason);
+		if (reason) result.stopReason = reason;
 	}
 
 	if (evt.eventType === "credentialIdEvent") {

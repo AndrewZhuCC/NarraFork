@@ -28,8 +28,26 @@ export class NotFoundError extends AppError {
 }
 
 export class ValidationError extends AppError {
-	constructor(message: string) {
-		super(message, 400, "VALIDATION_ERROR");
+	/**
+	 * `code` may be narrowed past the generic `VALIDATION_ERROR` when a client has
+	 * to REACT differently to one rejection than to the rest. Without a distinct
+	 * code the only discriminator is the prose message, which is neither stable
+	 * nor localizable.
+	 */
+	constructor(message: string, code: string = "VALIDATION_ERROR") {
+		super(message, 400, code);
+	}
+}
+
+/**
+ * The caller is authenticated and the target exists, but this action is not
+ * theirs to take. Distinct from `ValidationError` (400, "your input is wrong")
+ * and `NotFoundError` (404, "pretend it isn't there"): a client can only offer
+ * a sensible retry — or hide the affordance — if it can tell the three apart.
+ */
+export class ForbiddenError extends AppError {
+	constructor(message: string = "You are not allowed to perform this action") {
+		super(message, 403, "FORBIDDEN");
 	}
 }
 

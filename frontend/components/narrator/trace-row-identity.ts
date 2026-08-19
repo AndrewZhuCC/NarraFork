@@ -2,7 +2,6 @@
  * trace-row-identity.ts — Pure, DOM-free identity for ONE folded trace row.
  *
  * At low LOD a tool-run collapses into a trace (a list of single-line rows):
- *   L3      → ToolRunSummary  / `tool-run-summary`  (one row per tool call)
  *   L1 / L2 → ActivityTrace   / `activity-trace`    (reasoning + tool rows merged)
  *
  * Those rows carry no interaction surface of their own, so this module resolves
@@ -11,7 +10,7 @@
  * rows — the tool-specific menu facts.
  *
  * Shared by BOTH render paths on purpose:
- *   - chunked : CollapsibleTrace rows (ActivityTrace / ToolRunSummary)
+ *   - chunked : CollapsibleTrace rows (ActivityTrace)
  *   - vlist   : RenderToolRun rows (via the height-neutral identity passthrough)
  * It therefore lives OUTSIDE vlist/ — the isolation guard forbids non-vlist files
  * from statically importing vlist/, but the reverse direction is allowed.
@@ -58,7 +57,9 @@ export interface TraceRowToolMeta {
 	isFileTool?: boolean;
 	/**
 	 * Await({type:"agent"}) → the resolved child narrator id, when the tool call's
-	 * EMBEDDED metadata already knows it.
+	 * EMBEDDED data already knows it (its own returned metadata, the
+	 * `<subagent_id>` tag, or — while the wait is still running — the server-derived
+	 * `_awaitAgentNarratorId`).
 	 *
 	 * 【performance invariant】This is derived by a pure function from data already
 	 * in hand. A folded trace shows 10+ rows and a page shows several traces, so
@@ -119,6 +120,12 @@ export interface TraceRowToolCallLike {
 	_subagentActivity?: { subagentNarratorId?: string | null } | null;
 	/** Message id of the tool result — used as the child's `scrollTo` target. */
 	resultMessageId?: string | null;
+	/**
+	 * Server-derived child narrator id of a RUNNING Await-agent call. See
+	 * `AWAIT_AGENT_RESOLVED_FIELD` (server/services/narrator-messages.ts): a wait in
+	 * flight has no output, so this is the only source available before it returns.
+	 */
+	_awaitAgentNarratorId?: string | null;
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -161,7 +168,10 @@ export function traceRowAwaitAgentNarratorId(tc: TraceRowToolCallLike): string |
 		typeof output === "string"
 			? output
 			: (nonEmpty((asRecord(output) as { _text?: unknown })._text as string) ?? "");
-	return text ? readSubagentIdTag(text) : undefined;
+	const fromTag = text ? readSubagentIdTag(text) : undefined;
+	if (fromTag) return fromTag;
+	// Still waiting: fall back to the server's resolution of the selector.
+	return nonEmpty(tc._awaitAgentNarratorId);
 }
 
 /**

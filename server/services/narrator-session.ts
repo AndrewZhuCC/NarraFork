@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
+import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
 	MAX_EDIT_ATTACHMENTS_PER_TYPE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
@@ -44,6 +45,7 @@ import {
 } from "../lib/boolean-override";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { withDbRetry } from "../lib/db-resilience";
+import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import { hotSafe } from "../lib/hot-safe";
@@ -71,6 +73,7 @@ import {
 	normalizeLegacyPlanPreviousPermissionMode,
 	resolveEffectiveRelaxedPlan,
 } from "../lib/permission-modes";
+import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
 import {
 	getBlockedTaskActionInstruction,
@@ -125,6 +128,8 @@ import {
 } from "./narrator-event-handler";
 import { type ExecuteLoopResult, executeAgentLoop } from "./narrator-executor";
 import { deliverInjection } from "./narrator-injection";
+import { isFirstUserTurn } from "./narrator-message-count";
+import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import {
 	getContextOverflowFailureError,
@@ -177,6 +182,7 @@ import {
 	getConclusionEntry,
 	setConclusionFileId,
 } from "./subagent-conclusion";
+import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import {
 	getConclusionWatcher,
 	getManualOverrideMap,
@@ -191,6 +197,7 @@ import {
 	isTakenOver,
 } from "./subagent-takeover";
 import { isMcpToolAllowedForNarrator } from "./subagent-tools";
+import { resolveEffectiveTraits } from "./trait-layer-service";
 import { registerNarratorLoop } from "./update-coordinator";
 import { worktreeWatcher } from "./worktree-watcher";
 
@@ -363,7 +370,7 @@ import {
 	shouldFinalizeAbortBeforeRecovery,
 	triggerMidTurnCompact,
 } from "./narrator-compact";
-import { handlePermission } from "./narrator-permission";
+import { handlePermission, resolvePermissionOrDangerReflection } from "./narrator-permission";
 import {
 	reconstructToolExecutionTarget,
 	recoverStaleCompactingMessages,
@@ -379,6 +386,17 @@ import type { RevertScope, RevertWarning } from "./snapshot-revert";
 // Tools that may modify files on disk — git status is tracked after these complete
 const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
 const MAX_CONTINUATION_STALL_TURNS = 3;
+
+/**
+ * How long `interruptAndWaitForIdle` waits for an aborted loop to actually leave.
+ *
+ * An abort lands at the loop's next await point, so the wait covers whatever is
+ * currently in flight: a model request being cancelled, a tool being torn down, and
+ * the loop's own `finally` cleanup. Kept well under the HTTP request budget so a
+ * stuck loop degrades into a reported warning rather than a hanging request.
+ */
+const INTERRUPT_IDLE_TIMEOUT_MS = 15_000;
+const INTERRUPT_IDLE_POLL_MS = 50;
 
 export interface ContinuationStallState {
 	count: number;
@@ -444,10 +462,11 @@ function normalizeOptionalDangerReflectionOverride(
  */
 async function resolveSessionDevices(
 	projectId: string | null,
+	actingUserId?: string | null,
 ): Promise<import("../lib/agent").AgentConfig["availableDevices"]> {
 	try {
 		const { getSessionDevices } = await import("./device-connection-service");
-		return await getSessionDevices(projectId);
+		return await getSessionDevices(projectId, actingUserId);
 	} catch {
 		return [];
 	}
@@ -537,18 +556,19 @@ async function applySessionDefaultDevice(
 	return commitNarratorDefaultDevice(narratorId, active, deviceId);
 }
 
+/**
+ * Local wrapper kept only for its "narrator must exist" contract: the callers
+ * below are acting on a live session and a missing row is a real error, whereas
+ * the shared resolver reports an unknown project as null. The resolution itself
+ * lives in `narrator-project.ts` (single source of truth).
+ */
 async function resolveNarratorProjectId(narratorId: string): Promise<string | null> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { chapterId: true, contextProjectId: true },
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
-	if (!narrator.chapterId) return narrator.contextProjectId ?? null;
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true },
-	});
-	return chapter?.projectId ?? null;
+	return await resolveSharedNarratorProjectId(narrator);
 }
 
 export async function getNarratorExecutionDeviceState(narratorId: string): Promise<{
@@ -613,6 +633,10 @@ async function executeQueuedNewCommand(
 			sourceNarrator.dangerReflectionOverride,
 		),
 		cwd: active.cwd,
+		// The person who queued `/new` owns the session it spawns. Falling back to the
+		// source narrator's owner keeps it out of "ownerless" territory when the
+		// buffered message has no recorded author (system-queued paths).
+		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
 	if (initialMessage) {
@@ -826,7 +850,7 @@ export async function ensureNarrator(
 
 /**
  * Build the effective system prompt dynamically.
- * Reads AGENT.md (fallback CLAUDE.md) from disk each time so changes are picked up mid-conversation.
+ * Reads AGENTS.md (fallback AGENT.md, CLAUDE.md) from disk each time so changes are picked up mid-conversation.
  */
 async function buildSystemPrompt(
 	narrator: { systemPrompt: string | null; contextSummary: string | null },
@@ -841,6 +865,7 @@ async function buildSystemPrompt(
 		defaultDeviceId?: string | null;
 		allowLocalExecution?: boolean;
 	},
+	planFilePath?: string,
 ): Promise<{ prompt: string | null; usedCompactSummary: boolean }> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -849,6 +874,7 @@ async function buildSystemPrompt(
 		contextSummary: narrator.contextSummary,
 		planMode,
 		planFileId,
+		planFilePath,
 		planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
@@ -939,12 +965,31 @@ async function createNarrator(
 	const planFileId = isPlanMode
 		? await ensureNarratorPlanFileId(narratorId, narrator.planFileId)
 		: undefined;
+	const planFilePath = await resolveExistingPlanFileRelPath(narratorCwd, planFileId);
+
+	// Layered traits: user → project → narrator. Resolved here so the cached
+	// `_disabledTools`/`_blockedSkills` reflect the upper layers. The acting user is
+	// not known at creation time (it is per-turn state), so the user layer is
+	// applied on each turn instead — see the refresh in runTurn below.
+	const creationTraits = await resolveEffectiveTraits({
+		narratorTraits: narrator.traits,
+		projectId: narratorProjectId ?? null,
+		actingUserId: null,
+	});
 
 	// OAuth narrators may only see devices frozen into their provision snapshot.
 	const resolvedSessionDevices = (await resolveSessionDevices(narratorProjectId ?? null)) ?? [];
-	const sessionDevices = initialOAuthRuntime
+	const authorizedSessionDevices = initialOAuthRuntime
 		? filterOAuthSessionDevices(resolvedSessionDevices, initialOAuthRuntime)
 		: resolvedSessionDevices;
+	// Injection is narrower than authorization: an authorized device is only
+	// described to the model when the layered injection policy says so, which is
+	// what keeps a communal build machine out of every session's context. The
+	// filter can only remove entries, so it is never an escalation path.
+	const sessionDevices = resolveInjectedDevices(
+		authorizedSessionDevices,
+		creationTraits.deviceInjection,
+	);
 
 	const { prompt: effectiveSystemPrompt, usedCompactSummary } = await buildSystemPrompt(
 		{
@@ -964,6 +1009,7 @@ async function createNarrator(
 			defaultDeviceId: initialOAuthRuntime?.defaultDeviceId ?? narrator.defaultDeviceId ?? null,
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
+		planFilePath,
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -1027,14 +1073,14 @@ async function createNarrator(
 		_baseBranch: narratorBaseBranch,
 		_isInGitRepo: narratorIsInGitRepo,
 		_planFileId: planFileId,
-		_planFilePath: planFileId ? `.narrafork/plan-${planFileId}.md` : undefined,
+		_planFilePath: planFilePath,
 		_preparedPlanModes: new Map(),
 		_projectGitPath: projectGitPath,
 		_skillRoot: skillRoot,
 		_skillScopeKey: skillScopeKey,
 		_enabledOptionalTools: new Set(),
-		_disabledTools: getDisabledToolSet(narrator.traits),
-		_blockedSkills: getBlockedSkills(narrator.traits),
+		_disabledTools: getDisabledToolSet(creationTraits.traits),
+		_blockedSkills: getBlockedSkills(creationTraits.traits),
 		_narratorKind: isKnowledgeStewardNarrator(narrator.traits) ? "knowledge" : undefined,
 		_interruptCleanupDone: false,
 		_substatus: new Set(),
@@ -1457,10 +1503,14 @@ async function maybeStartSpecContinuation(
 		const blocked = compiled.tasks.find((task) => task.status === "blocked");
 		if (!blocked) return null;
 		const actionInstruction = getBlockedTaskActionInstruction(active.locale);
+		// `actionInstruction` already classifies the blocker and covers both branches, so
+		// this copy only adds what it cannot: that the message is system-generated, the tool
+		// name for asking, and that a stale entry may be rewritten. Restating its branches
+		// here (an earlier revision did) just made the prompt longer and self-repeating.
 		const prompt =
 			active.locale === "zh-CN"
-				? `Dynamic Spec blocked 任务续跑：当前任务仍处于活跃状态，不能视为完成。\n\nblocked 任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n本回合必须先判断阻塞类型并采取行动。无需用户介入时，先在 spec://tasks.json 下发具体解阻任务，再立即调用工具推进；不能把重复说明阻塞作为回合终点。`
-				: `Dynamic Spec blocked-task continuation: this task is still active and must not be treated as complete.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nThis turn must classify the blocker and take action. When user input is unnecessary, first add a concrete actionable unblock task to spec://tasks.json, then immediately use tools to advance it; do not end the turn with another blocker explanation.`;
+				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。`
+				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why.`;
 		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 			{
 				type: "spec_blocked_continuation",
@@ -1486,12 +1536,30 @@ async function maybeStartSpecContinuation(
 		return prompt;
 	}
 	const protectedNote = current.protected
-		? "\nThis task is protected. Only mark it done after concrete completion evidence; protected completion requires taskReflection."
+		? active.locale === "zh-CN"
+			? "\n- protected：只有具备具体验收证据才能标记 done，该变更会触发 taskReflection。"
+			: "\n- Protected: mark it done only with concrete completion evidence; that change runs taskReflection."
 		: "";
+	// ⚠️ Compiled from tasks.json, not written by the user, and emitted purely because a
+	// `doing` entry is still open — so it has to say so.
+	//
+	// The wording it replaces restated the task and ordered the model to continue ("Do not
+	// ask the user whether to continue"), which is indistinguishable from the user insisting
+	// the work is unfinished. Three observed failure modes came from that:
+	//
+	//  1. Work done, tasks.json not yet updated → the model reads the restated task as "you
+	//     are not done" and reworks code that was already correct.
+	//  2. The task needs the user (one was titled "需用户跑") → being told to act rather than
+	//     ask, the model edited tasks and got nudged again, 37 times in one session.
+	//  3. The task no longer matches reality → with no licence to say so, it grinds a stale
+	//     objective.
+	//
+	// Hence: state provenance, then enumerate the legitimate outcomes. The list must not be
+	// framed as "ways to END the turn" — "keep working" is one of the branches.
 	const prompt =
 		active.locale === "zh-CN"
-			? `Dynamic Spec 自动续跑：继续当前 doing 任务。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请继续执行这个任务。完成或受阻时，更新 spec://tasks.json；如果没有 doing 任务但还有 todo，系统会自动切换到下一个 todo。不要要求用户再次确认是否继续。${current.protected ? "\n该任务是 protected task。只有在有具体验收证据时才能标记 done；完成 protected task 会触发 taskReflection。" : ""}`
-			: `Dynamic Spec auto-continuation: continue the current doing task.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nContinue working on this task. When it is done or blocked, update spec://tasks.json. If there is no doing task but todo tasks remain, the system will automatically switch to the next todo. Do not ask the user whether to continue.${protectedNote}`;
+			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。${protectedNote}`
+			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.${protectedNote}`;
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 		{ type: "spec_continuation", task: current.text, protected: current.protected === true },
 	]);
@@ -1712,10 +1780,16 @@ async function deliverPendingInjection(
 					items: [
 						{
 							id: task.id,
+							alias: task.alias ?? null,
 							title: task.title,
 							status: task.status,
 							preview: task.resultPreview ?? "",
 							...(task.resultTruncated ? { truncated: true } : {}),
+							// Reader-only navigation target (the agent's own message that produced
+							// this result). Omitted rather than stored as null when absent, so a
+							// row written before this existed and a run with no assistant text are
+							// the same shape to every consumer.
+							...(task.resultMessageId ? { resultMessageId: task.resultMessageId } : {}),
 						},
 					],
 				},
@@ -1793,7 +1867,11 @@ async function deliverPendingInjection(
 					{
 						fromId: message.fromId,
 						fromTitle: message.fromTitle ?? null,
+						fromLabel: message.fromLabel ?? null,
 						fromType: message.fromType ?? null,
+						// Reader-only navigation target, omitted when the sender had written
+						// nothing yet (see the field's own doc).
+						...(message.fromMessageId ? { fromMessageId: message.fromMessageId } : {}),
 						text: message.text,
 					},
 				],
@@ -1971,22 +2049,43 @@ async function drainInjectionsIntoHistory(active: ActiveNarrator, locale: Locale
 }
 
 interface ContinuableTopLevelMessage {
+	id?: string;
 	role: string;
 	parentToolUseId?: string | null;
 	contentJson?: unknown;
+	contentText?: unknown;
 	toolCalls?: Array<{ toolUseId?: string | null; toolName?: string | null }>;
 }
 
-function getLastContinuableTopLevelMessage<T extends ContinuableTopLevelMessage>(
+/**
+ * Find the last top-level message a continuation can build on, plus the trailing
+ * reasoning-only assistant records that shadow it.
+ *
+ * A turn that died after streaming thinking but before answering (or calling a
+ * tool) leaves a reasoning-only assistant record behind — see
+ * {@link isDanglingReasoningOnlyAssistantMessage}. Treating it as the tail hides
+ * whatever came before it, so a preceding assistant turn with pending tool
+ * results gets misread as "nothing to replay" and the continuation degrades into
+ * a plain "continue" user message that abandons those results.
+ *
+ * Walking past those records is safe: they carry no answer text and no tool call,
+ * so nothing is lost by continuing from the turn underneath.
+ */
+export function resolveContinuationTail<T extends ContinuableTopLevelMessage>(
 	messages: T[],
-): T | undefined {
+): { tail: T | undefined; danglingReasoningIds: string[] } {
+	const danglingReasoningIds: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (!msg || msg.parentToolUseId) continue;
 		if (msg.role !== "user" && msg.role !== "assistant") continue;
-		return msg;
+		if (isDanglingReasoningOnlyAssistantMessage(msg)) {
+			if (msg.id) danglingReasoningIds.push(msg.id);
+			continue;
+		}
+		return { tail: msg, danglingReasoningIds };
 	}
-	return undefined;
+	return { tail: undefined, danglingReasoningIds };
 }
 
 function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefined): boolean {
@@ -1997,6 +2096,85 @@ function shouldReplayToolResultPacket(msg: ContinuableTopLevelMessage | undefine
 		Array.isArray(msg.toolCalls) &&
 		msg.toolCalls.some((tc) => Boolean(tc?.toolUseId) && Boolean(tc?.toolName))
 	);
+}
+
+/**
+ * Text of a trailing `role: "user"` row that a pass with no prompt of its own must resend.
+ *
+ * Every provider's history builder POPS the last top-level user row and expects the
+ * caller to send it as the current turn (`buildAnthropicHistory` line ~2832 and the
+ * same three lines in openai/gemini/cline). That contract holds for an ordinary user
+ * message, because whoever wrote the row also passes its text into `runAgentLoop`.
+ *
+ * It does NOT hold for a row written by a producer that then starts a bare
+ * `runAgentLoop(active, "")` — the review conclusion written by
+ * `review-event-handler` is the first such producer. The row was popped as "the
+ * current turn" and the current turn was empty, so the conclusion reached the model
+ * in NEITHER place: `pushUserTurn` pushes nothing for empty content, and history no
+ * longer contains the row. The reviewer's findings simply were not in the request.
+ *
+ * Nothing reports that. The turn runs, the model answers something generic about the
+ * previous context, and the transcript still shows the conclusion sitting there — so
+ * it reads as the model ignoring it rather than never receiving it.
+ *
+ * Recovered here rather than at the producer because the gap belongs to this seam:
+ * any future producer that persists a user row and starts an empty pass inherits the
+ * same bug, and a fix at one call site would not cover it. `sys` rows need none of
+ * this — the builders lift those into `trailingUserText` themselves.
+ */
+export function resolvePoppedTrailingUserText(
+	messages: ContinuableTopLevelMessage[],
+): string | null {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.parentToolUseId) continue;
+		// Mirrors the builders' filter: they only consider user/assistant/sys, and only
+		// a trailing `user` row is popped. A trailing `sys` run is lifted by the builder
+		// itself, so reaching one means there is nothing for this helper to recover.
+		if (msg.role === "sys") return null;
+		if (msg.role !== "user") return null;
+		const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+		const text = blocks
+			.filter(
+				(block: { type?: string; text?: unknown }) =>
+					block?.type === "text" && typeof block.text === "string" && block.text.trim(),
+			)
+			.map((block: { text?: unknown }) => String(block.text))
+			.join("\n");
+		if (text.trim()) return text;
+		// `contentText` is the flat fallback for rows written without an explicit text
+		// block, matching how `dbMessageVisibleText` reads a row.
+		const flat = typeof msg.contentText === "string" ? msg.contentText : "";
+		return flat.trim() ? flat : null;
+	}
+	return null;
+}
+
+/**
+ * Does model-visible history end on a server-authored injection?
+ *
+ * `resolveContinuationTail` walks PAST `sys` rows by design — it answers "what turn can
+ * a continuation build on", and an injection is not a turn. But its absence from that
+ * answer must not be read as "history ends on the row underneath": an injection sitting
+ * last is the freshest thing the narrator was handed, and every provider's history
+ * builder already sends a trailing `sys` run as the CURRENT turn
+ * (`buildAnthropicHistory`'s `trailingUserText`).
+ *
+ * So a continuation whose tail is an injection has its content already in place and needs
+ * nothing but a loop — the same `runAgentLoop(active, "")` that
+ * `startInjectionContinuationIfPossible` uses. Appending a synthetic "please continue"
+ * user row instead would be actively wrong, not merely redundant: it displaces the
+ * injection from the trailing position, so the builder stops lifting it and the model
+ * reads it as background while being asked to continue something unnamed.
+ */
+export function hasTrailingInjectionRow(messages: ContinuableTopLevelMessage[]): boolean {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (!msg || msg.parentToolUseId) continue;
+		if (msg.role === "sys") return true;
+		if (msg.role === "user" || msg.role === "assistant") return false;
+	}
+	return false;
 }
 
 async function getLatestSubagentParentToolUseId(narratorId: string): Promise<string | undefined> {
@@ -2479,7 +2657,7 @@ export async function runAgentLoop(
 			// pending-compact guard set by a background compact can be released here.
 			clearActiveHistoryCompactPending(narratorId);
 
-			// Rebuild system prompt each iteration so AGENT.md/CLAUDE.md changes are picked up.
+			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const freshNarrator = await narratorService.getById(narratorId);
 			const oauthRuntime = await assertOAuthNarratorRuntimeActive(
 				narratorId,
@@ -2693,13 +2871,14 @@ export async function runAgentLoop(
 				onTitleCheck: async (_savedId) => {
 					const n = await db.query.narrators.findFirst({
 						where: eq(narrators.id, narratorId),
-						columns: { messageCount: true, title: true },
+						columns: { title: true },
 					});
-					const hasOnlyInitialUserMessage = (n?.messageCount ?? 0) <= 1;
+					// `messageCount` is the real message count, not a turn count, so it is
+					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
 						n &&
-						hasOnlyInitialUserMessage &&
-						(!n.title || (active._provisionalTitle && n.title === active._provisionalTitle))
+						(!n.title || (active._provisionalTitle && n.title === active._provisionalTitle)) &&
+						(await isFirstUserTurn(narratorId))
 					);
 					return { titleUpdate };
 				},
@@ -2978,6 +3157,27 @@ export async function runAgentLoop(
 				freshNarrator.fastModeOverride,
 				active._currentUserId,
 			);
+
+			// Layered traits are re-resolved per turn for the same reason as fast mode:
+			// the acting user is only known now, and a project/user trait edit should
+			// take effect from the next turn rather than requiring a session restart.
+			try {
+				const turnTraits = await resolveEffectiveTraits({
+					narratorTraits: freshNarrator.traits,
+					projectId: active._projectId ?? null,
+					actingUserId: active._currentUserId,
+				});
+				active._disabledTools = getDisabledToolSet(turnTraits.traits);
+				const turnBlocked = getBlockedSkills(turnTraits.traits);
+				active._blockedSkills = { all: turnBlocked.all, names: turnBlocked.names };
+			} catch (error) {
+				// Never fail a turn over layer resolution; the narrator-level traits
+				// already loaded at creation remain in effect.
+				logger.debug("Failed to refresh layered traits for turn", {
+					narratorId,
+					error: String(error),
+				});
+			}
 			const resolvedServiceTier =
 				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
 					? "priority"
@@ -3305,10 +3505,32 @@ export async function runAgentLoop(
 					: trailingUserText
 				: currentText;
 
+			// The builders popped the trailing user row expecting the caller to send it as
+			// the current turn. A pass started with no prompt of its own (a review
+			// conclusion's "handle" button, any future producer that writes a user row and
+			// starts a bare loop) would otherwise drop that row entirely — see
+			// `resolvePoppedTrailingUserText`. Only consulted when this pass has nothing
+			// else to say, so an ordinary user turn (whose text is already in
+			// `currentText`) can never be duplicated.
+			const recoveredTrailingUserText =
+				currentTurnText.trim() || trailingToolResults.length > 0
+					? null
+					: resolvePoppedTrailingUserText(dbMessages);
+			if (recoveredTrailingUserText) {
+				logger.debug("Resending a popped trailing user row as this pass's turn", {
+					narratorId,
+					chars: recoveredTrailingUserText.length,
+				});
+			}
+
 			// When replaying a pure tool-result turn, preserve the original packet shape:
 			// no synthetic user text.
 			const isPureToolResultReplay = !currentTurnText.trim() && trailingToolResults.length > 0;
-			let effectiveText = isPureToolResultReplay ? "" : currentTurnText;
+			let effectiveText = isPureToolResultReplay
+				? ""
+				: currentTurnText.trim()
+					? currentTurnText
+					: (recoveredTrailingUserText ?? currentTurnText);
 
 			// Passive knowledge injection (point A): when this turn carries real user text,
 			// surface relevant knowledge-base entries the triggering user may read.
@@ -3958,6 +4180,9 @@ export async function runAgentLoop(
 				active.events.emit("event", { type: "user_message", data: userMsg });
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = fb.feedbackText;
+				// Approving a permission with attached text starts a new pass here, so a
+				// cut-in message queued during the same tool call needs its boundary back.
+				rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3983,6 +4208,9 @@ export async function runAgentLoop(
 					active.events.emit("event", { type: "user_message", data: userMsg });
 					await narratorService.updateStatus(narratorId, "working");
 					currentText = gitCheck.message;
+					// The guardrail notice starts a new pass, so keep a cut-in message's
+					// boundary alive instead of stranding it for the rest of the loop.
+					rearmCutInSoftStopBeforeContinuing(active);
 					continue;
 				}
 				// Git is clean and loop ended normally — conclude the review
@@ -4103,6 +4331,9 @@ export async function runAgentLoop(
 				await narratorService.updateStatus(narratorId, "working");
 				currentText = "";
 				currentImages = undefined;
+				// This drain starts a fresh pass before the buffer consumer below is
+				// reached, which would strand a cut-in message for the rest of the loop.
+				rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -4845,7 +5076,10 @@ async function feedMessage(
 				}
 			: { setTurnStart: true },
 	);
-	if ((narrator.messageCount ?? 0) <= 1 && !narrator.title) {
+	// The user message above is already persisted, so "first turn" means exactly one
+	// user message exists. `messageCount` cannot answer this any more — it now counts
+	// every message, not finished turns.
+	if (!narrator.title && (await isFirstUserTurn(narratorId))) {
 		active._provisionalTitle =
 			(await setProvisionalTitleFromUserMessage(narratorId, prompt)) ?? undefined;
 		generateQuickTitle(narratorId, prompt, locale).catch(() => {});
@@ -5017,7 +5251,7 @@ export async function updateToolCallConclusion(opts: {
 		resultMessageId,
 		refreshTiming = false,
 	} = opts;
-	const resultPrefix = `<subagent_id>${subagentId}</subagent_id>\n\n`;
+	const resultPrefix = agentResultTag(await resolveAgentLabel(parentNarratorId, subagentId));
 	const output = resultPrefix + (finalText || "(no output)");
 	const timing = refreshTiming
 		? resolveToolCallConclusionTiming(await narratorService.getToolCallByToolUseId(toolUseId))
@@ -5591,11 +5825,54 @@ export async function continueNarrator(
 		await reconcileRunningStatus(narratorId);
 		return { ok: false };
 	}
-	const lastTopLevelMessage = getLastContinuableTopLevelMessage(rawMsgs);
+	// A turn that died after streaming thinking leaves a reasoning-only assistant
+	// record as the tail. Look past those first: judging the tail without doing so
+	// misreads a preceding tool-call turn as "nothing to replay" and degrades the
+	// continuation into a plain "continue" message that abandons its tool results.
+	const { tail: lastTopLevelMessage, danglingReasoningIds } = resolveContinuationTail(rawMsgs);
 	const shouldReplayToolResults = shouldReplayToolResultPacket(lastTopLevelMessage);
 
-	if (!shouldReplayToolResults) {
-		// No pending tool calls — send a simple "continue" user message.
+	// Drop the dangling records before rebuilding the request. buildHistory reads
+	// the DB again, so leaving them in place would put the reasoning-only turn back
+	// at the end of the provider history — the exact shape that makes an upstream
+	// reject a tool-result-only packet. Deleting is safe: they hold no answer text
+	// and no tool call (see isDanglingReasoningOnlyAssistantMessage), and they carry
+	// no file changes, so the workspace must NOT be rolled back with them.
+	if (shouldReplayToolResults && danglingReasoningIds.length > 0) {
+		const deletedMessageIds: string[] = [];
+		for (const messageId of danglingReasoningIds) {
+			try {
+				const removed = await narratorService.deleteDanglingReasoningMessage(narratorId, messageId);
+				if (removed) deletedMessageIds.push(messageId);
+			} catch (err) {
+				logger.warn("Failed to drop dangling reasoning message before continue", {
+					narratorId,
+					messageId,
+					error: String(err),
+				});
+			}
+		}
+		if (deletedMessageIds.length > 0) {
+			logger.info("Dropped dangling reasoning tail before continuing tool results", {
+				narratorId,
+				count: deletedMessageIds.length,
+			});
+			broadcastToNarrator(narratorId, {
+				type: "messages_deleted",
+				narratorId,
+				deletedMessageIds,
+			});
+		}
+	}
+
+	// A trailing injection already IS the turn's content (see hasTrailingInjectionRow), so
+	// it is continued by starting a loop with empty text — exactly like a tool-result
+	// replay, and unlike the synthetic "continue" row below, which would push the
+	// injection out of the trailing position the history builders depend on.
+	const trailingInjection = !shouldReplayToolResults && hasTrailingInjectionRow(rawMsgs);
+
+	if (!shouldReplayToolResults && !trailingInjection) {
+		// No pending tool calls and no fresh injection — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
 		const { userMsg } = await feedMessage(
 			narratorId,
@@ -5639,8 +5916,9 @@ export async function continueNarrator(
 			: { setTurnStart: true },
 	);
 
-	// Pass empty text — buildHistory will reconstruct the trailing tool-result
-	// packet so the provider sees the same follow-up turn again.
+	// Pass empty text — buildHistory reconstructs the turn's content itself: the trailing
+	// tool-result packet, or (for an injection tail) the trailing `sys` run lifted into
+	// the current turn.
 	runAgentLoop(active, "", undefined).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
 		await narratorService.updateStatus(narratorId, "idle", {
@@ -6777,11 +7055,15 @@ async function editAndRegenerateUnlocked(
 			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
-		// A loop may have started while the files were being materialized. Abort before
-		// copy-on-write and let the catch block remove every file created by this attempt.
-		if (isLoopRunning(narratorId)) {
-			await reconcileRunningStatus(narratorId);
-			throw new ValidationError("Cannot edit while narrator is running");
+		// A loop may have started while the files were being materialized (the route
+		// already cleared the way once, but that was several awaits ago). Stop it the
+		// same way the route did rather than failing the edit the user asked for; only
+		// a loop that will not stop aborts here, before copy-on-write, so the catch
+		// block can remove every file created by this attempt.
+		if (isLoopRunning(narratorId) && !(await interruptAndWaitForIdle(narratorId))) {
+			throw new ValidationError(
+				"This narrator did not stop after being interrupted; try again in a moment",
+			);
 		}
 		privateMessageId = await narratorService.copyOnWriteMessage(narratorId, messageId, {
 			contentText: effectivePrompt,
@@ -7460,6 +7742,72 @@ export function isLoopRunning(narratorId: string): boolean {
 }
 
 /**
+ * Interrupt whatever this narrator is doing and wait until it has actually stopped.
+ *
+ * `interruptNarrator` only aborts the AbortController and returns immediately; the
+ * loop notices the abort at its next await point and then runs its own cleanup
+ * (status write, tool-call sealing, snapshot claim release) in a `finally`. So a
+ * caller that wants to *replace* the narrator's history or its workspace cannot act
+ * on the synchronous return value — it has to wait for the loop to leave.
+ *
+ * That waiting is why this exists rather than each caller polling: the authoritative
+ * signal is the in-memory `_loopRunning`/`alive` pair, plus the runtime-claim
+ * registry for parent-side work that runs with no loop at all
+ * (`isNarratorRuntimeBusy`). A caller reading DB `status` instead would see idle
+ * while the loop is still draining.
+ *
+ * Returns whether the narrator is idle now. `false` means it was still busy when
+ * the budget ran out — the caller decides whether to refuse or proceed anyway; this
+ * function deliberately does not throw, so a caller can treat a stubborn loop as a
+ * warning rather than a hard failure.
+ *
+ * A pending permission is resolved as a denial first: that pause keeps the turn
+ * alive with nobody driving it, so aborting alone would leave the loop parked on a
+ * promise that no longer has a decider.
+ */
+export async function interruptAndWaitForIdle(
+	narratorId: string,
+	opts?: { timeoutMs?: number },
+): Promise<boolean> {
+	const busy = () => isLoopRunning(narratorId) || isNarratorRuntimeBusy(narratorId);
+	if (!busy()) return true;
+
+	// A suspended permission request is not something an abort can reach: the loop is
+	// parked awaiting a decision, so denying the pending ones is what lets the turn
+	// unwind. Keyed by requestId, and only the entries this narrator owns are touched
+	// (an entry may merely be broadcast here on behalf of a subagent).
+	for (const [requestId, pending] of [...pendingPermissions.entries()]) {
+		if (pending.narratorId !== narratorId) continue;
+		try {
+			await resolvePermissionOrDangerReflection(requestId, "deny", {
+				denyMessage: "Interrupted: the user is editing this session's history",
+			});
+		} catch (error) {
+			logger.warn("Failed to deny pending permission while interrupting", {
+				narratorId,
+				requestId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	interruptNarrator(narratorId);
+
+	const deadline = Date.now() + (opts?.timeoutMs ?? INTERRUPT_IDLE_TIMEOUT_MS);
+	while (busy()) {
+		if (Date.now() >= deadline) {
+			logger.warn("Narrator did not go idle after an interrupt", { narratorId });
+			return false;
+		}
+		await new Promise((resolve) => setTimeout(resolve, INTERRUPT_IDLE_POLL_MS));
+	}
+	// The loop's own `finally` writes its terminal status, but a runtime claim that
+	// simply expired leaves the DB row behind; repair it so the UI is not stuck busy.
+	await reconcileRunningStatus(narratorId);
+	return true;
+}
+
+/**
  * Reconcile a narrator status that disagrees with the in-memory runtime, in
  * either direction. Returns true only when an actual correction was made.
  *
@@ -7586,6 +7934,29 @@ export function requestBufferedMessageSoftStop(narratorId: string): boolean {
 	if (!active?.alive) return false;
 	active._bufferSoftStop = true;
 	return true;
+}
+
+/**
+ * Re-arm a cut-in soft stop that another producer is about to step in front of.
+ *
+ * `evaluateSoftStopRequest` consumes `_bufferSoftStop` when it grants the stop, on
+ * the assumption that the queued message is consumed right after the pass returns.
+ * Several branches in `runAgentLoop` break that assumption: chained permission
+ * feedback, the review git-state guard and the injection drain each start a FRESH
+ * pass before the buffer consumer is reached. That new pass has no soft-stop
+ * request left, so `shouldStop()` stays false for its entire duration and the
+ * queued message waits through every remaining tool call until the whole loop
+ * ends — the "it says it cut in, but it only arrived at the very end" report.
+ *
+ * Re-arming costs nothing when the queue is empty (the flag is only honoured while
+ * `hasPendingBufferedWork` holds), and the stepping-in producer keeps its priority:
+ * its own text still rides on the turn being started here.
+ */
+export function rearmCutInSoftStopBeforeContinuing(active: ActiveNarrator): void {
+	if (!active._bufferSoftStopTaken) return;
+	if (!hasPendingBufferedWork(active.narratorId)) return;
+	active._bufferSoftStopTaken = false;
+	active._bufferSoftStop = true;
 }
 
 /**
@@ -7926,7 +8297,7 @@ export async function recoverOnStartup(
 			});
 		}
 	}
-	await backgroundTaskService.recoverStaleAgentTasksAfterRestart(protection.backgroundTaskIds);
+	await backgroundTaskService.recoverStaleTasksAfterRestart(protection.backgroundTaskIds);
 
 	// Defensive cleanup: strip transient "reflecting"/"reasoning" tags left on any
 	// resting narrator. These are mid-turn tags that must never survive a completed
@@ -8131,6 +8502,8 @@ export async function recoverOnStartup(
 export async function resolveOptionalToolState(
 	narratorId: string,
 	toolName: string,
+	/** Acting user, so the user trait layer applies. Optional for legacy callers. */
+	actingUserId?: string | null,
 ): Promise<{
 	state: "loaded" | "not_loaded" | "disabled_by_trait" | "unknown_tool";
 	/** True when a global tool routine already enables it for every session. */
@@ -8154,11 +8527,26 @@ export async function resolveOptionalToolState(
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true, traits: true },
+		columns: {
+			enabledTools: true,
+			traits: true,
+			chapterId: true,
+			contextProjectId: true,
+		},
 	});
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
-	if (getDisabledToolSet(narrator.traits).has(toolName)) {
+	// Layered, so the UI reports a project/user-level deny as disabled_by_trait
+	// instead of claiming the tool is merely not loaded.
+	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
+		"./trait-layer-service"
+	);
+	const stateTraits = await resolveEffectiveTraits({
+		narratorTraits: narrator.traits,
+		projectId: await resolveNarratorProjectId(narrator),
+		actingUserId: actingUserId ?? null,
+	});
+	if (getDisabledToolSet(stateTraits.traits).has(toolName)) {
 		return { state: "disabled_by_trait", globallyEnabled };
 	}
 
@@ -8309,6 +8697,7 @@ export {
 	normalizeDangerReflectionLevel,
 	reprocessAllPendingPermissions,
 	resolveDangerReflectionLevel,
+	resolveDecisionNarratorId,
 	resolvePermission,
 	resolvePermissionDecision,
 	resolvePermissionOrDangerReflection,

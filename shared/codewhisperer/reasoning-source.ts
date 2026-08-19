@@ -1,11 +1,16 @@
 /**
- * Thinking-signature source identity.
+ * Thinking-signature (and encrypted-content) source identity.
  *
- * Anthropic-family models return a `signature` (and optionally a base64
- * `redactedContent` block) on their thinking blocks. That signature is minted
- * by a specific upstream server and MUST only be echoed back to that same
- * server on subsequent turns — replaying a signature to a different server
- * fails signature verification and the request is rejected.
+ * Credential-bound models — the Claude families via `thinking.signature`, the
+ * OpenAI gpt/o-series via `reasoning.encrypted_content` — return a credential
+ * on their reasoning blocks. That credential is minted by a specific upstream
+ * server and MUST only be echoed back to that same server on subsequent turns:
+ * replaying it to a different server fails verification and the request is
+ * rejected.
+ *
+ * Relay models (DeepSeek, GLM, Kimi, ...) mint no credentials at all; their
+ * plain-text reasoning crosses upstreams freely and this module plays no part
+ * in their retention path.
  *
  * The tricky case is NUG: several NUG channels share the same `channelType`
  * ("kiro") and therefore the same replay/protocol path, but each `channel`
@@ -20,7 +25,7 @@
  * carry no source; see {@link signatureSourcesCompatible} for that case.
  */
 
-/** A stable identity for the upstream that minted a thinking signature. */
+/** A stable identity for the upstream that minted a reasoning credential. */
 export type ReasoningSourceKey = string;
 
 /**
@@ -43,6 +48,10 @@ export type ReasoningSourceKey = string;
  * caller that cannot prove ownership of the signature must drop the whole block —
  * Anthropic's own replay rule for a model change is "drop them silently". See
  * `dropUnreplayableThinkingBlocks` in the Anthropic provider for the enforcement.
+ *
+ * This check only applies to credential-bound models. Relay models skip it
+ * entirely (see `hasCredentialBoundReasoning`): an absent signature there is
+ * legal wire shape, not an ownership failure.
  */
 export function signatureSourcesCompatible(
 	stored: ReasoningSourceKey | undefined | null,

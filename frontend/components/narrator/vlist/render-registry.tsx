@@ -24,6 +24,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
+import { RenderReviewCard } from "./render/RenderReviewCard";
 
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSubagentRecovery } from "./render/RenderSubagentRecovery";
@@ -94,6 +95,13 @@ export function resolveRenderExtra(spec: {
 			// Identicon seed for the header's avatar (a sender / task / entry id).
 			// Height-neutral: the header row is a fixed single line either way.
 			if ("speakerId" in data) extra.speakerId = data.speakerId;
+			// Where the speaker row navigates to (a child session, a knowledge entry, a
+			// Dynamic Spec file, a chapter). ONE tagged value rather than a field per kind,
+			// so the destinations stay mutually exclusive — see `injection-target.ts`.
+			// Kept separate from `speakerId`, which is the identicon seed and is set even
+			// for speakers with nowhere to go. Height-neutral: the header row is one fixed
+			// line whether or not it is a link.
+			if ("target" in data) extra.target = data.target;
 			// The real account behind the row, when there is one (a merge is authored by
 			// whoever pressed the button). Height-neutral: it only changes the avatar and
 			// name inside the already-reserved header row.
@@ -128,6 +136,12 @@ export function resolveRenderExtra(spec: {
 				extra.kind = data.kind;
 				extra.data = data;
 			}
+			break;
+		case "review-card":
+			// The whole spec data IS the card's chrome (verdict / badges / action label).
+			// Height-neutral: the body's geometry came from the markdown, and the header row
+			// is a constant.
+			extra.data = data;
 			break;
 		case "subagent-recovery":
 			// The measured block already carries the full payload; only the live
@@ -253,6 +267,9 @@ export function renderElement(
 					header={extra.header as React.ReactNode}
 					noteText={extra.noteText as string | undefined}
 					payloadData={extra.payloadData}
+					// A framed spec-task row animates only on the newest injection of a
+					// running narrator (see vlist-spec-task-live).
+					payloadLive={extra.payloadLive === true}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 				/>
 			);
@@ -312,6 +329,18 @@ export function renderElement(
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 				/>
 			);
+		case "review-card":
+			return (
+				<RenderReviewCard
+					measured={m as never}
+					// Header chrome (verdict badge / revision marker / action label) is
+					// height-neutral: the measure pass reserved a constant header row, so this
+					// only decides what is painted in it.
+					data={extra.data as never}
+					actions={extra.reviewFeedbackActions as never}
+					truncatedLabel={extra.truncatedLabel as string | undefined}
+				/>
+			);
 		case "ask-in-passing":
 			return (
 				<RenderAskInPassing
@@ -350,6 +379,10 @@ export function renderElement(
 					// forward every body inside a tool card lost its action bar.
 					viewTargets={extra.viewTargets as never}
 					viewControls={extra.viewControls as never}
+					// A `spec://tasks.json` board only animates its in-progress row when it
+					// is the NEWEST board of a running narrator (the shell decides; a task
+					// status is recorded, so animating on it alone spins the whole history).
+					specTasksLive={extra.specTasksLive === true}
 				/>
 			);
 		case "tool-call-group":
@@ -363,7 +396,6 @@ export function renderElement(
 					timingLabels={extra.timingLabels as never}
 				/>
 			);
-		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
 			return (

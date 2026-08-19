@@ -1,4 +1,5 @@
 import { AppError, formatZodError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { requireNarratorAccess } from "@server/lib/narrator-access";
 import {
 	type Capability,
 	invocationScopeSchema,
@@ -64,7 +65,7 @@ const sessionInputSchema = z
 		hash: z.string().regex(/^[a-f0-9]{64}$/),
 		contributionId: z.string().min(1).max(128),
 		panelInstanceId: z.string().min(1).max(256),
-		surface: z.enum(["workspace", "director", "focus", "settings", "provider-settings"]),
+		surface: z.enum(["workspace", "director", "focus", "graph", "settings", "provider-settings"]),
 		surfaceScope: z.enum(["workspace", "narrator", "project", "global"]),
 		scope: invocationScopeSchema.optional(),
 	})
@@ -372,6 +373,24 @@ function bindUiCapability(
 	);
 }
 
+/**
+ * Whether a view's declared surfaces admit the surface it is being opened on.
+ *
+ * An exact match always passes. Beyond that, `graph` (a chapter node's embedded
+ * dock) accepts a view that declared only `focus`: both surfaces host exactly one
+ * narrator and expose the same host context, so requiring authors to re-publish a
+ * manifest would have made every existing focus plugin fail inside a node with
+ * PLUGIN_UI_SCOPE_DENIED. The reverse is deliberately NOT allowed — a view that
+ * opts into `graph` alone is stating it only makes sense at node size.
+ *
+ * Exported for unit testing.
+ */
+export function isSurfaceAllowedForView(declared: readonly string[], surface: string): boolean {
+	if (declared.includes(surface)) return true;
+	if (surface === "graph") return declared.includes("focus");
+	return false;
+}
+
 function assertUiContribution(
 	manifest: {
 		permissions?: { host?: string[] };
@@ -394,7 +413,7 @@ function assertUiContribution(
 		(candidate) => candidate.id === input.contributionId,
 	);
 	if (!view) throw new AppError("Plugin UI contribution not found", 404, "NOT_FOUND");
-	if (view.scope !== input.surfaceScope || !view.surfaces.includes(input.surface)) {
+	if (view.scope !== input.surfaceScope || !isSurfaceAllowedForView(view.surfaces, input.surface)) {
 		throw new AppError(
 			"Plugin UI contribution is not available on this surface",
 			403,
@@ -644,15 +663,26 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 										? contribution.style
 										: undefined,
 							scope: typeof contribution.scope === "string" ? contribution.scope : undefined,
+							// Opt-in shared UI runtime. Narrowed to the known literal for the same
+							// reason `surfaces` is bounded below: the client routes on this value, and
+							// silently dropping it would leave a view that declared the runtime
+							// rendering unstyled with nothing to explain why.
+							runtime: contribution.runtime === "host-react" ? contribution.runtime : undefined,
 							// Bounded to the known surface names so a hostile manifest cannot inflate
 							// the response or smuggle arbitrary strings into host routing logic.
+							//
+							// `provider-settings` must be included: `PluginProviderSection` decides
+							// whether to mount a plugin's own credential UI by looking for it here, so
+							// dropping it silently forced every provider plugin onto the host's
+							// generated config form no matter what its manifest declared.
 							surfaces: Array.isArray(contribution.surfaces)
 								? contribution.surfaces.filter(
 										(surface): surface is string =>
 											surface === "workspace" ||
 											surface === "director" ||
 											surface === "focus" ||
-											surface === "settings",
+											surface === "settings" ||
+											surface === "provider-settings",
 									)
 								: undefined,
 							status: status.desiredState === "enabled" ? "available" : "disabled",
@@ -671,6 +701,12 @@ export function createPluginUiRoutes(options: PluginUiRouteOptions = {}): Hono {
 			const body = sessionInputSchema.safeParse(await c.req.json().catch(() => undefined));
 			if (!body.success) throw new ValidationError(formatZodError(body.error));
 			assertSurfaceScope(body.data);
+			// A narrator-scoped panel reads that narrator's context through the UI host,
+			// so the session may only be created by someone who can read the narrator.
+			// Checked at creation rather than per dispatch: the session is the capability.
+			if (body.data.surfaceScope === "narrator" && body.data.scope?.narratorId) {
+				await requireNarratorAccess(c, body.data.scope.narratorId, "read");
+			}
 			// Called for its lifecycle gate, not its value: a session must not be created for a
 			// plugin that is disabled, uninstalled or superseded.
 			await assertEnabled(manager, body.data.pluginId, body.data.version, body.data.hash);

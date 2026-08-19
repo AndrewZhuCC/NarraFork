@@ -1,9 +1,12 @@
 import type { Statement } from "bun:sqlite";
-import { sqlite } from "../db";
+import { db, sqlite } from "../db";
 import { ValidationError } from "../lib/errors";
+import { knowledgeService } from "./knowledge-service";
+import { narratorReadableSqlFragment } from "./narrator-acl";
+import { projectReadableSqlFragment } from "./project-acl";
 
 interface SearchResult {
-	type: "chapter" | "message" | "narrator";
+	type: "chapter" | "message" | "narrator" | "knowledge";
 	id: string;
 	title?: string;
 	snippet: string;
@@ -16,6 +19,10 @@ interface SearchResult {
 	role?: string;
 	model?: string;
 	messageRole?: string;
+	/** Knowledge hits: the collection the entry lives in. */
+	collectionId?: string;
+	collectionName?: string;
+	tags?: string[];
 	createdAt?: string;
 	updatedAt?: string;
 	lastMessageAt?: string | null;
@@ -27,6 +34,12 @@ interface SearchOptions {
 	query: string;
 	entities: string[];
 	limit?: number;
+	/**
+	 * The searching user, so narrator and message hits are limited to what they may
+	 * read. Required rather than optional: an omitted principal used to mean "see
+	 * everything", and a caller that simply forgot would silently reopen the leak.
+	 */
+	principal: { userId: string; isAdmin: boolean };
 }
 
 export interface NarratorMessageSearchResult {
@@ -56,12 +69,71 @@ export function buildFtsQuery(safeQuery: string): string {
 
 let _chaptersFts: Statement | null = null;
 let _chaptersLike: Statement | null = null;
+let _chaptersFtsAcl: Statement | null = null;
+let _chaptersLikeAcl: Statement | null = null;
 let _messagesFts: Statement | null = null;
 let _messagesLike: Statement | null = null;
 let _narratorsFts: Statement | null = null;
 let _narratorsLike: Statement | null = null;
 let _narratorScopedFts: Statement | null = null;
 let _narratorScopedLike: Statement | null = null;
+// Non-admin variants of the two narrator-derived searches. Kept as separate cached
+// statements rather than one string built per request, because these are prepared
+// once for the process lifetime: the SQL text must not vary by user. The user id
+// travels as a bound parameter.
+let _messagesFtsAcl: Statement | null = null;
+let _messagesLikeAcl: Statement | null = null;
+let _narratorsFtsAcl: Statement | null = null;
+let _narratorsLikeAcl: Statement | null = null;
+
+/**
+ * Visibility clause for a narrators row aliased as `n`, matching
+ * `narratorReadableWhere` in narrator-acl.ts. Two `?` placeholders, both the
+ * requesting user id.
+ *
+ * Search is the one place a leak is hardest to notice: a hit exposes a private
+ * narrator's title and a snippet of its transcript without ever opening it.
+ */
+/**
+ * Built from the shared ACL fragment rather than hand-written here.
+ *
+ * A local copy drifted once already: it still queried the deprecated
+ * `narrator_grants` table after the ACL layer moved to `acl_grants`, which silently
+ * hid shared sessions from search. Deriving it means the visibility rules — including
+ * the project gate — can only be changed in one place.
+ *
+ * Placeholder count is whatever the fragment declares; see PARAM_COUNT below.
+ */
+const NARRATOR_VISIBILITY_FRAGMENT = narratorReadableSqlFragment(false, "n");
+const NARRATOR_VISIBILITY_SQL = NARRATOR_VISIBILITY_FRAGMENT?.sql ?? "1 = 1";
+/**
+ * How many bound parameters `NARRATOR_VISIBILITY_SQL` consumes, all of them the
+ * requesting user id. Derived from the string so the two can never disagree: a
+ * hard-coded number silently shifts every later parameter when the fragment changes,
+ * and a shifted LIMIT is the kind of bug that looks like a ranking quirk.
+ */
+const NARRATOR_VISIBILITY_PARAM_COUNT = (NARRATOR_VISIBILITY_SQL.match(/\?/g) ?? []).length;
+
+/** The user id repeated once per placeholder in the visibility clause. */
+function visibilityParams(userId: string): string[] {
+	return Array.from({ length: NARRATOR_VISIBILITY_PARAM_COUNT }, () => userId);
+}
+
+/**
+ * Project gate for a projects row aliased as `p`, for the chapter searches.
+ *
+ * A chapter hit exposes its title, description snippet and the name of the project
+ * it lives in, so it is gated by the project the same way a narrator hit is gated by
+ * narrator visibility. Derived from `projectReadableSqlFragment` so the rules cannot
+ * drift from the ones the project routes enforce.
+ */
+const PROJECT_VISIBILITY_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
+const PROJECT_VISIBILITY_PARAM_COUNT = (PROJECT_VISIBILITY_SQL.match(/\?/g) ?? []).length;
+
+/** The user id repeated once per placeholder in the project gate. */
+function projectGateParams(userId: string): string[] {
+	return Array.from({ length: PROJECT_VISIBILITY_PARAM_COUNT }, () => userId);
+}
 
 function chaptersFtsStmt() {
 	if (!_chaptersFts) {
@@ -87,11 +159,46 @@ function chaptersLikeStmt() {
 			  substr(COALESCE(c.description, c.title, ''), 1, 240) as snippet
 			 FROM chapters c
 			 JOIN projects p ON p.id = c.project_id
-			 WHERE c.title LIKE ? OR c.description LIKE ?
+			 WHERE (c.title LIKE ? OR c.description LIKE ?)
 			 LIMIT ?`,
 		);
 	}
 	return _chaptersLike;
+}
+/**
+ * Non-admin chapter search. The `JOIN projects` is an inner join in both variants,
+ * so a chapter whose project row has vanished is already excluded — a dangling
+ * reference must not read as "no project, therefore no gate".
+ */
+function chaptersFtsAclStmt() {
+	if (!_chaptersFtsAcl) {
+		_chaptersFtsAcl = sqlite.prepare(
+			`SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at,
+			  p.name as project_name,
+			  snippet(chapters_fts, 1, '', '', '...', 96) as snippet,
+			  rank as rank_score
+			 FROM chapters_fts
+			 JOIN chapters c ON c.rowid = chapters_fts.rowid
+			 JOIN projects p ON p.id = c.project_id
+			 WHERE chapters_fts MATCH ? AND ${PROJECT_VISIBILITY_SQL}
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _chaptersFtsAcl;
+}
+function chaptersLikeAclStmt() {
+	if (!_chaptersLikeAcl) {
+		_chaptersLikeAcl = sqlite.prepare(
+			`SELECT c.id, c.title, c.description, c.status, c.role, c.created_at, c.updated_at,
+			  p.name as project_name,
+			  substr(COALESCE(c.description, c.title, ''), 1, 240) as snippet
+			 FROM chapters c
+			 JOIN projects p ON p.id = c.project_id
+			 WHERE (c.title LIKE ? OR c.description LIKE ?) AND ${PROJECT_VISIBILITY_SQL}
+			 LIMIT ?`,
+		);
+	}
+	return _chaptersLikeAcl;
 }
 function messagesFtsStmt() {
 	if (!_messagesFts) {
@@ -163,6 +270,85 @@ function narratorsLikeStmt() {
 		);
 	}
 	return _narratorsLike;
+}
+
+/**
+ * Access-filtered twins of the four narrator-derived statements above.
+ *
+ * Separate statements rather than a conditional clause because the visibility SQL
+ * adds two placeholders; keeping the admin path on the original statements means
+ * the common case pays nothing.
+ */
+function messagesFtsAclStmt() {
+	if (!_messagesFtsAcl) {
+		_messagesFtsAcl = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, substr(m.content_text, 1, 240) as content_preview,
+			  m.role as message_role, m.created_at,
+			  n.chapter_id, n.title as narrator_title, n.model,
+			  c.title as chapter_title, p.name as project_name,
+			  snippet(narrator_messages_fts, 0, '', '', '...', 96) as snippet,
+			  rank as rank_score
+			 FROM narrator_messages_fts
+			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE narrator_messages_fts MATCH ? AND ${NARRATOR_VISIBILITY_SQL}
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _messagesFtsAcl;
+}
+function messagesLikeAclStmt() {
+	if (!_messagesLikeAcl) {
+		_messagesLikeAcl = sqlite.prepare(
+			`SELECT m.id, m.narrator_id, substr(m.content_text, 1, 240) as content_preview,
+			  m.role as message_role, m.created_at,
+			  n.chapter_id, n.title as narrator_title, n.model,
+			  c.title as chapter_title, p.name as project_name,
+			  substr(m.content_text, 1, 240) as snippet
+			 FROM narrator_messages m
+			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE m.content_text LIKE ? AND ${NARRATOR_VISIBILITY_SQL}
+			 LIMIT ?`,
+		);
+	}
+	return _messagesLikeAcl;
+}
+function narratorsFtsAclStmt() {
+	if (!_narratorsFtsAcl) {
+		_narratorsFtsAcl = sqlite.prepare(
+			`SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.message_count,
+			  n.last_message_at, n.created_at, n.updated_at,
+			  c.title as chapter_title, p.name as project_name,
+			  snippet(narrators_fts, 0, '', '', '...', 96) as snippet,
+			  rank as rank_score
+			 FROM narrators_fts
+			 JOIN narrators n ON n.rowid = narrators_fts.rowid
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE narrators_fts MATCH ? AND ${NARRATOR_VISIBILITY_SQL}
+			 ORDER BY rank LIMIT ?`,
+		);
+	}
+	return _narratorsFtsAcl;
+}
+function narratorsLikeAclStmt() {
+	if (!_narratorsLikeAcl) {
+		_narratorsLikeAcl = sqlite.prepare(
+			`SELECT n.id, n.title, n.chapter_id, n.status, n.model, n.message_count,
+			  n.last_message_at, n.created_at, n.updated_at,
+			  c.title as chapter_title, p.name as project_name
+			 FROM narrators n
+			 LEFT JOIN chapters c ON c.id = n.chapter_id
+			 LEFT JOIN projects p ON p.id = c.project_id
+			 WHERE n.title LIKE ? AND ${NARRATOR_VISIBILITY_SQL}
+			 LIMIT ?`,
+		);
+	}
+	return _narratorsLikeAcl;
 }
 
 /**
@@ -274,9 +460,42 @@ function scoreFromRank(rank: unknown, fallback: number): number {
 	return Math.max(0, Math.round(1000 - numeric * 1000));
 }
 
+/**
+ * Collection display names for knowledge hits, batch-loaded by id.
+ *
+ * One query for the whole result page rather than per row: a knowledge search can
+ * return up to the hard cap, and the collection name is only used as a badge.
+ */
+async function collectionNameMap(collectionIds: string[]): Promise<Map<string, string>> {
+	const ids = [...new Set(collectionIds.filter(Boolean))];
+	if (ids.length === 0) return new Map();
+	const rows = await db.query.knowledgeCollections.findMany({
+		where: (c, { inArray }) => inArray(c.id, ids),
+		columns: { id: true, name: true },
+	});
+	return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+/**
+ * The one ordering used by every search response: score first, then recency.
+ *
+ * Exported because knowledge hits are resolved on a separate (async) path and
+ * merged in by the route — a second local sort there would drift from this one.
+ */
+export function sortSearchResults(results: SearchResult[]): SearchResult[] {
+	return results.sort((a, b) => {
+		if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
+		const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
+		const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
+		return bTime - aTime;
+	});
+}
+
 export const searchService = {
 	search(options: SearchOptions): SearchResult[] {
-		const { query, entities, limit = 50 } = options;
+		const { query, entities, limit = 50, principal } = options;
+		const userId = principal.userId;
+		const aclFiltered = !principal.isAdmin;
 		const results: SearchResult[] = [];
 
 		// Sanitize: remove FTS5 special chars to prevent injection
@@ -290,10 +509,16 @@ export const searchService = {
 		const safeQueryLower = safeQuery.toLowerCase();
 
 		if (entities.includes("chapters")) {
+			// A chapter hit exposes its title, description snippet and project name, so
+			// it is filtered by the owning project's gate.
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const rows: any[] = useFts
-				? chaptersFtsStmt().all(quoted, limit)
-				: chaptersLikeStmt().all(like, like, limit);
+			const rows: any[] = aclFiltered
+				? useFts
+					? chaptersFtsAclStmt().all(quoted, ...projectGateParams(userId), limit)
+					: chaptersLikeAclStmt().all(like, like, ...projectGateParams(userId), limit)
+				: useFts
+					? chaptersFtsStmt().all(quoted, limit)
+					: chaptersLikeStmt().all(like, like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "chapter",
@@ -312,10 +537,16 @@ export const searchService = {
 		}
 
 		if (entities.includes("messages")) {
+			// A message hit exposes a transcript snippet, so it is filtered by the
+			// owning narrator's visibility.
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const rows: any[] = useFts
-				? messagesFtsStmt().all(quoted, limit)
-				: messagesLikeStmt().all(like, limit);
+			const rows: any[] = aclFiltered
+				? useFts
+					? messagesFtsAclStmt().all(quoted, ...visibilityParams(userId), limit)
+					: messagesLikeAclStmt().all(like, ...visibilityParams(userId), limit)
+				: useFts
+					? messagesFtsStmt().all(quoted, limit)
+					: messagesLikeStmt().all(like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "message",
@@ -337,9 +568,13 @@ export const searchService = {
 
 		if (entities.includes("narrators")) {
 			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			const rows: any[] = useFts
-				? narratorsFtsStmt().all(quoted, limit)
-				: narratorsLikeStmt().all(like, limit);
+			const rows: any[] = aclFiltered
+				? useFts
+					? narratorsFtsAclStmt().all(quoted, ...visibilityParams(userId), limit)
+					: narratorsLikeAclStmt().all(like, ...visibilityParams(userId), limit)
+				: useFts
+					? narratorsFtsStmt().all(quoted, limit)
+					: narratorsLikeStmt().all(like, limit);
 			for (const row of rows) {
 				results.push({
 					type: "narrator",
@@ -360,12 +595,66 @@ export const searchService = {
 			}
 		}
 
-		return results.sort((a, b) => {
-			if (b.matchScore !== a.matchScore) return b.matchScore - a.matchScore;
-			const bTime = Date.parse(b.updatedAt ?? b.createdAt ?? b.lastMessageAt ?? "") || 0;
-			const aTime = Date.parse(a.updatedAt ?? a.createdAt ?? a.lastMessageAt ?? "") || 0;
-			return bTime - aTime;
+		return sortSearchResults(results);
+	},
+
+	/**
+	 * Knowledge-base entries as global-search results.
+	 *
+	 * Async and therefore separate from `search()`: knowledge visibility is a
+	 * dual-axis (clearance + controlled tag) check that reads grants, so it cannot
+	 * be expressed as a SQL fragment the way the narrator/project gates are. The
+	 * matched rows are post-filtered by `knowledgeService.filterReadable`, which
+	 * fails closed — the same gate the knowledge routes use.
+	 *
+	 * Results carry `updatedAt`, so the "newest" sort in the UI orders them
+	 * alongside the other entity types without special-casing.
+	 */
+	async searchKnowledge(options: {
+		query: string;
+		limit?: number;
+		principal: { userId: string; isAdmin: boolean };
+	}): Promise<SearchResult[]> {
+		const { query, limit = 50, principal } = options;
+		const safeQuery = sanitizeQuery(query);
+		if (!safeQuery) return [];
+
+		// The caller's own personal versions shadow the committed one, mirroring what
+		// they see in the knowledge UI: a hit on text they only have locally must not
+		// be reported against the main body it replaced.
+		const rows = knowledgeService.search({
+			q: safeQuery,
+			limit,
+			draftUserId: principal.userId || undefined,
 		});
+		if (rows.length === 0) return [];
+
+		const readable = await knowledgeService.filterReadable(
+			principal.userId
+				? { userId: principal.userId, role: principal.isAdmin ? "admin" : "user" }
+				: undefined,
+			rows,
+		);
+		if (readable.length === 0) return [];
+
+		const collectionNames = await collectionNameMap(readable.map((r) => r.collectionId));
+		const safeQueryLower = safeQuery.toLowerCase();
+		return readable.map((row) => ({
+			type: "knowledge" as const,
+			id: row.id,
+			title: row.title,
+			collectionId: row.collectionId,
+			collectionName: collectionNames.get(row.collectionId),
+			tags: row.tags,
+			status: row.status,
+			createdAt: row.createdAt,
+			updatedAt: row.updatedAt,
+			matchField: row.title?.toLowerCase().includes(safeQueryLower) ? "title" : "content",
+			// Knowledge search returns rank-ordered rows without exposing the raw rank,
+			// so score by position within a band that keeps titles above body matches.
+			matchScore: safeQuery.length >= 3 ? 780 : 540,
+			snippet: row.snippet || row.title || "",
+		}));
 	},
 
 	/**

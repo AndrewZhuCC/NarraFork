@@ -232,11 +232,12 @@
 	"dropFilesHere": "拖放文件到此处",
 	"textFileTooLarge": "文本文件过大（最大 100MB）",
 	"unsupportedFileType": "不支持的文件类型",
+	"draftAttachmentsRestoreFailedTitle": "部分附件未能恢复",
+	"draftAttachmentsRestoreFailed": "有 {{count}} 个待发附件已丢失，需要重新添加。",
 	"loadOlderMessages": "加载更早的消息",
 	"loadOlderCalls": "加载更早的工具调用",
 	"jumpTargetUnavailable": "该消息已不在此会话的历史记录中。",
 	"jumpTargetTooFar": "该消息距离当前位置过远，无法直接跳转。请向上滚动加载更多历史后重试。",
-
 	"archiveNarrator": "归档",
 	"permissionMode": "权限模式",
 	"permissionModesUnavailable": "权限模式不可用",
@@ -615,6 +616,11 @@
 	"segmentCompactConfirm": "压缩选中的 {{count}} 条消息？原始消息将被隐藏并替换为摘要。",
 	"viewSubagentSession": "查看会话",
 	"openFullSubagentSession": "打开完整会话",
+	"injectionTarget": {
+		"openKnowledge": "打开知识库条目",
+		"openSpecFile": "打开该大纲文件",
+		"openChapter": "打开章节"
+	},
 	"subagentRecentCalls": "最近调用",
 	"subagentWaitingPermission": "等待权限（{{count}}）",
 	"subagentWaitingPermissionTitle": "等待权限",
@@ -809,6 +815,8 @@
 	"fileViewer.expandAll": "全部展开",
 	"fileViewer.collapseAll": "全部折叠",
 	"fileViewer.reload": "重新加载",
+	"fileViewer.download": "下载",
+	"fileViewer.downloadFailed": "下载失败",
 	"fileViewer.parseFailed": "无法按 {{format}} 解析，已显示原文。",
 	"fileViewer.truncated": "仅显示前 {{chars}} 个字符，文件实际更长。",
 	"fileViewer.nodesTruncated": "[节点树已截断以保持界面响应。]",
@@ -903,6 +911,11 @@
 	"reviewVerdict_approve": "已通过",
 	"reviewVerdict_request_changes": "需要修改",
 	"reviewVerdict_comment_only": "仅评论",
+	"reviewFeedbackRevisedBadge": "已修正",
+	"reviewFeedbackApply": "处理",
+	"reviewFeedbackApplied": "已处理",
+	"reviewFeedbackApplyFailed": "无法为评审结论启动一轮",
+	"reviewFeedbackTruncated": "预览已截断",
 	"chromeNotInstalled": "未检测到 Chrome/Chromium 浏览器。请先安装 Chrome，或运行：bunx puppeteer browsers install chrome",
 	"chromeFlatpakUnsupported": "Flatpak 安装的 Chrome 无法直接使用。请通过 deb/rpm 等原生方式安装 Chrome，或运行：bunx puppeteer browsers install chrome",
 	"details.title": "会话详情",
@@ -1027,8 +1040,8 @@
 	"details.clearTrait": "清除 trait",
 	"details.customTraitsSaved": "自定义 trait 已保存",
 	"details.customTraitsCleared": "自定义 trait 已清除",
+	"details.stats.title": "统计",
 	"details.stats.messages": "消息",
-	"details.stats.cost": "成本",
 	"details.stats.inputTokens": "总输入",
 	"details.stats.outputTokens": "总输出",
 	"details.stats.cacheReadTokens": "缓存读取",
@@ -1100,7 +1113,8 @@
 			"spec_blocked_continuation": "阻塞续跑",
 			"spec_goal_added": "目标登记",
 			"spec_fork_carryover": "大纲继承",
-			"spec_context_cleared": "上下文已清空"
+			"spec_context_cleared": "上下文已清空",
+			"review_feedback": "代码评审"
 		},
 		"cadence": {
 			"everyNTools": "每 {{n}} 次工具调用"
@@ -1109,7 +1123,7 @@
 		"attachedCount": "附带 {{count}} 条系统注入",
 		"body": {
 			"noticeSilentProgress": "已连续 {{count}} 次工具调用未输出可见文本",
-			"noticeRelaxedPlan": "仍在规划中 — 暂不要开始实现",
+			"noticeRelaxedPlan": "仍在规划中 — 计划写入 {{planFile}}，暂不要开始实现",
 			"noticePipelineExit": "Pipeline 仍在活动 — 请确认是否仍需要",
 			"tasksCurrent": "Dynamic Spec — {{n}} 条开放任务",
 			"tasksEmptyNever": "Dynamic Spec — 尚未建立任务",
@@ -1258,6 +1272,35 @@
 		"resultCount_other": "{{count}} 条结果",
 		"role_user": "你",
 		"role_assistant": "助手",
-		"role_system": "系统"
+		"role_system": "系统",
+		"jumpUnavailable": "在画布上展开该章节的节点后即可跳转到消息。"
+	},
+	"access": {
+		"visibilityTitle": "谁可以看到这个会话",
+		"visibilityPrivate": "仅自己",
+		"visibilityProject": "项目内",
+		"visibilityPublic": "所有人",
+		"visibilityHint": {
+			"private": "只有你和你共享给的人可以打开这个会话。",
+			"project": "参与这个项目的人都可以查看。",
+			"public": "任何已登录用户都可以打开这个会话。"
+		},
+		"peopleTitle": "有权访问的人",
+		"ownerLabel": "所有者：{{username}}",
+		"noOwner": "这个会话早于权限机制存在，没有所有者，因此只有管理员能修改共享设置。可以请管理员把它转交给你。",
+		"noGrants": "尚未共享给任何人。",
+		"shareTitle": "共享给他人",
+		"searchUsers": "搜索用户",
+		"share": "共享",
+		"levelRead": "可查看",
+		"levelWrite": "可操作",
+		"revoke": "移除访问权",
+		"revokeUser": "移除 {{username}} 的访问权",
+		"roleForUser": "{{username}} 的权限级别",
+		"panelLabel": "会话访问权限",
+		"noUsersFound": "没有匹配的用户。",
+		"readOnlyNotice": "只有所有者或管理员可以修改共享设置。",
+		"unavailable": "该会话暂时无法读取共享设置。",
+		"denied": "你已不再有权访问这个会话。"
 	}
 }

@@ -67,6 +67,32 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
 	return clamped;
 }
 
+/**
+ * Tell the narrator's subscribers which child an in-flight Await is waiting on.
+ *
+ * Imported lazily and never awaited by the caller: this is a UI affordance, so it
+ * must not add latency to the wait or fail it. `type: "agent"` is rejected for
+ * subagents (see `buildRawJsonSchema`), so the owning narrator is always the
+ * top-level one and no `parentToolUseId` routing is needed.
+ */
+async function broadcastAwaitAgentResolved(
+	narratorId: string,
+	toolUseId: string,
+	subagentNarratorId: string,
+): Promise<void> {
+	try {
+		const { broadcastToNarrator } = await import("@server/websocket/narrator-ws");
+		broadcastToNarrator(narratorId, {
+			type: "await_agent_resolved",
+			narratorId,
+			toolUseId,
+			subagentNarratorId,
+		});
+	} catch {
+		// Best-effort only; a reload picks the same fact up from the message loader.
+	}
+}
+
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const subagent = Boolean(config?.parentNarratorId);
 	return {
@@ -185,6 +211,14 @@ export const awaitTool: ToolDefinition = {
 					timeoutMs: MAX_AWAIT_TIMEOUT_MS,
 					signal: ctx.signal,
 					timeoutSignal: timeoutController.signal,
+					// The wait can last for the whole timeout, and the returned metadata
+					// (which is what normally carries `subagentId`) only lands when it
+					// ends. Publishing the id here is what lets the card offer "open
+					// session" while the child is still working.
+					onTargetResolved: (subagentNarratorId) => {
+						if (!toolUseId) return;
+						void broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, subagentNarratorId);
+					},
 				});
 				return {
 					output: result.formatted,
@@ -192,6 +226,9 @@ export const awaitTool: ToolDefinition = {
 						kind: "await",
 						awaitType: "agent",
 						targetId: id,
+						// Readable name for the header/badges; `subagentId` stays the real
+						// narrator id so the card can still open its session.
+						targetLabel: result.label,
 						resolvedId: result.id,
 						subagentId: result.id,
 						status: result.status,
@@ -232,12 +269,18 @@ export const awaitTool: ToolDefinition = {
 						combinedSignal,
 					);
 			const status = relabel(result.status);
+			// A bash task id is a nanoid too, so the alias is the readable handle. Bash
+			// always registers one; if a row somehow lacks it, keep the full id rather
+			// than inventing a prefix — unlike a subagent id, a task id is looked up by
+			// exact match (`getById`/`getByAlias`), so a prefix would not resolve.
+			const taskLabel = task.alias ?? taskId;
 			return {
-				output: formatResult(taskId, status, result.output),
+				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
 					awaitType: "bash",
 					targetId: id,
+					targetLabel: taskLabel,
 					resolvedId: taskId,
 					status,
 					waitForText: wait_for_text,
@@ -257,6 +300,10 @@ export const awaitTool: ToolDefinition = {
 	},
 };
 
+/**
+ * Wording for a bash Await. `taskId` is the readable handle the model should
+ * reuse as a selector (the task's alias when it has one), not the raw nanoid.
+ */
 export function formatResult(taskId: string, status: string, output: string | null): string {
 	switch (status) {
 		case "running":

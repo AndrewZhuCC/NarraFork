@@ -26,6 +26,7 @@ import {
 } from "../lib/agent/execution/rpc-types";
 import { detectShell } from "../lib/agent/shell";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
+import { isBashToolName } from "../lib/agent/tool-name";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
@@ -49,6 +50,13 @@ import { logger } from "../lib/logger";
 import { isPlanModeTrait, isSubagentVariant } from "../lib/narrator-utils";
 import type { DeviceAccessPolicy } from "../lib/oauth-client-policy";
 import { resolveEffectiveRelaxedPlan } from "../lib/permission-modes";
+import {
+	buildLegacyPlanFileRelPath,
+	buildPlanFileRelPath,
+	isInsidePlansDir,
+	isSafePlanFileIdForPath,
+	PLAN_DIR_REL,
+} from "../lib/plan-file-path";
 import { isInsidePath, normalizePathForOS, pathsEqual, resolvePath } from "../lib/platform-path";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
@@ -180,7 +188,10 @@ function resolvePermissionShellType(
 }
 
 function isRoutedPermissionTool(toolName: string): boolean {
-	return toolName === "Shell" || !!toolRegistry.get(toolName)?.executionRouting;
+	// toolRegistry.get resolves legacy aliases, so a stale "Shell" name still
+	// finds the Bash definition and stays routed (i.e. still requires a frozen
+	// execution target). Special-casing the alias here is no longer needed.
+	return !!toolRegistry.get(toolName)?.executionRouting;
 }
 
 function decisionPaths(context?: ExecutionTargetContext | null): TargetPathSemantics {
@@ -256,7 +267,7 @@ function getToolPolicyPaths(
 	bashAnalysis?: BashAnalysis,
 	context?: ExecutionTargetContext | null,
 ): string[] {
-	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
+	if (isBashToolName(toolName)) {
 		return getShellScopePaths(cwd, input, bashAnalysis, context);
 	}
 	if (context && isRoutedPermissionTool(toolName)) {
@@ -302,7 +313,7 @@ function resolveWhitelistDecision(
 			: null;
 	}
 
-	if (toolName === SHELL_TOOL_NAME || toolName === "Shell") {
+	if (isBashToolName(toolName)) {
 		if (!bashAnalysis) return null;
 		if (bashAnalysis.nonWhitelisted.length > 0) return null;
 		if (bashAnalysis.dangerousPatterns.length > 0) return null;
@@ -395,6 +406,32 @@ function compiledPolicyForDecision(opts: PermissionDecisionOpts): CompiledExecut
 	return compileExecutionPolicy(legacy, opts.executionContext);
 }
 
+/**
+ * Relative plan-file paths a plan-mode Write/Edit may target, most-preferred first.
+ *
+ * Normally a single path. It becomes two only while a cycle started before the move
+ * to `.narrafork/plans/` is still open: the caller's resolved path (which may be the
+ * legacy one) plus the canonical path, so a resumed cycle can keep writing where its
+ * plan already is without locking new cycles out of the new location.
+ *
+ * TODO(migration): collapse to the single resolved path once no pre-move plan cycle
+ * remains open.
+ */
+function planFileWriteCandidates(
+	planFileId: string | undefined,
+	designatedPlanFilePath: string | undefined,
+): string[] {
+	const candidates: string[] = [];
+	const designated = designatedPlanFilePath?.trim();
+	if (designated) candidates.push(designated);
+	if (isSafePlanFileIdForPath(planFileId)) {
+		for (const path of [buildPlanFileRelPath(planFileId), buildLegacyPlanFileRelPath(planFileId)]) {
+			if (!candidates.includes(path)) candidates.push(path);
+		}
+	}
+	return candidates;
+}
+
 export function resolvePermissionDecision(
 	opts: PermissionDecisionOpts,
 ): "allow" | "deny" | "ask" | "fatal" {
@@ -406,6 +443,7 @@ export function resolvePermissionDecision(
 		bashAnalysis,
 		isChapter = false,
 		planFileId,
+		planFilePath: designatedPlanFilePath,
 		conclusionFileId,
 		relaxedPlan = false,
 		planMode = false,
@@ -418,7 +456,7 @@ export function resolvePermissionDecision(
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
-	if (toolName === SHELL_TOOL_NAME && bashAnalysis?.isCatastrophic) return "fatal";
+	if (isBashToolName(toolName) && bashAnalysis?.isCatastrophic) return "fatal";
 
 	const protectedPathReason = resolveProtectedPathDeny(
 		toolName,
@@ -439,18 +477,22 @@ export function resolvePermissionDecision(
 	// available in read-only/exploration flows just like the legacy TaskCreate/TodoWrite path.
 	if (isTaskStateMaintenanceTool(toolName, input)) return "allow";
 
+	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
-		if (planFileId) {
+		if (planFileCandidates.length > 0) {
 			const filePath = typeof input.file_path === "string" ? input.file_path : "";
 			const absPath =
 				(context && executionTargetPolicyPath(context)) ??
 				resolveDecisionPath(cwd, filePath, context);
-			const planFilePath = resolveDecisionPath(cwd, `.narrafork/plan-${planFileId}.md`, context);
-			if (decisionPaths(context).equals(absPath, planFilePath)) return "allow";
+			const paths = decisionPaths(context);
+			for (const candidate of planFileCandidates) {
+				const planFilePath = resolveDecisionPath(cwd, candidate, context);
+				if (paths.equals(absPath, planFilePath)) return "allow";
+			}
 		}
 		if (!relaxedPlan) {
 			if (meta) {
-				const planFile = planFileId ? `.narrafork/plan-${planFileId}.md` : "(unknown)";
+				const planFile = planFileCandidates[0] ?? "(unknown)";
 				meta.blacklistReason =
 					`Plan mode: Write/Edit is only allowed to the plan file "${planFile}". ` +
 					`Write your plan to that file, then call ExitPlanMode. ` +
@@ -492,7 +534,7 @@ export function resolvePermissionDecision(
 	}
 
 	// Command blacklist
-	if ((toolName === SHELL_TOOL_NAME || toolName === "Shell") && bashAnalysis) {
+	if (isBashToolName(toolName) && bashAnalysis) {
 		const commandDecision = compiledPolicy.evaluateCommands(
 			bashAnalysis.commands.map((command) => command.tokens),
 		);
@@ -525,7 +567,7 @@ export function resolvePermissionDecision(
 	}
 
 	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
-	if (toolName === SHELL_TOOL_NAME && chapterGitIssues.length > 0) {
+	if (isBashToolName(toolName) && chapterGitIssues.length > 0) {
 		return resolveChapterGitIssueDecision(effectiveMode);
 	}
 
@@ -546,7 +588,7 @@ export function resolvePermissionDecision(
 	// Command whitelist
 	let effectiveBashAnalysis = bashAnalysis;
 	if (
-		(toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
+		isBashToolName(toolName) &&
 		bashAnalysis &&
 		isCommandWhitelistCovered(bashAnalysis, compiledPolicy.commandWhitelist)
 	) {
@@ -565,7 +607,7 @@ export function resolvePermissionDecision(
 	// builtin analyzer found nothing unsafe) so an explicit allowlist hit still skips
 	// the approval prompt in interactive default mode.
 	const explicitCommandWhitelisted =
-		toolName === SHELL_TOOL_NAME &&
+		isBashToolName(toolName) &&
 		!!bashAnalysis &&
 		isExplicitlyCommandWhitelisted(bashAnalysis, compiledPolicy.commandWhitelist);
 
@@ -637,7 +679,7 @@ export function resolvePermissionDecision(
 			}
 			return "deny";
 		}
-		if (toolName === SHELL_TOOL_NAME) {
+		if (isBashToolName(toolName)) {
 			if (!effectiveBashAnalysis) return "deny";
 			if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "deny";
 			if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "deny";
@@ -660,7 +702,7 @@ export function resolvePermissionDecision(
 	}
 
 	// Bash/Shell: AST-based command-level security
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		if (!effectiveBashAnalysis) return "ask";
 		if (effectiveBashAnalysis.nonWhitelisted.length > 0) return "ask";
 		if (effectiveBashAnalysis.dangerousPatterns.length > 0) return "ask";
@@ -721,7 +763,7 @@ function resolveBlacklistDecision(
 			? input.subagent_type === "explore" || input.subagent_type === "plan"
 				? "read"
 				: "full"
-			: toolName === SHELL_TOOL_NAME || toolName === "Shell"
+			: isBashToolName(toolName)
 				? bashAnalysis?.hasWriteOperation
 					? "write"
 					: "read"
@@ -890,6 +932,13 @@ export interface PermissionDecisionOpts {
 	bashAnalysis?: BashAnalysis;
 	isChapter?: boolean;
 	planFileId?: string;
+	/**
+	 * Resolved relative path of the designated plan file. Supplied by the caller
+	 * rather than rebuilt from `planFileId` because an in-flight cycle may still be
+	 * anchored to the pre-`plans/` layout; the gate must accept the same file the
+	 * model was told to write.
+	 */
+	planFilePath?: string;
 	planMode?: boolean;
 	conclusionFileId?: string;
 	whitelistDirs?: WhitelistDir[];
@@ -1079,7 +1128,7 @@ function resolveProtectedPathDeny(
 		return null;
 	}
 
-	if (toolName === SHELL_TOOL_NAME && bashAnalysis) {
+	if (isBashToolName(toolName) && bashAnalysis) {
 		if (bashAnalysis.hasWriteOperation) {
 			for (const p of bashAnalysis.filePaths) {
 				if (isGitInternalPath(p, targetOS)) {
@@ -1157,7 +1206,7 @@ function getDangerFingerprintScope(
 	if (!cwd) return {};
 	const normalizedCwd = resolvePath(cwd);
 	let paths: string[] = [];
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		paths = getShellScopePaths(normalizedCwd, input, bashAnalysis);
 	} else if (toolName === "Agent") {
 		const workdir = typeof input.workdir === "string" ? input.workdir : "";
@@ -1182,7 +1231,7 @@ function getDangerFingerprintInput(
 	toolName: string,
 	input: Record<string, unknown>,
 ): Record<string, unknown> {
-	if (toolName === SHELL_TOOL_NAME) {
+	if (isBashToolName(toolName)) {
 		// 只保留影响执行语义的字段：command 和 workdir
 		const result: Record<string, unknown> = {};
 		if (input.command !== undefined) result.command = input.command;
@@ -2060,7 +2109,7 @@ export function classifyDanger(
 			normalizeExecutionPolicyRuleSet({ whitelistDirs, commandWhitelist }, "narrator"),
 			executionContext,
 		);
-	if (toolName === SHELL_TOOL_NAME)
+	if (isBashToolName(toolName))
 		return classifyShellDanger(
 			input,
 			cwd,
@@ -2384,11 +2433,12 @@ function looksLikePathReference(text: string): boolean {
 	if (trimmed.length > 200) return false;
 	// `plan_path:` / `path:` / `file:` style key-value reference.
 	if (/^\s*(plan[_-]?path|path|file|filepath|plan[_-]?file)\s*[:=]/i.test(trimmed)) return true;
-	// `.narrafork/plan-*.md` short reference.
-	if (/\.narrafork[/\\]plan-[^\s]*\.md\s*$/i.test(trimmed)) return true;
-	// A `.narrafork/plan-*.md` mention followed by trailing prose (e.g. our own
-	// model-facing reference sentence, which ends with "Re-read that file …").
-	if (/\.narrafork[/\\]plan-[^\s]*\.md\b/i.test(trimmed)) return true;
+	// `.narrafork/plans/plan-*.md` short reference (the `plans/` segment is optional
+	// so pre-move paths are still recognised).
+	if (/\.narrafork[/\\](?:plans[/\\])?plan-[^\s]*\.md\s*$/i.test(trimmed)) return true;
+	// The same mention followed by trailing prose (e.g. our own model-facing
+	// reference sentence, which ends with "Re-read that file …").
+	if (/\.narrafork[/\\](?:plans[/\\])?plan-[^\s]*\.md\b/i.test(trimmed)) return true;
 	// Bare filesystem path pointing at a doc file: Windows drive (E:\ or E:/) or
 	// POSIX absolute (/…) ending in a doc extension, with no spaces mid-path
 	// beyond a leading label.
@@ -2465,7 +2515,12 @@ export interface PlanFileReadPolicy {
 	blacklistDirs?: BlacklistDir[];
 }
 
-type PlanFileResolutionError = "invalid" | "tooLarge" | "executorUpgrade";
+type PlanFileResolutionError =
+	| "invalid"
+	| "tooLarge"
+	| "executorUpgrade"
+	/** A relaxed-mode custom path that resolves outside `.narrafork/plans/`. */
+	| "outsidePlansDir";
 
 type RemoteCapabilityBackend = ExecutionBackend & {
 	supportsFsStatResolvedPath?: boolean;
@@ -2492,12 +2547,18 @@ function planExecutorUpgradeMessage(locale: Locale, planFile: string): string {
 	return `Error: Remote plan file "${planFile}" requires an executor upgrade for canonical authorization and atomic reading (${requiredFeatures}). Pure inline plans and other remote tools remain available, but file-based ExitPlanMode needs a newer executor.`;
 }
 
-function comparableBackendPath(backend: ExecutionBackend, baseCwd: string, value: string): string {
-	const paths =
+/** Path grammar of an execution backend, falling back to its declared platform. */
+function backendPathSemantics(backend: ExecutionBackend): TargetPathSemantics {
+	return (
 		backend.paths ??
 		targetPathSemantics(
 			backend.pathFlavor === "windows" || backend.platform?.os === "windows" ? "windows" : "posix",
-		);
+		)
+	);
+}
+
+function comparableBackendPath(backend: ExecutionBackend, baseCwd: string, value: string): string {
+	const paths = backendPathSemantics(backend);
 	return paths.identityKey(paths.resolve(baseCwd, value));
 }
 
@@ -2596,8 +2657,10 @@ export async function resolveExitPlanModeInputWithBackend(
 	const defaultPlanFilePath =
 		designatedPlanPath ??
 		active?._planFilePath ??
-		(planFileId ? `.narrafork/plan-${planFileId}.md` : null);
+		(isSafePlanFileIdForPath(planFileId) ? buildPlanFileRelPath(planFileId) : null);
 	const planFileName = customPlanFilePath ?? defaultPlanFilePath;
+	/** Placeholder for messages emitted before any plan path is known. */
+	const planFilePlaceholder = buildPlanFileRelPath("<id>");
 
 	// `mode` is a DECLARATION of where the plan comes from, verified rather than
 	// reinterpreted. Its whole purpose is to stop the source from being guessed
@@ -2617,7 +2680,7 @@ export async function resolveExitPlanModeInputWithBackend(
 			input: stripPlanFileInput(effectiveInput),
 			resolvedFromFile: false,
 			message: getToolMessageWithParams("exitPlanModeInlineModeDisabled", locale, {
-				planFile: planFileName ?? ".narrafork/plan-<id>.md",
+				planFile: planFileName ?? planFilePlaceholder,
 			}),
 		};
 	}
@@ -2630,7 +2693,7 @@ export async function resolveExitPlanModeInputWithBackend(
 			input: stripPlanFileInput(effectiveInput),
 			resolvedFromFile: false,
 			message: getToolMessageWithParams("exitPlanModeInlineWithoutBody", locale, {
-				planFile: planFileName ?? ".narrafork/plan-<id>.md",
+				planFile: planFileName ?? planFilePlaceholder,
 			}),
 		};
 	}
@@ -2660,18 +2723,42 @@ export async function resolveExitPlanModeInputWithBackend(
 	let planFileContentBytes: number | undefined;
 	const baseCwd = executionTarget?.cwd ?? toolBaseCwd(backend, cwd);
 
-	if (
-		!isRelaxedPlan &&
-		planFileName &&
-		(!isSafePlanIdentity(planFileId) ||
-			comparableBackendPath(backend, baseCwd, planFileName) !==
-				comparableBackendPath(backend, baseCwd, `.narrafork/plan-${planFileId}.md`))
-	) {
+	// A malformed persisted identity is a boundary violation in its own right. It is
+	// checked independently of whether a path could be derived from it: an identity
+	// that fails validation yields no path at all, and letting a missing path skip
+	// the check would silently turn the violation into an accepted inline plan.
+	if (!isRelaxedPlan && planFileId && !isSafePlanIdentity(planFileId)) {
 		planFileError = "invalid";
+	}
+
+	// Strict mode accepts only the canonical plan path — or, for a cycle that began
+	// before the move to `.narrafork/plans/`, the legacy path it is anchored to.
+	// TODO(migration): drop the legacy candidate once no pre-move cycle is open.
+	if (!isRelaxedPlan && planFileName && !planFileError) {
+		const strictCandidates = isSafePlanFileIdForPath(planFileId)
+			? [buildPlanFileRelPath(planFileId), buildLegacyPlanFileRelPath(planFileId)]
+			: [];
+		const matchesDesignated = strictCandidates.some(
+			(candidate) =>
+				comparableBackendPath(backend, baseCwd, planFileName) ===
+				comparableBackendPath(backend, baseCwd, candidate),
+		);
+		if (!isSafePlanIdentity(planFileId) || !matchesDesignated) planFileError = "invalid";
 	}
 
 	if (customPlanFilePath && !isMarkdownPlanFilePath(customPlanFilePath)) {
 		planFileError = "invalid";
+	}
+
+	// Relaxed plan mode lets the model write other files while planning, but the plan
+	// ITSELF stays in the plan directory: a plan file scattered anywhere in the tree
+	// is what made plan artifacts unfindable. This is the lexical half of the check —
+	// a symlink out of the directory is caught after stat resolves the real path.
+	if (customPlanFilePath && !planFileError) {
+		const paths = backendPathSemantics(backend);
+		if (!isInsidePlansDir(paths, baseCwd, customPlanFilePath)) {
+			planFileError = "outsidePlansDir";
+		}
 	}
 
 	if (
@@ -2765,6 +2852,14 @@ export async function resolveExitPlanModeInputWithBackend(
 									!targetContext.paths.equals(targetContext.target.canonicalPath, canonicalPath))
 							) {
 								planFileError = "invalid";
+							} else if (
+								// The lexical check above proved the SUPPLIED path is in the plan
+								// directory; this proves the file it actually resolves to is too,
+								// closing a symlink from inside the directory to a file outside it.
+								customPlanFilePath &&
+								!isInsidePlansDir(targetContext.paths, baseCwd, canonicalPath)
+							) {
+								planFileError = "outsidePlansDir";
 							} else {
 								const file = await backend.readFileBytes(authorizedPath, {
 									maxBytes: MAX_PLAN_FILE_BYTES + 1,
@@ -2857,9 +2952,15 @@ export async function resolveExitPlanModeInputWithBackend(
 								planFile: planFileName ?? "<unknown>",
 								maxBytes: MAX_PLAN_FILE_BYTES,
 							})
-						: getToolMessageWithParams("exitPlanModePlanFileInvalid", locale, {
-								planFile: planFileName ?? "<unknown>",
-							}),
+						: planFileError === "outsidePlansDir"
+							? getToolMessageWithParams("exitPlanModePlanFileOutsidePlansDir", locale, {
+									planFile: planFileName ?? "<unknown>",
+									plansDir: PLAN_DIR_REL,
+									defaultPlanFile: defaultPlanFilePath ?? planFilePlaceholder,
+								})
+							: getToolMessageWithParams("exitPlanModePlanFileInvalid", locale, {
+									planFile: planFileName ?? "<unknown>",
+								}),
 		};
 	}
 
@@ -2885,7 +2986,9 @@ export async function resolveExitPlanModeInputWithBackend(
 			if (looksLikePathReference(inlinePlan)) {
 				const planFilePath =
 					planFileName ??
-					(planFileId ? `.narrafork/plan-${planFileId}.md` : ".narrafork/plan-<id>.md");
+					(isSafePlanFileIdForPath(planFileId)
+						? buildPlanFileRelPath(planFileId)
+						: planFilePlaceholder);
 				const {
 					inline_plan: _drop,
 					plan: _drop2,
@@ -2922,7 +3025,10 @@ export async function resolveExitPlanModeInputWithBackend(
 	const hasPlanContent = typeof planValue === "string" && planValue.trim().length > 0;
 	if (!hasPlanContent) {
 		const planFilePath =
-			planFileName ?? (planFileId ? `.narrafork/plan-${planFileId}.md` : ".narrafork/plan-<id>.md");
+			planFileName ??
+			(isSafePlanFileIdForPath(planFileId)
+				? buildPlanFileRelPath(planFileId)
+				: planFilePlaceholder);
 		return {
 			ok: false,
 			input: effectiveInput,
@@ -3137,15 +3243,21 @@ function resolvePendingExecutionBackend(target: PendingExecutionTarget): Executi
 				`got ${backend.kind}/${backend.deviceId}.`,
 		);
 	}
-	const backendFlavor =
-		backend.pathFlavor ??
-		backend.paths?.flavor ??
-		(backend.platform?.os === "windows" ? "windows" : "posix");
-	if (target.pathFlavor !== backendFlavor) {
-		throw new Error(
-			`Frozen execution target path flavor drifted: expected ${target.pathFlavor}, ` +
-				`got ${backendFlavor}.`,
-		);
+	// A Dynamic Spec target runs on the host backend but keeps the spec:// grammar, so it
+	// never matches the backend's own filesystem flavor. Comparing the two would reject
+	// every reprocessed spec:// permission ("expected spec, got posix") — most visibly when
+	// a plan-mode spec write is pending and the user changes permission mode.
+	if (target.pathFlavor !== "spec") {
+		const backendFlavor =
+			backend.pathFlavor ??
+			backend.paths?.flavor ??
+			(backend.platform?.os === "windows" ? "windows" : "posix");
+		if (target.pathFlavor !== backendFlavor) {
+			throw new Error(
+				`Frozen execution target path flavor drifted: expected ${target.pathFlavor}, ` +
+					`got ${backendFlavor}.`,
+			);
+		}
 	}
 	const runtimeGeneration = backend.runtimeGeneration ?? 0;
 	if (target.runtimeGeneration !== runtimeGeneration) {
@@ -3383,8 +3495,8 @@ export async function handlePermission(
 	let bashAnalysis: BashAnalysis | undefined;
 	let shellAnalysisError: string | undefined;
 	const isBashControlOp =
-		toolName === SHELL_TOOL_NAME && !input.command && (input.await != null || input.stop != null);
-	if (toolName === SHELL_TOOL_NAME && typeof input.command === "string") {
+		isBashToolName(toolName) && !input.command && (input.await != null || input.stop != null);
+	if (isBashToolName(toolName) && typeof input.command === "string") {
 		try {
 			const shellType = resolvePermissionShellType(executionContext?.backend);
 			const shellCwd = executionContext?.target.cwd ?? resolveToolCwd(cwd, effectiveInput);
@@ -3467,8 +3579,7 @@ export async function handlePermission(
 				options?.executionPlan?.endpoints.some((endpoint) => endpoint.operation === "write") ===
 					true ||
 				WRITE_TOOLS.has(toolName) ||
-				((toolName === SHELL_TOOL_NAME || toolName === "Shell") &&
-					bashAnalysis?.hasWriteOperation === true);
+				(isBashToolName(toolName) && bashAnalysis?.hasWriteOperation === true);
 			if (capabilityNeedsWrite && oauthDeviceLevel !== "readWrite") {
 				return {
 					behavior: "deny",
@@ -3490,25 +3601,36 @@ export async function handlePermission(
 	const planFileId = isPlanMode
 		? (activeNarrators.get(narratorId)?._planFileId ?? narrator?.planFileId ?? undefined)
 		: undefined;
+	const designatedPlanFilePath = isPlanMode
+		? activeNarrators.get(narratorId)?._planFilePath
+		: undefined;
 
 	// Plan mode: redirect Write/Edit targeting any .md file to the designated plan file
 	let planRedirectNotice: string | undefined;
 	if (isPlanMode && !isRelaxedPlan && planFileId && (toolName === "Write" || toolName === "Edit")) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-		if (filePath) {
+		// A spec:// URI is never a filesystem plan file. Rewriting it to the plan path would
+		// also change the path grammar of an execution target that was already frozen as
+		// "spec" before permission handling, which the executor rejects outright ("path
+		// flavor is already frozen to spec and cannot change to posix") — so the model sees
+		// a routing error instead of a decision. Dynamic Spec writes are session metadata
+		// and are judged on their own below (tasks.json is allowed, anything else still
+		// falls through to the plan-mode soft deny).
+		if (filePath && !specVfsService.isSpecUri(filePath)) {
 			const paths = executionContext?.paths ?? localPathSemantics;
 			const absPath =
 				(executionContext && executionTargetPolicyPath(executionContext)) ??
 				resolveDecisionPath(cwd, filePath, executionContext);
-			const planFilePath = resolveDecisionPath(
-				cwd,
-				`.narrafork/plan-${planFileId}.md`,
-				executionContext,
+			// A resumed pre-move cycle may legitimately still be writing to its legacy
+			// path; redirecting that away would cut the model off from its own plan.
+			const candidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
+			const alreadyPlanFile = candidates.some((candidate) =>
+				paths.equals(absPath, resolveDecisionPath(cwd, candidate, executionContext)),
 			);
-			if (!paths.equals(absPath, planFilePath)) {
+			if (!alreadyPlanFile) {
 				const fileName = paths.basename(filePath).toLowerCase();
 				if (fileName.endsWith(".md")) {
-					const correctRelPath = `.narrafork/plan-${planFileId}.md`;
+					const correctRelPath = candidates[0] ?? buildPlanFileRelPath(planFileId);
 					effectiveInput = { ...effectiveInput, file_path: correctRelPath };
 					planRedirectNotice = getToolMessageWithParams("planModeFileRedirected", locale, {
 						originalPath: filePath,
@@ -3522,7 +3644,15 @@ export async function handlePermission(
 	// Conclusion file redirect
 	let conclusionRedirectNotice: string | undefined;
 	const subagentConcEntry = getConclusionEntry(narratorId);
-	if (subagentConcEntry && (toolName === "Write" || toolName === "Edit")) {
+	// Same reason as the plan-file redirect above: a spec:// target is frozen with the
+	// "spec" path grammar before permission handling, so rewriting it to a worktree path
+	// turns the call into a routing error rather than a decision. Dynamic Spec is the
+	// subagent's own session metadata, never the caller's conclusion document.
+	if (
+		subagentConcEntry &&
+		(toolName === "Write" || toolName === "Edit") &&
+		!specVfsService.isSpecUri(effectiveInput.file_path)
+	) {
 		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
 		const conclusionRelPath = subagentConcEntry.relPath;
 		if (filePath) {
@@ -3662,6 +3792,7 @@ export async function handlePermission(
 					bashAnalysis,
 					isChapter,
 					planFileId,
+					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
 					conclusionFileId,
 					compiledPolicy,
@@ -3721,7 +3852,7 @@ export async function handlePermission(
 		oauthKnowledgeCapability !== "write"
 	) {
 		const oauthDanger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -3887,7 +4018,7 @@ export async function handlePermission(
 		dangerReflectionLevel !== "off"
 	) {
 		const danger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -3976,7 +4107,7 @@ export async function handlePermission(
 	}
 	if (promotedPlanSoftDeny && permMode === "bypassPermissions" && dangerReflectionLevel !== "off") {
 		const baseDanger =
-			toolName === SHELL_TOOL_NAME && shellAnalysisError
+			isBashToolName(toolName) && shellAnalysisError
 				? buildShellAnalysisFailureDanger(toolName, effectiveInput, shellAnalysisError)
 				: classifyDanger(
 						toolName,
@@ -4068,7 +4199,7 @@ export async function handlePermission(
 		const isReadToolPathDenied =
 			(permMode === "readOnly" || isPlanMode) &&
 			(READ_ONLY_TOOLS.includes(toolName) ||
-				(toolName === SHELL_TOOL_NAME &&
+				(isBashToolName(toolName) &&
 					bashAnalysis &&
 					!bashAnalysis.hasWriteOperation &&
 					bashAnalysis.nonWhitelisted.length === 0 &&
@@ -4570,6 +4701,36 @@ export async function resolvePermission(
 		}
 	}
 	return true;
+}
+
+/**
+ * The narrator a request id belongs to, whatever kind of pending decision it is.
+ *
+ * Exists because the decision surfaces are keyed by request id alone and carry no
+ * narrator id: `POST /permissions/:requestId/...` and the `permission_decision`
+ * WebSocket frame both have to discover the owner before they can authorize the
+ * caller. Approving a tool call is the single most consequential action on this
+ * surface — it is what lets an agent write files or run commands — so a decision
+ * frame that skipped this lookup was authorized by nothing but knowledge of the
+ * request id, and request ids are broadcast to every reader of the session.
+ *
+ * All three in-memory registries key by request id and record `narratorId`. Once a
+ * request has been decided it lives only in `narrator_tool_calls`, where the request
+ * id IS the row id — hence the final fallback rather than "not found".
+ */
+export async function resolveDecisionNarratorId(requestId: string): Promise<string | null> {
+	const pending = pendingPermissions.get(requestId);
+	if (pending?.narratorId) return pending.narratorId;
+	const reflection = pendingDangerReflections.get(requestId);
+	if (reflection?.narratorId) return reflection.narratorId;
+	const { getTaskReflectionNarratorId } = await import("@server/lib/agent/tools/task-reflection");
+	const taskReflectionNarratorId = getTaskReflectionNarratorId(requestId);
+	if (taskReflectionNarratorId) return taskReflectionNarratorId;
+	const row = await db.query.narratorToolCalls.findFirst({
+		where: eq(narratorToolCalls.id, requestId),
+		columns: { narratorId: true },
+	});
+	return row?.narratorId ?? null;
 }
 
 export async function resolvePermissionOrDangerReflection(

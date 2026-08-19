@@ -598,11 +598,11 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 		expect(afterFold?.cacheKey).not.toBe(beforeFold?.cacheKey);
 	});
 
-	it("L3 tool-run summary: a second folded call re-keys the summary", async () => {
-		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 3);
-		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 3);
-		const first = one.find((item) => item.kind === "tool-run-summary");
-		const second = two.find((item) => item.kind === "tool-run-summary");
+	it("L2 activity trace: a second folded call re-keys the trace", async () => {
+		const one = await probeFolds([readToolMsg("m1", 1, "tu-1")], 2);
+		const two = await probeFolds([readToolMsg("m1", 1, "tu-1"), readToolMsg("m2", 2, "tu-2")], 2);
+		const first = one.find((item) => item.kind === "activity-trace");
+		const second = two.find((item) => item.kind === "activity-trace");
 		expect(first).toBeDefined();
 		expect(second).toBeDefined();
 		expect(second?.key).toBe(first?.key);
@@ -744,6 +744,51 @@ describe("live-patch audit: fields that are height-NEUTRAL (single header row)",
 			OPENED,
 		);
 		expect(identified.height).toBe(base.height);
+	});
+
+	/**
+	 * `awaitAgentResolvedPatch` writes the child narrator id of a RUNNING Await so
+	 * the row's "open session" item appears during the wait.
+	 *
+	 * It is NOT in the exhaustive audit above, which requires a height change: this
+	 * patch must have none. That is the whole reason it writes its own field instead
+	 * of `_metadata.subagentId` — `classifyAwait` renders a `subagent:` row from the
+	 * latter, so the obvious implementation would have grown every running Await
+	 * card. This case is what would fail if someone "simplified" it back.
+	 *
+	 * No revision component is needed either (unlike `timeoutMs`): the menu reads the
+	 * MESSAGE TREE, not the cached measured payload, so a retained entry stays correct.
+	 */
+	it("the resolved await-agent narrator id does not change the measured height", async () => {
+		const { measureToolCall } = await measureMod();
+		const base = measureToolCall(expandedCard(), WIDTH, LOD, OPENED);
+		expect(base.height).toBeGreaterThan(base.collapsedHeight);
+		const resolved = measureToolCall(
+			expandedCard({ _awaitAgentNarratorId: "sub-live" } as Partial<ToolCallData>),
+			WIDTH,
+			LOD,
+			OPENED,
+		);
+		expect(resolved.height).toBe(base.height);
+	});
+
+	it("writing the await id into _metadata WOULD change the height (why it does not)", async () => {
+		// Pins the alternative this design rejects: `classifyAwait` emits a
+		// `subagent: …` row for `metadata.subagentId`, so routing the derived id
+		// through metadata is a layout change caused by a context-menu affordance.
+		const { classifyToolDetail } = await import("@shared/pretext-layout/tool-detail");
+		const base = {
+			toolName: "Await",
+			category: "await",
+			status: "running",
+			inputJson: { type: "agent", id: "paper-extract" },
+		} as const;
+		const without = classifyToolDetail({ ...base, metadata: { awaitType: "agent" } });
+		const withId = classifyToolDetail({
+			...base,
+			metadata: { awaitType: "agent", subagentId: "sub-live" },
+		});
+		expect(JSON.stringify(withId)).not.toBe(JSON.stringify(without));
 	});
 });
 

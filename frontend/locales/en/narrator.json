@@ -233,11 +233,12 @@
 	"dropFilesHere": "Drop files here",
 	"textFileTooLarge": "Text file too large (max 100MB)",
 	"unsupportedFileType": "Unsupported file type",
+	"draftAttachmentsRestoreFailedTitle": "Some attachments could not be restored",
+	"draftAttachmentsRestoreFailed": "{{count}} pending attachment(s) were lost and need to be attached again.",
 	"loadOlderMessages": "Load older messages",
 	"loadOlderCalls": "Load earlier tool calls",
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
-
 	"archiveNarrator": "Archive",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
@@ -616,6 +617,11 @@
 	"segmentCompactConfirm": "Compact {{count}} selected message(s)? The original messages will be hidden and replaced with a summary.",
 	"viewSubagentSession": "View session",
 	"openFullSubagentSession": "Open full session",
+	"injectionTarget": {
+		"openKnowledge": "Open knowledge entry",
+		"openSpecFile": "Open this spec file",
+		"openChapter": "Open chapter"
+	},
 	"subagentRecentCalls": "Recent calls",
 	"subagentWaitingPermission": "Waiting for permission ({{count}})",
 	"subagentWaitingPermissionTitle": "Waiting for permission",
@@ -810,6 +816,8 @@
 	"fileViewer.expandAll": "Expand all",
 	"fileViewer.collapseAll": "Collapse all",
 	"fileViewer.reload": "Reload",
+	"fileViewer.download": "Download",
+	"fileViewer.downloadFailed": "Download failed",
 	"fileViewer.parseFailed": "Could not parse as {{format}}; showing raw text.",
 	"fileViewer.truncated": "Showing the first {{chars}} characters — the file is longer.",
 	"fileViewer.nodesTruncated": "[Node tree truncated to keep the UI responsive.]",
@@ -904,6 +912,11 @@
 	"reviewVerdict_approve": "Approved",
 	"reviewVerdict_request_changes": "Changes Requested",
 	"reviewVerdict_comment_only": "Comments Only",
+	"reviewFeedbackRevisedBadge": "Revised",
+	"reviewFeedbackApply": "Handle",
+	"reviewFeedbackApplied": "Handled",
+	"reviewFeedbackApplyFailed": "Could not start a turn for the review conclusion",
+	"reviewFeedbackTruncated": "preview truncated",
 	"chromeNotInstalled": "Chrome/Chromium is not installed. Please install Chrome, or run: bunx puppeteer browsers install chrome",
 	"chromeFlatpakUnsupported": "Flatpak-installed Chrome cannot be used directly. Please install Chrome natively (deb/rpm), or run: bunx puppeteer browsers install chrome",
 	"details.title": "Session details",
@@ -1028,8 +1041,8 @@
 	"details.clearTrait": "Clear trait",
 	"details.customTraitsSaved": "Custom trait saved",
 	"details.customTraitsCleared": "Custom trait cleared",
+	"details.stats.title": "Statistics",
 	"details.stats.messages": "Messages",
-	"details.stats.cost": "Cost",
 	"details.stats.inputTokens": "Total input",
 	"details.stats.outputTokens": "Total output",
 	"details.stats.cacheReadTokens": "Cache reads",
@@ -1101,7 +1114,8 @@
 			"spec_blocked_continuation": "Blocked continuation",
 			"spec_goal_added": "Goal added",
 			"spec_fork_carryover": "Outline carried over",
-			"spec_context_cleared": "Context cleared"
+			"spec_context_cleared": "Context cleared",
+			"review_feedback": "Code review"
 		},
 		"cadence": {
 			"everyNTools": "every {{n}} tool calls"
@@ -1110,7 +1124,7 @@
 		"attachedCount": "{{count}} system injection(s) attached",
 		"body": {
 			"noticeSilentProgress": "{{count}} tool calls without a visible reply",
-			"noticeRelaxedPlan": "Still planning — do not implement yet",
+			"noticeRelaxedPlan": "Still planning — write the plan to {{planFile}}, do not implement yet",
 			"noticePipelineExit": "Pipeline still active — confirm it is still needed",
 			"tasksCurrent": "Dynamic Spec — {{n}} open task(s)",
 			"tasksEmptyNever": "Dynamic Spec — no tasks created yet",
@@ -1259,6 +1273,35 @@
 		"resultCount_other": "{{count}} results",
 		"role_user": "You",
 		"role_assistant": "Assistant",
-		"role_system": "System"
+		"role_system": "System",
+		"jumpUnavailable": "Expand this chapter's node on the canvas to jump to a message."
+	},
+	"access": {
+		"visibilityTitle": "Who can see this session",
+		"visibilityPrivate": "Only me",
+		"visibilityProject": "Project",
+		"visibilityPublic": "Everyone",
+		"visibilityHint": {
+			"private": "Only you and the people you share it with can open this session.",
+			"project": "Anyone working on this project can follow along.",
+			"public": "Any signed-in user can open this session."
+		},
+		"peopleTitle": "People with access",
+		"ownerLabel": "Owner: {{username}}",
+		"noOwner": "This session predates access control and has no owner, so only an administrator can change its sharing. Ask one to transfer it to you.",
+		"noGrants": "Not shared with anyone yet.",
+		"shareTitle": "Share with someone",
+		"searchUsers": "Search users",
+		"share": "Share",
+		"levelRead": "Can view",
+		"levelWrite": "Can work",
+		"revoke": "Remove access",
+		"revokeUser": "Remove access for {{username}}",
+		"roleForUser": "Access level for {{username}}",
+		"panelLabel": "Session access",
+		"noUsersFound": "No matching users.",
+		"readOnlyNotice": "Only the owner or an administrator can change sharing.",
+		"unavailable": "Sharing settings are unavailable for this session.",
+		"denied": "You no longer have access to this session."
 	}
 }

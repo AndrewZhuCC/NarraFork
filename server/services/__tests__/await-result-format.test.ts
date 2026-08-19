@@ -41,23 +41,42 @@ afterEach(() => {
 });
 
 const AGENT_ID = "-tLSXSnYCPV_Z9m6gyRgX";
+/** What the model actually sees: the readable alias, not the nanoid. */
+const AGENT_LABEL = "map-the-providers";
 const TASK_ID = "bg-task-123";
 
 describe("Await agent result wording", () => {
 	test("aborted wait makes clear the subagent is still running and can be awaited again", () => {
-		const text = formatAgentAwaitResult(AGENT_ID, "aborted", null);
+		const text = formatAgentAwaitResult(AGENT_LABEL, "aborted", null);
 		// Must not look like the subagent itself was killed.
 		expect(text).not.toMatch(/status: aborted/);
 		expect(text).not.toMatch(/\(no output\)/);
 		expect(text.toLowerCase()).toContain("still running");
 		expect(text.toLowerCase()).toContain("await again");
-		// Subagent id tag is preserved so the frontend can still resolve it.
-		expect(text).toContain(`<subagent_id>${AGENT_ID}</subagent_id>`);
+		// The tag carries the label: it is the selector the model is told to reuse.
+		expect(text).toContain(`<subagent_id>${AGENT_LABEL}</subagent_id>`);
+	});
+
+	// The whole point of the alias plumbing: a raw nanoid must never reach the
+	// model, because whatever it reads here is what it passes back to Await/Send.
+	test("no status prints the raw narrator id anywhere", () => {
+		for (const status of [
+			"aborted",
+			"timeout",
+			"running",
+			"timed_out",
+			"taken_over",
+			"completed",
+		]) {
+			const text = formatAgentAwaitResult(AGENT_LABEL, status, "some output");
+			expect(text).not.toContain(AGENT_ID);
+			expect(text).toContain(AGENT_LABEL);
+		}
 	});
 
 	test("timeout/running wait reminds the caller to await again rather than implying failure", () => {
 		for (const status of ["timeout", "running"]) {
-			const text = formatAgentAwaitResult(AGENT_ID, status, null);
+			const text = formatAgentAwaitResult(AGENT_LABEL, status, null);
 			expect(text.toLowerCase()).toContain("still running");
 			expect(text.toLowerCase()).toContain("await again");
 			expect(text).not.toMatch(/\(no output\)/);
@@ -65,12 +84,12 @@ describe("Await agent result wording", () => {
 	});
 
 	test("aborted wait surfaces real partial output but drops empty placeholders", () => {
-		const withPartial = formatAgentAwaitResult(AGENT_ID, "aborted", "halfway through the task");
+		const withPartial = formatAgentAwaitResult(AGENT_LABEL, "aborted", "halfway through the task");
 		expect(withPartial).toContain("Partial output so far:");
 		expect(withPartial).toContain("halfway through the task");
 
 		// Placeholder stand-ins must not be shown as if they were real output.
-		const withPlaceholder = formatAgentAwaitResult(AGENT_ID, "aborted", "Await aborted.");
+		const withPlaceholder = formatAgentAwaitResult(AGENT_LABEL, "aborted", "Await aborted.");
 		expect(withPlaceholder).not.toContain("Partial output so far:");
 	});
 
@@ -92,7 +111,7 @@ describe("Await agent result wording", () => {
 			],
 			Date.parse("2026-04-23T12:35:00.000Z"),
 		);
-		const text = formatAgentAwaitResult(AGENT_ID, "timeout", null, activity);
+		const text = formatAgentAwaitResult(AGENT_LABEL, "timeout", null, activity);
 
 		expect(text).toContain("Recent subagent activity (UTC):");
 		expect(text).toContain("2026-04-23T12:34:48.000Z (12s ago)");
@@ -121,16 +140,16 @@ describe("Await agent result wording", () => {
 	});
 
 	test("terminal statuses keep the explicit result wording", () => {
-		const completed = formatAgentAwaitResult(AGENT_ID, "completed", "done");
-		expect(completed).toContain(`Agent ${AGENT_ID} status: completed`);
+		const completed = formatAgentAwaitResult(AGENT_LABEL, "completed", "done");
+		expect(completed).toContain(`Agent ${AGENT_LABEL} status: completed`);
 		expect(completed).toContain("done");
 
-		const failed = formatAgentAwaitResult(AGENT_ID, "failed", "boom");
-		expect(failed).toContain(`Agent ${AGENT_ID} status: failed`);
+		const failed = formatAgentAwaitResult(AGENT_LABEL, "failed", "boom");
+		expect(failed).toContain(`Agent ${AGENT_LABEL} status: failed`);
 	});
 
 	test("execution timeout is terminal and does not suggest awaiting again", () => {
-		const text = formatAgentAwaitResult(AGENT_ID, "timed_out", "30 minute limit reached");
+		const text = formatAgentAwaitResult(AGENT_LABEL, "timed_out", "30 minute limit reached");
 		expect(text).toContain("execution time limit");
 		expect(text).toContain("was stopped");
 		expect(text).not.toContain("Await again");
@@ -624,6 +643,99 @@ describe("background agent task lifecycle", () => {
 
 	test("readOutputTail reports a missing task as null", async () => {
 		await expect(backgroundTaskService.readOutputTail("no-such-task")).resolves.toBeNull();
+	});
+
+	test("reaps stale running bash rows after an unclean restart", async () => {
+		// The leak this closes: recovery filtered `type = "agent"`, so a bash row stayed at
+		// `running` forever after an unclean exit. Its child process is gone, so no
+		// markCompleted can ever fire; `Await` would wait out its whole timeout on an
+		// event that cannot arrive; and `cleanupCompleted`'s `ne(status,"running")` refuses
+		// to reap it, so the row outlives the database's usefulness.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-restart");
+		const taskId = "bash-stale-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "orphan probe",
+		});
+
+		expect(await backgroundTaskService.recoverStaleTasksAfterRestart()).toBe(1);
+		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+			status: "cancelled",
+			type: "bash",
+		});
+	});
+
+	test("reaps a stale bash row even when the protection set names it", async () => {
+		// `narrator_tool_continuations` has no `background_bash` kind, so a background
+		// command has no resume path — nothing can re-adopt a dead child process. A bash id
+		// appearing in the protected set can therefore only be stale bookkeeping, and
+		// honouring it would reintroduce exactly the permanent `running` leak.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-protected");
+		const taskId = "bash-protected-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "protected probe",
+		});
+
+		expect(await backgroundTaskService.recoverStaleTasksAfterRestart(new Set([taskId]))).toBe(1);
+		await expect(backgroundTaskService.getById(taskId)).resolves.toMatchObject({
+			status: "cancelled",
+		});
+	});
+
+	test("a reaped bash row unblocks Await instead of stranding it", async () => {
+		// The property that matters to the model: reaching a terminal state is what lets a
+		// pending `Await` return. Before the fix the row stayed `running`, so this wait
+		// could only end by timing out.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-await");
+		const taskId = "bash-await-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "await probe",
+		});
+
+		const waiting = backgroundTaskService.waitForCompletion(taskId, 5_000);
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+		await expect(waiting).resolves.toMatchObject({ status: "cancelled" });
+	});
+
+	test("a reaped bash row satisfies the predicate cleanupCompleted reaps on", async () => {
+		// The second half of the leak: `cleanupCompleted` deletes only rows that are BOTH
+		// non-running and older than the retention cutoff, so a permanently-running row was
+		// also permanently un-reapable — the table grew without bound.
+		//
+		// This asserts the row's own reapability (terminal status + a completedAt to compare
+		// against) rather than calling `cleanupCompleted`, deliberately:
+		//   - that function is global, so invoking it here would delete OTHER tests' rows
+		//     from the shared database and make this suite order-dependent;
+		//   - its `completedAt < cutoff` is a STRICT comparison, so a just-reaped row is
+		//     never old enough at `olderThanMs: 0` — asserting through it would be a race on
+		//     clock resolution, not a statement about recovery.
+		const { parentNarratorId } = await seedAgentTaskEntities("bash-cleanup");
+		const taskId = "bash-cleanup-task";
+		await backgroundTaskService.createBashTask({
+			id: taskId,
+			parentNarratorId,
+			command: "sleep 100",
+			title: "cleanup probe",
+		});
+
+		// While running it fails the predicate on both counts — this is the leak.
+		const running = await backgroundTaskService.getById(taskId);
+		expect(running).toMatchObject({ status: "running", completedAt: null });
+
+		await backgroundTaskService.recoverStaleTasksAfterRestart();
+
+		const reaped = await backgroundTaskService.getById(taskId);
+		expect(reaped?.status).not.toBe("running");
+		// A timestamp to compare against, which a running row never had.
+		expect(typeof reaped?.completedAt).toBe("string");
 	});
 
 	test("recovers stale running Agent rows after an unclean restart", async () => {

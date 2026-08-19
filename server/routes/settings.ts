@@ -55,6 +55,7 @@ import {
 	codexTierOrderSchema,
 	commandBlacklistEntrySchema,
 	commandWhitelistEntrySchema,
+	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
@@ -225,6 +226,7 @@ const nugProviderSchema = z.object({
 	oauthCallbackUrl: z.string().optional(),
 	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
+	kiroAnthropicProtocol: z.boolean().optional(),
 });
 
 const clineProviderSchema = z.object({
@@ -480,6 +482,7 @@ export const updateSettingsSchema = z
 					.max(100)
 					.optional(),
 				modelContextWindows: z.record(z.string(), z.number().int().min(1)),
+				modelCards: z.array(modelCardSchema).max(500).optional(),
 				whitelistDirs: z.array(whitelistDirEntrySchema).max(50),
 				blacklistDirs: z.array(blacklistDirEntrySchema).max(50),
 				commandWhitelist: z.array(commandWhitelistEntrySchema).max(50),
@@ -703,6 +706,20 @@ export const updateSettingsSchema = z
 				defaultExpiryHours: z.number().int().min(1),
 				maxFileSizeMb: z.number().int().min(1),
 			})
+			.partial()
+			.optional(),
+		/*
+		 * Only the enrollment opt-in is patchable here. The rest of `devices` (transfer
+		 * concurrency, verify mode, transfers dir) has no UI and is left to the config
+		 * file rather than exposed speculatively.
+		 *
+		 * This one has to be reachable over the API because the UI names it in the
+		 * refusal it shows when automatic key delivery is unavailable — and this schema
+		 * is `.strict()`, so before being listed the whole PATCH was rejected, making
+		 * that instruction impossible to follow without hand-editing settings.json.
+		 */
+		devices: z
+			.object({ allowPlaintextEnrollmentOnPrivateNetwork: z.boolean() })
 			.partial()
 			.optional(),
 	})

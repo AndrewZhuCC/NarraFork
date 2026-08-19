@@ -291,6 +291,75 @@ describe("adaptSegment — user-role system notices", () => {
 		}
 	});
 
+	// Regression: `persistSegmentCompactMarker` writes the marker with role="user"
+	// (the model must see it in history), and the marker message carries NO text
+	// block at all. Routing it through the bubble branch painted an empty indigo
+	// user bubble instead of the teal one-line "segment compacted (N)" indicator —
+	// which is also what stripped the row of its summary-modal affordance, because
+	// `resolveVListCompactTarget` only recognizes a `system-simple` payload.
+	it("routes a role=user segment_compact marker to the compact indicator", () => {
+		for (const status of ["compacting", "compacted"]) {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: `sc-${status}`,
+						role: "user",
+						contentJson: [{ type: "segment_compact", status, messageCount: 12 }],
+					},
+				},
+				CTX,
+			);
+			expect(specs).toHaveLength(1);
+			expect(specs[0]!.kind).toBe("system-simple");
+			const data = specs[0]!.data as { kind: string; status: string };
+			expect(data.kind).toBe("segment_compact");
+			expect(data.status).toBe(status);
+		}
+	});
+
+	it("routes a role=user FAILED segment_compact marker to the error card", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "sc-failed",
+					role: "user",
+					contentJson: [{ type: "segment_compact", status: "failed", error: "oom" }],
+				},
+			},
+			CTX,
+		);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]!.kind).toBe("system-text");
+		const data = specs[0]!.data as { kind: string; text: string };
+		expect(data.kind).toBe("segment_compact_failed");
+		expect(data.text).toBe("oom");
+	});
+
+	// The allow-list must stay narrow: a role=user INJECTION row can carry a
+	// merge_summary / review_feedback card as an EXTRA block after its leading
+	// `system_injection` block (deliverInjection's `extraBlocks`). Those rows are
+	// owned by the injection, so a broader allow-list would hijack them.
+	it("does not hijack a role=user injection row that carries an extra card block", () => {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "inj",
+					role: "user",
+					contentJson: [
+						{ type: "text", text: "review concluded" },
+						{ type: "system_injection", source: "review" },
+						{ type: "review_feedback", text: "Review done" },
+					],
+				},
+			},
+			CTX,
+		);
+		expect((specs[0]!.data as { kind?: string }).kind).not.toBe("review_feedback");
+	});
+
 	it("still renders a normal bubble for a plain user message", () => {
 		const specs = adaptSegment(
 			{
@@ -673,13 +742,11 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		expect(compacting.status).toBe("compacting");
 	});
 
-	it("merge_summary: reserves avatar; review_feedback: gray", () => {
+	it("merge_summary: reserves avatar", () => {
 		const merge = sysData([{ type: "merge_summary", text: "Merged X into trunk" }]);
 		expect(merge.kind).toBe("merge_summary");
 		expect(merge.hasAvatar).toBe(true);
 		expect(merge.text).toBe("Merged X into trunk");
-		const review = sysData([{ type: "review_feedback", text: "Review done" }]);
-		expect(review.color).toBe("gray");
 	});
 
 	it("bash_command: carries the command as both body text and command field", () => {
@@ -848,7 +915,7 @@ describe("adaptSegment — tool run", () => {
 		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "subagent-card"]);
 	});
 
-	it("L3 folds completed tools into a tool-run-summary", () => {
+	it("L3 keeps every completed tool as its own full card", () => {
 		const seg: AdapterSegment = {
 			kind: "tool-run",
 			sourceMessages: [],
@@ -858,9 +925,9 @@ describe("adaptSegment — tool run", () => {
 			],
 		};
 		const specs = adaptSegment(seg, { lod: 3 });
-		expect(specs).toHaveLength(1);
-		expect(specs[0]!.kind).toBe("tool-run-summary");
-		expect((specs[0]!.data as { items: unknown[] }).items).toHaveLength(2);
+		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "tool-call"]);
+		// L3's compression is per-CARD (each collapses to its header), not a fold.
+		expect(specs.every((s) => s.opts?.collapsesByLod === true)).toBe(true);
 	});
 
 	it("L2 folds completed tools into a tool-run-count", () => {
@@ -909,9 +976,12 @@ describe("adaptSegment — tool run", () => {
 		expect(l2[1]!.key).toBe("tool-t-tasks");
 		expect(l2[1]!.opts?.forceExpanded).toBe(true);
 
-		// L3: same card escapes the summary fold.
+		// L3: no fold exists, so all three are cards — and only the pinned one carries
+		// `forceExpanded`, which the measure layer honours over the level's collapse.
 		const l3 = adaptSegment(seg, { lod: 3, ...pin });
-		expect(l3.map((s) => s.kind)).toEqual(["tool-run-summary", "tool-call", "tool-run-summary"]);
+		expect(l3.map((s) => s.kind)).toEqual(["tool-call", "tool-call", "tool-call"]);
+		expect(l3[1]!.opts?.forceExpanded).toBe(true);
+		expect(l3[0]!.opts?.forceExpanded).toBeUndefined();
 
 		// No resolver → everything folds exactly as before.
 		const unpinned = adaptSegment(seg, { lod: 2 });
@@ -919,7 +989,7 @@ describe("adaptSegment — tool run", () => {
 		expect(unpinned[0]!.kind).toBe("tool-run-count");
 	});
 
-	it("L4 keeps every card full but still flags the pinned card forceExpanded", () => {
+	it("L3 keeps every card full but still flags the pinned card forceExpanded", () => {
 		const seg: AdapterSegment = {
 			kind: "tool-run",
 			sourceMessages: [],
@@ -937,7 +1007,7 @@ describe("adaptSegment — tool run", () => {
 			],
 		};
 		const specs = adaptSegment(seg, {
-			lod: 4,
+			lod: 3,
 			resolveLatestSpecTasksToolUseId: () => "t-tasks",
 		});
 		expect(specs.map((s) => s.kind)).toEqual(["tool-call", "tool-call"]);
@@ -1167,7 +1237,7 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 			inputJson: { subagent_type: "plan", prompt: "line one\nline two\nline three" },
 		});
 		// Prompt-open path exercises the ContentViewer maxHeight cap.
-		const measured = measureSubagentCard({ ...data, promptOpen: true }, 400, 6, { opened: true });
+		const measured = measureSubagentCard({ ...data, promptOpen: true }, 400, 5, { opened: true });
 		expect(measured.height).toBeGreaterThan(0);
 		expect(measured.promptBlockHeight).toBeGreaterThan(0);
 		expect(Number.isFinite(measured.height)).toBe(true);
@@ -1457,6 +1527,8 @@ describe("folded tool rows — drill-down payload", () => {
 	type Row = {
 		canDrillDown?: boolean;
 		card?: { toolName?: string; detail?: unknown; summary?: string };
+		/** A reasoning-step row's revealable markdown (the other reveal channel). */
+		bodyText?: string;
 	};
 	const readTc = (id = "tu-1") => ({
 		toolName: "Read",
@@ -1613,28 +1685,53 @@ describe("folded tool rows — drill-down payload", () => {
 		expect(activityRows(first).map((row) => row.card != null)).toEqual([true, false]);
 	});
 
-	it("the L3 tool-run-summary fold drills down under its own spec key", async () => {
-		const { adaptSegment } = await import("./segment-adapter");
-		const seg: AdapterSegment = {
-			kind: "tool-run",
-			items: [
-				{ blockIndex: 0, isSubagent: false, msg: msgWith([]), tc: readTc("tu-1") },
-				{ blockIndex: 1, isSubagent: false, msg: msgWith([]), tc: readTc("tu-2") },
+	it("a folded reasoning row reveals its own step body, keyed by row", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const msg = {
+			id: "m-reason",
+			role: "assistant" as const,
+			contentJson: [
+				{
+					type: "reasoning",
+					text: ["**Check the cache**", "The key folds lod in.", ""].join("\n"),
+				},
 			],
-			sourceMessages: [msgWith([])],
 		};
-		const collapsed = adaptSegment(seg, { lod: 3 })[0]!;
-		expect(collapsed.kind).toBe("tool-run-summary");
-		expect(collapsed.key).toBe("toolrun-summary-tool-tu-1");
-		expect(activityRows(collapsed).map((row) => row.card != null)).toEqual([false, false]);
+		const items = [{ kind: "reasoning" as const, msg, blockIndex: 0, block: msg.contentJson[0] }];
+		const collapsed = adaptActivityUnit(items, "act-1", { lod: 2 });
+		const collapsedRows = activityRows(collapsed);
+		expect(collapsedRows).toHaveLength(1);
+		expect(collapsedRows[0]?.bodyText).toBe("The key folds lod in.");
+		expect((collapsed.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([]);
 
-		const expanded = adaptSegment(seg, {
-			lod: 3,
-			...openRows("toolrun-summary-tool-tu-1", "tool-tu-1"),
-		})[0]!;
-		expect(activityRows(expanded).map((row) => row.card != null)).toEqual([true, false]);
-		// The reported indices are derived from those same rows.
+		// The reader's intent is stored against the ROW KEY, not its index — a live run
+		// inserts steps above existing rows (see AdapterContext.isRowExpanded).
+		const expanded = adaptActivityUnit(items, "act-1", {
+			lod: 2,
+			...openRows("act-1", "r-m-reason-0-step-0"),
+		});
 		expect((expanded.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([0]);
+	});
+
+	it("a LIVE reasoning row carries no body, so it cannot be expanded", async () => {
+		// Emitting whole bodies per delta would rebuild a string the size of the reply
+		// every frame; the row gains its chevron the moment the turn persists.
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const msg = {
+			id: "__streaming__",
+			role: "assistant" as const,
+			contentJson: [
+				{ type: "reasoning", text: ["**Check the cache**", "The key folds lod in."].join("\n") },
+			],
+		};
+		const live = adaptActivityUnit(
+			[{ kind: "reasoning", msg, blockIndex: 0, block: msg.contentJson[0] }],
+			"act-live",
+			{ lod: 2, ...openRows("act-live", "r-__streaming__-0-step-0") },
+		);
+		const rows = activityRows(live);
+		expect(rows[0]?.bodyText).toBeUndefined();
+		expect((live.opts as { expandedIndices?: number[] }).expandedIndices).toEqual([]);
 	});
 
 	it("the drilled-in card matches the standalone card the same tool produces", async () => {
@@ -1661,7 +1758,9 @@ describe("folded tool rows — drill-down payload", () => {
 });
 
 describe("LOD matrix adapter semantics", () => {
-	it("routes structured reasoning to titles-only steps at L3/L4 and full steps at L5/L6", () => {
+	it("renders structured reasoning as the SAME expandable step trace at L3/L4/L5", () => {
+		// There is no level whose step titles are visible but unopenable (the former
+		// `titlesOnly`), so the element and its opts are level-independent here.
 		const seg: AdapterSegment = {
 			kind: "message",
 			msg: {
@@ -1672,16 +1771,13 @@ describe("LOD matrix adapter semantics", () => {
 				],
 			},
 		};
-		for (const lod of [3, 4] as const) {
+		for (const lod of [3, 4, 5] as const) {
 			const spec = adaptSegment(seg, { lod })[0]!;
 			expect(spec.kind).toBe("reasoning-steps");
-			expect((spec.opts as { titlesOnly: boolean }).titlesOnly).toBe(true);
-		}
-		for (const lod of [5, 6] as const) {
-			const spec = adaptSegment(seg, { lod })[0]!;
-			expect(spec.kind).toBe("reasoning-steps");
-			expect((spec.opts as { titlesOnly: boolean }).titlesOnly).toBe(false);
-			expect((spec.data as { steps: unknown[] }).steps).toHaveLength(2);
+			expect(spec.opts).not.toHaveProperty("titlesOnly");
+			expect((spec.data as { steps: { body: string | null }[] }).steps).toHaveLength(2);
+			// The step that has real content keeps its body, whatever the level.
+			expect((spec.data as { steps: { body: string | null }[] }).steps[1]?.body).toBe("body");
 		}
 	});
 
@@ -1779,11 +1875,13 @@ describe("LOD matrix adapter semantics", () => {
 				{ blockIndex: 2, isSubagent: false, tc: { toolName: "Grep", status: "success" } },
 			],
 		};
-		const specs = adaptSegment(seg, { lod: 3 });
+		// The live card stays at its own position between the two completed batches
+		// rather than being hoisted above the calls that preceded it.
+		const specs = adaptSegment(seg, { lod: 2 });
 		expect(specs.map((spec) => spec.kind)).toEqual([
-			"tool-run-summary",
+			"tool-run-count",
 			"tool-call",
-			"tool-run-summary",
+			"tool-run-count",
 		]);
 	});
 });
@@ -2530,5 +2628,342 @@ describe("adaptSegment — per-turn usage rows", () => {
 		);
 		expect(short.height).toBe(long.height);
 		expect(short.height).toBeGreaterThan(0);
+	});
+});
+
+/**
+ * Reasoning's cross-LOD identity — the L2/L3 boundary's missing half.
+ *
+ * A tool call has always carried `tool-<toolUseId>` at both levels, so tool cards
+ * morphed while reasoning teleported. The reason was structural rather than an
+ * oversight: a folded row keys on `stableKeyBase` (the run's ordinal WITHIN ITS ACTIVITY
+ * UNIT), and L3+ has no activity unit, so that ordinal is not merely different there —
+ * it is uncomputable. Measured on a 16-message document, this left 8 of 40 identities
+ * unpaired at L2→L3 and reasoning rows at 0/16.
+ *
+ * The fix is a third identity both sides CAN derive independently: message id + the
+ * run's first block index + the step's ordinal.
+ */
+describe("reasoning steps: one identity across the L2/L3 boundary", () => {
+	/** A persisted assistant turn whose single reasoning block holds two titled steps. */
+	const twoStepMessage = (id = "real-msg", blocks?: unknown[]) =>
+		({
+			id,
+			role: "assistant",
+			contentJson: blocks ?? [
+				{ type: "reasoning", text: "**第一步**\n\n分析正文。\n\n**第二步**\n\n继续分析。" },
+			],
+			toolCalls: [],
+			children: [],
+		}) as never;
+
+	/** Step identities as they reach the DOM (`data-nf-unit`) at one level. */
+	const stepUnitIdsAt = async (lod: number, message = twoStepMessage()) => {
+		const { segmentMessages } = await import("../message-segments");
+		const { groupRenderUnits } = await import("../render-units");
+		const { adaptRenderUnits } = await import("./segment-adapter");
+		// `enabled` mirrors the shell: the activity fold exists only at L1/L2.
+		const units = groupRenderUnits(segmentMessages([message] as never), lod <= 2);
+		const specs = adaptRenderUnits(units as never, { lod: lod as never });
+		const out: string[] = [];
+		for (const spec of specs) {
+			const data = spec.data as {
+				items?: { unitId?: string }[];
+				steps?: { unitId?: string }[];
+			};
+			for (const row of data.items ?? data.steps ?? []) {
+				if (row.unitId) out.push(row.unitId);
+			}
+		}
+		return out;
+	};
+
+	it("gives a folded row and its L3+ step row the SAME unitId", async () => {
+		const folded = await stepUnitIdsAt(2);
+		const expanded = await stepUnitIdsAt(3);
+		// Derived from facts both levels hold: message, run start block, step ordinal.
+		expect(folded).toEqual(["reason-real-msg-b0-s0", "reason-real-msg-b0-s1"]);
+		expect(expanded).toEqual(folded);
+	});
+
+	/**
+	 * A streaming message's id is the synthetic `__streaming__` and becomes a real one at
+	 * the hand-off, so an id-derived identity would pair a live row against nothing and
+	 * then change under it. Both sides must therefore withhold it — and withholding on
+	 * only ONE side is the dangerous shape, since the rows would silently stop pairing.
+	 */
+	it("withholds the cross-level identity while the turn is streaming", async () => {
+		const streaming = twoStepMessage("__streaming__");
+		const folded = await stepUnitIdsAt(2, streaming);
+		const expanded = await stepUnitIdsAt(3, streaming);
+		// L1/L2 still needs a per-row value (it is painted), just not a pairable one.
+		expect(folded.every((id) => !id.startsWith("reason-__streaming__-b"))).toBe(true);
+		// L3+ emits none at all rather than one that cannot be honoured.
+		expect(expanded).toEqual([]);
+	});
+
+	/**
+	 * The two levels GROUP reasoning differently: the activity fold pushes blocks one by
+	 * one and parses each alone, while L3+ joins a run's adjacent blocks and parses the
+	 * concatenation. So for a multi-block run `s2` on one side need not be the same step
+	 * as `s2` on the other, and pairing them would morph one step into an unrelated one —
+	 * worse than not morphing, because it looks intentional.
+	 */
+	it("withholds it for a multi-block run, where the two parses can disagree", async () => {
+		const multiBlock = twoStepMessage("real-msg", [
+			{ type: "reasoning", text: "**第一步**\n\n分析正文。" },
+			{ type: "reasoning", text: "**第二步**\n\n继续分析。" },
+		]);
+		const expanded = await stepUnitIdsAt(3, multiBlock);
+		expect(expanded).toEqual([]);
+		const folded = await stepUnitIdsAt(2, multiBlock);
+		expect(folded.every((id) => !/^reason-real-msg-b\d+-s\d+$/.test(id))).toBe(true);
+	});
+
+	it("keeps the identity height-neutral at both levels", async () => {
+		const { measureActivityTrace, measureReasoningStepsTrace } = await import(
+			"./measure/measure-tool-run"
+		);
+		const steps = [
+			{ title: "第一步", body: "分析正文。", key: "seg0" },
+			{ title: "第二步", body: "继续分析。", key: "seg1" },
+		];
+		const withIds = measureReasoningStepsTrace(
+			steps.map((s, i) => ({ ...s, unitId: `reason-real-msg-b0-s${i}` })),
+			600,
+		);
+		const without = measureReasoningStepsTrace(steps, 600);
+		expect(withIds.height).toBe(without.height);
+		expect(withIds.rows.map((r) => r.unitId)).toEqual([
+			"reason-real-msg-b0-s0",
+			"reason-real-msg-b0-s1",
+		]);
+		// And the value survives the measure layer, or it never reaches `data-nf-unit`.
+		expect(without.rows[0]?.unitId).toBeUndefined();
+		const activityRows = [{ title: "第一步", bodyText: "分析正文。", key: "r-run0-0-step-0" }];
+		const activityWith = measureActivityTrace(
+			activityRows.map((r) => ({ ...r, unitId: "reason-real-msg-b0-s0" })),
+			600,
+		);
+		expect(activityWith.height).toBe(measureActivityTrace(activityRows, 600).height);
+	});
+
+	/**
+	 * The measure cache keys on painted content, and `unitId` is painted but
+	 * height-neutral — so it can move while `key` and every height-bearing field stay
+	 * put. That happens on the streaming hand-off: the run gains a pairable identity the
+	 * instant its turn persists. Without it in the revision, a cached entry serves rows
+	 * with no `data-nf-unit` and the morph silently stops working.
+	 */
+	it("keys the measure cache on the identity", async () => {
+		const { buildCacheKey, extractDataRevision } = await import("./measure-cache");
+		const base = {
+			steps: [{ title: "第一步", body: "分析正文。", key: "seg0" }],
+			headerLabel: "推理",
+			headerCount: "1 步",
+		};
+		const withId = {
+			...base,
+			steps: [{ ...base.steps[0], unitId: "reason-real-msg-b0-s0" }],
+		};
+		// The revision is what distinguishes two payloads under one spec.key…
+		expect(extractDataRevision(withId)).not.toBe(extractDataRevision(base));
+		// …and it must reach the key the cache is actually addressed by.
+		const keyOf = (data: unknown) =>
+			buildCacheKey("m1-b0", "reasoning-steps", 600, 3, undefined, extractDataRevision(data));
+		expect(keyOf(withId)).not.toBe(keyOf(base));
+	});
+});
+
+/**
+ * A concluded review reaches its own element.
+ *
+ * The card went through three shapes before this one, and each failed on the same
+ * property — a review conclusion is a MARKDOWN DOCUMENT with an action:
+ *
+ *   1. `system-simple`: one clamped line, so the findings could not fit (and since the
+ *      producer wrote no display text, nothing was shown at all).
+ *   2. `system-text` nested in an `injection-bubble`: a card inside a bubble, a badge lane
+ *      reserved at a guessed width the real badges did not fill, a body painted line by
+ *      line as PLAIN text (no markdown, no highlighting), and no scroll box.
+ *   3. `review-card` — its own element: a constant header row over a maxHeight-capped
+ *      scroll box holding a real markdown body.
+ *
+ * So these cases pin the routing and the payload, not a nesting arrangement.
+ */
+describe("adaptSegment — a concluded review", () => {
+	const CTX: AdapterContext = { lod: 5 };
+
+	/** The row production writes: role=user (a request) with origin=system (a reviewer). */
+	const conclusionRow = (
+		blocks: Array<{ type: string; [key: string]: unknown }>,
+		ctx: AdapterContext = CTX,
+	) =>
+		adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "rf",
+					role: "user",
+					origin: "system",
+					originLabel: "review",
+					contentJson: blocks,
+				},
+			},
+			ctx,
+		);
+
+	const cardData = (
+		block: Record<string, unknown>,
+		ctx: AdapterContext = CTX,
+		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
+	): any => {
+		const specs = conclusionRow(
+			[
+				{ type: "text", text: "model-facing copy" },
+				{ type: "review_feedback", ...block },
+			],
+			ctx,
+		);
+		return specs[0]?.data;
+	};
+
+	it("routes to `review-card`, not to the origin notice that would claim a system row", () => {
+		const specs = conclusionRow([
+			{ type: "text", text: "## Code Review: Approved\n" },
+			{ type: "review_feedback", verdict: "approve", findings: [], text: "Approved" },
+		]);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("review-card");
+	});
+
+	it("is not framed in a speaker bubble — no card-in-a-card", () => {
+		const specs = conclusionRow([
+			{ type: "review_feedback", verdict: "approve", findings: [], text: "Approved" },
+		]);
+		expect(specs[0]?.kind).not.toBe("injection-bubble");
+		expect(specs[0]?.kind).not.toBe("system-text");
+	});
+
+	it("does not hijack an injection row that merely carries a review block", () => {
+		// `deliverInjection`'s `extraBlocks` can append one to a row whose leading
+		// `system_injection` block owns it.
+		const specs = conclusionRow([
+			{ type: "text", text: "review concluded" },
+			{ type: "system_injection", source: "review" },
+			{ type: "review_feedback", verdict: "approve", findings: [] },
+		]);
+		expect(specs[0]?.kind).not.toBe("review-card");
+	});
+
+	it("carries the producer's markdown as the body, with verdict + action chrome", () => {
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [{ severity: "critical", message: "the index has no migration" }],
+			text: "## Code Review: Changes Requested\n\n- the index has no migration\n",
+		});
+		// The body stays MARKDOWN: the card measures it with the markdown pipeline, so the
+		// heading and the list survive instead of being flattened.
+		expect(data.text).toContain("## Code Review");
+		expect(data.text).toContain("- the index has no migration");
+		expect(data.verdictLabel).toBe("Changes Requested");
+		expect(data.color).toBe("orange");
+		// Always present, so the reserved action row is never empty.
+		expect(data.actionLabel).toBe("Handle");
+		expect(data.applied).toBe(false);
+	});
+
+	it("composes a body from verdict + findings for rows written without text", () => {
+		// The rows already in the database carry only `verdict` and `findings`. Without this
+		// synthesis every historical review keeps rendering as a bare label — the reported
+		// "shows nothing" bug, surviving on old data.
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [
+				{ severity: "critical", file: "server/db/schema.ts", line: 2606, message: "no migration" },
+				{ severity: "minor", message: "cached statement outlives the module" },
+			],
+		});
+		expect(data.text).toContain("Changes Requested");
+		expect(data.text).toContain("server/db/schema.ts:2606");
+		expect(data.text).toContain("no migration");
+		expect(data.text).toContain("cached statement outlives the module");
+		// And it is MARKDOWN, because the card renders its body through the markdown
+		// pipeline: bare `\n`-joined lines fold into one paragraph, which is how a
+		// historical conclusion came out as a single run-on blob.
+		expect(data.text).toContain("## ");
+		expect(data.text).toContain("\n\n");
+		expect(data.text).toContain("- **[critical]**");
+		// The file path is inline code, so it stands out from the prose around it.
+		expect(data.text).toContain("`server/db/schema.ts:2606`");
+	});
+
+	it("a composed body keeps one list item per finding", () => {
+		const data = cardData({
+			verdict: "request_changes",
+			findings: [
+				{ severity: "major", message: "first" },
+				{ severity: "minor", message: "second" },
+				{ severity: "suggestion", message: "third" },
+			],
+		});
+		const items = (data.text as string).split("\n").filter((l: string) => l.startsWith("- "));
+		expect(items).toHaveLength(3);
+	});
+
+	it("an approved review with no findings still says something", () => {
+		const data = cardData({ verdict: "approve", findings: [] });
+		expect(data.text).toBe("Approved");
+		expect(data.color).toBe("green");
+	});
+
+	it("marks a revision and flips the action once a turn has been started", () => {
+		const data = cardData({
+			verdict: "approve",
+			findings: [],
+			text: "## Code Review (revised): Approved\n",
+			revised: true,
+			applied: true,
+		});
+		expect(data.revisedLabel).toBe("Revised");
+		expect(data.applied).toBe(true);
+		expect(data.actionLabel).toBe("Handled");
+	});
+
+	it("uses the injected localized labels", () => {
+		const data = cardData(
+			{ verdict: "approve", findings: [] },
+			{ lod: 5, labels: { reviewVerdict_approve: "已通过", reviewFeedbackApply: "处理" } },
+		);
+		expect(data.text).toBe("已通过");
+		expect(data.verdictLabel).toBe("已通过");
+		expect(data.actionLabel).toBe("处理");
+	});
+
+	it("measures through the registry: the markdown body drives the height", () => {
+		const short = cardData({ verdict: "approve", findings: [], text: "Approved" });
+		const long = cardData({
+			verdict: "request_changes",
+			findings: [],
+			text: Array.from({ length: 12 }, (_, i) => `- finding number ${i} with real prose`).join(
+				"\n",
+			),
+		});
+		const measure = (d: unknown) =>
+			VLIST_REGISTRY["review-card"].measure(d as never, 800, 5).height;
+		expect(measure(short)).toBeGreaterThan(0);
+		expect(measure(long)).toBeGreaterThan(measure(short));
+	});
+
+	it("a very long conclusion is capped, because the body scrolls", () => {
+		// The property no earlier shape had: an unbounded conclusion must not grow the row
+		// without limit — the box is `overflow: auto` and the reader scrolls it.
+		const huge = cardData({
+			verdict: "request_changes",
+			findings: [],
+			text: Array.from({ length: 400 }, (_, i) => `- finding ${i}`).join("\n"),
+		});
+		const height = VLIST_REGISTRY["review-card"].measure(huge as never, 800, 5).height;
+		expect(height).toBeLessThan(600);
 	});
 });

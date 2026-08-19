@@ -129,8 +129,22 @@ export interface KiroChatRequest {
 		agentContinuationId?: string;
 		agentTaskType?: string;
 		workspaceId?: string;
-		envState?: Record<string, unknown>;
-		shellState?: Record<string, unknown>;
+		/**
+		 * Telemetry only; nothing branches on it. Typed structurally rather than as a loose
+		 * record so this request stays assignable to the server-side `KiroChatRequest`, whose
+		 * `KiroEnvState` requires both fields. `buildKiroRequest` always populates both, so the
+		 * looser type described a shape that never occurred while making the two declarations
+		 * incompatible at every boundary that passes a request from here to there.
+		 */
+		envState?: {
+			operatingSystem: "LINUX" | "MAC" | "WINDOWS";
+			currentWorkingDirectory: string;
+			environmentVariables?: Array<{ key: string; value: string }>;
+			timezoneOffset?: string;
+		};
+		/** Telemetry only, and always populated by `buildKiroRequest`. Typed for the same
+		 * reason as `envState` above: the server-side `KiroShellState` requires `shellName`. */
+		shellState?: { shellName: string };
 	};
 	profileArn?: string;
 }

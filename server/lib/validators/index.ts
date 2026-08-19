@@ -31,9 +31,20 @@ export {
 	mergeChapterSchema,
 	mergeCheckSchema,
 	splitChapterSchema,
+	updateChapterDetachedPanelsSchema,
+	updateChapterDockLayoutSchema,
 	updateChapterSchema,
 	updateGraphPositionsSchema,
 } from "./chapters";
+export {
+	chatDirectoryQuerySchema,
+	chatMessagesQuerySchema,
+	createDmRoomSchema,
+	markChatReadSchema,
+	materializeChatAttachmentsSchema,
+	postChatMessageSchema,
+	summarizeChatSchema,
+} from "./chat";
 export {
 	blacklistDirEntrySchema,
 	commandBlacklistEntrySchema,
@@ -54,11 +65,15 @@ export {
 	updateVolumeSnapshotSchema,
 } from "./containers";
 export {
+	buildPathRulesConfigSnippet,
 	createRemoteDeviceSchema,
 	deviceBrowseQuerySchema,
+	deviceInstallScriptSchema,
 	deviceSlugSchema,
 	deviceStatQuerySchema,
 	deviceTransferSchema,
+	executorPathRuleSchema,
+	updateDevicePathRulesSchema,
 	updateRemoteDeviceSchema,
 } from "./devices";
 export {
@@ -70,6 +85,7 @@ export {
 	gitDiffQuerySchema,
 	gitDiscardSchema,
 	gitLogQuerySchema,
+	gitModificationsQuerySchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
@@ -141,7 +157,11 @@ export {
 	forkNarratorSchema,
 	migrateBrokenModelNarratorsSchema,
 	narratorExportQuerySchema,
+	narratorGrantCreateSchema,
+	narratorGrantUpdateSchema,
 	narratorHandleSchema,
+	narratorTransferOwnerSchema,
+	narratorVisibilitySchema,
 	permissionDecisionSchema,
 	reorderBufferSchema,
 	retryFailedCompactSchema,
@@ -167,6 +187,9 @@ export {
 export {
 	createProjectSchema,
 	projectChapterSettingsSchema,
+	projectMembersSchema,
+	projectTransferOwnerSchema,
+	projectVisibilitySchema,
 	updateProjectSchema,
 } from "./projects";
 export {
@@ -185,6 +208,7 @@ export {
 	batchUpsertRecentTabsSchema,
 	clearRecentTabsSchema,
 	createFavoriteDirectorySchema,
+	modelCardSchema,
 	moveRecentTabSchema,
 	pinRecentTabSchema,
 	recentTabSchema,
@@ -199,11 +223,7 @@ export {
 } from "./settings";
 export { createProjectSkillSchema, updateProjectSkillSchema } from "./skills";
 export { specFileQuerySchema, updateSpecFileSchema } from "./spec";
-export {
-	createTerminalSchema,
-	updateTerminalGraphStateSchema,
-	updateTerminalViewStateSchema,
-} from "./terminals";
+export { createTerminalSchema, updateTerminalViewStateSchema } from "./terminals";
 export { narratorWsMessageSchema, terminalWsMessageSchema } from "./websocket";
 
 export { createWorkspaceSchema, importProjectSchema, updateWorkspaceSchema } from "./workspaces";

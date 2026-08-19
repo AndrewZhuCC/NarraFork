@@ -1,4 +1,12 @@
+import type { ExecutorPathRule } from "@shared/executor-path-rules";
+import type {
+	ExecutorManifest,
+	ExecutorPlatform,
+	ExecutorPlatformInfo,
+} from "@shared/remote-executor";
 import { request } from "./client";
+
+export type { ExecutorPathRule };
 
 export interface RemoteDevice {
 	id: string;
@@ -16,11 +24,30 @@ export interface RemoteDevice {
 	defaultCwd: string | null;
 	agentVersion: string | null;
 	capabilities: Record<string, unknown> | null;
+	/** Ordered path guard rules recorded here (desired state). */
+	pathRules: ExecutorPathRule[] | null;
+	/** Ordered rules the device reported enforcing at its last handshake. */
+	reportedPathRules: ExecutorPathRule[] | null;
 	scope: "global" | "project";
 	projectId: string | null;
+	/**
+	 * Set when the key was collected by the one-line installer rather than pasted by
+	 * hand. Attribution only; never used to authorize anything.
+	 */
+	enrolledAt: string | null;
+	enrolledFromIp: string | null;
+	enrolledUserAgent: string | null;
 	createdAt: string;
 	updatedAt: string;
 	revokedAt: string | null;
+}
+
+export interface DevicePathRulesResponse {
+	rules: ExecutorPathRule[];
+	/** Null until the device has completed a handshake that reports its rules. */
+	reportedRules: ExecutorPathRule[] | null;
+	/** Ready-to-paste `pathRules` fragment for the device's config file. */
+	configSnippet: string;
 }
 
 export interface CreateDeviceInput {
@@ -135,9 +162,62 @@ export interface UpdateDeviceInput {
 	projectId?: string | null;
 }
 
+export interface ExecutorManifestResponse {
+	/** Null when no executor release has been published or the server is offline. */
+	manifest: ExecutorManifest | null;
+	/** Device RPC protocol version this server speaks. */
+	expectedProtocolVersion: number;
+	platforms: ExecutorPlatformInfo[];
+}
+
+/** How the device key reaches the target machine. See `deviceInstallScriptSchema`. */
+export type ExecutorTokenDelivery = "enroll" | "prompt";
+
+export interface InstallScriptInput {
+	platform: ExecutorPlatform;
+	mode: "system" | "user";
+	disableShell?: boolean;
+	/**
+	 * Absolute base URL the TARGET machine will use to reach NarraFork.
+	 *
+	 * Should normally be sent: the server can only fall back to the forwarded
+	 * request origin, which is right for a standard reverse proxy but wrong whenever
+	 * the target machine reaches this server by another name.
+	 */
+	serverBaseUrl?: string;
+	/** Defaults to "enroll" server-side (one-line install). */
+	tokenDelivery?: ExecutorTokenDelivery;
+}
+
+export interface InstallScriptResult {
+	script: string;
+	filename: string;
+	shell: "sh" | "powershell";
+	/** Public URL serving the script body; what the one-liner fetches. */
+	scriptUrl: string;
+	/** The single command to paste on the target machine. */
+	oneLiner: string;
+	tokenDelivery: ExecutorTokenDelivery;
+	executorVersion: string;
+	platform: ExecutorPlatform;
+	/** The embedded enrollment ticket stops working after this time. */
+	expiresAt: string;
+}
+
 export const devicesApi = {
 	listDevices: () => request<RemoteDevice[]>("/devices"),
 	getDevice: (id: string) => request<RemoteDevice>(`/devices/${id}`),
+	getDevicePathRules: (id: string) =>
+		request<DevicePathRulesResponse>(`/devices/${encodeURIComponent(id)}/path-rules`),
+	/**
+	 * Records desired rules. Does not change what the device enforces: the operator
+	 * must still apply the returned snippet on the machine and restart the service.
+	 */
+	updateDevicePathRules: (id: string, rules: ExecutorPathRule[]) =>
+		request<DevicePathRulesResponse>(`/devices/${encodeURIComponent(id)}/path-rules`, {
+			method: "PUT",
+			body: JSON.stringify({ rules }),
+		}),
 	statDevicePath: (id: string, path: string, recursive = false) => {
 		const params = new URLSearchParams({ path, recursive: String(recursive) });
 		return request<RemoteStatResult>(`/devices/${id}/fs?${params}`);
@@ -209,4 +289,13 @@ export const devicesApi = {
 		request<DeviceConnectionDiagnostics>(`/devices/${id}/diagnostics`),
 	testDevice: (id: string) =>
 		request<TestConnectionResult>(`/devices/${id}/test`, { method: "POST" }),
+	getExecutorManifest: (opts?: { refresh?: boolean }) =>
+		request<ExecutorManifestResponse>(
+			`/devices/executor/manifest${opts?.refresh ? "?refresh=1" : ""}`,
+		),
+	createInstallScript: (id: string, data: InstallScriptInput) =>
+		request<InstallScriptResult>(`/devices/${id}/install-script`, {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
 };

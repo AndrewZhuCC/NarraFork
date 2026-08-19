@@ -283,6 +283,23 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 	  }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	/**
+	 * A running `Await({type:"agent"})` has resolved which child narrator it is
+	 * waiting on, so its card can offer "open session" DURING the wait.
+	 *
+	 * Needed as its own frame because the id is otherwise unknowable until the tool
+	 * returns: an in-flight call has no `outputJson`, hence no `metadata.subagentId`
+	 * and no `<subagent_id>` tag. Reloads get the same fact from the message loader
+	 * (`AWAIT_AGENT_RESOLVED_FIELD`); this frame is what spares an already-open page
+	 * from needing one.
+	 */
+	| {
+			type: "await_agent_resolved";
+			narratorId: string;
+			toolUseId: string;
+			subagentNarratorId: string;
+			parentToolUseId?: string;
+	  }
 	| {
 			type: "tool_output";
 			narratorId: string;
@@ -828,6 +845,36 @@ export type NarratorServerMessage =
 			durationMs?: number;
 	  }
 	| { type: "sync_ok"; narratorId: string; version: number }
+	/**
+	 * A subscribe request was refused because the connection's user may not read
+	 * that narrator (or it does not exist — deliberately indistinguishable, matching
+	 * the 404-on-denial rule of the HTTP surface).
+	 *
+	 * Sent so the client stops waiting: without it a denied subscription looks
+	 * exactly like a narrator that has simply produced no events yet, and the UI
+	 * would sit on a loading spinner forever.
+	 */
+	| { type: "subscribe_denied"; narratorId: string; requestId?: string }
+	/**
+	 * Project membership or visibility changed; the client should re-read its own
+	 * access. Carries no membership detail, so a recipient cannot learn who else is in
+	 * the project from the notification alone.
+	 */
+	| {
+			type: "project_access_changed";
+			projectId: string;
+			reason: "visibility_changed" | "members_changed" | "owner_changed";
+	  }
+	/**
+	 * Sharing settings for a narrator changed and the client should re-read its own
+	 * access. Deliberately carries no grant detail: a recipient must not learn who
+	 * else a narrator is shared with, only that their own answer may have moved.
+	 */
+	| {
+			type: "narrator_access_changed";
+			narratorId: string;
+			reason: "visibility_changed" | "shared" | "unshared" | "grant_changed" | "owner_changed";
+	  }
 	| {
 			type: "team_message";
 			narratorId: string;
@@ -898,4 +945,67 @@ export type NarratorServerMessage =
 			entryId?: string | null;
 			/** Set for collection-scoped reasons (collection owner transfer). */
 			collectionId?: string | null;
-	  };
+	  }
+	/**
+	 * A person posted in a chat room this connection subscribed to.
+	 *
+	 * Unlike the knowledge signals this DOES carry the body: chat is what the
+	 * reader is looking at, and a refetch-per-message round trip would make a live
+	 * conversation feel like polling. It is safe to carry because the room was
+	 * authorized once at subscribe time (`assertCanRead`) and the body is bounded
+	 * by `CHAT_MESSAGE_MAX_CHARS`.
+	 */
+	| {
+			type: "chat:message";
+			roomId: string;
+			message: {
+				id: string;
+				roomId: string;
+				seq: number;
+				kind: "text" | "system";
+				contentText: string;
+				replyToMessageId: string | null;
+				/**
+				 * The reply snapshot and attachment metadata travel WITH the frame.
+				 *
+				 * Omitting them would make a live-arriving reply render an empty quote
+				 * strip (and an attachment-only message render as blank) until something
+				 * else triggered a refetch — a defect visible only on the live path,
+				 * which is the path most messages take.
+				 */
+				replyToSeq: number | null;
+				replyToSender: {
+					id: string;
+					username: string;
+					avatarColor: string | null;
+					avatarImageId: string | null;
+				} | null;
+				replyToPreview: string | null;
+				attachments: Array<{
+					id: string;
+					kind: "image" | "file";
+					filename: string;
+					mediaType: string;
+					sizeBytes: number;
+					width: number | null;
+					height: number | null;
+				}>;
+				editedAt: string | null;
+				deletedAt: string | null;
+				createdAt: string;
+				sender: {
+					id: string;
+					username: string;
+					avatarColor: string | null;
+					avatarImageId: string | null;
+				} | null;
+			};
+	  }
+	| { type: "chat:message_deleted"; roomId: string; messageId: string }
+	/** Another member advanced their read watermark (read receipt). */
+	| { type: "chat:read"; roomId: string; userId: string; lastReadSeq: number }
+	/**
+	 * Per-user badge refresh for a room this user is NOT currently viewing.
+	 * Id + count only; the client refetches the summary if it needs more.
+	 */
+	| { type: "chat:unread_changed"; roomId: string; unread: number };

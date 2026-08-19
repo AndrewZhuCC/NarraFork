@@ -13,6 +13,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { coerceInjectionTarget } from "@shared/pretext-layout/injection-target";
 import type {
 	SideCarBody,
 	SideCarDoneTask,
@@ -29,11 +30,19 @@ beforeAll(() => {
 
 const CTX: AdapterContext = { lod: 5 };
 
-/** Model-facing copy, complete with the boilerplate a reader must NOT be shown. */
+/**
+ * Model-facing copy, complete with the instruction line a reader must NOT be shown.
+ *
+ * Mirrors what `renderSideCarBodyToText` emits for a `current` digest — heading, task
+ * lines, one update line. The digest is injected on a mid-turn cadence, so it no longer
+ * carries the tasks.json field rules or the blocked-task rule; those stay in the system
+ * prompt. `Update spec://tasks.json` is therefore the phrase whose absence proves the
+ * adapter projected the BODY rather than reading this text block.
+ */
 const MODEL_TEXT = [
-	"Current Dynamic Spec reminder (compiled from spec://tasks.json):",
+	"Dynamic Spec — open tasks (spec://tasks.json):",
 	"- doing: migrate the queues",
-	"Keep tasks.json to only text/status/protected; do not add IDs, timestamps, summaries.",
+	"Update spec://tasks.json if any state changed.",
 ].join("\n");
 
 const TASKS_BODY: SideCarBody = {
@@ -156,8 +165,8 @@ describe("system_injection — the body the reader gets", () => {
 		expect(data.text).toContain("migrate the queues");
 		// The instruction half is prompt engineering. Its presence here would mean the
 		// adapter read the row's text block instead of projecting the body.
-		expect(data.text).not.toContain("do not add IDs");
-		expect(data.text).not.toContain("text/status/protected");
+		expect(data.text).not.toContain("Update spec://tasks.json");
+		expect(data.text).not.toContain("open tasks (spec://tasks.json)");
 	});
 
 	it("projects to Markdown structure (heading + list), not the private line vocabulary", () => {
@@ -175,7 +184,9 @@ describe("system_injection — the body the reader gets", () => {
 		// and deliberately not parsed.
 		const data = injectionData({ type: "system_injection", source: "some_source" });
 		expect(data.text).toContain("migrate the queues");
-		expect(data.text).toContain("do not add IDs");
+		// The instruction line too — this is the mirror of the projected case above, so
+		// what proves "verbatim" is exactly the phrase the body path drops.
+		expect(data.text).toContain("Update spec://tasks.json");
 	});
 
 	it("reads a body that arrived under the DB column name (bodyJson)", () => {
@@ -583,6 +594,44 @@ describe("background completions — one bubble per task row", () => {
 		expect((specs[0]?.data as { markdown: string }).markdown).toBe("first output");
 	});
 
+	// A bash task's preview is verbatim stdout/stderr; an agent task's is a report the
+	// subagent WROTE as Markdown. The two therefore project differently, and the split
+	// follows the producer's intent rather than a guess about the bytes.
+	it("fences a bash result so tool output keeps its own formatting", () => {
+		// The shape that shipped broken: `bunx biome check` prints a `!` diagnostic line
+		// followed by two-space-indented source excerpts with a `│` gutter. As prose,
+		// Markdown turned the indented lines into their own code block and left the
+		// diagnostic as a paragraph — one message drawn as two unrelated cards.
+		const output = [
+			"! This variable measureWebSearch is unused.",
+			"",
+			'  55 │   it("reserves an extra loader lane", async () => {',
+		].join("\n");
+		const specs = taskBubbleSpecs("bg_bash", "bash", [
+			{ id: "b1", alias: "run-biome", title: "biome", status: "success", preview: output },
+		]);
+		const data = specs[0]?.data;
+		const markdown = (data as { markdown: string }).markdown;
+		expect(markdown.startsWith("```")).toBe(true);
+		// Verbatim: the gutter and the indentation are the content.
+		expect(markdown).toContain('  55 │   it("reserves an extra loader lane", async () => {');
+
+		// And it must actually MEASURE as a code block rather than as paragraphs, which
+		// is the property the reader sees. `parse-markdown` tags a fenced block "code".
+		const measured = VLIST_REGISTRY["injection-bubble"].measure(data, 600, 5, undefined);
+		expect(measured.blocks.some((b) => b.kind === "code")).toBe(true);
+	});
+
+	it("leaves an agent report as prose, since a subagent authors Markdown", () => {
+		const specs = taskBubbleSpecs("bg_agent", "agent", [
+			{ id: "t1", title: "explore", status: "success", preview: "- found it\n- and this" },
+		]);
+		const data = specs[0]?.data;
+		expect((data as { markdown: string }).markdown.startsWith("```")).toBe(false);
+		const measured = VLIST_REGISTRY["injection-bubble"].measure(data, 600, 5, undefined);
+		expect(measured.blocks.some((b) => b.kind === "code")).toBe(false);
+	});
+
 	it("keeps a bubble for a task that produced no output, and SAYS it is empty", () => {
 		// "It finished, with nothing to show" IS the result, and the status is in the
 		// header. Dropping the row would make a silent success look like it never ran.
@@ -636,6 +685,213 @@ describe("background completions — one bubble per task row", () => {
 			undefined,
 		);
 		expect(noted.height).toBeGreaterThan(plainMeasured.height);
+	});
+});
+
+/**
+ * Which rows offer to OPEN their speaker's session, and where they land.
+ *
+ * `sessionNarratorId` is deliberately separate from `speakerId` (the identicon seed,
+ * which every speaker kind carries). Collapsing the two is the bug this pins: a
+ * `bg_bash` row's `speakerId` is a bash TASK id, so navigating by the identicon seed
+ * would offer to open a narrator that does not exist.
+ */
+describe("injection bubbles — the navigation target", () => {
+	/** The resolved target on a row, or null when it offers none. */
+	function targetOf(specs: ReturnType<typeof adaptSegment>) {
+		return coerceInjectionTarget((specs[0]?.data as { target?: unknown })?.target) ?? null;
+	}
+
+	it("an inbound message points at its sender's session and at the message itself", () => {
+		const specs = bubbleSpecs("subagent_message", [
+			{
+				fromId: "narr-sender-1",
+				fromTitle: "explorer",
+				fromMessageId: "msg-in-child",
+				text: "found the leak",
+			},
+		]);
+		expect(targetOf(specs)).toEqual({
+			kind: "narrator",
+			narratorId: "narr-sender-1",
+			messageId: "msg-in-child",
+		});
+	});
+
+	it("a sender with no recorded message still opens its session", () => {
+		// A subagent that reports before writing anything has nothing to aim at. The row
+		// must still be clickable: opening at the tail is useful, and gating the whole
+		// affordance on the message id would silently drop it for the first report.
+		const specs = bubbleSpecs("subagent_message", [
+			{ fromId: "narr-sender-2", fromTitle: "explorer", text: "starting" },
+		]);
+		expect(targetOf(specs)).toEqual({ kind: "narrator", narratorId: "narr-sender-2" });
+	});
+
+	it("a finished background AGENT points at the message that produced the result", () => {
+		const specs = taskBubbleSpecs("bg_agent", "agent", [
+			{
+				id: "narr-child-1",
+				title: "explore auth",
+				status: "success",
+				preview: "found it",
+				resultMessageId: "msg-conclusion",
+			},
+		]);
+		// A background agent's task id IS its narrator id.
+		expect(targetOf(specs)).toEqual({
+			kind: "narrator",
+			narratorId: "narr-child-1",
+			messageId: "msg-conclusion",
+		});
+	});
+
+	it("a finished background COMMAND offers NO target — there is no session to open", () => {
+		// The load-bearing case: `speakerId` is set (it seeds the terminal row's glyph
+		// treatment), but a bash task id addresses a shell invocation. Navigating to it as
+		// a narrator would 404.
+		const specs = taskBubbleSpecs("bg_bash", "bash", [
+			{
+				id: "task-bash-1",
+				alias: "run-tests",
+				title: "bun test",
+				status: "success",
+				preview: "ok",
+			},
+		]);
+		expect((specs[0]?.data as { speakerId: string }).speakerId).toBe("task-bash-1");
+		expect(targetOf(specs)).toBeNull();
+	});
+
+	it("a knowledge hit points at its entry, because the excerpt is knowingly partial", () => {
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "knowledge_base_hint",
+				body: {
+					kind: "knowledge",
+					hits: [{ entryId: "k1", title: "Deploys", summary: "how deploys work" }],
+				},
+			}),
+			CTX,
+		);
+		expect(targetOf(specs)).toEqual({ kind: "knowledge", entryId: "k1", scope: "global" });
+	});
+
+	it("a SINGLE-file spec save points at that file", () => {
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "spec_update",
+				body: {
+					kind: "specUpdates",
+					items: [
+						{
+							uri: "spec://index.md",
+							timestamp: "2026-01-01T00:00:00Z",
+							updatedBy: "alice",
+							preview: "reorganized the plan",
+						},
+					],
+				},
+			}),
+			CTX,
+		);
+		expect(targetOf(specs)).toEqual({ kind: "spec", uri: "spec://index.md" });
+	});
+
+	it("a MULTI-file spec save points nowhere rather than picking one", () => {
+		// There is no honest single destination, and silently taking the first would send
+		// the reader somewhere the row never named.
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "spec_update",
+				body: {
+					kind: "specUpdates",
+					items: [
+						{ uri: "spec://index.md", timestamp: "t", updatedBy: "alice", preview: "a" },
+						{ uri: "spec://tasks.json", timestamp: "t", updatedBy: "alice", taskSummary: "b" },
+					],
+				},
+			}),
+			CTX,
+		);
+		expect(targetOf(specs)).toBeNull();
+	});
+
+	it("a task digest offers no target: it is ABOUT the spec, not a report of one file", () => {
+		const specs = adaptSegment(
+			injectionSegment({
+				type: "system_injection",
+				source: "living_work_spec",
+				body: TASKS_BODY,
+			}),
+			CTX,
+		);
+		expect(targetOf(specs)).toBeNull();
+	});
+
+	it("the navigation target is height-neutral", () => {
+		// It is render-layer chrome: the header lane is one fixed line whether or not the
+		// row is a link, so carrying a target must not move any geometry.
+		const withTarget = bubbleSpecs("subagent_message", [
+			{ fromId: "n1", fromTitle: "explorer", fromMessageId: "m-x", text: "found the leak" },
+		]);
+		const withoutTarget = {
+			...(withTarget[0]!.data as Record<string, unknown>),
+			target: null,
+		};
+		const a = VLIST_REGISTRY["injection-bubble"].measure(withTarget[0]!.data, 600, 5, undefined);
+		const b = VLIST_REGISTRY["injection-bubble"].measure(withoutTarget, 600, 5, undefined);
+		expect(a.height).toBe(b.height);
+		expect(a.usedWidth).toBe(b.usedWidth);
+	});
+});
+
+/**
+ * Framed system cards point at the chapter they are about.
+ *
+ * Both ids are already written by their producers (`review_feedback.reviewChapterId`,
+ * `merge_summary.sourceChapterId`), so this needed no new server field — but a row
+ * written before those existed has none, and must stay inert rather than linking to
+ * `undefined`.
+ */
+describe("framed system cards — the navigation target", () => {
+	function framedTarget(block: Record<string, unknown>) {
+		const specs = adaptSegment(
+			{
+				kind: "message",
+				msg: { id: "m1", role: "system", contentJson: [block] },
+				// biome-ignore lint/suspicious/noExplicitAny: adapter segment fixture
+			} as any,
+			CTX,
+		);
+		return coerceInjectionTarget((specs[0]?.data as { target?: unknown })?.target) ?? null;
+	}
+
+	// `review_feedback` used to be framed and therefore had a clickable speaker header
+	// pointing at the review chapter. It is its own `review-card` element now, which has no
+	// speaker row — so it has no navigation target, and asserting one here would pin a
+	// shape that no longer exists. (The block still carries `reviewChapterId`, so the
+	// affordance can be restored on the card's own header when it is wanted.)
+
+	it("a merge summary points at the source chapter that was merged in", () => {
+		expect(
+			framedTarget({
+				type: "merge_summary",
+				sourceBranch: "feature",
+				sourceChapterId: "chap-source-1",
+				targetBranch: "main",
+				summary: "merged the queue work",
+				text: "merged",
+			}),
+		).toEqual({ kind: "chapter", chapterId: "chap-source-1" });
+	});
+
+	it("a card written before the id existed stays inert", () => {
+		expect(framedTarget({ type: "review_feedback", verdict: "approve", text: "ok" })).toBeNull();
+		expect(framedTarget({ type: "merge_summary", summary: "s", text: "merged" })).toBeNull();
 	});
 });
 
@@ -703,6 +959,50 @@ describe("knowledge hits — bubbles only when there is an excerpt", () => {
 	it("falls back to the entry id when a hit has no title", () => {
 		const specs = knowledgeSpecs([{ entryId: "k-42", title: "", summary: "body text" }]);
 		expect((specs[0]?.data as { speaker: string }).speaker).toBe("k-42");
+	});
+
+	it("reduces a raw-Markdown summary to prose instead of painting a giant heading", () => {
+		/*
+		 * The reported bug. `summary` is a FLATTENED slice of the entry's Markdown body
+		 * (`\s+ → " "`), which does not neutralize Markdown — it weaponizes it: the body
+		 * opens with `# Title`, so the whole excerpt ended up behind that one `#` and the
+		 * bubble painted ~300 characters at display size, with the surviving `>` and
+		 * backticks as debris.
+		 *
+		 * Rows stored BEFORE the server started stripping still hold that text, so the
+		 * cleanup has to happen on the display path too (it is idempotent).
+		 */
+		const specs = knowledgeSpecs([
+			{
+				entryId: "k1",
+				title: "PocketJS 在 Kindle PW5 实机部署踩坑",
+				summary:
+					"# PocketJS 在 Kindle PW5 实机部署踩坑 > 2026-08-10；fork 修复分支：`AndrewZhuCC/pocketjs` ## 1. fork 情况 - 完整 fork",
+			},
+		]);
+		const data = specs[0]?.data as { markdown: string; speaker: string };
+		// The header already names the entry, so the excerpt drops the repeated title and
+		// leads with the first line that actually says something.
+		expect(data.speaker).toBe("PocketJS 在 Kindle PW5 实机部署踩坑");
+		expect(data.markdown).toContain("2026-08-10");
+		expect(data.markdown).toContain("AndrewZhuCC/pocketjs");
+		expect(data.markdown).toContain("fork 情况");
+		// Nothing that a Markdown renderer would turn back into a heading or a quote:
+		// escaped where a marker survives, removed where it was structure.
+		expect(data.markdown).not.toMatch(/(^|\s)#/);
+		expect(data.markdown).not.toMatch(/(^|\s)>/);
+		expect(data.markdown).not.toContain("`");
+	});
+
+	it("keeps a hit whose summary is nothing but Markdown structure off the bubble path", () => {
+		// A body of pure structure (a lone heading repeating the title, a fence) leaves no
+		// excerpt, which is the empty-shell case the all-or-nothing gate exists for.
+		const data = injectionData({
+			type: "system_injection",
+			source: "knowledge_base_hint",
+			body: KNOWLEDGE_BODY([{ entryId: "k1", title: "Only a title", summary: "# Only a title" }]),
+		});
+		expect(data.kind).toBe("origin_notice");
 	});
 
 	it("keeps an empty hit list on the card path", () => {

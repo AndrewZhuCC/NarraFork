@@ -6,6 +6,7 @@
 	"narrators": "叙述者",
 	"settings": "设置",
 	"admin": "管理",
+	"messages": "其他人",
 	"routines": "套路",
 	"scheduledTasks": "定时任务",
 	"learning": "学习",
@@ -15,7 +16,7 @@
 	"logoutConfirmMessage": "确定要退出登录吗？",
 	"cancel": "取消",
 	"confirm": "确认退出",
-	"searchPlaceholder": "搜索章节与消息...",
+	"searchPlaceholder": "搜索章节、消息、知识库...",
 	"recentTabs": "最近访问",
 	"clearAll": "清空",
 	"clearProjects": "清空叙事线",
@@ -57,7 +58,6 @@
 	"navSectionMore": "已收纳",
 	"emptyVisibleZone": "拖拽到此处显示",
 	"loadMoreRecentTabs": "加载更多",
-	"allRecentTabsLoaded": "已全部加载",
 	"retryRecentTabs": "重试",
 	"recentTabsSyncError": "最近标签同步失败"
 }

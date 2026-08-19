@@ -1,7 +1,10 @@
-import { readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { stat } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { detectShell } from "../lib/agent/shell";
+import { BASH_TOOL_NAME } from "../lib/agent/tool-name";
+import { getGlobalPromptCandidates, PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
+import { buildPlanFileRelPath, isSafePlanFileIdForPath } from "../lib/plan-file-path";
 import { IS_WINDOWS, isWslAllowed } from "../lib/platform";
 import {
 	getDynamicSpecSystemReminder,
@@ -9,11 +12,12 @@ import {
 	getReplyLanguageInstruction,
 	type Locale,
 } from "../lib/prompt-i18n";
+import { MAX_PROJECT_INSTRUCTIONS_BYTES, readFileCapped } from "../lib/read-file-capped";
 
 export interface BuildPromptOptions {
 	/** Base system prompt (narrator's custom prompt or subagent type prompt) */
 	basePrompt: string | null;
-	/** Working directory for CWD injection and AGENT.md lookup */
+	/** Working directory for CWD injection and AGENTS.md lookup */
 	cwd: string;
 	/** Locale for language instruction */
 	locale: Locale;
@@ -21,8 +25,15 @@ export interface BuildPromptOptions {
 	contextSummary?: string | null;
 	/** Whether plan mode is active */
 	planMode?: boolean;
-	/** Plan file ID for plan mode (locks Write/Edit to .narrafork/plan-{id}.md) */
+	/** Plan file ID for plan mode (locks Write/Edit to the designated plan file) */
 	planFileId?: string;
+	/**
+	 * Resolved relative path of the designated plan file. Passed in rather than
+	 * rebuilt from `planFileId` so the reminder names the same file the write gate
+	 * and ExitPlanMode use — during the move to `.narrafork/plans/` an in-flight
+	 * cycle can still be anchored to its legacy path.
+	 */
+	planFilePath?: string;
 	/** Whether plan mode accepts inline plans. When false, only the file-based flow is shown. */
 	planAllowInlinePlan?: boolean;
 	/** Whether to force language instruction even for English locale */
@@ -57,16 +68,15 @@ export interface BuildPromptResult {
  * iteration, so it stays a single bounded `stat` — never a read. The plan file
  * content itself is only read when ExitPlanMode resolves it.
  */
-async function statPlanFileBytes(cwd: string, planFileId?: string): Promise<number | undefined> {
-	if (!planFileId) return undefined;
-	// planFileId is generated/validated server-side, but this path is also used
-	// for restored narrators, so refuse anything that could escape the worktree.
-	if (planFileId.includes("/") || planFileId.includes("\\") || planFileId.includes("..")) {
-		return undefined;
-	}
+async function statPlanFileBytes(cwd: string, planFilePath?: string): Promise<number | undefined> {
+	if (!planFilePath) return undefined;
 	if (!isAbsolute(cwd)) return undefined;
+	// The path is built server-side, but restored narrators carry whatever is in
+	// the DB, so confirm it still resolves inside the working directory.
+	const resolved = resolve(cwd, planFilePath);
+	if (!localPathSemantics.contains(cwd, resolved)) return undefined;
 	try {
-		const stats = await stat(join(cwd, ".narrafork", `plan-${planFileId}.md`));
+		const stats = await stat(resolved);
 		if (!stats.isFile() || stats.size <= 0) return undefined;
 		return stats.size;
 	} catch {
@@ -77,8 +87,9 @@ async function statPlanFileBytes(cwd: string, planFileId?: string): Promise<numb
 
 /**
  * Build the effective system prompt by appending standard sections:
- * context summary → CWD → Dynamic Spec → AGENT.md/CLAUDE.md →
- * ~/.agents/AGENT.md|~/.claude/CLAUDE.md → language → plan mode.
+ * context summary → CWD → Dynamic Spec → project instructions
+ * (AGENTS.override.md/AGENTS.md/AGENT.md/CLAUDE.md) → global instructions
+ * (~/.agents, $CODEX_HOME, ~/.claude) → language → plan mode.
  *
  * Used by both main narrators and subagents. Subagents simply omit the
  * optional fields (contextSummary, planMode) to get a minimal prompt.
@@ -93,6 +104,7 @@ export async function buildEffectiveSystemPrompt(
 		contextSummary,
 		planMode,
 		planFileId,
+		planFilePath,
 		planAllowInlinePlan,
 		replyInUserLanguage,
 		defaultSystemPrompt,
@@ -118,17 +130,17 @@ export async function buildEffectiveSystemPrompt(
 		const base = prompt ?? "";
 		const sep = base ? "\n\n" : "";
 		const shellInfo = detectShell();
-		const shellLabel = IS_WINDOWS ? "Shell" : "Bash";
-		const toolList = IS_WINDOWS
-			? `All tools (Shell, Read, Write, Edit, Glob, Grep)`
-			: `All tools (Bash, Read, Write, Edit, Glob, Grep)`;
-		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\n${toolList} already use this as their default working directory. Do NOT \`cd\` into it in ${shellLabel} commands — it is redundant.`;
+		// The shell tool is named Bash on every platform (see BASH_TOOL_NAME). These
+		// sections used to say "Shell" whenever IS_WINDOWS, which contradicted the
+		// registered tool name on the common Windows setup (Git Bash) and made the
+		// model alternate between two names, one of which does not exist.
+		let cwdSection = `## Current Working Directory\n\n\`${cwd}\`\n\nAll tools (${BASH_TOOL_NAME}, Read, Write, Edit, Glob, Grep) already use this as their default working directory. Do NOT \`cd\` into it in ${BASH_TOOL_NAME} commands — it is redundant.`;
 
 		// Windows Git Bash: warn about MSYS2 path mangling and forbid cmd builtins
 		if (IS_WINDOWS && shellInfo.loginWrap) {
-			cwdSection += `\n\nCRITICAL — Windows Git Bash Shell Rules:
-- The Shell tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
-- NEVER use Windows cmd builtins or utilities in the Shell tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
+			cwdSection += `\n\nCRITICAL — Windows Git Bash Rules:
+- The ${BASH_TOOL_NAME} tool runs commands through Git Bash (MSYS2). MSYS2 automatically converts arguments that look like Unix paths: \`/S\` → \`S:/\`, \`/I\` → \`I:/\`, etc. This BREAKS any Windows cmd command that uses \`/flag\` syntax.
+- NEVER use Windows cmd builtins or utilities in the ${BASH_TOOL_NAME} tool: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`, \`ren\`, \`cls\`, \`more\`, \`sort\`, \`fc\`, \`comp\`, \`xcopy\`, \`robocopy\`, \`attrib\`, \`icacls\`.
 - Use the dedicated tools instead: Grep (uses ripgrep), Glob, Read, Write, Edit. These work correctly on all platforms.
 - For shell commands, use Unix-style equivalents available in Git Bash: \`ls\`, \`cat\`, \`cp\`, \`mv\`, \`rm\`, \`find\`, \`grep\`, \`mkdir\`, \`touch\`, \`head\`, \`tail\`, \`wc\`.
 - Use \`git\`, \`node\`, \`npm\`, \`bun\`, \`python\` etc. directly — they work fine in Git Bash.`;
@@ -136,8 +148,8 @@ export async function buildEffectiveSystemPrompt(
 
 		// Windows PowerShell guidance
 		if (IS_WINDOWS && shellInfo.type === "powershell") {
-			cwdSection += `\n\nCRITICAL — Windows PowerShell Shell Rules:
-- The Shell tool uses PowerShell on this system. Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
+			cwdSection += `\n\nCRITICAL — Windows PowerShell Rules:
+- The ${BASH_TOOL_NAME} tool uses PowerShell on this system (the tool name is still ${BASH_TOOL_NAME}). Use PowerShell cmdlets (e.g. Get-ChildItem, Select-String) or common cross-platform commands (e.g. git, node, npm, bun, python).
 - NEVER use Windows cmd builtins: \`findstr\`, \`dir\`, \`type\`, \`copy\`, \`move\`, \`del\`. They may behave unexpectedly in PowerShell.
 - Prefer the dedicated tools (Read, Write, Edit, Glob, Grep) over shell commands whenever possible.`;
 		}
@@ -201,7 +213,7 @@ export async function buildEffectiveSystemPrompt(
 			}
 			const deviceSection =
 				`## Execution Devices\n\n` +
-				`File and command tools (Read, Write, Edit, Glob, Grep, ${IS_WINDOWS ? "Shell" : "Bash"}) ` +
+				`File and command tools (Read, Write, Edit, Glob, Grep, ${BASH_TOOL_NAME}) ` +
 				`run only on their selected execution target.\n\n` +
 				`Current default execution target: **${currentTarget}**.${unavailableWarning}\n\n` +
 				`${availabilityText}\n\n` +
@@ -221,46 +233,41 @@ export async function buildEffectiveSystemPrompt(
 		prompt = `${base}${sep}${getDynamicSpecSystemReminder(locale)}`;
 	}
 
-	// 3. Inject AGENT.md (fallback to CLAUDE.md) if present
+	// 3. Inject project instructions. AGENTS.override.md is a local-only override
+	// (Codex convention), then the AGENTS.md standard, then legacy fallbacks.
+	// Byte-level capped read (same discipline as global MD) so a huge AGENTS.md
+	// cannot inflate the system prompt allocation unboundedly.
 	{
-		let agentMdContent: string | null = null;
-		for (const filename of ["AGENT.md", "CLAUDE.md"]) {
-			try {
-				agentMdContent = await readFile(join(cwd, filename), "utf-8");
-				break;
-			} catch {
-				// file not found, try next
-			}
+		let result: { content: string; truncated: boolean } | null = null;
+		for (const filename of PROJECT_PROMPT_FILENAMES) {
+			result = await readFileCapped(join(cwd, filename), MAX_PROJECT_INSTRUCTIONS_BYTES);
+			if (result) break;
 		}
-		if (agentMdContent) {
+		if (result) {
+			const suffix = result.truncated
+				? "\n\n[... project instructions truncated due to size limit]"
+				: "";
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Project Instructions\n\n${agentMdContent}`;
+			prompt = `${base}${sep}## Project Instructions\n\n${result.content}${suffix}`;
 		}
 	}
-	// 3b. Inject global AGENT.md (fallback to CLAUDE.md): ~/.agents/AGENT.md > ~/.claude/CLAUDE.md
+	// 3b. Inject global instructions (see getGlobalPromptCandidates for the order).
+	// Also byte-level capped to bound the allocation and avoid reading the whole
+	// file into JS heap before truncating.
 	{
-		let globalMd: string | null = null;
-		const globalCandidates = [
-			join(homedir(), ".agents", "AGENT.md"),
-			join(homedir(), ".claude", "CLAUDE.md"),
-		];
-		for (const candidate of globalCandidates) {
-			try {
-				globalMd = await readFile(candidate, "utf-8");
-				break;
-			} catch {
-				// file not found, try next
-			}
+		let result: { content: string; truncated: boolean } | null = null;
+		for (const candidate of getGlobalPromptCandidates()) {
+			result = await readFileCapped(candidate, MAX_PROJECT_INSTRUCTIONS_BYTES);
+			if (result) break;
 		}
-		if (globalMd) {
-			const MAX_GLOBAL_MD = 50_000;
-			if (globalMd.length > MAX_GLOBAL_MD) {
-				globalMd = globalMd.slice(0, MAX_GLOBAL_MD);
-			}
+		if (result) {
+			const suffix = result.truncated
+				? "\n\n[... global instructions truncated due to size limit]"
+				: "";
 			const base = prompt ?? "";
 			const sep = base ? "\n\n" : "";
-			prompt = `${base}${sep}## Global Instructions\n\n${globalMd}`;
+			prompt = `${base}${sep}## Global Instructions\n\n${result.content}${suffix}`;
 		}
 	}
 
@@ -280,10 +287,13 @@ export async function buildEffectiveSystemPrompt(
 		// planFileId every turn), but the record of having written to it does not.
 		// Stat the file so the reminder can tell the model to Read + Edit instead
 		// of Write-truncating a half-finished plan it no longer remembers.
-		const planFileBytes = await statPlanFileBytes(cwd, planFileId);
+		const effectivePlanFilePath =
+			planFilePath ??
+			(isSafePlanFileIdForPath(planFileId) ? buildPlanFileRelPath(planFileId) : undefined);
+		const planFileBytes = await statPlanFileBytes(cwd, effectivePlanFilePath);
 		prompt = `${base}${sep}${getPlanModeSystemReminder(
 			locale,
-			planFileId,
+			effectivePlanFilePath,
 			planAllowInlinePlan !== false,
 			planFileBytes,
 		)}`;

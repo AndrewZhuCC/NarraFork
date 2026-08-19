@@ -26,6 +26,12 @@ import { removeWSStatus, setWSStatus } from "./ws-status";
 
 export type NarratorSubscriptionKind = "list" | "panel" | "messages";
 
+/**
+ * Max chat room ids per `chat_subscribe` frame. Matches the server-side Zod cap
+ * in `validators/websocket.ts`, which is also the per-connection ceiling.
+ */
+export const CHAT_ROOM_SUBSCRIBE_BATCH_SIZE = 50;
+
 /** Opaque handle returned by `subscribe()` — pass to `unsubscribe()`. */
 export interface SubscriptionHandle {
 	/** @internal */ _id: number;
@@ -167,13 +173,10 @@ const RECONNECT_BASE_DELAY_MS = 1000;
 const RECONNECT_MAX_DELAY_MS = 30_000;
 const DISCONNECTED_THRESHOLD = 3;
 const CLIENT_PING_TIMEOUT_MS = 60_000;
-/**
- * Stop reconnecting after this many consecutive failures.
- * With exponential backoff capped at 30s this is roughly 25 minutes.
- */
-const MAX_RECONNECT_ATTEMPTS = 50;
 /** Server close code for "the session token that opened this socket expired". */
 const SESSION_EXPIRED_CLOSE_CODE = 4001;
+/** Server close code for graceful shutdown ("Going Away") — the common case is a restart. */
+const SERVER_SHUTDOWN_CLOSE_CODE = 1001;
 const WS_STATUS_ID = "narrator-global";
 const MAX_CATCH_UP_CURSORS = 100;
 /**
@@ -347,6 +350,9 @@ export class NarratorWSManager {
 	// --- Presence ref-counting ---
 	// narratorId → Set of handle IDs that requested presence
 	private presenceRefCounts = new Map<string, Set<number>>();
+
+	/** roomId → handle ids watching it. Same ref-counting shape as presence. */
+	private chatRoomRefCounts = new Map<string, Set<number>>();
 
 	// --- Stats ---
 	private statsRefCount = 0;
@@ -624,6 +630,41 @@ export class NarratorWSManager {
 			this.presenceRefCounts.delete(narratorId);
 			if (this.ws?.readyState === WebSocket.OPEN) {
 				this.ws.send(JSON.stringify({ type: "presence_leave", narratorId }));
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Chat rooms (ref-counted, same shape as presence)
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Subscribe this connection to a chat room's live messages.
+	 *
+	 * Ref-counted per room so several panels (the dock panel and the /messages
+	 * page can both show the same narrator room) share one server subscription,
+	 * and replayed on reconnect by `_restoreSubscriptions`.
+	 */
+	joinChatRoom(roomId: string, handleId: number): void {
+		let refs = this.chatRoomRefCounts.get(roomId);
+		if (!refs) {
+			refs = new Set();
+			this.chatRoomRefCounts.set(roomId, refs);
+			if (this.ws?.readyState === WebSocket.OPEN) {
+				this.ws.send(JSON.stringify({ type: "chat_subscribe", roomIds: [roomId] }));
+			}
+		}
+		refs.add(handleId);
+	}
+
+	leaveChatRoom(roomId: string, handleId: number): void {
+		const refs = this.chatRoomRefCounts.get(roomId);
+		if (!refs) return;
+		refs.delete(handleId);
+		if (refs.size === 0) {
+			this.chatRoomRefCounts.delete(roomId);
+			if (this.ws?.readyState === WebSocket.OPEN) {
+				this.ws.send(JSON.stringify({ type: "chat_unsubscribe", roomIds: [roomId] }));
 			}
 		}
 	}
@@ -1368,13 +1409,20 @@ export class NarratorWSManager {
 			this.ws = null;
 			clearTimeout(this.pingTimeoutTimer);
 			this.pingTimeoutTimer = undefined;
-			// 1001 = Going Away — server is shutting down, don't reconnect.
-			this._setConnected(false, false, ev.code === 1001 ? true : this._disconnected);
-			if (ev.code === 1001) return;
+			this._setConnected(
+				false,
+				false,
+				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ? true : this._disconnected,
+			);
+			// 1001 = Going Away — the server closed gracefully (shutdown / restart).
+			// A restart is by far the common case (auto-update, manual restart, crash
+			// supervisor), and it is usually back within seconds, so run a fresh
+			// backoff cycle instead of stranding the client until a visibility or
+			// network event happens to fire.
 			// 4001 = the session token this socket was opened with expired. HTTP
 			// sliding renewal has very likely already stored a fresh one, so retry
 			// immediately with whatever is in localStorage instead of backing off.
-			if (ev.code === SESSION_EXPIRED_CLOSE_CODE) {
+			if (ev.code === SESSION_EXPIRED_CLOSE_CODE || ev.code === SERVER_SHUTDOWN_CLOSE_CODE) {
 				this.reconnectAttempts = 0;
 			}
 			this._scheduleReconnect();
@@ -1392,14 +1440,13 @@ export class NarratorWSManager {
 			this._setConnected(false, false, true);
 			return;
 		}
-		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-			// Give up — server is likely down for good.
-			this._setConnected(false, false, true);
-			return;
-		}
 		if (this.reconnectAttempts >= DISCONNECTED_THRESHOLD && !this._disconnected) {
 			this._setConnected(false, false, true);
 		}
+		// Never give up for good. The delay simply saturates at the 30s cap, so a
+		// long server outage (large update, maintenance, a machine that wakes after
+		// the client) still recovers on its own. A capped-interval probe is cheap;
+		// a silently dead message stream that needs a manual reconnect is not.
 		const delay = Math.min(
 			RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts,
 			RECONNECT_MAX_DELAY_MS,
@@ -1474,6 +1521,19 @@ export class NarratorWSManager {
 		// Presence
 		for (const narratorId of this.presenceRefCounts.keys()) {
 			ws.send(JSON.stringify({ type: "presence_join", narratorId }));
+		}
+
+		// Chat rooms. The server re-authorizes each room on subscribe, so a room the
+		// user lost access to while offline simply never re-enters the index. Chunked
+		// to the server's per-frame cap.
+		const chatRoomIds = [...this.chatRoomRefCounts.keys()];
+		for (let i = 0; i < chatRoomIds.length; i += CHAT_ROOM_SUBSCRIBE_BATCH_SIZE) {
+			ws.send(
+				JSON.stringify({
+					type: "chat_subscribe",
+					roomIds: chatRoomIds.slice(i, i + CHAT_ROOM_SUBSCRIBE_BATCH_SIZE),
+				}),
+			);
 		}
 
 		// Stats
@@ -1749,8 +1809,25 @@ export class NarratorWSManager {
 				continue;
 			try {
 				entry.cb(data);
-			} catch {
-				// listener error — ignore
+			} catch (err) {
+				// A consumer that fails on a persisted-history frame has silently missed
+				// content while the version counters above already advanced — the next
+				// sync_check would compare equal and the server would never replay the
+				// lost frame. Drop the committed sync anchors so the following sync
+				// distrusts the local view and forces a catch-up / full reload, then
+				// nudge that sync immediately (gated internally by reconcile state).
+				console.warn(
+					`[NarratorWSManager] Listener failed on "${msgType}" for narrator ${narratorId}; ` +
+						"committed sync anchors were reset so the next sync re-fetches from the server.",
+					err,
+				);
+				if (narratorId && msgType && REALTIME_HISTORY_EVENT_TYPES.has(msgType)) {
+					this.clearCommittedCatchUpAnchor(narratorId);
+					const recoveryNarratorId = narratorId;
+					queueMicrotask(() => {
+						if (!this.cancelled) this.checkSync(recoveryNarratorId);
+					});
+				}
 			}
 		}
 	}

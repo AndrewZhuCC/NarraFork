@@ -27,6 +27,9 @@ import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { DevicePathRulesEditor } from "../../components/settings/DevicePathRulesEditor";
+import { ExecutorInstallModal } from "../../components/settings/ExecutorInstallModal";
+import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import type {
 	CreateDeviceInput,
@@ -58,21 +61,83 @@ interface IssuedToken {
 	token: string;
 }
 
+/**
+ * Why registration no longer shows the key.
+ *
+ * It used to: register → read a one-time key → dismiss → generate a script → paste
+ * the key back when the script asked. Three dialogs to move one string, and the
+ * "save this, it is shown only once" warning was misleading, because the install
+ * flow rotates the key anyway.
+ *
+ * Now registration goes straight to the install dialog, which produces a single
+ * command. The key is displayed only where seeing it is the actual point: an
+ * explicit rotation, or the manual-entry install path.
+ */
+
+/**
+ * The plaintext-LAN enrollment opt-in.
+ *
+ * Lives on this page rather than in a generic settings form because it is only
+ * ever reached from here: the install dialog names this exact setting when it
+ * refuses automatic key delivery, and being sent to hand-edit settings.json to
+ * follow that instruction is not an acceptable next step.
+ *
+ * Admin-only, matching `PATCH /api/settings`. Non-admins see the state so a
+ * refusal in the install dialog is explicable, but cannot change it.
+ */
+function PlaintextEnrollmentSetting({ isAdmin }: { isAdmin: boolean }) {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const { data: settings } = useQuery({ queryKey: ["settings"], queryFn: api.getSettings });
+	const enabled = settings?.devices?.allowPlaintextEnrollmentOnPrivateNetwork === true;
+
+	const mutation = useMutation({
+		mutationFn: (next: boolean) =>
+			api.updateSettings({ devices: { allowPlaintextEnrollmentOnPrivateNetwork: next } }),
+		onSuccess: (data) => qc.setQueryData(["settings"], data),
+		onError: (error: Error) => notifications.show({ color: "red", message: error.message }),
+	});
+
+	return (
+		<Card withBorder mt="lg" padding="md">
+			<Checkbox
+				label={t("devicePlaintextEnrollmentLabel")}
+				description={t("devicePlaintextEnrollmentHelp")}
+				checked={enabled}
+				disabled={!isAdmin || mutation.isPending}
+				onChange={(event) => mutation.mutate(event.currentTarget.checked)}
+			/>
+		</Card>
+	);
+}
+
 function SettingsDevicesPage() {
 	const { t } = useTranslation("settings");
 	const qc = useQueryClient();
 	const confirm = useConfirmDialog();
+	const { data: currentUser } = useCurrentUser();
+	// Non-admins may register and manage their own devices, but not the actions
+	// whose blast radius is the whole instance (transfers, global scope). The API
+	// enforces the same split; this only keeps the UI honest about it.
+	const isAdmin = currentUser?.role === "admin";
 	const [createOpen, setCreateOpen] = useState(false);
 	const [editingDevice, setEditingDevice] = useState<RemoteDevice | null>(null);
 	const [issuedToken, setIssuedToken] = useState<IssuedToken | null>(null);
 	const [transferDevice, setTransferDevice] = useState<RemoteDevice | null>(null);
 	const [diagnosticDevice, setDiagnosticDevice] = useState<RemoteDevice | null>(null);
+	const [installDevice, setInstallDevice] = useState<RemoteDevice | null>(null);
 	const [testResults, setTestResults] = useState<Record<string, TestConnectionResult>>({});
 
 	const { data: devices, isLoading } = useQuery({
 		queryKey: ["devices"],
 		queryFn: () => api.listDevices(),
 		refetchInterval: 10_000,
+	});
+	// Drives the "up to date / upgrade available" badge on each device card.
+	const { data: executorInfo } = useQuery({
+		queryKey: ["executorManifest"],
+		queryFn: () => api.getExecutorManifest(),
+		staleTime: 5 * 60_000,
 	});
 	const { data: projectRows } = useQuery({
 		queryKey: ["projects", "device-scope"],
@@ -89,7 +154,10 @@ function SettingsDevicesPage() {
 		onSuccess: (res) => {
 			qc.invalidateQueries({ queryKey: ["devices"] });
 			setCreateOpen(false);
-			setIssuedToken({ device: res.device, token: res.token });
+			// Straight to the install command. The key returned here is deliberately not
+			// shown: the installer rotates it, so displaying it would ask the operator to
+			// safeguard a string that is about to be replaced.
+			setInstallDevice(res.device);
 		},
 		onError: showError,
 	});
@@ -155,10 +223,13 @@ function SettingsDevicesPage() {
 							projectName={device.projectId ? projectNames.get(device.projectId) : undefined}
 							testResult={testResults[device.id]}
 							testing={testMut.isPending && testMut.variables === device.id}
+							latestExecutorVersion={executorInfo?.manifest?.version}
 							onTest={() => openAndTest(device)}
 							onDiagnostics={() => setDiagnosticDevice(device)}
 							onEdit={() => setEditingDevice(device)}
 							onTransfer={() => setTransferDevice(device)}
+							onInstall={() => setInstallDevice(device)}
+							isAdmin={isAdmin}
 							onRotate={() => rotateMut.mutate(device.id)}
 							onDelete={async () => {
 								const ok = await confirm({
@@ -174,12 +245,15 @@ function SettingsDevicesPage() {
 				</Stack>
 			)}
 
+			<PlaintextEnrollmentSetting isAdmin={isAdmin} />
+
 			<CreateDeviceWizard
 				opened={createOpen}
 				onClose={() => setCreateOpen(false)}
 				onSubmit={(input) => createMut.mutate(input)}
 				loading={createMut.isPending}
 				projects={projects}
+				isAdmin={isAdmin}
 			/>
 			<EditDeviceModal
 				device={editingDevice}
@@ -189,8 +263,10 @@ function SettingsDevicesPage() {
 				}}
 				loading={updateMut.isPending}
 				projects={projects}
+				isAdmin={isAdmin}
 			/>
 			<TokenModal issued={issuedToken} onClose={() => setIssuedToken(null)} />
+			<ExecutorInstallModal device={installDevice} onClose={() => setInstallDevice(null)} />
 			<TransferModal device={transferDevice} onClose={() => setTransferDevice(null)} />
 			<DeviceDiagnosticsModal
 				device={diagnosticDevice}
@@ -217,23 +293,30 @@ function DeviceCard({
 	projectName,
 	testResult,
 	testing,
+	latestExecutorVersion,
 	onTest,
 	onDiagnostics,
 	onEdit,
 	onRotate,
 	onDelete,
 	onTransfer,
+	onInstall,
+	isAdmin,
 }: {
 	device: RemoteDevice;
 	projectName?: string;
 	testResult?: TestConnectionResult;
 	testing: boolean;
+	latestExecutorVersion?: string;
 	onTest: () => void;
 	onDiagnostics: () => void;
 	onEdit: () => void;
 	onRotate: () => void;
 	onDelete: () => void;
 	onTransfer: () => void;
+	onInstall: () => void;
+	/** Transfers read/write arbitrary server-local paths, so they stay admin-only. */
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const platform =
@@ -260,6 +343,7 @@ function DeviceCard({
 							<Badge color={device.scope === "project" ? "violet" : "blue"} variant="outline">
 								{scopeLabel}
 							</Badge>
+							{executorVersionBadge(t, device.agentVersion, latestExecutorVersion)}
 						</Group>
 						{device.description ? (
 							<Text size="sm" c="dimmed">
@@ -284,6 +368,17 @@ function DeviceCard({
 							{t("deviceLastSeen")}: {formatDateTime(device.lastSeenAt, t("deviceNeverSeen"))}
 							{device.agentVersion ? ` · ${t("deviceAgentVersion")}: ${device.agentVersion}` : ""}
 						</Text>
+						{/*
+						 * Who collected the key, when the installer fetched it automatically. Shown
+						 * because that exchange is the one moment the key crosses the wire: if an
+						 * install command ever leaks, this line is the only evidence of who used it.
+						 */}
+						{device.enrolledAt ? (
+							<Text size="xs" c="dimmed">
+								{t("deviceEnrolledAt")}: {formatDateTime(device.enrolledAt, "—")}
+								{device.enrolledFromIp ? ` · ${device.enrolledFromIp}` : ""}
+							</Text>
+						) : null}
 					</Stack>
 					<Group gap="xs" justify="flex-end">
 						<Button size="xs" variant="light" loading={testing} onClick={onTest}>
@@ -292,11 +387,14 @@ function DeviceCard({
 						<Button size="xs" variant="subtle" onClick={onDiagnostics}>
 							{t("deviceDiagnosticsButton")}
 						</Button>
-						{device.status === "online" ? (
+						{device.status === "online" && isAdmin ? (
 							<Button size="xs" variant="subtle" onClick={onTransfer}>
 								{t("deviceTransferButton")}
 							</Button>
 						) : null}
+						<Button size="xs" variant="subtle" onClick={onInstall}>
+							{t("executorInstallButton")}
+						</Button>
 						<Button size="xs" variant="subtle" onClick={onEdit}>
 							{t("deviceEditButton")}
 						</Button>
@@ -329,12 +427,15 @@ function CreateDeviceWizard({
 	onSubmit,
 	loading,
 	projects,
+	isAdmin,
 }: {
 	opened: boolean;
 	onClose: () => void;
 	onSubmit: (input: CreateDeviceInput) => void;
 	loading: boolean;
 	projects: ProjectOption[];
+	/** Only admins may register a global device. */
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const [step, setStep] = useState(0);
@@ -343,7 +444,7 @@ function CreateDeviceWizard({
 	const [description, setDescription] = useState("");
 	const [mode, setMode] = useState<"reverse" | "direct">("reverse");
 	const [directUrl, setDirectUrl] = useState("");
-	const [scope, setScope] = useState<"global" | "project">("global");
+	const [scope, setScope] = useState<"global" | "project">(isAdmin ? "global" : "project");
 	const [projectId, setProjectId] = useState<string | null>(null);
 
 	useEffect(() => {
@@ -431,13 +532,16 @@ function CreateDeviceWizard({
 						<Stack mt="md">
 							<Select
 								label={t("deviceScopeLabel")}
+								// A global device is reachable from every project and is what makes a
+								// device inject by default, so only an admin may choose it. The API
+								// rejects it too; this keeps the option from looking available.
 								data={[
-									{ value: "global", label: t("deviceScopeGlobal") },
+									...(isAdmin ? [{ value: "global", label: t("deviceScopeGlobal") }] : []),
 									{ value: "project", label: t("deviceScopeProject") },
 								]}
 								value={scope}
 								onChange={(value) => {
-									const next = (value as "global" | "project") ?? "global";
+									const next = (value as "global" | "project") ?? "project";
 									setScope(next);
 									if (next === "global") setProjectId(null);
 								}}
@@ -529,12 +633,14 @@ function EditDeviceModal({
 	onSubmit,
 	loading,
 	projects,
+	isAdmin,
 }: {
 	device: RemoteDevice | null;
 	onClose: () => void;
 	onSubmit: (input: UpdateDeviceInput) => void;
 	loading: boolean;
 	projects: ProjectOption[];
+	isAdmin: boolean;
 }) {
 	const { t } = useTranslation("settings");
 	const [name, setName] = useState("");
@@ -595,13 +701,19 @@ function EditDeviceModal({
 				) : null}
 				<Select
 					label={t("deviceScopeLabel")}
+					// Same admin gate as creation: promoting a device to global would
+					// otherwise be a back door around it. An already-global device keeps
+					// showing its current value for a non-admin manager, but cannot be set.
 					data={[
-						{ value: "global", label: t("deviceScopeGlobal") },
+						...(isAdmin || scope === "global"
+							? [{ value: "global", label: t("deviceScopeGlobal") }]
+							: []),
 						{ value: "project", label: t("deviceScopeProject") },
 					]}
+					disabled={!isAdmin}
 					value={scope}
 					onChange={(value) => {
-						const next = (value as "global" | "project") ?? "global";
+						const next = (value as "global" | "project") ?? "project";
 						setScope(next);
 						if (next === "global") setProjectId(null);
 					}}
@@ -641,6 +753,17 @@ function EditDeviceModal({
 						{t("deviceSaveButton")}
 					</Button>
 				</Group>
+				{/*
+				 * Below the metadata Save on purpose: path rules have their own save,
+				 * their own validation, and take effect only after the operator applies
+				 * the config on the device and restarts it.
+				 */}
+				{device ? (
+					<>
+						<Divider label={t("devicePathRules")} labelPosition="center" />
+						<DevicePathRulesEditor device={device} />
+					</>
+				) : null}
 			</Stack>
 		</Modal>
 	);
@@ -948,10 +1071,22 @@ function TransferModal({ device, onClose }: { device: RemoteDevice | null; onClo
 	);
 }
 
+/**
+ * Shows a device key in plaintext.
+ *
+ * Reached only by an explicit "rotate key", where seeing the new key *is* the
+ * requested outcome. Registration no longer routes here — see the note above
+ * `SettingsDevicesPage`.
+ */
 function TokenModal({ issued, onClose }: { issued: IssuedToken | null; onClose: () => void }) {
 	const { t } = useTranslation("settings");
+	const [manualOpen, setManualOpen] = useState(false);
+	// Kept behind a disclosure for operators who wire the executor up by hand rather
+	// than with the generated installer.
 	const command = issued
-		? buildDeviceRunCommand(issued.device.connectionMode, issued.device.slug)
+		? buildDeviceRunCommand(issued.device.connectionMode, issued.device.slug, "file", {
+				serverBaseUrl: window.location.origin,
+			})
 		: "";
 	return (
 		<Modal opened={!!issued} onClose={onClose} title={t("deviceTokenModalTitle")} size="lg">
@@ -968,20 +1103,30 @@ function TokenModal({ issued, onClose }: { issued: IssuedToken | null; onClose: 
 						)}
 					</CopyButton>
 					<Divider />
-					<Text size="xs" c="dimmed">
-						{t("deviceRunHint")}
-					</Text>
-					<Code block>{command}</Code>
-					<CopyButton value={command}>
-						{({ copied, copy }) => (
-							<Button onClick={copy} variant="default">
-								{copied ? t("copied") : t("deviceCopyCommand")}
-							</Button>
-						)}
-					</CopyButton>
-					<Text size="xs" c="dimmed">
-						{t("deviceTokenFileHint")}
-					</Text>
+					<Text size="sm">{t("deviceRotatedNextStep")}</Text>
+					<Group>
+						<Button variant="subtle" onClick={() => setManualOpen((open) => !open)}>
+							{manualOpen ? t("deviceManualInstallHide") : t("deviceManualInstallShow")}
+						</Button>
+					</Group>
+					{manualOpen ? (
+						<Stack gap="xs">
+							<Text size="xs" c="dimmed">
+								{t("deviceRunHint")}
+							</Text>
+							<Code block>{command}</Code>
+							<CopyButton value={command}>
+								{({ copied, copy }) => (
+									<Button onClick={copy} variant="default">
+										{copied ? t("copied") : t("deviceCopyCommand")}
+									</Button>
+								)}
+							</CopyButton>
+							<Text size="xs" c="dimmed">
+								{t("deviceTokenFileHint")}
+							</Text>
+						</Stack>
+					) : null}
 				</Stack>
 			) : null}
 		</Modal>
@@ -999,6 +1144,31 @@ function projectSelectOptions(
 				? t("deviceProjectArchivedValue", { project: project.name })
 				: project.name,
 	}));
+}
+
+/**
+ * Compare the version a device reported at handshake against the latest published
+ * release. Rendered as a badge so version skew is visible without opening
+ * diagnostics.
+ */
+function executorVersionBadge(
+	t: (key: string, values?: Record<string, unknown>) => string,
+	agentVersion: string | null,
+	latestVersion: string | undefined,
+) {
+	if (!agentVersion || !latestVersion) return null;
+	if (agentVersion === latestVersion) {
+		return (
+			<Badge color="green" variant="light">
+				{t("executorVersionCurrent")}
+			</Badge>
+		);
+	}
+	return (
+		<Badge color="orange" variant="light">
+			{t("executorVersionUpgradeAvailable", { version: latestVersion })}
+		</Badge>
+	);
 }
 
 function diagnosticStageLabel(

@@ -42,7 +42,7 @@ import { settings } from "../lib/settings";
 import { createRemoteBackend } from "./device-remote-backend";
 import {
 	deviceHasFeature,
-	isDeviceAuthorizedForProject,
+	isDeviceAuthorized,
 	type RemoteDeviceRow,
 	verifyDeviceToken,
 } from "./device-service";
@@ -186,13 +186,19 @@ async function handleBinaryFrame(deviceId: string, bytes: Uint8Array): Promise<v
  */
 export async function getSessionDevices(
 	projectId: string | null | undefined,
+	/**
+	 * Acting user, for the device owner axis. Without it, `private` devices are
+	 * excluded — a session that cannot prove who is driving it must not be handed
+	 * someone's personal machine.
+	 */
+	actingUserId?: string | null,
 ): Promise<import("../lib/agent/execution/backend").DeviceSummary[]> {
 	const rows = await db.query.remoteDevices.findMany({
 		where: isNull(remoteDevices.revokedAt),
 	});
 	const summaries: import("../lib/agent/execution/backend").DeviceSummary[] = [];
 	for (const row of rows) {
-		if (!isDeviceAuthorizedForProject(row, projectId)) continue;
+		if (!isDeviceAuthorized(row, { projectId, userId: actingUserId })) continue;
 		const authorization = await resolveOAuthDeviceRuntimeAuthorization(row).catch(() => ({
 			oauthOwned: true,
 			allowed: false,
@@ -212,6 +218,12 @@ export async function getSessionDevices(
 					}
 				: undefined,
 			defaultCwd: row.defaultCwd,
+			// "private" means the row is scoped to its creator, and authorization
+			// above already proved the acting user is that creator.
+			ownedByActingUser: row.ownerScope === "private" && !!actingUserId,
+			// Carried through so injection can tell an admin-blessed global device
+			// from a project device any user could have registered.
+			scope: row.scope,
 		});
 	}
 	return summaries;
@@ -671,6 +683,36 @@ function handleRpcResult(conn: DeviceConnection, frame: RpcResultFrame): void {
 
 // ── DB status updates ──────────────────────────────────────────────────────────
 
+/**
+ * Interprets the path rules a device reported at handshake.
+ *
+ * Three states have to stay distinguishable, because the UI draws a "not applied"
+ * badge from this and a wrong answer would either cry wolf or hide real drift:
+ *
+ * - `null`  — the executor did not report (predates the field). Show nothing.
+ * - `[]`    — reported explicitly as unrestricted.
+ * - rules   — reported as enforcing that ordered list.
+ *
+ * Values are filtered rather than trusted: this arrives from a remote peer, and a
+ * malformed entry should degrade the display, not corrupt the stored JSON.
+ */
+export function normalizeReportedPathRules(
+	hello: DeviceHelloFrame,
+): Array<{ action: "allow" | "deny"; path: string }> | null {
+	if (!Array.isArray(hello.pathRules)) {
+		return hello.pathRulesUnrestricted === true ? [] : null;
+	}
+	return hello.pathRules
+		.filter(
+			(rule): rule is { action: "allow" | "deny"; path: string } =>
+				!!rule &&
+				(rule.action === "allow" || rule.action === "deny") &&
+				typeof rule.path === "string" &&
+				rule.path.length > 0,
+		)
+		.map((rule) => ({ action: rule.action, path: rule.path }));
+}
+
 async function markOnline(deviceId: string, hello: DeviceHelloFrame): Promise<void> {
 	const now = new Date().toISOString();
 	await db
@@ -684,6 +726,7 @@ async function markOnline(deviceId: string, hello: DeviceHelloFrame): Promise<vo
 			defaultCwd: hello.defaultCwd ?? null,
 			agentVersion: hello.agentVersion,
 			capabilitiesJson: hello.capabilities,
+			reportedPathRulesJson: normalizeReportedPathRules(hello),
 			updatedAt: now,
 		})
 		.where(eq(remoteDevices.id, deviceId));

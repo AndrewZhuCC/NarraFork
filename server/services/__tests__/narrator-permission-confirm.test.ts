@@ -17,6 +17,7 @@ import { localBackend, setRemoteBackendResolver } from "../../lib/agent/executio
 import type { ToolExecutionTarget } from "../../lib/agent/types";
 import type { ExecutionTargetContext } from "../execution-policy/types";
 import type { PendingDangerReflection, PendingExecutionTarget } from "../narrator-session-state";
+import { deleteConclusionFileId, setConclusionFileId } from "../subagent-conclusion";
 
 const { db, sqlite } = getTestDb();
 
@@ -473,11 +474,11 @@ describe("danger fingerprint execution identity", () => {
 describe("pending permission execution identity", () => {
 	test("reprocesses a remote ExitPlanMode only through its frozen remote backend", async () => {
 		const localRoot = mkdtempSync(join(tmpdir(), "narrafork-permission-reprocess-"));
-		const remotePath = "/remote/work/.narrafork/plan-remote-cycle.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-remote-cycle.md";
 		const remoteContent = "# Remote plan\n\nRead from the executor.";
 		const localContent = "# LOCAL FALLBACK MUST NOT BE READ";
-		const localPlanPath = join(localRoot, ".narrafork", "plan-remote-cycle.md");
-		mkdirSync(join(localRoot, ".narrafork"), { recursive: true });
+		const localPlanPath = join(localRoot, ".narrafork", "plans", "plan-remote-cycle.md");
+		mkdirSync(join(localRoot, ".narrafork", "plans"), { recursive: true });
 		writeFileSync(localPlanPath, localContent, "utf8");
 		const { backend, calls } = makeRemotePlanBackend(remotePath, remoteContent);
 		const id = "remote-reprocess-narrator";
@@ -548,8 +549,8 @@ describe("pending permission execution identity", () => {
 	});
 
 	test("reprocesses a relaxed custom plan path with the same frozen provenance", async () => {
-		const customInputPath = "plans/custom-plan.md";
-		const customPath = "/remote/work/plans/custom-plan.md";
+		const customInputPath = ".narrafork/plans/custom-plan.md";
+		const customPath = "/remote/work/.narrafork/plans/custom-plan.md";
 		const customContent = "# Custom remote plan\n\nKeep this source.";
 		const { backend, calls } = makeRemotePlanBackend(customPath, customContent);
 		const id = "remote-custom-reprocess-narrator";
@@ -627,7 +628,7 @@ describe("pending permission execution identity", () => {
 	});
 
 	test("fails a pending remote plan closed when its device goes offline", async () => {
-		const remotePath = "/remote/work/.narrafork/plan-offline-cycle.md";
+		const remotePath = "/remote/work/.narrafork/plans/plan-offline-cycle.md";
 		const { backend, calls } = makeRemotePlanBackend(remotePath, "# Remote plan");
 		const id = "remote-offline-narrator";
 		const message = "remote-offline-message";
@@ -697,7 +698,7 @@ describe("pending permission execution identity", () => {
 
 	test("fails closed when a reconnected target changes generation or path flavor", async () => {
 		for (const drift of ["generation", "pathFlavor"] as const) {
-			const remotePath = `/remote/work/.narrafork/plan-${drift}-drift.md`;
+			const remotePath = `/remote/work/.narrafork/plans/plan-${drift}-drift.md`;
 			const { backend } = makeRemotePlanBackend(remotePath, `# ${drift} drift`);
 			const id = `remote-${drift}-drift-narrator`;
 			const message = `remote-${drift}-drift-message`;
@@ -805,6 +806,211 @@ describe("pending permission execution identity", () => {
 			expect(pendingPermissions.has(toolCall)).toBe(false);
 		} finally {
 			controller.abort();
+		}
+	});
+
+	// A spec:// target rides the host backend but keeps the spec:// grammar, so comparing it
+	// to the backend's own filesystem flavor rejected every reprocessed Dynamic Spec call.
+	test("reprocesses a pending spec:// permission instead of reporting flavor drift", async () => {
+		const id = "spec-reprocess-narrator";
+		const message = "spec-reprocess-message";
+		const toolCall = "spec-reprocess-tool-call";
+		const toolUse = "spec-reprocess-tool-use";
+		const controller = new AbortController();
+		const input = { file_path: "spec://notes.md", content: "# notes" };
+		const specTarget: PendingExecutionTarget = {
+			deviceId: "local",
+			backendKind: "local",
+			cwd: "spec://",
+			pathFlavor: "spec",
+			lexicalPath: "spec://notes.md",
+			canonicalPath: "spec://notes.md",
+			resolvedFilePath: "spec://notes.md",
+			runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+			selectionSource: "local_default",
+		};
+		try {
+			await seedPermissionRequest({
+				narratorId: id,
+				messageId: message,
+				toolCallId: toolCall,
+				toolUseId: toolUse,
+				toolName: "Write",
+				input,
+			});
+			const permissionPromise = handlePermission(
+				id,
+				controller.signal,
+				"Write",
+				input,
+				toolUse,
+				"/local/work",
+				"en",
+				undefined,
+				{ executionBackend: localBackend, executionTarget: specTarget },
+			);
+			await waitFor(() => pendingPermissions.has(toolCall));
+			await db
+				.update(narrators)
+				.set({ permissionMode: "bypassPermissions" })
+				.where(eq(narrators.id, id));
+			expect(reprocessAllPendingPermissions(id)).toBe(1);
+
+			expect(await permissionPromise).toMatchObject({ behavior: "allow" });
+		} finally {
+			controller.abort();
+		}
+	});
+});
+
+describe("Dynamic Spec writes are never redirected to a filesystem path", () => {
+	// Both redirects below rewrote `file_path` before the decision. The execution target was
+	// already frozen with the spec grammar, so the rewritten posix path made the executor
+	// abort with "path flavor is already frozen to spec and cannot change to posix" — the
+	// model saw a routing error where it should have seen an allow/deny.
+	function specTarget(path: string): PendingExecutionTarget {
+		return {
+			deviceId: "local",
+			backendKind: "local",
+			cwd: "spec://",
+			pathFlavor: "spec",
+			lexicalPath: path,
+			canonicalPath: path,
+			resolvedFilePath: path,
+			runtimeGeneration: localBackend.runtimeGeneration ?? 0,
+			selectionSource: "local_default",
+		};
+	}
+
+	async function writeSpec(input: {
+		label: string;
+		specPath: string;
+		traits?: string[];
+		planFileId?: string;
+		conclusion?: boolean;
+	}): Promise<PermissionResult> {
+		const id = `spec-redirect-${input.label}`;
+		const toolUse = `spec-redirect-tool-use-${input.label}`;
+		const toolInput = { file_path: input.specPath, content: "{}" };
+		await seedPermissionRequest({
+			narratorId: id,
+			messageId: `spec-redirect-message-${input.label}`,
+			toolCallId: `spec-redirect-tool-call-${input.label}`,
+			toolUseId: toolUse,
+			toolName: "Write",
+			input: toolInput,
+			permissionMode: "bypassPermissions",
+			traits: input.traits,
+			planFileId: input.planFileId,
+		});
+		if (input.planFileId) {
+			activeNarrators.set(id, { _planFileId: input.planFileId } as never);
+		}
+		if (input.conclusion) {
+			setConclusionFileId(id, `conclusion-${input.label}`, "/local/work");
+		}
+		try {
+			return await handlePermission(
+				id,
+				new AbortController().signal,
+				"Write",
+				toolInput,
+				toolUse,
+				"/local/work",
+				"en",
+				undefined,
+				{ executionBackend: localBackend, executionTarget: specTarget(input.specPath) },
+			);
+		} finally {
+			if (input.conclusion) deleteConclusionFileId(id);
+		}
+	}
+
+	function expectAllowedPath(result: PermissionResult, path: string): void {
+		expect(result.behavior).toBe("allow");
+		if (result.behavior !== "allow") return;
+		expect(result.updatedInput?.file_path).toBe(path);
+		expect(result.notice).toBeUndefined();
+	}
+
+	test("plan mode leaves a spec:// Markdown write on its own target", async () => {
+		expectAllowedPath(
+			await writeSpec({
+				label: "plan-md",
+				specPath: "spec://index.md",
+				traits: ["plan"],
+				planFileId: "plan-cycle",
+			}),
+			"spec://index.md",
+		);
+	});
+
+	test("plan mode keeps the task queue writable through its spec:// path", async () => {
+		expectAllowedPath(
+			await writeSpec({
+				label: "plan-tasks",
+				specPath: "spec://tasks.json",
+				traits: ["plan"],
+				planFileId: "plan-cycle",
+			}),
+			"spec://tasks.json",
+		);
+	});
+
+	test("a conclusion-scoped subagent still writes its own spec:// files", async () => {
+		expectAllowedPath(
+			await writeSpec({
+				label: "conclusion-tasks",
+				specPath: "spec://tasks.json",
+				conclusion: true,
+			}),
+			"spec://tasks.json",
+		);
+	});
+
+	test("a conclusion-scoped subagent's filesystem write is still redirected", async () => {
+		const id = "spec-redirect-conclusion-fs";
+		const toolUse = "spec-redirect-conclusion-fs-tool-use";
+		const toolInput = { file_path: "docs/findings.md", content: "x" };
+		// A real writable cwd keeps the conclusion file inside the worktree; the
+		// ~/.narrafork/conclusions fallback would be an out-of-cwd write and pause for
+		// reflection, which would test the danger path rather than the redirect.
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-conclusion-redirect-"));
+		await seedPermissionRequest({
+			narratorId: id,
+			messageId: "spec-redirect-conclusion-fs-message",
+			toolCallId: "spec-redirect-conclusion-fs-tool-call",
+			toolUseId: toolUse,
+			toolName: "Write",
+			input: toolInput,
+			permissionMode: "bypassPermissions",
+		});
+		setConclusionFileId(id, "conclusion-fs", cwd);
+		try {
+			const result = await handlePermission(
+				id,
+				new AbortController().signal,
+				"Write",
+				toolInput,
+				toolUse,
+				cwd,
+				"en",
+				undefined,
+				{
+					executionBackend: localBackend,
+					executionTarget: frozenTarget(localBackend, {
+						cwd,
+						path: join(cwd, "docs/findings.md"),
+					}),
+				},
+			);
+			expect(result.behavior).toBe("allow");
+			if (result.behavior === "allow") {
+				expect(result.updatedInput?.file_path).toBe(".narrafork/conclusion-conclusion-fs.md");
+			}
+		} finally {
+			deleteConclusionFileId(id);
+			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 });

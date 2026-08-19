@@ -53,6 +53,7 @@ import {
 } from "./measure/measure-permission";
 import { measurePlanCard } from "./measure/measure-plan-card";
 import { measureReasoning, type ReasoningBlockData } from "./measure/measure-reasoning";
+import { measureReviewCard } from "./measure/measure-review-card";
 import { measureSubagentCard, type SubagentCardData } from "./measure/measure-subagent";
 import { type KnowledgeHintData, measureKnowledgeHint } from "./measure/measure-system-list";
 import {
@@ -76,9 +77,7 @@ import {
 	measureReasoningCountLine,
 	measureReasoningStepsTrace,
 	measureToolRunCountLine,
-	measureToolRunSummary,
 	type ReasoningStepItem,
-	type ToolRunSummaryItem,
 } from "./measure/measure-tool-run";
 import { measureWebSearch } from "./measure/measure-web-search";
 import { RenderAskInPassing } from "./render/RenderAskInPassing";
@@ -89,6 +88,7 @@ import { RenderPruneDivider } from "./render/RenderMisc";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
+import { RenderReviewCard } from "./render/RenderReviewCard";
 import { RenderSubagent } from "./render/RenderSubagent";
 import { RenderSystemList } from "./render/RenderSystemList";
 import { RenderSystemSimple } from "./render/RenderSystemSimple";
@@ -273,6 +273,28 @@ const PLAN_CARD_MD = [
 	"3. Verify tsgo + biome + the vlist test suite stay green",
 ].join("\n");
 
+/**
+ * A realistic review conclusion: prose, inline code, a file path and a fenced snippet.
+ *
+ * Deliberately markdown-heavy — this is exactly the content the earlier plain-text card
+ * could not render, so the sample has to exercise the markdown path rather than read as
+ * three flat lines.
+ */
+const REVIEW_CONCLUSION_MD = [
+	"## Code Review: Changes Requested",
+	"",
+	"- 🚨 **[critical]** `server/db/schema.ts:2606` — the new index has no migration, so",
+	"  `chapter-roster-service.test.ts` asserts a plan the database cannot produce.",
+	"- 📋 **[minor]** `server/services/pm-communication.ts` — the cached statement outlives",
+	"  the module it was prepared in.",
+	"",
+	"```ts",
+	"const stmt = sqlite.prepare(SELECT_ROSTER); // survives a hot reload",
+	"```",
+	"",
+	"Please address the above findings before merging.",
+].join("\n");
+
 const ASK_QUESTION_DATA: AskUserQuestionData = {
 	questions: [
 		{
@@ -387,7 +409,7 @@ const TOOL_CALL_GROUP: ToolCallData[] = [
 	{ toolName: "read", summary: "measure-subagent.ts", category: "read", status: "success" },
 ];
 
-const TOOL_RUN_ITEMS: ToolRunSummaryItem[] = [
+const ACTIVITY_ITEMS: ActivityTraceItem[] = [
 	{ title: "read registry.ts", hasIcon: true, iconColor: "lime" },
 	{ title: "read measure-markdown.ts", hasIcon: true, iconColor: "lime" },
 	{ title: "grep measureElement", hasIcon: true, iconColor: "cyan" },
@@ -395,7 +417,6 @@ const TOOL_RUN_ITEMS: ToolRunSummaryItem[] = [
 	{ title: "bash bun test", hasIcon: true, iconColor: "orange" },
 	{ title: "bash bunx tsgo --noEmit", hasIcon: true, iconColor: "orange" },
 ];
-const ACTIVITY_ITEMS: ActivityTraceItem[] = TOOL_RUN_ITEMS.map((it) => ({ ...it }));
 const REASONING_STEPS: ReasoningStepItem[] = [
 	{
 		title: "Inspect the measure signatures",
@@ -583,13 +604,13 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Reasoning (collapsed / expanded / low-LOD count) ─────────────────────
 	preview(
-		{ id: "reasoning-collapsed", label: "Reasoning · collapsed (L5) @600", width: 600 },
-		(w) => measureReasoning(REASONING_DATA, w, 5, {}),
+		{ id: "reasoning-collapsed", label: "Reasoning · collapsed (L4) @600", width: 600 },
+		(w) => measureReasoning(REASONING_DATA, w, 4, {}),
 		(m) => <RenderReasoning measured={m} />,
 	),
 	preview(
-		{ id: "reasoning-expanded", label: "Reasoning · expanded (L5) @600", width: 600 },
-		(w) => measureReasoning(REASONING_DATA, w, 5, { expanded: true }),
+		{ id: "reasoning-expanded", label: "Reasoning · expanded (L4) @600", width: 600 },
+		(w) => measureReasoning(REASONING_DATA, w, 4, { expanded: true }),
 		(m) => <RenderReasoning measured={m} />,
 	),
 	preview(
@@ -653,10 +674,8 @@ const HARNESS_CASES: HarnessCase[] = [
 		hasAvatar: true,
 		color: "indigo",
 	}),
-	...systemSimpleCase("review_feedback", "System · review feedback", {
-		text: "Review complete · 3 comments · 1 blocking",
-		color: "gray",
-	}),
+	// review_feedback is no longer a system-simple card either: it wraps its findings and
+	// carries an action button, so it lives in the system-text group below.
 	// spec_continuation / spec_blocked_continuation are no longer system-simple cards:
 	// the framed bubble draws them as a task row (RenderSpecTask). See measure-spec-task.
 
@@ -686,6 +705,29 @@ const HARNESS_CASES: HarnessCase[] = [
 		variant: "fork",
 		color: "indigo",
 	}),
+
+	// ── Review card ───────────────────────────────────────────────────────────
+	// Its own element rather than a system-text case: the body is real markdown inside a
+	// capped scroll box, so a long conclusion scrolls instead of growing the row.
+	preview(
+		{ id: "review-card", label: "Review card · changes requested @600", width: 600 },
+		(w) =>
+			measureReviewCard(
+				{
+					text: REVIEW_CONCLUSION_MD,
+					verdictLabel: "Changes Requested",
+					color: "orange",
+					actionLabel: "Handle",
+				},
+				w,
+			),
+		(m) => (
+			<RenderReviewCard
+				measured={m}
+				data={{ verdictLabel: "Changes Requested", color: "orange", actionLabel: "Handle" }}
+			/>
+		),
+	),
 
 	// ── Knowledge hint ────────────────────────────────────────────────────────
 	preview(
@@ -720,8 +762,8 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Tool call (collapsed / expanded spec-tasks / expanded generic) ───────
 	preview(
-		{ id: "tool-call-collapsed", label: "Tool call · collapsed (L5) @600", width: 600 },
-		(w) => measureToolCall(TOOL_CALL_READ, w, 5, { opened: false, isRecent: true }),
+		{ id: "tool-call-collapsed", label: "Tool call · collapsed (L4) @600", width: 600 },
+		(w) => measureToolCall(TOOL_CALL_READ, w, 4, { opened: false, isRecent: true }),
 		(m) => <RenderToolCall measured={m} />,
 	),
 	preview(
@@ -751,12 +793,7 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Tool-run trace family ─────────────────────────────────────────────────
 	preview(
-		{ id: "tool-run-summary", label: "Tool run summary (L3) @600", width: 600 },
-		(w) => measureToolRunSummary(TOOL_RUN_ITEMS, w, {}, { label: "Tool calls", count: "6" }),
-		(m) => <RenderToolRun measured={m} />,
-	),
-	preview(
-		{ id: "tool-run-count", label: "Tool run count line (L2) @600", width: 600 },
+		{ id: "tool-run-count", label: "Tool run count line (L1/L2) @600", width: 600 },
 		(w) => measureToolRunCountLine(12, w, { label: "Tool calls", count: "12 calls" }),
 		(m) => <RenderTraceCountLine measured={m} />,
 	),
@@ -819,8 +856,8 @@ const HARNESS_CASES: HarnessCase[] = [
 
 	// ── Subagent card (collapsed / expanded) ─────────────────────────────────
 	preview(
-		{ id: "subagent-collapsed", label: "Subagent card · collapsed (L5) @600", width: 600 },
-		(w) => measureSubagentCard(SUBAGENT_DATA, w, 5, { opened: false, isRecent: true }),
+		{ id: "subagent-collapsed", label: "Subagent card · collapsed (L4) @600", width: 600 },
+		(w) => measureSubagentCard(SUBAGENT_DATA, w, 4, { opened: false, isRecent: true }),
 		(m) => (
 			<RenderSubagent
 				measured={m}
@@ -835,8 +872,8 @@ const HARNESS_CASES: HarnessCase[] = [
 		),
 	),
 	preview(
-		{ id: "subagent-expanded", label: "Subagent card · expanded (L5) @600", width: 600 },
-		(w) => measureSubagentCard(SUBAGENT_DATA, w, 5, { opened: true, isRecent: true }),
+		{ id: "subagent-expanded", label: "Subagent card · expanded (L4) @600", width: 600 },
+		(w) => measureSubagentCard(SUBAGENT_DATA, w, 4, { opened: true, isRecent: true }),
 		(m) => (
 			<RenderSubagent
 				measured={m}

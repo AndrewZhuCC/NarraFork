@@ -1,5 +1,6 @@
 import { relations } from "drizzle-orm";
 import {
+	aclGrants,
 	apiRequests,
 	backgroundTasks,
 	benchmarkRuns,
@@ -8,6 +9,10 @@ import {
 	chapterCommits,
 	chapterEdges,
 	chapters,
+	chatAttachments,
+	chatMessages,
+	chatRoomMembers,
+	chatRooms,
 	containerInstances,
 	explorationGroups,
 	gatewaySessionMappings,
@@ -20,6 +25,7 @@ import {
 	narratorBufferedMessages,
 	narratorDrafts,
 	narratorFileSnapshots,
+	narratorGrants,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -158,9 +164,41 @@ export const narratorsRelations = relations(narrators, ({ one, many }) => ({
 	blacklistCmds: many(narratorBlacklistCmds),
 	bufferedMessages: many(narratorBufferedMessages),
 	drafts: many(narratorDrafts),
+	owner: one(users, {
+		fields: [narrators.ownerUserId],
+		references: [users.id],
+		relationName: "narratorOwner",
+	}),
+	grants: many(narratorGrants, { relationName: "narratorGrantNarrator" }),
 	specNamespace: one(specNamespaces, {
 		fields: [narrators.id],
 		references: [specNamespaces.narratorId],
+	}),
+}));
+
+/**
+ * `acl_grants` has no relations to its scope: `scope_id` is polymorphic (a project,
+ * chapter, narrator or knowledge id depending on `scope_type`), so there is no
+ * single table for Drizzle to join. Resolution goes through `acl-scope.ts`.
+ */
+export const aclGrantsRelations = relations(aclGrants, ({ one }) => ({
+	grantedByUser: one(users, {
+		fields: [aclGrants.grantedBy],
+		references: [users.id],
+		relationName: "aclGrantGrantedBy",
+	}),
+}));
+
+export const narratorGrantsRelations = relations(narratorGrants, ({ one }) => ({
+	narrator: one(narrators, {
+		fields: [narratorGrants.narratorId],
+		references: [narrators.id],
+		relationName: "narratorGrantNarrator",
+	}),
+	grantedByUser: one(users, {
+		fields: [narratorGrants.grantedBy],
+		references: [users.id],
+		relationName: "narratorGrantGrantedBy",
 	}),
 }));
 
@@ -306,6 +344,9 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	favoriteDirectories: many(userFavoriteDirectories),
 	workspaces: many(workspaces),
 	drafts: many(narratorDrafts),
+	narratorsOwned: many(narrators, { relationName: "narratorOwner" }),
+	narratorGrantsIssued: many(narratorGrants, { relationName: "narratorGrantGrantedBy" }),
+	aclGrantsIssued: many(aclGrants, { relationName: "aclGrantGrantedBy" }),
 	recentTabs: many(userRecentTabs),
 	preferences: one(userPreferences, {
 		fields: [users.id],
@@ -328,6 +369,61 @@ export const usersRelations = relations(users, ({ many, one }) => ({
 	}),
 	registrationCodesCreated: many(registrationCodes, { relationName: "registrationCodeCreator" }),
 	registrationCodesUsed: many(registrationCodes, { relationName: "registrationCodeRedeemer" }),
+	chatRoomMemberships: many(chatRoomMembers),
+	chatMessagesSent: many(chatMessages),
+}));
+
+export const chatRoomsRelations = relations(chatRooms, ({ one, many }) => ({
+	narrator: one(narrators, {
+		fields: [chatRooms.narratorId],
+		references: [narrators.id],
+	}),
+	members: many(chatRoomMembers),
+	messages: many(chatMessages),
+	attachments: many(chatAttachments),
+}));
+
+export const chatRoomMembersRelations = relations(chatRoomMembers, ({ one }) => ({
+	room: one(chatRooms, {
+		fields: [chatRoomMembers.roomId],
+		references: [chatRooms.id],
+	}),
+	user: one(users, {
+		fields: [chatRoomMembers.userId],
+		references: [users.id],
+	}),
+}));
+
+export const chatMessagesRelations = relations(chatMessages, ({ one, many }) => ({
+	room: one(chatRooms, {
+		fields: [chatMessages.roomId],
+		references: [chatRooms.id],
+	}),
+	sender: one(users, {
+		fields: [chatMessages.senderUserId],
+		references: [users.id],
+	}),
+	// The reply snapshot columns are deliberately NOT modelled as a relation: the
+	// point of the snapshot is that the quote renders without reading the target
+	// row, and a declared relation invites exactly the join it exists to avoid.
+	attachments: many(chatAttachments),
+}));
+
+export const chatAttachmentsRelations = relations(chatAttachments, ({ one }) => ({
+	room: one(chatRooms, {
+		fields: [chatAttachments.roomId],
+		references: [chatRooms.id],
+	}),
+	// `messageId` has no FK (the row predates its message), so this is a plain
+	// field mapping rather than a constrained reference.
+	message: one(chatMessages, {
+		fields: [chatAttachments.messageId],
+		references: [chatMessages.id],
+	}),
+	uploader: one(users, {
+		fields: [chatAttachments.uploaderUserId],
+		references: [users.id],
+	}),
 }));
 
 export const registrationCodesRelations = relations(registrationCodes, ({ one }) => ({

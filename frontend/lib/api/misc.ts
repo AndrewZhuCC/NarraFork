@@ -4,6 +4,7 @@ import type {
 } from "@frontend/types/usage-history";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
 import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
 	ChangelogEntry,
@@ -992,6 +993,25 @@ export const miscApi = {
 			method: "POST",
 			body: JSON.stringify({ path }),
 		}),
+	/**
+	 * Fetch a file for saving to disk.
+	 *
+	 * Not a plain link: `/api/fs/download` is behind the session gate, so the bytes
+	 * have to come through `authorizedFetch` and be handed to the browser as a Blob.
+	 * The server's `Content-Disposition` name is preferred over deriving one from
+	 * the path, since it has already been sanitized for use as a filename.
+	 */
+	fsDownload: async (path: string) => {
+		const res = await authorizedFetch(`${BASE}/fs/download?path=${encodeURIComponent(path)}`);
+		if (!res.ok) {
+			const error = await readFetchError(res, "Download failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
+	},
 
 	// Routines
 	getRoutines: () =>
@@ -1035,6 +1055,14 @@ export const miscApi = {
 			content: string | null;
 			filePath: string | null;
 			candidates: Array<{ path: string; exists: boolean }>;
+			/**
+			 * `content` is a byte-capped prefix, not the whole file. Saving it would write
+			 * the prefix over the original and destroy everything past the cut, so the
+			 * editor must refuse to save while this is true.
+			 */
+			truncated?: boolean;
+			/** Real size on disk, for telling the reader what they are not seeing. */
+			totalBytes?: number;
 		}>("/routines/global-prompt"),
 	updateGlobalPrompt: (data: { content: string; filePath?: string }) =>
 		request<{ ok: boolean; filePath: string }>("/routines/global-prompt", {
@@ -1128,7 +1156,7 @@ export const miscApi = {
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
-	cleanupStorage: (target: "uploads" | "shares" | "worktrees" | "containers") =>
+	cleanupStorage: (target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers") =>
 		request<{
 			ok: boolean;
 			removed?: number;

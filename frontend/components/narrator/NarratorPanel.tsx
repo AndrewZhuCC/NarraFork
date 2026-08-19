@@ -45,6 +45,8 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
 import { MAX_NARRATOR_DRAFT_CHARS } from "@shared/narrator-limits";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import {
@@ -79,6 +81,7 @@ import {
 	IconInfoCircle,
 	IconLock,
 	IconLockOpen,
+	IconMessages,
 	IconNotebook,
 	IconPaperclip,
 	IconPencil,
@@ -113,10 +116,12 @@ import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
+import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
+import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
 import { useNamedNarrators } from "../../hooks/useNamedNarrator";
 import {
@@ -309,6 +314,7 @@ import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
 import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
+import { revealSpecFile } from "./spec-file-reveal";
 import {
 	getGlobalCloseSwipe,
 	type SwipeAnchorInfo,
@@ -459,6 +465,14 @@ const SpecPanel = lazy(() =>
 const FileModificationsDrawer = lazy(() =>
 	import("./FileModificationsDrawer").then((module) => ({
 		default: module.FileModificationsDrawer,
+	})),
+);
+// Body of the read-only file viewer. Shared with the `file` dock panel — the
+// drawer below is just the off-dock (mobile) host for the same content, so both
+// surfaces show the same viewer instead of the drawer growing its own.
+const FileViewerContent = lazy(() =>
+	import("./file-viewer/FileViewerContent").then((module) => ({
+		default: module.FileViewerContent,
 	})),
 );
 
@@ -2130,6 +2144,7 @@ export function NarratorPanel({
 		providerLabels,
 		nugProviderIdByPrefix,
 	} = useAllModels();
+	const modelCardIndex = useModelCardIndex();
 	const { data: currentUser } = useCurrentUser();
 	const currentUserId = currentUser?.id ? String(currentUser.id) : null;
 	const { data: userPrefs } = useUserPreferences();
@@ -2199,6 +2214,14 @@ export function NarratorPanel({
 	const browserSessionsCapability = useNarratorBrowserSessionsCapability();
 	const confirm = useConfirmDialog();
 	const { t: tt } = useTranslation("terminal");
+	const { t: tChat } = useTranslation("chat");
+	// Unread count for the discussion-room toolbar entry. The room is resolved only
+	// in dock mode (that is the only surface with a panel to open), and the count
+	// comes from the shared unread summary rather than a per-narrator request.
+	const userChatRoomQuery = useNarratorChatRoom(narratorId, !!dock && !isWorkspacePreview);
+	const chatUnreadQuery = useChatUnread();
+	const userChatRoomId = userChatRoomQuery.data?.id;
+	const userChatUnread = userChatRoomId ? (chatUnreadQuery.data?.byRoom[userChatRoomId] ?? 0) : 0;
 	const qc = useQueryClient();
 	const executionDevicesQuery = useQuery({
 		queryKey: ["narratorExecutionDevices", narratorId],
@@ -2379,6 +2402,17 @@ export function NarratorPanel({
 	}, [promoteMutation, narratorId, t, navigate]);
 
 	const displayTitle = narrator?.title || t("untitled");
+	/**
+	 * A chapter node's header already shows this title and owns the edit / generate
+	 * actions, so drawing them again here is not just redundant — this header's dozen
+	 * tool buttons squeezed the title to zero width, leaving the node with a header
+	 * full of icons and no readable title at all. The whole title block is dropped in
+	 * that case, which also hands its width to the tool row.
+	 *
+	 * The editing state below stays wired up: every other surface (focus page,
+	 * workspace, detached subagent panel) still renders this block.
+	 */
+	const hostOwnsTitle = dock?.hostOwnsTitle === true;
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
@@ -2521,9 +2555,26 @@ export function NarratorPanel({
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
 		// NUG kiro models: use the per-model effort levels reported by the gateway.
+		// Ahead of cards on purpose — a gateway is first-hand authoritative about
+		// the tiers its own channel accepts.
 		if (resolvedModelOption?.channelType === "kiro") {
 			const kiroOptions = getKiroReasoningEffortOptions(resolvedModelOption);
 			if (kiroOptions) return kiroOptions;
+		}
+		// Model cards: the editable replacement for the hardcoded per-model tables.
+		// `none` is appended here rather than stored on the card, because on a card
+		// it would become a clamp target able to silently turn a requested `low`
+		// into thinking switched off.
+		const cardTiers = modelCardIndex
+			? cardEffortLevels(
+					lookupModelCard(
+						getBareModelForReasoning(resolvedModel, resolvedModelOption),
+						modelCardIndex,
+					)?.card,
+				)
+			: undefined;
+		if (cardTiers?.length) {
+			return ["none", ...cardTiers] as readonly ReasoningEffortValue[];
 		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
@@ -2561,6 +2612,7 @@ export function NarratorPanel({
 	}, [
 		codexCapableProviders,
 		isCodexChannelModel,
+		modelCardIndex,
 		resolvedModel,
 		resolvedModelOption,
 		settingsData?.anthropicProviders,
@@ -3294,114 +3346,186 @@ export function NarratorPanel({
 			unregister?.();
 		};
 	}, [appendInputRef, dock]);
+	/*
+	 * Pending attachments — images and text files.
+	 *
+	 * Both kinds are persisted, and both share ONE set of bookkeeping refs below
+	 * (`attachmentDraftLocalVersionRef` / `attachmentDraftSaveSeqRef` /
+	 * `attachmentDraftHydratedKeyRef`) because they are stored in a SINGLE
+	 * IndexedDB record per `(user, narrator)`. Two independent version counters
+	 * would race on that one record: whichever kind saved last would write its own
+	 * fresh list beside the other kind's stale one.
+	 */
 	const [attachedImages, setAttachedImages] = useState<File[]>([]);
 	const openImageViewer = useImageViewer();
 	const attachedImagesRef = useRef<File[]>(attachedImages);
 	attachedImagesRef.current = attachedImages;
-	const imageDraftHydratedKeyRef = useRef<string | null>(null);
-	const imageDraftSaveSeqRef = useRef(0);
-	const imageDraftLocalVersionRef = useRef(0);
+	const attachmentDraftHydratedKeyRef = useRef<string | null>(null);
+	const attachmentDraftSaveSeqRef = useRef(0);
+	const attachmentDraftLocalVersionRef = useRef(0);
 	const [attachedTextFiles, setAttachedTextFiles] = useState<File[]>([]);
+	// Mirrors `attachedTextFiles` for the same reason `attachedImagesRef` exists:
+	// callers registered once (the user-chat forward bridge) must read the CURRENT
+	// attachments without re-registering on every change.
+	const attachedTextFilesRef = useRef<File[]>(attachedTextFiles);
+	attachedTextFilesRef.current = attachedTextFiles;
 	const [isDragging, setIsDragging] = useState(false);
 	const dragCounterRef = useRef(0);
-	const warnDraftImagesPersistenceFailure = useCallback((action: string, err: unknown) => {
+	const warnDraftAttachmentsPersistenceFailure = useCallback((action: string, err: unknown) => {
 		if (import.meta.env.DEV) {
-			console.warn(`[NarratorPanel] Failed to ${action} draft images:`, err);
+			console.warn(`[NarratorPanel] Failed to ${action} draft attachments:`, err);
 		}
 	}, []);
 	const updateAttachedImages = useCallback((next: SetStateAction<File[]>) => {
-		imageDraftLocalVersionRef.current++;
+		attachmentDraftLocalVersionRef.current++;
 		setAttachedImages((prev) => {
 			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
 			attachedImagesRef.current = resolved;
 			return resolved;
 		});
 	}, []);
-	const persistCurrentDraftImages = useCallback(
+	/**
+	 * Text-file counterpart of `updateAttachedImages`.
+	 *
+	 * Every mutation of `attachedTextFiles` must go through this rather than the
+	 * raw setter: it is what bumps the shared local-version counter, without which
+	 * an in-flight hydrate would overwrite a file the user just attached.
+	 */
+	const updateAttachedTextFiles = useCallback((next: SetStateAction<File[]>) => {
+		attachmentDraftLocalVersionRef.current++;
+		setAttachedTextFiles((prev) => {
+			const resolved = typeof next === "function" ? (next as (prev: File[]) => File[])(prev) : next;
+			attachedTextFilesRef.current = resolved;
+			return resolved;
+		});
+	}, []);
+	const persistCurrentDraftAttachments = useCallback(
 		(targetUserId: string, targetNarratorId: string) => {
-			const seq = ++imageDraftSaveSeqRef.current;
+			const seq = ++attachmentDraftSaveSeqRef.current;
 			void saveDraftImageAttachments(
 				targetUserId,
 				targetNarratorId,
 				attachedImagesRef.current,
+				attachedTextFilesRef.current,
 			).catch((err) => {
-				if (seq === imageDraftSaveSeqRef.current) {
-					warnDraftImagesPersistenceFailure("save", err);
+				if (seq === attachmentDraftSaveSeqRef.current) {
+					warnDraftAttachmentsPersistenceFailure("save", err);
 				}
 			});
 		},
-		[warnDraftImagesPersistenceFailure],
+		[warnDraftAttachmentsPersistenceFailure],
 	);
-	const hideAttachedImagesForSend = useCallback(() => {
-		imageDraftLocalVersionRef.current++;
+	/**
+	 * Clear the on-screen attachments for an in-flight send, WITHOUT touching the
+	 * stored draft — a failed send restores them, and the record has to still be
+	 * there for that to mean anything.
+	 */
+	const hideAttachedFilesForSend = useCallback(() => {
+		attachmentDraftLocalVersionRef.current++;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 	}, []);
-	const clearAttachedImagesAndDraft = useCallback(() => {
-		imageDraftLocalVersionRef.current++;
+	const clearAttachedFilesAndDraft = useCallback(() => {
+		attachmentDraftLocalVersionRef.current++;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 		if (!currentUserId) return;
-		const seq = ++imageDraftSaveSeqRef.current;
+		const seq = ++attachmentDraftSaveSeqRef.current;
 		void clearDraftImageAttachments(currentUserId, narratorId).catch((err) => {
-			if (seq === imageDraftSaveSeqRef.current) {
-				warnDraftImagesPersistenceFailure("clear", err);
+			if (seq === attachmentDraftSaveSeqRef.current) {
+				warnDraftAttachmentsPersistenceFailure("clear", err);
 			}
 		});
-	}, [currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
+	}, [currentUserId, narratorId, warnDraftAttachmentsPersistenceFailure]);
 
 	useEffect(() => {
 		let cancelled = false;
-		const localVersionAtRequest = imageDraftLocalVersionRef.current;
+		const localVersionAtRequest = attachmentDraftLocalVersionRef.current;
 		const draftKey = currentUserId ? getDraftImageAttachmentKey(currentUserId, narratorId) : null;
-		imageDraftHydratedKeyRef.current = null;
+		attachmentDraftHydratedKeyRef.current = null;
 		attachedImagesRef.current = [];
+		attachedTextFilesRef.current = [];
 		setAttachedImages([]);
+		setAttachedTextFiles([]);
 		if (!currentUserId || !draftKey) return;
 
 		const persistLocalChanges = () => {
-			if (imageDraftLocalVersionRef.current !== localVersionAtRequest) {
-				persistCurrentDraftImages(currentUserId, narratorId);
+			if (attachmentDraftLocalVersionRef.current !== localVersionAtRequest) {
+				persistCurrentDraftAttachments(currentUserId, narratorId);
 			}
 		};
 
 		void loadDraftImageAttachments(currentUserId, narratorId)
-			.then((files) => {
+			.then((loaded) => {
 				if (cancelled) return;
-				imageDraftHydratedKeyRef.current = draftKey;
-				if (imageDraftLocalVersionRef.current === localVersionAtRequest) {
-					attachedImagesRef.current = files;
-					setAttachedImages(files);
+				attachmentDraftHydratedKeyRef.current = draftKey;
+				if (attachmentDraftLocalVersionRef.current === localVersionAtRequest) {
+					attachedImagesRef.current = loaded.images;
+					attachedTextFilesRef.current = loaded.textFiles;
+					setAttachedImages(loaded.images);
+					setAttachedTextFiles(loaded.textFiles);
+					// An entry that was stored but cannot be rebuilt (blob evicted by the
+					// browser, unreadable record) must be reported: silently restoring
+					// two of three attachments looks like the user misremembered.
+					if (loaded.droppedCount > 0) {
+						notifications.show({
+							color: "yellow",
+							title: t("draftAttachmentsRestoreFailedTitle"),
+							message: t("draftAttachmentsRestoreFailed", { count: loaded.droppedCount }),
+						});
+					}
 				} else {
 					persistLocalChanges();
 				}
 			})
 			.catch((err) => {
 				if (cancelled) return;
-				warnDraftImagesPersistenceFailure("load", err);
-				imageDraftHydratedKeyRef.current = draftKey;
+				warnDraftAttachmentsPersistenceFailure("load", err);
+				attachmentDraftHydratedKeyRef.current = draftKey;
 				persistLocalChanges();
 			});
 
 		return () => {
 			cancelled = true;
 		};
-	}, [currentUserId, narratorId, persistCurrentDraftImages, warnDraftImagesPersistenceFailure]);
+	}, [
+		currentUserId,
+		narratorId,
+		persistCurrentDraftAttachments,
+		warnDraftAttachmentsPersistenceFailure,
+		t,
+	]);
 
 	useEffect(() => {
 		if (
 			!currentUserId ||
 			sendingRef.current ||
-			imageDraftHydratedKeyRef.current !== getDraftImageAttachmentKey(currentUserId, narratorId)
+			attachmentDraftHydratedKeyRef.current !==
+				getDraftImageAttachmentKey(currentUserId, narratorId)
 		)
 			return;
-		const seq = ++imageDraftSaveSeqRef.current;
-		void saveDraftImageAttachments(currentUserId, narratorId, attachedImages).catch((err) => {
-			if (seq === imageDraftSaveSeqRef.current) {
-				warnDraftImagesPersistenceFailure("save", err);
+		const seq = ++attachmentDraftSaveSeqRef.current;
+		void saveDraftImageAttachments(
+			currentUserId,
+			narratorId,
+			attachedImages,
+			attachedTextFiles,
+		).catch((err) => {
+			if (seq === attachmentDraftSaveSeqRef.current) {
+				warnDraftAttachmentsPersistenceFailure("save", err);
 			}
 		});
-	}, [attachedImages, currentUserId, narratorId, warnDraftImagesPersistenceFailure]);
+	}, [
+		attachedImages,
+		attachedTextFiles,
+		currentUserId,
+		narratorId,
+		warnDraftAttachmentsPersistenceFailure,
+	]);
 
 	// --- Scroll state ---
 	const [isAtBottom, setIsAtBottom] = useState(true);
@@ -4691,9 +4815,15 @@ export function NarratorPanel({
 		narratorIsIdle &&
 		retryRecoveryAllowsRetry;
 
+	// A trailing injection (`role: "sys"`) is continuable for the same reason a stalled
+	// assistant turn is: it is content the narrator has been handed and has not answered.
+	// Requiring `assistant` here left an injection-terminated conversation with no primary
+	// action at all — Retry wants a `user` tail, so the reader got a disabled send button
+	// and no way to say "go on". `tailRoleAllowsContinue` is the shared rule the server's
+	// continue path reads too.
 	const canContinueNarrator =
 		!!effectiveLastMessage &&
-		effectiveLastMessage.role === "assistant" &&
+		tailRoleAllowsContinue(effectiveLastMessage.role) &&
 		!String(effectiveLastMessage.id).startsWith("optimistic-") &&
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
@@ -5166,27 +5296,100 @@ export function NarratorPanel({
 	const canCancelSubagentBackground =
 		subagentsCapability.supported && subagentsCapability.background;
 
-	// Open a file path in a read-only dock panel. Only available when this panel is
-	// hosted by a dockview surface (focus page / workspace); a graph embed or a
-	// standalone render has no surface to open into, so the handler stays undefined
-	// and every "open in panel" affordance hides itself.
+	// Open a file path in a read-only viewer. Two routes, in precedence order —
+	// mirroring the spec panel's dock/drawer split:
+	//  1. dock file panel — a dockview surface can host a real tab beside the chat.
+	//  2. internal drawer — off-dock surfaces (the mobile narrator page, which
+	//     renders NarratorPanel directly with no dock) get the same viewer inside a
+	//     Drawer. Without this the swipe/context menu silently dropped "open in
+	//     panel" on mobile, which is the one surface where a swipe menu is the
+	//     ONLY way to reach it.
+	// Workspace previews stay lightweight and get neither (same rule as the spec
+	// drawer), so their rows leave the affordance hidden rather than dead.
+	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
 	const dockOpenFilePanel = dock?.openFilePanel;
-	const handleOpenFilePanel = useMemo(
-		() => (dockOpenFilePanel ? (filePath: string) => dockOpenFilePanel(filePath) : undefined),
-		[dockOpenFilePanel],
-	);
+	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
+	const handleOpenFilePanel = useMemo(() => {
+		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
+		if (useInternalFileViewer) return (filePath: string) => setInternalFileViewerPath(filePath);
+		return undefined;
+	}, [dockOpenFilePanel, useInternalFileViewer]);
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
 	const handleVlistViewSubagentSession = useCallback(
-		(subagentNarratorId: string) => {
+		(subagentNarratorId: string, messageId?: string) => {
 			if (onViewSubagentSession) {
-				onViewSubagentSession(subagentNarratorId);
+				onViewSubagentSession(subagentNarratorId, messageId);
 				return;
 			}
-			navigate({ to: "/narrators/$narratorId", params: { narratorId: subagentNarratorId } });
+			// Standalone fallback: the narrator page reads `?scrollTo=` as its
+			// highlight target, which is the same jump the dock performs in-place.
+			navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId: subagentNarratorId },
+				search: messageId ? { scrollTo: messageId } : undefined,
+			});
 		},
 		[onViewSubagentSession, navigate],
+	);
+
+	/**
+	 * Open the Dynamic Spec panel with one file selected.
+	 *
+	 * Reuses `openSpecTool` (which opens rather than toggles — a click from a row that
+	 * points at a file must reveal it, never close an open panel) and then asks the
+	 * panel to select the uri. Only bound when this surface HAS a spec panel to open,
+	 * so a row on a surface without one stays inert.
+	 */
+	/**
+	 * Open a knowledge entry a hint row points at.
+	 *
+	 * Prefers the dock panel (staying beside the conversation the hint belongs to) and
+	 * falls back to the route on surfaces without one — the same in-surface-first rule
+	 * `handleVlistViewSubagentSession` follows.
+	 */
+	const dockOpenKnowledgePanel = dock?.openKnowledgePanel;
+	const handleOpenKnowledgeEntry = useCallback(
+		(entryId: string, scope: "global" | "personal") => {
+			if (dockOpenKnowledgePanel) {
+				dockOpenKnowledgePanel(entryId, scope);
+				return;
+			}
+			if (scope === "personal") {
+				navigate({
+					to: "/knowledge/personal/$personalEntryId",
+					params: { personalEntryId: entryId },
+				});
+				return;
+			}
+			navigate({ to: "/knowledge/$entryId", params: { entryId } });
+		},
+		[dockOpenKnowledgePanel, navigate],
+	);
+
+	const handleOpenSpecFile = useCallback(
+		(uri: string) => {
+			openSpecTool();
+			// The panel usually does not exist yet at this point — opening it IS this
+			// click's first effect — so the selection is applied through the registry,
+			// which waits briefly for the panel to mount. See `spec-file-reveal`.
+			revealSpecFile(narratorId, uri);
+		},
+		[openSpecTool, narratorId],
+	);
+
+	/**
+	 * Open a chapter referenced by a review-feedback / merge-summary row.
+	 *
+	 * Always a route: a chapter is not a panel kind, so there is no in-surface
+	 * destination to prefer over navigation.
+	 */
+	const handleOpenChapter = useCallback(
+		(chapterId: string) => {
+			navigate({ to: "/chapters/$chapterId", params: { chapterId } });
+		},
+		[navigate],
 	);
 
 	const handleDetachSubagent = useCallback(async (subagentNarratorId: string) => {
@@ -5234,6 +5437,11 @@ export function NarratorPanel({
 				? handleCancelSubagentBackground
 				: undefined,
 			onOpenFilePanel: handleOpenFilePanel,
+			// Injection-bubble navigation. Each is undefined on surfaces that cannot reach
+			// the destination, which leaves those rows inert rather than dead-clickable.
+			onOpenKnowledgeEntry: handleOpenKnowledgeEntry,
+			onOpenSpecFile: handleOpenSpecFile,
+			onOpenChapter: handleOpenChapter,
 		}),
 		[
 			forkHandler,
@@ -5254,6 +5462,9 @@ export function NarratorPanel({
 			canCancelSubagentBackground,
 			handleCancelSubagentBackground,
 			handleOpenFilePanel,
+			handleOpenKnowledgeEntry,
+			handleOpenSpecFile,
+			handleOpenChapter,
 		],
 	);
 
@@ -5763,8 +5974,7 @@ export function NarratorPanel({
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
 		hideInputForSend();
-		hideAttachedImagesForSend();
-		setAttachedTextFiles([]);
+		hideAttachedFilesForSend();
 		try {
 			const result = await api.sendNarratorMessage(
 				narratorId,
@@ -5777,7 +5987,7 @@ export function NarratorPanel({
 			);
 			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
 			commitInputDraftAfterSend();
-			clearAttachedImagesAndDraft();
+			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
 			// to a direct send (201), scroll so the new content is visible.
 			scrollToBottom(true);
@@ -5786,10 +5996,20 @@ export function NarratorPanel({
 			// Restore input and attachments on error
 			setInput(msg);
 			if (images.length > 0) updateAttachedImages(images);
-			if (textFiles.length > 0) setAttachedTextFiles(textFiles);
+			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
 			throw err; // Re-throw to let caller handle
 		}
 	};
+
+	/**
+	 * Latest `doSendBuffered`, for callers registered once with the dock bridge.
+	 *
+	 * `doSendBuffered` is redefined every render (it closes over the live input and
+	 * attachments), so a bridge that captured it directly would keep calling a
+	 * stale closure with stale attachment state.
+	 */
+	const doSendBufferedRef = useRef(doSendBuffered);
+	doSendBufferedRef.current = doSendBuffered;
 
 	/**
 	 * Core send handler. When the narrator is active, `mode` selects the queue
@@ -5835,8 +6055,7 @@ export function NarratorPanel({
 				const textFiles = [...attachedTextFiles];
 				restoreOnError = { msg, images, textFiles };
 				hideInputForSend();
-				hideAttachedImagesForSend();
-				setAttachedTextFiles([]);
+				hideAttachedFilesForSend();
 
 				const currentCwd =
 					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
@@ -5874,7 +6093,7 @@ export function NarratorPanel({
 				}
 
 				commitInputDraftAfterSend();
-				clearAttachedImagesAndDraft();
+				clearAttachedFilesAndDraft();
 				restoreOnError = null;
 				navigate({ to: "/narrators/$narratorId", params: { narratorId: newNarrator.id } });
 				return;
@@ -5918,11 +6137,10 @@ export function NarratorPanel({
 			// clears the input/attachments up-front for the optimistic bubble.
 			restoreOnError = { msg, images, textFiles };
 			hideInputForSend();
-			hideAttachedImagesForSend();
-			setAttachedTextFiles([]);
+			hideAttachedFilesForSend();
 			await submitMessage(msg, images, textFiles, abortController.signal);
 			commitInputDraftAfterSend();
-			clearAttachedImagesAndDraft();
+			clearAttachedFilesAndDraft();
 			restoreOnError = null;
 		} catch (err) {
 			// Restore the drafted input/attachments so the user doesn't lose their
@@ -5931,7 +6149,7 @@ export function NarratorPanel({
 			if (restoreOnError) {
 				setInput(restoreOnError.msg);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
-				if (restoreOnError.textFiles.length > 0) setAttachedTextFiles(restoreOnError.textFiles);
+				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 			}
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
 			if (isAbortError(err)) {
@@ -5959,6 +6177,49 @@ export function NarratorPanel({
 	};
 	const handleSendRef = useRef(handleSend);
 	handleSendRef.current = handleSend;
+
+	/**
+	 * Submit externally-supplied text as a user message (the user-chat panel's
+	 * "send to narrator").
+	 *
+	 * Routed through `doSendBuffered` — the composer's own send path — rather than
+	 * calling the REST endpoint directly, so a forward that lands mid-turn is
+	 * QUEUED exactly like anything typed here, and the draft / attachment
+	 * bookkeeping stays consistent. The current draft is deliberately preserved:
+	 * the forwarded text is its own message, not an edit of what the user was
+	 * composing.
+	 */
+	useEffect(() => {
+		const register = dock?.registerSubmitToNarrator;
+		if (!register) return;
+		return register((text: string) => {
+			const trimmed = text.trim();
+			if (!trimmed) return;
+			void (async () => {
+				const preservedDraft = inputRef.current;
+				const preservedImages = attachedImagesRef.current;
+				const preservedTextFiles = attachedTextFilesRef.current;
+				try {
+					// Forward-only send: no attachments, and the in-progress draft is put
+					// back afterwards so the operator does not lose what they were typing.
+					setInput(trimmed);
+					updateAttachedImages([]);
+					updateAttachedTextFiles([]);
+					await doSendBufferedRef.current(trimmed, false);
+				} catch (err) {
+					notifications.show({
+						color: "red",
+						title: t("sendFailed", "Failed to send"),
+						message: err instanceof Error ? err.message : "",
+					});
+				} finally {
+					setInput(preservedDraft);
+					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
+					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
+				}
+			})();
+		});
+	}, [dock, t, updateAttachedImages, updateAttachedTextFiles]);
 
 	// The active queue button mirrors the keyboard shortcuts: a short press uses
 	// Enter's mode, while a long press uses Ctrl/Cmd+Enter's mode.
@@ -6230,7 +6491,7 @@ export function NarratorPanel({
 			return true;
 		});
 		if (valid.length > 0) {
-			setAttachedTextFiles((prev) => [...prev, ...valid]);
+			updateAttachedTextFiles((prev) => [...prev, ...valid]);
 		}
 	};
 
@@ -6799,7 +7060,10 @@ export function NarratorPanel({
 		{
 			key: "path-rules",
 			collapsePriority: 10,
-			visualOverflow: { blockStart: 2, inlineEnd: 4 },
+			// Inline reserve only. A vertical reserve cannot protect this badge: it is
+			// painted inside the ActionIcon, which clips its own overflow, so padding
+			// on the wrapper would only push the button off the row's centre line.
+			visualOverflow: { inlineEnd: 4 },
 			render: (mode) => (
 				<PathRulesPopover
 					narratorId={narratorId}
@@ -6896,7 +7160,9 @@ export function NarratorPanel({
 					{
 						key: "terminal",
 						collapsePriority: 40,
-						visualOverflow: { blockStart: 5, inlineEnd: 5 },
+						// The Indicator paints outside the button but inside the toolbar's
+						// `overflow: visible` box, so it needs no vertical reserve either.
+						visualOverflow: { inlineEnd: 5 },
 						render: (mode: "inline" | "menu") =>
 							mode === "menu" ? (
 								<Menu.Item
@@ -6913,12 +7179,24 @@ export function NarratorPanel({
 								</Menu.Item>
 							) : (
 								<Tooltip label={terminalActionLabel}>
+									{/*
+									 * A default (block) Indicator wraps the button in a line box sized by
+									 * the inherited line-height, which is taller than the 22px button and
+									 * silently stretches the whole status row. Pinning it to the button's
+									 * own height keeps the row height a function of the controls.
+									 */}
 									<Indicator
+										inline
 										label={activeTerminalCount}
 										size={14}
 										disabled={activeTerminalCount === 0}
 										offset={2}
 										color="blue"
+										style={{
+											height: "var(--ai-size-sm)",
+											display: "flex",
+											alignItems: "center",
+										}}
 									>
 										<ActionIcon
 											variant="subtle"
@@ -7057,8 +7335,11 @@ export function NarratorPanel({
 										<IconArrowLeft size={16} />
 									</ActionIcon>
 								))}
+							{/* `flex: 1` even when the title is suppressed: it is what pushes the
+							    tool row to the right edge, and it hands the freed width to those
+							    buttons instead of leaving a gap where the title used to be. */}
 							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
-								{editingTitle && !isWorkspacePreview ? (
+								{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
 										value={titleValue}
@@ -7085,7 +7366,7 @@ export function NarratorPanel({
 										{displayTitle}
 									</Text>
 								)}
-								{!isWorkspacePreview && (
+								{!isWorkspacePreview && !hostOwnsTitle && (
 									<>
 										<ActionIcon
 											size="xs"
@@ -7304,6 +7585,27 @@ export function NarratorPanel({
 												onClick={() => dock.toggleToolPanel("browser")}
 											>
 												<IconWorldWww size={16} />
+											</ActionIcon>
+										</Indicator>
+									</Tooltip>
+								)}
+								{dock && (
+									<Tooltip label={tChat("panelTitle")}>
+										<Indicator
+											size={14}
+											offset={4}
+											label={userChatUnread > 99 ? "99+" : userChatUnread}
+											color="blue"
+											disabled={userChatUnread === 0}
+											style={{ display: "flex", alignItems: "center" }}
+										>
+											<ActionIcon
+												size="sm"
+												variant={dock.openToolTypes.has("userchat") ? "light" : "subtle"}
+												color={dock.openToolTypes.has("userchat") ? "indigo" : "gray"}
+												onClick={() => dock.toggleToolPanel("userchat")}
+											>
+												<IconMessages size={16} />
 											</ActionIcon>
 										</Indicator>
 									</Tooltip>
@@ -8023,10 +8325,10 @@ export function NarratorPanel({
 									}}
 								>
 									<IconFile size={14} style={{ flexShrink: 0, opacity: 0.6 }} />
-									<Text size="xs" truncate style={{ maxWidth: 160 }}>
+									<Text size="xs" truncate style={{ maxWidth: 160, minWidth: 0 }}>
 										{file.name}
 									</Text>
-									<Text size="xs" c="dimmed">
+									<Text size="xs" c="dimmed" style={{ flexShrink: 0, whiteSpace: "nowrap" }}>
 										{formatFileSize(file.size)}
 									</Text>
 									<CloseButton
@@ -8034,7 +8336,9 @@ export function NarratorPanel({
 										iconSize={12}
 										variant="transparent"
 										c="dimmed"
-										onClick={() => setAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))}
+										onClick={() =>
+											updateAttachedTextFiles((prev) => prev.filter((_, j) => j !== i))
+										}
 									/>
 								</Group>
 							))}
@@ -9363,6 +9667,53 @@ export function NarratorPanel({
 									onClose={() => setInternalSpecOpen(false)}
 									chromeless
 								/>
+							</Suspense>
+						</Drawer>
+					)}
+
+					{/* Internal file viewer drawer — the off-dock host for "open in panel".
+					    Mounted only while a path is selected (and torn down on close), so a
+					    session that never opens a file pays nothing. Same viewer body the
+					    dock's `file` panel renders. */}
+					{internalFileViewerPath && (
+						<Drawer
+							opened
+							onClose={() => setInternalFileViewerPath(null)}
+							position="right"
+							size={isMobileViewport ? "100%" : 600}
+							// The viewer body already shows the base name; the title carries the
+							// full path so the drawer adds information rather than repeating it.
+							//
+							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
+							// so a deep path keeps the filename — the part that identifies the file —
+							// visible instead of clipping it and leaving only directories.
+							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
+							closeButtonProps={{ size: "sm" }}
+							styles={{
+								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
+								// Mantine's header is a flex row and its title child has no
+								// `min-width: 0`, so a long unbroken path floors at its content
+								// width and pushes the close button off-screen — with no way back
+								// on touch, where there is no Escape key. The title must be the
+								// side that yields.
+								title: { minWidth: 0, flex: 1, overflow: "hidden" },
+								body: {
+									height: safeAreaDrawerBodyHeight(60),
+									padding: 0,
+									display: "flex",
+									flexDirection: "column",
+									...SAFE_AREA_DRAWER_BODY_STYLE,
+								},
+							}}
+						>
+							<Suspense
+								fallback={
+									<Center h="100%">
+										<Loader size="sm" />
+									</Center>
+								}
+							>
+								<FileViewerContent key={internalFileViewerPath} filePath={internalFileViewerPath} />
 							</Suspense>
 						</Drawer>
 					)}

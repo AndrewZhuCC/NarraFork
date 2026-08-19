@@ -21,6 +21,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useLocalPref } from "../../hooks/useLocalPref";
 import { useNarratorReviewToolsCapability } from "../../hooks/usePlatform";
 import {
 	flattenRulerPages,
@@ -54,6 +55,7 @@ import {
 	RulerPixiLayer,
 } from "./pixi/RulerPixiLayer";
 import { RebaseConflictDialog } from "./RebaseConflictDialog";
+import { RulerAnchorNotices } from "./RulerAnchorNotices";
 import { ChapterContextMenu, TickContextMenu } from "./RulerContextMenus";
 import { type CardWorldInfo, SegmentCanvas } from "./SegmentCanvas";
 import {
@@ -74,6 +76,12 @@ import {
 interface RulerFlowProps {
 	projectId: string;
 	focusChapterId?: string | null;
+	/**
+	 * Switch the project back to the classic canvas. Supplied by the project page, which
+	 * owns `flowMode`; the deprecation notice below uses it so the way out is one click
+	 * from inside the view being deprecated rather than a hunt through the toolbar.
+	 */
+	onLeaveDeprecated?: () => void;
 }
 
 /** Multiplier of viewport size used as off-screen buffer for expanded segment canvases */
@@ -245,8 +253,12 @@ function dirtyErrorKey(err: ApiError): string | null {
 	return DIRTY_ERROR_MAP[code] ?? null;
 }
 
-export function RulerFlow({ projectId }: RulerFlowProps) {
+export function RulerFlow({ projectId, onLeaveDeprecated }: RulerFlowProps) {
 	const { t } = useTranslation("graph");
+	const { t: tp } = useTranslation("projects");
+	const [deprecationAcknowledged, setDeprecationAcknowledged] = useLocalPref(
+		"narrafork_ruler_deprecation_ack",
+	);
 	// Paginated, not single-page. `useRulerData` fetches one page (server default 200
 	// commits) with no way to ask for more, so on any repository with a longer history
 	// the backbone was truncated — and a chapter anchored to a commit outside that
@@ -2776,10 +2788,12 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 	const {
 		anchoredChapters: alwaysVisibleChapters,
 		missingTickChapters,
+		rewrittenAnchorChapters,
 		anchorByChapter: liveAnchorByChapter,
 	} = useMemo<{
 		anchoredChapters: PixiChapterInfo[];
 		missingTickChapters: Array<{ id: string; title: string }>;
+		rewrittenAnchorChapters: Array<{ id: string; title: string }>;
 		anchorByChapter: Map<string, string>;
 	}>(() => {
 		const activeChapters = rulerData.activeChapters ?? [];
@@ -2789,6 +2803,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 			return {
 				anchoredChapters: [],
 				missingTickChapters: [],
+				rewrittenAnchorChapters: [],
 				anchorByChapter: new Map<string, string>(),
 			};
 		const result: PixiChapterInfo[] = [];
@@ -2798,7 +2813,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		// separately instead of being dropped — that silent drop is what made chapters
 		// anchored to commits outside the loaded window look deleted.
 		const activeIdSet = new Set(activeChapters.map((ch) => ch.id));
-		const { byStartSha, unanchored } = resolveChapterAnchors(allChapters, (sha) =>
+		const { byStartSha, unanchored, rewrittenAnchors } = resolveChapterAnchors(allChapters, (sha) =>
 			tickPositions.has(sha),
 		);
 		const anchorByChapter = new Map<string, string>();
@@ -2844,6 +2859,7 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 		return {
 			anchoredChapters: result,
 			missingTickChapters: unanchored.map((ch) => ({ id: ch.id, title: ch.title })),
+			rewrittenAnchorChapters: rewrittenAnchors.map((ch) => ({ id: ch.id, title: ch.title })),
 			anchorByChapter,
 		};
 	}, [
@@ -2997,57 +3013,62 @@ export function RulerFlow({ projectId }: RulerFlowProps) {
 				</Card>
 			)}
 
-			{/* Chapters that could not be placed on the backbone.
-			    Without this they were dropped from the layout in silence, which reads as
-			    "my chapter was deleted". Offers the action that usually fixes it — paging
-			    in older commits — and says so plainly when there is nothing left to load. */}
-			{missingTickChapters.length > 0 && (
+			{/* Anchoring notices, collapsed into one badge.
+			    Both concern chapters the backbone could not place exactly: ones with no
+			    position at all (not drawn — which reads as "my chapter was deleted", hence
+			    reporting them) and ones drawn at their fork point because the trunk was
+			    rewritten under them. They were two always-expanded cards covering the start
+			    of the timeline with no way to collapse or dismiss them. */}
+			<RulerAnchorNotices
+				missingTickChapters={missingTickChapters}
+				rewrittenAnchorChapters={rewrittenAnchorChapters}
+				hasPreviousPage={hasPreviousPage}
+				isFetchingPreviousPage={isFetchingPreviousPage}
+				onLoadOlder={() => void fetchPreviousPage()}
+				formatTitles={(titles) => formatNotificationList(titles.map(clampChapterTitle))}
+				top={rulerFallbackMessage ? 68 : 12}
+			/>
+
+			{/* Ruler is deprecated: no longer developed, known issues not being fixed.
+			    Stated inside the view itself, with the switch back to the classic canvas
+			    right there — the alternative is a user discovering the dead end only after
+			    hitting one of those issues. Acknowledged once and then silent, because the
+			    fact is static and does not need repeating on every visit. */}
+			{!deprecationAcknowledged && (
 				<Card
 					withBorder
 					padding="xs"
-					data-testid="ruler-off-backbone-notice"
+					data-testid="ruler-deprecation-notice"
 					style={{
 						position: "absolute",
-						top: rulerFallbackMessage ? 68 : 12,
+						bottom: 12,
 						left: 12,
 						zIndex: 50,
-						maxWidth: 520,
+						maxWidth: 460,
 					}}
 				>
-					<Stack gap={4}>
-						<Text size="xs" c="orange">
-							{t("ruler.offRulerChapters", {
-								count: missingTickChapters.length,
-								titles: formatNotificationList(
-									missingTickChapters.map((ch) => clampChapterTitle(ch.title)),
-								),
-							})}
+					<Stack gap={6}>
+						<Text size="xs" fw={600} c="yellow">
+							{tp("rulerDeprecatedTitle")}
 						</Text>
 						<Text size="xs" c="dimmed">
-							{hasPreviousPage
-								? t("ruler.offRulerChaptersDesc")
-								: t("ruler.offRulerChaptersExhausted")}
+							{tp("rulerDeprecatedDesc")}
 						</Text>
-						{/* A real <Button>, not a clickable <Text>.
-						    This is the only way back to a chapter that fell outside the loaded
-						    window, and as a bare `<Text onClick>` it had no role, no tab stop and
-						    no key handler — a keyboard or screen-reader user could not reach the
-						    single recovery path at all. The parked-work panel below already used
-						    Mantine's Button, so matching it costs nothing. */}
-						{hasPreviousPage && (
-							<Group gap="xs">
-								<Button
-									size="compact-xs"
-									variant="subtle"
-									loading={isFetchingPreviousPage}
-									onClick={() => void fetchPreviousPage()}
-								>
-									{isFetchingPreviousPage
-										? t("ruler.loadingOlderCommits")
-										: t("ruler.loadOlderCommits")}
+						<Group gap="xs">
+							{onLeaveDeprecated && (
+								<Button size="compact-xs" variant="light" onClick={onLeaveDeprecated}>
+									{tp("rulerDeprecatedSwitch")}
 								</Button>
-							</Group>
-						)}
+							)}
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								color="gray"
+								onClick={() => setDeprecationAcknowledged(true)}
+							>
+								{tp("rulerDeprecatedDismiss")}
+							</Button>
+						</Group>
 					</Stack>
 				</Card>
 			)}

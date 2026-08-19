@@ -5,6 +5,7 @@ import { chapters, projects } from "../db/schema";
 import { NotFoundError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { getContainerUnsupportedReason, supportsContainers } from "../lib/platform";
+import { requireChapterAccess, requireProjectAccess } from "../lib/project-access";
 import { getUserLanguage } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { safeSpawn } from "../lib/spawn";
@@ -18,6 +19,8 @@ import {
 	listCommitsSchema,
 	mergeChapterSchema,
 	splitChapterSchema,
+	updateChapterDetachedPanelsSchema,
+	updateChapterDockLayoutSchema,
 	updateChapterSchema,
 } from "../lib/validators";
 import { requireAdmin } from "../middleware/auth";
@@ -43,6 +46,46 @@ import { reviewService } from "../services/review-service";
 
 export const chapterRoutes = new Hono();
 
+/**
+ * Access gate for every `/:id/...` route in this router.
+ *
+ * Chapters have no ACL of their own: they inherit their project's verdict wholesale,
+ * because every chapter worktree lives inside the same git repository and anything
+ * with filesystem access to one chapter can read every branch through `git` or a
+ * `../` path. Per-chapter isolation would be fiction.
+ *
+ * A middleware rather than a call in each of ~30 handlers, so a route is protected
+ * by virtue of existing here and a newly added endpoint does not start out open.
+ * GET is read; every mutating method is project write — creating chapters,
+ * committing, merging, waking worktrees and driving containers all change shared
+ * state.
+ *
+ * Literal collection paths that share the `/:id` shape are skipped; they are matched
+ * by their own more specific routes.
+ */
+const CHAPTER_ID_GATE_EXEMPT_SEGMENTS = new Set([
+	"merge-sessions",
+	"container-setup",
+	"cleanup",
+	"batch-merge",
+	"podman",
+]);
+
+chapterRoutes.use("/:id/*", async (c, next) => {
+	const id = c.req.param("id");
+	if (!id || CHAPTER_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
+	await requireChapterAccess(c, id, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
+
+// The bare `/:id` routes are not covered by the `/:id/*` pattern above.
+chapterRoutes.use("/:id", async (c, next) => {
+	const id = c.req.param("id");
+	if (!id || CHAPTER_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
+	await requireChapterAccess(c, id, c.req.method === "GET" ? "read" : "write");
+	return next();
+});
+
 function containerUnsupportedPayload() {
 	return {
 		error: getContainerUnsupportedReason() ?? "Container management is unsupported",
@@ -55,6 +98,9 @@ chapterRoutes.get("/", async (c) => {
 	const projectId = c.req.query("projectId");
 	const status = c.req.query("status");
 	if (!projectId) return c.json({ error: "projectId is required" }, 400);
+	// Listing a project's chapters exposes its whole structure, so it needs the same
+	// read access as opening the project.
+	await requireProjectAccess(c, projectId, "read");
 	const result = await chapterService.listByProject(projectId, status ?? undefined);
 	return c.json(result);
 });
@@ -62,7 +108,14 @@ chapterRoutes.get("/", async (c) => {
 chapterRoutes.post("/", async (c) => {
 	const parsed = createChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const chapter = await chapterService.create(parsed.data);
+	// Creating a chapter creates a branch and a worktree in the project's repository,
+	// so it needs project write. Not covered by the `/:id` gate — this route has no id.
+	await requireProjectAccess(c, parsed.data.projectId, "write");
+	// Server-trusted creator, so the auto-created narrator has a real owner.
+	const chapter = await chapterService.create({
+		...parsed.data,
+		createdByUserId: c.get("user").sub,
+	});
 	return c.json(chapter, 201);
 });
 
@@ -106,6 +159,71 @@ chapterRoutes.delete("/:id", async (c) => {
 	return c.json({ ok: true });
 });
 
+// === Graph node dock layout ===
+//
+// The dockview layout of a chapter node's embedded surface (which tool panels are
+// open, how they are split). Its own endpoint rather than a field on the chapter
+// or on `PATCH /graph/positions`: it is a multi-KB blob that must never ride
+// along with a node drag or appear in the project graph's per-chapter payload.
+// Access is already gated by the `/:id` middleware above (GET → read, PUT → write).
+
+chapterRoutes.get("/:id/dock-layout", async (c) => {
+	const id = c.req.param("id");
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { dockLayoutJson: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	return c.json({ layout: row.dockLayoutJson ?? null });
+});
+
+chapterRoutes.put("/:id/dock-layout", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateChapterDockLayoutSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// Existence is checked before writing so a stale client (node deleted in
+	// another tab) gets a 404 instead of a silent no-op update.
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { id: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	await db.update(chapters).set({ dockLayoutJson: parsed.data.layout }).where(eq(chapters.id, id));
+	return c.json({ ok: true });
+});
+
+// === Detached panels ===
+//
+// Tool panels torn out of this chapter's node dock, now standing as their own
+// canvas nodes. Separate from the dock layout because that column holds dockview's
+// own serialized grid; custom entries there would break its `fromJSON`.
+
+chapterRoutes.get("/:id/detached-panels", async (c) => {
+	const id = c.req.param("id");
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { detachedPanelsJson: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	return c.json({ panels: row.detachedPanelsJson ?? null });
+});
+
+chapterRoutes.put("/:id/detached-panels", async (c) => {
+	const id = c.req.param("id");
+	const parsed = updateChapterDetachedPanelsSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const row = await db.query.chapters.findFirst({
+		where: eq(chapters.id, id),
+		columns: { id: true },
+	});
+	if (!row) throw new NotFoundError("Chapter", id);
+	await db
+		.update(chapters)
+		.set({ detachedPanelsJson: parsed.data.panels })
+		.where(eq(chapters.id, id));
+	return c.json({ ok: true });
+});
+
 // === Fork ===
 
 chapterRoutes.post("/:id/fork", async (c) => {
@@ -138,7 +256,11 @@ chapterRoutes.post("/:id/review", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const userId = c.get("user").sub;
 	const locale = parsed.data.locale ?? (await getUserLanguage(userId));
-	const chapter = await reviewService.createReview(id, { ...parsed.data, locale });
+	const chapter = await reviewService.createReview(id, {
+		...parsed.data,
+		locale,
+		createdByUserId: userId,
+	});
 	return c.json(chapter, 201);
 });
 
@@ -210,7 +332,7 @@ chapterRoutes.post("/:id/ai-resolve", async (c) => {
 
 chapterRoutes.post("/:id/unmerge", async (c) => {
 	const id = c.req.param("id");
-	const result = await chapterMerge.unmerge(id);
+	const result = await chapterMerge.unmerge(id, c.get("user").sub);
 	return c.json(result);
 });
 
@@ -218,7 +340,7 @@ chapterRoutes.post("/:id/unmerge", async (c) => {
 
 chapterRoutes.post("/:id/dormant", async (c) => {
 	const id = c.req.param("id");
-	await chapterCleanup.dormant(id);
+	await chapterCleanup.dormant(id, c.get("user").sub);
 	return c.json({ ok: true });
 });
 
@@ -233,6 +355,13 @@ chapterRoutes.post("/:id/wake", async (c) => {
 chapterRoutes.post("/cleanup", async (c) => {
 	const parsed = batchCleanupSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// The chapter ids arrive in the body, so the `/:id` gate cannot see them. Each is
+	// authorized individually: a batch must not become a way to destroy worktrees in a
+	// project the caller cannot write to, and one unauthorized id fails the whole call
+	// rather than being silently skipped.
+	for (const chapterId of parsed.data.chapterIds) {
+		await requireChapterAccess(c, chapterId, "write");
+	}
 	const report = await chapterCleanup.batchCleanup(parsed.data.chapterIds, {
 		force: parsed.data.force,
 		deleteBranch: parsed.data.deleteBranch,
@@ -245,6 +374,17 @@ chapterRoutes.post("/cleanup", async (c) => {
 chapterRoutes.post("/batch-merge", async (c) => {
 	const parsed = batchMergeSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	// Merging changes both the sources and the destination, so every chapter involved
+	// is checked. `targetChapterId` is optional — without it the merge forks a new
+	// chapter off `baseChapterId`, which is still a write to that project — so the
+	// base is always checked and the target only when present.
+	for (const chapterId of [
+		parsed.data.baseChapterId,
+		parsed.data.targetChapterId,
+		...parsed.data.sourceChapterIds,
+	]) {
+		if (chapterId) await requireChapterAccess(c, chapterId, "write");
+	}
 	const userId = c.get("user").sub;
 	const locale = await getUserLanguage(userId);
 	const result = await chapterBatchMerge.run({ ...parsed.data, locale, userId });

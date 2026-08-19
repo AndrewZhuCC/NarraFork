@@ -9,9 +9,12 @@ import type {
 import { prepareKiroWorkspaceState } from "../kiro-workspace-telemetry";
 import { resolveProxyForUrl } from "../net/proxy";
 import {
+	dropNugCachedCapability,
 	getNugCachedModelHash,
+	nugSupportsCapability,
 	type ResolvedNugModelMeta,
 	resolveNugModelMeta,
+	setNugCachedCapabilities,
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
 import { getToolMessage, type Locale } from "../prompt-i18n";
@@ -21,6 +24,7 @@ import { settings } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
 import { hostHistoryRuntime, hostNormalizeRuntime } from "./codewhisperer-host-runtime";
+import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { normalizeApiRequestDiagnostics, parseErrorDiagnostics } from "./error-diagnostics";
 import {
@@ -221,6 +225,15 @@ export interface NugBillingOrderResponse {
 	pollIntervalMs?: number;
 }
 
+/**
+ * Capability name for the Anthropic-protocol Kiro endpoint (`/v1/kiro/messages`).
+ *
+ * Must match the string the gateway publishes in `/v1/models`. The two sides have
+ * no compile-time link, so a rename on either would silently send every Kiro
+ * request down the legacy path — which still works, and is therefore invisible.
+ */
+const KIRO_MESSAGES_CAPABILITY = "kiro.messages.v1";
+
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
@@ -320,26 +333,36 @@ export class NugProvider implements ProviderAdapter {
 		const delegateBase = buildNugDelegateBaseConfig(this.config, meta, extraHeaders);
 		switch (meta.channelType) {
 			case "codex":
-				return new OpenAIProvider({
-					...delegateBase,
-					baseUrl: `${this.baseUrl}/v1`,
-					apiMode: "codex",
-					codexWebSocket: false,
-					// apiMode codex already presents the codex-tui originator,
-					// installation id and the stable codex body contract.
-				});
 			case "openai":
-				return new OpenAIProvider({
+			case "responses": {
+				// All three channels carry OpenAI-shaped reasoning credentials
+				// (`encrypted_content`), which are only replayable against the same
+				// gateway channel — tag them with the NUG channel identity instead of
+				// the delegate's own prefix.
+				const delegate = new OpenAIProvider({
 					...delegateBase,
 					baseUrl: `${this.baseUrl}/v1`,
-					apiMode: "completions",
+					apiMode:
+						meta.channelType === "codex"
+							? "codex"
+							: meta.channelType === "responses"
+								? "responses"
+								: "completions",
+					...(meta.channelType === "codex"
+						? {
+								codexWebSocket: false,
+								// apiMode codex already presents the codex-tui originator,
+								// installation id and the stable codex body contract.
+							}
+						: {}),
 				});
-			case "responses":
-				return new OpenAIProvider({
-					...delegateBase,
-					baseUrl: `${this.baseUrl}/v1`,
-					apiMode: "responses",
-				});
+				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
+				// The delegate is created per model, so the target is known here — the
+				// synchronous pushAssistantTurn can classify reasoning (strict vs
+				// relay) without waiting for a chat() run to note it.
+				delegate.noteActiveModel(this.modelForDelegate(meta));
+				return delegate;
+			}
 			case "anthropic": {
 				const delegate = new AnthropicProvider({
 					...delegateBase,
@@ -352,22 +375,114 @@ export class NugProvider implements ProviderAdapter {
 				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
 				return delegate;
 			}
+			case "kiro": {
+				// Gateways that serve `/v1/kiro/messages` speak Anthropic Messages on
+				// the Kiro channel, in both directions. Delegating means this provider
+				// reuses the Anthropic request builder and SSE parser instead of
+				// carrying its own CodeWhisperer implementation.
+				//
+				// Older gateways do not have that endpoint, so the capability has to be
+				// advertised first; without it the native path below still runs.
+				if (!this.supportsKiroMessages()) return null;
+				const delegate = new AnthropicProvider({
+					...delegateBase,
+					baseUrl: `${this.baseUrl}/v1/kiro`,
+					// Not the official API: the mid-conversation `system` role is
+					// unavailable here, which is what makes the history builder lift
+					// trailing sys rows into `trailingUserText` (see its comment) —
+					// exactly the behaviour the Kiro path needs.
+					officialApi: false,
+				});
+				// Signatures minted by this channel are only valid against it, so they
+				// carry the channel identity rather than a generic anthropic one.
+				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
+				// The Anthropic Messages protocol has no conversation-id field, so this
+				// header is the only way the gateway can key credential affinity for a
+				// multi-turn conversation. Without it every turn may land on a different
+				// upstream credential.
+				delegate.setSendConversationIdHeader(true);
+				return delegate;
+			}
 			default:
 				return null;
 		}
 	}
 
 	/**
-	 * Stable `provider:channel` identity for the upstream that mints thinking
-	 * signatures on this channel. Only anthropic-family channels (native `kiro`
-	 * and the `anthropic` delegate) produce signatures; other channels
-	 * (codex/openai/responses) return `undefined`.
+	 * Stable `provider:channel` identity for the upstream that mints reasoning
+	 * credentials on this channel — Anthropic thinking `signature`s on the
+	 * anthropic-family channels, OpenAI `encrypted_content` on
+	 * codex/openai/responses. Credentials are only valid against the channel
+	 * that produced them, so every credential-producing channel reports its
+	 * identity. (Channels that mint no credentials would also be covered by the
+	 * generic template, but no such channelType exists today.)
 	 */
 	private reasoningSourceForMeta(meta: ResolvedNugModelMeta): string | undefined {
-		if (meta.channelType === "kiro" || meta.channelType === "anthropic") {
+		if (
+			meta.channelType === "kiro" ||
+			meta.channelType === "anthropic" ||
+			meta.channelType === "codex" ||
+			meta.channelType === "openai" ||
+			meta.channelType === "responses"
+		) {
 			return `${this.config.prefix}:${meta.channel}`;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Whether this gateway serves the Anthropic-protocol Kiro endpoint.
+	 *
+	 * False for any gateway that has not advertised it, which covers every build
+	 * predating the endpoint as well as one whose advertisement was withdrawn after
+	 * a 404 (see `noteKiroMessagesUnavailable`). False keeps the native Kiro path,
+	 * so an old gateway is unaffected.
+	 */
+	private supportsKiroMessages(): boolean {
+		// Two independent conditions, both required.
+		//
+		// The operator opt-in comes first because it is the one a human controls: a
+		// gateway that advertises the endpoint must still not change this client's
+		// behaviour until someone has verified it end to end. Turning the flag off
+		// is the rollback.
+		if (!this.config.kiroAnthropicProtocol) return false;
+		return nugSupportsCapability(this.config.id, KIRO_MESSAGES_CAPABILITY);
+	}
+
+	/**
+	 * Record that the endpoint is absent despite being advertised, and report
+	 * whether that is new information.
+	 *
+	 * The catalog and the served routes can disagree: rolling the gateway image
+	 * back leaves a cached catalog from the newer build, so the advertisement
+	 * outlives the endpoint. Without this the provider would keep targeting a 404
+	 * on every turn.
+	 */
+	private noteKiroMessagesUnavailable(): boolean {
+		return dropNugCachedCapability(this.config.id, KIRO_MESSAGES_CAPABILITY);
+	}
+
+	/**
+	 * Whether a failure means the advertised Kiro endpoint is not actually served.
+	 *
+	 * Narrow on purpose. Three conditions must all hold:
+	 *
+	 *  - the request went to the Kiro channel through the Anthropic delegate, so a
+	 *    404 from any other channel is somebody else's problem;
+	 *  - nothing was streamed yet, because a 404 mid-stream is not a routing
+	 *    problem and re-running the turn would duplicate delivered output;
+	 *  - the status is exactly 404. A 403/401 means the endpoint exists but the key
+	 *    is wrong, and withdrawing the capability there would hide an auth failure
+	 *    behind a silent protocol downgrade.
+	 */
+	private isKiroMessagesMissing(
+		err: unknown,
+		meta: ResolvedNugModelMeta,
+		yielded: boolean,
+	): boolean {
+		if (meta.channelType !== "kiro" || yielded) return false;
+		if (!(this.activeDelegate instanceof AnthropicProvider)) return false;
+		return err instanceof ApiError && err.status === 404;
 	}
 
 	private ensureDelegateForModel(model: string): ProviderAdapter | null {
@@ -446,9 +561,10 @@ export class NugProvider implements ProviderAdapter {
 		this.activeMeta = meta;
 		this.activeDelegate = this.createDelegate(meta);
 		if (this.activeDelegate) {
-			// Delegate carries its own reasoning-source (the anthropic delegate was
-			// given the NUG channel override in createDelegate; others mint no
-			// signatures), so no extra source plumbing is needed here.
+			// Delegates carry their own reasoning-source override (assigned in
+			// createDelegate: anthropic-family → thinking signatures, codex/openai/
+			// responses → encrypted_content), so no extra source plumbing is needed
+			// here.
 			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
 		}
 		return buildKiroHistory(
@@ -523,13 +639,20 @@ export class NugProvider implements ProviderAdapter {
 		// uses Kiro images.
 		const history = Array.isArray(params.history) ? params.history : undefined;
 		const confirmed = this.confirmedImageRefs;
+		// The dedup walker has to match the shape the history actually holds, which
+		// is decided by the delegate rather than the channel name: a kiro channel
+		// reached through the Anthropic endpoint carries Messages-API image parts,
+		// while the native kiro path carries Kiro images. Dispatching on the channel
+		// alone would walk the wrong shape, find no images, and silently disable
+		// dedup — every turn would resend full payloads.
+		const usesAnthropicHistory = delegate instanceof AnthropicProvider;
 		const dedupHistory = (h: unknown[]): DedupResult => {
-			if (meta.channelType === "anthropic") return dedupAnthropicHistoryImages(h, confirmed);
+			if (usesAnthropicHistory) return dedupAnthropicHistoryImages(h, confirmed);
 			if (delegate) return dedupOpenAIHistoryImages(h, confirmed);
 			return dedupKiroHistoryImages(h, confirmed);
 		};
 		const restoreHistory = (h: unknown[], p: ImagePayloadMap): void => {
-			if (meta.channelType === "anthropic") restoreAnthropicHistoryImages(h, p);
+			if (usesAnthropicHistory) restoreAnthropicHistoryImages(h, p);
 			else if (delegate) restoreOpenAIHistoryImages(h, p);
 			else restoreKiroHistoryImages(h, p);
 		};
@@ -557,6 +680,23 @@ export class NugProvider implements ProviderAdapter {
 			}
 			return;
 		} catch (err) {
+			// The advertised Kiro endpoint is absent: the gateway was rolled back to a
+			// build without it while this client still holds the newer catalog.
+			//
+			// Retrying here is not possible — `params.history` was already built in
+			// the delegate's Anthropic shape, and the native path would hand that to
+			// the Kiro request builder. So the capability is withdrawn (making every
+			// later turn take the native path) and the outer loop is asked to rebuild
+			// history from the database and retry, reusing the mechanism Codex quota
+			// failover already uses for the same reason.
+			if (this.isKiroMessagesMissing(err, meta, yielded)) {
+				this.noteKiroMessagesUnavailable();
+				restore();
+				throw new CodexRebuildHistoryRetryError(
+					"NUG gateway no longer serves /v1/kiro/messages; retrying on the native Kiro protocol",
+					{ operation: "nug_kiro_messages_unavailable" },
+				);
+			}
 			// A cache miss can only occur before any stream event (the gateway
 			// rejects during body resolution). If we already streamed events, or
 			// nothing was stripped, propagate the error.
@@ -1151,6 +1291,7 @@ export class NugProvider implements ProviderAdapter {
 		modelHash?: string;
 		hash?: string;
 		usdRate?: number;
+		capabilities?: string[];
 	}> {
 		const response = await this.pfetch(`${this.baseUrl}/v1/models`, {
 			headers: { Authorization: `Bearer ${this.config.apiKey}`, ...this.modelHashHeaders() },
@@ -1165,6 +1306,7 @@ export class NugProvider implements ProviderAdapter {
 			modelHash?: string;
 			hash?: string;
 			usdRate?: number;
+			capabilities?: unknown;
 		};
 		const headerHash = response.headers.get("X-NUG-Model-Hash")?.trim();
 		if (!data.modelHash && headerHash) {
@@ -1174,6 +1316,16 @@ export class NugProvider implements ProviderAdapter {
 			data.hash = data.modelHash;
 		}
 		const usdRate = typeof data.usdRate === "number" ? data.usdRate : undefined;
-		return { models: data.models ?? [], modelHash: data.modelHash, hash: data.hash, usdRate };
+		// Recorded on every catalog fetch, including when the field is absent: that
+		// clears a stale advertisement, which is what makes a rolled-back gateway
+		// stop being treated as capable.
+		const capabilities = setNugCachedCapabilities(this.config.id, data.capabilities);
+		return {
+			models: data.models ?? [],
+			modelHash: data.modelHash,
+			hash: data.hash,
+			usdRate,
+			...(capabilities ? { capabilities } : {}),
+		};
 	}
 }

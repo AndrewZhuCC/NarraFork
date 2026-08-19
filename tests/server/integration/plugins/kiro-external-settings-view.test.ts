@@ -66,8 +66,29 @@ describe("kiro-external settings view: host contract", () => {
 
 	test("clears the import box so a pasted secret does not linger in the document", async () => {
 		// The textarea is the only place a credential exists in this document; it must not
-		// outlive the request that consumes it.
-		expect(await viewSource()).toContain('box.value = ""');
+		// outlive the request that consumes it. The page is a controlled React input, so the
+		// clear is a state reset rather than an assignment to `.value`.
+		expect(await viewSource()).toContain('setImportText("")');
+	});
+
+	test("does not rely on modal APIs the sandbox ignores", async () => {
+		const source = await viewSource();
+		// The iframe is sandboxed with `allow-scripts` only. Without `allow-modals` the browser
+		// ignores `confirm`/`alert` and returns `undefined`, so `if (!confirm(...)) return;`
+		// lets a destructive action through unconditionally — which is exactly the bug the
+		// hand-written version of this page shipped on credential deletion.
+		expect(source).not.toMatch(/\bwindow\.(confirm|alert|prompt)\b/);
+		expect(source).not.toMatch(/[^.\w](confirm|alert|prompt)\(/);
+	});
+
+	test("does not bundle its own React or Mantine", async () => {
+		const source = await viewSource();
+		// The panel renders with the host's shared runtime. A second copy of React here would
+		// mean components created by one React and rendered by another, and would undo the
+		// size argument for having a shared runtime at all.
+		expect(source).toContain("__nfPluginRuntime");
+		expect(source).not.toContain("react-dom");
+		expect(source).not.toContain("@mantine/core");
 	});
 });
 
@@ -78,6 +99,14 @@ describe("kiro-external settings view: manifest wiring", () => {
 		expect(view).toBeDefined();
 		expect(view?.surfaces).toContain("provider-settings");
 		expect(view?.providerId).toBe("kiro");
+	});
+
+	test("opts into the host UI runtime the page depends on", async () => {
+		// Without this the shell never injects React/Mantine and the page throws on a missing
+		// global. The declaration and the page's use of `__nfPluginRuntime` must agree.
+		const parsed = await manifest();
+		const view = parsed.contributes.views.find((item) => item.id === "kiro-external-settings");
+		expect(view?.runtime).toBe("host-react");
 	});
 
 	test("every command the view invokes is declared with a server handler", async () => {

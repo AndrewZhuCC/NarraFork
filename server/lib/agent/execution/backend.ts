@@ -45,6 +45,23 @@ export interface DeviceSummary {
 	platform?: DevicePlatform;
 	/** Default working directory on the device, when known. */
 	defaultCwd?: string | null;
+	/**
+	 * True when the device is private to the acting user. Drives the default
+	 * injection mode ("my own machine should just be there") without granting any
+	 * additional access — authorization already happened upstream.
+	 */
+	ownedByActingUser?: boolean;
+	/**
+	 * Project axis of the device record. Drives the default injection tier: only an
+	 * administrator can register a `"global"` device, which is what makes "present
+	 * in every session without being asked for" an administrative decision.
+	 *
+	 * Required rather than optional on purpose. An optional field would silently
+	 * read as `undefined` at any construction site that forgot it, and since
+	 * `undefined` is treated as project-scoped, the device would quietly stop being
+	 * injected with no type error to point at the omission.
+	 */
+	scope: "global" | "project";
 }
 
 /** Platform descriptor a backend reports (used for prompt injection + path handling). */

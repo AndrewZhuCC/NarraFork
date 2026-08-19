@@ -49,6 +49,8 @@
  * `shared/codewhisperer`, which bundled plugin code reuses).
  */
 
+import { knowledgeExcerpt } from "./knowledge-excerpt";
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Body payloads
 // ─────────────────────────────────────────────────────────────────────────────
@@ -79,13 +81,41 @@ export interface SideCarDoneTask {
 	preview: string;
 	/** The producer clipped the preview. */
 	truncated?: boolean;
+	/**
+	 * The message INSIDE the agent's own session that produced this result — the
+	 * navigation target when the reader opens that session from this row.
+	 *
+	 * Agent flavour only, and only when one could be resolved: a `bash` task has no
+	 * session to open, and an agent that produced no assistant text has no message
+	 * to aim at (see `getSubagentResultMessageId`). Absent means "open the session
+	 * at its tail", never "jump somewhere arbitrary".
+	 *
+	 * NOT model-facing: the projections ignore it (a message id is meaningless to
+	 * the model, which addresses agents by alias).
+	 */
+	resultMessageId?: string | null;
 }
 
 /** One message delivered from another narrator (subagent / team / buffered user). */
 export interface SideCarInboundMessage {
 	fromId?: string;
 	fromTitle?: string | null;
+	/** Readable alias of the sender, preferred over the id when untitled. */
+	fromLabel?: string | null;
 	fromType?: string | null;
+	/**
+	 * Where this message sits in the SENDER's own session — the navigation target
+	 * when the reader opens that session from this row.
+	 *
+	 * Recorded at send time as the sender's latest message, because a `Send` is not
+	 * itself a message in the sender's history: the closest thing to "where the
+	 * sender was when it said this" is what it had just written. Absent when the
+	 * sender had written nothing yet, or for senders that are not narrators —
+	 * absence means "open at the tail", never "jump somewhere arbitrary".
+	 *
+	 * NOT model-facing: the projections ignore it.
+	 */
+	fromMessageId?: string | null;
 	/** Team channel only: the message went to everyone. */
 	isBroadcast?: boolean;
 	text: string;
@@ -218,8 +248,14 @@ export function readSideCarBody(record: unknown): SideCarBody | undefined {
  * Deliberately NOT exported: it is a private staging vocabulary between the body
  * switch and the Markdown emitter. The one thing outside this module ever sees is
  * the Markdown string.
+ *
+ * `verbatim` is the one kind that is NOT prose: it carries preformatted machine output
+ * (a background command's stdout/stderr) that must reach the reader byte-for-byte, so
+ * the emitter fences it instead of escaping it line by line. The distinction cannot be
+ * recovered later — by the time the emitter sees a `text` line, whether its leading
+ * spaces were a linter's gutter or an accident of prose is unknowable.
  */
-type SideCarLineKind = "heading" | "text" | "bullet" | "meta";
+type SideCarLineKind = "heading" | "text" | "bullet" | "meta" | "verbatim";
 
 interface SideCarLine {
 	kind: SideCarLineKind;
@@ -252,7 +288,7 @@ export type SideCarLabels = Readonly<Record<string, string>>;
 export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = {
 	// Per-source headline for the fixed reminders.
 	noticeSilentProgress: "You have made {count} tool calls without a visible reply",
-	noticeRelaxedPlan: "Still in plan mode — keep planning, do not implement yet",
+	noticeRelaxedPlan: "Still planning — write the plan to {planFile}, do not implement yet",
 	noticePipelineExit: "Pipeline is still active — confirm whether it is still needed",
 	// Dynamic Spec digests.
 	tasksCurrent: "Dynamic Spec — {n} open task(s)",
@@ -323,8 +359,10 @@ function flatten(text: string, max = 160): string {
 	if (compact.length > max) return `${compact.slice(0, max)}…`;
 	// A whitespace-heavy prefix can collapse to under `max` even though the input was
 	// long, so the ellipsis has to be decided by whether real text survives past the
-	// cut. Probed with a sticky-start regex rather than `slice(cut).trim()` so the
-	// discarded tail is never materialized.
+	// cut. Probed by searching forward FROM the cut position (a `g` regex resumes at
+	// `lastIndex`; note this is not `y`/sticky, which would require a match exactly AT
+	// that index) rather than with `slice(cut).trim()`, so the discarded tail is never
+	// materialized.
 	const probe = /\S/g;
 	probe.lastIndex = cut;
 	return probe.test(text) ? `${compact}…` : compact;
@@ -384,7 +422,12 @@ function noticeHeadline(
 		case "silent_progress":
 			return labelWith(labels, "noticeSilentProgress", { count: params?.count ?? 0 });
 		case "relaxed_plan":
-			return label(labels, "noticeRelaxedPlan");
+			// A row written before the reminder named the plan file has no `planFile`
+			// param, so the placeholder would render literally. Fall back to the
+			// directory, which is where every plan file lives anyway.
+			return labelWith(labels, "noticeRelaxedPlan", {
+				planFile: params?.planFile ?? ".narrafork/plans/",
+			});
 		case "pipeline_exit_confirmation":
 			return label(labels, "noticePipelineExit");
 		default:
@@ -448,12 +491,16 @@ function projectSideCarBody(
 			// Only the tasks are projected. The digest's other half — "keep tasks.json to
 			// only text/status/protected", "do not add IDs" — is instruction aimed at the
 			// model; showing it to the reader is the noise this redesign removes.
+			// A `todo` task used to also carry `dimmed: true` here. It was dead on arrival:
+			// `SideCarLine` has no such field (the spread of an object literal is how it got
+			// past the excess-property check), and the only consumer of these lines —
+			// `presentationToMarkdown` — has no Markdown to map it to and says so. The role
+			// prefix already in the text ("todo: …") is what carries that distinction.
 			const lines: SideCarLine[] = tasks.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((task) => ({
 				kind: "bullet" as const,
 				text: `${label(labels, taskRoleKey(task.role))}: ${task.text}${
 					task.protected ? ` · ${label(labels, "taskProtected")}` : ""
 				}`,
-				...(task.role === "todo" ? { dimmed: true } : {}),
 			}));
 			return { headline, lines };
 		}
@@ -461,10 +508,18 @@ function projectSideCarBody(
 		case "knowledge": {
 			return {
 				headline: labelWith(labels, "knowledgeHeading", { n: body.hits.length }),
-				lines: body.hits.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((hit) => ({
-					kind: "bullet" as const,
-					text: hit.summary ? `${hit.title} — ${hit.summary}` : hit.title,
-				})),
+				lines: body.hits.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((hit) => {
+					// `summary` is a flattened slice of the entry's Markdown body, so it can
+					// still carry `#` / `>` / backtick debris (rows written before the server
+					// stripped it hold raw Markdown outright). Strip it to prose here too —
+					// the transform is idempotent, so a clean excerpt passes through — and
+					// drop a first line that only repeats the title this bullet already shows.
+					const excerpt = knowledgeExcerpt(hit.summary ?? "", { title: hit.title });
+					return {
+						kind: "bullet" as const,
+						text: excerpt ? `${hit.title} — ${excerpt}` : hit.title,
+					};
+				}),
 			};
 		}
 
@@ -475,7 +530,18 @@ function projectSideCarBody(
 				if (remainingBudget(lines) <= 0) break;
 				const name = item.title?.trim() || item.alias?.trim() || item.id;
 				lines.push({ kind: "heading", text: `${name} · ${item.status}` });
-				lines.push(...proseLines(item.preview || label(labels, "empty"), remainingBudget(lines)));
+				// A bash task's preview is verbatim stdout/stderr, so it stays ONE
+				// preformatted run rather than one paragraph per line: `proseLines` drops
+				// blank lines and trims nothing else, and the emitter then escapes each
+				// line independently — which loses exactly the column alignment that makes
+				// a compiler or linter diagnostic readable. An agent task's preview is a
+				// report the subagent authored as Markdown, so it keeps the prose path.
+				const preview = item.preview?.trim();
+				if (preview && body.flavor === "bash") {
+					lines.push({ kind: "verbatim", text: preview });
+				} else {
+					lines.push(...proseLines(preview || label(labels, "empty"), remainingBudget(lines)));
+				}
 				if (item.truncated) lines.push({ kind: "meta", text: label(labels, "tasksDoneTruncated") });
 			}
 			return {
@@ -618,10 +684,11 @@ export function renderSideCarBodyToText(
 								status: item.status,
 								preview: item.preview || tpl(templates, "emptyResult"),
 							})
-						: // Agent flavour additionally tells the model how to follow up.
+						: // Agent flavour additionally tells the model how to follow up, so its
+							// id slot is an Await/Send selector — the alias, like bash above.
 							tpl(templates, "bgAgentEntry", {
 								title: item.title,
-								id: item.id,
+								id: item.alias ?? item.id,
 								status: item.status,
 								preview: item.preview || tpl(templates, "emptyResult"),
 							}),
@@ -633,14 +700,16 @@ export function renderSideCarBodyToText(
 				.map((message) => {
 					if (source === "buffered_user") return message.text;
 					const isTeam = source === "team_message";
-					// The two channels differ in how they name an untitled sender, and both
-					// forms are load-bearing for byte parity with their predecessors: the team
-					// template interpolated `fromTitle ?? fromId` (the FULL id), while the
-					// parent-report template used an 8-char prefix (`senderLabel` in
-					// parent-inbound-queue).
+					// An untitled sender is named by its readable alias when the producer
+					// supplied one. The id fallbacks behind it are what the two channels
+					// historically used (team: the FULL id; parent report: an 8-char prefix)
+					// and are kept for rows persisted before `fromLabel` existed.
 					const name = isTeam
-						? (message.fromTitle ?? message.fromId ?? "")
-						: message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+						? (message.fromTitle ?? message.fromLabel ?? message.fromId ?? "")
+						: message.fromTitle?.trim() ||
+							message.fromLabel?.trim() ||
+							message.fromId?.slice(0, 8) ||
+							"";
 					return tpl(templates, isTeam ? "teamMessageEntry" : "subagentMessageEntry", {
 						name,
 						type: message.fromType ?? "",
@@ -688,10 +757,24 @@ function noticeModelKey(source: string): string {
 /**
  * The Dynamic Spec digest, in its four variants.
  *
- * Mirrors `spec-reminder.ts`: a heading, the task lines (`- role: text [protected]`),
- * then the fixed instruction notes. The notes differ per variant, and the `current`
- * variant additionally appends the blocked-task action instruction — all of which
- * arrive as templates so the wording stays in the server's i18n table.
+ * A heading, the task lines (`- role: text [protected]`), then ONE situation-specific
+ * instruction line. The wording arrives as templates so it stays in the server's i18n
+ * table.
+ *
+ * ## Why this is deliberately short
+ *
+ * This digest is injected MID-TURN, on a tool-call cadence (every 15 by default), so
+ * its cost is paid over and over inside a single piece of work. The rules that used to
+ * ride along with it — how `tasks.json` may be shaped, what makes a task finite, when
+ * `protected` is allowed, what to do about a blocked entry — are all already in the
+ * system prompt (`getDynamicSpecSystemReminder`, which embeds
+ * `blockedTaskActionInstructions` verbatim). Repeating them here bought nothing: the
+ * model had read them at position zero and would read them again on the next request.
+ *
+ * So each variant now carries only what the SYSTEM PROMPT CANNOT say — the live task
+ * state and the one action this particular situation calls for. The turn-end
+ * continuation prompts (`maybeStartSpecContinuation`) are a separate, rarer surface and
+ * stay as verbose as they need to be.
  */
 function renderTasksToText(
 	body: Extract<SideCarBody, { kind: "tasks" }>,
@@ -705,8 +788,6 @@ function renderTasksToText(
 				lines.push(`- ${task.role}: ${task.text}${task.protected ? " [protected]" : ""}`);
 			}
 			lines.push(tpl(templates, "tasksCurrentUpdateNote"));
-			lines.push(tpl(templates, "tasksSemanticsNote"));
-			lines.push(tpl(templates, "tasksBlockedActionNote"));
 			break;
 		}
 		case "emptyNever":
@@ -714,8 +795,6 @@ function renderTasksToText(
 				tpl(templates, "tasksEmptyHeading"),
 				tpl(templates, "tasksEmptyNeverCreate"),
 				tpl(templates, "tasksEmptyNeverSkip"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
 			);
 			break;
 		case "emptyDone":
@@ -723,8 +802,6 @@ function renderTasksToText(
 				tpl(templates, "tasksEmptyHeading"),
 				tpl(templates, "tasksEmptyDoneReorganize"),
 				tpl(templates, "tasksEmptyDoneContinue"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
 			);
 			break;
 		case "tooMany":
@@ -734,9 +811,6 @@ function renderTasksToText(
 					threshold: body.threshold ?? 0,
 				}),
 				tpl(templates, "tasksTooManyReorganize"),
-				tpl(templates, "tasksTooManyProtected"),
-				tpl(templates, "tasksFieldsNote"),
-				tpl(templates, "tasksSemanticsNote"),
 			);
 			break;
 	}
@@ -791,6 +865,36 @@ export function rawSideCarToMarkdown(content: string): string {
 }
 
 /**
+ * Markdown for VERBATIM machine output — always a fenced block.
+ *
+ * For a background command's stdout/stderr, {@link rawSideCarToMarkdown} is the wrong
+ * projection: it only fences text that looks like a TAG, so everything else is handed
+ * to the Markdown parser as if a human had authored it. Real tool output is full of
+ * characters Markdown owns, and each one silently restructures the block:
+ *
+ *   `! This variable is unused`   → nothing special, but `> `/`#` lines become quotes
+ *                                  and headings
+ *   `  55 │ it("…", async () => {` → a leading-indent line becomes an INDENTED CODE
+ *                                  block, so one diagnostic renders as prose and the
+ *                                  next as a code card
+ *   `|  a  |  b  |`               → a GFM table
+ *
+ * That is exactly what a reader saw from `bunx biome check`: alternating prose and
+ * code cards, the alignment that carried the meaning gone. Output from a compiler,
+ * linter or test runner is preformatted text whose columns and whitespace ARE the
+ * content, so it goes in a code block unconditionally — no sniffing, because the
+ * heuristic can only ever be wrong in the direction of mangling it.
+ *
+ * Returns `""` for blank content so the caller can decide what "it finished with no
+ * output" should say; an empty fence would just be a hollow card.
+ */
+export function verbatimOutputToMarkdown(content: string): string {
+	const trimmed = content.trim();
+	if (!trimmed) return "";
+	return fence(trimmed);
+}
+
+/**
  * Turn a projected presentation into Markdown.
  *
  * Kept separate from {@link sideCarBodyToMarkdown} so the mapping from line kinds to
@@ -821,13 +925,18 @@ function presentationToMarkdown(presentation: SideCarPresentation): string {
 	};
 
 	for (const line of presentation.lines) {
-		const text = line.text.trim();
-		if (!text) continue;
+		// A verbatim run keeps its own whitespace: `trim()` would strip the indentation
+		// of its FIRST and LAST lines only, silently de-aligning one row of a diagnostic
+		// against the rest. The emptiness check still runs on a trimmed copy, since a
+		// whitespace-only block is nothing to show either way.
+		const text = line.kind === "verbatim" ? line.text : line.text.trim();
+		if (!text.trim()) continue;
 		switch (line.kind) {
 			case "bullet":
-				// `dimmed` (a `todo` task, a secondary entry) has no Markdown equivalent
-				// worth inventing — italics would fight the surrounding text. The role
-				// prefix already in the text ("todo: …") carries that information.
+				// Every bullet is emitted the same way. A secondary bullet (a `todo` task)
+				// has no Markdown equivalent worth inventing — italics would fight the
+				// surrounding text — so the distinction lives in the text itself, as the
+				// role prefix ("todo: …") the tasks projection writes.
 				bullets.push(`- ${escapeMarkdown(text)}`);
 				break;
 			case "heading":
@@ -849,6 +958,13 @@ function presentationToMarkdown(presentation: SideCarPresentation): string {
 			case "text":
 				flushBullets();
 				blocks.push(looksLikeMarkup(text) ? fence(text) : escapeMarkdown(text));
+				break;
+			case "verbatim":
+				flushBullets();
+				// Preformatted machine output: fenced whole, never escaped line by line.
+				// Escaping would preserve the CHARACTERS but not the layout — the
+				// alignment is what a diagnostic's gutter and indentation mean.
+				blocks.push(fence(text));
 				break;
 		}
 	}
@@ -912,7 +1028,7 @@ function looksLikeMarkup(text: string): boolean {
  * The rest of the set genuinely changes the parse in every position: `*` (emphasis works
  * mid-word), backticks, link brackets, and line-leading list / quote / heading markers.
  */
-function escapeMarkdown(text: string): string {
+export function escapeMarkdown(text: string): string {
 	return (
 		text
 			.replace(/([*`[\]])/g, "\\$1")

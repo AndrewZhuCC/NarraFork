@@ -6,6 +6,7 @@
 	"narrators": "Narrators",
 	"settings": "Settings",
 	"admin": "Admin",
+	"messages": "People",
 	"routines": "Routines",
 	"scheduledTasks": "Scheduled Tasks",
 	"learning": "Learning",
@@ -15,7 +16,7 @@
 	"logoutConfirmMessage": "Are you sure you want to log out?",
 	"cancel": "Cancel",
 	"confirm": "Log Out",
-	"searchPlaceholder": "Search chapters & messages...",
+	"searchPlaceholder": "Search chapters, messages, knowledge...",
 	"recentTabs": "Recent",
 	"clearAll": "Clear",
 	"clearProjects": "Clear narraflows",
@@ -57,7 +58,6 @@
 	"navSectionMore": "Tucked away",
 	"emptyVisibleZone": "Drag here to show",
 	"loadMoreRecentTabs": "Load more",
-	"allRecentTabsLoaded": "All loaded",
 	"retryRecentTabs": "Retry",
 	"recentTabsSyncError": "Recent tabs could not be synced"
 }

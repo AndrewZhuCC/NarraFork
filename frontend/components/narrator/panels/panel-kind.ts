@@ -25,6 +25,9 @@ import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
  * - `chat`     — the primary narrator panel (a cluster's protagonist).
  * - `terminal` — a terminal; narrator-bound in the dock, config-bound in a workspace.
  * - `details` / `filemod` / `spec` / `git` / `browser` / `tasks` / `search` — singleton narrator resources.
+ * - `userchat` — the human discussion room beside this narrator (people talking to
+ *   each other; its content never enters the narrator's context unless someone
+ *   forwards it explicitly).
  * - `subagent` — a multi-instance child-narrator session in the cluster's secondary area.
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `webview`  — a standalone webview (workspace only).
@@ -40,8 +43,10 @@ export type PanelKind =
 	| "browser"
 	| "tasks"
 	| "search"
+	| "userchat"
 	| "subagent"
 	| "file"
+	| "knowledge"
 	| "webview"
 	| "plugin"
 	| "mock";
@@ -55,7 +60,7 @@ export type PanelKind =
  */
 export type ResourcePanelKind = Exclude<
 	PanelKind,
-	"chat" | "subagent" | "file" | "webview" | "plugin"
+	"chat" | "subagent" | "file" | "knowledge" | "webview" | "plugin"
 >;
 
 /**
@@ -77,6 +82,36 @@ export interface SubagentPanelParams {
 	subagentNarratorId: string;
 	/** Owning root narrator cluster (required by workspace surfaces). */
 	hostNarratorId?: string;
+	/**
+	 * Scroll to and flash this message once the panel mounts.
+	 *
+	 * A REQUEST, not state: it records "the reader clicked a row that points here",
+	 * which is true at click time and meaningless later. Both this and
+	 * `highlightRequestId` are therefore stripped before a layout is persisted
+	 * (`stripIdentityFromLayout`) — restoring a saved layout must reopen the session
+	 * where the reader left it, not re-run a jump from a previous visit.
+	 */
+	highlightMessageId?: string;
+	/**
+	 * Distinguishes one jump request from the next.
+	 *
+	 * The panel latches its jump per (narrator, target) so it fires once rather than
+	 * on every re-render. That latch is also what breaks a repeat click: the reader
+	 * scrolls away, clicks the same speaker row again, and the target is unchanged —
+	 * so the jump is skipped and the control looks broken. A fresh token per click
+	 * makes the second request a distinct one.
+	 */
+	highlightRequestId?: string;
+}
+
+/**
+ * A fresh token for one panel-jump request. Monotonic within a page session, which
+ * is all the latch needs (it only ever compares for equality).
+ */
+let highlightRequestSeq = 0;
+export function nextHighlightRequestId(): string {
+	highlightRequestSeq += 1;
+	return `h${highlightRequestSeq}`;
 }
 
 /**
@@ -91,6 +126,29 @@ export interface FilePanelParams {
 	filePath: string;
 	/** Optional display-name override (defaults to the path's basename). */
 	fileName?: string;
+	/** Owning root narrator cluster (required by workspace surfaces). */
+	hostNarratorId?: string;
+}
+
+/**
+ * Scope discriminator for knowledge entry panels. `"global"` entries are in the
+ * shared base (read via `useKnowledgeEntry`, write via `useAddKnowledgeRevision`).
+ * `"personal"` entries belong to the caller's personal library (read via
+ * `usePersonalEntry`, write via `useUpdatePersonalEntryContent`).
+ */
+export type KnowledgeEntryScope = "global" | "personal";
+
+/**
+ * Params carried by a knowledge entry panel (multi-instance: one panel per
+ * entry). Like `subagent` and `file`, the resource identity (`entryId`) MUST
+ * survive serialization — `stripIdentityFromLayout` only removes host identity.
+ */
+export interface KnowledgePanelParams {
+	panelType: "knowledge";
+	/** The knowledge entry id (global or personal). */
+	entryId: string;
+	/** Scope determines which hooks and permission rules are used. */
+	scope: KnowledgeEntryScope;
 	/** Owning root narrator cluster (required by workspace surfaces). */
 	hostNarratorId?: string;
 }
@@ -117,6 +175,7 @@ export type AnyPanelParams =
 	| NarratorBoundPanelParams
 	| SubagentPanelParams
 	| FilePanelParams
+	| KnowledgePanelParams
 	| StandaloneTerminalPanelParams
 	| StandaloneWebviewPanelParams
 	| PluginDockPanelParams;
@@ -139,8 +198,10 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	browser: "browser",
 	tasks: "tasks",
 	search: "search",
+	userchat: "userchat",
 	subagent: "subagent",
 	file: "file",
+	knowledge: "knowledge",
 	webview: "webview",
 	plugin: "plugin",
 	mock: "mock",
@@ -163,8 +224,10 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	browser: "Browser",
 	tasks: "Tasks",
 	search: "Search",
+	userchat: "Discussion",
 	subagent: "Subagent",
 	file: "File",
+	knowledge: "Knowledge",
 	webview: "Webview",
 	plugin: "Plugin",
 	mock: "Mock stream",

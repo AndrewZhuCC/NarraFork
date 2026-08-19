@@ -60,6 +60,10 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	"knowledge-hint": "entry titles come from measured content",
 	// Localized through a dedicated shell branch instead of a `labels` bundle.
 	"plan-card": "shell injects extra.label",
+	// Header chrome (verdict / revision / action label) is composed by the adapter
+	// (ctx.labels) and travels as data; the one render-layer string — the note for a body
+	// cut at the parse ceiling — arrives as extra.truncatedLabel.
+	"review-card": "adapter data + shell injects extra.truncatedLabel",
 	// Body is measured markdown (already projected + localized by the adapter); its
 	// only chrome is the speaker header node and the trailing note, both built by the
 	// integration layer — the render layer imports no avatar and no i18n.
@@ -102,8 +106,8 @@ describe("renderLabelsForKind — every chrome-painting kind is localizable", ()
 		expect(renderLabelsForKind("inline-permission", STUB_LABELS)).toBe(STUB_LABELS.permission);
 		expect(renderLabelsForKind("ask-user-question", STUB_LABELS)).toBe(STUB_LABELS.askUserQuestion);
 		expect(renderLabelsForKind("ask-in-passing", STUB_LABELS)).toBe(STUB_LABELS.askInPassing);
-		// The three folded-trace kinds share one bundle (same CollapsibleTrace chrome).
-		for (const kind of ["tool-run-summary", "activity-trace", "reasoning-steps"] as const) {
+		// The two folded-trace kinds share one bundle (same CollapsibleTrace chrome).
+		for (const kind of ["activity-trace", "reasoning-steps"] as const) {
 			expect(renderLabelsForKind(kind, STUB_LABELS)).toBe(STUB_LABELS.trace);
 		}
 	});

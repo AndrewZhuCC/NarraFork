@@ -22,7 +22,12 @@ import type {
 	DirectoryBlacklistRuleInput,
 	DirectoryWhitelistRuleInput,
 	MessageLocationResult,
+	NarratorAccess,
+	NarratorGrant,
+	NarratorGrantAccess,
+	NarratorGrantBatchResult,
 	NarratorMessageSearchResponse,
+	NarratorVisibility,
 	PaginatedNarrators,
 	PretextDocumentPageResult,
 	RuleTargetSelector,
@@ -1263,6 +1268,21 @@ export const narratorsApi = {
 				method: "DELETE",
 			},
 		),
+	/**
+	 * Start a turn for a review conclusion the narrator already holds.
+	 *
+	 * Writes no message: the conclusion row IS the user message and has been in the
+	 * history since the review concluded. `started: false` is a normal outcome (the
+	 * narrator is busy, or the row was already handled), not an error — either way the
+	 * findings are in the history the next request rebuilds.
+	 */
+	applyReviewFeedback: (narratorId: string, messageId: string) =>
+		request<{ ok: boolean; started: boolean; reason: string }>(
+			`/narrators/${narratorId}/review-feedback/${messageId}/apply`,
+			{
+				method: "POST",
+			},
+		),
 	dismissCwdRecoveryMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean; deletedMessageIds: string[] }>(
 			`/narrators/${narratorId}/cwd-recovery-messages/${messageId}`,
@@ -1585,4 +1605,37 @@ export const narratorsApi = {
 			errorMessage: string | null;
 			rawDump: unknown;
 		}>(`/narrators/${narratorId}/leaked-tool-dump/${apiRequestId}`),
+
+	// ── Access control (sharing) ───────────────────────────────────────────────
+
+	getNarratorAccess: (narratorId: string) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/access`),
+
+	setNarratorVisibility: (narratorId: string, visibility: NarratorVisibility) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/visibility`, {
+			method: "PATCH",
+			body: JSON.stringify({ visibility }),
+		}),
+
+	/** Share with several users at once; the response reports each user's outcome. */
+	grantNarratorAccess: (narratorId: string, userIds: string[], access: NarratorGrantAccess) =>
+		request<NarratorGrantBatchResult>(`/narrators/${narratorId}/grants`, {
+			method: "POST",
+			body: JSON.stringify({ userIds, access }),
+		}),
+
+	updateNarratorGrant: (narratorId: string, grantId: string, access: NarratorGrantAccess) =>
+		request<{ grants: NarratorGrant[] }>(`/narrators/${narratorId}/grants/${grantId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ access }),
+		}),
+
+	revokeNarratorGrant: (narratorId: string, grantId: string) =>
+		request<{ ok: true }>(`/narrators/${narratorId}/grants/${grantId}`, { method: "DELETE" }),
+
+	transferNarratorOwner: (narratorId: string, userId: string | null) =>
+		request<NarratorAccess>(`/narrators/${narratorId}/transfer-owner`, {
+			method: "POST",
+			body: JSON.stringify({ userId }),
+		}),
 };

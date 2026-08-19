@@ -83,6 +83,11 @@ describe("measureSystemTextCard — per-kind single-line height model", () => {
 			measureSystemTextCard("spec_context_cleared", { text: "kept 3 tasks" }, 1000).height,
 		).toBe(61);
 	});
+
+	// A `review_feedback` kind briefly lived in this module. Its geometry is pinned in
+	// measure-review-card.test.ts instead: a conclusion is a markdown document with an
+	// action, which needs a real markdown body inside a scroll box — neither of which this
+	// module's plain pre-wrap card can express.
 });
 
 describe("measureSystemTextCard — pre-wrap body grows with wrapped line count", () => {
@@ -174,7 +179,7 @@ describe("measureSystemTextCard — height is independent of LOD", () => {
 			"spec_context_cleared",
 		] as const;
 		for (const kind of kinds) {
-			const heights = ([1, 2, 3, 4, 5, 6] as const).map(
+			const heights = ([1, 2, 3, 4, 5] as const).map(
 				(lod) =>
 					measureSystemTextCard(kind, { text: "some body text", title: "t" }, 500, lod).height,
 			);

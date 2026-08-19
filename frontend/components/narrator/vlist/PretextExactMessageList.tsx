@@ -59,7 +59,11 @@ import {
 } from "../chunk-scroll-utils";
 import { ManualOlderHistoryLoad } from "../ManualOlderHistoryLoad";
 import { type MessageContextMenuActions, MessageContextMenuCtx } from "../MessageContextMenuCtx";
-import { type MessageSelectionResolver, makeMessageBlockSelectionId } from "../MessageSelectionCtx";
+import {
+	type MessageSelectionResolver,
+	makeMessageBlockSelectionId,
+	useMessageSelection,
+} from "../MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message-edit-text";
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
@@ -81,6 +85,7 @@ import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-c
 import type { MeasuredCollapsibleTrace, MeasuredTraceRow } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
 import { CaretFiller } from "./render/caret-filler";
+import type { ReviewCardActions } from "./render/RenderReviewCard";
 import type { ErrorNoticeActions, SpecCarryoverActions } from "./render/RenderSystemText";
 import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { renderElement, resolveRenderExtra } from "./render-registry";
@@ -127,19 +132,31 @@ import {
 	type VListEditRole,
 } from "./vlist-edit-target";
 import { resolveErrorNoticeActions, useVListErrorNoticeActions } from "./vlist-error-actions";
-import { type FoldRowGeometry, isFoldCaptureUsable, planFoldMotion } from "./vlist-fold-animation";
 import {
+	type FoldRowGeometry,
+	isFoldCaptureUsable,
+	planFoldFrameMotion,
+	planFoldMotion,
+} from "./vlist-fold-animation";
+import {
+	captureFoldFrameGeometry,
 	captureFoldGeometry,
 	createFoldMotionController,
 	prefersReducedMotion,
 } from "./vlist-fold-motion";
+import {
+	resolveHeadTrim,
+	retainKeysInPlace,
+	TRIM_FILL_COOLDOWN_MS,
+	trimClockNow,
+} from "./vlist-head-trim";
 import {
 	hasEffectiveHeightOverride,
 	layoutItemsWithOverrides,
 	pruneHeightOverrides,
 } from "./vlist-height-overrides";
 import { createHighlightController } from "./vlist-highlight";
-import { injectInjectionBubbleChrome } from "./vlist-injection-header";
+import { type InjectionNavigation, injectInjectionBubbleChrome } from "./vlist-injection-header";
 import {
 	createVListInteractionState,
 	isFullPayloadRequestedRow,
@@ -169,7 +186,12 @@ import {
 	resolvePinchLodStep,
 	resolveWheelLodStep,
 } from "./vlist-lod-gesture";
-import { buildLodSnapshots, diffLodSnapshots, type LodElementSnapshot } from "./vlist-lod-morph";
+import {
+	buildLodSnapshots,
+	diffLodSnapshots,
+	type LodElementSnapshot,
+	type LodElementSource,
+} from "./vlist-lod-morph";
 import {
 	createLodMorphController,
 	prefersReducedMotion as prefersReducedMotionLod,
@@ -183,6 +205,10 @@ import {
 	resolveReloadDelayMs,
 	shouldSurfaceDeferredReload,
 } from "./vlist-reload-policy";
+import {
+	resolveReviewFeedbackActions,
+	useReviewFeedbackActions,
+} from "./vlist-review-feedback-actions";
 import {
 	buildRowCtxActions,
 	buildRowToolActions,
@@ -209,6 +235,7 @@ import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
 } from "./vlist-spec-carryover-actions";
+import { isSpecTaskLiveItem, resolveSpecTaskLiveGate } from "./vlist-spec-task-live";
 import { resolveSwipeAnchorRowIndex } from "./vlist-swipe-anchor";
 import { buildTailMeta, type TailMetaMessage } from "./vlist-tail-meta";
 import { buildToolMetaIndex, type VListToolMeta } from "./vlist-tool-meta";
@@ -415,7 +442,10 @@ export function resolveReflectionTakeOver(
 	return getHandler(item.spec.key, reflection.kind, requestId);
 }
 
-/** Shell-runnable tools whose execution can be interrupted mid-flight. */
+/**
+ * Shell-runnable tools whose execution can be interrupted mid-flight.
+ * "Shell" is a legacy alias retained for older stored history only.
+ */
 const TERMINABLE_TOOLS = new Set(["Bash", "Shell", "Execute"]);
 
 /**
@@ -486,20 +516,26 @@ export function isFramedRunItem(item: VListItem | undefined): boolean {
 /**
  * Maximal consecutive runs (length ≥ 2) of frameless in-run tool/subagent cards.
  * Each run is drawn inside one decorative frame — parity with the legacy
- * ToolRunFrame's `isMultiRun && lod >= 4` grouping. Single in-run items never
+ * ToolRunFrame's `isMultiRun && lod >= 3` grouping. Single in-run items never
  * occur (a lone tool-run item renders standalone with its own border), but the
  * ≥ 2 guard keeps this defensive.
  */
 export function computeToolRunFrames(
 	items: readonly (VListItem | undefined)[],
-): Array<{ start: number; end: number }> {
-	const runs: Array<{ start: number; end: number }> = [];
+): Array<{ key: string; start: number; end: number }> {
+	const runs: Array<{ key: string; start: number; end: number }> = [];
 	let i = 0;
 	while (i < items.length) {
 		if (isFramedRunItem(items[i])) {
 			let j = i;
 			while (j + 1 < items.length && isFramedRunItem(items[j + 1])) j++;
-			if (j > i) runs.push({ start: i, end: j });
+			// Keyed by the FIRST member's spec key, not by the index. The index is not an
+			// identity: a fold anywhere earlier in the document renumbers every run after
+			// it, so an index-keyed frame would be paired with a different run's geometry
+			// across the very rebuild the fold transition has to diff. The first member's
+			// spec key survives a fold (only the toggled element's own key can change),
+			// which is exactly the pairing the FLIP needs.
+			if (j > i) runs.push({ key: `run:${items[i]?.spec.key ?? i}`, start: i, end: j });
 			i = j + 1;
 		} else {
 			i++;
@@ -700,7 +736,7 @@ const TOGGLEABLE_CARD_KINDS = new Set([
 	"message-bubble",
 ]);
 /** Trace-family kinds with header/earlier/row toggles. */
-const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-steps"]);
+const TRACE_KINDS = new Set(["activity-trace", "reasoning-steps"]);
 /**
  * Folded traces whose individual ROWS get their own interaction surface.
  *
@@ -709,7 +745,7 @@ const TRACE_KINDS = new Set(["activity-trace", "tool-run-summary", "reasoning-st
  * rows all belong to the same reasoning run — so a row menu would be a redundant
  * nested duplicate of the element's own.
  */
-const TRACE_ROW_INTERACTION_KINDS = new Set(["activity-trace", "tool-run-summary"]);
+const TRACE_ROW_INTERACTION_KINDS = new Set(["activity-trace"]);
 
 /**
  * Resolve a measured trace row into the authoritative selection identity.
@@ -755,6 +791,10 @@ function resolveTraceRowIdentity(
 			toolUseId,
 			...(meta?.filePath ? { filePath: meta.filePath } : {}),
 			...(meta?.isReadTool ? { isReadTool: true } : {}),
+			// Gates "open in panel". Broader than isReadTool (any Read/Write/Edit with
+			// a path), and NOT implied by `filePath`: dropping it here is what silently
+			// cost the folded row the item the expanded card offers.
+			...(meta?.isFileTool ? { isFileTool: true } : {}),
 			// Embedded metadata only — never a per-row network lookup.
 			...(meta?.awaitAgentNarratorId ? { awaitAgentNarratorId: meta.awaitAgentNarratorId } : {}),
 			// Subagent lifecycle facts (open session / detach / cancel), matching the
@@ -1032,6 +1072,21 @@ interface ExactRowProps {
 	/** Localized "was truncated" note painted inside an injection bubble. */
 	injectionNoteLabel?: string;
 	/**
+	 * Localized note for a review card whose markdown body was cut at the parse ceiling.
+	 * HEIGHT-NEUTRAL: it sits in the card's already-reserved header row.
+	 */
+	reviewTruncatedLabel?: string;
+	/**
+	 * What this host can do when the reader clicks an injection bubble's speaker row:
+	 * open a child session, a knowledge entry, a Dynamic Spec file, or a chapter.
+	 *
+	 * Same gating rule as `onOpenFilePanel`, applied per kind: only hosts that can
+	 * actually reach a destination supply that opener, and a row whose destination has
+	 * no opener stays inert rather than offering a control that does nothing.
+	 * HEIGHT-NEUTRAL.
+	 */
+	injectionNavigation?: InjectionNavigation;
+	/**
 	 * The signed-in user, for deciding whether a user bubble is the reader's own turn
 	 * (right + indigo) or a teammate's (left + neutral). HEIGHT-NEUTRAL: both sides
 	 * measure identically, which is why this is a render-layer prop rather than
@@ -1070,6 +1125,17 @@ interface ExactRowProps {
 	 * per row because the request id lives in the row's reflection.
 	 */
 	onReflectionTakeOver?: () => void;
+	/**
+	 * Bind a take-over handler for an arbitrary (key, kind, requestId).
+	 *
+	 * `onReflectionTakeOver` above is already resolved for the ROW's own element, so
+	 * it is useless to a DRILLED-IN card: the trace element is not a `tool-call`
+	 * kind, so the element-level resolver returns undefined for it while the nested
+	 * card may well carry a running gate of its own. This resolver lets the drill-down
+	 * bind that card's gate from the card's own reflection. Memoized per cache key
+	 * upstream, so binding per render allocates nothing new.
+	 */
+	getReflectionTakeOver?: (key: string, kind: string | undefined, requestId: string) => () => void;
 	/** Submit the subagent-recovery card's selection (mutation lives outside vlist/). */
 	onResumeSubagentRecovery?: (messageId: string, specKey: string, mode: "notify" | "await") => void;
 	/**
@@ -1084,6 +1150,11 @@ interface ExactRowProps {
 	 * instead of silently inert.
 	 */
 	errorNoticeActions?: ErrorNoticeActions;
+	/**
+	 * Live handler for a review-feedback card's action button. Present only on review
+	 * rows; absent → the button renders disabled instead of silently inert.
+	 */
+	reviewFeedbackActions?: ReviewCardActions;
 	/**
 	 * Compact-marker callbacks for THIS row (open summary / cancel a running
 	 * compaction). Absent for every non-marker row; referentially stable per key so
@@ -1114,6 +1185,16 @@ interface ExactRowProps {
 	 * the fade-in on already-settled text.
 	 */
 	animateStreaming?: boolean;
+	/**
+	 * This row's Dynamic Spec task state is LIVE: it is the newest spec-task surface
+	 * in the document AND the narrator is running, so its `doing` row is describing
+	 * work in flight and may animate.
+	 *
+	 * False everywhere else, deliberately. A task status is RECORDED, so animating on
+	 * the status alone set the entire scrollback spinning — see vlist-spec-task-live.
+	 * Height-neutral: it only swaps a glyph inside an already-reserved lane.
+	 */
+	specTaskLive?: boolean;
 }
 
 /**
@@ -1137,6 +1218,8 @@ const ExactRow = memo(
 		onOpenFilePanel,
 		openAttachmentLabel,
 		injectionNoteLabel,
+		reviewTruncatedLabel,
+		injectionNavigation,
 		currentUserId,
 		narratorId,
 		permissionSlot,
@@ -1145,15 +1228,18 @@ const ExactRow = memo(
 		onTerminate,
 		resolveUpdateTimeout,
 		onReflectionTakeOver,
+		getReflectionTakeOver,
 		onResumeSubagentRecovery,
 		specCarryoverActions,
 		errorNoticeActions,
+		reviewFeedbackActions,
 		compactActions,
 		compactCancelTitle,
 		askInPassingFormSlot,
 		onOpenAskInPassingTarget,
 		viewControls,
 		animateStreaming,
+		specTaskLive,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
 		const kind = item.spec.kind;
@@ -1164,9 +1250,18 @@ const ExactRow = memo(
 		// a teammate's turn and your own are the same height, so viewer identity must
 		// not reach the measured data (it would fork the cache per user).
 		injectUserBubbleIsSelf(kind, extra, currentUserId);
-		// Injection bubbles: speaker row + the localized trailing note. Both are chrome
-		// the measure pass already reserved space for, so this only fills it in.
-		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel);
+		// Injection bubbles: speaker row + the localized trailing note, plus the
+		// navigation binding for rows that point somewhere this host can reach. All
+		// chrome the measure pass already reserved space for, so this only fills it in.
+		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel, injectionNavigation);
+		// Dynamic Spec task rows animate ONLY on the newest surface of a running
+		// narrator. Both surfaces get the same flag: a framed task bubble
+		// (`injection-bubble` with a spec-task payload) and a `spec://tasks.json` tool
+		// card. Height-neutral, so it stays out of the measured data.
+		if (specTaskLive) {
+			if (kind === "injection-bubble") extra.payloadLive = true;
+			if (kind === "tool-call") extra.specTasksLive = true;
+		}
 		// User bubbles: make a text-file attachment clickable when the host owns a
 		// dockview surface. The path itself already rode along as height-neutral
 		// measure data, so this only binds the handler.
@@ -1221,6 +1316,40 @@ const ExactRow = memo(
 					// from the card would write an index while opening wrote a key.
 					onToggle: () => toggleRow(row.itemIndex, row.key),
 				};
+				// ⚠️ A drilled-in card is a REAL tool card and must carry the same live
+				// controls the standalone L3+ card gets. Running and streaming tools DO
+				// fold into a trace (see render-units' isKeptToolItem — only a
+				// permission-blocked call keeps its card), so "the reader opened a live
+				// row" is the normal case rather than an edge one, and each control below
+				// was drawn-but-inert or absent until the reader changed LOD.
+				//
+				// All three are height-neutral, which is why they can be bound here at all:
+				// the terminate button and the timing/timeout area live inside the card's
+				// already-measured single header line (popover + editor are portaled), and
+				// the take-over button's row is reserved by measure-reflection-notice
+				// whenever `hasTakeOver` is set. Nothing here can move the row, so the
+				// zero-DOM height prediction is untouched.
+				if (onTerminate && canTerminateTool(card.toolName)) {
+					cardExtra.onTerminate = onTerminate;
+				}
+				if (
+					resolveUpdateTimeout &&
+					isRunningStatus(card.status) &&
+					card.timeoutMs != null &&
+					card.toolUseId
+				) {
+					cardExtra.onUpdateTimeout = resolveUpdateTimeout(card.toolUseId);
+				}
+				// Manual takeover of a RUNNING reflection gate. Resolved from the CARD's
+				// own reflection (not the trace element's — the element is not a tool-call
+				// kind, so the element-level resolver returns undefined for it).
+				if (getReflectionTakeOver && card.reflection?.hasTakeOver && card.reflection.requestId) {
+					cardExtra.onReflectionTakeOver = getReflectionTakeOver(
+						rowKey,
+						card.reflection.kind,
+						card.reflection.requestId,
+					);
+				}
 				if (viewControls) {
 					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
 						sections: renderLabels.toolCall.sections,
@@ -1256,6 +1385,14 @@ const ExactRow = memo(
 		// outside vlist/, so the shell injects them. Without this the two controls
 		// paint but do nothing — the chunked path's ErrorNotice drives them itself.
 		if (errorNoticeActions) extra.errorNoticeActions = errorNoticeActions;
+		// Review feedback card: the button hands the conclusion to the narrator through a
+		// REST call, so the shell injects it. Without this the card would show findings the
+		// reader has no way to act on — and an idle narrator is never woken by a conclusion
+		// on purpose, so this button is the only path.
+		if (reviewFeedbackActions) extra.reviewFeedbackActions = reviewFeedbackActions;
+		if (kind === "review-card" && reviewTruncatedLabel) {
+			extra.truncatedLabel = reviewTruncatedLabel;
+		}
 		// Compact / segment-compact markers: the row itself is the affordance — it
 		// opens the summary modal, or cancels a compaction still in flight. Both live
 		// outside vlist/ (modal + API), so they arrive as bound callbacks.
@@ -1527,6 +1664,8 @@ const ExactRow = memo(
 		prev.onOpenFilePanel === next.onOpenFilePanel &&
 		prev.openAttachmentLabel === next.openAttachmentLabel &&
 		prev.injectionNoteLabel === next.injectionNoteLabel &&
+		prev.reviewTruncatedLabel === next.reviewTruncatedLabel &&
+		prev.injectionNavigation === next.injectionNavigation &&
 		// Authorship decides the bubble's side; a row must repaint if the viewer changes.
 		prev.currentUserId === next.currentUserId &&
 		prev.permissionSlot === next.permissionSlot &&
@@ -1535,14 +1674,24 @@ const ExactRow = memo(
 		prev.onTerminate === next.onTerminate &&
 		prev.resolveUpdateTimeout === next.resolveUpdateTimeout &&
 		prev.onReflectionTakeOver === next.onReflectionTakeOver &&
+		// The drill-down's own gate binding. Omitting it would pin a stale resolver on
+		// every mounted row — silently, since the button still paints and still calls
+		// SOMETHING (the previous narrator's handler).
+		prev.getReflectionTakeOver === next.getReflectionTakeOver &&
 		prev.onResumeSubagentRecovery === next.onResumeSubagentRecovery &&
 		prev.specCarryoverActions === next.specCarryoverActions &&
 		prev.errorNoticeActions === next.errorNoticeActions &&
+		prev.reviewFeedbackActions === next.reviewFeedbackActions &&
 		prev.compactActions === next.compactActions &&
 		prev.compactCancelTitle === next.compactCancelTitle &&
 		prev.askInPassingFormSlot === next.askInPassingFormSlot &&
 		prev.onOpenAskInPassingTarget === next.onOpenAskInPassingTarget &&
-		prev.viewControls === next.viewControls,
+		prev.viewControls === next.viewControls &&
+		// The spinner gate: it flips when the narrator settles or when a newer task
+		// surface arrives, and neither moves `measured` (a glyph swap is
+		// height-neutral). Without this term the previous live row keeps spinning
+		// after the turn ends.
+		prev.specTaskLive === next.specTaskLive,
 );
 
 /**
@@ -1968,8 +2117,26 @@ export const PretextExactMessageList = forwardRef<
 		toggledKey: string;
 		documentRevision: number;
 		capturedAt: number;
+		/**
+		 * The effective level the capture was taken at.
+		 *
+		 * An LOD switch changes no document revision (it is a build option, like a fold),
+		 * so without this a fold followed by a pinch inside the age bound would consume
+		 * this capture on the commit where the level moved — putting the fold controller
+		 * and the LOD morph controller on the same node's `transform` in one frame. See
+		 * `isFoldCaptureUsable`.
+		 */
+		lod: number;
 		scrollTop: number;
 		geometry: Map<string, FoldRowGeometry>;
+		/**
+		 * Boxes of the decorative tool-run frames, captured in the same breath as the
+		 * rows. A frame's border is only correct while it agrees with the cards inside
+		 * it, so the two geometries must come from ONE snapshot — capturing them at
+		 * different moments is how a border ends up animating from a box its contents
+		 * never occupied.
+		 */
+		frames: Map<string, FoldRowGeometry>;
 	} | null>(null);
 	/**
 	 * Reads the geometry of the CURRENTLY mounted rows.
@@ -1980,8 +2147,25 @@ export const PretextExactMessageList = forwardRef<
 	 * capture reading the committed values instead of a stale copy.
 	 */
 	const readFoldGeometryRef = useRef<
-		(() => { geometry: Map<string, FoldRowGeometry>; documentRevision: number }) | null
+		| (() => {
+				geometry: Map<string, FoldRowGeometry>;
+				frames: Map<string, FoldRowGeometry>;
+				documentRevision: number;
+				/**
+				 * The COMMITTED manifest's level, travelling with the geometry it belongs to.
+				 * Read through this one channel (rather than a second ref) so the capture's
+				 * revision and level can never come from different frames.
+				 */
+				lod: number;
+		  })
+		| null
 	>(null);
+	/**
+	 * The committed grouping frames, for the two consumers that run OUTSIDE render: the
+	 * click-time capture and the play effect. Assigned during render further down, where
+	 * the runs are actually computed.
+	 */
+	const toolRunFramesRef = useRef<ReturnType<typeof computeToolRunFrames>>([]);
 	/**
 	 * Drill-down header morph (see vlist-drill-morph.ts).
 	 *
@@ -2032,8 +2216,10 @@ export const PretextExactMessageList = forwardRef<
 			toggledKey: key,
 			documentRevision: read.documentRevision,
 			capturedAt: Date.now(),
+			lod: read.lod,
 			scrollTop: scrollTopRef.current,
 			geometry: read.geometry,
+			frames: read.frames,
 		};
 	}, []);
 	// Stable RowToggles per key (memoized) so unchanged rows keep referential props
@@ -2051,6 +2237,32 @@ export const PretextExactMessageList = forwardRef<
 						key,
 					);
 					captureFoldBefore(key);
+					// A per-key OVERRIDE of the level's default fold — NOT an LOD step, and the
+					// distinction is load-bearing.
+					//
+					// Three controllers animate this canvas and two of them write `transform`
+					// on the SAME element: the fold resolves a row through `data-nf-row-key`
+					// and the LOD morph through `data-nf-unit` OR `data-nf-row-key`, which ride
+					// on one node. They have independent cancel boundaries, so if both ever
+					// planned in one commit the two animations would fight over that property.
+					//
+					// Two things keep them apart, and both are needed:
+					//
+					//  1. THIS rebuild cannot move the level. `toggleVListLodUserOverride`
+					//     adds/removes one key in `lodUserOverrides`, which reaches the build as
+					//     a per-card opt (`isLodUserOverride`), while `manifest.lod` comes from
+					//     `useRenderLod()` and only a zoom step / pinch changes that. So the
+					//     LOD morph's gate (revision unchanged AND lod moved) rejects it: the
+					//     fold plays, the morph returns early.
+					//  2. A LATER rebuild cannot revive this fold's capture. A fold followed by
+					//     a pinch inside the capture's age bound is the one commit where both
+					//     could plan, because an LOD switch advances no document revision
+					//     either — so the capture also records its level and
+					//     `isFoldCaptureUsable` rejects it once the level moves.
+					//
+					// Which means this branch must NOT be turned into a real level step (nor
+					// gain one alongside the override) without giving the two controllers a
+					// shared cancel boundary. Pinned by vlist-fold-wiring.test.ts.
 					if (collapsesByLodByKeyRef.current.get(key) === true) {
 						setInteraction((prev) => toggleVListLodUserOverride(prev, key));
 					} else {
@@ -2138,6 +2350,11 @@ export const PretextExactMessageList = forwardRef<
 	}, []);
 	const resolveSpecActions = useSpecCarryoverActions(narratorId, openSpecTasks);
 
+	// Review feedback cards: the button hands the conclusion to this narrator as a user
+	// turn. A concluded review does not wake an idle narrator by design, so this is how
+	// the findings get acted on.
+	const resolveReviewActions = useReviewFeedbackActions(narratorId);
+
 	// Error notice cards: "mark as retryable" opens the shared rule dialog, the
 	// close button deletes the notice. The dialog is one shell-level instance
 	// (rows are zero-DOM copies and cannot own a modal); rows only carry the bound
@@ -2164,6 +2381,20 @@ export const PretextExactMessageList = forwardRef<
 	// "…was truncated" note inside an injection bubble. Height-neutral: the measure
 	// pass reserves a fixed line whenever `hasNote` holds, whatever the wording.
 	const injectionNoteLabel = t("sidecar.body.tasksDoneTruncated");
+	// Same shape for a review card whose body hit the markdown parse ceiling: the note
+	// sits in the card's already-reserved header row, so the wording is height-neutral.
+	const reviewTruncatedLabel = t("reviewFeedbackTruncated");
+	// Tooltip / aria label per navigable target kind. Height-neutral chrome, and
+	// memoized because it feeds the row memo's identity comparison.
+	const injectionTargetLabels = useMemo(
+		() => ({
+			narrator: t("openFullSubagentSession"),
+			knowledge: t("injectionTarget.openKnowledge"),
+			spec: t("injectionTarget.openSpecFile"),
+			chapter: t("injectionTarget.openChapter"),
+		}),
+		[t],
+	);
 	// Who is reading. Decides whether a user bubble is drawn as the reader's own turn
 	// or a teammate's — this is a shared deployment, so `role: "user"` alone does not
 	// mean "you". Height-neutral, so it stays out of the measurement cache key.
@@ -2335,6 +2566,15 @@ export const PretextExactMessageList = forwardRef<
 	// Height as the LAYOUT sees it (see the buildOptions comment below). Derived here
 	// so the value handed to the document hook only changes at bucket boundaries.
 	const layoutViewportHeight = bucketViewportHeight(viewportHeight);
+	// FOLD-ORDER MARKER — must stay ABOVE the fold-play layout effect.
+	//
+	// This hook owns the anchored rebuild's scroll correction, and it applies it in a
+	// LAYOUT effect. The fold play below reads the resulting scrollTop as its
+	// `afterScrollTop`, so it is only correct while that correction has already run —
+	// which within one component is decided purely by DECLARATION ORDER. Moving this
+	// call below the fold effect would silently plan every fold from an uncorrected
+	// scroll position (rows sliding by the anchor's own Δ), with nothing throwing.
+	// vlist-fold-wiring.test.ts asserts this marker precedes the play effect.
 	const pretextDocument = usePretextDocument(narratorId, {
 		lod,
 		labels: vlistLabels,
@@ -2397,7 +2637,8 @@ export const PretextExactMessageList = forwardRef<
 		userPrefs?.autoLoadOlderMessages,
 		userPrefsLoading,
 	);
-	const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq } = pretextDocument;
+	const { hasPrev, loadingOlder, loadOlder, loadOlderAsync, oldestLoadedSeq, getLastTrimAt } =
+		pretextDocument;
 	const hasPrevRef = useRef(hasPrev);
 	hasPrevRef.current = hasPrev;
 	const loadingOlderRef = useRef(loadingOlder);
@@ -2550,6 +2791,14 @@ export const PretextExactMessageList = forwardRef<
 			},
 			onSyncOk: () => {
 				initialRevisionSyncRef.current = false;
+			},
+			// Access was refused or revoked: no snapshot or catch-up is coming. Clear the
+			// pending initial sync so the view stops waiting on a stream it will never
+			// receive, and refetch — the REST call now answers 404 and the surrounding
+			// route renders its "not found" state instead of an endless spinner.
+			onSubscribeDenied: () => {
+				initialRevisionSyncRef.current = false;
+				bumpMessageRevision();
 			},
 		},
 		exactCatchUpCursor,
@@ -2875,8 +3124,18 @@ export const PretextExactMessageList = forwardRef<
 		const items = renderItemsRef.current;
 		const window = visibleRef.current;
 		const revision = foldRevisionOf(foldDocumentRevision);
+		// The COMMITTED level, not `useRenderLod()`: the capture describes the geometry
+		// this manifest produced, and a pinch that has re-rendered but not yet rebuilt
+		// the document would otherwise stamp the capture with a level its boxes are not
+		// from — inverting the check in isFoldCaptureUsable.
+		const committedLod = pretextDocument.manifest?.lod ?? -1;
 		if (!layout)
-			return { geometry: new Map<string, FoldRowGeometry>(), documentRevision: revision };
+			return {
+				geometry: new Map<string, FoldRowGeometry>(),
+				frames: new Map<string, FoldRowGeometry>(),
+				documentRevision: revision,
+				lod: committedLod,
+			};
 		// Only the MOUNTED rows: an unmounted row has no node to animate, and bounding
 		// the map here is what keeps a fold O(window) rather than O(history).
 		const keys: string[] = [];
@@ -2892,7 +3151,13 @@ export const PretextExactMessageList = forwardRef<
 				const index = indices[position];
 				return index === undefined ? undefined : layout.items[index];
 			}),
+			// The grouping frames, derived from the SAME layout in the same snapshot, so
+			// a border and the cards it wraps can never be planned from disagreeing
+			// geometry. Not window-bounded: a frame can span the whole window and still
+			// be mounted (see captureFoldFrameGeometry).
+			frames: captureFoldFrameGeometry(toolRunFramesRef.current, (index) => layout.items[index]),
 			documentRevision: revision,
+			lod: committedLod,
 		};
 	};
 
@@ -2907,7 +3172,32 @@ export const PretextExactMessageList = forwardRef<
 	 * `afterScrollTop` is read from the container rather than from state because the
 	 * anchored rebuild's scroll correction is itself applied in a layout effect; the
 	 * live value is what the reader will actually see (see planFoldMotion's note on
-	 * viewport coordinates).
+	 * viewport coordinates). That correction runs BEFORE this effect only because
+	 * `usePretextDocument` is called earlier in this component — an ordering guarded
+	 * at the source level by vlist-fold-wiring.test.ts.
+	 *
+	 * ## Why the pinned case PREDICTS its scrollTop instead of reading it
+	 *
+	 * While pinned to the bottom, `node.scrollTop` in this layout phase is not yet the
+	 * value the reader will see. Two writers push the viewport back to the end of the
+	 * content — the anchored "bottom" correction (a layout effect, keyed on the
+	 * coordinator's computed scrollTop) and the geometry-revision pin effect (a passive
+	 * effect writing in the NEXT frame) — and neither is guaranteed to have landed here:
+	 * the correction is skipped when its computed value did not change, and the pin is a
+	 * frame late by construction. Reading the raw value in either case plans the FLIP
+	 * from a position that is about to be corrected, so expanding a card at the bottom
+	 * started the animation off by the growth it was answering.
+	 *
+	 * `getScrollBottomTarget` is the exact value both writers converge on, and it is
+	 * already correct in this phase: React has committed the canvas's new
+	 * `height: totalHeight` and the tail footer, so `scrollHeight - clientHeight` is the
+	 * post-correction bottom. Predicting it makes the plan agree with the frame the
+	 * reader actually sees, whichever writer gets there.
+	 *
+	 * `pinnedToBottom` is render state, read from THIS commit's scope: the commit whose
+	 * geometry is being animated. A fold cannot unpin (our own scroll writes are
+	 * recognised as echoes, see writeScrollTop), so this is still the reader's state at
+	 * click time — which is the state the correction will be applied under.
 	 */
 	useLayoutEffect(() => {
 		const capture = foldCaptureRef.current;
@@ -2915,21 +3205,45 @@ export const PretextExactMessageList = forwardRef<
 		const node = viewportRef.current;
 		const layout = exactLayoutRef.current;
 		if (!node || !layout) return;
-		if (!isFoldCaptureUsable(capture, foldRevisionOf(foldDocumentRevision), Date.now())) {
-			// Something other than this fold rebuilt the document in between (or the
-			// rebuild never came). Dropping the capture is the whole point: animating
+		if (
+			!isFoldCaptureUsable(
+				capture,
+				foldRevisionOf(foldDocumentRevision),
+				Date.now(),
+				pretextDocument.manifest?.lod ?? -1,
+			)
+		) {
+			// Something other than this fold rebuilt the document in between, the level
+			// moved under it (a pinch right after a fold — see isFoldCaptureUsable), or
+			// the rebuild never came. Dropping the capture is the whole point: animating
 			// that delta would move rows for a change the reader did not make.
 			foldCaptureRef.current = null;
 			return;
 		}
-		const after = readFoldGeometryRef.current?.().geometry;
-		if (!after) return;
+		const read = readFoldGeometryRef.current?.();
+		if (!read) return;
+		// PREDICTED while pinned, live otherwise (see the note above). One value serves
+		// both plans so a border can never be planned against a different scroll pair
+		// than the cards inside it.
+		const afterScrollTop = pinnedToBottom ? getScrollBottomTarget(node) : node.scrollTop;
 		const motions = planFoldMotion({
 			before: capture.geometry,
-			after,
+			after: read.geometry,
 			toggledKey: capture.toggledKey,
 			beforeScrollTop: capture.scrollTop,
-			afterScrollTop: node.scrollTop,
+			afterScrollTop,
+		});
+		// The decorative grouping borders, planned from the same before/after snapshot
+		// and the same scroll pair as the rows. Without this the frame was written at
+		// its final box on the commit frame while the cards inside it were still 200ms
+		// from arriving, so the border visibly detached from its own contents.
+		const frameMotions = planFoldFrameMotion({
+			before: capture.frames,
+			after: read.frames,
+			beforeScrollTop: capture.scrollTop,
+			// Same predicted value as the rows: two scroll pairs would let a border
+			// animate from a box its own contents never occupied.
+			afterScrollTop,
 		});
 		// NOTHING TO PLAY IS NOT THE SAME AS DONE, and conflating the two is why an
 		// earlier version of this never animated at all. `setInteraction` re-renders
@@ -2941,10 +3255,18 @@ export const PretextExactMessageList = forwardRef<
 		// Keeping it costs nothing and is bounded from both ends: the revision check
 		// above rejects a capture whose document changed underneath it, and the age
 		// bound expires one whose rebuild never arrived.
-		if (motions.length === 0) return;
+		//
+		// Both plans are consulted: a frame is derived from its rows, so in practice it
+		// cannot move alone — but gating on the rows only would make that an assumption
+		// this effect silently depends on.
+		if (motions.length === 0 && frameMotions.length === 0) return;
 		foldCaptureRef.current = null;
-		foldMotionRef.current.play(motions, (key) =>
-			node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
+		foldMotionRef.current.play(
+			motions,
+			(key) => node.querySelector<HTMLElement>(`[data-nf-row-key="${cssAttrEscape(key)}"]`),
+			undefined,
+			frameMotions,
+			(key) => node.querySelector<HTMLElement>(`[data-tool-run-frame="${cssAttrEscape(key)}"]`),
 		);
 	});
 
@@ -3051,14 +3373,21 @@ export const PretextExactMessageList = forwardRef<
 	}, []);
 
 	/**
-	 * Play LOD-switch morphs, driven by an element-level diff keyed by `unitId`.
+	 * Play LOD-switch morphs, driven by an element-level diff keyed by `unitId ?? key`.
 	 *
-	 * An LOD switch re-themes every element into a different component (a card folds
-	 * into a trace row, a row expands into a card), minting new spec keys/kinds — so
-	 * neither the fold (`spec.key`) nor the drill morph (`traceKey::rowKey`) can pair
-	 * across it. What survives is `unitId`. This effect snapshots every unitId-bearing
-	 * element in the viewport×3 window, diffs against the previous commit, and morphs
-	 * each pair from its old screen position to its new one — all in one frame.
+	 * An LOD switch re-themes elements into different components (a card folds into a
+	 * trace row, a row expands into a card), so neither the fold nor the drill morph is
+	 * planned across it. This effect snapshots the viewport×3 window, diffs against the
+	 * previous commit, and morphs each pair from its old screen position to its new one
+	 * — all in one frame.
+	 *
+	 * Pairing covers the WHOLE document, not just the re-themed cards: a tool call pairs
+	 * on the LOD-independent `unitId` the adapter attaches, while everything else
+	 * (markdown, bubbles, system cards, usage rows) pairs on its `spec.key`, which is
+	 * already level-invariant. Only the cards used to pair, which is what made a switch
+	 * half-smooth — they eased into place while the body they sit in teleported.
+	 * Correspondingly, only a morph whose `kind` changed cross-fades; a body that merely
+	 * moved would blink. See vlist-lod-morph.ts.
 	 *
 	 * Gate: the morph only plays when the document revision is UNCHANGED and the lod
 	 * MOVED (a pure re-theme). A revision move means a live patch / page / reload
@@ -3076,12 +3405,54 @@ export const PretextExactMessageList = forwardRef<
 		// Assemble the unitId-bearing elements straight from the layout + specs. The
 		// whole committed document is read here (geometry is O(n) plain numbers, cheap);
 		// the viewport×3 crop happens inside buildLodSnapshots.
-		const elements: { unitId: string | null | undefined; top: number; height: number }[] = [];
+		const elements: LodElementSource[] = [];
 		for (let index = 0; index < items.length; index++) {
 			const item = items[index];
 			const geo = layout.items[index];
 			if (!item || !geo) continue;
-			elements.push({ unitId: item.spec.unitId, top: geo.top, height: geo.height });
+			// `key` and `kind` travel with `unitId`: the planner pairs on `unitId ?? key`
+			// (so the document body — markdown, bubbles, system cards — is no longer
+			// skipped for want of a unitId) and reads `kind` to decide whether the morph
+			// is a component swap worth cross-fading. See vlist-lod-morph.ts.
+			elements.push({
+				unitId: item.spec.unitId,
+				key: item.spec.key,
+				kind: item.spec.kind,
+				top: geo.top,
+				height: geo.height,
+			});
+			// The L2/L3 boundary: a tool call is a summary ROW inside this trace at L1/L2
+			// and a top-level CARD at L3+, both carrying the same `unitId`. Without the
+			// nested rows the pairing has an empty intersection exactly at the switch that
+			// changes the most, so nothing animates where it matters.
+			//
+			// `clip` is the item's own painted box: the shell clips a non-dynamic row to
+			// its arithmetic height, so a nested row animated from far outside that box
+			// would be invisible mid-flight. The planner drops the travel (keeping the
+			// fade) for that case — see clipFor.
+			const measured = measuredByKeyRef.current.get(item.spec.key) as
+				| { rows?: { top: number; rowHeight: number; unitId?: string }[] }
+				| undefined;
+			if (!measured?.rows) continue;
+			const clip = { top: geo.top, bottom: geo.top + geo.height };
+			for (const row of measured.rows) {
+				if (!row.unitId) continue;
+				elements.push({
+					unitId: row.unitId,
+					// A row key is scoped to its trace, so it is not a usable cross-level
+					// identity; `nested` tells the builder not to fall back to it.
+					key: row.unitId,
+					// The kind the ROW is, not the trace's: pairing it against the card's
+					// `tool-call` is what marks this morph as a re-theme worth fading.
+					kind: "trace-row",
+					top: geo.top + row.top,
+					// The title LINE, not the row block: a drilled-in row's block is a whole
+					// card tall, and the perceived thing that moves is the summary line.
+					height: row.rowHeight,
+					clip,
+					nested: true,
+				});
+			}
 		}
 		const next = buildLodSnapshots(elements, scrollTop, vh);
 		const prev = lodMorphPrevRef.current;
@@ -3101,9 +3472,23 @@ export const PretextExactMessageList = forwardRef<
 		if (!isLodSwitch || prefersReducedMotionLod()) return;
 		const plans = diffLodSnapshots(prev, next);
 		if (plans.length === 0) return;
-		lodMorphRef.current.playAll(plans, (unitId) =>
-			node.querySelector<HTMLElement>(`[data-nf-unit="${cssAttrEscape(unitId)}"]`),
-		);
+		lodMorphRef.current.playAll(plans, (unitId) => {
+			const escaped = cssAttrEscape(unitId);
+			// `data-nf-unit` first, then `data-nf-row-key` — the only attribute an element
+			// paired on its `key` paints. Without the fallback every key-paired plan would
+			// resolve to null and the document body would go back to teleporting, silently:
+			// the plans are still produced, so nothing looks broken from the planner's side.
+			//
+			// One selector serves both forms of a tool call, because `data-nf-unit` is
+			// painted on the top-level card wrapper AND on the folded trace row, and the
+			// two never coexist: at L3+ only the card is mounted, at L1/L2 only the row.
+			// (A drilled-in card inside a row paints no `data-nf-unit` of its own, so it
+			// cannot shadow its row here.)
+			return (
+				node.querySelector<HTMLElement>(`[data-nf-unit="${escaped}"]`) ??
+				node.querySelector<HTMLElement>(`[data-nf-row-key="${escaped}"]`)
+			);
+		});
 	});
 
 	// Stop LOD morphs on unmount, same discipline as the other controllers.
@@ -3144,6 +3529,53 @@ export const PretextExactMessageList = forwardRef<
 	useEffect(() => {
 		publishStreamingMessage((streamingMsg ?? null) as TreeMessage | null);
 	}, [publishStreamingMessage, streamingMsg]);
+	// --- Head trim: bound the loaded window in a long session ---
+	//
+	// Evaluated at the edge where the live row CLEARS, i.e. a turn just finished and
+	// the session is momentarily idle. Deliberately not after an append: an append
+	// happens mid-stream, and trimming then can destroy un-persisted output — the
+	// head removal moves `commitGrowthSignature` (`${length}:${newestId}`) without a
+	// message having landed, the hand-off reads that as growth, resets
+	// `charsSinceLastCommit`, and an already-stored earlier step then retires the live
+	// row. `resolveHeadTrim` also hard-rejects while streaming, so this is belt and
+	// braces; the timing is what makes a trim USEFUL (a turn's worth of new messages
+	// has just landed) rather than merely safe.
+	const hadStreamingRowRef = useRef(false);
+	const trimHead = pretextDocument.trimHead;
+	// Latest-value refs: the effect must not re-run when these change (they change
+	// every frame during a turn), it only reads them at the edge it fires on.
+	const trimInputsRef = useRef({
+		messages: pretextDocument.messages,
+		totalHeight: 0,
+		pinnedToBottom: true,
+		editingMessageId: null as string | null,
+		originalModalMessageId: null as string | null,
+		selectedMessageIds: [] as string[],
+	});
+	/** Set by a trim, consumed by the layout effect that sweeps per-row caches. */
+	const pendingTrimSweepRef = useRef(false);
+	useEffect(() => {
+		const hasStreamingRow = streamingMsg != null;
+		const justCleared = hadStreamingRowRef.current && !hasStreamingRow;
+		hadStreamingRowRef.current = hasStreamingRow;
+		if (!justCleared) return;
+		const inputs = trimInputsRef.current;
+		const decision = resolveHeadTrim({
+			messages: inputs.messages as readonly { id?: unknown; seq?: unknown }[],
+			totalHeight: inputs.totalHeight,
+			viewportHeight: viewportHeightRef.current,
+			overscan: ITEM_OVERSCAN,
+			pinnedToBottom: inputs.pinnedToBottom,
+			hasStreamingRow,
+			protectedMessageIds: [
+				inputs.editingMessageId,
+				inputs.originalModalMessageId,
+				...inputs.selectedMessageIds,
+			].filter((id): id is string => typeof id === "string" && id.length > 0),
+		});
+		if (!decision.trim) return;
+		if (trimHead(decision.dropCount)) pendingTrimSweepRef.current = true;
+	}, [streamingMsg, trimHead]);
 	// Append animation applies to the live row only, and only while output is
 	// actually arriving (parity with the classic path's streaming fade-in).
 	const animateStreamingRows = isActive && advancedAnim;
@@ -3439,9 +3871,22 @@ export const PretextExactMessageList = forwardRef<
 		if (viewportHeight <= 0) return;
 		const totalHeight = exactLayout?.totalHeight ?? 0;
 		if (totalHeight > viewportHeight + ITEM_OVERSCAN) return;
+		// Cooldown after a head trim. A trim sets `hasPrev` true and shortens the
+		// canvas, which is exactly this effect's trigger — so without the cooldown a
+		// trim could be answered by an immediate re-fetch, which re-grows the window,
+		// which permits the next trim: an endless trim/refetch loop, one request per
+		// round. `resolveHeadTrim`'s height factor is the primary guard (survivors must
+		// still cover several viewport bands); this covers the case where a rebuild
+		// lands a shorter canvas than the average-height estimate predicted.
+		//
+		// Only the AUTOMATIC fill path is gated. A reader's own upward scroll or the
+		// manual button still pages immediately: asking for history must always work.
+		const lastTrimAt = getLastTrimAt();
+		if (lastTrimAt > 0 && trimClockNow() - lastTrimAt < TRIM_FILL_COOLDOWN_MS) return;
 		loadOlder();
 	}, [
 		exactLayout?.totalHeight,
+		getLastTrimAt,
 		hasPrev,
 		loadOlder,
 		loadingOlder,
@@ -3860,10 +4305,51 @@ export const PretextExactMessageList = forwardRef<
 		manifestItems.length,
 	);
 
+	// Sweep per-row handler caches after a trim, keyed off the POST-trim manifest.
+	//
+	// Expressed as "keep what is still in the manifest" rather than "delete the
+	// dropped rows' keys": spec keys are derived and take several shapes
+	// (`tool-<id>`, `<msgId>-b3`, `activity-<id>-<index>`, `toolrun-summary-…`), so
+	// reconstructing them from message ids would duplicate that derivation and drift
+	// from it. Same direction pruneHeightOverrides takes. Without this, each trimmed
+	// row leaves a dead closure behind for the rest of the session — the very growth
+	// the trim exists to stop.
+	useEffect(() => {
+		if (!pendingTrimSweepRef.current) return;
+		pendingTrimSweepRef.current = false;
+		const liveKeys = new Set(manifestItems.map((item) => item.itemKey));
+		retainKeysInPlace(
+			[
+				unknownHeightReporterCacheRef.current,
+				togglesCacheRef.current,
+				reflectionTakeOverCacheRef.current,
+				loadFullPayloadCacheRef.current,
+			],
+			liveKeys,
+		);
+	}, [manifestItems]);
+
 	// Decorative grouping frames for consecutive in-run tool/subagent card runs.
 	// Rebuilt only when the document items change (not on scroll); drawn as
 	// absolute overlays under the rows so the grouped run reads as one container.
 	const toolRunFrames = useMemo(() => computeToolRunFrames(renderItems), [renderItems]);
+	// Read by the fold capture and its play effect, both of which run outside render.
+	toolRunFramesRef.current = toolRunFrames;
+
+	// The one row whose Dynamic Spec task state may ANIMATE.
+	//
+	// A task's `doing` is a recorded status, so animating on it alone set every task
+	// bubble in the scrollback spinning at once (see vlist-spec-task-live). Only the
+	// newest task surface of a RUNNING narrator is live; a settled session has none.
+	//
+	// Two identities because the two surfaces are addressed differently: an injection
+	// bubble by its spec key (the last spec-task bubble in the document) and a task
+	// board by its tool-use id — the same pin the fold exemption already derives, so
+	// the spinner and the pinned card can never name different calls.
+	const specTaskLiveGate = useMemo(
+		() => resolveSpecTaskLiveGate(renderItems, isActive, tailMeta.latestSpecTasksToolUseId),
+		[renderItems, isActive, tailMeta.latestSpecTasksToolUseId],
+	);
 
 	// Refresh the per-key measured lookup used by the stable toggle callbacks.
 	// Rebuilt only when the document items change (not on scroll).
@@ -3892,6 +4378,27 @@ export const PretextExactMessageList = forwardRef<
 	}, [pretextDocument.messages]);
 	const messagesByIdRef = useRef(messagesById);
 	messagesByIdRef.current = messagesById;
+
+	// Feed the head-trim evaluator (see the effect near publishStreamingMessage).
+	// Assigned during render rather than listed as effect deps on purpose: every one
+	// of these changes on most frames of a live turn, and the trim must run only at
+	// the streaming-cleared edge, not whenever its inputs move.
+	//
+	// An active selection protects its messages: dropping a row mid-selection would
+	// leave the toolbar acting on ids the document no longer holds.
+	const messageSelection = useMessageSelection();
+	const selectedMessageIds = useMemo(() => {
+		if (!selectionIndex || messageSelection.selectedBlockIds.size === 0) return [];
+		return entriesToMessageIds(selectionIndex.entries, messageSelection.selectedBlockIds);
+	}, [selectionIndex, messageSelection.selectedBlockIds]);
+	trimInputsRef.current = {
+		messages: pretextDocument.messages,
+		totalHeight: exactLayout?.totalHeight ?? 0,
+		pinnedToBottom,
+		editingMessageId: editingRow?.messageId ?? null,
+		originalModalMessageId,
+		selectedMessageIds,
+	};
 
 	// Enter inline edit mode. Reads the message at click time (through the ref) so
 	// the callback identity stays stable across document rebuilds. A message too
@@ -4125,6 +4632,7 @@ export const PretextExactMessageList = forwardRef<
 						onViewSubagentSession={handlers.onViewSubagentSession}
 						onDetachSubagent={handlers.onDetachSubagent}
 						onCancelBackgroundTask={handlers.onCancelBackgroundTask}
+						onOpenFilePanel={handlers.onOpenFilePanel}
 					>
 						{rowBody}
 					</TraceRowInteraction>
@@ -4221,6 +4729,34 @@ export const PretextExactMessageList = forwardRef<
 	const originalModalEdited = resolveVListEditedMeta(originalModalMessage);
 	const onRestoreAssistantMessage = rowHandlers?.onRestoreAssistantMessage;
 
+	/**
+	 * What an injection bubble's speaker row can open on this host.
+	 *
+	 * Assembled here (not per row) and memoized, because the row memo compares this by
+	 * identity: rebuilding it every render would defeat the comparison and repaint every
+	 * mounted injection row on each commit.
+	 *
+	 * Each opener is passed through only if the host supplied it, so a surface that
+	 * cannot reach a destination leaves those rows inert instead of offering a dead
+	 * control.
+	 */
+	const injectionNavigation = useMemo<InjectionNavigation>(
+		() => ({
+			onOpenNarrator: rowHandlers?.onViewSubagentSession,
+			onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
+			onOpenSpec: rowHandlers?.onOpenSpecFile,
+			onOpenChapter: rowHandlers?.onOpenChapter,
+			labels: injectionTargetLabels,
+		}),
+		[
+			rowHandlers?.onViewSubagentSession,
+			rowHandlers?.onOpenKnowledgeEntry,
+			rowHandlers?.onOpenSpecFile,
+			rowHandlers?.onOpenChapter,
+			injectionTargetLabels,
+		],
+	);
+
 	return (
 		<div
 			ref={assignViewport}
@@ -4310,8 +4846,12 @@ export const PretextExactMessageList = forwardRef<
 							if (!topGeom || !bottomGeom) return null;
 							return (
 								<div
-									key={`tool-run-frame-${run.start}`}
-									data-tool-run-frame
+									key={run.key}
+									// Addressable so the fold transition can animate this border in step
+									// with the cards it wraps. A data attribute, like data-nf-row-key:
+									// it cannot affect layout and never reaches spec.opts (the measure
+									// cache key).
+									data-tool-run-frame={run.key}
 									style={{
 										position: "absolute",
 										top: topGeom.top,
@@ -4393,12 +4933,17 @@ export const PretextExactMessageList = forwardRef<
 									onOpenFilePanel={rowHandlers?.onOpenFilePanel}
 									openAttachmentLabel={openAttachmentLabel}
 									injectionNoteLabel={injectionNoteLabel}
+									reviewTruncatedLabel={reviewTruncatedLabel}
+									injectionNavigation={injectionNavigation}
 									currentUserId={currentUserId}
 									permissionSlot={permissionSlot}
 									editorSlot={editorSlot}
 									onTerminate={terminateRunningTool}
 									resolveUpdateTimeout={getUpdateTimeout}
 									onReflectionTakeOver={resolveReflectionTakeOver(item, getReflectionTakeOver)}
+									// Unresolved on purpose: a drilled-in card binds its OWN gate (see
+									// rowCard). Referentially stable (useCallback), so the memo is unaffected.
+									getReflectionTakeOver={getReflectionTakeOver}
 									onUnknownHeight={
 										isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 									}
@@ -4413,12 +4958,21 @@ export const PretextExactMessageList = forwardRef<
 										sourceIds,
 										errorNotice.resolve,
 									)}
+									reviewFeedbackActions={resolveReviewFeedbackActions(
+										item,
+										sourceIds,
+										resolveReviewActions,
+									)}
 									compactActions={compact.byKey.get(item.spec.key)}
 									compactCancelTitle={compact.cancelTitle}
 									askInPassingFormSlot={askInPassingFormSlot}
 									onOpenAskInPassingTarget={askInPassing.openByKey.get(item.spec.key)}
 									viewControls={contentView.controls}
 									animateStreaming={animateStreamingRows && isStreamingRowKey(item.spec.key)}
+									// The task spinner gate. Two identities, one flag: the newest
+									// framed task bubble (by spec key) and the newest task board (by
+									// tool-use id). Both are null unless the narrator is running.
+									specTaskLive={isSpecTaskLiveItem(item, specTaskLiveGate)}
 								/>
 							);
 						})}

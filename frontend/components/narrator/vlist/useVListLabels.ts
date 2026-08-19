@@ -269,6 +269,15 @@ export function useVListLabels(): VListLabels {
 			// ── single-line system cards ────────────────────────────────────────────
 			mergeSummaryLabel: t("mergeSummaryLabel"),
 			reviewFeedbackLabel: t("reviewFeedbackLabel"),
+			// ── review feedback card (verdict badge / revision marker / action) ──────
+			// All MEASURED: the badges reserve the lane the body wraps around, and the
+			// button occupies its own reserved row.
+			reviewVerdict_approve: t("reviewVerdict_approve"),
+			reviewVerdict_request_changes: t("reviewVerdict_request_changes"),
+			reviewVerdict_comment_only: t("reviewVerdict_comment_only"),
+			reviewFeedbackRevisedBadge: t("reviewFeedbackRevisedBadge"),
+			reviewFeedbackApply: t("reviewFeedbackApply"),
+			reviewFeedbackApplied: t("reviewFeedbackApplied"),
 			// ── message-origin attribution ──────────────────────────────────────────
 			// The origin_notice heading is composed during adaptation (it is a
 			// measured row), so these belong to the adapter labels.
@@ -374,7 +383,7 @@ export function useVListLabels(): VListLabels {
 			// server/lib/i18n.ts): the model gets "keep tasks.json to only
 			// text/status/protected…", the reader gets "3 open tasks".
 			noticeSilentProgress: t("sidecar.body.noticeSilentProgress", { count: "{count}" }),
-			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan"),
+			noticeRelaxedPlan: t("sidecar.body.noticeRelaxedPlan", { planFile: "{planFile}" }),
 			noticePipelineExit: t("sidecar.body.noticePipelineExit"),
 			tasksCurrent: t("sidecar.body.tasksCurrent", { n: "{n}" }),
 			tasksEmptyNever: t("sidecar.body.tasksEmptyNever"),
@@ -561,7 +570,6 @@ export function renderLabelsForKind(kind: string, labels: VListRenderLabels): un
 			return labels.reasoning;
 		case "tool-call":
 			return labels.toolCall;
-		case "tool-run-summary":
 		case "activity-trace":
 		case "reasoning-steps":
 			return labels.trace;

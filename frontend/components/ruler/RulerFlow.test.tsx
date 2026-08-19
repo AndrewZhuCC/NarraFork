@@ -7,6 +7,7 @@ import { useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import graphLocale from "../../locales/en/graph.json";
+import projectsLocale from "../../locales/en/projects.json";
 
 // Isolated i18next instance + <I18nextProvider> so shared-singleton mutations
 // from other frontend suites can't leave this suite rendering raw i18n keys.
@@ -381,7 +382,8 @@ async function initI18n() {
 		await i18n.use(initReactI18next).init({
 			lng: "en",
 			fallbackLng: "en",
-			resources: { en: { graph: graphLocale } },
+			// `projects` too: the deprecation notice is worded from that namespace.
+			resources: { en: { graph: graphLocale, projects: projectsLocale } },
 			interpolation: { escapeValue: false },
 		});
 	}
@@ -398,6 +400,19 @@ async function flushRender() {
  * `ConfirmDialogProvider` is not optional: `useConfirmDialog` throws when absent, and
  * RulerFlow calls it for the parked-work discard action.
  */
+/**
+ * Expand the collapsed anchor-notice badge.
+ *
+ * The notices are collapsed by default now: they used to be two always-expanded cards
+ * pinned over the start of the backbone with no way to dismiss them. Tests that assert on
+ * their contents have to open them first, which is exactly the interaction being locked in.
+ */
+async function expandAnchorNotices() {
+	const toggle = document.querySelector('[data-testid="ruler-anchor-notices-toggle"]');
+	toggle?.dispatchEvent(new Event("click", { bubbles: true }));
+	await flushRender();
+}
+
 function renderRulerFlow(target: Root, client: QueryClient) {
 	target.render(
 		<I18nextProvider i18n={i18n}>
@@ -450,8 +465,86 @@ describe("RulerFlow", () => {
 		expect(document.body.textContent).toContain("2 commits");
 		expect(document.querySelector('[data-testid="mock-ruler-pixi-layer"]')).not.toBeNull();
 		expect(document.querySelector('[data-testid="mock-segment-canvas"]')).not.toBeNull();
-		// No off-backbone notice when every chapter resolves to a tick.
+		// No off-backbone notice when every chapter resolves to a tick — and no badge at
+		// all, so a healthy project gets nothing overlaying its canvas.
 		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
+		expect(document.querySelector('[data-testid="ruler-anchor-notices"]')).toBeNull();
+	});
+
+	test("keeps anchoring notices collapsed until asked for", async () => {
+		// The notices were two always-expanded cards stacked over the start of the timeline,
+		// with no collapse and no dismiss — precisely the region a user studies when a
+		// chapter looks missing. The badge must be all that shows by default.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						id: "chapter-offscreen",
+						title: "Older Work",
+						branch: "chapter/older",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-not-loaded",
+						mergeCommitSha: null,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = true;
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+
+		// The badge is present and carries the count, but the chapter list is not on screen.
+		const badge = document.querySelector('[data-testid="ruler-anchor-notices"]');
+		expect(badge).not.toBeNull();
+		expect(badge?.textContent).not.toContain("Older Work");
+
+		await expandAnchorNotices();
+		expect(
+			document.querySelector('[data-testid="ruler-off-backbone-notice"]')?.textContent,
+		).toContain("Older Work");
+	});
+
+	test("offers a way out of the deprecated Ruler view", async () => {
+		// Ruler is deprecated and will not be developed further, so the view has to say so
+		// and hand over the switch back to the classic canvas. Without this, `flowMode` was
+		// write-once at project creation and a Ruler project had no route out at all.
+		let leaveCalls = 0;
+		root.render(
+			<I18nextProvider i18n={i18n}>
+				<MantineProvider env="test">
+					<QueryClientProvider client={queryClient}>
+						<ConfirmDialogProvider>
+							<RulerFlow
+								projectId="project-one"
+								onLeaveDeprecated={() => {
+									leaveCalls++;
+								}}
+							/>
+						</ConfirmDialogProvider>
+					</QueryClientProvider>
+				</MantineProvider>
+			</I18nextProvider>,
+		);
+		await flushRender();
+
+		const notice = document.querySelector('[data-testid="ruler-deprecation-notice"]');
+		expect(notice).not.toBeNull();
+		expect(notice?.textContent).toContain("deprecated");
+
+		const switchButton = Array.from(notice?.querySelectorAll("button") ?? []).find((el) =>
+			el.textContent?.includes("Switch to NarraFlow"),
+		);
+		expect(switchButton).toBeDefined();
+		switchButton?.dispatchEvent(new Event("click", { bubbles: true }));
+		await flushRender();
+		expect(leaveCalls).toBe(1);
 	});
 
 	test("reports chapters whose anchor commit is outside the loaded window", async () => {
@@ -483,6 +576,7 @@ describe("RulerFlow", () => {
 		renderRulerFlow(root, queryClient);
 
 		await flushRender();
+		await expandAnchorNotices();
 
 		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
 		expect(notice).not.toBeNull();
@@ -531,6 +625,7 @@ describe("RulerFlow", () => {
 
 		renderRulerFlow(root, queryClient);
 		await flushRender();
+		await expandAnchorNotices();
 
 		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
 		const loadButton = Array.from(notice?.querySelectorAll("button") ?? []).find(
@@ -570,11 +665,84 @@ describe("RulerFlow", () => {
 		renderRulerFlow(root, queryClient);
 
 		await flushRender();
+		await expandAnchorNotices();
 
 		const notice = document.querySelector('[data-testid="ruler-off-backbone-notice"]');
 		expect(notice?.textContent).toContain("Unreachable Work");
 		expect(notice?.textContent).toContain("whole timeline is loaded");
 		expect(notice?.textContent).not.toContain("Load older commits");
+		// It must not send the user to the story network view: that view resolves the same
+		// start commit and fails identically, so the advice was a dead end.
+		expect(notice?.textContent).not.toContain("story network");
+	});
+
+	test("draws a chapter whose start commit was rewritten off the trunk", async () => {
+		// A rebase or squash-merge leaves `startCommitSha` naming a commit that still exists
+		// but is unreachable from the branch. It has no tick and never will, and the view
+		// used to drop the card while telling the user to open it from the story network
+		// view — which anchors on the same sha. The server's `merge-base` fork point is the
+		// only position it can have, so the chapter renders there and the notice says the
+		// position is approximate instead of claiming the chapter is missing.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						id: "chapter-rewritten",
+						title: "Rewritten Work",
+						branch: "chapter/rewritten",
+						role: "branch",
+						parentChapterId: null,
+						startCommitSha: "commit-rewritten-away",
+						mergeCommitSha: null,
+						anchorFallbackSha: rulerData.commits[1].sha,
+						startCommitOnBranch: false,
+						narratorId: "narrator-two",
+						narratorStatus: "idle",
+						axisOffset: 0,
+						crossOffset: 0,
+					},
+				],
+			},
+		];
+		rulerHasPreviousPage = false;
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+		await expandAnchorNotices();
+
+		// Placed, therefore NOT reported as unplaceable.
+		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
+
+		const notice = document.querySelector('[data-testid="ruler-rewritten-anchor-notice"]');
+		expect(notice).not.toBeNull();
+		expect(notice?.textContent).toContain("Rewritten Work");
+		expect(notice?.textContent).toContain("fork point");
+	});
+
+	test("keeps quiet when the fallback anchor is the start commit itself", async () => {
+		// `startCommitOnBranch: true` means `merge-base` returned the commit unchanged: it is
+		// a real ancestor that simply paged in. The position is exact, so an "approximate
+		// position" notice would be false.
+		rulerPages = () => [
+			{
+				...rulerData,
+				activeChapters: [
+					{
+						...rulerData.activeChapters[0],
+						anchorFallbackSha: rulerData.activeChapters[0].startCommitSha,
+						startCommitOnBranch: true,
+					},
+				],
+			},
+		];
+
+		renderRulerFlow(root, queryClient);
+		await flushRender();
+		await expandAnchorNotices();
+
+		expect(document.querySelector('[data-testid="ruler-rewritten-anchor-notice"]')).toBeNull();
+		expect(document.querySelector('[data-testid="ruler-off-backbone-notice"]')).toBeNull();
 	});
 
 	test("restores the parked-work panel from the chapter's persisted snapshot", async () => {

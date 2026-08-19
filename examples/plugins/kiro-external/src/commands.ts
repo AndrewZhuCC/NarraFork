@@ -22,20 +22,45 @@
  * matters because command output reaches the iframe.
  */
 
-import { loadAllCredentials } from "@server/lib/kiro/config";
+import { loadAllCredentials, loadUsageCache } from "@server/lib/kiro/config";
 import { hasImportableSecret, normalizeImportCredentials } from "@server/lib/kiro/import-normalize";
 import type { MultiTokenManager } from "@server/lib/kiro/multi-token-manager";
-import type { KiroCredentials } from "@server/lib/kiro/types";
-import type { CommandSecretWrite } from "@server/lib/plugins/protocol";
-import { serializeBundle } from "./credentials";
+import type { KiroCredentials, SnapshotOptions } from "@server/lib/kiro/types";
+import type { CommandConfigWrite, CommandSecretWrite } from "@server/lib/plugins/protocol";
+import {
+	credentialKey,
+	INDEX_KEY,
+	isCredentialKey,
+	readIndex,
+	readKeyState,
+} from "./credential-vault";
 import { isRecord } from "./rpc";
 
-/** Vault key for the credential bundle. Must match the manifest's configSchema field. */
-const BUNDLE_KEY = "provider.kiro.credentialsBundle";
+/**
+ * A monotonic revision for the index sentinel.
+ *
+ * Time-based rather than a counter: the plugin process can restart between mutations, and a
+ * counter starting from zero would re-issue a revision the cached manager already saw, so a
+ * real change would look like no change. `Date.now()` also survives a restart, and the
+ * `previous + 1` guard keeps it strictly increasing even if two writes land in the same
+ * millisecond or the clock steps backwards.
+ */
+function nextRevision(previous: number | undefined): number {
+	const now = Date.now();
+	return previous !== undefined && previous >= now ? previous + 1 : now;
+}
+
+/**
+ * Config key for the load-balancing mode. Non-secret, so it travels via `configWrites` rather
+ * than the vault; the host refuses a `configWrites` key that names a secret field.
+ */
+const LOAD_BALANCING_KEY = "provider.kiro.loadBalancingMode";
 
 export interface CommandOutcome {
 	output: unknown;
 	secretWrites?: CommandSecretWrite[];
+	/** Non-secret provider config the host should persist. */
+	configWrites?: CommandConfigWrite[];
 }
 
 export class CommandInputError extends Error {
@@ -58,7 +83,7 @@ function credentialId(input: unknown): string {
 }
 
 /**
- * The manager's live credential list, ready to be stored.
+ * The manager's live credential list, as one vault write per credential plus the sentinel.
  *
  * `MultiTokenManager` has no public credential accessor — `snapshot()` is deliberately
  * metadata-only so display code cannot reach secrets. But every mutation persists the full
@@ -66,29 +91,150 @@ function credentialId(input: unknown): string {
  * host's file), so reading that file back is the supported way to obtain the post-mutation
  * state without modifying the built-in module.
  *
- * The file is a staging area, not the durable store: the vault entry the host writes from
- * this bundle is what survives, and the plugin's data directory is temporary when the host
- * provides none.
+ * The file is a staging area, not the durable store: the vault entries the host writes are
+ * what survive, and the plugin's data directory is temporary when the host provides none.
+ *
+ * ## Write ordering, and why it is this way
+ *
+ * `secretWrites` is applied in order and is **not** atomic: an I/O failure partway through
+ * leaves earlier entries persisted (see `plugin-command-secret-writes.ts`). The order below is
+ * chosen so that every partial application is still a coherent state:
+ *
+ * 1. credential entries, 2. deletions of entries no longer present, 3. the sentinel.
+ *
+ * The sentinel is last because it is the revision marker: if it lands, the credentials it
+ * counts are already stored. Failing before it leaves the *old* revision in place, so the next
+ * read reloads rather than trusting a cache that no longer matches — stale, but never
+ * inconsistent.
+ *
+ * Deletions come before the sentinel for the same reason, and after the writes so that a
+ * rename-shaped change (remove id A, add id B) never has both absent at once.
  */
-function currentBundle(manager: MultiTokenManager, credentialsPath: string): CommandSecretWrite[] {
+async function currentBundle(
+	manager: MultiTokenManager,
+	credentialsPath: string,
+): Promise<CommandSecretWrite[]> {
 	const { credentials } = loadAllCredentials(credentialsPath);
-	// Fall back to the snapshot count only to detect a genuinely empty result; an empty
-	// bundle would otherwise silently clear the user's credentials.
+	// Fall back to the snapshot count only to detect a genuinely empty result; writing an
+	// empty set would otherwise silently clear the user's credentials.
 	if (credentials.length === 0 && manager.snapshot().entries.length > 0) {
 		throw new CommandInputError("Credential state could not be read back after the change");
 	}
-	return [{ key: BUNDLE_KEY, value: serializeBundle(credentials) }];
+
+	const writes: CommandSecretWrite[] = [];
+	const liveKeys = new Set<string>();
+	for (const credential of credentials) {
+		if (!credential.id) {
+			// Without an id there is no key to store it under. Refused rather than dropped:
+			// silently omitting a credential the user just added is worse than failing.
+			throw new CommandInputError("A credential has no id and cannot be stored");
+		}
+		const key = credentialKey(credential.id);
+		liveKeys.add(key);
+		writes.push({ key, value: JSON.stringify(credential) });
+	}
+
+	// Removing a credential means deleting its key, which requires knowing which keys exist.
+	// One `secrets.list` per mutation, not per request: mutations are user-initiated and rare.
+	const state = await readKeyState();
+	for (const key of state.credentialKeys) {
+		if (!liveKeys.has(key) && isCredentialKey(key)) writes.push({ key, value: null });
+	}
+
+	// `value: null` deletes. Zero credentials must delete the sentinel rather than store
+	// `count: 0`, because `isUsable()`/`secretsSet` only test whether the key exists with a
+	// non-empty value — a stored zero would report "configured" with nothing to serve.
+	const revision = nextRevision((await readIndex())?.revision);
+	writes.push(
+		credentials.length === 0
+			? { key: INDEX_KEY, value: null }
+			: { key: INDEX_KEY, value: JSON.stringify({ revision, count: credentials.length }) },
+	);
+	return writes;
 }
 
-/** Snapshot plus usage cache — the shape the credential page renders. */
-function statusOutput(manager: MultiTokenManager): unknown {
-	const snapshot = manager.snapshot();
+/** A positive integer from untrusted input, or undefined when absent. */
+function optionalPositiveInt(value: unknown, field: string, max: number): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 1) {
+		throw new CommandInputError(`${field} must be a positive number`);
+	}
+	return Math.min(Math.trunc(value), max);
+}
+
+/** Tier pagination requested by the credential page. */
+function readSnapshotOptions(input: unknown): SnapshotOptions | undefined {
+	if (!isRecord(input)) return undefined;
+	const pageSize = optionalPositiveInt(input.pageSize, "pageSize", 100);
+	// Page numbers are meaningless without a page size, and passing them through would let
+	// the caller believe it paginated when `snapshot()` silently returned everything.
+	if (pageSize === undefined) return undefined;
 	return {
-		credentialCount: snapshot.entries.length,
-		availableCount: snapshot.entries.filter((entry) => !entry.disabled).length,
+		pageSize,
+		paidPage: optionalPositiveInt(input.paidPage, "paidPage", 100_000) ?? 1,
+		enterprisePage: optionalPositiveInt(input.enterprisePage, "enterprisePage", 100_000) ?? 1,
+		freePage: optionalPositiveInt(input.freePage, "freePage", 100_000) ?? 1,
+	};
+}
+
+/**
+ * The credential page's whole read model.
+ *
+ * Two things are trimmed rather than returned verbatim, because command output crosses into
+ * an iframe and is capped:
+ *
+ * - `availableModels` becomes a count. The full list is per-credential and can run to dozens
+ *   of ids; the page only ever shows the number, and `models.list` serves the detail.
+ * - `usageCache` is filtered to the credentials on the current page. The cache covers every
+ *   credential ever queried, which for a large pool is mostly rows nothing will render.
+ *
+ * `entries` is kept alongside the tier groups because a paginated snapshot already defines it
+ * as the concatenation of the three pages — dropping it would break nothing but leaves
+ * callers without a flat list to search.
+ */
+function statusOutput(manager: MultiTokenManager, input?: unknown, credentialsPath?: string) {
+	const options = readSnapshotOptions(input);
+	const snapshot = manager.snapshot(options);
+
+	const trim = (entries: typeof snapshot.entries) =>
+		entries.map(({ availableModels, ...rest }) => ({
+			...rest,
+			modelCount: availableModels?.length ?? 0,
+		}));
+
+	const visibleIds = new Set(snapshot.entries.map((entry) => entry.id));
+	// `MultiTokenManager` keeps its usage cache private, but persists it next to the
+	// credentials file the plugin itself supplied, so reading it back is the supported way to
+	// obtain it without modifying the built-in module.
+	const usageCache: Record<string, unknown> = {};
+	if (credentialsPath) {
+		try {
+			for (const [id, entry] of Object.entries(loadUsageCache(credentialsPath))) {
+				if (visibleIds.has(id)) usageCache[id] = entry;
+			}
+		} catch {
+			// A missing or unreadable cache is normal (nothing queried yet) and must not take
+			// the whole page down with it.
+		}
+	}
+
+	return {
+		// Retained for older panels that read these two names.
+		credentialCount: snapshot.total,
+		availableCount: snapshot.available,
+		total: snapshot.total,
+		available: snapshot.available,
 		loadBalancingMode: snapshot.loadBalancingMode,
 		currentId: snapshot.currentId,
-		entries: snapshot.entries,
+		entries: trim(snapshot.entries),
+		paidEntries: trim(snapshot.paidEntries),
+		enterpriseEntries: trim(snapshot.enterpriseEntries),
+		freeEntries: trim(snapshot.freeEntries),
+		paidTotal: snapshot.paidTotal,
+		enterpriseTotal: snapshot.enterpriseTotal,
+		freeTotal: snapshot.freeTotal,
+		unhealthyTotal: snapshot.unhealthyTotal,
+		usageCache,
 	};
 }
 
@@ -101,8 +247,15 @@ export interface CommandContext {
 export type CommandHandler = (input: unknown, context: CommandContext) => Promise<CommandOutcome>;
 
 export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
-	/** Credential list, per-credential state and load-balancing mode. */
-	status: async (_input, { manager }) => ({ output: statusOutput(manager) }),
+	/**
+	 * Credential list, per-credential state, tier pagination and load-balancing mode.
+	 *
+	 * Accepts `{ pageSize, paidPage, enterprisePage, freePage }`; without `pageSize` the whole
+	 * pool is returned, which is what an older panel expects.
+	 */
+	status: async (input, { manager, credentialsPath }) => ({
+		output: statusOutput(manager, input, credentialsPath),
+	}),
 
 	/**
 	 * Add credentials from a pasted export.
@@ -130,7 +283,7 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 		const result = manager.addCredentials(normalized);
 		return {
 			output: { added: result.added, duplicates: result.duplicates },
-			secretWrites: currentBundle(manager, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
 		};
 	},
 
@@ -152,13 +305,67 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 			default:
 				throw new CommandInputError(`state must be disabled, enabled or reset: ${state}`);
 		}
-		return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
+		return {
+			output: statusOutput(manager, input, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
 	},
 
 	"credentials.remove": async (input, { manager, credentialsPath }) => {
 		const id = credentialId(input);
 		manager.removeCredential(id);
-		return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
+		return {
+			output: statusOutput(manager, input, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
+	},
+
+	/**
+	 * Remove several credentials at once.
+	 *
+	 * Separate from repeated `credentials.remove` calls because each of those persists the
+	 * bundle and returns a full snapshot; a 20-credential selection would mean 20 vault writes
+	 * and 20 round trips, with a partially-applied selection if one failed midway.
+	 */
+	"credentials.removeMany": async (input, { manager, credentialsPath }) => {
+		const raw = isRecord(input) ? input.credentialIds : undefined;
+		if (!Array.isArray(raw) || raw.length === 0) {
+			throw new CommandInputError("credentialIds must be a non-empty array");
+		}
+		if (raw.length > 500) throw new CommandInputError("credentialIds exceeds the 500 id limit");
+		const ids = raw.map((value, index) => requireString(value, `credentialIds[${index}]`));
+		const result = manager.removeCredentials(ids);
+		return {
+			output: {
+				removed: result.removed,
+				notFound: result.notFound,
+				status: statusOutput(manager, input, credentialsPath),
+			},
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
+	},
+
+	/**
+	 * Remove every credential the manager disabled for an unrecoverable reason.
+	 *
+	 * The definition of "unhealthy" stays inside `MultiTokenManager`, which is the point: the
+	 * panel must not carry its own copy of that rule, or the button would drift from what the
+	 * manager actually considers dead.
+	 */
+	"credentials.removeUnhealthy": async (input, { manager, credentialsPath }) => {
+		const result = manager.removeUnhealthyCredentials();
+		return {
+			output: {
+				removed: result.removed,
+				reasons: result.reasons,
+				status: statusOutput(manager, input, credentialsPath),
+			},
+			// Nothing was removed → nothing to persist. Writing anyway would be a pointless
+			// vault round trip on a button the user can press when the count is 0.
+			...(result.removed.length > 0
+				? { secretWrites: await currentBundle(manager, credentialsPath) }
+				: {}),
+		};
 	},
 
 	"credentials.setPriority": async (input, { manager, credentialsPath }) => {
@@ -168,7 +375,10 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 			throw new CommandInputError("priority must be a number");
 		}
 		manager.setPriority(id, Math.trunc(priority));
-		return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
+		return {
+			output: statusOutput(manager, input, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
 	},
 
 	/**
@@ -182,7 +392,7 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 		const models = await manager.fetchAndStoreModels(id);
 		return {
 			output: { credentialId: id, modelCount: models.length },
-			secretWrites: currentBundle(manager, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
 		};
 	},
 
@@ -246,7 +456,10 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 			throw new CommandInputError("No editable fields were provided");
 		}
 		manager.updateCredential(id, allowed as Partial<KiroCredentials>);
-		return { output: statusOutput(manager), secretWrites: currentBundle(manager, credentialsPath) };
+		return {
+			output: statusOutput(manager, input, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
 	},
 
 	/** Quota and usage figures for one credential. */
@@ -263,9 +476,14 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 			throw new CommandInputError(`mode must be priority or balanced: ${mode}`);
 		}
 		manager.setLoadBalancingMode(mode);
-		// Not a secret, so the host's own config form owns persistence for this one; the
-		// command only changes the live manager.
-		return { output: { loadBalancingMode: mode } };
+		// Two steps, both required. `setLoadBalancingMode` changes the live manager so the next
+		// request routes the new way; `configWrites` asks the host to persist it. Without the
+		// second, the switch worked until the next restart and then silently reverted — which is
+		// worse than not offering the control at all.
+		return {
+			output: { loadBalancingMode: mode },
+			configWrites: [{ key: LOAD_BALANCING_KEY, value: mode }],
+		};
 	},
 
 	/** Confirm a stored credential works, without revealing it. */
@@ -304,7 +522,26 @@ export const COMMAND_HANDLERS: Record<string, CommandHandler> = {
 		const modelIds = await manager.fetchAndStoreModels(id);
 		return {
 			output: { credentialId: id, modelCount: modelIds.length, models: modelIds },
-			secretWrites: currentBundle(manager, credentialsPath),
+			secretWrites: await currentBundle(manager, credentialsPath),
+		};
+	},
+
+	/**
+	 * Refresh every enabled credential's model list in one pass.
+	 *
+	 * The panel used to do this by calling `models.refresh` per credential from the iframe,
+	 * which meant one command round trip and one vault write each, and a partially-refreshed
+	 * pool if any single call failed. `fetchAllCredentialModels` already walks the pool and
+	 * skips disabled entries, so the loop belongs here.
+	 *
+	 * Only the union's size is returned: the panel shows a count, and a large pool's combined
+	 * model list is exactly the kind of payload that would push output toward its cap.
+	 */
+	"models.refreshAll": async (_input, { manager, credentialsPath }) => {
+		const models = await manager.fetchAllCredentialModels();
+		return {
+			output: { modelCount: models.length },
+			secretWrites: await currentBundle(manager, credentialsPath),
 		};
 	},
 };

@@ -22,7 +22,65 @@ Manual static build:
 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o narrafork-executor ./cmd/narrafork-executor
 ```
 
-## Register a device
+## Install (recommended: one command)
+
+You do not need to build or fetch the binary yourself. NarraFork mirrors published
+executor releases and generates a single install command:
+
+1. In NarraFork: **Settings → Remote Devices → Add device**. Choose the
+   *reverse dial* connection mode (recommended; works behind NAT).
+2. Pick the target platform and whether to install a machine-wide service or a
+   user-level one, then copy the generated command.
+3. Paste it on the target machine. It downloads the matching binary from your
+   NarraFork instance, verifies its SHA-256, collects the device key, writes the
+   config, and installs the service.
+
+```sh
+# Unix (the exact command, including its one-time ticket, comes from NarraFork)
+sh -c "$(curl -fsSL 'https://your-narrafork-host/api/executor/install/linux-amd64?ticket=…')"
+```
+
+The key is never written into the command or the script, and never passed as a
+command-line argument: the script fetches it once and stores it in a 0600 file
+(ACL-restricted on Windows). Because the target machine only has to reach NarraFork
+itself, this also works on hosts with no route to the public update server.
+
+### What the install command is, security-wise
+
+The command embeds a **short-lived enrollment ticket**, and that ticket can be
+exchanged for the device key. So the command is a credential — treat it like one.
+Three properties bound the risk:
+
+- It expires in minutes.
+- The key exchange works **once**, and performing it **rotates the device key**. If
+  someone else runs your command first, your own run fails outright rather than
+  quietly sharing a working key.
+- NarraFork records when and from where the key was collected, shown on the device.
+
+Because the key does cross the wire at that moment, automatic collection requires
+**https**, a **loopback** address, or a **private network** where an admin has
+allowed it (the checkbox at the bottom of **Settings → Remote Devices**, stored as
+`devices.allowPlaintextEnrollmentOnPrivateNetwork`). Plaintext http on a publicly
+routable address is always refused, whatever that setting says. "Private network"
+here means a literal private IP address — a hostname is never eligible, because the
+server cannot verify which network a name resolves to.
+
+### Manual key entry
+
+Choosing *Enter the key manually* in the install dialog produces a script that
+contains no credential at all and prompts for the key instead (input hidden). It
+requires a terminal and a human, and it works over plaintext http on any address.
+Use it when automatic collection is unavailable, or when you would rather the
+script be freely forwardable.
+
+Stored keys are hashed and cannot be read back, so the install dialog offers to
+issue one for this path — which replaces whatever key the device was using. Update
+the token file on the device accordingly if it was already enrolled.
+
+Everything below documents the fully manual path: building from source and wiring
+up the flags yourself.
+
+## Register a device manually
 
 1. In NarraFork: **Settings → Remote Devices → Add device**. Choose the
    *reverse dial* connection mode (recommended; works behind NAT).
@@ -139,6 +197,30 @@ overrides the JSON config file.
   hashed at rest on the server and can be rotated or revoked from the UI.
 - Revoking a device (or rotating its token) immediately drops the live
   connection.
+
+## Service templates
+
+`deploy/` holds templates for running the executor as a managed service. The
+generated installer produces equivalent units automatically; these are for manual
+installs and for reviewing what the installer will do.
+
+| File | Platform | Scope |
+|------|----------|-------|
+| `narrafork-executor.service` | Linux (systemd) | machine-wide, dedicated account |
+| `narrafork-executor.user.service` | Linux (systemd) | per-user (`systemctl --user`) |
+| `com.narrafork.executor.plist` | macOS (launchd) | LaunchDaemon or LaunchAgent |
+
+On Windows, install as a service with `sc.exe`/`New-Service`, or register a
+scheduled task at logon for a user-level install.
+
+## Releasing
+
+`bun scripts/release-executor.ts <version>` cross-compiles all six targets,
+computes each binary's SHA-256, and publishes them plus a manifest
+(`narrafork-executor-manifest.json`) to the update server's public tools channel.
+Binaries upload before the manifest, so a manifest never references an artifact
+that is not yet present. Use `--dry-run` to build and digest without uploading, or
+`--platform=<os>-<arch>` to publish a single target.
 
 ## Capabilities
 

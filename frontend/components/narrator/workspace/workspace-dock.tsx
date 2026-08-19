@@ -39,6 +39,7 @@ import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import { type KnowledgeEntryScope, nextHighlightRequestId } from "../panels/panel-kind";
 import { resolveToolPlacement } from "../panels/tool-placement";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
@@ -74,6 +75,13 @@ interface NarratorDockBridges {
 	appendChatInput: ((text: string) => void) | null;
 	writeTerminalStdin: ((text: string) => void) | null;
 	scrollToMessage: ((messageId: string) => void) | null;
+	/**
+	 * Submit text as a real user message through the narrator's own composer path
+	 * (used by the user-chat panel's "send to narrator"). See the note on the same
+	 * field in `dock/NarratorDockContext.tsx`: going through the composer is what
+	 * preserves busy-narrator buffering and slash-command handling.
+	 */
+	submitToNarrator: ((text: string) => void) | null;
 }
 
 /** Stable dockview panel id for a narrator-scoped tool panel. */
@@ -97,6 +105,14 @@ export function workspaceSubagentPanelId(
  */
 export function workspaceFilePanelId(hostNarratorId: string, filePath: string): string {
 	return `wfile_${hostNarratorId}_${hashFilePath(filePath)}`;
+}
+
+/**
+ * Stable panel id for one knowledge entry viewer inside a narrator cluster.
+ * EntryId is a nanoid (safe chars, bounded length) so embedded directly.
+ */
+export function workspaceKnowledgePanelId(hostNarratorId: string, entryId: string): string {
+	return `wknowledge_${hostNarratorId}_${entryId}`;
 }
 
 /**
@@ -188,7 +204,12 @@ class WorkspaceDockStore {
 	private getBridges(narratorId: string): NarratorDockBridges {
 		let b = this.bridges.get(narratorId);
 		if (!b) {
-			b = { appendChatInput: null, writeTerminalStdin: null, scrollToMessage: null };
+			b = {
+				appendChatInput: null,
+				writeTerminalStdin: null,
+				scrollToMessage: null,
+				submitToNarrator: null,
+			};
 			this.bridges.set(narratorId, b);
 		}
 		return b;
@@ -224,6 +245,18 @@ class WorkspaceDockStore {
 		return () => {
 			if (b.scrollToMessage === fn) b.scrollToMessage = null;
 		};
+	}
+
+	registerSubmitToNarrator(narratorId: string, fn: (text: string) => void): () => void {
+		const b = this.getBridges(narratorId);
+		b.submitToNarrator = fn;
+		return () => {
+			if (b.submitToNarrator === fn) b.submitToNarrator = null;
+		};
+	}
+
+	submitToNarrator(narratorId: string, text: string) {
+		this.getBridges(narratorId).submitToNarrator?.(text);
 	}
 
 	scrollToMessage(narratorId: string, messageId: string) {
@@ -271,6 +304,7 @@ class WorkspaceDockStore {
 			else if (params?.panelType === "narrator-tool") secondaryHostIds.add(params.narratorId);
 			else if (params?.panelType === "subagent") secondaryHostIds.add(params.hostNarratorId);
 			else if (params?.panelType === "file") secondaryHostIds.add(params.hostNarratorId);
+			else if (params?.panelType === "knowledge") secondaryHostIds.add(params.hostNarratorId);
 		}
 
 		// Close every secondary panel whose owning narrator cell is gone.
@@ -280,7 +314,9 @@ class WorkspaceDockStore {
 			const hostNarratorId =
 				params?.panelType === "narrator-tool"
 					? params.narratorId
-					: params?.panelType === "subagent" || params?.panelType === "file"
+					: params?.panelType === "subagent" ||
+							params?.panelType === "file" ||
+							params?.panelType === "knowledge"
 						? params.hostNarratorId
 						: null;
 			if (hostNarratorId && !narratorsWithCell.has(hostNarratorId)) {
@@ -362,13 +398,24 @@ class WorkspaceDockStore {
 		api.addPanel({ id, component: PANEL_COMPONENT.narratorTool, params });
 	}
 
-	openSubagentPanel(hostNarratorId: string, subagentNarratorId: string) {
+	openSubagentPanel(hostNarratorId: string, subagentNarratorId: string, messageId?: string) {
 		const api = this.apiRef.current;
 		if (!api || !subagentNarratorId) return;
 		const id = workspaceSubagentPanelId(hostNarratorId, subagentNarratorId);
 		const existing = api.getPanel(id);
 		if (existing) {
 			existing.api.setActive();
+			// Re-ask an already-open panel to jump. The request token is what makes a
+			// second click work; see `nextHighlightRequestId`.
+			if (messageId) {
+				existing.api.updateParameters({
+					panelType: "subagent",
+					hostNarratorId,
+					subagentNarratorId,
+					highlightMessageId: messageId,
+					highlightRequestId: nextHighlightRequestId(),
+				} satisfies WorkspacePanelParams);
+			}
 			return;
 		}
 
@@ -381,6 +428,11 @@ class WorkspaceDockStore {
 			panelType: "subagent",
 			hostNarratorId,
 			subagentNarratorId,
+			// One-shot jump request, delivered as a param because the panel does not exist
+			// yet; stripped before the layout is persisted (see stripIdentityFromLayout).
+			...(messageId
+				? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
+				: {}),
 		};
 		const placement = resolveToolPlacement({
 			hasSecondaryGroup: !!existingSecondary?.group,
@@ -467,6 +519,65 @@ class WorkspaceDockStore {
 		api.addPanel({ id, component: PANEL_COMPONENT.file, params });
 	}
 
+	/**
+	 * Open (or focus) a knowledge entry panel inside one narrator's cluster.
+	 * Same placement rule as file/subagent panels; multi-instance, keyed by entry.
+	 */
+	openKnowledgePanel(
+		hostNarratorId: string,
+		entryId: string,
+		scope: "global" | "personal" = "global",
+	) {
+		const api = this.apiRef.current;
+		if (!api || !entryId) return;
+		const id = workspaceKnowledgePanelId(hostNarratorId, entryId);
+		const existing = api.getPanel(id);
+		if (existing) {
+			existing.api.setActive();
+			return;
+		}
+
+		const narratorPanel = api.panels.find((panel) => {
+			const params = panel.params as WorkspacePanelParams | undefined;
+			return params?.panelType === "narrator" && params.narratorId === hostNarratorId;
+		});
+		const existingSecondary = findClusterSecondary(api, hostNarratorId);
+		const params: WorkspacePanelParams = {
+			panelType: "knowledge",
+			hostNarratorId,
+			entryId,
+			scope,
+		};
+		const placement = resolveToolPlacement({
+			hasSecondaryGroup: !!existingSecondary?.group,
+			hasChatPanel: !!narratorPanel,
+			surfaceWidth: api.width,
+		});
+
+		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.knowledge,
+				params,
+				position: { referenceGroup: existingSecondary.group },
+			});
+			return;
+		}
+
+		if (placement.mode === "split-right" && narratorPanel) {
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.knowledge,
+				params,
+				initialWidth: placement.initialWidth,
+				position: { referencePanel: narratorPanel.id, direction: "right" },
+			});
+			return;
+		}
+
+		api.addPanel({ id, component: PANEL_COMPONENT.knowledge, params });
+	}
+
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
 		this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))?.api.close();
 	}
@@ -494,7 +605,11 @@ function findClusterSecondary(api: DockviewApi, hostNarratorId: string) {
 		const params = panel.params as WorkspacePanelParams | undefined;
 		if (!params) return false;
 		if (params.panelType === "narrator-tool") return params.narratorId === hostNarratorId;
-		if (params.panelType === "subagent" || params.panelType === "file") {
+		if (
+			params.panelType === "subagent" ||
+			params.panelType === "file" ||
+			params.panelType === "knowledge"
+		) {
 			return params.hostNarratorId === hostNarratorId;
 		}
 		return false;
@@ -610,16 +725,21 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 			registerScrollToMessage: (fn: (messageId: string) => void) =>
 				store.registerScrollToMessage(narratorId, fn),
 			scrollToMessage: (messageId: string) => store.scrollToMessage(narratorId, messageId),
+			registerSubmitToNarrator: (fn: (text: string) => void) =>
+				store.registerSubmitToNarrator(narratorId, fn),
+			submitToNarrator: (text: string) => store.submitToNarrator(narratorId, text),
 			refreshOpenToolTypes: () => {
 				const api = store.apiRef.current;
 				if (api) store.refreshOpenToolTypes(api);
 			},
 			openToolPanel: (type: NarratorToolPanelType) =>
 				store.openToolPanel(narratorId, type, chapterIdRef.current),
-			openSubagentPanel: (subagentNarratorId: string) =>
-				store.openSubagentPanel(narratorId, subagentNarratorId),
+			openSubagentPanel: (subagentNarratorId: string, messageId?: string) =>
+				store.openSubagentPanel(narratorId, subagentNarratorId, messageId),
 			openFilePanel: (filePath: string, fileName?: string) =>
 				store.openFilePanel(narratorId, filePath, fileName),
+			openKnowledgePanel: (entryId: string, scope?: KnowledgeEntryScope) =>
+				store.openKnowledgePanel(narratorId, entryId, scope),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
 				store.toggleToolPanel(narratorId, type, chapterIdRef.current),

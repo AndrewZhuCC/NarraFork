@@ -14,10 +14,9 @@ import { generateShortId } from "./id";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
 
-const DEFAULT_UPLOADS_DIR = getNarraforkPath("uploads");
 let uploadsDirTestOverride: string | null = null;
 
-function isWithinDir(root: string, target: string): boolean {
+export function isWithinDir(root: string, target: string): boolean {
 	const rel = relative(root, target);
 	return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
@@ -27,8 +26,25 @@ export function setUploadsDirForTests(dir?: string | null): void {
 	uploadsDirTestOverride = dir ? resolve(dir) : null;
 }
 
+/**
+ * The uploads root.
+ *
+ * Resolved per call, not captured at module load. `getNarraforkPath` reads
+ * `NARRAFORK_HOME` lazily on purpose — "so test preloads and embedded runtimes can set the
+ * override before application modules are imported" — and freezing its answer in a
+ * module-level constant defeated exactly that, because the constant is evaluated whenever
+ * this module happens to be imported first.
+ *
+ * The visible symptom was a test that failed only in combination: a suite that sets
+ * `NARRAFORK_HOME` at module scope changes what the default SHOULD be, but a module already
+ * imported by an earlier suite had baked in the previous value. Resolving here makes the
+ * default a function of the environment at the moment it is read, which is what every other
+ * consumer of `getNarraforkPath` already assumes.
+ *
+ * Cost is a `resolve()` per call; callers that touch the filesystem afterwards dwarf it.
+ */
 export function getUploadsDir(): string {
-	return uploadsDirTestOverride ?? DEFAULT_UPLOADS_DIR;
+	return uploadsDirTestOverride ?? getNarraforkPath("uploads");
 }
 
 function getAvatarsDir(): string {
@@ -46,7 +62,7 @@ export function contentJsonHasImageBlocks(contentJson: unknown): boolean {
 
 const ALLOWED_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 
-const MIME_TO_EXT: Record<string, string> = {
+export const MIME_TO_EXT: Record<string, string> = {
 	"image/png": ".png",
 	"image/jpeg": ".jpg",
 	"image/gif": ".gif",
@@ -338,7 +354,7 @@ export interface ProcessedImageUpload {
  * uploads from later being served back as images or sent to AI providers.
  * Callers must validate the declared MIME type and size *before* calling this.
  */
-async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
+export async function processImageUpload(file: File): Promise<ProcessedImageUpload> {
 	const bytes = new Uint8Array(await file.arrayBuffer());
 	const detectedMediaType = detectImageMime(imageHeaderView(bytes));
 	if (!detectedMediaType) {
@@ -377,7 +393,7 @@ const UPLOAD_DIR_MODE = 0o700;
  * surfaces as a 500-class AppError. Reporting 400 would tell the client its request
  * was wrong and hide a real operator problem from error-rate monitoring.
  */
-function ensureUploadDirWritable(dir: string): void {
+export function ensureUploadDirWritable(dir: string): void {
 	try {
 		accessSync(dir, constants.W_OK);
 		return;
@@ -408,7 +424,7 @@ function ensureUploadDirWritable(dir: string): void {
  * on the message text would break on a localized or reworded message, and would also
  * match a file whose *contents* merely mention EACCES.
  */
-function toUploadPermissionError(error: unknown, filePath: string): unknown {
+export function toUploadPermissionError(error: unknown, filePath: string): unknown {
 	const code = (error as NodeJS.ErrnoException | null)?.code;
 	if (code !== "EACCES" && code !== "EPERM") return error;
 	logger.error("Image write permission denied", { filePath, error: String(error) });
@@ -605,7 +621,7 @@ export function validateTextFile(file: File): void {
 	}
 }
 
-function allocateWorktreeAttachmentPath(cwd: string, filename: string): string {
+export function allocateWorktreeAttachmentPath(cwd: string, filename: string): string {
 	const dir = resolve(cwd, ".narrafork", "attached");
 	mkdirSync(dir, { recursive: true });
 

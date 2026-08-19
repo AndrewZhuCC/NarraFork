@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod/v4";
@@ -892,6 +892,9 @@ describe("executeTool execution target freeze", () => {
 		name: "Remote",
 		slug: "remote",
 		online: true,
+		// These tests cover tool routing, not injection tiers; "global" preserves
+		// the pre-change behaviour.
+		scope: "global" as const,
 	};
 
 	test("persists the resolved remote target before permission handling", async () => {
@@ -960,6 +963,7 @@ describe("executeTool execution target freeze", () => {
 						name: "Secondary",
 						slug: "secondary",
 						online: true,
+						scope: "global" as const,
 					},
 				],
 				onExecutionTargetResolved: async (_toolUseId, target) => {
@@ -1155,7 +1159,15 @@ describe("executeTool execution target freeze", () => {
 					return { behavior: "allow" };
 				}),
 				defaultDeviceId: remoteBackend.deviceId,
-				availableDevices: [{ id: "other-device", name: "Other", slug: "other", online: true }],
+				availableDevices: [
+					{
+						id: "other-device",
+						name: "Other",
+						slug: "other",
+						online: true,
+						scope: "global" as const,
+					},
+				],
 			},
 		);
 
@@ -1177,7 +1189,15 @@ describe("executeTool execution target freeze", () => {
 				return { behavior: "allow" };
 			}),
 			defaultDeviceId: "offline-device",
-			availableDevices: [{ id: "offline-device", name: "Offline", slug: "offline", online: false }],
+			availableDevices: [
+				{
+					id: "offline-device",
+					name: "Offline",
+					slug: "offline",
+					online: false,
+					scope: "global" as const,
+				},
+			],
 			onExecutionTargetResolved: async () => {
 				persisted = true;
 			},
@@ -1436,11 +1456,31 @@ describe("taskReflection protected-task repair guidance", () => {
 			"zh-CN",
 		);
 
-		expect(en).toContain("malformed scheduler state");
-		expect(en).toContain("must not be marked done");
+		// The reviewer's question is about INTENT, not about task formalities. This was
+		// previously framed evidence-first ("is there concrete evidence it is complete"),
+		// which has no upper bound — a reviewer can always name one more unproven thing.
+		// One real session spent 1.5 hours on five consecutive denials of a task titled
+		// "阶段 0-4 全量验收"; by the last round the full 3067-test suite passed and it was
+		// still denied for lacking a standalone benchmark.
+		expect(en).toContain("betray what the user actually asked for");
+		expect(en).toContain("not the standard itself");
+		expect(zh).toContain("是否违背了用户真正要求的东西");
+		expect(zh).toContain("不是审核标准本身");
+
+		// An unbounded entry must be repairable by rewriting it into a finite task, rather
+		// than being held open forever.
+		expect(en).toContain("no decidable completion condition");
+		expect(en).toContain("legitimate repair");
+		expect(zh).toContain("没有可判定的完成条件");
+		expect(zh).toContain("合法纠正");
+
+		// A denial has to be actionable: if no passing instruction can be written, the task
+		// shape is the problem.
+		expect(en).toContain("do this and it passes");
+		expect(zh).toContain("做完这一步就能通过");
+
+		// Origin still weights conservatism, but no longer decides the outcome.
 		expect(en).toContain("createdBy=user, system, or unknown");
-		expect(zh).toContain("不是合法的调度任务");
-		expect(zh).toContain("不能把这种条目标记 done");
 		expect(zh).toContain("createdBy=user、system 或 unknown");
 	});
 
@@ -1510,10 +1550,81 @@ describe("relaxed plan reminder classifier", () => {
 		).resolves.toBe(false);
 	});
 
+	test("ignores writes to the plan file itself", async () => {
+		// The reminder exists to say "you are planning, not implementing". Attaching it to
+		// the ONE write plan mode asked for tells the model its correct action was suspect,
+		// which is the opposite of the intent.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-write",
+					name: "Write",
+					input: { file_path: ".narrafork/plans/plan-abc.md", content: "# Plan" },
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		// Relaxed plan mode lets the model pick its own file inside the plan directory.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-write-custom",
+					name: "Write",
+					input: { file_path: "/tmp/.narrafork/plans/my-plan.md", content: "# Plan" },
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-plan-edit",
+					name: "Edit",
+					input: {
+						file_path: ".narrafork/plans/plan-abc.md",
+						old_string: "a",
+						new_string: "b",
+					},
+				},
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(false);
+		// A cycle anchored to the pre-`plans/` layout writes outside the directory, and
+		// that file is just as much the plan.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-legacy-plan-write",
+					name: "Write",
+					input: { file_path: ".narrafork/plan-abc.md", content: "# Plan" },
+				},
+				{ ...relaxedPlanConfig, planFilePath: ".narrafork/plan-abc.md" },
+			),
+		).resolves.toBe(false);
+	});
+
 	test("flags mutating tools and write-capable subagents", async () => {
 		await expect(
 			shouldInjectRelaxedPlanToolReminder(
 				{ toolUseId: "tu-write", name: "Write", input: { file_path: "x.ts" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+		// A `.md` outside the plan directory is documentation, not the plan.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{ toolUseId: "tu-doc-write", name: "Write", input: { file_path: "docs/NOTES.md" } },
+				relaxedPlanConfig,
+			),
+		).resolves.toBe(true);
+		// The legacy plan path only counts when the cycle is actually anchored to it.
+		await expect(
+			shouldInjectRelaxedPlanToolReminder(
+				{
+					toolUseId: "tu-legacy-unanchored",
+					name: "Write",
+					input: { file_path: ".narrafork/plan-abc.md" },
+				},
 				relaxedPlanConfig,
 			),
 		).resolves.toBe(true);
@@ -1627,13 +1738,14 @@ describe("ExitPlanMode custom plan file resolution", () => {
 		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
 		try {
 			const plan = "# Custom plan\n\n- Keep the implementation focused.\n";
-			writeFileSync(join(cwd, "custom.md"), plan, "utf8");
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+			writeFileSync(join(cwd, ".narrafork", "plans", "custom.md"), plan, "utf8");
 			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
 
 			const result = await resolveExitPlanModeInput(
 				narratorId,
 				cwd,
-				{ plan_file_path: "custom.md" },
+				{ plan_file_path: ".narrafork/plans/custom.md" },
 				"en",
 				true,
 			);
@@ -1642,7 +1754,7 @@ describe("ExitPlanMode custom plan file resolution", () => {
 			if (result.ok) {
 				expect(result.resolvedFromFile).toBe(true);
 				expect(result.input.plan).toBe(plan);
-				expect(result.input._planFile).toBe("custom.md");
+				expect(result.input._planFile).toBe(".narrafork/plans/custom.md");
 			}
 		} finally {
 			activeNarrators.delete(narratorId);
@@ -1654,13 +1766,15 @@ describe("ExitPlanMode custom plan file resolution", () => {
 		const narratorId = `plan-file-invalid-${Date.now()}`;
 		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
 		try {
-			writeFileSync(join(cwd, "plan.txt"), "not a Markdown plan", "utf8");
+			// Inside the plan directory, so the failure is unambiguously about the extension.
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+			writeFileSync(join(cwd, ".narrafork", "plans", "plan.txt"), "not a Markdown plan", "utf8");
 			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
 
 			const result = await resolveExitPlanModeInput(
 				narratorId,
 				cwd,
-				{ plan_file_path: "plan.txt" },
+				{ plan_file_path: ".narrafork/plans/plan.txt" },
 				"en",
 				true,
 			);
@@ -1673,17 +1787,45 @@ describe("ExitPlanMode custom plan file resolution", () => {
 		}
 	});
 
-	test("rejects an oversized custom plan file before reading it", async () => {
-		const narratorId = `plan-file-large-${Date.now()}`;
+	test("rejects a custom plan path outside the plan directory", async () => {
+		const narratorId = `plan-file-outside-${Date.now()}`;
 		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
 		try {
-			writeFileSync(join(cwd, "large.md"), "x".repeat(MAX_PLAN_FILE_BYTES + 1), "utf8");
+			writeFileSync(join(cwd, "custom.md"), "# Plan outside the plan directory\n", "utf8");
 			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
 
 			const result = await resolveExitPlanModeInput(
 				narratorId,
 				cwd,
-				{ plan_file_path: "large.md" },
+				{ plan_file_path: "custom.md" },
+				"en",
+				true,
+			);
+
+			expect(result.ok).toBe(false);
+			if (!result.ok) expect(result.message).toContain(".narrafork/plans");
+		} finally {
+			activeNarrators.delete(narratorId);
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects an oversized custom plan file before reading it", async () => {
+		const narratorId = `plan-file-large-${Date.now()}`;
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-plan-"));
+		try {
+			mkdirSync(join(cwd, ".narrafork", "plans"), { recursive: true });
+			writeFileSync(
+				join(cwd, ".narrafork", "plans", "large.md"),
+				"x".repeat(MAX_PLAN_FILE_BYTES + 1),
+				"utf8",
+			);
+			activeNarrators.set(narratorId, { _planFileId: "default-plan" } as never);
+
+			const result = await resolveExitPlanModeInput(
+				narratorId,
+				cwd,
+				{ plan_file_path: ".narrafork/plans/large.md" },
 				"en",
 				true,
 			);

@@ -432,6 +432,16 @@ interface NarratorWSCallbacks {
 	onToolLongRunning?: (toolUseId: string, elapsed: number, parentToolUseId?: string) => void;
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
+	/**
+	 * A running Await-agent call learned which child narrator it is waiting on.
+	 * Lets the card offer "open session" before the wait returns (the id is not in
+	 * the persisted row until then).
+	 */
+	onAwaitAgentResolved?: (
+		toolUseId: string,
+		subagentNarratorId: string,
+		parentToolUseId?: string,
+	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
@@ -550,6 +560,14 @@ interface NarratorWSCallbacks {
 	) => boolean | undefined;
 	onFullReload?: () => void;
 	onSyncOk?: () => void;
+	/**
+	 * The server refused this subscription: the narrator is not shared with this
+	 * user, or does not exist (deliberately the same answer). Without handling it the
+	 * UI would wait for events that will never arrive.
+	 */
+	onSubscribeDenied?: () => void;
+	/** Sharing settings changed; anything showing access state should re-read it. */
+	onAccessChanged?: (reason: string) => void;
 	onCommitsUpdated?: (chapterId: string, newCount: number) => void;
 	onCommitSyncError?: (event: CommitSyncErrorEvent) => void;
 	onBackgroundTaskStarted?: (
@@ -976,6 +994,13 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
+					case "await_agent_resolved":
+						callbackOwner.callbacks.onAwaitAgentResolved?.(
+							data.toolUseId as string,
+							data.subagentNarratorId as string,
+							data.parentToolUseId as string | undefined,
+						);
+						break;
 					case "title_updated":
 						callbackOwner.callbacks.onTitleUpdated?.(data.title as string);
 						break;
@@ -1252,6 +1277,16 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onFullReload?.();
 						break;
 					}
+					case "subscribe_denied":
+						// Stop waiting: no snapshot or catch-up is coming for this narrator.
+						narratorWSManager.clearCatchUpState(subscribedId);
+						callbackOwner.callbacks.onSubscribeDenied?.();
+						break;
+					case "narrator_access_changed":
+						callbackOwner.callbacks.onAccessChanged?.(
+							typeof data.reason === "string" ? data.reason : "unknown",
+						);
+						break;
 					case "sync_ok":
 						// While a manifest reconcile is open, stage the authoritative version
 						// instead of publishing it over a separately staged realtime cursor.

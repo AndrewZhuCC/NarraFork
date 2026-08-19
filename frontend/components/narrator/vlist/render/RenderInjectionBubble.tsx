@@ -62,6 +62,13 @@ export interface RenderInjectionBubbleProps {
 	 * the wrap; this only lets the body renderer paint the row.
 	 */
 	payloadData?: unknown;
+	/**
+	 * This bubble's framed payload describes work happening RIGHT NOW: it is the
+	 * newest spec-task injection and the narrator is running. Only the spec-task body
+	 * reads it, to decide whether its `doing` row animates (see RenderSpecTask).
+	 * Height-neutral — a glyph swap inside an already-reserved lane.
+	 */
+	payloadLive?: boolean;
 	/** Forwarded for mermaid/katex local-measure refinement inside the body. */
 	onUnknownHeight?: (height: number) => void;
 	/**
@@ -86,6 +93,7 @@ export function RenderInjectionBubble({
 	header,
 	noteText,
 	payloadData,
+	payloadLive,
 	onUnknownHeight,
 	payloadSlots,
 }: RenderInjectionBubbleProps) {
@@ -135,6 +143,7 @@ export function RenderInjectionBubble({
 					<InjectionBody
 						measured={measured}
 						payloadData={payloadData}
+						payloadLive={payloadLive}
 						payloadSlots={payloadSlots}
 						onUnknownHeight={onUnknownHeight}
 					/>
@@ -187,11 +196,13 @@ export function RenderInjectionBubble({
 function InjectionBody({
 	measured,
 	payloadData,
+	payloadLive,
 	payloadSlots,
 	onUnknownHeight,
 }: {
 	measured: MeasuredInjectionBubble;
 	payloadData?: unknown;
+	payloadLive?: boolean;
 	payloadSlots?: RenderInjectionBubbleProps["payloadSlots"];
 	onUnknownHeight?: (height: number) => void;
 }) {
@@ -209,7 +220,13 @@ function InjectionBody({
 	// lock) is exactly what this branch removes. Its body height is the frame's
 	// content height, not the bubble's chrome-inclusive total.
 	if (kind === "spec-task") {
-		return <RenderSpecTask measured={cardMeasured} data={(payloadData ?? {}) as never} />;
+		return (
+			<RenderSpecTask
+				measured={cardMeasured}
+				data={(payloadData ?? {}) as never}
+				live={payloadLive === true}
+			/>
+		);
 	}
 	if (SYSTEM_SIMPLE_PAYLOADS.has(kind)) {
 		return (
@@ -223,9 +240,19 @@ function InjectionBody({
 		);
 	}
 	if (SYSTEM_TEXT_PAYLOADS.has(kind)) {
-		// `kind`/`data` are read off the measured block by the card itself; passing the
-		// tag keeps its dispatch identical to the standalone path.
-		return <RenderSystemText measured={cardMeasured} kind={kind as never} />;
+		// `kind` drives the card's dispatch, exactly as on the standalone path.
+		//
+		// `data` is forwarded rather than left to default, because these cards read their
+		// height-NEUTRAL chrome from it — badges, button labels, variants. The measure layer
+		// already reserved room for all of it (see each kind's KIND_CHROME), so passing it
+		// changes what is painted and never what was measured.
+		return (
+			<RenderSystemText
+				measured={cardMeasured}
+				kind={kind as never}
+				data={(payloadData ?? undefined) as never}
+			/>
+		);
 	}
 	return null;
 }
@@ -233,7 +260,6 @@ function InjectionBody({
 /** Payload kinds drawn by `RenderSystemSimple`. Mirrors the measure-side set. */
 const SYSTEM_SIMPLE_PAYLOADS = new Set([
 	"merge_summary",
-	"review_feedback",
 	"spec_continuation",
 	"spec_blocked_continuation",
 ]);

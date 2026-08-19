@@ -29,16 +29,26 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { PluginUiSurfaceProvider } from "../../plugins/PluginUiSurfaceContext";
+import {
+	type PluginUiHostSurface,
+	PluginUiSurfaceProvider,
+} from "../../plugins/PluginUiSurfaceContext";
 import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import {
+	type KnowledgeEntryScope,
+	type KnowledgePanelParams,
+	nextHighlightRequestId,
+	type SubagentPanelParams,
+} from "../panels/panel-kind";
 import { resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
 	fileDockPanelId,
 	isNarratorToolPanelType,
+	knowledgeDockPanelId,
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
 	type NarratorToolPanelType,
@@ -58,11 +68,39 @@ interface NarratorDockBridges {
 	writeTerminalStdin: ((text: string) => void) | null;
 	/** Registered by the chat panel; called by the search panel to jump to a message. */
 	scrollToMessage: ((messageId: string) => void) | null;
+	/**
+	 * Registered by the chat panel; called by the user-chat panel to SUBMIT text as
+	 * a real user message.
+	 *
+	 * Deliberately the composer's own submit path rather than a direct REST call:
+	 * that is where busy-narrator buffering, slash-command resolution and draft /
+	 * attachment state live. Bypassing it would make a forward sent mid-turn start a
+	 * new turn instead of queueing behind the current one.
+	 */
+	submitToNarrator: ((text: string) => void) | null;
 }
 
 export interface NarratorDockContextValue {
 	narratorId: string;
 	chapterId: string | null | undefined;
+
+	/**
+	 * The surrounding host already displays this narrator's title, so the chat panel
+	 * must not render its own title row (nor its edit / generate actions).
+	 *
+	 * Set by a chapter node's embedded dock: the node header shows the title and owns
+	 * those two actions, and the panel's copy was being squeezed to zero width by its
+	 * own tool buttons.
+	 *
+	 * Optional so the hand-built context values (detached canvas panels, workspace
+	 * shards) keep their current behaviour by simply not setting it — none of them has
+	 * an outer header to show the title.
+	 *
+	 * Deliberately NOT derived from `pluginSurface === "graph"`: that flag identifies
+	 * the host for PLUGINS, and using it to decide chat chrome would silently drop the
+	 * title the moment a surface name is reused or renamed.
+	 */
+	hostOwnsTitle?: boolean;
 
 	/**
 	 * Chapter fork-from-message handler supplied by the page (route owns the
@@ -111,8 +149,21 @@ export interface NarratorDockContextValue {
 
 	/** Register the message-jump handler (returns an unregister fn). */
 	registerScrollToMessage: (fn: (messageId: string) => void) => () => void;
-	/** Scroll to + highlight a message in the chat panel, if mounted. */
-	scrollToMessage: (messageId: string) => void;
+	/**
+	 * Scroll to + highlight a message in the chat panel.
+	 *
+	 * Optional because a surface may have no chat panel to jump to at all: a tool
+	 * panel torn out onto the story-network canvas keeps working on its own, but
+	 * "jump to this message" has nowhere to go once its source node is collapsed.
+	 * Consumers must treat absence as "disable the control" rather than calling it
+	 * through a `?.` that silently does nothing.
+	 */
+	scrollToMessage?: (messageId: string) => void;
+
+	/** Register the user-message submitter (returns an unregister fn). */
+	registerSubmitToNarrator: (fn: (text: string) => void) => () => void;
+	/** Submit text as a user message through the chat panel's composer path. */
+	submitToNarrator: (text: string) => void;
 
 	/** Tool panel types currently present in the layout (for toolbar active state). */
 	openToolTypes: ReadonlySet<NarratorToolPanelType>;
@@ -120,13 +171,34 @@ export interface NarratorDockContextValue {
 	refreshOpenToolTypes: () => void;
 	/** Open (or focus) a tool panel next to chat. */
 	openToolPanel: (type: NarratorToolPanelType) => void;
-	/** Open (or focus) a child narrator session in the shared secondary area. */
-	openSubagentPanel: (subagentNarratorId: string) => void;
+	/**
+	 * Open (or focus) a child narrator session in the shared secondary area.
+	 *
+	 * `messageId` scrolls that session to (and flashes) one message — used by rows
+	 * that report a specific thing the child said, such as an injection bubble. It is
+	 * delivered as a panel PARAMETER rather than through the `scrollToMessage` bridge
+	 * because the panel usually does not exist yet at click time, so there is nothing
+	 * registered to call; the panel consumes it once mounted.
+	 *
+	 * Optional for the same reason as `scrollToMessage`: a detached canvas panel has
+	 * no secondary area of its own, so when its source node is collapsed there is
+	 * nowhere to put the session. Absence means "disable the control".
+	 */
+	openSubagentPanel?: (subagentNarratorId: string, messageId?: string) => void;
 	/**
 	 * Open (or focus) a read-only file viewer for an absolute path. Multi-instance:
 	 * one panel per path, keyed by a hash of the path (see `fileDockPanelId`).
 	 */
 	openFilePanel: (filePath: string, fileName?: string) => void;
+	/**
+	 * Open (or focus) a knowledge entry viewer/editor panel. Multi-instance: one
+	 * panel per entry, keyed by entryId. `scope` determines which hooks are used
+	 * (global shared base vs personal library).
+	 *
+	 * Optional for the same reason as `openSubagentPanel`: a detached canvas panel
+	 * has no secondary area, so absence means "disable the control".
+	 */
+	openKnowledgePanel?: (entryId: string, scope?: KnowledgeEntryScope) => void;
 	/** Close a tool panel if present. */
 	closeToolPanel: (type: NarratorToolPanelType) => void;
 	/** Toggle a tool panel open/closed. */
@@ -150,6 +222,8 @@ export function NarratorDockProvider({
 	highlightMessageId,
 	onBack = null,
 	onMinimize = null,
+	hostOwnsTitle = false,
+	pluginSurface = "focus",
 	children,
 }: {
 	narratorId: string;
@@ -158,6 +232,15 @@ export function NarratorDockProvider({
 	highlightMessageId?: string;
 	onBack?: (() => void) | null;
 	onMinimize?: (() => void) | null;
+	/** See `hostOwnsTitle` on {@link NarratorDockContextValue}. */
+	hostOwnsTitle?: boolean;
+	/**
+	 * Which host surface plugins should see. Defaults to `"focus"` (the narrator
+	 * page). A chapter node's embedded dock passes `"graph"`: the coordination
+	 * model is identical — one surface, one narrator — but plugins get to tell the
+	 * two apart, since a node's viewport is far smaller than a full page.
+	 */
+	pluginSurface?: PluginUiHostSurface;
 	children: React.ReactNode;
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
@@ -175,6 +258,7 @@ export function NarratorDockProvider({
 		appendChatInput: null,
 		writeTerminalStdin: null,
 		scrollToMessage: null,
+		submitToNarrator: null,
 	});
 
 	// Keep chapterId in a ref so openToolPanel always uses the latest without
@@ -260,13 +344,25 @@ export function NarratorDockProvider({
 		[narratorId],
 	);
 
-	const openSubagentPanel = useCallback((subagentNarratorId: string) => {
+	const openSubagentPanel = useCallback((subagentNarratorId: string, messageId?: string) => {
 		const api = apiRef.current;
 		if (!api || !subagentNarratorId) return;
 		const id = subagentDockPanelId(subagentNarratorId);
 		const existing = api.getPanel(id);
 		if (existing) {
 			existing.api.setActive();
+			// An already-open panel is focused, and re-asked to jump. The nonce is what
+			// makes a SECOND click on the same row work: the panel's jump is latched per
+			// (narrator, target) so it fires once, and without a changing token the reader
+			// who scrolled away would click a live-looking control and see nothing.
+			if (messageId) {
+				existing.api.updateParameters({
+					panelType: "subagent",
+					subagentNarratorId,
+					highlightMessageId: messageId,
+					highlightRequestId: nextHighlightRequestId(),
+				} satisfies SubagentPanelParams);
+			}
 			return;
 		}
 
@@ -278,6 +374,12 @@ export function NarratorDockProvider({
 		const params: NarratorDockPanelParams = {
 			panelType: "subagent",
 			subagentNarratorId,
+			// Carried as a PARAMETER rather than pushed through the `scrollToMessage`
+			// bridge because the panel does not exist yet at click time — there is nothing
+			// registered to call. The panel consumes it on mount.
+			...(messageId
+				? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
+				: {}),
 		};
 		const placement = resolveToolPlacement({
 			hasSecondaryGroup: !!existingSecondary?.group,
@@ -370,6 +472,61 @@ export function NarratorDockProvider({
 		});
 	}, []);
 
+	// Same placement rule as the other multi-instance secondary panels (file,
+	// subagent). The panel id is derived from the entryId (a nanoid, safe as-is).
+	const openKnowledgePanel = useCallback(
+		(entryId: string, scope: KnowledgeEntryScope = "global") => {
+			const api = apiRef.current;
+			if (!api || !entryId) return;
+			const id = knowledgeDockPanelId(entryId);
+			const existing = api.getPanel(id);
+			if (existing) {
+				existing.api.setActive();
+				return;
+			}
+
+			const existingSecondary = api.panels.find((panel) => {
+				const panelParams = panel.params as NarratorDockPanelParams | undefined;
+				return panelParams?.panelType !== "chat";
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const params: KnowledgePanelParams = { panelType: "knowledge", entryId, scope };
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
+
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.knowledge,
+					params,
+					position: { referenceGroup: existingSecondary.group },
+				});
+				return;
+			}
+
+			if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.knowledge,
+					params,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+				return;
+			}
+
+			api.addPanel<NarratorDockPanelParams>({
+				id,
+				component: NARRATOR_DOCK_COMPONENT.knowledge,
+				params,
+			});
+		},
+		[],
+	);
+
 	const closeToolPanel = useCallback((type: NarratorToolPanelType) => {
 		apiRef.current?.getPanel(dockPanelId(type))?.api.close();
 	}, []);
@@ -382,10 +539,17 @@ export function NarratorDockProvider({
 		[openToolPanel, closeToolPanel],
 	);
 
+	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
+	// references across parent renders. The sole call site in
+	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
+	// context value below only rebuilds when truly necessary (narratorId/chapterId
+	// change, or local state changes). If a new call site is added without
+	// useCallback, the entire context will re-create on every parent render.
 	const value = useMemo<NarratorDockContextValue>(() => {
 		return {
 			narratorId,
 			chapterId,
+			hostOwnsTitle,
 			onForkFromMessage,
 			highlightMessageId,
 			onBack,
@@ -424,17 +588,28 @@ export function NarratorDockProvider({
 				};
 			},
 			scrollToMessage: (messageId) => bridgesRef.current.scrollToMessage?.(messageId),
+			registerSubmitToNarrator: (fn) => {
+				bridgesRef.current.submitToNarrator = fn;
+				return () => {
+					if (bridgesRef.current.submitToNarrator === fn) {
+						bridgesRef.current.submitToNarrator = null;
+					}
+				};
+			},
+			submitToNarrator: (text) => bridgesRef.current.submitToNarrator?.(text),
 			openToolTypes,
 			refreshOpenToolTypes,
 			openToolPanel,
 			openSubagentPanel,
 			openFilePanel,
+			openKnowledgePanel,
 			closeToolPanel,
 			toggleToolPanel,
 		};
 	}, [
 		narratorId,
 		chapterId,
+		hostOwnsTitle,
 		onForkFromMessage,
 		highlightMessageId,
 		onBack,
@@ -447,12 +622,13 @@ export function NarratorDockProvider({
 		openToolPanel,
 		openSubagentPanel,
 		openFilePanel,
+		openKnowledgePanel,
 		closeToolPanel,
 		toggleToolPanel,
 	]);
 
 	return (
-		<PluginUiSurfaceProvider hostContext={{ surface: "focus", narratorId, chapterId }}>
+		<PluginUiSurfaceProvider hostContext={{ surface: pluginSurface, narratorId, chapterId }}>
 			<NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>
 		</PluginUiSurfaceProvider>
 	);

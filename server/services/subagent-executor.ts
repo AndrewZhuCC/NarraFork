@@ -10,6 +10,7 @@ import {
 	TODO_REMINDER_TOOL_INTERVAL,
 } from "../lib/agent";
 import { normalizeBooleanOverride } from "../lib/boolean-override";
+import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { eventBus } from "../lib/event-bus";
 import { resolveFastModeForUser, resolveSubagentActingUserId } from "../lib/fast-mode";
 import { generateShortId } from "../lib/id";
@@ -69,6 +70,7 @@ import {
 } from "./subagent-conclusion";
 import { clearTeamInbox, drainTeamInbox } from "./subagent-team";
 import { resolveToolFilter } from "./subagent-tools";
+import { resolveEffectiveTraits } from "./trait-layer-service";
 import type { UpdateExecutionLease } from "./update-coordinator";
 
 // ---------------------------------------------------------------------------
@@ -683,14 +685,40 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 				})
 			)?.projectId ?? null)
 		: null;
-	const availableDevices = await import("./device-connection-service")
-		.then(({ getSessionDevices }) => getSessionDevices(projectId))
+	const authorizedDevices = await import("./device-connection-service")
+		.then(({ getSessionDevices }) =>
+			getSessionDevices(
+				projectId,
+				resolveSubagentActingUserId(
+					opts.userId ?? null,
+					activeNarrators.get(parentNarratorId)?._currentUserId,
+				),
+			),
+		)
 		.catch(() => []);
 	const defaultDeviceId = initialNarrator.defaultDeviceId ?? null;
 	let narratorReasoningEffort = initialNarrator.reasoningEffort ?? undefined;
 	let narratorFastModeOverride = normalizeBooleanOverride(initialNarrator.fastModeOverride);
-	const disabledTools = getDisabledToolSet(initialNarrator.traits);
-	const blockedSkills = getBlockedSkills(initialNarrator.traits);
+	// Layered traits: the parent narrator is an upper layer relative to a subagent,
+	// so an enforced restriction on the parent (or on the project/user above it)
+	// cannot be escaped here. `currentUserId` may be absent on recovery/detached
+	// paths, matching how fast mode falls back to the parent's acting user.
+	const subagentTraits = await resolveEffectiveTraits({
+		narratorTraits: initialNarrator.traits,
+		projectId,
+		actingUserId: resolveSubagentActingUserId(
+			currentUserId,
+			activeNarrators.get(parentNarratorId)?._currentUserId,
+		),
+	});
+	const disabledTools = getDisabledToolSet(subagentTraits.traits);
+	const blockedSkills = getBlockedSkills(subagentTraits.traits);
+	// Same narrowing as a primary session: authorization decides what may be used,
+	// the injection policy decides what the model is told about.
+	const availableDevices = resolveInjectedDevices(
+		authorizedDevices,
+		subagentTraits.deviceInjection,
+	);
 
 	// Register in the active subagent settings map so that model/reasoningEffort
 	// updates from the UI are picked up via getRuntimeSettingsOverride.
@@ -932,11 +960,15 @@ export async function executeSubagent(opts: SubagentExecOptions): Promise<{
 							items: [
 								{
 									fromId: m.fromId,
-									// `fromTitle ?? fromId` was the old inline template's sender slot; the
-									// renderer applies the same fallback, so keeping the raw pair holds the
-									// text identical AND gives the UI both parts.
+									// The renderer applies the `fromTitle → fromLabel → fromId` fallback, so
+									// passing all three keeps the text right AND gives the UI every part. The
+									// label matters because an untitled sender used to be named by its nanoid.
 									fromTitle: m.fromTitle ?? null,
+									fromLabel: m.fromLabel ?? null,
 									fromType: m.fromType ?? null,
+									// Reader-only navigation target into the sender's own session;
+									// omitted when the sender had written nothing yet.
+									...(m.fromMessageId ? { fromMessageId: m.fromMessageId } : {}),
 									...(m.isBroadcast ? { isBroadcast: true } : {}),
 									text: m.text,
 								},

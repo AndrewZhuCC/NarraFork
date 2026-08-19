@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { worktreeLock } from "../lib/async-mutex";
 import { GitAuthError, GitError } from "../lib/errors";
+import type { GitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
@@ -34,7 +35,20 @@ interface ExecOptions {
 	 */
 	timeout?: number;
 	maxOutputBytes?: number;
+	/**
+	 * `GIT_AUTHOR_*`/`GIT_COMMITTER_*` overrides that attribute a commit to the
+	 * acting person instead of the host machine's global git config.
+	 *
+	 * Only meaningful for commands that write commit objects. Null/undefined is the
+	 * documented "inherit the host identity" case and must remain byte-for-byte
+	 * identical to the historical behaviour, so no env is passed at all in that case
+	 * — see the note in {@link exec}.
+	 */
+	identity?: GitIdentityEnv | null;
 }
+
+/** Commit-writing methods take this to attribute the commit to a real person. */
+export type GitCommitIdentity = GitIdentityEnv | null | undefined;
 
 /**
  * Ceiling for read-only git commands.
@@ -54,6 +68,60 @@ const READ_TIMEOUT_MS = 60_000;
  * streams are still drained — only the retained string is bounded.
  */
 const READ_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+/**
+ * Depth of the walk behind {@link gitService.getLastCommitTimes}.
+ *
+ * Measured on this repository: 200 commits resolved 90 of 127 changed paths, and 400
+ * and 800 resolved the same 90 — the walk stops finding new paths well before it stops
+ * producing output (40 KB at 200, 88 KB at 800). Anything unresolved falls back to the
+ * window boundary, which is safe by construction, so extra depth buys nothing.
+ */
+const COMMIT_BOUNDARY_MAX_COMMITS = 200;
+
+/**
+ * Path ceiling for one boundary walk.
+ *
+ * Matched to the 200-entry cap on `getStatusSummary().files`: the caller cannot show
+ * more changed files than that, so a larger pathspec would describe rows nobody
+ * renders. Also keeps the argument vector far below ARG_MAX (128 paths measured at
+ * 5 KB here, against a 2 MB limit).
+ */
+const COMMIT_BOUNDARY_MAX_PATHS = 200;
+
+/**
+ * Prefix marking a commit line in the boundary walk.
+ *
+ * `--name-only` prints paths bare on their own lines, so commit lines need a sentinel
+ * that cannot occur at the start of a repo-relative path. NUL is the one byte git
+ * forbids in a path, which makes misparsing impossible rather than merely unlikely.
+ *
+ * It cannot be written literally in the format argument — spawn rejects an argv entry
+ * containing NUL (`ERR_INVALID_ARG_VALUE`) — so the format uses git's `%x00` escape and
+ * git emits the byte itself. Note that `String.prototype.trim` does NOT strip NUL, so
+ * the marker survives line trimming.
+ */
+const COMMIT_BOUNDARY_MARKER = "\0";
+/** The `%x00` escape that makes git print {@link COMMIT_BOUNDARY_MARKER}. */
+const COMMIT_BOUNDARY_MARKER_FORMAT = "%x00";
+
+/**
+ * Convert a git ISO-8601 timestamp to the UTC `...Z` form.
+ *
+ * `%cI` carries the committer's local offset (`2026-08-14T18:19:20+08:00`) while
+ * `file_attributions.changedAt` is stored as UTC with a `Z` suffix. These boundaries are
+ * compared against that column as STRINGS, and lexicographic order across different
+ * offsets is meaningless: the example above sorts after `2026-08-14T11:00:00Z` despite
+ * being two hours earlier. Normalizing here keeps every consumer on one representation.
+ *
+ * Returns null for an unparseable value rather than a wrong instant, so a caller can
+ * skip the boundary instead of silently filtering on garbage.
+ */
+function toUtcIso(raw: string): string | null {
+	const ms = Date.parse(raw);
+	if (Number.isNaN(ms)) return null;
+	return new Date(ms).toISOString();
+}
 
 /**
  * Default depth for {@link gitService.findCommitLogIndex}.
@@ -137,6 +205,16 @@ export interface GitStatusFile {
 	/** Two-character porcelain status, e.g. "M ", " M", "MM", "??". */
 	status: string;
 	path: string;
+	/**
+	 * Pre-rename path, for an `R`/`C` entry. Undefined for every other status.
+	 *
+	 * Porcelain already reports it (`R  old\0new`) and the parser already extracts it; it
+	 * is surfaced here because consumers keyed on `path` alone cannot find anything
+	 * recorded before the rename. File attribution is the concrete case: rows are written
+	 * under the path that existed at the time, so a renamed file's entire history sits
+	 * under a path that no longer appears in the diff.
+	 */
+	oldPath?: string;
 	linesAdded: number;
 	linesRemoved: number;
 	stagedLinesAdded: number;
@@ -195,6 +273,7 @@ function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions 
 		optionalLocks: options.optionalLocks ?? true,
 		timeout: options.timeout,
 		maxOutputBytes: options.maxOutputBytes,
+		identity: options.identity,
 	};
 }
 
@@ -218,10 +297,22 @@ async function exec(
 	cwd: string,
 	options: boolean | ExecOptions = {},
 ): Promise<ExecResult> {
-	const { silent, optionalLocks, timeout, maxOutputBytes } = normalizeExecOptions(options);
+	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
+		normalizeExecOptions(options);
 	const cmd = optionalLocks ? ["git", ...args] : ["git", "--no-optional-locks", ...args];
 	try {
-		const result = await safeSpawn({ cmd, cwd, timeout, maxOutputBytes });
+		const result = await safeSpawn({
+			cmd,
+			cwd,
+			timeout,
+			maxOutputBytes,
+			// `Bun.spawn`'s `env` REPLACES the environment rather than merging into it,
+			// so an identity has to be layered over `process.env` explicitly — passing
+			// the four `GIT_*` variables alone would strip PATH/HOME and break git.
+			// Omitted entirely when there is no identity: that keeps the no-identity
+			// path byte-for-byte identical to the behaviour before this existed.
+			env: identity ? { ...process.env, ...identity } : undefined,
+		});
 		const truncated = result.stdoutTruncated === true || result.stderrTruncated === true;
 		const trimmedStdout = stripTrailingLineBreaks(
 			result.stdoutTruncated ? stripTruncationMarker(result.stdout) : result.stdout,
@@ -688,8 +779,20 @@ export const gitService = {
 		return { added, removed };
 	},
 
-	async getMergeBase(repoPath: string, branchA: string, branchB: string): Promise<string> {
-		const result = await execRead(["merge-base", branchA, branchB], repoPath);
+	/**
+	 * `silent` is for callers that ASK about revisions which may legitimately not relate.
+	 * Unrelated histories and a pruned sha both exit non-zero here, and for the Ruler's
+	 * anchor fallback that is an expected answer ("no position for this chapter"), not a
+	 * fault — logging it at error level put routine lines in the log that read as a broken
+	 * repository. The throw is unchanged either way, so merge paths keep their diagnostics.
+	 */
+	async getMergeBase(
+		repoPath: string,
+		branchA: string,
+		branchB: string,
+		opts: { silent?: boolean } = {},
+	): Promise<string> {
+		const result = await execRead(["merge-base", branchA, branchB], repoPath, opts.silent ?? false);
 		if (result.exitCode !== 0) throw new GitError(`Failed to get merge base: ${result.stderr}`);
 		return result.stdout;
 	},
@@ -770,13 +873,14 @@ export const gitService = {
 		sourceBranch: string,
 		strategy: "merge" | "squash",
 		message: string,
-		options?: { fastForward?: boolean },
+		options?: { fastForward?: boolean; identity?: GitCommitIdentity },
 	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: string[];
 		isFastForward?: boolean;
 	}> {
+		const identity = options?.identity ?? null;
 		let args: string[];
 		if (strategy === "squash") {
 			args = ["merge", "--squash", sourceBranch];
@@ -786,12 +890,12 @@ export const gitService = {
 			args = ["merge", "--no-ff", "-m", message, sourceBranch];
 		}
 
-		const result = await exec(args, worktreePath);
+		const result = await exec(args, worktreePath, { identity });
 		if (result.exitCode !== 0) {
 			if (options?.fastForward) {
 				// ff-only failed — fall back to --no-ff
 				const fallbackArgs = ["merge", "--no-ff", "-m", message, sourceBranch];
-				const fallbackResult = await exec(fallbackArgs, worktreePath);
+				const fallbackResult = await exec(fallbackArgs, worktreePath, { identity });
 				if (fallbackResult.exitCode !== 0) {
 					const conflictFiles = await detectConflictFilesAfterFailedGitCommand(
 						worktreePath,
@@ -801,7 +905,7 @@ export const gitService = {
 					throw new GitError(gitFailureMessage("Merge failed", fallbackResult));
 				}
 				if (strategy === "squash") {
-					const commitResult = await exec(["commit", "-m", message], worktreePath);
+					const commitResult = await exec(["commit", "-m", message], worktreePath, { identity });
 					if (commitResult.exitCode !== 0)
 						throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 				}
@@ -814,7 +918,7 @@ export const gitService = {
 		}
 
 		if (strategy === "squash") {
-			const commitResult = await exec(["commit", "-m", message], worktreePath);
+			const commitResult = await exec(["commit", "-m", message], worktreePath, { identity });
 			if (commitResult.exitCode !== 0)
 				throw new GitError(gitFailureMessage("Squash commit failed", commitResult));
 		}
@@ -823,12 +927,19 @@ export const gitService = {
 		return { success: true, commitSha: sha, isFastForward: !!options?.fastForward };
 	},
 
-	/** Cherry-pick commits from source branch onto current branch */
+	/**
+	 * Cherry-pick commits from source branch onto current branch.
+	 *
+	 * `identity` sets the COMMITTER only in practice: git preserves each picked
+	 * commit's original author, which is the correct semantics — the acting user
+	 * transplanted the change, they did not write it.
+	 */
 	async cherryPick(
 		worktreePath: string,
 		repoPath: string,
 		sourceBranch: string,
 		baseSha: string,
+		identity?: GitCommitIdentity,
 	): Promise<{ success: boolean; commitSha?: string; conflictFiles?: string[] }> {
 		const logResult = await execRead(
 			["rev-list", "--reverse", `${baseSha}..${sourceBranch}`],
@@ -840,7 +951,9 @@ export const gitService = {
 		if (commits.length === 0) return { success: true };
 
 		for (const commit of commits) {
-			const result = await exec(["cherry-pick", commit], worktreePath);
+			const result = await exec(["cherry-pick", commit], worktreePath, {
+				identity: identity ?? null,
+			});
 			if (result.exitCode !== 0) {
 				const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 				if (conflictFiles) {
@@ -860,16 +973,22 @@ export const gitService = {
 	},
 
 	/** Rebase current branch onto another branch. On conflict the worktree is left
-	 *  in the middle of a rebase so the caller can decide to abort or resolve. */
+	 *  in the middle of a rebase so the caller can decide to abort or resolve.
+	 *
+	 *  `identity` becomes the committer of every rewritten commit; git preserves the
+	 *  original authors, same as cherry-pick. */
 	async rebase(
 		worktreePath: string,
 		ontoBranch: string,
+		identity?: GitCommitIdentity,
 	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: Array<{ file: string; conflictLines: number }>;
 	}> {
-		const result = await exec(["rebase", ontoBranch], worktreePath);
+		const result = await exec(["rebase", ontoBranch], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 			if (conflictFiles) {
@@ -888,14 +1007,19 @@ export const gitService = {
 		await exec(["rebase", "--abort"], worktreePath);
 	},
 
-	async rebaseContinue(worktreePath: string): Promise<{
+	async rebaseContinue(
+		worktreePath: string,
+		identity?: GitCommitIdentity,
+	): Promise<{
 		success: boolean;
 		commitSha?: string;
 		conflictFiles?: Array<{ file: string; conflictLines: number }>;
 	}> {
 		// Stage all resolved files then continue
 		await exec(["add", "-A"], worktreePath);
-		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath);
+		const result = await exec(["-c", "core.editor=true", "rebase", "--continue"], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			const conflictFiles = await detectConflictFilesAfterFailedGitCommand(worktreePath, result);
 			if (conflictFiles) {
@@ -975,12 +1099,22 @@ export const gitService = {
 	 * autoCommit failure as "fall back to a snapshot", and it gives them a reason to
 	 * show the user.
 	 */
-	async autoCommit(worktreePath: string, message: string): Promise<string | null> {
-		return withWorktreeLock(worktreePath, () => this.autoCommitUnlocked(worktreePath, message));
+	async autoCommit(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string | null> {
+		return withWorktreeLock(worktreePath, () =>
+			this.autoCommitUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link autoCommit} for callers already holding the worktree lock. */
-	async autoCommitUnlocked(worktreePath: string, message: string): Promise<string | null> {
+	async autoCommitUnlocked(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string | null> {
 		const status = await this.getStatus(worktreePath);
 		if (!status) return null;
 
@@ -996,7 +1130,9 @@ export const gitService = {
 		const addResult = await exec(["add", "-A"], worktreePath);
 		if (addResult.exitCode !== 0) throw new GitError(`git add failed: ${addResult.stderr}`);
 
-		const commitResult = await exec(["commit", "-m", message], worktreePath);
+		const commitResult = await exec(["commit", "-m", message], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0)
 			throw new GitError(`git commit failed: ${commitResult.stderr}`);
 
@@ -1052,6 +1188,10 @@ export const gitService = {
 				files.push({
 					status: entry.status,
 					path: entry.path,
+					// Only `R`/`C` entries carry one; `parsePorcelainStatusZ` leaves it
+					// undefined otherwise, and the field is omitted rather than sent as
+					// null so a JSON consumer sees the same shape it always did.
+					...(entry.oldPath ? { oldPath: entry.oldPath } : {}),
 					linesAdded: stagedStats.added + unstagedStats.added,
 					linesRemoved: stagedStats.removed + unstagedStats.removed,
 					stagedLinesAdded: stagedStats.added,
@@ -1267,32 +1407,46 @@ export const gitService = {
 		}
 	},
 
-	async initRepo(repoPath: string): Promise<void> {
+	async initRepo(repoPath: string, identity?: GitCommitIdentity): Promise<void> {
 		mkdirSync(repoPath, { recursive: true });
 		const result = await exec(["init"], repoPath);
 		if (result.exitCode !== 0) throw new GitError(`Failed to init repo: ${result.stderr}`);
 		// Create initial empty commit so branches can be created
-		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath);
+		const commitResult = await exec(["commit", "--allow-empty", "-m", "Initial commit"], repoPath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0) {
 			throw new GitError(`Failed to create initial commit: ${commitResult.stderr}`);
 		}
 	},
 
-	async stageAndCommit(repoPath: string, files: string[], message: string): Promise<void> {
+	async stageAndCommit(
+		repoPath: string,
+		files: string[],
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<void> {
 		const addResult = await exec(["add", ...files], repoPath);
 		if (addResult.exitCode !== 0) {
 			throw new GitError(`Failed to stage files: ${addResult.stderr}`);
 		}
-		const commitResult = await exec(["commit", "-m", message], repoPath);
+		const commitResult = await exec(["commit", "-m", message], repoPath, {
+			identity: identity ?? null,
+		});
 		if (commitResult.exitCode !== 0) {
 			throw new GitError(`Failed to commit: ${commitResult.stderr}`);
 		}
 	},
 
-	async commitGitignoreIfDirty(repoPath: string): Promise<void> {
+	async commitGitignoreIfDirty(repoPath: string, identity?: GitCommitIdentity): Promise<void> {
 		const statusResult = await execRead(["status", "--porcelain", ".gitignore"], repoPath);
 		if (statusResult.stdout.trim()) {
-			await this.stageAndCommit(repoPath, [".gitignore"], "Update .gitignore for NarraFork");
+			await this.stageAndCommit(
+				repoPath,
+				[".gitignore"],
+				"Update .gitignore for NarraFork",
+				identity,
+			);
 		}
 	},
 
@@ -1467,13 +1621,25 @@ export const gitService = {
 		if (result.exitCode !== 0) throw new GitError(`git reset failed: ${result.stderr}`);
 	},
 
-	async commit(worktreePath: string, message: string): Promise<string> {
-		return withWorktreeLock(worktreePath, () => this.commitUnlocked(worktreePath, message));
+	async commit(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		return withWorktreeLock(worktreePath, () =>
+			this.commitUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link commit} for callers already holding the worktree lock. */
-	async commitUnlocked(worktreePath: string, message: string): Promise<string> {
-		const result = await exec(["commit", "-m", message], worktreePath);
+	async commitUnlocked(
+		worktreePath: string,
+		message: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["commit", "-m", message], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) throw new GitError(`git commit failed: ${result.stderr}`);
 		return this.getHeadCommit(worktreePath);
 	},
@@ -1523,15 +1689,22 @@ export const gitService = {
 		if (r2.exitCode !== 0) throw new GitError(`git clean failed: ${r2.stderr}`);
 	},
 
-	async stash(worktreePath: string, message?: string): Promise<void> {
-		return withWorktreeLock(worktreePath, () => this.stashUnlocked(worktreePath, message));
+	/** Stash the working tree. `identity` authors the underlying stash commit objects. */
+	async stash(worktreePath: string, message?: string, identity?: GitCommitIdentity): Promise<void> {
+		return withWorktreeLock(worktreePath, () =>
+			this.stashUnlocked(worktreePath, message, identity),
+		);
 	},
 
 	/** {@link stash} for callers already holding the worktree lock. */
-	async stashUnlocked(worktreePath: string, message?: string): Promise<void> {
+	async stashUnlocked(
+		worktreePath: string,
+		message?: string,
+		identity?: GitCommitIdentity,
+	): Promise<void> {
 		const args = ["stash", "push", "--include-untracked"];
 		if (message) args.push("-m", message);
-		const result = await exec(args, worktreePath);
+		const result = await exec(args, worktreePath, { identity: identity ?? null });
 		if (result.exitCode !== 0) throw new GitError(`git stash failed: ${result.stderr}`);
 	},
 
@@ -1617,6 +1790,89 @@ export const gitService = {
 			truncated = true;
 		}
 		return { diff, truncated };
+	},
+
+	// === Commit boundaries ===
+
+	/**
+	 * When each of `paths` was last committed, plus the walk's oldest boundary.
+	 *
+	 * This answers "where does the current uncommitted change to this file begin",
+	 * which is what separates *this* round of edits from the file's whole history. A
+	 * single repository-wide HEAD timestamp cannot answer it: in this repository 90 of
+	 * 127 changed files were last committed BEFORE HEAD, by a median of 164 hours, so a
+	 * global boundary silently discards real attributions.
+	 *
+	 * One bounded walk serves every path. `--max-count` caps the work: beyond a few
+	 * hundred commits the walk stops finding new paths (200 and 800 both resolved the
+	 * same 90 files here) while output keeps growing.
+	 *
+	 * A path absent from `byPath` has no commit in the window. That is either a file
+	 * that was never committed (untracked — every attribution belongs to the current
+	 * change) or one whose last commit is older than the window. The two are
+	 * indistinguishable from the walk alone, so callers use `oldestInWindow` for
+	 * tracked paths: being NEWER than the true boundary, it can only under-count, and
+	 * over-crediting a file with unrelated history is the failure that matters.
+	 *
+	 * Precision caveat: `%cI` is second-resolution, so a change recorded in the SAME
+	 * second as the commit cannot be placed on either side of it and will be counted as
+	 * part of the current round. The error is bounded by one second and errs toward
+	 * showing a contributor rather than hiding one, which is the safer direction for a
+	 * display that answers "who touched this".
+	 *
+	 * @param paths  Repo-relative paths. Capped at {@link COMMIT_BOUNDARY_MAX_PATHS};
+	 *               the excess simply falls back to `oldestInWindow`.
+	 */
+	async getLastCommitTimes(
+		worktreePath: string,
+		paths: string[],
+	): Promise<{ byPath: Map<string, string>; oldestInWindow: string | null }> {
+		const byPath = new Map<string, string>();
+		if (paths.length === 0) return { byPath, oldestInWindow: null };
+		// An unborn HEAD has nothing to walk, and `git log` would fail rather than
+		// report zero commits.
+		if (await hasNoCommits(worktreePath)) return { byPath, oldestInWindow: null };
+
+		const capped = paths.slice(0, COMMIT_BOUNDARY_MAX_PATHS);
+		const result = await execRead(
+			[
+				// Prevent git from quoting non-ASCII paths as octal escape sequences
+				// (e.g. "\344\270\255..."). Without this, CJK and other non-ASCII filenames
+				// won't match the bare path strings callers pass in, causing boundary misses
+				// that fall back to the less precise `oldestInWindow`.
+				"-c",
+				"core.quotePath=false",
+				"log",
+				"HEAD",
+				`--max-count=${COMMIT_BOUNDARY_MAX_COMMITS}`,
+				// A commit line is prefixed so it cannot be confused with a file path;
+				// `--name-only` prints paths bare.
+				`--format=${COMMIT_BOUNDARY_MARKER_FORMAT}%cI`,
+				"--name-only",
+				"--",
+				...capped,
+			],
+			worktreePath,
+			true,
+		);
+		if (result.exitCode !== 0) return { byPath, oldestInWindow: null };
+
+		let current: string | null = null;
+		let oldestInWindow: string | null = null;
+		for (const rawLine of result.stdout.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			if (line.startsWith(COMMIT_BOUNDARY_MARKER)) {
+				current = toUtcIso(line.slice(COMMIT_BOUNDARY_MARKER.length));
+				// Walk order is newest-first, so the last commit seen is the oldest.
+				if (current) oldestInWindow = current;
+				continue;
+			}
+			// First sighting wins: the newest commit that touched this path.
+			if (current && !byPath.has(line)) byPath.set(line, current);
+		}
+
+		return { byPath, oldestInWindow };
 	},
 
 	// === Log ===
@@ -1745,14 +2001,36 @@ export const gitService = {
 			});
 		}
 		const lines = result.stdout.trim().split("\n");
+		// An exact hit is unambiguous and wins immediately. An abbreviated sha is only
+		// answered once the whole walk has been scanned, because a prefix that matches
+		// two commits names neither: at 7 hex chars the birthday bound is roughly
+		// 1/2000 over 50k commits, and this index drives Ruler's cursor pagination, so
+		// a wrong hit silently shifts a page and drops the commits in between.
+		//
+		// Rejecting ambiguity rather than imposing a minimum prefix length: a length
+		// floor is a guess about collision odds that still answers wrongly when the
+		// collision does happen, and it breaks the legitimate short-sha callers this
+		// method has always supported. Scanning to the end costs one extra pass over an
+		// already-materialized, `--max-count`-bounded array.
+		let prefixIndex: number | null = null;
+		let prefixAmbiguous = false;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i]?.trim();
 			if (!line) continue;
-			// Accept an abbreviated cursor too: the ruler carries full SHAs, but a caller
-			// passing `shortSha` would otherwise silently never match and page from 0.
-			if (line === sha || (sha.length >= 7 && line.startsWith(sha))) return i;
+			if (line === sha) return i;
+			if (line.startsWith(sha)) {
+				if (prefixIndex !== null) prefixAmbiguous = true;
+				else prefixIndex = i;
+			}
 		}
-		return null;
+		if (prefixAmbiguous) {
+			logger.warn("Ambiguous abbreviated sha in commit log index scan", {
+				worktreePath,
+				shaLength: sha.length,
+			});
+			return null;
+		}
+		return prefixIndex;
 	},
 
 	// === Reset ===
@@ -1853,15 +2131,25 @@ export const gitService = {
 	},
 
 	/** Revert a merge commit (using -m 1 to specify the mainline parent) */
-	async revertMergeCommit(worktreePath: string, commitSha: string): Promise<string> {
+	async revertMergeCommit(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
 		return withWorktreeLock(worktreePath, () =>
-			this.revertMergeCommitUnlocked(worktreePath, commitSha),
+			this.revertMergeCommitUnlocked(worktreePath, commitSha, identity),
 		);
 	},
 
 	/** {@link revertMergeCommit} for callers already holding the worktree lock. */
-	async revertMergeCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
-		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath);
+	async revertMergeCommitUnlocked(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["revert", "-m", "1", "--no-edit", commitSha], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			// Abort the failed revert to leave worktree clean
 			await exec(["revert", "--abort"], worktreePath);
@@ -1875,13 +2163,25 @@ export const gitService = {
 	},
 
 	/** Revert a regular (non-merge) commit */
-	async revertCommit(worktreePath: string, commitSha: string): Promise<string> {
-		return withWorktreeLock(worktreePath, () => this.revertCommitUnlocked(worktreePath, commitSha));
+	async revertCommit(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		return withWorktreeLock(worktreePath, () =>
+			this.revertCommitUnlocked(worktreePath, commitSha, identity),
+		);
 	},
 
 	/** {@link revertCommit} for callers already holding the worktree lock. */
-	async revertCommitUnlocked(worktreePath: string, commitSha: string): Promise<string> {
-		const result = await exec(["revert", "--no-edit", commitSha], worktreePath);
+	async revertCommitUnlocked(
+		worktreePath: string,
+		commitSha: string,
+		identity?: GitCommitIdentity,
+	): Promise<string> {
+		const result = await exec(["revert", "--no-edit", commitSha], worktreePath, {
+			identity: identity ?? null,
+		});
 		if (result.exitCode !== 0) {
 			await exec(["revert", "--abort"], worktreePath);
 			throw new GitError(

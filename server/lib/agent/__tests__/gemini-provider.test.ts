@@ -74,6 +74,14 @@ let setOutboundFetchOverrideForTest: (
 ) => void;
 let maxSseEventBytes = 0;
 let maxStreamBytes = 0;
+/**
+ * The provider's ceiling on a persisted dump, whatever `agent.requestDumpMaxSize` says.
+ *
+ * Read from the module rather than written literally: the configurable setting is
+ * clamped to this value, so a test that hard-codes the setting's current default breaks
+ * when that default changes even though the capping behaviour is unchanged.
+ */
+let maxDumpBytes = 0;
 let testHome = "";
 let originalNarraforkHome: string | undefined;
 
@@ -96,6 +104,7 @@ beforeAll(async () => {
 		factoryModule.createGeminiProvider as unknown as typeof createGeminiProvider;
 	maxSseEventBytes = interactionsModule.GEMINI_MAX_SSE_EVENT_BYTES;
 	maxStreamBytes = interactionsModule.GEMINI_MAX_STREAM_BYTES;
+	maxDumpBytes = interactionsModule.GEMINI_MAX_REQUEST_DUMP_BYTES;
 	setOutboundFetchOverrideForTest = outboundFetchModule.setOutboundFetchOverrideForTest;
 });
 
@@ -694,7 +703,7 @@ describe("Gemini Interactions API provider", () => {
 
 		const result = await makeProvider().generateWithMeta(
 			"hello",
-			"gemini-test:gemini-2.5-flash",
+			"gemini-test:gemini-3-flash-preview",
 			undefined,
 			{
 				reasoningEffort: "none",
@@ -709,8 +718,11 @@ describe("Gemini Interactions API provider", () => {
 		expect(requestHeaders.get("Accept")).toBe("text/event-stream");
 		expect(requestBody.stream).toBe(true);
 		expect(requestBody.store).toBe(false);
+		// `none` lands on `minimal` for a Gemini 3 model: that family exposes the
+		// full ladder including `minimal`, so the lowest real tier is used. (The
+		// retired 2.5 family had no `minimal`, so the same request clamped to `low`.)
 		expect(requestBody.generation_config).toEqual({
-			thinking_level: "low",
+			thinking_level: "minimal",
 			thinking_summaries: "auto",
 		});
 		expect(deltas).toEqual(["Hello", " world"]);
@@ -745,9 +757,14 @@ describe("Gemini Interactions API provider", () => {
 		});
 		let thrown: Error | undefined;
 		try {
-			await makeProvider().generateWithMeta("hello", "gemini-test:gemini-2.5-flash", undefined, {
-				reasoningEffort: "none",
-			});
+			await makeProvider().generateWithMeta(
+				"hello",
+				"gemini-test:gemini-3-flash-preview",
+				undefined,
+				{
+					reasoningEffort: "none",
+				},
+			);
 		} catch (error) {
 			thrown = error as Error;
 		}
@@ -769,15 +786,6 @@ describe("Gemini Interactions API provider", () => {
 		});
 
 		const provider = makeProvider();
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.0-flash-001", undefined, {
-			reasoningEffort: "high",
-		});
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.5-flash", undefined, {
-			reasoningEffort: "medium",
-		});
-		await provider.generateWithMeta("hello", "gemini-test:gemini-2.5-pro", undefined, {
-			reasoningEffort: "high",
-		});
 		await provider.generateWithMeta("hello", "gemini-test:gemini-3.1-pro-preview", undefined, {
 			reasoningEffort: "medium",
 		});
@@ -795,12 +803,13 @@ describe("Gemini Interactions API provider", () => {
 		});
 
 		expect(bodies.map((body) => body.generation_config)).toEqual([
-			{ thinking_level: "minimal", thinking_summaries: "auto" },
+			// 3.1-pro: low/medium/high ladder, so medium passes through.
 			{ thinking_level: "medium", thinking_summaries: "auto" },
+			// 3-pro: low/high only, so medium clamps up to high.
 			{ thinking_level: "high", thinking_summaries: "auto" },
-			{ thinking_level: "medium", thinking_summaries: "auto" },
+			// 3.1-flash-lite-image: minimal/high only, so medium clamps up to high.
 			{ thinking_level: "high", thinking_summaries: "auto" },
-			{ thinking_level: "high", thinking_summaries: "auto" },
+			// gemma is not a thinking model: no generation_config at all.
 			undefined,
 		]);
 	});
@@ -823,7 +832,16 @@ describe("Gemini Interactions API provider", () => {
 		}
 		expect(thrown?.message).toContain("SSE event exceeded hard limit");
 		const snapshot = dump.snapshot();
-		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThanOrEqual(1024 * 1024 + 40);
+		// Bounded by the provider's OWN dump ceiling, not by a hard-coded 1MB: the
+		// configurable `agent.requestDumpMaxSize` feeds `resolveDumpLimit`, so writing the
+		// old default in here made this test fail the moment that default was raised —
+		// while the property under test (the dump is capped rather than cloning the whole
+		// stream) still held. `maxDumpBytes` is the effective cap for any configured value.
+		// The slack covers the appended truncation marker.
+		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThanOrEqual(maxDumpBytes + 200);
+		// The stream itself is larger than the cap, so a real truncation must have happened
+		// — otherwise this assertion would pass for an unbounded dump that simply fit.
+		expect(snapshot.response?.bodyText?.length ?? 0).toBeLessThan(huge.length);
 		expect(snapshot.response?.error).toContain("hard limit");
 	});
 

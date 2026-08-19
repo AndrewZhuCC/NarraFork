@@ -954,7 +954,7 @@ export function useRuntimeMaintenanceCapability(): typeof RUNTIME_MAINTENANCE_CA
 
 // === storage ===
 
-type StorageCleanupTarget = "uploads" | "shares" | "worktrees" | "containers";
+type StorageCleanupTarget = "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers";
 
 type StorageCleanupRuntimeCapability = {
 	supported: boolean;
@@ -994,6 +994,7 @@ const STORAGE_CAPABILITY: StorageCapability = Object.freeze({
 	vacuumSupported: true,
 	cleanup: Object.freeze({
 		uploads: SUPPORTED,
+		chatAttachments: SUPPORTED,
 		shares: SUPPORTED,
 		worktrees: SUPPORTED,
 		containers: SUPPORTED,
@@ -1069,6 +1070,7 @@ const STORAGE_CLEANUP_OPERATION_CAPABILITIES: Record<
 	StorageCleanupOperationCapability
 > = Object.freeze({
 	uploads: Object.freeze({ supported: true, route: "storage" }),
+	chatAttachments: Object.freeze({ supported: true, route: "storage" }),
 	shares: Object.freeze({ supported: true, route: "storage" }),
 	containers: Object.freeze({ supported: true, route: "storage" }),
 	worktrees: Object.freeze({ supported: true, route: "storage" }),
