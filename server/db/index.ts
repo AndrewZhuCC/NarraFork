@@ -186,8 +186,32 @@ ensureColumns(sqlite);
 		)
 		.run();
 	if (fixTraitsJson.changes > 0) {
-		logger.info("Normalized invalid traits JSON to empty array", {
+		logger.info("Normalized invalid narrator traits JSON to empty array", {
 			count: fixTraitsJson.changes,
+		});
+	}
+
+	const fixProjectTraitsJson = sqlite
+		.prepare(
+			`UPDATE projects SET traits = '[]'
+			 WHERE traits IS NULL OR traits = '' OR json_valid(traits) = 0`,
+		)
+		.run();
+	if (fixProjectTraitsJson.changes > 0) {
+		logger.info("Normalized invalid project traits JSON to empty array", {
+			count: fixProjectTraitsJson.changes,
+		});
+	}
+
+	const fixUserTraitsJson = sqlite
+		.prepare(
+			`UPDATE user_preferences SET traits = '[]'
+			 WHERE traits IS NULL OR traits = '' OR json_valid(traits) = 0`,
+		)
+		.run();
+	if (fixUserTraitsJson.changes > 0) {
+		logger.info("Normalized invalid user traits JSON to empty array", {
+			count: fixUserTraitsJson.changes,
 		});
 	}
 
