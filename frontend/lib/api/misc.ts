@@ -21,6 +21,7 @@ import type {
 	DatabaseCleanupTarget,
 	DatabaseVacuumResult,
 	HookApiRecord,
+	KimiUsageCache,
 	KiroCredentialPatch,
 	KiroStatusResponse,
 	LearningDoc,
@@ -30,6 +31,7 @@ import type {
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchResponse,
+	StorageScanJobState,
 	StorageScanResult,
 } from "./types";
 
@@ -670,6 +672,11 @@ export const miscApi = {
 				}
 			>
 		>("/nug/quotas"),
+
+	// Kimi (kimi.com / kimi.ai) usage quotas — per-provider server-side cache
+	kimiGetUsages: () => request<Record<string, KimiUsageCache>>("/kimi/usages"),
+	kimiRefreshUsages: () =>
+		request<Record<string, KimiUsageCache>>("/kimi/usages/refresh", { method: "POST" }),
 	nugGetBillingConfig: (providerId: string) =>
 		request<{
 			enabled: boolean;
@@ -1154,6 +1161,14 @@ export const miscApi = {
 
 	// Storage
 	getCachedStorage: () => request<{ cached: boolean; data?: StorageScanResult }>("/storage/cached"),
+	startStorageScan: () =>
+		request<{ started: boolean; state: StorageScanJobState }>("/storage/scan/start", {
+			method: "POST",
+		}),
+	getStorageScanStatus: (signal?: AbortSignal) =>
+		request<{ state: StorageScanJobState }>("/storage/scan/status", { signal }),
+	cancelStorageScan: () =>
+		request<{ state: StorageScanJobState }>("/storage/scan/cancel", { method: "POST" }),
 	cleanupStorage: (target: "uploads" | "chatAttachments" | "shares" | "worktrees" | "containers") =>
 		request<{
 			ok: boolean;

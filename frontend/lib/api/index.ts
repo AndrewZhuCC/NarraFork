@@ -179,7 +179,6 @@ export {
 	getKiroChatRouteCapability,
 	guardedKiroStreamChat,
 	kiroStreamChat,
-	scanStorageStream,
 } from "./streams";
 export type {
 	ApiEntity,
@@ -189,10 +188,6 @@ export type {
 	BufferCreator,
 	BufferMessageSummary,
 	ChangelogEntry,
-	ChunkManifest,
-	ChunkManifestEntry,
-	ChunkManifestTuple,
-	ChunkRangeResult,
 	CodexCredentialEntry,
 	CodexUsageData,
 	CodexUsageWindow,
@@ -245,6 +240,8 @@ export type {
 	SearchMetadata,
 	SearchResponse,
 	StorageCategoryResult,
+	StorageScanJobState,
+	StorageScanJobStatus,
 	StorageScanResult,
 	SubagentActivityCatchUp,
 	SubagentActivitySummary,
