@@ -58,3 +58,6 @@ kirocli.zip
 kiro-cli*-linux-*/
 kiro-cli*-linux-*.7z
 *.log
+
+# Dynamic Spec runtime state (per-narrator task queue / planning notes)
+spec/

@@ -4,18 +4,11 @@ import { useContainers } from "@frontend/hooks/useContainers";
 import { useChapterContainersCapability } from "@frontend/hooks/usePlatform";
 import { type ApiError, api } from "@frontend/lib/api";
 import { CHAPTER_ROLE_ICONS, statusRegistry } from "@frontend/lib/constants";
-import {
-	ActionIcon,
-	Badge,
-	Collapse,
-	Group,
-	Menu,
-	Text,
-	Tooltip,
-	UnstyledButton,
-} from "@mantine/core";
+import { ActionIcon, Badge, Collapse, Group, Menu, Text, Tooltip } from "@mantine/core";
 import {
 	IconGitCommit,
+	IconGitFork,
+	IconGitMerge,
 	IconGraph,
 	IconMoon,
 	IconPackage,
@@ -24,12 +17,24 @@ import {
 } from "@tabler/icons-react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
+import type React from "react";
 import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import classes from "./ChapterBar.module.css";
+import { isActivationKey, isTextSelectionGesture } from "./chapter-bar-git-trigger";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
 
 // Lazy-loaded heavy panels and modals — only needed when user opens them
+const ChapterForkModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterForkModal").then((m) => ({
+		default: m.ChapterForkModal,
+	})),
+);
+const ChapterMergeModal = lazy(() =>
+	import("@frontend/components/chapter/ChapterMergeModal").then((m) => ({
+		default: m.ChapterMergeModal,
+	})),
+);
 const ContainerPanel = lazy(() =>
 	import("@frontend/components/container/ContainerPanel").then((m) => ({
 		default: m.ContainerPanel,
@@ -48,9 +53,16 @@ const PodmanInstallModal = lazy(() =>
 
 interface ChapterBarProps {
 	chapterId: string;
+	/**
+	 * Open the Git view for this chapter. NarratorPanel routes the gesture: dock
+	 * panel when a dock surface exists, the mobile Drawer host otherwise. The raw
+	 * dock context below is only a fallback for surfaces that render this bar
+	 * without the panel around it.
+	 */
+	onOpenGitPanel?: () => void;
 }
 
-export function ChapterBar({ chapterId }: ChapterBarProps) {
+export function ChapterBar({ chapterId, onOpenGitPanel }: ChapterBarProps) {
 	const { t } = useTranslation("chapters");
 	const { t: tn } = useTranslation("narrator");
 	const { t: tc } = useTranslation("common");
@@ -58,10 +70,10 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 	const { data: chapter } = useChapter(chapterId);
 	const { data: gitStatus } = useChapterGitStatus(chapterId);
 	// Git lives in the dockview surface (right side), not in a collapse below this
-	// bar. Null when this bar is rendered outside any dock surface (e.g. the mobile
-	// page or a ruler card) — then the git affordances are simply inert labels.
+	// bar. The prop wins because the caller knows the mobile Drawer host; the raw
+	// dock context is only a fallback for surfaces that render the bar standalone.
 	const dock = useNarratorDockContext();
-	const openGitPanel = dock ? () => dock.openToolPanel("git") : undefined;
+	const openGitPanel = onOpenGitPanel ?? (dock ? () => dock.openToolPanel("git") : undefined);
 	const containerCapability = useChapterContainersCapability();
 	const containerUnsupportedReason =
 		containerCapability.reason ?? tn("chapterBar.containersUnsupported");
@@ -82,6 +94,8 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 		},
 	});
 
+	const [forkModalOpen, setForkModalOpen] = useState(false);
+	const [mergeModalOpen, setMergeModalOpen] = useState(false);
 	const [containerConfigOpen, setContainerConfigOpen] = useState(false);
 	const [podmanInstallOpen, setPodmanInstallOpen] = useState(false);
 	const [containerPanelOpen, setContainerPanelOpen] = useState(false);
@@ -91,6 +105,31 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			setPodmanInstallOpen(true);
 		}
 	}, []);
+
+	/**
+	 * Open Git, unless this click was the end of a text selection.
+	 *
+	 * Readers copy the branch name out of this row, and a drag-select ends with a
+	 * click on the same element — without this guard every copy attempt would also
+	 * swap the side panel, and the selection would be lost to the re-render. A
+	 * collapsed selection (a plain click) still opens the panel. The predicate lives
+	 * in chapter-bar-git-trigger.ts, where it is tested directly.
+	 */
+	const handleGitTriggerClick = useCallback(() => {
+		if (isTextSelectionGesture(window.getSelection())) return;
+		openGitPanel?.();
+	}, [openGitPanel]);
+
+	// Keyboard equivalent for the role="button" row. Space is prevented so the
+	// conversation behind it does not scroll instead.
+	const handleGitTriggerKeyDown = useCallback(
+		(e: React.KeyboardEvent) => {
+			if (!isActivationKey(e.key)) return;
+			e.preventDefault();
+			openGitPanel?.();
+		},
+		[openGitPanel],
+	);
 
 	if (!chapter) return null;
 
@@ -113,82 +152,112 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 					backgroundColor: "light-dark(var(--mantine-color-gray-0), var(--mantine-color-dark-7))",
 				}}
 			>
-				{/* Left: chapter info — the whole strip is the Git panel affordance, so it
-				    is one button that stretches to the action icons. Cursor + hover tint
-				    are what tell the reader this text is clickable at all; without them
-				    the click target is invisible. */}
-				<UnstyledButton
-					onClick={openGitPanel}
-					disabled={!openGitPanel}
-					title={openGitPanel ? tn("chapterBar.git") : undefined}
+				{/* Left: chapter info — the whole strip opens the Git view. Deliberately a
+				    div with role="button" and not a real <button>: the UA stylesheet gives
+				    buttons `user-select: none`, and readers copy the branch name out of
+				    this row. `handleGitTriggerClick` is what keeps both gestures on the
+				    same element. */}
+				<Group
+					gap={6}
+					wrap="nowrap"
 					className={classes.gitTrigger}
+					role={openGitPanel ? "button" : undefined}
+					tabIndex={openGitPanel ? 0 : undefined}
+					title={openGitPanel ? tn("chapterBar.git") : undefined}
+					onClick={openGitPanel ? handleGitTriggerClick : undefined}
+					onKeyDown={openGitPanel ? handleGitTriggerKeyDown : undefined}
 				>
-					<Group gap={6} wrap="nowrap" style={{ minWidth: 0 }}>
-						{roleIcon && <Text size="xs">{roleIcon}</Text>}
-						<Text size="xs" fw={500} truncate>
-							{chapter.title}
-						</Text>
-						<Text size="xs" c="dimmed">
-							·
-						</Text>
-						<Text size="xs" c="dimmed" ff="monospace" truncate>
-							{chapter.branch}
-						</Text>
-						{gitStatus &&
-							(gitStatus.commitsAhead > 0 ||
-								gitStatus.linesAdded > 0 ||
-								gitStatus.linesRemoved > 0) && (
-								<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-									{gitStatus.commitsAhead > 0 && (
-										<Tooltip
-											label={tn("chapterBar.commitsAhead", {
-												count: gitStatus.commitsAhead,
-												base: gitStatus.baseBranch,
-											})}
+					{roleIcon && <Text size="xs">{roleIcon}</Text>}
+					<Text size="xs" fw={500} truncate>
+						{chapter.title}
+					</Text>
+					<Text size="xs" c="dimmed">
+						·
+					</Text>
+					<Text size="xs" c="dimmed" ff="monospace" truncate>
+						{chapter.branch}
+					</Text>
+					{gitStatus &&
+						(gitStatus.commitsAhead > 0 ||
+							gitStatus.linesAdded > 0 ||
+							gitStatus.linesRemoved > 0) && (
+							<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+								{gitStatus.commitsAhead > 0 && (
+									<Tooltip
+										label={tn("chapterBar.commitsAhead", {
+											count: gitStatus.commitsAhead,
+											base: gitStatus.baseBranch,
+										})}
+									>
+										<Badge
+											size="xs"
+											variant="light"
+											color="blue"
+											leftSection={<IconGitCommit size={10} />}
 										>
-											<Badge
-												size="xs"
-												variant="light"
-												color="blue"
-												leftSection={<IconGitCommit size={10} />}
-											>
-												{gitStatus.commitsAhead}
-											</Badge>
-										</Tooltip>
-									)}
-									{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
-										<Tooltip label={tn("chapterBar.uncommittedLines")}>
-											<Badge size="xs" variant="light" color="yellow">
-												{gitStatus.linesAdded > 0 && (
-													<Text span size="xs" c="green" fw={600}>
-														+{gitStatus.linesAdded}
-													</Text>
-												)}
-												{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
-												{gitStatus.linesRemoved > 0 && (
-													<Text span size="xs" c="red" fw={600}>
-														-{gitStatus.linesRemoved}
-													</Text>
-												)}
-											</Badge>
-										</Tooltip>
-									)}
-								</Group>
-							)}
-						{chapter.status !== "active" && (
-							<Badge
-								size="xs"
-								variant="light"
-								color={statusRegistry.chapterStatus(chapter.status).color}
-							>
-								{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
-							</Badge>
+											{gitStatus.commitsAhead}
+										</Badge>
+									</Tooltip>
+								)}
+								{(gitStatus.linesAdded > 0 || gitStatus.linesRemoved > 0) && (
+									<Tooltip label={tn("chapterBar.uncommittedLines")}>
+										<Badge size="xs" variant="light" color="yellow">
+											{gitStatus.linesAdded > 0 && (
+												<Text span size="xs" c="green" fw={600}>
+													+{gitStatus.linesAdded}
+												</Text>
+											)}
+											{gitStatus.linesAdded > 0 && gitStatus.linesRemoved > 0 && " "}
+											{gitStatus.linesRemoved > 0 && (
+												<Text span size="xs" c="red" fw={600}>
+													-{gitStatus.linesRemoved}
+												</Text>
+											)}
+										</Badge>
+									</Tooltip>
+								)}
+							</Group>
 						)}
-					</Group>
-				</UnstyledButton>
+					{chapter.status !== "active" && (
+						<Badge
+							size="xs"
+							variant="light"
+							color={statusRegistry.chapterStatus(chapter.status).color}
+						>
+							{tc(statusRegistry.chapterStatus(chapter.status).i18nKey)}
+						</Badge>
+					)}
+				</Group>
 
 				{/* Right: action menus */}
 				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+					{/* Git fork/merge menu */}
+					<Menu position="top-end" withinPortal>
+						<Menu.Target>
+							<Tooltip label={tn("chapterBar.git")}>
+								<ActionIcon variant="subtle" color="gray" size="sm">
+									<IconGitFork size={15} />
+								</ActionIcon>
+							</Tooltip>
+						</Menu.Target>
+						<Menu.Dropdown>
+							<Menu.Label>{tn("chapterBar.git")}</Menu.Label>
+							<Menu.Item
+								leftSection={<IconGitFork size={14} />}
+								onClick={() => setForkModalOpen(true)}
+							>
+								{t("fork")}
+							</Menu.Item>
+							<Menu.Divider />
+							<Menu.Item
+								leftSection={<IconGitMerge size={14} />}
+								onClick={() => setMergeModalOpen(true)}
+							>
+								{t("merge")}
+							</Menu.Item>
+						</Menu.Dropdown>
+					</Menu>
+
 					{/* Container toggle + menu */}
 					<Tooltip
 						label={
@@ -287,6 +356,26 @@ export function ChapterBar({ chapterId }: ChapterBarProps) {
 			</Collapse>
 
 			{/* Modals */}
+			{forkModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterForkModal
+						chapterId={chapterId}
+						chapterStatus={chapter.status}
+						opened={forkModalOpen}
+						onClose={() => setForkModalOpen(false)}
+					/>
+				</Suspense>
+			)}
+			{mergeModalOpen && (
+				<Suspense fallback={null}>
+					<ChapterMergeModal
+						chapterId={chapterId}
+						projectId={chapter.projectId}
+						opened={mergeModalOpen}
+						onClose={() => setMergeModalOpen(false)}
+					/>
+				</Suspense>
+			)}
 			{containerCapability.supported && containerConfigOpen && (
 				<Suspense fallback={null}>
 					<ContainerConfigModal

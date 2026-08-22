@@ -44,6 +44,7 @@ import {
 } from "../db/schema";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
+import { redactSpillPointerPaths } from "../lib/api-request-dump-store";
 import { narratorTraitsLock } from "../lib/async-mutex";
 import {
 	AUTO_CONTINUATION_OVERRIDE_VALUES,
@@ -1153,7 +1154,11 @@ narratorRoutes.get("/:id/leaked-tool-dump/:requestId", async (c) => {
 
 	let rawDump: unknown;
 	try {
-		rawDump = JSON.parse(row.rawDumpJson);
+		// Same redaction as the usage-history detail path: the stored dump carries absolute
+		// server paths (spill pointer / malformed capture) that name the host OS account, and a
+		// dump is something users export and forward to whoever is helping them. This route
+		// used to return the row verbatim, so it leaked what the other path was careful about.
+		rawDump = redactSpillPointerPaths(JSON.parse(row.rawDumpJson));
 	} catch {
 		rawDump = { invalidJson: true, rawText: row.rawDumpJson };
 	}
@@ -2686,21 +2691,29 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		requestedLimit != null && !Number.isNaN(requestedLimit)
 			? Math.min(Math.max(requestedLimit, 1), 100)
 			: 100;
-	const [result, narratorMeta] = await Promise.all([
-		narratorService.getPretextDocumentPage(id, {
-			afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
-			beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
-			limit,
-			messageVersion:
-				expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
-					? expectedMessageVersion
-					: undefined,
-		}),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
-		}),
-	]);
+	const result = await narratorService.getPretextDocumentPage(id, {
+		afterSeq: afterSeq != null && !Number.isNaN(afterSeq) ? afterSeq : undefined,
+		beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
+		limit,
+		messageVersion:
+			expectedMessageVersion != null && !Number.isNaN(expectedMessageVersion)
+				? expectedMessageVersion
+				: undefined,
+	});
+	// Read the prune metadata AFTER the page, never concurrently.
+	//
+	// The page builder materializes a lazy fork's missing refs on demand
+	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
+	// parallel, this query resolves BEFORE the backfill commits while the page
+	// carries the post-backfill version — so the equality check below failed
+	// deterministically on the first upward scroll past a fork boundary, the one
+	// place the backfill actually copies anything. Sequenced, both sides observe
+	// the same post-backfill version, and the check goes back to meaning what it
+	// says: another writer changed the narrator underneath us.
+	const narratorMeta = await db.query.narrators.findFirst({
+		where: eq(narrators.id, id),
+		columns: { pruneBoundaryMessageId: true, prunedPercent: true, messageVersion: true },
+	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	if (narratorMeta.messageVersion !== result.messageVersion)
 		throw new AppError(
@@ -2715,67 +2728,7 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	});
 });
 
-// Chunk manifest for the virtualized message list (lightweight fingerprints).
-// `since` short-circuits with { unchanged: true } when the structure version
-// has not changed.
-narratorRoutes.get("/:id/chunk-manifest", async (c) => {
-	const id = c.req.param("id");
-	const sinceRaw = c.req.query("since");
-	const since = sinceRaw != null ? Number.parseInt(sinceRaw, 10) : undefined;
-	const limitRaw = c.req.query("limitChunks");
-	const limitChunks = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
-	const beforeSeqRaw = c.req.query("beforeSeq");
-	const beforeSeq = beforeSeqRaw != null ? Number.parseInt(beforeSeqRaw, 10) : undefined;
-	const window =
-		(limitChunks != null && !Number.isNaN(limitChunks)) ||
-		(beforeSeq != null && !Number.isNaN(beforeSeq))
-			? {
-					limitChunks: limitChunks != null && !Number.isNaN(limitChunks) ? limitChunks : undefined,
-					beforeSeq: beforeSeq != null && !Number.isNaN(beforeSeq) ? beforeSeq : undefined,
-				}
-			: undefined;
-	const result = await narratorService.getChunkManifest(
-		id,
-		since != null && !Number.isNaN(since) ? since : undefined,
-		window,
-	);
-	return c.json(result);
-});
-
-// Fetch a contiguous range of chunks (full message trees) for the virtualized
-// list. Replaces the legacy 20/50 + around triple-path on the chunk codepath.
-narratorRoutes.get("/:id/chunks", async (c) => {
-	const id = c.req.param("id");
-	const fromSeqRaw = c.req.query("fromSeq");
-	const fromSeq = fromSeqRaw != null ? Number.parseInt(fromSeqRaw, 10) : undefined;
-	const direction = c.req.query("direction") === "newer" ? "newer" : "older";
-	const countRaw = c.req.query("count");
-	const count = countRaw != null ? Number.parseInt(countRaw, 10) : undefined;
-	const [result, narratorMeta] = await Promise.all([
-		narratorService.getChunksByRange(id, {
-			fromSeq: fromSeq != null && !Number.isNaN(fromSeq) ? fromSeq : undefined,
-			direction,
-			count: count != null && !Number.isNaN(count) ? count : undefined,
-		}),
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: {
-				pruneBoundaryMessageId: true,
-				prunedPercent: true,
-				messageVersion: true,
-			},
-		}),
-	]);
-	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	return c.json({
-		...result,
-		pruneBoundaryMessageId: narratorMeta.pruneBoundaryMessageId ?? null,
-		prunedPercent: narratorMeta.prunedPercent ?? null,
-		messageVersion: narratorMeta.messageVersion ?? 0,
-	});
-});
-
-// Resolve a message id to the chunk coordinate used by the virtualized list.
+// Resolve a message id to the document coordinate the exact-layout list jumps to.
 narratorRoutes.get("/:id/message-location/:messageId", async (c) => {
 	const id = c.req.param("id");
 	const messageId = c.req.param("messageId");
@@ -3133,6 +3086,19 @@ narratorRoutes.delete("/:id/cwd-recovery-messages/:messageId", async (c) => {
 	const narratorId = c.req.param("id");
 	const messageId = c.req.param("messageId");
 	await narratorService.dismissCwdRecoveryMessage(narratorId, messageId);
+	broadcastToNarrator(narratorId, {
+		type: "messages_deleted",
+		narratorId,
+		deletedMessageIds: [messageId],
+	});
+	return c.json({ ok: true, deletedMessageIds: [messageId] });
+});
+
+// Dismiss the interrupt task-guard reminder message
+narratorRoutes.delete("/:id/interrupt-task-guard-messages/:messageId", async (c) => {
+	const narratorId = c.req.param("id");
+	const messageId = c.req.param("messageId");
+	await narratorService.dismissInterruptTaskGuardMessage(narratorId, messageId);
 	broadcastToNarrator(narratorId, {
 		type: "messages_deleted",
 		narratorId,
@@ -5761,42 +5727,37 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
  */
 narratorRoutes.get("/:id/background-tasks", async (c) => {
 	const parentNarratorId = c.req.param("id");
+	const limitRaw = c.req.query("limit");
+	const limit = limitRaw != null ? Number.parseInt(limitRaw, 10) : undefined;
 	const { backgroundTaskService } = await import("../services/background-task-service");
-	const taskSummaries = await backgroundTaskService.listSummariesByParent(parentNarratorId);
-	const tasks = taskSummaries.map((task) => {
-		if (task.type !== "agent") return task;
-		const subagentId = task.subagentNarratorId ?? task.id;
-		if (!isNarratorActive(subagentId) && !isLoopRunning(subagentId)) return task;
-		return {
-			...task,
-			effectiveStatus: task.status === "running" ? "running" : "continued",
-			currentNarratorStatus: "working",
-			canCancelActiveWork: true,
-		};
-	});
+	// In-process liveness (a subagent whose loop is running while its task row is
+	// already terminal) is applied inside the service, not here: `activeCount`, the
+	// `activeTasks` set, the paged rows and the delta upserts all have to agree, and
+	// a route-only overlay left the badge disagreeing with the rows beside it.
+	return c.json(
+		await backgroundTaskService.listPageByParent(parentNarratorId, {
+			cursor: c.req.query("cursor"),
+			limit: limit != null && !Number.isNaN(limit) ? limit : undefined,
+		}),
+	);
+});
 
-	// Also include legacy agent background tasks from narrators table
-	// (for tasks created before the migration)
-	const legacyTasks = await db
-		.select({
-			id: narrators.id,
-			subagentType: narrators.subagentType,
-			backgroundStatus: narrators.backgroundStatus,
-			backgroundResult: narrators.backgroundResult,
-			backgroundCompletedAt: narrators.backgroundCompletedAt,
-			status: narrators.status,
-			createdAt: narrators.createdAt,
-			title: narrators.title,
-		})
-		.from(narrators)
-		.where(and(eq(narrators.parentNarratorId, parentNarratorId), eq(narrators.isBackground, true)))
-		.orderBy(desc(narrators.createdAt));
-
-	// Filter out legacy tasks that already exist in the unified table
-	const unifiedIds = new Set(tasks.map((t) => t.id));
-	const filteredLegacy = legacyTasks.filter((t) => !unifiedIds.has(t.id));
-
-	return c.json({ tasks, legacySubagentTasks: filteredLegacy });
+/**
+ * GET /api/narrators/:id/background-tasks/resolve?target=…
+ * Resolve an Await/Send target (task id, alias, or subagent narrator id) to the
+ * subagent narrator id. A one-shot lookup so a tool card never has to fetch the
+ * whole task list for a single id.
+ */
+narratorRoutes.get("/:id/background-tasks/resolve", async (c) => {
+	const parentNarratorId = c.req.param("id");
+	const target = c.req.query("target") ?? "";
+	if (!target) throw new ValidationError("target is required");
+	const { backgroundTaskService } = await import("../services/background-task-service");
+	const subagentNarratorId = await backgroundTaskService.resolveSubagentNarratorId(
+		parentNarratorId,
+		target,
+	);
+	return c.json({ subagentNarratorId });
 });
 
 /**

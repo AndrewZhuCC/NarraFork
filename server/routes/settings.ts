@@ -1,5 +1,4 @@
 import { existsSync } from "node:fs";
-import { networkInterfaces } from "node:os";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -17,9 +16,15 @@ import {
 } from "../lib/custom-api-quota-cache";
 import { ValidationError } from "../lib/errors";
 import { generateShortId } from "../lib/id";
+import {
+	getAllKimiCachedUsages,
+	purgeKimiUsageCache,
+	refreshAllKimiUsages,
+} from "../lib/kimi-usage-cache";
 import { isKiroAvailable, kiroGetCachedModels } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
+import { getLanAddresses } from "../lib/net/lan-addresses";
 import { getNugCachedModelsGrouped } from "../lib/nug-model-cache";
 import { legacyPermissionModeSchema } from "../lib/permission-modes";
 import { PROTOCOL_REGISTRY } from "../lib/search/adapters/index";
@@ -819,23 +824,6 @@ function maskSearchSettings(search: NarraForkSettings["search"]): NarraForkSetti
 	};
 }
 
-/** Get RFC 1918 private IPv4 addresses from network interfaces. */
-function getLanAddresses(): string[] {
-	const nets = networkInterfaces();
-	const result: string[] = [];
-	for (const ifaces of Object.values(nets)) {
-		for (const iface of ifaces ?? []) {
-			if (iface.internal || iface.family !== "IPv4") continue;
-			const a = iface.address;
-			// RFC 1918: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-			if (a.startsWith("10.") || a.startsWith("192.168.") || /^172\.(1[6-9]|2\d|3[01])\./.test(a)) {
-				result.push(a);
-			}
-		}
-	}
-	return result;
-}
-
 function isWildcardListenHost(host: string): boolean {
 	return host === "0.0.0.0" || host === "::" || host === "[::]";
 }
@@ -942,6 +930,7 @@ function buildSettingsResponse(
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		grokModelsGrouped: getGrokModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
+		kimiUsages: getAllKimiCachedUsages(),
 		codexAvailable: codexManager.snapshot().available > 0,
 		codexModels: getBuiltinCodexModels(),
 		builtinModelContextWindows: getBuiltinModelContextWindows(getBuiltinCodexModels(), "codex"),
@@ -1002,6 +991,32 @@ function getGeminiTransportChangedProviderIds(
 			return (
 				(provider.geminiTransport ?? "generate-content") !==
 				(nextProvider.geminiTransport ?? "generate-content")
+			);
+		})
+		.map((provider) => provider.id);
+}
+
+/**
+ * Custom API providers whose KIMI USAGE identity changed.
+ *
+ * Narrower than the quota test: the usage endpoint is addressed by `baseUrl` and
+ * authenticated by `apiKey`, and nothing else affects what it returns. `disabled`
+ * counts too — a disabled provider stops being refreshed, so leaving its numbers
+ * cached would show a quota that is no longer being updated.
+ */
+function getCustomApiProviderIdsWithKimiIdentityChanges(
+	prev: NarraForkSettings["customApiProviders"],
+	next: NarraForkSettings["customApiProviders"],
+): string[] {
+	const nextById = new Map((next ?? []).map((provider) => [provider.id, provider]));
+	return (prev ?? [])
+		.filter((provider) => {
+			const nextProvider = nextById.get(provider.id);
+			if (!nextProvider) return false;
+			return (
+				provider.baseUrl !== nextProvider.baseUrl ||
+				provider.apiKey !== nextProvider.apiKey ||
+				Boolean(provider.disabled) !== Boolean(nextProvider.disabled)
 			);
 		})
 		.map((provider) => provider.id);
@@ -1111,6 +1126,21 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 	if (staleCustomApiQuotaIds.length) {
 		purgeCustomApiQuotaCache(staleCustomApiQuotaIds);
 		logger.info("Purged custom API quota cache", { providerIds: staleCustomApiQuotaIds });
+	}
+	// Kimi usage keys off (baseUrl, apiKey) only, so it uses its OWN staleness test
+	// rather than the quota one: that set also fires on `protocol`,
+	// `geminiTransport` and `codexAccountId`, none of which changes what the usage
+	// endpoint returns — throwing the cache away for them just forces a needless
+	// upstream refetch.
+	const staleKimiUsageIds = uniqueIds([
+		...removedCustomApiIds,
+		...getCustomApiProviderIdsWithKimiIdentityChanges(
+			prev.customApiProviders,
+			next.customApiProviders,
+		),
+	]);
+	if (staleKimiUsageIds.length) {
+		purgeKimiUsageCache(staleKimiUsageIds);
 	}
 
 	// Collect prefixes of removed providers — needed to purge agent-level fields
@@ -1645,6 +1675,14 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			}
 		}
 
+		// Refresh Kimi usage caches when the provider list changed, so a newly
+		// added kimi.com/kimi.ai provider shows its quota without waiting for the
+		// periodic scheduler. Fire-and-forget: a slow upstream must not delay the
+		// settings response.
+		if (validated.customApiProviders) {
+			void refreshAllKimiUsages().catch(() => {});
+		}
+
 		if (vnetChanged) {
 			const closedConnections = closeVNetConnections("vnet settings changed");
 			const status = await startVNetUdpRendezvous(merged.vnet);
@@ -1692,10 +1730,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 	}),
 );
 
-// Generate a self-signed TLS certificate and enable HTTPS
+// Generate a TLS certificate and enable HTTPS.
+//
+// Compatibility shim over the CA flow in routes/tls.ts: existing clients (and
+// the setup wizard) still call this endpoint, so it now issues a CA-signed
+// certificate exactly like POST /api/settings/tls/generate, keeping the
+// original response shape plus the new SAN fields.
 settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
-	const { generateSelfSignedCert } = await import("../lib/tls");
-	const result = await generateSelfSignedCert();
+	const { ensureCa, issueServerCert } = await import("../lib/tls");
+	const ca = await ensureCa();
+	const result = await issueServerCert();
 
 	// Update settings to enable TLS with generated cert paths
 	const current = settings;
@@ -1722,6 +1766,11 @@ settingsRoutes.post("/generate-tls", requireAdmin, async (c) => {
 		certPath: result.certPath,
 		keyPath: result.keyPath,
 		expiresAt: result.expiresAt,
+		effectiveSans: result.effectiveSans,
+		customSans: result.customSans,
+		autoSans: result.autoSans,
+		caCreated: ca.created,
+		caExpiresAt: ca.expiresAt,
 		newUrl,
 		serverRestarting: true,
 	});

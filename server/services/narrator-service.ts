@@ -80,6 +80,8 @@ import {
 	contentJsonHasImageBlocks,
 	deleteNarratorUploads,
 	type ImageRef,
+	imageRefToContentBlock,
+	type PersistedUserImageBlock,
 	type TextFileRef,
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
@@ -1442,23 +1444,11 @@ export const narratorService = {
 		const now = new Date().toISOString();
 		const contentJson: Array<
 			| { type: "text"; text: string }
-			| {
-					type: "image";
-					imageId: string;
-					filename: string;
-					mediaType: string;
-					uploadNarratorId?: string;
-			  }
+			| PersistedUserImageBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
 		for (const image of options?.images ?? []) {
-			contentJson.push({
-				type: "image",
-				imageId: image.imageId,
-				filename: image.filename,
-				mediaType: image.mediaType,
-				...(image.uploadNarratorId ? { uploadNarratorId: image.uploadNarratorId } : {}),
-			});
+			contentJson.push(imageRefToContentBlock(image));
 		}
 		for (const file of options?.textFiles ?? []) {
 			contentJson.push({
@@ -2569,8 +2559,6 @@ export const narratorService = {
 	getLatestSuccessfulCompactSummary:
 		narratorMessageQueries.getLatestSuccessfulCompactSummary.bind(narratorMessageQueries),
 	isSubagentNarrator: narratorMessageQueries.isSubagentNarrator.bind(narratorMessageQueries),
-	getChunkManifest: narratorMessageQueries.getChunkManifest.bind(narratorMessageQueries),
-	getChunksByRange: narratorMessageQueries.getChunksByRange.bind(narratorMessageQueries),
 	getPretextDocumentPage:
 		narratorMessageQueries.getPretextDocumentPage.bind(narratorMessageQueries),
 	getMessageVersion: narratorMessageQueries.getMessageVersion.bind(narratorMessageQueries),
@@ -2591,6 +2579,8 @@ export const narratorService = {
 	dismissCwdRecoveryMessage:
 		narratorMessageQueries.dismissCwdRecoveryMessage.bind(narratorMessageQueries),
 	dismissErrorMessage: narratorMessageQueries.dismissErrorMessage.bind(narratorMessageQueries),
+	dismissInterruptTaskGuardMessage:
+		narratorMessageQueries.dismissInterruptTaskGuardMessage.bind(narratorMessageQueries),
 	deleteMessagesAfter: narratorMessageQueries.deleteMessagesAfter.bind(narratorMessageQueries),
 	deleteMessageBlock: narratorMessageQueries.deleteMessageBlock.bind(narratorMessageQueries),
 	deleteMessageBlocks: narratorMessageQueries.deleteMessageBlocks.bind(narratorMessageQueries),

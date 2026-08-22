@@ -687,6 +687,13 @@ export const narrators = sqliteTable(
 		index("idx_narrators_refs_inherited_from")
 			.on(table.refsInheritedFrom)
 			.where(sql`"refs_inherited_from" IS NOT NULL`),
+		// Cursor paging for the LEGACY half of the background-task list (subagents
+		// recorded before `background_tasks` existed). Partial because the set of
+		// interest is a small slice of a large table, and the list always filters on
+		// it. `idx_narrators_parent` alone cannot serve the `createdAt desc` order.
+		index("idx_narrators_background_parent_created")
+			.on(table.parentNarratorId, table.createdAt, table.id)
+			.where(sql`"is_background" = 1`),
 	],
 );
 
@@ -1663,6 +1670,12 @@ export const userPreferences = sqliteTable("user_preferences", {
 	addSubagentToRecentTabs: integer("add_subagent_to_recent_tabs", { mode: "boolean" })
 		.notNull()
 		.default(true),
+	// How the sidebar renders the recent-tab work section. "flat" is the historical
+	// behaviour (one row per tab, manually sortable); "directory" merges narrators
+	// that share a working directory into collapsible groups so the path is shown once.
+	recentTabsGroupMode: text("recent_tabs_group_mode", { enum: ["flat", "directory"] })
+		.notNull()
+		.default("flat"),
 	// Notification preferences
 	notifyOnDone: integer("notify_on_done", { mode: "boolean" }).notNull().default(true),
 	notifyOnWaiting: integer("notify_on_waiting", { mode: "boolean" }).notNull().default(true),
@@ -1715,6 +1728,11 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// Sidebar navigation layout (JSON: { items: [{ id, hidden }] } — order = display order,
 	// hidden:true items live in the "More" overflow menu)
 	navLayout: text("nav_layout").notNull().default("{}"),
+	// Narrator header toolbar layout (JSON: { items: [{ id }] } — a flat ordered list where
+	// "__divider__" marks the boundary: ids before it may be surfaced in the header, ids after
+	// it always live in the overflow menu). Order is the user's priority and is shared across
+	// desktop and mobile; how many actually fit is decided per host at render time.
+	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	/**
 	 * User layer of the layered trait system — the lowest-priority layer, applied
 	 * to every narrator the user acts on. Same encoding as `narrators.traits`.
@@ -1812,6 +1830,24 @@ export const userRecentTabs = sqliteTable(
 		pinned: integer("pinned", { mode: "boolean" }).notNull().default(false),
 		isScheduled: integer("is_scheduled", { mode: "boolean" }).notNull().default(false),
 		sortOrder: integer("sort_order").notNull(),
+		/**
+		 * The member position the user arranged by hand inside a directory group
+		 * (sidebar directory-aggregation mode).
+		 *
+		 * MUST stay separate from `sort_order`. That column carries recency and is
+		 * rewritten by the `above_idle` auto-promote every time a narrator starts
+		 * working, so a hand-ordered position stored there is wiped by the next status
+		 * change — that was the actual reason drag-to-reorder never stuck in this mode.
+		 *
+		 * NULL means "never hand-ordered" and sorts BEFORE the ordered members, in
+		 * recency order. A newly visited narrator is the newest thing in the group, so
+		 * burying it under older hand-placed rows would contradict the recency promise
+		 * the rest of the list makes.
+		 *
+		 * Cleared when the tab's cwd changes, otherwise a stale index from the previous
+		 * directory would interleave with the new group's members.
+		 */
+		dirSortOrder: integer("dir_sort_order"),
 		createdAt: text("created_at").notNull(),
 		updatedAt: text("updated_at").notNull(),
 	},
@@ -2996,6 +3032,10 @@ export const backgroundTasks = sqliteTable(
 	(table) => [
 		index("idx_bg_tasks_parent").on(table.parentNarratorId, table.status),
 		index("idx_bg_tasks_subagent").on(table.subagentNarratorId),
+		// Cursor paging order for the task list: `(parent, createdAt desc, id desc)`.
+		// Without it a parent with hundreds of tasks sorts its whole history on every
+		// page request.
+		index("idx_bg_tasks_parent_created").on(table.parentNarratorId, table.createdAt, table.id),
 	],
 );
 

@@ -19,6 +19,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { sliceBracketedRegion } from "./source-slice";
 
 const VLIST_DIR = import.meta.dir;
 
@@ -72,12 +73,10 @@ describe("wrap / source toggles stay out of the measure path", () => {
 
 	it("never reach the layout options the document is built from", () => {
 		const src = read("PretextExactMessageList.tsx");
-		const start = src.indexOf("const pretextDocument = usePretextDocument(");
-		expect(start).toBeGreaterThan(-1);
-		// The whole options object literal, up to the call's closing `});`.
-		const end = src.indexOf("\n\t});", start);
-		expect(end).toBeGreaterThan(start);
-		const options = src.slice(start, end);
+		// Brace-matched: a hardcoded `"\n\t});"` end sentinel assumed one tab of
+		// indentation and broke when the shell was re-indented (see source-slice.ts).
+		const options = sliceBracketedRegion(src, "usePretextDocument(narratorId, {");
+		if (options === null) throw new Error("usePretextDocument(narratorId, { … }) not found");
 		expect(options).not.toContain("viewWrap");
 		expect(options).not.toContain("viewShowSource");
 	});
@@ -111,7 +110,10 @@ describe("a plain row's source view cannot resize the row", () => {
 		const body = src.slice(start, src.indexOf("\n/**", start));
 		// Height comes from the caller (the measured frame), never from the content.
 		expect(body).toContain("height,");
-		expect(body).toContain('overflow: "auto"');
+		expect(body).toContain('overflowY: "auto"');
+		// The source is pre-wrap, so horizontal overflow is a paint artifact, never
+		// content — the wrapped state of every body box is `overflowX: hidden`.
+		expect(body).toContain('overflowX: "hidden"');
 		// No growth escape hatches: either of these would let the text set the height.
 		expect(body).not.toContain("minHeight");
 		expect(body).not.toContain("maxHeight");

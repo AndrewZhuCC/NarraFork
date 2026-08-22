@@ -1,6 +1,5 @@
 {
 	"appName": "NarraFork",
-	"narratorVirtualListToggle": "Narrator virtual list (on by default; turn off for the classic list)",
 	"dashboard": "Dashboard",
 	"projects": "NarraFlow",
 	"narrators": "Narrators",
@@ -37,6 +36,12 @@
 	"revealInExplorer": "Reveal in File Manager",
 	"newNarratorHere": "New narrator in this directory",
 	"newNarratorHereNoDir": "Could not resolve a directory for this tab",
+	"copyCwd": "Copy working directory",
+	"copyCwdNoDir": "Could not resolve a working directory for this tab",
+	"copyCwdSuccess": "Working directory copied: {{path}}",
+	"copyCwdFailed": "Failed to copy working directory",
+	"rename": "Rename",
+	"archive": "Archive",
 	"totalOutputChars": "Total AI output chars",
 	"feedback": "Feedback",
 	"requestDumpEnabledBadge": "Dump on",
@@ -59,5 +64,14 @@
 	"emptyVisibleZone": "Drag here to show",
 	"loadMoreRecentTabs": "Load more",
 	"retryRecentTabs": "Retry",
-	"recentTabsSyncError": "Recent tabs could not be synced"
+	"recentTabsSyncError": "Recent tabs could not be synced",
+	"recentTabsReorderFailed": "Tab order could not be saved",
+	"recentTabsGrouping": "Tab grouping",
+	"groupModeFlat": "Flat list",
+	"groupModeDirectory": "Group by directory",
+	"expandDirectory": "Expand directory {{path}}",
+	"collapseDirectory": "Collapse directory {{path}}",
+	"directoryNarratorCount": "{{count}} narrators in this directory",
+	"directoryWorkingCount": "{{count}} working",
+	"directoryAttentionCount": "{{count}} need attention"
 }
