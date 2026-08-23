@@ -10,6 +10,7 @@ import {
 	type ProviderResolution,
 	resolveProviderAndModel,
 } from "./provider";
+import { withReasoningMandatoryFallback } from "./reasoning-mandatory-fallback";
 import { stripCitationMarkersForModel } from "./strip-citation-markers";
 import { stripPlanBodyForModel } from "./strip-plan-body";
 import "./tools";
@@ -106,7 +107,17 @@ export async function agentGenerateWithMetaResolved(
 	tracking?: Omit<TrackApiRequestOptions, "provider" | "model">,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const generate = () =>
-		resolved.adapter.generateWithMeta(text, resolved.model, systemInstruction, options);
+		withReasoningMandatoryFallback(
+			`${resolved.provider}:${resolved.model}`,
+			options,
+			(effectiveOptions) =>
+				resolved.adapter.generateWithMeta(
+					text,
+					resolved.model,
+					systemInstruction,
+					effectiveOptions,
+				),
+		);
 	if (!tracking) return generate();
 	return trackApiRequest(
 		{
@@ -165,24 +176,30 @@ export async function agentGenerateWithHistoryWithMeta(
 ): Promise<import("./provider").GenerateMetaResult> {
 	const requestedModel = model ?? settings.agent.defaultModel;
 	const resolved = resolveProviderAndModel(requestedModel);
-	if (resolved.adapter.generateWithHistoryWithMeta) {
-		return resolved.adapter.generateWithHistoryWithMeta(
-			systemInstruction,
-			content,
-			resolved.model,
-			locale,
-			options,
-		);
-	}
-	return {
-		text: await resolved.adapter.generateWithHistory(
-			systemInstruction,
-			content,
-			resolved.model,
-			locale,
-			options,
-		),
-	};
+	return withReasoningMandatoryFallback(
+		`${resolved.provider}:${resolved.model}`,
+		options,
+		async (effectiveOptions) => {
+			if (resolved.adapter.generateWithHistoryWithMeta) {
+				return resolved.adapter.generateWithHistoryWithMeta(
+					systemInstruction,
+					content,
+					resolved.model,
+					locale,
+					effectiveOptions,
+				);
+			}
+			return {
+				text: await resolved.adapter.generateWithHistory(
+					systemInstruction,
+					content,
+					resolved.model,
+					locale,
+					effectiveOptions,
+				),
+			};
+		},
+	);
 }
 
 // === Summary model wrappers ===
