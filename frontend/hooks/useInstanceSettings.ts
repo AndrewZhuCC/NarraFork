@@ -191,7 +191,7 @@ function makeDefaults(): InstanceSettingsState {
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
-		queueDuringCompaction: false,
+		queueDuringCompaction: true,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
 		globalWhitelistDirs: [],
@@ -301,7 +301,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
-				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
+				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(
