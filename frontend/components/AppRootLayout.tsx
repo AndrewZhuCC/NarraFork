@@ -18,11 +18,10 @@ import {
 	Group,
 	Indicator,
 	Loader,
+	Menu,
 	Modal,
 	NavLink,
-	Switch,
 	Text,
-	TextInput,
 	Title,
 	Tooltip,
 	useComputedColorScheme,
@@ -30,18 +29,18 @@ import {
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { isSessionInvalidResponse } from "@shared/session-auth";
 import {
+	IconAdjustmentsHorizontal,
 	IconAlertTriangle,
 	IconArrowLeft,
+	IconCheck,
 	IconClearAll,
 	IconDashboard,
 	IconFolders,
-	IconLayoutList,
+	IconList,
 	IconMessageChatbot,
 	IconMessageReport,
 	IconPlus,
-	IconSearch,
 	IconSettings,
-	IconX,
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -58,7 +57,7 @@ import { useTranslation } from "react-i18next";
 import { useCurrentUser, useLogout } from "../hooks/useAuth";
 import { useChatUnreadLive } from "../hooks/useChat";
 import { useKnowledgeNotifications } from "../hooks/useKnowledge";
-import { useLocalPref } from "../hooks/useLocalPref";
+import { useLocalNumberPref, useLocalPref } from "../hooks/useLocalPref";
 import { useNavLayout } from "../hooks/useNavLayout";
 import { useOutputStats } from "../hooks/useOutputStats";
 import { useRecentTabKeyboardNav } from "../hooks/useRecentTabKeyboardNav";
@@ -74,7 +73,6 @@ import {
 } from "../lib/app-shell-scroll";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
 import { changeAppLanguage, getNamespacesForPath, normalizeLanguage } from "../lib/i18n";
-import { NARRATOR_VIRTUAL_LIST_INTERACTIVE } from "../lib/narrator-virtual-list";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../lib/responsive";
 import {
@@ -93,15 +91,21 @@ import {
 	installAuthenticatedAppShellRootLock,
 	SAFE_AREA_INSET_TOP,
 } from "../lib/safe-area";
+// The streaming fade's duration lives in lib/, not next to the animation logic in
+// vlist/: publishing it from here must not statically import the virtual list,
+// which stays behind its dynamic-import boundary (vlist-isolation.guard.test.ts).
+import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
+import { HeaderSearchBox } from "./nav/HeaderSearchBox";
 import { NavOverflowMenu } from "./nav/NavOverflowMenu";
 import { NavUserMenu } from "./nav/NavUserMenu";
 import { CUSTOMIZABLE_NAV_ITEMS } from "./nav/nav-items";
 import { isTabActive, RecentTabList, RecentTabsWSProvider } from "./nav/RecentTabs";
 import { useNavBadges } from "./nav/use-nav-badges";
+import { StartupRecoveryAlert } from "./StartupRecoveryAlert";
 import { BrokenModelMigrationHost } from "./settings/BrokenModelMigrationHost";
 import { ProviderBaseUrlFixHost } from "./settings/ProviderBaseUrlFixHost";
 import { SummaryModelPickerHost } from "./settings/SummaryModelPickerHost";
@@ -294,7 +298,9 @@ function AuthenticatedLayout() {
 	});
 	const headerRef = useRef<HTMLElement>(null);
 	const [logoutOpened, { open: openLogout, close: closeLogout }] = useDisclosure(false);
-	const [searchQuery, setSearchQuery] = useState("");
+	// The search QUERY state lives in HeaderSearchBox (per-keystroke re-renders
+	// must not touch the AppShell). Only the mobile open/closed toggle stays
+	// here because the title below is gated on it.
 	const [searchOpen, setSearchOpen] = useState(false);
 	const navigate = useNavigate();
 	const router = useRouter();
@@ -304,12 +310,12 @@ function AuthenticatedLayout() {
 	const { logout } = useLogout();
 	const { data: prefs } = useUserPreferences();
 	const updatePrefs = useUpdateUserPreferences();
+	const tabGroupMode = prefs?.recentTabsGroupMode ?? "flat";
 	const { tabs, clearTabs } = useRecentTabs();
 	const [oledMode] = useLocalPref("narrafork_oled");
 	const [advancedAnim] = useLocalPref("narrafork_advanced_anim");
-	const [narratorVirtualList, setNarratorVirtualList] = useLocalPref(
-		"narrafork_narrator_virtual_list",
-	);
+	const [blurInMs] = useLocalNumberPref("narrafork_blur_in_ms");
+	const [streamTokenMs] = useLocalNumberPref("narrafork_stream_token_ms");
 	const [wakeLockEnabled] = useLocalPref("narrafork_wakelock");
 	useWakeLock(wakeLockEnabled);
 	useRecentTabKeyboardNav();
@@ -505,6 +511,34 @@ function AuthenticatedLayout() {
 		}
 	}, [advancedAnim]);
 
+	// Publish the configured blur-in duration as a CSS variable on <html>.
+	// Removing it (rather than writing the default) when advanced animation is
+	// off keeps the stylesheet's own fallback as the single source of the default.
+	useEffect(() => {
+		const html = document.documentElement;
+		if (advancedAnim) {
+			html.style.setProperty("--nf-blur-in-duration", `${blurInMs}ms`);
+		} else {
+			html.style.removeProperty("--nf-blur-in-duration");
+		}
+	}, [advancedAnim, blurInMs]);
+
+	// The streaming per-grapheme fade has TWO consumers that must agree: the CSS
+	// animation and the JS retirement clock in stream-token-anim, which decides
+	// when a grapheme's span may be folded back into static text. A JS duration
+	// SHORTER than the CSS one seals spans mid-animation and snaps the character
+	// to its end state — so both are written here, from one value, in one effect.
+	//
+	// The JS side is set first: it only takes effect on the next animation frame,
+	// while the CSS var applies to spans already on screen. Setting the (longer)
+	// clock before the (shorter) CSS duration can only over-retain spans for a
+	// frame, which is invisible; the reverse order truncates fades in flight.
+	useEffect(() => {
+		setStreamAnimDurationMs(streamTokenMs);
+		const html = document.documentElement;
+		html.style.setProperty("--nf-stream-token-duration", `${streamTokenMs}ms`);
+	}, [streamTokenMs]);
+
 	// Sync theme-color meta tag with actual background color
 	useEffect(() => {
 		const color = computedScheme === "dark" ? (oledMode ? "#000000" : "#1a1b1e") : "#ffffff";
@@ -550,13 +584,6 @@ function AuthenticatedLayout() {
 		);
 	}
 
-	const handleSearch = () => {
-		if (searchQuery.trim()) {
-			navigate({ to: "/search", search: { q: searchQuery.trim() } });
-			setSearchOpen(false);
-		}
-	};
-
 	const openRequestDumpSetting = () => {
 		navigate({ to: "/settings/agent", hash: "request-dump-enabled" });
 	};
@@ -577,11 +604,6 @@ function AuthenticatedLayout() {
 	const navbarBottomGutter = appShellNavbarBottomGutter(
 		wizardOpen ? "0px" : navCollapsed ? "4px" : "var(--mantine-spacing-md)",
 	);
-
-	const handleSearchKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter") handleSearch();
-		if (e.key === "Escape") setSearchOpen(false);
-	};
 
 	return (
 		<AppShellWithNavWidth
@@ -638,27 +660,6 @@ function AuthenticatedLayout() {
 								{t("appName")}
 							</Title>
 						</Tooltip>
-						{NARRATOR_VIRTUAL_LIST_INTERACTIVE && (
-							<Tooltip
-								label={t("narratorVirtualListToggle")}
-								position="bottom"
-								withArrow
-								openDelay={400}
-							>
-								<Switch
-									size="sm"
-									checked={narratorVirtualList}
-									onChange={(e) => setNarratorVirtualList(e.currentTarget.checked)}
-									thumbIcon={
-										narratorVirtualList ? (
-											<IconLayoutList size={12} color="var(--mantine-color-indigo-6)" />
-										) : undefined
-									}
-									aria-label={t("narratorVirtualListToggle")}
-									style={{ flexShrink: 0 }}
-								/>
-							</Tooltip>
-						)}
 
 						<UpdateBadge />
 						{requestDumpEnabled && (
@@ -703,53 +704,7 @@ function AuthenticatedLayout() {
 								<IconMessageReport size={20} />
 							</ActionIcon>
 						</Tooltip>
-						{/* Desktop: always show search input */}
-						<TextInput
-							placeholder={t("searchPlaceholder")}
-							size="sm"
-							style={{ width: 300 }}
-							value={searchQuery}
-							onChange={(e) => setSearchQuery(e.currentTarget.value)}
-							onKeyDown={handleSearchKeyDown}
-							rightSection={
-								<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
-									<IconSearch size={16} />
-								</ActionIcon>
-							}
-							visibleFrom="sm"
-						/>
-						{/* Mobile: toggle search input via icon */}
-						{searchOpen ? (
-							<Group wrap="nowrap" gap="xs" hiddenFrom="sm" style={{ flex: 1, minWidth: 0 }}>
-								<TextInput
-									placeholder={t("searchPlaceholder")}
-									size="sm"
-									style={{ flex: 1, minWidth: 0 }}
-									value={searchQuery}
-									onChange={(e) => setSearchQuery(e.currentTarget.value)}
-									onKeyDown={handleSearchKeyDown}
-									rightSection={
-										<ActionIcon size="sm" variant="subtle" onClick={handleSearch}>
-											<IconSearch size={16} />
-										</ActionIcon>
-									}
-									autoFocus
-								/>
-								<ActionIcon variant="subtle" color="gray" onClick={() => setSearchOpen(false)}>
-									<IconX size={18} />
-								</ActionIcon>
-							</Group>
-						) : (
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								onClick={() => setSearchOpen(true)}
-								title={t("searchPlaceholder")}
-								hiddenFrom="sm"
-							>
-								<IconSearch size={18} />
-							</ActionIcon>
-						)}
+						<HeaderSearchBox searchOpen={searchOpen} onSearchOpenChange={setSearchOpen} />
 					</Group>
 				</Group>
 			</AppShell.Header>
@@ -881,6 +836,56 @@ function AuthenticatedLayout() {
 									rightSection={
 										navCollapsed ? undefined : (
 											<Group gap={8} wrap="nowrap">
+												{/* Display-mode switch for the tab list below. Wrapped in a Box that
+												    swallows the click: this lives INSIDE the NavLink, whose own
+												    onClick navigates to /narrators, and both sibling ActionIcons
+												    below stop propagation for the same reason. */}
+												<Box
+													onClick={(e: React.MouseEvent) => {
+														e.preventDefault();
+														e.stopPropagation();
+													}}
+													onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+													style={{ display: "flex" }}
+												>
+													<Menu position="right-start" withinPortal shadow="md" width={210}>
+														<Menu.Target>
+															<Tooltip label={t("recentTabsGrouping")} position="right" withArrow>
+																<ActionIcon
+																	size={28}
+																	variant="subtle"
+																	color="gray"
+																	aria-label={t("recentTabsGrouping")}
+																>
+																	<IconAdjustmentsHorizontal size={16} />
+																</ActionIcon>
+															</Tooltip>
+														</Menu.Target>
+														<Menu.Dropdown>
+															<Menu.Label>{t("recentTabsGrouping")}</Menu.Label>
+															<Menu.Item
+																leftSection={<IconList size={14} />}
+																rightSection={
+																	tabGroupMode === "flat" ? <IconCheck size={14} /> : undefined
+																}
+																onClick={() => updatePrefs.mutate({ recentTabsGroupMode: "flat" })}
+															>
+																{t("groupModeFlat")}
+															</Menu.Item>
+															<Menu.Item
+																leftSection={<IconFolders size={14} />}
+																rightSection={
+																	tabGroupMode === "directory" ? <IconCheck size={14} /> : undefined
+																}
+																onClick={() =>
+																	updatePrefs.mutate({ recentTabsGroupMode: "directory" })
+																}
+															>
+																{t("groupModeDirectory")}
+															</Menu.Item>
+														</Menu.Dropdown>
+													</Menu>
+												</Box>
 												<Tooltip label={t("newNarrator")} position="right" withArrow>
 													<ActionIcon
 														size={28}
@@ -1037,6 +1042,7 @@ function AuthenticatedLayout() {
 				style={{ paddingBottom: APP_SHELL_MAIN_PADDING_BOTTOM }}
 			>
 				<GitMissingAlert />
+				<StartupRecoveryAlert />
 				<Outlet />
 			</AppShell.Main>
 

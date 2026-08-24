@@ -31,6 +31,7 @@ import {
 	mergeRecentTabPatch,
 	mergeRecentTabRuntime,
 	normalizeRecentTab,
+	recentTabVisitSignature,
 } from "./recent-tabs-utils";
 
 export type {
@@ -54,6 +55,7 @@ export {
 	normalizeRecentTabViewers,
 	pruneRecentTabsRuntimeVersions,
 	RECENT_TAB_TEXT_MAX_CHARS,
+	recentTabVisitSignature,
 	reconcileRecentTabsRuntimePatches,
 	selectRecentTabsLiveWindow,
 	shouldAddSubagentRecentTab,
@@ -207,6 +209,29 @@ function dataRevision(data: RecentTabsInfiniteData | undefined): number {
 	return recentTabsDataRevision(data) ?? 0;
 }
 
+/** True when a rebuilt window is field-for-field the object the cache already holds. */
+function isSameLoadedWindow(
+	previous: RecentTabsInfiniteData,
+	next: RecentTabsInfiniteData,
+): boolean {
+	if (previous === next) return true;
+	if (previous.pages.length !== next.pages.length) return false;
+	return previous.pages.every((page, index) => {
+		const nextPage = next.pages[index];
+		if (
+			page.revision !== nextPage.revision ||
+			page.hasMore !== nextPage.hasMore ||
+			page.nextCursor !== nextPage.nextCursor ||
+			page.items.length !== nextPage.items.length
+		) {
+			return false;
+		}
+		// Item identity, not deep equality: every producer here already returns the
+		// previous tab object when a patch changed nothing.
+		return page.items.every((item, itemIndex) => item === nextPage.items[itemIndex]);
+	});
+}
+
 function replaceLoadedTabs(
 	data: RecentTabsInfiniteData,
 	tabs: RecentTab[],
@@ -238,7 +263,13 @@ function replaceLoadedTabs(
 				: {}),
 		};
 	});
-	return { ...data, pages };
+	const next = { ...data, pages };
+	// Returning the SAME object when nothing moved is what lets React Query skip the
+	// notification. Without it, a runtime tick that changed no field still allocated a
+	// new window object and re-rendered every consumer of the recent-tabs cache
+	// (the app shell, the sidebar lists, the graph) — the identity preservation inside
+	// `mergeRecentTabPatch` was being thrown away one layer up.
+	return isSameLoadedWindow(data, next) ? data : next;
 }
 
 function updateSectionData(
@@ -257,6 +288,12 @@ function updateSectionData(
 	});
 }
 
+function sameTabList(previous: RecentTab[] | undefined, next: RecentTab[]): boolean {
+	if (previous === next) return true;
+	if (!previous || previous.length !== next.length) return false;
+	return previous.every((tab, index) => tab === next[index]);
+}
+
 function syncCompatibilityCache(qc: QueryClient): void {
 	const projects = flattenPages(
 		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("projects")),
@@ -264,7 +301,13 @@ function syncCompatibilityCache(qc: QueryClient): void {
 	const work = flattenPages(
 		qc.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey("work")),
 	);
-	qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, [...projects, ...work]);
+	// Same reasoning as `replaceLoadedTabs`: this flat array is a separate cache entry
+	// that several components read, so re-allocating it on an unchanged tick would
+	// re-render them even after the section windows correctly stayed put.
+	qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (previous) => {
+		const next = [...projects, ...work];
+		return sameTabList(previous, next) ? (previous as RecentTab[]) : next;
+	});
 }
 
 /** Enforce workspace grouping: each header is immediately followed by its loaded children. */
@@ -348,6 +391,85 @@ export function applyRecentTabMove(
 	return next;
 }
 
+/**
+ * A before/after move on the flat order — the only reorder primitive the server has.
+ */
+export interface RecentTabOrderMove {
+	key: string;
+	beforeKey?: string;
+	afterKey?: string;
+}
+
+export interface RecentTabOrderMoveResult {
+	moves: RecentTabOrderMove[];
+	/** The order the cache converges to after applying every move in sequence. */
+	finalTabs: RecentTab[];
+}
+
+/**
+ * Translate a desired unit order into flat before/after moves.
+ *
+ * The sidebar's derived views (directory aggregation) reorder UNITS — blocks of one or
+ * more tab keys — while the server only reorders single keys. This walks the desired
+ * movable order and, whenever the next key is not already at its slot, emits ONE move
+ * placing it before the key that currently occupies the slot. Keys absent from
+ * `orderedBlocks` are fixed and never emitted or displaced relative to one another.
+ *
+ * Two properties are load-bearing and both are covered by tests:
+ *
+ *  - `beforeKey` is used throughout, never `afterKey`: the server expands an anchor
+ *    inside a workspace to the whole group boundary, so "after a workspace header" means
+ *    after its LAST CHILD there but right after the header in the client simulation —
+ *    "before an occupant" cannot diverge that way (an occupant is always a top-level
+ *    key: a workspace child only becomes the current slot after its own header was
+ *    placed, and by then it sits exactly where the walk expects it).
+ *  - Every move is simulated through {@link applyRecentTabMove}, the same function the
+ *    mutation cache path and the WS delta path use, so `finalTabs` is exactly what the
+ *    cache holds after the sequence is replayed — that is what lets the caller render
+ *    `finalTabs` optimistically without the order snapping back mid-flight.
+ */
+export function computeRecentTabOrderMoves(
+	tabs: RecentTab[],
+	orderedBlocks: string[][],
+): RecentTabOrderMoveResult {
+	const movable = new Set(orderedBlocks.flat());
+	let work = [...tabs];
+	const moves: RecentTabOrderMove[] = [];
+	let placedCount = 0;
+
+	for (const block of orderedBlocks) {
+		for (const key of block) {
+			// Defensive: a block naming a tab that is gone is skipped entirely — emitting
+			// a move for it would push a key the server does not have and corrupt the
+			// placed-slot bookkeeping for every key after it.
+			if (!work.some((tab) => tabKey(tab) === key)) continue;
+			// The slot this key must occupy: the first movable position not yet placed.
+			let seen = 0;
+			let targetIdx = -1;
+			for (let i = 0; i < work.length; i++) {
+				if (!movable.has(tabKey(work[i]))) continue;
+				if (seen === placedCount) {
+					targetIdx = i;
+					break;
+				}
+				seen++;
+			}
+			if (targetIdx < 0) continue; // defensive: no unplaced slot left
+			if (tabKey(work[targetIdx]) === key) {
+				placedCount++;
+				continue;
+			}
+			const beforeKey = tabKey(work[targetIdx]);
+			const move: RecentTabOrderMove = { key, beforeKey };
+			work = applyRecentTabMove(work, key, { beforeKey });
+			moves.push(move);
+			placedCount++;
+		}
+	}
+
+	return { moves, finalTabs: work };
+}
+
 function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): RecentTab[] {
 	if (operation.type === "remove") {
 		const removed = tabs.find((tab) => tabKey(tab) === operation.key);
@@ -415,9 +537,38 @@ export function reduceRecentTabsOperations(
 	return next;
 }
 
-/** Apply a mutation/WS delta atomically across every loaded section. */
-export function applyRecentTabsDelta(qc: QueryClient, delta: RecentTabsDelta): RecentTabsSection[] {
-	if (!Number.isFinite(delta.revision) || delta.revision <= 0) return [];
+export interface RecentTabsDeltaApplyResult {
+	/** Loaded windows that could not advance and must be rebuilt from page one. */
+	gaps: RecentTabsSection[];
+	/**
+	 * Sections whose window shrank while the server still has rows past it.
+	 * Only these gained an empty slot that a page fetch can refill.
+	 */
+	backfill: RecentTabsSection[];
+}
+
+const NO_DELTA_FOLLOW_UP: RecentTabsDeltaApplyResult = { gaps: [], backfill: [] };
+
+/**
+ * Apply a mutation/WS delta atomically across every loaded section.
+ *
+ * The returned result is what decides whether a page fetch follows. A delta that
+ * applied cleanly needs NO fetch: the operations carry `beforeKey`/`afterKey`
+ * anchors, so the reducer lands on the same order the server holds. Refetching
+ * both sections after every applied revision is what turned one narrator switch
+ * into a burst of `recent-tabs?section=...` requests — a visit upserts the tab,
+ * the mutation response and the WS delta each carry that revision, and every
+ * status change during the turn produces another one.
+ *
+ * A removal is the exception: `replaceLoadedTabs` shrinks the window to the rows
+ * that are left, so when the server still has more rows the window is one short
+ * until it is refilled.
+ */
+export function applyRecentTabsDelta(
+	qc: QueryClient,
+	delta: RecentTabsDelta,
+): RecentTabsDeltaApplyResult {
+	if (!Number.isFinite(delta.revision) || delta.revision <= 0) return NO_DELTA_FOLLOW_UP;
 	const baseRevision = delta.baseRevision ?? delta.revision - 1;
 	const loaded = (["projects", "work"] as const)
 		.map((section) => ({
@@ -428,27 +579,31 @@ export function applyRecentTabsDelta(qc: QueryClient, delta: RecentTabsDelta): R
 		.filter(
 			(entry): entry is typeof entry & { data: RecentTabsInfiniteData } => entry.data !== undefined,
 		);
-	if (loaded.length === 0) return [];
+	if (loaded.length === 0) return NO_DELTA_FOLLOW_UP;
 
 	const revisions = loaded.map(({ data }) => recentTabsDataRevision(data));
 	if (revisions.every((revision) => revision !== undefined && revision >= delta.revision))
-		return [];
+		return NO_DELTA_FOLLOW_UP;
+	// Rebuilding is the caller's job (one `reset` refresh). Invalidating here as well
+	// would make an active infinite query refetch every loaded page on top of it.
 	if (revisions.some((revision) => revision === undefined || revision !== baseRevision)) {
-		for (const section of ["projects", "work"] as const) {
-			void qc.invalidateQueries({ queryKey: recentTabsSectionQueryKey(section), exact: true });
-		}
-		return ["projects", "work"];
+		return { gaps: ["projects", "work"], backfill: [] };
 	}
 
+	const backfill: RecentTabsSection[] = [];
 	for (const { section, key, data } of loaded) {
 		const relevant = delta.operations.filter(
 			(operation) => operationSection(operation) === section,
 		);
-		const nextTabs = reduceRecentTabsOperations(flattenPages(data), section, relevant);
+		const previousTabs = flattenPages(data);
+		const nextTabs = reduceRecentTabsOperations(previousTabs, section, relevant);
 		qc.setQueryData(key, replaceLoadedTabs(data, nextTabs, delta.revision));
+		if (nextTabs.length < previousTabs.length && data.pages.at(-1)?.hasMore) {
+			backfill.push(section);
+		}
 	}
 	syncCompatibilityCache(qc);
-	return [];
+	return { gaps: [], backfill };
 }
 
 export function applyRecentTabsRuntimePatches(
@@ -490,6 +645,9 @@ function toPersistedRecentTab(tab: RecentTab): PersistedRecentTab {
 	if (tab.status !== undefined) persisted.status = tab.status;
 	if (tab.pinned !== undefined) persisted.pinned = tab.pinned;
 	if (tab.isScheduled !== undefined) persisted.isScheduled = tab.isScheduled;
+	// Carried so an undo-restore does not silently flatten hand-arranged directory
+	// groups back to recency order.
+	if (tab.dirSortOrder !== undefined) persisted.dirSortOrder = tab.dirSortOrder;
 	return persisted;
 }
 
@@ -747,6 +905,25 @@ export function refreshRecentTabsLoadedWindow(
 	return promise;
 }
 
+/**
+ * Apply a delta and fetch pages only when the delta could not be applied locally.
+ *
+ * Every mutation response and every WS delta funnels through here so the "did this
+ * need a network follow-up?" decision lives in one place instead of being repeated
+ * (and drifting) at each call site.
+ */
+export function applyRecentTabsDeltaAndFollowUp(
+	qc: QueryClient,
+	delta: RecentTabsDelta,
+): Promise<void> {
+	const { gaps, backfill } = applyRecentTabsDelta(qc, delta);
+	if (gaps.length === 0 && backfill.length === 0) return Promise.resolve();
+	return refreshRecentTabsLoadedWindow(qc, {
+		reset: gaps.length > 0,
+		minimumRevision: delta.revision,
+	});
+}
+
 function useRecentTabsSection(section: RecentTabsSection) {
 	const qc = useQueryClient();
 	return useInfiniteQuery({
@@ -790,17 +967,18 @@ export function useRecentTabs() {
 	const workTabs = useMemo(() => flattenPages(workQuery.data), [workQuery.data]);
 	const tabs = useMemo(() => [...projectTabs, ...workTabs], [projectTabs, workTabs]);
 
+	// Every mounted `useRecentTabs()` maintains the flat compatibility array, and each
+	// one memoizes its own copy — so writing unconditionally meant N cache writes per
+	// change for a value that had not changed.
 	useEffect(() => {
-		qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, tabs);
+		qc.setQueryData<RecentTab[]>(RECENT_TABS_QUERY_KEY, (previous) =>
+			sameTabList(previous, tabs) ? (previous as RecentTab[]) : tabs,
+		);
 	}, [qc, tabs]);
 
 	const applyAuthoritativeResult = useCallback(
 		(result: RecentTabsMutationResponse) => {
-			const gaps = applyRecentTabsDelta(qc, mutationDelta(result));
-			void refreshRecentTabsLoadedWindow(qc, {
-				reset: gaps.length > 0,
-				minimumRevision: result.revision,
-			}).catch(() => {});
+			void applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result)).catch(() => {});
 		},
 		[qc],
 	);
@@ -1013,16 +1191,72 @@ async function applyGlobalRecentTabsMutation(
 	request: Promise<RecentTabsMutationResponse>,
 ): Promise<void> {
 	const result = await request;
-	const gaps = applyRecentTabsDelta(globalQC, mutationDelta(result));
-	await refreshRecentTabsLoadedWindow(globalQC, {
-		reset: gaps.length > 0,
-		minimumRevision: result.revision,
-	});
+	await applyRecentTabsDeltaAndFollowUp(globalQC, mutationDelta(result));
 }
 
 export function addRecentTab(tab: AddRecentTabInput): Promise<void> {
 	return applyGlobalRecentTabsMutation(api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
 		(error) => {
+			if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", error);
+		},
+	);
+}
+
+/**
+ * Last-persisted visit signature per tab, insertion-ordered by recency of use.
+ *
+ * Bounded: a long-lived session visits an unbounded number of narrators, and this
+ * map would otherwise grow for the whole lifetime of the page. Eviction only
+ * costs one redundant upsert on the next visit to that tab, which is exactly the
+ * behaviour before this dedupe existed — the safe direction to fail in.
+ */
+const visitSignatures = new Map<string, string>();
+const MAX_TRACKED_VISIT_SIGNATURES = 200;
+
+function rememberVisitSignature(key: string, signature: string): void {
+	// Re-insert so the map stays ordered by recency, which is what makes the
+	// eviction below drop the least recently visited tab.
+	visitSignatures.delete(key);
+	visitSignatures.set(key, signature);
+	while (visitSignatures.size > MAX_TRACKED_VISIT_SIGNATURES) {
+		const oldest = visitSignatures.keys().next();
+		if (oldest.done) break;
+		visitSignatures.delete(oldest.value);
+	}
+}
+
+function isRecentTabLoaded(key: string): boolean {
+	for (const section of ["projects", "work"] as const) {
+		const data = globalQC.getQueryData<RecentTabsInfiniteData>(recentTabsSectionQueryKey(section));
+		if (data?.pages.some((page) => page.items.some((tab) => tabKey(tab) === key))) return true;
+	}
+	return false;
+}
+
+/**
+ * Register a visit, skipping the request when nothing persisted would change.
+ *
+ * Route effects re-run on every narrator query update (status, substatus, title,
+ * presence), so without this a single narrator switch issued a stream of identical
+ * upserts, each one costing a revision plus a WS delta to every one of that user's
+ * open clients.
+ *
+ * The skip is conditional on the tab still being in a loaded window: removing a tab
+ * from the sidebar and navigating back to the same page must re-create it, and the
+ * signature alone cannot tell that apart from a redundant re-render.
+ */
+export function recordRecentTabVisit(tab: AddRecentTabInput): Promise<void> {
+	const key = `${tab.type}:${tab.id}`;
+	const signature = recentTabVisitSignature(tab);
+	if (visitSignatures.get(key) === signature && isRecentTabLoaded(key)) {
+		return Promise.resolve();
+	}
+	rememberVisitSignature(key, signature);
+	return applyGlobalRecentTabsMutation(api.upsertRecentTab(buildRecentTabUpsert(tab))).catch(
+		(error) => {
+			// A failed write must not be remembered as persisted, or the tab would stay
+			// missing until something else happened to change the signature.
+			if (visitSignatures.get(key) === signature) visitSignatures.delete(key);
 			if (import.meta.env.DEV) console.warn("[useRecentTabs] upsertRecentTab failed:", error);
 		},
 	);
@@ -1039,7 +1273,7 @@ export function addRecentTabsBatch(tabs: AddRecentTabInput[]): Promise<void> {
 }
 
 export function addSubagentRecentTab(input: SubagentRecentTabInput): void {
-	void addRecentTab(buildSubagentRecentTab(input)).catch(() => {});
+	void recordRecentTabVisit(buildSubagentRecentTab(input)).catch(() => {});
 }
 
 export function updateRecentTabLocal(

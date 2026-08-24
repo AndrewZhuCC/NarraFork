@@ -6,7 +6,8 @@ import type {
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
-import { request } from "./client";
+import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
 export interface RecentTabsPageResponse {
@@ -116,6 +117,57 @@ export const settingsApi = {
 			manualRestartRequired?: boolean;
 			replacementPid?: number;
 		}>("/settings/generate-tls", { method: "POST" }),
+	// TLS CA + SAN management (server/routes/tls.ts)
+	getTlsStatus: () =>
+		request<{
+			caExists: boolean;
+			caExpiresAt: string | null;
+			certExists: boolean;
+			certExpiresAt: string | null;
+			legacySelfSigned: boolean;
+			certSans: string[];
+			customSans: string[];
+			autoSans: string[];
+		}>("/settings/tls/status"),
+	generateTlsWithCa: (customSans?: string[]) =>
+		request<{
+			certPath: string;
+			keyPath: string;
+			expiresAt: string;
+			effectiveSans: string[];
+			customSans: string[];
+			autoSans: string[];
+			caCreated: boolean;
+			caExpiresAt: string;
+			newUrl: string;
+			serverRestarting: boolean;
+		}>("/settings/tls/generate", {
+			method: "POST",
+			body: JSON.stringify(customSans !== undefined ? { customSans } : {}),
+		}),
+	regenerateTlsCa: () =>
+		request<{
+			expiresAt: string;
+			effectiveSans: string[];
+			caExpiresAt: string;
+			serverRestarting: boolean;
+		}>("/settings/tls/regenerate-ca", { method: "POST" }),
+	/**
+	 * Download the root CA certificate for importing into client devices.
+	 * Goes through `authorizedFetch` (session-gated route) and hands the bytes
+	 * to the browser as a Blob, matching `fsDownload`.
+	 */
+	downloadTlsCa: async () => {
+		const res = await authorizedFetch(`${BASE}/settings/tls/ca.pem`);
+		if (!res.ok) {
+			const error = await readFetchError(res, "CA download failed");
+			throw new ApiError(error.message, res.status, error.data);
+		}
+		return {
+			blob: await res.blob(),
+			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
+		};
+	},
 	addRetryRule: (data: { domain?: string; statusCode?: number; keyword?: string; note?: string }) =>
 		request<{ id: string }>("/settings/retry-rules", {
 			method: "POST",
@@ -183,6 +235,7 @@ export const settingsApi = {
 			terminalTheme: string;
 			terminalFontSize: number;
 			addSubagentToRecentTabs: boolean;
+			recentTabsGroupMode: "flat" | "directory";
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -222,6 +275,9 @@ export const settingsApi = {
 			navLayout: {
 				items: Array<{ id: string; hidden?: boolean }>;
 			};
+			narratorToolbarLayout: {
+				items: Array<{ id: string }>;
+			};
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -236,6 +292,7 @@ export const settingsApi = {
 		terminalTheme?: string;
 		terminalFontSize?: number;
 		addSubagentToRecentTabs?: boolean;
+		recentTabsGroupMode?: "flat" | "directory";
 		// Notification preferences
 		notifyOnDone?: boolean;
 		notifyOnWaiting?: boolean;
@@ -278,6 +335,11 @@ export const settingsApi = {
 		// the boundary — ids after it are tucked into the "More" menu)
 		navLayout?: {
 			items: Array<{ id: string; hidden?: boolean }>;
+		};
+		// Narrator header toolbar layout (same flat-ids + "__divider__" shape as
+		// navLayout; order is the user's priority, shared by desktop and mobile)
+		narratorToolbarLayout?: {
+			items: Array<{ id: string }>;
 		};
 	}) =>
 		request<ApiEntity>("/user-preferences", {
@@ -331,6 +393,16 @@ export const settingsApi = {
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/pin", {
 			method: "PATCH",
 			body: JSON.stringify({ key, pinned }),
+		}),
+	/**
+	 * Record the member order of ONE directory group. Writes only `dirSortOrder`, so it
+	 * cannot be replaced by a sequence of `moveRecentTab` calls: those rewrite the flat
+	 * recency order, which the `above_idle` auto-promote then overwrites.
+	 */
+	setRecentTabDirectoryOrder: (keys: string[]) =>
+		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/dir-order", {
+			method: "PATCH",
+			body: JSON.stringify({ keys }),
 		}),
 	clearRecentTabs: (scope: "all" | "projects" | "inactive_narrators", keepTabKey?: string) =>
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/clear", {

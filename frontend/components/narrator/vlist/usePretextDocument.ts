@@ -91,6 +91,9 @@ export interface UsePretextDocumentOptions {
 	 * The reference changes with the user/narrator/provider it depends on, which is
 	 * why folding it into buildOptions triggers a rebuild. */
 	canOfferProviderFix?: (errorText: string) => boolean;
+	/** Whether an error card may offer the model probe. Shares the fix's measured
+	 * button row, so the same rebuild contract applies. */
+	canOfferModelTest?: (errorText: string) => boolean;
 	/** Resolve a tool item's pending-permission presence (live WS list). Its
 	 * reference changes when the pending set changes, so folding it into
 	 * buildOptions triggers a document rebuild (cards expand / collapse). */
@@ -221,6 +224,13 @@ export interface UsePretextDocumentResult {
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
 	/**
+	 * Insert a mid-window structural marker (a segment-compact marker, or a custom
+	 * compact with a `beforeMessageId`) into the loaded window in place. Returns
+	 * false when the marker cannot be placed locally (duplicate, no seq, newer
+	 * than the loaded tail), so the caller falls back to a structural reload.
+	 */
+	insertMessage: (message: TreeMessage) => boolean;
+	/**
 	 * Drop deleted messages from the loaded window in place. Returns false when the
 	 * deletion cannot be applied locally (nothing loaded matches, or it would empty
 	 * the document), so the caller falls back to a structural reload.
@@ -329,6 +339,7 @@ export function usePretextDocument(
 			resolveToolSummary: options.resolveToolSummary,
 			resolveSubagentRecentSummary: options.resolveSubagentRecentSummary,
 			canOfferProviderFix: options.canOfferProviderFix,
+			canOfferModelTest: options.canOfferModelTest,
 			resolveHasPendingPermission: options.resolveHasPendingPermission,
 			// ⚠️ No `latestSpecTasksToolUseId` here, deliberately. The pinned tasks card
 			// is resolved by `buildPretextDocumentLayout` from the exact message list it
@@ -376,6 +387,8 @@ export function usePretextDocument(
 			// narrator's resolved provider does, and a card that gains (or loses) the
 			// button changes height.
 			options.canOfferProviderFix,
+			// Same reason: gaining or losing the probe button changes the card's height.
+			options.canOfferModelTest,
 			// Rebuild when the pending-permission set changes (its reference changes
 			// with the set), so cards expand/collapse as permissions come and go.
 			options.resolveHasPendingPermission,
@@ -639,6 +652,21 @@ export function usePretextDocument(
 			}) ?? false,
 		[coordinator, options.getCurrentView, options.isSubagent],
 	);
+	// Same live-view contract as appendMessage: the anchor is captured from the
+	// CURRENT scroll position at insert time, so a scroll in flight cannot desync
+	// it from the correction that follows.
+	const insertMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.insertMessage(message, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView],
+	);
 	// Both in-place history mutations read the view LIVE at patch time, the same
 	// contract as loadOlder / applyLivePatch / appendMessage: a scroll in flight must
 	// not desync the captured anchor from the correction that follows it.
@@ -720,6 +748,7 @@ export function usePretextDocument(
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		insertMessage,
 		removeMessages,
 		replaceMessage,
 		trimHead,

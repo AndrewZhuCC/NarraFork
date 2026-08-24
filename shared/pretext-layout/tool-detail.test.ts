@@ -250,6 +250,42 @@ describe("classifyToolDetail — read", () => {
 		});
 		expect(metaTexts(d)).toEqual(["/tmp/pic.png (12 KB, png)"]);
 	});
+	it("forwards intrinsic dimensions on a media ref (aspect-ratio reservation)", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, filePath: "/tmp/pic.png", width: 1600, height: 900 },
+		});
+		// The path meta row exists here, so the media cap sits inside a sections
+		// wrapper rather than being the unwrapped single body.
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1600);
+		expect(media.media?.height).toBe(900);
+		// The fixed estimate stays as the fallback signal; measure overrides it
+		// with the aspect fit when dims are present.
+		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
+	});
+	it("omits dimensions when only one side is present or they are invalid", () => {
+		const d = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, width: 1600 },
+		}) as ToolCappedDetail;
+		expect(d.media?.width).toBeUndefined();
+		expect(d.media?.height).toBeUndefined();
+		const bad = classifyToolDetail({
+			toolName: "Read",
+			category: "read",
+			inputJson: { file_path: "/tmp/pic.png" },
+			metadata: { isImage: true, width: 0, height: -3 },
+		}) as ToolCappedDetail;
+		expect(bad.media?.width).toBeUndefined();
+		expect(bad.media?.height).toBeUndefined();
+	});
 });
 
 describe("classifyToolDetail — file", () => {
@@ -521,6 +557,19 @@ describe("classifyToolDetail — webFetch", () => {
 			(s) => s.body.kind === "capped" && s.body.cap === "media",
 		)?.body as ToolCappedDetail;
 		expect(media.contentPx).toBe(MEDIA_IMAGE_CONTENT_PX);
+	});
+	it("forwards screenshot dimensions from the metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "WebFetch",
+			category: "webFetch",
+			inputJson: { mode: "screenshot" },
+			metadata: { previewUrl: "blob:x", width: 1280, height: 800 },
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1280);
+		expect(media.media?.height).toBe(800);
 	});
 	it("keeps the url link, mode badge and selector rows", () => {
 		const d = classifyToolDetail({
@@ -984,6 +1033,25 @@ describe("classifyToolDetail — share", () => {
 		expect(media.media?.previewUrl).toBe("/p/x");
 		expect(media.media?.filename).toBe("shot.png");
 	});
+	it("forwards preview image dimensions from the share metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "ShareFile",
+			category: "share",
+			metadata: {
+				downloadUrl: "/d/x",
+				preview: true,
+				previewUrl: "/p/x",
+				filename: "shot.png",
+				width: 2400,
+				height: 300,
+			},
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(2400);
+		expect(media.media?.height).toBe(300);
+	});
 	it("carries the download + copy-link ACTIONS and the metadata badges", () => {
 		const d = classifyToolDetail({
 			toolName: "ShareFile",
@@ -1121,6 +1189,19 @@ describe("classifyToolDetail — browser", () => {
 		expect(metaBadgeLabels(d)).toEqual(["screenshot", "s-1"]);
 		expect(metaRowsOf(d).rows.find((r) => r.href)?.href).toBe("https://x.dev");
 	});
+	it("forwards screenshot dimensions from the browser metadata", () => {
+		const d = classifyToolDetail({
+			toolName: "Browser",
+			category: "browser",
+			inputJson: { action: "screenshot", url: "https://x.dev" },
+			metadata: { previewUrl: "/p/x", sessionId: "s-1", width: 1440, height: 810 },
+		});
+		const media = asSections(d).sections.find(
+			(s) => s.body.kind === "capped" && s.body.cap === "media",
+		)?.body as ToolCappedDetail;
+		expect(media.media?.width).toBe(1440);
+		expect(media.media?.height).toBe(810);
+	});
 	it("returns error on failed browser action with no output", () => {
 		const d = classifyToolDetail({
 			toolName: "Browser",
@@ -1188,6 +1269,13 @@ describe("classifyToolDetail — taskOutput", () => {
 });
 
 describe("classifyToolDetail — plan deny feedback", () => {
+	/** The (unlabelled) feedback body of a denied plan. */
+	function denyBody(detail: ToolDetailData | null): ToolErrorDetail {
+		const found = asSections(detail).sections.find((s) => s.body?.kind === "error");
+		if (!found) throw new Error(`no feedback body in ${JSON.stringify(detail)}`);
+		return found.body as ToolErrorDetail;
+	}
+
 	it("keeps the denial feedback above the plan body", () => {
 		const d = classifyToolDetail({
 			toolName: "ExitPlanMode",
@@ -1195,8 +1283,135 @@ describe("classifyToolDetail — plan deny feedback", () => {
 			inputJson: { plan: "the plan" },
 			metadata: { denyFeedback: "needs more detail" },
 		});
-		expect((sectionBody(d, "error") as ToolErrorDetail).text).toBe("needs more detail");
+		expect(denyBody(d).text).toBe("needs more detail");
 		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// An "Error" heading would file the reviewer's own note under tool failures;
+	// the chunked PlanDetail prints it bare. `status: "fail"` is required for the
+	// column to be read at all, and without it this would pass because NO feedback
+	// section was produced rather than because the one produced is unlabelled.
+	it("leaves the feedback body unlabelled", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "needs more detail",
+		});
+		expect(denyBody(d).text).toBe("needs more detail");
+		expect(hasSection(d, "error")).toBe(false);
+	});
+
+	// `permissionDenyMessage` is a TOP-LEVEL tool-call column, NOT a `_metadata`
+	// key: enrichToolUseBlocks copies it onto the block itself. Reading only the
+	// metadata keys is why a plan denied with typed feedback rendered as a bare
+	// collapsed plan — the user's own words were dropped with no error anywhere.
+	it("reads the denial feedback from the top-level denyMessage field", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "split step 2 first",
+		});
+		expect(denyBody(d).text).toBe("split step 2 first");
+		expect((sectionBody(d, "plan") as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// The feedback is the reviewer's note back to the model, not a tool failure —
+	// the chunked PlanDetail paints it yellow, so the tone has to travel.
+	it("marks the feedback as a warning, not an error", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "split step 2 first",
+		});
+		expect(denyBody(d).tone).toBe("warning");
+	});
+
+	// A deny with NO feedback stores an English system placeholder. Presenting it
+	// would attribute a system string to the user, so it counts as "no feedback".
+	it("drops the system placeholder written when no feedback was typed", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "Permission denied by user",
+		});
+		expect(d?.kind).toBe("capped");
+		expect((d as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// `failReprocessedPendingPermission` DOES write this into the column (unlike the
+	// placeholder above, which only reaches `errorMessage`). Its detail text varies,
+	// so it is matched by prefix.
+	it("drops a reprocessing-failure message, whatever detail it carries", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			denyMessage: "Permission reprocessing failed: target narrator is frozen",
+		});
+		expect(d?.kind).toBe("capped");
+	});
+
+	// The column is NOT denial-only: narrator-permission stores `denyMessage ||
+	// feedbackText`, so an APPROVAL with a typed note lands in the same field (20 of
+	// this repository's 162 ExitPlanMode rows with the column set are approvals).
+	// Rendering those as denial feedback tells the reader their accepted plan was
+	// rejected — and the plan body is identical either way, so nothing else in the
+	// card contradicts it.
+	it("ignores the column on an APPROVED plan, where it holds approval feedback", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "success",
+			inputJson: { plan: "the plan" },
+			denyMessage: "批准。方案分析透彻",
+		});
+		expect(d?.kind).toBe("capped");
+		expect((d as ToolCappedDetail).text).toBe("the plan");
+	});
+
+	// A metadata copy (older rows / fixtures) still wins, so nothing regresses for
+	// payloads that already carried it there. Unlike the raw column, `denyFeedback`
+	// names a denial, so it is honoured without a status gate.
+	it("prefers a metadata copy over the top-level field", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			metadata: { denyFeedback: "from metadata" },
+			denyMessage: "from column",
+		});
+		expect(denyBody(d).text).toBe("from metadata");
+	});
+
+	// A denied call's `errorMessage` is the full "[计划模式] 用户拒绝了…" template,
+	// and `withErrorSection` appends it as a SECOND, red, "Error"-labelled section
+	// whenever `outputJson` is null — the same feedback twice, in two colours. Real
+	// denials always persist an output (`_text` + `_metadata`), which is the only
+	// reason it does not happen today; this pins the shape so the invariant is not
+	// left resting on another field being non-null.
+	it("shows the feedback exactly once on a realistic denied call", () => {
+		const d = classifyToolDetail({
+			toolName: "ExitPlanMode",
+			category: "plan",
+			status: "fail",
+			inputJson: { plan: "the plan" },
+			outputJson: { _text: "[计划模式] 用户拒绝了你的计划…", _metadata: { execDurationMs: 0 } },
+			denyMessage: "split step 2 first",
+			errorMessage: "[计划模式] 用户拒绝了你的计划，并附带以下反馈：split step 2 first",
+		});
+		const sections = asSections(d).sections;
+		expect(sections.map((s) => s.label)).toEqual([undefined, "plan"]);
+		expect(denyBody(d).text).toBe("split step 2 first");
 	});
 });
 

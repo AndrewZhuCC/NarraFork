@@ -127,6 +127,47 @@ describe("adaptSegment — user message", () => {
 		expect(data.attachments[0]!.uploadNarratorId).toBe("nar_1");
 	});
 
+	it("carries the intrinsic dimensions so measure can reserve the aspect box", () => {
+		const seg: AdapterSegment = {
+			kind: "message",
+			msg: {
+				id: "u3b",
+				role: "user",
+				narratorId: "nar_1",
+				contentJson: [
+					{
+						type: "image",
+						imageId: "img-2",
+						filename: "wide.png",
+						mediaType: "image/png",
+						width: 1200,
+						height: 100,
+					},
+				],
+			},
+		};
+		const data = adaptSegment(seg, CTX)[0]!.data as {
+			attachments: Array<Record<string, unknown>>;
+		};
+		expect(data.attachments[0]!.width).toBe(1200);
+		expect(data.attachments[0]!.height).toBe(100);
+		// A block without dimensions forwards null, not undefined, so the measure
+		// input shape is stable.
+		const noDims = adaptSegment(
+			{
+				kind: "message",
+				msg: {
+					id: "u3c",
+					role: "user",
+					contentJson: [{ type: "image", imageId: "img-3" }],
+				},
+			},
+			CTX,
+		)[0]!.data as { attachments: Array<Record<string, unknown>> };
+		expect(noDims.attachments[0]!.width).toBeNull();
+		expect(noDims.attachments[0]!.height).toBeNull();
+	});
+
 	it("prefers a block's own uploadNarratorId over the message narrator", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
@@ -1657,6 +1698,98 @@ describe("folded tool rows — drill-down payload", () => {
 	});
 
 	/**
+	 * An AGENT row drills into the SUBAGENT card, not the generic tool card.
+	 *
+	 * The bug this pins down: `isSubagent` was dropped when a tool-run folded into an
+	 * activity unit (hard-coded `false` while rebuilding the item), so every folded
+	 * Agent/Task/Send call built a `ToolCallData` payload — and the reader who opened
+	 * it got a title plus a raw input JSON dump instead of the badge row / recent
+	 * calls / prompt / result the very same call shows as a card at L3+.
+	 *
+	 * Silent by construction: a tool card renders any payload happily, so nothing
+	 * threw and the only signal was the card looking wrong.
+	 */
+	const agentTc = (id = "tu-a") => ({
+		toolName: "Agent",
+		toolUseId: id,
+		status: "success",
+		inputJson: { subagent_type: "explore", description: "trace the vlist path", prompt: "look" },
+		outputJson: { _text: "found it" },
+		_subagentActivity: {
+			subagentNarratorId: "child-1",
+			model: "kimi-2:k3",
+			latestToolCalls: [{ toolName: "Read", status: "success" }],
+		},
+	});
+
+	it("an expanded SUBAGENT row carries a subagent card, tagged by cardKind", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[
+				{
+					kind: "tool",
+					msg: msgWith([]),
+					blockIndex: 0,
+					tc: agentTc(),
+					isSubagent: true,
+				},
+			],
+			"act-1",
+			{ lod: 2, ...openRows("act-1", "tool-tu-a") },
+		);
+		const row = activityRows(spec)[0] as (Row & { cardKind?: string }) | undefined;
+		expect(row?.cardKind).toBe("subagent-card");
+		const card = row?.card as
+			| { agentType?: string; description?: string; prompt?: string; recentCallCount?: number }
+			| undefined;
+		// The SubagentCardData shape, from the same constructor the L3+ card uses.
+		expect(card?.agentType).toBe("explore");
+		expect(card?.description).toBe("trace the vlist path");
+		expect(card?.recentCallCount).toBe(1);
+		// And emphatically NOT the generic tool payload.
+		expect((card as { detail?: unknown } | undefined)?.detail).toBeUndefined();
+	});
+
+	it("an ordinary tool row stays a tool card (no cardKind tag)", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const spec = adaptActivityUnit(
+			[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: readTc() }],
+			"act-1",
+			{ lod: 2, ...openRows("act-1", "tool-tu-1") },
+		);
+		const row = activityRows(spec)[0] as (Row & { cardKind?: string }) | undefined;
+		// Absent rather than "tool-call": every pre-existing producer leaves it unset,
+		// and the measure layer treats absent as the tool card.
+		expect(row?.cardKind).toBeUndefined();
+		expect(row?.card?.toolName).toBe("Read");
+	});
+
+	/**
+	 * The prompt fold is keyed by the CARD (`tool-<toolUseId>`), the same channel the
+	 * standalone card uses — so a prompt opened inside a drilled-in row is still open
+	 * after an LOD change, and vice versa. Keying it by the TRACE would put the state
+	 * where the card never looks.
+	 */
+	it("reads the drilled-in card's prompt fold from the CARD's key", async () => {
+		const { adaptActivityUnit } = await import("./segment-adapter");
+		const build = (promptOpenKey: string) =>
+			adaptActivityUnit(
+				[{ kind: "tool", msg: msgWith([]), blockIndex: 0, tc: agentTc(), isSubagent: true }],
+				"act-1",
+				{
+					lod: 2,
+					...openRows("act-1", "tool-tu-a"),
+					isPromptOpen: (key: string) => key === promptOpenKey,
+				},
+			);
+		const opened = activityRows(build("tool-tu-a"))[0]?.card as { promptOpen?: boolean };
+		expect(opened.promptOpen).toBe(true);
+		// The trace's own key is NOT the channel.
+		const closed = activityRows(build("act-1"))[0]?.card as { promptOpen?: boolean };
+		expect(closed.promptOpen).toBeUndefined();
+	});
+
+	/**
 	 * A provider retry puts the same tool-use id in two persisted messages, and the
 	 * second row is suffixed (`tool-tu-1#1`) so the two cannot overlap. That suffixed
 	 * key is what the renderer paints and therefore what a click reports, so the
@@ -2077,6 +2210,81 @@ describe("adaptSegment — pending plan fallback", () => {
 				_planFile: ".narrafork/plan-portable-jukebox-parrot--cnz6sszhQubPv9s0.md",
 			});
 			expect(planDetail(seg, withPendingPlan)?.text).toBe(PLAN);
+		});
+	});
+
+	// ── Regression: a denied plan's reviewer feedback ──────────────────────────
+	//
+	// `permissionDenyMessage` is a TOP-LEVEL tool-call column (enrichToolUseBlocks
+	// copies it onto the block), not a `_metadata` key. The adapter used to forward
+	// only `_metadata`, so the classifier could never see it: a plan the user
+	// rejected WITH typed feedback rendered as a bare plan body and the feedback —
+	// the whole point of rejecting with a message — appeared nowhere on the vlist
+	// path. Asserted through `adaptSegment` (not the classifier alone) because the
+	// missing link was the forwarding, which a classifier-level test cannot catch.
+	describe("a denied plan's reviewer feedback", () => {
+		function planSeg(permissionDenyMessage: string | null, status = "fail"): AdapterSegment {
+			return {
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: false,
+						tc: {
+							toolName: "ExitPlanMode",
+							toolUseId: "tu-plan",
+							status,
+							inputJson: { plan: PLAN },
+							permissionDenyMessage,
+						},
+					},
+				],
+			};
+		}
+		const deniedSeg = (permissionDenyMessage: string | null) => planSeg(permissionDenyMessage);
+
+		function sections(seg: AdapterSegment) {
+			const spec = adaptSegment(seg, PLAN_CTX).find((s) => s.key === "tool-tu-plan");
+			return (spec?.data as { detail?: unknown })?.detail as {
+				kind?: string;
+				sections?: Array<{
+					label?: string;
+					body?: { kind?: string; text?: string; tone?: string };
+				}>;
+			} | null;
+		}
+
+		it("surfaces the feedback above the plan body", () => {
+			const detail = sections(deniedSeg("split step 2 first"));
+			expect(detail?.kind).toBe("sections");
+			// Unlabelled on purpose: an "Error" heading would file the reviewer's own
+			// note under tool failures (the chunked PlanDetail prints it bare).
+			const feedback = detail?.sections?.find((s) => s.body?.kind === "error");
+			expect(feedback?.label).toBeUndefined();
+			expect(feedback?.body?.text).toBe("split step 2 first");
+			const plan = detail?.sections?.find((s) => s.label === "plan");
+			expect(plan?.body?.text).toBe(PLAN);
+		});
+
+		it("tones the feedback as a warning, not a tool error", () => {
+			const detail = sections(deniedSeg("split step 2 first"));
+			expect(detail?.sections?.find((s) => s.body?.kind === "error")?.body?.tone).toBe("warning");
+		});
+
+		it("shows only the plan when the denial carried no feedback", () => {
+			// A feedback-less deny stores an English system placeholder; attributing
+			// it to the user would be worse than showing nothing.
+			expect(sections(deniedSeg("Permission denied by user"))?.kind).toBe("capped");
+			expect(sections(deniedSeg(null))?.kind).toBe("capped");
+		});
+
+		// The column is NOT denial-only — narrator-permission stores the note typed
+		// alongside an APPROVAL in the same place. The adapter forwards it either way
+		// (status travels with it), so this asserts the pair end to end: an approved
+		// plan must not grow a rejection notice above a plan that WAS accepted.
+		it("says nothing about a denial when the plan was APPROVED with feedback", () => {
+			expect(sections(planSeg("批准。方案分析透彻", "success"))?.kind).toBe("capped");
 		});
 	});
 });

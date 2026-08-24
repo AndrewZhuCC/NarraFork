@@ -1,6 +1,5 @@
 {
 	"appName": "NarraFork",
-	"narratorVirtualListToggle": "叙述者虚拟列表（默认开启，关闭则回到经典列表）",
 	"dashboard": "仪表盘",
 	"projects": "叙事线",
 	"narrators": "叙述者",
@@ -37,6 +36,12 @@
 	"revealInExplorer": "在资源管理器中打开",
 	"newNarratorHere": "在此目录新建叙述者",
 	"newNarratorHereNoDir": "无法确定该标签对应的目录",
+	"copyCwd": "复制工作目录",
+	"copyCwdNoDir": "无法确定该标签对应的工作目录",
+	"copyCwdSuccess": "已复制工作目录：{{path}}",
+	"copyCwdFailed": "复制工作目录失败",
+	"rename": "重命名",
+	"archive": "归档",
 	"totalOutputChars": "AI 输出总字符数",
 	"feedback": "反馈问题",
 	"requestDumpEnabledBadge": "Dump 已开启",
@@ -59,5 +64,14 @@
 	"emptyVisibleZone": "拖拽到此处显示",
 	"loadMoreRecentTabs": "加载更多",
 	"retryRecentTabs": "重试",
-	"recentTabsSyncError": "最近标签同步失败"
+	"recentTabsSyncError": "最近标签同步失败",
+	"recentTabsReorderFailed": "标签顺序保存失败",
+	"recentTabsGrouping": "标签分组方式",
+	"groupModeFlat": "平铺列表",
+	"groupModeDirectory": "按目录聚合",
+	"expandDirectory": "展开目录 {{path}}",
+	"collapseDirectory": "折叠目录 {{path}}",
+	"directoryNarratorCount": "该目录下有 {{count}} 个叙述者",
+	"directoryWorkingCount": "{{count}} 个正在运行",
+	"directoryAttentionCount": "{{count}} 个需要处理"
 }

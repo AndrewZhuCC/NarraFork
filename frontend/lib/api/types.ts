@@ -16,6 +16,77 @@ export type ChangelogEntry = {
 	date: string;
 } & LocalizedValue<string>;
 
+/** One Kimi usage window (5-hour / weekly / monthly) as cached by the server. */
+export interface KimiUsageWindow {
+	used: number | null;
+	limit: number | null;
+	remaining: number | null;
+	resetTime: string | null;
+}
+
+/** Per-provider Kimi (kimi.com / kimi.ai) usage cache entry. */
+export interface KimiUsageCache {
+	fiveHour: KimiUsageWindow | null;
+	weekly: KimiUsageWindow | null;
+	monthly: KimiUsageWindow | null;
+	extraWindows: Array<{ label: string } & KimiUsageWindow>;
+	fetchedAt: number;
+	error: string | null;
+}
+
+/**
+ * How a third-party component reaches the user — which is what determines our
+ * attribution obligations, not which `package.json` field listed it.
+ */
+export type LicenseEntryKind = "bundled" | "runtime" | "development";
+
+/** Where an entry's license text came from, so the page never overstates it. */
+export type LicenseTextSource = "package" | "spdx-template" | "missing";
+
+/**
+ * One third-party component, WITHOUT its license text.
+ *
+ * Texts are fetched individually by `textId`: the full set is ~1.1 MB against
+ * ~260 KB of metadata, and the page shows one at a time.
+ */
+export interface LicenseSummary {
+	name: string;
+	version: string;
+	/** The license we rely on. For dual-licensed components, the branch selected. */
+	license: string;
+	/** Upstream's raw disjunction, when a selection narrowed it. */
+	declaredLicense?: string;
+	/** Why that branch was selected. */
+	selectionReason?: string;
+	author: string;
+	repository: string;
+	kind: LicenseEntryKind;
+	textId?: string;
+	textSource: LicenseTextSource;
+	/** Present when the component ships a NOTICE file (Apache-2.0 §4(d)). */
+	noticeTextId?: string;
+	/**
+	 * How a bundled component reaches the user. Absent for npm packages, where
+	 * `dependencies` already answers it.
+	 */
+	distributedVia?: string;
+}
+
+/** A defect in the manifest, surfaced rather than swallowed. */
+export interface LicenseProblem {
+	severity: "error" | "warn";
+	name?: string;
+	message: string;
+}
+
+export interface LicenseManifestResponse {
+	entries: LicenseSummary[];
+	problems: LicenseProblem[];
+	generatedAt: number;
+	/** `filesystem` in development, `embedded` in a compiled binary. */
+	source: "filesystem" | "embedded" | "unavailable";
+}
+
 export interface LearningAction {
 	label: string;
 	description: string;
@@ -98,6 +169,23 @@ export interface StorageScanResult {
 	categories: StorageCategoryResult[];
 	totalBytes: number;
 	scannedAt: number;
+}
+
+/**
+ * Server-side background scan job state. The scan outlives the page that started
+ * it; clients poll this to observe progress and pick up the final result.
+ */
+export type StorageScanJobStatus = "idle" | "running" | "complete" | "error" | "cancelled";
+
+export interface StorageScanJobState {
+	status: StorageScanJobStatus;
+	progressMessage: string | null;
+	progressDetail: { done: number; total: number } | null;
+	categories: StorageCategoryResult[];
+	result: StorageScanResult | null;
+	error: string | null;
+	startedAt: number | null;
+	finishedAt: number | null;
 }
 
 export interface DatabaseCleanupCandidateSummary {
@@ -725,45 +813,6 @@ export interface PaginatedNarrators {
 	hasMore: boolean;
 	nextCursor: string | null;
 	totalCount: number;
-}
-
-// ── Chunk virtualization (manifest + range) ────────────────────────────────
-
-/** Decoded manifest entry (after expanding the compact wire tuple). */
-export interface ChunkManifestEntry {
-	/** = first message id in the chunk (stable across compact/seq shifts) */
-	id: string;
-	firstSeq: number;
-	lastSeq: number;
-	count: number;
-}
-
-/** Compact wire tuple: [id, firstSeq, lastSeq, count]. */
-export type ChunkManifestTuple = [string, number, number, number];
-
-export type ChunkManifest =
-	| { unchanged: true; messageVersion: number }
-	| {
-			unchanged: false;
-			messageVersion: number;
-			total: number;
-			/** Index of the first returned chunk within the full history. */
-			windowFirstIndex: number;
-			/** True when chunks older than the returned window exist. */
-			hasOlderChunks: boolean;
-			/** Compact tuples on the wire; decode with decodeChunkManifestTuple. */
-			chunks: ChunkManifestTuple[];
-	  };
-
-export interface ChunkRangeResult {
-	messages: TreeMessage[];
-	minSeq: number | null;
-	maxSeq: number | null;
-	hasOlder: boolean;
-	hasNewer: boolean;
-	messageVersion: number;
-	pruneBoundaryMessageId?: string | null;
-	prunedPercent?: number | null;
 }
 
 export interface PretextDocumentPageResult {

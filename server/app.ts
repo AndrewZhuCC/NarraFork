@@ -40,10 +40,12 @@ import { graphRoutes } from "./routes/graph";
 import { grokRoutes } from "./routes/grok";
 import { hookRoutes } from "./routes/hooks";
 import { integrationRoutes } from "./routes/integrations";
+import { kimiRoutes } from "./routes/kimi";
 import { kiroRoutes } from "./routes/kiro";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
+import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCardRoutes } from "./routes/model-cards";
 import { narratorRoutes } from "./routes/narrators";
@@ -71,6 +73,7 @@ import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
+import { tlsRoutes } from "./routes/tls";
 import { traitLayerRoutes } from "./routes/trait-layers";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
@@ -188,6 +191,10 @@ app.route("/api/shares", shareRoutes);
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
 
+// Public: third-party license attribution. Required to reach whoever receives the
+// software, and /licenses is linked from the login page.
+app.route("/api/licenses", licenseRoutes);
+
 // Public: remote executor binary download. A machine being enrolled has no
 // session yet, so this authorizes with a single-use, platform-bound ticket
 // issued from the admin-only device settings page.
@@ -284,6 +291,7 @@ app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
 app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
+app.route("/api/settings/tls", tlsRoutes);
 app.route("/api/learning", learningRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
@@ -303,6 +311,7 @@ app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);
 app.route("/api/kiro", kiroRoutes);
+app.route("/api/kimi", kimiRoutes);
 app.route("/api/openai", openaiRoutes);
 app.route("/api/codex", codexRoutes);
 app.route("/api/cline", clineRoutes);
