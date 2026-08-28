@@ -5474,6 +5474,7 @@ export function NarratorPanel({
 				text: composerText,
 				imageCount: attachedImages.length,
 				textFileCount: attachedTextFiles.length,
+				commentCount: commentDrafts.length,
 			}) ||
 			sendingRef.current
 		)
