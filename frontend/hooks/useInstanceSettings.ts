@@ -151,7 +151,10 @@ function makeDefaults(): InstanceSettingsState {
 		updateAutoDownload: false,
 		brandName: "",
 		brandIconColor: DEFAULT_BRAND_ICON_COLOR,
-		defaultModel: "kiro:claude-sonnet-4.5",
+		// Empty until the user picks one (see server defaults): no hardcoded
+		// fallback, so an unconfigured instance never displays a model the user
+		// never selected as if it were active.
+		defaultModel: "",
 		permissionMode: "acceptEdits",
 		summaryModel: "",
 		translationModel: "__summary__",
@@ -249,7 +252,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateAutoDownload: settings.update?.autoDownload ?? false,
 				brandName: settings.branding?.name ?? "",
 				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
-				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
+				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? ""),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
