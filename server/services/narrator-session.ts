@@ -221,7 +221,9 @@ import {
 	bufferedMessages,
 	claimNarratorRuntime,
 	clearActiveHistoryCompactPending,
+	clearPlanModePromptRebuild,
 	compactLocks,
+	consumePlanModePromptRebuild,
 	hasPendingHistoryCompact,
 	isNarratorRuntimeBusy,
 	knowledgeInjectionCycleStates,
@@ -250,7 +252,17 @@ interface PlannedUpdateRecoveryControl {
 	controller: AbortController;
 	onInterrupt?: (token: string) => void | Promise<void>;
 	interruptFinalizer: Promise<void> | null;
-	interruptForegroundSubagents: boolean;
+	/**
+	 * Subagents this recovery owner is waiting on, if any.
+	 *
+	 * A list rather than a flag because the recovery path re-drives a foreground
+	 * Agent through `resumeSubagent`, whose run signal is deliberately independent
+	 * of the parent — so nothing else can identify which subagents belong to it.
+	 * Empty means "this owner holds no subagent", which is the correct answer for
+	 * the Await batch: those awaits own only the parent-side wait, and the agents
+	 * they watch must keep running.
+	 */
+	foregroundSubagentIds: readonly string[];
 }
 
 export interface PlannedUpdateRecoveryRegistration {
@@ -269,7 +281,7 @@ export function registerPlannedUpdateRecoveryController(
 	narratorId: string,
 	controller: AbortController,
 	onInterrupt?: (token: string) => void | Promise<void>,
-	options: { interruptForegroundSubagents?: boolean; token?: string } = {},
+	options: { foregroundSubagentIds?: readonly string[]; token?: string } = {},
 ): PlannedUpdateRecoveryRegistration {
 	const token = options.token ?? randomUUID();
 	const control: PlannedUpdateRecoveryControl = {
@@ -277,7 +289,7 @@ export function registerPlannedUpdateRecoveryController(
 		controller,
 		onInterrupt,
 		interruptFinalizer: null,
-		interruptForegroundSubagents: options.interruptForegroundSubagents ?? false,
+		foregroundSubagentIds: options.foregroundSubagentIds ?? [],
 	};
 	plannedUpdateRecoveryControls.set(narratorId, control);
 	// These recovery stages drive a narrator with NO activeNarrators entry, yet they
@@ -306,10 +318,10 @@ export function registerPlannedUpdateRecoveryController(
 
 function interruptPlannedUpdateRecovery(narratorId: string): {
 	interrupted: boolean;
-	interruptForegroundSubagents: boolean;
+	foregroundSubagentIds: readonly string[];
 } {
 	const control = plannedUpdateRecoveryControls.get(narratorId);
-	if (!control) return { interrupted: false, interruptForegroundSubagents: false };
+	if (!control) return { interrupted: false, foregroundSubagentIds: [] };
 	control.controller.abort(new Error("Narrator interrupted by user"));
 	if (!control.interruptFinalizer) {
 		control.interruptFinalizer = Promise.resolve().then(() => control.onInterrupt?.(control.token));
@@ -322,7 +334,7 @@ function interruptPlannedUpdateRecovery(narratorId: string): {
 	});
 	return {
 		interrupted: true,
-		interruptForegroundSubagents: control.interruptForegroundSubagents,
+		foregroundSubagentIds: control.foregroundSubagentIds,
 	};
 }
 
@@ -1482,8 +1494,8 @@ async function maybeStartSpecContinuation(
 		// here (an earlier revision did) just made the prompt longer and self-repeating.
 		const prompt =
 			active.locale === "zh-CN"
-				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。`
-				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task: ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why.`;
+				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。改动 tasks.json 时先读取再就地修改，不要按本消息重写整个文件。`
+				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why. When you change tasks.json, read it first and edit in place; do not rewrite the file from this message.`;
 		const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 			{
 				type: "spec_blocked_continuation",
@@ -1529,10 +1541,14 @@ async function maybeStartSpecContinuation(
 	//
 	// Hence: state provenance, then enumerate the legitimate outcomes. The list must not be
 	// framed as "ways to END the turn" — "keep working" is one of the branches.
+	//
+	// It also names ONE task while tasks.json may hold many, so it says so. A model that
+	// reads this single line as the whole file concludes its other entries were lost and
+	// "restores" them by rewriting tasks.json — destroying the entries that were fine.
 	const prompt =
 		active.locale === "zh-CN"
-			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。${protectedNote}`
-			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task: ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.${protectedNote}`;
+			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}`
+			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}`;
 	const msg = await narratorService.persistSystemMessage(active.narratorId, prompt, [
 		{ type: "spec_continuation", task: current.text, protected: current.protected === true },
 	]);
@@ -2479,6 +2495,15 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			return rebuildHistoryForCurrentContext(null, true);
 		}
 
+		// Plan mode was toggled manually mid-pass. The rebuild carries TWO things the
+		// running turn cannot otherwise get: the plan-mode reminder (which only exists in
+		// the system prompt, fixed at pass start) and the row the toggle just persisted
+		// (the in-memory history was built before it existed). Without it the model is
+		// never told it entered plan mode while the permission gate already enforces it.
+		if (consumePlanModePromptRebuild(narratorId)) {
+			return rebuildHistoryForCurrentContext(getPruneBoundary(), true);
+		}
+
 		const row = await db.query.narrators.findFirst({
 			where: eq(narrators.id, narratorId),
 			columns: { pruneBoundaryMessageId: true },
@@ -2694,6 +2719,16 @@ export async function runAgentLoop(
 			// persisted boundary so the context stays within budget. When compactStart
 			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
 			// boundary left over from an earlier threshold configuration.
+			// A manual plan-mode toggle only needs to override the CURRENT pass, whose
+			// AgentConfig captured `freshNarrator` above. This pass just re-read the DB, so
+			// any live override is now redundant — and keeping it would make one manual
+			// toggle permanently shadow every other path that changes plan mode.
+			active._planModeLive = undefined;
+			active._relaxedPlanLive = undefined;
+			// The prompt this pass is about to build already reflects the toggled state, so a
+			// rebuild request raised before it is satisfied by construction.
+			clearPlanModePromptRebuild(narratorId);
+
 			const loopThresholds = getContextThresholds(resolved.model, resolved.provider);
 			const pruningWindowEnabled = isDynamicPruningWindowEnabled(loopThresholds);
 			active._pruneBoundaryMessageId = pruningWindowEnabled
@@ -2736,6 +2771,9 @@ export async function runAgentLoop(
 					defaultDeviceId: oauthRuntime?.defaultDeviceId ?? active._defaultDeviceId ?? null,
 					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
 				},
+				// Same reason as in rebuildSystemPrompt: a legacy plan path cannot be rebuilt
+				// from the identity, and the reminder must name the file the gate allows.
+				active._planFilePath,
 			);
 			active.systemPrompt = freshSystemPrompt;
 			active._usedCompactSummary = usedCompactSummary;
@@ -2828,6 +2866,13 @@ export async function runAgentLoop(
 						freshOAuthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
 						active._planFileId,
 						settings.agent.defaultSystemPrompt,
+						undefined,
+						// The reminder, the Write/Edit gate and ExitPlanMode resolution must all
+						// name the SAME file. A cycle resumed from the pre-`plans/` layout keeps a
+						// legacy path in `_planFilePath` that `buildPlanFileRelPath` cannot
+						// reconstruct from the identity alone, so passing it is what stops the
+						// model being told to write somewhere the gate then rejects.
+						active._planFilePath,
 					);
 					// NOTE: Do NOT set active.systemPrompt here — the returned value
 					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
@@ -2882,6 +2927,12 @@ export async function runAgentLoop(
 					active._planFileId = planState.planFileId;
 					active._planFilePath = planState.planFilePath;
 					active._previousPermissionMode = planState.previousPermissionMode;
+					// A manual toggle earlier in THIS pass may have left a live override behind.
+					// The DB now says plan mode is on, so the override has nothing left to
+					// correct — and a stale `false` here would keep the tool-description
+					// override released for a pass the model just put into plan mode.
+					active._planModeLive = undefined;
+					active._relaxedPlanLive = undefined;
 					if (!planState.wasPlanMode) {
 						broadcastToNarrator(narratorId, {
 							type: "plan_mode_changed",
@@ -2912,6 +2963,13 @@ export async function runAgentLoop(
 					active._planFileId = undefined;
 					active._planFilePath = undefined;
 					active._previousPermissionMode = undefined;
+					// Drop any live override from a manual toggle earlier in this pass. The DB is
+					// authoritative again from here, and this must not wait for the pass-start
+					// clear: the non-compact branch below aborts the loop, but the compact branch
+					// only aborts when there is plan text, so a stale `true` could otherwise keep
+					// plan mode applied to a pass the model just exited.
+					active._planModeLive = undefined;
+					active._relaxedPlanLive = undefined;
 					planModeAskedOnce.delete(narratorId);
 					// Plan mode is a trait overlay. Exiting it must not silently change the
 					// user's current permission policy. Still continue approval handling even
@@ -3171,14 +3229,25 @@ export async function runAgentLoop(
 				locale,
 				signal: active.abortController.signal,
 				chapterId: active._chapterId,
-				planMode: oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
+				// Plan mode can be toggled MANUALLY while this pass is running, so both flags
+				// are read live rather than frozen here. `_planModeLive`/`_relaxedPlanLive` are
+				// undefined until a toggle happens, in which case the pass-start DB snapshot
+				// applies; they are cleared at the top of every pass so the DB stays the truth.
+				get planMode() {
+					if (oauthRuntime) return false;
+					return active._planModeLive ?? isPlanModeTrait(freshNarrator.traits);
+				},
 				permissionMode: oauthRuntime?.permissionMode ?? freshNarrator.permissionMode ?? "default",
 				previousPermissionMode: oauthRuntime
 					? undefined
 					: (active._previousPermissionMode ?? freshNarrator.previousPermissionMode ?? undefined),
-				relaxedPlan: oauthRuntime
-					? false
-					: resolveEffectiveRelaxedPlan(freshNarrator.permissionMode, freshNarrator.relaxedPlan),
+				get relaxedPlan() {
+					if (oauthRuntime) return false;
+					return (
+						active._relaxedPlanLive ??
+						resolveEffectiveRelaxedPlan(freshNarrator.permissionMode, freshNarrator.relaxedPlan)
+					);
+				},
 				planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
 				planReflectionAutoApproveOverride: normalizeBooleanOverride(
 					freshNarrator.planReflectionAutoApproveOverride,
@@ -5687,7 +5756,11 @@ export async function retryLastMessage(
 		.limit(RETRY_TAIL_SCAN_LIMIT);
 
 	if (!tailRefs.length) {
-		throw new NotFoundError("No messages to retry", narratorId);
+		// A ValidationError, not a NotFoundError: the narrator exists and was found, it
+		// just has nothing to retry. Passing this sentence as a NotFoundError `entity`
+		// also fed it into the catalog's "{entity} not found: {id}" template, which in a
+		// localized UI produced "未找到No messages to retry：<id>".
+		throw new ValidationError("No messages to retry");
 	}
 
 	const tailMessages = await db.query.narratorMessages.findMany({
@@ -5706,16 +5779,15 @@ export async function retryLastMessage(
 
 	const resolved = resolveRetryTarget(orderedTail);
 	if (!resolved.target) {
-		throw new NotFoundError(
+		throw new ValidationError(
 			resolved.reason === "empty" ? "No messages to retry" : "Last message is not a user message",
-			narratorId,
 		);
 	}
 	const lastMsg = resolved.target;
 
 	const prompt = lastMsg.contentText ?? "";
 	if (!prompt.trim()) {
-		throw new NotFoundError("Last user message has no text", narratorId);
+		throw new ValidationError("Last user message has no text");
 	}
 
 	if (resolved.emptyAssistantIds.length > 0) {
@@ -6814,7 +6886,10 @@ async function editAndRegenerateUnlocked(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "user") {
-		throw new NotFoundError("Can only edit user messages", messageId);
+		// The message was found; the request is what is wrong. As a NotFoundError this
+		// sentence became the catalog's `{entity}` and rendered as "未找到Can only edit
+		// user messages：<id>" once a translation existed.
+		throw new ValidationError("Can only edit user messages");
 	}
 
 	const narrator = await narratorService.getById(narratorId);
@@ -7173,7 +7248,7 @@ export async function editAssistantMessage(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
-		throw new NotFoundError("Can only edit assistant messages", messageId);
+		throw new ValidationError("Can only edit assistant messages");
 	}
 
 	const newContentJson = buildEditedAssistantContentJson(targetMsg.contentJson, newContent);
@@ -7242,7 +7317,7 @@ export async function restoreAssistantMessage(
 	});
 	if (!targetMsg) throw new NotFoundError("Message", messageId);
 	if (targetMsg.role !== "assistant") {
-		throw new NotFoundError("Can only restore assistant messages", messageId);
+		throw new ValidationError("Can only restore assistant messages");
 	}
 
 	// Nothing to restore if the message was never edited.
@@ -7649,12 +7724,18 @@ export function interruptNarrator(narratorId: string): boolean {
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
 	active?.abortController.abort();
-	// A recovered Send await owns only the parent-side wait; interrupting it must not stop
-	// the target task. Fan out only for a live parent loop or a recovered foreground Agent.
-	if (active || recovery.interruptForegroundSubagents) {
+	// Stopping this narrator cancels the Agent tool calls of its current turn, and the
+	// subagents those calls own must stop with them. The fan-out is what settles their
+	// DB/UI state; membership is decided inside, per aborted tool call, so a subagent the
+	// user is driving from its own panel (independent run signal, nobody's pending tool
+	// call) is not swept up. A recovered Send await owns only the parent-side wait, so it
+	// contributes no ids; a recovered foreground Agent names the subagent it re-drove,
+	// because that continuation's signal is deliberately not this narrator's.
+	if (active || recovery.foregroundSubagentIds.length > 0) {
+		const explicitSubagentIds = recovery.foregroundSubagentIds;
 		import("./narrator-subagent")
 			.then(({ interruptForegroundSubagentsForParent }) =>
-				interruptForegroundSubagentsForParent(narratorId),
+				interruptForegroundSubagentsForParent(narratorId, explicitSubagentIds),
 			)
 			.catch((err) => {
 				logger.warn("Failed to interrupt foreground subagents", {

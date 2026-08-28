@@ -1,4 +1,5 @@
 import { notifications } from "@mantine/notifications";
+import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
@@ -34,6 +35,9 @@ export interface InstanceSettingsState {
 	updateServerUrl: string;
 	updateChannel: "stable" | "beta";
 	updateAutoDownload: boolean;
+	// Branding — empty name means "use the NarraFork default".
+	brandName: string;
+	brandIconColor: string;
 	// Agent / Models
 	defaultModel: string;
 	permissionMode: string;
@@ -147,6 +151,8 @@ function makeDefaults(): InstanceSettingsState {
 		updateServerUrl: "",
 		updateChannel: "stable",
 		updateAutoDownload: false,
+		brandName: "",
+		brandIconColor: DEFAULT_BRAND_ICON_COLOR,
 		defaultModel: "kiro:claude-sonnet-4.5",
 		permissionMode: "acceptEdits",
 		summaryModel: "",
@@ -187,7 +193,7 @@ function makeDefaults(): InstanceSettingsState {
 		autoCompactKeepPairs: 2,
 		autoCompactPruneThreshold: 80,
 		minPruneRatio: 30,
-		queueDuringCompaction: false,
+		queueDuringCompaction: true,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
 		routerModels: [],
@@ -244,6 +250,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				updateServerUrl: settings.update?.serverUrl ?? "",
 				updateChannel: settings.update?.channel ?? "stable",
 				updateAutoDownload: settings.update?.autoDownload ?? false,
+				brandName: settings.branding?.name ?? "",
+				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? "kiro:claude-sonnet-4.5"),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
@@ -296,7 +304,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				autoCompactPruneThreshold: settings.agent?.autoCompactPruneThreshold ?? 80,
 				minPruneRatio: settings.agent?.minPruneRatio ?? 30,
-				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? false,
+				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				routerModels: settings.agent?.routerModels ?? [],
@@ -366,6 +374,13 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					},
 				},
 				paths: { defaultProjectDir: state.projectDir },
+				branding: {
+					// "" is meaningful for both fields ("clear it"), so they are always
+					// sent. Omitting a key would be read as "leave unchanged" by the
+					// server's `.partial()` schema, making a custom name unremovable.
+					name: state.brandName.trim(),
+					iconColor: state.brandIconColor === DEFAULT_BRAND_ICON_COLOR ? "" : state.brandIconColor,
+				},
 				agent: {
 					defaultModel: state.defaultModel,
 					defaultPermissionMode: state.permissionMode,
@@ -459,6 +474,10 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				onSuccess: (data) => {
 					serverSnapshot.current = normalizedState;
 					setState(normalizedState);
+					// Branding is served by its own public endpoint with a long staleTime,
+					// so the tab title / favicon / header would keep the previous values
+					// until the next full page load without an explicit invalidation.
+					void qc.invalidateQueries({ queryKey: ["branding"] });
 					const resp = data as {
 						serverRestarting?: boolean;
 						manualRestartRequired?: boolean;

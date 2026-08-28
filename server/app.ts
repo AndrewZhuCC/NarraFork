@@ -6,7 +6,8 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { db } from "./db";
 import { users } from "./db/schema";
-import { buildAppErrorResponse } from "./lib/app-error-response";
+import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
+import { catalogError } from "./lib/errors";
 import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { getRuntimeEnvironment } from "./lib/platform";
@@ -18,6 +19,7 @@ import { adminRoutes } from "./routes/admin";
 import { anthropicRoutes } from "./routes/anthropic";
 import { authRoutes } from "./routes/auth";
 import { benchmarkRoutes } from "./routes/benchmarks";
+import brandingRoutes from "./routes/branding";
 import changelogRoutes from "./routes/changelog";
 import chapterEdgeRoutes from "./routes/chapter-edges";
 import { chapterRoutes } from "./routes/chapters";
@@ -75,6 +77,7 @@ import { storageRoutes } from "./routes/storage";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
 import { traitLayerRoutes } from "./routes/trait-layers";
+import { tutorialRoutes } from "./routes/tutorial";
 import { updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
@@ -191,6 +194,12 @@ app.route("/api/shares", shareRoutes);
 // Public: changelog (no sensitive data)
 app.route("/api/changelog", changelogRoutes);
 
+// Public: per-instance branding (name, icon colour, recoloured icons). Must be
+// readable before login — the login page and the browser tab are exactly where a
+// user needs to tell two instances apart. Exposes only a display name and a hex
+// colour; see that route's header.
+app.route("/api/branding", brandingRoutes);
+
 // Public: third-party license attribution. Required to reach whoever receives the
 // software, and /licenses is linked from the login page.
 app.route("/api/licenses", licenseRoutes);
@@ -259,6 +268,10 @@ const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
 	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
 	// back to database records, so they are intentionally not blocked here.
 	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
+	// Starting a tutorial lesson provisions the sandbox with git init + a commit.
+	// Only the start path: browsing the catalog and reading progress are database
+	// -only, and a user without git should still be able to read the lessons.
+	{ methods: ["POST"], pattern: /^\/api\/tutorial\/[^/]+\/start$/ },
 ];
 
 function requiresGit(method: string, path: string): boolean {
@@ -273,13 +286,9 @@ app.use("/api/*", async (c, next) => {
 	const path = c.req.path;
 	if (!requiresGit(c.req.method, path)) return next();
 	if (gitAvailable || recheckGit()) return next();
-	return c.json(
-		{
-			error: "Git is not installed. Please install git and retry this Git-dependent action.",
-			code: "GIT_NOT_INSTALLED",
-		},
-		503,
-	);
+	// Routed through the catalog so this reaches the user in their language like any other
+	// error, instead of being the one hand-written English body in the request pipeline.
+	throw catalogError("GIT_NOT_INSTALLED");
 });
 
 app.route("/api/projects", projectRoutes);
@@ -293,6 +302,7 @@ app.route("/api/terminals", terminalRoutes);
 app.route("/api/settings", settingsRoutes);
 app.route("/api/settings/tls", tlsRoutes);
 app.route("/api/learning", learningRoutes);
+app.route("/api/tutorial", tutorialRoutes);
 app.route("/api/admin", adminRoutes);
 app.route("/api/search", searchRoutes);
 app.route("/api/mcp", mcpRoutes);
@@ -354,7 +364,13 @@ app.onError((err, c) => {
 	const knownErrorResponse = buildAppErrorResponse(err, c);
 	if (knownErrorResponse) return knownErrorResponse;
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
-	return c.json({ error: "Internal server error" }, 500);
+	// The message stays deliberately generic (an unhandled error may quote internals), but it
+	// still carries a code so the client can localize it rather than print English.
+	//
+	// Built through the catalog rather than as an object literal: a literal's `messageCode`
+	// is just a string to TypeScript, so a typo would compile, and the client discards an
+	// unknown code silently — the only symptom would be English text in a localized UI.
+	return c.json(toErrorPayload(catalogError("INTERNAL_ERROR")), 500);
 });
 
 export { app };

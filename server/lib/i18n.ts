@@ -640,13 +640,17 @@ Continue investigating or refining the plan there, then call ExitPlanMode to sub
 	// rule verbatim) — the model read them at position zero and will read them again on
 	// the next request, so restating them here is pure repetition. The turn-end
 	// continuation prompts are a separate, rarer surface and may be as long as needed.
+	// ⚠️ The heading must say "excerpt". This digest lists at most 4 tasks selected by
+	// `buildSpecTaskDigestBody`; a longer list is silently cut. Read as the full file, a
+	// model concludes its own entries went missing and "restores" them by overwriting
+	// tasks.json with just these lines — which really does destroy the rest.
 	"sidecar.tasksCurrentHeading": {
-		en: "Dynamic Spec — open tasks (spec://tasks.json):",
-		"zh-CN": "Dynamic Spec 当前任务（spec://tasks.json）：",
+		en: "Dynamic Spec — excerpt of open tasks (not the full list; read spec://tasks.json for all of it):",
+		"zh-CN": "Dynamic Spec 当前任务节选（非完整列表，完整内容见 spec://tasks.json）：",
 	},
 	"sidecar.tasksCurrentUpdateNote": {
-		en: "Update spec://tasks.json if any state changed.",
-		"zh-CN": "状态有变化就更新 spec://tasks.json。",
+		en: "Update spec://tasks.json if any state changed. Edit it in place; do not rewrite the file from this excerpt.",
+		"zh-CN": "状态有变化就更新 spec://tasks.json。请就地修改，不要按本节选重写整个文件。",
 	},
 	"sidecar.tasksEmptyHeading": {
 		en: "Dynamic Spec — no open tasks.",

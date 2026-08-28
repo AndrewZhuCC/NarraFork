@@ -1,7 +1,12 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+	isWriteAudienceAllowed,
+	type NarratorVisibility,
+	type NarratorWriteAudience,
+} from "@shared/narrator-access";
 import { foldHandle } from "@shared/narrator-handle";
-import { and, eq, inArray, isNotNull, notInArray, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
 	apiRequests,
@@ -76,6 +81,7 @@ import {
 	type Locale,
 } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL, resolveEffectiveModel, settings } from "../lib/settings";
+import { escapeLikeNeedle } from "../lib/sql-like";
 import {
 	contentJsonHasImageBlocks,
 	deleteNarratorUploads,
@@ -102,6 +108,7 @@ import { integrationResourceBindingService } from "./integration-resource-bindin
 import {
 	assertNarratorAccess,
 	defaultVisibilityForNarrator,
+	defaultWriteAudienceForNarrator,
 	type NarratorAccessNeed,
 } from "./narrator-acl";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
@@ -131,6 +138,29 @@ export { narratorPersistence } from "./narrator-persistence";
  */
 const REFS_INSERT_BATCH = 500;
 const MAX_INHERITED_FULL_FORK_REFS = 500;
+
+/**
+ * Cap for the "and N more" figure reported by `listSubagentsForTeamView`.
+ *
+ * An exact remainder would be an unbounded `COUNT(*)` over a table that grows for
+ * the whole lifetime of a session; past this point "500+" tells the caller the
+ * same thing an exact number would.
+ */
+const TEAM_VIEW_OMITTED_COUNT_CAP = 500;
+
+/**
+ * The narrator columns a team listing renders. Deliberately narrower than the
+ * full row: `systemPrompt` / `contextSummary` are large and unused by any listing,
+ * and `traits` is needed only because it carries the alias a label resolves from.
+ */
+export interface TeamViewSubagent {
+	id: string;
+	title: string | null;
+	traits: string[];
+	variant: string;
+	status: string;
+	createdAt: string;
+}
 
 /**
  * A history compact marker is transient while its block is `compacting` (or
@@ -308,6 +338,11 @@ export interface CreateNarratorInput {
 	 * created: private for standalone, project for chapter-bound.
 	 */
 	visibility?: "private" | "project" | "public";
+	/**
+	 * Write audience. Omitted means the default for the kind of narrator being
+	 * created: owner-only for standalone, project for chapter-bound.
+	 */
+	writeAudience?: "owner" | "project" | "public";
 }
 
 interface CreateSubagentInput {
@@ -1142,6 +1177,35 @@ export interface PreparedNarratorCreation {
 	handleFold: string | null;
 }
 
+/**
+ * Settle the two audience columns for a new narrator, keeping the pair legal.
+ *
+ * The write audience is nested inside the read audience (see
+ * `@shared/narrator-access`), so it is derived from whichever visibility actually
+ * takes effect rather than from the chapter id independently — otherwise a caller
+ * passing an explicit `visibility: "private"` would silently get a `project` write
+ * audience, which is exactly the lying-column state this nesting removes.
+ *
+ * An explicitly supplied pair is validated rather than clamped: reaching here with an
+ * illegal combination means a caller constructed it in code, which is a bug to
+ * surface, not a user action to accommodate.
+ */
+function resolveNarratorAudiences(
+	visibility: NarratorVisibility | undefined,
+	writeAudience: NarratorWriteAudience | undefined,
+	chapterId: string | null | undefined,
+): { visibility: NarratorVisibility; writeAudience: NarratorWriteAudience } {
+	const effectiveVisibility = visibility ?? defaultVisibilityForNarrator(chapterId);
+	const effectiveWriteAudience =
+		writeAudience ?? defaultWriteAudienceForNarrator(effectiveVisibility);
+	if (!isWriteAudienceAllowed(effectiveVisibility, effectiveWriteAudience)) {
+		throw new ValidationError(
+			`Write audience "${effectiveWriteAudience}" is wider than visibility "${effectiveVisibility}"`,
+		);
+	}
+	return { visibility: effectiveVisibility, writeAudience: effectiveWriteAudience };
+}
+
 export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
 ): Promise<PreparedNarratorCreation> {
@@ -1282,7 +1346,7 @@ export async function prepareNarratorCreation(
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
 			ownerUserId: input.ownerUserId ?? null,
-			visibility: input.visibility ?? defaultVisibilityForNarrator(chapterId),
+			...resolveNarratorAudiences(input.visibility, input.writeAudience, chapterId),
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
@@ -1399,11 +1463,26 @@ export const narratorService = {
 				parentNarratorId: input.parentNarratorId,
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
-				// A subagent is part of its parent's work, so it inherits both halves of
-				// access control verbatim. Anything else would either hide a subagent from
-				// the person driving the parent, or expose a private session's subtasks.
+				// A subagent is part of its parent's work, so its access is DELEGATED to the
+				// root rather than copied: `acl_root_narrator_id` is the only thing consulted
+				// when deciding who may read or drive it. That is what makes a later sharing
+				// change on the main session reach its subagents — there is nothing to
+				// propagate, because there is no copy. Copying used to be the approach, and
+				// sharing a parent afterwards silently left its subagents unreachable.
+				//
+				// Nested subagents point at the same root, so the chain is never walked on a
+				// decision path.
+				aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+				// Kept because "whose work is this" is still read for listings, attribution
+				// and user deletion — it just no longer decides access.
 				ownerUserId: parent.ownerUserId,
-				visibility: parent.visibility,
+				// Frozen at their strictest values ON PURPOSE, not copied from the parent.
+				// Delegation means these are never consulted, and a copy that cannot follow
+				// the root is a trap: any future code path that reads them instead of the
+				// judged row would get a stale snapshot that may be WIDER than the root.
+				// Pinning them here makes such a mistake fail closed instead of leaking.
+				visibility: "private",
+				writeAudience: "owner",
 				inheritMode: "fresh",
 				status: "working",
 				createdAt: now,
@@ -1421,12 +1500,101 @@ export const narratorService = {
 
 	/**
 	 * List all subagents belonging to a parent narrator.
+	 *
+	 * Unbounded on purpose: selector resolution (`Send`, `Await`, `ContextAsk`)
+	 * needs to see every candidate or it would report "no such subagent" for one
+	 * that exists. Callers that only DISPLAY the team must use
+	 * `listSubagentsForTeamView`, which is bounded.
 	 */
 	async listSubagentsByParent(parentNarratorId: string) {
 		return db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, parentNarratorId),
 			orderBy: (n, { asc }) => [asc(n.createdAt)],
 		});
+	},
+
+	/**
+	 * Bounded team listing for display, ordered by usefulness rather than by age.
+	 *
+	 * A narrator that keeps working keeps spawning subagents, and unlike background
+	 * task rows these are never reaped — so the full list grows for the lifetime of
+	 * the session. `TeamStatus` printed all of it into the model's context.
+	 *
+	 * Ordering is `active first, then most recent`: `working`/`waiting` members are
+	 * what a coordination question is actually about, and among the rest the newest
+	 * are the ones the caller just launched. Plain `createdAt` ordering buries a
+	 * still-running agent under dozens of finished ones as soon as the team is
+	 * larger than the limit. The same ordering applies to a search, so `omitted`
+	 * stays a correct remainder for the rows actually shown.
+	 *
+	 * `query` matches title / alias traits / id prefix — the same handles the
+	 * listing prints, so a member found by name can be addressed by that name.
+	 *
+	 * Only the display columns are selected: the full row carries `systemPrompt` and
+	 * `contextSummary`, which can be large and which no listing renders.
+	 *
+	 * `omitted` is capped: an exact remainder would be an unbounded `COUNT(*)` on
+	 * the very table this method exists to stop scanning.
+	 */
+	async listSubagentsForTeamView(input: {
+		parentNarratorId: string;
+		limit: number;
+		query?: string;
+	}): Promise<{
+		subagents: TeamViewSubagent[];
+		omitted: number;
+		omittedCapped: boolean;
+	}> {
+		const limit = Math.max(1, Math.trunc(input.limit));
+		const needle = escapeLikeNeedle(input.query);
+		const conditions = [eq(narrators.parentNarratorId, input.parentNarratorId)];
+		if (needle) {
+			const like = `%${needle}%`;
+			const match = or(
+				sql`${narrators.title} LIKE ${like} ESCAPE '\\'`,
+				// Aliases live in the traits JSON array as `subagent-alias:<slug>`; a
+				// LIKE over the raw JSON text is enough for a display filter and needs
+				// no json1 table function.
+				sql`${narrators.traits} LIKE ${like} ESCAPE '\\'`,
+				sql`${narrators.id} LIKE ${`${needle}%`} ESCAPE '\\'`,
+			);
+			if (match) conditions.push(match);
+		}
+		const where = and(...conditions);
+		// Active members first. A CASE rather than a status filter so both groups come
+		// back in one query and one ordering — and NOT a bare `sql\`1\``, which SQLite
+		// reads as the ordinal of the first selected column.
+		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
+
+		const rows = await db
+			.select({
+				id: narrators.id,
+				title: narrators.title,
+				traits: narrators.traits,
+				variant: narrators.variant,
+				status: narrators.status,
+				createdAt: narrators.createdAt,
+			})
+			.from(narrators)
+			.where(where)
+			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+			.limit(limit)
+			.all();
+
+		const remainder = await db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(where)
+			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+			.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
+			.offset(rows.length)
+			.all();
+
+		return {
+			subagents: rows,
+			omitted: Math.min(remainder.length, TEAM_VIEW_OMITTED_COUNT_CAP),
+			omittedCapped: remainder.length > TEAM_VIEW_OMITTED_COUNT_CAP,
+		};
 	},
 
 	async persistSubagentUserMessage(
@@ -1832,9 +2000,12 @@ export const narratorService = {
 					behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 					parentNarratorId,
 					// A fork carries the parent's history, so it must not be reachable by a
-					// wider audience than the parent was.
+					// wider audience than the parent was. Both axes are copied, not delegated:
+					// a fork is an independent session (`type: "primary"`), and its owner must
+					// be able to re-share it without the origin's settings overriding them.
 					ownerUserId: parent.ownerUserId,
 					visibility: parent.visibility,
+					writeAudience: parent.writeAudience,
 					inheritMode: "full",
 					status: "idle",
 					title: opts?.title ?? null,
@@ -2024,10 +2195,11 @@ export const narratorService = {
 					parentNarratorId,
 					forkMessageId: null,
 					// Same rule as forkFromMessages: inherited history keeps the parent's
-					// audience. When the fork lands in a chapter it is at least
+					// audiences, both of them. When the fork lands in a chapter it is at least
 					// project-visible anyway, so inheriting can only narrow, never widen.
 					ownerUserId: parent.ownerUserId,
 					visibility: parent.visibility,
+					writeAudience: parent.writeAudience,
 					inheritMode,
 					apiConversationId,
 					contextSummary,
@@ -2509,9 +2681,12 @@ export const narratorService = {
 				behaviorFenceAttachOverride: normalizeBooleanOverride(parent.behaviorFenceAttachOverride),
 				title: opts?.title ?? undefined,
 				// A tool-initiated fork belongs to whoever owns the session that spawned
-				// it — the model has no identity of its own to attribute it to.
+				// it — the model has no identity of its own to attribute it to. Both
+				// audiences come along so the fork is never reachable more widely than
+				// the session it came from.
 				ownerUserId: parent.ownerUserId,
 				visibility: parent.visibility,
+				writeAudience: parent.writeAudience,
 			});
 			eventBus.emit({
 				type: "narrator:forked",

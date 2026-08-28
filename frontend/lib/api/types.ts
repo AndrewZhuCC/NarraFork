@@ -6,10 +6,23 @@ export type {
 
 import type { TextCitation } from "@shared/citations";
 import type { LocalizedValue } from "@shared/i18n-locales";
+import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import type {
+	TutorialLesson,
+	TutorialLessonSummary,
+	TutorialTrack,
+} from "@shared/tutorial/lessons";
 
 export type { TextCitation } from "@shared/citations";
 export type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+export type {
+	TutorialCompletion,
+	TutorialLesson,
+	TutorialLessonSummary,
+	TutorialStep,
+	TutorialTrack,
+} from "@shared/tutorial/lessons";
 
 export type ChangelogEntry = {
 	version: string;
@@ -24,14 +37,26 @@ export interface KimiUsageWindow {
 	resetTime: string | null;
 }
 
-/** Per-provider Kimi (kimi.com / kimi.ai) usage cache entry. */
+/**
+ * Per-provider Kimi (kimi.com / kimi.ai) usage cache entry.
+ *
+ * `GET /api/kimi/usages` is readable by any signed-in user, but the upstream error text
+ * is not: it is verbatim provider output about the deployment's own account and can
+ * contain a key fragment or an internal URL, so the server sends `error` only to admins
+ * and everyone else gets `hasError`. Both fields are optional here because a given
+ * response carries exactly one of them — read them through `kimiUsageFailed()` rather
+ * than testing `error` directly, or a non-admin's failed fetch reads as a successful one.
+ */
 export interface KimiUsageCache {
 	fiveHour: KimiUsageWindow | null;
 	weekly: KimiUsageWindow | null;
 	monthly: KimiUsageWindow | null;
 	extraWindows: Array<{ label: string } & KimiUsageWindow>;
 	fetchedAt: number;
-	error: string | null;
+	/** Admin-only: the upstream failure text. Absent for non-admins. */
+	error?: string | null;
+	/** Non-admin substitute for `error`: that it failed, without saying how. */
+	hasError?: boolean;
 }
 
 /**
@@ -128,6 +153,42 @@ export interface LearningIndexResponse {
 
 export interface LearningSearchResponse {
 	results: LearningDocSummary[];
+}
+
+// --- Interactive tutorial ---
+//
+// The lesson/step shapes are imported from `@shared/tutorial/lessons` rather than
+// redeclared: the server serialises exactly those types, and a second copy here is
+// how a field silently stops being rendered after the shared one changes.
+
+export interface TutorialIndexResponse {
+	tracks: TutorialTrack[];
+	lessons: TutorialLessonSummary[];
+	progress: Record<string, TutorialLessonProgress>;
+	sandbox: { exists: boolean; projectId: string | null };
+}
+
+export interface TutorialLessonResponse {
+	lesson: TutorialLesson;
+	progress: TutorialLessonProgress | null;
+}
+
+export interface TutorialLessonSessionResponse {
+	lessonId: string;
+	narratorId: string;
+	projectId: string | null;
+	chapterId: string | null;
+}
+
+export interface TutorialLessonProgress {
+	completedStepIds: string[];
+	completedAt?: string;
+}
+
+export interface TutorialSandboxStatus {
+	exists: boolean;
+	projectId: string | null;
+	gitPath: string;
 }
 
 export interface SearchFallback {
@@ -435,6 +496,13 @@ export interface SubagentActivitySummary {
 	/** Effective tier, already resolving a null narrator override through the global default. */
 	reasoningEffort?: string | null;
 	latestToolCalls: SubagentToolCallHeader[];
+	/**
+	 * The child is TAKEN OVER by the user (the parent's call is blocked until the
+	 * user stops it). Carried on the snapshot because the snapshot is the reconnect
+	 * catch-up channel — without it, a client reconnecting mid-takeover would keep
+	 * rendering a plain "running" card.
+	 */
+	takenOver?: boolean;
 }
 
 export interface SubagentActivityCatchUp {
@@ -506,6 +574,18 @@ export interface BaseContentBlock {
 	 * for why it is kept out of `_metadata`.
 	 */
 	_awaitAgentNarratorId?: string;
+	/**
+	 * The subagent this call is waiting on is currently TAKEN OVER by the user, so
+	 * the call is blocked until the takeover is stopped.
+	 *
+	 * Server-DERIVED runtime state (`TAKEN_OVER_FIELD` in
+	 * server/services/await-agent-resolution.ts), deliberately kept out of
+	 * `_metadata`: it must not reach the detail classifier, which would turn it into
+	 * an extra row and grow the card. Painted as a badge in the already-fixed header
+	 * row instead. Takeover authority is in-memory server-side, so this flag simply
+	 * stops appearing after a restart.
+	 */
+	_takenOver?: boolean;
 	/** Source citations on assistant text blocks, indexed against `text`. */
 	citations?: TextCitation[];
 	[key: string]: unknown;
@@ -547,6 +627,8 @@ export interface ToolCallRecord {
 	createdAt?: string | number | null;
 	/** Lightweight latest activity for Agent/Task/Send subagent cards. */
 	_subagentActivity?: SubagentActivitySummary;
+	/** See `BaseContentBlock._takenOver`. */
+	_takenOver?: boolean;
 }
 
 export type PathFlavor = "posix" | "windows";
@@ -1063,12 +1145,14 @@ export interface CodexUsageSchedulerSnapshot {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Read audience of a narrator.
- * - private: owner + explicitly granted users
- * - project: everyone working on the owning chapter's project
- * - public:  every signed-in user (also what pre-ACL narrators were migrated to)
+ * The two narrator audiences, re-exported from the shared module that also carries the
+ * nesting rule between them (`WRITE_AUDIENCE_BY_VISIBILITY`).
+ *
+ * Defined there rather than here so the panel greys out the write audiences a given
+ * read audience forbids using the same table the server validates against — a second
+ * copy of those enums would eventually disagree about which pairs are legal.
  */
-export type NarratorVisibility = "private" | "project" | "public";
+export type { NarratorVisibility, NarratorWriteAudience };
 
 /** read = follow along; write = also send messages, decide permissions, change settings. */
 export type NarratorGrantAccess = "read" | "write";
@@ -1086,6 +1170,7 @@ export interface NarratorGrant {
 export interface NarratorAccess {
 	narratorId: string;
 	visibility: NarratorVisibility;
+	writeAudience: NarratorWriteAudience;
 	/** null for narrators created before access control; only admins can manage those. */
 	owner: {
 		userId: string;
@@ -1096,6 +1181,13 @@ export interface NarratorAccess {
 	grants: NarratorGrant[];
 	/** Whether the current user may change visibility, grants or ownership. */
 	canManage: boolean;
+	/**
+	 * True for a subagent: the values above describe the main session that governs its
+	 * access, and nothing here can be edited in place.
+	 */
+	isDelegated: boolean;
+	/** The narrator whose settings govern access, when that is not this one. */
+	delegatesToNarratorId: string | null;
 }
 
 /** A project's three membership tiers. Ordered by increasing authority. */

@@ -537,6 +537,26 @@ export interface NarraForkSettings {
 	 * agent.webFetchPolicy.proxy), which are kept only for migration.
 	 */
 	proxy?: OutboundProxyConfig;
+	/**
+	 * Per-instance branding, so several deployments can be told apart in one
+	 * browser. When a window is unfocused or the app is installed as a PWA, the tab
+	 * title / app name / icon are the only distinguishing marks — and they are
+	 * identical across instances out of the box.
+	 *
+	 * Both fields are optional and blank means "use the NarraFork defaults"; see
+	 * `shared/branding.ts` for resolution and why every read path is forgiving.
+	 */
+	branding?: {
+		/** Instance display name. Blank/absent = "NarraFork". */
+		name?: string;
+		/**
+		 * Icon accent colour as `#rrggbb`. Absent = NarraFork indigo (#4c6ef5).
+		 * Drives the favicon, PWA icons and apple-touch-icon. Deliberately NOT the
+		 * manifest `theme_color`, which is the dark UI background rather than an
+		 * accent — see `server/routes/branding.ts`.
+		 */
+		iconColor?: string;
+	};
 	paths: { defaultProjectDir: string };
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
@@ -802,8 +822,14 @@ export interface NarraForkSettings {
 		autoCompactPruneThreshold?: number;
 		/**
 		 * When a narrator has an in-progress context compaction, whether a newly-sent
-		 * user message should wait for the compaction to finish before being sent.
-		 * Default false = send immediately (do not wait).
+		 * user message is QUEUED until the compaction finishes instead of starting a
+		 * turn right away. Default true.
+		 *
+		 * Queuing is the safe default because a turn started mid-compact runs against
+		 * the history the compact is replacing. It is a real queue, not a blocking
+		 * wait: the send returns immediately and the message stays editable and
+		 * cancellable until the compact settles. Off = send immediately, concurrent
+		 * with the compact. Either way, an explicit `priority` send cuts in.
 		 */
 		queueDuringCompaction?: boolean;
 		/**

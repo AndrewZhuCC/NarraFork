@@ -9,10 +9,13 @@ mock.module("../../db", () => ({ db, sqlite }));
 
 const {
 	consumeForegroundSubagentHardInterrupt,
+	getDetachableMap,
 	getForegroundAbortControllers,
 	interruptForegroundSubagent,
 	interruptForegroundSubagentsForParent,
+	ProxyAbortController,
 } = await import("../subagent-detach");
+type DetachEntry = import("../subagent-detach").DetachEntry;
 const {
 	claimManualOverride,
 	cleanupManualOverrideRuntime,
@@ -25,6 +28,7 @@ const {
 } = await import("../subagent-manual-override");
 const {
 	bufferSubagentUserMessage,
+	canDeliverBufferedMessageInPass,
 	clearSubagentBufferedMessages,
 	getSubagentBufferedMessages,
 	MAX_SUBAGENT_INTERRUPTION_RETRIES,
@@ -41,6 +45,7 @@ const SUBAGENT_ID = "subagent-interrupt-test";
 
 afterEach(() => {
 	getForegroundAbortControllers().clear();
+	getDetachableMap().clear();
 	clearManualOverrideRuntimes();
 	consumeForegroundSubagentHardInterrupt(SUBAGENT_ID);
 	clearSubagentBufferedMessages(SUBAGENT_ID);
@@ -162,6 +167,51 @@ describe("foreground subagent interrupt semantics", () => {
 		clearSubagentBufferedMessages(SUBAGENT_ID);
 
 		expect(shouldStopSubagentForBufferedMessage(SUBAGENT_ID)).toBe(false);
+	});
+});
+
+/**
+ * Which queued messages the running pass may carry at its next after-tools
+ * boundary. Anything rejected here waits for the whole loop pass to end, which
+ * for a long-running subagent is arbitrarily far away — so a wrong "false" turns
+ * agent-to-agent Send back into a delayed mailbox with no error to notice.
+ */
+describe("canDeliverBufferedMessageInPass", () => {
+	test("a plain message is carried by the current pass", () => {
+		expect(canDeliverBufferedMessageInPass({}, "user-1")).toBe(true);
+	});
+
+	// The regression this predicate was written for: Send stamps the sender's
+	// userId as createdBy, and the old condition rejected any createdBy at all, so
+	// every parent→child Send waited for the subagent's pass to finish.
+	test("a message from the user the pass already runs as is carried in-pass", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, "user-1")).toBe(true);
+	});
+
+	test("a message from a different user waits for a pass built for that identity", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-2" }, "user-1")).toBe(false);
+	});
+
+	// "No particular user" cannot conflict with the pass identity.
+	test("an unattributed message is carried even when the pass has a user", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: null }, "user-1")).toBe(true);
+		expect(canDeliverBufferedMessageInPass({}, null)).toBe(true);
+	});
+
+	test("an attributed message waits when the pass itself has no user", () => {
+		expect(canDeliverBufferedMessageInPass({ createdBy: "user-1" }, null)).toBe(false);
+	});
+
+	// In-pass delivery contributes text only, so anything whose payload is not
+	// text must go through the history-rebuilding path or be silently dropped.
+	test("attachments and pre-prompt commands still wait for the restart path", () => {
+		expect(
+			canDeliverBufferedMessageInPass({ images: [{ imageId: "img-1" }] as never }, "user-1"),
+		).toBe(false);
+		expect(
+			canDeliverBufferedMessageInPass({ textFiles: [new File(["x"], "a.txt")] }, "user-1"),
+		).toBe(false);
+		expect(canDeliverBufferedMessageInPass({ prePromptBashCommand: "ls" }, "user-1")).toBe(false);
 	});
 });
 
@@ -290,7 +340,9 @@ describe("foreground subagent interrupt controls", () => {
 		]);
 
 		try {
-			await interruptForegroundSubagentsForParent(parentId);
+			// The subagent is named explicitly (the recovery path's contract); the primary
+			// fork shares the same parent but is not a subagent and must survive.
+			await interruptForegroundSubagentsForParent(parentId, [primaryChildId, subagentChildId]);
 
 			const rows = sqlite
 				.prepare("SELECT id, status FROM narrators WHERE id IN (?, ?)")
@@ -305,6 +357,156 @@ describe("foreground subagent interrupt controls", () => {
 				.run(primaryChildId, subagentChildId);
 			sqlite.prepare("DELETE FROM narrators WHERE id = ?").run(parentId);
 		}
+	});
+
+	/**
+	 * Regression: stopping a parent used to interrupt every foreground subagent that
+	 * shared its `parentNarratorId`, which swept up children the user was driving
+	 * themselves from a side panel. Membership is now per Agent tool call: an entry
+	 * qualifies because ITS OWN parent signal aborted, which is exactly the set of
+	 * calls the parent's interrupt cancelled — one or many.
+	 */
+	describe("scope of the parent interrupt fan-out", () => {
+		const parentId = "fanout-parent";
+
+		function seedEntry(subagentId: string, parentSignal: AbortSignal): DetachEntry {
+			const entry: DetachEntry = {
+				runId: `run-${subagentId}`,
+				markDetached: () => {},
+				publishHandoff: () => true,
+				proxy: new ProxyAbortController(),
+				parentSignal,
+				fgAbort: new AbortController(),
+				toolUseId: `tool-${subagentId}`,
+				parentNarratorId: parentId,
+				subagentId,
+			};
+			getDetachableMap().set(subagentId, entry);
+			return entry;
+		}
+
+		async function seedNarratorRows(ids: string[]) {
+			const now = new Date().toISOString();
+			await db.insert(narrators).values([
+				{ id: parentId, variant: "primary", status: "working", createdAt: now, updatedAt: now },
+				...ids.map((id) => ({
+					id,
+					variant: "subagent:general" as const,
+					type: "subagent" as const,
+					parentNarratorId: parentId,
+					status: "working" as const,
+					createdAt: now,
+					updatedAt: now,
+				})),
+			]);
+		}
+
+		function cleanupNarratorRows(ids: string[]) {
+			for (const id of [...ids, parentId]) {
+				sqlite.prepare("DELETE FROM narrators WHERE id = ?").run(id);
+			}
+		}
+
+		test("interrupts every subagent of the cancelled turn, and only those", async () => {
+			// One turn started two subagents: both share the parent loop's signal, so a
+			// single parent abort marks both. The third is a panel-driven continuation whose
+			// run signal is independent by construction — it is nobody's pending tool call.
+			const turnAbort = new AbortController();
+			const first = seedEntry("fanout-turn-a", turnAbort.signal);
+			const second = seedEntry("fanout-turn-b", turnAbort.signal);
+			const independent = seedEntry("fanout-independent", new AbortController().signal);
+			const ids = [first.subagentId, second.subagentId, independent.subagentId];
+			await seedNarratorRows(ids);
+
+			try {
+				turnAbort.abort("Parent narrator interrupted");
+				expect(await interruptForegroundSubagentsForParent(parentId)).toBe(2);
+
+				expect(first.fgAbort.signal.aborted).toBe(true);
+				expect(second.fgAbort.signal.aborted).toBe(true);
+				expect(independent.fgAbort.signal.aborted).toBe(false);
+
+				const rows = sqlite
+					.prepare("SELECT id, status FROM narrators WHERE id IN (?, ?, ?)")
+					.all(...ids) as Array<{ id: string; status: string }>;
+				const statusById = new Map(rows.map((row) => [row.id, row.status]));
+				expect(statusById.get(first.subagentId)).toBe("idle");
+				expect(statusById.get(second.subagentId)).toBe("idle");
+				// The whole point: the panel session keeps running.
+				expect(statusById.get(independent.subagentId)).toBe("working");
+			} finally {
+				cleanupNarratorRows(ids);
+			}
+		});
+
+		test("an explicitly named subagent is interrupted even with a live parent signal", async () => {
+			// The recovery path re-drives a foreground Agent on its own signal, so the
+			// aborted-signal test cannot see it; its owner names it instead.
+			const named = seedEntry("fanout-named", new AbortController().signal);
+			const other = seedEntry("fanout-not-named", new AbortController().signal);
+			const ids = [named.subagentId, other.subagentId];
+			await seedNarratorRows(ids);
+
+			try {
+				expect(await interruptForegroundSubagentsForParent(parentId, [named.subagentId])).toBe(1);
+
+				expect(named.fgAbort.signal.aborted).toBe(true);
+				expect(other.fgAbort.signal.aborted).toBe(false);
+			} finally {
+				cleanupNarratorRows(ids);
+			}
+		});
+
+		test("a live turn with no cancelled tool call interrupts nothing", async () => {
+			const running = seedEntry("fanout-still-running", new AbortController().signal);
+			const ids = [running.subagentId];
+			await seedNarratorRows(ids);
+
+			try {
+				expect(await interruptForegroundSubagentsForParent(parentId)).toBe(0);
+				expect(running.fgAbort.signal.aborted).toBe(false);
+			} finally {
+				cleanupNarratorRows(ids);
+			}
+		});
+
+		test("a named id belonging to another parent is refused", async () => {
+			// Ownership is re-checked against the DB so a mistaken id cannot let one
+			// parent reach into another's child.
+			const foreignParentId = "fanout-foreign-parent";
+			const foreignChildId = "fanout-foreign-child";
+			const now = new Date().toISOString();
+			await db.insert(narrators).values([
+				{
+					id: foreignParentId,
+					variant: "primary",
+					status: "working",
+					createdAt: now,
+					updatedAt: now,
+				},
+				{
+					id: foreignChildId,
+					variant: "subagent:general",
+					type: "subagent",
+					parentNarratorId: foreignParentId,
+					status: "working",
+					createdAt: now,
+					updatedAt: now,
+				},
+			]);
+
+			try {
+				expect(await interruptForegroundSubagentsForParent(parentId, [foreignChildId])).toBe(0);
+				const row = sqlite
+					.prepare("SELECT status FROM narrators WHERE id = ?")
+					.get(foreignChildId) as { status: string };
+				expect(row.status).toBe("working");
+			} finally {
+				sqlite
+					.prepare("DELETE FROM narrators WHERE id IN (?, ?)")
+					.run(foreignChildId, foreignParentId);
+			}
+		});
 	});
 
 	test("manual override can resume the original foreground runner", async () => {
