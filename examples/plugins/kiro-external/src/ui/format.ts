@@ -7,14 +7,35 @@
  */
 
 import type { AccountTier, CredentialEntry } from "./panel-types";
-import { t } from "./strings";
+import { activeLocale, t } from "./strings";
 
 /** Tier badge colors, matching the host's `TIER_CONFIG`. */
-export const TIER_META: Record<AccountTier, { color: string; label: string; desc: string }> = {
-	paid: { color: "blue", label: t("tierPaid"), desc: t("tierPaidDesc") },
-	enterprise: { color: "violet", label: t("tierEnterprise"), desc: t("tierEnterpriseDesc") },
-	free: { color: "gray", label: t("tierFree"), desc: t("tierFreeDesc") },
-};
+export interface TierMeta {
+	color: string;
+	label: string;
+	desc: string;
+}
+
+/**
+ * Tier badge strings, resolved PER CALL.
+ *
+ * A module-level `TIER_META` table called `t()` once, at import time — before the host SDK
+ * was guaranteed to exist, and never again afterwards. The label froze at the host's locale
+ * (or the fallback) for the life of the panel: switching the app's language mid-session
+ * re-rendered every other string through `onLocaleChange` while the tier badges kept the old
+ * words. `t()` already resolves per call for exactly this reason; the table around it was
+ * the last place holding a translation still.
+ */
+export function getTierMeta(tier: AccountTier): TierMeta {
+	switch (tier) {
+		case "paid":
+			return { color: "blue", label: t("tierPaid"), desc: t("tierPaidDesc") };
+		case "enterprise":
+			return { color: "violet", label: t("tierEnterprise"), desc: t("tierEnterpriseDesc") };
+		default:
+			return { color: "gray", label: t("tierFree"), desc: t("tierFreeDesc") };
+	}
+}
 
 /** Whether an entry is a static API key, which is a bearer token with nothing to refresh. */
 export function isApiKeyEntry(entry: CredentialEntry): boolean {
@@ -52,7 +73,12 @@ export function formatTimestamp(value?: string | number): string {
 		typeof value === "number" ? (value < 10_000_000_000 ? value * 1000 : value) : value,
 	);
 	if (Number.isNaN(date.getTime())) return String(value);
-	return date.toLocaleString();
+	// Same source as `relativeTime`: an absolute timestamp rendered in the browser's
+	// language next to a relative one in the app's is the same split, at hour scale.
+	return date.toLocaleString(activeLocale(), {
+		dateStyle: "medium",
+		timeStyle: "short",
+	});
 }
 
 const RELATIVE_UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
@@ -66,8 +92,12 @@ const RELATIVE_UNITS: Array<[Intl.RelativeTimeFormatUnit, number]> = [
 /**
  * "3 hours ago" / "in 2 days".
  *
- * `Intl.RelativeTimeFormat` rather than a hand-rolled table: it localizes for free, and the
- * panel already depends on the browser locale for its own copy.
+ * `Intl.RelativeTimeFormat` rather than a hand-rolled table: it localizes for free.
+ *
+ * The locale comes from the HOST (`activeLocale`), not `navigator.language`. Mixing the
+ * two sources is what produced a panel whose labels were Chinese while its timestamps
+ * read "2 hours ago" — the strings had already moved to the host's locale and the dates
+ * had not.
  */
 export function relativeTime(value?: string | number): string {
 	if (!value) return "-";
@@ -76,8 +106,7 @@ export function relativeTime(value?: string | number): string {
 	);
 	if (Number.isNaN(date.getTime())) return String(value);
 	const deltaMs = date.getTime() - Date.now();
-	const locale = typeof navigator === "undefined" ? "en" : (navigator.language ?? "en");
-	const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+	const formatter = new Intl.RelativeTimeFormat(activeLocale(), { numeric: "auto" });
 	for (const [unit, ms] of RELATIVE_UNITS) {
 		if (Math.abs(deltaMs) >= ms) return formatter.format(Math.round(deltaMs / ms), unit);
 	}

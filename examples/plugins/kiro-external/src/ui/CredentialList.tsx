@@ -9,7 +9,13 @@
  * wrong box entirely.
  */
 
-import { formatRegions, formatUsageNumber, isApiKeyEntry, relativeTime, TIER_META } from "./format";
+import {
+	formatRegions,
+	formatUsageNumber,
+	getTierMeta,
+	isApiKeyEntry,
+	relativeTime,
+} from "./format";
 import { MantineCore, useEffect, useState } from "./host-runtime";
 import type { CredentialEntry, UsageEntry } from "./panel-types";
 import { t } from "./strings";
@@ -80,7 +86,7 @@ function UsageDisplay({ entry, usage }: { entry: CredentialEntry; usage?: UsageE
 	const limit = usage?.usageLimit;
 	const title = entry.subscriptionTitle ?? usage?.subscriptionTitle;
 	const tier = entry.tier ?? "free";
-	const meta = TIER_META[tier];
+	const meta = getTierMeta(tier);
 	const percent = limit && limit > 0 && current != null ? (current / limit) * 100 : null;
 
 	return (
