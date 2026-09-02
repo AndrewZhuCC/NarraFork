@@ -766,6 +766,10 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// or dispatch an unattended run — before the assistant message that requested it
 	// is even complete.
 	"ScheduledTask",
+	"PluginInstall",
+	"McpAdmin",
+	"HookAdmin",
+	"ScheduledTaskAdmin",
 	"ForkNarrator",
 	"EnterPlanMode",
 	...DANGER_REFLECTION_TOOLS,
