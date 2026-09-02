@@ -17917,7 +17917,6 @@ async function outboundFetch(input, init, options = {}) {
   const rawUrl = input instanceof Request ? input.url : String(input);
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const requestHeaders = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
-  requestHeaders.set("Connection", "close");
   const proxy = options.proxyUrl ? normalizeProxyUrl(options.proxyUrl, SUPPORTED_PROXY_PROTOCOLS).toString() : "";
   const fetchInit = {
     ...init,
@@ -20069,6 +20068,8 @@ var QUEUE_EVENT = "queueEvent";
 var QUOTA_BALANCE_EVENT = "quotaBalanceEvent";
 var MODEL_CATALOG_EVENT = "modelCatalogEvent";
 var IMAGE_CACHE_ACK_EVENT = "imageCacheAckEvent";
+var METERING_EVENT = "meteringEvent";
+var CONTEXT_USAGE_EVENT = "contextUsageEvent";
 function isRecord2(value) {
   return value != null && typeof value === "object" && !Array.isArray(value);
 }
@@ -20132,7 +20133,34 @@ function parseGatewaySSEEvent(eventType, data) {
     const refs = data.refs.filter((ref) => typeof ref === "string" && ref !== "");
     return { nugImageCacheAck: { refs } };
   }
+  if (eventType === METERING_EVENT) {
+    const usage = numberFrom(data.usage);
+    if (usage == null)
+      return null;
+    return {
+      metering: {
+        unit: typeof data.unit === "string" ? data.unit : "credit",
+        unitPlural: typeof data.unitPlural === "string" ? data.unitPlural : "credits",
+        usage
+      }
+    };
+  }
+  if (eventType === CONTEXT_USAGE_EVENT) {
+    const percentage = numberFrom(data.contextUsagePercentage) ?? numberFrom(data.context_usage_percentage);
+    if (percentage == null)
+      return null;
+    return { contextUsagePercentage: percentage };
+  }
   return null;
+}
+function numberFrom(value) {
+  if (typeof value === "number")
+    return Number.isFinite(value) ? value : undefined;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return;
 }
 
 // shared/codewhisperer/reasoning-source.ts
@@ -20491,7 +20519,7 @@ function normalizeKiroChatRequest(request, runtime = {}) {
 function isRecord3(value) {
   return typeof value === "object" && value !== null;
 }
-function numberFrom(value) {
+function numberFrom2(value) {
   if (typeof value === "number" && Number.isFinite(value))
     return value;
   if (typeof value === "string" && value.trim() !== "") {
@@ -20503,7 +20531,7 @@ function numberFrom(value) {
 }
 function firstNumber(source, keys) {
   for (const key of keys) {
-    const value = numberFrom(source[key]);
+    const value = numberFrom2(source[key]);
     if (value != null)
       return value;
   }
