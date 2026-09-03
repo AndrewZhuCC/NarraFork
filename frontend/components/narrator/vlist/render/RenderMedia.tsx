@@ -16,6 +16,7 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
+import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
 import {
 	IMGGEN_GROUP_GAP,
@@ -199,8 +200,15 @@ function TextFileView({ block, frame }: { block: PreparedFixedBlock; frame: Bloc
 	const filename = typeof block.data?.filename === "string" ? block.data.filename : "";
 	const size = typeof block.data?.size === "number" ? block.data.size : null;
 	return (
-		<div style={{ position: "absolute", top: frame.top, left: 0 }}>
-			<TextFileRow filename={filename} size={size} height={block.height} />
+		<div style={{ position: "absolute", top: frame.top, left: 0, maxWidth: "100%" }}>
+			<TextFileRow
+				filename={filename}
+				size={size}
+				height={block.height}
+				// Reserved width from measure — bounds the filename so it truncates
+				// instead of wrapping out of the fixed single-line row.
+				width={block.displayWidth}
+			/>
 		</div>
 	);
 }
@@ -345,10 +353,11 @@ function HeaderInlineView({
 								<span
 									className={frag.className}
 									style={{
-										font: frag.font,
-										marginLeft: frag.gapBefore,
-										whiteSpace: "pre",
-										display: "inline-block",
+										...fragmentTextStyle({
+											font: frag.font,
+											gapBefore: frag.gapBefore,
+											letterSpacing: letterSpacingForFont(frag.font),
+										}),
 										color:
 											frag.className === "vlist-imggen-prompt"
 												? // `c="violet"`: violet-4 on dark, violet-filled on light.

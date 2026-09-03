@@ -31,7 +31,7 @@
 
 import { CredentialList } from "./CredentialList";
 import { EditForm } from "./EditForm";
-import { containsApiKey, parseApiKeyLines, TIER_META } from "./format";
+import { containsApiKey, getTierMeta, parseApiKeyLines } from "./format";
 import {
 	createRoot,
 	hostTheme,
@@ -56,7 +56,7 @@ import {
 	type StatusOutput,
 	type UsageEntry,
 } from "./panel-types";
-import { t } from "./strings";
+import { onLocaleChange, t } from "./strings";
 
 const {
 	Alert,
@@ -115,6 +115,21 @@ function CredentialPanel({ sdk }: { sdk: PluginUiSdk }) {
 	const [confirming, setConfirming] = useState<PendingConfirm | undefined>();
 	const [modelsDialog, setModelsDialog] = useState<ModelsDialog | undefined>();
 	const [usageDialog, setUsageDialog] = useState<UsageDialog | undefined>();
+
+	/*
+	 * Re-render when the host language changes.
+	 *
+	 * `t()` resolves against the host's current locale on every call, so a re-render is all that is
+	 * needed — but something has to cause one. Colours need no equivalent: the host rewrites the
+	 * `--nf-*` variables and the browser repaints on its own. Text is the asymmetric case, because
+	 * a string already committed to the DOM stays until React replaces it.
+	 *
+	 * The counter is the render trigger; its value is never read. Deriving it from the locale
+	 * instead would be equivalent, but a monotonic bump cannot accidentally coalesce two changes
+	 * that happen to resolve to the same tag.
+	 */
+	const [, bumpLocale] = useState(0);
+	useEffect(() => onLocaleChange(() => bumpLocale((value) => value + 1)), []);
 
 	/**
 	 * True once the panel has unmounted.
@@ -526,7 +541,7 @@ function CredentialPanel({ sdk }: { sdk: PluginUiSdk }) {
 			) : null}
 
 			{groups.map(({ tier, entries, total }) => {
-				const meta = TIER_META[tier];
+				const meta = getTierMeta(tier);
 				return (
 					<Stack key={tier} gap="xs">
 						<Group gap="xs">
@@ -713,15 +728,20 @@ function CredentialPanel({ sdk }: { sdk: PluginUiSdk }) {
  *
  * Deliberately plain DOM: the failures this covers are "React or Mantine is unusable", so
  * rendering the message with them would fail the same way and leave the panel blank — which
- * is indistinguishable from the panel never having been asked to load. `strings.ts` is safe
- * to use here because it reads only `navigator.language`.
+ * is indistinguishable from the panel never having been asked to load.
+ *
+ * `strings.ts` is safe here because it reads `globalThis.narrafork.i18n`, which the host installs
+ * before this file runs and which does not depend on the runtime that just failed. (It previously
+ * read `navigator.language`; the guarantee is the same, the source is not.)
  */
 function renderFatal(detail: string): void {
 	const box = document.createElement("div");
 	box.style.padding = "12px";
-	box.style.font = "13px/1.5 system-ui, sans-serif";
-	box.style.color = "#ffa8a8";
-	box.style.background = "#2e1a1a";
+	box.style.font = "13px/1.5 var(--nf-font, system-ui, sans-serif)";
+	// Host tokens with the previous values as fallbacks: this path runs when the shared runtime is
+	// broken, but the token stylesheet is injected by the shell and is unaffected by that.
+	box.style.color = "var(--nf-color-error, #ffa8a8)";
+	box.style.background = "var(--nf-color-surface, #2e1a1a)";
 	box.style.borderRadius = "6px";
 	box.style.margin = "12px";
 	box.style.whiteSpace = "pre-wrap";

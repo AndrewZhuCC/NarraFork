@@ -45,6 +45,8 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	tasks: PANEL_COMPONENT.tasks,
 	search: PANEL_COMPONENT.search,
 	userchat: PANEL_COMPONENT.userchat,
+	appearance: PANEL_COMPONENT.appearance,
+	filetree: PANEL_COMPONENT.filetree,
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
 	knowledge: PANEL_COMPONENT.knowledge,
@@ -112,6 +114,8 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	tasks: PANEL_DEFAULT_TITLE.tasks,
 	search: PANEL_DEFAULT_TITLE.search,
 	userchat: PANEL_DEFAULT_TITLE.userchat,
+	appearance: PANEL_DEFAULT_TITLE.appearance,
+	filetree: PANEL_DEFAULT_TITLE.filetree,
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
 	knowledge: PANEL_DEFAULT_TITLE.knowledge,
@@ -129,6 +133,8 @@ const NARRATOR_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set([
 	"tasks",
 	"search",
 	"userchat",
+	"appearance",
+	"filetree",
 	// TEMPORARY: the streaming harness participates in the toolbar's
 	// open/close/toggle vocabulary so its button can show active state.
 	// Removed together with `../mock/` (see its README-REMOVAL.md).

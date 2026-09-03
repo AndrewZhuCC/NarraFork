@@ -45,8 +45,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useConfirmDialog } from "../../components/common/ConfirmDialogProvider";
 import { CopyButton } from "../../components/common/CopyButton";
+import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { type ApiError, api, type OAuthApp } from "../../lib/api";
 import {
@@ -194,12 +194,12 @@ function ExternalWebSocketSettingsSection() {
 							label={t("oauthExternalWebSocketAllowedOrigins")}
 							description={t("oauthExternalWebSocketAllowedOriginsHint")}
 							value={form.allowedOriginsText}
-							onChange={(event) =>
-								setForm((current) => ({
-									...current,
-									allowedOriginsText: event.currentTarget.value,
-								}))
-							}
+							onChange={(event) => {
+								// currentTarget is nulled after the handler returns, so read it
+								// before the deferred updater runs.
+								const val = event.currentTarget.value;
+								setForm((current) => ({ ...current, allowedOriginsText: val }));
+							}}
 							minRows={2}
 							autosize
 						/>

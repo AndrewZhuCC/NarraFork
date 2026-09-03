@@ -6,6 +6,7 @@ import {
 	normalizeSubagentToolInputSummary,
 	type SubagentToolInputSummary,
 } from "@shared/subagent-tool-summary";
+import { readToolProgressPayload, type ToolProgressPayload } from "@shared/tool-progress";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
 	BufferMessageSummary,
@@ -17,6 +18,7 @@ import type {
 } from "../lib/api";
 import {
 	type ListenerHandle,
+	type NarratorMessageSnapshot,
 	type NarratorSubscriptionKind,
 	narratorWSManager,
 	type SubscriptionHandle,
@@ -434,6 +436,15 @@ interface NarratorWSCallbacks {
 	onTimeoutUpdated?: (toolUseId: string, timeoutMs: number) => void;
 	onToolOutput?: (toolUseId: string, output: string, parentToolUseId?: string) => void;
 	/**
+	 * A determinate "N of M done" measurement from a running tool (TransferFile),
+	 * rendered as an actual progress bar rather than parsed out of its text output.
+	 */
+	onToolStructuredProgress?: (
+		toolUseId: string,
+		progress: ToolProgressPayload,
+		parentToolUseId?: string,
+	) => void;
+	/**
 	 * A running Await-agent call learned which child narrator it is waiting on.
 	 * Lets the card offer "open session" before the wait returns (the id is not in
 	 * the persisted row until then).
@@ -489,6 +500,22 @@ interface NarratorWSCallbacks {
 		baseBranch: string;
 		linesAdded: number;
 		linesRemoved: number;
+	}) => void;
+	/**
+	 * Individual worktree paths changed, so a file tree can patch the affected
+	 * directories instead of refetching.
+	 *
+	 * Paths are worktree-RELATIVE. Only delivered while the server's native watcher is
+	 * running (it is opt-in); the default polling fallback observes no paths, so a
+	 * consumer must treat this as an accelerator over its own on-demand fetching.
+	 *
+	 * `truncated` means the batch hit the watcher's cap and `changes` is a sample
+	 * rather than the whole set — invalidate broadly instead of applying it literally.
+	 */
+	onWorkspacePathsChanged?: (data: {
+		chapterId: string;
+		changes: { path: string; kind: "added" | "updated" | "deleted" }[];
+		truncated: boolean;
 	}) => void;
 	onMetering?: (unit: string, unitPlural: string, usage: number) => void;
 	onQuotaBalance?: (quotaBalance: string | null, detailedQuotaBalance?: string | null) => void;
@@ -688,6 +715,8 @@ interface NarratorWSCallbacks {
 			input?: unknown;
 			streamStartedAt?: number;
 			streamingOutput?: string;
+			/** Latest determinate progress, so a reconnect paints the bar immediately. */
+			structuredProgress?: ToolProgressPayload;
 			toolCallId?: string | null;
 			createdAt?: string | number | null;
 			timing?: SubagentToolCallTiming | null;
@@ -712,7 +741,7 @@ interface NarratorWSCallbacks {
 export function useNarratorWS(
 	narratorId: string | undefined,
 	callbacks: NarratorWSCallbacks,
-	initialCatchUpCursor?: CatchUpCursor,
+	initialMessageSnapshot?: NarratorMessageSnapshot,
 	options?: {
 		kind?: NarratorSubscriptionKind;
 		excludeTypes?: readonly string[];
@@ -729,24 +758,24 @@ export function useNarratorWS(
 		callbacksOwnerRef.current.callbacks = callbacks;
 	}
 	const subscriptionKind = options?.kind ?? "messages";
-	const initialCatchUpCursorRef = useRef<{
+	const initialMessageSnapshotRef = useRef<{
 		narratorId: string | undefined;
-		cursor: CatchUpCursor | undefined;
-	}>({ narratorId, cursor: initialCatchUpCursor });
-	if (initialCatchUpCursorRef.current.narratorId !== narratorId) {
+		snapshot: NarratorMessageSnapshot | undefined;
+	}>({ narratorId, snapshot: initialMessageSnapshot });
+	if (initialMessageSnapshotRef.current.narratorId !== narratorId) {
 		// Reset synchronously so the first subscription frame for a new narrator can
-		// never inherit the previous narrator's cursor.
-		initialCatchUpCursorRef.current = { narratorId, cursor: initialCatchUpCursor };
-	} else if (initialCatchUpCursor !== undefined) {
-		initialCatchUpCursorRef.current.cursor = initialCatchUpCursor;
+		// never inherit either half of the previous narrator's snapshot coordinate.
+		initialMessageSnapshotRef.current = { narratorId, snapshot: initialMessageSnapshot };
+	} else if (initialMessageSnapshot !== undefined) {
+		initialMessageSnapshotRef.current.snapshot = initialMessageSnapshot;
 	}
 	useEffect(() => {
-		if (narratorId && initialCatchUpCursor !== undefined) {
+		if (narratorId && initialMessageSnapshot?.cursor !== undefined) {
 			// Tail content commonly arrives after the subscription effect. Seed the
 			// manager for reconnect/sync frames without restarting the subscription.
-			narratorWSManager.seedCatchUpCursor(narratorId, initialCatchUpCursor);
+			narratorWSManager.seedCatchUpCursor(narratorId, initialMessageSnapshot.cursor);
 		}
-	}, [initialCatchUpCursor, narratorId]);
+	}, [initialMessageSnapshot, narratorId]);
 
 	const [connected, setConnected] = useState(narratorWSManager.connected);
 	const [disconnected, setDisconnected] = useState(narratorWSManager.disconnected);
@@ -757,11 +786,13 @@ export function useNarratorWS(
 		const subscribedId = narratorId;
 		const callbackOwner = callbacksOwnerRef.current;
 
+		const initialSnapshot =
+			initialMessageSnapshotRef.current.narratorId === subscribedId
+				? initialMessageSnapshotRef.current.snapshot
+				: undefined;
 		const subHandle: SubscriptionHandle = narratorWSManager.subscribe([subscribedId], {
-			catchUpCursor:
-				initialCatchUpCursorRef.current.narratorId === subscribedId
-					? initialCatchUpCursorRef.current.cursor
-					: undefined,
+			catchUpCursor: initialSnapshot?.cursor,
+			initialMessageSnapshot: initialSnapshot,
 			kind: subscriptionKind,
 		});
 
@@ -1014,6 +1045,19 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
+					case "tool_structured_progress": {
+						// Validated rather than cast: a malformed frame must degrade to a
+						// barless card, not to a bar reading `NaN%`.
+						const progress = readToolProgressPayload(data.progress);
+						if (progress) {
+							callbackOwner.callbacks.onToolStructuredProgress?.(
+								data.toolUseId as string,
+								progress,
+								data.parentToolUseId as string | undefined,
+							);
+						}
+						break;
+					}
 					case "await_agent_resolved":
 						callbackOwner.callbacks.onAwaitAgentResolved?.(
 							data.toolUseId as string,
@@ -1144,6 +1188,23 @@ export function useNarratorWS(
 							});
 						}
 						break;
+					case "workspace_paths_changed": {
+						// An empty `changes` with `truncated` set is meaningful (everything is
+						// suspect), so the array's emptiness is not a reason to skip the callback.
+						const rawChanges = Array.isArray(data.changes) ? data.changes : [];
+						const changes = rawChanges.flatMap((entry) => {
+							const item = entry as { path?: unknown; kind?: unknown };
+							if (typeof item.path !== "string" || !item.path) return [];
+							const kind = item.kind === "added" || item.kind === "deleted" ? item.kind : "updated";
+							return [{ path: item.path, kind } as const];
+						});
+						callbackOwner.callbacks.onWorkspacePathsChanged?.({
+							chapterId: (data.chapterId as string) ?? "",
+							changes,
+							truncated: data.truncated === true,
+						});
+						break;
+					}
 					case "metering":
 						if (!data.isSubagent) {
 							callbackOwner.callbacks.onMetering?.(
@@ -1496,6 +1557,7 @@ export function useNarratorWS(
 								input?: unknown;
 								streamStartedAt?: number;
 								streamingOutput?: string;
+								structuredProgress?: ToolProgressPayload;
 								toolCallId?: string | null;
 								createdAt?: string | number | null;
 								timing?: SubagentToolCallTiming | null;

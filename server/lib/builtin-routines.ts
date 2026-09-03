@@ -122,6 +122,17 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 	{
+		id: "scheduled_task",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ScheduledTask",
+			descriptionEn:
+				"Scheduled task management — create, inspect, edit, enable/disable, delete and trigger cron tasks",
+			descriptionZh: "定时任务管理 — 创建、查看、编辑、启用/禁用、删除和立即触发 cron 任务",
+		},
+	},
+	{
 		id: "narrafork_admin",
 		type: "tool",
 		category: "tools",
@@ -140,6 +151,52 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 			descriptionEn:
 				"Knowledge ACL management (admin only) — levels, tags, tag types, grants, per-user/entry ACL",
 			descriptionZh: "知识库 ACL 管理（仅管理员）— 密级、标签、标签类型、授权、用户/条目 ACL",
+		},
+	},
+	{
+		id: "plugin_install",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "PluginInstall",
+			descriptionEn:
+				"Plugin install management (admin only) — list import packages, install, and optionally enable plugins",
+			descriptionZh: "插件安装管理（仅管理员）— 列出导入包、安装并可选择启用插件",
+		},
+	},
+	{
+		id: "mcp_admin",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "McpAdmin",
+			descriptionEn:
+				"MCP server management (admin only) — list, add, remove, connect, disconnect, and test external MCP servers",
+			descriptionZh:
+				"MCP 服务器管理（仅管理员）— 列出、添加、移除、连接、断开和测试外部 MCP 服务器",
+		},
+	},
+	{
+		id: "hook_admin",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "HookAdmin",
+			descriptionEn:
+				"Hook management (admin only) — list, create, update, and delete narrator lifecycle hooks (command/http)",
+			descriptionZh:
+				"Hook 管理（仅管理员）— 列出、创建、更新和删除叙述者生命周期 Hook（命令/HTTP）",
+		},
+	},
+	{
+		id: "scheduled_task_admin",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "ScheduledTaskAdmin",
+			descriptionEn:
+				"Scheduled task management (admin only) — create, update, toggle, run, and delete cron narrator tasks",
+			descriptionZh: "定时任务管理（仅管理员）— 创建、更新、启停、立即运行和删除 cron 叙述者任务",
 		},
 	},
 	{

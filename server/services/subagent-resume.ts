@@ -21,6 +21,7 @@ import {
 	settleManualOverrideClaim,
 } from "./subagent-manual-override";
 import {
+	announceResumedBackgroundTask,
 	combineSubagentAbortSignals,
 	type SubagentUpdateExecutionLease,
 	startContinuedSubagent,
@@ -352,15 +353,32 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (await reconcileRunningStatus(input.subagentId)) {
 			original.status = (await narratorService.getById(input.subagentId)).status;
 		}
+		// A subagent that was never started by its parent (e.g. a team temp worker
+		// recruited directly through the plugin API) has no real runner, so its
+		// "working" status is stale — treating it as running would either buffer the
+		// message forever or reject the resume. Let the standalone start path
+		// below (which synthesizes an origin tool-use id) actually run it.
+		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(
+			() => null,
+		));
 		if (
 			!manualOverride &&
+			!neverStarted &&
 			(original.status === "working" || original.status === "waiting") &&
 			!input.allowRunningRestart
 		) {
 			throw new ValidationError("Subagent is already running; queue the message instead");
 		}
 
-		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId);
+		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId).catch(() => {
+			// Never-started subagent (e.g. a team temp worker recruited directly
+			// through the plugin API): there is no originating Agent tool call.
+			// Synthesize a standalone tool-use id so the message can still be
+			// persisted and the subagent run. Conclusion delivery back to a tool
+			// call is a no-op for the synthesized id (updateToolCallResult finds
+			// no matching row), which is exactly right for standalone runs.
+			return `standalone-${generateId()}`;
+		});
 		let effectiveInput = input;
 		// Set by the regenerate_edited_message branch below, then attached to every
 		// return path so the advisory is not lost between the rollback and the reply.
@@ -543,9 +561,12 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				persistPrompt: prepared.persistPrompt,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
-				allowRunningRestart: input.allowRunningRestart,
+				allowRunningRestart: input.allowRunningRestart || neverStarted,
 				skipStaleAttach: input.skipStaleAttach,
 				preserveBackground: input.preserveBackground,
+				// Forwarded so the resumed-task notice knows whether the tool result below
+				// will be rewritten (i.e. whether the parent already has the output).
+				skipConclusionDelivery: input.skipConclusionDelivery,
 				resumableUpdateLease: input.resumableUpdateLease,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,
@@ -575,6 +596,20 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						if (active?.token === token && active.runId === started.runId) {
 							activeResumeRuns.delete(input.subagentId);
 						}
+					});
+				}
+				// AFTER the conclusion above, never before: this wakes the parent, and a turn
+				// started while the historical Agent tool result still held the previous run's
+				// output would be built from a result this continuation just superseded.
+				// Failure here must not fail the run — the notice is an affordance, the
+				// conclusion is the record.
+				const announcement = started.takeResumedBackgroundAnnouncement?.();
+				if (announcement) {
+					await announceResumedBackgroundTask(announcement).catch((err) => {
+						logger.warn("Failed to announce a resumed background task", {
+							subagentId: input.subagentId,
+							error: err instanceof Error ? err.message : String(err),
+						});
 					});
 				}
 				return output;

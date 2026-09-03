@@ -20,13 +20,16 @@ import {
 	IconFileCode,
 	IconFileText,
 	IconFlask,
+	IconFolder,
 	IconGitBranch,
 	IconInfoCircle,
 	IconMessages,
 	IconNotebook,
+	IconPencil,
 	IconRobot,
 	IconSearch,
 	IconTerminal2,
+	IconTextSize,
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
@@ -68,6 +71,9 @@ const FileModificationsPanel = lazy(() =>
 	import("../FileModificationsDrawer").then((m) => ({ default: m.FileModificationsPanel })),
 );
 const SpecPanel = lazy(() => import("../SpecPanel").then((m) => ({ default: m.SpecPanel })));
+const AppearancePanel = lazy(() =>
+	import("../AppearancePanel").then((m) => ({ default: m.AppearancePanel })),
+);
 const NarratorSearchPanel = lazy(() =>
 	import("../NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
@@ -76,6 +82,13 @@ const NarratorUserChatPanel = lazy(() =>
 );
 const GitPanel = lazy(() =>
 	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
+);
+const FileTreePanel = lazy(() =>
+	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
+);
+// Lazy so a session that never edits does not pay for CodeMirror's module graph.
+const FileEditorContent = lazy(() =>
+	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
 );
 const FileViewerContent = lazy(() =>
 	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
@@ -789,6 +802,30 @@ export function UserChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 	);
 }
 
+// ── Appearance (live transcript typography) ──
+export function AppearanceDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+
+	useLayoutEffect(() => {
+		const title = t("appearance.title");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("appearance.title")}
+			icon={<IconTextSize size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__appearance__"
+			detachKind="appearance"
+		>
+			<LazyPanelBoundary>
+				<AppearancePanel />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -819,8 +856,11 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	const { t } = useTranslation("narrator");
 	// Identity is a RESOURCE, so it comes from params (like a subagent's child id)
 	// rather than the live page context — several file panels coexist per surface.
-	const { filePath, fileName } = props.params;
+	const { filePath, fileName, hostNarratorId } = props.params;
 	const title = fileName?.trim() || filePath.split(/[/\\]/).pop() || t("fileViewer.title");
+	// Read-only is the default and is never persisted: reopening a saved layout must not
+	// silently put a file into an editable state the reader did not ask for.
+	const [editing, setEditing] = useState(false);
 
 	useLayoutEffect(() => {
 		if (title && title !== props.api.title) props.api.setTitle(title);
@@ -853,9 +893,73 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 			// Multi-instance: the path is what identifies WHICH file viewer this is, so
 			// a torn-out panel can be rebuilt pointing at the same file.
 			resourceId={filePath}
+			actions={
+				// Editing needs a workspace to be bounded by, so the toggle only appears when
+				// the panel knows which narrator owns it. A file opened from a context with no
+				// host (a platform file outside any workspace) stays read-only, which is
+				// correct rather than a limitation: there is no root to permit a write.
+				hostNarratorId ? (
+					<Tooltip label={t("fileEditor.edit")} openDelay={200}>
+						<ActionIcon
+							variant={editing ? "filled" : "subtle"}
+							color={editing ? "indigo" : "gray"}
+							size="sm"
+							onClick={() => setEditing((prev) => !prev)}
+						>
+							<IconPencil size={14} />
+						</ActionIcon>
+					</Tooltip>
+				) : null
+			}
 		>
 			<LazyPanelBoundary>
-				<FileViewerContent key={filePath} filePath={filePath} />
+				{editing && hostNarratorId ? (
+					<FileEditorContent
+						key={`edit:${filePath}`}
+						filePath={filePath}
+						narratorId={hostNarratorId}
+					/>
+				) : (
+					<FileViewerContent key={filePath} filePath={filePath} />
+				)}
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
+// ── File tree (singleton browser of the narrator's cwd) ──
+export function FileTreeDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+	const openFilePanel = dock?.openFilePanel;
+
+	useLayoutEffect(() => {
+		const title = t("fileTree.title");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	const handleOpenFile = useCallback(
+		(absolutePath: string, fileName: string) => {
+			// Routed through the dock's existing multi-instance file viewer rather than a
+			// viewer of our own: re-opening the same path must focus the panel that is
+			// already showing it, and that dedup lives in `openFilePanel`.
+			openFilePanel?.(absolutePath, fileName);
+		},
+		[openFilePanel],
+	);
+
+	return (
+		<ToolPanelShell
+			title={t("fileTree.title")}
+			icon={<IconFolder size={16} color="var(--mantine-color-dimmed)" />}
+			props={props}
+			subjectId="__filetree__"
+			detachKind="filetree"
+		>
+			<LazyPanelBoundary>
+				<FileTreePanel narratorId={narratorId} onOpenFile={handleOpenFile} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);
@@ -923,7 +1027,9 @@ export const narratorDockComponents: Record<
 	tasks: TasksDockPanel,
 	search: SearchDockPanel,
 	userchat: UserChatDockPanel,
+	appearance: AppearanceDockPanel,
 	subagent: SubagentDockPanel,
+	filetree: FileTreeDockPanel,
 	file: FileDockPanel,
 	knowledge: KnowledgeDockPanel,
 	plugin: PluginDockPanel,
@@ -935,9 +1041,7 @@ export const narratorDockComponents: Record<
  * Close-less tab for the chat panel. The chat panel is the cluster's
  * protagonist and must never be closed (focus-page rule), so its dockview tab
  * renders the title only — no close action. Tool panels keep the default tab
- * (with close). Note: when chat is alone in its group the tab strip is hidden
- * entirely (`.dv-single-tab`); this matters only when a tool is dragged into
- * chat's group, making the strip visible.
+ * (with close).
  */
 function ChatTab(props: IDockviewPanelHeaderProps) {
 	const [title, setTitle] = useState(props.api.title ?? "");

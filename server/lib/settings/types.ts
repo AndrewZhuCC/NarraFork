@@ -521,14 +521,26 @@ export interface NarraForkSettings {
 		openBrowser: "off" | "browser" | "app";
 		/** Optional TLS configuration for HTTPS. */
 		tls?: TlsConfig;
+		/**
+		 * Extra origins allowed to read `/api/*` cross-origin, matched verbatim.
+		 *
+		 * Same-origin, loopback and editor-webview origins are allowed without being
+		 * listed here (see `lib/cors-origin.ts`), so this is only for a front end served
+		 * from a different, non-local host.
+		 */
+		allowedOrigins?: string[];
 	};
 	/**
 	 * Machine-level client fingerprint state shared across providers.
 	 * `installationId` is a persisted UUID (generated lazily) sent as the
 	 * `x-codex-installation-id` header when Codex emulation is enabled.
+	 * `claudeDeviceId` is a persisted 64-hex id (generated lazily) sent as
+	 * `metadata.user_id.device_id` on official Anthropic requests, matching the
+	 * shape and lifetime of the Claude Code CLI's own `device_id`.
 	 */
 	clientFingerprint?: {
 		installationId?: string;
+		claudeDeviceId?: string;
 	};
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
@@ -557,7 +569,15 @@ export interface NarraForkSettings {
 		 */
 		iconColor?: string;
 	};
-	paths: { defaultProjectDir: string };
+	paths: {
+		defaultProjectDir: string;
+		/**
+		 * Extra absolute directories the in-browser editor may write into, beyond a
+		 * narrator's own worktree. Empty by default; every entry widens the write
+		 * allow-list. See `fs-write-boundary.ts` for what is still refused inside one.
+		 */
+		extraWritableDirs: string[];
+	};
 	/** Knowledge base: how knowledge is auto-injected into agent context. */
 	knowledge: {
 		/** "summary" = inject matched entry summaries; "off" = disable passive injection. */

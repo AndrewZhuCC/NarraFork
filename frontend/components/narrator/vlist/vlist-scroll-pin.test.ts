@@ -54,6 +54,94 @@ describe("isSuppressedScrollEcho — telling our own write from the reader", () 
 	});
 });
 
+describe("isBottomLostToContentGrowth — a row growing beneath a pinned reader", () => {
+	/**
+	 * The shipped defect: a PENDING PERMISSION row is measured after paint (the real
+	 * InlinePermission / AskUserQuestionBanner mounts, then its ResizeObserver reports
+	 * again as the feedback textarea / target block / reflection notice settle). Between
+	 * two reports a scroll frame saw a large distance-from-bottom with the reader never
+	 * having touched anything, and unpinned auto-follow — permanently, because the pin
+	 * effect is gated on `pinnedToBottom`, so every later message landed off-screen.
+	 */
+	it("keeps the pin when the bottom moved but scrollTop did not", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// The permission form grew 120px below the viewport: same scrollTop, new bottom.
+		expect(isBottomLostToContentGrowth(true, 4000, 4000)).toBe(true);
+		// Sub-pixel settling of a programmatic write is not an upward gesture.
+		expect(isBottomLostToContentGrowth(true, 4000, 3999.6)).toBe(true);
+		// A shrinking viewport (composer grew, window resized) moves the bottom the same way.
+		expect(isBottomLostToContentGrowth(true, 0, 0)).toBe(true);
+	});
+
+	it("releases the pin as soon as the reader actually travels upward", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// Every gesture toward earlier content LOWERS scrollTop, which is the whole
+		// discriminator — no per-gesture listener needed.
+		expect(isBottomLostToContentGrowth(true, 4000, 3800)).toBe(false); // wheel / drag
+		expect(isBottomLostToContentGrowth(true, 4000, 2000)).toBe(false); // PageUp
+		expect(isBottomLostToContentGrowth(true, 4000, 3997)).toBe(false); // gentle 3px nudge
+	});
+
+	it("never re-pins a reader who had already left the bottom", async () => {
+		const { isBottomLostToContentGrowth } = await import("./PretextExactMessageList");
+		// Reading history while output streams: growth below must not drag them back.
+		expect(isBottomLostToContentGrowth(false, 1000, 1000)).toBe(false);
+		expect(isBottomLostToContentGrowth(false, 1000, 1200)).toBe(false);
+	});
+});
+
+describe("processScrollFrame answers content growth in the same frame", () => {
+	/**
+	 * Deciding to stay pinned is not enough on its own: the VIEW must also be pulled
+	 * back to the new bottom. Leaving that to the geometry-revision pin effect is not
+	 * sufficient — that effect is keyed on `exactLayout.totalHeight`, which only moves
+	 * once a reported height lands in `heightOverrides`. A report inside the 1px jitter
+	 * guard, or one for a row that already left the dynamic path, grows the real DOM box
+	 * without changing the layout, so the effect never runs and the view sits a form's
+	 * height short of the bottom.
+	 */
+	it("re-glues to the bottom and resolves the window from the settled position", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("isBottomLostToContentGrowth(");
+		// The re-glue SNAPS: what reaches it is a row settling its post-paint height,
+		// not content arriving. It only stands down for an active chase so it cannot
+		// cut a streaming glide short. (See the settle-vs-arrival group below.)
+		expect(frame).toContain(
+			"if (grewBeneathReader && smoothFollowerRef.current?.isActive() !== true)",
+		);
+		expect(frame).toContain("writeScrollTop(getScrollBottomTarget(node));");
+		// The mounted window must come from where the viewport now is, not from the
+		// pre-re-glue reading.
+		expect(frame).toContain("const settledTop = scrollTopRef.current;");
+		expect(frame).toContain("resolveVisibleWindow(layout, settledTop,");
+	});
+
+	/**
+	 * The panel's affordances read the SAME value the pin does. Reporting the raw
+	 * `atBottom` while staying pinned would flash the scroll-to-bottom button and count
+	 * unread messages for a reader who is being followed (NarratorPanel:
+	 * `showScrollToBottomButton = !isAtBottom || unreadCount > 0`).
+	 */
+	it("reports the effective pin to the panel, not the raw geometry reading", async () => {
+		const source = await Bun.file(
+			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
+		).text();
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("onAtBottomChange?.(effectiveAtBottom);");
+		expect(frame).toContain("if (effectiveAtBottom) onUnreadCountChange?.(0);");
+		expect(frame).not.toContain("onAtBottomChange?.(atBottom);");
+	});
+});
+
 describe("the scroll container disables the browser's own anchoring", () => {
 	it("sets overflow-anchor: none on the scroll viewport", async () => {
 		// The list answers every geometry change with an explicit anchored write, so
@@ -63,6 +151,121 @@ describe("the scroll container disables the browser's own anchoring", () => {
 			new URL("./PretextExactMessageList.tsx", import.meta.url).pathname,
 		).text();
 		expect(source).toContain('overflowAnchor: "none"');
+	});
+});
+
+describe("smooth bottom-follow wiring (vlist-smooth-follow)", () => {
+	async function shell() {
+		return Bun.file(new URL("./PretextExactMessageList.tsx", import.meta.url).pathname).text();
+	}
+
+	/**
+	 * ONE writer glides, and that is the whole point.
+	 *
+	 * "Content ARRIVED for a reader who is watching" is the only thing worth
+	 * animating. The other bottom writers answer a document being ESTABLISHED or
+	 * SETTLING — a fresh load, a narrator switch, a prepend re-pin, a row reporting
+	 * its post-paint height, a footer resolving, a resize — and every one of those is
+	 * a small delta, so routing them through the same gate made the list animate its
+	 * own mount: opening a narrator visibly scrolled DOWN into place instead of
+	 * opening at the bottom. That was a shipped regression, twice removed from
+	 * anything a test on the pure gate could have caught.
+	 */
+	it("glides ONLY the stamped tail-growth correction", async () => {
+		const source = await shell();
+		// The one glide entry point: a bottom correction the coordinator stamped as
+		// tail growth (streaming row / appended message / live patch at the tail).
+		expect(source).toContain('anchorKind === "bottom" && smoothFollow === true');
+		expect(source).toContain("getSmoothFollower().ensure();");
+		// And it is the ONLY one. `ensure()` anywhere else is how the mount animation
+		// came back.
+		expect(source.match(/getSmoothFollower\(\)\.ensure\(\)/g)?.length).toBe(1);
+	});
+
+	it("the pin effect SNAPS, standing down only for an active chase", async () => {
+		const source = await shell();
+		const pinEffect = source.slice(
+			source.indexOf("const scrollGeometryRevision ="),
+			source.indexOf("const scrollGeometryRevision =") + 1800,
+		);
+		// Yields to a chase (an unconditional write would land at the bottom on the
+		// next frame and cut every streaming glide short)…
+		expect(pinEffect).toContain("if (smoothFollowerRef.current?.isActive() === true) return;");
+		// …otherwise snaps, exactly as it did before any of this work.
+		expect(pinEffect).toContain("writeScrollTop(getScrollBottomTarget(viewportRef.current));");
+	});
+
+	it("non-glide corrections still land instantly and kill any chase in flight", async () => {
+		const source = await shell();
+		const correction = source.slice(
+			source.indexOf("const onScrollTopCorrection = useCallback("),
+			source.indexOf("const onScrollTopCorrection = useCallback(") + 1200,
+		);
+		// Anchored rebuilds / fold / LOD / removals keep their committed-geometry
+		// semantics: same instant write as before, and no chase survives them.
+		expect(correction).toContain("getSmoothFollower().cancel();");
+		expect(correction).toContain(
+			"writeScrollTop(applyExactScrollCorrection(nextTop, anchorKind, footerHeightRef.current));",
+		);
+	});
+
+	it("the chase dies with the pin on EVERY reader-intent path", async () => {
+		const source = await shell();
+		// wheel-up detach.
+		const detach = source.slice(
+			source.indexOf("const detachFromBottom = useCallback("),
+			source.indexOf("const detachFromBottom = useCallback(") + 400,
+		);
+		expect(detach).toContain("getSmoothFollower().cancel();");
+		// Any non-echo upward movement caught by processScrollFrame.
+		const frame = source.slice(
+			source.indexOf("const processScrollFrame = useCallback("),
+			source.indexOf("const onScroll = useCallback("),
+		);
+		expect(frame).toContain("if (!effectiveAtBottom) getSmoothFollower().cancel();");
+		// Explicit jumps: scrollToBottom handle, user-marker jump, message reveal.
+		const toBottom = source.slice(
+			source.indexOf("const scrollToBottom = useCallback("),
+			source.indexOf("const scrollToBottom = useCallback(") + 500,
+		);
+		expect(toBottom).toContain("getSmoothFollower().cancel();");
+		const reveal = source.slice(
+			source.indexOf("const scrollToMessageTarget = useCallback("),
+			source.indexOf("const scrollToMessageTarget = useCallback(") + 900,
+		);
+		expect(reveal).toContain("getSmoothFollower().cancel();");
+	});
+
+	it("fold and LOD transitions land the chase BEFORE capturing geometry", async () => {
+		const source = await shell();
+		// Both plan their FLIP/morph against the predicted bottom while pinned; a
+		// chase still gliding would move rows under the running animation.
+		const foldCapture = source.slice(
+			source.indexOf("const captureFoldBefore = useCallback("),
+			source.indexOf("const captureFoldBefore = useCallback(") + 700,
+		);
+		expect(foldCapture).toContain("smoothFollowerRef.current?.snapToTarget();");
+		const lodEmit = source.slice(
+			source.indexOf("const emit = (dir: 1 | -1"),
+			source.indexOf("const emit = (dir: 1 | -1") + 500,
+		);
+		expect(lodEmit).toContain("smoothFollowerRef.current?.snapToTarget();");
+	});
+
+	it("readCurrentView treats an active chase AS the bottom pin", async () => {
+		// Without this the chase's own lag makes every streaming commit capture an
+		// ITEM anchor, whose correction cancels the chase it should feed (thrash).
+		const source = await shell();
+		const view = source.slice(
+			source.indexOf("const readCurrentView = useCallback("),
+			source.indexOf("const readCurrentView = useCallback(") + 1200,
+		);
+		expect(view).toContain("smoothFollowerRef.current?.isActive()");
+	});
+
+	it("the chase never outlives the shell", async () => {
+		const source = await shell();
+		expect(source).toContain("useEffect(() => () => smoothFollowerRef.current?.cancel(), []);");
 	});
 });
 

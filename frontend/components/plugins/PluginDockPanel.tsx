@@ -12,13 +12,16 @@ import {
 } from "@mantine/core";
 import { IconAlertTriangle, IconPlugConnected, IconRefresh, IconTrash } from "@tabler/icons-react";
 import type { IDockviewPanelProps } from "dockview-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { pluginContributionStore } from "./PluginContributionStore";
-import { PluginPanelSlot, useOptionalPluginUiRuntime } from "./PluginUiRuntimeProvider";
+import { PluginPanelSlot } from "./PluginUiRuntimeProvider";
 import { usePluginUiSurface } from "./PluginUiSurfaceContext";
+// The hook comes from the context module (a non-component export in the provider breaks
+// its Fast Refresh boundary); the slot component from the provider itself.
+import { useOptionalPluginUiRuntime } from "./plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
 import { PluginUiHostError } from "./runtime";
@@ -151,6 +154,7 @@ export function PluginDockPanelView({
 	const runtime = useOptionalPluginUiRuntime();
 	const surface = usePluginUiSurface();
 	const params = useMemo(() => parsePluginDockPanelParams(rawParams), [rawParams]);
+	const lastAppliedTitleRef = useRef<string | null>(null);
 	const ownerNarratorId = params ? surface?.resolveOwnerNarratorId(params) : undefined;
 	const { data: ownerNarrator } = useNarrator(ownerNarratorId ?? "");
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator API entity
@@ -184,6 +188,11 @@ export function PluginDockPanelView({
 	}, [params, runtime]);
 	const snapshot =
 		params && runtime ? runtime.getSessionSnapshot(params.panelInstanceId) : undefined;
+	// The live session controller, if any. The session iframe renders INSIDE this
+	// panel's dock content (mirroring how built-in tool panels render their
+	// content), so the dock natively manages tab switching, hiding and movement.
+	const controller =
+		params && runtime ? runtime.getSessionController(params.panelInstanceId) : undefined;
 
 	useEffect(() => {
 		if (
@@ -237,7 +246,15 @@ export function PluginDockPanelView({
 		if (!params || !contribution) return;
 		const title =
 			contribution.title?.trim() || contribution.pluginName?.trim() || params.contributionId;
-		if (title && hostApi.title !== title) hostApi.setTitle(title);
+		// Only apply the title once per distinct value. `contribution` is a fresh
+		// object on every render (toPluginUiContribution builds a new literal) and
+		// `hostApi.title` does not reflect `setTitle` on every dock implementation,
+		// so comparing against hostApi.title alone would re-invoke setTitle on every
+		// render → Dockview updates state → render loop (React #185).
+		if (title && lastAppliedTitleRef.current !== title) {
+			lastAppliedTitleRef.current = title;
+			hostApi.setTitle(title);
+		}
 	}, [contribution, params, hostApi]);
 
 	if (!params) {
@@ -308,6 +325,31 @@ export function PluginDockPanelView({
 			</PluginPanelSlot>
 		</Box>
 	);
+	// A crashed/disposed session must show the error placeholder, not the iframe.
+	const sessionBroken = snapshot && ["error", "crashed", "disposed"].includes(snapshot.status);
+	if (controller && !sessionBroken) {
+		// Live session: render the iframe directly in the panel content. The
+		// handshake happens on iframe load (controller.attach), same as before.
+		return withSlot(
+			<iframe
+				srcDoc={controller.getSrcdoc()}
+				sandbox="allow-scripts"
+				allow=""
+				referrerPolicy="no-referrer"
+				title={contribution.title || params.contributionId}
+				onLoad={(event) => controller.attach(event.currentTarget)}
+				onFocus={() => controller.setFocused(true)}
+				onBlur={() => controller.setFocused(false)}
+				style={{
+					width: "100%",
+					height: "100%",
+					border: 0,
+					display: "block",
+					pointerEvents: "auto",
+				}}
+			/>,
+		);
+	}
 	if (!snapshot || ["pending", "registered", "connecting"].includes(snapshot.status)) {
 		return withSlot(
 			<Placeholder
@@ -362,10 +404,7 @@ export function PluginDockPanel(props: IDockviewPanelProps<PluginDockPanelParams
 	return <PluginDockPanelView rawParams={props.params} hostApi={hostApi} />;
 }
 
-export const PLUGIN_DOCKVIEW_COMPONENT = "plugin" as const;
-
-export function withPluginDockviewComponent<T extends Record<string, unknown>>(components: T) {
-	return { ...components, [PLUGIN_DOCKVIEW_COMPONENT]: PluginDockPanel };
-}
-
-export const pluginDockviewComponents = { [PLUGIN_DOCKVIEW_COMPONENT]: PluginDockPanel };
+// `PLUGIN_DOCKVIEW_COMPONENT`, `withPluginDockviewComponent` and
+// `pluginDockviewComponents` moved to `plugin-dockview-components.ts`. They are not
+// components, and a non-component export here invalidates this module's Fast Refresh
+// boundary — see that file's header for the measurement.

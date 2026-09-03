@@ -223,6 +223,29 @@ Kiro 订阅自带一个托管的 `web_search` MCP 工具。内置实现把它做
 是否有效或是否已耗尽配额。无效凭据会得到一条「看起来可用、执行时失败」的通道，随后 router 落到下一条。这与内置
 `custom-api` 通道的行为一致，但对搜索这种有回退链的场景，失败的那次调用是真实的时间成本。
 
+## i18n：已改为使用宿主 SDK（原先读错了语言源）
+
+`src/ui/strings.ts` 原先从 `navigator.language` 挑表，依据是一句注释声称
+`context.host.locale` 是 `"unknown"` 占位符。**那条注释是错的**——该字段一直携带真实值
+（`App.tsx` 填的是 `i18n.language`），只有宿主未接 `getContext` 时的 fallback 才是 `"unknown"`。
+
+代价是具体的：**用户把应用设为中文、但浏览器是英文时，面板显示英文**，
+一个被明确设置过的偏好被静默覆盖。而且旧实现在模块加载时就选定了表
+（`const table = pickTable()`），即使 locale 会变也无法跟随。
+
+现在 `t()` 每次调用委托给 `narrafork.i18n.t()`，由宿主提供当前语言与回退链
+（含 `zh-Hans`/`zh-SG` → `zh-CN` 的别名归一），词表仍留在插件里。
+面板订阅 `onLocaleChange()` 后 bump 一个 state 触发重渲染——
+文本不像 CSS 变量那样能自动跟随，见 `05-ui-bridge-and-dockview.md` §7.5b。
+
+`renderFatal()` 里那处「`strings.ts` 只读 `navigator.language` 所以安全」的注释也已更正：
+它现在读 `globalThis.narrafork.i18n`，该对象由宿主在加载本文件前注入，
+不依赖刚刚失败的共享 runtime——保证不变，来源变了。
+
+**主题**：面板用共享 host runtime 的 Mantine，配色本来就来自宿主主题；
+本轮只把 `renderFatal()` 的两个硬编码色值改为 `var(--nf-color-*, <原值>)`，
+因为那条路径刻意不用 runtime（它处理的正是「React/Mantine 不可用」）。
+
 ## 构建
 
 ```bash

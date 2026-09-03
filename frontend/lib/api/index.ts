@@ -1,7 +1,7 @@
 import { authApi } from "./auth";
 import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
-import { BASE } from "./client";
+import { apiBase } from "./client";
 import { devicesApi } from "./devices";
 import { gitApi } from "./git";
 import { integrationsApi } from "./integrations";
@@ -20,7 +20,7 @@ import { terminalsApi } from "./terminals";
 import { traitLayersApi } from "./trait-layers";
 
 export function getAvatarUrl(userId: string, avatarImageId: string): string {
-	return `${BASE}/uploads/avatars/${userId}/${avatarImageId}`;
+	return `${apiBase()}/uploads/avatars/${userId}/${avatarImageId}`;
 }
 
 export const api = {
@@ -132,6 +132,8 @@ export type {
 	KnowledgeVerdict,
 	KnowledgeWithdrawResult,
 } from "./knowledge-types";
+export type { WorkspaceDetail } from "./misc";
+export { isWorkspaceLayoutConflict, WORKSPACE_LAYOUT_CONFLICT_CODE } from "./misc";
 export type {
 	CreateOAuthAppInput,
 	OAuthApp,

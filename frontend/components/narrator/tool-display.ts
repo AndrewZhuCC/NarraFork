@@ -15,10 +15,12 @@ export type ToolCategory =
 	| "pipeline"
 	| "terminal"
 	| "share"
+	| "transfer"
 	| "recall"
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "schedule"
 	| "generic";
 
 const READ_TOOLS = new Set(["Read"]);
@@ -64,7 +66,9 @@ const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const PIPELINE_TOOLS = new Set(["StartPipeline", "ExtractPipeline", "EndPipeline"]);
 const TERMINAL_TOOLS = new Set(["Terminal"]);
 const SHARE_TOOLS = new Set(["ShareFile"]);
+const TRANSFER_TOOLS = new Set(["TransferFile"]);
 const RECALL_TOOLS = new Set(["Recall"]);
+const SCHEDULE_TOOLS = new Set(["ScheduledTask"]);
 const SKILL_TOOLS = new Set(["Skill"]);
 const BROWSER_TOOLS = new Set(["Browser"]);
 const KNOWLEDGE_TOOLS = new Set([
@@ -95,7 +99,9 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (PIPELINE_TOOLS.has(name)) return "pipeline";
 	if (TERMINAL_TOOLS.has(name)) return "terminal";
 	if (SHARE_TOOLS.has(name)) return "share";
+	if (TRANSFER_TOOLS.has(name)) return "transfer";
 	if (RECALL_TOOLS.has(name)) return "recall";
+	if (SCHEDULE_TOOLS.has(name)) return "schedule";
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
@@ -135,6 +141,13 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "teal";
 		case "share":
 			return "green";
+		// Not share's green: the two are adjacent in meaning (both hand a file
+		// somewhere) and a reader scanning a long run needs to tell "published a
+		// download link" from "moved bytes to a device" at a glance. Blue is already
+		// send/ask's colour, but those never sit next to a transfer the way a share
+		// does, and the glyph disambiguates.
+		case "transfer":
+			return "blue";
 		case "taskOutput":
 		case "await":
 			return "indigo";
@@ -154,6 +167,12 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "yellow";
 		case "recall":
 			return "cyan";
+		// Shares terminal's yellow rather than taking a new hue. The palette's unused
+		// slot is red, which reads as failure on a row that succeeded. Terminal and
+		// ScheduledTask calls rarely sit next to each other, and the glyph plus the
+		// `ScheduledTask · …` title disambiguate when they do.
+		case "schedule":
+			return "yellow";
 		default:
 			return "gray";
 	}
@@ -199,6 +218,18 @@ import {
 	subagentSummaryToPartialInput,
 } from "@shared/subagent-tool-summary";
 import { agentTargetDisplay, formatAgentIdForDisplay } from "./agent-id-display";
+
+/**
+ * The `task.name` field of a ScheduledTask call, if the nested object survived
+ * field-level projection. Returns "" when the payload is truncated at any level —
+ * the caller then falls back to the task id.
+ */
+function readTaskFieldName(input: unknown): string {
+	if (!input || isTruncated(input) || typeof input !== "object") return "";
+	const task = (input as Record<string, unknown>).task;
+	if (!task || isTruncated(task) || typeof task !== "object") return "";
+	return readLeafText((task as Record<string, unknown>).name) ?? "";
+}
 
 function extractStringArrayField(val: unknown, key: string): string[] {
 	if (!val || isTruncated(val) || typeof val !== "object") return [];
@@ -434,6 +465,23 @@ export function getSummary(
 			const fp = getFilePath(input);
 			return fp ? basename(fp) : "Share";
 		}
+		case "transfer": {
+			const direction = extractField(input, "direction");
+			const remotePath = extractField(input, "remotePath");
+			const localPath = extractField(input, "localPath");
+			// The device NAME comes from metadata: the input only carries the nanoid,
+			// which tells the reader nothing. Falls back to nothing rather than to the
+			// id — a bare `SXz3MqJ…` in the header is noise, and the detail card shows
+			// the resolved name anyway.
+			const deviceName = readLeafText(metadata?.deviceName);
+			// Name the file being moved, not the source: for both directions the
+			// interesting basename is the same one, and remotePath is the side the
+			// user typically named explicitly.
+			const name = remotePath ? basename(remotePath) : localPath ? basename(localPath) : "";
+			const arrow = direction === "upload" ? "→" : "←";
+			if (!name) return deviceName ? `${arrow} ${deviceName}` : direction || "Transfer";
+			return short(deviceName ? `${name} ${arrow} ${deviceName}` : name, 60);
+		}
 		case "skill": {
 			const skillName = extractField(input, "skill", "name");
 			const skillArgs = extractField(input, "args");
@@ -455,6 +503,17 @@ export function getSummary(
 		}
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
+		case "schedule": {
+			const action = extractField(input, "action");
+			// The task NAME is the only useful identifier here; a bare nanoid id tells the
+			// reader nothing. `create`/`update` carry it in `task.name`, the id-based actions
+			// do not, so those fall back to a short id rather than showing nothing.
+			const taskName = readTaskFieldName(input);
+			const taskId = extractField(input, "id");
+			const label = taskName || (taskId ? `${taskId.slice(0, 8)}…` : "");
+			if (!action) return label ? `Schedule: ${label}` : "Schedule";
+			return label ? short(`${action}: ${label}`, 60) : action;
+		}
 		default:
 			return toolName;
 	}

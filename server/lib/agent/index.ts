@@ -75,7 +75,11 @@ export { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 export async function buildHistory(
 	dbMessages: import("./provider").DbMessage[],
 	model: string,
-	provider = "kiro",
+	// Required on purpose. This used to default to "kiro", which meant an
+	// unprefixed model silently became a Kiro model — naming a provider the
+	// caller never chose and reporting the eventual failure against it. Both
+	// callers resolve the provider before calling, so there is nothing to guess.
+	provider: string,
 	narratorId?: string,
 ): Promise<BuiltHistory> {
 	const requestedModel = model || settings.agent.defaultModel;

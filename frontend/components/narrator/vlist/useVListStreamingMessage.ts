@@ -31,6 +31,7 @@ import {
 } from "../message-segments";
 import { buildTopLevelStreamingChunksMsg } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { dropSupersededStreamingBlocks } from "../streaming-block-supersede";
 import {
 	applyExactStreamDelta,
 	applyExactStreamingSnapshot,
@@ -44,6 +45,7 @@ import {
 	applyStreamingToolExecuting,
 	applyStreamingToolLongRunning,
 	applyStreamingToolOutput,
+	applyStreamingToolProgress,
 	applyStreamingToolStarted,
 	collectPersistedToolUseIds,
 	createStreamingToolStore,
@@ -125,6 +127,25 @@ export function useVListStreamingMessage(
 	 * provider used (see @shared/pretext-layout/streaming-live-blocks).
 	 */
 	const liveBlockIndexRef = useRef(-1);
+	/**
+	 * The block currently being written, held BY REFERENCE.
+	 *
+	 * Separate from `liveBlockIndexRef` on purpose, and not derivable from it. That ref
+	 * is an array INDEX, valid only for the array as it stood after the fold that set it
+	 * (see StreamDeltaResult.blockIndex): `upsertStreaming*Block` splices native
+	 * web_search / image_generation blocks in by `outputIndex` and does NOT update it, so
+	 * in a stream that mixes native blocks with text the index can name a neighbour.
+	 *
+	 * That staleness is harmless for its existing consumer — `buildStreamingMsg` uses it
+	 * to mark which lane is "still writing", so at worst a highlight lands one row off.
+	 * It is NOT harmless for `dropSupersededStreamingBlocks`, which uses this ref as a
+	 * deletion guard: protecting the wrong block would leave the lane that is actually
+	 * growing unprotected, and its short first delta can spuriously match an earlier
+	 * step's persisted text. So the block is captured at the moment the index is fresh
+	 * and compared by identity afterwards. References stay valid across splices because
+	 * text/reasoning blocks are mutated in place.
+	 */
+	const liveBlockRef = useRef<StreamingBlock | null>(null);
 	const [version, setVersion] = useState(0);
 	/**
 	 * Total characters this row has accumulated, and the value at the moment the
@@ -158,6 +179,7 @@ export function useVListStreamingMessage(
 		accumulatedCharsRef.current = 0;
 		charsAtLastCommitRef.current = 0;
 		liveBlockIndexRef.current = -1;
+		liveBlockRef.current = null;
 		const hadContent = blocksRef.current.length > 0 || toolStoreRef.current.size > 0;
 		if (hadContent) {
 			blocksRef.current = [];
@@ -241,6 +263,24 @@ export function useVListStreamingMessage(
 		}
 	}, [persistedToolUseIds]);
 
+	// Per-BLOCK hand-off, the text/reasoning counterpart of the per-tool one above.
+	//
+	// The server archives each finished block into the partial assistant message as it
+	// streams, but that row is invisible to clients until something delivers it — and
+	// when a reconnect catch-up finally does, the live row is still holding the same
+	// blocks, so the paragraph renders twice (see streaming-block-supersede.ts).
+	//
+	// Keyed on `committedMessages` for the same reason as the tool half: the trigger is
+	// "the document now contains it", a structural fact, not the arrival of some frame.
+	// `liveBlockRef` is read through the ref rather than declared as a dependency — it
+	// changes on every delta, and its only role is naming which block must not be
+	// touched during THIS evaluation.
+	useEffect(() => {
+		if (dropSupersededStreamingBlocks(blocksRef.current, committedMessages, liveBlockRef.current)) {
+			flush();
+		}
+	}, [committedMessages, flush]);
+
 	/**
 	 * Record streaming stdout, rate-limited per tool.
 	 *
@@ -301,6 +341,9 @@ export function useVListStreamingMessage(
 					// arriving after a tool call legitimately REOPENS the text lane, which is
 					// why this is set on every delta rather than only advanced forward.
 					liveBlockIndexRef.current = result.blockIndex;
+					// Capture the block ITSELF while the index is still fresh. See
+					// liveBlockRef's declaration for why the index cannot be resolved later.
+					liveBlockRef.current = blocksRef.current[result.blockIndex] ?? null;
 					accumulatedCharsRef.current = currentCharCount();
 					flush();
 				}
@@ -394,6 +437,7 @@ export function useVListStreamingMessage(
 				// reasoning or text preceded this is finished and must settle now instead of
 				// waiting for the turn to persist.
 				liveBlockIndexRef.current = -1;
+				liveBlockRef.current = null;
 				if (
 					applyStreamingToolChunk(toolStoreRef.current, {
 						toolUseId,
@@ -455,6 +499,13 @@ export function useVListStreamingMessage(
 			onToolOutput: (toolUseId, output, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;
 				pushToolOutput(toolUseId, output);
+			},
+			// Determinate progress. NOT routed through the text throttle: the producer
+			// already coalesces to ~4 frames/s, and the payload is a few numbers rather
+			// than a growing string, so a second throttle would only delay the bar.
+			onToolStructuredProgress: (toolUseId, progress, rawParentToolUseId) => {
+				if (!isSubagent && rawParentToolUseId) return;
+				if (applyStreamingToolProgress(toolStoreRef.current, toolUseId, progress)) flush();
 			},
 			onToolLongRunning: (toolUseId, _elapsedMs, rawParentToolUseId) => {
 				if (!isSubagent && rawParentToolUseId) return;

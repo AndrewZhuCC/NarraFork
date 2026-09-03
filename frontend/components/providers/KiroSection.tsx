@@ -38,7 +38,7 @@ import {
 import { type ModelOption, modelValue } from "../../lib/constants";
 import type { ProxyOverride } from "../../lib/proxy";
 import { relativeTime } from "../../lib/relative-time";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import {
 	getCredentialPageSelectionState,

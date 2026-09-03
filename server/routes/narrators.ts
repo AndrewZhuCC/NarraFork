@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { isAbsolute } from "node:path";
+import { mkdirSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { formatOriginLabel } from "@shared/message-origin";
 import {
-	MAX_EDIT_ATTACHMENTS_PER_TYPE,
+	MAX_EDIT_IMAGES_PER_MESSAGE,
+	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
 import {
@@ -125,7 +127,7 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction } from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -245,6 +247,7 @@ import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
+	resolveDecisionNarratorId,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
 } from "../services/narrator-permission";
@@ -321,7 +324,6 @@ import {
 	type BufferedMessage,
 	getNarratorRuntimeModel,
 	isNarratorRuntimeBusy,
-	pendingPermissions,
 	planModeAskedOnce,
 	requestPlanModePromptRebuild,
 	resetActiveUpstreamSession,
@@ -364,6 +366,7 @@ import {
 } from "../services/snapshot-revert";
 import { broadcastSpecChanged } from "../services/spec-broadcast";
 import { appendProtectedSpecTask } from "../services/spec-vfs-service";
+import { resolveStandaloneNarratorCwd } from "../services/standalone-narrator-cwd";
 import { resumeSubagent, withSubagentResumeLock } from "../services/subagent-resume";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
 import { usageHistoryService } from "../services/usage-history-service";
@@ -398,12 +401,14 @@ export async function parseMessageRequest(
 		const rawMessage = formData.get("message");
 		const message = typeof rawMessage === "string" ? rawMessage : "";
 		const imageFiles = formData.getAll("images") as File[];
-		if (imageFiles.length > 10) {
-			throw new ValidationError("Maximum 10 images per message");
+		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > 10) {
-			throw new ValidationError("Maximum 10 text files per message");
+		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+			throw new ValidationError(
+				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
+			);
 		}
 		// An attachment carries the turn on its own: images (and text files, whose
 		// paths are injected as an <attached_files> hint) are meaningful content even
@@ -554,13 +559,14 @@ narratorRoutes.use("/:id", async (c, next) => {
  * Approving a tool call is the single most consequential action on this surface —
  * it is what lets an agent write files or run commands — and the path carries no
  * narrator id, so the gates above cannot see these routes at all. The owning
- * narrator is resolved from the pending request (in memory) or from the tool-call
- * row (once decided), and write access is required.
+ * narrator is resolved through `resolveDecisionNarratorId`, which knows every
+ * decision registry (permission, danger/plan/task/question reflection) plus the
+ * tool-call-row fallback, and write access is required.
  */
 narratorRoutes.use("/permissions/:requestId/*", async (c, next) => {
 	const requestId = c.req.param("requestId");
 	if (!requestId) return next();
-	await requireOwningNarratorAccess(c, () => resolvePermissionNarratorId(requestId), "write");
+	await requireOwningNarratorAccess(c, () => resolveDecisionNarratorId(requestId), "write");
 	return next();
 });
 
@@ -581,19 +587,6 @@ for (const segment of [
 		await requireOwningNarratorAccess(c, () => resolveRuleNarratorId(segment, entryId), "write");
 		return next();
 	});
-}
-
-/** The narrator a permission request belongs to, pending or already decided. */
-async function resolvePermissionNarratorId(requestId: string): Promise<string | null> {
-	const pending = pendingPermissions.get(requestId);
-	if (pending?.narratorId) return pending.narratorId;
-	// Decided (or reflection-driven) requests are only in the tool-call table. The
-	// request id is the tool-call row id.
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
-	return row?.narratorId ?? null;
 }
 
 /** The narrator owning one allow/deny-list entry. */
@@ -943,6 +936,33 @@ narratorRoutes.get("/", async (c) => {
 	);
 });
 
+/**
+ * Bind the standalone-cwd decision to this process's real filesystem and settings.
+ *
+ * The decision itself lives in `standalone-narrator-cwd` so its branches (a `~` to
+ * expand, a configured directory that cannot be created) are unit-testable without a
+ * disk.
+ */
+function standaloneNarratorCwd(input: {
+	cwd?: string;
+	chapterId?: string | null;
+}): string | undefined {
+	return resolveStandaloneNarratorCwd(input, {
+		home: getHome(),
+		configuredDir: settings.paths.defaultProjectDir,
+		ensureDir: (path) => {
+			mkdirSync(path, { recursive: true });
+		},
+		toAbsolute: (path) => resolve(path),
+		onEnsureFailed: (path, error) => {
+			logger.warn("Failed to ensure default project dir exists for narrator cwd", {
+				path,
+				error: String(error),
+			});
+		},
+	});
+}
+
 // Create narrator
 narratorRoutes.post("/", async (c) => {
 	const body = await c.req.json();
@@ -962,12 +982,14 @@ narratorRoutes.post("/", async (c) => {
 	// Ownership always comes from the authenticated session, never from the body:
 	// a client must not be able to create a narrator on someone else's behalf.
 	const ownerUserId = c.get("user").sub;
+	const resolvedCwd = standaloneNarratorCwd(input);
 
 	if (input.kind) {
 		const user = c.get("user");
 		const locale = await getUserLanguage(user.sub);
 		const narrator = await narratorService.create({
 			...input,
+			cwd: resolvedCwd,
 			ownerUserId,
 			creatorIsAdmin: user.role === "admin",
 			locale,
@@ -975,7 +997,11 @@ narratorRoutes.post("/", async (c) => {
 		return c.json(publicNarratorResponse(narrator), 201);
 	}
 
-	const narrator = await narratorService.create({ ...input, ownerUserId });
+	const narrator = await narratorService.create({
+		...input,
+		cwd: resolvedCwd,
+		ownerUserId,
+	});
 	return c.json(publicNarratorResponse(narrator), 201);
 });
 
@@ -2273,16 +2299,18 @@ narratorRoutes.post("/:id/edit-and-regenerate/:messageId", async (c) => {
 			);
 		}
 		const imageFiles = formData.getAll("images") as File[];
-		if (imageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-			throw new ValidationError("Maximum 10 images per message");
+		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 		}
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 			newImages.push(file);
 		}
 		const textFileEntries = formData.getAll("textFiles") as File[];
-		if (textFileEntries.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-			throw new ValidationError("Maximum 10 text files per message");
+		if (textFileEntries.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+			throw new ValidationError(
+				`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`,
+			);
 		}
 		for (const file of textFileEntries) {
 			validateTextFile(file);
@@ -2603,11 +2631,11 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles,
 	);
 
-	if (keptImages.length + newImageFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-		throw new ValidationError("Maximum 10 images per message");
+	if (keptImages.length + newImageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
-	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_ATTACHMENTS_PER_TYPE) {
-		throw new ValidationError("Maximum 10 text files per message");
+	if (keptTextFileIndexes.length + newTextFiles.length > MAX_EDIT_TEXT_FILES_PER_MESSAGE) {
+		throw new ValidationError(`Maximum ${MAX_EDIT_TEXT_FILES_PER_MESSAGE} text files per message`);
 	}
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
@@ -3340,10 +3368,29 @@ narratorRoutes.post("/:id/interrupt", async (c) => {
 	if (!interrupted) {
 		// Fallback: the UI Stop button should hard-stop foreground/background subagents.
 		// The soft foreground interrupt is still used by Send({ doInterrupt: true }).
-		const { cancelBackgroundTask, interruptForegroundSubagent } = await import(
+		const { cancelBackgroundTask, interruptForegroundSubagent, isTakenOver } = await import(
 			"../services/narrator-subagent"
 		);
-		interrupted = interruptForegroundSubagent(id, { hard: true });
+		// EXCEPTION — a taken-over subagent must never be HARD interrupted from here.
+		// A hard interrupt makes runForegroundLoop break out of its loop before the
+		// queue-drain and the takeover suspension, so `finalizeSubagent` discards
+		// every queued message and the parent's blocked tool call is resolved — the
+		// takeover silently ends and the user's message is lost. During a takeover the
+		// user drives this subagent like an independent narrator, so Stop means "stop
+		// the current turn", exactly as the soft interrupt does: the loop then drains
+		// the queue (or re-suspends in `taken_over`) and the parent stays blocked.
+		//
+		// CONSEQUENCE, deliberate: while a taken-over subagent is SUSPENDED (parked in
+		// idle[taken_over] awaiting the user's next command, no foreground controller),
+		// this reports false and changes nothing — including the zombie fallback below,
+		// which only fires for working/waiting. That is the honest answer: no turn is in
+		// flight to stop. The alternative is worse — the soft path's only other lever is
+		// `interruptManualOverride`, which SETTLES the subagent and hands a result to the
+		// parent, i.e. it would END the takeover rather than interrupt anything. Ending
+		// one is `POST /:id/stop-takeover`'s job. The UI matches: it shows "Stop takeover"
+		// rather than Stop while suspended, so the inert button is unreachable there; a
+		// direct API caller gets `{interrupted: false}`.
+		interrupted = interruptForegroundSubagent(id, { hard: !isTakenOver(id) });
 		if (!interrupted) {
 			interrupted = await cancelBackgroundTask(id);
 		}
@@ -5913,6 +5960,29 @@ narratorRoutes.post("/:id/background-tasks/:taskId/cancel", async (c) => {
 	const task = await backgroundTaskService.getById(taskId);
 	if (task && task.parentNarratorId !== parentNarratorId) {
 		return c.json({ error: "Task does not belong to this narrator" }, 403);
+	}
+
+	// A transfer's projection row cannot be cancelled on its own: the work lives in
+	// the owning `device_transfer_tasks` row, which holds the resume checkpoint. Only
+	// cancelling that discards the checkpoint and aborts the in-flight run — marking
+	// the projection alone would show "cancelled" while bytes kept moving.
+	if (task?.type === "transfer") {
+		if (!task.transferTaskId) {
+			return c.json({ error: "Transfer task has no owning transfer record" }, 409);
+		}
+		const { cancelDeviceTransferTaskById } = await import("../services/device-transfer-service");
+		const cancelled = await cancelDeviceTransferTaskById(task.transferTaskId);
+		if (!cancelled) {
+			return c.json({ error: "Transfer is not cancellable" }, 409);
+		}
+		// The projection follows from the runner's own terminal report, so it is not
+		// written here — one owner, one writer.
+		return c.json({
+			success: true,
+			cancelledTask: true,
+			interruptedContinuation: false,
+			cancelledChildren: 0,
+		});
 	}
 
 	const subagentId = task?.type === "agent" ? (task.subagentNarratorId ?? task.id) : taskId;

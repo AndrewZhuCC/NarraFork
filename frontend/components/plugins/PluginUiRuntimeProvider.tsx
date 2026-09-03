@@ -1,8 +1,5 @@
-import { createSharedContext } from "@frontend/lib/shared-context";
-import { Box } from "@mantine/core";
 import {
 	useCallback,
-	useContext,
 	useEffect,
 	useLayoutEffect,
 	useMemo,
@@ -15,8 +12,25 @@ import {
 	type PluginUiPanelDelegate,
 	routePluginUiHostLocalRequest,
 } from "./host-local-router";
+/*
+ * The context, its record types, the two consumer hooks and `fallbackPluginUiContext` live
+ * in `plugin-ui-runtime-context.ts`.
+ *
+ * Non-component exports here made this module an INVALID Fast Refresh boundary, and this
+ * provider is mounted in `App.tsx` — so the invalidation sat on the app shell's own
+ * propagation path and turned shell edits into full page reloads. See that file's header.
+ */
+import { readHostPresentation, subscribeHostPresentation } from "./host-presentation";
 import { pluginContributionStore, toPluginUiContribution } from "./PluginContributionStore";
 import type { PluginUiSessionContext } from "./PluginUiSurfaceContext";
+import {
+	fallbackPluginUiContext,
+	RuntimeContext,
+	type RuntimeContextValue,
+	type SessionRecord,
+	type SlotRecord,
+	usePluginUiRuntime,
+} from "./plugin-ui-runtime-context";
 import type { PluginDockPanelParams } from "./protocol";
 import { parsePluginDockPanelParams } from "./protocol";
 import { PluginUiSession } from "./runtime";
@@ -32,49 +46,8 @@ import type {
 	PluginUiContext,
 	PluginUiContribution,
 	PluginUiRequestContext,
-	PluginUiRuntimeApi,
 	PluginUiRuntimeProviderProps,
-	PluginUiSessionSnapshot,
 } from "./types";
-
-interface SlotRecord {
-	element: HTMLElement;
-	priority: number;
-	visible: boolean;
-	active: boolean;
-	rect: { left: number; top: number; width: number; height: number };
-}
-
-interface SessionRecord {
-	params: PluginDockPanelParams;
-	sessionContext: PluginUiSessionContext;
-	contribution: PluginUiContribution;
-	materialized?: MaterializedPluginUiSession;
-	controller?: PluginUiSession;
-	snapshot: PluginUiSessionSnapshot;
-	/** Monotonic rebuild counter; bumps on every session rebuild so stale async completions are dropped. */
-	requestGeneration: number;
-	/** Backend rebuild attempts for the current identity. Session-401 auto-recovery is allowed exactly once. */
-	rebuildAttempts: number;
-	abortController: AbortController;
-	revoked: boolean;
-}
-
-interface RuntimeContextValue extends PluginUiRuntimeApi {
-	getSessions: () => SessionRecord[];
-	getSlots: (panelInstanceId: string) => SlotRecord[];
-}
-
-/**
- * Registry-keyed: the provider is mounted once by `main.tsx` while consumers live
- * in lazily-loaded dock panels, so a Fast Refresh re-evaluation (or a duplicated
- * production chunk) would otherwise split them across two context objects and
- * surface as "PluginUiRuntimeProvider is required". See `lib/shared-context.ts`.
- */
-const RuntimeContext = createSharedContext<RuntimeContextValue | null>(
-	"plugins/PluginUiRuntimeProvider",
-	null,
-);
 
 function readRect(element: HTMLElement): SlotRecord["rect"] {
 	const rect = element.getBoundingClientRect();
@@ -83,6 +56,18 @@ function readRect(element: HTMLElement): SlotRecord["rect"] {
 
 function isSlotVisible(slot: SlotRecord): boolean {
 	return slot.visible && slot.rect.width > 0 && slot.rect.height > 0;
+}
+
+function sameSlotState(a: SlotRecord, b: SlotRecord): boolean {
+	return (
+		a.priority === b.priority &&
+		a.visible === b.visible &&
+		a.active === b.active &&
+		a.rect.left === b.rect.left &&
+		a.rect.top === b.rect.top &&
+		a.rect.width === b.rect.width &&
+		a.rect.height === b.rect.height
+	);
 }
 
 /** Session-identity fields: when any of these change the session must be rebuilt. */
@@ -113,16 +98,6 @@ function isSessionInvalidError(error: unknown): boolean {
 		return (error as { code?: unknown }).code === "PLUGIN_UI_SESSION_INVALID";
 	}
 	return false;
-}
-
-export function usePluginUiRuntime(): RuntimeContextValue {
-	const value = useContext(RuntimeContext);
-	if (!value) throw new Error("PluginUiRuntimeProvider is required");
-	return value;
-}
-
-export function useOptionalPluginUiRuntime(): RuntimeContextValue | null {
-	return useContext(RuntimeContext);
 }
 
 export function PluginUiRuntimeProvider({
@@ -211,6 +186,14 @@ export function PluginUiRuntimeProvider({
 				showNotification: hostLocalRef.current?.showNotification,
 				openPanel: hostLocalRef.current?.openPanel,
 				openExternal: hostLocalRef.current?.openExternal,
+				navigate:
+					// main.tsx injects the live-router navigate via hostLocal;
+					// fall back to a no-op-ish error so a missing bridge surfaces
+					// as an explicit rejection instead of a silent success.
+					hostLocalRef.current?.navigate ??
+					((_to: string) => {
+						throw new Error("Plugin UI navigation bridge is not wired");
+					}),
 			};
 			return routePluginUiHostLocalRequest(context, options);
 		},
@@ -273,6 +256,13 @@ export function PluginUiRuntimeProvider({
 				return;
 			}
 			if (existing) {
+				if (import.meta.env.DEV) {
+					// eslint-disable-next-line no-console
+					console.debug(`[plugin-ui] ensureSession ${params.panelInstanceId}: rebuilding session`, {
+						identityChanged: !sameSessionIdentity(existing, contribution),
+						contextChanged: !sameSessionContext(existing.sessionContext, sessionContext),
+					});
+				}
 				sessionRecoveryBudgetRef.current.reset(params.panelInstanceId);
 				disposeRecord(existing);
 				sessionsRef.current.delete(params.panelInstanceId);
@@ -327,6 +317,10 @@ export function PluginUiRuntimeProvider({
 							},
 							onNotification: (p, notification) => onNotificationRef.current?.(p, notification),
 							defaultTimeoutMs,
+							// Read at shell-build time, not captured here: a session can be rebuilt
+							// later (backend 401 recovery), and a value frozen now would rebuild the
+							// panel in whatever theme was active when it first opened.
+							getPresentation: readHostPresentation,
 							onStateChange: (snapshot) => {
 								const latest = sessionsRef.current.get(params.panelInstanceId);
 								if (latest?.controller !== controller) return;
@@ -372,6 +366,28 @@ export function PluginUiRuntimeProvider({
 		],
 	);
 
+	/*
+	 * Push theme and language into every open panel when the host changes either.
+	 *
+	 * Both are sent on the same trigger because they share one observer, but they behave
+	 * differently on the far side: the shell applies the token CSS itself, while a locale change
+	 * only updates what `i18n.t()` returns and fires the plugin's `onChange`. A plugin that does
+	 * not subscribe therefore follows the theme but not the language — documented, not a defect.
+	 *
+	 * Every session is addressed, including ones still connecting; `sendNotification` drops the
+	 * message unless the port is ready, and those panels read the current values from their own
+	 * bootstrap anyway.
+	 */
+	useEffect(() => {
+		return subscribeHostPresentation(() => {
+			const presentation = readHostPresentation();
+			for (const record of sessionsRef.current.values()) {
+				record.controller?.setThemeTokens(presentation.tokenCss);
+				record.controller?.setLocale(presentation.locale, presentation.localeChain);
+			}
+		});
+	}, []);
+
 	const updateSessionParams = useCallback(
 		(panelInstanceId: string, params: PluginDockPanelParams) => {
 			const parsed = parsePluginDockPanelParams(params);
@@ -385,15 +401,26 @@ export function PluginUiRuntimeProvider({
 			) {
 				return;
 			}
+			// Idempotent: no-ops must NOT rerender. The dock panel re-invokes this
+			// on every render (its effect depends on the runtime context value,
+			// which rebuilds whenever sessionRevision bumps), so an unconditional
+			// rerender here would ping-pong with sessionRevision → render loop
+			// (React #185 "Maximum update depth exceeded").
+			if (JSON.stringify(parsed) === JSON.stringify(record.params)) return;
 			record.params = parsed;
 			record.controller?.updateParams(parsed);
 			rerenderSoon();
 		},
-		[rerenderSoon],
+		[],
 	);
 
 	const getSessionSnapshot = useCallback(
 		(panelInstanceId: string) => sessionsRef.current.get(panelInstanceId)?.snapshot,
+		[],
+	);
+
+	const getSessionController = useCallback(
+		(panelInstanceId: string) => sessionsRef.current.get(panelInstanceId)?.controller,
 		[],
 	);
 
@@ -444,6 +471,36 @@ export function PluginUiRuntimeProvider({
 		) => {
 			const slots = slotsRef.current.get(panelInstanceId) ?? new Map<HTMLElement, SlotRecord>();
 			const slot = { ...options, element, rect: readRect(element) };
+			const existing = slots.get(element);
+			// Idempotent registration: re-registering with identical state (the
+			// panel re-mounts its slot effect on every runtime revision) must NOT
+			// rerender — an unconditional rerender here bumps sessionRevision,
+			// rebuilds the context value and re-runs the slot effect → render
+			// loop (React #185).
+			if (existing && sameSlotState(existing, slot)) {
+				if (import.meta.env.DEV) {
+					// eslint-disable-next-line no-console
+					console.debug(`[plugin-ui] registerSlot ${panelInstanceId}: unchanged, skip rerender`);
+				}
+				return () => {
+					const current = slotsRef.current.get(panelInstanceId);
+					current?.delete(element);
+					if (current && current.size === 0) {
+						slotsRef.current.delete(panelInstanceId);
+						const timer = setTimeout(() => {
+							if (slotsRef.current.has(panelInstanceId)) return;
+							const session = sessionsRef.current.get(panelInstanceId);
+							if (session) disposeRecord(session);
+							sessionRecoveryBudgetRef.current.reset(panelInstanceId);
+							sessionsRef.current.delete(panelInstanceId);
+							disposeTimersRef.current.delete(panelInstanceId);
+							rerender();
+						}, 0);
+						disposeTimersRef.current.set(panelInstanceId, timer);
+					}
+					rerender();
+				};
+			}
 			slots.set(element, slot);
 			slotsRef.current.set(panelInstanceId, slots);
 			const session = sessionsRef.current.get(panelInstanceId);
@@ -482,7 +539,19 @@ export function PluginUiRuntimeProvider({
 		) => {
 			const slot = slotsRef.current.get(panelInstanceId)?.get(element);
 			if (!slot) return;
-			Object.assign(slot, options, { rect: readRect(element) });
+			const next = { ...options, element, rect: readRect(element) };
+			// Idempotent update: ResizeObserver / focus handlers fire on every
+			// geometry or focus change; an unconditional rerender would bump
+			// sessionRevision, rebuild the context value, re-run slot effects and
+			// render again → render loop (React #185).
+			if (sameSlotState(slot, next)) {
+				if (import.meta.env.DEV) {
+					// eslint-disable-next-line no-console
+					console.debug(`[plugin-ui] updateSlot ${panelInstanceId}: unchanged, skip rerender`);
+				}
+				return;
+			}
+			Object.assign(slot, next);
 			const session = sessionsRef.current.get(panelInstanceId);
 			const visible = isSlotVisible(slot);
 			session?.controller?.setVisibility(visible);
@@ -536,6 +605,7 @@ export function PluginUiRuntimeProvider({
 			ensureSession,
 			updateSessionParams,
 			getSessionSnapshot,
+			getSessionController,
 			reloadSession,
 			disposeSession,
 			registerPanelDelegate,
@@ -550,6 +620,7 @@ export function PluginUiRuntimeProvider({
 			ensureSession,
 			updateSessionParams,
 			getSessionSnapshot,
+			getSessionController,
 			getSessions,
 			getSlots,
 			disposeSession,
@@ -573,130 +644,25 @@ export function PluginUiRuntimeProvider({
 		[disposeRecord],
 	);
 
-	return (
-		<RuntimeContext.Provider value={value}>
-			{children}
-			<PluginUiLayer />
-		</RuntimeContext.Provider>
-	);
+	return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;
 }
+
+// `fallbackPluginUiContext` moved to `plugin-ui-runtime-context.ts` — see the import
+// comment at the top of this file.
 
 /**
- * Last-resort context when the app shell did not wire `getContext`. Mirrors the
- * backend PluginUiHost.context shape (which still reports host fields as
- * "unknown") so plugins always see the same envelope.
+ * DISABLED overlay layer (kept exported for compatibility).
+ *
+ * Plugin iframes used to be rendered here as viewport-fixed overlays tracking
+ * the panel slot. That design fought the dock: the overlay could drift from
+ * the slot (covering host chrome), and mixed with tool panels it did not
+ * participate in native tab switching. The iframe now renders INSIDE the dock
+ * panel content (`PluginDockPanelView`), exactly like built-in tool panels, so
+ * the dock natively manages tabbing, hiding and movement. The slot registry
+ * stays for panel visibility/active notifications to the session.
  */
-export function fallbackPluginUiContext(
-	params: PluginDockPanelParams,
-	sessionContext: PluginUiSessionContext,
-	contribution: PluginUiContribution,
-): PluginUiContext {
-	return {
-		contextVersion: 1,
-		host: {
-			appVersion: "unknown",
-			locale: "unknown",
-			colorScheme: "dark",
-			platform: "unknown",
-		},
-		plugin: {
-			id: params.pluginId,
-			version: contribution.version || "unknown",
-			contributionId: params.contributionId,
-			panelInstanceId: params.panelInstanceId,
-		},
-		surface: {
-			// `graph` (a chapter node's embedded dock) reports as `narrator-focus`
-			// rather than introducing a new wire value: both host exactly one
-			// narrator, and an unrecognized `kind` would break already-published
-			// plugins. A node's smaller viewport is something the iframe observes
-			// through its own size, not through a distinct surface kind.
-			kind:
-				sessionContext.surface === "focus" || sessionContext.surface === "graph"
-					? "narrator-focus"
-					: sessionContext.surface === "settings"
-						? "settings"
-						: sessionContext.surface,
-			active: true,
-			visible: true,
-		},
-		...(sessionContext.narratorId
-			? {
-					narrator: {
-						id: sessionContext.narratorId,
-						chapterId: sessionContext.chapterId,
-						projectId: sessionContext.projectId,
-					},
-				}
-			: {}),
-		...(sessionContext.projectId ? { project: { id: sessionContext.projectId } } : {}),
-		...(sessionContext.workspaceId
-			? {
-					workspace: {
-						id: sessionContext.workspaceId,
-						ownerNarratorId: sessionContext.narratorId,
-						presentation: sessionContext.presentation ?? "grid",
-					},
-				}
-			: {}),
-		route: { routeId: "plugin-ui" },
-	};
-}
-
-/** Stable top-level layer. A session keeps one iframe while slots move between surfaces. */
-export function PluginUiLayer() {
-	const runtime = usePluginUiRuntime();
-	return (
-		<Box
-			style={{ position: "fixed", inset: 0, zIndex: 20, pointerEvents: "none", overflow: "hidden" }}
-		>
-			{runtime.getSessions().map((session) => {
-				const slot = runtime
-					.getSlots(session.params.panelInstanceId)
-					.filter(isSlotVisible)
-					.sort((a, b) => b.priority - a.priority)[0];
-				if (
-					!slot ||
-					!session.controller ||
-					["pending", "error", "crashed", "disposed"].includes(session.snapshot.status)
-				)
-					return null;
-				const controller = session.controller;
-				return (
-					<Box
-						key={session.params.panelInstanceId}
-						style={{
-							position: "fixed",
-							left: slot.rect.left,
-							top: slot.rect.top,
-							width: slot.rect.width,
-							height: slot.rect.height,
-							pointerEvents: slot.active ? "auto" : "none",
-							overflow: "hidden",
-						}}
-					>
-						<iframe
-							srcDoc={controller.getSrcdoc()}
-							sandbox="allow-scripts"
-							allow=""
-							referrerPolicy="no-referrer"
-							title={session.contribution.title}
-							onLoad={(event) => controller.attach(event.currentTarget)}
-							onFocus={() => controller.setFocused(true)}
-							onBlur={() => controller.setFocused(false)}
-							style={{
-								width: "100%",
-								height: "100%",
-								border: 0,
-								display: "block",
-								pointerEvents: slot.active ? "auto" : "none",
-							}}
-						/>
-					</Box>
-				);
-			})}
-		</Box>
-	);
+export function PluginUiLayer(): null {
+	return null;
 }
 
 export function PluginPanelSlot({
@@ -707,29 +673,53 @@ export function PluginPanelSlot({
 	children,
 }: PluginPanelSlotProps) {
 	const runtime = usePluginUiRuntime();
+	const runtimeRef = useRef(runtime);
+	runtimeRef.current = runtime;
 	const elementRef = useRef<HTMLDivElement | null>(null);
 	const unregisterRef = useRef<(() => void) | null>(null);
 
+	// Deliberately does NOT depend on `runtime`: the context value rebuilds on
+	// every sessionRevision bump, so depending on it would re-run this effect
+	// after every slot update → registerSlot → rerender → revision → effect →
+	// … render loop (React #185). The runtime is a stable capability object;
+	// the latest reference is read through runtimeRef.
 	useLayoutEffect(() => {
 		const element = elementRef.current;
 		if (!element) return;
-		unregisterRef.current = runtime.registerSlot(panelInstanceId, element, {
+		const rt = runtimeRef.current;
+		unregisterRef.current = rt.registerSlot(panelInstanceId, element, {
 			priority,
 			visible,
 			active,
 		});
-		const update = () =>
-			runtime.updateSlot(panelInstanceId, element, { priority, visible, active });
+		const update = () => rt.updateSlot(panelInstanceId, element, { priority, visible, active });
 		const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
 		observer?.observe(element);
 		window.addEventListener("resize", update);
+		// ResizeObserver only reports SIZE changes; a dock layout move that keeps
+		// the same width/height (split, swap, restore, drag) leaves the iframe
+		// overlay stuck at its old rect — covering host chrome and trapping the
+		// panel until a browser refresh. Poll the element's POSITION on a low
+		// cadence so the overlay follows the slot. The check is cheap (one
+		// getBoundingClientRect per panel per tick) and updateSlot is idempotent
+		// (sameSlotState skips the rerender when nothing moved).
+		let lastLeft = -1;
+		let lastTop = -1;
+		const positionTimer = window.setInterval(() => {
+			const rect = element.getBoundingClientRect();
+			if (rect.left === lastLeft && rect.top === lastTop) return;
+			lastLeft = rect.left;
+			lastTop = rect.top;
+			update();
+		}, 300);
 		return () => {
 			observer?.disconnect();
 			window.removeEventListener("resize", update);
+			window.clearInterval(positionTimer);
 			unregisterRef.current?.();
 			unregisterRef.current = null;
 		};
-	}, [active, panelInstanceId, priority, runtime, visible]);
+	}, [active, panelInstanceId, priority, visible]);
 
 	return (
 		<div

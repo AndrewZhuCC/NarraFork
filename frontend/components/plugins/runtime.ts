@@ -1,3 +1,4 @@
+import { assetUrl } from "../../lib/base-path";
 import { PLUGIN_UI_RUNTIME_CSS_URL, PLUGIN_UI_RUNTIME_JS_URL } from "../../plugin-runtime/paths";
 import { createPluginAssetShell, createPluginNonce } from "./asset-shell";
 import type {
@@ -41,6 +42,24 @@ export interface PluginUiSessionOptions {
 	onNotification?: (params: PluginDockPanelParams, notification: UiRpcNotification) => void;
 	defaultTimeoutMs?: number;
 	onStateChange?: (snapshot: PluginUiSessionSnapshot) => void;
+	/**
+	 * Host theme and language for the panel's first frame.
+	 *
+	 * A getter rather than a value: the shell HTML is built lazily (and again on every session
+	 * rebuild), so a snapshot captured when the session object was constructed could already be
+	 * stale by the time the iframe loads — the panel would then paint in the previous theme and
+	 * only correct itself on the next push.
+	 */
+	getPresentation?: () => PluginUiPresentation;
+}
+
+/** Host presentation state pushed into a panel: theme tokens and active language. */
+export interface PluginUiPresentation {
+	/** Pre-rendered `:root { --nf-*: … }`; see `host-tokens.ts`. */
+	tokenCss: string;
+	locale: string;
+	/** Translation lookup order, most specific first, always ending at `en`. */
+	localeChain: readonly string[];
 }
 
 type PendingRequest = {
@@ -55,6 +74,28 @@ function asError(error: unknown, fallback: string): Error {
 
 function responseError(id: string, code: UiRpcError["code"], message: string): UiRpcResponse {
 	return makeUiResponse(id, undefined, { code, message });
+}
+
+/**
+ * Translate presentation state into shell options, omitting absent parts.
+ *
+ * Omitting rather than passing empty strings matters: `asset-shell` treats a missing `tokenCss`
+ * as "emit no declarations", which leaves a plugin's `var(--nf-x, fallback)` on its fallback. An
+ * empty-but-present value would instead define the variable as empty and defeat that fallback,
+ * so a caller with no presentation to offer would silently make panels worse than before the
+ * feature existed.
+ */
+function presentationShellOptions(presentation: PluginUiPresentation | undefined): {
+	locale?: string;
+	localeChain?: readonly string[];
+	tokenCss?: string;
+} {
+	if (!presentation) return {};
+	return {
+		...(presentation.tokenCss ? { tokenCss: presentation.tokenCss } : {}),
+		...(presentation.locale ? { locale: presentation.locale } : {}),
+		...(presentation.localeChain.length > 0 ? { localeChain: presentation.localeChain } : {}),
+	};
 }
 
 export class PluginUiHostError extends Error {
@@ -289,14 +330,48 @@ export class PluginUiSession {
 			panelInstanceId: this.params.panelInstanceId,
 			entryUrl: this.contribution.entryUrl,
 			styleUrl: this.contribution.styleUrl,
+			title: this.contribution.title,
 			...(usesHostRuntime
 				? {
-						runtimeUrl: PLUGIN_UI_RUNTIME_JS_URL,
-						runtimeStyleUrl: PLUGIN_UI_RUNTIME_CSS_URL,
+						/*
+						 * Mount-prefixed here rather than in `plugin-runtime/paths.ts`: those
+						 * constants are also imported by the Bun build helper and by
+						 * `server/main.ts` (for `NO_CACHE_FRONTEND_PATHS`), neither of which has
+						 * a document to derive a prefix from. They stay rooted; only this
+						 * browser-side consumer resolves them.
+						 *
+						 * Under a prefix the rooted path reaches the proxy's root, so the shared
+						 * runtime 404s and the panel reports `HostRuntimeUnavailableError` —
+						 * which names a missing runtime, not a wrong URL.
+						 */
+						runtimeUrl: assetUrl(PLUGIN_UI_RUNTIME_JS_URL),
+						runtimeStyleUrl: assetUrl(PLUGIN_UI_RUNTIME_CSS_URL),
 					}
 				: {}),
 			defaultTimeoutMs: this.options.defaultTimeoutMs,
+			...presentationShellOptions(this.options.getPresentation?.()),
 		});
+	}
+
+	/**
+	 * Push new theme tokens into the panel.
+	 *
+	 * The shell applies these itself by rewriting its token style element; the plugin is not
+	 * notified and does not need to be, because the browser recalculates styles on its own.
+	 */
+	setThemeTokens(tokenCss: string): void {
+		this.sendNotification("host.theme", { tokenCss });
+	}
+
+	/**
+	 * Push a new language into the panel.
+	 *
+	 * Unlike theme, this cannot take effect without the plugin: the shell updates what
+	 * `i18n.locale` and `i18n.t()` report, then fires `i18n.onChange` so the plugin can
+	 * re-render. A plugin that ignores the hook keeps its current text until remount.
+	 */
+	setLocale(locale: string, localeChain: readonly string[]): void {
+		this.sendNotification("host.locale", { locale, localeChain: [...localeChain] });
 	}
 
 	private handleMessage(event: MessageEvent, generation: number, port: MessagePort): void {

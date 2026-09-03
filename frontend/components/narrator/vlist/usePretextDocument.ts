@@ -4,6 +4,7 @@ import type {
 	PretextLayoutIndex,
 	PretextLayoutManifest,
 } from "@shared/pretext-layout";
+import { onTypographyChange } from "@shared/pretext-layout/typography";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import {
 	useCallback,
@@ -71,6 +72,8 @@ export interface UsePretextDocumentOptions {
 	showOriginal?: (key: string) => boolean;
 	/** Resolve whether a subagent card's prompt body is open. */
 	isPromptOpen?: (key: string) => boolean;
+	/** Reader expanded a subagent card's file-change list (its own fold). */
+	isFileChangesOpen?: (key: string) => boolean;
 	recentMessageIds?: ReadonlySet<string>;
 	resolveRecentMessageIds?: (messages: readonly NarratorMsg[]) => ReadonlySet<string>;
 	labels?: Record<string, string>;
@@ -123,7 +126,11 @@ export interface UsePretextDocumentOptions {
 	/** Synchronous live view used when a layout rebuild captures its scroll anchor. */
 	getCurrentView?: () => PretextDocumentView;
 	loadOptions?: PretextDocumentLoadOptions;
-	onScrollTopCorrection?: (scrollTop: number, anchorKind: PretextLayoutAnchor["kind"]) => void;
+	onScrollTopCorrection?: (
+		scrollTop: number,
+		anchorKind: PretextLayoutAnchor["kind"],
+		smoothFollow?: boolean,
+	) => void;
 }
 
 export interface UsePretextDocumentResult {
@@ -149,6 +156,8 @@ export interface UsePretextDocumentResult {
 	items: readonly VListItem[];
 	scrollTopCorrection?: number;
 	scrollTopCorrectionKind?: PretextLayoutAnchor["kind"];
+	/** True when the correction answers tail growth and may glide (vlist-smooth-follow). */
+	scrollTopCorrectionSmoothFollow?: boolean;
 	/** More (older) messages exist above the loaded window. */
 	hasPrev: boolean;
 	/** An older-page fetch is in flight. */
@@ -330,6 +339,7 @@ export function usePretextDocument(
 			isRowExpanded: options.isRowExpanded,
 			showOriginal: options.showOriginal,
 			isPromptOpen: options.isPromptOpen,
+			isFileChangesOpen: options.isFileChangesOpen,
 			recentMessageIds: options.recentMessageIds,
 			resolveRecentMessageIds: options.resolveRecentMessageIds,
 			labels: options.labels,
@@ -416,6 +426,9 @@ export function usePretextDocument(
 			// applies: the resolver identity moves with the set or the card never
 			// unfolds.
 			options.isPromptOpen,
+			// Same contract: expanding a file list draws more rows, so the resolver
+			// identity must move with the set or the list never expands.
+			options.isFileChangesOpen,
 			options.topPadding,
 			options.viewportHeight,
 			options.widthBucket,
@@ -567,6 +580,27 @@ export function usePretextDocument(
 			});
 		});
 	}, [coordinator, options.getCurrentView]);
+	// The reader's own typography (font scale / letter spacing / block spacing) is a
+	// MEASUREMENT input, not presentation, so a change invalidates exactly what a
+	// font swap does: baked fragment widths, the heights derived from them, and the
+	// committed layout holding those heights. Hence the same rebuild path.
+	//
+	// Unlike the font generation this one fires in normal use — the settings panel
+	// is designed to be adjusted while watching the transcript — so anchoring is
+	// what keeps the text the reader is looking at from sliding away under them.
+	useEffect(() => {
+		if (!coordinator) return;
+		return onTypographyChange(() => {
+			coordinator.invalidateFontDependentLayout(() => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			});
+		});
+	}, [coordinator, options.getCurrentView]);
 	// Apply the scroll correction in a layout effect (before the browser paints),
 	// not a passive effect. A passive effect runs AFTER paint, so the taller canvas
 	// would render one frame with the stale scrollTop — the content jumps to the
@@ -575,8 +609,17 @@ export function usePretextDocument(
 	// prepend and the correction land in the same frame (no visible jump).
 	useLayoutEffect(() => {
 		if (snapshot.scrollTop == null || !snapshot.scrollTopAnchorKind) return;
-		options.onScrollTopCorrection?.(snapshot.scrollTop, snapshot.scrollTopAnchorKind);
-	}, [options.onScrollTopCorrection, snapshot.scrollTop, snapshot.scrollTopAnchorKind]);
+		options.onScrollTopCorrection?.(
+			snapshot.scrollTop,
+			snapshot.scrollTopAnchorKind,
+			snapshot.scrollTopSmoothFollow === true,
+		);
+	}, [
+		options.onScrollTopCorrection,
+		snapshot.scrollTop,
+		snapshot.scrollTopAnchorKind,
+		snapshot.scrollTopSmoothFollow,
+	]);
 	const reload = useCallback(() => setReloadToken((value) => value + 1), []);
 	// Preserve the visible content by height arithmetic: the coordinator shifts
 	// scrollTop by the exact height prepended above it. No item-key anchor is
@@ -735,6 +778,7 @@ export function usePretextDocument(
 		items: snapshot.items ?? EMPTY_ITEMS,
 		scrollTopCorrection: snapshot.scrollTop,
 		scrollTopCorrectionKind: snapshot.scrollTopAnchorKind,
+		scrollTopCorrectionSmoothFollow: snapshot.scrollTopSmoothFollow,
 		hasPrev: snapshot.hasPrev ?? false,
 		loadingOlder: snapshot.loadingOlder ?? false,
 		oldestLoadedSeq: snapshot.input?.oldestLoadedSeq ?? null,

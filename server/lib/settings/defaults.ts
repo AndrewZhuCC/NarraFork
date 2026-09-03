@@ -9,9 +9,14 @@ import { DEFAULT_CODEX_TIER_ORDER } from "../codex-manager";
 import type { FieldDoc, NarraForkSettings } from "./types";
 
 export const DEFAULTS: NarraForkSettings = {
-	server: { port: 7778, host: "localhost", openBrowser: "browser" },
+	server: { port: 7778, host: "localhost", openBrowser: "browser", allowedOrigins: [] },
 	proxy: { mode: "direct" },
-	paths: { defaultProjectDir: resolve(homedir(), "projects") },
+	paths: {
+		defaultProjectDir: resolve(homedir(), "projects"),
+		// Empty by default, and that is the safe zero value: with no entry here the
+		// in-browser editor can only write inside a narrator's own worktree.
+		extraWritableDirs: [] as string[],
+	},
 	knowledge: {
 		injectMode: "summary",
 		maxInjectedEntries: 3,
@@ -27,7 +32,12 @@ export const DEFAULTS: NarraForkSettings = {
 		allowPrivateProxyTarget: false,
 	},
 	agent: {
-		defaultModel: "kiro:claude-sonnet-4.5",
+		// Deliberately empty on a fresh install — same reasoning as `summaryModel`
+		// below. Shipping a concrete model here names a provider the user has not
+		// configured, and every downstream failure then blames that phantom model
+		// instead of the real cause ("no default model configured"). The setup
+		// wizard makes selecting one a hard gate before anything can run.
+		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
 		defaultStartInPlanMode: false,
 		// Deliberately empty: an unset summary model follows the default model
@@ -225,6 +235,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 		valid: '"off" | "browser" | "app"',
 	},
+	"server.allowedOrigins": {
+		desc: "额外允许跨源读取 /api/* 的来源（逐字匹配，如 https://ide.example.com）。同源、本机回环（localhost/127.x）以及编辑器 webview 来源本身就被允许，无需在此列出；只有部署在其他非本机主机上的前端才需要配置。",
+		type: "string[]",
+	},
 	"server.tls.enabled": {
 		desc: "是否启用 HTTPS。启用后需要配置 certFile 和 keyFile。",
 		type: "boolean",
@@ -261,6 +275,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"paths.defaultProjectDir": {
 		desc: "默认项目目录。新建项目时的默认父目录。",
 		type: "string",
+	},
+	"paths.extraWritableDirs": {
+		desc: "浏览器内编辑器额外允许写入的目录（绝对路径）。默认只允许写入叙述者自己的 worktree；此处每一项都会扩大写入范围，请只填确实需要编辑的目录。符号链接会被解析后再校验，凭据文件（settings.json、数据库、~/.ssh 等）即使在允许目录内也仍然拒绝写入。",
+		type: "string[]",
 	},
 
 	// ── knowledge ───────────────────────────────────────────────────────
@@ -386,7 +404,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── agent ───────────────────────────────────────────────────────────
 	"agent.defaultModel": {
-		desc: '新建叙述者的默认模型。格式为 "provider:modelId"，如 "kiro:claude-sonnet-4.5"。',
+		desc: '新建叙述者的默认模型。格式为 "provider:modelId"，如 "anthropic:claude-sonnet-4.6"。留空表示未配置：此时任何依赖默认模型的操作都会直接报错，而不会回退到某个硬编码模型（回退会让报错指向用户从未选择过的 provider）。',
 		type: "string",
 	},
 	"agent.defaultPermissionMode": {
@@ -821,6 +839,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"clientFingerprint.installationId": {
 		desc: "作为 x-codex-installation-id 发送的持久化 UUID（客户端指纹身份，首次访问自动生成）。",
+		type: "string",
+	},
+	"clientFingerprint.claudeDeviceId": {
+		desc: "官方 Anthropic 请求中作为 metadata.user_id.device_id 发送的持久化设备标识（64 位小写 hex，首次访问自动生成）。与真实 Claude Code CLI 的 device_id 形状和生命周期一致：一次安装对应一个设备标识，重启不变。",
 		type: "string",
 	},
 

@@ -93,6 +93,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
 	lazy,
+	type ReactNode,
 	type SetStateAction,
 	Suspense,
 	useCallback,
@@ -149,6 +150,7 @@ import {
 	useUpdateWhitelistDir,
 	useWhitelistDirs,
 } from "../../hooks/useNarrator";
+import { useNarratorHeaderToolbarCapacity } from "../../hooks/useNarratorHeaderToolbarCapacity";
 import { useNarratorLod } from "../../hooks/useNarratorLod";
 import { useNarratorToolbarLayout } from "../../hooks/useNarratorToolbarLayout";
 import {
@@ -195,14 +197,15 @@ import {
 	safeAreaDrawerBodyHeight,
 } from "../../lib/safe-area";
 import { Z } from "../../lib/z-index";
-import { useConfirmDialog } from "../common/ConfirmDialogProvider";
-import { useImageViewer } from "../common/ImageViewerProvider";
+import { useConfirmDialog } from "../common/confirm-dialog-context";
+import { useImageViewer } from "../common/image-viewer-context";
 import { type SelectionCommentPayload, SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { TruncatedText } from "../common/TruncatedText";
 import { PermissionRuleEditor } from "../permissions/PermissionRuleEditor";
 import {
 	buildPluginDockPanelOpenRequest,
+	PluginContributionOptions,
 	PluginContributionPicker,
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
@@ -211,8 +214,6 @@ import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./Backgroun
 
 import { ChapterBar } from "./ChapterBar";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
-import { CommandParamHelper } from "./CommandParamHelper";
-import { type CommandItem, CommandPopover } from "./CommandPopover";
 import { CommentDraftChips } from "./CommentDraftChips";
 import { ContentViewerEnvironmentProvider, handleRegistry } from "./ContentViewer";
 import { resolveChatCommentAnchor } from "./comment-anchor";
@@ -242,7 +243,7 @@ import {
 	saveDraftImageAttachments,
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
-import { ExecutionDeviceMenu } from "./ExecutionDeviceMenu";
+import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -272,7 +273,7 @@ import {
 	type NarratorComposerHandle,
 	type NarratorRemoteDraft,
 } from "./NarratorComposer";
-import { NarratorLodMenu } from "./NarratorLodMenu";
+import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
@@ -282,6 +283,12 @@ import {
 } from "./NarratorStatusToolbar";
 import { NarratorToolbarOverflowMenu } from "./NarratorToolbarOverflowMenu";
 import { NugRechargeDialog } from "./NugRechargeDialog";
+import {
+	HEADER_TITLE_MIN_WIDTH_PX,
+	HEADER_TITLE_SLOT_ATTR,
+	HEADER_TOOLBAR_FIXED_ATTR,
+	selectHeaderToolbarEntries,
+} from "./narrator-header-toolbar-capacity";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, NarratorPanelProps } from "./narrator-panel-types";
 import {
@@ -2373,6 +2380,16 @@ export function NarratorPanel({
 	 * workspace, detached subagent panel) still renders this block.
 	 */
 	const hostOwnsTitle = dock?.hostOwnsTitle === true;
+
+	/*
+	 * Header geometry for the tool-row capacity measurement. The ROW is the budget
+	 * source: its width does not depend on how many entries are inline, which is
+	 * what keeps the decision from cascading (see narrator-header-toolbar-capacity).
+	 */
+	const headerRowRef = useRef<HTMLDivElement>(null);
+	const headerLeadingRef = useRef<HTMLDivElement>(null);
+	const headerToolbarRef = useRef<HTMLDivElement>(null);
+
 	// Resolve the effective model: when following default, use the actual default
 	// model value; when using a model aggregation, resolve to a representative
 	// concrete member so capability/context-window lookups work (the backend
@@ -3788,6 +3805,23 @@ export function NarratorPanel({
 		}) => {
 			const api = dockApiRef?.current;
 			if (!api) return;
+			// A plugin contribution is a singleton per narrator surface: re-picking it
+			// from the picker must focus the existing panel, not stack a second
+			// instance (each addPanel gets a fresh panelInstanceId).
+			const existingPlugin = api.panels.find((panel) => {
+				const params = panel.params as
+					| { panelType?: string; pluginId?: string; contributionId?: string }
+					| undefined;
+				return (
+					params?.panelType === "plugin" &&
+					params.pluginId === pick.pluginId &&
+					params.contributionId === pick.contributionId
+				);
+			});
+			if (existingPlugin) {
+				existingPlugin.api.setActive();
+				return;
+			}
 			// Stack into the cluster's secondary group when one exists, otherwise
 			// split right of the chat/narrator panel (mirrors openToolPanel).
 			const request = buildPluginDockPanelOpenRequest({
@@ -4143,8 +4177,7 @@ export function NarratorPanel({
 	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
 	// are panel state. An image-only or comments-only draft behaves like a typed one.
 	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
-	const composerSendable =
-		composerHasText || composerHasAttachments || commentDrafts.length > 0;
+	const composerSendable = composerHasText || composerHasAttachments || commentDrafts.length > 0;
 
 	// True when the composer carries nothing to send and there's a non-question pending
 	// permission. Used to show Enter-key hints on permission buttons via PermEnterHintCtx.
@@ -5699,10 +5732,13 @@ export function NarratorPanel({
 			if (showCompactQueueChoice) {
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
-				restoreOnError = { msg, images, textFiles };
+				const comments = getCommentDrafts(narratorId);
+				const payload = composeUserMessageWithComments(msg, comments);
+				restoreOnError = { msg, images, textFiles, comments };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
-				await submitMessage(msg, images, textFiles, abortController.signal, mode !== "turn");
+				if (comments.length > 0) clearCommentDrafts(narratorId);
+				await submitMessage(payload, images, textFiles, abortController.signal, mode !== "turn");
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
 				restoreOnError = null;
@@ -6290,20 +6326,74 @@ export function NarratorPanel({
 
 	const {
 		entries: toolbarEntries,
-		visible: toolbarVisibleDefs,
+		visible: toolbarSurfacedDefs,
+		overflow: toolbarTuckedDefs,
 		saveLayout: saveToolbarLayout,
 	} = useNarratorToolbarLayout({
+		// Uncapped on purpose: the cap depends on how many entries are SURFACEABLE,
+		// which is what this partition computes. Capping here would make the count
+		// fed to the measurement depend on the measurement's own result.
+		visibleLimit: null,
 		hostCapabilities: headerHostCapabilities,
-		// Mobile caps by count (a phone row cannot both show buttons and keep the
-		// title readable); desktop passes null, rendering every surfaced entry and
-		// letting the flex row absorb the width (the title compresses in a narrow
-		// dock — no width measurement is involved).
-		visibleLimit: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
 		// Per-narrator availability is applied INSIDE the partition (before the cap),
-		// so a capped mobile row back-fills past disabled entries instead of showing
-		// fewer buttons than the cap allows.
+		// so a capped row back-fills past disabled entries instead of showing fewer
+		// buttons than the cap allows.
 		entryEnabled: toolbarEntryEnabled,
 	});
+
+	/**
+	 * Width the title keeps before any entry collapses. Zero when the host draws
+	 * the title itself (a graph node), so the entries may claim that space —
+	 * previously the only way to stop the icon row from crushing the title was to
+	 * hide the title entirely, which is what `hostOwnsTitle` was doing.
+	 */
+	const headerTitleSlotMinWidth = useMemo(() => {
+		if (hostOwnsTitle || isWorkspacePreview) return 0;
+		// Plus the pencil / sparkles pair beside the title (ActionIcon size="xs" =
+		// 18px each, gap 4).
+		return HEADER_TITLE_MIN_WIDTH_PX + 2 * 18 + 2 * 4;
+	}, [hostOwnsTitle, isWorkspacePreview]);
+
+	const headerCapacity = useNarratorHeaderToolbarCapacity({
+		rowRef: headerRowRef,
+		toolbarRef: headerToolbarRef,
+		leadingRef: headerLeadingRef,
+		titleSlotMinWidth: headerTitleSlotMinWidth,
+		itemCount: toolbarSurfacedDefs.length,
+		// The measurement may not save a phone from itself: at ~360px a readable
+		// title plus two entries is the honest maximum, whatever the arithmetic says.
+		maxCapacity: isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null,
+		enabled: !isWorkspacePreview,
+	});
+
+	/**
+	 * `null` capacity = no successful measurement yet (first frame, no
+	 * ResizeObserver). Falling back to the mobile cap / "show everything" keeps the
+	 * previous behaviour rather than briefly emptying the row.
+	 */
+	const headerVisibleLimit =
+		headerCapacity ?? (isMobileViewport ? MOBILE_TOOLBAR_VISIBLE_LIMIT : null);
+	const headerSelection = useMemo(
+		() => selectHeaderToolbarEntries(toolbarSurfacedDefs, headerVisibleLimit),
+		[toolbarSurfacedDefs, headerVisibleLimit],
+	);
+	const toolbarVisibleDefs = headerSelection.visible;
+	/**
+	 * Everything not on the row: entries collapsed for width, plus the ones the
+	 * reader tucked away. Layout order is preserved so the menu reads as a
+	 * continuation of the row. This is also what the overflow button's aggregate
+	 * badge counts — without it, an entry collapsed for width would take its unread
+	 * count off screen with no trace.
+	 */
+	const toolbarHiddenDefs = useMemo(
+		() => [...headerSelection.hidden, ...toolbarTuckedDefs],
+		[headerSelection.hidden, toolbarTuckedDefs],
+	);
+	/** Ids collapsed for width — the menu marks these so "shown in header" stays honest. */
+	const toolbarNoRoomIds = useMemo(
+		() => headerSelection.hidden.map((def) => def.id as string),
+		[headerSelection.hidden],
+	);
 
 	/** Whether an entry's panel is currently open (drives the active styling). */
 	const toolbarEntryActive = useCallback(
@@ -6375,6 +6465,11 @@ export function NarratorPanel({
 					if (dock) dock.toggleToolPanel(id);
 					else setMobileToolPanel((current) => (current === id ? null : id));
 					return;
+				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
+				// transcript while a slider moves, so there is no drawer fallback to offer.
+				case "appearance":
+					dock?.toggleToolPanel("appearance");
+					return;
 				default:
 					return;
 			}
@@ -6386,6 +6481,78 @@ export function NarratorPanel({
 			onOpenTerminalPanel,
 			toggleTerminalTool,
 			toggleSpecTool,
+		],
+	);
+
+	/**
+	 * Options the overflow menu expands inline for a self-contained control.
+	 *
+	 * These three render their own Menu in the header, so there is nothing for
+	 * `activateToolbarEntry` to toggle. Before this, the menu listed them as a dead
+	 * row labelled "header only" — and on a phone the header keeps two icons while
+	 * everything else lives in that menu, so the detail level and the execution
+	 * device had NO reachable entry point at all. Returning the same option rows the
+	 * header's dropdown uses keeps the two surfaces in step by construction.
+	 *
+	 * Every id whose registry entry is `selfContained` must be handled here; an
+	 * unhandled one silently reverts to the informational row.
+	 */
+	const renderToolbarInlineOptions = useCallback(
+		(id: string, close: () => void): ReactNode => {
+			switch (id) {
+				case "device":
+					return (
+						<ExecutionDeviceOptions
+							label={t("executionDeviceSelector")}
+							localLabel={t("executionTargetLocal")}
+							offlineLabel={t("executionDeviceOffline")}
+							devices={executionDevicesQuery.data?.devices ?? []}
+							currentDeviceId={executionDevicesQuery.data?.defaultDeviceId ?? "local"}
+							onSelect={(deviceId) => {
+								close();
+								updateExecutionDeviceMutation.mutate(deviceId);
+							}}
+							withLabel={false}
+						/>
+					);
+				case "lodlevel":
+					return (
+						<NarratorLodOptions
+							lod={renderLod}
+							isDefault={renderLodIsDefault}
+							onSelectLod={(next) => {
+								close();
+								handleSelectLod(next);
+							}}
+							onSetAsDefault={() => {
+								close();
+								setAsDefault();
+							}}
+							withLabel={false}
+						/>
+					);
+				case "plugins":
+					return (
+						<PluginContributionOptions
+							onPick={(pick) => {
+								close();
+								openPluginPanel(pick);
+							}}
+						/>
+					);
+				default:
+					return null;
+			}
+		},
+		[
+			t,
+			executionDevicesQuery.data,
+			updateExecutionDeviceMutation,
+			renderLod,
+			renderLodIsDefault,
+			handleSelectLod,
+			setAsDefault,
+			openPluginPanel,
 		],
 	);
 
@@ -6929,6 +7096,7 @@ export function NarratorPanel({
 					)}
 					{/* Header */}
 					<Group
+						ref={headerRowRef}
 						justify="space-between"
 						py="xs"
 						px="md"
@@ -6949,7 +7117,7 @@ export function NarratorPanel({
 								: undefined
 						}
 					>
-						<Group gap="xs" style={{ flex: 1, minWidth: 0 }}>
+						<Group ref={headerLeadingRef} gap="xs" style={{ flex: 1, minWidth: 0 }}>
 							{!isWorkspacePreview &&
 								(onMinimize ? (
 									<Tooltip label={t("backToGraph")} position="right">
@@ -6997,10 +7165,25 @@ export function NarratorPanel({
 										<IconArrowLeft size={16} />
 									</ActionIcon>
 								))}
-							{/* `flex: 1` even when the title is suppressed: it is what pushes the
-							    tool row to the right edge, and it hands the freed width to those
-							    buttons instead of leaving a gap where the title used to be. */}
-							<Group gap={4} style={{ flex: 1, minWidth: 0 }} wrap="nowrap">
+							{/*
+							 * `flex: 1` even when the title is suppressed: it is what pushes the
+							 * tool row to the right edge, and it hands the freed width to those
+							 * buttons instead of leaving a gap where the title used to be.
+							 *
+							 * The floor that keeps the title readable is the capacity BUDGET
+							 * (`headerTitleSlotMinWidth`), not a CSS `min-width`. A min-width here
+							 * would win against the tool row's `flex-shrink: 0` only by overflowing
+							 * or wrapping a nowrap row — both worse than the truncation it would
+							 * prevent. `HEADER_TITLE_SLOT_ATTR` marks the slot so the measurement
+							 * budgets it by policy instead of reading a width this element derives
+							 * from whatever the tool row left over.
+							 */}
+							<Group
+								{...{ [HEADER_TITLE_SLOT_ATTR]: "" }}
+								gap={4}
+								style={{ flex: 1, minWidth: 0 }}
+								wrap="nowrap"
+							>
 								{hostOwnsTitle ? null : editingTitle && !isWorkspacePreview ? (
 									<TextInput
 										ref={titleInputRef}
@@ -7064,12 +7247,13 @@ export function NarratorPanel({
 							)}
 						</Group>
 						{!isWorkspacePreview && (
-							<Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+							<Group ref={headerToolbarRef} gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
 								{/*
 								 * Registry-driven tool entries. The SET comes from the registry, the
 								 * ORDER from the user's saved layout, and how many are surfaced from
-								 * the host (mobile caps by count; desktop renders every surfaced
-								 * entry and lets the title compress before the row). Entries the
+								 * the measured width of this row (mobile additionally caps by count).
+								 * Entries that do not fit move into the overflow menu instead of
+								 * compressing the title, which is what the row used to do. Entries the
 								 * host cannot present are absent from both lists rather than rendered
 								 * disabled — but they stay in the layout, so they return on a surface
 								 * that supports them.
@@ -7114,6 +7298,7 @@ export function NarratorPanel({
 											<PluginContributionPicker
 												key={def.id}
 												onPick={openPluginPanel}
+												surface="focus"
 												trigger={
 													<Tooltip label={label}>
 														<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>
@@ -7170,6 +7355,7 @@ export function NarratorPanel({
 								{dock && mockStreamEnabled && (
 									<Tooltip label="Mock stream (debug)">
 										<ActionIcon
+											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
 											size="sm"
 											variant={dock.openToolTypes.has("mock") ? "light" : "subtle"}
 											color={dock.openToolTypes.has("mock") ? "indigo" : "gray"}
@@ -7180,23 +7366,33 @@ export function NarratorPanel({
 									</Tooltip>
 								)}
 								{/*
-								 * Overflow menu: lists the tucked entries, carries the aggregate badge
-								 * so a tucked unread count is not lost, and owns the reorder UI.
-								 * Archive lives at its bottom — a destructive action must not sit one
-								 * mis-tap away from the panel toggles.
+								 * Overflow menu: lists everything not on the row (tucked by the user or
+								 * collapsed for width), carries the aggregate badge so a hidden unread
+								 * count is not lost, and owns the reorder UI. Archive lives at its
+								 * bottom — a destructive action must not sit one mis-tap away from the
+								 * panel toggles.
 								 */}
 								<NarratorToolbarOverflowMenu
 									entries={toolbarEntries}
+									hiddenDefs={toolbarHiddenDefs}
+									noRoomIds={toolbarNoRoomIds}
 									onSaveLayout={saveToolbarLayout}
 									hostCapabilities={headerHostCapabilities}
 									badgeCounts={toolbarBadgeCounts}
 									onActivate={activateToolbarEntry}
+									renderInlineOptions={renderToolbarInlineOptions}
 									onArchive={openArchiveConfirm}
 									archiveLoading={archiveMutation.isPending}
 								/>
 								{onClose && (
 									<Tooltip label={t("closePanel")}>
-										<ActionIcon size="sm" variant="subtle" color="red" onClick={onClose}>
+										<ActionIcon
+											{...{ [HEADER_TOOLBAR_FIXED_ATTR]: "" }}
+											size="sm"
+											variant="subtle"
+											color="red"
+											onClick={onClose}
+										>
 											<IconX size={16} />
 										</ActionIcon>
 									</Tooltip>
@@ -8781,8 +8977,8 @@ export function NarratorPanel({
 									onPasteImages={handleComposerPasteImages}
 								/>
 								{(() => {
-								const hasInput = composerSendable;
-								const hasAttachments = composerHasAttachments;
+									const hasInput = composerSendable;
+									const hasAttachments = composerHasAttachments;
 
 									// Takeover button: shown while a subagent is running and not yet
 									// taken over. Clicking it interrupts the current turn and hands
@@ -8807,9 +9003,17 @@ export function NarratorPanel({
 									const renderPrimaryActionButton = () => {
 										const showInterrupt = isActive && !hasInput && retryRecoveryAllowsInterrupt;
 
-										const hasCutInMessage = !!queuedMessages[0]?.priority;
-										const showRetry = !showInterrupt && !hasInput && canRetryLastUserMessage;
-										const showContinue = !showInterrupt && !hasInput && canContinueNarrator;
+										// "Cut in line" describes a Stop that hands the turn over to the
+										// queued priority message. A taken-over subagent has no cut-in
+										// semantics (see `canCutInLine`): its queue is filled without a
+										// soft stop, so the label would name an action the server does
+										// not perform — and it sat on the one button whose hold gesture
+										// interrupts, which is how "cut in" got read as "interrupt".
+										const hasCutInMessage = !isTakenOver && !!queuedMessages[0]?.priority;
+										const showRetry =
+											!showInterrupt && !hasInput && !hasAttachments && canRetryLastUserMessage;
+										const showContinue =
+											!showInterrupt && !hasInput && !hasAttachments && canContinueNarrator;
 
 										// Wrap a primary button as the right segment of the split
 										// send-options control (three-dots menu on the left). Used for

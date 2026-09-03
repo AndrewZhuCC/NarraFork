@@ -111,7 +111,21 @@ export interface PluginUiContext {
 	contextVersion: number;
 	host: {
 		appVersion: string;
+		/**
+		 * Host UI language, normalized (`en`, `zh-CN`).
+		 *
+		 * A snapshot taken when the session was built. Prefer `narrafork.i18n.locale`, which
+		 * tracks language changes live; this field cannot, because `context.subscribe` is not
+		 * implemented and `context.get` is only read once.
+		 */
 		locale: string;
+		/**
+		 * The scheme the host is actually rendering in, with `"auto"` already resolved.
+		 *
+		 * Also a build-time snapshot, for the same reason. Use it for one-off decisions (which
+		 * illustration to pick); do NOT use it to follow the theme — that is what the injected
+		 * `--nf-*` CSS variables are for, and they update in place without any plugin code.
+		 */
 		colorScheme: "light" | "dark";
 		platform: "windows" | "macos" | "linux" | "unknown";
 	};
@@ -201,6 +215,13 @@ export interface PluginUiRuntimeApi {
 	) => void;
 	updateSessionParams: (panelInstanceId: string, params: PluginDockPanelParams) => void;
 	getSessionSnapshot: (panelInstanceId: string) => PluginUiSessionSnapshot | undefined;
+	/**
+	 * The live session controller for a panel (if any). The panel renders the
+	 * session's iframe inside its own dock content — mirroring how built-in tool
+	 * panels render their content directly — instead of an overlay layer, so the
+	 * dock natively manages tab switching, hiding, and movement.
+	 */
+	getSessionController: (panelInstanceId: string) => PluginUiSessionController | undefined;
 	reloadSession: (panelInstanceId: string) => void;
 	/** Dispose the session for one panel (if any) without scheduling a rebuild. */
 	disposeSession: (panelInstanceId: string) => void;
@@ -227,4 +248,13 @@ export interface PluginUiSessionSnapshot {
 	status: "pending" | "registered" | "connecting" | "ready" | "error" | "crashed" | "disposed";
 	diagnosticId?: string;
 	error?: string;
+}
+
+/** Narrow surface over the live session runtime used by the dock panel. */
+export interface PluginUiSessionController {
+	getSrcdoc(): string;
+	attach(iframe: HTMLIFrameElement): void;
+	setVisibility(visible: boolean): void;
+	setActive(active: boolean): void;
+	setFocused(focused: boolean): void;
 }

@@ -7,10 +7,22 @@ import {
 	restorePretextLayoutAnchor,
 } from "@shared/pretext-layout";
 import { resetPreparedMarkdownCache } from "@shared/pretext-layout/prepared-markdown-cache";
+import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { ensureKatexLoaded, getFontRevision, getKatexRevision } from "./katex-runtime";
+import {
+	ensureKatexLoaded,
+	getFontRevision,
+	getKatexRevision,
+	isKatexReady,
+} from "./katex-runtime";
 import { measureCache } from "./measure-cache";
+import {
+	collectMathCandidateTexts,
+	collectNewMathCandidateTexts,
+	createMathScanCursor,
+	type MathScanCursor,
+} from "./message-math-text";
 import type { RenderLod } from "./prepared-block";
 import {
 	invalidateCachedPretextDocument,
@@ -61,6 +73,16 @@ export interface PretextLayoutCoordinatorSnapshot {
 	items?: readonly VListItem[];
 	scrollTop?: number;
 	scrollTopAnchorKind?: PretextLayoutAnchor["kind"];
+	/**
+	 * Present (and true) only when this correction answers TAIL GROWTH — a streaming
+	 * row growing, a message appended, a live patch resizing a card at the tail —
+	 * so the shell may glide the pinned viewport to the new bottom instead of
+	 * snapping (vlist-smooth-follow). Every other correction (prepend re-pin, fold,
+	 * LOD, removal, truncation, restore) omits it and stays instant: those mean
+	 * "keep what the reader sees", not "new content arrived", and the fold/LOD
+	 * transitions own their own FLIP geometry.
+	 */
+	scrollTopSmoothFollow?: boolean;
 	/** More (older) messages exist above the loaded window. */
 	hasPrev?: boolean;
 	/** An older-page fetch is in flight (drives the load indicator). */
@@ -161,6 +183,15 @@ export class PretextLayoutCoordinator {
 	 */
 	private streamingMessage: TreeMessage | null = null;
 	/**
+	 * How far the per-frame math scan has already read each body.
+	 *
+	 * Lives on the coordinator (not module scope) so it dies with the document: its
+	 * keys are message ids, and two narrators can hold the same id only by accident
+	 * of a shared prefix after a fork — where treating the body as "already scanned"
+	 * would be wrong.
+	 */
+	private mathScanCursor: MathScanCursor = createMathScanCursor();
+	/**
 	 * Full payloads for cards that expand WITHOUT user input. Resolved on the async
 	 * boundary below (beside KaTeX) so the first build already measures the real
 	 * body — an auto-expanded card must never grow after paint. Cards the user
@@ -208,6 +239,7 @@ export class PretextLayoutCoordinator {
 		}
 
 		const generation = ++this.generation;
+		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.current = { ...this.current, status: "loading", error: undefined };
@@ -450,12 +482,15 @@ export class PretextLayoutCoordinator {
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// A live patch resizes a card at the tail (a tool completes and grows its
+		// output body): tail growth, so a pinned reader may glide to the new bottom.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -484,16 +519,22 @@ export class PretextLayoutCoordinator {
 		const result = appendLoadedMessage(this.input.messages, message, isSubagent);
 		if (!result.appended) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		// The persisted form of a streamed answer arrives here, so it is the second
+		// place a document's first formula can appear with no fetch to await.
+		this.scheduleKatexForSyncPath([message], getView);
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// A new message landing at the tail is tail growth: a pinned reader may
+		// glide to the new bottom instead of being snapped to it.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -539,6 +580,8 @@ export class PretextLayoutCoordinator {
 		const result = insertLoadedMessage(this.input.messages, message);
 		if (!result.inserted) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		// A mid-window marker (a compact summary) can carry math of its own.
+		this.scheduleKatexForSyncPath([message], getView);
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
@@ -695,6 +738,10 @@ export class PretextLayoutCoordinator {
 		const result = replaceLoadedMessage(this.input.messages, message);
 		if (!result.replaced) return false;
 		this.input = { ...this.input, messages: result.messages as TreeMessage[] };
+		// Replacement is prefix-truncation only (see above), so the math was usually
+		// already seen — but a manual edit can introduce a formula, and the scan is
+		// free once the runtime is loaded.
+		this.scheduleKatexForSyncPath([message], getView);
 		const view = getView?.();
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
@@ -733,6 +780,11 @@ export class PretextLayoutCoordinator {
 		// Identity comparison is enough: the accumulator hands over a NEW object for
 		// every render version, and clearing passes null.
 		this.streamingMessage = next;
+		// Live output is the main surface LaTeX appears on, and it never goes through
+		// an async boundary — so this is where the runtime gets requested for a
+		// streaming formula. Started before the early return below so a row published
+		// while the initial load is still in flight also triggers it.
+		if (next) this.scheduleKatexForSyncPath([next], getView);
 		// Nothing to lay out yet (initial load in flight). Recording the row is still
 		// correct — the first commit will include it.
 		if (!this.input || !this.lastBuildOptions) {
@@ -744,12 +796,15 @@ export class PretextLayoutCoordinator {
 		const anchor =
 			view && this.current.index ? captureCoordinatorAnchor(this.current.index, view) : undefined;
 		const generation = ++this.generation;
+		// The streaming row IS the tail growing: a pinned reader glides to the new
+		// bottom rather than watching every committed row jump up per delta.
 		this.commitLayout(
 			this.input,
 			this.lastBuildOptions,
 			anchor,
 			view?.viewportHeight ?? this.lastViewportHeight,
 			generation,
+			true,
 		);
 		return true;
 	}
@@ -787,6 +842,10 @@ export class PretextLayoutCoordinator {
 		this.narratorId = undefined;
 		this.loadingOlder = false;
 		this.streamingMessage = null;
+		// Dropped with the document: message ids are only unique within one narrator,
+		// so carrying scan progress across a switch could mark another document's body
+		// as already examined.
+		this.mathScanCursor = createMathScanCursor();
 		// Cleared with the document: a stale timestamp would make the NEXT narrator's
 		// first-screen fill loop think it had just trimmed and skip a legitimate page.
 		this.lastTrimAt = 0;
@@ -830,6 +889,7 @@ export class PretextLayoutCoordinator {
 		this.generation++;
 		const generation = this.generation;
 		this.pendingLoad = null;
+		if (this.narratorId !== narratorId) this.mathScanCursor = createMathScanCursor();
 		this.narratorId = narratorId;
 		this.loadOptions = loadOptions;
 		this.loadingOlder = false;
@@ -858,10 +918,16 @@ export class PretextLayoutCoordinator {
 	 * Drop every cached measurement and prepared body, then rebuild at the last
 	 * committed params.
 	 *
-	 * This is the FONT-GENERATION path (see the `documentRevision` note): the
-	 * prepared handles carry pixel widths baked against the previous face, so they
-	 * cannot be reused, and the heights derived from them are already on screen.
-	 * The rebuild anchors so the reader is not moved by the corrected geometry.
+	 * Serves both generations that invalidate BAKED PIXEL WIDTHS (see the
+	 * `documentRevision` note):
+	 *  - FONT — a face resolved mid-session, so prepared handles carry widths
+	 *    measured against the previous face.
+	 *  - TYPOGRAPHY — the reader changed font scale / letter spacing / block
+	 *    spacing, which are measurement inputs, not presentation.
+	 *
+	 * In both cases the prepared handles cannot be reused and the heights derived
+	 * from them are already on screen. The rebuild anchors so the reader is not
+	 * moved by the corrected geometry.
 	 *
 	 * No-ops before the first commit — the first build will use the new generation
 	 * anyway.
@@ -919,7 +985,7 @@ export class PretextLayoutCoordinator {
 			pruneBoundaryMessageId: input.pruneBoundaryMessageId,
 			// The loaded-message count keeps the revision distinct as the window
 			// grows upward within one document version (prepended older pages).
-			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}`,
+			layoutRevision: `${input.messageVersion}:${input.messages.length}:${buildOptions.widthBucket}:${buildOptions.lod}:k${getKatexRevision()}:f${getFontRevision()}:t${getTypographyRevision()}`,
 			// The KaTeX revision belongs on the DOCUMENT revision, not just the layout
 			// revision: `layoutRevision` only reaches the manifest identity, while the
 			// measure cache keys on `documentRevision` + the data revision. Without it
@@ -932,7 +998,12 @@ export class PretextLayoutCoordinator {
 			// every prepared fragment carries a baked pixel width measured against the
 			// then-available face, so a face swap invalidates heights on math-free
 			// documents too (see prepared-markdown-cache's FONT REVISION note).
-			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}~f:${getFontRevision()}`,
+			//
+			// The TYPOGRAPHY generation is the user-driven counterpart: the reader's own
+			// font-scale / letter-spacing / block-spacing settings are measurement
+			// inputs, so a change makes every cached height describe a document that is
+			// no longer the one being painted.
+			documentRevision: `${input.messageVersion}~k:${getKatexRevision()}~f:${getFontRevision()}~t:${getTypographyRevision()}`,
 		});
 	}
 
@@ -945,10 +1016,8 @@ export class PretextLayoutCoordinator {
 	 * source text rather than blocking the whole document.
 	 */
 	private async prepareKatex(input: PretextDocumentInput): Promise<void> {
-		const texts: string[] = [];
-		for (const message of input.messages) {
-			if (message.contentText) texts.push(message.contentText);
-		}
+		// Reads the CONTENT BLOCKS, not just `contentText`: see message-math-text.
+		const texts = collectMathCandidateTexts(input.messages);
 		if (texts.length === 0) return;
 		try {
 			await ensureKatexLoaded(texts);
@@ -957,12 +1026,88 @@ export class PretextLayoutCoordinator {
 		}
 	}
 
+	/**
+	 * Load KaTeX for math that arrived on a SYNCHRONOUS path, then rebuild.
+	 *
+	 * `prepareKatex` covers the two async entries (`load`, `loadOlder`) by awaiting
+	 * before the first commit, so their formulas are measured correctly the first
+	 * time. Every other way math reaches the document is synchronous and cannot
+	 * await anything:
+	 *
+	 *   - `setStreamingMessage` — the live row, i.e. all streaming output
+	 *   - `appendMessage` / `insertMessage` / `replaceMessage` — a broadcast message
+	 *     adopted in place, which is how a streamed answer's PERSISTED form arrives
+	 *
+	 * Without this the first formula of a session prepares as literal text and stays
+	 * that way: the prepared/measure caches key on `getKatexRevision()`, which never
+	 * moves because nothing ever loads the runtime. Only a page reload (which goes
+	 * through `load`) recovered — the reported symptom.
+	 *
+	 * Shape of the fix: fire-and-forget. The caller has already committed a layout
+	 * with the formula as text, and when the runtime lands the revision bumps, so a
+	 * rebuild re-measures it as math. That second pass is why this may not await —
+	 * the synchronous commit must not be delayed by a 584KB import.
+	 *
+	 * The rebuild ANCHORS (like every other out-of-band mutation): a formula measured
+	 * as math is a different height than the same source as text, and a committed row
+	 * may not visually jump without a user action.
+	 *
+	 * Cost discipline: `setStreamingMessage` runs on every render version, so this
+	 * must not be O(body) per call. `collectNewMathCandidateTexts` keeps a per-string
+	 * cursor and only forwards a body whose NEW text could have closed a formula, so
+	 * a math-free turn costs a substring scan per frame instead of four regexes over
+	 * an ever-growing body (which made the whole turn O(n²)).
+	 */
+	private scheduleKatexForSyncPath(
+		messages: readonly (TreeMessage | null | undefined)[],
+		getView?: () => PrependView,
+	): void {
+		// Already loaded: the synchronous commit that just ran had full math support,
+		// so there is nothing to correct and no import to pay for.
+		if (isKatexReady()) return;
+		const texts = collectNewMathCandidateTexts(messages, this.mathScanCursor);
+		if (texts.length === 0) return;
+		// Identity guard: a narrator switch during the import must not resurrect a
+		// layout for a document that is no longer loaded.
+		//
+		// Deliberately NOT the generation counter. The caller commits its own layout
+		// immediately after calling this (that is the whole point — the row appears at
+		// once, as text), which bumps the generation before the import resolves, so a
+		// generation guard would reject EVERY correction and silently restore the bug.
+		const narratorId = this.narratorId;
+		void ensureKatexLoaded(texts)
+			.then(() => {
+				if (narratorId !== this.narratorId) return;
+				// Nothing loaded (the text had no math after all, or the chunk failed):
+				// the revision did not move, so a rebuild would be pure cost.
+				if (!isKatexReady()) return;
+				if (!this.input || !this.lastBuildOptions) return;
+				const view = getView?.();
+				const anchor =
+					view && this.current.index
+						? captureCoordinatorAnchor(this.current.index, view)
+						: undefined;
+				const nextGeneration = ++this.generation;
+				this.commitLayout(
+					this.input,
+					this.lastBuildOptions,
+					anchor,
+					view?.viewportHeight ?? this.lastViewportHeight,
+					nextGeneration,
+				);
+			})
+			.catch(() => {
+				// Formulas stay as source text; never wedge the list over a failed chunk.
+			});
+	}
+
 	private commitLayout(
 		input: PretextDocumentInput,
 		buildOptions: PretextLayoutBuildOptions,
 		anchor: PretextLayoutAnchor | undefined,
 		viewportHeight: number,
 		generation: number,
+		smoothFollow?: boolean,
 	): PretextLayoutCoordinatorSnapshot {
 		if (generation !== this.generation) return this.current;
 		try {
@@ -990,7 +1135,15 @@ export class PretextLayoutCoordinator {
 				// error for diagnostics; without clearing it here that error would ride
 				// along on every later healthy snapshot forever.
 				error: undefined,
-				...(scrollTop == null ? {} : { scrollTop, scrollTopAnchorKind: anchor?.kind ?? "item" }),
+				...(scrollTop == null
+					? {}
+					: {
+							scrollTop,
+							scrollTopAnchorKind: anchor?.kind ?? "item",
+							...(smoothFollow === true && anchor?.kind === "bottom"
+								? { scrollTopSmoothFollow: true }
+								: {}),
+						}),
 			};
 			this.emit();
 			return this.current;

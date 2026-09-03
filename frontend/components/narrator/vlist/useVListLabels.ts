@@ -177,6 +177,16 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
+		/** File-changes section title. */
+		fileChanges: string;
+		/** Suffix for a file whose line counts are unknown. */
+		linesNotMeasured: string;
+		/** Overflow row: `{count}` more files. */
+		moreFiles: string;
+		/** Overflow row: `{count}` files touched by shell commands. */
+		shellTouched: string;
+		/** Marker for a file a revert here will not restore (changed in another worktree). */
+		outsideWorkspace: string;
 		/** Same bundle as the tool card: the header + recent-call rows reuse it. */
 		timing: VListTimingLabels;
 	};
@@ -426,6 +436,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
+			sidecarSourceTutorialLesson: t("sidecar.sources.tutorial_lesson"),
 		}),
 		[t, tCommon],
 	);
@@ -548,6 +559,11 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
+				fileChanges: t("subagentChangedFiles"),
+				linesNotMeasured: t("subagentLinesNotMeasured"),
+				moreFiles: t("subagentMoreFiles"),
+				shellTouched: t("subagentShellTouched"),
+				outsideWorkspace: t("subagentOutsideWorkspace"),
 				timing,
 			},
 			permission,

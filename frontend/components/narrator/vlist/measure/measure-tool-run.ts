@@ -47,6 +47,15 @@
  *   trace row                            = 2 + max(14,12,16.8)     ≈ 18.8
  *   count line (Group py=2, no outer box)= 4 + max(16,16.8)        ≈ 20.8
  *
+ * ── The header band is CONDITIONAL (isTraceHeaderVisible) ────────────────────
+ * An `activity` trace showing its rows draws NO band: its label is generic while
+ * every row already names its own tool, so the ~20.8px was a fixed per-turn cost
+ * buying nothing. The band survives wherever it still does work — a collapsed
+ * activity fold (it is the only way back to the rows) and every other variant
+ * (`reasoning-steps` / `collapsible`, whose label identifies the list).
+ * `header.visible` carries the decision to the renderer; the block stays in the
+ * stack at height 0 so it keeps owning the outer top padding.
+ *
  * ── Expandable body (reasoning-step rows: standalone trace + activity fold) ──
  * A row's body is `Box pl="lg"(20) py={2} borderLeft:2px` wrapping MarkdownContent.
  * Like reasoning, the body renders at markdown `sm` (MarkdownContent.module.css
@@ -68,10 +77,12 @@ import {
 	BARE_ROW_PADDING_Y,
 	BARE_ROW_STATUS,
 	BARE_XS_LINE,
+	bareRowMetrics,
 } from "@shared/pretext-layout/row-metrics";
 // Type-only: the row identity the adapter attaches and the renderer consumes.
 // A type import adds no runtime dependency and stays clear of the measure math.
 import type { AdapterTraceRowIdentity } from "@shared/pretext-layout/segment-adapter";
+import { getTypographyRevision } from "@shared/pretext-layout/typography";
 import {
 	accumulateFrame,
 	DEFAULT_RENDER_LOD,
@@ -81,7 +92,7 @@ import {
 	type PreparedFixedBlock,
 	type RenderLod,
 } from "../prepared-block";
-import { SPACING } from "../pretext-fonts";
+import { SPACING, typographyMetrics } from "../pretext-fonts";
 import { measureMarkdown } from "./measure-markdown";
 // The drilled-in SUBAGENT card (an Agent/Task/Send row reveals the same card it
 // gets at L3+). Not a cycle: measure-subagent sources its row height from
@@ -96,7 +107,6 @@ import {
 	CARD_BORDER as SUBAGENT_CARD_BORDER,
 	CARD_PADDING as SUBAGENT_CARD_PADDING,
 	type SubagentCardData,
-	XS_LINE_HEIGHT,
 } from "./measure-subagent";
 // The drill-down card. NOT a cycle: measure-tool-call depends on markdown /
 // media / permission / reflection / pretext-metrics and never on this module.
@@ -143,6 +153,54 @@ export const TRACE_HEADER_CONTENT = Math.max(TRACE_HEADER_ICON, TRACE_XS_LINE);
 export const TRACE_HEADER_GROUP_HEIGHT = TRACE_HEADER_PADDING_Y * 2 + TRACE_HEADER_CONTENT;
 /** Collapsed (header-only) band height: outer py*2 + header group = 4 + 20.8 = 24.8. */
 export const TRACE_HEADER_BAND_HEIGHT = TRACE_OUTER_PADDING_Y * 2 + TRACE_HEADER_GROUP_HEIGHT;
+
+/**
+ * Trace geometry at the reader's current typography.
+ *
+ * The exported `TRACE_*` constants above remain the NEUTRAL baseline (they are the
+ * documented reference, and several tests pin them). Measurement reads this instead,
+ * so a row grows with the font-size setting.
+ *
+ * Only text scales; `TRACE_OUTER_PADDING_Y` / `TRACE_HEADER_PADDING_Y` and the icon
+ * slots are fixed chrome. The header lane keeps its `max(icon 16, text)` shape for
+ * the same reason the row lane does (see `bareRowMetrics`): the band must still
+ * contain its 16px icon when text is scaled down.
+ */
+export interface TraceMetrics {
+	xsLine: number;
+	rowContent: number;
+	rowHeight: number;
+	headerContent: number;
+	headerGroupHeight: number;
+	headerBandHeight: number;
+	countLineHeight: number;
+}
+
+let traceMetricsCache: TraceMetrics | null = null;
+let traceMetricsRevision = -1;
+
+export function traceMetrics(): TraceMetrics {
+	// Keyed on the GENERATION, not on a derived height: below the point where a glyph
+	// slot wins the `max`, several distinct font scales produce the same row height,
+	// so a height-keyed cache would serve one generation's snapshot to another.
+	const revision = getTypographyRevision();
+	if (traceMetricsCache && traceMetricsRevision === revision) return traceMetricsCache;
+	const bare = bareRowMetrics();
+	const headerContent = Math.max(TRACE_HEADER_ICON, bare.xsLine);
+	const headerGroupHeight = TRACE_HEADER_PADDING_Y * 2 + headerContent;
+	traceMetricsCache = {
+		xsLine: bare.xsLine,
+		rowContent: bare.content,
+		rowHeight: bare.height,
+		headerContent,
+		headerGroupHeight,
+		headerBandHeight: TRACE_OUTER_PADDING_Y * 2 + headerGroupHeight,
+		// A standalone count line is a bare `<Group py={2}>` with no outer Box.
+		countLineHeight: headerGroupHeight,
+	};
+	traceMetricsRevision = revision;
+	return traceMetricsCache;
+}
 
 /** Trailing status glyph size (12) — same slot the chunk path reserves. */
 export const TRACE_ROW_STATUS = BARE_ROW_STATUS;
@@ -241,6 +299,14 @@ export interface TraceItemData {
 	 */
 	timing?: Partial<ToolTimingStamps> | null;
 	/**
+	 * Added / removed line counts for a Write/Edit row (`+12 -3`).
+	 *
+	 * HEIGHT-NEUTRAL for the same reason `status` and `timing` are: it is one nowrap
+	 * span sharing the row's fixed 18.8px line. Still keyed by `traceRevision`,
+	 * because the renderer paints it from the cached payload.
+	 */
+	diffStats?: { added: number; removed: number } | null;
+	/**
 	 * Selection / context-menu coordinates for this row (renderer only).
 	 *
 	 * Pure passthrough, exactly like `toolName` / `category` / `iconColor`: the
@@ -324,8 +390,20 @@ export interface TraceExpandState {
 export interface MeasuredTraceHeader {
 	/** Top offset (px) of the header Group (== outer top padding). */
 	top: number;
-	/** Header Group height (px) ≈ 20.8. */
+	/** Header Group height (px) ≈ 20.8, or 0 when the band is not drawn. */
 	height: number;
+	/**
+	 * Whether the header band is drawn at all.
+	 *
+	 * False only for an ACTIVITY trace whose rows are on screen (see
+	 * `isTraceHeaderVisible`): there the band is pure decoration — a generic
+	 * "Activity · N reasoning · N tools" line above rows that already name every
+	 * call — so it is dropped, and the ~20.8px it occupied goes to content.
+	 *
+	 * The renderer must skip the band when this is false, or it paints a header the
+	 * height model did not reserve and every row below it shifts.
+	 */
+	visible: boolean;
 	/** Whether a leading chevron is drawn (collapseItems). */
 	hasChevron: boolean;
 	/** Whether the folded list is currently open (itemsOpened). */
@@ -365,6 +443,12 @@ export interface MeasuredTraceRow {
 	 * Null when the row carried none, so the slot is skipped entirely.
 	 */
 	timing: ToolTimingStamps | null;
+	/**
+	 * Added / removed line counts for a Write/Edit row (renderer only;
+	 * height-neutral). Null when the row is not a file tool or the counts are
+	 * unknown — never `{ added: 0, removed: 0 }` for "unknown".
+	 */
+	diffStats: { added: number; removed: number } | null;
 	/** Tool name for picking the real category glyph (renderer only). */
 	toolName?: string;
 	/** Resolved tool category for the glyph (renderer only). */
@@ -442,7 +526,13 @@ export interface MeasuredTraceRow {
  */
 export interface MeasuredCollapsibleTrace extends MeasuredElement {
 	variant: TraceVariant;
-	/** Collapsed (header-only) band height (px) ≈ 24.8. */
+	/**
+	 * Collapsed (header-only) band height (px) ≈ 24.8.
+	 *
+	 * The height of the band WHEN IT IS DRAWN — it stays at the neutral 24.8 even for
+	 * a trace whose band is hidden (`header.visible === false`), because it is the
+	 * documented reference for the collapsed form, not a report of this measure.
+	 */
 	headerBandHeight: number;
 	/** True when the whole row list is folded → header only. */
 	collapsedToHeader: boolean;
@@ -496,6 +586,29 @@ function isExpandable(item: TraceItemData): boolean {
 	return typeof item.bodyText === "string" && item.bodyText.trim().length > 0;
 }
 
+/**
+ * Whether the header band earns its ~20.8px.
+ *
+ * The band has two jobs, and only one of them survives once the rows are visible:
+ *
+ *  - It is the FOLD TOGGLE. At L1 an activity unit collapses to the band alone, and
+ *    that band's chevron is the reader's only way back to the rows. Dropping it there
+ *    would strand the whole run behind nothing clickable, so `collapseItems` always
+ *    keeps it.
+ *  - It LABELS the trace. `reasoning-steps` needs that ("Reasoning · 5 steps" is the
+ *    only thing identifying the list), but the ACTIVITY fold's own label is generic —
+ *    "Activity · 0 reasoning · 4 tools" above rows that each already name their tool.
+ *    It is a fixed cost per assistant turn, and a turn with one tool call spent more
+ *    vertical space on the label than on the call.
+ *
+ * So the band is dropped for exactly one case: an `activity` trace with its rows on
+ * screen. Every other variant keeps it, and the collapsed activity fold keeps it too.
+ */
+function isTraceHeaderVisible(variant: TraceVariant, collapseItems: boolean): boolean {
+	if (collapseItems) return true;
+	return variant !== "activity";
+}
+
 function emptyTrace(
 	contentWidth: number,
 	variant: TraceVariant,
@@ -508,11 +621,12 @@ function emptyTrace(
 		contentWidth,
 		usedWidth: 0,
 		variant,
-		headerBandHeight: TRACE_HEADER_BAND_HEIGHT,
+		headerBandHeight: traceMetrics().headerBandHeight,
 		collapsedToHeader: false,
 		header: {
 			top: 0,
 			height: 0,
+			visible: false,
 			hasChevron: false,
 			opened: false,
 			label: "",
@@ -567,18 +681,33 @@ export function measureCollapsibleTrace(
 	const blocks: PreparedBlock[] = [];
 
 	// Header carries the outer TOP padding as its marginTop.
+	//
+	// A hidden band is a ZERO-HEIGHT block rather than an absent one: it still owns
+	// the outer top padding, and keeping it in the stack keeps `blocks[0]` the header
+	// for every reader of the frame (the toggle/row indices below are derived, so they
+	// follow either way — but `frame.blocks[0]` is read directly).
+	const headerVisible = isTraceHeaderVisible(variant, collapseItems);
 	blocks.push(
-		fixedBlock("trace-header", TRACE_HEADER_GROUP_HEIGHT, TRACE_OUTER_PADDING_Y, 0, {
-			variant,
-			hasChevron: collapseItems,
-			opened: itemsOpened,
-			label: data.headerLabel ?? "",
-			count: data.headerCount ?? "",
-		}),
+		fixedBlock(
+			"trace-header",
+			headerVisible ? traceMetrics().headerGroupHeight : 0,
+			TRACE_OUTER_PADDING_Y,
+			0,
+			{
+				variant,
+				visible: headerVisible,
+				hasChevron: collapseItems,
+				opened: itemsOpened,
+				label: data.headerLabel ?? "",
+				count: data.headerCount ?? "",
+			},
+		),
 	);
 	const toggleBlockIndex = hasToggleRow ? blocks.length : -1;
 	if (hasToggleRow) {
-		blocks.push(fixedBlock("trace-toggle", TRACE_ROW_HEIGHT, 0, 0, { hiddenCount, showEarlier }));
+		blocks.push(
+			fixedBlock("trace-toggle", traceMetrics().rowHeight, 0, 0, { hiddenCount, showEarlier }),
+		);
 	}
 
 	// Rows (with folded-in expanded bodies / drilled-in cards).
@@ -591,7 +720,7 @@ export function measureCollapsibleTrace(
 		const expandable = isExpandable(item);
 		const expanded = expandable && expandedSet.has(itemIndex);
 
-		let blockHeight = TRACE_ROW_HEIGHT;
+		let blockHeight = traceMetrics().rowHeight;
 		let body: MeasuredElement | null = null;
 		let card: MeasuredToolCall | MeasuredSubagent | null = null;
 		if (expanded) {
@@ -651,6 +780,7 @@ export function measureCollapsibleTrace(
 	const header: MeasuredTraceHeader = {
 		top: headerFrame.top,
 		height: headerFrame.height,
+		visible: headerVisible,
 		hasChevron: collapseItems,
 		opened: itemsOpened,
 		label: data.headerLabel ?? "",
@@ -693,7 +823,7 @@ export function measureCollapsibleTrace(
 					top: border + SUBAGENT_CARD_PADDING + BADGE_ROW_HEIGHT + DESC_MARGIN_TOP,
 					left: border + SUBAGENT_CARD_PADDING + DESC_LEFT,
 					width: Math.max(1, contentWidth - 2 * (border + SUBAGENT_CARD_PADDING) - DESC_LEFT),
-					height: XS_LINE_HEIGHT,
+					height: typographyMetrics().line.xs,
 				};
 			} else {
 				const drillBorder = (cardMeasured as MeasuredToolCall).hasBorder ? CARD_BORDER : 0;
@@ -719,12 +849,13 @@ export function measureCollapsibleTrace(
 			// `recentCallTimings`.
 			status: item.status ?? null,
 			timing: item.timing ? resolveToolTimingStamps(item.timing) : null,
+			diffStats: item.diffStats ?? null,
 			shimmer: !!item.shimmer,
 			reflectionStatus: item.reflectionStatus,
 			expandable,
 			expanded,
 			top: bf.top,
-			rowHeight: TRACE_ROW_HEIGHT,
+			rowHeight: traceMetrics().rowHeight,
 			blockHeight: bf.height,
 			body,
 			cardMeasured,
@@ -736,8 +867,8 @@ export function measureCollapsibleTrace(
 				cardMeasured != null
 					? bf.top
 					: expanded
-						? bf.top + TRACE_ROW_HEIGHT + TRACE_BODY_PADDING_Y
-						: bf.top + TRACE_ROW_HEIGHT,
+						? bf.top + traceMetrics().rowHeight + TRACE_BODY_PADDING_Y
+						: bf.top + traceMetrics().rowHeight,
 			bodyLeft: cardMeasured != null ? 0 : TRACE_BODY_PADDING_LEFT + TRACE_BODY_BORDER_LEFT,
 			drillHeader,
 			// Passthrough only — never used above in any height computation.
@@ -753,7 +884,7 @@ export function measureCollapsibleTrace(
 		contentWidth,
 		usedWidth: contentWidth,
 		variant,
-		headerBandHeight: TRACE_HEADER_BAND_HEIGHT,
+		headerBandHeight: traceMetrics().headerBandHeight,
 		collapsedToHeader: !rowsOpened,
 		header,
 		toggle,
@@ -912,7 +1043,7 @@ function measureTraceCountLine(
 	contentWidth: number,
 	labels: TraceHeaderLabels = {},
 ): MeasuredTraceCountLine {
-	const block = fixedBlock("trace-count-line", TRACE_COUNT_LINE_HEIGHT, 0, 0, {
+	const block = fixedBlock("trace-count-line", traceMetrics().countLineHeight, 0, 0, {
 		kind,
 		count,
 		label: labels.label ?? "",

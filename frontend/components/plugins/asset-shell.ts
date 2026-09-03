@@ -1,3 +1,4 @@
+import { TOKEN_STYLE_ELEMENT_ID } from "./host-tokens";
 import type { JsonValue } from "./protocol";
 import {
 	createUiRequestId,
@@ -20,6 +21,8 @@ export interface PluginAssetShellOptions {
 	panelInstanceId: string;
 	entryUrl: string;
 	styleUrl?: string;
+	/** Panel title shown by the built-in loading splash (before the plugin script takes over). */
+	title?: string;
 	defaultTimeoutMs?: number;
 	/**
 	 * Shared host runtime (React + Mantine) to load before the plugin entry.
@@ -33,10 +36,91 @@ export interface PluginAssetShellOptions {
 	 */
 	runtimeUrl?: string;
 	runtimeStyleUrl?: string;
+	/**
+	 * Host presentation state for the panel's first frame.
+	 *
+	 * All optional so an omitting caller (tests, an older surface) produces the same shell as
+	 * before, minus the theme and language features. The defaults are inert: English, and no
+	 * token declarations at all — which leaves a plugin's `var(--nf-x, fallback)` on its
+	 * fallback rather than on an empty value.
+	 */
+	locale?: string;
+	/** Lookup order for translations, most specific first, always ending at `en`. */
+	localeChain?: readonly string[];
+	/** Pre-rendered `:root { --nf-*: … }` block; see `host-tokens.ts`. */
+	tokenCss?: string;
 }
 
 function escapeAttribute(value: string): string {
 	return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;").replaceAll("<", "&lt;");
+}
+
+/**
+ * Mantine tokens mirrored from the host document into the sandboxed iframe so
+ * plugin UIs can style themselves with the exact same design system (colors,
+ * radius, fonts, spacing) as the host — including light/dark scheme switches,
+ * because the srcdoc is rebuilt on theme change. Iframe documents do not
+ * inherit host CSS variables, so the shell copies the resolved values.
+ */
+const MANTINE_TOKEN_NAMES = [
+	"--mantine-color-body",
+	"--mantine-color-text",
+	"--mantine-color-dimmed",
+	"--mantine-color-default",
+	"--mantine-color-default-border",
+	"--mantine-color-default-hover",
+	"--mantine-color-black",
+	"--mantine-color-white",
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-gray-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-dark-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-blue-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-indigo-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-yellow-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-green-${i}`),
+	...Array.from({ length: 10 }, (_, i) => `--mantine-color-red-${i}`),
+	"--mantine-primary-color-0",
+	"--mantine-primary-color-1",
+	"--mantine-primary-color-2",
+	"--mantine-primary-color-3",
+	"--mantine-primary-color-4",
+	"--mantine-primary-color-5",
+	"--mantine-primary-color-6",
+	"--mantine-primary-color-7",
+	"--mantine-primary-color-8",
+	"--mantine-primary-color-9",
+	"--mantine-primary-color-filled",
+	"--mantine-primary-color-filled-hover",
+	"--mantine-primary-color-light",
+	"--mantine-primary-color-light-hover",
+	"--mantine-primary-color-contrast",
+	"--mantine-radius-xs",
+	"--mantine-radius-sm",
+	"--mantine-radius-md",
+	"--mantine-radius-lg",
+	"--mantine-spacing-xs",
+	"--mantine-spacing-sm",
+	"--mantine-spacing-md",
+	"--mantine-spacing-lg",
+	"--mantine-font-family",
+	"--mantine-font-family-monospace",
+	"--mantine-heading-font-family",
+	"--mantine-font-size-xs",
+	"--mantine-font-size-sm",
+	"--mantine-font-size-md",
+	"--mantine-font-size-lg",
+	"--mantine-line-height",
+];
+
+/** Read the host's live Mantine tokens. Safe to call during render (document is mounted). */
+export function readHostMantineTokens(): string {
+	if (typeof document === "undefined") return "";
+	const style = getComputedStyle(document.documentElement);
+	const parts: string[] = [];
+	for (const name of MANTINE_TOKEN_NAMES) {
+		const value = style.getPropertyValue(name).trim();
+		if (value) parts.push(`${name}:${value};`);
+	}
+	return parts.join("");
 }
 
 function escapeScriptJson(value: unknown): string {
@@ -73,6 +157,22 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
 		runtimeUrl: options.runtimeUrl,
 		runtimeStyleUrl: options.runtimeStyleUrl,
 		timeout,
+		/*
+		 * Host presentation state, needed on the FIRST frame.
+		 *
+		 * Not fetched over `context.get`: that is an async RPC that cannot complete before the
+		 * plugin's first render, so a panel would paint unstyled and in the wrong language, then
+		 * correct itself. Both are pushed again later when the host changes them.
+		 *
+		 * `localeChain` is computed host-side and passed in rather than derived here. This file is
+		 * an inline string with no module loader, so it cannot import `@shared/i18n-locales`, and
+		 * reimplementing the alias/fallback rules inside it would create a second copy free to
+		 * drift from the one the rest of the app uses.
+		 */
+		locale: options.locale ?? "en",
+		localeChain: options.localeChain ?? ["en"],
+		tokenCss: options.tokenCss ?? "",
+		tokenStyleId: TOKEN_STYLE_ELEMENT_ID,
 	};
 	return `
 (() => {
@@ -126,6 +226,42 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     post(message, ${PLUGIN_UI_REQUEST_MAX_BYTES});
   };
   const onNotification = (listener) => { notificationListeners.add(listener); return () => notificationListeners.delete(listener); };
+  // --- Host presentation state (theme tokens + language) ---
+  // Mutable: the host pushes replacements when the user changes either one.
+  let currentLocale = config.locale;
+  let currentChain = config.localeChain;
+  const localeListeners = new Set();
+  // Written into <head> by applyTokenCss. Styles must land before the plugin's first paint,
+  // so this runs during bootstrap rather than on the handshake.
+  let tokenStyle = null;
+  const applyTokenCss = (css) => {
+    if (!css) { if (tokenStyle) tokenStyle.textContent = ""; return; }
+    if (!tokenStyle) {
+      tokenStyle = document.createElement("style");
+      tokenStyle.id = config.tokenStyleId;
+      // Prepended so a plugin's own stylesheet can override a token if it needs to; a token
+      // that wins over the plugin's explicit CSS would make the panel unstyleable.
+      document.head.insertBefore(tokenStyle, document.head.firstChild);
+    }
+    tokenStyle.textContent = css;
+  };
+  applyTokenCss(config.tokenCss);
+  const translate = (tables, key, params) => {
+    if (!tables || typeof tables !== "object" || typeof key !== "string") return "";
+    let template;
+    for (const candidate of currentChain) {
+      const table = tables[candidate];
+      if (table && typeof table[key] === "string") { template = table[key]; break; }
+    }
+    // A key found nowhere yields the key itself: a button reading "signIn" is visibly a
+    // missing string, while an empty button looks like a rendering fault.
+    if (template === undefined) template = key;
+    if (!params) return template;
+    return template.replace(/\\{([a-zA-Z0-9_]+)\\}/g, (match, name) => {
+      const value = params[name];
+      return value === undefined ? match : String(value);
+    });
+  };
   const api = Object.freeze({
     request,
     notify,
@@ -166,6 +302,20 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
     }),
     notifications: Object.freeze({ show: (input) => request("notifications.show", input) }),
     ui: Object.freeze({ openExternal: (input) => request("ui.openExternal", input) }),
+    // Language. Theme needs no API at all: the host rewrites the token style element and the
+    // browser recalculates. Text cannot work that way -- a string already in the DOM can only
+    // be replaced by the plugin -- which is why this side needs an onChange hook.
+    i18n: Object.freeze({
+      // A getter, not a snapshot: freezing seals the descriptor, so the accessor keeps
+      // reporting the current value while the surface stays untamperable.
+      get locale() { return currentLocale; },
+      t: translate,
+      onChange: (listener) => {
+        if (typeof listener !== "function") return () => {};
+        localeListeners.add(listener);
+        return () => localeListeners.delete(listener);
+      },
+    }),
   });
   const validEnvelope = (message) => {
     if (!message || typeof message !== "object" || message.protocol !== config.protocol) return false;
@@ -183,6 +333,23 @@ function createInlineBridge(options: PluginAssetShellOptions): string {
       clearTimeout(item.timer);
       if (message.error) item.reject(Object.assign(new Error(message.error.message), message.error));
       else item.resolve(message.result);
+      return;
+    }
+    // Presentation updates are handled here and NOT forwarded to plugin listeners: theme is
+    // applied by this shell, and language is delivered through the typed i18n.onChange
+    // channel. Passing them on as raw notifications too would give plugins a second, untyped
+    // way to observe the same thing.
+    if (message.method === "host.theme") {
+      applyTokenCss(typeof message.params?.tokenCss === "string" ? message.params.tokenCss : "");
+      return;
+    }
+    if (message.method === "host.locale") {
+      const next = message.params || {};
+      if (typeof next.locale === "string") currentLocale = next.locale;
+      if (Array.isArray(next.localeChain) && next.localeChain.length > 0) currentChain = next.localeChain;
+      // Listener failures are contained: one panel component throwing must not stop the rest
+      // of the panel from re-rendering in the new language.
+      for (const listener of localeListeners) { try { listener(currentLocale); } catch {} }
       return;
     }
     for (const listener of notificationListeners) listener(message);
@@ -284,7 +451,12 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		.origin;
 	const csp = [
 		"default-src 'none'",
-		`sandbox allow-scripts`,
+		// ⚠️ NO `sandbox` directive here, deliberately: CSP's `sandbox` is header-only and is
+		// IGNORED in a `<meta>` tag (CSP Level 2 §3.3). Listing it read as the sandbox being
+		// declared twice for redundancy, when in fact only one declaration has ever done
+		// anything — the iframe's own `sandbox="allow-scripts"` attribute in
+		// `PluginUiRuntimeProvider`. Keeping the inert copy invites someone to "simplify" by
+		// deleting the attribute instead.
 		`script-src 'nonce-${escapeAttribute(options.nonce)}' ${assetOrigin}`,
 		`style-src ${assetOrigin} 'unsafe-inline'`,
 		`img-src ${assetOrigin} data: blob:`,
@@ -299,7 +471,14 @@ export function createPluginAssetShell(options: PluginAssetShellOptions): string
 		"manifest-src 'none'",
 		"media-src 'none'",
 	].join("; ");
-	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"></head><body><script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
+	// The iframe body starts with a themed loading splash (spinner + panel
+	// title) so the frame is never a blank white rectangle while the bridge
+	// handshake and plugin script load. The plugin script takes over the body
+	// as soon as it runs (plugin UIs render their own content); the splash is
+	// deliberately inline/CSP-safe (style-src 'unsafe-inline').
+	const splashTitle = options.title ? escapeAttribute(options.title) : "Plugin panel";
+	const splash = `<div id="plugin-shell-splash" style="position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--mantine-color-body,#1a1b1e);color:var(--mantine-color-dimmed,#909296);font-family:var(--mantine-font-family,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif);font-size:13px;"><div style="width:20px;height:20px;border:2px solid var(--mantine-color-default-border,#373a40);border-top-color:var(--mantine-primary-color-5,#4c6ef5);border-radius:50%;animation:plugin-shell-spin .9s linear infinite;"></div><div>${splashTitle}</div></div><style>@keyframes plugin-shell-spin{to{transform:rotate(360deg)}}</style>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${escapeAttribute(csp)}"><style>:root{${readHostMantineTokens()}}</style></head><body>${splash}<script nonce="${escapeAttribute(options.nonce)}">${createInlineBridge(options)}</script></body></html>`;
 }
 
 export function createPluginNonce(): string {

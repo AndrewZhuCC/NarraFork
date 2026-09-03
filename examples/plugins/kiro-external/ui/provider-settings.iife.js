@@ -212,24 +212,42 @@
     actionDeleteUnhealthy: "删除错误/封禁凭据",
     actionBatchDelete: "删除选中凭据"
   };
-  function pickTable() {
-    const locale = typeof navigator === "undefined" ? "en" : (navigator.language ?? "en").toLowerCase();
-    return locale.startsWith("zh") ? zhCN : en;
+  var TABLES = { en, "zh-CN": zhCN };
+  function hostI18n() {
+    return globalThis.narrafork?.i18n;
   }
-  var table = pickTable();
   function t(key, params) {
-    const template = table[key] ?? en[key] ?? String(key);
+    const host = hostI18n();
+    if (host)
+      return host.t(TABLES, key, params);
+    return interpolate(en[key] ?? String(key), params);
+  }
+  function activeLocale() {
+    const host = hostI18n();
+    if (host?.locale)
+      return host.locale;
+    return typeof navigator === "undefined" ? "en" : navigator.language ?? "en";
+  }
+  function onLocaleChange(listener) {
+    return hostI18n()?.onChange(listener) ?? (() => {});
+  }
+  function interpolate(template, params) {
     if (!params)
       return template;
     return template.replace(/\{(\w+)\}/g, (whole, name) => (name in params) ? String(params[name]) : whole);
   }
 
   // examples/plugins/kiro-external/src/ui/format.ts
-  var TIER_META = {
-    paid: { color: "blue", label: t("tierPaid"), desc: t("tierPaidDesc") },
-    enterprise: { color: "violet", label: t("tierEnterprise"), desc: t("tierEnterpriseDesc") },
-    free: { color: "gray", label: t("tierFree"), desc: t("tierFreeDesc") }
-  };
+  function getTierMeta(tier) {
+    switch (tier) {
+      case "paid":
+        return { color: "blue", label: t("tierPaid"), desc: t("tierPaidDesc") };
+      case "enterprise":
+        return { color: "violet", label: t("tierEnterprise"), desc: t("tierEnterpriseDesc") };
+      default:
+        return { color: "gray", label: t("tierFree"), desc: t("tierFreeDesc") };
+    }
+  }
   function isApiKeyEntry(entry) {
     if (entry.isApiKey === true)
       return true;
@@ -264,8 +282,7 @@
     if (Number.isNaN(date.getTime()))
       return String(value);
     const deltaMs = date.getTime() - Date.now();
-    const locale = typeof navigator === "undefined" ? "en" : navigator.language ?? "en";
-    const formatter = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+    const formatter = new Intl.RelativeTimeFormat(activeLocale(), { numeric: "auto" });
     for (const [unit, ms] of RELATIVE_UNITS) {
       if (Math.abs(deltaMs) >= ms)
         return formatter.format(Math.round(deltaMs / ms), unit);
@@ -360,7 +377,7 @@
     const limit = usage?.usageLimit;
     const title = entry.subscriptionTitle ?? usage?.subscriptionTitle;
     const tier = entry.tier ?? "free";
-    const meta = TIER_META[tier];
+    const meta = getTierMeta(tier);
     const percent = limit && limit > 0 && current != null ? current / limit * 100 : null;
     return /* @__PURE__ */ jsx(Stack, {
       gap: 2,
@@ -1195,6 +1212,8 @@
     const [confirming, setConfirming] = useState();
     const [modelsDialog, setModelsDialog] = useState();
     const [usageDialog, setUsageDialog] = useState();
+    const [, bumpLocale] = useState(0);
+    useEffect(() => onLocaleChange(() => bumpLocale((value) => value + 1)), []);
     const unmounted = useRef(false);
     useEffect(() => {
       return () => {
@@ -1564,7 +1583,7 @@
           ]
         }, undefined, true, undefined, this) : null,
         groups.map(({ tier, entries, total }) => {
-          const meta = TIER_META[tier];
+          const meta = getTierMeta(tier);
           return /* @__PURE__ */ jsx(Stack4, {
             gap: "xs",
             children: [
@@ -1768,9 +1787,9 @@
   function renderFatal(detail) {
     const box = document.createElement("div");
     box.style.padding = "12px";
-    box.style.font = "13px/1.5 system-ui, sans-serif";
-    box.style.color = "#ffa8a8";
-    box.style.background = "#2e1a1a";
+    box.style.font = "13px/1.5 var(--nf-font, system-ui, sans-serif)";
+    box.style.color = "var(--nf-color-error, #ffa8a8)";
+    box.style.background = "var(--nf-color-surface, #2e1a1a)";
     box.style.borderRadius = "6px";
     box.style.margin = "12px";
     box.style.whiteSpace = "pre-wrap";

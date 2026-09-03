@@ -1879,10 +1879,10 @@ function messageToolUseIds(message: DbMessage): string[] {
  * Keep the first assistant that still has an unpaired tool call *after* the
  * compact marker by clipping the compact window to the messages before it.
  */
-export function clipMessagesBeforeUnpairedToolCalls(
-	messages: DbMessage[],
+export function clipMessagesBeforeUnpairedToolCalls<T extends DbMessage>(
+	messages: T[],
 	unpairedCallIds: string[],
-): { messages: DbMessage[]; beforeMessageId?: string; clipped: boolean } {
+): { messages: T[]; beforeMessageId?: string; clipped: boolean } {
 	if (unpairedCallIds.length === 0) {
 		return { messages, clipped: false };
 	}

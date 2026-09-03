@@ -8,6 +8,7 @@ import {
 	isTruncated,
 	MEDIA_IMAGE_CONTENT_PX,
 	resolveDisplayText,
+	resolveFileDiffStats,
 	type ToolAskDetail,
 	type ToolCappedDetail,
 	type ToolDetailData,
@@ -1084,6 +1085,178 @@ describe("classifyToolDetail — share", () => {
 	});
 });
 
+describe("classifyToolDetail — transfer", () => {
+	it("renders a REAL determinate bar from the measurement, not ascii text", () => {
+		// The bar is a structured row the render layer paints with a Progress
+		// element. Carrying it as text would mean the client re-parses the producer's
+		// own formatting, and the bar could neither animate nor be styled.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+			metadata: {
+				_structuredProgress: {
+					completed: 4 * 1024 * 1024,
+					total: 10 * 1024 * 1024,
+					elapsedMs: 2000,
+				},
+			},
+		});
+		const bar = metaRowsOf(d).rows.find((r) => r.progress);
+		expect(bar?.progress?.ratio).toBeCloseTo(0.4, 5);
+		expect(bar?.progress?.percent).toBe(40);
+		expect(bar?.progress?.figures).toContain("4.0 MB / 10.0 MB");
+		expect(bar?.progress?.active).toBe(true);
+	});
+
+	it("marks the bar INDETERMINATE when the total is unknown", () => {
+		// An upload reports no total. A ratio of 0 would paint a bar frozen at zero,
+		// which reads as a stalled transfer rather than as an unmeasurable one.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: { _structuredProgress: { completed: 4 * 1024 * 1024, elapsedMs: 2000 } },
+		});
+		const bar = metaRowsOf(d).rows.find((r) => r.progress);
+		expect(bar?.progress?.ratio).toBeNull();
+		expect(bar?.progress?.percent).toBeUndefined();
+	});
+
+	it("suppresses the ascii text body while the real bar is showing", () => {
+		// Both channels describe the same instant; showing them together would say it
+		// twice, once badly.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: {
+				_structuredProgress: { completed: 100, total: 1000, elapsedMs: 1000 },
+				_streamingOutput: "upload → pad7s — 10%",
+			},
+		});
+		const hasTextBody = asSections(d).sections.some((s) => s.body.kind === "capped");
+		expect(hasTextBody).toBe(false);
+	});
+
+	it("falls back to the streamed TEXT when no measurement arrived", () => {
+		// An older payload, or a producer that only wired the text channel.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "running",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			metadata: { _streamingOutput: "upload → pad7s — 40%\n4.0 MB / 10.0 MB" },
+		});
+		expect(cappedSectionBody(d, "streaming-bash").text).toContain("4.0 MB / 10.0 MB");
+	});
+
+	it("drops the bar once the call is terminal", () => {
+		// A finished transfer's bar would sit at 100% forever, saying nothing the
+		// summary line does not already say.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			outputJson: "Uploaded 10.0 MB",
+			metadata: {
+				_structuredProgress: { completed: 10, total: 10, elapsedMs: 1000 },
+			},
+		});
+		expect(metaRowsOf(d).rows.some((r) => r.progress)).toBe(false);
+	});
+
+	it("uses the persisted output once the transfer finishes", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/r/app.apk", localPath: "/l/app.apk" },
+			outputJson: "Uploaded 10.0 MB — /l/app.apk → pad7s:/r/app.apk in 5s, 2.0 MB/s.",
+			metadata: { transferDirection: "upload", deviceName: "pad7s" },
+		});
+		expect(cappedSectionBody(d, "term").text).toContain("Uploaded 10.0 MB");
+	});
+
+	it("badges the direction, device, size and rate", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "download", remotePath: "/r/f", localPath: "/l/f" },
+			outputJson: "done",
+			metadata: {
+				transferDirection: "download",
+				deviceName: "pad7s",
+				bytesFormatted: "48.0 MB",
+				rateFormatted: "2.1 MB/s",
+				filesTransferred: 12,
+				recursive: true,
+			},
+		});
+		expect(metaBadgeLabels(d)).toEqual([
+			"download",
+			"pad7s",
+			"recursive",
+			"48.0 MB",
+			"2.1 MB/s",
+			"12 files",
+		]);
+	});
+
+	it("orders the path row source → destination per direction", () => {
+		// An arrow is the only thing telling the reader which side is which, so it
+		// must follow the transfer, not the argument order.
+		const up = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "upload", remotePath: "/remote/x", localPath: "/local/x" },
+			outputJson: "ok",
+		});
+		expect(metaTexts(up)).toContain("/local/x  →  /remote/x");
+		const down = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "success",
+			inputJson: { direction: "download", remotePath: "/remote/x", localPath: "/local/x" },
+			outputJson: "ok",
+		});
+		expect(metaTexts(down)).toContain("/remote/x  →  /local/x");
+	});
+
+	it("keeps the header and reports the failure when a transfer errors with no body", () => {
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "fail",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+		});
+		expect(metaTexts(d)).toContain("/l/f  →  /r/f");
+		expect((sectionBody(d, "error") as ToolErrorDetail).kind).toBe("error");
+	});
+
+	it("shows a failure message exactly once, not beside a placeholder", () => {
+		// The trailing `withErrorSection` pass appends `errorMessage` to whatever the
+		// classifier returned, so emitting our own placeholder unconditionally would
+		// print the failure twice.
+		const d = classifyToolDetail({
+			toolName: "TransferFile",
+			category: "transfer",
+			status: "fail",
+			inputJson: { direction: "upload", remotePath: "/r/f", localPath: "/l/f" },
+			errorMessage: "Device pad7s is offline.",
+		});
+		const errors = asSections(d).sections.filter((s) => s.body.kind === "error");
+		expect(errors.length).toBe(1);
+		expect((errors[0]?.body as ToolErrorDetail).text).toBe("Device pad7s is offline.");
+	});
+});
+
 describe("classifyToolDetail — recall", () => {
 	it("keeps each search hit as its own entry (role badge + title + snippet)", () => {
 		const d = classifyToolDetail({
@@ -1752,5 +1925,153 @@ describe("classifyToolDetail — render-only body text passthrough (Approach B)"
 		expect(media.media?.filename).toBe("pic.png");
 		expect(media.media?.sizeKB).toBe(12);
 		expect(media.media?.imageFormat).toBe("png");
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// resolveFileDiffStats — the `+N -N` figure's two sources, and the cases where it
+// must refuse to answer.
+//
+// The refusals are the point of these tests. A wrong line count looks exactly as
+// authoritative as a right one, so every path that cannot know the answer has to
+// return undefined rather than a plausible-looking number.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A truncated leaf as the server's field-level projection emits it. */
+const truncatedLeaf = (preview: string) => ({
+	_truncated: true as const,
+	preview,
+	fullLength: 99_999,
+});
+
+describe("resolveFileDiffStats — tool metadata (authoritative)", () => {
+	it("reads the counts the tool wrote, for both Write and Edit", () => {
+		expect(
+			resolveFileDiffStats(
+				"Edit",
+				{ old_string: "a", new_string: "b" },
+				{
+					linesAdded: 12,
+					linesRemoved: 3,
+				},
+			),
+		).toEqual({ added: 12, removed: 3 });
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 240, linesRemoved: 0 }),
+		).toEqual({ added: 240, removed: 0 });
+	});
+
+	it("prefers metadata over a local computation", () => {
+		// The local diff of these two strings would say 1/1; metadata wins because only
+		// the server saw the untruncated payload.
+		expect(
+			resolveFileDiffStats(
+				"Edit",
+				{ old_string: "a", new_string: "b" },
+				{
+					linesAdded: 7,
+					linesRemoved: 5,
+				},
+			),
+		).toEqual({ added: 7, removed: 5 });
+	});
+
+	it("keeps a genuine zero-change measurement", () => {
+		// Distinct from "unknown": the tool measured this and found no line changes.
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 0, linesRemoved: 0 }),
+		).toEqual({ added: 0, removed: 0 });
+	});
+
+	/**
+	 * A half-written pair is rejected rather than read with the missing half as zero,
+	 * which would understate one direction of the change without any signal.
+	 */
+	it("rejects a partial or malformed metadata pair", () => {
+		expect(resolveFileDiffStats("Write", { content: "x" }, { linesAdded: 5 })).toBeUndefined();
+		expect(resolveFileDiffStats("Write", { content: "x" }, { linesRemoved: 5 })).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: "5", linesRemoved: 0 }),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats(
+				"Write",
+				{ content: "x" },
+				{
+					linesAdded: Number.NaN,
+					linesRemoved: 0,
+				},
+			),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { content: "x" }, { linesAdded: -1, linesRemoved: 0 }),
+		).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — Edit local fallback", () => {
+	it("diffs old_string against new_string when both are complete", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "a\nb\nc", new_string: "a\nB\nc" }, null),
+		).toEqual({ added: 1, removed: 1 });
+	});
+
+	/**
+	 * A truncated side is an 8KB PREFIX of a longer string. Diffing prefixes yields a
+	 * smaller count with nothing marking it as partial, so the figure is withheld.
+	 */
+	it("refuses when either side was truncated in transport", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: truncatedLeaf("a"), new_string: "b" }, null),
+		).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "a", new_string: truncatedLeaf("b") }, null),
+		).toBeUndefined();
+	});
+
+	/**
+	 * `old_string: ""` is Edit's whole-file OVERWRITE mode. It has the same missing
+	 * baseline a Write does — the previous content is not in the input — so the client
+	 * cannot tell a 3-line change from a wholesale replacement.
+	 */
+	it("refuses Edit's overwrite mode, which has no baseline in the input", () => {
+		expect(
+			resolveFileDiffStats("Edit", { old_string: "", new_string: "a\nb\nc" }, null),
+		).toBeUndefined();
+	});
+
+	it("refuses when the input lacks the fields entirely", () => {
+		expect(resolveFileDiffStats("Edit", { file_path: "/a.ts" }, null)).toBeUndefined();
+		expect(resolveFileDiffStats("Edit", truncatedLeaf("{"), null)).toBeUndefined();
+		expect(resolveFileDiffStats("Edit", null, null)).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — Write has no local fallback", () => {
+	/**
+	 * THE case this guard exists for, and not an edge case: every Write persisted
+	 * before the tool started writing metadata lands here.
+	 *
+	 * A Write's input carries only `content`; the file's previous state is never sent.
+	 * Computing locally could only ever conclude "every line is new", rendering a
+	 * rewrite that changed 3 lines as `+240 -0`. The client also cannot tell whether
+	 * the Write created the file or replaced one, so there is no safe reading.
+	 */
+	it("returns undefined for a Write without metadata, however complete its content", () => {
+		expect(resolveFileDiffStats("Write", { content: "a\nb\nc" }, null)).toBeUndefined();
+		expect(resolveFileDiffStats("Write", { content: "a\nb\nc" }, {})).toBeUndefined();
+		expect(
+			resolveFileDiffStats("Write", { file_path: "/a.ts", content: "x".repeat(5_000) }, null),
+		).toBeUndefined();
+	});
+});
+
+describe("resolveFileDiffStats — non-file tools", () => {
+	it("never answers for a tool that does not change files", () => {
+		// Even carrying the metadata keys: a Bash call's header has no `+N -N` lane.
+		expect(
+			resolveFileDiffStats("Bash", { command: "ls" }, { linesAdded: 1, linesRemoved: 1 }),
+		).toBeUndefined();
+		expect(resolveFileDiffStats("Read", { file_path: "/a.ts" }, null)).toBeUndefined();
 	});
 });

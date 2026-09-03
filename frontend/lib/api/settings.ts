@@ -6,7 +6,7 @@ import type {
 	RecentTabsRuntimeResult,
 	RecentTabsSection,
 } from "@shared/recent-tabs";
-import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type { ApiEntity } from "./types";
 
@@ -167,7 +167,7 @@ export const settingsApi = {
 	 * to the browser as a Blob, matching `fsDownload`.
 	 */
 	downloadTlsCa: async () => {
-		const res = await authorizedFetch(`${BASE}/settings/tls/ca.pem`);
+		const res = await authorizedFetch(`${apiBase()}/settings/tls/ca.pem`);
 		if (!res.ok) {
 			const error = await readFetchError(res, "CA download failed");
 			throw new ApiError(error.message, res.status, error.data);
@@ -243,6 +243,11 @@ export const settingsApi = {
 			showOutputStats: boolean;
 			terminalTheme: string;
 			terminalFontSize: number;
+			/** Narrator transcript typography, as percentages of the built-in defaults. */
+			narratorFontScalePercent: number;
+			narratorLetterSpacingPercent: number;
+			narratorLineHeightScalePercent: number;
+			narratorParagraphScalePercent: number;
 			addSubagentToRecentTabs: boolean;
 			recentTabsGroupMode: "flat" | "directory";
 			// Notification preferences
@@ -300,6 +305,10 @@ export const settingsApi = {
 		showOutputStats?: boolean;
 		terminalTheme?: string;
 		terminalFontSize?: number;
+		narratorFontScalePercent?: number;
+		narratorLetterSpacingPercent?: number;
+		narratorLineHeightScalePercent?: number;
+		narratorParagraphScalePercent?: number;
 		addSubagentToRecentTabs?: boolean;
 		recentTabsGroupMode?: "flat" | "directory";
 		// Notification preferences

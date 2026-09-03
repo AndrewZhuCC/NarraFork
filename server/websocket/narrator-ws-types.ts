@@ -4,11 +4,15 @@
  * without creating circular imports.
  */
 
-import type { BackgroundTaskListDelta } from "@shared/background-task-list";
+import type {
+	BackgroundTaskListDelta,
+	BackgroundTaskProgressFrame,
+} from "@shared/background-task-list";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { ProgressPhase } from "@shared/progress-phase";
 import type { NarratorWsSubscriptionLimitError, RecentTabsDelta } from "@shared/recent-tabs";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
+import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
 import type { GitStatusSummary } from "../services/git-service";
@@ -284,6 +288,21 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 	  }
 	| { type: "tool_progress"; narratorId: string; toolUseId: string; elapsed: number }
+	/**
+	 * A DETERMINATE progress measurement ("N of M done") from a tool that can
+	 * measure its remaining work — currently TransferFile.
+	 *
+	 * Separate from `tool_progress`, which carries elapsed seconds only and means
+	 * "still alive". Keeping them apart lets the client decide between a real bar
+	 * and a spinner by WHICH frame arrived, rather than by probing fields.
+	 */
+	| {
+			type: "tool_structured_progress";
+			narratorId: string;
+			toolUseId: string;
+			progress: ToolProgressPayload;
+			parentToolUseId?: string;
+	  }
 	/**
 	 * A running `Await({type:"agent"})` has resolved which child narrator it is
 	 * waiting on, so its card can offer "open session" DURING the wait.
@@ -631,6 +650,19 @@ export type NarratorServerMessage =
 			/** The PARENT narrator whose list changed. */
 			narratorId: string;
 	  } & BackgroundTaskListDelta)
+	/**
+	 * Live byte progress for one background transfer row.
+	 *
+	 * A separate frame from `background_task_list_delta` on purpose: that channel is
+	 * version-ordered and a skipped version costs a full page refetch, while this
+	 * one fires ~2×/s per active transfer. Each payload is a complete snapshot, so a
+	 * dropped frame is self-correcting and no sequencing is required.
+	 */
+	| ({
+			type: "background_task_progress";
+			/** The PARENT narrator whose list holds the row. */
+			narratorId: string;
+	  } & BackgroundTaskProgressFrame)
 	| {
 			type: "git_status";
 			narratorId: string;
@@ -641,6 +673,30 @@ export type NarratorServerMessage =
 			baseBranch?: string;
 			linesAdded?: number;
 			linesRemoved?: number;
+	  }
+	| {
+			/**
+			 * Individual paths that changed under this narrator's worktree, so a file tree
+			 * can patch the affected directories rather than refetching.
+			 *
+			 * Paths are worktree-RELATIVE: the client knows its own root, and absolute
+			 * paths would disclose the host's directory layout to every subscriber.
+			 *
+			 * Only emitted while the native watcher is running
+			 * (`NARRAFORK_ENABLE_NATIVE_WATCHER=1`); the default polling fallback observes
+			 * no paths. A receiver must therefore treat this as an accelerator over its own
+			 * on-demand fetching, never as its only route to a fresh view.
+			 *
+			 * `truncated` says more changed than `changes` lists — the batch hit the
+			 * watcher's per-window cap. The list is then a sample, not the set, and the
+			 * receiver must invalidate broadly instead of applying it literally.
+			 */
+			type: "workspace_paths_changed";
+			narratorId: string;
+			chapterId: string;
+			toolUseId: string;
+			changes: readonly { path: string; kind: "added" | "updated" | "deleted" }[];
+			truncated: boolean;
 	  }
 	| {
 			type: "catch_up";
@@ -779,6 +835,12 @@ export type NarratorServerMessage =
 				input?: unknown;
 				streamStartedAt?: number;
 				streamingOutput?: string;
+				/**
+				 * Latest determinate progress measurement, so a client that connects
+				 * mid-transfer paints the bar from its catch-up instead of waiting for
+				 * the next frame.
+				 */
+				structuredProgress?: ToolProgressPayload;
 				/**
 				 * Child-row label for a subagent chunk (`parentToolUseId` set), where
 				 * `input` is deliberately absent. Lets a reconnecting client relabel the

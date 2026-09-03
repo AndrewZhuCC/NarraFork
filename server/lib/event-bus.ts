@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { BackgroundTaskType } from "@shared/background-task-list";
 import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
@@ -148,6 +149,14 @@ export type NarraForkEvent =
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
 	| {
+			type: "spec:changed";
+			narratorId: string;
+			path: string;
+			uri: string;
+			revisionId: string | null;
+			updatedBy: string;
+	  }
+	| {
 			type: "narrator:error";
 			narratorId: string;
 			error: string;
@@ -155,6 +164,13 @@ export type NarraForkEvent =
 	  }
 	| { type: "narrator:warning"; narratorId: string; message: string }
 	| { type: "narrator:permission_request"; narratorId: string; requestId: string }
+	| { type: "plugin:permission_request"; pluginId: string; requestId: string; capability: string }
+	| {
+			type: "plugin:permission_resolved";
+			pluginId: string;
+			requestId: string;
+			status: "granted" | "denied";
+	  }
 	/**
 	 * A tool call reached a terminal state. Carries only bounded metadata (never the tool input or
 	 * output), so it is safe to surface to external integrations that must show execution progress
@@ -307,14 +323,14 @@ export type NarraForkEvent =
 			type: "background_task:completed";
 			taskId: string;
 			parentNarratorId: string;
-			taskType: "bash" | "agent";
+			taskType: BackgroundTaskType;
 			output: string | null;
 	  }
 	| {
 			type: "background_task:failed";
 			taskId: string;
 			parentNarratorId: string;
-			taskType: "bash" | "agent";
+			taskType: BackgroundTaskType;
 			error: string | null;
 			/** Distinguishes an execution timeout from an ordinary failure. */
 			status?: "failed" | "timeout";
@@ -323,7 +339,7 @@ export type NarraForkEvent =
 			type: "background_task:cancelled";
 			taskId: string;
 			parentNarratorId: string;
-			taskType: "bash" | "agent";
+			taskType: BackgroundTaskType;
 	  }
 	| {
 			type: "background_task:output";
@@ -352,7 +368,12 @@ export type NarraForkEvent =
 	| { type: "device:status"; deviceId: string; status: "online" | "offline" }
 	| { type: "device:token-rotated"; deviceId: string }
 	| { type: "device:revoked"; deviceId: string }
-	// File transfer lifecycle
+	// File transfer lifecycle. NOTE: these three events are emitted but have never
+	// had a listener in any release — live progress and completion are consumed
+	// through the TransferFile tool's `onProgress` callbacks and the background
+	// task projection instead. `transfer:progress` is not emitted any more; these
+	// types stay until the remaining `transfer:done`/`transfer:error` emitters are
+	// cleaned up, so the bus keeps compiling.
 	| {
 			type: "transfer:progress";
 			transferId: string;

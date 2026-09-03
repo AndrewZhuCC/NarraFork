@@ -23,8 +23,11 @@
  * fixed or aspect-ratio derived.
  */
 
+import { measureNaturalWidth } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
 import { fitImageBox, readImageIntrinsicSize } from "@shared/pretext-layout/image-fit";
+import { getPreparedTextWithSegments } from "@shared/pretext-layout/prepared-markdown-cache";
+import { formatFileSize } from "@shared/text-file-types";
 import {
 	accumulateFrame,
 	type BlockFrame,
@@ -40,11 +43,10 @@ import {
 } from "../prepared-block";
 import {
 	FONT_SIZE,
-	FONT_WEIGHT,
 	LINE_HEIGHT,
 	lineBoxHeight,
-	SANS_FAMILY,
 	SPACING,
+	typographyMetrics,
 } from "../pretext-fonts";
 import { inlineMetrics, pretextLineMetrics } from "./pretext-metrics";
 
@@ -188,20 +190,54 @@ export interface MeasureTextFileInput {
 }
 
 /**
+ * Natural (unwrapped) width of the icon + filename + size row.
+ *
+ * The row is reserved at a FIXED single-line height, so the render layer must
+ * never wrap the filename — it truncates instead (see `TextFileRow`). That makes
+ * the row's painted width a pure function of its data, which this computes so a
+ * shrink-wrap container (the user bubble) can grow around it. Without it a long
+ * filename was squeezed into whatever width the caption text happened to need,
+ * and the row overflowed the box the measure layer had already committed to.
+ *
+ * Zero DOM: pretext's canvas text metrics only, same as every other measure here.
+ */
+export function textFileRowNaturalWidth(data: MeasureTextFileInput): number {
+	const metrics = typographyMetrics();
+	const filename = data.filename ?? "";
+	const nameWidth =
+		filename.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(filename, metrics.font.bodyMedium))
+			: 0;
+	const sizeText = typeof data.size === "number" ? `(${formatFileSize(data.size)})` : "";
+	const sizeWidth =
+		sizeText.length > 0
+			? measureNaturalWidth(getPreparedTextWithSegments(sizeText, metrics.font.xs)) +
+				IMGGEN_GROUP_GAP
+			: 0;
+	// icon + gap + name (+ gap + size). Ceil so a fractional advance never leaves
+	// the last glyph a sub-pixel outside the reserved box.
+	return Math.ceil(TEXT_FILE_ICON_SIZE + IMGGEN_GROUP_GAP + nameWidth + sizeWidth);
+}
+
+/**
  * Measure a text-file attachment chip: a single row (icon + filename + size).
- * Fixed height regardless of width — the filename is not wrapped in the list
- * view. Zero measurement.
+ * Fixed height regardless of width — the filename TRUNCATES rather than wraps,
+ * so a long name cannot push the row past the reserved single line. Zero DOM.
  */
 export function measureTextFile(
 	data: MeasureTextFileInput,
 	contentWidth: number,
 	_lod: RenderLod = DEFAULT_RENDER_LOD,
 ): MeasuredElement {
+	const natural = textFileRowNaturalWidth(data);
 	const block: PreparedFixedBlock = {
 		...FLAT_BASE,
 		kind: "fixed",
 		height: TEXT_FILE_HEIGHT,
 		tag: "text_file",
+		// Capped at the column: a name longer than the frame truncates, so the row
+		// never claims more space than exists.
+		displayWidth: Math.min(contentWidth, natural),
 		data: {
 			filename: data.filename ?? null,
 			size: typeof data.size === "number" ? data.size : null,
@@ -239,9 +275,6 @@ export const IMGGEN_MAX_DISPLAY_WIDTH = 512;
 /** Conservative fallback image area height when intrinsic size is unknown. */
 export const IMGGEN_UNKNOWN_IMAGE_HEIGHT = 240;
 
-const IMGGEN_STATUS_FONT = `${FONT_WEIGHT.regular} ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
-// revisedPrompt is fw={500} in the original component.
-const IMGGEN_PROMPT_FONT = `500 ${FONT_SIZE.xs}px ${SANS_FAMILY}`;
 // ml={4} applied to the revisedPrompt span.
 const IMGGEN_PROMPT_GAP = 4;
 
@@ -300,8 +333,13 @@ function buildHeaderInline(
 
 	const statusText = data.statusText ?? "";
 	if (statusText.length > 0) {
-		items.push({ text: statusText, font: IMGGEN_STATUS_FONT, break: "normal", extraWidth: 0 });
-		fonts.push(IMGGEN_STATUS_FONT);
+		items.push({
+			text: statusText,
+			font: typographyMetrics().font.xs,
+			break: "normal",
+			extraWidth: 0,
+		});
+		fonts.push(typographyMetrics().font.xs);
 		classNames.push(IMGGEN_STATUS_CLASS);
 		hrefs.push(null);
 	}
@@ -309,18 +347,18 @@ function buildHeaderInline(
 	if (prompt.length > 0) {
 		items.push({
 			text: prompt,
-			font: IMGGEN_PROMPT_FONT,
+			font: typographyMetrics().font.xsMedium,
 			break: "normal",
 			extraWidth: items.length > 0 ? IMGGEN_PROMPT_GAP : 0,
 		});
-		fonts.push(IMGGEN_PROMPT_FONT);
+		fonts.push(typographyMetrics().font.xsMedium);
 		classNames.push(IMGGEN_PROMPT_CLASS);
 		hrefs.push(null);
 	}
 	// Guarantee at least one fragment so pretext produces a valid single line.
 	if (items.length === 0) {
-		items.push({ text: " ", font: IMGGEN_STATUS_FONT, break: "normal", extraWidth: 0 });
-		fonts.push(IMGGEN_STATUS_FONT);
+		items.push({ text: " ", font: typographyMetrics().font.xs, break: "normal", extraWidth: 0 });
+		fonts.push(typographyMetrics().font.xs);
 		classNames.push(IMGGEN_STATUS_CLASS);
 		hrefs.push(null);
 	}
@@ -329,7 +367,7 @@ function buildHeaderInline(
 		...FLAT_BASE,
 		kind: "inline",
 		flow: prepareRichInline(items),
-		lineHeight: IMGGEN_HEADER_LINE_HEIGHT,
+		lineHeight: typographyMetrics().line.xs,
 		classNames,
 		hrefs,
 		fonts,
@@ -357,7 +395,7 @@ export function measureImageGeneration(
 	const headerBlock = buildHeaderInline(data, iconArea);
 	const headerTextWidth = Math.max(1, innerWidth - iconArea);
 	const { lineCount, maxLineWidth } = inlineMetrics(headerBlock, headerTextWidth);
-	const textHeight = lineCount * IMGGEN_HEADER_LINE_HEIGHT;
+	const textHeight = lineCount * typographyMetrics().line.xs;
 	// The header row is at least as tall as the icon.
 	const headerHeight = Math.max(IMGGEN_ICON_SIZE, textHeight);
 

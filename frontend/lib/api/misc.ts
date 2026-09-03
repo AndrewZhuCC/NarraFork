@@ -3,8 +3,9 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
 import type { PreparedUpdateStatus, UpdateCoordinationPhase } from "../update-state";
-import { ApiError, authorizedFetch, BASE, readFetchError, request } from "./client";
+import { ApiError, apiBase, authorizedFetch, readFetchError, request } from "./client";
 import { parseContentDispositionFileName } from "./narrators";
 import type {
 	ApiEntity,
@@ -40,6 +41,39 @@ import type {
 	TutorialLessonSessionResponse,
 	TutorialSandboxStatus,
 } from "./types";
+
+/**
+ * One workspace with its membership and arrangement.
+ *
+ * `panels` is authoritative; `layout` only says where those panels sit and is guarded
+ * by `layoutRevision`. `tree` is the same string as `layout`, still returned so older
+ * readers keep working during the rollout.
+ */
+export interface WorkspaceDetail extends ApiEntity {
+	title?: string;
+	layout: string;
+	tree: string;
+	layoutRevision: number;
+	panels: WorkspacePanel[];
+}
+
+/** Server code for a layout save that lost a race against another session. */
+export const WORKSPACE_LAYOUT_CONFLICT_CODE = "WORKSPACE_LAYOUT_CONFLICT";
+
+/**
+ * Whether a failed layout save was a lost race (as opposed to a real error).
+ *
+ * The current revision rides along so the caller can rebase and retry without an
+ * extra read — the retry happens while the user is dragging panels, so a second round
+ * trip would be visible as lag.
+ */
+export function isWorkspaceLayoutConflict(
+	error: unknown,
+): error is ApiError & { data: { currentRevision: number } } {
+	if (!(error instanceof ApiError) || error.status !== 409) return false;
+	const data = error.data as { code?: unknown; currentRevision?: unknown } | null;
+	return data?.code === WORKSPACE_LAYOUT_CONFLICT_CODE && typeof data.currentRevision === "number";
+}
 
 export const miscApi = {
 	// Dashboard aggregated summary
@@ -122,7 +156,7 @@ export const miscApi = {
 	uploadNotificationSound: async (file: File) => {
 		const formData = new FormData();
 		formData.append("file", file);
-		const res = await authorizedFetch(`${BASE}/notification-sounds`, {
+		const res = await authorizedFetch(`${apiBase()}/notification-sounds`, {
 			method: "POST",
 			body: formData,
 		});
@@ -423,8 +457,11 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/connect`, { method: "POST" }),
+	// Returns the server's status projection (like connect), not a bare ack:
+	// disconnecting now persists `enabled: false`, and the caller needs the
+	// authoritative post-change state rather than having to infer it.
 	mcpDisconnectServer: (id: string) =>
-		request<{ ok: boolean }>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
+		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
 	mcpTestConnection: (data: Record<string, unknown>) =>
 		request<{
 			ok: boolean;
@@ -876,6 +913,7 @@ export const miscApi = {
 			providers: Array<{ id: string; name: string; prefix: string; hasToken: boolean }>;
 			totalModels: number;
 			pendingAuth: boolean;
+			authorizeUrl?: string;
 		}>("/cline/status"),
 	clineBrowserAuth: (apiBaseUrl?: string) =>
 		request<{ authorizeUrl: string }>("/cline/auth/browser", {
@@ -1007,14 +1045,45 @@ export const miscApi = {
 		}>(`/dependencies/${name}/install`, { method: "POST" }),
 
 	// Filesystem browsing
-	fsBrowse: (path?: string, opts?: { showHidden?: boolean }) => {
+	fsBrowse: (path?: string, opts?: { showHidden?: boolean; includeFiles?: boolean }) => {
 		const params = new URLSearchParams();
 		if (path) params.set("path", path);
 		if (opts?.showHidden) params.set("showHidden", "1");
+		// Opt-in: the directory picker needs every entry to be selectable as a
+		// directory, so only the file tree asks for files.
+		if (opts?.includeFiles) params.set("includeFiles", "1");
 		const qs = params.toString();
 		return request<{
 			path: string | null;
-			entries: Array<{ name: string; path: string }>;
+			/**
+			 * Directories, including symlinks whose target is a directory (`isSymlink`).
+			 * `path` is the link's own path, not its target: the user is choosing the
+			 * path they navigated to.
+			 *
+			 * Files appear only when `includeFiles` was requested, marked
+			 * `isDirectory: false`. `isDirectory` is optional here purely for wire
+			 * compatibility with an older server; treat a missing value as `true`,
+			 * since directory-only was the previous behaviour.
+			 *
+			 * The server caps what one listing returns (see `MAX_BROWSE_ENTRIES` in
+			 * `server/routes/fs.ts`), so a length at that cap means the directory has
+			 * more children than this carries.
+			 */
+			entries: Array<{
+				name: string;
+				path: string;
+				isSymlink?: boolean;
+				isDirectory?: boolean;
+				size?: number;
+			}>;
+			/**
+			 * Some child of the directory is NOT in `entries` — the server hit a
+			 * scan/entry/probe cap (or the directory became unreadable mid-listing).
+			 * `entries.length` is then a floor, not the directory's size. Optional for
+			 * wire compatibility with an older server; treat a missing value as
+			 * `false`, since untruncated was the previous behaviour.
+			 */
+			truncated?: boolean;
 			drives?: Array<{ name: string; path: string }>;
 			parent?: string | null;
 			sep: string;
@@ -1044,8 +1113,84 @@ export const miscApi = {
 	 * The server's `Content-Disposition` name is preferred over deriving one from
 	 * the path, since it has already been sanitized for use as a filename.
 	 */
+	/**
+	 * Save a human edit.
+	 *
+	 * `baseHash` is the sha256 of the content the editor loaded — the optimistic lock.
+	 * Omit it only when creating a file that must not already exist; the server answers
+	 * 409 in both stale cases and includes the live content so the caller can show a
+	 * diff rather than only reporting failure.
+	 *
+	 * `narratorId` is not decoration: it is what defines the writable root, so a save
+	 * without one is refused.
+	 */
+	fsWrite: (input: {
+		path: string;
+		content: string;
+		narratorId: string;
+		baseHash?: string | null;
+		/**
+		 * The encoding `fsEditSource` reported, echoed back verbatim.
+		 *
+		 * Omitting it means UTF-8, which silently CONVERTS a legacy-charset file on
+		 * save. Always pass through what the load returned.
+		 */
+		encoding?: string;
+		/**
+		 * Acknowledge a target outside the narrator's workspace and every declared
+		 * writable directory.
+		 *
+		 * Only meaningful after the server refused once with 409 `NEEDS_CONFIRMATION`
+		 * and named the resolved physical path — sending it upfront would be consent to
+		 * a destination nobody has seen. Never overrides a credential-path, git-directory
+		 * or symlink-escape refusal.
+		 */
+		confirmOutsideRoots?: boolean;
+		/**
+		 * Tell the narrator that a person edited this file.
+		 *
+		 * Without it the agent's next turn reads a file it believes it last wrote, and
+		 * the watcher classifies the save as an anonymous `external` change.
+		 */
+		notifyAgent?: boolean;
+	}) =>
+		request<{
+			ok: true;
+			path: string;
+			hash: string;
+			bytesWritten: number;
+			encoding: string;
+			/** How the notification reached the narrator, when `notifyAgent` was set. */
+			notified?: "interjected" | "queued";
+		}>("/fs/write", {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+
+	/**
+	 * Load a file FOR EDITING — not the same thing as previewing it.
+	 *
+	 * `/fs/preview` decodes as UTF-8 unconditionally, which is fine for a viewer (the
+	 * reader sees the mojibake) and destructive for an editor: saving would write those
+	 * replacement characters back over every un-decodable byte in the file. This route
+	 * sniffs the encoding, returns its name for the save to echo, and refuses files
+	 * that cannot be edited as text at all.
+	 *
+	 * Throws `ApiError` with `status` 415 (`code: "BINARY"`) or 413
+	 * (`code: "TOO_LARGE_TO_EDIT"`) for those refusals, so the caller can explain why
+	 * editing is unavailable rather than offering a save that corrupts the file.
+	 *
+	 * `hash` is computed server-side deliberately: it makes the optimistic lock
+	 * independent of WebCrypto, which is absent over plain HTTP on a non-localhost
+	 * origin — precisely where a client-side hash would silently become `null` and read
+	 * as "create this file".
+	 */
+	fsEditSource: (path: string) =>
+		request<{ content: string; encoding: string; hash: string; size: number }>(
+			`/fs/edit-source?path=${encodeURIComponent(path)}`,
+		),
 	fsDownload: async (path: string) => {
-		const res = await authorizedFetch(`${BASE}/fs/download?path=${encodeURIComponent(path)}`);
+		const res = await authorizedFetch(`${apiBase()}/fs/download?path=${encodeURIComponent(path)}`);
 		if (!res.ok) {
 			const error = await readFetchError(res, "Download failed");
 			throw new ApiError(error.message, res.status, error.data);
@@ -1199,14 +1344,47 @@ export const miscApi = {
 		}),
 
 	// Workspaces
+	//
+	// Membership (`panels`) and arrangement (`layout`) are separate concerns here:
+	// panels are rows the server owns, the layout is a positioning blob. A client must
+	// never derive "which panels exist" from the layout — that equivalence is what
+	// allowed a narrator to be listed in the sidebar while no panel rendered.
 	listWorkspaces: () => request<ApiEntity[]>("/workspaces"),
-	getWorkspace: (id: string) => request<ApiEntity>(`/workspaces/${id}`),
+	getWorkspace: (id: string) => request<WorkspaceDetail>(`/workspaces/${id}`),
 	createWorkspace: (data: { title?: string; tree: string }) =>
 		request<ApiEntity>("/workspaces", { method: "POST", body: JSON.stringify(data) }),
-	updateWorkspace: (id: string, data: { title?: string; tree?: string }) =>
+	/** Rename only. The layout goes through `saveWorkspaceLayout` (revision-guarded). */
+	updateWorkspace: (id: string, data: { title: string }) =>
 		request<ApiEntity>(`/workspaces/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
 	deleteWorkspace: (id: string) =>
 		request<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
+
+	listWorkspacePanels: (id: string) =>
+		request<{ panels: WorkspacePanel[] }>(`/workspaces/${id}/panels`),
+	/** Add a panel. Idempotent for narrators: an existing member is returned as-is. */
+	addWorkspacePanel: (id: string, input: WorkspacePanelInput) =>
+		request<{ panel: WorkspacePanel }>(`/workspaces/${id}/panels`, {
+			method: "POST",
+			body: JSON.stringify(input),
+		}),
+	updateWorkspacePanelConfig: (id: string, panelId: string, config: unknown) =>
+		request<{ panel: WorkspacePanel }>(`/workspaces/${id}/panels/${panelId}`, {
+			method: "PATCH",
+			body: JSON.stringify({ config }),
+		}),
+	removeWorkspacePanel: (id: string, panelId: string) =>
+		request<{ ok: boolean }>(`/workspaces/${id}/panels/${panelId}`, { method: "DELETE" }),
+	/**
+	 * Save the arrangement under optimistic concurrency.
+	 *
+	 * Rejects with a 409 carrying `currentRevision` when another session saved first;
+	 * see `isWorkspaceLayoutConflict`. Losing this write costs positions only.
+	 */
+	saveWorkspaceLayout: (id: string, layout: string, expectedRevision: number) =>
+		request<{ layoutRevision: number }>(`/workspaces/${id}/layout`, {
+			method: "PUT",
+			body: JSON.stringify({ layout, expectedRevision }),
+		}),
 
 	// Changelog
 	getChangelogs: () => request<ChangelogEntry[]>("/changelog"),

@@ -1,18 +1,37 @@
 /**
  * Panel copy, in the two languages the host ships.
  *
- * The panel cannot use the host's i18n instance: it runs in a separate realm, and the host
- * does not expose translations over the UI SDK. `context.host.locale` is currently a
- * `"unknown"` placeholder, so the language is picked from `navigator.language` instead.
+ * The dictionaries stay here because only this plugin knows its own copy. What it no longer owns
+ * is deciding which language is active: `narrafork.i18n` reports the host's locale and applies
+ * the host's fallback rules, so this file holds tables and nothing else.
+ *
+ * It used to read `navigator.language`, on the strength of a comment claiming
+ * `context.host.locale` was a `"unknown"` placeholder. That was wrong — the field carried the
+ * real value — and the cost was concrete: a user running the app in Chinese with an
+ * English-language browser got an English panel, silently overriding a preference they had
+ * explicitly set.
  *
  * Wording is copied from the host's `settings` namespace deliberately — the point of this
  * panel is to be indistinguishable from the built-in one, and paraphrasing would show up as
- * the two pages disagreeing about what the same button does.
+ * the two pages disagreeing about what the same button does. That is a one-time human
+ * comparison; the host's translation keys are internal and are never read at runtime.
  */
 
+/**
+ * `en` is the source of truth for the key set; `zhCN` must cover it exactly.
+ *
+ * Both tables used to be typed `Record<string, string>`, which makes the two independent:
+ * adding a key to `en` and forgetting `zhCN` compiles, and `t()` then falls back to the
+ * English string. That fallback is the problem — a missing translation looks like a
+ * deliberate choice to leave one label in English, so nobody reports it.
+ *
+ * `Record<keyof typeof en, string>` turns the omission into a compile error, and the
+ * `satisfies` on `en` keeps its literal keys instead of widening them to `string` (which
+ * would make the constraint vacuous).
+ */
 type Strings = Record<string, string>;
 
-const en: Strings = {
+const en = {
 	credentials: "Credentials",
 	credentialsDesc: "Manage Kiro credentials. Credentials are grouped by account type.",
 	loadBalancing: "Load Balancing",
@@ -120,9 +139,9 @@ const en: Strings = {
 	actionRefreshAllModels: "Refresh all models",
 	actionDeleteUnhealthy: "Delete failed/banned",
 	actionBatchDelete: "Delete selected",
-};
+} satisfies Strings;
 
-const zhCN: Strings = {
+const zhCN: Record<keyof typeof en, string> = {
 	credentials: "凭据管理",
 	credentialsDesc: "管理 Kiro 凭据，按账户类型分组展示。",
 	loadBalancing: "负载均衡",
@@ -231,23 +250,62 @@ const zhCN: Strings = {
 	actionBatchDelete: "删除选中凭据",
 };
 
-/**
- * Pick a table from the browser locale.
- *
- * Only the `zh` prefix is special-cased; anything else falls back to English, matching the
- * host's own "English is the fallback" rule.
- */
-function pickTable(): Strings {
-	const locale =
-		typeof navigator === "undefined" ? "en" : (navigator.language ?? "en").toLowerCase();
-	return locale.startsWith("zh") ? zhCN : en;
+/** The tables in the shape the host SDK expects: locale tag → key → text. */
+const TABLES: Record<string, Record<string, string>> = { en, "zh-CN": zhCN };
+
+interface HostI18n {
+	locale: string;
+	t(tables: Record<string, Record<string, string>>, key: string, params?: unknown): string;
+	onChange(listener: (locale: string) => void): () => void;
 }
 
-const table = pickTable();
+function hostI18n(): HostI18n | undefined {
+	return (globalThis as { narrafork?: { i18n?: HostI18n } }).narrafork?.i18n;
+}
 
-/** Look up a string, filling `{name}` placeholders. Missing keys surface as the key itself. */
+/**
+ * Look up a string, filling `{name}` placeholders.
+ *
+ * Delegates to the host, which owns both the active locale and the fallback rules. The local
+ * branch below is only for a host too old to provide `i18n`.
+ *
+ * Resolved per call rather than against a table chosen at module load: the host reports language
+ * changes while the panel is open, and a table captured once could never reflect them.
+ */
 export function t(key: keyof typeof en, params?: Record<string, string | number>): string {
-	const template = table[key] ?? en[key] ?? String(key);
+	const host = hostI18n();
+	if (host) return host.t(TABLES, key as string, params);
+	return interpolate(en[key] ?? String(key), params);
+}
+
+/**
+ * The host's active locale, for `Intl` formatters.
+ *
+ * Not `navigator.language`: that is the BROWSER's language, which is a different thing
+ * from the language the user chose in this app. Reading it produces a panel whose text
+ * is Chinese (via the host tables) while its dates read "2 hours ago" — the kind of
+ * split that looks like a translation gap rather than a wrong locale source.
+ *
+ * Falls back to the browser only for a host too old to report a locale.
+ */
+export function activeLocale(): string {
+	const host = hostI18n();
+	if (host?.locale) return host.locale;
+	return typeof navigator === "undefined" ? "en" : (navigator.language ?? "en");
+}
+
+/**
+ * Subscribe to host language changes.
+ *
+ * Text cannot follow the host on its own — the `--nf-*` tokens let the browser recolour this
+ * panel with no code here, but a string already in the DOM stays until the panel rewrites it.
+ * Returns a no-op unsubscribe on an older host so callers need no capability check.
+ */
+export function onLocaleChange(listener: (locale: string) => void): () => void {
+	return hostI18n()?.onChange(listener) ?? (() => {});
+}
+
+function interpolate(template: string, params?: Record<string, string | number>): string {
 	if (!params) return template;
 	return template.replace(/\{(\w+)\}/g, (whole, name: string) =>
 		name in params ? String(params[name]) : whole,

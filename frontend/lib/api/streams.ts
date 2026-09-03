@@ -1,4 +1,4 @@
-import { ApiError, authorizedFetch, BASE, getErrorMessage, readFetchError } from "./client";
+import { ApiError, apiBase, authorizedFetch, getErrorMessage, readFetchError } from "./client";
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
 
@@ -155,7 +155,7 @@ export async function* kiroStreamChat(
 	model?: string,
 	signal?: AbortSignal,
 ): AsyncGenerator<string> {
-	const res = await authorizedFetch(`${BASE}/kiro/chat`, {
+	const res = await authorizedFetch(`${apiBase()}/kiro/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ text, model }),
