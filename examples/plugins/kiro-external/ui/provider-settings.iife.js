@@ -1,218 +1,42 @@
 (() => {
+  var __defProp = Object.defineProperty;
+  var __returnValue = (v) => v;
+  function __exportSetter(name, newValue) {
+    this[name] = __returnValue.bind(null, newValue);
+  }
+  var __export = (target, all) => {
+    for (var name in all)
+      __defProp(target, name, {
+        get: all[name],
+        enumerable: true,
+        configurable: true,
+        set: __exportSetter.bind(all, name)
+      });
+  };
+  var __esm = (fn, res) => () => (fn && (res = fn(fn = 0)), res);
+
+  // examples/plugins/kiro-external/src/ui/panel-types.ts
+  function isRecord(value) {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
+  async function runCommand(sdk, commandId, input) {
+    const raw = await sdk.request("commands.execute", {
+      commandId,
+      ...input === undefined ? {} : { input }
+    });
+    if (isRecord(raw) && "output" in raw)
+      return raw.output;
+    return raw;
+  }
+  function errorMessage(error) {
+    if (error instanceof Error)
+      return error.message;
+    if (isRecord(error) && typeof error.message === "string")
+      return error.message;
+    return String(error);
+  }
+
   // examples/plugins/kiro-external/src/ui/strings.ts
-  var en = {
-    credentials: "Credentials",
-    credentialsDesc: "Manage Kiro credentials. Credentials are grouped by account type.",
-    loadBalancing: "Load Balancing",
-    modePriority: "Priority",
-    modeBalanced: "Balanced",
-    refreshAllModels: "Refresh Models",
-    refreshAllModelsConfirm: "This will re-fetch model lists for all credentials. Continue?",
-    tierFree: "Free",
-    tierPaid: "Paid",
-    tierEnterprise: "Enterprise",
-    tierFreeDesc: "Limited model access",
-    tierPaidDesc: "All models available",
-    tierEnterpriseDesc: "Claude models only",
-    importTitle: "Import Credentials",
-    importPlaceholder: "Paste credential JSON, or one ksk_... API key per line...",
-    importHint: "Supports refresh tokens and static API keys. Paste bare ksk_... keys directly (one per line or comma-separated), or credential JSON. Values are sent to the plugin backend and never displayed back here.",
-    importBtn: "Import",
-    importSuccess: "Imported {added} credential(s), {duplicates} duplicate(s) skipped",
-    importInvalid: "No valid credential JSON or ksk_... API key found",
-    importEmpty: "Nothing to import.",
-    noCredentials: "No credentials. Import some to get started.",
-    colPriority: "Priority",
-    colStatus: "Status",
-    colExpires: "Expires",
-    colStats: "Stats",
-    colUsage: "Usage",
-    colLastUsed: "Last Used",
-    colActions: "Actions",
-    colDisplayName: "Display Name",
-    colRegion: "Region",
-    statSuccess: "OK",
-    statFail: "Fail",
-    apiKeyBadge: "api_key",
-    apiKeyNoRefresh: "Static API keys are never refreshed",
-    apiKeyNeverExpires: "Never expires",
-    refreshToken: "Refresh Token",
-    queryUsage: "Usage",
-    reset: "Reset",
-    edit: "Edit",
-    models: "Models",
-    deleteConfirm: "Are you sure you want to delete this credential?",
-    batchDelete: "Delete Selected",
-    batchDeleteConfirm: "Are you sure you want to delete {count} selected credentials?",
-    batchDeleteSuccess: "Deleted {count} credentials",
-    deleteUnhealthy: "Delete Failed/Banned",
-    deleteUnhealthyConfirm: "Delete all {count} credentials disabled for too many failures or banned status? This applies across all pages.",
-    deleteUnhealthySuccess: "Deleted {count} failed/banned credentials",
-    selectAll: "Select All",
-    pageInfo: "Page {current} / {total} ({count} total)",
-    enabled: "enabled",
-    disabled: "disabled",
-    editTitle: "Edit Kiro credential {id}",
-    editSecretHint: "Secrets left empty stay unchanged. Other fields cleared to empty remove the stored value.",
-    editSecretStored: "Stored — leave empty to keep",
-    editSave: "Save",
-    editCancel: "Cancel",
-    editEmail: "Email",
-    editDisplayName: "Display Name",
-    editRegion: "Region",
-    editAuthRegion: "Auth Region",
-    editApiRegion: "API Region",
-    editProfileArn: "Profile ARN",
-    editSubscriptionTitle: "Subscription Title",
-    editStartUrl: "Start URL",
-    editMachineId: "Machine ID",
-    editProxyUrl: "Proxy URL",
-    editProxyUsername: "Proxy username",
-    editAuthMethod: "Auth Method",
-    editPriority: "Priority",
-    editPriorityDesc: "Lower value is used first",
-    editRefreshToken: "Refresh Token",
-    editApiKey: "API Key",
-    editClientId: "Client ID",
-    editClientSecret: "Client secret",
-    editProxyPassword: "Proxy password",
-    editNoChanges: "No changes to save.",
-    confirmTitle: "Confirm",
-    confirmOk: "Confirm",
-    confirmCancel: "Cancel",
-    usageLoading: "Loading usage…",
-    usageNone: "No usage data available.",
-    usagePlan: "Plan",
-    usageResets: "Resets",
-    usageRemaining: "Remaining",
-    usageOverage: "Overage",
-    modelsLoading: "Fetching models…",
-    modelsNone: "No models available.",
-    modelsCount: "{count} models",
-    modelsRefresh: "Refresh models",
-    runtimeMissingTitle: "The credential page could not start",
-    busyStatus: "{label}…",
-    doneStatus: "{label} done.",
-    failedStatus: "{label} failed: {error}",
-    actionEnable: "Enable",
-    actionDisable: "Disable",
-    actionImport: "Import",
-    actionRefresh: "Refresh",
-    actionRemove: "Remove",
-    actionUpdate: "Update credential",
-    actionSetPriority: "Set priority",
-    actionSwitchMode: "Switch to {mode}",
-    actionRefreshAllModels: "Refresh all models",
-    actionDeleteUnhealthy: "Delete failed/banned",
-    actionBatchDelete: "Delete selected"
-  };
-  var zhCN = {
-    credentials: "凭据管理",
-    credentialsDesc: "管理 Kiro 凭据，按账户类型分组展示。",
-    loadBalancing: "负载均衡",
-    modePriority: "优先级",
-    modeBalanced: "均衡",
-    refreshAllModels: "刷新模型",
-    refreshAllModelsConfirm: "将重新获取所有凭据的模型列表，是否继续？",
-    tierFree: "免费版",
-    tierPaid: "付费版",
-    tierEnterprise: "企业版",
-    tierFreeDesc: "仅可使用部分模型",
-    tierPaidDesc: "可使用全部模型",
-    tierEnterpriseDesc: "仅可使用 Claude 系列模型",
-    importTitle: "导入凭据",
-    importPlaceholder: "粘贴凭据 JSON，或每行一个 ksk_... API Key...",
-    importHint: "支持 refreshToken 与静态 API Key。可直接粘贴多行 ksk_... 明文密钥（每行一个或用逗号分隔），也可粘贴凭据 JSON。内容会发送给插件后端，不会在此回显。",
-    importBtn: "导入",
-    importSuccess: "已导入 {added} 个凭据，跳过 {duplicates} 个重复",
-    importInvalid: "未找到有效的凭据 JSON 或 ksk_... API Key",
-    importEmpty: "没有可导入的内容。",
-    noCredentials: "暂无凭据，请导入凭据以开始使用。",
-    colPriority: "优先级",
-    colStatus: "状态",
-    colExpires: "过期",
-    colStats: "统计",
-    colUsage: "用量",
-    colLastUsed: "最后使用",
-    colActions: "操作",
-    colDisplayName: "展示名称",
-    colRegion: "区域",
-    statSuccess: "成功",
-    statFail: "失败",
-    apiKeyBadge: "api_key",
-    apiKeyNoRefresh: "静态 API Key 无需刷新",
-    apiKeyNeverExpires: "永不过期",
-    refreshToken: "刷新 Token",
-    queryUsage: "查询用量",
-    reset: "重置",
-    edit: "编辑",
-    models: "模型",
-    deleteConfirm: "确定要删除这个凭据吗？",
-    batchDelete: "删除选中",
-    batchDeleteConfirm: "确定要删除选中的 {count} 个凭据吗？",
-    batchDeleteSuccess: "已删除 {count} 个凭据",
-    deleteUnhealthy: "删除错误/封禁",
-    deleteUnhealthyConfirm: "确定要删除所有因错误过多或封禁而禁用的 {count} 个凭据吗？此操作会跨所有分页生效。",
-    deleteUnhealthySuccess: "已删除 {count} 个错误过多/封禁凭据",
-    selectAll: "全选",
-    pageInfo: "第 {current} / {total} 页（共 {count} 条）",
-    enabled: "已启用",
-    disabled: "已禁用",
-    editTitle: "编辑 Kiro 凭据 {id}",
-    editSecretHint: "敏感字段留空不会修改；其他字段清空则会移除已存储的值。",
-    editSecretStored: "已存储，留空则保持不变",
-    editSave: "保存",
-    editCancel: "取消",
-    editEmail: "邮箱",
-    editDisplayName: "展示名称",
-    editRegion: "区域",
-    editAuthRegion: "认证区域",
-    editApiRegion: "API 区域",
-    editProfileArn: "Profile ARN",
-    editSubscriptionTitle: "订阅名称",
-    editStartUrl: "Start URL",
-    editMachineId: "Machine ID",
-    editProxyUrl: "代理地址",
-    editProxyUsername: "代理用户名",
-    editAuthMethod: "认证方式",
-    editPriority: "优先级",
-    editPriorityDesc: "数值越小越优先使用",
-    editRefreshToken: "Refresh Token",
-    editApiKey: "API Key",
-    editClientId: "Client ID",
-    editClientSecret: "Client Secret",
-    editProxyPassword: "代理密码",
-    editNoChanges: "没有需要保存的修改。",
-    confirmTitle: "确认",
-    confirmOk: "确定",
-    confirmCancel: "取消",
-    usageLoading: "正在加载用量…",
-    usageNone: "暂无用量数据。",
-    usagePlan: "套餐",
-    usageResets: "重置时间",
-    usageRemaining: "剩余",
-    usageOverage: "超额",
-    modelsLoading: "正在获取模型…",
-    modelsNone: "暂无可用模型。",
-    modelsCount: "{count} 个模型",
-    modelsRefresh: "刷新模型",
-    runtimeMissingTitle: "凭据页无法启动",
-    busyStatus: "{label}…",
-    doneStatus: "{label}完成。",
-    failedStatus: "{label}失败：{error}",
-    actionEnable: "启用",
-    actionDisable: "禁用",
-    actionImport: "导入",
-    actionRefresh: "刷新",
-    actionRemove: "删除",
-    actionUpdate: "更新凭据",
-    actionSetPriority: "设置优先级",
-    actionSwitchMode: "切换为 {mode}",
-    actionRefreshAllModels: "刷新全部模型",
-    actionDeleteUnhealthy: "删除错误/封禁凭据",
-    actionBatchDelete: "删除选中凭据"
-  };
-  var TABLES = { en, "zh-CN": zhCN };
   function hostI18n() {
     return globalThis.narrafork?.i18n;
   }
@@ -236,6 +60,222 @@
       return template;
     return template.replace(/\{(\w+)\}/g, (whole, name) => (name in params) ? String(params[name]) : whole);
   }
+  var en, zhCN, TABLES;
+  var init_strings = __esm(() => {
+    en = {
+      credentials: "Credentials",
+      credentialsDesc: "Manage Kiro credentials. Credentials are grouped by account type.",
+      loadBalancing: "Load Balancing",
+      modePriority: "Priority",
+      modeBalanced: "Balanced",
+      refreshAllModels: "Refresh Models",
+      refreshAllModelsConfirm: "This will re-fetch model lists for all credentials. Continue?",
+      tierFree: "Free",
+      tierPaid: "Paid",
+      tierEnterprise: "Enterprise",
+      tierFreeDesc: "Limited model access",
+      tierPaidDesc: "All models available",
+      tierEnterpriseDesc: "Claude models only",
+      importTitle: "Import Credentials",
+      importPlaceholder: "Paste credential JSON, or one ksk_... API key per line...",
+      importHint: "Supports refresh tokens and static API keys. Paste bare ksk_... keys directly (one per line or comma-separated), or credential JSON. Values are sent to the plugin backend and never displayed back here.",
+      importBtn: "Import",
+      importSuccess: "Imported {added} credential(s), {duplicates} duplicate(s) skipped",
+      importInvalid: "No valid credential JSON or ksk_... API key found",
+      importEmpty: "Nothing to import.",
+      noCredentials: "No credentials. Import some to get started.",
+      colPriority: "Priority",
+      colStatus: "Status",
+      colExpires: "Expires",
+      colStats: "Stats",
+      colUsage: "Usage",
+      colLastUsed: "Last Used",
+      colActions: "Actions",
+      colDisplayName: "Display Name",
+      colRegion: "Region",
+      statSuccess: "OK",
+      statFail: "Fail",
+      apiKeyBadge: "api_key",
+      apiKeyNoRefresh: "Static API keys are never refreshed",
+      apiKeyNeverExpires: "Never expires",
+      refreshToken: "Refresh Token",
+      queryUsage: "Usage",
+      reset: "Reset",
+      edit: "Edit",
+      models: "Models",
+      deleteConfirm: "Are you sure you want to delete this credential?",
+      batchDelete: "Delete Selected",
+      batchDeleteConfirm: "Are you sure you want to delete {count} selected credentials?",
+      batchDeleteSuccess: "Deleted {count} credentials",
+      deleteUnhealthy: "Delete Failed/Banned",
+      deleteUnhealthyConfirm: "Delete all {count} credentials disabled for too many failures or banned status? This applies across all pages.",
+      deleteUnhealthySuccess: "Deleted {count} failed/banned credentials",
+      selectAll: "Select All",
+      pageInfo: "Page {current} / {total} ({count} total)",
+      enabled: "enabled",
+      disabled: "disabled",
+      editTitle: "Edit Kiro credential {id}",
+      editSecretHint: "Secrets left empty stay unchanged. Other fields cleared to empty remove the stored value.",
+      editSecretStored: "Stored — leave empty to keep",
+      editSave: "Save",
+      editCancel: "Cancel",
+      editEmail: "Email",
+      editDisplayName: "Display Name",
+      editRegion: "Region",
+      editAuthRegion: "Auth Region",
+      editApiRegion: "API Region",
+      editProfileArn: "Profile ARN",
+      editSubscriptionTitle: "Subscription Title",
+      editStartUrl: "Start URL",
+      editMachineId: "Machine ID",
+      editProxyUrl: "Proxy URL",
+      editProxyUsername: "Proxy username",
+      editAuthMethod: "Auth Method",
+      editPriority: "Priority",
+      editPriorityDesc: "Lower value is used first",
+      editRefreshToken: "Refresh Token",
+      editApiKey: "API Key",
+      editClientId: "Client ID",
+      editClientSecret: "Client secret",
+      editProxyPassword: "Proxy password",
+      editNoChanges: "No changes to save.",
+      confirmTitle: "Confirm",
+      confirmOk: "Confirm",
+      confirmCancel: "Cancel",
+      usageLoading: "Loading usage…",
+      usageNone: "No usage data available.",
+      usagePlan: "Plan",
+      usageResets: "Resets",
+      usageRemaining: "Remaining",
+      usageOverage: "Overage",
+      modelsLoading: "Fetching models…",
+      modelsNone: "No models available.",
+      modelsCount: "{count} models",
+      modelsRefresh: "Refresh models",
+      runtimeMissingTitle: "The credential page could not start",
+      busyStatus: "{label}…",
+      doneStatus: "{label} done.",
+      failedStatus: "{label} failed: {error}",
+      actionEnable: "Enable",
+      actionDisable: "Disable",
+      actionImport: "Import",
+      actionRefresh: "Refresh",
+      actionRemove: "Remove",
+      actionUpdate: "Update credential",
+      actionSetPriority: "Set priority",
+      actionSwitchMode: "Switch to {mode}",
+      actionRefreshAllModels: "Refresh all models",
+      actionDeleteUnhealthy: "Delete failed/banned",
+      actionBatchDelete: "Delete selected"
+    };
+    zhCN = {
+      credentials: "凭据管理",
+      credentialsDesc: "管理 Kiro 凭据，按账户类型分组展示。",
+      loadBalancing: "负载均衡",
+      modePriority: "优先级",
+      modeBalanced: "均衡",
+      refreshAllModels: "刷新模型",
+      refreshAllModelsConfirm: "将重新获取所有凭据的模型列表，是否继续？",
+      tierFree: "免费版",
+      tierPaid: "付费版",
+      tierEnterprise: "企业版",
+      tierFreeDesc: "仅可使用部分模型",
+      tierPaidDesc: "可使用全部模型",
+      tierEnterpriseDesc: "仅可使用 Claude 系列模型",
+      importTitle: "导入凭据",
+      importPlaceholder: "粘贴凭据 JSON，或每行一个 ksk_... API Key...",
+      importHint: "支持 refreshToken 与静态 API Key。可直接粘贴多行 ksk_... 明文密钥（每行一个或用逗号分隔），也可粘贴凭据 JSON。内容会发送给插件后端，不会在此回显。",
+      importBtn: "导入",
+      importSuccess: "已导入 {added} 个凭据，跳过 {duplicates} 个重复",
+      importInvalid: "未找到有效的凭据 JSON 或 ksk_... API Key",
+      importEmpty: "没有可导入的内容。",
+      noCredentials: "暂无凭据，请导入凭据以开始使用。",
+      colPriority: "优先级",
+      colStatus: "状态",
+      colExpires: "过期",
+      colStats: "统计",
+      colUsage: "用量",
+      colLastUsed: "最后使用",
+      colActions: "操作",
+      colDisplayName: "展示名称",
+      colRegion: "区域",
+      statSuccess: "成功",
+      statFail: "失败",
+      apiKeyBadge: "api_key",
+      apiKeyNoRefresh: "静态 API Key 无需刷新",
+      apiKeyNeverExpires: "永不过期",
+      refreshToken: "刷新 Token",
+      queryUsage: "查询用量",
+      reset: "重置",
+      edit: "编辑",
+      models: "模型",
+      deleteConfirm: "确定要删除这个凭据吗？",
+      batchDelete: "删除选中",
+      batchDeleteConfirm: "确定要删除选中的 {count} 个凭据吗？",
+      batchDeleteSuccess: "已删除 {count} 个凭据",
+      deleteUnhealthy: "删除错误/封禁",
+      deleteUnhealthyConfirm: "确定要删除所有因错误过多或封禁而禁用的 {count} 个凭据吗？此操作会跨所有分页生效。",
+      deleteUnhealthySuccess: "已删除 {count} 个错误过多/封禁凭据",
+      selectAll: "全选",
+      pageInfo: "第 {current} / {total} 页（共 {count} 条）",
+      enabled: "已启用",
+      disabled: "已禁用",
+      editTitle: "编辑 Kiro 凭据 {id}",
+      editSecretHint: "敏感字段留空不会修改；其他字段清空则会移除已存储的值。",
+      editSecretStored: "已存储，留空则保持不变",
+      editSave: "保存",
+      editCancel: "取消",
+      editEmail: "邮箱",
+      editDisplayName: "展示名称",
+      editRegion: "区域",
+      editAuthRegion: "认证区域",
+      editApiRegion: "API 区域",
+      editProfileArn: "Profile ARN",
+      editSubscriptionTitle: "订阅名称",
+      editStartUrl: "Start URL",
+      editMachineId: "Machine ID",
+      editProxyUrl: "代理地址",
+      editProxyUsername: "代理用户名",
+      editAuthMethod: "认证方式",
+      editPriority: "优先级",
+      editPriorityDesc: "数值越小越优先使用",
+      editRefreshToken: "Refresh Token",
+      editApiKey: "API Key",
+      editClientId: "Client ID",
+      editClientSecret: "Client Secret",
+      editProxyPassword: "代理密码",
+      editNoChanges: "没有需要保存的修改。",
+      confirmTitle: "确认",
+      confirmOk: "确定",
+      confirmCancel: "取消",
+      usageLoading: "正在加载用量…",
+      usageNone: "暂无用量数据。",
+      usagePlan: "套餐",
+      usageResets: "重置时间",
+      usageRemaining: "剩余",
+      usageOverage: "超额",
+      modelsLoading: "正在获取模型…",
+      modelsNone: "暂无可用模型。",
+      modelsCount: "{count} 个模型",
+      modelsRefresh: "刷新模型",
+      runtimeMissingTitle: "凭据页无法启动",
+      busyStatus: "{label}…",
+      doneStatus: "{label}完成。",
+      failedStatus: "{label}失败：{error}",
+      actionEnable: "启用",
+      actionDisable: "禁用",
+      actionImport: "导入",
+      actionRefresh: "刷新",
+      actionRemove: "删除",
+      actionUpdate: "更新凭据",
+      actionSetPriority: "设置优先级",
+      actionSwitchMode: "切换为 {mode}",
+      actionRefreshAllModels: "刷新全部模型",
+      actionDeleteUnhealthy: "删除错误/封禁凭据",
+      actionBatchDelete: "删除选中凭据"
+    };
+    TABLES = { en, "zh-CN": zhCN };
+  });
 
   // examples/plugins/kiro-external/src/ui/format.ts
   function getTierMeta(tier) {
@@ -254,7 +294,6 @@
     const method = entry.authMethod?.trim().toLowerCase();
     return method === "api_key" || method === "apikey";
   }
-  var API_KEY_PATTERN = /ksk[_-][A-Za-z0-9._-]+/;
   function containsApiKey(text) {
     return API_KEY_PATTERN.test(text);
   }
@@ -268,13 +307,6 @@
     }
     return results;
   }
-  var RELATIVE_UNITS = [
-    ["year", 365 * 24 * 60 * 60 * 1000],
-    ["month", 30 * 24 * 60 * 60 * 1000],
-    ["day", 24 * 60 * 60 * 1000],
-    ["hour", 60 * 60 * 1000],
-    ["minute", 60 * 1000]
-  ];
   function relativeTime(value) {
     if (!value)
       return "-";
@@ -302,16 +334,20 @@
   function formatUsageNumber(value) {
     return value.toFixed(2);
   }
+  var API_KEY_PATTERN, RELATIVE_UNITS;
+  var init_format = __esm(() => {
+    init_strings();
+    API_KEY_PATTERN = /ksk[_-][A-Za-z0-9._-]+/;
+    RELATIVE_UNITS = [
+      ["year", 365 * 24 * 60 * 60 * 1000],
+      ["month", 30 * 24 * 60 * 60 * 1000],
+      ["day", 24 * 60 * 60 * 1000],
+      ["hour", 60 * 60 * 1000],
+      ["minute", 60 * 1000]
+    ];
+  });
 
   // examples/plugins/kiro-external/src/ui/host-runtime.ts
-  var SUPPORTED_RUNTIME_VERSION = 1;
-
-  class HostRuntimeUnavailableError extends Error {
-    constructor(message) {
-      super(message);
-      this.name = "HostRuntimeUnavailableError";
-    }
-  }
   function readRuntime() {
     const candidate = globalThis.__nfPluginRuntime;
     if (!candidate || typeof candidate !== "object") {
@@ -326,37 +362,36 @@
     }
     return runtime;
   }
-  var hostRuntime = readRuntime();
-  var React = hostRuntime.React;
-  var MantineCore = hostRuntime.MantineCore;
-  var MantineHooks = hostRuntime.MantineHooks;
-  var hostTheme = hostRuntime.theme;
-  var createRoot = hostRuntime.ReactDOMClient.createRoot;
-  var jsx = hostRuntime.JsxRuntime.jsx;
-  var jsxs = hostRuntime.JsxRuntime.jsxs;
-  var Fragment = hostRuntime.JsxRuntime.Fragment;
-  var useState = hostRuntime.React.useState;
-  var useEffect = hostRuntime.React.useEffect;
-  var useCallback = hostRuntime.React.useCallback;
-  var useMemo = hostRuntime.React.useMemo;
-  var useRef = hostRuntime.React.useRef;
+  var SUPPORTED_RUNTIME_VERSION = 1, HostRuntimeUnavailableError, hostRuntime, React, MantineCore, MantineHooks, hostTheme, createRoot, jsx, jsxs, Fragment, useState, useEffect, useCallback, useMemo, useRef;
+  var init_host_runtime = __esm(() => {
+    HostRuntimeUnavailableError = class HostRuntimeUnavailableError extends Error {
+      constructor(message) {
+        super(message);
+        this.name = "HostRuntimeUnavailableError";
+      }
+    };
+    hostRuntime = readRuntime();
+    React = hostRuntime.React;
+    MantineCore = hostRuntime.MantineCore;
+    MantineHooks = hostRuntime.MantineHooks;
+    hostTheme = hostRuntime.theme;
+    createRoot = hostRuntime.ReactDOMClient.createRoot;
+    jsx = hostRuntime.JsxRuntime.jsx;
+    jsxs = hostRuntime.JsxRuntime.jsxs;
+    Fragment = hostRuntime.JsxRuntime.Fragment;
+    useState = hostRuntime.React.useState;
+    useEffect = hostRuntime.React.useEffect;
+    useCallback = hostRuntime.React.useCallback;
+    useMemo = hostRuntime.React.useMemo;
+    useRef = hostRuntime.React.useRef;
+  });
+
+  // examples/plugins/kiro-external/src/ui/shim/jsx-dev-runtime.ts
+  var init_jsx_dev_runtime = __esm(() => {
+    init_host_runtime();
+  });
+
   // examples/plugins/kiro-external/src/ui/CredentialList.tsx
-  var {
-    ActionIcon,
-    Badge,
-    Button,
-    Checkbox,
-    Group,
-    Pagination,
-    Paper,
-    Progress,
-    Stack,
-    Switch,
-    Table,
-    Text,
-    Tooltip
-  } = MantineCore;
-  var NARROW_PANEL_WIDTH = 900;
   function usePanelWidth() {
     const [width, setWidth] = useState(() => typeof document === "undefined" ? NARROW_PANEL_WIDTH : document.body.clientWidth);
     useEffect(() => {
@@ -883,9 +918,30 @@
       ]
     }, undefined, true, undefined, this);
   }
+  var ActionIcon, Badge, Button, Checkbox, Group, Pagination, Paper, Progress, Stack, Switch, Table, Text, Tooltip, NARROW_PANEL_WIDTH = 900;
+  var init_CredentialList = __esm(() => {
+    init_format();
+    init_host_runtime();
+    init_strings();
+    init_jsx_dev_runtime();
+    ({
+      ActionIcon,
+      Badge,
+      Button,
+      Checkbox,
+      Group,
+      Pagination,
+      Paper,
+      Progress,
+      Stack,
+      Switch,
+      Table,
+      Text,
+      Tooltip
+    } = MantineCore);
+  });
 
   // examples/plugins/kiro-external/src/ui/Overlay.tsx
-  var { Box, Button: Button2, Group: Group2, Paper: Paper2, ScrollArea, Stack: Stack2, Text: Text2 } = MantineCore;
   function PanelOverlay({ title, onClose, children, footer }) {
     useEffect(() => {
       const onKeyDown = (event) => {
@@ -986,19 +1042,15 @@
       }, undefined, false, undefined, this)
     }, undefined, false, undefined, this);
   }
+  var Box, Button2, Group2, Paper2, ScrollArea, Stack2, Text2;
+  var init_Overlay = __esm(() => {
+    init_host_runtime();
+    init_strings();
+    init_jsx_dev_runtime();
+    ({ Box, Button: Button2, Group: Group2, Paper: Paper2, ScrollArea, Stack: Stack2, Text: Text2 } = MantineCore);
+  });
 
   // examples/plugins/kiro-external/src/ui/EditForm.tsx
-  var {
-    Alert,
-    Button: Button3,
-    Group: Group3,
-    NumberInput,
-    SegmentedControl,
-    Stack: Stack3,
-    Text: Text3,
-    TextInput,
-    PasswordInput
-  } = MantineCore;
   function normalizeAuthMethod(method) {
     const lower = method?.trim().toLowerCase();
     if (lower === "api_key" || lower === "apikey")
@@ -1007,19 +1059,6 @@
       return "idc";
     return "social";
   }
-  var TEXT_FIELDS = [
-    { key: "displayName", label: t("editDisplayName") },
-    { key: "email", label: t("editEmail") },
-    { key: "region", label: t("editRegion") },
-    { key: "authRegion", label: t("editAuthRegion") },
-    { key: "apiRegion", label: t("editApiRegion") },
-    { key: "profileArn", label: t("editProfileArn") },
-    { key: "subscriptionTitle", label: t("editSubscriptionTitle") },
-    { key: "startUrl", label: t("editStartUrl") },
-    { key: "machineId", label: t("editMachineId") },
-    { key: "proxyUrl", label: t("editProxyUrl") },
-    { key: "proxyUsername", label: t("editProxyUsername") }
-  ];
   function EditForm({ entry, loading, error, onSubmit, onCancel }) {
     const [text, setText] = useState(() => {
       const initial = {};
@@ -1156,45 +1195,43 @@
       }, undefined, true, undefined, this)
     }, undefined, false, undefined, this);
   }
+  var Alert, Button3, Group3, NumberInput, SegmentedControl, Stack3, Text3, TextInput, PasswordInput, TEXT_FIELDS;
+  var init_EditForm = __esm(() => {
+    init_host_runtime();
+    init_Overlay();
+    init_strings();
+    init_jsx_dev_runtime();
+    ({
+      Alert,
+      Button: Button3,
+      Group: Group3,
+      NumberInput,
+      SegmentedControl,
+      Stack: Stack3,
+      Text: Text3,
+      TextInput,
+      PasswordInput
+    } = MantineCore);
+    TEXT_FIELDS = [
+      { key: "displayName", label: t("editDisplayName") },
+      { key: "email", label: t("editEmail") },
+      { key: "region", label: t("editRegion") },
+      { key: "authRegion", label: t("editAuthRegion") },
+      { key: "apiRegion", label: t("editApiRegion") },
+      { key: "profileArn", label: t("editProfileArn") },
+      { key: "subscriptionTitle", label: t("editSubscriptionTitle") },
+      { key: "startUrl", label: t("editStartUrl") },
+      { key: "machineId", label: t("editMachineId") },
+      { key: "proxyUrl", label: t("editProxyUrl") },
+      { key: "proxyUsername", label: t("editProxyUsername") }
+    ];
+  });
 
-  // examples/plugins/kiro-external/src/ui/panel-types.ts
-  function isRecord(value) {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
-  }
-  async function runCommand(sdk, commandId, input) {
-    const raw = await sdk.request("commands.execute", {
-      commandId,
-      ...input === undefined ? {} : { input }
-    });
-    if (isRecord(raw) && "output" in raw)
-      return raw.output;
-    return raw;
-  }
-  function errorMessage(error) {
-    if (error instanceof Error)
-      return error.message;
-    if (isRecord(error) && typeof error.message === "string")
-      return error.message;
-    return String(error);
-  }
-
-  // examples/plugins/kiro-external/src/ui/provider-settings.tsx
-  var {
-    Alert: Alert2,
-    Badge: Badge2,
-    Box: Box2,
-    Button: Button4,
-    Divider,
-    Group: Group4,
-    Loader,
-    MantineProvider,
-    SegmentedControl: SegmentedControl2,
-    Stack: Stack4,
-    Text: Text4,
-    Textarea
-  } = MantineCore;
-  var PAGE_SIZE = 20;
-  var TIER_ORDER = ["paid", "enterprise", "free"];
+  // examples/plugins/kiro-external/src/ui/panel.tsx
+  var exports_panel = {};
+  __export(exports_panel, {
+    mount: () => mount
+  });
   function CredentialPanel({ sdk }) {
     const [status, setStatus] = useState();
     const [loadError, setLoadError] = useState();
@@ -1238,12 +1275,26 @@
       setLoadError(undefined);
       return output;
     }, [command, pages]);
-    const run = useCallback((label, action) => {
+    const modelsChangedLegacyRef = useRef(false);
+    const notifyModelsChanged = useCallback(async () => {
+      if (!modelsChangedLegacyRef.current) {
+        try {
+          await sdk.request("provider.modelsChanged");
+          return;
+        } catch {
+          modelsChangedLegacyRef.current = true;
+        }
+      }
+      sdk.notify("providerSettings.catalogInvalidated", { providerId: "kiro" });
+    }, [sdk]);
+    const run = useCallback((label, action, options) => {
       if (busy)
         return;
       setBusy(true);
       setMessage({ text: t("busyStatus", { label }), tone: "neutral" });
       action().then(async () => {
+        if (options?.affectsCatalog)
+          await notifyModelsChanged();
         await refresh();
         if (unmounted.current)
           return;
@@ -1260,7 +1311,7 @@
           return;
         setBusy(false);
       });
-    }, [busy, refresh]);
+    }, [busy, refresh, notifyModelsChanged]);
     useEffect(() => {
       let cancelled = false;
       refresh().then(() => {
@@ -1343,7 +1394,7 @@
             tone: "good"
           });
         }
-      });
+      }, { affectsCatalog: true });
     }, [importText, run, command]);
     const handleSubmitEdit = useCallback((patch) => {
       const entry = editing;
@@ -1527,7 +1578,8 @@
               onClick: () => setConfirming({
                 message: t("refreshAllModelsConfirm"),
                 label: t("actionRefreshAllModels"),
-                run: () => command("models.refreshAll")
+                run: () => command("models.refreshAll"),
+                affectsCatalog: true
               }),
               children: t("refreshAllModels")
             }, undefined, false, undefined, this),
@@ -1547,7 +1599,8 @@
                   setSelectedIds(new Set);
                   const removed = isRecord(result) && Array.isArray(result.removed) ? result.removed.length : ids.length;
                   setMessage({ text: t("batchDeleteSuccess", { count: removed }), tone: "good" });
-                }
+                },
+                affectsCatalog: true
               }),
               children: [
                 t("batchDelete"),
@@ -1571,7 +1624,8 @@
                     text: t("deleteUnhealthySuccess", { count: removed }),
                     tone: "good"
                   });
-                }
+                },
+                affectsCatalog: true
               }),
               children: [
                 t("deleteUnhealthy"),
@@ -1622,9 +1676,9 @@
                 onToggleEnabled: (entry) => run(entry.disabled ? t("actionEnable") : t("actionDisable"), () => command("credentials.setState", {
                   credentialId: entry.id,
                   state: entry.disabled ? "enabled" : "disabled"
-                })),
+                }), { affectsCatalog: true }),
                 onRefreshToken: (entry) => run(t("actionRefresh"), () => command("credentials.refresh", { credentialId: entry.id })),
-                onReset: (entry) => run(t("reset"), () => command("credentials.setState", { credentialId: entry.id, state: "reset" })),
+                onReset: (entry) => run(t("reset"), () => command("credentials.setState", { credentialId: entry.id, state: "reset" }), { affectsCatalog: true }),
                 onEdit: (entry) => {
                   setEditError(undefined);
                   setEditing(entry);
@@ -1632,7 +1686,8 @@
                 onDelete: (entry) => setConfirming({
                   message: t("deleteConfirm"),
                   label: t("actionRemove"),
-                  run: () => command("credentials.remove", { credentialId: entry.id })
+                  run: () => command("credentials.remove", { credentialId: entry.id }),
+                  affectsCatalog: true
                 }),
                 onQueryUsage: showUsage,
                 onShowModels: showModels
@@ -1662,7 +1717,7 @@
           onConfirm: () => {
             const pending = confirming;
             setConfirming(undefined);
-            run(pending.label, pending.run);
+            run(pending.label, pending.run, { affectsCatalog: pending.affectsCatalog });
           }
         }, undefined, false, undefined, this) : null,
         modelsDialog ? /* @__PURE__ */ jsx(PanelOverlay, {
@@ -1784,6 +1839,101 @@
       ]
     }, undefined, true, undefined, this);
   }
+  function startHeightReporting(sdk) {
+    let supported = true;
+    let inFlight = false;
+    let lastReported = 0;
+    const report = () => {
+      if (!supported || inFlight)
+        return;
+      const height = Math.ceil(document.documentElement.scrollHeight);
+      if (height <= 0 || height === lastReported)
+        return;
+      inFlight = true;
+      sdk.request("panel.setHeight", { height }).then(() => {
+        lastReported = height;
+      }).catch((error) => {
+        const code = error?.code;
+        if (code === "NOT_SUPPORTED" || code === "METHOD_NOT_FOUND")
+          supported = false;
+      }).finally(() => {
+        inFlight = false;
+        const current = Math.ceil(document.documentElement.scrollHeight);
+        if (current > 0 && current !== lastReported)
+          report();
+      });
+    };
+    const observer = new ResizeObserver(report);
+    observer.observe(document.body);
+    report();
+  }
+  function mount(sdk) {
+    const root = document.createElement("div");
+    root.style.position = "relative";
+    root.style.minHeight = "100%";
+    root.style.padding = "12px";
+    root.style.boxSizing = "border-box";
+    document.body.style.margin = "0";
+    document.body.appendChild(root);
+    createRoot(root).render(/* @__PURE__ */ jsx(MantineProvider, {
+      theme: hostTheme,
+      children: /* @__PURE__ */ jsx(Box2, {
+        children: /* @__PURE__ */ jsx(PanelErrorBoundary, {
+          children: /* @__PURE__ */ jsx(CredentialPanel, {
+            sdk
+          }, undefined, false, undefined, this)
+        }, undefined, false, undefined, this)
+      }, undefined, false, undefined, this)
+    }, undefined, false, undefined, this));
+    startHeightReporting(sdk);
+  }
+  var Alert2, Badge2, Box2, Button4, Divider, Group4, Loader, MantineProvider, SegmentedControl2, Stack4, Text4, Textarea, PAGE_SIZE = 20, TIER_ORDER, HostComponent, PanelErrorBoundary;
+  var init_panel = __esm(() => {
+    init_CredentialList();
+    init_EditForm();
+    init_format();
+    init_host_runtime();
+    init_Overlay();
+    init_strings();
+    init_jsx_dev_runtime();
+    ({
+      Alert: Alert2,
+      Badge: Badge2,
+      Box: Box2,
+      Button: Button4,
+      Divider,
+      Group: Group4,
+      Loader,
+      MantineProvider,
+      SegmentedControl: SegmentedControl2,
+      Stack: Stack4,
+      Text: Text4,
+      Textarea
+    } = MantineCore);
+    TIER_ORDER = ["paid", "enterprise", "free"];
+    HostComponent = React.Component;
+    PanelErrorBoundary = class PanelErrorBoundary extends HostComponent {
+      state = {};
+      static getDerivedStateFromError(error) {
+        return { message: errorMessage(error) };
+      }
+      render() {
+        const { message } = this.state;
+        if (message) {
+          return /* @__PURE__ */ jsx(Alert2, {
+            color: "red",
+            variant: "light",
+            title: t("runtimeMissingTitle"),
+            children: message
+          }, undefined, false, undefined, this);
+        }
+        return this.props.children;
+      }
+    };
+  });
+
+  // examples/plugins/kiro-external/src/ui/provider-settings.tsx
+  init_strings();
   function renderFatal(detail) {
     const box = document.createElement("div");
     box.style.padding = "12px";
@@ -1805,54 +1955,15 @@
     document.body.style.margin = "0";
     document.body.appendChild(box);
   }
-  var HostComponent = React.Component;
-
-  class PanelErrorBoundary extends HostComponent {
-    state = {};
-    static getDerivedStateFromError(error) {
-      return { message: errorMessage(error) };
-    }
-    render() {
-      const { message } = this.state;
-      if (message) {
-        return /* @__PURE__ */ jsx(Alert2, {
-          color: "red",
-          variant: "light",
-          title: t("runtimeMissingTitle"),
-          children: message
-        }, undefined, false, undefined, this);
-      }
-      return this.props.children;
-    }
-  }
-  function mount(sdk) {
-    const root = document.createElement("div");
-    root.style.position = "relative";
-    root.style.minHeight = "100%";
-    root.style.padding = "12px";
-    root.style.boxSizing = "border-box";
-    document.body.style.margin = "0";
-    document.body.appendChild(root);
-    createRoot(root).render(/* @__PURE__ */ jsx(MantineProvider, {
-      theme: hostTheme,
-      defaultColorScheme: "dark",
-      forceColorScheme: "dark",
-      children: /* @__PURE__ */ jsx(Box2, {
-        children: /* @__PURE__ */ jsx(PanelErrorBoundary, {
-          children: /* @__PURE__ */ jsx(CredentialPanel, {
-            sdk
-          }, undefined, false, undefined, this)
-        }, undefined, false, undefined, this)
-      }, undefined, false, undefined, this)
-    }, undefined, false, undefined, this));
-  }
   var sdk = globalThis.narrafork;
   if (sdk) {
-    try {
-      mount(sdk);
-    } catch (error) {
-      renderFatal(errorMessage(error));
-    }
+    Promise.resolve().then(() => (init_panel(), exports_panel)).then(({ mount: mount2 }) => {
+      try {
+        mount2(sdk);
+      } catch (error) {
+        renderFatal(errorMessage(error));
+      }
+    }, (error) => renderFatal(errorMessage(error)));
   } else {
     renderFatal("The host did not provide the plugin UI SDK (globalThis.narrafork).");
   }

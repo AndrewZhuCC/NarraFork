@@ -6,11 +6,12 @@
 	"documentNamespace": "https://narrafork.local/sbom/com.narrafork.kiro-external",
 	"packages": [
 		{
-			"SPDXID": "SPDXRef-kiro-external",
+			"SPDXID": "SPDXRef-com.narrafork.kiro-external",
 			"name": "com.narrafork.kiro-external",
-			"versionInfo": "0.1.0",
+			"versionInfo": "0.1.2",
 			"licenseDeclared": "Apache-2.0",
-			"licenseConcluded": "Apache-2.0"
+			"licenseConcluded": "Apache-2.0",
+			"supplier": "NarraFork"
 		}
 	]
 }

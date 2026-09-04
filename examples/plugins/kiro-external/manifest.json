@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"pluginId": "com.narrafork.kiro-external",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"displayName": "Kiro (External)",
 	"description": "Kiro provider running as an out-of-process plugin, alongside the built-in adapter.",
 	"publisher": {
@@ -28,7 +28,7 @@
 		"startupTimeoutMs": 15000,
 		"activationTimeoutMs": 30000
 	},
-	"activationEvents": ["onProvider:kiro"],
+	"activationEvents": ["onProvider:kiro", "onView:kiro-external-settings"],
 	"contributes": {
 		"providers": [
 			{

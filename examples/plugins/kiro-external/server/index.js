@@ -23473,7 +23473,8 @@ async function* parseKiroWireStream(body, options = {}) {
 
 // examples/plugins/kiro-external/src/server.ts
 var PLUGIN_ID = "com.narrafork.kiro-external";
-var PLUGIN_VERSION = "0.1.0";
+var PLUGIN_VERSION = "0.1.2";
+var PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 var PROVIDER_PROTOCOL = "1.0";
 var LOCAL_ID = "kiro";
 installProxyResolver();
@@ -23961,6 +23962,7 @@ send({
     pluginId: PLUGIN_ID,
     version: PLUGIN_VERSION,
     rpcProtocol: RPC_PROTOCOL,
+    ...PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {},
     features: ["host_api.notifications", "rpc.cancel", "host_api.requests"]
   }
 });

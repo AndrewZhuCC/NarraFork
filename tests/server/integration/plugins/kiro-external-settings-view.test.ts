@@ -35,6 +35,10 @@ describe("kiro-external settings view: host contract", () => {
 			// Host-local methods are handled in the frontend bridge rather than the backend.
 			"context.get",
 			"panel.setTitle",
+			// Content-height reporting (auto-sized provider-settings frame) and the catalog
+			// invalidation signal after vault-writing commands.
+			"panel.setHeight",
+			"provider.modelsChanged",
 			"notifications.show",
 		]);
 		for (const method of new Set(called)) {

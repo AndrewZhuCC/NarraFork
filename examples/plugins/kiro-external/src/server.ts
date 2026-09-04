@@ -75,7 +75,8 @@ import { streamWithFailover } from "./stream-failover";
 import { parseKiroWireStream } from "./wire-stream";
 
 const PLUGIN_ID = "com.narrafork.kiro-external";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.1.2";
+const PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 const PROVIDER_PROTOCOL = "1.0";
 const LOCAL_ID = "kiro";
 
@@ -769,6 +770,7 @@ send({
 		pluginId: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		rpcProtocol: RPC_PROTOCOL,
+		...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),
 		// `host_api.notifications`: required — the host drops `provider.event` without it.
 		// `rpc.cancel`: required — cancellation support.
 		// `host_api.requests`: required — Plugin→Host requests (secrets.set for credential writeback).

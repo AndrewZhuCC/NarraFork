@@ -70,7 +70,9 @@ export const PLUGIN_BUILDS: Record<string, PluginBuildConfig> = {
 		targets: [
 			{ entry: "src/server.ts", outfile: "server/index.js", target: "bun", format: "esm" },
 			{
-				entry: "src/ui/provider-settings.ts",
+				// `.tsx`: like kiro-external, the panel reads React/Mantine from the host's shared
+				// runtime rather than bundling a second copy.
+				entry: "src/ui/provider-settings.tsx",
 				outfile: "ui/provider-settings.iife.js",
 				target: "browser",
 				format: "iife",

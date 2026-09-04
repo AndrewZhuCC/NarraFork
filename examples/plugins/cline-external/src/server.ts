@@ -65,7 +65,8 @@ import {
 } from "./rpc";
 
 const PLUGIN_ID = "com.narrafork.cline-external";
-const PLUGIN_VERSION = "0.1.0";
+const PLUGIN_VERSION = "0.1.4";
+const PACKAGE_DIGEST = process.env.NF_PLUGIN_PACKAGE_DIGEST;
 const PROVIDER_PROTOCOL = "1.0";
 const LOCAL_ID = "cline";
 
@@ -567,6 +568,11 @@ async function invokeCommand(id: string | number, params: unknown): Promise<void
 			...(result.secretWrites && result.secretWrites.length > 0
 				? { secretWrites: result.secretWrites }
 				: {}),
+			// Non-secret provider settings. Omitted when empty so the response shape is
+			// unchanged for the commands that do not persist config.
+			...(result.configWrites && result.configWrites.length > 0
+				? { configWrites: result.configWrites }
+				: {}),
 		});
 	} catch (error) {
 		if (error instanceof CommandInputError || error instanceof AuthInputError) {
@@ -694,6 +700,7 @@ send({
 		pluginId: PLUGIN_ID,
 		version: PLUGIN_VERSION,
 		rpcProtocol: RPC_PROTOCOL,
+		...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),
 		// `host_api.notifications`: required — the host drops `provider.event` without it.
 		// `rpc.cancel`: required — cancellation support.
 		// `host_api.requests`: required — commands read and write credentials with
