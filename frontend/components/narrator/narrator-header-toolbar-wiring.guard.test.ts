@@ -211,6 +211,14 @@ describe("self-contained controls are reachable from the overflow menu", () => {
 	});
 });
 
+describe("dock-only toolbar entries stay wired to their panels", () => {
+	it("the file tree entry toggles its panel and reflects its open state", async () => {
+		const source = await narratorPanel();
+		expect(source).toContain('return dock?.openToolTypes.has("filetree") ?? false;');
+		expect(source).toContain('dock?.toggleToolPanel("filetree");');
+	});
+});
+
 describe("the capacity hook observes only stable elements", () => {
 	it("never observes the entry wrappers it adds and removes", async () => {
 		const source = await capacityHook();

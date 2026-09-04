@@ -6403,6 +6403,8 @@ export function NarratorPanel({
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
 				case "filemod":
 					return fileModDrawerOpened;
+				case "filetree":
+					return dock?.openToolTypes.has("filetree") ?? false;
 				case "details":
 					return detailsOpened;
 				case "terminal":
@@ -6465,8 +6467,11 @@ export function NarratorPanel({
 					if (dock) dock.toggleToolPanel(id);
 					else setMobileToolPanel((current) => (current === id ? null : id));
 					return;
-				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
-				// transcript while a slider moves, so there is no drawer fallback to offer.
+				// Dock-only (registry `hosts: ["dock"]`): these panels exist beside the
+				// transcript, so there is no drawer fallback to offer.
+				case "filetree":
+					dock?.toggleToolPanel("filetree");
+					return;
 				case "appearance":
 					dock?.toggleToolPanel("appearance");
 					return;
