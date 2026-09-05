@@ -348,7 +348,7 @@ function defaultModelForProvider(provider: string): string | null {
 		const custom = settings.agent.customModels ?? [];
 		const codexCustom = custom.find((m) => m.provider === "codex")?.value;
 		const normalized = prefixProviderModel("codex", codexCustom);
-		return normalized ?? "codex:gpt-5.3-codex";
+		return normalized ?? "codex:gpt-5.5";
 	}
 
 	if (provider === "kiro") {
