@@ -330,15 +330,32 @@ export const KiroSection = React.memo(function KiroSection({
 			const entry = editingCredential;
 			if (!entry || !canUpdateKiroCredential) return;
 			const { priority, ...fields } = patch;
-			if (priority !== undefined && canSetKiroCredentialPriority) {
-				priorityMut.mutate({ id: entry.id, priority });
+			const hasFields = Object.keys(fields).length > 0;
+			const sendsPriority = priority !== undefined && canSetKiroCredentialPriority;
+			if (sendsPriority) {
+				priorityMut.mutate(
+					{ id: entry.id, priority },
+					// On a priority-only edit this is the mutation that decides the
+					// outcome, so it also owns closing the modal. Closing up front unmounted
+					// the Alert its own onError writes into — and because it declares
+					// onError at all, the global failure toast was replaced too, so a
+					// rejected priority change was reported in neither place.
+					hasFields
+						? undefined
+						: {
+								onSuccess: () => {
+									setEditingCredential(null);
+									setEditError(null);
+								},
+							},
+				);
 			}
-			if (Object.keys(fields).length > 0) {
+			if (hasFields) {
 				updateMut.mutate({ id: entry.id, fields });
 				return;
 			}
-			// Priority-only edits (or a no-op save) close the modal directly since the
-			// PATCH mutation that normally closes it never ran.
+			if (sendsPriority) return;
+			// Nothing to send at all — a save that changed nothing still closes.
 			setEditingCredential(null);
 			setEditError(null);
 		},
