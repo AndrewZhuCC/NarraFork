@@ -137,9 +137,9 @@ describe("resolveModelPricing lookup rules", () => {
 		expect(resolveModelPricing("claude")).toBeNull();
 	});
 
-	test("Kiro legacy 短名有价格，不会常态化未定价标记", () => {
-		// BUILTIN_KIRO_MODELS still exposes these for resolveProvider backward
-		// compat. Leaving them unpriced pushed every such request into
+	test("legacy 短名有价格，不会常态化未定价标记", () => {
+		// Legacy short aliases are still used for backward compat.
+		// Leaving them unpriced pushed every such request into
 		// unpricedRequestCount and made the UI's "*" permanent.
 		const haiku = resolveModelPricing("claude-haiku");
 		expect(haiku?.modelKey).toBe("claude-haiku-4-5");
@@ -151,8 +151,8 @@ describe("resolveModelPricing lookup rules", () => {
 		expect(resolveModelPricing("claude-opus")?.modelKey).toBe("claude-opus-4-5");
 		expect(resolveModelPricing("claude-opus")?.input).toBe(5.0);
 
-		// Provider-prefixed spelling (how Kiro requests actually arrive) resolves too.
-		expect(resolveModelPricing("kiro:claude-sonnet")?.modelKey).toBe("claude-sonnet-4-5");
+		// Provider-prefixed spelling resolves too.
+		expect(resolveModelPricing("anthropic:claude-sonnet")?.modelKey).toBe("claude-sonnet-4-5");
 	});
 
 	test("非日期的尾部数字不会被当作日期剥离（避免按错误价格静默计费）", () => {
@@ -192,7 +192,7 @@ describe("resolveModelPricing lookup rules", () => {
 
 	test("normalizeModelPricingKey 处理前缀、空白与大小写", () => {
 		expect(normalizeModelPricingKey("codex:GPT-5.5")).toBe("gpt-5.5");
-		expect(normalizeModelPricingKey("  kiro:claude-opus-4.6 ")).toBe("claude-opus-4.6");
+		expect(normalizeModelPricingKey("  anthropic:claude-opus-4.6 ")).toBe("claude-opus-4.6");
 		expect(normalizeModelPricingKey("gpt-5.5")).toBe("gpt-5.5");
 		expect(normalizeModelPricingKey(undefined)).toBe("");
 	});

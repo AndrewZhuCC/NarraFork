@@ -13,7 +13,6 @@ const HOST_RESERVED_PREFIXES = new Set([
 	"__summary__",
 	"default",
 	"summary",
-	"kiro",
 	"codex",
 ]);
 const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "prototype", "constructor"]);

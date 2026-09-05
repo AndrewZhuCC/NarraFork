@@ -12,7 +12,7 @@ function makeConfig(overrides: Partial<NUGProviderConfig> = {}): NUGProviderConf
 		prefix: "nug",
 		apiKey: "key",
 		baseUrl: "https://nug.example",
-		defaultModel: "kiro:claude-sonnet-4.5",
+		defaultModel: "antigravity:claude-sonnet-4.5",
 		...overrides,
 	};
 }
@@ -35,7 +35,7 @@ function makeHarness(
 		fetchModels: async () => {
 			state.fetchCount++;
 			if (options.fetchImpl) return options.fetchImpl();
-			return { models: [{ id: "kiro:claude-sonnet-4.5" }] };
+			return { models: [{ id: "antigravity:claude-sonnet-4.5" }] };
 		},
 		applyCatalog: (_config, catalog) => {
 			state.appliedCount++;
@@ -84,7 +84,7 @@ describe("nugModelRefreshCoordinator", () => {
 		const { coordinator, state } = makeHarness({
 			fetchImpl: async () => {
 				await gate;
-				return { models: [{ id: "kiro:claude-sonnet-4.5" }] };
+				return { models: [{ id: "antigravity:claude-sonnet-4.5" }] };
 			},
 		});
 		const first = coordinator.refreshIfStale(makeConfig());
@@ -147,7 +147,7 @@ describe("nugModelRefreshCoordinator", () => {
 			fetchImpl: async () => {
 				call++;
 				if (call === 1) throw new Error("first down");
-				return { models: [{ id: "kiro:claude-sonnet-4.5" }] };
+				return { models: [{ id: "antigravity:claude-sonnet-4.5" }] };
 			},
 		});
 		const outcomes = await coordinator.refreshAllIfStale([

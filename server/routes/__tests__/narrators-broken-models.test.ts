@@ -60,7 +60,7 @@ describe("broken model migration access boundary", () => {
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ targetModel: "kiro:claude-sonnet-4.5", narratorIds: ["n1"] }),
+				body: JSON.stringify({ targetModel: "anthropic:claude-sonnet-4.5", narratorIds: ["n1"] }),
 			},
 		);
 		expect(response.status).toBe(403);
@@ -94,7 +94,7 @@ describe("broken model migration route resolution", () => {
 			{
 				method: "POST",
 				headers: { "content-type": "application/json" },
-				body: JSON.stringify({ targetModel: "kiro:claude-sonnet-4.5", narratorIds: [] }),
+				body: JSON.stringify({ targetModel: "anthropic:claude-sonnet-4.5", narratorIds: [] }),
 			},
 		);
 		expect(response.status).toBe(400);

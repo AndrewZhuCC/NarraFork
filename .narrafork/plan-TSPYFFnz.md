@@ -2,7 +2,7 @@
 
 ## 核心思路
 
-将 Codex 从"嵌入在 OpenAIProviderConfig 中的单账号 OAuth"改为独立的凭据池管理模式，类似 Kiro 的架构。Codex 所有账号共享同一组模型（codex 系列），因此不需要 per-provider 绑定，而是作为一个独立的 provider 存在。
+将 Codex 从"嵌入在 OpenAIProviderConfig 中的单账号 OAuth"改为独立的凭据池管理模式。Codex 所有账号共享同一组模型（codex 系列），因此不需要 per-provider 绑定，而是作为一个独立的 provider 存在。
 
 ## 架构设计
 
@@ -44,7 +44,7 @@ interface CodexCredentialStats {
 |------|------|
 | `server/lib/codex-manager.ts` | 凭据池管理器：加载/保存/选择/轮换/刷新/失败处理 |
 | `server/routes/codex.ts` | 重写：凭据 CRUD + OAuth 流程 + 状态查询 |
-| `frontend/components/providers/CodexSection.tsx` | 重写：凭据管理 UI（类似 KiroSection） |
+| `frontend/components/providers/CodexSection.tsx` | 重写：凭据管理 UI（参考既有 provider Section） |
 
 ### 修改文件
 
@@ -71,7 +71,7 @@ class CodexManager {
   private currentIdx: number;
   private mode: "priority" | "balanced";
 
-  // 凭据选择（同 Kiro 逻辑）
+  // 凭据选择（同多凭据池逻辑）
   selectCredential(): CodexCredential;
   
   // Token 管理
@@ -123,7 +123,7 @@ class CodexManager {
 
 ### 前端 CodexSection
 
-类似 KiroSection 的结构：
+参考既有 provider Section 的结构：
 - 状态概览：凭据总数/可用数 + 负载均衡模式切换
 - 添加凭据：两个按钮（浏览器登录 / 设备码登录）
 - 凭据列表：每行显示 displayName、accountId、状态、优先级、成功/失败计数

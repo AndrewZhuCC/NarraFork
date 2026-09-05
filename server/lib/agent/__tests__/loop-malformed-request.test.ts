@@ -8,7 +8,7 @@ import type { AgentConfig, AgentEvent } from "../types";
 import { ApiError } from "../types";
 
 const UPSTREAM_BODY = JSON.stringify({
-	__type: "com.amazon.kiro.runtimeservice#ValidationException",
+	__type: "com.amazon.runtimeservice#ValidationException",
 	message: "Improperly formed request.",
 	reason: "REQUEST_BODY_INVALID",
 });
@@ -30,7 +30,7 @@ const REQUEST_BODY = {
 	},
 };
 
-/** "throw" = provider throws (kiro plugin path); "stream" = SSE error event (NUG relay path). */
+/** "throw" = provider throws; "stream" = SSE error event (NUG relay path). */
 let mode: "throw" | "stream" | "unrelated" = "throw";
 /** Attempts observed by the provider, so tests can assert the replay count. */
 let chatAttempts = 0;
@@ -53,8 +53,8 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 		params.requestDump?.setRequest({
-			transport: "kiro-plugin",
-			url: "https://q.us-east-1.amazonaws.com",
+			transport: "http",
+			url: "https://nug.example.test/v1/messages",
 			headers: { Authorization: "Bearer secret-token" },
 			body: REQUEST_BODY,
 		});
@@ -244,7 +244,7 @@ describe("agentLoop malformed-request-body capture", () => {
 });
 
 /**
- * This rejection is ~0.02% of Kiro requests and 39 of 40 recorded occurrences cleared on
+ * This rejection is ~0.02% of requests and 39 of 40 recorded occurrences cleared on
  * their own with the request unchanged, so the turn must not die on the first one. The
  * budget is bounded because the error carries no signal separating "upstream hiccup" from
  * "this body really is invalid" — an unbounded retry would re-send the whole history

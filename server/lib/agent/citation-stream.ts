@@ -14,13 +14,13 @@
  * `citeturn…` marker leak cannot reappear on one path but not another.
  */
 
+import type { ProviderTextCitation } from "@shared/agent-protocol/types";
 import {
 	normalizeTextCitations,
 	parseLegacyCitationMarkers,
 	remapIndexThroughRemovals,
 	type TextCitation,
 } from "@shared/citations";
-import type { ProviderTextCitation } from "@shared/codewhisperer/types";
 import { logger } from "../logger";
 
 export interface FinalizedAssistantText {

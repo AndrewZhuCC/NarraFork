@@ -7,7 +7,6 @@ import { createFileRoute, useSearch } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
-import { ClineSection } from "../../components/providers/ClineSection";
 import { CodexSection } from "../../components/providers/CodexSection";
 import {
 	CUSTOM_API_PROTOCOL_LABEL_KEYS,
@@ -15,7 +14,6 @@ import {
 	isAnthropicProtocol,
 	isGeminiProtocol,
 } from "../../components/providers/CustomApiProviderSection";
-import { KiroSection } from "../../components/providers/KiroSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { getModelDefaultContextWindow } from "../../components/providers/model-context-defaults";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
@@ -193,24 +191,14 @@ function SettingsProvidersPage() {
 	);
 
 	// ── Prefix conflict detection ──
-	const RESERVED_PREFIXES = useMemo(() => new Set(["kiro", "codex"]), []);
-	const clineProviderPrefixes = useMemo(() => {
-		const cps = (settings?.clineProviders ?? []) as Array<{ id: string; prefix?: string }>;
-		return cps
-			.filter((p): p is { id: string; prefix: string } => !!p.prefix)
-			.map((p) => ({ id: p.id, prefix: p.prefix }));
-	}, [settings]);
+	const RESERVED_PREFIXES = useMemo(() => new Set(["codex"]), []);
 	const allPrefixToId = useMemo(() => {
 		const map = new Map<string, string>();
-		for (const p of [
-			...state.customApiProviders,
-			...state.nugProviders,
-			...clineProviderPrefixes,
-		]) {
+		for (const p of [...state.customApiProviders, ...state.nugProviders]) {
 			if (p.prefix) map.set(p.prefix, p.id);
 		}
 		return map;
-	}, [state.customApiProviders, state.nugProviders, clineProviderPrefixes]);
+	}, [state.customApiProviders, state.nugProviders]);
 	const getPrefixError = useCallback(
 		(prefix: string, currentProviderId: string): string | undefined => {
 			if (!prefix) return undefined;
@@ -297,7 +285,7 @@ function SettingsProvidersPage() {
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
 	const [testingModel, setTestingModel] = useState<string | null>(null);
-	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (kiro/codex/cline)
+	// selectedProvider: provider ID for multi-instance providers, prefix for platform providers (codex)
 	const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
 
 	useEffect(() => {
@@ -359,7 +347,7 @@ function SettingsProvidersPage() {
 		[dispatchers, t],
 	);
 
-	// ── Server-side context window merge (e.g. after Cline model add) ──
+	// ── Server-side context window merge (e.g. after a provider model add) ──
 	const handleServerContextWindowsMerge = useCallback(
 		(windows: Record<string, number>) => {
 			dispatchers.mergeContextWindows(windows);
@@ -475,11 +463,9 @@ function SettingsProvidersPage() {
 	// ── Models maps (memoized) ──
 	const {
 		providerLabels,
-		kiroModels,
 		codexModels,
 		openaiByProvider,
 		anthropicByProvider,
-		clineByProvider,
 		geminiByProvider,
 		nugByProvider,
 		pluginProviderGroups,
@@ -603,7 +589,7 @@ function SettingsProvidersPage() {
 	// ── Build provider groups for overview ──
 	const providerGroups = useMemo(() => {
 		const byPrefix = new Map<string, ModelOption[]>();
-		const platformPrefixes = new Set(["kiro", "codex", "cline"]);
+		const platformPrefixes = new Set(["codex"]);
 		// Executable-plugin providers, keyed by prefix. They are presented like platform
 		// providers (single instance, not user-addable) but need their own lookup because
 		// the detail area has to reach the owning plugin rather than a builtin section.
@@ -643,11 +629,9 @@ function SettingsProvidersPage() {
 			if (!byPrefix.has(prefix)) byPrefix.set(prefix, []);
 		};
 
-		for (const m of kiroModels) addModel("kiro", m);
 		for (const m of codexModels) addModel("codex", m);
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
-		for (const g of clineByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of geminiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of nugByProvider) for (const m of g.models) addModel(g.prefix, m);
 
@@ -706,11 +690,9 @@ function SettingsProvidersPage() {
 			};
 		});
 	}, [
-		kiroModels,
 		codexModels,
 		openaiByProvider,
 		anthropicByProvider,
-		clineByProvider,
 		geminiByProvider,
 		nugByProvider,
 		pluginProviderGroups,
@@ -753,7 +735,7 @@ function SettingsProvidersPage() {
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
 		// Platform providers: selectedProvider is the prefix
-		if (["kiro", "codex", "cline"].includes(selectedProvider)) {
+		if (["codex"].includes(selectedProvider)) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
 		}
 		// Plugin providers are also addressed by prefix; without this they would fall
@@ -782,8 +764,8 @@ function SettingsProvidersPage() {
 	const autoFetchAndFill = useCallback(async () => {
 		const providerId = selectedProvider;
 		if (!providerId) return;
-		// Platform providers (kiro/codex/cline) manage their own model lists.
-		if (["kiro", "codex", "cline"].includes(providerId)) return;
+		// Platform providers (codex) manage their own model lists.
+		if (["codex"].includes(providerId)) return;
 
 		const customApi = state.customApiProviders.find((p) => p.id === providerId);
 		const nug = state.nugProviders.find((p) => p.id === providerId);
@@ -883,7 +865,6 @@ function SettingsProvidersPage() {
 					<ProviderSectionContent
 						providerKey={selectedProvider}
 						pluginProvider={selectedPluginProvider}
-						settings={settings}
 						state={state}
 						dispatchers={dispatchers}
 						providerModelsMap={providerModelsMap}
@@ -1003,7 +984,7 @@ function SettingsProvidersPage() {
 }
 
 // ── Provider Section Content ──
-// providerKey is either a platform prefix (kiro/codex/cline) or a provider ID
+// providerKey is either a platform prefix (codex) or a provider ID
 
 interface ProviderSectionContentProps {
 	providerKey: string;
@@ -1013,8 +994,6 @@ interface ProviderSectionContentProps {
 	 * providers are single-instance, like the builtins).
 	 */
 	pluginProvider?: { pluginId: string; contributionId: string };
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic settings JSON
-	settings: any;
 	state: ProvidersState;
 	dispatchers: ReturnType<typeof useProvidersDispatch>;
 	providerModelsMap: Record<string, ModelOption[]>;
@@ -1037,7 +1016,6 @@ interface ProviderSectionContentProps {
 function ProviderSectionContent({
 	providerKey,
 	pluginProvider,
-	settings,
 	state,
 	dispatchers,
 	providerModelsMap,
@@ -1056,20 +1034,6 @@ function ProviderSectionContent({
 	onNugLoginSuccess,
 }: ProviderSectionContentProps) {
 	// Platform providers: matched by prefix
-	if (providerKey === "kiro") {
-		return (
-			<KiroSection
-				settings={settings}
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				onTestModel={onTestModel}
-			/>
-		);
-	}
 	if (providerKey === "codex") {
 		return (
 			<CodexSection
@@ -1079,21 +1043,6 @@ function ProviderSectionContent({
 				onCustomModelsChange={dispatchers.setCustomModels}
 				modelContextWindows={state.modelContextWindows}
 				onContextWindowChange={dispatchers.handleContextWindowChange}
-				onTestModel={onTestModel}
-			/>
-		);
-	}
-	if (providerKey === "cline") {
-		return (
-			<ClineSection
-				settings={settings}
-				hiddenModels={state.hiddenModels}
-				onToggleHidden={dispatchers.toggleHidden}
-				customModels={state.customModels}
-				onCustomModelsChange={dispatchers.setCustomModels}
-				modelContextWindows={state.modelContextWindows}
-				onContextWindowChange={dispatchers.handleContextWindowChange}
-				onMergeContextWindows={onServerContextWindowsMerge}
 				onTestModel={onTestModel}
 			/>
 		);

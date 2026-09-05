@@ -14,13 +14,13 @@ describe("isProviderUnavailableError", () => {
 		expect(
 			isProviderUnavailableError(
 				new Error(
-					"Kiro provider is not available. Please check your Kiro connection and try again.",
+					"Provider is not available. Please check your provider connection and try again.",
 				),
 			),
 		).toBe(true);
 		expect(
 			isProviderUnavailableError(
-				new Error("Kiro provider is disabled. Please choose a different model or enable Kiro."),
+				new Error("Provider is disabled. Please choose a different model or enable it."),
 			),
 		).toBe(true);
 	});

@@ -44,18 +44,17 @@ describe("platform credential files", () => {
 		expect(isSecretPlatformPath(join(HOME, name), HOME)).toBe(true);
 	});
 
-	test("refuses everything under the kiro token store", () => {
+	test("refuses everything under a credential directory", () => {
 		// Matched as a directory because the layout is the provider's business and may
 		// gain files this list has never heard of.
-		expect(isSecretPlatformPath(join(HOME, "kiro", "tokens.json"), HOME)).toBe(true);
-		expect(isSecretPlatformPath(join(HOME, "kiro", "nested", "deep.json"), HOME)).toBe(true);
+		expect(isSecretPlatformPath(join(HOME, "codex-credentials.json"), HOME)).toBe(true);
 	});
 });
 
 describe("platform files the viewer must keep opening", () => {
 	test.each([
 		["malformed-request-dumps/dump.json", "a request dump the viewer links to"],
-		["kiro-dumps/capture.json", "a provider capture"],
+		["provider-dumps/capture.json", "a provider capture"],
 		["conclusions/abc.md", "a subagent conclusion"],
 		["model-cache.json", "a non-secret cache"],
 		["openai-models.json", "a non-secret model list"],

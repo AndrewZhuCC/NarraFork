@@ -1,8 +1,8 @@
 /**
  * Re-export shim for bounded API error diagnostics.
  *
- * The implementation moved to `@shared/codewhisperer/error-diagnostics` so the
- * CodeWhisperer protocol layer — reused by bundled plugin code — has no
+ * The implementation moved to `@shared/agent-protocol/error-diagnostics` so the
+ * shared protocol layer — which bundled plugin code reuses — has no
  * `server/` imports. Host importers keep using this path unchanged.
  */
 export {
@@ -14,4 +14,6 @@ export {
 	normalizeApiRequestDiagnostics,
 	normalizeDiagnosticHeaders,
 	parseErrorDiagnostics,
-} from "@shared/codewhisperer/error-diagnostics";
+	parseUpstreamErrorEnvelope,
+	type UpstreamErrorEnvelope,
+} from "@shared/agent-protocol/error-diagnostics";

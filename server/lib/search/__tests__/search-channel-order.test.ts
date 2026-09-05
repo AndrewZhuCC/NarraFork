@@ -9,7 +9,6 @@ import {
 	customSearchChannelId,
 	normalizeSearchSettings,
 	nugSearchChannelId,
-	SEARCH_KIRO_CHANNEL_ID,
 	SEARCH_NATIVE_CHANNEL_ID,
 	SEARCH_SUBAGENT_CHANNEL_ID,
 } from "../settings";
@@ -52,7 +51,6 @@ describe("normalizeSearchSettings channel order", () => {
 			channels: [
 				{ id: customSearchChannelId(providerId), kind: "custom-api", enabled: true, providerId },
 				{ id: SEARCH_SUBAGENT_CHANNEL_ID, kind: "subagent", enabled: false },
-				{ id: SEARCH_KIRO_CHANNEL_ID, kind: "kiro-mcp", enabled: true },
 				{ id: SEARCH_NATIVE_CHANNEL_ID, kind: "native", enabled: true },
 			],
 		});
@@ -62,7 +60,6 @@ describe("normalizeSearchSettings channel order", () => {
 		expect(channelIds(settings)).toEqual([
 			customSearchChannelId(providerId),
 			SEARCH_SUBAGENT_CHANNEL_ID,
-			SEARCH_KIRO_CHANNEL_ID,
 			SEARCH_NATIVE_CHANNEL_ID,
 		]);
 	});
@@ -70,9 +67,8 @@ describe("normalizeSearchSettings channel order", () => {
 	test("order survives a save/reload round trip", () => {
 		const settings = makeSettings({
 			channels: [
-				{ id: SEARCH_KIRO_CHANNEL_ID, kind: "kiro-mcp", enabled: true },
+				{ id: SEARCH_SUBAGENT_CHANNEL_ID, kind: "subagent", enabled: true },
 				{ id: SEARCH_NATIVE_CHANNEL_ID, kind: "native", enabled: false },
-				{ id: SEARCH_SUBAGENT_CHANNEL_ID, kind: "subagent", enabled: false },
 			],
 		});
 
@@ -83,7 +79,7 @@ describe("normalizeSearchSettings channel order", () => {
 
 		expect(changedOnSecondPass).toBe(false);
 		expect(channelIds(settings)).toEqual(first);
-		expect(first[0]).toBe(SEARCH_KIRO_CHANNEL_ID);
+		expect(first[0]).toBe(SEARCH_SUBAGENT_CHANNEL_ID);
 	});
 
 	test("appends newly available channels without disturbing saved order", () => {
@@ -102,7 +98,6 @@ describe("normalizeSearchSettings channel order", () => {
 		expect(channelIds(settings)).toEqual([
 			SEARCH_SUBAGENT_CHANNEL_ID,
 			SEARCH_NATIVE_CHANNEL_ID,
-			SEARCH_KIRO_CHANNEL_ID,
 			nugSearchChannelId("nug1"),
 		]);
 	});
@@ -163,8 +158,8 @@ describe("normalizeSearchSettings channel order", () => {
 			channels: [{ id: SEARCH_NATIVE_CHANNEL_ID, kind: "native", enabled: true }],
 		});
 		normalizeSearchSettings(withSaved, { codex: { useWebSearch: false } });
-		expect(withSaved.search?.channels.find((c) => c.id === SEARCH_NATIVE_CHANNEL_ID)?.enabled).toBe(
-			true,
-		);
+		expect(
+			withSaved.search?.channels.find((c) => c.id === SEARCH_NATIVE_CHANNEL_ID)?.enabled,
+		).toBe(true);
 	});
 });

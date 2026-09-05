@@ -24,7 +24,6 @@ import {
 	purgeKimiUsageCache,
 	refreshAllKimiUsages,
 } from "../lib/kimi-usage-cache";
-import { isKiroAvailable, kiroGetCachedModels } from "../lib/kiro-adapter";
 import { logger } from "../lib/logger";
 import { redactDiagnosticText } from "../lib/net/diagnostic-redaction";
 import { getLanAddresses } from "../lib/net/lan-addresses";
@@ -83,7 +82,6 @@ import {
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
-import { getClineEnabledModelsGrouped, purgeClineProviderCache } from "./cline";
 import { getGeminiCachedModelsGrouped, purgeGeminiProviderCache } from "./gemini";
 import { purgeNugProviderCache } from "./nug";
 import {
@@ -231,20 +229,6 @@ const nugProviderSchema = z.object({
 	oauthCallbackUrl: z.string().optional(),
 	proxy: proxyOverrideSchema,
 	disabled: z.boolean().optional(),
-	kiroAnthropicProtocol: z.boolean().optional(),
-});
-
-const clineProviderSchema = z.object({
-	id: z.string().min(1),
-	name: z.string(),
-	prefix: z.string().min(1),
-	baseUrl: z.string(),
-	accessToken: z.string().optional(),
-	defaultModel: z.string(),
-	defaultContextWindow: z.number().int().min(1).optional(),
-	enabledModels: z.array(z.string()).optional(),
-	proxy: proxyOverrideSchema,
-	disabled: z.boolean().optional(),
 });
 
 const geminiProviderSchema = z.object({
@@ -267,7 +251,7 @@ const geminiProviderSchema = z.object({
 
 const searchChannelSchema = z.object({
 	id: z.string().min(1),
-	kind: z.enum(["native", "kiro-mcp", "nug-mcp", "custom-api", "subagent"]),
+	kind: z.enum(["native", "nug-mcp", "custom-api", "subagent"]),
 	enabled: z.boolean(),
 	providerId: z.string().optional(),
 	model: z.string().optional(),
@@ -623,17 +607,10 @@ export const updateSettingsSchema = z
 			})
 			.partial()
 			.optional(),
-		kiro: z
-			.object({
-				proxy: proxyOverrideSchema,
-			})
-			.partial()
-			.optional(),
 		customApiProviders: z.array(customApiProviderSchema).optional(),
 		openaiProviders: z.array(openaiProviderSchema).optional(),
 		anthropicProviders: z.array(anthropicProviderSchema).optional(),
 		nugProviders: z.array(nugProviderSchema).optional(),
-		clineProviders: z.array(clineProviderSchema).optional(),
 		geminiProviders: z.array(geminiProviderSchema).optional(),
 		codex: z
 			.object({
@@ -903,17 +880,12 @@ function buildSettingsResponse(
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 			oauthClientSecret: p.oauthClientSecret ? maskApiKey(p.oauthClientSecret) : "",
 		})),
-		clineProviders: (source.clineProviders ?? []).map((p) => ({
-			...p,
-			accessToken: p.accessToken ? maskApiKey(p.accessToken) : "",
-		})),
 		geminiProviders: (source.geminiProviders ?? []).map((p) => ({
 			...p,
 			apiKey: p.apiKey ? maskApiKey(p.apiKey) : "",
 		})),
 		vnet: maskVNetSettings(source.vnet),
 		search: maskSearchSettings(source.search),
-		kiroModels: isKiroAvailable() ? kiroGetCachedModels() : null,
 		// Executable-plugin providers, grouped per provider prefix. Read straight from
 		// the in-memory registry; no plugin process is started to build this.
 		pluginProviderModelsGrouped: listPluginProviderModelGroups(pluginProviderRegistry),
@@ -929,7 +901,6 @@ function buildSettingsResponse(
 		openaiModelsGrouped: getOpenaiCachedModelsGrouped(),
 		anthropicModelsGrouped: getAnthropicCachedModelsGrouped(),
 		nugModelsGrouped: getNugCachedModelsGrouped(source.nugProviders ?? []),
-		clineModelsGrouped: getClineEnabledModelsGrouped(),
 		geminiModelsGrouped: getGeminiCachedModelsGrouped(),
 		customApiQuotas: getAllCustomApiCachedQuotas(),
 		kimiUsages: getAllKimiCachedUsages(),
@@ -1096,11 +1067,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 			fn: purgeNugProviderCache,
 		},
 		{
-			type: "cline",
-			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
-			fn: purgeClineProviderCache,
-		},
-		{
 			type: "gemini",
 			ids: staleGeminiCustomApiIds,
 			fn: purgeGeminiProviderCache,
@@ -1148,10 +1114,6 @@ function purgeRemovedProviderCaches(prev: NarraForkSettings, next: NarraForkSett
 		{
 			ids: getRemovedProviderIds(prev.nugProviders, next.nugProviders),
 			providers: prev.nugProviders,
-		},
-		{
-			ids: getRemovedProviderIds(prev.clineProviders, next.clineProviders),
-			providers: prev.clineProviders,
 		},
 	];
 	for (const { ids, providers } of removedProviderGroups) {
@@ -1368,7 +1330,7 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["kiro", "codex"]);
+			const RESERVED_PREFIXES = new Set(["codex"]);
 			const allPrefixes: Array<{ prefix: string; source: string }> = [];
 			for (const p of effectiveCustomApiProviders) {
 				if (p.prefix) {
@@ -1377,9 +1339,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			}
 			for (const p of validated.nugProviders ?? current.nugProviders ?? []) {
 				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `NUG "${p.name || p.id}"` });
-			}
-			for (const p of validated.clineProviders ?? current.clineProviders ?? []) {
-				if (p.prefix) allPrefixes.push({ prefix: p.prefix, source: `Cline "${p.name || p.id}"` });
 			}
 			// Check reserved prefix conflicts
 			for (const { prefix, source } of allPrefixes) {
@@ -1537,17 +1496,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 			}
 		}
 
-		// Preserve real access tokens for Cline providers
-		if (validated.clineProviders) {
-			const currentProviders = current.clineProviders ?? [];
-			for (const p of validated.clineProviders) {
-				if (p.accessToken?.startsWith("*")) {
-					const existing = currentProviders.find((cp) => cp.id === p.id);
-					p.accessToken = existing?.accessToken ?? "";
-				}
-			}
-		}
-
 		// Preserve real API keys and sensitive headers for custom search providers.
 		if (validated.search?.customProviders) {
 			const currentProviders = current.search?.customProviders ?? [];
@@ -1576,7 +1524,6 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 				key === "openaiProviders" ||
 				key === "anthropicProviders" ||
 				key === "nugProviders" ||
-				key === "clineProviders" ||
 				key === "geminiProviders"
 			) {
 				// Array — replace entirely, don't merge
@@ -1623,8 +1570,8 @@ settingsRoutes.patch("/", requireAdmin, async (c) =>
 		normalizeBrandingSettings(merged);
 
 		const prefixChanges = getProviderPrefixChanges(
-			[currentCustomApiProviders, current.nugProviders, current.clineProviders],
-			[merged.customApiProviders, merged.nugProviders, merged.clineProviders],
+			[currentCustomApiProviders, current.nugProviders],
+			[merged.customApiProviders, merged.nugProviders],
 		);
 		if (migrateProviderPrefixReferences(merged, prefixChanges)) {
 			logger.info("Migrated model references after provider prefix changes", {

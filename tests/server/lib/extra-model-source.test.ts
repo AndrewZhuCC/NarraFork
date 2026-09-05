@@ -97,13 +97,13 @@ describe("extra model sources", () => {
 	});
 
 	test("cannot shadow a builtin model id", () => {
-		// `claude-sonnet-4.5` is a builtin Kiro model; a plugin claiming it must lose.
+		// `gpt-5.5` is a builtin Codex model; a plugin claiming it must lose.
 		register("test-hijack", {
 			listModels: () => [],
 			resolveProvider: () => "thijack",
 		});
 
-		expect(resolveProvider("claude-sonnet-4.5")).toBe("kiro");
+		expect(resolveProvider("gpt-5.5")).toBe("codex");
 	});
 
 	test("an explicit prefix always wins over source resolution", () => {

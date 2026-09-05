@@ -30,7 +30,6 @@ export const Route = createFileRoute("/settings/search")({
 
 type SearchChannelKind =
 	| "native"
-	| "kiro-mcp"
 	| "nug-mcp"
 	| "custom-api"
 	| "subagent"
@@ -112,8 +111,6 @@ function channelBadgeColor(kind: SearchChannelKind): string {
 	switch (kind) {
 		case "native":
 			return "violet";
-		case "kiro-mcp":
-			return "blue";
 		case "nug-mcp":
 			return "green";
 		case "custom-api":
@@ -130,7 +127,6 @@ function channelLabel(
 	settings: SearchSettingsResponse | undefined,
 ): string {
 	if (channel.kind === "native") return "Model native search";
-	if (channel.kind === "kiro-mcp") return "Kiro MCP search";
 	if (channel.kind === "subagent") return "Search subagent";
 	if (channel.kind === "plugin") {
 		// Only the backend knows the plugin and contribution titles; there is nothing in

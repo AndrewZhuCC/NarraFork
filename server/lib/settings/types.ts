@@ -196,7 +196,7 @@ export interface NUGProviderConfig {
 	apiKey: string;
 	/** NUG service base URL, e.g. "http://127.0.0.1:7790". */
 	baseUrl: string;
-	/** Default model (bare name without prefix, may include channel e.g. "kiro:claude-sonnet-4.5"). */
+	/** Default model (bare name without prefix, may include channel e.g. "anthropic:claude-sonnet-4.5"). */
 	defaultModel: string;
 	/** NUG account username (auto-filled after login). */
 	nugUsername?: string;
@@ -212,21 +212,6 @@ export interface NUGProviderConfig {
 	oauthCallbackUrl?: string;
 	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
 	proxy?: ProxyOverride;
-	/**
-	 * Opt in to the Anthropic Messages protocol for this gateway's Kiro channel
-	 * (`POST /v1/kiro/messages`) instead of the native CodeWhisperer protocol.
-	 *
-	 * Absent/false keeps the native path, which is the only shape older gateways
-	 * serve. The switch is explicit rather than automatic on the gateway's
-	 * advertised capability: the two paths build different requests and parse
-	 * different streams, and a silent switch would make a regression look like a
-	 * model or upstream problem instead of a protocol change. Both conditions must
-	 * hold — this flag AND the gateway advertising `kiro.messages.v1`.
-	 *
-	 * Intended to be turned on per gateway once its endpoint has been verified end
-	 * to end, and to be turned off again as a one-step rollback if it misbehaves.
-	 */
-	kiroAnthropicProtocol?: boolean;
 }
 
 export interface GeminiProviderConfig {
@@ -261,32 +246,8 @@ export interface GeminiProviderConfig {
 	proxy?: ProxyOverride;
 }
 
-export interface ClineProviderConfig {
-	/** Unique short ID (8 chars, nanoid). */
-	id: string;
-	/** User-defined display name, e.g. "Cline", "Cline Production". */
-	name: string;
-	/** Whether this provider is disabled (keeps config but excluded from resolution). */
-	disabled?: boolean;
-	/** Provider prefix used in model IDs, e.g. "cline". */
-	prefix: string;
-	/** Cline API base URL, e.g. "https://openrouter.ai/api/v1". */
-	baseUrl: string;
-	/** OAuth access token (workos: prefix will be added automatically). */
-	accessToken?: string;
-	/** Default model (bare name without prefix). */
-	defaultModel: string;
-	/** Default context window size (tokens) for models in this provider. */
-	defaultContextWindow?: number;
-	/** User-selected models from the OpenRouter pool. Only these are available for use. */
-	enabledModels?: string[];
-	/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
-	proxy?: ProxyOverride;
-}
-
 export type SearchChannelKind =
 	| "native"
-	| "kiro-mcp"
 	| "nug-mcp"
 	| "custom-api"
 	| "subagent"
@@ -297,7 +258,7 @@ export type CustomSearchProviderProtocol = string;
 
 export interface SearchChannelConfig {
 	/**
-	 * Stable channel ID: native, kiro:local, nug:{id}, custom:{id}, subagent,
+	 * Stable channel ID: native, nug:{id}, custom:{id}, subagent,
 	 * plugin:{pluginId}:{contributionId}.
 	 */
 	id: string;
@@ -394,7 +355,7 @@ export type OutboundProxyMode = "system" | "direct" | "custom";
 
 /**
  * Unified outbound proxy policy applied to every outbound network channel
- * (Kiro, Codex, Anthropic, OpenAI-compatible, Cline, NUG, WebFetch, browser)
+ * (Codex, Anthropic, OpenAI-compatible, NUG, WebFetch, browser)
  * unless a per-location {@link ProxyOverride} overrides it.
  */
 export interface OutboundProxyConfig {
@@ -516,7 +477,7 @@ export interface NarraForkSettings {
 	/**
 	 * Unified outbound proxy policy applied to every outbound network channel.
 	 * Defaults to "system" (follow the OS/env proxy). Replaces the previous
-	 * per-provider proxy fields (kiro.proxy, codex.proxy, provider.proxy,
+	 * per-provider proxy fields (codex.proxy, provider.proxy,
 	 * agent.webFetchPolicy.proxy), which are kept only for migration.
 	 */
 	proxy?: OutboundProxyConfig;
@@ -772,7 +733,7 @@ export interface NarraForkSettings {
 		 */
 		providerOrder?: string[];
 		/**
-		 * Platform-level providers (kiro/codex/cline) that are disabled.
+		 * Platform-level providers (codex) that are disabled.
 		 * Multi-instance providers use their own `disabled` field instead.
 		 */
 		disabledProviders?: string[];
@@ -886,13 +847,6 @@ export interface NarraForkSettings {
 		/** External OAuth access-token WebSocket controls and resource limits. */
 		externalWebSocket?: OAuthExternalWebSocketSettings;
 	};
-	kiro?: {
-		credentialsPath: string;
-		configPath: string;
-		defaultModel?: string;
-		/** Optional per-provider proxy override. Absent/"default" = follow the global policy. */
-		proxy?: ProxyOverride;
-	};
 	/**
 	 * Codex (ChatGPT Pro/Plus) provider configuration.
 	 * Credentials are managed separately in ~/.narrafork/codex-credentials.json.
@@ -951,8 +905,6 @@ export interface NarraForkSettings {
 	anthropicProviders?: AnthropicProviderConfig[];
 	/** NUG (Narrafork Unified Gateway) providers — unified AI gateway. */
 	nugProviders?: NUGProviderConfig[];
-	/** Cline API providers — OpenRouter-compatible with OAuth authentication. */
-	clineProviders?: ClineProviderConfig[];
 	/** Google Gemini API providers — native generativelanguage.googleapis.com protocol. */
 	geminiProviders?: GeminiProviderConfig[];
 	/** External MCP server configurations. */

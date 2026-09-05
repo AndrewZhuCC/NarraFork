@@ -181,7 +181,7 @@ export function ModelsSection({
 				value={summaryModel}
 				onChange={(v) => {
 					// Guard against a null change: persisting a hardcoded fallback
-					// here is how a phantom "kiro:claude-haiku-4.5" used to get saved.
+					// here is how a phantom builtin model used to get saved.
 					if (v) setSummaryModel(v);
 				}}
 			/>

@@ -18,7 +18,6 @@ import {
 	settings,
 } from "../../../server/lib/settings";
 
-const originalEnvDisableKiroProvider = process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 const settingsKeys = Object.keys(settings) as Array<keyof typeof settings>;
 const tempDirs: string[] = [];
 
@@ -37,9 +36,7 @@ function resetProviders(): void {
 	settings.openaiProviders = [];
 	settings.anthropicProviders = [];
 	settings.nugProviders = [];
-	settings.clineProviders = [];
 	settings.codex = undefined;
-	settings.kiro = undefined;
 	if (settings.agent) {
 		settings.agent.customModels = [];
 	}
@@ -100,16 +97,10 @@ describe("resolveProvider fallback order", () => {
 	beforeEach(() => {
 		snapshot = cloneSettingsSnapshot();
 		resetProviders();
-		delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		if (originalEnvDisableKiroProvider === undefined) {
-			delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
-		} else {
-			process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = originalEnvDisableKiroProvider;
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
@@ -136,18 +127,9 @@ describe("resolveProvider fallback order", () => {
 		expect(provider).toBe("codex");
 	});
 
-	test("unknown model 无其他 provider 但有 kiro 配置时 fallback 到 kiro", () => {
-		settings.kiro = {
-			credentialsPath: "/tmp/kiro-creds.json",
-			configPath: "/tmp/kiro-config.json",
-		};
+	test("无任何 provider 配置时 fallback 到 anthropic", () => {
 		const provider = resolveProvider("unknown-model");
-		expect(provider).toBe("kiro");
-	});
-
-	test("无任何 provider 配置时保持 legacy fallback 到 kiro", () => {
-		const provider = resolveProvider("unknown-model");
-		expect(provider).toBe("kiro");
+		expect(provider).toBe("anthropic");
 	});
 
 	test("explicit provider prefix 保持优先", () => {
@@ -166,10 +148,6 @@ describe("resolveProvider fallback order", () => {
 		}
 	});
 
-	test("builtin kiro model 仍解析为 kiro", () => {
-		const provider = resolveProvider("claude-sonnet");
-		expect(provider).toBe("kiro");
-	});
 });
 
 describe("getProvider fallback behavior", () => {
@@ -178,42 +156,18 @@ describe("getProvider fallback behavior", () => {
 	beforeEach(() => {
 		snapshot = cloneSettingsSnapshot();
 		resetProviders();
-		delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		if (originalEnvDisableKiroProvider === undefined) {
-			delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
-		} else {
-			process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = originalEnvDisableKiroProvider;
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
-	test("禁用 kiro provider 时直接报错", () => {
-		addOpenaiProvider("deepseek");
-		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		expect(() => getProvider("kiro")).toThrow(/Kiro provider is disabled/);
-	});
-
-	test("禁用 kiro provider 且无其他 provider 时抛错", () => {
-		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		expect(() => getProvider("kiro")).toThrow(/Kiro provider is disabled/);
-	});
-
 	test("unknown provider 直接报错而非静默回退", () => {
 		addOpenaiProvider("deepseek");
-		expect(() => getProvider("unknown-provider")).toThrow(
-			/Provider "unknown-provider" is not configured/,
-		);
-	});
-
-	test("unknown provider 且 kiro 被禁用时抛错", () => {
-		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
 		expect(() => getProvider("unknown-provider")).toThrow(
 			/Provider "unknown-provider" is not configured/,
 		);
@@ -232,27 +186,20 @@ describe("resolveProviderAndModel behavior", () => {
 	beforeEach(() => {
 		snapshot = cloneSettingsSnapshot();
 		resetProviders();
-		delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		if (originalEnvDisableKiroProvider === undefined) {
-			delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
-		} else {
-			process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = originalEnvDisableKiroProvider;
-		}
 		__setCodexManagerForTests(undefined);
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
-	test("禁用 kiro provider 时直接报错而非静默回退", () => {
+	test("未配置的 provider 直接报错而非静默回退", () => {
 		addOpenaiProvider("deepseek");
-		process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = "1";
-		expect(() => resolveProviderAndModel("kiro:claude-sonnet-4.5")).toThrow(
-			/Kiro provider is disabled/,
+		expect(() => resolveProviderAndModel("acme:some-model")).toThrow(
+			/Provider "acme" is not configured/,
 		);
 	});
 
@@ -303,8 +250,8 @@ describe("resolveProviderAndModel behavior", () => {
 	});
 
 	// 这里刻意不做硬 fallback：回退会命名一个用户从未配置的 provider，
-	// 于是真正的问题（没有配置默认模型）被伪装成「provider kiro 未配置」，
-	// 在初始设置阶段表现为凭空出现的 kiro 模型。直接报错才指向真实原因。
+	// 于是真正的问题（没有配置默认模型）被伪装成 provider 未配置错误，
+	// 在初始设置阶段表现为凭空出现的模型。直接报错才指向真实原因。
 	test("self-referential defaultModel 直接报错，不回退到硬编码模型", () => {
 		settings.agent.defaultModel = "__default__";
 
@@ -419,7 +366,6 @@ describe("follow-summary sentinel (__summary__)", () => {
 		snapshot = cloneSettingsSnapshot();
 		resetProviders();
 		settings.agent.modelAggregations = [];
-		delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
@@ -505,16 +451,10 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 		settings.agent.modelAggregations = [];
 		settings.agent.modelContextWindows = {};
 		settings.agent.contextThresholds = undefined;
-		delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
 		__setCodexManagerForTests(undefined);
 	});
 	afterEach(() => {
 		restoreFromSnapshot(snapshot);
-		if (originalEnvDisableKiroProvider === undefined) {
-			delete process.env.NARRAFORK_DISABLE_KIRO_PROVIDER;
-		} else {
-			process.env.NARRAFORK_DISABLE_KIRO_PROVIDER = originalEnvDisableKiroProvider;
-		}
 		__setCodexManagerForTests(undefined);
 		deleteNugCachedModels("nug-id");
 		for (const dir of tempDirs.splice(0)) {
@@ -538,7 +478,7 @@ describe("getModelContextWindow / getContextThresholds 解析元模型引用", (
 				id: "antigravity:claude-opus-4-6-thinking",
 				model: "claude-opus-4-6-thinking",
 				channel: "antigravity",
-				channelType: "kiro",
+				channelType: "anthropic",
 				contextWindow: 1_000_000,
 			},
 		]);

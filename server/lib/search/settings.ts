@@ -9,7 +9,6 @@ import { getProtocolDefaultBaseUrl, isKnownProtocol } from "./adapters/index";
 import { areExtraSearchChannelsReady, listExtraSearchChannels } from "./plugin-source";
 
 export const SEARCH_NATIVE_CHANNEL_ID = "native";
-export const SEARCH_KIRO_CHANNEL_ID = "kiro:local";
 export const SEARCH_SUBAGENT_CHANNEL_ID = "subagent";
 export const DEFAULT_SEARCH_TIMEOUT_MS = 60_000;
 export const DEFAULT_SEARCH_MAX_OUTPUT_CHARS = 24_000;
@@ -69,10 +68,7 @@ function makeBaseChannel(
 }
 
 export function buildSearchChannelCatalog(settings: NarraForkSettings): SearchChannelConfig[] {
-	const catalog: SearchChannelConfig[] = [
-		makeBaseChannel(SEARCH_NATIVE_CHANNEL_ID, "native", true),
-		makeBaseChannel(SEARCH_KIRO_CHANNEL_ID, "kiro-mcp", true),
-	];
+	const catalog: SearchChannelConfig[] = [makeBaseChannel(SEARCH_NATIVE_CHANNEL_ID, "native", true)];
 
 	for (const provider of settings.nugProviders ?? []) {
 		catalog.push(makeBaseChannel(nugSearchChannelId(provider.id), "nug-mcp", true, provider.id));

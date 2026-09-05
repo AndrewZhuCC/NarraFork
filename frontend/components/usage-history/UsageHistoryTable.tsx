@@ -176,8 +176,6 @@ function getProviderColor(provider: string | null) {
 			return "orange";
 		case "openai":
 			return "green";
-		case "kiro":
-			return "blue";
 		case "codex":
 			return "cyan";
 		default:
@@ -799,10 +797,8 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 								<DetailField
 									label={t("usageHistoryTableCost")}
 									value={
-										record.provider === "kiro"
-											? record.meterUsage != null
-												? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
-												: "-"
+										record.meterUsage != null
+											? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
 											: record.costUsd != null
 												? `$${record.costUsd.toFixed(6)}`
 												: "-"
@@ -972,11 +968,9 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										</Group>
 									</Table.Td>
 									<Table.Td>
-										{record.provider === "kiro" ? (
-											<Text size="sm" fw={500} c={record.meterUsage ? "blue" : "dimmed"}>
-												{record.meterUsage != null
-													? `${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`
-													: "-"}
+										{record.meterUsage != null ? (
+											<Text size="sm" fw={500} c="blue">
+												{`${record.meterUsage.toFixed(2)} ${record.meterUnit || "credits"}`}
 											</Text>
 										) : (
 											<Text size="sm" fw={500} c={record.costUsd ? "green" : "dimmed"}>

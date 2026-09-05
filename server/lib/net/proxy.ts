@@ -1,8 +1,8 @@
 /**
  * Unified outbound proxy resolver.
  *
- * All outbound network channels (Kiro, Codex, Anthropic, OpenAI-compatible,
- * Cline, NUG, WebFetch, browser) resolve their proxy through this module so a
+ * All outbound network channels (Codex, Anthropic, OpenAI-compatible,
+ * NUG, WebFetch, browser) resolve their proxy through this module so a
  * single global policy (`settings.proxy`) controls every outbound request.
  *
  * Bun's global `fetch()` also reads HTTP(S)_PROXY automatically, and the

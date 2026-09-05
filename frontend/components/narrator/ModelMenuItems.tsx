@@ -80,12 +80,11 @@ export function ModelMenuItems({
 	}, []);
 	const groups = new Map<string, ModelOption[]>();
 	for (const m of allModels) {
-		const prov = m.provider ?? "kiro";
+		const prov = m.provider ?? "unknown";
 		if (!groups.has(prov)) groups.set(prov, []);
 		groups.get(prov)?.push(m);
 	}
 	const provLabels: Record<string, string> = {
-		kiro: "Kiro",
 		openai: "OpenAI",
 		...providerLabels,
 		__default__: t("modelGroupDefault"),

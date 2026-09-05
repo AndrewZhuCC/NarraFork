@@ -4,12 +4,10 @@ import {
 	BoundedConfirmedRefSet,
 	type ConfirmedRefSet,
 	dedupAnthropicHistoryImages,
-	dedupKiroHistoryImages,
 	dedupOpenAIHistoryImages,
 	imageRefForBase64,
 	isImageCacheMissError,
 	restoreAnthropicHistoryImages,
-	restoreKiroHistoryImages,
 	restoreOpenAIHistoryImages,
 } from "../nug-image-dedup";
 
@@ -57,70 +55,6 @@ describe("BoundedConfirmedRefSet", () => {
 		expect(refs.has("sha256:b")).toBe(false);
 		expect(refs.has("sha256:c")).toBe(true);
 		expect(refs.size).toBe(2);
-	});
-});
-
-describe("dedupKiroHistoryImages", () => {
-	test("unconfirmed ref keeps inline bytes, tags imageRef, reports present", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-				userInputMessage: {
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		const result = dedupKiroHistoryImages(history, confirmed());
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		const img = (history[0] as any).userInputMessage.images[0];
-		expect(img.imageRef).toBe(ref);
-		expect(img.source.bytes).toBe(PNG_B64);
-		expect(result.stripped.size).toBe(0);
-		expect(result.present).toEqual([ref]);
-	});
-
-	test("confirmed ref strips bytes and records payload for restore", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-				userInputMessage: {
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		const result = dedupKiroHistoryImages(history, confirmed(ref));
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		const img = (history[0] as any).userInputMessage.images[0];
-		expect(img.imageRef).toBe(ref);
-		expect(img.source.bytes).toBe("");
-		expect(result.stripped.get(ref)).toBe(PNG_B64);
-		expect(result.present).toEqual([]);
-	});
-
-	test("restore puts the stripped bytes back", () => {
-		const ref = expectedRef(PNG_B64);
-		const history = [
-			{
-				userInputMessage: {
-					content: "hi",
-					images: [{ format: "png", source: { bytes: PNG_B64 } }],
-				},
-			},
-		];
-		const result = dedupKiroHistoryImages(history, confirmed(ref));
-		restoreKiroHistoryImages(history, result.stripped);
-		// biome-ignore lint/suspicious/noExplicitAny: test introspection
-		const img = (history[0] as any).userInputMessage.images[0];
-		expect(img.source.bytes).toBe(PNG_B64);
-	});
-
-	test("no images is a no-op", () => {
-		const history = [{ userInputMessage: { content: "hi" } }];
-		const result = dedupKiroHistoryImages(history, confirmed());
-		expect(result.stripped.size).toBe(0);
-		expect(result.present).toEqual([]);
 	});
 });
 

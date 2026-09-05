@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../../../../db";
 import { narrators } from "../../../../db/schema";
-import { KiroMcpClient } from "../../../kiro/mcp-client";
 import type { ExecutionBackend } from "../../execution/backend";
 import { targetPathSemantics } from "../../execution/path-semantics";
 import type { AgentConfig, ToolContext, ToolDefinition } from "../../types";
@@ -1102,27 +1101,6 @@ describe("Terminal", () => {
 	test("abortableSleep resolves true when timer completes", async () => {
 		const completed = await abortableSleep(20, new AbortController().signal);
 		expect(completed).toBe(true);
-	});
-});
-
-describe("Kiro MCP", () => {
-	test("pre-aborted signal stops before request", async () => {
-		let acquiredContext = false;
-		const fakeTokenManager = {
-			maxRetries: 1,
-			acquireContext: async () => {
-				acquiredContext = true;
-				throw new Error("should not acquire context after abort");
-			},
-		} as unknown as ConstructorParameters<typeof KiroMcpClient>[0];
-		const client = new KiroMcpClient(fakeTokenManager);
-		const ac = new AbortController();
-		ac.abort();
-
-		await expect(client.callTool("web_search", { query: "hello" }, ac.signal)).rejects.toThrow(
-			"Aborted",
-		);
-		expect(acquiredContext).toBe(false);
 	});
 });
 

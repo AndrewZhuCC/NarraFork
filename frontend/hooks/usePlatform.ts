@@ -55,12 +55,10 @@ export type GatewayPlatform =
 	| "qqbot";
 
 export type ProviderCapabilityKey =
-	| "kiro"
 	| "openai"
 	| "anthropic"
 	| "nug"
 	| "codex"
-	| "cline"
 	| "gemini";
 
 type ChapterContainerRoute =

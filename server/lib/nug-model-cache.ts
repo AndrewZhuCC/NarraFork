@@ -6,7 +6,7 @@ import type { NUGProviderConfig } from "./settings/types";
 const cacheDir = getNarraforkHome();
 const cachePath = resolve(cacheDir, "nug-models-providers.json");
 
-export type NugChannelType = "kiro" | "codex" | "openai" | "anthropic" | string;
+export type NugChannelType = "codex" | "openai" | "anthropic" | string;
 
 export interface NugModelInfo extends Record<string, unknown> {
 	id: string;
@@ -58,7 +58,7 @@ const cachedModelsFetchedAtByProvider = new Map<string, number>();
 const cachedUsdRateByProvider = new Map<string, number>();
 const cachedCapabilitiesByProvider = new Map<string, string[]>();
 
-const knownChannelTypes = new Set(["kiro", "codex", "openai", "anthropic"]);
+const knownChannelTypes = new Set(["codex", "openai", "anthropic"]);
 
 function numericModelField(raw: Record<string, unknown>, keys: string[]): number | undefined {
 	for (const key of keys) {

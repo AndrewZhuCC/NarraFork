@@ -67,10 +67,10 @@ describe("credential usage totals", () => {
 
 	test("不同 provider 的同名 credentialId 不会串账", () => {
 		record({ provider: "codex", credentialId: "shared-id", inputTokens: 100 });
-		record({ provider: "kiro", credentialId: "shared-id", inputTokens: 700 });
+		record({ provider: "anthropic", credentialId: "shared-id", inputTokens: 700 });
 
 		expect(getCredentialUsageTotals("codex", "shared-id", 50, db).inputTokens).toBe(100);
-		expect(getCredentialUsageTotals("kiro", "shared-id", 50, db).inputTokens).toBe(700);
+		expect(getCredentialUsageTotals("anthropic", "shared-id", 50, db).inputTokens).toBe(700);
 	});
 
 	test("未定价请求被单独计数，成本标记为部分覆盖", () => {
@@ -203,7 +203,7 @@ describe("credential usage totals", () => {
 
 	test("listProviderCredentialTotals 只返回指定 provider", () => {
 		record({ provider: "codex", credentialId: "c1" });
-		record({ provider: "kiro", credentialId: "k1" });
+		record({ provider: "anthropic", credentialId: "k1" });
 
 		const codexEntries = listProviderCredentialTotals("codex", 200, db);
 		expect(codexEntries.map((e) => e.credentialId)).toEqual(["c1"]);

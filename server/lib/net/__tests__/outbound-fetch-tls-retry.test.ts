@@ -34,7 +34,7 @@ async function startHandshakeDroppingServer(): Promise<{
 	if (!address || typeof address === "string") throw new Error("Expected TCP address");
 	closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
 	return {
-		url: `https://127.0.0.1:${address.port}/v1/kiro/chat`,
+		url: `https://127.0.0.1:${address.port}/v1/chat`,
 		connections: () => connectionCount,
 	};
 }
@@ -65,7 +65,7 @@ async function startSelfSignedServer(): Promise<{ url: string; connections: () =
 	});
 	closers.push(() => server.stop(true));
 	return {
-		url: `https://127.0.0.1:${server.port}/v1/kiro/chat`,
+		url: `https://127.0.0.1:${server.port}/v1/chat`,
 		connections: () => connectionCount,
 	};
 }
@@ -166,7 +166,7 @@ describe("outbound fetch TLS handshake replay", () => {
 		closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())));
 
 		const response = await outboundFetch(
-			`https://127.0.0.1:${address.port}/v1/kiro/chat`,
+			`https://127.0.0.1:${address.port}/v1/chat`,
 			{ method: "POST", body: "{}" },
 			{ retryPolicy: "idempotent-only", tlsRejectUnauthorized: false },
 		);

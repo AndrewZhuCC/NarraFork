@@ -176,12 +176,6 @@ export type {
 	ScheduledTaskRunContext,
 	ScheduledTaskRunsPage,
 } from "./scheduled-tasks";
-export {
-	assertKiroChatRouteSupported,
-	getKiroChatRouteCapability,
-	guardedKiroStreamChat,
-	kiroStreamChat,
-} from "./streams";
 export type {
 	ApiEntity,
 	BaseContentBlock,
@@ -214,11 +208,6 @@ export type {
 	DatabaseTableKind,
 	DatabaseVacuumResult,
 	HookApiRecord,
-	KiroCredentialEntry,
-	KiroCredentialPatch,
-	KiroCredentialTier,
-	KiroStatusResponse,
-	KiroStatusSnapshot,
 	LearningAction,
 	LearningCategory,
 	LearningDoc,

@@ -150,7 +150,7 @@ request dump 回答的是「我们到底发了什么、上游回了什么」，�
 - **禁止使用 `npx`** — 可能解析到错误或缺失的包，始终使用 `bunx` 代替
 - **后端：** Hono v4 运行于 Bun.serve()，SQLite 通过 `bun:sqlite`，Drizzle ORM
 - **前端：** React 19 + Mantine v7（暗色主题，indigo 主色），TanStack Router（基于文件），TanStack React Query，@xyflow/react（图可视化），xterm.js（终端），react-i18next（国际化）
-- **AI：** 自定义 Agent Loop 架构（`server/lib/agent/`），支持多提供商：Anthropic API、OpenAI API、Kiro 适配器、Codex、NUG（统一网关）；MCP 集成通过 `@modelcontextprotocol/sdk`
+- **AI：** 自定义 Agent Loop 架构（`server/lib/agent/`），支持多提供商：Anthropic API、OpenAI API、Gemini、Codex、NUG（统一网关）；MCP 集成通过 `@modelcontextprotocol/sdk`
 - **校验：** Zod v4
 - **代码规范：** Biome v2（tab 缩进，100 字符行宽，推荐规则集）
 - **外部依赖：** git、可选 podman（容器）
@@ -195,10 +195,7 @@ server/
     stream-timeout.ts — 流超时处理
     project-db.ts   — 项目数据库工具
     codex-*.ts      — Codex 认证/管理/使用统计
-    kiro-adapter.ts — Kiro 适配器
-    kiro-workspace-telemetry.ts — Kiro 协议工作区遥测注入（NUG/Kiro 共用）
     agent/          — 自定义 AI Agent 框架（loop、多提供商、工具注册、19 个内置工具）
-    kiro/           — Kiro 平台集成（token 管理、多令牌管理、API 客户端、MCP 客户端、事件流解析）
     mcp/            — MCP 集成（manager、tool-bridge、transports）
   terminal/         — 终端运行时（PTY 抽象层、buffer 管理、dtach 支持）
   routes/           — Hono 路由组，挂载于 /api/*（31 个路由文件）
@@ -209,9 +206,8 @@ server/
 
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
-- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Kiro、Codex、NUG）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
-- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Kiro、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
-- **NUG 的 Kiro 渠道走 Anthropic delegate**（当网关支持时）：见下方「NUG Kiro 渠道的协议选择」。
+- **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Gemini、Codex、NUG）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Gemini、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
@@ -274,7 +270,7 @@ frontend/
   types/              — TypeScript 类型声明
 ```
 
-**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目（含图可视化）、章节、叙述者（含归档）、管理面板（providers/Kiro/终端）、例程、设置、搜索、登录、许可证。
+**路由结构：** `__root.tsx`（AppShell 布局）→ 仪表盘、项目（含图可视化）、章节、叙述者（含归档）、管理面板（providers/终端）、例程、设置、搜索、登录、许可证。
 
 **Vite 开发代理：** `/api/*` → `localhost:7779`，`/ws/*` → `ws://localhost:7779`。
 
@@ -302,72 +298,24 @@ frontend/
 - `/api/update` — 版本更新检查
 - `/api/project-db` — 项目数据库同步
 - `/api/git`、`/api/graph` — Git 操作和图数据
-- `/api/kiro`、`/api/openai`、`/api/codex`、`/api/anthropic`、`/api/nkp` — AI 提供商集成
+- `/api/openai`、`/api/codex`、`/api/anthropic`、`/api/gemini`、`/api/nug` — AI 提供商集成
 
 **WebSocket：** `/ws/narrator?token=`（订阅/取消订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
 
-## NUG Kiro 渠道的协议选择（Anthropic delegate vs 原生 CodeWhisperer）
+## Anthropic 历史构造的两处易错点
 
-NUG 网关为 Kiro 渠道提供了第二个入口 `POST /v1/kiro/messages`，双向都说 **Anthropic Messages 协议**。当网关支持时，`NugProvider` 的 kiro 分支复用现成的 `AnthropicProvider`（请求构造、SSE 解析、generate 全部继承），而不走 `server/lib/kiro/` 与 `shared/codewhisperer/` 的 CodeWhisperer 实现。
+`buildAnthropicHistory`（`server/lib/agent/anthropic-provider.ts`）有两处做错了不会报错、只会静默降低质量的地方：
 
-这是为了让本仓库最终能删掉全部 AWS CodeWhisperer 代码。**当前两条路径并存**，AWS 代码仍是老网关的回落路径，尚未删除。
+1. **尾部 `sys` 行必须提到当前轮**（`trailingUserText`）。Dynamic Spec 提醒、目标续跑这类注入若留在历史末尾，模型会当作背景而非「刚被问到的事」。做错**只表现为模型重视程度下降**，没有任何错误信号。
+   **只在 `officialApi: false` 时提取**：官方 API 路径把 `sys` 映射为 `role:"system"`（Claude Code 的刻意行为，本身已表达「常驻指令」），不可改写。
 
-### 端点选择：靠网关自报能力，不靠探测
-
-`GET /v1/models` 的响应新增 `capabilities: ["kiro.messages.v1"]`。`nug-model-cache` 缓存并持久化它（与 `modelHash` 同一套机制），`NugProvider.supportsKiroMessages()` 据此决定是否创建 delegate。
-
-三条方向性约定，每条错了都不会报错、只会静默走另一条链：
-
-- **字段缺失 = 老网关 = 走原生路径。** 这是唯一安全的零值方向：猜「支持」会打到一个不存在的端点。
-- **每次拉取目录都会写入 capabilities，包括字段缺失时**（此时清空缓存）。这样把网关镜像回滚后，客户端会停止认为它有该端点。
-- **能力名逐字匹配**，不做前缀匹配。`kiro.messages.v2` 不等于 `kiro.messages.v1`。能力名常量 `KIRO_MESSAGES_CAPABILITY` 与网关的 `gatewayCapabilities()` 无编译期关联，改名必须两侧同步，否则所有 Kiro 请求静默退回原生路径（仍然能用，所以没人会发现）。
-
-### 404 回落：复用 Codex 的 rebuild-history 重试
-
-目录与实际路由可能不一致（用户回滚了网关镜像，但客户端的目录缓存还是新的），所以第一次请求可能 404。此时**不能就地重试**：`params.history` 已经按 delegate 的 Anthropic 形状构造好了，原生路径会把它喂给 Kiro 请求构造器。
-
-做法是撤回该能力（后续每轮都走原生路径），然后抛 `CodexRebuildHistoryRetryError` 让外层从数据库重建历史再重试——与 Codex 配额切换复用同一机制，理由相同。
-
-判定刻意收窄，三个条件同时成立才算：kiro 渠道 + 已装 Anthropic delegate、**尚未产出任何事件**（流中 404 不是路由问题，重跑会重复已交付的输出）、状态码**恰好是 404**（403/401 说明端点存在但密钥不对，撤回能力会把认证失败伪装成协议降级）。
-
-### 两处必须在本侧补齐的缺口（不在 wire 上加字段）
-
-选 Anthropic 格式的代价是它并未解决 canonical 方案的前两个缺口，二者都在 `buildAnthropicHistory` 里补：
-
-1. **尾部 `sys` 行必须提到当前轮**（`trailingUserText`）。Dynamic Spec 提醒、目标续跑这类注入若留在历史末尾，模型会当作背景而非「刚被问到的事」。两条路径都会送达该文本，所以做错**只表现为模型重视程度下降**，没有任何错误信号。
-   **只在 `officialApi: false` 时提取**：官方 API 路径把 `sys` 映射为 `role:"system"`（Claude Code 的刻意行为，本身已表达「常驻指令」），不可改写。NUG delegate 恒为 `officialApi: false`，正好落在需要提取的一侧。
-
-2. **历史图片的 `imageId` 必须从磁盘还原。** 存储的消息只有 imageId，字节在上传者的目录下。`buildAnthropicHistory` 原本只读 text 块，**历史里的图片全部丢失**——追问一张早前的截图时，模型收到的请求里什么都没有。这是 anthropic 路径的既有缺陷（`openai-provider.ts:2928` 是另一条做对了的路径），修它顺带修好了直连 Anthropic 渠道，所以带了直连回归测试。
+2. **历史图片的 `imageId` 必须从磁盘还原。** 存储的消息只有 imageId，字节在上传者的目录下。该函数原本只读 text 块，**历史里的图片全部丢失**——追问一张早前的截图时，模型收到的请求里什么都没有（`openai-provider.ts` 是另一条做对了的路径）。
    失败一律跳过并记 WARN（文件被清理、读不出、owner 未知）：丢一张图不好，但为一张被清理的旧图让整轮失败更糟。
 
-### 图片去重的形状按 delegate 判定，不按渠道名
+## NUG 网关事件与图片去重
 
-`chat()` 里那个三路 `dedupHistory` 分派改为 `delegate instanceof AnthropicProvider`。按渠道名分派会让「kiro 渠道 + Anthropic delegate」这种组合去走 OpenAI 形状的遍历器，**找不到任何图片从而静默停用去重**，症状是每轮重传全部图片——看起来像网关问题。
-
-### 会话身份必须靠 `X-Conversation-ID` 头带过去
-
-Anthropic Messages 协议**没有会话 id 字段**，而网关的 `extractConversationID` 只认 header 或 `conversation_id`/`conversationId`/`conversationState.conversationId` 这些 body 字段——纯 Anthropic 请求一个都没有。因此 delegate 必须显式发 `X-Conversation-ID`（`setSendConversationIdHeader(true)`，仅 chat 路径，仅 NUG kiro delegate 打开）。
-
-该头默认关闭，因为它是 NUG 私有头，对官方 Anthropic API 和第三方兼容端点都无意义。
-
-**漏掉它不会报错**：网关侧会 fallback 生成一个 UUID，请求照样成功（完整历史每轮都在 body 里，不丢上下文），代价只是失去凭据粘性——同一会话的每一轮可能落到不同上游凭据。这种损失没有任何信号，所以测试断言的是**真实 outgoing 请求的头**，而不是 provider 上的标志位；后者被设置但没序列化时，弱断言仍会通过。
-
-### gateway 事件
-
-`meteringEvent` / `contextUsageEvent` 由 NUG 用自有事件名下发（Anthropic 协议无对应字段，且塞进 `usage` token 计数会让客户端上报一个它从未收到的测量值）。它们在 `shared/codewhisperer/gateway-events.ts` 里解析——该模块不含任何 Kiro 知识，只是多两个名字，所以它可以留下而 CodeWhisperer 解析器可以删。
-
-`AnthropicProvider` 的 SSE 循环**已有泛化的 gateway 事件短路**（走 `isGatewayEventType`），因此新增两个名字无需改动它；`anthropic-nug-gateway-events.test.ts` 用真实混流验证了这一点，而不是假定。
-
-**token 计数恒为 0 且不是测量值**：Kiro 报 credit 与上下文占比、从不报 token。narrafork 会把 0 当真实测量（零成本请求 + prompt 为空的上下文余量），所以真实用量只走 metering 事件。
-
-### 尚未做的事（删除 AWS 代码的两个阻塞前置）
-
-删掉 `shared/codewhisperer/protocol.ts` 等约 4100 行之前，必须先定两件事：
-
-1. **内置 `KiroProvider`（直连 AWS，不经 NUG）的存废。** 只要它还在，`event-stream-parser.ts` 与 `protocol.ts` 就不能删。「不留 aws 代码」等价于「下线内置 KiroProvider，所有 Kiro 流量必须经 NUG」——这是产品决定。
-2. **`kiro-external` 插件**打包了 `shared/codewhisperer/` 的转换器，删除会直接破坏它。
-
-`server/lib/kiro/mcp-client.ts` 支撑的 `kiro:local` 搜索通道同样受第 1 条影响（NUG 侧有 `/v1/mcp/search` 可替换，但那是另一条链）。
+- **gateway 事件**：NUG 用自有事件名下发排队状态、配额余额、模型目录与图片缓存确认，在 `shared/agent-protocol/gateway-events.ts` 里解析。`AnthropicProvider` / `OpenAIProvider` 的 SSE 循环有泛化的 gateway 事件短路（走 `isGatewayEventType`），新增事件名无需改动它们。
+- **图片去重的形状按 delegate 判定，不按渠道名**：`chat()` 里的 `dedupHistory` 分派用 `delegate instanceof AnthropicProvider` 而非渠道名。按渠道名分派会让某些组合走错形状的遍历器，**找不到任何图片从而静默停用去重**，症状是每轮重传全部图片——看起来像网关问题。
 
 ## 代码风格
 

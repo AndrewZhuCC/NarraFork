@@ -1,4 +1,4 @@
-import type { ChatParams as ProtocolChatParams } from "@shared/codewhisperer/chat-params";
+import type { ChatParams as ProtocolChatParams } from "@shared/agent-protocol/chat-params";
 import type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -10,13 +10,11 @@ import type {
 	ProviderTextCitation,
 	ReasoningProviderMetadata,
 	WebSearchAction,
-} from "@shared/codewhisperer/types";
+} from "@shared/agent-protocol/types";
 import { TUTORIAL_PROVIDER_PREFIX } from "@shared/tutorial/lessons";
-import { isKiroAvailable } from "../kiro-adapter";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
-	getClineProviderConfig,
 	getGeminiProviderConfig,
 	getNugProviderConfig,
 	getOpenaiProviderConfig,
@@ -27,24 +25,17 @@ import {
 } from "../settings";
 import type { UsageData } from "../usage-tracking";
 import { AnthropicProvider } from "./anthropic-provider";
-import { ClineProvider } from "./cline-provider";
 import { CodexProvider } from "./codex-provider";
 import { GeminiInteractionsProvider } from "./gemini-interactions-provider";
 import { GeminiProvider } from "./gemini-provider";
-import { KiroProvider } from "./kiro-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
 import { TutorialProvider } from "./tutorial-provider";
 
-function isKiroProviderDisabled(): boolean {
-	if (process.env.NARRAFORK_DISABLE_KIRO_PROVIDER === "1") return true;
-	return (settings.agent?.disabledProviders ?? []).includes("kiro");
-}
-
 // === Provider stream protocol types ===
 //
-// Canonical definitions live in `@shared/codewhisperer/types` so the protocol
+// Canonical definitions live in `@shared/agent-protocol/types` so the protocol
 // layer and bundled plugin code can use them without importing anything under
 // `server/`. Re-exported here to keep existing host import paths working.
 
@@ -66,7 +57,7 @@ export type {
 /**
  * Full host-side chat parameters.
  *
- * Extends the protocol-layer subset (`@shared/codewhisperer/chat-params`) with
+ * Extends the protocol-layer subset (`@shared/agent-protocol/chat-params`) with
  * the host runtime concerns — abort signal, request dump collector, callbacks —
  * that the shared request builder never reads. Keeping the `extends` explicit
  * means the shared subset cannot drift away from what the host actually passes.
@@ -78,7 +69,7 @@ export interface ChatParams extends ProtocolChatParams {
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
-	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or effort (Kiro; "max" is Kiro-only) */
+	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
 	serviceTier?: string;
@@ -145,7 +136,7 @@ export interface ProviderAdapter {
 
 	/**
 	 * True when this provider can leak XML tool calls (`<invoke>...</invoke>`) into the
-	 * assistant text stream instead of using native tool-use fields (Kiro/NUG). The
+	 * assistant text stream instead of using native tool-use fields (some gateways). The
 	 * agent loop uses this to always collect a bounded raw dump so leaked-tool diagnostics
 	 * have downloadable SSE data, and to run the post-turn stateless recovery safety net.
 	 */
@@ -158,9 +149,9 @@ export interface ProviderAdapter {
 	 * Stable identity ("provider:channel") of the upstream this provider is
 	 * currently routed to, used to gate thinking-signature replay across
 	 * servers. Returns `undefined` for providers that never mint Anthropic-style
-	 * signatures (openai/codex/cline) — such blocks carry no signature so there
+	 * signatures (openai/codex) — such blocks carry no signature so there
 	 * is nothing to gate. For NUG this reflects the active channel (e.g.
-	 * `nug:antigravity` vs `nug:kiro`), which is only known after
+	 * `nug:antigravity` vs `nug:channel-name`), which is only known after
 	 * `prepareForModel`/`buildHistory` has resolved the model.
 	 */
 	getActiveReasoningSource?(): string | undefined;
@@ -289,10 +280,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 		return new TutorialProvider();
 	}
 
-	if (provider === "kiro") {
-		if (isKiroProviderDisabled()) return null;
-		return new KiroProvider();
-	}
 	if (provider === "codex") {
 		return new CodexProvider({
 			useWebSocket: settings.codex?.useWebSocket ?? true,
@@ -314,11 +301,6 @@ function createProviderByName(provider: string): ProviderAdapter | null {
 	const openaiConfig = getOpenaiProviderConfig(provider);
 	if (openaiConfig) {
 		return new OpenAIProvider(openaiConfig);
-	}
-
-	const clineConfig = getClineProviderConfig(provider);
-	if (clineConfig) {
-		return new ClineProvider(clineConfig);
 	}
 
 	const geminiConfig = getGeminiProviderConfig(provider);
@@ -351,10 +333,6 @@ function defaultModelForProvider(provider: string): string | null {
 		return normalized ?? "codex:gpt-5.5";
 	}
 
-	if (provider === "kiro") {
-		return "kiro:claude-sonnet-4.5";
-	}
-
 	const openaiDefault = prefixProviderModel(
 		provider,
 		getOpenaiProviderConfig(provider)?.defaultModel,
@@ -369,12 +347,6 @@ function defaultModelForProvider(provider: string): string | null {
 
 	const nugDefault = prefixProviderModel(provider, getNugProviderConfig(provider)?.defaultModel);
 	if (nugDefault) return nugDefault;
-
-	const clineDefault = prefixProviderModel(
-		provider,
-		getClineProviderConfig(provider)?.defaultModel,
-	);
-	if (clineDefault) return clineDefault;
 
 	const geminiDefault = prefixProviderModel(
 		provider,
@@ -446,22 +418,6 @@ export function resolveProviderAndModel(
 	const requestedModel = resolveEffectiveModel(model, stickyProvider);
 	const requestedProvider = resolveProvider(requestedModel);
 
-	if (requestedProvider === "kiro") {
-		if (isKiroProviderDisabled()) {
-			throw new Error(
-				"Kiro provider is disabled. Please choose a different model or enable Kiro in settings.",
-			);
-		}
-
-		if (!isKiroAvailable()) {
-			throw new Error(
-				"Kiro provider is not available. Please check your Kiro connection and try again.",
-			);
-		}
-
-		return buildResolution(requestedProvider, requestedModel, "kiro", new KiroProvider());
-	}
-
 	const explicit = createProviderByName(requestedProvider);
 	if (explicit) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, explicit);
@@ -469,7 +425,7 @@ export function resolveProviderAndModel(
 
 	// Executable-plugin providers are resolved only after every builtin and
 	// compatible-API provider has declined, so a plugin can never shadow a
-	// builtin prefix (anthropic/openai/nug/cline/gemini/codex/kiro).
+	// builtin prefix (anthropic/openai/nug/gemini/codex).
 	const external = externalProviderResolver?.(requestedProvider, requestedModel);
 	if (external) {
 		return buildResolution(requestedProvider, requestedModel, requestedProvider, external);
