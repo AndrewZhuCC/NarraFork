@@ -19,7 +19,9 @@ const originalSummary = narratorContext.generateCompactSummary;
 const agent = await import("../../lib/agent");
 // Observe both builders without replacing their implementation or inputs.
 const historyBuild = spyOn(agent, "buildHistory");
-const { runCustomCompact } = await import("../narrator-compact");
+const { runCustomCompact, retryFailedCompact, __setCompactWatchdogTimingsForTests } = await import(
+	"../narrator-compact"
+);
 
 const now = "2026-09-06T00:00:00.000Z";
 const cipher = (round: number) => `opaque/+==\n密文-${round}`;
@@ -319,21 +321,208 @@ test("predecessor without new messages does not request or persist another compa
 	]);
 });
 
-test("remote request failure preserves the existing local-summary input", async () => {
-	// Unit 1 only locks the old behavior; this unsafe downgrade belongs to unit 2,
-	// and passing this assertion is not a claim that the fallback is safe.
-	await seedNarrator();
-	await message("checkpoint", 1, marker(7), true);
-	await message("new", 2);
-	await message("boundary", 3);
-	globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
-		requests.push(JSON.parse(String(init?.body)));
-		return new Response("test failure", { status: 400 });
-	}) as typeof fetch;
-	expect(await runCustomCompact("n1", "en", "boundary", { mode: "blocking" })).toBe(true);
-	expect(requests[0].input.filter((entry) => entry.type === "compaction")).toEqual([item(7)]);
-	expect(localInputs).toEqual([["new"]]);
-});
+for (const bounded of [true, false]) {
+	for (const failure of ["http", "network", "cancel", "timeout", "http-background"] as const) {
+		if (!bounded && failure === "http-background") continue;
+		test(`${bounded ? "primary bounded" : "subagent unbounded"} ${failure} preserves checkpoint and can retry`, async () => {
+			await seedNarrator();
+			const owner = bounded ? "n1" : "child";
+			if (!bounded) await seedNarrator(owner, "n1");
+			const parent = bounded ? null : "child-task";
+			await message("checkpoint", 1, marker(7), true, owner);
+			await message("new-user", 2, undefined, false, owner, "user", parent);
+			await message("new-reply", 3, undefined, false, owner, "assistant", parent);
+			if (bounded) {
+				await message("boundary", 4, undefined, false, owner, "user", parent);
+				await message("tail", 5, undefined, false, owner, "assistant", parent);
+			}
+			await db
+				.update(narrators)
+				.set({
+					contextSummary: "old summary",
+					pruneBoundaryMessageId: "new-user",
+					prunedPercent: 12,
+				})
+				.where(eq(narrators.id, owner));
+			const beforeRows = await db.select().from(narratorMessages);
+			const beforeRefs = await db.select().from(narratorMessageRefs);
+			const successFetch = globalThis.fetch;
+			const controller = new AbortController();
+			globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+				requests.push(JSON.parse(String(init?.body)));
+				if (failure === "http" || failure === "http-background")
+					return new Response("test failure", { status: 400 });
+				if (failure === "network") throw new TypeError("network failure");
+				return new Promise<Response>((_resolve, reject) => {
+					init?.signal?.addEventListener(
+						"abort",
+						() => reject(new DOMException("Aborted", "AbortError")),
+						{ once: true },
+					);
+					if (failure === "cancel") controller.abort();
+				});
+			}) as typeof fetch;
+			if (failure === "timeout")
+				__setCompactWatchdogTimingsForTests({ stallMs: 30, maxTotalMs: 1000 });
+			try {
+				const run = runCustomCompact(owner, "en", bounded ? "boundary" : undefined, {
+					mode: failure === "http-background" ? "background" : "blocking",
+					signal: controller.signal,
+				});
+				await expect(run).rejects.toThrow(
+					failure === "cancel"
+						? "Aborted"
+						: failure === "timeout"
+							? "progress"
+							: failure === "network"
+								? "Network request failed"
+								: "test failure",
+				);
+			} finally {
+				__setCompactWatchdogTimingsForTests(null);
+			}
+			// Assert the database, not just the return value: failed markers are not boundaries.
+			expect(localInputs).toEqual([]);
+			const rows = await db.select().from(narratorMessages);
+			const refs = await db.select().from(narratorMessageRefs);
+			for (const row of beforeRows) expect(rows.find((entry) => entry.id === row.id)).toEqual(row);
+			for (const ref of beforeRefs) {
+				const after = refs.find((entry) => entry.id === ref.id);
+				if (!after) throw new Error(`Missing original ref: ${ref.id}`);
+				// Inserting a bounded marker legitimately shifts tail seq numbers.
+				expect(after).toEqual({ ...ref, seq: after?.seq });
+				if (!["boundary", "tail"].includes(ref.messageId)) expect(after?.seq).toBe(ref.seq);
+			}
+			expect(refs.filter((ref) => ref.isCompact).map((ref) => ref.messageId)).toEqual([
+				"checkpoint",
+			]);
+			const state = await db.query.narrators.findFirst({ where: eq(narrators.id, owner) });
+			expect(state?.contextSummary).toBe("old summary");
+			expect(state?.pruneBoundaryMessageId).toBe("new-user");
+			expect(state?.prunedPercent).toBe(12);
+			const history = await narratorService.getModelHistorySinceLastCompact(owner);
+			const built = await agent.buildHistory(
+				history.map((entry) => ({ ...entry, parentToolUseId: null })),
+				"test-relay:gpt-5.3-codex",
+				"openai",
+				owner,
+			);
+			expect(
+				built.history.filter((entry) => (entry as Record<string, unknown>).type === "compaction"),
+			).toEqual([item(7)]);
+			expect(JSON.stringify(built.history)).toContain("new-reply");
+			const failed = rows.find((row) => !beforeRows.some((old) => old.id === row.id));
+			if (failure === "cancel") expect(failed).toBeUndefined();
+			else {
+				expect(Array.isArray(failed?.contentJson) ? failed.contentJson[0] : null).toMatchObject({
+					status: "failed",
+				});
+				if (failure === "timeout")
+					expect(JSON.stringify(failed?.contentJson)).toContain("progress");
+			}
+			globalThis.fetch = successFetch;
+			if (failed) {
+				expect((await narratorService.getCompactSummary(owner, failed.id)).canRetry).toBe(true);
+				const retry = await retryFailedCompact(owner, "en", failed.id);
+				expect(await retry.promise).toBe(true);
+			} else
+				expect(
+					await runCustomCompact(owner, "en", bounded ? "boundary" : undefined, {
+						mode: "blocking",
+					}),
+				).toBe(true);
+			const retriedHistory = await narratorService.getModelHistorySinceLastCompact(owner);
+			expect(retriedHistory[0].contentJson).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						status: "compacted",
+						remoteCompact: expect.objectContaining({ items: [item(2)] }),
+					}),
+				]),
+			);
+			expect(requests).toHaveLength(2);
+			for (const request of requests) {
+				expect(request.input.filter((entry) => entry.type === "compaction")).toEqual([item(7)]);
+				const text = JSON.stringify(request.input);
+				expect(text).toContain("new-user");
+				expect(text).toContain("new-reply");
+				expect(text).not.toContain("boundary");
+				expect(text).not.toContain("tail");
+			}
+			expect(localInputs).toEqual([]);
+		});
+	}
+}
+
+for (const boundary of ["first", "local", "clear"] as const) {
+	for (const bounded of [true, false]) {
+		test(`${boundary} ${bounded ? "bounded" : "unbounded"} HTTP failure safely falls back`, async () => {
+			await seedNarrator();
+			if (boundary !== "first") {
+				await message("old-remote", 1, marker(7), true);
+				await message(
+					"local-boundary",
+					2,
+					{
+						type: "compact",
+						status: "compacted",
+						summary: boundary === "local" ? "local summary" : "",
+					},
+					true,
+				);
+			}
+			await message("new", 3);
+			if (bounded) await message("boundary", 4);
+			globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+				requests.push(JSON.parse(String(init?.body)));
+				return new Response("test failure", { status: 400 });
+			}) as typeof fetch;
+			expect(
+				await runCustomCompact("n1", "en", bounded ? "boundary" : undefined, { mode: "blocking" }),
+			).toBe(true);
+			expect(requests[0].input.filter((entry) => entry.type === "compaction")).toEqual([]);
+			expect(localInputs).toEqual([["new"]]);
+		});
+	}
+}
+
+for (const cancel of [true, false]) {
+	test(`first compact ${cancel ? "cancellation" : "timeout"} never calls local summary`, async () => {
+		await seedNarrator();
+		await message("new", 1);
+		const controller = new AbortController();
+		globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(new Error("transport closed")), {
+					once: true,
+				});
+				if (cancel) controller.abort();
+			});
+		}) as typeof fetch;
+		if (!cancel) __setCompactWatchdogTimingsForTests({ stallMs: 30, maxTotalMs: 1000 });
+		try {
+			await expect(
+				runCustomCompact("n1", "en", undefined, { mode: "blocking", signal: controller.signal }),
+			).rejects.toThrow(cancel ? "Aborted" : "progress");
+		} finally {
+			__setCompactWatchdogTimingsForTests(null);
+		}
+		expect(localInputs).toEqual([]);
+		expect((await db.select().from(narratorMessageRefs)).filter((ref) => ref.isCompact)).toEqual(
+			[],
+		);
+		const history = await narratorService.getModelHistorySinceLastCompact("n1");
+		expect(history.map((row) => row.id)).toContain("new");
+		// Failure status may append a system reminder, but not the failed marker.
+		expect(
+			history.some(
+				(row) =>
+					Array.isArray(row.contentJson) &&
+					row.contentJson.some((block) => block.type === "compact"),
+			),
+		).toBe(false);
+	});
+}
 
 for (const mode of ["disabled", "non-codex"] as const) {
 	test(`${mode} compact keeps the existing local-summary input`, async () => {

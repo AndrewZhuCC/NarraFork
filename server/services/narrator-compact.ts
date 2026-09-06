@@ -1051,6 +1051,30 @@ async function doRunCustomCompact({
 					...summarizeCodexRemoteItems(remote.items),
 				});
 			} catch (remoteError) {
+				if (signal?.aborted) throw compactAbortError();
+				if (isCompactAbortError(remoteError)) throw remoteError;
+				// Local summaries cannot read the previous encrypted checkpoint. Let the
+				// existing failure/CAS path retain it instead of replacing it with only
+				// the new messages. Unbounded runs keep that checkpoint in messages.
+				const hasEncryptedPredecessor = (
+					remotePredecessor ? [remotePredecessor, ...messages] : messages
+				).some(
+					(message) =>
+						message.role === "system" &&
+						Array.isArray(message.contentJson) &&
+						message.contentJson.some((value) => {
+							const block = parseCompactMessageBlock(value);
+							const remote = block?.remoteCompact;
+							return (
+								block?.status === "compacted" &&
+								remote?.provider === "codex" &&
+								remote.version === 1 &&
+								Array.isArray(remote.items) &&
+								summarizeCodexRemoteItems(remote.items).encryptedCount > 0
+							);
+						}),
+				);
+				if (hasEncryptedPredecessor) throw remoteError;
 				logger.warn("Codex remote compact failed; falling back to local compact", {
 					narratorId,
 					error: truncateCompactError(remoteError),
