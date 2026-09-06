@@ -141,6 +141,7 @@ export interface GenerateMetaResult {
 
 export interface RemoteCompactResult {
 	items: unknown[];
+	retainedUsers?: import("@shared/compact-message").CodexRetainedUserMessage[];
 	summary?: string;
 	usage?: UsageData | null;
 }

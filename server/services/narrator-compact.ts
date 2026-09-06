@@ -19,7 +19,7 @@ import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, settings } from "../lib/settings";
+import { getAutoCompactKeepPairs, getSettingsRevision, settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
@@ -28,6 +28,7 @@ import { narratorService } from "./narrator-service";
 import type { CompactLock, CompactLockResult, CompactMode } from "./narrator-session-state";
 import {
 	activeNarrators,
+	activeSubagentSettings,
 	compactLocks,
 	markActiveHistoryCompactPending,
 	pruneLocks,
@@ -882,10 +883,27 @@ async function doRunCustomCompact({
 
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
-		columns: { pruneBoundaryMessageId: true, variant: true, model: true },
+		columns: { pruneBoundaryMessageId: true, variant: true, model: true, reasoningEffort: true },
 	});
-	const remoteModel = narrator?.model?.trim() || "";
-	const resolvedCompact = remoteModel ? resolveProviderAndModel(remoteModel) : null;
+	const active = activeNarrators.get(narratorId);
+	const runtime = active?.alive ? active : activeSubagentSettings.get(narratorId);
+	// Match the next normal request: use live settings, but re-resolve a primary's
+	// raw references when its cached settings revision has fallen behind.
+	const staleRuntime = active?.alive && active._settingsRevision !== getSettingsRevision();
+	const remoteModel = staleRuntime
+		? (active._modelRef ?? narrator?.model)
+		: runtime?.model || narrator?.model;
+	const remoteEffort = staleRuntime
+		? active._reasoningEffortRef
+		: runtime
+			? runtime.reasoningEffort
+			: narrator?.reasoningEffort;
+	const resolvedCompact = narrator
+		? resolveProviderAndModel(
+				remoteModel?.trim() || undefined,
+				active?.alive ? active.provider : undefined,
+			)
+		: null;
 	let messages = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId, {
 				includeRemoteCompact:
@@ -1036,11 +1054,13 @@ async function doRunCustomCompact({
 					conversationId: narratorId,
 					trailingToolResults: built.trailingToolResults,
 					onActivity: hooks?.beat,
+					reasoningEffort: remoteEffort ?? undefined,
 				});
 				remoteCompact = {
 					provider: "codex",
 					version: 1,
 					items: remote.items,
+					...(remote.retainedUsers?.length ? { retainedUsers: remote.retainedUsers } : {}),
 					model: resolvedCompact.model,
 					completedAt: new Date().toISOString(),
 					source: "remote",

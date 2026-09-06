@@ -654,6 +654,158 @@ describe("remote compact completion and activity", () => {
 	});
 });
 
+describe("Codex retained user originals", () => {
+	const provider = new OpenAIProvider({
+		id: "relay",
+		name: "relay",
+		prefix: "relay",
+		apiKey: "test",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "gpt-5.3-codex",
+		apiMode: "codex",
+		codexRemoteCompact: true,
+	});
+	const message = (id: string, role: DbMessage["role"], text: string): DbMessage => ({
+		id,
+		role,
+		narratorId: "owner",
+		contentJson: [{ type: "text", text }],
+		contentText: text,
+		parentToolUseId: null,
+		messageUuid: null,
+	});
+	async function compact(messages: DbMessage[]) {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () =>
+			Response.json({
+				status: "completed",
+				output: [{ type: "compaction", id: "cmp_new", encrypted_content: "opaque" }],
+			})) as unknown as typeof fetch;
+		try {
+			const built = await provider.buildHistory(messages, "relay:gpt-5.3-codex");
+			return await provider.compactRemote(built.history, "relay:gpt-5.3-codex");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	test("retains real users, not synthetic user-role sys messages or assistants", async () => {
+		const result = await compact([
+			message("u1", "user", "keep this exact requirement"),
+			message("s1", "sys", "system reminder, not a user original"),
+			message("a1", "assistant", "assistant answer"),
+			message("u2", "user", "not sent: trailing user"),
+		]);
+		expect(result.retainedUsers).toEqual([
+			{
+				id: "u1",
+				narratorId: "owner",
+				contentJson: [{ type: "text", text: "keep this exact requirement" }],
+			},
+		]);
+		expect(result.items).toEqual([
+			{ type: "compaction", id: "cmp_new", encrypted_content: "opaque" },
+		]);
+	});
+
+	test("64K budget keeps newest messages, middle-truncates the boundary and preserves order", async () => {
+		const result = await compact([
+			message("old", "user", "must disappear"),
+			message("boundary", "user", "A".repeat(160_000)),
+			message("new", "user", "B".repeat(160_000)),
+			message("reply", "assistant", "done"),
+		]);
+		expect(result.retainedUsers?.map((m) => m.id)).toEqual(["boundary", "new"]);
+		expect(result.retainedUsers?.[0].contentJson).toEqual([
+			{
+				type: "text",
+				text: `${"A".repeat(48_000)}…16000 tokens truncated…${"A".repeat(48_000)}`,
+			},
+		]);
+		expect(result.retainedUsers?.[1].contentJson).toEqual([
+			{ type: "text", text: "B".repeat(160_000) },
+		]);
+	});
+
+	test("storage cap bounds many tiny originals without changing their newest-first selection", async () => {
+		const result = await compact([
+			...Array.from({ length: 7000 }, (_, i) => message(`u${i}`, "user", "x")),
+			message("reply", "assistant", "ok"),
+		]);
+		expect(Buffer.byteLength(JSON.stringify(result.retainedUsers))).toBeLessThanOrEqual(512 * 1024);
+		expect(result.retainedUsers?.length).toBeLessThan(7000);
+		expect(result.retainedUsers?.at(-1)?.id).toBe("u6999");
+	});
+
+	test("UTF-8 budget does not split Chinese or emoji code points", async () => {
+		const result = await compact([
+			message("unicode", "user", "中🙂".repeat(50_000)),
+			message("reply", "assistant", "done"),
+		]);
+		const content = result.retainedUsers?.[0].contentJson[0];
+		expect(content?.type).toBe("text");
+		if (content?.type !== "text") throw new Error("missing retained text");
+		expect(content.text).not.toContain("�");
+		expect(content.text).toContain("…23500 tokens truncated…");
+		expect(content.text.startsWith("中🙂")).toBe(true);
+		expect(content.text.endsWith("中🙂")).toBe(true);
+	});
+
+	test("images stay references, replay with their upload owner, and consume the image budget", async () => {
+		const { saveUploadedImage, imageRefToContentBlock, deleteUploadedImage } = await import(
+			"../../uploads"
+		);
+		const { restoreCompactUsers } = await import("../openai-provider");
+		const bytes = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+			"base64",
+		);
+		const upload = await saveUploadedImage(
+			"image-owner",
+			new File([bytes], "pixel.png", { type: "image/png" }),
+		);
+		const imageMessage = message("image", "user", "caption");
+		imageMessage.contentJson = [{ type: "text", text: "caption" }, imageRefToContentBlock(upload)];
+		try {
+			const result = await compact([imageMessage, message("reply", "assistant", "ok")]);
+			expect(JSON.stringify(result.retainedUsers)).not.toContain("base64");
+			expect(result.retainedUsers?.[0].contentJson[1]).toMatchObject({
+				type: "image",
+				uploadNarratorId: "image-owner",
+				imageId: upload.imageId,
+			});
+			const replay = await restoreCompactUsers(
+				JSON.parse(JSON.stringify(result.retainedUsers)),
+				"fork-owner",
+			);
+			expect(JSON.stringify(replay)).toContain("data:image/png;base64,");
+			expect(JSON.stringify(replay)).not.toContain("uploadNarratorId");
+			const budgeted = await compact([
+				imageMessage,
+				message("new", "user", "B".repeat(63_000 * 4)),
+				message("reply", "assistant", "ok"),
+			]);
+			expect(budgeted.retainedUsers?.map((m) => m.id)).toEqual(["new"]);
+			deleteUploadedImage("image-owner", upload.imageId);
+			const missing = await restoreCompactUsers(result.retainedUsers ?? [], "fork-owner");
+			expect(JSON.stringify(missing)).toContain("caption");
+			expect(JSON.stringify(missing)).not.toContain("input_image");
+		} finally {
+			deleteUploadedImage("image-owner", upload.imageId);
+		}
+	});
+
+	test("repeated text in separate user messages is not deduplicated by content", async () => {
+		const result = await compact([
+			message("u1", "user", "again"),
+			message("a1", "assistant", "ok"),
+			message("u2", "user", "again"),
+			message("a2", "assistant", "ok"),
+		]);
+		expect(result.retainedUsers?.map((m) => m.id)).toEqual(["u1", "u2"]);
+	});
+});
+
 describe("prepareCodexCompactInput", () => {
 	test("pairs a trailing function_call_output and keeps one trigger last", () => {
 		const prepared = prepareCodexCompactInput(

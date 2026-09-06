@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { signatureSourcesCompatible } from "@shared/codewhisperer/reasoning-source";
 import { outputToText } from "@shared/codewhisperer/tool-output";
+import type { CodexRetainedUserMessage } from "@shared/compact-message";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
@@ -623,7 +624,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			trailingToolResults?: unknown[];
 			onActivity?: () => void;
 		},
-	): Promise<{ items: unknown[] }> {
+	): Promise<{ items: unknown[]; retainedUsers?: CodexRetainedUserMessage[] }> {
 		if (this.apiMode !== "codex") {
 			throw new Error("Remote compact is only supported for Codex providers");
 		}
@@ -668,7 +669,9 @@ export class OpenAIProvider implements ProviderAdapter {
 			body: JSON.stringify(body),
 			signal: options?.signal,
 		});
-		return { items: await readCompactOutputItems(response, options) };
+		const items = await readCompactOutputItems(response, options);
+		const retainedUsers = retainCompactUsers(input);
+		return { items, ...(retainedUsers.length ? { retainedUsers } : {}) };
 	}
 
 	/**
@@ -3393,6 +3396,84 @@ function expandResponsesToolResultMessage(
 	return items;
 }
 
+// Local provenance never goes on the wire. Weak keys live only as long as built history.
+const compactUserSources = new WeakMap<object, CodexRetainedUserMessage>();
+
+function retainCompactUsers(input: unknown[]): CodexRetainedUserMessage[] {
+	let remaining = 64_000;
+	let storedBytes = 2; // JSON array brackets.
+	const retained: CodexRetainedUserMessage[] = [];
+	for (let i = input.length - 1; i >= 0 && remaining > 0; i--) {
+		const item = input[i];
+		if (!isRecord(item)) continue;
+		const source = compactUserSources.get(item);
+		if (!source) continue;
+		const cost = (part: CodexRetainedUserMessage["contentJson"][number]) =>
+			part.type === "text" ? Math.ceil(Buffer.byteLength(part.text) / 4) : Math.ceil(7373 / 4);
+		const tokens = Math.max(
+			1,
+			source.contentJson.reduce((sum, part) => sum + cost(part), 0),
+		);
+		let content = source.contentJson;
+		if (tokens > remaining) {
+			const hasImages = content.some((part) => part.type === "image");
+			const parts = hasImages ? content.toReversed() : content;
+			content = [];
+			for (const part of parts) {
+				if (!remaining) break;
+				const tokens = cost(part);
+				if (tokens <= remaining) {
+					content.push(part);
+					remaining -= tokens;
+				} else if (part.type === "text") {
+					const bytes = Buffer.from(part.text);
+					const budget = remaining * 4;
+					let left = Math.floor(budget / 2);
+					let right = bytes.length - (budget - left);
+					while (left > 0 && (bytes[left] & 0xc0) === 0x80) left--;
+					while (right < bytes.length && (bytes[right] & 0xc0) === 0x80) right++;
+					content.push({
+						type: "text",
+						text: `${bytes.subarray(0, left).toString()}…${Math.ceil((bytes.length - budget) / 4)} tokens truncated…${bytes.subarray(right).toString()}`,
+					});
+					remaining = 0;
+				} else remaining = 0;
+			}
+			if (hasImages) content.reverse();
+			remaining = 0;
+		} else remaining -= tokens;
+		if (!content.length) continue;
+		const message = { ...source, contentJson: content };
+		// ponytail: a separate 512 KiB storage ceiling bounds JSON escaping and
+		// many tiny messages. If reached, omit older originals; the cipher still carries them.
+		storedBytes += Buffer.byteLength(JSON.stringify(message)) + (retained.length ? 1 : 0);
+		if (storedBytes > 512 * 1024) break;
+		retained.push(message);
+	}
+	return retained.reverse();
+}
+
+export async function restoreCompactUsers(
+	users: CodexRetainedUserMessage[],
+	narratorId?: string,
+): Promise<unknown[]> {
+	const result: unknown[] = [];
+	for (const user of users) {
+		const item = await buildResponsesUserMessageFromDbMessage(
+			{
+				...user,
+				role: "user",
+				contentText: null,
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+			narratorId,
+		);
+		if (item) result.push(item);
+	}
+	return result;
+}
+
 async function buildResponsesUserMessageFromDbMessage(
 	msg: DbMessage,
 	narratorId?: string,
@@ -3400,12 +3481,14 @@ async function buildResponsesUserMessageFromDbMessage(
 	const ownerNarratorId = msg.narratorId ?? narratorId;
 	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 	const content: OAIContentPart[] = [];
+	const retained: CodexRetainedUserMessage["contentJson"] = [];
 	let sawTextBlock = false;
 	for (const block of blocks as Array<Record<string, unknown>>) {
 		if (block.type === "text" && typeof block.text === "string") {
 			sawTextBlock = true;
 			if (block.text.length > 0) {
 				content.push({ type: "input_text", text: block.text });
+				retained.push({ type: "text", text: block.text });
 			}
 			continue;
 		}
@@ -3439,6 +3522,12 @@ async function buildResponsesUserMessageFromDbMessage(
 					type: "input_image",
 					image_url: `data:image/${mimeToFormat[effectiveMime] ?? "png"};base64,${result.base64}`,
 				});
+				retained.push({
+					type: "image",
+					imageId: block.imageId,
+					uploadNarratorId,
+					mediaType: effectiveMime,
+				});
 			} catch (error) {
 				logger.warn("Failed to rebuild Responses history image; skipping replay", {
 					narratorId,
@@ -3452,12 +3541,19 @@ async function buildResponsesUserMessageFromDbMessage(
 			}
 		}
 	}
-	if (content.length > 0) {
-		return { role: "user", content } as unknown as OAIMessage;
-	}
 	const fallbackText = msg.contentText || "";
-	if (fallbackText && !sawTextBlock) {
-		return buildResponsesUserMessage(fallbackText);
+	if (!content.length && fallbackText && !sawTextBlock) {
+		content.push({ type: "input_text", text: fallbackText });
+		retained.push({ type: "text", text: fallbackText });
+	}
+	if (content.length > 0) {
+		const item = { role: "user", content } as unknown as OAIMessage;
+		compactUserSources.set(item, {
+			id: msg.id,
+			narratorId: ownerNarratorId,
+			contentJson: retained,
+		});
+		return item;
 	}
 	return null;
 }

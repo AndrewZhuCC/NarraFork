@@ -30,7 +30,11 @@ const item = (round: number) => ({
 	id: `cmp_${round}`,
 	encrypted_content: cipher(round),
 });
-let requests: Array<{ input: Array<Record<string, unknown>> }> = [];
+let requests: Array<{
+	input: Array<Record<string, unknown>>;
+	model: string;
+	reasoning: { effort: string };
+}> = [];
 let localInputs: string[][] = [];
 
 async function seedNarrator(id = "n1", parentNarratorId?: string) {
@@ -128,6 +132,61 @@ afterAll(() => {
 	sqlite.close();
 });
 
+for (const model of [null, "", "   ", "__default__", "test-relay:gpt-5.3-codex"]) {
+	for (const effort of [null, "medium", "none"] as const) {
+		test(`remote model ${JSON.stringify(model)} and effort ${effort} match effective settings`, async () => {
+			await seedNarrator();
+			await db
+				.update(narrators)
+				.set({ model, reasoningEffort: effort })
+				.where(eq(narrators.id, "n1"));
+			await message("new", 1);
+			settings.agent.defaultModel = "test-relay:gpt-5.3-codex";
+			settings.agent.defaultReasoningEffort = "high";
+			expect(await runCustomCompact("n1", "en", undefined, { mode: "blocking" })).toBe(true);
+			expect(requests).toHaveLength(1);
+			expect(requests[0].model).toBe("gpt-5.3-codex");
+			expect(requests[0].reasoning.effort).toBe(effort ?? "high");
+			expect(localInputs).toEqual([]);
+		});
+	}
+}
+
+for (const kind of ["primary", "subagent", "stale-primary"] as const) {
+	test(`remote compact follows ${kind} runtime model and effort`, async () => {
+		const { activeNarrators, activeSubagentSettings } = await import("../narrator-session-state");
+		const { getSettingsRevision } = await import("../../lib/settings");
+		await seedNarrator();
+		await message("new", 1);
+		settings.agent.defaultModel = "test-relay:gpt-5.4";
+		settings.agent.defaultReasoningEffort = "high";
+		if (kind === "subagent") {
+			activeSubagentSettings.set("n1", { model: "test-relay:gpt-5.4", reasoningEffort: "low" });
+		} else {
+			activeNarrators.set("n1", {
+				narratorId: "n1",
+				alive: true,
+				model: kind === "stale-primary" ? "test-relay:gpt-5.3-codex" : "test-relay:gpt-5.4",
+				provider: "openai",
+				reasoningEffort: "low",
+				_modelRef: "__default__",
+				_reasoningEffortRef: "medium",
+				_settingsRevision: getSettingsRevision() - (kind === "stale-primary" ? 1 : 0),
+				_substatus: new Set(),
+				events: new (await import("node:events")).EventEmitter(),
+			} as import("../narrator-session-state").ActiveNarrator);
+		}
+		try {
+			expect(await runCustomCompact("n1", "en", undefined, { mode: "background" })).toBe(true);
+			expect(requests[0].model).toBe("gpt-5.4");
+			expect(requests[0].reasoning.effort).toBe(kind === "stale-primary" ? "medium" : "low");
+		} finally {
+			activeNarrators.delete("n1");
+			activeSubagentSettings.delete("n1");
+		}
+	});
+}
+
 test("second and third bounded compacts replay only the immediate encrypted predecessor", async () => {
 	await seedNarrator();
 	const pairs = ["first", "second", "third"].map((prefix) => [
@@ -158,8 +217,10 @@ test("second and third bounded compacts replay only the immediate encrypted pred
 		);
 		const text = JSON.stringify(input);
 		for (const included of pairs[round]) expect(text).toContain(included);
+		for (const [user] of pairs.slice(0, round)) expect(text.split(user)).toHaveLength(2);
 		for (const excluded of [...pairs.flat(), "boundary", "tail"].filter(
-			(value) => !pairs[round].includes(value),
+			(value) =>
+				!pairs[round].includes(value) && !pairs.slice(0, round).some(([user]) => user === value),
 		)) {
 			expect(text).not.toContain(excluded);
 		}
@@ -233,7 +294,7 @@ for (const bounded of [true, false]) {
 			expect(text).not.toContain("parent-secret");
 			expect(text).not.toContain("sibling-secret");
 			for (let previous = 0; previous < round; previous++) {
-				expect(text).not.toContain(`child-user-${previous}`);
+				expect(text.split(`child-user-${previous}`)).toHaveLength(2);
 				expect(text).not.toContain(`child-reply-${previous}`);
 			}
 		}
@@ -338,7 +399,25 @@ for (const bounded of [true, false]) {
 			const owner = bounded ? "n1" : "child";
 			if (!bounded) await seedNarrator(owner, "n1");
 			const parent = bounded ? null : "child-task";
-			await message("checkpoint", 1, marker(7), true, owner);
+			await message(
+				"checkpoint",
+				1,
+				{
+					...marker(7),
+					remoteCompact: {
+						...marker(7).remoteCompact,
+						retainedUsers: [
+							{
+								id: "old-user",
+								narratorId: owner,
+								contentJson: [{ type: "text", text: "retained requirement" }],
+							},
+						],
+					},
+				},
+				true,
+				owner,
+			);
 			await message("new-user", 2, undefined, false, owner, "user", parent);
 			await message("new-reply", 3, undefined, false, owner, "assistant", parent);
 			if (bounded) {
@@ -470,6 +549,7 @@ for (const bounded of [true, false]) {
 			for (const request of requests) {
 				expect(request.input.filter((entry) => entry.type === "compaction")).toEqual([item(7)]);
 				const text = JSON.stringify(request.input);
+				expect(text.split("retained requirement")).toHaveLength(2);
 				expect(text).toContain("new-user");
 				expect(text).toContain("new-reply");
 				expect(text).not.toContain("boundary");

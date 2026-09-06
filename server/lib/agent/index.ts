@@ -1,10 +1,11 @@
-import { summarizeCodexRemoteItems } from "@shared/compact-message";
+import { type CodexRemoteCompactPayload, summarizeCodexRemoteItems } from "@shared/compact-message";
 import { type TrackApiRequestOptions, trackApiRequest } from "../api-request-tracker";
 import { logger } from "../logger";
 import { isProviderUnavailableError } from "../provider-availability-error";
 import { parseModelId, settings } from "../settings";
 import { auxiliaryRetryDelayMs, getAuxiliaryMaxRetries } from "./error-handling";
 import { isRetryableError } from "./loop";
+import { restoreCompactUsers } from "./openai-provider";
 import {
 	type BuiltHistory,
 	type GenerateOptions,
@@ -130,7 +131,7 @@ export async function buildHistory(
 				typeof value === "object" &&
 				Array.isArray((value as Record<string, unknown>).items)
 			);
-		})?.remoteCompact as { items: unknown[] } | undefined;
+		})?.remoteCompact as CodexRemoteCompactPayload | undefined;
 		if (remote) {
 			const history = await resolved.adapter.buildHistory(
 				uniqueMessages,
@@ -138,6 +139,7 @@ export async function buildHistory(
 				narratorId,
 			);
 			const nextHistory = [
+				...(await restoreCompactUsers(remote.retainedUsers ?? [], narratorId)),
 				...remote.items,
 				...history.history.filter((item) => item !== remoteCompactMarker),
 			];

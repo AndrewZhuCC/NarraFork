@@ -28,10 +28,21 @@ export interface CompactAttempt {
  * All fields beyond `type` and `status` remain optional so messages written by
  * older NarraFork versions continue to parse and render normally.
  */
+export interface CodexRetainedUserMessage {
+	id: string;
+	narratorId?: string;
+	contentJson: Array<
+		| { type: "text"; text: string }
+		| { type: "image"; imageId: string; uploadNarratorId: string; mediaType: string }
+	>;
+}
+
 export interface CodexRemoteCompactPayload {
 	provider: "codex";
 	version: 1;
 	items: unknown[];
+	/** Bounded user originals; images stay upload references, never inline base64. */
+	retainedUsers?: CodexRetainedUserMessage[];
 	model: string;
 	completedAt: string;
 	source?: "remote";
