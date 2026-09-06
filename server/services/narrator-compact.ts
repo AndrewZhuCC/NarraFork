@@ -892,6 +892,10 @@ async function doRunCustomCompact({
 					!!resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter),
 			})
 		: await narratorService.getModelHistorySinceLastCompact(narratorId);
+	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
+	// Like loadSubagentHistory, normalize only this narrator's in-memory copies
+	// so both remote preview and compact treat its own replies as top-level.
+	if (isSubagent) messages = messages.map((msg) => ({ ...msg, parentToolUseId: null }));
 	// Keep the newly included predecessor exclusive to remote input; local
 	// summary/fallback and empty-range handling retain their original messages.
 	const remotePredecessor =
@@ -997,7 +1001,6 @@ async function doRunCustomCompact({
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode });
 
 	const pruneBoundaryMessageId = narrator?.pruneBoundaryMessageId ?? null;
-	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 	const compactProgress = createCompactProgressReporter({
 		narratorId,
 		messageId: compactingMsg.id,

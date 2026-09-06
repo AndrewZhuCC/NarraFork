@@ -1,4 +1,5 @@
-import { afterAll, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
@@ -15,6 +16,9 @@ const originalFetch = globalThis.fetch;
 const { narratorService } = await import("../narrator-service");
 const { narratorContext } = await import("../narrator-context");
 const originalSummary = narratorContext.generateCompactSummary;
+const agent = await import("../../lib/agent");
+// Observe both builders without replacing their implementation or inputs.
+const historyBuild = spyOn(agent, "buildHistory");
 const { runCustomCompact } = await import("../narrator-compact");
 
 const now = "2026-09-06T00:00:00.000Z";
@@ -27,9 +31,12 @@ const item = (round: number) => ({
 let requests: Array<{ input: Array<Record<string, unknown>> }> = [];
 let localInputs: string[][] = [];
 
-async function seedNarrator(id = "n1") {
+async function seedNarrator(id = "n1", parentNarratorId?: string) {
 	await db.insert(narrators).values({
 		id,
+		...(parentNarratorId
+			? { type: "subagent" as const, variant: "subagent:general", parentNarratorId }
+			: {}),
 		model: "test-relay:gpt-5.3-codex",
 		createdAt: now,
 		updatedAt: now,
@@ -43,10 +50,12 @@ async function message(
 	isCompact = false,
 	owner = "n1",
 	role: "user" | "assistant" = "assistant",
+	parentToolUseId: string | null = null,
 ) {
 	await db.insert(narratorMessages).values({
 		id,
 		narratorId: owner,
+		parentToolUseId,
 		// Completed replies keep the bounded history assistant-ended, as in
 		// automatic compaction (the provider intentionally pops a trailing user).
 		role: block ? "system" : role,
@@ -83,6 +92,7 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	requests = [];
 	localInputs = [];
+	historyBuild.mockClear();
 	settings.openaiProviders = [
 		{
 			id: "test-relay",
@@ -153,6 +163,103 @@ test("second and third bounded compacts replay only the immediate encrypted pred
 		}
 	}
 	expect(localInputs).toEqual([]);
+});
+
+for (const bounded of [true, false]) {
+	test(`subagent ${bounded ? "bounded" : "unbounded"} compact preserves three rounds without changing stored parents`, async () => {
+		await seedNarrator();
+		await seedNarrator("child", "n1");
+		await seedNarrator("sibling", "n1");
+		await message("parent-secret", 1);
+		await message("sibling-secret", 1, undefined, false, "sibling", "assistant", "sibling-task");
+		const providers = settings.openaiProviders;
+		for (let round = 0; round < 3; round++) {
+			await message(
+				`child-user-${round}`,
+				round * 10 + 1,
+				undefined,
+				false,
+				"child",
+				"user",
+				"child-task",
+			);
+			await message(
+				`child-reply-${round}`,
+				round * 10 + 2,
+				undefined,
+				false,
+				"child",
+				"assistant",
+				"child-task",
+			);
+			if (bounded) {
+				await message(
+					`boundary-${round}`,
+					round * 10 + 3,
+					undefined,
+					false,
+					"child",
+					"user",
+					"child-task",
+				);
+			}
+			settings.openaiProviders = providers;
+			const buildOffset = historyBuild.mock.calls.length;
+			expect(
+				await runCustomCompact("child", "en", bounded ? `boundary-${round}` : undefined, {
+					mode: "blocking",
+				}),
+			).toBe(true);
+			// Preview and actual remote input must both receive normalized copies.
+			const builds = historyBuild.mock.calls.slice(buildOffset, buildOffset + 2);
+			expect(builds).toHaveLength(2);
+			for (const [messages] of builds) {
+				expect(messages.every((entry) => entry.parentToolUseId === null)).toBe(true);
+				expect(messages.map((entry) => entry.id)).toContain(`child-user-${round}`);
+				expect(messages.map((entry) => entry.id)).toContain(`child-reply-${round}`);
+			}
+			expect(requests).toHaveLength(round + 1);
+			const input = requests[round].input;
+			expect(input.filter((entry) => entry.type === "compaction")).toEqual(
+				round ? [item(round)] : [],
+			);
+			const text = JSON.stringify(input);
+			expect(text).toContain(`child-user-${round}`);
+			expect(text).toContain(`child-reply-${round}`);
+			expect(text).not.toContain(`boundary-${round}`);
+			if (bounded && round > 0) expect(text).toContain(`boundary-${round - 1}`);
+			expect(text).not.toContain("parent-secret");
+			expect(text).not.toContain("sibling-secret");
+			for (let previous = 0; previous < round; previous++) {
+				expect(text).not.toContain(`child-user-${previous}`);
+				expect(text).not.toContain(`child-reply-${previous}`);
+			}
+		}
+		expect(localInputs).toEqual([]);
+		const rows = await db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, "child"));
+		for (const row of rows.filter((entry) => entry.role !== "system")) {
+			expect(row.parentToolUseId).toBe("child-task");
+		}
+	});
+}
+
+test("primary compact still filters child messages even when referenced in its history", async () => {
+	await seedNarrator();
+	await seedNarrator("child", "n1");
+	await message("primary-user", 1, undefined, false, "n1", "user");
+	await message("child-secret", 1, undefined, false, "child", "assistant", "child-task");
+	await db
+		.insert(narratorMessageRefs)
+		.values({ id: "shared-child-ref", narratorId: "n1", messageId: "child-secret", seq: 2 });
+	await message("primary-reply", 3);
+	expect(await runCustomCompact("n1", "en", undefined, { mode: "blocking" })).toBe(true);
+	expect(requests).toHaveLength(1);
+	expect(JSON.stringify(requests[0].input)).toContain("primary-user");
+	expect(JSON.stringify(requests[0].input)).toContain("primary-reply");
+	expect(JSON.stringify(requests[0].input)).not.toContain("child-secret");
 });
 
 test("legacy version 1 checkpoint uses current refs and excludes failed/in-progress markers", async () => {
