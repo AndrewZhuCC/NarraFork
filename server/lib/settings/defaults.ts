@@ -112,6 +112,7 @@ export const DEFAULTS: NarraForkSettings = {
 		worktreeSizeWarningMb: 500,
 		autoSaveOnDormant: true,
 		dormantAfterMinutes: 0,
+		treeSnapshotsEnabled: true,
 	},
 	containers: {
 		portRangeStart: 10000,
@@ -173,7 +174,6 @@ export const DEFAULTS: NarraForkSettings = {
 	search: {
 		channels: [
 			{ id: "native", kind: "native", enabled: true },
-			{ id: "kiro:local", kind: "kiro-mcp", enabled: true },
 			{ id: "subagent", kind: "subagent", enabled: false, maxTurns: 4 },
 		],
 		customProviders: [],
@@ -262,7 +262,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── proxy ───────────────────────────────────────────────────────────
 	"proxy.mode": {
-		desc: '统一出站代理模式，作用于所有出站网络请求（Kiro/Codex/Anthropic/OpenAI/Cline/NUG/WebFetch/浏览器）。默认 "direct" 直连不走代理，"system" 跟随系统代理（读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量），"custom" 使用手动配置的 URL。本地/回环目标始终豁免。',
+		desc: '统一出站代理模式，作用于所有出站网络请求（Codex/Anthropic/OpenAI/NUG/WebFetch/浏览器）。默认 "direct" 直连不走代理，"system" 跟随系统代理（读取 HTTPS_PROXY/HTTP_PROXY/ALL_PROXY 环境变量），"custom" 使用手动配置的 URL。本地/回环目标始终豁免。',
 		type: "string",
 		valid: '"direct" | "system" | "custom"',
 	},
@@ -698,6 +698,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "number",
 		valid: "≥0, 默认 0 (禁用)",
 	},
+	"chapters.treeSnapshotsEnabled": {
+		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。结构性快照（fork/merge/restore）不受影响。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
 
 	// ── containers ──────────────────────────────────────────────────────
 	"containers.portRangeStart": {
@@ -848,7 +853,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 
 	// ── pricing ─────────────────────────────────────────────────────────
 	"pricing.overrides": {
-		desc: '官方参考价覆盖（USD / 1M tokens），用于修正内置价格表。键是裸模型 ID（如 "gpt-5.6-sol"，不带 provider 前缀），值可只填要覆盖的字段：{ input, output, cacheRead, cacheWrite }。未填字段沿用内置值；为内置表里没有的模型新增条目即可给它定价。订阅制渠道（Codex/Kiro）算出的金额是"按官方 API 价折算的等价消耗"，不是实付金额。',
+		desc: '官方参考价覆盖（USD / 1M tokens），用于修正内置价格表。键是裸模型 ID（如 "gpt-5.6-sol"，不带 provider 前缀），值可只填要覆盖的字段：{ input, output, cacheRead, cacheWrite }。未填字段沿用内置值；为内置表里没有的模型新增条目即可给它定价。订阅制渠道（Codex 等）算出的金额是"按官方 API 价折算的等价消耗"，不是实付金额。',
 		type: "object",
 	},
 

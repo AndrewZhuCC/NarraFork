@@ -996,6 +996,8 @@ export interface CodexUsageData {
 		reset_at: number;
 		reset_after_seconds: number;
 	};
+	/** Rate-limit reset credits available for immediate window resets, when reported upstream. */
+	reset_credits_available?: number;
 	queriedAt: string;
 }
 
@@ -1017,90 +1019,6 @@ export interface CodexCredentialEntry {
 	lastUsedAt?: string;
 	expiresAt?: number;
 	usage?: CodexUsageData;
-}
-
-export type KiroCredentialTier = "free" | "paid" | "enterprise";
-
-export interface KiroCredentialEntry {
-	id: string;
-	priority: number;
-	disabled: boolean;
-	disabledReason?: string;
-	failureCount: number;
-	successCount: number;
-	lastUsedAt?: string;
-	email?: string;
-	displayName?: string;
-	hasProfileArn: boolean;
-	hasStartUrl?: boolean;
-	expiresAt?: string;
-	authMethod?: string;
-	isApiKey?: boolean;
-	subscriptionTitle?: string;
-	region?: string;
-	authRegion?: string;
-	apiRegion?: string;
-	profileArn?: string;
-	startUrl?: string;
-	machineId?: string;
-	hasClientId?: boolean;
-	hasClientSecret?: boolean;
-	proxyUrl?: string;
-	proxyUsername?: string;
-	hasProxyPassword?: boolean;
-	meterUsage?: number;
-	availableModels?: string[];
-	tier?: KiroCredentialTier;
-}
-
-export interface KiroStatusSnapshot {
-	entries: KiroCredentialEntry[];
-	paidEntries?: KiroCredentialEntry[];
-	enterpriseEntries?: KiroCredentialEntry[];
-	freeEntries?: KiroCredentialEntry[];
-	paidTotal?: number;
-	enterpriseTotal?: number;
-	freeTotal?: number;
-	unhealthyTotal?: number;
-	currentId: string;
-	loadBalancingMode: "priority" | "balanced";
-	total: number;
-	available: number;
-}
-
-export interface KiroStatusResponse {
-	available: boolean;
-	snapshot: KiroStatusSnapshot | null;
-	usageCache?: Record<string, ApiEntity>;
-	globalProxy?: string;
-}
-
-/**
- * Editable subset of a Kiro credential.
- *
- * Text fields clear when sent as an empty string. Secrets (`refreshToken`,
- * `apiKey`, `clientSecret`, `proxyPassword`) are never returned by the API, so an
- * empty value there leaves the stored secret alone.
- */
-export interface KiroCredentialPatch {
-	email?: string;
-	displayName?: string;
-	region?: string;
-	authRegion?: string;
-	apiRegion?: string;
-	profileArn?: string;
-	subscriptionTitle?: string;
-	startUrl?: string;
-	machineId?: string;
-	proxyUrl?: string;
-	proxyUsername?: string;
-	authMethod?: "social" | "idc" | "api_key";
-	priority?: number;
-	refreshToken?: string;
-	apiKey?: string;
-	clientId?: string;
-	clientSecret?: string;
-	proxyPassword?: string;
 }
 
 export interface CodexUsageTierStats {

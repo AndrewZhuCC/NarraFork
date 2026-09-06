@@ -14,7 +14,7 @@ describe("coerceAskQuestions", () => {
 			},
 			{
 				// no `question` key — this is the real-world failure case
-				header: "kiro能否关闭思考",
+				header: "能否关闭思考模式",
 				options: [
 					{ label: "对齐IDE", description: "不提供 none" },
 					{ label: "保留none", description: "比 IDE 多一个能力" },
@@ -24,7 +24,7 @@ describe("coerceAskQuestions", () => {
 
 		expect(questions).toHaveLength(2);
 		expect(questions[0].question).toBe("max-enum");
-		expect(questions[1].question).toBe("kiro能否关闭思考");
+		expect(questions[1].question).toBe("能否关闭思考模式");
 		expect(questions.every((q) => q.question.length > 0)).toBe(true);
 	});
 

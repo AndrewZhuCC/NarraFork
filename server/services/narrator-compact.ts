@@ -5,7 +5,7 @@ import {
 	summarizeCodexRemoteItems,
 	truncateCompactError,
 } from "@shared/compact-message";
-import { createThrottledProgressReporter } from "@shared/progress-phase";
+import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
@@ -83,6 +83,13 @@ const BACKGROUND_COMPACTING_SUBSTATUS = "background_compacting";
 interface CompactProgressReporter {
 	onTextDelta: (delta: string) => void;
 	onReasoningDelta: (delta: string) => void;
+	/**
+	 * Report that a failed summary attempt is being retried. Broadcasts
+	 * immediately (retry events are rare and must not wait out the throttle
+	 * window) with the CURRENT char counts plus the retry ordinal, so the UI can
+	 * say "retrying (N)" instead of an unexplained 0-char spinner.
+	 */
+	reportRetry: (retryCount: number, error: string) => void;
 	finish: () => void;
 }
 
@@ -265,7 +272,11 @@ export function createCompactProgressReporter(options: {
 	 */
 	onActivity?: () => void;
 }): CompactProgressReporter {
+	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
+	// last published snapshot (the throttled accumulator does not expose one).
+	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
 	const reporter = createThrottledProgressReporter((snapshot) => {
+		lastSnapshot = snapshot;
 		broadcastToNarrator(options.narratorId, {
 			type: "compact_progress",
 			narratorId: options.narratorId,
@@ -277,11 +288,26 @@ export function createCompactProgressReporter(options: {
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
+	const reportRetry = (retryCount: number, error: string) => {
+		broadcastToNarrator(options.narratorId, {
+			type: "compact_progress",
+			narratorId: options.narratorId,
+			messageId: options.messageId,
+			phase: lastSnapshot.phase,
+			thinkingChars: lastSnapshot.thinkingChars,
+			outputChars: lastSnapshot.outputChars,
+			mode: options.mode,
+			...(options.isSegment ? { isSegment: true } : {}),
+			retryCount,
+			retryError: error,
+		});
+	};
 	const onActivity = options.onActivity;
 	if (!onActivity) {
 		return {
 			onTextDelta: reporter.addOutput,
 			onReasoningDelta: reporter.addThinking,
+			reportRetry,
 			finish: reporter.finish,
 		};
 	}
@@ -294,6 +320,7 @@ export function createCompactProgressReporter(options: {
 			if (delta) onActivity();
 			reporter.addThinking(delta);
 		},
+		reportRetry,
 		finish: reporter.finish,
 	};
 }
@@ -989,6 +1016,7 @@ async function doRunCustomCompact({
 				narratorId,
 				messageId: failedMsg?.id ?? options.preparedRetryMessage.id,
 				mode,
+				error,
 				...replacementFields,
 			};
 			broadcastToNarrator(narratorId, compactFailedEvent);
@@ -1027,6 +1055,7 @@ async function doRunCustomCompact({
 	});
 
 	try {
+		let retryCount = 0;
 		let remoteCompact: import("@shared/compact-message").CodexRemoteCompactPayload | undefined;
 		let compactResult: { summary: string; contextPercent?: number } | undefined;
 		if (resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)) {
@@ -1110,6 +1139,10 @@ async function doRunCustomCompact({
 					compactProgress.onTextDelta,
 					compactProgress.onReasoningDelta,
 					hooks?.beat,
+					(info) => {
+						retryCount += 1;
+						compactProgress.reportRetry(retryCount, info.error);
+					},
 				);
 			}
 		}
@@ -1124,6 +1157,10 @@ async function doRunCustomCompact({
 				compactProgress.onTextDelta,
 				compactProgress.onReasoningDelta,
 				hooks?.beat,
+				(info) => {
+					retryCount += 1;
+					compactProgress.reportRetry(retryCount, info.error);
+				},
 			);
 		}
 		const { summary, contextPercent } = compactResult;
@@ -1378,6 +1415,7 @@ async function doRunCustomCompact({
 			narratorId,
 			messageId: compactingMsg.id,
 			mode: failureMode,
+			error: errorMsg,
 			...replacementFields,
 		};
 		broadcastToNarrator(narratorId, compactFailedEvent);
@@ -1509,6 +1547,9 @@ async function doRunSegmentCompact({
 			return false;
 		}
 
+		// Same retry-visibility contract as the history path: every scheduled retry
+		// bumps one ordinal the UI can show instead of a silent 0-char spinner.
+		let segmentRetryCount = 0;
 		const { summary, contextPercent } = await narratorContext.generateCompactSummary(
 			narratorId,
 			locale,
@@ -1519,6 +1560,10 @@ async function doRunSegmentCompact({
 			compactProgress.onTextDelta,
 			compactProgress.onReasoningDelta,
 			hooks?.beat,
+			(info) => {
+				segmentRetryCount += 1;
+				compactProgress.reportRetry(segmentRetryCount, info.error);
+			},
 		);
 		compactProgress.finish();
 		// Enforce cancellation at the persistence boundary too, so a summary that
@@ -1602,6 +1647,7 @@ async function doRunSegmentCompact({
 			narratorId,
 			messageId: markerMsg.id,
 			mode: "blocking",
+			error: errorMsg,
 		});
 		throw err;
 	}

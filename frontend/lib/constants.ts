@@ -62,8 +62,6 @@ export function nugChannelTypeLabel(channelType?: string): string {
 			return "openai 兼容";
 		case "anthropic":
 			return "anthropic";
-		case "kiro":
-			return "kiro";
 		default:
 			return channelType ?? "";
 	}
@@ -175,7 +173,6 @@ export function groupModelsByProvider(
 	providerLabels: Record<string, string> = {},
 ): { group: string; items: { value: string; label: string }[] }[] {
 	const defaultLabels: Record<string, string> = {
-		kiro: "Kiro",
 		openai: "OpenAI",
 		anthropic: "Anthropic",
 	};
@@ -185,7 +182,7 @@ export function groupModelsByProvider(
 	for (const m of models) {
 		if (seen.has(m.value)) continue;
 		seen.add(m.value);
-		const prov = m.provider ?? "kiro";
+		const prov = m.provider ?? "unknown";
 		if (!groups.has(prov)) groups.set(prov, []);
 		const suffix = m.rateMultiplier != null ? ` (×${m.rateMultiplier})` : "";
 		groups.get(prov)?.push({ value: m.value, label: `${m.label}${suffix}` });

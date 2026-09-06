@@ -267,11 +267,9 @@ function AiProviderOverrides() {
 
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const s = settingsData as any;
-	const kiroProxy = s?.kiro?.proxy as ProxyOverride | undefined;
 	const codexProxy = s?.codex?.proxy as ProxyOverride | undefined;
 	const customApiProviders = (s?.customApiProviders ?? []) as ProviderLike[];
 	const nugProviders = (s?.nugProviders ?? []) as ProviderLike[];
-	const clineProviders = (s?.clineProviders ?? []) as ProviderLike[];
 
 	const saveMut = useMutation({
 		mutationFn: (payload: Record<string, unknown>) => api.updateSettings(payload),
@@ -282,7 +280,7 @@ function AiProviderOverrides() {
 	});
 
 	const updateArrayProxy = (
-		key: "customApiProviders" | "nugProviders" | "clineProviders",
+		key: "customApiProviders" | "nugProviders",
 		list: ProviderLike[],
 		id: string,
 		next: ProxyOverride | undefined,
@@ -292,11 +290,9 @@ function AiProviderOverrides() {
 	};
 
 	const hasAny =
-		!!s?.kiro ||
 		!!s?.codex ||
 		customApiProviders.length > 0 ||
-		nugProviders.length > 0 ||
-		clineProviders.length > 0;
+		nugProviders.length > 0;
 
 	const label = (p: ProviderLike) => p.name || p.prefix || p.id;
 
@@ -304,20 +300,13 @@ function AiProviderOverrides() {
 		<GroupCard title={t("proxyGroupAiProviders")} loading={isLoading} empty={!hasAny}>
 			<Stack gap="sm">
 				<OverrideRow
-					name="Kiro"
-					value={kiroProxy}
-					disabled={saveMut.isPending}
-					onChange={(next) => saveMut.mutate({ kiro: { proxy: next } })}
-				/>
-				<OverrideRow
 					name="Codex"
 					value={codexProxy}
 					disabled={saveMut.isPending}
 					onChange={(next) => saveMut.mutate({ codex: { proxy: next } })}
 				/>
 				{(customApiProviders.length > 0 ||
-					nugProviders.length > 0 ||
-					clineProviders.length > 0) && <Divider />}
+					nugProviders.length > 0) && <Divider />}
 				{customApiProviders.map((p) => (
 					<OverrideRow
 						key={p.id}
@@ -338,16 +327,6 @@ function AiProviderOverrides() {
 						value={p.proxy}
 						disabled={saveMut.isPending}
 						onChange={(next) => updateArrayProxy("nugProviders", nugProviders, p.id, next)}
-					/>
-				))}
-				{clineProviders.map((p) => (
-					<OverrideRow
-						key={p.id}
-						name={label(p)}
-						badge="Cline"
-						value={p.proxy}
-						disabled={saveMut.isPending}
-						onChange={(next) => updateArrayProxy("clineProviders", clineProviders, p.id, next)}
 					/>
 				))}
 			</Stack>

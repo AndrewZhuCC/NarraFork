@@ -10,7 +10,12 @@ import type {
 	PermissionHandlerOptions,
 	PermissionResult,
 } from "../lib/agent";
-import { analyzeShellCommand, type BashAnalysis, classifyFind } from "../lib/agent/bash-analyze";
+import {
+	analyzeShellCommand,
+	type BashAnalysis,
+	classifyFind,
+	isReviewReadOnlyBashAnalysis,
+} from "../lib/agent/bash-analyze";
 import type { ExecutionBackend, TargetPathSemantics } from "../lib/agent/execution/backend";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { resolveBackendPath, toolBaseCwd } from "../lib/agent/execution/path-resolve";
@@ -28,6 +33,7 @@ import { detectShell } from "../lib/agent/shell";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import { isBashToolName } from "../lib/agent/tool-name";
 import { toolRegistry } from "../lib/agent/tool-registry";
+import { isAsyncAskRequest, isWithdrawOnlyAskRequest } from "../lib/agent/tools/ask-user-question";
 import { SHELL_TOOL_NAME } from "../lib/agent/tools/bash";
 import {
 	isKnowledgeReadAction,
@@ -95,6 +101,7 @@ import { integrationResourceBindingService } from "./integration-resource-bindin
 import { narratorService } from "./narrator-service";
 import {
 	activeNarrators,
+	activeSubagentSettings,
 	isNarratorRuntimeBusy,
 	type PendingDangerReflection,
 	type PendingExecutionTarget,
@@ -114,11 +121,6 @@ import { broadcastReflectionFrame } from "./reflection-broadcast";
 import { SPEC_TASKS_PATH } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 import { resolveTaskAlias, subagentMatchesSelector } from "./subagent-alias";
-import {
-	getConclusionEntry,
-	getConclusionFileId,
-	resolveConclusionFilePath,
-} from "./subagent-conclusion";
 
 // === Permission handling ===
 
@@ -445,7 +447,6 @@ export function resolvePermissionDecision(
 		isChapter = false,
 		planFileId,
 		planFilePath: designatedPlanFilePath,
-		conclusionFileId,
 		relaxedPlan = false,
 		planMode = false,
 		meta,
@@ -453,6 +454,7 @@ export function resolvePermissionDecision(
 		executionBackend,
 		executionTarget,
 		executionContext,
+		reviewReadOnlyBash = false,
 	} = opts;
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
@@ -502,6 +504,19 @@ export function resolvePermissionDecision(
 			}
 			return "deny";
 		}
+	}
+
+	// An ASYNCHRONOUS AskUserQuestion is not a request for approval — it is the agent
+	// filing a question and carrying on. Prompting for it would recreate exactly the
+	// blocking this mode exists to avoid, so it is allowed in every permission mode
+	// (including dontAsk: nothing is executed on the user's behalf, a row is written).
+	//
+	// `!input.answers` is load-bearing: after the user answers, the answers are merged
+	// into the input and the call runs again. That replay must keep the ordinary
+	// semantics, and treating it as a fresh async submission would file a duplicate.
+	// A withdraw-only call is the same kind of bookkeeping and needs no prompt either.
+	if (toolName === "AskUserQuestion" && !input.answers) {
+		if (isAsyncAskRequest(input) || isWithdrawOnlyAskRequest(input)) return "allow";
 	}
 
 	if (ALWAYS_ASK_TOOLS.includes(toolName)) return "ask";
@@ -565,6 +580,33 @@ export function resolvePermissionDecision(
 	if (blacklistResult) {
 		if (meta) meta.blacklistReason = blacklistResult.reason;
 		return "deny";
+	}
+
+	// Review follow-up Bash is a hard, non-interactive capability ceiling. Keep this
+	// after command/path blacklists, but before command whitelists, bypassPermissions,
+	// and ordinary Bash read-only shortcuts.
+	if (reviewReadOnlyBash && isBashToolName(toolName)) {
+		const isControlOperation =
+			typeof input.command !== "string" ||
+			input.run_in_background === true ||
+			typeof input.stop === "string" ||
+			input.await != null;
+		const deviceId = executionContext?.target.deviceId ?? executionTarget?.deviceId;
+		const externalPaths = getShellScopePaths(cwd, input, bashAnalysis, context).filter(
+			(path) =>
+				!isInsideDecisionWorktree(cwd, path, context) &&
+				!isInsideDecisionTruncateDir(cwd, path, context),
+		);
+		if (
+			isControlOperation ||
+			(deviceId !== undefined && deviceId !== LOCAL_DEVICE_ID) ||
+			externalPaths.length > 0 ||
+			!bashAnalysis ||
+			!isReviewReadOnlyBashAnalysis(bashAnalysis)
+		) {
+			return "deny";
+		}
+		return "allow";
 	}
 
 	const chapterGitIssues = isChapter ? getChapterGitPermissionIssues(bashAnalysis) : [];
@@ -661,24 +703,6 @@ export function resolvePermissionDecision(
 	if (toolName === "Recall") {
 		if (input.all_narrators !== true) return "allow";
 		return "ask";
-	}
-
-	// Conclusion file: always allow Write/Edit targeting the designated conclusion file,
-	// regardless of permission mode. This handles the fallback case where the conclusion
-	// file lives outside cwd (e.g. ~/.narrafork/conclusions/) because cwd is read-only.
-	if (conclusionFileId && (toolName === "Write" || toolName === "Edit")) {
-		const filePath = typeof input.file_path === "string" ? input.file_path : "";
-		if (filePath) {
-			const absPath =
-				(context && executionTargetPolicyPath(context)) ??
-				resolveDecisionPath(cwd, filePath, context);
-			const conclusionPath = resolveDecisionPath(
-				cwd,
-				resolveConclusionFilePath(cwd, conclusionFileId),
-				context,
-			);
-			if (decisionPaths(context).equals(absPath, conclusionPath)) return "allow";
-		}
 	}
 
 	// readOnly mode
@@ -958,7 +982,8 @@ export interface PermissionDecisionOpts {
 	 */
 	planFilePath?: string;
 	planMode?: boolean;
-	conclusionFileId?: string;
+	/** Hard Bash policy for review follow-up subagents. */
+	reviewReadOnlyBash?: boolean;
 	whitelistDirs?: WhitelistDir[];
 	blacklistDirs?: BlacklistDir[];
 	commandWhitelist?: CommandWhitelistEntry[];
@@ -3450,6 +3475,7 @@ export async function handlePermission(
 	options?: PermissionHandlerOptions,
 	parentToolUseId?: string,
 	runtimeConstraint?: RuntimePermissionConstraint,
+	reviewReadOnlyBash = false,
 ): Promise<PermissionResult> {
 	// Every routed permission starts from a complete frozen context. Missing backend/target,
 	// canonicalization failure, or backend identity drift is denied before policy loading.
@@ -3659,41 +3685,6 @@ export async function handlePermission(
 		}
 	}
 
-	// Conclusion file redirect
-	let conclusionRedirectNotice: string | undefined;
-	const subagentConcEntry = getConclusionEntry(narratorId);
-	// Same reason as the plan-file redirect above: a spec:// target is frozen with the
-	// "spec" path grammar before permission handling, so rewriting it to a worktree path
-	// turns the call into a routing error rather than a decision. Dynamic Spec is the
-	// subagent's own session metadata, never the caller's conclusion document.
-	if (
-		subagentConcEntry &&
-		(toolName === "Write" || toolName === "Edit") &&
-		!specVfsService.isSpecUri(effectiveInput.file_path)
-	) {
-		const filePath = typeof effectiveInput.file_path === "string" ? effectiveInput.file_path : "";
-		const conclusionRelPath = subagentConcEntry.relPath;
-		if (filePath) {
-			const absPath =
-				(executionContext && executionTargetPolicyPath(executionContext)) ??
-				resolveDecisionPath(cwd, filePath, executionContext);
-			const conclusionPath = resolveDecisionPath(cwd, subagentConcEntry.absPath, executionContext);
-			if (!decisionPaths(executionContext).equals(absPath, conclusionPath)) {
-				effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
-				conclusionRedirectNotice = getToolMessageWithParams(
-					"subagentConclusionRedirected",
-					locale,
-					{
-						originalPath: filePath,
-						conclusionFile: conclusionRelPath,
-					},
-				);
-			}
-		} else {
-			effectiveInput = { ...effectiveInput, file_path: conclusionRelPath };
-		}
-	}
-
 	if (toolName === "AskUserQuestion") {
 		const askResult = await validateOrRepairAskUserQuestionInput(
 			narratorId,
@@ -3770,7 +3761,15 @@ export async function handlePermission(
 	await options?.onInputResolved?.(effectiveInput);
 
 	const permMeta: PermissionDecisionMeta = {};
-	const conclusionFileId = getConclusionFileId(narratorId);
+
+	// Bash await/stop are pure control operations for ordinary sessions, but review
+	// follow-ups are limited to synchronous Git inspection and cannot use them.
+	if (reviewReadOnlyBash && isBashControlOp) {
+		return {
+			behavior: "deny",
+			message: "Review Bash only permits synchronous, read-only Git inspection commands.",
+		};
+	}
 
 	// Bash await/stop are pure control operations — skip full permission analysis
 	if (isBashControlOp) {
@@ -3812,7 +3811,7 @@ export async function handlePermission(
 					planFileId,
 					planFilePath: designatedPlanFilePath,
 					planMode: isPlanMode,
-					conclusionFileId,
+					reviewReadOnlyBash,
 					compiledPolicy,
 					executionContext,
 					relaxedPlan: isRelaxedPlan,
@@ -4100,11 +4099,7 @@ export async function handlePermission(
 		return {
 			behavior: "allow",
 			updatedInput: effectiveInput,
-			...(planRedirectNotice
-				? { notice: planRedirectNotice }
-				: conclusionRedirectNotice
-					? { notice: conclusionRedirectNotice }
-					: {}),
+			...(planRedirectNotice ? { notice: planRedirectNotice } : {}),
 		};
 	}
 	// Plan mode soft deny → ask the user once before falling back to auto-deny.
@@ -4488,6 +4483,12 @@ export interface ResolvePermissionOpts {
 	feedbackText?: string;
 	compactAfter?: boolean;
 	updatedPlan?: string;
+	/**
+	 * AskUserQuestion only: release the loop WITHOUT answering, turning the blocking
+	 * prompt into an asynchronous question the user answers later. Mutually exclusive
+	 * with `answers` (answering is not deferring); `answers` wins if both arrive.
+	 */
+	deferAsync?: boolean;
 	userId?: string;
 	/**
 	 * Who decided this permission. `"user"`/`"auto"`/`"reflection"` are the built-in
@@ -4499,6 +4500,128 @@ export interface ResolvePermissionOpts {
 }
 
 type DangerReflectionDecidedBy = "reflection" | "user" | "auto" | `narrator:${string}`;
+
+/**
+ * How approval feedback text reaches a SUBAGENT.
+ *
+ * ## Why subagents need their own path at all
+ *
+ * The primary-narrator path stashes the text in `pendingFeedback` (keyed by
+ * narratorId) and arms `_feedbackSoftStop` on the `activeNarrators` entry; the
+ * `[continuation-source: permission-feedback]` branch of `runAgentLoop` then
+ * persists it as a real `role: "user"` turn and restarts the pass with it.
+ *
+ * A subagent has NO `activeNarrators` entry — a running subagent registers only in
+ * `activeSubagentSettings` — so BOTH halves of that mechanism silently no-op for
+ * one. The user could type feedback into the InlinePermission form rendered inside
+ * the parent's SubagentCard, approve, and have the text vanish without a trace,
+ * which is worse than offering no input box at all.
+ *
+ * ## Why a message and not a note on the tool result
+ *
+ * The subagent's equivalent of "stash payload + arm soft stop" is the buffered
+ * message queue: `bufferSubagentUserMessage` enqueues the text AND requests the
+ * next safe post-tool boundary (`shouldStopSubagentForBufferedMessage` is exactly
+ * what the subagent loop passes as its `shouldStop`). The queue is drained by
+ * `getAfterToolsInjections` (in-pass) or `consumeNextBufferedSubagentMessage`
+ * (pass restart), and both persist it through `persistSubagentUserMessage`. So the
+ * result is the same shape the primary path produces: a `role: "user"` turn.
+ *
+ * That is what the content IS. The user typed a turn ("go ahead, but watch out for
+ * X"); routing it through `deliverInjection` instead would file it as a `sys`
+ * injection row — lower weight for the model, attributed to the system rather than
+ * to the person who wrote it, and rendered as a system card instead of their
+ * message. Attaching it to the tool result would be worse still: it would arrive
+ * as commentary on one call rather than as an instruction for what to do next.
+ *
+ * ## Why a seam and not a lazy import at the call site
+ *
+ * `mock.module` is process-wide in Bun: replacing `subagent-executor` for one test
+ * file hands the replacement to every later file in the run, and that module holds
+ * lazily-initialized queues other suites read. A seam the test installs and
+ * restores keeps the blast radius inside the test.
+ */
+export interface SubagentFeedbackDelivery {
+	/** Whether a subagent loop is currently running under this narrator id. */
+	isSubagentRunning: (narratorId: string) => boolean;
+	/**
+	 * Queue the text as the subagent's next user turn and request a safe stop.
+	 * Returns false when the queue refused it (full, or no running subagent).
+	 */
+	deliver: (narratorId: string, text: string, options: { createdBy: string | null }) => boolean;
+}
+
+/** Lazily bound to the real subagent modules; replaced only by tests. */
+let subagentFeedbackDelivery: SubagentFeedbackDelivery | null = null;
+
+/**
+ * Install a subagent feedback delivery implementation, returning the previous one
+ * so a test can restore it. Pass `null` to fall back to the real subagent modules.
+ */
+export function setSubagentFeedbackDelivery(
+	next: SubagentFeedbackDelivery | null,
+): SubagentFeedbackDelivery | null {
+	const previous = subagentFeedbackDelivery;
+	subagentFeedbackDelivery = next;
+	return previous;
+}
+
+/**
+ * Whether this permission's feedback must take the subagent path.
+ *
+ * Kept synchronous so the primary-narrator branch stays exactly what it was: an
+ * in-line `pendingFeedback.set` before `pending.resolve`, with no await inserted
+ * between the two. `activeSubagentSettings` is registered for the whole span of a
+ * subagent run, so this needs no database read on the decision path.
+ */
+function isSubagentFeedbackRecipient(narratorId: string): boolean {
+	if (subagentFeedbackDelivery) return subagentFeedbackDelivery.isSubagentRunning(narratorId);
+	return activeSubagentSettings.has(narratorId);
+}
+
+/**
+ * Queue approval feedback text as the subagent's next user turn.
+ *
+ * Failure is logged, not thrown: the permission has already been decided and the
+ * approved tool is about to run, so raising here would fail a call the user allowed.
+ */
+async function deliverSubagentPermissionFeedback(
+	narratorId: string,
+	text: string,
+	userId: string | null,
+): Promise<void> {
+	try {
+		let delivery = subagentFeedbackDelivery;
+		if (!delivery) {
+			const [{ bufferSubagentUserMessage }, { isTakenOver }] = await Promise.all([
+				import("./subagent-executor"),
+				import("./subagent-takeover"),
+			]);
+			delivery = {
+				isSubagentRunning: (id) => activeSubagentSettings.has(id),
+				deliver: (id, message, options) =>
+					bufferSubagentUserMessage(id, message, {
+						createdBy: options.createdBy,
+						// A taken-over subagent is driven by the user directly, so cutting
+						// short the turn they are steering would be wrong; the resume path
+						// drains the queue instead. Same rule every other subagent send obeys.
+						requestSoftStop: !isTakenOver(id),
+					}).ok,
+			};
+		}
+		if (!delivery.deliver(narratorId, text, { createdBy: userId })) {
+			logger.warn("Subagent permission feedback could not be queued", {
+				narratorId,
+				chars: text.length,
+			});
+		}
+	} catch (err) {
+		logger.error("Failed to deliver subagent permission feedback", {
+			narratorId,
+			error: String(err),
+		});
+	}
+}
 
 async function enableRelaxedPlanAfterPlanSoftDeny(
 	narratorId: string,
@@ -4549,6 +4672,7 @@ export async function resolvePermission(
 		feedbackText,
 		compactAfter,
 		updatedPlan,
+		deferAsync,
 		userId,
 		decidedBy = "user",
 		exitPlanCancelled,
@@ -4588,6 +4712,15 @@ export async function resolvePermission(
 	let updatedInput: Record<string, unknown> | undefined;
 	if (answers) {
 		updatedInput = { ...pending.input, answers };
+	} else if (deferAsync && pending.toolName === "AskUserQuestion") {
+		// "Answer later": the user releases the loop without deciding. Flipping the input
+		// to `async` is the whole mechanism — the tool then takes its asynchronous branch,
+		// files the question, and returns the same "carry on with a default" instruction
+		// the agent would have received had it asked asynchronously in the first place.
+		//
+		// Approved rather than denied, deliberately: a denial tells the agent its call was
+		// refused, when in fact the question was accepted and merely moved.
+		updatedInput = { ...pending.input, async: true, deferredByUser: true };
 	} else if (updatedPlan !== undefined && pending.toolName === "ExitPlanMode") {
 		updatedInput = { ...pending.input, plan: updatedPlan };
 	}
@@ -4641,13 +4774,20 @@ export async function resolvePermission(
 	}
 
 	if (decision === "allow") {
-		if (feedbackText?.trim()) {
+		const approvalFeedback = feedbackText?.trim();
+		// Carry the approver so the injected turn shows their avatar rather than an
+		// anonymous "you".
+		const feedbackUserId = decidedBy === "user" ? (userId ?? null) : null;
+		// A subagent has no `activeNarrators` entry, so `pendingFeedback` +
+		// `_feedbackSoftStop` would both be written into the void for one. Its
+		// equivalent is the buffered-message queue — see `SubagentFeedbackDelivery`.
+		const subagentFeedback =
+			approvalFeedback && isSubagentFeedbackRecipient(pending.narratorId) ? approvalFeedback : null;
+		if (approvalFeedback && !subagentFeedback) {
 			pendingFeedback.set(pending.narratorId, {
 				toolUseId: pending.toolUseId,
-				feedbackText: feedbackText.trim(),
-				// Carry the approver so the injected turn shows their avatar rather
-				// than an anonymous "you".
-				userId: decidedBy === "user" ? (userId ?? null) : null,
+				feedbackText: approvalFeedback,
+				userId: feedbackUserId,
 			});
 		}
 		const effectiveUpdatedInput = updatedInput ?? pending.input;
@@ -4694,7 +4834,16 @@ export async function resolvePermission(
 
 		pending.resolve({ behavior: "allow", updatedInput: effectiveUpdatedInput });
 
-		if (feedbackText?.trim() && pending.toolName !== "ExitPlanMode") {
+		// The ExitPlanMode exclusion is a PRIMARY-narrator rule and stays scoped to the
+		// primary branch: approving a plan already restarts the loop through
+		// `_planApprovedContinue`, which merges `pendingFeedback` into its own prompt, so
+		// arming a second stop would cut that restart short. Subagents have no plan mode
+		// at all (`subagent-tools.ts` admits neither EnterPlanMode nor ExitPlanMode, and
+		// `isPlanModeTrait` is never true for a subagent row), so the exclusion is
+		// vacuous on their path and is deliberately not carried over.
+		if (subagentFeedback) {
+			await deliverSubagentPermissionFeedback(pending.narratorId, subagentFeedback, feedbackUserId);
+		} else if (approvalFeedback && pending.toolName !== "ExitPlanMode") {
 			const active = activeNarrators.get(pending.narratorId);
 			if (active?.alive) {
 				active._feedbackSoftStop = true;
@@ -4703,7 +4852,13 @@ export async function resolvePermission(
 	} else {
 		const userFeedback = denyMessage || feedbackText?.trim();
 		if (pending.toolName === "ExitPlanMode") {
-			const locale = activeNarrators.get(pending.narratorId)?.locale ?? "en";
+			// `pending.locale` is the locale the request was RAISED with — the same value
+			// `handlePermission` received from whichever loop opened it (a subagent passes
+			// its `SubagentExecOptions.locale`, a primary its `ActiveNarrator.locale`), and
+			// it is frozen with the request so reprocessing reuses it. Reading
+			// `activeNarrators` instead resolved to undefined for every subagent and
+			// silently degraded this message to English for Chinese users.
+			const locale = pending.locale ?? "en";
 			if (exitPlanCancelled && userFeedback) {
 				pending.resolve({ behavior: "deny", message: userFeedback, rawMessage: true });
 			} else {
@@ -4764,6 +4919,31 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 		columns: { narratorId: true },
 	});
 	return row?.narratorId ?? null;
+}
+
+/**
+ * Defer a blocking AskUserQuestion into the asynchronous inbox.
+ *
+ * A dedicated entry point rather than a flag on the generic resolve routes, because
+ * "answer later" only means anything for AskUserQuestion. Reached through the generic
+ * route, a deferral of some other pending tool would resolve it as ALLOW with a stray
+ * `async: true` in its input — i.e. silently approve an operation the user was trying to
+ * postpone. The guard belongs here, with the pending-request registry, rather than in a
+ * route that would have to reach into it.
+ */
+export async function deferPendingQuestion(
+	requestId: string,
+	opts: { userId?: string } = {},
+): Promise<{ ok: boolean; reason?: "not_found" | "not_a_question" }> {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending) return { ok: false, reason: "not_found" };
+	if (pending.toolName !== "AskUserQuestion") return { ok: false, reason: "not_a_question" };
+	const resolved = await resolvePermission(requestId, "allow", {
+		deferAsync: true,
+		userId: opts.userId,
+		decidedBy: "user",
+	});
+	return resolved ? { ok: true } : { ok: false, reason: "not_found" };
 }
 
 export async function resolvePermissionOrDangerReflection(

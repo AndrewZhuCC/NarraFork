@@ -30,12 +30,6 @@ import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
-import {
-	initKiro,
-	isKiroAvailable,
-	kiroGetCachedModels,
-	kiroRefreshModelCache,
-} from "./lib/kiro-adapter";
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
@@ -50,7 +44,7 @@ import {
 	registerRuntimeAddressGetter,
 	registerServerRestart,
 } from "./lib/server-restart";
-import { saveSettings, settings } from "./lib/settings";
+import { settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref } from "./lib/spa-base-href";
 import {
@@ -1231,67 +1225,6 @@ try {
 	void refreshAllKimiUsages().catch(() => {});
 } catch (err) {
 	logger.warn("Kimi usage startup refresh failed", { error: String(err) });
-}
-
-function resolveStartupKiroConfig(): Parameters<typeof initKiro>[0] | null {
-	const configuredCredentialsPath = settings.kiro?.credentialsPath?.trim();
-	if (configuredCredentialsPath) {
-		return {
-			credentialsPath: configuredCredentialsPath,
-			configPath:
-				settings.kiro?.configPath?.trim() ||
-				configuredCredentialsPath.replace("credentials.json", "config.json"),
-			// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-			defaultModel: settings.kiro?.defaultModel as any,
-		};
-	}
-
-	const defaultKiroDir = getNarraforkPath("kiro");
-	const defaultCredentialsPath = resolve(defaultKiroDir, "credentials.json");
-	if (!existsSync(defaultCredentialsPath)) return null;
-
-	const defaultConfigPath = resolve(defaultKiroDir, "config.json");
-	settings.kiro = {
-		...settings.kiro,
-		credentialsPath: defaultCredentialsPath,
-		configPath: settings.kiro?.configPath?.trim() || defaultConfigPath,
-	};
-	saveSettings(settings);
-	logger.info("Kiro default credentials discovered; settings updated", {
-		credentialsPath: defaultCredentialsPath,
-	});
-
-	return {
-		credentialsPath: defaultCredentialsPath,
-		configPath: settings.kiro.configPath,
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-		defaultModel: settings.kiro.defaultModel as any,
-	};
-}
-
-// Initialize Kiro plugin if configured, or if built-in manager credentials exist at the default path.
-const kiroStartupConfig = resolveStartupKiroConfig();
-if (kiroStartupConfig) {
-	try {
-		const ok = initKiro(kiroStartupConfig);
-		logger.info(`Kiro plugin: ${ok ? "initialized" : "credentials not found"}`, {
-			available: isKiroAvailable(),
-		});
-		if (ok && isKiroAvailable()) {
-			const cached = kiroGetCachedModels();
-			if (cached.length > 0) {
-				logger.info(`Kiro model cache: ${cached.length} models loaded from disk`);
-			} else {
-				kiroRefreshModelCache()
-					.then((models) =>
-						logger.info(`Kiro model cache: ${models.length} models fetched from API`),
-					)
-					.catch((err) => logger.error("Kiro model cache refresh failed", { error: String(err) }));
-			}
-		}
-	} catch (err) {
-		logger.error("Kiro plugin initialization failed", { error: String(err) });
-	}
 }
 
 // Mark any stale terminals from a previous run as exited

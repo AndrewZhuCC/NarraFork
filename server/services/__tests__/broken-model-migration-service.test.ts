@@ -179,14 +179,14 @@ describe("broken model scan classification", () => {
 				prefix: "nugtest",
 				baseUrl: "https://example.invalid",
 				apiKey: "test-key",
-				defaultModel: "kiro:down-model",
+				defaultModel: "antigravity:down-model",
 			},
 		];
 		settings.agent.customModels = [];
 		setNugCachedModels("nug-test-id", [
-			{ id: "kiro:down-model", channel: "kiro", model: "down-model", available: false },
+			{ id: "antigravity:down-model", channel: "antigravity", model: "down-model", available: false },
 		]);
-		await createNarrator({ suffix: "nug-down", model: "nugtest:kiro:down-model" });
+		await createNarrator({ suffix: "nug-down", model: "nugtest:antigravity:down-model" });
 
 		expect((await scanOurs()).groups).toHaveLength(0);
 	});

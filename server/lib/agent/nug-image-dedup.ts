@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
  * may the client drop the inline payload and send the `imageRef` alone.
  *
  * Strategy (kept entirely inside NugProvider, no changes to the shared
- * Kiro/OpenAI providers):
+ * Anthropic/OpenAI providers):
  *   - Every image gets an `imageRef` (its content hash) added so the gateway
  *     can cache/identify it.
  *   - If the ref is NOT yet confirmed cached, the inline payload is kept so the
@@ -100,70 +100,6 @@ function base64FromDataUri(s: string): string | null {
 	const meta = s.slice(0, idx);
 	if (!meta.includes(";base64")) return null;
 	return s.slice(idx + 1);
-}
-
-// === Kiro protocol ===
-
-interface KiroImageNode {
-	format?: string;
-	source?: { bytes?: string };
-	imageRef?: string;
-}
-
-interface KiroUserMessageNode {
-	userInputMessage?: {
-		images?: KiroImageNode[];
-		[k: string]: unknown;
-	};
-}
-
-/**
- * Tag every image in a built Kiro history with its `imageRef`. Confirmed-cached
- * refs additionally have their inline bytes stripped (recorded for restore);
- * unconfirmed refs keep their bytes so the gateway can cache + acknowledge them.
- * Mutates the history in place.
- */
-export function dedupKiroHistoryImages(
-	history: unknown[],
-	confirmed: ConfirmedRefSet,
-): DedupResult {
-	const result = newDedupResult();
-	if (!Array.isArray(history)) return result;
-
-	for (const msg of history) {
-		const images = (msg as KiroUserMessageNode)?.userInputMessage?.images;
-		if (!Array.isArray(images)) continue;
-		for (const img of images) {
-			const bytes = img?.source?.bytes;
-			if (typeof bytes !== "string" || bytes.length === 0) continue;
-			const ref = imageRefForBase64(bytes);
-			if (!ref) continue;
-			img.imageRef = ref;
-			if (confirmed.has(ref)) {
-				result.stripped.set(ref, bytes);
-				if (img.source) img.source.bytes = "";
-			} else {
-				result.present.push(ref);
-			}
-		}
-	}
-	return result;
-}
-
-/** Restore Kiro history image payloads stripped for one request. */
-export function restoreKiroHistoryImages(history: unknown[], payloads: ImagePayloadMap): void {
-	if (!Array.isArray(history)) return;
-	for (const msg of history) {
-		const images = (msg as KiroUserMessageNode)?.userInputMessage?.images;
-		if (!Array.isArray(images)) continue;
-		for (const img of images) {
-			if (!img.imageRef) continue;
-			const original = payloads.get(img.imageRef);
-			if (original && img.source && (!img.source.bytes || img.source.bytes.length === 0)) {
-				img.source.bytes = original;
-			}
-		}
-	}
 }
 
 // === OpenAI / Codex (Responses + Chat Completions) ===
@@ -323,11 +259,10 @@ export function restoreAnthropicHistoryImages(history: unknown[], payloads: Imag
 /**
  * Whether an error from the NUG gateway is an image cache miss (HTTP 409).
  *
- * The signal differs by path: the Kiro path surfaces the raw JSON body (which
- * contains the `image_cache_miss` code), while the OpenAI/Codex path surfaces
- * only the extracted `error.message` ("...not cached; resend them inline").
- * Within NugProvider a 409 always originates from the NUG gateway, so the status
- * alone is a reliable signal.
+ * The OpenAI/Codex path surfaces only the extracted `error.message`
+ * ("...not cached; resend them inline") rather than the raw `image_cache_miss`
+ * code. Within NugProvider a 409 always originates from the NUG gateway, so the
+ * status alone is a reliable signal.
  */
 export function isImageCacheMissError(err: unknown): boolean {
 	if (!err || typeof err !== "object") return false;

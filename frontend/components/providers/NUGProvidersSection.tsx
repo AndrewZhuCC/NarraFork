@@ -65,7 +65,6 @@ export interface NUGProviderState {
 	oauthClientSecret?: string;
 	oauthDeviceId?: string;
 	proxy?: ProxyOverride;
-	kiroAnthropicProtocol?: boolean;
 }
 
 type ProvidersUpdater = NUGProviderState[] | ((prev: NUGProviderState[]) => NUGProviderState[]);
@@ -134,7 +133,6 @@ function sanitizePrefix(value: string): string {
 }
 
 const CHANNEL_COLORS: Record<string, string> = {
-	kiro: "violet",
 	codex: "teal",
 	openai: "green",
 	anthropic: "orange",
@@ -1094,15 +1092,6 @@ export const NUGProvidersSection = React.memo(function NUGProvidersSection({
 							<ProxyOverrideField
 								value={p.proxy}
 								onChange={(next) => updateProvider(p.id, { proxy: next })}
-							/>
-							<Switch
-								size="xs"
-								checked={!!p.kiroAnthropicProtocol}
-								onChange={(e) =>
-									updateProvider(p.id, { kiroAnthropicProtocol: e.currentTarget.checked })
-								}
-								label={t("nugKiroAnthropicProtocol")}
-								description={t("nugKiroAnthropicProtocolHint")}
 							/>
 							<Group gap="xs" align="flex-end">
 								<PasswordInput

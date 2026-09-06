@@ -10,6 +10,7 @@ import {
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import type { AsyncQuestion } from "@frontend/types/narrator";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
@@ -104,6 +105,11 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
+import {
+	useAnswerAsyncQuestion,
+	useAsyncQuestions,
+	useDismissAsyncQuestion,
+} from "../../hooks/useAsyncQuestions";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
@@ -210,8 +216,8 @@ import {
 } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
 import { UserAvatar } from "../UserAvatar";
+import { toBannerQuestions } from "./async-question-questions";
 import { BackgroundTasksDrawerHost, useBackgroundTasksButton } from "./BackgroundTasksDrawer";
-
 import { ChapterBar } from "./ChapterBar";
 import { CodexQuotaIndicator } from "./CodexQuotaIndicator";
 import { CommentDraftChips } from "./CommentDraftChips";
@@ -244,6 +250,7 @@ import {
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
+import { AsyncQuestionInboxButton } from "./GlobalQuestionInbox";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -290,7 +297,12 @@ import {
 	selectHeaderToolbarEntries,
 } from "./narrator-header-toolbar-capacity";
 import { revokeContentBlockPreviewUrls } from "./narrator-message-helpers";
-import type { ContentBlock, NarratorMsg, NarratorPanelProps } from "./narrator-panel-types";
+import type {
+	AsyncQuestionSlot,
+	ContentBlock,
+	NarratorMsg,
+	NarratorPanelProps,
+} from "./narrator-panel-types";
 import {
 	ACCEPTED_TYPES,
 	formatFileSize,
@@ -476,6 +488,14 @@ function resolveBooleanOverride(value: unknown, globalDefault: boolean): boolean
 
 /** Number of queued messages before the queue collapses into a summary bar. */
 const QUEUE_COLLAPSE_THRESHOLD = 2;
+
+/**
+ * Stable empty list for the async-question inbox.
+ *
+ * A fresh `[]` per render would give the slot memo a new dependency every time and
+ * rebuild the map (and with it every mounted question form) on unrelated renders.
+ */
+const EMPTY_ASYNC_QUESTIONS: AsyncQuestion[] = [];
 
 type CompactingMarkerKind = "context" | "segment";
 
@@ -1561,25 +1581,12 @@ const ANTHROPIC_XHIGH_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] 
 ];
 
 const CODEX_REASONING_OPTIONS_BY_MODEL: Record<string, readonly ReasoningEffortValue[]> = {
-	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
-	// Includes "none" for UI display (disables reasoning). The backend counterpart
-	// (openai-provider CODEX_MODEL_REASONING_LEVELS) omits "none" because it is
-	// handled separately before the table lookup.
-	// gpt-5.6 family supports a real "max" tier (ultra exists upstream for
-	// Sol/Terra but is not surfaced in NarraFork's UI enum).
+	// GPT-6 Astra requires reasoning, so it intentionally omits `none`.
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-terra": ["none", "low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
-	"gpt-5.3-codex-spark": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.3-codex": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.2-codex": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex-max": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.1-codex": ["none", "low", "medium", "high"],
-	"gpt-5.1-codex-mini": ["none", "medium", "high"],
-	"gpt-5.2": ["none", "low", "medium", "high", "xhigh"],
 	"gpt-5.5": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.4": ["none", "low", "medium", "high", "xhigh"],
-	"gpt-5.4-mini": ["none", "low", "medium", "high", "xhigh"],
 };
 
 function getBareModelForReasoning(model?: string, modelOption?: ModelOption): string {
@@ -1606,24 +1613,8 @@ function getCodexReasoningEffortOptions(
 	return CODEX_REASONING_OPTIONS_BY_MODEL[bareModel] ?? DEFAULT_CODEX_REASONING_EFFORT_OPTIONS;
 }
 
-/**
- * Map a NUG kiro model's advertised effort levels (low/medium/high/xhigh/max)
- * onto the UI's unified enum. Levels are shown exactly as the gateway reports
- * them (matching the Kiro IDE, which has no "none" tier — these models cannot
- * disable thinking). Returns undefined when the model advertises no effort.
- */
-function getKiroReasoningEffortOptions(
-	modelOption?: ModelOption,
-): readonly ReasoningEffortValue[] | undefined {
-	const levels = modelOption?.effortLevels;
-	if (!levels || levels.length === 0) return undefined;
-	const order: ReasoningEffortValue[] = ["low", "medium", "high", "xhigh", "max"];
-	const present = new Set<ReasoningEffortValue>();
-	for (const level of levels) {
-		if ((order as string[]).includes(level)) present.add(level as ReasoningEffortValue);
-	}
-	const ordered = order.filter((l) => present.has(l));
-	return ordered.length > 0 ? ordered : undefined;
+function codexModelSupportsReasoningDisabled(model?: string, modelOption?: ModelOption): boolean {
+	return getBareModelForReasoning(model, modelOption) !== "gpt-6-astra";
 }
 
 function isDeepSeekModel(model?: string): boolean {
@@ -2536,11 +2527,6 @@ export function NarratorPanel({
 		if (!providerPrefix) return false;
 		// Codex always has tiers, regardless of the model id.
 		if (codexCapableProviders.has(providerPrefix) || isCodexChannelModel) return true;
-		// Kiro channels are authoritative: the gateway reports the exact levels a
-		// model accepts, and an empty list means it genuinely has none.
-		if (resolvedModelOption?.channelType === "kiro") {
-			return !!getKiroReasoningEffortOptions(resolvedModelOption);
-		}
 		return modelAcceptsReasoningEffort(
 			getBareModelForReasoning(resolvedModel, resolvedModelOption),
 			settingsData?.agent?.reasoningEffortBlocklist,
@@ -2556,13 +2542,6 @@ export function NarratorPanel({
 		if (!resolvedModel) return GENERIC_REASONING_EFFORT_TIERS;
 		// DeepSeek: only two effective tiers (high / max mapped from xhigh)
 		if (isDeepSeekModel(resolvedModel)) return DEEPSEEK_REASONING_EFFORT_OPTIONS;
-		// NUG kiro models: use the per-model effort levels reported by the gateway.
-		// Ahead of cards on purpose — a gateway is first-hand authoritative about
-		// the tiers its own channel accepts.
-		if (resolvedModelOption?.channelType === "kiro") {
-			const kiroOptions = getKiroReasoningEffortOptions(resolvedModelOption);
-			if (kiroOptions) return kiroOptions;
-		}
 		// Model cards: the editable replacement for the hardcoded per-model tables.
 		// `none` is appended here rather than stored on the card, because on a card
 		// it would become a clamp target able to silently turn a requested `low`
@@ -2576,7 +2555,9 @@ export function NarratorPanel({
 				)
 			: undefined;
 		if (cardTiers?.length) {
-			return ["none", ...cardTiers] as readonly ReasoningEffortValue[];
+			return codexModelSupportsReasoningDisabled(resolvedModel, resolvedModelOption)
+				? (["none", ...cardTiers] as readonly ReasoningEffortValue[])
+				: (cardTiers as readonly ReasoningEffortValue[]);
 		}
 		const providerPrefix = resolvedModel.split(":")[0];
 		if (providerPrefix && (codexCapableProviders.has(providerPrefix) || isCodexChannelModel)) {
@@ -3405,6 +3386,7 @@ export function NarratorPanel({
 		activeCompactStart,
 		prunedPercent,
 		compactProgress,
+		compactFailure,
 		quotaBalance,
 		detailedQuotaBalance,
 		retryInfo,
@@ -3837,6 +3819,58 @@ export function NarratorPanel({
 	);
 	const [deletePreviewMessageId, setDeletePreviewMessageId] = useState<string | null>(null);
 	const [pendingDeleteCallback, setPendingDeleteCallback] = useState<(() => void) | null>(null);
+
+	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
+	//
+	// Kept entirely apart from `renderPermCb.pendingPermissions`: nothing is suspended
+	// waiting for these, so they must not reach the composer send gate, the Enter-key
+	// binding or the attention notifications, all of which read that list to mean "the
+	// session is blocked on the user".
+	//
+	// This per-narrator query feeds the INLINE forms on the tool cards. The inbox button
+	// above the composer reads the cross-session query instead (it has to be able to say
+	// "2 waiting elsewhere"), and both are kept in step by invalidating the narrator
+	// and global inbox queries on every decision.
+	const { data: asyncQuestionData } = useAsyncQuestions(narratorId, !isWorkspacePreview);
+	const answerAsyncQuestion = useAnswerAsyncQuestion(narratorId);
+	const dismissAsyncQuestion = useDismissAsyncQuestion(narratorId);
+	const [busyAsyncQuestionId, setBusyAsyncQuestionId] = useState<string | null>(null);
+	const openAsyncQuestions = asyncQuestionData?.items ?? EMPTY_ASYNC_QUESTIONS;
+	const asyncQuestionSlots = useMemo(() => {
+		const map = new Map<string, AsyncQuestionSlot>();
+		for (const question of openAsyncQuestions) {
+			if (!question.toolUseId) continue;
+			map.set(question.toolUseId, {
+				id: question.id,
+				draftId: question.toolCallId,
+				questions: toBannerQuestions(question.questions),
+				busy: busyAsyncQuestionId === question.id,
+				denyLabel: t("asyncQuestionDismiss"),
+				awaited: question.awaited,
+				awaitedLabel: t("asyncQuestionAwaitedNotice"),
+				onSubmit: (questionId, answers) => {
+					setBusyAsyncQuestionId(questionId);
+					answerAsyncQuestion.mutate(
+						{ questionId, answers },
+						{ onSettled: () => setBusyAsyncQuestionId(null) },
+					);
+				},
+				onDismiss: (questionId) => {
+					setBusyAsyncQuestionId(questionId);
+					dismissAsyncQuestion.mutate(
+						{ questionId },
+						{ onSettled: () => setBusyAsyncQuestionId(null) },
+					);
+				},
+			});
+		}
+		return map;
+	}, [openAsyncQuestions, busyAsyncQuestionId, answerAsyncQuestion, dismissAsyncQuestion, t]);
+	const permCbWithAsyncQuestions = useMemo(
+		() => ({ ...renderPermCb, asyncQuestions: asyncQuestionSlots }),
+		[renderPermCb, asyncQuestionSlots],
+	);
+
 	// Get the first pending Write/Edit permission for the drawer
 	const firstEditPermission = useMemo(() => {
 		for (const perm of renderPermCb.pendingPermissions) {
@@ -4313,7 +4347,16 @@ export function NarratorPanel({
 		if (generatingTitle) return;
 		const trimmed = titleValue.trim();
 		if (trimmed && trimmed !== narrator?.title) {
-			await api.updateNarratorTitle(narratorId, trimmed);
+			try {
+				await api.updateNarratorTitle(narratorId, trimmed);
+			} catch {
+				// Stay in edit mode: the text the user typed is only in this input, and
+				// leaving it would drop it. Without this the failure was invisible AND
+				// unrecoverable — every click-away re-fired the blur handler and failed
+				// again, so the field looked stuck for no stated reason.
+				notifications.show({ message: t("titleUpdateFailed"), color: "red", autoClose: 4000 });
+				return;
+			}
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
 		}
 		setEditingTitle(false);
@@ -4324,12 +4367,16 @@ export function NarratorPanel({
 			const { title } = await api.generateNarratorTitle(narratorId);
 			setTitleValue(title);
 			qc.invalidateQueries({ queryKey: ["narrators", narratorId], exact: true });
+		} catch {
+			notifications.show({ message: t("generateTitleFailed"), color: "red", autoClose: 4000 });
 		} finally {
 			setGeneratingTitle(false);
 		}
 	};
 	const handleTitleKeyDown = (e: React.KeyboardEvent) => {
-		if (e.key === "Enter") {
+		// See AskInPassingCard: Enter during IME composition is the candidate pick,
+		// not a submit.
+		if (e.key === "Enter" && !e.nativeEvent.isComposing) {
 			e.preventDefault();
 			saveTitle();
 		} else if (e.key === "Escape") {
@@ -6467,11 +6514,11 @@ export function NarratorPanel({
 					if (dock) dock.toggleToolPanel(id);
 					else setMobileToolPanel((current) => (current === id ? null : id));
 					return;
-				// Dock-only (registry `hosts: ["dock"]`): these panels exist beside the
-				// transcript, so there is no drawer fallback to offer.
 				case "filetree":
 					dock?.toggleToolPanel("filetree");
 					return;
+				// Dock-only (registry `hosts: ["dock"]`): the panel exists to sit beside the
+				// transcript while a slider moves, so there is no drawer fallback to offer.
 				case "appearance":
 					dock?.toggleToolPanel("appearance");
 					return;
@@ -6582,6 +6629,7 @@ export function NarratorPanel({
 		hasSpecTask: !!currentSpecTask,
 		isWaiting,
 		isPlanning,
+		hasCompactFailure: compactFailure != null,
 	});
 	// `compactProgressText` is non-null whenever either compact flag is set; the
 	// fallback only keeps the template from interpolating "null".
@@ -7716,7 +7764,7 @@ export function NarratorPanel({
 																onLodStep={handleLodStep}
 																onSelectionResolverChange={setChunkSelectionResolver}
 																rowHandlers={vlistRowHandlers}
-																permCb={renderPermCb}
+																permCb={permCbWithAsyncQuestions}
 																pruneDividerLabel={pruneDividerLabel}
 																hasChapter={hasChapter}
 																highlightMessageId={highlightMessageId}
@@ -8227,6 +8275,16 @@ export function NarratorPanel({
 											· {t("backgroundCompactingShort")} · {compactProgressFragment}
 										</Text>
 									)}
+									{workIndicatorPlan.showCompactFailureSuffix && (
+										<Text
+											size="xs"
+											c="red"
+											style={{ flexShrink: 0 }}
+											title={compactFailure?.error || undefined}
+										>
+											· {t("compactFailed")}
+										</Text>
+									)}
 								</Group>
 							</UnstyledButton>
 						) : (
@@ -8241,6 +8299,16 @@ export function NarratorPanel({
 									}}
 								/>
 								<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />
+								{compactFailure && !isCompacting && (
+									<Text
+										size="xs"
+										c="red"
+										style={{ flexShrink: 0 }}
+										title={compactFailure.error || undefined}
+									>
+										· {t("compactFailed")}
+									</Text>
+								)}
 								{turnElapsedText && !isWorkspacePreview && (
 									<TurnElapsedTime
 										text={`· ${t("lastTurnDuration", { duration: turnElapsedText })}`}
@@ -8905,6 +8973,22 @@ export function NarratorPanel({
 							</>
 						)}
 					</NarratorStatusBar>
+
+					{/* Question inbox, directly above the composer.
+					    This is where the user is when they are about to act, and an unanswered
+					    question IS an action. The two alternatives were worse: a banner in the
+					    message area scrolls away with the conversation, and the header toolbar
+					    has a capacity budget that DROPS entries when it overflows — a question
+					    waiting on the user must never be what gets dropped.
+
+					    Renders nothing when no question is open anywhere, so it costs no space
+					    in the common case. Scoped to the current session for its label and
+					    grouping, but the drawer it opens spans every session. */}
+					{!isWorkspacePreview && (
+						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
+							<AsyncQuestionInboxButton currentNarratorId={narratorId} />
+						</Box>
+					)}
 
 					{/* Input */}
 					{isWorkspacePreview ? null : isChapterMerged ? (

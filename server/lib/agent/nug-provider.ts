@@ -1,52 +1,27 @@
-import type {
-	KiroChatRequest,
-	KiroHistoryAssistantMessage,
-	KiroHistoryMessage,
-	KiroHistoryUserMessage,
-	KiroImage,
-	KiroToolResult,
-} from "../kiro-adapter";
-import { prepareKiroWorkspaceState } from "../kiro-workspace-telemetry";
 import { resolveProxyForUrl } from "../net/proxy";
 import {
-	dropNugCachedCapability,
 	getNugCachedModelHash,
-	nugSupportsCapability,
 	type ResolvedNugModelMeta,
 	resolveNugModelMeta,
 	setNugCachedCapabilities,
 } from "../nug-model-cache";
 import { applyNugModelCatalogUpdate } from "../nug-model-sync";
-import { getToolMessage, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
 import type { NUGProviderConfig } from "../settings";
-import { settings } from "../settings";
-import type { UsageData } from "../usage-tracking";
+
 import { AnthropicProvider } from "./anthropic-provider";
-import { hostHistoryRuntime, hostNormalizeRuntime } from "./codewhisperer-host-runtime";
-import { CodexRebuildHistoryRetryError } from "./codex-errors";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
-import { normalizeApiRequestDiagnostics, parseErrorDiagnostics } from "./error-diagnostics";
-import {
-	buildKiroHistory,
-	buildKiroReasoningContent,
-	buildKiroRequest,
-	extractImageFileName,
-	normalizeKiroChatRequest,
-	parseSSEStream,
-} from "./kiro-protocol";
+
 import { buildNugDelegateBaseConfig } from "./nug-delegate-config";
 import {
 	BoundedConfirmedRefSet,
 	type ConfirmedRefSet,
 	type DedupResult,
 	dedupAnthropicHistoryImages,
-	dedupKiroHistoryImages,
 	dedupOpenAIHistoryImages,
 	type ImagePayloadMap,
 	isImageCacheMissError,
 	restoreAnthropicHistoryImages,
-	restoreKiroHistoryImages,
 	restoreOpenAIHistoryImages,
 } from "./nug-image-dedup";
 import { OpenAIProvider } from "./openai-provider";
@@ -58,9 +33,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { DEFAULT_DUMP_MAX_BYTES, sanitizeHeaders } from "./request-dump";
-import { resolveModel } from "./resolve-model";
-import { ensureNonEmptySchema, resolveToolJsonSchema } from "./tool-registry";
+
 import {
 	type AgentToolUse,
 	ApiError,
@@ -71,45 +44,6 @@ import {
 /** Create an API error with bounded diagnostics for retry detection and persistence. */
 function httpError(message: string, status: number, diagnostics?: ApiRequestDiagnostics): Error {
 	return new ApiError(status, message, diagnostics);
-}
-
-function nugResponseDiagnostics(
-	response: Response,
-	bodyText: string,
-	defaults: Partial<ApiRequestDiagnostics> = {},
-): ApiRequestDiagnostics | undefined {
-	let payload: Record<string, unknown> = {};
-	try {
-		const parsed = JSON.parse(bodyText);
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			payload = parsed as Record<string, unknown>;
-		}
-	} catch {
-		// Non-JSON upstream bodies are retained only as a bounded snippet below.
-	}
-	const parsed = parseErrorDiagnostics(payload, {
-		source: "gateway",
-		phase: "http_response",
-		statusCode: response.status,
-		requestId: response.headers.get("x-request-id") ?? undefined,
-		responseHeaders: sanitizeHeaders(response.headers),
-		responseSnippet: bodyText,
-		transport: "http",
-		...defaults,
-	});
-	return (
-		parsed ??
-		normalizeApiRequestDiagnostics({
-			source: "gateway",
-			phase: "http_response",
-			statusCode: response.status,
-			requestId: response.headers.get("x-request-id") ?? undefined,
-			responseHeaders: sanitizeHeaders(response.headers),
-			responseSnippet: bodyText,
-			transport: "http",
-			...defaults,
-		})
-	);
 }
 
 /**
@@ -129,19 +63,6 @@ function confirmedRefSetFor(key: string): ConfirmedRefSet {
 		confirmedImageRefsByGateway.set(key, set);
 	}
 	return set;
-}
-
-function toUsageData(usage: ParsedStreamEvent["usage"]): UsageData | undefined {
-	if (!usage) return undefined;
-	return {
-		inputTokens: usage.inputTokens ?? usage.promptTokens ?? 0,
-		outputTokens: usage.completionTokens ?? 0,
-		cachedInputTokens: usage.cachedInputTokens ?? 0,
-		cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
-		cacheCreation5mInputTokens: usage.cacheCreation5mTokens ?? 0,
-		cacheCreation1hInputTokens: usage.cacheCreation1hTokens ?? 0,
-		reasoningTokens: usage.reasoningTokens ?? 0,
-	};
 }
 
 export interface NugUsageEvent {
@@ -225,30 +146,16 @@ export interface NugBillingOrderResponse {
 	pollIntervalMs?: number;
 }
 
-/**
- * Capability name for the Anthropic-protocol Kiro endpoint (`/v1/kiro/messages`).
- *
- * Must match the string the gateway publishes in `/v1/models`. The two sides have
- * no compile-time link, so a rename on either would silently send every Kiro
- * request down the legacy path — which still works, and is therefore invisible.
- */
-const KIRO_MESSAGES_CAPABILITY = "kiro.messages.v1";
-
 const NUG_MODEL_HASH_HEADER = "X-NUG-Model-Hash";
 const NUG_UNKNOWN_MODEL_HASH = "none";
 const MAX_CONFIRMED_IMAGE_REFS_PER_GATEWAY = 4096;
-/** Effort levels accepted as a Kiro reasoning hint. */
-const KIRO_EFFORT_HINTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
 /**
  * NUG (Narrafork Unified Gateway) provider adapter.
  *
- * Communicates with a remote NUG service. For Kiro-channel models, uses the
- * Kiro native protocol (same as the standalone Kiro provider). For other channels, uses the
- * unified /v1/chat endpoint or channel-specific endpoints.
- *
- * The Kiro protocol path reuses the same request building, history formatting,
- * and SSE event parsing as KiroProvider.
+ * Communicates with a remote NUG service. For each supported channel type
+ * (anthropic, openai, codex, responses), creates a typed delegate that handles
+ * request building, history formatting, and SSE parsing.
  */
 export class NugProvider implements ProviderAdapter {
 	private config: NUGProviderConfig;
@@ -272,12 +179,11 @@ export class NugProvider implements ProviderAdapter {
 	}
 
 	/**
-	 * NUG only leaks XML tool calls on its native Kiro channel (no delegate). When a
-	 * delegate handles the request (anthropic/openai/codex/responses) it uses native
-	 * tool-use fields, so leak diagnostics/recovery are unnecessary there.
+	 * All NUG channels use typed delegates with native tool-use fields, so XML
+	 * tool call leakage does not occur.
 	 */
 	get mayLeakXmlToolCalls(): boolean {
-		return this.activeDelegate == null;
+		return false;
 	}
 
 	private get baseUrl(): string {
@@ -293,25 +199,6 @@ export class NugProvider implements ProviderAdapter {
 
 	private modelHashHeaders(): Record<string, string> {
 		return { [NUG_MODEL_HASH_HEADER]: this.modelHashHeaderValue() };
-	}
-
-	private chatHeaders(conversationId?: string, effort?: string): Record<string, string> {
-		const h: Record<string, string> = {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${this.config.apiKey}`,
-			Accept: "text/event-stream",
-			...this.modelHashHeaders(),
-		};
-		if (conversationId) {
-			h["X-Conversation-ID"] = conversationId;
-		}
-		// Kiro reasoning-effort hint. NUG's kiro channel injects the upstream
-		// additionalModelRequestFields based on this and the model's effort schema.
-		// Send only effort levels accepted by the Kiro channel.
-		if (effort && KIRO_EFFORT_HINTS.has(effort)) {
-			h["X-Kiro-Effort"] = effort;
-		}
-		return h;
 	}
 
 	private resolveMeta(model: string): ResolvedNugModelMeta {
@@ -375,34 +262,6 @@ export class NugProvider implements ProviderAdapter {
 				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
 				return delegate;
 			}
-			case "kiro": {
-				// Gateways that serve `/v1/kiro/messages` speak Anthropic Messages on
-				// the Kiro channel, in both directions. Delegating means this provider
-				// reuses the Anthropic request builder and SSE parser instead of
-				// carrying its own CodeWhisperer implementation.
-				//
-				// Older gateways do not have that endpoint, so the capability has to be
-				// advertised first; without it the native path below still runs.
-				if (!this.supportsKiroMessages()) return null;
-				const delegate = new AnthropicProvider({
-					...delegateBase,
-					baseUrl: `${this.baseUrl}/v1/kiro`,
-					// Not the official API: the mid-conversation `system` role is
-					// unavailable here, which is what makes the history builder lift
-					// trailing sys rows into `trailingUserText` (see its comment) —
-					// exactly the behaviour the Kiro path needs.
-					officialApi: false,
-				});
-				// Signatures minted by this channel are only valid against it, so they
-				// carry the channel identity rather than a generic anthropic one.
-				delegate.setReasoningSourceOverride(this.reasoningSourceForMeta(meta));
-				// The Anthropic Messages protocol has no conversation-id field, so this
-				// header is the only way the gateway can key credential affinity for a
-				// multi-turn conversation. Without it every turn may land on a different
-				// upstream credential.
-				delegate.setSendConversationIdHeader(true);
-				return delegate;
-			}
 			default:
 				return null;
 		}
@@ -419,7 +278,6 @@ export class NugProvider implements ProviderAdapter {
 	 */
 	private reasoningSourceForMeta(meta: ResolvedNugModelMeta): string | undefined {
 		if (
-			meta.channelType === "kiro" ||
 			meta.channelType === "anthropic" ||
 			meta.channelType === "codex" ||
 			meta.channelType === "openai" ||
@@ -428,61 +286,6 @@ export class NugProvider implements ProviderAdapter {
 			return `${this.config.prefix}:${meta.channel}`;
 		}
 		return undefined;
-	}
-
-	/**
-	 * Whether this gateway serves the Anthropic-protocol Kiro endpoint.
-	 *
-	 * False for any gateway that has not advertised it, which covers every build
-	 * predating the endpoint as well as one whose advertisement was withdrawn after
-	 * a 404 (see `noteKiroMessagesUnavailable`). False keeps the native Kiro path,
-	 * so an old gateway is unaffected.
-	 */
-	private supportsKiroMessages(): boolean {
-		// Two independent conditions, both required.
-		//
-		// The operator opt-in comes first because it is the one a human controls: a
-		// gateway that advertises the endpoint must still not change this client's
-		// behaviour until someone has verified it end to end. Turning the flag off
-		// is the rollback.
-		if (!this.config.kiroAnthropicProtocol) return false;
-		return nugSupportsCapability(this.config.id, KIRO_MESSAGES_CAPABILITY);
-	}
-
-	/**
-	 * Record that the endpoint is absent despite being advertised, and report
-	 * whether that is new information.
-	 *
-	 * The catalog and the served routes can disagree: rolling the gateway image
-	 * back leaves a cached catalog from the newer build, so the advertisement
-	 * outlives the endpoint. Without this the provider would keep targeting a 404
-	 * on every turn.
-	 */
-	private noteKiroMessagesUnavailable(): boolean {
-		return dropNugCachedCapability(this.config.id, KIRO_MESSAGES_CAPABILITY);
-	}
-
-	/**
-	 * Whether a failure means the advertised Kiro endpoint is not actually served.
-	 *
-	 * Narrow on purpose. Three conditions must all hold:
-	 *
-	 *  - the request went to the Kiro channel through the Anthropic delegate, so a
-	 *    404 from any other channel is somebody else's problem;
-	 *  - nothing was streamed yet, because a 404 mid-stream is not a routing
-	 *    problem and re-running the turn would duplicate delivered output;
-	 *  - the status is exactly 404. A 403/401 means the endpoint exists but the key
-	 *    is wrong, and withdrawing the capability there would hide an auth failure
-	 *    behind a silent protocol downgrade.
-	 */
-	private isKiroMessagesMissing(
-		err: unknown,
-		meta: ResolvedNugModelMeta,
-		yielded: boolean,
-	): boolean {
-		if (meta.channelType !== "kiro" || yielded) return false;
-		if (!(this.activeDelegate instanceof AnthropicProvider)) return false;
-		return err instanceof ApiError && err.status === 404;
 	}
 
 	private ensureDelegateForModel(model: string): ProviderAdapter | null {
@@ -543,13 +346,8 @@ export class NugProvider implements ProviderAdapter {
 					: tools;
 			return this.activeDelegate.formatTools(effectiveTools);
 		}
-		return tools.map((tool) => ({
-			toolSpecification: {
-				name: tool.name,
-				description: tool.description,
-				inputSchema: { json: ensureNonEmptySchema(resolveToolJsonSchema(tool)) },
-			},
-		}));
+		// Unreachable: all supported channel types create a delegate.
+		return tools;
 	}
 
 	async buildHistory(
@@ -567,20 +365,14 @@ export class NugProvider implements ProviderAdapter {
 			// here.
 			return this.activeDelegate.buildHistory(dbMessages, this.modelForDelegate(meta), narratorId);
 		}
-		return buildKiroHistory(
-			dbMessages,
-			meta.bareModel,
-			narratorId,
-			this.getActiveReasoningSource(),
-			hostHistoryRuntime(),
-		);
+		// Unreachable: all supported channel types create a delegate.
+		return { history: [], trailingToolResults: [] };
 	}
 
 	getActiveReasoningSource(): string | undefined {
 		if (this.activeDelegate?.getActiveReasoningSource) {
 			return this.activeDelegate.getActiveReasoningSource();
 		}
-		// Native Kiro channel path: identity is provider:channel.
 		return this.activeMeta ? this.reasoningSourceForMeta(this.activeMeta) : undefined;
 	}
 
@@ -598,25 +390,7 @@ export class NugProvider implements ProviderAdapter {
 				this.modelForDelegate(this.activeMeta),
 				locale,
 			);
-			return;
 		}
-		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
-		const h = history as KiroHistoryMessage[];
-		const ack = getToolMessage("systemPromptAck", (locale ?? "en") as Locale);
-		h.unshift(
-			{
-				userInputMessage: {
-					content: systemPrompt,
-					modelId,
-					userInputMessageContext: {},
-				},
-			},
-			{
-				assistantResponseMessage: {
-					content: ack,
-				},
-			},
-		);
 	}
 
 	async *chat(params: ChatParams): AsyncGenerator<ParsedStreamEvent> {
@@ -634,27 +408,19 @@ export class NugProvider implements ProviderAdapter {
 		// so any stripped payload is restored once this attempt finishes (success,
 		// failure, or early close) to avoid leaving the persistent history empty.
 		//
-		// The history shape depends on the channel: anthropic uses Messages-API
-		// image parts, codex/openai use OpenAI image parts, and the kiro path
-		// uses Kiro images.
+		// The history shape depends on the delegate: anthropic uses Messages-API
+		// image parts, codex/openai use OpenAI image parts. Dispatching on the
+		// delegate type ensures the dedup walker matches the actual shape.
 		const history = Array.isArray(params.history) ? params.history : undefined;
 		const confirmed = this.confirmedImageRefs;
-		// The dedup walker has to match the shape the history actually holds, which
-		// is decided by the delegate rather than the channel name: a kiro channel
-		// reached through the Anthropic endpoint carries Messages-API image parts,
-		// while the native kiro path carries Kiro images. Dispatching on the channel
-		// alone would walk the wrong shape, find no images, and silently disable
-		// dedup — every turn would resend full payloads.
 		const usesAnthropicHistory = delegate instanceof AnthropicProvider;
 		const dedupHistory = (h: unknown[]): DedupResult => {
 			if (usesAnthropicHistory) return dedupAnthropicHistoryImages(h, confirmed);
-			if (delegate) return dedupOpenAIHistoryImages(h, confirmed);
-			return dedupKiroHistoryImages(h, confirmed);
+			return dedupOpenAIHistoryImages(h, confirmed);
 		};
 		const restoreHistory = (h: unknown[], p: ImagePayloadMap): void => {
 			if (usesAnthropicHistory) restoreAnthropicHistoryImages(h, p);
-			else if (delegate) restoreOpenAIHistoryImages(h, p);
-			else restoreKiroHistoryImages(h, p);
+			else restoreOpenAIHistoryImages(h, p);
 		};
 		const dedup: DedupResult | undefined = history ? dedupHistory(history) : undefined;
 		let restored = false;
@@ -669,7 +435,9 @@ export class NugProvider implements ProviderAdapter {
 				? this.filterModelCatalogEvents(
 						delegate.chat({ ...params, model: this.modelForDelegate(meta) }),
 					)
-				: this.filterModelCatalogEvents(this.chatKiro(params, meta));
+				: (async function* () {
+						// Unreachable: all supported channel types create a delegate.
+					})();
 
 		let yielded = false;
 		let cacheMiss = false;
@@ -680,23 +448,6 @@ export class NugProvider implements ProviderAdapter {
 			}
 			return;
 		} catch (err) {
-			// The advertised Kiro endpoint is absent: the gateway was rolled back to a
-			// build without it while this client still holds the newer catalog.
-			//
-			// Retrying here is not possible — `params.history` was already built in
-			// the delegate's Anthropic shape, and the native path would hand that to
-			// the Kiro request builder. So the capability is withdrawn (making every
-			// later turn take the native path) and the outer loop is asked to rebuild
-			// history from the database and retry, reusing the mechanism Codex quota
-			// failover already uses for the same reason.
-			if (this.isKiroMessagesMissing(err, meta, yielded)) {
-				this.noteKiroMessagesUnavailable();
-				restore();
-				throw new CodexRebuildHistoryRetryError(
-					"NUG gateway no longer serves /v1/kiro/messages; retrying on the native Kiro protocol",
-					{ operation: "nug_kiro_messages_unavailable" },
-				);
-			}
 			// A cache miss can only occur before any stream event (the gateway
 			// rejects during body resolution). If we already streamed events, or
 			// nothing was stripped, propagate the error.
@@ -718,86 +469,6 @@ export class NugProvider implements ProviderAdapter {
 		yield* runOnce();
 	}
 
-	private async *chatKiro(
-		params: ChatParams,
-		meta: ResolvedNugModelMeta,
-	): AsyncGenerator<ParsedStreamEvent> {
-		const request = normalizeKiroChatRequest(
-			buildKiroRequest({ ...params, model: meta.bareModel }),
-			hostNormalizeRuntime(),
-		);
-		prepareKiroWorkspaceState(request);
-
-		const body = { model: meta.routedModel, ...request };
-		const conversationId = request.conversationState?.conversationId ?? params.conversationId;
-		const headers = this.chatHeaders(conversationId, params.reasoningEffort);
-		params.requestDump?.setRequest({
-			transport: "http",
-			url: `${this.baseUrl}/v1/kiro/chat`,
-			headers: sanitizeHeaders(headers),
-			body,
-		});
-
-		const bodyText = JSON.stringify(body);
-		params.onRequestStart?.();
-		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
-			method: "POST",
-			headers,
-			body: bodyText,
-			signal: params.signal,
-		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
-		params.requestDump?.setResponseMeta({
-			status: response.status,
-			headers: sanitizeHeaders(response.headers),
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw httpError(
-				`NUG chat error ${response.status}: ${errText}`,
-				response.status,
-				nugResponseDiagnostics(response, errText, {
-					endpoint: "/v1/kiro/chat",
-					model: meta.routedModel,
-				}),
-			);
-		}
-
-		if (!response.body) {
-			throw httpError(
-				"NUG returned no response body",
-				502,
-				nugResponseDiagnostics(response, "NUG returned no response body", {
-					phase: "response_body",
-					statusCode: 502,
-					endpoint: "/v1/kiro/chat",
-					model: meta.routedModel,
-				}),
-			);
-		}
-
-		yield* parseSSEStream(response.body, {
-			parseTextToolCalls: params.tools.length > 0,
-			model: meta.bareModel,
-		});
-		if (responseTextPromise) {
-			params.requestDump?.setResponseBodyTextWithLimit(
-				await responseTextPromise,
-				settings.agent?.requestDumpMaxSize ?? DEFAULT_DUMP_MAX_BYTES,
-			);
-		}
-	}
-
 	formatToolResult(
 		toolUseId: string,
 		output: string,
@@ -808,20 +479,8 @@ export class NugProvider implements ProviderAdapter {
 		if (this.activeDelegate) {
 			return this.activeDelegate.formatToolResult(toolUseId, output, isError, images, toolName);
 		}
-		const result: KiroToolResult & { _images?: KiroImage[]; _imageLabel?: string } = {
-			toolUseId,
-			content: [{ text: output }],
-			status: isError ? "error" : "success",
-			isError,
-		};
-		if (images?.length) {
-			result._images = images.map((img) => ({
-				format: img.format as KiroImage["format"],
-				source: { bytes: img.base64 },
-			}));
-			result._imageLabel = extractImageFileName(output) ?? "image";
-		}
-		return result;
+		// Unreachable: all supported channel types create a delegate.
+		return { toolUseId, content: [{ text: output }], isError };
 	}
 
 	pushUserTurn(
@@ -840,26 +499,7 @@ export class NugProvider implements ProviderAdapter {
 				toolResults,
 				images,
 			);
-			return;
 		}
-		const modelId = this.activeMeta?.bareModel ?? resolveModel(model);
-		const h = history as KiroHistoryMessage[];
-		const kiroImages = images?.map((img) => ({
-			format: img.format as KiroImage["format"],
-			source: { bytes: img.base64 },
-		}));
-
-		const userMsg: KiroHistoryUserMessage = {
-			userInputMessage: {
-				content,
-				modelId,
-				origin: "AI_EDITOR",
-				...(kiroImages?.length ? { images: kiroImages } : {}),
-				userInputMessageContext:
-					toolResults.length > 0 ? { toolResults: toolResults as KiroToolResult[] } : {},
-			},
-		};
-		h.push(userMsg);
 	}
 
 	pushAssistantTurn(
@@ -904,32 +544,7 @@ export class NugProvider implements ProviderAdapter {
 				textOutputIndex,
 				redactedThinkingBlocks,
 			);
-			return;
 		}
-		const h = history as KiroHistoryMessage[];
-		// NOTE: upstream Kiro service requires snake_case "reasoning_content",
-		// not camelCase "reasoningContent".
-		const reasoningContent = buildKiroReasoningContent(
-			reasoningBlocks,
-			redactedThinkingBlocks,
-			this.getActiveReasoningSource(),
-		);
-		const assistantMsg: KiroHistoryAssistantMessage = {
-			assistantResponseMessage: {
-				content: text || "",
-				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-				...(toolUses.length > 0
-					? {
-							toolUses: toolUses.map((tu) => ({
-								toolUseId: tu.toolUseId,
-								name: tu.name,
-								input: tu.input,
-							})),
-						}
-					: {}),
-			},
-		};
-		h.push(assistantMsg);
 	}
 
 	async generate(text: string, model: string): Promise<string> {
@@ -955,80 +570,8 @@ export class NugProvider implements ProviderAdapter {
 				options,
 			);
 		}
-		const modelId = meta.bareModel;
-		const request: KiroChatRequest = {
-			conversationState: {
-				conversationId: crypto.randomUUID(),
-				chatTriggerType: "MANUAL",
-				...(systemInstruction
-					? {
-							history: [
-								{
-									userInputMessage: {
-										content: systemInstruction,
-										modelId,
-										origin: "AI_EDITOR",
-									},
-								},
-								{
-									assistantResponseMessage: {
-										content: "Understood.",
-									},
-								},
-							] as KiroHistoryMessage[],
-						}
-					: {}),
-				currentMessage: {
-					userInputMessage: {
-						content: text,
-						modelId,
-						origin: "AI_EDITOR",
-						userInputMessageContext: {},
-					},
-				},
-			},
-		};
-
-		prepareKiroWorkspaceState(request);
-		const body = { model: meta.routedModel, ...request };
-		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
-			method: "POST",
-			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw httpError(`NUG generate error ${response.status}: ${errText}`, response.status);
-		}
-
-		const chunks: string[] = [];
-		let contextPercent: number | undefined;
-		let usage: UsageData | undefined;
-		let credentialId: string | undefined;
-		let meterUsage: number | undefined;
-		let meterUnit: string | undefined;
-
-		if (response.body) {
-			for await (const evt of parseSSEStream(response.body)) {
-				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) {
-					chunks.push(evt.text);
-					await options?.onTextDelta?.(evt.text);
-				}
-				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
-				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
-				if (evt.usage) usage = toUsageData(evt.usage);
-				if (evt.credentialId) credentialId = evt.credentialId;
-				if (evt.metering) {
-					meterUsage = evt.metering.usage;
-					meterUnit = evt.metering.unit;
-				}
-			}
-		}
-
-		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
+		// Unreachable: all supported channel types create a delegate.
+		return { text: "" };
 	}
 
 	async generateWithHistory(
@@ -1079,81 +622,8 @@ export class NugProvider implements ProviderAdapter {
 				),
 			};
 		}
-		const modelId = meta.bareModel;
-		const ack = getToolMessage("titleAck", (locale ?? "en") as Locale);
-		const reminder = getToolMessage("titleReminder", (locale ?? "en") as Locale);
-
-		const request: KiroChatRequest = {
-			conversationState: {
-				conversationId: crypto.randomUUID(),
-				chatTriggerType: "MANUAL",
-				history: [
-					{
-						userInputMessage: {
-							content: systemInstruction,
-							modelId,
-							origin: "AI_EDITOR",
-						},
-					},
-					{
-						assistantResponseMessage: {
-							content: ack,
-						},
-					},
-				] as KiroHistoryMessage[],
-				currentMessage: {
-					userInputMessage: {
-						content: `${reminder}\n\n${content}`,
-						modelId,
-						userInputMessageContext: {},
-						origin: "AI_EDITOR",
-					},
-				},
-			},
-		};
-
-		prepareKiroWorkspaceState(request);
-		const body = { model: meta.routedModel, ...request };
-		const response = await this.pfetch(`${this.baseUrl}/v1/kiro/chat`, {
-			method: "POST",
-			headers: this.chatHeaders(request.conversationState.conversationId, options?.reasoningEffort),
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			throw httpError(
-				`NUG generateWithHistory error ${response.status}: ${errText}`,
-				response.status,
-			);
-		}
-
-		const chunks: string[] = [];
-		let contextPercent: number | undefined;
-		let usage: UsageData | undefined;
-		let credentialId: string | undefined;
-		let meterUsage: number | undefined;
-		let meterUnit: string | undefined;
-		if (response.body) {
-			for await (const evt of parseSSEStream(response.body)) {
-				if (this.consumeModelCatalogEvent(evt)) continue;
-				if (evt.text != null) {
-					chunks.push(evt.text);
-					await options?.onTextDelta?.(evt.text);
-				}
-				if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
-				if (evt.contextUsagePercentage != null) contextPercent = evt.contextUsagePercentage;
-				if (evt.usage) usage = toUsageData(evt.usage);
-				if (evt.credentialId) credentialId = evt.credentialId;
-				if (evt.metering) {
-					meterUsage = evt.metering.usage;
-					meterUnit = evt.metering.unit;
-				}
-			}
-		}
-
-		return { text: chunks.join(""), contextPercent, usage, credentialId, meterUsage, meterUnit };
+		// Unreachable: all supported channel types create a delegate.
+		return { text: "" };
 	}
 
 	// === NUG-specific methods (for frontend proxy routes) ===

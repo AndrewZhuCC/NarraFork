@@ -31,7 +31,7 @@ function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
 		result.auth = auth;
 	}
 	// Mask API keys in provider arrays
-	for (const key of ["openaiProviders", "anthropicProviders", "nugProviders", "clineProviders"]) {
+	for (const key of ["openaiProviders", "anthropicProviders", "nugProviders"]) {
 		const arr = result[key];
 		if (Array.isArray(arr)) {
 			result[key] = arr.map((p: Record<string, unknown>) => {
@@ -40,11 +40,6 @@ function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
 				return masked;
 			});
 		}
-	}
-	if (result.kiro && typeof result.kiro === "object") {
-		const kiro = { ...(result.kiro as Record<string, unknown>) };
-		if (typeof kiro.credentialsPath === "string") kiro.credentialsPath = "***MASKED***";
-		result.kiro = kiro;
 	}
 	return result;
 }

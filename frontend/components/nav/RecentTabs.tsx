@@ -117,7 +117,11 @@ import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { copyTextToClipboard } from "../../lib/clipboard";
 import { clearFaviconAlert, setFaviconAlert } from "../../lib/favicon";
-import { clearNotifiedAttention, triggerNotification } from "../../lib/notification";
+import {
+	clearNotifiedAttention,
+	triggerNotification,
+	updateAsyncQuestionAttention,
+} from "../../lib/notification";
 import { endDrag, moveDrag, startDragManual, startPointerDrag } from "../../lib/panel-drag";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 
@@ -456,7 +460,19 @@ export function RecentTabsWSProvider(_props: RecentTabsWSProviderProps) {
 				patch.activeTerminalCount = event.activeTerminalCount;
 			} else if (event.type === "containerStatus") patch.containerStatus = event.containerStatus;
 			else if (event.type === "draft") patch.hasDraft = !!event.hasDraft;
-			else return;
+			else if (event.type === "awaitedQuestion") {
+				// The subscription reconciles caches for ALL changes before this callback.
+				// Attention is separate: no synthetic status patch or urgency-gated refetch.
+				const tab = tabsRef.current.find((item) => getRecentTabNarratorId(item) === narratorId);
+				updateAsyncQuestionAttention(
+					narratorId,
+					event.questionId,
+					event.awaited === true,
+					tab?.title,
+					userPrefsRef.current,
+				);
+				return;
+			} else return;
 
 			// This WS event is now the freshest source for these fields. An older runtime
 			// response must not roll them back (icon colour / filled state lag).
@@ -1402,11 +1418,16 @@ export function RecentTabList({
 			await api.updateNarratorTitle(renameTab.id, trimmed);
 			updateRecentTabLocal("narrator", renameTab.id, { title: trimmed });
 			qc.invalidateQueries({ queryKey: ["narrators"] });
+			setRenameTab(null);
+		} catch {
+			// Keep the dialog open. Closing it on failure was indistinguishable from
+			// success, so a rename that never happened looked like one the server had
+			// accepted and then ignored.
+			notifications.show({ message: tn("titleUpdateFailed"), color: "red", autoClose: 4000 });
 		} finally {
 			setRenaming(false);
-			setRenameTab(null);
 		}
-	}, [renameTab, renameValue, qc]);
+	}, [renameTab, renameValue, qc, tn]);
 
 	/** 打开归档确认 */
 	const handleArchive = useCallback(() => {
@@ -2185,7 +2206,8 @@ export function RecentTabList({
 					value={renameValue}
 					onChange={(e) => setRenameValue(e.currentTarget.value)}
 					onKeyDown={(e) => {
-						if (e.key === "Enter") void handleRenameSubmit();
+						// Enter while an IME candidate is open commits the word, not the rename.
+						if (e.key === "Enter" && !e.nativeEvent.isComposing) void handleRenameSubmit();
 						if (e.key === "Escape") setRenameTab(null);
 					}}
 					data-autofocus

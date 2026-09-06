@@ -236,7 +236,7 @@ function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
 /**
  * Ensure a JSON Schema has at least one required property.
  *
- * Kiro/NUG APIs truncate a tool definition whose schema declares no required
+ * Some gateway APIs truncate a tool definition whose schema declares no required
  * parameter, so a schema of all-optional fields needs SOMETHING marked required.
  *
  * That "something" is always an injected dummy `confirm`, never an existing
@@ -258,9 +258,6 @@ function convertNumber(schema: z.ZodNumber): Record<string, unknown> {
  * so an actually-passed `confirm` is dropped before `execute()` and never
  * trips tool-executor's `safeParse`.
  *
- * `shared/codewhisperer/canonical-request.ts` carries a behaviourally identical
- * copy for the plugin bundle (it cannot import zod); the two are pinned
- * together by `kiro-external-canonical-request.test.ts`.
  */
 export function ensureNonEmptySchema(schema: Record<string, unknown>): Record<string, unknown> {
 	const required = schema.required as string[] | undefined;

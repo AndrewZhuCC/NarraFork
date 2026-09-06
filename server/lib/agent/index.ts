@@ -37,7 +37,6 @@ function rememberRemoteCompactInjection(key: string): boolean {
 	return true;
 }
 
-export { KiroProvider } from "./kiro-provider";
 export type { ReflectionLoopRunOptions } from "./loop";
 export { agentLoop, runReflectionLoop, TODO_REMINDER_TOOL_INTERVAL } from "./loop";
 export type {
@@ -48,7 +47,6 @@ export type {
 	ProviderAdapter,
 } from "./provider";
 export { getProvider, resolveProviderAndModel } from "./provider";
-export { resolveModel } from "./resolve-model";
 export { toolRegistry } from "./tool-registry";
 export type {
 	AgentConfig,
@@ -76,8 +74,8 @@ export { PLAN_MODE_ALLOWED_TOOLS } from "./types";
 export async function buildHistory(
 	dbMessages: import("./provider").DbMessage[],
 	model: string,
-	// Required on purpose. This used to default to "kiro", which meant an
-	// unprefixed model silently became a Kiro model — naming a provider the
+	// Required on purpose. There is no default provider: an unprefixed model
+	// used to silently acquire one, which meant naming a provider the
 	// caller never chose and reporting the eventual failure against it. Both
 	// callers resolve the provider before calling, so there is nothing to guess.
 	provider: string,
@@ -350,6 +348,23 @@ async function broadcastSummaryError(model: string, error: string): Promise<void
 }
 
 /**
+ * Information about a scheduled summary-model retry. Delivered via
+ * `onRetryScheduled` ONLY when a failed attempt is about to be retried — the
+ * first attempt, a success and the final failure never fire it, so a UI can
+ * treat every invocation as "the user-visible run is now retrying".
+ */
+export interface SummaryRetryInfo {
+	/** 1-based ordinal of the upcoming retry (first retry = 1). */
+	attempt: number;
+	/** Configured retry cap for this call. */
+	maxRetries: number;
+	/** Backoff the wrapper sleeps before the next attempt. */
+	delayMs: number;
+	/** Message of the error that triggered the retry. */
+	error: string;
+}
+
+/**
  * Retry wrapper for summary model calls.
  * Retries transient errors with exponential backoff; immediately re-throws
  * provider-unavailable errors after broadcasting a WS event.
@@ -362,6 +377,7 @@ async function withSummaryRetry<T>(
 	model: string,
 	reportSummaryModelErrors = true,
 	onRetryProgress?: () => void,
+	onRetryScheduled?: (info: SummaryRetryInfo) => void,
 ): Promise<T> {
 	const maxRetries = getAuxiliaryMaxRetries();
 	let lastErr: unknown;
@@ -402,6 +418,7 @@ async function withSummaryRetry<T>(
 					delayMs,
 					error: errMsg,
 				});
+				onRetryScheduled?.({ attempt: attempt + 1, maxRetries, delayMs, error: errMsg });
 				// Beat on both sides of the sleep: a single backoff can be 15s, and the
 				// next attempt may itself run long before failing.
 				onRetryProgress?.();
@@ -482,6 +499,7 @@ export async function summaryGenerate(
 	reportSummaryModelErrors = true,
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
 	onRetryProgress?: () => void,
+	onRetryScheduled?: (info: SummaryRetryInfo) => void,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	const generateOptions: GenerateOptions = {
@@ -497,6 +515,7 @@ export async function summaryGenerate(
 		model,
 		reportSummaryModelErrors,
 		onRetryProgress,
+		onRetryScheduled,
 	);
 }
 

@@ -8,7 +8,7 @@
  * This lives under `server/` rather than next to the lesson data because the
  * registry is host state: importing it from `shared/` would drag the whole server
  * module graph into files that bundled plugin code also consumes (see
- * `shared/codewhisperer/shared-core.guard.test.ts`).
+ * the shared-core purity guards).
  */
 
 import { describe, expect, test } from "bun:test";

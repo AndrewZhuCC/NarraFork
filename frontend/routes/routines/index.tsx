@@ -68,7 +68,6 @@ import {
 	useMcpExternalServerManagementCapability,
 	useMcpServerSettingsStorageCapability,
 	useMcpTransportsCapability,
-	useProviderRouteCapability,
 } from "../../hooks/usePlatform";
 import { useProjects } from "../../hooks/useProjects";
 import {
@@ -1883,7 +1882,6 @@ function McpToolsTab() {
 	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
 	const mcpExternalServerManagementCapability = useMcpExternalServerManagementCapability();
 	const mcpTransportCapability = useMcpTransportsCapability();
-	const kiroMcpToolsRoute = useProviderRouteCapability("kiro", "mcpTools");
 	const showMcpServerSettingsStorageWarning =
 		mcpServerSettingsStorageCapability.supported === false;
 	const mcpServerManagementSupported = isAdmin && mcpExternalServerManagementCapability.supported;
@@ -1897,7 +1895,6 @@ function McpToolsTab() {
 		mcpServerManagementSupported && mcpExternalServerManagementCapability.permissions !== false;
 	const mcpServerImportSupported =
 		mcpServerManagementSupported && mcpExternalServerManagementCapability.import !== false;
-	const kiroMcpToolsListSupported = kiroMcpToolsRoute.supported;
 	const mcpServerImportUnsupportedReason = mcpServerImportSupported
 		? undefined
 		: mcpServerManagementFallbackReason;
@@ -1980,17 +1977,6 @@ function McpToolsTab() {
 	const [importJson, setImportJson] = useState("");
 	const [importError, setImportError] = useState<string | null>(null);
 	const [importResult, setImportResult] = useState<string | null>(null);
-
-	// Kiro built-in tools (existing behavior)
-	// biome-ignore lint/suspicious/noExplicitAny: MCP tool response structure varies
-	const { data: kiroData } = useQuery<any>({
-		queryKey: ["mcp-tools"],
-		queryFn: () => api.kiroListMcpTools(),
-		enabled: kiroMcpToolsListSupported,
-		retry: false,
-	});
-	// biome-ignore lint/suspicious/noExplicitAny: MCP tool list structure
-	const kiroTools: any[] = kiroData?.tools ?? [];
 
 	const handleImport = useCallback(() => {
 		if (!mcpServerImportSupported) return;
@@ -2439,33 +2425,6 @@ function McpToolsTab() {
 					</Paper>
 				);
 			})}
-
-			{/* Kiro built-in tools */}
-			{kiroTools.length > 0 && (
-				<>
-					<Text size="sm" fw={600} mt="md">
-						{t("mcpBuiltinTools")}
-					</Text>
-					<Text size="xs" c="dimmed">
-						{t("mcpBuiltinToolsDesc")}
-					</Text>
-					{kiroTools.map((tool) => (
-						<Paper key={tool.name} withBorder p="sm">
-							<Text size="sm" fw={600}>
-								{tool.name}
-							</Text>
-							{tool.description && (
-								<Text size="xs" c="dimmed">
-									{formatRoutineTextPreview(
-										tool.description,
-										MAX_ROUTINE_DETAIL_TEXT_PREVIEW_CHARS,
-									)}
-								</Text>
-							)}
-						</Paper>
-					))}
-				</>
-			)}
 
 			{/* Create / Edit Modal */}
 			<Modal

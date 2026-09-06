@@ -34,7 +34,7 @@ function anthropicConfig(
 ): AnthropicProviderConfig {
 	return {
 		id: "relay-id",
-		name: "千铃Kiro",
+		name: "Relay Provider",
 		prefix: "relay",
 		apiKey: "relay-key",
 		baseUrl: "https://relay.example.test",

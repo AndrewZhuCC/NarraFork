@@ -9,7 +9,6 @@ server/generated/
 *.db-wal
 *.db-shm
 .worktrees/
-.kiro-dumps/
 .tanstack/
 
 # Virtual-list layout calibration harness artifacts (dev-only)
@@ -59,9 +58,6 @@ mitm-dump/
 *-dump.json
 package-lock.json
 IMPROVEMENT-PLAN.md
-kirocli.zip
-kiro-cli*-linux-*/
-kiro-cli*-linux-*.7z
 *.log
 
 # Dynamic Spec runtime state (per-narrator task queue / planning notes)

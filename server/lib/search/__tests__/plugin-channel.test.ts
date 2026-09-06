@@ -14,7 +14,6 @@ import {
 import {
 	normalizeSearchSettings,
 	pluginSearchChannelId,
-	SEARCH_KIRO_CHANNEL_ID,
 	SEARCH_NATIVE_CHANNEL_ID,
 	SEARCH_SUBAGENT_CHANNEL_ID,
 } from "../settings";
@@ -189,7 +188,6 @@ describe("plugin channels in the settings catalog", () => {
 		const settings = makeSettings([
 			{ id: CHANNEL_ID, kind: "plugin", enabled: false },
 			{ id: SEARCH_NATIVE_CHANNEL_ID, kind: "native", enabled: true },
-			{ id: SEARCH_KIRO_CHANNEL_ID, kind: "kiro-mcp", enabled: true },
 			{ id: SEARCH_SUBAGENT_CHANNEL_ID, kind: "subagent", enabled: false, maxTurns: 4 },
 		]);
 		normalizeSearchSettings(settings);

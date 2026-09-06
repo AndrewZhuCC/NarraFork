@@ -114,7 +114,7 @@ if (params.reasoningEffort && model.toLowerCase().includes("codex")) {
 
 ## 支持的 Provider
 
-- **Kiro Provider**: 原生 `codex:` 前缀模型（如 `codex:gpt-5.3-codex`）
+- **Codex Provider**: 原生 `codex:` 前缀模型（如 `codex:gpt-5.3-codex`）
 - **OpenAI Compatible Provider**: 任何模型 ID 包含 "codex" 的模型（如 `gpt-4-codex`、`my-codex-model` 等）
 - 只要模型 ID 中包含 "codex"（不区分大小写），就会启用 reasoning 配置功能
 

@@ -16,6 +16,7 @@
  */
 
 import { ActionIcon, Badge, Box, Center, Group, Loader, Text, Tooltip } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import {
 	IconFileCode,
 	IconFileText,
@@ -854,13 +855,39 @@ export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParam
 // ── File viewer (multi-instance, one panel per path) ──
 export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 	const { t } = useTranslation("narrator");
-	// Identity is a RESOURCE, so it comes from params (like a subagent's child id)
-	// rather than the live page context — several file panels coexist per surface.
-	const { filePath, fileName, hostNarratorId } = props.params;
+	const dock = useNarratorDockContext();
+	// File identity is a RESOURCE, so the path comes from params (several file panels
+	// coexist). Host identity is different: on a focus surface the live context is the
+	// source of truth, while workspace/detached surfaces carry it in params.
+	const { filePath, fileName } = props.params;
+	const hostNarratorId = dock?.narratorId ?? props.params.hostNarratorId;
 	const title = fileName?.trim() || filePath.split(/[/\\]/).pop() || t("fileViewer.title");
 	// Read-only is the default and is never persisted: reopening a saved layout must not
 	// silently put a file into an editable state the reader did not ask for.
 	const [editing, setEditing] = useState(false);
+	// Leaving edit mode unmounts the editor, and the buffer lives only there. The
+	// toggle used to drop typed-but-unsaved work with no warning at all.
+	const [editorDirty, setEditorDirty] = useState(false);
+	const toggleEditing = useCallback(() => {
+		setEditing((prev) => {
+			if (prev && editorDirty) {
+				notifications.show({
+					color: "yellow",
+					message: t("fileEditor.unsavedBlockExit"),
+					autoClose: 5000,
+				});
+				return prev;
+			}
+			return !prev;
+		});
+	}, [editorDirty, t]);
+
+	useLayoutEffect(() => {
+		if (!hostNarratorId || props.params.hostNarratorId === hostNarratorId) return;
+		// Hydrate focus layouts saved before file editing recorded ownership. This makes
+		// the edit action available on restore and repairs the params for future drags.
+		props.api.updateParameters({ ...props.params, hostNarratorId });
+	}, [hostNarratorId, props.api, props.params]);
 
 	useLayoutEffect(() => {
 		if (title && title !== props.api.title) props.api.setTitle(title);
@@ -904,7 +931,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							variant={editing ? "filled" : "subtle"}
 							color={editing ? "indigo" : "gray"}
 							size="sm"
-							onClick={() => setEditing((prev) => !prev)}
+							onClick={toggleEditing}
 						>
 							<IconPencil size={14} />
 						</ActionIcon>
@@ -918,6 +945,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 						key={`edit:${filePath}`}
 						filePath={filePath}
 						narratorId={hostNarratorId}
+						onDirtyChange={setEditorDirty}
 					/>
 				) : (
 					<FileViewerContent key={filePath} filePath={filePath} />

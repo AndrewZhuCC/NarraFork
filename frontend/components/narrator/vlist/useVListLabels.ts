@@ -276,6 +276,7 @@ export function useVListLabels(): VListLabels {
 			compactOutputChars: t("compactOutputChars", { count: COUNT_PLACEHOLDER }),
 			compactThinking: t("compactThinking"),
 			compactThinkingChars: t("compactThinkingChars", { count: COUNT_PLACEHOLDER }),
+			compactRetrying: t("compactRetrying", { count: COUNT_PLACEHOLDER }),
 			segmentCompacting: t("segmentCompacting"),
 			segmentCompacted: t("segmentCompacted", { count: COUNT_PLACEHOLDER }),
 			segmentCompactFailed: t("segmentCompactFailed"),
@@ -310,6 +311,7 @@ export function useVListLabels(): VListLabels {
 			originSourceOauth: t("origin.source.oauth"),
 			originSourceRecovery: t("origin.source.recovery"),
 			originSourcePlanReflection: t("origin.source.planReflection"),
+			originSourceAgentMessage: t("origin.source.agentMessage"),
 			// Periodic task-digest header subtitle ("every N tool calls"). The label
 			// keeps a literal `{n}` placeholder (same convention as tasksCurrent /
 			// tasksTooMany) that the adapter substitutes with the cadence interval.
@@ -421,6 +423,8 @@ export function useVListLabels(): VListLabels {
 			messageFromUnknown: t("sidecar.body.messageFromUnknown"),
 			messageBroadcast: t("sidecar.body.messageBroadcast"),
 			specUpdatesHeading: t("sidecar.body.specUpdatesHeading", { n: "{n}" }),
+			asyncQuestionAnsweredHeading: t("sidecar.body.asyncQuestionAnsweredHeading", { n: "{n}" }),
+			asyncQuestionDismissedHeading: t("sidecar.body.asyncQuestionDismissedHeading"),
 			proseFenceHeading: t("sidecar.body.proseFenceHeading"),
 			empty: t("sidecar.body.empty"),
 			sidecarSourceBehaviorFence: t("sidecar.sources.behavior_fence"),

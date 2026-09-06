@@ -25,37 +25,37 @@ afterEach(() => {
 
 describe("nug capability cache", () => {
 	test("records an advertised list", () => {
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 
-		expect(getNugCachedCapabilities(PROVIDER)).toEqual(["kiro.messages.v1"]);
-		expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(true);
+		expect(getNugCachedCapabilities(PROVIDER)).toEqual(["demo.feature.v1"]);
+		expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(true);
 	});
 
 	test("an unknown provider supports nothing", () => {
 		// The default direction has to be "not capable": guessing yes would target an
 		// endpoint that may not exist, while guessing no only costs the legacy path.
 		expect(getNugCachedCapabilities("never-seen")).toBeUndefined();
-		expect(nugSupportsCapability("never-seen", "kiro.messages.v1")).toBe(false);
+		expect(nugSupportsCapability("never-seen", "demo.feature.v1")).toBe(false);
 	});
 
 	test("an absent field clears a previous advertisement", () => {
 		// This is what makes a rolled-back gateway stop being treated as capable.
 		// Leaving the old list would send every request to an endpoint that now 404s.
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 		setNugCachedCapabilities(PROVIDER, undefined);
 
 		expect(getNugCachedCapabilities(PROVIDER)).toBeUndefined();
-		expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(false);
+		expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(false);
 	});
 
 	test("malformed payloads are treated as no advertisement", () => {
 		// A non-array, or an array whose every entry is unusable, is malformed rather
 		// than a deliberate empty list — reported as "said nothing" so it is not
 		// mistaken for a gateway that legitimately serves no optional protocol.
-		for (const malformed of [null, "kiro.messages.v1", 42, {}, [1, 2], [""]]) {
-			setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		for (const malformed of [null, "demo.feature.v1", 42, {}, [1, 2], [""]]) {
+			setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 			expect(setNugCachedCapabilities(PROVIDER, malformed)).toBeUndefined();
-			expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(false);
+			expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(false);
 		}
 	});
 
@@ -63,28 +63,28 @@ describe("nug capability cache", () => {
 		// Behaviourally identical (both support nothing), but the distinction lets a
 		// support question about a gateway advertising no optional protocol be told
 		// apart from one still running an old image.
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 		expect(setNugCachedCapabilities(PROVIDER, [])).toEqual([]);
 
 		expect(getNugCachedCapabilities(PROVIDER)).toEqual([]);
-		expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(false);
+		expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(false);
 
 		setNugCachedCapabilities(PROVIDER, undefined);
 		expect(getNugCachedCapabilities(PROVIDER)).toBeUndefined();
 	});
 
 	test("non-string entries are dropped but valid siblings survive", () => {
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1", 7, null, "other.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1", 7, null, "other.v1"]);
 
-		expect(getNugCachedCapabilities(PROVIDER)).toEqual(["kiro.messages.v1", "other.v1"]);
+		expect(getNugCachedCapabilities(PROVIDER)).toEqual(["demo.feature.v1", "other.v1"]);
 	});
 
 	test("matching is exact, not by prefix", () => {
 		// A gateway serving some other optional protocol must not be mistaken for one
 		// serving this endpoint.
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v2", "kiro.messages"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v2", "demo.feature"]);
 
-		expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(false);
+		expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(false);
 	});
 });
 
@@ -93,16 +93,16 @@ describe("withdrawing a capability after a 404", () => {
 		// The catalog and the served routes can disagree: rolling the image back
 		// leaves a cached catalog from the newer build, so the advertisement outlives
 		// the endpoint and has to be withdrawn on first contact.
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1", "other.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1", "other.v1"]);
 
-		expect(dropNugCachedCapability(PROVIDER, "kiro.messages.v1")).toBe(true);
+		expect(dropNugCachedCapability(PROVIDER, "demo.feature.v1")).toBe(true);
 		expect(getNugCachedCapabilities(PROVIDER)).toEqual(["other.v1"]);
 	});
 
 	test("clears the entry entirely when the last capability goes", () => {
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 
-		expect(dropNugCachedCapability(PROVIDER, "kiro.messages.v1")).toBe(true);
+		expect(dropNugCachedCapability(PROVIDER, "demo.feature.v1")).toBe(true);
 		expect(getNugCachedCapabilities(PROVIDER)).toBeUndefined();
 	});
 
@@ -111,18 +111,18 @@ describe("withdrawing a capability after a 404", () => {
 		// producing log lines for something already forgotten.
 		setNugCachedCapabilities(PROVIDER, ["other.v1"]);
 
-		expect(dropNugCachedCapability(PROVIDER, "kiro.messages.v1")).toBe(false);
-		expect(dropNugCachedCapability("never-seen", "kiro.messages.v1")).toBe(false);
+		expect(dropNugCachedCapability(PROVIDER, "demo.feature.v1")).toBe(false);
+		expect(dropNugCachedCapability("never-seen", "demo.feature.v1")).toBe(false);
 	});
 
 	test("a later catalog fetch can restore it", () => {
 		// Upgrading the gateway again must re-enable the endpoint without a client
 		// restart.
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
-		dropNugCachedCapability(PROVIDER, "kiro.messages.v1");
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
+		dropNugCachedCapability(PROVIDER, "demo.feature.v1");
 
-		setNugCachedCapabilities(PROVIDER, ["kiro.messages.v1"]);
+		setNugCachedCapabilities(PROVIDER, ["demo.feature.v1"]);
 
-		expect(nugSupportsCapability(PROVIDER, "kiro.messages.v1")).toBe(true);
+		expect(nugSupportsCapability(PROVIDER, "demo.feature.v1")).toBe(true);
 	});
 });

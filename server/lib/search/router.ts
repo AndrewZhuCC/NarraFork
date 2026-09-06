@@ -1,4 +1,4 @@
-import { isKiroSearchUsable, kiroMcpCall, type McpResponse } from "../kiro-adapter";
+
 import { logger } from "../logger";
 import {
 	getAnthropicProviderConfig,
@@ -27,6 +27,21 @@ import {
 import { isAbortError, withSearchTimeout } from "./timeout";
 import type { SearchChannelResult, SearchExecutionResult, SearchRequest } from "./types";
 
+/**
+ * JSON-RPC shape an MCP `tools/call` reply takes.
+ *
+ * Declared locally rather than imported: the only remaining MCP search channel
+ * speaks to the NUG gateway over plain HTTP, so there is no client library to
+ * borrow the type from.
+ */
+interface McpResponse {
+	error?: { message?: string };
+	result?: {
+		content?: Array<{ type?: string; text?: string }>;
+		isError?: boolean;
+	};
+}
+
 function textFromMcpResponse(response: McpResponse): { text: string; isError?: boolean } {
 	if (response.error) {
 		return { text: `Search error: ${response.error.message ?? "Unknown error"}`, isError: true };
@@ -49,8 +64,6 @@ function channelLabel(channel: SearchChannelConfig, config: NarraForkSettings = 
 	switch (channel.kind) {
 		case "native":
 			return "Model native search";
-		case "kiro-mcp":
-			return "Kiro MCP search";
 		case "nug-mcp":
 			return `NUG: ${findNugProvider(channel, config)?.name ?? channel.providerId ?? channel.id}`;
 		case "custom-api":
@@ -105,17 +118,6 @@ async function nugMcpSearch(
 	}
 	const mcp = (await response.json()) as McpResponse;
 	const parsed = textFromMcpResponse(mcp);
-	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
-}
-
-async function kiroMcpSearch(
-	channel: SearchChannelConfig,
-	request: SearchRequest,
-	signal: AbortSignal,
-): Promise<SearchChannelResult> {
-	if (!isKiroSearchUsable()) throw new Error("Kiro MCP search is not available");
-	const response = await kiroMcpCall("web_search", { query: request.query }, signal);
-	const parsed = textFromMcpResponse(response);
 	return { channelId: channel.id, channelLabel: channelLabel(channel), text: parsed.text };
 }
 
@@ -249,12 +251,6 @@ async function runChannel(
 	request: SearchRequest,
 ): Promise<SearchChannelResult> {
 	switch (channel.kind) {
-		case "kiro-mcp":
-			return withSearchTimeout(
-				request.signal,
-				(signal) => kiroMcpSearch(channel, request, signal),
-				channelTimeout(channel),
-			);
 		case "nug-mcp":
 			return withSearchTimeout(
 				request.signal,
@@ -302,8 +298,6 @@ async function runChannel(
 function isPotentiallyUsableFunctionChannel(channel: SearchChannelConfig): boolean {
 	if (!channel.enabled) return false;
 	switch (channel.kind) {
-		case "kiro-mcp":
-			return isKiroSearchUsable();
 		case "nug-mcp": {
 			const provider = findNugProvider(channel);
 			return !!provider && !provider.disabled && !!provider.apiKey && !!provider.baseUrl;

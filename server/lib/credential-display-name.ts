@@ -1,5 +1,4 @@
 import { getCodexManager } from "@server/lib/codex-manager";
-import { kiroSnapshot } from "@server/lib/kiro-adapter";
 
 /**
  * Human-readable name for a credential id, or the id itself when no better name exists.
@@ -19,12 +18,6 @@ export function resolveCredentialDisplayName(
 	if (!provider || !credentialId) return null;
 
 	try {
-		if (provider === "kiro") {
-			const snapshot = kiroSnapshot();
-			if (!snapshot) return credentialId;
-			const cred = snapshot.entries.find((c) => c.id === credentialId);
-			return cred?.displayName || cred?.email || credentialId;
-		}
 		if (provider === "codex") {
 			const snapshot = getCodexManager().snapshot();
 			const cred = snapshot.entries.find((c) => c.id === credentialId);

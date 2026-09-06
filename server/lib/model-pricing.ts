@@ -3,7 +3,7 @@
  *
  * These are the vendors' published list prices, used to attribute a dollar
  * figure to token usage. For subscription-based access (Codex on a ChatGPT
- * Pro/Plus plan, Kiro on a seat) the resulting number is an *equivalent* cost —
+ * Pro/Plus plan) the resulting number is an *equivalent* cost —
  * what the same tokens would have cost through the metered API — not an amount
  * actually billed. Call sites that surface it to users must say so.
  *
@@ -14,8 +14,8 @@
  *   - Anthropic: cacheCreation = input × 1.25, cacheRead = input × 0.10
  *
  * SCOPE: this table covers the `gpt` and `claude` families only — the models
- * reachable through Codex, Kiro, Anthropic and OpenAI. Every other provider
- * (gemini, cline, nkp, nug and any custom OpenAI-compatible endpoint) is
+ * reachable through Codex, Anthropic and OpenAI. Every other provider
+ * (gemini, nug and any custom OpenAI-compatible endpoint) is
  * intentionally unpriced here and depends on `settings.pricing.overrides`. Their
  * requests land in `unpricedRequestCount` and the UI marks the total partial,
  * which is the honest outcome: guessing a rate would silently fabricate spend.

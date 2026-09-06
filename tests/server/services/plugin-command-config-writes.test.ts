@@ -33,8 +33,8 @@ function harness(options?: { storedConfig?: Record<string, JsonValue> }) {
 			{
 				kind: "executable-plugin",
 				pluginId: "com.example.demo",
-				localId: "kiro",
-				providerInstanceId: "com.example.demo/kiro",
+				localId: "acme",
+				providerInstanceId: "com.example.demo/acme",
 				configSchema: CONFIG_SCHEMA,
 			},
 			// A second plugin's contribution, to prove the namespace check is real.
@@ -66,13 +66,13 @@ describe("applyCommandConfigWrites", () => {
 		const { registry, sink, updates } = harness();
 		const result = await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
-			writes: [{ key: "provider.kiro.loadBalancingMode", value: "balanced" }],
+			writes: [{ key: "provider.acme.loadBalancingMode", value: "balanced" }],
 			registry,
 			sink,
 		});
-		expect(result.written).toEqual(["provider.kiro.loadBalancingMode"]);
+		expect(result.written).toEqual(["provider.acme.loadBalancingMode"]);
 		expect(updates).toHaveLength(1);
-		expect(updates[0]?.providerInstanceId).toBe("com.example.demo/kiro");
+		expect(updates[0]?.providerInstanceId).toBe("com.example.demo/acme");
 		expect(updates[0]?.config.loadBalancingMode).toBe("balanced");
 	});
 
@@ -83,7 +83,7 @@ describe("applyCommandConfigWrites", () => {
 		});
 		await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
-			writes: [{ key: "provider.kiro.loadBalancingMode", value: "balanced" }],
+			writes: [{ key: "provider.acme.loadBalancingMode", value: "balanced" }],
 			registry,
 			sink,
 		});
@@ -96,11 +96,11 @@ describe("applyCommandConfigWrites", () => {
 		});
 		const result = await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
-			writes: [{ key: "provider.kiro.region", value: null }],
+			writes: [{ key: "provider.acme.region", value: null }],
 			registry,
 			sink,
 		});
-		expect(result.cleared).toEqual(["provider.kiro.region"]);
+		expect(result.cleared).toEqual(["provider.acme.region"]);
 		expect(updates[0]?.config).toEqual({ loadBalancingMode: "priority" });
 	});
 
@@ -109,8 +109,8 @@ describe("applyCommandConfigWrites", () => {
 		await applyCommandConfigWrites({
 			pluginId: "com.example.demo",
 			writes: [
-				{ key: "provider.kiro.loadBalancingMode", value: "balanced" },
-				{ key: "provider.kiro.region", value: "us-east-1" },
+				{ key: "provider.acme.loadBalancingMode", value: "balanced" },
+				{ key: "provider.acme.region", value: "us-east-1" },
 			],
 			registry,
 			sink,
@@ -154,7 +154,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
-				writes: [{ key: "provider.kiro.apiKey", value: "ksk_secret" }],
+				writes: [{ key: "provider.acme.apiKey", value: "ksk_secret" }],
 				registry,
 				sink,
 			}),
@@ -167,7 +167,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
-				writes: [{ key: "provider.kiro.undeclared", value: 1 }],
+				writes: [{ key: "provider.acme.undeclared", value: 1 }],
 				registry,
 				sink,
 			}),
@@ -179,7 +179,7 @@ describe("applyCommandConfigWrites", () => {
 		await expect(
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
-				writes: [{ key: "provider.kiro.region", value: "x".repeat(17 * 1024) }],
+				writes: [{ key: "provider.acme.region", value: "x".repeat(17 * 1024) }],
 				registry,
 				sink,
 			}),
@@ -194,8 +194,8 @@ describe("applyCommandConfigWrites", () => {
 			applyCommandConfigWrites({
 				pluginId: "com.example.demo",
 				writes: [
-					{ key: "provider.kiro.loadBalancingMode", value: "balanced" },
-					{ key: "provider.kiro.apiKey", value: "ksk_secret" },
+					{ key: "provider.acme.loadBalancingMode", value: "balanced" },
+					{ key: "provider.acme.apiKey", value: "ksk_secret" },
 				],
 				registry,
 				sink,

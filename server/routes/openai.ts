@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { Hono } from "hono";
+import { buildOpencodeSessionHeader } from "../lib/agent/opencode-session";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import { resolveProxyForUrl } from "../lib/net/proxy";
 import {
 	getBuiltinCodexModels,
 	type OpenAIProviderConfig,
@@ -230,7 +232,9 @@ interface FetchOpenaiModelsResult {
 }
 
 /** Fetch models from a specific OpenAI-compatible provider. */
-async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpenaiModelsResult> {
+export async function fetchOpenaiModels(
+	config: OpenAIProviderConfig,
+): Promise<FetchOpenaiModelsResult> {
 	const apiKey = config.apiKey;
 	const baseUrl = (config.baseUrl || defaultBaseUrl(config)).replace(/\/+$/, "");
 
@@ -243,6 +247,16 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpe
 	}
 
 	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
+	// The catalog is a request to the same gateway as inference, and OpenCode
+	// announced that requests without a session header may start erroring — an
+	// empty model dropdown is how that would surface here.
+	// Match inference precedence: derive a session only when the operator did not
+	// supply one, then apply configured headers so that override reaches `/models` too.
+	Object.assign(
+		headers,
+		buildOpencodeSessionHeader({ baseUrl: config.baseUrl, extraHeaders: config.extraHeaders }),
+		config.extraHeaders,
+	);
 	if (config.apiMode === "codex") {
 		headers.originator = "narrafork";
 		if (config.codexAccountId && isOfficialCodexDomain(baseUrl)) {
@@ -255,7 +269,11 @@ async function fetchOpenaiModels(config: OpenAIProviderConfig): Promise<FetchOpe
 	for (const candidate of candidates) {
 		const { url } = candidate;
 		try {
-			const response = await fetch(url, { headers });
+			// Honour the global outbound proxy policy and this provider's proxy
+			// override, same as chat requests (plain fetch would bypass both).
+			const proxy = resolveProxyForUrl(url, config.proxy);
+			// biome-ignore lint/suspicious/noExplicitAny: Bun-specific `proxy` extension on RequestInit
+			const response = await fetch(url, { headers, ...(proxy ? { proxy } : {}) } as any);
 			if (response.status === 404) {
 				errors.push(`${url} → 404`);
 				continue;

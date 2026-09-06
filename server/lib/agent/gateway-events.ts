@@ -1,12 +1,12 @@
 /**
  * Re-export shim for unified-gateway event parsing.
  *
- * The implementation moved to `@shared/codewhisperer/gateway-events` so the
- * CodeWhisperer protocol layer — reused by bundled plugin code — has no
+ * The implementation moved to `@shared/agent-protocol/gateway-events` so the
+ * shared protocol layer — which bundled plugin code reuses — has no
  * `server/` imports. Host importers keep using this path unchanged.
  */
 export {
 	isGatewayEventType,
 	parseGatewayDataEvent,
 	parseGatewaySSEEvent,
-} from "@shared/codewhisperer/gateway-events";
+} from "@shared/agent-protocol/gateway-events";

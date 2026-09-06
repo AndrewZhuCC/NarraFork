@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
-import { signatureSourcesCompatible } from "@shared/codewhisperer/reasoning-source";
-import { outputToText } from "@shared/codewhisperer/tool-output";
+import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
+import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { CodexRetainedUserMessage } from "@shared/compact-message";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
@@ -24,10 +24,11 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
-import { parseErrorDiagnostics } from "./error-diagnostics";
+import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
 import { ProviderInvalidStateError } from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
+import { buildOpencodeSessionHeader } from "./opencode-session";
 import type {
 	ChatParams,
 	DbMessage,
@@ -111,14 +112,13 @@ function defaultBaseUrl(mode: OpenAIApiMode): string {
 }
 
 const CODEX_MODEL_REASONING_LEVELS: Record<string, readonly ReasoningEffort[]> = {
-	// Extracted from codex-reversed model catalog (supported_reasoning_levels).
-	// "none" is omitted — it disables reasoning entirely and is handled via
-	// early-return in normalizeCodexReasoningEffort before this table is consulted.
-	// The frontend counterpart (NarratorPanel CODEX_REASONING_OPTIONS_BY_MODEL)
-	// includes "none" because it drives UI dropdown options.
-	// gpt-5.6 family supports a real "max" tier (unlike earlier codex models).
+	// Extracted from the Codex model catalog (supported_reasoning_levels).
+	// "none" is omitted because it disables reasoning entirely. GPT-6 Astra
+	// explicitly rejects it, while older Codex models retain their existing
+	// compatibility behavior below.
 	// The upstream catalog also lists "ultra" for Sol/Terra, but NarraFork's UI
 	// enum stops at "max", so ultra is intentionally not surfaced here.
+	"gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max"],
 	"gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
@@ -140,6 +140,7 @@ export const CODEX_IMAGE_GENERATION_PARTIAL_IMAGES = 2;
 const DEFAULT_CODEX_INPUT_MODALITIES: readonly CodexInputModality[] = ["text", "image"];
 
 const CODEX_MODEL_INPUT_MODALITIES: Record<string, readonly CodexInputModality[]> = {
+	"gpt-6-astra": ["text", "image"],
 	"gpt-5.6-sol": ["text", "image"],
 	"gpt-5.6-terra": ["text", "image"],
 	"gpt-5.6-luna": ["text", "image"],
@@ -227,16 +228,20 @@ const DEFAULT_CODEX_REASONING_LEVELS: readonly ReasoningEffort[] = [
 	"xhigh",
 ];
 
+/** Codex models whose upstream requires reasoning on every request. */
+const CODEX_MODELS_WITH_MANDATORY_REASONING = new Set(["gpt-6-astra"]);
+
 export function normalizeCodexReasoningEffort(
 	model: string,
 	reasoningEffort: string | undefined,
 ): string | undefined {
 	if (!reasoningEffort) return undefined;
-	// "none" disables reasoning entirely and bypasses the tier table. Checked
-	// before any lookup, which is also why a card's tiers never include "none":
-	// as a clamp target it could turn a requested "low" into reasoning off.
-	if (reasoningEffort === "none") return "none";
 	const bareModel = parseModelId(model).model;
+	// Astra rejects `none`, including on internal title/summary requests that do
+	// not originate from the narrator UI. Route it to the lowest accepted tier.
+	if (reasoningEffort === "none") {
+		return CODEX_MODELS_WITH_MANDATORY_REASONING.has(bareModel) ? "low" : "none";
+	}
 	// Model cards first — they are what the hardcoded table became, and a user can
 	// correct a model's tiers there without waiting for a release.
 	const supported =
@@ -333,7 +338,7 @@ function applyGenerateReasoningOptions(
 
 // === OpenAI identity prompt ===
 // OpenAI models need an explicit identity and tool-use instruction in the system prompt.
-// Unlike Kiro/Claude which receives tool definitions via protocol-level fields,
+// Unlike Claude which receives tool definitions via protocol-level fields,
 // OpenAI models benefit from system-level guidance to actively use their tools.
 
 const OPENAI_IDENTITY: Record<string, string> = {
@@ -1443,6 +1448,17 @@ export class OpenAIProvider implements ProviderAdapter {
 				headers["ChatGPT-Account-Id"] = accountId;
 			}
 		}
+		// OpenCode Go serves both OpenAI shapes (/zen/go/v1/responses and
+		// /chat/completions) and reads session identity only from its own header,
+		// so it has to be added here rather than carried by the request body.
+		Object.assign(
+			headers,
+			buildOpencodeSessionHeader({
+				baseUrl: this.config.baseUrl,
+				conversationId,
+				extraHeaders: this.config.extraHeaders,
+			}),
+		);
 		// Emulated codex headers + user-configured extra headers (user wins).
 		Object.assign(headers, fingerprint.headers);
 		return headers;
@@ -2397,7 +2413,37 @@ export function parseResponsesAPIEvent(
 	reasoningAccum: Map<number, ResponsesReasoningAccum>,
 ): ParsedStreamEvent[] {
 	const type = chunk.type;
-	if (!type) return [];
+	if (!type) {
+		// A frame with no `type` is not automatically meaningless: gateways relay bare
+		// `{"error":{"message":"..."}}` envelopes. Returning [] for those discarded the
+		// only explanation the user could have been given, and the turn was then
+		// reported as "the provider returned no content" — a local-configuration story
+		// for what is an upstream failure.
+		const envelope = parseUpstreamErrorEnvelope(chunk as unknown as Record<string, unknown>);
+		if (!envelope) return [];
+		const reason = envelope.code ?? "api_error";
+		return [
+			{
+				invalidState: {
+					reason,
+					message: envelope.message,
+					diagnostics: parseErrorDiagnostics(
+						{
+							...(chunk as unknown as Record<string, unknown>),
+							statusCode: envelope.statusCode,
+							message: envelope.message,
+						},
+						{
+							source: "provider",
+							phase: "sse_error",
+							reason,
+							message: envelope.message,
+						},
+					),
+				},
+			},
+		];
+	}
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
@@ -2831,9 +2877,15 @@ export function parseResponsesAPIEvent(
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic error event shape
 		const c = chunk as any;
 		const nested = c.error;
+		// The envelope parser is consulted first because it also reads `detail` /
+		// `description` / a string-valued `error`. Without it those payloads fell
+		// through to the "Unknown API error" placeholder, which is strictly worse than
+		// the text upstream actually sent.
+		const envelope = parseUpstreamErrorEnvelope(c as Record<string, unknown>);
 		const errMsg =
 			(nested && typeof nested === "object" ? nested.message : undefined) ??
 			c.message ??
+			envelope?.message ??
 			"Unknown API error";
 		const reason =
 			String(
@@ -2999,8 +3051,12 @@ function parseSSELine(
 	// Handle error objects embedded in stream chunks
 	// (some providers send errors as {error: {message, type, code}} inside the SSE stream)
 	if (chunk.error) {
-		const msg = chunk.error.message || "Unknown OpenAI API error";
-		const reason = String(chunk.error.code ?? chunk.error.type ?? "api_error");
+		// `chunk.error.message` is absent when the payload used `detail`/`description`, or
+		// when `error` is itself the message string. Recovering the real text matters more
+		// than the shape it arrived in — the placeholder below tells the user nothing.
+		const envelope = parseUpstreamErrorEnvelope(data);
+		const msg = chunk.error.message || envelope?.message || "Unknown OpenAI API error";
+		const reason = String(chunk.error.code ?? chunk.error.type ?? envelope?.code ?? "api_error");
 		const statusCode =
 			chunk.error.statusCode ??
 			chunk.error.status_code ??
@@ -3573,10 +3629,14 @@ function buildResponsesPreludeItems(
 	for (const block of reasoningBlocks ?? []) {
 		const text = block.text?.trim() ?? "";
 		const metadata = block.providerMetadata?.openai;
-		if (strict && metadata?.reasoningEncryptedContent) {
-			// Credential-strict model: replay the reasoning item verbatim. These
-			// blocks come from the current in-memory turn, so the credential was
-			// minted by this same upstream — no source check is needed.
+		if (metadata?.reasoningEncryptedContent) {
+			// Credential-bound reasoning: replay the item verbatim. These blocks
+			// come from the current in-memory turn, so the credential was minted by
+			// this same upstream — no source check is needed. This applies even when
+			// the model name would classify as a plain-text relay: some Codex-style
+			// gateways (e.g. Console Go) mint encrypted_content for every model and
+			// reject a follow-up turn that drops the reasoning item
+			// ("reasoning_text in the thinking mode must be passed back").
 			entries.push({
 				item: {
 					type: "reasoning",
@@ -3588,8 +3648,8 @@ function buildResponsesPreludeItems(
 				sourceIndex: sourceIndex++,
 			});
 		} else if (!strict && text) {
-			// Relay model: encrypted_content is meaningless payload for a
-			// non-OpenAI upstream — degrade every block to plain text.
+			// Genuine plain-text relay (no credential protocol): degrade to text so
+			// the model still sees its own prior thoughts.
 			fallbackParts.push(text);
 		}
 		// Strict + no credential: dropped entirely (the official API rejects
@@ -3782,19 +3842,19 @@ function buildResponsesAssistantItemsFromStoredContent(
 			const reasoningBlock = block as Extract<StoredAssistantBlock, { type: "reasoning" }>;
 			const text = typeof reasoningBlock.text === "string" ? reasoningBlock.text.trim() : "";
 			const metadata = reasoningBlock.providerMetadata?.openai;
+			const canReplayEncrypted =
+				!!metadata?.reasoningEncryptedContent &&
+				signatureSourcesCompatible(
+					reasoningBlock.providerMetadata?.signatureSource,
+					options.currentSource,
+				);
 			if (options.strict) {
 				// Credential-bound model: replay the encrypted item only when we can
 				// prove the credential was minted by the upstream handling this
 				// request. Anything else is dropped — the official API rejects
 				// unsigned/foreign reasoning replay, and the block would wedge the
 				// conversation if echoed with a blanked credential.
-				if (
-					metadata?.reasoningEncryptedContent &&
-					signatureSourcesCompatible(
-						reasoningBlock.providerMetadata?.signatureSource,
-						options.currentSource,
-					)
-				) {
+				if (canReplayEncrypted) {
 					items.push({
 						type: "reasoning",
 						id: metadata.itemId,
@@ -3808,10 +3868,23 @@ function buildResponsesAssistantItemsFromStoredContent(
 						hasSource: !!reasoningBlock.providerMetadata?.signatureSource,
 					});
 				}
+			} else if (canReplayEncrypted) {
+				// Model name classifies as a plain-text relay, but the block carries an
+				// encrypted_content minted by this same gateway (e.g. Console Go-style
+				// Codex-compatible endpoints mint credentials for relay models too).
+				// Those gateways reject a follow-up turn that drops the reasoning item
+				// ("reasoning_text in the thinking mode must be passed back"), so the
+				// item must be replayed verbatim rather than degraded to assistant text.
+				items.push({
+					type: "reasoning",
+					id: metadata.itemId,
+					summary: text ? [{ type: "summary_text", text }] : [],
+					encrypted_content: metadata.reasoningEncryptedContent,
+				} as unknown as OAIMessage);
 			} else if (text) {
-				// Relay model: the reasoning is plain text; encrypted_content is dead
-				// weight for a non-OpenAI upstream — degrade it to an assistant
-				// message so the model still sees its own prior thoughts.
+				// Genuine plain-text relay (or foreign encrypted block we must not echo
+				// to this upstream): degrade to an assistant message so the model still
+				// sees its own prior thoughts.
 				const item = buildResponsesAssistantMessageItem(text, messageIdAvailable);
 				if (item) {
 					items.push(item);

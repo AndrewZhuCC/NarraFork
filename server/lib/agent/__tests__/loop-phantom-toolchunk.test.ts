@@ -24,7 +24,7 @@ const testProvider: ProviderAdapter = {
 		if (providerScenario === "phantom_then_text") {
 			if (providerAttempts === 1) {
 				// A toolUseEvent that carries a toolUseId but no `name`. This is the
-				// real-world Kiro/nug2 edge case: isMeaningfulStreamEvent() flips
+				// real-world NUG edge case: isMeaningfulStreamEvent() flips
 				// sawMeaningfulResponse=true, yet the loop never builds an accumulator
 				// (name is required) and never pushes to toolUses — leaving zero
 				// persistable output. The old empty-response guard (gated on
