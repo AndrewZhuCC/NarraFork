@@ -457,6 +457,7 @@ export class CodexProvider implements ProviderAdapter {
 			reasoningEffort?: ChatParams["reasoningEffort"];
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
+			onActivity?: () => void;
 		},
 	): Promise<{ items: unknown[] }> {
 		if (!this.useRemoteCompact) {

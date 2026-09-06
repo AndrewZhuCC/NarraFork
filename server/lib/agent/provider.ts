@@ -154,6 +154,8 @@ export interface RemoteCompactCapableProvider {
 			reasoningEffort?: ChatParams["reasoningEffort"];
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
+			/** Lightweight liveness notification for each non-empty response chunk. */
+			onActivity?: () => void;
 		},
 	): Promise<RemoteCompactResult>;
 }

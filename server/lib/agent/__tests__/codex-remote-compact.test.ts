@@ -100,6 +100,7 @@ describe("OpenAIProvider.compactRemote", () => {
 			capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 			return new Response(
 				JSON.stringify({
+					status: "completed",
 					output: [{ type: "compaction", id: "cmp_test", encrypted_content: "enc" }],
 				}),
 				{
@@ -156,6 +157,7 @@ describe("OpenAIProvider.compactRemote", () => {
 			capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 			return new Response(
 				JSON.stringify({
+					status: "completed",
 					output: [{ type: "compaction", id: "cmp_test", encrypted_content: "enc" }],
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
@@ -266,6 +268,7 @@ describe("OpenAIProvider.compactRemote", () => {
 			capturedBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
 			return new Response(
 				JSON.stringify({
+					status: "completed",
 					output: [{ type: "compaction", id: "cmp_test", encrypted_content: "enc" }],
 				}),
 				{ status: 200, headers: { "content-type": "application/json" } },
@@ -445,6 +448,209 @@ describe("OpenAIProvider.compactRemote", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+});
+
+describe("remote compact completion and activity", () => {
+	const provider = new OpenAIProvider({
+		id: "relay",
+		name: "Codex Relay",
+		prefix: "relay",
+		apiKey: "sk-test",
+		baseUrl: "https://example.invalid/v1",
+		defaultModel: "gpt-5.3-codex",
+		apiMode: "codex",
+		codexRemoteCompact: true,
+	});
+	const item = { type: "compaction", id: "cmp_1", encrypted_content: "opaque/+==\n密文" };
+	const frame = (type: string, fields: Record<string, unknown> = {}) =>
+		`event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+	const done = frame("response.output_item.done", { item });
+	const completed = frame("response.completed", {
+		response: { status: "completed", output: [item] },
+	});
+	const sse = (text: string) =>
+		new Response(text, { headers: { "content-type": "text/event-stream" } });
+	async function run(response: Response, options?: Parameters<OpenAIProvider["compactRemote"]>[2]) {
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => response) as unknown as typeof fetch;
+		try {
+			return await provider.compactRemote(
+				[{ type: "message", role: "user" }],
+				"relay:gpt-5.3-codex",
+				options,
+			);
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	}
+
+	for (const [name, text] of [
+		["added without done", frame("response.output_item.added", { item }) + completed],
+		["done without completed", done],
+		["premature DONE sentinel", `${done}data: [DONE]\n\n`],
+		["completed without done", completed],
+		[
+			"two distinct done items",
+			done + frame("response.output_item.done", { item: { ...item, id: "cmp_2" } }) + completed,
+		],
+		["two done events with the same id", done + done + completed],
+		[
+			"failed after done",
+			done + frame("response.failed", { response: { error: { message: "upstream failed" } } }),
+		],
+		["incomplete after done", done + frame("response.incomplete")],
+		["error after done", done + frame("error", { message: "upstream error" })],
+		[
+			"contradictory final status",
+			done + frame("response.completed", { response: { status: "failed", output: [item] } }),
+		],
+		[
+			"duplicate items in final output",
+			done + frame("response.completed", { response: { output: [item, item] } }),
+		],
+		[
+			"conflicting final ciphertext",
+			done +
+				frame("response.completed", {
+					response: { output: [{ ...item, encrypted_content: "different" }] },
+				}),
+		],
+		[
+			"unfinished item",
+			frame("response.output_item.done", { item: { ...item, status: "in_progress" } }) + completed,
+		],
+		[
+			"missing ciphertext",
+			frame("response.output_item.done", { item: { type: "compaction" } }) + completed,
+		],
+		["malformed event", `data: {broken}\n\n${done}${completed}`],
+	]) {
+		test(`rejects ${name}`, async () => {
+			await expect(run(sse(text))).rejects.toThrow(/Codex remote compact/);
+		});
+	}
+
+	for (const status of [undefined, "in_progress", "failed", "incomplete"]) {
+		test(`JSON output requires completed status, not ${status}`, async () => {
+			await expect(run(Response.json({ status, output: [item] }))).rejects.toThrow(
+				/Codex remote compact/,
+			);
+		});
+	}
+	for (const output of [[item, item], [{ ...item, encrypted_content: " " }]]) {
+		test(`rejects invalid completed JSON: ${JSON.stringify(output)}`, async () => {
+			await expect(run(Response.json({ status: "completed", output }))).rejects.toThrow(
+				/Codex remote compact/,
+			);
+		});
+	}
+
+	test("reads split UTF-8, CRLF and multiline SSE while reporting each chunk", async () => {
+		const bytes = new TextEncoder().encode(
+			`: keepalive\r\n\r\n` +
+				frame("response.output_item.done", {
+					item: { type: "message", role: "assistant" },
+				}).replaceAll("\n", "\r\n") +
+				`event: response.output_item.done\r\ndata: ${JSON.stringify({ item })}\r\n\r\n` +
+				`event: response.completed\r\ndata: {"response":\r\ndata: {"status":"completed","output":[]}}\r\n\r\n`,
+		);
+		let offset = 0;
+		let beats = 0;
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					// No prefetch: the previous byte must have notified activity before the next read.
+					expect(beats).toBe(offset);
+					if (offset < bytes.length) controller.enqueue(bytes.slice(offset, ++offset));
+					else controller.close();
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		expect(await run(new Response(stream), { onActivity: () => beats++ })).toEqual({
+			items: [item],
+		});
+		expect(beats).toBe(bytes.length);
+	});
+
+	test("completes and cancels the reader without waiting for the connection to close", async () => {
+		let cancelled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode(done + completed));
+				timer = setTimeout(() => controller.error(new Error("waited for EOF")), 300);
+			},
+			cancel() {
+				cancelled = true;
+				if (timer) clearTimeout(timer);
+			},
+		});
+		try {
+			expect(await run(new Response(stream))).toEqual({ items: [item] });
+			expect(cancelled).toBe(true);
+			expect(stream.locked).toBe(false);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	});
+
+	test("abort during body reading cancels and releases the reader", async () => {
+		const abort = new AbortController();
+		let cancelled = false;
+		let reads = 0;
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (reads++ === 0) controller.enqueue(new TextEncoder().encode("data: {"));
+					else {
+						abort.abort();
+						controller.close();
+					}
+				},
+				cancel() {
+					cancelled = true;
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		await expect(
+			run(new Response(stream), { signal: abort.signal, onActivity: () => abort.abort() }),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(cancelled).toBe(true);
+		expect(stream.locked).toBe(false);
+	});
+
+	test("propagates body read errors instead of turning them into empty output", async () => {
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.error(new Error("body transport broke"));
+			},
+		});
+		await expect(run(new Response(stream))).rejects.toThrow("body transport broke");
+		expect(stream.locked).toBe(false);
+	});
+
+	test("bounds response bytes before accumulating an oversized frame", async () => {
+		const chunk = new TextEncoder().encode(`:${"x".repeat(1024 * 1024 - 1)}`);
+		let reads = 0;
+		let cancelled = false;
+		const stream = new ReadableStream<Uint8Array>(
+			{
+				pull(controller) {
+					if (reads++ < 17) controller.enqueue(chunk);
+					else controller.close();
+				},
+				cancel() {
+					cancelled = true;
+				},
+			},
+			{ highWaterMark: 0 },
+		);
+		await expect(run(new Response(stream))).rejects.toThrow("hard limit");
+		expect(cancelled).toBe(true);
+		expect(stream.locked).toBe(false);
 	});
 });
 

@@ -1035,6 +1035,7 @@ async function doRunCustomCompact({
 					signal,
 					conversationId: narratorId,
 					trailingToolResults: built.trailingToolResults,
+					onActivity: hooks?.beat,
 				});
 				remoteCompact = {
 					provider: "codex",

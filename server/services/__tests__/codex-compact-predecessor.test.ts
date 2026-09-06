@@ -111,7 +111,7 @@ beforeEach(() => {
 	globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
 		expect(String(url)).toBe("https://compact.invalid/v1/responses");
 		requests.push(JSON.parse(String(init?.body)));
-		return Response.json({ output: [item(requests.length)] });
+		return Response.json({ status: "completed", output: [item(requests.length)] });
 	}) as typeof fetch;
 	narratorContext.generateCompactSummary = async (_id, _locale, messages) => {
 		localInputs.push((messages ?? []).map((entry) => entry.id));
@@ -322,7 +322,16 @@ test("predecessor without new messages does not request or persist another compa
 });
 
 for (const bounded of [true, false]) {
-	for (const failure of ["http", "network", "cancel", "timeout", "http-background"] as const) {
+	for (const failure of [
+		"http",
+		"network",
+		"cancel",
+		"timeout",
+		"http-background",
+		"sse-added",
+		"sse-failed",
+		"sse-double",
+	] as const) {
 		if (!bounded && failure === "http-background") continue;
 		test(`${bounded ? "primary bounded" : "subagent unbounded"} ${failure} preserves checkpoint and can retry`, async () => {
 			await seedNarrator();
@@ -353,6 +362,21 @@ for (const bounded of [true, false]) {
 				if (failure === "http" || failure === "http-background")
 					return new Response("test failure", { status: 400 });
 				if (failure === "network") throw new TypeError("network failure");
+				if (failure.startsWith("sse-")) {
+					const event = (type: string, fields: Record<string, unknown> = {}) =>
+						`data: ${JSON.stringify({ type, ...fields })}\n\n`;
+					const done = event("response.output_item.done", { item: item(1) });
+					return new Response(
+						(failure === "sse-added"
+							? event("response.output_item.added", { item: item(1) })
+							: done) +
+							(failure === "sse-double" ? done : "") +
+							event(failure === "sse-failed" ? "response.failed" : "response.completed", {
+								response: { output: [item(1)] },
+							}),
+						{ headers: { "content-type": "text/event-stream" } },
+					);
+				}
 				return new Promise<Response>((_resolve, reject) => {
 					init?.signal?.addEventListener(
 						"abort",
@@ -376,7 +400,9 @@ for (const bounded of [true, false]) {
 							? "progress"
 							: failure === "network"
 								? "Network request failed"
-								: "test failure",
+								: failure.startsWith("sse-")
+									? "Codex remote compact"
+									: "test failure",
 				);
 			} finally {
 				__setCompactWatchdogTimingsForTests(null);
@@ -452,6 +478,80 @@ for (const bounded of [true, false]) {
 			expect(localInputs).toEqual([]);
 		});
 	}
+}
+
+for (const behavior of ["advancing", "stalled", "ceiling"] as const) {
+	test(`remote body ${behavior} uses the existing compact watchdog`, async () => {
+		await seedNarrator();
+		await message("checkpoint", 1, marker(7), true);
+		await message("new", 2);
+		let interval: ReturnType<typeof setInterval> | undefined;
+		let finish: ReturnType<typeof setTimeout> | undefined;
+		let cancelled = false;
+		let chunks = 0;
+		const providers = settings.openaiProviders;
+		globalThis.fetch = (async () =>
+			new Response(
+				new ReadableStream<Uint8Array>({
+					start(controller) {
+						const encode = (text: string) => new TextEncoder().encode(text);
+						controller.enqueue(encode(": initial activity\n\n"));
+						if (behavior !== "stalled")
+							interval = setInterval(() => {
+								chunks++;
+								controller.enqueue(encode(": still processing\n\n"));
+							}, 60);
+						if (behavior === "advancing")
+							finish = setTimeout(() => {
+								controller.enqueue(
+									encode(
+										`data: ${JSON.stringify({ type: "response.output_item.done", item: item(8) })}\n\n` +
+											`data: ${JSON.stringify({ type: "response.completed", response: { output: [item(8)] } })}\n\n`,
+									),
+								);
+							}, 750);
+					},
+					cancel() {
+						cancelled = true;
+						if (interval) clearInterval(interval);
+						if (finish) clearTimeout(finish);
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			)) as unknown as typeof fetch;
+		__setCompactWatchdogTimingsForTests({
+			stallMs: 300,
+			maxTotalMs: behavior === "ceiling" ? 700 : 2000,
+		});
+		try {
+			settings.openaiProviders = providers;
+			const run = runCustomCompact("n1", "en", undefined, { mode: "background" });
+			if (behavior === "advancing") {
+				expect(await run).toBe(true);
+				expect(chunks).toBeGreaterThan(3);
+				const history = await narratorService.getModelHistorySinceLastCompact("n1");
+				expect(history[0].contentJson).toEqual(
+					expect.arrayContaining([
+						expect.objectContaining({
+							remoteCompact: expect.objectContaining({ items: [item(8)] }),
+						}),
+					]),
+				);
+			} else {
+				await expect(run).rejects.toThrow(behavior === "stalled" ? "no progress" : "ceiling");
+				const refs = await db.select().from(narratorMessageRefs);
+				expect(refs.filter((ref) => ref.isCompact).map((ref) => ref.messageId)).toEqual([
+					"checkpoint",
+				]);
+			}
+			expect(localInputs).toEqual([]);
+			expect(cancelled).toBe(true);
+		} finally {
+			__setCompactWatchdogTimingsForTests(null);
+			if (interval) clearInterval(interval);
+			if (finish) clearTimeout(finish);
+		}
+	}, 4000);
 }
 
 for (const boundary of ["first", "local", "clear"] as const) {

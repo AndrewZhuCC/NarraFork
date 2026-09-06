@@ -12,7 +12,7 @@ import { getToolMessage, type Locale } from "../prompt-i18n";
 import { isNativeSearchChannelFirstEnabled } from "../search/native";
 import type { OpenAIProviderConfig } from "../settings";
 import { getReasoningEffortBlocklist, parseModelId, settings } from "../settings";
-import { readWithTimeout } from "../stream-timeout";
+import { readWithTimeout, StreamByteBudget } from "../stream-timeout";
 import { getImagePath, imageToBase64 } from "../uploads";
 import { extractOpenAIUsage } from "../usage-tracking";
 import { getHttpCodexUserAgent, getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
@@ -621,6 +621,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			reasoningEffort?: ReasoningEffort;
 			signal?: AbortSignal;
 			trailingToolResults?: unknown[];
+			onActivity?: () => void;
 		},
 	): Promise<{ items: unknown[] }> {
 		if (this.apiMode !== "codex") {
@@ -667,15 +668,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			body: JSON.stringify(body),
 			signal: options?.signal,
 		});
-		const responseText = await response.text().catch(() => "");
-		if (!response.ok) {
-			throw createOpenAIApiError(response, responseText);
-		}
-		const items = parseCompactOutputItems(responseText);
-		if (items.length === 0) {
-			throw new Error("Codex remote compact response did not contain output items");
-		}
-		return { items };
+		return { items: await readCompactOutputItems(response, options) };
 	}
 
 	/**
@@ -1692,59 +1685,154 @@ function parseResponsesJson(raw: string): {
 	}>(raw, "OpenAI API returned non-JSON responses payload");
 }
 
-/** Pull compaction items from a JSON or SSE /responses compact result. */
-function parseCompactOutputItems(raw: string): unknown[] {
-	const fromJson = (value: unknown): unknown[] => {
-		if (!value || typeof value !== "object") return [];
-		const output = (value as { output?: unknown }).output;
-		if (!Array.isArray(output)) return [];
-		return output.filter((item) => {
-			if (!item || typeof item !== "object") return false;
-			const type = (item as { type?: unknown }).type;
-			return type === "compaction" || type === "compaction_summary";
-		});
+/** Consume only this compact response; ordinary chat parsing is intentionally unchanged. */
+async function readCompactOutputItems(
+	response: Response,
+	options?: { signal?: AbortSignal; onActivity?: () => void },
+): Promise<unknown[]> {
+	const fail = (reason: string): never => {
+		throw new Error(`Codex remote compact ${reason}`);
 	};
-
-	try {
-		const parsed = JSON.parse(raw) as unknown;
-		const items = fromJson(parsed);
-		if (items.length > 0) return items;
-	} catch {
-		// SSE stream
-	}
-
-	const collected = new Map<string, unknown>();
-	let completed: unknown[] = [];
-	for (const block of raw.split("\n\n")) {
-		const dataLines = block
-			.split("\n")
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trim());
-		if (dataLines.length === 0) continue;
-		const data = dataLines.join("\n");
-		if (!data || data === "[DONE]") continue;
-		let event: { type?: string; item?: unknown; response?: { output?: unknown[] } };
-		try {
-			event = JSON.parse(data) as typeof event;
-		} catch {
-			continue;
+	const fromJson = (value: unknown) =>
+		isRecord(value) && Array.isArray(value.output)
+			? value.output.filter(
+					(item): item is Record<string, unknown> =>
+						isRecord(item) && (item.type === "compaction" || item.type === "compaction_summary"),
+				)
+			: [];
+	const validate = (items: Record<string, unknown>[]) => {
+		if (!items.length) fail("response did not contain output items");
+		if (items.length !== 1) fail("expected exactly one completed compaction item");
+		const item = items[0];
+		if (
+			(item.status !== undefined && item.status !== "completed") ||
+			typeof item.encrypted_content !== "string" ||
+			!item.encrypted_content.trim()
+		) {
+			fail("received an unfinished or empty compaction item");
 		}
-		if (event.type === "response.output_item.done" || event.type === "response.output_item.added") {
-			const item = event.item;
-			if (item && typeof item === "object") {
-				const type = (item as { type?: unknown }).type;
-				const id = (item as { id?: unknown }).id;
-				if (type === "compaction" || type === "compaction_summary") {
-					collected.set(typeof id === "string" && id ? id : `item-${collected.size}`, item);
+		return items;
+	};
+	const parseJson = (text: string): Record<string, unknown> => {
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {
+			return fail("received malformed JSON");
+		}
+		return isRecord(value) ? value : fail("expected a JSON object");
+	};
+	let compactItems: Record<string, unknown>[] = [];
+	let completed = false;
+	const parseFrame = (frame: string) => {
+		const lines = frame.split(/\r?\n/);
+		const data = lines
+			.filter((line) => line.startsWith("data:"))
+			.map((line) => line.slice(5).trimStart())
+			.join("\n")
+			.trim();
+		if (!data) return;
+		if (data === "[DONE]") return fail("stream ended before response.completed");
+		const event = parseJson(data);
+		const type =
+			event.type ??
+			lines
+				.find((line) => line.startsWith("event:"))
+				?.slice(6)
+				.trim();
+		if (type === "error" || type === "response.failed" || type === "response.incomplete") {
+			fail(`received ${type}`);
+		}
+		if (type === "response.output_item.done") {
+			compactItems.push(...fromJson({ output: [event.item] }));
+			if (compactItems.length) validate(compactItems);
+		}
+		if (type === "response.completed") {
+			validate(compactItems);
+			if (
+				!isRecord(event.response) ||
+				(event.response.status !== undefined && event.response.status !== "completed")
+			) {
+				fail("response was not completed");
+			}
+			// The final output is a snapshot, not a second output_item.done event.
+			const finalItems = fromJson(event.response);
+			if (finalItems.length) {
+				validate(finalItems);
+				if (
+					finalItems[0].encrypted_content !== compactItems[0].encrypted_content ||
+					(finalItems[0].id !== undefined &&
+						compactItems[0].id !== undefined &&
+						finalItems[0].id !== compactItems[0].id)
+				) {
+					fail("completed output disagreed with the finished compaction item");
 				}
 			}
+			completed = true;
 		}
-		if (event.type === "response.completed") {
-			completed = fromJson(event.response ?? {});
-		}
+	};
+
+	if (!response.body) {
+		if (!response.ok) throw createOpenAIApiError(response, "");
+		return fail("response had no body");
 	}
-	if (completed.length > 0) return completed;
-	return [...collected.values()];
+	const reader = response.body.getReader();
+	const signal = options?.signal;
+	const abort = () => {
+		void reader.cancel(signal?.reason).catch(() => {});
+	};
+	signal?.addEventListener("abort", abort, { once: true });
+	const decoder = new TextDecoder();
+	// ponytail: bound the whole response to 16 MiB (errors 64 KiB), not a new
+	// configurable buffering system. SSE frames are discarded as they are parsed.
+	const budget = new StreamByteBudget(
+		response.ok ? 16 * 1024 * 1024 : 64 * 1024,
+		"Codex remote compact response",
+	);
+	let buffer = "";
+	let json: boolean | undefined;
+	try {
+		signal?.throwIfAborted();
+		while (!completed) {
+			const { done, value } = await readWithTimeout(reader);
+			signal?.throwIfAborted();
+			if (value?.byteLength) {
+				budget.add(value.byteLength);
+				options?.onActivity?.();
+				signal?.throwIfAborted();
+				buffer += decoder.decode(value, { stream: true });
+			}
+			if (done) buffer += decoder.decode();
+			if (response.ok) {
+				// Preserve JSON relay support even if its content-type is inaccurate.
+				const first = buffer.trimStart()[0];
+				if (json === undefined && first) json = first === "{" || first === "[";
+				if (json === false) {
+					let boundary = /\r?\n\r?\n/.exec(buffer);
+					while (boundary && !completed) {
+						const frame = buffer.slice(0, boundary.index);
+						buffer = buffer.slice(boundary.index + boundary[0].length);
+						parseFrame(frame);
+						boundary = /\r?\n\r?\n/.exec(buffer);
+					}
+					if (done && !completed && buffer.trim()) parseFrame(buffer);
+				}
+			}
+			if (done) break;
+		}
+		if (!response.ok) throw createOpenAIApiError(response, buffer);
+		if (json) {
+			const result = parseJson(buffer);
+			compactItems = validate(fromJson(result));
+			if (result.status !== "completed") fail("JSON response was not completed");
+		} else if (!completed) fail("stream closed before response.completed");
+		return compactItems;
+	} finally {
+		signal?.removeEventListener("abort", abort);
+		// Do not wait for an upstream socket to close after its terminal event.
+		void reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
 }
 
 const CODEX_ID_PREFIX_BY_TYPE: Record<string, string> = {
