@@ -880,21 +880,32 @@ async function doRunCustomCompact({
 		retryingMessageId: options?.reuseFailedMessageId,
 	});
 
-	let messages = beforeMessageId
-		? await narratorService.getMessagesBefore(narratorId, beforeMessageId)
-		: await narratorService.getModelHistorySinceLastCompact(narratorId);
-	let compactBeforeMessageId = beforeMessageId;
-	let expectedAttempt = options?.preparedRetryMessage
-		? compactAttemptNumber(options.preparedRetryMessage)
-		: undefined;
-	let expectedSeq = options?.preparedRetryMessage?.seq;
-
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: { pruneBoundaryMessageId: true, variant: true, model: true },
 	});
 	const remoteModel = narrator?.model?.trim() || "";
 	const resolvedCompact = remoteModel ? resolveProviderAndModel(remoteModel) : null;
+	let messages = beforeMessageId
+		? await narratorService.getMessagesBefore(narratorId, beforeMessageId, {
+				includeRemoteCompact:
+					!!resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter),
+			})
+		: await narratorService.getModelHistorySinceLastCompact(narratorId);
+	// Keep the newly included predecessor exclusive to remote input; local
+	// summary/fallback and empty-range handling retain their original messages.
+	const remotePredecessor =
+		beforeMessageId &&
+		messages[0]?.role === "system" &&
+		Array.isArray(messages[0].contentJson) &&
+		messages[0].contentJson.some((block) => parseCompactMessageBlock(block)?.remoteCompact)
+			? messages.shift()
+			: undefined;
+	let compactBeforeMessageId = beforeMessageId;
+	let expectedAttempt = options?.preparedRetryMessage
+		? compactAttemptNumber(options.preparedRetryMessage)
+		: undefined;
+	let expectedSeq = options?.preparedRetryMessage?.seq;
 	if (
 		!options?.preparedRetryMessage &&
 		resolvedCompact &&
@@ -903,7 +914,7 @@ async function doRunCustomCompact({
 		messages.length > 0
 	) {
 		const preview = await buildHistory(
-			messages,
+			remotePredecessor ? [remotePredecessor, ...messages] : messages,
 			resolvedCompact.model,
 			resolvedCompact.provider,
 			narratorId,
@@ -1004,7 +1015,7 @@ async function doRunCustomCompact({
 				// role=system compact marker, which silently discards everything the
 				// previous compaction already folded into `encrypted_content`.
 				const built = await buildHistory(
-					messages ?? [],
+					remotePredecessor ? [remotePredecessor, ...messages] : (messages ?? []),
 					resolvedCompact.model,
 					resolvedCompact.provider,
 					narratorId,

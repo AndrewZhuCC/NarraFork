@@ -1852,7 +1852,11 @@ export const narratorMessageQueries = {
 		return modelMessages;
 	},
 
-	async getMessagesBefore(narratorId: string, beforeMessageId: string) {
+	async getMessagesBefore(
+		narratorId: string,
+		beforeMessageId: string,
+		options?: { includeRemoteCompact?: boolean },
+	) {
 		const targetRef = await db.query.narratorMessageRefs.findFirst({
 			where: and(
 				eq(narratorMessageRefs.narratorId, narratorId),
@@ -1875,7 +1879,10 @@ export const narratorMessageQueries = {
 			.limit(1);
 
 		const compactSeq = lastCompactRow[0]?.seq;
-		const lowerBound = compactSeq != null ? gt(narratorMessageRefs.seq, compactSeq) : sql`1=1`;
+		const lowerBound =
+			compactSeq != null
+				? (options?.includeRemoteCompact ? gte : gt)(narratorMessageRefs.seq, compactSeq)
+				: sql`1=1`;
 
 		const refRows = await db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
@@ -1902,7 +1909,22 @@ export const narratorMessageQueries = {
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
 		// A failed earlier compact marker may sit inside this retry range. Keep it
 		// visible in the transcript, but never summarize it into a later compact.
-		const compactableMessages = messages.filter((message) => !isCompactLifecycleMessage(message));
+		const compactableMessages = messages.filter((message) => {
+			// Only the nearest boundary may be replayed; never cross a local/clear
+			// checkpoint or admit failed/in-progress markers from the new range.
+			if (options?.includeRemoteCompact && seqMap.get(message.id) === compactSeq) {
+				return (
+					message.role === "system" &&
+					Array.isArray(message.contentJson) &&
+					message.contentJson.some(
+						(block) =>
+							parseCompactMessageBlock(block)?.status === "compacted" &&
+							hasRemoteCompactPayload([block]),
+					)
+				);
+			}
+			return !isCompactLifecycleMessage(message);
+		});
 		return compactableMessages;
 	},
 
