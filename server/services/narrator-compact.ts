@@ -898,18 +898,37 @@ async function doRunCustomCompact({
 		: runtime
 			? runtime.reasoningEffort
 			: narrator?.reasoningEffort;
-	const resolvedCompact = narrator
-		? resolveProviderAndModel(
+	let resolvedCompact: ReturnType<typeof resolveProviderAndModel> | null = null;
+	let resolutionError: unknown;
+	try {
+		if (narrator) {
+			resolvedCompact = resolveProviderAndModel(
 				remoteModel?.trim() || undefined,
 				active?.alive ? active.provider : undefined,
-			)
-		: null;
+			);
+		}
+	} catch (error) {
+		// An unavailable chat provider must not block a separately configured local summary.
+		resolutionError = error;
+	}
 	let messages = beforeMessageId
 		? await narratorService.getMessagesBefore(narratorId, beforeMessageId, {
 				includeRemoteCompact:
-					!!resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter),
+					resolutionError !== undefined ||
+					(!!resolvedCompact && isCodexRemoteCompactEnabled(resolvedCompact.adapter)),
 			})
 		: await narratorService.getModelHistorySinceLastCompact(narratorId);
+	if (
+		resolutionError !== undefined &&
+		messages.some(
+			(message) =>
+				Array.isArray(message.contentJson) &&
+				message.contentJson.some((block) => parseCompactMessageBlock(block)?.remoteCompact),
+		)
+	) {
+		// Local summaries cannot read an existing encrypted checkpoint.
+		throw resolutionError;
+	}
 	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
 	// Like loadSubagentHistory, normalize only this narrator's in-memory copies
 	// so both remote preview and compact treat its own replies as top-level.
