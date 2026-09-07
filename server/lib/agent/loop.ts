@@ -38,7 +38,7 @@ import {
 	isMalformedRequestBodyError,
 	writeMalformedRequestDump,
 } from "./malformed-request-dump";
-import { type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
+import { type ChatParams, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import {
@@ -3184,7 +3184,14 @@ export async function* agentLoop(
 			let requestStartPending = false;
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
-			const markRequestStarted = (info?: { credentialId?: string }) => {
+			const markRequestStarted: NonNullable<ChatParams["onRequestStart"]> = (info) => {
+				if (!config.reflectionLoop && info?.codexHttpTools) {
+					config.lastCodexHttpTools = {
+						provider: effectiveProvider,
+						model: effectiveModel,
+						tools: structuredClone(info.codexHttpTools),
+					};
+				}
 				if (info?.credentialId) {
 					credentialId = info.credentialId;
 				}
@@ -3807,6 +3814,9 @@ export async function* agentLoop(
 				try {
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
+					// Never reuse a stale snapshot after changing model/provider/transport.
+					if (!config.reflectionLoop) config.lastCodexHttpTools = undefined;
+					const parentTools = config.lastCodexHttpTools;
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,
@@ -3814,6 +3824,12 @@ export async function* agentLoop(
 						cwd: config.cwd,
 						history,
 						tools,
+						reflectionParentTools:
+							config.reflectionLoop &&
+							parentTools?.provider === effectiveProvider &&
+							parentTools.model === effectiveModel
+								? parentTools.tools
+								: undefined,
 						toolResults: pendingToolResults,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,

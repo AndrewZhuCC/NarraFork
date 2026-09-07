@@ -14,27 +14,56 @@ import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
+import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 import type { AgentConfig } from "../types";
 
 const DECISION_TOOL_NAME = "CachePrefixDecisionTool";
 const SYSTEM_PROMPT = "PARENT_SYSTEM_PROMPT";
 
 /** Requests the fake provider saw, in order. */
-let captured: Array<{ history: unknown[]; content: string }> = [];
+let captured: Array<{
+	history: unknown[];
+	content: string;
+	tools: unknown[];
+	parentTools?: unknown[];
+}> = [];
+const PARENT_TOOL_NAME = "CachePrefixParentTool";
+let parentGateTools: unknown[] | undefined;
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => tools.map((t) => ({ name: t.name })),
+	formatTools: (tools) => {
+		if (parentGateTools && tools.some((tool) => tool.name === dangerCancelTool.name)) {
+			// Dynamic schemas may be backed by shared objects. Do not mutate the saved prefix.
+			(parentGateTools[0] as { parameters: { description: string } }).parameters.description =
+				"changed while formatting reflection";
+		}
+		return tools.map((t) => ({ name: t.name }));
+	},
 	// Mirrors the real providers: prepend a marker entry representing the system prompt.
 	injectSystemPrompt: (history, systemPrompt) => {
 		(history as unknown[]).unshift({ role: "system", content: systemPrompt });
 	},
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	async *chat(params) {
-		params.onRequestStart?.();
+		const parentTurn = parentGateTools && params.content === "parent turn";
+		params.onRequestStart?.(parentTurn ? { codexHttpTools: parentGateTools } : undefined);
 		captured.push({
-			history: JSON.parse(JSON.stringify(params.history)),
+			history: structuredClone(params.history),
 			content: params.content,
+			tools: structuredClone(params.tools),
+			parentTools: structuredClone(params.reflectionParentTools),
 		});
+		if (parentGateTools) {
+			yield {
+				toolUses: parentTurn
+					? [{ toolUseId: "parent-call", name: PARENT_TOOL_NAME, input: {} }]
+					: [
+							{ toolUseId: "forbidden-call", name: PARENT_TOOL_NAME, input: {} },
+							{ toolUseId: "cancel-call", name: dangerCancelTool.name, input: { reason: "test" } },
+						],
+			};
+			return;
+		}
 		yield {
 			toolUses: [{ toolUseId: "tu_decide", name: DECISION_TOOL_NAME, input: { value: "ok" } }],
 		};
@@ -47,6 +76,8 @@ const testProvider: ProviderAdapter = {
 	generateWithHistory: async () => "",
 };
 
+// Match startup order: router registration reads the fully initialized core tools.
+await import("@server/services/narrator-session");
 const realProviderModule = { ...(await import("../provider")) };
 
 mock.module("../provider", () => ({
@@ -60,7 +91,7 @@ mock.module("../provider", () => ({
 	}),
 }));
 
-const { runReflectionLoop } = await import("../loop");
+const { agentLoop, runReflectionLoop } = await import("../loop");
 
 toolRegistry.register({
 	name: DECISION_TOOL_NAME,
@@ -101,10 +132,11 @@ function parentHistory(): unknown[] {
 async function runReflection(
 	history: unknown[],
 	injectParentSystemPrompt?: boolean,
+	lastCodexHttpTools?: AgentConfig["lastCodexHttpTools"],
 ): Promise<unknown[]> {
 	captured = [];
 	await runReflectionLoop({
-		parentConfig: parentConfig(),
+		parentConfig: { ...parentConfig(), lastCodexHttpTools },
 		history,
 		prompt: "REFLECTION_PROMPT",
 		reflectionLoop: {
@@ -161,5 +193,93 @@ describe("reflection loop cacheable prefix", () => {
 
 		// Nothing was inherited, so suppressing injection would drop the prompt entirely.
 		expect(systemEntries(history)).toEqual([SYSTEM_PROMPT]);
+	});
+
+	test("only reuses a snapshot from the same provider and model", async () => {
+		for (const [provider, model, matches] of [
+			["test", "test:model", true],
+			["other", "test:model", false],
+			["test", "test:other", false],
+		] as const) {
+			const tools = [{ type: "function", name: PARENT_TOOL_NAME }];
+			await runReflection(parentHistory(), undefined, { provider, model, tools });
+			expect(captured[0].parentTools).toEqual(matches ? tools : undefined);
+			expect(captured[0].tools).toEqual([{ name: DECISION_TOOL_NAME }]);
+		}
+	});
+
+	test("inherits actual parent wire tools without granting execution of parent tools", async () => {
+		let parentExecutions = 0;
+		let cancellations = 0;
+		const tools = [
+			{
+				name: PARENT_TOOL_NAME,
+				description: "Parent operation",
+				parameters: z.object({}),
+				execute: async () => {
+					parentExecutions++;
+					return { output: "must not run" };
+				},
+			},
+			{ ...dangerConfirmTool, execute: async () => ({ output: "confirm" }) },
+			{
+				...dangerCancelTool,
+				execute: async () => {
+					cancellations++;
+					return { output: "cancel" };
+				},
+			},
+		];
+		const originals = tools.map((tool) => toolRegistry.get(tool.name));
+		for (const tool of tools) toolRegistry.register(tool);
+		try {
+			captured = [];
+			// The provider's final list deliberately differs from formatTools().
+			parentGateTools = [
+				{
+					type: "function",
+					name: PARENT_TOOL_NAME,
+					description: "wire snapshot",
+					parameters: { type: "object", description: "original schema" },
+				},
+				{ type: "web_search" },
+			];
+			const expectedTools = structuredClone(parentGateTools);
+			const config = parentConfig();
+			config.maxTurns = 1;
+			config.toolFilter = (tool) => tool.name === PARENT_TOOL_NAME;
+			const history: unknown[] = [];
+			config.permissionHandler = async () => {
+				const observed = await runReflectionLoop({
+					parentConfig: config,
+					history,
+					prompt: "reflect",
+					reflectionLoop: {
+						allowedTools: [dangerConfirmTool.name, dangerCancelTool.name],
+						context: { kind: "dangerReflection", requestId: "req-real-tools" },
+					},
+				});
+				expect(observed.toolResults.some((result) => result.isError)).toBe(true);
+				return { behavior: "deny", message: "test cancelled" };
+			};
+			for await (const _event of agentLoop(config, "parent turn", history)) {
+				/* drain */
+			}
+			expect(captured).toHaveLength(2);
+			expect(captured[0].parentTools).toBeUndefined();
+			expect(captured[1].parentTools).toEqual(expectedTools);
+			expect(config.lastCodexHttpTools?.tools).toEqual(expectedTools);
+			expect(parentGateTools).not.toEqual(expectedTools);
+			expect(captured[1].tools).toEqual([
+				{ name: dangerConfirmTool.name },
+				{ name: dangerCancelTool.name },
+			]);
+			expect(parentExecutions).toBe(0);
+			expect(cancellations).toBe(1);
+		} finally {
+			parentGateTools = undefined;
+			for (const tool of tools) toolRegistry.unregister(tool.name);
+			for (const tool of originals) if (tool) toolRegistry.register(tool);
+		}
 	});
 });
