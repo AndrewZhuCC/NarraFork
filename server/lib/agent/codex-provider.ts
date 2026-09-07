@@ -523,7 +523,7 @@ export class CodexProvider implements ProviderAdapter {
 			const chatParams: ChatParams = {
 				...params,
 				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+					params.onRequestStart?.({ ...info, credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
 
@@ -591,7 +591,7 @@ export class CodexProvider implements ProviderAdapter {
 			const chatParams: ChatParams = {
 				...params,
 				onRequestStart: (info) =>
-					params.onRequestStart?.({ credentialId: info?.credentialId ?? ctx.id }),
+					params.onRequestStart?.({ ...info, credentialId: info?.credentialId ?? ctx.id }),
 			};
 			let hasStreamedEvents = false;
 

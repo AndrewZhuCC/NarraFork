@@ -91,7 +91,13 @@ export interface ChatParams extends ProtocolChatParams {
 	 * to distinguish a real empty upstream response from local request preparation
 	 * paths that completed without ever contacting the API.
 	 */
-	onRequestStart?: (info?: { credentialId?: string }) => void;
+	onRequestStart?: (info?: {
+		credentialId?: string;
+		/** Actual Codex HTTP tools, including hosted tools, for a nested reflection to reuse. */
+		codexHttpTools?: unknown[];
+	}) => void;
+	/** Parent's wire tools; Codex HTTP only. params.tools remains the reflection allow-list. */
+	reflectionParentTools?: unknown[];
 }
 
 export interface GenerateOptions {

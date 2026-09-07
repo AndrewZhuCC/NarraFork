@@ -893,11 +893,14 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
-				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, model, {
-					webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
-					imageGeneration: this.codexImageGenerationEnabled,
-				});
+				const toolsArr = (params.reflectionParentTools ?? body.tools ?? []) as unknown[];
+				// A reflection inherits the exact parent list, including its hosted tools.
+				if (!params.reflectionParentTools) {
+					appendCodexNativeTools(toolsArr, model, {
+						webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
+						imageGeneration: this.codexImageGenerationEnabled,
+					});
+				}
 				body.tools = toolsArr;
 			}
 
@@ -910,6 +913,30 @@ export class OpenAIProvider implements ProviderAdapter {
 					identity: createCodexRequestIdentity(params.conversationId),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
+				if (params.reflectionParentTools) {
+					const parentTools = params.reflectionParentTools as Array<{
+						type: string;
+						name?: string;
+					}>;
+					const parentNames = new Set(
+						parentTools.filter((tool) => tool.type === "function").map((tool) => tool.name),
+					);
+					const decisions = params.tools as Array<{ type: "function"; name: string }>;
+					const additionalTools = decisions.filter((tool) => !parentNames.has(tool.name));
+					if (additionalTools.length > 0) {
+						body.input = [
+							...responsesInput,
+							{ type: "additional_tools", role: "developer", tools: additionalTools },
+						];
+					}
+					// Keep parallel_tool_calls and the cached tools prefix unchanged. The
+					// upstream mask also blocks hosted tools that bypass our local executor.
+					body.tool_choice = {
+						type: "allowed_tools",
+						mode: "required",
+						tools: decisions.map((tool) => ({ type: "function", name: tool.name })),
+					};
+				}
 			} else {
 				// Plain responses-compatible relays: send the effort hint too. These
 				// used to get nothing at all, so their tier menu was dead weight.
@@ -925,8 +952,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				model,
 				hasInstructions: !!instructions,
 				instructionsLength: instructions.length,
-				inputMessageCount: responsesInput.length,
-				toolCount: tools.length,
+				inputMessageCount: (body.input as unknown[]).length,
+				toolCount: (body.tools as unknown[] | undefined)?.length ?? 0,
 				reasoningEffort: normalizedCodexReasoningEffort,
 				originalReasoningEffort: params.reasoningEffort,
 			});
@@ -957,7 +984,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		});
 
 		const bodyText = JSON.stringify(body);
-		params.onRequestStart?.();
+		if (this.apiMode === "codex") {
+			params.onRequestStart?.({ codexHttpTools: body.tools as unknown[] });
+		} else {
+			params.onRequestStart?.();
+		}
 		const response = await this.pfetch(endpoint, {
 			method: "POST",
 			headers: requestHeaders,

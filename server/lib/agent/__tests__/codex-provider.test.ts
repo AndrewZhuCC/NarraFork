@@ -7,6 +7,41 @@ import {
 } from "../openai-provider";
 
 describe("CodexProvider Responses WebSocket handling", () => {
+	test("HTTP credential delegation preserves the parent tool snapshot", async () => {
+		const provider = new CodexProvider({ useWebSocket: false });
+		const tools = [{ type: "function", name: "Read" }, { type: "web_search" }];
+		let reported: unknown;
+		Object.assign(provider, {
+			getMaxFailoverAttempts: () => 1,
+			getContext: async () => ({ id: "test-credential" }),
+			refreshUsageOnUse: () => {},
+			manager: { reportSuccess: () => {} },
+			createProvider: () => ({
+				async *chat(params: import("../provider").ChatParams) {
+					expect(params.reflectionParentTools).toEqual(tools);
+					params.onRequestStart?.({ codexHttpTools: tools });
+					yield { text: "ok" };
+				},
+			}),
+		});
+		for await (const _event of provider.chat({
+			conversationId: "snapshot-test",
+			content: "reflect",
+			model: "codex:gpt-5.3-codex",
+			cwd: process.cwd(),
+			history: [],
+			tools: [],
+			toolResults: [],
+			signal: new AbortController().signal,
+			reflectionParentTools: tools,
+			onRequestStart: (info) => {
+				reported = info;
+			},
+		})) {
+			/* drain */
+		}
+		expect(reported).toEqual({ credentialId: "test-credential", codexHttpTools: tools });
+	});
 	test("detects expected 101 errors from wrapped runtime events", () => {
 		const expected101Message =
 			"WebSocket connection to 'wss://chatgpt.com/backend-api/codex/responses' failed: Expected 101 status code";
