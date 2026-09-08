@@ -692,7 +692,10 @@ export async function executeTool(
 				: config.allowedTools
 					? new Set(config.allowedTools)
 					: null;
-		if (allowedTools && !allowedTools.has(tu.name)) {
+		if (
+			(tool.reflectionOnly && !config.reflectionLoop) ||
+			(allowedTools && !allowedTools.has(tu.name))
+		) {
 			return {
 				output: `Tool is not allowed by this narrator's runtime policy: ${tu.name}`,
 				isError: true,

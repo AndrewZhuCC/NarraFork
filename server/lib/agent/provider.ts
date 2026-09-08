@@ -105,7 +105,9 @@ export interface ChatParams extends ProtocolChatParams {
 		/** Actual Codex tools on HTTP or WebSocket, including hosted tools, for a reflection to reuse. */
 		codexTools?: unknown[];
 	}) => void;
-	/** Parent's wire tools; Codex only. params.tools remains the reflection allow-list. */
+	/** Inactive reflection definitions to predeclare on normal Codex requests. */
+	reflectionTools?: unknown[];
+	/** Parent's wire tools; Codex only. An empty array marks a reflection without a snapshot. */
 	reflectionParentTools?: unknown[];
 }
 

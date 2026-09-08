@@ -11,7 +11,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { ORIGINATOR_CODEX } from "../../user-agent";
 import { CodexProvider } from "../codex-provider";
 import * as codexWebSocket from "../codex-websocket";
-import { OpenAIProvider } from "../openai-provider";
+import { applyCodexReflectionTools, OpenAIProvider } from "../openai-provider";
 import type { ChatParams } from "../provider";
 import { resolveToolJsonSchema } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
@@ -215,6 +215,20 @@ const parentFunction = {
 	strict: false,
 };
 
+test("an empty active list cannot enable predeclared or parent tools", () => {
+	for (const reflection of [false, true]) {
+		const body: Record<string, unknown> = { tools: [], input: [] };
+		applyCodexReflectionTools(body, {
+			tools: [],
+			...(reflection
+				? { reflectionParentTools: [parentFunction, { type: "web_search" }] }
+				: { reflectionTools: decisionTools }),
+		} as ChatParams);
+		expect(body.tool_choice).toBe("none");
+		expect(body.input).toEqual([]);
+	}
+});
+
 for (const transport of ["http", "ws", "native-ws"] as const) {
 	describe(`Codex ${transport} reflection tool prefix`, () => {
 		const capture = (overrides: Partial<ChatParams> = {}) =>
@@ -227,11 +241,22 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 					{ role: "user", content: "shared history" },
 				],
 				tools: [parentFunction, { type: "web_search" }, { type: "image_generation" }],
+				reflectionTools: decisionTools,
 				onRequestStart: (info) => {
 					parentTools = structuredClone(info?.codexTools);
 				},
 			};
 			const parent = await capture(normal);
+			expect((parent.body.tools as unknown[]).slice(-2)).toEqual(decisionTools);
+			expect(parent.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "auto",
+				tools: [
+					{ type: "function", name: parentFunction.name },
+					{ type: "web_search" },
+					{ type: "image_generation" },
+				],
+			});
 			expect(JSON.stringify(parentTools)).toBe(JSON.stringify(parent.body.tools));
 			const before = JSON.stringify(parentTools);
 			const reflection = await capture({
@@ -245,12 +270,15 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			expect(JSON.stringify(parentTools)).toBe(before);
 			expect(reflection.body.instructions).toBe(parent.body.instructions);
 			const input = reflection.body.input as unknown[];
-			expect(input.slice(0, -2)).toEqual((parent.body.input as unknown[]).slice(0, -1));
-			expect(input.at(-1)).toEqual({
-				type: "additional_tools",
-				role: "developer",
-				tools: decisionTools,
-			});
+			expect(input.slice(0, -1)).toEqual((parent.body.input as unknown[]).slice(0, -1));
+			expect(input.some((item) => (item as { type?: string }).type === "additional_tools")).toBe(
+				false,
+			);
+			expect(reflection.headers["x-openai-internal-codex-responses-lite"]).toBeUndefined();
+			expect(
+				(reflection.body.client_metadata as Record<string, unknown>)
+					.ws_request_header_x_openai_internal_codex_responses_lite,
+			).toBeUndefined();
 			expect(reflection.body.tool_choice).toEqual({
 				type: "allowed_tools",
 				mode: "required",
@@ -277,7 +305,12 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				tools: [parentFunction, ...decisionTools],
 				reflectionParentTools: [parentFunction],
 			});
-			expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
+			expect(req.body.tools).toEqual([parentFunction, ...decisionTools]);
+			expect(
+				(req.body.input as Array<{ type?: string }>).some(
+					(item) => item.type === "additional_tools",
+				),
+			).toBe(false);
 			expect(req.body.tool_choice).toEqual({
 				type: "allowed_tools",
 				mode: "required",
@@ -304,10 +337,14 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 			});
 		});
 
-		test("an explicitly empty parent stays empty; no native tools are injected", async () => {
+		test("a missing snapshot declares only decisions without native or Lite tools", async () => {
 			const req = await capture({ tools: decisionTools, reflectionParentTools: [] });
-			expect(req.body.tools).toEqual([]);
-			expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
+			expect(req.body.tools).toEqual(decisionTools);
+			expect(
+				(req.body.input as Array<{ type?: string }>).some(
+					(item) => item.type === "additional_tools",
+				),
+			).toBe(false);
 		});
 
 		test("without a parent snapshot the normal request behavior stays unchanged", async () => {
@@ -326,6 +363,7 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 				let parentTools: unknown[] | undefined;
 				await capture({
 					tools: [parentFunction],
+					reflectionTools: decisionTools,
 					onRequestStart: (info) => {
 						parentTools = structuredClone(info?.codexTools);
 					},
@@ -368,7 +406,7 @@ for (const apiMode of ["responses", "completions"] as const) {
 		};
 		const normal = await captureChat(params, apiMode);
 		const reflection = await captureChat(
-			{ ...params, reflectionParentTools: [parentFunction] },
+			{ ...params, reflectionParentTools: [parentFunction], reflectionTools: decisionTools },
 			apiMode,
 		);
 		expect(reflection.body).toEqual(normal.body);
