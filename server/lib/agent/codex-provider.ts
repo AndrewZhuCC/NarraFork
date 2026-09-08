@@ -23,6 +23,7 @@ import {
 } from "./codex-websocket";
 import {
 	appendCodexNativeTools,
+	applyCodexReflectionTools,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
 	type OAIContentPart,
@@ -599,7 +600,7 @@ export class CodexProvider implements ProviderAdapter {
 				const request = this.buildResponsesWebSocketRequest(params);
 				const fingerprint = resolveCodexProviderFingerprint(params.conversationId);
 
-				params.onRequestStart?.({ credentialId: ctx.id });
+				params.onRequestStart?.({ credentialId: ctx.id, codexTools: request.tools as unknown[] });
 				for await (const event of streamCodexResponsesWebSocket({
 					baseUrl: CODEX_BASE_URL,
 					apiKey: ctx.token,
@@ -848,17 +849,21 @@ export class CodexProvider implements ProviderAdapter {
 			store: false,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, model, {
-			webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
-			imageGeneration: this.useImageGeneration,
-		});
+		const tools =
+			params.reflectionParentTools ?? (Array.isArray(params.tools) ? [...params.tools] : []);
+		if (!params.reflectionParentTools) {
+			appendCodexNativeTools(tools, model, {
+				webSearch: this.useWebSearch && isNativeSearchChannelFirstEnabled(),
+				imageGeneration: this.useImageGeneration,
+			});
+		}
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
 			identity: createCodexRequestIdentity(params.conversationId),
 			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
 		});
+		applyCodexReflectionTools(request, params);
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}

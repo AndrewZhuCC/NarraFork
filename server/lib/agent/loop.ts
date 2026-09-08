@@ -3187,11 +3187,11 @@ export async function* agentLoop(
 			let startFirstTokenTimerForAttempt: (() => void) | undefined;
 
 			const markRequestStarted: NonNullable<ChatParams["onRequestStart"]> = (info) => {
-				if (!config.reflectionLoop && info?.codexHttpTools) {
-					config.lastCodexHttpTools = {
+				if (!config.reflectionLoop && info?.codexTools) {
+					config.lastCodexTools = {
 						provider: effectiveProvider,
 						model: effectiveModel,
-						tools: structuredClone(info.codexHttpTools),
+						tools: structuredClone(info.codexTools),
 					};
 				}
 				if (info?.credentialId) {
@@ -3817,8 +3817,8 @@ export async function* agentLoop(
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
 					// Never reuse a stale snapshot after changing model/provider/transport.
-					if (!config.reflectionLoop) config.lastCodexHttpTools = undefined;
-					const parentTools = config.lastCodexHttpTools;
+					if (!config.reflectionLoop) config.lastCodexTools = undefined;
+					const parentTools = config.lastCodexTools;
 					const stream = provider.chat({
 						conversationId: config.conversationId,
 						content,

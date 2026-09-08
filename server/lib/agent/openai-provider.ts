@@ -216,6 +216,31 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
+/** Preserve the parent tool prefix; only the reflection's decision tools may run. */
+export function applyCodexReflectionTools(body: Record<string, unknown>, params: ChatParams): void {
+	if (!params.reflectionParentTools) return;
+	const parentTools = params.reflectionParentTools as Array<{ type: string; name?: string }>;
+	const parentNames = new Set(
+		parentTools.filter((tool) => tool.type === "function").map((tool) => tool.name),
+	);
+	const decisions = params.tools as Array<{ type: "function"; name: string }>;
+	const additionalTools = decisions.filter((tool) => !parentNames.has(tool.name));
+	body.tools = parentTools;
+	if (additionalTools.length > 0) {
+		body.input = [
+			...(body.input as unknown[]),
+			{ type: "additional_tools", role: "developer", tools: additionalTools },
+		];
+	}
+	// Do not change parallel_tool_calls. This also excludes hosted tools that
+	// would run upstream without passing through the local reflection allow-list.
+	body.tool_choice = {
+		type: "allowed_tools",
+		mode: "required",
+		tools: decisions.map((tool) => ({ type: "function", name: tool.name })),
+	};
+}
+
 /**
  * Fallback reasoning tiers for Codex models not present in
  * CODEX_MODEL_REASONING_LEVELS. Most codex models expose low..xhigh but no
@@ -913,30 +938,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					identity: createCodexRequestIdentity(params.conversationId),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
-				if (params.reflectionParentTools) {
-					const parentTools = params.reflectionParentTools as Array<{
-						type: string;
-						name?: string;
-					}>;
-					const parentNames = new Set(
-						parentTools.filter((tool) => tool.type === "function").map((tool) => tool.name),
-					);
-					const decisions = params.tools as Array<{ type: "function"; name: string }>;
-					const additionalTools = decisions.filter((tool) => !parentNames.has(tool.name));
-					if (additionalTools.length > 0) {
-						body.input = [
-							...responsesInput,
-							{ type: "additional_tools", role: "developer", tools: additionalTools },
-						];
-					}
-					// Keep parallel_tool_calls and the cached tools prefix unchanged. The
-					// upstream mask also blocks hosted tools that bypass our local executor.
-					body.tool_choice = {
-						type: "allowed_tools",
-						mode: "required",
-						tools: decisions.map((tool) => ({ type: "function", name: tool.name })),
-					};
-				}
+				applyCodexReflectionTools(body, params);
 			} else {
 				// Plain responses-compatible relays: send the effort hint too. These
 				// used to get nothing at all, so their tier menu was dead weight.
@@ -985,7 +987,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const bodyText = JSON.stringify(body);
 		if (this.apiMode === "codex") {
-			params.onRequestStart?.({ codexHttpTools: body.tools as unknown[] });
+			params.onRequestStart?.({ codexTools: body.tools as unknown[] });
 		} else {
 			params.onRequestStart?.();
 		}
@@ -1526,7 +1528,10 @@ export class OpenAIProvider implements ProviderAdapter {
 		const fingerprint = this.resolveFingerprint(params.conversationId);
 
 		try {
-			params.onRequestStart?.({ credentialId: this.config.id });
+			params.onRequestStart?.({
+				credentialId: this.config.id,
+				codexTools: request.tools as unknown[],
+			});
 			for await (const event of streamCodexResponsesWebSocket({
 				baseUrl,
 				apiKey,
@@ -1635,17 +1640,21 @@ export class OpenAIProvider implements ProviderAdapter {
 			store: false,
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, model, {
-			webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
-			imageGeneration: this.codexImageGenerationEnabled,
-		});
+		const tools =
+			params.reflectionParentTools ?? (Array.isArray(params.tools) ? [...params.tools] : []);
+		if (!params.reflectionParentTools) {
+			appendCodexNativeTools(tools, model, {
+				webSearch: this.codexWebSearchEnabled && isNativeSearchChannelFirstEnabled(),
+				imageGeneration: this.codexImageGenerationEnabled,
+			});
+		}
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
 			identity: createCodexRequestIdentity(params.conversationId),
 			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
 		});
+		applyCodexReflectionTools(request, params);
 		if (params.serviceTier) {
 			request.service_tier = params.serviceTier;
 		}

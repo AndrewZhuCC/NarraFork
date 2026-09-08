@@ -97,6 +97,42 @@ describe("Codex Responses WebSocket helpers", () => {
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
 
+	test("reflection restrictions and returning to normal do not reuse stale response properties", () => {
+		const parent = {
+			...makeRequest([makeUserMessage("hello")]),
+			tools: [{ type: "function", name: "Read" }],
+			tool_choice: "auto",
+		};
+		const reflection = {
+			...parent,
+			input: [...parent.input, makeUserMessage("reflect")],
+			tool_choice: {
+				type: "allowed_tools",
+				mode: "required",
+				tools: [{ type: "function", name: "DangerConfirm" }],
+			},
+		};
+		const reflected = buildCodexResponsesWebSocketRequest(
+			reflection,
+			parent,
+			makeCompleted("resp-parent", []),
+		);
+		expect(reflected.previous_response_id).toBeUndefined();
+		expect(reflected.input).toEqual(reflection.input);
+		expect(reflected.tools).toEqual(parent.tools);
+		expect(reflected.tool_choice).toEqual(reflection.tool_choice);
+		const normal = { ...parent, input: [...parent.input, makeUserMessage("continue")] };
+		const continued = buildCodexResponsesWebSocketRequest(
+			normal,
+			reflection,
+			makeCompleted("resp-reflection", []),
+		);
+		expect(continued.previous_response_id).toBeUndefined();
+		expect(continued.input).toEqual(normal.input);
+		expect(continued.tool_choice).toBe("auto");
+		expect(continued.parallel_tool_calls).toBe(true);
+	});
+
 	test("falls back to full create when reasoning settings change", () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		lastRequest.reasoning = { effort: "medium", summary: "auto" };

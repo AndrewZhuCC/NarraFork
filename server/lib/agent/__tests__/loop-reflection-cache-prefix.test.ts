@@ -46,7 +46,7 @@ const testProvider: ProviderAdapter = {
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
 	async *chat(params) {
 		const parentTurn = parentGateTools && params.content === "parent turn";
-		params.onRequestStart?.(parentTurn ? { codexHttpTools: parentGateTools } : undefined);
+		params.onRequestStart?.(parentTurn ? { codexTools: parentGateTools } : undefined);
 		captured.push({
 			history: structuredClone(params.history),
 			content: params.content,
@@ -132,11 +132,11 @@ function parentHistory(): unknown[] {
 async function runReflection(
 	history: unknown[],
 	injectParentSystemPrompt?: boolean,
-	lastCodexHttpTools?: AgentConfig["lastCodexHttpTools"],
+	lastCodexTools?: AgentConfig["lastCodexTools"],
 ): Promise<unknown[]> {
 	captured = [];
 	await runReflectionLoop({
-		parentConfig: { ...parentConfig(), lastCodexHttpTools },
+		parentConfig: { ...parentConfig(), lastCodexTools },
 		history,
 		prompt: "REFLECTION_PROMPT",
 		reflectionLoop: {
@@ -268,7 +268,7 @@ describe("reflection loop cacheable prefix", () => {
 			expect(captured).toHaveLength(2);
 			expect(captured[0].parentTools).toBeUndefined();
 			expect(captured[1].parentTools).toEqual(expectedTools);
-			expect(config.lastCodexHttpTools?.tools).toEqual(expectedTools);
+			expect(config.lastCodexTools?.tools).toEqual(expectedTools);
 			expect(parentGateTools).not.toEqual(expectedTools);
 			expect(captured[1].tools).toEqual([
 				{ name: dangerConfirmTool.name },

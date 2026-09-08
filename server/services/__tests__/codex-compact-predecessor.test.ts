@@ -704,6 +704,36 @@ for (const cancel of [true, false]) {
 	});
 }
 
+for (const bounded of [true, false]) {
+	for (const checkpoint of [true, false]) {
+		test(`unavailable chat provider: bounded=${bounded}, checkpoint=${checkpoint}`, async () => {
+			await seedNarrator();
+			await db
+				.update(narrators)
+				.set({ model: "missing-provider:model" })
+				.where(eq(narrators.id, "n1"));
+			if (checkpoint) await message("checkpoint", 1, marker(7), true);
+			await message("new", 2);
+			if (bounded) await message("boundary", 3);
+			const run = runCustomCompact("n1", "en", bounded ? "boundary" : undefined, {
+				mode: "blocking",
+			});
+			if (checkpoint) {
+				await expect(run).rejects.toThrow("not configured");
+				expect(localInputs).toEqual([]);
+				const refs = await db.select().from(narratorMessageRefs);
+				expect(refs.filter((ref) => ref.isCompact).map((ref) => ref.messageId)).toEqual([
+					"checkpoint",
+				]);
+			} else {
+				expect(await run).toBe(true);
+				expect(localInputs).toEqual([["new"]]);
+			}
+			expect(requests).toEqual([]);
+		});
+	}
+}
+
 for (const mode of ["disabled", "non-codex"] as const) {
 	test(`${mode} compact keeps the existing local-summary input`, async () => {
 		await seedNarrator();
