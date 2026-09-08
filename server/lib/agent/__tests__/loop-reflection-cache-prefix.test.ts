@@ -10,7 +10,7 @@
  * (often 100k+ token) prefix to be re-billed at full price instead of a cache read.
  */
 
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
@@ -157,6 +157,24 @@ function systemEntries(history: unknown[]): string[] {
 }
 
 describe("reflection loop cacheable prefix", () => {
+	test("predeclares reflection definitions separately from active tools", async () => {
+		let declarations: unknown[] | undefined;
+		let active: unknown;
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
+			declarations = params.reflectionTools;
+			active = params.tools;
+			yield { text: "done" };
+		});
+		try {
+			for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
+				/* drain */
+			}
+			expect(declarations).toContainEqual({ name: DECISION_TOOL_NAME });
+			expect(active).not.toContainEqual({ name: DECISION_TOOL_NAME });
+		} finally {
+			chat.mockRestore();
+		}
+	});
 	test("does not duplicate the system prompt already present in the parent history", async () => {
 		const history = await runReflection(parentHistory());
 
@@ -203,7 +221,7 @@ describe("reflection loop cacheable prefix", () => {
 		] as const) {
 			const tools = [{ type: "function", name: PARENT_TOOL_NAME }];
 			await runReflection(parentHistory(), undefined, { provider, model, tools });
-			expect(captured[0].parentTools).toEqual(matches ? tools : undefined);
+			expect(captured[0].parentTools).toEqual(matches ? tools : []);
 			expect(captured[0].tools).toEqual([{ name: DECISION_TOOL_NAME }]);
 		}
 	});

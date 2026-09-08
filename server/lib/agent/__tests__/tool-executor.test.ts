@@ -726,12 +726,16 @@ describe("executeTool permission guard", () => {
 		expect(result.output).toContain("not executed");
 	});
 
-	test("enforces the runtime allow-list before permission or execution", async () => {
+	test.each([
+		false,
+		true,
+	])("enforces runtime policy before permission or execution (reflectionOnly=%s)", async (reflectionOnly) => {
 		let executed = false;
 		let permissionCalls = 0;
 		toolRegistry.register({
 			name: TEST_TOOL_NAME,
 			description: "runtime allow-list test",
+			reflectionOnly,
 			parameters: z.object({}),
 			execute: async () => {
 				executed = true;
@@ -742,7 +746,7 @@ describe("executeTool permission guard", () => {
 			permissionCalls++;
 			return { behavior: "allow" };
 		});
-		config.allowedTools = new Set(["KnowledgeRead"]);
+		config.allowedTools = new Set([reflectionOnly ? TEST_TOOL_NAME : "KnowledgeRead"]);
 		const result = await executeTool(
 			{ toolUseId: "runtime-denied", name: TEST_TOOL_NAME, input: {} },
 			config,

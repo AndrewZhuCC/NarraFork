@@ -216,29 +216,35 @@ export function appendCodexNativeTools(
 	applyCodexImageGenerationDefaults(tools);
 }
 
-/** Preserve the parent tool prefix; only the reflection's decision tools may run. */
+/** Keep definitions stable; switch only which tools may run, without entering Responses Lite. */
 export function applyCodexReflectionTools(body: Record<string, unknown>, params: ChatParams): void {
-	if (!params.reflectionParentTools) return;
-	const parentTools = params.reflectionParentTools as Array<{ type: string; name?: string }>;
-	const parentNames = new Set(
-		parentTools.filter((tool) => tool.type === "function").map((tool) => tool.name),
-	);
-	const decisions = params.tools as Array<{ type: "function"; name: string }>;
-	const additionalTools = decisions.filter((tool) => !parentNames.has(tool.name));
-	body.tools = parentTools;
-	if (additionalTools.length > 0) {
-		body.input = [
-			...(body.input as unknown[]),
-			{ type: "additional_tools", role: "developer", tools: additionalTools },
-		];
-	}
-	// Do not change parallel_tool_calls. This also excludes hosted tools that
-	// would run upstream without passing through the local reflection allow-list.
-	body.tool_choice = {
-		type: "allowed_tools",
-		mode: "required",
-		tools: decisions.map((tool) => ({ type: "function", name: tool.name })),
-	};
+	const reflection = params.reflectionParentTools !== undefined;
+	const reserved = (reflection ? params.tools : params.reflectionTools) as
+		| Array<{ type: string; name?: string }>
+		| undefined;
+	if (!reserved || (!reflection && reserved.length === 0)) return;
+	const tools = (params.reflectionParentTools ?? body.tools ?? []) as Array<{
+		type: string;
+		name?: string;
+	}>;
+	const names = new Set(tools.filter((tool) => tool.type === "function").map((tool) => tool.name));
+	// An old/missing snapshot can need a one-time append. Never use additional_tools:
+	// relays can interpret that item as opting the entire request into Responses Lite.
+	body.tools = [...tools, ...reserved.filter((tool) => !names.has(tool.name))];
+	const reservedNames = new Set(reserved.map((tool) => tool.name));
+	const allowed = reflection
+		? reserved
+		: tools.filter((tool) => tool.type !== "function" || !reservedNames.has(tool.name));
+	// Hosted tools must also be excluded during reflection: they execute upstream.
+	body.tool_choice = allowed.length
+		? {
+				type: "allowed_tools",
+				mode: reflection ? "required" : "auto",
+				tools: allowed.map((tool) =>
+					tool.type === "function" ? { type: tool.type, name: tool.name } : { type: tool.type },
+				),
+			}
+		: "none";
 }
 
 /**
@@ -682,7 +688,6 @@ export class OpenAIProvider implements ProviderAdapter {
 		const conversationId = options?.conversationId?.trim();
 		const reasoningEffort = resolveCodexRequestReasoningEffort(model, options?.reasoningEffort);
 		applyCodexStableRequestFields(body, {
-			parallelToolCalls: this.config.codexParallelToolCalls,
 			identity: createCodexRequestIdentity(conversationId),
 			reasoningEffort,
 		});
@@ -936,7 +941,6 @@ export class OpenAIProvider implements ProviderAdapter {
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
-					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: createCodexRequestIdentity(params.conversationId),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
@@ -1204,7 +1208,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			body.stream = true;
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
-					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: codexIdentity,
 					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
 				});
@@ -1284,7 +1287,6 @@ export class OpenAIProvider implements ProviderAdapter {
 			body.stream = true;
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
-					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: codexIdentity,
 					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
 				});
@@ -1655,7 +1657,6 @@ export class OpenAIProvider implements ProviderAdapter {
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
-			parallelToolCalls: this.config.codexParallelToolCalls,
 			identity: createCodexRequestIdentity(params.conversationId),
 			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
 		});

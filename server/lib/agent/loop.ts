@@ -2339,6 +2339,7 @@ export async function* agentLoop(
 			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
 		}));
 
+	const reflectionToolDefinitions = allTools.filter((tool) => tool.reflectionOnly);
 	if (config.reflectionLoop) {
 		const allowedTools = new Set(config.reflectionLoop.allowedTools);
 		allTools = allTools.filter((tool) => allowedTools.has(tool.name));
@@ -3826,12 +3827,17 @@ export async function* agentLoop(
 						cwd: config.cwd,
 						history,
 						tools,
-						reflectionParentTools:
-							config.reflectionLoop &&
-							parentTools?.provider === effectiveProvider &&
-							parentTools.model === effectiveModel
+						// Only Codex reads these inactive declarations; other providers keep their tool list.
+						get reflectionTools() {
+							return config.reflectionLoop
+								? undefined
+								: provider.formatTools(reflectionToolDefinitions);
+						},
+						reflectionParentTools: config.reflectionLoop
+							? parentTools?.provider === effectiveProvider && parentTools.model === effectiveModel
 								? parentTools.tools
-								: undefined,
+								: []
+							: undefined,
 						toolResults: pendingToolResults,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,

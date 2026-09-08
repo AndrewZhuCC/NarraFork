@@ -79,7 +79,6 @@ export function openAIProviderToCustomApi(provider: OpenAIProviderConfig): Custo
 		codexAccountId: provider.codexAccountId,
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
-		codexParallelToolCalls: provider.codexParallelToolCalls,
 		codexImageGeneration: provider.codexImageGeneration,
 		codexRemoteCompact: provider.codexRemoteCompact,
 		userAgentMode: provider.userAgentMode,
@@ -146,7 +145,6 @@ export function deriveCustomApiProvidersFromLegacy(
 				codexAccountId: existing.codexAccountId,
 				codexWebSocket: existing.codexWebSocket,
 				codexWebSearch: existing.codexWebSearch,
-				codexParallelToolCalls: existing.codexParallelToolCalls,
 				codexImageGeneration: existing.codexImageGeneration,
 				codexRemoteCompact: existing.codexRemoteCompact,
 			});
@@ -180,7 +178,6 @@ export function customApiProviderToOpenAI(
 		codexAccountId: provider.codexAccountId,
 		codexWebSocket: provider.codexWebSocket,
 		codexWebSearch: provider.codexWebSearch,
-		codexParallelToolCalls: provider.codexParallelToolCalls,
 		codexImageGeneration: provider.codexImageGeneration,
 		codexRemoteCompact: provider.codexRemoteCompact,
 		userAgentMode: provider.userAgentMode,
