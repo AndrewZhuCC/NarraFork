@@ -223,7 +223,7 @@ test("an empty active list cannot enable predeclared or parent tools", () => {
 			...(reflection
 				? { reflectionParentTools: [parentFunction, { type: "web_search" }] }
 				: { reflectionTools: decisionTools }),
-		} as ChatParams);
+		});
 		expect(body.tool_choice).toBe("none");
 		expect(body.input).toEqual([]);
 	}

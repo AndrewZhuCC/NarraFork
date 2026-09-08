@@ -216,7 +216,10 @@ export function appendCodexNativeTools(
 }
 
 /** Keep definitions stable; switch only which tools may run, without entering Responses Lite. */
-export function applyCodexReflectionTools(body: Record<string, unknown>, params: ChatParams): void {
+export function applyCodexReflectionTools(
+	body: Record<string, unknown>,
+	params: Pick<ChatParams, "tools" | "reflectionTools" | "reflectionParentTools">,
+): void {
 	const reflection = params.reflectionParentTools !== undefined;
 	const reserved = (reflection ? params.tools : params.reflectionTools) as
 		| Array<{ type: string; name?: string }>
