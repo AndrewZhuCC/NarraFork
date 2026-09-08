@@ -60,8 +60,6 @@ export interface CustomApiProviderConfig {
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */
 	codexWebSearch?: boolean;
-	/** Codex relay: allow parallel tool calls; defaults to true. */
-	codexParallelToolCalls?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
 	/** Codex: use this provider's remote Responses compact endpoint. */
@@ -117,8 +115,6 @@ export interface OpenAIProviderConfig {
 	codexWebSocket?: boolean;
 	/** Codex: allow the native web_search tool to be sent to the model. */
 	codexWebSearch?: boolean;
-	/** Codex relay: allow parallel tool calls; defaults to true. */
-	codexParallelToolCalls?: boolean;
 	/** Codex: allow the native image_generation tool to be sent to the model. */
 	codexImageGeneration?: boolean;
 	/** Codex: use the official remote Responses compact endpoint. */
