@@ -566,6 +566,13 @@ export const CustomApiProviderSection = React.memo(function CustomApiProviderSec
 							onChange={(e) => updateProvider("codexWebSocket", e.currentTarget.checked)}
 						/>
 						<Switch
+							label={t("openaiCodexParallelToolCalls")}
+							description={t("openaiCodexParallelToolCallsDesc")}
+							size="xs"
+							checked={provider.codexParallelToolCalls !== false}
+							onChange={(e) => updateProvider("codexParallelToolCalls", e.currentTarget.checked)}
+						/>
+						<Switch
 							label={t("openaiCodexWebSearch")}
 							description={t("openaiCodexWebSearchDesc")}
 							size="xs"

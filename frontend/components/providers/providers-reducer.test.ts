@@ -17,6 +17,27 @@ const provider = {
 };
 
 describe("providers reducer server synchronization", () => {
+	for (const parallel of [undefined, false, true]) {
+		for (const legacy of [false, true]) {
+			test(`Codex parallel=${parallel} survives settings normalization, legacy=${legacy}`, () => {
+				const relay = {
+					...provider,
+					protocol: "codex-native",
+					apiMode: "codex",
+					codexParallelToolCalls: parallel,
+				};
+				const settings = {
+					[legacy ? "openaiProviders" : "customApiProviders"]: [relay],
+					agent: {},
+				};
+				for (const type of ["INIT_FROM_SETTINGS", "SYNC_FROM_SETTINGS"] as const) {
+					const state = providersReducer(initialProvidersState, { type, settings });
+					expect(state.customApiProviders[0]?.codexParallelToolCalls).toBe(parallel ?? true);
+					expect(state.openaiProviders[0]?.codexParallelToolCalls).toBe(parallel ?? true);
+				}
+			});
+		}
+	}
 	test("SYNC_FROM_SETTINGS replaces local state with the server-final normalized response", () => {
 		const local = providersStateFromSettings({
 			customApiProviders: [provider],

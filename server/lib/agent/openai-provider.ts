@@ -677,6 +677,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const conversationId = options?.conversationId?.trim();
 		const reasoningEffort = resolveCodexRequestReasoningEffort(model, options?.reasoningEffort);
 		applyCodexStableRequestFields(body, {
+			parallelToolCalls: this.config.codexParallelToolCalls,
 			identity: createCodexRequestIdentity(conversationId),
 			reasoningEffort,
 		});
@@ -930,6 +931,7 @@ export class OpenAIProvider implements ProviderAdapter {
 					: params.reasoningEffort;
 			if (this.apiMode === "codex") {
 				applyCodexStableRequestFields(body, {
+					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: createCodexRequestIdentity(params.conversationId),
 					reasoningEffort: normalizedCodexReasoningEffort as string,
 				});
@@ -1197,6 +1199,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			body.stream = true;
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
+					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: codexIdentity,
 					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
 				});
@@ -1276,6 +1279,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			body.stream = true;
 			if (codexIdentity) {
 				applyCodexStableRequestFields(body, {
+					parallelToolCalls: this.config.codexParallelToolCalls,
 					identity: codexIdentity,
 					reasoningEffort: resolveCodexRequestReasoningEffort(bareModel, options?.reasoningEffort),
 				});
@@ -1635,6 +1639,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		request.tools = tools;
 
 		applyCodexStableRequestFields(request, {
+			parallelToolCalls: this.config.codexParallelToolCalls,
 			identity: createCodexRequestIdentity(params.conversationId),
 			reasoningEffort: resolveCodexRequestReasoningEffort(model, params.reasoningEffort),
 		});

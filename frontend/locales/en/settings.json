@@ -512,6 +512,8 @@
 	"openaiCodexAccountIdPlaceholder": "account-id...",
 	"openaiCodexWebSocket": "Use Responses WebSocket",
 	"openaiCodexWebSocketDesc": "Use Responses WebSocket instead of HTTP for Codex requests (experimental; falls back to HTTP when unavailable)",
+	"openaiCodexParallelToolCalls": "Allow parallel tool calls",
+	"openaiCodexParallelToolCallsDesc": "Disable to send parallel_tool_calls=false for this relay, including reflection requests. For relays requiring serial tool calls; may affect speed and cache reuse.",
 	"openaiCodexWebSearch": "Enable web search",
 	"openaiCodexWebSearchDesc": "Send the native web_search tool to Codex models. Disable this to omit that tool from requests.",
 	"openaiCodexImageGeneration": "Enable image generation",

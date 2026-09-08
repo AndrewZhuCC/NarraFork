@@ -73,16 +73,13 @@ export function applyCodexStableRequestFields(
 	options: {
 		identity: CodexRequestIdentity;
 		reasoningEffort: string;
+		parallelToolCalls?: boolean;
 	},
 ): void {
 	body.prompt_cache_key = options.identity.conversationId;
 	body.tool_choice = "auto";
-	// Parallel tool calls stay ON. `false` belongs to the responses-lite contract
-	// (see codex-websocket.ts buildHandshakeHeaders), which NarraFork deliberately
-	// does not implement — the lite header was dropped in favour of keeping hosted
-	// tools. Sending `false` outside that contract has no upstream justification and
-	// silently degrades every Codex turn to one tool call at a time.
-	body.parallel_tool_calls = true;
+	// Preserve the default; a relay can explicitly disable parallel calls for compatibility.
+	body.parallel_tool_calls = options.parallelToolCalls ?? true;
 	body.reasoning = {
 		effort: options.reasoningEffort,
 		// Without an explicit summary mode the Responses API emits no

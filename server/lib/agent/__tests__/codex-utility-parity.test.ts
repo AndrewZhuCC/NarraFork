@@ -12,7 +12,10 @@ import { OpenAIProvider } from "../openai-provider";
 
 type Captured = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
 
-async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Captured> {
+async function capture(
+	run: (p: OpenAIProvider) => Promise<unknown>,
+	parallelToolCalls?: boolean,
+): Promise<Captured> {
 	const provider = new OpenAIProvider({
 		id: "codex",
 		name: "Codex",
@@ -21,6 +24,7 @@ async function capture(run: (p: OpenAIProvider) => Promise<unknown>): Promise<Ca
 		baseUrl: "https://chatgpt.com/backend-api/codex",
 		defaultModel: "gpt-5.3-codex",
 		apiMode: "codex",
+		codexParallelToolCalls: parallelToolCalls,
 		// Match codexFingerprintConfig() used by the built-in CodexProvider.
 		userAgentMode: "codex",
 		// biome-ignore lint/suspicious/noExplicitAny: test config subset
@@ -81,6 +85,10 @@ describe.each([
 	["generateWithMeta", genMeta],
 	["generateWithHistoryWithMeta", genHistory],
 ])("codex utility request parity: %s", (_name, run) => {
+	test("honors a relay's explicit parallel disable", async () => {
+		const req = await capture(run, false);
+		expect(req.body.parallel_tool_calls).toBe(false);
+	});
 	test("sends the stable managed Codex client headers", async () => {
 		const req = await capture(run);
 

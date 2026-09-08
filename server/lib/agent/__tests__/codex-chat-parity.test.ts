@@ -28,6 +28,7 @@ async function captureChat(
 	apiMode: "codex" | "responses" | "completions" = "codex",
 	transport: "http" | "ws" | "native-ws" = "http",
 	failWebSocket = false,
+	parallelToolCalls?: boolean,
 ): Promise<Captured> {
 	const provider =
 		transport === "native-ws"
@@ -41,6 +42,7 @@ async function captureChat(
 					defaultModel: "gpt-5.3-codex",
 					apiMode,
 					codexWebSocket: transport === "ws",
+					codexParallelToolCalls: parallelToolCalls,
 					// Match codexFingerprintConfig() used by the built-in CodexProvider.
 					userAgentMode: "codex",
 					// biome-ignore lint/suspicious/noExplicitAny: test config subset
@@ -214,6 +216,53 @@ const parentFunction = {
 	parameters: { type: "object", properties: {} },
 	strict: false,
 };
+
+for (const transport of ["http", "ws"] as const) {
+	for (const parallel of [undefined, false, true]) {
+		test(`${transport} relay parallel=${parallel} applies to normal and reflection requests`, async () => {
+			let parentTools: unknown[] | undefined;
+			const normal = await captureChat(
+				{
+					tools: [parentFunction],
+					onRequestStart: (info) => {
+						parentTools = structuredClone(info?.codexTools);
+					},
+				},
+				"codex",
+				transport,
+				false,
+				parallel,
+			);
+			const reflection = await captureChat(
+				{ tools: decisionTools, reflectionParentTools: parentTools },
+				"codex",
+				transport,
+				false,
+				parallel,
+			);
+			expect(normal.body.parallel_tool_calls).toBe(parallel ?? true);
+			expect(reflection.body.parallel_tool_calls).toBe(parallel ?? true);
+			expect(reflection.body.tools).toEqual(normal.body.tools);
+			expect(reflection.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "required",
+				tools: decisionTools.map((t) => ({ type: "function", name: t.name })),
+			});
+		});
+	}
+}
+
+test("HTTP fallback also keeps an explicitly disabled parallel setting", async () => {
+	const req = await captureChat(
+		{ tools: decisionTools, reflectionParentTools: [parentFunction] },
+		"codex",
+		"ws",
+		true,
+		false,
+	);
+	expect(req.body.parallel_tool_calls).toBe(false);
+	expect(req.websocketBody?.parallel_tool_calls).toBe(false);
+});
 
 for (const transport of ["http", "ws", "native-ws"] as const) {
 	describe(`Codex ${transport} reflection tool prefix`, () => {

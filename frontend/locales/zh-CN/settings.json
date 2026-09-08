@@ -512,6 +512,8 @@
 	"openaiCodexAccountIdPlaceholder": "account-id...",
 	"openaiCodexWebSocket": "使用 Responses WebSocket",
 	"openaiCodexWebSocketDesc": "使用 Responses WebSocket 而非 HTTP 连接到 Codex（实验性功能，不可用时会自动回退 HTTP）",
+	"openaiCodexParallelToolCalls": "允许并行调用工具",
+	"openaiCodexParallelToolCallsDesc": "关闭后，此中转的请求（包括反思）会发送 parallel_tool_calls=false。用于兼容要求关闭并行的中转，可能影响速度和缓存命中。",
 	"openaiCodexWebSearch": "启用网络搜索",
 	"openaiCodexWebSearchDesc": "向 Codex 模型发送原生 web_search 工具。关闭后请求中不会包含该工具。",
 	"openaiCodexImageGeneration": "启用图像生成",

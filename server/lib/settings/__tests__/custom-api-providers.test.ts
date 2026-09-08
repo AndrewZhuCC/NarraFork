@@ -2,16 +2,38 @@ import { describe, expect, test } from "bun:test";
 import {
 	customApiProtocolFromOpenAI,
 	customApiProviderToGemini,
+	customApiProviderToOpenAI,
 	deriveCustomApiProvidersFromLegacy,
 	geminiProviderToCustomApi,
 	getProviderPrefixChanges,
 	migrateProviderPrefixReferences,
 	normalizeCustomApiProvider,
+	openAIProviderToCustomApi,
 } from "../custom-api-providers";
 import { DEFAULTS } from "../defaults";
 import type { GeminiProviderConfig, NarraForkSettings, OpenAIProviderConfig } from "../types";
 
 describe("custom API provider migration", () => {
+	for (const parallel of [undefined, false, true]) {
+		test(`Codex parallel=${parallel} survives legacy and unified conversion`, () => {
+			const legacy: OpenAIProviderConfig = {
+				id: "relay",
+				name: "relay",
+				prefix: "relay",
+				apiKey: "test",
+				baseUrl: "https://example.com/v1",
+				defaultModel: "test",
+				apiMode: "codex",
+				codexParallelToolCalls: parallel,
+			};
+			const unified = normalizeCustomApiProvider(openAIProviderToCustomApi(legacy));
+			expect(unified.codexParallelToolCalls).toBe(parallel);
+			expect(customApiProviderToOpenAI(unified)?.codexParallelToolCalls).toBe(parallel);
+			expect(deriveCustomApiProvidersFromLegacy([legacy], [])[0]?.codexParallelToolCalls).toBe(
+				parallel,
+			);
+		});
+	}
 	test("preserves legacy responsesApi=false as completions-compatible", () => {
 		const provider: OpenAIProviderConfig = {
 			id: "legacy-openai",
