@@ -2287,6 +2287,19 @@ export async function* agentLoop(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
+	// Each loop owns its receipts. Nested reflection loops must not inherit a parent's row.
+	const executionBindings = new WeakMap<AgentToolUse, import("./types").ToolCallBinding>();
+	config.toolExecutionBindings = executionBindings;
+	const bindExecution = (tu: AgentToolUse, binding: import("./types").ToolCallBinding) => {
+		const previous = executionBindings.get(tu);
+		if (previous) {
+			if (previous.toolCallId !== binding.toolCallId || previous.attempt !== binding.attempt) {
+				throw new Error("A tool execution cannot be rebound to a different persisted attempt");
+			}
+			return;
+		}
+		executionBindings.set(tu, Object.freeze({ ...binding }));
+	};
 	const resolvedProvider = resolveProviderAndModel(config.model);
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
@@ -3019,6 +3032,7 @@ export async function* agentLoop(
 						: settled.output;
 					yield {
 						type: "tool_result",
+						toolCallBinding: executionBindings.get(tu),
 						toolUseId: tu.toolUseId,
 						toolName: tu.name,
 						output: baseOutput,
@@ -3875,6 +3889,7 @@ export async function* agentLoop(
 								// non-streaming toolUses skip that path entirely).
 								yield {
 									type: "block_complete",
+									onToolPersisted: (binding) => bindExecution(tu, binding),
 									block: {
 										type: "tool_use",
 										toolUseId: tu.toolUseId,
@@ -4219,6 +4234,7 @@ export async function* agentLoop(
 										// Block is complete — yield for immediate persistence
 										yield {
 											type: "block_complete",
+											onToolPersisted: (binding) => bindExecution(tu, binding),
 											block: {
 												type: "tool_use",
 												toolUseId: id,
@@ -4292,6 +4308,7 @@ export async function* agentLoop(
 												: sr.output;
 											yield {
 												type: "tool_result",
+												toolCallBinding: executionBindings.get(prevTu),
 												toolUseId: prevTu.toolUseId,
 												toolName: prevTu.name,
 												output: baseOutput,
@@ -6022,6 +6039,7 @@ export async function* agentLoop(
 				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
 				yield {
 					type: "tool_result",
+					toolCallBinding: executionBindings.get(tu),
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
 					output: baseOutput,
@@ -6044,6 +6062,10 @@ export async function* agentLoop(
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
 				type: "assistant_message",
+				onToolPersisted: (toolUseId, binding) => {
+					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
+					if (tu) bindExecution(tu, binding);
+				},
 				text: assistantText,
 				toolUses,
 				messageId,
@@ -6200,6 +6222,7 @@ export async function* agentLoop(
 
 						yield {
 							type: "tool_result",
+							toolCallBinding: executionBindings.get(tu),
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
 							output: result.broken
@@ -6287,6 +6310,7 @@ export async function* agentLoop(
 
 							yield {
 								type: "tool_result",
+								toolCallBinding: executionBindings.get(tu),
 								toolUseId: tu.toolUseId,
 								toolName: tu.name,
 								output: effectiveResult.broken
@@ -6360,6 +6384,7 @@ export async function* agentLoop(
 								yieldedToolResults.add(remainingTool.toolUseId);
 								yield {
 									type: "tool_result",
+									toolCallBinding: executionBindings.get(remainingTool),
 									toolUseId: remainingTool.toolUseId,
 									toolName: remainingTool.name,
 									output: skippedOutput,
@@ -6393,6 +6418,7 @@ export async function* agentLoop(
 								: undefined;
 							yield {
 								type: "tool_result",
+								toolCallBinding: executionBindings.get(remainingTool),
 								toolUseId: remainingTool.toolUseId,
 								toolName: remainingTool.name,
 								output: result.broken
