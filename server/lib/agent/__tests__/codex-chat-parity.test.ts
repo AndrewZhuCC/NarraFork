@@ -7,33 +7,75 @@
  *
  * Locks the outbound HTTP chat request against the shared stable contract.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { ORIGINATOR_CODEX } from "../../user-agent";
+import { CodexProvider } from "../codex-provider";
+import * as codexWebSocket from "../codex-websocket";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams } from "../provider";
 import { resolveToolJsonSchema } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
 
-type Captured = { url: string; headers: Record<string, string>; body: Record<string, unknown> };
+type Captured = {
+	url: string;
+	headers: Record<string, string>;
+	body: Record<string, unknown>;
+	websocketBody?: Record<string, unknown>;
+};
 
 async function captureChat(
 	overrides: Partial<ChatParams> = {},
 	apiMode: "codex" | "responses" | "completions" = "codex",
+	transport: "http" | "ws" | "native-ws" = "http",
+	failWebSocket = false,
 ): Promise<Captured> {
-	const provider = new OpenAIProvider({
-		id: "codex",
-		name: "Codex",
-		prefix: "codex",
-		apiKey: "sk-test-key",
-		baseUrl: "https://chatgpt.com/backend-api/codex",
-		defaultModel: "gpt-5.3-codex",
-		apiMode,
-		// Match codexFingerprintConfig() used by the built-in CodexProvider.
-		userAgentMode: "codex",
-		// biome-ignore lint/suspicious/noExplicitAny: test config subset
-	} as any);
+	const provider =
+		transport === "native-ws"
+			? new CodexProvider({ useWebSocket: true })
+			: new OpenAIProvider({
+					id: "codex",
+					name: "Codex",
+					prefix: "codex",
+					apiKey: "sk-test-key",
+					baseUrl: "https://chatgpt.com/backend-api/codex",
+					defaultModel: "gpt-5.3-codex",
+					apiMode,
+					codexWebSocket: transport === "ws",
+					// Match codexFingerprintConfig() used by the built-in CodexProvider.
+					userAgentMode: "codex",
+					// biome-ignore lint/suspicious/noExplicitAny: test config subset
+				} as any);
 
+	if (provider instanceof CodexProvider) {
+		Object.assign(provider, {
+			getMaxFailoverAttempts: () => 1,
+			getContext: async () => ({
+				id: "test-credential",
+				token: "sk-test-key",
+				credential: { accountId: "test-account" },
+			}),
+			refreshUsageOnUse: () => {},
+			manager: { reportSuccess: () => {} },
+		});
+	}
 	let captured: Captured | undefined;
+	let websocketBody: Record<string, unknown> | undefined;
+	const websocket =
+		transport === "http"
+			? undefined
+			: spyOn(codexWebSocket, "streamCodexResponsesWebSocket").mockImplementation(
+					async function* (options) {
+						websocketBody = structuredClone(options.request);
+						if (failWebSocket)
+							throw new codexWebSocket.CodexWebSocketFallbackError("test fallback", 404);
+						captured = {
+							url: codexWebSocket.buildCodexResponsesWebSocketUrl(options.baseUrl),
+							headers: codexWebSocket.buildHandshakeHeaders(options),
+							body: websocketBody,
+						};
+						yield { text: "ok" };
+					},
+				);
 	const realFetch = globalThis.fetch;
 	globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
 		const headers: Record<string, string> = {};
@@ -76,10 +118,11 @@ async function captureChat(
 		}
 	} finally {
 		globalThis.fetch = realFetch;
+		websocket?.mockRestore();
 	}
 
 	if (!captured) throw new Error("no request captured");
-	return captured;
+	return { ...captured, websocketBody };
 }
 
 describe("codex HTTP chat request parity", () => {
@@ -172,98 +215,163 @@ const parentFunction = {
 	strict: false,
 };
 
-describe("Codex HTTP reflection tool prefix", () => {
-	test("keeps the parent wire prefix and parallel mode while restricting real decision tools", async () => {
-		let parentTools: unknown[] | undefined;
-		const normal: Partial<ChatParams> = {
-			history: [
-				{ role: "developer", content: "parent instructions" },
-				{ role: "user", content: "shared history" },
-			],
-			tools: [parentFunction, { type: "web_search" }, { type: "image_generation" }],
-			onRequestStart: (info) => {
-				parentTools = structuredClone(info?.codexHttpTools);
-			},
-		};
-		const parent = await captureChat(normal);
-		expect(JSON.stringify(parentTools)).toBe(JSON.stringify(parent.body.tools));
-		const before = JSON.stringify(parentTools);
-		const reflection = await captureChat({
-			...normal,
-			content: "Call exactly one of DangerConfirm or DangerCancel.",
-			tools: structuredClone(decisionTools),
-			reflectionParentTools: parentTools,
-			onRequestStart: undefined,
-		});
-		expect(JSON.stringify(reflection.body.tools)).toBe(before);
-		expect(JSON.stringify(parentTools)).toBe(before);
-		expect(reflection.body.instructions).toBe(parent.body.instructions);
-		const input = reflection.body.input as unknown[];
-		expect(input.slice(0, -2)).toEqual((parent.body.input as unknown[]).slice(0, -1));
-		expect(input.at(-1)).toEqual({
-			type: "additional_tools",
-			role: "developer",
-			tools: decisionTools,
-		});
-		expect(reflection.body.tool_choice).toEqual({
-			type: "allowed_tools",
-			mode: "required",
-			tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
-		});
-		for (const key of [
-			"parallel_tool_calls",
-			"prompt_cache_key",
-			"reasoning",
-			"include",
-			"text",
-			"client_metadata",
-			"store",
-			"stream",
-		]) {
-			expect(reflection.body[key]).toEqual(parent.body[key]);
-		}
-		expect(reflection.body.parallel_tool_calls).toBe(true);
-		expect((await captureChat(normal)).body).toEqual(parent.body);
-	});
-
-	test("does not redeclare tools already in the parent list", async () => {
-		const req = await captureChat({
-			tools: [parentFunction, ...decisionTools],
-			reflectionParentTools: [parentFunction],
-		});
-		expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
-		expect(req.body.tool_choice).toEqual({
-			type: "allowed_tools",
-			mode: "required",
-			tools: [parentFunction, ...decisionTools].map((tool) => ({
-				type: "function",
-				name: tool.name,
-			})),
-		});
-	});
-
-	test("an explicitly empty parent stays empty; no native tools are injected", async () => {
-		const req = await captureChat({ tools: decisionTools, reflectionParentTools: [] });
-		expect(req.body.tools).toEqual([]);
-		expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
-	});
-
-	for (const apiMode of ["responses", "completions"] as const) {
-		test(`${apiMode} keeps its existing request shape`, async () => {
-			let reported: unknown;
-			const params = {
-				tools: structuredClone(decisionTools),
-				onRequestStart: (info?: { codexHttpTools?: unknown[] }) => {
-					reported = info?.codexHttpTools;
+for (const transport of ["http", "ws", "native-ws"] as const) {
+	describe(`Codex ${transport} reflection tool prefix`, () => {
+		const capture = (overrides: Partial<ChatParams> = {}) =>
+			captureChat(overrides, "codex", transport);
+		test("keeps the parent wire prefix and parallel mode while restricting real decision tools", async () => {
+			let parentTools: unknown[] | undefined;
+			const normal: Partial<ChatParams> = {
+				history: [
+					{ role: "developer", content: "parent instructions" },
+					{ role: "user", content: "shared history" },
+				],
+				tools: [parentFunction, { type: "web_search" }, { type: "image_generation" }],
+				onRequestStart: (info) => {
+					parentTools = structuredClone(info?.codexTools);
 				},
 			};
-			const normal = await captureChat(params, apiMode);
-			const reflection = await captureChat(
-				{ ...params, reflectionParentTools: [parentFunction] },
-				apiMode,
-			);
-			expect(reflection.body).toEqual(normal.body);
-			expect(reported).toBeUndefined();
+			const parent = await capture(normal);
+			expect(JSON.stringify(parentTools)).toBe(JSON.stringify(parent.body.tools));
+			const before = JSON.stringify(parentTools);
+			const reflection = await capture({
+				...normal,
+				content: "Call exactly one of DangerConfirm or DangerCancel.",
+				tools: structuredClone(decisionTools),
+				reflectionParentTools: parentTools,
+				onRequestStart: undefined,
+			});
+			expect(JSON.stringify(reflection.body.tools)).toBe(before);
+			expect(JSON.stringify(parentTools)).toBe(before);
+			expect(reflection.body.instructions).toBe(parent.body.instructions);
+			const input = reflection.body.input as unknown[];
+			expect(input.slice(0, -2)).toEqual((parent.body.input as unknown[]).slice(0, -1));
+			expect(input.at(-1)).toEqual({
+				type: "additional_tools",
+				role: "developer",
+				tools: decisionTools,
+			});
+			expect(reflection.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "required",
+				tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
+			});
+			for (const key of [
+				"parallel_tool_calls",
+				"prompt_cache_key",
+				"reasoning",
+				"include",
+				"text",
+				"client_metadata",
+				"store",
+				"stream",
+			]) {
+				expect(reflection.body[key]).toEqual(parent.body[key]);
+			}
+			expect(reflection.body.parallel_tool_calls).toBe(true);
+			expect((await capture(normal)).body).toEqual(parent.body);
 		});
-	}
-});
+
+		test("does not redeclare tools already in the parent list", async () => {
+			const req = await capture({
+				tools: [parentFunction, ...decisionTools],
+				reflectionParentTools: [parentFunction],
+			});
+			expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
+			expect(req.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "required",
+				tools: [parentFunction, ...decisionTools].map((tool) => ({
+					type: "function",
+					name: tool.name,
+				})),
+			});
+		});
+
+		test("does not append another definition when all decisions already exist", async () => {
+			const parentTools = [parentFunction, ...decisionTools];
+			const req = await capture({ tools: decisionTools, reflectionParentTools: parentTools });
+			expect(req.body.tools).toEqual(parentTools);
+			expect(
+				(req.body.input as Array<{ type?: string }>).some(
+					(item) => item.type === "additional_tools",
+				),
+			).toBe(false);
+			expect(req.body.tool_choice).toEqual({
+				type: "allowed_tools",
+				mode: "required",
+				tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
+			});
+		});
+
+		test("an explicitly empty parent stays empty; no native tools are injected", async () => {
+			const req = await capture({ tools: decisionTools, reflectionParentTools: [] });
+			expect(req.body.tools).toEqual([]);
+			expect((req.body.input as Array<{ tools?: unknown[] }>).at(-1)?.tools).toEqual(decisionTools);
+		});
+
+		test("without a parent snapshot the normal request behavior stays unchanged", async () => {
+			const req = await capture({ tools: structuredClone(decisionTools) });
+			expect(req.body.tool_choice).toBe("auto");
+			expect(req.body.parallel_tool_calls).toBe(true);
+			expect(
+				(req.body.input as Array<{ type?: string }>).some(
+					(item) => item.type === "additional_tools",
+				),
+			).toBe(false);
+		});
+
+		if (transport !== "http") {
+			test("HTTP fallback preserves the WebSocket parent tools and decision restriction", async () => {
+				let parentTools: unknown[] | undefined;
+				await capture({
+					tools: [parentFunction],
+					onRequestStart: (info) => {
+						parentTools = structuredClone(info?.codexTools);
+					},
+				});
+				const reported: unknown[] = [];
+				const req = await captureChat(
+					{
+						tools: decisionTools,
+						reflectionParentTools: parentTools,
+						onRequestStart: (info) => {
+							reported.push(structuredClone(info?.codexTools));
+						},
+					},
+					"codex",
+					transport,
+					true,
+				);
+				expect(req.url.startsWith("https:")).toBe(true);
+				expect(req.websocketBody).toEqual(req.body);
+				expect(req.body.tools).toEqual(parentTools);
+				expect(reported).toEqual([parentTools, parentTools]);
+				expect(req.body.tool_choice).toEqual({
+					type: "allowed_tools",
+					mode: "required",
+					tools: decisionTools.map((tool) => ({ type: "function", name: tool.name })),
+				});
+			});
+		}
+	});
+}
+
+for (const apiMode of ["responses", "completions"] as const) {
+	test(`${apiMode} keeps its existing request shape`, async () => {
+		let reported: unknown;
+		const params = {
+			tools: structuredClone(decisionTools),
+			onRequestStart: (info?: { codexTools?: unknown[] }) => {
+				reported = info?.codexTools;
+			},
+		};
+		const normal = await captureChat(params, apiMode);
+		const reflection = await captureChat(
+			{ ...params, reflectionParentTools: [parentFunction] },
+			apiMode,
+		);
+		expect(reflection.body).toEqual(normal.body);
+		expect(reported).toBeUndefined();
+	});
+}

@@ -956,8 +956,8 @@ export interface AgentConfig {
 	subagentModelRestrictionDescription?: string | null;
 	/** Internal bounded reflection loop context. */
 	reflectionLoop?: ReflectionLoopConfig;
-	/** Latest Codex HTTP wire tools for nested reflections; never execution authority. */
-	lastCodexHttpTools?: { provider: string; model: string; tools: unknown[] };
+	/** Latest Codex wire tools for nested reflections; never execution authority. */
+	lastCodexTools?: { provider: string; model: string; tools: unknown[] };
 	permissionHandler: (
 		toolName: string,
 		input: Record<string, unknown>,

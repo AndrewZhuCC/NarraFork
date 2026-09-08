@@ -19,7 +19,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 			createProvider: () => ({
 				async *chat(params: import("../provider").ChatParams) {
 					expect(params.reflectionParentTools).toEqual(tools);
-					params.onRequestStart?.({ codexHttpTools: tools });
+					params.onRequestStart?.({ codexTools: tools });
 					yield { text: "ok" };
 				},
 			}),
@@ -40,7 +40,7 @@ describe("CodexProvider Responses WebSocket handling", () => {
 		})) {
 			/* drain */
 		}
-		expect(reported).toEqual({ credentialId: "test-credential", codexHttpTools: tools });
+		expect(reported).toEqual({ credentialId: "test-credential", codexTools: tools });
 	});
 	test("detects expected 101 errors from wrapped runtime events", () => {
 		const expected101Message =

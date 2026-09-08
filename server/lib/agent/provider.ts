@@ -102,10 +102,10 @@ export interface ChatParams extends ProtocolChatParams {
 	 */
 	onRequestStart?: (info?: {
 		credentialId?: string;
-		/** Actual Codex HTTP tools, including hosted tools, for a nested reflection to reuse. */
-		codexHttpTools?: unknown[];
+		/** Actual Codex tools on HTTP or WebSocket, including hosted tools, for a reflection to reuse. */
+		codexTools?: unknown[];
 	}) => void;
-	/** Parent's wire tools; Codex HTTP only. params.tools remains the reflection allow-list. */
+	/** Parent's wire tools; Codex only. params.tools remains the reflection allow-list. */
 	reflectionParentTools?: unknown[];
 }
 
