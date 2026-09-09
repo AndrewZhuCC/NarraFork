@@ -6,6 +6,7 @@ import {
 	resolveModelPricing,
 	setModelPricingOverrides,
 } from "../model-pricing";
+import { settings } from "../settings";
 import { calculateCost, type UsageData } from "../usage-tracking";
 
 afterEach(() => {
@@ -251,6 +252,71 @@ describe("pricing overrides", () => {
 });
 
 describe("calculateCost", () => {
+	test.each([
+		["codex-native", true],
+		["responses-compatible", true],
+		["completions-compatible", true],
+		["gemini-compatible", true],
+		["anthropic-official", false],
+		["anthropic-compatible", false],
+	] as const)("custom API 按协议而非渠道名称计算缓存（%s）", (protocol, inclusive) => {
+		setModelPricingOverrides({
+			"billing-probe": { input: 10, output: 20, cacheRead: 1, cacheWrite: 2 },
+		});
+		for (const disabled of [false, true]) {
+			settings.customApiProviders = [
+				{
+					id: "billing-probe",
+					name: "Billing probe",
+					prefix: "anzhi.newapi",
+					apiKey: "test",
+					baseUrl: "https://example.invalid",
+					defaultModel: "billing-probe",
+					protocol,
+					disabled,
+				},
+			];
+			const cost = calculateCost(
+				usage({
+					inputTokens: inclusive ? 1_000_000 : 100_000,
+					cachedInputTokens: 900_000,
+					cacheCreationInputTokens: inclusive ? 0 : 200_000,
+				}),
+				"anzhi.newapi",
+				"anzhi.newapi:billing-probe",
+			);
+			expect(cost?.inputCost).toBeCloseTo(1, 6);
+			expect(cost?.cacheReadCost).toBeCloseTo(0.9, 6);
+			expect(cost?.cacheCreationCost).toBeCloseTo(inclusive ? 0 : 0.4, 6);
+			expect(cost?.totalCost).toBeCloseTo(inclusive ? 1.9 : 2.3, 6);
+		}
+	});
+
+	test.each([
+		"openaiProviders",
+		"geminiProviders",
+	] as const)("legacy 自定义渠道同样扣除缓存（%s）", (key) => {
+		settings.customApiProviders = [];
+		settings[key] = [
+			{
+				id: "billing-legacy",
+				name: "Legacy billing probe",
+				prefix: "legacy-billing",
+				apiKey: "test",
+				baseUrl: "https://example.invalid",
+				defaultModel: "gpt-5.5",
+				disabled: true,
+			},
+		];
+		const cost = calculateCost(
+			usage({ inputTokens: 1_000_000, cachedInputTokens: 900_000 }),
+			"legacy-billing",
+			"gpt-5.5",
+		);
+		expect(cost?.inputCost).toBeCloseTo(0.5, 6);
+		expect(cost?.totalCost).toBeCloseTo(0.95, 6);
+	});
+
 	test("Codex 模型现在能算出成本（回归：此前 gpt-5.x 全部返回 null）", () => {
 		const cost = calculateCost(
 			usage({ inputTokens: 1_000_000, outputTokens: 1_000_000 }),

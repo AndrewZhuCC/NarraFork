@@ -2,6 +2,11 @@ import { db } from "@server/db";
 import { narratorMessages, narratorToolCalls } from "@server/db/schema";
 import { eq } from "drizzle-orm";
 import { resolveModelPricing } from "./model-pricing";
+import { settings } from "./settings";
+import {
+	isGeminiCustomApiProtocol,
+	isOpenAICustomApiProtocol,
+} from "./settings/custom-api-providers";
 
 export interface UsageData {
 	inputTokens: number;
@@ -66,12 +71,24 @@ export function buildUsageDataFromSnapshot(snapshot?: {
  * operator adds overrides those requests resolve to no price at all and this
  * subtraction never runs for them — which is intended, not an oversight.
  */
-const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set([
-	"openai",
-	"codex",
-	"nug",
-	"gemini",
-]);
+const PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT = new Set(["openai", "codex", "nug", "gemini"]);
+
+function inputIncludesCachedTokens(provider: string): boolean {
+	// Include disabled channels: an in-flight request may finish after disabling one.
+	// ponytail: protocol changes/removal mid-request need a request-time usage-semantics snapshot.
+	const configured = settings.customApiProviders?.find((entry) => entry.prefix === provider);
+	if (configured) {
+		return (
+			isOpenAICustomApiProtocol(configured.protocol) ||
+			isGeminiCustomApiProtocol(configured.protocol)
+		);
+	}
+	return (
+		PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase()) ||
+		(settings.openaiProviders ?? []).some((entry) => entry.prefix === provider) ||
+		(settings.geminiProviders ?? []).some((entry) => entry.prefix === provider)
+	);
+}
 
 /**
  * Attribute a USD cost to one request's token usage using the official
@@ -89,7 +106,7 @@ export function calculateCost(usage: UsageData, provider: string, model: string)
 	const cachedInputTokens = Math.max(0, usage.cachedInputTokens || 0);
 	const cacheCreationTokens = Math.max(0, usage.cacheCreationInputTokens || 0);
 	const reportedInput = Math.max(0, usage.inputTokens || 0);
-	const uncachedInputTokens = PROVIDERS_WITH_CACHE_INCLUSIVE_INPUT.has(provider.toLowerCase())
+	const uncachedInputTokens = inputIncludesCachedTokens(provider)
 		? Math.max(0, reportedInput - cachedInputTokens)
 		: reportedInput;
 
