@@ -3659,9 +3659,10 @@ export const fileAttributions = sqliteTable(
 		index("idx_file_attr_scope_file").on(table.scopeId, table.fileKey, table.changedAt, table.id),
 		check(
 			"ck_file_attr_line_counts",
+			// Unqualified columns keep this CHECK valid when a migration renames its rebuilt table.
 			sql`
-			(${table.linesAdded} IS NULL OR (typeof(${table.linesAdded}) = 'integer' AND ${table.linesAdded} >= 0))
-			AND (${table.linesRemoved} IS NULL OR (typeof(${table.linesRemoved}) = 'integer' AND ${table.linesRemoved} >= 0))
+			("lines_added" IS NULL OR (typeof("lines_added") = 'integer' AND "lines_added" >= 0))
+			AND ("lines_removed" IS NULL OR (typeof("lines_removed") = 'integer' AND "lines_removed" >= 0))
 		`,
 		),
 	],

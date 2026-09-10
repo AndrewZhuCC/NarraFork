@@ -4,7 +4,9 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { applyPendingMigrationsByHash } from "./run-migrations";
+import { fileAttributions } from "./schema";
 
 const databases: Database[] = [];
 const tempFolders: string[] = [];
@@ -71,7 +73,67 @@ function expectRollback(db: Database, folder: string, error: RegExp): void {
 	expect(db.query("PRAGMA foreign_keys").get()).toEqual(fkState);
 }
 
+test("file attribution schema CHECK survives table rebuild renames without weakening validation", () => {
+	const db = database();
+	const constraint = getTableConfig(fileAttributions).checks.find(
+		(check) => check.name === "ck_file_attr_line_counts",
+	);
+	if (!constraint) throw new Error("Missing line count constraint");
+	const { sql } = new SQLiteSyncDialect().sqlToQuery(constraint.value);
+	db.run(
+		`CREATE TABLE file_attributions (lines_added integer, lines_removed integer, CHECK (${sql}))`,
+	);
+	db.run("INSERT INTO file_attributions VALUES (12, 4), (NULL, 0)");
+	db.run("ALTER TABLE file_attributions RENAME TO __new_file_attributions");
+	db.run("ALTER TABLE __new_file_attributions RENAME TO file_attributions");
+	expect(db.query("SELECT * FROM file_attributions").all()).toEqual([
+		{ lines_added: 12, lines_removed: 4 },
+		{ lines_added: null, lines_removed: 0 },
+	]);
+	for (const values of [
+		[-1, 0],
+		[0, -1],
+		[0.5, 0],
+		[0, 0.5],
+	]) {
+		expect(() => db.run("INSERT INTO file_attributions VALUES (?, ?)", values)).toThrow(
+			/CHECK constraint/,
+		);
+	}
+});
+
 describe("canonical Drizzle rebuild-copy compatibility", () => {
+	test.each([
+		"VIRTUAL",
+		"STORED",
+	])("omits generated destinations while preserving generated sources (%s)", (kind) => {
+		const db = database();
+		db.run(
+			`CREATE TABLE x (id text PRIMARY KEY, payload text, derived text GENERATED ALWAYS AS (upper(payload)) ${kind})`,
+		);
+		db.run("INSERT INTO x(id,payload) VALUES ('row-1','keep-me')");
+		const folder = migrationsWith(
+			[
+				`CREATE TABLE __new_x (id text PRIMARY KEY, payload text, derived text GENERATED ALWAYS AS (upper(payload)) ${kind} NOT NULL, derived_copy text, added text GENERATED ALWAYS AS (id || payload) ${kind} NOT NULL);`,
+				'INSERT INTO __new_x("id", "payload", "derived", "derived_copy", "added") SELECT "id", "payload", "derived", "derived", "added" FROM x;',
+				"DROP TABLE x;",
+				"ALTER TABLE __new_x RENAME TO x;",
+			].join(breakpoint),
+		);
+		applyPendingMigrationsByHash(db, folder);
+		expect(db.query("SELECT * FROM x").get()).toEqual({
+			id: "row-1",
+			payload: "keep-me",
+			derived: "KEEP-ME",
+			derived_copy: "KEEP-ME",
+			added: "row-1keep-me",
+		});
+		db.run("UPDATE x SET payload='changed'");
+		expect(db.query("SELECT derived FROM x").get()).toEqual({ derived: "CHANGED" });
+		applyPendingMigrationsByHash(db, folder);
+		expect(db.query("SELECT count(*) AS n FROM __drizzle_migrations").get()).toEqual({ n: 1 });
+	});
+
 	test("real 0153 preserves two legacy 13-column attributions, NULLs seven new columns and repairs user deletion", () => {
 		const db = database();
 		db.run("CREATE TABLE users (id text PRIMARY KEY NOT NULL)");

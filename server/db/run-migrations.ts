@@ -150,7 +150,12 @@ const CANONICAL_REBUILD_COPY = new RegExp(
 // Above SQLite's default 2000-column limit, but still bounded for custom SQLite builds.
 const REBUILD_COPY_MAX_COLUMNS = 2048;
 
-type RebuildCopyColumn = { name: string; notnull: number; dflt_value: string | null };
+type RebuildCopyColumn = {
+	name: string;
+	notnull: number;
+	dflt_value: string | null;
+	hidden: number;
+};
 
 /** SQLite identifier folding is ASCII-only; Unicode lowercasing could mistake a DQS literal for a column. */
 function rebuildIdentifierKey(name: string): string {
@@ -160,7 +165,7 @@ function rebuildIdentifierKey(name: string): string {
 function rebuildCopyColumns(sqlite: Database, table: string): RebuildCopyColumn[] {
 	// The table-valued PRAGMA accepts a bound name and a LIMIT; never inspect table data here.
 	const columns = sqlite
-		.prepare('SELECT name, "notnull", dflt_value FROM pragma_table_info(?) LIMIT ?')
+		.prepare('SELECT name, "notnull", dflt_value, hidden FROM pragma_table_xinfo(?) LIMIT ?')
 		.all(table, REBUILD_COPY_MAX_COLUMNS + 1) as RebuildCopyColumn[];
 	if (columns.length === 0) throw new Error(`no such table: ${table} (Drizzle rebuild-copy)`);
 	if (columns.length > REBUILD_COPY_MAX_COLUMNS) {
@@ -226,7 +231,10 @@ function compatibleRebuildCopyStatement(sqlite: Database, stmt: string): string 
 			throw new Error(`Unrecognized Drizzle rebuild-copy destination mapping: ${targetTokens[i]}`);
 		}
 		seenTargets.add(targetKey);
-		if (sourceColumns.has(sourceKey)) {
+		if (targetColumn.hidden === 2 || targetColumn.hidden === 3) {
+			// Generated destinations are computed by SQLite, never copied by INSERT.
+			omitted.push(targetColumn);
+		} else if (sourceColumns.has(sourceKey)) {
 			keptTargets.push(targetTokens[i]);
 			keptSources.push(sourceTokens[i]);
 		} else if (targetKey === sourceKey && !sourceColumns.has(targetKey)) {
@@ -240,7 +248,7 @@ function compatibleRebuildCopyStatement(sqlite: Database, stmt: string): string 
 	if (omitted.length === 0) return stmt;
 
 	const requiredWithoutDefault = omitted.filter(
-		(column) => column.notnull !== 0 && column.dflt_value === null,
+		(column) => column.hidden === 0 && column.notnull !== 0 && column.dflt_value === null,
 	);
 	if (requiredWithoutDefault.length > 0 || keptTargets.length === 0) {
 		// LIMIT 1 checks emptiness without counting/scanning the entire source table.
