@@ -8,6 +8,69 @@
       "when": 1787100000000,
       "tag": "0001_manual_0_6_0_acl_chat",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1788408852859,
+      "tag": "0001_tan_adam_warlock",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1788409218214,
+      "tag": "0002_fat_roxanne_simpson",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1788409678927,
+      "tag": "0003_chief_radioactive_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1788409790693,
+      "tag": "0004_freezing_shatterstar",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1788412575268,
+      "tag": "0005_fantastic_rhodey",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1788412652659,
+      "tag": "0006_sturdy_caretaker",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1788700465669,
+      "tag": "0007_dear_goliath",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1789013415001,
+      "tag": "0008_cool_wildside",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1789013415374,
+      "tag": "0009_elite_hellion",
+      "breakpoints": true
     }
   ]
 }
