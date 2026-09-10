@@ -764,6 +764,12 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Terminal",
 	"ShareFile",
 	"NarraForkAdmin",
+	// Knowledge writes self-gate via requestPermission. Reflection must wait for
+	// the parent provider stream to release its shared WebSocket session.
+	"KnowledgeCreate",
+	"KnowledgeEdit",
+	"KnowledgeReview",
+	"KnowledgeAdmin",
 	// ScheduledTask mutations self-gate via ctx.requestPermission and can launch a
 	// narrator (run_now). Eager mid-stream execution would open an approval prompt —
 	// or dispatch an unattended run — before the assistant message that requested it

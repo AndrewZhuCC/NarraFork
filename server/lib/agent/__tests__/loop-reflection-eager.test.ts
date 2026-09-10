@@ -10,7 +10,13 @@ const NORMAL_TOOL_NAME = "TestReflectNormalTool";
 /** Records the order in which each tool's execute() started. */
 const executionOrder: string[] = [];
 
-let scenario: "reflection" | "normal" = "reflection";
+const KNOWLEDGE_TOOLS = ["KnowledgeCreate", "KnowledgeEdit", "KnowledgeReview", "KnowledgeAdmin"];
+let scenario: "reflection" | "normal" | "knowledge" = "reflection";
+let knowledgeToolName = KNOWLEDGE_TOOLS[0];
+let knowledgeChunks = false;
+let streamReleased = false;
+let knowledgeRequests = 0;
+const permissionAfterRelease: boolean[] = [];
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -18,6 +24,38 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
+		if (scenario === "knowledge") {
+			if (knowledgeRequests++ > 0) {
+				yield { text: "done" };
+				return;
+			}
+			try {
+				if (knowledgeChunks) {
+					yield {
+						toolUseChunk: {
+							toolUseId: "tu_knowledge",
+							name: knowledgeToolName,
+							input: '{"value":"x"}',
+							outputIndex: 0,
+						},
+					};
+					yield { toolUseChunk: { toolUseId: "tu_knowledge", stop: true } };
+				} else {
+					yield {
+						toolUses: [
+							{ toolUseId: "tu_knowledge", name: knowledgeToolName, input: { value: "x" } },
+						],
+					};
+				}
+				yield { text: "trailing text before provider cleanup" };
+				await new Promise((resolve) => setTimeout(resolve, 1));
+				if (params.signal.aborted) throw new Error("Aborted");
+			} finally {
+				// Models the WebSocket session's busy flag being cleared in finally.
+				streamReleased = true;
+			}
+			return;
+		}
 		const toolName = scenario === "reflection" ? REFLECTION_TOOL_NAME : NORMAL_TOOL_NAME;
 		// Emit the decision tool call, then keep streaming trailing text so there is a
 		// window during which an eager execution (if any) would have already started.
@@ -77,7 +115,27 @@ toolRegistry.register({
 	},
 });
 
+const originalKnowledgeTools = KNOWLEDGE_TOOLS.map((name) => toolRegistry.get(name));
+for (const name of KNOWLEDGE_TOOLS) {
+	toolRegistry.register({
+		name,
+		description: "Knowledge write with internal approval",
+		parameters: z.object({ value: z.string() }),
+		async execute(args, ctx) {
+			executionOrder.push(name);
+			permissionAfterRelease.push(streamReleased);
+			await ctx.requestPermission(name, args, ctx.currentToolUseId ?? "");
+			return { output: "saved" };
+		},
+	});
+}
+
 afterAll(() => {
+	for (let i = 0; i < KNOWLEDGE_TOOLS.length; i++) {
+		const original = originalKnowledgeTools[i];
+		if (original) toolRegistry.register(original);
+		else toolRegistry.unregister(KNOWLEDGE_TOOLS[i]);
+	}
 	mock.module("../provider", () => realProviderModule);
 	toolRegistry.unregister(REFLECTION_TOOL_NAME);
 	toolRegistry.unregister(NORMAL_TOOL_NAME);
@@ -110,6 +168,35 @@ async function runUntilAbortMidStream(): Promise<AgentEvent[]> {
 	}
 	return events;
 }
+
+describe("knowledge approval waits for the parent provider stream to close", () => {
+	for (const name of KNOWLEDGE_TOOLS) {
+		for (const chunks of [false, true]) {
+			for (const abort of [false, true]) {
+				test(`${name}: chunks=${chunks}, abort=${abort}`, async () => {
+					scenario = "knowledge";
+					knowledgeToolName = name;
+					knowledgeChunks = chunks;
+					knowledgeRequests = 0;
+					streamReleased = false;
+					executionOrder.length = 0;
+					permissionAfterRelease.length = 0;
+					if (abort) {
+						await runUntilAbortMidStream();
+					} else {
+						const config = makeConfig(new AbortController().signal);
+						for await (const event of agentLoop(config, "save", [])) {
+							if (event.type === "error") throw new Error(event.message);
+						}
+					}
+					expect(streamReleased).toBe(true);
+					expect(executionOrder).toEqual(abort ? [] : [name]);
+					expect(permissionAfterRelease).toEqual(abort ? [] : [true]);
+				});
+			}
+		}
+	}
+});
 
 describe("reflection-only tools are not eager-executed mid-stream", () => {
 	test("reflection decision tool is deferred until the post-stream tool phase", async () => {
