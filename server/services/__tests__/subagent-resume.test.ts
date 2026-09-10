@@ -1,4 +1,7 @@
-import { afterAll, afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
+import { cleanDb } from "../../../tests/setup";
 
 const originToolUseId = "origin-tool-use";
 const parentNarratorId = "parent-narrator";
@@ -17,11 +20,22 @@ let originResult: { parentToolUseId: string } | null = { parentToolUseId: origin
 // Subagents whose narrator record reports a stale "working" status (created but
 // never actually run).
 const workingSubagentIds = new Set<string>();
+const standaloneSubagentIds = new Set<string>();
+const unknownOriginIds = new Set<string>();
+const mismatchedMarkerIds = new Set<string>();
+const databaseNarratorIds = new Set<string>();
+const announcements: unknown[] = [];
+let realConclusionResolver: typeof import("../narrator-persistence").narratorPersistence.resolveSubagentConclusionReference;
+let realResolverChild: ReturnType<typeof makeNarrator> | null = null;
+let realResolverOriginal: Record<string, unknown> | null = null;
 let loadedTrailingToolResults: unknown[] = [];
 let clearManualOverrideRuntimes: typeof import("../subagent-manual-override").clearManualOverrideRuntimes;
 let waitForManualOverride: typeof import("../subagent-manual-override").waitForManualOverride;
 let hasActiveSubagentResumeRun: typeof import("../subagent-resume").hasActiveSubagentResumeRun;
 let resumeSubagent: typeof import("../subagent-resume").resumeSubagent;
+let acquireNarratorRevertAdmission: typeof import("../narrator-session").acquireNarratorRevertAdmission;
+let startupAdmissionBarrier: { entered: () => void; wait: Promise<void> } | undefined;
+let publicationAdmissionBarrier: { entered: () => void; wait: Promise<void> } | undefined;
 
 // Real module namespaces captured before mocking, so afterAll can re-point the
 // GLOBAL module mocks back to the real implementations. Bun's mock.module is
@@ -44,8 +58,13 @@ const reconcileCalls: string[] = [];
 function makeNarrator(id: string) {
 	return {
 		id,
+		type: "subagent",
 		variant: "subagent:general",
 		parentNarratorId,
+		originToolCallId:
+			standaloneSubagentIds.has(id) || unknownOriginIds.has(id) ? null : `parent-tool-row-${id}`,
+		subagentOriginKind:
+			standaloneSubagentIds.has(id) || mismatchedMarkerIds.has(id) ? "standalone" : null,
 		status: statusOverrides.get(id) ?? "idle",
 		substatus: ["unread"],
 		errorMessage: null,
@@ -62,6 +81,7 @@ beforeAll(async () => {
 	// module. Bun's mock.module is process-wide and mock.restore() does not undo it.
 	const realNarratorSession = { ...(await import("../narrator-session")) };
 	const realEditAndRegenerate = realNarratorSession.editAndRegenerate;
+	acquireNarratorRevertAdmission = realNarratorSession.acquireNarratorRevertAdmission;
 	const realNarratorServiceModule = { ...(await import("../narrator-service")) };
 	const realNarratorService = realNarratorServiceModule.narratorService;
 	const realSettings = { ...(await import("../../lib/settings")) };
@@ -77,13 +97,45 @@ beforeAll(async () => {
 					: realDb.query.narratorMessages.findFirst(options as never),
 			),
 		},
+		narratorToolCalls: {
+			...realDb.query.narratorToolCalls,
+			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
+				realResolverOriginal && options?.columns?.executionOriginToolCallId
+					? realResolverOriginal
+					: realDb.query.narratorToolCalls.findFirst(options as never),
+			),
+		},
 		narrators: {
 			...realDb.query.narrators,
-			findFirst: mock(async (options?: { columns?: Record<string, boolean> }) =>
-				options?.columns?.pendingModelRestore
+			findFirst: mock(async (options?: { columns?: Record<string, boolean>; where?: SQL }) => {
+				// Scheduling fixtures have synthetic rows; model the same three-column
+				// admission projection without hiding the real-database provenance cases.
+				if (
+					options?.where &&
+					options.columns?.id &&
+					options.columns.variant &&
+					options.columns.parentNarratorId
+				) {
+					const id = new SQLiteSyncDialect().sqlToQuery(options.where).params[0];
+					if (
+						typeof id === "string" &&
+						id !== "n1" &&
+						id !== "n2" &&
+						!databaseNarratorIds.has(id)
+					) {
+						return {
+							id,
+							variant: id === parentNarratorId ? "primary" : "subagent:general",
+							parentNarratorId: id === parentNarratorId ? null : parentNarratorId,
+						};
+					}
+				}
+				return options?.columns?.pendingModelRestore
 					? { pendingModelRestore: null }
-					: realDb.query.narrators.findFirst(options as never),
-			),
+					: realResolverChild && options?.columns?.originToolCallId
+						? realResolverChild
+						: realDb.query.narrators.findFirst(options as never);
+			}),
 		},
 	};
 	const dbProxy = new Proxy(realDb, {
@@ -118,7 +170,16 @@ beforeAll(async () => {
 		narratorService: {
 			...realNarratorService,
 			getById: mock(async (id: string) => {
-				if (isEditTestNarrator(id)) return realNarratorService.getById(id);
+				if (id === parentNarratorId)
+					return {
+						...makeNarrator(id),
+						variant: "primary",
+						type: "primary",
+						parentNarratorId: null,
+					};
+				if (isEditTestNarrator(id) || databaseNarratorIds.has(id)) {
+					return realNarratorService.getById(id);
+				}
 				const narrator = makeNarrator(id);
 				if (workingSubagentIds.has(id)) narrator.status = "working";
 				return narrator;
@@ -171,7 +232,6 @@ beforeAll(async () => {
 			updateStatus: mock((...args: Parameters<typeof realNarratorService.updateStatus>) =>
 				isEditTestNarrator(args[0]) ? realNarratorService.updateStatus(...args) : Promise.resolve(),
 			),
-			getToolCallByToolUseId: mock(async () => ({ messageId: "parent-message" })),
 			isMessageSharedByMultipleNarrators: mock((messageId: string) =>
 				messageId === "m1"
 					? realNarratorService.isMessageSharedByMultipleNarrators(messageId)
@@ -186,6 +246,28 @@ beforeAll(async () => {
 		},
 	}));
 	realModules["../narrator-service"] = () => realNarratorServiceModule;
+
+	const realPersistenceModule = { ...(await import("../narrator-persistence")) };
+	realConclusionResolver =
+		realPersistenceModule.narratorPersistence.resolveSubagentConclusionReference.bind(
+			realPersistenceModule.narratorPersistence,
+		);
+	// Scheduling fixtures retain a known slot; provenance regressions below explicitly
+	// pass through the real resolver. A missing origin can no longer silently succeed.
+	spyOn(
+		realPersistenceModule.narratorPersistence,
+		"resolveSubagentConclusionReference",
+	).mockImplementation(async (subagentId, parentId, toolUseId) => {
+		if (realResolverChild || standaloneSubagentIds.has(subagentId)) {
+			return realConclusionResolver(subagentId, parentId, toolUseId);
+		}
+		if (parentId !== parentNarratorId) throw new Error("Wrong fixture parent");
+		return {
+			toolCallId: `parent-tool-row-${subagentId}`,
+			messageId: "parent-message",
+			originToolCallId: `parent-tool-row-${subagentId}`,
+		};
+	});
 
 	const realSubagentExecutor = { ...(await import("../subagent-executor")) };
 	const realSubagentRunner = { ...(await import("../subagent-runner")) };
@@ -222,9 +304,49 @@ beforeAll(async () => {
 					? "failed"
 					: "completed",
 		waitForBackgroundTask: mock(async () => ({ status: "running", result: null })),
+		announceResumedBackgroundTask: mock(async (announcement: unknown) => {
+			announcements.push(announcement);
+		}),
 		startContinuedSubagent: mock(async (input: Record<string, unknown>) => {
 			startCalls.push(input);
+			if (startupAdmissionBarrier) {
+				startupAdmissionBarrier.entered();
+				await startupAdmissionBarrier.wait;
+			}
 			const subagentId = String(input.subagentId);
+			// The fake model runner still performs real durable run admission. Publication
+			// must not be mocked away merely because model execution is controlled here.
+			const { narrators } = await import("../../db/schema");
+			const { runtimePublication } = await import("../agent-runtime/publication");
+			const recipientId = String(input.parentNarratorId);
+			const now = new Date().toISOString();
+			realDb
+				.insert(narrators)
+				.values({
+					id: recipientId,
+					type: "primary",
+					variant: "primary",
+					createdAt: now,
+					updatedAt: now,
+				})
+				.onConflictDoNothing()
+				.run();
+			realDb
+				.insert(narrators)
+				.values({
+					id: subagentId,
+					type: "subagent",
+					variant: "subagent:general",
+					parentNarratorId: recipientId,
+					createdAt: now,
+					updatedAt: now,
+				})
+				.onConflictDoNothing()
+				.run();
+			const publicationRun = runtimePublication.startAgentRun({
+				narratorId: subagentId,
+				parentNarratorId: recipientId,
+			});
 			const completion = new Promise<string>((resolve) => {
 				foregroundResolvers.set(subagentId, resolve);
 			});
@@ -238,7 +360,18 @@ beforeAll(async () => {
 				// Part of the contract: the resume path claims any owed resumed-background
 				// notice after delivering the conclusion. A mock without it made every
 				// terminal completion throw.
-				takeResumedBackgroundAnnouncement: () => undefined,
+				takeResumedBackgroundAnnouncement: () =>
+					!input.skipConclusionDelivery &&
+					(standaloneSubagentIds.has(subagentId) || databaseNarratorIds.has(subagentId))
+						? {
+								subagentId,
+								parentNarratorId: recipientId,
+								logicalRunId: publicationRun.logicalRunId,
+								status: "completed",
+								wakeParent: true,
+								locale: input.locale,
+							}
+						: undefined,
 				userMessage: {
 					id: `user-message-${startCalls.length}`,
 					narratorId: subagentId,
@@ -318,6 +451,10 @@ beforeAll(async () => {
 		),
 		updateToolCallConclusion: mock(async (input: Record<string, unknown>) => {
 			conclusionCalls.push(input);
+			if (publicationAdmissionBarrier) {
+				publicationAdmissionBarrier.entered();
+				await publicationAdmissionBarrier.wait;
+			}
 		}),
 	}));
 	realModules["../narrator-session"] = () => realNarratorSession;
@@ -342,10 +479,123 @@ async function finishRun(subagentId: string, output = "done") {
 	}
 }
 
+describe("resume lifecycle shares the root's file-revert admission", () => {
+	test("starting is occupied before the runner returns a terminal handle", async () => {
+		const entered = Promise.withResolvers<void>();
+		const proceed = Promise.withResolvers<void>();
+		startupAdmissionBarrier = { entered: entered.resolve, wait: proceed.promise };
+		const pending = resumeSubagent({
+			subagentId: "admission-starting",
+			intent: "follow_up",
+			actor: "user",
+			prompt: "start",
+			locale: "en",
+		});
+		await entered.promise;
+		try {
+			const { isNarratorRuntimeBusy } = await import("../narrator-session-state");
+			expect(isNarratorRuntimeBusy(parentNarratorId)).toBe(false);
+			await expect(
+				acquireNarratorRevertAdmission(parentNarratorId, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_BUSY" });
+		} finally {
+			proceed.resolve();
+			const started = await pending;
+			await finishRun("admission-starting");
+			await started.terminalCompletion;
+			startupAdmissionBarrier = undefined;
+		}
+	});
+
+	test("terminal execution is not quiescent while its conclusion is still publishing", async () => {
+		const entered = Promise.withResolvers<void>();
+		const publish = Promise.withResolvers<void>();
+		publicationAdmissionBarrier = { entered: entered.resolve, wait: publish.promise };
+		const started = await resumeSubagent({
+			subagentId: "admission-delivering",
+			intent: "follow_up",
+			actor: "user",
+			prompt: "start",
+			locale: "en",
+		});
+		terminalResolvers.get("admission-delivering")?.("final output");
+		await entered.promise;
+		let exclusive: Promise<() => void> | undefined;
+		let granted = false;
+		try {
+			await expect(
+				acquireNarratorRevertAdmission(parentNarratorId, {
+					signal: new AbortController().signal,
+					interrupt: false,
+				}),
+			).rejects.toMatchObject({ code: "NARRATOR_REVERT_BUSY" });
+			exclusive = acquireNarratorRevertAdmission(parentNarratorId, {
+				signal: new AbortController().signal,
+				interrupt: true,
+			}).then((release) => {
+				granted = true;
+				return release;
+			});
+			await Promise.resolve();
+			expect(granted).toBe(false);
+			expect(hasActiveSubagentResumeRun("admission-delivering")).toBe(true);
+		} finally {
+			publish.resolve();
+			await started.terminalCompletion;
+			const release = await exclusive;
+			release?.();
+			publicationAdmissionBarrier = undefined;
+		}
+		expect(granted).toBe(true);
+		expect(hasActiveSubagentResumeRun("admission-delivering")).toBe(false);
+	});
+
+	test("all resume intents refuse an exclusive revert before retry/edit/persistence", async () => {
+		const release = await acquireNarratorRevertAdmission(parentNarratorId, {
+			signal: new AbortController().signal,
+			interrupt: false,
+		});
+		try {
+			for (const intent of [
+				"follow_up",
+				"retry_last_input",
+				"continue_tool_results",
+				"retry_denied_tool",
+				"regenerate_edited_message",
+			] as const) {
+				await expect(
+					resumeSubagent({
+						subagentId: "admission-blocked",
+						intent,
+						actor: "user",
+						prompt: "start",
+						retryToolUseId: "tool",
+						editMessageId: "message",
+						editContent: "changed",
+						locale: "en",
+					}),
+				).rejects.toMatchObject({ statusCode: 409, code: "NARRATOR_REVERT_IN_PROGRESS" });
+			}
+			expect(startCalls).toHaveLength(0);
+			expect(persistedCalls).toHaveLength(0);
+			expect(retriedToolCalls).toHaveLength(0);
+			expect(editedMessageCalls).toHaveLength(0);
+			expect(deleteMessagesAfterCalls).toHaveLength(0);
+		} finally {
+			release();
+		}
+	});
+});
+
 afterEach(async () => {
 	for (const subagentId of [...terminalResolvers.keys()]) {
 		await finishRun(subagentId);
 	}
+	startupAdmissionBarrier = undefined;
+	publicationAdmissionBarrier = undefined;
 	startCalls.length = 0;
 	persistedCalls.length = 0;
 	conclusionCalls.length = 0;
@@ -357,9 +607,18 @@ afterEach(async () => {
 	statusOverrides.clear();
 	originResult = { parentToolUseId: originToolUseId };
 	workingSubagentIds.clear();
+	standaloneSubagentIds.clear();
+	unknownOriginIds.clear();
+	mismatchedMarkerIds.clear();
+	databaseNarratorIds.clear();
+	announcements.length = 0;
+	realResolverChild = null;
+	realResolverOriginal = null;
 	clearManualOverrideRuntimes();
 	foregroundResolvers.clear();
 	terminalResolvers.clear();
+	const { sqlite } = await import("../../db");
+	cleanDb(sqlite);
 });
 
 afterAll(() => {
@@ -437,6 +696,77 @@ describe("resumeSubagent status reconciliation", () => {
 });
 
 describe("resumeSubagent", () => {
+	test("real plugin creation persists provenance across database reads and repeated resumes", async () => {
+		const { db } = await import("../../db");
+		const { narrators, narratorMessages, narratorMessageRefs } = await import("../../db/schema");
+		const { eq } = await import("drizzle-orm");
+		const { createNarratorForPlugin } = await import("../narrator-session");
+		const { narratorService } = await import("../narrator-service");
+		const parentId = "plugin-durable-parent";
+		const now = new Date().toISOString();
+		const childIds: string[] = [];
+		databaseNarratorIds.add(parentId);
+		await db.insert(narrators).values({ id: parentId, cwd: ".", createdAt: now, updatedAt: now });
+		try {
+			const worker = await createNarratorForPlugin({
+				type: "subagent",
+				parentNarratorId: parentId,
+			});
+			childIds.push(worker.narratorId);
+			databaseNarratorIds.add(worker.narratorId);
+			const stored = await db.query.narrators.findFirst({
+				where: eq(narrators.id, worker.narratorId),
+			});
+			expect(stored).toMatchObject({ subagentOriginKind: "standalone", originToolCallId: null });
+			// No registry or creation-returned object is supplied to resume: every getById
+			// reloads the durable row, including the second follow-up.
+			originResult = null;
+			for (let turn = 0; turn < 2; turn++) {
+				const result = await resumeSubagent({
+					subagentId: worker.narratorId,
+					intent: "follow_up",
+					actor: "parent_agent",
+					prompt: "inspect",
+					locale: "en",
+				});
+				expect(result.originToolUseId).toBe(`standalone-${worker.narratorId}`);
+				expect(startCalls[turn].skipConclusionDelivery).toBeUndefined();
+				await db
+					.update(narrators)
+					.set({ status: "idle" })
+					.where(eq(narrators.id, worker.narratorId));
+				await finishRun(worker.narratorId);
+				await expect(result.terminalCompletion).resolves.toContain("done");
+				expect(hasActiveSubagentResumeRun(worker.narratorId)).toBe(false);
+				originResult = { parentToolUseId: result.originToolUseId };
+			}
+			expect(conclusionCalls).toHaveLength(0);
+			expect(announcements).toHaveLength(2);
+			const unknown = await narratorService.createSubagent({
+				parentNarratorId: parentId,
+				subagentType: "general",
+				cwd: ".",
+			});
+			childIds.push(unknown.id);
+			expect(unknown.subagentOriginKind).toBeNull();
+			await expect(
+				narratorService.createSubagent({
+					parentNarratorId: parentId,
+					subagentType: "general",
+					cwd: ".",
+					subagentOriginKind: "standalone",
+					originToolCallId: "forbidden",
+				}),
+			).rejects.toThrow("cannot have an Agent tool-call origin");
+		} finally {
+			for (const id of childIds) {
+				await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
+				await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
+				await db.delete(narrators).where(eq(narrators.id, id));
+			}
+			await db.delete(narrators).where(eq(narrators.id, parentId));
+		}
+	});
 	test("starts a never-started plugin temp worker despite its stale working status", async () => {
 		// A team temp worker recruited directly through the plugin API has no
 		// originating Agent tool call (resolveSubagentOriginToolUseId fails) and
@@ -444,6 +774,11 @@ describe("resumeSubagent", () => {
 		// synthesizing a standalone origin — instead of rejecting it with
 		// "already running" or stranding the message in the buffer.
 		originResult = null;
+		standaloneSubagentIds.add("temp-worker-1");
+		realResolverChild = makeNarrator("temp-worker-1");
+		await expect(
+			realConclusionResolver("temp-worker-1", parentNarratorId, "standalone-untrusted"),
+		).rejects.toThrow("no trusted parent tool-call origin");
 		workingSubagentIds.add("temp-worker-1");
 		const result = await resumeSubagent({
 			subagentId: "temp-worker-1",
@@ -468,8 +803,195 @@ describe("resumeSubagent", () => {
 		expect(String(startCalls[0].toolUseId ?? "")).toMatch(/^standalone-/);
 
 		await finishRun("temp-worker-1");
+		await expect(result.terminalCompletion).resolves.toContain("done");
 		expect(hasActiveSubagentResumeRun("temp-worker-1")).toBe(false);
-		expect(conclusionCalls).toHaveLength(1);
+		expect(conclusionCalls).toHaveLength(0);
+		expect(announcements).toHaveLength(1);
+		expect(startCalls[0].skipConclusionDelivery).toBeUndefined();
+
+		// The first run persists its transport link. It does not become a real Agent
+		// origin on follow-up, nor does the worker bypass live-run status validation.
+		originResult = { parentToolUseId: result.originToolUseId };
+		workingSubagentIds.clear();
+		const followUp = await resumeSubagent({
+			subagentId: "temp-worker-1",
+			intent: "follow_up",
+			actor: "user",
+			prompt: "inspect again",
+			locale: "en",
+		});
+		expect(followUp.originToolUseId).toBe(result.originToolUseId);
+		expect(startCalls[1].allowRunningRestart).toBe(false);
+		await finishRun("temp-worker-1");
+		await expect(followUp.terminalCompletion).resolves.toContain("done");
+		expect(conclusionCalls).toHaveLength(0);
+		expect(announcements).toHaveLength(2);
+	});
+
+	test("does not authorize a missing origin or a standalone-prefixed transport", async () => {
+		originResult = null;
+		await expect(
+			resumeSubagent({
+				subagentId: "broken-ordinary-missing-link",
+				intent: "follow_up",
+				actor: "user",
+				prompt: "continue",
+				locale: "en",
+			}),
+		).rejects.toThrow("original Agent tool call");
+		expect(startCalls).toHaveLength(0);
+
+		const subagentId = "broken-ordinary-prefixed-link";
+		unknownOriginIds.add(subagentId);
+		realResolverChild = makeNarrator(subagentId);
+		originResult = { parentToolUseId: "standalone-forged" };
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "continue",
+			locale: "en",
+		});
+		terminalResolvers.get(subagentId)?.("done");
+		await expect(result.terminalCompletion).rejects.toThrow("no trusted parent tool-call origin");
+		await Bun.sleep(0);
+		expect(conclusionCalls).toHaveLength(0);
+		expect(announcements).toHaveLength(0);
+		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
+	});
+
+	test("ordinary child resolves its real database slot before conclusion delivery", async () => {
+		const { db } = await import("../../db");
+		const { narrators, narratorMessages, narratorMessageRefs, narratorToolCalls } = await import(
+			"../../db/schema"
+		);
+		const { eq } = await import("drizzle-orm");
+		const subagentId = "ordinary-real-slot";
+		const toolCallId = `parent-tool-row-${subagentId}`;
+		const messageId = "ordinary-real-slot-message";
+		const now = new Date().toISOString();
+		// tests/preload.ts isolates this database from all real user data.
+		await db.insert(narrators).values({ id: parentNarratorId, createdAt: now, updatedAt: now });
+		try {
+			await db.insert(narratorMessages).values({
+				id: messageId,
+				narratorId: parentNarratorId,
+				role: "assistant",
+				contentJson: [{ type: "tool_use", id: originToolUseId, name: "Agent", input: {} }],
+				createdAt: now,
+			});
+			await db.insert(narratorMessageRefs).values({
+				id: `${messageId}-ref`,
+				narratorId: parentNarratorId,
+				messageId,
+				seq: 1,
+			});
+			await db.insert(narratorToolCalls).values({
+				id: toolCallId,
+				narratorId: parentNarratorId,
+				messageId,
+				toolUseId: originToolUseId,
+				toolName: "Agent",
+				inputJson: {},
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				status: "success",
+				createdAt: now,
+			});
+			realResolverChild = makeNarrator(subagentId);
+			const result = await resumeSubagent({
+				subagentId,
+				intent: "follow_up",
+				actor: "user",
+				prompt: "continue",
+				locale: "en",
+			});
+			await finishRun(subagentId);
+			await expect(result.terminalCompletion).resolves.toContain("done");
+			expect(conclusionCalls).toHaveLength(1);
+			expect(conclusionCalls[0]).toMatchObject({
+				subagentId,
+				parentNarratorId,
+				toolCallId,
+				messageId,
+				toolUseId: originToolUseId,
+			});
+		} finally {
+			await db.delete(narratorToolCalls).where(eq(narratorToolCalls.id, toolCallId));
+			await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, messageId));
+			await db.delete(narratorMessages).where(eq(narratorMessages.id, messageId));
+			await db.delete(narrators).where(eq(narrators.id, subagentId));
+			await db.delete(narrators).where(eq(narrators.id, parentNarratorId));
+		}
+	});
+
+	test("ordinary origin mismatch still rejects through the real resolver", async () => {
+		const subagentId = "ordinary-origin-mismatch";
+		realResolverChild = makeNarrator(subagentId);
+		realResolverOriginal = {
+			narratorId: "foreign-parent",
+			toolUseId: originToolUseId,
+			toolName: "Agent",
+			executionIdentityVersion: 1,
+			executionOriginToolCallId: null,
+		};
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "continue",
+			locale: "en",
+		});
+		terminalResolvers.get(subagentId)?.("done");
+		await expect(result.terminalCompletion).rejects.toThrow("not the parent's original Agent row");
+		await Bun.sleep(0);
+		expect(conclusionCalls).toHaveLength(0);
+		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
+	});
+
+	test("standalone explicit skipConclusionDelivery preserves runner announcement suppression", async () => {
+		const subagentId = "standalone-explicit-skip";
+		standaloneSubagentIds.add(subagentId);
+		originResult = null;
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "continue",
+			locale: "en",
+			skipConclusionDelivery: true,
+		});
+		await finishRun(subagentId);
+		await expect(result.terminalCompletion).resolves.toContain("done");
+		expect(conclusionCalls).toHaveLength(0);
+		expect(announcements).toHaveLength(0);
+		expect(startCalls[0].skipConclusionDelivery).toBe(true);
+		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
+	});
+
+	test("standalone marker cannot bypass the resolver when an origin PK exists", async () => {
+		const subagentId = "ordinary-with-invalid-marker";
+		mismatchedMarkerIds.add(subagentId);
+		realResolverChild = makeNarrator(subagentId);
+		realResolverOriginal = {
+			narratorId: "foreign-parent",
+			toolUseId: originToolUseId,
+			toolName: "Agent",
+			executionIdentityVersion: 1,
+			executionOriginToolCallId: null,
+		};
+		const result = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "continue",
+			locale: "en",
+		});
+		terminalResolvers.get(subagentId)?.("done");
+		await expect(result.terminalCompletion).rejects.toThrow("not the parent's original Agent row");
+		await Bun.sleep(0);
+		expect(conclusionCalls).toHaveLength(0);
+		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
 	});
 
 	test("serializes one active resumed run and delivers its conclusion once", async () => {
@@ -505,6 +1027,8 @@ describe("resumeSubagent", () => {
 			subagentId,
 			parentNarratorId,
 			toolUseId: originToolUseId,
+			toolCallId: `parent-tool-row-${subagentId}`,
+			messageId: "parent-message",
 			finalText: "final answer",
 			resultMessageId: "result-message",
 		});
@@ -851,6 +1375,42 @@ describe("resumeSubagent", () => {
 		expect(truncation?.narratorId).toBe(subagentId);
 		expect(truncation?.opts).toMatchObject({ skipRevert: false });
 		await finishRun(subagentId);
+	});
+
+	test("standalone manual override retains the existing runner and publication authority", async () => {
+		const subagentId = "standalone-manual-override";
+		standaloneSubagentIds.add(subagentId);
+		originResult = null;
+		const first = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "start",
+			locale: "en",
+		});
+		originResult = { parentToolUseId: first.originToolUseId };
+		const waiting = waitForManualOverride(
+			subagentId,
+			new AbortController().signal,
+			parentNarratorId,
+			first.originToolUseId,
+		);
+		const resumed = await resumeSubagent({
+			subagentId,
+			intent: "follow_up",
+			actor: "user",
+			prompt: "resume manually",
+			locale: "en",
+		});
+		expect(resumed.resumedSuspendedRunner).toBe(true);
+		expect(startCalls).toHaveLength(1);
+		expect(persistedCalls[0].parentToolUseId).toBe(first.originToolUseId);
+		await expect(waiting).resolves.toMatchObject({ action: "resume", prompt: "resume manually" });
+		await finishRun(subagentId);
+		await expect(first.terminalCompletion).resolves.toContain("done");
+		expect(conclusionCalls).toHaveLength(0);
+		expect(announcements).toHaveLength(1);
+		expect(hasActiveSubagentResumeRun(subagentId)).toBe(false);
 	});
 
 	test("resumes a suspended original runner instead of starting another engine", async () => {

@@ -3,6 +3,7 @@ import {
 	type JsonRpcNotification,
 	type JsonValue,
 	PROVIDER_PROTOCOL_VERSION,
+	PROVIDER_REQUEST_MAX_BYTES,
 	PROVIDER_SEARCH_METHOD,
 	type ProviderStreamEvent,
 	providerEventSchema,
@@ -25,7 +26,7 @@ const DEFAULT_LIMITS: ProviderRpcLimits = {
 	maxTotalQueueBytes: 2 * 1024 * 1024,
 	maxFrameBytes: 256 * 1024,
 	maxUnaryResponseBytes: 1024 * 1024,
-	maxRequestBytes: 32 * 1024 * 1024,
+	maxRequestBytes: PROVIDER_REQUEST_MAX_BYTES,
 	maxOperationOutputBytes: 24 * 1024 * 1024,
 	maxTextBytes: 8 * 1024 * 1024,
 	maxReasoningBytes: 8 * 1024 * 1024,
@@ -35,7 +36,7 @@ const DEFAULT_LIMITS: ProviderRpcLimits = {
 	maxEventsPerOperation: 100_000,
 	acceptedTimeoutMs: 5_000,
 	unaryTimeoutMs: 30_000,
-	streamIdleTimeoutMs: 120_000,
+	streamIdleTimeoutMs: 5 * 60_000,
 	operationTimeoutMs: 30 * 60_000,
 	cancelGraceMs: 5_000,
 	maxLateEvents: 3,
@@ -1487,10 +1488,14 @@ export class PluginProviderRpcClient {
 				record,
 				"timeout",
 				"Provider stream became idle",
-				new ProviderRpcError("STREAM_IDLE_TIMEOUT", "Provider stream idle timeout", {
-					operationId: record.operationId,
-					requestId: record.requestId,
-				}),
+				new ProviderRpcError(
+					"STREAM_IDLE_TIMEOUT",
+					`Provider stream idle timeout after ${this.limits.streamIdleTimeoutMs}ms`,
+					{
+						operationId: record.operationId,
+						requestId: record.requestId,
+					},
+				),
 			);
 		}, this.limits.streamIdleTimeoutMs);
 	}

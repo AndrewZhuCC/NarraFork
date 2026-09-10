@@ -41,6 +41,10 @@ scripts/lib/*
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/
 scripts/lib/__tests__/*
+# Required by the cross-platform build and its post-processing workers.
+!scripts/post-process-worker.ts
+!scripts/lib/binary-metadata.ts
+!scripts/lib/__tests__/binary-metadata.test.ts
 !scripts/lib/__tests__/latest-yml.test.ts
 !scripts/lib/__tests__/executor-manifest.test.ts
 !scripts/validate-plugin-release.ts
@@ -52,6 +56,15 @@ scripts/lib/__tests__/*
 # fresh clone and `bun run package` inside vscode-extension/ would fail on a missing
 # module rather than on anything explaining why.
 !scripts/package-vscode-extension.ts
+# Reproducible tool-body follow regression harness; reports remain under .narrafork/.
+!scripts/smoke-tool-content-follow.ts
+!scripts/smoke-tool-content-follow-fixture.tsx
+# Monaco regression sources are required in fresh clones; generated reports stay ignored.
+!scripts/smoke-monaco-large-file*.ts
+!scripts/smoke-monaco-large-file*.tsx
+!scripts/smoke-file-navigation.ts
+!scripts/smoke-file-navigation-fixture.tsx
+!scripts/smoke-editor-real-io-fixture.tsx
 .tmp-narrafork-home.*
 .release.local.json
 mitm-dump/

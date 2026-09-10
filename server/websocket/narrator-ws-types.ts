@@ -56,6 +56,8 @@ export interface RecentTabsSnapshotMessage {
 
 // Server → Client messages
 export type NarratorServerMessage =
+	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
+	| { type: "human_attention_changed" }
 	| RecentTabsDelta
 	| NarratorWsSubscriptionLimitError
 	| RecentTabsSnapshotMessage
@@ -331,8 +333,9 @@ export type NarratorServerMessage =
 			parentToolUseId?: string;
 	  }
 	/**
-	 * A running `Await({type:"agent"})` has resolved which child narrator it is
-	 * waiting on, so its card can offer "open session" DURING the wait.
+	 * A running Await-agent or single-target Send has resolved its child narrator,
+	 * so its card can offer "open session" DURING the wait. The legacy event name
+	 * is shared by both navigation-only updates; neither is a tool result.
 	 *
 	 * Needed as its own frame because the id is otherwise unknowable until the tool
 	 * returns: an in-flight call has no `outputJson`, hence no `metadata.subagentId`
@@ -345,6 +348,16 @@ export type NarratorServerMessage =
 			narratorId: string;
 			toolUseId: string;
 			subagentNarratorId: string;
+			parentToolUseId?: string;
+	  }
+	/** Navigation receipts only: queued deliveryMessageIds may not yet exist in the DB. */
+	| {
+			type: "send_delivery_resolved";
+			narratorId: string;
+			toolUseId: string;
+			targets: import("@shared/communication-tool").SendDeliveryReceipt[];
+			targetCount?: number;
+			toolCallBinding?: { toolCallId: string; attempt: number };
 			parentToolUseId?: string;
 	  }
 	| {
@@ -432,6 +445,7 @@ export type NarratorServerMessage =
 			narratorId: string;
 			hasDraft: boolean;
 			text: string;
+			fileReferences?: import("@shared/file-reference").FileReference[];
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
@@ -616,7 +630,7 @@ export type NarratorServerMessage =
 			extractedFields?: Record<string, string>;
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field */
-			streamingField?: { name: string; delta: string };
+			streamingField?: { name: string; delta: string; startsField?: boolean };
 			/**
 			 * Child-row label for the parent card's "recent calls" list. Built from the
 			 * fields the streaming JSON parser has already extracted, so the row can be

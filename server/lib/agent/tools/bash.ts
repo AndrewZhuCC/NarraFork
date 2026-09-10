@@ -1,10 +1,13 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
+import { registerLocalBashActivity } from "@server/services/file-change-runtime";
 import { z } from "zod/v4";
+import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
 import { hotSafe } from "../../hot-safe";
 import { generateShortId } from "../../id";
+import { logger } from "../../logger";
 import { getHome } from "../../platform";
-import type { ExecutionBackend } from "../execution/backend";
+import type { ExecHandle, ExecutionBackend } from "../execution/backend";
 import { withDeviceParam } from "../execution/device-schema";
 import { resolveBackendPath, toolBaseCwd } from "../execution/path-resolve";
 import { getToolBackend } from "../execution/tool-backend";
@@ -80,10 +83,26 @@ interface RunningBashEntry {
 	setTimedOut: () => void;
 }
 
-const runningBashProcesses = hotSafe(
-	"narrafork:runningBashProcesses",
-	() => new Map<string, RunningBashEntry>(),
+let preexistingBashRegistry = true;
+const runningBashProcesses = hotSafe("narrafork:runningBashProcesses", () => {
+	preexistingBashRegistry = false;
+	return new Map<string, RunningBashEntry>();
+});
+// A hot upgrade cannot prove that older loops discarded their old tool closures,
+// even when their process registry is momentarily empty. This one-time data flag
+// is false on a clean boot and survives later hot reloads without storing old code.
+const bashActivityMigration = hotSafe("narrafork:bashActivityMigration:v1", () =>
+	Object.freeze({ requiresColdStart: preexistingBashRegistry }),
 );
+
+export function assertBashActivityProtectionReady(): void {
+	if (bashActivityMigration.requiresColdStart)
+		throw new AppError(
+			"File rollback protection was enabled by a hot upgrade. Finish current work and restart the service before reverting files.",
+			409,
+			"REVERT_RUNTIME_RELOAD_REQUIRED",
+		);
+}
 
 /**
  * Kill all running bash processes spawned by the Bash tool.
@@ -151,6 +170,75 @@ const REVIEW_READ_ONLY_BASH_DESCRIPTION =
 	"with environment variable assignments, run background/control operations, or invoke other " +
 	"commands.";
 
+interface BashExecution {
+	start(signal: AbortSignal): Promise<ExecHandle>;
+	cancelUndispatched(): void;
+}
+
+/** Admission and lifetime are independent of the legacy attribution mutex and
+ * tool/HTTP return. Even an unrecognized/read-only-looking command participates. */
+async function prepareBashExecution(
+	backend: ExecutionBackend,
+	command: string,
+	cwd: string,
+	ctx: ToolContext,
+	env?: Record<string, string> | null,
+): Promise<BashExecution> {
+	const activity = await registerLocalBashActivity({
+		backend,
+		cwd,
+		target: ctx.executionTarget,
+		signal: ctx.signal,
+	});
+	let started = false;
+	let ended = false;
+	const end = (outcome: "finished" | "unknown") => {
+		if (!activity || ended) return;
+		ended = true;
+		try {
+			activity.end(outcome);
+		} catch (error) {
+			// The coordinator retains its recovery hold on persistence failure.
+			// Never retry an uncertain outcome as "finished" or let a detached
+			// callback's rejection discard the only lifecycle observer.
+			logger.warn("Bash workspace activity settlement requires recovery", {
+				scopeId: activity.scope.id,
+				outcome,
+				error: String(error),
+			});
+		}
+	};
+	return {
+		async start(signal) {
+			if (started) throw new Error("Bash execution was already dispatched");
+			started = true;
+			let handle: ExecHandle;
+			try {
+				signal.throwIfAborted();
+				handle = await backend.execCommand({
+					command,
+					cwd: activity?.cwd ?? cwd,
+					signal,
+					env: env ?? undefined,
+				});
+			} catch (error) {
+				// LocalBackend rejects dispatch only before spawning. Asynchronous
+				// spawn/process errors always come with a handle and its real barrier.
+				end("finished");
+				throw error;
+			}
+			void (handle.whenSettled ?? handle.exited).then(
+				() => end("finished"),
+				() => end("unknown"),
+			);
+			return handle;
+		},
+		cancelUndispatched() {
+			if (!started) end("finished");
+		},
+	};
+}
+
 export const bashTool: ToolDefinition = {
 	name: SHELL_TOOL_NAME,
 	executionRouting: {
@@ -167,7 +255,7 @@ export const bashTool: ToolDefinition = {
 	description: (config) =>
 		config.reviewReadOnlyBash
 			? REVIEW_READ_ONLY_BASH_DESCRIPTION
-			: `Executes a given bash command and returns its output.\n\nThe working directory persists between commands, but shell state does not. The shell environment is initialized from the user's profile (bash or zsh).\n\nIMPORTANT: Avoid using this tool to run \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`sed\`, \`awk\`, or \`echo\` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:\n\n - File search: Use Glob (NOT find or ls)\n - Content search: Use Grep (NOT grep or rg)\n - Read files: Use Read (NOT cat/head/tail)\n - Edit files: Use Edit (NOT sed/awk)\n - Write files: Use Write (NOT echo >/cat <<EOF)\n - Communication: Output text directly (NOT echo/printf)\nWhile the Bash tool can do similar things, it's better to use the built-in tools as they provide a better user experience and make it easier to review tool calls and give permission.\n\n# Instructions\n - If your command will create new directories or files, first use this tool to run \`ls\` to verify the parent directory exists and is the correct location.\n - Always quote file paths that contain spaces with double quotes in your command (e.g., cd "path with spaces/file.txt")\n - Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of \`cd\`. You may use \`cd\` if the User explicitly requests it.\n - You may specify an optional timeout in milliseconds (up to 600000ms / 10 minutes). By default, your command will timeout after 120000ms (2 minutes).\n - Write a clear, concise description of what your command does. For simple commands, keep it brief (5-10 words). For complex commands (piped commands, obscure flags, or anything hard to understand at a glance), include enough context so that the user can understand what your command will do.\n - When issuing multiple commands:\n  - If the commands are independent and can run in parallel, make multiple Bash tool calls in a single message. Example: if you need to run "git status" and "git diff", send a single message with two Bash tool calls in parallel.\n  - If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together.\n  - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail.\n  - DO NOT use newlines to separate commands (newlines are ok in quoted strings).\n - For git commands:\n  - Prefer to create a new commit rather than amending an existing commit.\n  - Before running destructive operations (e.g., git reset --hard, git push --force, git checkout --), consider whether there is a safer alternative that achieves the same goal. Only use destructive operations when they are truly the best approach.\n  - Never skip hooks (--no-verify) or bypass signing (--no-gpg-sign, -c commit.gpgsign=false) unless the user has explicitly asked for it. If a hook fails, investigate and fix the underlying issue.\n - Avoid unnecessary \`sleep\` commands:\n  - Do not sleep between commands that can run immediately — just run them.\n  - Do not retry failing commands in a sleep loop — diagnose the root cause or consider an alternative approach.\n  - If you must poll an external process, use a check command (e.g. \`gh run view\`) rather than sleeping first.\n  - If you must sleep, keep the duration short (1-5 seconds) to avoid blocking the user.\n\n\n# Committing changes with git\n\nOnly create commits when requested by the user. If unclear, ask first. When the user asks you to create a new git commit, follow these steps carefully:\n\nGit Safety Protocol:\n- NEVER update the git config\n- NEVER run destructive git commands (push --force, reset --hard, checkout ., restore ., clean -f, branch -D) unless the user explicitly requests these actions. Taking unauthorized destructive actions is unhelpful and can result in lost work, so it's best to ONLY run these commands when given direct instructions \n- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it\n- NEVER run force push to main/master, warn the user if they request it\n- CRITICAL: Always create NEW commits rather than amending, unless the user explicitly requests a git amend. When a pre-commit hook fails, the commit did NOT happen — so --amend would modify the PREVIOUS commit, which may result in destroying work or losing previous changes. Instead, after hook failure, fix the issue, re-stage, and create a NEW commit\n- When staging files, prefer adding specific files by name rather than using "git add -A" or "git add .", which can accidentally include sensitive files (.env, credentials) or large binaries\n- NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive\n\n1. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following bash commands in parallel, each using the Bash tool:\n  - Run a git status command to see all untracked files. IMPORTANT: Never use the -uall flag as it can cause memory issues on large repos.\n  - Run a git diff command to see both staged and unstaged changes that will be committed.\n  - Run a git log command to see recent commit messages, so that you can follow this repository's commit message style.\n2. Analyze all staged changes (both previously staged and newly added) and draft a commit message:\n  - Summarize the nature of the changes (eg. new feature, enhancement to an existing feature, bug fix, refactoring, test, docs, etc.). Ensure the message accurately reflects the changes and their purpose (i.e. "add" means a wholly new feature, "update" means an enhancement to an existing feature, "fix" means a bug fix, etc.).\n  - Do not commit files that likely contain secrets (.env, credentials.json, etc). Warn the user if they specifically request to commit those files\n  - Draft a concise (1-2 sentences) commit message that focuses on the "why" rather than the "what"\n  - Ensure it accurately reflects the changes and their purpose\n3. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following commands:\n   - Add relevant untracked files to the staging area.\n   - Create the commit with the drafted message.\n   - Run git status after the commit completes to verify success.\n   Note: git status depends on the commit completing, so run it sequentially after the commit.\n4. If the commit fails due to pre-commit hook: fix the issue and create a NEW commit\n\nImportant notes:\n- NEVER run additional commands to read or explore code, besides git bash commands\n- NEVER use the TodoWrite or Agent tools\n- DO NOT push to the remote repository unless the user explicitly asks you to do so\n- IMPORTANT: Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported.\n- IMPORTANT: Do not use --no-edit with git rebase commands, as the --no-edit flag is not a valid option for git rebase.\n- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit\n- In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la this example:\n<example>\ngit commit -m "$(cat <<'EOF'\n   Commit message here.\n   EOF\n   )"\n</example>\n\n# Creating pull requests\nUse the gh command via the Bash tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a Github URL use the gh command to get the information needed.\n\nIMPORTANT: When the user asks you to create a pull request, follow these steps carefully:\n\n1. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following bash commands in parallel using the Bash tool, in order to understand the current state of the branch since it diverged from the main branch:\n   - Run a git status command to see all untracked files (never use -uall flag)\n   - Run a git diff command to see both staged and unstaged changes that will be committed\n   - Check if the current branch tracks a remote branch and is up to date with the remote, so you know if you need to push to the remote\n   - Run a git log command and \`git diff [base-branch]...HEAD\` to understand the full commit history for the current branch (from the time it diverged from the base branch)\n2. Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request!!!), and draft a pull request title and summary:\n   - Keep the PR title short (under 70 characters)\n   - Use the description/body for details, not the title\n3. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following commands in parallel:\n   - Create new branch if needed\n   - Push to remote with -u flag if needed\n   - Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting.\n<example>\ngh pr create --title "the pr title" --body "$(cat <<'EOF'\n## Summary\n<1-3 bullet points>\n\n## Test plan\n[Bulleted markdown checklist of TODOs for testing the pull request...]\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nEOF\n)"\n</example>\n\nImportant:\n- DO NOT use the TodoWrite or Agent tools\n- Return the PR URL when you're done, so the user can see it\n\n# Other common operations\n- View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments`,
+			: `Executes a given bash command and returns its output.\n\nThe working directory persists between commands, but shell state does not. The shell environment is initialized from the user's profile (bash or zsh).\n\nIMPORTANT: Avoid using this tool to run \`find\`, \`grep\`, \`cat\`, \`head\`, \`tail\`, \`sed\`, \`awk\`, or \`echo\` commands, unless explicitly instructed or after you have verified that a dedicated tool cannot accomplish your task. Instead, use the appropriate dedicated tool as this will provide a much better experience for the user:\n\n - File search: Use Glob (NOT find or ls)\n - Content search: Use Grep (NOT grep or rg)\n - Read files: Use Read (NOT cat/head/tail)\n - Edit files: Use Edit (NOT sed/awk)\n - Write files: Use Write (NOT echo >/cat <<EOF)\n - Communication: Output text directly (NOT echo/printf)\nWhile the Bash tool can do similar things, it's better to use the built-in tools as they provide a better user experience and make it easier to review tool calls and give permission.\n\n# Instructions\n - If your command will create new directories or files, first use this tool to run \`ls\` to verify the parent directory exists and is the correct location.\n - Always quote file paths that contain spaces with double quotes in your command (e.g., cd "path with spaces/file.txt")\n - Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of \`cd\`. You may use \`cd\` if the User explicitly requests it.\n - You may specify an optional timeout in milliseconds (up to 600000ms / 10 minutes). By default, your command will timeout after 120000ms (2 minutes).\n - Write a clear, concise description of what your command does. For simple commands, keep it brief (5-10 words). For complex commands (piped commands, obscure flags, or anything hard to understand at a glance), include enough context so that the user can understand what your command will do.\n - When issuing multiple commands:\n  - If the commands are independent and can run in parallel, make multiple Bash tool calls in a single message. Example: if you need to run "git status" and "git diff", send a single message with two Bash tool calls in parallel.\n  - If the commands depend on each other and must run sequentially, use a single Bash call with '&&' to chain them together.\n  - Use ';' only when you need to run commands sequentially but don't care if earlier commands fail.\n  - DO NOT use newlines to separate commands (newlines are ok in quoted strings).\n - For git commands:\n  - Prefer to create a new commit rather than amending an existing commit.\n  - Before running destructive operations (e.g., git reset --hard, git push --force, git checkout --), consider whether there is a safer alternative that achieves the same goal. Only use destructive operations when they are truly the best approach.\n  - Never skip hooks (--no-verify) or bypass signing (--no-gpg-sign, -c commit.gpgsign=false) unless the user has explicitly asked for it. If a hook fails, investigate and fix the underlying issue.\n - Avoid unnecessary \`sleep\` commands:\n  - Do not sleep between commands that can run immediately — just run them.\n  - Do not retry failing commands in a sleep loop — diagnose the root cause or consider an alternative approach.\n  - If you must poll an external process, use a check command (e.g. \`gh run view\`) rather than sleeping first.\n  - If you must sleep, keep the duration short (1-5 seconds) to avoid blocking the user.\n\n\n# Committing changes with git\n\nOnly create commits when requested by the user. If unclear, ask first. When the user asks you to create a new git commit, follow these steps carefully:\n\nGit Safety Protocol:\n- NEVER update the git config\n- NEVER run destructive git commands (push --force, reset --hard, checkout ., restore ., clean -f, branch -D) unless the user explicitly requests these actions. Taking unauthorized destructive actions is unhelpful and can result in lost work, so it's best to ONLY run these commands when given direct instructions \n- NEVER skip hooks (--no-verify, --no-gpg-sign, etc) unless the user explicitly requests it\n- NEVER run force push to main/master, warn the user if they request it\n- CRITICAL: Always create NEW commits rather than amending, unless the user explicitly requests a git amend. When a pre-commit hook fails, the commit did NOT happen — so --amend would modify the PREVIOUS commit, which may result in destroying work or losing previous changes. Instead, after hook failure, fix the issue, re-stage, and create a NEW commit\n- When staging files, prefer adding specific files by name rather than using "git add -A" or "git add .", which can accidentally include sensitive files (.env, credentials) or large binaries\n- NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive\n\n1. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following bash commands in parallel, each using the Bash tool:\n  - Run a git status command to see all untracked files. IMPORTANT: Never use the -uall flag as it can cause memory issues on large repos.\n  - Run a git diff command to see both staged and unstaged changes that will be committed.\n  - Run a git log command to see recent commit messages, so that you can follow this repository's commit message style.\n2. Analyze all staged changes (both previously staged and newly added) and draft a commit message:\n  - Summarize the nature of the changes (eg. new feature, enhancement to an existing feature, bug fix, refactoring, test, docs, etc.). Ensure the message accurately reflects the changes and their purpose (i.e. "add" means a wholly new feature, "update" means an enhancement to an existing feature, "fix" means a bug fix, etc.).\n  - Do not commit files that likely contain secrets (.env, credentials.json, etc). Warn the user if they specifically request to commit those files\n  - Draft a concise (1-2 sentences) commit message that focuses on the "why" rather than the "what"\n  - Ensure it accurately reflects the changes and their purpose\n3. Run the following dependent steps sequentially, proceeding only after the previous step succeeds:\n   - Stage only the relevant files, including intended modifications and untracked files.\n   - Create the commit with the drafted message.\n   - Run git status after the commit completes to verify success.\n   Note: git status depends on the commit completing, so run it sequentially after the commit.\n4. If the commit fails due to pre-commit hook: fix the issue and create a NEW commit\n\nImportant notes:\n- You may use tools and subagents to understand, review, or edit code and run relevant tests before committing. Subagents may modify files; coordinate their editing scopes to avoid conflicting edits.\n- When agents share a working directory, reserve Git state-changing operations (including staging, committing, switching branches, stash, reset, rebase, merge, restore, and checkout) for the primary agent to execute serially with the required user authorization. Subagents must not perform these operations in the shared working directory; this does not prohibit them from editing code or running tests. Confirm relevant editing tasks have finished before staging and committing.\n- DO NOT push to the remote repository unless the user explicitly asks you to do so\n- IMPORTANT: Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported.\n- IMPORTANT: Do not use --no-edit with git rebase commands, as the --no-edit flag is not a valid option for git rebase.\n- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit\n- In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la this example:\n<example>\ngit commit -m "$(cat <<'EOF'\n   Commit message here.\n   EOF\n   )"\n</example>\n\n# Creating pull requests\nUse the gh command via the Bash tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a Github URL use the gh command to get the information needed.\n\nIMPORTANT: When the user asks you to create a pull request, follow these steps carefully:\n\n1. You can call multiple tools in a single response. When multiple independent pieces of information are requested and all commands are likely to succeed, run multiple tool calls in parallel for optimal performance. run the following bash commands in parallel using the Bash tool, in order to understand the current state of the branch since it diverged from the main branch:\n   - Run a git status command to see all untracked files (never use -uall flag)\n   - Run a git diff command to see both staged and unstaged changes that will be committed\n   - Check if the current branch tracks a remote branch and is up to date with the remote, so you know if you need to push to the remote\n   - Run a git log command and \`git diff [base-branch]...HEAD\` to understand the full commit history for the current branch (from the time it diverged from the base branch)\n2. Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request!!!), and draft a pull request title and summary:\n   - Keep the PR title short (under 70 characters)\n   - Use the description/body for details, not the title\n3. Run the following dependent steps sequentially, proceeding only after the previous step succeeds:\n - Create new branch if needed\n   - Push to remote with -u flag if needed\n   - Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting.\n<example>\ngh pr create --title "the pr title" --body "$(cat <<'EOF'\n## Summary\n<1-3 bullet points>\n\n## Test plan\n[Bulleted markdown checklist of TODOs for testing the pull request...]\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\nEOF\n)"\n</example>\n\nImportant:\n- You may use tools and subagents to understand, review, or edit the pull request changes and run relevant tests. Subagents may edit code in coordinated, non-conflicting scopes. Follow the shared-working-directory Git state coordination rules above; independent checks and non-conflicting editing tasks may run in parallel, but dependent Git and pull request steps must run sequentially.\n- Return the PR URL when you're done, so the user can see it\n\n# Other common operations\n- View comments on a Github PR: gh api repos/foo/bar/pulls/123/comments`,
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -280,6 +368,10 @@ export const bashTool: ToolDefinition = {
 			),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
+		ctx = {
+			...ctx,
+			executionTarget: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
+		};
 		const { command, stop, timeout, workdir, description, run_in_background, device } = args as {
 			command?: string;
 			stop?: string;
@@ -404,32 +496,38 @@ export const bashTool: ToolDefinition = {
 			narratorId: ctx.narratorId,
 		});
 
-		// Background execution: fire-and-forget via backgroundTaskService
-		if (run_in_background) {
-			return _runInBackground(command, cwd, timeoutMs, title, ctx, device, gitIdentityEnv);
+		let execution: BashExecution;
+		try {
+			execution = await prepareBashExecution(backend, command, cwd, ctx, gitIdentityEnv);
+		} catch (error) {
+			if (run_in_background) throw error;
+			return {
+				output: `Bash admission error: ${error instanceof Error ? error.message : String(error)}`,
+				isError: true,
+			};
 		}
 
-		// Commands that explicitly name in-workspace write targets (`sed -i src/a.ts`,
-		// `biome check --write server/`) take the workspace write lock so their change
-		// set can be attributed to this narrator alone. The attempt is bounded: a
-		// command that cannot get the lock in time runs unserialized rather than
-		// stalling the session, and commands whose writes are unpredictable
-		// (`bun run build`) are never serialized at all.
-		const serializationInput = await resolveBashSerializationInput({
-			command,
-			cwd,
-			isBackground: false,
-			isChapter: !!ctx.chapterId,
-		});
+		// Preserve background pre-spawn failures as rejected tool executions, while
+		// releasing only activity that was never handed to a process.
+		if (run_in_background) {
+			try {
+				return await _runInBackground(command, timeoutMs, title, ctx, execution);
+			} finally {
+				execution.cancelUndispatched();
+			}
+		}
 
 		try {
+			// Legacy attribution remains bounded/heuristic. Its timeout fallback does
+			// NOT bypass the separately registered coordinator activity above.
+			const serializationInput = await resolveBashSerializationInput({
+				command,
+				cwd,
+				isBackground: false,
+				isChapter: !!ctx.chapterId,
+			});
 			const runForeground = async (): Promise<ToolResult> => {
-				const handle = await backend.execCommand({
-					command,
-					cwd,
-					signal: ctx.signal,
-					env: gitIdentityEnv ?? undefined,
-				});
+				const handle = await execution.start(ctx.signal);
 
 				let output = "";
 				let timedOut = false;
@@ -583,8 +681,16 @@ export const bashTool: ToolDefinition = {
 				let exitCodeValue: number | null = null;
 				try {
 					exitCodeValue = await handle.exited;
+				} catch (error) {
+					if (toolUseId) {
+						clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
+						runningBashProcesses.delete(toolUseId);
+					}
+					if (liveEmitTimer) clearTimeout(liveEmitTimer);
+					throw error;
 				} finally {
 					clearTimeout(timer);
+					if (toolUseId) clearTimeout(runningBashProcesses.get(toolUseId)?.timer);
 					clearInterval(watchdogTimer);
 					ctx.signal.removeEventListener("abort", abortHandler);
 				}
@@ -637,6 +743,10 @@ export const bashTool: ToolDefinition = {
 				output: `Error: ${err instanceof Error ? err.message : String(err)}`,
 				isError: true,
 			};
+		} finally {
+			// Background start() owns lifetime before returning; only pre-spawn
+			// admission/task/serialization failures are cleaned up here.
+			execution.cancelUndispatched();
 		}
 	},
 };
@@ -647,12 +757,10 @@ import type { ToolContext } from "../types";
 
 async function _runInBackground(
 	command: string,
-	cwd: string,
 	timeoutMs: number | undefined,
 	title: string,
 	ctx: ToolContext,
-	device?: string,
-	gitIdentityEnv?: Record<string, string> | null,
+	execution: BashExecution,
 ): Promise<ToolResult> {
 	const taskId = `bash_${generateShortId()}`;
 	const bgAbort = new AbortController();
@@ -667,6 +775,8 @@ async function _runInBackground(
 		parentNarratorId: ctx.narratorId,
 		command,
 		toolUseId: ctx.currentToolUseId ?? undefined,
+		toolCallBinding: ctx.toolCallBinding,
+		executionTarget: ctx.executionTarget,
 		alias,
 		title,
 	});
@@ -683,16 +793,10 @@ async function _runInBackground(
 	(async () => {
 		let timedOut = false;
 		try {
-			const backend = getToolBackend(ctx, device);
-			const handle = await backend.execCommand({
-				command,
-				cwd,
-				signal: bgAbort.signal,
-				// Resolved by the caller before the task record was created: a background
-				// command outlives the turn, and re-resolving here could pick up a
-				// different acting user than the one who started it.
-				env: gitIdentityEnv ?? undefined,
-			});
+			// Frozen backend/cwd/env and activity were captured before task creation.
+			// Do not resolve a second backend after the tool/HTTP request has returned.
+			ctx.signal.throwIfAborted();
+			const handle = await execution.start(bgAbort.signal);
 			let outputBytes = 0;
 			let outputTruncated = false;
 			const killFn = () => handle.kill();

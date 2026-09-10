@@ -18,6 +18,7 @@ import {
 	type SubagentPanelParams,
 	dockPanelId as sharedDockPanelId,
 } from "../panels/panel-kind";
+import { type ToolEditReference, toolEditReferenceKey } from "../tool-edit-reference";
 
 /** Panel type discriminator stored on each dockview panel's params. */
 export type NarratorDockPanelType = Exclude<PanelKind, "webview">;
@@ -88,9 +89,32 @@ export function hashFilePath(filePath: string): string {
 	return `${hash.toString(36)}${filePath.length.toString(36)}`;
 }
 
+/** Keep host legacy ids; live cross-session reads differ, historical refs retain their own identity. */
+export function filePanelIdentity(
+	filePath: string,
+	deviceId = "local",
+	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
+): string {
+	if (toolEdit) {
+		return `history-${hashFilePath(JSON.stringify([deviceId, filePath, toolEditReferenceKey(toolEdit)]))}`;
+	}
+	if (fileNarratorId) {
+		return `session-${hashFilePath(JSON.stringify([fileNarratorId, deviceId, filePath]))}`;
+	}
+	return deviceId === "local"
+		? hashFilePath(filePath)
+		: `remote-${hashFilePath(JSON.stringify([deviceId, filePath]))}`;
+}
+
 /** Stable multi-instance panel id for one read-only file viewer. */
-export function fileDockPanelId(filePath: string): string {
-	return `ndock-file-${hashFilePath(filePath)}`;
+export function fileDockPanelId(
+	filePath: string,
+	deviceId = "local",
+	toolEdit?: ToolEditReference,
+	fileNarratorId?: string,
+): string {
+	return `ndock-file-${filePanelIdentity(filePath, deviceId, toolEdit, fileNarratorId)}`;
 }
 
 /**

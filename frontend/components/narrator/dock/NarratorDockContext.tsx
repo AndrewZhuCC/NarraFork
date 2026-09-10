@@ -19,6 +19,7 @@
  * prop-callback behaviour.
  */
 
+import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";
 import type { DockviewApi } from "dockview-react";
 import {
 	createContext,
@@ -37,14 +38,16 @@ import type {
 	FileModPanelExternalProps,
 	NarratorDetailsPanelExternalProps,
 } from "../narrator-panel-types";
+import { focusMessagePanel } from "../panels/focus-message-panel";
 import {
+	type FileOpenOptions,
 	type FilePanelParams,
 	type KnowledgeEntryScope,
 	type KnowledgePanelParams,
 	nextHighlightRequestId,
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
-import { resolveToolPlacement } from "../panels/tool-placement";
+import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
 import {
 	dockPanelId,
 	fileDockPanelId,
@@ -79,6 +82,7 @@ interface NarratorDockBridges {
 	 * new turn instead of queueing behind the current one.
 	 */
 	submitToNarrator: ((text: string) => void) | null;
+	addFileReference: ((reference: FileReference) => void) | null;
 }
 
 export interface NarratorDockContextValue {
@@ -190,7 +194,12 @@ export interface NarratorDockContextValue {
 	 * Open (or focus) a read-only file viewer for an absolute path. Multi-instance:
 	 * one panel per path, keyed by a hash of the path (see `fileDockPanelId`).
 	 */
-	openFilePanel: (filePath: string, fileName?: string) => void;
+	openFilePanel?: (filePath: string, fileName?: string, options?: FileOpenOptions) => void;
+	/** Selection metadata only; never copy an unsaved buffer into a saved-file reference. */
+	fileReferenceSelection?: FileReferenceEditorSelection | null;
+	setFileReferenceSelection?: (selection: FileReferenceEditorSelection | null) => void;
+	registerAddFileReference?: (fn: (reference: FileReference) => void) => () => void;
+	addFileReference?: (reference: FileReference) => void;
 	/**
 	 * Open (or focus) a knowledge entry viewer/editor panel. Multi-instance: one
 	 * panel per entry, keyed by entryId. `scope` determines which hooks are used
@@ -246,6 +255,8 @@ export function NarratorDockProvider({
 }) {
 	const apiRef = useRef<DockviewApi | null>(null);
 	const [fileModProps, setFileModProps] = useState<FileModPanelExternalProps | null>(null);
+	const [fileReferenceSelection, setFileReferenceSelection] =
+		useState<FileReferenceEditorSelection | null>(null);
 	const [detailsProps, setDetailsProps] = useState<NarratorDetailsPanelExternalProps | null>(null);
 	const [browserInfo, setBrowserInfo] = useState<NarratorBrowserInfo>({
 		sessionCount: 0,
@@ -260,6 +271,7 @@ export function NarratorDockProvider({
 		writeTerminalStdin: null,
 		scrollToMessage: null,
 		submitToNarrator: null,
+		addFileReference: null,
 	});
 
 	// Keep chapterId in a ref so openToolPanel always uses the latest without
@@ -345,85 +357,110 @@ export function NarratorDockProvider({
 		[narratorId],
 	);
 
-	const openSubagentPanel = useCallback((subagentNarratorId: string, messageId?: string) => {
-		const api = apiRef.current;
-		if (!api || !subagentNarratorId) return;
-		const id = subagentDockPanelId(subagentNarratorId);
-		const existing = api.getPanel(id);
-		if (existing) {
-			existing.api.setActive();
-			// An already-open panel is focused, and re-asked to jump. The nonce is what
-			// makes a SECOND click on the same row work: the panel's jump is latched per
-			// (narrator, target) so it fires once, and without a changing token the reader
-			// who scrolled away would click a live-looking control and see nothing.
-			if (messageId) {
-				existing.api.updateParameters({
-					panelType: "subagent",
-					subagentNarratorId,
-					highlightMessageId: messageId,
-					highlightRequestId: nextHighlightRequestId(),
-				} satisfies SubagentPanelParams);
+	const openSubagentPanel = useCallback(
+		(subagentNarratorId: string, messageId?: string) => {
+			const api = apiRef.current;
+			if (!api || !subagentNarratorId) return;
+			// Communication bubbles can point back to the host, not only to children.
+			// Never create a second copy of the primary session in the secondary area.
+			if (subagentNarratorId === narratorId) {
+				const primary = api.getPanel(dockPanelId("chat"));
+				if (primary) {
+					focusMessagePanel(api, primary, messageId, (id) =>
+						bridgesRef.current.scrollToMessage?.(id),
+					);
+				}
+				return;
 			}
-			return;
-		}
+			const id = subagentDockPanelId(subagentNarratorId);
+			const existing = api.getPanel(id);
+			if (existing) {
+				existing.api.setActive();
+				// An already-open panel is focused, and re-asked to jump. The nonce is what
+				// makes a SECOND click on the same row work: the panel's jump is latched per
+				// (narrator, target) so it fires once, and without a changing token the reader
+				// who scrolled away would click a live-looking control and see nothing.
+				if (messageId) {
+					existing.api.updateParameters({
+						panelType: "subagent",
+						subagentNarratorId,
+						highlightMessageId: messageId,
+						highlightRequestId: nextHighlightRequestId(),
+					} satisfies SubagentPanelParams);
+				}
+				return;
+			}
 
-		const existingSecondary = api.panels.find((panel) => {
-			const params = panel.params as NarratorDockPanelParams | undefined;
-			return params?.panelType !== "chat";
-		});
-		const chatPanel = api.getPanel(dockPanelId("chat"));
-		const params: NarratorDockPanelParams = {
-			panelType: "subagent",
-			subagentNarratorId,
-			// Carried as a PARAMETER rather than pushed through the `scrollToMessage`
-			// bridge because the panel does not exist yet at click time — there is nothing
-			// registered to call. The panel consumes it on mount.
-			...(messageId
-				? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
-				: {}),
-		};
-		const placement = resolveToolPlacement({
-			hasSecondaryGroup: !!existingSecondary?.group,
-			hasChatPanel: !!chatPanel,
-			surfaceWidth: api.width,
-		});
+			const existingSecondary = api.panels.find((panel) => {
+				const params = panel.params as NarratorDockPanelParams | undefined;
+				return params?.panelType !== "chat";
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const params: NarratorDockPanelParams = {
+				panelType: "subagent",
+				subagentNarratorId,
+				// Carried as a PARAMETER rather than pushed through the `scrollToMessage`
+				// bridge because the panel does not exist yet at click time — there is nothing
+				// registered to call. The panel consumes it on mount.
+				...(messageId
+					? { highlightMessageId: messageId, highlightRequestId: nextHighlightRequestId() }
+					: {}),
+			};
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
 
-		if (placement.mode === "within-secondary" && existingSecondary?.group) {
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.subagent,
+					params,
+					position: { referenceGroup: existingSecondary.group },
+				});
+				return;
+			}
+
+			if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.subagent,
+					params,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+				return;
+			}
+
 			api.addPanel<NarratorDockPanelParams>({
 				id,
 				component: NARRATOR_DOCK_COMPONENT.subagent,
 				params,
-				position: { referenceGroup: existingSecondary.group },
 			});
-			return;
-		}
-
-		if (placement.mode === "split-right" && chatPanel) {
-			api.addPanel<NarratorDockPanelParams>({
-				id,
-				component: NARRATOR_DOCK_COMPONENT.subagent,
-				params,
-				initialWidth: placement.initialWidth,
-				position: { referencePanel: chatPanel.id, direction: "right" },
-			});
-			return;
-		}
-
-		api.addPanel<NarratorDockPanelParams>({
-			id,
-			component: NARRATOR_DOCK_COMPONENT.subagent,
-			params,
-		});
-	}, []);
+		},
+		[narratorId],
+	);
 
 	// Same placement rule as the other secondary panels, but multi-instance: the
 	// panel id is derived from the path, so re-opening the same file focuses the
 	// existing viewer instead of stacking duplicates.
 	const openFilePanel = useCallback(
-		(filePath: string, fileName?: string) => {
+		(filePath: string, fileName?: string, options: FileOpenOptions = {}) => {
 			const api = apiRef.current;
 			if (!api || !filePath) return;
-			const id = fileDockPanelId(filePath);
+			const deviceId = options.deviceId ?? "local";
+			// Absent means the host's authority (legacy panels keep their existing ids).
+			const fileNarratorId =
+				options.fileNarratorId === narratorId ? undefined : options.fileNarratorId;
+			const navigation = {
+				deviceId,
+				fileNarratorId,
+				toolEdit: options.toolEdit,
+				selection: options.selection,
+				highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
+			};
+			const id = fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId);
 			const existing = api.getPanel(id);
 			if (existing) {
 				// Layouts written before file editing carried no host identity. Repair the
@@ -432,18 +469,15 @@ export function NarratorDockProvider({
 				// cast: corrupt persisted params are replaced wholesale — falling through to
 				// addPanel would throw on the duplicate id.
 				const current = existing.params as FilePanelParams | undefined;
-				if (current && typeof current.filePath === "string") {
-					if (current.hostNarratorId !== narratorId) {
-						existing.api.updateParameters({ ...current, hostNarratorId: narratorId });
-					}
-				} else {
-					existing.api.updateParameters({
-						panelType: "file",
-						hostNarratorId: narratorId,
-						filePath,
-						...(fileName ? { fileName } : {}),
-					});
-				}
+				existing.api.updateParameters({
+					...current,
+					panelType: "file",
+					hostNarratorId: narratorId,
+					filePath,
+					...navigation,
+					referenceOrigin: current?.referenceOrigin === true || options.referenceOrigin === true,
+					...(fileName ? { fileName } : {}),
+				});
 				existing.api.setActive();
 				return;
 			}
@@ -457,8 +491,20 @@ export function NarratorDockProvider({
 				panelType: "file",
 				hostNarratorId: narratorId,
 				filePath,
+				...navigation,
+				referenceOrigin: options.referenceOrigin === true,
 				...(fileName ? { fileName } : {}),
 			};
+			const browserPosition = resolveFileBrowserPosition(api, options.sourcePanelId);
+			if (browserPosition) {
+				api.addPanel<NarratorDockPanelParams>({
+					id,
+					component: NARRATOR_DOCK_COMPONENT.file,
+					params,
+					position: browserPosition,
+				});
+				return;
+			}
 			const placement = resolveToolPlacement({
 				hasSecondaryGroup: !!existingSecondary?.group,
 				hasChatPanel: !!chatPanel,
@@ -562,6 +608,17 @@ export function NarratorDockProvider({
 		[openToolPanel, closeToolPanel],
 	);
 
+	const registerAddFileReference = useCallback((fn: (reference: FileReference) => void) => {
+		bridgesRef.current.addFileReference = fn;
+		return () => {
+			if (bridgesRef.current.addFileReference === fn) bridgesRef.current.addFileReference = null;
+		};
+	}, []);
+	const addFileReference = useCallback(
+		(reference: FileReference) => bridgesRef.current.addFileReference?.(reference),
+		[],
+	);
+
 	// These callback props (onForkFromMessage, onBack, onMinimize) MUST keep stable
 	// references across parent renders. The sole call site in
 	// routes/narrators/$narratorId.tsx wraps each with useCallback, ensuring the
@@ -580,6 +637,10 @@ export function NarratorDockProvider({
 			apiRef,
 			fileModProps,
 			setFileModProps,
+			fileReferenceSelection,
+			setFileReferenceSelection,
+			registerAddFileReference,
+			addFileReference,
 			detailsProps,
 			setDetailsProps,
 			browserInfo,
@@ -638,6 +699,9 @@ export function NarratorDockProvider({
 		onBack,
 		onMinimize,
 		fileModProps,
+		fileReferenceSelection,
+		registerAddFileReference,
+		addFileReference,
 		detailsProps,
 		browserInfo,
 		openToolTypes,

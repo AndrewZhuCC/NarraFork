@@ -18,8 +18,11 @@ import {
 	clearCodexResponsesWebSocketSessions,
 	streamCodexResponsesWebSocket,
 } from "../codex-websocket";
+import { diagnosticsFromError } from "../error-diagnostics";
+import { isRetryableError, ProviderInvalidStateError } from "../error-handling";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
+import { ApiRequestDumpCollector } from "../request-dump";
 
 const CONNECTION_LIMIT_FRAME = JSON.stringify({
 	type: "error",
@@ -146,12 +149,13 @@ function userMessage(text: string) {
 
 async function runStream(
 	server: TestServer,
-	overrides: { sessionKey?: string; input?: string[] } = {},
+	overrides: { sessionKey?: string; input?: string[]; requestDump?: ApiRequestDumpCollector } = {},
 ): Promise<ParsedStreamEvent[]> {
 	const events: ParsedStreamEvent[] = [];
 	for await (const event of streamCodexResponsesWebSocket({
 		baseUrl: server.baseUrl,
 		apiKey: "sk-test",
+		requestDump: overrides.requestDump,
 		sessionKey: overrides.sessionKey ?? "narrator-1",
 		conversationId: "conv-1",
 		credentialId: "cred-1",
@@ -168,6 +172,26 @@ async function runStream(
 	}
 	return events;
 }
+
+test("raw malformed frames and close reasons survive retries without mixing attempts", async () => {
+	activeServer = startServer(({ requestIndex, send, close }) => {
+		if (requestIndex === 0) {
+			send("not-json 中");
+			close(1008, "websocket_connection_limit_reached");
+		} else for (const frame of completedFrames(`r-${requestIndex}`, "ok")) send(frame);
+	});
+	const first = new ApiRequestDumpCollector();
+	await runStream(activeServer, { requestDump: first });
+	expect(first.snapshot().attempts?.[0].response?.bodyText).toContain("not-json 中\n");
+	expect(first.snapshot().attempts?.[0].response?.bodyText).toContain("[websocket close 1008]");
+	expect(first.snapshot().response?.bodyText).toContain("response.completed");
+	expect(first.snapshot().response?.bodyText).not.toContain("not-json");
+	const before = JSON.stringify(first.snapshot());
+	const second = new ApiRequestDumpCollector();
+	await runStream(activeServer, { requestDump: second });
+	expect(JSON.stringify(first.snapshot())).toBe(before);
+	expect(second.snapshot().response?.bodyText).toContain("r-2");
+});
 
 function collectText(events: ParsedStreamEvent[]): string {
 	return events.map((event) => event.text ?? "").join("");
@@ -193,7 +217,7 @@ function createChatProvider(server: TestServer): OpenAIProvider {
 async function runChat(
 	provider: OpenAIProvider,
 	overrides: Partial<ChatParams> = {},
-	onEvent?: (event: ParsedStreamEvent) => void,
+	onEvent?: (event: ParsedStreamEvent) => "break" | undefined,
 ): Promise<{ events: ParsedStreamEvent[]; error: unknown }> {
 	const events: ParsedStreamEvent[] = [];
 	let error: unknown;
@@ -214,7 +238,7 @@ async function runChat(
 				: controller.signal,
 		})) {
 			events.push(event);
-			onEvent?.(event);
+			if (onEvent?.(event) === "break") break;
 		}
 	} catch (caught) {
 		error = caught;
@@ -237,6 +261,129 @@ function requestTurnState(server: TestServer, requestIndex: number): unknown {
 		| undefined;
 	return metadata?.["x-codex-turn-state"];
 }
+
+test.each([
+	["message", 503, true],
+	["close", 503, true],
+	["message", 400, false],
+	["close", 400, false],
+] as const)("preserves string error text and structured retry classification (%s, %i)", async (delivery, status, retryable) => {
+	// No retry keywords in the message: classification must use the supplied status.
+	const message = "backend rejected this request";
+	const frame = JSON.stringify({ type: "error", status, error: message });
+	const server = startServer(({ send, close }) => {
+		if (delivery === "message") send(frame);
+		else close(1011, frame);
+	});
+	activeServer = server;
+
+	// No requestDump collector: correct errors cannot depend on dump being enabled.
+	const result = await runChat(createChatProvider(server));
+	expect(result.error).toBeInstanceOf(ProviderInvalidStateError);
+	expect(result.error).toMatchObject({ message, status, code: "api_error" });
+	expect(diagnosticsFromError(result.error)).toMatchObject({ message, statusCode: status });
+	expect(isRetryableError(result.error)).toBe(retryable);
+	expect(server.requests).toHaveLength(1);
+});
+
+test("preserves detail, code and nested statusCode on a typed WS error", async () => {
+	const server = startServer(({ send }) => {
+		send(
+			JSON.stringify({
+				type: "error",
+				error: { detail: "upstream rejected", code: "gateway_failure", statusCode: 503 },
+			}),
+		);
+	});
+	activeServer = server;
+	const result = await runChat(createChatProvider(server));
+	expect(result.error).toMatchObject({
+		message: "upstream rejected",
+		code: "gateway_failure",
+		status: 503,
+		retryable: true,
+	});
+	expect(diagnosticsFromError(result.error)).toMatchObject({
+		message: "upstream rejected",
+		code: "gateway_failure",
+		statusCode: 503,
+	});
+});
+
+test.each([
+	false,
+	true,
+])("surfaces errors inside completed frames instead of an empty response (usage=%s)", async (withUsage) => {
+	const server = startServer(({ send }) => {
+		send(
+			JSON.stringify({
+				type: "response.completed",
+				response: {
+					id: "failed-response",
+					status: "failed",
+					error: { message: "upstream rejected", code: "server_error", statusCode: 503 },
+					...(withUsage ? { usage: { input_tokens: 4, output_tokens: 0 } } : {}),
+				},
+			}),
+		);
+	});
+	activeServer = server;
+	const result = await runChat(createChatProvider(server));
+	expect(result.error).toBeUndefined();
+	expect(result.events.find((event) => event.invalidState)?.invalidState).toMatchObject({
+		message: "upstream rejected",
+		reason: "server_error",
+		diagnostics: { message: "upstream rejected", code: "server_error", statusCode: 503 },
+	});
+	expect(result.events.filter((event) => event.usage)).toHaveLength(withUsage ? 1 : 0);
+	expect(server.requests).toHaveLength(1);
+});
+
+test("empty error sentinels on metadata and completed frames do not fail a healthy turn", async () => {
+	const server = startServer(({ send }) => {
+		send(JSON.stringify({ type: "response.metadata", status: 200, message: "ok", error: {} }));
+		send(JSON.stringify({ type: "response.output_text.delta", delta: "ok" }));
+		send(
+			JSON.stringify({
+				type: "response.completed",
+				response: {
+					id: "healthy",
+					status: "completed",
+					error: {},
+					usage: { input_tokens: 2, output_tokens: 1 },
+				},
+			}),
+		);
+	});
+	activeServer = server;
+	const result = await runChat(createChatProvider(server));
+	expect(result.error).toBeUndefined();
+	expect(result.events.some((event) => event.invalidState)).toBe(false);
+	expect(collectText(result.events)).toBe("ok");
+});
+
+test("an explicit policy refusal outranks an incomplete output-limit reason", async () => {
+	const server = startServer(({ send }) => {
+		send(
+			JSON.stringify({
+				type: "response.incomplete",
+				response: {
+					status: "incomplete",
+					incomplete_details: { reason: "max_output_tokens" },
+					error: { code: "cyber_policy", message: "blocked" },
+				},
+			}),
+		);
+	});
+	activeServer = server;
+	const result = await runChat(createChatProvider(server));
+	expect(result.error).toBeUndefined();
+	expect(result.events.find((event) => event.invalidState)?.invalidState).toMatchObject({
+		reason: "cyber_policy",
+		message: "blocked",
+	});
+	expect(server.requests).toHaveLength(1);
+});
 
 test("reconnects and completes the turn when upstream reports its connection limit", async () => {
 	const server = startServer(({ requestIndex, send }) => {
@@ -676,4 +823,152 @@ test("an explicit upstream reset clears the sticky token retained for resumable 
 	expect(server.requests[1]?.connectionIndex).toBe(1);
 	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
 	expect(requestTurnState(server, 1)).toBeUndefined();
+});
+
+const CYBER_POLICY_FRAME = JSON.stringify({
+	type: "error",
+	status: 400,
+	error: {
+		type: "invalid_request_error",
+		code: "cyber_policy",
+		message: "Request blocked by cyber safety policy",
+	},
+});
+
+test("a policy-violation error frame ends the turn as invalidState — never retried, never thrown", async () => {
+	const server = startServer(({ send }) => {
+		send(CYBER_POLICY_FRAME);
+	});
+	activeServer = server;
+
+	const events = await runStream(server);
+
+	// The violation surfaces through the same terminal channel a streamed
+	// response.failed takes, so the loop classifies it content_filter and the
+	// credential pool records neither a success nor a failure.
+	const invalid = events.find((event) => event.invalidState);
+	expect(invalid?.invalidState?.reason).toBe("cyber_policy");
+	expect(invalid?.invalidState?.message).toBe("Request blocked by cyber safety policy");
+	// Exactly one request on one connection: no reconnect, no resend, no SSE fallback.
+	expect(server.requests).toHaveLength(1);
+	expect(server.connectionCount()).toBe(1);
+});
+
+test("a policy violation delivered on the close frame still ends the turn as invalidState", async () => {
+	const server = startServer(({ close }) => {
+		close(1008, CYBER_POLICY_FRAME);
+	});
+	activeServer = server;
+
+	const events = await runStream(server);
+
+	const invalid = events.find((event) => event.invalidState);
+	expect(invalid?.invalidState?.reason).toBe("cyber_policy");
+	expect(server.requests).toHaveLength(1);
+	expect(server.connectionCount()).toBe(1);
+});
+
+test.each([
+	["error frame", "cyber_policy"],
+	["close reason", "cyber_policy"],
+	["truncated close reason", "cyber_policy"],
+	["response.failed", "cyber_policy"],
+	["response.incomplete", "cyber_policy"],
+	["response.failed", "server_error"],
+	["response.completed", "server_error"],
+	["response.completed", "cyber_policy"],
+	["response.incomplete", "content_filter"],
+	["response.incomplete", "max_output_tokens"],
+])("discards the chain when the consumer immediately breaks on invalidState (%s: %s)", async (delivery, reason) => {
+	const server = startServer(({ requestIndex, send, close }) => {
+		if (requestIndex === 1) {
+			if (delivery === "error frame") {
+				send(CYBER_POLICY_FRAME);
+			} else if (delivery === "close reason") {
+				// Keep this valid JSON within the RFC 6455 close-reason limit so it
+				// exercises the structured close branch, not the truncated fallback.
+				close(1008, JSON.stringify({ error: { code: reason, message: "blocked" } }));
+			} else if (delivery === "truncated close reason") {
+				const truncated = CYBER_POLICY_FRAME.slice(0, 123);
+				expect(() => JSON.parse(truncated)).toThrow();
+				close(1008, truncated);
+			} else {
+				send(
+					JSON.stringify({
+						type: delivery,
+						response: {
+							id: "resp-rejected",
+							...(delivery !== "response.incomplete"
+								? { status: "failed", error: { code: reason, message: "blocked" } }
+								: { incomplete_details: { reason } }),
+						},
+					}),
+				);
+			}
+			return;
+		}
+		if (requestIndex === 0) send(turnStateFrame());
+		for (const frame of completedFrames(`resp-${requestIndex}`, "ok")) send(frame);
+	});
+	activeServer = server;
+	const provider = createChatProvider(server);
+	const { default: WebSocket } = await import("ws");
+	// Inspect the real client's state, not a delayed server-side close callback.
+	let sendingClient: InstanceType<typeof WebSocket> | undefined;
+	const originalSend = WebSocket.prototype.send;
+	const sendSpy = spyOn(WebSocket.prototype, "send").mockImplementation(function (
+		this: InstanceType<typeof WebSocket>,
+		...args
+	) {
+		sendingClient = this;
+		Reflect.apply(originalSend, this, args);
+	});
+	let clientClosedAtInvalidState = false;
+	try {
+		const first = await runChat(provider);
+		expect(first.error).toBeUndefined();
+		expect(collectText(first.events)).toBe("ok");
+
+		const rejected = await runChat(
+			provider,
+			{ history: [userMessage("hello")], content: "blocked" },
+			(event) => {
+				if (event.invalidState) {
+					clientClosedAtInvalidState = sendingClient?.readyState === WebSocket.CLOSED;
+					// The real agent loop returns here. Draining the generator would
+					// execute cleanup AFTER yield and hide the leaked socket/chain.
+					return "break";
+				}
+			},
+		);
+		expect(rejected.error).toBeUndefined();
+		expect(rejected.events.filter((event) => event.invalidState)).toHaveLength(1);
+		expect(rejected.events.find((event) => event.invalidState)?.invalidState?.reason).toBe(reason);
+		// No replay, reconnect, or fallback within the rejected chat. Its request
+		// really continued a successful response; there is stale state to discard.
+		expect(server.requests).toHaveLength(2);
+		expect(server.connectionCount()).toBe(1);
+		expect(server.requests[1]?.connectionIndex).toBe(0);
+		expect(server.requests[1]?.body.previous_response_id).toBe("resp-0");
+		expect(server.requests[1]?.body.input).toEqual([userMessage("blocked")]);
+
+		const history = [userMessage("hello"), userMessage("blocked")];
+		const next = await runChat(provider, { history, content: "next" });
+		expect(next.error).toBeUndefined();
+		expect(collectText(next.events)).toBe("ok");
+		expect(server.requests).toHaveLength(3);
+		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+		expect(server.requests[2]?.body.input).toEqual([...history, userMessage("next")]);
+		expect(server.requests[2]?.connectionIndex).toBe(1);
+		expect(server.connectionCount()).toBe(2);
+		expect(clientClosedAtInvalidState).toBe(true);
+		// Only the connection-scoped response chain is discarded. Sticky routing
+		// and the credential identity retain their existing semantics.
+		expect(requestTurnState(server, 2)).toBe("sticky-1");
+		for (const headers of server.handshakes) {
+			expect(headers.get("authorization")).toBe("Bearer sk-local-test-only");
+		}
+	} finally {
+		sendSpy.mockRestore();
+	}
 });

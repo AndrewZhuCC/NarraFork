@@ -39,6 +39,8 @@ export const DEFAULTS: NarraForkSettings = {
 		// wizard makes selecting one a hard gate before anything can run.
 		defaultModel: "",
 		defaultPermissionMode: "acceptEdits",
+		defaultNarratorVisibility: "auto",
+		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
 		// Deliberately empty: an unset summary model follows the default model
 		// (resolveConfiguredSummaryModel). Shipping a concrete model here would
@@ -63,6 +65,7 @@ export const DEFAULTS: NarraForkSettings = {
 			search: [],
 			review: [],
 		},
+		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
 		requestDumpEnabled: false,
@@ -412,6 +415,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string",
 		valid: '"default" | "acceptEdits" | "bypassPermissions" | "readOnly" | "dontAsk"',
 	},
+	"agent.defaultNarratorVisibility": {
+		desc: "新建叙述者的默认可见性，仅在未显式指定时生效。auto 保持章节叙述者 project、独立叙述者 private；不改变已有会话或分叉继承。可操作性由独立的 defaultNarratorWriteAudience 配置决定，并按最终可见性收窄。",
+		type: "string",
+		valid: '"auto" | "private" | "public"',
+	},
+	"agent.defaultNarratorWriteAudience": {
+		desc: "新建叙述者的默认可操作性，仅在未显式指定 writeAudience 时生效。auto 随最终可见性采用最宽合法写权限；owner、project、public 会按最终可见性收窄，绝不扩大可见性。不改变已有会话、分叉或子代理的继承。",
+		type: "string",
+		valid: '"auto" | "owner" | "project" | "public"',
+	},
 	"agent.defaultStartInPlanMode": {
 		desc: "新建叙述者是否默认进入计划模式。计划模式是独立 trait，不再作为权限模式保存。",
 		type: "boolean",
@@ -473,6 +486,12 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.subagentAllowedModels.review": {
 		desc: "review 子代理允许的模型池。空数组表示无限制。",
 		type: "string[]",
+	},
+	"agent.subagentModelReasoningEfforts": {
+		desc: "子代理模型池的可选固定思考等级。仅影响之后新建的子代理，覆盖调用方指定等级；缺席条目不覆盖原有继承。",
+		type: "object",
+		valid:
+			"explore/plan/search/review/general；每类最多 50 项；模型引用最长 200；等级 none/low/medium/high/xhigh/max；默认 {}",
 	},
 	"agent.legacyEncoding": {
 		desc: "启用非 UTF-8 编码检测（GBK、Shift_JIS 等）。启用后文件读写使用 chardet 自动检测并保留原始编码。禁用时仅使用 UTF-8。",

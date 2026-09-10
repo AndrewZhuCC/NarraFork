@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-violation";
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { CodexRetainedUserMessage } from "@shared/compact-message";
@@ -25,7 +26,11 @@ import {
 } from "./codex-websocket";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
-import { ProviderInvalidStateError } from "./error-handling";
+import {
+	classifyInvalidState,
+	isCompletionLimitReason,
+	ProviderInvalidStateError,
+} from "./error-handling";
 import { isGatewayEventType, parseGatewayDataEvent, parseGatewaySSEEvent } from "./gateway-events";
 import { buildImageGenerationSavedPathInstruction } from "./image-generation";
 import { buildOpencodeSessionHeader } from "./opencode-session";
@@ -38,7 +43,7 @@ import type {
 	ProviderAdapter,
 	ProviderTextCitation,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
+import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -987,12 +992,15 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		const requestHeaders = this.buildHeaders(apiKey, params.conversationId);
-		params.requestDump?.setRequest({
-			transport: "http",
-			url: endpoint,
-			headers: sanitizeHeaders(requestHeaders),
-			body,
-		});
+		params.requestDump?.beginResponseAttempt(
+			{
+				transport: "http",
+				url: endpoint,
+				headers: sanitizeHeaders(requestHeaders),
+				body,
+			},
+			settings.agent?.requestDumpMaxSize,
+		);
 
 		const bodyText = JSON.stringify(body);
 		if (this.apiMode === "codex") {
@@ -1005,44 +1013,53 @@ export class OpenAIProvider implements ProviderAdapter {
 			headers: requestHeaders,
 			body: bodyText,
 			signal: params.signal,
+		}).catch((error) => {
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
+
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
-		if (!response.ok) {
-			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
-			throw createOpenAIApiError(response, errText);
-		}
-
 		if (!response.body) {
-			throw new Error("OpenAI API returned no body");
+			const error = response.ok
+				? new Error("OpenAI API returned no body")
+				: createOpenAIApiError(response, "");
+			params.requestDump?.setResponseError(error);
+			params.requestDump?.finishResponseCapture(false);
+			throw error;
 		}
-
-		if (usesResponsesEndpoint(this.apiMode)) {
-			// Responses API & Codex both use the native Responses SSE format
-			for await (const evt of _parseResponsesAPIStream(response.body)) {
-				yield stampReasoningSource(evt, this.getActiveReasoningSource());
+		const capture = captureResponseStream(response.body, params.requestDump);
+		try {
+			if (!response.ok) {
+				const errorCapture = new BoundedUtf8Capture();
+				const reader = capture.stream.getReader();
+				try {
+					while (errorCapture.received < errorCapture.limit) {
+						const { done, value } = await readWithTimeout(reader);
+						if (done) break;
+						errorCapture.append(value);
+					}
+				} finally {
+					void reader.cancel().catch(() => {});
+				}
+				throw createOpenAIApiError(response, errorCapture.text());
 			}
-		} else {
-			yield* this.parseSSEStreamWithDetection(response.body);
-		}
-
-		if (responseTextPromise) {
-			const bodyText = await responseTextPromise;
-			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
-			params.requestDump?.setResponseBodyTextWithLimit(bodyText, maxSize);
+			if (usesResponsesEndpoint(this.apiMode)) {
+				for await (const evt of _parseResponsesAPIStream(capture.stream)) {
+					yield stampReasoningSource(evt, this.getActiveReasoningSource());
+				}
+			} else {
+				yield* this.parseSSEStreamWithDetection(capture.stream);
+			}
+		} catch (error) {
+			params.requestDump?.setResponseError(error);
+			throw error;
+		} finally {
+			capture.finish();
 		}
 	}
 
@@ -1349,9 +1366,20 @@ export class OpenAIProvider implements ProviderAdapter {
 			const raw = await response.text();
 			const json = parseResponsesJson(raw);
 			const text = extractResponsesText(json.output);
+			// Reuse stream error precedence: a policy/API failure is not a truncation.
+			const invalid = parseResponsesAPIEvent({ response: json }, new Map(), new Map()).find(
+				(event) => event.invalidState,
+			)?.invalidState;
+			const outputTruncated = !!text && !!invalid && isCompletionLimitReason(invalid.reason);
+			if (invalid && !outputTruncated) {
+				throw new ProviderInvalidStateError(invalid.reason, invalid.message, {
+					diagnostics: invalid.diagnostics,
+				});
+			}
 			if (text) await options?.onTextDelta?.(text);
 			return {
 				text,
+				...(outputTruncated && { outputTruncated }),
 				usage: parsedUsageToUsageData(json.usage),
 			};
 		}
@@ -1362,6 +1390,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
+		let outputTruncated = false;
 		for await (const evt of _parseResponsesAPIStream(response.body)) {
 			if (evt.text) {
 				text += evt.text;
@@ -1370,6 +1399,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
+				if (text && isCompletionLimitReason(evt.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
 					`OpenAI Responses stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
@@ -1377,7 +1410,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage };
+		return { text, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	private async requestChatCompletionsTextWithMeta(
@@ -1406,7 +1439,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (contentType.includes("application/json")) {
 			const raw = await response.text();
 			const json = parseJsonWithPreview<{
-				choices?: Array<{ message?: { content?: string } }>;
+				choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+				error?: unknown;
 				usage?: {
 					prompt_tokens?: number;
 					completion_tokens?: number;
@@ -1415,9 +1449,26 @@ export class OpenAIProvider implements ProviderAdapter {
 				};
 			}>(raw, "OpenAI chat/completions returned non-JSON payload");
 			const text = json.choices?.[0]?.message?.content ?? "";
+			const finishReason = json.choices?.[0]?.finish_reason;
+			const error = parseUpstreamErrorEnvelope(json);
+			if (error) {
+				throw new ProviderInvalidStateError(error.code ?? "api_error", error.message);
+			}
+			const outputTruncated = !!finishReason && isCompletionLimitReason(finishReason);
+			if (
+				(outputTruncated && !text) ||
+				finishReason === "content_filter" ||
+				finishReason === "model_context_window_exceeded"
+			) {
+				throw new ProviderInvalidStateError(
+					finishReason ?? "api_error",
+					`OpenAI Chat Completions stopped: ${finishReason}`,
+				);
+			}
 			if (text) await options?.onTextDelta?.(text);
 			return {
 				text,
+				...(outputTruncated && { outputTruncated }),
 				contextPercent: undefined,
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
 			};
@@ -1429,6 +1480,7 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		let text = "";
 		let usage: GenerateMetaResult["usage"] = null;
+		let outputTruncated = false;
 		for await (const evt of parseSSEStream(response.body)) {
 			if (evt.text) {
 				text += evt.text;
@@ -1437,6 +1489,10 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (evt.reasoning) await options?.onReasoningDelta?.(evt.reasoning);
 			if (evt.usage) usage = parsedUsageToUsageData(evt.usage);
 			if (evt.invalidState) {
+				if (text && isCompletionLimitReason(evt.invalidState.reason)) {
+					outputTruncated = true;
+					continue;
+				}
 				throw new ProviderInvalidStateError(
 					evt.invalidState.reason,
 					`OpenAI Chat Completions stream error (${evt.invalidState.reason}): ${evt.invalidState.message}`,
@@ -1444,7 +1500,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, contextPercent: undefined, usage };
+		return { text, contextPercent: undefined, usage, ...(outputTruncated && { outputTruncated }) };
 	}
 
 	/**
@@ -1557,13 +1613,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				resetSessionBeforeRequest: params.resetUpstreamSession,
 				userAgent: fingerprint.userAgent,
 				extraHeaders: fingerprint.headers,
-				onRequestPrepared: ({ url, headers, body }) =>
-					params.requestDump?.setRequest({
-						transport: "websocket",
-						url,
-						headers: sanitizeHeaders(headers),
-						body,
-					}),
+				requestDump: params.requestDump,
+				requestDumpMaxBytes: settings.agent?.requestDumpMaxSize,
 			})) {
 				yield stampReasoningSource(event, this.getActiveReasoningSource());
 			}
@@ -2154,6 +2205,7 @@ async function* _parseResponsesAPIStream(
 	let lineCount = 0;
 	let sawResponsesEvent = false;
 	let completed = false;
+	let completionLimited = false;
 	let terminalError = false;
 	let lastParseError: { error: string; preview: string } | undefined;
 
@@ -2211,8 +2263,13 @@ async function* _parseResponsesAPIStream(
 			sawResponsesEvent = true;
 		}
 		const events = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+		for (const evt of events) {
+			if (!evt.invalidState) continue;
+			// Output limits end generation, not accounting: relays can still send usage.
+			if (isCompletionLimitReason(evt.invalidState.reason)) completionLimited = true;
+			else terminalError = true;
+		}
 		if (type === "response.completed") completed = true;
-		if (events.some((evt) => evt.invalidState)) terminalError = true;
 		return events;
 	};
 
@@ -2254,6 +2311,7 @@ async function* _parseResponsesAPIStream(
 				for (const evt of events) {
 					yield evt;
 				}
+				if (terminalError) return;
 			}
 		}
 		// Process remaining buffer
@@ -2265,7 +2323,8 @@ async function* _parseResponsesAPIStream(
 				yield evt;
 			}
 		}
-		if (!completed && !terminalError) {
+		if (terminalError || completionLimited) return;
+		if (!completed) {
 			const parseDetail = lastParseError
 				? ` Last malformed SSE data: ${lastParseError.error}; preview=${lastParseError.preview}`
 				: sawResponsesEvent
@@ -2462,37 +2521,7 @@ export function parseResponsesAPIEvent(
 	reasoningAccum: Map<number, ResponsesReasoningAccum>,
 ): ParsedStreamEvent[] {
 	const type = chunk.type;
-	if (!type) {
-		// A frame with no `type` is not automatically meaningless: gateways relay bare
-		// `{"error":{"message":"..."}}` envelopes. Returning [] for those discarded the
-		// only explanation the user could have been given, and the turn was then
-		// reported as "the provider returned no content" — a local-configuration story
-		// for what is an upstream failure.
-		const envelope = parseUpstreamErrorEnvelope(chunk as unknown as Record<string, unknown>);
-		if (!envelope) return [];
-		const reason = envelope.code ?? "api_error";
-		return [
-			{
-				invalidState: {
-					reason,
-					message: envelope.message,
-					diagnostics: parseErrorDiagnostics(
-						{
-							...(chunk as unknown as Record<string, unknown>),
-							statusCode: envelope.statusCode,
-							message: envelope.message,
-						},
-						{
-							source: "provider",
-							phase: "sse_error",
-							reason,
-							message: envelope.message,
-						},
-					),
-				},
-			},
-		];
-	}
+	const payload = chunk as unknown as Record<string, unknown>;
 
 	// ── Extract usage from any event (bob_cx and similar gateways may include it anywhere) ──
 	const results: ParsedStreamEvent[] = [];
@@ -2515,6 +2544,93 @@ export function parseResponsesAPIEvent(
 				cachedInputTokens: usage.input_tokens_details?.cached_tokens ?? undefined,
 			},
 		});
+	}
+
+	// ── Actual response failure takes precedence over an outer "completed" label ──
+	// Only inspect the response envelope itself, never error fields in output items.
+	const response =
+		chunk.response && typeof chunk.response === "object" && !Array.isArray(chunk.response)
+			? (chunk.response as Record<string, unknown>)
+			: undefined;
+	const responseError = parseUpstreamErrorEnvelope(response);
+	const envelope = parseUpstreamErrorEnvelope(payload);
+	const failureState =
+		response?.status === "failed" || response?.status === "incomplete"
+			? response.status
+			: type === "response.failed"
+				? "failed"
+				: type === "response.incomplete"
+					? "incomplete"
+					: responseError
+						? "failed"
+						: undefined;
+	if (failureState || envelope || type === "error") {
+		const incompleteReason =
+			failureState === "incomplete" &&
+			typeof chunk.response?.incomplete_details?.reason === "string"
+				? chunk.response.incomplete_details.reason.trim() || undefined
+				: undefined;
+		const code = responseError?.code ?? envelope?.code;
+		const statusCode = responseError?.statusCode ?? envelope?.statusCode;
+		const flatError =
+			payload.error && typeof payload.error === "object" && !Array.isArray(payload.error)
+				? (payload.error as Record<string, unknown>)
+				: undefined;
+		const policyCode = [
+			responseError?.code,
+			envelope?.code,
+			chunk.response?.error?.code,
+			chunk.response?.error?.type,
+			flatError?.code,
+			flatError?.type,
+			incompleteReason,
+		]
+			.map((candidate) =>
+				typeof candidate === "string" ? normalizePolicyViolationCode(candidate) : null,
+			)
+			.find((candidate) => candidate != null);
+		// Policy blocks and other non-transient codes must not become completion-limit
+		// continuations. Incomplete reasons may override only transient codes/statuses;
+		// classification here uses neither prose nor user-configured retry overrides.
+		const preferIncompleteReason =
+			!code || classifyInvalidState(code, undefined, { statusCode }, []).category === "transient";
+		const reason =
+			policyCode ??
+			(preferIncompleteReason ? (incompleteReason ?? code) : code) ??
+			(failureState === "incomplete" ? "unknown" : "api_error");
+		const message =
+			responseError?.message ??
+			envelope?.message ??
+			(failureState === "incomplete"
+				? `Response incomplete: ${reason}`
+				: failureState === "failed"
+					? "Response failed"
+					: "Unknown API error");
+		results.push({
+			invalidState: {
+				reason,
+				message,
+				diagnostics: parseErrorDiagnostics(
+					{
+						...payload,
+						...response,
+						error: response?.error ?? payload.error,
+						statusCode,
+						code,
+						reason,
+						message,
+					},
+					{
+						source: response?.diagnostics || payload.diagnostics ? "gateway" : "provider",
+						phase: failureState ? `response_${failureState}` : "sse_error",
+						reason,
+						message,
+					},
+				),
+			},
+		});
+		// Usage is retained, but never finalize pending tools or a successful chain.
+		return results;
 	}
 
 	// ── Response created: capture response ID for previous_response_id chaining ──
@@ -2859,111 +2975,6 @@ export function parseResponsesAPIEvent(
 			}
 		}
 		// Note: usage is already extracted at the top of this function
-		return results;
-	}
-
-	// ── Error states ──
-	if (type === "response.failed") {
-		const response = chunk.response ?? {};
-		const responseError = response.error ?? {};
-		const errMsg = responseError.message ?? "Response failed";
-		const reason = String(responseError.code ?? responseError.type ?? "api_error") || "api_error";
-		const statusCode =
-			responseError.status_code ??
-			responseError.statusCode ??
-			response.status_code ??
-			response.statusCode ??
-			response.status;
-		const diagnosticsPayload = {
-			...(chunk as unknown as Record<string, unknown>),
-			error: responseError,
-			statusCode,
-			code: responseError.code ?? responseError.type,
-			message: errMsg,
-		};
-		results.push({
-			invalidState: {
-				reason,
-				message: errMsg,
-				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
-					source: "provider",
-					phase: "response_failed",
-					reason,
-					message: errMsg,
-				}),
-			},
-		});
-		return results;
-	}
-	if (type === "response.incomplete") {
-		const response = chunk.response ?? {};
-		const reason = response.incomplete_details?.reason ?? "unknown";
-		const message = `Response incomplete: ${reason}`;
-		const diagnosticsPayload = {
-			...(chunk as unknown as Record<string, unknown>),
-			statusCode: response.status_code ?? response.statusCode,
-			reason,
-			message,
-		};
-		results.push({
-			invalidState: {
-				reason,
-				message,
-				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
-					source: "provider",
-					phase: "response_incomplete",
-					reason,
-					message,
-				}),
-			},
-		});
-		return results;
-	}
-	// Handle standalone "error" events from the Responses API.
-	// OpenAI sends these as: { type: "error", error: { type, code, message, param } }
-	// or the older documented format: { type: "error", code, message, param }
-	if (type === "error") {
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic error event shape
-		const c = chunk as any;
-		const nested = c.error;
-		// The envelope parser is consulted first because it also reads `detail` /
-		// `description` / a string-valued `error`. Without it those payloads fell
-		// through to the "Unknown API error" placeholder, which is strictly worse than
-		// the text upstream actually sent.
-		const envelope = parseUpstreamErrorEnvelope(c as Record<string, unknown>);
-		const errMsg =
-			(nested && typeof nested === "object" ? nested.message : undefined) ??
-			c.message ??
-			envelope?.message ??
-			"Unknown API error";
-		const reason =
-			String(
-				(nested && typeof nested === "object" ? (nested.code ?? nested.type) : undefined) ??
-					c.code ??
-					"api_error",
-			) || "api_error";
-		const diagnosticsPayload = {
-			...(c as Record<string, unknown>),
-			statusCode:
-				c.statusCode ??
-				c.status_code ??
-				(nested && typeof nested === "object"
-					? (nested.statusCode ?? nested.status_code)
-					: undefined),
-			message: errMsg,
-		};
-		results.push({
-			invalidState: {
-				reason,
-				message: errMsg,
-				diagnostics: parseErrorDiagnostics(diagnosticsPayload, {
-					source: c.diagnostics ? "gateway" : "provider",
-					phase: "sse_error",
-					reason,
-					message: errMsg,
-				}),
-			},
-		});
 		return results;
 	}
 

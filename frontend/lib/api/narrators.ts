@@ -1,6 +1,11 @@
-import type { AsyncQuestion } from "@frontend/types/narrator";
+import type { AsyncQuestion, HumanAttentionDetail } from "@frontend/types/narrator";
 import type { UsageHistoryStats } from "@frontend/types/usage-history";
 import type { BackgroundTaskListPage } from "@shared/background-task-list";
+import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
+import type { FileReference } from "@shared/file-reference";
+import type { HumanAttentionPage } from "@shared/human-attention";
+import type { SubagentModelPools, SubagentModelUse } from "@shared/subagent-model-policy";
+import type { ToolEditPreview } from "@shared/tool-edit-preview";
 import {
 	ApiError,
 	absorbRenewedToken,
@@ -36,6 +41,30 @@ import type {
 	WhitelistDir,
 } from "./types";
 import { normalizeRuleTargetSelector, selectorToLegacyDeviceScope } from "./types";
+
+/** Persisted row identity; a provider's tool-use id alone need not be unique. */
+export interface ToolCallDetailRef {
+	toolCallId?: string;
+	messageId?: string;
+	/** Cache discriminator only; never a substitute for a row PK or message ref. */
+	executionAttempt?: number;
+}
+
+export function toolCallDetailQueryKey(
+	narratorId: string,
+	toolUseId: string,
+	ref?: ToolCallDetailRef,
+) {
+	return [
+		"narrators",
+		narratorId,
+		"tool-calls",
+		toolUseId,
+		ref?.toolCallId ?? null,
+		ref?.messageId ?? null,
+		ref?.executionAttempt ?? null,
+	] as const;
+}
 
 export function shouldClearEditDraft(result: unknown): result is true {
 	return result === true;
@@ -85,18 +114,24 @@ function sanitizeDownloadName(value: string): string | null {
 export type RevertScope = "narrator" | "workspace";
 
 /**
- * Why a narrator-scoped rollback reports no files for a window.
+ * Why a rollback scope is unavailable for a window.
  *
- * `nothing_owned` is the one value that arrives together with `available: true`:
- * the boundaries were recorded and prove this narrator changed nothing, which is
- * an answer rather than a missing capability. The others mean the scope could not
- * be computed, and the workspace scope is offered instead.
+ * `nothing_owned` is the only non-blocking reason: with `available: true`, it
+ * proves this narrator changed nothing. Every other reason blocks file rollback,
+ * without automatically selecting a wider scope or replaying legacy tool inputs.
  */
 export type ScopedRevertUnavailableReason =
 	| "no_boundaries"
 	| "snapshot_missing"
 	| "no_workspace"
 	| "git_unsupported"
+	| "window_too_large"
+	| "legacy_unverified"
+	| "execution_unavailable"
+	| "runtime_reload_required"
+	| "incomplete_coverage"
+	| "unsupported_target"
+	| "pending_operations"
 	| "nothing_owned";
 
 /**
@@ -106,6 +141,7 @@ export type ScopedRevertUnavailableReason =
  * translate them.
  */
 export type RevertWarning =
+	| FileChangeEvidenceUncertaintyWarning
 	| {
 			code: "WORKSPACE_SCOPE_DISCARDED_OTHERS";
 			otherActorCount: number;
@@ -124,7 +160,99 @@ export type RevertWarning =
 			sampleFilePaths: string[];
 	  };
 
+export type RevertAction = "rollback_to_block" | "delete_tool_block" | "revert_files";
+
+export interface RevertActionTarget {
+	messageId: string;
+	blockIndex?: number;
+}
+
+/** The exact durable plan reviewed by the user, never a request to re-plan. */
+export interface RevertPlanConfirmation {
+	planId: string;
+	planHash: string;
+	action: RevertAction;
+}
+
+export interface RevertActionConfirmOptions {
+	skipRevert: boolean;
+	scope?: RevertScope;
+	revertPlan?: RevertPlanConfirmation;
+}
+
+export interface RevertActionPlan {
+	id: string;
+	planHash: string | null;
+	status: string;
+	coverageComplete: boolean;
+	expectedFileCount: number;
+	expiresAt: string;
+	expired: boolean;
+	kind: "revert" | "history_delete" | "rollback_to_block";
+	selectorKind: string;
+}
+
+export interface RevertHistorySummary {
+	deletedMessageCount: number;
+	deletedBlockCount: number;
+}
+
+export interface RevertActionPreview {
+	action: RevertAction;
+	plan: RevertActionPlan | null;
+	executable: false;
+	historySummary: RevertHistorySummary | null;
+	unavailable?: ScopedRevertUnavailableReason;
+}
+
+/** Bounded metadata only; snapshots and file contents are not loaded by this UI. */
+export interface RevertPlanFile {
+	id: string;
+	fileKey: string;
+	sequence: number;
+	identityJson: {
+		deviceId: string;
+		displayPath: string;
+		lexicalPath: string;
+		canonicalPath: string;
+	};
+	expectedStateJson: { kind: "absent" | "regular" | "symlink" | "unknown" };
+	desiredStateJson: { kind: "absent" | "regular" | "symlink" };
+}
+
+export interface RevertPlanFilesPage {
+	items: RevertPlanFile[];
+	hasMore: boolean;
+	nextCursor: { fileKey: string } | null;
+	executable: false;
+}
+
+export interface RevertPlanApplyResult {
+	planId: string;
+	status: "committed" | "compensated" | "recovery_required";
+	journalStatus: string;
+	settling: boolean;
+	reason: string | null;
+}
+
+export type RevertPlanPreviewIssue =
+	| "expired"
+	| "not_prepared"
+	| "preview_failed"
+	| "incomplete_files"
+	| "window_too_large"
+	| "reload_required";
+
+/** UI-only review state, tied to one target and one opening/reload. */
+export interface RevertPlanReview extends Omit<RevertActionPlan, "id"> {
+	planId: string;
+	action: RevertAction;
+	previewKey: string;
+	filesComplete: boolean;
+}
+
 export interface RevertPreviewFile {
+	fileKey?: string;
 	deviceId: string;
 	filePath: string;
 	willBeDeleted: boolean;
@@ -140,8 +268,8 @@ export interface RevertPreviewFileWithContent extends RevertPreviewFile {
  *
  * Narrower than {@link RevertScopePreviews}: a block is one recorded call, so there
  * is no scope to choose between. `available: false` means the change cannot be
- * reversed precisely (no recorded boundary, a remote workspace) and deletion falls
- * back to replaying tool inputs, which cannot see what Bash or an editor wrote.
+ * reversed safely. Only history-only deletion is permitted; legacy tool inputs
+ * are not evidence that authorizes writing files.
  */
 export interface BlockDeletePreview {
 	available: boolean;
@@ -155,18 +283,25 @@ export interface BlockDeletePreview {
 /**
  * Both rollback scopes for one window, so the dialog can compare them.
  *
- * Optional because a workspace without tree snapshots (pre-snapshot history, a
- * non-git directory, a remote device) is previewed through the legacy replay path,
- * which reports `affectedFiles` alone. Callers must therefore treat a missing
- * `scope` as "the server chose for me" and not as "nothing can be reverted".
+ * Scope metadata remains optional for older preview responses. Missing metadata
+ * is unverified, not permission to replay `affectedFiles` or proof of no changes.
+ * `scope` is only a recommendation; workspace rollback always needs an explicit
+ * user choice and an available, complete preview.
  */
 export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreviewFile> {
+	/** Present only for the new action-preview + paged-files flow. */
+	revertPlan?: RevertPlanReview;
+	previewIssue?: RevertPlanPreviewIssue;
+	previewError?: string;
 	scope?: RevertScope;
 	affectedFiles: F[];
 	narratorScope?: {
 		available: boolean;
 		reason?: ScopedRevertUnavailableReason;
 		files: F[];
+		/** A truncated preview cannot authorize a file rollback. */
+		totalFileCount?: number;
+		hasMore?: boolean;
 		/** Paths another actor changed in the same regions; blocks a scoped rollback. */
 		conflicts: string[];
 		/** Subagent changes this rollback would also revert. */
@@ -174,6 +309,7 @@ export interface RevertScopePreviews<F extends RevertPreviewFile = RevertPreview
 	};
 	workspaceScope?: {
 		available: boolean;
+		reason?: ScopedRevertUnavailableReason;
 		files: F[];
 		warnings: RevertWarning[];
 	};
@@ -272,6 +408,14 @@ function withCompatibleTarget<T extends { selector: RuleTargetSelector }>(data: 
 	return { ...data, deviceScope: selectorToLegacyDeviceScope(data.selector) };
 }
 
+export interface NarratorCustomTraits {
+	subagentModelRestriction: { version: 1; pools: SubagentModelPools } | null;
+	disabledTools: { version: 1; tools: string[] } | null;
+	blockedSkills: { version: 1; all: boolean; names: string[] } | null;
+	availableModels: SubagentModelUse[];
+	availableTools: { name: string; description: string; category: string }[];
+}
+
 export const narratorsApi = {
 	listNarrators: (opts?: {
 		chapterId?: string;
@@ -344,24 +488,32 @@ export const narratorsApi = {
 		request<{
 			hasDraft: boolean;
 			text: string;
+			fileReferences?: FileReference[];
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`),
-	updateNarratorDraft: (id: string, text: string, baseRevision: number, sourceId?: string) =>
+	updateNarratorDraft: (
+		id: string,
+		text: string,
+		baseRevision: number,
+		sourceId?: string,
+		fileReferences?: FileReference[],
+	) =>
 		request<{
 			ok: boolean;
 			traits: string[];
 			hasDraft: boolean;
 			text: string;
+			fileReferences?: FileReference[];
 			revision: number;
 			updatedAt: string | null;
 			updatedBy: string | null;
 			sourceId: string | null;
 		}>(`/narrators/${id}/draft`, {
 			method: "PUT",
-			body: JSON.stringify({ text, baseRevision, sourceId }),
+			body: JSON.stringify({ text, baseRevision, sourceId, fileReferences }),
 		}),
 	getNarratorUsageStats: (id: string, opts?: { includeSubagents?: boolean }) => {
 		const params = new URLSearchParams();
@@ -558,8 +710,35 @@ export const narratorsApi = {
 			fileName: parseContentDispositionFileName(res.headers.get("content-disposition")),
 		};
 	},
-	getToolCallDetail: (narratorId: string, toolUseId: string) =>
-		request<ApiEntity>(`/narrators/${narratorId}/tool-calls/${toolUseId}`),
+	getToolCallDetail: (
+		narratorId: string,
+		toolUseId: string,
+		ref?: ToolCallDetailRef,
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams();
+		if (ref?.toolCallId !== undefined) params.set("toolCallId", ref.toolCallId);
+		if (ref?.messageId !== undefined) params.set("messageId", ref.messageId);
+		const query = params.size ? `?${params}` : "";
+		return request<ApiEntity>(
+			`/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}${query}`,
+			{ signal },
+		);
+	},
+	getToolEditPreview: (
+		narratorId: string,
+		toolUseId: string,
+		ref?: ToolCallDetailRef,
+		signal?: AbortSignal,
+	) => {
+		const params = new URLSearchParams();
+		if (ref?.toolCallId !== undefined) params.set("toolCallId", ref.toolCallId);
+		if (ref?.messageId !== undefined) params.set("messageId", ref.messageId);
+		return request<ToolEditPreview>(
+			`/narrators/${encodeURIComponent(narratorId)}/tool-calls/${encodeURIComponent(toolUseId)}/file-edit-preview${params.size ? `?${params}` : ""}`,
+			{ signal },
+		);
+	},
 	interruptNarrator: (id: string) =>
 		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
 	detachSubagent: (id: string) =>
@@ -646,6 +825,7 @@ export const narratorsApi = {
 			keepTextFiles?: { index: number; filename: string }[];
 			newImages?: File[];
 			newTextFiles?: File[];
+			fileReferences?: FileReference[];
 		},
 	) => {
 		const path = `/narrators/${narratorId}/buffer/${messageId}`;
@@ -656,6 +836,7 @@ export const narratorsApi = {
 					text,
 					...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 					...(opts?.keepTextFiles ? { keepTextFiles: opts.keepTextFiles } : {}),
+					fileReferences: opts?.fileReferences,
 				}),
 			});
 		}
@@ -663,6 +844,9 @@ export const narratorsApi = {
 		formData.append("text", text);
 		if (opts.keepImageIds) formData.append("keepImageIds", JSON.stringify(opts.keepImageIds));
 		if (opts.keepTextFiles) formData.append("keepTextFiles", JSON.stringify(opts.keepTextFiles));
+		if (opts.fileReferences !== undefined) {
+			formData.append("fileReferences", JSON.stringify(opts.fileReferences));
+		}
 		for (const img of opts.newImages ?? []) formData.append("images", img);
 		for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
 		// Content-Type is left unset so the browser adds the multipart boundary.
@@ -673,6 +857,11 @@ export const narratorsApi = {
 		}
 		return (await res.json()) as { ok: boolean };
 	},
+	retryBufferedMessage: (narratorId: string, messageId: string) =>
+		request<{ ok: true; resumed: boolean }>(
+			`/narrators/${encodeURIComponent(narratorId)}/buffer/${encodeURIComponent(messageId)}/retry`,
+			{ method: "POST" },
+		),
 	removeBufferedMessage: (narratorId: string, messageId: string) =>
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/${messageId}`, {
 			method: "DELETE",
@@ -683,6 +872,17 @@ export const narratorsApi = {
 		request<{ ok: boolean }>(`/narrators/${narratorId}/buffer/reorder`, {
 			method: "PUT",
 			body: JSON.stringify({ orderedIds }),
+		}),
+	getHumanAttention: (params?: { cursor?: string; limit?: number }, signal?: AbortSignal) => {
+		const query = new URLSearchParams();
+		if (params?.cursor) query.set("cursor", params.cursor);
+		if (params?.limit !== undefined) query.set("limit", String(params.limit));
+		const suffix = query.size > 0 ? `?${query.toString()}` : "";
+		return request<HumanAttentionPage>(`/narrators/human-attention${suffix}`, { signal });
+	},
+	getHumanAttentionDetail: (id: string, signal?: AbortSignal) =>
+		request<HumanAttentionDetail>(`/narrators/human-attention/${encodeURIComponent(id)}`, {
+			signal,
 		}),
 	getPendingPermissions: (id: string) => request<ApiEntity[]>(`/narrators/${id}/permissions`),
 	// Async AskUserQuestion inbox — separate from permissions because nothing is
@@ -822,27 +1022,14 @@ export const narratorsApi = {
 		request<{ restored: number; skipped: number }>("/narrators/broken-models/undo", {
 			method: "POST",
 		}),
-	getCustomTraits: (id: string) =>
-		request<{
-			subagentModelRestriction: {
-				version: 1;
-				pools: Record<string, { model: string; purpose?: string }[]>;
-			} | null;
-			disabledTools: { version: 1; tools: string[] } | null;
-			blockedSkills: { version: 1; all: boolean; names: string[] } | null;
-			availableModels: { model: string; purpose?: string }[];
-			availableTools: { name: string; description: string; category: string }[];
-		}>(`/narrators/${id}/custom-traits`),
-	updateSubagentModelRestriction: (
-		id: string,
-		pools: Record<string, { model: string; purpose?: string }[]>,
-	) =>
-		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+	getCustomTraits: (id: string) => request<NarratorCustomTraits>(`/narrators/${id}/custom-traits`),
+	updateSubagentModelRestriction: (id: string, pools: SubagentModelPools) =>
+		request<{ ok: boolean; traits: string[]; customTraits: NarratorCustomTraits }>(
 			`/narrators/${id}/custom-traits/subagent-model-restriction`,
 			{ method: "PUT", body: JSON.stringify({ pools }) },
 		),
 	clearSubagentModelRestriction: (id: string) =>
-		request<{ ok: boolean; traits: string[]; customTraits: unknown }>(
+		request<{ ok: boolean; traits: string[]; customTraits: NarratorCustomTraits }>(
 			`/narrators/${id}/custom-traits/subagent-model-restriction`,
 			{ method: "DELETE" },
 		),
@@ -1055,6 +1242,7 @@ export const narratorsApi = {
 		priority?: boolean,
 		onUploadProgress?: (fraction: number) => void,
 		signal?: AbortSignal,
+		fileReferences?: FileReference[],
 	) => {
 		const headers: Record<string, string> = {};
 		const token = getToken();
@@ -1072,6 +1260,9 @@ export const narratorsApi = {
 				for (const tf of textFiles) formData.append("textFiles", tf);
 			}
 			if (priority) formData.append("priority", "true");
+			if (fileReferences !== undefined) {
+				formData.append("fileReferences", JSON.stringify(fileReferences));
+			}
 			// Use XHR-backed upload so we can surface real upload progress to the UI.
 			res = await postFormDataWithProgress(url, formData, {
 				headers,
@@ -1083,7 +1274,7 @@ export const narratorsApi = {
 			res = await fetch(url, {
 				method: "POST",
 				headers,
-				body: JSON.stringify(priority ? { message, priority: true } : { message }),
+				body: JSON.stringify({ message, ...(priority ? { priority: true } : {}), fileReferences }),
 				signal,
 			});
 		}
@@ -1127,6 +1318,37 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/tool-calls/${encodeURIComponent(toolUseId)}/allow-retry`,
 			{ method: "POST" },
 		),
+	previewRevertAction: (
+		narratorId: string,
+		body: RevertActionTarget & { action: RevertAction; idempotencyKey: string },
+		signal?: AbortSignal,
+	) =>
+		request<RevertActionPreview>(`/narrators/${narratorId}/revert-action-preview`, {
+			method: "POST",
+			body: JSON.stringify(body),
+			signal,
+		}),
+	getRevertPlanFiles: (
+		narratorId: string,
+		planId: string,
+		params: { limit: number; cursor?: string },
+		signal?: AbortSignal,
+	) => {
+		const query = new URLSearchParams({ limit: String(params.limit) });
+		if (params.cursor !== undefined) query.set("cursor", params.cursor);
+		return request<RevertPlanFilesPage>(
+			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(planId)}/files?${query}`,
+			{ signal },
+		);
+	},
+	applyRevertPlan: (narratorId: string, plan: RevertPlanConfirmation) =>
+		request<RevertPlanApplyResult>(
+			`/narrators/${narratorId}/revert-plans/${encodeURIComponent(plan.planId)}/apply`,
+			{
+				method: "POST",
+				body: JSON.stringify({ planHash: plan.planHash, action: plan.action }),
+			},
+		),
 	rollbackToBlock: (
 		narratorId: string,
 		messageId: string,
@@ -1162,6 +1384,7 @@ export const narratorsApi = {
 			newImages?: File[];
 			keepTextFilePaths?: string[];
 			newTextFiles?: File[];
+			fileReferences?: FileReference[];
 		},
 	) => {
 		const headers: Record<string, string> = {};
@@ -1184,6 +1407,9 @@ export const narratorsApi = {
 			if (opts.keepTextFilePaths) {
 				formData.append("keepTextFilePaths", JSON.stringify(opts.keepTextFilePaths));
 			}
+			if (opts.fileReferences !== undefined) {
+				formData.append("fileReferences", JSON.stringify(opts.fileReferences));
+			}
 			for (const img of opts.newImages ?? []) formData.append("images", img);
 			for (const tf of opts.newTextFiles ?? []) formData.append("textFiles", tf);
 			body = formData;
@@ -1195,6 +1421,7 @@ export const narratorsApi = {
 				...(opts?.scope ? { scope: opts.scope } : {}),
 				...(opts?.keepImageIds ? { keepImageIds: opts.keepImageIds } : {}),
 				...(opts?.keepTextFilePaths ? { keepTextFilePaths: opts.keepTextFilePaths } : {}),
+				fileReferences: opts?.fileReferences,
 			});
 		}
 

@@ -11,7 +11,7 @@ import type {
 	ReasoningProviderMetadata,
 	WebSearchAction,
 } from "@shared/agent-protocol/types";
-import { TUTORIAL_PROVIDER_PREFIX } from "@shared/tutorial/lessons";
+import { catalogError } from "../errors";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAnthropicProviderConfig,
@@ -33,7 +33,6 @@ import { GrokProvider } from "./grok-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import type { ApiRequestDumpCollector } from "./request-dump";
-import { TutorialProvider } from "./tutorial-provider";
 
 // === Provider stream protocol types ===
 //
@@ -131,6 +130,8 @@ export interface GenerateOptions {
 
 export interface GenerateMetaResult {
 	text: string;
+	/** Partial text retained after an output-token limit; not a complete response. */
+	outputTruncated?: boolean;
 	contextPercent?: number;
 	usage?: UsageData | null;
 	credentialId?: string;
@@ -327,16 +328,10 @@ export function createGeminiProvider(
 }
 
 function createProviderByName(provider: string): ProviderAdapter | null {
-	// Checked FIRST so `tutorial:` is a reserved prefix that no compatible-API
-	// provider or plugin can claim. The interactive tutorial routes real narrator
-	// sessions here to replay scripted turns without contacting any AI API;
-	// letting a user-configured provider shadow the prefix would silently send
-	// tutorial traffic to a real upstream (and bill it).
-	//
-	// Deliberately NOT registered as a model source: a scripted model must never
-	// appear in the normal model pickers.
-	if (provider === TUTORIAL_PROVIDER_PREFIX) {
-		return new TutorialProvider();
+	// Keep the retired prefix reserved: old sessions must fail locally, never be
+	// claimed by a configured provider or plugin and sent to a billable upstream.
+	if (provider === "tutorial") {
+		throw catalogError("TUTORIAL_REMOVED");
 	}
 
 	if (provider === "codex") {

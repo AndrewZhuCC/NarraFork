@@ -6,7 +6,7 @@
  * - mode:写入会话 override(parseMode 解析;auto → null)。
  * - subagent:在隔离上下文(独立 persona)做一次无工具生成。
  *
- * 注册走 toolRegistry 单例;registerRouterTools() 幂等(重复调用先 unregister)。
+ * 注册走 toolRegistry 单例;registerRouterTools() 幂等(重复注册直接替换，不提前读取工具列表)。
  */
 import { z } from "zod/v4";
 import { agentGenerateWithMeta } from "../../lib/agent";
@@ -135,7 +135,6 @@ const ROUTER_TOOLS: ToolDefinition[] = [statusTool, modeTool, subagentTool];
 /** Register the three router_* tools. Idempotent: re-registration replaces. */
 export function registerRouterTools(): void {
 	for (const tool of ROUTER_TOOLS) {
-		if (toolRegistry.get(tool.name)) toolRegistry.unregister(tool.name);
 		toolRegistry.register(tool);
 	}
 }

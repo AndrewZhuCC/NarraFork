@@ -28,12 +28,13 @@ import { registerExternalProviderResolver } from "./lib/agent/provider";
 import { verifyToken } from "./lib/auth";
 import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
+import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { logger } from "./lib/logger";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
-import { getNarraforkPath } from "./lib/narrafork-home";
+import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
 import { validateAccessTokenById } from "./lib/oauth-provider";
 import { IS_MACOS, IS_WINDOWS, initWslFlag } from "./lib/platform";
 import { projectDbManager } from "./lib/project-db";
@@ -46,7 +47,7 @@ import {
 } from "./lib/server-restart";
 import { settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
-import { injectSpaBaseHref } from "./lib/spa-base-href";
+import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
 	createStartupReadinessGate,
@@ -132,6 +133,22 @@ recoverProviderPrefixMigrationOnStartup();
 
 // Track event-loop stalls early so blocking operations are visible in logs/diagnostics.
 startEventLoopMonitor();
+
+// Diagnose old-install permissions before the first tool call, without blocking
+// HTTP/login or the administrator's repair UI. This reads directory metadata only.
+void inspectApplicationDataDirectory(getNarraforkHome())
+	.then((status) => {
+		if (status.status !== "ok") {
+			logger.warn("Application data directory needs attention; check Settings > Storage", {
+				status: status.status,
+				canRepair: status.canRepair,
+				...status.details,
+			});
+		}
+	})
+	.catch((error) => {
+		logger.warn("Application data directory preflight failed", { error: String(error) });
+	});
 
 // Set rootless podman env vars early so all child processes inherit them
 ensureRootlessEnv();
@@ -279,10 +296,7 @@ function getFrontendCacheControl(path: string): string {
 async function serveSpaIndex(indexFile: Bun.BunFile, requestPath: string): Promise<Response> {
 	const html = injectSpaBaseHref(await indexFile.text(), requestPath);
 	return new Response(html, {
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-			"Cache-Control": "no-cache",
-		},
+		headers: spaIndexHeaders(requestPath),
 	});
 }
 
@@ -1263,6 +1277,11 @@ pluginManager
 // the background after that queue is mounted.
 getPlannedUpdateStartupProtection()
 	.then(async (plannedUpdate) => {
+		// The instance lock is already held. Release only previous-process mailbox claims
+		// before planned recovery mounts owners; hot reload preserves the process marker.
+		await import("./services/agent-runtime/inbox").then(({ recoverInboxClaimsOnColdStartup }) =>
+			recoverInboxClaimsOnColdStartup(),
+		);
 		await recoverNarrators(plannedUpdate.protection);
 		await restorePendingModelOverrides();
 		// Browser-backed narrators must see their restored sessions before planned-update continuation

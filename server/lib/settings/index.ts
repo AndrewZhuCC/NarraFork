@@ -8,10 +8,15 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
+import { generateShortId } from "../id";
 import { logger } from "../logger";
 import { invalidateModelCardCache } from "../model-cards";
 import { type ModelPricing, setModelPricingOverrides } from "../model-pricing";
 import { getNarraforkHome } from "../narrafork-home";
+import {
+	normalizeDefaultNarratorVisibility,
+	normalizeDefaultNarratorWriteAudience,
+} from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
@@ -96,6 +101,7 @@ export {
 	registerOpenaiModelLister,
 	resolveAggregation,
 	resolveAllowedModelCandidate,
+	resolveAllowedModelCandidateMatch,
 	resolveDefaultReasoningEffort,
 	resolveEffectiveModel,
 	resolveModelContextWindow,
@@ -215,9 +221,9 @@ export function reloadSettings(): NarraForkSettings {
 }
 
 function loadSettingsFromDisk(): NarraForkSettings {
-	mkdirSync(narraforkDir, { recursive: true });
+	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (!existsSync(settingsPath)) {
-		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2));
+		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
 	}
 	const raw = existsSync(settingsPath) ? JSON.parse(readFileSync(settingsPath, "utf-8")) : {};
 	const merged = deepMerge(DEFAULTS, raw);
@@ -275,6 +281,22 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	// smaller one — is an operator decision and is left alone.
 	if (raw.agent?.requestDumpMaxSize === LEGACY_REQUEST_DUMP_MAX_SIZE) {
 		merged.agent.requestDumpMaxSize = DEFAULTS.agent.requestDumpMaxSize;
+		needsSave = true;
+	}
+
+	const defaultVisibility = normalizeDefaultNarratorVisibility(
+		merged.agent.defaultNarratorVisibility,
+	);
+	if (merged.agent.defaultNarratorVisibility !== defaultVisibility) {
+		merged.agent.defaultNarratorVisibility = defaultVisibility;
+		needsSave = true;
+	}
+
+	const defaultWriteAudience = normalizeDefaultNarratorWriteAudience(
+		merged.agent.defaultNarratorWriteAudience,
+	);
+	if (merged.agent.defaultNarratorWriteAudience !== defaultWriteAudience) {
+		merged.agent.defaultNarratorWriteAudience = defaultWriteAudience;
 		needsSave = true;
 	}
 
@@ -384,6 +406,10 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		needsSave = true;
 	}
 
+	if (normalizeMcpServerIds(merged)) {
+		needsSave = true;
+	}
+
 	if (migrateLegacyMcpBehaviors(merged)) {
 		needsSave = true;
 	}
@@ -469,6 +495,29 @@ type LegacyMcpServerConfig = {
 	defaultBehavior?: string;
 	toolPermissions?: Array<{ behavior?: string }>;
 };
+
+/** Raw settings edits bypass the MCP create route, but every UI action needs a unique string ID. */
+export function normalizeMcpServerIds(settings: NarraForkSettings): boolean {
+	if (!Array.isArray(settings.mcpServers)) return false;
+	const isValidId = (id: unknown): id is string => typeof id === "string" && id.trim().length > 0;
+	// Reserve existing IDs before generating replacements so valid references stay intact.
+	const reserved = new Set(settings.mcpServers.map((server) => server.id).filter(isValidId));
+	const seen = new Set<string>();
+	let dirty = false;
+	for (const server of settings.mcpServers) {
+		if (!isValidId(server.id) || seen.has(server.id)) {
+			let id: string;
+			do {
+				id = generateShortId();
+			} while (reserved.has(id));
+			server.id = id;
+			reserved.add(id);
+			dirty = true;
+		}
+		seen.add(server.id);
+	}
+	return dirty;
+}
 
 /** Migrate pre readOnly/readWrite MCP behavior values. */
 export function migrateLegacyMcpBehaviors(settings: NarraForkSettings): boolean {
@@ -684,7 +733,8 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeCustomApiProviderSettings(newSettings);
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
-	mkdirSync(narraforkDir, { recursive: true });
+	normalizeMcpServerIds(newSettings);
+	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
 	try {
 		writeFileSync(tempPath, JSON.stringify(newSettings, null, 2), { mode: 0o600 });

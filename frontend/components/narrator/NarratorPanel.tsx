@@ -8,13 +8,13 @@ import {
 	useSensors,
 } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { narratorColumnPlaceholderStyle } from "@frontend/lib/narrator-content-column";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import type { AsyncQuestion } from "@frontend/types/narrator";
 import type { ComboboxData, ComboboxItemGroup } from "@mantine/core";
 import {
 	ActionIcon,
-	Alert,
 	Anchor,
 	Avatar,
 	Badge,
@@ -46,6 +46,12 @@ import {
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
+import type {
+	FileReference,
+	FileReferenceContext,
+	FileReferenceEditorSelection,
+	FileTarget,
+} from "@shared/file-reference";
 import { cardEffortLevels, lookupModelCard } from "@shared/model-card";
 import { MOBILE_TOOLBAR_VISIBLE_LIMIT } from "@shared/narrator-toolbar";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
@@ -120,7 +126,6 @@ import { useAllModels } from "../../hooks/useModels";
 import {
 	useArchiveNarrator,
 	useBlacklistDirs,
-	useBlockDeletePreview,
 	useCmdBlacklist,
 	useCmdWhitelist,
 	useCreateBlacklistDir,
@@ -138,7 +143,7 @@ import {
 	useInterruptNarrator,
 	useNarrator,
 	usePromoteNarrator,
-	useRollbackPreview,
+	useRevertHistoryAction,
 	useStartAskInPassing,
 	useStopTakeoverSubagent,
 	useTakeoverSubagent,
@@ -175,13 +180,11 @@ import { useSpecFiles, useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import { ApiError, api, type BufferMessageSummary, isAbortError } from "../../lib/api";
-import type { RevertScope } from "../../lib/api/narrators";
+import type { RevertActionConfirmOptions, RevertScope } from "../../lib/api/narrators";
 import type { PathFlavor } from "../../lib/api/types";
 import {
 	AGG_MODEL_PREFIX,
-	buildAggModelValue,
 	FOLLOW_DEFAULT_MODEL,
-	type ModelAggregation,
 	type ModelOption,
 	parseAggModelValue,
 	resolveDisplayModel,
@@ -196,7 +199,7 @@ import {
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { requestNugModelRefreshOnPickerOpen } from "../../lib/nug-model-refresh";
-import { formatRevertWarning, formatRevertWarnings } from "../../lib/revert-warnings";
+import { formatRevertWarnings } from "../../lib/revert-warnings";
 import {
 	SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
 	SAFE_AREA_DRAWER_BODY_STYLE,
@@ -250,7 +253,10 @@ import {
 } from "./draft-image-attachments";
 import { EditingMessageCtx, type EditingMessageState } from "./EditingMessageCtx";
 import { ExecutionDeviceMenu, ExecutionDeviceOptions } from "./ExecutionDeviceMenu";
-import { AsyncQuestionInboxButton } from "./GlobalQuestionInbox";
+import type { FileReferenceScopeValue } from "./FileReferenceScope";
+import { useFilePanelNavigation } from "./file-panel-navigation";
+import { editFileReferenceInput, trimFileReferenceInput } from "./file-reference-input";
+import { HumanAttentionInboxButton } from "./GlobalQuestionInbox";
 import {
 	formatKimiBarText,
 	formatKimiDetailsText,
@@ -284,6 +290,7 @@ import { NarratorLodMenu, NarratorLodOptions } from "./NarratorLodMenu";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import {
+	BackgroundTasksStatusButton,
 	NarratorStatusBar,
 	NarratorStatusToolbar,
 	type NarratorStatusToolbarAction,
@@ -320,10 +327,11 @@ import {
 	resolveNarratorToolbarBadge,
 } from "./narrator-toolbar-badges";
 import type { NarratorToolbarHost, NarratorToolbarId } from "./narrator-toolbar-items";
+import { nextHighlightRequestId } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
 import { QueuedAttachmentPreview, QueuedMessageRow } from "./QueuedMessageRow";
 import { type RenderLod, RenderLodCtx } from "./RenderLodCtx";
-import { RevertScopeConfirmModal } from "./RevertScopeConfirmModal";
+import { RevertActionConfirmModal } from "./RevertScopeConfirmModal";
 import { SwipeAnchorOverlay } from "./SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./selection-anchor-overlay";
 import { revealSpecFile } from "./spec-file-reveal";
@@ -605,59 +613,6 @@ function SetGlobalModelModal({
 				</Group>
 			</Stack>
 		</Modal>
-	);
-}
-
-/**
- * Inline provider switcher for aggregation models.
- * Shows a SegmentedControl with "Auto" + each member provider.
- */
-function AggProviderSwitcher({
-	currentModel,
-	aggregations,
-	providerLabels,
-	onSelect,
-}: {
-	currentModel: string | null | undefined;
-	aggregations: ModelAggregation[];
-	providerLabels: Record<string, string>;
-	onSelect: (model: string) => void;
-}) {
-	const { t } = useTranslation("settings");
-	const parsed = parseAggModelValue(currentModel);
-	if (!parsed) return null;
-
-	const agg = aggregations.find((a) => a.id === parsed.aggId);
-	if (!agg || agg.models.length === 0) return null;
-
-	// Build segments: "auto" + each member model
-	const segments: Array<{ value: string; label: string }> = [
-		{ value: "auto", label: t("aggAutoLabel") },
-	];
-	for (const memberModel of agg.models) {
-		const colonIdx = memberModel.indexOf(":");
-		const prefix = colonIdx > 0 ? memberModel.slice(0, colonIdx) : memberModel;
-		const displayName = providerLabels[prefix] ?? prefix;
-		segments.push({ value: memberModel, label: displayName });
-	}
-
-	// Determine current value
-	const currentValue = parsed.pinnedModel ?? "auto";
-
-	return (
-		<SegmentedControl
-			size="xs"
-			data={segments}
-			value={currentValue}
-			onChange={(v) => {
-				if (v === "auto") {
-					onSelect(buildAggModelValue(parsed.aggId));
-				} else {
-					onSelect(buildAggModelValue(parsed.aggId, v));
-				}
-			}}
-			style={{ flexShrink: 0 }}
-		/>
 	);
 }
 
@@ -1681,207 +1636,6 @@ function ReasoningEffortMenuItems({
 	);
 }
 
-/**
- * Confirmation modal for rollback-to-block.
- *
- * Owns only the preview query and this action's wording; the scope choice, the file
- * list and the three exits live in RevertScopeConfirmModal, shared with
- * edit-and-regenerate so both present the same decision.
- */
-function RollbackConfirmModal({
-	narratorId,
-	pendingRollback,
-	onConfirm,
-	onCancel,
-}: {
-	narratorId: string;
-	pendingRollback: { messageId: string; blockIndex: number } | null;
-	onConfirm: (opts: { skipRevert: boolean; scope?: RevertScope }) => void;
-	onCancel: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const { data, isLoading } = useRollbackPreview(
-		narratorId,
-		pendingRollback?.messageId ?? null,
-		pendingRollback?.blockIndex ?? null,
-		!!pendingRollback,
-	);
-
-	const blockCount = data?.deletedBlockCount ?? 0;
-	const messageCount = data?.deletedMessageCount ?? 0;
-
-	let description: string;
-	if (blockCount > 0 && messageCount > 0) {
-		description = t("rollbackConfirmDesc", { blockCount, messageCount });
-	} else if (blockCount > 0) {
-		description = t("rollbackConfirmDescBlocksOnly", { blockCount });
-	} else {
-		description = t("rollbackConfirmDescMessagesOnly", { messageCount });
-	}
-
-	return (
-		<RevertScopeConfirmModal
-			opened={!!pendingRollback}
-			title={t("rollbackConfirmTitle")}
-			description={description}
-			data={data}
-			isLoading={isLoading}
-			confirmWithRevertLabel={t("rollbackConfirmWithRevert")}
-			confirmNoFilesLabel={t("rollbackConfirm")}
-			messagesOnlyLabel={t("rollbackConfirmMessagesOnly")}
-			onConfirm={onConfirm}
-			onCancel={onCancel}
-		/>
-	);
-}
-
-/**
- * Confirmation modal for deleting a single tool_use block.
- *
- * Deleting a block rolls back exactly the files that one call changed, which now
- * includes changes no tool input describes (Bash, build scripts, editors). That
- * makes it a destructive action worth confirming: previously it fired straight from
- * the context menu with no indication of what would be undone.
- *
- * There is no scope picker here — a block IS one recorded call, so the narrow scope
- * is the only meaningful one. A conflict means another actor changed the same
- * regions, so the file rollback is refused and only history-only deletion is left.
- */
-function BlockDeleteConfirmModal({
-	narratorId,
-	pending,
-	onConfirm,
-	onCancel,
-}: {
-	narratorId: string;
-	pending: { messageId: string; blockIndex: number } | null;
-	onConfirm: (opts: { skipRevert: boolean }) => void;
-	onCancel: () => void;
-}) {
-	const { t } = useTranslation("narrator");
-	const { t: tc } = useTranslation("common");
-	const { data, isLoading, isError } = useBlockDeletePreview(
-		narratorId,
-		pending?.messageId ?? null,
-		pending?.blockIndex ?? null,
-		!!pending,
-	);
-
-	const files = data?.files ?? [];
-	const conflicts = data?.conflicts ?? [];
-	// A failed preview must not read as "nothing would change": both lists are empty
-	// in that case, which would otherwise render as a reassuring "no files affected"
-	// next to an enabled rollback button.
-	const previewFailed = !isLoading && (isError || !data);
-	// A conflict is the one case where the file rollback cannot run at all.
-	const revertBlocked = conflicts.length > 0 || previewFailed;
-	const subagentWarningText = data?.subagentWarning
-		? formatRevertWarning(t, {
-				code: "SUBAGENT_CHANGES_REVERTED",
-				changeCount: data.subagentWarning.changeCount,
-				sampleFilePaths: data.subagentWarning.sampleFiles,
-			})
-		: null;
-
-	return (
-		<Modal
-			opened={!!pending}
-			onClose={onCancel}
-			title={t("blockDeleteConfirmTitle")}
-			centered
-			size="md"
-		>
-			<Stack gap="md">
-				{isLoading ? (
-					<Center py="md">
-						<Loader size="sm" />
-					</Center>
-				) : (
-					<>
-						<Text size="sm">{t("blockDeleteConfirmDesc")}</Text>
-
-						{previewFailed && (
-							<Alert color="red" variant="light" title={t("blockDeletePreviewFailedTitle")}>
-								<Text size="xs">{t("blockDeletePreviewFailedDesc")}</Text>
-							</Alert>
-						)}
-
-						{conflicts.length > 0 && (
-							<Alert color="red" variant="light" title={t("revertScopeConflictTitle")}>
-								<Text size="xs">
-									{t("revertScopeConflictDesc", { files: conflicts.slice(0, 5).join(", ") })}
-								</Text>
-							</Alert>
-						)}
-
-						{subagentWarningText && (
-							<Alert color="yellow" variant="light" title={t("revertScopeSubagentTitle")}>
-								<Text size="xs">{subagentWarningText}</Text>
-							</Alert>
-						)}
-
-						{files.length > 0 ? (
-							<>
-								<Text size="sm" fw={500}>
-									{t("rollbackConfirmFiles")}
-								</Text>
-								<Stack gap={4} mah={260} style={{ overflowY: "auto" }}>
-									{files.map((file) => (
-										<Group key={file.filePath} gap="xs" wrap="nowrap">
-											<TruncatedPath path={file.filePath} />
-											<Badge
-												size="xs"
-												variant="light"
-												color={file.willBeDeleted ? "red" : "orange"}
-											>
-												{file.willBeDeleted
-													? t("fileMod_willBeDeleted")
-													: t("fileMod_willBeReverted")}
-											</Badge>
-										</Group>
-									))}
-								</Stack>
-							</>
-						) : (
-							!previewFailed && (
-								<Text size="sm" c="dimmed">
-									{conflicts.length > 0
-										? t("revertScopeBlocked")
-										: data?.reason === "nothing_owned"
-											? t("revertScopeNothingOwned")
-											: t("blockDeleteConfirmNoFiles")}
-								</Text>
-							)
-						)}
-					</>
-				)}
-				<Group gap="xs" justify="flex-end">
-					<Button size="xs" variant="subtle" onClick={onCancel}>
-						{tc("cancel")}
-					</Button>
-					<Button
-						size="xs"
-						variant="default"
-						onClick={() => onConfirm({ skipRevert: true })}
-						loading={isLoading}
-					>
-						{t("blockDeleteHistoryOnly")}
-					</Button>
-					<Button
-						size="xs"
-						color="red"
-						disabled={revertBlocked}
-						onClick={() => onConfirm({ skipRevert: false })}
-						loading={isLoading}
-					>
-						{files.length > 0 ? t("blockDeleteWithRevert") : t("contextMenu_delete")}
-					</Button>
-				</Group>
-			</Stack>
-		</Modal>
-	);
-}
-
 function TurnElapsedTime({
 	text,
 	startedAtLabel,
@@ -1975,6 +1729,7 @@ export function NarratorPanel({
 	narrator: narratorProp,
 	onForkFromMessage,
 	highlightMessageId,
+	highlightRequestId,
 	onSendToTerminal,
 	appendInputRef,
 	terminalOpen,
@@ -2667,6 +2422,9 @@ export function NarratorPanel({
 
 	// --- Message operations ---
 	const setUnreadCountRef = useRef<React.Dispatch<React.SetStateAction<number>>>(undefined);
+	const revertHistoryAction = useRevertHistoryAction(narratorId);
+	const { mutateAsync: applyHistoryAction, isPending: revertHistorySubmitting } =
+		revertHistoryAction;
 	// Deleting a block rolls its file changes back, so it asks first rather than
 	// firing straight from the context menu.
 	const [pendingBlockDelete, setPendingBlockDelete] = useState<{
@@ -2674,33 +2432,27 @@ export function NarratorPanel({
 		blockIndex: number;
 	} | null>(null);
 
-	const handleDeleteBlock = useCallback((messageId: string, blockIndex: number) => {
-		setPendingBlockDelete({ messageId, blockIndex });
-	}, []);
+	const handleDeleteBlock = useCallback(
+		(messageId: string, blockIndex: number) => {
+			if (!revertHistorySubmitting) setPendingBlockDelete({ messageId, blockIndex });
+		},
+		[revertHistorySubmitting],
+	);
 
 	const confirmBlockDelete = useCallback(
-		async ({ skipRevert }: { skipRevert: boolean }) => {
-			if (!pendingBlockDelete) return;
-			const { messageId, blockIndex } = pendingBlockDelete;
-			setPendingBlockDelete(null);
+		async (opts: RevertActionConfirmOptions) => {
+			if (!pendingBlockDelete || revertHistorySubmitting) return;
 			try {
-				await api.deleteMessageBlock(narratorId, messageId, blockIndex, { skipRevert });
+				await applyHistoryAction({ action: "delete_tool_block", target: pendingBlockDelete, opts });
+				setPendingBlockDelete(null);
+			} catch {
+				// The mutation explains the journal outcome. Keep the revoked preview open
+				// for an explicit reload or a history-only choice; never retry automatically.
+			} finally {
 				chunkListRef.current?.refreshStructure("full");
-			} catch (error) {
-				// A rollback refusal (another actor changed the same regions) is not a
-				// generic failure: the server explains what happened and the user still has
-				// a way forward. Surfacing "please retry" instead would send them into a
-				// loop that cannot succeed.
-				const isConflict = error instanceof ApiError && error.status === 409;
-				notifications.show({
-					title: isConflict ? t("blockDeleteConflictTitle") : t("deleteMessageFailed"),
-					message: isConflict ? t("blockDeleteConflictDesc") : t("deleteMessageFailedDesc"),
-					color: isConflict ? "yellow" : "red",
-					autoClose: isConflict ? 10000 : 5000,
-				});
 			}
 		},
-		[narratorId, pendingBlockDelete, t],
+		[applyHistoryAction, pendingBlockDelete, revertHistorySubmitting],
 	);
 
 	const [pendingRollback, setPendingRollback] = useState<{
@@ -2718,14 +2470,19 @@ export function NarratorPanel({
 				});
 				return;
 			}
-			setPendingRollback({ messageId, blockIndex });
+			if (!revertHistorySubmitting) setPendingRollback({ messageId, blockIndex });
 		},
-		[rollbackEditRegenerateSupported, rollbackEditRegenerateUnsupportedReason, t],
+		[
+			rollbackEditRegenerateSupported,
+			rollbackEditRegenerateUnsupportedReason,
+			revertHistorySubmitting,
+			t,
+		],
 	);
 
 	const confirmRollback = useCallback(
-		async ({ skipRevert, scope }: { skipRevert: boolean; scope?: RevertScope }) => {
-			if (!pendingRollback) return;
+		async (opts: RevertActionConfirmOptions) => {
+			if (!pendingRollback || revertHistorySubmitting) return;
 			if (!rollbackEditRegenerateSupported) {
 				notifications.show({
 					title: t("rollbackEditRegenerateUnsupportedTitle"),
@@ -2736,32 +2493,18 @@ export function NarratorPanel({
 				return;
 			}
 			try {
-				const result = await api.rollbackToBlock(
-					narratorId,
-					pendingRollback.messageId,
-					pendingRollback.blockIndex,
-					{ skipRevert, ...(scope ? { scope } : {}) },
-				);
-				// A rollback can reach beyond the chosen scope (subagent writes, a
-				// workspace restore); surface that so the result is verified, not assumed.
-				const warningText = formatRevertWarnings(t, result.warnings);
-				if (warningText) {
-					notifications.show({
-						title: t("rollbackPartialTitle"),
-						message: warningText,
-						color: "yellow",
-						autoClose: false,
-					});
-				}
-			} catch (err) {
-				const message = err instanceof Error ? err.message : "Failed to rollback";
-				notifications.show({ title: t("rollbackFailed"), message, color: "red" });
+				await applyHistoryAction({ action: "rollback_to_block", target: pendingRollback, opts });
+				setPendingRollback(null);
+			} catch {
+				// No second history mutation, and no re-plan/retry after an uncertain apply.
+			} finally {
+				chunkListRef.current?.refreshStructure("full");
 			}
-			setPendingRollback(null);
 		},
 		[
-			narratorId,
+			applyHistoryAction,
 			pendingRollback,
+			revertHistorySubmitting,
 			rollbackEditRegenerateSupported,
 			rollbackEditRegenerateUnsupportedReason,
 			t,
@@ -2778,6 +2521,7 @@ export function NarratorPanel({
 				newImages: File[];
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
+				fileReferences?: FileReference[];
 			},
 		): Promise<boolean> => {
 			if (!rollbackEditRegenerateSupported) {
@@ -3106,20 +2850,7 @@ export function NarratorPanel({
 			const anchor = resolveChatCommentAnchor(anchorNode, contentRef.current);
 			addCommentDraft(
 				narratorId,
-				createCommentDraft({
-					source: "chat",
-					excerpt,
-					comment,
-					...(anchor
-						? {
-								messageId: anchor.messageId,
-								messageSeq: anchor.messageSeq,
-								role: anchor.role,
-								blockIndex: anchor.blockIndex,
-								blockId: anchor.blockId,
-							}
-						: {}),
-				}),
+				createCommentDraft({ source: "chat", excerpt, comment, ...anchor }),
 			);
 		},
 		[narratorId],
@@ -4209,7 +3940,7 @@ export function NarratorPanel({
 
 	// What the composer currently holds, split by ownership: the text flag comes
 	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
-	// are panel state. An image-only or comments-only draft behaves like a typed one.
+	// are panel state. An image-only draft behaves like a typed one everywhere below.
 	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
 	const composerSendable = composerHasText || composerHasAttachments || commentDrafts.length > 0;
 
@@ -4939,13 +4670,111 @@ export function NarratorPanel({
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
 
 	const [internalFileViewerPath, setInternalFileViewerPath] = useState<string | null>(null);
-	const dockOpenFilePanel = dock?.openFilePanel;
+	const [internalFileViewerTarget, setInternalFileViewerTarget] = useState<
+		(FileTarget & { highlightRequestId: string }) | null
+	>(null);
+	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
+		null,
+	);
+	const fileNavigationRef = useRef(0);
+	const fileNavigationAbortRef = useRef<AbortController | null>(null);
+	const dockOpenFilePanel = useFilePanelNavigation();
 	const useInternalFileViewer = !dockOpenFilePanel && !isWorkspacePreview;
 	const handleOpenFilePanel = useMemo(() => {
 		if (dockOpenFilePanel) return (filePath: string) => dockOpenFilePanel(filePath);
-		if (useInternalFileViewer) return (filePath: string) => setInternalFileViewerPath(filePath);
+		if (useInternalFileViewer)
+			return (filePath: string) => {
+				setInternalFileViewerTarget(null);
+				setInternalFileViewerPath(filePath);
+			};
 		return undefined;
 	}, [dockOpenFilePanel, useInternalFileViewer]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: cancel navigation when the owning narrator changes
+	useEffect(
+		() => () => {
+			fileNavigationRef.current++;
+			fileNavigationAbortRef.current?.abort();
+		},
+		[narratorId],
+	);
+	const handleOpenReferencedFile = useCallback(
+		async (target: FileTarget) => {
+			const request = ++fileNavigationRef.current;
+			fileNavigationAbortRef.current?.abort();
+			const controller = new AbortController();
+			fileNavigationAbortRef.current = controller;
+			try {
+				const { targets } = await fileReferenceApi.resolve(narratorId, [target], controller.signal);
+				if (request !== fileNavigationRef.current || !targets[0]) return;
+				const resolved = targets[0];
+				const highlightRequestId = nextHighlightRequestId();
+				if (dockOpenFilePanel) {
+					dockOpenFilePanel(resolved.path, undefined, {
+						fileNarratorId: narratorId,
+						deviceId: resolved.deviceId,
+						selection: resolved.selection,
+						highlightRequestId,
+						referenceOrigin: true,
+					});
+				} else if (useInternalFileViewer) {
+					setInternalFileViewerTarget({ ...resolved, highlightRequestId });
+					setInternalFileViewerPath(resolved.path);
+				}
+			} catch (error) {
+				if (request === fileNavigationRef.current)
+					notifications.show({
+						color: "red",
+						title: t("fileReferences.openFailed"),
+						message: error instanceof Error ? error.message : String(error),
+					});
+			}
+		},
+		[narratorId, dockOpenFilePanel, useInternalFileViewer, t],
+	);
+	const addFileReference = useCallback((reference: FileReference) => {
+		composerRef.current?.addFileReference(reference);
+	}, []);
+	const fileReferenceDevice = executionDevicesQuery.data
+		? (executionDevicesQuery.data.defaultDeviceId ?? "local")
+		: undefined;
+	const fileReferenceCwd =
+		fileReferenceDevice === "local"
+			? (fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath)
+			: executionDevicesQuery.data?.devices.find((device) => device.id === fileReferenceDevice)
+					?.defaultCwd;
+	const fileReferenceContext = useMemo<FileReferenceContext | null>(
+		() =>
+			fileReferenceDevice && fileReferenceCwd
+				? { deviceId: fileReferenceDevice, cwd: fileReferenceCwd }
+				: null,
+		[fileReferenceDevice, fileReferenceCwd],
+	);
+	const fileReferenceScope = useMemo<FileReferenceScopeValue>(
+		() => ({
+			narratorId,
+			context: fileReferenceContext,
+			openFile:
+				!isWorkspacePreview && (dockOpenFilePanel || useInternalFileViewer)
+					? handleOpenReferencedFile
+					: undefined,
+			addReference: addFileReference,
+			selection: dock?.fileReferenceSelection ?? localFileSelection,
+			setSelection: dock?.setFileReferenceSelection ?? setLocalFileSelection,
+		}),
+		[
+			narratorId,
+			fileReferenceContext,
+			isWorkspacePreview,
+			dockOpenFilePanel,
+			useInternalFileViewer,
+			handleOpenReferencedFile,
+			addFileReference,
+			dock?.fileReferenceSelection,
+			dock?.setFileReferenceSelection,
+			localFileSelection,
+		],
+	);
 
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
@@ -5419,6 +5248,7 @@ export function NarratorPanel({
 			text: string,
 			imageCount: number,
 			priority?: boolean,
+			fileReferences?: FileReference[],
 		) => {
 			if (!result?.buffered || !result.id) return false;
 
@@ -5427,6 +5257,7 @@ export function NarratorPanel({
 				text,
 				bufferedAt: result.bufferedAt ?? new Date().toISOString(),
 				imageCount,
+				fileReferences,
 				creator:
 					currentUser?.id && currentUser?.username
 						? {
@@ -5482,8 +5313,10 @@ export function NarratorPanel({
 		textFiles: File[] = [],
 		signal?: AbortSignal,
 		priority?: boolean,
+		fileReferences: FileReference[] = [],
 	) => {
 		const optimisticBlocks: ContentBlock[] = [
+			...fileReferences.map((reference) => ({ type: "file_reference", reference })),
 			...images.map((f) => ({
 				type: "image",
 				filename: f.name,
@@ -5507,6 +5340,7 @@ export function NarratorPanel({
 				priority,
 				reportUploadProgress,
 				signal,
+				fileReferences,
 			);
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
@@ -5542,7 +5376,7 @@ export function NarratorPanel({
 				// Message was buffered — show it in the queue immediately.
 				// The WS buffer_set event can be missed when the subscription is not
 				// fully caught up, so also reconcile with REST.
-				applyBufferedSendResult(result, msg, images.length);
+				applyBufferedSendResult(result, msg, images.length, priority, fileReferences);
 				scrollToBottom(true);
 			} else if (result?.id) {
 				// Normal message — set narrator status to "working" optimistically.
@@ -5574,17 +5408,24 @@ export function NarratorPanel({
 		msg: string,
 		priority?: boolean,
 		signal?: AbortSignal,
+		references?: FileReference[],
 		includeCommentDrafts = true,
 	): Promise<boolean> => {
+		const draft = trimFileReferenceInput({
+			text: composerRef.current?.getText() ?? "",
+			fileReferences: composerRef.current?.getFileReferences() ?? [],
+		});
+		const fileReferences = references ?? (draft.text === msg ? draft.fileReferences : []);
 		const images = [...attachedImages];
 		const textFiles = [...attachedTextFiles];
-		// `/new` is a spawn command — packing comments in front of it would hide the
-		// slash from the backend. Leave drafts in the store for the next real send.
-		// External dock forwards are also standalone messages and must not consume the
-		// operator's in-progress composer comments.
+		// Keep /new recognizable by the backend and external forwards independent of drafts.
 		const comments =
 			includeCommentDrafts && !/^\/new(?:\s|$)/.test(msg) ? getCommentDrafts(narratorId) : [];
 		const payload = composeUserMessageWithComments(msg, comments);
+		const payloadReferences = editFileReferenceInput({ text: msg, fileReferences }, payload, {
+			start: 0,
+			end: 0,
+		}).fileReferences;
 		composerRef.current?.hideTextForSend();
 		hideAttachedFilesForSend();
 		if (comments.length > 0) clearCommentDrafts(narratorId);
@@ -5597,8 +5438,15 @@ export function NarratorPanel({
 				priority,
 				reportUploadProgress,
 				signal,
+				payloadReferences,
 			);
-			const buffered = applyBufferedSendResult(result, msg, images.length, priority);
+			const buffered = applyBufferedSendResult(
+				result,
+				payload,
+				images.length,
+				priority,
+				payloadReferences,
+			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			// Whether the message was buffered (202) or the backend fell through
@@ -5606,11 +5454,13 @@ export function NarratorPanel({
 			scrollToBottom(true);
 			return buffered;
 		} catch (err) {
-			// Restore input, attachments and comment drafts on error
-			composerRef.current?.setText(msg);
+			// Restore text and its independently tracked file references together.
+			composerRef.current?.restoreInput(msg, fileReferences);
 			if (images.length > 0) updateAttachedImages(images);
 			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
-			if (comments.length > 0) setCommentDrafts(narratorId, comments);
+			if (comments.length > 0) {
+				setCommentDrafts(narratorId, [...comments, ...getCommentDrafts(narratorId)]);
+			}
 			throw err; // Re-throw to let caller handle
 		}
 	};
@@ -5646,8 +5496,12 @@ export function NarratorPanel({
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
 		const composerText = composerRef.current?.getText() ?? "";
-		const msg = composerText.trim();
-		const attachmentCount = attachedImages.length + attachedTextFiles.length;
+		const { text: msg, fileReferences } = trimFileReferenceInput({
+			text: composerText,
+			fileReferences: composerRef.current?.getFileReferences() ?? [],
+		});
+		const attachmentCount =
+			attachedImages.length + attachedTextFiles.length + fileReferences.length;
 		// An attachment-only message is a valid turn: images (and text files) carry the
 		// content by themselves, so an empty textarea must not block the send.
 		if (
@@ -5656,6 +5510,7 @@ export function NarratorPanel({
 				imageCount: attachedImages.length,
 				textFileCount: attachedTextFiles.length,
 				commentCount: commentDrafts.length,
+				fileReferenceCount: fileReferences.length,
 			}) ||
 			sendingRef.current
 		)
@@ -5675,12 +5530,14 @@ export function NarratorPanel({
 			images: File[];
 			textFiles: File[];
 			comments: CommentDraft[];
+			fileReferences: FileReference[];
 		} | null = null;
 		try {
-			composerRef.current?.noteSent(msg);
+			composerRef.current?.noteSent(msg, fileReferences);
 
 			const newMatch = msg.match(/^\/new(?:\s+([\s\S]*))?$/);
 			if (newMatch) {
+				if (fileReferences.length) throw new Error(t("fileReferences.newSessionFirst"));
 				if (isActive) {
 					// /new while active: always normal queue (never interrupt to spawn).
 					await doSendBuffered(msg);
@@ -5690,9 +5547,8 @@ export function NarratorPanel({
 				const images = [...attachedImages];
 				const textFiles = [...attachedTextFiles];
 				const comments = getCommentDrafts(narratorId);
-				// Pack comments into the new narrator's first message, not the `/new` command.
 				const initialMessage = composeUserMessageWithComments(newMatch[1]?.trim() ?? "", comments);
-				restoreOnError = { msg, images, textFiles, comments };
+				restoreOnError = { msg, images, textFiles, comments, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 				if (comments.length > 0) clearCommentDrafts(narratorId);
@@ -5781,11 +5637,19 @@ export function NarratorPanel({
 				const textFiles = [...attachedTextFiles];
 				const comments = getCommentDrafts(narratorId);
 				const payload = composeUserMessageWithComments(msg, comments);
-				restoreOnError = { msg, images, textFiles, comments };
+				restoreOnError = { msg, images, textFiles, comments, fileReferences };
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 				if (comments.length > 0) clearCommentDrafts(narratorId);
-				await submitMessage(payload, images, textFiles, abortController.signal, mode !== "turn");
+				await submitMessage(
+					payload,
+					images,
+					textFiles,
+					abortController.signal,
+					mode !== "turn",
+					editFileReferenceInput({ text: msg, fileReferences }, payload, { start: 0, end: 0 })
+						.fileReferences,
+				);
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
 				restoreOnError = null;
@@ -5795,13 +5659,20 @@ export function NarratorPanel({
 			const textFiles = [...attachedTextFiles];
 			const comments = getCommentDrafts(narratorId);
 			const payload = composeUserMessageWithComments(msg, comments);
-			// Remember the draft so a cancelled upload can restore it — submitMessage
-			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles, comments };
+			// Preserve the draft for failed or cancelled sends.
+			restoreOnError = { msg, images, textFiles, comments, fileReferences };
 			composerRef.current?.hideTextForSend();
 			hideAttachedFilesForSend();
 			if (comments.length > 0) clearCommentDrafts(narratorId);
-			await submitMessage(payload, images, textFiles, abortController.signal);
+			await submitMessage(
+				payload,
+				images,
+				textFiles,
+				abortController.signal,
+				undefined,
+				editFileReferenceInput({ text: msg, fileReferences }, payload, { start: 0, end: 0 })
+					.fileReferences,
+			);
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
 			restoreOnError = null;
@@ -5810,11 +5681,14 @@ export function NarratorPanel({
 			// message. `doSendBuffered` already restores internally on its own throw;
 			// this covers the `/new` and idle direct-send paths.
 			if (restoreOnError) {
-				composerRef.current?.setText(restoreOnError.msg);
+				composerRef.current?.restoreInput(restoreOnError.msg, restoreOnError.fileReferences);
 				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
 				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
 				if (restoreOnError.comments.length > 0) {
-					setCommentDrafts(narratorId, restoreOnError.comments);
+					setCommentDrafts(narratorId, [
+						...restoreOnError.comments,
+						...getCommentDrafts(narratorId),
+					]);
 				}
 			}
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
@@ -5868,15 +5742,16 @@ export function NarratorPanel({
 			if (!trimmed) return;
 			void (async () => {
 				const preservedDraft = composerRef.current?.getText() ?? "";
+				const preservedFileReferences = composerRef.current?.getFileReferences() ?? [];
 				const preservedImages = attachedImagesRef.current;
 				const preservedTextFiles = attachedTextFilesRef.current;
 				try {
 					// Forward-only send: no attachments, and the in-progress draft is put
 					// back afterwards so the operator does not lose what they were typing.
-					composerRef.current?.setText(trimmed);
+					composerRef.current?.restoreInput(trimmed, []);
 					updateAttachedImages([]);
 					updateAttachedTextFiles([]);
-					await doSendBufferedRef.current(trimmed, false, undefined, false);
+					await doSendBufferedRef.current(trimmed, false, undefined, [], false);
 				} catch (err) {
 					notifications.show({
 						color: "red",
@@ -5884,7 +5759,7 @@ export function NarratorPanel({
 						message: err instanceof Error ? err.message : "",
 					});
 				} finally {
-					composerRef.current?.setText(preservedDraft);
+					composerRef.current?.restoreInput(preservedDraft, preservedFileReferences);
 					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
 					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
 				}
@@ -6019,7 +5894,13 @@ export function NarratorPanel({
 		if (queuedMessages.length > 0) {
 			cancelBuffer(narratorId);
 			// Restore the first queued message text to the input
-			composerRef.current?.setText(queuedMessages[0].text);
+			composerRef.current?.restoreInput(
+				queuedMessages[0].text,
+				(queuedMessages[0].fileReferences ?? []).map((reference) => ({
+					...reference,
+					inputRange: undefined,
+				})),
+			);
 			setQueuedMessages([]);
 		}
 	};
@@ -6030,16 +5911,29 @@ export function NarratorPanel({
 		setQueuedMessages((prev) => prev.filter((m) => m.id !== messageId));
 		// If removing the only message, restore its text to input
 		if (queuedMessages.length === 1 && msg) {
-			composerRef.current?.setText(msg.text);
+			composerRef.current?.restoreInput(
+				msg.text,
+				(msg.fileReferences ?? []).map((reference) => ({ ...reference, inputRange: undefined })),
+			);
 		}
 		api.removeBufferedMessage(narratorId, messageId).catch(() => {
 			// Rollback on failure
 			setQueuedMessages(snapshot);
 			if (queuedMessages.length === 1 && msg) {
-				composerRef.current?.setText("");
+				composerRef.current?.restoreInput("", []);
 			}
 		});
 	};
+
+	const handleRetryQueued = useCallback(
+		async (messageId: string) => {
+			const result = await api.retryBufferedMessage(narratorId, messageId);
+			// Refresh authoritative state; do not resurrect a row already consumed over WS.
+			reconcileBufferedMessages();
+			return result;
+		},
+		[narratorId, reconcileBufferedMessages],
+	);
 
 	const sensors = useSensors(
 		useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -6450,8 +6344,6 @@ export function NarratorPanel({
 					return dock ? dock.openToolTypes.has("tasks") : mobileTasksOpen;
 				case "filemod":
 					return fileModDrawerOpened;
-				case "filetree":
-					return dock?.openToolTypes.has("filetree") ?? false;
 				case "details":
 					return detailsOpened;
 				case "terminal":
@@ -6466,6 +6358,8 @@ export function NarratorPanel({
 					return dock ? dock.openToolTypes.has("browser") : mobileToolPanel === "browser";
 				case "userchat":
 					return dock ? dock.openToolTypes.has("userchat") : mobileToolPanel === "userchat";
+				case "filetree":
+					return dock?.openToolTypes.has("filetree") ?? false;
 				default:
 					return false;
 			}
@@ -7104,8 +6998,12 @@ export function NarratorPanel({
 
 	return (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
-			<ContentViewerEnvironmentProvider value={contentViewerEnvironment}>
+			<ContentViewerEnvironmentProvider
+				value={contentViewerEnvironment}
+				fileReferences={fileReferenceScope}
+			>
 				<Stack
+					data-narrator-panel
 					h="100%"
 					gap={0}
 					style={{ overflow: "hidden", position: "relative" }}
@@ -7768,6 +7666,7 @@ export function NarratorPanel({
 																pruneDividerLabel={pruneDividerLabel}
 																hasChapter={hasChapter}
 																highlightMessageId={highlightMessageId}
+																highlightRequestId={highlightRequestId}
 																tailFooter={
 																	isSubagent &&
 																	narrator &&
@@ -8026,7 +7925,7 @@ export function NarratorPanel({
 							drafts={commentDrafts}
 							onRemove={(id) => removeCommentDraft(narratorId, id)}
 							specRevisionByUri={specRevisionByUri}
-							withTopBorder={attachedImages.length === 0 && attachedTextFiles.length === 0}
+							withTopBorder={!composerHasAttachments}
 						/>
 					)}
 
@@ -8112,6 +8011,13 @@ export function NarratorPanel({
 									<Text size="xs" c="blue" fw={500} style={{ flexShrink: 0 }}>
 										{t("queuedCount", { count: queuedMessages.length })}
 									</Text>
+									{queuedMessages.some((msg) => msg.state === "failed") && (
+										<Badge color="red" size="xs" style={{ flexShrink: 0 }}>
+											{t("queuedFailedCount", {
+												count: queuedMessages.filter((msg) => msg.state === "failed").length,
+											})}
+										</Badge>
+									)}
 									<QueuedAttachmentPreview
 										images={queuedMessages[0].images ?? []}
 										textFiles={queuedMessages[0].textFiles ?? []}
@@ -8164,6 +8070,7 @@ export function NarratorPanel({
 													onCancelEdit={handleCancelEditQueued}
 													onStartEdit={handleStartEditQueued}
 													onRemove={handleRemoveQueued}
+													onRetry={handleRetryQueued}
 													cancelBufferLabel={t("cancelBuffer")}
 													editLabel={tc("edit")}
 													priorityLabel={t("queuedPriority")}
@@ -8258,7 +8165,8 @@ export function NarratorPanel({
 									{/* The current task text can be long (spec task titles especially), so
 									    reveal the full string on hover/tap when the row clips it. */}
 									<TruncatedText size="xs" c={workIndicatorColor} text={workIndicatorText} />
-									{(queuePosition != null || queueMessageValue) && (
+									{((queuePositionValue != null && queuePositionValue > 0) ||
+										queueMessageValue) && (
 										<Text size="xs" c="yellow" style={{ flexShrink: 0 }}>
 											·{" "}
 											{queueMessageValue ??
@@ -8299,6 +8207,16 @@ export function NarratorPanel({
 									}}
 								/>
 								<TruncatedText size="xs" c="dimmed" text={t(statusBarDisplay.labelKey)} />
+								{tasksSupported && tasksButtonEnabled && (
+									<BackgroundTasksStatusButton
+										runningCount={tasksRunningCount}
+										onOpen={() => {
+											// Reveal the panel, even if it is already open in an inactive tab.
+											if (dock) dock.openToolPanel("tasks");
+											else setMobileTasksOpen(true);
+										}}
+									/>
+								)}
 								{compactFailure && !isCompacting && (
 									<Text
 										size="xs"
@@ -8473,17 +8391,27 @@ export function NarratorPanel({
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
-															data={allModels.map((m) => ({
-																value: m.value,
-																label:
-																	m.value === FOLLOW_DEFAULT_MODEL
-																		? t("followDefault", { model: defaultModelValue })
-																		: m.provider === "__agg__"
-																			? `⚡ ${m.label}`
-																			: m.provider
-																				? `${m.provider}:${m.label}`
-																				: m.label,
-															}))}
+															// The menu renders the full catalog; the trigger only needs
+															// the selected option so native sizing ignores longer models.
+															data={allModels
+																.filter((m) => {
+																	const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
+																	const agg = parseAggModelValue(raw);
+																	return (
+																		m.value === (agg ? `${AGG_MODEL_PREFIX}${agg.aggId}` : raw)
+																	);
+																})
+																.map((m) => ({
+																	value: m.value,
+																	label:
+																		m.value === FOLLOW_DEFAULT_MODEL
+																			? t("followDefault", { model: defaultModelValue })
+																			: m.provider === "__agg__"
+																				? `⚡ ${m.label}`
+																				: m.provider
+																					? `${m.provider}:${m.label}`
+																					: m.label,
+																}))}
 															value={(() => {
 																const raw = narrator.model ?? FOLLOW_DEFAULT_MODEL;
 																const agg = parseAggModelValue(raw);
@@ -8496,8 +8424,13 @@ export function NarratorPanel({
 															style={{ pointerEvents: "auto" }}
 														/>
 													</Menu.Target>
-													<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+													<Menu.Dropdown
+														data-model-menu-scroll
+														style={{ maxHeight: "60vh", overflowY: "auto" }}
+													>
 														<ModelMenuItems
+															opened={modelMenuOpenDesktop}
+															aggregations={aggregations}
 															allModels={allModels}
 															currentModel={narrator.model}
 															totalCostUsd={narrator.totalCostUsd}
@@ -8511,24 +8444,19 @@ export function NarratorPanel({
 													</Menu.Dropdown>
 												</Menu>
 											</Tooltip>
-											{parseAggModelValue(narrator.model) && (
-												<AggProviderSwitcher
-													currentModel={narrator.model}
-													aggregations={aggregations}
-													providerLabels={providerLabels}
-													onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-												/>
-											)}
+
 											{/* Reasoning Effort (Codex + Anthropic providers) */}
 											{supportsReasoningEffort && (
 												<Menu position="top-end">
 													<Menu.Target>
 														<NativeSelect
 															size="xs"
-															data={reasoningEffortOptions.map((effort) => ({
-																value: effort,
-																label: t(`reasoning_${effort}`),
-															}))}
+															data={[
+																{
+																	value: displayedReasoningEffort,
+																	label: t(`reasoning_${displayedReasoningEffort}`),
+																},
+															]}
 															value={displayedReasoningEffort}
 															onChange={() => {}}
 															onMouseDown={(e: React.MouseEvent) => e.preventDefault()}
@@ -8787,8 +8715,13 @@ export function NarratorPanel({
 																	</Text>
 																</ActionIcon>
 															</Menu.Target>
-															<Menu.Dropdown style={{ maxHeight: "60vh", overflowY: "auto" }}>
+															<Menu.Dropdown
+																data-model-menu-scroll
+																style={{ maxHeight: "60vh", overflowY: "auto" }}
+															>
 																<ModelMenuItems
+																	opened={modelMenuOpenMobile}
+																	aggregations={aggregations}
 																	allModels={allModels}
 																	currentModel={narrator.model}
 																	totalCostUsd={narrator.totalCostUsd}
@@ -8805,14 +8738,7 @@ export function NarratorPanel({
 															</Menu.Dropdown>
 														</Menu>
 													</Tooltip>
-													{parseAggModelValue(narrator.model) && (
-														<AggProviderSwitcher
-															currentModel={narrator.model}
-															aggregations={aggregations}
-															providerLabels={providerLabels}
-															onSelect={(v) => modelMutation.mutate({ id: narratorId, model: v })}
-														/>
-													)}
+
 													{/* Reasoning Effort (Codex + Anthropic providers) - Mobile */}
 													{supportsReasoningEffort && (
 														<Menu position="bottom-end" withinPortal>
@@ -8986,7 +8912,7 @@ export function NarratorPanel({
 					    grouping, but the drawer it opens spans every session. */}
 					{!isWorkspacePreview && (
 						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
-							<AsyncQuestionInboxButton currentNarratorId={narratorId} />
+							<HumanAttentionInboxButton currentNarratorId={narratorId} />
 						</Box>
 					)}
 
@@ -9066,13 +8992,13 @@ export function NarratorPanel({
 									onPasteImages={handleComposerPasteImages}
 								/>
 								{(() => {
-									const hasInput = composerSendable;
+									const hasInput = composerHasText || commentDrafts.length > 0;
 									const hasAttachments = composerHasAttachments;
 
 									// Takeover button: shown while a subagent is running and not yet
 									// taken over. Clicking it interrupts the current turn and hands
 									// direct control to the user (parent tool call stays blocked).
-									if (canTakeover && !hasInput && !editingMessageState) {
+									if (canTakeover && !hasInput && !hasAttachments && !editingMessageState) {
 										return (
 											<Button
 												key="takeover"
@@ -9090,7 +9016,8 @@ export function NarratorPanel({
 									// queue / edit-submit). Extracted so it can be reused inside the
 									// takeover two-button layout.
 									const renderPrimaryActionButton = () => {
-										const showInterrupt = isActive && !hasInput && retryRecoveryAllowsInterrupt;
+										const showInterrupt =
+											isActive && !hasInput && !hasAttachments && retryRecoveryAllowsInterrupt;
 
 										// "Cut in line" describes a Stop that hands the turn over to the
 										// queued priority message. A taken-over subagent has no cut-in
@@ -9232,10 +9159,10 @@ export function NarratorPanel({
 													>
 														<Button
 															key="send-priority"
-															disabled={!hasInput}
+															disabled={!hasInput && !hasAttachments}
 															loading={isSending}
 															onPointerDown={(event) => {
-																if (!hasInput) return;
+																if (!hasInput && !hasAttachments) return;
 																startQueueHold(event);
 															}}
 															onPointerUp={handleQueuePointerUp}
@@ -9275,7 +9202,7 @@ export function NarratorPanel({
 													<Button
 														key="send"
 														onClick={handleSend}
-														disabled={!hasInput}
+														disabled={!hasInput && !hasAttachments}
 														loading={isSending}
 													>
 														{tc("send")}
@@ -9419,7 +9346,16 @@ export function NarratorPanel({
 									</Center>
 								}
 							>
-								<FileViewerContent key={internalFileViewerPath} filePath={internalFileViewerPath} />
+								<FileViewerContent
+									key={internalFileViewerPath}
+									filePath={internalFileViewerPath}
+									narratorId={narratorId}
+									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
+									referenceOrigin={!!internalFileViewerTarget}
+									selection={internalFileViewerTarget?.selection}
+									highlightRequestId={internalFileViewerTarget?.highlightRequestId}
+									onOpenFileTarget={handleOpenReferencedFile}
+								/>
 							</Suspense>
 						</Drawer>
 					)}
@@ -9461,17 +9397,25 @@ export function NarratorPanel({
 					)}
 				</Stack>
 			</ContentViewerEnvironmentProvider>
-			<RollbackConfirmModal
+			<RevertActionConfirmModal
 				narratorId={narratorId}
-				pendingRollback={pendingRollback}
+				action="rollback_to_block"
+				pending={pendingRollback}
+				submitting={revertHistorySubmitting}
 				onConfirm={confirmRollback}
-				onCancel={() => setPendingRollback(null)}
+				onCancel={() => {
+					if (!revertHistorySubmitting) setPendingRollback(null);
+				}}
 			/>
-			<BlockDeleteConfirmModal
+			<RevertActionConfirmModal
 				narratorId={narratorId}
+				action="delete_tool_block"
 				pending={pendingBlockDelete}
+				submitting={revertHistorySubmitting}
 				onConfirm={confirmBlockDelete}
-				onCancel={() => setPendingBlockDelete(null)}
+				onCancel={() => {
+					if (!revertHistorySubmitting) setPendingBlockDelete(null);
+				}}
 			/>
 			<ModelPriceModal
 				model={priceModel}

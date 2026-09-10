@@ -2288,6 +2288,19 @@ export async function* agentLoop(
 	initialToolResults?: unknown[],
 	images?: Array<{ format: string; base64: string }>,
 ): AsyncGenerator<AgentEvent> {
+	// Each loop owns its receipts. Nested reflection loops must not inherit a parent's row.
+	const executionBindings = new WeakMap<AgentToolUse, import("./types").ToolCallBinding>();
+	config.toolExecutionBindings = executionBindings;
+	const bindExecution = (tu: AgentToolUse, binding: import("./types").ToolCallBinding) => {
+		const previous = executionBindings.get(tu);
+		if (previous) {
+			if (previous.toolCallId !== binding.toolCallId || previous.attempt !== binding.attempt) {
+				throw new Error("A tool execution cannot be rebound to a different persisted attempt");
+			}
+			return;
+		}
+		executionBindings.set(tu, Object.freeze({ ...binding }));
+	};
 	const resolvedProvider = resolveProviderAndModel(config.model);
 	let provider = resolvedProvider.adapter;
 	let effectiveModel = resolvedProvider.model;
@@ -2622,11 +2635,16 @@ export async function* agentLoop(
 	 * pass start: a row written mid-turn is invisible until the next pass, and a
 	 * finished background task should not have to wait that long to be mentioned.
 	 */
+	const pendingInputConsumptions: Array<() => void> = [];
 	async function collectAfterToolsInjectionText(): Promise<string> {
 		if (!config.getAfterToolsInjections) return "";
 		try {
-			const text = await config.getAfterToolsInjections();
-			return text?.trim() ?? "";
+			const injection = await config.getAfterToolsInjections();
+			const text = (typeof injection === "string" ? injection : injection.text).trim();
+			if (text && typeof injection !== "string" && injection.onConsumed) {
+				pendingInputConsumptions.push(injection.onConsumed);
+			}
+			return text;
 		} catch (err) {
 			logger.warn("Failed to collect after-tools injections", {
 				narratorId: config.narratorId,
@@ -2668,6 +2686,9 @@ export async function* agentLoop(
 		}
 	}
 
+	// Preserve the exact build identity for delivery receipts; the model history itself
+	// is copied/mutated by provider projections and must not be used as a global inbox.
+	let sourceInputHistory = history;
 	// Shallow-copy to avoid mutating the caller's array
 	history = [...history];
 
@@ -2706,6 +2727,7 @@ export async function* agentLoop(
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
+		sourceInputHistory = replacement.history;
 		if (replacement.systemPrompt != null) {
 			config.systemPrompt = replacement.systemPrompt;
 		}
@@ -3053,6 +3075,7 @@ export async function* agentLoop(
 						: settled.output;
 					yield {
 						type: "tool_result",
+						toolCallBinding: executionBindings.get(tu),
 						toolUseId: tu.toolUseId,
 						toolName: tu.name,
 						output: baseOutput,
@@ -3117,6 +3140,7 @@ export async function* agentLoop(
 				  }
 				| undefined;
 			let requestContextPercent: number | undefined;
+			let upstreamContextPercent: number | undefined;
 			let requestMeterUsage: number | undefined;
 			let requestMeterUnit: string | undefined;
 			let sawMeaningfulResponse = false;
@@ -3276,6 +3300,13 @@ export async function* agentLoop(
 				malformedSpillReuseToken ??= `malformed:${requestId}`;
 			};
 
+			function getEstimatedUpstreamPromptTokens(): number | undefined {
+				const contextWindow = getModelContextWindow(effectiveModel, effectiveProvider);
+				return upstreamContextPercent !== undefined && contextWindow
+					? Math.round((upstreamContextPercent / 100) * contextWindow)
+					: undefined;
+			}
+
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
 				if (!requestStarted) return;
 				// Retract the live tool cards this request published but never completed.
@@ -3305,7 +3336,17 @@ export async function* agentLoop(
 					type: "api_request_end",
 					requestId,
 					credentialId,
-					usage: requestUsage,
+					// Keep measured counts independent of window occupancy. Only replace
+					// missing/zero prompt placeholders with the upstream-derived estimate.
+					usage:
+						upstreamContextPercent !== undefined && !requestUsage?.promptTokens
+							? {
+									...requestUsage,
+									inputTokens: getEstimatedUpstreamPromptTokens(),
+									promptTokens: getEstimatedUpstreamPromptTokens(),
+									completionTokens: requestUsage?.completionTokens || estimateTokens(assistantText),
+								}
+							: requestUsage,
 					ttftMs: requestTtftMs,
 					durationMs: Date.now() - requestStartTime,
 					contextPercent: requestContextPercent,
@@ -3768,6 +3809,7 @@ export async function* agentLoop(
 				requestStartPending = false;
 				requestTtftMs = undefined;
 				requestUsage = undefined;
+				upstreamContextPercent = undefined;
 				requestContextPercent = undefined;
 				requestMeterUsage = undefined;
 				requestMeterUnit = undefined;
@@ -3817,6 +3859,24 @@ export async function* agentLoop(
 				try {
 					const resetUpstreamSession = resetUpstreamSessionOnNextRequest;
 					resetUpstreamSessionOnNextRequest = false;
+					if (config.runtimeAuthorizationGuard) await config.runtimeAuthorizationGuard();
+					// This is adoption by the recipient loop, not persistence, wake admission,
+					// or upstream response success. An interrupted/preparation-failed pass never
+					// reaches it. Receipt failures cannot retract input or cause redelivery.
+					if (!attemptAbort.signal.aborted) {
+						const callbacks = pendingInputConsumptions.splice(0);
+						callbacks.unshift(() => config.onModelInputConsumed?.(sourceInputHistory, content));
+						for (const callback of callbacks) {
+							try {
+								callback();
+							} catch (error) {
+								logger.warn("Failed to acknowledge adopted model input", {
+									narratorId: config.narratorId,
+									error: String(error),
+								});
+							}
+						}
+					}
 					// Never reuse a stale snapshot after changing model/provider/transport.
 					if (!config.reflectionLoop) config.lastCodexTools = undefined;
 					const parentTools = config.lastCodexTools;
@@ -3967,6 +4027,7 @@ export async function* agentLoop(
 								// non-streaming toolUses skip that path entirely).
 								yield {
 									type: "block_complete",
+									onToolPersisted: (binding) => bindExecution(tu, binding),
 									block: {
 										type: "tool_use",
 										toolUseId: tu.toolUseId,
@@ -4152,7 +4213,9 @@ export async function* agentLoop(
 												}
 
 												// Compute streaming field delta
-												let streamingField: { name: string; delta: string } | undefined;
+												let streamingField:
+													| { name: string; delta: string; startsField?: boolean }
+													| undefined;
 												if (acc.activeStreamingField && wantedKeys.size > 0) {
 													const sfResult = extractJsonFields(raw, wantedKeys);
 													if (
@@ -4168,6 +4231,7 @@ export async function* agentLoop(
 																streamingField = {
 																	name: acc.activeStreamingField,
 																	delta: decoded.text,
+																	startsField: acc.streamingFieldYielded === 0,
 																};
 															}
 															acc.streamingFieldYielded += decoded.consumedChars;
@@ -4217,7 +4281,9 @@ export async function* agentLoop(
 											) {
 												acc.streamingMetadata = await resolveStreamingEditMetadata(acc, config.cwd);
 											}
-											let streamingField: { name: string; delta: string } | undefined;
+											let streamingField:
+												| { name: string; delta: string; startsField?: boolean }
+												| undefined;
 
 											if (acc.activeStreamingField && stopWantedKeys.size > 0) {
 												const sfResult = extractJsonFields(stopRaw, stopWantedKeys);
@@ -4234,6 +4300,7 @@ export async function* agentLoop(
 															streamingField = {
 																name: acc.activeStreamingField,
 																delta: decoded.text,
+																startsField: acc.streamingFieldYielded === 0,
 															};
 														}
 														acc.streamingFieldYielded += decoded.consumedChars;
@@ -4311,6 +4378,7 @@ export async function* agentLoop(
 										// Block is complete — yield for immediate persistence
 										yield {
 											type: "block_complete",
+											onToolPersisted: (binding) => bindExecution(tu, binding),
 											block: {
 												type: "tool_use",
 												toolUseId: id,
@@ -4384,6 +4452,7 @@ export async function* agentLoop(
 												: sr.output;
 											yield {
 												type: "tool_result",
+												toolCallBinding: executionBindings.get(prevTu),
 												toolUseId: prevTu.toolUseId,
 												toolName: prevTu.name,
 												output: baseOutput,
@@ -4519,29 +4588,20 @@ export async function* agentLoop(
 								},
 							};
 						}
-						if (parsed.contextUsagePercentage != null) {
+						if (
+							parsed.contextUsagePercentage != null &&
+							Number.isFinite(parsed.contextUsagePercentage)
+						) {
 							receivedUsage = true;
-							// Some gateways report a context-window occupancy percentage instead of
-							// raw token counts. Derive the estimated prompt token count from
-							// percentage × context window (consistent with the percentage the
-							// UI shows), and estimate output tokens from the assistant text.
+							// Upstream occupancy is independent of measured/billed token counts.
 							const ctxWin = getModelContextWindow(effectiveModel, effectiveProvider);
-							const clampedPct = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
-							requestContextPercent = clampedPct;
-							const estimatedPromptTokens = ctxWin
-								? Math.round((clampedPct / 100) * ctxWin)
-								: undefined;
+							upstreamContextPercent = Math.min(Math.max(parsed.contextUsagePercentage, 0), 100);
+							requestContextPercent = upstreamContextPercent;
+							const estimatedPromptTokens = getEstimatedUpstreamPromptTokens();
 							const estimatedCompletionTokens = estimateTokens(assistantText);
-							// Store percent-derived usage so api_request_end reports the same
-							// estimate rather than the char-heuristic fallback below.
-							requestUsage = {
-								inputTokens: estimatedPromptTokens,
-								promptTokens: estimatedPromptTokens,
-								completionTokens: estimatedCompletionTokens,
-							};
 							yield {
 								type: "context_usage",
-								percentage: parsed.contextUsagePercentage,
+								percentage: upstreamContextPercent,
 								promptTokens: estimatedPromptTokens,
 								inputTokens: estimatedPromptTokens,
 								completionTokens: estimatedCompletionTokens,
@@ -4579,16 +4639,28 @@ export async function* agentLoop(
 						// Convert OpenAI/Anthropic usage to context_usage percentage
 						if (parsed.usage && parsed.usage.promptTokens != null) {
 							receivedUsage = true;
-							// Store usage for API request tracking
+							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
+							// Merge partial counters without letting prompt/input placeholders
+							// erase known counts. Output and cache counters update independently.
 							requestUsage = {
-								promptTokens: parsed.usage.promptTokens,
-								inputTokens: parsed.usage.inputTokens,
-								completionTokens: parsed.usage.completionTokens,
-								reasoningTokens: parsed.usage.reasoningTokens,
-								cachedInputTokens: parsed.usage.cachedInputTokens,
-								cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
-								cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
-								cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
+								promptTokens: parsed.usage.promptTokens || previousUsage?.promptTokens || 0,
+								inputTokens:
+									parsed.usage.inputTokens === 0 && previousUsage?.inputTokens
+										? previousUsage.inputTokens
+										: (parsed.usage.inputTokens ?? previousUsage?.inputTokens),
+								completionTokens:
+									parsed.usage.completionTokens === 0 && previousUsage?.completionTokens
+										? previousUsage.completionTokens
+										: (parsed.usage.completionTokens ?? previousUsage?.completionTokens),
+								reasoningTokens: parsed.usage.reasoningTokens ?? previousUsage?.reasoningTokens,
+								cachedInputTokens:
+									parsed.usage.cachedInputTokens ?? previousUsage?.cachedInputTokens,
+								cacheCreationInputTokens:
+									parsed.usage.cacheCreationInputTokens ?? previousUsage?.cacheCreationInputTokens,
+								cacheCreation5mTokens:
+									parsed.usage.cacheCreation5mTokens ?? previousUsage?.cacheCreation5mTokens,
+								cacheCreation1hTokens:
+									parsed.usage.cacheCreation1hTokens ?? previousUsage?.cacheCreation1hTokens,
 							};
 							const contextWindow =
 								parsed.usage.contextWindow ??
@@ -4598,20 +4670,17 @@ export async function* agentLoop(
 							// { input_tokens: 0, output_tokens: 0 } in message_start and
 							// defer real usage to message_delta. Emitting 0% context usage
 							// causes the UI to briefly flash "0%" before showing the real value.
-							if (contextWindow && parsed.usage.promptTokens > 0) {
+							if (
+								contextWindow &&
+								parsed.usage.promptTokens > 0 &&
+								upstreamContextPercent === undefined
+							) {
 								const percentage = (parsed.usage.promptTokens / contextWindow) * 100;
 								requestContextPercent = Math.min(percentage, 100);
 								yield {
 									type: "context_usage",
 									percentage: requestContextPercent,
-									promptTokens: parsed.usage.promptTokens,
-									inputTokens: parsed.usage.inputTokens,
-									completionTokens: parsed.usage.completionTokens,
-									reasoningTokens: parsed.usage.reasoningTokens,
-									cachedInputTokens: parsed.usage.cachedInputTokens,
-									cacheCreationInputTokens: parsed.usage.cacheCreationInputTokens,
-									cacheCreation5mTokens: parsed.usage.cacheCreation5mTokens,
-									cacheCreation1hTokens: parsed.usage.cacheCreation1hTokens,
+									...requestUsage,
 									contextWindow,
 								};
 							}
@@ -5818,14 +5887,14 @@ export async function* agentLoop(
 						return;
 					}
 
-					// A positive provider usage event is preferred; the caller's latest usage
-					// is a fallback for providers that only emit an initial 0% event or do
-					// not repeat usage on every response.
+					// Explicit upstream occupancy wins, including zero. Otherwise prefer
+					// positive measured usage, then the caller's last known occupancy.
 					const callerContextUsagePercentage = config.getContextUsagePercentage?.();
 					const contextUsagePercentage =
-						requestContextPercent != null && requestContextPercent > 0
+						upstreamContextPercent ??
+						(requestContextPercent != null && requestContextPercent > 0
 							? requestContextPercent
-							: (callerContextUsagePercentage ?? requestContextPercent);
+							: (callerContextUsagePercentage ?? requestContextPercent));
 					let compactReplacement: AgentHistoryReplacement | null = null;
 					if (
 						!reasoningOnlyCompactAttempted &&
@@ -6027,7 +6096,7 @@ export async function* agentLoop(
 			// ── Estimate token usage when provider doesn't report it ──
 			// Some providers don't report token usage in their API responses.
 			// For these cases, we estimate based on text length to provide usage statistics.
-			if (!requestUsage) {
+			if (!requestUsage && upstreamContextPercent === undefined) {
 				const historyText = JSON.stringify(history);
 				const systemText = config.systemPrompt ?? "";
 				const estimatedInputTokens =
@@ -6114,6 +6183,7 @@ export async function* agentLoop(
 				const baseOutput = sr.broken ? getToolMessage("brokenToolCallResult", locale) : sr.output;
 				yield {
 					type: "tool_result",
+					toolCallBinding: executionBindings.get(tu),
 					toolUseId: tu.toolUseId,
 					toolName: tu.name,
 					output: baseOutput,
@@ -6136,6 +6206,10 @@ export async function* agentLoop(
 			// rely on this to finalize persistence, broadcast the message, run hooks, and update titles.
 			yield {
 				type: "assistant_message",
+				onToolPersisted: (toolUseId, binding) => {
+					const tu = toolUses.find((tool) => tool.toolUseId === toolUseId);
+					if (tu) bindExecution(tu, binding);
+				},
 				text: assistantText,
 				toolUses,
 				messageId,
@@ -6292,6 +6366,7 @@ export async function* agentLoop(
 
 						yield {
 							type: "tool_result",
+							toolCallBinding: executionBindings.get(tu),
 							toolUseId: tu.toolUseId,
 							toolName: tu.name,
 							output: result.broken
@@ -6379,6 +6454,7 @@ export async function* agentLoop(
 
 							yield {
 								type: "tool_result",
+								toolCallBinding: executionBindings.get(tu),
 								toolUseId: tu.toolUseId,
 								toolName: tu.name,
 								output: effectiveResult.broken
@@ -6452,6 +6528,7 @@ export async function* agentLoop(
 								yieldedToolResults.add(remainingTool.toolUseId);
 								yield {
 									type: "tool_result",
+									toolCallBinding: executionBindings.get(remainingTool),
 									toolUseId: remainingTool.toolUseId,
 									toolName: remainingTool.name,
 									output: skippedOutput,
@@ -6485,6 +6562,7 @@ export async function* agentLoop(
 								: undefined;
 							yield {
 								type: "tool_result",
+								toolCallBinding: executionBindings.get(remainingTool),
 								toolUseId: remainingTool.toolUseId,
 								toolName: remainingTool.name,
 								output: result.broken

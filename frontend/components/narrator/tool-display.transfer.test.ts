@@ -1,6 +1,25 @@
 import { describe, expect, it } from "bun:test";
 import { getCategory, getCategoryColor, getSummary } from "./tool-display";
 
+describe("Send delivery-state header summary", () => {
+	it.each([
+		{ await: true },
+		{ await: false },
+		{},
+	])("shows sending rather than a mode before queueing for %j", (input) => {
+		expect(getSummary("Send", { id: "parent", ...input })).toBe("to parent · Sending");
+		expect(
+			getSummary("Send", { id: "parent", ...input }, undefined, { communicationRunning: "发送中" }),
+		).toBe("to parent · 发送中");
+	});
+
+	it("uses projected metadata but preserves an explicit false input", () => {
+		const metadata = { await: true, targets: [{ id: "parent", status: "queued" }] };
+		expect(getSummary("Send", { _truncated: true }, metadata)).toBe("to parent · Sent · Waiting");
+		expect(getSummary("Send", { await: false }, metadata)).toBe("to parent · Sent");
+	});
+});
+
 describe("TransferFile classification", () => {
 	it("is its own category, not generic", () => {
 		// Generic is what made a transfer render as its own raw argument JSON.

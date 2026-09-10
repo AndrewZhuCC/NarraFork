@@ -24,9 +24,17 @@
  * Pure: mutates the passed store and returns whether the caller should re-render.
  */
 
+import {
+	isCommunicationTool,
+	knownSendDeliveryTargets,
+	mergeSendDeliveryTargetCount,
+	mergeSendDeliveryTargets,
+	type SendDeliveryReceipt,
+} from "@shared/communication-tool";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import {
-	getStreamingFieldPreview,
+	completeStreamingFieldRanges,
+	foldStreamingToolFields,
 	getToolOutputPreview,
 	type TopLevelStreamingChunk,
 } from "../narrator-message-helpers";
@@ -42,6 +50,80 @@ export type StreamingToolStore = Map<string, TopLevelStreamingChunk>;
  */
 const UNKNOWN_TOOL_NAME = "Tool";
 
+/** Keep navigation receipts in the live tail store, independently of lifecycle/output. */
+export function applyStreamingSendDelivery(
+	store: StreamingToolStore,
+	event: {
+		toolUseId: string;
+		targets: SendDeliveryReceipt[];
+		toolCallBinding?: { toolCallId: string; attempt: number };
+		targetCount?: number;
+	},
+): boolean {
+	if (!event.toolUseId || !Array.isArray(event.targets)) return false;
+	const existing = store.get(event.toolUseId);
+	if (
+		existing &&
+		existing.toolName !== UNKNOWN_TOOL_NAME &&
+		!isCommunicationTool({ toolName: existing.toolName, inputJson: existing._input })
+	)
+		return false;
+	const binding = existing?._sendDeliveryBinding;
+	const matchesBinding =
+		!!binding &&
+		!!event.toolCallBinding &&
+		binding.toolCallId === event.toolCallBinding.toolCallId &&
+		binding.attempt === event.toolCallBinding.attempt;
+	if (binding && event.toolCallBinding && !matchesBinding) return false;
+	const terminal =
+		(LIVE_TOOL_PHASE_RANK[existing?._status ?? ""] ?? 0) >= 3 || existing?._output != null;
+	if (terminal && !matchesBinding) return false;
+	const incoming = event.targets.filter(
+		(target) => typeof target?.deliveryMessageId === "string" && !!target.deliveryMessageId.trim(),
+	);
+	// Legacy consumption has no attempt identity. It may enrich an existing exact
+	// receipt, never seed or replace navigation on the currently running attempt.
+	const unboundConsumption =
+		!event.toolCallBinding && incoming.some((target) => target.injectionConsumedAt !== undefined);
+	const matchingReceiptsOnly = terminal || unboundConsumption;
+	const prior = knownSendDeliveryTargets({
+		_metadata: existing?._metadata,
+		outputJson: existing?._output,
+		_sendDeliveryTargets: existing?._sendDeliveryTargets,
+	});
+	const next = mergeSendDeliveryTargets(prior, incoming, matchingReceiptsOnly);
+	const targetCount = mergeSendDeliveryTargetCount(
+		existing?._sendDeliveryTargetCount,
+		unboundConsumption ? undefined : event.targetCount,
+	);
+	if (
+		(!next.length && targetCount === undefined) ||
+		(JSON.stringify(next) === JSON.stringify(existing?._sendDeliveryTargets ?? []) &&
+			targetCount === existing?._sendDeliveryTargetCount)
+	)
+		return false;
+	// Terminal and unbound consumption frames cannot seed another attempt's navigation.
+	if (
+		matchingReceiptsOnly &&
+		!incoming.some((target) =>
+			prior.some(
+				(prior) => prior.id === target.id && prior.deliveryMessageId === target.deliveryMessageId,
+			),
+		)
+	)
+		return false;
+	store.set(event.toolUseId, {
+		toolUseId: event.toolUseId,
+		inputCharsTotal: 0,
+		...existing,
+		toolName: existing?.toolName === "TeamStatus" ? "TeamStatus" : "Send",
+		_sendDeliveryTargets: next,
+		...(targetCount !== undefined ? { _sendDeliveryTargetCount: targetCount } : {}),
+		...(event.toolCallBinding ? { _sendDeliveryBinding: event.toolCallBinding } : {}),
+	});
+	return true;
+}
+
 export function createStreamingToolStore(): StreamingToolStore {
 	return new Map();
 }
@@ -55,7 +137,7 @@ export interface ToolChunkEvent {
 	extractedFields?: Record<string, string>;
 	metadata?: Record<string, unknown>;
 	/** One delta of a field being streamed (accumulated across frames). */
-	streamingField?: { name: string; delta: string };
+	streamingField?: { name: string; delta: string; startsField?: boolean };
 }
 
 /**
@@ -71,17 +153,7 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 	// events below; a late argument chunk must not demote it back to "streaming".
 	if (existing?._started) return false;
 
-	let streamingFieldName = existing?.streamingFieldName;
-	let streamingFieldValue = existing?.streamingFieldValue;
-	if (event.streamingField) {
-		const sameField = streamingFieldName === event.streamingField.name;
-		streamingFieldName = event.streamingField.name;
-		streamingFieldValue = getStreamingFieldPreview(
-			sameField
-				? `${streamingFieldValue ?? ""}${event.streamingField.delta}`
-				: event.streamingField.delta,
-		);
-	}
+	const fields = foldStreamingToolFields(existing, event);
 
 	store.set(event.toolUseId, {
 		...existing,
@@ -94,10 +166,8 @@ export function applyStreamingToolChunk(store: StreamingToolStore, event: ToolCh
 		...(event.contentCharsReceived !== undefined
 			? { contentCharsReceived: event.contentCharsReceived }
 			: {}),
-		...(event.extractedFields !== undefined ? { extractedFields: event.extractedFields } : {}),
 		...(event.metadata !== undefined ? { metadata: event.metadata } : {}),
-		...(streamingFieldName !== undefined ? { streamingFieldName } : {}),
-		...(streamingFieldValue !== undefined ? { streamingFieldValue } : {}),
+		...fields,
 	});
 	return true;
 }
@@ -203,7 +273,12 @@ export function applyStreamingToolStarted(
 		_started: true,
 		// Field-scoped guard: everything else in this object still merges normally.
 		_status: resolveLiveToolStatus(existing?._status, "initializing"),
-		...(event.input ? { _input: event.input } : {}),
+		...(event.input
+			? {
+					_input: event.input,
+					streamingFieldRanges: completeStreamingFieldRanges(existing, event.input),
+				}
+			: {}),
 		...(event.streamStartedAt != null ? { _startedAt: event.streamStartedAt } : {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
 	});
@@ -351,7 +426,12 @@ export function applyStreamingToolCompleted(
 		_status: event.status,
 		...(event.output !== undefined ? { _output: event.output } : {}),
 		...(event.durationMs != null ? { _durationMs: event.durationMs } : {}),
-		...(event.updatedInput ? { _input: event.updatedInput } : {}),
+		...(event.updatedInput
+			? {
+					_input: event.updatedInput,
+					streamingFieldRanges: completeStreamingFieldRanges(existing, event.updatedInput),
+				}
+			: {}),
 		...(event.metadata ? { _metadata: event.metadata } : {}),
 	});
 	return true;

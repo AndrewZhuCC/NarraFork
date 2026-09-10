@@ -1,8 +1,7 @@
 /**
  * Parent-narrator inbound message queue.
  *
- * Standalone module (no db dependency) to avoid circular imports between
- * narrator-session and agent-communication — mirrors bg-completion-queue.
+ * Compatibility producer/formatter over the shared persistent runtime mailbox.
  *
  * When a subagent uses `Send({ id: "parent", message })` to report progress to
  * the narrator that launched it, the message is enqueued in the shared
@@ -18,10 +17,8 @@
 import type { Locale } from "../lib/prompt-i18n";
 import { pushPendingInjection } from "./parent-injection-queue";
 
-/** Per-message content cap (defensive; progress reports should be concise). */
-const MAX_PARENT_INBOUND_CHARS = 8_000;
-
 export interface ParentInboundMessage {
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	/** Subagent narrator id that sent the message. */
 	fromId: string;
 	/** Subagent title (may be null when untitled). */
@@ -41,6 +38,8 @@ export interface ParentInboundMessage {
 	 * agents by alias and has no use for a message id.
 	 */
 	fromMessageId?: string | null;
+	/** Exact Send call in the sender's session; preferred over the legacy message target. */
+	fromToolUseId?: string;
 	/** Message text (already capped). */
 	text: string;
 	timestamp: string;
@@ -59,16 +58,7 @@ export function pushParentInboundMessage(
 	parentNarratorId: string,
 	message: ParentInboundMessage,
 ): void {
-	pushPendingInjection(parentNarratorId, {
-		kind: "subagent_message",
-		message: {
-			...message,
-			text:
-				message.text.length > MAX_PARENT_INBOUND_CHARS
-					? `${message.text.slice(0, MAX_PARENT_INBOUND_CHARS)}…[truncated]`
-					: message.text,
-		},
-	});
+	pushPendingInjection(parentNarratorId, { kind: "subagent_message", message });
 }
 
 function senderLabel(message: ParentInboundMessage, isZh: boolean): string {

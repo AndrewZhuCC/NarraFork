@@ -18,6 +18,9 @@
  */
 
 import { resolveAssistantTextDisplay, type TextCitation } from "../citations";
+import { isCommunicationTool, limitCommunicationPreview } from "../communication-tool";
+import { type FileReference, fileReferenceDisplay } from "../file-reference";
+import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { hasUsablePlanBody } from "../plan-reference";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
@@ -26,10 +29,18 @@ import {
 	rawSideCarToMarkdown,
 	readSideCarBody,
 	type SideCarBody,
+	type SideCarInboundMessage,
 	sideCarBodyToMarkdown,
 	verbatimOutputToMarkdown,
 } from "../sidecar-body";
 import { subagentResultText } from "../subagent-result-text";
+import {
+	type CommunicationState,
+	communicationSelectors,
+	communicationTargetLabel,
+	deriveCommunicationState,
+	resolveCommunicationTargets,
+} from "./communication-state";
 import type { VListElementKind } from "./element-kinds";
 import type { InjectionTarget } from "./injection-target";
 import type { RenderLod } from "./prepared-block";
@@ -50,12 +61,23 @@ import {
 	reflectionTitleKeyPrefix,
 	reflectionTitleKeySuffix,
 } from "./reflection";
+import { reconcileSourceText } from "./source-text";
 import {
 	isLiveStreamingBlock,
 	isLiveStreamingRun,
 	STREAMING_MESSAGE_ID,
 } from "./streaming-live-blocks";
-import { classifyToolDetail, isTruncated, resolveFileDiffStats } from "./tool-detail";
+import {
+	type ClassifyToolDetailInput,
+	classifyToolDetail,
+	describeToolBody,
+	isTruncated,
+	resolveFileDiffStats,
+	type ToolCappedDetail,
+	toolInputFieldRange,
+	toolInputFieldView,
+	toolOutputValue,
+} from "./tool-detail";
 import { collectTruncatedLeaves, hasTruncatedLeaf, readLeafText } from "./tool-io-projection";
 import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } from "./turn-usage";
 
@@ -189,11 +211,17 @@ export interface AdapterMessage {
  * NOTE: the real `tc` is ToolCallData — it has toolName/status/inputJson but NO
  * `summary` field (a display summary is derived downstream from inputJson). */
 export interface AdapterToolItem {
+	/** Already assigned by the producer to distinguish repeated tool-use occurrences. */
+	dedupeSuffix?: number;
 	blockIndex: number;
 	isSubagent: boolean;
 	/** Owning assistant message (present on real ToolRunItem). */
 	msg?: AdapterMessage;
 	tc: {
+		/** Actual row PK, already mapped from tool_use.tcId by message-segments. */
+		id?: string;
+		messageId?: string;
+		executionAttempt?: number;
 		toolName: string;
 		status?: string | null;
 		inputJson?: unknown;
@@ -231,6 +259,28 @@ export interface AdapterToolItem {
 		 */
 		_takenOver?: boolean;
 		[key: string]: unknown;
+	};
+}
+
+/** Height-neutral identity for on-demand payloads, independent of display/LOD keys. */
+export interface AdapterToolDetailRef {
+	toolCallId?: string;
+	messageId?: string;
+	executionAttempt?: number;
+}
+
+export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRef {
+	const messageId = item.msg?.id ?? item.tc.messageId;
+	const block = item.msg?.contentJson[item.blockIndex];
+	const attempt =
+		item.tc.executionAttempt ??
+		(block?.type === "tool_use" && block.id === item.tc.toolUseId
+			? block.executionAttempt
+			: undefined);
+	return {
+		...(item.tc.id ? { toolCallId: item.tc.id } : {}),
+		...(messageId && messageId !== "__streaming__" ? { messageId } : {}),
+		...(typeof attempt === "number" ? { executionAttempt: attempt } : {}),
 	};
 }
 
@@ -355,18 +405,6 @@ function readNonEmptyString(record: Record<string, unknown>, key: string): strin
 	return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-/**
- * Read a string field that field-level projection may have wrapped.
- *
- * `readNonEmptyString` narrows with `typeof === "string"`, which a truncated leaf
- * (`{_truncated, preview}`) fails — so the field silently vanishes from the card.
- * This keeps it visible as its preview instead.
- */
-function readLeafString(record: Record<string, unknown>, key: string): string | undefined {
-	const text = readLeafText(record[key]);
-	return text != null && text.length > 0 ? text : undefined;
-}
-
 /** Trim a possibly-null string; undefined when absent or blank. */
 function nonEmptyTrimmed(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
@@ -449,6 +487,8 @@ export interface AdapterTraceRowIdentity {
 	toolUseId?: string;
 	/** Tool rows: the raw tool name. */
 	toolName?: string;
+	/** Exact persisted ref for the inspector, independent of selection aliases. */
+	toolDetailRef?: AdapterToolDetailRef;
 }
 
 interface AdapterTraceItem {
@@ -759,8 +799,8 @@ export interface AdapterContext {
 	 * the document (the measure cache keys on the body length, so the taller card is
 	 * re-measured rather than served stale).
 	 */
-	resolveFullToolInput?: (toolUseId: string | undefined) => unknown;
-	resolveFullToolOutput?: (toolUseId: string | undefined) => unknown;
+	resolveFullToolInput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
+	resolveFullToolOutput?: (toolUseId: string | undefined, ref?: AdapterToolDetailRef) => unknown;
 	/**
 	 * A LIVE pending permission's `suggestions`, which win over the tool call's
 	 * persisted `permissionSuggestions` when resolving a reflection gate (same
@@ -1086,6 +1126,12 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
  * MessageBubble's `block.uploadNarratorId ?? message.narratorId ?? narratorId`.
  */
 function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
+	if (block.type === "file_reference") {
+		return fileReferenceDisplay({
+			type: "file_reference",
+			reference: block.reference as FileReference,
+		});
+	}
 	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
 	return {
 		type: block.type,
@@ -1200,6 +1246,50 @@ function adaptMessage(
 			const reviewBlock = blocks[reviewBlockIndex];
 			if (reviewBlock) return [adaptReviewCard(reviewBlock, idBase, reviewBlockIndex, ctx)];
 		}
+		// Send deliveries keep role=user for the model, but their structured block owns
+		// the reader-facing identity. Match it BEFORE origin erases that structure.
+		// Only communication is rerouted here; reminder/permission cards keep their
+		// existing paths, and an explicit human origin keeps its right-hand bubble.
+		const injectionIndex = blocks.findIndex((b) => b.type === "system_injection");
+		const injection = blocks[injectionIndex];
+		if (msg.origin !== "user" && injection && readCommunicationInjection(injection)) {
+			const modelFacingText = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			const spoken = adaptSpokenInjection(injection, idBase, injectionIndex, modelFacingText, ctx);
+			if (spoken) return spoken;
+		}
+		// Older Send rows have attribution but no structured body. Keep their COMPLETE
+		// text and readable label; never recover a sender id or strip prompt prefixes
+		// by guessing at the prose. Index zero is the historical user row's address.
+		if (
+			!injection &&
+			msg.origin === "assistant" &&
+			(msg.originLabel === "agentMessage" || msg.originLabel?.startsWith("agentMessage:"))
+		) {
+			const text = blocks
+				.filter((b) => b.type === "text")
+				.map((b) => b.text ?? "")
+				.join("\n");
+			return [
+				{
+					kind: "injection-bubble",
+					key: `${idBase}-b0-m-legacy`,
+					data: {
+						markdown: rawSideCarToMarkdown(text),
+						speaker: originHeadingLabel(ctx, msg.origin, msg.originLabel),
+						speakerId: null,
+						speakerKind: null,
+						target: null,
+						isBroadcast: false,
+						source: "subagent_message",
+						hasHeader: true,
+						modelFacing: text,
+					},
+				},
+			];
+		}
 		// Turns stored as role=user for protocol/scheduling reasons that no human
 		// wrote (auto-continuation, review kickoff, AI-initiated sends). Painting
 		// them as user bubbles is what made authorship ambiguous, so they get the
@@ -1230,7 +1320,12 @@ function adaptMessage(
 			.map((b) => b.text ?? "")
 			.join("\n");
 		const attachments = visible
-			.filter((b) => b.type === "image" || b.type === "text_file")
+			.filter(
+				(b) =>
+					b.type === "image" ||
+					b.type === "text_file" ||
+					(b.type === "file_reference" && b.reference),
+			)
 			.map((b) => userAttachmentData(b, msg));
 		const key = `${idBase}-bubble`;
 		const commandText =
@@ -1410,13 +1505,18 @@ function adaptMessage(
 			continue;
 		}
 		switch (kind) {
-			case "markdown":
+			case "markdown": {
+				const fileReferenceContext = normalizeFileReferenceContext(block.fileReferenceContext);
 				specs.push({
 					kind,
 					key,
 					data: markdownData(block),
+					// Missing provenance retains the legacy shape. The render boundary maps
+					// it to explicit null, never inheriting the live narrator's current cwd.
+					...(fileReferenceContext ? { opts: { fileReferenceContext } } : {}),
 				});
 				break;
+			}
 			case "web-search":
 				specs.push({ kind, key, data: webSearchData(block, ctx) });
 				break;
@@ -2210,7 +2310,7 @@ function adaptSpokenInjection(
 						? ({
 								kind: "narrator",
 								narratorId: message.fromId,
-								messageId: message.fromMessageId ?? null,
+								messageId: message.fromToolUseId ?? message.fromMessageId ?? null,
 							} satisfies InjectionTarget)
 						: null,
 					isBroadcast: message.isBroadcast === true,
@@ -2228,7 +2328,8 @@ function adaptSpokenInjection(
 	// A background task is an addressable, NAMED thing — `Bash` takes an `alias`
 	// precisely so a later `Await({ id })` can refer to it — so "run-tests finished,
 	// here is its output" has a subject in the same way a teammate's message does.
-	// The alias is what the reader launched it as, so it wins over the derived title.
+	// An agent completion identifies a subagent, so show its current narrator title;
+	// a Bash completion is instead addressed by its launch alias.
 	if (body.kind === "tasksDone") {
 		// One finished task per row (persistence delivers them singly now), so the key is
 		// the task id alone — no positional suffix.
@@ -2264,7 +2365,10 @@ function adaptSpokenInjection(
 				key: `${idBase}-b${blockIndex}-t-${task.id}`,
 				data: {
 					markdown,
-					speaker: task.alias?.trim() || task.title?.trim() || task.id,
+					speaker:
+						body.flavor === "agent"
+							? task.title?.trim() || task.alias?.trim() || task.id
+							: task.alias?.trim() || task.title?.trim() || task.id,
 					// A background task is addressable by id, which is what seeds its glyph.
 					speakerId: task.id ?? null,
 					speakerKind: task.status ?? null,
@@ -2489,11 +2593,35 @@ export const PLATFORM_INJECTION_SOURCES = new Set([
  * adding a producer here is a claim that its content has an author worth naming, and
  * that claim should be made explicitly at the point someone adds the producer.
  */
-const SPOKEN_INJECTION_SOURCES = new Set([
-	// Somebody sent the reader something.
+const COMMUNICATION_INJECTION_SOURCES = new Set([
 	"subagent_message",
+	"agent_message",
 	"team_message",
 	"group_message",
+]);
+
+/** The same structural predicate drives user-row rendering and selection ownership. */
+export function readCommunicationInjection(block: {
+	type: string;
+	source?: unknown;
+	body?: unknown;
+	bodyJson?: unknown;
+}): SideCarInboundMessage | null {
+	if (
+		block.type !== "system_injection" ||
+		typeof block.source !== "string" ||
+		!COMMUNICATION_INJECTION_SOURCES.has(block.source)
+	)
+		return null;
+	const body = readSideCarBody(block);
+	if (body?.kind !== "messages") return null;
+	const message = body.items[0];
+	return message && typeof message.text === "string" && message.text.trim() ? message : null;
+}
+
+const SPOKEN_INJECTION_SOURCES = new Set([
+	// Somebody sent the reader something.
+	...COMMUNICATION_INJECTION_SOURCES,
 	// Work the reader started reporting its own result. `bg_bash` qualifies for the
 	// same reason as `bg_agent`: an aliased background command is a named entity the
 	// system already treats as addressable, not an anonymous event.
@@ -2523,12 +2651,14 @@ function specUpdateTarget(body: SideCarBody): InjectionTarget | null {
 /**
  * Display name for one inbound message's sender.
  *
- * Mirrors `senderLabel` in `@shared/sidecar-body` (title, else an 8-char id prefix) so
+ * Mirrors `senderLabel` in `@shared/sidecar-body` (title, alias, then an 8-char id prefix) so
  * the bubble header and the model-facing text name the same participant. Falls back to
  * empty, which the render layer shows as an unnamed speaker rather than inventing one.
  */
-function spokenSpeakerLabel(message: { fromTitle?: string | null; fromId?: string }): string {
-	return message.fromTitle?.trim() || message.fromId?.slice(0, 8) || "";
+function spokenSpeakerLabel(message: SideCarInboundMessage): string {
+	return (
+		message.fromTitle?.trim() || message.fromLabel?.trim() || message.fromId?.slice(0, 8) || ""
+	);
 }
 
 function adaptSystemBlock(
@@ -2906,7 +3036,12 @@ export function groupToolItemsForLod(
 	for (let i = 0; i < items.length; i++) {
 		const item = items[i];
 		if (!item) continue;
-		if (isActiveToolItem(item) || isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)) {
+		if (
+			isCommunicationTool(item.tc) ||
+			item.isSubagent ||
+			isActiveToolItem(item) ||
+			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
+		) {
 			flush();
 			groups.push({ kind: "active", item, index: i });
 			continue;
@@ -2934,18 +3069,179 @@ interface ToolRunContext {
 	isSoleSubagent: boolean;
 }
 
+export interface CommunicationBubbleData {
+	toolUseId?: string;
+	toolName: string;
+	recipients: {
+		label: string;
+		title?: string;
+		id?: string;
+		deliveryMessageId?: string;
+		injectionConsumedAt?: string;
+	}[];
+	deliveryState?: CommunicationState;
+	broadcast: boolean;
+	message: string;
+	messageTruncated: boolean;
+	messageBody?: ToolCappedDetail;
+	labels?: Record<string, string>;
+	awaitReply: boolean;
+	status: string;
+	error?: string;
+	warning?: string;
+	timing?: Record<string, number>;
+	toolDetailRef?: AdapterToolDetailRef;
+}
+
+const COMMUNICATION_ERROR_MAX_CHARS = 2_048;
+
+function communicationRecipients(
+	input: Record<string, unknown>,
+	metadata: Record<string, unknown>,
+	tc: AdapterToolItem["tc"],
+): CommunicationBubbleData["recipients"] {
+	const selectors = communicationSelectors(input);
+	// Persisted targets define the complete set; live events may cover only a prefix.
+	const liveTargets = asObject(tc)._sendDeliveryTargets;
+	if (Array.isArray(metadata.targets) || Array.isArray(liveTargets)) {
+		return resolveCommunicationTargets(metadata, liveTargets).map((target) => {
+			const { id, deliveryMessageId } = target;
+			const title = target.title?.trim();
+			return {
+				label: communicationTargetLabel(target),
+				...(title ? { title } : {}),
+				...(id && id !== "parent" && id !== "main" ? { id } : {}),
+				...(deliveryMessageId ? { deliveryMessageId } : {}),
+				...(target.injectionConsumedAt ? { injectionConsumedAt: target.injectionConsumedAt } : {}),
+			};
+		});
+	}
+	const resolved = readNonEmptyString(tc, "_awaitAgentNarratorId");
+	// The WS event resolves only a single target, never every member of a fanout.
+	if (resolved && resolved !== "parent" && resolved !== "main" && selectors.length === 1) {
+		return [{ label: selectors[0] ?? resolved, id: resolved }];
+	}
+	return selectors.map((label) => ({ label }));
+}
+
+function buildCommunicationBubbleData(
+	item: AdapterToolItem,
+	ctx: AdapterContext,
+): CommunicationBubbleData {
+	const inputJson = withFullInput(item, ctx);
+	const input = toolInputFieldView(inputJson);
+	const metadata = asObject(resolveToolMetadata(item.tc));
+	const text = readLeafText(input.message) ?? "";
+	const preview = limitCommunicationPreview(text);
+	const message = preview.text;
+	const messageTruncated = hasTruncatedLeaf(input.message) || preview.truncated;
+	const targets = resolveCommunicationTargets(metadata, asObject(item.tc)._sendDeliveryTargets);
+	const awaitReply =
+		item.tc.toolName === "Send" &&
+		(typeof input.await === "boolean" ? input.await : metadata.await === true);
+	const deliveryState = deriveCommunicationState({
+		targets,
+		targetCount: metadata.targetCount ?? asObject(item.tc)._sendDeliveryTargetCount,
+		selectorCount: Array.isArray(metadata.targets) ? 0 : communicationSelectors(input).length,
+		awaitReply,
+		status: item.tc.status,
+	});
+	const failedTarget = targets.find(
+		(target) => target.status === "fail" || target.status === "failed" || target.status === "error",
+	);
+	const interruptedTarget = targets.find(
+		(target) =>
+			target.status === "timeout" || target.status === "aborted" || target.status === "cancelled",
+	);
+	const status = failedTarget
+		? "error"
+		: interruptedTarget
+			? String(interruptedTarget.status)
+			: (item.tc.status ?? "initializing");
+	const error =
+		readNonEmptyString(item.tc, "errorMessage") ??
+		failedTarget?.error?.trim() ??
+		(status === "fail" || status === "error" || status === "failed"
+			? (readLeafText(item.tc.outputJson) ?? readLeafText(asObject(item.tc.outputJson)._text))
+			: undefined);
+	const warning =
+		readNonEmptyString(metadata, "warning") ??
+		(interruptedTarget
+			? interruptedTarget.error?.trim() || String(interruptedTarget.status)
+			: undefined);
+	return {
+		toolUseId: item.tc.toolUseId,
+		toolName: item.tc.toolName,
+		recipients: communicationRecipients(input, metadata, item.tc),
+		broadcast: item.tc.toolName === "TeamStatus" && input.action === "broadcast",
+		message,
+		messageTruncated,
+		labels: ctx.labels,
+		messageBody: describeToolBody(
+			{
+				kind: "capped",
+				id: "input.message",
+				source: "input.message",
+				// Viewer-only reference: inline measure/render consumes bounded `message`.
+				// Keeping the source here lets an explicitly loaded payload open in full.
+				text,
+				format: "markdown",
+				live: false,
+				cap: "code",
+				followTarget: { kind: "end" },
+				textTruncated: hasTruncatedLeaf(input.message),
+			},
+			{
+				...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
+				...(item.tc.toolUseId
+					? { toolUseId: item.tc.toolUseId }
+					: { previewId: toolItemKey(item) }),
+				toolName: item.tc.toolName,
+				category: "send",
+				status: item.tc.status,
+				inputJson,
+				metadata,
+				isStreaming: isStreamingToolItem(item),
+			},
+		),
+		awaitReply,
+		deliveryState,
+		status,
+		...(error ? { error: error.slice(0, COMMUNICATION_ERROR_MAX_CHARS) } : {}),
+		...(warning ? { warning: warning.slice(0, COMMUNICATION_ERROR_MAX_CHARS) } : {}),
+		timing: cardTiming(item.tc),
+		toolDetailRef: resolveToolDetailRef(item),
+	};
+}
+
+/** Communication is dispatched before subagent cards and ignores every LOD fold. */
+function adaptCommunicationBubble(item: AdapterToolItem, ctx: AdapterContext): ElementSpec {
+	const key = toolItemKey(item);
+	return {
+		kind: "communication-bubble",
+		key,
+		unitId: key,
+		data: buildCommunicationBubbleData(item, ctx),
+		opts: { opened: true, forceExpanded: true, inRun: false, isLast: true },
+	};
+}
+
 /** Adapt a single tool item to its full card (tool-call or subagent-card). */
 function adaptToolItemFull(
 	item: AdapterToolItem,
 	ctx: AdapterContext,
 	runContext: ToolRunContext = { inRun: false, isLast: true, isSoleSubagent: false },
 ): ElementSpec {
+	const isCommunication = isCommunicationTool(item.tc);
+	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
+	// Approval controls only mount on a generic tool card. Once the decision lands,
+	// the same tool identity becomes its conversation bubble, never a subagent card.
+	if (isCommunication && !hasPendingPermission) return adaptCommunicationBubble(item, ctx);
 	const key = toolItemKey(item);
 	const opened = ctx.isExpanded?.(key);
 	const defaultOpened =
 		opened === undefined && item.isSubagent && runContext.isSoleSubagent ? true : opened;
 	const lodUserOverride = ctx.isLodUserOverride?.(key) ?? false;
-	const hasPendingPermission = ctx.resolveHasPendingPermission?.(item.tc.toolUseId) ?? false;
 	// The latest tasks.json call stays expanded at every LOD (the task board is the
 	// narrator's live working state). Like the permission flag it folds into the
 	// card's opts, so the measure cache keys the two geometries apart.
@@ -2969,9 +3265,11 @@ function adaptToolItemFull(
 		collapsesByLod:
 			!hasPendingPermission &&
 			!isActiveToolItem(item) &&
-			(ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
+			(item.isSubagent
+				? ctx.lod === 1
+				: ctx.lod === 3 || (ctx.lod === 4 && !isRecentToolItem(item, ctx))),
 	};
-	if (item.isSubagent) {
+	if (item.isSubagent && !isCommunication) {
 		const data = buildSubagentCardData(item, ctx);
 		return {
 			kind: "subagent-card",
@@ -3050,30 +3348,63 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	// whose output is the runner's `{_text, _metadata}` envelope — a finished subagent
 	// card with a blank conclusion. `withFullOutput` so a projected/truncated body is
 	// replaced by the real one once the shell fetched it.
-	const resultBody = subagentResultText(withFullOutput(item, ctx));
-	const resultText = resultBody || undefined;
+	const metadata = resolveToolMetadata(item.tc);
+	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
+	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
+	const resultContent = resultValue === undefined ? undefined : subagentResultText(outputJson);
+	const resultText = resultContent || undefined;
 	const isActive = !isTerminalStatus(item.tc.status);
 	// ── Fields carried by the persisted tool call (mirrors SubagentCard.tsx
-	// derivations). prompt/isBackground/agentType live on inputJson; Send tools
-	// carry the prompt on `message` and imply agentType "send".
+	// derivations). prompt/isBackground/agentType live on inputJson.
+	// Send is conversation content and never reaches this subagent constructor.
 	//
 	// `withFullInput` so a prompt the server had to truncate is replaced by the
 	// real body once the shell fetched it (the fetch itself is gated on the
 	// reader OPENING the prompt — see the shell's promptExpandedToolUseIds).
-	const input = asObject(withFullInput(item, ctx));
-	const isSend = item.tc.toolName === "Send";
-	// `readLeafString` (not readNonEmptyString): a truncated prompt arrives as a
-	// `{_truncated, preview}` wrapper, which a plain string check would drop —
-	// making the whole prompt block disappear instead of showing its preview.
-	const promptField = readLeafString(input, "prompt");
-	const prompt = promptField ?? (isSend ? readLeafString(input, "message") : undefined);
-	// Whether that prompt is still only a PREVIEW. Drives the shell's on-demand
-	// fetch; height-neutral (the prompt body is capped either way).
-	const promptTruncated =
-		hasTruncatedLeaf(input.prompt) || (isSend && hasTruncatedLeaf(input.message));
+	const inputJson = withFullInput(item, ctx);
+	const input = toolInputFieldView(inputJson);
+	// Preserve projected prompt previews rather than dropping wrapper values.
+	const promptSource = "input.prompt";
+	const prompt = readLeafText(input.prompt);
+	const promptTruncated = hasTruncatedLeaf(input.prompt);
+	const bodyContext: ClassifyToolDetailInput = {
+		...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
+		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: key }),
+		toolName: item.tc.toolName,
+		category: "agent",
+		status: item.tc.status,
+		inputJson,
+		outputJson,
+		metadata,
+		isStreaming: isStreamingToolItem(item),
+	};
+	const makeBody = (
+		source: ToolCappedDetail["source"],
+		text: string,
+		truncated: boolean,
+	): ToolCappedDetail =>
+		describeToolBody(
+			{
+				kind: "capped",
+				id: source,
+				source,
+				text,
+				format: source === "output.main" ? "markdown" : "text",
+				live: false,
+				cap: source === "output.main" ? "agent-result" : "code",
+				followTarget: { kind: "end" },
+				textTruncated: truncated,
+			},
+			bodyContext,
+		);
+	const promptBody =
+		prompt === undefined ? undefined : makeBody(promptSource, prompt, promptTruncated);
+	const resultBody =
+		resultContent === undefined
+			? undefined
+			: makeBody("output.main", resultContent, hasTruncatedLeaf(outputJson));
 	const isBackground = input.background === true || input.run_in_background === true;
-	const agentType =
-		readNonEmptyString(input, "subagent_type") ?? (isSend ? "send" : item.tc.toolName);
+	const agentType = readNonEmptyString(input, "subagent_type") ?? item.tc.toolName;
 	// Thinking-effort badge. Same precedence as SubagentCard.tsx minus the live
 	// narrator query (which the adapter has no access to): the activity summary
 	// already carries the child narrator's EFFECTIVE tier, so it wins over the
@@ -3093,10 +3424,12 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		description,
 		// Identity passthrough (height-neutral) so the shell can bind the
 		// on-demand prompt fetch to this exact tool call.
-		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+		...(item.tc.toolUseId
+			? { toolUseId: item.tc.toolUseId, toolDetailRef: resolveToolDetailRef(item) }
+			: {}),
 		model: activity?.model ?? undefined,
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-		...(prompt === undefined ? {} : { prompt }),
+		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is
 		// the SAME `tool-<toolUseId>` the standalone card uses, so a prompt the reader
@@ -3138,6 +3471,7 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 		timing: cardTiming(item.tc),
 		recentCallTimings,
 		resultText,
+		resultBody,
 		resultPreview: resultText?.slice(0, 120),
 	};
 }
@@ -3188,7 +3522,9 @@ function buildToolCardData(
 		// joins the fixed header row next to the remote-target badge.
 		...(resolveTakenOver(item) ? { isTakenOver: true } : {}),
 		// ── Header timing / identity passthrough (all height-neutral) ──────────
-		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : {}),
+		...(item.tc.toolUseId
+			? { toolUseId: item.tc.toolUseId, toolDetailRef: resolveToolDetailRef(item) }
+			: {}),
 		...(errorMessage ? { errorMessage } : {}),
 		...toolTimingFields(item.tc, category, metadata),
 		// How much of this payload is STILL a preview (the full one has not been
@@ -3207,12 +3543,21 @@ function buildToolCardData(
 		// Expanded detail region height model (line counts / body lines / px).
 		// null when the tool call has no meaningful detail body.
 		detail: classifyToolDetail({
+			...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
+			...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: toolItemKey(item) }),
 			toolName: item.tc.toolName,
 			category,
 			status: item.tc.status,
 			inputJson: applyPendingPlanFallback(inputJson, item, ctx),
 			outputJson,
-			metadata,
+			metadata: isCommunicationTool(item.tc)
+				? {
+						...asObject(metadata),
+						_sendDeliveryTargets: asObject(item.tc)._sendDeliveryTargets,
+						targetCount:
+							asObject(metadata).targetCount ?? asObject(item.tc)._sendDeliveryTargetCount,
+					}
+				: metadata,
 			isStreaming,
 			...(errorMessage ? { errorMessage } : {}),
 			// The reviewer's note on the permission decision lives in a TOP-LEVEL
@@ -3473,21 +3818,83 @@ function truncatedPayloadFields(
  * fetched the full payload and it was never substituted, so "load full content"
  * appeared to do nothing.
  *
- * The substitution is a WHOLE-PAYLOAD replacement: `getToolCallDetail` returns the
- * un-projected row straight from the database, i.e. the authoritative version of
- * the entire tree, so merging leaf-by-leaf would only add a reconciliation step
- * with nothing to gain. The `??` keeps the projected payload when no fetch landed.
+ * Values come from the authoritative whole payload. Edit additionally verifies
+ * source-coordinate continuity while both the old preview and full field are
+ * available, so a paused reader can keep the same source line after the fetch.
  */
+const completedEditInputs = new WeakMap<
+	object,
+	WeakMap<object, { context: string; value: unknown }>
+>();
+
 function withFullInput(item: AdapterToolItem, ctx: AdapterContext): unknown {
 	if (!ctx.resolveFullToolInput || !hasTruncatedLeaf(item.tc.inputJson)) return item.tc.inputJson;
-	return ctx.resolveFullToolInput(item.tc.toolUseId) ?? item.tc.inputJson;
+	const full = ctx.resolveFullToolInput(item.tc.toolUseId, resolveToolDetailRef(item));
+	if (full == null) return item.tc.inputJson;
+	const original = item.tc.inputJson;
+	if (
+		item.tc.toolName !== "Edit" ||
+		typeof full !== "object" ||
+		Array.isArray(full) ||
+		isTruncated(full) ||
+		!original ||
+		typeof original !== "object" ||
+		Array.isArray(original) ||
+		isTruncated(original)
+	)
+		return full;
+	// Only memoization depends on immutable payload references. Source identities
+	// are derived from call/field data below, so reconstructed objects map equally.
+	const cacheContext = JSON.stringify([
+		item.tc.toolUseId ?? null,
+		item.tc.toolUseId ? null : toolItemKey(item),
+		item.dedupeSuffix ?? null,
+		isStreamingToolItem(item) && !isTerminalStatus(item.tc.status),
+	]);
+	let cachedInputs = completedEditInputs.get(original);
+	const cached = cachedInputs?.get(full);
+	if (cached?.context === cacheContext) return cached.value;
+	const previous = toolInputFieldView(original);
+	const complete = toolInputFieldView(full);
+	const context: ClassifyToolDetailInput = {
+		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: toolItemKey(item) }),
+		...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
+		toolName: "Edit",
+		category: "file",
+		inputJson: item.tc.inputJson,
+		status: item.tc.status,
+		isStreaming: isStreamingToolItem(item),
+	};
+	const ranges = { ...asObject(asObject(full)._streamingFieldRanges) };
+	for (const field of ["old_string", "new_string"] as const) {
+		const before = readLeafText(previous[field]);
+		const after = readLeafText(complete[field]);
+		if (before === undefined || after === undefined || isTruncated(complete[field])) continue;
+		const range = toolInputFieldRange(context, field);
+		if (!range) continue;
+		// Known heads/offsets must match exactly; unknown windows may only remap
+		// when their complete observed tail matches. Neither path searches for a
+		// repeated line or changes epoch just because the payload object changed.
+		ranges[field] = reconcileSourceText({ text: before, range }, after, {
+			epoch: range.epoch,
+		}).range;
+	}
+	const value = { ...asObject(full), _streamingFieldRanges: ranges };
+	if (!cachedInputs) {
+		cachedInputs = new WeakMap();
+		completedEditInputs.set(original, cachedInputs);
+	}
+	cachedInputs.set(full, { context: cacheContext, value });
+	return value;
 }
 
 /** Full (un-truncated) tool output once the shell has fetched it. */
 function withFullOutput(item: AdapterToolItem, ctx: AdapterContext): unknown {
 	if (!ctx.resolveFullToolOutput || !hasTruncatedLeaf(item.tc.outputJson))
 		return item.tc.outputJson;
-	return ctx.resolveFullToolOutput(item.tc.toolUseId) ?? item.tc.outputJson;
+	return (
+		ctx.resolveFullToolOutput(item.tc.toolUseId, resolveToolDetailRef(item)) ?? item.tc.outputJson
+	);
 }
 
 /**
@@ -3536,6 +3943,7 @@ function toolRowIdentity(item: AdapterToolItem): AdapterTraceRowIdentity | undef
 		blockIndices: [item.blockIndex],
 		toolUseId: item.tc.toolUseId,
 		toolName: item.tc.toolName,
+		toolDetailRef: resolveToolDetailRef(item),
 	};
 }
 
@@ -3633,16 +4041,21 @@ function toolTraceItem(
  * its full expanded card at its original position at every LOD.
  */
 function adaptToolRun(items: AdapterToolItem[], ctx: AdapterContext): ElementSpec[] {
-	const isMultiRun = items.length >= 2;
-	const isSoleSubagent = items.filter((item) => item.isSubagent).length === 1;
+	const isSoleSubagent =
+		items.filter((item) => item.isSubagent && !isCommunicationTool(item.tc)).length === 1;
 	if (ctx.lod >= 3) {
-		return items.map((item, index) =>
-			adaptToolItemFull(item, ctx, {
-				inRun: isMultiRun,
-				isLast: index === items.length - 1,
+		return items.map((item, index) => {
+			// A bubble breaks the surrounding tool frame as well as the low-LOD fold.
+			const previous = items[index - 1];
+			const next = items[index + 1];
+			const previousIsTool = !!previous && !isCommunicationTool(previous.tc);
+			const nextIsTool = !!next && !isCommunicationTool(next.tc);
+			return adaptToolItemFull(item, ctx, {
+				inRun: previousIsTool || nextIsTool,
+				isLast: !nextIsTool,
 				isSoleSubagent,
-			}),
-		);
+			});
+		});
 	}
 	// Resolved once per run: the resolver is a shell closure over the latest id,
 	// and the grouping below only ever compares against it.

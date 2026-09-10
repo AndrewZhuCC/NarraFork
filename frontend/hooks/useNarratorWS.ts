@@ -430,7 +430,7 @@ interface NarratorWSCallbacks {
 		contentCharsReceived?: number,
 		extractedFields?: Record<string, string>,
 		metadata?: Record<string, unknown>,
-		streamingField?: { name: string; delta: string },
+		streamingField?: { name: string; delta: string; startsField?: boolean },
 		meta?: SubagentToolEventMeta,
 	) => void;
 	onToolCompleted?: (
@@ -477,6 +477,14 @@ interface NarratorWSCallbacks {
 		subagentNarratorId: string,
 		parentToolUseId?: string,
 	) => void;
+	/** Accepted Send receipts; their reserved message IDs may still be queued. */
+	onSendDeliveryResolved?: (
+		toolUseId: string,
+		targets: import("@shared/communication-tool").SendDeliveryReceipt[],
+		parentToolUseId?: string,
+		toolCallBinding?: { toolCallId: string; attempt: number },
+		targetCount?: number,
+	) => void;
 	onTitleUpdated?: (title: string) => void;
 	onBufferSet?: (messages: BufferMessageSummary[]) => void;
 	onBufferConsumed?: (messageId: string, remaining: BufferMessageSummary[]) => void;
@@ -489,6 +497,7 @@ interface NarratorWSCallbacks {
 	onDraftChanged?: (draft: {
 		hasDraft: boolean;
 		text: string;
+		fileReferences?: import("@shared/file-reference").FileReference[];
 		revision: number;
 		updatedAt: string | null;
 		updatedBy: string | null;
@@ -1051,7 +1060,9 @@ export function useNarratorWS(
 							data.contentCharsReceived as number | undefined,
 							data.extractedFields as Record<string, string> | undefined,
 							data.metadata as Record<string, unknown> | undefined,
-							data.streamingField as { name: string; delta: string } | undefined,
+							data.streamingField as
+								| { name: string; delta: string; startsField?: boolean }
+								| undefined,
 							subagentToolEventMeta(data),
 						);
 						break;
@@ -1114,6 +1125,15 @@ export function useNarratorWS(
 							data.parentToolUseId as string | undefined,
 						);
 						break;
+					case "send_delivery_resolved":
+						callbackOwner.callbacks.onSendDeliveryResolved?.(
+							data.toolUseId as string,
+							data.targets as import("@shared/communication-tool").SendDeliveryReceipt[],
+							data.parentToolUseId as string | undefined,
+							data.toolCallBinding as { toolCallId: string; attempt: number } | undefined,
+							data.targetCount as number | undefined,
+						);
+						break;
 					case "title_updated":
 						callbackOwner.callbacks.onTitleUpdated?.(data.title as string);
 						break;
@@ -1158,6 +1178,9 @@ export function useNarratorWS(
 						callbackOwner.callbacks.onDraftChanged?.({
 							hasDraft: !!data.hasDraft,
 							text: typeof data.text === "string" ? data.text : "",
+							fileReferences: Array.isArray(data.fileReferences)
+								? (data.fileReferences as import("@shared/file-reference").FileReference[])
+								: [],
 							revision: typeof data.revision === "number" ? data.revision : 0,
 							updatedAt: typeof data.updatedAt === "string" ? data.updatedAt : null,
 							updatedBy: typeof data.updatedBy === "string" ? data.updatedBy : null,

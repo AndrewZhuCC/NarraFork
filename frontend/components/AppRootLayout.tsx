@@ -67,6 +67,7 @@ import { useSetupWizardGuard } from "../hooks/useSetupWizardGuard";
 import { useUpdateUserPreferences, useUserPreferences } from "../hooks/useUserPreferences";
 import { useWakeLock } from "../hooks/useWakeLock";
 import { type ApiError, api, clearToken, getToken } from "../lib/api";
+import { isPublicNarratorSharePath } from "../lib/app-path-classify";
 import {
 	useAppShellHistoryEntryKey,
 	useAppShellMainScrollRestoration,
@@ -98,6 +99,7 @@ import {
 import { setStreamAnimDurationMs } from "../lib/stream-anim-duration";
 import { BrandTitle } from "./common/BrandTitle";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
+import { DataDirectorySecurityAlert } from "./DataDirectorySecurityAlert";
 import { GitMissingAlert } from "./GitMissingAlert";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
@@ -204,7 +206,8 @@ export function RootLayout() {
 	// GitMissingAlert used to render here as a full-screen overlay outside the
 	// AppShell. It is now an in-flow banner inside AppShell.Main (see below), so
 	// it no longer needs to escape the layout — and no longer hides it.
-	return isLoginPage || isOAuthConsentPage ? (
+	// A share capability must never inherit the browser's session, even for an admin.
+	return isLoginPage || isOAuthConsentPage || isPublicNarratorSharePath(location.pathname) ? (
 		<Outlet />
 	) : isPublicPage && !getToken() ? (
 		<Outlet />
@@ -1069,6 +1072,7 @@ function AuthenticatedLayout() {
 			>
 				<GitMissingAlert />
 				<StartupRecoveryAlert />
+				<DataDirectorySecurityAlert />
 				<Outlet />
 			</AppShell.Main>
 

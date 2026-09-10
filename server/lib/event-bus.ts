@@ -145,6 +145,8 @@ export type NarraForkEvent =
 			sourceChapterId: string;
 			error: string;
 	  }
+	/** Data-free invalidation after a human decision source changes. */
+	| { type: "human_attention:changed" }
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
@@ -400,6 +402,11 @@ export type NarraForkEvent =
 			revision: number;
 			reason: string;
 	  }
+	| {
+			type: "plugin:provider_models_changed";
+			pluginId: string;
+			providerInstanceId: string;
+	  }
 	// Knowledge base publish/review lifecycle. Payloads carry ONLY ids and decision
 	// scalars — never entry/draft content — so a listener can route notifications
 	// without re-reading (or leaking) classified bodies. Emitted AFTER the owning
@@ -491,9 +498,15 @@ export type NarraForkEvent =
 			roomId: string;
 			messageId: string;
 			seq: number;
-			senderUserId: string;
+			senderUserId: string | null;
 			roomKind: "dm" | "narrator";
 			/** Set for a narrator room, so a consumer can scope by narrator. */
+			narratorId: string | null;
+	  }
+	| {
+			type: "chat:message_deleted";
+			roomId: string;
+			messageId: string;
 			narratorId: string | null;
 	  }
 	| {

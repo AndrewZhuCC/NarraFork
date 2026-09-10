@@ -1,11 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import {
-	isWriteAudienceAllowed,
-	type NarratorVisibility,
-	type NarratorWriteAudience,
-} from "@shared/narrator-access";
 import { foldHandle } from "@shared/narrator-handle";
 import { and, desc, eq, inArray, isNotNull, notInArray, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -53,6 +48,7 @@ import { fastModeOverrideFromLegacyInput, legacyFastModeMirror } from "../lib/fa
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
+import { resolveNarratorAudiences } from "../lib/narrator-audiences";
 import {
 	BLOCKED_SKILLS_TRAIT_PREFIX,
 	type BlockedSkillsTrait,
@@ -93,7 +89,8 @@ import {
 } from "../lib/uploads";
 import { generateWordSlug } from "../lib/words";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
-import { claimAgentMessageOrigin } from "./agent-message-origin";
+import { agentMessageDeliveryBody } from "./agent-message-delivery";
+import { buildAgentMessageOrigin } from "./agent-message-origin";
 import type {
 	BlockAllSkillsResult,
 	BlockSkillResult,
@@ -107,17 +104,17 @@ import type {
 } from "./command-service";
 import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
-import {
-	assertNarratorAccess,
-	defaultVisibilityForNarrator,
-	defaultWriteAudienceForNarrator,
-	type NarratorAccessNeed,
-} from "./narrator-acl";
+import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
+import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
 // now happens inside `persistUserMessage`/`persistSystemMessage`, so every writer of a
 // child row gets it rather than only the subagent entry point that remembered to call it.
-import { appendMessageRef, narratorPersistence } from "./narrator-persistence";
+import {
+	appendMessageRef,
+	deleteRecipientMessageRefs,
+	narratorPersistence,
+} from "./narrator-persistence";
 import { materializeChildrenOf } from "./narrator-refs-backfill";
 import { specVfsService } from "./spec-vfs-service";
 import { removeTabFromAllUsers } from "./user-preferences-service";
@@ -335,18 +332,22 @@ export interface CreateNarratorInput {
 	 */
 	ownerUserId?: string | null;
 	/**
-	 * Read audience. Omitted means the default for the kind of narrator being
-	 * created: private for standalone, project for chapter-bound.
+	 * Read audience. Omitted follows agent.defaultNarratorVisibility; auto keeps
+	 * standalone narrators private and chapter-bound narrators project-visible.
 	 */
 	visibility?: "private" | "project" | "public";
 	/**
-	 * Write audience. Omitted means the default for the kind of narrator being
-	 * created: owner-only for standalone, project for chapter-bound.
+	 * Write audience. Omitted follows agent.defaultNarratorWriteAudience, narrowed
+	 * to effective visibility; auto uses the widest legal audience for that visibility.
 	 */
 	writeAudience?: "owner" | "project" | "public";
 }
 
 interface CreateSubagentInput {
+	/** Immutable source Agent row; omitted only for non-tool/legacy creation paths. */
+	originToolCallId?: string;
+	/** Only trusted non-tool creation paths may explicitly declare standalone provenance. */
+	subagentOriginKind?: "standalone";
 	parentNarratorId: string;
 	subagentType: string;
 	cwd: string;
@@ -1065,14 +1066,19 @@ export async function handleBashCommand(
 			durationMs,
 		})
 		.where(eq(narratorMessages.id, assistantMsgId));
-	await narratorService.updateToolCallResult(toolUseId, {
-		output: persistedOutput,
-		status,
-		errorMessage: result.isError ? result.output : undefined,
-		durationMs,
-		executionStartedAt: streamStartedAt,
-		completedAt,
-	});
+	await narratorService.updateToolCallResult(
+		toolUseId,
+		{
+			output: persistedOutput,
+			status,
+			errorMessage: result.isError ? result.output : undefined,
+			durationMs,
+			executionStartedAt: streamStartedAt,
+			completedAt,
+		},
+		assistantMsgId,
+		toolCallId,
+	);
 
 	broadcastToNarrator(narratorId, {
 		type: "tool_completed",
@@ -1184,35 +1190,6 @@ export interface PreparedNarratorCreation {
 	row: typeof narrators.$inferInsert;
 	handle: string | null;
 	handleFold: string | null;
-}
-
-/**
- * Settle the two audience columns for a new narrator, keeping the pair legal.
- *
- * The write audience is nested inside the read audience (see
- * `@shared/narrator-access`), so it is derived from whichever visibility actually
- * takes effect rather than from the chapter id independently — otherwise a caller
- * passing an explicit `visibility: "private"` would silently get a `project` write
- * audience, which is exactly the lying-column state this nesting removes.
- *
- * An explicitly supplied pair is validated rather than clamped: reaching here with an
- * illegal combination means a caller constructed it in code, which is a bug to
- * surface, not a user action to accommodate.
- */
-function resolveNarratorAudiences(
-	visibility: NarratorVisibility | undefined,
-	writeAudience: NarratorWriteAudience | undefined,
-	chapterId: string | null | undefined,
-): { visibility: NarratorVisibility; writeAudience: NarratorWriteAudience } {
-	const effectiveVisibility = visibility ?? defaultVisibilityForNarrator(chapterId);
-	const effectiveWriteAudience =
-		writeAudience ?? defaultWriteAudienceForNarrator(effectiveVisibility);
-	if (!isWriteAudienceAllowed(effectiveVisibility, effectiveWriteAudience)) {
-		throw new ValidationError(
-			`Write audience "${effectiveWriteAudience}" is wider than visibility "${effectiveVisibility}"`,
-		);
-	}
-	return { visibility: effectiveVisibility, writeAudience: effectiveWriteAudience };
 }
 
 export async function prepareNarratorCreation(
@@ -1355,7 +1332,13 @@ export async function prepareNarratorCreation(
 			oauthPolicySnapshotJson: input.oauthPolicySnapshotJson ?? null,
 			defaultDeviceId: input.defaultDeviceId ?? null,
 			ownerUserId: input.ownerUserId ?? null,
-			...resolveNarratorAudiences(input.visibility, input.writeAudience, chapterId),
+			...resolveNarratorAudiences(
+				input.visibility,
+				input.writeAudience,
+				chapterId,
+				settings.agent.defaultNarratorVisibility,
+				settings.agent.defaultNarratorWriteAudience,
+			),
 			inheritMode: "fresh",
 			status: "idle",
 			title: input.title ?? null,
@@ -1405,10 +1388,39 @@ export const narratorService = {
 	},
 
 	async createSubagent(input: CreateSubagentInput) {
+		if (input.subagentOriginKind === "standalone" && input.originToolCallId != null) {
+			throw new ValidationError("Standalone subagents cannot have an Agent tool-call origin");
+		}
 		const parent = await this.getById(input.parentNarratorId);
 
 		if (isSubagentVariant(parent.variant)) {
 			throw new ValidationError("Subagents cannot spawn nested subagents");
+		}
+		if (input.originToolCallId != null) {
+			const origin = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, input.originToolCallId),
+				columns: {
+					narratorId: true,
+					toolUseId: true,
+					toolName: true,
+					status: true,
+					executionAttempt: true,
+					executionStartedAt: true,
+				},
+			});
+			if (
+				!origin ||
+				origin.narratorId !== input.parentNarratorId ||
+				origin.toolName !== "Agent" ||
+				origin.status !== "running" ||
+				!origin.executionStartedAt
+			) {
+				throw new ValidationError("Subagent origin must be its parent's executing Agent row");
+			}
+			await narratorPersistence.validateToolCallBinding(input.parentNarratorId, origin.toolUseId, {
+				toolCallId: input.originToolCallId,
+				attempt: origin.executionAttempt,
+			});
 		}
 
 		const now = new Date().toISOString();
@@ -1473,6 +1485,9 @@ export const narratorService = {
 				behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
 				behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
 				parentNarratorId: input.parentNarratorId,
+				originToolCallId: input.originToolCallId ?? null,
+				subagentOriginKind:
+					input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
 				cwd: input.cwd,
 				defaultDeviceId: input.defaultDeviceId ?? parent.defaultDeviceId ?? null,
 				// A subagent is part of its parent's work, so its access is DELEGATED to the
@@ -1618,15 +1633,10 @@ export const narratorService = {
 	 * there is one insert path for user rows again. Three things remain this method's
 	 * own, and each is a decision the generic entry point must NOT make:
 	 *
-	 * 1. **Registry attribution.** Three routes reach this method (the in-pass drain,
-	 *    the pass-restart drain, `resumeSubagent`) and any of them may carry either a
-	 *    human's typed message or a message another AGENT sent through `Send`. Those two
-	 *    are indistinguishable by the time they arrive — same text, same `createdBy` (the
-	 *    human whose session triggered the send) — so the delivery registry is consulted
-	 *    instead of trusting the row's shape. Claiming is consume-once and MUST happen on
-	 *    exactly the routes that deliver agent-to-agent messages; doing it inside
-	 *    `persistUserMessage` would let an unrelated primary-narrator turn with identical
-	 *    text claim a subagent's pending attribution.
+	 * 1. **Explicit delivery attribution.** The in-pass drain, pass-restart drain and
+	 *    `resumeSubagent` carry an envelope only for agent-authored messages. It owns
+	 *    the exact reserved message ID and reader-facing body. No text/hash registry is
+	 *    consulted: a cleared, reordered or failed delivery cannot label human input.
 	 * 2. **Withholding the creator for AI-authored text.** `createdBy` stays audit data,
 	 *    but the creator ROW is what a bubble header renders as the author, so a machine's
 	 *    words must not be signed with a real person's avatar. The generic path keeps
@@ -1646,20 +1656,26 @@ export const narratorService = {
 		options?: {
 			images?: ImageRef[];
 			textFiles?: TextFileRef[];
+			fileReferences?: import("@shared/file-reference").FileReferenceSnapshot[];
 			commandText?: string | null;
 			createdBy?: string | null;
 			origin?: MessageOriginOptions;
+			delivery?: import("./agent-message-delivery").AgentMessageDelivery;
+			mailboxClaim?: import("./agent-runtime/mailbox-types").MailboxClaim;
 		},
 	) {
-		// Claimed unconditionally: `claimAgentMessageOrigin` returns null for an
-		// ordinary human message, and claiming is consume-once so the attribution
-		// cannot leak onto a later message that repeats the same text.
-		const claimed = claimAgentMessageOrigin(narratorId, text);
-		const origin = options?.origin ?? claimed ?? undefined;
+		const delivery = options?.delivery;
+		if (delivery && delivery.recipientNarratorId !== narratorId) {
+			throw new ValidationError("Agent delivery recipient does not match message recipient");
+		}
+		const origin =
+			options?.origin ?? (delivery ? buildAgentMessageOrigin(delivery.sender) : undefined);
 		const contentJson: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| SystemInjectionBlock
 			| { type: "text_file"; filename: string; size: number; filePath: string }
+			| import("@shared/file-reference").FileReferenceSnapshot
 		> = [];
 		for (const image of options?.images ?? []) {
 			contentJson.push(imageRefToContentBlock(image));
@@ -1672,7 +1688,13 @@ export const narratorService = {
 				filePath: file.filePath,
 			});
 		}
+		contentJson.push(...(options?.fileReferences ?? []));
 		contentJson.push({ type: "text", text });
+		if (delivery) {
+			contentJson.push(
+				buildSystemInjectionBlock("subagent_message", agentMessageDeliveryBody(delivery)),
+			);
+		}
 		const effectiveText =
 			(!text.trim() && (options?.images?.length ?? 0) > 0 ? "[user sent image(s)]" : text) +
 			buildAttachedFilesHint(options?.textFiles ?? []);
@@ -1683,7 +1705,11 @@ export const narratorService = {
 			options?.commandText ?? null,
 			options?.createdBy ?? null,
 			origin,
-			{ parentToolUseId },
+			{
+				parentToolUseId,
+				messageId: delivery?.recipientMessageId,
+				mailboxClaim: options?.mailboxClaim ?? delivery?.mailboxClaim,
+			},
 		);
 		// See (2) above: withheld here rather than in the shared entry point, so the
 		// row's `created_by` survives as audit data while the rendered author does not
@@ -1862,7 +1888,7 @@ export const narratorService = {
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.subagentNarratorId, narratorId)).run();
 			tx.delete(backgroundTasks).where(eq(backgroundTasks.parentNarratorId, narratorId)).run();
 			tx.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)).run();
-			tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
+			deleteRecipientMessageRefs(tx).where(eq(narratorMessageRefs.narratorId, narratorId)).run();
 
 			const sharedRows = tx
 				.select({
@@ -1935,6 +1961,8 @@ export const narratorService = {
 			tx.delete(narrators).where(eq(narrators.id, narratorId)).run();
 			return transition;
 		});
+		// FK cascades remove durable questions without emitting their own lifecycle frames.
+		eventBus.emit({ type: "human_attention:changed" });
 		if (bindingTransition) {
 			await integrationResourceBindingService.recordTransitionAudit(
 				"resource_binding.delete",
@@ -2776,9 +2804,13 @@ export const narratorService = {
 	getMessageLocation: narratorMessageQueries.getMessageLocation.bind(narratorMessageQueries),
 	getMessagesAfter: narratorMessageQueries.getMessagesAfter.bind(narratorMessageQueries),
 	getToolCallDetail: narratorMessageQueries.getToolCallDetail.bind(narratorMessageQueries),
+	getToolCallPreviewMetadata:
+		narratorMessageQueries.getToolCallPreviewMetadata.bind(narratorMessageQueries),
 	getCompactSummary: narratorMessageQueries.getCompactSummary.bind(narratorMessageQueries),
 	deleteCompactMessage: narratorMessageQueries.deleteCompactMessage.bind(narratorMessageQueries),
 	deleteMessage: narratorMessageQueries.deleteMessage.bind(narratorMessageQueries),
+	deleteEmptyRetryPlaceholder:
+		narratorMessageQueries.deleteEmptyRetryPlaceholder.bind(narratorMessageQueries),
 	deleteDanglingReasoningMessage:
 		narratorMessageQueries.deleteDanglingReasoningMessage.bind(narratorMessageQueries),
 	dismissSpecCarryoverMessage:

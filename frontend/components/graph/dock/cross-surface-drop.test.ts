@@ -18,7 +18,10 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
-import { shouldAcceptForeignPanel } from "./cross-surface-drop";
+import type { DockviewApi, DockviewDidDropEvent } from "dockview-react";
+import { fileDockPanelId } from "../../narrator/dock/dock-panel-types";
+import type { NarratorDockContextValue } from "../../narrator/dock/NarratorDockContext";
+import { handleForeignPanelDrop, shouldAcceptForeignPanel } from "./cross-surface-drop";
 import { __resetChapterDockRegistry, registerDetachedDock } from "./dock-registry";
 
 /** A dockview api stub exposing just the panel lookup this module uses. */
@@ -38,6 +41,100 @@ function mountSurface(nodeId: string, panels: Record<string, unknown>) {
 
 afterEach(() => {
 	__resetChapterDockRegistry();
+});
+
+describe("historical file cross-surface drop", () => {
+	it("rebuilds the historical panel without replacing an existing live editor", () => {
+		const toolEdit = {
+			narratorId: "origin",
+			toolUseId: "sdk-id",
+			toolCallId: "row",
+			executionAttempt: 2,
+		};
+		const params = {
+			panelType: "file",
+			filePath: "/a.ts",
+			deviceId: "Remote",
+			referenceOrigin: true,
+			toolEdit,
+		};
+		const historicalId = fileDockPanelId(params.filePath, params.deviceId, toolEdit);
+		const liveId = fileDockPanelId(params.filePath, params.deviceId);
+		const events: string[] = [];
+		let sourceOpen = true;
+		const sourcePanel = {
+			id: historicalId,
+			params,
+			api: {
+				close: () => {
+					events.push("close");
+					sourceOpen = false;
+				},
+			},
+		};
+		registerDetachedDock("source", "chapter", {
+			apiRef: {
+				current: {
+					getPanel: (id: string) => (sourceOpen && id === historicalId ? sourcePanel : undefined),
+				},
+			},
+		} as unknown as NarratorDockContextValue);
+		const live = {
+			id: liveId,
+			params: { panelType: "file", filePath: "/a.ts", deviceId: "Remote" },
+		};
+		const added: Array<{ id: string; params: unknown }> = [];
+		const api = {
+			getPanel: (id: string) => (id === liveId ? live : undefined),
+			addPanel: (panel: { id: string; params: unknown }) => {
+				events.push("add");
+				added.push(panel);
+			},
+		} as unknown as DockviewApi;
+		expect(
+			handleForeignPanelDrop(
+				{ getData: () => ({ panelId: historicalId }) } as unknown as DockviewDidDropEvent,
+				api,
+				{ narratorId: "target-host", chapterId: "chapter" },
+			),
+		).toBe(true);
+		expect(events).toEqual(["close", "add"]);
+		expect(added[0]).toMatchObject({ id: historicalId, component: "file", params });
+		expect(api.getPanel(liveId)).toBe(live as never);
+		expect(live.params).not.toHaveProperty("toolEdit");
+	});
+});
+
+it("drops a child reader beside the host's same-path editor without rebinding authority", () => {
+	const filePath = "/work/b/a.ts";
+	const childId = fileDockPanelId(filePath, "local", undefined, "child");
+	const hostId = fileDockPanelId(filePath);
+	const params = {
+		panelType: "file",
+		filePath,
+		deviceId: "local",
+		referenceOrigin: true,
+		fileNarratorId: "child",
+	};
+	const source = { id: childId, params, api: { close() {} } };
+	registerDetachedDock("source", "chapter", {
+		apiRef: { current: { getPanel: (id: string) => (id === childId ? source : undefined) } },
+	} as unknown as NarratorDockContextValue);
+	const host = { id: hostId, params: { panelType: "file", filePath } };
+	const added: Array<{ id: string; params: unknown }> = [];
+	const api = {
+		getPanel: (id: string) => (id === hostId ? host : undefined),
+		addPanel: (panel: { id: string; params: unknown }) => added.push(panel),
+	} as unknown as DockviewApi;
+	expect(
+		handleForeignPanelDrop(
+			{ getData: () => ({ panelId: childId }) } as unknown as DockviewDidDropEvent,
+			api,
+			{ narratorId: "parent", chapterId: "chapter" },
+		),
+	).toBe(true);
+	expect(added[0]).toMatchObject({ id: childId, params });
+	expect(api.getPanel(hostId)).toBe(host as never);
 });
 
 describe("shouldAcceptForeignPanel", () => {

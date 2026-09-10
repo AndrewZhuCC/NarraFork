@@ -14,9 +14,21 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { segmentMessages } from "../message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { groupRenderUnits } from "../render-units";
+import type { MeasuredCommunicationBubble } from "./measure/measure-communication-bubble";
+import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { installCanvasStub } from "./measure/test-canvas-stub";
+import { buildPretextLayoutManifest } from "./pretext-layout-manifest";
 import { VLIST_REGISTRY } from "./registry";
-import { type AdapterContext, type AdapterSegment, adaptSegments } from "./segment-adapter";
+import {
+	type AdapterContext,
+	type AdapterRenderUnit,
+	type AdapterSegment,
+	adaptSegments,
+	type CommunicationBubbleData,
+} from "./segment-adapter";
+import { toolCompletedPatch } from "./vlist-live-events";
+import { buildSelectionIndex } from "./vlist-selection";
 
 const disposeCanvasStub = installCanvasStub();
 afterAll(() => disposeCanvasStub());
@@ -68,6 +80,190 @@ function textMessage(id: string, role: string, text: string): NarratorMsg {
 		children: [],
 	} as unknown as NarratorMsg;
 }
+
+describe("subagent cards default to folded at L1 and expanded at L2–L5", () => {
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s keeps multiple finished subagents between their ordinary-tool neighbours", (lod) => {
+		const message = {
+			...toolMessage(),
+			contentJson: ["Read", "Agent", "Agent", "Read"].map((name, index) => ({
+				type: "tool_use",
+				id: `call-${index}`,
+				name,
+				input:
+					name === "Agent"
+						? { subagent_type: "explore", description: "Inspect auth", prompt: "Check auth" }
+						: { file_path: "/repo/auth.ts" },
+				status: "success",
+				outputJson: { _text: "Finished inspection" },
+			})),
+			toolCalls: [],
+		} as unknown as NarratorMsg;
+		const units = groupRenderUnits(segmentMessages([message]), lod <= 2).map((unit, i) =>
+			unit.kind === "activity" ? { ...unit, key: `activity-${i}` } : unit,
+		) as unknown as AdapterRenderUnit[];
+		const built = buildPretextLayoutManifest({
+			layoutRevision: "subagent-low-lod",
+			documentRevision: 1,
+			lod,
+			widthBucket: "600",
+			renderUnits: units,
+			contentWidth: 600,
+			viewportHeight: 720,
+			resolveSource: () => ({ firstSeq: 1, lastSeq: 1, sourceMessageIds: [message.id] }),
+		});
+		expect(built.items.map((item) => item.spec.kind)).toEqual([
+			lod <= 2 ? "activity-trace" : "tool-call",
+			"subagent-card",
+			"subagent-card",
+			lod <= 2 ? "activity-trace" : "tool-call",
+		]);
+		for (const item of built.items.filter((item) => item.spec.kind === "subagent-card")) {
+			expect(item.spec.opts?.collapsesByLod).toBe(lod === 1);
+			const measured = item.measured as MeasuredSubagent;
+			expect(measured.effectiveExpanded).toBe(lod !== 1);
+			expect(measured.resultBlockHeight > 0).toBe(lod !== 1);
+			for (const opened of [false, true]) {
+				const toggled = VLIST_REGISTRY["subagent-card"].measure(item.spec.data, 600, lod, {
+					...item.spec.opts,
+					...(lod === 1 ? { lodUserOverride: opened } : { opened }),
+				}) as MeasuredSubagent;
+				expect(toggled.effectiveExpanded).toBe(opened);
+			}
+		}
+	});
+});
+
+describe("communication × real messages, manifest and selection", () => {
+	function send(id: string, seq: number, status = "success"): NarratorMsg {
+		return {
+			...toolMessage(),
+			id,
+			seq,
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "send-real",
+					tcId: `call-${id}`,
+					name: "Send",
+					input: { name: "worker", message: "**hello**" },
+					status,
+					outputJson: { _metadata: { targets: [{ id: "worker-real", label: "worker" }] } },
+				},
+			],
+			toolCalls: [],
+		} as unknown as NarratorMsg;
+	}
+	function layout(messages: NarratorMsg[], lod: 1 | 2 | 3 | 4 | 5) {
+		const units = groupRenderUnits(segmentMessages(messages), lod <= 2).map((unit, i) =>
+			unit.kind === "activity" ? { ...unit, key: `activity-${i}` } : unit,
+		) as unknown as AdapterRenderUnit[];
+		return buildPretextLayoutManifest({
+			layoutRevision: "communication",
+			documentRevision: 1,
+			lod,
+			widthBucket: "600",
+			renderUnits: units,
+			contentWidth: 600,
+			viewportHeight: 720,
+			resolveSource: () => ({
+				firstSeq: 1,
+				lastSeq: 3,
+				sourceMessageIds: messages.map((m) => m.id),
+			}),
+		});
+	}
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s preserves call identity and selection while retiring the synthetic twin", (lod) => {
+		const persisted = send("saved", 1);
+		const live = send("__streaming__", 3, "running");
+		const separator = { ...textMessage("answer", "assistant", "between"), seq: 2 };
+		const built = layout([persisted, separator, live], lod);
+		const bubbles = built.items.filter((item) => item.spec.kind === "communication-bubble");
+		expect(bubbles).toHaveLength(1);
+		const bubble = bubbles[0];
+		if (!bubble) throw new Error("missing communication bubble");
+		const data = bubble.spec.data as CommunicationBubbleData;
+		expect(bubble.spec.key).toBe("tool-send-real");
+		expect(bubble.spec.unitId).toBe("tool-send-real");
+		expect(data).toMatchObject({
+			message: "**hello**",
+			toolUseId: "send-real",
+			toolName: "Send",
+			recipients: [{ id: "worker-real", label: "worker" }],
+			toolDetailRef: { toolCallId: "call-saved", messageId: "saved" },
+		});
+		expect(bubble.measured.height).toBeGreaterThan(30);
+		const selection = buildSelectionIndex([persisted, separator]);
+		expect(selection.byBlockId.get(`tc-${data.toolUseId}`)).toMatchObject({
+			messageId: "saved",
+			blockId: "tc-send-real",
+			blockIndex: 0,
+		});
+		expect(built.items.map((item) => item.spec.kind)).toEqual(["communication-bubble", "markdown"]);
+		const liveOnly = layout([live], lod).items[0];
+		expect(liveOnly?.spec.key).toBe(bubble.spec.key);
+		expect(liveOnly?.spec.unitId).toBe(bubble.spec.unitId);
+	});
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s maps a real fail completion without errorMessage through adapter and measurement", (lod) => {
+		for (const toolName of ["Send", "TeamStatus"]) {
+			const running = send("live-failure", 1, "running");
+			running.contentJson = running.contentJson.map((block) => ({
+				...block,
+				name: toolName,
+				input: { name: "worker", target_id: "worker", action: "send", message: "**hello**" },
+			}));
+			const before = layout([running], lod).items[0];
+			for (const output of [
+				"Send error: target missing",
+				{ _text: "Send error: target missing" },
+				undefined,
+			]) {
+				// Production completion writes status/output only, never errorMessage.
+				const patched = toolCompletedPatch({
+					toolUseId: "send-real",
+					status: "fail",
+					output,
+					durationMs: 123,
+				})([running]);
+				expect(patched.changed).toBe(true);
+				expect(patched.messages[0]?.contentJson[0]?.errorMessage).toBeUndefined();
+				const failed = layout([...patched.messages], lod).items[0];
+				if (!before || !failed) throw new Error("missing communication item");
+				const data = failed.spec.data as CommunicationBubbleData;
+				const measured = failed.measured as MeasuredCommunicationBubble;
+				expect(failed.spec.kind).toBe("communication-bubble");
+				expect(failed.spec.key).toBe(before.spec.key);
+				expect(data).toMatchObject({
+					status: "fail",
+					message: "**hello**",
+					timing: { durationMs: 123 },
+				});
+				expect(data.error).toBe(output === undefined ? undefined : "Send error: target missing");
+				expect(measured.errorTop).toBeGreaterThanOrEqual(0);
+				expect(measured.errorText).toBe(data.error ?? "");
+				expect(measured.height).toBeGreaterThan(before.measured.height);
+			}
+		}
+	});
+
+	it.each([
+		1, 2, 3, 4, 5,
+	] as const)("L%s gives persisted retries independent keys and exact refs", (lod) => {
+		const items = layout([send("retry-one", 1), send("retry-two", 2)], lod).items;
+		expect(items.map((item) => item.spec.key)).toEqual(["tool-send-real", "tool-send-real#dup1"]);
+		expect(new Set(items.map((item) => item.spec.unitId)).size).toBe(2);
+		expect(
+			items.map((item) => (item.spec.data as CommunicationBubbleData).toolDetailRef?.messageId),
+		).toEqual(["retry-one", "retry-two"]);
+	});
+});
 
 describe("adapter × real segmentMessages", () => {
 	it("adapts real segments to registry kinds with defined tool data", () => {

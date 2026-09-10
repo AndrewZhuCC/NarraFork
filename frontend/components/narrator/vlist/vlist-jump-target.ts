@@ -14,6 +14,56 @@
  * testable without a server.
  */
 
+import type { PretextLayoutIndex } from "@shared/pretext-layout/index";
+
+/** Prefer an exact tool row over the first row of its owning assistant message. */
+export function jumpTargetItemIndex(index: PretextLayoutIndex, target: string): number | undefined {
+	const id = jumpTargetMessageId(target);
+	return index.itemByKey(`tool-${id}`)?.index ?? index.itemIndicesForSourceMessageId(id)[0];
+}
+
+/** Center inside this viewport only; native scrollIntoView also moves ancestors. */
+export function jumpTargetScrollTop(viewport: HTMLElement, target: HTMLElement): number {
+	const viewportRect = viewport.getBoundingClientRect();
+	const targetRect = target.getBoundingClientRect();
+	// Rects are visual pixels under classic graph zoom; scroll metrics are layout
+	// pixels. offsetHeight includes borders (and scrollbars), just like the rect.
+	const measuredScale = viewport.offsetHeight ? viewportRect.height / viewport.offsetHeight : 1;
+	const scale = Number.isFinite(measuredScale) && measuredScale > 0 ? measuredScale : 1;
+	return Math.max(
+		0,
+		Math.min(
+			viewport.scrollHeight - viewport.clientHeight,
+			viewport.scrollTop +
+				(targetRect.top - viewportRect.top) / scale -
+				viewport.clientTop -
+				(viewport.clientHeight - targetRect.height / scale) / 2,
+		),
+	);
+}
+
+/** Look only inside this list: docked sessions can render the same message ids. */
+export function mountedJumpTarget(
+	root: HTMLElement,
+	domIds: readonly string[],
+	targetIds: readonly string[],
+): HTMLElement | null {
+	for (const target of targetIds) {
+		const key = `tool-${jumpTargetMessageId(target)}`;
+		const row = root.querySelector<HTMLElement>(`[data-nf-row-key="${CSS.escape(key)}"]`);
+		if (row) return row;
+	}
+	const candidates = [
+		...domIds,
+		...targetIds.flatMap((target) => [target, `msg-${jumpTargetMessageId(target)}`]),
+	];
+	for (const id of candidates) {
+		const element = root.querySelector<HTMLElement>(`[id="${CSS.escape(id)}"]`);
+		if (element) return element.closest<HTMLElement>("[data-nf-row-key]") ?? element;
+	}
+	return null;
+}
+
 /** Resolve a message id to its top-level ref seq (`getMessageLocation`). */
 export type JumpMessageLocationFetcher = (messageId: string) => Promise<{
 	seq: number;

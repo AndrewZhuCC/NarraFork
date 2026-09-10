@@ -1,11 +1,14 @@
 import { notifications } from "@mantine/notifications";
 import { DEFAULT_BRAND_ICON_COLOR } from "@shared/branding";
 import { cloneDefaultContextThresholds } from "@shared/context-thresholds";
+import type {
+	SubagentAllowedModels,
+	SubagentModelReasoningEfforts,
+} from "@shared/subagent-model-policy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ensurePrefix } from "../components/providers/types";
-import type { SubagentAllowedModels } from "../components/settings/ModelsSection";
 import { api } from "../lib/api";
 import type {
 	CommandBlacklistRuleInput,
@@ -16,6 +19,8 @@ import type {
 import { normalizeRuleTargetSelector } from "../lib/api/types";
 import { normalizeUrlProtocol } from "../lib/url";
 
+export type DefaultNarratorVisibility = "auto" | "private" | "public";
+export type DefaultNarratorWriteAudience = "auto" | "owner" | "project" | "public";
 export type DangerReflectionLevel = "off" | "light" | "standard" | "strict";
 export type AutoContinuationMode = "always" | "blockStop" | "protectedOnly" | "off";
 
@@ -49,11 +54,14 @@ export interface InstanceSettingsState {
 	subagentSearchModel: string;
 	subagentReviewModel: string;
 	subagentAllowedModels: SubagentAllowedModels;
+	subagentModelReasoningEfforts: SubagentModelReasoningEfforts;
 	legacyEncoding: boolean;
 	freshShellEnv: boolean;
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
 	requestDumpErrorsOnly: boolean;
+	defaultNarratorVisibility: DefaultNarratorVisibility;
+	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
 	defaultStartInPlanMode: boolean;
 	defaultRelaxedPlan: boolean;
 	defaultPruneEnabled: boolean;
@@ -167,11 +175,14 @@ function makeDefaults(): InstanceSettingsState {
 		subagentSearchModel: "",
 		subagentReviewModel: "",
 		subagentAllowedModels: { explore: [], plan: [], general: [], search: [], review: [] },
+		subagentModelReasoningEfforts: {},
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
+		defaultNarratorVisibility: "auto",
+		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
 		defaultRelaxedPlan: false,
 		defaultPruneEnabled: false,
@@ -259,6 +270,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				brandIconColor: settings.branding?.iconColor ?? DEFAULT_BRAND_ICON_COLOR,
 				defaultModel: ensurePrefix(settings.agent?.defaultModel ?? ""),
 				permissionMode: settings.agent?.defaultPermissionMode ?? "default",
+				defaultNarratorVisibility: settings.agent?.defaultNarratorVisibility ?? "auto",
+				defaultNarratorWriteAudience: settings.agent?.defaultNarratorWriteAudience ?? "auto",
 				defaultStartInPlanMode: settings.agent?.defaultStartInPlanMode ?? false,
 				summaryModel: ensurePrefix(settings.agent?.summaryModel ?? ""),
 				translationModel: settings.agent?.translationModel?.startsWith("__")
@@ -276,6 +289,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					search: settings.agent?.subagentAllowedModels?.search ?? [],
 					review: settings.agent?.subagentAllowedModels?.review ?? [],
 				},
+				subagentModelReasoningEfforts: settings.agent?.subagentModelReasoningEfforts ?? {},
 				legacyEncoding: settings.agent?.legacyEncoding ?? false,
 				freshShellEnv: settings.agent?.freshShellEnv ?? false,
 				translateReasoning: settings.agent?.translateReasoning ?? false,
@@ -359,6 +373,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	}, [isDirty]);
 
 	const save = () => {
+		if (!initialized) return;
 		const normalizedUpdateServerUrl = normalizeUrlProtocol(state.updateServerUrl) ?? "";
 		const normalizedState = {
 			...state,
@@ -400,11 +415,17 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 						review: state.subagentReviewModel,
 					},
 					subagentAllowedModels: state.subagentAllowedModels,
+					...(JSON.stringify(state.subagentModelReasoningEfforts) !==
+					JSON.stringify(serverSnapshot.current.subagentModelReasoningEfforts)
+						? { subagentModelReasoningEfforts: state.subagentModelReasoningEfforts }
+						: {}),
 					legacyEncoding: state.legacyEncoding,
 					freshShellEnv: state.freshShellEnv,
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
 					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
+					defaultNarratorVisibility: state.defaultNarratorVisibility,
+					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,
 					defaultRelaxedPlan: state.defaultRelaxedPlan,
 					defaultPruneEnabled: state.defaultPruneEnabled,

@@ -1,5 +1,6 @@
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateShortId } from "@server/lib/id";
+import type { ToolCallBinding } from "../lib/agent/types";
 
 const DEFAULT_REPLY_TIMEOUT_MS = 60_000;
 const MAX_REPLY_TIMEOUT_MS = 86_400_000;
@@ -26,7 +27,23 @@ export type SendAwaitTargetStatus =
 	| "cancelled"
 	| "taken_over";
 
-export interface SendAwaitTargetSnapshot {
+/** Coordinates are captured at Send acceptance; restoring never substitutes the current revision. */
+export interface SendAwaitDeliveryCoordinates {
+	deliveryId?: string;
+	recipientRefId?: string;
+	revision?: number;
+}
+export function snapshotDeliveryCoordinates(
+	input: SendAwaitDeliveryCoordinates,
+): SendAwaitDeliveryCoordinates {
+	return {
+		...(input.deliveryId !== undefined ? { deliveryId: input.deliveryId } : {}),
+		...(input.recipientRefId !== undefined ? { recipientRefId: input.recipientRefId } : {}),
+		...(input.revision !== undefined ? { revision: input.revision } : {}),
+	};
+}
+export interface SendAwaitTargetSnapshot extends SendAwaitDeliveryCoordinates {
+	deliveryMessageId?: string;
 	id: string;
 	title?: string | null;
 	status: SendAwaitTargetStatus;
@@ -35,7 +52,10 @@ export interface SendAwaitTargetSnapshot {
 	error?: string;
 }
 
-export interface AgentReplyWaitSnapshot {
+export interface AgentReplyWaitSnapshot extends SendAwaitDeliveryCoordinates {
+	requesterMessageId?: string;
+	requesterToolCallBinding?: ToolCallBinding;
+	deliveryMessageId?: string;
 	toolUseId: string;
 	requestId: string;
 	requesterId: string;
@@ -50,6 +70,8 @@ export interface AgentReplyWaitSnapshot {
 }
 
 export interface AgentReplyWaitRunSnapshot {
+	targetCount?: number;
+	requesterToolCallBinding?: ToolCallBinding;
 	toolUseId: string;
 	requesterId: string;
 	doInterrupt: boolean;
@@ -79,6 +101,7 @@ interface ActiveAgentReplyWaitRun {
 }
 
 export interface AgentReplyWaitRunHandle {
+	setTargetCount?: (count: number) => void;
 	readonly toolUseId: string;
 	readonly token: string;
 	markStable: (input?: {
@@ -97,7 +120,17 @@ export interface AgentReplyWaitHandle {
 	fail: (error: string) => void;
 	updateSnapshot: (
 		input: Partial<
-			Pick<AgentReplyWaitSnapshot, "label" | "title" | "deliveryNote" | "interrupted">
+			Pick<
+				AgentReplyWaitSnapshot,
+				| "label"
+				| "title"
+				| "deliveryNote"
+				| "interrupted"
+				| "deliveryMessageId"
+				| "deliveryId"
+				| "recipientRefId"
+				| "revision"
+			>
 		>,
 	) => void;
 }
@@ -110,6 +143,70 @@ const activeReplyWaitRuns = hotSafe(
 	"narrafork:activeAgentReplyWaitRuns:v1",
 	() => new Map<string, ActiveAgentReplyWaitRun>(),
 );
+
+/** Exact active-run receipts for a loaded tool row; no text lookup or history scan. */
+export function getActiveSendDeliveryTargets(
+	requesterId: string,
+	toolUseId: string,
+	toolCallBinding?: ToolCallBinding,
+): Array<
+	SendAwaitDeliveryCoordinates & { id: string; deliveryMessageId: string; title?: string | null }
+> {
+	const run = activeReplyWaitRuns.get(toolUseId);
+	if (!run || run.snapshot.requesterId !== requesterId) return [];
+	const binding = run.snapshot.requesterToolCallBinding;
+	if (toolCallBinding && !binding) return [];
+	if (
+		binding &&
+		(binding.toolCallId !== toolCallBinding?.toolCallId ||
+			binding.attempt !== toolCallBinding?.attempt)
+	)
+		return [];
+	return [
+		...run.snapshot.waiters.flatMap((waiter) =>
+			waiter.deliveryMessageId
+				? [
+						{
+							id: waiter.responderId,
+							deliveryMessageId: waiter.deliveryMessageId,
+							...snapshotDeliveryCoordinates(waiter),
+							title: waiter.title,
+						},
+					]
+				: [],
+		),
+		...run.snapshot.prefixTargets.flatMap((target) =>
+			target.deliveryMessageId
+				? [
+						{
+							id: target.id,
+							deliveryMessageId: target.deliveryMessageId,
+							title: target.title,
+							...snapshotDeliveryCoordinates(target),
+						},
+					]
+				: [],
+		),
+	];
+}
+
+export function getActiveSendDeliveryTargetCount(
+	requesterId: string,
+	toolUseId: string,
+	toolCallBinding?: ToolCallBinding,
+): number | undefined {
+	const run = activeReplyWaitRuns.get(toolUseId);
+	if (!run || run.snapshot.requesterId !== requesterId) return undefined;
+	const binding = run.snapshot.requesterToolCallBinding;
+	if (toolCallBinding && !binding) return undefined;
+	if (
+		binding &&
+		(binding.toolCallId !== toolCallBinding?.toolCallId ||
+			binding.attempt !== toolCallBinding?.attempt)
+	)
+		return undefined;
+	return run.snapshot.targetCount;
+}
 
 function sameScope(a: AgentReplyScope, b: AgentReplyScope): boolean {
 	return a.type === b.type && a.id === b.id;
@@ -183,6 +280,7 @@ function activeRunForHandle(handle: AgentReplyWaitRunHandle): ActiveAgentReplyWa
 }
 
 export function beginAgentReplyWaitRun(input: {
+	requesterToolCallBinding?: ToolCallBinding;
 	toolUseId: string;
 	requesterId: string;
 	doInterrupt?: boolean;
@@ -195,6 +293,9 @@ export function beginAgentReplyWaitRun(input: {
 	const run: ActiveAgentReplyWaitRun = {
 		token,
 		snapshot: {
+			...(input.requesterToolCallBinding
+				? { requesterToolCallBinding: { ...input.requesterToolCallBinding } }
+				: {}),
 			toolUseId: input.toolUseId,
 			requesterId: input.requesterId,
 			doInterrupt: input.doInterrupt ?? false,
@@ -211,6 +312,10 @@ export function beginAgentReplyWaitRun(input: {
 	const handle: AgentReplyWaitRunHandle = {
 		toolUseId: input.toolUseId,
 		token,
+		setTargetCount: (count) => {
+			const active = activeRunForHandle(handle);
+			if (active && Number.isSafeInteger(count) && count >= 0) active.snapshot.targetCount = count;
+		},
 		markStable: (stableInput = {}) => {
 			const active = activeRunForHandle(handle);
 			if (!active) return;
@@ -308,21 +413,26 @@ function resolveDeadline(input: { timeoutMs?: number; deadlineAt?: string }): st
 	return new Date(Date.now() + timeoutMs).toISOString();
 }
 
-export function registerAgentReplyWait(opts: {
-	requesterId: string;
-	responderId: string;
-	scope: AgentReplyScope;
-	timeoutMs?: number;
-	deadlineAt?: string;
-	requestId?: string;
-	signal?: AbortSignal;
-	run?: AgentReplyWaitRunHandle;
-	toolUseId?: string;
-	label?: string;
-	title?: string | null;
-	deliveryNote?: string;
-	interrupted?: boolean;
-}): AgentReplyWaitHandle {
+export function registerAgentReplyWait(
+	opts: SendAwaitDeliveryCoordinates & {
+		requesterMessageId?: string;
+		requesterToolCallBinding?: ToolCallBinding;
+		requesterId: string;
+		responderId: string;
+		scope: AgentReplyScope;
+		timeoutMs?: number;
+		deadlineAt?: string;
+		requestId?: string;
+		signal?: AbortSignal;
+		run?: AgentReplyWaitRunHandle;
+		toolUseId?: string;
+		label?: string;
+		title?: string | null;
+		deliveryNote?: string;
+		interrupted?: boolean;
+		deliveryMessageId?: string;
+	},
+): AgentReplyWaitHandle {
 	const deadlineAt = resolveDeadline(opts);
 	let resolvePromise!: (result: AgentReplyWaitResult) => void;
 	const promise = new Promise<AgentReplyWaitResult>((resolve) => {
@@ -338,6 +448,10 @@ export function registerAgentReplyWait(opts: {
 	const toolUseId = opts.toolUseId ?? opts.run?.toolUseId;
 	const attachedSnapshot = toolUseId
 		? attachWaiterSnapshot(opts.run, {
+				...(opts.requesterMessageId ? { requesterMessageId: opts.requesterMessageId } : {}),
+				...(opts.requesterToolCallBinding
+					? { requesterToolCallBinding: { ...opts.requesterToolCallBinding } }
+					: {}),
 				toolUseId,
 				requestId,
 				requesterId: opts.requesterId,
@@ -348,6 +462,8 @@ export function registerAgentReplyWait(opts: {
 				title: opts.title,
 				deliveryNote: opts.deliveryNote ?? "",
 				interrupted: opts.interrupted,
+				deliveryMessageId: opts.deliveryMessageId,
+				...snapshotDeliveryCoordinates(opts),
 			})
 		: undefined;
 	const entry: PendingAgentReplyWait = {
@@ -416,23 +532,42 @@ export function registerAgentReplyWaitFromSnapshot(
 		title: snapshot.title,
 		deliveryNote: snapshot.deliveryNote,
 		interrupted: snapshot.interrupted,
+		deliveryMessageId: snapshot.deliveryMessageId,
+		...snapshotDeliveryCoordinates(snapshot),
+		requesterMessageId: snapshot.requesterMessageId,
+		requesterToolCallBinding: snapshot.requesterToolCallBinding,
 	});
 }
 
 export interface ResolvePendingAgentReplyResult {
+	recipientMessageId?: string;
+	/** The existing waiting Send row receives this reply; no ordinary inbox message. */
+	recipientToolUseId?: string;
 	matched: boolean;
 	requestId?: string;
 	ambiguous?: boolean;
 	error?: string;
 }
 
-export function resolvePendingAgentReply(opts: {
+interface AgentReplySelector {
 	fromNarratorId: string;
 	toNarratorId: string;
 	scope: AgentReplyScope;
-	message: string;
 	replyTo?: string;
-}): ResolvePendingAgentReplyResult {
+}
+export interface PreparedAgentReply {
+	readonly requestId: string;
+	readonly requesterId: string;
+	readonly responderId: string;
+	readonly scope: Readonly<AgentReplyScope>;
+}
+export type AgentReplyPreparation =
+	| { matched: true; prepared: PreparedAgentReply }
+	| { matched: false; ambiguous?: boolean; error?: string };
+const preparedReplyEntries = new WeakMap<PreparedAgentReply, PendingAgentReplyWait>();
+
+/** Pure matching: resolve exact scope/identity and reject ambiguity without settling any waiter. */
+export function preparePendingAgentReply(opts: AgentReplySelector): AgentReplyPreparation {
 	let entry: PendingAgentReplyWait | undefined;
 	if (opts.replyTo) {
 		entry = pendingReplyWaits.get(opts.replyTo);
@@ -463,16 +598,59 @@ export function resolvePendingAgentReply(opts: {
 		entry = candidates[0];
 	}
 
+	if (!entry) return { matched: false };
+	const prepared = Object.freeze({
+		requestId: entry.requestId,
+		requesterId: entry.requesterId,
+		responderId: entry.responderId,
+		scope: Object.freeze({ ...entry.scope }),
+	});
+	preparedReplyEntries.set(prepared, entry);
+	return { matched: true, prepared };
+}
+
+/** A prepared match cannot be reused after timeout, cancellation or replacement with the same ID. */
+export function isPreparedAgentReplyPending(prepared: PreparedAgentReply): boolean {
+	const entry = preparedReplyEntries.get(prepared);
+	return (
+		!!entry &&
+		pendingReplyWaits.get(prepared.requestId) === entry &&
+		entry.requesterId === prepared.requesterId &&
+		entry.responderId === prepared.responderId &&
+		sameScope(entry.scope, prepared.scope)
+	);
+}
+export function settlePreparedAgentReply(
+	prepared: PreparedAgentReply,
+	text: string,
+): ResolvePendingAgentReplyResult {
+	const entry = preparedReplyEntries.get(prepared);
+	if (!entry || !isPreparedAgentReplyPending(prepared))
+		return { matched: false, error: "Prepared Send reply request is no longer pending." };
 	const message =
-		opts.message.length > MAX_REPLY_CHARS
-			? `${opts.message.slice(0, MAX_REPLY_CHARS)}…[truncated]`
-			: opts.message;
+		text.length > MAX_REPLY_CHARS ? `${text.slice(0, MAX_REPLY_CHARS)}…[truncated]` : text;
 	const matched = settlePendingReply(entry, {
 		status: "replied",
 		message,
 		receivedAt: new Date().toISOString(),
 	});
-	return matched ? { matched: true, requestId: entry.requestId } : { matched: false };
+	return matched
+		? {
+				matched: true,
+				requestId: entry.requestId,
+				...(entry.snapshot?.requesterMessageId
+					? { recipientMessageId: entry.snapshot.requesterMessageId }
+					: {}),
+				...(entry.snapshot?.toolUseId ? { recipientToolUseId: entry.snapshot.toolUseId } : {}),
+			}
+		: { matched: false };
+}
+
+export function resolvePendingAgentReply(
+	opts: AgentReplySelector & { message: string },
+): ResolvePendingAgentReplyResult {
+	const match = preparePendingAgentReply(opts);
+	return match.matched ? settlePreparedAgentReply(match.prepared, opts.message) : match;
 }
 
 export function clearPendingAgentReplyWaits(): void {

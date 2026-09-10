@@ -46,7 +46,10 @@ import {
 	syncPluginUiContributions,
 } from "@frontend/components/plugins";
 import { createAppPluginHostLocal } from "@frontend/components/plugins/app-host-local";
-import { handlePluginUiNotification } from "@frontend/components/plugins/notifications";
+import {
+	handlePluginUiNotification,
+	invalidatePluginModelQueries,
+} from "@frontend/components/plugins/notifications";
 import { useBranding } from "@frontend/hooks/useBranding";
 import { usePluginContributions } from "@frontend/hooks/usePluginContributions";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
@@ -65,6 +68,7 @@ import {
 	RouteChunkErrorBoundary,
 	RoutePendingIndicator,
 } from "./components/common/RouteChunkErrorBoundary";
+import { isPublicNarratorSharePath } from "./lib/app-path-classify";
 import { getRouterBasepath } from "./lib/base-path";
 import i18n from "./lib/i18n";
 import { mantineTheme } from "./lib/mantine-theme";
@@ -160,7 +164,11 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	React.useEffect(
 		() =>
 			narratorWSManager.onConnectionChange((connected, isReconnect) => {
-				if (connected && isReconnect) void syncPluginUiContributions().catch(() => {});
+				if (!connected) return;
+				// Includes the first connection: startup discovery may finish between the initial
+				// settings request and WS subscription, not only while reconnecting.
+				invalidatePluginModelQueries(queryClient);
+				if (isReconnect) void syncPluginUiContributions().catch(() => {});
 			}),
 		[],
 	);
@@ -169,10 +177,13 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	// refetch the bounded HTTP snapshot so every open panel converges quickly.
 	React.useEffect(() => {
 		const listener = narratorWSManager.addListener(
-			{ types: ["plugin_contributions_changed"] },
-			() => {
-				invalidatePluginUiContributions();
-				void queryClient.invalidateQueries({ queryKey: ["plugins", "ui-contributions"] });
+			{ types: ["plugin_contributions_changed", "plugin_provider_models_changed"] },
+			(message) => {
+				invalidatePluginModelQueries(queryClient);
+				if (message.type === "plugin_contributions_changed") {
+					invalidatePluginUiContributions();
+					void queryClient.invalidateQueries({ queryKey: ["plugins", "ui-contributions"] });
+				}
 			},
 		);
 		return () => narratorWSManager.removeListener(listener);
@@ -282,6 +293,25 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
  */
 export function App({ history }: { history: RouterHistory }) {
 	const [router] = React.useState(() => createAppRouter(history));
+	// History lives outside RouterProvider. Subscribe here so both cold opens and
+	// client-side navigation unmount the authenticated plugin hosts before a share renders.
+	const subscribe = React.useCallback((notify: () => void) => history.subscribe(notify), [history]);
+	const isPublicShare = React.useSyncExternalStore(
+		subscribe,
+		() => isPublicNarratorSharePath(history.location.pathname, getRouterBasepath()),
+		() => false,
+	);
+	const routeContent = (
+		<React.Suspense
+			fallback={
+				<Center h="100vh">
+					<Loader />
+				</Center>
+			}
+		>
+			<RouterProvider router={router} />
+		</React.Suspense>
+	);
 
 	return (
 		<MantineProvider
@@ -292,20 +322,16 @@ export function App({ history }: { history: RouterHistory }) {
 			<DatesProvider settings={{ firstDayOfWeek: 1 }}>
 				<ConfirmDialogProvider>
 					<ImageViewerProvider>
-						<AppNotifications />
+						{!isPublicShare && <AppNotifications />}
 						<QueryClientProvider client={queryClient}>
-							<PluginThemeInjector />
-							<PluginRuntimeShell>
-								<React.Suspense
-									fallback={
-										<Center h="100vh">
-											<Loader />
-										</Center>
-									}
-								>
-									<RouterProvider router={router} />
-								</React.Suspense>
-							</PluginRuntimeShell>
+							{isPublicShare ? (
+								routeContent
+							) : (
+								<>
+									<PluginThemeInjector />
+									<PluginRuntimeShell>{routeContent}</PluginRuntimeShell>
+								</>
+							)}
 						</QueryClientProvider>
 					</ImageViewerProvider>
 				</ConfirmDialogProvider>

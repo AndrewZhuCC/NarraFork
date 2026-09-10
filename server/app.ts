@@ -28,6 +28,7 @@ import { customSubagentRoutes } from "./routes/custom-subagents";
 import { dashboardRoutes } from "./routes/dashboard";
 import { dependencyRoutes } from "./routes/dependencies";
 import { deviceRoutes } from "./routes/devices";
+import { editorDocumentRoutes } from "./routes/editor-documents";
 import executionLogRoutes from "./routes/execution-log";
 import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
 import { externalV1Routes } from "./routes/external-v1";
@@ -59,6 +60,10 @@ import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectDbRoutes } from "./routes/project-db";
 import { projectRoutes } from "./routes/projects";
+import {
+	publicNarratorShareManagementRoutes,
+	publicNarratorShareRoutes,
+} from "./routes/public-narrator-shares";
 import { reviewsRouter } from "./routes/reviews";
 import { routineRoutes } from "./routes/routines";
 import { rulerRoutes } from "./routes/ruler";
@@ -294,6 +299,9 @@ app.route("/api/oauth", oauthRoutes);
 // but the router itself requires an OAuth principal and enforces scope + resource ownership.
 app.route("/api/external/v1", externalV1Routes);
 
+// Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
+app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
+
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
 // to the internal UI/API surface.
@@ -326,10 +334,6 @@ const GIT_REQUIRED_RULES: readonly GitRequiredRule[] = [
 	// Commit file diff endpoints need git diff-tree. Commit list/details can fall
 	// back to database records, so they are intentionally not blocked here.
 	{ methods: ["GET"], pattern: /^\/api\/chapters\/[^/]+\/commits\/[^/]+\/files(?:\/|$)/ },
-	// Starting a tutorial lesson provisions the sandbox with git init + a commit.
-	// Only the start path: browsing the catalog and reading progress are database
-	// -only, and a user without git should still be able to read the lessons.
-	{ methods: ["POST"], pattern: /^\/api\/tutorial\/[^/]+\/start$/ },
 ];
 
 function requiresGit(method: string, path: string): boolean {
@@ -354,6 +358,8 @@ app.route("/api/chapters", chapterRoutes);
 app.route("/api/chapters", gitRoutes);
 app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
+app.route("/api/narrators", publicNarratorShareManagementRoutes);
+app.route("/api/narrators", editorDocumentRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
 app.route("/api/terminals", terminalRoutes);

@@ -1,4 +1,8 @@
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
+import {
+	CYBER_POLICY_VIOLATION_CODE,
+	normalizePolicyViolationCode,
+} from "@shared/agent-protocol/policy-violation";
 import { eq, sql } from "drizzle-orm";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import type WebSocket from "ws";
@@ -12,7 +16,8 @@ import {
 	stripResponsesLiteHeader,
 } from "../user-agent";
 import { deriveCodexWindowId } from "./codex-request";
-import { parseUpstreamErrorEnvelope } from "./error-diagnostics";
+import { parseErrorDiagnostics, parseUpstreamErrorEnvelope } from "./error-diagnostics";
+import { ProviderInvalidStateError } from "./error-handling";
 import { parseGatewayDataEvent } from "./gateway-events";
 import {
 	type OAIMessage,
@@ -22,6 +27,7 @@ import {
 	type ResponsesToolAccum,
 } from "./openai-provider";
 import type { ParsedStreamEvent } from "./provider";
+import { type ApiRequestDumpCollector, sanitizeHeaders } from "./request-dump";
 
 const RESPONSES_WS_BETA_HEADER = "responses_websockets=2026-02-06";
 const TURN_STATE_HEADER = "x-codex-turn-state";
@@ -183,7 +189,10 @@ export interface StreamCodexResponsesWebSocketOptions {
 	 * Applied last so they can override the built-in defaults.
 	 */
 	extraHeaders?: Record<string, string>;
-	/** Observe the exact request envelope and effective handshake headers. */
+	/** Optional, request-scoped raw transcript capture (not attached to the cached session). */
+	requestDump?: ApiRequestDumpCollector;
+	requestDumpMaxBytes?: number;
+	/** Observe the first exact request envelope and effective handshake headers. */
 	onRequestPrepared?: (request: {
 		url: string;
 		headers: Record<string, string>;
@@ -375,6 +384,43 @@ export function isCodexWebSocketPreviousResponseMissingError(
 	error: CodexWrappedErrorEvent,
 ): boolean {
 	return wrappedErrorCodes(error).includes(PREVIOUS_RESPONSE_NOT_FOUND_CODE);
+}
+
+/**
+ * Recover the normalized policy-violation code (e.g. `cyber_policy`) carried by
+ * a wrapped upstream error, or null. Checks every code-bearing field because
+ * the observed payloads split the signal across `code` and `type`.
+ */
+function wrappedPolicyViolationCode(error: CodexWrappedErrorEvent): string | null {
+	for (const code of wrappedErrorCodes(error)) {
+		const violation = normalizePolicyViolationCode(code);
+		if (violation) return violation;
+	}
+	return null;
+}
+
+/**
+ * Build the terminal invalidState event for a policy violation, mirroring what
+ * `parseResponsesAPIEvent` produces for a streamed `response.failed`. The whole
+ * point of this shape is reuse: the agent loop's classifier reads
+ * `invalidState.reason`, so a violation emitted this way is terminal (never
+ * retried, resumed, or failed over) with no transport-specific handling.
+ */
+function buildPolicyViolationEvent(
+	code: string,
+	message: string,
+	status?: number,
+): ParsedStreamEvent {
+	return {
+		invalidState: {
+			reason: code,
+			message,
+			diagnostics: parseErrorDiagnostics(
+				{ code, statusCode: status, message },
+				{ source: "provider", phase: "policy_violation", reason: code, message },
+			),
+		},
+	};
 }
 
 export function decidePrematureCodexReconnect(
@@ -594,44 +640,23 @@ function coerceWrappedError(value: unknown): CodexWrappedErrorEvent | null {
 	const obj = asRecord(value);
 	if (!obj) return null;
 
+	const envelope = parseUpstreamErrorEnvelope(obj);
+	if (!envelope && obj.type !== "error") return null;
+
+	// Normalize even type="error": its error may be a string or carry detail
+	// instead of message. Returning the original frame here made the formatter
+	// discard the upstream explanation. Conversely, a normal message/status is
+	// not enough to declare failure — use the shared positive error recognizer.
 	const nested = asRecord(obj.error);
-	const hasStructuredError =
-		nested &&
-		(typeof nested.message === "string" ||
-			typeof nested.code === "string" ||
-			typeof nested.type === "string");
-	const hasFlatError =
-		typeof obj.message === "string" ||
-		typeof obj.code === "string" ||
-		typeof obj.status === "number" ||
-		typeof obj.status_code === "number";
-
-	if (obj.type === "error") return obj as unknown as CodexWrappedErrorEvent;
-	if (hasStructuredError) return { ...(obj as object), type: "error" } as CodexWrappedErrorEvent;
-
-	if (!hasFlatError) {
-		// The checks above only look at `message`/`code`/`type`. Fall back to the shared
-		// envelope recognizer, which also reads `detail` / `description` and a
-		// string-valued `error`. Without it those payloads returned null here and the
-		// frame was treated as ordinary content — so the upstream explanation was
-		// dropped and the turn ended up reported as having produced nothing.
-		const envelope = parseUpstreamErrorEnvelope(obj);
-		if (!envelope) return null;
-		return {
-			type: "error",
-			status: envelope.statusCode,
-			error: { code: envelope.code, message: envelope.message },
-		};
-	}
-
 	return {
+		...obj,
 		type: "error",
-		status: typeof obj.status === "number" ? obj.status : undefined,
-		status_code: typeof obj.status_code === "number" ? obj.status_code : undefined,
+		status: envelope?.statusCode,
 		error: {
-			code: typeof obj.code === "string" ? obj.code : undefined,
-			type: typeof obj.type === "string" ? obj.type : undefined,
-			message: typeof obj.message === "string" ? obj.message : undefined,
+			...nested,
+			code: envelope?.code,
+			type: typeof nested?.type === "string" ? nested.type.trim() || undefined : undefined,
+			message: envelope?.message ?? "Codex WebSocket request failed",
 		},
 	};
 }
@@ -659,6 +684,17 @@ export function findCodexRecoverableCloseCode(
 	return null;
 }
 
+/**
+ * Salvage a policy-violation code from a truncated close reason. RFC 6455 caps
+ * close reasons at 123 bytes, so the JSON payload upstream writes there is
+ * usually cut mid-string and unparseable — but the machine code itself appears
+ * verbatim and never occurs in prose, which makes a substring check exact here
+ * (the same argument as {@link findCodexRecoverableCloseCode}).
+ */
+export function findCodexPolicyViolationCloseCode(text: string): string | null {
+	return text.includes(CYBER_POLICY_VIOLATION_CODE) ? CYBER_POLICY_VIOLATION_CODE : null;
+}
+
 export function parseCodexWrappedError(text: string): CodexWrappedErrorEvent | null {
 	const trimmed = text.trim();
 	if (!trimmed) return null;
@@ -683,15 +719,18 @@ export function parseCodexWrappedError(text: string): CodexWrappedErrorEvent | n
 	return null;
 }
 
-function formatWrappedError(error: CodexWrappedErrorEvent): Error {
-	const dynamicError = error as CodexWrappedErrorEvent & { code?: string; message?: string };
+function formatWrappedError(error: CodexWrappedErrorEvent): ProviderInvalidStateError {
 	const status = error.status ?? error.status_code;
-	const code = error.error?.code ?? error.error?.type ?? dynamicError.code;
-	const message = error.error?.message ?? dynamicError.message ?? "Codex WebSocket request failed";
-	const suffix = [status ? `status=${status}` : null, code ? `code=${code}` : null]
-		.filter(Boolean)
-		.join(", ");
-	return new Error(suffix ? `${message} (${suffix})` : message);
+	const reason = error.error?.code ?? error.error?.type ?? "api_error";
+	const message = error.error?.message ?? "Codex WebSocket request failed";
+	// Preserve machine-readable fields through the normal provider/loop error path.
+	// A message-only Error loses status/code and falls back to keyword retry guesses.
+	return new ProviderInvalidStateError(reason, message, {
+		diagnostics: parseErrorDiagnostics(
+			{ ...error, statusCode: status, code: reason, message },
+			{ source: "provider", phase: "websocket_error", reason, message },
+		),
+	});
 }
 
 export function buildCodexResponsesWebSocketRequest(
@@ -795,6 +834,7 @@ function isCodexWebSocketAbortError(error: unknown): boolean {
 }
 
 class ReusableWebSocketConnection {
+	onFrame?: (frame: PendingFrame) => void;
 	private ws: WebSocket | null = null;
 	private queue: PendingFrame[] = [];
 	private waiters: Array<(frame: PendingFrame) => void> = [];
@@ -925,6 +965,10 @@ class ReusableWebSocketConnection {
 		return !!this.ws && this.open;
 	}
 
+	hasPendingFrames(): boolean {
+		return this.queue.length > 0;
+	}
+
 	isClosed(): boolean {
 		return (
 			!this.ws || this.ws.readyState === this.ws.CLOSED || this.ws.readyState === this.ws.CLOSING
@@ -984,6 +1028,7 @@ class ReusableWebSocketConnection {
 	}
 
 	async close(): Promise<void> {
+		this.onFrame = undefined;
 		if (!this.ws) return;
 		const ws = this.ws;
 		this.ws = null;
@@ -1001,6 +1046,7 @@ class ReusableWebSocketConnection {
 	}
 
 	private push(frame: PendingFrame): void {
+		this.onFrame?.(frame);
 		const waiter = this.waiters.shift();
 		if (waiter) {
 			waiter(frame);
@@ -1018,7 +1064,11 @@ async function ensureConnection(
 	if (options.signal.aborted) {
 		throw createCodexWebSocketAbortError();
 	}
-	if (session.connection?.isOpen() && !session.connection.isExpiring()) {
+	if (
+		session.connection?.isOpen() &&
+		!session.connection.isExpiring() &&
+		!session.connection.hasPendingFrames()
+	) {
 		return session.connection;
 	}
 	// Any new socket invalidates the response chain. `previous_response_id` is
@@ -1097,6 +1147,17 @@ export async function* streamCodexResponsesWebSocket(
 		let hasYieldedEvents = false;
 		const handshakeHeaders = buildHandshakeHeaders(options);
 		let requestReported = false;
+		const beginAttempt = () =>
+			options.requestDump?.beginResponseAttempt(
+				{
+					transport: "websocket",
+					url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+					headers: sanitizeHeaders(handshakeHeaders),
+					body: { type: "response.create", ...request },
+				},
+				options.requestDumpMaxBytes,
+			);
+		beginAttempt();
 
 		/**
 		 * Serialize the request against the session's CURRENT chain state.
@@ -1120,9 +1181,25 @@ export async function* streamCodexResponsesWebSocket(
 
 		const dispatchRequest = async (): Promise<void> => {
 			const frame = buildRequestFrame();
-			// Only the first dispatch is reported: the dump records what we sent for this
-			// logical request, and overwriting it with a recovery resend would erase the
-			// payload that actually triggered the failure being diagnosed.
+			options.requestDump?.setRequest({
+				transport: "websocket",
+				url: buildCodexResponsesWebSocketUrl(options.baseUrl),
+				headers: sanitizeHeaders(handshakeHeaders),
+				body: frame.body,
+			});
+			if (connection)
+				connection.onFrame = (incoming) => {
+					if (incoming.type === "message") {
+						options.requestDump?.appendResponseText(incoming.text);
+						options.requestDump?.appendResponseText("\n");
+					} else if (incoming.type === "close") {
+						options.requestDump?.appendResponseText(
+							`\n[websocket close ${incoming.code}] ${incoming.reason}\n`,
+						);
+					} else options.requestDump?.setResponseError(incoming.error);
+				};
+			// Preserve the legacy first-dispatch observer contract. The collector above
+			// separately records every attempt, including recovery resends.
 			if (!requestReported) {
 				requestReported = true;
 				options.onRequestPrepared?.({
@@ -1147,7 +1224,10 @@ export async function* streamCodexResponsesWebSocket(
 		 * ends the stream instead of sending into a socket nobody is reading.
 		 */
 		const reconnectAndResend = async (): Promise<boolean> => {
+			if (connection) connection.onFrame = undefined;
+			options.requestDump?.finishResponseCapture(false);
 			await discardResponseChain(session);
+			beginAttempt();
 			connection = null;
 			responseId = "";
 			itemsAdded = [];
@@ -1336,6 +1416,33 @@ export async function* streamCodexResponsesWebSocket(
 					const status = closeWrappedError.status ?? closeWrappedError.status_code;
 					const errorCode = closeWrappedError.error?.code ?? closeWrappedError.error?.type;
 					const error = formatWrappedError(closeWrappedError);
+					const closeViolation = wrappedPolicyViolationCode(closeWrappedError);
+					if (closeViolation) {
+						// A policy verdict delivered on the close frame is a content refusal,
+						// not a transport failure. Emit it as a terminal invalidState (the
+						// same channel a streamed response.failed takes) instead of
+						// throwing: a throw would strip the code into prose, penalize a
+						// healthy credential via reportFailure, and risk a replay of the
+						// violating prompt through the SSE fallback.
+						logger.warn("Codex WebSocket closed with a policy violation", {
+							sessionKey: options.sessionKey,
+							narratorId: options.narratorId,
+							credentialId: options.credentialId,
+							model: options.model,
+							closeCode: frame.code,
+							status,
+							code: closeViolation,
+						});
+						// The caller may return as soon as it receives invalidState.
+						await discardResponseChain(session);
+						connection = null;
+						yield buildPolicyViolationEvent(
+							closeViolation,
+							closeWrappedError.error?.message ?? error.message,
+							status,
+						);
+						return;
+					}
 					if (isCodexWebSocketConnectionLimitError(closeWrappedError)) {
 						const outcome = await handleConnectionLimitReached({
 							status,
@@ -1401,6 +1508,26 @@ export async function* streamCodexResponsesWebSocket(
 					yield { silentDisconnect: true };
 					return;
 				}
+				// A policy violation survives truncation the same way: the code token is
+				// verbatim in the reason even when the JSON around it is cut off.
+				const truncatedViolation = findCodexPolicyViolationCloseCode(frame.reason);
+				if (truncatedViolation) {
+					logger.warn("Codex WebSocket closed with a truncated policy violation reason", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						closeCode: frame.code,
+						code: truncatedViolation,
+					});
+					await discardResponseChain(session);
+					connection = null;
+					yield buildPolicyViolationEvent(
+						truncatedViolation,
+						"Upstream closed the connection with a policy violation (cyber_policy)",
+					);
+					return;
+				}
 
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				const decision = decidePrematureCodexReconnect(
@@ -1449,6 +1576,31 @@ export async function* streamCodexResponsesWebSocket(
 			if (wrappedError) {
 				const status = wrappedError.status ?? wrappedError.status_code;
 				const error = formatWrappedError(wrappedError);
+				const frameViolation = wrappedPolicyViolationCode(wrappedError);
+				if (frameViolation) {
+					// Same rule as the close-frame path: a policy verdict rides out as a
+					// terminal invalidState, never as a thrown error that retry
+					// classifiers (or the SSE fallback) could act on. The user-facing
+					// message is the upstream text without the diagnostic suffix.
+					logger.warn("Codex WebSocket received a policy violation error frame", {
+						sessionKey: options.sessionKey,
+						narratorId: options.narratorId,
+						credentialId: options.credentialId,
+						model: options.model,
+						status,
+						code: frameViolation,
+					});
+					// Do not leave an open socket or stale response chain behind if
+					// the consumer returns without advancing past this yield.
+					await discardResponseChain(session);
+					connection = null;
+					yield buildPolicyViolationEvent(
+						frameViolation,
+						wrappedError.error?.message ?? error.message,
+						status,
+					);
+					return;
+				}
 				if (isCodexWebSocketConnectionLimitError(wrappedError)) {
 					const outcome = await handleConnectionLimitReached({
 						status,
@@ -1504,7 +1656,18 @@ export async function* streamCodexResponsesWebSocket(
 				itemsAdded.push(cloneJson(chunk.item));
 			}
 
-			for (const event of parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum)) {
+			const parsedEvents = parseResponsesAPIEvent(chunk, toolAccum, reasoningAccum);
+			if (parsedEvents.some((event) => event.invalidState)) {
+				// A relay may label an errored response "completed". The parsed failure
+				// outranks that label: never cache it as a successful continuation chain.
+				// Clean up BEFORE yield, since the loop may stop on the first invalidState.
+				await discardResponseChain(session);
+				connection = null;
+				yield* parsedEvents;
+				return;
+			}
+
+			for (const event of parsedEvents) {
 				hasYieldedEvents ||= shouldTreatCodexStreamEventAsYielded(event);
 				yield event;
 			}
@@ -1516,21 +1679,9 @@ export async function* streamCodexResponsesWebSocket(
 				touchSession(session);
 				return;
 			}
-			if (chunk.type === "response.failed" || chunk.type === "response.incomplete") {
-				// The chain is dead, but the CALLER must still learn why. `parseResponsesAPIEvent`
-				// has already turned this chunk into an `invalidState` event above, which carries
-				// the upstream code/message and lets the agent loop classify it (retryable
-				// server_error vs. terminal refusal vs. context overflow).
-				//
-				// Returning without that distinction — as this did — presented a failed response
-				// as a successful empty turn, so a transient upstream error looked like the model
-				// choosing to say nothing.
-				await discardResponseChain(session);
-				connection = null;
-				return;
-			}
 		}
 	} catch (error) {
+		options.requestDump?.setResponseError(error);
 		if (isCodexWebSocketAbortError(error) && !requestDispatched) {
 			throw error;
 		}
@@ -1547,6 +1698,10 @@ export async function* streamCodexResponsesWebSocket(
 		await resetSession(session, false);
 		throw error;
 	} finally {
+		if (connection) connection.onFrame = undefined;
+		options.requestDump?.finishResponseCapture(completed);
+		// An early-returning consumer must not leave unread frames for the next request.
+		if (!completed && connection) await discardResponseChain(session);
 		await resetAbortedSessionIfNeeded();
 		session.busy = false;
 		touchSession(session);

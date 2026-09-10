@@ -65,6 +65,11 @@ import {
 	modelCardSchema,
 	whitelistDirEntrySchema,
 } from "../lib/validators";
+import {
+	defaultNarratorVisibilitySchema,
+	defaultNarratorWriteAudienceSchema,
+} from "../lib/validators/settings";
+import { subagentModelReasoningEffortsSchema } from "../lib/validators/subagent-models";
 import { startVNetUdpRendezvous } from "../lib/vnet/udp-rendezvous";
 import { requireAdmin } from "../middleware/auth";
 import {
@@ -82,6 +87,7 @@ import {
 import { closeAllExternalNarratorConnections } from "../websocket/oauth-connection-registry";
 import { closeVNetConnections } from "../websocket/vnet-ws";
 import { getAnthropicCachedModelsGrouped, purgeAnthropicProviderCache } from "./anthropic";
+import { dataDirectorySecurityRoutes } from "./data-directory-security";
 import { getGeminiCachedModelsGrouped, purgeGeminiProviderCache } from "./gemini";
 import { getGrokModelsGrouped, purgeGrokProviderCache } from "./grok";
 import { purgeNugProviderCache } from "./nug";
@@ -397,6 +403,8 @@ export const updateSettingsSchema = z
 			.object({
 				defaultModel: z.string().min(1),
 				defaultPermissionMode: legacyPermissionModeSchema,
+				defaultNarratorVisibility: defaultNarratorVisibilitySchema,
+				defaultNarratorWriteAudience: defaultNarratorWriteAudienceSchema,
 				defaultStartInPlanMode: z.boolean(),
 				summaryModel: z.string(),
 				translationModel: z.string(),
@@ -411,6 +419,7 @@ export const updateSettingsSchema = z
 						review: z.string(),
 					})
 					.partial(),
+				subagentModelReasoningEfforts: subagentModelReasoningEffortsSchema,
 				subagentAllowedModels: z
 					.object({
 						explore: z.array(z.string()),
@@ -769,6 +778,7 @@ function normalizeLegacySettingsPatch(body: unknown): unknown {
 }
 
 export const settingsRoutes = new Hono();
+settingsRoutes.route("/data-directory-security", dataDirectorySecurityRoutes);
 
 /** Mask an API key for safe display (show last 4 chars). */
 function maskApiKey(key?: string): string {

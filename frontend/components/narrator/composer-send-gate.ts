@@ -20,12 +20,13 @@ export interface ComposerContentState {
 	imageCount: number;
 	textFileCount: number;
 	/** Staged selection comments (Spec + chat) waiting to ride the next send. */
-	commentCount: number;
+	commentCount?: number;
+	fileReferenceCount?: number;
 }
 
 /** True when at least one attachment is staged. */
 export function hasComposerAttachments(state: ComposerContentState): boolean {
-	return state.imageCount > 0 || state.textFileCount > 0;
+	return state.imageCount > 0 || state.textFileCount > 0 || (state.fileReferenceCount ?? 0) > 0;
 }
 
 /** True when the composer has typed text (ignoring whitespace-only input). */
@@ -35,7 +36,7 @@ export function hasComposerText(state: ComposerContentState): boolean {
 
 /** True when at least one selection-comment draft is staged. */
 export function hasComposerComments(state: ComposerContentState): boolean {
-	return state.commentCount > 0;
+	return (state.commentCount ?? 0) > 0;
 }
 
 /**

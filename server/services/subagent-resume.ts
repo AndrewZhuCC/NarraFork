@@ -1,7 +1,12 @@
+import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
 import { and, asc, eq, isNotNull } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages, narrators } from "../db/schema";
-import { AsyncMutex } from "../lib/async-mutex";
+import {
+	freezeFileReferenceSnapshots,
+	getFileReferenceSnapshots,
+	projectFileReferenceText,
+} from "../lib/agent/file-reference-projection";
 import { ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -11,6 +16,11 @@ import { resolveEffectiveModel, resolveProvider } from "../lib/settings";
 import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
+import {
+	withNarratorMutationAdmission,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} from "./narrator-session-state";
 import type { RevertScope, RevertWarning } from "./snapshot-revert";
 import { loadSubagentHistory } from "./subagent-executor";
 import {
@@ -23,6 +33,8 @@ import {
 import {
 	announceResumedBackgroundTask,
 	combineSubagentAbortSignals,
+	commitResumedBackgroundTaskAnnouncement,
+	type ResumedBackgroundTaskAnnouncement,
 	type SubagentUpdateExecutionLease,
 	startContinuedSubagent,
 } from "./subagent-runner";
@@ -36,12 +48,19 @@ export type SubagentResumeIntent =
 export type SubagentResumeActor = "user" | "parent_agent";
 
 export interface ResumeSubagentInput {
+	/** Trusted automatic-continuation identity, separate from message audit author. */
+	executionPrincipal?: import("./narrator-question-service").QuestionExecutionPrincipal;
+	/** Wake an already accepted mailbox head without creating a second user message. */
+	mailboxInput?: boolean;
+	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	subagentId: string;
 	intent: SubagentResumeIntent;
 	actor: SubagentResumeActor;
 	prompt?: string;
 	images?: ImageRef[];
 	textFiles?: File[];
+	fileReferences?: FileReferenceSnapshot[];
+	editFileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
 	retryToolUseId?: string;
@@ -81,6 +100,8 @@ export interface ResumeSubagentInput {
 	skipConclusionDelivery?: boolean;
 	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
 	resumableUpdateLease?: boolean;
+	/** Persisted logical run from the planned-update checkpoint, never an execution epoch. */
+	resumeLogicalRunId?: string;
 	/** Remaining execution timeout passed to the continued runner. */
 	timeoutMs?: number;
 	/** Absolute execution deadline preserved by planned-update recovery. */
@@ -113,11 +134,11 @@ interface ActiveResumeRun {
 	runId: string | null;
 	publicationClaimId: string;
 	originToolUseId: string;
+	standaloneParentNarratorId: string | null;
 	phase: "starting" | "running" | "delivering";
 	delivered: boolean;
 }
 
-const resumeLock = new AsyncMutex();
 const activeResumeRuns = new Map<string, ActiveResumeRun>();
 
 export function hasActiveSubagentResumeRun(subagentId: string): boolean {
@@ -125,7 +146,7 @@ export function hasActiveSubagentResumeRun(subagentId: string): boolean {
 }
 
 export function withSubagentResumeLock<T>(subagentId: string, fn: () => Promise<T>): Promise<T> {
-	return resumeLock.acquire(subagentId, fn);
+	return withNarratorMutationAdmission(subagentId, fn);
 }
 
 export async function resolveSubagentOriginToolUseId(subagentId: string): Promise<string> {
@@ -170,7 +191,12 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 		const lastUserMessage = [...messages].reverse().find((message) => message.role === "user");
 		if (!lastUserMessage)
 			throw new ValidationError("No subagent user message is available to retry");
-		prompt = extractPromptText(lastUserMessage.contentText);
+		prompt = extractPromptText(
+			projectFileReferenceText(
+				lastUserMessage.contentText ?? "",
+				getFileReferenceSnapshots(lastUserMessage.contentJson),
+			),
+		);
 		// `skipRevert` must be forwarded, not defaulted. `deleteMessagesAfter` rolls the
 		// workspace back unless told otherwise, so omitting it here reverts files that
 		// the caller may have explicitly asked to keep — and a `regenerate_edited_message`
@@ -196,7 +222,13 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 				});
 			}
 		}
-		const rebuilt = await loadSubagentHistory(input.subagentId, effectiveModel, provider);
+		const rebuilt = await loadSubagentHistory(
+			input.subagentId,
+			effectiveModel,
+			provider,
+			undefined,
+			prompt,
+		);
 		initialHistory = rebuilt.history;
 		initialTrailingToolResults = rebuilt.trailingToolResults;
 		persistPrompt = false;
@@ -213,7 +245,13 @@ async function prepareResumeTurn(input: ResumeSubagentInput) {
 		}
 	}
 
-	if (persistPrompt && !prompt.trim() && !input.images?.length && !input.textFiles?.length) {
+	if (
+		persistPrompt &&
+		!prompt.trim() &&
+		!input.images?.length &&
+		!input.textFiles?.length &&
+		!input.fileReferences?.length
+	) {
 		throw new ValidationError("A follow-up message or attachment is required");
 	}
 
@@ -234,12 +272,12 @@ function broadcastUserMessage(
 	broadcastToNarrator(parentNarratorId, {
 		type: "user_message",
 		narratorId: parentNarratorId,
-		message: userMessage,
+		message: fileReferenceMessageForDisplay(userMessage),
 	});
 	broadcastToNarrator(subagentId, {
 		type: "user_message",
 		narratorId: subagentId,
-		message: { ...userMessage, parentToolUseId: null },
+		message: fileReferenceMessageForDisplay({ ...userMessage, parentToolUseId: null }),
 	});
 }
 
@@ -264,6 +302,7 @@ async function deliverCompletedResume(
 	publicationClaimId: string,
 	originToolUseId: string,
 	completionOutput: string,
+	announcement?: ResumedBackgroundTaskAnnouncement,
 ): Promise<void> {
 	let lastError: unknown;
 	for (let attempt = 1; attempt <= 3; attempt++) {
@@ -282,6 +321,21 @@ async function deliverCompletedResume(
 				active.phase = "delivering";
 
 				const narrator = await narratorService.getById(subagentId);
+				if (active.standaloneParentNarratorId && narrator.originToolCallId === null) {
+					if (
+						narrator.subagentOriginKind !== "standalone" ||
+						narrator.parentNarratorId !== active.standaloneParentNarratorId
+					) {
+						throw new ValidationError("Standalone worker creation binding has changed");
+					}
+					if (announcement)
+						db.transaction((tx) =>
+							commitResumedBackgroundTaskAnnouncement(announcement, completionOutput, tx),
+						);
+					active.delivered = true;
+					activeResumeRuns.delete(subagentId);
+					return;
+				}
 				const substatus = parseSubstatus(narrator.substatus);
 				const hasError = substatus.includes("error") || !!narrator.errorMessage;
 				const finalText = stripSubagentResultPrefix(completionOutput) || "(no output)";
@@ -289,15 +343,21 @@ async function deliverCompletedResume(
 					"./narrator-session"
 				);
 				const resultMessageId = await getSubagentResultMessageId(subagentId);
-				const toolCall = await narratorService.getToolCallByToolUseId(originToolUseId);
-				let privateMessageId: string | undefined;
-				if (
-					toolCall?.messageId &&
-					(await narratorService.isMessageSharedByMultipleNarrators(toolCall.messageId))
-				) {
-					privateMessageId = await narratorService.copyOnWriteToolCallMessage(
+				const { narratorPersistence } = await import("./narrator-persistence");
+				let reference = await narratorPersistence.resolveSubagentConclusionReference(
+					subagentId,
+					narrator.parentNarratorId as string,
+					originToolUseId,
+				);
+				if (await narratorService.isMessageSharedByMultipleNarrators(reference.messageId)) {
+					await narratorService.copyOnWriteToolCallMessage(
 						narrator.parentNarratorId as string,
-						toolCall.messageId,
+						reference.messageId,
+						originToolUseId,
+					);
+					reference = await narratorPersistence.resolveSubagentConclusionReference(
+						subagentId,
+						narrator.parentNarratorId as string,
 						originToolUseId,
 					);
 				}
@@ -307,8 +367,12 @@ async function deliverCompletedResume(
 					toolUseId: originToolUseId,
 					finalText,
 					hasError,
-					messageId: privateMessageId,
+					messageId: reference.messageId,
+					toolCallId: reference.toolCallId,
 					resultMessageId,
+					onPersist: announcement
+						? (tx) => commitResumedBackgroundTaskAnnouncement(announcement, finalText, tx)
+						: undefined,
 				});
 				active.delivered = true;
 				activeResumeRuns.delete(subagentId);
@@ -325,6 +389,39 @@ async function deliverCompletedResume(
 }
 
 export async function resumeSubagent(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	// Freeze accepted caller-owned snapshots before admission's first async boundary.
+	input = {
+		...input,
+		fileReferences:
+			input.fileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.fileReferences),
+		editFileReferences:
+			input.editFileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.editFileReferences),
+	};
+	return withNarratorStartAdmission(input.subagentId, () =>
+		withNarratorWorkAdmission(
+			input.subagentId,
+			() => resumeSubagentUnlocked(input),
+			(result) => result.terminalCompletion,
+		),
+	);
+}
+
+async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<ResumeSubagentResult> {
+	input = {
+		...input,
+		fileReferences:
+			input.fileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.fileReferences),
+		editFileReferences:
+			input.editFileReferences === undefined
+				? undefined
+				: freezeFileReferenceSnapshots(input.editFileReferences),
+	};
 	return withSubagentResumeLock(input.subagentId, async () => {
 		const original = await narratorService.getById(input.subagentId);
 		if (!isSubagentVariant(original.variant) || !original.parentNarratorId) {
@@ -353,14 +450,16 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 		if (await reconcileRunningStatus(input.subagentId)) {
 			original.status = (await narratorService.getById(input.subagentId)).status;
 		}
-		// A subagent that was never started by its parent (e.g. a team temp worker
-		// recruited directly through the plugin API) has no real runner, so its
-		// "working" status is stale — treating it as running would either buffer the
-		// message forever or reject the resume. Let the standalone start path
-		// below (which synthesizes an origin tool-use id) actually run it.
-		const neverStarted = !(await resolveSubagentOriginToolUseId(input.subagentId).catch(
-			() => null,
-		));
+		const standaloneOrigin =
+			original.subagentOriginKind === "standalone" && original.originToolCallId === null;
+		const linkedOrigin = await resolveSubagentOriginToolUseId(input.subagentId).catch((error) => {
+			if (!(error instanceof ValidationError)) throw error;
+			if (!standaloneOrigin) throw error;
+			return null;
+		});
+		// Only an explicitly standalone worker with no persisted input can bypass the stale
+		// status check. Message grouping is not evidence of creation provenance.
+		const neverStarted = !!standaloneOrigin && !linkedOrigin;
 		if (
 			!manualOverride &&
 			!neverStarted &&
@@ -370,15 +469,8 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			throw new ValidationError("Subagent is already running; queue the message instead");
 		}
 
-		const originToolUseId = await resolveSubagentOriginToolUseId(input.subagentId).catch(() => {
-			// Never-started subagent (e.g. a team temp worker recruited directly
-			// through the plugin API): there is no originating Agent tool call.
-			// Synthesize a standalone tool-use id so the message can still be
-			// persisted and the subagent run. Conclusion delivery back to a tool
-			// call is a no-op for the synthesized id (updateToolCallResult finds
-			// no matching row), which is exactly right for standalone runs.
-			return `standalone-${generateId()}`;
-		});
+		// A standalone tool-use id is a message transport link only, never an Agent origin.
+		const originToolUseId = linkedOrigin ?? `standalone-${input.subagentId}`;
 		let effectiveInput = input;
 		// Set by the regenerate_edited_message branch below, then attached to every
 		// return path so the advisory is not lost between the rollback and the reply.
@@ -424,6 +516,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 					newImages: effectiveInput.editNewImages,
 					keepTextFilePaths: effectiveInput.editKeepTextFilePaths,
 					newTextFiles: effectiveInput.editNewTextFiles,
+					fileReferences: effectiveInput.editFileReferences,
 					userId: effectiveInput.createdBy,
 					deferContinuation: true,
 					revertFiles: effectiveInput.editRevertFiles ?? true,
@@ -479,11 +572,17 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						{
 							images: input.images,
 							textFiles: savedTextFiles,
+							fileReferences: input.fileReferences,
+							delivery: input.delivery,
 							commandText: input.commandText,
 							createdBy: input.createdBy,
 						},
 					);
 				}
+				const currentInput = projectFileReferenceText(
+					userMessage?.contentText ?? prepared.prompt,
+					prepared.persistPrompt ? input.fileReferences : [],
+				);
 				const rebuilt =
 					prepared.initialHistory && prepared.initialTrailingToolResults
 						? {
@@ -494,6 +593,8 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 								input.subagentId,
 								resolveEffectiveModel(prepared.narrator.model),
 								resolveProvider(resolveEffectiveModel(prepared.narrator.model)),
+								undefined,
+								currentInput,
 							);
 
 				const runtime = getManualOverrideRuntime(input.subagentId);
@@ -504,10 +605,12 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				await narratorService.updateStatus(input.subagentId, "working");
 				const resumed = settleManualOverrideClaim(manualClaim, {
 					action: "resume",
-					prompt: prepared.prompt,
+					prompt: currentInput,
 					history: rebuilt.history,
 					trailingToolResults: rebuilt.trailingToolResults,
-					userId: input.createdBy ?? null,
+					userId: input.executionPrincipal
+						? input.executionPrincipal.userId
+						: (input.createdBy ?? null),
 				});
 				if (!resumed) {
 					throw new ValidationError("Subagent suspension ended before it could be resumed");
@@ -539,26 +642,31 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			runId: null,
 			publicationClaimId,
 			originToolUseId,
+			standaloneParentNarratorId: standaloneOrigin ? original.parentNarratorId : null,
 			phase: "starting",
 			delivered: false,
 		});
 		try {
 			const started = await startContinuedSubagent({
+				deferPublicationRelease: true,
 				subagentId: input.subagentId,
 				parentNarratorId: original.parentNarratorId,
 				toolUseId: originToolUseId,
 				prompt: prepared.prompt,
 				images: input.images,
 				textFiles: input.textFiles,
+				fileReferences: input.fileReferences,
+				delivery: input.delivery,
 				commandText: input.commandText,
 				createdBy: input.createdBy,
-				userId: input.createdBy,
+				userId: input.executionPrincipal ? input.executionPrincipal.userId : input.createdBy,
 				canReportToParent: input.actor === "parent_agent",
 				signal: runSignal,
 				abortController,
 				updateExecutionLease: input.updateExecutionLease,
 				locale: input.locale,
-				persistPrompt: prepared.persistPrompt,
+				persistPrompt: input.mailboxInput ? false : prepared.persistPrompt,
+				mailboxInput: input.mailboxInput,
 				initialHistory: prepared.initialHistory,
 				initialTrailingToolResults: prepared.initialTrailingToolResults,
 				allowRunningRestart: input.allowRunningRestart || neverStarted,
@@ -568,6 +676,7 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 				// will be rewritten (i.e. whether the parent already has the output).
 				skipConclusionDelivery: input.skipConclusionDelivery,
 				resumableUpdateLease: input.resumableUpdateLease,
+				resumeLogicalRunId: input.resumeLogicalRunId,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,
 				executionTimeoutMs: input.executionTimeoutMs,
@@ -580,41 +689,48 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 			if (started.userMessage) {
 				broadcastUserMessage(input.subagentId, original.parentNarratorId, started.userMessage);
 			}
-			const terminalCompletion = started.terminalCompletion.then(async (output) => {
-				if (!input.skipConclusionDelivery && !runSignal.aborted) {
-					await deliverCompletedResume(
-						input.subagentId,
-						token,
-						started.runId,
-						publicationClaimId,
-						originToolUseId,
-						output,
-					);
-				} else {
-					await withSubagentResumeLock(input.subagentId, async () => {
-						const active = activeResumeRuns.get(input.subagentId);
-						if (active?.token === token && active.runId === started.runId) {
-							activeResumeRuns.delete(input.subagentId);
-						}
-					});
-				}
-				// AFTER the conclusion above, never before: this wakes the parent, and a turn
-				// started while the historical Agent tool result still held the previous run's
-				// output would be built from a result this continuation just superseded.
-				// Failure here must not fail the run — the notice is an affordance, the
-				// conclusion is the record.
-				const announcement = started.takeResumedBackgroundAnnouncement?.();
-				if (announcement) {
-					await announceResumedBackgroundTask(announcement).catch((err) => {
-						logger.warn("Failed to announce a resumed background task", {
-							subagentId: input.subagentId,
-							error: err instanceof Error ? err.message : String(err),
+			const terminalCompletion = started.terminalCompletion
+				.then(async (output) => {
+					const announcement = started.takeResumedBackgroundAnnouncement?.();
+					if (!input.skipConclusionDelivery && !runSignal.aborted) {
+						await deliverCompletedResume(
+							input.subagentId,
+							token,
+							started.runId,
+							publicationClaimId,
+							originToolUseId,
+							output,
+							announcement,
+						);
+					} else {
+						await withSubagentResumeLock(input.subagentId, async () => {
+							const active = activeResumeRuns.get(input.subagentId);
+							if (active?.token === token && active.runId === started.runId) {
+								if (announcement)
+									db.transaction((tx) =>
+										commitResumedBackgroundTaskAnnouncement(announcement, output, tx),
+									);
+								activeResumeRuns.delete(input.subagentId);
+							}
 						});
-					});
-				}
-				return output;
-			});
-			void terminalCompletion.catch(async (error) => {
+					}
+					// AFTER the conclusion above, never before: this wakes the parent, and a turn
+					// started while the historical Agent tool result still held the previous run's
+					// output would be built from a result this continuation just superseded.
+					// Failure here must not fail the run — the notice is an affordance, the
+					// conclusion is the record.
+					if (announcement) {
+						await announceResumedBackgroundTask(announcement).catch((err) => {
+							logger.warn("Failed to announce a resumed background task", {
+								subagentId: input.subagentId,
+								error: err instanceof Error ? err.message : String(err),
+							});
+						});
+					}
+					return output;
+				})
+				.finally(() => started.releasePublication?.());
+			const settledCompletion = terminalCompletion.catch(async (error) => {
 				logger.error("Resumed subagent run failed", {
 					subagentId: input.subagentId,
 					token,
@@ -630,13 +746,15 @@ export async function resumeSubagent(input: ResumeSubagentInput): Promise<Resume
 						activeResumeRuns.delete(input.subagentId);
 					}
 				});
+				throw error;
 			});
+			void settledCompletion.catch(() => {});
 			return {
 				started: true,
 				resumedSuspendedRunner: false,
 				originToolUseId,
 				token,
-				terminalCompletion,
+				terminalCompletion: settledCompletion,
 				userMessage: started.userMessage,
 				...(editRevertWarnings?.length ? { revertWarnings: editRevertWarnings } : {}),
 			};

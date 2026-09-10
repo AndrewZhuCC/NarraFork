@@ -89,6 +89,13 @@ export const ERROR_CATALOG = {
 		en: "Internal server error",
 	},
 
+	// --- retired features ------------------------------------------------------
+	TUTORIAL_REMOVED: {
+		status: 410,
+		code: "TUTORIAL_REMOVED",
+		en: "The interactive tutorial has been removed. Saved conversations and sandbox files are unchanged. Use the learning guide instead.",
+	},
+
 	// --- dependencies ----------------------------------------------------------
 	GIT_NOT_INSTALLED: {
 		status: 503,
@@ -118,6 +125,21 @@ export const ERROR_CATALOG = {
 		status: 401,
 		code: "GIT_AUTH_REQUIRED",
 		en: "Git authentication required",
+	},
+	GIT_TREE_MERGE_FAILED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Git tree merge failed: {detail}",
+	},
+	GIT_TREE_MERGE_FALLBACK_FAILED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Git {version} does not support {feature}. An automatic compatibility merge in a temporary directory was attempted but failed: {detail}. Check your Git installation and the temporary directory's permissions and available space, or install Git 2.40+ (for example, install it separately and add it to the server's PATH).",
+	},
+	GIT_TREE_MERGE_CONFLICTS_UNLISTED: {
+		status: 422,
+		code: "GIT_ERROR",
+		en: "Merge conflicts were detected, but their full scope or resolution cannot be verified automatically. Automatic application was refused. Resolve the conflicts manually.",
 	},
 	MERGE_DIRTY_SOURCE: {
 		status: 400,
@@ -289,4 +311,17 @@ export function readErrorPayload(data: Record<string, unknown> | null | undefine
 			? sanitizeErrorParams(rawParams as ErrorMessageParams)
 			: {};
 	return { messageCode, messageParams: params };
+}
+
+/**
+ * Preserve catalog metadata in string-only errorMessage storage and events.
+ * Plain errors keep their previous text; catalog errors keep readable English
+ * alongside the stable key and bounded params, without a schema change.
+ */
+export function serializeCatalogErrorMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : String(error);
+	if (!(error instanceof Error)) return message;
+	const metadata = readErrorPayload(error as unknown as Record<string, unknown>);
+	if (!metadata.messageCode) return message;
+	return JSON.stringify({ type: "catalog_error", error: message, ...metadata });
 }

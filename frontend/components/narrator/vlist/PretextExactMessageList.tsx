@@ -26,12 +26,18 @@ import {
 } from "@frontend/lib/narrator-content-column";
 import { narratorWSManager } from "@frontend/lib/narrator-ws-manager";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
+import {
+	createSmoothFollower,
+	type SmoothFollower,
+	shouldSmoothFollow,
+} from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { type PretextLayoutIndex, resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
+import type { ToolCappedDetail, ToolSectionsDetail } from "@shared/pretext-layout/tool-detail";
 import type { LaidOutItem, ListLayout } from "@shared/pretext-layout/vlist-virtualization";
 import { normalizeSubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import {
@@ -80,6 +86,7 @@ import {
 	subagentRecentCallSummary,
 } from "../tool-display";
 import type { TraceRowIdentity } from "../trace-row-identity";
+import { openCommunicationRecipient } from "./communication-navigation";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import { isRunningStatus, type MeasuredToolCall } from "./measure/measure-tool-call";
@@ -100,7 +107,12 @@ import { useVListContentView } from "./useVListContentView";
 import { renderLabelsForKind, useVListLabels, type VListRenderLabels } from "./useVListLabels";
 import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
-import { useVListToolDetails } from "./useVListToolDetails";
+import {
+	sameToolDetailRequests,
+	toolDetailRequestFromData,
+	useVListToolDetails,
+	type VListToolDetailRequest,
+} from "./useVListToolDetails";
 import { VListContentViewHost, type VListViewControls } from "./VListContentViewHost";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListRowInteraction } from "./VListRowInteraction";
@@ -110,14 +122,14 @@ import { isVListAskInPassingPending } from "./vlist-ask-in-passing-target";
 import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-target";
 import { useVListCompactActions, type VListCompactRowActions } from "./vlist-compact-bridge";
 import {
-	parseTraceRowViewKey,
 	resolvePrimaryViewTarget,
 	resolveRowViewTargets,
+	resolveSubagentModelTargets,
 	resolveSubagentViewTargets,
+	resolveToolDetailModelTargets,
 	resolveToolDetailViewTargets,
-	traceRowViewKey,
+	type VListViewOwner,
 	type VListViewTarget,
-	viewTargetSpecKey,
 } from "./vlist-content-view-target";
 import { installVListCopyHandler } from "./vlist-copy-text";
 import {
@@ -193,7 +205,13 @@ import {
 	traceRowFoldChannel,
 	type VListInteractionState,
 } from "./vlist-interaction-state";
-import { jumpTargetMessageId, resolveJumpTargetSeq } from "./vlist-jump-target";
+import {
+	jumpTargetItemIndex,
+	jumpTargetMessageId,
+	jumpTargetScrollTop,
+	mountedJumpTarget,
+	resolveJumpTargetSeq,
+} from "./vlist-jump-target";
 import { resolveJumpWindowDecision } from "./vlist-jump-window";
 import {
 	createLodFocusPoint,
@@ -264,7 +282,6 @@ import {
 	entriesToText,
 	type SelectionIndex,
 } from "./vlist-selection";
-import { createSmoothFollower, type SmoothFollower } from "./vlist-smooth-follow";
 import {
 	resolveSpecCarryoverActions,
 	useSpecCarryoverActions,
@@ -401,6 +418,8 @@ type PretextExactMessageListProps = {
 	 * so no state crosses the boundary and no row re-renders for it.
 	 */
 	highlightMessageId?: string;
+	/** A new request repeats the jump while retaining this list's loaded window. */
+	highlightRequestId?: string;
 	tailFooter?: ReactNode;
 };
 
@@ -461,6 +480,19 @@ export function isSuppressedScrollEcho(
 }
 
 /**
+ * Upward movement from any input source (including the scrollbar and keyboard).
+ * Programmatic writes update scrollTopRef synchronously, so their delayed events
+ * cannot look like fresh movement even after the echo-suppression window closes.
+ */
+export function isUpwardHistoryScroll(
+	previousScrollTop: number,
+	reportedScrollTop: number,
+	isEcho: boolean,
+): boolean {
+	return !isEcho && reportedScrollTop < previousScrollTop - SCROLL_ECHO_EPSILON;
+}
+
+/**
  * True when a scroll frame reporting "not at the bottom" describes the CONTENT
  * GROWING BENEATH a reader who is pinned there — not the reader leaving.
  *
@@ -509,19 +541,6 @@ function range(start: number, end: number): number[] {
 	const out: number[] = [];
 	for (let i = start; i < end; i++) out.push(i);
 	return out;
-}
-
-/**
- * Order-sensitive equality for two id lists. Used to keep the truncated-tool-use
- * state referentially stable: a fresh array of the SAME ids must not retrigger the
- * fetch (which would rebuild the document in a loop).
- */
-function sameIdList(a: readonly string[], b: readonly string[]): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) {
-		if (a[i] !== b[i]) return false;
-	}
-	return true;
 }
 
 /**
@@ -769,32 +788,58 @@ function injectRenderLabels(
  * has bodies once it drew them. Pure and cheap — it walks the already-built block
  * list and copies strings — so it runs per mounted row, never per message.
  */
+function ownerRequestKey(owner: VListViewOwner): string {
+	return owner.traceItemIndex == null
+		? owner.specKey
+		: `${owner.specKey}#row${owner.traceItemIndex}`;
+}
+
 function resolveItemViewTargets(
 	item: VListItem,
 	renderLabels: VListRenderLabels,
 	extra: Record<string, unknown>,
+	fromSource = false,
 ): readonly VListViewTarget[] {
 	const kind = item.spec.kind;
+	if (kind === "communication-bubble") {
+		const data = item.spec.data as { messageBody?: ToolCappedDetail };
+		return resolveToolDetailModelTargets(
+			item.spec.key,
+			{
+				kind: "sections",
+				sections: data.messageBody
+					? [{ key: "input.message", label: "message", body: data.messageBody }]
+					: [],
+			},
+			{ sections: renderLabels.toolCall.sections },
+		);
+	}
 	if (kind === "tool-call") {
-		return resolveToolDetailViewTargets(item.spec.key, item.measured as MeasuredToolCall, {
-			sections: renderLabels.toolCall.sections,
-		});
+		const labels = { sections: renderLabels.toolCall.sections };
+		const model = (item.spec.data as { detail?: ToolSectionsDetail } | null)?.detail;
+		return fromSource && model
+			? resolveToolDetailModelTargets(item.spec.key, model, labels)
+			: resolveToolDetailViewTargets(item.spec.key, item.measured as MeasuredToolCall, labels);
 	}
 	if (kind === "subagent-card") {
 		const data = (item.spec.data ?? {}) as { resultText?: unknown; agentType?: unknown };
 		const description = typeof extra.description === "string" ? extra.description : "";
 		const agentType = typeof data.agentType === "string" ? data.agentType : "agent";
-		return resolveSubagentViewTargets(
-			item.spec.key,
-			item.measured as MeasuredSubagent,
-			{
-				promptText: typeof extra.promptText === "string" ? extra.promptText : undefined,
-				resultText: typeof data.resultText === "string" ? data.resultText : undefined,
-				// Mirrors SubagentCard's result viewer title (`${agentType} — ${description}`).
-				title: description ? `${agentType} — ${description}` : agentType,
-			},
-			{ prompt: renderLabels.subagent.prompt },
-		);
+		const options = { title: description ? `${agentType} — ${description}` : agentType };
+		const labels = { prompt: renderLabels.subagent.prompt };
+		return fromSource
+			? resolveSubagentModelTargets(
+					item.spec.key,
+					item.spec.data as { promptBody?: ToolCappedDetail; resultBody?: ToolCappedDetail },
+					options,
+					labels,
+				)
+			: resolveSubagentViewTargets(
+					item.spec.key,
+					item.measured as MeasuredSubagent,
+					options,
+					labels,
+				);
 	}
 	return resolveRowViewTargets(
 		item.spec,
@@ -853,9 +898,24 @@ function resolveTraceRowCardData(item: VListItem, itemIndex: number): Record<str
 function resolveTraceRowViewTargets(
 	item: VListItem,
 	itemIndex: number,
-	rowKey: string,
 	renderLabels: VListRenderLabels,
+	fromSource = false,
 ): readonly VListViewTarget[] {
+	const owner = { specKey: item.spec.key, traceItemIndex: itemIndex };
+	const cardData = resolveTraceRowCardData(item, itemIndex);
+	if (fromSource) {
+		if (cardData.detail)
+			return resolveToolDetailModelTargets(owner, cardData.detail as ToolSectionsDetail, {
+				sections: renderLabels.toolCall.sections,
+			});
+		if (cardData.promptBody || cardData.resultBody)
+			return resolveSubagentModelTargets(
+				owner,
+				cardData as { promptBody?: ToolCappedDetail; resultBody?: ToolCappedDetail },
+				{ title: String(cardData.agentType ?? "agent") },
+				{ prompt: renderLabels.subagent.prompt },
+			);
+	}
 	const measured = item.measured as MeasuredCollapsibleTrace;
 	const row = measured.rows?.find((candidate) => candidate.itemIndex === itemIndex);
 	const card = row?.cardMeasured;
@@ -868,17 +928,13 @@ function resolveTraceRowViewTargets(
 		const description = typeof cardData.description === "string" ? cardData.description : "";
 		const agentType = typeof cardData.agentType === "string" ? cardData.agentType : "agent";
 		return resolveSubagentViewTargets(
-			rowKey,
+			owner,
 			card as MeasuredSubagent,
-			{
-				promptText: typeof cardData.prompt === "string" ? cardData.prompt : undefined,
-				resultText: typeof cardData.resultText === "string" ? cardData.resultText : undefined,
-				title: description ? `${agentType} — ${description}` : agentType,
-			},
+			{ title: description ? `${agentType} — ${description}` : agentType },
 			{ prompt: renderLabels.subagent.prompt },
 		);
 	}
-	return resolveToolDetailViewTargets(rowKey, card as MeasuredToolCall, {
+	return resolveToolDetailViewTargets(owner, card as MeasuredToolCall, {
 		sections: renderLabels.toolCall.sections,
 	});
 }
@@ -1089,6 +1145,10 @@ export function sameRowInteraction(a: RowInteraction, b: RowInteraction): boolea
 		sameNumberList(a.blockIndices, b.blockIndices) &&
 		a.copyText === b.copyText &&
 		a.toolUseId === b.toolUseId &&
+		a.toolDetailRef?.toolUseId === b.toolDetailRef?.toolUseId &&
+		a.toolDetailRef?.toolCallId === b.toolDetailRef?.toolCallId &&
+		a.toolDetailRef?.messageId === b.toolDetailRef?.messageId &&
+		a.toolDetailRef?.executionAttempt === b.toolDetailRef?.executionAttempt &&
 		// Tool facts drive the row's menu items and the card's open-session button.
 		// Compared field-wise: the index is rebuilt per frame, so the object identity
 		// always differs even when the facts do not.
@@ -1170,6 +1230,8 @@ interface RowInteraction {
 	actions: MessageContextMenuActions;
 	/** Tool-call id for tc-/sa- rows (drives the inspector item). */
 	toolUseId?: string;
+	/** Exact request identity from the card, not the selection alias. */
+	toolDetailRef?: VListToolDetailRequest;
 	/** Row tool facts (file path, child narrator, background state). */
 	toolMeta?: VListToolMeta;
 	/** Card-specific actions bound to this row's tool. */
@@ -1466,7 +1528,7 @@ const ExactRow = memo(
 		// Injection bubbles: speaker row + the localized trailing note, plus the
 		// navigation binding for rows that point somewhere this host can reach. All
 		// chrome the measure pass already reserved space for, so this only fills it in.
-		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel, injectionNavigation);
+		injectInjectionBubbleChrome(kind, extra, injectionNoteLabel, injectionNavigation, narratorId);
 		// knowledge_hint card: make its entry rows open the entry they name.
 		//
 		// `RenderSystemList` has always read `extra.onOpenEntry`, but nothing ever wrote
@@ -1537,7 +1599,8 @@ const ExactRow = memo(
 				if (!row.cardMeasured) return null;
 				// Per-ROW scope: several rows of ONE trace can be open at once, each with
 				// its own bodies, wrap/source state and payload request.
-				const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
+				const rowOwner = { specKey: item.spec.key, traceItemIndex: row.itemIndex };
+				const rowKey = ownerRequestKey(rowOwner);
 				// A SUBAGENT row drills into its subagent card, never the generic tool
 				// card: the badge row / recent calls / prompt fold / result body are the
 				// agent format the L3+ card shows, and drilling in asks for exactly that.
@@ -1579,15 +1642,9 @@ const ExactRow = memo(
 							typeof subExtra.description === "string" ? subExtra.description : "";
 						const agentType = typeof subData.agentType === "string" ? subData.agentType : "agent";
 						const subTargets = resolveSubagentViewTargets(
-							rowKey,
+							rowOwner,
 							row.cardMeasured as MeasuredSubagent,
-							{
-								promptText:
-									typeof subExtra.promptText === "string" ? subExtra.promptText : undefined,
-								resultText: typeof subData.resultText === "string" ? subData.resultText : undefined,
-								// Mirrors SubagentCard's result viewer title.
-								title: description ? `${agentType} — ${description}` : agentType,
-							},
+							{ title: description ? `${agentType} — ${description}` : agentType },
 							{ prompt: renderLabels.subagent.prompt },
 						);
 						if (subTargets.length > 0) {
@@ -1646,7 +1703,7 @@ const ExactRow = memo(
 					);
 				}
 				if (viewControls) {
-					const cardTargets = resolveToolDetailViewTargets(rowKey, card, {
+					const cardTargets = resolveToolDetailViewTargets(rowOwner, card, {
 						sections: renderLabels.toolCall.sections,
 					});
 					if (cardTargets.length > 0) {
@@ -1729,6 +1786,41 @@ const ExactRow = memo(
 		// Subagent card's in-card "open full session" button. RenderSubagent has
 		// always accepted onOpenSession, but nothing supplied it — the button was
 		// inert. Bind it to the same action the row menu uses.
+		if (kind === "communication-bubble") {
+			const open = injectionNavigation?.onOpenNarrator;
+			// Registry-projected data follows the measured identity: recipient changes
+			// re-key extractDataRevision, and language changes re-key labelsRevision.
+			// Comparing spec.data itself would repaint every row on every rebuild.
+			const labels = (extra.data as { labels?: Record<string, string> }).labels;
+			if (open) {
+				extra.onOpenRecipient = (id: string, deliveryMessageId?: string) => {
+					void openCommunicationRecipient(
+						{ id, deliveryMessageId },
+						{
+							locate: narratorsApi.getMessageLocation,
+							open,
+							notify: (reason) =>
+								notifications.show({
+									color: reason === "error" ? "red" : "yellow",
+									message:
+										reason === "legacy"
+											? (labels?.communicationReceiptLegacy ??
+												"This older message has no receipt link. Opened the recipient's session instead.")
+											: reason === "unavailable"
+												? (labels?.communicationReceiptUnavailable ??
+													"The message has not been received yet or is no longer available. Please try again later.")
+												: (labels?.communicationReceiptError ??
+													"Could not locate the received message."),
+								}),
+						},
+					);
+				};
+			}
+			if (viewControls) {
+				const target = resolveItemViewTargets(item, renderLabels, extra)[0];
+				if (target) extra.onViewFull = () => viewControls.openFullscreen(target);
+			}
+		}
 		if (kind === "subagent-card") {
 			if (interaction?.toolActions?.onViewSubagentSession) {
 				extra.onOpenSession = interaction.toolActions.onViewSubagentSession;
@@ -1783,8 +1875,13 @@ const ExactRow = memo(
 			extra.viewTargets = viewTargets;
 			extra.viewControls = viewControls;
 		}
+		// Communication bubbles expose fullscreen through their own button and the
+		// row menu. They do not implement inline source/wrap modes, so do not mount
+		// a generic toolbar whose toggles would change state without changing paint.
 		const rowViewTarget =
-			!cardHostsOwnBars && viewTargets && viewTargets.length > 0 ? viewTargets[0] : undefined;
+			kind !== "communication-bubble" && !cardHostsOwnBars && viewTargets && viewTargets.length > 0
+				? viewTargets[0]
+				: undefined;
 		// A plain content row's own body honours the source toggle: the renderer
 		// swaps the measured markdown for the raw text inside the SAME reserved
 		// geometry. Only wired while the toggle is actually on, so an untouched row
@@ -1835,11 +1932,7 @@ const ExactRow = memo(
 			interaction && editorSlot === undefined ? (
 				<MessageContextMenuCtx.Provider value={interaction.actions}>
 					<MessageIdentityCtx.Provider
-						value={{
-							messageId: interaction.messageId,
-							messageSeq,
-							role: messageRole,
-						}}
+						value={{ messageId: interaction.messageId, messageSeq, role: messageRole }}
 					>
 						<VListRowInteraction
 							blockId={interaction.blockId}
@@ -1852,6 +1945,7 @@ const ExactRow = memo(
 							actions={interaction.actions}
 							narratorId={narratorId}
 							toolUseId={interaction.toolUseId}
+							toolDetailRef={interaction.toolDetailRef}
 							toolMeta={interaction.toolMeta}
 							toolActions={interaction.toolActions}
 							onViewOriginal={interaction.onViewOriginal}
@@ -1891,8 +1985,8 @@ const ExactRow = memo(
 			<div
 				id={itemId}
 				data-message-id={sourceIds[0]}
-				{...(messageSeq != null ? { "data-message-seq": String(messageSeq) } : {})}
-				{...(messageRole ? { "data-role": messageRole } : {})}
+				data-message-seq={messageSeq}
+				data-role={messageRole}
 				// LOD-independent identity of this row's content (see ElementSpec.unitId).
 				// A tool call carries the same value here as the folded trace row it
 				// becomes at L1/L2, so the two renderings are pairable across a level
@@ -2146,6 +2240,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			pruneDividerLabel,
 			hasChapter,
 			highlightMessageId,
+			highlightRequestId,
 			tailFooter,
 		} = props;
 		const lod = useRenderLod() as RenderLod;
@@ -2329,6 +2424,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					getViewportHeight: () => viewportRef.current?.clientHeight ?? 0,
 					writeInstant: (value) => writeScrollTop(value),
 					writeChase: (value) => writeChaseScrollTop(value),
+					canAnimate: shouldSmoothFollow,
 				});
 				smoothFollowerRef.current = follower;
 			}
@@ -2469,27 +2565,51 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// `{_truncated, preview, _hints}` produced an EMPTY header summary — the reason
 		// Edit/Read rows showed just the tool name while their expanded detail (which
 		// fetches the full payload) looked fine.
-		const resolveExactToolSummary = useCallback((tc: unknown) => {
-			const call = (tc ?? {}) as {
-				toolName?: unknown;
-				inputJson?: unknown;
-				_metadata?: unknown;
-				outputJson?: unknown;
-			};
-			if (typeof call.toolName !== "string") return "";
-			const outputMetadata =
-				call.outputJson && typeof call.outputJson === "object" && !Array.isArray(call.outputJson)
-					? (call.outputJson as { _metadata?: unknown })._metadata
-					: undefined;
-			const metadata = outputMetadata ?? call._metadata;
-			return getSummary(
-				call.toolName,
-				call.inputJson,
-				metadata && typeof metadata === "object"
-					? (metadata as Record<string, unknown>)
-					: undefined,
-			);
-		}, []);
+		const { t, i18n } = useTranslation("narrator");
+		const resolveExactToolSummary = useCallback(
+			(tc: unknown) => {
+				const call = (tc ?? {}) as {
+					toolName?: unknown;
+					inputJson?: unknown;
+					_metadata?: unknown;
+					outputJson?: unknown;
+					status?: string;
+					_sendDeliveryTargets?: unknown;
+					_sendDeliveryTargetCount?: number;
+				};
+				if (typeof call.toolName !== "string") return "";
+				const outputMetadata =
+					call.outputJson && typeof call.outputJson === "object" && !Array.isArray(call.outputJson)
+						? (call.outputJson as { _metadata?: unknown })._metadata
+						: undefined;
+				const sourceMetadata = outputMetadata ?? call._metadata;
+				const metadata =
+					sourceMetadata && typeof sourceMetadata === "object"
+						? (sourceMetadata as Record<string, unknown>)
+						: undefined;
+				const summaryMetadata =
+					call.toolName === "Send"
+						? {
+								...metadata,
+								status: call.status,
+								_sendDeliveryTargets: call._sendDeliveryTargets,
+								targetCount: call._sendDeliveryTargetCount ?? metadata?.targetCount,
+							}
+						: metadata;
+				return getSummary(call.toolName, call.inputJson, summaryMetadata, {
+					communicationRunning: t("communicationRunning"),
+					communicationNoRecipients: t("communicationNoRecipients"),
+					communicationSuccess: t("communicationSuccess"),
+					communicationReceived: t("communicationReceived"),
+					communicationWaiting: t("communicationWaiting"),
+					communicationReplyReceived: t("communicationReplyReceived"),
+					communicationTimeout: t("communicationTimeout"),
+					communicationCancelled: t("communicationCancelled"),
+					communicationError: t("communicationError"),
+				});
+			},
+			[t],
+		);
 		// A subagent recent-call row's label detail. Same shared helper the chunked
 		// `SubagentActivityRow` calls, so one child call is worded identically in both
 		// render paths. It takes the projected `inputSummary` rather than a tool call
@@ -3018,7 +3138,6 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// (older history exhausted), the anchor-preserving rebuild keeps the visible
 		// content fixed while the reserved space changes off-screen above it.
 		const [olderHeaderHeight, setOlderHeaderHeight] = useState(0);
-		const { t, i18n } = useTranslation("narrator");
 		const { t: tCommon } = useTranslation("common");
 		// Every localized string the vlist paints comes from one place (the vlist
 		// layers themselves import no i18n — see CONTRACT.md §0). `adapterLabels` feeds
@@ -3119,10 +3238,13 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// path's LazyDetailRenderer equivalent). The id list is published by an effect
 		// AFTER the build below, so this render uses the previous list — one build
 		// behind is exactly right: the row must already be expanded to need its body.
-		const [truncatedToolUseIds, setTruncatedToolUseIds] = useState<readonly string[]>([]);
+		const [truncatedToolCalls, setTruncatedToolCalls] = useState<{
+			narratorId: string;
+			requests: readonly VListToolDetailRequest[];
+		}>({ narratorId, requests: [] });
 		const { resolveFullToolInput, resolveFullToolOutput } = useVListToolDetails(
 			narratorId,
-			truncatedToolUseIds,
+			truncatedToolCalls.narratorId === narratorId ? truncatedToolCalls.requests : [],
 		);
 		// Header terminate control: interrupting the narrator is what actually stops a
 		// running shell / MCP tool (the chunked control does the same).
@@ -3314,9 +3436,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		loadOlderAsyncRef.current = loadOlderAsync;
 		const oldestLoadedSeqRef = useRef(oldestLoadedSeq);
 		oldestLoadedSeqRef.current = oldestLoadedSeq;
-		// A near-top scroll only auto-loads when it follows a recent upward gesture
-		// (wheel/touch), mirroring the chunk list's intent gate so momentum settling
-		// at the top does not endlessly page history.
+		// A near-top scroll only auto-loads after recent upward reader movement.
+		// Wheel/touch handlers and non-programmatic scroll frames both record intent;
+		// consuming it prevents an idle top or a prepend correction from paging again.
 		const olderHistoryIntentAtRef = useRef<number | null>(null);
 		// Older history occupies a constant-height header reserved inside the exact
 		// canvas top padding. It never changes height (button ↔ spinner ↔ empty all
@@ -3632,20 +3754,42 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		// correct treatment for a change the reader did not just click: the content they
 		// are looking at holds its screen position and nothing below it appears to move.
 		const truncatedExpandedToolUseIds = useMemo(() => {
-			const ids: string[] = [];
+			const ids: VListToolDetailRequest[] = [];
 			for (const item of renderItems) {
 				if (!item) continue;
+				if (item.spec.kind === "communication-bubble") {
+					const source = item.spec.data as { toolUseId?: string; messageBody?: ToolCappedDetail };
+					if (
+						source.toolUseId &&
+						source.messageBody?.textTruncated &&
+						isFullPayloadRequestedRow(activeInteraction, item.spec.key)
+					) {
+						ids.push(toolDetailRequestFromData(source.toolUseId, source));
+					}
+					continue;
+				}
 				if (item.spec.kind === "tool-call") {
 					const measured = item.measured as MeasuredToolCall;
 					if (measured.truncatedLeafCount <= 0) continue;
 					if (!isFullPayloadRequestedRow(activeInteraction, item.spec.key)) continue;
-					if (measured.toolUseId) ids.push(measured.toolUseId);
+					if (measured.toolUseId)
+						ids.push(toolDetailRequestFromData(measured.toolUseId, item.spec.data));
 					continue;
 				}
 				if (item.spec.kind === "subagent-card") {
 					const measured = item.measured as MeasuredSubagent;
-					if (!measured.promptTruncated) continue;
-					if (measured.toolUseId) ids.push(measured.toolUseId);
+					const source = item.spec.data as {
+						promptBody?: ToolCappedDetail;
+						resultBody?: ToolCappedDetail;
+					};
+					const requested = isFullPayloadRequestedRow(activeInteraction, item.spec.key);
+					if (
+						!measured.promptTruncated &&
+						!(requested && (source.promptBody?.textTruncated || source.resultBody?.textTruncated))
+					)
+						continue;
+					if (measured.toolUseId)
+						ids.push(toolDetailRequestFromData(measured.toolUseId, item.spec.data));
 					continue;
 				}
 				// A drilled-in trace row hosts a real tool card, so it reaches the same
@@ -3664,32 +3808,57 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 						// the row.
 						if (row.cardKind === "subagent-card") {
 							const subCard = row.cardMeasured as MeasuredSubagent;
-							if (!subCard.promptTruncated || !subCard.toolUseId) continue;
-							ids.push(subCard.toolUseId);
+							const source = resolveTraceRowCardData(item, row.itemIndex) as {
+								promptBody?: ToolCappedDetail;
+								resultBody?: ToolCappedDetail;
+							};
+							const requested = isFullPayloadRequestedRow(
+								activeInteraction,
+								ownerRequestKey({ specKey: item.spec.key, traceItemIndex: row.itemIndex }),
+							);
+							if (
+								!subCard.toolUseId ||
+								(!subCard.promptTruncated &&
+									!(
+										requested &&
+										(source.promptBody?.textTruncated || source.resultBody?.textTruncated)
+									))
+							)
+								continue;
+							ids.push(toolDetailRequestFromData(subCard.toolUseId, source));
 							continue;
 						}
 						const card = row.cardMeasured as MeasuredToolCall;
 						if (card.truncatedLeafCount <= 0 || !card.toolUseId) continue;
-						const rowKey = traceRowViewKey(item.spec.key, row.itemIndex);
+						const rowOwner = { specKey: item.spec.key, traceItemIndex: row.itemIndex };
+						const rowKey = ownerRequestKey(rowOwner);
 						if (!isFullPayloadRequestedRow(activeInteraction, rowKey)) continue;
-						ids.push(card.toolUseId);
+						ids.push(
+							toolDetailRequestFromData(
+								card.toolUseId,
+								resolveTraceRowCardData(item, row.itemIndex),
+							),
+						);
 					}
 				}
 			}
 			return ids;
 		}, [renderItems, activeInteraction]);
 		useEffect(() => {
-			setTruncatedToolUseIds((prev) =>
-				sameIdList(prev, truncatedExpandedToolUseIds) ? prev : truncatedExpandedToolUseIds,
+			setTruncatedToolCalls((prev) =>
+				prev.narratorId === narratorId &&
+				sameToolDetailRequests(prev.requests, truncatedExpandedToolUseIds)
+					? prev
+					: { narratorId, requests: truncatedExpandedToolUseIds },
 			);
-		}, [truncatedExpandedToolUseIds]);
+		}, [narratorId, truncatedExpandedToolUseIds]);
 
 		// Mark a row as having asked for its full payload. This must mark
 		// SYNCHRONOUSLY: the channel below treats `requestFullPayload` as fire-and-
 		// forget, so handing it a thunk factory (as the removed per-row notice-line
 		// prop once consumed) marks nothing and the fetch never starts.
-		const requestRowFullPayload = useCallback((key: string) => {
-			setInteraction((prev) => markVListFullPayloadRequested(prev, key));
+		const requestRowFullPayload = useCallback((owner: VListViewOwner) => {
+			setInteraction((prev) => markVListFullPayloadRequested(prev, ownerRequestKey(owner)));
 		}, []);
 
 		// Fullscreen content viewer: per-body wrap / source state plus the single open
@@ -3715,27 +3884,42 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 		//
 		// Scoped to an open modal — with nothing open this short-circuits before the
 		// scan, so a scrolling list pays nothing.
-		const openTargetId = contentView.openTarget?.id ?? null;
+		const openTarget = contentView.openTarget;
 		const openTargetState = useMemo<{ target?: VListViewTarget; loading: boolean }>(() => {
-			if (!openTargetId) return { loading: false };
-			const viewKey = viewTargetSpecKey(openTargetId);
-			if (!viewKey) return { loading: false };
-			// A body opened from a drilled-in trace row carries the ROW key, so resolve
-			// back through the owning trace element and then its measured row. Without
-			// this the modal never re-derived such a body and would keep showing the
-			// server-side prefix even after the fetch resolved.
-			const traceRow = parseTraceRowViewKey(viewKey);
-			const specKey = traceRow?.specKey ?? viewKey;
-			const item = renderItems.find((candidate) => candidate?.spec.key === specKey);
-			if (!item) return { loading: false };
-			const targets = traceRow
-				? resolveTraceRowViewTargets(item, traceRow.itemIndex, viewKey, renderLabels)
-				: resolveItemViewTargets(item, renderLabels, resolveRenderExtra(item.spec));
-			const target = targets.find((candidate) => candidate.id === openTargetId);
-			const loading =
-				target?.truncated === true && isFullPayloadRequestedRow(activeInteraction, viewKey);
-			return { ...(target ? { target } : {}), loading };
-		}, [openTargetId, renderItems, renderLabels, activeInteraction]);
+			if (!openTarget) return { loading: false };
+			const match = (item: VListItem, traceItemIndex?: number) => {
+				const targets =
+					traceItemIndex == null
+						? resolveItemViewTargets(item, renderLabels, resolveRenderExtra(item.spec), true)
+						: resolveTraceRowViewTargets(item, traceItemIndex, renderLabels, true);
+				return targets.find((candidate) => candidate.id === openTarget.id);
+			};
+			const owner = openTarget.owner;
+			const item = renderItems.find((candidate) => candidate?.spec.key === owner.specKey);
+			let target = item ? match(item, owner.traceItemIndex) : undefined;
+			// Location can change at an LOD/trace transition; content identity cannot.
+			// This fallback only runs for the ONE open modal after its old owner moved.
+			if (!target) {
+				for (const candidate of renderItems) {
+					if (!candidate) continue;
+					target = match(candidate);
+					if (!target && TRACE_ROW_INTERACTION_KINDS.has(candidate.spec.kind)) {
+						const rows = (candidate.measured as MeasuredCollapsibleTrace).rows ?? [];
+						for (const row of rows) {
+							target = match(candidate, row.itemIndex);
+							if (target) break;
+						}
+					}
+					if (target) break;
+				}
+			}
+			return {
+				...(target ? { target } : {}),
+				loading:
+					target?.truncated === true &&
+					isFullPayloadRequestedRow(activeInteraction, ownerRequestKey(target.owner)),
+			};
+		}, [openTarget, renderItems, renderLabels, activeInteraction]);
 		const refreshOpenTarget = contentView.refreshOpenTarget;
 		const refreshedTarget = openTargetState.target;
 		useEffect(() => {
@@ -5165,6 +5349,11 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				suppressedScrollTopRef.current,
 				nextTop,
 			);
+			// Scrollbar drags and keyboard scrolling have no wheel/touch event to arm
+			// the history gate. Record their actual upward travel before testing it.
+			if (isUpwardHistoryScroll(previousTop, nextTop, isEcho)) {
+				olderHistoryIntentAtRef.current = Date.now();
+			}
 			if (!isEcho) {
 				// The reader moved during our suppression window: close it so nothing else
 				// in this frame treats their scrolling as programmatic.
@@ -5420,22 +5609,18 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				// is driven by the reveal itself, so it can never fire on a failed jump or
 				// on a row that has since scrolled away.
 				const revealMounted = () => {
-					const candidates = [
-						...domIds,
-						...targetIds.flatMap((target) => [target, `msg-${messageIdFromTarget(target)}`]),
-					];
-					for (const id of candidates) {
-						const element = document.getElementById(id);
-						if (!element) continue;
-						pinnedToBottomRef.current = false;
-						setPinnedToBottom(false);
-						element.scrollIntoView?.({ block: "center" });
-						// Flash the row itself (not a wrapper): the id is on the ExactRow hit
-						// box, so the outline traces the row the jump landed on.
-						if (highlightId) highlightRef.current.flash(element);
-						return true;
-					}
-					return false;
+					const node = viewportRef.current;
+					if (!node) return false;
+					const element = mountedJumpTarget(node, domIds, targetIds);
+					if (!element) return false;
+					pinnedToBottomRef.current = false;
+					setPinnedToBottom(false);
+					// Restrict the reveal to this list, including repeated jumps to a mounted
+					// row. Native scrollIntoView can also scroll the panel/page ancestors.
+					writeScrollTop(jumpTargetScrollTop(node, element));
+					// Highlight the exact tool row, not its message's earlier text/alias.
+					if (highlightId) highlightRef.current.flash(element);
+					return true;
 				};
 				// Scroll to a message that HAS a layout item, then let the mounted-window
 				// recomputation (one frame) produce the node the flash needs.
@@ -5445,7 +5630,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 						const index = pretextDocumentRef.current.readWindow().index;
 						const node = viewportRef.current;
 						if (!index || !node) return false;
-						const itemIndex = index.itemIndicesForSourceMessageId(messageId)[0];
+						const itemIndex = jumpTargetItemIndex(index, messageId);
 						if (itemIndex == null) continue;
 						const targetTop = index.itemStart(itemIndex) - Math.max(0, node.clientHeight / 2);
 						pinnedToBottomRef.current = false;
@@ -5566,15 +5751,10 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			],
 		);
 
-		// Deep-link / search jump: reveal the target once per (narrator, target) pair.
-		//
-		// Gated on a READY document rather than retried per rebuild. The jump now reaches
-		// history above the loaded window by paging toward it itself, so the only thing
-		// it cannot do is start before there is a window at all — and a retry loop over a
-		// path that fetches (and can report failure to the reader) would fire a request
-		// and a notice on every intermediate commit. Only a SUCCESSFUL reveal is
-		// recorded, so returning to the same target later (a repeated search hit)
-		// re-flashes because the panel hands the id back as a fresh mount.
+		// Deep-link / search jump: once per (narrator, target, request). A new request
+		// repeats the jump without remounting the panel or discarding loaded history.
+		// Wait for a READY document; missing history is paged by the jump itself.
+		// Latch each attempt so intermediate rebuilds do not duplicate fetches/notices.
 		const jumpedHighlightRef = useRef<string | null>(null);
 		const documentReady = pretextDocument.status === "ready";
 		useEffect(() => {
@@ -5583,7 +5763,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				return;
 			}
 			if (!documentReady) return;
-			const key = `${narratorId}:${highlightMessageId}`;
+			const key = JSON.stringify([narratorId, highlightMessageId, highlightRequestId]);
 			if (jumpedHighlightRef.current === key) return;
 			// Latch BEFORE awaiting: a failed deep-link jump has already told the reader
 			// why (the notice inside scrollToMessageTarget), and re-running it on the next
@@ -5594,7 +5774,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 				targetIds: [highlightMessageId],
 				highlightId: highlightMessageId,
 			});
-		}, [documentReady, highlightMessageId, narratorId, scrollToMessageTarget]);
+		}, [documentReady, highlightMessageId, highlightRequestId, narratorId, scrollToMessageTarget]);
 
 		// A flash outlives its row's mount (the reader can scroll away mid-animation),
 		// so the controller is stopped explicitly on unmount.
@@ -5852,6 +6032,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					copyText,
 					actions,
 					toolUseId,
+					toolDetailRef: toolUseId
+						? toolDetailRequestFromData(toolUseId, item.spec.data)
+						: undefined,
 					toolMeta,
 					toolActions,
 					...(editedMeta ? { onViewOriginal: () => setOriginalModalMessageId(messageId) } : {}),
@@ -5930,12 +6113,9 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 			return (row, rowBody) => {
 				const baseIdentity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
 				if (!baseIdentity) return null;
-				const messageMeta = messagesById.get(baseIdentity.messageId);
-				const identity = {
-					...baseIdentity,
-					messageSeq: messageMeta?.seq,
-					role: messageMeta?.role,
-				};
+				// Read current metadata without invalidating every trace slot on streaming deltas.
+				const messageMeta = messagesByIdRef.current.get(baseIdentity.messageId);
+				const identity = { ...baseIdentity, messageSeq: messageMeta?.seq, role: messageMeta?.role };
 				const actions = buildRowCtxActions(
 					{
 						messageId: identity.messageId,
@@ -5957,6 +6137,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 								identity={identity}
 								actions={actions}
 								narratorId={narratorId}
+								toolDetailRef={row.identity?.toolDetailRef}
 								onViewSubagentSession={handlers.onViewSubagentSession}
 								onDetachSubagent={handlers.onDetachSubagent}
 								onCancelBackgroundTask={handlers.onCancelBackgroundTask}
@@ -5968,7 +6149,7 @@ export const PretextExactMessageList = forwardRef<MessageListHandle, PretextExac
 					</MessageContextMenuCtx.Provider>
 				);
 			};
-		}, [selectionIndex, rowHandlers, rowToolMetaIndex, messagesById, narratorId]);
+		}, [selectionIndex, rowHandlers, rowToolMetaIndex, narratorId]);
 
 		/**
 		 * The card-specific actions for a DRILLED-IN trace row's tool call (the

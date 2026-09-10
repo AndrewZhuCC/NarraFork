@@ -1,5 +1,23 @@
 import { z } from "zod/v4";
-import type { ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
+
+async function reportTeamSendTargetCount(ctx: ToolContext, count: number): Promise<void> {
+	if (!ctx.currentToolUseId) return;
+	try {
+		const { broadcastSendDeliveryResolved } = await import(
+			"@server/services/send-delivery-resolution"
+		);
+		await broadcastSendDeliveryResolved(
+			ctx.narratorId,
+			ctx.currentToolUseId,
+			[],
+			ctx.toolCallBinding,
+			count,
+		);
+	} catch {
+		// Display metadata must not prevent a message from being sent.
+	}
+}
 
 type TeamAction = "list" | "list_agents" | "list_bash" | "file_changes" | "broadcast" | "send";
 
@@ -321,30 +339,38 @@ export const teamStatusTool: ToolDefinition = {
 				);
 				if (targets.length === 0) {
 					const targetKind = ctx.parentNarratorId ? "sibling subagents" : "child subagents";
-					return { output: `No ${targetKind} to broadcast to.` };
+					return {
+						output: `No ${targetKind} to broadcast to.`,
+						metadata: {
+							kind: "send",
+							broadcast: true,
+							await: false,
+							targets: [],
+							targetCount: 0,
+							warning: `No ${targetKind} to broadcast to.`,
+						},
+					};
 				}
+				await reportTeamSendTargetCount(ctx, targets.length);
 				const senderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
-				// Reader-only navigation target: where the sender was in its own session
-				// when it broadcast this. Best-effort — a sender that has written nothing
-				// has nothing to point at, and that must not fail the broadcast.
-				const { getSubagentResultMessageId } = await import("@server/services/narrator-session");
-				const fromMessageId = await getSubagentResultMessageId(ctx.narratorId).catch(
-					() => undefined,
-				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: senderType,
-					...(fromMessageId ? { fromMessageId } : {}),
+					fromToolUseId: ctx.currentToolUseId,
+					fromToolCallBinding: ctx.toolCallBinding,
 					text: message,
 					timestamp: now,
 					isBroadcast: true,
 				};
-				for (const target of targets) {
-					deliverTeamMessage(target.id, msg, parentNarratorId);
-				}
+				const deliveryIds = new Map(
+					targets.map((target) => [
+						target.id,
+						deliverTeamMessage(target.id, msg, parentNarratorId),
+					]),
+				);
 				const nonWorking = targets.filter(
 					(t: { id: string; status: string }) => t.status !== "working",
 				);
@@ -355,7 +381,27 @@ export const teamStatusTool: ToolDefinition = {
 				if (nonWorking.length > 0) {
 					output += `\n(warning: ${nonWorking.length} target(s) not currently working — messages may not be received)`;
 				}
-				return { output };
+				return {
+					output,
+					metadata: {
+						kind: "send",
+						broadcast: true,
+						await: false,
+						...(nonWorking.length > 0
+							? {
+									warning: `${nonWorking.length} target(s) not currently working — messages may not be received`,
+								}
+							: {}),
+						targetCount: targets.length,
+						targets: targets.map((target) => ({
+							id: target.id,
+							deliveryMessageId: deliveryIds.get(target.id),
+							label: agentLabelFromNarrator(target, parentNarratorId),
+							title: target.title,
+							status: "queued",
+						})),
+					},
+				};
 			}
 
 			case "send": {
@@ -381,34 +427,45 @@ export const teamStatusTool: ToolDefinition = {
 						isError: true,
 					};
 				}
+				await reportTeamSendTargetCount(ctx, 1);
 				const sendSenderType = teamMemberType(sender.variant);
 				const now = new Date().toISOString();
-				// See the broadcast branch: reader-only navigation target, best-effort.
-				const { getSubagentResultMessageId: resolveSenderMessageId } = await import(
-					"@server/services/narrator-session"
-				);
-				const sendFromMessageId = await resolveSenderMessageId(ctx.narratorId).catch(
-					() => undefined,
-				);
 				const msg: TeamMessage = {
 					fromId: ctx.narratorId,
 					fromTitle: sender.title,
 					fromLabel: agentLabelFromNarrator(sender, parentNarratorId),
 					fromType: sendSenderType,
-					...(sendFromMessageId ? { fromMessageId: sendFromMessageId } : {}),
+					fromToolUseId: ctx.currentToolUseId,
+					fromToolCallBinding: ctx.toolCallBinding,
 					text: message,
 					timestamp: now,
 					isBroadcast: false,
 				};
 				// Inbox keys are real narrator ids; delivering under an alias would drop the
 				// message into an inbox nobody drains.
-				deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
+				const deliveryMessageId = deliverTeamMessage(resolvedTargetId, msg, parentNarratorId);
 				const warning =
 					target.status !== "working"
 						? ` (warning: target is ${target.status}, message may not be received)`
 						: "";
 				return {
 					output: `Message sent to ${agentLabelFromNarrator(target, parentNarratorId)}.${warning}`,
+					metadata: {
+						kind: "send",
+						broadcast: false,
+						await: false,
+						targetCount: 1,
+						...(warning ? { warning: warning.trim() } : {}),
+						targets: [
+							{
+								id: target.id,
+								deliveryMessageId,
+								label: agentLabelFromNarrator(target, parentNarratorId),
+								title: target.title,
+								status: "queued",
+							},
+						],
+					},
 				};
 			}
 

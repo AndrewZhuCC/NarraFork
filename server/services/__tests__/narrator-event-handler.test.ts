@@ -17,8 +17,10 @@ const realNarratorWsModule = { ...(await import("../../websocket/narrator-ws")) 
 mock.module("../../db", () => ({ db, sqlite }));
 
 const broadcastMessages: unknown[] = [];
+const broadcastTargets: string[] = [];
 mock.module("../../websocket/narrator-ws", () => ({
 	broadcastToNarrator: (_narratorId: string, message: unknown) => {
+		broadcastTargets.push(_narratorId);
 		broadcastMessages.push(message);
 	},
 	getNarratorConnections: () => [],
@@ -58,13 +60,235 @@ function makeSubagentContext(): EventHandlerContext {
 
 afterEach(() => {
 	clearStreamingSnapshot(PARENT_NARRATOR_ID);
+	clearStreamingSnapshot("subagent-narrator");
 	broadcastMessages.length = 0;
+	broadcastTargets.length = 0;
 });
 
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
+});
+
+async function cleanupFileContextNarrator(id: string) {
+	// These tests use the functional in-memory DB, whose historical FK edges
+	// intentionally mirror migrations beyond the minimal narrator fixture.
+	sqlite.run("PRAGMA foreign_keys = OFF");
+	try {
+		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id));
+		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, id));
+		await db.delete(narrators).where(eq(narrators.id, id));
+	} finally {
+		sqlite.run("PRAGMA foreign_keys = ON");
+	}
+}
+
+describe("queue snapshot clear", () => {
+	for (const isSubagent of [false, true]) {
+		test(`queue updates only reach their owner (subagent=${isSubagent})`, async () => {
+			const ctx = makeSubagentContext();
+			if (!isSubagent) {
+				ctx.narratorId = PARENT_NARRATOR_ID;
+				ctx.parentToolUseId = undefined;
+			}
+			for (const event of [
+				{ type: "queue_status" as const, position: 2, queueDepth: 3 },
+				{ type: "queue_status" as const, position: 0 },
+				{ type: "queue_status" as const },
+			]) {
+				await processEvent(event, ctx);
+			}
+			expect(broadcastTargets).toEqual(Array(3).fill(ctx.narratorId));
+			expect(broadcastMessages).toEqual([
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId, position: 2 }),
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId, position: 0 }),
+				expect.objectContaining({ type: "queue_status", narratorId: ctx.narratorId }),
+			]);
+			if (isSubagent) expect(getStreamingSnapshot(PARENT_NARRATOR_ID)).toBeUndefined();
+		});
+	}
+	for (const clear of [
+		{ type: "queue_status" as const },
+		{ type: "queue_status" as const, position: 0, queueDepth: 0 },
+	]) {
+		test(`clears queue snapshot before text: ${JSON.stringify(clear)}`, async () => {
+			const ctx = makeSubagentContext();
+			await processEvent(
+				{ type: "queue_status", position: 1, queueDepth: 2, queueMessage: "waiting" },
+				ctx,
+			);
+			await processEvent(clear, ctx);
+			const snapshot = getStreamingSnapshot(ctx.narratorId);
+			expect(snapshot?.queuePosition).toBeUndefined();
+			expect(snapshot?.queueDepth).toBeUndefined();
+			expect(snapshot?.queueMessage).toBeUndefined();
+			expect(snapshot?.streamingBlocks).toEqual([]);
+			expect(broadcastMessages.at(-1)).toMatchObject({ type: "queue_status" });
+			clearStreamingSnapshot(ctx.narratorId);
+		});
+	}
+});
+
+describe("assistant file-reference provenance", () => {
+	test("a subagent reconnect snapshot belongs to its own text context", async () => {
+		const ctx = {
+			...makeSubagentContext(),
+			getFileReferenceContext: () => ({ deviceId: "ChildDevice", cwd: "/child" }),
+		};
+		await processEvent({ type: "stream_text", text: "src/a.ts", outputIndex: 0 }, ctx);
+		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks[0]).toMatchObject({
+			type: "text",
+			fileReferenceContext: { deviceId: "ChildDevice", cwd: "/child" },
+		});
+		expect(getStreamingSnapshot(PARENT_NARRATOR_ID)?.streamingBlocks ?? []).toHaveLength(0);
+		await processEvent({ type: "stream_reset" }, ctx);
+		expect(getStreamingSnapshot(ctx.narratorId)).toBeUndefined();
+	});
+
+	test("first delta provenance survives device switches, partial persistence and reload", async () => {
+		const id = "file-context-main";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		let source = { deviceId: "DeviceA", cwd: "/repo" };
+		let reads = 0;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			parentToolUseId: undefined,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+			getFileReferenceContext: () => {
+				reads++;
+				return source;
+			},
+		};
+		try {
+			await processEvent({ type: "stream_text", text: "[file]", outputIndex: 0 }, ctx);
+			source = { deviceId: "DeviceB", cwd: "/other" };
+			await processEvent({ type: "stream_text", text: "(src/a.ts#L2)", outputIndex: 0 }, ctx);
+			expect(reads).toBe(1);
+			expect(getStreamingSnapshot(id)?.streamingBlocks[0]).toMatchObject({
+				fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" },
+			});
+			const deltas = broadcastMessages.filter(
+				(m) => (m as { type?: string }).type === "stream_event",
+			) as Array<{ event: Record<string, unknown> }>;
+			expect(deltas).toHaveLength(2);
+			for (const frame of deltas)
+				expect(frame.event.fileReferenceContext).toEqual({ deviceId: "DeviceA", cwd: "/repo" });
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "text", text: "[file](src/a.ts#L2)", outputIndex: 0 },
+				},
+				ctx,
+			);
+			const savedId = partialId;
+			await processEvent({ type: "stream_text", text: "next", outputIndex: 0 }, ctx);
+			await processEvent(
+				{ type: "block_complete", block: { type: "text", text: "next", outputIndex: 0 } },
+				ctx,
+			);
+			await processEvent(
+				{ type: "assistant_message", text: "[file](src/a.ts#L2)next", toolUses: [] },
+				ctx,
+			);
+			const reloaded = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, savedId as string),
+			});
+			expect(reloaded?.contentJson).toMatchObject([
+				{ fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" } },
+				{ fileReferenceContext: { deviceId: "DeviceB", cwd: "/other" } },
+			]);
+			const final = broadcastMessages.findLast(
+				(m) => (m as { type?: string }).type === "message",
+			) as { message: { contentJson: unknown } };
+			expect(final.message.contentJson).toEqual(reloaded?.contentJson);
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("a combined provider text block never borrows its last device for earlier text", async () => {
+		const id = "file-context-mixed";
+		const createdAt = new Date().toISOString();
+		await db.insert(narrators).values({ id, createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		let deviceId = "A";
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			parentToolUseId: undefined,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+			getFileReferenceContext: () => ({ deviceId, cwd: "/repo" }),
+		};
+		try {
+			await processEvent({ type: "stream_text", text: "first ", outputIndex: 0 }, ctx);
+			deviceId = "B";
+			await processEvent({ type: "stream_text", text: "second", outputIndex: 1 }, ctx);
+			await processEvent(
+				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
+				ctx,
+			);
+			const message = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId as string),
+			});
+			expect((message?.contentJson as unknown[])?.[0]).toMatchObject({
+				type: "text",
+				text: "first second",
+			});
+			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+		} finally {
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("a completed block with no start event does not guess the current location", async () => {
+		const id = "file-context-unknown";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			parentToolUseId: undefined,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+			getFileReferenceContext: () => {
+				throw new Error("must not read current device at completion");
+			},
+		};
+		try {
+			await processEvent(
+				{ type: "block_complete", block: { type: "text", text: "src/a.ts" } },
+				ctx,
+			);
+			const message = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId as string),
+			});
+			expect((message?.contentJson as unknown[])?.[0]).not.toHaveProperty("fileReferenceContext");
+		} finally {
+			await cleanupFileContextNarrator(id);
+		}
+	});
 });
 
 describe("narrator event handler streaming snapshot", () => {

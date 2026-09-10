@@ -63,6 +63,7 @@ import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import type { MessagePlacementOptions } from "./narrator-persistence";
+import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { narratorService } from "./narrator-service";
 
 /**
@@ -183,6 +184,8 @@ export interface InjectionRecipientPlacement {
 }
 
 export interface DeliverInjectionOptions {
+	/** Exact recipient row reserved by an inbound agent delivery. */
+	messageId?: string;
 	/** Model-facing text. Stored verbatim as the row's first text block. */
 	content: string;
 	/** Producer tag. */
@@ -199,8 +202,10 @@ export interface DeliverInjectionOptions {
 	originSource?: MessageOriginSource;
 	/** Free-form detail for the attribution label (a task name, a handle). */
 	originDetail?: string | null;
-	/** Human who triggered this, when there is one. */
+	/** Human who triggered this, when there is one (audit, not execution authority). */
 	createdBy?: string | null;
+	/** Trusted source execution identity; an explicit anonymous userId must remain anonymous. */
+	executionPrincipal?: QuestionExecutionPrincipal;
 	/**
 	 * Set when the recipient is a SUBAGENT — see {@link InjectionRecipientPlacement}.
 	 * Omitted means a primary narrator: a top-level row and a single broadcast, which
@@ -260,6 +265,14 @@ export function buildSystemInjectionBlock(
  * consumer as well as its collaborator, and a static import would close a cycle.
  */
 export async function deliverInjection(
+	...args: Parameters<typeof deliverInjectionUnlocked>
+): ReturnType<typeof deliverInjectionUnlocked> {
+	if (!args[1].content.trim()) return EMPTY_RESULT;
+	const { withNarratorWorkAdmission } = await import("./narrator-session-state");
+	return withNarratorWorkAdmission(args[0], () => deliverInjectionUnlocked(...args));
+}
+
+async function deliverInjectionUnlocked(
 	narratorId: string,
 	options: DeliverInjectionOptions,
 ): Promise<DeliverInjectionResult> {
@@ -282,8 +295,9 @@ export async function deliverInjection(
 	};
 
 	const placement =
-		options.subagent || options.onPersist
+		options.subagent || options.onPersist || options.messageId
 			? {
+					...(options.messageId ? { messageId: options.messageId } : {}),
 					...(options.subagent ? { parentToolUseId: options.subagent.parentToolUseId } : {}),
 					...(options.onPersist ? { onPersist: options.onPersist } : {}),
 				}
@@ -354,7 +368,7 @@ export async function deliverInjection(
 		// subagent, and what may start one" in a module that reaches the session layer only
 		// through a lazy import — and would leave the route-level caller of the same
 		// scheduler entry unprotected.
-		result.started = await wakeIfIdle(narratorId, locale);
+		result.started = await wakeIfIdle(narratorId, locale, options.executionPrincipal);
 	}
 
 	return result;
@@ -379,7 +393,11 @@ export async function deliverInjection(
  */
 export interface InjectionScheduler {
 	requestSoftStop: (narratorId: string) => boolean;
-	wakeIfIdle: (narratorId: string, locale: Locale) => Promise<{ started: boolean }>;
+	wakeIfIdle: (
+		narratorId: string,
+		locale: Locale,
+		executionPrincipal?: QuestionExecutionPrincipal,
+	) => Promise<{ started: boolean }>;
 }
 
 /** Lazily bound to the real session module; replaced only by tests. */
@@ -402,8 +420,15 @@ async function resolveScheduler(): Promise<InjectionScheduler> {
 	const session = await import("./narrator-session");
 	return {
 		requestSoftStop: session.requestBufferedMessageSoftStop,
-		wakeIfIdle: (narratorId, locale) =>
-			session.startInjectionContinuationIfPossible(narratorId, locale),
+		wakeIfIdle: (narratorId, locale, executionPrincipal) =>
+			executionPrincipal
+				? session.startInjectionContinuationIfPossible(
+						narratorId,
+						locale,
+						undefined,
+						executionPrincipal,
+					)
+				: session.startInjectionContinuationIfPossible(narratorId, locale),
 	};
 }
 
@@ -438,9 +463,16 @@ async function requestSoftStop(narratorId: string): Promise<boolean> {
  * A failure here is logged, not thrown: the row is already persisted, so the content
  * is not lost — it simply waits for the next request instead of getting one now.
  */
-async function wakeIfIdle(narratorId: string, locale: Locale): Promise<boolean> {
+async function wakeIfIdle(
+	narratorId: string,
+	locale: Locale,
+	executionPrincipal?: QuestionExecutionPrincipal,
+): Promise<boolean> {
 	try {
-		const { started } = await (await resolveScheduler()).wakeIfIdle(narratorId, locale);
+		const seam = await resolveScheduler();
+		const { started } = executionPrincipal
+			? await seam.wakeIfIdle(narratorId, locale, executionPrincipal)
+			: await seam.wakeIfIdle(narratorId, locale);
 		return started;
 	} catch (err) {
 		logger.warn("Injection delivered but waking the narrator failed", {

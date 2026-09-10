@@ -3,12 +3,16 @@ import {
 	type AgentReplyScope,
 	beginAgentReplyWaitRun,
 	clearPendingAgentReplyWaits,
+	getActiveSendDeliveryTargets,
 	getPendingAgentReplyCount,
 	getRunningAgentReplyWaitRunSnapshot,
 	hasPendingAgentReply,
+	isPreparedAgentReplyPending,
+	preparePendingAgentReply,
 	registerAgentReplyWait,
 	registerAgentReplyWaitFromSnapshot,
 	resolvePendingAgentReply,
+	settlePreparedAgentReply,
 	waitForAgentReplyWaitRunStability,
 } from "../agent-reply-waiter";
 
@@ -22,6 +26,49 @@ afterEach(() => {
 });
 
 describe("agent Send reply waiter", () => {
+	test("read-only prepared match cannot settle a replacement with the same request ID", async () => {
+		const first = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			requestId: "replacement-reply",
+		});
+		const prepared = preparePendingAgentReply({
+			fromNarratorId: RESPONDER_ID,
+			toNarratorId: REQUESTER_ID,
+			scope: TEAM_SCOPE,
+		});
+		expect(prepared.matched).toBe(true);
+		expect(getPendingAgentReplyCount(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(1);
+		if (!prepared.matched) throw new Error("expected prepared reply");
+		expect(isPreparedAgentReplyPending(prepared.prepared)).toBe(true);
+		const replacement = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			requestId: first.requestId,
+		});
+		expect(isPreparedAgentReplyPending(prepared.prepared)).toBe(false);
+		expect(settlePreparedAgentReply(prepared.prepared, "stale response")).toMatchObject({
+			matched: false,
+		});
+		expect(getPendingAgentReplyCount(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(1);
+		expect((await first.promise).status).toBe("cancelled");
+		const fresh = preparePendingAgentReply({
+			fromNarratorId: RESPONDER_ID,
+			toNarratorId: REQUESTER_ID,
+			scope: TEAM_SCOPE,
+			replyTo: first.requestId,
+		});
+		if (!fresh.matched) throw new Error("expected fresh reply");
+		expect(settlePreparedAgentReply(fresh.prepared, "fresh response")).toMatchObject({
+			matched: true,
+		});
+		expect(await replacement.promise).toMatchObject({
+			status: "replied",
+			message: "fresh response",
+		});
+	});
 	test("matches an explicit request id and consumes only that waiter", async () => {
 		const first = registerAgentReplyWait({
 			requesterId: REQUESTER_ID,
@@ -264,9 +311,85 @@ describe("agent Send reply waiter", () => {
 				replyTo: requestId,
 				message: "Restored reply",
 			}),
-		).toEqual({ matched: true, requestId });
+		).toEqual({ matched: true, requestId, recipientToolUseId: run.toolUseId });
 		expect(await restored.promise).toMatchObject({ status: "replied", message: "Restored reply" });
 		run.complete();
+	});
+
+	test("exact delivery receipts survive snapshot restoration without changing reply state", () => {
+		const run = beginAgentReplyWaitRun({ toolUseId: "receipt-send", requesterId: REQUESTER_ID });
+		const wait = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			run,
+		});
+		wait.updateSnapshot({ deliveryMessageId: "reserved-row" });
+		expect(getActiveSendDeliveryTargets(REQUESTER_ID, run.toolUseId)).toEqual([
+			{ id: RESPONDER_ID, deliveryMessageId: "reserved-row" },
+		]);
+		expect(getActiveSendDeliveryTargets("other-owner", run.toolUseId)).toEqual([]);
+		run.markStable();
+		const snapshot = getRunningAgentReplyWaitRunSnapshot(run.toolUseId);
+		if (!snapshot) throw new Error("missing active run snapshot");
+		expect(snapshot.waiters[0].result).toBeUndefined();
+		run.complete();
+		const restoredRun = beginAgentReplyWaitRun({
+			toolUseId: run.toolUseId,
+			requesterId: REQUESTER_ID,
+		});
+		registerAgentReplyWaitFromSnapshot(restoredRun, snapshot.waiters[0]);
+		expect(getActiveSendDeliveryTargets(REQUESTER_ID, run.toolUseId)).toEqual([
+			{ id: RESPONDER_ID, deliveryMessageId: "reserved-row" },
+		]);
+		expect(hasPendingAgentReply(REQUESTER_ID, RESPONDER_ID, TEAM_SCOPE)).toBe(true);
+		restoredRun.complete();
+		expect(getActiveSendDeliveryTargets(REQUESTER_ID, run.toolUseId)).toEqual([]);
+	});
+
+	test("restored reply wait retains the exact requester message and attempt binding", () => {
+		const binding = { toolCallId: "precise-tool-row", attempt: 3 };
+		const run = beginAgentReplyWaitRun({
+			toolUseId: "reused",
+			requesterId: REQUESTER_ID,
+			requesterToolCallBinding: binding,
+		});
+		const waiter = registerAgentReplyWait({
+			requesterId: REQUESTER_ID,
+			responderId: RESPONDER_ID,
+			scope: TEAM_SCOPE,
+			run,
+			requesterMessageId: "precise-message",
+			requesterToolCallBinding: binding,
+			deliveryMessageId: "recipient-input",
+		});
+		run.markStable();
+		const snapshot = getRunningAgentReplyWaitRunSnapshot(run.toolUseId);
+		if (!snapshot) throw new Error("missing snapshot");
+		run.complete();
+		const restored = beginAgentReplyWaitRun({
+			toolUseId: snapshot.toolUseId,
+			requesterId: snapshot.requesterId,
+			requesterToolCallBinding: snapshot.requesterToolCallBinding,
+		});
+		registerAgentReplyWaitFromSnapshot(restored, snapshot.waiters[0]);
+		expect(getActiveSendDeliveryTargets(REQUESTER_ID, "reused", binding)).toEqual([
+			{ id: RESPONDER_ID, deliveryMessageId: "recipient-input" },
+		]);
+		expect(
+			getActiveSendDeliveryTargets(REQUESTER_ID, "reused", { ...binding, attempt: 2 }),
+		).toEqual([]);
+		expect(getActiveSendDeliveryTargets(REQUESTER_ID, "reused")).toEqual([]);
+		expect(
+			resolvePendingAgentReply({
+				fromNarratorId: RESPONDER_ID,
+				toNarratorId: REQUESTER_ID,
+				scope: TEAM_SCOPE,
+				replyTo: waiter.requestId,
+				message: "replied",
+			}),
+		).toMatchObject({ matched: true, recipientMessageId: "precise-message" });
+		restored.complete();
 	});
 
 	test("uses only the remaining time of an absolute restored deadline", async () => {

@@ -5,6 +5,7 @@
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
 import type { ModelCard } from "@shared/model-card";
+import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { LoadBalancingMode } from "../codex-manager";
 import type { CodexPlanTier } from "../codex-usage-summary";
 import type { PermissionMode } from "../permission-modes";
@@ -475,6 +476,8 @@ export interface OidcProviderConfig {
 }
 
 export interface NarraForkSettings {
+	/** Instance-wide, monotonic setup completion; absent until legacy preferences are migrated. */
+	setupWizardCompleted?: boolean;
 	server: {
 		port: number;
 		host: string;
@@ -580,6 +583,10 @@ export interface NarraForkSettings {
 	agent: {
 		defaultModel: string;
 		defaultPermissionMode: PermissionMode;
+		/** Creation default only; auto keeps chapter/project and standalone/private behavior. */
+		defaultNarratorVisibility: "auto" | "private" | "public";
+		/** Creation default only; narrowed to visibility, auto uses its widest legal audience. */
+		defaultNarratorWriteAudience: "auto" | "owner" | "project" | "public";
 		/** Whether newly-created narrators should start with the plan trait enabled. */
 		defaultStartInPlanMode: boolean;
 		summaryModel: string;
@@ -602,6 +609,8 @@ export interface NarraForkSettings {
 			search?: string[];
 			review?: string[];
 		};
+		/** Optional fixed tiers for entries in the corresponding allowed model pool. */
+		subagentModelReasoningEfforts?: SubagentModelReasoningEfforts;
 		/**
 		 * Enable non-UTF-8 charset detection (GBK, Shift_JIS, …) for file read/write
 		 * and grep. Note: shell command output is auto-detected on Windows regardless

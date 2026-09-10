@@ -1,3 +1,4 @@
+import type { RuntimePolicy } from "@server/services/agent-runtime/policy";
 import type {
 	AgentToolUse,
 	ApiRequestDiagnosticSource,
@@ -70,6 +71,12 @@ export interface ToolUpdateExecutionLease {
 	release(): void;
 }
 
+/** One actual persisted tool-call attempt, never a provider id or a COW display clone. */
+export interface ToolCallBinding {
+	readonly toolCallId: string;
+	readonly attempt: number;
+}
+
 export interface ToolContext {
 	narratorId: string;
 	cwd: string;
@@ -98,6 +105,8 @@ export interface ToolContext {
 	skillScopeKey?: string;
 	/** Skills blocked by narrator custom traits. `all` blocks every skill. */
 	blockedSkills?: { all: boolean; names: string[] } | null;
+	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
+	runtimePolicy?: RuntimePolicy;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -140,6 +149,8 @@ export interface ToolContext {
 	emitLongRunning?: (toolUseId: string, elapsed: number) => void;
 	/** The toolUseId of the current tool execution (set by executeTool) */
 	currentToolUseId?: string;
+	/** Durable identity of this execution; also retained by background tool closures. */
+	toolCallBinding?: ToolCallBinding;
 	/** Context for bounded reflection loops, such as danger reflection review. */
 	reflectionLoop?: ReflectionLoopContext;
 	/**
@@ -241,6 +252,8 @@ export type ToolExecutionRouting =
 	  };
 
 export interface PermissionHandlerOptions {
+	/** Exact execution row; never resolve a different row by provider toolUseId. */
+	toolCallBinding?: ToolCallBinding;
 	/** Suppress user-facing attention for an internally resumed permission flow. */
 	suppressAttention?: boolean;
 	/** Frozen execution backend selected before permission handling. */
@@ -368,6 +381,8 @@ export type AgentEvent =
 			type: "assistant_message";
 			text: string;
 			toolUses: AgentToolUse[];
+			/** Internal persistence receipt for tools missing an incremental block. */
+			onToolPersisted?: (toolUseId: string, binding: ToolCallBinding) => void;
 			messageId?: string;
 			credentialId?: string;
 			/** Source citations for `text`, when the provider reported any. */
@@ -383,6 +398,7 @@ export type AgentEvent =
 	  }
 	| {
 			type: "tool_result";
+			toolCallBinding?: ToolCallBinding;
 			toolUseId: string;
 			toolName: string;
 			output: string;
@@ -434,11 +450,18 @@ export type AgentEvent =
 			/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
 			metadata?: Record<string, unknown>;
 			/** Incremental delta of the large streaming field (content, command, prompt, etc.) */
-			streamingField?: { name: string; delta: string };
+			streamingField?: {
+				name: string;
+				delta: string;
+				/** True at the JSON string's start, false for a continuation; absent means unknown. */
+				startsField?: boolean;
+			};
 	  }
 	| {
 			type: "block_complete";
 			block: ContentBlock;
+			/** Called only after the current message's real tool row is durable. */
+			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
@@ -844,6 +867,8 @@ export interface AgentConfig {
 	signal: AbortSignal;
 	/** Chapter ID the narrator belongs to (passed through to ToolContext) */
 	chapterId?: string;
+	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
+	runtimePolicy?: RuntimePolicy;
 	/** Parent narrator ID — set for subagents, passed through to ToolContext for Team tracking */
 	parentNarratorId?: string;
 	/** Parent Agent/Task/Send tool_use that spawned this subagent. */
@@ -915,9 +940,27 @@ export interface AgentConfig {
 	 * Persist the immutable primary execution identity before a routed tool enters permission handling.
 	 * Rejecting this callback prevents execution so audit state cannot silently diverge.
 	 */
-	onExecutionTargetResolved?: (toolUseId: string, target: ToolExecutionTarget) => Promise<void>;
+	onExecutionTargetResolved?: (
+		toolUseId: string,
+		target: ToolExecutionTarget,
+		binding?: ToolCallBinding,
+	) => Promise<void>;
 	/** Persist the complete endpoint plan for multi-target audit and retry. */
-	onExecutionPlanResolved?: (toolUseId: string, plan: ToolExecutionPlan) => Promise<void>;
+	onExecutionPlanResolved?: (
+		toolUseId: string,
+		plan: ToolExecutionPlan,
+		binding?: ToolCallBinding,
+	) => Promise<void>;
+	/** Required on production runners; bare legacy/reflection callers remain compatible. */
+	requireToolCallBinding?: boolean;
+	/** Object-keyed receipts populated by this loop's persistence barriers, not provider ids. */
+	toolExecutionBindings?: WeakMap<AgentToolUse, ToolCallBinding>;
+	/** Durable single-start claim immediately before tool.execute, after authorization. */
+	onToolExecutionStarting?: (
+		toolUseId: string,
+		binding: ToolCallBinding,
+		startedAt: number,
+	) => Promise<ToolCallBinding>;
 	/**
 	 * Shared de-dup set of knowledge-base entry ids already injected in the current compact
 	 * cycle. Passed in by the session runner so passive injection at the user-message point
@@ -998,7 +1041,12 @@ export interface AgentConfig {
 	 *
 	 * Called once per turn, after tool results are settled.
 	 */
-	getAfterToolsInjections?: () => Promise<string> | string;
+	getAfterToolsInjections?: () =>
+		| Promise<string | { text: string; onConsumed?: () => void }>
+		| string
+		| { text: string; onConsumed?: () => void };
+	/** Exact source history adopted at the provider-input boundary, never during preparation. */
+	onModelInputConsumed?: (sourceHistory: unknown[], content: string) => void;
 	/**
 	 * Persist a reminder the LOOP itself produced as its own message row.
 	 *

@@ -15,6 +15,26 @@ import {
 	hasSendableComposerContent,
 } from "./composer-send-gate";
 
+describe("comment send wiring", () => {
+	test("the panel passes comment drafts to both the handler and UI gates", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+		expect(source).toMatch(
+			/hasSendableComposerContent\(\{[^}]*commentCount:\s*commentDrafts.length/,
+		);
+		expect(source).toMatch(/const composerSendable = [^;]*commentDrafts.length > 0/);
+		expect(source).toContain("const hasInput = composerHasText || commentDrafts.length > 0;");
+	});
+
+	test("all direct-send paths pack comments, while external forwards opt out", async () => {
+		const source = await Bun.file(new URL("./NarratorPanel.tsx", import.meta.url)).text();
+		expect(source.match(/composeUserMessageWithComments\(/g)).toHaveLength(4);
+		expect(source).not.toContain("await submitMessage(msg,");
+		expect(source.replace(/\s+/g, " ")).toContain(
+			"doSendBufferedRef.current(trimmed, false, undefined, [], false)",
+		);
+	});
+});
+
 function state(overrides: Partial<ComposerContentState> = {}): ComposerContentState {
 	return { text: "", imageCount: 0, textFileCount: 0, commentCount: 0, ...overrides };
 }
@@ -34,6 +54,13 @@ describe("hasSendableComposerContent", () => {
 
 	test("a text file alone is sendable", () => {
 		expect(hasSendableComposerContent(state({ textFileCount: 1 }))).toBe(true);
+	});
+
+	test("a structured file reference alone is sendable without claiming typed text", () => {
+		const draft = state({ fileReferenceCount: 1 });
+		expect(hasSendableComposerContent(draft)).toBe(true);
+		expect(hasComposerAttachments(draft)).toBe(true);
+		expect(hasComposerText(draft)).toBe(false);
 	});
 
 	test("an image with a blank textarea is sendable", () => {
