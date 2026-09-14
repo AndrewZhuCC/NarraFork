@@ -199,6 +199,46 @@ async function render() {
 }
 
 describe("composer Enter focus", () => {
+	test("mounted composer registers Tab focus without swallowing its own Tab or completion", async () => {
+		await render();
+		const textarea = host.querySelector("textarea");
+		if (!textarea) throw new Error("Missing composer textarea");
+		Object.defineProperty(textarea, "getClientRects", { value: () => [{}] });
+		Object.defineProperty(textarea, "getBoundingClientRect", {
+			value: () => ({ top: 10, bottom: 100, left: 0, right: 300 }),
+		});
+		Object.assign(window, { innerHeight: 600, innerWidth: 800 });
+		const focus = spyOn(textarea, "focus").mockImplementation(() => {});
+		const press = (target: Element) => {
+			const event = new Event("keydown", { bubbles: true, cancelable: true });
+			Object.assign(event, {
+				key: "Tab",
+				code: "Tab",
+				ctrlKey: false,
+				metaKey: false,
+				shiftKey: false,
+				altKey: false,
+				isComposing: false,
+				repeat: false,
+			});
+			target.dispatchEvent(event);
+			return event;
+		};
+		expect(press(document.body).defaultPrevented).toBe(true);
+		expect(focus).toHaveBeenCalledTimes(1);
+		// linkedom needs the same focus/value-watcher setup as FileReferencePopover tests.
+		Object.assign(textarea, { attachEvent() {}, detachEvent() {} });
+		act(() => {
+			textarea.dispatchEvent(new Event("focusin", { bubbles: true }));
+		});
+		expect(press(textarea).defaultPrevented).toBe(false);
+		const complete = (event: Event) => event.preventDefault();
+		textarea.addEventListener("keydown", complete, true);
+		expect(press(textarea).defaultPrevented).toBe(true);
+		textarea.removeEventListener("keydown", complete, true);
+		expect(focus).toHaveBeenCalledTimes(1);
+		focus.mockRestore();
+	});
 	test("focuses from the page without sending; leaves controls and modified Enter alone", async () => {
 		await render();
 		const textarea = host.querySelector("textarea");

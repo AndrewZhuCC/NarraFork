@@ -7,6 +7,7 @@ type ReadingTarget = {
 	host: HTMLElement;
 	hovered: boolean;
 	active: boolean;
+	composer?: boolean;
 	read: () => void;
 };
 
@@ -63,6 +64,7 @@ export function handleReadFromStartShortcut(
 	doc: Document,
 	page: ReadingPage,
 	shortcut = readNarratorShortcuts().readFromStart,
+	composer = false,
 ): void {
 	if (
 		doc.visibilityState === "hidden" ||
@@ -70,6 +72,25 @@ export function handleReadFromStartShortcut(
 		shortcutTargetBlocked(event, true)
 	)
 		return;
+	if (composer) {
+		if (
+			event.keyCode === 229 ||
+			doc.activeElement?.closest("[data-narrator-composer]") ||
+			event
+				.composedPath()
+				.some(
+					(node) =>
+						node instanceof Element &&
+						node.closest('[role="menu"], [role="listbox"], [role="alertdialog"]'),
+				) ||
+			Array.from(
+				doc.querySelectorAll<HTMLElement>(
+					'[role="dialog"], [role="alertdialog"], [aria-modal="true"], [role="menu"], [role="listbox"]',
+				),
+			).some((node) => readingPosition(node) !== null)
+		)
+			return;
+	}
 	// ponytail: geometry is scanned only on the shortcut, bounded by mounted bodies;
 	// if lists stop virtualizing, replace this with their visible-row index.
 	const targets = Array.from(page.targets, (get) => {
@@ -80,18 +101,23 @@ export function handleReadFromStartShortcut(
 			position: readingPosition(target.host),
 		};
 	}).filter((target) => target.position !== null);
-	if (!targets.length) return;
+	const eligible = targets.filter(
+		(target) => !!target.composer === composer && (!composer || !target.host.matches(":disabled")),
+	);
+	if (!eligible.length) return;
 	const focused = doc.activeElement?.closest("[data-shortcut-reading-host]");
-	const explicit =
-		targets.find((target) => target.host === focused) ?? targets.find((t) => t.hovered);
-	const panels = new Set(targets.map((target) => target.panel));
+	const reading =
+		targets.find((target) => !target.composer && target.host === focused) ??
+		targets.find((target) => !target.composer && target.hovered);
+	const explicit = composer ? eligible.find((target) => target.panel === reading?.panel) : reading;
+	const panels = new Set(eligible.map((target) => target.panel));
 	const focusedPanel = doc.activeElement?.closest(panelSelector);
 	const panel =
 		explicit?.panel ??
 		(focusedPanel && panels.has(focusedPanel) ? focusedPanel : null) ??
 		(page.lastPanel && panels.has(page.lastPanel) ? page.lastPanel : null) ??
-		targets.find((target) => target.active)?.panel;
-	const candidates = targets.filter((target) => panels.size === 1 || target.panel === panel);
+		eligible.find((target) => target.active)?.panel;
+	const candidates = eligible.filter((target) => panels.size === 1 || target.panel === panel);
 	const chosen = explicit ?? candidates.sort((a, b) => (a.position ?? 0) - (b.position ?? 0))[0];
 	if (!chosen) return;
 	event.preventDefault();
@@ -108,7 +134,11 @@ export function registerReadFromStartTarget(get: () => ReadingTarget): () => voi
 		pages.set(doc, page);
 	}
 	const current = page;
-	const onKeyDown = (event: KeyboardEvent) => handleReadFromStartShortcut(event, doc, current);
+	const onKeyDown = (event: KeyboardEvent) => {
+		const bindings = readNarratorShortcuts();
+		handleReadFromStartShortcut(event, doc, current, bindings.readFromStart);
+		handleReadFromStartShortcut(event, doc, current, bindings.focusComposer, true);
+	};
 	const onReading = (event: Event) => {
 		if (event.target instanceof Element) {
 			const panel = event.target.closest(panelSelector);
@@ -132,6 +162,23 @@ export function registerReadFromStartTarget(get: () => ReadingTarget): () => voi
 		current.cleanup?.();
 		pages.delete(doc);
 	};
+}
+
+export function useFocusComposerShortcut(ref: RefObject<HTMLTextAreaElement | null>): void {
+	const active = useNarratorPanelVisible();
+	const latest = useRef(active);
+	latest.current = active;
+	useEffect(() => {
+		const host = ref.current;
+		if (!host) return;
+		return registerReadFromStartTarget(() => ({
+			host,
+			hovered: false,
+			active: latest.current,
+			composer: true,
+			read: () => host.focus(),
+		}));
+	}, [ref]);
 }
 
 export function useReadFromStartShortcut(

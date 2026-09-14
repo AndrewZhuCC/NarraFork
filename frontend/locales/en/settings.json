@@ -9,6 +9,7 @@
 		"next": "Next narrator",
 		"numbered": "Switch to narrator {{number}}",
 		"readFromStart": "Read from start",
+		"focusComposer": "Focus narrator input",
 		"disabled": "Disabled",
 		"invalid": "Cannot use this key. Try a key combination, arrow key, Home, or a function key.",
 		"conflict": "Already assigned to “{{action}}”. Choose another shortcut.",

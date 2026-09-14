@@ -85,7 +85,8 @@ test("shortcut recorder captures keys, cancels, rejects conflicts, clears and re
 		const buttons = container.querySelectorAll("button[aria-pressed]");
 		const button = buttons[0];
 		if (!button) throw new Error("Missing shortcut recorder");
-		expect(buttons.length).toBe(12);
+		expect(buttons.length).toBe(13);
+		expect(api.bindings.focusComposer).toBe("Tab");
 		expect(container.querySelector("input")).toBeNull();
 		expect(container.textContent).not.toContain("macOS reserves");
 		expect(container.textContent).not.toContain("sync across devices");
@@ -155,6 +156,23 @@ test("shortcut recorder captures keys, cancels, rejects conflicts, clears and re
 		click(home);
 		press(home, "Home", "Home");
 		expect(api.bindings.readFromStart).toBe("Home");
+		const composer = buttons[12];
+		expect(composer.textContent).toBe("Tab");
+		click(composer);
+		press(composer, "F7", "F7");
+		expect(api.bindings.focusComposer).toBe("F7");
+		click(composer);
+		expect(press(composer, "Tab", "Tab", { shiftKey: true }).defaultPrevented).toBe(false);
+		expect(api.bindings.focusComposer).toBe("F7");
+		click(composer);
+		expect(press(composer, "Tab", "Tab").defaultPrevented).toBe(true);
+		expect(api.bindings.focusComposer).toBe("Tab");
+		const clearComposer = container.querySelector(
+			'button[aria-label="Clear shortcut for Focus narrator input"]',
+		);
+		if (!clearComposer) throw new Error("Missing composer clear button");
+		click(clearComposer);
+		expect(api.bindings.focusComposer).toBe("");
 
 		values.set("narrafork_narrator_shortcuts", JSON.stringify({ ...api.bindings, previous: "F8" }));
 		act(() => {

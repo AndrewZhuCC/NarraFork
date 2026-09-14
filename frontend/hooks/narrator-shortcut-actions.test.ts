@@ -189,6 +189,164 @@ describe("read from start", () => {
 	afterEach(() => {
 		for (const cleanup of cleanups.splice(0)) cleanup();
 	});
+	function composer(id: string, parent = panel(), active = true) {
+		const node = document.createElement("textarea");
+		node.setAttribute("data-narrator-composer", "");
+		rect(node, 400, 490);
+		parent.append(node);
+		cleanups.push(
+			registerReadFromStartTarget(() => ({
+				host: node,
+				active,
+				hovered: false,
+				composer: true,
+				read: () => {
+					calls.push(id);
+					focus = node;
+				},
+			})),
+		);
+		return node;
+	}
+	const pressTab = (target = document.body, overrides: Partial<KeyboardEvent> = {}) =>
+		press(target, { code: "Tab", key: "Tab", ...overrides });
+	test("Tab focuses a single composer without hover and allows leaving then returning from buttons", () => {
+		const input = composer("only");
+		expect(pressTab().defaultPrevented).toBe(true);
+		expect(focus).toBe(input);
+		expect(pressTab(input).defaultPrevented).toBe(false);
+		const button = document.createElement("button");
+		document.body.append(button);
+		focus = button;
+		expect(pressTab(button).defaultPrevented).toBe(true);
+		expect(calls).toEqual(["only", "only"]);
+	});
+	test("composer shares active, reading hover, last panel and focus arbitration with Home", () => {
+		const a = panel(),
+			b = panel();
+		const body = host("read-a", a, { hovered: false, active: false });
+		const options = { hovered: false, active: true };
+		host("read-b", b, options);
+		composer("a", a, false);
+		composer("b", b);
+		pressTab();
+		focus = null;
+		body.dispatchEvent(new window.Event("wheel", { bubbles: true }));
+		pressTab();
+		focus = null;
+		options.hovered = true;
+		press();
+		pressTab();
+		focus = body;
+		// Reading focus wins even while another body's hover remains active.
+		pressTab();
+		expect(calls).toEqual(["b", "a", "read-b", "b", "a"]);
+	});
+	test.each([
+		"display",
+		"visibility",
+		"hidden",
+		"aria-hidden",
+		"inert",
+		"detached",
+		"disabled",
+	])("Tab excludes %s composers", (mode) => {
+		const parent = panel();
+		const input = composer("hidden", parent);
+		if (mode === "display") parent.style.display = "none";
+		if (mode === "visibility") parent.style.visibility = "hidden";
+		if (mode === "hidden") parent.hidden = true;
+		if (mode === "aria-hidden") parent.setAttribute("aria-hidden", "true");
+		if (mode === "inert") parent.inert = true;
+		if (mode === "detached") parent.remove();
+		if (mode === "disabled") input.setAttribute("disabled", "");
+		composer("visible", panel(), false);
+		pressTab();
+		expect(calls).toEqual(["visible"]);
+	});
+	test.each([
+		"input",
+		"textarea",
+		'div contenteditable="true"',
+		'div class="monaco-editor"',
+		'div class="xterm"',
+		"div data-narrator-shortcut-settings",
+		'div role="dialog"',
+		'div role="alertdialog"',
+		'div role="menu"',
+		'div role="listbox"',
+	])("Tab leaves %s alone", (markup) => {
+		composer("a");
+		const node = document.createElement("div");
+		node.innerHTML = `<${markup}></${markup.split(" ")[0]}>`;
+		document.body.append(node);
+		expect(pressTab(node.firstElementChild as HTMLElement).defaultPrevented).toBe(false);
+		expect(calls).toEqual([]);
+	});
+	test.each([
+		"dialog",
+		"alertdialog",
+		"menu",
+		"listbox",
+	])("an open %s blocks Tab even outside its portal", (role) => {
+		composer("a");
+		const overlay = document.createElement("div");
+		overlay.setAttribute("role", role);
+		rect(overlay);
+		document.body.append(overlay);
+		expect(pressTab().defaultPrevented).toBe(false);
+		overlay.hidden = true;
+		expect(pressTab().defaultPrevented).toBe(true);
+	});
+	test("focus binding honors an explicitly configured modified Tab", () => {
+		composer("a");
+		setNarratorShortcut("focusComposer", "Control+Tab");
+		expect(pressTab().defaultPrevented).toBe(false);
+		expect(pressTab(document.body, { ctrlKey: true }).defaultPrevented).toBe(true);
+		expect(calls).toEqual(["a"]);
+	});
+	test("focus binding is live, disableable and preserves unconfigured chords, IME and repeats", () => {
+		composer("a");
+		setNarratorShortcut("focusComposer", "");
+		expect(pressTab().defaultPrevented).toBe(false);
+		setNarratorShortcut("focusComposer", "F6");
+		expect(pressTab().defaultPrevented).toBe(false);
+		expect(press(document.body, { code: "F6", key: "F6" }).defaultPrevented).toBe(true);
+		focus = null;
+		resetNarratorShortcuts();
+		for (const overrides of [
+			{ shiftKey: true },
+			{ ctrlKey: true },
+			{ metaKey: true },
+			{ altKey: true },
+			{ isComposing: true },
+			{ keyCode: 229 },
+			{ repeat: true },
+		]) {
+			expect(pressTab(document.body, overrides).defaultPrevented).toBe(false);
+		}
+		const prevent = (event: Event) => event.preventDefault();
+		document.body.addEventListener("keydown", prevent);
+		expect(pressTab().defaultPrevented).toBe(true);
+		document.body.removeEventListener("keydown", prevent);
+		expect(calls).toEqual(["a"]);
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		try {
+			expect(pressTab().defaultPrevented).toBe(false);
+		} finally {
+			Reflect.deleteProperty(document, "visibilityState");
+		}
+	});
+	test("composer-only registration cleans listeners on last unmount and does not consume Home or Enter", () => {
+		composer("a");
+		expect(press().defaultPrevented).toBe(false);
+		expect(press(document.body, { code: "Enter", key: "Enter" }).defaultPrevented).toBe(false);
+		for (const cleanup of cleanups.splice(0)) cleanup();
+		expect(pressTab().defaultPrevented).toBe(false);
+		composer("b");
+		pressTab();
+		expect(calls).toEqual(["b"]);
+	});
 	test("single foreground narrator needs no hover or focus, even at mobile width", () => {
 		host("only");
 		expect(press().defaultPrevented).toBe(true);

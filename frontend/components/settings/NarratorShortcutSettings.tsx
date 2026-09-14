@@ -55,7 +55,13 @@ export function NarratorShortcutSettings() {
 							onBlur={() => setRecording(null)}
 							onKeyDown={(event) => {
 								if (recording !== action) return;
-								if (event.key === "Tab" && !event.ctrlKey && !event.metaKey && !event.altKey) {
+								if (
+									event.key === "Tab" &&
+									!event.ctrlKey &&
+									!event.metaKey &&
+									!event.altKey &&
+									(action !== "focusComposer" || event.shiftKey)
+								) {
 									setRecording(null);
 									return;
 								}

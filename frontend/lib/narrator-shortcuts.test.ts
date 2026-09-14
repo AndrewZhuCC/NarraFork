@@ -33,6 +33,7 @@ describe("narrator shortcuts", () => {
 		["Cmd + Shift + 1", "Meta+Shift+Digit1"],
 		["control+option+a", "Control+Alt+KeyA"],
 		["Home", "Home"],
+		["Tab", "Tab"],
 		["mod + shift + Digit9", "Mod+Shift+Digit9"],
 		[" ", ""],
 	])("normalizes %s", (input, expected) => expect(normalizeShortcut(input)).toBe(expected));
@@ -44,6 +45,7 @@ describe("narrator shortcuts", () => {
 		"a",
 		"Shift+1",
 		"Enter",
+		"Shift+Tab",
 		"F25",
 		"x".repeat(101),
 	])("rejects invalid/typing chord %s", (input) => expect(normalizeShortcut(input)).toBeNull());

@@ -9,6 +9,7 @@
 		"next": "下一个叙述者",
 		"numbered": "切换到第 {{number}} 个叙述者",
 		"readFromStart": "从头阅读",
+		"focusComposer": "聚焦叙述者输入框",
 		"disabled": "已停用",
 		"invalid": "无法使用此按键，请尝试组合键、方向键、Home 或功能键。",
 		"conflict": "已被「{{action}}」使用，请换一个快捷键。",

@@ -17,6 +17,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { useNarratorCommands } from "../../hooks/useCommands";
 import { useInputHistory, writeInputHistoryEntries } from "../../hooks/useInputHistory";
 import { useNamedNarrators } from "../../hooks/useNamedNarrator";
+import { useFocusComposerShortcut } from "../../hooks/useReadFromStartShortcut";
 import { ApiError, api } from "../../lib/api";
 import { formatLocaleNumber } from "../../lib/intl-format";
 import { CommandParamHelper } from "./CommandParamHelper";
@@ -192,6 +193,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		const draftSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 		const draftSyncSeqRef = useRef(0);
 		const textareaRef = useRef<HTMLTextAreaElement>(null);
+		useFocusComposerShortcut(textareaRef);
 		// null until the user is known: recall is keyed per `(user, narrator)`, and a
 		// placeholder key would both consume a slot in the bounded history namespace and
 		// strand whatever was typed before hydration in a list nothing reads again.

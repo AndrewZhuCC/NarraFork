@@ -11,6 +11,7 @@ export const SHORTCUT_ACTIONS = [
 	"narrator8",
 	"narrator9",
 	"readFromStart",
+	"focusComposer",
 ] as const;
 export type ShortcutAction = (typeof SHORTCUT_ACTIONS)[number];
 export type ShortcutBindings = Record<ShortcutAction, string>;
@@ -27,6 +28,7 @@ export const DEFAULT_NARRATOR_SHORTCUTS: ShortcutBindings = {
 	narrator8: "Mod+Shift+Digit8",
 	narrator9: "Mod+Shift+Digit9",
 	readFromStart: "Home",
+	focusComposer: "Tab",
 };
 const MODIFIERS = ["Mod", "Control", "Meta", "Alt", "Shift"] as const;
 const NAMED_KEYS = [
@@ -75,6 +77,7 @@ export function normalizeShortcut(value: string): string | null {
 		return null;
 	// Never turn ordinary typing / activation keys into unmodified global shortcuts.
 	if (
+		!(key === "Tab" && modifiers.length === 0) &&
 		!modifiers.some((modifier) => modifier !== "Shift") &&
 		!/^(Home|End|PageUp|PageDown|Arrow\w+|F\d+)$/.test(key)
 	)
