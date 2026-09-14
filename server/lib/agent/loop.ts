@@ -2977,6 +2977,7 @@ export async function* agentLoop(
 					inputChunks: string[];
 					totalChars: number;
 					startedAt: number;
+					streamCompletedAt?: number;
 					extractedFilePath?: string;
 					extractedFields?: Record<string, string>;
 					/** Metadata derived while tool input is still streaming (e.g. Edit match line). */
@@ -4166,6 +4167,9 @@ export async function* agentLoop(
 										}
 									}
 									if (stop) {
+										// Sample before the final Edit metadata read and any downstream awaits.
+										// This is the provider-input boundary, not the later tool_call delivery time.
+										acc.streamCompletedAt = Date.now();
 										const stopRaw = acc.inputChunks.join("");
 
 										// Short-input tools: skip field extraction on stop too
@@ -4251,6 +4255,7 @@ export async function* agentLoop(
 											name: acc.name,
 											input: parsedInput,
 											streamStartedAt: acc.startedAt,
+											streamCompletedAt: acc.streamCompletedAt,
 											outputIndex: acc.outputIndex,
 											...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
 											...(acc.thoughtSignatureSource && {
@@ -4291,6 +4296,7 @@ export async function* agentLoop(
 												name: tu.name,
 												input: parsedInput,
 												streamStartedAt: acc.startedAt,
+												streamCompletedAt: acc.streamCompletedAt,
 												outputIndex: acc.outputIndex,
 												...(acc.thoughtSignature && { thoughtSignature: acc.thoughtSignature }),
 												...(acc.thoughtSignatureSource && {
@@ -4338,6 +4344,7 @@ export async function* agentLoop(
 											toolName: tu.name,
 											input: parsedInput,
 											streamStartedAt: acc.startedAt,
+											streamCompletedAt: acc.streamCompletedAt,
 										};
 
 										// Drain any tool results that settled during streaming.
