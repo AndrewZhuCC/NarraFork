@@ -855,13 +855,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				messages.push(...expandResponsesToolResultMessage(tr));
 			}
 		} else {
-			for (const tr of params.toolResults as OAIToolResult[]) {
-				messages.push({
-					role: "tool",
-					tool_call_id: tr.tool_call_id,
-					content: tr.content,
-				});
-			}
+			messages.push(...expandCompletionsToolResults(params.toolResults as OAIToolResult[]));
 		}
 
 		// Append current user message (skip "." continuation markers unless images are attached)
@@ -1099,7 +1093,11 @@ export class OpenAIProvider implements ProviderAdapter {
 		if (this.responsesFormat) {
 			return buildResponsesToolResultMessage(toolUseId, output, images);
 		}
-		return { tool_call_id: toolUseId, content: output } satisfies OAIToolResult;
+		return {
+			tool_call_id: toolUseId,
+			content: output,
+			...(images?.length ? { _images: images } : {}),
+		} satisfies OAIToolResult;
 	}
 
 	pushUserTurn(
@@ -1118,9 +1116,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			if (userMessage) h.push(userMessage);
 			return;
 		}
-		for (const tr of toolResults as OAIToolResult[]) {
-			h.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-		}
+		h.push(...expandCompletionsToolResults(toolResults as OAIToolResult[]));
 		const userMessage = buildOAIUserMessage(content, images);
 		if (userMessage) h.push(userMessage);
 	}
@@ -2148,6 +2144,7 @@ function extractResponsesText(
 interface OAIToolResult {
 	tool_call_id: string;
 	content: string;
+	_images?: Array<{ format: string; base64: string }>;
 }
 
 // === Helpers ===
@@ -3474,6 +3471,25 @@ function buildOAIUserMessage(
 	return { role: "user", content };
 }
 
+function expandCompletionsToolResults(results: OAIToolResult[]): OAIMessage[] {
+	// Complete every pending tool call before inserting user-role images.
+	// Explicit fields keep the internal image metadata off the wire.
+	const messages: OAIMessage[] = results.map((result) => ({
+		role: "tool",
+		tool_call_id: result.tool_call_id,
+		content: result.content,
+	}));
+	for (const result of results) {
+		if (!result._images?.length) continue;
+		const message = buildOAIUserMessage(
+			`[Images from tool call ${result.tool_call_id}]`,
+			result._images,
+		);
+		if (message) messages.push(message);
+	}
+	return messages;
+}
+
 function buildResponsesUserMessage(content: string): OAIMessage {
 	return { role: "user", content: [{ type: "input_text", text: content }] } as OAIMessage;
 }
@@ -4146,9 +4162,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 	for (const msg of topLevel) {
 		if (msg.role === "assistant") {
 			// Flush pending tool results as role: "tool" messages
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
+			history.push(...expandCompletionsToolResults(pendingToolResults));
 			pendingToolResults = [];
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
@@ -4258,9 +4272,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 			}
 		} else if (msg.role === "user") {
 			// Flush pending tool results before user message
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
+			history.push(...expandCompletionsToolResults(pendingToolResults));
 			pendingToolResults = [];
 
 			const text = msg.contentText || "";
@@ -4268,9 +4280,7 @@ function buildOAIHistory(dbMessages: DbMessage[]): {
 				history.push({ role: "user", content: text });
 			}
 		} else if (msg.role === "sys") {
-			for (const tr of pendingToolResults) {
-				history.push({ role: "tool", tool_call_id: tr.tool_call_id, content: tr.content });
-			}
+			history.push(...expandCompletionsToolResults(pendingToolResults));
 			pendingToolResults = [];
 
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];

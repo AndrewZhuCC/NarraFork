@@ -898,6 +898,98 @@ describe("OpenAIProvider Responses history reasoning continuation", () => {
 	});
 });
 
+describe("OpenAIProvider Completions tool images", () => {
+	test("keeps batched tool images in requests and memory without leaking metadata", async () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
+		const image = { format: "png", base64: SAMPLE_PNG_BASE64 };
+		const toolResults = [
+			provider.formatToolResult("image-call", "screenshot", false, [image, image]),
+			provider.formatToolResult("text-call", "plain", false),
+			provider.formatToolResult("error-call", "failed with screenshot", true, [image]),
+		];
+		const history: OAIMessage[] = [
+			{
+				role: "assistant",
+				content: "",
+				tool_calls: ["image-call", "text-call", "error-call"].map((id) => ({
+					id,
+					type: "function" as const,
+					function: { name: "Read", arguments: "{}" },
+				})),
+			},
+		];
+		const requests: OAIMessage[][] = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input, init) => {
+			requests.push(JSON.parse(String(init?.body)).messages);
+			return new Response(
+				'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+				{
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		}) as typeof fetch;
+		try {
+			const request = async (results: unknown[]) => {
+				for await (const _event of provider.chat({
+					history,
+					content: "",
+					model: "openai:gpt-5",
+					tools: [],
+					toolResults: results,
+					conversationId: "tool-image-test",
+					cwd: process.cwd(),
+					signal: new AbortController().signal,
+				})) {
+					/* consume the mocked stream */
+				}
+			};
+			await request(toolResults);
+			provider.pushUserTurn(history, ".", "openai:gpt-5", toolResults);
+			await request([]);
+			expect(requests[0]).toEqual(history);
+			expect(requests[1]).toEqual(history);
+			expect(history.map((message) => message.role)).toEqual([
+				"assistant",
+				"tool",
+				"tool",
+				"tool",
+				"user",
+				"user",
+			]);
+			expect(history.slice(1, 4)).toEqual([
+				{ role: "tool", tool_call_id: "image-call", content: "screenshot" },
+				{ role: "tool", tool_call_id: "text-call", content: "plain" },
+				{ role: "tool", tool_call_id: "error-call", content: "failed with screenshot" },
+			]);
+			for (const [index, callId, count] of [
+				[4, "image-call", 2],
+				[5, "error-call", 1],
+			] as const) {
+				expect(history[index].content).toEqual([
+					{ type: "text", text: `[Images from tool call ${callId}]` },
+					...Array.from({ length: count }, () => ({
+						type: "image_url" as const,
+						image_url: { url: `data:image/png;base64,${SAMPLE_PNG_BASE64}` },
+					})),
+				]);
+			}
+			expect(JSON.stringify(requests)).not.toContain("_images");
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+
+	test("text-only results retain their original shape", () => {
+		const provider = new OpenAIProvider({ ...TEST_PROVIDER, apiMode: "completions" });
+		const result = provider.formatToolResult("call", "text", false, []);
+		expect(result).toEqual({ tool_call_id: "call", content: "text" });
+		const history: unknown[] = [];
+		provider.pushUserTurn(history, ".", "openai:gpt-5", [result]);
+		expect(history).toEqual([{ role: "tool", tool_call_id: "call", content: "text" }]);
+	});
+});
+
 describe("OpenAIProvider lightweight streaming generation", () => {
 	test.each([
 		["responses", "responses"],
