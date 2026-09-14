@@ -324,7 +324,7 @@ export const ContentViewer = memo(
 			detachFromBottom();
 			boxRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 		}, [detachFromBottom]);
-		useReadFromStartShortcut(boxRef, !isPreviewLod && !isMobile, hovered, handleReadFromStart);
+		useReadFromStartShortcut(boxRef, !isPreviewLod, hovered, handleReadFromStart);
 
 		// Register in global registry so parents can resolve via DOM lookup
 		useEffect(() => {

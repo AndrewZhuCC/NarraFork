@@ -251,7 +251,12 @@ export function VListContentViewHost({
 	const enabled = !!target && !!controls && interactive && panelVisible;
 	const { state: float, scrollToBodyTop } = useFloatState(hostRef, enabled && hovered && !isMobile);
 	const onReaderProgress = useReaderProgress(target, controls, interactive);
-	useReadFromStartShortcut(hostRef, enabled && !isMobile, hovered, scrollToBodyTop);
+	useReadFromStartShortcut(
+		hostRef,
+		!!target && !!controls && interactive,
+		hovered,
+		scrollToBodyTop,
+	);
 
 	const openFullscreen = useCallback(() => {
 		if (target && controls) controls.openFullscreen(target);

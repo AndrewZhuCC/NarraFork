@@ -582,12 +582,15 @@ describe("VListContentViewHost — back to the start of this body", () => {
 		expect(labels.indexOf("readFromStart")).toBe(0);
 	});
 
-	test("Home invokes the same body-start scroll as the button", async () => {
+	test.each([
+		false,
+		true,
+	])("Home without hover invokes body-start scroll (mobile=%s)", async (mobile) => {
+		isMobileViewport = mobile;
 		const { controls } = makeControls();
 		await renderHost({ target: CODE_TARGET, controls });
 		const scroller = stubScrollGeometry({ above: 120, scrollTop: 1000 });
 		Object.defineProperty(hostEl(), "getClientRects", { value: () => [{}], configurable: true });
-		await hover();
 		const event = Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), {
 			code: "Home",
 			key: "Home",

@@ -27,7 +27,7 @@ const {
 	narratorShortcutTabs,
 	registerRecentTabKeyboardSource,
 } = await import("./useRecentTabKeyboardNav");
-const { handleReadFromStartShortcut } = await import("./useReadFromStartShortcut");
+const { registerReadFromStartTarget } = await import("./useReadFromStartShortcut");
 const { readNarratorShortcuts, resetNarratorShortcuts, setNarratorShortcut } = await import(
 	"./useNarratorShortcuts"
 );
@@ -147,92 +147,171 @@ describe("narrator navigation", () => {
 });
 
 describe("read from start", () => {
-	function host() {
+	const cleanups: (() => void)[] = [];
+	const calls: string[] = [];
+	const home = { code: "Home", key: "Home", metaKey: false, shiftKey: false };
+	const press = (target = document.body, overrides: Partial<KeyboardEvent> = {}) =>
+		fire(target, () => {}, { ...home, ...overrides });
+	function rect(node: HTMLElement, top = 0, bottom = 600) {
+		Object.defineProperty(node, "getClientRects", { configurable: true, value: () => [{}] });
+		Object.defineProperty(node, "getBoundingClientRect", {
+			configurable: true,
+			value: () => ({ top, bottom, left: 0, right: 300 }),
+		});
+	}
+	function panel() {
 		const node = document.createElement("div");
-		node.setAttribute("data-shortcut-reading-host", "");
-		Object.defineProperty(node, "getClientRects", { value: () => [{}] });
+		node.setAttribute("data-narrator-panel", "");
+		node.style.overflow = "hidden";
+		rect(node, 100, 500);
 		document.body.append(node);
 		return node;
 	}
-	const home = { code: "Home", key: "Home", metaKey: false, shiftKey: false };
-	test("only the hovered target runs and a handled key cannot run twice", () => {
-		const a = host(),
-			b = host();
-		const calls: string[] = [];
-		const event = fire(
-			document.body,
-			(event) => {
-				handleReadFromStartShortcut(event, a, false, () => calls.push("a"), "Home");
-				handleReadFromStartShortcut(event, b, true, () => calls.push("b"), "Home");
-				handleReadFromStartShortcut(event, a, true, () => calls.push("again"), "Home");
-			},
-			home,
+	function host(id: string, parent = panel(), options = { hovered: false, active: true }) {
+		const node = document.createElement("div");
+		node.setAttribute("data-shortcut-reading-host", "");
+		rect(node, 120, 450);
+		parent.append(node);
+		cleanups.push(
+			registerReadFromStartTarget(() => ({ host: node, ...options, read: () => calls.push(id) })),
 		);
-		expect(calls).toEqual(["b"]);
-		expect(event.defaultPrevented).toBe(true);
+		return node;
+	}
+	beforeEach(() => {
+		calls.length = 0;
+		Object.assign(window, {
+			innerWidth: 320,
+			innerHeight: 600,
+			getComputedStyle: (node: HTMLElement) => node.style,
+		});
+		resetNarratorShortcuts();
 	});
-	test("focus wins over hovering a different content block", () => {
-		const a = host(),
-			b = host();
-		focus = a;
-		const calls: string[] = [];
-		fire(
-			a,
-			(event) => {
-				handleReadFromStartShortcut(event, b, true, () => calls.push("b"), "Home");
-				handleReadFromStartShortcut(event, a, false, () => calls.push("a"), "Home");
-			},
-			home,
-		);
-		expect(calls).toEqual(["a"]);
+	afterEach(() => {
+		for (const cleanup of cleanups.splice(0)) cleanup();
+	});
+	test("single foreground narrator needs no hover or focus, even at mobile width", () => {
+		host("only");
+		expect(press().defaultPrevented).toBe(true);
+		expect(calls).toEqual(["only"]);
+	});
+	test("ignores keyboard events while the page is hidden", () => {
+		host("only");
+		const descriptor = Object.getOwnPropertyDescriptor(document, "visibilityState");
+		Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+		try {
+			expect(press().defaultPrevented).toBe(false);
+			expect(calls).toEqual([]);
+		} finally {
+			if (descriptor) Object.defineProperty(document, "visibilityState", descriptor);
+			else Reflect.deleteProperty(document, "visibilityState");
+		}
+	});
+	test("selects the body at the reading edge, not an offscreen historical DOM row", () => {
+		const parent = panel();
+		const old = host("history", parent);
+		rect(old, -300, 90);
+		const current = host("current", parent);
+		rect(current, -30, 250);
+		const next = host("next", parent);
+		rect(next, 270, 480);
+		focus = old;
+		press();
+		expect(calls).toEqual(["current"]);
 	});
 	test.each([
+		"display",
+		"visibility",
+		"hidden",
+		"aria-hidden",
+		"detached",
+	])("excludes %s panels even when focused or hovered", (mode) => {
+		const parent = panel();
+		const hidden = host("background", parent, { hovered: true, active: true });
+		focus = hidden;
+		if (mode === "display") parent.style.display = "none";
+		if (mode === "visibility") parent.style.visibility = "hidden";
+		if (mode === "hidden") parent.hidden = true;
+		if (mode === "aria-hidden") parent.setAttribute("aria-hidden", "true");
+		if (mode === "detached") parent.remove();
+		host("foreground", panel(), { hovered: false, active: false });
+		press();
+		expect(calls).toEqual(["foreground"]);
+	});
+	test("multiple panels choose active, then last reading region, then hover and focus", () => {
+		const a = host("a", panel(), { hovered: false, active: false });
+		const options = { hovered: false, active: true };
+		const b = host("b", panel(), options);
+		press();
+		a.dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+		press();
+		options.hovered = true;
+		press();
+		focus = a;
+		press();
+		expect(calls).toEqual(["b", "a", "b", "a"]);
+		focus = null;
+		options.hovered = false;
+		b.dispatchEvent(new window.Event("wheel", { bubbles: true }));
+		press();
+		expect(calls.at(-1)).toBe("b");
+	});
+	test.each([
+		"input",
 		"textarea",
+		"select",
 		'div contenteditable="true"',
 		'div class="monaco-editor"',
 		'div class="xterm"',
+		"div data-narrator-shortcut-settings",
+		'div role="dialog"',
 	])("preserves Home in %s", (markup) => {
-		const a = host();
+		const a = host("a");
 		a.innerHTML = `<${markup}></${markup.split(" ")[0]}>`;
-		const input = a.firstElementChild;
-		if (!input) throw new Error("missing test input");
-		const event = fire(
-			input,
-			(event) =>
-				handleReadFromStartShortcut(
-					event,
-					a,
-					true,
-					() => {
-						throw new Error("must not read");
-					},
-					"Home",
-				),
-			home,
-		);
-		expect(event.defaultPrevented).toBe(false);
+		expect(press(a.firstElementChild as HTMLElement).defaultPrevented).toBe(false);
+		expect(calls).toEqual([]);
 	});
-	test("disabled and targetless shortcuts leave browser behavior alone", () => {
-		const a = host();
-		for (const [hovered, shortcut] of [
-			[false, "Home"],
-			[true, ""],
-		] as const) {
-			const event = fire(
-				document.body,
-				(event) =>
-					handleReadFromStartShortcut(
-						event,
-						a,
-						hovered,
-						() => {
-							throw new Error("must not read");
-						},
-						shortcut,
-					),
-				home,
-			);
-			expect(event.defaultPrevented).toBe(false);
+	test("uses live configurable bindings and respects disable, composition and handled keys", () => {
+		host("a");
+		setNarratorShortcut("readFromStart", "");
+		expect(press().defaultPrevented).toBe(false);
+		setNarratorShortcut("readFromStart", "F6");
+		expect(press().defaultPrevented).toBe(false);
+		expect(press(document.body, { code: "F6", key: "F6" }).defaultPrevented).toBe(true);
+		resetNarratorShortcuts();
+		expect(press(document.body, { isComposing: true }).defaultPrevented).toBe(false);
+		expect(press(document.body, { repeat: true }).defaultPrevented).toBe(false);
+		expect(calls).toEqual(["a"]);
+	});
+	test("many bodies share one listener and the final unmount removes it", () => {
+		const add = document.addEventListener.bind(document);
+		const remove = document.removeEventListener.bind(document);
+		let added = 0,
+			removed = 0;
+		document.addEventListener = (...args: Parameters<Document["addEventListener"]>) => {
+			if (args[0] === "keydown") added++;
+			return add(...args);
+		};
+		document.removeEventListener = (...args: Parameters<Document["removeEventListener"]>) => {
+			if (args[0] === "keydown") removed++;
+			return remove(...args);
+		};
+		try {
+			const parent = panel();
+			for (let i = 0; i < 100; i++) host(String(i), parent);
+			expect(added).toBe(1);
+			cleanups.shift()?.();
+			expect(removed).toBe(0);
+			press();
+			expect(calls).toHaveLength(1);
+			for (const cleanup of cleanups.splice(0)) cleanup();
+			expect(removed).toBe(1);
+			expect(press().defaultPrevented).toBe(false);
+			host("remounted");
+			press();
+			expect(calls.at(-1)).toBe("remounted");
+		} finally {
+			document.addEventListener = add;
+			document.removeEventListener = remove;
 		}
 	});
 });
