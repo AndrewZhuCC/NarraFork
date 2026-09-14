@@ -570,15 +570,6 @@ export interface NarraForkSettings {
 		 * setting them to "0"/"false" force-disables regardless of this setting).
 		 */
 		enabled: boolean;
-		/**
-		 * Allow proxy URLs targeting private/reserved IP addresses (127.x, 10.x, 172.16-31.x,
-		 * 192.168.x, 169.254.x, ::1, fe80::, etc.) to be forwarded to plugins.
-		 *
-		 * Defaults to false. Private deployments using a LAN proxy should enable this
-		 * explicitly. Without it, an SSRF surface exists where a plugin on the host network
-		 * could be directed to reach internal services or cloud metadata endpoints.
-		 */
-		allowPrivateProxyTarget: boolean;
 	};
 	agent: {
 		defaultModel: string;
@@ -641,8 +632,6 @@ export interface NarraForkSettings {
 		translateReasoning: boolean;
 		/** Default value for the relaxed plan toggle on new narrators. */
 		defaultRelaxedPlan: boolean;
-		/** Default value for the auto-prune toggle on new narrators. */
-		defaultPruneEnabled: boolean;
 		/**
 		 * Whether plan mode accepts inline plans (the `inline_plan` parameter of ExitPlanMode).
 		 * When false, only the file-based plan flow is supported: the ExitPlanMode tool
@@ -799,17 +788,14 @@ export interface NarraForkSettings {
 		/**
 		 * Context window management thresholds (percentage, 0–100).
 		 * Split by model context window size: standard (≤600k) vs large (>600k).
-		 * - pruneStart: begin progressive message pruning at this percentage
 		 * - compactStart: trigger context compaction at this percentage
 		 */
 		contextThresholds?: {
-			standard: { pruneStart: number; compactStart: number };
-			large: { pruneStart: number; compactStart: number };
+			standard: { compactStart: number };
+			large: { compactStart: number };
 		};
 		/** Number of recent user/assistant turns kept after automatic history compact. */
 		autoCompactKeepPairs?: number;
-		/** Pruned message percentage at which automatic background compact is forced. */
-		autoCompactPruneThreshold?: number;
 		/**
 		 * When a narrator has an in-progress context compaction, whether a newly-sent
 		 * user message is QUEUED until the compaction finishes instead of starting a
@@ -822,15 +808,6 @@ export interface NarraForkSettings {
 		 * with the compact. Either way, an explicit `priority` send cuts in.
 		 */
 		queueDuringCompaction?: boolean;
-		/**
-		 * Minimum prune ratio (percentage, 0–100) applied per prune pass.
-		 * Each time pruning advances, it prunes at least this fraction of the
-		 * remaining prunable messages. Larger values prune in bigger steps,
-		 * reducing how often the prompt-cache prefix is invalidated (which keeps
-		 * cache hits high and cost low) at the expense of dropping more context
-		 * at once. Default 30.
-		 */
-		minPruneRatio?: number;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

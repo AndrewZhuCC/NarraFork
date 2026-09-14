@@ -71,6 +71,13 @@
       "when": 1789013415374,
       "tag": "0009_elite_hellion",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1789350740582,
+      "tag": "0010_mute_runaways",
+      "breakpoints": true
     }
   ]
 }

@@ -215,7 +215,6 @@ export interface VListRenderLabels {
 		resolvedLabel: string;
 	};
 	planCard: string;
-	pruneDivider: string;
 }
 
 export interface VListLabels {
@@ -335,6 +334,7 @@ export function useVListLabels(): VListLabels {
 			// ── read-only AskUserQuestion replay ────────────────────────────────────
 			// These prefixes wrap together with the answer text, so they are MEASURED
 			// (adapter labels) rather than substituted by the render layer.
+			backgroundTaskStarted: t("backgroundTaskStarted"),
 			sendAwaitReply: t("sendAwaitReply"),
 			communicationBroadcast: t("communicationBroadcast"),
 			communicationRecipientUnknown: t("communicationRecipientUnknown"),
@@ -571,6 +571,8 @@ export function useVListLabels(): VListLabels {
 			subagent: {
 				recentCalls: t("subagentRecentCalls"),
 				openSession: t("openFullSubagentSession"),
+				backgroundNotice: t("subagentBackgroundNotice"),
+				openInPanel: t("subagentOpenInPanel"),
 				prompt: t("subagentPrompt"),
 				pendingTitle: t("subagentWaitingPermissionTitle"),
 				resolveOverride: t("resolveOverride"),
@@ -611,7 +613,6 @@ export function useVListLabels(): VListLabels {
 				resolvedLabel: t("askInPassing_resolvedLabel"),
 			},
 			planCard: t("perm_plan"),
-			pruneDivider: t("pruneBoundaryLabel"),
 		};
 	}, [t, tCommon]);
 

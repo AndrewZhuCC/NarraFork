@@ -45,6 +45,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
+import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
 import { tailRoleAllowsContinue } from "@shared/continue-tail";
 import type {
 	FileReference,
@@ -119,6 +120,7 @@ import {
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
+import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { useLodIndicatorTrigger } from "../../hooks/useLodIndicatorTrigger";
 import { useModelCardIndex } from "../../hooks/useModelCards";
@@ -153,7 +155,6 @@ import {
 	useUpdateFastMode,
 	useUpdateModel,
 	useUpdatePermissionMode,
-	useUpdatePruneEnabled,
 	useUpdateReasoningEffort,
 	useUpdateReflectionOverrides,
 	useUpdateRelaxedPlan,
@@ -429,24 +430,17 @@ const DANGER_REFLECTION_OVERRIDE_VALUES = [
 type DangerReflectionOverride = (typeof DANGER_REFLECTION_OVERRIDE_VALUES)[number];
 
 type ContextThresholdsDraft = {
-	standard: { pruneStart: number; compactStart: number };
-	large: { pruneStart: number; compactStart: number };
+	standard: { compactStart: number };
+	large: { compactStart: number };
 };
 
 type ContextManagementDraft = {
 	contextThresholds: ContextThresholdsDraft;
 	autoCompactKeepPairs: number;
-	autoCompactPruneThreshold: number;
-	minPruneRatio: number;
 };
 
-const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = {
-	standard: { pruneStart: 95, compactStart: 99 },
-	large: { pruneStart: 95, compactStart: 99 },
-};
+const DEFAULT_CONTEXT_THRESHOLDS_DRAFT: ContextThresholdsDraft = DEFAULT_CONTEXT_THRESHOLDS;
 const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
-const DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD = 80;
-const DEFAULT_MIN_PRUNE_RATIO = 30;
 
 function normalizeBooleanOverride(value: unknown): BooleanOverride {
 	return BOOLEAN_OVERRIDE_VALUES.includes(value as BooleanOverride)
@@ -1757,6 +1751,17 @@ export function NarratorPanel({
 	const navigate = useNavigate();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const narrator = narratorProp ?? fetchedNarrator;
+	const humanAttentionQuery = useHumanAttention(!workspacePreview);
+	const attentionItems = loadedHumanAttentionItems(humanAttentionQuery.data?.pages);
+	// Only synchronous decisions owned by this session already have a tail prompt.
+	// Async asks (even when awaited), child sessions and unknown pages still need the inbox.
+	const showHumanAttentionInbox =
+		humanAttentionQuery.isError ||
+		humanAttentionQuery.hasNextPage ||
+		attentionItems.length === 0 ||
+		attentionItems.some(
+			(item) => item.narratorId !== narratorId || item.source === "question" || !item.blocking,
+		);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -1803,8 +1808,6 @@ export function NarratorPanel({
 				prev.lastUserMessageId === meta.lastUserMessageId &&
 				prev.contextPercent === meta.contextPercent &&
 				prev.turnUsageJson === meta.turnUsageJson &&
-				prev.pruneBoundaryMessageId === meta.pruneBoundaryMessageId &&
-				prev.prunedPercent === meta.prunedPercent &&
 				prev.latestSpecTasksToolUseId === meta.latestSpecTasksToolUseId
 			) {
 				return prev;
@@ -1837,7 +1840,6 @@ export function NarratorPanel({
 	const relaxedPlanMutation = useUpdateRelaxedPlan();
 	const reflectionOverridesMutation = useUpdateReflectionOverrides();
 	const modelMutation = useUpdateModel();
-	const pruneEnabledMutation = useUpdatePruneEnabled();
 	const {
 		visibleWithDefault: allModels,
 		groupedModels,
@@ -2052,9 +2054,6 @@ export function NarratorPanel({
 	);
 	const dangerReflectionGlobal = dangerReflectionGlobalLevel !== "off";
 	const planReflectionAutoApproveGlobal = settingsData?.agent?.planReflectionAutoApprove ?? false;
-	const pruneEnabledGlobal = settingsData?.agent?.defaultPruneEnabled ?? false;
-	const pruneEnabledEffective = narrator?.pruneEnabled ?? pruneEnabledGlobal;
-	const pruneDiffersFromDefault = pruneEnabledEffective !== pruneEnabledGlobal;
 	const reflectionSettingsDisabled =
 		!settingsData || updateSettingsMutation.isPending || reflectionOverridesMutation.isPending;
 	const contextThresholdSettings = useMemo<ContextManagementDraft>(() => {
@@ -2062,27 +2061,19 @@ export function NarratorPanel({
 		return {
 			contextThresholds: {
 				standard: {
-					pruneStart:
-						thresholds.standard?.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.standard.pruneStart,
 					compactStart:
 						thresholds.standard?.compactStart ??
 						DEFAULT_CONTEXT_THRESHOLDS_DRAFT.standard.compactStart,
 				},
 				large: {
-					pruneStart:
-						thresholds.large?.pruneStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.large.pruneStart,
 					compactStart:
 						thresholds.large?.compactStart ?? DEFAULT_CONTEXT_THRESHOLDS_DRAFT.large.compactStart,
 				},
 			},
 			autoCompactKeepPairs:
 				settingsData?.agent?.autoCompactKeepPairs ?? DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
-			autoCompactPruneThreshold:
-				settingsData?.agent?.autoCompactPruneThreshold ?? DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
-			minPruneRatio: settingsData?.agent?.minPruneRatio ?? DEFAULT_MIN_PRUNE_RATIO,
 		};
 	}, [settingsData?.agent]);
-	const forceCompactPruneThreshold = contextThresholdSettings.autoCompactPruneThreshold;
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
 			onSuccess: (data) => {
@@ -2166,7 +2157,7 @@ export function NarratorPanel({
 		queryKey: ["contextThresholds", resolvedBareModel, resolvedProvider],
 		queryFn: () => api.getContextThresholds(resolvedBareModel, resolvedProvider),
 		staleTime: 5 * 60 * 1000,
-		placeholderData: { pruneStart: 95, compactStart: 99 },
+		placeholderData: DEFAULT_CONTEXT_THRESHOLDS.standard,
 	});
 
 	const nugProviderConfig = useMemo(() => {
@@ -3113,9 +3104,7 @@ export function NarratorPanel({
 		contextWindow,
 		isEstimated,
 		contextStale,
-		activePruneStart,
 		activeCompactStart,
-		prunedPercent,
 		compactProgress,
 		compactFailure,
 		quotaBalance,
@@ -3784,10 +3773,6 @@ export function NarratorPanel({
 		const normalized: ContextManagementDraft = {
 			contextThresholds: {
 				standard: {
-					pruneStart: Math.max(
-						50,
-						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.standard.pruneStart)),
-					),
 					compactStart: Math.max(
 						50,
 						Math.min(
@@ -3797,10 +3782,6 @@ export function NarratorPanel({
 					),
 				},
 				large: {
-					pruneStart: Math.max(
-						10,
-						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.pruneStart)),
-					),
 					compactStart: Math.max(
 						10,
 						Math.min(100, Math.round(contextThresholdDraft.contextThresholds.large.compactStart)),
@@ -3811,19 +3792,12 @@ export function NarratorPanel({
 				1,
 				Math.min(25, Math.round(contextThresholdDraft.autoCompactKeepPairs)),
 			),
-			autoCompactPruneThreshold: Math.max(
-				0,
-				Math.min(100, Math.round(contextThresholdDraft.autoCompactPruneThreshold)),
-			),
-			minPruneRatio: Math.max(0, Math.min(100, Math.round(contextThresholdDraft.minPruneRatio))),
 		};
 		updateSettingsMutation.mutate(
 			{
 				agent: {
 					contextThresholds: normalized.contextThresholds,
 					autoCompactKeepPairs: normalized.autoCompactKeepPairs,
-					autoCompactPruneThreshold: normalized.autoCompactPruneThreshold,
-					minPruneRatio: normalized.minPruneRatio,
 				},
 			},
 			{
@@ -4930,7 +4904,6 @@ export function NarratorPanel({
 	);
 
 	// --- Flat message elements ---
-	const pruneDividerLabel = t("pruneBoundaryLabel");
 	const showScrollToBottomButton = !isAtBottom || unreadCount > 0;
 
 	// --- Scroll state ---
@@ -5623,7 +5596,13 @@ export function NarratorPanel({
 					// the status check and this request), interrupting would abort the
 					// message we just sent.
 					const buffered = await doSendBuffered(msg, true, abortController.signal);
-					if (buffered) interruptMutation.mutate(narratorId);
+					if (buffered) {
+						// The queued message must be durably accepted before interrupting. Using
+						// `mutate` here fired-and-forgot the interrupt request; its cancellation
+						// could race the queue write/auto-resume and leave the message stuck in
+						// the "next request" state.
+						await interruptMutation.mutateAsync(narratorId);
+					}
 				}
 				return;
 			}
@@ -6644,9 +6623,7 @@ export function NarratorPanel({
 				)}
 				<Menu.Label c="dimmed" fz={10}>
 					{t("activeThresholds", {
-						prune: activePruneStart ?? modelThresholds?.pruneStart,
 						compact: activeCompactStart ?? modelThresholds?.compactStart,
-						force: forceCompactPruneThreshold,
 					})}
 				</Menu.Label>
 				<Menu.Item
@@ -6658,9 +6635,6 @@ export function NarratorPanel({
 					{t("thresholdSettings")}
 				</Menu.Item>
 				<Menu.Divider />
-				{prunedPercent != null && (
-					<Menu.Label>{t("prunedPercent", { percent: prunedPercent })}</Menu.Label>
-				)}
 				{hasContextData && (
 					<Menu.Label>
 						{t("contextUsagePercent", { percent: contextPercent.toFixed(1) })}
@@ -6679,64 +6653,6 @@ export function NarratorPanel({
 						{isEstimated && <span style={{ opacity: 0.6, marginLeft: 4 }}>({t("estimated")})</span>}
 					</Menu.Label>
 				)}
-				<Menu.Divider />
-				<Tooltip label={t("pruneEnabledTooltip")} multiline w={260} withArrow position="top">
-					<Menu.Label>
-						<Stack gap={4}>
-							<Switch
-								size="xs"
-								label={t("pruneEnabled")}
-								checked={pruneEnabledEffective}
-								onChange={(e) => {
-									pruneEnabledMutation.mutate({
-										id: narratorId,
-										pruneEnabled: e.currentTarget.checked,
-									});
-								}}
-							/>
-							{pruneEnabledEffective && (
-								<Text size="xs" c="orange">
-									{t("pruneEnabledWarning")}
-								</Text>
-							)}
-							{pruneDiffersFromDefault && (
-								<Group justify="space-between" wrap="nowrap" style={{ width: "100%" }}>
-									<Anchor
-										component="button"
-										type="button"
-										size="xs"
-										c="dimmed"
-										style={{ textDecoration: "underline" }}
-										onClick={(event) => {
-											event.stopPropagation();
-											pruneEnabledMutation.mutate({
-												id: narratorId,
-												pruneEnabled: pruneEnabledGlobal,
-											});
-										}}
-									>
-										{t("pruneEnabledResetDefault")}
-									</Anchor>
-									<Anchor
-										component="button"
-										type="button"
-										size="xs"
-										c="dimmed"
-										style={{ textDecoration: "underline" }}
-										onClick={(event) => {
-											event.stopPropagation();
-											updateSettingsMutation.mutate({
-												agent: { defaultPruneEnabled: pruneEnabledEffective },
-											});
-										}}
-									>
-										{t("pruneEnabledSetDefault")}
-									</Anchor>
-								</Group>
-							)}
-						</Stack>
-					</Menu.Label>
-				</Tooltip>
 				<Menu.Divider />
 				<Menu.Item
 					leftSection={<IconArrowsMinimize size={14} />}
@@ -7426,39 +7342,6 @@ export function NarratorPanel({
 									max={25}
 									allowDecimal={false}
 								/>
-								<NumberInput
-									label={ts("autoCompactPruneThreshold")}
-									description={ts("autoCompactPruneThresholdDesc")}
-									value={contextThresholdDraft.autoCompactPruneThreshold}
-									onChange={(value) =>
-										setContextThresholdDraft((prev) => ({
-											...prev,
-											autoCompactPruneThreshold:
-												typeof value === "number" ? value : DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
-										}))
-									}
-									min={0}
-									max={100}
-									allowDecimal={false}
-									suffix="%"
-								/>
-							</Group>
-							<Group grow>
-								<NumberInput
-									label={ts("minPruneRatio")}
-									description={ts("minPruneRatioDesc")}
-									value={contextThresholdDraft.minPruneRatio}
-									onChange={(value) =>
-										setContextThresholdDraft((prev) => ({
-											...prev,
-											minPruneRatio: typeof value === "number" ? value : DEFAULT_MIN_PRUNE_RATIO,
-										}))
-									}
-									min={0}
-									max={100}
-									allowDecimal={false}
-									suffix="%"
-								/>
 							</Group>
 							<Box style={{ borderTop: "1px solid var(--mantine-color-default-border)" }} />
 							<Stack gap="xs">
@@ -7470,27 +7353,6 @@ export function NarratorPanel({
 								</Text>
 								<Group grow align="flex-start">
 									<NumberInput
-										label={ts("pruneStart")}
-										description={ts("pruneStartDesc")}
-										value={contextThresholdDraft.contextThresholds.standard.pruneStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													standard: {
-														...prev.contextThresholds.standard,
-														pruneStart: typeof value === "number" ? value : 95,
-													},
-												},
-											}))
-										}
-										min={50}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-									<NumberInput
 										label={ts("compactStart")}
 										description={ts("compactStartDesc")}
 										value={contextThresholdDraft.contextThresholds.standard.compactStart}
@@ -7501,7 +7363,10 @@ export function NarratorPanel({
 													...prev.contextThresholds,
 													standard: {
 														...prev.contextThresholds.standard,
-														compactStart: typeof value === "number" ? value : 99,
+														compactStart:
+															typeof value === "number"
+																? value
+																: DEFAULT_CONTEXT_THRESHOLDS.standard.compactStart,
 													},
 												},
 											}))
@@ -7522,27 +7387,6 @@ export function NarratorPanel({
 								</Text>
 								<Group grow align="flex-start">
 									<NumberInput
-										label={ts("pruneStart")}
-										description={ts("pruneStartDesc")}
-										value={contextThresholdDraft.contextThresholds.large.pruneStart}
-										onChange={(value) =>
-											setContextThresholdDraft((prev) => ({
-												...prev,
-												contextThresholds: {
-													...prev.contextThresholds,
-													large: {
-														...prev.contextThresholds.large,
-														pruneStart: typeof value === "number" ? value : 95,
-													},
-												},
-											}))
-										}
-										min={10}
-										max={100}
-										allowDecimal={false}
-										suffix="%"
-									/>
-									<NumberInput
 										label={ts("compactStart")}
 										description={ts("compactStartDesc")}
 										value={contextThresholdDraft.contextThresholds.large.compactStart}
@@ -7553,7 +7397,10 @@ export function NarratorPanel({
 													...prev.contextThresholds,
 													large: {
 														...prev.contextThresholds.large,
-														compactStart: typeof value === "number" ? value : 99,
+														compactStart:
+															typeof value === "number"
+																? value
+																: DEFAULT_CONTEXT_THRESHOLDS.large.compactStart,
 													},
 												},
 											}))
@@ -7663,7 +7510,6 @@ export function NarratorPanel({
 																onSelectionResolverChange={setChunkSelectionResolver}
 																rowHandlers={vlistRowHandlers}
 																permCb={permCbWithAsyncQuestions}
-																pruneDividerLabel={pruneDividerLabel}
 																hasChapter={hasChapter}
 																highlightMessageId={highlightMessageId}
 																highlightRequestId={highlightRequestId}
@@ -8910,7 +8756,7 @@ export function NarratorPanel({
 					    Renders nothing when no question is open anywhere, so it costs no space
 					    in the common case. Scoped to the current session for its label and
 					    grouping, but the drawer it opens spans every session. */}
-					{!isWorkspacePreview && (
+					{!isWorkspacePreview && showHumanAttentionInbox && (
 						<Box px="md" pb={4} style={{ flexShrink: 0 }}>
 							<HumanAttentionInboxButton currentNarratorId={narratorId} />
 						</Box>

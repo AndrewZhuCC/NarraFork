@@ -5,6 +5,12 @@
  */
 export const FILE_CHANGE_EVIDENCE_VERSION = 2;
 
+export interface FileHistoryTarget {
+	deviceId: string;
+	pathFlavor: FileChangePathFlavor;
+	canonicalPath: string;
+}
+
 const MIB = 1024 * 1024;
 
 /** Shared admission budgets. Exceeding one never turns a prefix into complete evidence. */
@@ -34,6 +40,17 @@ export const FILE_CHANGE_LIMITS = Object.freeze({
 	remoteReceiptEntries: 100_000,
 	remoteReceiptBytes: 64 * MIB,
 });
+
+/**
+ * Message roles that never persist tool calls or disk operations.
+ * Leftover sys/user/disp cards after an interrupt must not veto file coverage.
+ */
+export const NON_OPERATION_ROLES: ReadonlySet<string> = new Set([
+	"sys",
+	"disp",
+	"system",
+	"user",
+]);
 
 /** spec:// is deliberately not a disk-path flavor. */
 export type FileChangePathFlavor = "posix" | "windows";

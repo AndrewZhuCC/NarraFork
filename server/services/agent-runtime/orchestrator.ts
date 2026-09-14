@@ -48,7 +48,6 @@ import { getToolMessage, getToolMessageWithParams, type Locale } from "../../lib
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
-	getAutoCompactPruneThreshold,
 	getContextThresholds,
 	getSettingsRevision,
 	isAnthropicProvider,
@@ -56,6 +55,7 @@ import {
 	resolveEffectiveModel,
 	resolveProvider,
 	settings,
+	subscribeSettingsChanges,
 	usesCodexModel,
 	usesStatefulModel,
 } from "../../lib/settings";
@@ -82,7 +82,7 @@ import {
 	restoreBufferedMessage,
 	toBufferSummary,
 } from "../narrator-buffer";
-import { pruneToolCalls, runCustomCompact, runPlanCompact } from "../narrator-compact";
+import { runCustomCompact, runPlanCompact } from "../narrator-compact";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -132,7 +132,6 @@ import {
 	getSubagentFinalText,
 	getSubagentResultMessageId,
 	hasPendingBufferedWork,
-	isDynamicPruningWindowEnabled,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
@@ -206,6 +205,7 @@ import { createRuntimeEventContext, createRuntimeMessageWriters } from "./contex
 import { applyForegroundControl, resetForegroundTurn } from "./control";
 import { buildRuntimeHistory } from "./history";
 import { createRuntimeRunState, type RuntimeProfile, type RuntimeRunOutcome } from "./input";
+import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
 import { resolveRuntimePolicy } from "./policy";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
@@ -486,6 +486,8 @@ export async function runAgentLoopUnlocked(
 			runState.initialSettingsApplied = true;
 			active._settingsRevision = getSettingsRevision();
 			active.model = resolveEffectiveModel(active._modelRef, active.provider);
+			const turnModelRef = active._modelRef;
+			const turnEffectiveModel = active.model;
 			active.provider = resolveProvider(active.model);
 			active._reasoningEffortRef = freshNarrator.reasoningEffort ?? null;
 			active.reasoningEffort = resolveRuntimeReasoningEffort(
@@ -520,10 +522,6 @@ export async function runAgentLoopUnlocked(
 					? settings.agent.tasksReminderInterval
 					: tasksReminderIntervalOverride;
 
-			// Apply dynamic pruning — strip tool calls from messages at or before the
-			// persisted boundary so the context stays within budget. When compactStart
-			// is <= pruneStart, dynamic pruning is explicitly disabled; clear any stale
-			// boundary left over from an earlier threshold configuration.
 			// A manual plan-mode toggle only needs to override the CURRENT pass, whose
 			// AgentConfig captured `freshNarrator` above. This pass just re-read the DB, so
 			// any live override is now redundant — and keeping it would make one manual
@@ -533,23 +531,6 @@ export async function runAgentLoopUnlocked(
 			// The prompt this pass is about to build already reflects the toggled state, so a
 			// rebuild request raised before it is satisfied by construction.
 			clearPlanModePromptRebuild(narratorId);
-
-			const loopThresholds = getContextThresholds(resolved.model, resolved.provider);
-			const pruningWindowEnabled = isDynamicPruningWindowEnabled(loopThresholds);
-			active._pruneBoundaryMessageId = pruningWindowEnabled
-				? (freshNarrator.pruneBoundaryMessageId ?? null)
-				: null;
-			if (!pruningWindowEnabled && freshNarrator.pruneBoundaryMessageId) {
-				await narratorService.clearPruneBoundary(narratorId);
-				broadcastToNarrator(narratorId, {
-					type: "prune_boundary",
-					narratorId,
-					boundaryMessageId: null,
-					prunedPercent: null,
-				});
-			} else if (active._pruneBoundaryMessageId) {
-				pruneToolCalls(dbMessages, active._pruneBoundaryMessageId);
-			}
 
 			const preparedHistory = await buildRuntimeHistory({
 				narratorId,
@@ -648,7 +629,7 @@ export async function runAgentLoopUnlocked(
 				toolCallIdsMap: new Map(),
 			});
 
-			// Build shared context management hooks (prune + compact)
+			// Build shared context management hooks (compact)
 			let compactDoneFlag = false;
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
@@ -656,10 +637,6 @@ export async function runAgentLoopUnlocked(
 				isSubagent: isSubagentNarrator,
 				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
-				getPruneBoundary: () => active._pruneBoundaryMessageId ?? null,
-				setPruneBoundary: (id) => {
-					active._pruneBoundaryMessageId = id;
-				},
 				onCompactDone: () => {
 					compactDoneFlag = true;
 				},
@@ -1081,6 +1058,13 @@ export async function runAgentLoopUnlocked(
 						}
 					: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
 				requireToolCallBinding: true,
+				onInternalReadAuthorization: async (toolUseId, binding) => {
+					await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
+				},
+				onInternalReadCreated: (toolUseId, binding, input, sequence) =>
+					narratorPersistence.createInternalRead(narratorId, toolUseId, binding, input, sequence),
+				onInternalReadCompleted: (toolUseId, binding, result) =>
+					narratorPersistence.completeInternalRead(narratorId, toolUseId, binding, result),
 				onToolExecutionStarting: (toolUseId, binding, startedAt) =>
 					narratorPersistence.claimToolCallExecution(narratorId, toolUseId, binding, startedAt),
 				onExecutionTargetResolved: (toolUseId, target, binding) =>
@@ -1372,9 +1356,30 @@ export async function runAgentLoopUnlocked(
 							"Relevant knowledge-base entries were found for this request:",
 						);
 						if (block) {
-							await messageWriters.persistSystemMessage(narratorId, block, [
-								knowledgeInjection.createKnowledgeHintBlock(hits, "user_message", cycleSeq),
-							]);
+							const knowledgeMessage = await messageWriters.persistSystemMessage(
+								narratorId,
+								block,
+								[
+									{
+										...knowledgeInjection.createKnowledgeHintBlock(hits, "user_message", cycleSeq),
+										modelText: block,
+									},
+								],
+							);
+							broadcastToNarrator(narratorId, {
+								type: "message",
+								narratorId,
+								message: {
+									id: knowledgeMessage.id,
+									narratorId,
+									role: knowledgeMessage.role,
+									contentJson: knowledgeMessage.contentJson,
+									contentText: knowledgeMessage.contentText,
+									createdAt: knowledgeMessage.createdAt,
+									seq: knowledgeMessage.seq,
+									children: [],
+								},
+							});
 							knowledgeService.recordInjectionEvents({
 								narratorId,
 								compactSeq: cycleSeq,
@@ -1445,15 +1450,26 @@ export async function runAgentLoopUnlocked(
 						diagnostics: mu.diagnostics,
 					});
 
-				const outcome =
-					mu.providerId && mu.nugModelId
-						? await nugAvailabilityPoller.waitForModelAvailable({
-								providerId: mu.providerId,
-								nugModelId: mu.nugModelId,
-								signal: active.abortController.signal,
-							})
-						: "aborted";
+				const outcome = await waitForModelAvailabilityOrChange({
+					target: active,
+					isCurrent: () => active.alive && owner.isCurrent(),
+					hasModelChanged: () =>
+						active._modelRef !== turnModelRef ||
+						active.model !== turnEffectiveModel ||
+						(turnModelRef === FOLLOW_DEFAULT_MODEL &&
+							resolveEffectiveModel(turnModelRef, active.provider) !== turnEffectiveModel),
+					subscribe: subscribeSettingsChanges,
+					wait: (signal) =>
+						mu.providerId && mu.nugModelId
+							? nugAvailabilityPoller.waitForModelAvailable({
+									providerId: mu.providerId,
+									nugModelId: mu.nugModelId,
+									signal,
+								})
+							: Promise.resolve("aborted"),
+				});
 
+				if (!active.alive || !owner.isCurrent()) return false;
 				if (active.abortController.signal.aborted || outcome === "aborted") {
 					await finalizeInterruptedRun(active, narratorId, undefined);
 					runState.wasInterrupted = true;
@@ -1669,7 +1685,7 @@ export async function runAgentLoopUnlocked(
 				continue;
 			}
 
-			// --- Context length exceeded: aggressive prune (Codex) then compact/retry ---
+			// --- Context length exceeded: emergency compact/retry ---
 			// [continuation-source: context-overflow]
 			if (recovery.kind === "overflow" && active.alive) {
 				// Finalize or clean up the partial message from the failed turn.
@@ -1697,12 +1713,6 @@ export async function runAgentLoopUnlocked(
 
 				runState.recovery.overflowRetries = overflow.overflowRetries;
 
-				if (overflow.action === "retry_pruned") {
-					active._pruneBoundaryMessageId = overflow.boundaryMessageId;
-					active._resetUpstreamSessionOnNextRequest = true;
-					runState.recovery.transientRetries = 0;
-					continue;
-				}
 				if (overflow.action === "retry_compacted") {
 					active.conversationId = overflow.newConversationId;
 					active._resetUpstreamSessionOnNextRequest = true;
@@ -2049,9 +2059,7 @@ export async function runAgentLoopUnlocked(
 			// Agent loop done — update stats (always, even if we continue with buffered messages)
 			await narratorService.updateStats(narratorId, 0);
 
-			// Compact after a complete turn when either:
-			// 1. context usage is above compactStart and the prune gate allows compact, or
-			// 2. the pruned message ratio itself has reached the configured force-compact threshold.
+			// Compact after a complete turn when context usage reaches compactStart.
 			// This is a fallback — the mid-turn context_usage handler may have already started
 			// a background compact.
 			// [continuation-source: post-turn-compact]
@@ -2071,50 +2079,7 @@ export async function runAgentLoopUnlocked(
 				const postTurnContextPct = active._contextUsagePct;
 				active._contextUsagePct = undefined;
 
-				const compactPruneThreshold = getAutoCompactPruneThreshold();
-				const contextReachedCompactStart = postTurnContextPct >= postTurnThresholds.compactStart;
-				const pruningWindowEnabled = isDynamicPruningWindowEnabled(postTurnThresholds);
-				let currentPrunedPct = 0;
-				let shouldCompact = false;
-				let compactReason: "context_threshold" | "prune_threshold" | "pruning_window_disabled" =
-					"context_threshold";
-
-				if (contextReachedCompactStart && !pruningWindowEnabled) {
-					logger.info("Pruning window disabled, triggering background compact (post-turn)", {
-						narratorId,
-						contextPct: postTurnContextPct,
-						pruneStart: postTurnThresholds.pruneStart,
-						compactStart: postTurnThresholds.compactStart,
-					});
-					shouldCompact = true;
-					compactReason = "pruning_window_disabled";
-				} else {
-					const narrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { prunedPercent: true, pruneEnabled: true },
-					});
-					currentPrunedPct = narrator?.prunedPercent ?? 0;
-					const pruneDisabled = narrator != null && !narrator.pruneEnabled;
-					const pruneReachedForceCompact =
-						!pruneDisabled && currentPrunedPct >= compactPruneThreshold;
-
-					if (contextReachedCompactStart && !pruneDisabled && !pruneReachedForceCompact) {
-						logger.info(
-							"Context above compactStart post-turn but prunedPercent below threshold, skipping compact",
-							{
-								narratorId,
-								contextPct: postTurnContextPct,
-								prunedPercent: currentPrunedPct,
-								threshold: compactPruneThreshold,
-							},
-						);
-					} else if (contextReachedCompactStart || pruneReachedForceCompact) {
-						shouldCompact = true;
-						compactReason = pruneReachedForceCompact ? "prune_threshold" : "context_threshold";
-					}
-				}
-
-				if (shouldCompact) {
+				if (postTurnContextPct >= postTurnThresholds.compactStart) {
 					const boundaryMessageId = await narratorService.getCompactBoundaryMessage(
 						narratorId,
 						getAutoCompactKeepPairs(),
@@ -2125,9 +2090,7 @@ export async function runAgentLoopUnlocked(
 							narratorId,
 							boundaryMessageId,
 							contextPct: postTurnContextPct,
-							prunedPercent: currentPrunedPct,
-							threshold: compactPruneThreshold,
-							reason: compactReason,
+							threshold: postTurnThresholds.compactStart,
 						});
 
 						// Fire-and-forget: compact runs in the background.
@@ -2145,7 +2108,6 @@ export async function runAgentLoopUnlocked(
 						logger.info("Compact requested but not enough messages to compact", {
 							narratorId,
 							contextPct: postTurnContextPct,
-							prunedPercent: currentPrunedPct,
 						});
 					}
 				}

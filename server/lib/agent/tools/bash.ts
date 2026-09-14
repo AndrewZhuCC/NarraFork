@@ -1,5 +1,6 @@
 import { backgroundTaskService } from "@server/services/background-task-service";
 import { registerLocalBashActivity } from "@server/services/file-change-runtime";
+import { beginBashCaptureWindow } from "@server/services/narrator-tree-snapshot-hooks";
 import { z } from "zod/v4";
 import { AppError } from "../../errors";
 import { resolveNarratorGitIdentityEnv } from "../../git-identity";
@@ -192,9 +193,13 @@ async function prepareBashExecution(
 	});
 	let started = false;
 	let ended = false;
+	let bashWindow: { end(): void } | undefined;
 	const end = (outcome: "finished" | "unknown") => {
-		if (!activity || ended) return;
+		if (ended) return;
 		ended = true;
+		bashWindow?.end();
+		bashWindow = undefined;
+		if (!activity) return;
 		try {
 			activity.end(outcome);
 		} catch (error) {
@@ -215,6 +220,8 @@ async function prepareBashExecution(
 			let handle: ExecHandle;
 			try {
 				signal.throwIfAborted();
+				if (backend.kind === "local")
+					bashWindow = beginBashCaptureWindow(cwd, ctx.currentToolUseId ?? "__anonymous__");
 				handle = await backend.execCommand({
 					command,
 					cwd: activity?.cwd ?? cwd,
@@ -913,7 +920,7 @@ async function _runInBackground(
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Background bash task started: ${title}\n` +
-		`Use Await({ type: "bash", id: "${alias}" }) to check status or get results.`;
+		`Await({ type: "bash", id: "${alias}" })`;
 
 	if (conflicted) {
 		output +=

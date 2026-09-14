@@ -3,6 +3,7 @@ import { normalizePolicyViolationCode } from "@shared/agent-protocol/policy-viol
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { CodexRetainedUserMessage } from "@shared/compact-message";
+import { modelTextFromContentBlocks } from "@shared/native-injection";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { mapGenericReasoningEffort } from "@shared/reasoning-effort-support";
@@ -4108,10 +4109,7 @@ async function buildResponsesHistory(
 			history.push(...pendingToolResults.flatMap(expandResponsesToolResultMessage));
 			pendingToolResults = [];
 			const content = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const textParts = content
-				.filter((b: { type: string }) => b.type === "text")
-				.map((b: { text: string }) => b.text);
-			const text = textParts.join("\n") || msg.contentText || "";
+			const text = modelTextFromContentBlocks(content) || msg.contentText || "";
 			// Emit sys context as a user-role input item rather than a developer
 			// message. Developer/system items get hoisted into top-level
 			// `instructions` (and, on Gemini-translating proxies, into

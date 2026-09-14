@@ -426,11 +426,7 @@ for (const bounded of [true, false]) {
 			}
 			await db
 				.update(narrators)
-				.set({
-					contextSummary: "old summary",
-					pruneBoundaryMessageId: "new-user",
-					prunedPercent: 12,
-				})
+				.set({ contextSummary: "old summary" })
 				.where(eq(narrators.id, owner));
 			const beforeRows = await db.select().from(narratorMessages);
 			const beforeRefs = await db.select().from(narratorMessageRefs);
@@ -503,8 +499,6 @@ for (const bounded of [true, false]) {
 			]);
 			const state = await db.query.narrators.findFirst({ where: eq(narrators.id, owner) });
 			expect(state?.contextSummary).toBe("old summary");
-			expect(state?.pruneBoundaryMessageId).toBe("new-user");
-			expect(state?.prunedPercent).toBe(12);
 			const history = await narratorService.getModelHistorySinceLastCompact(owner);
 			const built = await agent.buildHistory(
 				history.map((entry) => ({ ...entry, parentToolUseId: null })),

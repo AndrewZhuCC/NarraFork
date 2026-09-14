@@ -48,7 +48,6 @@ export {
 	anthropicProviderPrefix,
 	buildAggModelValue,
 	DEFAULT_AUTO_COMPACT_KEEP_PAIRS,
-	DEFAULT_AUTO_COMPACT_PRUNE_THRESHOLD,
 	DEFAULT_CONTEXT_THRESHOLDS,
 	expandAllowedPoolForDisplay,
 	FOLLOW_DEFAULT_MODEL,
@@ -57,7 +56,6 @@ export {
 	getAggregation,
 	getAnthropicProviderConfig,
 	getAutoCompactKeepPairs,
-	getAutoCompactPruneThreshold,
 	getBuiltinCodexModels,
 	getBuiltinModelContextWindows,
 	getContextThresholds,
@@ -138,6 +136,26 @@ export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): bo
 			changed = true;
 		}
 	}
+	const agent = settings.agent;
+	if (agent && typeof agent === "object" && !Array.isArray(agent)) {
+		const values = agent as Record<string, unknown>;
+		for (const key of ["defaultPruneEnabled", "minPruneRatio", "autoCompactPruneThreshold"]) {
+			if (key in values) {
+				delete values[key];
+				changed = true;
+			}
+		}
+		const thresholds = values.contextThresholds;
+		if (thresholds && typeof thresholds === "object" && !Array.isArray(thresholds)) {
+			for (const tier of ["standard", "large"]) {
+				const value = (thresholds as Record<string, unknown>)[tier];
+				if (value && typeof value === "object" && "pruneStart" in value) {
+					delete (value as Record<string, unknown>).pruneStart;
+					changed = true;
+				}
+			}
+		}
+	}
 	return changed;
 }
 
@@ -216,6 +234,7 @@ export function reloadSettings(): NarraForkSettings {
 	} else {
 		_cache.current = fresh;
 	}
+	for (const listener of settingsChangeListeners) listener();
 	// biome-ignore lint/style/noNonNullAssertion: guaranteed non-null after assignment above
 	return _cache.current!;
 }
@@ -600,6 +619,13 @@ export function purgeStaleAgentModelRefs(
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
 let settingsRevision = 0;
+const settingsChangeListeners = new Set<() => void>();
+
+/** Subscribe to persisted settings after the runtime singleton has been updated. */
+export function subscribeSettingsChanges(listener: () => void): () => void {
+	settingsChangeListeners.add(listener);
+	return () => settingsChangeListeners.delete(listener);
+}
 
 export function getSettingsRevision(): number {
 	return settingsRevision;
@@ -762,6 +788,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 			(_cache.current as any)[key] = newSettings[key];
 		}
 	}
+	for (const listener of settingsChangeListeners) listener();
 }
 
 export const settings: NarraForkSettings = loadSettings();
