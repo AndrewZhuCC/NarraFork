@@ -716,6 +716,8 @@ async function resumeNextBufferedMessageUnlocked(
 	if (!inputOwner) return;
 	let claimedRow: import("./agent-runtime/mailbox-types").MailboxRow | undefined;
 	try {
+		// Consume one bounded notification batch before adopting the next user input.
+		await drainAndPersistPendingInjections(active);
 		claimedRow = claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
 		if (!claimedRow) return;
 		const first = projectMailboxUserMessage(claimedRow);
@@ -2709,6 +2711,8 @@ async function feedMessageUnlocked(
 					acceptedReferences,
 				)
 			).id;
+		// A buffered claim already passed this boundary in resume; never double its budget.
+		if (!internalOptions?.bufferedRow) await drainAndPersistPendingInjections(active);
 		claimedInput =
 			internalOptions?.bufferedRow ??
 			claimInboxHead(
