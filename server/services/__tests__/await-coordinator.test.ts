@@ -1,6 +1,6 @@
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators } from "../../db/schema";
+import { backgroundTasks, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
 const realDb = { ...(await import("../../db")) };
@@ -60,14 +60,97 @@ afterAll(() => {
 
 afterEach(() => cleanDb(sqlite));
 
-describe("awaitAnyRuntimeEvent", () => {
-	test("the Await tool defaults to any-event mode without resolving its selector", async () => {
-		const signal = new AbortController().signal;
-		const waiting = awaitTool.execute({ type: "bash", id: "not-a-real-task" }, {
+describe("Await target compatibility", () => {
+	for (const type of ["bash", "agent"] as const) {
+		for (const onlyWaitFor of [undefined, true]) {
+			test(`${type} reads a completed target with onlyWaitFor=${onlyWaitFor}`, async () => {
+				const now = new Date().toISOString();
+				await db.insert(narrators).values([
+					{ id: PARENT, variant: "primary", createdAt: now, updatedAt: now },
+					{
+						id: SOURCE,
+						variant: "subagent:general",
+						isBackground: true,
+						backgroundStatus: "completed",
+						parentNarratorId: PARENT,
+						createdAt: now,
+						updatedAt: now,
+					},
+				]);
+				await db.insert(backgroundTasks).values({
+					id: "completed-target",
+					parentNarratorId: PARENT,
+					type,
+					status: "completed",
+					subagentNarratorId: type === "agent" ? SOURCE : null,
+					output: "persisted target output",
+					startedAt: now,
+					createdAt: now,
+					updatedAt: now,
+				});
+				const result = await awaitTool.execute(
+					{
+						type,
+						id: "completed-target",
+						...(onlyWaitFor === undefined ? {} : { onlyWaitFor }),
+						timeout: 1000,
+					},
+					{ narratorId: PARENT, signal: AbortSignal.timeout(500) } as never,
+				);
+				expect(result.output).not.toContain("Await error:");
+				expect(result.metadata).toMatchObject({ awaitMode: "target", status: "completed" });
+				expect(result.output).toContain("persisted target output");
+			});
+		}
+	}
+
+	test("default target wait ignores another task's completion", async () => {
+		const now = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id: PARENT, variant: "primary", createdAt: now, updatedAt: now });
+		await db.insert(backgroundTasks).values({
+			id: "running-target",
+			parentNarratorId: PARENT,
+			type: "bash",
+			status: "running",
+			startedAt: now,
+			createdAt: now,
+			updatedAt: now,
+		});
+		const waiting = awaitTool.execute({ type: "bash", id: "running-target", timeout: 1000 }, {
 			narratorId: PARENT,
-			signal,
-			currentToolUseId: "await-tool-any",
+			signal: AbortSignal.timeout(100),
 		} as never);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		eventBus.emit({
+			type: "background_task:completed",
+			taskId: "unrelated-task",
+			parentNarratorId: PARENT,
+			taskType: "bash",
+			output: "unrelated output",
+		});
+		const result = await waiting;
+		expect(result.metadata).toMatchObject({
+			awaitMode: "target",
+			targetId: "running-target",
+			status: "aborted",
+		});
+		expect(result.output).not.toContain("unrelated output");
+	});
+});
+
+describe("awaitAnyRuntimeEvent", () => {
+	test("the Await tool explicitly opts into any-event mode without resolving its selector", async () => {
+		const signal = new AbortController().signal;
+		const waiting = awaitTool.execute(
+			{ type: "bash", id: "not-a-real-task", onlyWaitFor: false, timeout: 1000 },
+			{
+				narratorId: PARENT,
+				signal,
+				currentToolUseId: "await-tool-any",
+			} as never,
+		);
 		eventBus.emit({
 			type: "background_task:completed",
 			taskId: "task-any",

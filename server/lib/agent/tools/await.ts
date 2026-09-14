@@ -121,7 +121,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		type: "object",
 		properties: {
 			type: {
-				description: `Compatibility selector. When onlyWaitFor is true, await one of: ${targets.join(", ")}. Otherwise any supported asynchronous event may release the wait. ${questionHint}${
+				description: `What to await by default: ${targets.join(", ")}. Only explicit onlyWaitFor: false allows any supported asynchronous event to release the wait. ${questionHint}${
 					policy.capabilities.awaitAgent ? "" : " Subagents cannot await other agents."
 				}`,
 				type: "string",
@@ -130,12 +130,12 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			},
 			id: {
 				description:
-					"Required compatibility selector. Used as the target only when onlyWaitFor is true.",
+					"Required target ID or alias. Ignored as a target only when onlyWaitFor is explicitly false.",
 				type: "string",
 			},
 			onlyWaitFor: {
 				description:
-					"When true, wait only for the specified type/id target. Omit or use false to return on any supported asynchronous event.",
+					"Omit or use true to wait only for the specified type/id target. Only explicit false returns on any supported asynchronous event.",
 				type: "boolean",
 			},
 			timeout: {
@@ -156,10 +156,10 @@ export const awaitTool: ToolDefinition = {
 	name: "Await",
 	description:
 		"Wait for an asynchronous task to complete and return its current status and output.\n\n" +
-		"By default, Await returns as soon as any supported asynchronous event for this narrator is " +
-		"observed, so another notification cannot be blocked behind an unrelated target wait. " +
-		"Pass `onlyWaitFor: true` to wait only for the specified `type` and `id` target. The required " +
-		"`type` and `id` fields are compatibility selectors and are ignored as a target in the default mode. " +
+		"By default, Await waits only for the specified `type` and `id` target, as does " +
+		"`onlyWaitFor: true`. Pass `onlyWaitFor: false` explicitly to return as soon as any supported " +
+		"asynchronous event for this narrator is observed; only in that mode are the required " +
+		"`type` and `id` fields ignored as a target. " +
 		'Use `type: "agent"` to await a background or running subagent from a primary narrator. ' +
 		'Subagents cannot use `type: "agent"` to wait for other agents; use asynchronous Send instead. ' +
 		'Use `type: "bash"` to await a background bash task. ' +
@@ -176,18 +176,18 @@ export const awaitTool: ToolDefinition = {
 		type: z
 			.enum(["agent", "bash", "transfer", "question"])
 			.describe(
-				'What to await: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion).',
+				'What to await by default: "agent" (primary narrator only), "bash", "transfer" (a background device file transfer), or "question" (an async AskUserQuestion). Only explicit onlyWaitFor: false waits for any supported event.',
 			),
 		id: z
 			.string()
 			.describe(
-				"Required compatibility selector; used as the target only when onlyWaitFor is true.",
+				"Required target ID or alias; ignored as a target only when onlyWaitFor is explicitly false.",
 			),
 		onlyWaitFor: z
 			.boolean()
 			.optional()
 			.describe(
-				"When true, wait only for the specified type/id target; omit or use false for any event.",
+				"Omit or use true to wait only for the specified type/id target; only explicit false waits for any event.",
 			),
 		timeout: looseNumber(AWAIT_TIMEOUT_DESCRIPTION),
 		wait_for_text: z
@@ -208,7 +208,7 @@ export const awaitTool: ToolDefinition = {
 			onlyWaitFor?: boolean;
 			wait_for_text?: string;
 		};
-		const awaitMode: AwaitMode = onlyWaitFor === true ? "target" : "any";
+		const awaitMode: AwaitMode = onlyWaitFor === false ? "any" : "target";
 		const timeout = normalizeNumber((args as { timeout?: unknown }).timeout, {
 			min: 1000,
 			max: MAX_AWAIT_TIMEOUT_MS,
