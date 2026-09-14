@@ -30,6 +30,7 @@
  * toolbar is optional; late metadata never replaces the body's ancestor chain.
  */
 
+import { useReadFromStartShortcut } from "@frontend/hooks/useReadFromStartShortcut";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Box } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
@@ -250,6 +251,7 @@ export function VListContentViewHost({
 	const enabled = !!target && !!controls && interactive && panelVisible;
 	const { state: float, scrollToBodyTop } = useFloatState(hostRef, enabled && hovered && !isMobile);
 	const onReaderProgress = useReaderProgress(target, controls, interactive);
+	useReadFromStartShortcut(hostRef, enabled && !isMobile, hovered, scrollToBodyTop);
 
 	const openFullscreen = useCallback(() => {
 		if (target && controls) controls.openFullscreen(target);
@@ -278,6 +280,7 @@ export function VListContentViewHost({
 			ref={hostRef}
 			style={{ ...relative, ...style }}
 			data-vlist-content-host
+			data-shortcut-reading-host
 			onMouseEnter={!enabled || isMobile ? undefined : () => setPointerOverBody(true)}
 			onMouseLeave={!enabled || isMobile ? undefined : () => setPointerOverBody(false)}
 			onClick={enabled && isMobile ? handleClick : undefined}

@@ -1,5 +1,19 @@
 {
 	"title": "设置",
+	"narratorShortcuts": {
+		"title": "叙述者快捷键",
+		"recording": "请按下快捷键（Esc 取消）",
+		"clear": "清除",
+		"clearAction": "清除「{{action}}」快捷键",
+		"previous": "上一个叙述者",
+		"next": "下一个叙述者",
+		"numbered": "切换到第 {{number}} 个叙述者",
+		"readFromStart": "从头阅读",
+		"disabled": "已停用",
+		"invalid": "无法使用此按键，请尝试组合键、方向键、Home 或功能键。",
+		"conflict": "已被「{{action}}」使用，请换一个快捷键。",
+		"reset": "恢复所有默认快捷键"
+	},
 	"subagentPoolReasoningEffortHelp": "只影响之后新建的子代理；指定后覆盖主代理传入的等级，实际请求按模型支持情况适配。不指定表示不施加池级覆盖，不等于 none（关闭思考）。",
 	"personalGroup": "个人设置",
 	"instanceGroup": "实例管理",

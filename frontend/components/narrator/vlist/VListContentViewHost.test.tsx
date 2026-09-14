@@ -582,6 +582,27 @@ describe("VListContentViewHost — back to the start of this body", () => {
 		expect(labels.indexOf("readFromStart")).toBe(0);
 	});
 
+	test("Home invokes the same body-start scroll as the button", async () => {
+		const { controls } = makeControls();
+		await renderHost({ target: CODE_TARGET, controls });
+		const scroller = stubScrollGeometry({ above: 120, scrollTop: 1000 });
+		Object.defineProperty(hostEl(), "getClientRects", { value: () => [{}], configurable: true });
+		await hover();
+		const event = Object.assign(new window.Event("keydown", { bubbles: true, cancelable: true }), {
+			code: "Home",
+			key: "Home",
+			ctrlKey: false,
+			metaKey: false,
+			altKey: false,
+			shiftKey: false,
+			isComposing: false,
+			repeat: false,
+		});
+		document.dispatchEvent(event);
+		expect(event.defaultPrevented).toBe(true);
+		expect(scroller.scrollTops).toEqual([1000 - 120 - 8]);
+	});
+
 	test("clicking it scrolls the head back into view", async () => {
 		const { controls } = makeControls();
 		await renderHost({ target: CODE_TARGET, controls });

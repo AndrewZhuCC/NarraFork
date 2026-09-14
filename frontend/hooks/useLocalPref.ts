@@ -59,6 +59,32 @@ type NumberKey =
 	| "narrafork_stream_token_ms";
 
 const listeners = new Set<() => void>();
+const SHORTCUT_PREF_KEY = "narrafork_narrator_shortcuts";
+let shortcutFallback: string | undefined;
+
+export function readLocalShortcutPref(): string {
+	if (shortcutFallback !== undefined) return shortcutFallback;
+	try {
+		return localStorage.getItem(SHORTCUT_PREF_KEY) ?? "{}";
+	} catch {
+		return "{}";
+	}
+}
+
+export function writeLocalShortcutPref(value: string): void {
+	try {
+		localStorage.setItem(SHORTCUT_PREF_KEY, value);
+		shortcutFallback = undefined;
+	} catch {
+		// Quota errors can reject writes even while reads still return an old value.
+		shortcutFallback = value;
+	}
+	notify();
+}
+
+export function useLocalShortcutPref(): string {
+	return useSyncExternalStore(subscribe, readLocalShortcutPref, () => "{}");
+}
 
 // --- Singleton storage listener ---
 // One global "storage" listener dispatches to all subscribers,
@@ -68,7 +94,8 @@ let storageListener: ((e: StorageEvent) => void) | null = null;
 function ensureStorageListener() {
 	if (storageListener) return;
 	storageListener = (e: StorageEvent) => {
-		if (e.key?.startsWith("narrafork_")) {
+		if (e.key === SHORTCUT_PREF_KEY || e.key === null) shortcutFallback = undefined;
+		if (e.key === null || e.key?.startsWith("narrafork_")) {
 			for (const cb of listeners) cb();
 		}
 	};

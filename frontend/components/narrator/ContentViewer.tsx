@@ -35,6 +35,7 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { useReadFromStartShortcut } from "../../hooks/useReadFromStartShortcut";
 import { useSwipeMenu } from "../../hooks/useSwipeMenu";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../lib/history-state";
 import {
@@ -323,6 +324,7 @@ export const ContentViewer = memo(
 			detachFromBottom();
 			boxRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
 		}, [detachFromBottom]);
+		useReadFromStartShortcut(boxRef, !isPreviewLod && !isMobile, hovered, handleReadFromStart);
 
 		// Register in global registry so parents can resolve via DOM lookup
 		useEffect(() => {
@@ -649,6 +651,7 @@ export const ContentViewer = memo(
 			<>
 				<Box
 					ref={boxRef}
+					data-shortcut-reading-host
 					pos="relative"
 					data-content-block
 					data-cv-id={instanceId.current}

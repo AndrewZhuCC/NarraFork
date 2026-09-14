@@ -25,6 +25,12 @@
 // still be a real module edge for the HMR graph this split exists to keep small.
 import type { RecentTab } from "@frontend/hooks/recent-tabs-utils";
 
+export function getRecentTabNarratorId(tab: RecentTab): string | null {
+	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
+	if (tab.type === "chapter") return tab.narratorId ?? null;
+	return null;
+}
+
 /** Horizontal travel, in px, at which a released swipe commits instead of springing back. */
 export const SWIPE_THRESHOLD = 80;
 

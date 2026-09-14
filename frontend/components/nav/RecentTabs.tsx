@@ -85,7 +85,10 @@ import { useCollapsedTabDirectories } from "../../hooks/useCollapsedTabDirectori
 import { useArchiveNarrator } from "../../hooks/useNarrator";
 import type { NarratorListWSEvent } from "../../hooks/useNarratorWS";
 import { useFsRevealCapability } from "../../hooks/usePlatform";
-import { usePendingTabKey } from "../../hooks/useRecentTabKeyboardNav";
+import {
+	registerRecentTabKeyboardSource,
+	usePendingTabKey,
+} from "../../hooks/useRecentTabKeyboardNav";
 import {
 	addRecentTab,
 	addRecentTabOrThrow,
@@ -143,6 +146,7 @@ import {
 	autoScrollAllowedForPointer,
 	clampSwipeTravel,
 	classifySwipeRelease,
+	getRecentTabNarratorId,
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
@@ -276,13 +280,6 @@ function pointerXFromActivatorEvent(activatorEvent: Event): number | null {
 	return e.touches?.[0]?.clientX ?? null;
 }
 const PREFETCH_QUERY_GC_TIME_MS = 5 * 60_000;
-
-function getRecentTabNarratorId(tab: RecentTab): string | null {
-	if (tab.type === "narrator" || tab.type === "subagent") return tab.id;
-	if (tab.type === "chapter") return tab.narratorId ?? null;
-	// group tabs have no single narrator (multi-party)
-	return null;
-}
 
 // Module-level flag: set on dragEnd, cleared on next click capture.
 // Prevents the synthetic click after drag from triggering Link navigation.
@@ -1982,6 +1979,23 @@ export function RecentTabList({
 		}
 		return rows;
 	}, []);
+
+	useEffect(() => {
+		if (filter !== "narrator") return;
+		return registerRecentTabKeyboardSource(() => {
+			if (!listBoxRef.current?.getBoundingClientRect().height) return [];
+			const byKey = new Map(
+				[...pinnedItemsRef.current, ...unpinnedItemsRef.current].map((tab) => [
+					tabSortId(tab),
+					tab,
+				]),
+			);
+			return measureDropRows().flatMap((row) => {
+				const tab = byKey.get(row.key);
+				return tab ? [tab] : [];
+			});
+		});
+	}, [filter, measureDropRows]);
 
 	const handleExternalDrop = useCallback(
 		({

@@ -1,5 +1,19 @@
 {
 	"title": "Settings",
+	"narratorShortcuts": {
+		"title": "Narrator keyboard shortcuts",
+		"recording": "Press a shortcut (Esc to cancel)",
+		"clear": "Clear",
+		"clearAction": "Clear shortcut for {{action}}",
+		"previous": "Previous narrator",
+		"next": "Next narrator",
+		"numbered": "Switch to narrator {{number}}",
+		"readFromStart": "Read from start",
+		"disabled": "Disabled",
+		"invalid": "Cannot use this key. Try a key combination, arrow key, Home, or a function key.",
+		"conflict": "Already assigned to “{{action}}”. Choose another shortcut.",
+		"reset": "Restore all default shortcuts"
+	},
 	"subagentPoolReasoningEffortHelp": "Only affects newly created subagents. A specified tier overrides the agent's input and is adapted to model support. Not specified applies no pool override; it is not none (thinking off).",
 	"personalGroup": "Personal",
 	"instanceGroup": "Instance",

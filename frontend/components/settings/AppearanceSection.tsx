@@ -15,6 +15,7 @@ import {
 import { LanguageSwitcher } from "../LanguageSwitcher";
 import { ThemeSwitcher } from "../ThemeSwitcher";
 import { TERMINAL_THEMES } from "../terminal/terminal-theme";
+import { NarratorShortcutSettings } from "./NarratorShortcutSettings";
 
 // biome-ignore lint/suspicious/noExplicitAny: dynamic prefs type
 type AnyPrefs = any;
@@ -482,6 +483,8 @@ export function AppearanceSection({
 					{t("shiftEnterNewlineHint")}
 				</Text>
 			</Stack>
+
+			<NarratorShortcutSettings />
 
 			{/* Session — per-user, kept here so non-admins can still reach them */}
 			<Title order={5} mt="sm">
