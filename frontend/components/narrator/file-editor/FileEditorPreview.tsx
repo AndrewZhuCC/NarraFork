@@ -1,7 +1,9 @@
 import { Box, Center, Loader, Text } from "@mantine/core";
 import { localFileDirectory } from "@shared/markdown-file-path";
-import { lazy, Suspense, useMemo } from "react";
+import { lazy, Suspense, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { type SelectionCommentPayload, SelectionPopover } from "../../common/SelectionPopover";
+import { addCommentDraft } from "../comment-draft-store";
 import { FileReferenceScopeProvider } from "../FileReferenceScope";
 import type { FileViewerMode } from "../file-viewer/file-viewer-modes";
 import {
@@ -27,6 +29,9 @@ export function FileEditorPreview({
 	filePath,
 	deviceId,
 	narratorId,
+	commentNarratorId,
+	commentScopeKey,
+	unsaved = false,
 	withSourceLines,
 }: {
 	text: string;
@@ -34,10 +39,28 @@ export function FileEditorPreview({
 	filePath: string;
 	deviceId: string;
 	narratorId?: string;
+	commentNarratorId?: string;
+	commentScopeKey?: string;
+	unsaved?: boolean;
 	/** Stamp `data-line` anchors so the split view can scroll-sync by source line. */
 	withSourceLines?: boolean;
 }) {
 	const { t } = useTranslation("narrator");
+	const commentRef = useRef<HTMLDivElement>(null);
+	const handleComment = useCallback(
+		({ excerpt, comment }: SelectionCommentPayload) => {
+			if (!commentNarratorId) return;
+			// Rendered text is not a source range: keep the quote without inventing line numbers.
+			addCommentDraft(commentNarratorId, {
+				source: "file",
+				fileTarget: { deviceId, path: filePath },
+				unsaved,
+				excerpt,
+				comment,
+			});
+		},
+		[commentNarratorId, deviceId, filePath, unsaved],
+	);
 	const tooLarge = text.length > MAX_EDITOR_PREVIEW_CHARS;
 	const format = mode === "node" ? detectStructuredFormat(filePath) : null;
 	const parsed = useMemo(
@@ -63,28 +86,44 @@ export function FileEditorPreview({
 	}
 	return (
 		<FileReferenceScopeProvider value={scope}>
-			<Suspense
-				fallback={
-					<Center p="md">
-						<Loader size="sm" />
-					</Center>
-				}
-			>
-				{mode === "preview" ? (
-					<Box p="xs">
-						<MarkdownContent text={text} sourceLines={withSourceLines} />
-					</Box>
-				) : parsed && !isStructuredParseError(parsed) ? (
-					<>
-						<StructuredNodeTree nodes={parsed.nodes} />
-						{parsed.truncated && (
-							<Text size="xs" c="yellow" p="xs">
-								{t("fileViewer.nodesTruncated")}
-							</Text>
-						)}
-					</>
-				) : null}
-			</Suspense>
+			<Box ref={commentRef}>
+				<Suspense
+					fallback={
+						<Center p="md">
+							<Loader size="sm" />
+						</Center>
+					}
+				>
+					{mode === "preview" ? (
+						<Box p="xs">
+							<MarkdownContent text={text} sourceLines={withSourceLines} />
+						</Box>
+					) : parsed && !isStructuredParseError(parsed) ? (
+						<>
+							<StructuredNodeTree nodes={parsed.nodes} />
+							{parsed.truncated && (
+								<Text size="xs" c="yellow" p="xs">
+									{t("fileViewer.nodesTruncated")}
+								</Text>
+							)}
+						</>
+					) : null}
+				</Suspense>
+				{commentNarratorId && (
+					<SelectionPopover
+						containerRef={commentRef}
+						onComment={handleComment}
+						resetKey={JSON.stringify([
+							commentNarratorId,
+							deviceId,
+							filePath,
+							mode,
+							commentScopeKey,
+							unsaved,
+						])}
+					/>
+				)}
+			</Box>
 		</FileReferenceScopeProvider>
 	);
 }

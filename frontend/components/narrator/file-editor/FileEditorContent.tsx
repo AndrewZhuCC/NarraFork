@@ -41,6 +41,7 @@ import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { addCommentDraft } from "../comment-draft-store";
 import type { DiffLine } from "../DiffView";
 import { useFileReferenceScope } from "../FileReferenceScope";
 import { availableModes } from "../file-viewer/file-viewer-modes";
@@ -72,7 +73,12 @@ import {
 	computeEditorConflictDiff,
 	encodeEditorSnapshot,
 } from "./editor-worker-client";
-import { type MonacoDocumentStatus, MonacoEditor, type MonacoEditorHandle } from "./MonacoEditor";
+import {
+	type MonacoDocumentStatus,
+	MonacoEditor,
+	type MonacoEditorHandle,
+	type MonacoSelectionCommentPayload,
+} from "./MonacoEditor";
 import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import { monacoHostVisible } from "./monaco-scroll";
 import { type EditorState, isDirty, reloaded } from "./save-state";
@@ -89,6 +95,8 @@ export interface FileEditorContentProps {
 	filePath: string;
 	/** Actual source narrator; the dock host is not a filesystem authority. */
 	narratorId?: string;
+	/** Receiving chat; intentionally separate from the file's source narrator. */
+	commentNarratorId?: string;
 	deviceId?: string;
 	referenceOrigin?: boolean;
 	selection?: FileSelection;
@@ -129,6 +137,7 @@ export function FileEditorContent(props: FileEditorContentProps) {
 function FileEditorDocument({
 	filePath,
 	narratorId,
+	commentNarratorId,
 	deviceId = "local",
 	referenceOrigin = false,
 	selection,
@@ -167,6 +176,7 @@ function FileEditorDocument({
 	const modeRef = useRef(mode);
 	modeRef.current = mode;
 	const [previewText, setPreviewText] = useState<string | null>(null);
+	const [previewComment, setPreviewComment] = useState({ unsaved: false, revision: 0 });
 	const [previewError, setPreviewError] = useState<string | null>(null);
 	const previewController = useRef<AbortController | null>(null);
 	const [conflictDiff, setConflictDiff] = useState<{
@@ -339,6 +349,28 @@ function FileEditorDocument({
 	const baseHash = state?.baseHash;
 	const revision = state?.version?.revision;
 	const phase = state?.phase;
+	const commentScopeKey = JSON.stringify([
+		commentNarratorId,
+		deviceId,
+		filePath,
+		revision,
+		baseHash,
+		dirty,
+		state?.loading,
+	]);
+	const handleComment = useCallback(
+		({ excerpt, comment, selection }: MonacoSelectionCommentPayload) => {
+			if (!commentNarratorId) return;
+			addCommentDraft(commentNarratorId, {
+				source: "file",
+				fileTarget: { deviceId, path: filePath, selection },
+				unsaved: dirty,
+				excerpt,
+				comment,
+			});
+		},
+		[commentNarratorId, deviceId, filePath, dirty],
+	);
 	// A quiet-window equivalence check is not part of the keystroke path. Undo to the
 	// known alternativeVersionId is immediate; equal text with different history is verified.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: any new revision or baseline cancels and restarts the quiet window
@@ -397,32 +429,37 @@ function FileEditorDocument({
 	}, [mode]);
 	// keepCurrent: a disk reload regenerates the preview behind the existing one;
 	// only an explicit mode switch or error replaces what is on screen.
-	const generatePreview = useCallback(async (keepCurrent = false) => {
-		previewController.current?.abort();
-		if (!keepCurrent) {
-			setPreviewText(null);
-			setPreviewError(null);
-		}
-		const model = editorRef.current?.getModel();
-		if (!model) return;
-		// No snapshot/full-text work until the user explicitly requests a preview.
-		if (model.getValueLength() > PREVIEW_BYTES) {
-			setPreviewError(tRef.current("fileEditor.previewTooLarge"));
-			return;
-		}
-		const controller = new AbortController();
-		previewController.current = controller;
-		try {
-			const blob = await encodeEditorSnapshot(captureEditorSnapshot(model), controller.signal);
-			if (blob.size > PREVIEW_BYTES) throw new Error(tRef.current("fileEditor.previewTooLarge"));
-			const text = await blob.text();
-			controller.signal.throwIfAborted();
-			setPreviewText(text);
-		} catch (error) {
-			if (!controller.signal.aborted)
-				setPreviewError(error instanceof Error ? error.message : String(error));
-		}
-	}, []);
+	const generatePreview = useCallback(
+		async (keepCurrent = false) => {
+			previewController.current?.abort();
+			if (!keepCurrent) {
+				setPreviewText(null);
+				setPreviewError(null);
+			}
+			const model = editorRef.current?.getModel();
+			if (!model) return;
+			// No snapshot/full-text work until the user explicitly requests a preview.
+			if (model.getValueLength() > PREVIEW_BYTES) {
+				setPreviewError(tRef.current("fileEditor.previewTooLarge"));
+				return;
+			}
+			const controller = new AbortController();
+			previewController.current = controller;
+			try {
+				const unsaved = sessionDirty(session.state);
+				const blob = await encodeEditorSnapshot(captureEditorSnapshot(model), controller.signal);
+				if (blob.size > PREVIEW_BYTES) throw new Error(tRef.current("fileEditor.previewTooLarge"));
+				const text = await blob.text();
+				controller.signal.throwIfAborted();
+				setPreviewComment((previous) => ({ unsaved, revision: previous.revision + 1 }));
+				setPreviewText(text);
+			} catch (error) {
+				if (!controller.signal.aborted)
+					setPreviewError(error instanceof Error ? error.message : String(error));
+			}
+		},
+		[session],
+	);
 	regeneratePreviewRef.current = () => void generatePreview(true);
 	// A remembered non-raw default means the panel OPENS in preview/split: generate
 	// the first rendering once the model is ready, without waiting for a mode click.
@@ -1010,6 +1047,8 @@ function FileEditorDocument({
 						onReady={handleReady}
 						onDocumentChange={handleChange}
 						onSelectionChange={handleSelection}
+						onComment={commentNarratorId && !state.loading ? handleComment : undefined}
+						commentScopeKey={commentScopeKey}
 						onSearchRequested={openSearch}
 						onSave={handleSave}
 						onError={(error) => setEditorError(error.message)}
@@ -1064,6 +1103,9 @@ function FileEditorDocument({
 									filePath={filePath}
 									deviceId={deviceId}
 									narratorId={narratorId}
+									commentNarratorId={!state.loading ? commentNarratorId : undefined}
+									commentScopeKey={JSON.stringify([commentScopeKey, previewComment.revision])}
+									unsaved={previewComment.unsaved}
 									withSourceLines={split}
 								/>
 							</Suspense>

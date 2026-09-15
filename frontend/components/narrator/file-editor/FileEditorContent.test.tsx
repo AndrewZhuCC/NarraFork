@@ -20,6 +20,7 @@ import {
 	serializeDetachedNodes,
 } from "../../graph/dock/detached-panels";
 import { readPanelSubject } from "../../graph/dock/tab-detach";
+import { clearAllCommentDrafts, getCommentDrafts } from "../comment-draft-store";
 import {
 	NarratorDockContext,
 	type NarratorDockContextValue,
@@ -96,17 +97,25 @@ beforeEach(async () => {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
 	Object.defineProperty(window.document, "getSelection", { value: () => null });
 	Object.defineProperty(window.document, "hasFocus", { value: () => false });
+	Object.defineProperty(window.document, "fonts", {
+		value: { addEventListener() {}, removeEventListener() {} },
+	});
 	Object.defineProperty(window.HTMLInputElement.prototype, "select", {
 		configurable: true,
 		value() {},
 	});
 	const overrides = {
 		window,
+		innerWidth: 1024,
+		innerHeight: 768,
 		confirm: confirmReload,
 		document: window.document,
 		navigator: window.navigator,
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
+		HTMLTextAreaElement: window.HTMLTextAreaElement,
+		HTMLInputElement: window.HTMLInputElement,
+		NodeFilter: { SHOW_ELEMENT: 1, SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2 },
 		Node: window.Node,
 		Text: window.Text,
 		MutationObserver: window.MutationObserver,
@@ -214,6 +223,7 @@ afterEach(async () => {
 		}
 		originalGlobals.clear();
 		mountedTestModels.clear();
+		clearAllCommentDrafts();
 	}
 });
 async function mount(props: Partial<FileEditorContentProps> = {}) {
@@ -540,6 +550,22 @@ for (const surface of ["focus", "workspace"] as const)
 				target: { path: filePath },
 				dirty: true,
 			});
+			expect(model.props.onComment).toBeDefined();
+			await act(async () =>
+				model.props.onComment?.({
+					excerpt: "child draft",
+					comment: "Review child file",
+					anchorNode: null,
+					selection,
+				}),
+			);
+			expect(getCommentDrafts("parent")[0]).toMatchObject({
+				fileTarget: { deviceId: "local", path: filePath, selection },
+				unsaved: true,
+			});
+			expect(getCommentDrafts("child")).toEqual([]);
+			expect(upload).not.toHaveBeenCalled();
+			expect(model.text).toBe("child draft");
 			await click(iconButton("device-floppy"));
 			expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
 			expect(upload.mock.calls[0]?.[0]).toBe("child");
@@ -566,6 +592,174 @@ test("StrictMode effect replay still loads an editable session and releases aban
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("strict draft");
 	expect(beginUpload.mock.calls[0]?.[0]).toBe("child");
 });
+
+for (const unsaved of [false, true])
+	test(`source comment captures exact target and selection (${unsaved ? "dirty" : "clean"}) without saving`, async () => {
+		const model = await mount({ narratorId: "child", commentNarratorId: "host" });
+		if (unsaved) await edit(model, "a\nchanged\n");
+		const text = model.text;
+		const history = [...model.undoEntries];
+		expect(model.props.onComment).toBeDefined();
+		await act(async () =>
+			model.props.onComment?.({
+				excerpt: unsaved ? "changed" : "b",
+				comment: "Please explain this selection",
+				anchorNode: null,
+				selection,
+			}),
+		);
+		expect(getCommentDrafts("host")).toEqual([
+			expect.objectContaining({
+				source: "file",
+				fileTarget: { deviceId: "local", path: source.target.path, selection },
+				unsaved,
+				excerpt: unsaved ? "changed" : "b",
+				comment: "Please explain this selection",
+			}),
+		]);
+		expect(getCommentDrafts("child")).toEqual([]);
+		expect(model.text).toBe(text);
+		expect(model.undoEntries).toEqual(history);
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(unsaved);
+		expect(beginUpload).not.toHaveBeenCalled();
+		expect(upload).not.toHaveBeenCalled();
+		expect(commit).not.toHaveBeenCalled();
+		expect(legacyWrite).not.toHaveBeenCalled();
+	});
+
+test("comment recipient changes scope without reloading the source or losing dirty buffer", async () => {
+	const model = await mount({ narratorId: "child", commentNarratorId: "host" });
+	await edit(model, "keep this draft");
+	const scope = model.props.commentScopeKey;
+	const history = [...model.undoEntries];
+	expect(await mount({ narratorId: "child", commentNarratorId: "other-host" })).toBe(model);
+	expect(model.props.commentScopeKey).not.toBe(scope);
+	await act(async () =>
+		model.props.onComment?.({ excerpt: "keep", comment: "Review", anchorNode: null, selection }),
+	);
+	expect(getCommentDrafts("host")).toEqual([]);
+	expect(getCommentDrafts("child")).toEqual([]);
+	expect(getCommentDrafts("other-host")).toHaveLength(1);
+	await mount({ narratorId: "child", commentNarratorId: undefined });
+	expect(model.props.onComment).toBeUndefined();
+	expect(model.text).toBe("keep this draft");
+	expect(model.undoEntries).toEqual(history);
+	expect(create).toHaveBeenCalledTimes(1);
+	expect(upload).not.toHaveBeenCalled();
+});
+
+test("remote source comment preserves device identity and reads as source, not recipient", async () => {
+	preview.mockResolvedValue({
+		...source,
+		target: { deviceId: "remote-device", path: source.target.path },
+	});
+	const model = await mount({
+		narratorId: "child",
+		commentNarratorId: "host",
+		deviceId: "remote-device",
+	});
+	await act(async () =>
+		model.props.onComment?.({
+			excerpt: "b",
+			comment: "Review remote",
+			anchorNode: null,
+			selection,
+		}),
+	);
+	expect(preview.mock.calls[0]?.[0]).toBe("child");
+	expect(getCommentDrafts("host")[0]).toMatchObject({
+		fileTarget: { deviceId: "remote-device", path: source.target.path, selection },
+		unsaved: false,
+	});
+	expect(getCommentDrafts("child")).toEqual([]);
+	expect(upload).not.toHaveBeenCalled();
+});
+
+for (const snapshotUnsaved of [false, true])
+	test(`markdown DOM comment preserves ${snapshotUnsaved ? "unsaved" : "saved"} snapshot provenance without invented lines`, async () => {
+		read.mockResolvedValue("# Saved heading");
+		const model = await mount({
+			filePath: "/work/a.md",
+			narratorId: "child",
+			commentNarratorId: "host",
+			selection: undefined,
+		});
+		if (snapshotUnsaved) await edit(model, "# Draft heading");
+		await switchFileMode("preview");
+		// Explicit preview provenance belongs to its snapshot, not the live model.
+		await act(async () => {
+			if (snapshotUnsaved) model.undo();
+			else model.edit("# Later unsaved buffer");
+		});
+		const heading = host.querySelector("[data-file-editor-preview] h1");
+		const text = heading?.firstChild;
+		if (!heading || !text) throw new Error("Missing rendered heading");
+		expect(heading.textContent).toBe(snapshotUnsaved ? "Draft heading" : "Saved heading");
+		const range = {
+			commonAncestorContainer: text,
+			startContainer: text,
+			endContainer: text,
+			startOffset: 0,
+			endOffset: 5,
+			intersectsNode: (node: Node) => node === text,
+			getBoundingClientRect: () => ({
+				top: 80,
+				left: 40,
+				bottom: 100,
+				right: 160,
+				width: 120,
+				height: 20,
+			}),
+		};
+		Object.defineProperty(window, "getSelection", {
+			configurable: true,
+			value: () => ({
+				isCollapsed: false,
+				rangeCount: 1,
+				getRangeAt: () => range,
+				removeAllRanges() {},
+			}),
+		});
+		await act(async () => {
+			heading.dispatchEvent(new Event("mouseup", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 30));
+		});
+		const add = document.body.querySelector<HTMLButtonElement>(
+			`button[aria-label="${en.addComment}"]`,
+		);
+		if (!add) throw new Error("Missing DOM selection comment action");
+		await click(add);
+		const textarea = document.body.querySelector("textarea");
+		const setter = Object.getOwnPropertyDescriptor(
+			window.HTMLTextAreaElement.prototype,
+			"value",
+		)?.set;
+		if (!textarea || !setter) throw new Error("Missing comment input");
+		await act(async () => {
+			setter.call(textarea, "Review heading");
+			textarea.dispatchEvent(new Event("input", { bubbles: true }));
+			textarea.dispatchEvent(new Event("change", { bubbles: true }));
+		});
+		const confirm = [...document.body.querySelectorAll("button")].find(
+			(button) => button.textContent === "confirm",
+		);
+		if (!confirm) throw new Error("Missing comment confirmation");
+		await click(confirm);
+		expect(getCommentDrafts("host")).toEqual([
+			expect.objectContaining({
+				source: "file",
+				fileTarget: { deviceId: "local", path: "/work/a.md" },
+				excerpt: snapshotUnsaved ? "Draft" : "Saved",
+				comment: "Review heading",
+				unsaved: snapshotUnsaved,
+			}),
+		]);
+		expect(getCommentDrafts("child")).toEqual([]);
+		expect(model.text).toBe(snapshotUnsaved ? "# Saved heading" : "# Later unsaved buffer");
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(!snapshotUnsaved);
+		expect(upload).not.toHaveBeenCalled();
+		expect(commit).not.toHaveBeenCalled();
+	});
 
 test("model identity includes source narrator and canonical authorized path", async () => {
 	create.mockResolvedValue({

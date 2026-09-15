@@ -1,7 +1,7 @@
 /**
  * comment-draft-store.ts — session-scoped selection-comment drafts.
  *
- * Spec markdown and chat messages both feed the same draft list; the composer
+ * Spec markdown, chat messages and file selections feed the same draft list; the composer
  * packs them into the next user message. Drafts are NOT written to spec://
  * files, NOT persisted to the DB, and live only for this tab session.
  *
@@ -15,9 +15,11 @@
  * inflating dock context.
  */
 
+import type { FileTarget } from "@shared/file-reference";
+import { fileReferenceLabel } from "@shared/file-reference-display";
 import { useSyncExternalStore } from "react";
 
-export type CommentDraftSource = "spec" | "chat";
+export type CommentDraftSource = "spec" | "chat" | "file";
 
 export type CommentDraft = {
 	id: string;
@@ -32,6 +34,8 @@ export type CommentDraft = {
 	role?: "user" | "assistant" | "system";
 	blockId?: string;
 	blockIndex?: number;
+	fileTarget?: FileTarget;
+	unsaved?: boolean;
 };
 
 export type CommentDraftInput = Omit<CommentDraft, "id"> & { id?: string };
@@ -147,8 +151,26 @@ function formatChatHeader(draft: CommentDraft): string {
 	return draft.messageSeq != null ? `[chat] ${role} · seq ${draft.messageSeq}` : `[chat] ${role}`;
 }
 
+function formatFileHeader(draft: CommentDraft): string {
+	const target = draft.fileTarget;
+	const locator = target
+		? fileReferenceLabel({ ...target, selection: undefined, id: draft.id, label: target.path })
+		: "unknown file";
+	const selection = target?.selection;
+	const range = selection
+		? ` · ${selection.startLineNumber}:${selection.startColumn}–${selection.endLineNumber}:${selection.endColumn} (1-based UTF-16 columns, end-exclusive)`
+		: "";
+	// A plain locator also preserves relative paths without inventing an absolute device link.
+	return `[file] ${locator}${range} · captured selection snapshot (not current disk content)${draft.unsaved ? " · unsaved buffer" : ""}`;
+}
+
 function formatOneDraft(draft: CommentDraft): string {
-	const header = draft.source === "spec" ? formatSpecHeader(draft) : formatChatHeader(draft);
+	const header =
+		draft.source === "spec"
+			? formatSpecHeader(draft)
+			: draft.source === "file"
+				? formatFileHeader(draft)
+				: formatChatHeader(draft);
 	return `${header}\n${quoteExcerpt(draft.excerpt)}\n${draft.comment}`;
 }
 

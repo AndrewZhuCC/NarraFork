@@ -8972,6 +8972,7 @@ export function NarratorPanel({
 									key={internalFileViewerPath}
 									filePath={internalFileViewerPath}
 									narratorId={narratorId}
+									commentNarratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
 									selection={internalFileViewerTarget?.selection}

@@ -1,8 +1,9 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import * as domText from "../../lib/dom-text";
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 
@@ -74,6 +75,7 @@ function installDom() {
 		Element: window.Element,
 		Node: window.Node,
 		ResizeObserver: TestResizeObserver,
+		MutationObserver: window.MutationObserver,
 		matchMedia,
 		getComputedStyle:
 			window.getComputedStyle?.bind(window) ?? (() => ({ getPropertyValue: () => "" })),
@@ -85,18 +87,30 @@ function Harness({
 	onAction,
 	onComment,
 	label,
+	resetKey,
+	hideComment,
+	externalSelection = "quoted text",
+	domMode,
 }: {
 	onAction?: (text: string) => void;
 	onComment?: (payload: { excerpt: string; comment: string; anchorNode: Node | null }) => void;
 	label?: string;
+	resetKey?: string;
+	hideComment?: boolean;
+	externalSelection?: string;
+	domMode?: boolean;
 }) {
 	const ref = useRef<HTMLDivElement>(null);
 	return (
 		<div>
-			<div ref={ref}>selectable</div>
+			<div ref={ref} data-selectable>
+				selectable
+			</div>
 			<SelectionPopover
 				containerRef={ref}
-				externalSelection="quoted text"
+				externalSelection={domMode ? undefined : externalSelection}
+				resetKey={resetKey}
+				hideComment={hideComment}
 				externalAnchor={{ x: 80, y: 60 }}
 				onAction={onAction}
 				onComment={onComment}
@@ -111,6 +125,10 @@ async function renderHarness(
 		onAction?: (text: string) => void;
 		onComment?: (payload: { excerpt: string; comment: string; anchorNode: Node | null }) => void;
 		label?: string;
+		resetKey?: string;
+		hideComment?: boolean;
+		externalSelection?: string;
+		domMode?: boolean;
 	} = {},
 ) {
 	await act(async () => {
@@ -146,6 +164,98 @@ afterAll(() => {
 });
 
 describe("SelectionPopover actions", () => {
+	test.each([
+		"style",
+		"class",
+		"hidden",
+		"inert",
+	])("hiding a dock ancestor via %s dismisses an open popover", async (attribute) => {
+		await renderHarness();
+		const target = container?.querySelector("[data-selectable]") as HTMLElement;
+		const ancestor = target.parentElement;
+		if (!ancestor) throw new Error("missing dock ancestor");
+		Object.defineProperty(target, "checkVisibility", {
+			configurable: true,
+			value: () => !ancestor.hasAttribute(attribute),
+		});
+		expect(button("addComment")).toBeTruthy();
+		await act(async () => {
+			ancestor.setAttribute(attribute, attribute === "style" ? "display:none" : "hidden-panel");
+		});
+		expect(button("addComment")).toBeNull();
+		await act(async () => {
+			ancestor.removeAttribute(attribute);
+		});
+		expect(button("addComment")).toBeNull();
+	});
+	test.each([
+		"touchend",
+		"keyup",
+	])("DOM selection completes on %s with the shared budget", async (event) => {
+		const preview = spyOn(domText, "collectSelectionTextPreview").mockReturnValue("selected");
+		try {
+			await renderHarness({ domMode: true });
+			const target = container?.querySelector("[data-selectable]");
+			if (!target) throw new Error("missing selection container");
+			Object.assign(window, {
+				getSelection: () => ({
+					rangeCount: 1,
+					getRangeAt: () => ({
+						commonAncestorContainer: target,
+						startContainer: target,
+						getBoundingClientRect: () => target.getBoundingClientRect(),
+					}),
+				}),
+			});
+			await act(async () => {
+				target.dispatchEvent(new Event(event, { bubbles: true }));
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			});
+			expect(preview).toHaveBeenCalledWith(expect.anything(), 200_000);
+			expect(button("addComment")).toBeTruthy();
+		} finally {
+			preview.mockRestore();
+		}
+	});
+	test("external selection survives DOM mouseup and comment input focus", async () => {
+		await renderHarness();
+		await act(async () => {
+			container
+				?.querySelector("[data-selectable]")
+				?.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(button("addComment")).toBeTruthy();
+		await act(async () =>
+			button("addComment")?.dispatchEvent(new MouseEvent("click", { bubbles: true })),
+		);
+		await act(async () =>
+			document.body
+				.querySelector("textarea")
+				?.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })),
+		);
+		expect(document.body.querySelector("textarea")).toBeTruthy();
+	});
+
+	test("reset target dismisses old selection even if the external text is unchanged", async () => {
+		await renderHarness({ resetKey: "a" });
+		expect(button("addComment")).toBeTruthy();
+		await renderHarness({
+			resetKey: "b",
+			onComment: () => {
+				throw new Error("stale comment");
+			},
+		});
+		expect(button("addComment")).toBeNull();
+		await renderHarness({ resetKey: "b", externalSelection: "new quote" });
+		expect(button("addComment")).toBeTruthy();
+	});
+
+	test("hideComment preserves copying without a recipient", async () => {
+		await renderHarness({ hideComment: true });
+		expect(button("copy")).toBeTruthy();
+		expect(button("addComment")).toBeNull();
+	});
 	test("always shows copy and comment; send only when onAction is provided", async () => {
 		await renderHarness();
 		expect(button("copy")).toBeTruthy();

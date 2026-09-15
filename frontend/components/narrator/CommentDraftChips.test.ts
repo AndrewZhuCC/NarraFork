@@ -1,6 +1,47 @@
 import { describe, expect, test } from "bun:test";
-import { isSpecCommentStale } from "./CommentDraftChips";
+import { MantineProvider } from "@mantine/core";
+import { createInstance } from "i18next";
+import { parseHTML } from "linkedom";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { I18nextProvider } from "react-i18next";
+import { CommentDraftChips, isSpecCommentStale } from "./CommentDraftChips";
 import { createCommentDraft } from "./comment-draft-store";
+
+test("file chips show filename, device/path hover text, unsaved marker and existing remove control", async () => {
+	const i18n = createInstance();
+	await i18n.init({
+		lng: "en",
+		resources: {
+			en: { narrator: { commentFileUnsaved: "Unsaved", removeComment: "Remove comment" } },
+		},
+	});
+	const draft = createCommentDraft({
+		source: "file",
+		excerpt: "captured text",
+		comment: "please edit",
+		fileTarget: { deviceId: "WindowsCase", path: "C:\\work\\完整 file.ts" },
+		unsaved: true,
+	});
+	const html = renderToStaticMarkup(
+		createElement(
+			I18nextProvider,
+			{ i18n },
+			createElement(
+				MantineProvider,
+				{},
+				createElement(CommentDraftChips, { drafts: [draft], onRemove: () => {} }),
+			),
+		),
+	);
+	const { document } = parseHTML(html);
+	const label = document.querySelector('[title="C:\\\\work\\\\完整 file.ts · WindowsCase"]');
+	expect(label?.textContent).toContain("完整 file.ts · Unsaved");
+	expect(label?.textContent).not.toContain("C:");
+	expect(label?.getAttribute("title")).not.toContain(":1");
+	expect(document.querySelector('button[aria-label="Remove comment"]')).not.toBeNull();
+	expect(isSpecCommentStale(draft, new Map([["spec://index.md", "new"]]))).toBe(false);
+});
 
 describe("isSpecCommentStale", () => {
 	test("is false for chat drafts", () => {

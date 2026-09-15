@@ -38,7 +38,36 @@ function chatDraft(overrides: Partial<CommentDraft> = {}): CommentDraft {
 	});
 }
 
+function fileDraft(overrides: Partial<CommentDraft> = {}): CommentDraft {
+	return createCommentDraft({
+		source: "file",
+		excerpt: "captured buffer text",
+		comment: "change this",
+		fileTarget: {
+			deviceId: "RemoteCase",
+			path: "/work/完整 file.ts",
+			selection: { startLineNumber: 2, startColumn: 3, endLineNumber: 4, endColumn: 1 },
+		},
+		unsaved: true,
+		...overrides,
+	});
+}
+
 describe("comment draft store", () => {
+	test("file drafts remain isolated and can be removed and restored alongside other sources", () => {
+		clearAllCommentDrafts();
+		const file = fileDraft({ id: "file-1" });
+		addCommentDraft("n-a", file);
+		addCommentDraft("n-a", chatDraft({ id: "chat-1" }));
+		addCommentDraft("n-b", specDraft({ id: "spec-1" }));
+		const previous = clearCommentDrafts("n-a");
+		expect(getCommentDrafts("n-a")).toEqual([]);
+		setCommentDrafts("n-a", previous);
+		expect(getCommentDrafts("n-a")[0]).toEqual(file);
+		removeCommentDraft("n-a", file.id);
+		expect(getCommentDrafts("n-a").map((draft) => draft.id)).toEqual(["chat-1"]);
+		expect(getCommentDrafts("n-b").map((draft) => draft.id)).toEqual(["spec-1"]);
+	});
 	test("isolates drafts per narrator", () => {
 		clearAllCommentDrafts();
 		addCommentDraft("n-a", specDraft({ id: "a1" }));
@@ -91,6 +120,34 @@ describe("comment draft store", () => {
 });
 
 describe("comment packing for send", () => {
+	test("file header preserves device, full path, exact range and unsaved snapshot provenance", () => {
+		const packed = formatCommentDraftsForSend([fileDraft()]);
+		expect(packed).toContain("[file] /work/完整 file.ts · RemoteCase");
+		expect(packed).toContain("2:3–4:1 (1-based UTF-16 columns, end-exclusive)");
+		expect(packed).toContain("captured selection snapshot (not current disk content)");
+		expect(packed).toContain("unsaved buffer\n> captured buffer text\nchange this");
+	});
+
+	test("preview without range does not invent lines or an absolute link for relative paths", () => {
+		const packed = formatCommentDraftsForSend([
+			fileDraft({ fileTarget: { deviceId: "RemoteCase", path: "src/file.ts" }, unsaved: false }),
+		]);
+		expect(packed).toContain("[file] src/file.ts · RemoteCase · captured selection snapshot");
+		expect(packed).not.toContain("#L");
+		expect(packed).not.toContain("1:1");
+		expect(packed).not.toContain("end-exclusive");
+		expect(packed).not.toContain("nf-file:");
+		expect(packed).not.toContain("unsaved buffer");
+	});
+
+	test("packs file, chat and spec in order into the same user message", () => {
+		const drafts = [fileDraft(), chatDraft(), specDraft()];
+		const message = composeUserMessageWithComments("please review", drafts);
+		expect(message).toBe(`${formatCommentDraftsForSend(drafts)}\n\nplease review`);
+		expect(message.match(/<comments>/g)).toHaveLength(1);
+		expect(message.indexOf("[file]")).toBeLessThan(message.indexOf("[chat]"));
+		expect(message.indexOf("[chat]")).toBeLessThan(message.indexOf("[spec]"));
+	});
 	test("formats spec and chat drafts into one <comments> block", () => {
 		const packed = formatCommentDraftsForSend([
 			specDraft({

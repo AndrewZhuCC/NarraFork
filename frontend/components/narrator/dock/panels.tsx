@@ -1072,6 +1072,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
 							filePath={filePath}
 							narratorId={fileNarratorId}
+							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}
@@ -1083,6 +1084,7 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							key={`${fileNarratorId}:${deviceId}:${filePath}`}
 							filePath={filePath}
 							narratorId={fileNarratorId}
+							commentNarratorId={hostNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}

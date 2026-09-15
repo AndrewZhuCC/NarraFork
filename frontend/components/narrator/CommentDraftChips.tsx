@@ -4,6 +4,7 @@
  */
 
 import { Box, CloseButton, Group, Text, Tooltip } from "@mantine/core";
+import { fileReferenceLabel } from "@shared/file-reference-display";
 import { IconAlertCircle, IconMessage } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import type { CommentDraft } from "./comment-draft-store";
@@ -52,7 +53,19 @@ export function CommentDraftChips({
 		>
 			{drafts.map((draft) => {
 				const stale = isSpecCommentStale(draft, specRevisionByUri);
-				const sourceLabel = draft.source === "spec" ? t("commentFromSpec") : t("commentFromChat");
+				const fileTarget = draft.source === "file" ? draft.fileTarget : undefined;
+				const fileName = fileTarget?.path
+					.split(/^[A-Za-z]:[\\/]/u.test(fileTarget.path) ? /[\\/]/u : "/")
+					.pop();
+				const sourceLabel =
+					draft.source === "file"
+						? `${fileName || t("commentFromFile")}${draft.unsaved ? ` · ${t("commentFileUnsaved")}` : ""}`
+						: draft.source === "spec"
+							? t("commentFromSpec")
+							: t("commentFromChat");
+				const fileTitle = fileTarget
+					? fileReferenceLabel({ ...fileTarget, id: draft.id, label: fileTarget.path })
+					: undefined;
 				return (
 					<Group
 						key={draft.id}
@@ -69,7 +82,7 @@ export function CommentDraftChips({
 					>
 						<IconMessage size={14} style={{ flexShrink: 0, opacity: 0.7 }} />
 						<Box style={{ minWidth: 0, flex: 1 }}>
-							<Text size="xs" c="dimmed" truncate>
+							<Text size="xs" c="dimmed" truncate title={fileTitle}>
 								{sourceLabel} · “{preview(draft.excerpt, 48)}”
 							</Text>
 							<Text size="xs" truncate>
