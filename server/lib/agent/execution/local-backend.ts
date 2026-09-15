@@ -49,14 +49,17 @@ import { LOCAL_DEVICE_ID } from "./backend";
 import { localPathSemantics } from "./path-semantics";
 
 // Inline source works in both development and compiled Bun binaries without a filesystem worker.
+// ponytail: scanSync stays in this worker; a native scan may finish before teardown.
+// Async Glob pool tasks can outlive a terminated VM and crash the host. Restore async scanning
+// only when Bun fixes that lifecycle; never move this scan onto the HTTP thread.
 const BOUNDED_GLOB_WORKER = `
-self.onmessage = async ({ data }) => {
+self.onmessage = ({ data }) => {
 	try {
 		const matches = [];
 		let bytes = 2;
 		let truncated = false;
 		const query = data.query.toLowerCase();
-		for await (const raw of new Bun.Glob(data.pattern).scan({ cwd: data.cwd, dot: data.dot, onlyFiles: !data.includeDirectories, followSymlinks: false })) {
+		for (const raw of new Bun.Glob(data.pattern).scanSync({ cwd: data.cwd, dot: data.dot, onlyFiles: !data.includeDirectories, followSymlinks: false })) {
 			const entry = process.platform === "win32" ? raw.replaceAll(String.fromCharCode(92), "/") : raw;
 			if (query && !entry.toLowerCase().includes(query)) continue;
 			const size = Buffer.byteLength(JSON.stringify(entry)) + 1;

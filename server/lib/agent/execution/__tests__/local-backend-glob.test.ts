@@ -15,6 +15,31 @@ afterEach(() => {
 });
 
 describe("local glob worker budgets", () => {
+	test("terminatable workers never dispatch an async native glob task", async () => {
+		const root = tempRoot();
+		writeFileSync(join(root, "file.ts"), "");
+		const createObjectURL = URL.createObjectURL.bind(URL);
+		// Fail safely in the real worker rather than reproducing a native process crash in the suite.
+		const createURL = spyOn(URL, "createObjectURL").mockImplementation((blob) => {
+			if (!(blob instanceof Blob)) return createObjectURL(blob);
+			return createObjectURL(
+				new Blob(
+					[
+						'Bun.Glob.prototype.scan = () => { throw new Error("unsafe async glob in terminatable worker"); };\n',
+						blob,
+					],
+					{ type: "text/javascript" },
+				),
+			);
+		});
+		try {
+			const result = await new LocalBackend().glob("**/*", { cwd: root, timeoutMs: 2000 });
+			expect([...result]).toEqual(["file.ts"]);
+			expect(result.truncated).toBe(false);
+		} finally {
+			createURL.mockRestore();
+		}
+	});
 	test("literal path query, Unicode, spaces and directory candidates are supported", async () => {
 		const root = tempRoot();
 		mkdirSync(join(root, "中文 dir"));
