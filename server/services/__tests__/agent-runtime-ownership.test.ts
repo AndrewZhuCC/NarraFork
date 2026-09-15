@@ -141,6 +141,60 @@ function failedPreparation(run: Promise<unknown>) {
 	);
 }
 
+describe("completion attention hooks", () => {
+	for (const mode of ["foreground", "background", "primary"] as const) {
+		test(`${mode} sends one done hook per completed turn`, async () => {
+			const { hookService } = await import("../hook-service");
+			await import("../attention-hook-bridge");
+			const hooks = spyOn(hookService, "runHooks").mockResolvedValue({ outcome: "success" });
+			spyOn(passExecutor, "executeAgentLoop").mockResolvedValue({
+				finalText: "done",
+				hasError: false,
+				shouldUpdateTitle: false,
+				completedNaturally: true,
+				completedAssistantTurn: true,
+			});
+			const id = mode === "primary" ? ROOT : CHILD;
+			for (let turn = 1; turn <= 2; turn++) {
+				await narratorService.updateStatus(id, "working", { setTurnStart: true });
+				if (mode === "background") {
+					const { runtimePublication } = await import("../agent-runtime/publication");
+					runtimePublication.startAgentRun({ narratorId: CHILD, parentNarratorId: ROOT });
+					await executeBackgroundTask(child());
+				} else if (mode === "foreground") {
+					const run = startForegroundRun({
+						...child(),
+						subagentId: CHILD,
+						initialHistory: [],
+						customDef: null,
+					});
+					await run.terminal;
+				} else {
+					const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
+					const owner = tryClaimExecution(ROOT, "primary");
+					if (!owner) throw new Error("Missing primary owner");
+					try {
+						await runAgentLoopUnlocked(active(ROOT), owner, "finish");
+					} finally {
+						owner.release();
+					}
+				}
+				// The real attention bridge resolves narrator context asynchronously.
+				await new Promise((resolve) => setImmediate(resolve));
+				expect(
+					hooks.mock.calls.filter(
+						([event, input]) =>
+							event === "Attention" &&
+							input.narrator_id === id &&
+							input.attention_reason === "done",
+					),
+				).toHaveLength(turn);
+				expect((await narratorService.getById(id)).status).toBe("idle");
+			}
+		});
+	}
+});
+
 describe("publication release respects the runtime inbox wake decision", () => {
 	for (const mode of ["foreground", "background", "resume", "deferred-resume"] as const) {
 		for (const allowInboxWake of [false, true]) {

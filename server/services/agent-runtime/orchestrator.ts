@@ -2434,9 +2434,13 @@ export async function runAgentLoopUnlocked(
 				// so the "DB idle but loop still running" window is minimal. If status has
 				// already moved (e.g. another loop took over after hot reload, or user
 				// interrupted), the CAS is a no-op.
-				await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
-					substatus: ["unread"],
-				});
+				// Managed children publish completion in finalizeSubagent; doing it here too
+				// fires Attention(done) twice, before and after the runner's finalization.
+				if (profile.kind === "primary") {
+					await narratorService.compareAndSetStatus(narratorId, ["working", "waiting"], "idle", {
+						substatus: ["unread"],
+					});
+				}
 			}
 
 			active.events.emit("event", { type: "done", data: null });
