@@ -48,10 +48,14 @@ type ScheduledTaskRow = typeof scheduledTasks.$inferSelect;
  */
 const realNarratorSession = { ...(await import("../narrator-session")) };
 let sentTo: string | null = null;
+let sentEffort: Parameters<typeof realNarratorSession.sendMessage>[11];
+let busy = false;
 mock.module("../narrator-session", () => ({
 	...realNarratorSession,
-	sendMessage: async (narratorId: string) => {
-		sentTo = narratorId;
+	isLoopRunning: (id: string) => busy || realNarratorSession.isLoopRunning(id),
+	sendMessage: async (...args: Parameters<typeof realNarratorSession.sendMessage>) => {
+		sentTo = args[0];
+		sentEffort = args[11];
 		throw new Error("sentinel: sendMessage reached");
 	},
 }));
@@ -161,6 +165,7 @@ function chapterTask(
 		prompt: "run the checks",
 		systemPrompt: null,
 		model: null,
+		reasoningEffort: null,
 		permissionMode: "bypassPermissions",
 		locale: "en",
 		runContext: "chapter",
@@ -199,6 +204,7 @@ async function launchAndCaptureTarget(
 }
 
 afterEach(async () => {
+	busy = false;
 	for (const projectId of createdProjects.splice(0)) {
 		await db.delete(narrators).where(eq(narrators.chapterId, projectId));
 		const rows = await db.query.chapters.findMany({
@@ -222,6 +228,69 @@ afterEach(async () => {
 afterAll(() => {
 	mock.module("../narrator-session", () => realNarratorSession);
 	mock.restore();
+});
+
+describe("scheduled run effort dispatch", () => {
+	for (const context of ["chapter", "standalone"] as const) {
+		for (const reuse of [true, false]) {
+			test(`${context} / ${reuse ? "reuse" : "new"}: explicit effort is per dispatch, never persisted even on startup failure`, async () => {
+				const env = await makeChapterWithNarrator({
+					ownerUserId: null,
+					visibility: "public",
+					writeAudience: "owner",
+				});
+				const admin = await makeUser("admin");
+				if (!reuse) await db.delete(narrators).where(eq(narrators.id, env.narratorId));
+				else
+					await db
+						.update(narrators)
+						.set({ reasoningEffort: "medium" })
+						.where(eq(narrators.id, env.narratorId));
+				const task = {
+					...chapterTask(env.projectId, env.chapterId, admin),
+					runContext: context,
+					narratorMode: reuse ? ("reuse" as const) : ("new" as const),
+					reuseNarratorId: reuse ? env.narratorId : null,
+				};
+				for (const effort of ["low", "high", null] as const) {
+					const result = await launchAndCaptureTarget({ ...task, reasoningEffort: effort });
+					expect(result.outcome).toBe("sent");
+					expect(sentEffort).toBe(effort ?? undefined);
+					if (result.outcome !== "sent") throw new Error("Missing target");
+					const row = await db.query.narrators.findFirst({
+						where: eq(narrators.id, result.narratorId),
+					});
+					expect(row?.reasoningEffort).toBe(reuse ? "medium" : null);
+					if (context === "standalone" && !reuse)
+						await db.delete(narrators).where(eq(narrators.id, result.narratorId));
+				}
+			});
+		}
+	}
+	test("busy and ACL rejection never dispatch a task override", async () => {
+		const env = await makeChapterWithNarrator({
+			ownerUserId: null,
+			visibility: "public",
+			writeAudience: "owner",
+		});
+		const admin = await makeUser("admin");
+		const task = {
+			...chapterTask(env.projectId, env.chapterId, admin),
+			reasoningEffort: "high" as const,
+		};
+		busy = true;
+		expect((await launchAndCaptureTarget(task)).outcome).toBe("skipped");
+		expect(sentTo).toBeNull();
+		busy = false;
+		expect(
+			(await launchAndCaptureTarget({ ...task, createdBy: await makeUser("user") })).outcome,
+		).toBe("skipped");
+		expect(sentTo).toBeNull();
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, env.narratorId) }))
+				?.reasoningEffort,
+		).toBeNull();
+	});
 });
 
 describe("the principal a scheduled task is judged as", () => {

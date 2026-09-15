@@ -81,6 +81,34 @@ async function insertTasks(count: number): Promise<void> {
 	}
 }
 
+test("reasoning effort create, read, patch omission and explicit reset", async () => {
+	for (const reasoningEffort of [undefined, null, "low", "high"] as const) {
+		const task = await scheduledTaskService.create({
+			name: "effort",
+			cronExpr: "0 9 * * *",
+			prompt: "check",
+			reasoningEffort,
+		});
+		createdIds.push(task.id);
+		expect(task.reasoningEffort).toBe(reasoningEffort ?? null);
+		expect((await scheduledTaskService.get(task.id))?.reasoningEffort).toBe(
+			reasoningEffort ?? null,
+		);
+		expect(
+			(await scheduledTaskService.list()).tasks.find((row) => row.id === task.id)?.reasoningEffort,
+		).toBe(reasoningEffort ?? null);
+		expect((await scheduledTaskService.update(task.id, { name: "renamed" })).reasoningEffort).toBe(
+			reasoningEffort ?? null,
+		);
+		expect(
+			(await scheduledTaskService.update(task.id, { reasoningEffort: "high" })).reasoningEffort,
+		).toBe("high");
+		expect(
+			(await scheduledTaskService.update(task.id, { reasoningEffort: null })).reasoningEffort,
+		).toBeNull();
+	}
+});
+
 describe("scheduledTaskService.list is bounded", () => {
 	test("returns every row and truncated:false below the cap", async () => {
 		await insertTasks(3);

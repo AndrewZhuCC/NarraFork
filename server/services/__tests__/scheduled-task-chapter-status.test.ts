@@ -94,6 +94,7 @@ function chapterTask(projectId: string, chapterId: string): ScheduledTaskRow {
 		prompt: "run the checks",
 		systemPrompt: null,
 		model: null,
+		reasoningEffort: null,
 		permissionMode: "bypassPermissions",
 		locale: "en",
 		runContext: "chapter",

@@ -22,6 +22,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { LOCALE_OPTIONS, type Locale } from "@shared/i18n-locales";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 import {
 	IconAlertTriangle,
 	IconChevronRight,
@@ -39,7 +40,9 @@ import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../components/common/DirectoryPicker";
 import { useChapters } from "../../hooks/useChapters";
+import { useModelCardIndex } from "../../hooks/useModelCards";
 import { useAllModels } from "../../hooks/useModels";
+import { useNarrator, useNarrators } from "../../hooks/useNarrator";
 import { useProjects } from "../../hooks/useProjects";
 import {
 	useCreateScheduledTask,
@@ -50,7 +53,7 @@ import {
 	useUpdateScheduledTask,
 } from "../../hooks/useScheduledTasks";
 import type { ScheduledTask, ScheduledTaskInput } from "../../lib/api";
-import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
+import { FOLLOW_DEFAULT_MODEL, resolveDisplayModel } from "../../lib/constants";
 import {
 	type CronPresetState,
 	cronToPreset,
@@ -59,6 +62,10 @@ import {
 } from "../../lib/cron-presets";
 import { formatRelativeTime } from "../../lib/format";
 import { formatLocaleDateTime } from "../../lib/intl-format";
+import {
+	displayedModelReasoningEffort,
+	getModelReasoningEffort,
+} from "../../lib/model-reasoning-effort";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 
@@ -71,6 +78,7 @@ interface TaskDraft {
 	prompt: string;
 	systemPrompt: string;
 	model: string;
+	reasoningEffort: ReasoningEffort | null;
 	permissionMode: string;
 	locale: Locale;
 	runContext: "standalone" | "chapter";
@@ -78,6 +86,7 @@ interface TaskDraft {
 	projectId: string;
 	chapterId: string;
 	narratorMode: "new" | "reuse";
+	reuseNarratorId?: string | null;
 	enabled: boolean;
 	timezone: string;
 }
@@ -87,6 +96,7 @@ const EMPTY_DRAFT: TaskDraft = {
 	prompt: "",
 	systemPrompt: "",
 	model: "",
+	reasoningEffort: null,
 	permissionMode: "bypassPermissions",
 	locale: "zh-CN",
 	runContext: "standalone",
@@ -104,6 +114,7 @@ function draftFromTask(task: ScheduledTask): TaskDraft {
 		prompt: task.prompt,
 		systemPrompt: task.systemPrompt ?? "",
 		model: task.model ?? "",
+		reasoningEffort: task.reasoningEffort ?? null,
 		permissionMode: task.permissionMode,
 		locale: task.locale,
 		runContext: task.runContext,
@@ -111,6 +122,7 @@ function draftFromTask(task: ScheduledTask): TaskDraft {
 		projectId: task.projectId ?? "",
 		chapterId: task.chapterId ?? "",
 		narratorMode: task.narratorMode,
+		reuseNarratorId: task.reuseNarratorId,
 		enabled: task.enabled,
 		timezone: task.timezone ?? "",
 	};
@@ -163,6 +175,7 @@ function ScheduledTasksPage() {
 			prompt: draft.prompt,
 			systemPrompt: draft.systemPrompt.trim() || null,
 			model: draft.model.trim() || null,
+			reasoningEffort: draft.reasoningEffort,
 			permissionMode: draft.permissionMode,
 			locale: draft.locale,
 			runContext: draft.runContext,
@@ -456,11 +469,58 @@ function TaskFormModal({
 }) {
 	const { t } = useTranslation("scheduledTasks");
 	const { t: tc } = useTranslation("common");
+	const { t: tn } = useTranslation("narrator");
 	const { data: projects = [] } = useProjects();
 	const { data: chapters = [] } = useChapters(
 		draft.runContext === "chapter" ? draft.projectId : "",
 	);
-	const { groupedModels } = useAllModels();
+	const { groupedModels, allModels, defaultModelValue, aggregations, settingsData } =
+		useAllModels();
+	const modelCardIndex = useModelCardIndex();
+	const { data: chapterNarrators, isPending: chapterNarratorsPending } = useNarrators({
+		chapterId: opened && draft.runContext === "chapter" ? draft.chapterId : undefined,
+	});
+	const reuseId =
+		draft.runContext === "chapter"
+			? chapterNarrators?.[0]?.id
+			: draft.narratorMode === "reuse"
+				? draft.reuseNarratorId
+				: null;
+	// Detail contains metadata, not message history. Do not fetch while the modal is closed.
+	const {
+		data: reuseNarrator,
+		isPending: reusePending,
+		error: reuseError,
+	} = useNarrator(opened ? (reuseId ?? "") : "");
+	const reusable =
+		reuseNarrator && (draft.runContext === "chapter" || reuseNarrator.status !== "archived");
+	const resolvedModel = resolveDisplayModel(
+		reusable ? (reuseNarrator.effectiveModel ?? reuseNarrator.model) : draft.model,
+		{ defaultModelValue, aggregations },
+	);
+	const modelOption = allModels.find((option) => option.value === resolvedModel);
+	const effort = getModelReasoningEffort({
+		model: resolvedModel,
+		modelOption,
+		settings: settingsData,
+		modelCardIndex,
+	});
+	const effortDisabled =
+		!modelOption ||
+		!effort.supported ||
+		(!!reuseId && reusePending && !reuseError) ||
+		(draft.runContext === "chapter" && !!draft.chapterId && chapterNarratorsPending);
+	const displayedEffort = displayedModelReasoningEffort(
+		resolvedModel,
+		draft.reasoningEffort,
+		settingsData?.agent?.defaultReasoningEffort || "max",
+		effort.options,
+	);
+	// Keep an unresolved reference and its desired effort intact; viewing a form must not rewrite them.
+	const effortOptions =
+		effortDisabled && draft.reasoningEffort && !effort.options.includes(draft.reasoningEffort)
+			? [...effort.options, draft.reasoningEffort]
+			: effort.options;
 
 	const patch = useCallback(
 		(p: Partial<TaskDraft>) => setDraft((d) => ({ ...d, ...p })),
@@ -691,17 +751,41 @@ function TaskFormModal({
 					/>
 				</Group>
 
-				<Select
-					label={t("model")}
-					description={t("modelDesc")}
-					data={groupedModels}
-					searchable
-					limit={MODEL_SELECT_OPTION_LIMIT}
-					value={draft.model || FOLLOW_DEFAULT_MODEL}
-					onChange={(v) => patch({ model: v && v !== FOLLOW_DEFAULT_MODEL ? v : "" })}
-					maxDropdownHeight={320}
-					comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
-				/>
+				<Group grow align="flex-start">
+					<Select
+						label={t("model")}
+						description={t("modelDesc")}
+						data={groupedModels}
+						searchable
+						limit={MODEL_SELECT_OPTION_LIMIT}
+						value={draft.model || FOLLOW_DEFAULT_MODEL}
+						onChange={(v) => patch({ model: v && v !== FOLLOW_DEFAULT_MODEL ? v : "" })}
+						maxDropdownHeight={320}
+						comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+					/>
+					<Select
+						label={t("reasoningEffort")}
+						description={t("reasoningEffortDesc")}
+						data={[
+							{ value: "", label: t("reasoningEffortDefault") },
+							...effortOptions.map((value) => ({
+								value,
+								label: tn(`reasoning_${value}`),
+							})),
+						]}
+						disabled={effortDisabled}
+						value={
+							draft.reasoningEffort == null
+								? ""
+								: effortDisabled
+									? draft.reasoningEffort
+									: displayedEffort
+						}
+						onChange={(v) => patch({ reasoningEffort: (v || null) as ReasoningEffort | null })}
+						clearable
+						clearButtonProps={{ "aria-label": t("reasoningEffortDefault") }}
+					/>
+				</Group>
 
 				<Select
 					label={t("permissionMode")}

@@ -7,6 +7,7 @@ import type {
 	FileChangeState,
 } from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { sql } from "drizzle-orm";
 import {
 	type AnySQLiteColumn,
@@ -4777,6 +4778,8 @@ export const scheduledTasks = sqliteTable(
 		systemPrompt: text("system_prompt"),
 		// Model id; null → follow default model.
 		model: text("model"),
+		// Per-run override; null preserves the narrator/global effort setting.
+		reasoningEffort: text("reasoning_effort").$type<ReasoningEffort>(),
 		// Permission mode for unattended execution; defaults to bypassPermissions.
 		permissionMode: text("permission_mode").notNull().default("bypassPermissions"),
 		locale: text("locale").$type<Locale>().notNull().default(DEFAULT_LOCALE),

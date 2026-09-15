@@ -1,3 +1,4 @@
+import type { ReasoningEffort } from "../../lib/agent";
 import type { ImageRef } from "../../lib/uploads";
 import type { CustomSubagentDef } from "../custom-subagent-service";
 import type { ExecuteLoopResult } from "../narrator-executor";
@@ -29,7 +30,9 @@ export interface SubagentRuntimeProfile {
 	control?: RuntimeForegroundControl;
 }
 
-export type RuntimeProfile = { kind: "primary" } | SubagentRuntimeProfile;
+export type RuntimeProfile =
+	| { kind: "primary"; reasoningEffort?: ReasoningEffort }
+	| SubagentRuntimeProfile;
 
 export type RuntimeInput =
 	| { kind: "current"; text: string; images?: ImageRef[] }

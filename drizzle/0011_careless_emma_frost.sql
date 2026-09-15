@@ -1,0 +1,1 @@
+ALTER TABLE `scheduled_tasks` ADD `reasoning_effort` text;

@@ -1,4 +1,5 @@
 import type { Locale } from "@shared/i18n-locales";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { request } from "./client";
 
 export type ScheduledTaskRunContext = "standalone" | "chapter";
@@ -15,6 +16,7 @@ export interface ScheduledTask {
 	prompt: string;
 	systemPrompt: string | null;
 	model: string | null;
+	reasoningEffort: ReasoningEffort | null;
 	permissionMode: string;
 	locale: ScheduledTaskLocale;
 	runContext: ScheduledTaskRunContext;
@@ -59,6 +61,7 @@ export interface ScheduledTaskInput {
 	prompt: string;
 	systemPrompt?: string | null;
 	model?: string | null;
+	reasoningEffort?: ReasoningEffort | null;
 	permissionMode?: string;
 	locale?: ScheduledTaskLocale;
 	runContext?: ScheduledTaskRunContext;

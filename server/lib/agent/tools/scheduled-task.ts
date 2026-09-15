@@ -1,4 +1,5 @@
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from "@shared/i18n-locales";
+import { REASONING_EFFORT_VALUES } from "@shared/reasoning-effort";
 import { z } from "zod/v4";
 import type { scheduledTasks } from "../../../db/schema";
 import { isValidCron, nextCronRun } from "../../cron";
@@ -83,6 +84,13 @@ const taskFieldsSchema = z.object({
 		.optional()
 		.describe("Extra system prompt for narrators this task creates."),
 	model: z.string().max(200).nullable().optional().describe("Model override for the run."),
+	reasoningEffort: z
+		.enum(REASONING_EFFORT_VALUES)
+		.nullable()
+		.optional()
+		.describe(
+			"Reasoning effort for each scheduled run only. Null follows the narrator/global setting; omitted on update leaves it unchanged.",
+		),
 	permissionMode: z
 		.enum(PERMISSION_MODES)
 		.optional()
@@ -180,6 +188,7 @@ function summarizeTask(task: TaskRow) {
 		runContext: task.runContext,
 		...(task.chapterId ? { chapterId: task.chapterId } : {}),
 		permissionMode: task.permissionMode,
+		reasoningEffort: task.reasoningEffort,
 		promptChars: task.prompt.length,
 		...(task.systemPrompt ? { systemPromptChars: task.systemPrompt.length } : {}),
 	};

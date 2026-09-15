@@ -52,6 +52,60 @@ describe("ScheduledTask argument validation", () => {
 		return scheduledTaskTool.execute(args, ctx);
 	}
 
+	test("accepts task effort tiers and null without inventing an override", () => {
+		for (const reasoningEffort of [null, "none", "low", "medium", "high", "xhigh", "max"]) {
+			const result = scheduledTaskTool.parameters.parse({
+				action: "update",
+				id: "t1",
+				task: { reasoningEffort },
+			});
+			expect(result).toMatchObject({ task: { reasoningEffort } });
+		}
+		const result = scheduledTaskTool.parameters.parse({
+			action: "update",
+			id: "t1",
+			task: { name: "x" },
+		});
+		expect(result).toMatchObject({ task: { name: "x" } });
+		expect((result as { task: object }).task).not.toHaveProperty("reasoningEffort");
+	});
+
+	test("round-trips task effort through create, list and update", async () => {
+		const created = await run({
+			action: "create",
+			task: {
+				name: "Effort test",
+				cronExpr: "0 9 * * *",
+				prompt: "test",
+				enabled: false,
+				reasoningEffort: "low",
+			},
+		});
+		expect(created.isError).toBeFalsy();
+		const task = JSON.parse(created.output);
+		try {
+			expect(task.reasoningEffort).toBe("low");
+			const listed = JSON.parse((await run({ action: "list" })).output);
+			expect(listed.find((row: { id: string }) => row.id === task.id)?.reasoningEffort).toBe("low");
+			const changed = await run({
+				action: "update",
+				id: task.id,
+				task: { reasoningEffort: "max" },
+			});
+			expect(JSON.parse(changed.output).reasoningEffort).toBe("max");
+			const cleared = await run({ action: "update", id: task.id, task: { reasoningEffort: null } });
+			expect(JSON.parse(cleared.output).reasoningEffort).toBeNull();
+		} finally {
+			await run({ action: "delete", id: task.id });
+		}
+	});
+
+	test("rejects an invalid task effort before reaching the service", async () => {
+		const result = await run({ action: "update", id: "t1", task: { reasoningEffort: "extreme" } });
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("reasoningEffort");
+	});
+
 	test("rejects an unknown action without reaching the service", async () => {
 		const result = await run({ action: "purge" });
 		expect(result.isError).toBe(true);

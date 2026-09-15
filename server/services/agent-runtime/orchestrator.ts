@@ -264,6 +264,8 @@ export async function runAgentLoopUnlocked(
 	profile: RuntimeProfile = { kind: "primary" },
 ): Promise<RuntimeRunOutcome> {
 	const { narratorId, locale } = active;
+	// Run-local only: never write this override into the reusable active session or DB.
+	const runReasoningEffort = profile.kind === "primary" ? profile.reasoningEffort : undefined;
 	const runState = createRuntimeRunState({ kind: "current", text, images }, profile);
 	const runtimePolicy = resolveRuntimePolicy(
 		profile.kind === "primary"
@@ -944,8 +946,9 @@ export async function runAgentLoopUnlocked(
 			};
 
 			const resolvedReasoningEffort =
-				freshNarrator.reasoningEffort ||
-				resolveDefaultReasoningEffort(resolved.provider, resolved.model);
+				runReasoningEffort ??
+				(freshNarrator.reasoningEffort ||
+					resolveDefaultReasoningEffort(resolved.provider, resolved.model));
 
 			// Resolved per turn, not frozen at creation: an "inherit" override follows
 			// the acting user's fastModeDefault preference, so flipping that default
@@ -1243,6 +1246,7 @@ export async function runAgentLoopUnlocked(
 					}
 
 					const runtimeReasoningEffort =
+						runReasoningEffort ??
 						active.reasoningEffort ??
 						resolveDefaultReasoningEffort(active.provider, active.model) ??
 						null;

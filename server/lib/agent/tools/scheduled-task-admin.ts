@@ -1,3 +1,4 @@
+import { REASONING_EFFORT_VALUES } from "@shared/reasoning-effort";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 import { errorResult, isAdminUser, requestWritePermission, truncateText } from "./admin-common";
@@ -42,6 +43,13 @@ const taskFieldsSchema = {
 		.optional()
 		.describe("Optional override system prompt"),
 	model: z.string().max(200).nullable().optional().describe("Optional narrator model"),
+	reasoningEffort: z
+		.enum(REASONING_EFFORT_VALUES)
+		.nullable()
+		.optional()
+		.describe(
+			"Reasoning effort for each scheduled run only. Null follows the narrator/global setting; omitted on update leaves it unchanged.",
+		),
 	permissionMode: z
 		.string()
 		.optional()
@@ -277,6 +285,7 @@ function sanitizeTask(task: Record<string, unknown>): Record<string, unknown> {
 		"cronExpr",
 		"timezone",
 		"model",
+		"reasoningEffort",
 		"permissionMode",
 		"runContext",
 		"cwd",

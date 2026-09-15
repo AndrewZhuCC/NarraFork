@@ -2561,6 +2561,7 @@ export async function runAgentLoop(
 	active: ActiveNarrator,
 	text: string,
 	images?: ImageRef[],
+	reasoningEffort?: ReasoningEffort,
 ): Promise<{ started: boolean }> {
 	const narratorId = active.narratorId;
 	if (narratorLoopAdmissions.has(narratorId) || narratorToolExecutionAdmissions.has(narratorId)) {
@@ -2579,7 +2580,7 @@ export async function runAgentLoop(
 			// Release and the final mailbox check form one synchronous owner transition.
 			let allowInboxWake = false;
 			const completion = withNarratorWorkAdmission(narratorId, () =>
-				runAgentLoopUnlocked(active, owner, text, images),
+				runAgentLoopUnlocked(active, owner, text, images, { kind: "primary", reasoningEffort }),
 			)
 				.then((result) => {
 					allowInboxWake = result.allowInboxWake ?? false;
@@ -2650,6 +2651,7 @@ async function feedMessageUnlocked(
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	reasoningEffort?: ReasoningEffort,
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -2884,7 +2886,7 @@ async function feedMessageUnlocked(
 					signal: active.abortController.signal,
 				},
 			);
-			runAgentLoop(active, "", undefined).catch(async (err) => {
+			runAgentLoop(active, "", undefined, reasoningEffort).catch(async (err) => {
 				const diagnostics = diagnosticsFromError(err);
 				logger.error("runAgentLoop unhandled error", {
 					narratorId,
@@ -2911,6 +2913,7 @@ async function feedMessageUnlocked(
 			active,
 			projectFileReferenceText(effectivePrompt, acceptedReferences),
 			images,
+			reasoningEffort,
 		).catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
@@ -3189,6 +3192,7 @@ export async function sendMessage(
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	reasoningEffort?: ReasoningEffort,
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const narrator = await narratorService.getById(narratorId);
@@ -3208,6 +3212,7 @@ export async function sendMessage(
 		undefined,
 		origin,
 		acceptedReferences,
+		reasoningEffort,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {

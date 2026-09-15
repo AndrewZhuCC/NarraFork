@@ -3,6 +3,7 @@ import { formatOriginLabel } from "@shared/message-origin";
 import { and, asc, desc, eq, lt, lte } from "drizzle-orm";
 import { db } from "../db";
 import { scheduledTaskRuns, scheduledTasks, users } from "../db/schema";
+import type { ReasoningEffort } from "../lib/agent";
 import { AsyncMutex } from "../lib/async-mutex";
 import { nextCronRun } from "../lib/cron";
 import { NotFoundError, ValidationError } from "../lib/errors";
@@ -44,6 +45,7 @@ export interface CreateScheduledTaskInput {
 	prompt: string;
 	systemPrompt?: string | null;
 	model?: string | null;
+	reasoningEffort?: ReasoningEffort | null;
 	permissionMode?: string;
 	locale?: Locale;
 	runContext?: "standalone" | "chapter";
@@ -154,6 +156,7 @@ export const scheduledTaskService = {
 			prompt: input.prompt,
 			systemPrompt: input.systemPrompt ?? null,
 			model: input.model ?? null,
+			reasoningEffort: input.reasoningEffort ?? null,
 			permissionMode: input.permissionMode ?? "bypassPermissions",
 			locale: input.locale ?? DEFAULT_LOCALE,
 			runContext,
@@ -213,6 +216,7 @@ export const scheduledTaskService = {
 			...(input.prompt !== undefined && { prompt: input.prompt }),
 			...(input.systemPrompt !== undefined && { systemPrompt: input.systemPrompt }),
 			...(input.model !== undefined && { model: input.model }),
+			...(input.reasoningEffort !== undefined && { reasoningEffort: input.reasoningEffort }),
 			...(input.permissionMode !== undefined && { permissionMode: input.permissionMode }),
 			...(input.locale !== undefined && { locale: input.locale }),
 			...(input.runContext !== undefined && { runContext: input.runContext }),
@@ -539,6 +543,8 @@ export const scheduledTaskService = {
 			undefined,
 			null,
 			{ origin: "system", originLabel: formatOriginLabel("scheduledTask", task.name) },
+			undefined,
+			task.reasoningEffort ?? undefined,
 		);
 
 		return { status: "success", narratorId, reuseNarratorId: newReuseId };

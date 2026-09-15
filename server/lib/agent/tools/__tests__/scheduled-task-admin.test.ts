@@ -153,6 +153,37 @@ describe("ScheduledTaskAdmin tool", () => {
 		expect(calls).toHaveLength(0);
 	});
 
+	test("creates, updates and clears effort without mutating it on unrelated updates", async () => {
+		const { service, tasks } = makeService();
+		const tool = createScheduledTaskAdminTool({ service, isAdminUser: () => true });
+		const created = await tool.execute({ ...VALID_CREATE, reasoningEffort: "low" }, makeCtx());
+		expect(created.isError).toBeFalsy();
+		expect(JSON.parse(created.output)).toMatchObject({ reasoningEffort: "low" });
+		await tool.execute({ action: "update", id: "t1", name: "renamed" }, makeCtx());
+		expect(tasks.get("t1")?.reasoningEffort).toBe("low");
+		const changed = await tool.execute(
+			{ action: "update", id: "t1", reasoningEffort: "max" },
+			makeCtx(),
+		);
+		expect(JSON.parse(changed.output)).toMatchObject({ reasoningEffort: "max" });
+		const cleared = await tool.execute(
+			{ action: "update", id: "t1", reasoningEffort: null },
+			makeCtx(),
+		);
+		expect(cleared.isError).toBeFalsy();
+		expect(JSON.parse(cleared.output)).toMatchObject({ reasoningEffort: null });
+		expect(tasks.get("t1")?.reasoningEffort).toBeNull();
+	});
+
+	test("rejects invalid effort without creating a task", async () => {
+		const { service, calls } = makeService();
+		const tool = createScheduledTaskAdminTool({ service, isAdminUser: () => true });
+		const result = await tool.execute({ ...VALID_CREATE, reasoningEffort: "extreme" }, makeCtx());
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("reasoningEffort");
+		expect(calls).toHaveLength(0);
+	});
+
 	test("creates a task for admins after approval", async () => {
 		const { service, calls, tasks } = makeService();
 		const tool = createScheduledTaskAdminTool({ service, isAdminUser: () => true });

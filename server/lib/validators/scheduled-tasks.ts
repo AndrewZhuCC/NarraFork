@@ -1,3 +1,4 @@
+import { REASONING_EFFORT_VALUES } from "@shared/reasoning-effort";
 import { z } from "zod";
 import { isValidCron } from "../cron";
 import { permissionModeSchema } from "../permission-modes";
@@ -13,6 +14,7 @@ const baseFields = {
 	prompt: z.string().min(1).max(50000),
 	systemPrompt: z.string().max(10000).optional().nullable(),
 	model: z.string().max(200).optional().nullable(),
+	reasoningEffort: z.enum(REASONING_EFFORT_VALUES).nullable().optional(),
 	permissionMode: permissionModeSchema.optional(),
 	locale: localeSchema.optional(),
 	runContext: runContextEnum.optional(),

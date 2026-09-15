@@ -57,6 +57,109 @@ function session(id: string, model: string, provider: string): ActiveNarrator {
 	};
 }
 
+describe("run-local reasoning effort", () => {
+	test("a competing launch cannot apply its override to the current owner", async () => {
+		const id = "retry-primary";
+		const active = session(id, "unused:model", "unused");
+		active.reasoningEffort = "medium";
+		active._reasoningEffortRef = "medium";
+		activeNarrators.set(id, active);
+		const owner = tryClaimExecution(id, "primary");
+		if (!owner) throw new Error("Missing current owner");
+		const execute = spyOn(executor, "executeAgentLoop");
+		const { runAgentLoop } = await import("../narrator-session");
+		expect(await runAgentLoop(active, "scheduled", undefined, "high")).toEqual({ started: false });
+		expect(execute).not.toHaveBeenCalled();
+		expect(getExecutionOwner(id)?.epoch).toBe(owner.epoch);
+		expect(active.reasoningEffort).toBe("medium");
+		expect(active._reasoningEffortRef).toBe("medium");
+	});
+	for (const narratorEffort of [null, "medium"] as const) {
+		test(`serial low/high/inherit preserves narrator ${narratorEffort} and settings refresh`, async () => {
+			const prefix = "runtime_effort";
+			const model = `${prefix}:gpt-5`;
+			settings.openaiProviders = [
+				{
+					id: prefix,
+					name: prefix,
+					prefix,
+					apiKey: "test-only",
+					baseUrl: "https://example.invalid/v1",
+					defaultModel: "gpt-5",
+					apiMode: "responses",
+				},
+			];
+			const id = "retry-primary";
+			const now = new Date().toISOString();
+			await db.insert(narrators).values({
+				id,
+				model,
+				reasoningEffort: narratorEffort,
+				autoContinuationOverride: "off",
+				cwd: process.env.HOME,
+				createdAt: now,
+				updatedAt: now,
+			});
+			await narratorService.persistSystemMessage(id, marker);
+			const active = session(id, model, prefix);
+			activeNarrators.set(id, active);
+			for (const effort of ["low", "high", undefined] as const) {
+				active.alive = true;
+				active.abortController = new AbortController();
+				const baseline =
+					narratorEffort ??
+					(await import("../../lib/settings")).resolveDefaultReasoningEffort(prefix, model);
+				const expected = effort ?? baseline;
+				let calls = 0;
+				spyOn(executor, "executeAgentLoop").mockImplementation(async ({ config }) => {
+					calls++;
+					expect(config.reasoningEffort).toBe(expected);
+					for (const revision of [active._settingsRevision, -1]) {
+						active._settingsRevision = revision;
+						const next = config.getRuntimeSettingsOverride?.();
+						expect(next?.reasoningEffort ?? config.reasoningEffort).toBe(expected);
+						expect(active._reasoningEffortRef).toBe(narratorEffort);
+						expect(active.reasoningEffort).toBe(baseline ?? null);
+					}
+					return calls === 1
+						? {
+								finalText: "",
+								hasError: false,
+								shouldUpdateTitle: false,
+								retryableError: "temporary failure",
+							}
+						: {
+								finalText: "done",
+								hasError: false,
+								shouldUpdateTitle: false,
+								completedNaturally: true,
+								completedAssistantTurn: true,
+							};
+				});
+				spyOn(recovery, "handleTransientError").mockResolvedValue({
+					shouldRetry: true,
+					delayMs: 0,
+				});
+				const owner = tryClaimExecution(id, "primary");
+				if (!owner) throw new Error("Missing effort owner");
+				try {
+					const outcome = await runAgentLoopUnlocked(active, owner, "", undefined, {
+						kind: "primary",
+						reasoningEffort: effort,
+					});
+					expect(outcome.finalText).toBe("done");
+				} finally {
+					owner.release();
+				}
+				expect(calls).toBe(2);
+				expect(
+					(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.reasoningEffort,
+				).toBe(narratorEffort);
+			}
+		});
+	}
+});
+
 describe("provider retry policy is identical through the real primary and child runtime", () => {
 	for (const kind of ["primary", "subagent"] as const) {
 		for (const mode of ["responses", "anthropic"] as const) {
