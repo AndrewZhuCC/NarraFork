@@ -69,6 +69,7 @@ export const DEFAULTS: NarraForkSettings = {
 		freshShellEnv: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
+		cacheDropDumpEnabled: false,
 		// 32MB. Enabling dumping is an explicit, warned, high-risk opt-in made to capture
 		// a specific failure, so the ceiling must be high enough that a real request —
 		// full conversation history, replayed tool output, inline images — survives intact.
@@ -499,6 +500,10 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"agent.requestDumpErrorsOnly": {
 		desc: "启用后仅为报错的模型/API 请求持久化原始请求与响应 dump，成功请求不会保存 dump。",
+		type: "boolean",
+	},
+	"agent.cacheDropDumpEnabled": {
+		desc: "缓存骤降诊断：按叙述者滚动保留最近 3 次请求样本，骤降时保留前后样本，独立于全量 dump。包含对话正文，应按敏感数据保管。路径 ~/.narrafork/request-dumps/cache-diagnostics/，全局上限 256 MiB，保留 7 天。关闭后停止捕获并清理正常滚动样本，异常样本保留到过期或空间淘汰。默认关闭。",
 		type: "boolean",
 	},
 	"agent.requestDumpMaxSize": {

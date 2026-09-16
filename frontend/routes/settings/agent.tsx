@@ -48,6 +48,8 @@ function SettingsAgentPage() {
 				setRequestDumpEnabled={is.setRequestDumpEnabled}
 				requestDumpErrorsOnly={is.requestDumpErrorsOnly}
 				setRequestDumpErrorsOnly={is.setRequestDumpErrorsOnly}
+				cacheDropDumpEnabled={is.cacheDropDumpEnabled}
+				setCacheDropDumpEnabled={is.setCacheDropDumpEnabled}
 				defaultNarratorVisibility={is.defaultNarratorVisibility}
 				setDefaultNarratorVisibility={is.setDefaultNarratorVisibility}
 				defaultNarratorWriteAudience={is.defaultNarratorWriteAudience}

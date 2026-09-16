@@ -1385,6 +1385,11 @@ import { startSkillCacheCleanupTimer } from "./services/skill-service";
 
 startSkillCacheCleanupTimer();
 
+// Cache incident retention remains bounded even while capture is switched off.
+import { startCacheDropMaintenance } from "./lib/cache-drop-diagnostics";
+
+startCacheDropMaintenance();
+
 // Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
 import { startChallengeCleanupTimer } from "./lib/webauthn";
 

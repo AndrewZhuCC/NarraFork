@@ -12,6 +12,9 @@
 
 import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { z } from "zod/v4";
+import { shouldPersistRawDump } from "../../api-request-tracker";
+import { CacheDropDumpStore } from "../../cache-drop-dump-store";
+import { settings } from "../../settings";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import { dangerCancelTool, dangerConfirmTool } from "../tools/danger-reflection";
@@ -157,6 +160,83 @@ function systemEntries(history: unknown[]): string[] {
 }
 
 describe("reflection loop cacheable prefix", () => {
+	test.each([
+		false,
+		true,
+	])("cache-drop capture is independent of full dumping (enabled=%s)", async (enabled) => {
+		const previous = {
+			enabled: settings.agent.cacheDropDumpEnabled,
+			full: settings.agent.requestDumpEnabled,
+		};
+		settings.agent.cacheDropDumpEnabled = enabled;
+		settings.agent.requestDumpEnabled = false;
+		const records = spyOn(CacheDropDumpStore.prototype, "record").mockResolvedValue(undefined);
+		const collectors: boolean[] = [];
+		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
+			collectors.push(!!params.requestDump);
+			params.requestDump?.beginResponseAttempt({
+				transport: "http",
+				body: { history: params.history, content: params.content },
+			});
+			params.requestDump?.setResponseBodyText("actual response");
+			params.onRequestStart?.();
+			if (params.content === "normal diagnostic") {
+				yield {
+					text: "done",
+					usage: { promptTokens: 10000, inputTokens: 10000, completionTokens: 1 },
+				};
+			} else {
+				yield {
+					toolUses: [
+						{ toolUseId: "tu-diagnostic", name: DECISION_TOOL_NAME, input: { value: "ok" } },
+					],
+					usage: {
+						promptTokens: 10000,
+						inputTokens: 10000,
+						completionTokens: 1,
+						cachedInputTokens: 9000,
+					},
+				};
+			}
+		});
+		try {
+			for await (const _event of agentLoop(
+				{ ...parentConfig(), maxTurns: 1 },
+				"normal diagnostic",
+				[],
+			)) {
+				/* drain */
+			}
+			await runReflectionLoop({
+				parentConfig: parentConfig(),
+				history: parentHistory(),
+				prompt: "diagnostic reflection",
+				reflectionLoop: {
+					allowedTools: [DECISION_TOOL_NAME],
+					context: { kind: "taskReflection", requestId: "diagnostic" },
+				},
+				label: "diagnostic",
+			});
+			expect(collectors).toEqual([enabled, enabled]);
+			expect(records).toHaveBeenCalledTimes(enabled ? 2 : 0);
+			if (enabled) {
+				const normal = records.mock.calls[0][0];
+				const reflection = records.mock.calls[1][0];
+				expect(normal.kind).toBe("narrator");
+				expect(normal.cachedInputTokens).toBeUndefined();
+				expect(reflection.kind).toBe("reflection");
+				expect(reflection.cachedInputTokens).toBe(9000);
+				expect(reflection.narratorId).toBe(normal.narratorId);
+				expect(reflection.conversationId).toBe(normal.conversationId);
+				expect(shouldPersistRawDump({ rawDump: normal.dump })).toBe(false);
+			}
+		} finally {
+			chat.mockRestore();
+			records.mockRestore();
+			settings.agent.cacheDropDumpEnabled = previous.enabled;
+			settings.agent.requestDumpEnabled = previous.full;
+		}
+	});
 	test("predeclares reflection definitions separately from active tools", async () => {
 		let declarations: unknown[] | undefined;
 		let active: unknown;

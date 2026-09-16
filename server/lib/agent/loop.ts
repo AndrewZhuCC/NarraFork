@@ -7,6 +7,7 @@ import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
 import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
 import { type DangerReflectionLevel, resolveBooleanOverride } from "../boolean-override";
+import { recordCacheDropDiagnostic, resetCacheDropBaseline } from "../cache-drop-diagnostics";
 import { logger } from "../logger";
 import { buildPlanFileRelPath, isPlanAuthoringPath, PLAN_DIR_REL } from "../plan-file-path";
 import { getPrompt, getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
@@ -38,7 +39,7 @@ import {
 	writeMalformedRequestDump,
 } from "./malformed-request-dump";
 import { type ChatParams, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
-import { ApiRequestDumpCollector } from "./request-dump";
+import { ApiRequestDumpCollector, CACHE_DIAGNOSTIC_DUMP_MAX_BYTES } from "./request-dump";
 import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
@@ -2731,6 +2732,7 @@ export async function* agentLoop(
 	let historyToolUseIds = collectToolUseIdsFromHistory(history, initialToolResults);
 
 	function applyHistoryReplacement(replacement: AgentHistoryReplacement) {
+		resetCacheDropBaseline(config.narratorId);
 		resetUpstreamSessionOnNextRequest = true;
 		history = replacement.history;
 		sourceInputHistory = replacement.history;
@@ -3166,6 +3168,7 @@ export async function* agentLoop(
 			let completionLimitMessage: string | undefined;
 			let requestDiagnostics: ApiRequestDiagnostics | undefined;
 			let requestDump: ApiRequestDumpCollector | undefined;
+			let cacheDiagnosticEnabled = false;
 			/**
 			 * Set when leaked XML tool calls are detected this turn (recovered or unrecovered),
 			 * forcing the raw dump to persist regardless of the errors-only setting so the SSE
@@ -3338,6 +3341,33 @@ export async function* agentLoop(
 						})
 					: undefined;
 				requestDump?.setDiagnostics(diagnostics);
+				const dumpSnapshot = requestDump?.snapshot();
+				if (
+					cacheDiagnosticEnabled &&
+					requestDump &&
+					dumpSnapshot &&
+					settings.agent.cacheDropDumpEnabled
+				) {
+					void recordCacheDropDiagnostic({
+						requestId,
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						kind: config.reflectionLoop ? "reflection" : "narrator",
+						conversationId: config.conversationId,
+						contextEpoch: config.knowledgeInjectionCompactSeq ?? undefined,
+						createdAt: new Date().toISOString(),
+						startedAt: requestStartTime,
+						inputTokens: requestUsage?.inputTokens ?? requestUsage?.promptTokens ?? 0,
+						// Do not turn absent usage into a false zero-cache incident.
+						cachedInputTokens: requestUsage?.cachedInputTokens,
+						errorMessage,
+						dump:
+							requestDump.maxCaptureBytes === undefined
+								? requestDump.snapshot(CACHE_DIAGNOSTIC_DUMP_MAX_BYTES)
+								: dumpSnapshot,
+					});
+				}
 				yield {
 					type: "api_request_end",
 					requestId,
@@ -3360,7 +3390,7 @@ export async function* agentLoop(
 					meterUnit: requestMeterUnit,
 					// The dump wins whenever one exists: `malformedRequestRecord` is only set on
 					// the no-collector path, where it is the sole record of the rejection.
-					rawDump: requestDump?.snapshot() ?? malformedRequestRecord,
+					rawDump: dumpSnapshot ?? malformedRequestRecord,
 					errorMessage,
 					diagnostics,
 					forceDumpPersist,
@@ -3825,12 +3855,15 @@ export async function* agentLoop(
 				// may leak XML tool calls (NUG) so leaked-tool diagnostics always have a
 				// bounded raw dump to persist on detection. Providers write bodyText/events through
 				// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
+				cacheDiagnosticEnabled = settings.agent.cacheDropDumpEnabled && !!config.narratorId;
+				const fullCapture = settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls;
 				requestDump =
-					settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls
-						? new ApiRequestDumpCollector({
-								provider: effectiveProvider,
-								model: effectiveModel,
-							})
+					fullCapture || cacheDiagnosticEnabled
+						? new ApiRequestDumpCollector(
+								{ provider: effectiveProvider, model: effectiveModel },
+								fullCapture ? undefined : CACHE_DIAGNOSTIC_DUMP_MAX_BYTES,
+								cacheDiagnosticEnabled,
+							)
 						: undefined;
 
 				const attemptAbort = new AbortController();

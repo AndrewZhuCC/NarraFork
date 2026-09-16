@@ -1,8 +1,11 @@
+import { sliceToUtf8Budget, utf8Bytes } from "../utf8-budget";
 import type { ApiRequestDiagnostics } from "./types";
 
 export interface ApiRequestDump {
 	provider?: string;
 	model?: string;
+	/** A diagnostic capture exceeded its byte, node, or depth budget. */
+	captureTruncated?: boolean;
 	diagnostics?: ApiRequestDiagnostics;
 	/**
 	 * Annotation attached by a special-case capture (currently only the upstream
@@ -201,10 +204,85 @@ export function sanitizeHeaders(
 	);
 }
 
+/** Independent diagnostic budget; turning on diagnosis must not retain unbounded bodies. */
+export const CACHE_DIAGNOSTIC_DUMP_MAX_BYTES = 4 * 1024 * 1024;
+
+/** Copy only a bounded JSON prefix, without first serializing the unbounded source. */
+function boundedJsonCopy<T>(value: T, maxBytes: number): { value: T; truncated: boolean } {
+	let remaining = Math.max(0, maxBytes - 128);
+	let nodes = 50_000;
+	let truncated = false;
+	const seen = new WeakSet<object>();
+	const copy = (item: unknown, depth: number): unknown => {
+		if (remaining < 16 || --nodes < 0 || depth > 64) {
+			truncated = true;
+			return undefined;
+		}
+		if (typeof item === "string") {
+			// Only stringify a bounded candidate (JSON escaping costs at most 6 bytes/unit).
+			let text = item.slice(0, remaining);
+			let cost = utf8Bytes(JSON.stringify(text));
+			if (cost > remaining) {
+				text = sliceToUtf8Budget(item, Math.max(0, Math.floor((remaining - 2) / 6)));
+				cost = utf8Bytes(JSON.stringify(text));
+			}
+			truncated ||= text.length !== item.length;
+			remaining -= cost;
+			return text;
+		}
+		if (item === undefined) return undefined;
+		if (item === null || typeof item === "boolean" || typeof item === "number") {
+			remaining -= 24; // conservative bound, including finite double representation
+			return typeof item === "number" && !Number.isFinite(item) ? null : (item ?? null);
+		}
+		if (typeof item !== "object" || seen.has(item)) {
+			truncated = true;
+			return undefined;
+		}
+		seen.add(item);
+		remaining -= 2;
+		let result: unknown[] | Record<string, unknown>;
+		if (Array.isArray(item)) {
+			result = [];
+			for (let i = 0; i < item.length; i++) {
+				if (remaining < 32 || nodes <= 0) {
+					truncated = true;
+					break;
+				}
+				remaining -= 5; // separator plus a possible null placeholder
+				result.push(copy(item[i], depth + 1) ?? null);
+			}
+		} else {
+			result = Object.create(null) as Record<string, unknown>;
+			for (const key in item) {
+				if (!Object.hasOwn(item, key)) continue;
+				if (remaining < 32 || nodes <= 0 || key.length > remaining / 6) {
+					truncated = true;
+					break;
+				}
+				remaining -= utf8Bytes(JSON.stringify(key)) + 2;
+				const child = copy((item as Record<string, unknown>)[key], depth + 1);
+				if (child !== undefined) result[key] = child;
+			}
+		}
+		seen.delete(item);
+		return result;
+	};
+	return { value: copy(value, 0) as T, truncated };
+}
+
 export class ApiRequestDumpCollector {
 	private dump: ApiRequestDump;
 	private responseCapture?: BoundedUtf8Capture;
 	private responseBudgetUsed = 0;
+	private captureTruncated = false;
+
+	private copy<T>(value: T, maxBytes = this.maxCaptureBytes): T {
+		if (maxBytes === undefined) return toJsonSafe(value);
+		const bounded = boundedJsonCopy(value, maxBytes);
+		this.captureTruncated ||= bounded.truncated;
+		return bounded.value;
+	}
 
 	beginResponseAttempt(
 		request: NonNullable<ApiRequestDump["request"]>,
@@ -228,7 +306,11 @@ export class ApiRequestDumpCollector {
 		}
 		this.responseBudgetUsed += this.responseCapture?.kept ?? 0;
 		this.responseCapture = new BoundedUtf8Capture(
-			Math.max(0, responseDumpBudget(maxBytes) - this.responseBudgetUsed),
+			Math.max(
+				0,
+				Math.min(responseDumpBudget(maxBytes), this.maxCaptureBytes ?? HARD_DUMP_MAX_BYTES) -
+					this.responseBudgetUsed,
+			),
 		);
 		this.dump.response = { bodyIncomplete: true };
 		this.setRequest(request);
@@ -254,18 +336,26 @@ export class ApiRequestDumpCollector {
 		});
 	}
 
-	constructor(initial?: ApiRequestDump) {
-		this.dump = toJsonSafe(initial ?? {});
+	constructor(
+		initial?: ApiRequestDump,
+		readonly maxCaptureBytes?: number,
+		private readonly retainInitialRequest = maxCaptureBytes !== undefined,
+	) {
+		this.dump = this.copy(initial ?? {});
 	}
 
 	setRequest(request: NonNullable<ApiRequestDump["request"]>): void {
-		this.dump.request = toJsonSafe(request);
+		// In diagnostic mode retain the logical full WS request before its wire delta replaces it.
+		if (this.retainInitialRequest && this.dump.request) {
+			this.dump.initialRequest ??= this.dump.request;
+		}
+		this.dump.request = this.copy({ ...request, headers: sanitizeHeaders(request.headers) });
 	}
 
 	setResponseMeta(response: Partial<NonNullable<ApiRequestDump["response"]>>): void {
 		this.dump.response = {
 			...(this.dump.response ?? {}),
-			...toJsonSafe(response),
+			...this.copy(response),
 		};
 	}
 
@@ -285,7 +375,7 @@ export class ApiRequestDumpCollector {
 	}
 
 	setResponseEvents(events: unknown[]): void {
-		this.setResponseMeta({ events: toJsonSafe(events) });
+		this.setResponseMeta({ events: this.copy(events) });
 	}
 
 	/**
@@ -295,7 +385,12 @@ export class ApiRequestDumpCollector {
 	 * elements are kept and a truncation marker is appended.
 	 */
 	setResponseEventsWithLimit(events: unknown[], maxCount: number, maxBytes: number): void {
-		const safe = toJsonSafe(events);
+		const safe = this.copy(
+			events,
+			this.maxCaptureBytes === undefined
+				? undefined
+				: Math.min(this.maxCaptureBytes, responseDumpBudget(maxBytes)),
+		);
 		if (!Array.isArray(safe)) {
 			this.setResponseMeta({ events: safe });
 			return;
@@ -333,7 +428,7 @@ export class ApiRequestDumpCollector {
 
 	setDiagnostics(diagnostics: ApiRequestDiagnostics | undefined): void {
 		if (!diagnostics) return;
-		this.dump.diagnostics = toJsonSafe(diagnostics);
+		this.dump.diagnostics = this.copy(diagnostics);
 	}
 
 	/**
@@ -344,11 +439,21 @@ export class ApiRequestDumpCollector {
 	 */
 	setCapture(capture: unknown): void {
 		if (capture == null) return;
-		this.dump.capture = toJsonSafe(capture);
+		this.dump.capture = this.copy(capture);
 	}
 
-	snapshot(): ApiRequestDump {
+	snapshot(maxBytes = this.maxCaptureBytes): ApiRequestDump {
 		this.flushResponseCapture();
-		return toJsonSafe(this.dump);
+		if (maxBytes === undefined) return toJsonSafe(this.dump);
+		// Prefer request evidence when the combined response/attempts exceed the snapshot budget.
+		const { initialRequest, request, response, attempts, ...metadata } = this.dump;
+		const bounded = boundedJsonCopy(
+			{ ...metadata, initialRequest, request, response, attempts },
+			maxBytes,
+		);
+		return {
+			...bounded.value,
+			...(this.captureTruncated || bounded.truncated ? { captureTruncated: true } : {}),
+		};
 	}
 }

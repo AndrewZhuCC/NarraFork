@@ -66,6 +66,8 @@ export interface AgentSectionProps {
 	setRequestDumpEnabled: (v: boolean) => void;
 	requestDumpErrorsOnly: boolean;
 	setRequestDumpErrorsOnly: (v: boolean) => void;
+	cacheDropDumpEnabled: boolean;
+	setCacheDropDumpEnabled: (v: boolean) => void;
 	defaultNarratorVisibility: DefaultNarratorVisibility;
 	setDefaultNarratorVisibility: (v: DefaultNarratorVisibility) => void;
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
@@ -262,6 +264,12 @@ export function AgentSection(props: AgentSectionProps) {
 					checked={props.requestDumpErrorsOnly}
 					disabled={!props.requestDumpEnabled}
 					onChange={(e) => props.setRequestDumpErrorsOnly(e.currentTarget.checked)}
+				/>
+				<Switch
+					label={t("cacheDropDumpEnabled")}
+					description={t("cacheDropDumpEnabledDesc")}
+					checked={props.cacheDropDumpEnabled}
+					onChange={(e) => props.setCacheDropDumpEnabled(e.currentTarget.checked)}
 				/>
 				<Modal
 					opened={dumpWarningOpen}

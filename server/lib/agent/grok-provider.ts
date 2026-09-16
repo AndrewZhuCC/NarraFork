@@ -28,7 +28,7 @@ import type {
 	ParsedStreamEvent,
 	ProviderAdapter,
 } from "./provider";
-import { sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -231,12 +231,19 @@ export class GrokProvider implements ProviderAdapter {
 		if (tools.length > 0) body.tools = tools;
 
 		const headers = this.buildHeaders(apiKey);
-		params.requestDump?.setRequest({
+		const dumpRequest = {
 			transport: "http",
 			url: `${baseUrl}/responses`,
 			headers: sanitizeHeaders(headers),
 			body,
-		});
+		};
+		const diagnosticDump =
+			params.requestDump?.maxCaptureBytes !== undefined ? params.requestDump : undefined;
+		if (diagnosticDump) {
+			diagnosticDump.beginResponseAttempt(dumpRequest, diagnosticDump.maxCaptureBytes);
+		} else {
+			params.requestDump?.setRequest(dumpRequest);
+		}
 		logger.debug("Grok chat request", {
 			model,
 			baseUrl,
@@ -254,15 +261,17 @@ export class GrokProvider implements ProviderAdapter {
 			body: JSON.stringify(body),
 			signal: params.signal,
 		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
+		// Only diagnostic capture uses the bounded tap; legacy full-dump buffering is unchanged.
+		const responseTextPromise =
+			params.requestDump && !diagnosticDump
+				? response
+						.clone()
+						.text()
+						.catch((error) => {
+							params.requestDump?.setResponseError(error);
+							return "";
+						})
+				: undefined;
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
@@ -270,7 +279,12 @@ export class GrokProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
+			if (diagnosticDump) {
+				diagnosticDump.appendResponseText(errText);
+				diagnosticDump.finishResponseCapture(true);
+			} else {
+				params.requestDump?.setResponseBodyText(errText);
+			}
 			throw new ApiError(
 				response.status,
 				`Grok API error ${response.status}: ${errText}`,
@@ -281,7 +295,12 @@ export class GrokProvider implements ProviderAdapter {
 			throw new Error("Grok API returned no body");
 		}
 
-		yield* this.parseResponsesStream(response.body);
+		const capture = captureResponseStream(response.body, diagnosticDump);
+		try {
+			yield* this.parseResponsesStream(capture.stream);
+		} finally {
+			capture.finish();
+		}
 		if (responseTextPromise) {
 			const bodyText = await responseTextPromise;
 			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;

@@ -14,6 +14,62 @@ import {
 	sanitizeHeaders,
 } from "../request-dump";
 
+describe("bounded diagnostic capture", () => {
+	test("preserves the logical WS request and the actual frame without modifying either", () => {
+		const collector = new ApiRequestDumpCollector({ provider: "openai" }, 4096);
+		const full = { transport: "websocket", body: { input: [{ role: "user", content: "before" }] } };
+		const delta = {
+			transport: "websocket",
+			body: { input: [], previous_response_id: "resp-before" },
+		};
+		collector.beginResponseAttempt(full, 4096);
+		collector.setRequest(delta);
+		full.body.input[0].content = "changed later";
+		collector.appendResponseText("completed");
+		collector.finishResponseCapture(true);
+		const result = collector.snapshot();
+		expect(result.initialRequest?.body).toEqual({ input: [{ role: "user", content: "before" }] });
+		expect(result.request?.body).toEqual(delta.body);
+		expect(result.response?.bodyText).toBe("completed");
+		expect(result.captureTruncated).toBeUndefined();
+	});
+
+	test("bounds request, response and combined UTF8 snapshot including escaped strings", () => {
+		const collector = new ApiRequestDumpCollector({}, 1024);
+		collector.beginResponseAttempt(
+			{
+				body: { text: '中文😀\\"\n'.repeat(10000) },
+				headers: { Authorization: "Bearer secret-value" },
+			},
+			32 * 1024 * 1024,
+		);
+		collector.appendResponseText("x".repeat(10000));
+		collector.finishResponseCapture(true);
+		const result = collector.snapshot();
+		expect(result.captureTruncated).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(1024);
+		expect(JSON.stringify(result)).not.toContain("secret-value");
+	});
+
+	test("bounded snapshot is independently available without changing normal full-dump retention", () => {
+		const collector = new ApiRequestDumpCollector();
+		collector.setRequest({ body: { text: "x".repeat(10000) } });
+		expect(collector.snapshot(1024).captureTruncated).toBe(true);
+		expect(collector.snapshot().request?.body).toEqual({ text: "x".repeat(10000) });
+		expect(collector.snapshot().captureTruncated).toBeUndefined();
+	});
+
+	test("depth and node limits stop pathological request graphs", () => {
+		const collector = new ApiRequestDumpCollector({}, 4096);
+		const circular: Record<string, unknown> = { input: Array(100000).fill(null) };
+		circular.self = circular;
+		collector.setRequest({ body: circular });
+		const result = collector.snapshot();
+		expect(result.captureTruncated).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4096);
+	});
+});
+
 describe("incremental response capture", () => {
 	test("UTF8 byte boundaries preserve prefixes and seal on truncation", () => {
 		const c = new BoundedUtf8Capture(5);

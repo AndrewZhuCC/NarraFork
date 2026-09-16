@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { AnthropicProvider } from "../anthropic-provider";
+import { GrokProvider } from "../grok-provider";
 import type { ChatParams, ParsedStreamEvent } from "../provider";
+import { ApiRequestDumpCollector, HARD_DUMP_MAX_BYTES } from "../request-dump";
 
 /**
  * NUG injects its own gateway events (credit consumption, context-window
@@ -80,6 +82,149 @@ const MIXED_SSE =
 	'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n' +
 	'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n' +
 	'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+describe.each(["anthropic", "grok"] as const)("%s bounded diagnostic response capture", (kind) => {
+	const config = {
+		id: "diagnostic-test",
+		prefix: "diagnostic-test",
+		baseUrl: "https://gateway.invalid/v1",
+		apiKey: "test-key",
+		officialApi: false,
+	};
+	const provider =
+		kind === "anthropic"
+			? new AnthropicProvider(config as never)
+			: new GrokProvider(config as never);
+	const textFrame =
+		kind === "anthropic"
+			? 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n'
+			: 'data: {"type":"response.output_text.delta","delta":"hello"}\n\n';
+	const usageFrame =
+		kind === "anthropic"
+			? 'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":30,"output_tokens":2}}\n\n'
+			: 'data: {"type":"response.completed","response":{"usage":{"prompt_tokens":30,"completion_tokens":2}}}\n\n';
+
+	function install(body: ReadableStream<Uint8Array> | string, status = 200) {
+		const response = new Response(body, {
+			status,
+			headers: { "content-type": "text/event-stream", "x-request-id": "diagnostic-request" },
+		});
+		response.clone = () => {
+			throw new Error("diagnostic capture must not clone the response");
+		};
+		globalThis.fetch = Object.assign(async () => response, {
+			preconnect: globalThis.fetch.preconnect,
+		});
+	}
+
+	async function run(requestDump?: ApiRequestDumpCollector) {
+		const events: ParsedStreamEvent[] = [];
+		for await (const event of provider.chat({ ...chatParams(), requestDump })) events.push(event);
+		return events;
+	}
+
+	test("keeps output and usage unchanged while bounding an oversized streamed response", async () => {
+		const chunks = [textFrame, ...Array<string>(80).fill(`: ${"x".repeat(1024)}\n\n`), usageFrame];
+		install(chunks.join(""));
+		const baseline = await run();
+		let index = 0;
+		install(
+			new ReadableStream(
+				{
+					pull(controller) {
+						if (index === chunks.length) controller.close();
+						else controller.enqueue(new TextEncoder().encode(chunks[index++]));
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+		);
+		const dump = new ApiRequestDumpCollector({}, 4096);
+		expect(await run(dump)).toEqual(baseline);
+		expect(baseline.some((event) => event.text === "hello")).toBe(true);
+		expect(baseline.some((event) => event.usage?.inputTokens === 30)).toBe(true);
+		const response = dump.snapshot(HARD_DUMP_MAX_BYTES).response;
+		expect(response).toMatchObject({
+			status: 200,
+			headers: { "x-request-id": "diagnostic-request" },
+			bodyBytesReceived: Buffer.byteLength(chunks.join("")),
+			bodyBytesKept: 4096,
+			bodyTruncated: true,
+			bodyIncomplete: false,
+		});
+		expect(Buffer.byteLength(response?.bodyText ?? "")).toBeLessThanOrEqual(4096);
+		expect(response?.bodyText).toContain("hello");
+	});
+
+	test("consumer cancellation stops pulling and preserves the partial prefix", async () => {
+		let pulls = 0;
+		let cancelled = false;
+		install(
+			new ReadableStream(
+				{
+					pull(controller) {
+						pulls++;
+						controller.enqueue(new TextEncoder().encode(textFrame));
+					},
+					cancel() {
+						cancelled = true;
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+		);
+		const dump = new ApiRequestDumpCollector({}, 4096);
+		const stream = provider.chat({ ...chatParams(), requestDump: dump });
+		expect((await stream.next()).value).toMatchObject({ text: "hello" });
+		await stream.return(undefined);
+		expect(pulls).toBe(1);
+		expect(cancelled).toBe(true);
+		expect(dump.snapshot().response).toMatchObject({ bodyText: textFrame, bodyIncomplete: true });
+	});
+
+	test("transport failure preserves emitted text, the error and partial capture", async () => {
+		let pulls = 0;
+		install(
+			new ReadableStream(
+				{
+					pull(controller) {
+						if (pulls++ === 0) controller.enqueue(new TextEncoder().encode(textFrame));
+						else controller.error(new Error("broken transport"));
+					},
+				},
+				{ highWaterMark: 0 },
+			),
+		);
+		const dump = new ApiRequestDumpCollector({}, 4096);
+		const stream = provider.chat({ ...chatParams(), requestDump: dump });
+		expect((await stream.next()).value).toMatchObject({ text: "hello" });
+		await expect(stream.next()).rejects.toThrow("broken transport");
+		expect(dump.snapshot().response).toMatchObject({
+			bodyText: textFrame,
+			bodyIncomplete: true,
+			error: "broken transport",
+		});
+	});
+
+	test("SSE failures preserve the same invalidState and preceding text", async () => {
+		const body = `${textFrame}data: {"type":"error","error":{"type":"overloaded_error","message":"retry later"}}\n\n`;
+		install(body);
+		const baseline = await run();
+		install(body);
+		const dump = new ApiRequestDumpCollector({}, 4096);
+		expect(await run(dump)).toEqual(baseline);
+		expect(baseline.some((event) => event.invalidState?.message === "retry later")).toBe(true);
+		expect(dump.snapshot().response?.bodyText).toBe(body);
+	});
+
+	test("HTTP errors retain their original status and body without cloning", async () => {
+		const body = '{"error":{"type":"overloaded_error","message":"retry later"}}';
+		install(body, 503);
+		const dump = new ApiRequestDumpCollector({}, 4096);
+		await expect(run(dump)).rejects.toMatchObject({ status: 503 });
+		expect(dump.snapshot().response).toMatchObject({ status: 503, bodyText: body });
+	});
+});
 
 describe("anthropic provider consuming NUG gateway streams", () => {
 	test("surfaces metering and context usage from interleaved gateway events", async () => {

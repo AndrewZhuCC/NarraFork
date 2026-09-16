@@ -659,6 +659,8 @@
 	"requestDumpEnabledDesc": "Persist the raw request and response data for every AI provider call into request history so you can inspect the full payload later.",
 	"requestDumpErrorsOnly": "Keep error dumps only",
 	"requestDumpErrorsOnlyDesc": "When enabled, dumps are still collected while a request runs, but only failed requests are saved to request history; successful requests are discarded.",
+	"cacheDropDumpEnabled": "Cache-drop diagnostics",
+	"cacheDropDumpEnabledDesc": "Keep the latest 3 request samples per narrator; preserve before/after samples when cache usage drops sharply. Independent of full request dumps. Contains conversation text; treat as sensitive data. Stored in ~/.narrafork/request-dumps/cache-diagnostics/ with a global 256 MiB limit and 7-day retention. Turning off stops capture and clears normal rolling samples; anomaly samples remain until expiry or space eviction.",
 	"requestDumpWarningTitle": "Enable request dumps?",
 	"requestDumpWarningBody": "When enabled, NarraFork will persist raw request and response dumps for every AI provider call, which may quickly consume significant disk space. Turn this on only while debugging request issues, and turn it off when debugging is complete.",
 	"requestDumpWarningCancel": "Cancel",

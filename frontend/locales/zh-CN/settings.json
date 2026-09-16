@@ -659,6 +659,8 @@
 	"requestDumpEnabledDesc": "为每次 AI 提供商调用持久化原始请求与响应数据到请求历史中，之后可在列表里查看完整 payload。",
 	"requestDumpErrorsOnly": "仅保留报错请求 dump",
 	"requestDumpErrorsOnlyDesc": "开启后仍会在请求执行期间收集 dump，但只有报错请求会保存到请求历史，成功请求不会落库。",
+	"cacheDropDumpEnabled": "缓存骤降诊断",
+	"cacheDropDumpEnabledDesc": "按叙述者滚动保留最近 3 次请求样本，缓存骤降时保留前后样本。独立于全量 dump；包含对话正文，请按敏感数据保管。保存路径：~/.narrafork/request-dumps/cache-diagnostics/；全局上限 256 MiB，保留 7 天。关闭后停止捕获并清理正常滚动样本，异常样本保留到过期或空间淘汰。",
 	"requestDumpWarningTitle": "确认开启请求 Dump？",
 	"requestDumpWarningBody": "开启后，NarraFork 会为每次 AI 提供商调用持久化原始请求与响应 dump，可能快速占用大量磁盘空间。请仅在需要调试请求问题时临时开启，并在调试完成后关闭。",
 	"requestDumpWarningCancel": "取消",

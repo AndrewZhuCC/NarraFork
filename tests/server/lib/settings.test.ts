@@ -112,6 +112,42 @@ describe("settings deepMerge", () => {
 	});
 });
 
+describe("cache-drop diagnostic settings", () => {
+	it("defaults off for legacy settings and roundtrips independently of full dumps", () => {
+		// tests/preload.ts isolates this file from the user's settings.
+		const path = resolve(getNarraforkHome(), "settings.json");
+		const original = readFileSync(path, "utf8");
+		const snapshot = structuredClone(liveSettings);
+		try {
+			const defaults = getDefaults();
+			expect(defaults.agent.cacheDropDumpEnabled).toBe(false);
+			const { cacheDropDumpEnabled: _omitted, ...legacyAgent } = defaults.agent;
+			writeFileSync(path, JSON.stringify({ ...defaults, agent: legacyAgent }));
+			expect(reloadSettings().agent.cacheDropDumpEnabled).toBe(false);
+
+			for (const enabled of [true, false]) {
+				saveSettings({
+					...defaults,
+					agent: {
+						...defaults.agent,
+						requestDumpEnabled: false,
+						cacheDropDumpEnabled: enabled,
+					},
+				});
+				const persisted = JSON.parse(readFileSync(path, "utf8"));
+				const loaded = reloadSettings();
+				for (const agent of [liveSettings.agent, loaded.agent, persisted.agent]) {
+					expect(agent.cacheDropDumpEnabled).toBe(enabled);
+					expect(agent.requestDumpEnabled).toBe(false);
+				}
+			}
+		} finally {
+			saveSettings(snapshot);
+			writeFileSync(path, original);
+		}
+	});
+});
+
 describe("auto-continuation defaults", () => {
 	it("uses protected-only mode when no value has been configured", () => {
 		expect(getDefaults().agent.autoContinuationMode).toBe("protectedOnly");

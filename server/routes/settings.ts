@@ -434,6 +434,7 @@ export const updateSettingsSchema = z
 				translateReasoning: z.boolean(),
 				requestDumpEnabled: z.boolean(),
 				requestDumpErrorsOnly: z.boolean(),
+				cacheDropDumpEnabled: z.boolean(),
 				defaultRelaxedPlan: z.boolean(),
 				planModeAllowInlinePlan: z.boolean(),
 				planReflectionAutoApprove: z.boolean(),

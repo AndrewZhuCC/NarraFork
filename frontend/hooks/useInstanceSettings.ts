@@ -60,6 +60,7 @@ export interface InstanceSettingsState {
 	translateReasoning: boolean;
 	requestDumpEnabled: boolean;
 	requestDumpErrorsOnly: boolean;
+	cacheDropDumpEnabled: boolean;
 	defaultNarratorVisibility: DefaultNarratorVisibility;
 	defaultNarratorWriteAudience: DefaultNarratorWriteAudience;
 	defaultStartInPlanMode: boolean;
@@ -178,6 +179,7 @@ function makeDefaults(): InstanceSettingsState {
 		translateReasoning: false,
 		requestDumpEnabled: false,
 		requestDumpErrorsOnly: false,
+		cacheDropDumpEnabled: false,
 		defaultNarratorVisibility: "auto",
 		defaultNarratorWriteAudience: "auto",
 		defaultStartInPlanMode: false,
@@ -289,6 +291,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				translateReasoning: settings.agent?.translateReasoning ?? false,
 				requestDumpEnabled: settings.agent?.requestDumpEnabled ?? false,
 				requestDumpErrorsOnly: settings.agent?.requestDumpErrorsOnly ?? false,
+				cacheDropDumpEnabled: settings.agent?.cacheDropDumpEnabled ?? false,
 				defaultRelaxedPlan: settings.agent?.defaultRelaxedPlan ?? false,
 				planModeAllowInlinePlan: settings.agent?.planModeAllowInlinePlan ?? true,
 				planReflectionAutoApprove: settings.agent?.planReflectionAutoApprove ?? false,
@@ -415,6 +418,7 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					translateReasoning: state.translateReasoning,
 					requestDumpEnabled: state.requestDumpEnabled,
 					requestDumpErrorsOnly: state.requestDumpErrorsOnly,
+					cacheDropDumpEnabled: state.cacheDropDumpEnabled,
 					defaultNarratorVisibility: state.defaultNarratorVisibility,
 					defaultNarratorWriteAudience: state.defaultNarratorWriteAudience,
 					defaultStartInPlanMode: state.defaultStartInPlanMode,

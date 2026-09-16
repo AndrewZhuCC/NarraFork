@@ -49,7 +49,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import { signatureSourcesCompatible } from "./reasoning-source";
-import { sanitizeHeaders } from "./request-dump";
+import { captureResponseStream, sanitizeHeaders } from "./request-dump";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -1798,12 +1798,19 @@ export class AnthropicProvider implements ProviderAdapter {
 			params.conversationId,
 		);
 
-		params.requestDump?.setRequest({
+		const dumpRequest = {
 			transport: "http",
 			url: `${this.getBaseUrl()}${reqPath}`,
 			headers: sanitizeHeaders(reqHeaders),
 			body,
-		});
+		};
+		const diagnosticDump =
+			params.requestDump?.maxCaptureBytes !== undefined ? params.requestDump : undefined;
+		if (diagnosticDump) {
+			diagnosticDump.beginResponseAttempt(dumpRequest, diagnosticDump.maxCaptureBytes);
+		} else {
+			params.requestDump?.setRequest(dumpRequest);
+		}
 
 		logger.debug("Anthropic chat request", {
 			model,
@@ -1825,15 +1832,17 @@ export class AnthropicProvider implements ProviderAdapter {
 			body: bodyStr,
 			signal: params.signal,
 		});
-		const responseTextPromise = params.requestDump
-			? response
-					.clone()
-					.text()
-					.catch((error) => {
-						params.requestDump?.setResponseError(error);
-						return "";
-					})
-			: undefined;
+		// Only diagnostic capture uses the bounded tap; legacy full-dump buffering is unchanged.
+		const responseTextPromise =
+			params.requestDump && !diagnosticDump
+				? response
+						.clone()
+						.text()
+						.catch((error) => {
+							params.requestDump?.setResponseError(error);
+							return "";
+						})
+				: undefined;
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
@@ -1841,7 +1850,12 @@ export class AnthropicProvider implements ProviderAdapter {
 
 		if (!response.ok) {
 			const errText = await response.text().catch(() => "");
-			params.requestDump?.setResponseBodyText(errText);
+			if (diagnosticDump) {
+				diagnosticDump.appendResponseText(errText);
+				diagnosticDump.finishResponseCapture(true);
+			} else {
+				params.requestDump?.setResponseBodyText(errText);
+			}
 			throw createAnthropicApiError(response, errText);
 		}
 
@@ -1849,10 +1863,15 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw new Error("Anthropic API returned no body");
 		}
 
-		yield* parseAnthropicSSEStream(
-			response.body,
-			getAnthropicEffectiveContextWindow(model, this.config),
-		);
+		const capture = captureResponseStream(response.body, diagnosticDump);
+		try {
+			yield* parseAnthropicSSEStream(
+				capture.stream,
+				getAnthropicEffectiveContextWindow(model, this.config),
+			);
+		} finally {
+			capture.finish();
+		}
 		if (responseTextPromise) {
 			const bodyText = await responseTextPromise;
 			const maxSize = settings.agent?.requestDumpMaxSize ?? 1024 * 1024;
