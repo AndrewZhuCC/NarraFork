@@ -299,6 +299,7 @@ describe("large editor objects and real durable pipeline", () => {
 		const repeated = await service.commit(actor, doc.docId, id, {});
 		expect(repeated.status).toBe("committing");
 		expect(await service.remove(actor, doc.docId)).toEqual({ status: "committing" });
+		await service.sweep();
 		expect((await bodies()).length).toBe(2);
 		release.resolve();
 		const saved = await pending;
@@ -355,6 +356,128 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(
 			(await failure(() => service.content(actor, doc.docId, doc.versionHandle))).statusCode,
 		).toBe(410);
+		expect(await bodies()).toHaveLength(0);
+	});
+	test.each([
+		403, 404,
+	])("owner can release a full quota after file authorization starts rejecting with %i", async (status) => {
+		const docs: EditorDocumentDescriptor[] = [];
+		for (let i = 0; i < 8; i++) docs.push(await create());
+		expect((await failure(create)).code).toBe("EDITOR_QUOTA_EXCEEDED");
+		const authorize = actor.authorize;
+		actor.authorize = async () => {
+			throw new EditorDocumentError("EDITOR_WRITE_REFUSED", "File unavailable", status);
+		};
+		for (const foreign of [
+			{ ...actor, userId: "other" },
+			{ ...actor, narratorId: "other" },
+		])
+			expect((await failure(() => service.remove(foreign, docs[0].docId))).code).toBe(
+				"EDITOR_SESSION_EXPIRED",
+			);
+		expect(await bodies()).toHaveLength(8);
+		expect(await service.remove(actor, docs[0].docId)).toEqual({ status: "released" });
+		expect(await bodies()).toHaveLength(7);
+		actor.authorize = authorize;
+		await create();
+		expect((await failure(create)).code).toBe("EDITOR_QUOTA_EXCEEDED");
+		expect(await bodies()).toHaveLength(8);
+		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
+	});
+	test("abort during post-worker authorization rejects create and returns its quota", async () => {
+		for (let i = 0; i < 7; i++) await create();
+		const entered = deferred(),
+			resume = deferred(),
+			controller = new AbortController();
+		const authorize = actor.authorize;
+		let calls = 0;
+		actor.authorize = async (...args) => {
+			if (++calls === 2) {
+				entered.resolve();
+				await resume.promise;
+			}
+			return authorize(...args);
+		};
+		const pending = service.create(
+			actor,
+			{ path: target, deviceId: "local", origin: "legacy" },
+			controller.signal,
+		);
+		await entered.promise;
+		controller.abort(new Error("Cancelled during final authorization"));
+		resume.resolve();
+		await expect(pending).rejects.toThrow("Cancelled during final authorization");
+		expect(await bodies()).toHaveLength(7);
+		actor.authorize = authorize;
+		await create();
+		expect((await failure(create)).code).toBe("EDITOR_QUOTA_EXCEEDED");
+		expect(await bodies()).toHaveLength(8);
+	});
+	test("closing cleanup retries on the next sweep without waiting for session TTL", async () => {
+		const doc = await create();
+		const versionPath = join(root, "transfers", (await bodies())[0]);
+		// An isolated directory in place of the private object makes unlink fail on every platform.
+		await unlink(versionPath);
+		await mkdir(versionPath);
+		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+		expect(await bodies()).toHaveLength(1);
+		await rm(versionPath, { recursive: true });
+		await service.sweep();
+		for (let i = 0; i < 8; i++) await create();
+		expect((await failure(create)).code).toBe("EDITOR_QUOTA_EXCEEDED");
+		expect(await bodies()).toHaveLength(8);
+	});
+	test("closing sweeps preserve an active download until its pin is released", async () => {
+		const doc = await create();
+		const stream = await service.content(actor, doc.docId, doc.versionHandle);
+		try {
+			expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+			await service.sweep();
+			expect(await bodies()).toHaveLength(1);
+		} finally {
+			await stream.cancel();
+		}
+		expect(await bodies()).toHaveLength(0);
+	});
+	test("closing sweeps preserve an active upload until its pin is released", async () => {
+		const jobs = new EditorDocumentJobs();
+		const run = jobs.run.bind(jobs);
+		const entered = deferred(),
+			resume = deferred();
+		jobs.run = async (...args) => {
+			if (args[1].action === "seal") {
+				entered.resolve();
+				await resume.promise;
+			}
+			return run(...args);
+		};
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			jobs,
+			execute: (request) => runtime.executeEditor(request),
+		});
+		const doc = await create();
+		const entry = await service.createUpload(actor, doc.docId, {
+			baseHash: doc.baseHash,
+			encoding: doc.encoding,
+			snapshotRevision: 1,
+		});
+		const pending = service
+			.put(actor, doc.docId, entry.uploadId, new Response("draft").body, 5)
+			.then(
+				() => null,
+				(error: unknown) => error,
+			);
+		await entered.promise;
+		try {
+			expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+			await service.sweep();
+			expect(await bodies()).toHaveLength(2);
+		} finally {
+			resume.resolve();
+			await pending;
+		}
+		expect(await pending).toBeInstanceOf(Error);
 		expect(await bodies()).toHaveLength(0);
 	});
 	test("eight sessions and reservation quota are enforced before creating objects", async () => {

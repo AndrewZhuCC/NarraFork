@@ -213,15 +213,15 @@ export class EditorDocumentService {
 		}
 		session.reserved += delta;
 	}
-	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
+	private owned(actor: EditorActor, docId: string) {
 		const session = this.sessions.get(docId);
-		if (
-			!session ||
-			session.closing ||
-			session.userId !== actor.userId ||
-			session.narratorId !== actor.narratorId
-		)
+		if (!session || session.userId !== actor.userId || session.narratorId !== actor.narratorId)
 			throw expired();
+		return session;
+	}
+	private async bound(actor: EditorActor, docId: string, need: "read" | "write") {
+		const session = this.owned(actor, docId);
+		if (session.closing) throw expired();
 		if (Date.now() - session.lastUsed > EDITOR_SESSION_IDLE_MS && session.pins === 0) {
 			await this.release(session);
 			throw expired();
@@ -283,6 +283,7 @@ export class EditorDocumentService {
 			);
 			if (result.kind !== "source") throw invalid("Unexpected source worker response");
 			await this.bound(actor, session.id, "read");
+			signal?.throwIfAborted();
 			this.reserve(session, result.metadata.utf8Bytes - EDITOR_TRANSFER_MAX_BYTES);
 			session.source = { path, handle: randomUUID(), metadata: result.metadata };
 			session.looseFiles.delete(path);
@@ -837,7 +838,8 @@ export class EditorDocumentService {
 		return { uploadId, state: upload.state };
 	}
 	async remove(actor: EditorActor, docId: string): Promise<{ status: "released" | "committing" }> {
-		const { session } = await this.bound(actor, docId, "read");
+		// Releasing private objects needs session ownership, not continued access to the target file.
+		const session = this.owned(actor, docId);
 		await this.release(session);
 		return { status: session.committing ? "committing" : "released" };
 	}
@@ -896,7 +898,8 @@ export class EditorDocumentService {
 	async sweep(now = Date.now()) {
 		// At most 32 live sessions and 1024 small operation records, never a filesystem scan.
 		for (const session of this.sessions.values())
-			if (now - session.lastUsed > EDITOR_SESSION_IDLE_MS) await this.release(session);
+			if (session.closing || now - session.lastUsed > EDITOR_SESSION_IDLE_MS)
+				await this.release(session);
 		for (const [id, operation] of this.operations)
 			if (operation.value.status !== "committing" && operation.expires < now) {
 				try {
