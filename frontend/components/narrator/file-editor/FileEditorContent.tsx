@@ -413,14 +413,14 @@ function FileEditorDocument({
 		return () => window.removeEventListener("beforeunload", beforeUnload);
 	}, [session]);
 	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
-	// Only a CHANGE of explicit navigation returns to source — running on mount would
-	// clobber a remembered non-raw default before the user ever sees it.
+	// Only a changed source-range navigation returns to editing. A file-only open
+	// also changes the request ID, but must preserve the chosen/default view.
 	const navigationRef = useRef(navigationKey);
 	useEffect(() => {
 		if (navigationRef.current === navigationKey) return;
 		navigationRef.current = navigationKey;
-		setMode("raw");
-	}, [navigationKey]);
+		if (selection) setMode("raw");
+	}, [navigationKey, selection]);
 	useEffect(() => {
 		if (mode === "raw") {
 			previewController.current?.abort();

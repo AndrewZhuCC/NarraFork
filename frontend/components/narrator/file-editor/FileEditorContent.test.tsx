@@ -983,7 +983,10 @@ test("split mode keeps the editor interactive beside a live-updating preview", a
 	expect(model.text).toBe("# Edited live");
 });
 
-test("set-as-default link saves the mode and the next panel opens with it", async () => {
+test.each([
+	"split",
+	"preview",
+] as const)("saved %s default survives file-only navigation", async (defaultMode) => {
 	const store = new Map<string, string>();
 	const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 	restores.push(() => {
@@ -1004,20 +1007,33 @@ test("set-as-default link saves the mode and the next panel opens with it", asyn
 	await mount({ filePath: "/work/a.md", selection: undefined });
 	// raw IS the saved default, so no link is offered.
 	expect(defaultLink()).toBeUndefined();
-	await switchFileMode("split");
+	await switchFileMode(defaultMode);
 	const link = defaultLink();
 	expect(link).toBeDefined();
 	await act(async () => {
 		link?.dispatchEvent(new Event("click", { bubbles: true }));
 	});
-	expect(store.get("narrafork_file_editor_mode")).toBe("split");
+	expect(store.get("narrafork_file_editor_mode")).toBe(defaultMode);
 	expect(defaultLink()).toBeUndefined();
-	// A fresh component (same panel reopened later) initializes from the saved default.
-	await act(async () => root?.render(null));
-	await mount({ filePath: "/work/a.md", selection: undefined });
+	const expectDefault = () => {
+		expect(host.querySelector("[data-file-editor-source]")?.hasAttribute("inert")).toBe(
+			defaultMode === "preview",
+		);
+		expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+		expect(defaultLink()).toBeUndefined();
+	};
+	// A new file, a late navigation ID, and reopening without a range must all keep the mode.
+	await mount({ filePath: "/work/b.md", selection: undefined });
+	expectDefault();
+	await mount({ filePath: "/work/b.md", selection: undefined, navigationRequestId: "late" });
+	expectDefault();
+	await mount({ filePath: "/work/b.md", selection: undefined, navigationRequestId: "again" });
+	expectDefault();
+	// Explicit source-range navigation still reveals the editor, without changing the default.
+	await mount({ filePath: "/work/b.md", selection, navigationRequestId: "range" });
 	expect(host.querySelector("[data-file-editor-source]")?.hasAttribute("inert")).toBe(false);
-	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
-	expect(defaultLink()).toBeUndefined();
+	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	expect(store.get("narrafork_file_editor_mode")).toBe(defaultMode);
 });
 
 test("cancelled reload keeps dirty document, selection and undo history without reading", async () => {
