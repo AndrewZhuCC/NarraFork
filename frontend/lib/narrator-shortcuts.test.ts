@@ -49,6 +49,61 @@ describe("narrator shortcuts", () => {
 		"F25",
 		"x".repeat(101),
 	])("rejects invalid/typing chord %s", (input) => expect(normalizeShortcut(input)).toBeNull());
+	test.each([
+		["Backquote", "`"],
+		["Minus", "-"],
+		["Equal", "="],
+		["BracketLeft", "["],
+		["BracketRight", "]"],
+		["Backslash", "\\"],
+		["Semicolon", ";"],
+		["Quote", "'"],
+		["Comma", ","],
+		["Period", "."],
+		["Slash", "/"],
+		["NumpadAdd", "Numpad +"],
+		["NumpadSubtract", "Numpad -"],
+		["NumpadMultiply", "Numpad *"],
+		["NumpadDivide", "Numpad /"],
+		["NumpadDecimal", "Numpad ."],
+		["NumpadEqual", "Numpad ="],
+		["NumpadComma", "Numpad ,"],
+	])("records, persists and matches modified %s without hijacking typing", (code, label) => {
+		const binding = `Control+${code}`;
+		expect(normalizeShortcut(`ctrl+${code.toLowerCase()}`)).toBe(binding);
+		expect(formatShortcut(binding, true)).toBe(`Ctrl + ${label}`);
+		expect(parseShortcutBindings(JSON.stringify({ previous: binding })).previous).toBe(binding);
+		expect(
+			matchesShortcut(
+				event({
+					code,
+					key: label.replace("Numpad ", ""),
+					ctrlKey: true,
+					metaKey: false,
+					shiftKey: false,
+				}),
+				binding,
+				true,
+			),
+		).toBe(true);
+		expect(normalizeShortcut(code)).toBeNull();
+		expect(normalizeShortcut(`Shift+${code}`)).toBeNull();
+	});
+	test("plus on the main keyboard retains Shift and stays distinct from numpad add", () => {
+		const plus = event({ code: "Equal", key: "+", ctrlKey: true, metaKey: false });
+		const binding = "Control+Shift+Equal";
+		expect(normalizeShortcut("Ctrl+Shift+Equal")).toBe(binding);
+		expect(formatShortcut(binding, true)).toBe("Ctrl + Shift + =");
+		expect(matchesShortcut(plus, binding, true)).toBe(true);
+		expect(matchesShortcut({ ...plus, shiftKey: false }, binding, true)).toBe(false);
+		expect(matchesShortcut(plus, "Control+NumpadAdd", true)).toBe(false);
+	});
+	test("symbol shortcuts still detect modifier alias conflicts", () => {
+		const bindings = { ...DEFAULT_NARRATOR_SHORTCUTS, previous: "Control+BracketLeft" };
+		expect(findShortcutConflict(bindings, "next", "Ctrl+BracketLeft", true)).toBe("previous");
+		expect(findShortcutConflict(bindings, "next", "Mod+BracketLeft", false)).toBe("previous");
+		expect(findShortcutConflict(bindings, "next", "Mod+BracketLeft", true)).toBeUndefined();
+	});
 	test("matches physical digits even when Shift changes the printable character", () => {
 		expect(matchesShortcut(event(), DEFAULT_NARRATOR_SHORTCUTS.narrator1, true)).toBe(true);
 		expect(matchesShortcut(event(), DEFAULT_NARRATOR_SHORTCUTS.narrator1, false)).toBe(false);

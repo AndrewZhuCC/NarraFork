@@ -174,6 +174,25 @@ test("shortcut recorder captures keys, cancels, rejects conflicts, clears and re
 		click(clearComposer);
 		expect(api.bindings.focusComposer).toBe("");
 
+		for (const [key, code, shiftKey, binding, label] of [
+			["[", "BracketLeft", false, "Control+BracketLeft", "Ctrl + ["],
+			["+", "Equal", true, "Control+Shift+Equal", "Ctrl + Shift + ="],
+			["+", "NumpadAdd", false, "Control+NumpadAdd", "Ctrl + Numpad +"],
+		] as const) {
+			click(button);
+			expect(press(button, key, code, { ctrlKey: true, shiftKey }).defaultPrevented).toBe(true);
+			expect(api.bindings.previous).toBe(binding);
+			expect(button.textContent).toBe(label);
+			expect(button.getAttribute("aria-pressed")).toBe("false");
+			expect(JSON.parse(values.get("narrafork_narrator_shortcuts") ?? "{}").previous).toBe(binding);
+		}
+		act(() => api?.setBinding("next", "Control+BracketLeft"));
+		click(button);
+		press(button, "[", "BracketLeft", { ctrlKey: true });
+		expect(container.textContent).toContain("Already assigned");
+		expect(api.bindings.previous).toBe("Control+NumpadAdd");
+		press(button, "Escape", "Escape");
+
 		values.set("narrafork_narrator_shortcuts", JSON.stringify({ ...api.bindings, previous: "F8" }));
 		act(() => {
 			window.dispatchEvent(

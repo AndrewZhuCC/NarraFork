@@ -31,6 +31,27 @@ export const DEFAULT_NARRATOR_SHORTCUTS: ShortcutBindings = {
 	focusComposer: "Tab",
 };
 const MODIFIERS = ["Mod", "Control", "Meta", "Alt", "Shift"] as const;
+// Store physical codes, not printable symbols: '+' is also the chord separator.
+const SYMBOL_KEYS = new Map([
+	["Backquote", "`"],
+	["Minus", "-"],
+	["Equal", "="],
+	["BracketLeft", "["],
+	["BracketRight", "]"],
+	["Backslash", "\\"],
+	["Semicolon", ";"],
+	["Quote", "'"],
+	["Comma", ","],
+	["Period", "."],
+	["Slash", "/"],
+	["NumpadAdd", "Numpad +"],
+	["NumpadSubtract", "Numpad -"],
+	["NumpadMultiply", "Numpad *"],
+	["NumpadDivide", "Numpad /"],
+	["NumpadDecimal", "Numpad ."],
+	["NumpadEqual", "Numpad ="],
+	["NumpadComma", "Numpad ,"],
+]);
 const NAMED_KEYS = [
 	"Home",
 	"End",
@@ -46,6 +67,7 @@ const NAMED_KEYS = [
 	"Backspace",
 	"Delete",
 	"Space",
+	...SYMBOL_KEYS.keys(),
 ];
 const MODIFIER_ALIASES: Record<string, string> = {
 	mod: "Mod",
@@ -116,7 +138,7 @@ export function formatShortcut(value: string, isMac: boolean): string {
 			if (part === "Meta") return isMac ? "Cmd" : "Meta";
 			if (part === "Control") return "Ctrl";
 			if (part === "Alt") return isMac ? "Option" : "Alt";
-			return part.replace(/^(Key|Digit)/, "");
+			return SYMBOL_KEYS.get(part) ?? part.replace(/^(Key|Digit)/, "");
 		})
 		.join(" + ");
 }
