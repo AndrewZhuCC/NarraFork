@@ -15,6 +15,57 @@ import {
 } from "../request-dump";
 
 describe("bounded diagnostic capture", () => {
+	test("full WS frames do not duplicate the prepared history and crowd out the response", () => {
+		const collector = new ApiRequestDumpCollector({}, 4 * 1024 * 1024);
+		const prepared = {
+			transport: "websocket",
+			body: {
+				type: "response.create",
+				input: [{ role: "user", content: "x".repeat(2300000) }],
+				tools: [{ type: "function", name: "Read" }],
+				client_metadata: { session_id: "session" },
+			},
+		};
+		collector.beginResponseAttempt(prepared, 4 * 1024 * 1024);
+		const actual = {
+			...prepared,
+			body: {
+				...prepared.body,
+				client_metadata: {
+					...prepared.body.client_metadata,
+					"x-codex-turn-state": "routing-state",
+				},
+			},
+		};
+		collector.setRequest(actual);
+		collector.setResponseMeta({ status: 200, headers: { "x-request-id": "upstream-id" } });
+		collector.appendResponseText(
+			'data: {"type":"response.completed","response":{"usage":{"input_tokens_details":{"cached_tokens":3968}}}}\n\n',
+		);
+		collector.finishResponseCapture(true);
+		const result = collector.snapshot();
+		expect(result.initialRequest === undefined).toBe(true);
+		expect(JSON.stringify(result.request?.body) === JSON.stringify(actual.body)).toBe(true);
+		expect(result.response?.headers?.["x-request-id"]).toBe("upstream-id");
+		expect(result.response?.bodyText).toContain('"cached_tokens":3968');
+		expect(result.captureTruncated).toBeUndefined();
+		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(4 * 1024 * 1024);
+	});
+
+	test("oversized requests cannot erase response status, headers and available response text", () => {
+		const collector = new ApiRequestDumpCollector({}, 4096);
+		collector.beginResponseAttempt({ body: { input: "x".repeat(10000) } }, 4096);
+		collector.setResponseMeta({ status: 200, headers: { "x-request-id": "kept" } });
+		collector.appendResponseText("small complete reply");
+		collector.finishResponseCapture(true);
+		const result = collector.snapshot();
+		expect(result.captureTruncated).toBe(true);
+		expect(result.response?.status).toBe(200);
+		expect(result.response?.headers?.["x-request-id"]).toBe("kept");
+		expect(result.response?.bodyText).toBe("small complete reply");
+		expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(4096);
+	});
+
 	test("preserves the logical WS request and the actual frame without modifying either", () => {
 		const collector = new ApiRequestDumpCollector({ provider: "openai" }, 4096);
 		const full = { transport: "websocket", body: { input: [{ role: "user", content: "before" }] } };

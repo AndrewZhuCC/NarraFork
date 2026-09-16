@@ -13,7 +13,6 @@ import {
 import { join, resolve } from "node:path";
 
 export const CACHE_DROP_MIN_TOKENS = 8192;
-export const CACHE_DROP_MAX_RATIO = 0.5;
 export const CACHE_DROP_MAX_REQUEST_BYTES = 8 * 1024 * 1024;
 export const CACHE_DROP_MAX_BYTES = 256 * 1024 * 1024;
 export const CACHE_DROP_MAX_FILES = 256;
@@ -293,8 +292,7 @@ export class CacheDropDumpStore {
 					previous &&
 					sameIdentity(previous, sample) &&
 					previous.cached >= CACHE_DROP_MIN_TOKENS &&
-					previous.cached - (cachedInputTokens ?? 0) >= CACHE_DROP_MIN_TOKENS &&
-					(cachedInputTokens ?? 0) <= previous.cached * CACHE_DROP_MAX_RATIO;
+					previous.cached - (cachedInputTokens ?? 0) >= CACHE_DROP_MIN_TOKENS;
 				if (valid)
 					this.baselines.set(sample.narratorId, {
 						requestId: sample.requestId,

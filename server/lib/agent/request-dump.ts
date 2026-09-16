@@ -345,8 +345,14 @@ export class ApiRequestDumpCollector {
 	}
 
 	setRequest(request: NonNullable<ApiRequestDump["request"]>): void {
-		// In diagnostic mode retain the logical full WS request before its wire delta replaces it.
-		if (this.retainInitialRequest && this.dump.request) {
+		// Only a WS delta needs its prepared full history alongside the actual frame.
+		// A full frame already contains that history; duplicating it crowds out the response.
+		const body = request.body as { previous_response_id?: unknown } | null | undefined;
+		if (
+			this.retainInitialRequest &&
+			this.dump.request &&
+			typeof body?.previous_response_id === "string"
+		) {
 			this.dump.initialRequest ??= this.dump.request;
 		}
 		this.dump.request = this.copy({ ...request, headers: sanitizeHeaders(request.headers) });
@@ -445,15 +451,38 @@ export class ApiRequestDumpCollector {
 	snapshot(maxBytes = this.maxCaptureBytes): ApiRequestDump {
 		this.flushResponseCapture();
 		if (maxBytes === undefined) return toJsonSafe(this.dump);
-		// Prefer request evidence when the combined response/attempts exceed the snapshot budget.
 		const { initialRequest, request, response, attempts, ...metadata } = this.dump;
-		const bounded = boundedJsonCopy(
-			{ ...metadata, initialRequest, request, response, attempts },
+		const complete = boundedJsonCopy(
+			{ ...metadata, request, response, initialRequest, attempts },
 			maxBytes,
+		);
+		if (!complete.truncated) {
+			return { ...complete.value, ...(this.captureTruncated ? { captureTruncated: true } : {}) };
+		}
+		// Only genuinely oversized snapshots need partitioning; do not truncate a reply that fits.
+		// Reserve room for upstream headers/usage evidence; neither side may erase the other.
+		const { bodyText, events, ...responseMeta } = response ?? {};
+		const keptResponse = response
+			? boundedJsonCopy({ ...responseMeta, bodyText, events }, Math.floor(maxBytes / 4))
+			: undefined;
+		if (
+			keptResponse?.value &&
+			typeof bodyText === "string" &&
+			keptResponse.value.bodyText !== bodyText
+		) {
+			keptResponse.value.bodyTruncated = true;
+		}
+		const responseBytes = utf8Bytes(JSON.stringify(keptResponse?.value) ?? "") + 64;
+		const bounded = boundedJsonCopy(
+			{ ...metadata, request, initialRequest, attempts },
+			Math.max(0, maxBytes - responseBytes),
 		);
 		return {
 			...bounded.value,
-			...(this.captureTruncated || bounded.truncated ? { captureTruncated: true } : {}),
+			...(keptResponse?.value ? { response: keptResponse.value } : {}),
+			...(this.captureTruncated || bounded.truncated || keptResponse?.truncated
+				? { captureTruncated: true }
+				: {}),
 		};
 	}
 }

@@ -241,15 +241,38 @@ describe("CacheDropDumpStore", () => {
 		await verifyReferences();
 	});
 
-	test("requires minimum absolute drop and half the previous cached count", async () => {
+	test("requires an absolute drop of at least 8192 tokens, not a halving", async () => {
 		const s = store();
 		await s.record(sample({ cachedInputTokens: 8000 }));
 		await s.record(sample({ cachedInputTokens: 0 }));
-		await s.record(sample({ cachedInputTokens: 20_000 }));
-		await s.record(sample({ cachedInputTokens: 11_000 }));
+		await s.record(sample({ cachedInputTokens: 30_000 }));
+		await s.record(sample({ cachedInputTokens: 21_809 }));
 		expect(await groups("event")).toHaveLength(0);
-		await s.record(sample({ cachedInputTokens: 0 }));
+		await s.record(sample({ cachedInputTokens: 13_617 }));
 		expect(await groups("event")).toHaveLength(1);
+	});
+
+	test("a 132992->100352 drop retains its fixed event group after rolling replacement", async () => {
+		const s = store();
+		for (const cachedInputTokens of [132_864, 132_992, 100_352, 134_272])
+			await s.record(sample({ inputTokens: 150_000, cachedInputTokens }));
+		const events = await groups("event");
+		expect(events).toHaveLength(1);
+		expect(events[0]?.manifest.samples.map((ref) => [ref.requestId, ref.role])).toEqual([
+			["request-1", "before"],
+			["request-2", "before"],
+			["request-3", "trigger"],
+			["request-4", "after"],
+		]);
+		for (let i = 0; i < 5; i++)
+			await s.record(sample({ inputTokens: 150_000, cachedInputTokens: 134_272 }));
+		expect(await groups("event")).toEqual(events);
+		expect((await groups("rolling"))[0]?.manifest.samples.map((ref) => ref.requestId)).toEqual([
+			"request-7",
+			"request-8",
+			"request-9",
+		]);
+		await verifyReferences();
 	});
 
 	test("consecutive triggers create bounded independent events instead of extending one", async () => {
