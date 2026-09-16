@@ -43,6 +43,10 @@ scripts/lib/*
 scripts/lib/__tests__/*
 # Required by the cross-platform build and its post-processing workers.
 !scripts/post-process-worker.ts
+!scripts/post-process-worker.test.ts
+!scripts/build-local.ts
+!scripts/install-local.py
+!scripts/install-local.test.py
 !scripts/lib/binary-metadata.ts
 !scripts/lib/__tests__/binary-metadata.test.ts
 !scripts/lib/__tests__/latest-yml.test.ts

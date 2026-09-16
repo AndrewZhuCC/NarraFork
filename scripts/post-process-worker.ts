@@ -5,17 +5,12 @@
  *
  * Communication: parentPort.postMessage({ type: "log" | "done", ... })
  */
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import {
-	existsSync,
-	readFileSync,
-	readdirSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
-import { workerData, parentPort } from "node:worker_threads";
+import { parentPort, workerData } from "node:worker_threads";
 import { generateZstdPatch } from "../server/lib/zstd-patch";
 import {
 	type BinaryMetadata,
@@ -154,7 +149,51 @@ const buildDate = new Date().toISOString();
 
 // 1. macOS signing (must happen before hashing so digests match the final file)
 if (platform.target.includes("darwin")) {
-	if (!adHocSign(outfile)) {
+	const identity = process.env.NF_CODESIGN_IDENTITY;
+	const keychain = process.env.NF_CODESIGN_KEYCHAIN;
+	const identifier = process.env.NF_CODESIGN_IDENTIFIER;
+	const configured = [identity, keychain, identifier].some((value) => value !== undefined);
+	if (configured) {
+		if (
+			process.platform !== "darwin" ||
+			!identity ||
+			!/^[a-f\d]{40}$/i.test(identity) ||
+			!keychain ||
+			!existsSync(keychain) ||
+			!identifier ||
+			!/^[a-z\d.-]+$/i.test(identifier)
+		) {
+			throw new Error("Invalid NF_CODESIGN configuration; refusing ad-hoc fallback");
+		}
+		const options = { timeout: 120_000, maxBuffer: 128 * 1024 };
+		execFileSync(
+			"/usr/bin/codesign",
+			[
+				"--force",
+				"--sign",
+				identity,
+				"--keychain",
+				keychain,
+				"--identifier",
+				identifier,
+				"--timestamp=none",
+				outfile,
+			],
+			options,
+		);
+		execFileSync(
+			"/usr/bin/codesign",
+			[
+				"--verify",
+				"--strict",
+				"-R",
+				`=identifier "${identifier}" and certificate leaf = H"${identity}"`,
+				outfile,
+			],
+			options,
+		);
+		log(`✓ Identity signed and verified: ${identifier} (${relative(root, outfile)})`);
+	} else if (!adHocSign(outfile)) {
 		log(
 			`⚠ Ad-hoc signing failed — users may need to run: codesign --force --sign - ${relative(root, outfile)}`,
 		);
