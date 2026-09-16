@@ -75,6 +75,7 @@ function startServer(
 		send: (frame: string) => void;
 		close: (code: number, reason: string) => void;
 	}) => void,
+	handshakeHeaders?: (connectionIndex: number) => Record<string, string>,
 ): TestServer {
 	const requests: ReceivedRequest[] = [];
 	const handshakes: Headers[] = [];
@@ -87,7 +88,7 @@ function startServer(
 		fetch(req, srv) {
 			// Bun consumes the request on upgrade; snapshot its headers beforehand.
 			const headers = new Headers(req.headers);
-			if (srv.upgrade(req)) {
+			if (srv.upgrade(req, { headers: handshakeHeaders?.(connectionsAccepted) })) {
 				handshakes.push(headers);
 				return undefined;
 			}
@@ -197,14 +198,14 @@ function collectText(events: ParsedStreamEvent[]): string {
 	return events.map((event) => event.text ?? "").join("");
 }
 
-function createChatProvider(server: TestServer): OpenAIProvider {
+function createChatProvider(server: TestServer, apiKey = "sk-local-test-only"): OpenAIProvider {
 	// Exercise the real chat -> chatCodexWebSocket -> transport path, not a mock or
 	// an in-generator reconnect. tests/preload.ts isolates HOME/NARRAFORK_HOME.
 	return new OpenAIProvider({
 		id: "codex-ws-recovery",
 		name: "Local Codex WebSocket recovery test",
 		prefix: "codex-ws-recovery",
-		apiKey: "sk-local-test-only",
+		apiKey,
 		baseUrl: server.baseUrl,
 		defaultModel: "gpt-5.3-codex",
 		apiMode: "codex",
@@ -568,6 +569,55 @@ test("captures turn state from a metadata event and replays it on later requests
 	expect(second?.["x-codex-turn-state"]).toBe("ts-1");
 });
 
+test("work turns freeze the first token across metadata, reconnects and background continuations", async () => {
+	const server = startServer(
+		({ requestIndex, send }) => {
+			send(turnStateFrame(`metadata-${requestIndex}`));
+			for (const frame of completedFrames(`response-${requestIndex}`, "ok")) send(frame);
+		},
+		(index) => (index > 0 ? { "x-codex-turn-state": `handshake-${index}` } : {}),
+	);
+	activeServer = server;
+	const provider = createChatProvider(server);
+	for (const options of [
+		{ workTurnId: "work-1" },
+		{ workTurnId: "work-1" },
+		{ workTurnId: "work-1", resetUpstreamSession: true },
+		{ workTurnId: "work-2" },
+		{ workTurnId: "work-2" },
+		{},
+	]) {
+		const result = await runChat(provider, options);
+		expect(result.error).toBeUndefined();
+	}
+	expect(server.requests.map((_, index) => requestTurnState(server, index))).toEqual([
+		undefined,
+		"metadata-0",
+		"metadata-0",
+		"handshake-2",
+		"handshake-2",
+		"handshake-2",
+	]);
+	expect(server.connectionCount()).toBe(3);
+	expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
+	expect(server.requests[3]?.body.previous_response_id).toBeUndefined();
+});
+
+test("editing a relay API key cannot reuse the previous authorization's socket or token", async () => {
+	const server = startServer(({ requestIndex, send }) => {
+		send(turnStateFrame());
+		for (const frame of completedFrames(`response-${requestIndex}`, "ok")) send(frame);
+	});
+	activeServer = server;
+	for (const key of ["sk-old", "sk-new"]) {
+		const result = await runChat(createChatProvider(server, key), { workTurnId: "work-1" });
+		expect(result.error).toBeUndefined();
+	}
+	expect(server.connectionCount()).toBe(2);
+	expect(requestTurnState(server, 0)).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBeUndefined();
+});
+
 test("the request dump records the original request, not a recovery resend", async () => {
 	const server = startServer(({ requestIndex, send }) => {
 		if (requestIndex === 0) {
@@ -687,10 +737,10 @@ for (const { code, frame } of recoverableErrors) {
 		expect(server.requests[2]?.connectionIndex).toBe(2);
 		expect(server.requests[2]?.body.previous_response_id).toBeUndefined();
 		expect(server.requests[2]?.body.input).toEqual(server.requests[0]?.body.input);
-		expect(requestTurnState(server, 2)).toBe("sticky-2");
+		expect(requestTurnState(server, 2)).toBe("sticky-1");
 	});
 
-	test(`abort during ${code} cleanup still clears sticky state before the next chat`, async () => {
+	test(`abort during ${code} cleanup preserves sticky state for the continuing work turn`, async () => {
 		const controller = new AbortController();
 		const server = startServer(({ requestIndex, send }) => {
 			if (requestIndex === 0) {
@@ -731,14 +781,14 @@ for (const { code, frame } of recoverableErrors) {
 		expect(collectText(second.events)).toBe("fresh");
 		expect(server.requests).toHaveLength(2);
 		expect(server.requests[1]?.connectionIndex).toBe(1);
-		expect(requestTurnState(server, 1)).toBeUndefined();
+		expect(requestTurnState(server, 1)).toBe("sticky-1");
 	});
 }
 
 test.each([
 	"error frame",
 	"close reason",
-])("ordinary errors still clear sticky state before the next chat (%s)", async (delivery) => {
+])("ordinary errors discard the response chain without changing same-turn routing (%s)", async (delivery) => {
 	const failure = JSON.stringify({
 		type: "error",
 		status: 400,
@@ -769,10 +819,10 @@ test.each([
 	expect(server.requests).toHaveLength(2);
 	expect(server.requests[1]?.connectionIndex).toBe(1);
 	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-	expect(requestTurnState(server, 1)).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 });
 
-test("normal abort still clears sticky state before the next chat", async () => {
+test("normal abort preserves sticky state for the continuing work turn", async () => {
 	const server = startServer(({ requestIndex, send }) => {
 		if (requestIndex === 0) {
 			send(turnStateFrame());
@@ -797,10 +847,10 @@ test("normal abort still clears sticky state before the next chat", async () => 
 	expect(collectText(second.events)).toBe("fresh");
 	expect(server.requests).toHaveLength(2);
 	expect(server.requests[1]?.connectionIndex).toBe(1);
-	expect(requestTurnState(server, 1)).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 });
 
-test("an explicit upstream reset clears the sticky token retained for resumable chat recovery", async () => {
+test("a rebuilt history clears the response chain while retaining same-turn routing", async () => {
 	const server = startServer(({ requestIndex, send }) => {
 		if (requestIndex === 0) {
 			send(turnStateFrame());
@@ -822,7 +872,7 @@ test("an explicit upstream reset clears the sticky token retained for resumable 
 	expect(server.requests).toHaveLength(2);
 	expect(server.requests[1]?.connectionIndex).toBe(1);
 	expect(server.requests[1]?.body.previous_response_id).toBeUndefined();
-	expect(requestTurnState(server, 1)).toBeUndefined();
+	expect(requestTurnState(server, 1)).toBe("sticky-1");
 });
 
 const CYBER_POLICY_FRAME = JSON.stringify({

@@ -84,6 +84,7 @@ import type { UpdateExecutionLease } from "./update-coordinator";
 // ---------------------------------------------------------------------------
 
 export interface SubagentBufferedMessage {
+	preserveWorkTurn?: boolean;
 	state?: "queued" | "failed";
 	error?: string | null;
 	_mailboxClaim?: MailboxClaim;
@@ -129,6 +130,8 @@ export interface SubagentExecOptions {
 	initialHistory: unknown[];
 	initialTrailingToolResults?: unknown[];
 	initialPrePromptBashCommand?: string;
+	/** Accepted input consumed before this runtime session was created. */
+	workTurnId?: string;
 	/** Pre-loaded custom subagent definition (avoids redundant I/O) */
 	customDef?: CustomSubagentDef | null;
 	/** Rebuild system prompt callback — called after compact to regenerate with new contextSummary */
@@ -442,6 +445,8 @@ export async function readSubagentSpecContinuationState(narratorId: string): Pro
  * Returns false if the queue is full.
  */
 export interface SubagentBufferedMessageOptions {
+	/** Internal tool-decision feedback, not a new user work turn. */
+	preserveWorkTurn?: boolean;
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery;
 	images?: ImageRef[];
 	textFiles?: File[];
@@ -480,6 +485,7 @@ export async function pushSubagentBufferedMessage(
 		options?.prePromptBashCommand,
 		options?.fileReferences,
 		"fifo",
+		options?.preserveWorkTurn,
 	);
 }
 
@@ -681,6 +687,7 @@ async function persistNextBufferedSubagentMessage(opts: {
 }): Promise<{
 	buffered: SubagentBufferedMessage;
 	userMsg: Awaited<ReturnType<typeof narratorService.persistSubagentUserMessage>>;
+	workTurnId?: string;
 } | null> {
 	const { narratorId, parentNarratorId, toolUseId } = opts;
 	const row = claimInboxHead(
@@ -720,6 +727,11 @@ async function persistNextBufferedSubagentMessage(opts: {
 		if (hadSoftStop) requestSubagentBufferedMessageSoftStop(narratorId);
 		throw error;
 	}
+	// Both in-pass injection and control/pass restarts share this committed input boundary.
+	// Agent Send rows can also project as user history, but do not start a user work turn.
+	const workTurnId = row.kind === "user_input" && !buffered.preserveWorkTurn ? row.id : undefined;
+	const active = activeNarrators.get(narratorId);
+	if (active && workTurnId) active._upstreamWorkTurnId = workTurnId;
 	try {
 		broadcastToNarrator(parentNarratorId, {
 			type: "user_message",
@@ -752,7 +764,7 @@ async function persistNextBufferedSubagentMessage(opts: {
 			error: String(error),
 		});
 	}
-	return { buffered, userMsg };
+	return { buffered, userMsg, workTurnId };
 }
 
 /** The running-pass path shares the same durable claim/restore boundary as restarts. */
@@ -808,6 +820,8 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 	prompt: string;
 	/** Raw current input for an orchestrator that will rebuild history itself. */
 	currentInput?: string;
+	/** Only present for an actually consumed user_input mailbox row. */
+	workTurnId?: string;
 	history: unknown[];
 	trailingToolResults: unknown[];
 	userId?: string | null;
@@ -888,6 +902,7 @@ export async function consumeNextBufferedSubagentMessage(opts: {
 			: modelText;
 		return {
 			prompt,
+			workTurnId: claimed.workTurnId,
 			currentInput: modelText,
 			history: rebuilt.history,
 			trailingToolResults: rebuilt.trailingToolResults,
@@ -1077,6 +1092,7 @@ async function runSubagentRuntime(
 	const active: ActiveNarrator = {
 		narratorId: opts.narratorId,
 		conversationId: randomUUID(),
+		_upstreamWorkTurnId: opts.workTurnId,
 		cwd: opts.cwd,
 		model,
 		provider: resolveProvider(model),

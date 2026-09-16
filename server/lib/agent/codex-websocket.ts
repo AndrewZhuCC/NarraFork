@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
 import {
 	CYBER_POLICY_VIOLATION_CODE,
@@ -140,7 +141,9 @@ interface CachedSession {
 	disabled: boolean;
 	lastRequest: CodexResponsesRequestBody | null;
 	lastCompleted: CompletedResponseSnapshot | null;
+	/** First upstream value for this work turn, matching codex-rs OnceLock semantics. */
 	turnState: string | null;
+	workTurnId?: string;
 	busy: boolean;
 	lastUsedAt: number;
 }
@@ -180,6 +183,8 @@ export interface StreamCodexResponsesWebSocketOptions {
 	signal: AbortSignal;
 	/** Close and clear cached WebSocket response-chain state before dispatching this request. */
 	resetSessionBeforeRequest?: boolean;
+	/** New user work starts fresh routing; absent means a continuation of the cached turn. */
+	workTurnId?: string;
 	turnMetadata?: string;
 	/** Override the User-Agent handshake header. Defaults to the narrafork UA. */
 	userAgent?: string;
@@ -291,7 +296,21 @@ function requestWithoutInput(
 }
 
 function buildSessionCacheKey(options: StreamCodexResponsesWebSocketOptions): string {
-	return [options.baseUrl, options.sessionKey, options.credentialId, options.model].join("::");
+	// Keep OAuth refreshes within the same account; API-key relays have no stable account id.
+	const headers = new Headers(buildHandshakeHeaders(options));
+	const accountId = headers.get("chatgpt-account-id");
+	const authIdentity = createHash("sha256")
+		.update(
+			JSON.stringify(accountId ? ["account", accountId] : ["auth", headers.get("authorization")]),
+		)
+		.digest("hex");
+	return [
+		options.baseUrl,
+		options.sessionKey,
+		options.credentialId,
+		options.model,
+		authIdentity,
+	].join("::");
 }
 
 function touchSession(session: CachedSession): void {
@@ -1089,7 +1108,7 @@ async function ensureConnection(
 		(response) => {
 			const turnState = response.headers[TURN_STATE_HEADER];
 			if (typeof turnState === "string" && turnState) {
-				session.turnState = turnState;
+				session.turnState ??= turnState;
 			}
 		},
 	);
@@ -1132,14 +1151,19 @@ export async function* streamCodexResponsesWebSocket(
 	let requestDispatched = false;
 	const resetAbortedSessionIfNeeded = async () => {
 		if (!completed && options.signal.aborted && (requestDispatched || connection)) {
-			await resetSession(session, false);
+			await discardResponseChain(session);
 			connection = null;
 		}
 	};
 
 	try {
+		// Only the runtime knows when new user work starts. An aborted request is not that boundary.
+		if (options.workTurnId && options.workTurnId !== session.workTurnId) {
+			await resetSession(session);
+			session.workTurnId = options.workTurnId;
+		}
 		if (options.resetSessionBeforeRequest) {
-			await resetSession(session, false);
+			await discardResponseChain(session);
 		}
 		let reconnectCount = 0;
 		let connectionLimitReconnects = 0;
@@ -1236,7 +1260,7 @@ export async function* streamCodexResponsesWebSocket(
 			touchSession(session);
 			connection = await ensureConnection(session, options, handshakeHeaders);
 			if (options.signal.aborted) {
-				await resetSession(session, false);
+				await discardResponseChain(session);
 				return false;
 			}
 			await dispatchRequest();
@@ -1363,7 +1387,7 @@ export async function* streamCodexResponsesWebSocket(
 				}
 				const latestMessageCreatedAt = await getLatestNarratorMessageCreatedAt(options.narratorId);
 				if (options.signal.aborted) {
-					await resetSession(session, false);
+					await discardResponseChain(session);
 					yield { silentDisconnect: true };
 					return;
 				}
@@ -1391,7 +1415,7 @@ export async function* streamCodexResponsesWebSocket(
 					}
 					continue;
 				}
-				await resetSession(session, false);
+				await discardResponseChain(session);
 				connection = null;
 				if (decision.shouldFallback) {
 					throw new CodexWebSocketFallbackError(
@@ -1406,7 +1430,7 @@ export async function* streamCodexResponsesWebSocket(
 			}
 			if (frame.type === "close") {
 				if (options.signal.aborted) {
-					await resetSession(session, false);
+					await discardResponseChain(session);
 					yield { silentDisconnect: true };
 					return;
 				}
@@ -1556,7 +1580,7 @@ export async function* streamCodexResponsesWebSocket(
 					}
 					continue;
 				}
-				await resetSession(session, false);
+				await discardResponseChain(session);
 				connection = null;
 				const closeReason = frame.reason.trim();
 				const closeMessage =
@@ -1646,7 +1670,7 @@ export async function* streamCodexResponsesWebSocket(
 			// the first in a turn) learned the token nowhere and dropped sticky routing.
 			const eventTurnState = extractTurnStateFromEvent(chunk as Record<string, unknown>);
 			if (eventTurnState) {
-				session.turnState = eventTurnState;
+				session.turnState ??= eventTurnState;
 			}
 
 			if (chunk.type === "response.created" && chunk.response?.id) {
@@ -1692,10 +1716,10 @@ export async function* streamCodexResponsesWebSocket(
 			// Recovery handlers already discarded the socket and response chain. Keep
 			// the turn's sticky token for the caller's next chat invocation, whether it
 			// resumes partial output or retries after exhausting the reconnect budget.
-			// The finally block still fully resets a request that was aborted.
+			// Aborting a reflection also discards only the connection, not the parent's routing token.
 			throw error;
 		}
-		await resetSession(session, false);
+		await discardResponseChain(session);
 		throw error;
 	} finally {
 		if (connection) connection.onFrame = undefined;

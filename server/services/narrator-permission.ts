@@ -4624,6 +4624,7 @@ async function deliverSubagentPermissionFeedback(
 					(
 						await bufferSubagentUserMessage(id, message, {
 							createdBy: options.createdBy,
+							preserveWorkTurn: true,
 							// A taken-over subagent is driven by the user directly, so cutting
 							// short the turn they are steering would be wrong; the resume path
 							// drains the queue instead. Same rule every other subagent send obeys.

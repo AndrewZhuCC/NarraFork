@@ -1003,11 +1003,13 @@ export interface AgentConfig {
 	/** Metadata sent with API requests (e.g. Anthropic metadata.user_id) */
 	metadata?: { user_id: string };
 	/**
-	 * One-shot reset for reusable upstream transport/session state before the first
+	 * One-shot reset for reusable upstream response-chain state before the first
 	 * provider request in this agent loop. Used after compact/context-clear rebuilt
 	 * history outside the inner loop.
 	 */
 	resetUpstreamSessionOnFirstRequest?: boolean;
+	/** Read per request: in-pass user input can start a new work turn; reflections inherit it. */
+	getWorkTurnId?: () => string | undefined;
 	/** Filter tools available to this agent (subagent/tool-trait restriction) */
 	toolFilter?: (tool: ToolDefinition) => boolean;
 	/** Request-level extensions (prompt persona / near-field guidance / tool anchoring). */

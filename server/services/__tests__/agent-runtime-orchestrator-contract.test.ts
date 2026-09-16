@@ -200,7 +200,8 @@ describe("real shared orchestrator profile contract", () => {
 				let spillPath = "";
 				let id = "";
 				const h = fixture({ kind: "primary" }, [
-					async () => {
+					async (options) => {
+						expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 						const accepted = await enqueueBufferedMessage(
 							"contract-primary",
 							"queued prompt",
@@ -214,6 +215,7 @@ describe("real shared orchestrator profile contract", () => {
 							kind === "references" ? [snapshot] : undefined,
 						);
 						expect(accepted.ok).toBe(true);
+						expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 						id = accepted.id;
 						const row = db
 							.select()
@@ -226,6 +228,7 @@ describe("real shared orchestrator profile contract", () => {
 						return { ...finished };
 					},
 					async (options) => {
+						expect(options.config.getWorkTurnId?.()).toBe(id);
 						expect(existsSync(spillPath)).toBe(false);
 						if (kind === "references") expect(options.userText).toContain(snapshot.snapshotText);
 						// The Bash double does not append a tool result, so history rebuilding
@@ -233,6 +236,7 @@ describe("real shared orchestrator profile contract", () => {
 						return { ...finished };
 					},
 				]);
+				h.session._upstreamWorkTurnId = "original-work-turn";
 				const result = await h.run();
 				expect(result.hasError).toBe(false);
 				expect(h.calls).toHaveLength(2);
@@ -262,6 +266,8 @@ describe("real shared orchestrator profile contract", () => {
 			expect(h.calls).toHaveLength(1);
 			expect(h.calls[0].userText).toBe("same input");
 			expect(h.calls[0].config.model).toBe(MODEL);
+			expect(h.calls[0].config.getWorkTurnId).toBeFunction();
+			expect(h.calls[0].config.getWorkTurnId?.()).toBeUndefined();
 			expect(h.calls[0].config.loopExtensions).toEqual(
 				profile.kind === "primary" ? [routerLoopExtension] : undefined,
 			);
@@ -389,8 +395,13 @@ describe("real shared orchestrator profile contract", () => {
 				},
 				finished,
 			]);
+			h.session._upstreamWorkTurnId = "original-work-turn";
 			const result = await h.run();
 			expect(result.hasError).toBe(false);
+			expect(h.calls.map((call) => call.config.getWorkTurnId?.())).toEqual([
+				"original-work-turn",
+				"original-work-turn",
+			]);
 			expect(h.calls.map((call) => call.userText)).toEqual(["same input", ""]);
 			expect(
 				db.select().from(narratorMessages).where(eq(narratorMessages.role, "user")).all(),
@@ -423,6 +434,7 @@ describe("real shared orchestrator profile contract", () => {
 					if (!injection || typeof injection === "string")
 						throw new Error("Missing adoption packet");
 					expect(injection.text).toContain("after-tools ready");
+					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 					const before = db.select().from(narratorBufferedMessages).get();
 					expect(before).toMatchObject({ state: "materialized", adoptedAt: null });
 					expect(injection.onConsumed).toBeFunction();
@@ -432,6 +444,7 @@ describe("real shared orchestrator profile contract", () => {
 					return finished;
 				},
 			]);
+			h.session._upstreamWorkTurnId = "original-work-turn";
 			expect((await h.run()).hasError).toBe(false);
 			expect(h.calls).toHaveLength(1);
 		});
@@ -444,14 +457,18 @@ describe("real shared orchestrator profile contract", () => {
 		test(`child ${scenario.name} stays queued until the next pass adopts its exact user`, async () => {
 			const order: string[] = [];
 			const feedback = `${scenario.name} input`;
+			let acceptedId = "";
 			const h = fixture(profiles[1], [
 				async (options) => {
 					expect(options.config.userId).toBe("principal-a");
 					const accepted = await bufferSubagentUserMessage("contract-child", feedback, {
 						createdBy: scenario.recipient,
 						requestSoftStop: scenario.softStop,
+						preserveWorkTurn: scenario.softStop,
 					});
 					expect(accepted.ok).toBe(true);
+					acceptedId = accepted.id;
+					expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 					order.push("queued");
 					if (scenario.softStop) expect(options.config.shouldStop?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
@@ -469,6 +486,9 @@ describe("real shared orchestrator profile contract", () => {
 				},
 				async (options) => {
 					expect(options.config.userId).toBe(scenario.recipient);
+					expect(options.config.getWorkTurnId?.()).toBe(
+						scenario.softStop ? "original-work-turn" : acceptedId,
+					);
 					expect(options.userText).toContain(feedback);
 					order.push("feedback-before-next-tool");
 					const message = db
@@ -484,6 +504,7 @@ describe("real shared orchestrator profile contract", () => {
 				},
 			]);
 			h.session._currentUserId = "principal-a";
+			h.session._upstreamWorkTurnId = "original-work-turn";
 			expect((await h.run()).hasError).toBe(false);
 			expect(h.calls).toHaveLength(2);
 			expect(order).toEqual(["queued", "old-pass-stopped", "feedback-before-next-tool"]);
@@ -496,15 +517,20 @@ describe("real shared orchestrator profile contract", () => {
 		const text = "same principal after-tools input";
 		const h = fixture(profiles[1], [
 			async (options) => {
+				const reflectionConfig = { ...options.config };
+				expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 				const accepted = await bufferSubagentUserMessage("contract-child", text, {
 					createdBy: "principal-a",
 					requestSoftStop: false,
 				});
 				expect(accepted.ok).toBe(true);
+				expect(options.config.getWorkTurnId?.()).toBe("original-work-turn");
 				expect(options.config.shouldStop?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);
+				expect(options.config.getWorkTurnId?.()).toBe(accepted.id);
+				expect(reflectionConfig.getWorkTurnId?.()).toBe(accepted.id);
 				const row = db
 					.select()
 					.from(narratorBufferedMessages)
@@ -542,6 +568,7 @@ describe("real shared orchestrator profile contract", () => {
 			},
 		]);
 		h.session._currentUserId = "principal-a";
+		h.session._upstreamWorkTurnId = "original-work-turn";
 		expect((await h.run()).hasError).toBe(false);
 		expect(h.calls).toHaveLength(1);
 	});

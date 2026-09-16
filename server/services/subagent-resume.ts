@@ -17,6 +17,7 @@ import type { ImageRef } from "../lib/uploads";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
 import {
+	activeNarrators,
 	withNarratorMutationAdmission,
 	withNarratorStartAdmission,
 	withNarratorWorkAdmission,
@@ -550,6 +551,10 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 			throw error;
 		}
 
+		const newUserInput =
+			input.actor === "user" &&
+			!input.mailboxInput &&
+			(input.intent === "follow_up" || input.intent === "regenerate_edited_message");
 		if (manualClaim) {
 			try {
 				let userMessage: ResumeSubagentResult["userMessage"];
@@ -608,6 +613,8 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				if (!resumed) {
 					throw new ValidationError("Subagent suspension ended before it could be resumed");
 				}
+				const active = activeNarrators.get(input.subagentId);
+				if (active && newUserInput) active._upstreamWorkTurnId = userMessage?.id ?? generateId();
 				if (userMessage) {
 					broadcastUserMessage(input.subagentId, original.parentNarratorId, userMessage);
 				}
@@ -641,6 +648,7 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 		});
 		try {
 			const started = await startContinuedSubagent({
+				newUserInput,
 				deferPublicationRelease: true,
 				subagentId: input.subagentId,
 				parentNarratorId: original.parentNarratorId,

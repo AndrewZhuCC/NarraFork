@@ -70,6 +70,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
+	/** Explicit user-work boundary; omission continues the session's current work turn. */
+	workTurnId?: string;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Service tier for Codex-mode providers — "priority" enables fast mode */
@@ -79,9 +81,8 @@ export interface ChatParams extends ProtocolChatParams {
 	/** Optional collector for persisting raw provider request/response dumps. */
 	requestDump?: ApiRequestDumpCollector;
 	/**
-	 * Reset any reusable upstream transport state before this request. Used when the
-	 * agent loop rebuilt history (e.g. after compact) so WebSocket/previous-response
-	 * chains do not continue from stale context.
+	 * Discard the reusable upstream response chain after history was rebuilt (e.g.
+	 * after compact), without discarding the current work turn's routing token.
 	 */
 	resetUpstreamSession?: boolean;
 	/**

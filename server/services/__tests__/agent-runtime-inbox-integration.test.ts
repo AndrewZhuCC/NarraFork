@@ -249,7 +249,7 @@ test("child real consumer retains mailbox payload after SQL failure and retries 
 	}
 	expect(state(accepted.id)).toMatchObject({ state: "queued", text: d.text });
 	expect(childMessages()).toHaveLength(0);
-	await consume();
+	expect((await consume())?.workTurnId).toBeUndefined();
 	expect(state(accepted.id)).toMatchObject({ state: "materialized", text: "", adoptedAt: null });
 	expect(childMessages()).toHaveLength(1);
 	await consume();
@@ -259,7 +259,7 @@ test("child real consumer retains mailbox payload after SQL failure and retries 
 test("post-commit WS failure never requeues the committed child delivery", async () => {
 	const accepted = await pushSubagentBufferedMessage("child", "plain user");
 	failBroadcast = true;
-	expect(await consume()).not.toBeNull();
+	expect((await consume())?.workTurnId).toBe(accepted.id);
 	failBroadcast = false;
 	expect(state(accepted.id)?.state).toBe("materialized");
 	await consume();

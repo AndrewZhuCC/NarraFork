@@ -997,6 +997,7 @@ export async function runAgentLoopUnlocked(
 				runtimePolicy,
 				narratorId,
 				conversationId: active.conversationId,
+				getWorkTurnId: () => active._upstreamWorkTurnId,
 				model: resolved.model,
 				provider: resolved.provider,
 				cwd: active.cwd,
@@ -2316,6 +2317,7 @@ export async function runAgentLoopUnlocked(
 						undefined,
 						{ mailboxClaim: buffered._mailboxClaim },
 					);
+					if (!buffered.preserveWorkTurn) active._upstreamWorkTurnId = buffered.id;
 					pendingBufferedDelivery = undefined;
 					cleanupBufferedTextFiles(buffered._stagingId ?? buffered.id);
 					broadcastToNarrator(narratorId, {

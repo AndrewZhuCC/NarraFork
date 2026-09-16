@@ -241,7 +241,7 @@ describe("approval feedback for a subagent permission request", () => {
 		// The text is in the queue the subagent loop drains, trimmed, attributed to
 		// the approver.
 		expect(getSubagentBufferedMessages(SUBAGENT_ID)).toMatchObject([
-			{ text: "可以，但注意 X", createdBy: APPROVER_ID },
+			{ text: "可以，但注意 X", createdBy: APPROVER_ID, preserveWorkTurn: true },
 		]);
 		// And the loop is asked to stop at its next post-tool boundary so the text is
 		// taken up promptly instead of at the end of an arbitrarily long run. This is
@@ -274,6 +274,7 @@ describe("approval feedback for a subagent permission request", () => {
 			cwd: ".",
 		});
 		expect(consumed?.prompt).toBe("记得同时更新迁移");
+		expect(consumed?.workTurnId).toBeUndefined();
 		// And it is present in the rebuilt model history, not just in the prompt: a
 		// drain that returned the text but rebuilt a history without it would still
 		// lose the feedback on any later pass.

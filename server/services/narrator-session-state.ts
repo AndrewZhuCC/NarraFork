@@ -30,6 +30,8 @@ export interface ActiveNarrator {
 	abortController: AbortController;
 	narratorId: string;
 	conversationId: string;
+	/** Last accepted user input; retries, tool decisions and system continuations keep this ID. */
+	_upstreamWorkTurnId?: string;
 	cwd: string;
 	/** Raw model reference stored on the narrator, e.g. __default__ or __agg__:id. */
 	_modelRef?: string;
@@ -298,6 +300,8 @@ export interface SavedBufferedFile {
 // === BufferedMessage interface ===
 
 export interface BufferedMessage {
+	/** Tool approval feedback is user-authored, but continues the existing work turn. */
+	preserveWorkTurn?: boolean;
 	id: string;
 	text: string;
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */

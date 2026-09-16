@@ -40,6 +40,7 @@ import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-rout
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
+import { generateId } from "../lib/id";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -664,6 +665,8 @@ export async function executeQueuedGoalCommand(
 			throw error;
 		}
 	});
+	const active = activeNarrators.get(narratorId);
+	if (active && !buffered.preserveWorkTurn) active._upstreamWorkTurnId = buffered.id;
 	broadcastToNarrator(narratorId, {
 		type: "user_message",
 		narratorId,
@@ -2791,6 +2794,7 @@ async function feedMessageUnlocked(
 			origin,
 			{ mailboxClaim: inboxClaim(claimedInput) },
 		);
+		if (!accepted.preserveWorkTurn) active._upstreamWorkTurnId = claimedInput.id;
 	} catch (error) {
 		if (claimedInput) releaseInboxClaim(claimedInput, error);
 		throw error;
@@ -5662,6 +5666,8 @@ async function editAndRegenerateUnlocked(
 		throw new ValidationError("Narrator session was not initialized for regeneration");
 	}
 
+	// An explicit edit is new input even when copy-on-write kept the original message ID.
+	active._upstreamWorkTurnId = generateId();
 	// `active` was resolved above before saving new text files. Restore the
 	// triggering user so knowledge-base ACL works after a rebuild.
 	active._currentUserId = opts?.userId ?? active._currentUserId ?? null;

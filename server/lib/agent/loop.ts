@@ -3940,6 +3940,7 @@ export async function* agentLoop(
 						toolResults: pendingToolResults,
 						signal: attemptAbort.signal,
 						stickySessionKey: config.narratorId,
+						workTurnId: config.getWorkTurnId?.(),
 						reasoningEffort: config.reasoningEffort,
 						serviceTier: config.serviceTier,
 						metadata: config.metadata,

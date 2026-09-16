@@ -129,6 +129,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	preserveWorkTurn?: boolean;
 	stagingId?: string;
 	fileReferencesPath?: string;
 	commandTextPath?: string;
@@ -269,6 +270,7 @@ export function projectMailboxUserMessage(row: MailboxRow): BufferedMessage {
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
 		id: row.id,
+		preserveWorkTurn: metadata.preserveWorkTurn,
 		state: row.state === "failed" ? "failed" : "queued",
 		error: row.lastError,
 		get text() {
@@ -347,6 +349,7 @@ export async function enqueueBufferedMessage(
 	bashCommand?: string | null,
 	fileReferences?: FileReferenceSnapshot[],
 	frontOrder: "stack" | "fifo" = "stack",
+	preserveWorkTurn = false,
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
@@ -367,6 +370,7 @@ export async function enqueueBufferedMessage(
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
 		const metadata: StagingMetadata = { stagingId };
+		if (preserveWorkTurn) metadata.preserveWorkTurn = true;
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
 			commandText = null;

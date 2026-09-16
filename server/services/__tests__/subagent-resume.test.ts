@@ -1215,6 +1215,7 @@ describe("resumeSubagent", () => {
 			createdBy: "user-2",
 			userId: "user-2",
 			canReportToParent: true,
+			newUserInput: false,
 		});
 		await finishRun(subagentId);
 	});
@@ -1249,6 +1250,7 @@ describe("resumeSubagent", () => {
 			persistPrompt: false,
 			initialHistory: [{ role: "user", content: "history" }],
 			initialTrailingToolResults: [{ type: "tool_result", toolUseId: "denied-tool-use" }],
+			newUserInput: false,
 		});
 		await finishRun(subagentId);
 	});
@@ -1298,6 +1300,7 @@ describe("resumeSubagent", () => {
 			prompt: "edited prompt",
 			persistPrompt: false,
 			userId: "user-5",
+			newUserInput: true,
 		});
 		await finishRun(subagentId);
 	});

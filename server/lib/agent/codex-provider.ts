@@ -647,6 +647,7 @@ export class CodexProvider implements ProviderAdapter {
 					request,
 					signal: params.signal,
 					resetSessionBeforeRequest: params.resetUpstreamSession,
+					workTurnId: params.workTurnId,
 					userAgent: fingerprint.userAgent,
 					extraHeaders: fingerprint.headers,
 					requestDump: params.requestDump,

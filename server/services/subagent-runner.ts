@@ -1218,6 +1218,7 @@ export function waitForBackgroundTask(
 // === Foreground subagent execution loop ===
 
 interface ForegroundLoopInput {
+	workTurnId?: string;
 	deferCompletionPublication?: boolean;
 	prePromptBashCommand?: string;
 	publicationRun?: PublicationRun;
@@ -1465,6 +1466,7 @@ function startForegroundRunUnlocked(
 			const result = await executeSubagent(
 				{
 					initialPrePromptBashCommand: currentPrePromptBashCommand,
+					workTurnId: input.workTurnId,
 					narratorId: subagentId,
 					parentNarratorId,
 					toolUseId,
@@ -2053,6 +2055,8 @@ async function runSubagentUnlocked(input: RunSubagentInput): Promise<string> {
 // === Continue subagent ===
 
 export interface ContinueSubagentInput {
+	/** Explicit user follow-up/edit, not a retry, tool decision or agent message. */
+	newUserInput?: boolean;
 	mailboxInput?: boolean;
 	/** The resume adapter owns the final exact-origin publication chain. */
 	deferPublicationRelease?: boolean;
@@ -2406,6 +2410,9 @@ async function startContinuedSubagentUnlocked(
 				publicationRun,
 				deferCompletionPublication: input.skipConclusionDelivery !== true,
 				prePromptBashCommand: mailboxInput?.prePromptBashCommand,
+				workTurnId:
+					mailboxInput?.workTurnId ??
+					(input.newUserInput ? (userMessage?.id ?? generateId()) : undefined),
 				subagentId,
 				parentNarratorId,
 				toolUseId,
