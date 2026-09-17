@@ -47,6 +47,7 @@ scripts/lib/__tests__/*
 !scripts/build-local.ts
 !scripts/install-local.py
 !scripts/install-local.test.py
+!scripts/install-ks-mini.py
 !scripts/lib/binary-metadata.ts
 !scripts/lib/__tests__/binary-metadata.test.ts
 !scripts/lib/__tests__/latest-yml.test.ts
