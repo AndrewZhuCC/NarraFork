@@ -10,9 +10,10 @@ mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: 
 mock.module("../agent-runtime/orchestrator", () => ({
 	runAgentLoopUnlocked: async () => ({ started: true, allowInboxWake: false }),
 }));
-const { resumeNextBufferedMessage, sendMessage } = await import("../narrator-session");
+const { resumeNextBufferedMessage, sendMessage, startParentInboundContinuationIfPossible } =
+	await import("../narrator-session");
 const { enqueueBufferedMessage, getBufferedMessages } = await import("../narrator-buffer");
-const { runtimeInbox } = await import("../agent-runtime/inbox");
+const { runtimeInbox, wakeInboxIfEligible } = await import("../agent-runtime/inbox");
 const { specVfsService } = await import("../spec-vfs-service");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
@@ -177,6 +178,60 @@ async function withIdleSession(run: (session: typeof active) => Promise<void>) {
 		activeNarrators.delete("recipient");
 	}
 }
+
+for (const position of ["front", "back"] as const) {
+	test(`plan-mode user input queued at ${position} resumes after interrupt without leaving plan mode`, async () => {
+		db.update(narrators)
+			.set({ status: "idle", traits: ["standalone", "plan"], substatus: '["interrupted"]' })
+			.where(eq(narrators.id, "recipient"))
+			.run();
+		const queued = await enqueueBufferedMessage(
+			"recipient",
+			"adjust the plan",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			position,
+		);
+		await withIdleSession(async () => {
+			expect(await wakeInboxIfEligible("recipient", "en")).toBe(true);
+			expect(await wakeInboxIfEligible("recipient", "en")).toBe(false);
+		});
+		expect(
+			db
+				.select()
+				.from(narratorMessages)
+				.all()
+				.filter((row) => row.role === "user"),
+		).toMatchObject([{ contentText: "adjust the plan" }]);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.id, queued.id))
+				.get()?.state,
+		).toBe("materialized");
+		expect(db.select().from(narrators).where(eq(narrators.id, "recipient")).get()?.traits).toEqual([
+			"standalone",
+			"plan",
+		]);
+	});
+}
+
+test("plan mode still blocks unsolicited inbound continuation", async () => {
+	db.update(narrators)
+		.set({ status: "idle", traits: ["standalone", "plan"] })
+		.where(eq(narrators.id, "recipient"))
+		.run();
+	notice();
+	expect(await startParentInboundContinuationIfPossible("recipient", "en")).toEqual({
+		started: false,
+	});
+	expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+	expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("queued");
+});
 
 for (const delivery of ["send", "resume"] as const) {
 	test(`${delivery} persists a cancelled bash notice before ordinary input exactly once`, async () => {

@@ -3852,9 +3852,9 @@ async function startSubagentInjectionContinuation(
  * during that window would then sit untouched until the user acted again — and they
  * are queued now precisely because the recovery claim made the narrator look busy.
  *
- * Deliberately conservative: it never competes with a live owner, never wakes a
- * plan-mode narrator (mirroring goal/inbound continuation), and repairs a status row
- * that outlived recovery before starting anything.
+ * Never competes with a live owner, and repairs a status row that outlived recovery.
+ * Unlike automatic goal/inbound continuation, queued user input must also resume in
+ * plan mode: it is an explicit instruction, not permission to leave planning.
  */
 export async function resumeBufferedMessagesIfIdle(
 	narratorId: string,
@@ -3874,7 +3874,6 @@ export async function resumeBufferedMessagesIfIdle(
 		const narrator = await narratorService.getById(narratorId);
 		if (isSubagentVariant(narrator.variant)) return { resumed: false };
 		if (narrator.status !== "idle") return { resumed: false };
-		if (isPlanModeTrait(narrator.traits)) return { resumed: false };
 
 		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		if (active._loopRunning) return { resumed: false };
