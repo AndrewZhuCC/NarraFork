@@ -356,6 +356,19 @@ describe("human attention global listener and pagination", () => {
 		).toHaveLength(3);
 	});
 
+	test("opening the same-session owner closes the inbox even when navigation keeps the route", async () => {
+		const current = item("same-session", { narratorId: "parent" });
+		addPermission(current);
+		await render(<HumanAttentionInboxButton currentNarratorId="parent" />);
+		await click("decision(s)");
+		await click(narratorEn.humanAttentionOpenSession, row(current.id));
+		expect(router.navigate).toHaveBeenCalledWith({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "parent" },
+		});
+		expect(document.querySelector("[data-attention-id]")).toBeNull();
+	});
+
 	test("a failed list retains an explicit retry and does not claim nothing is waiting", async () => {
 		const list = spyOn(api, "getHumanAttention").mockRejectedValueOnce(new Error("network"));
 		await render(<HumanAttentionInboxButton />);
@@ -406,6 +419,8 @@ describe("child async questions from the parent attention entry", () => {
 			to: "/narrators/$narratorId",
 			params: { narratorId: "actual-child" },
 		});
+		expect(document.querySelector("[data-attention-id]")).toBeNull();
+		await click("decision(s)");
 		await click("Review decision", row(child.id));
 		expect(row(child.id).textContent).toContain("Decision owner: actual-child");
 		expect(row(child.id).querySelector("textarea")?.value).toBe("Keep this answer");

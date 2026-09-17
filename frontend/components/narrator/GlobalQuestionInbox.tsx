@@ -145,6 +145,15 @@ export function HumanAttentionInboxDrawer({
 }) {
 	const { t } = useTranslation("narrator");
 	const client = useQueryClient();
+	const navigate = useNavigate();
+	const openSession = useCallback(
+		(narratorId: string) => {
+			// Same-session navigation does not unmount the drawer: close it explicitly.
+			onClose();
+			void navigate({ to: "/narrators/$narratorId", params: { narratorId } });
+		},
+		[navigate, onClose],
+	);
 	const query = useHumanAttention(opened);
 	const items = loadedHumanAttentionItems(query.data?.pages);
 	const { current, others } = groupHumanAttentionByScope(items, currentNarratorId);
@@ -201,7 +210,7 @@ export function HumanAttentionInboxDrawer({
 								{t("inboxGroupCurrentSession")}
 							</Text>
 							{current.map((item) => (
-								<HumanAttentionRow key={item.id} item={item} />
+								<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
 							))}
 						</Stack>
 					)}
@@ -214,7 +223,7 @@ export function HumanAttentionInboxDrawer({
 								</Text>
 							)}
 							{others.map((item) => (
-								<HumanAttentionRow key={item.id} item={item} />
+								<HumanAttentionRow key={item.id} item={item} onOpenSession={openSession} />
 							))}
 						</Stack>
 					)}
@@ -253,23 +262,28 @@ function RetryNotice({
 	);
 }
 
-function OwnerLink({ item }: { item: HumanAttentionItem }) {
+function OwnerLink({
+	item,
+	onOpenSession,
+}: {
+	item: HumanAttentionItem;
+	onOpenSession: (narratorId: string) => void;
+}) {
 	const { t } = useTranslation("narrator");
-	const navigate = useNavigate();
 	return (
-		<Button
-			onClick={() =>
-				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } })
-			}
-			size="compact-xs"
-			variant="subtle"
-		>
+		<Button onClick={() => onOpenSession(item.narratorId)} size="compact-xs" variant="subtle">
 			{t("humanAttentionOpenSession")}
 		</Button>
 	);
 }
 
-function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
+function HumanAttentionRow({
+	item,
+	onOpenSession,
+}: {
+	item: HumanAttentionItem;
+	onOpenSession: (narratorId: string) => void;
+}) {
 	const { t } = useTranslation("narrator");
 	const [expanded, setExpanded] = useState(false);
 	return (
@@ -313,9 +327,9 @@ function HumanAttentionRow({ item }: { item: HumanAttentionItem }) {
 					>
 						{t(expanded ? "humanAttentionCollapse" : "humanAttentionReview")}
 					</Button>
-					<OwnerLink item={item} />
+					<OwnerLink item={item} onOpenSession={onOpenSession} />
 				</Group>
-				{expanded && <HumanAttentionForm item={item} />}
+				{expanded && <HumanAttentionForm item={item} onOpenSession={onOpenSession} />}
 			</Stack>
 		</Paper>
 	);
@@ -410,9 +424,14 @@ function ReviewText({ label, value }: { label: string; value: unknown }) {
 	);
 }
 
-function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
+function HumanAttentionForm({
+	item: summary,
+	onOpenSession,
+}: {
+	item: HumanAttentionItem;
+	onOpenSession: (narratorId: string) => void;
+}) {
 	const { t } = useTranslation("narrator");
-	const navigate = useNavigate();
 	const client = useQueryClient();
 	const query = useHumanAttentionDetail(summary.id);
 	const item = query.data?.item ?? summary;
@@ -469,10 +488,9 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 	const fileDrawer = useMemo(
 		() => ({
 			// The inbox has no workspace file drawer; open the ACTUAL owner rather than a noop or parent.
-			openForApproval: () =>
-				void navigate({ to: "/narrators/$narratorId", params: { narratorId: item.narratorId } }),
+			openForApproval: () => onOpenSession(item.narratorId),
 		}),
-		[item.narratorId, navigate],
+		[item.narratorId, onOpenSession],
 	);
 
 	if (query.isLoading) return <Text size="sm">{t("humanAttentionLoading")}</Text>;
@@ -490,7 +508,7 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 				<Text size="sm">
 					{t(query.data?.tooLarge ? "humanAttentionTooLarge" : "humanAttentionUnavailable")}
 				</Text>
-				<OwnerLink item={item} />
+				<OwnerLink item={item} onOpenSession={onOpenSession} />
 			</Alert>
 		);
 	const readOnly = !summary.canAct || !item.canAct;
