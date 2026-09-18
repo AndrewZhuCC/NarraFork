@@ -412,15 +412,21 @@ function FileEditorDocument({
 		window.addEventListener("beforeunload", beforeUnload);
 		return () => window.removeEventListener("beforeunload", beforeUnload);
 	}, [session]);
-	const navigationKey = JSON.stringify([deviceId, filePath, navigationRequestId, selection]);
-	// Only a changed source-range navigation returns to editing. A file-only open
-	// also changes the request ID, but must preserve the chosen/default view.
-	const navigationRef = useRef(navigationKey);
+	const modeNavigationKey = JSON.stringify([
+		deviceId,
+		filePath,
+		selection?.startLineNumber,
+		selection?.startColumn,
+		selection?.endLineNumber,
+		selection?.endColumn,
+	]);
+	// Only a changed source range returns to editing; Monaco still receives the nonce for repeat jumps.
+	const navigationRef = useRef(modeNavigationKey);
 	useEffect(() => {
-		if (navigationRef.current === navigationKey) return;
-		navigationRef.current = navigationKey;
+		if (navigationRef.current === modeNavigationKey) return;
+		navigationRef.current = modeNavigationKey;
 		if (selection) setMode("raw");
-	}, [navigationKey, selection]);
+	}, [modeNavigationKey, selection]);
 	useEffect(() => {
 		if (mode === "raw") {
 			previewController.current?.abort();

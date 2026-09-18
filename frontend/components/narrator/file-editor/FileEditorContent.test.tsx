@@ -986,7 +986,7 @@ test("split mode keeps the editor interactive beside a live-updating preview", a
 test.each([
 	"split",
 	"preview",
-] as const)("saved %s default survives file-only navigation", async (defaultMode) => {
+] as const)("saved %s default survives unchanged navigation", async (defaultMode) => {
 	const store = new Map<string, string>();
 	const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
 	restores.push(() => {
@@ -1022,15 +1022,30 @@ test.each([
 		expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
 		expect(defaultLink()).toBeUndefined();
 	};
-	// A new file, a late navigation ID, and reopening without a range must all keep the mode.
+	// A new file and repeated file-only opens must all keep the mode.
 	await mount({ filePath: "/work/b.md", selection: undefined });
 	expectDefault();
 	await mount({ filePath: "/work/b.md", selection: undefined, navigationRequestId: "late" });
 	expectDefault();
 	await mount({ filePath: "/work/b.md", selection: undefined, navigationRequestId: "again" });
 	expectDefault();
-	// Explicit source-range navigation still reveals the editor, without changing the default.
-	await mount({ filePath: "/work/b.md", selection, navigationRequestId: "range" });
+	// A fresh editor may open at a range without overriding the saved default.
+	await act(async () => root?.unmount());
+	root = createRoot(host);
+	await mount({ filePath: "/work/c.md", selection, navigationRequestId: "range-first" });
+	expectDefault();
+	await mount({
+		filePath: "/work/c.md",
+		selection: { ...selection },
+		navigationRequestId: "range-again",
+	});
+	expectDefault();
+	// A genuinely different source range still reveals the editor without changing the default.
+	await mount({
+		filePath: "/work/c.md",
+		selection: { ...selection, endColumn: selection.endColumn + 1 },
+		navigationRequestId: "range-changed",
+	});
 	expect(host.querySelector("[data-file-editor-source]")?.hasAttribute("inert")).toBe(false);
 	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
 	expect(store.get("narrafork_file_editor_mode")).toBe(defaultMode);
@@ -1180,12 +1195,32 @@ test("invalid JSON can be fixed without dropping the model", async () => {
 	expect(create).toHaveBeenCalledTimes(1);
 });
 
-test("line references preserve preview switch and new navigation returns to same model", async () => {
+test("line references preserve preview until the selected range changes", async () => {
 	const model = await mount({ filePath: "/work/a.md", navigationRequestId: "first" });
+	await edit(model, "# draft");
+	const history = model.undoEntries;
 	await switchFileMode("preview");
 	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
 	expect(await mount({ filePath: "/work/a.md", navigationRequestId: "second" })).toBe(model);
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	expect(
+		await mount({
+			filePath: "/work/a.md",
+			selection: { ...selection },
+			navigationRequestId: "third",
+		}),
+	).toBe(model);
+	expect(host.querySelector("[data-file-editor-preview]")).not.toBeNull();
+	expect(
+		await mount({
+			filePath: "/work/a.md",
+			selection: { ...selection, endColumn: selection.endColumn + 1 },
+			navigationRequestId: "fourth",
+		}),
+	).toBe(model);
 	expect(host.querySelector("[data-file-editor-preview]")).toBeNull();
+	expect(model.text).toBe("# draft");
+	expect(model.undoEntries).toBe(history);
 	expect(create).toHaveBeenCalledTimes(1);
 });
 
