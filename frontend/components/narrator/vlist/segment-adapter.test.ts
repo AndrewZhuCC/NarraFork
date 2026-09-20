@@ -1380,7 +1380,9 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 
 	const COMPACT_LABELS = {
 		compacting: "压缩上下文中...",
+		compactingRemote: "正在请求 Codex 远程压缩…",
 		compacted: "上下文已压缩",
+		compactedRemote: "已用 Codex 远程压缩",
 		compactFailed: "压缩失败",
 		compactOutputChars: "{count} 字符",
 		compactThinking: "思考中",
@@ -1406,6 +1408,14 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 			labels: COMPACT_LABELS,
 		});
 		expect(dataOf(spec).text).toBe("压缩上下文中... · 128 字符");
+	});
+
+	it("remote context compacting uses the remote label and English fallback", () => {
+		const block = [{ type: "compact", status: "compacting", source: "remote" }];
+		expect(dataOf(compactSpec(block)).text).toBe("Requesting Codex remote compact…");
+		expect(dataOf(compactSpec(block, { lod: 5, labels: COMPACT_LABELS })).text).toBe(
+			"正在请求 Codex 远程压缩…",
+		);
 	});
 
 	it("context compact compacting → opts.progress folds the live count into the cache key", () => {
@@ -1476,7 +1486,7 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		// The whole point of the retry broadcast: "0 chars" alone reads as a stall
 		// while the summary model is actually failing and backing off.
 		const spec = compactSpec([
-			{ type: "compact", status: "compacting", outputChars: 0, retryCount: 2 },
+			{ type: "compact", status: "compacting", source: "remote", outputChars: 0, retryCount: 2 },
 		]);
 		expect(dataOf(spec).text).toBe("Compacting context… · retry #2");
 	});
@@ -1510,7 +1520,12 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 
 	it("context compact compacted → terse 'compacted' label, NOT the summary body", () => {
 		const spec = compactSpec([
-			{ type: "compact", status: "compacted", summary: "a very long compact summary body" },
+			{
+				type: "compact",
+				status: "compacted",
+				source: "local",
+				summary: "a very long compact summary body",
+			},
 		]);
 		expect(dataOf(spec).status).toBe("compacted");
 		expect(dataOf(spec).text).toBe("Context compacted");
@@ -1518,8 +1533,33 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		expect(spec.opts?.progress).toBeUndefined();
 	});
 
+	it("remote context compacted uses the localized remote label", () => {
+		const spec = compactSpec([{ type: "compact", status: "compacted", source: "remote" }], {
+			lod: 5,
+			labels: COMPACT_LABELS,
+		});
+		expect(dataOf(spec).text).toBe("已用 Codex 远程压缩");
+	});
+
+	it("legacy remote payload marks a completed compact without entering layout data", () => {
+		const spec = compactSpec([
+			{
+				type: "compact",
+				status: "compacted",
+				remoteCompact: {
+					provider: "codex",
+					items: [{ type: "compaction", encrypted_content: "secret" }],
+				},
+			},
+		]);
+		expect(dataOf(spec).text).toBe("Compacted with Codex remote compact");
+		expect(dataOf(spec).remoteCompact).toBeUndefined();
+	});
+
 	it("context compact failed → 'compact failed' label and failed status", () => {
-		const spec = compactSpec([{ type: "compact", status: "failed", error: "boom" }]);
+		const spec = compactSpec([
+			{ type: "compact", status: "failed", source: "remote", error: "boom" },
+		]);
 		expect(dataOf(spec).status).toBe("failed");
 		expect(dataOf(spec).text).toBe("Compact failed");
 	});
@@ -1534,7 +1574,13 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 
 	it("segment_compact compacted → 'segment compacted (N messages)', not summary", () => {
 		const spec = compactSpec([
-			{ type: "segment_compact", status: "compacted", messageCount: 12, summary: "hidden body" },
+			{
+				type: "segment_compact",
+				status: "compacted",
+				source: "remote",
+				messageCount: 12,
+				summary: "hidden body",
+			},
 		]);
 		expect(dataOf(spec).status).toBe("compacted");
 		expect(dataOf(spec).text).toBe("Segment compacted (12 messages)");
