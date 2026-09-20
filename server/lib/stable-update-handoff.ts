@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { logger } from "./logger";
 import { getNarraforkPath } from "./narrafork-home";
+import { isValidLaunchdLabel } from "./stable-update-install";
 import { APP_VERSION, GIT_COMMIT } from "./version";
 
 export const STABLE_SERVER_EXEC_PATH = resolve(homedir(), ".local/bin/narrafork-server");
@@ -26,7 +27,6 @@ export const STABLE_UPDATE_HANDOFF_MAX_AGE_MS = 10 * 60 * 1000;
 const STABLE_SERVER_MAX_BYTES = 512 * 1024 * 1024;
 const STABLE_SERVER_HASH_TIMEOUT_MS = 30_000;
 const STABLE_UPDATE_HANDOFF_FILENAME = "stable-path-handoff.json";
-const EXPECTED_XPC_SERVICE_NAME = "dev.narrafork.server";
 
 interface StableUpdateHandoffClaim {
 	format: 1;
@@ -39,6 +39,7 @@ interface StableUpdateHandoffClaim {
 	targetCommit: string;
 	sourcePid: number;
 	sourceCommit: string;
+	launchdLabel?: string;
 	execPath: string;
 }
 
@@ -49,6 +50,7 @@ export interface WriteStableUpdateHandoffInput {
 	targetSha512: string;
 	targetVersion: string;
 	targetCommit: string;
+	launchdLabel?: string;
 	sourcePid?: number;
 	sourceCommit?: string;
 }
@@ -84,6 +86,11 @@ function requiredString(value: unknown, name: string): string {
 	return value;
 }
 
+function requiredLaunchdLabel(value: unknown): string {
+	if (!isValidLaunchdLabel(value)) throw new Error("Invalid stable update handoff launchd label");
+	return value;
+}
+
 function parseClaim(raw: string): StableUpdateHandoffClaim {
 	const value = JSON.parse(raw) as Partial<StableUpdateHandoffClaim>;
 	if (
@@ -105,6 +112,9 @@ function parseClaim(raw: string): StableUpdateHandoffClaim {
 		targetCommit: requiredString(value.targetCommit, "target commit"),
 		sourcePid: value.sourcePid as number,
 		sourceCommit: requiredString(value.sourceCommit, "source commit"),
+		// Legacy v1 claims omitted the label; nonce, target hash and fixed path remain mandatory.
+		launchdLabel:
+			value.launchdLabel === undefined ? undefined : requiredLaunchdLabel(value.launchdLabel),
 		execPath: requiredString(value.execPath, "exec path"),
 	};
 }
@@ -158,6 +168,9 @@ export function writeStableUpdateHandoff(
 		targetCommit: requiredString(input.targetCommit, "target commit"),
 		sourcePid: input.sourcePid ?? process.pid,
 		sourceCommit: requiredString(input.sourceCommit ?? GIT_COMMIT, "source commit"),
+		launchdLabel: requiredLaunchdLabel(
+			input.launchdLabel ?? overrides?.xpcServiceName ?? process.env.XPC_SERVICE_NAME,
+		),
 		execPath: resolve(overrides?.expectedExecPath ?? STABLE_SERVER_EXEC_PATH),
 	};
 	if (!Number.isSafeInteger(claim.sourcePid) || claim.sourcePid <= 0) {
@@ -260,19 +273,22 @@ function readMarker(path: string, uid: number): { nonce: string; pid: number } {
 	};
 }
 
-function isExpectedLaunchdContext(overrides?: StableUpdateHandoffOverrides): boolean {
-	return (
-		(overrides?.platform ?? process.platform) === "darwin" &&
-		(overrides?.ppid ?? process.ppid) === 1 &&
-		(overrides?.xpcServiceName ?? process.env.XPC_SERVICE_NAME) === EXPECTED_XPC_SERVICE_NAME
-	);
+function currentLaunchdLabel(overrides?: StableUpdateHandoffOverrides): string | null {
+	if (
+		(overrides?.platform ?? process.platform) !== "darwin" ||
+		(overrides?.ppid ?? process.ppid) !== 1
+	)
+		return null;
+	const service = overrides?.xpcServiceName ?? process.env.XPC_SERVICE_NAME;
+	return isValidLaunchdLabel(service) ? service : null;
 }
 
 /** Consume the fixed-path launchd update claim at most once. */
 export async function consumeStableUpdateHandoff(
 	overrides?: StableUpdateHandoffOverrides,
 ): Promise<{ markerNonce: string } | null> {
-	if (!isExpectedLaunchdContext(overrides)) return null;
+	const launchdLabel = currentLaunchdLabel(overrides);
+	if (!launchdLabel) return null;
 
 	const path = claimPath(overrides);
 	const consumedPath = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.consumed`;
@@ -295,6 +311,8 @@ export async function consumeStableUpdateHandoff(
 			throw new Error("invalid claim file");
 		}
 		const claim = parseClaim(readFileSync(consumedPath, "utf8"));
+		if (claim.launchdLabel && claim.launchdLabel !== launchdLabel)
+			throw new Error("launchd service mismatch");
 		const now = overrides?.now ?? Date.now();
 		if (claim.createdAt > now || now - claim.createdAt > STABLE_UPDATE_HANDOFF_MAX_AGE_MS) {
 			throw new Error("expired claim");
@@ -306,7 +324,7 @@ export async function consumeStableUpdateHandoff(
 		}
 
 		const expectedExecPath = resolve(overrides?.expectedExecPath ?? STABLE_SERVER_EXEC_PATH);
-		const currentExecPath = resolve(overrides?.execPath ?? process.execPath);
+		const currentExecPath = realpathSync(overrides?.execPath ?? process.execPath);
 		if (claim.execPath !== expectedExecPath || currentExecPath !== expectedExecPath) {
 			throw new Error("unexpected executable path");
 		}

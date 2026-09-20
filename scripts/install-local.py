@@ -1,6 +1,6 @@
 """Install a signed selfuse build at a stable actual path; never restart the service.
 
-Usage: python3 scripts/install-local.py [--check | --validate-migrations | --prepare-update]
+Usage: python3 scripts/install-local.py [--launchd-label LABEL] [--check | --validate-migrations | --prepare-update]
 This intentionally supports the local supervisor installation only, not ks-mini.
 
 --prepare-update only prepares: it verifies the running server over /api/health and records a
@@ -8,6 +8,7 @@ This intentionally supports the local supervisor installation only, not ks-mini.
 placed-update.json so the built-in update coordination owns the single restart. It never
 restarts, stops or reloads the service itself, and the default install never writes the marker.
 """
+import argparse
 import datetime
 from contextlib import closing
 import hashlib
@@ -32,7 +33,8 @@ def digest(path):
     return h.hexdigest()
 
 
-LAUNCHD_LABEL = 'dev.narrafork.server'
+DEFAULT_LAUNCHD_LABEL = 'dev.narrafork.server'
+LAUNCHD_LABEL_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 HEALTH_READ_LIMIT = 65536
 
 
@@ -90,11 +92,17 @@ def validate_report(report, *, backup_sha256, source_sha256, commit, version, pe
 def main():
     if not __debug__:
         raise RuntimeError('Run without Python -O: installation safety checks are required')
-    flags = sys.argv[1:]
-    assert len(set(flags)) == len(flags) and set(flags) <= {'--check', '--validate-migrations', '--prepare-update'}, __doc__
-    check_only = '--check' in flags
-    validate_migrations = '--validate-migrations' in flags
-    prepare_update = '--prepare-update' in flags
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--launchd-label', default=DEFAULT_LAUNCHD_LABEL)
+    parser.add_argument('--check', action='store_true')
+    parser.add_argument('--validate-migrations', action='store_true')
+    parser.add_argument('--prepare-update', action='store_true')
+    args = parser.parse_args()
+    launchd_label = args.launchd_label
+    assert LAUNCHD_LABEL_PATTERN.fullmatch(launchd_label), 'Invalid launchd label'
+    check_only = args.check
+    validate_migrations = args.validate_migrations
+    prepare_update = args.prepare_update
     assert not (check_only and (validate_migrations or prepare_update)), \
         '--check is read-only and cannot be combined with an installing mode'
     assert sys.platform == 'darwin'
@@ -132,11 +140,13 @@ def main():
     assert old_stat.st_mode & 0o022 == 0, 'The stable binary is group/world writable'
     assert not target.exists() or old_binary == target, 'Unexpected existing stable binary'
     supervisor = bin_dir / 'narrafork-launchd-supervisor'
-    plist = home / 'Library/LaunchAgents/dev.narrafork.server.plist'
+    plist = home / 'Library/LaunchAgents' / f'{launchd_label}.plist'
     agent = plistlib.loads(plist.read_bytes())
+    keep_alive = agent.get('KeepAlive')
     if prepare_update:
-        assert agent.get('Label') == LAUNCHD_LABEL and agent.get('KeepAlive') is True, \
-            'The launch agent must be the keep-alive dev.narrafork.server job'
+        assert agent.get('Label') == launchd_label and (keep_alive is True or (
+            isinstance(keep_alive, dict) and keep_alive.get('SuccessfulExit') is False
+        )), 'The launch agent must keep the configured job alive after unsuccessful exits'
     assert agent['ProgramArguments'] == [str(supervisor)]
     def resolve():
         return subprocess.check_output([str(supervisor), '--resolve'], text=True, timeout=10).strip()
@@ -227,7 +237,7 @@ def main():
                    sizeBytes=metadata['size'], sha512=metadata['sha512'])
     stable_install = None
     if prepare_update:
-        stable_install = {'launchdLabel': LAUNCHD_LABEL, 'fromCommit': health['commit'],
+        stable_install = {'launchdLabel': launchd_label, 'fromCommit': health['commit'],
                           'toCommit': metadata['commit'], 'certificateSha1': fingerprint}
         updated['stablePathInstall'] = stable_install
         updated['fromVersion'] = health['version'].split('+')[0]

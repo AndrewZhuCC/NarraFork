@@ -2,14 +2,45 @@ import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { getNarraforkPath } from "./narrafork-home";
+import { isCompiledRuntime } from "./runtime-target";
 import { safeSpawn } from "./spawn";
 import { GIT_COMMIT } from "./version";
 
+const LAUNCHD_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const STABLE_SERVER_EXEC_PATH = join(homedir(), ".local/bin/narrafork-server");
+
 export interface StablePathInstall {
-	launchdLabel: "dev.narrafork.server";
+	launchdLabel: string;
 	fromCommit: string;
 	toCommit: string;
 	certificateSha1: string;
+}
+
+export function isValidLaunchdLabel(value: unknown): value is string {
+	return typeof value === "string" && LAUNCHD_LABEL_PATTERN.test(value);
+}
+
+export function supportsStableUpdateSignal(
+	context = {
+		platform: process.platform as string,
+		parentPid: process.ppid,
+		service: process.env.XPC_SERVICE_NAME,
+		execPath: process.execPath,
+		compiled: isCompiledRuntime(),
+		stablePath: STABLE_SERVER_EXEC_PATH,
+	},
+): boolean {
+	try {
+		return (
+			context.platform === "darwin" &&
+			context.parentPid === 1 &&
+			isValidLaunchdLabel(context.service) &&
+			context.compiled &&
+			realpathSync(context.execPath) === resolve(context.stablePath)
+		);
+	} catch {
+		return false;
+	}
 }
 
 /** Local installer opt-in only: ordinary downloaded updates must not accept same-exec paths. */
@@ -21,7 +52,7 @@ export async function verifyStablePathInstall(
 		parentPid: process.ppid,
 		service: process.env.XPC_SERVICE_NAME,
 		execPath: process.execPath,
-		stablePath: join(homedir(), ".local/bin/narrafork-server"),
+		stablePath: STABLE_SERVER_EXEC_PATH,
 		identityPath: getNarraforkPath("code-signing", "identity.json"),
 		commit: GIT_COMMIT,
 		uid: process.getuid?.(),
@@ -46,7 +77,7 @@ export async function verifyStablePathInstall(
 		if (
 			context.platform !== "darwin" ||
 			context.parentPid !== 1 ||
-			context.service !== "dev.narrafork.server" ||
+			!isValidLaunchdLabel(context.service) ||
 			install.launchdLabel !== context.service ||
 			!/^([a-f\d]{8}|[a-f\d]{40})$/.test(install.fromCommit) ||
 			!/^([a-f\d]{8}|[a-f\d]{40})$/.test(install.toCommit) ||
@@ -55,7 +86,7 @@ export async function verifyStablePathInstall(
 			install.toCommit.startsWith(context.commit) ||
 			!/^[a-f\d]{40}$/i.test(install.certificateSha1) ||
 			resolve(candidate) !== context.stablePath ||
-			resolve(context.execPath) !== context.stablePath
+			realpathSync(context.execPath) !== context.stablePath
 		)
 			return false;
 		const stat = lstatSync(candidate);

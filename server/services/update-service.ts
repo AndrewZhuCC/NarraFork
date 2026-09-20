@@ -12,6 +12,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	readFileSync,
+	realpathSync,
 	statSync,
 	unlinkSync,
 	writeFileSync,
@@ -255,7 +256,7 @@ function getCurrentExecutablePath(): string | null {
 	// Check if running as compiled binary
 	// Linux/macOS: $bunfs, Windows: ~BUN/%7EBUN
 	if (import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/")) {
-		return process.execPath;
+		return realpathSync(process.execPath);
 	}
 	return null;
 }
@@ -1895,6 +1896,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 				targetSha512: prepared.sha512,
 				targetVersion: prepared.version,
 				targetCommit: prepared.stablePathInstall.toCommit,
+				launchdLabel: prepared.stablePathInstall.launchdLabel,
 				sourcePid: process.pid,
 				sourceCommit: prepared.stablePathInstall.fromCommit,
 			});
@@ -1906,6 +1908,7 @@ async function drainAndSpawnPreparedUpdate(options: {
 			const shutdown = await handleGracefullyShutdownRequest({
 				token: session.token,
 				version: prepared.version,
+				supervisedRestart: true,
 			});
 			if (!shutdown.ok) throw new Error(shutdown.body.error);
 		} catch (error) {

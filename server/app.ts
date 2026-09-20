@@ -12,6 +12,7 @@ import { logger } from "./lib/logger";
 import { getRuntimeEnvironment } from "./lib/platform";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
+import { supportsStableUpdateSignal } from "./lib/stable-update-install";
 import { APP_VERSION, GIT_COMMIT } from "./lib/version";
 import { requireSessionAuth } from "./middleware/auth";
 import { adminRoutes } from "./routes/admin";
@@ -225,6 +226,7 @@ app.get("/api/health", (c) => {
 			process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
 		gitAvailable: gitOk,
 		runtimeEnvironment: getRuntimeEnvironment(),
+		stableUpdateSignal: supportsStableUpdateSignal() ? "SIGUSR2" : null,
 	});
 });
 

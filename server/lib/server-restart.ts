@@ -23,6 +23,7 @@ type GracefulShutdownRequest = {
 	token: string;
 	pid?: number;
 	version?: string;
+	supervisedRestart?: boolean;
 };
 
 type GracefulShutdownResult = {

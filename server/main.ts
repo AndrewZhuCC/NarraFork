@@ -52,6 +52,7 @@ import {
 import { settings } from "./lib/settings";
 import { ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
+import { supportsStableUpdateSignal } from "./lib/stable-update-install";
 import {
 	buildHealthPayload,
 	createStartupReadinessGate,
@@ -1014,6 +1015,24 @@ function startServer(listenPort: number) {
 	return server;
 }
 
+if (supportsStableUpdateSignal()) {
+	process.on("SIGUSR2", () => {
+		void import("./services/update-service")
+			.then(({ applyUpdate }) => applyUpdate())
+			.then((result) => {
+				logger.info("Stable update signal handled", {
+					success: result.success,
+					phase: result.phase,
+				});
+			})
+			.catch((error) => {
+				logger.error("Stable update signal failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+	});
+}
+
 let actualPort = port;
 let _server: ReturnType<typeof startServer>;
 
@@ -1741,7 +1760,7 @@ registerGracefulShutdownHandler(async (request) => {
 		skipWindowsProcessTreeKill: true,
 		skipBashProcessKill: true,
 	});
-	setTimeout(() => process.exit(0), 250);
+	setTimeout(() => process.exit(request.supervisedRestart ? 75 : 0), 250);
 	return result;
 });
 
