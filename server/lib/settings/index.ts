@@ -69,6 +69,7 @@ export {
 	getQueueDuringCompaction,
 	getReasoningEffortBlocklist,
 	getRouterModels,
+	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
 	getVisibleModels,
 	grokProviderPrefix,
@@ -104,6 +105,7 @@ export {
 	resolveEffectiveModel,
 	resolveModelContextWindow,
 	resolveProvider,
+	resolveTranslationModelOverride,
 	usesCodexApiMode,
 	usesCodexModel,
 	usesGrokModel,
@@ -583,6 +585,10 @@ export function purgeStaleAgentModelRefs(
 	}
 	if (isStale(settings.agent.translationModel)) {
 		settings.agent.translationModel = "__summary__";
+		dirty = true;
+	}
+	if (isStale(settings.agent.promptOptimizeModel)) {
+		settings.agent.promptOptimizeModel = "__summary__";
 		dirty = true;
 	}
 	for (const key of ["explore", "plan", "search", "review"] as const) {

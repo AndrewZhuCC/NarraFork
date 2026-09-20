@@ -152,6 +152,7 @@ describe("LivePatchQueue", () => {
 		const drains: (() => void)[] = [];
 		const applied: LivePatch[] = [];
 		let cancelled = 0;
+		let applyResult = true;
 		let current = narratorId;
 		return {
 			applied,
@@ -164,6 +165,9 @@ describe("LivePatchQueue", () => {
 			setNarrator: (next: string | undefined) => {
 				current = next;
 			},
+			setApplyResult: (next: boolean) => {
+				applyResult = next;
+			},
 			frame: () => {
 				const drain = drains.shift();
 				drain?.();
@@ -172,7 +176,7 @@ describe("LivePatchQueue", () => {
 				currentNarratorId: () => current,
 				apply: (patch: LivePatch) => {
 					applied.push(patch);
-					return true;
+					return applyResult;
 				},
 				schedule: (drain: () => void) => {
 					drains.push(drain);
@@ -209,6 +213,19 @@ describe("LivePatchQueue", () => {
 		// The single composed patch really carries all three.
 		const result = h.applied[0]?.([]);
 		expect(result?.messages).toHaveLength(3);
+	});
+
+	it("notifies terminal-event fallbacks when the loaded document cannot be patched", async () => {
+		const { LivePatchQueue } = await import("./vlist-live-patch");
+		const h = harness("n1");
+		h.setApplyResult(false);
+		const queue = new LivePatchQueue(h.host);
+		let missed = 0;
+		queue.enqueue(marker("completion"), () => {
+			missed += 1;
+		});
+		h.frame();
+		expect(missed).toBe(1);
 	});
 
 	it("drops a batch whose narrator changed before the frame drained", async () => {
@@ -611,7 +628,7 @@ describe("live event → patch field mapping", () => {
 
 	it("Send receipt WS patch survives message segmentation and reaches adapter recipients", async () => {
 		const { sendDeliveryResolvedPatch } = await import("./vlist-live-events");
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const { adaptSegment } = await import("./segment-adapter");
 		const doc = toolDoc("tu-1", "running");
 		Object.assign(block(doc), {
@@ -659,7 +676,7 @@ describe("live event → patch field mapping", () => {
 		const { buildTopLevelStreamingChunksMsg, topLevelStreamingChunkToToolFields } = await import(
 			"../narrator-message-helpers"
 		);
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const { adaptSegment } = await import("./segment-adapter");
 		const store = createStreamingToolStore();
 		const started = {
@@ -999,7 +1016,7 @@ describe("live event → patch field mapping", () => {
 			"./streaming-tool-chunks"
 		);
 		const { buildTopLevelStreamingChunksMsg } = await import("../narrator-message-helpers");
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const event = {
 			toolUseId: "tu-1",
 			targets: [],
@@ -1026,7 +1043,7 @@ describe("live event → patch field mapping", () => {
 	});
 
 	it("segmentation preserves a consumed row beneath an older enriched navigation block", async () => {
-		const { resolveAllToolCallsFromMsg } = await import("../message-segments");
+		const { resolveAllToolCallsFromMsg } = await import("../message/message-segments");
 		const doc = toolDoc("tu-1", "success");
 		const received = {
 			id: "child",

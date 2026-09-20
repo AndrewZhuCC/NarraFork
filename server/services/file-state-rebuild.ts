@@ -14,6 +14,14 @@ import {
 } from "../db/schema";
 import { LOCAL_DEVICE_ID, type PathFlavor } from "../lib/agent/execution/backend";
 import { targetPathSemantics } from "../lib/agent/execution/path-resolve";
+import {
+	appendAfter,
+	deleteRange,
+	insertBefore,
+	relocateRange,
+	replaceRange,
+	substituteInRange,
+} from "../lib/agent/structural/edit-ops";
 import { replace } from "../lib/agent/tools/edit";
 import {
 	applyLineEnding,
@@ -601,7 +609,236 @@ export function applyToolCall(
 		}
 	}
 
+	if (toolCall.toolName === "StructSed") {
+		return applyStructSedCall(currentContent, toolCall, input);
+	}
+
 	return currentContent;
+}
+
+/**
+ * Replay a StructSed mutation from its recorded input.
+ *
+ * Replays by the RESOLVED LINE RANGE the tool stored, never by re-running `locate`: the
+ * reconstructed content differs from what the tool saw, a same-named symbol may have moved,
+ * and the machine doing the rebuild may not even have the grammar installed. The range is
+ * the only address that still means the same thing here.
+ *
+ * Every failure path throws. Returning `currentContent` for something unreplayable is how
+ * a rollback silently produces a file in which this edit never happened — the surrounding
+ * Write/Edit calls would still replay, so the result looks plausible and is wrong.
+ */
+/**
+ * The batched operations of a StructSed call, in either recorded shape.
+ *
+ * Current writes record `operations: <count>` plus one JSON string per operation (`op1`,
+ * `op2`…), because the recorded input admits only scalar fields. Older rows — written while
+ * an array was still being attempted — carry `operations` as the array itself. Both are read
+ * here so history from before the change stays replayable; dropping the array branch would
+ * make those reverts fail rather than merely be unavailable.
+ *
+ * Returns null when this is not a batch at all (the ordinary single-operation shape).
+ */
+function readStructSedBatch(
+	input: Record<string, unknown>,
+	toolCall: OrderedToolCall,
+): Record<string, unknown>[] | null {
+	const recorded = input.operations;
+	// Legacy shape: the operations travelled inline as objects.
+	if (Array.isArray(recorded)) {
+		return recorded.map((entry) => (entry ?? {}) as Record<string, unknown>);
+	}
+	if (typeof recorded !== "number") return null;
+	const out: Record<string, unknown>[] = [];
+	for (let index = 1; index <= recorded; index++) {
+		const raw = input[`op${index}`];
+		if (typeof raw !== "string") {
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} recorded ${recorded} batched operation(s) but op${index} is missing.`,
+				toolCall.toolUseId,
+			);
+		}
+		try {
+			const parsed: unknown = JSON.parse(raw);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error("not an object");
+			}
+			out.push(parsed as Record<string, unknown>);
+		} catch (error) {
+			// A malformed entry cannot be skipped: replaying the rest would rebuild the file as
+			// though this operation never happened, which is a wrong result presented as a
+			// successful revert.
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} has an unreadable batched operation op${index}: ` +
+					`${error instanceof Error ? error.message : String(error)}`,
+				toolCall.toolUseId,
+			);
+		}
+	}
+	return out;
+}
+
+function applyStructSedCall(
+	currentContent: string | null,
+	toolCall: OrderedToolCall,
+	input: Record<string, unknown>,
+): string | null {
+	if (currentContent === null) {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} expects existing content but the baseline is missing.`,
+			toolCall.toolUseId,
+		);
+	}
+
+	// A batch recorded every operation with its own resolved range. Replaying only the
+	// first would silently rebuild the file as though the rest never happened.
+	const batch = readStructSedBatch(input, toolCall);
+	if (Array.isArray(batch)) {
+		if (batch.length === 0) {
+			throw new ReplayDivergedError(
+				`StructSed call ${toolCall.toolUseId} recorded an empty batch.`,
+				toolCall.toolUseId,
+			);
+		}
+		let text = normalizeLineEndings(currentContent);
+		// Bottom-up, matching how the tool applied them: every recorded address is relative
+		// to the original file, so a change below must not shift the ones above it.
+		const ordered = [...batch].sort(
+			(a, b) => structSedStartLine(b, toolCall) - structSedStartLine(a, toolCall),
+		);
+		for (const entry of ordered) {
+			const applied = applyStructSedOperation(text, toolCall, entry, false);
+			if (applied === null) {
+				throw new ReplayDivergedError(
+					`StructSed call ${toolCall.toolUseId} could not replay one of its batched operations.`,
+					toolCall.toolUseId,
+				);
+			}
+			text = applied;
+		}
+		return applyLineEnding(text, detectLineEnding(currentContent));
+	}
+
+	return applyStructSedOperation(currentContent, toolCall, input, true);
+}
+
+/**
+ * The recorded start line of one batch entry, used only for ordering.
+ *
+ * A missing range is divergence rather than a default: sorting an unaddressed operation to
+ * an arbitrary position would apply it somewhere nobody asked for.
+ */
+function structSedStartLine(entry: unknown, toolCall: OrderedToolCall): number {
+	const line = (entry as Record<string, unknown> | null)?.resolvedStartLine;
+	if (typeof line !== "number") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has a batched operation with no recorded line range.`,
+			toolCall.toolUseId,
+		);
+	}
+	return line;
+}
+
+/**
+ * Replay ONE recorded operation.
+ *
+ * `restoreLineEnding` is false for batch entries: the intermediate steps stay LF-normalized
+ * and the caller restores the file's original ending once, at the end. Doing it per step
+ * would re-detect the ending from partially rewritten text.
+ */
+function applyStructSedOperation(
+	currentContent: string,
+	toolCall: OrderedToolCall,
+	input: Record<string, unknown>,
+	restoreLineEnding: boolean,
+): string | null {
+	const command = input.command;
+	const startLine = input.resolvedStartLine;
+	const endLine = input.resolvedEndLine;
+	if (typeof command !== "string") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has no recorded command to replay.`,
+			toolCall.toolUseId,
+		);
+	}
+	if (typeof startLine !== "number" || typeof endLine !== "number") {
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} has no recorded line range to replay.`,
+			toolCall.toolUseId,
+		);
+	}
+
+	const content = normalizeLineEndings(currentContent);
+	const range = { startLine, endLine };
+	const applyLineEnding_ = (text: string): string =>
+		restoreLineEnding ? applyLineEnding(text, detectLineEnding(currentContent)) : text;
+	try {
+		switch (command) {
+			case "delete":
+				return applyLineEnding_(deleteRange(content, range));
+			case "copy":
+			case "move": {
+				// The destination travelled resolved, like the source. Its absence is a real
+				// state (append at end of file), not missing data, so it does not diverge.
+				const toStart = input.resolvedToStartLine;
+				const toEnd = input.resolvedToEndLine;
+				const hasAnchor = typeof toStart === "number" && typeof toEnd === "number";
+				const next = relocateRange(content, range, {
+					...(hasAnchor ? { anchor: { startLine: toStart, endLine: toEnd } } : {}),
+					placement: input.placement === "before" ? "before" : "after",
+					removeSource: command === "move",
+				});
+				return applyLineEnding_(next);
+			}
+			case "replace":
+			case "insert":
+			case "append": {
+				const text = input.content;
+				if (typeof text !== "string") {
+					throw new ReplayDivergedError(
+						`StructSed ${command} call ${toolCall.toolUseId} has no recorded content to replay.`,
+						toolCall.toolUseId,
+					);
+				}
+				const normalized = normalizeLineEndings(text);
+				const next =
+					command === "replace"
+						? replaceRange(content, range, normalized)
+						: command === "insert"
+							? insertBefore(content, range, normalized)
+							: appendAfter(content, range, normalized);
+				return applyLineEnding_(next);
+			}
+			case "substitute": {
+				const pattern = input.pattern;
+				const replacement = input.replacement;
+				if (typeof pattern !== "string" || typeof replacement !== "string") {
+					throw new ReplayDivergedError(
+						`StructSed substitute call ${toolCall.toolUseId} has no recorded pattern/replacement to replay.`,
+						toolCall.toolUseId,
+					);
+				}
+				const result = substituteInRange(content, range, pattern, replacement, {
+					...(typeof input.flags === "string" ? { flags: input.flags } : {}),
+				});
+				return applyLineEnding_(result.text);
+			}
+			default:
+				throw new ReplayDivergedError(
+					`StructSed call ${toolCall.toolUseId} has an unknown command "${command}".`,
+					toolCall.toolUseId,
+				);
+		}
+	} catch (error) {
+		if (error instanceof ReplayDivergedError) throw error;
+		// An out-of-range line range means the reconstructed content no longer matches
+		// what the tool edited, which is divergence, not a recoverable condition.
+		throw new ReplayDivergedError(
+			`StructSed call ${toolCall.toolUseId} no longer applies to the reconstructed content: ` +
+				`${error instanceof Error ? error.message : String(error)}`,
+			toolCall.toolUseId,
+		);
+	}
 }
 
 /** Device-aware grouping used by all rebuild operations. */

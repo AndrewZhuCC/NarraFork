@@ -28,6 +28,7 @@ import {
 	isNativeModelContextBlock,
 } from "../native-injection";
 import { hasUsablePlanBody } from "../plan-reference";
+import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
 	escapeMarkdown,
@@ -212,6 +213,19 @@ export interface AdapterMessage {
 	tokensIn?: number | null;
 	costUsd?: number | null;
 	meterUsage?: number | null;
+	/** Eager mailbox/outbox delivery lifecycle projected onto the canonical message. */
+	deliveryId?: string | null;
+	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
+	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
+}
+
+function deliveryProjection(message?: AdapterMessage): Record<string, unknown> {
+	if (!message?.deliveryId) return {};
+	return {
+		deliveryId: message.deliveryId,
+		deliveryKind: message.deliveryKind ?? null,
+		deliveryState: message.deliveryState ?? null,
+	};
 }
 
 /** A tool-run item (structural subset of message-segments ToolRunItem).
@@ -1226,6 +1240,7 @@ function adaptContextBlocks(
 			idBase,
 			index,
 			modelText,
+			msg,
 			ctx,
 		);
 		if (spoken) {
@@ -1251,7 +1266,7 @@ function adaptContextBlocks(
 	for (let index = 0; index < blocks.length; index++) {
 		const block = blocks[index];
 		if (!block || owned.has(index) || block.type !== "text" || !block.text?.trim()) continue;
-		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: { text: block.text } });
+		specs.push({ kind: "markdown", key: `${idBase}-b${index}`, data: block.text });
 	}
 	return specs;
 }
@@ -1334,7 +1349,14 @@ function adaptMessage(
 				(blocks[injectionIndex]?.type === "system_injection"
 					? (blocks[injectionIndex]?.modelText ?? "")
 					: "");
-			const spoken = adaptSpokenInjection(injection, idBase, injectionIndex, modelFacingText, ctx);
+			const spoken = adaptSpokenInjection(
+				injection,
+				idBase,
+				injectionIndex,
+				modelFacingText,
+				msg,
+				ctx,
+			);
 			if (spoken) return spoken;
 		}
 		// Older Send rows have attribution but no structured body. Keep their COMPLETE
@@ -1427,6 +1449,9 @@ function adaptMessage(
 					// the "计划反思" identity instead of falling back to "you" on the right.
 					origin: msg.origin ?? null,
 					originLabel: msg.originLabel ?? null,
+					...(msg.deliveryId ? { deliveryId: msg.deliveryId } : {}),
+					...(msg.deliveryKind ? { deliveryKind: msg.deliveryKind } : {}),
+					...(msg.deliveryState ? { deliveryState: msg.deliveryState } : {}),
 					...(commandText ? { commandText } : {}),
 					...(attachments.length > 0 ? { attachments } : {}),
 				},
@@ -1472,7 +1497,7 @@ function adaptMessage(
 			blocks.find((b) => b.type === "system_injection" && typeof b.modelText === "string")
 				?.modelText ??
 			"";
-		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, ctx);
+		const spoken = adaptSpokenInjection(sysBlock, idBase, blockIndex, modelFacingText, msg, ctx);
 		if (spoken) return [...specs, ...spoken];
 		// Server-authored FACTS that still have an author (a person merged a branch, the
 		// platform brought a container up). Those are statements in the conversation, so
@@ -1729,9 +1754,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	reasoningCount: "{count} reasoning steps",
 	toolGeneric: "Tool",
 	compacting: "Compacting context…",
-	compactingRemote: "Requesting Codex remote compact…",
 	compacted: "Context compacted",
-	compactedRemote: "Compacted with Codex remote compact",
 	compactFailed: "Compact failed",
 	compactOutputChars: "{count} chars",
 	compactThinking: "thinking",
@@ -2064,7 +2087,6 @@ function composeCompactText(
 		thinkingChars?: number | null;
 		outputChars?: number | null;
 		messageCount?: number | null;
-		isRemote?: boolean;
 		retryCount?: number | null;
 	},
 ): string {
@@ -2079,13 +2101,6 @@ function composeCompactText(
 				String(opts.retryCount),
 			);
 			return `${label} · ${retryLabel}`;
-		}
-		const remoteWaiting =
-			opts.isRemote &&
-			opts.phase !== "thinking" &&
-			!(typeof opts.outputChars === "number" && opts.outputChars > 0);
-		if (remoteWaiting) {
-			return sysLabel(ctx, "compactingRemote");
 		}
 		// Thinking phase: the summary model has not produced visible output yet, so
 		// feature the thinking count instead of a stuck "0 chars". A count below the
@@ -2112,7 +2127,7 @@ function composeCompactText(
 		const count = typeof opts.messageCount === "number" ? opts.messageCount : 0;
 		return sysLabel(ctx, "segmentCompacted").replace(/\{count\}/g, String(count));
 	}
-	return sysLabel(ctx, opts.isRemote ? "compactedRemote" : "compacted");
+	return sysLabel(ctx, "compacted");
 }
 
 /**
@@ -2346,6 +2361,7 @@ function adaptSpokenInjection(
 	idBase: string,
 	blockIndex: number,
 	modelFacingText: string,
+	msg: AdapterMessage,
 	ctx: AdapterContext,
 ): ElementSpec[] | null {
 	if (block.type !== "system_injection") return null;
@@ -2377,6 +2393,7 @@ function adaptSpokenInjection(
 				// key stable across a same-block re-projection.
 				key: `${idBase}-b${blockIndex}-m-${message.fromId ?? "anon"}`,
 				data: {
+					...deliveryProjection(msg),
 					markdown: rawSideCarToMarkdown(text),
 					speaker: spokenSpeakerLabel(message),
 					// The sender's own id seeds the deterministic identicon in the header.
@@ -2447,6 +2464,7 @@ function adaptSpokenInjection(
 				kind: "injection-bubble",
 				key: `${idBase}-b${blockIndex}-t-${task.id}`,
 				data: {
+					...deliveryProjection(msg),
 					markdown,
 					speaker:
 						body.flavor === "agent"
@@ -2521,6 +2539,7 @@ function adaptSpokenInjection(
 			kind: "injection-bubble" as const,
 			key: `${idBase}-b${blockIndex}-k-${hit.entryId}`,
 			data: {
+				...deliveryProjection(msg),
 				// PLAIN text, escaped rather than parsed: the excerpt is prose by
 				// construction now, and any `#`/`>`/`-` still in it is debris from the
 				// flattening, not authored structure.
@@ -2596,6 +2615,7 @@ function adaptSpokenInjection(
 				kind: "injection-bubble",
 				key: `${idBase}-b${blockIndex}-p-${source}`,
 				data: {
+					...deliveryProjection(msg),
 					payload: {
 						kind: "spec-task",
 						data: {
@@ -2914,9 +2934,6 @@ function adaptSystemSimpleData(
 					: block.status === "failed"
 						? "failed"
 						: "compacted";
-			const isRemote =
-				block.source === "remote" ||
-				(!!block.remoteCompact && typeof block.remoteCompact === "object");
 			return {
 				kind: "compact",
 				// The label is synthesized from status (parity with CompactIndicator);
@@ -2927,7 +2944,6 @@ function adaptSystemSimpleData(
 					phase: block.progressPhase,
 					thinkingChars: block.thinkingChars,
 					outputChars: block.outputChars,
-					isRemote,
 					retryCount: block.retryCount,
 				}),
 				status: compactStatus,
@@ -3016,12 +3032,16 @@ function adaptSystemTextData(
 			// Falls back to that text only when a producer supplied no body.
 			const body = readSideCarBody(block);
 			const source = typeof block.source === "string" ? block.source : "";
-			const modelText = block.modelText ?? block.text ?? contentText;
+			// Native self-contained injections keep their model-facing projection on
+			// `modelText`; legacy rows may still provide a sibling `text` block.
+			const modelFacingText = block.modelText ?? block.text ?? contentText;
 			const markdown = body
 				? sideCarBodyToMarkdown(source, body, ctx.labels)
-				: rawSideCarToMarkdown(modelText);
+				: rawSideCarToMarkdown(modelFacingText);
 			return {
 				kind: "origin_notice",
+				// A structured body is authoritative even when its reader projection is empty:
+				// falling back here would expose model-only instruction text in the UI.
 				text: markdown,
 				title: injectionHeadingLabel(ctx, source),
 				timeLabel: formatOriginNoticeTime(createdAt),
@@ -3031,7 +3051,7 @@ function adaptSystemTextData(
 				// (instruction boilerplate stripped), while this is what the agent actually
 				// received. The context-menu inspector shows this so the reader can see
 				// exactly what the model saw.
-				modelFacing: modelText,
+				modelFacing: modelFacingText,
 			};
 		}
 		case "spec_goal_added": {
@@ -3106,7 +3126,8 @@ function isLatestSpecTasksToolItem(
 /** Split a tool run into chronological groups: active items stay standalone,
  * completed items fold in contiguous batches. Mirrors groupToolRunItemsForLod —
  * including its second argument: the latest tasks.json call keeps its full card
- * out of the fold at every LOD. */
+ * out of the fold at every LOD. Prefer-open tools (AskUserQuestion) stay
+ * standalone too: their options/form is operational content, not activity noise. */
 export function groupToolItemsForLod(
 	items: AdapterToolItem[],
 	latestSpecTasksToolUseId?: string | null,
@@ -3126,6 +3147,7 @@ export function groupToolItemsForLod(
 			isCommunicationTool(item.tc) ||
 			item.isSubagent ||
 			isActiveToolItem(item) ||
+			isPreferOpenTool(item.tc) ||
 			isLatestSpecTasksToolItem(item, latestSpecTasksToolUseId)
 		) {
 			flush();
@@ -3335,6 +3357,12 @@ function adaptToolItemFull(
 		item,
 		ctx.resolveLatestSpecTasksToolUseId?.(),
 	);
+	// Prefer-open (AskUserQuestion): default-expand at every LOD, but the reader may
+	// still fold. Not `forceExpanded` — that would make the chevron dead, which is
+	// exactly the L5 bug `userCollapsed` was introduced to fix. `collapsesByLod`
+	// must stay false so the header toggle writes `expanded` rather than
+	// `lodUserOverride` (the override channel FORCE-expands and cannot fold).
+	const preferOpen = isPreferOpenTool(item.tc);
 	const opts = {
 		isRecent: isRecentToolItem(item, ctx),
 		...(defaultOpened === undefined ? {} : { opened: defaultOpened }),
@@ -3348,8 +3376,10 @@ function adaptToolItemFull(
 		// Same contract for the pinned tasks card: it never collapses to a header,
 		// even at L3 or as an older card at L4.
 		...(isPinnedSpecTasks ? { forceExpanded: true } : {}),
+		...(preferOpen ? { preferOpen: true } : {}),
 		collapsesByLod:
 			!hasPendingPermission &&
+			!preferOpen &&
 			!isActiveToolItem(item) &&
 			(item.isSubagent
 				? ctx.lod === 1
@@ -3721,12 +3751,14 @@ function toolTimingStamps(source: Record<string, unknown>): Record<string, numbe
 	const out: Record<string, number> = {};
 	const startedAt = parseEpochMs(source.startedAt);
 	const streamStartedAt = parseEpochMs(source.streamStartedAt);
+	const streamCompletedAt = parseEpochMs(source.streamCompletedAt);
 	const permissionStartedAt = parseEpochMs(source.permissionStartedAt);
 	const executionStartedAt = parseEpochMs(source.executionStartedAt);
 	const completedAt = parseEpochMs(source.completedAt);
 	const createdAt = parseEpochMs(source.createdAt);
 	if (startedAt != null) out.startedAt = startedAt;
 	if (streamStartedAt != null) out.streamStartedAt = streamStartedAt;
+	if (streamCompletedAt != null) out.streamCompletedAt = streamCompletedAt;
 	if (permissionStartedAt != null) out.permissionStartedAt = permissionStartedAt;
 	if (executionStartedAt != null) out.executionStartedAt = executionStartedAt;
 	if (completedAt != null) out.completedAt = completedAt;

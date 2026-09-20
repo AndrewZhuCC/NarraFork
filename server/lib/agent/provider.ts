@@ -100,6 +100,8 @@ export interface ChatParams extends ProtocolChatParams {
 	reflectionTools?: unknown[];
 	/** Parent's wire tools; Codex only. An empty array marks a reflection without a snapshot. */
 	reflectionParentTools?: unknown[];
+	/** Execution ceiling when reflection inherits the complete parent tool declarations. */
+	reflectionAllowedTools?: readonly string[];
 }
 
 export interface GenerateOptions {

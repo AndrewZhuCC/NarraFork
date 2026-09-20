@@ -29,8 +29,22 @@ NarraFork 是一个以"叙事分叉"为隐喻的 AI 协作编程平台。软件�
 | `bunx @biomejs/biome check .` | Biome 代码检查 + 格式检查（白名单命令，无需用户批准） |
 | `bunx tsgo --noEmit` | TypeScript 类型检查（白名单命令，无需用户批准） |
 | `bunx @biomejs/biome check --write <file>` | Biome 代码检查 + 格式化（白名单命令，无需用户批准，建议单文件执行） |
+| `bun test <路径>` | 运行测试。**手动跑子集时请加 `--isolate`**，理由见下方"测试隔离" |
 
 **开发需要两个进程：** `bun run dev`（后端）和 `bun run dev:frontend`（前端）。
+
+**测试隔离（`--isolate`）：**
+
+`bun test` 默认让所有测试文件共享一个 global 和 module registry。linkedom 的 `parseHTML()` 每次返回新 window，但 `window.HTMLElement.prototype` 是**模块级单例**——多个 window 共用同一个原型对象。因此测试里给它装几何 stub（linkedom 没有布局引擎，不伪造就测不了滚动/测量）实际是进程级改动，`afterEach` 不还原就会泄漏给后续测试文件。
+
+受害者是那些断言"我的代码完全不读几何"的测试（如 `ContentScrollbars.test.tsx` 把 `clientWidth` 定义成读了就抛错）：它们在自己从没装过的 stub 上失败，报错 `Forbidden geometry read: ...`。**中弹名单取决于文件枚举顺序**，所以一次目录重命名就能让受害集合整体改变，看起来像重构引入了回归。
+
+诊断特征：**单个文件跑全绿、混在一起跑失败**。遇到这种就先加 `--isolate` 复跑，再判断是否真回归。
+
+- `bun run test` / `bun run test:watch` 已默认带 `--isolate`；CI 中的 `bun test` 也已加上。
+- `--isolate` 让每个文件拿到全新 global 并清空 module registry，代价是全仓耗时约 2.5 倍（本机 136s → 346s）。赶时间且只关心自己那几个文件时可用 `bun run test:fast`（无隔离），但**判断"是否有回归"必须以 `--isolate` 的结果为准**。
+- `bunfig.toml` 不支持 `isolate` 键，只能通过 CLI 传入；`--parallel` 隐含 `--isolate`，不要与 `--no-isolate` 并用。
+- 隔离不是万能：它救不了"文件路径写错"这类问题（见下方"源码文本守卫"）。
 
 **运行中 NarraFork 进程铁律（最高优先级）：**
 - **永远不要停止、杀死、重启或接管由 `bun run start:dev` 启动的 NarraFork 进程。** 该进程承载当前 agent loop；一旦停止，所有会话都会中断，当前 agent 也可能无法重启并继续修复。
@@ -211,7 +225,7 @@ server/
 **关键模式：**
 - **事件总线**（`lib/event-bus.ts`）解耦服务 → WebSocket 广播。所有跨服务通信通过类型化事件流转。
 - **叙述者会话**使用自定义 Agent Loop（`server/lib/agent/loop.ts`），支持多提供商（Anthropic、OpenAI、Gemini、Codex、NUG）。通过 HTTP SSE 流式传输 + 并行 WebSocket 广播。权限请求会暂停会话（Promise 挂起），由用户决策解除（5 分钟超时）。支持子代理（subagent）模式：explore（只读探索）、plan（架构规划）、general（通用写入）、review（代码评审）。
-- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Gemini、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。支持可选工具机制（通过 `enabledTools` 字段控制可见性）。
+- **多提供商 Agent 架构**（`server/lib/agent/`）：自定义 Agent Loop 支持 Anthropic、OpenAI、Gemini、Codex、NUG 五个提供商，统一的工具注册和执行框架，内置工具分为核心（bash、read、write、edit、glob、grep、web-search、web-fetch、task、continue-task、team-status、todo、ask-user-question、skill、plan-mode（enter/exit）共 16 个）、可选（terminal、share-file、recall、browser、fork-narrator、narrafork-admin）和 review 专用工具。可选工具采用**三段式模式**（`shared/routine-modes.ts`）：`manual`（仅会话内 `/load` 临时加载）、`auto`（预留给未来 toolsearch 机制，**当前行为等同 manual**）、`resident`（每个新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），旧的 `enabledRoutines`/`disabledRoutines` 作为 `resident`/`manual` 的兼容投射被双向同步；`narrators.enabledTools` 仍是与模式正交的会话级临时装载。
 - **子代理（Subagent）**：叙述者支持派生子代理（explore/plan/general/review 四种类型），通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立的叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**有三种模式：`full`（延迟会话 fork）、`compressed`（Haiku 生成摘要注入 system prompt）、`fresh`（无上下文）。
 - **章节拆分（Split at Commit）**：从历史 commit 分叉时，将原章节拆为前序（prefix）和后续（continuation），新分叉成为前序的另一个 fork。前序章节的叙述者只保留拆分点之前的消息。
@@ -333,6 +347,23 @@ frontend/
 - 错误处理：抛出 `@server/lib/errors` 中的 `AppError` 子类 — 全局处理器负责序列化
 - 校验：在 `@server/lib/validators.ts` 中定义 Zod schema，在路由处理器中解析
 - 配置文件位于 `~/.narrafork/settings.json` — 通过 `@server/lib/settings` 的 `settings` 单例访问
+
+**源码文本守卫（`readFileSync` 类测试）：**
+
+约 140 个测试文件用 `readFileSync` / `Bun.file` 把**源码当纯文本**读进来做断言（其中 18 个显式命名 `*.guard.test.ts`）。存在的理由是真实的：`NarratorPanel` 这类组件挂着 query、WS 订阅和滚动容器，单元测试挂载不起来；而"某段代码**不存在**"（如 vlist 之外不得静态 import vlist）本就是模块图性质，运行时观察不到。
+
+代价是**这些路径对 TypeScript 和打包器完全不可见**——它们只是字符串。移动或重命名文件时：
+
+- `bun run build` 和 `bunx tsgo --noEmit` 都会通过，因为业务 import 已修好；
+- 而守卫测试在文件顶层 `readFileSync` 直接抛 ENOENT，**整个测试文件挂掉**。
+
+后果不对称：这类守卫的唯一职责就是"防止某个不变量被悄悄改掉"，它自己失效等于保险丝被拔掉，且过程无声。`--isolate` 对此无效。
+
+因此**移动 `frontend/components/narrator/` 等目录下的文件后，必须全仓搜索旧路径字符串**，而不是只看类型检查和构建是否通过。
+
+改这类断言时的原则：
+- 断言指向的逻辑若已搬家，应把断言**改指新宿主**（必要时拆成两处分别验证"上游转发"与"下游归属"），而不是删掉或放宽它。
+- 断言"某段代码**存在**"（如 `toContain("if (dockOpenFilePanel) return ...")`）是把实现细节抄了一份，重构必然同步失败，且验证的是"文本长这样"而非"行为正确"。这类应优先改造成真实行为测试——逻辑一旦抽成 hook 就可以直接调用测试。
 
 ## DESIGN.md
 

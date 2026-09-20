@@ -19,8 +19,18 @@ import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, getSettingsRevision, settings } from "../lib/settings";
+import {
+	getAutoCompactKeepPairs,
+	getSettingsRevision,
+	resolveDefaultReasoningEffort,
+	settings,
+} from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
+import {
+	appendLiveCompactDelta,
+	finishLiveCompactProgress,
+	startLiveCompactProgress,
+} from "./compact-live-state";
 import { drainQueuedMessagesAfterCompact } from "./compact-queue-drain";
 import { narratorContext } from "./narrator-context";
 import { estimateNarratorBuildHistoryTokens } from "./narrator-history-token-estimate";
@@ -90,7 +100,10 @@ interface CompactProgressReporter {
 	 * say "retrying (N)" instead of an unexplained 0-char spinner.
 	 */
 	reportRetry: (retryCount: number, error: string) => void;
+	/** Stop progress ticks while final persistence completes. */
 	finish: () => void;
+	/** Close the on-demand text stream after the final marker state is persisted. */
+	close: (status: "compacted" | "failed") => void;
 }
 
 /**
@@ -263,6 +276,9 @@ export function createCompactProgressReporter(options: {
 	narratorId: string;
 	messageId: string;
 	mode: CompactMode;
+	model?: string;
+	reasoningEffort?: string;
+	startedAt?: string;
 	isSegment?: boolean;
 	/**
 	 * Called on every non-empty delta, BEFORE throttling. The stall watchdog uses
@@ -275,6 +291,11 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
+	startLiveCompactProgress(options.messageId, {
+		model: options.model ?? "",
+		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+		startedAt: options.startedAt ?? new Date().toISOString(),
+	});
 	const reporter = createThrottledProgressReporter((snapshot) => {
 		lastSnapshot = snapshot;
 		broadcastToNarrator(options.narratorId, {
@@ -285,6 +306,9 @@ export function createCompactProgressReporter(options: {
 			thinkingChars: snapshot.thinkingChars,
 			outputChars: snapshot.outputChars,
 			mode: options.mode,
+			...(options.model ? { model: options.model } : {}),
+			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
+			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
@@ -303,25 +327,41 @@ export function createCompactProgressReporter(options: {
 		});
 	};
 	const onActivity = options.onActivity;
-	if (!onActivity) {
-		return {
-			onTextDelta: reporter.addOutput,
-			onReasoningDelta: reporter.addThinking,
-			reportRetry,
-			finish: reporter.finish,
-		};
-	}
+	let outputChars = 0;
+	let thinkingChars = 0;
+	const addOutput = (delta: string) => {
+		if (delta) {
+			outputChars += delta.length;
+			appendLiveCompactDelta(options.messageId, "output", delta, {
+				outputChars,
+				thinkingChars,
+			});
+			onActivity?.();
+		}
+		reporter.addOutput(delta);
+	};
+	const addThinking = (delta: string) => {
+		if (delta) {
+			thinkingChars += delta.length;
+			appendLiveCompactDelta(options.messageId, "thinking", delta, {
+				outputChars,
+				thinkingChars,
+			});
+			onActivity?.();
+		}
+		reporter.addThinking(delta);
+	};
+	let closed = false;
 	return {
-		onTextDelta: (delta) => {
-			if (delta) onActivity();
-			reporter.addOutput(delta);
-		},
-		onReasoningDelta: (delta) => {
-			if (delta) onActivity();
-			reporter.addThinking(delta);
-		},
+		onTextDelta: addOutput,
+		onReasoningDelta: addThinking,
 		reportRetry,
-		finish: reporter.finish,
+		finish: () => reporter.finish(),
+		close: (status: "compacted" | "failed") => {
+			if (closed) return;
+			closed = true;
+			finishLiveCompactProgress(options.messageId, status);
+		},
 	};
 }
 
@@ -1085,6 +1125,9 @@ async function doRunCustomCompact({
 		narratorId,
 		messageId: compactingMsg.id,
 		mode,
+		model: selectedModel,
+		reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
+		startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
 		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
 
@@ -1284,6 +1327,7 @@ async function doRunCustomCompact({
 			...(isRetry ? { messageId: compactedMsg.id } : {}),
 			...replacementFields,
 		});
+		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
 		compactProgress.finish();
@@ -1381,6 +1425,7 @@ async function doRunCustomCompact({
 					...replacementFields,
 				});
 			}
+			compactProgress.close("failed");
 			throw err;
 		}
 
@@ -1450,6 +1495,7 @@ async function doRunCustomCompact({
 			...replacementFields,
 		};
 		broadcastToNarrator(narratorId, compactFailedEvent);
+		compactProgress.close("failed");
 		throw err;
 	} finally {
 		await setCompactingSubstatus(
@@ -1565,6 +1611,9 @@ async function doRunSegmentCompact({
 		narratorId,
 		messageId: markerMsg.id,
 		mode: "blocking",
+		model: settings.agent.summaryModel,
+		reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
+		startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
 		isSegment: true,
 		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
 	});
@@ -1580,6 +1629,7 @@ async function doRunSegmentCompact({
 				isSegment: true,
 				mode: "blocking",
 			});
+			compactProgress.close("compacted");
 
 			return false;
 		}
@@ -1640,6 +1690,7 @@ async function doRunSegmentCompact({
 			isSegment: true,
 			mode: "blocking",
 		});
+		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
 		compactProgress.finish();
@@ -1685,6 +1736,7 @@ async function doRunSegmentCompact({
 			mode: "blocking",
 			error: errorMsg,
 		});
+		compactProgress.close("failed");
 		throw err;
 	}
 }

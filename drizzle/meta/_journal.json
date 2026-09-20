@@ -85,6 +85,13 @@
       "when": 1789374991463,
       "tag": "0011_careless_emma_frost",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1789891697337,
+      "tag": "0012_curved_bloodstorm",
+      "breakpoints": true
     }
   ]
 }

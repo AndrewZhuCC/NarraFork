@@ -48,6 +48,10 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Edit", descKey: "tpToolDescEdit", category: "default" },
 	{ name: "Glob", descKey: "tpToolDescGlob", category: "read-only" },
 	{ name: "Grep", descKey: "tpToolDescGrep", category: "read-only" },
+	{ name: "StructView", descKey: "tpToolDescStructView", category: "read-only" },
+	// `default`, not `read-only`: it writes files. Its own dry-run default is a separate
+	// guard and does not make the tool read-only.
+	{ name: "StructSed", descKey: "tpToolDescStructSed", category: "default" },
 	{ name: "WebSearch", descKey: "tpToolDescWebSearch", category: "always-allow" },
 	{ name: "WebFetch", descKey: "tpToolDescWebFetch", category: "default" },
 	{ name: "Agent", descKey: "tpToolDescAgent", category: "default" },

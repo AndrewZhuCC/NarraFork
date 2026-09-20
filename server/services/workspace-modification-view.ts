@@ -4,6 +4,7 @@
  * receipts. Per-path windows prevent hot files crowding out quiet ones; completeness
  * describes recorded rows in the requested window, not all real filesystem writes.
  */
+import { posix } from "node:path";
 import { and, desc, eq, gte, inArray, lt, lte, or, type SQL, sql } from "drizzle-orm";
 import type {
 	FileChangeActor,
@@ -33,6 +34,8 @@ const DEFAULT_EVENT_LIMIT = 500;
 const MAX_EVENT_LIMIT = 2000;
 /** Display budget, NOT sufficient to prove a complete contributor list or absent flags. */
 const PER_PATH_EVENT_LIMIT = 10;
+/** Hover cards need a useful history, not the entire per-file observation window. */
+const FILE_TIMELINE_EVENT_LIMIT = 5;
 const PATHS_PER_SHARD = 50;
 /** 400 paths; each of at most three canonical/legacy workspace spellings gets 10+1
  * indexed rows. Merge those bounded slices before returning at most ten per path. */
@@ -57,6 +60,15 @@ export interface ModificationEvent {
 	attributionGrade: FileChangeAttributionGrade;
 }
 
+/** Small per-file history projection for hover cards; newest first and always bounded. */
+export interface ModificationEventSummary {
+	id: string;
+	changedAt: string;
+	action: ModificationAction;
+	actor: ModificationActor;
+	evidence: "legacy" | "v2";
+}
+
 export interface FileModificationGroup {
 	filePath: string;
 	/** Observed count; see completeness.countsLowerBound before treating it as a total. */
@@ -67,6 +79,8 @@ export interface FileModificationGroup {
 	lastAction: ModificationAction;
 	/** Known subjects plus unknown identity buckets, newest first; not current diff owners. */
 	actors: ModificationActor[];
+	/** Bounded event summaries for the file-row hover card, newest first. */
+	recentEvents: ModificationEventSummary[];
 	/** True = observed, false = absent from a complete window, null = unknown. */
 	hasExternalChange: boolean | null;
 	hasImpreciseAttribution: boolean | null;
@@ -97,8 +111,21 @@ export interface WorkspaceModificationView {
 	baselineStatus: "unverified";
 }
 
+export interface WorkspaceAttributionScope {
+	workspacePath: string;
+	/** Git-root-relative prefix of the recorded cwd. Empty for the root itself. */
+	prefix: string;
+	/** Remote tools record absolute filenames; this is the target-normalized Git root. */
+	absoluteGitRoot?: string;
+	absoluteSeparator?: "/" | "\\";
+}
+
 export interface WorkspaceModificationViewOptions {
 	deviceId?: string;
+	/** Trusted scope adapters only, never forwarded directly from HTTP input. */
+	additionalScopes?: WorkspaceAttributionScope[];
+	/** Candidate/probe budgets were exhausted, so absence in unvisited cwd scopes is unknown. */
+	additionalScopesTruncated?: boolean;
 	/** Opt-in independent live Git/effect projection; never inferred from a timestamp. */
 	currentDiff?: boolean;
 	signal?: AbortSignal;
@@ -220,16 +247,55 @@ type EventRow = {
  * function or all-history flag scan on the request thread. A missing flag in a
  * truncated slice is unknown until an indexed exact projection can supply it.
  */
+function safeGitRootPath(path: string): string | null {
+	if (!path || posix.isAbsolute(path)) return null;
+	const normalized = posix.normalize(path);
+	return normalized === ".." || normalized.startsWith("../") ? null : normalized;
+}
+
+function recordedScopePath(path: string, scope?: WorkspaceAttributionScope): string {
+	if (!scope) return path;
+	const rootPath = safeGitRootPath(path);
+	if (!rootPath) return "\0outside-workspace";
+	if (scope.absoluteGitRoot) {
+		const separator = scope.absoluteSeparator ?? "/";
+		return `${scope.absoluteGitRoot.replace(/[\\/]$/, "")}${separator}${rootPath.replaceAll(
+			"/",
+			separator,
+		)}`;
+	}
+	return posix.relative(`/${scope.prefix}`, `/${rootPath}`);
+}
+
+function displayScopePath(path: string, scope?: WorkspaceAttributionScope): string {
+	if (!scope) return path;
+	if (scope.absoluteGitRoot) {
+		const root = scope.absoluteGitRoot.replace(/[\\/]$/, "");
+		const separator = scope.absoluteSeparator ?? "/";
+		if (path !== root && !path.startsWith(`${root}${separator}`)) return "\0outside-workspace";
+		return (
+			safeGitRootPath(
+				path.slice(root.length + (path === root ? 0 : 1)).replaceAll(separator, "/"),
+			) ?? "\0outside-workspace"
+		);
+	}
+	if (posix.isAbsolute(path)) return "\0outside-workspace";
+	const rootPath = posix.normalize(posix.join(scope.prefix, path));
+	return rootPath === ".." || rootPath.startsWith("../") ? "\0outside-workspace" : rootPath;
+}
+
 async function selectPerPathRows(
 	filePaths: string[],
 	baseConditions: SQL[],
 	workspaceKeys: string[],
+	scopes: ReadonlyMap<string, WorkspaceAttributionScope>,
 ): Promise<{ rows: EventRow[]; truncatedPaths: Set<string> }> {
 	const rows: EventRow[] = [];
 	const truncatedPaths = new Set<string>();
 	const counts = new Map<string, number>();
-	for (let offset = 0; offset < filePaths.length; offset += PATHS_PER_SHARD) {
-		const shard = filePaths.slice(offset, offset + PATHS_PER_SHARD);
+	const shardSize = Math.min(PATHS_PER_SHARD, Math.max(1, Math.floor(400 / workspaceKeys.length)));
+	for (let offset = 0; offset < filePaths.length; offset += shardSize) {
+		const shard = filePaths.slice(offset, offset + shardSize);
 		const parts = shard.flatMap((filePath) =>
 			workspaceKeys.map(
 				(workspaceKey) => sql`
@@ -239,7 +305,7 @@ async function selectPerPathRows(
 						${EVENT_ROW_ID} as "rowId",
 						${fileAttributions.effectId} as "effectId",
 						${SNAPSHOT_COLUMN} as "actorSnapshotJson",
-						${fileAttributions.filePath} as "filePath",
+						${filePath} as "filePath",
 						${fileAttributions.narratorId} as "narratorId",
 						${fileAttributions.userId} as "userId",
 						${fileAttributions.subagentType} as "subagentType",
@@ -248,7 +314,7 @@ async function selectPerPathRows(
 						${fileAttributions.toolUseId} as "toolUseId",
 						${fileAttributions.changedAt} as "changedAt"
 					from ${fileAttributions}
-					where ${and(...baseConditions, eq(fileAttributions.workspacePath, workspaceKey), eq(fileAttributions.filePath, filePath))}
+					where ${and(...baseConditions, eq(fileAttributions.workspacePath, workspaceKey), eq(fileAttributions.filePath, recordedScopePath(filePath, scopes.get(workspaceKey))))}
 					order by ${fileAttributions.changedAt} desc, ${EVENT_ROW_ID} desc
 					limit ${PER_PATH_EVENT_LIMIT + 1}
 				)`,
@@ -273,6 +339,10 @@ export async function getWorkspaceModificationView(
 	const deviceId = options.deviceId ?? LOCAL_DEVICE_ID;
 	const key = deviceId === LOCAL_DEVICE_ID ? normalizeWorkspacePath(workspacePath) : workspacePath;
 	const workspaceKeys = new Set([key]);
+	const scopes = new Map(
+		(options.additionalScopes ?? []).slice(0, 32).map((scope) => [scope.workspacePath, scope]),
+	);
+	for (const scope of scopes.keys()) workspaceKeys.add(scope);
 	if (deviceId === LOCAL_DEVICE_ID) {
 		try {
 			const canonical = (
@@ -343,32 +413,41 @@ export async function getWorkspaceModificationView(
 	const incompleteDisplayPaths = new Set<string>();
 	if (options.filePaths) {
 		const paths = [...new Set(options.filePaths)];
-		const selected = await selectPerPathRows(paths.slice(0, MAX_QUERY_PATHS), conditions, [
-			...workspaceKeys,
-		]);
+		const selected = await selectPerPathRows(
+			paths.slice(0, MAX_QUERY_PATHS),
+			conditions,
+			[...workspaceKeys],
+			scopes,
+		);
 		rows = selected.rows;
 		rows.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
 		for (const path of [...selected.truncatedPaths, ...paths.slice(MAX_QUERY_PATHS)]) {
 			incompleteDisplayPaths.add(resolveDisplayPath(path, options.pathAliases));
 		}
-		hasMore = incompleteDisplayPaths.size > 0;
+		hasMore = incompleteDisplayPaths.size > 0 || options.additionalScopesTruncated === true;
 	} else {
 		// Each canonical/legacy spelling gets its own indexed bound; IN + global
 		// ORDER BY would otherwise sort the entire history across workspace keys.
 		const fetched = (
 			await Promise.all(
-				[...workspaceKeys].map((workspaceKey) =>
-					db
+				[...workspaceKeys].map(async (workspaceKey) => {
+					const rows = await db
 						.select(EVENT_COLUMNS)
 						.from(fileAttributions)
 						.where(and(...conditions, eq(fileAttributions.workspacePath, workspaceKey)))
 						.orderBy(desc(fileAttributions.changedAt), desc(EVENT_ROW_ID))
-						.limit(limit + 1),
-				),
+						.limit(limit + 1);
+					return rows
+						.map((row) => ({
+							...row,
+							filePath: displayScopePath(row.filePath, scopes.get(workspaceKey)),
+						}))
+						.filter((row) => row.filePath !== "\0outside-workspace");
+				}),
 			)
 		).flat();
 		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
-		hasMore = fetched.length > limit;
+		hasMore = fetched.length > limit || options.additionalScopesTruncated === true;
 		rows = fetched.slice(0, limit);
 	}
 
@@ -451,6 +530,7 @@ export async function getWorkspaceModificationView(
 				lastActor: actor,
 				lastAction: action,
 				actors: [],
+				recentEvents: [],
 				hasExternalChange: complete ? false : null,
 				hasImpreciseAttribution: true,
 				hasDeletedActor: complete ? false : null,
@@ -469,6 +549,15 @@ export async function getWorkspaceModificationView(
 			!group.actors.some((existing) => attributionActorKey(existing) === attributionActorKey(actor))
 		) {
 			group.actors.push(actor);
+		}
+		if (group.recentEvents.length < FILE_TIMELINE_EVENT_LIMIT) {
+			group.recentEvents.push({
+				id: row.id,
+				changedAt: row.changedAt,
+				action,
+				actor,
+				evidence,
+			});
 		}
 	}
 	for (const group of byFile.values()) {

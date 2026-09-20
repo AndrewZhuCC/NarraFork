@@ -425,6 +425,7 @@ export function migrateProviderPrefixReferences(
 		defaultModel: settings.agent.defaultModel,
 		summaryModel: settings.agent.summaryModel,
 		translationModel: settings.agent.translationModel,
+		promptOptimizeModel: settings.agent.promptOptimizeModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
 		subagentModelReasoningEfforts: settings.agent.subagentModelReasoningEfforts,
@@ -441,6 +442,10 @@ export function migrateProviderPrefixReferences(
 	settings.agent.summaryModel = rewriteModelReference(settings.agent.summaryModel, prefixMap);
 	settings.agent.translationModel = rewriteModelReference(
 		settings.agent.translationModel,
+		prefixMap,
+	);
+	settings.agent.promptOptimizeModel = rewriteModelReference(
+		settings.agent.promptOptimizeModel,
 		prefixMap,
 	);
 	for (const key of Object.keys(settings.agent.subagentModels) as Array<
@@ -487,6 +492,7 @@ export function migrateProviderPrefixReferences(
 		defaultModel: settings.agent.defaultModel,
 		summaryModel: settings.agent.summaryModel,
 		translationModel: settings.agent.translationModel,
+		promptOptimizeModel: settings.agent.promptOptimizeModel,
 		subagentModels: settings.agent.subagentModels,
 		subagentAllowedModels: settings.agent.subagentAllowedModels,
 		subagentModelReasoningEfforts: settings.agent.subagentModelReasoningEfforts,

@@ -14,10 +14,13 @@
  */
 
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { MeasuredElement } from "./prepared-block";
 import type { VListElementKind } from "./registry";
-import { RenderAskInPassing } from "./render/RenderAskInPassing";
+import {
+	type AskInPassingPendingInteraction,
+	RenderAskInPassing,
+} from "./render/RenderAskInPassing";
 import { RenderCommunicationBubble } from "./render/RenderCommunicationBubble";
 import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
@@ -88,6 +91,9 @@ export function resolveRenderExtra(spec: {
 			// the badge lives inside the already-reserved header row.
 			if ("origin" in data) extra.origin = data.origin;
 			if ("originLabel" in data) extra.originLabel = data.originLabel;
+			if ("deliveryId" in data) extra.deliveryId = data.deliveryId;
+			if ("deliveryKind" in data) extra.deliveryKind = data.deliveryKind;
+			if ("deliveryState" in data) extra.deliveryState = data.deliveryState;
 			// Slash-command bubbles fold their expansion behind a toggle; mark them so
 			// the integration layer wires onToggle (plain bubbles get no toggle).
 			if ("commandText" in data && data.commandText) extra.commandText = data.commandText;
@@ -100,6 +106,9 @@ export function resolveRenderExtra(spec: {
 			// Producer tag drives the accent rail; the speaker header is built by the
 			// integration layer (this layer imports no avatar), same as a user bubble.
 			if ("source" in data) extra.source = data.source;
+			if ("deliveryId" in data) extra.deliveryId = data.deliveryId;
+			if ("deliveryKind" in data) extra.deliveryKind = data.deliveryKind;
+			if ("deliveryState" in data) extra.deliveryState = data.deliveryState;
 			if ("speaker" in data) extra.speaker = data.speaker;
 			// Identicon seed for the header's avatar (a sender / task / entry id).
 			// Height-neutral: the header row is a fixed single line either way.
@@ -381,11 +390,7 @@ export function renderElement(
 					kind={(extra.kind as "pending" | "resolved") ?? "pending"}
 					measured={m}
 					labels={extra.labels as never}
-					// The pending form's real interactive component (state + fork/send
-					// mutation + cancel) is mounted as a slot; the resolved card's arrow
-					// needs the route to its answer narrator. Without these the card
-					// painted correctly but could neither be typed into nor opened.
-					formSlot={extra.askInPassingFormSlot as React.ReactNode}
+					pending={extra.askInPassingPending as AskInPassingPendingInteraction | undefined}
 					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
 				/>
 			);

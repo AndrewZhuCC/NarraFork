@@ -30,9 +30,14 @@ import {
 	materializeRichInlineLineRange,
 	walkRichInlineLineRanges,
 } from "@chenglou/pretext/rich-inline";
-import { DiffContent } from "@frontend/components/narrator/DiffContent";
+import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
+import {
+	STRUCT_THEME_DARK,
+	STRUCT_THEME_LIGHT,
+	tokenizeStructViewBody,
+} from "@frontend/lib/struct-view-tokens";
 import {
 	Badge,
 	Box,
@@ -49,6 +54,7 @@ import {
 	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
+	useComputedColorScheme,
 } from "@mantine/core";
 import {
 	CARD_SHIMMER_CLASS,
@@ -78,8 +84,8 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
-import { AutoFollowScroll } from "../../AutoFollowScroll";
-import { TOOL_HEADER_SELECT_ATTR } from "../../MessageSelectionCtx";
+import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
+import { AutoFollowScroll } from "../../scroll/AutoFollowScroll";
 import { OPTION_CONTROL_SIZE } from "../measure/measure-permission";
 import {
 	CARD_HEADER_INNER_ICON,
@@ -233,6 +239,11 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	file: "violet",
 	bash: "orange",
 	search: "cyan",
+	// Same cyan as search: both answer a question about code rather than returning its
+	// contents. The mode chip on the card distinguishes them.
+	structure: "cyan",
+	// Violet like the other file-mutating tools, not search's cyan: this one writes.
+	structureEdit: "violet",
 	webSearch: "teal",
 	webFetch: "teal",
 	tasks: "teal",
@@ -749,6 +760,7 @@ export interface ToolTimingLabels {
 	title: string;
 	started: string;
 	streamStarted: string;
+	streamCompleted?: string;
 	permissionStarted: string;
 	executionStarted: string;
 	completed: string;
@@ -767,6 +779,7 @@ const DEFAULT_TIMING_LABELS: ToolTimingLabels = {
 	title: "Timing",
 	started: "Started",
 	streamStarted: "Tool streaming started",
+	streamCompleted: "Tool streaming completed",
 	permissionStarted: "Permission wait started",
 	executionStarted: "Execution started",
 	completed: "Execution completed",
@@ -793,6 +806,7 @@ function hasTimingDetails(timing: ToolTimingStamps | null | undefined): boolean 
 		timing.startedAt != null ||
 		timing.createdAt != null ||
 		timing.streamStartedAt != null ||
+		timing.streamCompletedAt != null ||
 		timing.permissionStartedAt != null ||
 		timing.executionStartedAt != null ||
 		timing.completedAt != null
@@ -824,7 +838,7 @@ function ToolTimingBreakdown({
 		(value): value is number => value != null,
 	);
 	const explicitStarted = explicitCandidates.length > 0 ? Math.min(...explicitCandidates) : null;
-	const { streamStartedAt, permissionStartedAt, executionStartedAt } = timing;
+	const { streamStartedAt, streamCompletedAt, permissionStartedAt, executionStartedAt } = timing;
 	const finalDurationMs = timing.durationMs ?? displayDurationMs ?? null;
 	const completed =
 		timing.completedAt ??
@@ -845,6 +859,15 @@ function ToolTimingBreakdown({
 		[
 			{ key: "started", label: labels.started, time: genericStarted },
 			{ key: "stream", label: labels.streamStarted, time: streamStartedAt },
+			...(streamCompletedAt != null
+				? [
+						{
+							key: "streamCompleted",
+							label: labels.streamCompleted ?? "Tool streaming completed",
+							time: streamCompletedAt,
+						},
+					]
+				: []),
 			{ key: "permission", label: labels.permissionStarted, time: permissionStartedAt },
 			{ key: "execution", label: labels.executionStarted, time: executionStartedAt },
 			{ key: "completed", label: labels.completed, time: completed },
@@ -1390,6 +1413,27 @@ function HighlightedBody({ text, lang }: { text: string; lang: string | undefine
 }
 
 /**
+ * The same body, coloured by a report tokenizer instead of a language grammar.
+ *
+ * A separate component rather than a branch inside `HighlightedBody` because the two
+ * routes use different hooks and hooks cannot be called conditionally. Both end at
+ * `TokenFlowText`, so the exactness check and the plain-text fallback apply identically.
+ */
+function CustomHighlightedBody({ text, kind }: { text: string; kind: "struct-view" }) {
+	const dark = useComputedColorScheme("dark") !== "light";
+	// Synchronous: unlike Shiki there is no grammar or WASM to fetch, so there is nothing
+	// to cache and no pending state to render around.
+	const tokens = useMemo(
+		() =>
+			kind === "struct-view"
+				? tokenizeStructViewBody(text, dark ? STRUCT_THEME_DARK : STRUCT_THEME_LIGHT)
+				: null,
+		[text, kind, dark],
+	);
+	return <TokenFlowText text={text} tokens={tokens} />;
+}
+
+/**
  * Test-only handle on the timing breakdown body. Mantine's Popover dropdown is
  * portaled and only mounts while open, so a static render of the header cannot
  * reach the breakdown — exported so RenderToolCall.timing.test.tsx can assert the
@@ -1860,6 +1904,8 @@ export function RenderToolBody({
 								}}
 							/>
 						</div>
+					) : model.customHighlight && !showSource ? (
+						<CustomHighlightedBody text={model.text ?? ""} kind={model.customHighlight} />
 					) : (
 						<HighlightedBody
 							text={model.text ?? ""}

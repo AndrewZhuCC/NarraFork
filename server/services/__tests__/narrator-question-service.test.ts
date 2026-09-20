@@ -196,7 +196,9 @@ describe("own question wait capability", () => {
 		});
 		expect(answer.ok).toBe(true);
 		const filter = resolveToolFilter("general");
-		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(true);
+		// Asking is gone for subagents, but waiting on a question that already exists
+		// (e.g. filed by the primary before delegation) stays available.
+		expect(filter?.({ ...awaitTool, name: "AskUserQuestion" })).toBe(false);
 		expect(filter?.(awaitTool)).toBe(true);
 		const context = {
 			narratorId: NARRATOR_ID,
@@ -204,15 +206,12 @@ describe("own question wait capability", () => {
 			currentToolUseId: "legacy-question-wait",
 			signal: new AbortController().signal,
 		} as import("../../lib/agent/types").ToolContext;
-		const own = await awaitTool.execute(
-			{ type: "question", id: record.id, onlyWaitFor: true },
-			context,
-		);
+		const own = await awaitTool.execute({ type: "question", id: record.id }, context);
 		expect(own.isError).not.toBe(true);
 		expect(own.output).toContain("Redis");
 		expect(own.metadata?.status).toBe("answered");
 		const foreign = await awaitTool.execute(
-			{ type: "question", id: record.id, onlyWaitFor: true },
+			{ type: "question", id: record.id },
 			{
 				...context,
 				narratorId: OTHER_NARRATOR_ID,

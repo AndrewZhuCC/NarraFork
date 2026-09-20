@@ -13,7 +13,7 @@ import type React from "react";
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
-import { clearHighlightCache } from "../../components/narrator/highlight-cache";
+import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
@@ -25,7 +25,7 @@ const NarratorTerminal = lazy(() =>
 	})),
 );
 const SpecPanel = lazy(() =>
-	import("../../components/narrator/SpecPanel").then((m) => ({
+	import("../../components/narrator/spec/SpecPanel").then((m) => ({
 		default: m.SpecPanel,
 	})),
 );
@@ -38,6 +38,7 @@ const NarratorPanel = lazy(() =>
 import { NarratorDock } from "../../components/narrator/dock/NarratorDock";
 import { NarratorDockProvider } from "../../components/narrator/dock/NarratorDockContext";
 import { useChapter } from "../../hooks/useChapters";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import { useNarrator } from "../../hooks/useNarrator";
 import { useTerminalCapability } from "../../hooks/usePlatform";
 import {
@@ -244,6 +245,7 @@ function NarratorDetailPage() {
 		return pushHistorySentinel(router.history, APP_HISTORY_SENTINEL.terminalDrawer, closeDrawer)
 			.dispose;
 	}, [drawerOpened, isMobile, closeDrawer, router.history]);
+	useMobileDrawerHistory(specDrawerOpened, closeSpecDrawer);
 
 	// Mobile: open drawer and auto-create terminal if none running
 	const openDrawerWithTerminal = useCallback(() => {

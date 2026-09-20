@@ -365,7 +365,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	}
 	if (
 		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && (tu.input.onlyWaitFor !== true || tu.input.type === "agent")) ||
+		(tu.name === "Await" && tu.input.type === "agent") ||
 		(tu.name === "Send" && tu.input.await === true)
 	) {
 		return "resumable";
@@ -417,11 +417,7 @@ async function upsertDeferredTool(
 			permissionGranted,
 			...(executionTarget ? { executionTarget } : {}),
 			...(tu.name === "Await" && typeof tu.input.type === "string"
-				? {
-						awaitType: tu.input.type,
-						awaitMode: tu.input.onlyWaitFor === true ? "target" : "any",
-						onlyWaitFor: tu.input.onlyWaitFor === true,
-					}
+				? { awaitType: tu.input.type }
 				: {}),
 			...(tu.name === "Agent"
 				? {
@@ -710,6 +706,17 @@ export async function executeTool(
 		if (!tool) {
 			return {
 				output: `Unknown tool: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		if (
+			(config.reflectionLoop && !config.reflectionLoop.allowedTools.includes(tu.name)) ||
+			(tool.reflectionOnly && !config.reflectionLoop)
+		) {
+			return {
+				output: `Tool is not allowed in the current reflection context: ${tu.name}`,
 				isError: true,
 				durationMs: 0,
 			};

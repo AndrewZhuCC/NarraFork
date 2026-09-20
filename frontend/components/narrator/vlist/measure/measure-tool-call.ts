@@ -68,6 +68,7 @@
 
 import { measureLineStats, prepareWithSegments } from "@chenglou/pretext";
 import { prepareRichInline, type RichInlineItem } from "@chenglou/pretext/rich-inline";
+import { prefersOpenToolCategory } from "@shared/prefer-open-tool";
 import {
 	type DiffDocument,
 	diffDocumentLineNoWidth,
@@ -185,6 +186,8 @@ export type ToolCategory =
 	| "file"
 	| "bash"
 	| "search"
+	| "structure"
+	| "structureEdit"
 	| "webSearch"
 	| "webFetch"
 	| "tasks"
@@ -591,6 +594,7 @@ export interface ToolCallData {
 	 * header had a duration but no breakdown of where the time went.
 	 */
 	streamStartedAt?: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt?: number | null;
 	executionStartedAt?: number | null;
 	completedAt?: number | null;
@@ -634,6 +638,7 @@ export interface ToolCallData {
 export interface ToolTimingStamps {
 	startedAt: number | null;
 	streamStartedAt: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt: number | null;
 	executionStartedAt: number | null;
 	completedAt: number | null;
@@ -656,6 +661,7 @@ function stampOf(value: unknown): number | null {
 export function resolveToolTimingStamps(source: {
 	startedAt?: number | null;
 	streamStartedAt?: number | null;
+	streamCompletedAt?: number | null;
 	permissionStartedAt?: number | null;
 	executionStartedAt?: number | null;
 	completedAt?: number | null;
@@ -665,6 +671,7 @@ export function resolveToolTimingStamps(source: {
 	return {
 		startedAt: stampOf(source.startedAt),
 		streamStartedAt: stampOf(source.streamStartedAt),
+		streamCompletedAt: stampOf(source.streamCompletedAt),
 		permissionStartedAt: stampOf(source.permissionStartedAt),
 		executionStartedAt: stampOf(source.executionStartedAt),
 		completedAt: stampOf(source.completedAt),
@@ -715,6 +722,17 @@ export interface MeasureToolCallOpts {
 	 * key via digestOpts, so the two geometries never share an entry.
 	 */
 	forceExpanded?: boolean;
+	/**
+	 * Default-expand at every LOD, but unlike `forceExpanded`/`lodExempt` an
+	 * explicit reader fold still wins. Used for operational cards such as
+	 * AskUserQuestion, whose options/form must stay visible at low LOD without
+	 * locking the reader out of collapsing a long completed question list.
+	 *
+	 * Derived automatically from `data.category === "ask"`; the opt exists so the
+	 * adapter can key the measure cache on the decision and so a future prefer-open
+	 * category need not hard-code another name here.
+	 */
+	preferOpen?: boolean;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -917,6 +935,11 @@ export function computeDefaultOpen(data: ToolCallData, pendingPermission: boolea
 		"plan",
 		"knowledge",
 		"file",
+		// StructSed edits a file just as Write and Edit do, so it opens like them. Its
+		// own category exists to carry a different chip and colour, not a lesser status —
+		// leaving it out meant a structural rewrite arrived folded while the equivalent
+		// Edit arrived showing its diff.
+		"structureEdit",
 	];
 	if (autoOpen.includes(data.category)) return true;
 	if ((data.category === "await" || data.category === "bash") && data.detail != null) return true;
@@ -936,9 +959,19 @@ export function resolveToolCallOpened(
 		opened: boolean;
 		lodUserOverride?: boolean;
 		userCollapsed?: boolean;
+		/**
+		 * Operational card (ask form / question): default-expanded at every LOD.
+		 * Unlike `lodExempt`, an explicit fold still collapses it — the chevron
+		 * must stay alive on cards the reader may want to put away after answering.
+		 */
+		preferOpen?: boolean;
 	},
 ): boolean {
 	if (opts.lodExempt || opts.lodUserOverride) return true;
+	// Prefer-open is a DEFAULT, not a lock. `userCollapsed` is the only signal of
+	// an explicit reader fold (a derived `opened === false` from computeDefaultOpen
+	// must not count — same contract as L5 below).
+	if (opts.preferOpen) return opts.userCollapsed !== true;
 	// L5 is the most detailed level, so an UNTOUCHED card is expanded — but the
 	// reader may still fold one, and `userCollapsed` is the only input that can say
 	// so. Returning a bare `true` here made the header chevron dead at L5: the
@@ -954,7 +987,9 @@ export function resolveToolCallOpened(
 	if (lod === 4) return opts.isRecent ? opts.opened : false;
 	if (lod === 3) return false;
 	// L1/L2: the upstream tool-run gate owns these levels; a card shown here is
-	// treated as collapsed (its content lives in the folded trace instead).
+	// treated as collapsed (its content lives in the folded trace instead). Prefer-open
+	// cards are kept OUT of that fold by the adapter, so this branch only applies
+	// when a caller still hands a collapsed card here without the flag.
 	return false;
 }
 
@@ -1829,13 +1864,14 @@ export function measureToolCall(
 	// forces the card expanded so the permission area shows.
 	const hasPendingPermission = opts.hasPendingPermission === true;
 	const forceExpanded = hasPending || hasPendingPermission || opts.forceExpanded === true;
+	const preferOpen = opts.preferOpen === true || prefersOpenToolCategory(data.category);
 
 	const innerWidth = toolCardInnerWidth(contentWidth, inRun);
 
 	// ── Expand decision ──────────────────────────────────────────────────────
 	const lodExempt = isRunningStatus(data.status) || isStreaming || forceExpanded;
 	const isRecent = opts.isRecent ?? true;
-	const opened = opts.opened ?? computeDefaultOpen(data, forceExpanded);
+	const opened = opts.opened ?? (preferOpen || computeDefaultOpen(data, forceExpanded));
 	// An EXPLICIT fold, as opposed to `opened === false` derived from
 	// `computeDefaultOpen`. The two must stay distinct: at L5 the derived default is
 	// not a decision the reader made, so honouring it there would collapse every
@@ -1849,6 +1885,7 @@ export function measureToolCall(
 		isRecent,
 		opened,
 		lodUserOverride: opts.lodUserOverride,
+		preferOpen,
 	});
 
 	// ── Fixed chrome ─────────────────────────────────────────────────────────

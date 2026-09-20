@@ -2,11 +2,13 @@ import { Box, Modal } from "@mantine/core";
 import { lazy, Suspense, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { ToolCallDetailRef } from "../../lib/api/narrators";
-import { useFilePanelNavigation } from "./file-panel-navigation";
-import type { ToolEditReference } from "./tool-edit-reference";
+import { useFilePanelNavigation } from "./file-panel/file-panel-navigation";
+import type { ToolEditReference } from "./tool-call/tool-edit-reference";
 
 const ToolEditFileViewer = lazy(() =>
-	import("./ToolEditFileViewer").then((module) => ({ default: module.ToolEditFileViewer })),
+	import("./tool-call/ToolEditFileViewer").then((module) => ({
+		default: module.ToolEditFileViewer,
+	})),
 );
 
 /** Both right-click surfaces bind the persisted tool identity, not the active file/device. */
@@ -26,8 +28,13 @@ export function useToolEditNavigation({
 	const openFilePanel = useFilePanelNavigation();
 	const { t } = useTranslation("narrator");
 	const [opened, setOpened] = useState(false);
+	// StructSed qualifies alongside Edit: the preview is built from the tool call's tree
+	// snapshot hashes, which it records the same way, so nothing here is Edit-specific.
+	// Excluding it only denied a structural rewrite the review affordance its equivalent
+	// Edit already had.
 	const reference = useMemo<ToolEditReference | null>(() => {
-		if (toolName !== "Edit" || !narratorId || !toolUseId || !filePath) return null;
+		if ((toolName !== "Edit" && toolName !== "StructSed") || !narratorId || !toolUseId || !filePath)
+			return null;
 		return {
 			narratorId,
 			toolUseId,

@@ -1500,6 +1500,16 @@ describe("measureToolCall — running/pending cards are lodExempt", () => {
 		// Pending permission forces open regardless of category.
 		expect(computeDefaultOpen(baseCard(), true)).toBe(true);
 	});
+
+	it("computeDefaultOpen opens a StructSed card like a Write or Edit", async () => {
+		// StructSed rewrites a file exactly as the `file` category tools do; its own
+		// category carries a different chip and colour, not a lesser status. Arriving folded
+		// while an equivalent Edit arrived showing its diff was the visible symptom.
+		const { computeDefaultOpen } = await mod();
+		expect(computeDefaultOpen(baseCard({ category: "structureEdit" }), false)).toBe(true);
+		// The read-only structural sibling stays collapsed — it inspects, it does not change.
+		expect(computeDefaultOpen(baseCard({ category: "structure" }), false)).toBe(false);
+	});
 });
 
 describe("measureToolCall — the pinned latest-tasks card is forceExpanded", () => {
@@ -1707,6 +1717,7 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 	const STAMPS = {
 		startedAt: 1_000,
 		streamStartedAt: 900,
+		streamCompletedAt: 1_000,
 		permissionStartedAt: 1_100,
 		executionStartedAt: 1_500,
 		completedAt: 4_000,
@@ -1724,6 +1735,7 @@ describe("measureToolCall — lifecycle stamps reach the renderer", () => {
 		expect(measureToolCall(baseCard(), 600, 4).timing).toEqual({
 			startedAt: null,
 			streamStartedAt: null,
+			streamCompletedAt: null,
 			permissionStartedAt: null,
 			executionStartedAt: null,
 			completedAt: null,

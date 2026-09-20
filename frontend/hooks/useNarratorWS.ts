@@ -49,6 +49,9 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 		...(data.streamStartedAt != null
 			? { streamStartedAt: data.streamStartedAt as string | number }
 			: {}),
+		...(data.streamCompletedAt != null
+			? { streamCompletedAt: data.streamCompletedAt as string | number }
+			: {}),
 		...(data.permissionStartedAt != null
 			? { permissionStartedAt: data.permissionStartedAt as string | number }
 			: {}),
@@ -197,6 +200,11 @@ export interface CompactProgressEvent extends ProgressSnapshot {
 	messageId: string;
 	isSegment: boolean;
 	mode: "blocking" | "background";
+	model?: string;
+	reasoningEffort?: string;
+	startedAt?: string;
+	output?: string;
+	thinking?: string;
 	/** 1-based ordinal of the retry now in flight (0 = not retrying). */
 	retryCount: number;
 	/** Error that triggered the current retry, when retryCount > 0. */
@@ -219,6 +227,11 @@ export function coerceCompactProgressEvent(
 		...coerceProgressSnapshot(data),
 		isSegment: data.isSegment === true,
 		mode: data.mode === "background" ? "background" : "blocking",
+		...(typeof data.model === "string" ? { model: data.model } : {}),
+		...(typeof data.reasoningEffort === "string" ? { reasoningEffort: data.reasoningEffort } : {}),
+		...(typeof data.startedAt === "string" ? { startedAt: data.startedAt } : {}),
+		...(typeof data.output === "string" ? { output: data.output } : {}),
+		...(typeof data.thinking === "string" ? { thinking: data.thinking } : {}),
 		// Older servers never broadcast retry state, which normalizes to "not
 		// retrying" — exactly their pre-existing behaviour.
 		retryCount,
@@ -417,6 +430,7 @@ interface NarratorWSCallbacks {
 		toolUseId: string,
 		toolName: string,
 		streamStartedAt?: number,
+		streamCompletedAt?: number,
 		input?: Record<string, unknown>,
 		parentToolUseId?: string,
 		meta?: SubagentToolEventMeta,
@@ -566,16 +580,29 @@ interface NarratorWSCallbacks {
 		required?: number;
 		resumeAction: "retry" | "continue";
 	}) => void;
-	/** The narrator is suspended waiting for a NUG model to recover (credential pool exhausted). */
+	/**
+	 * The narrator is parked on a self-recovering block: a NUG model to recover
+	 * (credential pool exhausted), or a Kimi quota window to reset.
+	 */
 	onModelUnavailableWaiting?: (info: {
 		message: string;
 		model: string;
 		providerId?: string;
 		providerPrefix?: string;
 		nugModelId?: string;
+		waitKind?: "credentials" | "quota";
+		/** Epoch ms the quota window resets at (`quota` waits only). */
+		resumeAt?: number;
 	}) => void;
-	/** A suspended narrator's NUG model recovered; it is resuming. */
-	onModelUnavailableRecovered?: (info: { model: string; nugModelId?: string }) => void;
+	/**
+	 * A parked narrator's block cleared; it is resuming. `waitKind` matches the wait
+	 * it was parked on, so the notice can be worded consistently.
+	 */
+	onModelUnavailableRecovered?: (info: {
+		model: string;
+		nugModelId?: string;
+		waitKind?: "credentials" | "quota";
+	}) => void;
 	onQueueStatus?: (position?: number, queueDepth?: number, queueMessage?: string) => void;
 	onWebSearch?: (
 		id: string,
@@ -1043,6 +1070,7 @@ export function useNarratorWS(
 							data.toolUseId as string,
 							data.toolName as string,
 							data.streamStartedAt as number | undefined,
+							data.streamCompletedAt as number | undefined,
 							data.input as Record<string, unknown> | undefined,
 							data.parentToolUseId as string | undefined,
 							subagentToolEventMeta(data),
@@ -1315,12 +1343,15 @@ export function useNarratorWS(
 							providerId: data.providerId as string | undefined,
 							providerPrefix: data.providerPrefix as string | undefined,
 							nugModelId: data.nugModelId as string | undefined,
+							waitKind: data.waitKind as "credentials" | "quota" | undefined,
+							resumeAt: data.resumeAt as number | undefined,
 						});
 						break;
 					case "model_unavailable_recovered":
 						callbackOwner.callbacks.onModelUnavailableRecovered?.({
 							model: data.model as string,
 							nugModelId: data.nugModelId as string | undefined,
+							waitKind: data.waitKind as "credentials" | "quota" | undefined,
 						});
 						break;
 					case "queue_status":
@@ -1631,6 +1662,7 @@ export function useNarratorWS(
 								executing?: boolean;
 								input?: unknown;
 								streamStartedAt?: number;
+								streamCompletedAt?: number;
 								streamingOutput?: string;
 								structuredProgress?: ToolProgressPayload;
 								toolCallId?: string | null;

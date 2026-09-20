@@ -188,9 +188,47 @@ export function extractDataRevision(data: unknown): string | undefined {
 	// Collect height-affecting primitives that can change for the same spec.key.
 	let rev = "";
 	if ("status" in d && d.status != null) rev += `s:${d.status}`;
+	// Ask-in-passing's adapter uses `kind`, not `status`, while preserving its
+	// stable row key. Both the variant and question affect the cached blocks;
+	// hash text rather than length so equal-length edits also repaint.
+	if (d.kind === "pending" || d.kind === "resolved") {
+		rev += `|aip:${d.kind}`;
+		if (typeof d.question === "string") rev += `|aq:${textSignature(d.question)}`;
+		// The adapter currently resolves navigation separately. Also invalidate if
+		// a caller supplies the measure payload's optional navigation target.
+		if (typeof d.targetNarratorId === "string") rev += `|at:${textSignature(d.targetNarratorId)}`;
+	}
 	if ("isStreaming" in d && d.isStreaming) rev += "|st:1";
 	if ("isActive" in d && d.isActive) rev += "|ac:1";
 	if ("isTerminal" in d && d.isTerminal) rev += "|te:1";
+	// Delivery state/id are height-neutral header fields, but ExactRow renders from
+	// the cached measured payload. Key them so queued → claimed/materialized/failed,
+	// and canonical user edits that carry a new delivery identity, repaint immediately
+	// instead of remaining stuck behind the old measured object.
+	if (typeof d.deliveryId === "string") rev += `|di:${d.deliveryId}`;
+	if (typeof d.deliveryKind === "string") rev += `|dk:${d.deliveryKind}`;
+	if (typeof d.deliveryState === "string") rev += `|ds:${d.deliveryState}`;
+	// Injection/user header and body passthroughs are painted from `spec.data`, but
+	// ExactRow memoizes the measured object. A same-id message update must therefore
+	// invalidate the object even when geometry stays equal.
+	for (const key of [
+		"markdown",
+		"modelFacing",
+		"speaker",
+		"speakerKind",
+		"source",
+		"origin",
+		"originLabel",
+		"createdAt",
+	] as const) {
+		if (typeof d[key] === "string") rev += `|${key}:${textSignature(d[key])}`;
+	}
+	if (d.creator && typeof d.creator === "object") {
+		const creator = d.creator as Record<string, unknown>;
+		rev += `|cr:${String(creator.id ?? "")}:${String(creator.username ?? "")}:${String(
+			creator.avatarColor ?? "",
+		)}:${String(creator.avatarImageId ?? "")}`;
+	}
 	// Effective timeout — the ONE height-neutral passthrough that needs keying.
 	//
 	// Height-neutral fields normally may be omitted (the `/ 2m` suffix rides the
@@ -732,6 +770,7 @@ function leafTextRevision(d: Record<string, unknown>): string {
 		"cap",
 		"codeLang",
 		"codeLangPath",
+		"customHighlight",
 		"sourcePath",
 		"kind",
 	] as const) {

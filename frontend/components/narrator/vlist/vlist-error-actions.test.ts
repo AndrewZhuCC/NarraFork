@@ -21,6 +21,7 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 import {
 	errorNoticeText,
 	isErrorNoticeItem,
@@ -29,11 +30,11 @@ import {
 import type { VListItem } from "./vlist-pipeline";
 
 const DIR = import.meta.dir;
-const SHELL = readFileSync(join(DIR, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const DISPATCH = readFileSync(join(DIR, "render-registry.tsx"), "utf8");
 const CARD = readFileSync(join(DIR, "render", "RenderSystemText.tsx"), "utf8");
 const ACTIONS = readFileSync(join(DIR, "vlist-error-actions.tsx"), "utf8");
-const MODAL = readFileSync(join(DIR, "..", "RetryRuleModal.tsx"), "utf8");
+const MODAL = readFileSync(join(DIR, "..", "permission", "RetryRuleModal.tsx"), "utf8");
 const LABELS = readFileSync(join(DIR, "useVListLabels.ts"), "utf8");
 const MEASURE = readFileSync(join(DIR, "measure", "measure-system-text.ts"), "utf8");
 const ADAPTER = readFileSync(

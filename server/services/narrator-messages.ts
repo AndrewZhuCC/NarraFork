@@ -64,6 +64,7 @@ import {
 	resolveAwaitAgentIdsForToolCalls,
 	TAKEN_OVER_FIELD,
 } from "./await-agent-resolution";
+import { liveCompactProgress } from "./compact-live-state";
 import { deleteRecipientMessageRefs, updateRecipientMessageRef } from "./narrator-persistence";
 import {
 	ensureRefsCoverMessage,
@@ -90,7 +91,11 @@ import {
 } from "./snapshot-revert";
 // Pure in-memory state module (no imports of its own), so importing it here
 // cannot widen this file's already-delicate import cycle with narrator-service.
-import { getFileChangesBySubagent, type SubagentFileChanges } from "./subagent-file-changes";
+import {
+	getFileChangesBySubagent,
+	type SubagentExecutionBoundary,
+	type SubagentFileChanges,
+} from "./subagent-file-changes";
 import { isTakenOverForDisplay, listDisplayTakenOverSubagents } from "./subagent-takeover";
 import { toolEditPreviewColumns } from "./tool-edit-preview";
 
@@ -1914,6 +1919,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				executionAttempt: tc.executionAttempt,
 				durationMs: tc.durationMs,
 				streamStartedAt: tc.streamStartedAt,
+				streamCompletedAt: tc.streamCompletedAt,
 				permissionStartedAt: tc.permissionStartedAt,
 				executionStartedAt: tc.executionStartedAt,
 				completedAt: tc.completedAt,
@@ -1949,7 +1955,7 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
  * `outputJson` alone was 11-15%.
  *
  * The renderer never needs the array on this path. `segmentMessages`
- * (frontend/components/narrator/message-segments.ts) builds each `ToolCallData`
+ * (frontend/components/narrator/message/message-segments.ts) builds each `ToolCallData`
  * as `block.<field> ?? tc?.<field>` for every field it reads — the block is
  * always preferred and the row is only a fallback — and `enrichToolUseBlocks`
  * writes all of those fields onto the block (with `id`/`createdAt` landing as
@@ -2125,6 +2131,7 @@ interface SubagentActivityOwner {
 	subagentNarratorId: string;
 	model: string | null;
 	reasoningEffort: string | null;
+	executionBoundary: SubagentExecutionBoundary;
 }
 
 /**
@@ -2204,6 +2211,7 @@ async function loadLatestSubagentToolCalls(
 					status: narratorToolCalls.status,
 					createdAt: narratorToolCalls.createdAt,
 					streamStartedAt: narratorToolCalls.streamStartedAt,
+					streamCompletedAt: narratorToolCalls.streamCompletedAt,
 					permissionStartedAt: narratorToolCalls.permissionStartedAt,
 					executionStartedAt: narratorToolCalls.executionStartedAt,
 					completedAt: narratorToolCalls.completedAt,
@@ -2267,9 +2275,14 @@ async function buildSubagentActivities(
 	}
 	const narratorIds = [...new Set(owners.map((owner) => owner.subagentNarratorId))];
 	const toolCallsByNarrator = await loadLatestSubagentToolCalls(narratorIds);
+	const executionBoundariesBySubagent = new Map(
+		owners.map((owner) => [owner.subagentNarratorId, owner.executionBoundary] as const),
+	);
 	// One aggregate for EVERY card on the page. A per-card query here would turn
 	// opening a session with a dozen Agent calls into a query storm on a list path.
-	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds);
+	const fileChangesByNarrator = await getFileChangesBySubagent(narratorIds, {
+		executionBoundariesBySubagent,
+	});
 	for (const owner of owners) {
 		const effectiveReasoningEffort =
 			owner.reasoningEffort ??
@@ -2326,6 +2339,8 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 					.select({
 						...historyToolMetadataColumns,
 						executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
+						executionAttempt: narratorToolCalls.executionAttempt,
+						executionSegmentId: narratorToolCalls.executionSegmentId,
 						callerSeq: sql<
 							number | null
 						>`(SELECT aggregate_ref.seq FROM narrator_message_refs aggregate_ref
@@ -2498,11 +2513,19 @@ function resolveAggregateScopeTx(tx: MessageTx, narratorId: string, toolUseIds: 
 		const parentToolUseId = row.originToolCallId && parentByOrigin.get(row.originToolCallId);
 		if (!parentToolUseId || !row.parentNarratorId || !isSubagentVariant(row.variant)) continue;
 		const group = ownerGroups.get(parentToolUseId) ?? new Map<string, SubagentActivityOwner>();
+		const parent = parents.get(parentToolUseId);
+		if (!parent) continue;
 		group.set(row.id, {
 			parentToolUseId,
 			subagentNarratorId: row.id,
 			model: row.model,
 			reasoningEffort: row.reasoningEffort,
+			executionBoundary: {
+				sourceToolCallId: parent.id,
+				executionAttempt: parent.executionAttempt ?? null,
+				executionIdentityVersion: parent.executionIdentityVersion ?? null,
+				executionSegmentId: parent.executionSegmentId ?? null,
+			},
 		});
 		ownerGroups.set(parentToolUseId, group);
 	}
@@ -3214,9 +3237,9 @@ const narratorMessageQueriesUnlocked = {
 	 * remains the complete row shape used by display/compatibility paths, while the
 	 * agent loop does not need audit, billing, permission timeline, or UI metadata.
 	 */
-	async getModelHistorySinceLastCompact(narratorId: string) {
+	async getModelHistorySinceLastCompact(narratorId: string, limit?: number) {
 		const compactSeq = await this.getLatestCompactSeq(narratorId);
-		const refRows = await db
+		const refQuery = db
 			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
@@ -3229,6 +3252,9 @@ const narratorMessageQueriesUnlocked = {
 				),
 			)
 			.orderBy(narratorMessageRefs.seq);
+		const refRows = await (limit == null
+			? refQuery
+			: refQuery.limit(Math.min(Math.max(Math.trunc(limit), 1), 2000)));
 		if (refRows.length === 0) return [];
 
 		const messageIds = refRows.map((r) => r.messageId);
@@ -4135,9 +4161,28 @@ const narratorMessageQueriesUnlocked = {
 				ref.isCompact === 0 &&
 				(latestCompactSeq == null || ref.seq > latestCompactSeq);
 			const latestAttempt = compactBlock.attempts?.at(-1);
+			const live =
+				compactBlock.status === "compacting" ? liveCompactProgress.get(messageId) : undefined;
 			return {
 				status: compactBlock.status,
 				summary: typeof compactBlock.summary === "string" ? compactBlock.summary : "",
+				...(live
+					? {
+							model: live.model || latestAttempt?.model,
+							reasoningEffort: live.reasoningEffort,
+							startedAt: live.startedAt,
+							output: live.output,
+							thinking: live.thinking,
+							outputChars: live.outputChars,
+							thinkingChars: live.thinkingChars,
+							outputTruncated: live.outputTruncated,
+							thinkingTruncated: live.thinkingTruncated,
+						}
+					: {
+							model: latestAttempt?.model,
+							startedAt: latestAttempt?.startedAt,
+							finishedAt: latestAttempt?.finishedAt,
+						}),
 				error:
 					typeof compactBlock.error === "string"
 						? compactBlock.error

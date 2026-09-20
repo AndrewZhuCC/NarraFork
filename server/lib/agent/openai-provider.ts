@@ -45,6 +45,7 @@ import type {
 	ProviderTextCitation,
 } from "./provider";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { parseJsonTextWithBody } from "./response-body";
 import { resolveToolJsonSchema } from "./tool-registry";
 import {
 	type AgentToolUse,
@@ -225,12 +226,26 @@ export function appendCodexNativeTools(
 /** Keep definitions stable; switch only which tools may run, without entering Responses Lite. */
 export function applyCodexReflectionTools(
 	body: Record<string, unknown>,
-	params: Pick<ChatParams, "tools" | "reflectionTools" | "reflectionParentTools">,
+	params: Pick<
+		ChatParams,
+		"tools" | "reflectionTools" | "reflectionParentTools" | "reflectionAllowedTools"
+	>,
 ): void {
 	const reflection = params.reflectionParentTools !== undefined;
-	const reserved = (reflection ? params.tools : params.reflectionTools) as
+	const declarations = (reflection ? params.tools : params.reflectionTools) as
 		| Array<{ type: string; name?: string }>
 		| undefined;
+	// The inherited declarations contain ordinary and hosted tools too. They keep
+	// the cache prefix stable, but only this gate's function tools may execute.
+	const reserved =
+		reflection && params.reflectionAllowedTools
+			? declarations?.filter(
+					(tool) =>
+						tool.type === "function" &&
+						!!tool.name &&
+						params.reflectionAllowedTools?.includes(tool.name),
+				)
+			: declarations;
 	if (!reserved || (!reflection && reserved.length === 0)) return;
 	const tools = (params.reflectionParentTools ?? body.tools ?? []) as Array<{
 		type: string;
@@ -1556,6 +1571,9 @@ export class OpenAIProvider implements ProviderAdapter {
 		);
 		// Emulated codex headers + user-configured extra headers (user wins).
 		Object.assign(headers, fingerprint.headers);
+		// Runtime-dynamic headers last (e.g. the NUG client-relay channel id,
+		// which rotates on every relay reconnect and must be read per request).
+		Object.assign(headers, this.config.dynamicHeaders?.() ?? {});
 		return headers;
 	}
 
@@ -1729,14 +1747,20 @@ export class OpenAIProvider implements ProviderAdapter {
 	}
 }
 
-/** Parse JSON with a clearer error message and body preview. */
+/**
+ * Parse JSON, keeping the raw body when it is not JSON.
+ *
+ * `errorPrefix` names the upstream. Throwing NonJsonResponseError (rather than a
+ * bare Error with the preview only in the message) puts the body into the
+ * structured diagnostics as well, so the model-test panel can show it instead of
+ * only the parser's wording.
+ */
 function parseJsonWithPreview<T>(raw: string, errorPrefix: string): T {
-	try {
-		return JSON.parse(raw) as T;
-	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
-		throw new Error(`${errorPrefix}: ${message}. body preview=${raw.slice(0, 500)}`);
-	}
+	return parseJsonTextWithBody<T>(raw, {
+		label: errorPrefix,
+		status: 200,
+		contentType: "application/json",
+	});
 }
 
 /**

@@ -9,7 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { getCodexManager } from "../codex-manager";
 import { AppError } from "../errors";
 import { modelCardContextWindow, modelCardMaxCompletionTokens } from "../model-cards";
-import { resolveNugModelMeta } from "../nug-model-cache";
+import { isNugCachedModelAvailable, resolveNugModelMeta } from "../nug-model-cache";
 import type {
 	AnthropicProviderConfig,
 	GeminiProviderConfig,
@@ -332,6 +332,23 @@ function isFollowSummaryModelValue(model: string): boolean {
 }
 
 /**
+ * The model reference reasoning translation should use, or `undefined` when it
+ * follows `agent.summaryModel`.
+ *
+ * `undefined` rather than a resolved concrete model on purpose: callers pass it
+ * as `summaryGenerate`'s `modelOverride`, and an override pins the value at call
+ * time. Returning the summary model here would freeze that binding, defeating
+ * the "follow the summary model dynamically" contract of the `__summary__`
+ * sentinel. Aggregations and `__default__` pass through untouched —
+ * `resolveEffectiveModel` inside the generate path resolves them.
+ */
+export function resolveTranslationModelOverride(): string | undefined {
+	const configured = s().agent.translationModel?.trim();
+	if (!configured || isFollowSummaryModelValue(configured)) return undefined;
+	return configured;
+}
+
+/**
  * Normalize a resolved candidate. Returns null when the candidate is empty or
  * still self-referential — callers decide whether that is fatal, so a broken
  * value never silently becomes a concrete model nobody selected.
@@ -611,6 +628,23 @@ export function getVisibleModels(): string[] {
 		result.push(v);
 	}
 	return result;
+}
+
+/**
+ * Models that may be exposed to the subagent tool. Unlike the regular picker,
+ * subagents should not be offered NUG models explicitly marked unavailable.
+ * Unknown cache state remains visible for compatibility with legacy gateways.
+ */
+export function getSubagentVisibleModels(): string[] {
+	return getVisibleModels().filter((model) => {
+		const colon = model.indexOf(":");
+		if (colon <= 0) return true;
+		const prefix = model.slice(0, colon);
+		const config = getNugProviderConfig(prefix);
+		if (!config) return true;
+		const nugModelId = model.slice(colon + 1);
+		return isNugCachedModelAvailable(config.id, nugModelId) !== false;
+	});
 }
 
 // ---------------------------------------------------------------------------

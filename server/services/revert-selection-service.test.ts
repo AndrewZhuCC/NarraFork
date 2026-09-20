@@ -34,7 +34,7 @@ CREATE TABLE narrator_tool_calls (
  tool_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'success', is_background INTEGER NOT NULL DEFAULT 0,
  execution_identity_version INTEGER NOT NULL DEFAULT 1, execution_origin_tool_call_id TEXT, execution_attempt INTEGER NOT NULL DEFAULT 1,
  file_change_operation_id TEXT, execution_device_id TEXT DEFAULT 'local', execution_path_flavor TEXT DEFAULT 'posix',
- resolved_file_path TEXT, canonical_file_path TEXT, runtime_generation INTEGER DEFAULT 1, is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
+ resolved_file_path TEXT, canonical_file_path TEXT, runtime_generation INTEGER DEFAULT 1, execution_segment_id TEXT, is_file_history_checkpoint INTEGER NOT NULL DEFAULT 0,
  input_json TEXT, output_json TEXT, execution_targets_json TEXT
 );
 CREATE INDEX idx_toolcalls_message ON narrator_tool_calls(message_id);
@@ -49,7 +49,7 @@ CREATE TABLE file_change_scopes (
 );
 INSERT INTO file_change_scopes VALUES('scope','installation','local','workspace','posix','/repo','active');
 CREATE TABLE file_change_operations (
- id TEXT PRIMARY KEY, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
+ id TEXT PRIMARY KEY, execution_segment_id TEXT, evidence_version INTEGER NOT NULL DEFAULT 2, source_instance_id TEXT NOT NULL DEFAULT 'installation',
  source_kind TEXT NOT NULL DEFAULT 'tool', source_id TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
  tool_call_id TEXT, narrator_id TEXT, project_id TEXT, request_digest TEXT,
  execution_binding_json TEXT DEFAULT '{"deviceId":"local","runtimeEpoch":"test","runtimeGeneration":1,"fencingToken":0}',
@@ -68,6 +68,8 @@ CREATE TABLE file_change_effects (
  identity_json TEXT NOT NULL, before_state_json TEXT NOT NULL, intended_after_state_json TEXT NOT NULL, observed_after_state_json TEXT NOT NULL, execution_receipt_json TEXT
 );
 CREATE UNIQUE INDEX idx_fc_effect_operation_file ON file_change_effects(operation_id,file_key,phase);
+CREATE TABLE file_change_execution_segments (id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL, parent_segment_id TEXT);
+CREATE INDEX idx_fc_segment_parent ON file_change_execution_segments(parent_segment_id);
 CREATE TABLE chapter_commits (id TEXT PRIMARY KEY, narrator_message_id TEXT);
 CREATE INDEX idx_chapter_commits_narrator_message ON chapter_commits(narrator_message_id);
 CREATE TABLE spec_file_revisions (id TEXT PRIMARY KEY, source_message_id TEXT);
@@ -155,7 +157,13 @@ function message(
 function tool(
 	seq: number,
 	name = "Write",
-	options: { messageId?: string; narratorId?: string; providerId?: string; id?: string } = {},
+	options: {
+		messageId?: string;
+		narratorId?: string;
+		providerId?: string;
+		id?: string;
+		segment?: string;
+	} = {},
 ) {
 	const id = options.id ?? `tool-${serial++}`;
 	const providerId = options.providerId ?? `provider-${serial++}`;
@@ -168,7 +176,18 @@ function tool(
 			"INSERT INTO narrator_tool_calls(id,narrator_id,message_id,tool_use_id,tool_name,resolved_file_path,canonical_file_path) VALUES(?,?,?,?,?,?,?)",
 		)
 		.run(id, narratorId, messageId, providerId, name, `/repo/${id}`, `/repo/${id}`);
+	if (options.segment)
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id=? WHERE id=?")
+			.run(options.segment, id);
 	return { id, messageId, providerId, narratorId };
+}
+function segment(id: string, narratorId: string, parentId: string | null = null) {
+	sqlite
+		.query(
+			"INSERT INTO file_change_execution_segments(id,narrator_id,parent_segment_id) VALUES(?,?,?)",
+		)
+		.run(id, narratorId, parentId);
 }
 function journal(t: ReturnType<typeof tool>, count = 1, origin = t.id) {
 	const id = `op-${serial++}`;
@@ -477,7 +496,10 @@ describe("complete mutation candidates, not just successful writes", () => {
 		const result = await collect();
 		expect(result.tools.map((t) => t.id)).toEqual([unknown.id, pending.id]);
 		expect(result.evidenceComplete).toBe(false);
-		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
+		expect(result.noDiskTools).toContainEqual({
+			toolCallId: unknown.id,
+			reason: "non_file_change",
+		});
 		expect(hasIssue(result, "EFFECT_UNRESOLVED")).toBe(true);
 	});
 	test("explicit fixed no-dispatch zero-effect terminal is distinct from a missing effect journal", async () => {
@@ -506,7 +528,7 @@ describe("complete mutation candidates, not just successful writes", () => {
 		);
 		message(3, [{ type: "text", text: "later user" }], "root", "user-card", "user");
 		const result = await collect({ kind: "from_seq", minSeq: 1 });
-		expect(result.history.messages.map((row) => row.id)).toEqual([
+		expect(result.history.messages.map((m) => m.id)).toEqual([
 			write.messageId,
 			"sys-card",
 			"user-card",
@@ -515,135 +537,182 @@ describe("complete mutation candidates, not just successful writes", () => {
 		expect(result.issues).toEqual([]);
 		expect(result.effects).toHaveLength(1);
 	});
-	for (const selector of [
-		{ kind: "all" },
-		{ kind: "messages", messageIds: ["checkpoint"] },
-		{ kind: "from_seq", minSeq: 1 },
-	] satisfies FileChangeRevertSelector[]) {
-		test(`disp file-history checkpoints retain file evidence for ${selector.kind}`, async () => {
-			const hidden = message(
-				1,
-				[{ type: "file_history_checkpoint" }],
-				"root",
-				"checkpoint",
-				"disp",
-			);
-			const t = tool(1, "Write", { messageId: hidden });
-			sqlite
-				.query("UPDATE narrator_tool_calls SET is_file_history_checkpoint=1 WHERE id=?")
-				.run(t.id);
-			const op = journal(t);
-			const result = await collect(selector);
-			expect(result.history.toolChanges).toContainEqual({ id: t.id, action: "delete" });
-			expect(result.tools.map((row) => row.id)).toEqual([t.id]);
-			expect(result.operations.map((row) => row.id)).toEqual([op]);
-			expect(result.effects).toHaveLength(1);
-			expect(result.evidenceComplete).toBe(true);
-			expect(result.issues).toEqual([]);
-
-			sqlite
-				.query("UPDATE narrator_tool_calls SET file_change_operation_id=NULL WHERE id=?")
-				.run(t.id);
-			const missing = await collect(selector);
-			expect(missing.evidenceComplete).toBe(false);
-			expect(missing.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: t.id });
-		});
-	}
-	test("a leftover assistant write without a journal still refuses mixed from_seq coverage", async () => {
-		const write = tool(1);
+	test("an unmeasured Bash operation cannot veto independently journaled file effects", async () => {
+		const write = tool(1, "Write");
 		journal(write);
-		tool(2, "Write", { id: "assistant-gap-tool" });
+		const bash = tool(2, "Bash");
+		const bashOperation = journal(bash);
+		sqlite
+			.query(
+				"UPDATE file_change_operations SET settlement='reconcile_required',unresolved_effect_count=1 WHERE id=?",
+			)
+			.run(bashOperation);
+
 		const result = await collect({ kind: "from_seq", minSeq: 1 });
-		expect(result.evidenceComplete).toBe(false);
-		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
-	});
-	test("spec writes and real read-only tools are excluded independently of unknown disk evidence", async () => {
-		const read = tool(1, "Read");
-		const spec = tool(2);
-		sqlite
-			.query(
-				"UPDATE narrator_tool_calls SET execution_path_flavor='spec',resolved_file_path='spec://tasks.json',canonical_file_path=NULL WHERE id=?",
-			)
-			.run(spec.id);
-		const disk = tool(3);
-		const result = await collect();
-		expect(result.noDiskTools).toEqual([
-			{ toolCallId: read.id, reason: "read_only" },
-			{ toolCallId: spec.id, reason: "spec" },
-		]);
-		expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: disk.id });
-	});
-	test("Bash background initial success does not settle a live or missing background task", async () => {
-		const t = tool(1, "Bash");
-		sqlite.query("UPDATE narrator_tool_calls SET is_background=1 WHERE id=?").run(t.id);
-		sqlite
-			.query(
-				"INSERT INTO background_tasks(id,status,type,parent_narrator_id,tool_call_id,execution_attempt) VALUES('bg','running','bash','root',?,1)",
-			)
-			.run(t.id);
-		let result = await collect();
-		expect(hasIssue(result, "BACKGROUND_UNRESOLVED")).toBe(true);
-		expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
-		sqlite.query("UPDATE background_tasks SET status='failed'").run();
-		result = await collect();
-		expect(result.evidenceComplete).toBe(false);
-		expect(result.tools).toHaveLength(1);
-	});
-	test("operation binding/expected count and reverse pins are not silently trusted", async () => {
-		const t = tool(1);
-		const op = journal(t, 2);
-		sqlite
-			.query("UPDATE file_change_operations SET attempt=2,expected_effect_count=3 WHERE id=?")
-			.run(op);
-		sqlite
-			.query("UPDATE file_change_effects SET before_blob_digest=NULL WHERE operation_id=?")
-			.run(op);
-		const result = await collect();
-		expect(result.effects).toHaveLength(2);
-		expect(hasIssue(result, "ATTEMPT_BINDING_MISMATCH")).toBe(true);
-		expect(hasIssue(result, "OPERATION_UNRESOLVED")).toBe(true);
-		expect(hasIssue(result, "EFFECT_PIN_MISSING")).toBe(true);
-	});
-	test("active read tools and retired/mismatched scopes do not authorize history execution", async () => {
-		const read = tool(1, "Read");
-		const write = tool(2);
-		journal(write);
-		sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(read.id);
-		sqlite.query("UPDATE file_change_scopes SET status='retired'").run();
-		const result = await collect();
-		expect(hasIssue(result, "TOOL_ACTIVE_OR_UNKNOWN")).toBe(true);
-		expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
-		expect(result.evidenceComplete).toBe(false);
-	});
-
-	test("a receipt from another runtime generation is not the selected attempt's evidence", async () => {
-		const op = journal(tool(1));
-		sqlite
-			.query(
-				"UPDATE file_change_effects SET execution_receipt_json=json_set(execution_receipt_json,'$.executionBinding.runtimeGeneration',2) WHERE operation_id=?",
-			)
-			.run(op);
-		const result = await collect();
-		expect(hasIssue(result, "EFFECT_UNRESOLVED")).toBe(true);
-		expect(result.evidenceComplete).toBe(false);
-	});
-
-	test("the full selected operation budget is enforced, not 256MiB independently per operation", async () => {
-		const first = journal(tool(1));
-		const second = journal(tool(2));
-		sqlite
-			.query("UPDATE file_change_operations SET evidence_bytes=? WHERE id IN (?,?)")
-			.run(160 * 1024 * 1024, first, second);
-		await rejected(collect(), "BUDGET_EXCEEDED");
-	});
-
-	test("more than one effect page is fully included, not completed from its first 32 rows", async () => {
-		const t = tool(1);
-		journal(t, 70);
-		const result = await collect();
-		expect(result.effects).toHaveLength(70);
 		expect(result.evidenceComplete).toBe(true);
+		expect(result.issues).toEqual([]);
+		expect(result.effects).toHaveLength(1);
+		expect(result.operations.map((operation) => operation.id)).toEqual(
+			expect.not.arrayContaining([bashOperation]),
+		);
+		expect(result.noDiskTools).toContainEqual({ toolCallId: bash.id, reason: "non_file_change" });
 	});
+	test("an unknown non-file tool with a stale operation pointer cannot veto file effects", async () => {
+		const write = tool(1, "Write");
+		journal(write);
+		const unknown = tool(2, "plugin:writer");
+		sqlite
+			.query(
+				"UPDATE narrator_tool_calls SET file_change_operation_id='missing-op',status='pending' WHERE id=?",
+			)
+			.run(unknown.id);
+
+		const result = await collect({ kind: "from_seq", minSeq: 1 });
+		expect(result.evidenceComplete).toBe(true);
+		expect(result.issues).toEqual([]);
+		expect(result.effects).toHaveLength(1);
+		expect(result.noDiskTools).toContainEqual({
+			toolCallId: unknown.id,
+			reason: "non_file_change",
+		});
+	});
+	test("an active file tool is deferred without vetoing settled earlier effects", async () => {
+		const write = tool(1, "Write");
+		journal(write);
+		const active = tool(2, "Write");
+		sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(active.id);
+
+		const result = await collect({ kind: "from_seq", minSeq: 1 });
+		expect(result.evidenceComplete).toBe(true);
+		expect(result.issues).toEqual([]);
+		expect(result.effects).toHaveLength(1);
+		expect(result.noDiskTools).toContainEqual({ toolCallId: active.id, reason: "pending" });
+	});
+});
+
+for (const selector of [
+	{ kind: "all" },
+	{ kind: "messages", messageIds: ["checkpoint"] },
+	{ kind: "from_seq", minSeq: 1 },
+] satisfies FileChangeRevertSelector[]) {
+	test(`disp file-history checkpoints retain file evidence for ${selector.kind}`, async () => {
+		const hidden = message(1, [{ type: "file_history_checkpoint" }], "root", "checkpoint", "disp");
+		const t = tool(1, "Write", { messageId: hidden });
+		sqlite
+			.query("UPDATE narrator_tool_calls SET is_file_history_checkpoint=1 WHERE id=?")
+			.run(t.id);
+		const op = journal(t);
+		const result = await collect(selector);
+		expect(result.history.toolChanges).toContainEqual({ id: t.id, action: "delete" });
+		expect(result.tools.map((row) => row.id)).toEqual([t.id]);
+		expect(result.operations.map((row) => row.id)).toEqual([op]);
+		expect(result.effects).toHaveLength(1);
+		expect(result.evidenceComplete).toBe(true);
+		expect(result.issues).toEqual([]);
+
+		sqlite
+			.query("UPDATE narrator_tool_calls SET file_change_operation_id=NULL WHERE id=?")
+			.run(t.id);
+		const missing = await collect(selector);
+		expect(missing.evidenceComplete).toBe(false);
+		expect(missing.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: t.id });
+	});
+}
+test("a leftover assistant write without a journal still refuses mixed from_seq coverage", async () => {
+	const write = tool(1);
+	journal(write);
+	tool(2, "Write", { id: "assistant-gap-tool" });
+	const result = await collect({ kind: "from_seq", minSeq: 1 });
+	expect(result.evidenceComplete).toBe(false);
+	expect(hasIssue(result, "FILE_JOURNAL_MISSING")).toBe(true);
+});
+test("spec writes and real read-only tools are excluded independently of unknown disk evidence", async () => {
+	const read = tool(1, "Read");
+	const spec = tool(2);
+	sqlite
+		.query(
+			"UPDATE narrator_tool_calls SET execution_path_flavor='spec',resolved_file_path='spec://tasks.json',canonical_file_path=NULL WHERE id=?",
+		)
+		.run(spec.id);
+	const disk = tool(3);
+	const result = await collect();
+	expect(result.noDiskTools).toEqual([
+		{ toolCallId: read.id, reason: "read_only" },
+		{ toolCallId: spec.id, reason: "spec" },
+	]);
+	expect(result.issues).toContainEqual({ code: "FILE_JOURNAL_MISSING", toolCallId: disk.id });
+});
+test("Bash background initial success does not settle a live or missing background task", async () => {
+	const t = tool(1, "Bash");
+	sqlite.query("UPDATE narrator_tool_calls SET is_background=1 WHERE id=?").run(t.id);
+	sqlite
+		.query(
+			"INSERT INTO background_tasks(id,status,type,parent_narrator_id,tool_call_id,execution_attempt) VALUES('bg','running','bash','root',?,1)",
+		)
+		.run(t.id);
+	let result = await collect();
+	expect(hasIssue(result, "BACKGROUND_UNRESOLVED")).toBe(false);
+	expect(result.evidenceComplete).toBe(true);
+	expect(result.noDiskTools).toContainEqual({ toolCallId: t.id, reason: "non_file_change" });
+	sqlite.query("UPDATE background_tasks SET status='failed'").run();
+	result = await collect();
+	expect(result.evidenceComplete).toBe(true);
+	expect(result.tools).toHaveLength(1);
+});
+test("operation binding/expected count and reverse pins are not silently trusted", async () => {
+	const t = tool(1);
+	const op = journal(t, 2);
+	sqlite
+		.query("UPDATE file_change_operations SET attempt=2,expected_effect_count=3 WHERE id=?")
+		.run(op);
+	sqlite
+		.query("UPDATE file_change_effects SET before_blob_digest=NULL WHERE operation_id=?")
+		.run(op);
+	const result = await collect();
+	expect(result.effects).toHaveLength(2);
+	expect(hasIssue(result, "ATTEMPT_BINDING_MISMATCH")).toBe(true);
+	expect(hasIssue(result, "OPERATION_UNRESOLVED")).toBe(true);
+	expect(hasIssue(result, "EFFECT_PIN_MISSING")).toBe(true);
+});
+test("active read tools and retired/mismatched scopes do not authorize history execution", async () => {
+	const read = tool(1, "Read");
+	const write = tool(2);
+	journal(write);
+	sqlite.query("UPDATE narrator_tool_calls SET status='running' WHERE id=?").run(read.id);
+	sqlite.query("UPDATE file_change_scopes SET status='retired'").run();
+	const result = await collect();
+	expect(hasIssue(result, "TOOL_ACTIVE_OR_UNKNOWN")).toBe(false);
+	expect(hasIssue(result, "EFFECT_SCOPE_UNVERIFIED")).toBe(true);
+	expect(result.evidenceComplete).toBe(false);
+});
+
+test("a receipt from another runtime generation is not the selected attempt's evidence", async () => {
+	const op = journal(tool(1));
+	sqlite
+		.query(
+			"UPDATE file_change_effects SET execution_receipt_json=json_set(execution_receipt_json,'$.executionBinding.runtimeGeneration',2) WHERE operation_id=?",
+		)
+		.run(op);
+	const result = await collect();
+	expect(hasIssue(result, "EFFECT_UNRESOLVED")).toBe(true);
+	expect(result.evidenceComplete).toBe(false);
+});
+
+test("the full selected operation budget is enforced, not 256MiB independently per operation", async () => {
+	const first = journal(tool(1));
+	const second = journal(tool(2));
+	sqlite
+		.query("UPDATE file_change_operations SET evidence_bytes=? WHERE id IN (?,?)")
+		.run(160 * 1024 * 1024, first, second);
+	await rejected(collect(), "BUDGET_EXCEEDED");
+});
+
+test("more than one effect page is fully included, not completed from its first 32 rows", async () => {
+	const t = tool(1);
+	journal(t, 70);
+	const result = await collect();
+	expect(result.effects).toHaveLength(70);
+	expect(result.evidenceComplete).toBe(true);
 });
 
 describe("derived history requires actual origins and fresh authorization", () => {
@@ -662,6 +731,50 @@ describe("derived history requires actual origins and fresh authorization", () =
 			.run(parent.providerId, child.messageId);
 		return { parent, child };
 	}
+	test("parent Task selects child initial segment and recursively includes grandchild", async () => {
+		const parent = tool(1, "Task", { segment: "parent" });
+		segment("parent", "root");
+		narrator("child");
+		sqlite
+			.query(
+				"UPDATE narrators SET type='subagent',parent_narrator_id='root',origin_tool_call_id=? WHERE id='child'",
+			)
+			.run(parent.id);
+		segment("child-initial", "child", "parent");
+		const child = tool(1, "Task", { narratorId: "child", segment: "child-initial" });
+		narrator("grandchild");
+		sqlite
+			.query(
+				"UPDATE narrators SET type='subagent',parent_narrator_id='child',origin_tool_call_id=? WHERE id='grandchild'",
+			)
+			.run(child.id);
+		segment("grandchild-initial", "grandchild", "child-initial");
+		const grandchild = tool(1, "Write", {
+			narratorId: "grandchild",
+			segment: "grandchild-initial",
+		});
+		journal(grandchild);
+		const result = await collect();
+		expect(result.effects).toHaveLength(1);
+	});
+	test("child writes in another segment are excluded explicitly", async () => {
+		const { parent, child } = childFixture();
+		segment("parent", "root");
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id='parent' WHERE id=?")
+			.run(parent.id);
+		segment("child-initial", "child", "parent");
+		sqlite
+			.query("UPDATE narrator_tool_calls SET execution_segment_id='child-initial' WHERE id=?")
+			.run(child.id);
+		const later = tool(2, "Write", { narratorId: "child", segment: "other" });
+		journal(later);
+		const result = await collect();
+		expect(result.noDiskTools).toContainEqual({
+			toolCallId: later.id,
+			reason: "outside_selected_call",
+		});
+	});
 	test("exact child origin recursively includes child refs/tools/effects and COW budget", async () => {
 		const { parent, child } = childFixture();
 		const result = await collect();

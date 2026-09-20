@@ -48,7 +48,7 @@ import {
 	nextHighlightRequestId,
 } from "../panels/panel-kind";
 import { resolveFileBrowserPosition, resolveToolPlacement } from "../panels/tool-placement";
-import type { ToolEditReference } from "../tool-edit-reference";
+import type { ToolEditReference } from "../tool-call/tool-edit-reference";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 
 /** The published + bridged state we shard per narrator. */
@@ -804,8 +804,8 @@ export function useWorkspaceNarratorDockValue(narratorId: string): NarratorDockC
 		useCallback(() => (store ? store.getSnapshot(narratorId) : EMPTY_SHARD), [store, narratorId]),
 	);
 
-	// Chapter id (for the git tool). Subagents have no chapter; standalone
-	// narrators return undefined — both fine, the git adapter degrades.
+	// Legacy chapter association for the git tool. The adapter now resolves the
+	// narrator's actual workspace, so standalone and subagent narrators are supported.
 	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	const chapterId = (narrator as any)?.chapterId as string | null | undefined;

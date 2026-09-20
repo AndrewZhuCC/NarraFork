@@ -17,6 +17,7 @@ import {
 	IconDatabaseEdit,
 	IconDatabaseSearch,
 	IconEye,
+	IconFilePencil,
 	IconFilter,
 	IconGavel,
 	IconGitFork,
@@ -31,6 +32,7 @@ import {
 	IconSearch,
 	IconShare,
 	IconShieldLock,
+	IconSitemap,
 	IconTerminal2,
 	IconTransfer,
 	IconWand,
@@ -73,6 +75,14 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconTerminal2;
 		case "search":
 			return IconSearch;
+		// A tree glyph, not the magnifier: StructView reads a file's shape rather than
+		// scanning for a pattern, and the distinction is the reason this category exists.
+		case "structure":
+			return IconSitemap;
+		// The same tree, with a pencil: it addresses code by shape like StructView, but it
+		// changes it. Reusing the bare sitemap would make an edit look like an inspection.
+		case "structureEdit":
+			return IconFilePencil;
 		case "webSearch":
 			return IconWorldSearch;
 		case "webFetch":

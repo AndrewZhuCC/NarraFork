@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
@@ -76,6 +76,12 @@ async function message(
 		seq,
 		isCompact: isCompact ? 1 : 0,
 	});
+	// This fixture inserts refs directly, so keep the production next-seq allocator's
+	// watermark aligned with the manually assigned sequence.
+	await db
+		.update(narrators)
+		.set({ nextSeq: sql`max(${narrators.nextSeq}, ${seq + 1})` })
+		.where(eq(narrators.id, owner));
 }
 
 function marker(round: number, status = "compacted") {

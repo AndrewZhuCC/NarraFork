@@ -22,6 +22,7 @@
 import { Box, Center, Drawer, Loader, Text } from "@mantine/core";
 import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { useMobileDrawerHistory } from "../../hooks/useMobileDrawerHistory";
 import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
@@ -34,7 +35,7 @@ const NarratorSearchPanel = lazy(() =>
 	import("./NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
 const BrowserPanel = lazy(() =>
-	import("./BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
+	import("./browser/BrowserPanel").then((m) => ({ default: m.BrowserPanel })),
 );
 const NarratorUserChatPanel = lazy(() =>
 	import("../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
@@ -89,7 +90,7 @@ export interface MobileToolPanelHostProps {
 	kind: MobileToolPanelKind | null;
 	onClose: () => void;
 	narratorId: string;
-	/** Required by the git panel; when absent the git entry reports "no chapter". */
+	/** Optional legacy chapter association; Git resolves the narrator's actual workspace. */
 	chapterId?: string | null;
 	/** Live browser session count, forwarded so the panel matches the dock's props. */
 	browserSessionCount?: number;
@@ -108,7 +109,6 @@ export function MobileToolPanelHost({
 	kind,
 	onClose,
 	narratorId,
-	chapterId,
 	browserSessionCount,
 	browserVisualChange,
 	onJumpToMessage,
@@ -117,6 +117,7 @@ export function MobileToolPanelHost({
 	const { t } = useTranslation("narrator");
 	const { t: tGit } = useTranslation("git");
 	const { t: tChat } = useTranslation("chat");
+	useMobileDrawerHistory(kind !== null, onClose);
 
 	const title =
 		kind === "git"
@@ -147,19 +148,11 @@ export function MobileToolPanelHost({
 			    a chat room subscription), so keeping the inactive ones mounted would hold
 			    subscriptions open for panels the reader closed. */}
 			{kind === "git" ? (
-				chapterId ? (
-					<Box style={{ height: "100%" }}>
-						<PanelBoundary>
-							<GitPanel chapterId={chapterId} />
-						</PanelBoundary>
-					</Box>
-				) : (
-					<Center h="100%">
-						<Text size="sm" c="dimmed">
-							{tGit("panel.noChapter")}
-						</Text>
-					</Center>
-				)
+				<Box style={{ height: "100%" }}>
+					<PanelBoundary>
+						<GitPanel narratorId={narratorId} />
+					</PanelBoundary>
+				</Box>
 			) : null}
 			{kind === "search" ? (
 				<PanelBoundary>

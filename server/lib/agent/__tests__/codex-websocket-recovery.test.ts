@@ -88,7 +88,7 @@ function startServer(
 		fetch(req, srv) {
 			// Bun consumes the request on upgrade; snapshot its headers beforehand.
 			const headers = new Headers(req.headers);
-			if (srv.upgrade(req, { headers: handshakeHeaders?.(connectionsAccepted) })) {
+			if (srv.upgrade(req, { headers: new Headers(handshakeHeaders?.(connectionsAccepted)) })) {
 				handshakes.push(headers);
 				return undefined;
 			}
@@ -575,7 +575,8 @@ test("work turns freeze the first token across metadata, reconnects and backgrou
 			send(turnStateFrame(`metadata-${requestIndex}`));
 			for (const frame of completedFrames(`response-${requestIndex}`, "ok")) send(frame);
 		},
-		(index) => (index > 0 ? { "x-codex-turn-state": `handshake-${index}` } : {}),
+		(index): Record<string, string> =>
+			index > 0 ? { "x-codex-turn-state": `handshake-${index}` } : {},
 	);
 	activeServer = server;
 	const provider = createChatProvider(server);

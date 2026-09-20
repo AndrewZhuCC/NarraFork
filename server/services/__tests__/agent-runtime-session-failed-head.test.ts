@@ -4,7 +4,8 @@ import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite }));
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 mock.module("../agent-runtime/orchestrator", () => ({
@@ -33,6 +34,8 @@ beforeEach(() => {
 });
 afterAll(() => {
 	getExecutionOwner("recipient")?.release();
+	mock.module("../../db", () => realDbModule);
+	mock.restore();
 	sqlite.close();
 });
 const active = { narratorId: "recipient", locale: "en", _replyInUserLanguage: false } as Parameters<

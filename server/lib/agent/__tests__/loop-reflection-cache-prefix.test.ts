@@ -22,6 +22,8 @@ import type { AgentConfig } from "../types";
 
 const DECISION_TOOL_NAME = "CachePrefixDecisionTool";
 const SYSTEM_PROMPT = "PARENT_SYSTEM_PROMPT";
+let emittedTool = DECISION_TOOL_NAME;
+let decisions = 0;
 
 /** Requests the fake provider saw, in order. */
 let captured: Array<{
@@ -29,19 +31,19 @@ let captured: Array<{
 	content: string;
 	tools: unknown[];
 	parentTools?: unknown[];
+	allowedTools?: readonly string[];
+	identity: unknown;
 }> = [];
 const PARENT_TOOL_NAME = "CachePrefixParentTool";
 let parentGateTools: unknown[] | undefined;
 
 const testProvider: ProviderAdapter = {
-	formatTools: (tools) => {
-		if (parentGateTools && tools.some((tool) => tool.name === dangerCancelTool.name)) {
-			// Dynamic schemas may be backed by shared objects. Do not mutate the saved prefix.
-			(parentGateTools[0] as { parameters: { description: string } }).parameters.description =
-				"changed while formatting reflection";
-		}
-		return tools.map((t) => ({ name: t.name }));
-	},
+	formatTools: (tools) =>
+		tools.map((t) => ({
+			name: t.name,
+			description: t.description,
+			input_schema: t.rawJsonSchema ?? z.toJSONSchema(t.parameters),
+		})),
 	// Mirrors the real providers: prepend a marker entry representing the system prompt.
 	injectSystemPrompt: (history, systemPrompt) => {
 		(history as unknown[]).unshift({ role: "system", content: systemPrompt });
@@ -50,11 +52,23 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		const parentTurn = parentGateTools && params.content === "parent turn";
 		params.onRequestStart?.(parentTurn ? { codexTools: parentGateTools } : undefined);
+		if (parentTurn) {
+			// The provider may mutate shared definitions after its concrete request was captured.
+			(parentGateTools?.[0] as { parameters: { description: string } }).parameters.description =
+				"changed after request capture";
+		}
 		captured.push({
 			history: structuredClone(params.history),
 			content: params.content,
 			tools: structuredClone(params.tools),
 			parentTools: structuredClone(params.reflectionParentTools),
+			allowedTools: params.reflectionAllowedTools,
+			identity: {
+				conversationId: params.conversationId,
+				stickySessionKey: params.stickySessionKey,
+				metadata: params.metadata,
+				model: params.model,
+			},
 		});
 		if (parentGateTools) {
 			yield {
@@ -68,7 +82,7 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 		yield {
-			toolUses: [{ toolUseId: "tu_decide", name: DECISION_TOOL_NAME, input: { value: "ok" } }],
+			toolUses: [{ toolUseId: "tu_decide", name: emittedTool, input: { value: "ok" } }],
 		};
 	},
 	formatToolResult: (toolUseId, output, isError) => ({ toolUseId, output, isError }),
@@ -101,7 +115,10 @@ toolRegistry.register({
 	description: "Fake reflection decision tool",
 	reflectionOnly: true,
 	parameters: z.object({ value: z.string() }),
-	execute: async () => ({ output: "decided" }),
+	execute: async () => {
+		decisions++;
+		return { output: "decided" };
+	},
 });
 
 afterAll(() => {
@@ -237,7 +254,7 @@ describe("reflection loop cacheable prefix", () => {
 			settings.agent.requestDumpEnabled = previous.full;
 		}
 	});
-	test("predeclares reflection definitions separately from active tools", async () => {
+	test("marks predeclared reflection definitions for the normal Codex execution ceiling", async () => {
 		let declarations: unknown[] | undefined;
 		let active: unknown;
 		const chat = spyOn(testProvider, "chat").mockImplementation(async function* (params) {
@@ -249,12 +266,102 @@ describe("reflection loop cacheable prefix", () => {
 			for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
 				/* drain */
 			}
-			expect(declarations).toContainEqual({ name: DECISION_TOOL_NAME });
-			expect(active).not.toContainEqual({ name: DECISION_TOOL_NAME });
+			expect(declarations).toEqual(
+				expect.arrayContaining([expect.objectContaining({ name: DECISION_TOOL_NAME })]),
+			);
+			expect(active).toEqual(
+				expect.arrayContaining([expect.objectContaining({ name: DECISION_TOOL_NAME })]),
+			);
 		} finally {
 			chat.mockRestore();
 		}
 	});
+	test("ordinary loops cannot execute reflection decisions", async () => {
+		const before = decisions;
+		for await (const _event of agentLoop({ ...parentConfig(), maxTurns: 1 }, "normal", [])) {
+			/* drain */
+		}
+		expect(decisions).toBe(before);
+	});
+
+	test("reflection rejects ordinary tools even with an allowing parent handler", async () => {
+		let executed = false;
+		const name = "CacheForbiddenTool";
+		toolRegistry.register({
+			name,
+			description: "ordinary",
+			parameters: z.object({ value: z.string() }),
+			execute: async () => {
+				executed = true;
+				return { output: "bad" };
+			},
+		});
+		emittedTool = name;
+		try {
+			const result = await runReflectionLoop({
+				parentConfig: parentConfig(),
+				history: parentHistory(),
+				prompt: "reflect",
+				reflectionLoop: {
+					allowedTools: [DECISION_TOOL_NAME],
+					context: { kind: "taskReflection", requestId: "denial" },
+				},
+			});
+			expect(executed).toBe(false);
+			expect(result.toolResults.some((r) => r.toolName === name && r.isError)).toBe(true);
+		} finally {
+			emittedTool = DECISION_TOOL_NAME;
+			toolRegistry.unregister(name);
+		}
+	});
+	for (const planMode of [false, true]) {
+		test(`inherits complete ordered parent tools (planMode=${planMode})`, async () => {
+			const dynamicName = "CacheDynamicTool";
+			let resolutions = 0;
+			toolRegistry.register({
+				name: dynamicName,
+				description: (config) => `${config.systemPrompt}:${++resolutions}`,
+				getRawJsonSchema: (config) => ({
+					type: "object",
+					description: config.systemPrompt,
+					properties: { value: { const: resolutions } },
+				}),
+				parameters: z.object({}),
+				execute: async () => {
+					throw new Error("Must not execute");
+				},
+			});
+			try {
+				captured = [];
+				const config = {
+					...parentConfig(),
+					maxTurns: 1,
+					planMode,
+					toolFilter: (tool: { name: string }) => tool.name === dynamicName,
+				};
+				for await (const _event of agentLoop(config, "parent", [])) {
+					/* drain */
+				}
+				const parentTools = captured[0].tools;
+				expect(parentTools.map((t) => (t as { name: string }).name)).toContain(DECISION_TOOL_NAME);
+				await runReflectionLoop({
+					parentConfig: config,
+					history: parentHistory(),
+					prompt: "reflect",
+					reflectionLoop: {
+						allowedTools: [DECISION_TOOL_NAME],
+						context: { kind: "taskReflection", requestId: "snapshot" },
+					},
+				});
+				expect(JSON.stringify(captured[1].tools)).toBe(JSON.stringify(parentTools));
+				expect(captured[1].identity).toEqual(captured[0].identity);
+				expect(resolutions).toBe(1);
+			} finally {
+				toolRegistry.unregister(dynamicName);
+			}
+		});
+	}
+
 	test("does not duplicate the system prompt already present in the parent history", async () => {
 		const history = await runReflection(parentHistory());
 
@@ -302,7 +409,10 @@ describe("reflection loop cacheable prefix", () => {
 			const tools = [{ type: "function", name: PARENT_TOOL_NAME }];
 			await runReflection(parentHistory(), undefined, { provider, model, tools });
 			expect(captured[0].parentTools).toEqual(matches ? tools : []);
-			expect(captured[0].tools).toEqual([{ name: DECISION_TOOL_NAME }]);
+			expect(captured[0].tools).toEqual(
+				expect.arrayContaining([expect.objectContaining({ name: DECISION_TOOL_NAME })]),
+			);
+			expect(captured[0].allowedTools).toEqual([DECISION_TOOL_NAME]);
 		}
 	});
 
@@ -368,10 +478,8 @@ describe("reflection loop cacheable prefix", () => {
 			expect(captured[1].parentTools).toEqual(expectedTools);
 			expect(config.lastCodexTools?.tools).toEqual(expectedTools);
 			expect(parentGateTools).not.toEqual(expectedTools);
-			expect(captured[1].tools).toEqual([
-				{ name: dangerConfirmTool.name },
-				{ name: dangerCancelTool.name },
-			]);
+			expect(captured[1].tools).toEqual(captured[0].tools);
+			expect(captured[1].allowedTools).toEqual([dangerConfirmTool.name, dangerCancelTool.name]);
 			expect(parentExecutions).toBe(0);
 			expect(cancellations).toBe(1);
 		} finally {

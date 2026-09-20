@@ -21,9 +21,9 @@ import type {
 	SideCarInboundMessage,
 	SideCarKnowledgeHit,
 } from "@shared/sidecar-body";
-import type { RenderSegment } from "../message-segments";
+import type { RenderSegment } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
-import { groupRenderUnits } from "../render-units";
+import { groupRenderUnits } from "../trace/render-units";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import { type AdapterContext, type AdapterSegment, adaptSegment } from "./segment-adapter";
@@ -88,7 +88,6 @@ function injectionData(block: Record<string, unknown>, over: Record<string, unkn
 		timeLabel: string;
 		origin: string;
 		originLabel: string | null;
-		modelFacing: string;
 	};
 }
 
@@ -130,59 +129,53 @@ describe("system_injection — routing", () => {
 		expect(specs[0]?.kind).toBe("system-text");
 	});
 
-	it.each([
-		"user",
-		"sys",
-		"system",
-		"disp",
-	])("renders a bodyless native interrupt reminder for role %s", (role) => {
-		const modelText = "Interrupted task remains unfinished. Resume it now.";
-		const data = injectionData(
-			{ type: "system_injection", source: "interrupt_task_guard", modelText },
-			{ native: true, role },
+	it("uses modelText as the fallback body for a native injection without body", () => {
+		const specs = adaptSegment(
+			injectionSegment(
+				{
+					type: "system_injection",
+					source: "interrupt_task_guard",
+					modelText: MODEL_TEXT,
+				},
+				{ native: true },
+			),
+			CTX,
 		);
-		expect(data.text).toBe(modelText);
-		expect(data.title).toBeTruthy();
-		expect(data.modelFacing).toBe(modelText);
+		expect(specs).toHaveLength(1);
+		expect(specs[0]?.kind).toBe("system-text");
+		expect((specs[0]?.data as { text?: string }).text).toContain(MODEL_TEXT);
 	});
 
-	it("preserves legacy sibling text and inline block.text reminders", () => {
-		const block = { type: "system_injection", source: "interrupt_task_guard" };
-		const sibling = injectionData(block);
-		expect(sibling.text).toContain("migrate the queues");
-		expect(sibling.modelFacing).toBe(MODEL_TEXT);
-		const inline = injectionData({ ...block, text: "Legacy reminder" }, { native: true });
-		expect(inline.text).toBe("Legacy reminder");
-		expect(inline.modelFacing).toBe("Legacy reminder");
+	it("prefers the reader-facing body over modelText when both are present", () => {
+		const specs = adaptSegment(
+			injectionSegment(
+				{
+					type: "system_injection",
+					source: CARD_SOURCE,
+					modelText: MODEL_TEXT,
+					body: TASKS_BODY,
+				},
+				{ native: true },
+			),
+			CTX,
+		);
+		const text = (specs[0]?.data as { text?: string }).text ?? "";
+		expect(text).toContain("migrate the queues");
+		expect(text).not.toContain("Update spec://tasks.json");
 	});
 
-	it("keeps native structured reader text separate from the exact model projection", () => {
+	it("does not reveal modelText when a structured body projects to an empty string", () => {
 		const data = injectionData(
 			{
 				type: "system_injection",
 				source: CARD_SOURCE,
 				modelText: MODEL_TEXT,
-				body: TASKS_BODY,
-			},
-			{ native: true },
-		);
-		expect(data.text).toContain("migrate the queues");
-		expect(data.text).not.toContain("Update spec://tasks.json");
-		expect(data.modelFacing).toBe(MODEL_TEXT);
-	});
-
-	it("does not replace an intentionally empty structured body with hidden model text", () => {
-		const data = injectionData(
-			{
-				type: "system_injection",
-				source: CARD_SOURCE,
-				modelText: MODEL_TEXT,
-				body: { kind: "prose", text: "" },
+				body: { kind: "notice" },
 			},
 			{ native: true },
 		);
 		expect(data.text).toBe("");
-		expect(data.modelFacing).toBe(MODEL_TEXT);
+		expect(data.text).not.toContain("Update spec://tasks.json");
 	});
 
 	it("the kind it routes to is registered, so it can actually be measured", () => {

@@ -4,6 +4,12 @@ import { isAbsolute } from "node:path";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
+	isPreloadedMode,
+	type RoutineModeConfig,
+	resolveEffectiveToolRoutineMode,
+	type ToolRoutineMode,
+} from "@shared/routine-modes";
+import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
@@ -94,11 +100,14 @@ import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
 	claimInboxHead,
 	deliverInboxInjection,
+	flushInboxPublicationBarrier,
 	hasInboxKind,
 	type InboxAgentMetadata,
 	inboxClaim,
 	inboxConsumption,
 	inboxMetadata,
+	materializeClaimedInboxUserMessage,
+	persistClaimedUserInput,
 	releaseInboxClaim,
 	runtimeInbox,
 	wakeInboxIfEligible,
@@ -111,7 +120,10 @@ import {
 	isExecutionSuspended,
 	tryClaimExecution,
 } from "./agent-runtime/ownership";
-import { flushRuntimePublications } from "./agent-runtime/publication";
+import {
+	type RuntimeMailboxRow,
+	resolveRuntimeQueueBackend,
+} from "./agent-runtime/runtime-queue-port";
 import { backgroundTaskService } from "./background-task-service";
 import { formatBackgroundCompletionNotifications } from "./bg-completion-queue";
 import { gitService } from "./git-service";
@@ -126,6 +138,7 @@ import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
 import { buildEffectiveSystemPrompt } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
+import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import {
 	enrichToolUseBlocks,
 	handleBashCommand,
@@ -313,9 +326,10 @@ import {
 	projectFileReferenceText,
 } from "../lib/agent/file-reference-projection";
 import {
-	cleanupBufferedTextFiles,
+	cleanupBufferedTextFilesAsync,
 	enqueueBufferedMessage,
 	getBufferedMessages,
+	getBufferedMessagesAsync,
 	projectMailboxUserMessage,
 	restoreBufferedMessage,
 	toBufferSummary,
@@ -644,13 +658,25 @@ export async function executeQueuedGoalCommand(
 	const userMsg = await withInboxOwner(narratorId, async () => {
 		const row = buffered._mailboxClaim
 			? undefined
-			: claimInboxHead(
+			: await claimInboxHead(
 					narratorId,
 					(candidate) => candidate.id === buffered.id && candidate.kind === "user_input",
 				);
 		const claim = buffered._mailboxClaim ?? (row ? inboxClaim(row) : undefined);
 		if (!claim) throw new ValidationError("Buffered goal is no longer at the mailbox head");
 		try {
+			// PostgreSQL: the queue's materialize section commits message + ref + mailbox flip
+			// atomically; SQLite keeps the synchronous placement transaction.
+			if (getNarratorMessageRefsPort())
+				return await materializeClaimedInboxUserMessage({
+					claim,
+					reservedMessageId: row?.recipientMessageId,
+					narratorId,
+					text: rawCommand,
+					contentBlocks: [...(buffered.fileReferences ?? []), { type: "text", text: rawCommand }],
+					commandText: rawCommand,
+					createdBy: buffered.createdBy,
+				});
 			return await narratorService.persistUserMessage(
 				narratorId,
 				rawCommand,
@@ -661,7 +687,7 @@ export async function executeQueuedGoalCommand(
 				{ mailboxClaim: claim },
 			);
 		} catch (error) {
-			if (row) releaseInboxClaim(row, error);
+			if (row) await releaseInboxClaim(row, error);
 			throw error;
 		}
 	});
@@ -717,11 +743,11 @@ async function resumeNextBufferedMessageUnlocked(
 	if (isLoopRunning(narratorId)) return;
 	const inputOwner = tryClaimExecution(narratorId, "tool-replay");
 	if (!inputOwner) return;
-	let claimedRow: import("./agent-runtime/mailbox-types").MailboxRow | undefined;
+	let claimedRow: RuntimeMailboxRow | undefined;
 	try {
 		// Consume one bounded notification batch before adopting the next user input.
 		await drainAndPersistPendingInjections(active);
-		claimedRow = claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
+		claimedRow = await claimInboxHead(narratorId, (candidate) => candidate.kind === "user_input");
 		if (!claimedRow) return;
 		const first = projectMailboxUserMessage(claimedRow);
 		// Parsed before consuming, because the two kinds of item are consumed
@@ -735,6 +761,19 @@ async function resumeNextBufferedMessageUnlocked(
 				const row = claimedRow;
 				if (!row) throw new ValidationError("Buffered command claim missing");
 				try {
+					// PostgreSQL: one queue materialize section; SQLite: the placement transaction.
+					if (getNarratorMessageRefsPort()) {
+						await materializeClaimedInboxUserMessage({
+							claim: inboxClaim(row),
+							reservedMessageId: row.recipientMessageId,
+							narratorId,
+							text: first.text,
+							contentBlocks: [{ type: "text", text: first.text }],
+							commandText: first.commandText,
+							createdBy: first.createdBy,
+						});
+						return;
+					}
 					await narratorService.persistUserMessage(
 						narratorId,
 						first.text,
@@ -745,7 +784,7 @@ async function resumeNextBufferedMessageUnlocked(
 						{ mailboxClaim: inboxClaim(row) },
 					);
 				} catch (error) {
-					releaseInboxClaim(row, error);
+					await releaseInboxClaim(row, error);
 					throw error;
 				}
 			});
@@ -754,12 +793,12 @@ async function resumeNextBufferedMessageUnlocked(
 			type: "buffer_consumed",
 			narratorId,
 			messageId: first.id,
-			remaining: toBufferSummary(getBufferedMessages(narratorId)),
+			remaining: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
 		});
 
 		const settleAfterTerminalCommand = async () => {
 			// More queued behind this terminal command → keep draining; else settle idle.
-			if ((getBufferedMessages(narratorId)?.length ?? 0) > 0) {
+			if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
 				await resumeNextBufferedMessage(active, locale);
 				return;
 			}
@@ -826,10 +865,20 @@ async function resumeNextBufferedMessageUnlocked(
 				undefined,
 				first.fileReferences,
 			)
-				.then(({ userMsg, userBroadcasted }) => {
+				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
-					// queued copies are finally safe to drop.
-					cleanupBufferedTextFiles(first.id);
+					// queued copies are finally safe to drop. Cleanup is deliberately awaited only
+					// after durable persistence; a cleanup failure must not restore an already-delivered
+					// mailbox row.
+					try {
+						await cleanupBufferedTextFilesAsync(first.id);
+					} catch (error) {
+						logger.warn("Failed to clean buffered text files after delivery", {
+							narratorId,
+							messageId: first.id,
+							error: String(error),
+						});
+					}
 					if (!userBroadcasted) {
 						broadcastToNarrator(narratorId, {
 							type: "user_message",
@@ -838,22 +887,22 @@ async function resumeNextBufferedMessageUnlocked(
 						});
 					}
 				})
-				.catch((err) => {
+				.catch(async (err) => {
 					// Not delivered, so the message is still the user's. Put it back at the head
 					// of the queue with its attachments intact and tell the client, then report
 					// the failure as before.
-					restoreBufferedMessage(narratorId, first);
+					await restoreBufferedMessage(narratorId, first);
 					broadcastToNarrator(narratorId, {
 						type: "buffer_set",
 						narratorId,
-						messages: toBufferSummary(getBufferedMessages(narratorId)),
+						messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
 					});
 					return handleTerminalCommandError("auto-resume message", err);
 				});
 		}
 	} finally {
 		try {
-			if (claimedRow) releaseInboxClaim(claimedRow, "Buffered resume did not commit");
+			if (claimedRow) await releaseInboxClaim(claimedRow, "Buffered resume did not commit");
 		} finally {
 			inputOwner.release();
 		}
@@ -962,6 +1011,10 @@ async function createNarrator(
 	let narratorWorktreePath: string | undefined;
 	let narratorBaseBranch: string | undefined;
 	let projectGitPath: string | null = null;
+	// Project-level optional tool modes. Read from the project row that is fetched
+	// anyway, so the preload decision below can honour a project override — without
+	// it, setting a tool to "resident" for one project changed nothing.
+	let projectRoutineConfig: RoutineModeConfig | undefined;
 	if (narrator.chapterId) {
 		const ch = await db.query.chapters.findFirst({
 			where: eq(chapters.id, narrator.chapterId),
@@ -972,6 +1025,7 @@ async function createNarrator(
 			where: eq(projects.id, ch.projectId),
 		});
 		projectGitPath = project?.gitPath ?? null;
+		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
 		narratorProjectId = ch.projectId;
 		if (ch.worktreePath) {
 			// A saved narrator cwd is an explicit user override (for example, after
@@ -1002,6 +1056,7 @@ async function createNarrator(
 		if (!project) throw new NotFoundError("Project", narrator.contextProjectId);
 		narratorProjectId = project.id;
 		projectGitPath = project.gitPath;
+		projectRoutineConfig = parseProjectRoutineConfig(project.chapterSettings);
 		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, project.gitPath, getHome());
 	} else {
 		narratorCwd = resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
@@ -1147,15 +1202,17 @@ async function createNarrator(
 			active._enabledOptionalTools.add("KnowledgeEdit");
 		}
 	} else {
-		// Auto-load optional tools whose routines are globally enabled.
-		const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
-		const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
+		// Preload optional tools whose routine mode is `resident` (project override
+		// first, then global). `manual` and `auto` are not preloaded — `auto` is the
+		// toolsearch placeholder and behaves like `manual` until that lands.
 		for (const routine of getBuiltinToolRoutines()) {
 			if (!routine.tool) continue;
-			const on = routine.defaultEnabled
-				? !disabledRoutines.has(routine.id)
-				: enabledRoutines.has(routine.id);
-			if (on) {
+			const { mode } = resolveEffectiveToolRoutineMode(
+				routine,
+				settings.routines,
+				projectRoutineConfig,
+			);
+			if (isPreloadedMode(mode)) {
 				for (const toolName of getBuiltinToolNames(routine.tool)) {
 					active._enabledOptionalTools.add(toolName);
 				}
@@ -1393,11 +1450,26 @@ async function maybeDeliverInterruptTaskGuard(
 		const content = isZh
 			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
 			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
+		const body = {
+			kind: "tasks" as const,
+			variant: "current" as const,
+			tasks: openTasks.slice(0, 8).map((task) => ({
+				role:
+					task.status === "doing"
+						? ("doing" as const)
+						: task.status === "blocked"
+							? ("blocked" as const)
+							: ("todo" as const),
+				text: task.text,
+				...(task.protected ? { protected: true as const } : {}),
+			})),
+		};
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
 		await deliverInjection(narratorId, {
 			content,
+			body,
 			source: "interrupt_task_guard",
 			// Persisted as a plain row; the next user turn reads it from history.
 			schedule: "none",
@@ -1781,7 +1853,7 @@ async function deliverPendingInjectionsInOrder(
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
-		migrateLegacyParentInjections(narratorId);
+		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
 		const parts: string[] = [];
 
@@ -1800,7 +1872,7 @@ async function deliverPendingInjectionsInOrder(
 		// the fate of the rest.
 		let projectedBytes = 0;
 		for (let count = 0; count < 16; count++) {
-			const row = claimInboxHead(
+			const row = await claimInboxHead(
 				narratorId,
 				(candidate) =>
 					candidate.kind !== "user_input" &&
@@ -1836,7 +1908,7 @@ async function deliverPendingInjectionsInOrder(
 					}
 				}
 			} catch (err) {
-				releaseInboxClaim(row, err);
+				await releaseInboxClaim(row, err);
 				logger.warn("Failed to deliver a pending injection row", {
 					narratorId,
 					kind: row.kind,
@@ -1873,19 +1945,25 @@ export async function deliverPendingInjection(
 		options: import("./narrator-injection").DeliverInjectionOptions,
 	) => deliverInboxInjection(id, options, entry.mailboxClaim);
 	const claim = entry.mailboxClaim;
+	// The refs port decides the dialect. PostgreSQL: `deliverInboxInjection` drives the
+	// queue's own materialize section (message + ref + mailbox flip in one transaction),
+	// so the synchronous SQLite placement hook must NOT be set. SQLite: the hook keeps
+	// the exact `persistPlacement` semantics.
+	const pgClaim = claim && getNarratorMessageRefsPort() ? claim : undefined;
 	const placement = {
 		messageId: entry.recipientMessageId,
 		subagent,
-		onPersist: claim
-			? (
-					tx: import("./agent-runtime/mailbox-types").RuntimeTx,
-					messageId: string,
-					refId: string,
-				) => {
-					runtimeInbox.materializeInTransaction(tx, claim, { messageId, refId });
-					return undefined;
-				}
-			: undefined,
+		onPersist:
+			claim && !pgClaim
+				? (
+						tx: import("./agent-runtime/mailbox-types").RuntimeTx,
+						messageId: string,
+						refId: string,
+					) => {
+						runtimeInbox.materializeInTransaction(tx, claim, { messageId, refId });
+						return undefined;
+					}
+				: undefined,
 	};
 	{
 		const kind = entry.kind;
@@ -2590,12 +2668,16 @@ export async function runAgentLoop(
 					return { started: result.started };
 				})
 				.finally(() => {
-					if (
-						owner.release() &&
-						allowInboxWake &&
-						hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"])
-					)
-						void wakeInboxIfEligible(narratorId, active.locale);
+					if (owner.release() && allowInboxWake)
+						void (async () => {
+							if (await hasInboxKind(narratorId, ["user_input", "agent_message", "task_notice"]))
+								await wakeInboxIfEligible(narratorId, active.locale);
+						})().catch((error) => {
+							logger.warn("Inbox wake check deferred after loop release", {
+								narratorId,
+								error: String(error),
+							});
+						});
 				});
 			return { completion };
 		});
@@ -2649,7 +2731,7 @@ async function feedMessageUnlocked(
 		/** A buffered message may be restored only before its user row is committed. */
 		bufferedDelivery?: boolean;
 		bufferedId?: string;
-		bufferedRow?: import("./agent-runtime/mailbox-types").MailboxRow;
+		bufferedRow?: RuntimeMailboxRow;
 		bufferedOwner?: ExecutionOwner;
 	},
 	origin?: MessageOriginOptions,
@@ -2691,7 +2773,7 @@ async function feedMessageUnlocked(
 	const inputOwner = internalOptions?.bufferedOwner ?? tryClaimExecution(narratorId, "tool-replay");
 	if (!inputOwner?.isCurrent())
 		throw new ValidationError("Narrator input is already being adopted");
-	let claimedInput: import("./agent-runtime/mailbox-types").MailboxRow | undefined;
+	let claimedInput: RuntimeMailboxRow | undefined;
 	let stagingId: string | undefined;
 	let userMsg: typeof narratorMessages.$inferSelect;
 	let effectivePrompt: string;
@@ -2699,7 +2781,17 @@ async function feedMessageUnlocked(
 		// Materialize publication outbox entries before claiming the mailbox head. A pending
 		// publication is an ordering barrier; without flushing it here, an idle user send can
 		// be rejected even though the blocking task notice is still invisible in history.
-		flushRuntimePublications(narratorId);
+		// The shared barrier honors the facade's sync API and a wired service's Promise
+		// shape alike.
+		await flushInboxPublicationBarrier(narratorId);
+		// An idle narrator may still have earlier agent/task mailbox work that deliberately
+		// does not auto-wake it (notably cancellation notices). Consume that non-user work
+		// before appending this new user input, otherwise the exact claim below reports that
+		// the user's row is queued behind earlier mailbox work forever. The idle drain reuses
+		// the current tool-replay owner and uses schedule:none, so it persists history only;
+		// it cannot start a second loop or skip an earlier user_input row.
+		if (!internalOptions?.bufferedId && !internalOptions?.bufferedRow)
+			await drainAndPersistPendingInjections(active);
 		const acceptedId =
 			internalOptions?.bufferedId ??
 			(
@@ -2716,14 +2808,12 @@ async function feedMessageUnlocked(
 					acceptedReferences,
 				)
 			).id;
-		// A buffered claim already passed this boundary in resume; never double its budget.
-		if (!internalOptions?.bufferedRow) await drainAndPersistPendingInjections(active);
 		claimedInput =
 			internalOptions?.bufferedRow ??
-			claimInboxHead(
+			(await claimInboxHead(
 				narratorId,
 				(candidate) => candidate.id === acceptedId && candidate.kind === "user_input",
-			);
+			));
 		if (
 			claimedInput &&
 			(claimedInput.narratorId !== narratorId ||
@@ -2785,23 +2875,36 @@ async function feedMessageUnlocked(
 		// Build the effective prompt with attached file hints
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
 
-		userMsg = await narratorService.persistUserMessage(
+		userMsg = (await persistClaimedUserInput({
+			claim: inboxClaim(claimedInput),
+			reservedMessageId: claimedInput.recipientMessageId,
 			narratorId,
-			effectivePrompt,
-			persistBlocks,
+			text: effectivePrompt,
+			contentBlocks: persistBlocks,
 			commandText,
-			userId,
+			createdBy: userId,
 			origin,
-			{ mailboxClaim: inboxClaim(claimedInput) },
-		);
+		})) as unknown as typeof narratorMessages.$inferSelect;
 		if (!accepted.preserveWorkTurn) active._upstreamWorkTurnId = claimedInput.id;
 	} catch (error) {
-		if (claimedInput) releaseInboxClaim(claimedInput, error);
+		if (claimedInput) await releaseInboxClaim(claimedInput, error);
 		throw error;
 	} finally {
 		inputOwner.release();
 	}
-	if (stagingId) cleanupBufferedTextFiles(stagingId);
+	if (stagingId) {
+		// The mailbox row is durable at this point. Await backend-neutral cleanup, but do not
+		// turn a cleanup failure into a delivery failure that could make callers restore it.
+		try {
+			await cleanupBufferedTextFilesAsync(stagingId);
+		} catch (error) {
+			logger.warn("Failed to clean buffered text files after persistence", {
+				narratorId,
+				messageId: stagingId,
+				error: String(error),
+			});
+		}
+	}
 
 	try {
 		active._lastTokenUsage = undefined;
@@ -3861,9 +3964,9 @@ export async function resumeBufferedMessagesIfIdle(
 	locale: Locale = "en",
 	replyInUserLanguage = false,
 ): Promise<{ resumed: boolean }> {
-	if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) return { resumed: false };
+	if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
 	return continuationStartLock.acquire(narratorId, async () => {
-		if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) return { resumed: false };
+		if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
 		// A live loop (or any other runtime owner) will consume the queue itself.
 		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
 
@@ -6605,7 +6708,11 @@ export async function reconcileRunningStatus(narratorId: string): Promise<boolea
  * the boundary is reached, there is nothing left and the loop must keep running.
  */
 export function hasPendingBufferedWork(narratorId: string): boolean {
-	return (getBufferedMessages(narratorId)?.length ?? 0) > 0;
+	if (resolveRuntimeQueueBackend() === "postgres")
+		throw new Error(
+			"hasPendingBufferedWork is synchronous and cannot inspect the PostgreSQL mailbox; use getBufferedMessagesAsync",
+		);
+	return getBufferedMessages(narratorId).length > 0;
 }
 
 /**
@@ -7169,6 +7276,23 @@ export async function recoverOnStartup(
 // ---------------------------------------------------------------------------
 
 /**
+ * Read `chapterSettings.routines` out of a project row.
+ *
+ * Tolerant by design: a malformed `chapterSettings` must degrade to "no project
+ * opinion" rather than break session startup.
+ */
+function parseProjectRoutineConfig(raw: unknown): RoutineModeConfig | undefined {
+	if (!raw) return undefined;
+	try {
+		const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+		const routines = (parsed as { routines?: RoutineModeConfig } | null)?.routines;
+		return routines && typeof routines === "object" ? routines : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Whether an optional tool would be visible to the model on the next turn.
  *
  * Mirrors the resolution order used when building a session (`ensureActive`) and
@@ -7176,7 +7300,8 @@ export async function recoverOnStartup(
  * starting a session:
  *   1. custom trait deny-list wins (tool hidden even if loaded)
  *   2. active session's in-memory set, when a session exists
- *   3. otherwise: globally enabled tool routine, or persisted `enabledTools`
+ *   3. otherwise: a `resident` routine mode (project override before global), or
+ *      persisted `enabledTools`
  *
  * Returns `unknown_tool` for names outside OPTIONAL_TOOLS.
  */
@@ -7187,23 +7312,19 @@ export async function resolveOptionalToolState(
 	actingUserId?: string | null,
 ): Promise<{
 	state: "loaded" | "not_loaded" | "disabled_by_trait" | "unknown_tool";
-	/** True when a global tool routine already enables it for every session. */
+	/**
+	 * True when the tool is preloaded into every session by its routine mode.
+	 *
+	 * Kept under the original name for existing clients, but it now reflects the
+	 * EFFECTIVE mode (project override included), not just the global setting —
+	 * a caller asking "does this narrator get it for free?" wants that answer.
+	 */
 	globallyEnabled: boolean;
+	/** The effective routine mode, when the tool belongs to a tool routine. */
+	mode?: ToolRoutineMode;
 }> {
 	if (!OPTIONAL_TOOLS.has(toolName)) {
 		return { state: "unknown_tool", globallyEnabled: false };
-	}
-
-	const disabledRoutines = new Set(settings.routines?.disabledRoutines ?? []);
-	const enabledRoutines = new Set(settings.routines?.enabledRoutines ?? []);
-	let globallyEnabled = false;
-	for (const routine of getBuiltinToolRoutines()) {
-		if (!routine.tool) continue;
-		if (!getBuiltinToolNames(routine.tool).includes(toolName)) continue;
-		globallyEnabled = routine.defaultEnabled
-			? !disabledRoutines.has(routine.id)
-			: enabledRoutines.has(routine.id);
-		if (globallyEnabled) break;
 	}
 
 	const narrator = await db.query.narrators.findFirst({
@@ -7222,13 +7343,35 @@ export async function resolveOptionalToolState(
 	const { resolveEffectiveTraits, resolveNarratorProjectId } = await import(
 		"./trait-layer-service"
 	);
+	const narratorProjectId = await resolveNarratorProjectId(narrator);
+
+	// Same project layer the session build uses, so this never reports a state the
+	// next turn would contradict.
+	let projectRoutineConfig: RoutineModeConfig | undefined;
+	if (narratorProjectId) {
+		const project = await db.query.projects.findFirst({
+			where: eq(projects.id, narratorProjectId),
+			columns: { chapterSettings: true },
+		});
+		projectRoutineConfig = parseProjectRoutineConfig(project?.chapterSettings);
+	}
+
+	let mode: ToolRoutineMode | undefined;
+	for (const routine of getBuiltinToolRoutines()) {
+		if (!routine.tool) continue;
+		if (!getBuiltinToolNames(routine.tool).includes(toolName)) continue;
+		mode = resolveEffectiveToolRoutineMode(routine, settings.routines, projectRoutineConfig).mode;
+		if (isPreloadedMode(mode)) break;
+	}
+	const globallyEnabled = mode ? isPreloadedMode(mode) : false;
+
 	const stateTraits = await resolveEffectiveTraits({
 		narratorTraits: narrator.traits,
-		projectId: await resolveNarratorProjectId(narrator),
+		projectId: narratorProjectId,
 		actingUserId: actingUserId ?? null,
 	});
 	if (getDisabledToolSet(stateTraits.traits).has(toolName)) {
-		return { state: "disabled_by_trait", globallyEnabled };
+		return { state: "disabled_by_trait", globallyEnabled, ...(mode ? { mode } : {}) };
 	}
 
 	const active = activeNarrators.get(narratorId);
@@ -7236,12 +7379,13 @@ export async function resolveOptionalToolState(
 		return {
 			state: active._enabledOptionalTools.has(toolName) ? "loaded" : "not_loaded",
 			globallyEnabled,
+			...(mode ? { mode } : {}),
 		};
 	}
 
 	const persisted = Array.isArray(narrator.enabledTools) ? narrator.enabledTools : [];
 	const loaded = globallyEnabled || persisted.includes(toolName);
-	return { state: loaded ? "loaded" : "not_loaded", globallyEnabled };
+	return { state: loaded ? "loaded" : "not_loaded", globallyEnabled, ...(mode ? { mode } : {}) };
 }
 
 /**
@@ -7340,6 +7484,7 @@ export function updateActiveBlockedSkills(
 export {
 	clearBufferedMessages,
 	getBufferedMessages,
+	getBufferedMessagesAsync,
 	pushBufferedMessage,
 	removeBufferedMessage,
 	reorderBufferedMessages,

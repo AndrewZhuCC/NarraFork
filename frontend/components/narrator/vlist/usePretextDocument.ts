@@ -186,6 +186,8 @@ export interface UsePretextDocumentResult {
 
 	error?: Error;
 	reload: () => void;
+	/** Bounded canonical refresh of the current window; never jumps to an ask source. */
+	refreshAskInPassing: () => Promise<boolean>;
 	/** Extend the loaded window upward by one older page (reverse infinite scroll). */
 	loadOlder: () => void;
 	/**
@@ -233,6 +235,8 @@ export interface UsePretextDocumentResult {
 	 * marker, duplicate), so the caller falls back to a structural reload.
 	 */
 	appendMessage: (message: TreeMessage) => boolean;
+	/** Apply a canonical realtime/catch-up message by id + seq without duplicating it. */
+	upsertMessage: (message: TreeMessage) => boolean;
 	/**
 	 * Insert a mid-window structural marker (a segment-compact marker, or a custom
 	 * compact with a `beforeMessageId`) into the loaded window in place. Returns
@@ -705,6 +709,30 @@ export function usePretextDocument(
 	// Same live-view contract as appendMessage: the anchor is captured from the
 	// CURRENT scroll position at insert time, so a scroll in flight cannot desync
 	// it from the correction that follows.
+	const upsertMessage = useCallback(
+		(message: TreeMessage) =>
+			coordinator?.upsertMessage(message, options.isSubagent === true, () => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? false,
+		[coordinator, options.getCurrentView, options.isSubagent],
+	);
+	const refreshAskInPassing = useCallback(
+		() =>
+			coordinator?.refreshAskInPassing(() => {
+				const view = resolvePretextDocumentView(viewRef.current, options.getCurrentView);
+				return {
+					scrollTop: view.scrollTop,
+					pinnedToBottom: view.pinnedToBottom,
+					viewportHeight: view.viewportHeight,
+				};
+			}) ?? Promise.resolve(false),
+		[coordinator, options.getCurrentView],
+	);
 	const insertMessage = useCallback(
 		(message: TreeMessage) =>
 			coordinator?.insertMessage(message, () => {
@@ -799,12 +827,14 @@ export function usePretextDocument(
 
 		error: snapshot.error,
 		reload,
+		refreshAskInPassing,
 		loadOlder,
 		loadOlderAsync,
 		applyCompactProgress,
 		applyLivePatch,
 		setStreamingMessage,
 		appendMessage,
+		upsertMessage,
 		insertMessage,
 		removeMessages,
 		replaceMessage,

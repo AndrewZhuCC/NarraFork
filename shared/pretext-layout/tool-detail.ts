@@ -193,6 +193,19 @@ export interface ToolCappedDetail {
 	 * Height-neutral.
 	 */
 	codeLangPath?: string;
+	/**
+	 * RENDER-ONLY: colour this body with a bespoke tokenizer instead of a language
+	 * grammar.
+	 *
+	 * For bodies that are structured REPORTS rather than code. A language grammar
+	 * highlights those confidently wrongly — on StructView `outline` rows it painted our
+	 * `exported`/`refs:3` annotations with the function-name colour, left `variable`
+	 * entirely grey (not a TS keyword), and split `L13-27` into a subtraction.
+	 *
+	 * A string rather than a boolean so a second report-shaped tool can add its own
+	 * tokenizer without another field. Height-neutral, like the two fields above.
+	 */
+	customHighlight?: "struct-view";
 }
 
 /** One SpecTasks row: text drives wrapping; status/protected drive the glyph. */
@@ -456,7 +469,7 @@ export interface ToolSectionsDetail {
 export type ToolDetailData = ToolSectionsDetail;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Pure helpers (mirrored in frontend/components/narrator/tool-display.ts — keep
+// Pure helpers (mirrored in frontend/components/narrator/tool-call/tool-display.ts — keep
 // the two copies in sync). Truncation is FIELD-LEVEL: the wrapper shape is
 // unchanged but it now sits on the oversized string LEAF, so these readers work
 // on ordinary fields instead of scraping a preview blob.
@@ -565,8 +578,16 @@ function asObject(val: unknown): Record<string, unknown> | null {
 // `+N -N` line statistics for a file tool's header / folded row.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** File tools whose header can carry a `+N -N` figure. */
-const DIFF_STATS_TOOLS = new Set(["Write", "Edit"]);
+/**
+ * File tools whose header can carry a `+N -N` figure.
+ *
+ * StructSed belongs here for the same reason Edit does: it rewrites part of a file and
+ * the server measures both sides at execution time, so the count comes from the
+ * authoritative metadata path below. Leaving it out made a structural rewrite read as a
+ * lesser kind of step than the equivalent Edit while folded, despite changing the file
+ * just as much.
+ */
+const DIFF_STATS_TOOLS = new Set(["Write", "Edit", "StructSed"]);
 
 /**
  * Added / removed line counts for a Write or Edit, or undefined when unknown.
@@ -885,6 +906,10 @@ function classifyByCategory(
 			);
 		case "search":
 			return classifySearch(status, inputJson, outputJson);
+		case "structure":
+			return classifyStructure(status, inputJson, outputJson, metadata);
+		case "structureEdit":
+			return classifyStructureEdit(status, inputJson, outputJson, metadata);
 		case "webSearch":
 			return classifyWebSearch(inputJson, outputJson);
 		case "webFetch":
@@ -1453,6 +1478,348 @@ function classifySearch(
 	]);
 }
 
+/** Chip colour per StructView mode, grouped by what the mode is for. */
+const STRUCTURE_MODE_COLORS: Record<string, string> = {
+	// Reading structure.
+	outline: "indigo",
+	api: "indigo",
+	extract: "indigo",
+	imports: "indigo",
+	enclosing: "indigo",
+	tree: "indigo",
+	// Analysing it.
+	report: "teal",
+	refs: "teal",
+	calls: "teal",
+	// Raw text, no parsing involved.
+	print: "gray",
+};
+
+/**
+ * Body height cap per StructView mode.
+ *
+ * The cap is the scroll box's MAX height, so it should match how long a mode's output
+ * typically is. Everything used to share `code` (200px, ~13 lines), which put a 68-line
+ * report and a 330-line outline into the same small window — defeating the point of
+ * `report`, whose whole value is seeing five sections at once.
+ *
+ * Only the existing cap tiers are reused; adding a per-tool tier would turn
+ * `DETAIL_CAPS` into a registry.
+ */
+const STRUCTURE_MODE_CAPS: Record<string, DetailCapKind> = {
+	// Pinpoint lookups: short by construction.
+	extract: "code",
+	print: "code",
+	enclosing: "code",
+	imports: "code",
+	// Listings: routinely dozens to hundreds of lines. 300px rather than 400 because
+	// past a certain point a taller box only costs screen without showing the end.
+	outline: "agent-result",
+	api: "agent-result",
+	refs: "agent-result",
+	calls: "agent-result",
+	tree: "agent-result",
+	// The one mode designed to be read in full.
+	report: "knowledge",
+};
+
+/**
+ * Modes whose body is real source of the target file, so a LANGUAGE grammar applies.
+ *
+ * Only these two. The `   109│` line-number prefix does not disturb highlighting —
+ * verified against the real tokenizer, the remaining tokens come out identical to the
+ * un-prefixed text, with `109` merely coloured as a numeric literal, the same thing
+ * `Read` already does.
+ *
+ * Every other mode emits a structured report and goes to the bespoke tokenizer instead.
+ * An earlier version sent the table-shaped modes here on the grounds that their rows
+ * contain real signature fragments; that held for the simplest row and broke on the rest
+ * (`variable flat` uncoloured while `refs` was coloured, `exported` painted as a function
+ * name, `L13-27` split on the hyphen).
+ */
+const STRUCTURE_SOURCE_MODES = new Set(["extract", "print"]);
+
+/** Counts that are meaningful per mode, so a card only shows what its mode produced. */
+const STRUCTURE_MODE_COUNTS: Record<string, ReadonlyArray<[string, string]>> = {
+	outline: [["declarations", "decl"]],
+	api: [["exports", "exports"]],
+	imports: [
+		["imports", "imports"],
+		["exports", "exports"],
+	],
+	tree: [["elements", "elements"]],
+	refs: [
+		["declarations", "decl"],
+		["singleReference", "refs:1"],
+	],
+	calls: [["distinctCalls", "callees"]],
+	print: [
+		["blocks", "blocks"],
+		["printedLines", "lines"],
+		["totalLines", "of"],
+	],
+	report: [["declarations", "decl"]],
+	extract: [],
+	enclosing: [],
+};
+
+/**
+ * StructView's detail card.
+ *
+ * Separate from `classifySearch` because the two share no input fields: routing
+ * StructView through the search classifier made it read `pattern`/`glob`/`path`, find
+ * nothing, and drop its entire header — leaving a bare wall of output with no
+ * indication of which file or mode produced it.
+ *
+ * The counts rendered here all come from metadata the tool already emits, so this adds
+ * no server work.
+ */
+function classifyStructure(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const filePath = filePathOf(inputJson);
+	// Absent mode means the tool's default, matching getSummary so the card and the
+	// collapsed row cannot disagree while arguments are still streaming.
+	const mode = extractField(inputJson, "mode") || "outline";
+	const output = resolveDisplayText(outputJson);
+
+	// Three chip colour groups, so one glance separates "which mode" from "with what
+	// argument" from "how big the result". Arguments previously split across gray and
+	// cyan, which collided with the mode chip and the count chips respectively.
+	const detailChips = chips([
+		chip(mode, STRUCTURE_MODE_COLORS[mode] ?? "indigo"),
+		chip(extractField(inputJson, "symbol"), "grape"),
+		chip(extractField(inputJson, "address"), "grape"),
+		chip(extractField(inputJson, "position"), "grape"),
+		chip(extractField(inputJson, "kind"), "grape"),
+		chip(extractField(inputJson, "filter"), "grape"),
+		// A degraded result means heuristics, not parsing. That qualifier has to be
+		// visible on the card itself — burying it in a trailing note inside the output
+		// is how an approximate answer gets read as an exact one.
+		metadata?.support === "degraded" ? chip("approximate", "yellow") : null,
+		// Several matches means the tool listed candidates instead of extracting one.
+		metadata?.ambiguous === true ? chip("ambiguous", "orange") : null,
+	]);
+
+	// Only the counts this mode actually produces. Previously every numeric metadata key
+	// was tried and zero/absent ones filtered out, which worked but stated no intent —
+	// a `print` card would have shown a declaration count if one ever leaked in.
+	const statChips = chips(
+		(STRUCTURE_MODE_COUNTS[mode] ?? []).map(([key, label]) => countChip(metadata, key, label)),
+	);
+
+	// Show the RESULT'S precision, not the parser's internal id. `provider` is "tree-sitter"
+	// / "heuristic" — an implementation detail the reader does not need and should not have
+	// to decode. `precision` ("exact" / "approximate") is the thing that changes how far to
+	// trust the card. Older records without `precision` fall back to the provider string.
+	const precisionLabel = nonEmptyString(metadata?.precision) ?? nonEmptyString(metadata?.provider);
+	const languageLabel = nonEmptyString(metadata?.languageId);
+
+	// Header first, even on failure: `classifySearch` dropped it entirely when a call
+	// failed, which removed the only clue about what had been attempted.
+	const headerSection = section(
+		"meta.target",
+		undefined,
+		metaRows([
+			pathRow(filePath, { dimmed: false }),
+			badgeRow(detailChips),
+			statChips.length > 0 ? badgeRow(statChips) : null,
+			languageLabel || precisionLabel
+				? {
+						text: [languageLabel, precisionLabel].filter(Boolean).join(" · "),
+						dimmed: true,
+					}
+				: null,
+		]),
+	);
+
+	if (isFailStatus(status) && !output) {
+		return sections([
+			headerSection,
+			section("meta.error", undefined, {
+				kind: "error",
+				text: filePath ? `StructView failed on ${filePath}` : "StructView failed",
+			}),
+		]);
+	}
+
+	// Two highlighting routes, never both: real source gets a language grammar, reports get
+	// the tokenizer written for their own grammar.
+	const isSource = STRUCTURE_SOURCE_MODES.has(mode);
+
+	return sections([
+		headerSection,
+		// `format: "code"` throughout: every mode's output is column-aligned, and prose
+		// reflowing would destroy the alignment that makes it readable. Highlighting is
+		// render-only and height-neutral (it colours characters inside the same box), so
+		// neither route affects the cap or the measured height.
+		textSection("output.main", outputJson, "output", {
+			cap: STRUCTURE_MODE_CAPS[mode] ?? "code",
+			contentLines: countLines(output),
+			text: output,
+			format: "code" as const,
+			// The PATH, not a resolved language id: this layer is purity-guarded and cannot
+			// import the frontend's `getShikiLang`.
+			...(isSource && filePath ? { codeLangPath: filePath } : {}),
+			...(isSource ? {} : { customHighlight: "struct-view" as const }),
+		}),
+	]);
+}
+
+/** Chip colour per StructSed command, split by whether the command removes content. */
+const STRUCTURE_EDIT_COMMAND_COLORS: Record<string, string> = {
+	// Rewrites in place.
+	replace: "violet",
+	substitute: "violet",
+	// Adds without removing — the safest shapes, so they read differently.
+	insert: "teal",
+	append: "teal",
+	// Removal is the one command with no recoverable content in its own input.
+	delete: "red",
+};
+
+/**
+ * StructSed's detail card.
+ *
+ * Separate from `classifyStructure` because the inputs do not line up: StructSed carries
+ * `command`, not `mode`, so reusing that classifier would label every call "outline" — a
+ * delete would present as a read.
+ *
+ * The body is the tool's own report (a dry-run preview, or the applied summary), which is
+ * line-numbered and column-aligned, so it takes the same bespoke tokenizer as StructView's
+ * reports rather than a language grammar.
+ */
+function classifyStructureEdit(
+	status: string | null | undefined,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const filePath = filePathOf(inputJson);
+	const command = extractField(inputJson, "command");
+	const output = resolveDisplayText(outputJson);
+
+	// Whichever address form was used; the tool rejects both at once, so at most one shows.
+	const symbol = extractField(inputJson, "symbol");
+	const address = extractField(inputJson, "address");
+
+	const detailChips = chips([
+		chip(command, command ? (STRUCTURE_EDIT_COMMAND_COLORS[command] ?? "violet") : "violet"),
+		chip(symbol, "grape"),
+		chip(address, "grape"),
+		chip(extractField(inputJson, "kind"), "grape"),
+		// A preview did not touch the file. That has to be visible on the card: reading an
+		// applied edit as a preview (or the reverse) misstates whether the work happened.
+		metadata?.dryRun === true ? chip("dry run", "yellow") : null,
+	]);
+
+	const statChips = chips([
+		countChip(metadata, "replacements", "replaced"),
+		lineRangeChip(metadata),
+	]);
+
+	const headerSection = section(
+		"meta.target",
+		undefined,
+		metaRows([
+			pathRow(filePath, { dimmed: false }),
+			badgeRow(detailChips),
+			statChips.length > 0 ? badgeRow(statChips) : null,
+		]),
+	);
+
+	// Header first even on failure, so a failed call still shows what was attempted.
+	if (isFailStatus(status) && !output) {
+		return sections([
+			headerSection,
+			section("meta.error", undefined, {
+				kind: "error",
+				text: filePath ? `StructSed failed on ${filePath}` : "StructSed failed",
+			}),
+		]);
+	}
+
+	// A dry run carries the changed region as before/after text. Rendering that as a real
+	// diff — the same widget Edit uses — shows which lines move at a glance, where the
+	// struct-view tokenizer (built for the report's line-numbered syntax) would leave the
+	// source unhighlighted. The tool omits the diff for a change too large to show that way,
+	// in which case the text preview below is what remains.
+	const diffBefore = typeof metadata?.diffBefore === "string" ? metadata.diffBefore : null;
+	const diffAfter = typeof metadata?.diffAfter === "string" ? metadata.diffAfter : null;
+	if (diffBefore != null && diffAfter != null) {
+		const diffStartLine =
+			typeof metadata?.diffStartLine === "number" ? metadata.diffStartLine : undefined;
+		const diffDocument = createDiffDocument({
+			oldText: diffBefore,
+			newText: diffAfter,
+			focusSide: "new",
+			...(diffStartLine != null ? { startLine: diffStartLine } : {}),
+		});
+		// A preview and an applied edit now BOTH render a diff — visually identical red/green
+		// rows. A dry run therefore leads with an explicit "not written" banner so the diff
+		// is not mistaken for a completed change; the applied edit has no banner.
+		const isDryRun = metadata?.dryRun === true;
+		return sections([
+			headerSection,
+			...(isDryRun
+				? [
+						section("output.notice", undefined, {
+							kind: "error" as const,
+							// Yellow, not red: this is a notice, not a failure.
+							tone: "warning" as const,
+							text: "Preview only — nothing was written. Re-run with dry_run: false to apply.",
+						}),
+					]
+				: []),
+			textSection("output.main", outputJson, "output", {
+				cap: "diff",
+				format: "diff",
+				diffDocument,
+				revision: diffDocument.revision,
+				text: output,
+				followTarget: { kind: "diff-row", focus: diffDocument.focus },
+				textTruncated: diffDocument.truncated,
+				...(filePath ? { codeLangPath: filePath } : {}),
+			}),
+		]);
+	}
+
+	return sections([
+		headerSection,
+		textSection("output.main", outputJson, "output", {
+			// A dry run prints before AND after, so it needs more room than a one-line
+			// applied summary; the taller cap covers the case that actually has content.
+			cap: metadata?.dryRun === true ? "agent-result" : "code",
+			contentLines: countLines(output),
+			text: output,
+			format: "code" as const,
+			customHighlight: "struct-view" as const,
+		}),
+	]);
+}
+
+/** `L12-40`-style chip from the resolved range the tool reports. */
+function lineRangeChip(metadata: Record<string, unknown> | null): ToolStructuredBadge | null {
+	const start = metadata?.startLine;
+	const end = metadata?.endLine;
+	if (typeof start !== "number" || typeof end !== "number") return null;
+	return chip(start === end ? `L${start}` : `L${start}-${end}`, "gray");
+}
+
+/** A `12 decl`-style chip from a numeric metadata field, or null when absent/zero. */
+function countChip(
+	metadata: Record<string, unknown> | null,
+	key: string,
+	label: string,
+): ToolStructuredBadge | null {
+	const value = metadata?.[key];
+	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return null;
+	return { label: `${value} ${label}`, color: "gray" };
+}
+
 function classifyWebSearch(inputJson: unknown, outputJson: unknown): ToolDetailData | null {
 	const query = extractField(inputJson, "query");
 	const output = resolveDisplayText(outputJson);
@@ -1728,7 +2095,7 @@ function nonEmptyString(value: unknown): string | undefined {
 
 /**
  * Split a multi-select answer (`"Alpha, Beta"`) into its parts. Mirrors
- * `splitAnswerParts` in frontend/components/narrator/ask-user-question-utils.ts
+ * `splitAnswerParts` in frontend/components/narrator/question/ask-user-question-utils.ts
  * (which this file cannot import — purity guard).
  */
 function askAnswerParts(answer: string): string[] {

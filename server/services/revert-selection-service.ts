@@ -1,3 +1,28 @@
+/**
+ * CAPABILITY BOUNDARY: this module is SQLite-only by design, and that is a
+ * deliberate capability decision, not unfinished porting.
+ *
+ * Everything it does is built on connection-scoped SQLite facts a second backend
+ * cannot reproduce as the same capability:
+ *
+ *   - the conservative connection stamp (`total_changes()` + `PRAGMA data_version`)
+ *     that rejects ANY intervening write — PostgreSQL has no per-connection
+ *     "anything changed since" counter; the equivalent guarantee there is a
+ *     transaction-isolation property, not a stamp;
+ *   - `INDEXED BY` + `rowid` keyset scans, which pin both the index choice and a
+ *     physical row order PostgreSQL does not expose;
+ *   - raw `bun:sqlite` prepared statements against the root handle, including the
+ *     worker-side collector.
+ *
+ * THE PG ALTERNATIVE (for whoever ports history selection): do not translate the
+ * scans. Re-express the collector as set-oriented, keyset-paged SELECTs on the
+ * PG schema (the same indexes exist; ordering is by the columns themselves, not
+ * `rowid`), and replace the stamp with `REPEATABLE READ` — one snapshot for the
+ * whole collection, which is the stronger form of "no intervening write" the
+ * stamp approximates. The plan/journal/evidence write paths that CONSUME this
+ * selection already have their PG counterparts (`postgres-revert-plan-store.ts`,
+ * `postgres-revert-journal-store.ts`, `postgres-file-change-evidence-store.ts`).
+ */
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
@@ -97,11 +122,13 @@ export interface RevertSelectionTool {
 	canonicalFilePath: string | null;
 	runtimeGeneration: number | null;
 	isFileHistoryCheckpoint: number;
+	executionSegmentId: string | null;
 	/** Length metadata only; these large values are never read/copied by this collector. */
 	copyBytes: number;
 }
 export interface RevertSelectionOperation {
 	id: string;
+	executionSegmentId: string | null;
 	evidenceVersion: number;
 	sourceInstanceId: string;
 	sourceKind: string;
@@ -155,7 +182,17 @@ export interface RevertSelectionResult {
 	tools: RevertSelectionTool[];
 	operations: RevertSelectionOperation[];
 	effects: FileChangeReversalEffect[];
-	noDiskTools: { toolCallId: string; reason: "read_only" | "spec" | "no_dispatch" | "delegated" }[];
+	noDiskTools: {
+		toolCallId: string;
+		reason:
+			| "read_only"
+			| "spec"
+			| "no_dispatch"
+			| "delegated"
+			| "pending"
+			| "non_file_change"
+			| "outside_selected_call";
+	}[];
 	issues: RevertSelectionIssue[];
 	metadataDigest: string;
 }
@@ -206,6 +243,8 @@ interface ScopeState {
 	operations: Set<string>;
 	associationRows: Set<string>;
 	childRoots: Set<string>;
+	selectedSegments: Map<string, Set<string>>;
+	segmentRows: number;
 	/** One complete bounded parent inventory per collection; never persisted across requests. */
 	childCandidates: Map<string, ReadonlyMap<string, readonly string[]>>;
 	childCandidateCount: number;
@@ -279,6 +318,8 @@ export class RevertSelectionService {
 			operations: new Set(),
 			associationRows: new Set(),
 			childRoots: new Set(),
+			selectedSegments: new Map(),
+			segmentRows: 0,
 			childCandidates: new Map(),
 			childCandidateCount: 0,
 			files: new Set(),
@@ -676,6 +717,27 @@ export class RevertSelectionService {
 		state.tools.add(tool.id);
 		integer(state.tools.size, 0, FILE_CHANGE_LIMITS.historyToolRelatedChanges, "selected tools");
 		this.add(state, state.result.tools, tool);
+		const allowed = state.selectedSegments.get(owningNarratorId);
+		if (allowed && (!tool.executionSegmentId || !allowed.has(tool.executionSegmentId))) {
+			this.add(state, state.result.noDiskTools, {
+				toolCallId: tool.id,
+				reason: "outside_selected_call",
+			});
+			return;
+		}
+		const isFileTool = ["Write", "Edit", "StructSed"].includes(tool.toolName);
+		const isDelegationTool = ["Agent", "Task"].includes(tool.toolName);
+		if (!isFileTool && !isDelegationTool) {
+			this.add(state, state.result.noDiskTools, {
+				toolCallId: tool.id,
+				reason: READ_ONLY_TOOLS.has(tool.toolName) ? "read_only" : "non_file_change",
+			});
+			return;
+		}
+		if (isFileTool && (!["success", "fail"].includes(tool.status) || Boolean(tool.isBackground))) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "pending" });
+			return;
+		}
 		if (!["success", "fail"].includes(tool.status))
 			this.issue(state, { code: "TOOL_ACTIVE_OR_UNKNOWN", toolCallId: tool.id });
 		const origin = tool.executionOriginToolCallId ?? tool.id;
@@ -695,29 +757,28 @@ export class RevertSelectionService {
 		if ((task && ["running", "paused"].includes(task.status)) || (tool.isBackground && !task))
 			this.issue(state, { code: "BACKGROUND_UNRESOLVED", toolCallId: tool.id });
 		let delegated = false;
-		if (["Agent", "Task"].includes(tool.toolName))
-			delegated = await this.children(state, tool, owningNarratorId);
+		if (isDelegationTool) delegated = await this.children(state, tool, owningNarratorId);
 		else await this.rejectUnboundChildren(state, tool, new Set([owningNarratorId]));
+		if (delegated) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "delegated" });
+			return;
+		}
+		if (!isFileTool) {
+			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "non_file_change" });
+			return;
+		}
 		if (tool.fileChangeOperationId) {
 			await this.operation(state, tool);
 			return;
 		}
-		if (READ_ONLY_TOOLS.has(tool.toolName)) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "read_only" });
-			return;
-		}
 		if (
-			["Write", "Edit"].includes(tool.toolName) &&
+			isFileTool &&
 			tool.executionIdentityVersion === 1 &&
 			tool.executionPathFlavor === "spec" &&
 			tool.resolvedFilePath?.startsWith("spec://") &&
 			(!tool.canonicalFilePath || tool.canonicalFilePath.startsWith("spec://"))
 		) {
 			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "spec" });
-			return;
-		}
-		if (delegated) {
-			this.add(state, state.result.noDiskTools, { toolCallId: tool.id, reason: "delegated" });
 			return;
 		}
 		this.issue(state, { code: "FILE_JOURNAL_MISSING", toolCallId: tool.id });
@@ -733,6 +794,10 @@ export class RevertSelectionService {
 		const childIds = new Set(candidates.get(origin) ?? []);
 		if (childIds.size && (tool.executionIdentityVersion !== 1 || tool.executionAttempt !== 1))
 			throw fail("CHILD_ATTEMPT_UNVERIFIED", "Child origin does not record a retry-attempt range");
+		// Null is the legacy path. A non-null but missing segment is NOT permission
+		// to fall back to narrator-wide file effects or a reused provider ID.
+		const descendants =
+			childIds.size && tool.executionSegmentId ? await this.descendantSegments(state, tool) : null;
 		for (const childId of childIds) {
 			if (!state.childRoots.has(childId)) {
 				state.childRoots.add(childId);
@@ -743,6 +808,7 @@ export class RevertSelectionService {
 					"child narrators",
 				);
 				await this.authorize(state, childId);
+				if (descendants) state.selectedSegments.set(childId, descendants.get(childId) ?? new Set());
 				await this.select(state, childId, { kind: "all" });
 			}
 		}
@@ -750,6 +816,40 @@ export class RevertSelectionService {
 		void ownerNarratorId;
 		return childIds.size > 0;
 	}
+	private async descendantSegments(
+		state: ScopeState,
+		tool: RevertSelectionTool,
+	): Promise<Map<string, Set<string>>> {
+		const result = new Map<string, Set<string>>();
+		const root = tool.executionSegmentId;
+		if (!root) return result;
+		const rows = this.rows<{ id: string; narratorId: string }>(
+			state,
+			`WITH RECURSIVE descendants(id, narrator_id) AS (
+				SELECT id, narrator_id FROM file_change_execution_segments WHERE parent_segment_id = ?
+				UNION
+				SELECT s.id, s.narrator_id FROM file_change_execution_segments s JOIN descendants d ON s.parent_segment_id = d.id
+			)
+			SELECT id, narrator_id AS narratorId FROM descendants LIMIT ?`,
+			[root, FILE_CHANGE_LIMITS.historyToolRelatedChanges + 1],
+		);
+		if (rows.length > FILE_CHANGE_LIMITS.historyToolRelatedChanges)
+			throw fail("BUDGET_EXCEEDED", "Execution segment descendants exceed the bounded inventory");
+		for (const row of rows) {
+			state.segmentRows++;
+			integer(
+				state.segmentRows,
+				0,
+				FILE_CHANGE_LIMITS.historyToolRelatedChanges,
+				"execution segments",
+			);
+			const ids = result.get(row.narratorId) ?? new Set<string>();
+			ids.add(row.id);
+			result.set(row.narratorId, ids);
+		}
+		return result;
+	}
+
 	private async loadChildCandidates(
 		state: ScopeState,
 		parentNarratorId: string,
@@ -1033,7 +1133,7 @@ export class RevertSelectionService {
 	}
 }
 
-const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
+const READ_ONLY_TOOLS = new Set(["Read", "Glob", "Grep", "StructView", "WebSearch", "WebFetch"]);
 const REF_SELECT = `SELECT r.rowid, r.id AS refId, r.message_id AS id, r.narrator_id AS narratorId, r.seq,
  coalesce(m.role,'assistant') AS role, r.segment_compact_id AS segmentCompactId, octet_length(m.content_json) AS contentBytes,
  octet_length(m.content_json) + coalesce(octet_length(m.content_text),0) + coalesce(octet_length(m.original_content_json),0) AS copyBytes,
@@ -1043,10 +1143,10 @@ const TOOL_SELECT = `SELECT id, narrator_id AS narratorId, message_id AS message
  is_background AS isBackground, execution_identity_version AS executionIdentityVersion, execution_origin_tool_call_id AS executionOriginToolCallId,
  execution_attempt AS executionAttempt, file_change_operation_id AS fileChangeOperationId, execution_device_id AS executionDeviceId,
  execution_path_flavor AS executionPathFlavor, resolved_file_path AS resolvedFilePath, canonical_file_path AS canonicalFilePath,
- runtime_generation AS runtimeGeneration, is_file_history_checkpoint AS isFileHistoryCheckpoint,
+ runtime_generation AS runtimeGeneration, is_file_history_checkpoint AS isFileHistoryCheckpoint, execution_segment_id AS executionSegmentId,
  coalesce(octet_length(input_json),0) + coalesce(octet_length(output_json),0) + coalesce(octet_length(execution_targets_json),0) AS copyBytes
  FROM narrator_tool_calls`;
-const OPERATION_SELECT = `SELECT id, evidence_version AS evidenceVersion, source_instance_id AS sourceInstanceId, source_kind AS sourceKind, source_id AS sourceId,
+const OPERATION_SELECT = `SELECT id, execution_segment_id AS executionSegmentId, evidence_version AS evidenceVersion, source_instance_id AS sourceInstanceId, source_kind AS sourceKind, source_id AS sourceId,
  attempt, tool_call_id AS toolCallId, narrator_id AS narratorId, project_id AS projectId, request_digest AS requestDigest,
  CASE WHEN octet_length(execution_binding_json) <= ${FILE_CHANGE_LIMITS.metadataBytes} THEN execution_binding_json END AS executionBindingJson,
  expected_effect_count AS expectedEffectCount, prepared_effect_count AS preparedEffectCount, settled_effect_count AS settledEffectCount,

@@ -27,7 +27,7 @@ import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { RenderLodCtx } from "../../RenderLodCtx";
+import { RenderLodCtx } from "../../lod/RenderLodCtx";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 
 const CONTENT_WIDTH = 800;
@@ -124,6 +124,17 @@ describe("inline math font size (virtual list)", () => {
 		// inheriting the document default (Mantine body = 16px) silently rescales
 		// the formula away from the measured geometry.
 		expect(host?.style.fontSize).toBe(`${MEASURED_BASE_PX}px`);
+		view.unmount();
+	});
+
+	it("keeps the boxed formula inside its reserved width", async () => {
+		const view = await renderMarkdownBody("答案是 $\\boxed{21}$。");
+		const host = inlineMathHost(view.container);
+		expect(host).not.toBeNull();
+		// The geometry model includes KaTeX's `.boxpad` class-only padding, so the
+		// host can safely clip at its reserved edge without overlapping the next text.
+		expect(host?.style.overflow).toBe("hidden");
+		expect(Number.parseFloat(host?.style.width ?? "0")).toBeGreaterThan(20);
 		view.unmount();
 	});
 

@@ -33,7 +33,9 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
-const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
+const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
+	"../agent-runtime/orchestrator"
+);
 const { tryClaimExecution, getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { settings } = await import("../../lib/settings");
@@ -173,6 +175,21 @@ function fixture(
 		run: (text = "same input") => runAgentLoopUnlocked(session, owner, text, undefined, profile),
 	};
 }
+
+describe("Bash Git command detection for status refresh", () => {
+	test("uses parsed command nodes instead of matching argument text", async () => {
+		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);
+		expect(await isGitCommandToolResult("Bash", { command: "git commit -m fix" }, "/tmp")).toBe(
+			true,
+		);
+		expect(await isGitCommandToolResult("Bash", { command: "echo ok && git status" }, "/tmp")).toBe(
+			true,
+		);
+		expect(await isGitCommandToolResult("Bash", { command: "echo git" }, "/tmp")).toBe(false);
+		expect(await isGitCommandToolResult("Bash", { command: "printf git" }, "/tmp")).toBe(false);
+		expect(await isGitCommandToolResult("Write", { command: "git status" }, "/tmp")).toBe(false);
+	});
+});
 
 describe("real shared orchestrator profile contract", () => {
 	for (const kind of ["references", "bash"] as const) {
@@ -704,5 +721,24 @@ describe("real shared orchestrator profile contract", () => {
 			proxy.dispose();
 			await run;
 		}
+	});
+
+	test("PG finalizer/consumption contract has no SQLite cleanup fallthrough", async () => {
+		const source = await Bun.file(
+			new URL("../agent-runtime/orchestrator.ts", import.meta.url),
+		).text();
+		expect(source).toContain("cleanupBufferedTextFilesAsync");
+		expect(source).not.toContain("cleanupBufferedTextFiles(");
+		expect(source).toContain("function hasPostgresRuntime()");
+		expect(source).toContain("Skipping pending model restore");
+		expect(source).toContain("Skipping persisted transient substatus cleanup");
+		expect(source).toContain("Skipping persisted subagent handoff");
+		expect(source).toContain("const narr = pgRuntime");
+		expect(source).not.toContain("const narr = await db.query.narrators.findFirst");
+		const subagentSource = await Bun.file(
+			new URL("../subagent-executor.ts", import.meta.url),
+		).text();
+		expect(subagentSource).toContain("cleanupBufferedTextFilesAsync");
+		expect(subagentSource).not.toContain("cleanupBufferedTextFiles(");
 	});
 });

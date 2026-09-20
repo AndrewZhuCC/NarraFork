@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { and, eq } from "drizzle-orm";
@@ -151,6 +152,7 @@ export function extractToolPaths(toolName: string, input: Record<string, unknown
 		case "Write":
 		case "Edit":
 		case "NotebookEdit":
+		case "StructView":
 			return typeof input.file_path === "string" ? [input.file_path] : [];
 		case "ShareFile":
 			return typeof input.path === "string" ? [input.path] : [];
@@ -719,7 +721,7 @@ export function resolvePermissionDecision(
 
 	// readOnly mode
 	if (effectiveMode === "readOnly") {
-		if (READ_ONLY_TOOLS.includes(toolName)) {
+		if (isReadOnlyCall(toolName, input)) {
 			const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, context);
 			const hasExternalPath =
 				toolPaths.length > 0 &&
@@ -785,7 +787,7 @@ export function resolvePermissionDecision(
 
 	if (!hasExternalPath) {
 		if (effectiveMode === "default") {
-			return READ_ONLY_TOOLS.includes(toolName) ? "allow" : "ask";
+			return isReadOnlyCall(toolName, input) ? "allow" : "ask";
 		}
 		if (effectiveMode === "acceptEdits" && ACCEPT_EDITS_AUTO_ALLOW.includes(toolName))
 			return "allow";
@@ -793,7 +795,7 @@ export function resolvePermissionDecision(
 
 	if (
 		hasExternalPath &&
-		READ_ONLY_TOOLS.includes(toolName) &&
+		isReadOnlyCall(toolName, input) &&
 		toolPaths.every((path) => isInsideDecisionTruncateDir(cwd, path, context))
 	) {
 		return "allow";
@@ -859,13 +861,22 @@ const ALWAYS_ALLOW_TOOLS = [
 	"PackDeactivate",
 ];
 
-const ACCEPT_EDITS_AUTO_ALLOW = ["Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"];
+const ACCEPT_EDITS_AUTO_ALLOW = [
+	"Edit",
+	"Write",
+	"NotebookEdit",
+	"Read",
+	"Glob",
+	"Grep",
+	"StructView",
+];
 
 /** Tools that don't modify the project worktree — safe to auto-allow in readOnly mode. */
 const READ_ONLY_TOOLS = [
 	"Read",
 	"Grep",
 	"Glob",
+	"StructView",
 	"ShareFile",
 	"ContextAsk",
 	"Await",
@@ -873,6 +884,30 @@ const READ_ONLY_TOOLS = [
 	"KnowledgeRead",
 	"KnowledgeLibrary",
 ];
+
+/**
+ * Whether THIS CALL only reads, which is not always decidable from the tool name.
+ *
+ * StructSed with `dry_run` resolves the address and renders a diff without writing a byte,
+ * so a preview is a read. Its default is `dry_run: true`, so the most common call shape was
+ * the one being sent for approval.
+ *
+ * The flag is trustworthy here: execution reads `args.dry_run !== false` from the same input
+ * this sees (`effectiveInput = permission.updatedInput ?? tu.input`), and `updatedInput` only
+ * ever carries AskUserQuestion answers, an ExitPlanMode plan, or an async deferral — it never
+ * rewrites `dry_run`.
+ *
+ * `!== false` mirrors the tool's own check verbatim. Writing `=== true` here would classify an
+ * omitted `dry_run` as a write; the two predicates disagreeing about one call is the dangerous
+ * direction, so they must stay identical.
+ *
+ * Per-call classification is the established shape in this file, not a new idea: the blacklist
+ * decision below already splits `Agent` by `subagent_type` and Bash by its parsed command.
+ */
+function isReadOnlyCall(toolName: string, input: Record<string, unknown>): boolean {
+	if (READ_ONLY_TOOLS.includes(toolName)) return true;
+	return toolName === "StructSed" && input.dry_run !== false;
+}
 
 /** Tools that always require user approval regardless of permission mode. */
 const ALWAYS_ASK_TOOLS = ["ExitPlanMode", "AskUserQuestion"];
@@ -1102,7 +1137,14 @@ function areUnsafeCommandsWhitelistedForDanger(
 
 // ── Protected path checks (hard-deny, no bypass) ─────────
 
-const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit"]);
+/**
+ * Tools whose `file_path` input is a write target.
+ *
+ * Membership is SECURITY-RELEVANT in two places, and in both an omission fails open:
+ * the `.git` write ban below, and the OAuth read-only device policy. A file-modifying
+ * tool missing from this set gets neither check and is silently allowed through.
+ */
+const WRITE_TOOLS = new Set(["Write", "Edit", "NotebookEdit", "StructSed"]);
 const DESTRUCTIVE_COMMANDS = new Set(["rm", "rmdir", "shred"]);
 
 function executionPathOS(backend?: ExecutionBackend): string {
@@ -2137,6 +2179,12 @@ function classifyShellDanger(
 		context,
 	);
 	if (externalPaths.length > 0) {
+		// Scratch writes confined to system temp directories keep their visibility but
+		// drop from "high" to "medium": the light reflection level only pauses on high,
+		// so `… > /tmp/x` no longer triggers a full reflection round there, while
+		// standard/strict (threshold medium and below) still do.
+		const tempDowngrade =
+			bashAnalysis.hasWriteOperation && allExternalPathsAreSystemTemp(externalPaths);
 		return danger(
 			"Shell command accesses paths outside the current working directory.",
 			[
@@ -2148,7 +2196,7 @@ function classifyShellDanger(
 				"Use a narrower command scoped to explicit paths.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
-			bashAnalysis.hasWriteOperation ? "high" : "low",
+			tempDowngrade ? "medium" : bashAnalysis.hasWriteOperation ? "high" : "low",
 		);
 	}
 	return null;
@@ -2285,13 +2333,18 @@ export function classifyDanger(
 		);
 	}
 
-	if (READ_ONLY_TOOLS.includes(toolName)) {
+	// A dry run reads, so it earns no write-risk notice: warning about out-of-worktree writes
+	// for a preview that writes nothing is noise that dulls the real warnings.
+	if (isReadOnlyCall(toolName, input)) {
 		return null;
 	}
 
 	const toolPaths = getToolPolicyPaths(toolName, input, cwd, bashAnalysis, executionContext);
 	const externalPaths = describeExternalPaths(cwd, toolPaths, policy, "write", executionContext);
 	if (externalPaths.length > 0) {
+		// Same temp-dir downgrade as the shell branch: a Write tool scratch file under
+		// /tmp stays visible to standard/strict but does not pause the light level.
+		const tempDowngrade = allExternalPathsAreSystemTemp(externalPaths);
 		return danger(
 			`${toolName} targets paths outside the current working directory.`,
 			[
@@ -2303,11 +2356,34 @@ export function classifyDanger(
 				"Use explicit user approval for external files.",
 			],
 			[`External paths: ${externalPaths.join(", ")}`],
-			"high",
+			tempDowngrade ? "medium" : "high",
 		);
 	}
 
 	return null;
+}
+
+/**
+ * System temp directories, for the danger-reflection severity downgrade only.
+ *
+ * Writes into `/tmp` (and the OS tmpdir) are disposable scratch work, not worktree
+ * content: they are outside project git history either way, but they are also outside
+ * every user asset. Pausing the whole session to reflect on `echo hi > /tmp/x` — which
+ * the light level does, because the external-path write classifies as "high" — turned
+ * throwaway shell plumbing into a full reflection round. Downgraded to "medium", the
+ * light level (threshold = high) skips it while standard and strict still pause.
+ *
+ * Only used by classifyDanger; the permission decision path keeps its own checks, so a
+ * directory blacklist targeting /tmp still denies those writes before any of this runs.
+ */
+function isSystemTempDirPath(path: string): boolean {
+	const normalized = resolvePath(path);
+	if (normalized === "/tmp") return true;
+	return isInsidePath(tmpdir(), normalized);
+}
+
+function allExternalPathsAreSystemTemp(paths: string[]): boolean {
+	return paths.length > 0 && paths.every(isSystemTempDirPath);
 }
 
 function dangerSeverityRank(severity: DangerSeverity): number {
@@ -3220,7 +3296,12 @@ function permissionPrimaryPath(
 	toolName: string,
 	input: Record<string, unknown>,
 ): string | undefined {
-	if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
+	if (
+		toolName === "Read" ||
+		toolName === "Write" ||
+		toolName === "Edit" ||
+		toolName === "StructView"
+	) {
 		return typeof input.file_path === "string" ? input.file_path : undefined;
 	}
 	if (toolName === "Glob" || toolName === "Grep") {
@@ -3721,7 +3802,7 @@ export async function handlePermission(
 	if (toolName === "AskUserQuestion") {
 		try {
 			const { assertNarratorCanAskQuestion } = await import("./narrator-question-service");
-			await assertNarratorCanAskQuestion(narratorId, effectiveInput);
+			await assertNarratorCanAskQuestion(narratorId);
 		} catch (error) {
 			return { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
 		}

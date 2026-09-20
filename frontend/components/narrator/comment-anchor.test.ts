@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { parseHTML } from "linkedom";
 import { resolveChatCommentAnchor } from "./comment-anchor";
-import { BLOCK_ID_ATTR } from "./MessageSelectionCtx";
+import { BLOCK_ID_ATTR } from "./message/MessageSelectionCtx";
 
 function makeTree() {
 	const { document } = parseHTML("<div id='root'></div>");

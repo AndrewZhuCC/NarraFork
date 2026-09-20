@@ -1,4 +1,4 @@
-import { BLOCK_ID_ATTR } from "./MessageSelectionCtx";
+import { BLOCK_ID_ATTR } from "./message/MessageSelectionCtx";
 
 export type ChatCommentRole = "user" | "assistant" | "system";
 

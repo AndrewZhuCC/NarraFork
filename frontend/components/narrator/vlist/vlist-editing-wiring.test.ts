@@ -20,8 +20,9 @@
 import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { shellSource } from "./guard-source";
 
-const SHELL = readFileSync(join(import.meta.dir, "PretextExactMessageList.tsx"), "utf8");
+const SHELL = shellSource();
 const ROW_INTERACTION = readFileSync(join(import.meta.dir, "VListRowInteraction.tsx"), "utf8");
 
 describe("vlist inline editing wiring", () => {
@@ -48,7 +49,7 @@ describe("vlist inline editing wiring", () => {
 		expect(SHELL).toMatch(/const OriginalContentModal = lazy\(\(\) =>\s*\n?\s*import\("\.\.\//);
 		// The pure text helper may be imported statically (it carries no component
 		// graph); the editor component itself must NOT be.
-		expect(SHELL).toContain('from "../message-edit-text"');
+		expect(SHELL).toContain('from "../message/message-edit-text"');
 		expect(SHELL).not.toMatch(/^import \{[^}]*MessageEditorPanel[^}]*\} from/m);
 	});
 

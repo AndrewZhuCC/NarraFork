@@ -233,6 +233,30 @@ for (const transport of ["http", "ws", "native-ws"] as const) {
 	describe(`Codex ${transport} reflection tool prefix`, () => {
 		const capture = (overrides: Partial<ChatParams> = {}) =>
 			captureChat(overrides, "codex", transport);
+		test("full inherited declarations only enable the explicit reflection ceiling", async () => {
+			const parent = await capture({
+				tools: [parentFunction, ...decisionTools],
+				reflectionTools: decisionTools,
+			});
+			const parentTools = structuredClone(parent.body.tools) as unknown[];
+			for (const allowed of [[dangerCancelTool.name], []]) {
+				const reflection = await capture({
+					tools: structuredClone(parentTools),
+					reflectionParentTools: parentTools,
+					reflectionAllowedTools: allowed,
+				});
+				expect(reflection.body.tools).toEqual(parent.body.tools);
+				expect(reflection.body.tool_choice).toEqual(
+					allowed.length
+						? {
+								type: "allowed_tools",
+								mode: "required",
+								tools: [{ type: "function", name: dangerCancelTool.name }],
+							}
+						: "none",
+				);
+			}
+		});
 		test("keeps the parent wire prefix and parallel mode while restricting real decision tools", async () => {
 			let parentTools: unknown[] | undefined;
 			const normal: Partial<ChatParams> = {

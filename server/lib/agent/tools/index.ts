@@ -36,6 +36,8 @@ import { scheduledTaskAdminTool } from "./scheduled-task-admin";
 import { sendTool } from "./send";
 import { shareFileTool } from "./share-file";
 import { skillTool } from "./skill";
+import { structSedTool } from "./struct-sed";
+import { structViewTool } from "./struct-view";
 import { switchDeviceTool } from "./switch-device";
 import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
@@ -118,6 +120,8 @@ const coreProvider: ToolProvider = {
 			editTool,
 			globTool,
 			grepTool,
+			structViewTool,
+			structSedTool,
 			webSearchTool,
 			webFetchTool,
 			learningGuideTool,

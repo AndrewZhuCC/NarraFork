@@ -37,6 +37,7 @@ import type {
 	PaginatedNarrators,
 	PretextDocumentPageResult,
 	RuleTargetSelector,
+	TreeMessage,
 	WhitelistCmd,
 	WhitelistDir,
 } from "./types";
@@ -654,7 +655,15 @@ export const narratorsApi = {
 	// scrollbar geometry or band semantics.
 	getPretextDocumentPage: (
 		id: string,
-		opts?: { afterSeq?: number; beforeSeq?: number; limit?: number; messageVersion?: number },
+		opts?: {
+			afterSeq?: number;
+			beforeSeq?: number;
+			limit?: number;
+			messageVersion?: number;
+			signal?: AbortSignal;
+			maxResponseBytes?: number;
+			onResponseBytes?: (bytes: number) => void;
+		},
 	) => {
 		const params = new URLSearchParams();
 		if (opts?.afterSeq != null) params.set("afterSeq", String(opts.afterSeq));
@@ -664,12 +673,18 @@ export const narratorsApi = {
 		const qs = params.toString();
 		return request<PretextDocumentPageResult>(
 			`/narrators/${id}/pretext-document${qs ? `?${qs}` : ""}`,
+			{
+				signal: opts?.signal,
+				maxResponseBytes: opts?.maxResponseBytes,
+				onResponseBytes: opts?.onResponseBytes,
+			},
 		);
 	},
 	// Resolve a message id to its top-level seq coordinate (jump-to-message).
-	getMessageLocation: (id: string, messageId: string) =>
+	getMessageLocation: (id: string, messageId: string, signal?: AbortSignal) =>
 		request<MessageLocationResult>(
 			`/narrators/${id}/message-location/${encodeURIComponent(messageId)}`,
+			{ signal },
 		),
 	// Full-text search within a single narrator's own conversation history.
 	searchNarratorMessages: (id: string, q: string, limit?: number) => {
@@ -739,8 +754,11 @@ export const narratorsApi = {
 			{ signal },
 		);
 	},
-	interruptNarrator: (id: string) =>
-		request<ApiEntity>(`/narrators/${id}/interrupt`, { method: "POST" }),
+	interruptNarrator: (id: string, waitForIdle = false) =>
+		request<ApiEntity & { settled?: boolean }>(
+			`/narrators/${id}/interrupt${waitForIdle ? "?waitForIdle=1" : ""}`,
+			{ method: "POST" },
+		),
 	detachSubagent: (id: string) =>
 		request<{ detached: boolean }>(`/narrators/${id}/detach`, { method: "POST" }),
 	takeoverSubagent: (id: string) =>
@@ -1224,6 +1242,20 @@ export const narratorsApi = {
 		}),
 	getCompactSummary: (narratorId: string, messageId: string) =>
 		request<CompactMessageDetail>(`/narrators/${narratorId}/compact/${messageId}`),
+	streamCompactSummary: (
+		narratorId: string,
+		messageId: string,
+		offsets: { output: number; thinking: number },
+	) => {
+		const params = new URLSearchParams({
+			outputOffset: String(Math.max(0, offsets.output)),
+			thinkingOffset: String(Math.max(0, offsets.thinking)),
+		});
+		return authorizedFetch(
+			`${apiBase()}/narrators/${encodeURIComponent(narratorId)}/compact/${encodeURIComponent(messageId)}/live?${params}`,
+			{ headers: { Accept: "text/event-stream" } },
+		);
+	},
 	retryFailedCompact: (narratorId: string, messageId: string, model?: string) =>
 		request<RetryFailedCompactResponse>(`/narrators/${narratorId}/compact/${messageId}/retry`, {
 			method: "POST",
@@ -1748,10 +1780,13 @@ export const narratorsApi = {
 		narratorId: string,
 		opts: { sourceMessageId: string; sourceMessageUuid?: string },
 	) =>
-		request<{ messageId: string }>(`/narrators/${narratorId}/ask-in-passing/start`, {
-			method: "POST",
-			body: JSON.stringify(opts),
-		}),
+		request<{ messageId: string; message?: TreeMessage }>(
+			`/narrators/${narratorId}/ask-in-passing/start`,
+			{
+				method: "POST",
+				body: JSON.stringify(opts),
+			},
+		),
 	askInPassing: (
 		narratorId: string,
 		opts: {
@@ -1759,7 +1794,7 @@ export const narratorsApi = {
 			pendingMessageId: string;
 		},
 	) =>
-		request<ApiEntity>(`/narrators/${narratorId}/ask-in-passing`, {
+		request<ApiEntity & { message?: TreeMessage }>(`/narrators/${narratorId}/ask-in-passing`, {
 			method: "POST",
 			body: JSON.stringify(opts),
 		}),
@@ -1894,5 +1929,28 @@ export const narratorsApi = {
 		request<NarratorAccess>(`/narrators/${narratorId}/transfer-owner`, {
 			method: "POST",
 			body: JSON.stringify({ userId }),
+		}),
+
+	// ── Prompt optimization ────────────────────────────────────────────────────
+
+	optimizePrompt: (
+		narratorId: string,
+		text: string,
+		style: "clarify" | "concise" | "structured" | "translate_en",
+		options?: {
+			withContext?: boolean;
+			messageId?: string;
+			signal?: AbortSignal;
+		},
+	) =>
+		request<{ text: string; model: string }>(`/narrators/${narratorId}/optimize-prompt`, {
+			method: "POST",
+			body: JSON.stringify({
+				text,
+				style,
+				withContext: options?.withContext,
+				messageId: options?.messageId,
+			}),
+			signal: options?.signal,
 		}),
 };

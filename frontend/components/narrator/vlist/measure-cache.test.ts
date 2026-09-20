@@ -17,6 +17,82 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("ask-in-passing cached measurements", () => {
+	beforeEach(async () => {
+		const { measureCache } = await import("./measure-cache");
+		measureCache.clear();
+	});
+
+	it("remeasures variant transitions and equal-length questions under a stable row/document key", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached, VLIST_REGISTRY } = await import("./registry");
+		const { adaptSegment } = await import("./segment-adapter");
+		const adapt = (status: string, question: string) => {
+			const spec = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "stable-aip-message",
+						role: "system",
+						contentJson: [{ type: "ask_in_passing", status, question }],
+					},
+				},
+				{ lod: 5 },
+			)[0];
+			if (!spec) throw new Error("missing ask-in-passing spec");
+			return spec;
+		};
+		const initial = adapt("pending", "Why?");
+		let previous: unknown;
+		for (const [status, question] of [
+			["pending", "Why?"],
+			["resolved", "Why?"],
+			["resolved", "How?"],
+			["pending", "How?"],
+		] as const) {
+			const spec = adapt(status, question);
+			expect(spec.key).toBe(initial.key);
+			expect(spec.data).toEqual({ kind: status, question });
+			const measure = (data: unknown) =>
+				measureElementCached(spec.kind, data, 600, 5, spec.opts, spec.key, "stable-doc");
+			const measured = measure(spec.data);
+			expect(measured).not.toBe(previous);
+			expect(measured).toEqual(VLIST_REGISTRY[spec.kind].measure(spec.data, 600, 5, spec.opts));
+			expect(measured.blocks[0]?.kind).toBe(status === "pending" ? "fixed" : "inline");
+			expect(measure({ kind: status, question })).toBe(measured);
+			expect(measureCache.size).toBe(1);
+			previous = measured;
+		}
+		expect(measureCache.misses).toBe(4);
+		expect(measureCache.hits).toBe(4);
+		measureCache.clear();
+	});
+
+	it("invalidates an optional navigation target supplied directly to the registry", async () => {
+		const { measureCache } = await import("./measure-cache");
+		const { measureElementCached } = await import("./registry");
+		const measure = (targetNarratorId?: string) =>
+			measureElementCached(
+				"ask-in-passing",
+				{ kind: "resolved", question: "Why?", targetNarratorId },
+				600,
+				5,
+				undefined,
+				"stable-aip",
+				"stable-doc",
+			);
+		let previous = measure();
+		for (const target of ["target-a", "target-b", undefined]) {
+			const next = measure(target);
+			expect(next).not.toBe(previous);
+			expect(next).toEqual(previous);
+			expect(measure(target)).toBe(next);
+			previous = next;
+		}
+		measureCache.clear();
+	});
+});
+
 describe("trace inspector refs in cached measurements", () => {
 	it("replaces changed PK/message/attempt refs without changing geometry or remeasuring identical refs", async () => {
 		const { measureCache } = await import("./measure-cache");
@@ -172,6 +248,39 @@ describe("bounded source retention", () => {
 });
 
 describe("canonical body revision", () => {
+	it("re-keys fixed-height headers when canonical delivery state changes", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = {
+			role: "user",
+			text: "queued input",
+			deliveryId: "delivery-1",
+			deliveryKind: "user_input",
+			deliveryState: "queued",
+		};
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, deliveryState: "materialized" }),
+		);
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, deliveryId: "delivery-2" }),
+		);
+	});
+
+	it("re-keys injection speaker/body passthroughs for same-id edits", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const base = {
+			markdown: "hello",
+			modelFacing: "hello",
+			speaker: "worker",
+			source: "subagent_message",
+		};
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, markdown: "updated" }),
+		);
+		expect(extractDataRevision(base)).not.toBe(
+			extractDataRevision({ ...base, speaker: "reviewer" }),
+		);
+	});
+
 	it("tracks format/live/source/range/revision even with identical painted text", async () => {
 		const { extractDataRevision } = await import("./measure-cache");
 		const { createSourceText } = await import("@shared/pretext-layout/source-text");

@@ -48,20 +48,21 @@ import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
+import { ImageViewer } from "../../common/ImageViewer";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { type SelectionCommentPayload, SelectionPopover } from "../../common/SelectionPopover";
 import { TruncatedText } from "../../common/TruncatedText";
-import { ContentViewer } from "../ContentViewer";
 import { addCommentDraft } from "../comment-draft-store";
+import { FileReferenceScopeProvider, useFileReferenceScope } from "../composer/FileReferenceScope";
+import { ContentViewer } from "../content/ContentViewer";
+import { MonacoEditor } from "../file-editor/MonacoEditor";
 import {
 	getFilePreviewType,
 	MAX_FILE_PREVIEW_BLOB_BYTES,
 	readTextPreview,
-} from "../FilePreviewModal";
-import { FileReferenceScopeProvider, useFileReferenceScope } from "../FileReferenceScope";
-import { MonacoEditor } from "../file-editor/MonacoEditor";
-import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../highlight-cache";
-import { MarkdownContent } from "../MarkdownContent";
+} from "../file-panel/FilePreviewModal";
+import { MAX_FILE_HIGHLIGHT_CODE_CHARS } from "../markdown/highlight-cache";
+import { MarkdownContent } from "../markdown/MarkdownContent";
 import { filePanelBaseName } from "../panels/panel-kind";
 import { availableModes, type FileViewerMode } from "./file-viewer-modes";
 import { StructuredNodeTree } from "./StructuredNodeTree";
@@ -166,7 +167,7 @@ export interface FileViewerContentProps {
 	/** Receiving chat, which may differ from the file's source narrator. */
 	commentNarratorId?: string;
 	deviceId?: string;
-	/** References are text-only and cannot enter the legacy binary/download reader. */
+	/** References use scoped text/image readers, never the legacy binary/download reader. */
 	referenceOrigin?: boolean;
 	selection?: FileSelection;
 	highlightRequestId?: string;
@@ -188,6 +189,18 @@ export function fileViewerReadMode(
 ): "legacy" | "scoped" | "missing-context" {
 	if (!referenceOrigin && deviceId === "local") return "legacy";
 	return narratorId ? "scoped" : "missing-context";
+}
+
+/** Image links are previews, not text references; selected ranges remain text-only. */
+export function fileViewerUsesText(
+	previewType: "image" | "pdf" | "text",
+	selection: FileSelection | undefined,
+	referenceOrigin: boolean,
+	deviceId: string,
+): boolean {
+	if (selection) return true;
+	if (previewType === "image") return false;
+	return previewType === "text" || referenceOrigin || deviceId !== "local";
 }
 
 export function FileViewerContent({
@@ -223,7 +236,7 @@ export function FileViewerContent({
 	const [load, setLoad] = useState<LoadState>(INITIAL_LOAD);
 
 	const previewType = getFilePreviewType(filePath);
-	const isText = previewType === "text" || !!selection || referenceOrigin || deviceId !== "local";
+	const isText = fileViewerUsesText(previewType, selection, referenceOrigin, deviceId);
 	const previewSupported = readerMode !== "legacy" || previewCapability.supported;
 	const sourceOnly = !!selection;
 	const lang = useMemo(() => getShikiLang(filePath), [filePath]);
@@ -512,11 +525,14 @@ export function FileViewerContent({
 								{previewCapability.reason ?? t("filePreview_unsupported")}
 							</Text>
 						</Box>
-					) : !isText ? (
+					) : !isText && previewType !== "text" ? (
 						<BinaryFilePreview
-							key={`${filePath}:${reloadToken}`}
+							key={JSON.stringify([narratorId, deviceId, readerMode, filePath, reloadToken])}
 							filePath={filePath}
 							previewType={previewType}
+							narratorId={narratorId}
+							deviceId={deviceId}
+							readerMode={readerMode}
 						/>
 					) : load.loading ? (
 						<Center h="100%">
@@ -601,38 +617,61 @@ export async function readBinaryPreview(response: Response): Promise<Blob> {
 	return new Blob(chunks, { type: response.headers.get("content-type") ?? "" });
 }
 
-function BinaryFilePreview({
+export function BinaryFilePreview({
 	filePath,
 	previewType,
+	narratorId,
+	deviceId = "local",
+	readerMode = "legacy",
 }: {
 	filePath: string;
 	previewType: "image" | "pdf";
+	narratorId?: string;
+	deviceId?: string;
+	readerMode?: ReturnType<typeof fileViewerReadMode>;
 }) {
 	const { t } = useTranslation("narrator");
 	const openImageViewer = useImageViewer();
-	const [url, setUrl] = useState<string | null>(null);
+	const [image, setImage] = useState<{ url: string; blob: Blob } | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const fileName = fileBaseName(filePath);
+	const tRef = useRef(t);
+	tRef.current = t;
 
 	useEffect(() => {
 		const controller = new AbortController();
 		let disposed = false;
 		let objectUrl: string | null = null;
-		const timeout = setTimeout(() => controller.abort(), 30_000);
-		authorizedFetch(`/api/fs/preview?path=${encodeURIComponent(filePath)}`, {
-			signal: controller.signal,
-		})
-			.then(async (response) => {
-				if (!response.ok) {
-					const failure = await readFetchError(response, "Request failed");
-					throw new ApiError(failure.message, response.status, failure.data);
-				}
-				return readBinaryPreview(response);
-			})
+		setImage(null);
+		setError(null);
+		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
+		const read = async () => {
+			if (readerMode !== "legacy") {
+				if (readerMode === "missing-context" || !narratorId)
+					throw new Error(tRef.current("fileReferences.missingContext"));
+				if (previewType !== "image")
+					throw new Error(tRef.current("fileReferences.binaryNotSupported"));
+				return fileReferenceApi.imagePreview(
+					narratorId,
+					{ deviceId, path: filePath },
+					controller.signal,
+				);
+			}
+			const response = await authorizedFetch(
+				`/api/fs/preview?path=${encodeURIComponent(filePath)}`,
+				{ signal: controller.signal },
+			);
+			if (!response.ok) {
+				const failure = await readFetchError(response, "Request failed");
+				throw new ApiError(failure.message, response.status, failure.data);
+			}
+			return readBinaryPreview(response);
+		};
+		read()
 			.then((blob) => {
 				if (disposed) return;
 				objectUrl = URL.createObjectURL(blob);
-				setUrl(objectUrl);
+				setImage({ url: objectUrl, blob });
 			})
 			.catch((err) => {
 				if (!disposed) setError(err instanceof Error ? err.message : String(err));
@@ -644,8 +683,9 @@ function BinaryFilePreview({
 			controller.abort();
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [filePath]);
+	}, [filePath, deviceId, narratorId, readerMode, previewType]);
 
+	const url = image?.url;
 	if (error) {
 		return (
 			<Text p="md" size="sm" c="red">
@@ -670,24 +710,22 @@ function BinaryFilePreview({
 			/>
 		);
 	}
+	const options = {
+		src: url,
+		blob: image?.blob,
+		filename: fileName,
+		alt: fileName,
+		// Scoped/remote previews must never fall back to an unrestricted local path.
+		...(readerMode === "legacy" ? { savedPath: filePath } : {}),
+	};
 	return (
-		<Center h="100%" p="xs">
-			<button
-				type="button"
-				aria-label={fileName}
-				onClick={() =>
-					openImageViewer({ src: url, savedPath: filePath, filename: fileName, alt: fileName })
-				}
-				style={{ display: "contents", cursor: "zoom-in" }}
-			>
-				<img
-					src={url}
-					alt={fileName}
-					onError={() => setError(t("filePreview_loadError"))}
-					style={{ maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
-				/>
-			</button>
-		</Center>
+		<ImageViewer
+			key={url}
+			options={options}
+			embedded
+			onFullscreen={() => openImageViewer(options)}
+			onError={() => setError(t("filePreview_loadError"))}
+		/>
 	);
 }
 

@@ -47,9 +47,17 @@ import {
 	recordTreeSnapshotBefore,
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
+import { specVfsService } from "./spec-vfs-service";
 
-/** Tools that may modify files on disk, i.e. the ones worth a boundary pair. */
-export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", SHELL_TOOL_NAME]);
+/**
+ * Tools that may modify files on disk, i.e. the ones worth a boundary pair.
+ *
+ * A file-mutating tool missing from this set gets NO tree snapshot boundary, so the
+ * preferred revert path cannot cover it and `narrator-scoped-revert` reports
+ * `incomplete_coverage` for the whole range. That fails closed rather than pretending a
+ * revert succeeded, but the capability is simply absent until the name is listed here.
+ */
+export const FILE_MUTATING_TOOLS = new Set(["Write", "Edit", "StructSed", SHELL_TOOL_NAME]);
 
 /**
  * Build the snapshot hook pair for one agent loop.
@@ -87,6 +95,25 @@ export function buildTreeSnapshotEventHooks(opts: {
 			const defaultDeviceId = session._defaultDeviceId ?? LOCAL_DEVICE_ID;
 			const requestedDevice = args?.device;
 			const workdir = args?.workdir;
+			const fileTargets = [args?.file_path, args?.to_file].filter(
+				(value): value is string => typeof value === "string" && value.length > 0,
+			);
+			const isVirtualSpecTarget =
+				toolName !== SHELL_TOOL_NAME &&
+				fileTargets.length > 0 &&
+				fileTargets.every((value) => specVfsService.isSpecUri(value));
+			if (isVirtualSpecTarget) {
+				// Spec files are persisted by the virtual filesystem, not the worktree. They
+				// intentionally have no tree boundary and should not look like an unverified
+				// local target in the server log.
+				abandonTreeSnapshot(session, narratorId, toolUseId);
+				logger.debug("Tree snapshot skipped for virtual Spec target", {
+					narratorId,
+					toolUseId,
+					toolName,
+				});
+				return;
+			}
 			if (
 				defaultDeviceId !== LOCAL_DEVICE_ID ||
 				(requestedDevice !== undefined && requestedDevice !== LOCAL_DEVICE_ID) ||

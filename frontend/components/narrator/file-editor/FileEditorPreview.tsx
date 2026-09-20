@@ -4,7 +4,7 @@ import { lazy, Suspense, useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { type SelectionCommentPayload, SelectionPopover } from "../../common/SelectionPopover";
 import { addCommentDraft } from "../comment-draft-store";
-import { FileReferenceScopeProvider } from "../FileReferenceScope";
+import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import type { FileViewerMode } from "../file-viewer/file-viewer-modes";
 import {
 	detectStructuredFormat,
@@ -13,7 +13,7 @@ import {
 } from "../file-viewer/structured-parse";
 
 const MarkdownContent = lazy(() =>
-	import("../MarkdownContent").then((m) => ({ default: m.MarkdownContent })),
+	import("../markdown/MarkdownContent").then((m) => ({ default: m.MarkdownContent })),
 );
 const StructuredNodeTree = lazy(() =>
 	import("../file-viewer/StructuredNodeTree").then((m) => ({ default: m.StructuredNodeTree })),

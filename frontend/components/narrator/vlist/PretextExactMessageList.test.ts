@@ -1,24 +1,27 @@
 import { describe, expect, it } from "bun:test";
-import { readFileSync } from "node:fs";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
-import {
-	applyExactScrollCorrection,
-	buildExactCatchUpCursor,
-	buildExactListLayout,
-	buildExactMessageSnapshot,
-	computeToolRunFrames,
-	hasRenderableExactLayout,
-	isCompactMarkerMessage,
-	isFramedRunItem,
-	resolveRowHitHeight,
-	shouldReloadExactDocument,
-} from "./PretextExactMessageList";
+import { shellSource } from "./guard-source";
 import {
 	resolvePretextDocumentView,
 	resolveRebuildView,
 	shouldForcePretextDocumentLoad,
 } from "./usePretextDocument";
+import {
+	buildExactCatchUpCursor,
+	buildExactMessageSnapshot,
+	hasRenderableExactLayout,
+	isCompactMarkerMessage,
+	resolveExactCatchUpRevisionDelta,
+	shouldReloadExactDocument,
+} from "./vlist-exact-document";
+import {
+	buildExactListLayout,
+	computeToolRunFrames,
+	isFramedRunItem,
+	resolveRowHitHeight,
+} from "./vlist-exact-layout";
+import { applyExactScrollCorrection } from "./vlist-exact-scroll";
 import type { VListItem } from "./vlist-pipeline";
 
 function makeManifest(): PretextLayoutManifest {
@@ -119,6 +122,28 @@ describe("PretextExactMessageList", () => {
 		// Scrolled up (reading history): defer the structural reload so the reader
 		// is not snapped back to the tail; it fires when they return to the bottom.
 		expect(shouldReloadExactDocument(4, 3, true, false)).toBe(false);
+	});
+
+	it("counts a multi-message catch-up once so the next structural event reloads", () => {
+		let messageRevision = 10;
+		let appliedRevision = 10;
+		const catchUpDelta = resolveExactCatchUpRevisionDelta({
+			initialSync: false,
+			topLevelCount: 2,
+			applied: true,
+			orphanChildrenCount: 0,
+			subagentActivitiesCount: 0,
+		});
+
+		expect(catchUpDelta).toEqual({ messageRevisionDelta: 1, appliedRevisionDelta: 1 });
+		messageRevision += catchUpDelta.messageRevisionDelta;
+		appliedRevision += catchUpDelta.appliedRevisionDelta;
+		expect(shouldReloadExactDocument(messageRevision, appliedRevision, true, true)).toBe(false);
+
+		// The following structural event gets its own revision and must not be mistaken
+		// for an already-applied catch-up message.
+		messageRevision += 1;
+		expect(shouldReloadExactDocument(messageRevision, appliedRevision, true, true)).toBe(true);
 	});
 
 	it("forces a fresh document load once per explicit reload token", () => {
@@ -229,7 +254,7 @@ describe("PretextExactMessageList", () => {
 	});
 
 	it("keeps the experimental shell independent from band geometry", () => {
-		const source = readFileSync(`${import.meta.dir}/PretextExactMessageList.tsx`, "utf8");
+		const source = shellSource();
 		expect(source).toContain("pretextDocument.index");
 		expect(source).toContain('position: "absolute"');
 		expect(source).toContain('overflow: "hidden"');

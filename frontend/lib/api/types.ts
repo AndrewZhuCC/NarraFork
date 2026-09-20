@@ -380,6 +380,75 @@ export interface DatabaseVacuumResult {
 	durationMs: number;
 }
 
+// === Workspace write barriers (external recovery) ===
+
+export type WorkspaceBarrierVerdict =
+	| "applied"
+	| "not_applied"
+	| "not_dispatched"
+	| "foreign"
+	| "unobservable";
+
+export interface WorkspaceBarrierScope {
+	id: string;
+	deviceId: string;
+	canonicalRoot: string;
+	pathFlavor: "posix" | "windows";
+	status: "active" | "retired" | "needs_verification";
+	activeLeaseId: string | null;
+	activeMutationCount: number;
+	updatedAt: string;
+}
+
+export interface WorkspaceBarrierEffect {
+	effectId: string;
+	operationId: string;
+	canonicalPath: string;
+	displayPath: string;
+	settlement: string;
+	dispatched: boolean;
+	beforeKind: "absent" | "regular" | "symlink" | "unknown";
+	intendedKind: "absent" | "regular" | "symlink" | "unknown";
+}
+
+export interface WorkspaceBarrierOperation {
+	operationId: string;
+	sourceKind: string;
+	narratorId: string | null;
+	toolCallId: string | null;
+	startedAt: string;
+}
+
+export interface WorkspaceBarrier {
+	scope: WorkspaceBarrierScope;
+	kind: "quarantined" | "unverified_root";
+	local: boolean;
+	operations: WorkspaceBarrierOperation[];
+	effects: WorkspaceBarrierEffect[];
+}
+
+export interface WorkspaceBarrierObservation {
+	effectId: string;
+	canonicalPath: string;
+	displayPath: string;
+	verdict: WorkspaceBarrierVerdict;
+	actualKind: "absent" | "regular" | "unobservable";
+	observedDigest: string | null;
+	observedSizeBytes: number | null;
+}
+
+export interface WorkspaceBarrierObservationResult {
+	scope: WorkspaceBarrierScope;
+	observations: WorkspaceBarrierObservation[];
+}
+
+export interface WorkspaceBarrierRecoveryResult {
+	recovered: "barrier_cleared" | "root_verified";
+	settledEffectCount: number;
+	revision?: number;
+	fencingToken?: number;
+}
+
 export interface RuntimeScanResult {
 	terminals: {
 		running: number;
@@ -409,6 +478,7 @@ export interface RuntimeScanResult {
 export interface SubagentToolCallTiming {
 	startedAt?: string | number | null;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -459,7 +529,7 @@ export interface SubagentFileChanges {
 	totalUnmeasured: number;
 	bashTouchedCount: number;
 	countsTruncated: boolean;
-	attributionScope?: "legacy_unscoped";
+	attributionScope?: "exact_attempt" | "mixed" | "legacy_unscoped";
 	scope?: {
 		sourceToolUseId: string | null;
 		startedAt?: string | null;
@@ -516,6 +586,7 @@ export interface BaseContentBlock {
 	durationMs?: number;
 	startedAt?: string | number | null;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -595,6 +666,7 @@ export interface ToolCallRecord {
 	status?: string;
 	durationMs?: number;
 	streamStartedAt?: string | number | null;
+	streamCompletedAt?: string | number | null;
 	permissionStartedAt?: string | number | null;
 	executionStartedAt?: string | number | null;
 	completedAt?: string | number | null;
@@ -808,7 +880,12 @@ export interface BufferedTextFileSummary {
 }
 
 export interface BufferMessageSummary {
+	/** Mailbox control row id; this remains the id used by edit/remove/retry APIs. */
 	id: string;
+	/** Canonical timeline message id, when supplied by a new server. */
+	messageId?: string | null;
+	/** Optional delivery identity for matching a canonical row. */
+	deliveryId?: string | null;
 	state?: "queued" | "failed";
 	error?: string | null;
 	text: string;
@@ -862,8 +939,14 @@ export interface TreeMessage {
 		avatarColor?: string | null;
 		avatarImageId?: string | null;
 	} | null;
+	/** Atomic version immediately after an ask insert; transport-only, not persisted. */
+	askInsertVersion?: number;
 	/** Stable top-level ordering from narrator_message_refs.seq. */
 	seq?: number;
+	/** Eager mailbox/outbox projection identity and lifecycle, when present. */
+	deliveryId?: string | null;
+	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
+	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
 	children: TreeMessage[];
 	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */

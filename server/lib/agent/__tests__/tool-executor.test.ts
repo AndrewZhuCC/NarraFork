@@ -35,8 +35,10 @@ import {
 	buildTaskReflectionDenialFingerprint,
 	buildTaskReflectionPrompt,
 	getExitPlanReflectionAllowedTools,
+	setPlanReflectionOverrideLoaderForTests,
 	shouldInjectRelaxedPlanToolReminder,
 	shouldRunExitPlanModeReflection,
+	shouldRunExitPlanModeReflectionLive,
 } from "../loop";
 import { classifyToolUpdateExecution, executeTool, preAdmitToolExecution } from "../tool-executor";
 import { toolRegistry } from "../tool-registry";
@@ -80,6 +82,7 @@ afterEach(() => {
 	toolContinuationService.upsert = originalUpsertContinuation;
 	resetUpdateCoordinationForTests();
 	setRemoteBackendResolver(null);
+	setPlanReflectionOverrideLoaderForTests(null);
 	settings.agent.planReflectionAutoApprove = originalPlanReflectionAutoApprove;
 	settings.agent.planReflectionAllowAutoCompact = originalPlanReflectionAllowAutoCompact;
 });
@@ -188,7 +191,7 @@ describe("executeTool trusted runtime policy", () => {
 		}
 	});
 
-	test("server child policy rejects synchronous Ask even when a legacy config has no parent hint", async () => {
+	test("server child policy rejects any Ask even when a legacy config has no parent hint", async () => {
 		const previous = toolRegistry.get("AskUserQuestion");
 		toolRegistry.register(askUserQuestionTool);
 		try {
@@ -205,7 +208,7 @@ describe("executeTool trusted runtime policy", () => {
 				config,
 			);
 			expect(result.isError).toBe(true);
-			expect(result.output).toContain("async: true");
+			expect(result.output).toContain("not available under this runtime policy");
 		} finally {
 			if (previous) toolRegistry.register(previous);
 			else toolRegistry.unregister("AskUserQuestion");
@@ -236,20 +239,6 @@ describe("executeTool update admission gate", () => {
 				input: { type: "agent", id: "worker" },
 			}),
 		).toBe("resumable");
-		expect(
-			classifyToolUpdateExecution({
-				toolUseId: "classify-await-any",
-				name: "Await",
-				input: { type: "bash", id: "legacy-target" },
-			}),
-		).toBe("resumable");
-		expect(
-			classifyToolUpdateExecution({
-				toolUseId: "classify-await-target-bash",
-				name: "Await",
-				input: { type: "bash", id: "target", onlyWaitFor: true },
-			}),
-		).toBe("ordinary");
 		expect(
 			classifyToolUpdateExecution({
 				toolUseId: "classify-background-agent",
@@ -1477,6 +1466,82 @@ describe("ExitPlanMode reflection gate", () => {
 				planReflectionAutoApproveOverride: "off",
 			}),
 		).toBe(false);
+	});
+
+	test("decision-time DB override beats the pass-start snapshot", async () => {
+		// Global stays on so a frozen "inherit"/"on" would still open the reflection gate.
+		setPlanReflectionAutoApprove(true);
+		setPlanReflectionOverrideLoaderForTests(async () => ({
+			planReflectionAutoApproveOverride: "off",
+		}));
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-off",
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "on",
+			}),
+		).resolves.toBe(false);
+
+		// And the reverse: pass froze "off", user turned the switch on mid-pass.
+		setPlanReflectionAutoApprove(false);
+		setPlanReflectionOverrideLoaderForTests(async () => ({
+			planReflectionAutoApproveOverride: "on",
+		}));
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-on",
+				permissionMode: "acceptEdits",
+				planReflectionAutoApproveOverride: "off",
+			}),
+		).resolves.toBe(true);
+	});
+
+	test("live reload failure falls back to the pass snapshot", async () => {
+		setPlanReflectionAutoApprove(false);
+		setPlanReflectionOverrideLoaderForTests(async () => {
+			throw new Error("db unavailable");
+		});
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-fail",
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "on",
+			}),
+		).resolves.toBe(true);
+
+		setPlanReflectionOverrideLoaderForTests(async () => null);
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-missing",
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "off",
+			}),
+		).resolves.toBe(false);
+	});
+
+	test("live inherit override still follows the current global default", async () => {
+		setPlanReflectionOverrideLoaderForTests(async () => ({
+			planReflectionAutoApproveOverride: "inherit",
+		}));
+
+		setPlanReflectionAutoApprove(false);
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-inherit",
+				permissionMode: "bypassPermissions",
+				// Pass started when the narrator override was still explicitly on.
+				planReflectionAutoApproveOverride: "on",
+			}),
+		).resolves.toBe(false);
+
+		setPlanReflectionAutoApprove(true);
+		await expect(
+			shouldRunExitPlanModeReflectionLive({
+				narratorId: "narr-live-inherit",
+				permissionMode: "bypassPermissions",
+				planReflectionAutoApproveOverride: "off",
+			}),
+		).resolves.toBe(true);
 	});
 
 	test("runs in edit-capable modes outside reflection loops", () => {
