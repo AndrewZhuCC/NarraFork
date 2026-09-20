@@ -11,7 +11,7 @@
 
 import { readSession, removeSession, writeSession } from "@frontend/lib/session-store";
 import type { PendingPermission } from "@frontend/types/narrator";
-import { Badge, Box, Button, Group, Modal, Paper, Text, Textarea } from "@mantine/core";
+import { Badge, Box, Button, Group, Modal, Paper, Text, Textarea, Tooltip } from "@mantine/core";
 import { IconFileCode } from "@tabler/icons-react";
 import { type CSSProperties, type ReactNode, useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -50,6 +50,9 @@ interface PermButton {
 	label: string;
 	color: string;
 	variant?: string;
+	tooltip?: string;
+	loading?: boolean;
+	disabled?: boolean;
 	onClick: () => void;
 }
 
@@ -80,13 +83,15 @@ function PermButtonBar({
 		<Group gap="sm">
 			{buttons.map((btn, i) => {
 				const focused = focusIndex === i;
-				return (
+				const button = (
 					<Button
 						key={`${btn.label}-${btn.color}`}
 						size="sm"
 						color={btn.color}
 						variant={btn.variant as "light" | "subtle" | undefined}
 						onClick={btn.onClick}
+						loading={btn.loading}
+						disabled={btn.disabled}
 						className={focused ? "perm-btn-pulse" : undefined}
 						style={
 							focused
@@ -103,6 +108,13 @@ function PermButtonBar({
 							</Text>
 						)}
 					</Button>
+				);
+				return btn.tooltip ? (
+					<Tooltip key={`${btn.label}-${btn.color}`} label={btn.tooltip} multiline>
+						{button}
+					</Tooltip>
+				) : (
+					button
 				);
 			})}
 			{suffix}
@@ -162,6 +174,7 @@ export function InlinePermission({
 	onDecision,
 	onQuestionSubmit,
 	onQuestionReflect,
+	onPlanReflect,
 	onQuestionDeny,
 	onQuestionDefer,
 	onPlanPreviewChange,
@@ -177,6 +190,7 @@ export function InlinePermission({
 	) => void;
 	onQuestionSubmit?: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect?: (requestId: string) => Promise<void> | void;
+	onPlanReflect?: (requestId: string) => Promise<void> | void;
 	onQuestionDeny?: (requestId: string) => void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;
@@ -245,6 +259,8 @@ export function InlinePermission({
 	// Feedback confirmation dialog state (must be before early returns)
 	const [feedbackConfirmOpen, setFeedbackConfirmOpen] = useState(false);
 	const [pendingCompactAfter, setPendingCompactAfter] = useState<boolean | undefined>();
+	const [planReflecting, setPlanReflecting] = useState(false);
+	const [planReflectionFailed, setPlanReflectionFailed] = useState(false);
 
 	// ExitPlanMode plan content is rendered by the tool card itself. The permission
 	// area only exposes approval controls and an explicit edit mode.
@@ -328,6 +344,19 @@ export function InlinePermission({
 			setEditedPlan(planText);
 		}
 		setEditing(true);
+	};
+
+	const handlePlanReflect = async () => {
+		if (!onPlanReflect || planReflecting) return;
+		setPlanReflecting(true);
+		setPlanReflectionFailed(false);
+		try {
+			await onPlanReflect(permission.id);
+		} catch {
+			setPlanReflectionFailed(true);
+		} finally {
+			setPlanReflecting(false);
+		}
 	};
 
 	// Regular permission: feedback textarea + Allow/Deny buttons
@@ -469,6 +498,17 @@ export function InlinePermission({
 								},
 							});
 						}
+						if (!editing && isExitPlan && onPlanReflect) {
+							btns.push({
+								label: planReflecting ? t("planReflecting") : t("planReflect"),
+								color: "violet",
+								variant: "light",
+								tooltip: t("planReflectTooltip"),
+								loading: planReflecting,
+								disabled: planReflecting,
+								onClick: () => void handlePlanReflect(),
+							});
+						}
 						if (!editing) {
 							btns.push({
 								label: isExitPlan && feedback.trim() ? t("planRevise") : tc("deny"),
@@ -486,6 +526,11 @@ export function InlinePermission({
 					registerActions={isActivePermission ? registerActions : noop}
 					suffix={!editing && EDIT_TOOLS.has(permission.toolName) ? <ReviewInPanelButton /> : null}
 				/>
+			)}
+			{planReflectionFailed && (
+				<Text size="xs" c="red" mt={4}>
+					{t("planReflectionStartFailed")}
+				</Text>
 			)}
 			{isExitPlan && (
 				<Modal

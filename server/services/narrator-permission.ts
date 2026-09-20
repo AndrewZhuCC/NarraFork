@@ -1527,6 +1527,47 @@ async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	return shouldScheduleQuestionReflection(effectiveMode);
 }
 
+export async function reflectPendingExitPlanMode(
+	requestId: string,
+): Promise<{ ok: boolean; reason?: string }> {
+	const pending = pendingPermissions.get(requestId);
+	if (!pending) return { ok: false, reason: "Permission request not found" };
+	if (pending.toolName !== "ExitPlanMode") {
+		return { ok: false, reason: "Permission request is not ExitPlanMode" };
+	}
+	if (pending.signal.aborted) return { ok: false, reason: "Narrator aborted" };
+
+	const narrator = await narratorService.getById(pending.narratorId).catch(() => null);
+	if (pendingPermissions.get(requestId) !== pending) {
+		return { ok: false, reason: "Permission request not found" };
+	}
+	if (pending.signal.aborted) return { ok: false, reason: "Narrator aborted" };
+	if (!narrator) return { ok: false, reason: "Narrator not found" };
+	if (isSubagentVariant(narrator.variant)) {
+		return { ok: false, reason: "Plan reflection is not available for subagents" };
+	}
+
+	// This click is neither an allow nor a deny. Remove the request from the pending
+	// registry and release its wait into the existing ExitPlanMode reflection gate.
+	// Do not broadcast a final permission_resolved: plan_reflection_started hides the
+	// ordinary card without tombstoning its id, so manual takeover can restore it.
+	pending.cleanup();
+	if (pending.attentionEmitted) {
+		eventBus.emit({
+			type: "narrator:attention_resolved",
+			narratorId: pending.narratorId,
+			reason: "waiting_permission",
+			detail: "reflection",
+		});
+	}
+	pending.resolve({
+		behavior: "planReflection",
+		requestId,
+		input: { ...pending.input },
+	});
+	return { ok: true };
+}
+
 export async function reflectPendingAskUserQuestion(
 	requestId: string,
 	opts: { automatic?: boolean } = {},
@@ -4418,6 +4459,7 @@ export async function handlePermission(
 			status: "pending",
 			inputJson: effectiveInput,
 			permissionStartedAt: new Date().toISOString(),
+			permissionSuggestions: null,
 			...(decisionReason ? { permissionDecisionReason: decisionReason } : {}),
 		})
 		.where(eq(narratorToolCalls.id, toolCallId));

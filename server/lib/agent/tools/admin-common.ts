@@ -41,6 +41,9 @@ export async function requestWritePermission(
 	if (decision.behavior === "dangerReflection") {
 		return `${toolName} is waiting for danger reflection approval.`;
 	}
+	if (decision.behavior === "planReflection") {
+		return `${toolName} received an unresolved plan reflection permission.`;
+	}
 	if (decision.behavior !== "allow") {
 		return decision.message ?? `${toolName} was denied by the user.`;
 	}

@@ -91,6 +91,7 @@ export function usePermissionSlots({
 	const onPermissionDecision = permCb?.onPermissionDecision;
 	const onQuestionSubmit = permCb?.onQuestionSubmit;
 	const onQuestionReflect = permCb?.onQuestionReflect;
+	const onPlanReflect = permCb?.onPlanReflect;
 	const onQuestionDeny = permCb?.onQuestionDeny;
 	const onQuestionDefer = permCb?.onQuestionDefer;
 
@@ -133,6 +134,7 @@ export function usePermissionSlots({
 						onPermissionDecision,
 						onQuestionSubmit,
 						onQuestionReflect,
+						onPlanReflect,
 						onQuestionDeny,
 						onQuestionDefer,
 					}),
@@ -159,6 +161,7 @@ export function usePermissionSlots({
 		onPermissionDecision,
 		onQuestionSubmit,
 		onQuestionReflect,
+		onPlanReflect,
 		onQuestionDeny,
 		onQuestionDefer,
 	]);
@@ -209,6 +212,7 @@ interface PermissionNodeHandlers {
 	onPermissionDecision?: PermissionCallbacks["onPermissionDecision"];
 	onQuestionSubmit?: PermissionCallbacks["onQuestionSubmit"];
 	onQuestionReflect?: PermissionCallbacks["onQuestionReflect"];
+	onPlanReflect?: PermissionCallbacks["onPlanReflect"];
 	onQuestionDeny?: PermissionCallbacks["onQuestionDeny"];
 	onQuestionDefer?: PermissionCallbacks["onQuestionDefer"];
 }
@@ -247,6 +251,7 @@ export function buildPermissionNode(
 			onDecision={handlers.onPermissionDecision}
 			onQuestionSubmit={handlers.onQuestionSubmit}
 			onQuestionReflect={handlers.onQuestionReflect}
+			onPlanReflect={handlers.onPlanReflect}
 			onQuestionDeny={handlers.onQuestionDeny}
 			onQuestionDefer={handlers.onQuestionDefer}
 		/>

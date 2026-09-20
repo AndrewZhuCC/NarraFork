@@ -969,6 +969,10 @@ export const narratorsApi = {
 				method: "POST",
 			},
 		),
+	reflectPlan: (requestId: string) =>
+		request<{ ok: boolean }>(`/narrators/permissions/${requestId}/reflect-plan`, {
+			method: "POST",
+		}),
 	disarmQuestionReflection: (requestId: string) =>
 		request<{ ok: boolean; disarmed: boolean }>(
 			`/narrators/permissions/${requestId}/disarm-question-reflection`,

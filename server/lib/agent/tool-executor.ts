@@ -907,10 +907,10 @@ export async function executeTool(
 				metadata: executionTargetMetadata(frozenExecution?.target),
 			};
 		}
-		if (permission.behavior === "dangerReflection") {
+		if (permission.behavior === "dangerReflection" || permission.behavior === "planReflection") {
 			return {
 				output:
-					"Internal permission error: tool executor received an unresolved dangerReflection result. " +
+					`Internal permission error: tool executor received an unresolved ${permission.behavior} result. ` +
 					"The tool was not executed.",
 				isError: true,
 				durationMs: 0,

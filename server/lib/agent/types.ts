@@ -362,6 +362,12 @@ export type PermissionResult =
 			rawMessage?: boolean;
 	  }
 	| {
+			/** Internal one-shot handoff from a pending ExitPlanMode card into plan reflection. */
+			behavior: "planReflection";
+			requestId: string;
+			input: Record<string, unknown>;
+	  }
+	| {
 			behavior: "dangerReflection";
 			requestId: string;
 			danger: DangerInfo;

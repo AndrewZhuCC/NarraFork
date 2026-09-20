@@ -837,7 +837,7 @@ function HumanAttentionForm({
 			}
 		},
 	});
-	const run = async (action: () => Promise<unknown>) => {
+	const run = async (action: () => Promise<unknown>, throwOnError = false) => {
 		if (
 			actionLock.current ||
 			!summary.canAct ||
@@ -849,8 +849,9 @@ function HumanAttentionForm({
 		actionLock.current = true;
 		try {
 			await mutation.mutateAsync(action);
-		} catch {
+		} catch (error) {
 			/* Inline retry notice keeps the request and draft. */
+			if (throwOnError) throw error;
 		}
 	};
 	const fileDrawer = useMemo(
@@ -966,6 +967,7 @@ function HumanAttentionForm({
 						<InlinePermission
 							permission={{ ...permission, id: item.requestId }}
 							onPlanPreviewChange={preview}
+							onPlanReflect={() => run(() => api.reflectPlan(item.requestId), true)}
 							onDecision={(_id, decision, feedbackText, compactAfter, updatedPlan) =>
 								void run(() =>
 									decision === "allow"

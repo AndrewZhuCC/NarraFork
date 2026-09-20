@@ -1801,6 +1801,7 @@ async function resolveExitPlanModeReflection(
 	config: AgentConfig,
 	history: unknown[],
 	toolUse: AgentToolUse,
+	toolCallId?: string,
 ): Promise<ExitPlanReflectionGateResult> {
 	const locale = (config.locale as Locale) ?? "en";
 	const { loadPlanFileReadPolicy, resolveExitPlanModeInputWithBackend } = await import(
@@ -1834,6 +1835,7 @@ async function resolveExitPlanModeReflection(
 		toolUseId: toolUse.toolUseId,
 		toolName: toolUse.name,
 		inputJson: resolvedInput.input,
+		...(toolCallId ? { toolCallId } : {}),
 		abortController: reflectionAbort,
 	});
 	await markExitPlanReflectionStarted(requestId);
@@ -2044,6 +2046,47 @@ async function buildSpecTasksCandidateContent(
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return null;
+	}
+}
+
+const exitPlanReflectionApprovalReceipts = new Map<string, { compactAfter: boolean }>();
+
+function exitPlanReflectionApprovalKey(narratorId: string, toolUseId: string): string {
+	return `${narratorId}:${toolUseId}`;
+}
+
+async function markExitPlanReflectionApproved(
+	narratorId: string,
+	toolUseId: string,
+	compactAfter: boolean,
+): Promise<void> {
+	const { pendingPlanApproverSource, pendingPlanCompact } = await import(
+		"@server/services/narrator-session-state"
+	);
+	if (compactAfter) pendingPlanCompact.add(narratorId);
+	pendingPlanApproverSource.set(narratorId, "reflection");
+	exitPlanReflectionApprovalReceipts.set(exitPlanReflectionApprovalKey(narratorId, toolUseId), {
+		compactAfter,
+	});
+}
+
+async function finalizeExitPlanReflectionApproval(
+	narratorId: string,
+	toolUseId: string,
+	executionFailed: boolean,
+): Promise<void> {
+	const key = exitPlanReflectionApprovalKey(narratorId, toolUseId);
+	const receipt = exitPlanReflectionApprovalReceipts.get(key);
+	if (!receipt) return;
+	exitPlanReflectionApprovalReceipts.delete(key);
+	if (!executionFailed) return;
+
+	const { pendingPlanApproverSource, pendingPlanCompact } = await import(
+		"@server/services/narrator-session-state"
+	);
+	if (receipt.compactAfter) pendingPlanCompact.delete(narratorId);
+	if (pendingPlanApproverSource.get(narratorId) === "reflection") {
+		pendingPlanApproverSource.delete(narratorId);
 	}
 }
 
@@ -2260,16 +2303,27 @@ async function executeToolAfterReflections(
 			}
 		}
 
-		const executeAfterPreAdmission = (
+		const executeAfterPreAdmission = async (
 			executeOptions: Parameters<typeof executeTool>[2] = {},
 		): Promise<ToolExecResult> => {
 			admissionHandedToExecutor = true;
-			return executeTool(tu, config, {
-				...executeOptions,
-				admissionState,
-				preAdmissionComplete,
-				...(preFrozenExecution && { preFrozenTarget: preFrozenExecution.target }),
-			});
+			try {
+				const result = await executeTool(tu, config, {
+					...executeOptions,
+					admissionState,
+					preAdmissionComplete,
+					...(preFrozenExecution && { preFrozenTarget: preFrozenExecution.target }),
+				});
+				await finalizeExitPlanReflectionApproval(
+					config.narratorId,
+					tu.toolUseId,
+					result.isError === true,
+				);
+				return result;
+			} catch (err) {
+				await finalizeExitPlanReflectionApproval(config.narratorId, tu.toolUseId, true);
+				throw err;
+			}
 		};
 
 		// Decision-time reload: the permission-menu "计划反思" switch must apply to a
@@ -2298,33 +2352,16 @@ async function executeToolAfterReflections(
 			}
 
 			const shouldCompact = reflected.decision.action === "confirm_compact";
-			if (shouldCompact) {
-				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-				pendingPlanCompact.add(config.narratorId);
-			}
-
-			// Mark the plan-approval source so the `_planApprovedContinue` persistence
-			// branch attributes the injected "plan approved, begin execution" turn to
-			// the plan reflection (left bubble, "计划反思") instead of a generic
-			// auto-continuation system card or a human user.
-			const { pendingPlanApproverSource } = await import("@server/services/narrator-session-state");
-			pendingPlanApproverSource.set(config.narratorId, "reflection");
+			// Mark attribution before execution; executeAfterPreAdmission clears both markers
+			// if ExitPlanMode fails before the approved continuation can consume them.
+			await markExitPlanReflectionApproved(config.narratorId, tu.toolUseId, shouldCompact);
 
 			// Reflection confirmed — skip user approval and execute directly. Keep tu.input as the
 			// original model input so executeTool emits updatedInput and the event handler persists
 			// the resolved plan before onExitPlanMode reads it for optional plan compact.
-			const result = await executeAfterPreAdmission({
+			return executeAfterPreAdmission({
 				preGrantedPermission: { behavior: "allow", updatedInput: { ...reflected.input } },
 			});
-			if (result.isError) {
-				// The plan was never approved-and-continued, so both markers are stale. Left
-				// behind, `pendingPlanApproverSource` would attribute the NEXT approval in
-				// this same loop — possibly a real person's — to the reflection.
-				const { pendingPlanCompact } = await import("@server/services/narrator-session-state");
-				if (shouldCompact) pendingPlanCompact.delete(config.narratorId);
-				pendingPlanApproverSource.delete(config.narratorId);
-			}
-			return result;
 		}
 		if ((tu.name === "Write" || tu.name === "Edit") && shouldRunTaskReflection(config)) {
 			const candidateContent = await buildSpecTasksCandidateContent(config.narratorId, tu);
@@ -2410,19 +2447,70 @@ export async function* agentLoop(
 	const locale = (config.locale as Locale) ?? "en";
 
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
-	// This prevents concurrent permission prompts / danger reflection loops from racing each other.
+	// This prevents concurrent permission prompts / reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
 	let permissionTail: Promise<void> = Promise.resolve();
-	config.permissionHandler = async (toolName, input, toolUseId, options) => {
-		const run = permissionTail.then(async () => {
-			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
-			if (result.behavior !== "dangerReflection") return result;
-
+	const resolvePermissionResult = async (
+		toolName: string,
+		toolUseId: string,
+		options: Parameters<NonNullable<AgentConfig["permissionHandler"]>>[3],
+		result: PermissionResult,
+	): Promise<PermissionResult> => {
+		if (result.behavior === "dangerReflection") {
 			return resolveDangerReflectionDecision(config, history, result, {
 				toolUseId,
 				name: toolName,
 				input: result.input,
 			});
+		}
+		if (result.behavior !== "planReflection") return result;
+		if (toolName !== "ExitPlanMode") {
+			return {
+				behavior: "deny",
+				message: "Plan reflection can only resume an ExitPlanMode permission",
+				fatal: true,
+			};
+		}
+
+		const reflected = await resolveExitPlanModeReflection(
+			config,
+			history,
+			{
+				toolUseId,
+				name: toolName,
+				input: result.input,
+			},
+			result.requestId,
+		);
+		if (reflected.decision.action === "manual") {
+			// The synthetic reflection was stopped. Re-register the original permission
+			// without raising a second attention notification, then keep handling any
+			// later one-shot reflection click on the restored card.
+			const manualResult = await originalPermissionHandler(toolName, reflected.input, toolUseId, {
+				...options,
+				suppressAttention: true,
+			});
+			return resolvePermissionResult(toolName, toolUseId, options, manualResult);
+		}
+		if (
+			reflected.decision.action !== "confirm" &&
+			reflected.decision.action !== "confirm_compact"
+		) {
+			const denied = buildExitPlanReflectionDeniedToolResult(reflected.decision, locale);
+			return { behavior: "deny", message: denied.output, rawMessage: true };
+		}
+
+		await markExitPlanReflectionApproved(
+			config.narratorId,
+			toolUseId,
+			reflected.decision.action === "confirm_compact",
+		);
+		return { behavior: "allow", updatedInput: reflected.input };
+	};
+	config.permissionHandler = async (toolName, input, toolUseId, options) => {
+		const run = permissionTail.then(async () => {
+			const result = await originalPermissionHandler(toolName, input, toolUseId, options);
+			return resolvePermissionResult(toolName, toolUseId, options, result);
 		});
 		permissionTail = run.then(
 			() => undefined,

@@ -100,6 +100,7 @@ export interface PermissionCallbacks {
 	) => void;
 	onQuestionSubmit: (requestId: string, answers: Record<string, string>) => void;
 	onQuestionReflect: (requestId: string) => Promise<void> | void;
+	onPlanReflect: (requestId: string) => Promise<void> | void;
 	onQuestionDeny: (requestId: string) => void;
 	/** Release the blocked loop and move the question to the async inbox. */
 	onQuestionDefer?: (requestId: string) => Promise<void> | void;

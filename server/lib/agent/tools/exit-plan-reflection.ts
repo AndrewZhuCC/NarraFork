@@ -173,7 +173,10 @@ async function markExitPlanReflectionStatus(
 					permissionDecisionReason: message,
 					permissionSuggestions: planReflectionSuggestions(pending, status, message, compactAfter),
 					...(status !== "running" && status !== "awaiting_user"
-						? { permissionDecidedAt: new Date().toISOString() }
+						? {
+								permissionDecidedAt: new Date().toISOString(),
+								permissionDecidedBy: status === "aborted" ? "aborted" : "reflection",
+							}
 						: {}),
 					...(status === "cancelled" || status === "aborted" ? { errorMessage: message } : {}),
 				})

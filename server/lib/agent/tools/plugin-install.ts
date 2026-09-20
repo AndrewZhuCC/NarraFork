@@ -562,6 +562,9 @@ export function createPluginInstallTool(deps: PluginInstallToolDeps = {}): ToolD
 				if (decision.behavior === "dangerReflection") {
 					return errorResult("PluginInstall is waiting for danger reflection approval.");
 				}
+				if (decision.behavior === "planReflection") {
+					return errorResult("PluginInstall received an unresolved plan reflection permission.");
+				}
 				if (decision.behavior !== "allow") {
 					return errorResult(decision.message ?? "PluginInstall was denied by the user.");
 				}

@@ -607,6 +607,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[bumpPermissionGeneration],
 	);
 
+	/** Temporarily hide the original plan approval while its reflection gate owns the row. */
+	const hidePendingExitPlanForReflection = useCallback(
+		(toolUseId: string) => {
+			bumpPermissionGeneration();
+			setPendingPermsByRequestId((prev) => {
+				let next: Map<string, PendingPermission> | null = null;
+				for (const [requestId, permission] of prev) {
+					if (permission.toolUseId !== toolUseId || permission.toolName !== "ExitPlanMode")
+						continue;
+					next ??= new Map(prev);
+					next.delete(requestId);
+				}
+				return next ?? prev;
+			});
+		},
+		[bumpPermissionGeneration],
+	);
+
 	/**
 	 * Settle a decision that had to go over HTTP because the WebSocket was down.
 	 *
@@ -715,6 +733,24 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		[permissionDecisionsSupported, resolveAndRemovePerm, t, updatedPermissionInputSupported],
 	);
 
+	const handlePlanReflect = useCallback(
+		async (requestId: string) => {
+			if (!permissionDecisionsSupported) return;
+			try {
+				await api.reflectPlan(requestId);
+				qc.invalidateQueries({ queryKey: ["permissions", narratorId] });
+			} catch (error) {
+				notifications.show({
+					message: t("planReflectionStartFailed"),
+					color: "red",
+					autoClose: 3000,
+				});
+				throw error;
+			}
+		},
+		[narratorId, permissionDecisionsSupported, qc, t],
+	);
+
 	const handleQuestionDeny = useCallback(
 		(requestId: string) => {
 			if (!permissionDecisionsSupported) return;
@@ -765,6 +801,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 		onPermissionDecision: handlePermissionDecision,
 		onQuestionSubmit: handleQuestionSubmit,
 		onQuestionReflect: handleQuestionReflect,
+		onPlanReflect: handlePlanReflect,
 		onQuestionDeny: handleQuestionDeny,
 		onQuestionDefer: handleQuestionDefer,
 	};
@@ -775,6 +812,7 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 			onPermissionDecision: (...args) => permCbRef.current?.onPermissionDecision(...args),
 			onQuestionSubmit: (...args) => permCbRef.current?.onQuestionSubmit(...args),
 			onQuestionReflect: (...args) => permCbRef.current?.onQuestionReflect(...args),
+			onPlanReflect: (...args) => permCbRef.current?.onPlanReflect(...args),
 			onQuestionDeny: (...args) => permCbRef.current?.onQuestionDeny(...args),
 			onQuestionDefer: (...args) => permCbRef.current?.onQuestionDefer?.(...args),
 		}),
@@ -919,7 +957,9 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearReflectionProgress(requestId);
 				removePendingPermission(requestId);
 			},
-			onPlanReflectionStarted: () => {},
+			onPlanReflectionStarted: ({ toolUseId }) => {
+				hidePendingExitPlanForReflection(toolUseId);
+			},
 			onPlanReflectionStopped: ({
 				requestId,
 				toolUseId,

@@ -292,6 +292,7 @@ import {
 	disarmQuestionReflection,
 	getQuestionReflectionDeadline,
 	reflectPendingAskUserQuestion,
+	reflectPendingExitPlanMode,
 	resolveDecisionNarratorId,
 	stopDangerReflectionLoop,
 	takeOverQuestionReflection,
@@ -5490,6 +5491,18 @@ narratorRoutes.post("/permissions/:requestId/defer", async (c) => {
 			},
 			result.reason === "not_a_question" ? 400 : 404,
 		);
+	}
+	return c.json({ ok: true });
+});
+
+// Run ExitPlanMode reflection once without changing global/session settings or recording a user allow
+narratorRoutes.post("/permissions/:requestId/reflect-plan", async (c) => {
+	const requestId = c.req.param("requestId");
+	const result = await reflectPendingExitPlanMode(requestId);
+	if (!result.ok) {
+		const error = result.reason ?? "Plan reflection request not found";
+		if (result.reason === "Permission request not found") return c.json({ error }, 404);
+		return c.json({ error }, 400);
 	}
 	return c.json({ ok: true });
 });
