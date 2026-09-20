@@ -2193,7 +2193,6 @@ export interface ContinueSubagentInput {
 	 * `planResumedBackgroundTaskNotice`.
 	 */
 	skipConclusionDelivery?: boolean;
-	resumableUpdateLease?: boolean;
 	/** Remaining execution timeout passed by planned-update recovery. */
 	timeoutMs?: number;
 	/** Absolute execution deadline preserved by planned-update recovery. */
@@ -2366,7 +2365,7 @@ async function startContinuedSubagentUnlocked(
 
 	const updateLease = claimSubagentUpdateExecutionLease(
 		input.updateExecutionLease,
-		input.resumableUpdateLease ? "resumable" : "ordinary",
+		"resumable",
 		subagentId,
 	);
 	if (!updateLease) {

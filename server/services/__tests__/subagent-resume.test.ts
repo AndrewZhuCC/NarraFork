@@ -1093,7 +1093,6 @@ describe("resumeSubagent", () => {
 			skipStaleAttach: true,
 			preserveBackground: true,
 			skipConclusionDelivery: true,
-			resumableUpdateLease: true,
 		});
 
 		expect(result.terminalCompletion).toBeInstanceOf(Promise);
@@ -1102,7 +1101,6 @@ describe("resumeSubagent", () => {
 			allowRunningRestart: true,
 			skipStaleAttach: true,
 			preserveBackground: true,
-			resumableUpdateLease: true,
 		});
 		const abortController = startCalls[0]?.abortController;
 		expect(abortController).toBeInstanceOf(AbortController);

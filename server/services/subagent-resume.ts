@@ -100,8 +100,6 @@ export interface ResumeSubagentInput {
 	preserveBackground?: boolean;
 	/** Background recovery must not publish into the already-completed Agent tool call. */
 	skipConclusionDelivery?: boolean;
-	/** Keep a recovered Agent checkpointable by subsequent planned updates. */
-	resumableUpdateLease?: boolean;
 	/** Persisted logical run from the planned-update checkpoint, never an execution epoch. */
 	resumeLogicalRunId?: string;
 	/** Remaining execution timeout passed to the continued runner. */
@@ -145,6 +143,16 @@ const activeResumeRuns = new Map<string, ActiveResumeRun>();
 
 export function hasActiveSubagentResumeRun(subagentId: string): boolean {
 	return activeResumeRuns.has(subagentId);
+}
+
+export function listActiveSubagentResumeRuns(): Array<{
+	subagentId: string;
+	originToolUseId: string;
+}> {
+	return [...activeResumeRuns].map(([subagentId, run]) => ({
+		subagentId,
+		originToolUseId: run.originToolUseId,
+	}));
 }
 
 export function withSubagentResumeLock<T>(subagentId: string, fn: () => Promise<T>): Promise<T> {
@@ -686,7 +694,6 @@ async function resumeSubagentUnlocked(input: ResumeSubagentInput): Promise<Resum
 				// Forwarded so the resumed-task notice knows whether the tool result below
 				// will be rewritten (i.e. whether the parent already has the output).
 				skipConclusionDelivery: input.skipConclusionDelivery,
-				resumableUpdateLease: input.resumableUpdateLease,
 				resumeLogicalRunId: input.resumeLogicalRunId,
 				timeoutMs: input.timeoutMs,
 				executionDeadlineAt: input.executionDeadlineAt,

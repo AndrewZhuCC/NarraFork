@@ -440,9 +440,11 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 	const { BACKGROUND_TASK_TIMEOUT_MS, listRunningSubagentExecutions } = await import(
 		"./subagent-runner"
 	);
+	const { listActiveSubagentResumeRuns } = await import("./subagent-resume");
 	const runningAgents = listRunningSubagentExecutions();
 	const runningAgentByToolUseId = new Map(runningAgents.map((entry) => [entry.toolUseId, entry]));
 	const runningAgentBySubagentId = new Map(runningAgents.map((entry) => [entry.subagentId, entry]));
+	const checkpointedForegroundAgentIds = new Set<string>();
 	// Only rows owned by a narrator this process is still running may become continuations.
 	// See isLiveNarratorForCheckpoint: an unfiltered scan resurrects narrators whose turn
 	// ended long ago but left non-terminal tool rows behind.
@@ -544,6 +546,7 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 		if (toolCall.toolName === "Agent") {
 			const subagentId = subagentByOrigin.get(toolCall.toolUseId);
 			if (!subagentId) continue;
+			checkpointedForegroundAgentIds.add(subagentId);
 			const runtime =
 				runningAgentByToolUseId.get(toolCall.toolUseId) ?? runningAgentBySubagentId.get(subagentId);
 			const deadline = resolveAgentExecutionDeadline({
@@ -590,6 +593,58 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 				payloadJson: { targetId, awaitDeadlineAt: deadlineAt },
 			});
 		}
+	}
+
+	// A resumed runner may not yet be linked in the message-origin map. Recover it only
+	// through a live parent's unfinished Agent call; never resurrect a completed parent.
+	for (const activeResume of listActiveSubagentResumeRuns()) {
+		if (checkpointedForegroundAgentIds.has(activeResume.subagentId)) continue;
+		const runtime = runningAgentBySubagentId.get(activeResume.subagentId);
+		if (!runtime || runtime.background) continue;
+		const [originToolCall] = await db
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				status: narratorToolCalls.status,
+				inputJson: narratorToolCalls.inputJson,
+				executionStartedAt: narratorToolCalls.executionStartedAt,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, runtime.parentNarratorId),
+					eq(narratorToolCalls.toolUseId, activeResume.originToolUseId),
+					eq(narratorToolCalls.toolName, "Agent"),
+				),
+			)
+			.limit(1);
+		if (
+			!originToolCall ||
+			!["initializing", "pending", "running"].includes(originToolCall.status) ||
+			!isLiveNarratorForCheckpoint(snapshot, originToolCall.narratorId)
+		) {
+			throw new Error(
+				`Active resumed subagent ${activeResume.subagentId} has no live unfinished origin Agent call; retry the update after it finishes`,
+			);
+		}
+		const deadline = resolveAgentExecutionDeadline({
+			runtimeDeadlineAt: runtime.executionDeadlineAt,
+			runtimeTimeoutMs: runtime.timeoutMs,
+			toolInput: originToolCall.inputJson as Record<string, unknown> | null,
+			startedAt: runtime.startedAt ?? originToolCall.executionStartedAt ?? originToolCall.createdAt,
+		});
+		await toolContinuationService.upsert({
+			toolCallId: originToolCall.id,
+			narratorId: originToolCall.narratorId,
+			updateEpoch: snapshot.updateEpoch,
+			kind: "foreground_agent",
+			payloadJson: {
+				subagentId: activeResume.subagentId,
+				logicalRunId: runtime.logicalRunId ?? readAgentLogicalRunId(activeResume.subagentId),
+				...deadline,
+			},
+		});
 	}
 
 	const runningBackgroundAgents = await db
@@ -965,7 +1020,6 @@ async function restoreAgent(
 		skipStaleAttach: true,
 		preserveBackground: background,
 		skipConclusionDelivery: background,
-		resumableUpdateLease: true,
 		resumeLogicalRunId,
 		timeoutMs: remainingExecutionTimeoutMs,
 		executionDeadlineAt,
