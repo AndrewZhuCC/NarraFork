@@ -2336,6 +2336,9 @@ async function executeToolAfterReflections(
 						executionTarget: preFrozenExecution.target,
 					}
 				: config;
+			// Freezing the execution target clones config; WeakMap entries do not spread.
+			const parentTools = requestToolSnapshots.get(config);
+			if (parentTools) requestToolSnapshots.set(reflectionConfig, parentTools);
 			const reflected = await resolveExitPlanModeReflection(reflectionConfig, history, tu);
 			if (reflected.decision.action === "manual") {
 				tu.input = reflected.input;
