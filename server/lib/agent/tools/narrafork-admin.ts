@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import { type NarraForkSettings, SETTING_DOCS } from "../../../lib/settings/index";
 import type { ToolDefinition, ToolResult } from "../types";
+import { isAdminUser, requestWritePermission } from "./admin-common";
 
 /**
  * NarraForkAdmin — optional tool for reading and writing NarraFork settings.
@@ -14,6 +15,10 @@ import type { ToolDefinition, ToolResult } from "../types";
 // Lazy imports to avoid circular/dead-load issues
 async function getSettingsModule() {
 	return import("../../../lib/settings/index");
+}
+
+async function getUpdateService() {
+	return import("../../../services/update-service");
 }
 
 // ---------------------------------------------------------------------------
@@ -142,14 +147,26 @@ function annotateSettings(
 export const narraforkAdminTool: ToolDefinition = {
 	name: "NarraForkAdmin",
 	description:
-		"Manage NarraFork server settings (admin only). " +
+		"Manage NarraFork server settings and safely schedule prepared local updates (admin only). " +
 		"Actions: get_settings (all settings with docs), " +
 		"get_setting (single key by dot-path), " +
 		"update_settings (partial merge, requires approval), " +
-		"reset_setting (revert to default, requires approval).",
+		"reset_setting (revert to default, requires approval), " +
+		"get_update_status (read-only), apply_update and cancel_update (require approval). " +
+		"Update actions only delegate to the existing update service: apply waits for background Bash, " +
+		"ordinary tool safety points, and the recovery checkpoint, may interrupt this connection, must not " +
+		"be retried in a loop, and creates no launchd jobs. No JWT, browser token, or password is needed.",
 	parameters: z.object({
 		action: z
-			.enum(["get_settings", "get_setting", "update_settings", "reset_setting"])
+			.enum([
+				"get_settings",
+				"get_setting",
+				"update_settings",
+				"reset_setting",
+				"get_update_status",
+				"apply_update",
+				"cancel_update",
+			])
 			.describe("The action to perform"),
 		path: z
 			.string()
@@ -165,13 +182,75 @@ export const narraforkAdminTool: ToolDefinition = {
 				"Settings object to merge (for 'update_settings'). " +
 					"Supports partial updates via deep merge. Example: { agent: { maxTurns: 300 } }",
 			),
+		targetVersion: z
+			.string()
+			.trim()
+			.min(1)
+			.optional()
+			.describe("Optional prepared version selector for get_update_status and apply_update."),
 	}),
 	async execute(args, ctx): Promise<ToolResult> {
-		const { action, path, value } = args as {
-			action: "get_settings" | "get_setting" | "update_settings" | "reset_setting";
+		const { action, path, value, targetVersion } = args as {
+			action:
+				| "get_settings"
+				| "get_setting"
+				| "update_settings"
+				| "reset_setting"
+				| "get_update_status"
+				| "apply_update"
+				| "cancel_update";
 			path?: string;
 			value?: Record<string, unknown>;
+			targetVersion?: string;
 		};
+
+		if (action === "get_update_status" || action === "apply_update" || action === "cancel_update") {
+			const contextRole = (ctx as typeof ctx & { userRole?: string }).userRole;
+			if ((contextRole && contextRole !== "admin") || !(await isAdminUser(ctx.userId))) {
+				return {
+					output: "NarraForkAdmin update actions are restricted to administrators.",
+					isError: true,
+				};
+			}
+
+			if (action !== "get_update_status") {
+				const permissionError = await requestWritePermission(ctx, "NarraForkAdmin", {
+					action,
+					...(targetVersion ? { targetVersion } : {}),
+				});
+				if (permissionError) return { output: permissionError, isError: true };
+			}
+
+			try {
+				const updateService = await getUpdateService();
+				if (action === "get_update_status") {
+					const status = await updateService.getUpdateStatus(targetVersion);
+					return {
+						output: JSON.stringify(status, null, 2),
+						title: "Update status",
+					};
+				}
+				if (action === "apply_update") {
+					const result = await updateService.applyUpdate({ targetVersion });
+					return {
+						output: JSON.stringify(result, null, 2),
+						title: result.success ? "Update scheduled" : "Update scheduling failed",
+						isError: !result.success,
+					};
+				}
+				const result = updateService.cancelPreparedUpdate("Cancelled by NarraForkAdmin");
+				return {
+					output: JSON.stringify(result, null, 2),
+					title: result.cancelled ? "Update cancelled" : "No update cancelled",
+				};
+			} catch (error) {
+				return {
+					output: `Update action failed: ${error instanceof Error ? error.message : String(error)}`,
+					isError: true,
+					title: "Update action failed",
+				};
+			}
+		}
 
 		const settingsMod = await getSettingsModule();
 

@@ -29,9 +29,12 @@ import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
 	canOperatorShutdown,
+	handleGracefullyShutdownRequest,
 	scheduleOperatorShutdown,
 } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { removeStableUpdateHandoff, writeStableUpdateHandoff } from "../lib/stable-update-handoff";
+import { type StablePathInstall, verifyStablePathInstall } from "../lib/stable-update-install";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatchToFile, type ZstdPatchMeta } from "../lib/zstd-patch";
@@ -221,6 +224,8 @@ interface PlacedUpdateInfo {
 	placedAt: string;
 	sha512: string;
 	sizeBytes: number;
+	/** Opt-in written only by the fixed-signature local installer. */
+	stablePathInstall?: StablePathInstall;
 }
 
 /**
@@ -1121,13 +1126,12 @@ async function computeFileSha512(filePath: string): Promise<string> {
 }
 
 interface VerifiedFileFingerprint {
-	sizeBytes: number;
-	mtimeMs: number;
+	fingerprint: string;
 	sha512: string;
 }
 
 /**
- * Remembers which (path, size, mtime) fingerprint already hashed to which digest.
+ * Remembers which (path, device, inode, size, mtime, ctime) fingerprint hashed to which digest.
  *
  * `/api/update/status` is polled roughly once a second while an update is draining, and the
  * prepared binary is around 100MB. Hashing it on every poll would be a ~100MB read plus a full
@@ -1138,8 +1142,7 @@ interface VerifiedFileFingerprint {
 const verifiedFileDigests = new Map<string, VerifiedFileFingerprint>();
 
 interface InFlightFileDigest {
-	sizeBytes: number;
-	mtimeMs: number;
+	fingerprint: string;
 	promise: Promise<string>;
 }
 
@@ -1167,21 +1170,23 @@ export function __getVerifiedDigestComputationCount(): number {
 /** @internal Exported so tests can start from a known cache state. */
 export function __resetVerifiedDigestCacheForTests(): void {
 	verifiedFileDigests.clear();
+	inFlightFileDigests.clear();
 	verifiedFileDigestComputations = 0;
 }
 
 async function verifyFileSha512Cached(
 	filePath: string,
-	stat: { size: number; mtimeMs: number },
+	stat: { size: number; mtimeMs: number; ctimeMs: number; dev: number; ino: number },
 	expectedSha512: string,
 ): Promise<boolean> {
+	const fingerprint = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
 	const cached = verifiedFileDigests.get(filePath);
-	if (cached && cached.sizeBytes === stat.size && cached.mtimeMs === stat.mtimeMs) {
+	if (cached?.fingerprint === fingerprint) {
 		return cached.sha512 === expectedSha512;
 	}
 
 	const pending = inFlightFileDigests.get(filePath);
-	if (pending && pending.sizeBytes === stat.size && pending.mtimeMs === stat.mtimeMs) {
+	if (pending?.fingerprint === fingerprint) {
 		return (await pending.promise) === expectedSha512;
 	}
 
@@ -1191,8 +1196,7 @@ async function verifyFileSha512Cached(
 	const promise = computeFileSha512(filePath)
 		.then((sha512) => {
 			verifiedFileDigests.set(filePath, {
-				sizeBytes: stat.size,
-				mtimeMs: stat.mtimeMs,
+				fingerprint,
 				sha512,
 			});
 			return sha512;
@@ -1203,8 +1207,7 @@ async function verifyFileSha512Cached(
 			}
 		});
 	inFlightFileDigests.set(filePath, {
-		sizeBytes: stat.size,
-		mtimeMs: stat.mtimeMs,
+		fingerprint,
 		promise,
 	});
 
@@ -1221,6 +1224,7 @@ async function readPlacedUpdateInfo(
 ): Promise<PlacedUpdateInfo | null> {
 	if (!existsSync(PLACED_UPDATE_INFO_PATH)) return null;
 	try {
+		if (statSync(PLACED_UPDATE_INFO_PATH).size > 64 * 1024) return null;
 		const info = JSON.parse(readFileSync(PLACED_UPDATE_INFO_PATH, "utf8")) as PlacedUpdateInfo;
 		if (options.targetVersion && info.version !== options.targetVersion) return null;
 		if (info.fromVersion !== APP_VERSION) return null;
@@ -1237,7 +1241,16 @@ async function readPlacedUpdateInfo(
 		if (!allowedDirectories.some((dir) => isPathInsideDirectory(resolvedCandidatePath, dir))) {
 			return null;
 		}
-		if (execPath && isSamePath(resolvedCandidatePath, execPath)) return null;
+		if (execPath && isSamePath(resolvedCandidatePath, execPath)) {
+			if (
+				!info.stablePathInstall ||
+				!(await verifyStablePathInstall(resolvedCandidatePath, info.stablePathInstall))
+			)
+				return null;
+		} else if (info.stablePathInstall) {
+			// A fixed-path handoff must never redirect execution to another pathname.
+			return null;
+		}
 		if (!existsSync(resolvedCandidatePath)) return null;
 
 		const stat = statSync(resolvedCandidatePath);
@@ -1452,6 +1465,7 @@ export async function applyUpdate(options: { targetVersion?: string } = {}): Pro
 		newExecPath,
 		targetVersion: placedInfo.version,
 		updateEpoch,
+		preparedUpdate: placedInfo,
 	}).catch((error) => {
 		const cancelled = error instanceof UpdateCancelledError;
 		runFailedUpdateCleanup({
@@ -1829,12 +1843,27 @@ async function drainAndSpawnPreparedUpdate(options: {
 	newExecPath: string;
 	targetVersion: string;
 	updateEpoch: string;
+	preparedUpdate: PlacedUpdateInfo;
 }): Promise<void> {
 	await waitForBackgroundBashDrain();
 	assertUpdateNotCancelled();
 	beginQuiescingTools();
 	await waitForOrdinaryToolDrain();
 	const recoverySnapshot = await checkpointPreparedUpdateFence(options.updateEpoch);
+	// Draining may take hours. Never restart into a package replaced since the admin's request.
+	const prepared = await readPlacedUpdateInfo({ targetVersion: options.targetVersion });
+	if (
+		!prepared ||
+		prepared.sha512 !== options.preparedUpdate.sha512 ||
+		prepared.sizeBytes !== options.preparedUpdate.sizeBytes ||
+		(prepared.newBinaryPath ?? prepared.updatePath) !== options.newExecPath ||
+		JSON.stringify(prepared.stablePathInstall) !==
+			JSON.stringify(options.preparedUpdate.stablePathInstall)
+	) {
+		throw new Error(
+			"Prepared update changed while waiting for tools; schedule it again explicitly",
+		);
+	}
 	// Last cancellation checkpoint before the two irreversible steps: writing the recovery
 	// manifest and spawning the replacement process.
 	assertUpdateNotCancelled();
@@ -1856,6 +1885,35 @@ async function drainAndSpawnPreparedUpdate(options: {
 		expectedEpoch: options.updateEpoch,
 		handoffMarkerNonce: session.markerNonce,
 	});
+
+	if (prepared.stablePathInstall) {
+		try {
+			await writeStableUpdateHandoff({
+				markerNonce: session.markerNonce,
+				markerPath: session.markerPath,
+				updateEpoch: options.updateEpoch,
+				targetSha512: prepared.sha512,
+				targetVersion: prepared.version,
+				targetCommit: prepared.stablePathInstall.toCommit,
+				sourcePid: process.pid,
+				sourceCommit: prepared.stablePathInstall.fromCommit,
+			});
+			logger.info("Prepared stable-path update handed to existing launchd service", {
+				updateEpoch: options.updateEpoch,
+				targetCommit: prepared.stablePathInstall.toCommit,
+			});
+			// Do not spawn a competing replacement: KeepAlive will exec the fixed path once.
+			const shutdown = await handleGracefullyShutdownRequest({
+				token: session.token,
+				version: prepared.version,
+			});
+			if (!shutdown.ok) throw new Error(shutdown.body.error);
+		} catch (error) {
+			removeStableUpdateHandoff(session.markerNonce);
+			throw error;
+		}
+		return;
+	}
 
 	try {
 		// The ambient proxy variables are blanked in THIS process (see

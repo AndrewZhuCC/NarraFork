@@ -13,6 +13,7 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createConnection, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 import { logger } from "./logger";
+import { consumeStableUpdateHandoff } from "./stable-update-handoff";
 import { APP_VERSION } from "./version";
 
 export const HANDOFF_URL_ENV = "NARRAFORK_GRACEFUL_RESTART_URL";
@@ -289,7 +290,11 @@ export async function waitForPreviousServerShutdown(): Promise<boolean> {
 	const token = process.env[HANDOFF_TOKEN_ENV];
 	const markerPath = process.env[HANDOFF_MARKER_PATH_ENV];
 	const markerNonce = process.env[HANDOFF_MARKER_NONCE_ENV];
-	if (!handoffUrl || !token) return true;
+	if (!handoffUrl || !token) {
+		const stableHandoff = await consumeStableUpdateHandoff();
+		if (stableHandoff) observedRestartHandoff = stableHandoff;
+		return true;
+	}
 
 	// Latch the handoff identity now: the `finally` block below deletes these variables, and
 	// planned-update recovery (which runs much later, inside ./main) must still be able to prove

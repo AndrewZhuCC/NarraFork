@@ -1,5 +1,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import {
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { registerOperatorShutdownHandler } from "../../lib/server-restart";
 import { toolContinuationService } from "../tool-continuation-service";
@@ -496,6 +504,23 @@ describe("prepared update status hashing", () => {
 
 		expect((await getUpdateStatus("7.1.0")).ready).toBe(false);
 		expect(__getVerifiedDigestComputationCount()).toBe(baseline + 1);
+	});
+
+	test("atomic replacement with identical size and mtime invalidates the digest cache", async () => {
+		const path = join(updateDir, "narrafork-7.6.0");
+		writePlacedUpdate("7.6.0", Buffer.alloc(1024, 1));
+		const timestamp = new Date("2026-01-01T00:00:00Z");
+		utimesSync(path, timestamp, timestamp);
+		expect((await getUpdateStatus("7.6.0")).ready).toBe(true);
+		const before = statSync(path);
+		const replacement = `${path}.replacement`;
+		writeFileSync(replacement, Buffer.alloc(1024, 2));
+		utimesSync(replacement, timestamp, timestamp);
+		renameSync(replacement, path);
+		expect(statSync(path).mtimeMs).toBe(before.mtimeMs);
+		expect(statSync(path).ino).not.toBe(before.ino);
+		expect((await getUpdateStatus("7.6.0")).ready).toBe(false);
+		expect(__getVerifiedDigestComputationCount()).toBe(2);
 	});
 
 	test("a digest mismatch keeps reporting not-ready on later polls", async () => {
