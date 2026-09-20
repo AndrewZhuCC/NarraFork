@@ -598,22 +598,28 @@ export class PretextLayoutCoordinator {
 		if (this.pendingAskRefresh) return this.pendingAskRefresh;
 		const input = this.input;
 		const narratorId = this.narratorId;
-		const generation = this.generation;
 		const askMutationEpoch = this.askMutationEpoch;
 		if (!input || !narratorId || !this.lastBuildOptions) return Promise.resolve(false);
 		const run = async () => {
 			try {
 				const next = await refreshPretextDocumentWindow(narratorId, input, this.loadOptions);
+				// Streaming/layout updates change generation without changing the persisted
+				// window. Reject stale data, not a still-valid read during live output.
 				if (
 					!next ||
 					askMutationEpoch !== this.askMutationEpoch ||
-					generation !== this.generation ||
+					input !== this.input ||
+					narratorId !== this.narratorId ||
 					!this.current.index ||
 					!this.lastBuildOptions
 				)
 					return false;
 				await this.prepareKatex(next);
-				if (generation !== this.generation || askMutationEpoch !== this.askMutationEpoch)
+				if (
+					input !== this.input ||
+					narratorId !== this.narratorId ||
+					askMutationEpoch !== this.askMutationEpoch
+				)
 					return false;
 				const view = getView();
 				const anchor = captureCoordinatorAnchor(this.current.index, view);
@@ -936,6 +942,9 @@ export class PretextLayoutCoordinator {
 
 	cancel(): void {
 		this.generation++;
+		// Retire any in-flight ask refresh too: `refreshAskInPassing` no longer keys on
+		// the layout generation, so without this an abandoned read could commit.
+		this.askMutationEpoch++;
 		// Abandon any in-flight tail load so a later same-narrator load() does not
 		// coalesce onto a superseded fetch.
 		this.pendingLoad = null;
@@ -962,6 +971,9 @@ export class PretextLayoutCoordinator {
 	reset(): void {
 		this.publishDocumentSnapshot();
 		this.generation++;
+		// Same reason as `cancel`: a refresh that started before the switch must not
+		// commit, even when the returning document reuses the identical cached input.
+		this.askMutationEpoch++;
 		this.pendingLoad = null;
 		this.input = undefined;
 		this.narratorId = undefined;
