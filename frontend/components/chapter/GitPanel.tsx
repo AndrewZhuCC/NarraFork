@@ -1,14 +1,9 @@
-import { ActionIcon, Alert, Box, Button, Group, Loader, Stack, Text } from "@mantine/core";
+import { ActionIcon, Alert, Box, Button, Group, Loader, Select, Stack, Text } from "@mantine/core";
 import { IconArrowLeft, IconRefresh } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import {
-	type GitTarget,
-	gitWorkspaceTarget,
-	invalidateWorkspaceQueries,
-	useGitWorkspace,
-} from "../../hooks/useGit";
+import { type GitTarget, invalidateWorkspaceQueries, useGitWorkspace } from "../../hooks/useGit";
 import { gitTargetKey } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 import { GitChangesTab } from "./GitChangesTab";
@@ -35,12 +30,38 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 	const qc = useQueryClient();
 	const workspaceQuery = useGitWorkspace(narratorId);
 	const workspace = workspaceQuery.data;
-	const target = !workspaceQuery.isError ? gitWorkspaceTarget(narratorId, workspace) : null;
+	const target = workspaceQuery.target;
+	const repositories = workspace?.capabilities.read ? (workspace.repositories ?? []) : [];
+	const errorStatus = (workspaceQuery.error as { status?: number } | null)?.status;
+	const errorDetail =
+		errorStatus === 401 || errorStatus === 403 || workspace?.capabilities.read === false
+			? undefined
+			: workspaceQuery.error?.message || workspace?.reason;
 
 	if (workspaceQuery.isPending) return <Loader size="sm" />;
 
 	return (
 		<Stack gap={4} style={{ height: "100%", minHeight: 0 }}>
+			{repositories.length > 1 && (
+				<Select
+					mx="xs"
+					mt="xs"
+					size="xs"
+					aria-label={t("workspace.repositorySelect")}
+					data={repositories.map((repository) => ({
+						value: repository.workspaceKey,
+						label: repository.relativePath || ".",
+					}))}
+					value={workspace?.workspaceKey}
+					allowDeselect={false}
+					onChange={(workspaceKey) => workspaceQuery.selectWorkspace(workspaceKey)}
+				/>
+			)}
+			{workspace?.capabilities.read && workspace.discoveryTruncated && (
+				<Alert color="yellow" mx="xs" mt={repositories.length > 1 ? 0 : "xs"} py={4}>
+					<Text size="xs">{t("workspace.discoveryTruncated")}</Text>
+				</Alert>
+			)}
 			{!target ? (
 				<Stack gap={4} p="xs">
 					<Group justify="flex-end">
@@ -60,7 +81,7 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 							`workspace.${workspaceQuery.isError ? "error" : (workspace?.state ?? "error")}`,
 						)}
 					>
-						{workspaceQuery.error?.message || workspace?.reason}
+						{errorDetail}
 					</Alert>
 				</Stack>
 			) : (

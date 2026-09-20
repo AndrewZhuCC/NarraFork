@@ -15,6 +15,7 @@
 import { Center, Text } from "@mantine/core";
 import { useCallback, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
+import { useGitWorkspace } from "../../../hooks/useGit";
 import { useFileTreeStatus, useNarrator } from "../../../hooks/useNarrator";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
 import { FileTreeContent } from "./FileTreeContent";
@@ -34,18 +35,27 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 	const { data: narrator } = useNarrator(narratorId);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator entity
 	const root = ((narrator as any)?.cwd as string | undefined)?.trim() ?? "";
+	const workspaceQuery = useGitWorkspace(narratorId);
+	const workspace = workspaceQuery.data;
+	// This tree displays the local narrator cwd, never a remote device's paths.
+	const canReadStatus =
+		!workspaceQuery.isError &&
+		workspace?.deviceId === "local" &&
+		workspace.capabilities.read &&
+		!!workspace.workspaceKey;
 	const { data: fileTreeStatus, refetch: refetchFileTreeStatus } = useFileTreeStatus(
 		narratorId,
-		!!root,
+		!!root && !!canReadStatus,
 		root,
+		canReadStatus ? (workspace?.workspaceKey ?? undefined) : undefined,
 	);
 	const lineStats = useMemo(
-		() => buildTreeLineStats(fileTreeStatus?.files ?? []),
-		[fileTreeStatus?.files],
+		() => buildTreeLineStats(canReadStatus ? (fileTreeStatus?.files ?? []) : []),
+		[canReadStatus, fileTreeStatus?.files],
 	);
 	const refreshLineStats = useCallback(() => {
-		void refetchFileTreeStatus();
-	}, [refetchFileTreeStatus]);
+		if (canReadStatus) void refetchFileTreeStatus();
+	}, [canReadStatus, refetchFileTreeStatus]);
 
 	// The tree publishes its patch entry point here; held in a ref because the WS
 	// callback must not re-subscribe every time the tree re-renders.
@@ -89,7 +99,7 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 			root={root}
 			showHidden={showHidden}
 			lineStats={lineStats}
-			lineStatsTruncated={fileTreeStatus?.truncated === true}
+			lineStatsTruncated={!!canReadStatus && fileTreeStatus?.truncated === true}
 			onRefreshLineStats={refreshLineStats}
 			onOpenFile={onOpenFile}
 			registerIngest={registerIngest}

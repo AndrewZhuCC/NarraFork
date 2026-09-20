@@ -29,6 +29,10 @@ import { hasProjectAccess, loadProjectForAccess } from "./project-acl";
 const denied = () =>
 	new AppError("Git workspace access denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
 
+function isAccessScanUnavailable(error: unknown): boolean {
+	return error instanceof AppError && error.code === "GIT_WORKSPACE_ACCESS_CHECK_UNAVAILABLE";
+}
+
 function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	const { workspace } = target;
 	workspace.state = "access_denied";
@@ -184,24 +188,90 @@ async function relatedProjects(target: GitWorkspaceTarget, scan: GitAccessScan) 
 	return [...matches.values()];
 }
 
+function selectGitTarget(target: GitWorkspaceTarget, selected: GitWorkspaceTarget): void {
+	const cwd = target.workspace.cwd;
+	target.workspace = {
+		...selected.workspace,
+		cwd,
+		repositories: target.workspace.repositories,
+		discoveryTruncated: target.workspace.discoveryTruncated,
+	};
+	target.repositoryPath = selected.repositoryPath;
+}
+
+async function authorizeResolvedGitCandidate(
+	target: GitWorkspaceTarget,
+	need: "read" | "write",
+	principal: ReturnType<typeof narratorPrincipalOf>,
+	scan: GitAccessScan,
+	canWriteBase: boolean,
+	narratorExecution: {
+		context: ExecutionTargetContext | null;
+		policy: Awaited<ReturnType<typeof executionPolicyEngine.compile>> | null;
+	},
+	policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>>,
+): Promise<boolean> {
+	const { workspace, backend } = target;
+	if (workspace.state !== "ready" || !backend || !workspace.rootPath) return false;
+	let canWrite = canWriteBase;
+	try {
+		for (const project of await relatedProjects(target, scan)) {
+			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
+			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
+		}
+		await scan.run(() => requireSafeLocalGitPath(target, workspace.rootPath as string));
+		if (narratorExecution.context || narratorExecution.policy) {
+			const context = narratorExecution.context;
+			const compiled = narratorExecution.policy;
+			if (!context || !compiled) throw denied();
+			if (!gitPathPolicyAllows(compiled, context, workspace.rootPath, "read")) throw denied();
+			canWrite &&= gitPathPolicyAllows(compiled, context, workspace.rootPath, "write");
+			if (target.repositoryPath) {
+				if (!gitPathPolicyAllows(compiled, context, target.repositoryPath, "read")) throw denied();
+				canWrite &&= gitPathPolicyAllows(compiled, context, target.repositoryPath, "write");
+			}
+			if (policy && policy.permissionMode !== "bypassPermissions") {
+				if (
+					compiled.evaluatePath({ path: workspace.rootPath, operation: "read" }).decision !==
+						"allow" &&
+					!backend.paths.contains(context.target.cwd, workspace.rootPath)
+				)
+					throw denied();
+				canWrite &&=
+					compiled.evaluatePath({ path: workspace.rootPath, operation: "write" }).decision ===
+					"allow";
+			}
+		}
+		if (need === "write" && !canWrite) throw denied();
+		scan.check();
+		workspace.capabilities = { read: true, write: canWrite };
+		return true;
+	} catch (error) {
+		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
+		return false;
+	}
+}
+
 export async function authorizeGitTarget(
 	c: Context,
 	source: { narratorId: string } | { chapterId: string },
 	need: "read" | "write",
+	requestedWorkspaceKey?: string,
 ): Promise<GitWorkspaceTarget> {
 	const principal = narratorPrincipalOf(c);
 	const signal = c.req.raw.signal;
-	let canWrite = true;
+	let canWriteBase = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
 	let deviceClass: ExecutionDeviceClass | null = null;
 	const narratorExecution: {
 		context: ExecutionTargetContext | null;
 		policy: Awaited<ReturnType<typeof executionPolicyEngine.compile>> | null;
 	} = { context: null, policy: null };
+	let discoveryAccessScan: GitAccessScan | undefined;
 	let target: GitWorkspaceTarget;
 	if ("narratorId" in source) {
 		const narrator = await requireNarratorAccess(c, source.narratorId, need);
-		canWrite = await canWriteNarrator(narrator, principal);
+		canWriteBase = await canWriteNarrator(narrator, principal);
 		policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId);
 		target = await resolveNarratorGitTarget(
 			source.narratorId,
@@ -209,7 +279,7 @@ export async function authorizeGitTarget(
 			async (initial) => {
 				if (initial.contextProjectId) {
 					const project = await loadProjectForAccess(initial.contextProjectId, principal, need);
-					canWrite &&= await hasProjectAccess(project, principal, "write");
+					canWriteBase &&= await hasProjectAccess(project, principal, "write");
 				}
 				const id = initial.workspace.deviceId;
 				if (id !== "local") {
@@ -242,8 +312,8 @@ export async function authorizeGitTarget(
 								: "global";
 					const level = policy.policy.deviceAccess[deviceClass];
 					if (level === "denied" || !policy.allowedTools.has("Read")) throw denied();
-					canWrite &&= level === "readWrite" && policy.allowedTools.has("Bash");
-					if (need === "write" && !canWrite) throw denied();
+					canWriteBase &&= level === "readWrite" && policy.allowedTools.has("Bash");
+					if (need === "write" && !canWriteBase) throw denied();
 				}
 			},
 			async (initial) => {
@@ -279,63 +349,132 @@ export async function authorizeGitTarget(
 					)
 				)
 					throw denied();
-				canWrite &&= gitPathPolicyAllows(
+				canWriteBase &&= gitPathPolicyAllows(
 					narratorExecution.policy,
 					narratorExecution.context,
 					workspace.cwd,
 					"write",
 				);
-				if (need === "write" && !canWrite) throw denied();
+				if (need === "write" && !canWriteBase) throw denied();
+			},
+			async (candidate) => {
+				try {
+					if (!candidate.backend || !narratorExecution.context || !narratorExecution.policy)
+						return false;
+					await requireSafeLocalGitPath(candidate, candidate.workspace.cwd);
+					return gitPathPolicyAllows(
+						narratorExecution.policy,
+						narratorExecution.context,
+						candidate.workspace.cwd,
+						"read",
+					);
+				} catch (error) {
+					if (error instanceof AppError && error.statusCode === 403) return false;
+					throw error;
+				}
+			},
+			async (candidate, deadline) => {
+				if (performance.now() >= deadline) return "budget_exhausted";
+				discoveryAccessScan ??= new GitAccessScan(
+					signal,
+					Math.max(1, deadline - performance.now()),
+				);
+				try {
+					return (await authorizeResolvedGitCandidate(
+						candidate,
+						need,
+						principal,
+						discoveryAccessScan,
+						canWriteBase,
+						narratorExecution,
+						policy,
+					))
+						? "authorized"
+						: "denied";
+				} catch (error) {
+					if (isAccessScanUnavailable(error)) return "budget_exhausted";
+					throw error;
+				}
 			},
 		);
 	} else {
 		await requireChapterAccess(c, source.chapterId, need);
 		target = await resolveChapterGitTarget(source.chapterId, signal);
 		if (target.contextProjectId)
-			canWrite = await hasProjectAccess(
+			canWriteBase = await hasProjectAccess(
 				await loadProjectForAccess(target.contextProjectId, principal, "read"),
 				principal,
 				"write",
 			);
 	}
-	const { workspace, backend } = target;
-	if (workspace.state !== "ready" || !backend || !workspace.rootPath) {
-		if (workspace.state === "access_denied") redactDeniedTarget(target);
-		return target;
-	}
-	const root = workspace.rootPath;
-	const scan = new GitAccessScan(signal);
+
+	const authorizationBudgetMs = target.discoveryDeadline
+		? Math.max(1, target.discoveryDeadline - performance.now())
+		: 5000;
+	const scan = discoveryAccessScan ?? new GitAccessScan(signal, authorizationBudgetMs);
 	try {
-		for (const project of await relatedProjects(target, scan)) {
-			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
-			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
+		if (target.workspace.state === "ready") {
+			if (
+				!(await authorizeResolvedGitCandidate(
+					target,
+					need,
+					principal,
+					scan,
+					canWriteBase,
+					narratorExecution,
+					policy,
+				))
+			)
+				redactDeniedTarget(target);
+			return target;
 		}
-		await scan.run(() => requireSafeLocalGitPath(target, root));
-		if ("narratorId" in source) {
-			const context = narratorExecution.context;
-			const compiled = narratorExecution.policy;
-			if (!context || !compiled) throw denied();
-			if (!gitPathPolicyAllows(compiled, context, root, "read")) throw denied();
-			canWrite &&= gitPathPolicyAllows(compiled, context, root, "write");
-			if (target.repositoryPath) {
-				if (!gitPathPolicyAllows(compiled, context, target.repositoryPath, "read")) throw denied();
-				canWrite &&= gitPathPolicyAllows(compiled, context, target.repositoryPath, "write");
-			}
-			if (policy && policy.permissionMode !== "bypassPermissions") {
-				if (
-					compiled.evaluatePath({ path: root, operation: "read" }).decision !== "allow" &&
-					!backend.paths.contains(workspace.cwd, root)
-				)
-					throw denied();
-				canWrite &&= compiled.evaluatePath({ path: root, operation: "write" }).decision === "allow";
-			}
+		if (target.workspace.state === "access_denied") {
+			redactDeniedTarget(target);
+			return target;
 		}
-		if (need === "write" && !canWrite) throw denied();
-		scan.check();
-		workspace.capabilities = { read: true, write: canWrite };
-	} catch (error) {
-		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;
-		redactDeniedTarget(target);
+
+		const readable: GitWorkspaceTarget[] = target.discoveredRepositoriesAuthorized
+			? [...(target.discoveredRepositories ?? [])]
+			: [];
+		if (!target.discoveredRepositoriesAuthorized)
+			for (const candidate of target.discoveredRepositories ?? []) {
+				try {
+					if (
+						await authorizeResolvedGitCandidate(
+							candidate,
+							need,
+							principal,
+							scan,
+							canWriteBase,
+							narratorExecution,
+							policy,
+						)
+					)
+						readable.push(candidate);
+				} catch (error) {
+					if (!isAccessScanUnavailable(error)) throw error;
+					target.discoveryTruncated = true;
+					break;
+				}
+			}
+		target.workspace.repositories = readable.map(({ workspace }) => ({
+			workspaceKey: workspace.workspaceKey as string,
+			rootPath: workspace.rootPath as string,
+			relativePath:
+				target.backend?.paths.relative(
+					target.discoveryBasePath ?? target.workspace.cwd,
+					workspace.rootPath as string,
+				) ?? "",
+		}));
+		target.workspace.discoveryTruncated = target.discoveryTruncated === true;
+		const selected = requestedWorkspaceKey
+			? readable.find(({ workspace }) => workspace.workspaceKey === requestedWorkspaceKey)
+			: readable[0];
+		if (selected) selectGitTarget(target, selected);
+		else if (target.discoveryTruncated)
+			target.workspace.reason =
+				"Directory is not a Git working tree; repository discovery was truncated";
+		return target;
 	} finally {
 		scan.dispose();
 		const elapsedMs = Math.round(performance.now() - scan.started);

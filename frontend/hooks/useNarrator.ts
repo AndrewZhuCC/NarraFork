@@ -92,15 +92,20 @@ export interface FileTreeStatus {
 	truncated: boolean;
 }
 
-export function useFileTreeStatus(narratorId: string, enabled = true, root?: string) {
+export function useFileTreeStatus(
+	narratorId: string,
+	enabled = true,
+	root?: string,
+	workspaceKey?: string,
+) {
 	return useQuery<FileTreeStatus>({
 		// `root` is part of the key: the status is reported relative to the narrator's
 		// cwd, so after a cwd change the previous query's paths would annotate a tree
 		// they no longer describe — and the old entry could linger without a refetch
 		// trigger. A fresh key starts an empty (unannotated) query that refetches
 		// immediately instead.
-		queryKey: ["narrators", narratorId, "file-tree-status", root ?? ""],
-		queryFn: () => api.getFileTreeStatus(narratorId),
+		queryKey: ["narrators", narratorId, "file-tree-status", root ?? "", workspaceKey ?? ""],
+		queryFn: ({ signal }) => api.getFileTreeStatus(narratorId, workspaceKey, signal),
 		enabled: enabled && !!narratorId,
 		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});

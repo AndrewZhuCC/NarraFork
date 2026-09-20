@@ -264,8 +264,11 @@ import {
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
-import { gitService } from "../services/git-service";
+import { gitManagementService } from "../services/git-management-service";
+import { withGitRequestContext } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
+import { assertGitWorkspaceKey } from "../services/git-workspace";
+import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
 import {
 	getHumanAttentionForPrincipal,
 	listHumanAttentionForPrincipal,
@@ -5953,22 +5956,43 @@ narratorRoutes.post("/:id/unrevert", async (c) => {
  */
 narratorRoutes.get("/:id/file-tree-status", async (c) => {
 	const narratorId = c.req.param("id");
-	const cwd = await resolveNarratorCwd(narratorId);
-	if (!cwd || !(await gitService.getRepositoryRoot(cwd))) {
+	const workspaceKey = c.req.query("workspaceKey");
+	const target = await authorizeGitTarget(c, { narratorId }, "read", workspaceKey);
+	if (workspaceKey !== undefined) {
+		assertGitWorkspaceKey(target.workspace, workspaceKey);
+		requireReadyGitTarget(target, "read");
+	}
+	const { workspace, backend } = target;
+	if (!workspace.capabilities.read || !workspace.rootPath || !backend) {
 		return c.json({ isGitRepo: false, files: [], totalFiles: 0, truncated: false });
 	}
-
-	// Share the same short-lived cache used by the Git panel. The watcher invalidates it
-	// before broadcasting file activity, and concurrent file-tree surfaces then reuse the
-	// one fresh Git query instead of each spawning their own set of processes.
-	const status = await getStatusSummaryCached(cwd);
+	const { paths } = backend;
+	// Preserve cwd-scoped status inside a repo; prefix child-repo paths back into the tree.
+	const selectedRepository = workspace.repositories?.find(
+		(repository) => repository.workspaceKey === workspace.workspaceKey,
+	);
+	const statusRoot = selectedRepository ? workspace.rootPath : workspace.cwd;
+	const status = await withGitRequestContext(c.req.raw.signal, () =>
+		backend.kind === "local"
+			? getStatusSummaryCached(statusRoot)
+			: gitManagementService(target, c.req.raw.signal).getStatusSummary(statusRoot),
+	);
 	return c.json({
 		isGitRepo: true,
-		files: status.files.map((file) => ({
-			path: file.path,
-			linesAdded: file.linesAdded,
-			linesRemoved: file.linesRemoved,
-		})),
+		files: status.files.flatMap((file) => {
+			const absolutePath = paths.resolve(
+				paths.resolve(workspace.cwd, selectedRepository?.relativePath ?? "."),
+				file.path,
+			);
+			if (!paths.contains(workspace.cwd, absolutePath)) return [];
+			return [
+				{
+					path: paths.relative(workspace.cwd, absolutePath).replaceAll("\\", "/"),
+					linesAdded: file.linesAdded,
+					linesRemoved: file.linesRemoved,
+				},
+			];
+		}),
 		totalFiles: status.totalFiles,
 		truncated: status.totalFiles > status.files.length,
 	});

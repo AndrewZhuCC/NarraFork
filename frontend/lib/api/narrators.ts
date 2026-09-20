@@ -1646,13 +1646,16 @@ export const narratorsApi = {
 		}),
 
 	// File tree — current uncommitted Git line counts, relative to this narrator's cwd.
-	getFileTreeStatus: (narratorId: string) =>
+	getFileTreeStatus: (narratorId: string, workspaceKey?: string, signal?: AbortSignal) =>
 		request<{
 			isGitRepo: boolean;
 			files: Array<{ path: string; linesAdded: number; linesRemoved: number }>;
 			totalFiles: number;
 			truncated: boolean;
-		}>(`/narrators/${narratorId}/file-tree-status`),
+		}>(
+			`/narrators/${narratorId}/file-tree-status${workspaceKey ? `?workspaceKey=${encodeURIComponent(workspaceKey)}` : ""}`,
+			{ signal },
+		),
 
 	// File modifications
 	getFileModifications: (narratorId: string, upToMessageId?: string, fromMessageId?: string) => {

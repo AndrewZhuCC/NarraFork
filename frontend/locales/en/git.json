@@ -3,6 +3,8 @@
 	"workspace.statusTruncated": "Status output was truncated; file counts may be incomplete. Bulk actions affect the entire working tree.",
 	"workspace.sectionTruncated": "{{section}} count is a lower bound",
 	"workspace.serverFilesTruncated": "some files are not shown",
+	"workspace.repositorySelect": "Select Git repository",
+	"workspace.discoveryTruncated": "Repository discovery was truncated; some nested repositories may not be listed.",
 	"workspace.ready": "Git workspace",
 	"workspace.loading": "Checking workspace…",
 	"workspace.not_git": "This directory is not a Git working tree",

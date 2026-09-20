@@ -3,6 +3,8 @@
 	"workspace.statusTruncated": "状态输出已截断，文件计数可能不完整；全部操作仍会作用于整个工作树。",
 	"workspace.sectionTruncated": "{{section}}计数是下界",
 	"workspace.serverFilesTruncated": "部分文件未显示",
+	"workspace.repositorySelect": "选择 Git 仓库",
+	"workspace.discoveryTruncated": "仓库发现结果已截断，部分嵌套仓库可能未列出。",
 	"workspace.ready": "Git 工作区",
 	"workspace.loading": "正在检测工作区…",
 	"workspace.not_git": "此目录不属于 Git 工作树",

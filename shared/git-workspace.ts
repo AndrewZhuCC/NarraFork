@@ -17,6 +17,8 @@ export interface GitWorkspace {
 	state: GitWorkspaceState;
 	capabilities: { read: boolean; write: boolean };
 	reason?: string;
+	repositories?: Array<{ workspaceKey: string; rootPath: string; relativePath: string }>;
+	discoveryTruncated?: boolean;
 	narratorId?: string;
 	/** Present only when the actual worktree matches this chapter. */
 	chapterId?: string;

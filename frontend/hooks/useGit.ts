@@ -1,5 +1,5 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
 import type { CurrentDiffView } from "../../server/services/git-current-diff-view";
 import type {
 	FileChangeActorKind,
@@ -132,6 +132,72 @@ export const GIT_FACT_QUERIES = [
 	"gitStashList",
 ];
 
+const GIT_WORKSPACE_SELECTIONS_KEY = "narrafork_git_workspace_selections";
+const gitWorkspaceSelectionListeners = new Set<() => void>();
+
+function subscribeGitWorkspaceSelections(listener: () => void) {
+	gitWorkspaceSelectionListeners.add(listener);
+	return () => gitWorkspaceSelectionListeners.delete(listener);
+}
+
+function readGitWorkspaceSelectionsRaw(): string | null {
+	try {
+		return sessionStorage.getItem(GIT_WORKSPACE_SELECTIONS_KEY);
+	} catch {
+		return null;
+	}
+}
+
+function parseGitWorkspaceSelections(raw: string | null): Record<string, string> {
+	if (!raw) return {};
+	try {
+		const parsed = JSON.parse(raw) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		return Object.fromEntries(
+			Object.entries(parsed).filter(
+				(entry): entry is [string, string] => typeof entry[1] === "string",
+			),
+		);
+	} catch {
+		return {};
+	}
+}
+
+function persistGitWorkspaceSelection(
+	scope: string,
+	workspaceKey: string | null,
+	expected?: string,
+) {
+	const selections = parseGitWorkspaceSelections(readGitWorkspaceSelectionsRaw());
+	if (expected !== undefined && selections[scope] !== expected) return;
+	if (workspaceKey) selections[scope] = workspaceKey;
+	else delete selections[scope];
+	try {
+		sessionStorage.setItem(GIT_WORKSPACE_SELECTIONS_KEY, JSON.stringify(selections));
+	} catch {
+		return;
+	}
+	for (const listener of gitWorkspaceSelectionListeners) listener();
+}
+
+function useGitWorkspaceSelection(scope: string) {
+	const raw = useSyncExternalStore(
+		subscribeGitWorkspaceSelections,
+		readGitWorkspaceSelectionsRaw,
+		() => null,
+	);
+	const workspaceKey = useMemo(() => parseGitWorkspaceSelections(raw)[scope] ?? null, [raw, scope]);
+	const selectWorkspace = useCallback(
+		(nextWorkspaceKey: string | null) => persistGitWorkspaceSelection(scope, nextWorkspaceKey),
+		[scope],
+	);
+	const clearIfCurrent = useCallback(
+		(expected: string) => persistGitWorkspaceSelection(scope, null, expected),
+		[scope],
+	);
+	return { workspaceKey, selectWorkspace, clearIfCurrent };
+}
+
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
 	if (workspace?.state !== "ready" || !workspace.capabilities.read || !workspace.workspaceKey)
 		return null;
@@ -202,9 +268,25 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		narrator?.contextProjectId,
 		narrator?.defaultDeviceId,
 	];
+	const selectionScope = JSON.stringify([narratorId, context]);
+	const selection = useGitWorkspaceSelection(selectionScope);
 	const query = useQuery({
-		queryKey: ["gitWorkspace", narratorId, context],
-		queryFn: ({ signal }) => api.getGitWorkspace(narratorId as string, signal),
+		queryKey: ["gitWorkspace", narratorId, context, selection.workspaceKey],
+		queryFn: async ({ signal }) => {
+			try {
+				return await api.getGitWorkspace(
+					narratorId as string,
+					signal,
+					selection.workspaceKey ?? undefined,
+				);
+			} catch (error) {
+				if (selection.workspaceKey && (error as ApiError)?.status === 409) {
+					selection.clearIfCurrent(selection.workspaceKey);
+					return api.getGitWorkspace(narratorId as string, signal);
+				}
+				throw error;
+			}
+		},
 		enabled: !!narratorId,
 		retry: false,
 		staleTime: 5_000,
@@ -216,7 +298,13 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 		if (!query.isError && query.data?.capabilities.read !== false) return;
 		qc.removeQueries({ predicate: (q) => GIT_FACT_QUERIES.includes(String(q.queryKey[0])) });
 	}, [qc, query.isError, query.data?.capabilities.read]);
-	return query;
+	const target = !query.isError ? gitWorkspaceTarget(narratorId as string, query.data) : null;
+	return {
+		...query,
+		workspaceKey: target && typeof target !== "string" ? target.workspaceKey : null,
+		target,
+		selectWorkspace: selection.selectWorkspace,
+	};
 }
 
 export function invalidateWorkspaceQueries(

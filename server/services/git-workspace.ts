@@ -7,9 +7,14 @@ import { chapters, narrators, projects } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import {
+	discoverGitWorkspacePaths,
+	GIT_WORKSPACE_DISCOVERY_BUDGET_MS,
+} from "./git-workspace-scanner";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import { activeNarrators } from "./narrator-session-state";
 import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git-service";
@@ -89,6 +94,31 @@ export async function probeLocalGitWorkspace(cwd: string, signal?: AbortSignal):
 	}
 }
 
+export async function probeGitWorkspace(
+	backend: ExecutionBackend,
+	cwd: string,
+	signal?: AbortSignal,
+): Promise<GitProbe> {
+	const result =
+		backend.kind === "local"
+			? await probeLocalGitWorkspace(cwd, signal)
+			: await createRemoteGitService(backend, signal).probe(cwd);
+	return { ...result, state: result.state ?? "unsupported" };
+}
+
+function isDiscoveredRepositoryRoot(
+	backend: ExecutionBackend,
+	basePath: string,
+	candidatePath: string,
+	rootPath: string,
+): boolean {
+	if (!backend.paths.equals(candidatePath, rootPath) || !backend.paths.contains(basePath, rootPath))
+		return false;
+	const relative = backend.paths.relative(basePath, rootPath).replaceAll("\\", "/");
+	const depth = relative.split("/").filter(Boolean).length;
+	return !!relative && !relative.startsWith("../") && depth >= 1 && depth <= 3;
+}
+
 export function gitWorkspaceIdentity(
 	backend: Pick<ExecutionBackend, "deviceId" | "paths">,
 	root: string,
@@ -106,6 +136,12 @@ export interface GitWorkspaceTarget {
 	contextProjectId?: string;
 	/** The local session cwd is NOT used as a remote cwd fallback. */
 	configuredCwd?: string;
+	/** Discovered candidates are internal until each one passes authorization. */
+	discoveredRepositories?: GitWorkspaceTarget[];
+	discoveredRepositoriesAuthorized?: boolean;
+	discoveryTruncated?: boolean;
+	discoveryDeadline?: number;
+	discoveryBasePath?: string;
 	/** Request-bound authorization refresh, never serialized to clients. */
 	beforeWrite?: () => Promise<void>;
 }
@@ -115,6 +151,11 @@ export async function resolveNarratorGitTarget(
 	signal?: AbortSignal,
 	beforeResolve?: (target: GitWorkspaceTarget) => Promise<void>,
 	beforeProbe?: (target: GitWorkspaceTarget) => Promise<void>,
+	beforeCandidateProbe?: (target: GitWorkspaceTarget) => Promise<boolean>,
+	authorizeCandidate?: (
+		target: GitWorkspaceTarget,
+		deadline: number,
+	) => Promise<"authorized" | "denied" | "budget_exhausted">,
 ): Promise<GitWorkspaceTarget> {
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
@@ -191,11 +232,7 @@ export async function resolveNarratorGitTarget(
 	}
 	let probe: GitProbe;
 	try {
-		const result =
-			backend.kind === "local"
-				? await probeLocalGitWorkspace(workspace.cwd, signal)
-				: await createRemoteGitService(backend, signal).probe(workspace.cwd);
-		probe = { ...result, state: result.state ?? "unsupported" };
+		probe = await probeGitWorkspace(backend, workspace.cwd, signal);
 	} catch (error) {
 		signal?.throwIfAborted();
 		workspace.state = /offline|connection|unavailable|disconnect/i.test(String(error))
@@ -208,16 +245,132 @@ export async function resolveNarratorGitTarget(
 	}
 	workspace.state = probe.state ?? "unsupported";
 	workspace.reason = probe.reason;
-	if (probe.state !== "ready" || !probe.rootPath || !probe.repositoryPath) return target;
-	workspace.rootPath = probe.rootPath;
-	target.repositoryPath = probe.repositoryPath;
-	workspace.workspaceKey = gitWorkspaceIdentity(backend, probe.rootPath);
-	workspace.repositoryKey = gitWorkspaceIdentity(backend, probe.repositoryPath);
-	// A chapter is only a side-effect adapter for its *actual* worktree.
-	if (backend.kind === "local" && chapter?.worktreePath) {
-		const chapterRoot = await realpath(chapter.worktreePath).catch(() => null);
-		if (chapterRoot && backend.paths.equals(chapterRoot, probe.rootPath))
-			workspace.chapterId = chapter.id;
+	if (probe.state === "ready" && probe.rootPath && probe.repositoryPath) {
+		workspace.rootPath = probe.rootPath;
+		target.repositoryPath = probe.repositoryPath;
+		workspace.workspaceKey = gitWorkspaceIdentity(backend, probe.rootPath);
+		workspace.repositoryKey = gitWorkspaceIdentity(backend, probe.repositoryPath);
+		// A chapter is only a side-effect adapter for its *actual* worktree.
+		if (backend.kind === "local" && chapter?.worktreePath) {
+			const chapterRoot = await realpath(chapter.worktreePath).catch(() => null);
+			if (chapterRoot && backend.paths.equals(chapterRoot, probe.rootPath))
+				workspace.chapterId = chapter.id;
+		}
+		return target;
+	}
+	if (probe.state !== "not_git") return target;
+
+	const discoveryStarted = performance.now();
+	const discoveryDeadline = discoveryStarted + GIT_WORKSPACE_DISCOVERY_BUDGET_MS;
+	target.discoveryDeadline = discoveryDeadline;
+	const discoveryController = new AbortController();
+	const relayAbort = () => discoveryController.abort(signal?.reason);
+	signal?.addEventListener("abort", relayAbort, { once: true });
+	if (signal?.aborted) relayAbort();
+	const discoveryTimer = setTimeout(
+		() => discoveryController.abort(new Error("Git repository discovery timed out")),
+		GIT_WORKSPACE_DISCOVERY_BUDGET_MS,
+	);
+	try {
+		const baseIdentity = await backend.resolvePathIdentity(workspace.cwd, {
+			signal: discoveryController.signal,
+			timeoutMs: GIT_WORKSPACE_DISCOVERY_BUDGET_MS,
+		});
+		target.discoveryBasePath = baseIdentity.canonicalPath;
+		const discovery = await discoverGitWorkspacePaths(
+			backend,
+			workspace.cwd,
+			discoveryController.signal,
+		);
+		target.discoveryTruncated = discovery.truncated;
+		if (discovery.unsupported) return target;
+		const repositories: GitWorkspaceTarget[] = [];
+		const seenWorkspaceKeys = new Set<string>();
+		target.discoveredRepositories = repositories;
+		target.discoveredRepositoriesAuthorized = authorizeCandidate !== undefined;
+		for (const cwd of discovery.paths) {
+			const candidate: GitWorkspaceTarget = {
+				backend,
+				contextProjectId: projectId,
+				configuredCwd: localCwd,
+				workspace: {
+					narratorId,
+					projectId,
+					deviceId,
+					cwd,
+					rootPath: null,
+					workspaceKey: null,
+					repositoryKey: null,
+					state: "not_git",
+					capabilities: { read: false, write: false },
+				},
+			};
+			if (beforeCandidateProbe && !(await beforeCandidateProbe(candidate))) continue;
+			let candidateIdentity: Awaited<ReturnType<ExecutionBackend["resolvePathIdentity"]>>;
+			let candidateProbe: GitProbe;
+			try {
+				candidateIdentity = await backend.resolvePathIdentity(cwd, {
+					signal: discoveryController.signal,
+					timeoutMs: Math.max(1, Math.floor(discoveryDeadline - performance.now())),
+				});
+				candidateProbe = await probeGitWorkspace(backend, cwd, discoveryController.signal);
+			} catch {
+				discoveryController.signal.throwIfAborted();
+				continue;
+			}
+			if (
+				candidateProbe.state !== "ready" ||
+				!candidateProbe.rootPath ||
+				!candidateProbe.repositoryPath ||
+				!candidateIdentity.exists ||
+				!isDiscoveredRepositoryRoot(
+					backend,
+					baseIdentity.canonicalPath,
+					candidateIdentity.canonicalPath,
+					candidateProbe.rootPath,
+				)
+			)
+				continue;
+			const workspaceKey = gitWorkspaceIdentity(backend, candidateProbe.rootPath);
+			if (seenWorkspaceKeys.has(workspaceKey)) continue;
+			candidate.workspace = {
+				...candidate.workspace,
+				cwd,
+				rootPath: candidateProbe.rootPath,
+				workspaceKey,
+				repositoryKey: gitWorkspaceIdentity(backend, candidateProbe.repositoryPath),
+				state: "ready",
+				reason: undefined,
+			};
+			candidate.repositoryPath = candidateProbe.repositoryPath;
+			if (authorizeCandidate) {
+				const authorization = await authorizeCandidate(candidate, discoveryDeadline);
+				if (authorization === "budget_exhausted") {
+					target.discoveryTruncated = true;
+					break;
+				}
+				if (authorization === "denied") continue;
+			}
+			seenWorkspaceKeys.add(workspaceKey);
+			repositories.push(candidate);
+		}
+		target.discoveredRepositories = repositories;
+	} catch (error) {
+		signal?.throwIfAborted();
+		if (!discoveryController.signal.aborted) throw error;
+		target.discoveryTruncated = true;
+		workspace.reason = "Directory is not a Git working tree; repository discovery was incomplete";
+	} finally {
+		clearTimeout(discoveryTimer);
+		signal?.removeEventListener("abort", relayAbort);
+		const elapsedMs = Math.round(performance.now() - discoveryStarted);
+		if (elapsedMs >= 1000)
+			logger.warn("Slow Git repository discovery", {
+				deviceId: backend.deviceId,
+				elapsedMs,
+				candidates: target.discoveredRepositories?.length ?? 0,
+				truncated: target.discoveryTruncated === true,
+			});
 	}
 	return target;
 }

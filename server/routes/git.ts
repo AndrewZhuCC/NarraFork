@@ -132,19 +132,35 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 				: { narratorId: c.req.param("id") ?? "" };
 		if (c.req.method === "GET" && c.req.path.endsWith("/modifications") && c.req.raw.signal.aborted)
 			return cancelledModificationResponse(c, source);
-		const target = await authorizeGitTarget(c, origin, need);
+		let requestedWorkspaceKey = c.req.query("workspaceKey");
+		if (need === "write") {
+			// Hono caches parsed JSON: each handler still uses its existing Zod schema.
+			const body = await c.req.json().catch(() => ({}));
+			requestedWorkspaceKey = body?.workspaceKey;
+		}
+		if (
+			requestedWorkspaceKey !== undefined &&
+			(typeof requestedWorkspaceKey !== "string" || requestedWorkspaceKey.length > 256)
+		)
+			throw new ValidationError("Invalid Git workspace key");
+		const target = await authorizeGitTarget(c, origin, need, requestedWorkspaceKey);
+		if (workspaceRequest && requestedWorkspaceKey !== undefined)
+			assertGitWorkspaceKey(target.workspace, requestedWorkspaceKey);
 		if (!workspaceRequest) {
 			if (need === "write") {
-				// Hono caches parsed JSON: each handler still uses its existing Zod schema.
-				const body = await c.req.json().catch(() => ({}));
-				if (source === "narrator" || body.workspaceKey !== undefined)
-					assertGitWorkspaceKey(target.workspace, body.workspaceKey);
-			} else if (c.req.query("workspaceKey") !== undefined)
-				assertGitWorkspaceKey(target.workspace, c.req.query("workspaceKey"));
+				if (source === "narrator" || requestedWorkspaceKey !== undefined)
+					assertGitWorkspaceKey(target.workspace, requestedWorkspaceKey);
+			} else if (requestedWorkspaceKey !== undefined)
+				assertGitWorkspaceKey(target.workspace, requestedWorkspaceKey);
 			requireReadyGitTarget(target, need);
 		}
 		target.beforeWrite = async () => {
-			const fresh = await authorizeGitTarget(c, origin, "write");
+			const fresh = await authorizeGitTarget(
+				c,
+				origin,
+				"write",
+				target.workspace.workspaceKey ?? undefined,
+			);
 			assertGitWorkspaceKey(fresh.workspace, target.workspace.workspaceKey);
 			requireReadyGitTarget(fresh, "write");
 			if (fresh.backend?.runtimeGeneration !== target.backend?.runtimeGeneration)
