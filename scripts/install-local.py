@@ -1,7 +1,12 @@
 """Install a signed selfuse build at a stable actual path; never restart the service.
 
-Usage: python3 scripts/install-local.py [--check | --validate-migrations]
+Usage: python3 scripts/install-local.py [--check | --validate-migrations | --prepare-update]
 This intentionally supports the local supervisor installation only, not ks-mini.
+
+--prepare-update only prepares: it verifies the running server over /api/health and records a
+`stablePathInstall` handoff marker (launchdLabel/fromCommit/toCommit/certificateSha1) in
+placed-update.json so the built-in update coordination owns the single restart. It never
+restarts, stops or reloads the service itself, and the default install never writes the marker.
 """
 import datetime
 from contextlib import closing
@@ -15,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 
@@ -24,6 +30,39 @@ def digest(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
             h.update(chunk)
     return h.hexdigest()
+
+
+LAUNCHD_LABEL = 'dev.narrafork.server'
+HEALTH_READ_LIMIT = 65536
+
+
+def health_url(settings_path):
+    """Loopback /api/health URL of the running server, from settings server.host/port/tls."""
+    server = json.loads(settings_path.read_text()).get('server', {}) if settings_path.is_file() else {}
+    host = server.get('host') or '127.0.0.1'
+    port = server.get('port') or 7778
+    assert isinstance(port, int) and 0 < port < 65536, 'Invalid server port in settings'
+    host = {'0.0.0.0': '127.0.0.1', '::': '::1', '::0': '::1'}.get(host, host)
+    if ':' in host and not host.startswith('['):  # Bare IPv6 literals need brackets.
+        host = f'[{host}]'
+    scheme = 'https' if (server.get('tls') or {}).get('enabled') else 'http'
+    return f'{scheme}://{host}:{port}/api/health'
+
+
+def read_health(url):
+    """Running server identity over loopback: no proxy, no credentials, default TLS verification."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=10) as response:
+        body = response.read(HEALTH_READ_LIMIT + 1)
+    assert len(body) <= HEALTH_READ_LIMIT, 'Health response exceeded 64 KiB'
+    payload = json.loads(body)
+    commit, version = payload.get('commit'), payload.get('version')
+    assert payload.get('status') == 'ok' and payload.get('readiness') == 'ready', \
+        'Running server is not healthy'
+    assert isinstance(commit, str) and re.fullmatch(r'[a-f0-9]{8,40}', commit), \
+        'Running server commit is unusable'
+    assert isinstance(version, str) and version, 'Running server version is unusable'
+    return {'commit': commit, 'version': version}
 
 
 def validate_report(report, *, backup_sha256, source_sha256, commit, version, pending):
@@ -51,9 +90,13 @@ def validate_report(report, *, backup_sha256, source_sha256, commit, version, pe
 def main():
     if not __debug__:
         raise RuntimeError('Run without Python -O: installation safety checks are required')
-    assert sys.argv[1:] in ([], ['--check'], ['--validate-migrations']), __doc__
-    check_only = sys.argv[1:] == ['--check']
-    validate_migrations = sys.argv[1:] == ['--validate-migrations']
+    flags = sys.argv[1:]
+    assert len(set(flags)) == len(flags) and set(flags) <= {'--check', '--validate-migrations', '--prepare-update'}, __doc__
+    check_only = '--check' in flags
+    validate_migrations = '--validate-migrations' in flags
+    prepare_update = '--prepare-update' in flags
+    assert not (check_only and (validate_migrations or prepare_update)), \
+        '--check is read-only and cannot be combined with an installing mode'
     assert sys.platform == 'darwin'
     os.umask(0o077)
     home = Path.home()
@@ -84,16 +127,30 @@ def main():
     old_data = json.loads(old_placed)
     old_binary = Path(old_data['newBinaryPath'])
     assert old_binary.is_file() and old_binary.parent == bin_dir
+    old_stat = old_binary.stat()
+    assert old_stat.st_uid == os.getuid(), 'The stable binary is not owned by this user'
+    assert old_stat.st_mode & 0o022 == 0, 'The stable binary is group/world writable'
     assert not target.exists() or old_binary == target, 'Unexpected existing stable binary'
     supervisor = bin_dir / 'narrafork-launchd-supervisor'
     plist = home / 'Library/LaunchAgents/dev.narrafork.server.plist'
-    assert plistlib.loads(plist.read_bytes())['ProgramArguments'] == [str(supervisor)]
+    agent = plistlib.loads(plist.read_bytes())
+    if prepare_update:
+        assert agent.get('Label') == LAUNCHD_LABEL and agent.get('KeepAlive') is True, \
+            'The launch agent must be the keep-alive dev.narrafork.server job'
+    assert agent['ProgramArguments'] == [str(supervisor)]
     def resolve():
         return subprocess.check_output([str(supervisor), '--resolve'], text=True, timeout=10).strip()
     assert resolve() == str(old_binary)
     if check_only:
         print(json.dumps({'preflight': 'ok', 'source': str(source), 'sha256': expected, 'target': str(target), 'oldBinary': str(old_binary)}))
         return
+
+    url, health = None, None
+    if prepare_update:
+        url = health_url(state / 'settings.json')
+        health = read_health(url)
+        assert health['commit'] != metadata['commit'], \
+            'The running server already reports the build being installed'
 
     required_space = 2 * (state / 'narrafork.db').stat().st_size + 4 * source.stat().st_size + 1024**3
     assert shutil.disk_usage(state).free > required_space, 'Not enough space for a safe backup and install'
@@ -168,19 +225,28 @@ def main():
                    newBinaryPath=str(target), updatePath=str(target), placed=True,
                    placedAt=datetime.datetime.now(datetime.timezone.utc).isoformat(),
                    sizeBytes=metadata['size'], sha512=metadata['sha512'])
+    stable_install = None
+    if prepare_update:
+        stable_install = {'launchdLabel': LAUNCHD_LABEL, 'fromCommit': health['commit'],
+                          'toCommit': metadata['commit'], 'certificateSha1': fingerprint}
+        updated['stablePathInstall'] = stable_install
+        updated['fromVersion'] = health['version'].split('+')[0]
+    else:
+        updated.pop('stablePathInstall', None)
     result = {'backup': str(backup), 'installed': str(target), 'sha256': expected,
               'sourceCommit': head, 'migrationCountBefore': len(applied),
               'embeddedMigrations': len(journal['entries']),
               'pendingMigrations': [entry['tag'] for entry in pending],
               'migrationValidation': migration_validation,
               'oldBinary': str(old_binary), 'oldSha256': old_sha256,
+              'stablePathInstall': stable_install,
               'signingIdentifier': 'app.narrafork.selfuse', 'restarted': False}
     # Persist recovery locations before switching anything. This installer never restarts NF.
     (backup / 'install-record.json').write_text(json.dumps(result, indent=2))
     switched = False
     try:
         shutil.copy2(source, temporary)
-        temporary.chmod(0o755)
+        temporary.chmod(old_stat.st_mode & 0o777)
         assert digest(temporary) == expected
         subprocess.run(['/usr/bin/codesign', '--verify', '--strict', '-R', requirement, str(temporary)], check=True, timeout=30)
         with placed_tmp.open('x') as stream:
@@ -190,6 +256,11 @@ def main():
         os.symlink(str(target), link_tmp)
         assert placed.read_bytes() == old_placed and os.readlink(link) == old_link, 'Installation changed concurrently'
         assert digest(old_binary) == old_sha256, 'Installed binary changed concurrently'
+        if prepare_update:
+            # Re-check right before the switch: waiting on the backup can outlive a restart
+            # performed elsewhere, and the handoff marker must name the commit actually running.
+            assert read_health(url)['commit'] == health['commit'], \
+                'The running server changed commit while this install was prepared'
         os.replace(temporary, target)
         switched = True
         os.replace(link_tmp, link)
