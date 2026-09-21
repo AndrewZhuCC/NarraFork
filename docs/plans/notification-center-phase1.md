@@ -38,7 +38,9 @@
 | m1 preview 省略号 | **已修**：fan-out 与 service 截断均为 `≤max` 且保留 `…` |
 | m2 Load more 键 | **已修**：使用 `nav:notificationLoadMore`；另增 `nav:notificationResolved` |
 | m3 重复 insert 通知 | **已修**：`ON CONFLICT DO NOTHING` 未实际插入时不 `notifyChanged` |
-| M3 有界 N+1 / M4 权限集成 / M5 保留 job | 遗留，P2；不阻塞合并 |
+| **M4 权限真实 writer** | **已补**：集成测试 `permission fan-out → recordNotifications → listNotifications`（owner 可见、stranger 不可见、replay 去重、decided 不复活、resolved+sourceAlive） |
+| **M3 有界 N+1** | **已优**：`resolveDisplayStatusBatch` 按页预载 tool/narrator/room/membership，ACL 仍走 `canReadNarrator`；批失败回落单行路径 |
+| M5 保留 job | 遗留，P2；不阻塞合并 |
 
 状态枚举：`todo` → `doing` → `done` / `blocked`（blocked 必须写清缺什么）。
 
