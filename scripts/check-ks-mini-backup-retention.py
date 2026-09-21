@@ -19,9 +19,11 @@ with tempfile.TemporaryDirectory(prefix='nf-backup-retention-') as directory:
     old = state / 'backup-before-stable-signing-20260920T120000123456Z'
     legacy = state / 'backup-before-stable-signing-20260921T120000Z'
     newer = state / 'backup-before-stable-signing-20260921T120001000000Z'
+    versioned = state / 'backup-before-0.7.3-20260914T071818Z'
+    versioned_newer = state / 'backup-before-0.7.7-20260922T120000Z'
     special = state / 'KNOWN-GOOD-selfuse'
     labelled = state / 'backup-before-stable-signing-manual-keep'
-    for path in (old, legacy, newer, special, labelled):
+    for path in (old, legacy, newer, versioned, versioned_newer, special, labelled):
         path.mkdir()
         (path / 'keep.txt').write_text('preserve outside the old automatic backups')
     link = state / 'backup-before-stable-signing-20260919T120000000000Z'
@@ -35,14 +37,14 @@ with tempfile.TemporaryDirectory(prefix='nf-backup-retention-') as directory:
         pass
     else:
         raise AssertionError('Incomplete backup was accepted')
-    assert old.is_dir() and legacy.is_dir()
+    assert old.is_dir() and legacy.is_dir() and versioned.is_dir()
 
     for name in required:
         (current / name).write_text('verified by the installer before this helper is called')
     result = prune(state, current)
-    assert result == {'removed': 2, 'errorCount': 0, 'errors': []}, result
-    assert not old.exists() and not legacy.exists()
-    assert all(path.is_dir() for path in (current, newer, special, labelled))
+    assert result == {'removed': 3, 'errorCount': 0, 'errors': []}, result
+    assert not old.exists() and not legacy.exists() and not versioned.exists()
+    assert all(path.is_dir() for path in (current, newer, versioned_newer, special, labelled))
     assert (special / 'keep.txt').is_file() and link.is_symlink()
     assert prune(state, current)['removed'] == 0
 

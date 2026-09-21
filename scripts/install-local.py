@@ -92,7 +92,7 @@ def validate_report(report, *, backup_sha256, source_sha256, commit, version, pe
 
 
 def prune_previous_backups(state, current):
-    pattern = re.compile(r'backup-before-stable-signing-(\d{8}T\d{6})(\d{6})?Z')
+    pattern = re.compile(r'backup-before-(?:stable-signing|\d+\.\d+\.\d+)-(\d{8}T\d{6})(\d{6})?Z')
     current_match = pattern.fullmatch(current.name)
     assert current.parent == state and current_match and current.is_dir() and not current.is_symlink()
     required = ('narrafork-server', 'narrafork.db', 'placed-update.json', 'launcher-target.txt',
