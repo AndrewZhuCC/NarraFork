@@ -1,11 +1,16 @@
 """Small retention self-check; operates only inside an automatically removed temp directory."""
 import runpy
+import sys
 import tempfile
 from pathlib import Path
 
-module = runpy.run_path(str(Path(__file__).with_name('install-ks-mini.py')))
+installer = sys.argv[1] if len(sys.argv) == 2 else 'install-ks-mini.py'
+assert len(sys.argv) <= 2 and installer in ('install-ks-mini.py', 'install-local.py')
+module = runpy.run_path(str(Path(__file__).with_name(installer)))
 prune = module['prune_previous_backups']
-required = ('narrafork-server', 'narrafork.db', 'placed-update.json', 'links.json', 'install-record.json')
+required = ('narrafork-server', 'narrafork.db', 'placed-update.json', 'install-record.json')
+required += (('launcher-target.txt', 'launch-agent.plist', 'narrafork-launchd-supervisor')
+             if installer == 'install-local.py' else ('links.json',))
 
 with tempfile.TemporaryDirectory(prefix='nf-backup-retention-') as directory:
     state = Path(directory)
@@ -59,4 +64,4 @@ with tempfile.TemporaryDirectory(prefix='nf-backup-retention-') as directory:
     finally:
         module['shutil'].rmtree = original
 
-print('ks-mini backup retention self-check passed')
+print(f'{installer} backup retention self-check passed')

@@ -7,7 +7,11 @@ import { applySqliteDataBackfills } from "../server/db/data-backfills";
 import { ensureColumns } from "../server/db/ensure-columns";
 import { runMigrations } from "../server/db/run-migrations";
 
-const TARGET_TAG = "0012_curved_bloodstorm";
+const ALLOWED_TARGET_TAGS = new Set([
+	"0012_curved_bloodstorm",
+	"0013_omniscient_dormammu",
+]);
+const JOURNAL_TAIL_TAG = "0013_omniscient_dormammu";
 const MAX_REPORT_BYTES = 64 * 1024;
 
 type Args = {
@@ -113,8 +117,12 @@ function tableDigest(
 	return { columns: selected, rows, sha256: hash.digest("hex") };
 }
 
-function affectedSummary(db: Database, excludeNew: boolean): Record<string, unknown> {
-	return {
+function affectedSummary(
+	db: Database,
+	targetTag: string,
+	excludeNew: boolean,
+): Record<string, unknown> {
+	const summary: Record<string, unknown> = {
 		narrators: tableDigest(db, "narrators", excludeNew ? new Set(["next_seq"]) : new Set()),
 		narrator_tool_calls: tableDigest(
 			db,
@@ -122,6 +130,14 @@ function affectedSummary(db: Database, excludeNew: boolean): Record<string, unkn
 			excludeNew ? new Set(["stream_completed_at"]) : new Set(),
 		),
 	};
+	if (targetTag === "0013_omniscient_dormammu") {
+		summary.file_change_scope_recoveries = tableDigest(
+			db,
+			"file_change_scope_recoveries",
+			excludeNew ? new Set(["workspace_lease_id"]) : new Set(),
+		);
+	}
+	return summary;
 }
 
 function columnShape(db: Database, table: string, column: string): unknown[] {
@@ -132,14 +148,28 @@ function columnShape(db: Database, table: string, column: string): unknown[] {
 		.map(({ cid: _cid, ...rest }) => rest);
 }
 
-function schemaShape(db: Database): Record<string, unknown> {
-	const table = "file_change_scope_recoveries";
-	const index = "idx_fc_scope_recovery_scope";
+function tableSchemaShape(db: Database, table: string): Record<string, unknown> {
+	const indexes = (
+		db.query(`PRAGMA index_list(${quoteIdentifier(table)})`).all() as Array<
+			Record<string, unknown> & { name: string }
+		>
+	)
+		.map(({ seq: _seq, ...index }) => ({
+			...index,
+			columns: db.query(`PRAGMA index_xinfo(${quoteIdentifier(index.name)})`).all(),
+		}))
+		.sort((left, right) => String(left.name).localeCompare(String(right.name)));
 	return {
-		tableInfo: db.query(`PRAGMA table_info(${quoteIdentifier(table)})`).all(),
+		tableXInfo: db.query(`PRAGMA table_xinfo(${quoteIdentifier(table)})`).all(),
 		foreignKeys: db.query(`PRAGMA foreign_key_list(${quoteIdentifier(table)})`).all(),
-		indexes: db.query(`PRAGMA index_list(${quoteIdentifier(table)})`).all(),
-		indexInfo: db.query(`PRAGMA index_xinfo(${quoteIdentifier(index)})`).all(),
+		indexes,
+	};
+}
+
+function schemaShape(db: Database): Record<string, unknown> {
+	return {
+		fileChangeScopeRecoveries: tableSchemaShape(db, "file_change_scope_recoveries"),
+		workspaceWriteLeases: tableSchemaShape(db, "workspace_write_leases"),
 		narratorsNextSeq: columnShape(db, "narrators", "next_seq"),
 		toolCallsStreamCompletedAt: columnShape(db, "narrator_tool_calls", "stream_completed_at"),
 	};
@@ -206,22 +236,25 @@ async function main() {
 		entries?: Array<{ tag?: string }>;
 	};
 	const tags = journal.entries?.map((entry) => entry.tag) ?? [];
-	if (tags.length !== migrationFiles.length || tags.at(-1) !== TARGET_TAG) {
-		throw new Error("0012 is not the journal tail");
+	if (tags.length !== migrationFiles.length || tags.at(-1) !== JOURNAL_TAIL_TAG) {
+		throw new Error(`${JOURNAL_TAIL_TAG} is not the journal tail`);
 	}
-	const target = migrationFiles.at(-1);
-	if (!target) throw new Error("Missing target migration");
+	const migrationsWithTags = migrationFiles.map((migration, index) => ({
+		...migration,
+		tag: tags[index],
+	}));
 
 	const db = new Database(database, { strict: true });
 	db.exec("PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON");
 	try {
 		const beforeLedger = new Set(ledger(db));
-		const pending = migrationFiles.filter((migration) => !beforeLedger.has(migration.hash));
-		if (pending.length !== 1 || pending[0].hash !== target.hash) {
-			throw new Error("Validation is limited to the single 0012 migration");
+		const pending = migrationsWithTags.filter((migration) => !beforeLedger.has(migration.hash));
+		const target = pending[0];
+		if (pending.length !== 1 || !target?.tag || !ALLOWED_TARGET_TAGS.has(target.tag)) {
+			throw new Error("Validation is limited to a single explicitly allowed migration");
 		}
 		const beforeCounts = rowCounts(db);
-		const beforeAffected = affectedSummary(db, true);
+		const beforeAffected = affectedSummary(db, target.tag, true);
 		const hadNextSeq = columns(db, "narrators").includes("next_seq");
 		if (hadNextSeq) {
 			db.exec("CREATE TEMP TABLE validation_next_seq_before AS SELECT id, next_seq FROM narrators");
@@ -234,14 +267,29 @@ async function main() {
 			throw new Error("Target migration hash was not applied");
 		}
 		const expectedCounts = { ...beforeCounts };
-		if (!("file_change_scope_recoveries" in expectedCounts)) {
-			expectedCounts.file_change_scope_recoveries = 0;
-		}
+		const newTable =
+			target.tag === "0012_curved_bloodstorm"
+				? "file_change_scope_recoveries"
+				: "workspace_write_leases";
+		if (!(newTable in expectedCounts)) expectedCounts[newTable] = 0;
 		if (canonical(rowCounts(db)) !== canonical(expectedCounts)) {
 			throw new Error("Existing table row counts changed");
 		}
-		if (canonical(affectedSummary(db, true)) !== canonical(beforeAffected)) {
+		if (canonical(affectedSummary(db, target.tag, true)) !== canonical(beforeAffected)) {
 			throw new Error("Existing affected-table fields changed");
+		}
+		if (target.tag === "0013_omniscient_dormammu") {
+			if (columns(db, "workspace_write_leases").length !== 15) {
+				throw new Error("workspace_write_leases does not have 15 columns");
+			}
+			const populatedLeaseIds = db
+				.query(
+					"SELECT count(*) AS count FROM file_change_scope_recoveries WHERE workspace_lease_id IS NOT NULL",
+				)
+				.get() as { count: number };
+			if (Number(populatedLeaseIds.count) !== 0) {
+				throw new Error("Existing recovery rows gained workspace_lease_id values");
+			}
 		}
 		const badNextSeq = db
 			.query(
@@ -265,7 +313,7 @@ async function main() {
 		try {
 			await runUpgrade(fresh);
 			if (canonical(schemaShape(db)) !== canonical(schemaShape(fresh))) {
-				throw new Error("0012 schema does not match a fresh migration schema");
+				throw new Error(`${target.tag} schema does not match a fresh migration schema`);
 			}
 		} finally {
 			fresh.close();
@@ -274,7 +322,7 @@ async function main() {
 		const firstState = canonical({
 			ledger: ledger(db),
 			counts: rowCounts(db),
-			affected: affectedSummary(db, false),
+			affected: affectedSummary(db, target.tag, false),
 			schema: schemaShape(db),
 		});
 		await runUpgrade(db);
@@ -282,7 +330,7 @@ async function main() {
 		const secondState = canonical({
 			ledger: ledger(db),
 			counts: rowCounts(db),
-			affected: affectedSummary(db, false),
+			affected: affectedSummary(db, target.tag, false),
 			schema: schemaShape(db),
 		});
 		if (firstState !== secondState) throw new Error("Upgrade is not idempotent");
@@ -294,7 +342,7 @@ async function main() {
 			sourceSha256: args.sourceSha256,
 			commit: args.commit,
 			version: args.version,
-			targetMigrations: pending.map((migration) => ({ tag: TARGET_TAG, hash: migration.hash })),
+			targetMigrations: pending.map((migration) => ({ tag: migration.tag, hash: migration.hash })),
 			checks: {
 				migrationApplied: true,
 				quickCheck: true,

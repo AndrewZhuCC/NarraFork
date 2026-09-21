@@ -2,6 +2,8 @@
 
 Usage: python3 scripts/install-local.py [--launchd-label LABEL] [--check | --validate-migrations | --prepare-update]
 This intentionally supports the local supervisor installation only, not ks-mini.
+After successful installation, remove older timestamped automatic backups and keep this backup.
+Special archives, symlinks and newer concurrent backups are preserved; --check never prunes.
 
 --prepare-update only prepares: it verifies the running server over /api/health and records a
 `stablePathInstall` handoff marker (launchdLabel/fromCommit/toCommit/certificateSha1) in
@@ -87,6 +89,34 @@ def validate_report(report, *, backup_sha256, source_sha256, commit, version, pe
             'idempotent': True,
         },
     }, 'Migration validation report is incomplete or does not match this install'
+
+
+def prune_previous_backups(state, current):
+    pattern = re.compile(r'backup-before-stable-signing-(\d{8}T\d{6})(\d{6})?Z')
+    current_match = pattern.fullmatch(current.name)
+    assert current.parent == state and current_match and current.is_dir() and not current.is_symlink()
+    required = ('narrafork-server', 'narrafork.db', 'placed-update.json', 'launcher-target.txt',
+                'launch-agent.plist', 'narrafork-launchd-supervisor', 'install-record.json')
+    for name in required:
+        path = current / name
+        assert path.is_file() and not path.is_symlink(), 'Current backup is incomplete'
+    current_stamp = current_match[1] + (current_match[2] or '000000')
+    removed, error_count, errors = 0, 0, []
+    with os.scandir(state) as entries:
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if not match or not entry.is_dir(follow_symlinks=False):
+                continue
+            if match[1] + (match[2] or '000000') >= current_stamp:
+                continue
+            try:
+                shutil.rmtree(entry.path)
+                removed += 1
+            except OSError as error:
+                error_count += 1
+                if len(errors) < 10:
+                    errors.append({'backup': entry.name, 'error': str(error)[:500]})
+    return {'removed': removed, 'errorCount': error_count, 'errors': errors}
 
 
 def main():
@@ -196,8 +226,10 @@ def main():
     if pending:
         assert validate_migrations, ('Validate pending migrations separately before installing',
                                      [entry['tag'] for entry in pending])
-        assert [entry['tag'] for entry in pending] == ['0012_curved_bloodstorm'], \
-            ('Validation is limited to migration 0012', [entry['tag'] for entry in pending])
+        assert [entry['tag'] for entry in pending] in (
+            ['0012_curved_bloodstorm'], ['0013_omniscient_dormammu'],
+        ), ('Validation is limited to a single reviewed migration (0012 or 0013)',
+            [entry['tag'] for entry in pending])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
         assert digest(validation_db) == backup_sha256
@@ -295,6 +327,12 @@ def main():
         for path in [temporary, placed_tmp, link_tmp]:
             if path.exists() or path.is_symlink():
                 path.unlink()
+    # Keep rollback material until validation and the atomic install have both succeeded.
+    # Cleanup failure must not invite replaying an already-successful installation.
+    try:
+        result['backupCleanup'] = prune_previous_backups(state, backup)
+    except (OSError, AssertionError) as error:
+        result['backupCleanup'] = {'errorCount': 1, 'error': str(error)[:500]}
     print(json.dumps(result), flush=True)
 
 
