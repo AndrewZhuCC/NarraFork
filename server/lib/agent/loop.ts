@@ -718,6 +718,10 @@ const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	"Execute",
+	SHELL_TOOL_NAME,
+	"Write",
+	"Edit",
+	"StructSed",
 	"Agent",
 	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
 	// let a wait/message run before the group barrier observes the sibling Agent's
@@ -751,18 +755,11 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 ]);
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
+	// Bash and mutating file tools can enter permission or reflection flows that reuse the
+	// provider session, so they must wait until the parent stream releases it in finally.
 	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
-	// Ordinary Bash is ordered, not necessarily deferred until the response ends.
 	// Pipeline/plan transitions still need the complete assistant message.
-	if (isStrictSerial(tu) && tu.name !== SHELL_TOOL_NAME) return false;
-	// Virtual task writes can enter a reflection loop. Keep that decision after
-	// request finalization rather than reflecting against an incomplete response.
-	if (
-		(tu.name === "Write" || tu.name === "Edit") &&
-		typeof tu.input.file_path === "string" &&
-		tu.input.file_path.startsWith("spec://")
-	)
-		return false;
+	if (isStrictSerial(tu)) return false;
 	// A stopped but malformed argument stream is not executable input.
 	if ("_raw" in tu.input) return false;
 	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,

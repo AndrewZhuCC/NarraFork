@@ -6,18 +6,26 @@ import type { AgentConfig, AgentEvent } from "../types";
 
 const REFLECTION_TOOL_NAME = "TestReflectDecisionTool";
 const NORMAL_TOOL_NAME = "TestReflectNormalTool";
+const PROVIDER_SESSION_TOOLS = ["Bash", "Write", "Edit", "StructSed"] as const;
+const EAGER_READ_TOOL = "Read";
 
 /** Records the order in which each tool's execute() started. */
 const executionOrder: string[] = [];
 
 const KNOWLEDGE_TOOLS = ["KnowledgeCreate", "KnowledgeEdit", "KnowledgeReview", "KnowledgeAdmin"];
-let scenario: "reflection" | "normal" | "reflection_then_normal" | "knowledge" = "reflection";
+let scenario: "reflection" | "normal" | "reflection_then_normal" | "knowledge" | "session_tool" =
+	"reflection";
 let knowledgeToolName = KNOWLEDGE_TOOLS[0];
 let knowledgeChunks = false;
+let sessionToolName: (typeof PROVIDER_SESSION_TOOLS)[number] | typeof EAGER_READ_TOOL = "Bash";
+let sessionToolInputOverride: Record<string, unknown> | undefined;
 let streamReleased = false;
 let knowledgeRequests = 0;
+let sessionToolRequests = 0;
 const permissionAfterRelease: boolean[] = [];
+const executionAfterRelease: boolean[] = [];
 let onNormalStarted: (() => void) | undefined;
+let onSessionToolStarted: (() => void) | undefined;
 
 const testProvider: ProviderAdapter = {
 	formatTools: (tools) => tools,
@@ -25,6 +33,40 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
+		if (scenario === "session_tool") {
+			if (sessionToolRequests++ > 0) {
+				yield { text: "done" };
+				return;
+			}
+			try {
+				let resolveSessionToolStarted!: () => void;
+				const sessionToolStarted = new Promise<void>((resolve) => {
+					resolveSessionToolStarted = resolve;
+				});
+				onSessionToolStarted = resolveSessionToolStarted;
+				const input =
+					sessionToolInputOverride ??
+					(sessionToolName === "Bash"
+						? { command: "custom-command" }
+						: sessionToolName === "Read"
+							? { file_path: "/tmp/input.txt" }
+							: sessionToolName === "StructSed"
+								? { file_path: "/tmp/output.txt", content: "x", dry_run: false }
+								: { file_path: "/tmp/output.txt", content: "x" });
+				yield {
+					toolUses: [{ toolUseId: "tu_session_tool", name: sessionToolName, input }],
+				};
+				yield { text: "trailing text before provider cleanup" };
+				if (sessionToolName === EAGER_READ_TOOL) {
+					await sessionToolStarted;
+				} else {
+					await new Promise((resolve) => setTimeout(resolve, 1));
+				}
+			} finally {
+				streamReleased = true;
+			}
+			return;
+		}
 		if (scenario === "knowledge") {
 			if (knowledgeRequests++ > 0) {
 				yield { text: "done" };
@@ -123,6 +165,29 @@ toolRegistry.register({
 });
 
 const originalKnowledgeTools = KNOWLEDGE_TOOLS.map((name) => toolRegistry.get(name));
+const sessionToolNames = [...PROVIDER_SESSION_TOOLS, EAGER_READ_TOOL];
+const originalSessionTools = sessionToolNames.map((name) => toolRegistry.get(name));
+for (const name of sessionToolNames) {
+	toolRegistry.register({
+		name,
+		description: `Provider-session boundary test tool ${name}`,
+		parameters: z.object({
+			command: z.string().optional(),
+			file_path: z.string().optional(),
+			content: z.string().optional(),
+			dry_run: z.boolean().optional(),
+		}),
+		execute: async (args, ctx) => {
+			executionOrder.push(name);
+			executionAfterRelease.push(streamReleased);
+			onSessionToolStarted?.();
+			if (name !== EAGER_READ_TOOL) {
+				await ctx.requestPermission(name, args, ctx.currentToolUseId ?? "");
+			}
+			return { output: `ran:${name}` };
+		},
+	});
+}
 for (const name of KNOWLEDGE_TOOLS) {
 	toolRegistry.register({
 		name,
@@ -143,13 +208,18 @@ afterAll(() => {
 		if (original) toolRegistry.register(original);
 		else toolRegistry.unregister(KNOWLEDGE_TOOLS[i]);
 	}
+	for (let i = 0; i < sessionToolNames.length; i++) {
+		const original = originalSessionTools[i];
+		if (original) toolRegistry.register(original);
+		else toolRegistry.unregister(sessionToolNames[i]);
+	}
 	mock.module("../provider", () => realProviderModule);
 	toolRegistry.unregister(REFLECTION_TOOL_NAME);
 	toolRegistry.unregister(NORMAL_TOOL_NAME);
 	mock.restore();
 });
 
-function makeConfig(signal: AbortSignal): AgentConfig {
+function makeConfig(signal: AbortSignal, overrides: Partial<AgentConfig> = {}): AgentConfig {
 	return {
 		narratorId: "n-reflect-eager",
 		conversationId: "conv-reflect-eager",
@@ -158,6 +228,7 @@ function makeConfig(signal: AbortSignal): AgentConfig {
 		cwd: "/tmp",
 		signal,
 		permissionHandler: async () => ({ behavior: "allow" }),
+		...overrides,
 	};
 }
 
@@ -209,6 +280,67 @@ describe("knowledge approval waits for the parent provider stream to close", () 
 			}
 		}
 	}
+});
+
+describe("provider-session tools wait for the parent stream release", () => {
+	for (const name of PROVIDER_SESSION_TOOLS) {
+		test(`${name} permission and execution start after provider finally`, async () => {
+			scenario = "session_tool";
+			sessionToolName = name;
+			sessionToolInputOverride = undefined;
+			sessionToolRequests = 0;
+			streamReleased = false;
+			executionOrder.length = 0;
+			executionAfterRelease.length = 0;
+			permissionAfterRelease.length = 0;
+			onSessionToolStarted = undefined;
+			const config = makeConfig(new AbortController().signal, {
+				permissionHandler: async () => {
+					permissionAfterRelease.push(streamReleased);
+					return { behavior: "allow" };
+				},
+			});
+			for await (const event of agentLoop(config, "run session tool", [])) {
+				if (event.type === "error") throw new Error(event.message);
+			}
+			expect(streamReleased).toBe(true);
+			expect(executionOrder).toEqual([name]);
+			expect(executionAfterRelease).toEqual([true]);
+			expect(permissionAfterRelease.length).toBeGreaterThan(0);
+			expect(permissionAfterRelease.every(Boolean)).toBe(true);
+		});
+	}
+
+	test("spec task Write remains post-stream while ordinary Read remains eager", async () => {
+		scenario = "session_tool";
+		sessionToolName = "Write";
+		sessionToolInputOverride = { file_path: "spec://tasks.json", content: '{"tasks":[]}' };
+		sessionToolRequests = 0;
+		streamReleased = false;
+		executionOrder.length = 0;
+		executionAfterRelease.length = 0;
+		for await (const event of agentLoop(
+			makeConfig(new AbortController().signal),
+			"update tasks",
+			[],
+		)) {
+			if (event.type === "error") throw new Error(event.message);
+		}
+		expect(executionAfterRelease).toEqual([true]);
+
+		sessionToolName = EAGER_READ_TOOL;
+		sessionToolInputOverride = undefined;
+		sessionToolRequests = 0;
+		streamReleased = false;
+		executionOrder.length = 0;
+		executionAfterRelease.length = 0;
+		onSessionToolStarted = undefined;
+		for await (const event of agentLoop(makeConfig(new AbortController().signal), "read", [])) {
+			if (event.type === "error") throw new Error(event.message);
+		}
+		expect(executionOrder).toEqual([EAGER_READ_TOOL]);
+		expect(executionAfterRelease).toEqual([false]);
+	});
 });
 
 describe("reflection-only tools are not eager-executed mid-stream", () => {

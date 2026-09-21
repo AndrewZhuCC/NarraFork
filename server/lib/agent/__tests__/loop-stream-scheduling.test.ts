@@ -21,7 +21,11 @@ const started: string[] = [];
 const starts = new Map<string, ReturnType<typeof gate>>();
 const finishes = new Map<string, ReturnType<typeof gate>>();
 const executionFailures = new Set<string>();
+const EAGER_WRITE_TOOL = "TestEagerWrite";
+const EAGER_EDIT_TOOL = "TestEagerEdit";
 const names = [
+	EAGER_WRITE_TOOL,
+	EAGER_EDIT_TOOL,
 	"Write",
 	"Edit",
 	"Read",
@@ -145,8 +149,8 @@ describe("ordered streaming tool scheduling", () => {
 		const streamPending = gate();
 		const endStream = gate();
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0)] };
-			yield { toolUseChunk: { toolUseId: "edit", name: "Edit", outputIndex: 1 } };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0)] };
+			yield { toolUseChunk: { toolUseId: "edit", name: EAGER_EDIT_TOOL, outputIndex: 1 } };
 			editInputOpen.resolve();
 			await completeEdit.promise;
 			yield { toolUseChunk: { toolUseId: "edit", input: '{"value":"edit"}', stop: true } };
@@ -195,15 +199,15 @@ describe("ordered streaming tool scheduling", () => {
 			const endStream = gate();
 			script = async function* () {
 				if (shape === "one reversed batch") {
-					yield { toolUses: [tool("Read", "second", 1), tool("Write", "first", 0)] };
+					yield { toolUses: [tool("Read", "second", 1), tool(EAGER_WRITE_TOOL, "first", 0)] };
 				} else {
 					if (shape === "mixed complete and partial event") {
 						yield {
 							toolUses: [tool("Read", "second", 1)],
-							toolUseChunk: { toolUseId: "first", name: "Write", outputIndex: 0 },
+							toolUseChunk: { toolUseId: "first", name: EAGER_WRITE_TOOL, outputIndex: 0 },
 						};
 					} else {
-						yield { toolUseChunk: { toolUseId: "first", name: "Write", outputIndex: 0 } };
+						yield { toolUseChunk: { toolUseId: "first", name: EAGER_WRITE_TOOL, outputIndex: 0 } };
 						yield { toolUses: [tool("Read", "second", 1)] };
 					}
 					secondReady.resolve();
@@ -263,7 +267,7 @@ describe("ordered streaming tool scheduling", () => {
 		const write = watch("write");
 		const read = watch("read");
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0)] };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0)] };
 			yield { toolUses: [tool("Read", "read", 1)], text: "next chunk" };
 			nextChunkConsumed.resolve();
 			await endStream.promise;
@@ -338,7 +342,7 @@ describe("ordered streaming tool scheduling", () => {
 		const read = watch("read");
 		const lifecycle: string[] = [];
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0), tool("Read", "read", 1)] };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0), tool("Read", "read", 1)] };
 			streamPending.resolve();
 			await endStream.promise;
 		};
@@ -383,7 +387,7 @@ describe("ordered streaming tool scheduling", () => {
 		const streamPending = gate();
 		const endStream = gate();
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0), tool("Read", "read", 1)] };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0), tool("Read", "read", 1)] };
 			streamPending.resolve();
 			await endStream.promise;
 		};
@@ -407,9 +411,9 @@ describe("ordered streaming tool scheduling", () => {
 			const failureDelivered = gate();
 			let returned = false;
 			script = async function* () {
-				yield { toolUses: [tool("Write", "write", 0)] };
+				yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0)] };
 				await write.started;
-				yield { toolUses: [tool("Edit", "edit", 1)] };
+				yield { toolUses: [tool(EAGER_EDIT_TOOL, "edit", 1)] };
 				editQueued.resolve();
 				await failStream.promise;
 				if (ending === "throw") {
@@ -474,7 +478,7 @@ describe("ordered streaming tool scheduling", () => {
 			const ac = new AbortController();
 			let stopped = false;
 			script = async function* () {
-				yield { toolUses: [tool("Write", "write", 0)] };
+				yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0)] };
 				await write.started;
 				await nextTick();
 				if (ending === "abort") ac.abort();
@@ -507,7 +511,7 @@ describe("detached eager tool results after interruption", () => {
 		const persisted = gate();
 		const detached: Array<Extract<AgentEvent, { type: "tool_result" }>> = [];
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0), tool("Edit", "queued", 1)] };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0), tool(EAGER_EDIT_TOOL, "queued", 1)] };
 			await afterEntered.promise;
 			ac.abort();
 			throw new Error("Aborted");
@@ -560,7 +564,9 @@ describe("detached eager tool results after interruption", () => {
 			const detached: Array<Extract<AgentEvent, { type: "tool_result" }>> = [];
 			if (failed) executionFailures.add("write");
 			script = async function* () {
-				yield { toolUses: [tool("Write", "write", 0), tool("Edit", "queued", 1)] };
+				yield {
+					toolUses: [tool(EAGER_WRITE_TOOL, "write", 0), tool(EAGER_EDIT_TOOL, "queued", 1)],
+				};
 				await write.started;
 				ac.abort();
 				throw new Error("Aborted");
@@ -601,7 +607,7 @@ describe("detached eager tool results after interruption", () => {
 		const write = watch("write");
 		const detached = mock(async (_event: AgentEvent) => {});
 		script = async function* () {
-			yield { toolUses: [tool("Write", "write", 0)] };
+			yield { toolUses: [tool(EAGER_WRITE_TOOL, "write", 0)] };
 			await write.started;
 			await nextTick();
 			ac.abort();

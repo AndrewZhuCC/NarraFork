@@ -22,17 +22,6 @@ let executionBeforeInputComplete: string[] = [];
 let executionBeforeStreamEnd: string[] = [];
 let executionWhileBashPending: string[] = [];
 
-function gate() {
-	let resolve!: () => void;
-	const promise = new Promise<void>((done) => {
-		resolve = done;
-	});
-	return { promise, resolve };
-}
-
-let bashStarted = gate();
-let releaseBash = gate();
-let readAfterStarted = gate();
 const nextTick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 const PARALLEL_TOOL_NAMES = ["Read", "Glob", "Grep"] as const;
@@ -85,11 +74,8 @@ const testProvider: ProviderAdapter = {
 					{ toolUseId: "tu_after", name: "Read", input: { value: "after" }, outputIndex: 2 },
 				],
 			};
-			await bashStarted.promise;
 			await nextTick();
 			executionWhileBashPending = [...executionOrder];
-			releaseBash.resolve();
-			await readAfterStarted.promise;
 			executionBeforeStreamEnd = [...executionOrder];
 			return;
 		}
@@ -173,7 +159,6 @@ for (const name of PARALLEL_TOOL_NAMES) {
 		parameters: z.object({ value: z.string() }),
 		execute: async (args) => {
 			executionOrder.push(`${name}:${args.value}`);
-			if (scenario === "bash_barrier" && args.value === "after") readAfterStarted.resolve();
 			if (scenario === "parallel_all_reject" || name === "Glob") {
 				throw new Error(`boom:${args.value}`);
 			}
@@ -189,8 +174,6 @@ toolRegistry.register({
 	parameters: z.object({ parallel: z.boolean().optional(), strict_serial: z.boolean().optional() }),
 	execute: async () => {
 		executionOrder.push("Bash");
-		bashStarted.resolve();
-		await releaseBash.promise;
 		return { output: "bash-done" };
 	},
 });
@@ -254,12 +237,12 @@ function toolResults(events: AgentEvent[]): Extract<AgentEvent, { type: "tool_re
 
 describe("Bash streaming barriers", () => {
 	for (const streamed of [true, false]) {
-		for (const [label, input, eager] of [
-			["parallel opt-in", { parallel: true }, true],
-			["default serial", {}, false],
-			["explicit strict serial", { parallel: true, strict_serial: true }, false],
+		for (const [label, input] of [
+			["parallel opt-in", { parallel: true }],
+			["default serial", {}],
+			["explicit strict serial", { parallel: true, strict_serial: true }],
 		] as const) {
-			test(`${streamed ? "chunked" : "complete"} ${label} uses completed input for subsequent Read`, async () => {
+			test(`${streamed ? "chunked" : "complete"} ${label} waits for stream end before subsequent Read`, async () => {
 				scenario = "bash_barrier";
 				providerAttempts = 0;
 				executionOrder.length = 0;
@@ -267,9 +250,6 @@ describe("Bash streaming barriers", () => {
 				executionBeforeInputComplete = [];
 				executionBeforeStreamEnd = [];
 				executionWhileBashPending = [];
-				bashStarted = gate();
-				releaseBash = gate();
-				readAfterStarted = gate();
 				bashInput = input;
 				streamBashInput = streamed;
 				const events: AgentEvent[] = [];
@@ -281,10 +261,9 @@ describe("Bash streaming barriers", () => {
 					events.push(event);
 				}
 				expect(executionBeforeInputComplete).toEqual([]);
-				expect(executionWhileBashPending.includes("Read:after")).toBe(eager);
-				if (!eager) expect(executionWhileBashPending).toEqual(["Bash"]);
-				expect(executionBeforeStreamEnd).toContain("Read:after");
-				expect(executionBeforeStreamEnd[0]).toBe("Bash");
+				expect(executionWhileBashPending).toEqual([]);
+				expect(executionBeforeStreamEnd).toEqual([]);
+				expect(executionOrder[0]).toBe("Bash");
 				expect(executionOrder).toContain("Bash");
 				expect(executionOrder).toContain("Read:after");
 				if (streamed) expect(executionOrder).toContain("Read:pending");
