@@ -12,6 +12,7 @@ import {
 	apiRequests,
 	narratorMessageRefs,
 	narratorMessages,
+	narrators,
 	narratorToolCalls,
 } from "../db/schema";
 import type { AgentEvent } from "../lib/agent";
@@ -26,6 +27,7 @@ import {
 	startApiRequest,
 } from "../lib/api-request-tracker";
 import { updateCustomApiQuotaByPrefix } from "../lib/custom-api-quota-cache";
+import { withDbRetry } from "../lib/db-resilience";
 import { eventBus } from "../lib/event-bus";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
@@ -48,6 +50,65 @@ import {
 	truncateToolIO,
 } from "./narrator-service";
 import { recordOutputChunk } from "./output-stats";
+
+/**
+ * Finish an already-started tool after its loop has drained/aborted. This intentionally
+ * takes no EventHandlerContext: a newer turn may own the streaming snapshot and hooks.
+ * Only the original execution receipt can update history; never recover it by provider id.
+ */
+export async function persistDetachedToolResult(
+	narratorId: string,
+	event: Extract<AgentEvent, { type: "tool_result" }>,
+): Promise<void> {
+	const binding = event.toolCallBinding;
+	if (!binding) {
+		throw new CriticalEventPersistenceError("Detached tool result has no execution receipt");
+	}
+	// The generator is already gone, so a transient lock cannot rely on its normal
+	// tool_result retry path. Retry asynchronously and retain the same CAS authority.
+	const affected = await withDbRetry(
+		() =>
+			narratorPersistence.updateToolCallResult(event.toolUseId, {
+				expectedBinding: { ...binding, narratorId },
+				output: event.metadata ? { _text: event.output, _metadata: event.metadata } : event.output,
+				input: event.brokenInputOverride ?? event.updatedInput ?? event.input,
+				status: event.isError ? "fail" : "success",
+				errorMessage: event.isError ? event.output : undefined,
+				durationMs: event.durationMs,
+				permissionStartedAt: event.permissionStartedAt,
+				executionStartedAt: event.executionStartedAt,
+				completedAt: event.completedAt,
+			}),
+		{ label: "persistDetachedToolResult", maxRetries: 3 },
+	);
+	if (!affected) return;
+
+	// Refresh persisted history, not tool_completed (which mutates live streaming
+	// state by toolUseId). Project the current row so a newer attempt remains visible.
+	const message = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, affected.messageId),
+		with: { toolCalls: true },
+	});
+	const ref = await db.query.narratorMessageRefs.findFirst({
+		where: and(
+			eq(narratorMessageRefs.narratorId, narratorId),
+			eq(narratorMessageRefs.messageId, affected.messageId),
+		),
+		columns: { seq: true },
+	});
+	if (!message || !ref) return;
+	const owner = await db.query.narrators.findFirst({
+		where: eq(narrators.id, narratorId),
+		columns: { type: true, parentNarratorId: true },
+	});
+	const broadcastTargetId =
+		owner?.type === "subagent" ? (owner.parentNarratorId ?? narratorId) : narratorId;
+	const projected = enrichToolUseBlocks(truncateToolIO([{ ...message, seq: ref.seq }]))[0];
+	dualBroadcastToNarrator(
+		{ narratorId, broadcastTargetId, parentToolUseId: message.parentToolUseId },
+		{ type: "message_updated", narratorId: broadcastTargetId, message: projected },
+	);
+}
 
 // === Context types ===
 
@@ -101,8 +162,17 @@ export interface EventHandlerContext {
 	getTurnStartedAt?: () => string | undefined;
 	/** Trusted in-memory execution location, sampled once at the start of each text block. */
 	getFileReferenceContext?: () => FileReferenceContext | null | undefined;
-	/** Text-lane contexts survive device switches until their own block_complete. */
+	/** Loop-ID contexts survive checkpoints/device switches until the turn settles. */
 	fileReferenceContexts?: FileReferenceContextTracker;
+	/** Raw (pre-sanitization) committed stream bases for same-ID deltas after a checkpoint. */
+	committedContentSnapshots?: Map<
+		string,
+		Extract<SnapshotStreamingBlock, { type: "text" | "reasoning" }>
+	>;
+	/** Avoid translating the same checkpoint concurrently while metadata catches up. */
+	reasoningTranslations?: Set<string>;
+	/** Retry publication after a checkpoint write succeeded but its announce failed. */
+	unpublishedContentBlockIds?: Set<string>;
 	getTtftMs?: () => number | undefined;
 	setPartialMessageId: (id: string | undefined) => void;
 	setContextUsagePct: (pct: number) => void;
@@ -210,18 +280,7 @@ export interface EventHooks {
 	onClearCompactSummary?: () => Promise<void>;
 	/** Git status tracking after file-mutating tools and completed Bash commands */
 	onGitTrack?: (toolName: string, toolUseId: string, input?: Record<string, unknown>) => void;
-	/**
-	 * Snapshot: record the workspace tree hash before a file-mutating tool executes.
-	 *
-	 * Awaited, because the captured state must predate the tool's writes. All
-	 * file-mutating tools are excluded from the loop's eager execution, so the tool
-	 * has not started when this runs.
-	 *
-	 * `input` is passed because a shared worktree makes the tree hash alone
-	 * ambiguous: it captures every actor's writes in the window, so the tool's own
-	 * declaration of what it will write (Write/Edit's `file_path`) is needed to
-	 * attribute the resulting delta. It is complete at this point in the event.
-	 */
+	/** Legacy direct-call adapter only; processEvent never triggers workspace captures. */
 	onSnapshotBefore?: (toolUseId: string, toolName: string, input: unknown) => Promise<void> | void;
 	/** Snapshot: record the workspace tree hash after a file-mutating tool completes */
 	onSnapshotAfter?: (toolUseId: string, toolName: string) => Promise<void> | void;
@@ -293,7 +352,14 @@ export interface ToolChunkSnapshot {
 
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type SnapshotStreamingBlock =
-	| { type: "reasoning"; id?: string; outputIndex?: number; text: string }
+	| {
+			type: "reasoning";
+			id?: string;
+			revision?: number;
+			outputIndex?: number;
+			text: string;
+			textOffset?: number;
+	  }
 	| {
 			type: "web_search";
 			id: string;
@@ -320,7 +386,10 @@ export type SnapshotStreamingBlock =
 			type: "text";
 			text: string;
 			id?: string;
+			revision?: number;
 			outputIndex?: number;
+			/** Absolute raw UTF-16 start; normally zero, nonzero only for a missing prefix. */
+			textOffset?: number;
 			fileReferenceContext?: FileReferenceContext | null;
 	  };
 
@@ -348,6 +417,53 @@ function getOrCreateSnapshot(narratorId: string): StreamingSnapshot {
 		streamingSnapshots.set(narratorId, snap);
 	}
 	return snap;
+}
+
+async function persistContentCheckpoint(
+	ctx: EventHandlerContext,
+	messageId: string,
+	block: Extract<
+		Parameters<typeof narratorService.appendBlockToMessage>[2],
+		{ type: "text" | "reasoning" }
+	>,
+): Promise<void> {
+	try {
+		await narratorService.appendBlockToMessage(messageId, ctx.narratorId, block, {
+			republishUnchanged: !!block.id && ctx.unpublishedContentBlockIds?.has(block.id),
+		});
+		if (block.id) ctx.unpublishedContentBlockIds?.delete(block.id);
+	} catch (error) {
+		if (block.id) {
+			ctx.unpublishedContentBlockIds ??= new Set();
+			ctx.unpublishedContentBlockIds.add(block.id);
+		}
+		throw error;
+	}
+}
+
+/** Append by the loop's raw UTF-16 coordinates, never by sanitized persisted text. */
+function appendRawStreamText(
+	previous: { text: string; textOffset?: number } | undefined,
+	text: string,
+	textOffset?: number,
+): { text: string; textOffset?: number } {
+	if (textOffset == null) {
+		return {
+			text: (previous?.text ?? "") + text,
+			...(previous?.textOffset != null ? { textOffset: previous.textOffset } : {}),
+		};
+	}
+	const previousStart = previous?.textOffset ?? 0;
+	const previousEnd = previousStart + (previous?.text.length ?? 0);
+	if (!previous || textOffset > previousEnd || textOffset < previousStart) {
+		// A missing prefix/gap cannot be invented. Reconnect consumers receive its
+		// absolute offset and can request the durable copy rather than guess a join.
+		return { text, textOffset };
+	}
+	return {
+		text: previous.text + text.slice(Math.max(0, previousEnd - textOffset)),
+		textOffset: previousStart,
+	};
 }
 
 function getSnapshotBlockOutputIndex(block: SnapshotStreamingBlock): number | undefined {
@@ -602,6 +718,8 @@ async function discardAttemptPersistedBlocks(
 	clearStreamingSnapshot(broadcastTargetId);
 	if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
 	ctx.fileReferenceContexts?.clear();
+	ctx.committedContentSnapshots?.clear();
+	ctx.unpublishedContentBlockIds?.clear();
 	dualBroadcast(ctx, {
 		type: "streaming_reset",
 		narratorId: broadcastTargetId,
@@ -746,7 +864,9 @@ const LOCALE_NAMES: Record<string, string> = {
 
 type PersistedReasoningBlock = {
 	type?: string;
+	id?: string;
 	text?: string;
+	translatedText?: string;
 	outputIndex?: number;
 	providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
 };
@@ -761,11 +881,20 @@ function getReasoningItemId(
 function findReasoningBlockIndex(
 	blocks: unknown[],
 	locator: {
+		id?: string;
 		reasoningText: string;
 		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
 		outputIndex?: number;
 	},
 ): number {
+	if (locator.id) {
+		// An attempt-scoped ID must never fall back to text/outputIndex and attach
+		// an old translation to a different block after a retry.
+		return blocks.findIndex((block) => {
+			const candidate = block as PersistedReasoningBlock;
+			return candidate?.type === "reasoning" && candidate.id === locator.id;
+		});
+	}
 	const targetItemId = getReasoningItemId(locator.providerMetadata);
 	if (targetItemId) {
 		for (let i = blocks.length - 1; i >= 0; i--) {
@@ -840,6 +969,7 @@ function translateReasoningBlock(
 	reasoningText: string,
 	ctx: EventHandlerContext,
 	locator?: {
+		id?: string;
 		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
 		outputIndex?: number;
 	},
@@ -849,9 +979,26 @@ function translateReasoningBlock(
 	if (locale === "en") return;
 
 	const langName = LOCALE_NAMES[locale] || locale;
+	const translationKey = JSON.stringify([
+		messageId,
+		locator?.id,
+		locator?.outputIndex,
+		reasoningText,
+	]);
+	ctx.reasoningTranslations ??= new Set();
+	if (ctx.reasoningTranslations.has(translationKey)) return;
+	ctx.reasoningTranslations.add(translationKey);
 
 	(async () => {
 		try {
+			const before = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true },
+			});
+			const beforeBlocks = Array.isArray(before?.contentJson) ? before.contentJson : [];
+			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
+			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
+			if (!isSameReasoningBlock(beforeBlock, reasoningText) || beforeBlock?.translatedText) return;
 			const result = await summaryGenerate(
 				reasoningText,
 				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
@@ -866,8 +1013,7 @@ function translateReasoningBlock(
 			if (!translated) return;
 
 			// Find the exact reasoning block in the message.
-			// Prefer stable identifiers (OpenAI itemId, then outputIndex), and only
-			// fall back to text matching for older persisted messages.
+			// Prefer loop identity; provider coordinates/text are legacy-only fallbacks.
 			const msg = await db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 				columns: { contentJson: true },
@@ -875,6 +1021,7 @@ function translateReasoningBlock(
 			if (!msg) return;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const targetIdx = findReasoningBlockIndex(blocks, {
+				id: locator?.id,
 				reasoningText,
 				providerMetadata: locator?.providerMetadata,
 				outputIndex: locator?.outputIndex,
@@ -885,7 +1032,16 @@ function translateReasoningBlock(
 			// See isSameReasoningBlock.
 			if (!isSameReasoningBlock(blocks[targetIdx], reasoningText)) return;
 
-			await narratorService.patchReasoningTranslation(messageId, targetIdx, translated);
+			const patched = await narratorService.patchReasoningTranslation(
+				messageId,
+				targetIdx,
+				translated,
+				{
+					id: locator?.id,
+					text: reasoningText,
+				},
+			);
+			if (!patched) return;
 
 			// Broadcast updated message so frontend picks up the translation
 			const fullMessage = await db.query.narratorMessages.findFirst({
@@ -915,6 +1071,8 @@ function translateReasoningBlock(
 				messageId,
 				error: String(err),
 			});
+		} finally {
+			ctx.reasoningTranslations?.delete(translationKey);
 		}
 	})();
 }
@@ -940,8 +1098,19 @@ export async function processEvent(
 			const fileReferenceContext = ctx.fileReferenceContexts.capture(
 				event.outputIndex,
 				ctx.getFileReferenceContext,
+				event.blockId,
 			);
-			const textBlockId = ctx.fileReferenceContexts.blockId(event.outputIndex);
+			const textBlockId = event.blockId ?? ctx.fileReferenceContexts.blockId(event.outputIndex);
+			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
+			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
+			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const latestRevision = existing?.type === "text" ? existing.revision : base?.revision;
+			if (
+				event.blockRevision != null &&
+				latestRevision != null &&
+				event.blockRevision <= latestRevision
+			)
+				return null;
 			// Clear "reasoning" substatus when text starts (reasoning phase ended)
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -959,10 +1128,14 @@ export async function processEvent(
 
 			// Text snapshots belong to the actual author (also on a subagent's own
 			// page), never to a different narrator sharing the parent's subscription.
-			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
-			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
+			const rawText = appendRawStreamText(
+				existing?.type === "text" ? existing : base?.type === "text" ? base : undefined,
+				event.text,
+				event.blockTextOffset,
+			);
 			if (existing?.type === "text") {
-				existing.text += event.text;
+				Object.assign(existing, rawText);
+				if (event.blockRevision != null) existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
@@ -970,7 +1143,8 @@ export async function processEvent(
 					{
 						type: "text",
 						id: textBlockId,
-						text: event.text,
+						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						...rawText,
 						outputIndex: event.outputIndex,
 						fileReferenceContext,
 					},
@@ -979,7 +1153,13 @@ export async function processEvent(
 
 			const streamEvent: Record<string, unknown> = {
 				type: "content_block_delta",
-				delta: { type: "text_delta", text: event.text, id: textBlockId },
+				delta: {
+					type: "text_delta",
+					text: event.text,
+					id: textBlockId,
+					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+				},
 				fileReferenceContext,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 			};
@@ -997,7 +1177,13 @@ export async function processEvent(
 				type: "stream_event",
 				data: {
 					type: "content_block_delta",
-					delta: { type: "text_delta", text: event.text, id: textBlockId },
+					delta: {
+						type: "text_delta",
+						text: event.text,
+						id: textBlockId,
+						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					},
 					fileReferenceContext,
 					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
 				},
@@ -1006,11 +1192,7 @@ export async function processEvent(
 		}
 
 		case "tool_call": {
-			// Snapshot: capture tree state before the tool modifies files. Awaited so
-			// the snapshot cannot race the tool's own writes.
-			if (hooks?.onSnapshotBefore) {
-				await hooks.onSnapshotBefore(event.toolUseId, event.toolName, event.input);
-			}
+			// Workspace captures belong to executeTool's awaited lifecycle, not UI events.
 			const routing = subagentToolRouting(ctx, event.toolUseId);
 			// The child row's label. Computed once and reused by both the snapshot and
 			// the reduced parent frame — `input` is complete here, so this is the
@@ -1158,12 +1340,14 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 			const textBlockId =
-				block.type === "text" ? ctx.fileReferenceContexts?.blockId(block.outputIndex) : undefined;
+				block.type === "text"
+					? (block.id ?? ctx.fileReferenceContexts?.blockId(block.outputIndex))
+					: undefined;
 			const mixedTextSources =
-				block.type === "text" && ctx.fileReferenceContexts?.hasDifferentContexts();
+				block.type === "text" && !block.id && ctx.fileReferenceContexts?.hasDifferentContexts();
 			let fileReferenceContext =
 				block.type === "text"
-					? (ctx.fileReferenceContexts?.complete(block.outputIndex) ?? null)
+					? (ctx.fileReferenceContexts?.peek(block.outputIndex, block.id) ?? null)
 					: null;
 			if (mixedTextSources && block.type === "text") {
 				// The loop can combine multiple output items into one block_complete.
@@ -1177,47 +1361,55 @@ export async function processEvent(
 				if (streamed?.type !== "text" || streamed.text !== block.text) fileReferenceContext = null;
 			}
 
-			// Snapshot: remove the completed block from the ordered streaming blocks.
-			// The completed block will be served via the partial message from the
-			// database, so the snapshot should only contain blocks still being streamed.
-			if (block.type === "text" || !ctx.parentToolUseId) {
-				const snap = streamingSnapshots.get(ctx.parentToolUseId ? narratorId : broadcastTargetId);
-				if (snap) {
-					if (block.type === "text") {
-						// Remove the completed text block (prefer exact provider outputIndex).
-						const idx =
-							block.outputIndex != null
-								? snap.streamingBlocks.findIndex(
-										(b) => b.type === "text" && b.outputIndex === block.outputIndex,
-									)
-								: (() => {
-										for (let i = snap.streamingBlocks.length - 1; i >= 0; i--) {
-											if (snap.streamingBlocks[i].type === "text") return i;
-										}
-										return -1;
-									})();
-						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
-					} else if (block.type === "reasoning") {
-						const idx =
-							block.outputIndex != null
-								? snap.streamingBlocks.findIndex(
-										(b) => b.type === "reasoning" && b.outputIndex === block.outputIndex,
-									)
-								: snap.streamingBlocks.findIndex((b) => b.type === "reasoning");
-						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
-					} else if (block.type === "web_search") {
-						const idx = snap.streamingBlocks.findIndex(
-							(b) => b.type === "web_search" && b.id === block.id,
-						);
-						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
-					} else if (block.type === "image_generation") {
-						const idx = snap.streamingBlocks.findIndex(
-							(b) => b.type === "image_generation" && b.id === block.id,
-						);
-						if (idx !== -1) snap.streamingBlocks.splice(idx, 1);
+			// Capture the exact live object, but keep it visible until BOTH persistence
+			// and publication finish. A later delta may advance it while we await I/O.
+			const snap = streamingSnapshots.get(ctx.parentToolUseId ? narratorId : broadcastTargetId);
+			const completedSnapshot = snap?.streamingBlocks.find((candidate) => {
+				if (candidate.type !== block.type) return false;
+				if (block.type === "text" || block.type === "reasoning") {
+					if (block.id) return candidate.id === block.id;
+					if (block.type === "text" && textBlockId) return candidate.id === textBlockId;
+					return block.outputIndex == null || candidate.outputIndex === block.outputIndex;
+				}
+				return "id" in block && candidate.id === block.id;
+			});
+			const capturedText =
+				completedSnapshot && "text" in completedSnapshot ? completedSnapshot.text : undefined;
+			const retireCompletedSnapshot = () => {
+				if ((block.type === "text" || block.type === "reasoning") && block.id) {
+					const base = ctx.committedContentSnapshots?.get(block.id);
+					if (base && block.revision != null && block.revision > (base.revision ?? -1)) {
+						// Metadata-only checkpoints still advance the latest known revision,
+						// so an out-of-order old delta cannot resurrect the retired prefix.
+						base.revision = block.revision;
 					}
 				}
-			}
+				if (!snap || !completedSnapshot) return;
+				const index = snap.streamingBlocks.indexOf(completedSnapshot);
+				if (index === -1) return;
+				if (
+					(block.type === "text" || block.type === "reasoning") &&
+					(completedSnapshot.type === "text" || completedSnapshot.type === "reasoning")
+				) {
+					if (block.id) {
+						if (
+							completedSnapshot.revision != null &&
+							(block.revision == null || completedSnapshot.revision > block.revision)
+						)
+							return;
+						ctx.committedContentSnapshots ??= new Map();
+						// Keep the raw streamed prefix, NOT block.text: the loop sanitizes its
+						// durable text (e.g. think tags/plan bodies), so the two can differ.
+						ctx.committedContentSnapshots.set(block.id, {
+							...completedSnapshot,
+							revision: block.revision ?? completedSnapshot.revision,
+						});
+					} else if (completedSnapshot.text !== capturedText) {
+						return;
+					}
+				}
+				snap.streamingBlocks.splice(index, 1);
+			};
 
 			// Ensure a partial message exists for incremental persistence
 			if (!ctx.getPartialMessageId()) {
@@ -1278,24 +1470,39 @@ export async function processEvent(
 			// Persist the completed block
 			const partialId = ctx.getPartialMessageId() as string;
 			if (block.type === "text") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await persistContentCheckpoint(ctx, partialId, {
 					type: "text",
 					text: block.text,
 					outputIndex: block.outputIndex,
 					...(textBlockId ? { id: textBlockId } : {}),
+					...(block.revision != null ? { revision: block.revision } : {}),
+					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
 					...(fileReferenceContext ? { fileReferenceContext } : {}),
-					...(block.citations?.length ? { citations: block.citations } : {}),
+					...(block.citations ? { citations: block.citations } : {}),
 				});
+				retireCompletedSnapshot();
+				if (
+					!block.id &&
+					ctx.fileReferenceContexts?.blockId(block.outputIndex) === textBlockId &&
+					(!completedSnapshot || !snap?.streamingBlocks.includes(completedSnapshot))
+				) {
+					ctx.fileReferenceContexts?.complete(block.outputIndex);
+				}
 			} else if (block.type === "reasoning") {
-				await narratorService.appendBlockToMessage(partialId, narratorId, {
+				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
 					text: block.text,
+					...(block.id ? { id: block.id } : {}),
+					...(block.revision != null ? { revision: block.revision } : {}),
+					...(block.rawTextLength != null ? { rawTextLength: block.rawTextLength } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
 				});
+				retireCompletedSnapshot();
 				// Fire-and-forget reasoning translation
 				if (settings.agent.translateReasoning && block.text) {
 					translateReasoningBlock(partialId, narratorId, broadcastTargetId, block.text, ctx, {
+						id: block.id,
 						providerMetadata: block.providerMetadata,
 						outputIndex: block.outputIndex,
 					});
@@ -1317,6 +1524,9 @@ export async function processEvent(
 					streamCompletedAt: block.streamCompletedAt,
 					outputIndex: block.outputIndex,
 					...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
+					...(block.thoughtSignatureSource
+						? { thoughtSignatureSource: block.thoughtSignatureSource }
+						: {}),
 				});
 				if (!toolCallId)
 					throw new CriticalEventPersistenceError("Tool block did not produce a persisted row");
@@ -1340,6 +1550,7 @@ export async function processEvent(
 					outputIndex: block.outputIndex,
 					...(block.action ? { action: block.action } : {}),
 				});
+				retireCompletedSnapshot();
 			} else if (block.type === "image_generation") {
 				// Save base64 image to filesystem. If saving fails, keep the raw result
 				// in the persisted block so the UI/history replay can still recover it.
@@ -1376,6 +1587,7 @@ export async function processEvent(
 						: {}),
 					...(shouldPersistInlineResult && block.result ? { result: block.result } : {}),
 				});
+				retireCompletedSnapshot();
 				if (savedPath) {
 					if (!ctx.parentToolUseId) {
 						const snap = getOrCreateSnapshot(broadcastTargetId);
@@ -1423,14 +1635,7 @@ export async function processEvent(
 
 		case "assistant_message": {
 			const fileReferenceContext = ctx.fileReferenceContexts?.fallback() ?? null;
-			ctx.fileReferenceContexts?.clear();
-			// Snapshot: clear streaming state — this turn's text + tools are done
-			clearStreamingSnapshot(broadcastTargetId);
-			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
-			// The turn is settled, so no attempt of it can be discarded any more. Drop the
-			// per-attempt baselines rather than letting them accumulate across a long
-			// session (each retry adds one entry).
-			ctx.attemptBlockBaselines?.clear();
+			// Retain reconnect state until the final durable message has been published.
 
 			const tokenUsage = ctx.getTokenUsage();
 			const turnUsage = tokenUsage
@@ -1482,7 +1687,6 @@ export async function processEvent(
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);
 				}
-				ctx.setPartialMessageId(undefined);
 			} else {
 				// No partial message — fallback to full persistence
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -1641,6 +1845,13 @@ export async function processEvent(
 				narratorId: broadcastTargetId,
 				message: processed,
 			});
+			ctx.setPartialMessageId(undefined);
+			ctx.fileReferenceContexts?.clear();
+			ctx.committedContentSnapshots?.clear();
+			ctx.unpublishedContentBlockIds?.clear();
+			clearStreamingSnapshot(broadcastTargetId);
+			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
+			ctx.attemptBlockBaselines?.clear();
 			eventBus.emit({ type: "narrator:message", narratorId, role: "assistant" });
 
 			// Main narrator: clear compact summary after first response
@@ -1944,12 +2155,6 @@ export async function processEvent(
 				hooks.onGitTrack(event.toolName, event.toolUseId, event.input);
 			}
 
-			// Snapshot: capture tree state after the tool completed. Awaited so the
-			// recorded hash reflects this tool's writes and not a later tool's.
-			if (hooks?.onSnapshotAfter) {
-				await hooks.onSnapshotAfter(event.toolUseId, event.toolName);
-			}
-
 			// Main narrator: ExitPlanMode
 			if (!event.isError && event.toolName === "ExitPlanMode" && hooks?.onExitPlanMode) {
 				await hooks.onExitPlanMode(event.toolUseId);
@@ -2046,6 +2251,8 @@ export async function processEvent(
 			clearStreamingSnapshot(broadcastTargetId);
 			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
 			ctx.fileReferenceContexts?.clear();
+			ctx.committedContentSnapshots?.clear();
+			ctx.unpublishedContentBlockIds?.clear();
 
 			if (hooks?.onErrorCleanup) {
 				await hooks.onErrorCleanup(event.message, event.diagnostics);
@@ -2111,6 +2318,8 @@ export async function processEvent(
 			clearStreamingSnapshot(broadcastTargetId);
 			if (ctx.parentToolUseId) clearStreamingSnapshot(narratorId);
 			ctx.fileReferenceContexts?.clear();
+			ctx.committedContentSnapshots?.clear();
+			ctx.unpublishedContentBlockIds?.clear();
 			dualBroadcast(ctx, {
 				type: "streaming_reset",
 				narratorId: broadcastTargetId,
@@ -2141,6 +2350,25 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
+			// Provider itemId is replay metadata, not the attempt-scoped display ID.
+			// Keep its legacy fallback only when the producer has no loop identity.
+			const reasoningId = event.blockId ?? event.providerMetadata?.openai?.itemId;
+			const reasoningOutputIndex = event.outputIndex;
+			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
+			const existing = snap.streamingBlocks.find((b) => {
+				if (b.type !== "reasoning") return false;
+				if (reasoningId) return b.id === reasoningId;
+				if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
+				return !b.id && b.outputIndex == null;
+			});
+			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
+			if (
+				event.blockRevision != null &&
+				latestRevision != null &&
+				event.blockRevision <= latestRevision
+			)
+				return null;
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
 				ctx.addSubstatus("reasoning").catch(() => {});
@@ -2156,37 +2384,27 @@ export async function processEvent(
 			// Track AI reasoning output character rate
 			recordOutputChunk(event.text.length);
 
-			const reasoningId = event.providerMetadata?.openai?.itemId;
-			const reasoningOutputIndex = event.outputIndex;
-
-			// Snapshot: accumulate streaming reasoning blocks in provider order.
-			if (!ctx.parentToolUseId) {
-				const snap = getOrCreateSnapshot(broadcastTargetId);
-				const existingIdx = snap.streamingBlocks.findIndex((b) => {
-					if (b.type !== "reasoning") return false;
-					if (reasoningId) return b.id === reasoningId;
-					if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
-					return !b.id && b.outputIndex == null;
-				});
-				if (existingIdx !== -1) {
-					const existing = snap.streamingBlocks[existingIdx];
-					if (existing.type === "reasoning") {
-						existing.text += event.text;
-						if (reasoningId) existing.id = reasoningId;
-						if (reasoningOutputIndex != null) existing.outputIndex = reasoningOutputIndex;
-					}
-				} else {
-					snap.streamingBlocks.splice(
-						findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
-						0,
-						{
-							type: "reasoning",
-							text: event.text,
-							...(reasoningId ? { id: reasoningId } : {}),
-							...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
-						},
-					);
-				}
+			// Accumulate on the author's snapshot, including a subagent's own page.
+			const rawText = appendRawStreamText(
+				existing?.type === "reasoning" ? existing : base?.type === "reasoning" ? base : undefined,
+				event.text,
+				event.blockTextOffset,
+			);
+			if (existing?.type === "reasoning") {
+				Object.assign(existing, rawText);
+				if (event.blockRevision != null) existing.revision = event.blockRevision;
+			} else {
+				snap.streamingBlocks.splice(
+					findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
+					0,
+					{
+						type: "reasoning",
+						...rawText,
+						...(reasoningId ? { id: reasoningId } : {}),
+						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
+					},
+				);
 			}
 
 			const reasoningStreamEvent: Record<string, unknown> = {
@@ -2195,6 +2413,8 @@ export async function processEvent(
 					type: "reasoning_delta",
 					text: event.text,
 					...(reasoningId ? { id: reasoningId } : {}),
+					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
 					...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 				},
 			};
@@ -2216,6 +2436,8 @@ export async function processEvent(
 						type: "reasoning_delta",
 						text: event.text,
 						...(reasoningId ? { id: reasoningId } : {}),
+						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				},

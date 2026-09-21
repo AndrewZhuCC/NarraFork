@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import {
 	type CodexRemoteCompactPayload,
 	type CompactMessageMode,
@@ -23,6 +24,7 @@ import {
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type {
 	ApiRequestDiagnostics,
+	ReasoningProviderMetadata,
 	ToolCallBinding,
 	ToolExecutionPlan,
 	ToolExecutionTarget,
@@ -42,12 +44,14 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { settings } from "../lib/settings";
+import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxClaim } from "./agent-runtime/mailbox-types";
 import { getExecutionOwner } from "./agent-runtime/ownership";
 import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { createFileChangeExecutionSegmentsService } from "./file-change-execution-segments";
+import { enrichToolUseBlocks, truncateToolIO } from "./narrator-messages";
 import type { RefMessage, RefMessageInput } from "./narrator-refs/port";
 import { type PgNarratorRefsTx, persistPgMessageWithRef } from "./narrator-refs/postgres-store";
 import {
@@ -601,6 +605,17 @@ function appendMessageRefSync(
 	narratorId: string,
 	messageId: string,
 	isCompact = 0,
+	/**
+	 * Whether this insertion is visible to sync clients.
+	 *
+	 * `createPartialAssistantMessage` allocates a ref/seq for an EMPTY assistant
+	 * shell before any `block_complete` lands. Announcing that shell would bump
+	 * `messageVersion` without broadcastable content, deliver an empty row into
+	 * the document, and let live-row hand-off retire streaming reasoning/text
+	 * while the committed copy is still blank. The shell stays internal until
+	 * `appendBlockToMessage` publishes real blocks.
+	 */
+	bumpMessageVersion = true,
 ): number {
 	// The shared next_seq authority; the synchronous counter claim rolls back with this ref.
 	const seq = claimNextRefSeq(tx, narratorId);
@@ -615,17 +630,16 @@ function appendMessageRefSync(
 		})
 		.run();
 
-	// messageCount rides along with the messageVersion bump this row already gets:
-	// same row, same transaction, so the added cost is nil (72ms → 83ms per 20k
-	// refs). It must be an increment, not a recompute — recounting on every insert
-	// is O(n²) over a conversation and measured 8.3s for the same 20k refs.
+	// messageCount is an insert-count upper bound, not sync authority — it still
+	// advances for an unannounced partial. messageVersion is the sync token and
+	// only moves when clients are meant to observe a change.
 	//
 	// Deletions are handled by the read path instead of by matching decrements: refs
 	// are removed from ~30 scattered call sites, so the counter is treated as a fast
 	// upper bound that self-corrects when read. See narrator-message-count.ts.
 	tx.update(narrators)
 		.set({
-			messageVersion: sql`${narrators.messageVersion} + 1`,
+			...(bumpMessageVersion ? { messageVersion: sql`${narrators.messageVersion} + 1` } : {}),
 			messageCount: sql`COALESCE(${narrators.messageCount}, 0) + 1`,
 		})
 		.where(eq(narrators.id, narratorId))
@@ -1021,14 +1035,18 @@ export function createPgPlacedMessageMaterializer(
 
 // ── narratorPersistence object ─────────────────────────────────────────────
 
-async function appendPersistedMessage(message: RefMessageInput): Promise<RefMessage> {
+async function appendPersistedMessage(
+	message: RefMessageInput,
+	options?: { bumpMessageVersion?: boolean },
+): Promise<RefMessage> {
+	const bumpMessageVersion = options?.bumpMessageVersion !== false;
 	const pg = getNarratorMessageRefsPort();
-	if (pg) return pg.append(message);
+	if (pg) return pg.append(message, { bumpMessageVersion });
 	return withDbRetry(
 		async () =>
 			db.transaction((tx) => {
 				const created = tx.insert(narratorMessages).values(message).returning().get();
-				const seq = appendMessageRefSync(tx, message.narratorId, message.id);
+				const seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
 				return { ...created, seq };
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
@@ -1048,6 +1066,28 @@ function assertPgPlacement(placement?: MessagePlacementOptions): void {
 			"PostgreSQL narrator mailbox/onPersist placement unavailable on this entry point; " +
 				"use queue.materialize(claim, createPgPlacedMessageMaterializer(message, hooks))",
 		);
+}
+
+/** A late signature/cipher frame augments provider replay data; absent keys are not deletions. */
+function mergeReasoningMetadata(
+	previous: ReasoningProviderMetadata | undefined,
+	incoming: ReasoningProviderMetadata,
+): ReasoningProviderMetadata {
+	const merged = {
+		...previous,
+		...Object.fromEntries(Object.entries(incoming).filter(([, value]) => value !== undefined)),
+	};
+	for (const provider of ["openai", "anthropic", "gemini"] as const) {
+		if (incoming[provider]) {
+			merged[provider] = {
+				...previous?.[provider],
+				...Object.fromEntries(
+					Object.entries(incoming[provider]).filter(([, value]) => value !== undefined),
+				),
+			};
+		}
+	}
+	return merged;
 }
 
 const sqliteNarratorPersistence = {
@@ -1899,38 +1939,43 @@ const sqliteNarratorPersistence = {
 	) {
 		const id = generateId();
 		const now = new Date().toISOString();
-		const pg = getNarratorMessageRefsPort();
 
-		const msg = await appendPersistedMessage({
-			id,
-			narratorId,
-			messageUuid: sdkMessage.uuid,
-			parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
-			role: "assistant",
-			contentJson: [],
-			contentText: null,
-			tokensIn: sdkMessage.tokensIn ?? null,
-			turnUsageJson: sdkMessage.turnUsage ?? null,
-			provider: sdkMessage.provider ?? null,
-			credentialId: sdkMessage.credentialId ?? null,
-			model: sdkMessage.model ?? null,
-			outputTokens: sdkMessage.outputTokens ?? null,
-			cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
-			cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
-			cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
-			cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
-			reasoningTokens: sdkMessage.reasoningTokens ?? null,
-			ttftMs: sdkMessage.ttftMs ?? null,
-			durationMs: sdkMessage.durationMs ?? null,
-			contextPercent: sdkMessage.contextPercent ?? null,
-			meterUsage: sdkMessage.meterUsage ?? null,
-			meterUnit: sdkMessage.meterUnit ?? null,
-			createdAt: now,
-		});
+		// Empty shell: allocate id + ref/seq so `appendBlockToMessage` has a stable
+		// target, but do NOT bump messageVersion. Announcing an empty assistant row
+		// makes clients render a blank committed message and lets live-row hand-off
+		// drop streaming reasoning/text before any content is visible. Visibility
+		// starts when `appendBlockToMessage` publishes real blocks.
+		const msg = await appendPersistedMessage(
+			{
+				id,
+				narratorId,
+				messageUuid: sdkMessage.uuid,
+				parentToolUseId: sdkMessage.parent_tool_use_id ?? null,
+				role: "assistant",
+				contentJson: [],
+				contentText: null,
+				tokensIn: sdkMessage.tokensIn ?? null,
+				turnUsageJson: sdkMessage.turnUsage ?? null,
+				provider: sdkMessage.provider ?? null,
+				credentialId: sdkMessage.credentialId ?? null,
+				model: sdkMessage.model ?? null,
+				outputTokens: sdkMessage.outputTokens ?? null,
+				cachedInputTokens: sdkMessage.cachedInputTokens ?? null,
+				cacheCreationInputTokens: sdkMessage.cacheCreationInputTokens ?? null,
+				cacheCreation5mTokens: sdkMessage.cacheCreation5mTokens ?? null,
+				cacheCreation1hTokens: sdkMessage.cacheCreation1hTokens ?? null,
+				reasoningTokens: sdkMessage.reasoningTokens ?? null,
+				ttftMs: sdkMessage.ttftMs ?? null,
+				durationMs: sdkMessage.durationMs ?? null,
+				contextPercent: sdkMessage.contextPercent ?? null,
+				meterUsage: sdkMessage.meterUsage ?? null,
+				meterUnit: sdkMessage.meterUnit ?? null,
+				createdAt: now,
+			},
+			{ bumpMessageVersion: false },
+		);
 
-		const seq = msg.seq;
-		if (!pg) await bumpParentNarratorMessageVersion(sdkMessage.parent_tool_use_id);
-		return { ...msg, seq };
+		return { ...msg, seq: msg.seq };
 	},
 
 	async appendBlockToMessage(
@@ -1944,10 +1989,15 @@ const sqliteNarratorPersistence = {
 					citations?: import("@shared/citations").TextCitation[];
 					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
 					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 			  }
 			| {
 					type: "reasoning";
 					text: string;
+					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -1980,12 +2030,17 @@ const sqliteNarratorPersistence = {
 					width?: number;
 					height?: number;
 			  },
+		options?: { republishUnchanged?: boolean },
 	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true, parentToolUseId: true },
-		});
-		if (!existing) return;
+		// No await between reading and replacing the JSON body: a concurrent checkpoint
+		// or translation must not overwrite a newer revision read by another consumer.
+		const existing = db.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true, parentToolUseId: true },
+			})
+			.sync();
+		if (!existing) throw new NotFoundError("Assistant message", messageId);
 
 		type StoredAssistantBlock =
 			| {
@@ -1995,10 +2050,15 @@ const sqliteNarratorPersistence = {
 					citations?: import("@shared/citations").TextCitation[];
 					fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
 					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 			  }
 			| {
 					type: "reasoning";
 					text: string;
+					id?: string;
+					revision?: number;
+					rawTextLength?: number;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
 			  }
@@ -2026,7 +2086,35 @@ const sqliteNarratorPersistence = {
 			Array.isArray(existing.contentJson) ? existing.contentJson : []
 		) as StoredAssistantBlock[];
 		let content: StoredAssistantBlock[];
-		if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+		const matchingIndex =
+			(block.type === "text" || block.type === "reasoning") && block.id
+				? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+				: -1;
+		if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+			const previous = current[matchingIndex] as Record<string, unknown>;
+			const stale =
+				typeof previous.revision === "number" &&
+				(block.revision == null || block.revision < previous.revision);
+			const next: Record<string, unknown> = {
+				...previous,
+				...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
+			};
+			if (block.type === "reasoning" && block.providerMetadata) {
+				next.providerMetadata = mergeReasoningMetadata(
+					previous.providerMetadata as ReasoningProviderMetadata | undefined,
+					block.providerMetadata,
+				);
+			}
+			if (previous.text !== block.text) delete next.translatedText;
+			if (stale || isDeepStrictEqual(previous, next)) {
+				content = current;
+			} else {
+				// A checkpoint updates the original chronological slot, even when its
+				// metadata arrives after a tool has already been committed.
+				content = [...current];
+				content[matchingIndex] = next as StoredAssistantBlock;
+			}
+		} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
 			const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
 				const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
 				return typeof outputIndex === "number" ? outputIndex : undefined;
@@ -2039,25 +2127,69 @@ const sqliteNarratorPersistence = {
 				return aOrder === bOrder ? a.index - b.index : aOrder - bOrder;
 			});
 			content = indexed.map(({ entry }) => entry);
-		} else if (block.type === "reasoning") {
-			const idx = current.findIndex((b) => b.type !== "reasoning");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
-		} else if (block.type === "text") {
-			const idx = current.findIndex((b) => b.type === "tool_use");
-			content =
-				idx === -1 ? [...current, block] : [...current.slice(0, idx), block, ...current.slice(idx)];
 		} else {
+			// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+			// pull later reasoning in front of text/tools that were actually seen first.
 			content = [...current, block];
 		}
-		const contentText = content
-			.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
-			.join("\n");
+		if (content === current && !options?.republishUnchanged) return undefined;
+		if (content !== current) {
+			const contentText = content
+				.flatMap((b) => (b.type === "text" && typeof b.text === "string" ? [b.text] : []))
+				.join("\n");
+			db.update(narratorMessages)
+				.set({ contentJson: content, contentText: contentText || null })
+				.where(eq(narratorMessages.id, messageId))
+				.run();
+		}
 
-		await db
-			.update(narratorMessages)
-			.set({ contentJson: content, contentText: contentText || null })
-			.where(eq(narratorMessages.id, messageId));
+		/**
+		 * Publish the partial now that it holds real content.
+		 *
+		 * Completed blocks are removed from the reconnect streaming snapshot at
+		 * `block_complete`, so without this announce a reconnecting client would see
+		 * neither the live row nor the committed copy — reasoning and assistant text
+		 * vanish until some later reload. Matches the `messageVersion` contract: a
+		 * bump always ships with a broadcast of the current message body.
+		 */
+		const publishPartial = async () => {
+			const owner = existing.parentToolUseId
+				? await db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { parentNarratorId: true },
+					})
+				: undefined;
+			const broadcastTargetId = owner?.parentNarratorId ?? narratorId;
+			// The parent embeds this child's messages, so its reconnect version must
+			// change at the same boundary as the child's (never for the empty shell).
+			await bumpNarratorMessageVersions([narratorId, broadcastTargetId]);
+			const published = await db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				with: { toolCalls: true },
+			});
+			if (!published) throw new NotFoundError("Assistant message", messageId);
+			const ref = await db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { seq: true },
+			});
+			const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
+			if (!projected) throw new Error(`Cannot publish assistant message ${messageId}`);
+			dualBroadcastToNarrator(
+				{
+					narratorId,
+					broadcastTargetId,
+					parentToolUseId: existing.parentToolUseId,
+				},
+				{
+					type: "message_updated",
+					narratorId,
+					message: projected,
+				},
+			);
+		};
 
 		if (block.type === "tool_use") {
 			const now = new Date().toISOString();
@@ -2093,8 +2225,10 @@ const sqliteNarratorPersistence = {
 						: null,
 				createdAt: now,
 			});
+			await publishPartial();
 			return toolCallId;
 		}
+		await publishPartial();
 		return undefined;
 	},
 
@@ -2102,23 +2236,31 @@ const sqliteNarratorPersistence = {
 		messageId: string,
 		reasoningIndex: number,
 		translatedText: string,
+		expected?: { id?: string; text: string },
 	) {
-		const existing = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { contentJson: true },
-		});
-		if (!existing) return;
+		const existing = db.query.narratorMessages
+			.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { contentJson: true },
+			})
+			.sync();
+		if (!existing) return false;
 
 		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
-		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON content blocks
-		const block = content[reasoningIndex] as any;
-		if (!block || block.type !== "reasoning") return;
+		const index = expected?.id
+			? content.findIndex((entry) => entry?.type === "reasoning" && entry.id === expected.id)
+			: reasoningIndex;
+		const block = content[index] as Record<string, unknown> | undefined;
+		if (!block || block.type !== "reasoning") return false;
+		if (expected && block.text !== expected.text) return false;
+		if (block.translatedText === translatedText) return false;
 
 		block.translatedText = translatedText;
-		await db
-			.update(narratorMessages)
+		db.update(narratorMessages)
 			.set({ contentJson: content })
-			.where(eq(narratorMessages.id, messageId));
+			.where(eq(narratorMessages.id, messageId))
+			.run();
+		return true;
 	},
 
 	/**
@@ -3271,29 +3413,49 @@ const sqliteNarratorPersistence = {
 			resultMessageId?: string;
 			bumpMessageVersion?: boolean;
 			preserveTiming?: boolean;
+			/** Detached completions must atomically match their original execution authority. */
+			expectedBinding?: ToolCallBinding & { narratorId: string };
+			/** Persist a permission redirect/sanitized input in the same CAS as the result. */
+			input?: Record<string, unknown>;
 			/** Commit publication intent with the exact tool result, synchronously. */
 			onPersist?: (tx: DbTx) => void;
 		},
 		messageId?: string,
 		toolCallId?: string,
 	) {
-		const exactId = await resolveToolCallWriteId(toolUseId, { toolCallId, messageId });
+		const expected = result.expectedBinding;
+		if (
+			expected &&
+			(!expected.toolCallId || !Number.isInteger(expected.attempt) || expected.attempt < 1)
+		) {
+			throw new ValidationError("Tool result requires a valid execution binding");
+		}
+		if (expected && toolCallId && expected.toolCallId !== toolCallId) {
+			throw new ValidationError("Tool result binding does not match its target row");
+		}
+		const exactId =
+			expected?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { toolCallId, messageId }));
 		if (!exactId) return;
 		const conditions = [eq(narratorToolCalls.id, exactId)];
-		const affectedToolCalls = await db
-			.select({
-				narratorId: narratorToolCalls.narratorId,
-				messageId: narratorToolCalls.messageId,
-				toolUseId: narratorToolCalls.toolUseId,
-				toolName: narratorToolCalls.toolName,
-				executionDeviceId: narratorToolCalls.executionDeviceId,
-			})
-			.from(narratorToolCalls)
-			.where(and(...conditions));
-		db.transaction((tx) => {
-			tx.update(narratorToolCalls)
+		if (expected) {
+			// Do not validate then await before writing: retries, COW and history edits may
+			// retire the receipt while an old tool is finishing. The write itself is the CAS.
+			conditions.push(
+				eq(narratorToolCalls.narratorId, expected.narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+				eq(narratorToolCalls.executionAttempt, expected.attempt),
+				eq(narratorToolCalls.executionIdentityVersion, 1),
+				isNull(narratorToolCalls.executionOriginToolCallId),
+				sql`exists (select 1 from ${narratorMessageRefs} where ${narratorMessageRefs.narratorId} = ${expected.narratorId} and ${narratorMessageRefs.messageId} = ${narratorToolCalls.messageId})`,
+			);
+			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
+		}
+		const affectedToolCalls = db.transaction((tx) => {
+			const updated = tx
+				.update(narratorToolCalls)
 				.set({
 					outputJson: result.output ?? null,
+					...(result.input !== undefined ? { inputJson: result.input } : {}),
 					status: result.status,
 					errorMessage: result.errorMessage ?? null,
 					permissionStartedAt:
@@ -3316,8 +3478,19 @@ const sqliteNarratorPersistence = {
 					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
 				})
 				.where(and(...conditions))
-				.run();
+				.returning({
+					narratorId: narratorToolCalls.narratorId,
+					messageId: narratorToolCalls.messageId,
+					toolUseId: narratorToolCalls.toolUseId,
+					toolName: narratorToolCalls.toolName,
+					executionDeviceId: narratorToolCalls.executionDeviceId,
+				})
+				.all();
+			if (expected && updated.length !== 1) {
+				throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
+			}
 			result.onPersist?.(tx);
+			return updated;
 		});
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
@@ -3341,7 +3514,16 @@ const sqliteNarratorPersistence = {
 		const affectedMessageIds = [
 			...new Set(affectedToolCalls.map((tc) => tc.messageId).filter((id): id is string => !!id)),
 		];
-		if (affectedMessageIds.length > 0) {
+		if (expected) {
+			// Detached results must not infer a parent from a provider-local tool-use id.
+			const owner = await db.query.narrators.findFirst({
+				where: eq(narrators.id, expected.narratorId),
+				columns: { type: true, parentNarratorId: true },
+			});
+			if (owner?.type === "subagent" && owner.parentNarratorId) {
+				affectedNarratorIds.push(owner.parentNarratorId);
+			}
+		} else if (affectedMessageIds.length > 0) {
 			const affectedMessages = await db.query.narratorMessages.findMany({
 				where: inArray(narratorMessages.id, affectedMessageIds),
 				columns: { parentToolUseId: true },
@@ -3362,6 +3544,7 @@ const sqliteNarratorPersistence = {
 		if (result.bumpMessageVersion !== false) {
 			await bumpNarratorMessageVersions(affectedNarratorIds);
 		}
+		return affectedToolCalls[0];
 	},
 
 	/**

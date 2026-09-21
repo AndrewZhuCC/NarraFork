@@ -624,7 +624,7 @@ export function loadSource(): RawCoverage {
 			0,
 		),
 	};
-	if (snapshotShape.tables !== 107 || snapshotShape.columns !== 1538) {
+	if (snapshotShape.tables !== 108 || snapshotShape.columns !== 1554) {
 		throw new Error(
 			`unexpected SQLite source shape: ${snapshotShape.tables}/${snapshotShape.columns}`,
 		);

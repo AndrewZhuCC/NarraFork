@@ -63,8 +63,6 @@ import {
 	resolveOlderHistoryAutoLoadEnabled,
 } from "../history/older-history-auto-load";
 import { useRenderLod } from "../lod/RenderLodCtx";
-import { MessageIdentityCtx } from "../MessageIdentityCtx";
-import { MessageContextMenuCtx } from "../message/MessageContextMenuCtx";
 import { type MessageSelectionResolver, useMessageSelection } from "../message/MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message/message-edit-text";
 import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
@@ -79,15 +77,18 @@ import {
 	subagentRecentCallSummary,
 } from "../tool-call/tool-display";
 import { recentRunSegmentMessageIds } from "../trace/run-segments";
-import { TraceRowInteraction } from "../trace/TraceRowInteraction";
+import {
+	clearAllCompactProgress,
+	clearCompactProgress,
+	clearCompactProgressAliases,
+	setCompactProgress,
+} from "./compact-progress-store";
 import { ExactRow } from "./ExactRow";
 import type { MeasuredSubagent } from "./measure/measure-subagent";
 import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import type { RenderLod } from "./prepared-block";
-import type { TraceRowInteractionSlot } from "./render/RenderToolRun";
 import { resolveRenderExtra } from "./render-registry";
-import { isStreamingMessageSuperseded } from "./streaming-handoff";
 import { type UsePretextDocumentResult, usePretextDocument } from "./usePretextDocument";
 import { useVListContentView } from "./useVListContentView";
 import { useVListLabels } from "./useVListLabels";
@@ -99,6 +100,7 @@ import {
 	useVListToolDetails,
 	type VListToolDetailRequest,
 } from "./useVListToolDetails";
+import { useVListTraceBindings } from "./useVListTraceBindings";
 import { VListContentViewModal } from "./VListContentViewModal";
 import { VListUserMarkers } from "./VListUserMarkers";
 import { useVListAskInPassing } from "./vlist-ask-in-passing-bridge";
@@ -148,7 +150,6 @@ import {
 	resolveItemViewTargets,
 	resolveRowOpenState,
 	resolveTraceRowCardData,
-	resolveTraceRowIdentity,
 	resolveTraceRowViewTargets,
 	rowInteractionSig,
 	rowSelectionBlockIds,
@@ -275,8 +276,8 @@ import {
 import {
 	buildRowCtxActions,
 	buildRowToolActions,
+	rowActionHandlerDependencies,
 	type VListRowHandlers,
-	type VListRowToolActions,
 } from "./vlist-row-actions";
 import {
 	beginRowPayloadFrame,
@@ -559,6 +560,13 @@ export const PretextExactMessageList = memo(
 			 * navigating away) and stop scrolling instead of fighting the new target.
 			 */
 			const jumpTokenRef = useRef(0);
+			/**
+			 * Compact-progress keys this panel has written into the module store.
+			 * `compact_done` often carries no marker id (non-retry path), so cleanup
+			 * cannot rely on the event payload alone — clear what we observed, plus
+			 * every COW alias when the event does name replacement identities.
+			 */
+			const compactProgressKeysRef = useRef<Map<string, boolean>>(new Map());
 			const pinnedToBottomRef = useRef(true);
 			const suppressScrollStateRef = useRef(false);
 			/**
@@ -1934,13 +1942,50 @@ export const PretextExactMessageList = memo(
 					// `segmentCompactId` (server-side), so a full-history compact leaves every
 					// older message readable and a segment compact's hidden rows are already
 					// gone via `onSegmentCompactHide` above.
-					onCompactDone: () => bumpMessageRevision(),
-					onFullReload: bumpMessageRevision,
-					// Live compact-progress ticks patch the loaded compact marker in place
-					// (no refetch, no messageVersion bump) so the "…compacting · N chars"
-					// label counts up smoothly during a blocking/background compaction.
-					onCompactProgress: ({ messageId, isSegment, ...progress }) => {
-						pretextDocument.applyCompactProgress(messageId, progress, !!isSegment);
+					onCompactDone: (_contextPercentAfter, isSegment, _mode, replacement) => {
+						// COW retries may name old and/or new marker ids; the non-retry
+						// path often names none. Always clear aliases when present, then
+						// every key this panel wrote (progress is keyed by the id that
+						// `compact_progress` broadcast, which is not always on the done
+						// payload). Do not clearAll here — another narrator may still be
+						// compacting.
+						clearCompactProgressAliases(replacement, isSegment);
+						const observed = compactProgressKeysRef.current;
+						for (const [messageId, wasSegment] of observed) {
+							if (isSegment != null && wasSegment !== isSegment) continue;
+							clearCompactProgress(messageId, wasSegment);
+							observed.delete(messageId);
+						}
+						bumpMessageRevision();
+					},
+					onCompactFailed: (_error, _mode, messageId) => {
+						clearCompactProgress(messageId);
+						if (messageId) compactProgressKeysRef.current.delete(messageId);
+					},
+					onFullReload: () => {
+						clearAllCompactProgress();
+						compactProgressKeysRef.current.clear();
+						bumpMessageRevision();
+					},
+					// Live compact-progress ticks repaint only the mounted fixed-height marker.
+					// They never enter the pretext document or its measurement cache.
+					onCompactProgress: ({
+						messageId,
+						isSegment,
+						phase,
+						thinkingChars,
+						outputChars,
+						retryCount,
+					}) => {
+						if (!messageId) return;
+						const segment = !!isSegment;
+						setCompactProgress(messageId, segment, {
+							phase,
+							thinkingChars,
+							outputChars,
+							retryCount,
+						});
+						compactProgressKeysRef.current.set(messageId, segment);
 					},
 					onCatchUp: (orphanChildren, topLevel, subagentActivities) => {
 						const initialSync = initialRevisionSyncRef.current;
@@ -2688,6 +2733,7 @@ export const PretextExactMessageList = memo(
 						key: string;
 						top: number;
 						drilled: boolean;
+						rowHeight?: number;
 						blockHeight?: number;
 						drillHeader: { top: number; height: number } | null;
 					}[];
@@ -2701,6 +2747,7 @@ export const PretextExactMessageList = memo(
 								rows?: {
 									key: string;
 									top: number;
+									rowHeight?: number;
 									blockHeight: number;
 									cardMeasured: unknown | null;
 									drillHeader: { top: number; height: number } | null;
@@ -2714,6 +2761,7 @@ export const PretextExactMessageList = memo(
 						rows: measured.rows.map((r) => ({
 							key: r.key,
 							top: r.top,
+							rowHeight: r.rowHeight,
 							blockHeight: r.blockHeight,
 							drilled: r.cardMeasured != null,
 							drillHeader: r.drillHeader,
@@ -3192,7 +3240,6 @@ export const PretextExactMessageList = memo(
 			//
 			// Hand-off is structural: the row retires when the committed document already
 			// contains its content, so no timer can drop it while its replacement is missing.
-			const [streamingCharsSinceCommit, setStreamingCharsSinceCommit] = useState(0);
 			/**
 			 * Generation of THIS mount of the live row, for the streaming fade's store scope.
 			 *
@@ -3212,21 +3259,10 @@ export const PretextExactMessageList = memo(
 			useEffect(() => {
 				setStreamAnimMountEpoch(nextStreamAnimEpoch());
 			}, [narratorId]);
-			const streamingSuperseded = useMemo(
-				() =>
-					isStreamingMessageSuperseded({
-						streamingMessage: pretextDocument.streamingMessage,
-						committedMessages: pretextDocument.messages,
-						charsSinceLastCommit: streamingCharsSinceCommit,
-					}),
-				[pretextDocument.streamingMessage, pretextDocument.messages, streamingCharsSinceCommit],
-			);
 			const streamingMsg = useVListStreamingMessage(narratorId, {
 				enabled: isActive,
 				isSubagent,
-				superseded: streamingSuperseded,
 				committedMessages: pretextDocument.messages,
-				onCharsSinceCommitChange: setStreamingCharsSinceCommit,
 			});
 			const publishStreamingMessage = pretextDocument.setStreamingMessage;
 			useEffect(() => {
@@ -3234,25 +3270,9 @@ export const PretextExactMessageList = memo(
 			}, [publishStreamingMessage, streamingMsg]);
 			// --- Head trim: bound the loaded window in a long session ---
 			//
-			// Evaluated at the edge where the live row CLEARS, i.e. a turn just finished and
-			// the session is momentarily idle. Deliberately not after an append: an append
-			// happens mid-stream, and trimming then can destroy un-persisted output — the
-			// head removal moves `commitGrowthSignature` (`${length}:${newestId}`) without a
-			// message having landed, the hand-off reads that as growth, resets
-			// `charsSinceLastCommit`, and an already-stored earlier step then retires the live
-			// row. `resolveHeadTrim` also hard-rejects while streaming, so this is belt and
-			// braces; the timing is what makes a trim USEFUL (a turn's worth of new messages
-			// has just landed) rather than merely safe.
-			//
-			// "The live row cleared" is only a PROXY for "the turn ended", and it stopped
-			// being an exact one: the per-block hand-off (streaming-block-supersede.ts) also
-			// empties the row, mid-turn, the moment a catch-up delivers the partial message
-			// carrying blocks the row still held. That edge lands while the model is between
-			// steps — `resolveHeadTrim` sees `hasStreamingRow: false`, a pinned reader and a
-			// long window, so nothing else would decline it — and a trim there resets
-			// `charsSinceLastCommit` exactly as described above, endangering the output of the
-			// step that follows. So the intent is now stated directly instead of inferred:
-			// only trim while the narrator is NOT active.
+			// A checkpoint can empty the live projection mid-turn. Keep the existing
+			// active-session protection: trim only after the narrator becomes idle,
+			// never infer turn completion from an empty synthetic row.
 			const hadStreamingRowRef = useRef(false);
 			const trimHead = pretextDocument.trimHead;
 			// Latest-value refs: the effect must not re-run when these change (they change
@@ -4268,9 +4288,9 @@ export const PretextExactMessageList = memo(
 			// drilled-in card's action bindings.
 			const interactionReuseRef = useRef<RowPayloadReuseState<RowInteraction> | null>(null);
 			const interactionsByKey = useMemo(() => {
-				// The closures below capture these; a change must rebuild every payload
-				// rather than reuse one wired to stale handlers (see the module's note).
-				const generation = [selectionIndex, rowHandlers, openEditor, messagesById] as const;
+				// Indices are inputs to the per-row projection, not captured by its actions.
+				// Rebuilding them for one message must not evict every historical payload.
+				const generation = [narratorId, openEditor, ...rowActionHandlerDependencies(rowHandlers)];
 				const previous = beginRowPayloadFrame(interactionReuseRef.current, generation);
 				const map = new Map<string, RowInteraction>();
 				if (!selectionIndex) {
@@ -4364,6 +4384,8 @@ export const PretextExactMessageList = memo(
 						blockIndices,
 						copyText,
 						actions,
+						editRole: editTarget?.role,
+						queuedActions: queued ? { ...queued } : undefined,
 						toolUseId,
 						toolDetailRef: toolUseId
 							? toolDetailRequestFromData(toolUseId, item.spec.data)
@@ -4384,6 +4406,7 @@ export const PretextExactMessageList = memo(
 				// read through `rowToolMetaIndex`, which is memoized on that same array —
 				// so it already re-keys this memo when the document changes.
 			}, [
+				narratorId,
 				selectionIndex,
 				renderItems,
 				manifestItems,
@@ -4431,108 +4454,16 @@ export const PretextExactMessageList = memo(
 				[narratorId, upsertOrReload, removeOrReload],
 			);
 
-			// Per-key ROW interaction slots for the folded traces (activity-trace /
-			// tool-run-summary). This is a second, finer tier than `interactionsByKey`:
-			// that one gives a whole list element its menu, this one gives each row INSIDE
-			// a collapsed trace its own. Built in a memo that does NOT depend on scroll
-			// state, so each slot stays referentially stable and the ExactRow memo keeps
-			// skipping unchanged rows while scrolling.
-			//
-			// `rowBody` is the row's ENTIRE painted block, drill-down included — a revealed
-			// card is the same tool call the row summarizes, so both live inside one
-			// interactive block (one menu, one swipe, one selection outline).
-			//
-			// ⚠️ ONE shared slot for every trace row, memoized WITHOUT `renderItems`.
-			//
-			// The closure captures nothing per-item — it resolves everything from the `row`
-			// it is handed — so a per-key function was never more than N copies of one
-			// behaviour. That distinction is load-bearing rather than cosmetic: `renderItems`
-			// is a fresh array on every layout commit, including the one each streaming delta
-			// produces, so minting the slots inside a memo that depends on it gave every
-			// mounted trace row a new `rowInteraction` prop per frame. The ExactRow memo
-			// compares that prop by identity, so the whole window re-rendered ~per frame for
-			// the duration of a live turn, and the folded row's CSS shimmer stuttered under
-			// the reconciliation (see vlist-row-payload-reuse.ts for the same problem on the
-			// `interaction` payload, which does carry per-row data and so needs a cache).
-			const traceRowInteractionSlot = useMemo<TraceRowInteractionSlot | undefined>(() => {
-				if (!selectionIndex) return undefined;
-				const toolMetaIndex = rowToolMetaIndex;
-				const handlers = rowHandlers ?? {};
-				return (row, rowBody) => {
-					const baseIdentity = resolveTraceRowIdentity(row, selectionIndex, toolMetaIndex);
-					if (!baseIdentity) return null;
-					const messageMeta = messagesByIdRef.current.get(baseIdentity.messageId);
-					const identity = {
-						...baseIdentity,
-						messageSeq: messageMeta?.seq,
-						role: messageMeta?.role,
-					};
-					const actions = buildRowCtxActions(
-						{
-							messageId: identity.messageId,
-							blockIndex: identity.blockIndex,
-							blockIndices: identity.blockIndices,
-						},
-						handlers,
-					);
-					return (
-						<MessageContextMenuCtx.Provider value={actions}>
-							<MessageIdentityCtx.Provider
-								value={{
-									messageId: identity.messageId,
-									messageSeq: identity.messageSeq,
-									role: identity.role,
-								}}
-							>
-								<TraceRowInteraction
-									identity={identity}
-									actions={actions}
-									narratorId={narratorId}
-									toolDetailRef={row.identity?.toolDetailRef}
-									onViewSubagentSession={handlers.onViewSubagentSession}
-									onDetachSubagent={handlers.onDetachSubagent}
-									onCancelBackgroundTask={handlers.onCancelBackgroundTask}
-									onOpenFilePanel={handlers.onOpenFilePanel}
-								>
-									{rowBody}
-								</TraceRowInteraction>
-							</MessageIdentityCtx.Provider>
-						</MessageContextMenuCtx.Provider>
-					);
-				};
-			}, [selectionIndex, rowHandlers, rowToolMetaIndex, narratorId]);
-
-			/**
-			 * The card-specific actions for a DRILLED-IN trace row's tool call (the
-			 * subagent card's "open full session" button, the lifecycle items). A trace
-			 * element carries no per-row interaction payload, so the drilled-in card
-			 * binds its own from the same meta index the row menus use.
-			 *
-			 * Referentially stable (memo deps are the shared index + the handlers), so
-			 * the ExactRow memo is unaffected.
-			 */
-			const resolveRowToolActions = useCallback(
-				(toolUseId: string): VListRowToolActions | undefined => {
-					const meta = rowToolMetaIndex.get(toolUseId);
-					if (!meta) return undefined;
-					return buildRowToolActions(meta, rowHandlers ?? {});
-				},
-				[rowToolMetaIndex, rowHandlers],
-			);
-
-			/**
-			 * Resolve the row-interaction slot for one list element.
-			 *
-			 * Kept a FUNCTION of the item rather than a prebuilt map so the lookup needs no
-			 * per-frame allocation at all: the answer is "the shared slot, if this kind folds
-			 * rows". A map keyed by `spec.key` would have to be rebuilt from `renderItems`
-			 * each commit, which is the churn this shape removes.
-			 */
-			const resolveRowInteraction = useCallback(
-				(item: VListItem): TraceRowInteractionSlot | undefined =>
-					TRACE_ROW_INTERACTION_KINDS.has(item.spec.kind) ? traceRowInteractionSlot : undefined,
-				[traceRowInteractionSlot],
-			);
+			// Each trace group owns only its projected row bindings. Rebuilding a
+			// document index must not replace callbacks belonging to unchanged groups.
+			const traceBindingsByKey = useVListTraceBindings({
+				narratorId,
+				renderItems,
+				selectionIndex,
+				rowToolMetaIndex,
+				messageMetaById: messagesById,
+				rowHandlers,
+			});
 
 			// Item index of the row being edited, so it can be pinned into the mounted
 			// window. -1 → not in the loaded document (nothing to pin).
@@ -4785,6 +4716,7 @@ export const PretextExactMessageList = memo(
 									const sourceIds = sourceIdsForItem(item, manifestItem);
 									const itemId = domIdForItem(item, sourceIds);
 									const messageMeta = messagesById.get(sourceIds[0] ?? "");
+									const traceBinding = traceBindingsByKey.get(item.spec.key);
 									const permissionSlot = permissionSlotByKey.get(item.spec.key);
 									const editorSlot =
 										editingRow?.key === item.spec.key ? renderEditorSlot(editingRow) : undefined;
@@ -4829,7 +4761,7 @@ export const PretextExactMessageList = memo(
 											toggles={getRowToggles(item.spec.key)}
 											renderLabels={renderLabels}
 											interaction={interactionsByKey.get(item.spec.key)}
-											rowInteraction={resolveRowInteraction(item)}
+											rowInteraction={traceBinding?.rowInteraction}
 											closingRowKeys={closingRows.get(item.spec.key)}
 											narratorId={narratorId}
 											onOpenFilePanel={rowHandlers?.onOpenFilePanel}
@@ -4850,7 +4782,7 @@ export const PretextExactMessageList = memo(
 											// the card, not the trace) and the session/lifecycle actions a trace
 											// element has no interaction payload for. Both stable.
 											onTogglePromptForKey={togglePromptForKey}
-											resolveRowToolActions={resolveRowToolActions}
+											resolveRowToolActions={traceBinding?.resolveRowToolActions}
 											onUnknownHeight={
 												isDynamicRow ? getUnknownHeightReporter(item.spec.key) : undefined
 											}

@@ -72,6 +72,7 @@ async function record(params: {
 	action: "write" | "edit" | "bash" | "external" | "human";
 	toolName?: string | null;
 	treeHashAfter?: string;
+	lineStats?: { added: number; removed: number } | null;
 }): Promise<void> {
 	let toolUseId: string | undefined;
 	if (params.narratorId && params.treeHashAfter) {
@@ -107,6 +108,7 @@ async function record(params: {
 		action: params.action,
 		toolName: params.toolName ?? null,
 		toolUseId: toolUseId ?? null,
+		lineStats: params.lineStats ?? null,
 	});
 	// Timestamps are ISO strings at millisecond resolution; separate the rows so the
 	// newest-first ordering is deterministic.
@@ -179,6 +181,8 @@ describe("unified workspace modification view", () => {
 		expect(group?.actors).toHaveLength(3);
 		expect(group?.recentEvents).toHaveLength(3);
 		expect(group?.recentEvents.map((event) => event.action)).toEqual(["external", "edit", "write"]);
+		// NULL means unmeasured (legacy rows / bash); these fixture rows never set lineStats.
+		expect(group?.recentEvents.every((event) => event.linesAdded == null)).toBe(true);
 		expect(group?.hasExternalChange).toBe(true);
 		// External changes are never precisely attributable.
 		expect(group?.hasImpreciseAttribution).toBe(true);
@@ -196,6 +200,42 @@ describe("unified workspace modification view", () => {
 		expect(group?.changeCount).toBe(7);
 		expect(group?.recentEvents).toHaveLength(5);
 		expect(group?.recentEvents.every((event) => event.action === "edit")).toBe(true);
+	});
+
+	test("carries measured line counts into hover-card recent events", async () => {
+		const ws = makeWorkspace("nf-view-lines-");
+		const narratorId = await createNarrator("Solo", ws);
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+			lineStats: { added: 12, removed: 3 },
+		});
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+			lineStats: { added: 0, removed: 0 },
+		});
+		await record({
+			workspacePath: ws,
+			filePath: "measured.ts",
+			narratorId,
+			action: "edit",
+		});
+
+		const view = await getWorkspaceModificationView(ws);
+		const group = view.byFile.find((item) => item.filePath === "measured.ts");
+		expect(group?.recentEvents.map((event) => [event.linesAdded, event.linesRemoved])).toEqual([
+			[null, null],
+			[0, 0],
+			[12, 3],
+		]);
+		const newest = timelineOf(view).find((event) => event.filePath === "measured.ts");
+		expect(newest?.linesAdded).toBeNull();
+		expect(newest?.linesRemoved).toBeNull();
 	});
 
 	test("never upgrades legacy write/edit observations to measured attribution", async () => {

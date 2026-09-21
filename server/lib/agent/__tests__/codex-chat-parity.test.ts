@@ -8,7 +8,7 @@
  * Locks the outbound HTTP chat request against the shared stable contract.
  */
 import { describe, expect, spyOn, test } from "bun:test";
-import { ORIGINATOR_CODEX } from "../../user-agent";
+import { ORIGINATOR, ORIGINATOR_CODEX } from "../../user-agent";
 import { CodexProvider } from "../codex-provider";
 import * as codexWebSocket from "../codex-websocket";
 import { applyCodexReflectionTools, OpenAIProvider } from "../openai-provider";
@@ -24,11 +24,14 @@ type Captured = {
 };
 
 async function captureChat(
-	overrides: Partial<ChatParams> = {},
+	overrides: Partial<ChatParams> & {
+		userAgentMode?: "narrafork" | "claude-code" | "codex" | "custom";
+	} = {},
 	apiMode: "codex" | "responses" | "completions" = "codex",
 	transport: "http" | "ws" | "native-ws" = "http",
 	failWebSocket = false,
 ): Promise<Captured> {
+	const { userAgentMode = "codex", ...chatOverrides } = overrides;
 	const provider =
 		transport === "native-ws"
 			? new CodexProvider({ useWebSocket: true })
@@ -42,7 +45,7 @@ async function captureChat(
 					apiMode,
 					codexWebSocket: transport === "ws",
 					// Match codexFingerprintConfig() used by the built-in CodexProvider.
-					userAgentMode: "codex",
+					userAgentMode,
 					// biome-ignore lint/suspicious/noExplicitAny: test config subset
 				} as any);
 
@@ -112,7 +115,7 @@ async function captureChat(
 			toolResults: [],
 			signal: new AbortController().signal,
 			reasoningEffort: "high",
-			...overrides,
+			...chatOverrides,
 		})) {
 			// Drain the stream so the request completes.
 		}
@@ -134,6 +137,21 @@ describe("codex HTTP chat request parity", () => {
 		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR_CODEX}/[^ ]+ `));
 		// The Codex Responses transport is always streamed.
 		expect(req.headers.accept).toBe("text/event-stream");
+	});
+
+	/**
+	 * User-reported bug lock: selecting NarraFork UA on the Codex provider must
+	 * change both identity headers, not just User-Agent. originator is what
+	 * request dumps and relays surface first.
+	 */
+	test("NarraFork UA mode presents NarraFork on User-Agent and originator", async () => {
+		const req = await captureChat({ userAgentMode: "narrafork" });
+
+		expect(req.headers.originator).toBe(ORIGINATOR);
+		expect(req.headers["user-agent"]).toMatch(new RegExp(`^${ORIGINATOR}/[^ ]+ `));
+		expect(req.headers["user-agent"]).not.toMatch(/^codex-tui\//);
+		// Protocol identity fields still travel; only the presented client name changes.
+		expect(req.headers["x-codex-installation-id"]).toBeTruthy();
 	});
 
 	/**

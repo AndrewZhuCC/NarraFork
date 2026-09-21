@@ -99,6 +99,13 @@ export interface AdapterContentBlock {
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
 	modelText?: string | null;
+	/** Immutable UI-only publication receipt, shared by SQLite and PostgreSQL. */
+	publicationResult?: {
+		logicalRunId: string;
+		truncated: boolean;
+		originalBytes: number;
+		sourceResultRef: string;
+	};
 	thinking?: string | null;
 	translatedText?: string | null;
 	query?: string | null;
@@ -149,7 +156,10 @@ export interface AdapterContentBlock {
 	thinkingChars?: number | null;
 	/**
 	 * compact / segment_compact: 1-based ordinal of the summary retry now in
-	 * flight (transient, patched by applyCompactProgress; absent = not retrying).
+	 * flight. Transient render-state: the vlist paints live ticks from
+	 * `compact-progress-store` (not this field); the server does not re-persist
+	 * it. Absent = not retrying. Still read here when composing the initial
+	 * `data.text` fallback for a marker loaded mid-run.
 	 */
 	retryCount?: number | null;
 	/** segment_compact: number of messages folded into the segment summary. */
@@ -189,6 +199,8 @@ export interface AdapterMessage {
 	 * back to a positional rule when this is absent.
 	 */
 	liveBlockIndex?: number;
+	/** Frontend projection only; never written back into stored messages. */
+	liveContentProjection?: boolean;
 	creator?: {
 		id?: string;
 		username: string;
@@ -1476,6 +1488,41 @@ function adaptMessage(
 		];
 	}
 
+	// Publication receipts are immutable display snapshots, not system prose.
+	if (msg.role === "disp") {
+		const snapshotIndex = blocks.findIndex((block) => {
+			const meta = block.publicationResult;
+			return (
+				block.type === "text" &&
+				typeof block.text === "string" &&
+				meta != null &&
+				typeof meta.logicalRunId === "string" &&
+				meta.logicalRunId.length > 0 &&
+				typeof meta.sourceResultRef === "string" &&
+				meta.sourceResultRef.length > 0 &&
+				typeof meta.truncated === "boolean" &&
+				Number.isFinite(meta.originalBytes) &&
+				meta.originalBytes >= 0
+			);
+		});
+		if (snapshotIndex >= 0) {
+			const snapshot = blocks[snapshotIndex];
+			return [
+				{
+					kind: "system-simple",
+					key: `${idBase}-b${snapshotIndex}`,
+					data: {
+						kind: "publication_result",
+						text: "",
+						snapshotText: snapshot.text,
+						publicationResult: snapshot.publicationResult,
+						messageId: msg.id,
+					},
+				},
+			];
+		}
+	}
+
 	// system messages: SCAN for the recognized system block (mirrors
 	// MessageBubble's blocks.find(b => b.type === ...)). The meaningful block is
 	// NOT necessarily blocks[0] — a leading text block can precede it (e.g.
@@ -1606,7 +1653,15 @@ function adaptMessage(
 					kind,
 					key,
 					data,
-					opts: { expanded: ctx.isExpanded?.(key), showOriginal },
+					opts: {
+						expanded: ctx.isExpanded?.(key),
+						showOriginal,
+						// A live reasoning body (synthetic streaming row or checkpoint
+						// projection) must go through the incremental prepared-block path
+						// in the measure registry — the same flag markdown already carries.
+						// Without it every delta re-runs the full reasoning measure.
+						...(streaming ? { streamingContent: true } : {}),
+					},
 				});
 			}
 			position = nextPosition - 1;
@@ -1621,7 +1676,19 @@ function adaptMessage(
 					data: markdownData(block),
 					// Missing provenance retains the legacy shape. The render boundary maps
 					// it to explicit null, never inheriting the live narrator's current cwd.
-					...(fileReferenceContext ? { opts: { fileReferenceContext } } : {}),
+					...(fileReferenceContext || typeof block.revision === "number"
+						? {
+								opts: {
+									...(fileReferenceContext ? { fileReferenceContext } : {}),
+									...(typeof block.revision === "number"
+										? { contentRevision: block.revision }
+										: {}),
+									...(isLiveStreamingBlock(streamingMessage, msg, bi)
+										? { streamingContent: true }
+										: {}),
+								},
+							}
+						: {}),
 				});
 				break;
 			}
@@ -1825,6 +1892,18 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 /** Resolve a system-card chrome label (injected i18n → English fallback). */
 function sysLabel(ctx: AdapterContext, key: string): string {
 	return ctx.labels?.[key] ?? SYSTEM_LABEL_FALLBACKS[key] ?? key;
+}
+
+/** Stable compact labels carried to the renderer for fixed-height live repainting. */
+function compactProgressLabels(ctx: AdapterContext): Record<string, string> {
+	return {
+		compacting: sysLabel(ctx, "compacting"),
+		segmentCompacting: sysLabel(ctx, "segmentCompacting"),
+		outputChars: sysLabel(ctx, "compactOutputChars"),
+		thinking: sysLabel(ctx, "compactThinking"),
+		thinkingChars: sysLabel(ctx, "compactThinkingChars"),
+		retrying: sysLabel(ctx, "compactRetrying"),
+	};
 }
 
 /**
@@ -2132,40 +2211,6 @@ function composeCompactText(
 		return sysLabel(ctx, "segmentCompacted").replace(/\{count\}/g, String(count));
 	}
 	return sysLabel(ctx, opts.isRemote ? "compactedRemote" : "compacted");
-}
-
-/**
- * While a compact marker is `compacting`, its live `outputChars` changes the
- * one-line label text but NOT its height (single clamped line). The measure
- * cache keys on (spec.key, kind, width, lod, opts, dataRevision) and the compact
- * block's dataRevision only tracks `status` — which stays "compacting" for the
- * whole run — so a bare rebuild would return the stale cached text. Folding the
- * live count into `opts.progress` makes the opts digest (and therefore the cache
- * key) change on each progress tick, forcing a re-measure that re-composes the
- * label. The measure fn ignores `progress` (height is constant), so this only
- * affects cache identity, never layout geometry. Returns `{}` when not
- * compacting so completed/failed markers keep a stable, cacheable key.
- */
-function compactProgressOpts(
-	status: "compacting" | "compacted" | "failed",
-	outputChars?: number | null,
-	phase?: ProgressPhase | null,
-	thinkingChars?: number | null,
-	retryCount?: number | null,
-): { opts?: Record<string, unknown> } {
-	if (status !== "compacting") return {};
-	// The phase and the thinking count belong in the digest for the same reason
-	// the output count does: they change the composed label while the height (a
-	// single clamped line) never moves. `retry` too: entering/leaving a retry
-	// swaps the whole label text.
-	return {
-		opts: {
-			progress: typeof outputChars === "number" ? outputChars : 0,
-			phase: phase === "thinking" ? "thinking" : "output",
-			thinking: typeof thinkingChars === "number" ? thinkingChars : 0,
-			retry: typeof retryCount === "number" ? retryCount : 0,
-		},
-	};
 }
 
 /**
@@ -2879,15 +2924,8 @@ function adaptSystemBlock(
 					retryCount: block.retryCount,
 				}),
 				status: segStatus,
-				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
+				compactLabels: compactProgressLabels(ctx),
 			},
-			...compactProgressOpts(
-				segStatus,
-				block.outputChars,
-				block.progressPhase,
-				block.thinkingChars,
-				block.retryCount,
-			),
 		};
 	}
 
@@ -2896,15 +2934,6 @@ function adaptSystemBlock(
 			kind: "system-simple",
 			key: `${keyBase}-sys`,
 			data: adaptSystemSimpleData(blockType, block, ctx),
-			...(blockType === "compact" && block.status === "compacting"
-				? compactProgressOpts(
-						"compacting",
-						block.outputChars,
-						block.progressPhase,
-						block.thinkingChars,
-						block.retryCount,
-					)
-				: {}),
 		};
 	}
 	if (SYSTEM_TEXT_SUBTYPES.has(blockType)) {
@@ -2957,7 +2986,7 @@ function adaptSystemSimpleData(
 					retryCount: block.retryCount,
 				}),
 				status: compactStatus,
-				...(typeof block.outputChars === "number" ? { outputChars: block.outputChars } : {}),
+				compactLabels: compactProgressLabels(ctx),
 			};
 		}
 		case "merge_summary":
@@ -4298,19 +4327,22 @@ export function reasoningStepUnitId(
 }
 
 /**
- * True for a reasoning row belonging to the synthetic (un-persisted) streaming row.
+ * True for a reasoning row belonging to a live-streaming message — either the
+ * synthetic `__streaming__` row or a checkpointed real message currently
+ * projecting a newer live revision (`liveContentProjection`).
  *
  * This is the PARSER question, not the "is it still being written" question. The
  * whole live message is re-adapted on every delta, so any reasoning inside it must go
  * through the incremental parser — including a run that has already finished, since
  * re-parsing its accumulated body every frame is the O(len²)-per-turn shape
- * `reasoning-segments-cache.ts` exists to remove. For the visual live state see
- * `isLiveReasoningItem`.
+ * `reasoning-segments-cache.ts` exists to remove. The same applies to a checkpoint
+ * projection: the real message ID is re-adapted every frame while the projection
+ * is active. For the visual live state see `isLiveReasoningItem`.
  */
 function isStreamingReasoningItem(
 	item: Extract<AdapterActivityInput, { kind: "reasoning" }>,
 ): boolean {
-	return item.msg?.id === STREAMING_MESSAGE_ID;
+	return item.msg?.id === STREAMING_MESSAGE_ID || item.msg?.liveContentProjection === true;
 }
 
 /**

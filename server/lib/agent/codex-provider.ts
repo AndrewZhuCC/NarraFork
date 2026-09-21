@@ -955,6 +955,8 @@ export class CodexProvider implements ProviderAdapter {
 			outputIndex?: number;
 		}>,
 		textOutputIndex?: number,
+		redactedThinkingBlocks?: Parameters<ProviderAdapter["pushAssistantTurn"]>[8],
+		orderedContent?: readonly import("./types").ContentBlock[],
 	): void {
 		this.dummyProvider.pushAssistantTurn(
 			history,
@@ -965,6 +967,8 @@ export class CodexProvider implements ProviderAdapter {
 			messageId,
 			imageGenerations,
 			textOutputIndex,
+			redactedThinkingBlocks,
+			orderedContent,
 		);
 	}
 

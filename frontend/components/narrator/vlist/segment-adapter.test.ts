@@ -1418,11 +1418,12 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		);
 	});
 
-	it("context compact compacting → opts.progress folds the live count into the cache key", () => {
+	it("context compacting keeps live progress out of the layout cache key", () => {
 		const at0 = compactSpec([{ type: "compact", status: "compacting", outputChars: 0 }]);
 		const at99 = compactSpec([{ type: "compact", status: "compacting", outputChars: 99 }]);
-		expect(at0.opts?.progress).toBe(0);
-		expect(at99.opts?.progress).toBe(99);
+		expect(at0.opts?.progress).toBeUndefined();
+		expect(at99.opts?.progress).toBeUndefined();
+		expect(dataOf(at0).compactLabels).toEqual(dataOf(at99).compactLabels);
 	});
 
 	it("thinking phase features the thinking count instead of a stuck '0 chars'", () => {
@@ -1454,19 +1455,19 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		expect(dataOf(spec).text).toBe("Compacting context… · 42 chars");
 	});
 
-	it("the phase and thinking count join the measure cache key", () => {
-		// The label changes while the height (one clamped line) never does, so the
-		// digest must move or the stale text would be served from the cache.
+	it("the phase and thinking count do not enter the measure cache key", () => {
+		// The marker remains fixed-height; live phase/count changes are rendered from
+		// the store instead of forcing a document rebuild.
 		const thinking = compactSpec([
 			{ type: "compact", status: "compacting", progressPhase: "thinking", thinkingChars: 30 },
 		]);
 		const output = compactSpec([
 			{ type: "compact", status: "compacting", progressPhase: "output", outputChars: 30 },
 		]);
-		expect(thinking.opts?.phase).toBe("thinking");
-		expect(thinking.opts?.thinking).toBe(30);
-		expect(output.opts?.phase).toBe("output");
-		expect(output.opts?.thinking).toBe(0);
+		expect(thinking.opts?.phase).toBeUndefined();
+		expect(thinking.opts?.thinking).toBeUndefined();
+		expect(output.opts?.phase).toBeUndefined();
+		expect(output.opts?.thinking).toBeUndefined();
 	});
 
 	it("segment compact reports the thinking phase too", () => {
@@ -1479,7 +1480,7 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 			},
 		]);
 		expect(dataOf(spec).text).toBe("Segment compacting… · thinking · 90 chars");
-		expect(spec.opts?.phase).toBe("thinking");
+		expect(spec.opts?.phase).toBeUndefined();
 	});
 
 	it("a scheduled summary retry replaces the counts with 'retry #N'", () => {
@@ -1507,15 +1508,15 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		expect(dataOf(spec).text).toBe("压缩上下文中... · 重试第 1 次");
 	});
 
-	it("segment compacting reports the retry too, and retry joins the cache key", () => {
+	it("segment compacting reports the retry without changing the cache key", () => {
 		const spec = compactSpec([{ type: "segment_compact", status: "compacting", retryCount: 3 }]);
 		expect(dataOf(spec).text).toBe("Segment compacting… · retry #3");
-		expect(spec.opts?.retry).toBe(3);
-		// Leaving the retry (fresh output streaming again) must re-measure too.
+		expect(spec.opts?.retry).toBeUndefined();
+		// Leaving the retry (fresh output streaming again) is a render-state change only.
 		const recovered = compactSpec([
 			{ type: "segment_compact", status: "compacting", outputChars: 9 },
 		]);
-		expect(recovered.opts?.retry).toBe(0);
+		expect(recovered.opts?.retry).toBeUndefined();
 	});
 
 	it("context compact compacted → terse 'compacted' label, NOT the summary body", () => {
@@ -1564,12 +1565,13 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 		expect(dataOf(spec).text).toBe("Compact failed");
 	});
 
-	it("segment_compact compacting → '…segment compacting · N chars' + progress opt", () => {
+	it("segment_compact compacting keeps live progress outside the layout spec", () => {
 		const spec = compactSpec([{ type: "segment_compact", status: "compacting", outputChars: 7 }]);
 		expect(dataOf(spec).kind).toBe("segment_compact");
 		expect(dataOf(spec).status).toBe("compacting");
 		expect(dataOf(spec).text).toBe("Segment compacting… · 7 chars");
-		expect(spec.opts?.progress).toBe(7);
+		expect(spec.opts?.progress).toBeUndefined();
+		expect(dataOf(spec).compactLabels).toBeDefined();
 	});
 
 	it("segment_compact compacted → 'segment compacted (N messages)', not summary", () => {
@@ -4140,6 +4142,77 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
  */
 describe("adaptSegment — a concluded review", () => {
 	const CTX: AdapterContext = { lod: 5 };
+
+	describe("publication result receipts", () => {
+		const publicationResult = {
+			logicalRunId: "run",
+			truncated: true,
+			originalBytes: 90000,
+			sourceResultRef: "message:answer",
+		};
+		it.each([
+			1, 5,
+		] as const)("keeps snapshot identity and fixed single-line geometry at L%s", (lod) => {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "publication-result:run",
+						role: "disp",
+						contentJson: [{ type: "text", text: "large result".repeat(1000), publicationResult }],
+					},
+				},
+				{ lod },
+			);
+			expect(specs).toHaveLength(1);
+			expect(specs[0]).toMatchObject({
+				kind: "system-simple",
+				key: "publication-result:run-b0",
+				data: {
+					kind: "publication_result",
+					text: "",
+					messageId: "publication-result:run",
+					publicationResult,
+				},
+			});
+			const measured = VLIST_REGISTRY[specs[0].kind].measure(specs[0].data, 320, lod);
+			expect(measured.height).toBe(25);
+		});
+		it.each(["sys", "system", "assistant"])("does not collapse %s messages", (role) => {
+			const specs = adaptSegment(
+				{
+					kind: "message",
+					msg: {
+						id: "ordinary",
+						role,
+						contentJson: [{ type: "text", text: "ordinary", publicationResult }],
+					},
+				},
+				CTX,
+			);
+			expect(
+				specs.some((spec) => (spec.data as { kind?: string }).kind === "publication_result"),
+			).toBe(false);
+		});
+		it("does not collapse ordinary or malformed display messages", () => {
+			for (const meta of [undefined, { ...publicationResult, logicalRunId: "" }]) {
+				const specs = adaptSegment(
+					{
+						kind: "message",
+						msg: {
+							id: "ordinary",
+							role: "disp",
+							contentJson: [{ type: "text", text: "ordinary", publicationResult: meta }],
+						},
+					},
+					CTX,
+				);
+				expect(
+					specs.some((spec) => (spec.data as { kind?: string }).kind === "publication_result"),
+				).toBe(false);
+			}
+		});
+	});
 
 	/** The row production writes: role=user (a request) with origin=system (a reviewer). */
 	const conclusionRow = (

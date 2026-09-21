@@ -137,7 +137,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		expect(r.effectiveExpanded).toBe(false);
 		// header = pad*2 + badge row + descMt + xs line ; + border*2 (not inRun).
 		const expectedHeader =
-			c.CARD_PADDING * 2 + c.BADGE_ROW_HEIGHT + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
+			c.CARD_PADDING * 2 + c.badgeRowHeight() + c.DESC_MARGIN_TOP + c.XS_LINE_HEIGHT;
 		expect(r.headerHeight).toBe(expectedHeader);
 		expect(r.headerHeight).toBe(56);
 		expect(r.hasResultPreview).toBe(false);
@@ -159,7 +159,7 @@ describe("measureSubagentCard — collapsed header (55-75px)", () => {
 		expect(r.hasResultPreview).toBe(true);
 		const expectedHeader =
 			c.CARD_PADDING * 2 +
-			c.BADGE_ROW_HEIGHT +
+			c.badgeRowHeight() +
 			c.DESC_MARGIN_TOP +
 			c.XS_LINE_HEIGHT +
 			(c.RESULT_PREVIEW_MARGIN_TOP + c.XS_LINE_HEIGHT);
@@ -779,7 +779,7 @@ describe("background launch notice", () => {
 			expect(measured.hasBackgroundNotice).toBe(expected);
 		}
 	});
-	it("replaces protocol output with one fixed row and suppresses collapsed preview", async () => {
+	it("hides protocol output and reserves no result height", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const data = {
 			...BASE,
@@ -792,10 +792,7 @@ describe("background launch notice", () => {
 		const expanded = measureSubagentCard(data, WIDTH, 5, { opened: true });
 		expect(expanded.hasBackgroundNotice).toBe(true);
 		expect(expanded.resultMeasured).toBeNull();
-		expect(expanded.resultBlockHeight).toBeGreaterThan(0);
-		expect(measureSubagentCard(data, 240, 5, { opened: true }).resultBlockHeight).toBe(
-			expanded.resultBlockHeight,
-		);
+		expect(expanded.resultBlockHeight).toBe(0);
 		const collapsed = measureSubagentCard(data, WIDTH, 5, { opened: false });
 		expect(collapsed.hasResultPreview).toBe(false);
 		expect(collapsed.resultBlockHeight).toBe(0);

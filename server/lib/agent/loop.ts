@@ -1,11 +1,15 @@
 import { resolve } from "node:path";
-import type { TextCitation } from "@shared/citations";
 import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/progress-phase";
 import { scanToolOutputForKnowledgeDetailed } from "../../services/knowledge-injection";
 import { type ProtectedTaskMutation, SPEC_TASKS_PATH } from "../../services/spec-task-service";
 import { specVfsService } from "../../services/spec-vfs-service";
 import { beginNarratorResponseActivity } from "../../services/update-coordinator";
-import { type ApiRequestHandle, finishApiRequest, startApiRequest } from "../api-request-tracker";
+import {
+	type ApiRequestHandle,
+	finishApiRequest,
+	shouldCollectRequestDump,
+	startApiRequest,
+} from "../api-request-tracker";
 import {
 	type BooleanOverride,
 	type DangerReflectionLevel,
@@ -24,7 +28,6 @@ import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
-import { finalizeAssistantTextWithCitations, TextCitationAccumulator } from "./citation-stream";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
@@ -44,12 +47,14 @@ import {
 	isMalformedRequestBodyError,
 	writeMalformedRequestDump,
 } from "./malformed-request-dump";
+import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type ChatParams, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { ApiRequestDumpCollector, CACHE_DIAGNOSTIC_DUMP_MAX_BYTES } from "./request-dump";
 import { detectShell } from "./shell";
 import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
+	selectStreamingToolExecutions,
 	settleToolExecutionResult,
 } from "./tool-execution-groups";
 import {
@@ -585,52 +590,6 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 	);
 }
 
-/** Yield block_complete events for accumulated reasoning blocks and assistant text.
- *  Used in every early-return / error path to persist partial progress.
- *
- *  The text block is finalized here rather than at each call site: there are ~19
- *  partial-flush paths (abort, resumable error, invalid state, …) and every one
- *  of them must strip provider-internal citation markers. Doing it inside the
- *  single generator is what guarantees no path can leak `citeturn…` into a
- *  persisted block. `citations` is supplied by the success path, which already
- *  finalized the text to reuse it for the model history. */
-function* flushPartialContent(
-	reasoningBlockMap: Map<string, ReasoningBlockEntry>,
-	assistantText: string,
-	textOutputIndex?: number,
-	citations?: TextCitation[],
-): Generator<AgentEvent> {
-	for (const entry of reasoningBlockMap.values()) {
-		if (entry.text || entry.providerMetadata) {
-			yield {
-				type: "block_complete",
-				block: {
-					type: "reasoning",
-					text: entry.text,
-					providerMetadata: entry.providerMetadata,
-					outputIndex: entry.outputIndex,
-				},
-			};
-		}
-	}
-	if (!assistantText) return;
-	// Already-finalized text re-parses to itself, so this stays correct whether
-	// or not the caller pre-computed citations.
-	const finalized = citations
-		? { text: assistantText, citations }
-		: finalizeAssistantTextWithCitations(assistantText);
-	if (!finalized.text) return;
-	yield {
-		type: "block_complete",
-		block: {
-			type: "text",
-			text: finalized.text,
-			outputIndex: textOutputIndex,
-			...(finalized.citations.length > 0 ? { citations: finalized.citations } : {}),
-		},
-	};
-}
-
 // Cadence (in completed tool calls) for the periodic spec (tasks.json) reminder.
 // Named for the legacy todo reminder it replaced; still the spec-reminder interval.
 export const TODO_REMINDER_TOOL_INTERVAL = 15;
@@ -758,7 +717,6 @@ function normalizeSilentToolCallThreshold(value: number | undefined): number {
 const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
 const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
-	SHELL_TOOL_NAME,
 	"Execute",
 	"Agent",
 	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
@@ -766,8 +724,6 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// registered/running state. Defer them to the ordered post-stream tool phase.
 	"Await",
 	"Send",
-	"Write",
-	"Edit",
 	"Browser",
 	"Terminal",
 	"ShareFile",
@@ -796,6 +752,19 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
 	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
+	// Ordinary Bash is ordered, not necessarily deferred until the response ends.
+	// Pipeline/plan transitions still need the complete assistant message.
+	if (isStrictSerial(tu) && tu.name !== SHELL_TOOL_NAME) return false;
+	// Virtual task writes can enter a reflection loop. Keep that decision after
+	// request finalization rather than reflecting against an incomplete response.
+	if (
+		(tu.name === "Write" || tu.name === "Edit") &&
+		typeof tu.input.file_path === "string" &&
+		tu.input.file_path.startsWith("spec://")
+	)
+		return false;
+	// A stopped but malformed argument stream is not executable input.
+	if ("_raw" in tu.input) return false;
 	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,
 	// DangerConfirm/Cancel, …) settle a pending decision whose resolution aborts the
 	// reflection loop's own AbortController. Executing them eagerly mid-stream aborts the
@@ -816,8 +785,6 @@ type ReasoningBlockEntry = {
 	text: string;
 	providerMetadata?: ReasoningProviderMetadata;
 	outputIndex?: number;
-	/** When true, the next reasoning delta should be preceded by a separator. */
-	_needsSeparator?: boolean;
 };
 
 function reasoningBlockKey(event: {
@@ -861,9 +828,7 @@ function collectReasoningBlocks(
 	const blocks: ReasoningBlockEntry[] = [];
 	for (const entry of map.values()) {
 		if (entry.text || entry.providerMetadata) {
-			// Strip internal-only _needsSeparator before passing to pushAssistantTurn
-			const { _needsSeparator: _, ...block } = entry;
-			blocks.push(block);
+			blocks.push({ ...entry });
 		}
 	}
 	return blocks.length > 0 ? blocks : undefined;
@@ -2452,6 +2417,9 @@ export async function* agentLoop(
 	// Permission checks must be serialized even when tools themselves are parallel-safe.
 	// This prevents concurrent permission prompts / reflection loops from racing each other.
 	const originalPermissionHandler = config.permissionHandler;
+	// A streamed tool may request reflection before the provider's current user
+	// turn has been appended to history. Supply that turn on a separate array.
+	let getPermissionHistory = (): unknown[] => history;
 	let permissionTail: Promise<void> = Promise.resolve();
 	const resolvePermissionResult = async (
 		toolName: string,
@@ -2460,7 +2428,7 @@ export async function* agentLoop(
 		result: PermissionResult,
 	): Promise<PermissionResult> => {
 		if (result.behavior === "dangerReflection") {
-			return resolveDangerReflectionDecision(config, history, result, {
+			return resolveDangerReflectionDecision(config, getPermissionHistory(), result, {
 				toolUseId,
 				name: toolName,
 				input: result.input,
@@ -2477,7 +2445,7 @@ export async function* agentLoop(
 
 		const reflected = await resolveExitPlanModeReflection(
 			config,
-			history,
+			getPermissionHistory(),
 			{
 				toolUseId,
 				name: toolName,
@@ -3062,29 +3030,36 @@ export async function* agentLoop(
 
 			const content = isFirstTurn ? userText : nextTurnContent;
 			nextTurnContent = ""; // consume once
+			getPermissionHistory = () => {
+				const reflectionHistory = [...history];
+				provider.pushUserTurn(
+					reflectionHistory,
+					content,
+					effectiveModel,
+					isFirstTurn ? (initialToolResults ?? []) : pendingToolResults,
+					isFirstTurn ? images : undefined,
+				);
+				return reflectionHistory;
+			};
 
 			// Call provider and collect the response
 			let assistantText = "";
 			/** Provider-native content block index for the text block (for interleaved ordering). */
 			let textOutputIndex: number | undefined;
-			/** Source citations reported for this turn's assistant text (native search). */
-			const citationAccum = new TextCitationAccumulator();
-			/**
-			 * Where each text output item begins inside `assistantText`.
-			 *
-			 * Responses annotation indices are relative to their own output item, so a
-			 * turn with two text items would anchor the second item's references at the
-			 * wrong offset without this. With the usual single text item every offset is
-			 * 0 and the mapping is an identity.
-			 */
-			const textItemBaseOffsets = new Map<string, number>();
 			/**
 			 * Reasoning blocks accumulated during streaming, keyed by itemId.
 			 * Supports multiple reasoning items per turn (e.g. interleaved with tool calls).
 			 * Falls back to a synthetic key "__default" for providers that don't supply itemId.
 			 */
 			const reasoningBlockMap = new Map<string, ReasoningBlockEntry>();
-			const redactedThinkingBlocks: Array<{ data: string; outputIndex?: number }> = [];
+			// Persistence/replay share block identities; aggregate strings below remain
+			// compatibility inputs for providers whose wire protocol has one text field.
+			const outputContent = new OutputContentAccumulator();
+			const redactedThinkingBlocks: Array<{
+				data: string;
+				outputIndex?: number;
+				signatureSource?: string;
+			}> = [];
 			const toolUses: AgentToolUse[] = [];
 			type ToolOrderIdentity = {
 				toolUseId: string;
@@ -3108,18 +3083,18 @@ export async function* agentLoop(
 			};
 			const registerToolOrderIdentity = (
 				tool: { toolUseId: string; name?: string; outputIndex?: number },
-				strictSerial = false,
+				strictSerial?: boolean,
 			): ToolOrderIdentity => {
 				const existing = toolOrderIdentities.get(tool.toolUseId);
 				if (existing) {
 					if (tool.outputIndex != null) existing.outputIndex = tool.outputIndex;
 					if (tool.name) existing.name = tool.name;
-					if (
-						strictSerial ||
-						(tool.name && isStrictSerialToolExecution({ name: tool.name, input: {} }))
-					) {
-						existing.strictSerial = true;
-					}
+					// Completed input is authoritative, including an explicit false for
+					// parallel Bash. Partial chunks keep the conservative barrier.
+					existing.strictSerial =
+						strictSerial ??
+						(existing.strictSerial ||
+							!!(tool.name && isStrictSerialToolExecution({ name: tool.name, input: {} })));
 					return existing;
 				}
 				const identity: ToolOrderIdentity = {
@@ -3128,7 +3103,7 @@ export async function* agentLoop(
 					outputIndex: tool.outputIndex,
 					name: tool.name,
 					strictSerial:
-						strictSerial ||
+						strictSerial ??
 						(tool.name ? isStrictSerialToolExecution({ name: tool.name, input: {} }) : false),
 				};
 				toolOrderIdentities.set(tool.toolUseId, identity);
@@ -3140,19 +3115,6 @@ export async function* agentLoop(
 					tu.outputIndex = identity.outputIndex;
 				}
 				return identity;
-			};
-			const hasPriorStrictSerialBarrier = (tu: AgentToolUse): boolean => {
-				const current = markCompletedToolUse(tu);
-				for (const identity of toolOrderIdentities.values()) {
-					if (
-						identity.toolUseId !== tu.toolUseId &&
-						identity.strictSerial &&
-						compareToolOrder(identity, current) < 0
-					) {
-						return true;
-					}
-				}
-				return false;
 			};
 			const sortToolUsesByOutputOrder = (): void => {
 				for (const toolUse of toolUses) markCompletedToolUse(toolUse);
@@ -3191,6 +3153,48 @@ export async function* agentLoop(
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
 			// Synchronously queryable map of settled early-exec results (populated via .then())
 			const settledResults = new Map<string, ToolExecResult>();
+			// Only fully persisted AND announced calls are candidates. A preceding input
+			// still streaming remains an ordering barrier even if a later call is ready.
+			const streamReadyTools = new Set<string>();
+			let streamExecutionOpen = false;
+			const pumpStreamingTools = (): void => {
+				if (
+					!streamExecutionOpen ||
+					config.signal.aborted ||
+					config.deferEagerToolsForSafeStop === true ||
+					observeSoftStopForTurn()
+				)
+					return;
+				const completed = new Map(toolUses.map((tu) => [tu.toolUseId, tu]));
+				const candidates = selectStreamingToolExecutions(
+					[...toolOrderIdentities.values()].sort(compareToolOrder).map((identity) => {
+						const tool = completed.get(identity.toolUseId);
+						const result = settledResults.get(identity.toolUseId);
+						return {
+							tool,
+							ready: streamReadyTools.has(identity.toolUseId),
+							started: earlyExecMap.has(identity.toolUseId),
+							settled: result !== undefined,
+							fatal: result?.fatal,
+							allowed: tool !== undefined && shouldEagerExecuteTool(tool),
+						};
+					}),
+				);
+				for (const tu of candidates) {
+					// Register only actual starts, never promises for queued tools: the
+					// cut-in/abort paths must distinguish running work from skippable work.
+					const execution = settleToolExecutionResult(
+						executeToolAfterReflections(tu, config, history, locale),
+					);
+					earlyExecMap.set(tu.toolUseId, execution);
+					void execution.then((result) => {
+						settledResults.set(tu.toolUseId, result);
+						// Includes the after-snapshot boundary, so a dependent write can
+						// start safely even while the provider is waiting for another token.
+						pumpStreamingTools();
+					});
+				}
+			};
 			// Track which tool_results have already been yielded during streaming
 			const yieldedToolResults = new Set<string>();
 			// Track tool calls whose input was broken (output cut off mid-stream)
@@ -3242,6 +3246,19 @@ export async function* agentLoop(
 					outputIndex?: number;
 				}
 			>();
+			const orderedAssistantContent = (historyTools: readonly AgentToolUse[]): ContentBlock[] =>
+				outputContent.orderedContent([
+					...historyTools.map((tool): ContentBlock => ({ type: "tool_use", ...tool })),
+					...(collectCompletedWebSearches(webSearchAccum) ?? []).map(
+						(block): ContentBlock => ({ type: "web_search", ...block }),
+					),
+					...(collectCompletedImageGenerations(imageGenAccum) ?? []).map(
+						(block): ContentBlock => ({ type: "image_generation", ...block }),
+					),
+					...redactedThinkingBlocks.map(
+						(block): ContentBlock => ({ type: "redacted_thinking", ...block }),
+					),
+				]);
 			// Track whether the provider reported usage data during this turn
 			let receivedUsage = false;
 			// Per-attempt evidence for the empty-response guard (reset on every retry).
@@ -3250,6 +3267,31 @@ export async function* agentLoop(
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
 
+			function earlyToolResultEvent(
+				tu: AgentToolUse,
+				settled: ToolExecResult,
+			): Extract<AgentEvent, { type: "tool_result" }> {
+				const brokenOverride = settled.broken
+					? sanitizeBrokenInput(tu.name, settled.updatedInput ?? tu.input, locale)
+					: undefined;
+				return {
+					type: "tool_result",
+					toolCallBinding: executionBindings.get(tu),
+					toolUseId: tu.toolUseId,
+					toolName: tu.name,
+					input: settled.updatedInput ?? tu.input,
+					output: settled.broken ? getToolMessage("brokenToolCallResult", locale) : settled.output,
+					isError: settled.isError ?? false,
+					durationMs: settled.durationMs,
+					permissionStartedAt: settled.permissionStartedAt,
+					executionStartedAt: settled.executionStartedAt,
+					completedAt: settled.completedAt,
+					brokenInputOverride: brokenOverride,
+					updatedInput: brokenOverride ?? settled.updatedInput,
+					metadata: settled.metadata,
+				};
+			}
+
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
 					const settled = settledResults.get(tu.toolUseId);
@@ -3257,29 +3299,37 @@ export async function* agentLoop(
 					yieldedToolResults.add(tu.toolUseId);
 					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
 					if (settled.updatedInput) tu.input = settled.updatedInput;
-					const brokenOverride = settled.broken
-						? sanitizeBrokenInput(tu.name, tu.input, locale)
-						: undefined;
 					await processToolResultInjections(tu, settled);
-					const baseOutput = settled.broken
-						? getToolMessage("brokenToolCallResult", locale)
-						: settled.output;
-					yield {
-						type: "tool_result",
-						toolCallBinding: executionBindings.get(tu),
-						toolUseId: tu.toolUseId,
-						toolName: tu.name,
-						input: settled.updatedInput ?? tu.input,
-						output: baseOutput,
-						isError: settled.isError ?? false,
-						durationMs: settled.durationMs,
-						permissionStartedAt: settled.permissionStartedAt,
-						executionStartedAt: settled.executionStartedAt,
-						completedAt: settled.completedAt,
-						brokenInputOverride: brokenOverride,
-						updatedInput: brokenOverride ?? settled.updatedInput,
-						metadata: settled.metadata,
-					};
+					yield earlyToolResultEvent(tu, settled);
+				}
+			}
+
+			const detachedToolResults = new Set<string>();
+			function detachStartedEarlyToolResults(): void {
+				const persist = config.onDetachedToolResult;
+				if (!persist) return;
+				for (const tu of toolUses) {
+					const execution = earlyExecMap.get(tu.toolUseId);
+					if (
+						!execution ||
+						yieldedToolResults.has(tu.toolUseId) ||
+						detachedToolResults.has(tu.toolUseId)
+					)
+						continue;
+					detachedToolResults.add(tu.toolUseId);
+					// The executor still owns its IO, leases and after snapshot. Keep its
+					// final result alive without holding up interruption or emitting into
+					// a stream that may already belong to the narrator's next run.
+					void execution
+						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
+						.catch((error) => {
+							logger.error("Failed to persist detached tool result", {
+								narratorId: config.narratorId,
+								toolUseId: tu.toolUseId,
+								toolCallId: executionBindings.get(tu)?.toolCallId,
+								error: String(error),
+							});
+						});
 				}
 			}
 
@@ -3309,6 +3359,7 @@ export async function* agentLoop(
 					]);
 				}
 				yield* drainSettledEarlyToolResults();
+				detachStartedEarlyToolResults();
 			}
 
 			function hasStartedEarlyToolExecution(): boolean {
@@ -3501,6 +3552,7 @@ export async function* agentLoop(
 			}
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
+				streamExecutionOpen = false;
 				if (!requestStarted) return;
 				// Retract the live tool cards this request published but never completed.
 				//
@@ -3853,6 +3905,7 @@ export async function* agentLoop(
 				// and the teardown retraction in finishRequest would find nothing.
 				yield* retractStreamingToolCards();
 				reasoningBlockMap.clear();
+				outputContent.reset();
 				redactedThinkingBlocks.length = 0;
 				toolUseAccum.clear();
 				// Tell the frontend to drop the live streaming reasoning it is showing;
@@ -3919,16 +3972,6 @@ export async function* agentLoop(
 				yield* finishRequest(errorMessage);
 			}
 
-			/**
-			 * Key for a text output item, used to anchor its annotation offsets.
-			 *
-			 * Providers that omit `output_index` collapse onto a single default key,
-			 * which is correct: without an item identity there is only one text run.
-			 */
-			function citationStreamKey(outputIndex?: number): string {
-				return outputIndex == null ? "__default" : `output:${outputIndex}`;
-			}
-
 			// Request-level extensions: near-field guidance + tool anchoring (per turn)
 			if (config.loopExtensions && config.loopExtensions.length > 0) {
 				for (const ext of config.loopExtensions) {
@@ -3982,9 +4025,8 @@ export async function* agentLoop(
 				// begins (the stream fails during the model's response, not after tool
 				// dispatch), so this is safe.
 				assistantText = "";
+				outputContent.reset();
 				textOutputIndex = undefined;
-				citationAccum.reset();
-				textItemBaseOffsets.clear();
 				reasoningBlockMap.clear();
 				toolUses.length = 0;
 				toolOrderIdentities.clear();
@@ -3993,6 +4035,8 @@ export async function* agentLoop(
 				credentialId = undefined;
 				earlyExecMap.clear();
 				settledResults.clear();
+				streamReadyTools.clear();
+				streamExecutionOpen = false;
 				// Leak-detection dump flag is per successful attempt; clear stale state so a
 				// retry that no longer leaks does not force-persist the previous attempt's dump.
 				forceDumpPersist = false;
@@ -4038,12 +4082,11 @@ export async function* agentLoop(
 				requestMeterUnit = undefined;
 				requestDiagnostics = undefined;
 
-				// Initialize request dump collector when explicitly enabled, OR when the provider
-				// may leak XML tool calls (NUG) so leaked-tool diagnostics always have a
-				// bounded raw dump to persist on detection. Providers write bodyText/events through
-				// the *WithLimit helpers, so collection stays bounded even when force-enabled here.
+				// Re-evaluate live settings for every attempt so a running narrator picks up
+				// dump toggles on its next provider.chat(). Cache-drop diagnostics remain a
+				// separate bounded capture when full request dumps are disabled.
 				cacheDiagnosticEnabled = settings.agent.cacheDropDumpEnabled && !!config.narratorId;
-				const fullCapture = settings.agent.requestDumpEnabled || provider.mayLeakXmlToolCalls;
+				const fullCapture = shouldCollectRequestDump(provider.mayLeakXmlToolCalls);
 				requestDump =
 					fullCapture || cacheDiagnosticEnabled
 						? new ApiRequestDumpCollector(
@@ -4145,7 +4188,26 @@ export async function* agentLoop(
 						...(isFirstTurn && images?.length ? { images } : {}),
 					});
 
+					streamExecutionOpen = true;
 					for await (const parsed of stream) {
+						// Stop dispatch before yielding/awaiting error publication. A finishing
+						// tool must not release more queued work while failure handling runs.
+						if (parsed.invalidState || parsed.silentDisconnect) streamExecutionOpen = false;
+						// Make every identity in this provider event visible before ANY yield.
+						// Completed calls and an earlier unfinished chunk may arrive together.
+						for (const tu of parsed.toolUses ?? []) {
+							tu.name = canonicalizeToolName(tu.name);
+							markCompletedToolUse(tu);
+						}
+						if (parsed.toolUseChunk?.toolUseId) {
+							registerToolOrderIdentity({
+								toolUseId: parsed.toolUseChunk.toolUseId,
+								name: parsed.toolUseChunk.name
+									? canonicalizeToolName(parsed.toolUseChunk.name)
+									: undefined,
+								outputIndex: parsed.toolUseChunk.outputIndex,
+							});
+						}
 						yield* flushRequestStart();
 						const hasMeaningfulEvent = isMeaningfulStreamEvent(parsed);
 						// Evidence for the empty-response guard: count every event and note
@@ -4185,13 +4247,106 @@ export async function* agentLoop(
 							lastRetryDiagnostics = undefined;
 						}
 
-						if (parsed.text) {
-							// First delta of this output item: remember where it starts in the raw
-							// text, so a later annotation's item-relative index can be rebased.
-							const key = citationStreamKey(parsed.textOutputIndex);
-							if (!textItemBaseOffsets.has(key)) {
-								textItemBaseOffsets.set(key, assistantText.length);
+						const reasoningKey = reasoningBlockKey(parsed);
+						const reasoningLane: ContentLane = {
+							blockId:
+								parsed.reasoningBlockId ??
+								(reasoningKey === "__default" ? undefined : reasoningKey),
+							outputIndex: parsed.reasoningOutputIndex,
+						};
+						const textLane: ContentLane = {
+							blockId: parsed.textBlockId,
+							outputIndex: parsed.textOutputIndex,
+						};
+						if (parsed.contentBoundary?.phase === "start") {
+							yield* outputContent.boundary(parsed.contentBoundary);
+						}
+						if (parsed.reasoning) {
+							yield* outputContent.begin("reasoning", reasoningLane);
+							const itemKey = reasoningKey;
+							const existing = reasoningBlockMap.get(itemKey);
+							const stampedMetadata = stampReasoningSource(
+								parsed.reasoningMetadata,
+								provider.getActiveReasoningSource?.(),
+							);
+							// Metadata can arrive mid-item; it must not inject bytes into signed reasoning.
+							if (existing) {
+								existing.text += parsed.reasoning;
+								if (stampedMetadata) {
+									existing.providerMetadata = stampedMetadata;
+								}
+								if (parsed.reasoningOutputIndex != null) {
+									existing.outputIndex = parsed.reasoningOutputIndex;
+								}
+							} else {
+								reasoningBlockMap.set(itemKey, {
+									text: parsed.reasoning,
+									providerMetadata: stampedMetadata,
+									outputIndex: parsed.reasoningOutputIndex,
+								});
 							}
+							const identity = outputContent.append(
+								"reasoning",
+								parsed.reasoning,
+								reasoningLane,
+								stampedMetadata,
+							);
+							yield {
+								type: "stream_reasoning",
+								text: parsed.reasoning,
+								providerMetadata: stampedMetadata,
+								...identity,
+							};
+						} else if (parsed.reasoningMetadata) {
+							// Metadata-only event (e.g. final encrypted_content from output_item.done
+							// or Anthropic thinking block stop with signature).
+							// Update the stored metadata without emitting a streaming event.
+							const itemKey = reasoningBlockKey(parsed);
+							const existing = reasoningBlockMap.get(itemKey);
+							const stampedMetadata = stampReasoningSource(
+								parsed.reasoningMetadata,
+								provider.getActiveReasoningSource?.(),
+							);
+							if (existing) {
+								existing.providerMetadata = stampedMetadata;
+								if (parsed.reasoningOutputIndex != null) {
+									existing.outputIndex = parsed.reasoningOutputIndex;
+								}
+							} else {
+								// Metadata arrived before any text — create an empty-text entry
+								reasoningBlockMap.set(itemKey, {
+									text: "",
+									providerMetadata: stampedMetadata,
+									outputIndex: parsed.reasoningOutputIndex,
+								});
+							}
+							if (stampedMetadata)
+								yield* outputContent.reasoningMetadata(stampedMetadata, reasoningLane);
+						}
+
+						// ── Mimo ellipsis reasoning detection ──
+						// Some mimo models (via Anthropic protocol) emit "..." as the
+						// entire reasoning content, which is a degenerate response.
+						// When detected, discard the reasoning block and retry the request.
+						if (parsed.reasoningMetadata && effectiveModel.toLowerCase().includes("mimo")) {
+							const itemKey = reasoningBlockKey(parsed);
+							const entry = reasoningBlockMap.get(itemKey);
+							if (entry && entry.text.trim() === "...") {
+								logger.warn(
+									"Mimo model returned ellipsis-only reasoning, discarding and retrying",
+									{
+										narratorId: config.narratorId,
+										model: effectiveModel,
+										provider: effectiveProvider,
+									},
+								);
+								reasoningBlockMap.delete(itemKey);
+								mimoEllipsisRetry = true;
+								break; // break out of for-await stream loop to trigger retry
+							}
+						}
+						if (parsed.text) {
+							yield* outputContent.begin("text", textLane);
 							assistantText += parsed.text;
 							if (parsed.text.trim()) silentToolCallCount = 0;
 							if (parsed.textOutputIndex != null) {
@@ -4200,21 +4355,45 @@ export async function* agentLoop(
 							// Deltas are forwarded verbatim. Stripping happens once at finalize,
 							// and the read side projects historical rows anyway — a second,
 							// incremental parser here only created two ways to disagree.
-							yield { type: "stream_text", text: parsed.text, outputIndex: parsed.textOutputIndex };
+							const identity = outputContent.append("text", parsed.text, textLane);
+							yield { type: "stream_text", text: parsed.text, ...identity };
 						}
-						// Citations are metadata, not visible output: accumulate silently and
-						// attach them when the text block is finalized. Broadcasting them per
-						// event would add a high-frequency WS channel for no visual gain.
+						// Late annotations update their original block; aggregate text and
+						// block-local citations are both derived from the same lane spans.
 						if (parsed.textCitations) {
-							const key = citationStreamKey(
-								parsed.textCitations[0]?.outputIndex ?? parsed.textOutputIndex,
+							yield* outputContent.addCitations(parsed.textCitations, textLane);
+						}
+						if (parsed.contentBoundary && parsed.contentBoundary.phase !== "start") {
+							yield* outputContent.boundary(parsed.contentBoundary);
+						}
+						// Content is acknowledged by the awaited event consumer before even
+						// the first tool card is shown (not just before eager execution).
+						if (parsed.toolUseChunk?.toolUseId) {
+							const chunk = parsed.toolUseChunk;
+							yield* outputContent.beforeExternal(chunk.toolUseId, chunk.outputIndex);
+							chunk.outputIndex ??= outputContent.observeExternal(chunk.toolUseId);
+						}
+						for (const tool of parsed.toolUses ?? []) {
+							yield* outputContent.beforeExternal(tool.toolUseId, tool.outputIndex);
+							tool.outputIndex ??= outputContent.observeExternal(tool.toolUseId);
+						}
+						if (parsed.webSearch) {
+							yield* outputContent.beforeExternal(
+								parsed.webSearch.id,
+								parsed.webSearch.outputIndex,
 							);
-							citationAccum.add(parsed.textCitations, textItemBaseOffsets.get(key) ?? 0);
+							parsed.webSearch.outputIndex ??= outputContent.observeExternal(parsed.webSearch.id);
+						}
+						if (parsed.imageGeneration) {
+							yield* outputContent.beforeExternal(
+								parsed.imageGeneration.id,
+								parsed.imageGeneration.outputIndex,
+							);
+							parsed.imageGeneration.outputIndex ??= outputContent.observeExternal(
+								parsed.imageGeneration.id,
+							);
 						}
 						if (parsed.toolUses) {
-							// Legacy alias → canonical name, before anything keys off the name
-							// (order identity, TOOL_FIELD_CONFIG, registry lookup, persistence).
-							for (const tu of parsed.toolUses) tu.name = canonicalizeToolName(tu.name);
 							// ── Tool use dedup ──
 							// Some providers (notably NUG) may emit the same tool call
 							// via BOTH the non-streaming `parsed.toolUses` array AND the streaming
@@ -4276,34 +4455,14 @@ export async function* agentLoop(
 									} satisfies ContentBlock,
 								};
 
-								// Start eager execution (same as the streaming stop path).
-								// Skip after a strict-serial barrier — those tools must execute
-								// in final group order after preceding tools complete.
-								if (
-									config.deferEagerToolsForSafeStop !== true &&
-									!observeSoftStopForTurn() &&
-									!earlyExecMap.has(tu.toolUseId) &&
-									!isStrictSerial(tu) &&
-									!hasPriorStrictSerialBarrier(tu) &&
-									shouldEagerExecuteTool(tu)
-								) {
-									const execPromise = executeTool(tu, config).catch(
-										(err): ToolExecResult => ({
-											output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-											isError: true,
-											durationMs: 0,
-										}),
-									);
-									execPromise.then((r) => settledResults.set(tu.toolUseId, r));
-									earlyExecMap.set(tu.toolUseId, execPromise);
-								}
-
 								yield {
 									type: "tool_call",
 									toolUseId: tu.toolUseId,
 									toolName: tu.name,
 									input: tu.input,
 								};
+								streamReadyTools.add(tu.toolUseId);
+								pumpStreamingTools();
 							}
 						}
 
@@ -4633,38 +4792,6 @@ export async function* agentLoop(
 											} satisfies ContentBlock,
 										};
 
-										// Start tool execution eagerly (don't await — collect later).
-										// Wrap with .catch() so a rejected permissionHandler doesn't
-										// create an unhandled rejection; the error surfaces as isError.
-										// The .then() populates settledResults synchronously so the
-										// streaming loop can drain completed results without awaiting.
-										// Skip after a strict-serial barrier — those tools must execute
-										// in final group order after preceding tools complete.
-										//
-										// A pending soft stop also suppresses the eager start: the
-										// queued cut-in is meant to be answered after the tool that
-										// was running when it arrived, and an eagerly started tool is
-										// awaited (not skipped) by the execution phase below. Without
-										// this gate every remaining tool of the turn still runs, which
-										// is what made a cut-in look like it landed a request late.
-										if (
-											config.deferEagerToolsForSafeStop !== true &&
-											!observeSoftStopForTurn() &&
-											!isStrictSerial(tu) &&
-											!hasPriorStrictSerialBarrier(tu) &&
-											shouldEagerExecuteTool(tu)
-										) {
-											const execPromise = executeTool(tu, config).catch(
-												(err): ToolExecResult => ({
-													output: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
-													isError: true,
-													durationMs: 0,
-												}),
-											);
-											execPromise.then((r) => settledResults.set(id, r));
-											earlyExecMap.set(id, execPromise);
-										}
-
 										// Notify frontend the tool has started
 										yield {
 											type: "tool_call",
@@ -4674,6 +4801,8 @@ export async function* agentLoop(
 											streamStartedAt: acc.startedAt,
 											streamCompletedAt: acc.streamCompletedAt,
 										};
+										streamReadyTools.add(id);
+										pumpStreamingTools();
 
 										// Drain any tool results that settled during streaming.
 										// This lets fast tools (Read, Glob, etc.) report completion
@@ -4719,6 +4848,7 @@ export async function* agentLoop(
 						}
 
 						if (parsed.silentDisconnect) {
+							yield* drainStartedEarlyToolResults();
 							yield* finishRequest("Silent disconnect");
 							yield { type: "silent_disconnect" };
 							return;
@@ -4727,98 +4857,17 @@ export async function* agentLoop(
 
 						if (parsed.credentialId) credentialId = parsed.credentialId;
 
-						if (parsed.reasoning) {
-							const itemKey = reasoningBlockKey(parsed);
-							const existing = reasoningBlockMap.get(itemKey);
-							const stampedMetadata = stampReasoningSource(
-								parsed.reasoningMetadata,
-								provider.getActiveReasoningSource?.(),
-							);
-							// Separator prefix for multiple delimited reasoning segments that share a provider item.
-							let prefix = "";
-							if (existing) {
-								if (existing._needsSeparator && existing.text) {
-									prefix = "\n\n";
-									existing._needsSeparator = false;
-								}
-								existing.text += prefix + parsed.reasoning;
-								if (stampedMetadata) {
-									existing.providerMetadata = stampedMetadata;
-								}
-								if (parsed.reasoningOutputIndex != null) {
-									existing.outputIndex = parsed.reasoningOutputIndex;
-								}
-							} else {
-								reasoningBlockMap.set(itemKey, {
-									text: parsed.reasoning,
-									providerMetadata: stampedMetadata,
-									outputIndex: parsed.reasoningOutputIndex,
-								});
-							}
-							yield {
-								type: "stream_reasoning",
-								text: prefix + parsed.reasoning,
-								providerMetadata: stampedMetadata,
-								outputIndex: parsed.reasoningOutputIndex,
-							};
-						} else if (parsed.reasoningMetadata) {
-							// Metadata-only event (e.g. final encrypted_content from output_item.done
-							// or Anthropic thinking block stop with signature).
-							// Update the stored metadata without emitting a streaming event.
-							// Mark the entry so the next reasoning delta inserts a separator.
-							const itemKey = reasoningBlockKey(parsed);
-							const existing = reasoningBlockMap.get(itemKey);
-							const stampedMetadata = stampReasoningSource(
-								parsed.reasoningMetadata,
-								provider.getActiveReasoningSource?.(),
-							);
-							if (existing) {
-								existing.providerMetadata = stampedMetadata;
-								if (parsed.reasoningOutputIndex != null) {
-									existing.outputIndex = parsed.reasoningOutputIndex;
-								}
-								// Mark for separator so the next reasoning delta from a
-								// new thinking block gets a visual break from the previous one.
-								if (existing.text) {
-									existing._needsSeparator = true;
-								}
-							} else {
-								// Metadata arrived before any text — create an empty-text entry
-								reasoningBlockMap.set(itemKey, {
-									text: "",
-									providerMetadata: stampedMetadata,
-									outputIndex: parsed.reasoningOutputIndex,
-								});
-							}
-						}
-
-						// ── Mimo ellipsis reasoning detection ──
-						// Some mimo models (via Anthropic protocol) emit "..." as the
-						// entire reasoning content, which is a degenerate response.
-						// When detected, discard the reasoning block and retry the request.
-						if (parsed.reasoningMetadata && effectiveModel.toLowerCase().includes("mimo")) {
-							const itemKey = reasoningBlockKey(parsed);
-							const entry = reasoningBlockMap.get(itemKey);
-							if (entry && entry.text.trim() === "...") {
-								logger.warn(
-									"Mimo model returned ellipsis-only reasoning, discarding and retrying",
-									{
-										narratorId: config.narratorId,
-										model: effectiveModel,
-										provider: effectiveProvider,
-									},
-								);
-								reasoningBlockMap.delete(itemKey);
-								mimoEllipsisRetry = true;
-								break; // break out of for-await stream loop to trigger retry
-							}
-						}
-
 						if (parsed.redactedThinking) {
+							yield* outputContent.flush();
+							parsed.redactedThinking.outputIndex = outputContent.observeExternal(
+								`redacted:${redactedThinkingBlocks.length}`,
+								parsed.redactedThinking.outputIndex,
+							);
 							const redactedSource = provider.getActiveReasoningSource?.();
 							redactedThinkingBlocks.push({
 								data: parsed.redactedThinking.data,
 								outputIndex: parsed.redactedThinking.outputIndex,
+								...(redactedSource ? { signatureSource: redactedSource } : {}),
 							});
 							yield {
 								type: "block_complete",
@@ -5026,7 +5075,7 @@ export async function* agentLoop(
 							}
 							const classification = classifyInvalidState(reason, message, requestDiagnostics);
 							if (classification.category === "context_overflow") {
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* outputContent.flush();
 								yield* finishRequest(message);
 								yield { type: "context_length_exceeded", message };
 								return;
@@ -5060,7 +5109,7 @@ export async function* agentLoop(
 									isModelUnavailableError({ message, diagnostics: requestDiagnostics }) &&
 									!hasStartedEarlyToolExecution()
 								) {
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* outputContent.flush();
 									yield* finishRequest(message);
 									const prefixToken = `${nugProvider.prefix}:`;
 									const nugModelId = effectiveModel.startsWith(prefixToken)
@@ -5098,7 +5147,7 @@ export async function* agentLoop(
 								if (kimiQuota.kind !== "none") {
 									const { providerId, providerPrefix, resetAt } =
 										kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-									yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+									yield* outputContent.flush();
 									yield* finishRequest(message);
 									yield {
 										type: "model_unavailable",
@@ -5259,7 +5308,7 @@ export async function* agentLoop(
 									// Retry budget spent (or a stateful provider that cannot replay the
 									// request): fall back to a textual continuation rather than failing.
 								}
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* outputContent.flush();
 								yield* finishRequest(message);
 								yield { type: "resumable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -5339,7 +5388,7 @@ export async function* agentLoop(
 								}
 								// Exhausted retries — yield block_complete for partial content
 								// then signal retryable_error to the caller.
-								yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+								yield* outputContent.flush();
 								yield* finishRequest(message);
 								yield { type: "retryable_error", message, diagnostics: requestDiagnostics };
 								return;
@@ -5349,8 +5398,9 @@ export async function* agentLoop(
 							// error surfaces to the user instead of being masked by the
 							// downstream empty-response check (which would retry and eventually
 							// report a misleading "Provider returned an empty response" message).
+							yield* drainStartedEarlyToolResults();
 							sawErrorEvent = true;
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* outputContent.flush();
 							yield* finishRequest(message);
 							yield {
 								type: "invalid_state",
@@ -5361,8 +5411,10 @@ export async function* agentLoop(
 							return;
 						}
 					}
+					streamExecutionOpen = false;
 					yield* flushRequestStart();
 				} catch (err) {
+					streamExecutionOpen = false;
 					if (config.signal.aborted) {
 						// Let already-fulfilled eager tool promises publish into `settledResults`,
 						// then persist their completed results before surfacing the abort.  Without
@@ -5370,10 +5422,10 @@ export async function* agentLoop(
 						// already finished execution stuck as running/interrupted in history.
 						await Promise.resolve();
 						yield* drainEarlyToolResultsAfterAbort();
-						// Do not await still-running eager tools beyond the bounded abort drain. Their
-						// execution cleanup is handled by the tool executor.
+						// Do not await still-running eager tools beyond the bounded abort drain. The
+						// executor finishes cleanup; the detached callback preserves the exact result.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
@@ -5451,7 +5503,7 @@ export async function* agentLoop(
 							toolCount: toolUses.length,
 							startedToolCount: earlyExecMap.size,
 						});
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* drainStartedEarlyToolResults();
 						yield* finishRequest(message);
 						yield {
@@ -5514,7 +5566,7 @@ export async function* agentLoop(
 					);
 					const paymentRequired = nugProvider ? getPaymentRequiredErrorInfo(err) : null;
 					if (paymentRequired) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						yield {
 							type: "payment_required",
@@ -5536,7 +5588,7 @@ export async function* agentLoop(
 					// poller, instead of retrying the full request (with its whole history)
 					// over and over. Only for NUG providers.
 					if (nugProvider && isModelUnavailableError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						// `effectiveModel` is `${prefix}:${channel:bareModel}`; strip the
 						// provider prefix to recover the gateway model id (`channel:bareModel`)
@@ -5575,7 +5627,7 @@ export async function* agentLoop(
 						if (kimiQuota.kind !== "none") {
 							const { providerId, providerPrefix, resetAt } =
 								kimiQuota.kind === "wait" ? kimiQuota.wait : kimiQuota.refusal;
-							yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+							yield* outputContent.flush();
 							yield* finishRequest(msg);
 							yield {
 								type: "model_unavailable",
@@ -5600,7 +5652,7 @@ export async function* agentLoop(
 						(err as { code: string }).code === "CONTEXT_LENGTH_EXCEEDED"
 					) {
 						// Persist partial content before signalling overflow
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -5608,7 +5660,7 @@ export async function* agentLoop(
 					// Detect context overflow errors from OpenAI/Codex-compatible providers.
 					// Treat as context_length_exceeded so caller can prune/compact+retry.
 					if (isContextWindowExceededError(err)) {
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						yield { type: "context_length_exceeded", message: msg };
 						return;
@@ -5740,7 +5792,7 @@ export async function* agentLoop(
 							// Retry budget spent (or a stateful provider that cannot replay the
 							// request): fall back to a textual continuation rather than failing.
 						}
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						yield { type: "resumable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
@@ -5812,17 +5864,20 @@ export async function* agentLoop(
 							}
 						}
 						// Exhausted retries — persist partial content and signal caller
-						yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+						yield* outputContent.flush();
 						yield* finishRequest(msg);
 						yield { type: "retryable_error", message: msg, diagnostics: requestDiagnostics };
 						return;
 					}
-					// Non-retryable error — persist partial content and signal caller
-					yield* flushPartialContent(reasoningBlockMap, assistantText, textOutputIndex);
+					// Non-retryable error — retain already-started side effects, but never
+					// dispatch queued calls merely to finish a failed response.
+					yield* drainStartedEarlyToolResults();
+					yield* outputContent.flush();
 					yield* finishRequest(msg);
 					yield { type: "error", message: msg, diagnostics: requestDiagnostics };
 					return;
 				} finally {
+					streamExecutionOpen = false;
 					clearFirstTokenTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
 					startFirstTokenTimerForAttempt = undefined;
@@ -6173,8 +6228,9 @@ export async function* agentLoop(
 					// attempt would throw its result away and re-send the same request.
 					canReplayInPlace()
 				) {
-					// Drop accumulated reasoning so flushPartialContent won't persist it.
+					// This attempt is discarded in both the display and replay lanes.
 					reasoningBlockMap.clear();
+					outputContent.reset();
 					redactedThinkingBlocks.length = 0;
 					// Tell the frontend to discard the live streaming reasoning it is showing.
 					yield { type: "stream_reset" };
@@ -6351,7 +6407,7 @@ export async function* agentLoop(
 			// `assistant_message` event, persistence and `pushAssistantTurn`. If the
 			// raw text were used for the model history, the next turn would see the
 			// internal markers and happily reproduce them.
-			const finalizedText = citationAccum.finalize(assistantText);
+			const finalizedText = outputContent.finalizeText();
 			const turnCitations = finalizedText.citations;
 			if (finalizedText.strippedMarkers) {
 				logger.debug("Stripped provider-internal citation markers from assistant text", {
@@ -6461,12 +6517,7 @@ export async function* agentLoop(
 
 			// Yield accumulated content before assistant_message so partial-block
 			// persistence is finalized for both normal and truncated turns.
-			yield* flushPartialContent(
-				reasoningBlockMap,
-				assistantText,
-				textOutputIndex,
-				turnCitations.length > 0 ? turnCitations : undefined,
-			);
+			yield* outputContent.flush();
 
 			// Drain settled tool results before assistant_message so the DB
 			// has correct tool call statuses when the message is broadcast.
@@ -6547,6 +6598,7 @@ export async function* agentLoop(
 						collectCompletedImageGenerations(imageGenAccum),
 						textOutputIndex,
 						redactedThinkingBlocks,
+						orderedAssistantContent(toHistoryToolUses(toolUses)),
 					);
 					yield { type: "turn_complete", turnIndex };
 					turnIndex++;
@@ -6568,6 +6620,10 @@ export async function* agentLoop(
 			} else if (pendingToolResults.length > 0) {
 				provider.pushUserTurn(history, "", effectiveModel, pendingToolResults);
 			}
+
+			// The current input now lives in history; pending permissions must not
+			// append it a second time when they resolve after stream completion.
+			getPermissionHistory = () => history;
 
 			// Execute each tool call
 			pendingToolResults = [];
@@ -6601,6 +6657,17 @@ export async function* agentLoop(
 					// Serial execution (single tool)
 					const tu = group[0];
 					const earlyPromise = earlyExecMap.get(tu.toolUseId);
+					if (!streamReadyTools.has(tu.toolUseId)) {
+						yield {
+							type: "tool_call",
+							toolUseId: tu.toolUseId,
+							toolName: tu.name,
+							input: tu.input,
+							streamStartedAt: tu.streamStartedAt,
+							streamCompletedAt: tu.streamCompletedAt,
+						};
+						streamReadyTools.add(tu.toolUseId);
+					}
 					// settleToolExecutionResult converts a genuine rejection into a formal
 					// isError ToolExecResult so a throwing serial tool never aborts the loop.
 					const result = await settleToolExecutionResult(
@@ -6638,17 +6705,6 @@ export async function* agentLoop(
 							return;
 						}
 					} else {
-						// Only yield tool_call if not already yielded during streaming
-						if (!earlyPromise) {
-							yield {
-								type: "tool_call",
-								toolUseId: tu.toolUseId,
-								toolName: tu.name,
-								input: tu.input,
-								streamStartedAt: tu.streamStartedAt,
-							};
-						}
-
 						// For tools with streamStartedAt, compute display duration as
 						// total elapsed minus time spent executing preceding tools.
 						let durationMs = result.durationMs;
@@ -6665,6 +6721,7 @@ export async function* agentLoop(
 							? sanitizeBrokenInput(tu.name, tu.input, locale)
 							: undefined;
 
+						yieldedToolResults.add(tu.toolUseId);
 						yield {
 							type: "tool_result",
 							toolCallBinding: executionBindings.get(tu),
@@ -6676,6 +6733,9 @@ export async function* agentLoop(
 								: result.output,
 							isError: result.isError ?? false,
 							durationMs,
+							permissionStartedAt: result.permissionStartedAt,
+							executionStartedAt: result.executionStartedAt,
+							completedAt: result.completedAt,
 							brokenInputOverride,
 							updatedInput: brokenInputOverride ?? result.updatedInput,
 							metadata:
@@ -6694,7 +6754,7 @@ export async function* agentLoop(
 					// Parallel execution (multiple Task calls)
 					// Yield tool_call events for tools not already started during streaming
 					for (const tu of group) {
-						if (!earlyExecMap.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
+						if (!streamReadyTools.has(tu.toolUseId) && !yieldedToolResults.has(tu.toolUseId)) {
 							yield {
 								type: "tool_call",
 								toolUseId: tu.toolUseId,
@@ -6900,6 +6960,7 @@ export async function* agentLoop(
 						collectCompletedImageGenerations(imageGenAccum),
 						textOutputIndex,
 						redactedThinkingBlocks,
+						orderedAssistantContent(toHistoryToolUses(toolUses)),
 					);
 					yield { type: "turn_complete", turnIndex };
 					return;
@@ -6931,6 +6992,7 @@ export async function* agentLoop(
 					collectCompletedImageGenerations(imageGenAccum),
 					textOutputIndex,
 					redactedThinkingBlocks,
+					orderedAssistantContent(toHistoryToolUses(cleanToolUses)),
 				);
 
 				// Inject a user-side reminder so the model knows what happened and
@@ -6953,6 +7015,7 @@ export async function* agentLoop(
 					collectCompletedImageGenerations(imageGenAccum),
 					textOutputIndex,
 					redactedThinkingBlocks,
+					orderedAssistantContent(toHistoryToolUses(toolUses)),
 				);
 			}
 

@@ -79,6 +79,14 @@ export interface ToolCallBinding {
 	readonly executionSegmentId?: string;
 }
 
+/** Awaited execution boundary, after authorization and final admission (not UI events). */
+export interface ToolExecutionLifecycleContext {
+	toolUse: AgentToolUse;
+	effectiveInput: Record<string, unknown>;
+	executionTarget?: ToolExecutionTarget;
+	binding?: ToolCallBinding;
+}
+
 export interface ToolContext {
 	/** Eval-only audited Read bridge; never exposes the runner configuration. */
 	executeRead?: (input: Record<string, unknown>, signal: AbortSignal) => Promise<ToolResult>;
@@ -401,7 +409,16 @@ export type AgentEvent =
 			/** Source citations for `text`, when the provider reported any. */
 			citations?: import("@shared/citations").TextCitation[];
 	  }
-	| { type: "stream_text"; text: string; outputIndex?: number }
+	| {
+			type: "stream_text";
+			text: string;
+			outputIndex?: number;
+			/** Attempt-scoped identity and revision shared with persisted content. */
+			blockId?: string;
+			blockRevision?: number;
+			/** Raw text characters preceding this delta (metadata may also advance revision). */
+			blockTextOffset?: number;
+	  }
 	| {
 			type: "tool_call";
 			toolUseId: string;
@@ -659,6 +676,10 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
+			blockId?: string;
+			blockRevision?: number;
+			/** Raw text characters preceding this delta (metadata may also advance revision). */
+			blockTextOffset?: number;
 	  }
 	| {
 			type: "context_usage";
@@ -760,6 +781,11 @@ export type ContentBlock =
 			type: "text";
 			text: string;
 			outputIndex?: number;
+			/** Display/persistence identity, never an upstream replay credential. */
+			id?: string;
+			revision?: number;
+			/** Raw stream length before citation-marker cleanup. */
+			rawTextLength?: number;
 			/**
 			 * Source citations for this text, indexed against `text`.
 			 * Present only when the provider reported sources (native search).
@@ -772,6 +798,10 @@ export type ContentBlock =
 			translatedText?: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
+			id?: string;
+			revision?: number;
+			/** Raw stream length before citation-marker cleanup. */
+			rawTextLength?: number;
 	  }
 	| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 	| {
@@ -1015,6 +1045,18 @@ export interface AgentConfig {
 		binding: ToolCallBinding,
 		result: ToolResult & { durationMs?: number },
 	) => Promise<void>;
+	/** Fail-open observation after authorization/final admission, before the durable start claim. */
+	onToolExecutionBefore?: (context: ToolExecutionLifecycleContext) => Promise<void> | void;
+	/** Paired cleanup, including thrown/aborted execution; awaited before executeTool settles. */
+	onToolExecutionAfter?: (
+		context: ToolExecutionLifecycleContext & { result?: ToolResult; error?: unknown },
+	) => Promise<void> | void;
+	/**
+	 * Persist an already-started tool's final result after the bounded abort drain
+	 * closed its event consumer. Never routes through a newer run's streaming state
+	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
+	 */
+	onDetachedToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void>;
 	/** Durable single-start claim immediately before tool.execute, after authorization. */
 	onToolExecutionStarting?: (
 		toolUseId: string,
