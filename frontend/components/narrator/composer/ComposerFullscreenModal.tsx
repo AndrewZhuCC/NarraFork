@@ -145,7 +145,7 @@ export function ComposerFullscreenModal({
 							/>
 						) : undefined
 					}
-					rightSectionWidth={optimizeHook ? "auto" : undefined}
+					rightSectionWidth={optimizeHook ? 40 : undefined}
 					rightSectionProps={
 						optimizeHook
 							? {

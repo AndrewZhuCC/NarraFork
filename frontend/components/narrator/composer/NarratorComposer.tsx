@@ -1106,7 +1106,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 							onContextMessageCountChange={optimizeHook.setContextMessageCount}
 						/>
 					}
-					rightSectionWidth="auto"
+					rightSectionWidth={64}
 					styles={{
 						section: {
 							alignItems: "center",
