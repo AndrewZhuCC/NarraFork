@@ -1,0 +1,62 @@
+"""Small retention self-check; operates only inside an automatically removed temp directory."""
+import runpy
+import tempfile
+from pathlib import Path
+
+module = runpy.run_path(str(Path(__file__).with_name('install-ks-mini.py')))
+prune = module['prune_previous_backups']
+required = ('narrafork-server', 'narrafork.db', 'placed-update.json', 'links.json', 'install-record.json')
+
+with tempfile.TemporaryDirectory(prefix='nf-backup-retention-') as directory:
+    state = Path(directory)
+    current = state / 'backup-before-stable-signing-20260921T120000123456Z'
+    current.mkdir()
+    old = state / 'backup-before-stable-signing-20260920T120000123456Z'
+    legacy = state / 'backup-before-stable-signing-20260921T120000Z'
+    newer = state / 'backup-before-stable-signing-20260921T120001000000Z'
+    special = state / 'KNOWN-GOOD-selfuse'
+    labelled = state / 'backup-before-stable-signing-manual-keep'
+    for path in (old, legacy, newer, special, labelled):
+        path.mkdir()
+        (path / 'keep.txt').write_text('preserve outside the old automatic backups')
+    link = state / 'backup-before-stable-signing-20260919T120000000000Z'
+    link.symlink_to(special, target_is_directory=True)
+    (old / 'external-link').symlink_to(special, target_is_directory=True)
+
+    # An incomplete current backup must not authorize any deletion.
+    try:
+        prune(state, current)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('Incomplete backup was accepted')
+    assert old.is_dir() and legacy.is_dir()
+
+    for name in required:
+        (current / name).write_text('verified by the installer before this helper is called')
+    result = prune(state, current)
+    assert result == {'removed': 2, 'errorCount': 0, 'errors': []}, result
+    assert not old.exists() and not legacy.exists()
+    assert all(path.is_dir() for path in (current, newer, special, labelled))
+    assert (special / 'keep.txt').is_file() and link.is_symlink()
+    assert prune(state, current)['removed'] == 0
+
+    # Failure deleting one backup is reported without undoing the successful install.
+    blocked = state / 'backup-before-stable-signing-20260918T120000000000Z'
+    blocked.mkdir()
+    original = module['shutil'].rmtree
+
+    def fail_one(path, *args, **kwargs):
+        if Path(path) == blocked:
+            raise PermissionError('simulated cleanup denial')
+        return original(path, *args, **kwargs)
+
+    module['shutil'].rmtree = fail_one
+    try:
+        result = prune(state, current)
+        assert result['errorCount'] == 1 and result['removed'] == 0, result
+        assert blocked.is_dir() and current.is_dir()
+    finally:
+        module['shutil'].rmtree = original
+
+print('ks-mini backup retention self-check passed')

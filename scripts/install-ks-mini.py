@@ -3,6 +3,8 @@
 Usage: python3 install-ks-mini.py <bundle-directory> [--check] [--validate-migrations] [--prepare-update]
 The bundle contains deploy.json and its named artifact; validation bundles also contain the
 validator and migrations. Bundles never contain signing keys.
+After a successful install, keep its backup and remove older timestamped automatic backups.
+Special archives and symlinks are untouched; --check and failed installs never prune backups.
 """
 import datetime
 import hashlib
@@ -81,6 +83,33 @@ def validate_report(report, *, backup_sha256, source_sha256, commit, version, pe
             'idempotent': True,
         },
     }, 'Migration validation report is incomplete or does not match this install'
+
+
+def prune_previous_backups(state, current):
+    pattern = re.compile(r'backup-before-stable-signing-(\d{8}T\d{6})(\d{6})?Z')
+    current_match = pattern.fullmatch(current.name)
+    assert current.parent == state and current_match and current.is_dir() and not current.is_symlink()
+    for name in ('narrafork-server', 'narrafork.db', 'placed-update.json', 'links.json', 'install-record.json'):
+        path = current / name
+        assert path.is_file() and not path.is_symlink(), 'Current backup is incomplete'
+    current_stamp = current_match[1] + (current_match[2] or '000000')
+    removed, error_count, errors = 0, 0, []
+    with os.scandir(state) as entries:
+        for entry in entries:
+            match = pattern.fullmatch(entry.name)
+            if not match or not entry.is_dir(follow_symlinks=False):
+                continue
+            # Do not delete the current backup or a newer concurrent install's backup.
+            if match[1] + (match[2] or '000000') >= current_stamp:
+                continue
+            try:
+                shutil.rmtree(entry.path)
+                removed += 1
+            except OSError as error:
+                error_count += 1
+                if len(errors) < 10:
+                    errors.append({'backup': entry.name, 'error': str(error)[:500]})
+    return {'removed': removed, 'errorCount': error_count, 'errors': errors}
 
 
 def main():
@@ -357,6 +386,12 @@ def main():
         for p in [temporary, placed_tmp, *link_temps.values()]:
             if p.exists() or p.is_symlink():
                 p.unlink()
+    # Only prune after backup validation and successful installation, outside rollback handling.
+    # Cleanup failures must not turn an installed package into an apparent install failure.
+    try:
+        result['backupCleanup'] = prune_previous_backups(state, backup)
+    except (OSError, AssertionError) as error:
+        result['backupCleanup'] = {'errorCount': 1, 'error': str(error)[:500]}
     print(json.dumps(result), flush=True)
 
 
