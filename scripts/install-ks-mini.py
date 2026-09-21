@@ -252,8 +252,10 @@ def main():
     if pending:
         assert validate_migrations, ('Validate pending migrations before installing',
                                      [item['name'] for item in pending_files])
-        assert [item['name'] for item in pending_files] == ['0012_curved_bloodstorm.sql'], \
-            ('Validation is limited to migration 0012', [item['name'] for item in pending_files])
+        assert [item['name'] for item in pending_files] in (
+            ['0012_curved_bloodstorm.sql'], ['0013_omniscient_dormammu.sql'],
+        ), ('Validation is limited to a single reviewed migration (0012 or 0013)',
+            [item['name'] for item in pending_files])
         validation_db = backup / 'narrafork.validation.db'
         shutil.copy2(backup_db, validation_db)
         assert digest(validation_db) == backup_sha256
