@@ -2774,17 +2774,31 @@ async function* agentLoopInMetadataSnapshot(
 		historyToolUseIds = collectToolUseIdsFromHistory(history, pendingToolResults);
 	}
 
-	function hasPendingRuntimeSettingsOverride(): boolean {
-		const runtimeSettings = config.getRuntimeSettingsOverride?.();
-		return Boolean(
-			(runtimeSettings && Object.keys(runtimeSettings).length > 0) || config.getModelOverride?.(),
-		);
+	async function hasPendingRuntimeSettingsOverride(): Promise<boolean> {
+		// Probe only: a settle/resolve failure here must not escalate a retry path
+		// into a whole-turn exception. Treat "cannot tell" as "no pending switch"
+		// and keep the current model; real authorization failures still surface
+		// from applyPendingRuntimeSettings.
+		try {
+			const runtimeSettings = await config.getRuntimeSettingsOverride?.();
+			return Boolean(
+				(runtimeSettings && Object.keys(runtimeSettings).length > 0) || config.getModelOverride?.(),
+			);
+		} catch (error) {
+			logger.warn("Failed to probe pending runtime settings override", {
+				narratorId: config.narratorId,
+				error: String(error),
+			});
+			return false;
+		}
 	}
 
 	async function applyPendingRuntimeSettings(
 		cause: "turn" | "retry",
 	): Promise<Extract<AgentEvent, { type: "model_switched" }> | null> {
-		const settingsOverride = config.getRuntimeSettingsOverride?.() ?? null;
+		// Resolve authorization before touching adapters/history. A rejection must
+		// propagate rather than silently issuing a request with an obsolete model.
+		const settingsOverride = (await config.getRuntimeSettingsOverride?.()) ?? null;
 		const legacyModelOverride = config.getModelOverride?.() ?? null;
 		const newModel = settingsOverride?.model || legacyModelOverride;
 		const hasReasoningOverride =
@@ -5250,7 +5264,7 @@ async function* agentLoopInMetadataSnapshot(
 									}
 									continue chatRetryLoop;
 								}
-								if (hasPendingRuntimeSettingsOverride()) {
+								if (await hasPendingRuntimeSettingsOverride()) {
 									yield* finishRequest(message);
 									const switchEvent = await applyPendingRuntimeSettings("retry");
 									if (switchEvent) {
@@ -5370,7 +5384,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(firstTokenTimeoutMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -5748,7 +5762,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(msg);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -5814,7 +5828,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						continue; // retry provider.chat()
 					}
-					if (hasPendingRuntimeSettingsOverride()) {
+					if (await hasPendingRuntimeSettingsOverride()) {
 						yield* finishRequest(firstTokenTimeoutMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
@@ -5929,7 +5943,7 @@ async function* agentLoopInMetadataSnapshot(
 							model: effectiveModel,
 							requestId,
 						});
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
 								yield switchEvent;
@@ -5988,7 +6002,7 @@ async function* agentLoopInMetadataSnapshot(
 							}
 							continue; // retry provider.chat()
 						}
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							yield* finishRequest(lastRetryErrorMessage);
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
@@ -6056,7 +6070,7 @@ async function* agentLoopInMetadataSnapshot(
 					}
 					const emptyResponseMessage = `${effectiveProvider}: ${emptyResponseText}`;
 					requestDiagnostics = buildEmptyDiagnostics(emptyResponseMessage);
-					if (hasPendingRuntimeSettingsOverride()) {
+					if (await hasPendingRuntimeSettingsOverride()) {
 						yield* finishRequest(emptyResponseMessage);
 						const switchEvent = await applyPendingRuntimeSettings("retry");
 						if (switchEvent) {
@@ -6198,7 +6212,7 @@ async function* agentLoopInMetadataSnapshot(
 
 					// Shared retry ceiling with empty responses to avoid infinite loops.
 					if (reasoningOnlyRetries >= MAX_EMPTY_RESPONSE_RETRIES) {
-						if (hasPendingRuntimeSettingsOverride()) {
+						if (await hasPendingRuntimeSettingsOverride()) {
 							const switchEvent = await applyPendingRuntimeSettings("retry");
 							if (switchEvent) {
 								yield switchEvent;
